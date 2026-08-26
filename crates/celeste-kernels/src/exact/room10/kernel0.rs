@@ -1467,62 +1467,57 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     let n51: ZB = zb_and(n43, n50);
     let n52: ZN = zn_sub(r_c39, zn_splat(P8::from_raw(65536i32)));
     let n53: ZB = zn_le(n52, zn_splat(P8::from_raw(0i32)));
-    let n57: ZN = zn_sub(r_c20, zn_splat(P8::from_raw(65536i32)));
-    let n58: ZN = zsel_n(n42, n57, r_c20);
-    let n59: ZB = zn_gt(n58, zn_splat(P8::from_raw(0i32)));
-    let n60: ZB = zn_le(n58, zn_splat(P8::from_raw(0i32)));
-    let n61: ZB = zn_le(r_c39, zn_splat(P8::from_raw(0i32)));
-    let n62: ZB = zb_and(n43, n61);
-    let n63: ZB = zn_gt(n52, zn_splat(P8::from_raw(0i32)));
-    let n64: ZB = zb_and(n51, n63);
-    let n65: ZN = zsel_n(n50, n52, r_c39);
-    let n66: ZB = zb_or(n62, n64);
-    let n67: ZN = zsel_n(n42, r_c39, n65);
-    let n68: ZB = zb_or(n42, n66);
-    let n69: ZB = zb_and(n59, n68);
-    let n70: ZB = zb_and(n60, n68);
-    let n71: ZB = zb_or(n69, n70);
-    let n74: ZW = zw_bits_n(r_c20);
-    let n75: ZW = zw_mix1(zw_splat(11400714819323198485u64), n74, 20u64);
-    let n76: ZW = zw_mix2(zw_splat(11562461410679940143u64), n74, 20u64);
-    let n77: ZW = zw_bits_n(n52);
-    let n78: ZW = zw_mix1(n75, n77, 39u64);
-    let n79: ZW = zw_mix2(n76, n77, 39u64);
-    let n80: ZW = zw_bits_n(n34);
-    let n81: ZW = zw_mix1(n78, n80, 84u64);
-    let n82: ZW = zw_mix2(n79, n80, 84u64);
-    let n83: ZW = zw_bits_n(n41);
-    let n84: ZW = zw_mix1(n81, n83, 85u64);
-    let n85: ZW = zw_mix2(n82, n83, 85u64);
-    let n86: ZW = zw_bits_n(n49);
-    let n87: ZW = zw_mix1(n84, n86, 86u64);
-    let n88: ZW = zw_mix2(n85, n86, 86u64);
-    let n89: ZW = zw_bits_n(r_c87);
-    let n90: ZW = zw_mix1(n87, n89, 87u64);
-    let n91: ZW = zw_mix2(n88, n89, 87u64);
-    let n92: ZW = zw_bits_n(n58);
-    let n93: ZW = zw_mix1(zw_splat(11400714819323198485u64), n92, 20u64);
-    let n94: ZW = zw_mix2(zw_splat(11562461410679940143u64), n92, 20u64);
-    let n95: ZW = zw_bits_n(n67);
-    let n96: ZW = zw_mix1(n93, n95, 39u64);
-    let n97: ZW = zw_mix2(n94, n95, 39u64);
-    let n98: ZW = zw_bits_b(r_c41);
-    let n99: ZW = zw_mix1(n96, n98, 41u64);
-    let n100: ZW = zw_mix2(n97, n98, 41u64);
-    let n101: ZW = zw_mix1(n99, n80, 84u64);
-    let n102: ZW = zw_mix2(n100, n80, 84u64);
-    let n103: ZW = zw_mix1(n101, n83, 85u64);
-    let n104: ZW = zw_mix2(n102, n83, 85u64);
-    let n105: ZW = zw_mix1(n103, n86, 86u64);
-    let n106: ZW = zw_mix2(n104, n86, 86u64);
-    let n107: ZW = zw_mix1(n105, n89, 87u64);
-    let n108: ZW = zw_mix2(n106, n89, 87u64);
+    let n56: ZN = zn_sub(r_c20, zn_splat(P8::from_raw(65536i32)));
+    let n57: ZN = zsel_n(n42, n56, r_c20);
+    let n58: ZB = zn_le(r_c39, zn_splat(P8::from_raw(0i32)));
+    let n59: ZB = zb_and(n43, n58);
+    let n60: ZB = zn_gt(n52, zn_splat(P8::from_raw(0i32)));
+    let n61: ZB = zb_and(n51, n60);
+    let n62: ZN = zsel_n(n50, n52, r_c39);
+    let n63: ZB = zb_or(n59, n61);
+    let n64: ZN = zsel_n(n42, r_c39, n62);
+    let n65: ZB = zb_or(n42, n63);
+    let n68: ZW = zw_bits_n(r_c20);
+    let n69: ZW = zw_mix1(zw_splat(11400714819323198485u64), n68, 20u64);
+    let n70: ZW = zw_mix2(zw_splat(11562461410679940143u64), n68, 20u64);
+    let n71: ZW = zw_bits_n(n52);
+    let n72: ZW = zw_mix1(n69, n71, 39u64);
+    let n73: ZW = zw_mix2(n70, n71, 39u64);
+    let n74: ZW = zw_bits_n(n34);
+    let n75: ZW = zw_mix1(n72, n74, 84u64);
+    let n76: ZW = zw_mix2(n73, n74, 84u64);
+    let n77: ZW = zw_bits_n(n41);
+    let n78: ZW = zw_mix1(n75, n77, 85u64);
+    let n79: ZW = zw_mix2(n76, n77, 85u64);
+    let n80: ZW = zw_bits_n(n49);
+    let n81: ZW = zw_mix1(n78, n80, 86u64);
+    let n82: ZW = zw_mix2(n79, n80, 86u64);
+    let n83: ZW = zw_bits_n(r_c87);
+    let n84: ZW = zw_mix1(n81, n83, 87u64);
+    let n85: ZW = zw_mix2(n82, n83, 87u64);
+    let n86: ZW = zw_bits_n(n57);
+    let n87: ZW = zw_mix1(zw_splat(11400714819323198485u64), n86, 20u64);
+    let n88: ZW = zw_mix2(zw_splat(11562461410679940143u64), n86, 20u64);
+    let n89: ZW = zw_bits_n(n64);
+    let n90: ZW = zw_mix1(n87, n89, 39u64);
+    let n91: ZW = zw_mix2(n88, n89, 39u64);
+    let n92: ZW = zw_bits_b(r_c41);
+    let n93: ZW = zw_mix1(n90, n92, 41u64);
+    let n94: ZW = zw_mix2(n91, n92, 41u64);
+    let n95: ZW = zw_mix1(n93, n74, 84u64);
+    let n96: ZW = zw_mix2(n94, n74, 84u64);
+    let n97: ZW = zw_mix1(n95, n77, 85u64);
+    let n98: ZW = zw_mix2(n96, n77, 85u64);
+    let n99: ZW = zw_mix1(n97, n80, 86u64);
+    let n100: ZW = zw_mix2(n98, n80, 86u64);
+    let n101: ZW = zw_mix1(n99, n83, 87u64);
+    let n102: ZW = zw_mix2(n100, n83, 87u64);
     let ok_v0_b0: u16 = ALL & zb_holds(r_c38) & zb_holds(n37) & zb_holds(n30) & zb_holds(n31);
     let bd_v0_b0: bool = false;
     let live_v0_b0: u16 = ALL & zb_holds(n43) & zb_holds(n50) & zb_holds(n53);
     let ok_v0_b1: u16 = ALL & zb_holds(r_c38) & zb_holds(n37) & zb_holds(n30) & zb_holds(n31);
     let bd_v0_b1: bool = false;
-    let live_v0_b1: u16 = ALL & zb_holds(n71);
+    let live_v0_b1: u16 = ALL & zb_holds(n65);
     let sh0 = KShared0 {
         c87: r_c87,
         c39: n52,
@@ -1533,9 +1528,9 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     };
     let sh1 = KShared1 {
         c87: r_c87,
-        c39: n67,
+        c39: n64,
         c84: n34,
-        c20: n58,
+        c20: n57,
         c41: r_c41,
         c86: n49,
         c85: n41,
@@ -1547,14 +1542,14 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     declined |= live_v0_b0 & !ok_v0_b0;
     take_0_0 |= live_v0_b0 & ok_v0_b0;
     let o0 = KOut0 {
-        h1: n90, h2: n91,
+        h1: n84, h2: n85,
     };
     // body 0: buttons 0x00, forks 0x0
     sink.o0(0, take_0_0, &sh0, &o0);
     declined |= live_v0_b1 & !ok_v0_b1;
     take_1_0 |= live_v0_b1 & ok_v0_b1;
     let o1 = KOut1 {
-        h1: n107, h2: n108,
+        h1: n101, h2: n102,
     };
     // body 1: buttons 0x00, forks 0x0
     sink.o1(0, take_1_0, &sh1, &o1);

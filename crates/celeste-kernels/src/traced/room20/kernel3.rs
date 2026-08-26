@@ -2209,67 +2209,62 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     let n90: ZB = zb_and(n87, n89);
     let n91: ZN = zn_sub(r_c39, zn_splat(P8::from_raw(65536i32)));
     let n92: ZB = zn_le(n91, zn_splat(P8::from_raw(0i32)));
-    let n95: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c261);
-    let n96: bool = P8::from_raw(524288i32) == u.c310;
-    let n97: ZB = zn_eq(zn_splat(P8::from_raw(7340032i32)), r_c274);
-    let n98: ZB = zn_eq(zn_splat(P8::from_raw(1179648i32)), r_c271);
-    let n99: ZB = zb_not(r_c42);
-    let n100: ZB = zn_eq(zn_splat(P8::from_raw(65536i32)), r_c88);
-    let n101: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c86);
-    let n102: ZB = zb_not(r_c298);
-    let n103: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c241);
-    let n104: bool = P8::from_raw(524288i32) == u.c299;
-    let n105: bool = P8::from_raw(524288i32) == u.c300;
-    let n106: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c303);
-    let n107: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c305);
-    let n108: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c306);
-    let n109: ZB = zn_eq(zn_splat(P8::from_raw(1179648i32)), r_c252);
-    let n110: ZB = zn_eq(zn_splat(P8::from_raw(2621440i32)), r_c254);
-    let n111: ZB = zn_eq(zn_splat(P8::from_raw(7340032i32)), r_c255);
-    let n134: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c85);
-    let n155: ZN = zn_sub(r_c20, zn_splat(P8::from_raw(65536i32)));
-    let n156: ZN = zsel_n(n86, n155, r_c20);
-    let n157: ZB = zn_gt(n156, zn_splat(P8::from_raw(0i32)));
-    let n158: ZB = zn_le(n156, zn_splat(P8::from_raw(0i32)));
-    let n159: ZB = zn_le(r_c39, zn_splat(P8::from_raw(0i32)));
-    let n160: ZB = zb_and(n87, n159);
-    let n161: ZB = zn_gt(n91, zn_splat(P8::from_raw(0i32)));
-    let n162: ZB = zb_and(n90, n161);
-    let n163: ZN = zsel_n(n89, n91, r_c39);
-    let n164: ZB = zb_or(n160, n162);
-    let n165: ZN = zsel_n(n86, r_c39, n163);
-    let n166: ZB = zb_or(n86, n164);
-    let n167: ZB = zb_and(n157, n166);
-    let n168: ZB = zb_and(n158, n166);
-    let n169: ZB = zb_or(n167, n168);
-    let n172: ZW = zw_bits_n(r_c20);
+    let n94: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c261);
+    let n95: bool = P8::from_raw(524288i32) == u.c310;
+    let n96: ZB = zn_eq(zn_splat(P8::from_raw(7340032i32)), r_c274);
+    let n97: ZB = zn_eq(zn_splat(P8::from_raw(1179648i32)), r_c271);
+    let n98: ZB = zb_not(r_c42);
+    let n99: ZB = zn_eq(zn_splat(P8::from_raw(65536i32)), r_c88);
+    let n100: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c86);
+    let n101: ZB = zb_not(r_c298);
+    let n102: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c241);
+    let n103: bool = P8::from_raw(524288i32) == u.c299;
+    let n104: bool = P8::from_raw(524288i32) == u.c300;
+    let n105: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c303);
+    let n106: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c305);
+    let n107: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c306);
+    let n108: ZB = zn_eq(zn_splat(P8::from_raw(1179648i32)), r_c252);
+    let n109: ZB = zn_eq(zn_splat(P8::from_raw(2621440i32)), r_c254);
+    let n110: ZB = zn_eq(zn_splat(P8::from_raw(7340032i32)), r_c255);
+    let n133: ZB = zn_eq(zn_splat(P8::from_raw(0i32)), r_c85);
+    let n154: ZN = zn_sub(r_c20, zn_splat(P8::from_raw(65536i32)));
+    let n155: ZN = zsel_n(n86, n154, r_c20);
+    let n156: ZB = zn_le(r_c39, zn_splat(P8::from_raw(0i32)));
+    let n157: ZB = zb_and(n87, n156);
+    let n158: ZB = zn_gt(n91, zn_splat(P8::from_raw(0i32)));
+    let n159: ZB = zb_and(n90, n158);
+    let n160: ZN = zsel_n(n89, n91, r_c39);
+    let n161: ZB = zb_or(n157, n159);
+    let n162: ZN = zsel_n(n86, r_c39, n160);
+    let n163: ZB = zb_or(n86, n161);
+    let n166: ZW = zw_bits_n(r_c20);
+    let n167: ZW = zw_mix1(zw_splat(11400714819323198485u64), n166, 20u64);
+    let n168: ZW = zw_mix2(zw_splat(11562461410679940143u64), n166, 20u64);
+    let n169: ZW = zw_bits_n(n91);
+    let n170: ZW = zw_mix1(n167, n169, 39u64);
+    let n171: ZW = zw_mix2(n168, n169, 39u64);
+    let n172: ZW = zw_bits_n(n155);
     let n173: ZW = zw_mix1(zw_splat(11400714819323198485u64), n172, 20u64);
     let n174: ZW = zw_mix2(zw_splat(11562461410679940143u64), n172, 20u64);
-    let n175: ZW = zw_bits_n(n91);
+    let n175: ZW = zw_bits_n(n162);
     let n176: ZW = zw_mix1(n173, n175, 39u64);
     let n177: ZW = zw_mix2(n174, n175, 39u64);
-    let n178: ZW = zw_bits_n(n156);
-    let n179: ZW = zw_mix1(zw_splat(11400714819323198485u64), n178, 20u64);
-    let n180: ZW = zw_mix2(zw_splat(11562461410679940143u64), n178, 20u64);
-    let n181: ZW = zw_bits_n(n165);
-    let n182: ZW = zw_mix1(n179, n181, 39u64);
-    let n183: ZW = zw_mix2(n180, n181, 39u64);
-    let n184: ZW = zw_bits_b(r_c41);
-    let n185: ZW = zw_mix1(n182, n184, 41u64);
-    let n186: ZW = zw_mix2(n183, n184, 41u64);
-    let ok_v0_b0: u16 = ALL & zb_holds(r_c38) & zb_holds(n134) & zb_holds(n85) & zb_holds(n97) & zb_holds(n79) & zb_holds(n98) & zb_holds(n78) & zb_holds(n84) & zb_holds(r_c269) & zb_holds(n77) & zb_holds(n83) & zb_holds(n95) & zb_holds(n81) & zb_holds(n74) & zb_holds(n73) & zb_holds(r_c258) & zb_holds(n111) & zb_holds(n110) & zb_holds(n109) & zb_holds(n108) & zb_holds(n107) & zb_holds(r_c250) & zb_holds(n72) & zb_holds(n106) & zb_holds(n69) & zb_holds(n103) & zb_holds(n102) & zb_holds(n68) & zb_holds(r_c239) & zb_holds(n101) & zb_holds(n100) & zb_holds(n99) & zb_holds(r_c175) & zb_holds(n66) & zb_holds(n67);
-    let bd_v0_b0: bool = !n76 || !n75 || !n96 || !n82 || !n71 || !n70 || !n105 || !n104;
+    let n178: ZW = zw_bits_b(r_c41);
+    let n179: ZW = zw_mix1(n176, n178, 41u64);
+    let n180: ZW = zw_mix2(n177, n178, 41u64);
+    let ok_v0_b0: u16 = ALL & zb_holds(r_c38) & zb_holds(n133) & zb_holds(n85) & zb_holds(n96) & zb_holds(n79) & zb_holds(n97) & zb_holds(n78) & zb_holds(n84) & zb_holds(r_c269) & zb_holds(n77) & zb_holds(n83) & zb_holds(n94) & zb_holds(n81) & zb_holds(n74) & zb_holds(n73) & zb_holds(r_c258) & zb_holds(n110) & zb_holds(n109) & zb_holds(n108) & zb_holds(n107) & zb_holds(n106) & zb_holds(r_c250) & zb_holds(n72) & zb_holds(n105) & zb_holds(n69) & zb_holds(n102) & zb_holds(n101) & zb_holds(n68) & zb_holds(r_c239) & zb_holds(n100) & zb_holds(n99) & zb_holds(n98) & zb_holds(r_c175) & zb_holds(n66) & zb_holds(n67);
+    let bd_v0_b0: bool = !n76 || !n75 || !n95 || !n82 || !n71 || !n70 || !n104 || !n103;
     let live_v0_b0: u16 = ALL & zb_holds(n87) & zb_holds(n89) & zb_holds(n92);
-    let ok_v0_b1: u16 = ALL & zb_holds(r_c38) & zb_holds(n134) & zb_holds(n85) & zb_holds(n97) & zb_holds(n79) & zb_holds(n98) & zb_holds(n78) & zb_holds(n84) & zb_holds(r_c269) & zb_holds(n77) & zb_holds(n83) & zb_holds(n95) & zb_holds(n81) & zb_holds(n74) & zb_holds(n73) & zb_holds(r_c258) & zb_holds(n111) & zb_holds(n110) & zb_holds(n109) & zb_holds(n108) & zb_holds(n107) & zb_holds(r_c250) & zb_holds(n72) & zb_holds(n106) & zb_holds(n69) & zb_holds(n103) & zb_holds(n102) & zb_holds(n68) & zb_holds(r_c239) & zb_holds(n101) & zb_holds(n100) & zb_holds(n99) & zb_holds(r_c175) & zb_holds(n66) & zb_holds(n67);
-    let bd_v0_b1: bool = !n76 || !n75 || !n96 || !n82 || !n71 || !n70 || !n105 || !n104;
-    let live_v0_b1: u16 = ALL & zb_holds(n169);
+    let ok_v0_b1: u16 = ALL & zb_holds(r_c38) & zb_holds(n133) & zb_holds(n85) & zb_holds(n96) & zb_holds(n79) & zb_holds(n97) & zb_holds(n78) & zb_holds(n84) & zb_holds(r_c269) & zb_holds(n77) & zb_holds(n83) & zb_holds(n94) & zb_holds(n81) & zb_holds(n74) & zb_holds(n73) & zb_holds(r_c258) & zb_holds(n110) & zb_holds(n109) & zb_holds(n108) & zb_holds(n107) & zb_holds(n106) & zb_holds(r_c250) & zb_holds(n72) & zb_holds(n105) & zb_holds(n69) & zb_holds(n102) & zb_holds(n101) & zb_holds(n68) & zb_holds(r_c239) & zb_holds(n100) & zb_holds(n99) & zb_holds(n98) & zb_holds(r_c175) & zb_holds(n66) & zb_holds(n67);
+    let bd_v0_b1: bool = !n76 || !n75 || !n95 || !n82 || !n71 || !n70 || !n104 || !n103;
+    let live_v0_b1: u16 = ALL & zb_holds(n163);
     let sh0 = KShared0 {
         c39: n91,
         c20: r_c20,
     };
     let sh1 = KShared1 {
-        c39: n165,
-        c20: n156,
+        c39: n162,
+        c20: n155,
         c41: r_c41,
     };
     let mut take_0_0: u16 = 0;
@@ -2279,14 +2274,14 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     declined |= live_v0_b0 & (if bd_v0_b0 { ALL } else { !ok_v0_b0 });
     take_0_0 |= live_v0_b0 & ok_v0_b0 & (if bd_v0_b0 { 0 } else { ALL });
     let o0 = KOut0 {
-        h1: n176, h2: n177,
+        h1: n170, h2: n171,
     };
     // body 0: buttons 0x00, forks 0x0
     sink.o0(0, take_0_0, &sh0, &o0);
     declined |= live_v0_b1 & (if bd_v0_b1 { ALL } else { !ok_v0_b1 });
     take_1_0 |= live_v0_b1 & ok_v0_b1 & (if bd_v0_b1 { 0 } else { ALL });
     let o1 = KOut1 {
-        h1: n185, h2: n186,
+        h1: n179, h2: n180,
     };
     // body 1: buttons 0x00, forks 0x0
     sink.o1(0, take_1_0, &sh1, &o1);

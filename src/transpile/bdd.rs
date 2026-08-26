@@ -377,9 +377,14 @@ pub struct Stats {
     pub constants: usize,
     /// Boolean nodes proved equal to an ATOM and replaced by it.
     pub to_atom: usize,
-    /// Boolean nodes proved equal to an earlier NON-atom node - counted,
-    /// and deliberately NOT applied. See the note on `simplify`.
+    /// Boolean nodes proved equal to an earlier node without a safe
+    /// representative - counted, and deliberately NOT applied. See the
+    /// note on `simplify`.
     pub mergeable: usize,
+    /// Branch re-merges collapsed to their common factor - the
+    /// `(A & p) | (A & not p) -> A` family. See the safety proof on
+    /// `simplify`.
+    pub merged: usize,
     pub atoms: usize,
     pub bdd_nodes: usize,
     pub overflowed: bool,
@@ -414,13 +419,150 @@ pub struct Stats {
 ///   atom computes exactly "read this input", so no form of it can be
 ///   more precise.
 ///
-/// Anything else is counted as `mergeable` and left alone. That is not a
-/// permanent refusal - it is a refusal to guess, since the measurement
-/// that would settle it (does deopt volume actually rise?) needs the
-/// traced path wired into the search, which it is not yet.
+/// ## The common-factor collapse (2026-08-26)
+///
+/// There is a THIRD safe case, and it is a specific SHAPE, not a
+/// general "merge into anything in your own cone". The dominant
+/// redundancy in a traced frame is the tracer's branch re-merge
+/// `(A & p) | (A & not p)`, which is `A` again - three levels deep in
+/// the dash block, once per direction combo (`plans/graph-audit.md`).
+///
+/// **Rule.** Let `N` be an `Or` whose flattened disjuncts are
+/// `And`-trees `dᵢ = ⋀ Cᵢ ∪ Pᵢ`, where every disjunct contains the same
+/// non-empty common factor set `C` (compared by POST-MAP node identity)
+/// and `Pᵢ` are the residual conjuncts. If the BDD proves
+/// `⋁ᵢ (⋀ Pᵢ) ≡ true`, rewrite `N` to `⋀ C`. (An empty `Pᵢ` is `true`,
+/// which covers absorption `A ∨ (A ∧ p)`.) The `And`-of-`Or`s dual with
+/// `⋀ᵢ (⋁ Pᵢ) ≡ false` rewrites to `⋁ C`.
+///
+/// **Safety** (never makes a lane less decided; the substitution
+/// invariant is `val(map[x]) ⊒ val(x)` in the information order, with
+/// concrete equality). Concretely `N = C ∧ ⋁Pᵢ = C ∧ true = C` by
+/// distributivity and the tautology, so the concrete half holds. For
+/// decidedness, suppose `N`'s Kleene value is decided:
+///
+/// * decided TRUE: some disjunct is true, so all its conjuncts are
+///   true, so every member of `C` (whose image is `⊒` some true
+///   conjunct) is true - `⋀C` is true.
+/// * decided FALSE: every disjunct has a decided-false conjunct. If any
+///   of those is a `C` member, `⋀C` is false. If all of them are
+///   residual, then every `⋀Pᵢ` is decided false, and concretizing the
+///   undecided atoms keeps them false - contradicting the tautology
+///   `⋁ᵢ⋀Pᵢ ≡ true`, which the BDD proved over ALL atom assignments
+///   (atoms are independent there, a superset of the realizable ones).
+///
+/// So `N` decided forces `⋀C` decided and equal; `N` undecided needs
+/// nothing. ∎
+///
+/// **Why not the audit's broader rule.** `plans/graph-audit.md`
+/// proposed merging `N` into ANY node `M` of `N`'s own cone with the
+/// same BDD reference, with a monotonicity proof. That proof is WRONG:
+/// it writes `N = F(M, v)` and lets `M` range independently of `v`,
+/// which fails when `v` shares atoms with `M`. Counterexample:
+/// `A = (a ∧ ¬a) ∨ (d ∧ e)` (concretely `d ∧ e`), `N = A ∧ (d ∧ e)` -
+/// same BDD reference, `A` in `N`'s cone, but at `a = ⊥, d = false`
+/// Kleene gives `N = ⊥ ∧ false = false` (decided) while `A = ⊥`.
+/// `false ∧ ⊥ = false` MANUFACTURES decidedness, so an ancestor is not
+/// always at-least-as-decided. The general merge was implemented first
+/// and `simplifying_preserves_what_the_graph_evaluates_to` caught it
+/// losing a decided lane; only the factor shape above survives.
+///
+/// This is deliberately NOT a `Graph::fold` rule: `fold`'s contract
+/// (`folding_is_exact_not_merely_sound`) is exactness in Kleene, and
+/// this rewrite is a refinement (at `A = true`, `p = ⊥` the merged form
+/// is `⊥`, `A` is `true`). It also needs the complementary-comparison
+/// knowledge (`gt`/`le` on the same operands are one variable) that
+/// only the BDD has.
+/// Flatten a same-op tree (`Or`-of-`Or`s or `And`-of-`And`s) in `g` into
+/// its non-`op` leaves. `None` when the tree is bigger than `cap`, which
+/// bounds the work per candidate rather than trusting the input.
+fn flatten(g: &Graph, root: NodeId, want_and: bool, cap: usize) -> Option<Vec<NodeId>> {
+    let mut leaves = Vec::new();
+    let mut stack = vec![root];
+    while let Some(x) = stack.pop() {
+        let n = g.get(x);
+        let same = matches!((&n.op, want_and), (Op::And, true) | (Op::Or, false));
+        if same {
+            stack.extend(n.args.iter().copied());
+        } else {
+            leaves.push(x);
+            if leaves.len() > cap {
+                return None;
+            }
+        }
+    }
+    Some(leaves)
+}
+
+/// The common-factor collapse - see the module note on `simplify` for
+/// the rule and its safety proof. Returns the replacement node in `out`,
+/// or `None` when the shape or the tautology does not hold.
+fn factor_common(
+    g: &Graph,
+    b: &mut Bdd,
+    of: &[Option<Ref>],
+    map: &[NodeId],
+    out: &mut Graph,
+    id: NodeId,
+) -> Option<NodeId> {
+    use std::collections::BTreeSet;
+    let dual = match g.get(id).op {
+        Op::Or => false,
+        Op::And => true,
+        _ => return None,
+    };
+    let terms = flatten(g, id, dual, 64)?;
+    if terms.len() < 2 {
+        return None;
+    }
+    // Each term's conjuncts (disjuncts, in the dual), as OLD ids and as
+    // their POST-MAP images - identity after rewriting is what makes two
+    // spellings of one factor the same factor.
+    let mut parts: Vec<(Vec<NodeId>, BTreeSet<NodeId>)> = Vec::with_capacity(terms.len());
+    for t in &terms {
+        let leaves = flatten(g, *t, !dual, 64)?;
+        let imgs: BTreeSet<NodeId> = leaves.iter().map(|l| map[*l as usize]).collect();
+        if imgs.contains(&UNREACHABLE) {
+            return None;
+        }
+        parts.push((leaves, imgs));
+    }
+    // The common factor, by image.
+    let mut common: BTreeSet<NodeId> = parts[0].1.clone();
+    for (_, imgs) in parts.iter().skip(1) {
+        common = common.intersection(imgs).copied().collect();
+        if common.is_empty() {
+            return None;
+        }
+    }
+    // The residuals' joint function: OR of per-term ANDs (dual: AND of
+    // per-term ORs), over the OLD nodes' references. A missing reference
+    // (cap overflow, non-boolean leaf) means no proof, so no rewrite.
+    let mut joint = if dual { TRUE } else { FALSE };
+    for (leaves, _) in &parts {
+        let mut res = if dual { FALSE } else { TRUE };
+        for l in leaves {
+            if common.contains(&map[*l as usize]) {
+                continue;
+            }
+            let r = of[*l as usize]?;
+            res = if dual { b.or(res, r)? } else { b.and(res, r)? };
+        }
+        joint = if dual { b.and(joint, res)? } else { b.or(joint, res)? };
+    }
+    if joint != if dual { FALSE } else { TRUE } {
+        return None;
+    }
+    // The tautology holds: the whole node is exactly its common factor.
+    let mut it = common.into_iter();
+    let first = it.next()?;
+    let op = if dual { Op::Or } else { Op::And };
+    Some(it.fold(first, |acc, m| out.fold(op.clone(), vec![acc, m])))
+}
+
 pub fn simplify(g: &Graph, roots: &[NodeId], cap: usize) -> (Graph, Vec<NodeId>, Stats) {
     let need = reachable(g, roots);
-    let (_, a) = analyze(g, &need, cap);
+    let (mut bdd, a) = analyze(g, &need, cap);
     let mut out = Graph::new();
     let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
     let mut seen: HashMap<Ref, NodeId> = HashMap::new();
@@ -452,12 +594,18 @@ pub fn simplify(g: &Graph, roots: &[NodeId], cap: usize) -> (Graph, Vec<NodeId>,
                     map[*at as usize]
                 }
                 Some(_) => rebuild(&mut out, &map),
-                None => {
-                    if seen.insert(r, id as NodeId).is_some() {
-                        st.mergeable += 1;
+                None => match factor_common(g, &mut bdd, &a.of, &map, &mut out, id as NodeId) {
+                    Some(f) => {
+                        st.merged += 1;
+                        f
                     }
-                    rebuild(&mut out, &map)
-                }
+                    None => {
+                        if seen.insert(r, id as NodeId).is_some() {
+                            st.mergeable += 1;
+                        }
+                        rebuild(&mut out, &map)
+                    }
+                },
             },
             _ => rebuild(&mut out, &map),
         };
@@ -493,7 +641,7 @@ pub fn simplify_until_stable(
     let mut all = Vec::new();
     for _ in 0..max_passes {
         let (next, map, st) = simplify(&cur, &cur_roots, cap);
-        let progress = st.constants + st.to_atom;
+        let progress = st.constants + st.to_atom + st.merged;
         all.push(st);
         for c in composed.iter_mut() {
             *c = if *c == UNREACHABLE { UNREACHABLE } else { map[*c as usize] };
@@ -550,6 +698,111 @@ mod tests {
         assert_eq!(out.get(roots[1]).op, Op::ConstBool(true));
         // `x` is an atom, so it survives as itself.
         assert_eq!(out.get(roots[2]).op, Op::Cell(2));
+    }
+
+    #[test]
+    fn a_branch_remerge_collapses_to_its_own_ancestor() {
+        // The dominant redundancy in a traced frame
+        // (`plans/graph-audit.md`): the tracer merges branch arms that
+        // all wrote the same value, producing `(A & p) | (A & not p)`,
+        // which is `A` - and `A` is in the merge's own cone, so
+        // substituting it never loses a decided lane. Three levels
+        // deep, like the dash block's direction arms, and with the
+        // middle level's complement spelled as the OPPOSITE COMPARISON
+        // rather than a `Not`, which only the BDD sees through.
+        let mut g = Graph::new();
+        // The ancestor is COMPOUND, so the collapse cannot ride the
+        // existing atom substitution - it has to be the cone merge.
+        let a0 = g.leaf(Op::Cell(1));
+        let a1 = g.leaf(Op::Cell(4));
+        let a = g.fold(Op::And, vec![a0, a1]);
+        let p = g.leaf(Op::Cell(2));
+        let (x, y) = (g.leaf(Op::Cell(10)), g.leaf(Op::Cell(11)));
+        let np = g.fold(Op::Not, vec![p]);
+        let l1 = {
+            let l = g.fold(Op::And, vec![a, p]);
+            let r = g.fold(Op::And, vec![a, np]);
+            g.fold(Op::Or, vec![l, r])
+        };
+        let gt = g.fold(Op::Gt, vec![x, y]);
+        let le = g.fold(Op::Le, vec![x, y]);
+        let l2 = {
+            let l = g.fold(Op::And, vec![l1, gt]);
+            let r = g.fold(Op::And, vec![l1, le]);
+            g.fold(Op::Or, vec![l, r])
+        };
+        let q = g.leaf(Op::Cell(3));
+        let nq = g.fold(Op::Not, vec![q]);
+        let l3 = {
+            let l = g.fold(Op::And, vec![l2, q]);
+            let r = g.fold(Op::And, vec![l2, nq]);
+            g.fold(Op::Or, vec![l, r])
+        };
+        assert_ne!(l3, a, "fold must not have collapsed this on its own");
+        let (out, map, st) = simplify(&g, &[l3], CAP);
+        assert_eq!(map[l3 as usize], map[a as usize], "the whole chain is A");
+        assert_eq!(out.get(map[l3 as usize]).op, Op::And);
+        assert_eq!(st.merged, 3, "one merge per level: {:?}", st);
+        assert_eq!(st.mergeable, 0, "everything provable was in-cone: {:?}", st);
+    }
+
+    #[test]
+    fn the_merged_form_is_never_more_decided_than_its_ancestor() {
+        // The property test the rewrite's safety rests on: for the
+        // remerge shape, at EVERY tri-state assignment, wherever the
+        // merged form `(A & p) | (A & not p)` is decided, `A` is
+        // decided and agrees - so substituting `A` never turns a
+        // decided lane undecided. Built over a pool of ancestors that
+        // are themselves compound, not just atoms.
+        let mut g = Graph::new();
+        let cells: Vec<NodeId> = (0..3).map(|i| g.leaf(Op::Cell(i))).collect();
+        let ancestors = vec![
+            cells[0],
+            g.fold(Op::And, vec![cells[0], cells[1]]),
+            g.fold(Op::Or, vec![cells[1], cells[2]]),
+        ];
+        let ps = vec![cells[2], g.fold(Op::Not, vec![cells[0]])];
+        let mut pairs: Vec<(NodeId, NodeId)> = Vec::new();
+        for a in &ancestors {
+            for p in &ps {
+                let np = g.fold(Op::Not, vec![*p]);
+                let l = g.fold(Op::And, vec![*a, *p]);
+                let r = g.fold(Op::And, vec![*a, np]);
+                let merged = g.fold(Op::Or, vec![l, r]);
+                pairs.push((merged, *a));
+            }
+        }
+        let tri = [Some(true), Some(false), None];
+        for b0 in tri {
+            for b1 in tri {
+                for b2 in tri {
+                    let cells = Map::from([
+                        (0u32, Val::Bool(b0)),
+                        (1u32, Val::Bool(b1)),
+                        (2u32, Val::Bool(b2)),
+                    ]);
+                    let out = g.eval(&cells).unwrap();
+                    for (merged, anc) in &pairs {
+                        let (m, a) = (out[*merged as usize], out[*anc as usize]);
+                        match (m, a) {
+                            // Merged undecided: substituting A only
+                            // ever ADDS decidedness. Fine.
+                            (Val::Bool(None), _) => {}
+                            // Merged decided: A must be decided the
+                            // same way, or the substitution would
+                            // change a decided lane.
+                            (Val::Bool(Some(x)), Val::Bool(Some(y))) => {
+                                assert_eq!(x, y, "decided disagreement at {:?}", cells)
+                            }
+                            (m, a) => panic!(
+                                "merged {:?} more decided than ancestor {:?} at {:?}",
+                                m, a, cells
+                            ),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
