@@ -211,3 +211,38 @@ compatibility) but NOT the search result / visited set — see Assumptions.
   key. It only defers frontier inserts to an end-of-frame bulk flush and
   freezes the frontier mid-frame. This is search-identity-preserving and
   gated byte-identical. [status below]
+
+## 2. Insert-cost measurement (frontier-only, compiled forward, room10)
+
+Command: `CELESTE_COMPILED_FORWARD=1 CELESTE_FRONTIER_ONLY=1 CELESTE_DEDUP_CENSUS=1
+CELESTE_CHUNK_PHASE_TIME=1 ./target/release/rewrite bench --frames 50`
+(in-memory map frontier, 16 threads, 8000-lane cap; release/fat-LTO).
+
+Final: 50 frames, 5.01s wall, 8,033,952 rows visited (1,191,326 new at f50;
+offered 9.46M -> 1.97M distinct -> 1.19M new — matches the spec profile).
+
+Phase totals (WALL seconds over the whole 50-frame run):
+
+| phase | wall | what |
+|---|---|---|
+| `fwd.interpret`        | 3.42s | kernel + materialize + boundary prepare + probe (PARALLEL, ~8x: 28.0 thread-s body) |
+| `fwd.partition_filter` | 0.54s | within-frame dedup tier (parallel) |
+| `fwd.merge`            | 0.49s | vectorize survivors |
+| **`fwd.boundary_stream`** | **0.44s** | **the SERIAL insert side: `subtract_decide` -> `insert_new`** |
+| `fwd.boundary_gather`  | 0.08s | gather survivors (parallel) |
+
+**The INSERT half (the previously-unmeasured `fwd.boundary_stream`) is 0.44s
+= 8.8% of wall, ~55 ns per newly-inserted row (0.44s / 8.03M rows).** It is
+SERIAL (the RowTable is the one piece of shared mutable state; ids are
+assigned in input order). The probe half is confirmed ~free (`filter+probe
+0.0 ns/row`; hash is 8-45 ns/row and lives in the parallel prepare).
+
+Sizing the write-buffer win: the ENTIRE serial insert is 0.44s / 8.8%. A
+frozen-frontier + bulk-flush cannot beat that by more than 8.8% of wall on
+THIS in-memory profile, and only the part that is genuinely
+insert-bound (hashmap insert of new rows) is reclaimable — the candidate
+iteration and KeptLanes build stay. The real prize of freezing is
+architectural (lock-free probes + read-optimizable structure + enabling
+check-before-materialize to kill the 73% materialization), NOT the ~9%
+insert phase itself, which is small at DRAM scale and only bites on the
+mmap engine at billions of keys. Numbers here are the in-memory floor.

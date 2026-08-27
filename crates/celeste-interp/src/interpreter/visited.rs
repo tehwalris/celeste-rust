@@ -504,15 +504,30 @@ enum Engine {
     Mmap(MmapVisited),
 }
 
+/// Frozen-frontier flush for the MAP engine: buffer a frame's new rows and
+/// bulk-flush at `end_frame` instead of inserting incrementally, so
+/// mid-frame probes hit a frozen table (the mmap engine already does this).
+/// Opt-in via `CELESTE_FRONTIER_BUFFERED=1`; byte-identical either way. Off
+/// by default so no running campaign changes without asking.
+fn map_buffered_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CELESTE_FRONTIER_BUFFERED").map_or(false, |v| v != "0")
+    })
+}
+
 impl Visited {
     /// The historic in-RAM engine, no artifacts.
     pub fn in_memory() -> Self {
-        Self { dir: None, engine: Engine::Map(RowTable::default()) }
+        let mut table = RowTable::default();
+        table.set_buffered(map_buffered_on());
+        Self { dir: None, engine: Engine::Map(table) }
     }
 
     /// The historic engine, writing `.rowkeys` at each boundary so the
     /// artifacts are interchangeable with the mmap engine's.
-    pub fn map_with_dir(table: RowTable, dir: &Path) -> Self {
+    pub fn map_with_dir(mut table: RowTable, dir: &Path) -> Self {
+        table.set_buffered(map_buffered_on());
         Self { dir: Some(dir.to_path_buf()), engine: Engine::Map(table) }
     }
 
@@ -582,9 +597,17 @@ impl Visited {
     pub fn end_frame(&mut self) -> Result<()> {
         match &mut self.engine {
             Engine::Map(t) => {
-                let keys = t.take_recent();
-                let first_id = t.len() as u32 - keys.len() as u32;
-                t.end_frame();
+                let (keys, first_id) = if t.is_buffered() {
+                    // Frozen-frontier path: bulk-flush this frame's buffered
+                    // rows into the table now (they were probe-invisible all
+                    // frame). Same keys, same discovery-order ids.
+                    t.end_frame_buffered()
+                } else {
+                    let keys = t.take_recent();
+                    let first_id = t.len() as u32 - keys.len() as u32;
+                    t.end_frame();
+                    (keys, first_id)
+                };
                 if let Some(dir) = &self.dir {
                     let frame = t.watermarks().len() as u32;
                     save_frame_rowkeys(dir, frame, &keys, first_id)?;
