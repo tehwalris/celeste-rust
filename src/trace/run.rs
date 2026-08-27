@@ -128,10 +128,9 @@ impl Run {
                     b.structure.len()
                 )
             })?;
-            // One row set per outcome, made ONCE per block and reset
-            // per slice: the kernel dedups its own output, and
-            // allocating its table per slice cost more than the dedup
-            // saved (244 MB of allocation a frame).
+            // One row set per outcome, made ONCE per block and now kept
+            // CHUNK-WIDE (no per-slice reset): cross-slice duplicate
+            // successors are deduped before materialization (RowSet).
             let mut seen: Vec<celeste_engine::kernel::RowSet> =
                 (0..k.outcomes).map(|_| celeste_engine::kernel::RowSet::new()).collect();
             let mut accs: Vec<Rt2> =

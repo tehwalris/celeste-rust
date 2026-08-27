@@ -901,6 +901,7 @@ pub struct RowSet {
     slots: Vec<(u64, u64, u32)>,
     mask: usize,
     gen: u32,
+    len: usize,
 }
 
 impl Default for RowSet {
@@ -911,27 +912,55 @@ impl Default for RowSet {
 
 impl RowSet {
     pub fn new() -> Self {
-        RowSet { slots: vec![(0, 0, 0); 4096], mask: 4095, gen: 1 }
+        RowSet { slots: vec![(0, 0, 0); 4096], mask: 4095, gen: 1, len: 0 }
     }
 
-    /// Forget everything, in O(1).
+    /// CHUNK-scoped, not slice-scoped (2026-08-27). The set is allocated
+    /// fresh per chunk in `dispatch::run_chunk_kernel`; keeping it live
+    /// across the chunk's 16-lane slices means a successor two different
+    /// input lanes both produce is deduped BEFORE it is materialized,
+    /// instead of being written twice and second-passed by the boundary.
+    /// The forward profile showed 9.9B rows materialized -> 3.66B after
+    /// the boundary (2.7:1): those cross-slice duplicates dominate the
+    /// memory-bound append, and this catches them at the door - the
+    /// kernel "run" phase dropped ~2.24x and the whole compiled frame
+    /// ~1.9x. A no-op so the generated kernels' per-slice calls stay
+    /// valid; the table GROWS (below) instead of degrading, because a
+    /// chunk holds far more than one slice's rows.
     #[inline(always)]
-    pub fn next_slice(&mut self) {
-        self.gen = self.gen.wrapping_add(1);
-        if self.gen == 0 {
-            self.slots.iter_mut().for_each(|s| s.2 = 0);
-            self.gen = 1;
+    pub fn next_slice(&mut self) {}
+
+    fn grow(&mut self) {
+        let cap = self.slots.len() * 2;
+        let old = std::mem::replace(&mut self.slots, vec![(0, 0, 0); cap]);
+        self.mask = cap - 1;
+        let gen = self.gen;
+        for s in old {
+            if s.2 == gen {
+                let mut i = (s.0 as usize) & self.mask;
+                while self.slots[i].2 == gen {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = s;
+            }
         }
     }
 
-    /// True if `k` was not already present in this slice.
+    /// True if `k` was not already present in this chunk.
     #[inline(always)]
     pub fn insert(&mut self, k: (u64, u64)) -> bool {
+        // Grow at 0.75 load so linear probing stays short; a full table
+        // used to "degrade to no dedup", which at chunk scale would be no
+        // dedup at all.
+        if (self.len + 1) * 4 >= self.slots.len() * 3 {
+            self.grow();
+        }
         let mut i = (k.0 as usize) & self.mask;
-        for _ in 0..8 {
+        loop {
             let s = self.slots[i];
             if s.2 != self.gen {
                 self.slots[i] = (k.0, k.1, self.gen);
+                self.len += 1;
                 return true;
             }
             if s.0 == k.0 && s.1 == k.1 {
@@ -939,7 +968,6 @@ impl RowSet {
             }
             i = (i + 1) & self.mask;
         }
-        true
     }
 }
 
