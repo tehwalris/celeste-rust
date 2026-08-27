@@ -2126,51 +2126,66 @@ impl AbstractRun {
         let pos_obs = self.pos_obs.as_ref();
         let compiled = self.compiled;
 
-        let mut batch: Vec<State> = Vec::with_capacity(threads);
-        let mut queue = input_states.into_iter();
-        loop {
-            batch.clear();
-            for state in queue.by_ref().take(threads) {
-                batch.push(state);
-            }
-            if batch.is_empty() {
-                break;
-            }
-            type Ran = Result<(Vec<State>, FrameEventCounters)>;
-            let results: Vec<Ran> = {
-                let _t = ScopedPhase::new("fwd.interpret");
-                std::thread::scope(|scope| {
-                    let handles: Vec<_> = batch
-                        .drain(..)
-                        .map(|state| {
-                            scope.spawn(move || -> Ran {
-                                crate::interpreter::virtual_merge::set_nested_parallel(true);
-                                let mut ev = FrameEventCounters::default();
-                                let outputs = interpret_state_base(
-                                    variants, deopt, frame_cfg, fixed_env, state, &mut ev, pos_obs,
-                                    compiled,
-                                )?;
-                                Ok((outputs, ev))
-                            })
+        // Work-stealing over ALL input states (see `step_parallel`): a
+        // shared queue the `threads` workers pull from until it drains,
+        // instead of static batches with a barrier between them. There is
+        // nothing shared here (no visited table), so the only concern is
+        // ordering: `finish_phased_boundary` merges `new_states` with an
+        // order-sensitive lane layout, so results carry their input index
+        // and are reassembled in input order below - identical to the
+        // serial path no matter what order the workers finish in.
+        type Ran = Result<(usize, Vec<State>, FrameEventCounters)>;
+        let worker_results: Vec<Ran> = {
+            let _t = ScopedPhase::new("fwd.interpret");
+            let queue = std::sync::Mutex::new(input_states.into_iter().enumerate());
+            let queue = &queue;
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|_| {
+                        scope.spawn(move || -> Vec<Ran> {
+                            crate::interpreter::virtual_merge::set_nested_parallel(true);
+                            let mut local: Vec<Ran> = Vec::new();
+                            loop {
+                                let next = { queue.lock().unwrap().next() };
+                                let (idx, state) = match next {
+                                    Some(x) => x,
+                                    None => break,
+                                };
+                                local.push((|| {
+                                    let mut ev = FrameEventCounters::default();
+                                    let outputs = interpret_state_base(
+                                        variants, deopt, frame_cfg, fixed_env, state, &mut ev,
+                                        pos_obs, compiled,
+                                    )?;
+                                    Ok((idx, outputs, ev))
+                                })());
+                            }
+                            local
                         })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| match h.join() {
-                            Ok(r) => r,
-                            Err(panic) => Err(anyhow::anyhow!(
-                                "chunk-parallel frame worker: {}",
-                                panic_text(&panic)
-                            )),
-                        })
-                        .collect()
-                })
-            };
-            for result in results {
-                let (outputs, ev) = result?;
-                counters.absorb(&ev);
-                new_states.extend(outputs);
-            }
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| match h.join() {
+                        Ok(local) => local,
+                        Err(panic) => vec![Err(anyhow::anyhow!(
+                            "chunk-parallel frame worker: {}",
+                            panic_text(&panic)
+                        ))],
+                    })
+                    .collect()
+            })
+        };
+        // Reassemble in INPUT order before the order-sensitive merge.
+        let mut ordered: Vec<(usize, Vec<State>, FrameEventCounters)> =
+            Vec::with_capacity(worker_results.len());
+        for result in worker_results {
+            ordered.push(result?);
+        }
+        ordered.sort_by_key(|(idx, ..)| *idx);
+        for (_idx, outputs, ev) in ordered {
+            counters.absorb(&ev);
+            new_states.extend(outputs);
         }
         self.report_frame_events(&counters);
         self.finish_phased_boundary(new_states, frame_no)
