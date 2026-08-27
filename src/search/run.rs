@@ -689,6 +689,12 @@ fn partition_filter(
                 scope.spawn(move || {
                     let mut out: Vec<Vec<(u32, (u64, u64))>> = vec![Vec::new(); frags.len()];
                     let mut probes = 0u64;
+                    // Per-OCCURRENCE quadrant census (instrumentation only,
+                    // does not change any decision): classify every offered
+                    // occurrence on (frozen-frontier hit, within-frame dup).
+                    // Index = (frontier as usize)*2 + (wf_dup as usize).
+                    let quad = crate::interpreter::vectorize::dedup_quadrants_on();
+                    let mut qb = [0u64; 4];
                     for (fi, frag) in frags.iter().enumerate() {
                         let Some(keys) = frag else { continue };
                         for (lane, &key) in keys.iter().enumerate() {
@@ -699,9 +705,21 @@ fn partition_filter(
                             if ((key.0 >> 32) as usize) % threads != p {
                                 continue;
                             }
-                            if seen_p.insert(key) {
+                            let is_new = seen_p.insert(key);
+                            // `visited` is FROZEN mid-frame (run with
+                            // CELESTE_FRONTIER_BUFFERED=1), so this is the
+                            // frontier AS IT STOOD AT FRAME START. Probed
+                            // once per key (on the first occurrence for the
+                            // dedup, and here for every occurrence when the
+                            // quadrant census is on).
+                            let frontier =
+                                if quad || is_new { visited.contains_historic(key) } else { false };
+                            if quad {
+                                qb[(frontier as usize) * 2 + (!is_new as usize)] += 1;
+                            }
+                            if is_new {
                                 probes += 1;
-                                if !visited.contains_historic(key) {
+                                if !frontier {
                                     out[fi].push((lane as u32, key));
                                 }
                             }
@@ -709,6 +727,9 @@ fn partition_filter(
                     }
                     if census {
                         crate::interpreter::vectorize::add_global_probes(probes);
+                    }
+                    if quad {
+                        crate::interpreter::vectorize::add_quadrants(qb);
                     }
                     out
                 })
@@ -2329,6 +2350,32 @@ impl AbstractRun {
                 hash_ns as f64 / offered.max(1) as f64,
                 probe_ns as f64 / offered.max(1) as f64,
                 offered,
+            );
+        }
+        // Per-OCCURRENCE quadrant census (CELESTE_DEDUP_QUADRANTS=1): what
+        // fraction of duplicate occurrences does Option 1 (a frozen-frontier
+        // check before materialize) actually cover, counting the popular
+        // cross-frame rows' within-frame REPEATS as frontier hits (which the
+        // sequential cascade miscredits to "within-frame")?
+        if let Some(q) = crate::interpreter::vectorize::quadrants_take() {
+            // index = (frontier as usize)*2 + (wf_dup as usize)
+            let (nn, ny, yn, yy) = (q[0], q[1], q[2], q[3]);
+            let total = nn + ny + yn + yy;
+            let dups = total.saturating_sub(nn); // occurrences that are not genuinely-new-distinct
+            let opt1 = yn + yy; // frozen-frontier hits = Option 1 coverage
+            let pct = |a: u64, b: u64| 100.0 * a as f64 / b.max(1) as f64;
+            println!(
+                "  dedup quadrants (occurrences): (frontier N, wf N)={} new, \
+                 (frontier N, wf Y)={} within-frame-only, \
+                 (frontier Y, wf N)={} frontier-1st, \
+                 (frontier Y, wf Y)={} frontier-repeat; total offered {}",
+                nn, ny, yn, yy, total
+            );
+            println!(
+                "  Option 1 (frozen-frontier check) covers {} occurrences = {:.1}% of duplicates, \
+                 {:.1}% of offered; within-frame-only (needs Option 4) {} = {:.1}% of duplicates; \
+                 genuinely new {}",
+                opt1, pct(opt1, dups), pct(opt1, total), ny, pct(ny, dups), nn
             );
         }
         let visited = self.visited_rows.as_mut().expect("stream implies visited");

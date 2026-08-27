@@ -1432,6 +1432,48 @@ pub fn add_global_probes(n: u64) {
     GLOBAL_PROBES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Per-OCCURRENCE quadrant census (`CELESTE_DEDUP_QUADRANTS=1`): classifies
+/// every offered row occurrence this frame on TWO independent axes -
+///   FROZEN-FRONTIER HIT: is the key in the frontier as it stood at FRAME
+///     START (before this frame's inserts)? Read against the frozen table
+///     (run with `CELESTE_FRONTIER_BUFFERED=1`, whose map engine holds this
+///     frame's inserts out of `contains_historic` until `end_frame`).
+///   WITHIN-FRAME DUP: is this the 2nd-or-later occurrence of the key this
+///     frame? (the partition filter's frame-persistent `seen` set).
+/// Index = (frontier as usize)*2 + (wf_dup as usize):
+///   0 (N,N) genuinely new    1 (N,Y) within-frame-only (needs Option 4)
+///   2 (Y,N) frontier, 1st    3 (Y,Y) frontier, within-frame repeat
+/// Option 1 (frozen-frontier check before materialize) covers 2+3; the
+/// cascade census miscredits the popular-row repeats (3) to "within-frame".
+static QUADRANTS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+pub fn dedup_quadrants_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_DEDUP_QUADRANTS").is_some())
+}
+
+/// Add one worker's per-thread bucket tallies.
+pub fn add_quadrants(counts: [u64; 4]) {
+    for (a, c) in QUADRANTS.iter().zip(counts) {
+        a.fetch_add(c, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// This frame's four buckets, and reset. `None` when the census is off.
+pub fn quadrants_take() -> Option<[u64; 4]> {
+    if !dedup_quadrants_on() {
+        return None;
+    }
+    Some(std::array::from_fn(|i| {
+        QUADRANTS[i].swap(0, std::sync::atomic::Ordering::Relaxed)
+    }))
+}
+
 /// Phase 1a of the PARTITIONED subtract (D4, plans/dedup-roofline-plan.md):
 /// hash every lane into its row key and stop - no seen set, no visited
 /// probe. The filter runs afterwards, hash-partitioned across threads, in
