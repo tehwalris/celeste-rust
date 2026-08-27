@@ -17,8 +17,8 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 
 use crate::game_runner::{create_initial_state_with_builtins, inject_tile_flag_at_builtin};
-use crate::interpreter::glue::{interpret_cfg, interpret_prepared_cfg};
 use crate::interpreter::abstraction::make_state_abstract;
+use crate::interpreter::glue::{interpret_cfg, interpret_prepared_cfg};
 use crate::interpreter::state::State;
 use crate::interpreter::value::{HeapValue, MaybeVector, Value};
 use crate::interpreter::vectorize::vectorize_states;
@@ -138,7 +138,9 @@ fn unbox_closure_captures(state: &mut State) {
         let unboxed: Vec<Value> = captures
             .iter()
             .map(|capture| {
-                let Value::Pointer(target) = capture else { return capture.clone() };
+                let Value::Pointer(target) = capture else {
+                    return capture.clone();
+                };
                 match state.heap.get_opt(*target) {
                     Some(HeapValue::Value(value)) => {
                         changed = true;
@@ -226,7 +228,12 @@ pub fn observe_state(state: &State) -> StateObservation {
         .map(|(k, v)| (k.clone(), v.raw()))
         .collect();
 
-    StateObservation { structure, globals, rows, prints: state.prints.clone() }
+    StateObservation {
+        structure,
+        globals,
+        rows,
+        prints: state.prints.clone(),
+    }
 }
 
 /// Every vectorizable value goes to the rows - INCLUDING uniform scalars.
@@ -500,7 +507,10 @@ fn stream_boundary_prepare(
             1,
             "engine-keyed frontier (Option 1) does not support a rung split; run level 0"
         );
-        assert!(!filter_now, "engine-keyed frontier needs the partitioned filter");
+        assert!(
+            !filter_now,
+            "engine-keyed frontier needs the partitioned filter"
+        );
     }
     let mut abs_ns = t_abs.elapsed().as_nanos() as u64;
     for state in split {
@@ -511,10 +521,8 @@ fn stream_boundary_prepare(
         let state = if let Some(band) = band {
             counters.band_before += state.vector_size;
             let budget = band.horizon.saturating_sub(frame);
-            let mut coarse = crate::interpreter::abstraction::coarsen_to(
-                state.clone(),
-                band.prev_precision,
-            );
+            let mut coarse =
+                crate::interpreter::abstraction::coarsen_to(state.clone(), band.prev_precision);
             coarse.gc();
             let keys = super::sweep::row_keys(&coarse)?;
             let mask: Vec<bool> = keys
@@ -523,9 +531,7 @@ fn stream_boundary_prepare(
                     Some(id) => {
                         let e = band.prev_table.earliest_frame(id).unwrap_or(u32::MAX);
                         let g = band.g_prev[id as usize];
-                        e <= frame
-                            && g != super::sweep::G_UNREACHABLE
-                            && (g as u32) <= budget
+                        e <= frame && g != super::sweep::G_UNREACHABLE && (g as u32) <= budget
                     }
                     // TODO(soundness, band): A MISS AGAINST AN UNBANDED
                     // PREVIOUS LEVEL (i.e. k = 1, whose previous level is 0)
@@ -697,9 +703,7 @@ fn within_frame_set() -> &'static crate::compiled::dispatch::WithinFrameSet {
 /// assignment by construction), so checkpoints are interchangeable.
 fn partitioned_filter_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("CELESTE_PARTITIONED_FILTER").map_or(true, |v| v != "0")
-    })
+    *ON.get_or_init(|| std::env::var("CELESTE_PARTITIONED_FILTER").map_or(true, |v| v != "0"))
 }
 
 /// D4's filter stage: turn a batch of `Raw` fragments into `Filtered` ones
@@ -764,8 +768,11 @@ fn partition_filter(
                             // once per key (on the first occurrence for the
                             // dedup, and here for every occurrence when the
                             // quadrant census is on).
-                            let frontier =
-                                if quad || is_new { visited.contains_historic(key) } else { false };
+                            let frontier = if quad || is_new {
+                                visited.contains_historic(key)
+                            } else {
+                                false
+                            };
                             if quad {
                                 qb[(frontier as usize) * 2 + (!is_new as usize)] += 1;
                             }
@@ -850,7 +857,9 @@ fn decided_survivors(
         let keys = match keys {
             PreparedKeys::Filtered(keys) => keys,
             PreparedKeys::Raw(_) => {
-                unreachable!("a Raw fragment reached the serial phase; partition_filter must run first")
+                unreachable!(
+                    "a Raw fragment reached the serial phase; partition_filter must run first"
+                )
             }
         };
         let (survivors, before) =
@@ -1073,7 +1082,11 @@ fn frame_threads() -> usize {
 pub fn effective_chunk_cap() -> usize {
     const SERIAL_CAP: usize = 1_000_000;
     const PARALLEL_CAP: usize = 8_000;
-    let default_cap = if frame_threads() > 1 { PARALLEL_CAP } else { SERIAL_CAP };
+    let default_cap = if frame_threads() > 1 {
+        PARALLEL_CAP
+    } else {
+        SERIAL_CAP
+    };
     std::env::var("CELESTE_MAX_STATE_LANES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -1223,7 +1236,9 @@ impl CompiledForward {
             // ENGINE-keyed (Option 1) without threading them through every
             // interpret/variant/deopt path: the worker reads them right after
             // this returns, on the same thread. See `take_carried_keys`.
-            let keyed = self.engine.run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
+            let keyed = self
+                .engine
+                .run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
             let (states, keys): (Vec<State>, Vec<Option<Vec<(u64, u64)>>>) =
                 keyed.into_iter().unzip();
             set_carried_keys(keys);
@@ -1234,7 +1249,9 @@ impl CompiledForward {
             .into_iter()
             .map(|(s, _)| s)
             .collect();
-        let got = self.engine.run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
+        let got = self
+            .engine
+            .run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
         let got_states: Vec<State> = got.iter().map(|(s, _)| s.clone()).collect();
         // The comparator must compare AT THE CONFIGURED RUNG's
         // abstraction. `FrameEngine::row_key_set` funnels through
@@ -1247,11 +1264,13 @@ impl CompiledForward {
         // sound to compare across the two engines' different lane
         // groupings because every step is a per-lane function of the
         // lane's values and its state's (identical) heap structure.
-        let level0 =
-            crate::interpreter::abstraction::rem_precision_from_env()
-                == crate::interpreter::abstraction::RemPrecision::Bits(0);
+        let level0 = crate::interpreter::abstraction::rem_precision_from_env()
+            == crate::interpreter::abstraction::RemPrecision::Bits(0);
         let (want_keys, got_keys) = if level0 {
-            (self.engine.row_key_set(&reference), self.engine.row_key_set(&got_states))
+            (
+                self.engine.row_key_set(&reference),
+                self.engine.row_key_set(&got_states),
+            )
         } else {
             (
                 rung_row_key_set(&reference)
@@ -1311,9 +1330,7 @@ impl CompiledForward {
 /// (`split_precision_straddles` + `make_state_abstract`), then
 /// `sweep::row_keys` per surviving state. This is check mode's comparator
 /// at every rung above Bits(0) - see the call site.
-fn rung_row_key_set(
-    states: &[State],
-) -> Result<rustc_hash::FxHashSet<(u64, u64)>> {
+fn rung_row_key_set(states: &[State]) -> Result<rustc_hash::FxHashSet<(u64, u64)>> {
     let mut keys: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
     for s in states {
         if s.vector_size == 0 {
@@ -1453,7 +1470,11 @@ fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward
     );
     println!(
         "compiled forward engine ENABLED ({}), program {}",
-        if check { "check mode: both paths, row-key sets compared" } else { "compiled only" },
+        if check {
+            "check mode: both paths, row-key sets compared"
+        } else {
+            "compiled only"
+        },
         COMPILE_RECIPE
     );
     Ok(Some(engine))
@@ -1461,9 +1482,7 @@ fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward
 
 impl AbstractRun {
     pub fn start(program: &Program) -> Result<Self> {
-        crate::interpreter::vectorize::set_merge_partition_patterns(
-            &program.merge_partition_cells,
-        );
+        crate::interpreter::vectorize::set_merge_partition_patterns(&program.merge_partition_cells);
         let fixed_env = program.fixed_env();
         let initial = create_initial_state_with_builtins(&fixed_env);
         let init_states = interpret_cfg(program.init_cfg().clone(), initial, &fixed_env)
@@ -1472,9 +1491,8 @@ impl AbstractRun {
         for state in &mut states {
             inject_tile_flag_at_builtin(state);
         }
-        let frame_cfg = crate::interpreter::fixed_env::PreparedCfg::new(
-            program.frame_cfg().clone(),
-        );
+        let frame_cfg =
+            crate::interpreter::fixed_env::PreparedCfg::new(program.frame_cfg().clone());
         let visited_rows = if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
             println!("frontier-only search ENABLED (128-bit hashed visited set)");
             Some(crate::interpreter::visited::Visited::in_memory())
@@ -1520,9 +1538,7 @@ impl AbstractRun {
     ) -> Result<Self> {
         let mut run = Self::start(program)?;
         run.deopt = Some(DeoptTarget {
-            plain_cfg: crate::interpreter::fixed_env::PreparedCfg::new(
-                plain.frame_cfg().clone(),
-            ),
+            plain_cfg: crate::interpreter::fixed_env::PreparedCfg::new(plain.frame_cfg().clone()),
             plain_env: plain.fixed_env(),
             mapping,
             force,
@@ -1572,9 +1588,9 @@ impl AbstractRun {
     /// (states, lanes, fallbacks) run under shape variants so far.
     /// Fallbacks should be zero; see `VariantDispatch::total_fallbacks`.
     pub fn variant_events(&self) -> (usize, usize, usize) {
-        self.variants
-            .as_ref()
-            .map_or((0, 0, 0), |v| (v.total_events.0, v.total_events.1, v.total_fallbacks))
+        self.variants.as_ref().map_or((0, 0, 0), |v| {
+            (v.total_events.0, v.total_events.1, v.total_fallbacks)
+        })
     }
 
     /// The frontier visited set, when frontier-only search is enabled.
@@ -1587,7 +1603,9 @@ impl AbstractRun {
     /// in-RAM map for the fp-run + mmap engine (fresh runs only; resumes
     /// hand a ready engine to `restore`). Call before the first `step`.
     pub fn configure_visited_dir(&mut self, dir: &std::path::Path) {
-        let Some(v) = self.visited_rows.as_mut() else { return };
+        let Some(v) = self.visited_rows.as_mut() else {
+            return;
+        };
         if crate::interpreter::visited::mmap_engine_selected() {
             assert!(v.is_empty(), "engine swap after frames were recorded");
             *v = crate::interpreter::visited::Visited::mmap_new(dir);
@@ -1676,10 +1694,9 @@ impl AbstractRun {
             if keep == state.vector_size {
                 kept.push(state);
             } else if keep > 0 {
-                kept.push(state.filter_by_mask_clone(
-                    &mask,
-                    crate::interpreter::state::FILTER_BAND,
-                ));
+                kept.push(
+                    state.filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_BAND),
+                );
             }
         }
         self.states = kept;
@@ -1699,8 +1716,16 @@ impl AbstractRun {
         if visited.is_some() != self.visited_rows.is_some() {
             return Err(anyhow::anyhow!(
                 "checkpoint frontier state ({}) does not match this run ({})",
-                if visited.is_some() { "present" } else { "absent" },
-                if self.visited_rows.is_some() { "enabled" } else { "disabled" },
+                if visited.is_some() {
+                    "present"
+                } else {
+                    "absent"
+                },
+                if self.visited_rows.is_some() {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
             ));
         }
         self.states = states;
@@ -1878,129 +1903,145 @@ impl AbstractRun {
         // worker-scoped sets were measured 8.5x and 1.46x weaker).
         let mut partition_seen: Vec<rustc_hash::FxHashSet<(u64, u64)>> =
             (0..threads).map(|_| Default::default()).collect();
-        let mut batch: Vec<State> = Vec::with_capacity(threads);
-        let mut queue = input_states.into_iter();
-        loop {
-            batch.clear();
-            for state in queue.by_ref().take(threads) {
-                batch.push(state);
+        // Work-stealing over ALL input states: a shared queue the workers
+        // pull from until it drains, instead of static batches of `threads`
+        // with a barrier between them. The barrier made every batch wait on
+        // its slowest chunk (~1.6 s of load imbalance at f50); pulling one
+        // chunk at a time balances dynamically and drops the per-batch
+        // barrier. Each result carries its input index and is reassembled in
+        // input order below, so the partition filter's candidate order - and
+        // thus the surviving lane - is byte-identical to the serial path no
+        // matter what order the workers finish in.
+        //
+        // The partitioned filter (D4): workers only HASH their fragments; the
+        // seen+probe filter runs after the join, hash-partitioned across
+        // threads with sets that persist for the whole frame.
+        // CELESTE_PARTITIONED_FILTER=0 restores the classic in-worker filter
+        // (identical results either way; the classic path re-probes every new
+        // key once per fragment it appears in, ~8x - see BENCHMARK_DATA.md
+        // "Dedup roofline").
+        type Prepared = Result<(usize, Vec<PreparedRows>, FrameEventCounters, StreamCounters)>;
+        let worker_results: Vec<Prepared> = {
+            let _t = ScopedPhase::new("fwd.interpret");
+            let visited_ro: &crate::interpreter::visited::Visited = self
+                .visited_rows
+                .as_ref()
+                .expect("stream implies a visited table");
+            // Option 4: point the frame's chunks at a SHARED within-frame set
+            // so a successor a sibling chunk already emitted is skipped before
+            // materialization. Frozen frontier required (same reason as
+            // Option 1); races are sound (see `WithinFrameSet`). It now spans
+            // the WHOLE frame rather than resetting per batch, so it skips
+            // more already-emitted rows before materialization - same final
+            // rows, less work.
+            let wf_active = visited_ro.is_frozen();
+            if wf_active {
+                let set = within_frame_set();
+                set.clear();
+                crate::compiled::dispatch::set_within_frame(set);
             }
-            if batch.is_empty() {
-                break;
-            }
-            // The partitioned filter (D4): workers only HASH their
-            // fragments; the seen+probe filter runs after the join,
-            // hash-partitioned across threads with sets that persist for
-            // the whole frame. CELESTE_PARTITIONED_FILTER=0 restores the
-            // classic in-worker filter (identical results either way; the
-            // classic path re-probes every new key once per fragment it
-            // appears in, ~8x - see BENCHMARK_DATA.md "Dedup roofline").
-            type Prepared = Result<(Vec<PreparedRows>, FrameEventCounters, StreamCounters)>;
-            let results: Vec<Prepared> = {
-                let _t = ScopedPhase::new("fwd.interpret");
-                let visited_ro: &crate::interpreter::visited::Visited = self
-                    .visited_rows
-                    .as_ref()
-                    .expect("stream implies a visited table");
-                // Option 4: point the frame's chunks at a SHARED within-frame
-                // set so a successor a sibling chunk already emitted is skipped
-                // before materialization. Frozen frontier required (same reason
-                // as Option 1); races are sound (see `WithinFrameSet`).
-                // The shared within-frame set is set for every frozen-frontier frame.
-                let wf_active = visited_ro.is_frozen();
-                if wf_active {
-                    let set = within_frame_set();
-                    set.clear();
-                    crate::compiled::dispatch::set_within_frame(set);
-                }
-                let scope_out = std::thread::scope(|scope| {
-                    let handles: Vec<_> = batch
-                        .drain(..)
-                        .map(|state| {
-                            scope.spawn(move || -> Prepared {
-                                // This thread IS the parallelism; the row
-                                // hashing inside must not fan out again.
-                                crate::interpreter::virtual_merge::set_nested_parallel(true);
-                                let mut ev = FrameEventCounters::default();
-                                let mut sc = StreamCounters::default();
-                                let t0 = std::time::Instant::now();
-                                // Option 1: point this
-                                // thread's kernels at the FROZEN frontier so they
-                                // skip materializing rows already in it. Requires a
-                                // frozen frontier (buffered/mmap); else a mid-frame
-                                // probe would be timing-dependent, so we do not set
-                                // it (no skip, still sound and byte-identical).
-                                let _fg = visited_ro
-                                    .is_frozen()
-                                    .then(|| crate::compiled::dispatch::with_frozen_frontier(visited_ro));
-                                let outputs = interpret_state_base(
-                                    variants, deopt, frame_cfg, fixed_env, state, &mut ev,
-                                    pos_obs, compiled,
-                                )?;
-                                drop(_fg);
-                                // Engine keys the compiled body carried for these
-                                // outputs (Option 1). Empty on the interpreter path.
-                                let carried = take_carried_keys();
-                                let use_carried = !carried.is_empty();
-                                let t1 = std::time::Instant::now();
-                                let mut prepared = Vec::new();
-                                for (oi, out) in outputs.into_iter().enumerate() {
-                                    let ck = if use_carried {
-                                        carried.get(oi).cloned().flatten()
-                                    } else {
-                                        None
-                                    };
-                                    prepared.extend(stream_boundary_prepare(
-                                        out,
-                                        band,
-                                        frame_no,
-                                        &mut sc,
-                                        visited_ro,
-                                        !partitioned,
-                                        ck,
-                                    )?);
-                                }
-                                add_worker_ns(WORKER_BODY, (t1 - t0).as_nanos() as u64);
-                                add_worker_ns(
-                                    WORKER_PREPARE,
-                                    t1.elapsed().as_nanos() as u64,
-                                );
-                                Ok((prepared, ev, sc))
-                            })
+            let queue = std::sync::Mutex::new(input_states.into_iter().enumerate());
+            let queue = &queue;
+            let scope_out = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|_| {
+                        scope.spawn(move || -> Vec<Prepared> {
+                            // This thread IS the parallelism; the row hashing
+                            // inside must not fan out again.
+                            crate::interpreter::virtual_merge::set_nested_parallel(true);
+                            // Option 1: point this worker's kernels at the
+                            // FROZEN frontier so they skip materializing rows
+                            // already in it. Held for the worker's whole life
+                            // (it processes many chunks); sound only because
+                            // the frontier is frozen for the frame, else a
+                            // mid-frame probe would be timing-dependent.
+                            let _fg = visited_ro.is_frozen().then(|| {
+                                crate::compiled::dispatch::with_frozen_frontier(visited_ro)
+                            });
+                            let mut local: Vec<Prepared> = Vec::new();
+                            loop {
+                                let next = { queue.lock().unwrap().next() };
+                                let (idx, state) = match next {
+                                    Some(x) => x,
+                                    None => break,
+                                };
+                                local.push((|| {
+                                    let mut ev = FrameEventCounters::default();
+                                    let mut sc = StreamCounters::default();
+                                    let t0 = std::time::Instant::now();
+                                    let outputs = interpret_state_base(
+                                        variants, deopt, frame_cfg, fixed_env, state, &mut ev,
+                                        pos_obs, compiled,
+                                    )?;
+                                    // Engine keys the compiled body carried for
+                                    // these outputs (Option 1). Empty on the
+                                    // interpreter path.
+                                    let carried = take_carried_keys();
+                                    let use_carried = !carried.is_empty();
+                                    let t1 = std::time::Instant::now();
+                                    let mut prepared = Vec::new();
+                                    for (oi, out) in outputs.into_iter().enumerate() {
+                                        let ck = if use_carried {
+                                            carried.get(oi).cloned().flatten()
+                                        } else {
+                                            None
+                                        };
+                                        prepared.extend(stream_boundary_prepare(
+                                            out,
+                                            band,
+                                            frame_no,
+                                            &mut sc,
+                                            visited_ro,
+                                            !partitioned,
+                                            ck,
+                                        )?);
+                                    }
+                                    add_worker_ns(WORKER_BODY, (t1 - t0).as_nanos() as u64);
+                                    add_worker_ns(WORKER_PREPARE, t1.elapsed().as_nanos() as u64);
+                                    Ok((idx, prepared, ev, sc))
+                                })());
+                            }
+                            drop(_fg);
+                            local
                         })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| match h.join() {
-                            Ok(r) => r,
-                            // A worker panicked. The serial path lets the
-                            // panic unwind into the deopt handler; here the
-                            // frame is already past that point, so surface
-                            // it as an error rather than losing the chunk.
-                            Err(panic) => Err(anyhow::anyhow!(
-                                "chunk-parallel frame worker: {}",
-                                panic_text(&panic)
-                            )),
-                        })
-                        .collect()
-                });
-                if wf_active {
-                    crate::compiled::dispatch::clear_within_frame();
-                }
-                scope_out
-            };
-            // Collect the batch's fragments in input order first: the
-            // partition filter wants the whole batch (its threads scan
-            // fragments in this order, which is what makes its candidate
-            // order the serial order), and the serial phase then walks the
-            // same list.
-            let mut all_prepared: Vec<PreparedRows> = Vec::new();
-            for result in results {
-                let (prepared, ev, sc) = result?;
-                counters.absorb(&ev);
-                stream_counters.absorb(&sc);
-                all_prepared.extend(prepared);
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| match h.join() {
+                        Ok(local) => local,
+                        // A worker panicked. The serial path lets the panic
+                        // unwind into the deopt handler; here the frame is
+                        // already past that point, so surface it as an error
+                        // rather than losing the chunk.
+                        Err(panic) => vec![Err(anyhow::anyhow!(
+                            "chunk-parallel frame worker: {}",
+                            panic_text(&panic)
+                        ))],
+                    })
+                    .collect()
+            });
+            if wf_active {
+                crate::compiled::dispatch::clear_within_frame();
             }
+            scope_out
+        };
+        // Reassemble in INPUT order (workers finish out of order): the
+        // partition filter scans fragments in this order, and that order is
+        // what makes its surviving lane identical to the serial path.
+        let mut ordered: Vec<(usize, Vec<PreparedRows>, FrameEventCounters, StreamCounters)> =
+            Vec::with_capacity(worker_results.len());
+        for result in worker_results {
+            ordered.push(result?);
+        }
+        ordered.sort_by_key(|(idx, ..)| *idx);
+        let mut all_prepared: Vec<PreparedRows> = Vec::new();
+        for (_idx, prepared, ev, sc) in ordered {
+            counters.absorb(&ev);
+            stream_counters.absorb(&sc);
+            all_prepared.extend(prepared);
+        }
+        {
             if partitioned {
                 let _t = ScopedPhase::new("fwd.partition_filter");
                 let visited_ro: &crate::interpreter::visited::Visited = self
@@ -2106,8 +2147,8 @@ impl AbstractRun {
                                 crate::interpreter::virtual_merge::set_nested_parallel(true);
                                 let mut ev = FrameEventCounters::default();
                                 let outputs = interpret_state_base(
-                                    variants, deopt, frame_cfg, fixed_env, state, &mut ev,
-                                    pos_obs, compiled,
+                                    variants, deopt, frame_cfg, fixed_env, state, &mut ev, pos_obs,
+                                    compiled,
                                 )?;
                                 Ok((outputs, ev))
                             })
@@ -2134,7 +2175,6 @@ impl AbstractRun {
         self.report_frame_events(&counters);
         self.finish_phased_boundary(new_states, frame_no)
     }
-
 }
 
 /// One input state's whole frame: shape dispatch first (a state whose
@@ -2196,14 +2236,22 @@ pub fn print_worker_phase_times() {
     for (name, v) in [
         ("frame body", ns[WORKER_BODY]),
         ("  ...deopt input snapshot", ns[WORKER_SNAPSHOT]),
-        ("  ...deopt origin-tagged specialized run", ns[WORKER_TAGGED]),
+        (
+            "  ...deopt origin-tagged specialized run",
+            ns[WORKER_TAGGED],
+        ),
         ("  ...deopt re-run (plain program)", ns[WORKER_DEOPT]),
         ("boundary prepare", ns[WORKER_PREPARE]),
         ("  ...abstract", ns[WORKER_ABSTRACT]),
         ("  ...gc", ns[WORKER_GC]),
         ("  ...row keys + visited probe", ns[WORKER_KEYS]),
     ] {
-        println!("  {:<30} {:8.2}s  {:5.1}%", name, v as f64 / 1e9, 100.0 * v as f64 / total);
+        println!(
+            "  {:<30} {:8.2}s  {:5.1}%",
+            name,
+            v as f64 / 1e9,
+            100.0 * v as f64 / total
+        );
     }
 }
 
@@ -2312,13 +2360,12 @@ fn interpret_state_base(
                 let t_snap = std::time::Instant::now();
                 let snapshot = state.clone();
                 add_worker_ns(WORKER_SNAPSHOT, t_snap.elapsed().as_nanos() as u64);
-                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    match compiled {
+                let attempt =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match compiled {
                         Some(c) => c.run_chunk(frame_cfg, fixed_env, state),
                         None => interpret_prepared_cfg(frame_cfg, state, fixed_env)
                             .map(|r| r.into_iter().map(|(s, _)| s).collect()),
-                    }
-                }));
+                    }));
                 match attempt {
                     Ok(Ok(result)) => new_states.extend(result),
                     Ok(Err(err)) => {
@@ -2484,7 +2531,12 @@ impl AbstractRun {
                 "  Option 1 (frozen-frontier check) covers {} occurrences = {:.1}% of duplicates, \
                  {:.1}% of offered; within-frame-only (needs Option 4) {} = {:.1}% of duplicates; \
                  genuinely new {}",
-                opt1, pct(opt1, dups), pct(opt1, total), ny, pct(ny, dups), nn
+                opt1,
+                pct(opt1, dups),
+                pct(opt1, total),
+                ny,
+                pct(ny, dups),
+                nn
             );
         }
         let visited = self.visited_rows.as_mut().expect("stream implies visited");
@@ -2536,30 +2588,25 @@ impl AbstractRun {
     /// level's band (phased path; the streaming path does this per state in
     /// `stream_boundary_one`).
     fn apply_band_filter(&mut self, frame: u32) -> Result<()> {
-        let Some(band) = &self.band else { return Ok(()) };
+        let Some(band) = &self.band else {
+            return Ok(());
+        };
         let budget = band.horizon.saturating_sub(frame);
         let mut kept_states = Vec::new();
         let (mut before, mut after, mut missing) = (0usize, 0usize, 0usize);
         for state in std::mem::take(&mut self.states) {
             before += state.vector_size;
-            let mut coarse = crate::interpreter::abstraction::coarsen_to(
-                state.clone(),
-                band.prev_precision,
-            );
+            let mut coarse =
+                crate::interpreter::abstraction::coarsen_to(state.clone(), band.prev_precision);
             coarse.gc();
             let keys = super::sweep::row_keys(&coarse)?;
             let mask: Vec<bool> = keys
                 .iter()
                 .map(|k| match band.prev_table.id_of(*k) {
                     Some(id) => {
-                        let e = band
-                            .prev_table
-                            .earliest_frame(id)
-                            .unwrap_or(u32::MAX);
+                        let e = band.prev_table.earliest_frame(id).unwrap_or(u32::MAX);
                         let g = band.g_prev[id as usize];
-                        e <= frame
-                            && g != super::sweep::G_UNREACHABLE
-                            && (g as u32) <= budget
+                        e <= frame && g != super::sweep::G_UNREACHABLE && (g as u32) <= budget
                     }
                     None => {
                         // Sound to drop: the coarse row was never even
@@ -2577,10 +2624,9 @@ impl AbstractRun {
             if kept == state.vector_size {
                 kept_states.push(state);
             } else if kept > 0 {
-                kept_states.push(state.filter_by_mask_clone(
-                    &mask,
-                    crate::interpreter::state::FILTER_BAND,
-                ));
+                kept_states.push(
+                    state.filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_BAND),
+                );
             }
         }
         self.states = kept_states;
@@ -2600,7 +2646,9 @@ impl AbstractRun {
     /// Frontier-only subtract (phased path): drop lanes whose row was seen
     /// in any earlier frame, and record this frame's rows.
     fn subtract_frontier(&mut self) -> Result<()> {
-        let Some(visited) = self.visited_rows.as_mut() else { return Ok(()) };
+        let Some(visited) = self.visited_rows.as_mut() else {
+            return Ok(());
+        };
         let (kept, before, after) = crate::interpreter::vectorize::subtract_visited(
             std::mem::take(&mut self.states),
             visited,
@@ -2608,7 +2656,9 @@ impl AbstractRun {
         visited.end_frame()?;
         println!(
             "  frontier-only: {} -> {} new lanes, visited total {}",
-            before, after, visited.len()
+            before,
+            after,
+            visited.len()
         );
         self.states = kept;
         Ok(())
@@ -2783,9 +2833,7 @@ fn run_deopt_frame_granular(
     }
 
     if !in_range || !covered.iter().all(|c| *c) {
-        println!(
-            "  deopt: lane accounting mismatch on the retry; whole-state fallback"
-        );
+        println!("  deopt: lane accounting mismatch on the retry; whole-state fallback");
         return Ok((run_deopt_frame(deopt, snapshot)?, n));
     }
 
@@ -2846,7 +2894,10 @@ fn log_deopt(frame_events: &mut (usize, usize), state: &State, reason: &str) {
     if frame_events.0 == 1 {
         let one_line = reason.replace('\n', " | ");
         let short: String = one_line.chars().take(240).collect();
-        println!("  deopt trigger (state of {} lanes): {}", state.vector_size, short);
+        println!(
+            "  deopt trigger (state of {} lanes): {}",
+            state.vector_size, short
+        );
     }
 }
 
@@ -2859,4 +2910,3 @@ fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> String {
         "panic with a non-string payload".to_string()
     }
 }
-
