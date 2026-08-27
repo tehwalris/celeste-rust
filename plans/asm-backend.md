@@ -259,3 +259,88 @@ building only if the hashing kernels are chosen for the asm backend on
 compile-time grounds and the 27% is then bought back. For a kernel that is
 NOT this hashing-dense, the port roofline is looser and parity is more likely
 out of the box.
+
+## Milestone 1: full value + hash DAG op coverage (2026-08-27)
+
+The backend now lowers EVERY op a real kernel DAG contains, each gated
+bit-exact against the corresponding `celeste_engine::kernel` primitive on
+synthetic graphs (6 `#[test]`s, all green, warning-free). Verified against
+the actual primitive census over all three generated rooms.
+
+### Representation model (all in the zmm class - no new register class)
+
+| graph value | asm | registers |
+|---|---|---|
+| `ZN` number | i32 lanes | 1 zmm |
+| `ZI` interval | lo/hi planes | 2 zmm |
+| `ZB` tri-state bool | **vector masks** (per-lane 0/0xFFFFFFFF) val/known | 2 zmm |
+| `ZW` word | u64 halves | 2 zmm |
+
+Keeping `ZB` as vector masks (not k-registers) was the key call: the whole
+boolean layer - the bulk of a kernel (`zb_holds` 160k, `zsel_n` 23k,
+`zb_and` 19k across the rooms) - reuses the existing allocator, scheduler,
+spill and remat, with only a single fixed scratch k-reg (`k1`) touched
+transiently inside a compare or blend.
+
+### Op classes covered, and how
+
+- **Arithmetic** `Add/Sub/Min/Max/Neg/Abs/Flr` (`vpaddd/…`), `Mul` (native
+  even/odd `vpmuldq` weave = `zn_mul`).
+- **Comparisons** `Lt/Le/Gt/Ge/Eq` -> `vpcmpd` to k1 -> `vpmovm2d` to a
+  vector mask (`zn_*`); interval `Eq` folds to a numeric compare.
+- **Tri-state bool** `And/Or/Not/Eq/Known` via `vpand/por/pxor/pandn`
+  matching the Kleene formulas in `zb_*`.
+- **Select** `Sel` (all widths `zsel_n/b/i`) via `vpternlogd $0xca` on the
+  condition's val plane (join-on-unknown handled by the mask algebra).
+- **Intervals** `zi_add/sub/min/max/neg/abs`, `Span`, `Flr` (`zi_flr`),
+  interval compare (`zi_cmp`), `Frag/FragOk/SplitOk` (`zi_fork_flr` /
+  `zi_span_ok`), `Known(Flr(interval))` -> `zi_flr_ok`. Wide `Const` -> `ZI`.
+- **Hash bridge** `Bits` of number/interval/bool (`zw_bits_n/i/b`) so the
+  value layer feeds the row-key fold; `Word`/`Mix` as before.
+- **Call-outs** `Div/Rem/Sin/Mget/TileFlagAt` (below).
+
+### The call-out ABI (the one genuinely hard interface)
+
+`Div/Rem/Sin` (scalar per-lane even in the Rust primitives) and the
+collision look-ups `Mget/TileFlagAt` (a cart/cache query mid-DAG) are
+emitted as a `call` through an `AsmCtx` of function pointers - the kernel's
+THIRD argument. Design:
+
+- Loads/stores move to callee-saved `r13` (inputs) / `r14` (outputs); the
+  ctx sits in `r15`. So a mid-DAG `call` may freely clobber `rdi/rsi/rdx`.
+  The prologue pushes r13/r14/r15 (also making rsp 16-aligned for calls).
+- Each SIMD operand is marshalled through a stack buffer; the wrapper
+  (`callout.rs`) reads it, invokes the EXACT kernel primitive, and writes
+  the result back - so the answer is bit-identical by construction. `Div/
+  Rem/Sin/Mget` return a `ZN` (64-byte buffer); `TileFlag` returns a `u16`
+  mask that is re-expanded to a vector mask via `kmovw`+`vpmovm2d`.
+- A call clobbers every vector register, so the emitter saves all 32 zmm to
+  a stack save-area before the call and restores them after (a spilled live
+  value is in my frame, untouched by the callee). This is correctness-first
+  and slow for collision-heavy kernels; a future pass can save only the live
+  registers. `Mget`/`TileFlagAt` take the cart/cache via `AsmCtx::env`
+  (a `CollisionEnv`); the collision test wires the REAL `CartData`/
+  `CollisionCache` and matches `zn_mget`/`zn_tile_flag_at` bit-exact.
+
+### What the DAG does NOT contain (so it is not built / not load-bearing)
+
+Confirmed by census over all three rooms:
+
+- `zi_mul_pos` / `zi_div_pos` (interval * / / positive scalar): **zero
+  sites** - NOT implemented; interval `Mul`/`Div` raise a clean emit-time
+  error if ever encountered.
+- `zn_sin`: **zero sites** - implemented (call-out) and tested anyway.
+- `zn_tile_flag_at_lanes` (per-lane hitbox): **zero sites** - the codegen
+  path (`CallOp::TileFlagLanes`) and wrapper exist but are UNTESTED with a
+  cart; the created-object frame that needs it is not among the generated
+  kernels.
+- `zi_min/max/neg/abs`, `zi_flr_ok`: zero sites - implemented + tested
+  (cheap, and they fell out of the interval layer).
+- `Free`/`Split`/`SplitValid`: eliminated by `specialize_into` before
+  codegen (as in `lower.rs`), so codegen never sees them.
+
+### Non-replicated error paths (documented, not hit by valid kernels)
+
+- `zi_add`/`zi_sub` PANIC on overflow in the Rust primitive (scalar
+  fallback); the asm wraps silently. Valid kernels never overflow here; the
+  interval test uses bounded inputs.

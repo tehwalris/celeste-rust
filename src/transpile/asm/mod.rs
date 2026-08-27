@@ -7,10 +7,12 @@
 //! against the graph -> Rust -> rustc+LLVM path. It is not wired into any
 //! kernel; `super::tests` is its correctness gate.
 
+mod callout;
 mod codegen;
 mod jit;
 
-pub use codegen::{compile, Compiled};
+pub use callout::{AsmCtx, CollisionEnv};
+pub use codegen::{compile, Compiled, RootKind};
 pub use jit::{assemble, KernelFn, Loaded};
 
 use anyhow::Result;

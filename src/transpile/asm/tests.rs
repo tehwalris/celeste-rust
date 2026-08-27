@@ -4,14 +4,21 @@
 //! equivalent of the identical graph and compares compile-time and runtime.
 
 use std::collections::HashMap;
+
+const ONE_FIXED2: i32 = 0x0002_0000; // +2.0 in 16.16
 use std::fmt::Write as _;
 
 use celeste_engine::kernel::{
-    zn_abs, zn_add, zn_flr, zn_max, zn_min, zn_neg, zn_sub, zw_bits_n, zw_mix1, zw_mix2, zw_splat,
-    ZN, ZW,
+    zb_and, zb_eq, zb_not, zb_or, zi_abs, zi_add, zi_cmp, zi_flr, zi_fork_flr, zi_max, zi_min,
+    zi_neg, zi_span_ok, zi_sub, zn_abs, zn_add, zn_eq, zn_flr, zn_ge, zn_gt, zn_le, zn_lt, zn_max,
+    zn_min, zn_mul, zn_neg, zn_sub, zsel_b, zsel_i, zsel_n, zw_bits_b, zw_bits_i, zw_bits_n,
+    zn_div, zn_mget, zn_rem, zn_sin, zn_tile_flag_at, zw_mix1, zw_mix2, zw_splat, Cmp, ZB, ZI,
+    ZN, ZW, ALL,
 };
 
 use crate::pico8_num::Pico8Num as P8;
+use celeste_core::cart_data::CartData;
+use celeste_core::collision_cache::CollisionCache;
 use crate::transpile::asm::compile_and_load;
 use crate::transpile::graph::{Graph, NodeId, Op};
 
@@ -51,54 +58,171 @@ fn pack_inputs(input_cells: &[u32], cols: &HashMap<u32, [i32; 16]>) -> Vec<u8> {
     buf
 }
 
-/// Independent oracle: evaluate the graph with the REAL kernel primitives.
-fn oracle(g: &Graph, roots: &[NodeId], cols: &HashMap<u32, [i32; 16]>) -> Vec<[u64; 16]> {
-    enum V {
-        N(ZN),
-        W(ZW),
-    }
+/// A node's abstract value in the reference evaluator.
+#[derive(Clone, Copy)]
+enum V {
+    N(ZN),
+    B(ZB),
+    I(ZI),
+    W(ZW),
+}
+
+/// Evaluate every node with the REAL `celeste_engine::kernel` primitives.
+fn eval_nodes(
+    g: &Graph,
+    cols: &HashMap<u32, [i32; 16]>,
+    room: Option<(&CartData, &CollisionCache)>,
+) -> Vec<V> {
     let zn_of = |col: &[i32; 16]| ZN::from_array(std::array::from_fn(|i| P8::from_raw(col[i])));
-    let mut vals: Vec<Option<V>> = Vec::with_capacity(g.len());
+    let mut vals: Vec<V> = Vec::with_capacity(g.len());
     for id in 0..g.len() as NodeId {
         let node = g.get(id);
         let n = |k: usize| -> ZN {
-            match vals[node.args[k] as usize].as_ref().unwrap() {
-                V::N(z) => *z,
-                V::W(_) => panic!("node {id}: expected numeric operand"),
+            match vals[node.args[k] as usize] {
+                V::N(z) => z,
+                _ => panic!("node {id}: expected numeric operand"),
+            }
+        };
+        let b = |k: usize| -> ZB {
+            match vals[node.args[k] as usize] {
+                V::B(z) => z,
+                _ => panic!("node {id}: expected boolean operand"),
+            }
+        };
+        let iv = |k: usize| -> ZI {
+            match vals[node.args[k] as usize] {
+                V::I(z) => z,
+                V::N(z) => ZI { lo: z, hi: z },
+                _ => panic!("node {id}: expected interval operand"),
             }
         };
         let w = |k: usize| -> ZW {
-            match vals[node.args[k] as usize].as_ref().unwrap() {
-                V::W(z) => *z,
-                V::N(_) => panic!("node {id}: expected word operand"),
+            match vals[node.args[k] as usize] {
+                V::W(z) => z,
+                _ => panic!("node {id}: expected word operand"),
             }
         };
+        let dom_bool = |k: usize| matches!(vals[node.args[k] as usize], V::B(_));
+        let is_i = |k: usize| matches!(vals[node.args[k] as usize], V::I(_));
+        let wide = |k: usize| is_i(k);
         let v = match &node.op {
             Op::Const(lo, hi) => {
-                assert_eq!(lo, hi);
-                V::N(ZN::from_array([P8::from_raw(*lo); 16]))
+                if lo == hi {
+                    V::N(ZN::from_array([P8::from_raw(*lo); 16]))
+                } else {
+                    V::I(ZI { lo: ZN::from_array([P8::from_raw(*lo); 16]), hi: ZN::from_array([P8::from_raw(*hi); 16]) })
+                }
             }
+            Op::ConstBool(x) => V::B(ZB { val: if *x { ALL } else { 0 }, known: ALL }),
             Op::Cell(c) => V::N(zn_of(&cols[c])),
+            Op::Add if wide(0) || wide(1) => V::I(zi_add(iv(0), iv(1))),
+            Op::Sub if wide(0) || wide(1) => V::I(zi_sub(iv(0), iv(1))),
+            Op::Min if wide(0) || wide(1) => V::I(zi_min(iv(0), iv(1))),
+            Op::Max if wide(0) || wide(1) => V::I(zi_max(iv(0), iv(1))),
             Op::Add => V::N(zn_add(n(0), n(1))),
             Op::Sub => V::N(zn_sub(n(0), n(1))),
             Op::Min => V::N(zn_min(n(0), n(1))),
             Op::Max => V::N(zn_max(n(0), n(1))),
+            Op::Mul => V::N(zn_mul(n(0), n(1))),
+            Op::Div => V::N(zn_div(n(0), n(1))),
+            Op::Rem => V::N(zn_rem(n(0), n(1))),
+            Op::Sin => V::N(zn_sin(n(0))),
+            Op::Neg if wide(0) => V::I(zi_neg(iv(0))),
+            Op::Abs if wide(0) => V::I(zi_abs(iv(0))),
             Op::Neg => V::N(zn_neg(n(0))),
             Op::Abs => V::N(zn_abs(n(0))),
+            Op::Flr if wide(0) => V::N(zi_flr(iv(0))),
             Op::Flr => V::N(zn_flr(n(0))),
+            Op::Lt if wide(0) || wide(1) => V::B(zi_cmp(Cmp::Lt, iv(0), iv(1))),
+            Op::Le if wide(0) || wide(1) => V::B(zi_cmp(Cmp::Le, iv(0), iv(1))),
+            Op::Gt if wide(0) || wide(1) => V::B(zi_cmp(Cmp::Gt, iv(0), iv(1))),
+            Op::Ge if wide(0) || wide(1) => V::B(zi_cmp(Cmp::Ge, iv(0), iv(1))),
+            Op::Lt => V::B(zn_lt(n(0), n(1))),
+            Op::Le => V::B(zn_le(n(0), n(1))),
+            Op::Gt => V::B(zn_gt(n(0), n(1))),
+            Op::Ge => V::B(zn_ge(n(0), n(1))),
+            Op::Eq => {
+                if dom_bool(0) {
+                    V::B(zb_eq(b(0), b(1)))
+                } else {
+                    V::B(zn_eq(n(0), n(1)))
+                }
+            }
+            Op::Not => V::B(zb_not(b(0))),
+            Op::And => V::B(zb_and(b(0), b(1))),
+            Op::Or => V::B(zb_or(b(0), b(1))),
+            Op::Known => {
+                // Known(Flr(interval)) reads the interval (zi_flr_ok).
+                let inner = node.args[0] as usize;
+                let flr_over_ival = matches!(g.get(inner as u32).op, Op::Flr)
+                    && matches!(vals[g.get(inner as u32).args[0] as usize], V::I(_));
+                if flr_over_ival {
+                    let src = g.get(inner as u32).args[0] as usize;
+                    if let V::I(z) = vals[src] {
+                        let fl = zn_flr(z.lo);
+                        let fh = zn_flr(z.hi);
+                        let val = zn_eq(fl, fh).val;
+                        V::B(ZB { val, known: ALL })
+                    } else {
+                        unreachable!()
+                    }
+                } else {
+                    let (val, _) = match vals[inner] {
+                        V::B(z) => (z.known, ()),
+                        V::N(_) => (ALL, ()),
+                        V::I(z) => (zn_eq(z.lo, z.hi).val, ()),
+                        _ => panic!("Known of unsupported domain"),
+                    };
+                    V::B(ZB { val, known: ALL })
+                }
+            }
+            Op::Sel => {
+                let c = b(0);
+                match vals[node.args[1] as usize] {
+                    V::B(_) => V::B(zsel_b(c, b(1), b(2))),
+                    V::I(_) => V::I(zsel_i(c, iv(1), iv(2))),
+                    _ => V::N(zsel_n(c, n(1), n(2))),
+                }
+            }
+            Op::Bits if is_i(0) => V::W(zw_bits_i(iv(0))),
+            Op::Bits if dom_bool(0) => V::W(zw_bits_b(b(0))),
             Op::Bits => V::W(zw_bits_n(n(0))),
             Op::Word(x) => V::W(zw_splat(*x)),
             Op::Mix(c, 0) => V::W(zw_mix1(w(0), w(1), *c as u64)),
             Op::Mix(c, _) => V::W(zw_mix2(w(0), w(1), *c as u64)),
+            Op::Span => V::I(ZI { lo: iv(0).lo, hi: iv(1).hi }),
+            Op::Frag(c) => V::I(zi_fork_flr(iv(0), *c as usize).0),
+            Op::FragOk(c) => {
+                let (_, ok) = zi_fork_flr(iv(0), *c as usize);
+                V::B(ZB { val: ok, known: ALL })
+            }
+            Op::SplitOk => V::B(zi_span_ok(iv(0))),
+            Op::Mget => {
+                let (cart, _) = room.expect("Mget needs a room");
+                V::N(zn_mget(cart, n(0), n(1)))
+            }
+            Op::TileFlagAt => {
+                let (cart, cache) = room.expect("TileFlagAt needs a room");
+                let w = n(2).lane(0);
+                let h = n(3).lane(0);
+                let flag = n(4).lane(0);
+                V::B(zn_tile_flag_at(cache, cart, n(0), n(1), w, h, flag))
+            }
             other => panic!("oracle: unsupported op {other:?}"),
         };
-        vals.push(Some(v));
+        vals.push(v);
     }
+    vals
+}
+
+/// Word-root oracle for the hashing tests.
+fn oracle(g: &Graph, roots: &[NodeId], cols: &HashMap<u32, [i32; 16]>) -> Vec<[u64; 16]> {
+    let vals = eval_nodes(g, cols, None);
     roots
         .iter()
-        .map(|r| match vals[*r as usize].as_ref().unwrap() {
+        .map(|r| match vals[*r as usize] {
             V::W(z) => z.to_array(),
-            V::N(_) => panic!("root is not a word"),
+            _ => panic!("root is not a word"),
         })
         .collect()
 }
@@ -107,7 +231,7 @@ fn oracle(g: &Graph, roots: &[NodeId], cols: &HashMap<u32, [i32; 16]>) -> Vec<[u
 fn run_asm(loaded: &crate::transpile::asm::Loaded, input: &[u8], n_roots: usize) -> Vec<[u64; 16]> {
     let mut out = vec![0u8; n_roots * 128];
     unsafe {
-        (loaded.func)(input.as_ptr(), out.as_mut_ptr());
+        (loaded.func)(input.as_ptr(), out.as_mut_ptr(), std::ptr::null());
     }
     (0..n_roots)
         .map(|r| {
@@ -144,13 +268,14 @@ fn build_fold_arith(cells: &[u32], rng: &mut Lcg) -> (Graph, Vec<NodeId>) {
         let cell = g.leaf(Op::Cell(c));
         let kv = (rng.i32() >> 8) << 8;
         let k = g.leaf(Op::Const(kv, kv));
-        let v = match rng.next_u64() % 7 {
+        let v = match rng.next_u64() % 8 {
             0 => g.add(Op::Add, vec![cell, k]),
             1 => g.add(Op::Sub, vec![cell, k]),
             2 => g.add(Op::Min, vec![cell, k]),
             3 => g.add(Op::Max, vec![cell, k]),
             4 => g.add(Op::Neg, vec![cell]),
             5 => g.add(Op::Abs, vec![cell]),
+            6 => g.add(Op::Mul, vec![cell, k]),
             _ => g.add(Op::Flr, vec![cell]),
         };
         let v = if rng.next_u64() & 1 == 0 { g.add(Op::Flr, vec![v]) } else { v };
@@ -228,6 +353,361 @@ fn asm_row_key_matches_under_spilling() {
     let (g, roots) = build_wide(14, 14);
     let spill = check(&g, &roots, "wide", &mut rng);
     assert!(spill > 0, "a 14x14 wide key must force spilling, got {spill}");
+}
+
+// ---- typed-root coverage (value + bool + interval layers) ----
+
+use crate::transpile::asm::RootKind;
+
+/// Read raw output bytes for `n_roots` 128-byte slots.
+fn run_asm_raw(
+    loaded: &crate::transpile::asm::Loaded,
+    input: &[u8],
+    n_roots: usize,
+    ctx: *const std::os::raw::c_void,
+) -> Vec<u8> {
+    let mut out = vec![0u8; n_roots * 128];
+    unsafe { (loaded.func)(input.as_ptr(), out.as_mut_ptr(), ctx) };
+    out
+}
+
+fn zn_bytes(z: ZN) -> [u8; 64] {
+    let a = z.to_array();
+    let mut o = [0u8; 64];
+    for i in 0..16 {
+        o[i * 4..i * 4 + 4].copy_from_slice(&(a[i].as_raw_u32()).to_le_bytes());
+    }
+    o
+}
+
+/// Assert the emitted kernel's typed roots match the reference evaluator.
+fn check_typed(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
+    let (compiled, loaded) = compile_and_load(g, roots, tag).expect("compile+load");
+    for _ in 0..8 {
+        let cols = random_columns(&compiled.input_cells, rng);
+        let input = pack_inputs(&compiled.input_cells, &cols);
+        let out = run_asm_raw(&loaded, &input, compiled.n_roots, std::ptr::null());
+        let vals = eval_nodes(g, &cols, None);
+        for (ri, r) in roots.iter().enumerate() {
+            let base = ri * 128;
+            match (compiled.root_kinds[ri], vals[*r as usize]) {
+                (RootKind::Num, V::N(z)) => {
+                    assert_eq!(&out[base..base + 64], &zn_bytes(z), "{tag}: num root {ri}");
+                }
+                (RootKind::Ival, V::I(z)) => {
+                    assert_eq!(&out[base..base + 64], &zn_bytes(z.lo), "{tag}: ival lo {ri}");
+                    assert_eq!(&out[base + 64..base + 128], &zn_bytes(z.hi), "{tag}: ival hi {ri}");
+                }
+                (RootKind::Bool, V::B(z)) => {
+                    let val = u16::from_le_bytes([out[base], out[base + 1]]);
+                    let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
+                    assert_eq!(val, z.val, "{tag}: bool val root {ri}");
+                    assert_eq!(known, z.known, "{tag}: bool known root {ri}");
+                }
+                (k, _) => panic!("{tag}: root {ri} kind {k:?} vs oracle type mismatch"),
+            }
+        }
+    }
+}
+
+/// A graph exercising comparisons, the tri-state bool algebra, Known,
+/// selects (num and bool arms), and ConstBool - roots of Num and Bool type.
+fn build_value_graph(cells: &[u32], _rng: &mut Lcg) -> (Graph, Vec<NodeId>) {
+    let mut g = Graph::new();
+    let cs: Vec<NodeId> = cells.iter().map(|c| g.leaf(Op::Cell(*c))).collect();
+    let zero = g.leaf(Op::Const(0, 0));
+    let mut roots = Vec::new();
+    let mut prev_bool = g.leaf(Op::ConstBool(true));
+    for w in cs.windows(2) {
+        let (x, y) = (w[0], w[1]);
+        let lt = g.add(Op::Lt, vec![x, y]);
+        let ge = g.add(Op::Ge, vec![x, zero]);
+        let eq = g.add(Op::Eq, vec![x, y]);
+        let a = g.add(Op::And, vec![lt, ge]);
+        let o = g.add(Op::Or, vec![a, prev_bool]);
+        let n = g.add(Op::Not, vec![eq]);
+        let both = g.add(Op::And, vec![o, n]);
+        let seln = g.add(Op::Sel, vec![both, x, y]);
+        let beq = g.add(Op::Eq, vec![both, prev_bool]);
+        let selb = g.add(Op::Sel, vec![lt, both, beq]);
+        let kb = g.add(Op::Known, vec![selb]);
+        roots.push(seln);
+        roots.push(both);
+        roots.push(beq);
+        roots.push(kb);
+        prev_bool = selb;
+    }
+    roots.push(prev_bool);
+    (g, roots)
+}
+
+/// Small bounded columns (raw ~ +-8.0 fixed) so interval add/sub cannot
+/// overflow (the kernel `zi_*` ops panic on overflow, a contract path we do
+/// not replicate).
+fn random_small_columns(cells: &[u32], rng: &mut Lcg) -> HashMap<u32, [i32; 16]> {
+    cells
+        .iter()
+        .map(|c| (*c, std::array::from_fn::<i32, 16, _>(|_| (rng.i32() % 0x8_0000) - 0x4_0000)))
+        .collect()
+}
+
+/// Like `check_typed` but with bounded inputs, for the interval ops.
+fn check_typed_small(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
+    let (compiled, loaded) = compile_and_load(g, roots, tag).expect("compile+load");
+    for _ in 0..8 {
+        let cols = random_small_columns(&compiled.input_cells, rng);
+        let input = pack_inputs(&compiled.input_cells, &cols);
+        let out = run_asm_raw(&loaded, &input, compiled.n_roots, std::ptr::null());
+        let vals = eval_nodes(g, &cols, None);
+        for (ri, r) in roots.iter().enumerate() {
+            let base = ri * 128;
+            match (compiled.root_kinds[ri], vals[*r as usize]) {
+                (RootKind::Num, V::N(z)) => {
+                    assert_eq!(&out[base..base + 64], &zn_bytes(z), "{tag}: num root {ri}");
+                }
+                (RootKind::Ival, V::I(z)) => {
+                    assert_eq!(&out[base..base + 64], &zn_bytes(z.lo), "{tag}: ival lo {ri}");
+                    assert_eq!(&out[base + 64..base + 128], &zn_bytes(z.hi), "{tag}: ival hi {ri}");
+                }
+                (RootKind::Bool, V::B(z)) => {
+                    // Only the KNOWN lanes' val bits are defined; compare val
+                    // masked by known, and known exactly.
+                    let val = u16::from_le_bytes([out[base], out[base + 1]]);
+                    let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
+                    assert_eq!(known, z.known, "{tag}: bool known root {ri}");
+                    assert_eq!(val & known, z.val & known, "{tag}: bool val root {ri}");
+                }
+                (RootKind::Word, V::W(z)) => {
+                    let got: [u64; 16] = std::array::from_fn(|l| {
+                        u64::from_le_bytes(out[base + l * 8..base + l * 8 + 8].try_into().unwrap())
+                    });
+                    assert_eq!(got, z.to_array(), "{tag}: word root {ri}");
+                }
+                (k, _) => panic!("{tag}: root {ri} kind {k:?} vs oracle type mismatch"),
+            }
+        }
+    }
+}
+
+/// Build intervals (via Span and a wide Const) and exercise the interval
+/// ops: zi_add/sub/min/max/neg/abs, zi_flr + Known(Flr), zi_cmp (all four
+/// orders), Frag/FragOk/SplitOk, Sel over intervals, and Bits-of-interval
+/// feeding the hash.
+fn build_interval_graph(cells: &[u32]) -> (Graph, Vec<NodeId>) {
+    let mut g = Graph::new();
+    let two = g.leaf(Op::Const(ONE_FIXED2, ONE_FIXED2)); // +2.0
+    let band = g.leaf(Op::Const(-0x8000, 0x8000)); // a widened +-0.5 literal
+    let seed1 = g.leaf(Op::Word(0x9e37_79b9_7f4a_7c15));
+    let seed2 = g.leaf(Op::Word(0xa076_1d64_78bd_642f));
+    let mut roots = Vec::new();
+    let mut h1 = seed1;
+    let mut h2 = seed2;
+    for (i, c) in cells.iter().enumerate() {
+        let base = g.leaf(Op::Cell(*c));
+        let hi = g.add(Op::Add, vec![base, two]);
+        let ivl = g.add(Op::Span, vec![base, hi]); // [base, base+2]
+        let shifted = g.add(Op::Add, vec![ivl, band]); // interval + interval
+        let neg = g.add(Op::Neg, vec![shifted]);
+        let ab = g.add(Op::Abs, vec![neg]);
+        let mn = g.add(Op::Min, vec![ab, ivl]);
+        let mx = g.add(Op::Max, vec![mn, shifted]);
+        // floor + its premise
+        let fl = g.add(Op::Flr, vec![mx]);
+        let flok = g.add(Op::Known, vec![fl]);
+        // interval comparisons
+        let lt = g.add(Op::Lt, vec![ivl, shifted]);
+        let ge = g.add(Op::Ge, vec![mx, ivl]);
+        // fork
+        let spanok = g.add(Op::SplitOk, vec![mx]);
+        let frag0 = g.add(Op::Frag(0), vec![mx]);
+        let ok0 = g.add(Op::FragOk(0), vec![mx]);
+        let frag1 = g.add(Op::Frag(1), vec![mx]);
+        let ok1 = g.add(Op::FragOk(1), vec![mx]);
+        // select an interval on a decided bool
+        let seli = g.add(Op::Sel, vec![spanok, frag0, frag1]);
+        // hash the floor and the interval
+        let bfl = g.add(Op::Bits, vec![fl]);
+        let biv = g.add(Op::Bits, vec![seli]);
+        let bok = g.add(Op::Bits, vec![flok]);
+        h1 = g.add(Op::Mix(*c, 0), vec![h1, bfl]);
+        h1 = g.add(Op::Mix(*c + 1, 0), vec![h1, biv]);
+        h2 = g.add(Op::Mix(*c, 1), vec![h2, bok]);
+        // a spread of typed roots
+        roots.push(mx);
+        roots.push(fl);
+        roots.push(lt);
+        roots.push(ge);
+        roots.push(spanok);
+        roots.push(ok0);
+        roots.push(ok1);
+        roots.push(seli);
+        if i == cells.len() - 1 {
+            roots.push(h1);
+            roots.push(h2);
+        }
+    }
+    (g, roots)
+}
+
+#[test]
+fn asm_interval_layer_matches_primitives() {
+    let mut rng = Lcg(0x1234_9999);
+    for k in [2usize, 4, 7] {
+        let cells: Vec<u32> = (0..k as u32).map(|i| i * 3 + 2).collect();
+        let (g, roots) = build_interval_graph(&cells);
+        check_typed_small(&g, &roots, &format!("iv{k}"), &mut rng);
+    }
+}
+
+/// Compare typed roots with a real `AsmCtx` (for the call-out ops). `env`
+/// may be null for div/rem/sin (they do not touch it).
+fn check_typed_ctx(
+    g: &Graph,
+    roots: &[NodeId],
+    tag: &str,
+    rng: &mut Lcg,
+    ctx: &crate::transpile::asm::AsmCtx,
+) {
+    let (compiled, loaded) = compile_and_load(g, roots, tag).expect("compile+load");
+    let ctxp = ctx as *const _ as *const std::os::raw::c_void;
+    for _ in 0..8 {
+        let cols = random_small_columns(&compiled.input_cells, rng);
+        let input = pack_inputs(&compiled.input_cells, &cols);
+        let out = run_asm_raw(&loaded, &input, compiled.n_roots, ctxp);
+        let vals = eval_nodes(g, &cols, None);
+        for (ri, r) in roots.iter().enumerate() {
+            let base = ri * 128;
+            match (compiled.root_kinds[ri], vals[*r as usize]) {
+                (RootKind::Num, V::N(z)) => {
+                    assert_eq!(&out[base..base + 64], &zn_bytes(z), "{tag}: num root {ri}");
+                }
+                (RootKind::Bool, V::B(z)) => {
+                    let val = u16::from_le_bytes([out[base], out[base + 1]]);
+                    let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
+                    assert_eq!(known, z.known, "{tag}: bool known {ri}");
+                    assert_eq!(val & known, z.val & known, "{tag}: bool val {ri}");
+                }
+                (RootKind::Word, V::W(z)) => {
+                    let got: [u64; 16] = std::array::from_fn(|l| {
+                        u64::from_le_bytes(out[base + l * 8..base + l * 8 + 8].try_into().unwrap())
+                    });
+                    assert_eq!(got, z.to_array(), "{tag}: word root {ri}");
+                }
+                (k, _) => panic!("{tag}: root {ri} kind {k:?} mismatch"),
+            }
+        }
+    }
+}
+
+/// Div / Rem / Sin, emitted as call-outs through `AsmCtx` (no cart needed;
+/// `env` is null). Divisor is a nonzero constant so `zn_div/zn_rem` are
+/// defined on every lane.
+#[test]
+fn asm_callout_div_rem_sin_matches_primitives() {
+    let mut rng = Lcg(0xca11_0075);
+    let ctx = crate::transpile::asm::AsmCtx::new(std::ptr::null());
+    let mut g = Graph::new();
+    let three = g.leaf(Op::Const(0x0003_0000, 0x0003_0000));
+    let cells: Vec<u32> = (0..6u32).map(|i| i + 1).collect();
+    let cs: Vec<NodeId> = cells.iter().map(|c| g.leaf(Op::Cell(*c))).collect();
+    let mut roots = Vec::new();
+    let seed = g.leaf(Op::Word(0x1234_5678_9abc_def0));
+    let mut h = seed;
+    for (i, &c) in cs.iter().enumerate() {
+        let d = g.add(Op::Div, vec![c, three]);
+        let r = g.add(Op::Rem, vec![c, three]);
+        let sn = g.add(Op::Sin, vec![c]);
+        roots.push(d);
+        roots.push(r);
+        roots.push(sn);
+        // Also route through the hash so a call-out result feeds Bits/Mix.
+        let bd = g.add(Op::Bits, vec![d]);
+        h = g.add(Op::Mix(cells[i], 0), vec![h, bd]);
+    }
+    roots.push(h);
+    check_typed_ctx(&g, &roots, "callout", &mut rng, &ctx);
+}
+
+/// mget + tile_flag_at, emitted as call-outs into the real collision cache
+/// (a cart-backed `AsmCtx`). Coordinates are floored and clamped into range
+/// so `zn_mget` / `zn_tile_flag_at` are defined on every lane.
+#[test]
+fn asm_callout_collision_matches_primitives() {
+    let cart = CartData::load("cart").expect("cart");
+    let cache = CollisionCache::new(&cart, 1, 0).expect("cache");
+    let env = crate::transpile::asm::CollisionEnv { cart: &cart, cache: &cache };
+    let ctx = crate::transpile::asm::AsmCtx::new(&env as *const _ as *const std::os::raw::c_void);
+
+    let mut g = Graph::new();
+    let clamp = |g: &mut Graph, v: NodeId, lo: i32, hi: i32| -> NodeId {
+        let fl = g.add(Op::Flr, vec![v]);
+        let lo = g.leaf(Op::Const(lo << 16, lo << 16));
+        let hi = g.leaf(Op::Const(hi << 16, hi << 16));
+        let mx = g.add(Op::Max, vec![fl, lo]);
+        g.add(Op::Min, vec![mx, hi])
+    };
+    let w8 = g.leaf(Op::Const(8 << 16, 8 << 16));
+    let flag0 = g.leaf(Op::Const(0, 0));
+    let cells: Vec<u32> = (0..8u32).map(|i| i + 1).collect();
+    let cs: Vec<NodeId> = cells.iter().map(|c| g.leaf(Op::Cell(*c))).collect();
+    let mut roots = Vec::new();
+    let seed = g.leaf(Op::Word(0xdead_beef_0bad_f00d));
+    let mut h = seed;
+    for (i, w) in cs.windows(2).enumerate() {
+        let xt = clamp(&mut g, w[0], 0, 127);
+        let yt = clamp(&mut g, w[1], 0, 63);
+        let mg = g.add(Op::Mget, vec![xt, yt]);
+        let xp = clamp(&mut g, w[0], 0, 118);
+        let yp = clamp(&mut g, w[1], 0, 118);
+        let tf = g.add(Op::TileFlagAt, vec![xp, yp, w8, w8, flag0]);
+        roots.push(mg);
+        roots.push(tf);
+        // route mget through the hash to exercise a call result feeding Mix
+        let bm = g.add(Op::Bits, vec![mg]);
+        h = g.add(Op::Mix(cells[i], 0), vec![h, bm]);
+    }
+    roots.push(h);
+
+    let (compiled, loaded) = compile_and_load(&g, &roots, "collision").expect("compile+load");
+    let ctxp = &ctx as *const _ as *const std::os::raw::c_void;
+    let mut rng = Lcg(0xc0111_5107);
+    for _ in 0..8 {
+        let cols = random_columns(&compiled.input_cells, &mut rng);
+        let input = pack_inputs(&compiled.input_cells, &cols);
+        let out = run_asm_raw(&loaded, &input, compiled.n_roots, ctxp);
+        let vals = eval_nodes(&g, &cols, Some((&cart, &cache)));
+        for (ri, r) in roots.iter().enumerate() {
+            let base = ri * 128;
+            match (compiled.root_kinds[ri], vals[*r as usize]) {
+                (RootKind::Num, V::N(z)) => {
+                    assert_eq!(&out[base..base + 64], &zn_bytes(z), "collision num root {ri}");
+                }
+                (RootKind::Bool, V::B(z)) => {
+                    let val = u16::from_le_bytes([out[base], out[base + 1]]);
+                    let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
+                    assert_eq!(known, z.known, "collision bool known {ri}");
+                    assert_eq!(val & known, z.val & known, "collision bool val {ri}");
+                }
+                (RootKind::Word, V::W(z)) => {
+                    let got: [u64; 16] = std::array::from_fn(|l| {
+                        u64::from_le_bytes(out[base + l * 8..base + l * 8 + 8].try_into().unwrap())
+                    });
+                    assert_eq!(got, z.to_array(), "collision word root {ri}");
+                }
+                (k, _) => panic!("collision root {ri} kind {k:?} mismatch"),
+            }
+        }
+    }
+}
+
+#[test]
+fn asm_value_and_bool_layer_matches_primitives() {
+    let mut rng = Lcg(0x51ce_d00d);
+    for k in [3usize, 5, 9, 16] {
+        let cells: Vec<u32> = (0..k as u32).map(|i| i * 2 + 3).collect();
+        let (g, roots) = build_value_graph(&cells, &mut rng);
+        check_typed(&g, &roots, &format!("val{k}"), &mut rng);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,12 +909,12 @@ fn asm_backend_benchmark() {
     let iters = 200_000u64;
     let mut bench = |f: crate::transpile::asm::KernelFn| -> f64 {
         for _ in 0..2000 {
-            unsafe { f(input.as_ptr(), out_buf.as_mut_ptr()) };
+            unsafe { f(input.as_ptr(), out_buf.as_mut_ptr(), std::ptr::null()) };
         }
         let t = Instant::now();
         for _ in 0..iters {
             unsafe {
-                f(std::hint::black_box(input.as_ptr()), std::hint::black_box(out_buf.as_mut_ptr()))
+                f(std::hint::black_box(input.as_ptr()), std::hint::black_box(out_buf.as_mut_ptr()), std::ptr::null())
             };
         }
         t.elapsed().as_nanos() as f64 / iters as f64

@@ -24,7 +24,7 @@ const RTLD_NOW: c_int = 2;
 
 /// The ABI every emitted kernel has: read packed input columns, write
 /// packed output columns. See `codegen::Compiled` for the layouts.
-pub type KernelFn = unsafe extern "C" fn(*const u8, *mut u8);
+pub type KernelFn = unsafe extern "C" fn(*const u8, *mut u8, *const std::os::raw::c_void);
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 

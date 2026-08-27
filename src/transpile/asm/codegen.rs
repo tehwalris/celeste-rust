@@ -28,9 +28,36 @@ const H1: u8 = 27; // remat helper (BitsHi extract temp)
 const RES: u8 = 26; // scratch for a spilled result
 const N_ALLOC: u8 = 26; // homes zmm0..=zmm25
 
+// Call-out ABI. Loads/stores use callee-saved r13 (inputs) / r14 (outputs);
+// r15 holds the AsmCtx pointer - so a mid-DAG `call` may clobber rdi/rsi.
+// `AsmCtx` field byte offsets (see callout.rs; keep in lockstep).
+const CTX_DIV: u32 = 0;
+const CTX_REM: u32 = 8;
+const CTX_SIN: u32 = 16;
+const CTX_MGET: u32 = 24;
+const CTX_TILE: u32 = 32;
+const CTX_TILE_LANES: u32 = 40;
+const CTX_ENV: u32 = 48;
+const SAVE_BYTES: u32 = 32 * 64; // save all 32 zmm across a call
+const ARGBUF_BYTES: u32 = 8 * 64; // up to 6 SIMD args + a result buffer
+
+/// A call-out op (emitted as a `call` through `AsmCtx`).
+#[derive(Clone, Copy)]
+enum CallOp {
+    Div,
+    Rem,
+    Sin,
+    Mget,
+    /// Uniform box: `scalars = [w, h, flag]`.
+    TileFlag,
+    /// Per-lane box: `args = [x, y, w, h]`, `scalars = [flag]`.
+    TileFlagLanes,
+}
+
 const C1: u64 = 0xbf58_476d_1ce4_e5b9; // mix64 multiplier 1
 const C2: u64 = 0x94d0_49bb_1331_11eb; // mix64 multiplier 2
 const FLR_MASK: i32 = 0xffff_0000u32 as i32;
+const ONE_FIXED: i32 = 0x0001_0000; // P8::from_i16(1) raw
 
 type Vreg = u32;
 
@@ -48,9 +75,23 @@ enum WordHalf {
     ConstU64(u64),
 }
 
+/// One plane of a tri-state boolean (`ZB`): a per-lane VECTOR mask (each
+/// lane all-ones or zero), not a k-register - so the whole boolean layer
+/// stays in the plentiful zmm class and reuses the allocator/scheduler.
+/// `Const(true)` = all-ones, `Const(false)` = zero.
+#[derive(Clone, Copy)]
+enum MaskVal {
+    Reg(Vreg),
+    Const(bool),
+}
+
 #[derive(Clone, Copy)]
 enum Value {
     Num(NumVal),
+    /// `[val, known]` vector-mask planes.
+    Bool([MaskVal; 2]),
+    /// `[lo, hi]` interval planes.
+    Ival([NumVal; 2]),
     Word([WordHalf; 2]),
 }
 
@@ -69,6 +110,10 @@ enum ROp {
     MinSD,
     MaxSD,
     AndD,
+    OrD,
+    XorD,
+    /// `(~a) & b` (`vpandnd`).
+    AndnD,
 }
 
 /// 64-bit lane binary ops (the row-key word layer).
@@ -113,6 +158,12 @@ enum Key {
     BitsHi(Vreg),
     Srlq(Vreg, u8),
     QBin(u8, SrcKey, SrcKey),
+    Muldq(Vreg, Vreg),
+    Sraq(Vreg, u8),
+    Sllq(Vreg, u8),
+    BlendImm(u16, Vreg, Vreg),
+    Cmp(u8, Vreg, SrcKey),
+    Ternlog(Vreg, Vreg, Vreg, u8),
 }
 
 /// A total order on operand keys so commutative ops canonicalize. Registers
@@ -139,7 +190,38 @@ enum Inst {
     Srlq { dst: Vreg, a: Vreg, imm: u8 },
     /// 64-bit lane binary op; `b` may be a broadcast constant.
     QBin { dst: Vreg, op: QOp, a: Vreg, b: Src },
+    /// Signed 32x32 -> 64 multiply of the EVEN lanes (`vpmuldq`).
+    Muldq { dst: Vreg, a: Vreg, b: Vreg },
+    /// Arithmetic 64-bit right shift by an immediate (`vpsraq`).
+    Sraq { dst: Vreg, a: Vreg, imm: u8 },
+    /// Logical 64-bit left shift by an immediate (`vpsllq`).
+    Sllq { dst: Vreg, a: Vreg, imm: u8 },
+    /// Blend `a`/`b` per 32-bit lane by a COMPILE-TIME mask: lane takes `b`
+    /// where the mask bit is set, else `a` (`kmov` imm -> k1; `vpblendmd`).
+    BlendImm { dst: Vreg, mask: u16, a: Vreg, b: Vreg },
+    /// Signed 32-bit compare -> per-lane vector mask: `vpcmpd $imm` to k1,
+    /// then `vpmovm2d` to `dst`. `imm` is the `vpcmpd` predicate.
+    Cmp { dst: Vreg, imm: u8, a: Vreg, b: Src },
+    /// Three-input bitwise LUT (`vpternlogd`): `dst = LUT_imm(a, b, c)`.
+    Ternlog { dst: Vreg, a: Vreg, b: Vreg, c: Vreg, imm: u8 },
+    /// A call-out. `dst` receives the result: a `ZN` for div/rem/sin/mget, a
+    /// vector MASK for tile_flag (expanded from the returned u16).
+    Call { op: CallOp, dst: Vreg, args: Vec<Vreg>, scalars: Vec<i32> },
     Store { off: u32, src: Src },
+    /// Store a vector mask as a 16-bit lane mask: `vpmovd2m` to k1, `kmovw`
+    /// to eax, `movw` to memory. Used for `ZB` roots.
+    StoreMask { off: u32, src: Vreg },
+}
+
+/// The type of a root value, so a caller knows how to read its 128-byte
+/// output slot: `Num` = one ZN at +0; `Word`/`Ival` = two 64-byte planes at
+/// +0/+64; `Bool` = two u16 masks (val at +0, known at +2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RootKind {
+    Num,
+    Bool,
+    Ival,
+    Word,
 }
 
 /// The result of lowering: the assembly text plus the two layouts a caller
@@ -149,9 +231,10 @@ pub struct Compiled {
     /// Input cells, in the ascending order they occupy the input buffer.
     /// Cell `input_cells[i]` is the `ZN` (64 bytes) at byte offset `i*64`.
     pub input_cells: Vec<u32>,
-    /// Number of `ZW` roots. Root `i` is at byte offset `i*128`: half0 at
-    /// `i*128`, half1 at `i*128 + 64`.
+    /// Number of roots. Root `i` occupies a 128-byte slot at `i*128`.
     pub n_roots: usize,
+    /// Each root's type (how to read its slot).
+    pub root_kinds: Vec<RootKind>,
     pub sym: String,
     /// How many spill slots the allocator used (0 = everything fit).
     pub spill_slots: usize,
@@ -277,6 +360,236 @@ impl<'a> Lower<'a> {
         self.pure(Key::Srlq(a, imm), move |d| Inst::Srlq { dst: d, a, imm })
     }
 
+    fn muldq(&mut self, a: Vreg, b: Vreg) -> Vreg {
+        // vpmuldq is commutative in its two source lanes.
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        self.pure(Key::Muldq(a, b), move |d| Inst::Muldq { dst: d, a, b })
+    }
+    fn sraq(&mut self, a: Vreg, imm: u8) -> Vreg {
+        self.pure(Key::Sraq(a, imm), move |d| Inst::Sraq { dst: d, a, imm })
+    }
+    fn sllq(&mut self, a: Vreg, imm: u8) -> Vreg {
+        self.pure(Key::Sllq(a, imm), move |d| Inst::Sllq { dst: d, a, imm })
+    }
+    fn blend_imm(&mut self, mask: u16, a: Vreg, b: Vreg) -> Vreg {
+        self.pure(Key::BlendImm(mask, a, b), move |d| Inst::BlendImm { dst: d, mask, a, b })
+    }
+
+    /// 16.16 fixed-point multiply, the even/odd `vpmuldq` weave from
+    /// `zn_mul`: even lanes are `(a*b)>>16`, odd lanes the same after an
+    /// arithmetic 32-bit right shift brings them into the low i32, then the
+    /// odd results are shifted back up and blended over the even ones.
+    fn zn_mul(&mut self, a: Vreg, b: Vreg) -> Vreg {
+        let ev = self.muldq(a, b);
+        let ev = self.sraq(ev, 16);
+        let ah = self.sraq(a, 32);
+        let bh = self.sraq(b, 32);
+        let od = self.muldq(ah, bh);
+        let od = self.sraq(od, 16);
+        let od = self.sllq(od, 32);
+        self.blend_imm(0xaaaa, ev, od)
+    }
+
+    // ---- boolean / mask layer (ZB as vector masks) ----
+
+    /// Materialize a mask plane into a register: a live vreg, or a broadcast
+    /// of the all-ones / all-zero constant for a compile-time mask.
+    fn mask_reg(&mut self, m: MaskVal) -> Vreg {
+        match m {
+            MaskVal::Reg(v) => v,
+            MaskVal::Const(b) => {
+                let c = if b { -1i32 } else { 0i32 };
+                self.pure(Key::BcastD(c), move |d| Inst::BcastD { dst: d, val: c })
+            }
+        }
+    }
+
+    /// A 32-bit-lane binary op (`vpandd/vpord/vpxord/vpandnd/...`), memoized.
+    /// `AndnD` is `(~a) & b`, so it is NOT commutative; the others among the
+    /// mask ops (`And/Or/Xor`) are and get canonical operand order.
+    fn dbin(&mut self, op: ROp, a: Vreg, b: Vreg) -> Vreg {
+        let tag = match op {
+            ROp::AddD => 0u8,
+            ROp::SubD => 1,
+            ROp::MinSD => 2,
+            ROp::MaxSD => 3,
+            ROp::AndD => 4,
+            ROp::OrD => 5,
+            ROp::XorD => 6,
+            ROp::AndnD => 7,
+        };
+        let (a, b) = if matches!(op, ROp::AndD | ROp::OrD | ROp::XorD) && b < a {
+            (b, a)
+        } else {
+            (a, b)
+        };
+        let key = Key::RBin(tag, a, SrcKey::Reg(b));
+        self.pure(key, move |d| Inst::RBin { dst: d, op, a, b: Src::Reg(b) })
+    }
+
+    /// Bitwise NOT of a mask (`x ^ all-ones`).
+    fn not_mask(&mut self, a: Vreg) -> Vreg {
+        let key = Key::RBin(6, a, SrcKey::I32(-1));
+        self.pure(key, move |d| Inst::RBin { dst: d, op: ROp::XorD, a, b: Src::BI32(-1) })
+    }
+
+    /// Signed 32-bit compare to a vector mask.
+    fn cmp(&mut self, imm: u8, a: Vreg, b: Src) -> Vreg {
+        self.pure(Key::Cmp(imm, a, b.key()), move |d| Inst::Cmp { dst: d, imm, a, b })
+    }
+
+    /// `dst = LUT_imm(a, b, c)` (`vpternlogd`).
+    fn ternlog(&mut self, a: Vreg, b: Vreg, c: Vreg, imm: u8) -> Vreg {
+        self.pure(Key::Ternlog(a, b, c, imm), move |d| Inst::Ternlog { dst: d, a, b, c, imm })
+    }
+
+    /// Vector-mask select `c ? t : f` (one plane), via `vpternlogd 0xca`.
+    fn vsel(&mut self, c: Vreg, t: Vreg, f: Vreg) -> Vreg {
+        self.ternlog(c, t, f, 0xca)
+    }
+
+    // ---- interval layer (ZI as two i32 planes) ----
+
+    /// A 32-bit-lane binary op with a broadcast CONSTANT second operand.
+    fn dbin_c(&mut self, op: ROp, a: Vreg, c: i32) -> Vreg {
+        let tag = match op {
+            ROp::AddD => 0u8,
+            ROp::SubD => 1,
+            ROp::MinSD => 2,
+            ROp::MaxSD => 3,
+            ROp::AndD => 4,
+            ROp::OrD => 5,
+            ROp::XorD => 6,
+            ROp::AndnD => 7,
+        };
+        self.pure(Key::RBin(tag, a, SrcKey::I32(c)), move |d| Inst::RBin {
+            dst: d,
+            op,
+            a,
+            b: Src::BI32(c),
+        })
+    }
+    fn neg(&mut self, a: Vreg) -> Vreg {
+        self.pure(Key::Neg(a), move |d| Inst::Neg { dst: d, a })
+    }
+    fn absd(&mut self, a: Vreg) -> Vreg {
+        self.pure(Key::Abs(a), move |d| Inst::Abs { dst: d, a })
+    }
+    fn ival_regs(&mut self, iv: [NumVal; 2]) -> [Vreg; 2] {
+        [self.num_reg(iv[0]), self.num_reg(iv[1])]
+    }
+    /// `zn_flr`: `x & 0xffff_0000`.
+    fn flr(&mut self, a: Vreg) -> Vreg {
+        self.dbin_c(ROp::AndD, a, FLR_MASK)
+    }
+    /// `mask_eq(a, b)` as a vector mask.
+    fn mask_eq(&mut self, a: Vreg, b: Vreg) -> Vreg {
+        self.cmp(0, a, Src::Reg(b))
+    }
+
+    fn zi_add(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
+        [self.dbin(ROp::AddD, a[0], b[0]), self.dbin(ROp::AddD, a[1], b[1])]
+    }
+    fn zi_sub(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
+        // Endpoints cross: [a.lo - b.hi, a.hi - b.lo].
+        [self.dbin(ROp::SubD, a[0], b[1]), self.dbin(ROp::SubD, a[1], b[0])]
+    }
+    fn zi_min(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
+        [self.dbin(ROp::MinSD, a[0], b[0]), self.dbin(ROp::MinSD, a[1], b[1])]
+    }
+    fn zi_max(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
+        [self.dbin(ROp::MaxSD, a[0], b[0]), self.dbin(ROp::MaxSD, a[1], b[1])]
+    }
+    fn zi_neg(&mut self, a: [Vreg; 2]) -> [Vreg; 2] {
+        let lo = self.neg(a[1]);
+        let hi = self.neg(a[0]);
+        [lo, hi]
+    }
+    /// `zi_abs`: the three-case blend (non-negative / non-positive / straddle).
+    fn zi_abs(&mut self, a: [Vreg; 2]) -> [Vreg; 2] {
+        let zero = self.num_reg(NumVal::ConstI32(0));
+        let pos = self.cmp(5, a[0], Src::Reg(zero)); // lo >= 0  (NLT)
+        let neg = self.cmp(2, a[1], Src::Reg(zero)); // hi <= 0  (LE)
+        let al = self.absd(a[0]);
+        let ah = self.absd(a[1]);
+        let m = self.dbin(ROp::MaxSD, al, ah);
+        // straddle default: lo=0, hi=max(|lo|,|hi|)
+        let mut lo = zero;
+        let mut hi = m;
+        lo = self.vsel(neg, ah, lo);
+        hi = self.vsel(neg, al, hi);
+        lo = self.vsel(pos, a[0], lo);
+        hi = self.vsel(pos, a[1], hi);
+        [lo, hi]
+    }
+    /// `zi_flr_ok`: does the interval have a unique floor? (val; known=ALL)
+    fn zi_flr_ok(&mut self, a: [Vreg; 2]) -> Vreg {
+        let fl = self.flr(a[0]);
+        let fh = self.flr(a[1]);
+        self.mask_eq(fl, fh)
+    }
+    /// `zi_span_ok`: does it span at most two floors?
+    fn zi_span_ok(&mut self, a: [Vreg; 2]) -> Vreg {
+        let fl = self.flr(a[0]);
+        let fh = self.flr(a[1]);
+        let e0 = self.mask_eq(fl, fh);
+        let one = self.dbin_c(ROp::AddD, fl, ONE_FIXED);
+        let e1 = self.mask_eq(fh, one);
+        self.dbin(ROp::OrD, e0, e1)
+    }
+    /// `zi_fork_flr(a, c)`: (fragment interval, valid mask).
+    fn zi_fork_flr(&mut self, a: [Vreg; 2], c: u8) -> ([Vreg; 2], Vreg) {
+        let fl = self.flr(a[0]);
+        let fh = self.flr(a[1]);
+        let one = self.dbin_c(ROp::AddD, fl, ONE_FIXED);
+        let two = self.mask_eq(fh, one);
+        let all = self.num_reg(NumVal::ConstI32(-1));
+        if c == 0 {
+            // hi = two ? (fh - 1 raw) : a.hi ; valid = ALL
+            let below = self.dbin_c(ROp::AddD, fh, -1);
+            let hi = self.vsel(two, below, a[1]);
+            ([a[0], hi], all)
+        } else {
+            // lo = two ? fh : a.lo ; valid = two
+            let lo = self.vsel(two, fh, a[0]);
+            ([lo, a[1]], two)
+        }
+    }
+    /// `zi_cmp`: tri-state (val, known) for an ORDERED interval comparison.
+    /// `kind`: 0 Lt, 1 Le, 2 Gt, 3 Ge.
+    fn zi_cmp(&mut self, kind: u8, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
+        // (t, f) as in kernel `zi_cmp`. imm: LT 1, LE 2, GT 6, GE 5.
+        let (t, f) = match kind {
+            0 => (self.cmp(1, a[1], Src::Reg(b[0])), self.cmp(5, a[0], Src::Reg(b[1]))),
+            1 => (self.cmp(2, a[1], Src::Reg(b[0])), self.cmp(6, a[0], Src::Reg(b[1]))),
+            2 => (self.cmp(6, a[0], Src::Reg(b[1])), self.cmp(2, a[1], Src::Reg(b[0]))),
+            _ => (self.cmp(5, a[0], Src::Reg(b[1])), self.cmp(1, a[1], Src::Reg(b[0]))),
+        };
+        let known = self.dbin(ROp::OrD, t, f);
+        [t, known]
+    }
+
+    /// `zw_bits_n`: zero-extend an i32 column to the two u64 ZW halves.
+    fn bits_n(&mut self, v: Vreg) -> [Vreg; 2] {
+        let lo = self.pure(Key::BitsLo(v), move |d| Inst::BitsLo { dst: d, src: v });
+        let hi = self.pure(Key::BitsHi(v), move |d| Inst::BitsHi { dst: d, src: v });
+        [lo, hi]
+    }
+    /// One `zw_bits_i` ZW half: `(lo_half << 32) | hi_half`.
+    fn pack_i(&mut self, lo_half: Vreg, hi_half: Vreg) -> Vreg {
+        let shifted = self.sllq(lo_half, 32);
+        self.dbin(ROp::OrD, shifted, hi_half)
+    }
+    /// `zw_bits_b`: `(val&1) | ((known&1)<<1)` per lane, as the two ZW halves.
+    fn bits_b(&mut self, val: Vreg, known: Vreg) -> (Vreg, Vreg) {
+        let vbit = self.dbin_c(ROp::AndD, val, 1);
+        let kbit = self.dbin_c(ROp::AndD, known, 1);
+        let kshift = self.dbin(ROp::AddD, kbit, kbit); // kbit << 1
+        let comb = self.dbin(ROp::OrD, vbit, kshift);
+        let h = self.bits_n(comb);
+        (h[0], h[1])
+    }
+
     /// `a op b` on words (all three word ops are commutative), memoized and
     /// operand-order-canonical so equal values share a vreg.
     fn qbin(&mut self, op: QOp, a: Vreg, b: Src) -> Vreg {
@@ -294,6 +607,34 @@ impl<'a> Lower<'a> {
             _ => bail!("node {} is not a numeric value where one was needed", id),
         }
     }
+
+    fn as_bool(&self, id: NodeId) -> Result<[MaskVal; 2]> {
+        match self.vals[id as usize] {
+            Some(Value::Bool(b)) => Ok(b),
+            _ => bail!("node {} is not a boolean value where one was needed", id),
+        }
+    }
+
+    fn as_ival(&self, id: NodeId) -> Result<[NumVal; 2]> {
+        match self.vals[id as usize] {
+            Some(Value::Ival(i)) => Ok(i),
+            // A number is the degenerate interval [x, x] (zi_of_zn).
+            Some(Value::Num(n)) => Ok([n, n]),
+            _ => bail!("node {} is not an interval where one was needed", id),
+        }
+    }
+
+    /// The value domain of a node, for domain-dispatched ops (`Eq`, `Sel`,
+    /// `Known`, `Bits`).
+    fn dom(&self, id: NodeId) -> u8 {
+        match self.vals[id as usize] {
+            Some(Value::Num(_)) => 0,
+            Some(Value::Bool(_)) => 1,
+            Some(Value::Ival(_)) => 2,
+            Some(Value::Word(_)) => 3,
+            None => 0,
+        }
+    }
     fn as_word(&self, id: NodeId) -> Result<[WordHalf; 2]> {
         match self.vals[id as usize] {
             Some(Value::Word(w)) => Ok(w),
@@ -306,10 +647,11 @@ impl<'a> Lower<'a> {
         let a = node.args.clone();
         let val = match &node.op {
             Op::Const(lo, hi) => {
-                if lo != hi {
-                    bail!("node {}: the asm slice supports only exact Const, got [{lo},{hi}]", id);
+                if lo == hi {
+                    Value::Num(NumVal::ConstI32(*lo))
+                } else {
+                    Value::Ival([NumVal::ConstI32(*lo), NumVal::ConstI32(*hi)])
                 }
-                Value::Num(NumVal::ConstI32(*lo))
             }
             Op::Cell(c) => {
                 let off = *self
@@ -321,6 +663,18 @@ impl<'a> Lower<'a> {
             }
             Op::Word(w) => Value::Word([WordHalf::ConstU64(*w), WordHalf::ConstU64(*w)]),
             op @ (Op::Add | Op::Sub | Op::Min | Op::Max) => {
+                if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
+                    let (ia, ib) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
+                    let (ar, br) = (self.ival_regs(ia), self.ival_regs(ib));
+                    let r = match op {
+                        Op::Add => self.zi_add(ar, br),
+                        Op::Sub => self.zi_sub(ar, br),
+                        Op::Min => self.zi_min(ar, br),
+                        _ => self.zi_max(ar, br),
+                    };
+                    self.vals[id as usize] = Some(Value::Ival([NumVal::Reg(r[0]), NumVal::Reg(r[1])]));
+                    return Ok(());
+                }
                 let (x, y) = (self.as_num(a[0])?, self.as_num(a[1])?);
                 let (rop, tag) = match op {
                     Op::Add => (ROp::AddD, 0u8),
@@ -342,42 +696,70 @@ impl<'a> Lower<'a> {
                 let dst = self.pure(key, move |d| Inst::RBin { dst: d, op: rop, a: areg, b: bsrc });
                 Value::Num(NumVal::Reg(dst))
             }
+            Op::Mul => {
+                let x = self.as_num(a[0])?;
+                let y = self.as_num(a[1])?;
+                let (xr, yr) = (self.num_reg(x), self.num_reg(y));
+                Value::Num(NumVal::Reg(self.zn_mul(xr, yr)))
+            }
             Op::Neg => {
-                let areg = {
+                if self.dom(a[0]) == 2 {
+                    let iv = self.as_ival(a[0])?;
+                    let ar = self.ival_regs(iv);
+                    let r = self.zi_neg(ar);
+                    Value::Ival([NumVal::Reg(r[0]), NumVal::Reg(r[1])])
+                } else {
                     let n = self.as_num(a[0])?;
-                    self.num_reg(n)
-                };
-                let dst = self.pure(Key::Neg(areg), move |d| Inst::Neg { dst: d, a: areg });
-                Value::Num(NumVal::Reg(dst))
+                    let areg = self.num_reg(n);
+                    let dst = self.pure(Key::Neg(areg), move |d| Inst::Neg { dst: d, a: areg });
+                    Value::Num(NumVal::Reg(dst))
+                }
             }
             Op::Abs => {
-                let areg = {
+                if self.dom(a[0]) == 2 {
+                    let iv = self.as_ival(a[0])?;
+                    let ar = self.ival_regs(iv);
+                    let r = self.zi_abs(ar);
+                    Value::Ival([NumVal::Reg(r[0]), NumVal::Reg(r[1])])
+                } else {
                     let n = self.as_num(a[0])?;
-                    self.num_reg(n)
-                };
-                let dst = self.pure(Key::Abs(areg), move |d| Inst::Abs { dst: d, a: areg });
-                Value::Num(NumVal::Reg(dst))
+                    let areg = self.num_reg(n);
+                    let dst = self.pure(Key::Abs(areg), move |d| Inst::Abs { dst: d, a: areg });
+                    Value::Num(NumVal::Reg(dst))
+                }
             }
             Op::Flr => {
-                let areg = {
-                    let n = self.as_num(a[0])?;
-                    self.num_reg(n)
-                };
-                let key = Key::RBin(4, areg, SrcKey::I32(FLR_MASK));
-                let dst = self.pure(key, move |d| Inst::RBin {
-                    dst: d,
-                    op: ROp::AndD,
-                    a: areg,
-                    b: Src::BI32(FLR_MASK),
-                });
-                Value::Num(NumVal::Reg(dst))
+                // zi_flr takes the low endpoint's floor; zn_flr is the same
+                // on a degenerate interval, so route both through `as_ival`.
+                let iv = self.as_ival(a[0])?;
+                let lo = self.num_reg(iv[0]);
+                Value::Num(NumVal::Reg(self.flr(lo)))
             }
-            Op::Bits => {
-                let n = self.as_num(a[0])?;
-                let src = self.num_reg(n);
-                let lo = self.pure(Key::BitsLo(src), move |d| Inst::BitsLo { dst: d, src });
-                let hi = self.pure(Key::BitsHi(src), move |d| Inst::BitsHi { dst: d, src });
-                Value::Word([WordHalf::Reg(lo), WordHalf::Reg(hi)])
+            Op::Bits => match self.dom(a[0]) {
+                2 => {
+                    // zw_bits_i: pack (lo << 32) | hi per lane, on each ZW half.
+                    let iv = self.as_ival(a[0])?;
+                    let ar = self.ival_regs(iv);
+                    let lo = self.bits_n(ar[0]);
+                    let hi = self.bits_n(ar[1]);
+                    let h0 = self.pack_i(lo[0], hi[0]);
+                    let h1 = self.pack_i(lo[1], hi[1]);
+                    Value::Word([WordHalf::Reg(h0), WordHalf::Reg(h1)])
+                }
+                1 => {
+                    // zw_bits_b: (val bit) | (known bit << 1) per lane.
+                    let b = self.as_bool(a[0])?;
+                    let (v, k) = (self.mask_reg(b[0]), self.mask_reg(b[1]));
+                    let (h0, h1) = self.bits_b(v, k);
+                    Value::Word([WordHalf::Reg(h0), WordHalf::Reg(h1)])
+                }
+                _ => {
+                    let n = self.as_num(a[0])?;
+                    let src = self.num_reg(n);
+                    let lo = self.pure(Key::BitsLo(src), move |d| Inst::BitsLo { dst: d, src });
+                    let hi = self.pure(Key::BitsHi(src), move |d| Inst::BitsHi { dst: d, src });
+                    Value::Word([WordHalf::Reg(lo), WordHalf::Reg(hi)])
+                }
             }
             Op::Mix(c, half) => {
                 let h = self.as_word(a[0])?;
@@ -414,6 +796,223 @@ impl<'a> Lower<'a> {
                     out[i] = WordHalf::Reg(dst);
                 }
                 Value::Word(out)
+            }
+            Op::ConstBool(b) => Value::Bool([MaskVal::Const(*b), MaskVal::Const(true)]),
+            op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
+                if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
+                    // Interval comparison -> tri-state ZB (zi_cmp).
+                    let kind = match op {
+                        Op::Lt => 0u8,
+                        Op::Le => 1,
+                        Op::Gt => 2,
+                        _ => 3,
+                    };
+                    let (ia, ib) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
+                    let (ar, br) = (self.ival_regs(ia), self.ival_regs(ib));
+                    let r = self.zi_cmp(kind, ar, br);
+                    Value::Bool([MaskVal::Reg(r[0]), MaskVal::Reg(r[1])])
+                } else {
+                    // Numeric comparison -> ZB (known = all-ones). `vpcmpd`
+                    // predicate: LT 1, LE 2, GT 6 (NLE), GE 5 (NLT).
+                    let imm = match op {
+                        Op::Lt => 1u8,
+                        Op::Le => 2,
+                        Op::Gt => 6,
+                        _ => 5,
+                    };
+                    let x = self.as_num(a[0])?;
+                    let y = self.as_num(a[1])?;
+                    let xr = self.num_reg(x);
+                    let val = self.cmp(imm, xr, self.num_src(y));
+                    Value::Bool([MaskVal::Reg(val), MaskVal::Const(true)])
+                }
+            }
+            Op::Eq => {
+                // Boolean Eq (zb_eq) or numeric Eq (zn_eq), by operand domain.
+                match self.dom(a[0]) {
+                    1 => {
+                        let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
+                        let (pv, qv) = (self.mask_reg(p[0]), self.mask_reg(q[0]));
+                        // val = ~(pv ^ qv)
+                        let x = self.dbin(ROp::XorD, pv, qv);
+                        let val = self.not_mask(x);
+                        let (pk, qk) = (self.mask_reg(p[1]), self.mask_reg(q[1]));
+                        let known = self.dbin(ROp::AndD, pk, qk);
+                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                    }
+                    _ => {
+                        let x = self.as_num(a[0])?;
+                        let y = self.as_num(a[1])?;
+                        let xr = self.num_reg(x);
+                        let val = self.cmp(0, xr, self.num_src(y));
+                        Value::Bool([MaskVal::Reg(val), MaskVal::Const(true)])
+                    }
+                }
+            }
+            Op::Not => {
+                let b = self.as_bool(a[0])?;
+                let v = self.mask_reg(b[0]);
+                let nv = self.not_mask(v);
+                Value::Bool([MaskVal::Reg(nv), b[1]])
+            }
+            op @ (Op::And | Op::Or) => {
+                let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
+                let (pv, qv) = (self.mask_reg(p[0]), self.mask_reg(q[0]));
+                let (pk, qk) = (self.mask_reg(p[1]), self.mask_reg(q[1]));
+                if matches!(op, Op::And) {
+                    // val = pv & qv ; known_false = (~pv & pk) | (~qv & qk)
+                    // known = (pk & qk) | known_false
+                    let val = self.dbin(ROp::AndD, pv, qv);
+                    let kfa = self.dbin(ROp::AndnD, pv, pk);
+                    let kfb = self.dbin(ROp::AndnD, qv, qk);
+                    let kf = self.dbin(ROp::OrD, kfa, kfb);
+                    let kk = self.dbin(ROp::AndD, pk, qk);
+                    let known = self.dbin(ROp::OrD, kk, kf);
+                    Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                } else {
+                    // val = pv | qv ; known_true = (pv & pk) | (qv & qk)
+                    let val = self.dbin(ROp::OrD, pv, qv);
+                    let kta = self.dbin(ROp::AndD, pv, pk);
+                    let ktb = self.dbin(ROp::AndD, qv, qk);
+                    let kt = self.dbin(ROp::OrD, kta, ktb);
+                    let kk = self.dbin(ROp::AndD, pk, qk);
+                    let known = self.dbin(ROp::OrD, kk, kt);
+                    Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                }
+            }
+            Op::Known => {
+                // Decidedness. `Known(Flr(x))` where x is an interval reads
+                // the INTERVAL (zi_flr_ok), because Flr is exact BY this very
+                // premise, so asking the result would answer itself.
+                let inner = a[0];
+                if let Op::Flr = self.g.get(inner).op {
+                    let src = self.g.get(inner).args[0];
+                    if self.dom(src) == 2 {
+                        let iv = self.as_ival(src)?;
+                        let ar = self.ival_regs(iv);
+                        let val = self.zi_flr_ok(ar);
+                        return {
+                            self.vals[id as usize] =
+                                Some(Value::Bool([MaskVal::Reg(val), MaskVal::Const(true)]));
+                            Ok(())
+                        };
+                    }
+                }
+                match self.dom(inner) {
+                    1 => {
+                        let b = self.as_bool(inner)?;
+                        Value::Bool([b[1], MaskVal::Const(true)])
+                    }
+                    2 => {
+                        // A number is decided iff lo == hi.
+                        let iv = self.as_ival(inner)?;
+                        let ar = self.ival_regs(iv);
+                        let val = self.mask_eq(ar[0], ar[1]);
+                        Value::Bool([MaskVal::Reg(val), MaskVal::Const(true)])
+                    }
+                    _ => Value::Bool([MaskVal::Const(true), MaskVal::Const(true)]),
+                }
+            }
+            Op::Sel => {
+                let c = self.as_bool(a[0])?;
+                let cv = self.mask_reg(c[0]);
+                match self.dom(a[1]) {
+                    1 => {
+                        let (t, f) = (self.as_bool(a[1])?, self.as_bool(a[2])?);
+                        let (tv, fv) = (self.mask_reg(t[0]), self.mask_reg(f[0]));
+                        let (tk, fk) = (self.mask_reg(t[1]), self.mask_reg(f[1]));
+                        let val = self.vsel(cv, tv, fv);
+                        let known = self.vsel(cv, tk, fk);
+                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                    }
+                    2 => {
+                        let (t, f) = (self.as_ival(a[1])?, self.as_ival(a[2])?);
+                        let (tl, fl) = (self.num_reg(t[0]), self.num_reg(f[0]));
+                        let (th, fh) = (self.num_reg(t[1]), self.num_reg(f[1]));
+                        let lo = self.vsel(cv, tl, fl);
+                        let hi = self.vsel(cv, th, fh);
+                        Value::Ival([NumVal::Reg(lo), NumVal::Reg(hi)])
+                    }
+                    _ => {
+                        let t = self.as_num(a[1])?;
+                        let f = self.as_num(a[2])?;
+                        let (tr, fr) = (self.num_reg(t), self.num_reg(f));
+                        Value::Num(NumVal::Reg(self.vsel(cv, tr, fr)))
+                    }
+                }
+            }
+            Op::Span => {
+                // The hull [lo of arg0, hi of arg1].
+                let a0 = self.as_ival(a[0])?;
+                let a1 = self.as_ival(a[1])?;
+                Value::Ival([a0[0], a1[1]])
+            }
+            Op::Frag(c) => {
+                let iv = self.as_ival(a[0])?;
+                let ar = self.ival_regs(iv);
+                let (frag, _) = self.zi_fork_flr(ar, *c);
+                Value::Ival([NumVal::Reg(frag[0]), NumVal::Reg(frag[1])])
+            }
+            Op::FragOk(c) => {
+                let iv = self.as_ival(a[0])?;
+                let ar = self.ival_regs(iv);
+                let (_, ok) = self.zi_fork_flr(ar, *c);
+                Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
+            }
+            Op::SplitOk => {
+                let iv = self.as_ival(a[0])?;
+                let ar = self.ival_regs(iv);
+                let ok = self.zi_span_ok(ar);
+                Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
+            }
+            Op::Div | Op::Rem | Op::Sin | Op::Mget => {
+                let (op, n_args) = match &node.op {
+                    Op::Div => (CallOp::Div, 2),
+                    Op::Rem => (CallOp::Rem, 2),
+                    Op::Sin => (CallOp::Sin, 1),
+                    _ => (CallOp::Mget, 2),
+                };
+                let mut args = Vec::with_capacity(n_args);
+                for k in 0..n_args {
+                    let n = self.as_num(a[k])?;
+                    args.push(self.num_reg(n));
+                }
+                let dst = self.fresh();
+                self.insts.push(Inst::Call { op, dst, args, scalars: Vec::new() });
+                Value::Num(NumVal::Reg(dst))
+            }
+            Op::TileFlagAt => {
+                let nx = self.as_num(a[0])?;
+                let x = self.num_reg(nx);
+                let ny = self.as_num(a[1])?;
+                let y = self.num_reg(ny);
+                let (wv, hv, fv) = (self.as_num(a[2])?, self.as_num(a[3])?, self.as_num(a[4])?);
+                let flag = match fv {
+                    NumVal::ConstI32(c) => c,
+                    _ => bail!("node {}: tile_flag flag must be an exact constant", id),
+                };
+                let dst = self.fresh();
+                match (wv, hv) {
+                    (NumVal::ConstI32(w), NumVal::ConstI32(h)) => {
+                        self.insts.push(Inst::Call {
+                            op: CallOp::TileFlag,
+                            dst,
+                            args: vec![x, y],
+                            scalars: vec![w, h, flag],
+                        });
+                    }
+                    _ => {
+                        let wr = self.num_reg(wv);
+                        let hr = self.num_reg(hv);
+                        self.insts.push(Inst::Call {
+                            op: CallOp::TileFlagLanes,
+                            dst,
+                            args: vec![x, y, wr, hr],
+                            scalars: vec![flag],
+                        });
+                    }
+                }
+                Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
             }
             other => bail!("node {}: op {:?} is not supported by the asm slice", id, other),
         };
@@ -532,7 +1131,23 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
             out.push(*a);
             push_src(b, out);
         }
+        Inst::Muldq { a, b, .. } | Inst::BlendImm { a, b, .. } => {
+            out.push(*a);
+            out.push(*b);
+        }
+        Inst::Sraq { a, .. } | Inst::Sllq { a, .. } => out.push(*a),
+        Inst::Cmp { a, b, .. } => {
+            out.push(*a);
+            push_src(b, out);
+        }
+        Inst::Ternlog { a, b, c, .. } => {
+            out.push(*a);
+            out.push(*b);
+            out.push(*c);
+        }
+        Inst::Call { args, .. } => out.extend(args.iter().copied()),
         Inst::Store { src, .. } => push_src(src, out),
+        Inst::StoreMask { src, .. } => out.push(*src),
     }
 }
 
@@ -658,8 +1273,15 @@ fn inst_def(inst: &Inst) -> Option<Vreg> {
         | Inst::BitsLo { dst, .. }
         | Inst::BitsHi { dst, .. }
         | Inst::Srlq { dst, .. }
-        | Inst::QBin { dst, .. } => Some(*dst),
-        Inst::Store { .. } => None,
+        | Inst::QBin { dst, .. }
+        | Inst::Muldq { dst, .. }
+        | Inst::Sraq { dst, .. }
+        | Inst::Sllq { dst, .. }
+        | Inst::BlendImm { dst, .. }
+        | Inst::Cmp { dst, .. }
+        | Inst::Ternlog { dst, .. }
+        | Inst::Call { dst, .. } => Some(*dst),
+        Inst::Store { .. } | Inst::StoreMask { .. } => None,
     }
 }
 
@@ -755,6 +1377,10 @@ struct Emitter<'a> {
     insts: &'a [Inst],
     remat: &'a [bool],
     def_of: &'a [u32],
+    /// rsp offset of the 32-zmm save area used around a call.
+    save_off: u32,
+    /// rsp offset of the call-out argument/result buffers.
+    argbuf_off: u32,
     pool: Pool,
     out: String,
 }
@@ -795,7 +1421,7 @@ impl<'a> Emitter<'a> {
     fn rematerialize(&mut self, v: Vreg, dst: u8) {
         match &self.insts[self.def_of[v as usize] as usize] {
             Inst::Load { off, .. } => {
-                writeln!(self.out, "    vmovdqu64 {}(%rdi), %zmm{}", off, dst).unwrap();
+                writeln!(self.out, "    vmovdqu64 {}(%r13), %zmm{}", off, dst).unwrap();
             }
             Inst::BitsLo { src, .. } => {
                 let src = *src;
@@ -862,7 +1488,7 @@ impl<'a> Emitter<'a> {
                     return;
                 }
                 let d = self.def_reg(*dst);
-                writeln!(self.out, "    vmovdqu64 {}(%rdi), %zmm{}", off, d).unwrap();
+                writeln!(self.out, "    vmovdqu64 {}(%r13), %zmm{}", off, d).unwrap();
                 self.store_def(*dst, d);
             }
             Inst::BcastD { dst, val } => {
@@ -881,6 +1507,9 @@ impl<'a> Emitter<'a> {
                     ROp::MinSD => "vpminsd",
                     ROp::MaxSD => "vpmaxsd",
                     ROp::AndD => "vpandd",
+                    ROp::OrD => "vpord",
+                    ROp::XorD => "vpxord",
+                    ROp::AndnD => "vpandnd",
                 };
                 writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
                 self.store_def(*dst, d);
@@ -936,6 +1565,145 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
                 self.store_def(*dst, d);
             }
+            Inst::Muldq { dst, a, b } => {
+                let ra = self.use_reg(*a, OPA);
+                let rb = self.use_reg(*b, OPB);
+                let d = self.def_reg(*dst);
+                writeln!(self.out, "    vpmuldq %zmm{}, %zmm{}, %zmm{}", rb, ra, d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::Sraq { dst, a, imm } => {
+                let ra = self.use_reg(*a, OPA);
+                let d = self.def_reg(*dst);
+                writeln!(self.out, "    vpsraq ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::Sllq { dst, a, imm } => {
+                let ra = self.use_reg(*a, OPA);
+                let d = self.def_reg(*dst);
+                writeln!(self.out, "    vpsllq ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::BlendImm { dst, mask, a, b } => {
+                let ra = self.use_reg(*a, OPA);
+                let rb = self.use_reg(*b, OPB);
+                let d = self.def_reg(*dst);
+                // k1 is the fixed scratch mask register.
+                writeln!(self.out, "    movw ${}, %ax", *mask as i16).unwrap();
+                writeln!(self.out, "    kmovw %eax, %k1").unwrap();
+                // vpblendmd: lane takes the second source where k is set.
+                writeln!(self.out, "    vpblendmd %zmm{}, %zmm{}, %zmm{}{{%k1}}", rb, ra, d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::Cmp { dst, imm, a, b } => {
+                let ra = self.use_reg(*a, OPA);
+                let bop = self.src_operand(*b, OPB, true);
+                let d = self.def_reg(*dst);
+                // k1 = (a CMP b); expand mask to a per-lane vector mask.
+                writeln!(self.out, "    vpcmpd ${}, {}, %zmm{}, %k1", imm, bop, ra).unwrap();
+                writeln!(self.out, "    vpmovm2d %k1, %zmm{}", d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::Ternlog { dst, a, b, c, imm } => {
+                let ra = self.use_reg(*a, OPA);
+                let rb = self.use_reg(*b, OPB);
+                let rc = self.use_reg(*c, H0);
+                let d = self.def_reg(*dst);
+                // dst = LUT(dst, b, c) with dst preloaded from a.
+                if d != ra {
+                    writeln!(self.out, "    vmovdqa64 %zmm{}, %zmm{}", ra, d).unwrap();
+                }
+                writeln!(self.out, "    vpternlogd ${}, %zmm{}, %zmm{}, %zmm{}", imm, rc, rb, d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::Call { op, dst, args, scalars } => {
+                // 1. marshal SIMD args to arg buffers (slots 0..).
+                for (i, a) in args.iter().enumerate() {
+                    let r = self.use_reg(*a, OPA);
+                    let off = self.argbuf_off + i as u32 * 64;
+                    writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%rsp)", r, off).unwrap();
+                }
+                let resbuf = self.argbuf_off + 7 * 64;
+                // 2. save all 32 zmm (the call clobbers every vector reg).
+                for r in 0..32u32 {
+                    writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%rsp)", r, self.save_off + r * 64)
+                        .unwrap();
+                }
+                let arg = |i: u32| self.argbuf_off + i * 64;
+                // 3. set up C args and pick the ctx slot; `stack_arg` = a 7th
+                //    scalar pushed for the tile_flag calls.
+                let (ctx_off, stack_arg): (u32, bool) = match op {
+                    CallOp::Div | CallOp::Rem | CallOp::Sin => {
+                        writeln!(self.out, "    leaq {}(%rsp), %rdi", resbuf).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %rsi", arg(0)).unwrap();
+                        if !matches!(op, CallOp::Sin) {
+                            writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(1)).unwrap();
+                        }
+                        let c = match op {
+                            CallOp::Div => CTX_DIV,
+                            CallOp::Rem => CTX_REM,
+                            _ => CTX_SIN,
+                        };
+                        (c, false)
+                    }
+                    CallOp::Mget => {
+                        writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %rcx", arg(1)).unwrap();
+                        (CTX_MGET, false)
+                    }
+                    CallOp::TileFlag => {
+                        writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %rcx", arg(1)).unwrap();
+                        writeln!(self.out, "    movl ${}, %r8d", scalars[0]).unwrap();
+                        writeln!(self.out, "    movl ${}, %r9d", scalars[1]).unwrap();
+                        writeln!(self.out, "    subq $16, %rsp").unwrap();
+                        writeln!(self.out, "    movl ${}, (%rsp)", scalars[2]).unwrap();
+                        (CTX_TILE, true)
+                    }
+                    CallOp::TileFlagLanes => {
+                        writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %rcx", arg(1)).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %r8", arg(2)).unwrap();
+                        writeln!(self.out, "    leaq {}(%rsp), %r9", arg(3)).unwrap();
+                        writeln!(self.out, "    subq $16, %rsp").unwrap();
+                        writeln!(self.out, "    movl ${}, (%rsp)", scalars[0]).unwrap();
+                        (CTX_TILE_LANES, true)
+                    }
+                };
+                // 4. call through the ctx.
+                writeln!(self.out, "    movq {}(%r15), %rax", ctx_off).unwrap();
+                writeln!(self.out, "    call *%rax").unwrap();
+                if stack_arg {
+                    writeln!(self.out, "    addq $16, %rsp").unwrap();
+                }
+                // 5. restore all 32 zmm.
+                for r in 0..32u32 {
+                    writeln!(self.out, "    vmovdqu64 {}(%rsp), %zmm{}", self.save_off + r * 64, r)
+                        .unwrap();
+                }
+                // 6. read the result into dst.
+                let d = self.def_reg(*dst);
+                if matches!(op, CallOp::TileFlag | CallOp::TileFlagLanes) {
+                    writeln!(self.out, "    movzwl {}(%rsp), %eax", resbuf).unwrap();
+                    writeln!(self.out, "    kmovw %eax, %k1").unwrap();
+                    writeln!(self.out, "    vpmovm2d %k1, %zmm{}", d).unwrap();
+                } else {
+                    writeln!(self.out, "    vmovdqu64 {}(%rsp), %zmm{}", resbuf, d).unwrap();
+                }
+                self.store_def(*dst, d);
+            }
+            Inst::StoreMask { off, src } => {
+                let rs = self.use_reg(*src, OPA);
+                writeln!(self.out, "    vpmovd2m %zmm{}, %k1", rs).unwrap();
+                writeln!(self.out, "    kmovw %k1, %eax").unwrap();
+                writeln!(self.out, "    movw %ax, {}(%r14)", off).unwrap();
+            }
             Inst::Store { off, src } => {
                 let r = match src {
                     Src::Reg(v) => self.use_reg(*v, OPA),
@@ -950,7 +1718,7 @@ impl<'a> Emitter<'a> {
                         OPA
                     }
                 };
-                writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%rsi)", r, off).unwrap();
+                writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%r14)", r, off).unwrap();
             }
         }
     }
@@ -1002,14 +1770,40 @@ pub fn compile(g: &Graph, roots: &[NodeId], sym: &str) -> Result<Compiled> {
         lo.lower_node(id)?;
     }
 
-    // Roots -> stores.
+    // Roots -> typed stores, each into its own 128-byte slot.
+    let mut root_kinds: Vec<RootKind> = Vec::with_capacity(roots.len());
     for (ri, r) in roots.iter().enumerate() {
-        let w = lo.as_word(*r)?;
-        for half in 0..2 {
-            let src = lo.word_src(w[half]);
-            let off = ri as u32 * 128 + half as u32 * 64;
-            lo.insts.push(Inst::Store { off, src });
-        }
+        let base = ri as u32 * 128;
+        let kind = match lo.vals[*r as usize] {
+            Some(Value::Word(w)) => {
+                for half in 0..2 {
+                    let src = lo.word_src(w[half]);
+                    lo.insts.push(Inst::Store { off: base + half as u32 * 64, src });
+                }
+                RootKind::Word
+            }
+            Some(Value::Num(n)) => {
+                let src = lo.num_src(n);
+                lo.insts.push(Inst::Store { off: base, src });
+                RootKind::Num
+            }
+            Some(Value::Ival(iv)) => {
+                for (half, nv) in iv.iter().enumerate() {
+                    let src = lo.num_src(*nv);
+                    lo.insts.push(Inst::Store { off: base + half as u32 * 64, src });
+                }
+                RootKind::Ival
+            }
+            Some(Value::Bool(b)) => {
+                let val = lo.mask_reg(b[0]);
+                let known = lo.mask_reg(b[1]);
+                lo.insts.push(Inst::StoreMask { off: base, src: val });
+                lo.insts.push(Inst::StoreMask { off: base + 2, src: known });
+                RootKind::Bool
+            }
+            None => bail!("root {} was never lowered", r),
+        };
+        root_kinds.push(kind);
     }
 
     // Instruction-level list scheduling to interleave the independent mul
@@ -1041,11 +1835,20 @@ pub fn compile(g: &Graph, roots: &[NodeId], sym: &str) -> Result<Compiled> {
 
     let (home, spill_slots) = allocate(&lo.insts, lo.next_vreg, &remat);
 
+    // Any call-outs? They need a 32-zmm save area and arg buffers above the
+    // spill region, and the r13/r14/r15 prologue.
+    let has_calls = lo.insts.iter().any(|i| matches!(i, Inst::Call { .. }));
+    let spill_bytes = spill_slots as u32 * 64;
+    let save_off = spill_bytes;
+    let argbuf_off = spill_bytes + SAVE_BYTES;
+
     let mut em = Emitter {
         home: &home,
         insts: &lo.insts,
         remat: &remat,
         def_of: &def_of,
+        save_off,
+        argbuf_off,
         pool: Pool::default(),
         out: String::new(),
     };
@@ -1057,11 +1860,23 @@ pub fn compile(g: &Graph, roots: &[NodeId], sym: &str) -> Result<Compiled> {
     }
     std::mem::swap(&mut em.out, &mut body); // em.out empty again, body holds the code
 
-    let frame = spill_slots * 64;
+    // Frame: spill slots, then (if any call-outs) the zmm save area and the
+    // call-out arg buffers. r13/r14/r15 are callee-saved and hold the input,
+    // output and ctx pointers so a `call` may clobber rdi/rsi/rdx.
+    let extra = if has_calls { SAVE_BYTES + ARGBUF_BYTES } else { 0 };
+    let frame = spill_bytes + extra;
     let mut asm = String::new();
     writeln!(asm, ".text").unwrap();
     writeln!(asm, ".globl {sym}").unwrap();
     writeln!(asm, "{sym}:").unwrap();
+    // Three pushes make rsp 16-aligned (entry is 8 mod 16); a 64-multiple
+    // frame keeps it aligned for calls.
+    writeln!(asm, "    push %r13").unwrap();
+    writeln!(asm, "    push %r14").unwrap();
+    writeln!(asm, "    push %r15").unwrap();
+    writeln!(asm, "    movq %rdi, %r13").unwrap();
+    writeln!(asm, "    movq %rsi, %r14").unwrap();
+    writeln!(asm, "    movq %rdx, %r15").unwrap();
     if frame > 0 {
         writeln!(asm, "    sub ${}, %rsp", frame).unwrap();
     }
@@ -1070,6 +1885,9 @@ pub fn compile(g: &Graph, roots: &[NodeId], sym: &str) -> Result<Compiled> {
     if frame > 0 {
         writeln!(asm, "    add ${}, %rsp", frame).unwrap();
     }
+    writeln!(asm, "    pop %r15").unwrap();
+    writeln!(asm, "    pop %r14").unwrap();
+    writeln!(asm, "    pop %r13").unwrap();
     writeln!(asm, "    vzeroupper").unwrap();
     writeln!(asm, "    ret").unwrap();
 
@@ -1087,6 +1905,7 @@ pub fn compile(g: &Graph, roots: &[NodeId], sym: &str) -> Result<Compiled> {
         asm,
         input_cells: lo.input_cells,
         n_roots: roots.len(),
+        root_kinds,
         sym: sym.to_string(),
         spill_slots,
     })
