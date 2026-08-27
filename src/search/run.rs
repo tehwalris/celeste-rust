@@ -698,16 +698,20 @@ fn take_carried_keys() -> Vec<Option<Vec<(u64, u64)>>> {
 }
 
 /// Whether the compiled forward path keys the frontier by the ENGINE key it
-/// carries (Option 1). Tied to the frontier-skip flag: the skip needs the
-/// frontier in the kernel's own key space, and vice-versa the carried key is
-/// only useful once the kernel probes it.
+/// carries. This is the ONE predicate that couples every engine-keyed piece
+/// (routing through step_parallel, the carry, the frozen-frontier guard): the
+/// frozen-frontier skip (Option 1) OR the within-frame skip (Option 4) turns it
+/// on, because the within-frame skip probes and populates the SAME engine key
+/// space and would be unsound/divergent on an interpreter-keyed frontier. So
+/// there is no path where the within-frame skip is on but the frontier is not
+/// engine-keyed.
 fn engine_keyed_frontier() -> bool {
-    frontier_skip_on()
+    frontier_skip_on() || within_frame_skip_on()
 }
 
 /// Option 4: the racy within-frame skip. Implies the engine-keyed frontier
 /// (it probes the same key space) and requires a frozen frontier.
-fn within_frame_skip_on() -> bool {
+pub(crate) fn within_frame_skip_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CELESTE_WITHIN_FRAME_SKIP").is_some())
 }
@@ -1951,7 +1955,7 @@ impl AbstractRun {
                                 // frozen frontier (buffered/mmap); else a mid-frame
                                 // probe would be timing-dependent, so we do not set
                                 // it (no skip, still sound and byte-identical).
-                                let _fg = (frontier_skip_on() && visited_ro.is_frozen())
+                                let _fg = (engine_keyed_frontier() && visited_ro.is_frozen())
                                     .then(|| crate::compiled::dispatch::with_frozen_frontier(visited_ro));
                                 let outputs = interpret_state_base(
                                     variants, deopt, frame_cfg, fixed_env, state, &mut ev,
@@ -2507,7 +2511,7 @@ impl AbstractRun {
                 opt1, pct(opt1, dups), pct(opt1, total), ny, pct(ny, dups), nn
             );
         }
-        if frontier_skip_on() {
+        if engine_keyed_frontier() {
             let probes = crate::compiled::dispatch::FRONTIER_PROBES.swap(0, std::sync::atomic::Ordering::Relaxed);
             let hits = crate::compiled::dispatch::FRONTIER_HITS.swap(0, std::sync::atomic::Ordering::Relaxed);
             let none = crate::compiled::dispatch::FRONTIER_NONE.swap(0, std::sync::atomic::Ordering::Relaxed);

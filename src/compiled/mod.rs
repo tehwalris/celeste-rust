@@ -35,7 +35,12 @@ pub type KeyedState = (crate::interpreter::state::State, Option<Vec<(u64, u64)>>
 /// are one feature.
 fn engine_keyed_frontier_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CELESTE_FRONTIER_SKIP").is_some())
+    // Must match `search::run::engine_keyed_frontier` (frontier-skip OR
+    // within-frame-skip): the carry is needed for either.
+    *ON.get_or_init(|| {
+        std::env::var_os("CELESTE_FRONTIER_SKIP").is_some()
+            || std::env::var_os("CELESTE_WITHIN_FRAME_SKIP").is_some()
+    })
 }
 // The engine's hasher, not celeste-rust's. rustc-hash 1 and 2 hash
 // differently and this crate is still on 1; the row machinery's maps

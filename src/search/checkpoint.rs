@@ -527,7 +527,7 @@ pub fn save(
     // skip is on - Option-1-only states.bin is already deterministic.
     let sorted;
     let states_to_write: &[State] =
-        if std::env::var_os("CELESTE_WITHIN_FRAME_SKIP").is_some() {
+        if crate::search::run::within_frame_skip_on() {
             sorted = canonical_sort_frontier(states);
             &sorted
         } else {
