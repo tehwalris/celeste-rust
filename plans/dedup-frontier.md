@@ -421,3 +421,49 @@ the win today" - the frozen frontier only pays once the EARLY CHECK exists).
   Byte-identical WITHIN a kernel (the const cells were already constant, so
   the new key's within-kernel PARTITION is unchanged -> RowSet keeps the same
   rows -> identical outputs). Gate: differentials + `check` + parcheck.
+
+## Increment status (2026-08-27) - SOUND design, gated per step
+
+| # | what | gate | status |
+|---|---|---|---|
+| 3 | frozen-frontier / buffered map engine (`CELESTE_FRONTIER_BUFFERED`) | unit + parcheck + artifact byte-diff + quick suite | LANDED (byte-identical; ~+5.6% wall alone - it is the substrate for Step B, not a standalone win) |
+| a | vectorized `cell_mix` (`zw_cellmix_n/i/b`, `zw_add`, `zw_mix64`) | `vector_cell_mix_agrees_with_the_scalar_definition` | LANDED |
+| b+c | emitter emits the SOUND full boundary key inline, ALL rooms regenerated | quick suite 293 passed: `{traced,ladder,exact}_kernels_reproduce_the_interpreter` (CELESTE_COMPILED_FORWARD=check), room00/room20 lattice differentials, `{traced,ladder,exact}_kernels_are_current` + the `#[ignore]`d room00/room20 currency | LANDED |
+| B | check the frozen frontier BEFORE the append (skip materializing dup rows) | interpreter differential + parcheck byte-identical + run-phase delta | NOT STARTED - see below |
+
+The engine's kernel key now EQUALS `Rt2::boundary`'s row key (b+c), so the
+engine and campaign key spaces coincide (the old D1 bijection becomes an
+equality) - which is exactly what lets Step B probe the frontier with the
+kernel's own key.
+
+### Step B - the remaining work, and its hard part (for Philippe)
+
+Move the dedup check before the column pushes in the kernel's `append`
+(`trace::kernel::render` / `compiled::dispatch::run_traced_kernel`): probe the
+FROZEN frontier + a within-frame buffer with the row key (already in-register,
+`mix64(KPART + kv.h)`), and skip materializing on a hit. The frozen frontier
+(#3) and the in-register key (b+c) are both in place.
+
+THE HARD PART is determinism of the WITHIN-FRAME tier, and it is why this is
+Philippe's call, not an autonomous commit:
+- The profile says ~90% of killed duplicates are WITHIN-FRAME cross-chunk
+  (another chunk this frame), only ~10% cross-frame. So the big win needs the
+  kernel to skip rows a SIBLING chunk is about to emit - but sibling chunks run
+  in PARALLEL, and row ids are assigned in INPUT ORDER by the serial
+  `decided_survivors` for byte-identical checkpoints (parcheck).
+- Today that within-frame dedup is deliberately AFTER materialization
+  (`partition_filter`'s hash-partitioned per-thread `seen` sets, then the
+  serial id assignment) precisely so the survivor set and id order are a
+  deterministic function of the input, independent of thread timing. Pulling
+  it before materialization while keeping ids byte-identical is the crux of
+  Design 2 and needs a determinism model decision (e.g. a per-thread
+  key-partitioned frozen buffer that the kernel consults, with id assignment
+  still serial over survivors in input order).
+- Cross-FRAME only (frozen frontier, ~10% of dups) is deterministic and safe
+  to do first (the frontier is read-only mid-frame), but it is the smaller
+  half of the win.
+
+Recommendation: land the cross-frame skip first (safe, ~10%), then design the
+within-frame pre-materialization buffer with Philippe (the determinism model
+is a real decision, and a subtle bug there is the catastrophic kind CLAUDE.md
+warns about). Not started here on purpose: correctness/determinism first.
