@@ -276,6 +276,78 @@ unsafe fn mix64_v(x: __m512i) -> __m512i {
     _mm512_xor_si512(b, _mm512_srli_epi64::<31>(b))
 }
 
+// ---- full row-key primitives: vectorized `cell_mix` ----
+//
+// The boundary row key is an ORDER-INDEPENDENT SUM of per-cell mixes
+// (`runtime2::boundary_finish`): `key = mix64(part + Σ_cells cell_mix(cell,
+// value, seed))`, over TWO seeds for 128 bits. These are the vectorized
+// `cell_mix` for each per-lane output-column type (Num, Ival, Bool/UBool),
+// so a kernel can emit that SAME key inline instead of the sequential
+// `zw_mix1/2` chain over only the non-const cells (which is unsound to
+// dedup on ACROSS shapes; see plans/dedup-frontier.md). Each is gated
+// byte-identical against the scalar `cell_mix` in tests.
+
+#[inline(always)]
+fn zw_or(a: ZW, b: ZW) -> ZW {
+    unsafe { ZW(_mm512_or_si512(a.0, b.0), _mm512_or_si512(a.1, b.1)) }
+}
+#[inline(always)]
+fn zw_xor(a: ZW, b: ZW) -> ZW {
+    unsafe { ZW(_mm512_xor_si512(a.0, b.0), _mm512_xor_si512(a.1, b.1)) }
+}
+
+/// 64-bit wrapping add, lane for lane - the row-key accumulation step.
+#[inline(always)]
+pub fn zw_add(a: ZW, b: ZW) -> ZW {
+    unsafe { ZW(_mm512_add_epi64(a.0, b.0), _mm512_add_epi64(a.1, b.1)) }
+}
+
+/// `mix64` over a whole ZW - the row key's final fold (and the interval
+/// inner mix). Public so the emitter can spell the closing `mix64(part + Σ)`.
+#[inline(always)]
+pub fn zw_mix64(x: ZW) -> ZW {
+    unsafe { ZW(mix64_v(x.0), mix64_v(x.1)) }
+}
+
+/// `cell_mix(c, AV::Num(v), seed)` for a whole ZN column.
+#[inline(always)]
+pub fn zw_cellmix_n(c: u64, x: ZN, seed: u64) -> ZW {
+    // av_code(Num) = 1<<56 | bits(v); cell_mix = mix64(seed ^ c*GOLD ^ av_code)
+    let base = zw_splat(seed ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    let code = zw_or(zw_splat(1u64 << 56), zw_bits_n(x));
+    zw_mix64(zw_xor(base, code))
+}
+
+/// `cell_mix(c, AV::Ival(lo, hi), seed)` for a ZI column.
+#[inline(always)]
+pub fn zw_cellmix_i(c: u64, x: ZI, seed: u64) -> ZW {
+    // av_code(Ival) = 2<<56 | ((lo<<24) ^ mix64(hi<<1))
+    let base = zw_splat(seed ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    let lo = zw_bits_n(x.lo);
+    let hi = zw_bits_n(x.hi);
+    let lo24 = unsafe { ZW(_mm512_slli_epi64::<24>(lo.0), _mm512_slli_epi64::<24>(lo.1)) };
+    let hi1 = unsafe { ZW(_mm512_slli_epi64::<1>(hi.0), _mm512_slli_epi64::<1>(hi.1)) };
+    let inner = zw_xor(lo24, zw_mix64(hi1));
+    let code = zw_or(zw_splat(2u64 << 56), inner);
+    zw_mix64(zw_xor(base, code))
+}
+
+/// `cell_mix(c, AV::Bool(v)|UBool, seed)` for a ZB column: per lane the
+/// `known` bit selects Bool(val) (av_code 3<<56|val) vs UBool (4<<56).
+#[inline(always)]
+pub fn zw_cellmix_b(c: u64, x: ZB, seed: u64) -> ZW {
+    let base = seed ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let code: [u64; W] = std::array::from_fn(|i| {
+        if (x.known >> i) & 1 != 0 {
+            3u64 << 56 | ((x.val >> i) & 1) as u64
+        } else {
+            4u64 << 56
+        }
+    });
+    zw_mix64(zw_xor(zw_splat(base), ZW::from_array(code)))
+}
+
+
 // ---- 16-lane PICO-8 arithmetic ----
 //
 // A `Pico8Num` is its raw `i32` in 16.16 fixed point, so add, sub, min
@@ -1287,6 +1359,51 @@ mod tests {
                 (((val >> i) & 1) as u64) | ((((known >> i) & 1) as u64) << 1)
             });
             assert_eq!(zw_bits_b(b).to_array(), want, "bits_b {:04x}/{:04x}", val, known);
+        }
+    }
+    /// The vectorized `cell_mix` (full row-key contribution) for every
+    /// per-lane output-column type, gated BYTE-IDENTICAL against the scalar
+    /// `cell_mix` that DEFINES the boundary row key. This is the primitive a
+    /// sound canonical-emission kernel folds over all cells; a disagreement
+    /// here silently changes which successors are distinct, so it is checked
+    /// directly against the definition rather than any second copy.
+    #[test]
+    fn vector_cell_mix_agrees_with_the_scalar_definition() {
+        use crate::runtime2::{cell_mix, AV};
+        let seeds = [0x5bf0_3635u64, 0x27d4_eb2f, 0, 1, 0xdead_beef_cafe_f00d];
+        let cells = [0u64, 1, 20, 39, 41, 255, 0xffff_ffff];
+        for s in seeds {
+            for c in cells {
+                for k in 0..24usize {
+                    let col = column(k);
+                    let got = zw_cellmix_n(c, col, s).to_array();
+                    for i in 0..W {
+                        let want = cell_mix(c, AV::Num(col.lane(i)), s);
+                        assert_eq!(got[i], want, "n c={} s={:x} k={} i={}", c, s, k, i);
+                    }
+                    let lo = column(k);
+                    let hi = column(k + 5);
+                    let iv = ZI { lo, hi };
+                    let got = zw_cellmix_i(c, iv, s).to_array();
+                    for i in 0..W {
+                        let want = cell_mix(c, AV::Ival(lo.lane(i), hi.lane(i)), s);
+                        assert_eq!(got[i], want, "i c={} s={:x} k={} i={}", c, s, k, i);
+                    }
+                }
+                for (val, known) in [(0u16, 0u16), (ALL, ALL), (0x5555, 0xaaaa), (1, 0xffff), (0xf0f0, 0x0ff0)] {
+                    let b = ZB { val, known };
+                    let got = zw_cellmix_b(c, b, s).to_array();
+                    for i in 0..W {
+                        let av = if (known >> i) & 1 != 0 {
+                            AV::Bool((val >> i) & 1 != 0)
+                        } else {
+                            AV::UBool
+                        };
+                        let want = cell_mix(c, av, s);
+                        assert_eq!(got[i], want, "b c={} s={:x} v={:x}/{:x} i={}", c, s, val, known, i);
+                    }
+                }
+            }
         }
     }
 
