@@ -117,6 +117,33 @@ version = "0.1.0"
 dependencies = [
  "celeste-core",
  "celeste-engine",
+ "celeste-kernels-room00",
+ "celeste-kernels-room10",
+ "celeste-kernels-room20",
+]
+
+[[package]]
+name = "celeste-kernels-room00"
+version = "0.1.0"
+dependencies = [
+ "celeste-core",
+ "celeste-engine",
+]
+
+[[package]]
+name = "celeste-kernels-room10"
+version = "0.1.0"
+dependencies = [
+ "celeste-core",
+ "celeste-engine",
+]
+
+[[package]]
+name = "celeste-kernels-room20"
+version = "0.1.0"
+dependencies = [
+ "celeste-core",
+ "celeste-engine",
 ]
 
 [[package]]

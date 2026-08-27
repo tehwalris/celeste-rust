@@ -6,4 +6,7 @@ edition = "2021"
 [dependencies]
 celeste-core = { path = "../celeste-core" }
 celeste-engine = { path = "../celeste-engine" }
+celeste-kernels-room00 = { path = "../celeste-kernels-room00" }
+celeste-kernels-room10 = { path = "../celeste-kernels-room10" }
+celeste-kernels-room20 = { path = "../celeste-kernels-room20" }
 

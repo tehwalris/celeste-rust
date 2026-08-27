@@ -32,8 +32,9 @@ if [ -z "${SKIP_RENDER:-}" ]; then
         the_kernel_emitter_lowers_a_traced_graph --no-capture 2>&1 |
         grep -E '^\[emit\] (FUSED|rendered|RENDER)' || true
 
-    # The ROOM's set is no longer rendered here. It is CHECKED IN, in
-    # `crates/celeste-kernels/src/traced`, so the workspace build
+    # The ROOM's set is no longer rendered here. It is CHECKED IN, one
+    # crate per room (`crates/celeste-kernels-room00/src/traced` etc.,
+    # aggregated by `crates/celeste-kernels`), so the workspace build
     # compiles it and `traced_kernels_are_current` catches it going
     # stale. Regenerate it with ./regen-generated.sh.
 fi

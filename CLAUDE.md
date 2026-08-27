@@ -261,12 +261,29 @@ crates/celeste-interp    the INTERPRETER (the oracle),           deps: core, ir
                          game_runner, its instrumentation
 crates/celeste-engine    Rt2 block model, boundary/dedup/merge,  deps: core, names
                          row keys, kernel.rs lane primitives
-crates/celeste-kernels   GENERATED per-shape TRACED kernels     deps: core, engine
+crates/celeste-kernels-room00  GENERATED room (0,0) kernels       deps: core, engine
+crates/celeste-kernels-room10  GENERATED room (1,0) kernels       deps: core, engine
+crates/celeste-kernels-room20  GENERATED room (2,0) kernels       deps: core, engine
+crates/celeste-kernels   THIN AGGREGATOR of the three room crates deps: engine, the
+                         (SETS/FINGERPRINT per variant)               3 room crates
 .  (celeste-rust)        search driver, program assembly,        deps: all
                          AST tracer, transpile emitters,
                          compiled dispatch, campaign bins
 native-probe             bench/gate binary for the engine        deps: all
 ```
+
+The kernel crate is split ONE PER ROOM (task: split celeste-kernels for
+dev-loop compile time) so that touching one room's generated kernels
+only recompiles that room's crate: before the split the three rooms'
+generated code (~900k lines) was ONE compilation unit, so a one-line
+edit to a room (2,0) kernel forced a full relink of room (0,0) and
+(1,0) too. `crates/celeste-kernels` is now a thin aggregator that
+re-exports each room crate's `traced`/`ladder`/`exact::room<xy>` module
+and assembles `SETS`/`FINGERPRINT` from them - the public API
+(`celeste_kernels::{traced,ladder,exact}::{SETS,FINGERPRINT,room00,
+room10,room20}`) is unchanged, so every consumer (the dispatcher,
+`native-probe`, `traced-kernel-check`) still just depends on
+`celeste-kernels`.
 
 The split is HALF DONE (plans/tracing.md stage 1). The 38k lines of
 rewrite rules that used to be the next thing to extract are DELETED
@@ -303,7 +320,9 @@ kernels were room (1,0) shapes; since 2026-08-26 every set carries rooms
 identity (the active set's content hash) is hashed into the campaign
 fingerprint when it is on, so engines never share checkpoints. The
 kernel sets are the CONSTANT-LATTICE sets,
-`crates/celeste-kernels/src/{traced,ladder,exact}`, in ONE binary with
+`celeste_kernels::{traced,ladder,exact}` (generated one crate per room,
+`crates/celeste-kernels-room{00,10,20}`, aggregated by
+`crates/celeste-kernels`), in ONE binary with
 no cargo features: the per-class "walk" kernels and the `fused` artifact
 were deleted 2026-08-25 (plans/delete-the-interpreter.md Phase 1) after
 the traced set took every lane at f94 (BENCHMARK_DATA.md 2026-08-24:
@@ -324,11 +343,16 @@ its own root, so `celeste_rust::pico8_num::...` still resolves everywhere.
 
 ### The generated files are CHECKED IN
 
-`crates/celeste-kernels/src/{traced,ladder,exact}/` - the three
-CONSTANT-LATTICE kernel sets (base / rung-agnostic / exact-rem), each
-with one `room<x><y>/` subdirectory per generated room ((0,0), (1,0),
-(2,0)) and a merged `mod.rs` whose `SETS` table the dispatcher flattens
-(plans/specialize.md "Spec: latticeify everything"). Regenerate with:
+`crates/celeste-kernels-room00/src/{traced,ladder,exact}/room00/`
+(and the `-room10`/`-room20` siblings) - the three CONSTANT-LATTICE
+kernel sets (base / rung-agnostic / exact-rem), one crate per generated
+room ((0,0), (1,0), (2,0)), each variant dir holding that room's
+`room<x><y>/` kernels plus a thin `mod.rs` wrapper. The AGGREGATOR,
+`crates/celeste-kernels/src/{traced,ladder,exact}/mod.rs`, `pub use`s
+every room crate's module and assembles the `SETS` table the dispatcher
+flattens, plus a `FINGERPRINT` that re-hashes every room's kernel
+sources regardless of which crate they live in (plans/specialize.md
+"Spec: latticeify everything"). Regenerate with:
 
 ```bash
 ./regen-generated.sh     # then READ THE DIFF, then commit
@@ -351,12 +375,15 @@ dedups on. A reordering is a different search. New names (only possible
 if the Lua changes) may be APPENDED by hand, never inserted.
 
 There is a bootstrap to know about: the emitter lives in `celeste-rust`,
-which depends on `celeste-kernels`, whose contents it produces. Change
-what the kernel emitter emits and the committed kernels stop compiling,
-which stops `cargo build --bin transpile` from building the tool that
-would fix them. `regen-generated.sh` avoids it by generating into a
-scratch dir and only installing what builds; if you get stuck anyway,
-`git checkout crates/celeste-kernels/src`, build, regenerate.
+which depends on `celeste-kernels` and its three room crates, whose
+contents it produces. Change what the kernel emitter emits and the
+committed kernels stop compiling, which stops `cargo build --bin
+transpile` from building the tool that would fix them.
+`regen-generated.sh` avoids it by generating into a scratch dir and only
+installing what builds; if you get stuck anyway, `git checkout
+crates/celeste-kernels/src crates/celeste-kernels-room00/src
+crates/celeste-kernels-room10/src crates/celeste-kernels-room20/src`,
+build, regenerate.
 
 ## Useful entry points
 

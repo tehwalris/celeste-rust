@@ -2,8 +2,8 @@
 //!
 //!   transpile --room-kernels DIR              the TRACED per-shape set
 //!
-//! The default target is the checked-in generated crate,
-//! `crates/celeste-kernels/src/traced`. The canonical regen is
+//! The default target is a per-room generated crate,
+//! `crates/celeste-kernels-room<xy>/src/traced`. The canonical regen is
 //! `./regen-generated.sh`.
 
 use anyhow::{anyhow, Context, Result};
@@ -38,7 +38,7 @@ fn main() -> Result<()> {
             // (plans/kernel-ladder.md) - the same walk with the boundary
             // widenings left OUT of the graph, so the campaign boundary
             // applies whichever precision rung is configured. Target:
-            // crates/celeste-kernels/src/ladder.
+            // crates/celeste-kernels-room<xy>/src/ladder.
             "--room-kernels-ladder" => {
                 let d = args.next().ok_or_else(|| anyhow!("--room-kernels-ladder DIR"))?;
                 let sizes = celeste_rust::trace::kernel::write_room_kernels_ladder(
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
             // --room-kernels-exact DIR: the EXACT-REM set for the
             // ladder's top rung (k = 16) - interval slots as plain
             // numbers, no rem forks. Target:
-            // crates/celeste-kernels/src/exact.
+            // crates/celeste-kernels-room<xy>/src/exact.
             "--room-kernels-exact" => {
                 let d = args.next().ok_or_else(|| anyhow!("--room-kernels-exact DIR"))?;
                 let sizes = celeste_rust::trace::kernel::write_room_kernels_exact(
@@ -71,16 +71,34 @@ fn main() -> Result<()> {
                 );
                 return Ok(());
             }
-            // --merge-kernels DIR: write DIR/mod.rs from the per-room
-            // subdirectories the three generators above produced. Rooms
-            // are generated one process each (CELESTE_START_ROOM feeds
-            // a OnceLock); this is the file-level step that puts them
-            // all into one dispatch registry (`SETS`).
+            // --merge-kernels SET OUT_DIR ROOM_DIR...: write
+            // OUT_DIR/mod.rs (the AGGREGATOR, `crates/celeste-kernels`'s
+            // side) from one or more ROOM_DIRs, each a directory
+            // holding exactly one room*/ subdirectory the generators
+            // above produced (a room crate's `src/SET`, or a matching
+            // scratch dir). Rooms are generated one process each
+            // (CELESTE_START_ROOM feeds a OnceLock); this is the
+            // file-level step that puts them all into one dispatch
+            // registry (`SETS`).
             "--merge-kernels" => {
-                let d = args.next().ok_or_else(|| anyhow!("--merge-kernels DIR"))?;
-                let rooms =
-                    celeste_rust::trace::kernel::merge_kernel_sets(std::path::Path::new(&d))?;
-                eprintln!("merged {} rooms: {:?} in {}", rooms.len(), rooms, d);
+                let set = args.next().ok_or_else(|| {
+                    anyhow!("--merge-kernels SET OUT_DIR ROOM_DIR...")
+                })?;
+                let out = args.next().ok_or_else(|| {
+                    anyhow!("--merge-kernels SET OUT_DIR ROOM_DIR...")
+                })?;
+                let room_dirs: Vec<std::path::PathBuf> =
+                    args.by_ref().map(std::path::PathBuf::from).collect();
+                anyhow::ensure!(
+                    !room_dirs.is_empty(),
+                    "--merge-kernels SET OUT_DIR ROOM_DIR...: need at least one ROOM_DIR"
+                );
+                let rooms = celeste_rust::trace::kernel::merge_kernel_sets(
+                    &set,
+                    std::path::Path::new(&out),
+                    &room_dirs,
+                )?;
+                eprintln!("merged {} rooms: {:?} into {}", rooms.len(), rooms, out);
                 return Ok(());
             }
             "--room-consts" => {

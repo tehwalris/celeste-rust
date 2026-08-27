@@ -1,4 +1,6 @@
-//! The generated CONSTANT-LATTICE kernels, and nothing hand-written.
+//! A THIN AGGREGATOR over the generated CONSTANT-LATTICE kernels, and
+//! nothing hand-written except this file and the three variant
+//! `mod.rs` files below (also generated - see their own doc comments).
 //!
 //! Three variants x three rooms, every one of them lattice-specialized
 //! (plans/specialize.md "Spec: latticeify everything, all rooms, one
@@ -10,13 +12,21 @@
 //! default `CELESTE_KERNEL_STRICT`, never silently wrong. The
 //! non-lattice walk sets that used to live here were retired 2026-08-26.
 //!
-//! Each variant module holds one submodule per generated ROOM
-//! (`room00`, `room10`, `room20`), one kernel per heap shape that room
-//! reaches, and `SETS` - every room's `KERNELS` table, which
-//! `Dispatch::new_multi` flattens into the one shape-hash registry.
-//! Rooms are generated one process each (`CELESTE_START_ROOM` feeds
-//! process globals) and merged file-level by `transpile
-//! --merge-kernels`; the canonical regen is `./regen-generated.sh`.
+//! The generated kernels themselves live ONE CRATE PER ROOM
+//! (`celeste-kernels-room00`, `celeste-kernels-room10`,
+//! `celeste-kernels-room20`) so that touching one room's kernels only
+//! recompiles that room's crate - before this split the three rooms
+//! were ~900k lines in ONE compilation unit, so a one-line edit to a
+//! room (2,0) kernel forced a full relink of every room. Each variant
+//! module here (`traced`/`ladder`/`exact`) re-exports that room crate's
+//! `room00`/`room10`/`room20` submodule and assembles `SETS` - every
+//! room's `KERNELS` table, which `Dispatch::new_multi` flattens into
+//! the one shape-hash registry - plus a `FINGERPRINT` that re-hashes
+//! every room's kernel sources (so it is unaffected by which crate a
+//! room's kernels happen to live in). Rooms are generated one process
+//! each (`CELESTE_START_ROOM` feeds process globals) into their own
+//! crate and merged file-level by `transpile --merge-kernels`; the
+//! canonical regen is `./regen-generated.sh`.
 //!
 //! CHECKED IN, like `celeste-names`' tables, and for the same reason: a
 //! build.rs would have to run `transpile`, which needs the tracer from a
@@ -26,11 +36,12 @@
 //! and the `#[ignore]`d `room00_kernels_are_current` /
 //! `room20_kernels_are_current`.
 //!
-//! This crate sits ABOVE `celeste-engine` because the emitted code calls
-//! `celeste_engine::kernel`'s lane primitives and builds
-//! `celeste_engine::runtime2::Rt2` blocks - while the engine reaches DOWN to
-//! `celeste-names` for `FIELD_NAMES`. That is why the generated code is two
-//! crates and not one: in one crate those two directions are a cycle.
+//! This crate (and its room crates) sit ABOVE `celeste-engine` because
+//! the emitted code calls `celeste_engine::kernel`'s lane primitives and
+//! builds `celeste_engine::runtime2::Rt2` blocks - while the engine reaches
+//! DOWN to `celeste-names` for `FIELD_NAMES`. That is why the generated
+//! code is two crates (well, five, counting the per-room split) and not
+//! one: in one crate those two directions are a cycle.
 
 /// The BASE (level-0) set: the Bits(0) boundary widenings are traced
 /// into the graph, accumulators go through `Rt2::boundary`. Serves rem

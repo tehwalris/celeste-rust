@@ -22,14 +22,16 @@ pub mod kernel;
 ///
 /// It used to be installed here as generated source, like `kernel.rs`
 /// above. It is CHECKED IN now, in
-/// `crates/celeste-kernels/src/traced/room10` (the base variant of the
-/// multi-room constant-lattice sets, plans/specialize.md), because
-/// `compiled::FrameEngine` has to be able to call it - so this crate
-/// reads the same artifact the workspace builds rather than its own
-/// copy. The feature-gated room-(2,0) `lattice` module that used to sit
-/// beside it is gone: the room-(2,0) set is checked in as
-/// `traced::room20` and gated in the main workspace
-/// (`room20_lattice_kernels_match_the_interpreter`).
+/// `crates/celeste-kernels-room10/src/traced/room10` (the base variant
+/// of the multi-room constant-lattice sets, plans/specialize.md; each
+/// room is its own crate so touching one room's kernels does not
+/// recompile the others), because `compiled::FrameEngine` has to be
+/// able to call it - so this crate reads the same artifact the
+/// workspace builds (via the `celeste-kernels` aggregator's `traced::
+/// room10` re-export) rather than its own copy. The feature-gated
+/// room-(2,0) `lattice` module that used to sit beside it is gone: the
+/// room-(2,0) set is checked in as `traced::room20` and gated in the
+/// main workspace (`room20_lattice_kernels_match_the_interpreter`).
 pub use celeste_kernels::traced::room10 as kernels;
 
 #[cfg(test)]

@@ -9,11 +9,12 @@ serve/
 
 # Native-compile probe (task #124). The generated code is CHECKED IN
 # (task #150): `crates/celeste-names/src/gen.rs` (frozen) and the traced
-# kernel set `crates/celeste-kernels/src/traced/`, gated by
-# `traced_kernels_are_current`, which regenerates it and compares. A
-# build.rs cannot do that job - generating it needs the tracer from a
-# crate that sits above it - and checking it in is also what makes a
-# fresh clone build.
+# kernel set, one crate per room (`crates/celeste-kernels-room00/src/
+# traced/`, `-room10`, `-room20`) aggregated by `crates/celeste-kernels`,
+# gated by `traced_kernels_are_current`, which regenerates it and
+# compares. A build.rs cannot do that job - generating it needs the
+# tracer from a crate that sits above it - and checking it in is also
+# what makes a fresh clone build.
 #
 # Stale: the probe is a workspace member now, so it builds into /target.
 # Kept so an old checkout's build dir cannot be committed by accident.
@@ -21,8 +22,8 @@ native-probe/target/
 
 # The traced kernel run check generates its SINGLE-FRAME kernel; see its
 # Cargo.toml. (The room's per-shape set is checked in, in
-# crates/celeste-kernels/src/traced - it has to be, for FrameEngine to
-# call it.)
+# crates/celeste-kernels-room10/src/traced - it has to be, for
+# FrameEngine to call it.)
 traced-kernel-check/src/kernel.rs
 traced-kernel-check/target/
 target/traced-kernel.rs

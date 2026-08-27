@@ -5,8 +5,9 @@
 //! lane code, and `Line` is the stream it fills: one `Let` per bound node,
 //! `Raw` for structure. `trace::emit::lower_frame` builds an `Emit::bare`
 //! around the tracer's graph, `trace::kernel::render` assembles the lines
-//! into the checked-in per-shape kernels
-//! (`crates/celeste-kernels/src/traced/`).
+//! into the checked-in per-shape kernels, one crate per room
+//! (`crates/celeste-kernels-room00/src/traced/` etc., aggregated by
+//! `crates/celeste-kernels`).
 //!
 //! Every value has a static class - emit-time constant, block-uniform
 //! scalar (computed once per block), or per-lane (16 rows per zmm) - and
