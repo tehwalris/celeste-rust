@@ -759,8 +759,7 @@ fn partition_filter(
                                 continue;
                             }
                             let is_new = seen_p.insert(key);
-                            // `visited` is FROZEN mid-frame (run with
-                            // CELESTE_FRONTIER_BUFFERED=1), so this is the
+                            // `visited` is always FROZEN mid-frame, so this is the
                             // frontier AS IT STOOD AT FRAME START. Probed
                             // once per key (on the first occurrence for the
                             // dedup, and here for every occurrence when the
@@ -1925,7 +1924,7 @@ impl AbstractRun {
                                 let mut ev = FrameEventCounters::default();
                                 let mut sc = StreamCounters::default();
                                 let t0 = std::time::Instant::now();
-                                // Option 1 (CELESTE_FRONTIER_SKIP): point this
+                                // Option 1: point this
                                 // thread's kernels at the FROZEN frontier so they
                                 // skip materializing rows already in it. Requires a
                                 // frozen frontier (buffered/mmap); else a mid-frame

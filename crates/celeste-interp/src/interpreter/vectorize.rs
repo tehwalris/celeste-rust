@@ -1436,7 +1436,7 @@ pub fn add_global_probes(n: u64) {
 /// every offered row occurrence this frame on TWO independent axes -
 ///   FROZEN-FRONTIER HIT: is the key in the frontier as it stood at FRAME
 ///     START (before this frame's inserts)? Read against the frozen table
-///     (run with `CELESTE_FRONTIER_BUFFERED=1`, whose map engine holds this
+///     (the frontier is always frozen mid-frame: the map engine holds this
 ///     frame's inserts out of `contains_historic` until `end_frame`).
 ///   WITHIN-FRAME DUP: is this the 2nd-or-later occurrence of the key this
 ///     frame? (the partition filter's frame-persistent `seen` set).
