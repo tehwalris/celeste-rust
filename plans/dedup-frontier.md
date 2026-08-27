@@ -691,3 +691,34 @@ LOSE a row - so the set MUST compare the full 128-bit key exactly (never key.0
 alone). Design: fixed open-addressed table, slot state Empty/Writing/Full via
 one AtomicU8 CAS to claim, key.0/key.1 as AtomicU64 published Release-after-
 claim; a probe seeing Writing returns "new" (materialize) - sound, no spin.
+
+## Option 4 progress + a CRITICAL Option 1 fix (2026-08-27)
+
+Building Option 4's parcheck gate (byte-identical serial vs parallel) exposed a
+pre-existing bug in OPTION 1: the engine-keyed frontier (carried keys) + frozen-
+frontier skip were wired ONLY into `step_parallel` (frame_threads>1), never the
+serial loop (threads==1). So serial took the interpreter-key path and parallel
+the engine-key path - DIFFERENT key spaces, checkpoints diverged across thread
+counts. Missed because Option 1 was validated with new-lanes/visited SEQUENCE
+(count) comparisons + serial-mode differentials, NOT a byte-level cross-thread
+checkpoint gate. (My earlier "byte-identical determinism" claim for Option 1 was
+SEQ-only - a real overstatement, now corrected.) FIX: route the streaming
+engine-keyed case through `step_parallel` at any thread count. Option 1 is now
+BYTE-IDENTICAL serial vs 16-thread (rowkeys + states.bin), verified.
+
+Option 4 (racy within-frame skip), status:
+- WithinFrameSet (lock-free, exact-128-bit-compare so a race only ever
+  materializes a duplicate, never loses a row) + kernel probe: DONE, off by
+  default (CELESTE_WITHIN_FRAME_SKIP).
+- Content-sort ids (4a): DONE + committed; interpreter parcheck byte-identical.
+- With it on: serial vs 16-thread ROWKEYS byte-identical; reachable set correct.
+- MEASURED (room10 frontier-only+buffered, f50): KROWS materialized
+  OFF 71,913,505 -> Option 1 34,673,730 -> Option 1+4 23,126,505 (-68% vs OFF,
+  -33% on top of Option 1); compiled run phase 39.4s -> 34.1s -> 31.4s.
+- BLOCKER: states.bin is NOT byte-identical serial vs parallel - the racy skip
+  makes materialization order (hence fragment/lane order) timing-dependent, and
+  states.bin bincodes the fragments in that order. Needs a checkpoint-time
+  content-sort of the frontier: fragments by (shape, pm1), LANES within each
+  fragment by key. `KeptLanes` only FILTERS ascending (can't permute), so this
+  needs a new gather-by-permutation (or a global frontier re-canonicalize). Not
+  yet done -> Option 4 stays off by default and is NOT parcheck-complete.
