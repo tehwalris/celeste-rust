@@ -1217,7 +1217,7 @@ mod tests {
                 "{}: a different input numbering than the first key",
                 show_key(key)
             );
-            match super::super::emit::bind(f, &g)
+            match super::super::emit::bind(f, &g, true)
                 .and_then(|b| super::super::emit::lower_frame(
                     &b.graph, &b.inputs, &b.uni, &b.outcomes, room.clone(), b.forks,
                 ))
@@ -1334,7 +1334,7 @@ mod tests {
             };
             let g = it.d.graph.clone();
             let (mut lines, mut variants) = (0usize, 0usize);
-            match super::super::emit::bind(&f, &g)
+            match super::super::emit::bind(&f, &g, true)
                 .and_then(|b| super::super::emit::lower_frame(
                     &b.graph, &b.inputs, &b.uni, &b.outcomes, room.clone(), b.forks,
                 ))
@@ -1431,7 +1431,7 @@ mod tests {
         };
         let g = std::mem::take(&mut it.d.graph);
         // The ENGINE's cell ids, resolved from the tracer's paths.
-        let b = match super::super::emit::bind(&f, &g) {
+        let b = match super::super::emit::bind(&f, &g, true) {
             Ok(b) => b,
             Err(e) => return eprintln!("[emit] BIND REFUSED: {:#}", e),
         };

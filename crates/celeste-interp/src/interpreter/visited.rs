@@ -477,7 +477,12 @@ impl MmapVisited {
     fn end_frame(&mut self) -> Result<()> {
         let frame = self.watermarks.len() as u32 + 1;
         let first_id = self.row_count as u32;
-        let keys = std::mem::take(&mut self.batch_order);
+        let mut keys = std::mem::take(&mut self.batch_order);
+        // CONTENT-SORT ids (Option 4): sort by the engine key so ids are a pure
+        // function of the row SET, not arrival order (which the racy within-
+        // frame skip makes timing-dependent). Same decision as the map engine's
+        // `RowTable::end_frame_buffered`.
+        keys.sort_unstable();
         self.batch_set = Default::default();
         save_frame_rowkeys(&self.dir, frame, &keys, first_id)?;
         let fk = FrameKeys::open(&self.dir, frame)?;
@@ -507,27 +512,15 @@ enum Engine {
 /// Frozen-frontier flush for the MAP engine: buffer a frame's new rows and
 /// bulk-flush at `end_frame` instead of inserting incrementally, so
 /// mid-frame probes hit a frozen table (the mmap engine already does this).
-/// Opt-in via `CELESTE_FRONTIER_BUFFERED=1`; byte-identical either way. Off
-/// by default so no running campaign changes without asking.
-fn map_buffered_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("CELESTE_FRONTIER_BUFFERED").map_or(false, |v| v != "0")
-    })
-}
-
 impl Visited {
     /// The historic in-RAM engine, no artifacts.
     pub fn in_memory() -> Self {
-        let mut table = RowTable::default();
-        table.set_buffered(map_buffered_on());
-        Self { dir: None, engine: Engine::Map(table) }
+        Self { dir: None, engine: Engine::Map(RowTable::default()) }
     }
 
     /// The historic engine, writing `.rowkeys` at each boundary so the
     /// artifacts are interchangeable with the mmap engine's.
-    pub fn map_with_dir(mut table: RowTable, dir: &Path) -> Self {
-        table.set_buffered(map_buffered_on());
+    pub fn map_with_dir(table: RowTable, dir: &Path) -> Self {
         Self { dir: Some(dir.to_path_buf()), engine: Engine::Map(table) }
     }
 
@@ -549,6 +542,15 @@ impl Visited {
 
     pub fn is_mmap(&self) -> bool {
         matches!(self.engine, Engine::Mmap(_))
+    }
+
+    /// Is the frontier READ-ONLY during a frame (so a mid-frame probe is
+    /// timing-independent)? Always true now: the mmap engine's
+    /// `contains_historic` only sees completed frames, and the map engine is
+    /// always buffered (this frame's inserts sit in `pending` until end_frame).
+    /// The cross-frame / within-frame skips require this.
+    pub fn is_frozen(&self) -> bool {
+        true
     }
 
     /// Whether phase 1 should dedup within the chunk BEFORE the global
@@ -597,17 +599,9 @@ impl Visited {
     pub fn end_frame(&mut self) -> Result<()> {
         match &mut self.engine {
             Engine::Map(t) => {
-                let (keys, first_id) = if t.is_buffered() {
-                    // Frozen-frontier path: bulk-flush this frame's buffered
-                    // rows into the table now (they were probe-invisible all
-                    // frame). Same keys, same discovery-order ids.
-                    t.end_frame_buffered()
-                } else {
-                    let keys = t.take_recent();
-                    let first_id = t.len() as u32 - keys.len() as u32;
-                    t.end_frame();
-                    (keys, first_id)
-                };
+                // Flush this frame's frozen `pending` rows with content-sorted
+                // ids; return them for the `.rowkeys` file.
+                let (keys, first_id) = t.end_frame();
                 if let Some(dir) = &self.dir {
                     let frame = t.watermarks().len() as u32;
                     save_frame_rowkeys(dir, frame, &keys, first_id)?;

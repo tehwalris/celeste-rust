@@ -9187,8 +9187,8 @@ pub fn acc0(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_0: u64 = 832264386291447709;
-pub const KPART2_0: u64 = 1052865157337462445;
+pub const KPART1_0: u64 = 12420673293300903163;
+pub const KPART2_0: u64 = 9668700051799990314;
 
 /// Append this assignment's lanes that TAKE outcome 0 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -9212,6 +9212,7 @@ pub const KPART2_0: u64 = 1052865157337462445;
 pub fn append0(
     acc: &mut Rt2, sh: &KShared0, kv: &KOut0, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -9235,6 +9236,9 @@ pub fn append0(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(sh.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
@@ -9274,6 +9278,7 @@ pub fn append0(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -9405,8 +9410,8 @@ pub fn acc1(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_1: u64 = 16256605769646710881;
-pub const KPART2_1: u64 = 11546916578262672175;
+pub const KPART1_1: u64 = 3309304179945901719;
+pub const KPART2_1: u64 = 10900413287533541749;
 
 /// Append this assignment's lanes that TAKE outcome 1 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -9430,6 +9435,7 @@ pub const KPART2_1: u64 = 11546916578262672175;
 pub fn append1(
     acc: &mut Rt2, sh: &KShared1, kv: &KOut1, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -9453,6 +9459,9 @@ pub fn append1(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(sh.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
@@ -9492,6 +9501,7 @@ pub fn append1(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -9583,8 +9593,8 @@ pub fn acc2(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_2: u64 = 5520698842460580932;
-pub const KPART2_2: u64 = 17342533822672903865;
+pub const KPART1_2: u64 = 9655011771420340376;
+pub const KPART2_2: u64 = 17762183697962115454;
 
 /// Append this assignment's lanes that TAKE outcome 2 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -9608,6 +9618,7 @@ pub const KPART2_2: u64 = 17342533822672903865;
 pub fn append2(
     acc: &mut Rt2, sh: &KShared2, kv: &KOut2, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -9631,6 +9642,9 @@ pub fn append2(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
             v.push(if kv.c41.known & (1 << i) != 0 {
@@ -9642,6 +9656,7 @@ pub fn append2(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -9749,8 +9764,8 @@ pub fn acc3(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_3: u64 = 15436652655955429933;
-pub const KPART2_3: u64 = 4665627946308289631;
+pub const KPART1_3: u64 = 17676660957541454523;
+pub const KPART2_3: u64 = 1752022734833791775;
 
 /// Append this assignment's lanes that TAKE outcome 3 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -9774,6 +9789,7 @@ pub const KPART2_3: u64 = 4665627946308289631;
 pub fn append3(
     acc: &mut Rt2, sh: &KShared3, kv: &KOut3, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -9797,6 +9813,9 @@ pub fn append3(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
             v.push(if kv.c41.known & (1 << i) != 0 {
@@ -9808,6 +9827,7 @@ pub fn append3(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -9922,8 +9942,8 @@ pub fn acc4(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_4: u64 = 15194786124306846155;
-pub const KPART2_4: u64 = 2356138572729568584;
+pub const KPART1_4: u64 = 3894522390349256095;
+pub const KPART2_4: u64 = 13550844400004298185;
 
 /// Append this assignment's lanes that TAKE outcome 4 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -9947,6 +9967,7 @@ pub const KPART2_4: u64 = 2356138572729568584;
 pub fn append4(
     acc: &mut Rt2, sh: &KShared4, kv: &KOut4, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -9970,6 +9991,9 @@ pub fn append4(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(sh.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
@@ -10009,6 +10033,7 @@ pub fn append4(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -10099,8 +10124,8 @@ pub fn acc5(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_5: u64 = 12987197707694311148;
-pub const KPART2_5: u64 = 3765179590959324565;
+pub const KPART1_5: u64 = 16597660540236085661;
+pub const KPART2_5: u64 = 1359774650325538411;
 
 /// Append this assignment's lanes that TAKE outcome 5 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -10124,6 +10149,7 @@ pub const KPART2_5: u64 = 3765179590959324565;
 pub fn append5(
     acc: &mut Rt2, sh: &KShared5, kv: &KOut5, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -10147,6 +10173,9 @@ pub fn append5(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
             v.push(if kv.c41.known & (1 << i) != 0 {
@@ -10158,6 +10187,7 @@ pub fn append5(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -10264,8 +10294,8 @@ pub fn acc6(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_6: u64 = 11530942862915513421;
-pub const KPART2_6: u64 = 6498944024149057888;
+pub const KPART1_6: u64 = 3481324562242081953;
+pub const KPART2_6: u64 = 17111611207664838666;
 
 /// Append this assignment's lanes that TAKE outcome 6 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -10289,6 +10319,7 @@ pub const KPART2_6: u64 = 6498944024149057888;
 pub fn append6(
     acc: &mut Rt2, sh: &KShared6, kv: &KOut6, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -10312,6 +10343,9 @@ pub fn append6(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
             v.push(if kv.c41.known & (1 << i) != 0 {
@@ -10323,6 +10357,7 @@ pub fn append6(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -10618,8 +10653,8 @@ pub fn acc7(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_7: u64 = 695480966907961521;
-pub const KPART2_7: u64 = 12646940967063900584;
+pub const KPART1_7: u64 = 12588532526180940866;
+pub const KPART2_7: u64 = 8542324980597727890;
 
 /// Append this assignment's lanes that TAKE outcome 7 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -10643,6 +10678,7 @@ pub const KPART2_7: u64 = 12646940967063900584;
 pub fn append7(
     acc: &mut Rt2, sh: &KShared7, kv: &KOut7, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -10666,6 +10702,9 @@ pub fn append7(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(kv.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[38] {
@@ -10676,6 +10715,7 @@ pub fn append7(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -10972,8 +11012,8 @@ pub fn acc8(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_8: u64 = 9808485925165688493;
-pub const KPART2_8: u64 = 298611435258291118;
+pub const KPART1_8: u64 = 7529037763116079881;
+pub const KPART2_8: u64 = 5587526481758043244;
 
 /// Append this assignment's lanes that TAKE outcome 8 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -10997,6 +11037,7 @@ pub const KPART2_8: u64 = 298611435258291118;
 pub fn append8(
     acc: &mut Rt2, sh: &KShared8, kv: &KOut8, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -11020,6 +11061,9 @@ pub fn append8(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(kv.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[38] {
@@ -11030,6 +11074,7 @@ pub fn append8(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -11160,8 +11205,8 @@ pub fn acc9(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_9: u64 = 3467485702763097611;
-pub const KPART2_9: u64 = 17864001685985312262;
+pub const KPART1_9: u64 = 10972735960148926981;
+pub const KPART2_9: u64 = 5498892657056739525;
 
 /// Append this assignment's lanes that TAKE outcome 9 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -11185,6 +11230,7 @@ pub const KPART2_9: u64 = 17864001685985312262;
 pub fn append9(
     acc: &mut Rt2, sh: &KShared9, kv: &KOut9, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -11208,6 +11254,9 @@ pub fn append9(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(sh.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
@@ -11247,6 +11296,7 @@ pub fn append9(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -11285,43 +11335,44 @@ pub fn out_slots(i: usize) -> &'static [(u32, &'static str)] {
     }
 }
 
-struct Append<'a> { accs: &'a mut [Rt2], seen: &'a mut [RowSet], n: usize, org: &'a [u32] }
+struct Append<'a> { accs: &'a mut [Rt2], seen: &'a mut [RowSet], n: usize, org: &'a [u32], skip: &'a dyn Fn((u64, u64)) -> bool }
 
 impl<'a> Sink for Append<'a> {
     fn o0(&mut self, _mask: u8, take: u16, sh: &KShared0, v: &KOut0) {
-        append0(&mut self.accs[0], sh, v, take, self.n, &mut self.seen[0], self.org);
+        append0(&mut self.accs[0], sh, v, take, self.n, &mut self.seen[0], self.org, self.skip);
     }
     fn o1(&mut self, _mask: u8, take: u16, sh: &KShared1, v: &KOut1) {
-        append1(&mut self.accs[1], sh, v, take, self.n, &mut self.seen[1], self.org);
+        append1(&mut self.accs[1], sh, v, take, self.n, &mut self.seen[1], self.org, self.skip);
     }
     fn o2(&mut self, _mask: u8, take: u16, sh: &KShared2, v: &KOut2) {
-        append2(&mut self.accs[2], sh, v, take, self.n, &mut self.seen[2], self.org);
+        append2(&mut self.accs[2], sh, v, take, self.n, &mut self.seen[2], self.org, self.skip);
     }
     fn o3(&mut self, _mask: u8, take: u16, sh: &KShared3, v: &KOut3) {
-        append3(&mut self.accs[3], sh, v, take, self.n, &mut self.seen[3], self.org);
+        append3(&mut self.accs[3], sh, v, take, self.n, &mut self.seen[3], self.org, self.skip);
     }
     fn o4(&mut self, _mask: u8, take: u16, sh: &KShared4, v: &KOut4) {
-        append4(&mut self.accs[4], sh, v, take, self.n, &mut self.seen[4], self.org);
+        append4(&mut self.accs[4], sh, v, take, self.n, &mut self.seen[4], self.org, self.skip);
     }
     fn o5(&mut self, _mask: u8, take: u16, sh: &KShared5, v: &KOut5) {
-        append5(&mut self.accs[5], sh, v, take, self.n, &mut self.seen[5], self.org);
+        append5(&mut self.accs[5], sh, v, take, self.n, &mut self.seen[5], self.org, self.skip);
     }
     fn o6(&mut self, _mask: u8, take: u16, sh: &KShared6, v: &KOut6) {
-        append6(&mut self.accs[6], sh, v, take, self.n, &mut self.seen[6], self.org);
+        append6(&mut self.accs[6], sh, v, take, self.n, &mut self.seen[6], self.org, self.skip);
     }
     fn o7(&mut self, _mask: u8, take: u16, sh: &KShared7, v: &KOut7) {
-        append7(&mut self.accs[7], sh, v, take, self.n, &mut self.seen[7], self.org);
+        append7(&mut self.accs[7], sh, v, take, self.n, &mut self.seen[7], self.org, self.skip);
     }
     fn o8(&mut self, _mask: u8, take: u16, sh: &KShared8, v: &KOut8) {
-        append8(&mut self.accs[8], sh, v, take, self.n, &mut self.seen[8], self.org);
+        append8(&mut self.accs[8], sh, v, take, self.n, &mut self.seen[8], self.org, self.skip);
     }
     fn o9(&mut self, _mask: u8, take: u16, sh: &KShared9, v: &KOut9) {
-        append9(&mut self.accs[9], sh, v, take, self.n, &mut self.seen[9], self.org);
+        append9(&mut self.accs[9], sh, v, take, self.n, &mut self.seen[9], self.org, self.skip);
     }
 }
 
 pub fn step(
     b: &Rt2, lo: usize, n: usize, accs: &mut [Rt2], seen: &mut [RowSet],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> Option<u16> {
     let (u, s) = bind(b)?;
     let rin = rows(b, &s, lo)?;
@@ -11334,7 +11385,7 @@ pub fn step(
     // Engine-carried origin metadata for this slice's lanes
     // (empty = untracked); see `Rt2::origin`.
     let org: &[u32] = if b.origin.is_empty() { &[] } else { &b.origin[lo..lo + n] };
-    let mut sink = Append { accs, seen, n, org };
+    let mut sink = Append { accs, seen, n, org, skip };
     Some(frame(&u, &rin, &g, &mut sink))
 }
 

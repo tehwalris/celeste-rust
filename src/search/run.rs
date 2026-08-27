@@ -458,7 +458,7 @@ fn stream_boundary_one(
     visited: &mut crate::interpreter::visited::Visited,
     counters: &mut StreamCounters,
 ) -> Result<Vec<State>> {
-    let prepared = stream_boundary_prepare(state, band, frame, counters, visited, true)?;
+    let prepared = stream_boundary_prepare(state, band, frame, counters, visited, true, None)?;
     Ok(stream_boundary_subtract(prepared, visited, counters))
 }
 
@@ -484,10 +484,24 @@ fn stream_boundary_prepare(
     counters: &mut StreamCounters,
     visited: &crate::interpreter::visited::Visited,
     filter_now: bool,
+    // ENGINE keys carried from the compiled body (Option 1). `Some` => the
+    // frontier is engine-keyed and these ARE the per-lane keys, so the
+    // interpreter re-hash is skipped. Only supported when the state does not
+    // rung-split (level 0, which is where Option 1 runs) and the partitioned
+    // filter is on.
+    carried: Option<Vec<(u64, u64)>>,
 ) -> Result<Vec<PreparedRows>> {
     let mut kept_out = Vec::new();
     let t_abs = std::time::Instant::now();
     let split = crate::interpreter::abstraction::split_precision_straddles(state);
+    if carried.is_some() {
+        assert_eq!(
+            split.len(),
+            1,
+            "engine-keyed frontier (Option 1) does not support a rung split; run level 0"
+        );
+        assert!(!filter_now, "engine-keyed frontier needs the partitioned filter");
+    }
     let mut abs_ns = t_abs.elapsed().as_nanos() as u64;
     for state in split {
         let t_abs = std::time::Instant::now();
@@ -608,7 +622,18 @@ fn stream_boundary_prepare(
         // per-lane cache miss lives, and it needs only `&RowTable`, so it
         // belongs on this side of the parallel/serial line.
         let t_keys = std::time::Instant::now();
-        let keys = if filter_now {
+        let keys = if let Some(ck) = &carried {
+            // Engine keys carried from the compiled body: the frontier is
+            // engine-keyed, so use them directly (no interpreter re-hash).
+            assert_eq!(
+                ck.len(),
+                state.vector_size,
+                "carried engine keys ({}) != lanes ({}) after abstraction",
+                ck.len(),
+                state.vector_size
+            );
+            PreparedKeys::Raw(Some(ck.clone()))
+        } else if filter_now {
             PreparedKeys::Filtered(crate::interpreter::vectorize::visited_row_keys(
                 &state, visited,
             ))
@@ -635,6 +660,34 @@ enum PreparedKeys {
     /// Hash-only (`visited_lane_keys`): one key per lane, filtering
     /// pending in `partition_filter`. Same `None` meaning.
     Raw(Option<Vec<(u64, u64)>>),
+}
+
+thread_local! {
+    /// Per-output-state ENGINE row keys stashed by `CompiledForward::run_chunk`
+    /// and consumed by the streaming worker on the SAME thread immediately
+    /// after `interpret_state_base` returns (Option 1's engine-keyed frontier).
+    /// `Some(keys)` = engine keys carried from a kernel/merged block; `None` =
+    /// an interpreter/fallback state that takes the interpreter key path.
+    static CARRIED_KEYS: std::cell::RefCell<Vec<Option<Vec<(u64, u64)>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn set_carried_keys(keys: Vec<Option<Vec<(u64, u64)>>>) {
+    CARRIED_KEYS.with(|c| *c.borrow_mut() = keys);
+}
+
+/// Take (and clear) the keys stashed for the just-produced outputs. Returns
+/// empty when the frame body did not carry any (interpreter/deopt path).
+fn take_carried_keys() -> Vec<Option<Vec<(u64, u64)>>> {
+    CARRIED_KEYS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// The process-wide within-frame set, reused across frames (cleared per frame).
+/// 2^22 slots (~4M) for ~1.2M distinct successors/frame - load factor ~0.3.
+fn within_frame_set() -> &'static crate::compiled::dispatch::WithinFrameSet {
+    static SET: std::sync::OnceLock<crate::compiled::dispatch::WithinFrameSet> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| crate::compiled::dispatch::WithinFrameSet::with_bits(22))
 }
 
 /// The partitioned filter's default is ON; `CELESTE_PARTITIONED_FILTER=0`
@@ -689,6 +742,12 @@ fn partition_filter(
                 scope.spawn(move || {
                     let mut out: Vec<Vec<(u32, (u64, u64))>> = vec![Vec::new(); frags.len()];
                     let mut probes = 0u64;
+                    // Per-OCCURRENCE quadrant census (instrumentation only,
+                    // does not change any decision): classify every offered
+                    // occurrence on (frozen-frontier hit, within-frame dup).
+                    // Index = (frontier as usize)*2 + (wf_dup as usize).
+                    let quad = crate::interpreter::vectorize::dedup_quadrants_on();
+                    let mut qb = [0u64; 4];
                     for (fi, frag) in frags.iter().enumerate() {
                         let Some(keys) = frag else { continue };
                         for (lane, &key) in keys.iter().enumerate() {
@@ -699,9 +758,21 @@ fn partition_filter(
                             if ((key.0 >> 32) as usize) % threads != p {
                                 continue;
                             }
-                            if seen_p.insert(key) {
+                            let is_new = seen_p.insert(key);
+                            // `visited` is FROZEN mid-frame (run with
+                            // CELESTE_FRONTIER_BUFFERED=1), so this is the
+                            // frontier AS IT STOOD AT FRAME START. Probed
+                            // once per key (on the first occurrence for the
+                            // dedup, and here for every occurrence when the
+                            // quadrant census is on).
+                            let frontier =
+                                if quad || is_new { visited.contains_historic(key) } else { false };
+                            if quad {
+                                qb[(frontier as usize) * 2 + (!is_new as usize)] += 1;
+                            }
+                            if is_new {
                                 probes += 1;
-                                if !visited.contains_historic(key) {
+                                if !frontier {
                                     out[fi].push((lane as u32, key));
                                 }
                             }
@@ -709,6 +780,9 @@ fn partition_filter(
                     }
                     if census {
                         crate::interpreter::vectorize::add_global_probes(probes);
+                    }
+                    if quad {
+                        crate::interpreter::vectorize::add_quadrants(qb);
                     }
                     out
                 })
@@ -1146,7 +1220,15 @@ impl CompiledForward {
         state: State,
     ) -> Result<Vec<State>> {
         if !self.check {
-            return Ok(self.engine.run_frame_chunk(&state, Some((frame_cfg, fixed_env))));
+            // Carry the engine keys (b.row_keys) out-of-band so the frontier is
+            // ENGINE-keyed (Option 1) without threading them through every
+            // interpret/variant/deopt path: the worker reads them right after
+            // this returns, on the same thread. See `take_carried_keys`.
+            let keyed = self.engine.run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
+            let (states, keys): (Vec<State>, Vec<Option<Vec<(u64, u64)>>>) =
+                keyed.into_iter().unzip();
+            set_carried_keys(keys);
+            return Ok(states);
         }
         let reference: Vec<State> = interpret_prepared_cfg(frame_cfg, state.clone(), fixed_env)
             .context("frame failed (compiled-forward check: reference side)")?
@@ -1154,6 +1236,7 @@ impl CompiledForward {
             .map(|(s, _)| s)
             .collect();
         let got = self.engine.run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
+        let got_states: Vec<State> = got.iter().map(|(s, _)| s.clone()).collect();
         // The comparator must compare AT THE CONFIGURED RUNG's
         // abstraction. `FrameEngine::row_key_set` funnels through
         // `Rt2::boundary`, which widens at Bits(0) - fine (and cheap)
@@ -1169,12 +1252,12 @@ impl CompiledForward {
             crate::interpreter::abstraction::rem_precision_from_env()
                 == crate::interpreter::abstraction::RemPrecision::Bits(0);
         let (want_keys, got_keys) = if level0 {
-            (self.engine.row_key_set(&reference), self.engine.row_key_set(&got))
+            (self.engine.row_key_set(&reference), self.engine.row_key_set(&got_states))
         } else {
             (
                 rung_row_key_set(&reference)
                     .context("rung-abstracting the reference side of the check")?,
-                rung_row_key_set(&got)
+                rung_row_key_set(&got_states)
                     .context("rung-abstracting the compiled side of the check")?,
             )
         };
@@ -1217,6 +1300,9 @@ impl CompiledForward {
         // pathology cannot compound across frames or contaminate the
         // reference it is being judged against.
         drop(got);
+        // Check mode carries the interpreter's reference states forward (see
+        // above); they take the interpreter key path (None carried) downstream.
+        set_carried_keys(vec![None; reference.len()]);
         Ok(reference)
     }
 }
@@ -1689,7 +1775,17 @@ impl AbstractRun {
         let input_states = chunk_states(std::mem::take(&mut self.states));
         // Chunk-parallel path. Everything else keeps the serial loop below -
         // one code path per arrangement, and the parallel one is opt-in.
-        if frame_threads() > 1 {
+        // The engine-keyed frontier (Option 1) and the within-frame skip
+        // (Option 4) are wired into step_parallel, NOT the serial loop below.
+        // Routing the streaming engine-keyed case through step_parallel even at
+        // one thread keeps the two thread counts in the SAME key space, so a
+        // serial run is byte-identical to a parallel one (parcheck). Without
+        // this, threads==1 falls to the interpreter-key path below and diverges.
+        // The compiled streaming path (engine-keyed frontier + frozen/within-frame
+        // skips) is UNCONDITIONAL and lives only in step_parallel, so every
+        // streaming frame routes here regardless of thread count - which is
+        // also what keeps 1-thread byte-identical to N-thread.
+        if frame_threads() > 1 || stream {
             return if stream {
                 self.step_parallel(input_states, frame_no)
             } else {
@@ -1807,7 +1903,18 @@ impl AbstractRun {
                     .visited_rows
                     .as_ref()
                     .expect("stream implies a visited table");
-                std::thread::scope(|scope| {
+                // Option 4: point the frame's chunks at a SHARED within-frame
+                // set so a successor a sibling chunk already emitted is skipped
+                // before materialization. Frozen frontier required (same reason
+                // as Option 1); races are sound (see `WithinFrameSet`).
+                // The shared within-frame set is set for every frozen-frontier frame.
+                let wf_active = visited_ro.is_frozen();
+                if wf_active {
+                    let set = within_frame_set();
+                    set.clear();
+                    crate::compiled::dispatch::set_within_frame(set);
+                }
+                let scope_out = std::thread::scope(|scope| {
                     let handles: Vec<_> = batch
                         .drain(..)
                         .map(|state| {
@@ -1818,13 +1925,32 @@ impl AbstractRun {
                                 let mut ev = FrameEventCounters::default();
                                 let mut sc = StreamCounters::default();
                                 let t0 = std::time::Instant::now();
+                                // Option 1 (CELESTE_FRONTIER_SKIP): point this
+                                // thread's kernels at the FROZEN frontier so they
+                                // skip materializing rows already in it. Requires a
+                                // frozen frontier (buffered/mmap); else a mid-frame
+                                // probe would be timing-dependent, so we do not set
+                                // it (no skip, still sound and byte-identical).
+                                let _fg = visited_ro
+                                    .is_frozen()
+                                    .then(|| crate::compiled::dispatch::with_frozen_frontier(visited_ro));
                                 let outputs = interpret_state_base(
                                     variants, deopt, frame_cfg, fixed_env, state, &mut ev,
                                     pos_obs, compiled,
                                 )?;
+                                drop(_fg);
+                                // Engine keys the compiled body carried for these
+                                // outputs (Option 1). Empty on the interpreter path.
+                                let carried = take_carried_keys();
+                                let use_carried = !carried.is_empty();
                                 let t1 = std::time::Instant::now();
                                 let mut prepared = Vec::new();
-                                for out in outputs {
+                                for (oi, out) in outputs.into_iter().enumerate() {
+                                    let ck = if use_carried {
+                                        carried.get(oi).cloned().flatten()
+                                    } else {
+                                        None
+                                    };
                                     prepared.extend(stream_boundary_prepare(
                                         out,
                                         band,
@@ -1832,6 +1958,7 @@ impl AbstractRun {
                                         &mut sc,
                                         visited_ro,
                                         !partitioned,
+                                        ck,
                                     )?);
                                 }
                                 add_worker_ns(WORKER_BODY, (t1 - t0).as_nanos() as u64);
@@ -1857,7 +1984,11 @@ impl AbstractRun {
                             )),
                         })
                         .collect()
-                })
+                });
+                if wf_active {
+                    crate::compiled::dispatch::clear_within_frame();
+                }
+                scope_out
             };
             // Collect the batch's fragments in input order first: the
             // partition filter wants the whole batch (its threads scan
@@ -2329,6 +2460,32 @@ impl AbstractRun {
                 hash_ns as f64 / offered.max(1) as f64,
                 probe_ns as f64 / offered.max(1) as f64,
                 offered,
+            );
+        }
+        // Per-OCCURRENCE quadrant census (CELESTE_DEDUP_QUADRANTS=1): what
+        // fraction of duplicate occurrences does Option 1 (a frozen-frontier
+        // check before materialize) actually cover, counting the popular
+        // cross-frame rows' within-frame REPEATS as frontier hits (which the
+        // sequential cascade miscredits to "within-frame")?
+        if let Some(q) = crate::interpreter::vectorize::quadrants_take() {
+            // index = (frontier as usize)*2 + (wf_dup as usize)
+            let (nn, ny, yn, yy) = (q[0], q[1], q[2], q[3]);
+            let total = nn + ny + yn + yy;
+            let dups = total.saturating_sub(nn); // occurrences that are not genuinely-new-distinct
+            let opt1 = yn + yy; // frozen-frontier hits = Option 1 coverage
+            let pct = |a: u64, b: u64| 100.0 * a as f64 / b.max(1) as f64;
+            println!(
+                "  dedup quadrants (occurrences): (frontier N, wf N)={} new, \
+                 (frontier N, wf Y)={} within-frame-only, \
+                 (frontier Y, wf N)={} frontier-1st, \
+                 (frontier Y, wf Y)={} frontier-repeat; total offered {}",
+                nn, ny, yn, yy, total
+            );
+            println!(
+                "  Option 1 (frozen-frontier check) covers {} occurrences = {:.1}% of duplicates, \
+                 {:.1}% of offered; within-frame-only (needs Option 4) {} = {:.1}% of duplicates; \
+                 genuinely new {}",
+                opt1, pct(opt1, dups), pct(opt1, total), ny, pct(ny, dups), nn
             );
         }
         let visited = self.visited_rows.as_mut().expect("stream implies visited");

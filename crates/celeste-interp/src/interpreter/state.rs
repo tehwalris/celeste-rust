@@ -377,6 +377,44 @@ impl State {
 
     /// `filter_by_mask_clone` for a caller that already knows its survivors
     /// as runs, skipping the bool mask entirely.
+    /// Reorder the lanes by `perm` (a permutation of `0..vector_size`): new
+    /// lane `i` gets old lane `perm[i]`. Scalars broadcast and stay scalar;
+    /// only per-lane vectors are gathered. Used to canonicalize a frontier
+    /// fragment (sort its lanes by row key) so a checkpoint is a pure function
+    /// of the row SET, not the materialization order (Option 4).
+    pub fn permute_lanes(&mut self, perm: &[u32]) {
+        assert_eq!(
+            perm.len(),
+            self.vector_size,
+            "permute_lanes must cover exactly the current lanes"
+        );
+        fn gather<T: std::fmt::Debug + Clone + PartialEq + Eq>(
+            v: super::value::MaybeVector<T>,
+            perm: &[u32],
+        ) -> super::value::MaybeVector<T> {
+            match v {
+                super::value::MaybeVector::Scalar(s) => super::value::MaybeVector::Scalar(s),
+                super::value::MaybeVector::Vector(arc) => {
+                    let src = arc.as_ref();
+                    let out: Vec<T> = perm.iter().map(|&i| src[i as usize].clone()).collect();
+                    super::value::MaybeVector::Vector(std::sync::Arc::new(out))
+                }
+            }
+        }
+        let perm = &perm;
+        self.map_values_in_place(|value| match value {
+            Value::Number(v) => Value::Number(gather(v, perm)),
+            Value::NumberInterval(v) => Value::NumberInterval(gather(v, perm)),
+            Value::Bool(v) => Value::Bool(gather(v, perm)),
+            Value::MaybeBool(_) => panic!("{}", super::value::MAYBE_BOOL_ESCAPED),
+            other @ (Value::UnknownBool
+            | Value::String(_)
+            | Value::Nil(_)
+            | Value::Pointer(_)
+            | Value::NilPointer(_)) => other,
+        });
+    }
+
     pub fn filter_by_kept_clone(
         &self,
         kept: &super::value::KeptLanes,

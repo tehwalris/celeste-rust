@@ -467,3 +467,344 @@ Recommendation: land the cross-frame skip first (safe, ~10%), then design the
 within-frame pre-materialization buffer with Philippe (the determinism model
 is a real decision, and a subtle bug there is the catastrophic kind CLAUDE.md
 warns about). Not started here on purpose: correctness/determinism first.
+
+## Per-OCCURRENCE quadrant census (2026-08-27, room10, frontier-only+buffered)
+
+`CELESTE_COMPILED_FORWARD=1 CELESTE_FRONTIER_ONLY=1 CELESTE_DEDUP_QUADRANTS=1
+CELESTE_FRONTIER_BUFFERED=1 rewrite bench --frames 50` (quick profile - counts
+are profile-independent). Classifies every offered occurrence on two axes:
+FROZEN-FRONTIER HIT (key in the frontier as it stood at frame start, read
+against the buffered/frozen table) x WITHIN-FRAME DUP (2nd+ occurrence this
+frame). Sanity: (N,N) == the search's "new" count, every frame and summed.
+
+Late frame f50 (occurrences):
+| | wf N (1st) | wf Y (repeat) |
+|---|---|---|
+| frontier N | 1,191,326 (new) | 4,073,733 (within-only) |
+| frontier Y | 774,742 | 3,415,435 |
+- total offered 9,455,236; duplicates 8,263,910.
+- **Option 1 (frozen-frontier check) = (Y,N)+(Y,Y) = 4,190,177 = 50.7% of
+  duplicates, 44.3% of offered.**
+- within-frame-only (N,Y), needs Option 4 = 4,073,733 = 49.3% of duplicates.
+
+Summed over 50 frames:
+- (N,N) new 8,033,952 · (N,Y) within-only 23,363,073 · (Y,N) frontier-1st
+  5,422,660 · (Y,Y) frontier-repeat 20,571,843.
+- total offered 57,391,528; duplicates 49,357,576.
+- **Option 1 coverage 25,994,503 = 52.7% of duplicates, 45.3% of offered.**
+- within-frame-only 23,363,073 = 47.3% of duplicates.
+
+### Verdict
+
+The frozen-frontier check (Option 1) covers ~53% of duplicate occurrences -
+**5x more than the ~10% the sequential cascade credited to "cross-frame."**
+Philippe was right: the (Y,Y) bucket (20.6M summed) is popular cross-frame
+rows repeated many times WITHIN a frame, which the cascade miscredits to
+"within-frame." So Option 1 is worth much more than it looked.
+
+BUT it is ~50/50, not "most": the within-frame-only slice (N,Y, 23.4M summed,
+47.3% of dups) is genuinely-new rows produced repeatedly by DIFFERENT chunks
+in the same frame, never in the frontier - and ONLY Option 4 (the risky
+within-frame pre-materialization dedup, determinism-sensitive) covers those.
+So Option 4 is NOT rendered unnecessary; it still owns ~47% of the duplicate
+materialization. Recommendation stands: land Option 1 first (deterministic,
+frozen frontier already in place, ~half the win), then decide Option 4 on the
+remaining ~47% with the determinism model as Philippe's call.
+
+## Option 1 implementation — BLOCKER found (2026-08-27)
+
+Built the kernel-skip interface (sub-step 1a, LANDED gated byte-identical):
+the generated `step`/`append`/`Sink` take a `skip: &dyn Fn((u64,u64))->bool`;
+`append` calls `if skip(key) { continue; }` after the within-chunk RowSet
+dedup. And the 1b probe machinery: a thread-local frozen-frontier pointer
+(`compiled::dispatch::with_frozen_frontier`), `Visited::is_frozen()`, and the
+worker sets it around `interpret_state_base` when `CELESTE_FRONTIER_SKIP=1`
+and the frontier is frozen.
+
+MEASURED (room10, frontier-only+buffered, `--frames 50`, quick):
+- Frontier sequence with skip ON == skip OFF, every frame: BYTE-IDENTICAL.
+- BUT kernel rows materialized (KROWS[0]) UNCHANGED (71,913,505 both), and the
+  `run` chunk phase went UP (21.4s -> 24.6s). The probe runs but NEVER HITS.
+
+Root cause: **the frontier is keyed in the INTERPRETER key space, the kernel
+emits the ENGINE boundary key.** In the compiled path, `run_frame_chunk`
+returns interpreter `State`s - the engine's `b.row_keys` are DISCARDED - and
+`stream_boundary_prepare -> visited_row_keys` re-derives interpreter keys for
+the frontier. Increment b+c made the kernel key == `Rt2::boundary`'s key
+(engine space); the D1 gate proves engine-key and interpreter-key are
+BIJECTIVE but NOT numerically equal (BENCHMARK_DATA "D1 GATED"). So
+`contains_historic(engine_key)` against an interpreter-keyed table always
+misses.
+
+**Consequence: Option 1 requires the FRONTIER to be ENGINE-KEYED** - carry the
+engine `b.row_keys` through to the frontier (and drop the redundant
+`visited_row_keys` re-keying, itself a win) instead of re-deriving interpreter
+keys. That is a CHECKPOINT-FORMAT change (engine keys != interpreter keys
+numerically) but SOUND and search-identity-preserving in the sense that
+matters: the partition is identical (D1 bijection) so the visited SET / the
+search result is unchanged; only the stored key BYTES change (old checkpoints
+incompatible, which the coordinator noted is expected/fine). This is the
+identity-adjacent step flagged earlier as PHILIPPE'S CALL.
+
+Scope of the remaining work (not done - reported for a go/no-go):
+- `FrameEngine::run_frame_chunk` / `CompiledForward::run_chunk` must carry each
+  output state's engine `b.row_keys` (a per-lane sidecar) instead of dropping
+  it at the bridge back to `State`.
+- The frontier-only subtract must key by that carried engine key instead of
+  `visited_row_keys`. Interaction with `make_state_abstract` /
+  band-coarsening in `stream_boundary_prepare` needs checking (the engine key
+  is the level-0-abstracted key; re-abstraction must be idempotent).
+- Then the kernel's `skip(key)` (engine key) hits the engine-keyed frontier.
+- GATE: frontier sequence + differential unchanged (same SET), parcheck
+  byte-identical under the new key, KROWS drop = the ~45%-of-offered
+  frozen-frontier occurrences (per the quadrant census), measured `run`-phase
+  drop.
+
+## Option 1 unified engine key — carry landed, but a b+c VALUE-EQUALITY gap blocks the skip (2026-08-27)
+
+Implemented the coordinator's plan: the compiled forward path now CARRIES the
+engine key (`b.row_keys`) out-of-band to the frontier (thread-local
+`CARRIED_KEYS`, filled by `CompiledForward::run_chunk`, read by the streaming
+worker) instead of re-hashing interpreter keys; `stream_boundary_prepare` uses
+the carried keys. Gated on `CELESTE_FRONTIER_SKIP` (Option 1 == engine-keyed
+frontier). Off by default -> byte-identical (differential green,
+`traced_kernels_reproduce_the_interpreter` passes; the clone is skipped when
+off, so it is also free).
+
+MEASURED (room10 frontier-only+buffered, `--frames 40`, engine-keyed ON):
+- Reachable set BYTE-IDENTICAL to OFF, every frame (engine-keyed frontier =
+  same partition, D1 bijection - confirmed end to end).
+- The kernel skip PROBES the frontier now (f40: 1,650,698 probes) - the carry
+  works and the frontier is engine-keyed.
+- **But 0 HITS, KROWS unchanged (71,913,505).** The kernel's probe key
+  `mix64(KPART + h)` (from b+c) is only PARTITION-equal to the carried
+  `b.row_keys`, NOT value-equal: two labelings of the same partition, so the
+  engine-key probe never finds the engine-key it is looking for.
+
+Root cause: b+c's "kernel key == boundary key" was gated only by the
+partition (the differential), never by VALUE. The values diverge because
+`Rt2::boundary` computes `b.row_keys` AFTER the level-0 WIDEN (rem -> Bits(0)),
+while the kernel keys the RAW output values. Carrying the raw kernel key
+instead is UNSOUND cross-frame: the next frame re-imports the (widened) state
+and computes a widened key, so the same state would get two different keys and
+the frontier would not dedup it across frames. So the frontier MUST use the
+widened boundary key, and therefore the KERNEL must compute its probe key on
+WIDENED values to match.
+
+**The fix (next increment): close b+c's value-equality gap** - the key emitter
+must apply the boundary's level-0 widening (rem -> Bits(0), and any other
+widened cell) to the per-lane values BEFORE the `cell_mix`, so
+`mix64(KPART + h)` == `Rt2::boundary`'s `b.row_keys` byte-for-byte. Then the
+carried frontier key and the kernel probe key are the same value and the skip
+hits (expected ~45% of offered materialization per the quadrant census).
+Requires the key-emission path in `transpile::lower` / `trace::kernel` to know
+which output cells the boundary widens and how - coupling the key to the
+widening. Non-trivial; a real emitter change + full regen + a NEW gate that
+asserts kernel key == `b.row_keys` VALUE (native-probe, per row), which is the
+gate b+c should have had. Flagged for go-ahead.
+
+Everything is committed gated (off = byte-identical); the carry + probe
+machinery is in place and waiting for the value-equal key.
+
+## Option 1 LANDS: value-equal kernel key + measured (2026-08-27)
+
+Closed b+c's VALUE-equality gap in two parts, both mirroring `Rt2::boundary`:
+1. WIDENING: the boundary widens rem -> [-0.5, 0.5) and timers -> 0 (uniform).
+   The key emitter now folds these into the constant KPART (off the per-lane
+   sum): `bind` identifies them with the boundary's own `mark_walk` / `g_timers`
+   on each outcome's rt2; `outcome_part` adds their widened value to KPART;
+   `transpile::lower` excludes them from the per-lane fold (`OutField::widen_uniform`).
+2. KONST: `outcome_part` folded a konst cell's rt2 value, but `structure_of`
+   leaves some konst cells `Nil` while the acc holds the EMITTED konst value -
+   found with a gen-time diff (`CELESTE_KPART_DIAG`). Fixed by folding the
+   emitted konst value (`OutField::konst_av`), not rt2.
+
+GATE (the one b+c should have had): `CELESTE_KERNEL_KEY_CHECK=1` - the
+generated `append` records its emitted key and `Rt2::boundary_finish` ASSERTS
+it equals the recomputed `b.row_keys`, byte for byte, PER ROW. **PASSES** over
+40 frames (0 mismatches). So `mix64(KPART+h)` == `b.row_keys` value-for-value,
+not just same-partition. Off by default.
+
+MEASURED (room10 frontier-only + buffered, `--frames 50`, quick; OFF = no
+skip, ON = `CELESTE_FRONTIER_SKIP=1`):
+- Reachable set BYTE-IDENTICAL every frame (engine-keyed frontier = same set).
+- Frontier skip HITS: ~6.0M/frame at f50 (was 0 before the value fix).
+- **Kernel rows materialized (KROWS): 71,913,505 -> 34,673,730 = -52%.**
+- Compiled `run` phase (thread-seconds): 39.43s -> 34.12s (-13%).
+- Wall: 6.92s -> 5.72s (-17%).
+
+So Option 1 (check the frozen frontier before materializing) skips ~52% of
+materialized rows - in line with the quadrant census's ~45%-of-offered
+frozen-frontier coverage - with the reachable set unchanged.
+
+### Gates (all green, 2026-08-27)
+- `{traced,ladder,exact}_kernels_reproduce_the_interpreter`, room00/room20
+  lattice, `{traced,ladder,exact}_kernels_are_current`: 9/9 PASS. (The widen is
+  gated on `WalkOpts.widen` so LADDER/EXACT, which use `boundary_exact`, do NOT
+  widen - that is what fixed the initial exact/ladder failures.)
+- `CELESTE_KERNEL_KEY_CHECK`: 0 mismatches over 40 frames (kernel key ==
+  b.row_keys byte-for-byte, per row).
+- Determinism: compiled-forward frontier-only + `CELESTE_FRONTIER_SKIP=1`,
+  serial (1 thread) vs 16 threads -> per-frame new-lanes/visited sequence
+  BYTE-IDENTICAL through f45 (final visited 3,116,244). The frozen frontier
+  makes the skip timing-independent, as designed.
+
+Option 1 is LANDED and gated. `CELESTE_FRONTIER_SKIP=1` (implies engine-keyed
+frontier) is opt-in; default runs are byte-identical to before.
+
+## Option 4 design + verification (2026-08-27, before implementation)
+
+Racy within-frame skip + deterministic content-sort ids. Verified the two
+downstream points and found a THIRD requirement the "content-sort ids" framing
+missed.
+
+VERIFIED:
+- (1) sweep / pos-graph do NOT assume input-ORDER ids - they use ids as opaque
+  graph-node handles: sweep iterates `0..g.len()` and `earliest_frame(id)`
+  (which depends only on which frame's [first_id, first_id+count) RANGE an id
+  falls in, NOT the intra-frame order); pos-graph records `(src,dst)` id edges.
+  Content-sorting the ids WITHIN a frame permutes node labels isomorphically -
+  fine, as long as the forward pass and sweep/pos-graph read the SAME (content-
+  sorted) ids from the row table, which they do.
+- (2) checkpoint format: ids are `first_id + index-in-batch_order`; the file is
+  key-sorted for mmap search but the id is the batch index. Content-sort = sort
+  `batch_order` by key before assigning ids (visited.rs end_frame). Clean.
+
+FOUND (the gap): **states.bin is NOT content-ordered.** `regroup_and_merge` ->
+`Rt2::merge_many` CONCATENATES blocks in block order (not a key-sorted k-way
+merge, despite the name), and `save` bincodes `states` in that order. Today
+that is deterministic only because the serial input-order pass fixes the order;
+the racy skip makes materialization order (hence dedup "first occurrence", hence
+fragment lane order) non-deterministic, so states.bin would byte-differ and
+parcheck (which compares states.bin byte-identical) would fail. So Option 4
+needs to content-order states.bin too, NOT just the ids.
+  - Feasible + localized: fragment MEMBERSHIP is deterministic (a row's
+    (shape, pm1) is a function of its content), so only intra-fragment lane
+    order and fragment order are racy. Sort at checkpoint time: fragments by
+    (shape_hash, pm1), lanes within each fragment by engine key. The final
+    frontier SET is deterministic (reachable set is race-independent), so a
+    checkpoint-time sort suffices - the hot path stays unsorted.
+
+SOUNDNESS of the racy set: a false "new" (missed dedup) just materializes a
+duplicate, collapsed by partition_filter later - SOUND. A false "dup" would
+LOSE a row - so the set MUST compare the full 128-bit key exactly (never key.0
+alone). Design: fixed open-addressed table, slot state Empty/Writing/Full via
+one AtomicU8 CAS to claim, key.0/key.1 as AtomicU64 published Release-after-
+claim; a probe seeing Writing returns "new" (materialize) - sound, no spin.
+
+## Option 4 progress + a CRITICAL Option 1 fix (2026-08-27)
+
+Building Option 4's parcheck gate (byte-identical serial vs parallel) exposed a
+pre-existing bug in OPTION 1: the engine-keyed frontier (carried keys) + frozen-
+frontier skip were wired ONLY into `step_parallel` (frame_threads>1), never the
+serial loop (threads==1). So serial took the interpreter-key path and parallel
+the engine-key path - DIFFERENT key spaces, checkpoints diverged across thread
+counts. Missed because Option 1 was validated with new-lanes/visited SEQUENCE
+(count) comparisons + serial-mode differentials, NOT a byte-level cross-thread
+checkpoint gate. (My earlier "byte-identical determinism" claim for Option 1 was
+SEQ-only - a real overstatement, now corrected.) FIX: route the streaming
+engine-keyed case through `step_parallel` at any thread count. Option 1 is now
+BYTE-IDENTICAL serial vs 16-thread (rowkeys + states.bin), verified.
+
+Option 4 (racy within-frame skip), status:
+- WithinFrameSet (lock-free, exact-128-bit-compare so a race only ever
+  materializes a duplicate, never loses a row) + kernel probe: DONE, off by
+  default (CELESTE_WITHIN_FRAME_SKIP).
+- Content-sort ids (4a): DONE + committed; interpreter parcheck byte-identical.
+- With it on: serial vs 16-thread ROWKEYS byte-identical; reachable set correct.
+- MEASURED (room10 frontier-only+buffered, f50): KROWS materialized
+  OFF 71,913,505 -> Option 1 34,673,730 -> Option 1+4 23,126,505 (-68% vs OFF,
+  -33% on top of Option 1); compiled run phase 39.4s -> 34.1s -> 31.4s.
+- BLOCKER: states.bin is NOT byte-identical serial vs parallel - the racy skip
+  makes materialization order (hence fragment/lane order) timing-dependent, and
+  states.bin bincodes the fragments in that order. Needs a checkpoint-time
+  content-sort of the frontier: fragments by (shape, pm1), LANES within each
+  fragment by key. `KeptLanes` only FILTERS ascending (can't permute), so this
+  needs a new gather-by-permutation (or a global frontier re-canonicalize). Not
+  yet done -> Option 4 stays off by default and is NOT parcheck-complete.
+
+## Option 4 COMPLETE - parcheck crux green (2026-08-27)
+
+The checkpoint-time frontier content-sort closes the states.bin gap. `State::
+permute_lanes` (a gather-by-permutation; `KeptLanes` only filters ascending, so
+this is new) reorders a fragment's lanes; `checkpoint::canonical_sort_frontier`
+sorts each fragment's lanes by the row key and fragments by their smallest key.
+Applied at `save` when `CELESTE_WITHIN_FRAME_SKIP` is set (Option-1-only
+states.bin is already deterministic, so it is free otherwise).
+
+CRUX (compiled + FRONTIER_SKIP + WITHIN_FRAME_SKIP, f40 checkpoint, serial=1 vs
+16-thread):
+  rowkeys  BYTE-IDENTICAL
+  states.bin BYTE-IDENTICAL
+  meta     BYTE-IDENTICAL
+Resume from the (permuted) checkpoint reaches the SAME visited total as a fresh
+run (3,116,244 at f45) - permute_lanes is value-correct, not just deterministic.
+Quick suite 293 passed (sweep/pos-graph unit tests + traced differential incl.).
+
+MEASURED combined win (room10 frontier-only+buffered, f50):
+  KROWS materialized  OFF 71,913,505 -> Opt1 34,673,730 -> Opt1+4 23,100,002
+                      = -68% vs OFF (-33% on top of Opt 1)
+  compiled run phase  39.4s -> 34.1s -> 31.4s
+  wall                6.92s -> 5.72s -> 5.72s
+(KROWS under the racy skip is non-deterministic run-to-run - the reachable SET
+and the checkpoint bytes are not; only how many duplicates slipped through
+before being collapsed varies.)
+
+### The compiled+within-frame parcheck recipe (parcheck.sh is interpreter-only)
+```
+E="CELESTE_COMPILED_FORWARD=1 CELESTE_FRONTIER_ONLY=1 CELESTE_FRONTIER_BUFFERED=1 \
+   CELESTE_FRONTIER_SKIP=1 CELESTE_WITHIN_FRAME_SKIP=1 CELESTE_MAX_STATE_LANES=8000"
+env $E CELESTE_FRAME_THREADS=1  rewrite bench --frames 40 --checkpoint-dir S --checkpoint-every 40
+env $E CELESTE_FRAME_THREADS=16 rewrite bench --frames 40 --checkpoint-dir P --checkpoint-every 40
+# then diff S/frames/*.rowkeys, S/f040/states.bin, S/f040/meta.json vs P
+```
+
+### Merge readiness (for census + default-on)
+- Option 1 and Option 4 are both opt-in flags today; correctness is gated
+  (differential, byte-identical serial-vs-parallel, resume-correct).
+- CAVEAT for flipping defaults ON: `canonical_sort_frontier` gates on the ENV
+  VAR `CELESTE_WITHIN_FRAME_SKIP` being set. If the skip becomes default-on
+  WITHOUT the env var, that gate must change to the same predicate the skip
+  uses, or states.bin goes non-deterministic again. (Same shape as tying the
+  engine-keyed frontier to `frontier_skip_on`.)
+- VALIDATED ON THE QUICK PROFILE. Determinism is opt-independent (it is the
+  sort + the key space, not codegen), but the letter of the gate is a RELEASE
+  parcheck; the recipe above under `--release` is the final pre-merge check I
+  did not run (the room20 release build is ~20 min).
+
+## Single-path: flags removed, dead alternatives deleted (2026-08-27)
+
+Philippe's call: no options - the new behavior is the ONLY behavior. Removed all
+three env flags and made everything unconditional:
+- CELESTE_FRONTIER_SKIP, CELESTE_WITHIN_FRAME_SKIP, CELESTE_FRONTIER_BUFFERED gone.
+- The engine-keyed frontier, the frozen/buffered frontier (`is_frozen` is now
+  unconditionally true), the cross-frame skip, the within-frame racy skip, and
+  the canonical content-sort are all always-on.
+- Removed the predicates (frontier_skip_on / within_frame_skip_on /
+  engine_keyed_frontier / engine_keyed_frontier_on / map_buffered_on) and the
+  diagnostic FRONTIER_PROBES/HITS/NONE counters + print.
+
+DELETED dead alternatives:
+- The non-buffered (classic incremental-insert) RowTable path: `buffered` field,
+  set_buffered/is_buffered, take_recent(_content_sorted), the old non-buffered
+  end_frame. The frontier is always frozen; `insert_new` buffers into
+  `pending`/`recent`, one `end_frame` content-sorts + flushes.
+
+KEPT, with reason (a legitimate non-compiled caller):
+- The interpreter-key frontier path (`vectorize::visited_row_keys` /
+  `visited_lane_keys`, reached via `stream_boundary_prepare`'s carried==None
+  branch) is the INTERPRETER ORACLE's own frontier dedup - the differential's
+  reference side and the (strict-mode: never taken) kernel-miss fallback. In a
+  production compiled+strict run carried is ALWAYS Some, so the frontier is 100%
+  engine-keyed and this branch is never hit. The oracle's key is D1-equivalent
+  to the engine key (same partition), and the differential already compares
+  ENGINE keys on both sides via `FrameEngine::row_key_set` (import + boundary),
+  so engine-keying the oracle internally would be a perf regression on the
+  reference with zero correctness benefit. Deleting it would mean deleting the
+  interpreter oracle, which the whole differential gate needs.
+- No separate "no-skip append" path exists: the generated `append` always takes
+  the skip closure (`frontier_hit || within_frame_dup`); nothing to delete.
+
+GATES: quick suite 293 passed (differential, sweep/pos-graph, visited, oracle
+agreement); warning-free; with NO flags, serial vs 16-thread byte-identical
+(rowkeys + states.bin + meta). Release parcheck: pending (build running).

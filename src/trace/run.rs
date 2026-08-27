@@ -138,9 +138,12 @@ impl Run {
             let mut declined = 0usize;
             let t0 = std::time::Instant::now();
             let mut lo = 0;
+            // trace::run is a diagnostic path; it does not skip against a
+            // frontier, so the kernel gets a no-op skip.
+            let noskip = |_k: (u64, u64)| false;
             while lo < b.width {
                 let n = SLICE.min(b.width - lo);
-                let mask = (k.step)(&b, lo, n, &mut accs, &mut seen).ok_or_else(|| {
+                let mask = (k.step)(&b, lo, n, &mut accs, &mut seen, &noskip).ok_or_else(|| {
                     anyhow::anyhow!(
                         "frame {}: {} did not bind a block of its own shape {:#x}: {}",
                         self.frame,

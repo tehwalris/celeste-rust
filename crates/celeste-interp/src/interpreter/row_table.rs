@@ -44,18 +44,10 @@ pub struct RowTable {
     /// Empty on a table rebuilt `from_parts`: a resumed run only ever
     /// writes rowkeys for the frames it executes itself.
     recent: Vec<(u64, u64)>,
-    /// BUFFERED (frozen-frontier) mode only: this frame's new keys as a
-    /// set, for O(1) within-frame dedup while `rows` stays FROZEN to
-    /// completed frames. Mirrors `MmapVisited::batch_set`, which already
-    /// ships this design. Empty (and unused) when `buffered` is false.
+    /// This frame's new keys as a set, for O(1) within-frame dedup while
+    /// `rows` stays FROZEN to completed frames. Mirrors
+    /// `MmapVisited::batch_set`.
     pending: FxHashSet<(u64, u64)>,
-    /// When true, `insert_new` buffers into `pending`/`recent` and leaves
-    /// `rows` untouched until `end_frame_buffered` bulk-flushes it, so a
-    /// frame's `id_of`/`contains_historic` probes hit a FROZEN table. When
-    /// false, the classic path inserts straight into `rows`. Byte-identical
-    /// either way (same keys, same discovery-order ids, same watermarks);
-    /// this is the map-engine analogue of the already-gated mmap engine.
-    buffered: bool,
 }
 
 /// Splitmix64 finalizer - used to mix the shape hash into both key halves
@@ -72,59 +64,25 @@ impl RowTable {
         (h1 ^ mix(shape_hash), h2 ^ mix(shape_hash.wrapping_add(0x9e37_79b9_7f4a_7c15)))
     }
 
-    /// Turn on BUFFERED (frozen-frontier) inserts. Must be called before
-    /// any row is inserted - the two paths assign the same ids, but mixing
-    /// them within one frame would not.
-    pub fn set_buffered(&mut self, on: bool) {
-        assert!(
-            self.recent.is_empty() && self.pending.is_empty(),
-            "set_buffered mid-frame"
-        );
-        self.buffered = on;
-    }
-
-    pub fn is_buffered(&self) -> bool {
-        self.buffered
-    }
-
     /// Insert a row if new, returning `Some(id)` exactly when it was new.
     ///
-    /// In BUFFERED mode the row goes into `pending`/`recent` and `rows`
-    /// stays frozen until `end_frame_buffered`; the discovery-order id is
-    /// still assigned now (rows are flushed in this same order), so the ids
-    /// are byte-identical to the classic path.
+    /// The frontier is FROZEN mid-frame: the row goes into `pending`/`recent`
+    /// and `rows` stays untouched until `end_frame` bulk-flushes it,
+    /// so a frame's `id_of`/`contains_historic` probes hit only completed
+    /// frames. The discovery-order id returned here is only used as a "was it
+    /// new" bool; the FINAL id is assigned by the content-sort at end_frame.
     pub fn insert_new(&mut self, key: (u64, u64)) -> Option<u32> {
-        if self.buffered {
-            if self.rows.contains_key(&key) {
-                return None;
-            }
-            // id = completed rows + pending-so-far, in discovery order.
-            let next = self.rows.len() + self.recent.len();
-            debug_assert!(next < u32::MAX as usize, "row id space exhausted");
-            if self.pending.insert(key) {
-                self.recent.push(key);
-                Some(next as u32)
-            } else {
-                None
-            }
-        } else {
-            let next = self.rows.len();
-            debug_assert!(next < u32::MAX as usize, "row id space exhausted");
-            match self.rows.entry(key) {
-                std::collections::hash_map::Entry::Occupied(_) => None,
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert(next as u32);
-                    self.recent.push(key);
-                    Some(next as u32)
-                }
-            }
+        if self.rows.contains_key(&key) {
+            return None;
         }
-    }
-
-    /// The keys inserted since the last `end_frame`, in id order. Call
-    /// BEFORE `end_frame` when persisting the frame's `.rowkeys`.
-    pub fn take_recent(&mut self) -> Vec<(u64, u64)> {
-        std::mem::take(&mut self.recent)
+        let next = self.rows.len() + self.recent.len();
+        debug_assert!(next < u32::MAX as usize, "row id space exhausted");
+        if self.pending.insert(key) {
+            self.recent.push(key);
+            Some(next as u32)
+        } else {
+            None
+        }
     }
 
     pub fn id_of(&self, key: (u64, u64)) -> Option<u32> {
@@ -140,21 +98,19 @@ impl RowTable {
         self.rows.is_empty()
     }
 
-    /// Record the frame boundary: all ids assigned since the previous call
-    /// belong to the frame that just completed.
-    pub fn end_frame(&mut self) {
-        self.watermarks.push(self.rows.len() as u32);
-    }
-
-    /// BUFFERED close: bulk-flush this frame's `pending` rows into `rows`
-    /// in discovery order (the ids they were already handed), push the
-    /// watermark, and return `(keys, first_id)` for the `.rowkeys` file.
-    /// The classic `end_frame` + `take_recent` split is folded into one
-    /// call because the flush needs `recent` and `take_recent` drains it.
-    pub fn end_frame_buffered(&mut self) -> (Vec<(u64, u64)>, u32) {
-        debug_assert!(self.buffered, "end_frame_buffered on a non-buffered table");
+    /// Close the frame: content-sort this frame's `pending` keys, flush them
+    /// into `rows` with their sorted ids, push the watermark, and return
+    /// `(keys, first_id)` for the `.rowkeys` file.
+    pub fn end_frame(&mut self) -> (Vec<(u64, u64)>, u32) {
         let first_id = self.rows.len() as u32;
-        let keys = std::mem::take(&mut self.recent);
+        let mut keys = std::mem::take(&mut self.recent);
+        // CONTENT-SORT ids: assign this frame's ids by a deterministic sort of
+        // the frame's new keys, NOT arrival order. Under the racy within-frame
+        // skip (Option 4) arrival order is timing-dependent; sorting by the
+        // engine key makes the id table (and visited.bin) a pure function of
+        // the row SET. Byte-identical decision to the mmap engine, which sorts
+        // the same way in `MmapVisited::end_frame`.
+        keys.sort_unstable();
         self.rows.reserve(keys.len());
         for (i, key) in keys.iter().enumerate() {
             self.rows.insert(*key, first_id + i as u32);
@@ -193,7 +149,7 @@ impl RowTable {
             .enumerate()
             .map(|(id, key)| (key, id as u32))
             .collect();
-        Self { rows, watermarks, recent: Vec::new(), pending: FxHashSet::default(), buffered: false }
+        Self { rows, watermarks, recent: Vec::new(), pending: FxHashSet::default() }
     }
 }
 
@@ -223,31 +179,25 @@ mod tests {
         assert_eq!(rebuilt.watermarks(), &[2, 3, 3]);
     }
 
-    /// The buffered (frozen-frontier) path assigns byte-identical ids and
-    /// watermarks to the classic path, and its mid-frame `id_of` is FROZEN
-    /// to completed frames (the property that lets Design 2 freeze the
-    /// frontier). Same offered sequence, same recorded result.
+    /// The frozen frontier: `insert_new` hands out discovery-order "was it
+    /// new" ids while `rows` (hence `id_of`) stays frozen to completed frames
+    /// until `end_frame`, which flushes with CONTENT-SORTED ids.
     #[test]
-    fn buffered_matches_classic_ids_and_freezes_mid_frame() {
+    fn insert_freezes_mid_frame_and_end_frame_content_sorts() {
         let ops: &[(u64, u64)] = &[(1, 1), (2, 2), (1, 1), (3, 3), (2, 2), (4, 4)];
-        // classic
-        let mut c = RowTable::default();
-        let cids: Vec<_> = ops.iter().map(|k| c.insert_new(*k)).collect();
-        c.end_frame();
-        // buffered
         let mut b = RowTable::default();
-        b.set_buffered(true);
         let bids: Vec<_> = ops.iter().map(|k| b.insert_new(*k)).collect();
         // FROZEN: a row inserted THIS frame is not yet visible to id_of.
         assert_eq!(b.id_of((1, 1)), None, "buffered id_of leaked a pending row");
-        let (keys, first_id) = b.end_frame_buffered();
-        assert_eq!(cids, bids, "buffered ids differ from classic");
+        let (keys, first_id) = b.end_frame();
+        // discovery-order ids from insert_new (the "was it new" bool source).
+        assert_eq!(bids, vec![Some(0), Some(1), None, Some(2), None, Some(3)]);
         assert_eq!(first_id, 0);
+        // keys are CONTENT-SORTED on flush; ids follow that order.
         assert_eq!(keys, vec![(1, 1), (2, 2), (3, 3), (4, 4)]);
-        // After the flush both tables are identical.
-        assert_eq!(b.rows_by_id(), c.rows_by_id());
-        assert_eq!(b.watermarks(), c.watermarks());
-        assert_eq!(b.id_of((3, 3)), c.id_of((3, 3)));
+        assert_eq!(b.rows_by_id(), vec![(1, 1), (2, 2), (3, 3), (4, 4)]);
+        assert_eq!(b.watermarks(), &[4]);
+        assert_eq!(b.id_of((3, 3)), Some(2));
     }
 
     #[test]

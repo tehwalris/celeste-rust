@@ -32,7 +32,7 @@ pub struct Kernel {
     pub acc: fn(usize, Arc<CartData>, Arc<CollisionCache>) -> Rt2,
     /// `None`: not this kernel's shape. `Some(mask)`: the lanes it
     /// declined, which the doctrine says stops the run.
-    pub step: fn(&Rt2, usize, usize, &mut [Rt2], &mut [RowSet]) -> Option<u16>,
+    pub step: fn(&Rt2, usize, usize, &mut [Rt2], &mut [RowSet], &dyn Fn((u64, u64)) -> bool) -> Option<u16>,
     /// Which slot would stop `bind`, or `None` if it would bind.
     ///
     /// `step` returns an `Option` because it is the hot path. Under the

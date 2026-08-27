@@ -52,6 +52,16 @@ pub fn av_code(v: AV) -> u64 {
     }
 }
 
+/// Gate for the per-row kernel-key VALUE check (`CELESTE_KERNEL_KEY_CHECK=1`):
+/// when on, the generated `append` records its emitted key in `row_keys` and
+/// `boundary_finish` ASSERTS the boundary recomputes the same key, byte for
+/// byte, per row. This is the gate that proves `mix64(KPART+h)` == `b.row_keys`
+/// (not just the same partition) and guards it forever.
+pub fn key_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_KEY_CHECK").is_some())
+}
+
 #[inline]
 pub fn cell_mix(c: u64, v: AV, seed: u64) -> u64 {
     mix64(seed ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ av_code(v))
@@ -964,6 +974,15 @@ impl Rt2 {
         let shape_hash = self.shape_hash_of();
         self.shape_hash = shape_hash;
 
+        // Per-row kernel-key VALUE gate (CELESTE_KERNEL_KEY_CHECK=1): the
+        // generated `append` recorded its emitted key in `row_keys`; capture
+        // it before we recompute, then assert equality at the end.
+        let kernel_keys: Vec<(u64, u64)> = if key_check() {
+            std::mem::take(&mut self.row_keys)
+        } else {
+            Vec::new()
+        };
+
         // Per-lane 128-bit row key over the compacted value cells:
         // ORDER-INDEPENDENT per-cell mixes summed per lane (the
         // interpreter's row key is order-independent for the same reason).
@@ -1036,6 +1055,29 @@ impl Rt2 {
                 let m = mix64(0x517c_c1b7_2722_0a95 ^ o as u64);
                 key.0 = mix64(key.0 ^ m);
                 key.1 = mix64(key.1 ^ m);
+            }
+        }
+
+        if !kernel_keys.is_empty() {
+            assert_eq!(
+                kernel_keys.len(),
+                self.row_keys.len(),
+                "kernel key count != boundary key count"
+            );
+            for (i, (k, b)) in kernel_keys.iter().zip(&self.row_keys).enumerate() {
+                if k != b {
+                    let mut dump = String::new();
+                    for (c, cell) in self.structure.iter().enumerate() {
+                        if matches!(cell, Cell2::Val) {
+                            use std::fmt::Write as _;
+                            let _ = write!(dump, "\n  cell {}: {:?}", c, self.cols[c].at(i));
+                        }
+                    }
+                    panic!(
+                        "KERNEL KEY != BOUNDARY KEY at row {}: kernel {:016x}{:016x} vs boundary {:016x}{:016x} (shape {:016x}, width {}){}",
+                        i, k.0, k.1, b.0, b.1, self.shape_hash, self.width, dump
+                    );
+                }
             }
         }
     }

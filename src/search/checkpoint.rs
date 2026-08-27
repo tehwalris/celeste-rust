@@ -50,7 +50,12 @@ const MAGIC: &[u8; 4] = b"C8TB";
 /// differ from the first hinted nil onward - room (1,0) diverges at f25.
 /// Not a serde change; the bump exists to refuse pre-erasure checkpoints,
 /// whose trajectories are a (very slightly) different search.
-pub const FORMAT_VERSION: u32 = 5;
+/// 5 -> 6: row ids are assigned by a deterministic CONTENT SORT of each
+/// frame's new keys (by the engine key), not arrival order (Option 4's racy
+/// within-frame skip makes arrival order timing-dependent). Every id changes,
+/// so visited.bin and the sweep's id space differ; a v5 checkpoint's ids would
+/// be meaningless here.
+pub const FORMAT_VERSION: u32 = 6;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Meta {
@@ -453,6 +458,33 @@ pub fn load_meta_and_table_unvalidated(dir: &Path, frame: u32) -> Result<(Meta, 
 /// map engine, the full key table is serialized as `visited.bin`; with
 /// the mmap engine the keys are already on disk as `frames/*.rowkeys`
 /// and only the counts go into the meta.
+/// Canonicalize the frontier so `states.bin` is a pure function of the row SET,
+/// not the (racy, under Option 4's within-frame skip) materialization order:
+/// sort each fragment's LANES by the row key, then sort fragments by their
+/// smallest lane key. A fragment's membership is already deterministic (a row's
+/// (shape, pm1) is a function of its content), and post-dedup rows are distinct,
+/// so the smallest key per fragment is a total order across fragments. Any
+/// deterministic total order works; the interpreter row key is used because it
+/// is a pure function of the state and needs no engine at checkpoint time.
+fn canonical_sort_frontier(states: &[State]) -> Vec<State> {
+    let mut keyed: Vec<((u64, u64), State)> = states
+        .iter()
+        .filter(|s| s.vector_size > 0)
+        .map(|s| {
+            let mut s = s.clone();
+            let keys = crate::interpreter::vectorize::visited_lane_keys(&s)
+                .expect("frontier fragment has row keys");
+            let mut perm: Vec<u32> = (0..s.vector_size as u32).collect();
+            perm.sort_by_key(|&i| keys[i as usize]);
+            let smallest = keys[perm[0] as usize];
+            s.permute_lanes(&perm);
+            (smallest, s)
+        })
+        .collect();
+    keyed.sort_by_key(|(k, _)| *k);
+    keyed.into_iter().map(|(_, s)| s).collect()
+}
+
 pub fn save(
     dir: &Path,
     frame: u32,
@@ -489,8 +521,13 @@ pub fn save(
         None => None,
     };
 
+    // The within-frame racy skip makes materialization order (hence fragment/
+    // lane order) timing-dependent, so canonicalize the frontier before writing
+    // it - that is what makes states.bin a pure function of the row SET and
+    // byte-identical across thread counts.
+    let sorted = canonical_sort_frontier(states);
     let states_bin_len = write_bin(&tmp_dir.join("states.bin"), |w| {
-        bincode::serialize_into(w, states).context("serializing states")
+        bincode::serialize_into(w, &sorted).context("serializing states")
     })
     .context("writing states.bin")?;
 
