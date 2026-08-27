@@ -246,3 +246,140 @@ architectural (lock-free probes + read-optimizable structure + enabling
 check-before-materialize to kill the 73% materialization), NOT the ~9%
 insert phase itself, which is small at DRAM scale and only bites on the
 mmap engine at billions of keys. Numbers here are the in-memory floor.
+
+## 3. Safe flushing prototype: buffered (frozen-frontier) MAP engine
+
+Landed opt-in as `CELESTE_FRONTIER_BUFFERED=1` (default OFF). The map engine
+now mirrors the mmap engine, which ALREADY ships this exact design: buffer a
+frame's new rows in a within-frame set (`RowTable::pending`, the analogue of
+`MmapVisited::batch_set`) and BULK-FLUSH them into `rows` at `end_frame`
+(`end_frame_buffered`), so every mid-frame `id_of`/`contains_historic` probe
+hits a FROZEN table (completed frames only). The within-frame cross-chunk
+dedup is carried by the existing `partition_seen` tier (partitioned filter)
+plus `pending` - exactly the "buffer is load-bearing under a frozen frontier"
+point in Design 2.
+
+Determinism: ids are assigned at `insert_new` time in discovery (input)
+order, `pending` is flushed in that same order, so ids/watermarks/rowkeys are
+byte-identical to the classic path. This is the SAME argument (and the same
+artifacts) that already makes the map and mmap engines interchangeable, so
+byte-identity is precedented, not new.
+
+Gates: `buffered_matches_classic_ids_and_freezes_mid_frame` (unit),
+frontier-only sequence identity vs golden, and `./parcheck.sh`. [RESULTS below]
+
+## 4. Full design implementation plan (canonical emission + check-before-materialize)
+
+The Step-1 verdict rewrites Design 1. The naive kernel key is UNSOUND across
+kernels; the FIX is that the kernel must emit a key that is a pure function of
+`(shape, full values)`. The boundary key ALREADY IS exactly that, and it is
+even better than "canonical order" requires: it is a COMMUTATIVE SUM,
+`part = shape_seed + Σ_cells cell_mix(cell_id, value)` (runtime2.rs:976-1015),
+so order does not matter and const cells fold into `shape_seed` at compile
+time. So "canonical emission" should mean **the kernel emits the BOUNDARY key
+inline**, NOT a new key. This has a decisive safety property: the key stays
+NUMERICALLY EQUAL to today's, so it is checkpoint-COMPATIBLE and is NOT a
+search-identity change - it only moves where the key is computed.
+
+Steps, each with its gate; identity-affecting ones flagged.
+
+- **Step A - kernel emits the boundary key inline (SEARCH-IDENTITY-NEUTRAL).**
+  Change the emitter (`transpile/lower.rs:1003-1046`) so the row-key nodes are
+  `shape_seed + Σ over ALL output cells of cell_mix(cell_id, value)` instead of
+  the current sequential `zw_mix` chain over only the non-const cells. Const
+  cells fold into `shape_seed` at generation time (free at runtime); per-lane
+  cells use the additive `cell_mix` primitive the boundary uses (add the
+  `ZW`/vector form of `cell_mix` to `celeste-engine::kernel` if absent). Then
+  regenerate all kernels.
+  - GATE: the D1 key-gate upgrades from BIJECTION to EQUALITY
+    (`native-probe --key-gate` / `--key-gate-outputs`: the r2i map is the
+    identity). `traced_kernels_reproduce_the_interpreter` + room00/room20
+    lattice differentials + `CELESTE_COMPILED_FORWARD=check` all green.
+    `traced_kernels_are_current` + the `#[ignore]`d room00/room20 currency
+    tests (touching the emitter) after `./regen-generated.sh`, READ THE DIFF.
+  - NOT an identity change (keys are byte-identical numbers), so checkpoints
+    stay valid. This is the safe foundation and should land first.
+
+- **Step B - check the frozen frontier BEFORE materializing (perf; neutral).**
+  With the boundary key available in-register in the kernel's `append`
+  (Step A), probe the FROZEN frontier + within-frame buffer there and skip
+  the column pushes on a hit. Requires plumbing a `&Visited` (frozen) and the
+  within-frame buffer into `run_traced_kernel`/`append`. The frontier stays
+  frozen for the whole frame (Step 3 already does this for the map engine);
+  the buffer catches within-frame cross-chunk dups. Kills the ~73%
+  materialization of duplicates.
+  - GATE: byte-identical frontier sequence + `./parcheck.sh` + the
+    differential. Row SET and ids unchanged (same key, same order); only
+    WHEN materialization is skipped changes. Determinism preserved because
+    survivorship/id order is still decided serially in input order.
+  - NOT a search-identity change.
+
+- **Step C - per-shape frontier sets (perf; OPTIONAL).** Split the one
+  frontier into one set per shape_hash, keyed by the (shape-independent) value
+  half. Pure locality optimization; the key already carries the shape, so this
+  cannot change the partition. Defer until A+B are measured.
+
+### PHILIPPE'S CALL - identity-changing variants (do NOT commit)
+
+The plan above is deliberately identity-NEUTRAL (it emits the SAME boundary
+key). The following would change the search identity and are OUT OF SCOPE for
+autonomous work - flagged per CLAUDE.md "A reordering is a different search":
+
+- Replacing the boundary key with any DIFFERENT key function (e.g. the current
+  cheap sequential `zw_mix` over non-const cells, or a per-shape key that omits
+  the shape mix) - changes the stored row keys, invalidates every checkpoint,
+  band and sweep artifact, and (for the non-const-dropping variants) is the
+  UNSOUND merge from Step 1. Do not.
+- Changing `FIELD_NAMES` order, the shape hash, or which fields the key covers.
+- Dropping the shape mix from the frontier key on the theory that per-shape
+  sets make it redundant - it also guards against cross-shape hash collisions;
+  removing it is a soundness argument Philippe must make.
+
+### Step 3 RESULTS (measured 2026-08-27, release/fat-LTO, room10)
+
+BYTE-IDENTICAL, four gates green:
+- unit: `buffered_matches_classic_ids_and_freezes_mid_frame` PASS.
+- frontier-only sequence (`--frames 50`) IDENTICAL to the classic golden
+  (per-frame new-lanes + visited-total, all 50 frames).
+- `./parcheck.sh 45 8000` under `CELESTE_FRONTIER_BUFFERED=1`: serial vs
+  16-thread `states.bin` byte-identical, frontier identical every frame.
+- buffered vs classic artifacts (frames 45): all 45 `.rowkeys` files +
+  `states.bin` + `meta.json` BYTE-IDENTICAL.
+- `cargo nextest run --cargo-profile quick`: 292 passed, 12 skipped.
+
+PERF: a NET LOSS in-memory. Clean A/B, 2 runs each, quiet machine:
+- classic (OFF): 5.00s, 5.01s; peak 1.22-1.23 GB.
+- buffered (ON): 5.28s, 5.29s; peak 1.30 GB.  => **~+5.6% wall, +6% peak.**
+
+Why: the in-memory insert was already cheap (~55 ns/row, 8.8% of wall); the
+buffer adds a SECOND hashmap op (the `pending` dedup set) plus a bulk flush,
+which the frozen frontier does not pay back on its own. `fwd.boundary_stream`
+drops 0.44->0.36s only because the inserts MOVE to the (untimed) end-of-frame
+flush - the work does not disappear.
+
+CONCLUSION: the write-buffer / frozen frontier is NOT a standalone win at
+DRAM scale - it is the verified, determinism-safe PREREQUISITE for Step B
+(check-before-materialize), where the real prize (killing the ~73%
+materialization of duplicates) lives. Kept OFF by default; the escape hatch
+and byte-identity are what make Step B safe to build on. This matches the
+spec's own prediction ("a single frozen frontier checked early is most of
+the win today" - the frozen frontier only pays once the EARLY CHECK exists).
+
+## Assumptions & decisions (continued)
+
+- **A4 (measured).** The buffered map engine is byte-identical to classic
+  (four gates above) and to the already-shipping mmap engine's design, so
+  determinism holds under it. Gate: parcheck + artifact diff + unit test.
+- **A5 (measured, decision).** Buffered-alone is ~+5.6% wall in-memory, so
+  it stays OFF by default (`CELESTE_FRONTIER_BUFFERED`, opt-in). It is a
+  stepping stone, not a shippable win on its own. DECISION: do not flip the
+  default; land it as the frozen-frontier substrate for Step B.
+- **A6 (judgment, scope).** The full design's Steps A/B/C (kernel emits the
+  boundary key inline, check-before-materialize, per-shape sets) are a large,
+  high-risk change to the emitter + all generated kernels + `run_frame_chunk`
+  + the frontier structure. Completing AND gating them responsibly exceeds
+  this session; per CLAUDE.md "correctness beats cleverness" and "don't leave
+  half-done", they are LEFT AS A PLAN (Section 4) rather than shipped
+  half-gated. The plan is written so the identity-NEUTRAL foundation (Step A:
+  emit the SAME boundary key, upgrading the D1 bijection to equality) lands
+  first and safely. Not started in code, deliberately.
