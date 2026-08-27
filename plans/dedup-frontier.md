@@ -127,3 +127,87 @@ checked early is most of the win today.
    pieces. Anything that changes the SEARCH IDENTITY (shape hash, row
    key, FIELD_NAMES order) is Philippe's call - surface it, do not commit
    it silently. CLAUDE.md: "A reordering is a different search."
+
+---
+
+# Findings (agent, 2026-08-27)
+
+## 1. Path-independence verdict: SPLIT — shape YES, kernel key NO (UNSOUND)
+
+Two separable claims live under "emission is path-independent":
+
+**(a) The output SHAPE is path-independent — YES, by construction and
+empirically.** Each kernel's `OUT_SHAPE_i` is `bind::structure_of(output_state)`
+(`trace::verify.rs:229`), which is (i) proven CANONICAL by the existing test
+`the_structure_a_traced_state_becomes_is_already_canonical` — canonicalizing it
+is the identity — and (ii) a PURE FUNCTION OF THE STATE, not the input. So two
+input-shape kernels that converge on the same semantic successor bake a
+byte-identical `OUT_SHAPE`+`OUT_GLOBALS`. Confirmed empirically:
+`tools/shape_share.py` shows output-shape sharing is the NORM, not the
+exception — room20 has one output structure produced by 7 different
+input-shape kernels; every room shares nearly all output structures across
+kernels. And the D1 key-gate (`native-probe --key-gate`, BENCHMARK_DATA "D1
+GATED") already proves the engine's BOUNDARY key (all cells, canonical) ==
+the interpreter's canonical key, bijection on 55.9M rows.
+
+**(b) The KERNEL KEY that Design 1 proposes to dedup on is NOT
+path-independent, and keying the frontier by it is UNSOUND.** The kernel's
+own row key (`KOut{h1,h2}`, the `RowSet` key) hashes only the NON-CONSTANT
+output cells — the emitter DROPS every cell that is "agreed across button
+variants AND compile-time Const" (`transpile/lower.rs:1020-1046`). Which cells
+are const is a property of the INPUT shape's frame dynamics, NOT of the output
+shape. So for a shared output shape, different kernels drop DIFFERENT cells,
+and worse, bake DIFFERENT CONSTANT VALUES for a dropped cell.
+
+Concrete proof (`tools/key_unsound.py`, 7 such (cell, shared-shape) instances
+in the checked-in kernels). Cleanest: output structure `c1684e2288f8` (room00)
+is produced by kernel0#0, kernel1#1, kernel2#3. Cell 159:
+- kernel0 `acc0`: `cols[159] = Col::U(AV::Num(0))`  (const, dropped from key)
+- kernel1 `acc1`: `cols[159] = Col::U(AV::Num(65536))` (const, dropped from key)
+- kernel2#3: cell 159 is PER-LANE (in the key)
+
+Two reachable states in shape `c1684e2288f8` that differ ONLY in cell 159
+(one =0 from kernel0, one =65536 from kernel1) compute the SAME kernel key
+(159 excluded in both) and would COLLIDE in a shared per-shape frontier —
+one is dropped — a LOST REACHABLE STATE. The current boundary key (all cells)
+distinguishes them (0 vs 65536 hash differently), which is why the search is
+sound today.
+
+**Consequence for Design 1 as written ("key by the kernel's own key"): not
+viable — it is UNSOUND, not merely re-inflating.** The mandate's rule applies:
+adapt or scope down, never ship a silent mis-merge.
+
+### The sound adaptation (what "canonical emission" must actually mean)
+
+The kernel key must be a pure function of `(shape, full output values)` — i.e.
+it must hash ALL output cells in canonical cell order, matching the boundary
+key's partition. The dropped-const-cells optimization is what breaks it. The
+fix that keeps it CHEAP: the const cells are compile-time constants per
+kernel-outcome, so the emitter can FOLD them into the mix chain at generation
+time (constant-folded by rustc) and mix the per-lane cells at runtime exactly
+as now. Result: a key equal in PARTITION to the boundary/canonical key
+(hence path-independent AND sound, equal visited set), at ~the same runtime
+cost (same number of per-lane mixes; the const folds are free). This is the
+only sound way to key a per-shape frontier by a kernel-computed key. It is
+what Design 1 must become. It changes the numeric row keys (checkpoint
+compatibility) but NOT the search result / visited set — see Assumptions.
+
+## Assumptions & decisions (running log for evening review)
+
+- **A1 (verified).** Output shape emission is path-independent. Gate:
+  `the_structure_a_traced_state_becomes_is_already_canonical` (existing) +
+  `native-probe --key-gate` D1 bijection + `tools/shape_share.py` (shows the
+  property is heavily EXERCISED: shapes shared by up to 7 kernels).
+- **A2 (verified, NEGATIVE).** The kernel's own row key (drops agreed+const
+  cells) is NOT a sound frontier key across kernels. Gate:
+  `tools/key_unsound.py` finds 7 concrete (cell, shared-shape) collisions;
+  hand-confirmed cell 159 of room00 out `c1684e2288f8` (kernel0 bakes 0,
+  kernel1 bakes 65536, both drop it). DECISION: do NOT key the frontier by
+  the current kernel key. Design 1 must become "kernel emits the FULL
+  canonical key (all cells, const-folded at compile time)". This makes the
+  key a pure function of (shape, values) = the boundary key's partition.
+- **A3 (decision).** The flushing prototype (Design 2 reversible subset)
+  keeps the CURRENT canonical/boundary key and does NOT touch the kernel
+  key. It only defers frontier inserts to an end-of-frame bulk flush and
+  freezes the frontier mid-frame. This is search-identity-preserving and
+  gated byte-identical. [status below]
