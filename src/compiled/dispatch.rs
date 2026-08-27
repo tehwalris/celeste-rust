@@ -338,25 +338,13 @@ impl Drop for FrontierGuard {
 
 /// Is `key` in the frozen frontier this thread was pointed at? `false` when
 /// no guard is set (Option 1 off).
-pub static FRONTIER_PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static FRONTIER_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static FRONTIER_NONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 fn frontier_hit(key: (u64, u64)) -> bool {
-    FRONTIER_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     FROZEN_FRONTIER.with(|c| match c.get() {
         // SAFETY: the pointer is set only for the lifetime of a
         // `FrontierGuard`, which the worker keeps alive across the kernel
         // call, and the frontier is read-only (frozen) for that whole time.
-        Some(p) => {
-            let h = unsafe { (*p).contains_historic(key) };
-            if h { FRONTIER_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-            h
-        }
-        None => {
-            FRONTIER_NONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            false
-        }
+        Some(p) => unsafe { (*p).contains_historic(key) },
+        None => false,
     })
 }
 

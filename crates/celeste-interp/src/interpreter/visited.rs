@@ -512,27 +512,18 @@ enum Engine {
 /// Frozen-frontier flush for the MAP engine: buffer a frame's new rows and
 /// bulk-flush at `end_frame` instead of inserting incrementally, so
 /// mid-frame probes hit a frozen table (the mmap engine already does this).
-/// Opt-in via `CELESTE_FRONTIER_BUFFERED=1`; byte-identical either way. Off
-/// by default so no running campaign changes without asking.
-fn map_buffered_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("CELESTE_FRONTIER_BUFFERED").map_or(false, |v| v != "0")
-    })
-}
-
 impl Visited {
     /// The historic in-RAM engine, no artifacts.
     pub fn in_memory() -> Self {
         let mut table = RowTable::default();
-        table.set_buffered(map_buffered_on());
+        table.set_buffered(true);
         Self { dir: None, engine: Engine::Map(table) }
     }
 
     /// The historic engine, writing `.rowkeys` at each boundary so the
     /// artifacts are interchangeable with the mmap engine's.
     pub fn map_with_dir(mut table: RowTable, dir: &Path) -> Self {
-        table.set_buffered(map_buffered_on());
+        table.set_buffered(true);
         Self { dir: Some(dir.to_path_buf()), engine: Engine::Map(table) }
     }
 

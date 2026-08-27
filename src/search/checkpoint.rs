@@ -521,20 +521,13 @@ pub fn save(
         None => None,
     };
 
-    // Option 4: the racy within-frame skip makes materialization order (hence
-    // fragment/lane order) timing-dependent; canonicalize so states.bin is
-    // byte-identical across thread counts. Only needed (and only paid) when the
-    // skip is on - Option-1-only states.bin is already deterministic.
-    let sorted;
-    let states_to_write: &[State] =
-        if crate::search::run::within_frame_skip_on() {
-            sorted = canonical_sort_frontier(states);
-            &sorted
-        } else {
-            states
-        };
+    // The within-frame racy skip makes materialization order (hence fragment/
+    // lane order) timing-dependent, so canonicalize the frontier before writing
+    // it - that is what makes states.bin a pure function of the row SET and
+    // byte-identical across thread counts.
+    let sorted = canonical_sort_frontier(states);
     let states_bin_len = write_bin(&tmp_dir.join("states.bin"), |w| {
-        bincode::serialize_into(w, states_to_write).context("serializing states")
+        bincode::serialize_into(w, &sorted).context("serializing states")
     })
     .context("writing states.bin")?;
 

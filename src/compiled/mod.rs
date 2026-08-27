@@ -28,20 +28,6 @@ use celeste_engine::runtime2;
 /// interpreter re-hash.
 pub type KeyedState = (crate::interpreter::state::State, Option<Vec<(u64, u64)>>);
 
-/// Whether the compiled forward path carries the engine key to the frontier
-/// (Option 1). Off (default) skips the per-block key clone entirely, so the
-/// path is byte-identical AND free relative to before. Reads the same env as
-/// `search::run::frontier_skip_on` - the skip and the engine-keyed frontier
-/// are one feature.
-fn engine_keyed_frontier_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Must match `search::run::engine_keyed_frontier` (frontier-skip OR
-    // within-frame-skip): the carry is needed for either.
-    *ON.get_or_init(|| {
-        std::env::var_os("CELESTE_FRONTIER_SKIP").is_some()
-            || std::env::var_os("CELESTE_WITHIN_FRAME_SKIP").is_some()
-    })
-}
 // The engine's hasher, not celeste-rust's. rustc-hash 1 and 2 hash
 // differently and this crate is still on 1; the row machinery's maps
 // belong to the engine, so they use the engine's.
@@ -631,8 +617,9 @@ impl FrameEngine {
         t.mark(CHUNK_MERGE);
         out.extend(
             merged.iter().map(|b| {
-                let keys = engine_keyed_frontier_on().then(|| b.row_keys.clone());
-                (export_block_tagged(b, origin_tag), keys)
+                // Carry the engine keys unconditionally - the engine-keyed
+                // frontier is the only frontier.
+                (export_block_tagged(b, origin_tag), Some(b.row_keys.clone()))
             }),
         );
         t.mark(CHUNK_EXPORT);
