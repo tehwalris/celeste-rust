@@ -722,3 +722,52 @@ Option 4 (racy within-frame skip), status:
   fragment by key. `KeptLanes` only FILTERS ascending (can't permute), so this
   needs a new gather-by-permutation (or a global frontier re-canonicalize). Not
   yet done -> Option 4 stays off by default and is NOT parcheck-complete.
+
+## Option 4 COMPLETE - parcheck crux green (2026-08-27)
+
+The checkpoint-time frontier content-sort closes the states.bin gap. `State::
+permute_lanes` (a gather-by-permutation; `KeptLanes` only filters ascending, so
+this is new) reorders a fragment's lanes; `checkpoint::canonical_sort_frontier`
+sorts each fragment's lanes by the row key and fragments by their smallest key.
+Applied at `save` when `CELESTE_WITHIN_FRAME_SKIP` is set (Option-1-only
+states.bin is already deterministic, so it is free otherwise).
+
+CRUX (compiled + FRONTIER_SKIP + WITHIN_FRAME_SKIP, f40 checkpoint, serial=1 vs
+16-thread):
+  rowkeys  BYTE-IDENTICAL
+  states.bin BYTE-IDENTICAL
+  meta     BYTE-IDENTICAL
+Resume from the (permuted) checkpoint reaches the SAME visited total as a fresh
+run (3,116,244 at f45) - permute_lanes is value-correct, not just deterministic.
+Quick suite 293 passed (sweep/pos-graph unit tests + traced differential incl.).
+
+MEASURED combined win (room10 frontier-only+buffered, f50):
+  KROWS materialized  OFF 71,913,505 -> Opt1 34,673,730 -> Opt1+4 23,100,002
+                      = -68% vs OFF (-33% on top of Opt 1)
+  compiled run phase  39.4s -> 34.1s -> 31.4s
+  wall                6.92s -> 5.72s -> 5.72s
+(KROWS under the racy skip is non-deterministic run-to-run - the reachable SET
+and the checkpoint bytes are not; only how many duplicates slipped through
+before being collapsed varies.)
+
+### The compiled+within-frame parcheck recipe (parcheck.sh is interpreter-only)
+```
+E="CELESTE_COMPILED_FORWARD=1 CELESTE_FRONTIER_ONLY=1 CELESTE_FRONTIER_BUFFERED=1 \
+   CELESTE_FRONTIER_SKIP=1 CELESTE_WITHIN_FRAME_SKIP=1 CELESTE_MAX_STATE_LANES=8000"
+env $E CELESTE_FRAME_THREADS=1  rewrite bench --frames 40 --checkpoint-dir S --checkpoint-every 40
+env $E CELESTE_FRAME_THREADS=16 rewrite bench --frames 40 --checkpoint-dir P --checkpoint-every 40
+# then diff S/frames/*.rowkeys, S/f040/states.bin, S/f040/meta.json vs P
+```
+
+### Merge readiness (for census + default-on)
+- Option 1 and Option 4 are both opt-in flags today; correctness is gated
+  (differential, byte-identical serial-vs-parallel, resume-correct).
+- CAVEAT for flipping defaults ON: `canonical_sort_frontier` gates on the ENV
+  VAR `CELESTE_WITHIN_FRAME_SKIP` being set. If the skip becomes default-on
+  WITHOUT the env var, that gate must change to the same predicate the skip
+  uses, or states.bin goes non-deterministic again. (Same shape as tying the
+  engine-keyed frontier to `frontier_skip_on`.)
+- VALIDATED ON THE QUICK PROFILE. Determinism is opt-independent (it is the
+  sort + the key space, not codegen), but the letter of the gate is a RELEASE
+  parcheck; the recipe above under `--release` is the final pre-merge check I
+  did not run (the room20 release build is ~20 min).
