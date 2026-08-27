@@ -72,12 +72,22 @@ fn outcome_part(
     rt2: &celeste_engine::runtime2::Rt2,
     fields: &[OutField],
     ubool: &[u32],
+    widen_cells: &[(u32, AV)],
 ) -> (u64, u64) {
-    use std::collections::HashSet;
-    let per_lane: HashSet<u32> =
-        fields.iter().filter(|f| f.konst.is_none()).map(|f| f.cell).collect();
-    let konst_cell: HashSet<u32> =
-        fields.iter().filter(|f| f.konst.is_some()).map(|f| f.cell).collect();
+    use std::collections::{HashMap, HashSet};
+    // A boundary-widened-to-uniform cell (rem, timers) contributes its WIDENED
+    // value from KPART, not the per-lane fold - so it is NOT per-lane, and the
+    // widen map overrides its value below (mirror `Rt2::boundary_widen`).
+    let widen: HashMap<u32, AV> = widen_cells.iter().copied().collect();
+    let per_lane: HashSet<u32> = fields
+        .iter()
+        .filter(|f| f.konst.is_none() && !widen.contains_key(&f.cell))
+        .map(|f| f.cell)
+        .collect();
+    // Konst cells fold their EMITTED value (what the acc holds), NOT rt2 -
+    // `structure_of` leaves some of these `Nil`, which is the KPART bug.
+    let konst_av: HashMap<u32, AV> =
+        fields.iter().filter_map(|f| f.konst_av.map(|av| (f.cell, av))).collect();
     let ubool: HashSet<u32> = ubool.iter().copied().collect();
     let shape_hash = rt2.shape_hash_of();
     let mut part1: u64 = shape_hash;
@@ -90,15 +100,14 @@ fn outcome_part(
         if per_lane.contains(&cu) {
             continue; // Col::N/V/I in the acc - summed per lane by the graph
         }
-        let av = if ubool.contains(&cu) {
+        let av = if let Some(w) = widen.get(&cu) {
+            // The boundary WIDENS this cell to a uniform value; key it that way.
+            *w
+        } else if let Some(kav) = konst_av.get(&cu) {
+            // A konst field: fold its emitted value (the acc's value).
+            *kav
+        } else if ubool.contains(&cu) {
             AV::UBool
-        } else if konst_cell.contains(&cu) {
-            // A konst field: the acc holds the traced value, which is what
-            // rt2 carries too (structure_of of the same state).
-            match rt2.cols[c] {
-                Col::U(v) => v,
-                ref other => panic!("konst cell {} not uniform: {:?}", c, other),
-            }
         } else {
             // Structural: the acc is build_block's default - a pointer where
             // the shape has one, else Nil. (A concrete non-field cell would be
@@ -112,6 +121,7 @@ fn outcome_part(
         part1 = part1.wrapping_add(cell_mix(c as u64, av, 0x5bf0_3635));
         part2 = part2.wrapping_add(cell_mix(c as u64, av, 0x27d4_eb2f));
     }
+
     (part1, part2)
 }
 
@@ -521,8 +531,12 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
             i
         )?;
 
-        let (kpart1, kpart2) =
-            outcome_part(&f.outs[i].rt2, &out.fields, &f.outs[i].ubool_cells);
+        let (kpart1, kpart2) = outcome_part(
+            &f.outs[i].rt2,
+            &out.fields,
+            &f.outs[i].ubool_cells,
+            &b.outcomes[i].widen,
+        );
         writeln!(
             o,
             "/// The SOUND (full boundary) row key's per-outcome CONSTANT\n\
@@ -641,6 +655,7 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
             "        if !org.is_empty() {{ acc.origin.push(org[i]); }}\n\
              \x20       wrote |= 1 << i;\n\
              \x20       acc.width += 1;\n\
+             \x20       if celeste_engine::runtime2::key_check() {{ acc.row_keys.push(key); }}\n\
              \x20   }}\n\
              \x20   wrote\n\
              }}\n"
@@ -1056,7 +1071,7 @@ pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
     let frame = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &[], false)?;
 
     let graph = std::mem::take(&mut it.d.graph);
-    let bound = super::emit::bind(&frame, &graph)?;
+    let bound = super::emit::bind(&frame, &graph, true)?;
     let room = crate::transpile::graph::Room { cart: cart_data.clone(), cache: cache.clone() };
     let lowered = super::emit::lower_frame(
         &bound.graph,
@@ -1253,7 +1268,7 @@ pub(crate) fn lattice_kernel_refs(
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
     let mut refs: Vec<Reference> = Vec::new();
     for (i, (_k, f)) in std::mem::take(&mut lw.frames).into_iter().enumerate() {
-        let bound = super::emit::bind(&f, &lw.graph)
+        let bound = super::emit::bind(&f, &lw.graph, opts.widen)
             .map_err(|e| anyhow::anyhow!("lattice shape {} bind: {:#}", i, e))?;
         let lowered = super::emit::lower_frame(
             &bound.graph,
@@ -2922,7 +2937,7 @@ pub fn room_constants(root: &std::path::Path) -> Result<String> {
     // Bind+lower each converged frame to get the emitted size.
     let mut lines_by_shape: std::collections::BTreeMap<String, usize> = Default::default();
     for (k, f) in frames.iter_mut() {
-        if let Ok(bound) = super::emit::bind(f, &graph) {
+        if let Ok(bound) = super::emit::bind(f, &graph, true) {
             if let Ok(low) = super::emit::lower_frame(&bound.graph, &bound.inputs, &bound.uni, &bound.outcomes, Some(room.clone()), bound.forks) {
                 lines_by_shape.insert(k.clone(), low.body.len());
             }

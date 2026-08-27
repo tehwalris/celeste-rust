@@ -139,6 +139,19 @@ pub(crate) struct OutField {
     /// removes most of the per-row column writes - and most of the
     /// output values that were living across the variant sequence.
     pub(crate) konst: Option<String>,
+    /// Set when `Rt2::boundary` WIDENS this cell to a UNIFORM value at level
+    /// 0 (rem -> the [-0.5, 0.5) interval, a timer -> 0). The kernel key must
+    /// then contribute the WIDENED value from the constant `KPART` prefix, not
+    /// the raw per-lane value - so the field is EXCLUDED from the per-lane
+    /// fold (`transpile::lower`) and added to `KPART` with this value
+    /// (`trace::kernel::outcome_part`). Without it `mix64(KPART+h)` differs
+    /// from `b.row_keys` and the Option-1 probe misses.
+    pub(crate) widen_uniform: Option<celeste_engine::runtime2::AV>,
+    /// The konst field's VALUE as an `AV` (mirrors `konst`, which is the code
+    /// string). `outcome_part` folds THIS into KPART - `structure_of`'s rt2
+    /// leaves some konst cells `Nil`, so keying by rt2 there is wrong; the acc
+    /// (and thus the boundary) uses this value.
+    pub(crate) konst_av: Option<celeste_engine::runtime2::AV>,
 }
 
 /// Output cells of one frame.

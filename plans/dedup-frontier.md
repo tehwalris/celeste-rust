@@ -605,3 +605,34 @@ gate b+c should have had. Flagged for go-ahead.
 
 Everything is committed gated (off = byte-identical); the carry + probe
 machinery is in place and waiting for the value-equal key.
+
+## Option 1 LANDS: value-equal kernel key + measured (2026-08-27)
+
+Closed b+c's VALUE-equality gap in two parts, both mirroring `Rt2::boundary`:
+1. WIDENING: the boundary widens rem -> [-0.5, 0.5) and timers -> 0 (uniform).
+   The key emitter now folds these into the constant KPART (off the per-lane
+   sum): `bind` identifies them with the boundary's own `mark_walk` / `g_timers`
+   on each outcome's rt2; `outcome_part` adds their widened value to KPART;
+   `transpile::lower` excludes them from the per-lane fold (`OutField::widen_uniform`).
+2. KONST: `outcome_part` folded a konst cell's rt2 value, but `structure_of`
+   leaves some konst cells `Nil` while the acc holds the EMITTED konst value -
+   found with a gen-time diff (`CELESTE_KPART_DIAG`). Fixed by folding the
+   emitted konst value (`OutField::konst_av`), not rt2.
+
+GATE (the one b+c should have had): `CELESTE_KERNEL_KEY_CHECK=1` - the
+generated `append` records its emitted key and `Rt2::boundary_finish` ASSERTS
+it equals the recomputed `b.row_keys`, byte for byte, PER ROW. **PASSES** over
+40 frames (0 mismatches). So `mix64(KPART+h)` == `b.row_keys` value-for-value,
+not just same-partition. Off by default.
+
+MEASURED (room10 frontier-only + buffered, `--frames 50`, quick; OFF = no
+skip, ON = `CELESTE_FRONTIER_SKIP=1`):
+- Reachable set BYTE-IDENTICAL every frame (engine-keyed frontier = same set).
+- Frontier skip HITS: ~6.0M/frame at f50 (was 0 before the value fix).
+- **Kernel rows materialized (KROWS): 71,913,505 -> 34,673,730 = -52%.**
+- Compiled `run` phase (thread-seconds): 39.43s -> 34.12s (-13%).
+- Wall: 6.92s -> 5.72s (-17%).
+
+So Option 1 (check the frozen frontier before materializing) skips ~52% of
+materialized rows - in line with the quadrant census's ~45%-of-offered
+frozen-frontier coverage - with the reachable set unchanged.

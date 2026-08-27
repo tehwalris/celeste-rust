@@ -60,6 +60,11 @@ pub struct FrameOutcome {
     pub outputs: Vec<(u32, NodeId, &'static str)>,
     pub live: NodeId,
     pub ok: NodeId,
+    /// Cells `Rt2::boundary` widens to a UNIFORM value at level 0 (rem x/y ->
+    /// the [-0.5, 0.5) interval; timer globals -> 0), with that value. The key
+    /// emitter mirrors the boundary: these contribute the widened value from
+    /// `KPART`, off the per-lane fold. See `OutField::widen_uniform`.
+    pub widen: Vec<(u32, celeste_engine::runtime2::AV)>,
 }
 
 /// A traced frame in the ENGINE's numbering: everything `lower_frame`
@@ -106,7 +111,7 @@ fn root_legend(f: &crate::trace::verify::Frame) -> String {
 /// refuses. A hitbox IS uniform - it is fixed per object type and never
 /// written during a frame - so saying so here is a stand-in for the
 /// classification, not a fudge.
-pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
+pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> Result<Bound> {
     let mut roots: Vec<NodeId> = Vec::new();
     for o in &f.outs {
         roots.extend(o.fields.iter().map(|(_, nd, _)| *nd));
@@ -168,6 +173,17 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
         }
     }
 
+    // Level-0 boundary WIDENINGS that make a cell UNIFORM (rem -> [-0.5, 0.5)
+    // interval; timer globals -> 0). The kernel key must contribute these the
+    // way `Rt2::boundary` does - from the constant KPART, off the per-lane
+    // fold - or `mix64(KPART+h)` != `b.row_keys` and Option 1's probe misses.
+    // Identified with the boundary's OWN walk (`mark_walk`, `g_timers`), on
+    // each outcome's output structure, so this is exactly what it widens.
+    use celeste_engine::runtime2::AV;
+    let ids = crate::compiled::boundary_ids();
+    let half = celeste_core::pico8_num::Pico8Num::from_parts(0, 0x8000);
+    let rem_ival = AV::Ival(-half, half.next_smallest());
+    let zero = celeste_core::pico8_num::Pico8Num::from_i16(0);
     let mut at = 0usize;
     let mut outcomes = Vec::new();
     for o in &f.outs {
@@ -180,7 +196,27 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
                 (o.cells[i], roots[at + i], *ty)
             })
             .collect();
-        outcomes.push(FrameOutcome { outputs, live: roots[at + n], ok: roots[at + n + 1] });
+        let mut widen: Vec<(u32, AV)> = Vec::new();
+        // LADDER/EXACT sets go through `Rt2::boundary_exact` (no widening), so
+        // their key must NOT widen. Only the LEVEL0 set (widen_level0) does.
+        if widen_level0 {
+            let (rem_cells, _det_cells) = o.rt2.mark_walk(&ids);
+            for c in rem_cells {
+                widen.push((c, rem_ival));
+            }
+            for &tg in &ids.g_timers {
+                let cell = o.rt2.globals[tg as usize];
+                if (cell as usize) < o.rt2.structure.len() {
+                    widen.push((cell, AV::Num(zero)));
+                }
+            }
+        }
+        outcomes.push(FrameOutcome {
+            outputs,
+            live: roots[at + n],
+            ok: roots[at + n + 1],
+            widen,
+        });
         at += n + 2;
     }
     Ok(Bound { graph, forks: f.forks, inputs, uni, outcomes })
@@ -227,6 +263,14 @@ pub fn lower_frame(
                         tainted: false,
                         node: *node,
                         konst: None,
+                        konst_av: None,
+                        // Boundary-widened-to-uniform cells (rem, timers): the
+                        // key emitter excludes them from the per-lane fold.
+                        widen_uniform: o
+                            .widen
+                            .iter()
+                            .find(|(c, _)| *c == *cell)
+                            .map(|(_, av)| *av),
                     })
                     .collect(),
             },

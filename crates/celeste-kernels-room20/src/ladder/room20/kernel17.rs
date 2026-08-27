@@ -11828,8 +11828,8 @@ pub fn acc0(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_0: u64 = 17310884889625053153;
-pub const KPART2_0: u64 = 8678418314782866327;
+pub const KPART1_0: u64 = 3258248766251752042;
+pub const KPART2_0: u64 = 5922994135608136700;
 
 /// Append this assignment's lanes that TAKE outcome 0 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -11927,6 +11927,7 @@ pub fn append0(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -12041,8 +12042,8 @@ pub fn acc1(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_1: u64 = 15990151978929535894;
-pub const KPART2_1: u64 = 3831756090133193594;
+pub const KPART1_1: u64 = 4857953469042483884;
+pub const KPART2_1: u64 = 12717451651879366905;
 
 /// Append this assignment's lanes that TAKE outcome 1 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -12140,6 +12141,7 @@ pub fn append1(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -12270,8 +12272,8 @@ pub fn acc2(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_2: u64 = 5055231813092918663;
-pub const KPART2_2: u64 = 7605369903329149322;
+pub const KPART1_2: u64 = 1285140487108049024;
+pub const KPART2_2: u64 = 14144071245450305900;
 
 /// Append this assignment's lanes that TAKE outcome 2 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -12375,6 +12377,7 @@ pub fn append2(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -12505,8 +12508,8 @@ pub fn acc3(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_3: u64 = 16903100713655481144;
-pub const KPART2_3: u64 = 9833413725603708729;
+pub const KPART1_3: u64 = 468410735097414016;
+pub const KPART2_3: u64 = 12410079912519475796;
 
 /// Append this assignment's lanes that TAKE outcome 3 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -12610,6 +12613,7 @@ pub fn append3(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -12700,8 +12704,8 @@ pub fn acc4(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_4: u64 = 12324093367925927381;
-pub const KPART2_4: u64 = 12364506016476404550;
+pub const KPART1_4: u64 = 4909163120369739572;
+pub const KPART2_4: u64 = 15664057126307302299;
 
 /// Append this assignment's lanes that TAKE outcome 4 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -12765,6 +12769,7 @@ pub fn append4(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -12855,8 +12860,8 @@ pub fn acc5(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_5: u64 = 10611605397908074725;
-pub const KPART2_5: u64 = 10354055476980256846;
+pub const KPART1_5: u64 = 10997453262556401376;
+pub const KPART2_5: u64 = 2411889762376763118;
 
 /// Append this assignment's lanes that TAKE outcome 5 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -12920,6 +12925,7 @@ pub fn append5(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -13026,8 +13032,8 @@ pub fn acc6(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_6: u64 = 11136836713617634455;
-pub const KPART2_6: u64 = 15030401020721226940;
+pub const KPART1_6: u64 = 11491666720883627818;
+pub const KPART2_6: u64 = 16342189998971974879;
 
 /// Append this assignment's lanes that TAKE outcome 6 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -13097,6 +13103,7 @@ pub fn append6(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -13203,8 +13210,8 @@ pub fn acc7(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_7: u64 = 17078508449713251950;
-pub const KPART2_7: u64 = 17747118913405544487;
+pub const KPART1_7: u64 = 4590382458680357692;
+pub const KPART2_7: u64 = 6927796367751691845;
 
 /// Append this assignment's lanes that TAKE outcome 7 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -13274,6 +13281,7 @@ pub fn append7(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -13387,8 +13395,8 @@ pub fn acc8(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_8: u64 = 6556206805066229762;
-pub const KPART2_8: u64 = 15592723234554252880;
+pub const KPART1_8: u64 = 8254372998957189721;
+pub const KPART2_8: u64 = 7249132005406011282;
 
 /// Append this assignment's lanes that TAKE outcome 8 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -13486,6 +13494,7 @@ pub fn append8(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -13575,8 +13584,8 @@ pub fn acc9(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_9: u64 = 7359791922650843579;
-pub const KPART2_9: u64 = 17068849822392135886;
+pub const KPART1_9: u64 = 9966348597960427544;
+pub const KPART2_9: u64 = 7463574154913698253;
 
 /// Append this assignment's lanes that TAKE outcome 9 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -13640,6 +13649,7 @@ pub fn append9(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -13745,8 +13755,8 @@ pub fn acc10(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_10: u64 = 6505727788572677553;
-pub const KPART2_10: u64 = 6750100009566586826;
+pub const KPART1_10: u64 = 8928483359467820361;
+pub const KPART2_10: u64 = 2468381003000484817;
 
 /// Append this assignment's lanes that TAKE outcome 10 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -13816,6 +13826,7 @@ pub fn append10(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -14111,8 +14122,8 @@ pub fn acc11(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_11: u64 = 7538238740480024082;
-pub const KPART2_11: u64 = 8274342854545347923;
+pub const KPART1_11: u64 = 7240363014696139081;
+pub const KPART2_11: u64 = 97385359111614732;
 
 /// Append this assignment's lanes that TAKE outcome 11 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -14177,6 +14188,7 @@ pub fn append11(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -14473,8 +14485,8 @@ pub fn acc12(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_12: u64 = 16651243698737751054;
-pub const KPART2_12: u64 = 14372757396449290073;
+pub const KPART1_12: u64 = 2180868251631278096;
+pub const KPART2_12: u64 = 15589330933981481702;
 
 /// Append this assignment's lanes that TAKE outcome 12 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -14539,6 +14551,7 @@ pub fn append12(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }
@@ -14668,8 +14681,8 @@ pub fn acc13(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 /// per-lane cells are summed by the graph into `kv.h1/h2`, and
 /// `append` closes the key with `mix64(KPART + kv.h)`, which is
 /// byte-identical to `Rt2::boundary`'s own row key.
-pub const KPART1_13: u64 = 343323083668812483;
-pub const KPART2_13: u64 = 13760168619098720467;
+pub const KPART1_13: u64 = 3139789272845942717;
+pub const KPART2_13: u64 = 4769369865815699658;
 
 /// Append this assignment's lanes that TAKE outcome 13 and
 /// that the kernel is willing to keep. A lane in `deopt` is
@@ -14773,6 +14786,7 @@ pub fn append13(
         if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
+        if celeste_engine::runtime2::key_check() { acc.row_keys.push(key); }
     }
     wrote
 }

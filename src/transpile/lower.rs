@@ -1053,12 +1053,16 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                 .fields
                 .iter()
                 .enumerate()
-                .filter(|(fi, _)| {
-                    !(agreed(*fi)
-                        && matches!(
-                            sp.get(bodies[first_body].3[*fi]).op,
-                            Op::Const(..) | Op::ConstBool(_)
-                        ))
+                .filter(|(fi, f)| {
+                    // A cell the boundary widens to a UNIFORM value (rem,
+                    // timers) contributes from the constant KPART, not the
+                    // per-lane fold - mirror the boundary and drop it here.
+                    f.widen_uniform.is_none()
+                        && !(agreed(*fi)
+                            && matches!(
+                                sp.get(bodies[first_body].3[*fi]).op,
+                                Op::Const(..) | Op::ConstBool(_)
+                            ))
                 })
                 .map(|(fi, f)| (f.cell, fi))
                 .collect();
@@ -1276,6 +1280,20 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                         lo, hi
                     )),
                     Op::ConstBool(b) => Some(format!("AV::Bool({})", b)),
+                    _ => None,
+                }
+            };
+            f.konst_av = if f.tainted {
+                None
+            } else {
+                use celeste_engine::runtime2::AV;
+                use celeste_core::pico8_num::Pico8Num;
+                match sp.get(bodies[fb].3[fi]).op {
+                    Op::Const(lo, hi) if lo == hi => Some(AV::Num(Pico8Num::from_raw(lo))),
+                    Op::Const(lo, hi) => {
+                        Some(AV::Ival(Pico8Num::from_raw(lo), Pico8Num::from_raw(hi)))
+                    }
+                    Op::ConstBool(b) => Some(AV::Bool(b)),
                     _ => None,
                 }
             };
