@@ -127,6 +127,22 @@ impl RowTable {
         std::mem::take(&mut self.recent)
     }
 
+    /// Non-buffered close with CONTENT-SORTED ids: sort this frame's new keys
+    /// by the engine key and REASSIGN their ids in `rows` to the sorted order,
+    /// so the id table (and .rowkeys) is a pure function of the row SET, not
+    /// arrival order - matching `end_frame_buffered` and the mmap engine. The
+    /// arrival ids handed out by `insert_new` this frame were only ever used
+    /// as a "was it new" bool, so reassigning here is safe.
+    pub fn take_recent_content_sorted(&mut self) -> (Vec<(u64, u64)>, u32) {
+        let mut keys = std::mem::take(&mut self.recent);
+        let first_id = self.rows.len() as u32 - keys.len() as u32;
+        keys.sort_unstable();
+        for (i, k) in keys.iter().enumerate() {
+            self.rows.insert(*k, first_id + i as u32);
+        }
+        (keys, first_id)
+    }
+
     pub fn id_of(&self, key: (u64, u64)) -> Option<u32> {
         self.rows.get(&key).copied()
     }

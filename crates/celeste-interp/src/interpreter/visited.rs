@@ -619,8 +619,7 @@ impl Visited {
                     // frame). Same keys, same discovery-order ids.
                     t.end_frame_buffered()
                 } else {
-                    let keys = t.take_recent();
-                    let first_id = t.len() as u32 - keys.len() as u32;
+                    let (keys, first_id) = t.take_recent_content_sorted();
                     t.end_frame();
                     (keys, first_id)
                 };
