@@ -258,7 +258,9 @@ fn run_traced_kernel(
     // FROZEN frontier this thread was pointed at (`with_frozen_frontier`,
     // set by the worker only when the frontier is frozen/buffered). Off =>
     // `frontier_hit` returns false => byte-identical to no skip.
-    let skip = |key: (u64, u64)| frontier_hit(key);
+    // Skip a successor already in the frozen frontier (Option 1) OR already
+    // emitted this frame by a sibling chunk (Option 4, race-sound).
+    let skip = |key: (u64, u64)| frontier_hit(key) || within_frame_dup(key);
     let mut lo = 0usize;
     while lo < chunk.width {
         let n = kernel::W.min(chunk.width - lo);
@@ -356,4 +358,102 @@ fn frontier_hit(key: (u64, u64)) -> bool {
             false
         }
     })
+}
+
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering as O};
+
+/// A frame-scoped, SHARED-across-workers set the kernels probe to skip
+/// materializing a successor a sibling chunk already emitted THIS frame
+/// (Option 4). Lock-free and RACE-SOUND: two occurrences of a successor are
+/// byte-identical, so a race that lets both through just materializes a
+/// duplicate (collapsed by `partition_filter`), never loses a row. The only
+/// unsound outcome - reporting a DUP for a distinct key - is ruled out by
+/// comparing the FULL 128-bit key on every hit.
+pub struct WithinFrameSet {
+    mask: usize,
+    state: Vec<AtomicU8>, // 0 = empty, 1 = writing, 2 = full
+    k0: Vec<AtomicU64>,
+    k1: Vec<AtomicU64>,
+}
+
+impl WithinFrameSet {
+    /// `bits` slots = 2^bits. ~1.2M distinct successors/frame, so 2^22 (4M
+    /// slots, load factor ~0.3) keeps probe chains short.
+    pub fn with_bits(bits: u32) -> Self {
+        let n = 1usize << bits;
+        Self {
+            mask: n - 1,
+            state: (0..n).map(|_| AtomicU8::new(0)).collect(),
+            k0: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            k1: (0..n).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// Reset to empty for a new frame. Only `state` matters - a stale key
+    /// under `state == empty` is never read.
+    pub fn clear(&self) {
+        for s in &self.state {
+            s.store(0, O::Relaxed);
+        }
+    }
+
+    /// `true` => this key is ALREADY present (skip / do not materialize).
+    /// `false` => newly inserted, or "not sure" under contention (materialize).
+    #[inline]
+    pub fn probe_or_insert(&self, key: (u64, u64)) -> bool {
+        let h = key.0 ^ key.1.rotate_left(32);
+        let mut slot = (h as usize) & self.mask;
+        for _ in 0..32 {
+            match self.state[slot].load(O::Acquire) {
+                2 => {
+                    if self.k0[slot].load(O::Relaxed) == key.0
+                        && self.k1[slot].load(O::Relaxed) == key.1
+                    {
+                        return true; // exact dup
+                    }
+                    slot = (slot + 1) & self.mask; // collision, linear probe
+                }
+                0 => {
+                    // Claim the empty slot; only the CAS winner writes it.
+                    if self.state[slot]
+                        .compare_exchange(0, 1, O::AcqRel, O::Acquire)
+                        .is_ok()
+                    {
+                        self.k0[slot].store(key.0, O::Relaxed);
+                        self.k1[slot].store(key.1, O::Relaxed);
+                        self.state[slot].store(2, O::Release);
+                        return false; // newly inserted
+                    }
+                    // lost the claim; reload the same slot next iteration
+                }
+                _ => return false, // writing: treat as new (materialize) - sound
+            }
+        }
+        false // probe budget spent: materialize - sound
+    }
+}
+
+/// The current frame's within-frame set, shared across the step_parallel
+/// workers. Set for the lifetime of the worker scope, null otherwise.
+static WITHIN_FRAME: AtomicPtr<WithinFrameSet> = AtomicPtr::new(std::ptr::null_mut());
+
+/// SAFETY: the caller keeps `set` alive for the whole worker scope and clears
+/// the pointer (below) before dropping it.
+pub fn set_within_frame(set: &WithinFrameSet) {
+    WITHIN_FRAME.store(set as *const _ as *mut _, O::Release);
+}
+
+pub fn clear_within_frame() {
+    WITHIN_FRAME.store(std::ptr::null_mut(), O::Release);
+}
+
+#[inline]
+fn within_frame_dup(key: (u64, u64)) -> bool {
+    let p = WITHIN_FRAME.load(O::Acquire);
+    if p.is_null() {
+        return false;
+    }
+    // SAFETY: non-null only within the worker scope that set it, where the set
+    // outlives every kernel probe.
+    unsafe { (*p).probe_or_insert(key) }
 }

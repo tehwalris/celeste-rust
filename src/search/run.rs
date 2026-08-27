@@ -705,6 +705,21 @@ fn engine_keyed_frontier() -> bool {
     frontier_skip_on()
 }
 
+/// Option 4: the racy within-frame skip. Implies the engine-keyed frontier
+/// (it probes the same key space) and requires a frozen frontier.
+fn within_frame_skip_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_WITHIN_FRAME_SKIP").is_some())
+}
+
+/// The process-wide within-frame set, reused across frames (cleared per frame).
+/// 2^22 slots (~4M) for ~1.2M distinct successors/frame - load factor ~0.3.
+fn within_frame_set() -> &'static crate::compiled::dispatch::WithinFrameSet {
+    static SET: std::sync::OnceLock<crate::compiled::dispatch::WithinFrameSet> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| crate::compiled::dispatch::WithinFrameSet::with_bits(22))
+}
+
 fn partitioned_filter_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -1785,7 +1800,13 @@ impl AbstractRun {
         let input_states = chunk_states(std::mem::take(&mut self.states));
         // Chunk-parallel path. Everything else keeps the serial loop below -
         // one code path per arrangement, and the parallel one is opt-in.
-        if frame_threads() > 1 {
+        // The engine-keyed frontier (Option 1) and the within-frame skip
+        // (Option 4) are wired into step_parallel, NOT the serial loop below.
+        // Routing the streaming engine-keyed case through step_parallel even at
+        // one thread keeps the two thread counts in the SAME key space, so a
+        // serial run is byte-identical to a parallel one (parcheck). Without
+        // this, threads==1 falls to the interpreter-key path below and diverges.
+        if frame_threads() > 1 || (stream && engine_keyed_frontier()) {
             return if stream {
                 self.step_parallel(input_states, frame_no)
             } else {
@@ -1903,7 +1924,17 @@ impl AbstractRun {
                     .visited_rows
                     .as_ref()
                     .expect("stream implies a visited table");
-                std::thread::scope(|scope| {
+                // Option 4: point the frame's chunks at a SHARED within-frame
+                // set so a successor a sibling chunk already emitted is skipped
+                // before materialization. Frozen frontier required (same reason
+                // as Option 1); races are sound (see `WithinFrameSet`).
+                let wf_active = within_frame_skip_on() && visited_ro.is_frozen();
+                if wf_active {
+                    let set = within_frame_set();
+                    set.clear();
+                    crate::compiled::dispatch::set_within_frame(set);
+                }
+                let scope_out = std::thread::scope(|scope| {
                     let handles: Vec<_> = batch
                         .drain(..)
                         .map(|state| {
@@ -1972,7 +2003,11 @@ impl AbstractRun {
                             )),
                         })
                         .collect()
-                })
+                });
+                if wf_active {
+                    crate::compiled::dispatch::clear_within_frame();
+                }
+                scope_out
             };
             // Collect the batch's fragments in input order first: the
             // partition filter wants the whole batch (its threads scan
