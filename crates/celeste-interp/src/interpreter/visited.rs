@@ -515,15 +515,12 @@ enum Engine {
 impl Visited {
     /// The historic in-RAM engine, no artifacts.
     pub fn in_memory() -> Self {
-        let mut table = RowTable::default();
-        table.set_buffered(true);
-        Self { dir: None, engine: Engine::Map(table) }
+        Self { dir: None, engine: Engine::Map(RowTable::default()) }
     }
 
     /// The historic engine, writing `.rowkeys` at each boundary so the
     /// artifacts are interchangeable with the mmap engine's.
-    pub fn map_with_dir(mut table: RowTable, dir: &Path) -> Self {
-        table.set_buffered(true);
+    pub fn map_with_dir(table: RowTable, dir: &Path) -> Self {
         Self { dir: Some(dir.to_path_buf()), engine: Engine::Map(table) }
     }
 
@@ -548,14 +545,12 @@ impl Visited {
     }
 
     /// Is the frontier READ-ONLY during a frame (so a mid-frame probe is
-    /// timing-independent)? True for the mmap engine (contains_historic only
-    /// sees completed frames) and for the buffered map engine (this frame's
-    /// inserts sit in `pending` until end_frame). Option-1 skip requires this.
+    /// timing-independent)? Always true now: the mmap engine's
+    /// `contains_historic` only sees completed frames, and the map engine is
+    /// always buffered (this frame's inserts sit in `pending` until end_frame).
+    /// The cross-frame / within-frame skips require this.
     pub fn is_frozen(&self) -> bool {
-        match &self.engine {
-            Engine::Mmap(_) => true,
-            Engine::Map(t) => t.is_buffered(),
-        }
+        true
     }
 
     /// Whether phase 1 should dedup within the chunk BEFORE the global
@@ -604,16 +599,9 @@ impl Visited {
     pub fn end_frame(&mut self) -> Result<()> {
         match &mut self.engine {
             Engine::Map(t) => {
-                let (keys, first_id) = if t.is_buffered() {
-                    // Frozen-frontier path: bulk-flush this frame's buffered
-                    // rows into the table now (they were probe-invisible all
-                    // frame). Same keys, same discovery-order ids.
-                    t.end_frame_buffered()
-                } else {
-                    let (keys, first_id) = t.take_recent_content_sorted();
-                    t.end_frame();
-                    (keys, first_id)
-                };
+                // Flush this frame's frozen `pending` rows with content-sorted
+                // ids; return them for the `.rowkeys` file.
+                let (keys, first_id) = t.end_frame();
                 if let Some(dir) = &self.dir {
                     let frame = t.watermarks().len() as u32;
                     save_frame_rowkeys(dir, frame, &keys, first_id)?;
