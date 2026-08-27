@@ -467,3 +467,46 @@ Recommendation: land the cross-frame skip first (safe, ~10%), then design the
 within-frame pre-materialization buffer with Philippe (the determinism model
 is a real decision, and a subtle bug there is the catastrophic kind CLAUDE.md
 warns about). Not started here on purpose: correctness/determinism first.
+
+## Per-OCCURRENCE quadrant census (2026-08-27, room10, frontier-only+buffered)
+
+`CELESTE_COMPILED_FORWARD=1 CELESTE_FRONTIER_ONLY=1 CELESTE_DEDUP_QUADRANTS=1
+CELESTE_FRONTIER_BUFFERED=1 rewrite bench --frames 50` (quick profile - counts
+are profile-independent). Classifies every offered occurrence on two axes:
+FROZEN-FRONTIER HIT (key in the frontier as it stood at frame start, read
+against the buffered/frozen table) x WITHIN-FRAME DUP (2nd+ occurrence this
+frame). Sanity: (N,N) == the search's "new" count, every frame and summed.
+
+Late frame f50 (occurrences):
+| | wf N (1st) | wf Y (repeat) |
+|---|---|---|
+| frontier N | 1,191,326 (new) | 4,073,733 (within-only) |
+| frontier Y | 774,742 | 3,415,435 |
+- total offered 9,455,236; duplicates 8,263,910.
+- **Option 1 (frozen-frontier check) = (Y,N)+(Y,Y) = 4,190,177 = 50.7% of
+  duplicates, 44.3% of offered.**
+- within-frame-only (N,Y), needs Option 4 = 4,073,733 = 49.3% of duplicates.
+
+Summed over 50 frames:
+- (N,N) new 8,033,952 · (N,Y) within-only 23,363,073 · (Y,N) frontier-1st
+  5,422,660 · (Y,Y) frontier-repeat 20,571,843.
+- total offered 57,391,528; duplicates 49,357,576.
+- **Option 1 coverage 25,994,503 = 52.7% of duplicates, 45.3% of offered.**
+- within-frame-only 23,363,073 = 47.3% of duplicates.
+
+### Verdict
+
+The frozen-frontier check (Option 1) covers ~53% of duplicate occurrences -
+**5x more than the ~10% the sequential cascade credited to "cross-frame."**
+Philippe was right: the (Y,Y) bucket (20.6M summed) is popular cross-frame
+rows repeated many times WITHIN a frame, which the cascade miscredits to
+"within-frame." So Option 1 is worth much more than it looked.
+
+BUT it is ~50/50, not "most": the within-frame-only slice (N,Y, 23.4M summed,
+47.3% of dups) is genuinely-new rows produced repeatedly by DIFFERENT chunks
+in the same frame, never in the frontier - and ONLY Option 4 (the risky
+within-frame pre-materialization dedup, determinism-sensitive) covers those.
+So Option 4 is NOT rendered unnecessary; it still owns ~47% of the duplicate
+materialization. Recommendation stands: land Option 1 first (deterministic,
+frozen frontier already in place, ~half the win), then decide Option 4 on the
+remaining ~47% with the determinism model as Philippe's call.
