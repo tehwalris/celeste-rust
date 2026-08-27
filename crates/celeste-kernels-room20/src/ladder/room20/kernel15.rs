@@ -4583,17 +4583,24 @@ pub fn acc0(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
     b
 }
 
+/// The SOUND (full boundary) row key's per-outcome CONSTANT
+/// prefix: shape hash + the uniform cells' `cell_mix` sum. The
+/// per-lane cells are summed by the graph into `kv.h1/h2`, and
+/// `append` closes the key with `mix64(KPART + kv.h)`, which is
+/// byte-identical to `Rt2::boundary`'s own row key.
+pub const KPART1_0: u64 = 8264015308642045931;
+pub const KPART2_0: u64 = 2347083161190526496;
+
 /// Append this assignment's lanes that TAKE outcome 0 and
 /// that the kernel is willing to keep. A lane in `deopt` is
 /// dropped here and belongs to the interpreter - the caller
 /// has `kv.deopt` and must account for it.
 /// SKIPS a row whose values another configuration already
-/// wrote. The key is over the non-constant cells only - the
-/// rest are one value for the whole accumulator and cannot
-/// tell two rows apart - so it is a handful of mixes rather
-/// than a hundred, computed from values already in
-/// registers. A duplicate caught here costs nothing; one
-/// caught at the boundary has already been written.
+/// wrote, by the SOUND full boundary key (`mix64(KPART + kv.h)`),
+/// so the dedup here is exactly the boundary's - computed from
+/// values already in registers before materializing the row.
+/// A duplicate caught here costs nothing; one caught at the
+/// boundary has already been written.
 ///
 /// 128-bit like the boundary's own key, because a collision
 /// DROPS a successor rather than merely costing time.
@@ -4620,10 +4627,13 @@ pub fn append0(
     let (h1, h2) = (kv.h1.to_array(), kv.h2.to_array());
     for i in 0..n {
         if take & (1 << i) == 0 { continue; }
-        let key = if org.is_empty() { (h1[i], h2[i]) } else {
+        let k0 = mix64(KPART1_0.wrapping_add(h1[i]));
+        let k1 = mix64(KPART2_0.wrapping_add(h2[i]));
+        let key = if org.is_empty() { (k0, k1) } else {
             // mix64 is a bijection: same row, different
             // origins can never collide.
-            (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])
+            let m = mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64);
+            (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
         if let Col::N(v) = &mut acc.cols[87] { v.push(sh.c87.lane(i)); }
@@ -4772,17 +4782,24 @@ pub fn acc1(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
     b
 }
 
+/// The SOUND (full boundary) row key's per-outcome CONSTANT
+/// prefix: shape hash + the uniform cells' `cell_mix` sum. The
+/// per-lane cells are summed by the graph into `kv.h1/h2`, and
+/// `append` closes the key with `mix64(KPART + kv.h)`, which is
+/// byte-identical to `Rt2::boundary`'s own row key.
+pub const KPART1_1: u64 = 6505727788572677553;
+pub const KPART2_1: u64 = 6750100009566586826;
+
 /// Append this assignment's lanes that TAKE outcome 1 and
 /// that the kernel is willing to keep. A lane in `deopt` is
 /// dropped here and belongs to the interpreter - the caller
 /// has `kv.deopt` and must account for it.
 /// SKIPS a row whose values another configuration already
-/// wrote. The key is over the non-constant cells only - the
-/// rest are one value for the whole accumulator and cannot
-/// tell two rows apart - so it is a handful of mixes rather
-/// than a hundred, computed from values already in
-/// registers. A duplicate caught here costs nothing; one
-/// caught at the boundary has already been written.
+/// wrote, by the SOUND full boundary key (`mix64(KPART + kv.h)`),
+/// so the dedup here is exactly the boundary's - computed from
+/// values already in registers before materializing the row.
+/// A duplicate caught here costs nothing; one caught at the
+/// boundary has already been written.
 ///
 /// 128-bit like the boundary's own key, because a collision
 /// DROPS a successor rather than merely costing time.
@@ -4809,10 +4826,13 @@ pub fn append1(
     let (h1, h2) = (kv.h1.to_array(), kv.h2.to_array());
     for i in 0..n {
         if take & (1 << i) == 0 { continue; }
-        let key = if org.is_empty() { (h1[i], h2[i]) } else {
+        let k0 = mix64(KPART1_1.wrapping_add(h1[i]));
+        let k1 = mix64(KPART2_1.wrapping_add(h2[i]));
+        let key = if org.is_empty() { (k0, k1) } else {
             // mix64 is a bijection: same row, different
             // origins can never collide.
-            (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])
+            let m = mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64);
+            (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
         if let Col::N(v) = &mut acc.cols[87] { v.push(sh.c87.lane(i)); }
@@ -5124,17 +5144,24 @@ pub fn acc2(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
     b
 }
 
+/// The SOUND (full boundary) row key's per-outcome CONSTANT
+/// prefix: shape hash + the uniform cells' `cell_mix` sum. The
+/// per-lane cells are summed by the graph into `kv.h1/h2`, and
+/// `append` closes the key with `mix64(KPART + kv.h)`, which is
+/// byte-identical to `Rt2::boundary`'s own row key.
+pub const KPART1_2: u64 = 7538238740480024082;
+pub const KPART2_2: u64 = 8274342854545347923;
+
 /// Append this assignment's lanes that TAKE outcome 2 and
 /// that the kernel is willing to keep. A lane in `deopt` is
 /// dropped here and belongs to the interpreter - the caller
 /// has `kv.deopt` and must account for it.
 /// SKIPS a row whose values another configuration already
-/// wrote. The key is over the non-constant cells only - the
-/// rest are one value for the whole accumulator and cannot
-/// tell two rows apart - so it is a handful of mixes rather
-/// than a hundred, computed from values already in
-/// registers. A duplicate caught here costs nothing; one
-/// caught at the boundary has already been written.
+/// wrote, by the SOUND full boundary key (`mix64(KPART + kv.h)`),
+/// so the dedup here is exactly the boundary's - computed from
+/// values already in registers before materializing the row.
+/// A duplicate caught here costs nothing; one caught at the
+/// boundary has already been written.
 ///
 /// 128-bit like the boundary's own key, because a collision
 /// DROPS a successor rather than merely costing time.
@@ -5161,10 +5188,13 @@ pub fn append2(
     let (h1, h2) = (kv.h1.to_array(), kv.h2.to_array());
     for i in 0..n {
         if take & (1 << i) == 0 { continue; }
-        let key = if org.is_empty() { (h1[i], h2[i]) } else {
+        let k0 = mix64(KPART1_2.wrapping_add(h1[i]));
+        let k1 = mix64(KPART2_2.wrapping_add(h2[i]));
+        let key = if org.is_empty() { (k0, k1) } else {
             // mix64 is a bijection: same row, different
             // origins can never collide.
-            (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])
+            let m = mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64);
+            (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
         if let Col::N(v) = &mut acc.cols[87] { v.push(sh.c87.lane(i)); }
@@ -5300,17 +5330,24 @@ pub fn acc3(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
     b
 }
 
+/// The SOUND (full boundary) row key's per-outcome CONSTANT
+/// prefix: shape hash + the uniform cells' `cell_mix` sum. The
+/// per-lane cells are summed by the graph into `kv.h1/h2`, and
+/// `append` closes the key with `mix64(KPART + kv.h)`, which is
+/// byte-identical to `Rt2::boundary`'s own row key.
+pub const KPART1_3: u64 = 16053582394776907550;
+pub const KPART2_3: u64 = 10306110557116707903;
+
 /// Append this assignment's lanes that TAKE outcome 3 and
 /// that the kernel is willing to keep. A lane in `deopt` is
 /// dropped here and belongs to the interpreter - the caller
 /// has `kv.deopt` and must account for it.
 /// SKIPS a row whose values another configuration already
-/// wrote. The key is over the non-constant cells only - the
-/// rest are one value for the whole accumulator and cannot
-/// tell two rows apart - so it is a handful of mixes rather
-/// than a hundred, computed from values already in
-/// registers. A duplicate caught here costs nothing; one
-/// caught at the boundary has already been written.
+/// wrote, by the SOUND full boundary key (`mix64(KPART + kv.h)`),
+/// so the dedup here is exactly the boundary's - computed from
+/// values already in registers before materializing the row.
+/// A duplicate caught here costs nothing; one caught at the
+/// boundary has already been written.
 ///
 /// 128-bit like the boundary's own key, because a collision
 /// DROPS a successor rather than merely costing time.
@@ -5337,10 +5374,13 @@ pub fn append3(
     let (h1, h2) = (kv.h1.to_array(), kv.h2.to_array());
     for i in 0..n {
         if take & (1 << i) == 0 { continue; }
-        let key = if org.is_empty() { (h1[i], h2[i]) } else {
+        let k0 = mix64(KPART1_3.wrapping_add(h1[i]));
+        let k1 = mix64(KPART2_3.wrapping_add(h2[i]));
+        let key = if org.is_empty() { (k0, k1) } else {
             // mix64 is a bijection: same row, different
             // origins can never collide.
-            (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])
+            let m = mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64);
+            (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
         if let Col::N(v) = &mut acc.cols[87] { v.push(sh.c87.lane(i)); }
@@ -5825,401 +5865,496 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     let n518: ZN = zsel_n(n205, r_c375, n495);
     let n519: ZN = zsel_n(n205, r_c377, n513);
     let n520: ZB = zb_or(n205, n514);
-    let n523: ZW = zw_bits_n(r_c39);
-    let n524: ZW = zw_mix1(zw_splat(11400714819323198485u64), n523, 39u64);
-    let n525: ZW = zw_mix2(zw_splat(11562461410679940143u64), n523, 39u64);
-    let n526: ZW = zw_bits_n(n181);
-    let n527: ZW = zw_mix1(n524, n526, 84u64);
-    let n528: ZW = zw_mix2(n525, n526, 84u64);
-    let n529: ZW = zw_bits_n(n186);
-    let n530: ZW = zw_mix1(n527, n529, 85u64);
-    let n531: ZW = zw_mix2(n528, n529, 85u64);
-    let n532: ZW = zw_bits_n(n232);
-    let n533: ZW = zw_mix1(n530, n532, 86u64);
-    let n534: ZW = zw_mix2(n531, n532, 86u64);
-    let n535: ZW = zw_bits_n(r_c87);
-    let n536: ZW = zw_mix1(n533, n535, 87u64);
-    let n537: ZW = zw_mix2(n534, n535, 87u64);
-    let n538: ZW = zw_bits_i(n173);
-    let n539: ZW = zw_mix1(n536, n538, 246u64);
-    let n540: ZW = zw_mix2(n537, n538, 246u64);
-    let n541: u64 = (n178.0.as_raw_u32() as u64) << 32 | n178.1.as_raw_u32() as u64;
-    let n542: ZW = zw_mix1(n539, zw_splat(n541), 254u64);
-    let n543: ZW = zw_mix2(n540, zw_splat(n541), 254u64);
-    let n544: ZW = zw_bits_n(n283);
-    let n545: ZW = zw_mix1(n542, n544, 317u64);
-    let n546: ZW = zw_mix2(n543, n544, 317u64);
-    let n547: ZW = zw_bits_n(r_c20);
-    let n548: ZW = zw_mix1(n545, n547, 20u64);
-    let n549: ZW = zw_mix2(n546, n547, 20u64);
-    let n550: u64 = false as u64;
-    let n551: ZW = zw_mix1(n548, zw_splat(n550), 41u64);
-    let n552: ZW = zw_mix2(n549, zw_splat(n550), 41u64);
-    let n553: u64 = P8::from_raw(-65536i32).as_raw_u32() as u64;
-    let n554: ZW = zw_mix1(n551, zw_splat(n553), 297u64);
-    let n555: ZW = zw_mix2(n552, zw_splat(n553), 297u64);
-    let n556: u64 = P8::from_raw(0i32).as_raw_u32() as u64;
-    let n557: ZW = zw_mix1(n554, zw_splat(n556), 299u64);
-    let n558: ZW = zw_mix2(n555, zw_splat(n556), 299u64);
-    let n559: u64 = P8::from_raw(65536i32).as_raw_u32() as u64;
-    let n560: ZW = zw_mix1(n557, zw_splat(n559), 300u64);
-    let n561: ZW = zw_mix2(n558, zw_splat(n559), 300u64);
-    let n562: ZW = zw_bits_n(n400);
-    let n563: ZW = zw_mix1(n560, n562, 302u64);
-    let n564: ZW = zw_mix2(n561, n562, 302u64);
-    let n565: ZW = zw_mix1(n563, zw_splat(n550), 309u64);
-    let n566: ZW = zw_mix2(n564, zw_splat(n550), 309u64);
-    let n567: ZW = zw_mix1(n565, zw_splat(n550), 310u64);
-    let n568: ZW = zw_mix2(n566, zw_splat(n550), 310u64);
-    let n569: ZW = zw_mix1(n567, zw_splat(n556), 394u64);
-    let n570: ZW = zw_mix2(n568, zw_splat(n556), 394u64);
-    let n571: ZW = zw_mix1(n569, zw_splat(n556), 395u64);
-    let n572: ZW = zw_mix2(n570, zw_splat(n556), 395u64);
-    let n573: ZW = zw_mix1(n571, zw_splat(n556), 396u64);
-    let n574: ZW = zw_mix2(n572, zw_splat(n556), 396u64);
-    let n575: ZW = zw_mix1(n573, zw_splat(n556), 397u64);
-    let n576: ZW = zw_mix2(n574, zw_splat(n556), 397u64);
-    let n577: ZW = zw_mix1(n575, zw_splat(n550), 398u64);
-    let n578: ZW = zw_mix2(n576, zw_splat(n550), 398u64);
-    let n579: ZW = zw_mix1(n577, zw_splat(n556), 406u64);
-    let n580: ZW = zw_mix2(n578, zw_splat(n556), 406u64);
-    let n581: ZW = zw_bits_n(n405);
-    let n582: ZW = zw_mix1(n579, n581, 407u64);
-    let n583: ZW = zw_mix2(n580, n581, 407u64);
-    let n584: u64 = true as u64;
-    let n585: ZW = zw_mix1(n575, zw_splat(n584), 398u64);
-    let n586: ZW = zw_mix2(n576, zw_splat(n584), 398u64);
-    let n587: ZW = zw_bits_n(n427);
-    let n588: ZW = zw_mix1(n585, n587, 406u64);
-    let n589: ZW = zw_mix2(n586, n587, 406u64);
-    let n590: ZW = zw_mix1(n588, n581, 407u64);
-    let n591: ZW = zw_mix2(n589, n581, 407u64);
-    let n592: ZW = zw_bits_n(n430);
-    let n593: ZW = zw_mix1(n577, n592, 406u64);
-    let n594: ZW = zw_mix2(n578, n592, 406u64);
-    let n595: ZW = zw_mix1(n593, n581, 407u64);
-    let n596: ZW = zw_mix2(n594, n581, 407u64);
-    let n597: ZW = zw_bits_n(n417);
-    let n598: ZW = zw_mix1(n560, n597, 302u64);
-    let n599: ZW = zw_mix2(n561, n597, 302u64);
-    let n600: ZW = zw_mix1(n598, zw_splat(n550), 309u64);
-    let n601: ZW = zw_mix2(n599, zw_splat(n550), 309u64);
-    let n602: ZW = zw_mix1(n600, zw_splat(n584), 310u64);
-    let n603: ZW = zw_mix2(n601, zw_splat(n584), 310u64);
-    let n604: ZW = zw_mix1(n602, zw_splat(n556), 394u64);
-    let n605: ZW = zw_mix2(n603, zw_splat(n556), 394u64);
-    let n606: ZW = zw_mix1(n604, zw_splat(n556), 395u64);
-    let n607: ZW = zw_mix2(n605, zw_splat(n556), 395u64);
-    let n608: ZW = zw_mix1(n606, zw_splat(n556), 396u64);
-    let n609: ZW = zw_mix2(n607, zw_splat(n556), 396u64);
-    let n610: ZW = zw_mix1(n608, zw_splat(n556), 397u64);
-    let n611: ZW = zw_mix2(n609, zw_splat(n556), 397u64);
-    let n612: ZW = zw_mix1(n610, zw_splat(n550), 398u64);
-    let n613: ZW = zw_mix2(n611, zw_splat(n550), 398u64);
-    let n614: ZW = zw_bits_n(n418);
-    let n615: ZW = zw_mix1(n612, n614, 406u64);
-    let n616: ZW = zw_mix2(n613, n614, 406u64);
-    let n617: ZW = zw_bits_n(n419);
-    let n618: ZW = zw_mix1(n615, n617, 407u64);
-    let n619: ZW = zw_mix2(n616, n617, 407u64);
-    let n620: ZW = zw_mix1(n610, zw_splat(n584), 398u64);
-    let n621: ZW = zw_mix2(n611, zw_splat(n584), 398u64);
-    let n622: ZW = zw_bits_n(n429);
-    let n623: ZW = zw_mix1(n620, n622, 406u64);
-    let n624: ZW = zw_mix2(n621, n622, 406u64);
-    let n625: ZW = zw_mix1(n623, n617, 407u64);
-    let n626: ZW = zw_mix2(n624, n617, 407u64);
-    let n627: ZW = zw_bits_n(n432);
-    let n628: ZW = zw_mix1(n612, n627, 406u64);
-    let n629: ZW = zw_mix2(n613, n627, 406u64);
-    let n630: ZW = zw_mix1(n628, n617, 407u64);
-    let n631: ZW = zw_mix2(n629, n617, 407u64);
-    let n632: u64 = P8::from_raw(131072i32).as_raw_u32() as u64;
-    let n633: ZW = zw_mix1(n545, zw_splat(n632), 20u64);
-    let n634: ZW = zw_mix2(n546, zw_splat(n632), 20u64);
-    let n635: ZW = zw_mix1(n633, zw_splat(n584), 41u64);
-    let n636: ZW = zw_mix2(n634, zw_splat(n584), 41u64);
-    let n637: u64 = P8::from_raw(655360i32).as_raw_u32() as u64;
-    let n638: ZW = zw_mix1(n635, zw_splat(n637), 297u64);
-    let n639: ZW = zw_mix2(n636, zw_splat(n637), 297u64);
-    let n640: u64 = P8::from_raw(262144i32).as_raw_u32() as u64;
-    let n641: ZW = zw_mix1(n638, zw_splat(n640), 299u64);
-    let n642: ZW = zw_mix2(n639, zw_splat(n640), 299u64);
-    let n643: ZW = zw_mix1(n641, zw_splat(n556), 300u64);
-    let n644: ZW = zw_mix2(n642, zw_splat(n556), 300u64);
-    let n645: ZW = zw_mix1(n643, n562, 302u64);
-    let n646: ZW = zw_mix2(n644, n562, 302u64);
-    let n647: ZW = zw_mix1(n645, zw_splat(n584), 309u64);
-    let n648: ZW = zw_mix2(n646, zw_splat(n584), 309u64);
-    let n649: ZW = zw_mix1(n647, zw_splat(n550), 310u64);
-    let n650: ZW = zw_mix2(n648, zw_splat(n550), 310u64);
-    let n651: u64 = P8::from_raw(98304i32).as_raw_u32() as u64;
-    let n652: ZW = zw_mix1(n649, zw_splat(n651), 394u64);
-    let n653: ZW = zw_mix2(n650, zw_splat(n651), 394u64);
-    let n654: u64 = P8::from_raw(69510i32).as_raw_u32() as u64;
-    let n655: ZW = zw_mix1(n652, zw_splat(n654), 395u64);
-    let n656: ZW = zw_mix2(n653, zw_splat(n654), 395u64);
-    let n657: ZW = zw_mix1(n655, zw_splat(n632), 396u64);
-    let n658: ZW = zw_mix2(n656, zw_splat(n632), 396u64);
-    let n659: ZW = zw_mix1(n657, zw_splat(n556), 397u64);
-    let n660: ZW = zw_mix2(n658, zw_splat(n556), 397u64);
-    let n661: ZW = zw_mix1(n659, zw_splat(n550), 398u64);
-    let n662: ZW = zw_mix2(n660, zw_splat(n550), 398u64);
-    let n663: ZW = zw_mix1(n661, zw_splat(n559), 406u64);
-    let n664: ZW = zw_mix2(n662, zw_splat(n559), 406u64);
-    let n665: ZW = zw_mix1(n663, zw_splat(n556), 407u64);
-    let n666: ZW = zw_mix2(n664, zw_splat(n556), 407u64);
-    let n667: u64 = P8::from_raw(-131072i32).as_raw_u32() as u64;
-    let n668: ZW = zw_mix1(n655, zw_splat(n667), 396u64);
-    let n669: ZW = zw_mix2(n656, zw_splat(n667), 396u64);
-    let n670: ZW = zw_mix1(n668, zw_splat(n556), 397u64);
-    let n671: ZW = zw_mix2(n669, zw_splat(n556), 397u64);
-    let n672: ZW = zw_mix1(n670, zw_splat(n584), 398u64);
-    let n673: ZW = zw_mix2(n671, zw_splat(n584), 398u64);
-    let n674: u64 = P8::from_raw(-327680i32).as_raw_u32() as u64;
-    let n675: ZW = zw_mix1(n672, zw_splat(n674), 406u64);
-    let n676: ZW = zw_mix2(n673, zw_splat(n674), 406u64);
-    let n677: ZW = zw_mix1(n675, zw_splat(n556), 407u64);
-    let n678: ZW = zw_mix2(n676, zw_splat(n556), 407u64);
-    let n679: u64 = P8::from_raw(327680i32).as_raw_u32() as u64;
-    let n680: ZW = zw_mix1(n661, zw_splat(n679), 406u64);
-    let n681: ZW = zw_mix2(n662, zw_splat(n679), 406u64);
-    let n682: ZW = zw_mix1(n680, zw_splat(n556), 407u64);
-    let n683: ZW = zw_mix2(n681, zw_splat(n556), 407u64);
-    let n684: ZW = zw_mix1(n649, zw_splat(n654), 394u64);
-    let n685: ZW = zw_mix2(n650, zw_splat(n654), 394u64);
-    let n686: ZW = zw_mix1(n684, zw_splat(n651), 395u64);
-    let n687: ZW = zw_mix2(n685, zw_splat(n651), 395u64);
-    let n688: ZW = zw_mix1(n686, zw_splat(n556), 396u64);
-    let n689: ZW = zw_mix2(n687, zw_splat(n556), 396u64);
-    let n690: u64 = P8::from_raw(-98304i32).as_raw_u32() as u64;
-    let n691: ZW = zw_mix1(n688, zw_splat(n690), 397u64);
-    let n692: ZW = zw_mix2(n689, zw_splat(n690), 397u64);
-    let n693: ZW = zw_mix1(n691, zw_splat(n550), 398u64);
-    let n694: ZW = zw_mix2(n692, zw_splat(n550), 398u64);
-    let n695: ZW = zw_mix1(n693, zw_splat(n556), 406u64);
-    let n696: ZW = zw_mix2(n694, zw_splat(n556), 406u64);
-    let n697: ZW = zw_mix1(n695, zw_splat(n674), 407u64);
-    let n698: ZW = zw_mix2(n696, zw_splat(n674), 407u64);
-    let n699: ZW = zw_mix1(n684, zw_splat(n654), 395u64);
-    let n700: ZW = zw_mix2(n685, zw_splat(n654), 395u64);
-    let n701: ZW = zw_mix1(n699, zw_splat(n667), 396u64);
-    let n702: ZW = zw_mix2(n700, zw_splat(n667), 396u64);
-    let n703: ZW = zw_mix1(n701, zw_splat(n690), 397u64);
-    let n704: ZW = zw_mix2(n702, zw_splat(n690), 397u64);
-    let n705: ZW = zw_mix1(n703, zw_splat(n584), 398u64);
-    let n706: ZW = zw_mix2(n704, zw_splat(n584), 398u64);
-    let n707: u64 = P8::from_raw(-231700i32).as_raw_u32() as u64;
-    let n708: ZW = zw_mix1(n705, zw_splat(n707), 406u64);
-    let n709: ZW = zw_mix2(n706, zw_splat(n707), 406u64);
-    let n710: ZW = zw_mix1(n708, zw_splat(n707), 407u64);
-    let n711: ZW = zw_mix2(n709, zw_splat(n707), 407u64);
-    let n712: ZW = zw_mix1(n699, zw_splat(n632), 396u64);
-    let n713: ZW = zw_mix2(n700, zw_splat(n632), 396u64);
-    let n714: ZW = zw_mix1(n712, zw_splat(n690), 397u64);
-    let n715: ZW = zw_mix2(n713, zw_splat(n690), 397u64);
-    let n716: ZW = zw_mix1(n714, zw_splat(n550), 398u64);
-    let n717: ZW = zw_mix2(n715, zw_splat(n550), 398u64);
-    let n718: u64 = P8::from_raw(231700i32).as_raw_u32() as u64;
-    let n719: ZW = zw_mix1(n716, zw_splat(n718), 406u64);
-    let n720: ZW = zw_mix2(n717, zw_splat(n718), 406u64);
-    let n721: ZW = zw_mix1(n719, zw_splat(n707), 407u64);
-    let n722: ZW = zw_mix2(n720, zw_splat(n707), 407u64);
-    let n723: ZW = zw_mix1(n688, zw_splat(n632), 397u64);
-    let n724: ZW = zw_mix2(n689, zw_splat(n632), 397u64);
-    let n725: ZW = zw_mix1(n723, zw_splat(n550), 398u64);
-    let n726: ZW = zw_mix2(n724, zw_splat(n550), 398u64);
-    let n727: ZW = zw_mix1(n725, zw_splat(n556), 406u64);
-    let n728: ZW = zw_mix2(n726, zw_splat(n556), 406u64);
-    let n729: ZW = zw_mix1(n727, zw_splat(n679), 407u64);
-    let n730: ZW = zw_mix2(n728, zw_splat(n679), 407u64);
-    let n731: ZW = zw_mix1(n701, zw_splat(n632), 397u64);
-    let n732: ZW = zw_mix2(n702, zw_splat(n632), 397u64);
-    let n733: ZW = zw_mix1(n731, zw_splat(n584), 398u64);
-    let n734: ZW = zw_mix2(n732, zw_splat(n584), 398u64);
-    let n735: ZW = zw_mix1(n733, zw_splat(n707), 406u64);
-    let n736: ZW = zw_mix2(n734, zw_splat(n707), 406u64);
-    let n737: ZW = zw_mix1(n735, zw_splat(n718), 407u64);
-    let n738: ZW = zw_mix2(n736, zw_splat(n718), 407u64);
-    let n739: ZW = zw_mix1(n712, zw_splat(n632), 397u64);
-    let n740: ZW = zw_mix2(n713, zw_splat(n632), 397u64);
-    let n741: ZW = zw_mix1(n739, zw_splat(n550), 398u64);
-    let n742: ZW = zw_mix2(n740, zw_splat(n550), 398u64);
-    let n743: ZW = zw_mix1(n741, zw_splat(n718), 406u64);
-    let n744: ZW = zw_mix2(n742, zw_splat(n718), 406u64);
-    let n745: ZW = zw_mix1(n743, zw_splat(n718), 407u64);
-    let n746: ZW = zw_mix2(n744, zw_splat(n718), 407u64);
-    let n747: ZW = zw_mix1(n643, n597, 302u64);
-    let n748: ZW = zw_mix2(n644, n597, 302u64);
-    let n749: ZW = zw_mix1(n747, zw_splat(n584), 309u64);
-    let n750: ZW = zw_mix2(n748, zw_splat(n584), 309u64);
-    let n751: ZW = zw_mix1(n749, zw_splat(n584), 310u64);
-    let n752: ZW = zw_mix2(n750, zw_splat(n584), 310u64);
-    let n753: ZW = zw_mix1(n751, zw_splat(n651), 394u64);
-    let n754: ZW = zw_mix2(n752, zw_splat(n651), 394u64);
-    let n755: ZW = zw_mix1(n753, zw_splat(n654), 395u64);
-    let n756: ZW = zw_mix2(n754, zw_splat(n654), 395u64);
-    let n757: ZW = zw_mix1(n755, zw_splat(n632), 396u64);
-    let n758: ZW = zw_mix2(n756, zw_splat(n632), 396u64);
-    let n759: ZW = zw_mix1(n757, zw_splat(n556), 397u64);
-    let n760: ZW = zw_mix2(n758, zw_splat(n556), 397u64);
-    let n761: ZW = zw_mix1(n759, zw_splat(n550), 398u64);
-    let n762: ZW = zw_mix2(n760, zw_splat(n550), 398u64);
-    let n763: ZW = zw_mix1(n761, zw_splat(n559), 406u64);
-    let n764: ZW = zw_mix2(n762, zw_splat(n559), 406u64);
-    let n765: ZW = zw_mix1(n763, zw_splat(n556), 407u64);
-    let n766: ZW = zw_mix2(n764, zw_splat(n556), 407u64);
-    let n767: ZW = zw_mix1(n755, zw_splat(n667), 396u64);
-    let n768: ZW = zw_mix2(n756, zw_splat(n667), 396u64);
-    let n769: ZW = zw_mix1(n767, zw_splat(n556), 397u64);
-    let n770: ZW = zw_mix2(n768, zw_splat(n556), 397u64);
-    let n771: ZW = zw_mix1(n769, zw_splat(n584), 398u64);
-    let n772: ZW = zw_mix2(n770, zw_splat(n584), 398u64);
-    let n773: ZW = zw_mix1(n771, zw_splat(n674), 406u64);
-    let n774: ZW = zw_mix2(n772, zw_splat(n674), 406u64);
-    let n775: ZW = zw_mix1(n773, zw_splat(n556), 407u64);
-    let n776: ZW = zw_mix2(n774, zw_splat(n556), 407u64);
-    let n777: ZW = zw_mix1(n761, zw_splat(n679), 406u64);
-    let n778: ZW = zw_mix2(n762, zw_splat(n679), 406u64);
-    let n779: ZW = zw_mix1(n777, zw_splat(n556), 407u64);
-    let n780: ZW = zw_mix2(n778, zw_splat(n556), 407u64);
-    let n781: ZW = zw_mix1(n751, zw_splat(n654), 394u64);
-    let n782: ZW = zw_mix2(n752, zw_splat(n654), 394u64);
-    let n783: ZW = zw_mix1(n781, zw_splat(n651), 395u64);
-    let n784: ZW = zw_mix2(n782, zw_splat(n651), 395u64);
-    let n785: ZW = zw_mix1(n783, zw_splat(n556), 396u64);
-    let n786: ZW = zw_mix2(n784, zw_splat(n556), 396u64);
-    let n787: ZW = zw_mix1(n785, zw_splat(n690), 397u64);
-    let n788: ZW = zw_mix2(n786, zw_splat(n690), 397u64);
-    let n789: ZW = zw_mix1(n787, zw_splat(n550), 398u64);
-    let n790: ZW = zw_mix2(n788, zw_splat(n550), 398u64);
-    let n791: ZW = zw_mix1(n789, zw_splat(n556), 406u64);
-    let n792: ZW = zw_mix2(n790, zw_splat(n556), 406u64);
-    let n793: ZW = zw_mix1(n791, zw_splat(n674), 407u64);
-    let n794: ZW = zw_mix2(n792, zw_splat(n674), 407u64);
-    let n795: ZW = zw_mix1(n781, zw_splat(n654), 395u64);
-    let n796: ZW = zw_mix2(n782, zw_splat(n654), 395u64);
-    let n797: ZW = zw_mix1(n795, zw_splat(n667), 396u64);
-    let n798: ZW = zw_mix2(n796, zw_splat(n667), 396u64);
-    let n799: ZW = zw_mix1(n797, zw_splat(n690), 397u64);
-    let n800: ZW = zw_mix2(n798, zw_splat(n690), 397u64);
-    let n801: ZW = zw_mix1(n799, zw_splat(n584), 398u64);
-    let n802: ZW = zw_mix2(n800, zw_splat(n584), 398u64);
-    let n803: ZW = zw_mix1(n801, zw_splat(n707), 406u64);
-    let n804: ZW = zw_mix2(n802, zw_splat(n707), 406u64);
-    let n805: ZW = zw_mix1(n803, zw_splat(n707), 407u64);
-    let n806: ZW = zw_mix2(n804, zw_splat(n707), 407u64);
-    let n807: ZW = zw_mix1(n795, zw_splat(n632), 396u64);
-    let n808: ZW = zw_mix2(n796, zw_splat(n632), 396u64);
-    let n809: ZW = zw_mix1(n807, zw_splat(n690), 397u64);
-    let n810: ZW = zw_mix2(n808, zw_splat(n690), 397u64);
-    let n811: ZW = zw_mix1(n809, zw_splat(n550), 398u64);
-    let n812: ZW = zw_mix2(n810, zw_splat(n550), 398u64);
-    let n813: ZW = zw_mix1(n811, zw_splat(n718), 406u64);
-    let n814: ZW = zw_mix2(n812, zw_splat(n718), 406u64);
-    let n815: ZW = zw_mix1(n813, zw_splat(n707), 407u64);
-    let n816: ZW = zw_mix2(n814, zw_splat(n707), 407u64);
-    let n817: ZW = zw_mix1(n785, zw_splat(n632), 397u64);
-    let n818: ZW = zw_mix2(n786, zw_splat(n632), 397u64);
-    let n819: ZW = zw_mix1(n817, zw_splat(n550), 398u64);
-    let n820: ZW = zw_mix2(n818, zw_splat(n550), 398u64);
-    let n821: ZW = zw_mix1(n819, zw_splat(n556), 406u64);
-    let n822: ZW = zw_mix2(n820, zw_splat(n556), 406u64);
-    let n823: ZW = zw_mix1(n821, zw_splat(n679), 407u64);
-    let n824: ZW = zw_mix2(n822, zw_splat(n679), 407u64);
-    let n825: ZW = zw_mix1(n797, zw_splat(n632), 397u64);
-    let n826: ZW = zw_mix2(n798, zw_splat(n632), 397u64);
-    let n827: ZW = zw_mix1(n825, zw_splat(n584), 398u64);
-    let n828: ZW = zw_mix2(n826, zw_splat(n584), 398u64);
-    let n829: ZW = zw_mix1(n827, zw_splat(n707), 406u64);
-    let n830: ZW = zw_mix2(n828, zw_splat(n707), 406u64);
-    let n831: ZW = zw_mix1(n829, zw_splat(n718), 407u64);
-    let n832: ZW = zw_mix2(n830, zw_splat(n718), 407u64);
-    let n833: ZW = zw_mix1(n807, zw_splat(n632), 397u64);
-    let n834: ZW = zw_mix2(n808, zw_splat(n632), 397u64);
-    let n835: ZW = zw_mix1(n833, zw_splat(n550), 398u64);
-    let n836: ZW = zw_mix2(n834, zw_splat(n550), 398u64);
-    let n837: ZW = zw_mix1(n835, zw_splat(n718), 406u64);
-    let n838: ZW = zw_mix2(n836, zw_splat(n718), 406u64);
-    let n839: ZW = zw_mix1(n837, zw_splat(n718), 407u64);
-    let n840: ZW = zw_mix2(n838, zw_splat(n718), 407u64);
-    let n841: ZW = zw_mix1(zw_splat(11400714819323198485u64), n526, 84u64);
-    let n842: ZW = zw_mix2(zw_splat(11562461410679940143u64), n526, 84u64);
-    let n843: ZW = zw_mix1(n841, n529, 85u64);
-    let n844: ZW = zw_mix2(n842, n529, 85u64);
-    let n845: ZW = zw_mix1(n843, n532, 86u64);
-    let n846: ZW = zw_mix2(n844, n532, 86u64);
-    let n847: ZW = zw_bits_n(n450);
-    let n848: ZW = zw_mix1(n845, n847, 87u64);
-    let n849: ZW = zw_mix2(n846, n847, 87u64);
-    let n850: ZW = zw_mix1(n848, n538, 245u64);
-    let n851: ZW = zw_mix2(n849, n538, 245u64);
-    let n852: ZW = zw_mix1(n850, zw_splat(n541), 253u64);
-    let n853: ZW = zw_mix2(n851, zw_splat(n541), 253u64);
-    let n854: ZW = zw_mix1(n852, n547, 20u64);
-    let n855: ZW = zw_mix2(n853, n547, 20u64);
-    let n856: ZW = zw_mix1(n854, zw_splat(n550), 41u64);
-    let n857: ZW = zw_mix2(n855, zw_splat(n550), 41u64);
-    let n858: ZW = zw_mix1(n852, zw_splat(n632), 20u64);
-    let n859: ZW = zw_mix2(n853, zw_splat(n632), 20u64);
-    let n860: ZW = zw_mix1(n858, zw_splat(n584), 41u64);
-    let n861: ZW = zw_mix2(n859, zw_splat(n584), 41u64);
-    let n862: ZW = zw_bits_b(n463);
-    let n863: ZW = zw_mix1(zw_splat(11400714819323198485u64), n862, 38u64);
-    let n864: ZW = zw_mix2(zw_splat(11562461410679940143u64), n862, 38u64);
-    let n865: ZW = zw_bits_n(n462);
-    let n866: ZW = zw_mix1(n863, n865, 39u64);
-    let n867: ZW = zw_mix2(n864, n865, 39u64);
-    let n868: ZW = zw_mix1(n866, n526, 84u64);
-    let n869: ZW = zw_mix2(n867, n526, 84u64);
-    let n870: ZW = zw_mix1(n868, n529, 85u64);
-    let n871: ZW = zw_mix2(n869, n529, 85u64);
-    let n872: ZW = zw_mix1(n870, n532, 86u64);
-    let n873: ZW = zw_mix2(n871, n532, 86u64);
-    let n874: ZW = zw_bits_n(n461);
-    let n875: ZW = zw_mix1(n872, n874, 87u64);
-    let n876: ZW = zw_mix2(n873, n874, 87u64);
-    let n877: ZW = zw_mix1(n875, n547, 20u64);
-    let n878: ZW = zw_mix2(n876, n547, 20u64);
-    let n879: ZW = zw_mix1(n875, zw_splat(n632), 20u64);
-    let n880: ZW = zw_mix2(n876, zw_splat(n632), 20u64);
-    let n881: ZW = zw_bits_n(n473);
-    let n882: ZW = zw_mix1(zw_splat(11400714819323198485u64), n881, 20u64);
-    let n883: ZW = zw_mix2(zw_splat(11562461410679940143u64), n881, 20u64);
-    let n884: ZW = zw_mix1(n882, n523, 39u64);
-    let n885: ZW = zw_mix2(n883, n523, 39u64);
-    let n886: ZW = zw_mix1(n884, n526, 84u64);
-    let n887: ZW = zw_mix2(n885, n526, 84u64);
-    let n888: ZW = zw_mix1(n886, n529, 85u64);
-    let n889: ZW = zw_mix2(n887, n529, 85u64);
-    let n890: ZW = zw_mix1(n888, n532, 86u64);
-    let n891: ZW = zw_mix2(n889, n532, 86u64);
-    let n892: ZW = zw_mix1(n890, n535, 87u64);
-    let n893: ZW = zw_mix2(n891, n535, 87u64);
-    let n894: ZW = zw_bits_i(n474);
-    let n895: ZW = zw_mix1(n892, n894, 246u64);
-    let n896: ZW = zw_mix2(n893, n894, 246u64);
-    let n897: ZW = zw_bits_i(n475);
-    let n898: ZW = zw_mix1(n895, n897, 254u64);
-    let n899: ZW = zw_mix2(n896, n897, 254u64);
-    let n900: ZW = zw_bits_n(n515);
-    let n901: ZW = zw_mix1(n898, n900, 258u64);
-    let n902: ZW = zw_mix2(n899, n900, 258u64);
-    let n903: ZW = zw_bits_n(n492);
-    let n904: ZW = zw_mix1(n901, n903, 269u64);
-    let n905: ZW = zw_mix2(n902, n903, 269u64);
-    let n906: ZW = zw_bits_n(n516);
-    let n907: ZW = zw_mix1(n904, n906, 270u64);
-    let n908: ZW = zw_mix2(n905, n906, 270u64);
-    let n909: ZW = zw_bits_n(n517);
-    let n910: ZW = zw_mix1(n907, n909, 274u64);
-    let n911: ZW = zw_mix2(n908, n909, 274u64);
-    let n912: ZW = zw_bits_n(n518);
-    let n913: ZW = zw_mix1(n910, n912, 375u64);
-    let n914: ZW = zw_mix2(n911, n912, 375u64);
-    let n915: ZW = zw_bits_n(n519);
-    let n916: ZW = zw_mix1(n913, n915, 377u64);
-    let n917: ZW = zw_mix2(n914, n915, 377u64);
+    let n522: ZW = zw_cellmix_n(39u64, r_c39, 1542469173u64);
+    let n523: ZW = zw_cellmix_n(39u64, r_c39, 668265263u64);
+    let n524: ZW = zw_add(zw_splat(0u64), n522);
+    let n525: ZW = zw_add(zw_splat(0u64), n523);
+    let n526: ZW = zw_cellmix_n(84u64, n181, 1542469173u64);
+    let n527: ZW = zw_cellmix_n(84u64, n181, 668265263u64);
+    let n528: ZW = zw_add(n524, n526);
+    let n529: ZW = zw_add(n525, n527);
+    let n530: ZW = zw_cellmix_n(85u64, n186, 1542469173u64);
+    let n531: ZW = zw_cellmix_n(85u64, n186, 668265263u64);
+    let n532: ZW = zw_add(n528, n530);
+    let n533: ZW = zw_add(n529, n531);
+    let n534: ZW = zw_cellmix_n(86u64, n232, 1542469173u64);
+    let n535: ZW = zw_cellmix_n(86u64, n232, 668265263u64);
+    let n536: ZW = zw_add(n532, n534);
+    let n537: ZW = zw_add(n533, n535);
+    let n538: ZW = zw_cellmix_n(87u64, r_c87, 1542469173u64);
+    let n539: ZW = zw_cellmix_n(87u64, r_c87, 668265263u64);
+    let n540: ZW = zw_add(n536, n538);
+    let n541: ZW = zw_add(n537, n539);
+    let n542: ZW = zw_cellmix_i(246u64, n173, 1542469173u64);
+    let n543: ZW = zw_cellmix_i(246u64, n173, 668265263u64);
+    let n544: ZW = zw_add(n540, n542);
+    let n545: ZW = zw_add(n541, n543);
+    let n546: ZW = zw_cellmix_i(254u64, zi_splat(n178.0, n178.1), 1542469173u64);
+    let n547: ZW = zw_cellmix_i(254u64, zi_splat(n178.0, n178.1), 668265263u64);
+    let n548: ZW = zw_add(n544, n546);
+    let n549: ZW = zw_add(n545, n547);
+    let n550: ZW = zw_cellmix_n(317u64, n283, 1542469173u64);
+    let n551: ZW = zw_cellmix_n(317u64, n283, 668265263u64);
+    let n552: ZW = zw_add(n548, n550);
+    let n553: ZW = zw_add(n549, n551);
+    let n554: ZW = zw_cellmix_n(20u64, r_c20, 1542469173u64);
+    let n555: ZW = zw_cellmix_n(20u64, r_c20, 668265263u64);
+    let n556: ZW = zw_add(n552, n554);
+    let n557: ZW = zw_add(n553, n555);
+    let n558: ZW = zw_cellmix_b(41u64, zb_splat(false), 1542469173u64);
+    let n559: ZW = zw_cellmix_b(41u64, zb_splat(false), 668265263u64);
+    let n560: ZW = zw_add(n556, n558);
+    let n561: ZW = zw_add(n557, n559);
+    let n562: ZW = zw_cellmix_n(297u64, zn_splat(P8::from_raw(-65536i32)), 1542469173u64);
+    let n563: ZW = zw_cellmix_n(297u64, zn_splat(P8::from_raw(-65536i32)), 668265263u64);
+    let n564: ZW = zw_add(n560, n562);
+    let n565: ZW = zw_add(n561, n563);
+    let n566: ZW = zw_cellmix_n(299u64, zn_splat(P8::from_raw(0i32)), 1542469173u64);
+    let n567: ZW = zw_cellmix_n(299u64, zn_splat(P8::from_raw(0i32)), 668265263u64);
+    let n568: ZW = zw_add(n564, n566);
+    let n569: ZW = zw_add(n565, n567);
+    let n570: ZW = zw_cellmix_n(300u64, zn_splat(P8::from_raw(65536i32)), 1542469173u64);
+    let n571: ZW = zw_cellmix_n(300u64, zn_splat(P8::from_raw(65536i32)), 668265263u64);
+    let n572: ZW = zw_add(n568, n570);
+    let n573: ZW = zw_add(n569, n571);
+    let n574: ZW = zw_cellmix_n(302u64, n400, 1542469173u64);
+    let n575: ZW = zw_cellmix_n(302u64, n400, 668265263u64);
+    let n576: ZW = zw_add(n572, n574);
+    let n577: ZW = zw_add(n573, n575);
+    let n578: ZW = zw_cellmix_b(309u64, zb_splat(false), 1542469173u64);
+    let n579: ZW = zw_cellmix_b(309u64, zb_splat(false), 668265263u64);
+    let n580: ZW = zw_add(n576, n578);
+    let n581: ZW = zw_add(n577, n579);
+    let n582: ZW = zw_cellmix_b(310u64, zb_splat(false), 1542469173u64);
+    let n583: ZW = zw_cellmix_b(310u64, zb_splat(false), 668265263u64);
+    let n584: ZW = zw_add(n580, n582);
+    let n585: ZW = zw_add(n581, n583);
+    let n586: ZW = zw_cellmix_n(394u64, zn_splat(P8::from_raw(0i32)), 1542469173u64);
+    let n587: ZW = zw_cellmix_n(394u64, zn_splat(P8::from_raw(0i32)), 668265263u64);
+    let n588: ZW = zw_add(n584, n586);
+    let n589: ZW = zw_add(n585, n587);
+    let n590: ZW = zw_cellmix_n(395u64, zn_splat(P8::from_raw(0i32)), 1542469173u64);
+    let n591: ZW = zw_cellmix_n(395u64, zn_splat(P8::from_raw(0i32)), 668265263u64);
+    let n592: ZW = zw_add(n588, n590);
+    let n593: ZW = zw_add(n589, n591);
+    let n594: ZW = zw_cellmix_n(396u64, zn_splat(P8::from_raw(0i32)), 1542469173u64);
+    let n595: ZW = zw_cellmix_n(396u64, zn_splat(P8::from_raw(0i32)), 668265263u64);
+    let n596: ZW = zw_add(n592, n594);
+    let n597: ZW = zw_add(n593, n595);
+    let n598: ZW = zw_cellmix_n(397u64, zn_splat(P8::from_raw(0i32)), 1542469173u64);
+    let n599: ZW = zw_cellmix_n(397u64, zn_splat(P8::from_raw(0i32)), 668265263u64);
+    let n600: ZW = zw_add(n596, n598);
+    let n601: ZW = zw_add(n597, n599);
+    let n602: ZW = zw_cellmix_b(398u64, zb_splat(false), 1542469173u64);
+    let n603: ZW = zw_cellmix_b(398u64, zb_splat(false), 668265263u64);
+    let n604: ZW = zw_add(n600, n602);
+    let n605: ZW = zw_add(n601, n603);
+    let n606: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(0i32)), 1542469173u64);
+    let n607: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(0i32)), 668265263u64);
+    let n608: ZW = zw_add(n604, n606);
+    let n609: ZW = zw_add(n605, n607);
+    let n610: ZW = zw_cellmix_n(407u64, n405, 1542469173u64);
+    let n611: ZW = zw_cellmix_n(407u64, n405, 668265263u64);
+    let n612: ZW = zw_add(n608, n610);
+    let n613: ZW = zw_add(n609, n611);
+    let n614: ZW = zw_cellmix_b(398u64, zb_splat(true), 1542469173u64);
+    let n615: ZW = zw_cellmix_b(398u64, zb_splat(true), 668265263u64);
+    let n616: ZW = zw_add(n600, n614);
+    let n617: ZW = zw_add(n601, n615);
+    let n618: ZW = zw_cellmix_n(406u64, n427, 1542469173u64);
+    let n619: ZW = zw_cellmix_n(406u64, n427, 668265263u64);
+    let n620: ZW = zw_add(n616, n618);
+    let n621: ZW = zw_add(n617, n619);
+    let n622: ZW = zw_add(n620, n610);
+    let n623: ZW = zw_add(n621, n611);
+    let n624: ZW = zw_cellmix_n(406u64, n430, 1542469173u64);
+    let n625: ZW = zw_cellmix_n(406u64, n430, 668265263u64);
+    let n626: ZW = zw_add(n604, n624);
+    let n627: ZW = zw_add(n605, n625);
+    let n628: ZW = zw_add(n626, n610);
+    let n629: ZW = zw_add(n627, n611);
+    let n630: ZW = zw_cellmix_n(302u64, n417, 1542469173u64);
+    let n631: ZW = zw_cellmix_n(302u64, n417, 668265263u64);
+    let n632: ZW = zw_add(n572, n630);
+    let n633: ZW = zw_add(n573, n631);
+    let n634: ZW = zw_add(n632, n578);
+    let n635: ZW = zw_add(n633, n579);
+    let n636: ZW = zw_cellmix_b(310u64, zb_splat(true), 1542469173u64);
+    let n637: ZW = zw_cellmix_b(310u64, zb_splat(true), 668265263u64);
+    let n638: ZW = zw_add(n634, n636);
+    let n639: ZW = zw_add(n635, n637);
+    let n640: ZW = zw_add(n638, n586);
+    let n641: ZW = zw_add(n639, n587);
+    let n642: ZW = zw_add(n640, n590);
+    let n643: ZW = zw_add(n641, n591);
+    let n644: ZW = zw_add(n642, n594);
+    let n645: ZW = zw_add(n643, n595);
+    let n646: ZW = zw_add(n644, n598);
+    let n647: ZW = zw_add(n645, n599);
+    let n648: ZW = zw_add(n646, n602);
+    let n649: ZW = zw_add(n647, n603);
+    let n650: ZW = zw_cellmix_n(406u64, n418, 1542469173u64);
+    let n651: ZW = zw_cellmix_n(406u64, n418, 668265263u64);
+    let n652: ZW = zw_add(n648, n650);
+    let n653: ZW = zw_add(n649, n651);
+    let n654: ZW = zw_cellmix_n(407u64, n419, 1542469173u64);
+    let n655: ZW = zw_cellmix_n(407u64, n419, 668265263u64);
+    let n656: ZW = zw_add(n652, n654);
+    let n657: ZW = zw_add(n653, n655);
+    let n658: ZW = zw_add(n646, n614);
+    let n659: ZW = zw_add(n647, n615);
+    let n660: ZW = zw_cellmix_n(406u64, n429, 1542469173u64);
+    let n661: ZW = zw_cellmix_n(406u64, n429, 668265263u64);
+    let n662: ZW = zw_add(n658, n660);
+    let n663: ZW = zw_add(n659, n661);
+    let n664: ZW = zw_add(n662, n654);
+    let n665: ZW = zw_add(n663, n655);
+    let n666: ZW = zw_cellmix_n(406u64, n432, 1542469173u64);
+    let n667: ZW = zw_cellmix_n(406u64, n432, 668265263u64);
+    let n668: ZW = zw_add(n648, n666);
+    let n669: ZW = zw_add(n649, n667);
+    let n670: ZW = zw_add(n668, n654);
+    let n671: ZW = zw_add(n669, n655);
+    let n672: ZW = zw_cellmix_n(20u64, zn_splat(P8::from_raw(131072i32)), 1542469173u64);
+    let n673: ZW = zw_cellmix_n(20u64, zn_splat(P8::from_raw(131072i32)), 668265263u64);
+    let n674: ZW = zw_add(n552, n672);
+    let n675: ZW = zw_add(n553, n673);
+    let n676: ZW = zw_cellmix_b(41u64, zb_splat(true), 1542469173u64);
+    let n677: ZW = zw_cellmix_b(41u64, zb_splat(true), 668265263u64);
+    let n678: ZW = zw_add(n674, n676);
+    let n679: ZW = zw_add(n675, n677);
+    let n680: ZW = zw_cellmix_n(297u64, zn_splat(P8::from_raw(655360i32)), 1542469173u64);
+    let n681: ZW = zw_cellmix_n(297u64, zn_splat(P8::from_raw(655360i32)), 668265263u64);
+    let n682: ZW = zw_add(n678, n680);
+    let n683: ZW = zw_add(n679, n681);
+    let n684: ZW = zw_cellmix_n(299u64, zn_splat(P8::from_raw(262144i32)), 1542469173u64);
+    let n685: ZW = zw_cellmix_n(299u64, zn_splat(P8::from_raw(262144i32)), 668265263u64);
+    let n686: ZW = zw_add(n682, n684);
+    let n687: ZW = zw_add(n683, n685);
+    let n688: ZW = zw_cellmix_n(300u64, zn_splat(P8::from_raw(0i32)), 1542469173u64);
+    let n689: ZW = zw_cellmix_n(300u64, zn_splat(P8::from_raw(0i32)), 668265263u64);
+    let n690: ZW = zw_add(n686, n688);
+    let n691: ZW = zw_add(n687, n689);
+    let n692: ZW = zw_add(n690, n574);
+    let n693: ZW = zw_add(n691, n575);
+    let n694: ZW = zw_cellmix_b(309u64, zb_splat(true), 1542469173u64);
+    let n695: ZW = zw_cellmix_b(309u64, zb_splat(true), 668265263u64);
+    let n696: ZW = zw_add(n692, n694);
+    let n697: ZW = zw_add(n693, n695);
+    let n698: ZW = zw_add(n696, n582);
+    let n699: ZW = zw_add(n697, n583);
+    let n700: ZW = zw_cellmix_n(394u64, zn_splat(P8::from_raw(98304i32)), 1542469173u64);
+    let n701: ZW = zw_cellmix_n(394u64, zn_splat(P8::from_raw(98304i32)), 668265263u64);
+    let n702: ZW = zw_add(n698, n700);
+    let n703: ZW = zw_add(n699, n701);
+    let n704: ZW = zw_cellmix_n(395u64, zn_splat(P8::from_raw(69510i32)), 1542469173u64);
+    let n705: ZW = zw_cellmix_n(395u64, zn_splat(P8::from_raw(69510i32)), 668265263u64);
+    let n706: ZW = zw_add(n702, n704);
+    let n707: ZW = zw_add(n703, n705);
+    let n708: ZW = zw_cellmix_n(396u64, zn_splat(P8::from_raw(131072i32)), 1542469173u64);
+    let n709: ZW = zw_cellmix_n(396u64, zn_splat(P8::from_raw(131072i32)), 668265263u64);
+    let n710: ZW = zw_add(n706, n708);
+    let n711: ZW = zw_add(n707, n709);
+    let n712: ZW = zw_add(n710, n598);
+    let n713: ZW = zw_add(n711, n599);
+    let n714: ZW = zw_add(n712, n602);
+    let n715: ZW = zw_add(n713, n603);
+    let n716: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(65536i32)), 1542469173u64);
+    let n717: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(65536i32)), 668265263u64);
+    let n718: ZW = zw_add(n714, n716);
+    let n719: ZW = zw_add(n715, n717);
+    let n720: ZW = zw_cellmix_n(407u64, zn_splat(P8::from_raw(0i32)), 1542469173u64);
+    let n721: ZW = zw_cellmix_n(407u64, zn_splat(P8::from_raw(0i32)), 668265263u64);
+    let n722: ZW = zw_add(n718, n720);
+    let n723: ZW = zw_add(n719, n721);
+    let n724: ZW = zw_cellmix_n(396u64, zn_splat(P8::from_raw(-131072i32)), 1542469173u64);
+    let n725: ZW = zw_cellmix_n(396u64, zn_splat(P8::from_raw(-131072i32)), 668265263u64);
+    let n726: ZW = zw_add(n706, n724);
+    let n727: ZW = zw_add(n707, n725);
+    let n728: ZW = zw_add(n726, n598);
+    let n729: ZW = zw_add(n727, n599);
+    let n730: ZW = zw_add(n728, n614);
+    let n731: ZW = zw_add(n729, n615);
+    let n732: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(-327680i32)), 1542469173u64);
+    let n733: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(-327680i32)), 668265263u64);
+    let n734: ZW = zw_add(n730, n732);
+    let n735: ZW = zw_add(n731, n733);
+    let n736: ZW = zw_add(n734, n720);
+    let n737: ZW = zw_add(n735, n721);
+    let n738: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(327680i32)), 1542469173u64);
+    let n739: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(327680i32)), 668265263u64);
+    let n740: ZW = zw_add(n714, n738);
+    let n741: ZW = zw_add(n715, n739);
+    let n742: ZW = zw_add(n740, n720);
+    let n743: ZW = zw_add(n741, n721);
+    let n744: ZW = zw_cellmix_n(394u64, zn_splat(P8::from_raw(69510i32)), 1542469173u64);
+    let n745: ZW = zw_cellmix_n(394u64, zn_splat(P8::from_raw(69510i32)), 668265263u64);
+    let n746: ZW = zw_add(n698, n744);
+    let n747: ZW = zw_add(n699, n745);
+    let n748: ZW = zw_cellmix_n(395u64, zn_splat(P8::from_raw(98304i32)), 1542469173u64);
+    let n749: ZW = zw_cellmix_n(395u64, zn_splat(P8::from_raw(98304i32)), 668265263u64);
+    let n750: ZW = zw_add(n746, n748);
+    let n751: ZW = zw_add(n747, n749);
+    let n752: ZW = zw_add(n750, n594);
+    let n753: ZW = zw_add(n751, n595);
+    let n754: ZW = zw_cellmix_n(397u64, zn_splat(P8::from_raw(-98304i32)), 1542469173u64);
+    let n755: ZW = zw_cellmix_n(397u64, zn_splat(P8::from_raw(-98304i32)), 668265263u64);
+    let n756: ZW = zw_add(n752, n754);
+    let n757: ZW = zw_add(n753, n755);
+    let n758: ZW = zw_add(n756, n602);
+    let n759: ZW = zw_add(n757, n603);
+    let n760: ZW = zw_add(n758, n606);
+    let n761: ZW = zw_add(n759, n607);
+    let n762: ZW = zw_cellmix_n(407u64, zn_splat(P8::from_raw(-327680i32)), 1542469173u64);
+    let n763: ZW = zw_cellmix_n(407u64, zn_splat(P8::from_raw(-327680i32)), 668265263u64);
+    let n764: ZW = zw_add(n760, n762);
+    let n765: ZW = zw_add(n761, n763);
+    let n766: ZW = zw_add(n746, n704);
+    let n767: ZW = zw_add(n747, n705);
+    let n768: ZW = zw_add(n766, n724);
+    let n769: ZW = zw_add(n767, n725);
+    let n770: ZW = zw_add(n768, n754);
+    let n771: ZW = zw_add(n769, n755);
+    let n772: ZW = zw_add(n770, n614);
+    let n773: ZW = zw_add(n771, n615);
+    let n774: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(-231700i32)), 1542469173u64);
+    let n775: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(-231700i32)), 668265263u64);
+    let n776: ZW = zw_add(n772, n774);
+    let n777: ZW = zw_add(n773, n775);
+    let n778: ZW = zw_cellmix_n(407u64, zn_splat(P8::from_raw(-231700i32)), 1542469173u64);
+    let n779: ZW = zw_cellmix_n(407u64, zn_splat(P8::from_raw(-231700i32)), 668265263u64);
+    let n780: ZW = zw_add(n776, n778);
+    let n781: ZW = zw_add(n777, n779);
+    let n782: ZW = zw_add(n766, n708);
+    let n783: ZW = zw_add(n767, n709);
+    let n784: ZW = zw_add(n782, n754);
+    let n785: ZW = zw_add(n783, n755);
+    let n786: ZW = zw_add(n784, n602);
+    let n787: ZW = zw_add(n785, n603);
+    let n788: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(231700i32)), 1542469173u64);
+    let n789: ZW = zw_cellmix_n(406u64, zn_splat(P8::from_raw(231700i32)), 668265263u64);
+    let n790: ZW = zw_add(n786, n788);
+    let n791: ZW = zw_add(n787, n789);
+    let n792: ZW = zw_add(n790, n778);
+    let n793: ZW = zw_add(n791, n779);
+    let n794: ZW = zw_cellmix_n(397u64, zn_splat(P8::from_raw(131072i32)), 1542469173u64);
+    let n795: ZW = zw_cellmix_n(397u64, zn_splat(P8::from_raw(131072i32)), 668265263u64);
+    let n796: ZW = zw_add(n752, n794);
+    let n797: ZW = zw_add(n753, n795);
+    let n798: ZW = zw_add(n796, n602);
+    let n799: ZW = zw_add(n797, n603);
+    let n800: ZW = zw_add(n798, n606);
+    let n801: ZW = zw_add(n799, n607);
+    let n802: ZW = zw_cellmix_n(407u64, zn_splat(P8::from_raw(327680i32)), 1542469173u64);
+    let n803: ZW = zw_cellmix_n(407u64, zn_splat(P8::from_raw(327680i32)), 668265263u64);
+    let n804: ZW = zw_add(n800, n802);
+    let n805: ZW = zw_add(n801, n803);
+    let n806: ZW = zw_add(n768, n794);
+    let n807: ZW = zw_add(n769, n795);
+    let n808: ZW = zw_add(n806, n614);
+    let n809: ZW = zw_add(n807, n615);
+    let n810: ZW = zw_add(n808, n774);
+    let n811: ZW = zw_add(n809, n775);
+    let n812: ZW = zw_cellmix_n(407u64, zn_splat(P8::from_raw(231700i32)), 1542469173u64);
+    let n813: ZW = zw_cellmix_n(407u64, zn_splat(P8::from_raw(231700i32)), 668265263u64);
+    let n814: ZW = zw_add(n810, n812);
+    let n815: ZW = zw_add(n811, n813);
+    let n816: ZW = zw_add(n782, n794);
+    let n817: ZW = zw_add(n783, n795);
+    let n818: ZW = zw_add(n816, n602);
+    let n819: ZW = zw_add(n817, n603);
+    let n820: ZW = zw_add(n818, n788);
+    let n821: ZW = zw_add(n819, n789);
+    let n822: ZW = zw_add(n820, n812);
+    let n823: ZW = zw_add(n821, n813);
+    let n824: ZW = zw_add(n690, n630);
+    let n825: ZW = zw_add(n691, n631);
+    let n826: ZW = zw_add(n824, n694);
+    let n827: ZW = zw_add(n825, n695);
+    let n828: ZW = zw_add(n826, n636);
+    let n829: ZW = zw_add(n827, n637);
+    let n830: ZW = zw_add(n828, n700);
+    let n831: ZW = zw_add(n829, n701);
+    let n832: ZW = zw_add(n830, n704);
+    let n833: ZW = zw_add(n831, n705);
+    let n834: ZW = zw_add(n832, n708);
+    let n835: ZW = zw_add(n833, n709);
+    let n836: ZW = zw_add(n834, n598);
+    let n837: ZW = zw_add(n835, n599);
+    let n838: ZW = zw_add(n836, n602);
+    let n839: ZW = zw_add(n837, n603);
+    let n840: ZW = zw_add(n838, n716);
+    let n841: ZW = zw_add(n839, n717);
+    let n842: ZW = zw_add(n840, n720);
+    let n843: ZW = zw_add(n841, n721);
+    let n844: ZW = zw_add(n832, n724);
+    let n845: ZW = zw_add(n833, n725);
+    let n846: ZW = zw_add(n844, n598);
+    let n847: ZW = zw_add(n845, n599);
+    let n848: ZW = zw_add(n846, n614);
+    let n849: ZW = zw_add(n847, n615);
+    let n850: ZW = zw_add(n848, n732);
+    let n851: ZW = zw_add(n849, n733);
+    let n852: ZW = zw_add(n850, n720);
+    let n853: ZW = zw_add(n851, n721);
+    let n854: ZW = zw_add(n838, n738);
+    let n855: ZW = zw_add(n839, n739);
+    let n856: ZW = zw_add(n854, n720);
+    let n857: ZW = zw_add(n855, n721);
+    let n858: ZW = zw_add(n828, n744);
+    let n859: ZW = zw_add(n829, n745);
+    let n860: ZW = zw_add(n858, n748);
+    let n861: ZW = zw_add(n859, n749);
+    let n862: ZW = zw_add(n860, n594);
+    let n863: ZW = zw_add(n861, n595);
+    let n864: ZW = zw_add(n862, n754);
+    let n865: ZW = zw_add(n863, n755);
+    let n866: ZW = zw_add(n864, n602);
+    let n867: ZW = zw_add(n865, n603);
+    let n868: ZW = zw_add(n866, n606);
+    let n869: ZW = zw_add(n867, n607);
+    let n870: ZW = zw_add(n868, n762);
+    let n871: ZW = zw_add(n869, n763);
+    let n872: ZW = zw_add(n858, n704);
+    let n873: ZW = zw_add(n859, n705);
+    let n874: ZW = zw_add(n872, n724);
+    let n875: ZW = zw_add(n873, n725);
+    let n876: ZW = zw_add(n874, n754);
+    let n877: ZW = zw_add(n875, n755);
+    let n878: ZW = zw_add(n876, n614);
+    let n879: ZW = zw_add(n877, n615);
+    let n880: ZW = zw_add(n878, n774);
+    let n881: ZW = zw_add(n879, n775);
+    let n882: ZW = zw_add(n880, n778);
+    let n883: ZW = zw_add(n881, n779);
+    let n884: ZW = zw_add(n872, n708);
+    let n885: ZW = zw_add(n873, n709);
+    let n886: ZW = zw_add(n884, n754);
+    let n887: ZW = zw_add(n885, n755);
+    let n888: ZW = zw_add(n886, n602);
+    let n889: ZW = zw_add(n887, n603);
+    let n890: ZW = zw_add(n888, n788);
+    let n891: ZW = zw_add(n889, n789);
+    let n892: ZW = zw_add(n890, n778);
+    let n893: ZW = zw_add(n891, n779);
+    let n894: ZW = zw_add(n862, n794);
+    let n895: ZW = zw_add(n863, n795);
+    let n896: ZW = zw_add(n894, n602);
+    let n897: ZW = zw_add(n895, n603);
+    let n898: ZW = zw_add(n896, n606);
+    let n899: ZW = zw_add(n897, n607);
+    let n900: ZW = zw_add(n898, n802);
+    let n901: ZW = zw_add(n899, n803);
+    let n902: ZW = zw_add(n874, n794);
+    let n903: ZW = zw_add(n875, n795);
+    let n904: ZW = zw_add(n902, n614);
+    let n905: ZW = zw_add(n903, n615);
+    let n906: ZW = zw_add(n904, n774);
+    let n907: ZW = zw_add(n905, n775);
+    let n908: ZW = zw_add(n906, n812);
+    let n909: ZW = zw_add(n907, n813);
+    let n910: ZW = zw_add(n884, n794);
+    let n911: ZW = zw_add(n885, n795);
+    let n912: ZW = zw_add(n910, n602);
+    let n913: ZW = zw_add(n911, n603);
+    let n914: ZW = zw_add(n912, n788);
+    let n915: ZW = zw_add(n913, n789);
+    let n916: ZW = zw_add(n914, n812);
+    let n917: ZW = zw_add(n915, n813);
+    let n918: ZW = zw_add(zw_splat(0u64), n526);
+    let n919: ZW = zw_add(zw_splat(0u64), n527);
+    let n920: ZW = zw_add(n918, n530);
+    let n921: ZW = zw_add(n919, n531);
+    let n922: ZW = zw_add(n920, n534);
+    let n923: ZW = zw_add(n921, n535);
+    let n924: ZW = zw_cellmix_n(87u64, n450, 1542469173u64);
+    let n925: ZW = zw_cellmix_n(87u64, n450, 668265263u64);
+    let n926: ZW = zw_add(n922, n924);
+    let n927: ZW = zw_add(n923, n925);
+    let n928: ZW = zw_cellmix_i(245u64, n173, 1542469173u64);
+    let n929: ZW = zw_cellmix_i(245u64, n173, 668265263u64);
+    let n930: ZW = zw_add(n926, n928);
+    let n931: ZW = zw_add(n927, n929);
+    let n932: ZW = zw_cellmix_i(253u64, zi_splat(n178.0, n178.1), 1542469173u64);
+    let n933: ZW = zw_cellmix_i(253u64, zi_splat(n178.0, n178.1), 668265263u64);
+    let n934: ZW = zw_add(n930, n932);
+    let n935: ZW = zw_add(n931, n933);
+    let n936: ZW = zw_add(n934, n554);
+    let n937: ZW = zw_add(n935, n555);
+    let n938: ZW = zw_add(n936, n558);
+    let n939: ZW = zw_add(n937, n559);
+    let n940: ZW = zw_add(n934, n672);
+    let n941: ZW = zw_add(n935, n673);
+    let n942: ZW = zw_add(n940, n676);
+    let n943: ZW = zw_add(n941, n677);
+    let n944: ZW = zw_cellmix_b(38u64, n463, 1542469173u64);
+    let n945: ZW = zw_cellmix_b(38u64, n463, 668265263u64);
+    let n946: ZW = zw_add(zw_splat(0u64), n944);
+    let n947: ZW = zw_add(zw_splat(0u64), n945);
+    let n948: ZW = zw_cellmix_n(39u64, n462, 1542469173u64);
+    let n949: ZW = zw_cellmix_n(39u64, n462, 668265263u64);
+    let n950: ZW = zw_add(n946, n948);
+    let n951: ZW = zw_add(n947, n949);
+    let n952: ZW = zw_add(n950, n526);
+    let n953: ZW = zw_add(n951, n527);
+    let n954: ZW = zw_add(n952, n530);
+    let n955: ZW = zw_add(n953, n531);
+    let n956: ZW = zw_add(n954, n534);
+    let n957: ZW = zw_add(n955, n535);
+    let n958: ZW = zw_cellmix_n(87u64, n461, 1542469173u64);
+    let n959: ZW = zw_cellmix_n(87u64, n461, 668265263u64);
+    let n960: ZW = zw_add(n956, n958);
+    let n961: ZW = zw_add(n957, n959);
+    let n962: ZW = zw_add(n960, n554);
+    let n963: ZW = zw_add(n961, n555);
+    let n964: ZW = zw_add(n960, n672);
+    let n965: ZW = zw_add(n961, n673);
+    let n966: ZW = zw_cellmix_n(20u64, n473, 1542469173u64);
+    let n967: ZW = zw_cellmix_n(20u64, n473, 668265263u64);
+    let n968: ZW = zw_add(zw_splat(0u64), n966);
+    let n969: ZW = zw_add(zw_splat(0u64), n967);
+    let n970: ZW = zw_add(n968, n522);
+    let n971: ZW = zw_add(n969, n523);
+    let n972: ZW = zw_add(n970, n526);
+    let n973: ZW = zw_add(n971, n527);
+    let n974: ZW = zw_add(n972, n530);
+    let n975: ZW = zw_add(n973, n531);
+    let n976: ZW = zw_add(n974, n534);
+    let n977: ZW = zw_add(n975, n535);
+    let n978: ZW = zw_add(n976, n538);
+    let n979: ZW = zw_add(n977, n539);
+    let n980: ZW = zw_cellmix_i(246u64, n474, 1542469173u64);
+    let n981: ZW = zw_cellmix_i(246u64, n474, 668265263u64);
+    let n982: ZW = zw_add(n978, n980);
+    let n983: ZW = zw_add(n979, n981);
+    let n984: ZW = zw_cellmix_i(254u64, n475, 1542469173u64);
+    let n985: ZW = zw_cellmix_i(254u64, n475, 668265263u64);
+    let n986: ZW = zw_add(n982, n984);
+    let n987: ZW = zw_add(n983, n985);
+    let n988: ZW = zw_cellmix_n(258u64, n515, 1542469173u64);
+    let n989: ZW = zw_cellmix_n(258u64, n515, 668265263u64);
+    let n990: ZW = zw_add(n986, n988);
+    let n991: ZW = zw_add(n987, n989);
+    let n992: ZW = zw_cellmix_n(269u64, n492, 1542469173u64);
+    let n993: ZW = zw_cellmix_n(269u64, n492, 668265263u64);
+    let n994: ZW = zw_add(n990, n992);
+    let n995: ZW = zw_add(n991, n993);
+    let n996: ZW = zw_cellmix_n(270u64, n516, 1542469173u64);
+    let n997: ZW = zw_cellmix_n(270u64, n516, 668265263u64);
+    let n998: ZW = zw_add(n994, n996);
+    let n999: ZW = zw_add(n995, n997);
+    let n1000: ZW = zw_cellmix_n(274u64, n517, 1542469173u64);
+    let n1001: ZW = zw_cellmix_n(274u64, n517, 668265263u64);
+    let n1002: ZW = zw_add(n998, n1000);
+    let n1003: ZW = zw_add(n999, n1001);
+    let n1004: ZW = zw_cellmix_n(375u64, n518, 1542469173u64);
+    let n1005: ZW = zw_cellmix_n(375u64, n518, 668265263u64);
+    let n1006: ZW = zw_add(n1002, n1004);
+    let n1007: ZW = zw_add(n1003, n1005);
+    let n1008: ZW = zw_cellmix_n(377u64, n519, 1542469173u64);
+    let n1009: ZW = zw_cellmix_n(377u64, n519, 668265263u64);
+    let n1010: ZW = zw_add(n1006, n1008);
+    let n1011: ZW = zw_add(n1007, n1009);
     let ok_v0_b0: u16 = ALL & zb_holds(n171) & zb_holds(n170) & zb_holds(n169) & zb_holds(n168) & zb_holds(n167) & zb_holds(n166) & zb_holds(n165) & zb_holds(r_c307) & zb_holds(n164) & zb_holds(n163) & zb_holds(n158) & zb_holds(n157) & zb_holds(n156) & zb_holds(n155) & zb_holds(r_c296) & zb_holds(n154) & zb_holds(n153) & zb_holds(n152) & zb_holds(n151) & zb_holds(n150) & zb_holds(r_c288) & zb_holds(n149) & zb_holds(n148) & zb_holds(n143) & zb_holds(n142) & zb_holds(n141) & zb_holds(n140) & zb_holds(r_c277) & zb_holds(n139) & zb_holds(n138) & zb_holds(n137) & zb_holds(n135) & zb_holds(n134) & zb_holds(n133) & zb_holds(n128) & zb_holds(n127) & zb_holds(r_c257) & zb_holds(n126) & zb_holds(n125) & zb_holds(n124) & zb_holds(n123) & zb_holds(n122) & zb_holds(r_c248) & zb_holds(n121) & zb_holds(n120) & zb_holds(n115) & zb_holds(n114) & zb_holds(r_c238) & zb_holds(n113) & zb_holds(n111) & zb_holds(n112) & zb_holds(n394);
     let bd_v0_b0: bool = !n162 || !n161 || !n160 || !n159 || !n147 || !n146 || !n145 || !n144 || !n132 || !n131 || !n130 || !n129 || !n119 || !n118 || !n117 || !n116;
     let live_v0_b0: u16 = ALL & zb_holds(n393) & zb_holds(n395) & zb_holds(n421);
@@ -6398,7 +6533,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: zn_splat(P8::from_raw(0i32)),
         c407: n405,
-        h1: n582, h2: n583,
+        h1: n612, h2: n613,
     };
     // body 0: buttons 0x00, forks 0x0
     sink.o0(0, take_0_0, &sh0, &o0);
@@ -6420,7 +6555,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: n427,
         c407: n405,
-        h1: n590, h2: n591,
+        h1: n622, h2: n623,
     };
     // body 1: buttons 0x01, forks 0x0
     sink.o0(1, take_0_1, &sh0, &o0);
@@ -6442,7 +6577,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: n430,
         c407: n405,
-        h1: n595, h2: n596,
+        h1: n628, h2: n629,
     };
     // body 2: buttons 0x02, forks 0x0
     sink.o0(2, take_0_2, &sh0, &o0);
@@ -6464,7 +6599,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: n418,
         c407: n419,
-        h1: n618, h2: n619,
+        h1: n656, h2: n657,
     };
     // body 3: buttons 0x10, forks 0x0
     sink.o0(16, take_0_3, &sh0, &o0);
@@ -6486,7 +6621,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: n429,
         c407: n419,
-        h1: n625, h2: n626,
+        h1: n664, h2: n665,
     };
     // body 4: buttons 0x11, forks 0x0
     sink.o0(17, take_0_4, &sh0, &o0);
@@ -6508,7 +6643,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: n432,
         c407: n419,
-        h1: n630, h2: n631,
+        h1: n670, h2: n671,
     };
     // body 5: buttons 0x12, forks 0x0
     sink.o0(18, take_0_5, &sh0, &o0);
@@ -6530,7 +6665,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: zn_splat(P8::from_raw(65536i32)),
         c407: zn_splat(P8::from_raw(0i32)),
-        h1: n665, h2: n666,
+        h1: n722, h2: n723,
     };
     // body 6: buttons 0x20, forks 0x0
     sink.o0(32, take_0_6, &sh0, &o0);
@@ -6552,7 +6687,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: zn_splat(P8::from_raw(-327680i32)),
         c407: zn_splat(P8::from_raw(0i32)),
-        h1: n677, h2: n678,
+        h1: n736, h2: n737,
     };
     // body 7: buttons 0x21, forks 0x0
     sink.o0(33, take_0_7, &sh0, &o0);
@@ -6574,7 +6709,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: zn_splat(P8::from_raw(327680i32)),
         c407: zn_splat(P8::from_raw(0i32)),
-        h1: n682, h2: n683,
+        h1: n742, h2: n743,
     };
     // body 8: buttons 0x22, forks 0x0
     sink.o0(34, take_0_8, &sh0, &o0);
@@ -6596,7 +6731,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: zn_splat(P8::from_raw(0i32)),
         c407: zn_splat(P8::from_raw(-327680i32)),
-        h1: n697, h2: n698,
+        h1: n764, h2: n765,
     };
     // body 9: buttons 0x24, forks 0x0
     sink.o0(36, take_0_9, &sh0, &o0);
@@ -6618,7 +6753,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: zn_splat(P8::from_raw(-231700i32)),
         c407: zn_splat(P8::from_raw(-231700i32)),
-        h1: n710, h2: n711,
+        h1: n780, h2: n781,
     };
     // body 10: buttons 0x25, forks 0x0
     sink.o0(37, take_0_10, &sh0, &o0);
@@ -6640,7 +6775,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: zn_splat(P8::from_raw(231700i32)),
         c407: zn_splat(P8::from_raw(-231700i32)),
-        h1: n721, h2: n722,
+        h1: n792, h2: n793,
     };
     // body 11: buttons 0x26, forks 0x0
     sink.o0(38, take_0_11, &sh0, &o0);
@@ -6662,7 +6797,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: zn_splat(P8::from_raw(0i32)),
         c407: zn_splat(P8::from_raw(327680i32)),
-        h1: n729, h2: n730,
+        h1: n804, h2: n805,
     };
     // body 12: buttons 0x28, forks 0x0
     sink.o0(40, take_0_12, &sh0, &o0);
@@ -6684,7 +6819,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: zn_splat(P8::from_raw(-231700i32)),
         c407: zn_splat(P8::from_raw(231700i32)),
-        h1: n737, h2: n738,
+        h1: n814, h2: n815,
     };
     // body 13: buttons 0x29, forks 0x0
     sink.o0(41, take_0_13, &sh0, &o0);
@@ -6706,7 +6841,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(false),
         c406: zn_splat(P8::from_raw(231700i32)),
         c407: zn_splat(P8::from_raw(231700i32)),
-        h1: n745, h2: n746,
+        h1: n822, h2: n823,
     };
     // body 14: buttons 0x2a, forks 0x0
     sink.o0(42, take_0_14, &sh0, &o0);
@@ -6728,7 +6863,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: zn_splat(P8::from_raw(65536i32)),
         c407: zn_splat(P8::from_raw(0i32)),
-        h1: n765, h2: n766,
+        h1: n842, h2: n843,
     };
     // body 15: buttons 0x30, forks 0x0
     sink.o0(48, take_0_15, &sh0, &o0);
@@ -6750,7 +6885,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: zn_splat(P8::from_raw(-327680i32)),
         c407: zn_splat(P8::from_raw(0i32)),
-        h1: n775, h2: n776,
+        h1: n852, h2: n853,
     };
     // body 16: buttons 0x31, forks 0x0
     sink.o0(49, take_0_16, &sh0, &o0);
@@ -6772,7 +6907,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: zn_splat(P8::from_raw(327680i32)),
         c407: zn_splat(P8::from_raw(0i32)),
-        h1: n779, h2: n780,
+        h1: n856, h2: n857,
     };
     // body 17: buttons 0x32, forks 0x0
     sink.o0(50, take_0_17, &sh0, &o0);
@@ -6794,7 +6929,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: zn_splat(P8::from_raw(0i32)),
         c407: zn_splat(P8::from_raw(-327680i32)),
-        h1: n793, h2: n794,
+        h1: n870, h2: n871,
     };
     // body 18: buttons 0x34, forks 0x0
     sink.o0(52, take_0_18, &sh0, &o0);
@@ -6816,7 +6951,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: zn_splat(P8::from_raw(-231700i32)),
         c407: zn_splat(P8::from_raw(-231700i32)),
-        h1: n805, h2: n806,
+        h1: n882, h2: n883,
     };
     // body 19: buttons 0x35, forks 0x0
     sink.o0(53, take_0_19, &sh0, &o0);
@@ -6838,7 +6973,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: zn_splat(P8::from_raw(231700i32)),
         c407: zn_splat(P8::from_raw(-231700i32)),
-        h1: n815, h2: n816,
+        h1: n892, h2: n893,
     };
     // body 20: buttons 0x36, forks 0x0
     sink.o0(54, take_0_20, &sh0, &o0);
@@ -6860,7 +6995,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: zn_splat(P8::from_raw(0i32)),
         c407: zn_splat(P8::from_raw(327680i32)),
-        h1: n823, h2: n824,
+        h1: n900, h2: n901,
     };
     // body 21: buttons 0x38, forks 0x0
     sink.o0(56, take_0_21, &sh0, &o0);
@@ -6882,7 +7017,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: zn_splat(P8::from_raw(-231700i32)),
         c407: zn_splat(P8::from_raw(231700i32)),
-        h1: n831, h2: n832,
+        h1: n908, h2: n909,
     };
     // body 22: buttons 0x39, forks 0x0
     sink.o0(57, take_0_22, &sh0, &o0);
@@ -6904,7 +7039,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
         c310: zb_splat(true),
         c406: zn_splat(P8::from_raw(231700i32)),
         c407: zn_splat(P8::from_raw(231700i32)),
-        h1: n839, h2: n840,
+        h1: n916, h2: n917,
     };
     // body 23: buttons 0x3a, forks 0x0
     sink.o0(58, take_0_23, &sh0, &o0);
@@ -6913,7 +7048,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     let o1 = KOut1 {
         c20: r_c20,
         c41: zb_splat(false),
-        h1: n856, h2: n857,
+        h1: n938, h2: n939,
     };
     // body 24: buttons 0x00, forks 0x0
     sink.o1(0, take_1_0, &sh1, &o1);
@@ -6922,7 +7057,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     let o1 = KOut1 {
         c20: zn_splat(P8::from_raw(131072i32)),
         c41: zb_splat(true),
-        h1: n860, h2: n861,
+        h1: n942, h2: n943,
     };
     // body 25: buttons 0x20, forks 0x0
     sink.o1(32, take_1_1, &sh1, &o1);
@@ -6930,7 +7065,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     take_2_0 |= live_v0_b26 & ok_v0_b26 & (if bd_v0_b26 { 0 } else { ALL });
     let o2 = KOut2 {
         c20: r_c20,
-        h1: n877, h2: n878,
+        h1: n962, h2: n963,
     };
     // body 26: buttons 0x00, forks 0x0
     sink.o2(0, take_2_0, &sh2, &o2);
@@ -6938,14 +7073,14 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     take_2_1 |= live_v32_b27 & ok_v32_b27 & (if bd_v32_b27 { 0 } else { ALL });
     let o2 = KOut2 {
         c20: zn_splat(P8::from_raw(131072i32)),
-        h1: n879, h2: n880,
+        h1: n964, h2: n965,
     };
     // body 27: buttons 0x20, forks 0x0
     sink.o2(32, take_2_1, &sh2, &o2);
     declined |= live_v0_b28 & (if bd_v0_b28 { ALL } else { !ok_v0_b28 });
     take_3_0 |= live_v0_b28 & ok_v0_b28 & (if bd_v0_b28 { 0 } else { ALL });
     let o3 = KOut3 {
-        h1: n916, h2: n917,
+        h1: n1010, h2: n1011,
     };
     // body 28: buttons 0x00, forks 0x0
     sink.o3(0, take_3_0, &sh3, &o3);

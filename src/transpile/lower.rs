@@ -284,6 +284,11 @@ impl<'a> Ctx<'a> {
             Op::Word(_) => Repr::word(false),
             Op::Bits => Repr::word(self.r(a[0]).lane),
             Op::Mix(_, _) => Repr::word(a.iter().any(|x| self.r(*x).lane)),
+            // The sound full-key layer: `CellMix` reads one value's per-lane
+            // contribution (always a per-lane WORD - it is only ever built
+            // over the non-const output cells), `AddW` sums them.
+            Op::CellMix(_, _) => Repr::word(true),
+            Op::AddW => Repr::word(a.iter().any(|x| self.r(*x).lane)),
         })
     }
 
@@ -679,6 +684,32 @@ impl<'a> Ctx<'a> {
                     ),
                 }
             }
+            // ---- sound full row key ----
+            // One cell's ADDITIVE contribution `cell_mix(cell, value,
+            // seed[half])`, vectorized. The value is coerced to its per-lane
+            // form first (a uniform per-lane-sum cell is splatted), so the
+            // type dispatch is exactly `Op::Bits`'s.
+            Op::CellMix(c, half) => {
+                let src = self.r(a[0]);
+                let seed: u64 = if half == 0 { 0x5bf0_3635 } else { 0x27d4_eb2f };
+                let (want, f) = match (src.dom, src.wide) {
+                    (Dom::Num, false) => (Repr::num(true, false), "zw_cellmix_n"),
+                    (Dom::Num, true) => (Repr::num(true, true), "zw_cellmix_i"),
+                    (Dom::Bool, _) => (Repr::boolean(true, false), "zw_cellmix_b"),
+                    (Dom::Word, _) => bail!("CellMix of a machine word"),
+                };
+                let v = self.at(id, 0, want)?;
+                format!("{}({}u64, {}, {}u64)", f, c, v, seed)
+            }
+            Op::AddW => {
+                let w = Repr::word(lane);
+                let (x, y) = (self.at(id, 0, w)?, self.at(id, 1, w)?);
+                if lane {
+                    format!("zw_add({}, {})", x, y)
+                } else {
+                    format!("{}.wrapping_add({})", x, y)
+                }
+            }
             Op::Word(_) => bail!("node {} is an inline leaf and needs no let", id),
             Op::Const(..) | Op::ConstBool(_) | Op::Cell(_) | Op::Free(_) => {
                 bail!("node {} is an inline leaf and needs no let", id)
@@ -1031,16 +1062,23 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                 })
                 .map(|(fi, f)| (f.cell, fi))
                 .collect();
+            // Agreed (button-independent) cells first, so the additive sum's
+            // agreed prefix hash-conses across the outcome's variants; the
+            // sum is commutative, so ordering only affects sharing, not the
+            // key. The SOUND key is the boundary's SUM of `cell_mix` over the
+            // per-lane cells; the uniform-cell prefix and the closing `mix64`
+            // are added in `append` (`trace::kernel::render` knows the shape
+            // hash and the uniform cells; this layer does not).
             order.sort_by_key(|(cell, fi)| (!agreed(*fi), *cell));
-            let seed1 = sp.leaf(Op::Word(0x9e37_79b9_7f4a_7c15));
-            let seed2 = sp.leaf(Op::Word(0xa076_1d64_78bd_642f));
+            let zero = sp.leaf(Op::Word(0));
             for bi in mine {
-                let (mut h1, mut h2) = (seed1, seed2);
+                let (mut h1, mut h2) = (zero, zero);
                 for (cell, fi) in &order {
                     let v = bodies[bi].3[*fi];
-                    let b = sp.add(Op::Bits, vec![v]);
-                    h1 = sp.add(Op::Mix(*cell, 0), vec![h1, b]);
-                    h2 = sp.add(Op::Mix(*cell, 1), vec![h2, b]);
+                    let c1 = sp.add(Op::CellMix(*cell, 0), vec![v]);
+                    let c2 = sp.add(Op::CellMix(*cell, 1), vec![v]);
+                    h1 = sp.add(Op::AddW, vec![h1, c1]);
+                    h2 = sp.add(Op::AddW, vec![h2, c2]);
                 }
                 hash_of[bi] = Some((h1, h2));
             }

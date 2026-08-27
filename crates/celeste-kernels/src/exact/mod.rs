@@ -22,4 +22,4 @@ pub const SETS: &[&[Kernel]] = &[
 /// Content hash of every kernel source in every room of this
 /// set. Hashed into the campaign fingerprint so two different
 /// kernel sets can never share a checkpoint.
-pub const FINGERPRINT: u64 = 10004119745198974532;
+pub const FINGERPRINT: u64 = 11035168998074309745;

@@ -213,7 +213,7 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
             // A concrete value has no row key - the key is over the
             // abstract representation, which a `Conc` has already thrown
             // away.
-            Op::Word(_) | Op::Bits | Op::Mix(..) => {
+            Op::Word(_) | Op::Bits | Op::Mix(..) | Op::CellMix(..) | Op::AddW => {
                 bail!("node {} is {:?}, a row-key node with no concrete value", id, node.op)
             }
         };

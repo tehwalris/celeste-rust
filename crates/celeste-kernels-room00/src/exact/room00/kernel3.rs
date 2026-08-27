@@ -1536,17 +1536,24 @@ pub fn acc0(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
     b
 }
 
+/// The SOUND (full boundary) row key's per-outcome CONSTANT
+/// prefix: shape hash + the uniform cells' `cell_mix` sum. The
+/// per-lane cells are summed by the graph into `kv.h1/h2`, and
+/// `append` closes the key with `mix64(KPART + kv.h)`, which is
+/// byte-identical to `Rt2::boundary`'s own row key.
+pub const KPART1_0: u64 = 13963257849362436872;
+pub const KPART2_0: u64 = 8407074677912292207;
+
 /// Append this assignment's lanes that TAKE outcome 0 and
 /// that the kernel is willing to keep. A lane in `deopt` is
 /// dropped here and belongs to the interpreter - the caller
 /// has `kv.deopt` and must account for it.
 /// SKIPS a row whose values another configuration already
-/// wrote. The key is over the non-constant cells only - the
-/// rest are one value for the whole accumulator and cannot
-/// tell two rows apart - so it is a handful of mixes rather
-/// than a hundred, computed from values already in
-/// registers. A duplicate caught here costs nothing; one
-/// caught at the boundary has already been written.
+/// wrote, by the SOUND full boundary key (`mix64(KPART + kv.h)`),
+/// so the dedup here is exactly the boundary's - computed from
+/// values already in registers before materializing the row.
+/// A duplicate caught here costs nothing; one caught at the
+/// boundary has already been written.
 ///
 /// 128-bit like the boundary's own key, because a collision
 /// DROPS a successor rather than merely costing time.
@@ -1573,10 +1580,13 @@ pub fn append0(
     let (h1, h2) = (kv.h1.to_array(), kv.h2.to_array());
     for i in 0..n {
         if take & (1 << i) == 0 { continue; }
-        let key = if org.is_empty() { (h1[i], h2[i]) } else {
+        let k0 = mix64(KPART1_0.wrapping_add(h1[i]));
+        let k1 = mix64(KPART2_0.wrapping_add(h2[i]));
+        let key = if org.is_empty() { (k0, k1) } else {
             // mix64 is a bijection: same row, different
             // origins can never collide.
-            (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])
+            let m = mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64);
+            (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
         if let Col::N(v) = &mut acc.cols[87] { v.push(sh.c87.lane(i)); }
@@ -1654,17 +1664,24 @@ pub fn acc1(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
     b
 }
 
+/// The SOUND (full boundary) row key's per-outcome CONSTANT
+/// prefix: shape hash + the uniform cells' `cell_mix` sum. The
+/// per-lane cells are summed by the graph into `kv.h1/h2`, and
+/// `append` closes the key with `mix64(KPART + kv.h)`, which is
+/// byte-identical to `Rt2::boundary`'s own row key.
+pub const KPART1_1: u64 = 3592812026101378167;
+pub const KPART2_1: u64 = 12880145991920963684;
+
 /// Append this assignment's lanes that TAKE outcome 1 and
 /// that the kernel is willing to keep. A lane in `deopt` is
 /// dropped here and belongs to the interpreter - the caller
 /// has `kv.deopt` and must account for it.
 /// SKIPS a row whose values another configuration already
-/// wrote. The key is over the non-constant cells only - the
-/// rest are one value for the whole accumulator and cannot
-/// tell two rows apart - so it is a handful of mixes rather
-/// than a hundred, computed from values already in
-/// registers. A duplicate caught here costs nothing; one
-/// caught at the boundary has already been written.
+/// wrote, by the SOUND full boundary key (`mix64(KPART + kv.h)`),
+/// so the dedup here is exactly the boundary's - computed from
+/// values already in registers before materializing the row.
+/// A duplicate caught here costs nothing; one caught at the
+/// boundary has already been written.
 ///
 /// 128-bit like the boundary's own key, because a collision
 /// DROPS a successor rather than merely costing time.
@@ -1691,10 +1708,13 @@ pub fn append1(
     let (h1, h2) = (kv.h1.to_array(), kv.h2.to_array());
     for i in 0..n {
         if take & (1 << i) == 0 { continue; }
-        let key = if org.is_empty() { (h1[i], h2[i]) } else {
+        let k0 = mix64(KPART1_1.wrapping_add(h1[i]));
+        let k1 = mix64(KPART2_1.wrapping_add(h2[i]));
+        let key = if org.is_empty() { (k0, k1) } else {
             // mix64 is a bijection: same row, different
             // origins can never collide.
-            (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])
+            let m = mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64);
+            (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
         if let Col::N(v) = &mut acc.cols[87] { v.push(sh.c87.lane(i)); }
@@ -1855,47 +1875,58 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     let n120: ZB = zb_and(n99, n108);
     let n121: ZB = zb_or(n119, n120);
     let n122: ZB = zb_or(n65, n121);
-    let n125: ZW = zw_bits_n(r_c20);
-    let n126: ZW = zw_mix1(zw_splat(11400714819323198485u64), n125, 20u64);
-    let n127: ZW = zw_mix2(zw_splat(11562461410679940143u64), n125, 20u64);
-    let n128: ZW = zw_bits_n(n72);
-    let n129: ZW = zw_mix1(n126, n128, 39u64);
-    let n130: ZW = zw_mix2(n127, n128, 39u64);
-    let n131: ZW = zw_bits_n(n61);
-    let n132: ZW = zw_mix1(n129, n131, 84u64);
-    let n133: ZW = zw_mix2(n130, n131, 84u64);
-    let n134: ZW = zw_bits_n(n84);
-    let n135: ZW = zw_mix1(n132, n134, 85u64);
-    let n136: ZW = zw_mix2(n133, n134, 85u64);
-    let n137: ZW = zw_bits_n(n83);
-    let n138: ZW = zw_mix1(n135, n137, 86u64);
-    let n139: ZW = zw_mix2(n136, n137, 86u64);
-    let n140: ZW = zw_bits_n(r_c87);
-    let n141: ZW = zw_mix1(n138, n140, 87u64);
-    let n142: ZW = zw_mix2(n139, n140, 87u64);
-    let n143: ZW = zw_bits_n(n106);
-    let n144: ZW = zw_mix1(zw_splat(11400714819323198485u64), n143, 20u64);
-    let n145: ZW = zw_mix2(zw_splat(11562461410679940143u64), n143, 20u64);
-    let n146: ZW = zw_bits_n(n110);
-    let n147: ZW = zw_mix1(n144, n146, 39u64);
-    let n148: ZW = zw_mix2(n145, n146, 39u64);
-    let n149: ZW = zw_bits_b(r_c41);
-    let n150: ZW = zw_mix1(n147, n149, 41u64);
-    let n151: ZW = zw_mix2(n148, n149, 41u64);
-    let n152: ZW = zw_mix1(n150, n131, 84u64);
-    let n153: ZW = zw_mix2(n151, n131, 84u64);
-    let n154: ZW = zw_mix1(n152, n134, 85u64);
-    let n155: ZW = zw_mix2(n153, n134, 85u64);
-    let n156: ZW = zw_mix1(n154, n137, 86u64);
-    let n157: ZW = zw_mix2(n155, n137, 86u64);
-    let n158: ZW = zw_mix1(n156, n140, 87u64);
-    let n159: ZW = zw_mix2(n157, n140, 87u64);
-    let n160: ZW = zw_bits_n(n117);
-    let n161: ZW = zw_mix1(n158, n160, 241u64);
-    let n162: ZW = zw_mix2(n159, n160, 241u64);
-    let n163: ZW = zw_bits_n(n118);
-    let n164: ZW = zw_mix1(n161, n163, 249u64);
-    let n165: ZW = zw_mix2(n162, n163, 249u64);
+    let n124: ZW = zw_cellmix_n(20u64, r_c20, 1542469173u64);
+    let n125: ZW = zw_cellmix_n(20u64, r_c20, 668265263u64);
+    let n126: ZW = zw_add(zw_splat(0u64), n124);
+    let n127: ZW = zw_add(zw_splat(0u64), n125);
+    let n128: ZW = zw_cellmix_n(39u64, n72, 1542469173u64);
+    let n129: ZW = zw_cellmix_n(39u64, n72, 668265263u64);
+    let n130: ZW = zw_add(n126, n128);
+    let n131: ZW = zw_add(n127, n129);
+    let n132: ZW = zw_cellmix_n(84u64, n61, 1542469173u64);
+    let n133: ZW = zw_cellmix_n(84u64, n61, 668265263u64);
+    let n134: ZW = zw_add(n130, n132);
+    let n135: ZW = zw_add(n131, n133);
+    let n136: ZW = zw_cellmix_n(85u64, n84, 1542469173u64);
+    let n137: ZW = zw_cellmix_n(85u64, n84, 668265263u64);
+    let n138: ZW = zw_add(n134, n136);
+    let n139: ZW = zw_add(n135, n137);
+    let n140: ZW = zw_cellmix_n(86u64, n83, 1542469173u64);
+    let n141: ZW = zw_cellmix_n(86u64, n83, 668265263u64);
+    let n142: ZW = zw_add(n138, n140);
+    let n143: ZW = zw_add(n139, n141);
+    let n144: ZW = zw_cellmix_n(87u64, r_c87, 1542469173u64);
+    let n145: ZW = zw_cellmix_n(87u64, r_c87, 668265263u64);
+    let n146: ZW = zw_add(n142, n144);
+    let n147: ZW = zw_add(n143, n145);
+    let n148: ZW = zw_cellmix_n(20u64, n106, 1542469173u64);
+    let n149: ZW = zw_cellmix_n(20u64, n106, 668265263u64);
+    let n150: ZW = zw_add(zw_splat(0u64), n148);
+    let n151: ZW = zw_add(zw_splat(0u64), n149);
+    let n152: ZW = zw_cellmix_n(39u64, n110, 1542469173u64);
+    let n153: ZW = zw_cellmix_n(39u64, n110, 668265263u64);
+    let n154: ZW = zw_add(n150, n152);
+    let n155: ZW = zw_add(n151, n153);
+    let n156: ZW = zw_cellmix_b(41u64, r_c41, 1542469173u64);
+    let n157: ZW = zw_cellmix_b(41u64, r_c41, 668265263u64);
+    let n158: ZW = zw_add(n154, n156);
+    let n159: ZW = zw_add(n155, n157);
+    let n160: ZW = zw_add(n158, n132);
+    let n161: ZW = zw_add(n159, n133);
+    let n162: ZW = zw_add(n160, n136);
+    let n163: ZW = zw_add(n161, n137);
+    let n164: ZW = zw_add(n162, n140);
+    let n165: ZW = zw_add(n163, n141);
+    let n166: ZW = zw_add(n164, n144);
+    let n167: ZW = zw_add(n165, n145);
+    let n168: ZW = zw_cellmix_n(241u64, n117, 1542469173u64);
+    let n169: ZW = zw_cellmix_n(241u64, n117, 668265263u64);
+    let n170: ZW = zw_add(n166, n168);
+    let n171: ZW = zw_add(n167, n169);
+    let n172: ZW = zw_cellmix_n(249u64, n118, 1542469173u64);
+    let n173: ZW = zw_cellmix_n(249u64, n118, 668265263u64);
+    let n174: ZW = zw_add(n170, n172);
+    let n175: ZW = zw_add(n171, n173);
     let ok_v0_b0: u16 = ALL & zb_holds(r_c38) & zb_holds(n57) & zb_holds(n78) & zb_holds(n77) & zb_holds(n76) & zb_holds(n75) & zb_holds(n56) & zb_holds(r_c243) & zb_holds(n74) & zb_holds(n55) & zb_holds(n50) & zb_holds(n49) & zb_holds(r_c233) & zb_holds(n47) & zb_holds(n48);
     let bd_v0_b0: bool = !n54 || !n53 || !n52 || !n51;
     let live_v0_b0: u16 = ALL & zb_holds(n73) & zb_holds(n66) & zb_holds(n71);
@@ -1928,14 +1959,14 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     declined |= live_v0_b0 & (if bd_v0_b0 { ALL } else { !ok_v0_b0 });
     take_0_0 |= live_v0_b0 & ok_v0_b0 & (if bd_v0_b0 { 0 } else { ALL });
     let o0 = KOut0 {
-        h1: n141, h2: n142,
+        h1: n146, h2: n147,
     };
     // body 0: buttons 0x00, forks 0x0
     sink.o0(0, take_0_0, &sh0, &o0);
     declined |= live_v0_b1 & (if bd_v0_b1 { ALL } else { !ok_v0_b1 });
     take_1_0 |= live_v0_b1 & ok_v0_b1 & (if bd_v0_b1 { 0 } else { ALL });
     let o1 = KOut1 {
-        h1: n164, h2: n165,
+        h1: n174, h2: n175,
     };
     // body 1: buttons 0x00, forks 0x0
     sink.o1(0, take_1_0, &sh1, &o1);

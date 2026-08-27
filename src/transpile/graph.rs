@@ -302,6 +302,16 @@ pub enum Op {
     /// pair of them is the 128-bit key. `cell` goes into the mixing, so
     /// the key is not invariant under moving a value between fields.
     Mix(u32, u8),
+    /// `CellMix(cell, half)(value)` - one cell's ADDITIVE contribution to
+    /// the SOUND (full boundary) row key: `cell_mix(cell, value, seed[half])`
+    /// (see `celeste_engine::kernel::zw_cellmix_*`). Unlike `Mix`, this reads
+    /// the VALUE directly (not `Bits`) and is order-independent, because the
+    /// boundary key is a commutative SUM of these. The per-outcome constant
+    /// prefix (shape hash + the uniform cells) is added, and the closing
+    /// `mix64`, in the generated `append` - see `trace::kernel::render`.
+    CellMix(u32, u8),
+    /// `AddW(a, b)` - 64-bit wrapping add, the row-key sum's accumulate step.
+    AddW,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -959,7 +969,7 @@ impl Graph {
                 // which is the only caller - and if something ever does,
                 // the honest answer is that this evaluator is the wrong
                 // tool rather than that the answer is top.
-                Op::Word(_) | Op::Bits | Op::Mix(..) => {
+                Op::Word(_) | Op::Bits | Op::Mix(..) | Op::CellMix(..) | Op::AddW => {
                     bail!("node {}: {:?} is a row-key node, not an abstract value", i, node.op)
                 }
                 })

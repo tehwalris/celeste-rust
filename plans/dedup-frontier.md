@@ -383,3 +383,41 @@ the win today" - the frozen frontier only pays once the EARLY CHECK exists).
   half-gated. The plan is written so the identity-NEUTRAL foundation (Step A:
   emit the SAME boundary key, upgrading the D1 bijection to equality) lands
   first and safely. Not started in code, deliberately.
+
+## Assumptions & decisions (continued, increment work 2026-08-27)
+
+- **A7 (landed, gated).** Increment (a): vectorized `cell_mix`
+  (`zw_cellmix_n/i/b` + `zw_add`, `zw_mix64`) in celeste-engine, byte-identical
+  to the scalar `cell_mix` across all seeds/cells/values/lanes
+  (`vector_cell_mix_agrees_with_the_scalar_definition`). Per-lane output
+  types are exactly Num/Ival/Bool-UBool (verified: every `Col::V` per-lane
+  push is Bool/UBool; no per-lane Ptr/Str/Nil in any room). Commit landed.
+- **A8 (decision).** Increment (b) design, to keep it BYTE-IDENTICAL and
+  gateable: the boundary key is `mix64(part + Σ_cells cell_mix)`, a
+  commutative sum split into UNIFORM cells (Col::U in the acc = the
+  `konst`-valued output fields + the OUT_UBOOL cells) and PER-LANE cells
+  (Col::N/V/I = the `konst.is_none()` fields). So: `lower.rs` emits the
+  PER-LANE sum (Op::CellMix + Op::AddW over the same non-const fields the
+  current key already folds); `render` (which has `f.outs[i].rt2`, the ubool
+  list and the shape hash) computes the per-outcome constant
+  `PART_i = shape_hash-base + Σ_uniform cell_mix` and emits the FINAL key in
+  `append` as `mix64(PART_i + sum)` (+ origin mix, which then matches the
+  boundary's origin mix exactly). Within a kernel the const cells are
+  constant, so the new key induces the SAME within-kernel partition as the
+  old partial key -> the RowSet dedup keeps the same rows -> byte-identical
+  outputs (differential gates this). The NEW property (key == boundary key)
+  is what Step B needs; gated separately.
+
+- **A9 (landed pending gate).** Increment (b)+(c): the emitter now emits the
+  SOUND full boundary key inline in every room's kernels. `transpile::graph`
+  gains `Op::CellMix(cell, half)` (additive per-cell `cell_mix` over the
+  VALUE) and `Op::AddW` (64-bit sum); `transpile::lower` folds the per-lane
+  cells into `kv.h1/h2` with these; `trace::kernel::render` computes the
+  per-outcome constant `KPART{1,2}_i` (via `outcome_part`, mirroring
+  `boundary_finish`'s uniform-cell sum) and closes the key in `append` as
+  `mix64(KPART + kv.h)` (+ origin mix on BOTH halves, matching the boundary).
+  Regenerated all rooms (`./regen-generated.sh`). Verified the emission:
+  `zw_cellmix_n(20, r_c20, 0x5bf03635)` etc. + `mix64(KPART1_0 + h1[i])`.
+  Byte-identical WITHIN a kernel (the const cells were already constant, so
+  the new key's within-kernel PARTITION is unchanged -> RowSet keeps the same
+  rows -> identical outputs). Gate: differentials + `check` + parcheck.

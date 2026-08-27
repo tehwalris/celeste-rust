@@ -34,7 +34,7 @@ use std::fmt::Write;
 
 use anyhow::{Context, Result};
 
-use celeste_engine::runtime2::{Cell2, Col, AV};
+use celeste_engine::runtime2::{cell_mix, Cell2, Col, AV};
 
 use super::emit::{Bound, Lowered};
 use super::verify::Frame;
@@ -59,6 +59,62 @@ fn row_ty(kind: &str) -> &'static str {
 }
 
 /// Render the kernel for one traced frame.
+/// The per-outcome CONSTANT prefix of the sound (full boundary) row key:
+/// `part1/part2 = shape_hash-base + Σ_{uniform acc cells} cell_mix(cell, av,
+/// seed)`. The PER-LANE cells (the `konst.is_none()` output fields) are summed
+/// at runtime by the graph (`Op::CellMix`); every other `Val` cell is a
+/// compile-time constant of the outcome's shape, so it folds here. This
+/// MIRRORS `Rt2::boundary_finish`'s `part1/part2` accumulation over the acc's
+/// `Col::U` `Val` cells - the acc being `build_block` (every `Val` cell
+/// `Col::U(Nil)`, pointer cells `Col::U(Ptr)`) with the konst fields set to
+/// their value and the OUT_UBOOL cells set to `UBool`.
+fn outcome_part(
+    rt2: &celeste_engine::runtime2::Rt2,
+    fields: &[OutField],
+    ubool: &[u32],
+) -> (u64, u64) {
+    use std::collections::HashSet;
+    let per_lane: HashSet<u32> =
+        fields.iter().filter(|f| f.konst.is_none()).map(|f| f.cell).collect();
+    let konst_cell: HashSet<u32> =
+        fields.iter().filter(|f| f.konst.is_some()).map(|f| f.cell).collect();
+    let ubool: HashSet<u32> = ubool.iter().copied().collect();
+    let shape_hash = rt2.shape_hash_of();
+    let mut part1: u64 = shape_hash;
+    let mut part2: u64 = 0xa076_1d64_78bd_642f ^ shape_hash;
+    for (c, cell) in rt2.structure.iter().enumerate() {
+        if !matches!(cell, Cell2::Val) {
+            continue;
+        }
+        let cu = c as u32;
+        if per_lane.contains(&cu) {
+            continue; // Col::N/V/I in the acc - summed per lane by the graph
+        }
+        let av = if ubool.contains(&cu) {
+            AV::UBool
+        } else if konst_cell.contains(&cu) {
+            // A konst field: the acc holds the traced value, which is what
+            // rt2 carries too (structure_of of the same state).
+            match rt2.cols[c] {
+                Col::U(v) => v,
+                ref other => panic!("konst cell {} not uniform: {:?}", c, other),
+            }
+        } else {
+            // Structural: the acc is build_block's default - a pointer where
+            // the shape has one, else Nil. (A concrete non-field cell would be
+            // a kernel that outputs Nil where it should not; the key gate
+            // catches that, so Nil here is the faithful acc value.)
+            match rt2.cols[c] {
+                Col::U(AV::Ptr(t)) => AV::Ptr(t),
+                _ => AV::Nil,
+            }
+        };
+        part1 = part1.wrapping_add(cell_mix(c as u64, av, 0x5bf0_3635));
+        part2 = part2.wrapping_add(cell_mix(c as u64, av, 0x27d4_eb2f));
+    }
+    (part1, part2)
+}
+
 pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> {
     let mut o = String::new();
 
@@ -465,6 +521,21 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
             i
         )?;
 
+        let (kpart1, kpart2) =
+            outcome_part(&f.outs[i].rt2, &out.fields, &f.outs[i].ubool_cells);
+        writeln!(
+            o,
+            "/// The SOUND (full boundary) row key's per-outcome CONSTANT\n\
+             /// prefix: shape hash + the uniform cells' `cell_mix` sum. The\n\
+             /// per-lane cells are summed by the graph into `kv.h1/h2`, and\n\
+             /// `append` closes the key with `mix64(KPART + kv.h)`, which is\n\
+             /// byte-identical to `Rt2::boundary`'s own row key.\n\
+             pub const KPART1_{i}: u64 = {kpart1};\n\
+             pub const KPART2_{i}: u64 = {kpart2};\n",
+            i = i,
+            kpart1 = kpart1,
+            kpart2 = kpart2,
+        )?;
         writeln!(
             o,
             "/// Append this assignment's lanes that TAKE outcome {i} and\n\
@@ -472,12 +543,11 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
              /// dropped here and belongs to the interpreter - the caller\n\
              /// has `kv.deopt` and must account for it.\n\
              /// SKIPS a row whose values another configuration already\n\
-             /// wrote. The key is over the non-constant cells only - the\n\
-             /// rest are one value for the whole accumulator and cannot\n\
-             /// tell two rows apart - so it is a handful of mixes rather\n\
-             /// than a hundred, computed from values already in\n\
-             /// registers. A duplicate caught here costs nothing; one\n\
-             /// caught at the boundary has already been written.\n\
+             /// wrote, by the SOUND full boundary key (`mix64(KPART + kv.h)`),\n\
+             /// so the dedup here is exactly the boundary's - computed from\n\
+             /// values already in registers before materializing the row.\n\
+             /// A duplicate caught here costs nothing; one caught at the\n\
+             /// boundary has already been written.\n\
              ///\n\
              /// 128-bit like the boundary's own key, because a collision\n\
              /// DROPS a successor rather than merely costing time.\n\
@@ -506,19 +576,25 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
              \x20       if take & (1 << i) == 0 {{ continue; }}",
             i = i
         )?;
-        // The key is FOLDED BY THE GRAPH now (`Op::Bits` / `Op::Mix`),
-        // 16 lanes at a time and with its button-independent prefix
-        // shared across every assignment. All that is left here is the
-        // table probe, which is inherently scalar: a hash table cannot
-        // be vectorized, and at ~2M probes it does not need to be.
+        // The per-lane cell_mix SUM is FOLDED BY THE GRAPH (`Op::CellMix` /
+        // `Op::AddW`), 16 lanes at a time, sharing the button-independent
+        // prefix across assignments. Here the key is CLOSED with the
+        // per-outcome constant prefix and the final `mix64` - exactly
+        // `Rt2::boundary`'s `mix64(part + h)` - plus the origin mix (both
+        // halves, as the boundary does). The table probe that follows is
+        // inherently scalar (~2M probes, does not need vectorizing).
         writeln!(
             o,
-            "        let key = if org.is_empty() {{ (h1[i], h2[i]) }} else {{\n\
+            "        let k0 = mix64(KPART1_{i}.wrapping_add(h1[i]));\n\
+             \x20       let k1 = mix64(KPART2_{i}.wrapping_add(h2[i]));\n\
+             \x20       let key = if org.is_empty() {{ (k0, k1) }} else {{\n\
              \x20           // mix64 is a bijection: same row, different\n\
              \x20           // origins can never collide.\n\
-             \x20           (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])\n\
+             \x20           let m = mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64);\n\
+             \x20           (mix64(k0 ^ m), mix64(k1 ^ m))\n\
              \x20       }};\n\
-             \x20       if !seen.insert(key) {{ continue; }}"
+             \x20       if !seen.insert(key) {{ continue; }}",
+            i = i
         )?;
         for OutField { cell, ty, tainted, konst, .. } in &out.fields {
             if konst.is_some() {
