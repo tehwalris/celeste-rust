@@ -253,10 +253,15 @@ fn run_traced_kernel(
     let mut accs: Vec<runtime2::Rt2> = (0..k.outcomes)
         .map(|i| (k.acc)(i, chunk.cart.clone(), chunk.cache.clone()))
         .collect();
+    // Option 1 (frozen-frontier check before materialize): the kernel
+    // skips materializing any output row whose key is already in the
+    // FROZEN frontier. Sub-step 1a wires the interface with a no-op;
+    // 1b passes a real probe over the frame-start (buffered) frontier.
+    let skip = |_key: (u64, u64)| false;
     let mut lo = 0usize;
     while lo < chunk.width {
         let n = kernel::W.min(chunk.width - lo);
-        let Some(declined) = (k.step)(chunk, lo, n, &mut accs, &mut seen) else {
+        let Some(declined) = (k.step)(chunk, lo, n, &mut accs, &mut seen, &skip) else {
             note_miss("traced", "bind", chunk.width);
             return false;
         };

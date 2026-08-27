@@ -560,6 +560,7 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
              pub fn append{i}(\n\
              \x20   acc: &mut Rt2, sh: &KShared{i}, kv: &KOut{i}, take: u16,\n\
              \x20   n: usize, seen: &mut RowSet, org: &[u32],\n\
+             \x20   skip: &dyn Fn((u64, u64)) -> bool,\n\
              ) -> u16 {{\n\
              \x20   // Returns the lanes actually WRITTEN, which is `take`\n\
              \x20   // minus the ones another configuration already wrote.\n\
@@ -593,7 +594,10 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
              \x20           let m = mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64);\n\
              \x20           (mix64(k0 ^ m), mix64(k1 ^ m))\n\
              \x20       }};\n\
-             \x20       if !seen.insert(key) {{ continue; }}",
+             \x20       if !seen.insert(key) {{ continue; }}\n\
+             \x20       // Option 1: a row already in the FROZEN frontier is a\n\
+             \x20       // cross-frame duplicate - skip materialization entirely.\n\
+             \x20       if skip(key) {{ continue; }}",
             i = i
         )?;
         for OutField { cell, ty, tainted, konst, .. } in &out.fields {
@@ -676,14 +680,14 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     // stops the run rather than falling back.
     writeln!(
         o,
-        "struct Append<'a> {{ accs: &'a mut [Rt2], seen: &'a mut [RowSet], n: usize, org: &'a [u32] }}\n"
+        "struct Append<'a> {{ accs: &'a mut [Rt2], seen: &'a mut [RowSet], n: usize, org: &'a [u32], skip: &'a dyn Fn((u64, u64)) -> bool }}\n"
     )?;
     writeln!(o, "impl<'a> Sink for Append<'a> {{")?;
     for i in 0..l.outs.len() {
         writeln!(
             o,
             "    fn o{i}(&mut self, _mask: u8, take: u16, sh: &KShared{i}, v: &KOut{i}) {{\n\
-             \x20       append{i}(&mut self.accs[{i}], sh, v, take, self.n, &mut self.seen[{i}], self.org);\n\
+             \x20       append{i}(&mut self.accs[{i}], sh, v, take, self.n, &mut self.seen[{i}], self.org, self.skip);\n\
              \x20   }}",
             i = i
         )?;
@@ -693,6 +697,7 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
         o,
         "pub fn step(\n\
          \x20   b: &Rt2, lo: usize, n: usize, accs: &mut [Rt2], seen: &mut [RowSet],\n\
+         \x20   skip: &dyn Fn((u64, u64)) -> bool,\n\
          ) -> Option<u16> {{\n\
          \x20   let (u, s) = bind(b)?;\n\
          \x20   let rin = rows(b, &s, lo)?;\n\
@@ -705,7 +710,7 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
          \x20   // Engine-carried origin metadata for this slice's lanes\n\
          \x20   // (empty = untracked); see `Rt2::origin`.\n\
          \x20   let org: &[u32] = if b.origin.is_empty() {{ &[] }} else {{ &b.origin[lo..lo + n] }};\n\
-         \x20   let mut sink = Append {{ accs, seen, n, org }};\n\
+         \x20   let mut sink = Append {{ accs, seen, n, org, skip }};\n\
          \x20   Some(frame(&u, &rin, &g, &mut sink))\n\
          }}\n"
     )?;

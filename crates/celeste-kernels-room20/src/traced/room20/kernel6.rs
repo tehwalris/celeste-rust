@@ -4212,6 +4212,7 @@ pub const KPART2_0: u64 = 12031228013755287347;
 pub fn append0(
     acc: &mut Rt2, sh: &KShared0, kv: &KOut0, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -4235,6 +4236,9 @@ pub fn append0(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(sh.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
@@ -4385,6 +4389,7 @@ pub const KPART2_1: u64 = 2994703861201136931;
 pub fn append1(
     acc: &mut Rt2, sh: &KShared1, kv: &KOut1, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -4408,6 +4413,9 @@ pub fn append1(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
             v.push(if kv.c41.known & (1 << i) != 0 {
@@ -4738,6 +4746,7 @@ pub const KPART2_2: u64 = 298611435258291118;
 pub fn append2(
     acc: &mut Rt2, sh: &KShared2, kv: &KOut2, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -4761,6 +4770,9 @@ pub fn append2(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(sh.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[38] {
@@ -4904,6 +4916,7 @@ pub const KPART2_3: u64 = 17990197863674698660;
 pub fn append3(
     acc: &mut Rt2, sh: &KShared3, kv: &KOut3, take: u16,
     n: usize, seen: &mut RowSet, org: &[u32],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -4927,6 +4940,9 @@ pub fn append3(
             (mix64(k0 ^ m), mix64(k1 ^ m))
         };
         if !seen.insert(key) { continue; }
+        // Option 1: a row already in the FROZEN frontier is a
+        // cross-frame duplicate - skip materialization entirely.
+        if skip(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(sh.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(sh.c20.lane(i)); }
         if let Col::N(v) = &mut acc.cols[241] { v.push(sh.c241.lane(i)); }
@@ -4964,25 +4980,26 @@ pub fn out_slots(i: usize) -> &'static [(u32, &'static str)] {
     }
 }
 
-struct Append<'a> { accs: &'a mut [Rt2], seen: &'a mut [RowSet], n: usize, org: &'a [u32] }
+struct Append<'a> { accs: &'a mut [Rt2], seen: &'a mut [RowSet], n: usize, org: &'a [u32], skip: &'a dyn Fn((u64, u64)) -> bool }
 
 impl<'a> Sink for Append<'a> {
     fn o0(&mut self, _mask: u8, take: u16, sh: &KShared0, v: &KOut0) {
-        append0(&mut self.accs[0], sh, v, take, self.n, &mut self.seen[0], self.org);
+        append0(&mut self.accs[0], sh, v, take, self.n, &mut self.seen[0], self.org, self.skip);
     }
     fn o1(&mut self, _mask: u8, take: u16, sh: &KShared1, v: &KOut1) {
-        append1(&mut self.accs[1], sh, v, take, self.n, &mut self.seen[1], self.org);
+        append1(&mut self.accs[1], sh, v, take, self.n, &mut self.seen[1], self.org, self.skip);
     }
     fn o2(&mut self, _mask: u8, take: u16, sh: &KShared2, v: &KOut2) {
-        append2(&mut self.accs[2], sh, v, take, self.n, &mut self.seen[2], self.org);
+        append2(&mut self.accs[2], sh, v, take, self.n, &mut self.seen[2], self.org, self.skip);
     }
     fn o3(&mut self, _mask: u8, take: u16, sh: &KShared3, v: &KOut3) {
-        append3(&mut self.accs[3], sh, v, take, self.n, &mut self.seen[3], self.org);
+        append3(&mut self.accs[3], sh, v, take, self.n, &mut self.seen[3], self.org, self.skip);
     }
 }
 
 pub fn step(
     b: &Rt2, lo: usize, n: usize, accs: &mut [Rt2], seen: &mut [RowSet],
+    skip: &dyn Fn((u64, u64)) -> bool,
 ) -> Option<u16> {
     let (u, s) = bind(b)?;
     let rin = rows(b, &s, lo)?;
@@ -4995,7 +5012,7 @@ pub fn step(
     // Engine-carried origin metadata for this slice's lanes
     // (empty = untracked); see `Rt2::origin`.
     let org: &[u32] = if b.origin.is_empty() { &[] } else { &b.origin[lo..lo + n] };
-    let mut sink = Append { accs, seen, n, org };
+    let mut sink = Append { accs, seen, n, org, skip };
     Some(frame(&u, &rin, &g, &mut sink))
 }
 
