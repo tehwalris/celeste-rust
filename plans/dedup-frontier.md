@@ -559,3 +559,49 @@ Scope of the remaining work (not done - reported for a go/no-go):
   byte-identical under the new key, KROWS drop = the ~45%-of-offered
   frozen-frontier occurrences (per the quadrant census), measured `run`-phase
   drop.
+
+## Option 1 unified engine key — carry landed, but a b+c VALUE-EQUALITY gap blocks the skip (2026-08-27)
+
+Implemented the coordinator's plan: the compiled forward path now CARRIES the
+engine key (`b.row_keys`) out-of-band to the frontier (thread-local
+`CARRIED_KEYS`, filled by `CompiledForward::run_chunk`, read by the streaming
+worker) instead of re-hashing interpreter keys; `stream_boundary_prepare` uses
+the carried keys. Gated on `CELESTE_FRONTIER_SKIP` (Option 1 == engine-keyed
+frontier). Off by default -> byte-identical (differential green,
+`traced_kernels_reproduce_the_interpreter` passes; the clone is skipped when
+off, so it is also free).
+
+MEASURED (room10 frontier-only+buffered, `--frames 40`, engine-keyed ON):
+- Reachable set BYTE-IDENTICAL to OFF, every frame (engine-keyed frontier =
+  same partition, D1 bijection - confirmed end to end).
+- The kernel skip PROBES the frontier now (f40: 1,650,698 probes) - the carry
+  works and the frontier is engine-keyed.
+- **But 0 HITS, KROWS unchanged (71,913,505).** The kernel's probe key
+  `mix64(KPART + h)` (from b+c) is only PARTITION-equal to the carried
+  `b.row_keys`, NOT value-equal: two labelings of the same partition, so the
+  engine-key probe never finds the engine-key it is looking for.
+
+Root cause: b+c's "kernel key == boundary key" was gated only by the
+partition (the differential), never by VALUE. The values diverge because
+`Rt2::boundary` computes `b.row_keys` AFTER the level-0 WIDEN (rem -> Bits(0)),
+while the kernel keys the RAW output values. Carrying the raw kernel key
+instead is UNSOUND cross-frame: the next frame re-imports the (widened) state
+and computes a widened key, so the same state would get two different keys and
+the frontier would not dedup it across frames. So the frontier MUST use the
+widened boundary key, and therefore the KERNEL must compute its probe key on
+WIDENED values to match.
+
+**The fix (next increment): close b+c's value-equality gap** - the key emitter
+must apply the boundary's level-0 widening (rem -> Bits(0), and any other
+widened cell) to the per-lane values BEFORE the `cell_mix`, so
+`mix64(KPART + h)` == `Rt2::boundary`'s `b.row_keys` byte-for-byte. Then the
+carried frontier key and the kernel probe key are the same value and the skip
+hits (expected ~45% of offered materialization per the quadrant census).
+Requires the key-emission path in `transpile::lower` / `trace::kernel` to know
+which output cells the boundary widens and how - coupling the key to the
+widening. Non-trivial; a real emitter change + full regen + a NEW gate that
+asserts kernel key == `b.row_keys` VALUE (native-probe, per row), which is the
+gate b+c should have had. Flagged for go-ahead.
+
+Everything is committed gated (off = byte-identical); the carry + probe
+machinery is in place and waiting for the value-equal key.

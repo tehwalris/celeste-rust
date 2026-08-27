@@ -458,7 +458,7 @@ fn stream_boundary_one(
     visited: &mut crate::interpreter::visited::Visited,
     counters: &mut StreamCounters,
 ) -> Result<Vec<State>> {
-    let prepared = stream_boundary_prepare(state, band, frame, counters, visited, true)?;
+    let prepared = stream_boundary_prepare(state, band, frame, counters, visited, true, None)?;
     Ok(stream_boundary_subtract(prepared, visited, counters))
 }
 
@@ -484,10 +484,24 @@ fn stream_boundary_prepare(
     counters: &mut StreamCounters,
     visited: &crate::interpreter::visited::Visited,
     filter_now: bool,
+    // ENGINE keys carried from the compiled body (Option 1). `Some` => the
+    // frontier is engine-keyed and these ARE the per-lane keys, so the
+    // interpreter re-hash is skipped. Only supported when the state does not
+    // rung-split (level 0, which is where Option 1 runs) and the partitioned
+    // filter is on.
+    carried: Option<Vec<(u64, u64)>>,
 ) -> Result<Vec<PreparedRows>> {
     let mut kept_out = Vec::new();
     let t_abs = std::time::Instant::now();
     let split = crate::interpreter::abstraction::split_precision_straddles(state);
+    if carried.is_some() {
+        assert_eq!(
+            split.len(),
+            1,
+            "engine-keyed frontier (Option 1) does not support a rung split; run level 0"
+        );
+        assert!(!filter_now, "engine-keyed frontier needs the partitioned filter");
+    }
     let mut abs_ns = t_abs.elapsed().as_nanos() as u64;
     for state in split {
         let t_abs = std::time::Instant::now();
@@ -608,7 +622,18 @@ fn stream_boundary_prepare(
         // per-lane cache miss lives, and it needs only `&RowTable`, so it
         // belongs on this side of the parallel/serial line.
         let t_keys = std::time::Instant::now();
-        let keys = if filter_now {
+        let keys = if let Some(ck) = &carried {
+            // Engine keys carried from the compiled body: the frontier is
+            // engine-keyed, so use them directly (no interpreter re-hash).
+            assert_eq!(
+                ck.len(),
+                state.vector_size,
+                "carried engine keys ({}) != lanes ({}) after abstraction",
+                ck.len(),
+                state.vector_size
+            );
+            PreparedKeys::Raw(Some(ck.clone()))
+        } else if filter_now {
             PreparedKeys::Filtered(crate::interpreter::vectorize::visited_row_keys(
                 &state, visited,
             ))
@@ -650,6 +675,34 @@ enum PreparedKeys {
 fn frontier_skip_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CELESTE_FRONTIER_SKIP").is_some())
+}
+
+thread_local! {
+    /// Per-output-state ENGINE row keys stashed by `CompiledForward::run_chunk`
+    /// and consumed by the streaming worker on the SAME thread immediately
+    /// after `interpret_state_base` returns (Option 1's engine-keyed frontier).
+    /// `Some(keys)` = engine keys carried from a kernel/merged block; `None` =
+    /// an interpreter/fallback state that takes the interpreter key path.
+    static CARRIED_KEYS: std::cell::RefCell<Vec<Option<Vec<(u64, u64)>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn set_carried_keys(keys: Vec<Option<Vec<(u64, u64)>>>) {
+    CARRIED_KEYS.with(|c| *c.borrow_mut() = keys);
+}
+
+/// Take (and clear) the keys stashed for the just-produced outputs. Returns
+/// empty when the frame body did not carry any (interpreter/deopt path).
+fn take_carried_keys() -> Vec<Option<Vec<(u64, u64)>>> {
+    CARRIED_KEYS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// Whether the compiled forward path keys the frontier by the ENGINE key it
+/// carries (Option 1). Tied to the frontier-skip flag: the skip needs the
+/// frontier in the kernel's own key space, and vice-versa the carried key is
+/// only useful once the kernel probes it.
+fn engine_keyed_frontier() -> bool {
+    frontier_skip_on()
 }
 
 fn partitioned_filter_on() -> bool {
@@ -1177,7 +1230,15 @@ impl CompiledForward {
         state: State,
     ) -> Result<Vec<State>> {
         if !self.check {
-            return Ok(self.engine.run_frame_chunk(&state, Some((frame_cfg, fixed_env))));
+            // Carry the engine keys (b.row_keys) out-of-band so the frontier is
+            // ENGINE-keyed (Option 1) without threading them through every
+            // interpret/variant/deopt path: the worker reads them right after
+            // this returns, on the same thread. See `take_carried_keys`.
+            let keyed = self.engine.run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
+            let (states, keys): (Vec<State>, Vec<Option<Vec<(u64, u64)>>>) =
+                keyed.into_iter().unzip();
+            set_carried_keys(keys);
+            return Ok(states);
         }
         let reference: Vec<State> = interpret_prepared_cfg(frame_cfg, state.clone(), fixed_env)
             .context("frame failed (compiled-forward check: reference side)")?
@@ -1185,6 +1246,7 @@ impl CompiledForward {
             .map(|(s, _)| s)
             .collect();
         let got = self.engine.run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
+        let got_states: Vec<State> = got.iter().map(|(s, _)| s.clone()).collect();
         // The comparator must compare AT THE CONFIGURED RUNG's
         // abstraction. `FrameEngine::row_key_set` funnels through
         // `Rt2::boundary`, which widens at Bits(0) - fine (and cheap)
@@ -1200,12 +1262,12 @@ impl CompiledForward {
             crate::interpreter::abstraction::rem_precision_from_env()
                 == crate::interpreter::abstraction::RemPrecision::Bits(0);
         let (want_keys, got_keys) = if level0 {
-            (self.engine.row_key_set(&reference), self.engine.row_key_set(&got))
+            (self.engine.row_key_set(&reference), self.engine.row_key_set(&got_states))
         } else {
             (
                 rung_row_key_set(&reference)
                     .context("rung-abstracting the reference side of the check")?,
-                rung_row_key_set(&got)
+                rung_row_key_set(&got_states)
                     .context("rung-abstracting the compiled side of the check")?,
             )
         };
@@ -1248,6 +1310,9 @@ impl CompiledForward {
         // pathology cannot compound across frames or contaminate the
         // reference it is being judged against.
         drop(got);
+        // Check mode carries the interpreter's reference states forward (see
+        // above); they take the interpreter key path (None carried) downstream.
+        set_carried_keys(vec![None; reference.len()]);
         Ok(reference)
     }
 }
@@ -1862,9 +1927,18 @@ impl AbstractRun {
                                     pos_obs, compiled,
                                 )?;
                                 drop(_fg);
+                                // Engine keys the compiled body carried for these
+                                // outputs (Option 1). Empty on the interpreter path.
+                                let carried = take_carried_keys();
+                                let use_carried = engine_keyed_frontier() && !carried.is_empty();
                                 let t1 = std::time::Instant::now();
                                 let mut prepared = Vec::new();
-                                for out in outputs {
+                                for (oi, out) in outputs.into_iter().enumerate() {
+                                    let ck = if use_carried {
+                                        carried.get(oi).cloned().flatten()
+                                    } else {
+                                        None
+                                    };
                                     prepared.extend(stream_boundary_prepare(
                                         out,
                                         band,
@@ -1872,6 +1946,7 @@ impl AbstractRun {
                                         &mut sc,
                                         visited_ro,
                                         !partitioned,
+                                        ck,
                                     )?);
                                 }
                                 add_worker_ns(WORKER_BODY, (t1 - t0).as_nanos() as u64);
@@ -2396,6 +2471,12 @@ impl AbstractRun {
                  genuinely new {}",
                 opt1, pct(opt1, dups), pct(opt1, total), ny, pct(ny, dups), nn
             );
+        }
+        if frontier_skip_on() {
+            let probes = crate::compiled::dispatch::FRONTIER_PROBES.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let hits = crate::compiled::dispatch::FRONTIER_HITS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let none = crate::compiled::dispatch::FRONTIER_NONE.swap(0, std::sync::atomic::Ordering::Relaxed);
+            println!("  frontier skip: {} probes ({} thread-local-unset), {} hits", probes, none, hits);
         }
         let visited = self.visited_rows.as_mut().expect("stream implies visited");
         visited.end_frame()?;

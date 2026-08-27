@@ -19,6 +19,24 @@ use anyhow::Result;
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_engine::runtime2;
+
+/// An output state plus the ENGINE row key of each of its lanes (`Rt2::boundary`'s
+/// `row_keys`), when the state came off a kernel/merged block. `None` marks an
+/// interpreter-fallback state, whose engine key the boundary derives downstream.
+/// This is how the compiled forward path keeps the frontier ENGINE-keyed - the
+/// same key the kernels emit and probe (Option 1) - and drops the redundant
+/// interpreter re-hash.
+pub type KeyedState = (crate::interpreter::state::State, Option<Vec<(u64, u64)>>);
+
+/// Whether the compiled forward path carries the engine key to the frontier
+/// (Option 1). Off (default) skips the per-block key clone entirely, so the
+/// path is byte-identical AND free relative to before. Reads the same env as
+/// `search::run::frontier_skip_on` - the skip and the engine-keyed frontier
+/// are one feature.
+fn engine_keyed_frontier_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_FRONTIER_SKIP").is_some())
+}
 // The engine's hasher, not celeste-rust's. rustc-hash 1 and 2 hash
 // differently and this crate is still on 1; the row machinery's maps
 // belong to the engine, so they use the engine's.
@@ -450,7 +468,7 @@ impl FrameEngine {
             &crate::interpreter::fixed_env::PreparedCfg,
             &crate::interpreter::fixed_env::FixedEnv,
         )>,
-    ) -> Vec<crate::interpreter::state::State> {
+    ) -> Vec<KeyedState> {
         let mut t = ChunkTimer::start();
         // An origin-tagged chunk (the backward sweep, the pos-graph
         // recorder): the per-lane tag global becomes engine metadata for
@@ -473,7 +491,11 @@ impl FrameEngine {
         t.mark(CHUNK_PARTITION);
         let use_kernel = use_kernel();
         let mut done: Vec<runtime2::Rt2> = Vec::new();
-        let mut out: Vec<crate::interpreter::state::State> = Vec::new();
+        // Each output state carries its ENGINE row keys (`b.row_keys`) when it
+        // came off a kernel/merged block, so the forward frontier is engine-keyed
+        // (Option 1) and the redundant re-hash is dropped. `None` = an
+        // interpreter-fallback state whose engine key must be derived downstream.
+        let mut out: Vec<KeyedState> = Vec::new();
         // DISPATCH EVERY CHUNK BEFORE INTERPRETING ANY. A premise failure
         // in `interpret_block` panics out of the whole state, and with the
         // interleaved loop that panic landed before the remaining chunks
@@ -544,7 +566,7 @@ impl FrameEngine {
                     Ok(states) => {
                         t.mark(CHUNK_RUN);
                         t.mark(CHUNK_MERGE);
-                        return states;
+                        return states.into_iter().map(|s| (s, None)).collect();
                     }
                     Err(e) => {
                         // The campaign's own premises fail on this state:
@@ -564,7 +586,7 @@ impl FrameEngine {
                 if self.plain.is_none() {
                     // The strict path (no plain program registered): the
                     // compile program, loudly fatal on a premise failure.
-                    out.extend(self.interpret_block(block, origin_tag));
+                    out.extend(self.interpret_block(block, origin_tag).into_iter().map(|s| (s, None)));
                     continue;
                 }
                 let plain = self.plain.as_ref().unwrap();
@@ -572,19 +594,19 @@ impl FrameEngine {
                     // No campaign cfg (native-probe harnesses): the
                     // compile program per chunk, plain on failure.
                     match self.try_interpret_block(&block, origin_tag) {
-                        Ok(states) => out.extend(states),
+                        Ok(states) => out.extend(states.into_iter().map(|s| (s, None))),
                         Err(e) => {
                             deopt_note(&format!(
                                 "engine chunk -> plain ({} lanes): {:#}",
                                 block.width, e
                             ));
-                            out.extend(self.plain_block(plain, block, origin_tag));
+                            out.extend(self.plain_block(plain, block, origin_tag).into_iter().map(|s| (s, None)));
                         }
                     }
                 } else {
                     // A kernel's deopt sub-chunk fails the compile
                     // program's premises by construction.
-                    out.extend(self.plain_block(plain, block, origin_tag));
+                    out.extend(self.plain_block(plain, block, origin_tag).into_iter().map(|s| (s, None)));
                 }
             }
         }
@@ -602,7 +624,12 @@ impl FrameEngine {
         let keeps = Self::dedup_keeps_serial(&done);
         let merged = self.regroup_and_merge(done, keeps, &mut |_| {});
         t.mark(CHUNK_MERGE);
-        out.extend(merged.iter().map(|b| export_block_tagged(b, origin_tag)));
+        out.extend(
+            merged.iter().map(|b| {
+                let keys = engine_keyed_frontier_on().then(|| b.row_keys.clone());
+                (export_block_tagged(b, origin_tag), keys)
+            }),
+        );
         t.mark(CHUNK_EXPORT);
         out
     }
