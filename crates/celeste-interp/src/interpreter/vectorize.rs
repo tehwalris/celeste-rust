@@ -9,15 +9,14 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-
 use super::{
     heap::{Heap, HeapId},
     local_env::LocalEnv,
     state::State,
     value::{HeapValue, MaybeVector, Value},
 };
-use celeste_ir::ir::GlobalId;
 use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
+use celeste_ir::ir::GlobalId;
 
 /// A "shape" is a state with all vectorizable values normalized to placeholder values.
 /// States with the same shape can be merged by vectorizing their values.
@@ -131,12 +130,10 @@ fn normalize_heap_value_for_shape(value: &HeapValue) -> HeapValueShape {
         }
         HeapValue::ArrayTable(items) => HeapValueShape::ArrayTable(items.clone()),
         HeapValue::UnknownTable => HeapValueShape::UnknownTable,
-        HeapValue::Closure(id, captures) => {
-            HeapValueShape::Closure(
-                id.clone(),
-                captures.iter().map(normalize_value_for_shape).collect(),
-            )
-        }
+        HeapValue::Closure(id, captures) => HeapValueShape::Closure(
+            id.clone(),
+            captures.iter().map(normalize_value_for_shape).collect(),
+        ),
         HeapValue::BuiltinFun(name) => HeapValueShape::BuiltinFun(name.clone()),
     }
 }
@@ -316,7 +313,8 @@ fn vectorize_same_shape_states(states: Vec<State>) -> State {
 }
 
 fn merge_heap_values_from_states(states: &[State], id: HeapId) -> HeapValue {
-    let values: Vec<_> = states.iter()
+    let values: Vec<_> = states
+        .iter()
         .map(|s| (s.heap.get(id).clone(), s.vector_size))
         .collect();
 
@@ -328,12 +326,11 @@ fn merge_heap_values(values: &[(HeapValue, usize)]) -> HeapValue {
 
     match first_value {
         HeapValue::Value(_) => {
-            let value_and_sizes: Vec<_> = values.iter()
-                .map(|(hv, size)| {
-                    match hv {
-                        HeapValue::Value(v) => (v.clone(), *size),
-                        _ => panic!("Shape mismatch"),
-                    }
+            let value_and_sizes: Vec<_> = values
+                .iter()
+                .map(|(hv, size)| match hv {
+                    HeapValue::Value(v) => (v.clone(), *size),
+                    _ => panic!("Shape mismatch"),
                 })
                 .collect();
             HeapValue::Value(merge_values(&value_and_sizes))
@@ -349,12 +346,11 @@ fn merge_heap_values(values: &[(HeapValue, usize)]) -> HeapValue {
             let num_captures = captures.len();
             let merged_captures: Vec<Value> = (0..num_captures)
                 .map(|i| {
-                    let capture_values: Vec<_> = values.iter()
-                        .map(|(hv, size)| {
-                            match hv {
-                                HeapValue::Closure(_, caps) => (caps[i].clone(), *size),
-                                _ => panic!("Shape mismatch"),
-                            }
+                    let capture_values: Vec<_> = values
+                        .iter()
+                        .map(|(hv, size)| match hv {
+                            HeapValue::Closure(_, caps) => (caps[i].clone(), *size),
+                            _ => panic!("Shape mismatch"),
                         })
                         .collect();
                     merge_values(&capture_values)
@@ -434,13 +430,18 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             // Get reference value for comparison
             let ref_val = match &values[0].0 {
                 Value::NumberInterval(MaybeVector::Scalar(n)) => Some(*n),
-                Value::NumberInterval(MaybeVector::Vector(nums)) if !nums.is_empty() => Some(nums[0]),
+                Value::NumberInterval(MaybeVector::Vector(nums)) if !nums.is_empty() => {
+                    Some(nums[0])
+                }
                 _ => None,
             };
 
             let mut result = Vec::with_capacity(total_size);
             let mut all_same = ref_val.is_some();
-            let ref_val = ref_val.unwrap_or(Pico8NumInterval::new(Pico8Num::from_i16(0), Pico8Num::from_i16(0)));
+            let ref_val = ref_val.unwrap_or(Pico8NumInterval::new(
+                Pico8Num::from_i16(0),
+                Pico8Num::from_i16(0),
+            ));
 
             for (v, size) in values {
                 match v {
@@ -526,7 +527,8 @@ where
     // Positional: all these states are at the same program point, so slot N
     // holds the same logical value in each of them.
     for (slot, _) in first_env.iter() {
-        let value_and_sizes: Vec<_> = states.iter()
+        let value_and_sizes: Vec<_> = states
+            .iter()
             .map(|s| (get_env(s).get_by_raw_id(slot).clone(), s.vector_size))
             .collect();
         let merged_value = merge_values(&value_and_sizes);
@@ -797,7 +799,6 @@ fn dedup_vectorized_state(mut state: State) -> State {
     let row_hashes = hash_rows(&vector_values, state.vector_size);
     let (mask, unique_count) = bucket_unique_mask(&vector_values, &row_hashes);
 
-
     if unique_count == state.vector_size {
         // No duplicates found
         return state;
@@ -923,25 +924,49 @@ pub fn assert_state_vector_lengths(state: &State) {
         };
         match heap_value {
             HeapValue::Value(Value::Number(MaybeVector::Vector(v))) => {
-                assert_eq!(v.len(), expected_len, "Vector length mismatch in heap (numbers)");
+                assert_eq!(
+                    v.len(),
+                    expected_len,
+                    "Vector length mismatch in heap (numbers)"
+                );
             }
             HeapValue::Value(Value::NumberInterval(MaybeVector::Vector(v))) => {
-                assert_eq!(v.len(), expected_len, "Vector length mismatch in heap (number intervals)");
+                assert_eq!(
+                    v.len(),
+                    expected_len,
+                    "Vector length mismatch in heap (number intervals)"
+                );
             }
             HeapValue::Value(Value::Bool(MaybeVector::Vector(v))) => {
-                assert_eq!(v.len(), expected_len, "Vector length mismatch in heap (bools)");
+                assert_eq!(
+                    v.len(),
+                    expected_len,
+                    "Vector length mismatch in heap (bools)"
+                );
             }
             HeapValue::Closure(_, captures) => {
                 for cap in captures {
                     match cap {
                         Value::Number(MaybeVector::Vector(v)) => {
-                            assert_eq!(v.len(), expected_len, "Vector length mismatch in closure (numbers)");
+                            assert_eq!(
+                                v.len(),
+                                expected_len,
+                                "Vector length mismatch in closure (numbers)"
+                            );
                         }
                         Value::NumberInterval(MaybeVector::Vector(v)) => {
-                            assert_eq!(v.len(), expected_len, "Vector length mismatch in closure (number intervals)");
+                            assert_eq!(
+                                v.len(),
+                                expected_len,
+                                "Vector length mismatch in closure (number intervals)"
+                            );
                         }
                         Value::Bool(MaybeVector::Vector(v)) => {
-                            assert_eq!(v.len(), expected_len, "Vector length mismatch in closure (bools)");
+                            assert_eq!(
+                                v.len(),
+                                expected_len,
+                                "Vector length mismatch in closure (bools)"
+                            );
                         }
                         _ => {}
                     }
@@ -955,13 +980,25 @@ pub fn assert_state_vector_lengths(state: &State) {
     for (_, v) in state.local_env.iter() {
         match v {
             Value::Number(MaybeVector::Vector(vec)) => {
-                assert_eq!(vec.len(), expected_len, "Vector length mismatch in local_env (numbers)");
+                assert_eq!(
+                    vec.len(),
+                    expected_len,
+                    "Vector length mismatch in local_env (numbers)"
+                );
             }
             Value::NumberInterval(MaybeVector::Vector(vec)) => {
-                assert_eq!(vec.len(), expected_len, "Vector length mismatch in local_env (number intervals)");
+                assert_eq!(
+                    vec.len(),
+                    expected_len,
+                    "Vector length mismatch in local_env (number intervals)"
+                );
             }
             Value::Bool(MaybeVector::Vector(vec)) => {
-                assert_eq!(vec.len(), expected_len, "Vector length mismatch in local_env (bools)");
+                assert_eq!(
+                    vec.len(),
+                    expected_len,
+                    "Vector length mismatch in local_env (bools)"
+                );
             }
             _ => {}
         }
@@ -972,13 +1009,25 @@ pub fn assert_state_vector_lengths(state: &State) {
         for (_, v) in env.iter() {
             match v {
                 Value::Number(MaybeVector::Vector(nums)) => {
-                    assert_eq!(nums.len(), expected_len, "Vector length mismatch in outer_local_env (numbers)");
+                    assert_eq!(
+                        nums.len(),
+                        expected_len,
+                        "Vector length mismatch in outer_local_env (numbers)"
+                    );
                 }
                 Value::NumberInterval(MaybeVector::Vector(nums)) => {
-                    assert_eq!(nums.len(), expected_len, "Vector length mismatch in outer_local_env (number intervals)");
+                    assert_eq!(
+                        nums.len(),
+                        expected_len,
+                        "Vector length mismatch in outer_local_env (number intervals)"
+                    );
                 }
                 Value::Bool(MaybeVector::Vector(bools)) => {
-                    assert_eq!(bools.len(), expected_len, "Vector length mismatch in outer_local_env (bools)");
+                    assert_eq!(
+                        bools.len(),
+                        expected_len,
+                        "Vector length mismatch in outer_local_env (bools)"
+                    );
                 }
                 _ => {}
             }
@@ -1023,13 +1072,16 @@ fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
     }
     let common_slots: FxHashSet<usize> = common.iter().map(|(slot, _)| *slot).collect();
 
-    states.into_iter().map(|mut state| {
-        let slots = std::sync::Arc::clone(state.local_env.slots());
-        state
-            .local_env
-            .retain(|id: LocalId| common_slots.contains(&slots.slot_of(id)));
-        state
-    }).collect()
+    states
+        .into_iter()
+        .map(|mut state| {
+            let slots = std::sync::Arc::clone(state.local_env.slots());
+            state
+                .local_env
+                .retain(|id: LocalId| common_slots.contains(&slots.slot_of(id)));
+            state
+        })
+        .collect()
 }
 
 /// Vectorize a collection of states.
@@ -1627,7 +1679,8 @@ pub fn visited_row_keys(
                                 crate::interpreter::virtual_merge::Piece::Slice(sl) => sl[i],
                                 crate::interpreter::virtual_merge::Piece::Scalar(v, _) => *v,
                             };
-                            let _ = write!(line, " i{},{}", v.low.as_raw_u32(), v.high.as_raw_u32());
+                            let _ =
+                                write!(line, " i{},{}", v.low.as_raw_u32(), v.high.as_raw_u32());
                         }
                     }
                 }
@@ -1706,9 +1759,9 @@ pub fn subtract_apply(state: State, survivors: Survivors) -> Option<State> {
     match survivors {
         Survivors::All => Some(state),
         Survivors::Some(kept) if kept.is_empty() => None,
-        Survivors::Some(kept) => Some(
-            state.filter_by_kept_clone(&kept, crate::interpreter::state::FILTER_VISITED),
-        ),
+        Survivors::Some(kept) => {
+            Some(state.filter_by_kept_clone(&kept, crate::interpreter::state::FILTER_VISITED))
+        }
     }
 }
 
@@ -1740,7 +1793,13 @@ pub fn subtract_precomputed(
 pub fn gc_states(states: Vec<State>) -> Vec<State> {
     let threads = crate::interpreter::virtual_merge::merge_threads();
     if states.len() < 8 || threads == 1 {
-        states.into_iter().map(|mut s| { s.gc(); s }).collect()
+        states
+            .into_iter()
+            .map(|mut s| {
+                s.gc();
+                s
+            })
+            .collect()
     } else {
         let mut states = states;
         let chunk = states.len().div_ceil(threads);
@@ -1833,9 +1892,8 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
                                 .map(|state| {
                                     (
                                         shape_of_state(state),
-                                        partition_class(state, partition_cells).expect(
-                                            "partition-varying states were split above",
-                                        ),
+                                        partition_class(state, partition_cells)
+                                            .expect("partition-varying states were split above"),
                                     )
                                 })
                                 .collect::<Vec<_>>()
@@ -1854,28 +1912,63 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     stats.shape_grouping_ns = t2.elapsed().as_nanos() as u64;
     stats.group_count = states_by_shape.len();
 
-
-    // Vectorize each group
+    // Vectorize each group. Each shape group is INDEPENDENT, so the merges
+    // run across threads (work-stolen from a shared queue, since group sizes
+    // are very uneven - up to ~349 fragments in one group). Output order is
+    // the original group order (results carry their index and are sorted
+    // back), so this is byte-identical to the sequential map regardless of
+    // finish order (parcheck holds it). Nested fan-out is disabled: each
+    // worker IS the parallelism, so the hashing inside must not fan out.
     let t3 = std::time::Instant::now();
+    let merge_one = |group: Vec<State>| -> State {
+        if group.len() > 1 {
+            // Merge + dedup over the virtual concatenation - never
+            // materialises the pre-dedup table. Produces the same state as
+            // the materialised pipeline below (a test holds them equal); the
+            // fallback covers group shapes the column collection cannot
+            // represent.
+            if let Some(state) = super::virtual_merge::merge_dedup_group(&group) {
+                return state;
+            }
+        }
+        let vectorized = vectorize_same_shape_states(group);
+        let deduped = dedup_vectorized_state(vectorized);
+        unvectorize_if_possible(deduped)
+    };
     let result: Vec<State> = {
-        states_by_shape
-            .into_iter()
-            .map(|(_, group)| {
-                if group.len() > 1 {
-                    // Merge + dedup over the virtual concatenation - never
-                    // materialises the pre-dedup table. Produces the same
-                    // state as the materialised pipeline below (a test
-                    // holds them equal); the fallback covers group shapes
-                    // the column collection cannot represent.
-                    if let Some(state) = super::virtual_merge::merge_dedup_group(&group) {
-                        return state;
-                    }
-                }
-                let vectorized = vectorize_same_shape_states(group);
-                let deduped = dedup_vectorized_state(vectorized);
-                unvectorize_if_possible(deduped)
-            })
-            .collect()
+        let groups: Vec<Vec<State>> = states_by_shape.into_values().collect();
+        let threads = super::virtual_merge::merge_threads();
+        if groups.len() < 2 || threads == 1 {
+            groups.into_iter().map(merge_one).collect()
+        } else {
+            let queue = std::sync::Mutex::new(groups.into_iter().enumerate());
+            let queue = &queue;
+            let merge_one = &merge_one;
+            let mut out: Vec<(usize, State)> = std::thread::scope(|scope| {
+                (0..threads)
+                    .map(|_| {
+                        scope.spawn(move || {
+                            super::virtual_merge::set_nested_parallel(true);
+                            let mut local: Vec<(usize, State)> = Vec::new();
+                            loop {
+                                let next = { queue.lock().unwrap().next() };
+                                let (i, group) = match next {
+                                    Some(x) => x,
+                                    None => break,
+                                };
+                                local.push((i, merge_one(group)));
+                            }
+                            local
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("vectorize group worker"))
+                    .collect()
+            });
+            out.sort_by_key(|(i, _)| *i);
+            out.into_iter().map(|(_, s)| s).collect()
+        }
     };
     stats.vectorize_groups_ns = t3.elapsed().as_nanos() as u64;
     super::merge_dump::report(dump_before, &result);
@@ -1987,11 +2080,15 @@ mod tests {
         let mut s = State::new();
         s.vector_size = 3;
         let a = s.heap.alloc();
-        s.heap.set(a, HeapValue::Value(Value::Number(MaybeVector::vector(
-            [1, 2, 3].iter().map(|n| Pico8Num::from_i16(*n)).collect(),
-        ))));
+        s.heap.set(
+            a,
+            HeapValue::Value(Value::Number(MaybeVector::vector(
+                [1, 2, 3].iter().map(|n| Pico8Num::from_i16(*n)).collect(),
+            ))),
+        );
         let b = s.heap.alloc();
-        s.heap.set(b, HeapValue::Value(Value::Bool(MaybeVector::Scalar(true))));
+        s.heap
+            .set(b, HeapValue::Value(Value::Bool(MaybeVector::Scalar(true))));
         let unset = s.heap.alloc();
         let table = s.heap.alloc();
         let mut fields: std::collections::HashMap<String, HeapId, _> = Default::default();
@@ -2001,7 +2098,8 @@ mod tests {
         let arr = s.heap.alloc();
         s.heap.set(arr, HeapValue::ArrayTable(vec![a, b, unset]));
         let builtin = s.heap.alloc();
-        s.heap.set(builtin, HeapValue::BuiltinFun("sin".to_string()));
+        s.heap
+            .set(builtin, HeapValue::BuiltinFun("sin".to_string()));
         s.global_env.insert("zebra".to_string(), table);
         s.global_env.insert("alpha".to_string(), arr);
         s.global_env.insert("sin".to_string(), builtin);
@@ -2012,15 +2110,19 @@ mod tests {
         let mut s = State::new();
         s.vector_size = 2;
         let p = s.heap.alloc();
-        s.heap.set(p, HeapValue::Value(Value::Nil(Some("gone".to_string()))));
+        s.heap
+            .set(p, HeapValue::Value(Value::Nil(Some("gone".to_string()))));
         let mut env = LocalEnv::new();
         env.set_by_raw_id(0, Value::Pointer(p));
         env.set_by_raw_id(4, Value::UnknownBool);
         s.local_env = env;
         let mut outer = LocalEnv::new();
-        outer.set_by_raw_id(2, Value::NumberInterval(MaybeVector::Scalar(
-            celeste_core::pico8_num::Pico8NumInterval::from_number(Pico8Num::from_i16(7)),
-        )));
+        outer.set_by_raw_id(
+            2,
+            Value::NumberInterval(MaybeVector::Scalar(
+                celeste_core::pico8_num::Pico8NumInterval::from_number(Pico8Num::from_i16(7)),
+            )),
+        );
         s.outer_local_envs = vec![outer, LocalEnv::new()];
         shapes.push(s);
 
@@ -2038,13 +2140,19 @@ mod tests {
         let mut state1 = State::new();
         state1.vector_size = 1;
         let id = state1.heap.alloc();
-        state1.heap.set(id, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(5)))));
+        state1.heap.set(
+            id,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(5)))),
+        );
         state1.global_env.insert("x".to_string(), id);
 
         let mut state2 = State::new();
         state2.vector_size = 1;
         let id2 = state2.heap.alloc();
-        state2.heap.set(id2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(3)))));
+        state2.heap.set(
+            id2,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(3)))),
+        );
         state2.global_env.insert("x".to_string(), id2);
 
         let result = vectorize_states(vec![state1, state2]);
@@ -2066,13 +2174,19 @@ mod tests {
         let mut state1 = State::new();
         state1.vector_size = 1;
         let id = state1.heap.alloc();
-        state1.heap.set(id, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(5)))));
+        state1.heap.set(
+            id,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(5)))),
+        );
         state1.global_env.insert("x".to_string(), id);
 
         let mut state2 = State::new();
         state2.vector_size = 1;
         let id2 = state2.heap.alloc();
-        state2.heap.set(id2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(5)))));
+        state2.heap.set(
+            id2,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(5)))),
+        );
         state2.global_env.insert("x".to_string(), id2);
 
         let result = vectorize_states(vec![state1, state2]);
@@ -2092,12 +2206,12 @@ mod tests {
     /// confirmed against the packed representative.
     #[test]
     fn bucket_keeps_the_first_of_each_distinct_row() {
-        let nums: Vec<Pico8Num> = [1, 2, 1, 3, 2, 1].iter().map(|v| Pico8Num::from_i16(*v)).collect();
+        let nums: Vec<Pico8Num> = [1, 2, 1, 3, 2, 1]
+            .iter()
+            .map(|v| Pico8Num::from_i16(*v))
+            .collect();
         let bools = [true, false, true, true, false, true];
-        let values = vec![
-            VectorRef::Numbers(&nums),
-            VectorRef::Bools(&bools),
-        ];
+        let values = vec![VectorRef::Numbers(&nums), VectorRef::Bools(&bools)];
         let hashes = hash_rows(&values, nums.len());
         let (mask, unique) = bucket_unique_mask(&values, &hashes);
         assert_eq!(mask, vec![true, true, false, true, false, false]);
@@ -2111,12 +2225,12 @@ mod tests {
     /// branch gets exercised: a real 64-bit collision has never been seen.
     #[test]
     fn bucket_falls_back_exactly_when_hashes_collide() {
-        let nums: Vec<Pico8Num> = [1, 2, 1, 3, 2, 1].iter().map(|v| Pico8Num::from_i16(*v)).collect();
+        let nums: Vec<Pico8Num> = [1, 2, 1, 3, 2, 1]
+            .iter()
+            .map(|v| Pico8Num::from_i16(*v))
+            .collect();
         let bools = [true, false, true, true, false, true];
-        let values = vec![
-            VectorRef::Numbers(&nums),
-            VectorRef::Bools(&bools),
-        ];
+        let values = vec![VectorRef::Numbers(&nums), VectorRef::Bools(&bools)];
         let all_same = vec![0x5eed_5eed_5eed_5eedu64; nums.len()];
         let (mask, unique) = bucket_unique_mask(&values, &all_same);
         assert_eq!(mask, vec![true, true, false, true, false, false]);
@@ -2128,7 +2242,10 @@ mod tests {
     /// left alone.
     #[test]
     fn bucket_fallback_touches_only_the_colliding_class() {
-        let nums: Vec<Pico8Num> = [1, 2, 3, 3, 4].iter().map(|v| Pico8Num::from_i16(*v)).collect();
+        let nums: Vec<Pico8Num> = [1, 2, 3, 3, 4]
+            .iter()
+            .map(|v| Pico8Num::from_i16(*v))
+            .collect();
         let values = vec![VectorRef::Numbers(&nums)];
         // Rows 0,1 collide (distinct values); rows 2,3 share a hash and are
         // genuinely equal; row 4 is alone.
@@ -2150,8 +2267,14 @@ mod tests {
         state1.vector_size = 1;
         let x1 = state1.heap.alloc();
         let y1 = state1.heap.alloc();
-        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
-        state1.heap.set(y1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+        state1.heap.set(
+            x1,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))),
+        );
+        state1.heap.set(
+            y1,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))),
+        );
         state1.global_env.insert("x".to_string(), x1);
         state1.global_env.insert("y".to_string(), y1);
 
@@ -2159,8 +2282,14 @@ mod tests {
         state2.vector_size = 1;
         let x2 = state2.heap.alloc();
         let y2 = state2.heap.alloc();
-        state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))));
-        state2.heap.set(y2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(20)))));
+        state2.heap.set(
+            x2,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))),
+        );
+        state2.heap.set(
+            y2,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(20)))),
+        );
         state2.global_env.insert("x".to_string(), x2);
         state2.global_env.insert("y".to_string(), y2);
 
@@ -2168,8 +2297,14 @@ mod tests {
         state3.vector_size = 1;
         let x3 = state3.heap.alloc();
         let y3 = state3.heap.alloc();
-        state3.heap.set(x3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
-        state3.heap.set(y3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+        state3.heap.set(
+            x3,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))),
+        );
+        state3.heap.set(
+            y3,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))),
+        );
         state3.global_env.insert("x".to_string(), x3);
         state3.global_env.insert("y".to_string(), y3);
 
@@ -2206,8 +2341,14 @@ mod tests {
         state1.vector_size = 1;
         let x1 = state1.heap.alloc();
         let y1 = state1.heap.alloc();
-        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
-        state1.heap.set(y1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+        state1.heap.set(
+            x1,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))),
+        );
+        state1.heap.set(
+            y1,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))),
+        );
         state1.global_env.insert("x".to_string(), x1);
         state1.global_env.insert("y".to_string(), y1);
 
@@ -2215,8 +2356,14 @@ mod tests {
         state2.vector_size = 1;
         let x2 = state2.heap.alloc();
         let y2 = state2.heap.alloc();
-        state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
-        state2.heap.set(y2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(20)))));
+        state2.heap.set(
+            x2,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))),
+        );
+        state2.heap.set(
+            y2,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(20)))),
+        );
         state2.global_env.insert("x".to_string(), x2);
         state2.global_env.insert("y".to_string(), y2);
 
@@ -2224,8 +2371,14 @@ mod tests {
         state3.vector_size = 1;
         let x3 = state3.heap.alloc();
         let y3 = state3.heap.alloc();
-        state3.heap.set(x3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))));
-        state3.heap.set(y3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+        state3.heap.set(
+            x3,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))),
+        );
+        state3.heap.set(
+            y3,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))),
+        );
         state3.global_env.insert("x".to_string(), x3);
         state3.global_env.insert("y".to_string(), y3);
 
@@ -2244,16 +2397,22 @@ mod tests {
         let mut state1 = State::new();
         state1.vector_size = 2;
         let x1 = state1.heap.alloc();
-        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::vector(vec![
-            Pico8Num::from_i16(1),
-            Pico8Num::from_i16(2),
-        ]))));
+        state1.heap.set(
+            x1,
+            HeapValue::Value(Value::Number(MaybeVector::vector(vec![
+                Pico8Num::from_i16(1),
+                Pico8Num::from_i16(2),
+            ]))),
+        );
         state1.global_env.insert("x".to_string(), x1);
 
         let mut state2 = State::new();
         state2.vector_size = 1;
         let x2 = state2.heap.alloc();
-        state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(3)))));
+        state2.heap.set(
+            x2,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(3)))),
+        );
         state2.global_env.insert("x".to_string(), x2);
 
         let result = vectorize_states(vec![state1, state2]);
@@ -2282,16 +2441,22 @@ mod tests {
         let mut state1 = State::new();
         state1.vector_size = 2;
         let x1 = state1.heap.alloc();
-        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::vector(vec![
-            Pico8Num::from_i16(1),
-            Pico8Num::from_i16(2),
-        ]))));
+        state1.heap.set(
+            x1,
+            HeapValue::Value(Value::Number(MaybeVector::vector(vec![
+                Pico8Num::from_i16(1),
+                Pico8Num::from_i16(2),
+            ]))),
+        );
         state1.global_env.insert("x".to_string(), x1);
 
         let mut state2 = State::new();
         state2.vector_size = 1;
         let x2 = state2.heap.alloc();
-        state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))));
+        state2.heap.set(
+            x2,
+            HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))),
+        );
         state2.global_env.insert("x".to_string(), x2);
 
         let result = vectorize_states(vec![state1, state2]);
@@ -2314,7 +2479,9 @@ mod tests {
         // Deterministic pseudo-random lane values (no RNG in tests).
         let mut seed: u64 = 0x9e3779b97f4a7c15;
         let mut next = move |modulus: i16| -> i16 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 33) % modulus as u64) as i16
         };
 
@@ -2327,21 +2494,20 @@ mod tests {
             // Cell 0: low-cardinality number column (drawn from 4 values, so
             // plenty of duplicate rows). Scalar representation when a
             // fragment happens to be uniform, like real fragments.
-            let numbers: Vec<Pico8Num> =
-                (0..lanes).map(|_| Pico8Num::from_i16(next(4))).collect();
+            let numbers: Vec<Pico8Num> = (0..lanes).map(|_| Pico8Num::from_i16(next(4))).collect();
             let c0 = state.heap.alloc();
-            state
-                .heap
-                .set(c0, HeapValue::Value(Value::Number(MaybeVector::vector(numbers))));
+            state.heap.set(
+                c0,
+                HeapValue::Value(Value::Number(MaybeVector::vector(numbers))),
+            );
 
             // Cell 1: bool column.
             let bools: Vec<bool> = (0..lanes).map(|_| next(2) == 0).collect();
-            let c1 = state
-                .heap
-                .alloc();
-            state
-                .heap
-                .set(c1, HeapValue::Value(Value::Bool(MaybeVector::vector(bools))));
+            let c1 = state.heap.alloc();
+            state.heap.set(
+                c1,
+                HeapValue::Value(Value::Bool(MaybeVector::vector(bools))),
+            );
 
             // Cell 2: interval column, two distinct intervals.
             let intervals: Vec<celeste_core::pico8_num::Pico8NumInterval> = (0..lanes)
@@ -2380,8 +2546,7 @@ mod tests {
             state.global_env.insert("e".to_string(), c4);
 
             // A local, mixing scalar and vector representations.
-            let local: Vec<Pico8Num> =
-                (0..lanes).map(|_| Pico8Num::from_i16(next(3))).collect();
+            let local: Vec<Pico8Num> = (0..lanes).map(|_| Pico8Num::from_i16(next(3))).collect();
             state
                 .local_env
                 .set(LocalId::from(0), Value::Number(MaybeVector::vector(local)));
@@ -2484,7 +2649,8 @@ impl StateSet {
             watermark: VectorizationWatermark::new(),
         };
         // Initialize watermark based on initial states
-        set.watermark.update(set.shape_count(), set.expanded_count());
+        set.watermark
+            .update(set.shape_count(), set.expanded_count());
         set
     }
 
@@ -2623,7 +2789,7 @@ mod watermark_tests {
         wm.update(10, 100);
         assert_eq!(wm.watermark(), (10, 100));
         assert!(!wm.should_renormalize(50)); // <= 10 * 5
-        assert!(wm.should_renormalize(51));  // > 10 * 5
+        assert!(wm.should_renormalize(51)); // > 10 * 5
     }
 
     #[test]
@@ -2642,12 +2808,14 @@ mod watermark_tests {
             let mut state = State::new();
             state.vector_size = 1;
             let id = state.heap.alloc();
-            state.heap.set(id, HeapValue::Value(Value::Number(
-                MaybeVector::Scalar(Pico8Num::from_i16(i))
-            )));
-            state.local_env.set(celeste_ir::ir::LocalId::from(0), Value::Number(
-                MaybeVector::Scalar(Pico8Num::from_i16(i))
-            ));
+            state.heap.set(
+                id,
+                HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(i)))),
+            );
+            state.local_env.set(
+                celeste_ir::ir::LocalId::from(0),
+                Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(i))),
+            );
             states.push(state);
         }
 
@@ -2685,6 +2853,6 @@ mod watermark_tests {
     fn test_watermark_custom_threshold() {
         let wm = VectorizationWatermark::with_threshold(2.0);
         assert!(!wm.should_renormalize(2)); // <= 1 * 2
-        assert!(wm.should_renormalize(3));  // > 1 * 2
+        assert!(wm.should_renormalize(3)); // > 1 * 2
     }
 }
