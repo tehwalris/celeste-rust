@@ -771,3 +771,40 @@ env $E CELESTE_FRAME_THREADS=16 rewrite bench --frames 40 --checkpoint-dir P --c
   sort + the key space, not codegen), but the letter of the gate is a RELEASE
   parcheck; the recipe above under `--release` is the final pre-merge check I
   did not run (the room20 release build is ~20 min).
+
+## Single-path: flags removed, dead alternatives deleted (2026-08-27)
+
+Philippe's call: no options - the new behavior is the ONLY behavior. Removed all
+three env flags and made everything unconditional:
+- CELESTE_FRONTIER_SKIP, CELESTE_WITHIN_FRAME_SKIP, CELESTE_FRONTIER_BUFFERED gone.
+- The engine-keyed frontier, the frozen/buffered frontier (`is_frozen` is now
+  unconditionally true), the cross-frame skip, the within-frame racy skip, and
+  the canonical content-sort are all always-on.
+- Removed the predicates (frontier_skip_on / within_frame_skip_on /
+  engine_keyed_frontier / engine_keyed_frontier_on / map_buffered_on) and the
+  diagnostic FRONTIER_PROBES/HITS/NONE counters + print.
+
+DELETED dead alternatives:
+- The non-buffered (classic incremental-insert) RowTable path: `buffered` field,
+  set_buffered/is_buffered, take_recent(_content_sorted), the old non-buffered
+  end_frame. The frontier is always frozen; `insert_new` buffers into
+  `pending`/`recent`, one `end_frame` content-sorts + flushes.
+
+KEPT, with reason (a legitimate non-compiled caller):
+- The interpreter-key frontier path (`vectorize::visited_row_keys` /
+  `visited_lane_keys`, reached via `stream_boundary_prepare`'s carried==None
+  branch) is the INTERPRETER ORACLE's own frontier dedup - the differential's
+  reference side and the (strict-mode: never taken) kernel-miss fallback. In a
+  production compiled+strict run carried is ALWAYS Some, so the frontier is 100%
+  engine-keyed and this branch is never hit. The oracle's key is D1-equivalent
+  to the engine key (same partition), and the differential already compares
+  ENGINE keys on both sides via `FrameEngine::row_key_set` (import + boundary),
+  so engine-keying the oracle internally would be a perf regression on the
+  reference with zero correctness benefit. Deleting it would mean deleting the
+  interpreter oracle, which the whole differential gate needs.
+- No separate "no-skip append" path exists: the generated `append` always takes
+  the skip closure (`frontier_hit || within_frame_dup`); nothing to delete.
+
+GATES: quick suite 293 passed (differential, sweep/pos-graph, visited, oracle
+agreement); warning-free; with NO flags, serial vs 16-thread byte-identical
+(rowkeys + states.bin + meta). Release parcheck: pending (build running).
