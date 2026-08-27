@@ -154,7 +154,14 @@ impl RowTable {
     pub fn end_frame_buffered(&mut self) -> (Vec<(u64, u64)>, u32) {
         debug_assert!(self.buffered, "end_frame_buffered on a non-buffered table");
         let first_id = self.rows.len() as u32;
-        let keys = std::mem::take(&mut self.recent);
+        let mut keys = std::mem::take(&mut self.recent);
+        // CONTENT-SORT ids: assign this frame's ids by a deterministic sort of
+        // the frame's new keys, NOT arrival order. Under the racy within-frame
+        // skip (Option 4) arrival order is timing-dependent; sorting by the
+        // engine key makes the id table (and visited.bin) a pure function of
+        // the row SET. Byte-identical decision to the mmap engine, which sorts
+        // the same way in `MmapVisited::end_frame`.
+        keys.sort_unstable();
         self.rows.reserve(keys.len());
         for (i, key) in keys.iter().enumerate() {
             self.rows.insert(*key, first_id + i as u32);

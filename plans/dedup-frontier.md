@@ -651,3 +651,43 @@ frozen-frontier coverage - with the reachable set unchanged.
 
 Option 1 is LANDED and gated. `CELESTE_FRONTIER_SKIP=1` (implies engine-keyed
 frontier) is opt-in; default runs are byte-identical to before.
+
+## Option 4 design + verification (2026-08-27, before implementation)
+
+Racy within-frame skip + deterministic content-sort ids. Verified the two
+downstream points and found a THIRD requirement the "content-sort ids" framing
+missed.
+
+VERIFIED:
+- (1) sweep / pos-graph do NOT assume input-ORDER ids - they use ids as opaque
+  graph-node handles: sweep iterates `0..g.len()` and `earliest_frame(id)`
+  (which depends only on which frame's [first_id, first_id+count) RANGE an id
+  falls in, NOT the intra-frame order); pos-graph records `(src,dst)` id edges.
+  Content-sorting the ids WITHIN a frame permutes node labels isomorphically -
+  fine, as long as the forward pass and sweep/pos-graph read the SAME (content-
+  sorted) ids from the row table, which they do.
+- (2) checkpoint format: ids are `first_id + index-in-batch_order`; the file is
+  key-sorted for mmap search but the id is the batch index. Content-sort = sort
+  `batch_order` by key before assigning ids (visited.rs end_frame). Clean.
+
+FOUND (the gap): **states.bin is NOT content-ordered.** `regroup_and_merge` ->
+`Rt2::merge_many` CONCATENATES blocks in block order (not a key-sorted k-way
+merge, despite the name), and `save` bincodes `states` in that order. Today
+that is deterministic only because the serial input-order pass fixes the order;
+the racy skip makes materialization order (hence dedup "first occurrence", hence
+fragment lane order) non-deterministic, so states.bin would byte-differ and
+parcheck (which compares states.bin byte-identical) would fail. So Option 4
+needs to content-order states.bin too, NOT just the ids.
+  - Feasible + localized: fragment MEMBERSHIP is deterministic (a row's
+    (shape, pm1) is a function of its content), so only intra-fragment lane
+    order and fragment order are racy. Sort at checkpoint time: fragments by
+    (shape_hash, pm1), lanes within each fragment by engine key. The final
+    frontier SET is deterministic (reachable set is race-independent), so a
+    checkpoint-time sort suffices - the hot path stays unsorted.
+
+SOUNDNESS of the racy set: a false "new" (missed dedup) just materializes a
+duplicate, collapsed by partition_filter later - SOUND. A false "dup" would
+LOSE a row - so the set MUST compare the full 128-bit key exactly (never key.0
+alone). Design: fixed open-addressed table, slot state Empty/Writing/Full via
+one AtomicU8 CAS to claim, key.0/key.1 as AtomicU64 published Release-after-
+claim; a probe seeing Writing returns "new" (materialize) - sound, no spin.

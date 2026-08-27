@@ -50,7 +50,12 @@ const MAGIC: &[u8; 4] = b"C8TB";
 /// differ from the first hinted nil onward - room (1,0) diverges at f25.
 /// Not a serde change; the bump exists to refuse pre-erasure checkpoints,
 /// whose trajectories are a (very slightly) different search.
-pub const FORMAT_VERSION: u32 = 5;
+/// 5 -> 6: row ids are assigned by a deterministic CONTENT SORT of each
+/// frame's new keys (by the engine key), not arrival order (Option 4's racy
+/// within-frame skip makes arrival order timing-dependent). Every id changes,
+/// so visited.bin and the sweep's id space differ; a v5 checkpoint's ids would
+/// be meaningless here.
+pub const FORMAT_VERSION: u32 = 6;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Meta {

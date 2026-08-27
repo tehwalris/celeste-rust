@@ -477,7 +477,12 @@ impl MmapVisited {
     fn end_frame(&mut self) -> Result<()> {
         let frame = self.watermarks.len() as u32 + 1;
         let first_id = self.row_count as u32;
-        let keys = std::mem::take(&mut self.batch_order);
+        let mut keys = std::mem::take(&mut self.batch_order);
+        // CONTENT-SORT ids (Option 4): sort by the engine key so ids are a pure
+        // function of the row SET, not arrival order (which the racy within-
+        // frame skip makes timing-dependent). Same decision as the map engine's
+        // `RowTable::end_frame_buffered`.
+        keys.sort_unstable();
         self.batch_set = Default::default();
         save_frame_rowkeys(&self.dir, frame, &keys, first_id)?;
         let fk = FrameKeys::open(&self.dir, frame)?;
