@@ -34,3 +34,10 @@ pub mod graph;
 pub mod ival;
 pub mod kernel;
 pub(crate) mod lower;
+
+/// PROTOTYPE: a native AVX-512 assembly backend for the row-key hashing
+/// slice, alongside `lower`. Compile-fast alternative to rustc+LLVM
+/// (~1000x emit, ~1.27x off LLVM runtime, port-bound). Not wired into any
+/// kernel; exercised by its own bit-exact differential tests. See
+/// `plans/asm-backend.md`.
+pub mod asm;
