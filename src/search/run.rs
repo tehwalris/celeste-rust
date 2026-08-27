@@ -642,6 +642,16 @@ enum PreparedKeys {
 /// for the same reason the visited engine choice is not: the outputs are
 /// gated identical (H=68 sidecar set-identity plus byte-identical id
 /// assignment by construction), so checkpoints are interchangeable.
+/// Option 1 (`CELESTE_FRONTIER_SKIP=1`): the traced kernels probe the FROZEN
+/// frontier and skip materializing rows already in it. Requires the frontier
+/// be frozen (run with `CELESTE_FRONTIER_BUFFERED=1`), else the worker leaves
+/// it off (see the guard). Not in the fingerprint: outputs are byte-identical
+/// (only frontier rows are skipped, which the subtract would have dropped).
+fn frontier_skip_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_FRONTIER_SKIP").is_some())
+}
+
 fn partitioned_filter_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -1839,10 +1849,19 @@ impl AbstractRun {
                                 let mut ev = FrameEventCounters::default();
                                 let mut sc = StreamCounters::default();
                                 let t0 = std::time::Instant::now();
+                                // Option 1 (CELESTE_FRONTIER_SKIP): point this
+                                // thread's kernels at the FROZEN frontier so they
+                                // skip materializing rows already in it. Requires a
+                                // frozen frontier (buffered/mmap); else a mid-frame
+                                // probe would be timing-dependent, so we do not set
+                                // it (no skip, still sound and byte-identical).
+                                let _fg = (frontier_skip_on() && visited_ro.is_frozen())
+                                    .then(|| crate::compiled::dispatch::with_frozen_frontier(visited_ro));
                                 let outputs = interpret_state_base(
                                     variants, deopt, frame_cfg, fixed_env, state, &mut ev,
                                     pos_obs, compiled,
                                 )?;
+                                drop(_fg);
                                 let t1 = std::time::Instant::now();
                                 let mut prepared = Vec::new();
                                 for out in outputs {

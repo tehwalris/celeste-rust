@@ -551,6 +551,17 @@ impl Visited {
         matches!(self.engine, Engine::Mmap(_))
     }
 
+    /// Is the frontier READ-ONLY during a frame (so a mid-frame probe is
+    /// timing-independent)? True for the mmap engine (contains_historic only
+    /// sees completed frames) and for the buffered map engine (this frame's
+    /// inserts sit in `pending` until end_frame). Option-1 skip requires this.
+    pub fn is_frozen(&self) -> bool {
+        match &self.engine {
+            Engine::Mmap(_) => true,
+            Engine::Map(t) => t.is_buffered(),
+        }
+    }
+
     /// Whether phase 1 should dedup within the chunk BEFORE the global
     /// probe. True for the mmap engine, whose global probe costs several
     /// times a map lookup - see the order discussion in

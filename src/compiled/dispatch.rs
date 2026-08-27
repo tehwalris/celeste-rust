@@ -255,9 +255,10 @@ fn run_traced_kernel(
         .collect();
     // Option 1 (frozen-frontier check before materialize): the kernel
     // skips materializing any output row whose key is already in the
-    // FROZEN frontier. Sub-step 1a wires the interface with a no-op;
-    // 1b passes a real probe over the frame-start (buffered) frontier.
-    let skip = |_key: (u64, u64)| false;
+    // FROZEN frontier this thread was pointed at (`with_frozen_frontier`,
+    // set by the worker only when the frontier is frozen/buffered). Off =>
+    // `frontier_hit` returns false => byte-identical to no skip.
+    let skip = |key: (u64, u64)| frontier_hit(key);
     let mut lo = 0usize;
     while lo < chunk.width {
         let n = kernel::W.min(chunk.width - lo);
@@ -298,4 +299,49 @@ fn run_traced_kernel(
         }
     }
     true
+}
+
+// ---- Option 1: frozen-frontier skip before materialization ----
+//
+// The generated kernel `append` takes a `skip: &dyn Fn((u64,u64))->bool`
+// and skips materializing any row it returns true for. The frontier lives
+// in `Visited` (interp), which the generated kernels cannot name, and the
+// worker path does not thread it down. So the worker sets it on a
+// thread-local for the duration of its compiled-engine call, and
+// `run_traced_kernel` reads it. Off (no guard) => `false` => byte-identical.
+
+thread_local! {
+    static FROZEN_FRONTIER: std::cell::Cell<Option<*const crate::interpreter::visited::Visited>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Clears the thread-local frozen frontier on drop.
+pub struct FrontierGuard(());
+
+/// Point this thread's kernels at `v` as the frozen frontier for Option-1
+/// skip, until the guard drops. CONTRACT: `v` must be FROZEN (read-only)
+/// while the guard is alive - i.e. `v.is_frozen()` (the buffered map or the
+/// mmap engine). Only the worker that owns this thread's kernel call sets it,
+/// around ONE `interpret_state_base`, so the pointer never outlives the borrow.
+pub fn with_frozen_frontier(v: &crate::interpreter::visited::Visited) -> FrontierGuard {
+    FROZEN_FRONTIER.with(|c| c.set(Some(v as *const _)));
+    FrontierGuard(())
+}
+
+impl Drop for FrontierGuard {
+    fn drop(&mut self) {
+        FROZEN_FRONTIER.with(|c| c.set(None));
+    }
+}
+
+/// Is `key` in the frozen frontier this thread was pointed at? `false` when
+/// no guard is set (Option 1 off).
+fn frontier_hit(key: (u64, u64)) -> bool {
+    FROZEN_FRONTIER.with(|c| match c.get() {
+        // SAFETY: the pointer is set only for the lifetime of a
+        // `FrontierGuard`, which the worker keeps alive across the kernel
+        // call, and the frontier is read-only (frozen) for that whole time.
+        Some(p) => unsafe { (*p).contains_historic(key) },
+        None => false,
+    })
 }

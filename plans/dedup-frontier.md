@@ -510,3 +510,52 @@ So Option 4 is NOT rendered unnecessary; it still owns ~47% of the duplicate
 materialization. Recommendation stands: land Option 1 first (deterministic,
 frozen frontier already in place, ~half the win), then decide Option 4 on the
 remaining ~47% with the determinism model as Philippe's call.
+
+## Option 1 implementation — BLOCKER found (2026-08-27)
+
+Built the kernel-skip interface (sub-step 1a, LANDED gated byte-identical):
+the generated `step`/`append`/`Sink` take a `skip: &dyn Fn((u64,u64))->bool`;
+`append` calls `if skip(key) { continue; }` after the within-chunk RowSet
+dedup. And the 1b probe machinery: a thread-local frozen-frontier pointer
+(`compiled::dispatch::with_frozen_frontier`), `Visited::is_frozen()`, and the
+worker sets it around `interpret_state_base` when `CELESTE_FRONTIER_SKIP=1`
+and the frontier is frozen.
+
+MEASURED (room10, frontier-only+buffered, `--frames 50`, quick):
+- Frontier sequence with skip ON == skip OFF, every frame: BYTE-IDENTICAL.
+- BUT kernel rows materialized (KROWS[0]) UNCHANGED (71,913,505 both), and the
+  `run` chunk phase went UP (21.4s -> 24.6s). The probe runs but NEVER HITS.
+
+Root cause: **the frontier is keyed in the INTERPRETER key space, the kernel
+emits the ENGINE boundary key.** In the compiled path, `run_frame_chunk`
+returns interpreter `State`s - the engine's `b.row_keys` are DISCARDED - and
+`stream_boundary_prepare -> visited_row_keys` re-derives interpreter keys for
+the frontier. Increment b+c made the kernel key == `Rt2::boundary`'s key
+(engine space); the D1 gate proves engine-key and interpreter-key are
+BIJECTIVE but NOT numerically equal (BENCHMARK_DATA "D1 GATED"). So
+`contains_historic(engine_key)` against an interpreter-keyed table always
+misses.
+
+**Consequence: Option 1 requires the FRONTIER to be ENGINE-KEYED** - carry the
+engine `b.row_keys` through to the frontier (and drop the redundant
+`visited_row_keys` re-keying, itself a win) instead of re-deriving interpreter
+keys. That is a CHECKPOINT-FORMAT change (engine keys != interpreter keys
+numerically) but SOUND and search-identity-preserving in the sense that
+matters: the partition is identical (D1 bijection) so the visited SET / the
+search result is unchanged; only the stored key BYTES change (old checkpoints
+incompatible, which the coordinator noted is expected/fine). This is the
+identity-adjacent step flagged earlier as PHILIPPE'S CALL.
+
+Scope of the remaining work (not done - reported for a go/no-go):
+- `FrameEngine::run_frame_chunk` / `CompiledForward::run_chunk` must carry each
+  output state's engine `b.row_keys` (a per-lane sidecar) instead of dropping
+  it at the bridge back to `State`.
+- The frontier-only subtract must key by that carried engine key instead of
+  `visited_row_keys`. Interaction with `make_state_abstract` /
+  band-coarsening in `stream_boundary_prepare` needs checking (the engine key
+  is the level-0-abstracted key; re-abstraction must be idempotent).
+- Then the kernel's `skip(key)` (engine key) hits the engine-keyed frontier.
+- GATE: frontier sequence + differential unchanged (same SET), parcheck
+  byte-identical under the new key, KROWS drop = the ~45%-of-offered
+  frozen-frontier occurrences (per the quadrant census), measured `run`-phase
+  drop.
