@@ -636,3 +636,18 @@ skip, ON = `CELESTE_FRONTIER_SKIP=1`):
 So Option 1 (check the frozen frontier before materializing) skips ~52% of
 materialized rows - in line with the quadrant census's ~45%-of-offered
 frozen-frontier coverage - with the reachable set unchanged.
+
+### Gates (all green, 2026-08-27)
+- `{traced,ladder,exact}_kernels_reproduce_the_interpreter`, room00/room20
+  lattice, `{traced,ladder,exact}_kernels_are_current`: 9/9 PASS. (The widen is
+  gated on `WalkOpts.widen` so LADDER/EXACT, which use `boundary_exact`, do NOT
+  widen - that is what fixed the initial exact/ladder failures.)
+- `CELESTE_KERNEL_KEY_CHECK`: 0 mismatches over 40 frames (kernel key ==
+  b.row_keys byte-for-byte, per row).
+- Determinism: compiled-forward frontier-only + `CELESTE_FRONTIER_SKIP=1`,
+  serial (1 thread) vs 16 threads -> per-frame new-lanes/visited sequence
+  BYTE-IDENTICAL through f45 (final visited 3,116,244). The frozen frontier
+  makes the skip timing-independent, as designed.
+
+Option 1 is LANDED and gated. `CELESTE_FRONTIER_SKIP=1` (implies engine-keyed
+frontier) is opt-in; default runs are byte-identical to before.
