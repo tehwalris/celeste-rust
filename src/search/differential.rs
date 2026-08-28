@@ -561,6 +561,81 @@ mod tests {
         );
     }
 
+    /// The ASM LADDER set reproduces the interpreter at rem rung Bits(1)
+    /// (the rung-agnostic set, `boundary_exact`). Mirror of
+    /// `ladder_kernels_reproduce_the_interpreter_at_bits1` with the ASM
+    /// backend on.
+    #[test]
+    fn asm_ladder_kernels_reproduce_the_interpreter_at_bits1() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        std::env::set_var("CELESTE_REM_BITS", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
+        std::env::set_var("CELESTE_ASM_KERNELS", "1");
+        assert_eq!(
+            crate::interpreter::abstraction::rem_precision_from_env(),
+            crate::interpreter::abstraction::RemPrecision::Bits(1),
+            "the precision env was read before this test set it"
+        );
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+        let frames = 28;
+        let mut baseline = AbstractRun::start(&program).expect("start baseline");
+        let mut want = Vec::new();
+        for _ in 1..=frames {
+            baseline.step().expect("baseline step");
+            want.push(baseline.lane_count());
+        }
+        drop(baseline);
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        let mut run = AbstractRun::start(&program).expect("start compiled run");
+        for (frame, want) in (1..=frames).zip(want) {
+            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
+            assert_eq!(run.lane_count(), want, "ASM ladder lane count at frame {}", frame);
+        }
+        assert!(crate::compiled::dispatch::traced_lanes() > 0, "no ASM ladder kernel ran");
+        assert_eq!(crate::compiled::dispatch::missed_lanes(), 0, "ASM ladder missed lanes");
+    }
+
+    /// The ASM EXACT set reproduces the interpreter at the top rung
+    /// (k = 16, rem `Exact`). Mirror of
+    /// `exact_kernels_reproduce_the_interpreter_at_k16` with the ASM
+    /// backend on.
+    #[test]
+    fn asm_exact_kernels_reproduce_the_interpreter_at_k16() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        std::env::set_var("CELESTE_REM_BITS", "16");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
+        std::env::set_var("CELESTE_ASM_KERNELS", "1");
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+        let frames = 28;
+        let mut baseline = AbstractRun::start(&program).expect("start baseline");
+        let mut want = Vec::new();
+        for _ in 1..=frames {
+            baseline.step().expect("baseline step");
+            want.push(baseline.lane_count());
+        }
+        drop(baseline);
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        let mut run = AbstractRun::start(&program).expect("start compiled run");
+        for (frame, want) in (1..=frames).zip(want) {
+            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
+            assert_eq!(run.lane_count(), want, "ASM exact lane count at frame {}", frame);
+        }
+        assert!(crate::compiled::dispatch::traced_lanes() > 0, "no ASM exact kernel ran");
+        assert_eq!(crate::compiled::dispatch::missed_lanes(), 0, "ASM exact missed lanes");
+    }
+
     /// The kernel-driven LADDER gate (plans/kernel-ladder.md): at rem
     /// rung Bits(1), the RUNG-AGNOSTIC kernel set reproduces the
     /// interpreter's row sets, per chunk, at the rung's own abstraction.

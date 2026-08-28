@@ -97,7 +97,13 @@ impl AsmKernel {
     /// its `live & ok` lanes into the outcome's acc; a nonzero `live & !ok`
     /// (declined) drops the whole chunk to the reference path. Then
     /// `boundary` for keys + within-block dedup, and push to `done`.
-    fn run(&self, chunk: &Rt2, ids: &runtime2::BoundaryIds, done: &mut Vec<Rt2>) -> bool {
+    fn run(
+        &self,
+        chunk: &Rt2,
+        ids: &runtime2::BoundaryIds,
+        done: &mut Vec<Rt2>,
+        exact: bool,
+    ) -> bool {
         let mut accs: Vec<Rt2> = self.acc_templates.iter().map(|t| t.build()).collect();
         let mut inbuf = vec![0u8; self.compiled.input_bytes as usize];
         let mut outbuf = vec![0u8; self.compiled.n_roots * 128];
@@ -149,10 +155,16 @@ impl AsmKernel {
 
         for mut acc in accs {
             if acc.width > 0 {
-                // The level-0 traced set pre-widened in the graph; the
-                // boundary's own widening is then a free agreement check and
-                // computes the row keys + dedups within the block.
-                acc.boundary(ids);
+                if exact {
+                    // The rung-agnostic / exact sets hand back EXACT rows;
+                    // widening here would pre-empt the campaign's rung.
+                    acc.boundary_exact();
+                } else {
+                    // The level-0 traced set pre-widened in the graph; the
+                    // boundary's own widening is then a free agreement check
+                    // and computes the row keys + dedups within the block.
+                    acc.boundary(ids);
+                }
                 done.push(acc);
             }
         }
@@ -250,9 +262,13 @@ fn push_field(acc: &mut Rt2, f: &AsmField, buf: &[u8], i: usize) {
     }
 }
 
-/// The start room's assembled kernels, keyed by input shape hash.
+/// The start room's assembled kernels, keyed by input shape hash, for one
+/// rem-precision mode.
 pub(crate) struct Registry {
     by_shape: HashMap<u64, AsmKernel>,
+    /// The rung-agnostic / exact sets go through `boundary_exact`; the
+    /// level-0 set through `boundary`.
+    exact_boundary: bool,
 }
 
 impl Registry {
@@ -269,16 +285,22 @@ impl Registry {
         done: &mut Vec<Rt2>,
     ) -> bool {
         match self.by_shape.get(&chunk.shape_hash) {
-            Some(k) => k.run(chunk, ids, done),
+            Some(k) => k.run(chunk, ids, done, self.exact_boundary),
             None => false,
         }
     }
 
-    /// Retrace the start room and assemble every shape. `root` is the repo
-    /// root (Lua sources + cart). `decide = true` matches the Rust kernel so
-    /// the assembled compute is the same fused graph.
-    pub fn build_for_start_room(root: &Path) -> Result<Registry> {
-        let refs = crate::trace::kernel::room_kernels_in(root)
+    /// Retrace the start room and assemble every shape for one lattice set
+    /// (`opts`). `root` is the repo root (Lua sources + cart). `decide =
+    /// true` matches the Rust kernel so the assembled compute is the same
+    /// fused graph. `exact_boundary` selects `boundary_exact` for the
+    /// rung-agnostic / exact sets.
+    pub fn build_for_start_room(
+        root: &Path,
+        opts: crate::trace::shapes::WalkOpts,
+        exact_boundary: bool,
+    ) -> Result<Registry> {
+        let refs = crate::trace::kernel::lattice_kernel_refs(root, opts)
             .context("retracing the start room for ASM kernels")?;
         let mut by_shape = HashMap::new();
         for (si, r) in refs.iter().enumerate() {
@@ -341,7 +363,7 @@ impl Registry {
                 anyhow::bail!("two start-room shapes hash to {shape:#x}");
             }
         }
-        Ok(Registry { by_shape })
+        Ok(Registry { by_shape, exact_boundary })
     }
 }
 
@@ -384,15 +406,27 @@ pub(crate) fn registry() -> Option<&'static Registry> {
             return None;
         }
         let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
+        // Build for the active rem-precision mode, matching the generated
+        // set the engine would otherwise dispatch (dispatch::traced_mode).
+        use crate::trace::shapes::WalkOpts;
+        let (opts, exact) = match super::dispatch::traced_mode() {
+            super::dispatch::TracedMode::Level0 => (WalkOpts::LEVEL0, false),
+            super::dispatch::TracedMode::Level0Agnostic => (WalkOpts::LADDER, true),
+            super::dispatch::TracedMode::ExactRem => (WalkOpts::EXACT, true),
+        };
         let built = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
-            .spawn(move || Registry::build_for_start_room(Path::new(&root)))
+            .spawn(move || Registry::build_for_start_room(Path::new(&root), opts, exact))
             .expect("spawn asm-kernel builder")
             .join()
             .expect("asm-kernel builder panicked");
         match built {
             Ok(reg) => {
-                eprintln!("ASM kernels ENABLED: {} start-room shapes assembled", reg.len());
+                eprintln!(
+                    "ASM kernels ENABLED ({:?}): {} start-room shapes assembled",
+                    super::dispatch::traced_mode(),
+                    reg.len()
+                );
                 Some(reg)
             }
             Err(e) => panic!("building ASM kernels: {e:#}"),
