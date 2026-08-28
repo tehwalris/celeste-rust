@@ -277,3 +277,33 @@ Add a `*_at_bits2` (or a rung sweep) differential gate. Likely the ladder
 kernel set or a rung-boundary widening in the engine. Until then KERNELS=1
 campaigns must stay at Bits(0)/Bits(1) on the compiled path, or run rungs on
 the interpreter.
+
+## P3 DONE (a749df3): fruit chunk cap removed - verified vestigial
+
+Row set byte-identical at fruit cap 10 vs 8000 on room (2,0), 32 frames.
+
+## P4: work-stealing forward memory regression - DOES NOT REPRODUCE (no action)
+
+Re-measured post-P0 (room (1,0), quick, 16 threads): the f50 forward peaks at
+**2.7 GB**, not the 24.7 GB the plan recorded. That is consistent with
+CLAUDE.md's "chunk-parallel work took frame 60 from 4.3 GB to 2.4 GB" - the
+chunk-parallel streaming already bounds the per-frame transient. The 24.7 GB
+figure was a different/earlier config. No `all_prepared` blowup to fix.
+
+## P5: cell-partition pos-graph recorder - origin-tag balloon is ROOM-(0,0)-ONLY
+
+Measured: room (1,0) f50 WITH `--record-pos-graph` peaks at 2.7 GB, SAME as
+without. The origin-tag balloon (pos-graph-and-memory.md section 1) needs a
+room with objects whose per-lane merges the tag defeats - room (0,0)'s fruit
+(101 GB at f93). Room (1,0) has no objects, so there is nothing to optimize
+there, and room (0,0) cannot be validated cheaply (100 GB scale).
+
+The cell-partition recorder is still the right fix for room (0,0)'s pos-graph
+memory, and its CORRECTNESS gate (reachable row set == tag-based run) is cheap
+on room (1,0)/(2,0). But it is a substantial new feature (a quantized
+partition key over `cell_of(x,y)`, new machinery vs today's named-pm1
+partition), its MEMORY benefit only shows at room-(0,0) scale, and room (0,0)'s
+pos-graph WORKS today (fused forward, just heavy). Given P4 turned out moot and
+the priority (P0) is done + fully validated, this is DEFERRED with the spec in
+pos-graph-and-memory.md section 2 intact. Recommend implementing when a
+room-(0,0) campaign is next run, so the memory win can be measured.
