@@ -1,3 +1,53 @@
+# WHOLE room (1,0) campaign via the in-process `ladder` (2026-08-28, QUICK profile, interpreter forward)
+
+Tonight's run of the NEW single-process ladder: `rewrite ladder --from 94
+--to 94 --maxk 2 --room 1,0` (commit fe1822f). Three things make this NOT a
+clean A/B against the block below - read the caveats before quoting a
+speedup:
+
+  1. **QUICK profile, not release.** Philippe's call: skip the fat-LTO
+     relink until the kernels are asm-only. Absolute numbers run a bit hot
+     vs release, but the win is large enough to record anyway (labelled).
+  2. **INTERPRETER forward, not the compiled/lattice engine.** The compiled
+     forward currently writes a checkpoint the sweep cannot read (engine key
+     != sweep's row_keys; see plans/pos-graph-and-memory.md 5), so the
+     ladder runs the interpreter until that is fixed.
+  3. **This session's work-stealing + parallel-merge** speedups (commits
+     e6636d1 / fbebb72 / 7a14292) are in, and they apply to the interpreter
+     path too.
+
+| stage | wall | peak RSS | note |
+|---|---|---|---|
+| l0 forward (+save-frames +fused pos-graph) | 382 s | 24.4 GB | win seed at f89 |
+| l0 backward sweep | 176 s | 27.9 GB | 178,576,090 rows, 2 win seeds in B(94), e+g optimum 89 |
+| k=1 banded forward | 7 s | 26.1 GB | k=1 WINS |
+| k=1 backward sweep | 22 s | 18.5 GB | 1,163,134 rows, e+g optimum 93 |
+| k=2 banded forward | 1 s | 15.9 GB | H=94 REFUTED at k=2 |
+| **TOTAL** | **589 s** | | |
+
+Verdict BYTE-for-the-answer identical to the block below and to ladder.sh:
+level 0 wins at f89, k=1 wins at f93, k=2 refutes H=94. Every row count and
+win-seed count matches to the digit - the in-process ladder reproduces the
+whole forward+sweep+banded pipeline exactly.
+
+Wall: 589 s total vs the release/lattice 676 s below - faster DESPITE quick,
+because work-stealing + parallel merge more than pay for the quick penalty
+(the f50 forward frame alone went 5.03 s -> 2.89 s, -43%, this session). But
+the axes are confounded (profile AND engine AND work-stealing all differ), so
+this is a "whole campaign is ~10 min and correct", not a clean per-lever
+number.
+
+PEAK RSS is HIGHER here (24-28 GB vs 9-19 GB below), for two reasons, both
+noted for room (0,0) where it would matter:
+  - SINGLE PROCESS: the ladder runs every stage in one process, so glibc
+    keeps each stage's arenas (the sweep peak includes the forward's
+    retained memory). ladder.sh runs separate processes precisely for this
+    isolation; room (0,0) needs that, so the in-process ladder is a
+    room-(1,0)/(2,0) tool until it can spawn per-stage subprocesses.
+  - the work-stealing forward's per-frame (vs per-batch) filtering raised
+    the forward transient (9.28 -> 24.4 GB); a super-batch fix is planned
+    (plans/pos-graph-and-memory.md 4).
+
 # WHOLE room (1,0) campaign on LATTICE kernels, fwd+bwd+FUSED pos-graph (2026-08-26, idle, KERNELS=1 ladder.sh 94 94 2)
 
 Step 4 of the overnight plan, room (1,0), the full precision ladder on the
