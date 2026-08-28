@@ -135,60 +135,66 @@ Full nextest suite; `rewrite ladder` per-rung precision correct (k=1 gives
 
 ---
 
-## P3: understand `CELESTE_FRUIT_CHUNK_LANES` (Philippe wants to know why it is semantic)
+## P3: the fruit chunk cap is probably VESTIGIAL - verify and remove it
 
-"CHUNKING IS SEMANTIC ON ROOMS WITH FRUIT" (ladder.sh) contradicts the
-general invariant that the chunk cap only changes row IDs, not the row SET
-(parcheck relies on that). Investigate WHY fruit breaks it:
-- `chunk_states` / `effective_fruit_chunk_cap` in run.rs, and the fruit
-  handling around abstraction.rs:773 ("fruit's y is the whole band and
-  collisions split on ...").
-- Likely: a fruit's abstract state spans an interval that a chunk boundary
-  splits differently, so different caps produce different SPLITS and thus
-  different reachable rows - an over-approximation that depends on the cap.
-- Write up the finding (is it sound? is the 8000 cap load-bearing for
-  correctness or just memory?). This is understanding, not a code change -
-  but it may reveal whether the fingerprint SHOULD include the fruit cap
-  (it does today) and whether that is a latent soundness smell.
+Philippe (2026-08-28): the fruit chunk cap was only ever needed to work
+around a BUGGY interval-split interaction that has since been fixed; it
+probably does nothing now. So the hypothesis is NOT "chunking is genuinely
+semantic on fruit" but "this was a workaround for a bug that no longer
+exists."
 
----
-
-## P4: work-stealing peak-memory regression - the "super-batch" fix (explained)
-
-### What the regression is (plainly)
-Before work-stealing, the forward processed states in small BATCHES of
-`threads` (~16): interpret 16 states -> filter+subtract them -> free their
-materialized output rows -> next 16. Peak memory held ~16 states' worth of
-output rows at once.
-
-My work-stealing change processes the WHOLE FRAME at once: all workers
-interpret every state, and ALL output rows (`PreparedRows`, each a full
-`State`) pile up in `all_prepared` before ONE filter pass. So the peak now
-holds a WHOLE FRAME's output rows, not 16 states' - that is the 9.28 -> 24.4
-GB jump.
-
-### The "super-batch" fix
-Split the difference: process the frame in chunks bigger than the old 16 but
-smaller than the whole frame - a "super-batch" of, say, a few hundred states
-or a lane budget. Work-steal the interpret WITHIN a super-batch (so 16
-threads stay balanced - a super-batch is >> 16, no idle-at-barrier), then
-filter+subtract+free that super-batch before the next. Peak memory = one
-super-batch, not a whole frame; load balance = kept.
-
-Byte-identical: per-super-batch filtering gives the same result as per-frame
-(the frontier is frozen for the frame and `partition_seen` persists across
-super-batches), and results are reassembled in input order. Hold to
-parcheck.
-
-Lower priority than P0-P2; it is a memory/speed tradeoff, not correctness.
+Steps:
+- Confirm it is a no-op today: vary `CELESTE_FRUIT_CHUNK_LANES` on a fruit
+  room (1,0) forward and check the row SET is invariant (only ids/order
+  change), i.e. the same thing parcheck asserts for the general cap. If the
+  set is invariant, the "CHUNKING IS SEMANTIC ON FRUIT" claim is stale.
+- If confirmed vestigial: REMOVE the special fruit cap
+  (`effective_fruit_chunk_cap`, the `CELESTE_FRUIT_CHUNK_LANES` reads, the
+  run_ladder set_var, and its contribution to the config fingerprint) so a
+  fruit room chunks like any other. Removing it from the fingerprint is a
+  key-space change - fine on scratch dirs.
+- Look at the fixed interval-split interaction (abstraction.rs:773 area,
+  `split_rem_straddles`, the fruit `off` widening) to confirm the bug it
+  guarded against is really gone before deleting the guard.
+- If it turns out NOT vestigial (the set does change with the cap), stop and
+  write up why - that would be a real cap-dependent over-approximation.
 
 ---
 
-## Later: cell-partition pos-graph recorder (the real memory fix) - clarified
+## P4: work-stealing forward peak-memory regression - find the REAL cause
+
+### The observation
+Forward peak RSS went 9.28 GB (pre-work-stealing) -> 24.4 GB. What changed
+mechanically: `partition_filter` + `decided_survivors` moved from PER-BATCH
+(the old code filtered/freed each batch of ~16 states' output rows before
+the next) to PER-FRAME (all workers' output `PreparedRows` - each a full
+`State` - accumulate in `all_prepared`, then ONE filter). So a whole frame's
+output rows are live at once instead of a batch's.
+
+### Philippe's note (2026-08-28) - do NOT assume the super-batch fix
+Work-stealing itself does not increase memory. Reducing its granularity (the
+"super-batch" idea I wrote first) should NOT be necessary to fix this
+properly. Find the real reason the transient is large and bound it WITHOUT
+giving back work-stealing's balance. Candidates to investigate:
+- Stream survivors out INCREMENTALLY as workers produce them (filter +
+  subtract + free per chunk of output) while the interpret still work-steals
+  the whole frame - decouple "when we filter" from "how we schedule".
+- Or the rows do not need to be fully materialized `State`s before filtering
+  at all - keep only keys until a lane survives, materialize lazily.
+- Check whether the peak is really `all_prepared` or something else (the
+  within-frame set, the frozen-frontier probe buffers) before optimizing.
+
+Byte-identical is the constraint (parcheck). Lower priority than P0-P2; a
+memory concern, not correctness.
+
+---
+
+## P5: cell-partition pos-graph recorder (the real memory fix) - ON the list
 
 This is the memory fix for `--record-pos-graph` (the origin tag balloons the
-transient; section 1 of pos-graph-and-memory.md). Deferred, but here is what
-"quantized partition key" means so it is not mysterious:
+transient; section 1 of pos-graph-and-memory.md). Philippe: do NOT defer -
+it is P5, on the list. Here is what "quantized partition key" means so it is
+not mysterious:
 
 - Today the pos-graph tags EVERY lane with its source cell (`POS_ORIGIN`) so
   outputs can be attributed to inputs. That tag is per-lane-distinct, so it
@@ -212,4 +218,6 @@ transient; section 1 of pos-graph-and-memory.md). Deferred, but here is what
 ## Suggested execution order
 P0 (unblocks the fast path + fixes the 651M blowup) -> P1 (remove static
 pos-graph, easy, Philippe insists) -> P2 (nice config, removes the hacks) ->
-P3 (understand fruit, may inform P2) -> P4 (memory) -> cell-partition (later).
+P3 (fruit cap: verify vestigial and remove) -> P4 (forward memory, find the
+real cause) -> P5 (cell-partition pos-graph recorder, the pos-graph memory
+fix). All six are on the list.
