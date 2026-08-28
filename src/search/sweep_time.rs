@@ -225,23 +225,6 @@ pub fn build_index(dir: &Path, frames: u32, table: &RowTable) -> Result<RowIndex
     Ok(idx)
 }
 
-/// Return free heap to the OS, between the sweep's two big phases.
-///
-/// `Vec`'s `Drop` frees, it does not necessarily unmap: glibc holds the
-/// pages in its arenas for reuse, which is right for a steady-state
-/// allocator and wrong for a process with two disjoint multi-tens-of-GB
-/// phases under a hard cgroup cap. No-op on anything but glibc.
-fn trim_allocator() {
-    #[cfg(target_env = "gnu")]
-    {
-        extern "C" {
-            fn malloc_trim(pad: usize) -> std::os::raw::c_int;
-        }
-        // Safe: `malloc_trim` only walks the allocator's own free lists.
-        unsafe { malloc_trim(0) };
-    }
-}
-
 /// Add `cell` to the live destination set, folding its recorded predecessor
 /// cells into the candidate mask. Idempotent - both sets only grow, because
 /// `B` only grows as the sweep runs backward.
@@ -332,10 +315,6 @@ pub fn prepare_pos_graph(
     fingerprint: &str,
     recipe_text: &str,
     from: Option<&Path>,
-    program: &Program,
-    plain: &Program,
-    mapping: StateMapping,
-    variants: &VariantBuilder<'_>,
 ) -> Result<PosGraph> {
     if let Some(src) = from {
         return borrow_pos_graph(src, frames, recipe_text);
@@ -365,48 +344,22 @@ pub fn prepare_pos_graph(
         );
         return Ok(graph);
     }
-    println!(
-        "sweep: recording the position graph over frames f{:03}..f{:03}",
+    // No static replay build any more (it was the room-(0,0) OOM: a whole
+    // second forward pass, ~76 GB transient, glibc-pinned). The position
+    // graph is recorded ON THE FLY, fused into the forward pass
+    // (`bench --record-pos-graph`, which the ladder sets), or borrowed from a
+    // coarser level (`--pos-graph-from`). A checkpoint that has neither is a
+    // setup error, named loudly rather than silently rebuilt.
+    Err(anyhow!(
+        "{}/posgraph.bin covers frames 1..{} but the sweep needs 1..{}: the \
+         forward pass did not record the position graph. Re-run the forward \
+         with --record-pos-graph (the ladder does this), or point the sweep at \
+         a coarser level's graph with --pos-graph-from. The static replay \
+         builder was removed (it was the room (0,0) OOM).",
+        dir.display(),
         covered,
-        frames - 1
-    );
-    let t = std::time::Instant::now();
-    let mut engine = AbstractRun::start_with_deopt(program, plain, mapping.clone(), false)?;
-    register_variants(&mut engine, mapping, variants(program)?)?;
-    let fresh = pos_graph::build_from_replay(dir, covered, frames, fingerprint, &mut engine)?;
-    drop(engine);
-    // The replay's transient is the biggest allocation this process ever
-    // makes - room (0,0)'s peaked around 76 GB - and dropping it does not
-    // return it to the OS: glibc keeps it in its arenas, where it is
-    // invisible to us and fully counted by the cgroup. MEASURED on room
-    // (0,0): with the graph built in this process the RSS after the re-index
-    // was 94 GB and the backward loop was OOM-killed at the 100 GB cap; with
-    // the same graph loaded from `posgraph.bin` instead it was 41.6 GB and
-    // the sweep finished.
-    //
-    // So ask for the arenas back. How much this actually recovers is NOT
-    // measured: room (1,0)'s transient is small enough that its post-index
-    // RSS is the same either way (22.9 GB before this call existed, 24.7 GB
-    // with it), and reproducing room (0,0)'s is 1.7 h of replay. The remedy
-    // that IS measured is the one above - build the table with `rewrite
-    // pos-graph`, in its own process, and let the sweep load it.
-    trim_allocator();
-    let graph = match existing {
-        Some(old) => {
-            let mut b = old.into_builder();
-            b.merge(fresh.into_builder());
-            b.build(frames, fingerprint)
-        }
-        None => fresh,
-    };
-    graph.save(dir)?;
-    println!(
-        "sweep: position graph has {} pairs over {} destination cells, built in {:.1}s",
-        graph.pairs(),
-        graph.live_cells(),
-        t.elapsed().as_secs_f64()
-    );
-    Ok(graph)
+        frames
+    ))
 }
 
 /// Use a position graph recorded by ANOTHER precision level of the same
@@ -512,17 +465,7 @@ pub fn backward_sweep_time(
             frames
         ));
     }
-    let graph = prepare_pos_graph(
-        dir,
-        frames,
-        fingerprint,
-        recipe_text,
-        pos_graph_from,
-        program,
-        plain,
-        mapping.clone(),
-        variants,
-    )?;
+    let graph = prepare_pos_graph(dir, frames, fingerprint, recipe_text, pos_graph_from)?;
 
     let ck = checkpoint::load(dir, frames, fingerprint).context("loading final checkpoint")?;
     let table = ck.visited;

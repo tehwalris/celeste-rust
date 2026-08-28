@@ -130,40 +130,30 @@ case "${KERNELS:-}" in
   ""|0) ;;
   *) echo "KERNELS must be 0 or 1" >&2; exit 1 ;;
 esac
-# FUSE=1 records the position graph DURING the level-0 forward pass instead
-# of replaying the whole room for it afterwards (`--record-pos-graph`). The
-# l0-posgraph stage below then finds a table that already covers the horizon
-# and reuses it.
+# FUSE=1 records the position graph DURING the level-0 forward pass
+# (`--record-pos-graph`); the sweep then finds a table that already covers
+# the horizon and reuses it. Measured on room (1,0) at H=72 with a synthetic
+# win: the recording costs 7% of the forward pass (265 s fused vs 248 s), and
+# it replaced a separate 242 s replay stage that no longer exists.
 #
-# ON by default for rooms where posgraphcheck.sh has been run, because the
-# replay is not a cheap safety margin - it is HALF of level 0. Measured on
-# room (1,0) at H=72 with a synthetic win: forward 248 s + pos-graph 242 s
-# unfused, against 265 s fused. The recording costs 7% of the forward pass
-# and removes a 242 s stage.
+# Historically gated (fused == replayed) at h40 on room (2,0) (2026-08-17)
+# and room (1,0) (2026-08-18): identical visited row SETS, identical sweep
+# `g` as a function of the row, the recorded table a strict SUPERSET of the
+# replay's (one extra pair, the spawn's first move), surviving --resume. A
+# superset is sound: the table only shrinks the sweep's candidate set.
 #
-# Gated at h40 on room (2,0) (2026-08-17) and room (1,0) (2026-08-18): the
-# visited row SETS are identical with and without it (900,028 rows, onlyA=0
-# onlyB=0 on (1,0)), the sweep's `g` is identical as a function of the row,
-# the recorded table is a strict SUPERSET (one extra pair - the spawn's
-# first move, which a replay starting from the frame-1 batch cannot see),
-# and the table survives --resume. A superset is sound by construction: the
-# table only shrinks the sweep's candidate set, and the EXPANSION is what
-# establishes an edge.
-#
-# Room (0,0) is NOT gated yet, so it keeps the replay until someone runs
-# `ROOM=0,0 ./posgraphcheck.sh`. FUSE=0 forces the replay anywhere.
-case "${FUSE:-}" in
+# The static replay builder is GONE (it was the room (0,0) OOM), so the
+# position graph MUST be recorded in the forward pass now - there is no
+# replay to fall back to. Room (0,0)'s fused table is therefore validated
+# only by the sweep reading it end to end (the fused-vs-replay gate went
+# with the replay). FUSE defaults on everywhere.
+case "${FUSE:-1}" in
   1) FUSE_ARG="--record-pos-graph" ;;
-  0) FUSE_ARG="" ;;
-  "") case "$ROOM" in
-        1,0|2,0) FUSE_ARG="--record-pos-graph" ;;
-        *) FUSE_ARG=""
-           echo "pos-graph: replay path (room $ROOM is not gated for fused recording;" \
-                "run ROOM=$ROOM ./posgraphcheck.sh, then FUSE=1)" ;;
-      esac ;;
+  0) echo "FUSE=0 is no longer supported: the static replay builder was removed;" \
+          "the forward must record the position graph (FUSE=1)" >&2; exit 1 ;;
   *) echo "FUSE must be 0 or 1" >&2; exit 1 ;;
 esac
-[ -n "$FUSE_ARG" ] && echo "pos-graph: recorded IN the forward pass (fused)"
+echo "pos-graph: recorded IN the forward pass (fused)"
 # SHARE_POSGRAPH=1 (the default) gives every banded level LEVEL 0's position
 # graph instead of rebuilding one per (k, H) - 16 stages of 19-22 s per
 # horizon, measured on room (1,0) at H=72.
@@ -182,12 +172,9 @@ esac
 # (posgraphsharecheck.sh). `--pos-graph-from` re-checks the fingerprint at
 # every coarser precision level, so a table from a different recipe, room,
 # chunk cap or win target is still refused.
-SHARE_POSGRAPH=${SHARE_POSGRAPH:-1}
-case "$SHARE_POSGRAPH" in
-  1) echo "pos-graph: banded levels borrow level 0's table" ;;
-  0) echo "pos-graph: rebuilt per level (SHARE_POSGRAPH=0)" ;;
-  *) echo "SHARE_POSGRAPH must be 0 or 1" >&2; exit 1 ;;
-esac
+# Banded levels always borrow level 0's table now (the per-level rebuild went
+# with the static builder); SHARE_POSGRAPH is no longer a knob.
+echo "pos-graph: banded levels borrow level 0's table"
 for H in $(seq "$FROM" "$TO"); do
   echo "=== horizon $H: level 0 extend + sweep ==="
   # A level-0 tree built past this horizon in one process (which is how a
@@ -231,12 +218,11 @@ for H in $(seq "$FROM" "$TO"); do
   # both were measured and both still OOMed. What works below f090 is the
   # group knob (250k -> 100k took f001..f080 from 40-76 GB to 6-10 GB with a
   # BYTE-IDENTICAL table), and what works above it is one process per few
-  # frames, since glibc keeps the arenas between frames. `rewrite pos-graph
-  # --frames N` extends an existing table, so staging it is just a loop.
-  stage "l0-posgraph-h$H" /tmp/l0posgraph-h$H.log \
-      "$BIN" --recipe "$RECIPE" pos-graph \
-      --checkpoint-dir "$L0" --frames "$H" \
-      ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
+  # frames, since glibc keeps the arenas between frames.
+  #
+  # The l0-posgraph stage is GONE: the forward fuses the recording
+  # (`--record-pos-graph`), so its posgraph.bin already covers the horizon
+  # and the sweep loads it directly.
   stage "l0-sweep-h$H" /tmp/l0sweep-h$H.log \
       "$BIN" --recipe "$RECIPE" sweep \
       --checkpoint-dir "$L0" --frames "$H" --horizon "$H" \
@@ -261,15 +247,11 @@ for H in $(seq "$FROM" "$TO"); do
       break
     fi
     echo "=== horizon $H: k=$K wins; sweeping level $K ==="
-    if [ "$SHARE_POSGRAPH" = 1 ]; then
-      SHARE_ARGS=(--pos-graph-from "$L0")
-    else
-      SHARE_ARGS=()
-      stage "k$K-posgraph-h$H" "/tmp/k${K}posgraph-h$H.log" \
-          env CELESTE_REM_BITS=$K "$BIN" --recipe "$RECIPE" pos-graph \
-          --checkpoint-dir "$KDIR" --frames "$H" \
-          ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
-    fi
+    # Banded levels always BORROW level 0's position graph (SHARE_POSGRAPH
+    # semantics, now the only path): level 0 over-approximates every level
+    # above it, so its table contains level k's. The per-(k,H) rebuild stage
+    # is gone with the static builder.
+    SHARE_ARGS=(--pos-graph-from "$L0")
     stage "k$K-sweep-h$H" "/tmp/k${K}sweep-h$H.log" \
         env CELESTE_REM_BITS=$K "$BIN" --recipe "$RECIPE" sweep --banded \
         --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H" \

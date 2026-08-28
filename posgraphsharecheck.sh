@@ -68,15 +68,14 @@ for K in $(seq 1 "$MAXK"); do
   env CELESTE_REM_BITS=$K ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" \
       bench --frames "$H" --deopt --checkpoint-dir "$KDIR" --save-frames \
       --band-dir "$PREV" --band-horizon "$H" --band-prev-bits "$PREV_BITS" \
+      --record-pos-graph \
       > "$D/k$K-bench.log" 2>&1
   if ! grep -q "first room-exit" "$D/k$K-bench.log"; then
     echo "k=$K     : refuted at H=$H, no sweep to compare - stopping here"
     break
   fi
 
-  echo "== k=$K: sweep with its OWN table"
-  env CELESTE_REM_BITS=$K ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" \
-      pos-graph --checkpoint-dir "$KDIR" --frames "$H" > "$D/k$K-pg.log" 2>&1
+  echo "== k=$K: sweep with its OWN table (fused into the k forward above)"
   env CELESTE_REM_BITS=$K ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" \
       sweep --banded --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H" \
       > "$D/k$K-sweep-own.log" 2>&1

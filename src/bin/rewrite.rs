@@ -369,33 +369,6 @@ enum Command {
         #[arg(long = "variant")]
         variants: Vec<String>,
     },
-    /// Build (or extend) the position-transition table `pos_graph` on its
-    /// own, without sweeping.
-    ///
-    /// The sweep does this itself when the table is missing or short of the
-    /// horizon, through the same function. Doing it separately is worth it
-    /// at room-(0,0) scale for two reasons: it is 1.7 h that is then banked
-    /// on disk across sweeps, and the replay's transient does not have to
-    /// share a process - and a cgroup limit - with the re-index that
-    /// follows it.
-    PosGraph {
-        #[arg(long)]
-        checkpoint_dir: String,
-        /// The forward pass's last frame (its checkpoint must exist).
-        #[arg(long)]
-        frames: u32,
-        /// Register a shape-dispatched variant, exactly as `bench
-        /// --variant` spells it (SHAPES[@PM1]=RECIPE_PATH). This stage
-        /// replays the forward pass, so it takes the same set - not
-        /// because correctness needs it (dispatch is semantically
-        /// invisible; a variant-free replay of a variant-recorded forward
-        /// pass is legal) but so that a WRONG variant shows up as a
-        /// disagreement between stages rather than as a campaign whose
-        /// stages quietly disagree. ladder.sh passes the same
-        /// `${VARIANT_ARGS[@]}` to every stage.
-        #[arg(long = "variant")]
-        variants: Vec<String>,
-    },
     /// The whole precision ladder in ONE process - the in-binary
     /// replacement for `ladder.sh` (default path: SHARE_POSGRAPH=1, no
     /// variants). For each horizon it extends level 0 (forward + fused
@@ -2667,32 +2640,6 @@ fn main() -> Result<()> {
                     ("out_of_table", result.out_of_table.to_string()),
                 ],
             );
-        }
-        Command::PosGraph {
-            checkpoint_dir,
-            frames,
-            variants,
-        } => {
-            use celeste_rust::search::state_mapping::StateMapping;
-            use celeste_rust::search::sweep_time;
-            let dir = std::path::PathBuf::from(checkpoint_dir);
-            let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
-            let fingerprint = celeste_rust::search::checkpoint::config_fingerprint(&recipe_text);
-            let plain = Program::compile_executable_from_disk()?;
-            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
-            let mapping = StateMapping::from_recipe(&recipe);
-            let build = |p: &Program| build_variants(&variants, p);
-            sweep_time::prepare_pos_graph(
-                &dir,
-                frames,
-                &fingerprint,
-                &recipe_text,
-                None,
-                &program,
-                &plain,
-                mapping,
-                &build,
-            )?;
         }
         Command::Ladder {
             from,
