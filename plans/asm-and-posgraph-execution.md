@@ -82,18 +82,35 @@ Findings from the real-graph gate (drove the above):
   CHOICE nodes: `Free` (button assignment) and `Split`/`SplitValid` (interval
   fork). These are UN-SPECIALIZED — `bind`'s graph still holds them.
 
-NEXT INCREMENT (the crux): **per-variant graph specialization**. The real
-kernel compute is per-variant (the `Lowered.variants`): each variant fixes
-the choices — `Free(d)` -> a constant button state, `Split(d)` -> `Frag((s>>d)
-&1)` (graph.rs `fold`, ~:491). So the ASM path must, per shape, enumerate the
-choice assignments (the `ChoiceSet`/variant enumeration), specialize
-`bind.graph` per choice into a straight-line graph (only Frag/FragOk left,
-which the codegen handles), remap the roots, and ASM-compile ONE kernel per
-variant. `Lowered.variants` gives the variants but as rendered Rust exprs, not
-node graphs — need the node-level specialization (graph.rs specialize/fold +
-the choice enumeration) exposed. THEN: generic Rust append/dedup/boundary from
-the outcome metadata; dispatch shim at `dispatch.rs:241`; startup retrace;
-ASM fingerprint + gates; delete the generated kernel crates.
+CORRECTED APPROACH (Philippe, 2026-08-29): resolve the forks at the GRAPH
+level into ONE fused graph, NOT per-variant. This is already how the Rust
+kernel is built - `emit_body` specializes every (button, fork) configuration
+into one shared hash-consed arena (`Free`->const, `Split`->`Frag`), so agreeing
+configs share nodes. There is no per-variant compilation; the "variants" are
+just distinct root tuples over that one fused graph.
+
+DONE (`ba96ecc`):
+- `lower::specialize_frame` — steps 1-4 of the frame lowering factored out of
+  `emit_body` (which now calls it). Byte-for-byte identical Rust kernels, so
+  it is the SINGLE source of the specialized compute.
+- `trace::emit::asm_fused(bound, room, decide)` — runs `specialize_frame`,
+  returns the fused graph + per-body roots (`AsmBody{outcome,frees,splits,
+  roots=[fields..,ok,live]}`) + flat roots + input reprs.
+- codegen `Op::Sel` now dispatches on the JOINED arm domain (num+ival -> ival,
+  coercing the num arm) — the one real codegen gap the fused graph exposed.
+- Gate `every_start_room_kernel_graph_asm_compiles_the_fused_graph`: every
+  start-room shape's fused graph assembles+loads. One .so per shape.
+
+NEXT INCREMENT: the generic Rust APPEND. The ASM function computes, per body,
+the output field columns + `ok`/`live` masks into packed slots. A generic Rust
+routine then, per body: take `live & ok` lanes, push the field values into the
+outcome's acc block (built from the outcome's structure), recompute the row key
+in Rust (`Rt2::row_keys_canonical` — seeds match the kernel's byte-for-byte),
+dedup via `RowSet` + the frozen-frontier `skip`, and boundary. This replaces
+the generated per-kernel `append{i}`. THEN: wire into `dispatch.rs:241`;
+startup retrace + JIT (shell out to gcc at boot); ASM fingerprint; gate against
+the interpreter (`CELESTE_COMPILED_FORWARD=check`); delete the generated kernel
+crates.
 
 ### Original scope below (kept for reference)
 
