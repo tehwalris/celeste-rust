@@ -58,6 +58,45 @@ Risk: associating each output with its input group's cell without the tag needs
 the frame body to process a uniform-position input and record per-input-state.
 Check where interpret_state_base calls tag/record and thread c_in through.
 
+## B. ASM kernel cutover (P6) — PROGRESS 2026-08-29
+
+Committed increments (branch census):
+- `e986a9e` — **bool inputs** in the ASM codegen (`CellRepr::Bool`, a
+  `LoadMask` inst: movzwl/kmovw/vpmovm2d). Closes gap #2 (bool half). Gated
+  by `asm_bool_input_matches_primitives`.
+- `b029e74` — **ival inputs** (`CellRepr::Ival`, two ZN planes; repr-aware
+  input layout: `Compiled.input_offsets/input_reprs/input_bytes`). Gated by
+  `asm_ival_input_matches_primitives`. Plus `trace::emit::asm_roots_and_reprs`
+  (extract the flat root list + input reprs from a `Bound`) and the real-graph
+  gate `every_start_room_kernel_graph_asm_extracts_and_compiles`.
+
+Findings from the real-graph gate (drove the above):
+- The row key is recomputed generically in Rust (`Rt2::row_keys_canonical`/
+  `boundary_finish`, seeds match byte-for-byte, `key_check` already asserts
+  equality) — so h1/h2 are NOT ASM roots and `CellMix`/`AddW` never need ASM
+  codegen. ASM roots = per outcome: output field nodes, then `live`, then `ok`.
+- Real kernel inputs are num + bool + **ival** (`player.rem`); all three now
+  load. No other input kinds appear.
+- The codegen ALREADY implements the specialized fork ops `Frag`/`FragOk`/
+  `Span`/`SplitOk`. The ONLY ops it cannot lower on a real graph are the
+  CHOICE nodes: `Free` (button assignment) and `Split`/`SplitValid` (interval
+  fork). These are UN-SPECIALIZED — `bind`'s graph still holds them.
+
+NEXT INCREMENT (the crux): **per-variant graph specialization**. The real
+kernel compute is per-variant (the `Lowered.variants`): each variant fixes
+the choices — `Free(d)` -> a constant button state, `Split(d)` -> `Frag((s>>d)
+&1)` (graph.rs `fold`, ~:491). So the ASM path must, per shape, enumerate the
+choice assignments (the `ChoiceSet`/variant enumeration), specialize
+`bind.graph` per choice into a straight-line graph (only Frag/FragOk left,
+which the codegen handles), remap the roots, and ASM-compile ONE kernel per
+variant. `Lowered.variants` gives the variants but as rendered Rust exprs, not
+node graphs — need the node-level specialization (graph.rs specialize/fold +
+the choice enumeration) exposed. THEN: generic Rust append/dedup/boundary from
+the outcome metadata; dispatch shim at `dispatch.rs:241`; startup retrace;
+ASM fingerprint + gates; delete the generated kernel crates.
+
+### Original scope below (kept for reference)
+
 ## B. ASM kernel cutover (P6, "wire in ASM, delete the old kernels")
 
 GOAL: replace the ~900k lines of checked-in Rust kernels (the rustc+LLVM
