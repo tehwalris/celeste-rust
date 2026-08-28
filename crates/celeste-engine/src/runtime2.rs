@@ -811,6 +811,25 @@ impl Rt2 {
         self.boundary_dedup()
     }
 
+    /// Per-lane canonical row keys, NO widening and NO dedup: materialize,
+    /// canonicalize, hash - then hand back `row_keys` verbatim, lane i of the
+    /// input as key i of the output.
+    ///
+    /// This is the ONE row key of the search (the kernel/engine key), used to
+    /// RECOMPUTE the keys of an already-abstracted state - the backward
+    /// sweep's index build and the band filter. The state handed in is
+    /// already at its final rung abstraction (the campaign widened it before
+    /// the forward's boundary hashed it), so the widening is baked into the
+    /// content and re-applying `boundary_widen` here would be idempotent at
+    /// Bits(0) and WRONG at any finer rung. Skipping it makes this key a pure
+    /// function of the state's content, so it reproduces whatever the
+    /// forward's `boundary` / `boundary_exact` stored, at every level.
+    pub fn row_keys_canonical(&mut self) -> Vec<(u64, u64)> {
+        self.boundary_prepare();
+        self.boundary_finish();
+        self.row_keys.clone()
+    }
+
     /// Shared boundary head: materialize every stale column (the
     /// boundary walks whole columns - BFS pointer scan, hashing,
     /// compaction) and clear the widen history.

@@ -629,6 +629,100 @@ mod tests {
         );
     }
 
+    /// `engine_row_keys` (the canonical row key, recomputed from a state's
+    /// content by re-importing and re-hashing) reproduces the keys a
+    /// compiled forward CARRIES out of its boundary, byte for byte, per lane.
+    ///
+    /// This is the property the backward sweep rests on: it recomputes a
+    /// saved lane's key and looks it up in the row table the forward built
+    /// from these carried keys. If the recompute did not match the carry,
+    /// the lookup would miss - exactly the "not in the row table" bug this
+    /// unification fixes.
+    #[test]
+    fn engine_row_keys_reproduce_the_carried_keys() {
+        // The init CFG interpret recurses deeper than a nextest test
+        // thread's default stack; run the body on a big-stack thread (the
+        // production sweep does not run init, so it is unaffected).
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(engine_row_keys_reproduce_the_carried_keys_body)
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    fn engine_row_keys_reproduce_the_carried_keys_body() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        // Build from the COMPILE recipe - the program whose boundary defines
+        // the key, and the one `engine_row_keys` uses internally.
+        let compile_program =
+            crate::program::frozen::rewritten("rewrites-compile.jsonl").expect("frozen compile");
+        crate::interpreter::vectorize::set_merge_partition_patterns(
+            &compile_program.merge_partition_cells,
+        );
+        let engine = crate::compiled::FrameEngine::new_for_start_room(&compile_program)
+            .expect("build engine");
+
+        // Seed exactly as AbstractRun::start does.
+        let fixed_env = compile_program.fixed_env();
+        let initial =
+            crate::game_runner::create_initial_state_with_builtins(&fixed_env);
+        let init_states = crate::interpreter::glue::interpret_cfg(
+            compile_program.init_cfg().clone(),
+            initial,
+            &fixed_env,
+        )
+        .expect("init");
+        let mut states: Vec<crate::interpreter::state::State> =
+            init_states.into_iter().map(|(s, _)| s).collect();
+        for s in &mut states {
+            crate::game_runner::inject_tile_flag_at_builtin(s);
+        }
+
+        let frame_cfg = crate::interpreter::fixed_env::PreparedCfg::new(
+            compile_program.frame_cfg().clone(),
+        );
+        let mut checked_lanes = 0usize;
+        // 26 frames: enough to reach the first fork (frame 25) so the check
+        // spans multi-lane blocks, not just the single spawn lane.
+        for frame in 1..=26 {
+            let mut next = Vec::new();
+            for state in std::mem::take(&mut states) {
+                if state.vector_size == 0 {
+                    continue;
+                }
+                let outputs = engine.run_frame_chunk(&state, Some((&frame_cfg, &fixed_env)));
+                for (out, carried) in outputs {
+                    let carried = carried.unwrap_or_else(|| {
+                        panic!("frame {}: the engine did not carry keys", frame)
+                    });
+                    let recomputed =
+                        crate::compiled::engine_row_keys(&out).expect("engine_row_keys");
+                    assert_eq!(
+                        recomputed, carried,
+                        "frame {}: engine_row_keys does not reproduce the carried keys \
+                         ({} lanes)",
+                        frame,
+                        out.vector_size
+                    );
+                    checked_lanes += out.vector_size;
+                    next.push(out);
+                }
+            }
+            states = next;
+            assert!(!states.is_empty(), "frame {}: no states carried forward", frame);
+        }
+        assert!(
+            checked_lanes > 0,
+            "no lanes were checked - the engine produced no keyed output"
+        );
+    }
+
     /// The rung-agnostic set at LEVEL 0 (`CELESTE_TRACED_SET=ladder`,
     /// rem Bits(0)): exercises `Rt2::boundary_exact` plus the campaign's
     /// full Bits(0) widening downstream, compared with the level-0

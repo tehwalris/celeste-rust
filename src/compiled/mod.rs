@@ -279,6 +279,38 @@ pub struct PlainPath {
     pub mapping: crate::search::state_mapping::StateMapping,
 }
 
+/// The recipe the kernels and the name tables were generated from - the
+/// program whose boundary defines the canonical row key.
+const COMPILE_RECIPE: &str = "rewrites-compile.jsonl";
+
+/// The canonical (kernel/engine) row keys of a state, per lane in lane
+/// order - the ONE row key of the search.
+///
+/// Backed by a process-wide `FrameEngine` built from the COMPILE recipe's
+/// frozen program, so the ids/cart/cache match every compiled forward's and
+/// the keys it produces are byte-identical to what a forward stored. This is
+/// available regardless of `CELESTE_COMPILED_FORWARD`: the backward sweep and
+/// the band filter key on it even when the forward that wrote the checkpoint
+/// was the interpreter, so there is exactly one key space.
+pub fn engine_row_keys(
+    state: &crate::interpreter::state::State,
+) -> Result<Vec<(u64, u64)>> {
+    use anyhow::Context;
+    static KEY_ENGINE: std::sync::OnceLock<FrameEngine> = std::sync::OnceLock::new();
+    let engine = match KEY_ENGINE.get() {
+        Some(e) => e,
+        None => {
+            let compile_program = crate::program::frozen::rewritten(COMPILE_RECIPE)
+                .with_context(|| format!("loading the frozen {}", COMPILE_RECIPE))?;
+            let engine = FrameEngine::new_for_start_room(&compile_program)?;
+            // Racing initializers build identical engines; keep whichever wins.
+            let _ = KEY_ENGINE.set(engine);
+            KEY_ENGINE.get().expect("just set")
+        }
+    };
+    Ok(engine.row_keys_lane_order(state))
+}
+
 pub struct FrameEngine {
     ids: runtime2::BoundaryIds,
     frame_cfg: crate::interpreter::fixed_env::PreparedCfg,
@@ -624,6 +656,28 @@ impl FrameEngine {
         );
         t.mark(CHUNK_EXPORT);
         out
+    }
+
+    /// The kernel/engine row keys of one state, per lane in LANE ORDER (no
+    /// dedup, no widening) - the canonical row key of the whole search.
+    /// Free-function `engine_row_keys` is the usual entry point; this is the
+    /// method when a `FrameEngine` is already in hand.
+    ///
+    /// Reproduces exactly what a compiled forward's boundary stored for the
+    /// same already-abstracted content, so the backward sweep and the band
+    /// filter can recompute a saved state's keys and find them in the row
+    /// table. `import_block` + `Rt2::row_keys_canonical`; origin-tagged
+    /// states (sweep / pos-graph replays) carry their tag into `Rt2::origin`
+    /// exactly as `row_key_set` does, so the mixed keys match.
+    pub fn row_keys_lane_order(
+        &self,
+        state: &crate::interpreter::state::State,
+    ) -> Vec<(u64, u64)> {
+        let mut b = bridge::import_block(state, self.cart.clone(), self.cache.clone());
+        if let Some(tag) = origin_tag_of(state) {
+            b.origin = crate::interpreter::deopt_collect::read_origins_named(state, tag);
+        }
+        b.row_keys_canonical()
     }
 
     /// The canonical row-key SET of some interpreter states, as the
