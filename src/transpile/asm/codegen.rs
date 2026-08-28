@@ -150,6 +150,7 @@ impl Src {
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Key {
     Load(u32),
+    LoadMask(u32),
     BcastD(i32),
     RBin(u8, Vreg, SrcKey),
     Neg(Vreg),
@@ -180,6 +181,11 @@ fn key_ord(k: SrcKey) -> (u8, i64) {
 /// (`dst`), which is what makes the allocator a single-register problem.
 enum Inst {
     Load { dst: Vreg, off: u32 },
+    /// Load a 16-bit `val` mask from the input buffer at `off` and expand it
+    /// to a per-lane vector mask (`movzwl`; `kmovw`; `vpmovm2d`). The bool
+    /// input path - the reverse of `StoreMask`; `known` is supplied as
+    /// `Const(true)` by the lowerer.
+    LoadMask { dst: Vreg, off: u32 },
     BcastD { dst: Vreg, val: i32 },
     RBin { dst: Vreg, op: ROp, a: Vreg, b: Src },
     Neg { dst: Vreg, a: Vreg },
@@ -222,6 +228,22 @@ pub enum RootKind {
     Bool,
     Ival,
     Word,
+}
+
+/// How an `Op::Cell` INPUT column is packed in the input buffer, so the
+/// codegen loads it into the right value domain. Every input cell still
+/// occupies one 64-byte slot (`input_cells[i]` at `i*64`); the repr only
+/// changes how those bytes are interpreted:
+/// * `Num` - 16 x i32 raw `Pico8Num` (a full `ZN`).
+/// * `Bool` - a 16-bit `val` mask in the first 2 bytes; `known` is implicitly
+///   all-ones (block bool inputs are fully known, e.g. `has_dashed`).
+///
+/// A cell absent from the repr map defaults to `Num`, so callers that only
+/// have numeric inputs pass an empty map.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CellRepr {
+    Num,
+    Bool,
 }
 
 /// The result of lowering: the assembly text plus the two layouts a caller
@@ -273,6 +295,8 @@ struct Lower<'a> {
     next_vreg: Vreg,
     input_cells: Vec<u32>,
     cell_off: HashMap<u32, u32>,
+    /// Per-cell input repr (absent = `Num`); decides how `Op::Cell` loads.
+    cell_reprs: &'a HashMap<u32, CellRepr>,
     /// Global value numbering: a pure op's `Key` -> the vreg that already
     /// holds its result. This is the CSE that shares the inner `mix64`
     /// across rows.
@@ -658,8 +682,20 @@ impl<'a> Lower<'a> {
                     .cell_off
                     .get(c)
                     .expect("input cell offset assigned before lowering");
-                let dst = self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
-                Value::Num(NumVal::Reg(dst))
+                match self.cell_reprs.get(c).copied().unwrap_or(CellRepr::Num) {
+                    CellRepr::Num => {
+                        let dst =
+                            self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
+                        Value::Num(NumVal::Reg(dst))
+                    }
+                    CellRepr::Bool => {
+                        // The val plane is a 16-bit mask expanded per lane;
+                        // block bool inputs are fully known.
+                        let dst =
+                            self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off });
+                        Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
+                    }
+                }
             }
             Op::Word(w) => Value::Word([WordHalf::ConstU64(*w), WordHalf::ConstU64(*w)]),
             op @ (Op::Add | Op::Sub | Op::Min | Op::Max) => {
@@ -1119,7 +1155,7 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
         }
     };
     match inst {
-        Inst::Load { .. } | Inst::BcastD { .. } => {}
+        Inst::Load { .. } | Inst::LoadMask { .. } | Inst::BcastD { .. } => {}
         Inst::RBin { a, b, .. } => {
             out.push(*a);
             push_src(b, out);
@@ -1266,6 +1302,7 @@ fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
 fn inst_def(inst: &Inst) -> Option<Vreg> {
     match inst {
         Inst::Load { dst, .. }
+        | Inst::LoadMask { dst, .. }
         | Inst::BcastD { dst, .. }
         | Inst::RBin { dst, .. }
         | Inst::Neg { dst, .. }
@@ -1489,6 +1526,18 @@ impl<'a> Emitter<'a> {
                 }
                 let d = self.def_reg(*dst);
                 writeln!(self.out, "    vmovdqu64 {}(%r13), %zmm{}", off, d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::LoadMask { dst, off } => {
+                if self.skip_def(*dst) {
+                    return;
+                }
+                let d = self.def_reg(*dst);
+                // Load the 16-bit val mask and expand it to a per-lane vector
+                // mask (the reverse of StoreMask).
+                writeln!(self.out, "    movzwl {}(%r13), %eax", off).unwrap();
+                writeln!(self.out, "    kmovw %eax, %k1").unwrap();
+                writeln!(self.out, "    vpmovm2d %k1, %zmm{}", d).unwrap();
                 self.store_def(*dst, d);
             }
             Inst::BcastD { dst, val } => {
@@ -1725,7 +1774,12 @@ impl<'a> Emitter<'a> {
 }
 
 /// Compile `roots` (each a word-domain node) of `g` into AVX-512 assembly.
-pub fn compile(g: &Graph, roots: &[NodeId], sym: &str) -> Result<Compiled> {
+pub fn compile(
+    g: &Graph,
+    roots: &[NodeId],
+    sym: &str,
+    cell_reprs: &HashMap<u32, CellRepr>,
+) -> Result<Compiled> {
     let live = reachable(g, roots);
 
     // Assign input offsets to reachable cells, ascending by cell id.
@@ -1748,6 +1802,7 @@ pub fn compile(g: &Graph, roots: &[NodeId], sym: &str) -> Result<Compiled> {
         next_vreg: 0,
         input_cells: cells.clone(),
         cell_off,
+        cell_reprs,
         memo: HashMap::new(),
     };
     // Schedule: lower nodes in DEPTH-major order (ASAP level, then id).

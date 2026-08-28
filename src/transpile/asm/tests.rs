@@ -710,6 +710,82 @@ fn asm_value_and_bool_layer_matches_primitives() {
     }
 }
 
+/// A bool INPUT cell (`CellRepr::Bool`): the input buffer carries a 16-bit
+/// `val` mask (known implicitly all-ones), the codegen expands it to a
+/// per-lane vector mask, and it flows through `Not`/`Sel` to Num and Bool
+/// roots. This is the input marshalling the ASM kernel dispatch needs -
+/// room (1,0) kernels take `has_dashed`/`will_restart`/... as bool inputs.
+/// Compared bit-exact against the real `ZB`/`ZN` primitives.
+#[test]
+fn asm_bool_input_matches_primitives() {
+    use crate::transpile::asm::{compile_and_load_reprs, CellRepr, RootKind};
+    let mut g = Graph::new();
+    let cnum = g.leaf(Op::Cell(0)); // num
+    let cbool = g.leaf(Op::Cell(1)); // bool
+    let cnum2 = g.leaf(Op::Cell(2)); // num
+    let notb = g.add(Op::Not, vec![cbool]);
+    let sel = g.add(Op::Sel, vec![cbool, cnum, cnum2]); // Num, gated by the bool input
+    let seln = g.add(Op::Sel, vec![notb, cnum2, cnum]); // Num, gated by !bool
+    let roots = vec![sel, seln, notb, cbool];
+    let mut reprs = HashMap::new();
+    reprs.insert(1u32, CellRepr::Bool);
+    let (compiled, loaded) =
+        compile_and_load_reprs(&g, &roots, "boolin", &reprs).expect("compile+load");
+    assert_eq!(
+        compiled.root_kinds,
+        vec![RootKind::Num, RootKind::Num, RootKind::Bool, RootKind::Bool]
+    );
+    assert_eq!(compiled.input_cells, vec![0, 1, 2]);
+
+    let mut rng = Lcg(0x600d_cafe);
+    for trial in 0..8 {
+        let mask = (rng.next_u64() & 0xFFFF) as u16;
+        let num0: [i32; 16] = std::array::from_fn(|_| rng.i32());
+        let num2: [i32; 16] = std::array::from_fn(|_| rng.i32());
+        // cell0 @0 (num ZN); cell1 @64 (u16 mask in the first 2 bytes);
+        // cell2 @128 (num ZN).
+        let mut input = vec![0u8; 3 * 64];
+        for (l, v) in num0.iter().enumerate() {
+            input[l * 4..l * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        input[64..66].copy_from_slice(&mask.to_le_bytes());
+        for (l, v) in num2.iter().enumerate() {
+            input[128 + l * 4..128 + l * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let out = run_asm_raw(&loaded, &input, compiled.n_roots, std::ptr::null());
+
+        let zb = ZB { val: mask, known: ALL };
+        let zn0 = ZN::from_array(std::array::from_fn(|i| P8::from_raw(num0[i])));
+        let zn2 = ZN::from_array(std::array::from_fn(|i| P8::from_raw(num2[i])));
+        let e_sel = zsel_n(zb, zn0, zn2);
+        let e_seln = zsel_n(zb_not(zb), zn2, zn0);
+        let e_not = zb_not(zb);
+
+        assert_eq!(&out[0..64], &zn_bytes(e_sel), "trial {trial}: sel");
+        assert_eq!(&out[128..192], &zn_bytes(e_seln), "trial {trial}: seln");
+        assert_eq!(
+            u16::from_le_bytes([out[256], out[257]]),
+            e_not.val,
+            "trial {trial}: not val"
+        );
+        assert_eq!(
+            u16::from_le_bytes([out[258], out[259]]),
+            e_not.known,
+            "trial {trial}: not known"
+        );
+        assert_eq!(
+            u16::from_le_bytes([out[384], out[385]]),
+            mask,
+            "trial {trial}: passthrough val"
+        );
+        assert_eq!(
+            u16::from_le_bytes([out[386], out[387]]),
+            ALL,
+            "trial {trial}: passthrough known"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Benchmark: asserts BOTH the asm backend and a self-contained rustc build
 // of the identical graph match the primitives, then prints compile-time and
@@ -857,7 +933,9 @@ fn asm_backend_benchmark() {
 
     // --- my backend: emit + assemble time ---
     let t = Instant::now();
-    let compiled = crate::transpile::asm::compile(&g, &roots, &format!("kernel_{sym}")).unwrap();
+    let compiled =
+        crate::transpile::asm::compile(&g, &roots, &format!("kernel_{sym}"), &HashMap::new())
+            .unwrap();
     let emit_ms = t.elapsed().as_secs_f64() * 1e3;
     let t = Instant::now();
     let so_asm = crate::transpile::asm::assemble(&compiled.asm, "bench_asm").unwrap();
