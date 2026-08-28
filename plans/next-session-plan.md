@@ -237,3 +237,37 @@ pos-graph, easy, Philippe insists) -> P2 (nice config, removes the hacks) ->
 P3 (fruit cap: verify vestigial and remove) -> P4 (forward memory, find the
 real cause) -> P5 (cell-partition pos-graph recorder, the pos-graph memory
 fix). All six are on the list.
+
+## FINDING (2026-08-28): compiled forward at rungs diverges above Bits(1)
+
+Enabling the compiled ladder (P0) surfaced a PRE-EXISTING bug: the compiled
+forward diverges from the interpreter above Bits(1).
+
+- `CELESTE_REM_BITS=2 CELESTE_COMPILED_FORWARD=check` on room (1,0), 30 frames:
+  FAILS - 90 rows the interpreter produced are MISSING from the compiled output
+  (interpreter 904, compiled 814) at f~25. And the in-process compiled ladder
+  panics at k=2 ("player_rem_xy interval [-0.5,0.5) spans 4 buckets of width
+  0x4000 (cap 2)"): the compiled forward emits a full-width (Bits(0)-widened)
+  rem at a Bits(2) rung, which the Bits(2) bucketing rejects.
+- NOT the key unification: the divergence is in the STATES (from
+  `run_frame_chunk`, unchanged by P0); the check comparator uses the same key
+  on both sides. My carried-key removal changed the frontier key, not states.
+- Bits(1) is gated (`ladder_kernels_reproduce_the_interpreter_at_bits1`) and
+  passes; Bits(2) has no gate. This is a kernel-set / rung-boundary coverage
+  gap on the compiled forward, undertested because the compiled ladder never
+  ran rungs before (compiled+sweep was broken).
+
+Consequences / decisions:
+- The in-process `rewrite ladder` runs the INTERPRETER forward at every level.
+  Its checkpoints are engine-keyed now (the one key), so the sweep reads them.
+  Correct verdict, no compiled rung.
+- A compiled level-0 + interpreter rungs HYBRID is not viable: the fingerprint's
+  compiled_engine component differs, so a rung cannot borrow level 0's band.
+- The compiled+sweep fix itself IS validated: a standalone level-0 compiled
+  ladder (f30, room (1,0)) swept 27047 rows with no "not in the row table".
+
+TODO (follow-up, not in P0-P5): fix the compiled forward at Bits(2..15).
+Add a `*_at_bits2` (or a rung sweep) differential gate. Likely the ladder
+kernel set or a rung-boundary widening in the engine. Until then KERNELS=1
+campaigns must stay at Bits(0)/Bits(1) on the compiled path, or run rungs on
+the interpreter.

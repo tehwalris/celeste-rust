@@ -1226,18 +1226,23 @@ fn run_ladder(
     std::env::set_var("CELESTE_START_ROOM", room);
     std::env::set_var("CELESTE_FRONTIER_ONLY", "1");
     std::env::set_var("CELESTE_DEOPT_COLLECT_FIRST", "1");
-    // The ladder runs the COMPILED forward. Since the search keys everything
-    // on the ONE row key (the kernel/engine key, `compiled::engine_row_keys`),
-    // a compiled checkpoint is sweep-readable: the sweep recomputes the same
-    // key it stored, so the old "a saved lane's row is not in the row table"
-    // failure is gone. Strict so a missed chunk is fatal, not silently
-    // fallen-through. Overridable from the environment.
-    if std::env::var_os("CELESTE_COMPILED_FORWARD").is_none() {
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
-    }
-    if std::env::var_os("CELESTE_KERNEL_STRICT").is_none() {
-        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
-    }
+    // The ladder runs the INTERPRETER forward at every level. The compiled
+    // forward's checkpoints are NOW sweep-readable (the search keys everything
+    // on the one kernel/engine key, `compiled::engine_row_keys`, so the old "a
+    // saved lane's row is not in the row table" failure is gone - validated by
+    // a standalone level-0 compiled ladder), but two things keep the in-process
+    // ladder on the interpreter for now:
+    //   * the compiled forward diverges from the interpreter above Bits(1) - a
+    //     pre-existing kernel-set coverage gap on room (1,0) at Bits(2), 90
+    //     rows missing at f~25 under CELESTE_COMPILED_FORWARD=check (NOT the
+    //     key unification: the states come from run_frame_chunk, unchanged), so
+    //     a compiled rung gives a wrong verdict; and
+    //   * a compiled level-0 checkpoint and interpreter rungs cannot share a
+    //     band - the fingerprint's compiled_engine component differs - so the
+    //     ladder must be uniformly one engine.
+    // The interpreter is correct at every rung and its checkpoints are
+    // engine-keyed too, so the sweep reads them the same way. See
+    // plans/next-session-plan.md "compiled forward at rungs".
     if std::env::var_os("CELESTE_MAX_STATE_LANES").is_none() {
         std::env::set_var("CELESTE_MAX_STATE_LANES", "8000");
     }
