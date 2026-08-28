@@ -38,13 +38,14 @@ pub(crate) enum TracedMode {
     ExactRem,
 }
 
-/// The mode, decided once per process: `CELESTE_TRACED_SET=traced|ladder`
-/// overrides; otherwise the rem rung picks (Bits(0) -> the level-0 set,
-/// every other rung -> the rung-agnostic set). `compiled_forward`
-/// validates the (mode, precision) combination before any chunk runs.
+/// The mode, re-evaluated per call (the in-process ladder changes the rem
+/// rung between levels): `CELESTE_TRACED_SET=traced|ladder` overrides;
+/// otherwise the rem rung picks (Bits(0) -> the level-0 set, every other
+/// rung -> the rung-agnostic set). `compiled_forward` validates the
+/// (mode, precision) combination before any chunk runs.
 pub(crate) fn traced_mode() -> TracedMode {
     // NOT cached: the in-process ladder changes rem precision per rung (via
-    // `set_rem_precision_override`), and the kernel set must follow it -
+    // `set_rem_precision`), and the kernel set must follow it -
     // Bits(0) -> the level-0 set, Bits(1..) -> the rung-agnostic set, Exact ->
     // the exact set. A OnceLock here froze the mode at level 0's Bits(0) and
     // made every rung refuse its own set. `rem_precision_from_env` is a cheap

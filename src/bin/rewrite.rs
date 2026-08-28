@@ -1241,13 +1241,10 @@ fn run_ladder(
     if std::env::var_os("CELESTE_MAX_STATE_LANES").is_none() {
         std::env::set_var("CELESTE_MAX_STATE_LANES", "8000");
     }
-    // CHUNKING IS SEMANTIC ON ROOMS WITH FRUIT (ladder.sh) - the fruit chunk
-    // cap is part of the config fingerprint and changes the row SET, not just
-    // ids. Missing it made the room (1,0) forward produce 651M rows instead
-    // of 178M. Must match ladder.sh's 8000.
-    if std::env::var_os("CELESTE_FRUIT_CHUNK_LANES").is_none() {
-        std::env::set_var("CELESTE_FRUIT_CHUNK_LANES", "8000");
-    }
+    // (The old CELESTE_FRUIT_CHUNK_LANES=8000 set here was a no-op:
+    // `effective_fruit_chunk_cap()` already defaults to 8000. The 651M-row
+    // blowup once blamed on it was the compiled-path key divergence, now
+    // fixed. The fruit cap itself is vestigial - see P3.)
 
     let recipe_text = std::fs::read_to_string(recipe_path).unwrap_or_default();
     let no_variants: Vec<String> = Vec::new();
@@ -1257,11 +1254,11 @@ fn run_ladder(
 
     'horizons: for h in from..=to {
         println!("=== horizon {}: level 0 extend + sweep ===", h);
-        // Level 0 is the default precision, Bits(0). Set BOTH the override
-        // (which rem_precision_from_env honours in-process) and the env var
-        // (so a subprocess or a direct env read agrees).
+        // Level 0 is Bits(0). `set_rem_precision` is the in-process source of
+        // truth; also clear CELESTE_REM_BITS so nothing reads a stale env
+        // default (and any subprocess agrees).
         std::env::remove_var("CELESTE_REM_BITS");
-        celeste_rust::interpreter::abstraction::set_rem_precision_override(
+        celeste_rust::interpreter::abstraction::set_rem_precision(
             celeste_rust::interpreter::abstraction::RemPrecision::Bits(0),
         );
         let l0 = level_checkpoint_dir(base_dir, 0);
@@ -1323,11 +1320,10 @@ fn run_ladder(
         let mut refuted = false;
         for k in 1..=maxk {
             // Each rung's rem precision, read by the fingerprint and the
-            // abstraction, exactly as ladder.sh's `env CELESTE_REM_BITS=$K` -
-            // but via the override, since the env read is a read-once OnceLock
-            // and this process already ran level 0.
+            // abstraction. `set_rem_precision` is the in-process source of
+            // truth; CELESTE_REM_BITS is set too so any subprocess agrees.
             std::env::set_var("CELESTE_REM_BITS", k.to_string());
-            celeste_rust::interpreter::abstraction::set_rem_precision_override(if k >= 16 {
+            celeste_rust::interpreter::abstraction::set_rem_precision(if k >= 16 {
                 celeste_rust::interpreter::abstraction::RemPrecision::Exact
             } else {
                 celeste_rust::interpreter::abstraction::RemPrecision::Bits(k)

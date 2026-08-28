@@ -231,57 +231,69 @@ impl RemPrecision {
     }
 }
 
-/// A process-lifetime override of the rem precision, for a single process
-/// that runs SEVERAL precision levels (the in-process `ladder`): the env
-/// read below is a read-once OnceLock, so it cannot express "level 0 then
-/// k=1 then k=2" in one process. When set, this takes precedence over
-/// CELESTE_REM_BITS. `NONE` = fall back to the env. Encoding: 0..=15 =
-/// `Bits(n)`, `EXACT` = `Exact`.
-static REM_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(REM_OVERRIDE_NONE);
-const REM_OVERRIDE_NONE: u8 = 0xFF;
-const REM_OVERRIDE_EXACT: u8 = 0xFE;
+/// The session rem precision, as ONE settable process global.
+///
+/// The environment (CELESTE_REM_BITS / CELESTE_EXACT_REM) is the DEFAULT
+/// source, read the first time the precision is needed; `set_rem_precision`
+/// then overrides it for the rest of the process. This is what lets a single
+/// process run several levels (the in-process `ladder`: level 0, then k=1,
+/// then k=2) - the old read-once OnceLock could only express one.
+///
+/// Encoding: 0..=15 = `Bits(n)`, `EXACT` = `Exact`, `UNSET` = not yet read
+/// from the env.
+static REM_PRECISION: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(REM_UNSET);
+const REM_UNSET: u8 = 0xFF;
+const REM_EXACT: u8 = 0xFE;
 
-/// Override the session rem precision for the rest of the process. Set by
-/// `run_ladder` before each level's stages. Idempotent; last write wins.
-pub fn set_rem_precision_override(p: RemPrecision) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let v = match p {
-        RemPrecision::Exact => REM_OVERRIDE_EXACT,
-        RemPrecision::Bits(b) if b >= 16 => REM_OVERRIDE_EXACT,
+fn encode_rem(p: RemPrecision) -> u8 {
+    match p {
+        RemPrecision::Exact => REM_EXACT,
+        RemPrecision::Bits(b) if b >= 16 => REM_EXACT,
         RemPrecision::Bits(b) => b,
-    };
-    REM_OVERRIDE.store(v, Relaxed);
+    }
 }
 
-/// The session's rem precision: the `set_rem_precision_override` value if
-/// set, else CELESTE_REM_BITS=k (16 or CELESTE_EXACT_REM mean exact; unset
-/// means the historic Bits(0)). The env branch is read once.
-pub fn rem_precision_from_env() -> RemPrecision {
-    match REM_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        REM_OVERRIDE_NONE => {}
-        REM_OVERRIDE_EXACT => return RemPrecision::Exact,
-        b => return RemPrecision::Bits(b),
+/// Set the session rem precision for the rest of the process (overriding the
+/// env default). Last write wins.
+pub fn set_rem_precision(p: RemPrecision) {
+    REM_PRECISION.store(encode_rem(p), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn rem_precision_from_env_default() -> RemPrecision {
+    if std::env::var_os("CELESTE_EXACT_REM").is_some() {
+        return RemPrecision::Exact;
     }
-    static PRECISION: std::sync::OnceLock<RemPrecision> = std::sync::OnceLock::new();
-    *PRECISION.get_or_init(|| {
-        if std::env::var_os("CELESTE_EXACT_REM").is_some() {
-            return RemPrecision::Exact;
-        }
-        match std::env::var("CELESTE_REM_BITS") {
-            Ok(v) => {
-                let bits: u8 = v
-                    .parse()
-                    .unwrap_or_else(|_| panic!("CELESTE_REM_BITS={:?} is not a number", v));
-                if bits >= 16 {
-                    RemPrecision::Exact
-                } else {
-                    RemPrecision::Bits(bits)
-                }
+    match std::env::var("CELESTE_REM_BITS") {
+        Ok(v) => {
+            let bits: u8 = v
+                .parse()
+                .unwrap_or_else(|_| panic!("CELESTE_REM_BITS={:?} is not a number", v));
+            if bits >= 16 {
+                RemPrecision::Exact
+            } else {
+                RemPrecision::Bits(bits)
             }
-            Err(_) => RemPrecision::Bits(0),
         }
-    })
+        Err(_) => RemPrecision::Bits(0),
+    }
+}
+
+/// The session's rem precision: the `set_rem_precision` value if one was set,
+/// else the env default (CELESTE_REM_BITS=k; 16 or CELESTE_EXACT_REM mean
+/// exact; unset means the historic Bits(0)), latched on first read.
+pub fn rem_precision_from_env() -> RemPrecision {
+    use std::sync::atomic::Ordering::Relaxed;
+    match REM_PRECISION.load(Relaxed) {
+        REM_UNSET => {
+            let p = rem_precision_from_env_default();
+            // Racing readers compute the same env default; either store wins.
+            REM_PRECISION.store(encode_rem(p), Relaxed);
+            p
+        }
+        REM_EXACT => RemPrecision::Exact,
+        b => RemPrecision::Bits(b),
+    }
 }
 
 /// The spd precision ladder (plans/spd-rung.md) - the rung BELOW level 0
@@ -324,7 +336,12 @@ impl SpdPrecision {
 }
 
 /// The session's spd precision: CELESTE_SPD_WIDTH_LOG2=w (unset means
-/// Exact - nothing changes for existing campaigns). Read once.
+/// Exact - nothing changes for existing campaigns).
+///
+/// Still read-once from the env: unlike rem, no code path SETS spd
+/// in-process (the ladder refines rem, not spd), so there is nothing for a
+/// settable override to express. If an in-process spd ladder ever lands,
+/// mirror `set_rem_precision`.
 pub fn spd_precision_from_env() -> SpdPrecision {
     static PRECISION: std::sync::OnceLock<SpdPrecision> = std::sync::OnceLock::new();
     *PRECISION.get_or_init(|| match std::env::var("CELESTE_SPD_WIDTH_LOG2") {
