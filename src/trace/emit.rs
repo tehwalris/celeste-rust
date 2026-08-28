@@ -222,6 +222,44 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
     Ok(Bound { graph, forks: f.forks, inputs, uni, outcomes })
 }
 
+/// The flat ASM root list and per-cell input reprs for a bound frame, so
+/// the AVX-512 backend (`transpile::asm::compile`) can lower its COMPUTE
+/// core.
+///
+/// Roots, per outcome in order: every output field's node, then `live`,
+/// then `ok`. This is the same order `bind` builds and `root_legend`
+/// documents, MINUS the h1/h2 row-key fold - the ASM path recomputes the
+/// row key generically in Rust from the output cells (`Rt2::row_keys_
+/// canonical` / `boundary_finish`, whose seeds match the kernel's), so the
+/// `CellMix`/`AddW` nodes never need to reach the codegen.
+///
+/// Cell reprs come from the bound `inputs`/`uni` kinds: `bool` -> `Bool`,
+/// `num` -> `Num`. An `ival` (per-lane interval, e.g. `player.rem`) INPUT
+/// would need `ZI` input packing the codegen does not have yet - a loud
+/// error here rather than a silent miscompile reading two planes as one.
+pub fn asm_roots_and_reprs(
+    bound: &Bound,
+) -> Result<(Vec<NodeId>, std::collections::HashMap<u32, crate::transpile::asm::CellRepr>)> {
+    use crate::transpile::asm::CellRepr;
+    let mut roots = Vec::new();
+    for o in &bound.outcomes {
+        roots.extend(o.outputs.iter().map(|(_, nd, _)| *nd));
+        roots.push(o.live);
+        roots.push(o.ok);
+    }
+    let mut reprs = std::collections::HashMap::new();
+    for (cell, kind) in bound.inputs.iter().chain(bound.uni.iter()) {
+        let repr = match *kind {
+            "bool" => CellRepr::Bool,
+            "num" => CellRepr::Num,
+            "ival" => CellRepr::Ival,
+            other => anyhow::bail!("cell {} has unexpected input kind {:?}", cell, other),
+        };
+        reprs.insert(*cell, repr);
+    }
+    Ok((roots, reprs))
+}
+
 /// Lower a traced frame - ALL of its output shapes into ONE body.
 ///
 /// A frame that kills an object ends in a different heap shape than one

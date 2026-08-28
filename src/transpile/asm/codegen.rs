@@ -234,25 +234,47 @@ pub enum RootKind {
 /// codegen loads it into the right value domain. Every input cell still
 /// occupies one 64-byte slot (`input_cells[i]` at `i*64`); the repr only
 /// changes how those bytes are interpreted:
-/// * `Num` - 16 x i32 raw `Pico8Num` (a full `ZN`).
-/// * `Bool` - a 16-bit `val` mask in the first 2 bytes; `known` is implicitly
-///   all-ones (block bool inputs are fully known, e.g. `has_dashed`).
+/// * `Num` - one `ZN` (64 bytes): 16 x i32 raw `Pico8Num`.
+/// * `Bool` - a 16-bit `val` mask in the first 2 bytes of a 64-byte slot;
+///   `known` is implicitly all-ones (block bool inputs are fully known,
+///   e.g. `has_dashed`).
+/// * `Ival` - a `ZI` (128 bytes): the `lo` plane (`ZN`) at +0, the `hi`
+///   plane at +64. A per-lane interval, e.g. `player.rem`.
 ///
-/// A cell absent from the repr map defaults to `Num`, so callers that only
-/// have numeric inputs pass an empty map.
+/// A cell absent from the repr map defaults to `Num`. Input cells are laid
+/// out in `input_cells` order, each at `Compiled::input_offsets[i]`, sized
+/// by repr (64 or 128 bytes).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CellRepr {
     Num,
     Bool,
+    Ival,
+}
+
+impl CellRepr {
+    /// Bytes this input cell occupies in the input buffer.
+    fn size(self) -> u32 {
+        match self {
+            CellRepr::Num | CellRepr::Bool => 64,
+            CellRepr::Ival => 128,
+        }
+    }
 }
 
 /// The result of lowering: the assembly text plus the two layouts a caller
 /// needs to pack its buffers.
 pub struct Compiled {
     pub asm: String,
-    /// Input cells, in the ascending order they occupy the input buffer.
-    /// Cell `input_cells[i]` is the `ZN` (64 bytes) at byte offset `i*64`.
+    /// Input cells, in ascending order. Cell `input_cells[i]` occupies the
+    /// input buffer at byte `input_offsets[i]`, sized by `input_reprs[i]`
+    /// (`Num`/`Bool` 64 bytes, `Ival` 128).
     pub input_cells: Vec<u32>,
+    /// Byte offset of each input cell (parallel to `input_cells`).
+    pub input_offsets: Vec<u32>,
+    /// Repr of each input cell (parallel to `input_cells`).
+    pub input_reprs: Vec<CellRepr>,
+    /// Total bytes the input buffer must be.
+    pub input_bytes: u32,
     /// Number of roots. Root `i` occupies a 128-byte slot at `i*128`.
     pub n_roots: usize,
     /// Each root's type (how to read its slot).
@@ -694,6 +716,14 @@ impl<'a> Lower<'a> {
                         let dst =
                             self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off });
                         Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
+                    }
+                    CellRepr::Ival => {
+                        // Two ZN planes: lo at +0, hi at +64.
+                        let hi_off = off + 64;
+                        let lo_r = self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
+                        let hi_r =
+                            self.pure(Key::Load(hi_off), move |d| Inst::Load { dst: d, off: hi_off });
+                        Value::Ival([NumVal::Reg(lo_r), NumVal::Reg(hi_r)])
                     }
                 }
             }
@@ -1792,8 +1822,19 @@ pub fn compile(
         .collect();
     cells.sort_unstable();
     cells.dedup();
+    // Repr-aware input layout: each cell sized by its repr (Ival needs two
+    // planes), laid out ascending.
+    let input_reprs: Vec<CellRepr> =
+        cells.iter().map(|c| cell_reprs.get(c).copied().unwrap_or(CellRepr::Num)).collect();
+    let mut input_offsets: Vec<u32> = Vec::with_capacity(cells.len());
+    let mut off = 0u32;
+    for r in &input_reprs {
+        input_offsets.push(off);
+        off += r.size();
+    }
+    let input_bytes = off;
     let cell_off: HashMap<u32, u32> =
-        cells.iter().enumerate().map(|(i, c)| (*c, i as u32 * 64)).collect();
+        cells.iter().zip(&input_offsets).map(|(c, o)| (*c, *o)).collect();
 
     let mut lo = Lower {
         g,
@@ -1959,6 +2000,9 @@ pub fn compile(
     Ok(Compiled {
         asm,
         input_cells: lo.input_cells,
+        input_offsets,
+        input_reprs,
+        input_bytes,
         n_roots: roots.len(),
         root_kinds,
         sym: sym.to_string(),

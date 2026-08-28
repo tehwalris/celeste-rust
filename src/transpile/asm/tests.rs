@@ -786,6 +786,68 @@ fn asm_bool_input_matches_primitives() {
     }
 }
 
+/// An interval (`ZI`) INPUT cell (`CellRepr::Ival`): two `ZN` planes (lo at
+/// +0, hi at +64 of a 128-byte slot), the codegen loads both, and the
+/// interval flows through `Add`/`Flr` to Ival and Num roots. Real room
+/// kernels take `player.rem` as an ival input. Packed via `input_offsets`
+/// (repr-aware layout) and compared bit-exact against `zi_add`/`zi_flr`.
+#[test]
+fn asm_ival_input_matches_primitives() {
+    use crate::transpile::asm::{compile_and_load_reprs, CellRepr, RootKind};
+    let mut g = Graph::new();
+    let civ = g.leaf(Op::Cell(0)); // ival
+    let cnum = g.leaf(Op::Cell(1)); // num
+    let sum = g.add(Op::Add, vec![civ, cnum]); // Ival
+    let fl = g.add(Op::Flr, vec![sum]); // Num
+    let roots = vec![sum, fl, civ];
+    let mut reprs = HashMap::new();
+    reprs.insert(0u32, CellRepr::Ival);
+    let (compiled, loaded) =
+        compile_and_load_reprs(&g, &roots, "ivalin", &reprs).expect("compile+load");
+    assert_eq!(
+        compiled.root_kinds,
+        vec![RootKind::Ival, RootKind::Num, RootKind::Ival]
+    );
+    // cell0 ival (128 bytes) then cell1 num (64 bytes).
+    assert_eq!(compiled.input_offsets, vec![0, 128]);
+    assert_eq!(compiled.input_bytes, 192);
+
+    let mut rng = Lcg(0xda7a_1a11);
+    for trial in 0..8 {
+        // Bounded so zi_add cannot overflow (the kernel panics on overflow).
+        let bound = |r: &mut Lcg| ((r.next_u64() % 0x10_0000) as i32) - 0x8_0000;
+        let lo: [i32; 16] = std::array::from_fn(|_| bound(&mut rng));
+        let hi: [i32; 16] = std::array::from_fn(|i| lo[i] + (rng.next_u64() % 0x2_0000) as i32);
+        let num: [i32; 16] = std::array::from_fn(|_| bound(&mut rng));
+
+        let mut input = vec![0u8; compiled.input_bytes as usize];
+        for (l, v) in lo.iter().enumerate() {
+            input[l * 4..l * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (l, v) in hi.iter().enumerate() {
+            input[64 + l * 4..64 + l * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (l, v) in num.iter().enumerate() {
+            input[128 + l * 4..128 + l * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let out = run_asm_raw(&loaded, &input, compiled.n_roots, std::ptr::null());
+
+        let ziv = ZI {
+            lo: ZN::from_array(std::array::from_fn(|i| P8::from_raw(lo[i]))),
+            hi: ZN::from_array(std::array::from_fn(|i| P8::from_raw(hi[i]))),
+        };
+        let znum = ZN::from_array(std::array::from_fn(|i| P8::from_raw(num[i])));
+        let e_sum = zi_add(ziv, ZI { lo: znum, hi: znum });
+        let e_fl = zi_flr(e_sum);
+
+        assert_eq!(&out[0..64], &zn_bytes(e_sum.lo), "trial {trial}: sum lo");
+        assert_eq!(&out[64..128], &zn_bytes(e_sum.hi), "trial {trial}: sum hi");
+        assert_eq!(&out[128..192], &zn_bytes(e_fl), "trial {trial}: flr");
+        assert_eq!(&out[256..320], &zn_bytes(ziv.lo), "trial {trial}: passthrough lo");
+        assert_eq!(&out[320..384], &zn_bytes(ziv.hi), "trial {trial}: passthrough hi");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Benchmark: asserts BOTH the asm backend and a self-contained rustc build
 // of the identical graph match the primitives, then prints compile-time and

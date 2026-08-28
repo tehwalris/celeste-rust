@@ -1659,6 +1659,73 @@ mod tests {
         variant_set_is_current("traced", super::write_room_kernels);
     }
 
+    /// The ASM cutover's compute-extraction gate
+    /// (plans/asm-and-posgraph-execution.md B): `bind` ->
+    /// `asm_roots_and_reprs` -> `compile_and_load_reprs` on every real
+    /// start-room shape. Two invariants:
+    ///
+    /// 1. EXTRACTION is total: every shape yields ASM roots + input reprs
+    ///    (num/bool/ival inputs all resolve).
+    /// 2. The ONLY ops the codegen cannot yet lower on a real (un-specialized)
+    ///    graph are the CHOICE nodes - `Free` (button assignment) and
+    ///    `Split`/`SplitValid` (interval fork) - which per-variant
+    ///    specialization (the next increment) resolves to a constant / `Frag`;
+    ///    the codegen already handles Frag/FragOk/Span/SplitOk. Any OTHER
+    ///    compile failure is a regression and fails here.
+    ///
+    /// So this is green today AND guards against a new unsupported op
+    /// slipping in. A shape with no rem straddle (no fork) compiles all the
+    /// way to a loaded `.so`, proving the pipeline end-to-end on a real
+    /// kernel graph; the rest wait on specialization.
+    #[test]
+    fn every_start_room_kernel_graph_asm_extracts_and_compiles() {
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
+            return;
+        }
+        let refs = match super::room_kernels_in(std::path::Path::new(".")) {
+            Ok(r) => r,
+            Err(e) => panic!("{:#}", e),
+        };
+        assert!(!refs.is_empty(), "no start-room kernels traced");
+        let mut compiled_ok = 0usize;
+        for (si, r) in refs.iter().enumerate() {
+            let (roots, reprs) = crate::trace::emit::asm_roots_and_reprs(&r.bound)
+                .unwrap_or_else(|e| panic!("shape {si} extraction failed: {e:#}"));
+            assert!(!roots.is_empty(), "shape {si}: no roots");
+            match crate::transpile::asm::compile_and_load_reprs(
+                &r.bound.graph,
+                &roots,
+                &format!("shape{si}"),
+                &reprs,
+            ) {
+                Ok((compiled, _loaded)) => {
+                    assert_eq!(compiled.n_roots, roots.len(), "shape {si}: root count");
+                    compiled_ok += 1;
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    assert!(
+                        msg.contains("Free(")
+                            || msg.contains("Split(")
+                            || msg.contains("SplitValid("),
+                        "shape {si} failed on an op that is NOT a choice node \
+                         (Free/Split/SplitValid) - a regression: {msg}"
+                    );
+                }
+            }
+        }
+        assert!(
+            compiled_ok > 0,
+            "no un-specialized shape compiled - the pipeline never ran end-to-end"
+        );
+        eprintln!(
+            "[asm] {}/{} start-room shapes compile un-specialized; the rest await \
+             per-variant specialization (Split -> Frag)",
+            compiled_ok,
+            refs.len()
+        );
+    }
+
     /// The RUNG-AGNOSTIC set's staleness gate (plans/kernel-ladder.md).
     #[test]
     fn ladder_kernels_are_current() {
