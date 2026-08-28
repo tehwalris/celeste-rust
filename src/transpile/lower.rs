@@ -944,15 +944,34 @@ pub(crate) struct Outcome {
 /// * **`decide`, afterwards.** Guard algebra only collapses once the
 ///   choices are constants. Skipping it reports 256 bodies where there
 ///   are 16, because structural node identity is not semantic identity.
-pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
-    let forks = e.fork_depth as u8;
-
+/// Specialize a traced frame's graph into ONE fused, hash-consed arena.
+///
+/// Every (button, fork configuration) is resolved: `Free` becomes a
+/// constant and `Split`/`SplitValid` become `Frag`/`FragOk` (ordinary
+/// unary ops), so NO fork node survives and configurations that agree
+/// share nodes ("duplicate, then fuse again"). Steps 1-4 of the frame
+/// lowering. Returns the fused graph and one body per DISTINCT (outcome,
+/// roots): `(outcome, frees, splits, roots)`, where `roots` is that
+/// outcome's fields in order, then `ok`, then `live`, as node ids in the
+/// fused graph.
+///
+/// This is the SINGLE source of the specialized compute: the kernel
+/// emitter renders Rust from it (`emit_body`) and the AVX-512 backend
+/// assembles it (`trace::emit::asm_fused`), so both compute byte-for-byte
+/// the same thing - there is no parallel specialization.
+pub(crate) fn specialize_frame(
+    graph: &Graph,
+    outs: &[(Vec<NodeId>, NodeId, NodeId)],
+    forks: u8,
+    decide: bool,
+    room: Option<&crate::transpile::graph::Room>,
+) -> (Graph, Vec<(usize, u8, u64, Vec<NodeId>)>) {
     // --- 1. which forks each outcome actually depends on ---
-    let cones = e.graph.split_cones();
-    let bits_of = |o: &Outcome| -> Vec<u8> {
-        let mut m = cones[o.ok as usize] | cones[o.live as usize];
-        for f in o.of.fields.iter() {
-            m |= cones[f.node as usize];
+    let cones = graph.split_cones();
+    let bits_of = |fields: &[NodeId], ok: NodeId, live: NodeId| -> Vec<u8> {
+        let mut m = cones[ok as usize] | cones[live as usize];
+        for &f in fields {
+            m |= cones[f as usize];
         }
         (0..forks).filter(|d| m & (1u64 << d) != 0).collect()
     };
@@ -962,15 +981,15 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
     // (outcome, button, fork configuration, roots) where roots is the
     // outcome's fields in order, then `ok`, then `live`.
     let mut cands: Vec<(usize, u8, u64, Vec<NodeId>)> = Vec::new();
-    for (oi, o) in outs.iter().enumerate() {
-        let mut want: Vec<NodeId> = o.of.fields.iter().map(|f| f.node).collect();
-        want.push(o.ok);
-        want.push(o.live);
+    for (oi, (fields, ok, live)) in outs.iter().enumerate() {
+        let mut want: Vec<NodeId> = fields.clone();
+        want.push(*ok);
+        want.push(*live);
         // An outcome reaches a fraction of the graph, and mapping the
         // whole arena once per (button, configuration) is most of the
         // work and none of the answer.
-        let need = reachable(&e.graph, &want);
-        let bits = bits_of(o);
+        let need = reachable(graph, &want);
+        let bits = bits_of(fields, *ok, *live);
         // Buttons first, with the forks left standing. If two
         // assignments agree before the forks are resolved they agree
         // after - resolving is substitution, and substitution preserves
@@ -980,7 +999,7 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
             let mut probe = Graph::new();
             let mut seen: BTreeMap<Vec<NodeId>, u8> = BTreeMap::new();
             for m in 0u8..64 {
-                let map = e.graph.specialize_subset_into(m, None, Some(&need), &mut probe);
+                let map = graph.specialize_subset_into(m, None, Some(&need), &mut probe);
                 let sig: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
                 seen.entry(sig).or_insert(m);
             }
@@ -996,7 +1015,7 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                         sm |= 1u64 << d;
                     }
                 }
-                let map = e.graph.specialize_subset_into(m, Some(sm), Some(&need), &mut sp);
+                let map = graph.specialize_subset_into(m, Some(sm), Some(&need), &mut sp);
                 let roots: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
                 cands.push((oi, m, sm, roots));
             }
@@ -1004,15 +1023,15 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
     }
 
     // --- 3. decide the boolean layer, on the RESOLVED graph ---
-    if e.decide {
+    if decide {
         let all: Vec<NodeId> = cands.iter().flat_map(|c| c.3.iter().copied()).collect();
         let (g1, m1, _) =
-            crate::transpile::ival::fold(&sp, &all, e.room.as_ref()).expect("interval fold");
+            crate::transpile::ival::fold(&sp, &all, room).expect("interval fold");
         let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
         let (g2, m2, _) = crate::transpile::bdd::simplify_until_stable(&g1, &r1, 1 << 22, 4);
         let r2: Vec<NodeId> = r1.iter().map(|x| m2[*x as usize]).collect();
         let (g3, m3, _) =
-            crate::transpile::ival::fold(&g2, &r2, e.room.as_ref()).expect("interval fold 2");
+            crate::transpile::ival::fold(&g2, &r2, room).expect("interval fold 2");
         let mut it = r2.iter().map(|x| m3[*x as usize]);
         for c in cands.iter_mut() {
             for r in c.3.iter_mut() {
@@ -1030,6 +1049,18 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
             .filter(|c| seen.insert((c.0, c.3.clone())))
             .collect()
     };
+    (sp, bodies)
+}
+
+pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
+    // Steps 1-4: the fused, fork-free graph and its bodies (shared with the
+    // ASM backend, so both emit exactly this compute).
+    let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId)> = outs
+        .iter()
+        .map(|o| (o.of.fields.iter().map(|f| f.node).collect(), o.ok, o.live))
+        .collect();
+    let (mut sp, bodies) =
+        specialize_frame(&e.graph, &outs_spec, e.fork_depth as u8, e.decide, e.room.as_ref());
 
     // --- 5. the row key, as graph nodes ---
     let mut hash_of: Vec<Option<(NodeId, NodeId)>> = vec![None; bodies.len()];

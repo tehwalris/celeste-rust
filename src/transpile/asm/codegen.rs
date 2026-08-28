@@ -650,7 +650,12 @@ impl<'a> Lower<'a> {
     fn as_num(&self, id: NodeId) -> Result<NumVal> {
         match self.vals[id as usize] {
             Some(Value::Num(n)) => Ok(n),
-            _ => bail!("node {} is not a numeric value where one was needed", id),
+            _ => bail!(
+                "node {} (op {:?}, domain {}) is not a numeric value where one was needed",
+                id,
+                self.g.get(id).op,
+                self.dom(id)
+            ),
         }
     }
 
@@ -982,7 +987,11 @@ impl<'a> Lower<'a> {
             Op::Sel => {
                 let c = self.as_bool(a[0])?;
                 let cv = self.mask_reg(c[0]);
-                match self.dom(a[1]) {
+                // Dispatch on the JOINED arm domain, so a select of a number
+                // and an interval takes the interval path (as_ival coerces the
+                // numeric arm to [n, n]) - matching the Rust emitter, which
+                // reads both arms at their common representation.
+                match self.dom(a[1]).max(self.dom(a[2])) {
                     1 => {
                         let (t, f) = (self.as_bool(a[1])?, self.as_bool(a[2])?);
                         let (tv, fv) = (self.mask_reg(t[0]), self.mask_reg(f[0]));

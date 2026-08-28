@@ -1659,26 +1659,18 @@ mod tests {
         variant_set_is_current("traced", super::write_room_kernels);
     }
 
-    /// The ASM cutover's compute-extraction gate
-    /// (plans/asm-and-posgraph-execution.md B): `bind` ->
-    /// `asm_roots_and_reprs` -> `compile_and_load_reprs` on every real
-    /// start-room shape. Two invariants:
+    /// The ASM cutover's compute gate (plans/asm-and-posgraph-execution.md
+    /// B): pull out the FUSED graph (`emit::asm_fused` ->
+    /// `lower::specialize_frame`, the same fused, fork-free graph the Rust
+    /// kernel is emitted from) and assemble it, for EVERY start-room shape.
     ///
-    /// 1. EXTRACTION is total: every shape yields ASM roots + input reprs
-    ///    (num/bool/ival inputs all resolve).
-    /// 2. The ONLY ops the codegen cannot yet lower on a real (un-specialized)
-    ///    graph are the CHOICE nodes - `Free` (button assignment) and
-    ///    `Split`/`SplitValid` (interval fork) - which per-variant
-    ///    specialization (the next increment) resolves to a constant / `Frag`;
-    ///    the codegen already handles Frag/FragOk/Span/SplitOk. Any OTHER
-    ///    compile failure is a regression and fails here.
-    ///
-    /// So this is green today AND guards against a new unsupported op
-    /// slipping in. A shape with no rem straddle (no fork) compiles all the
-    /// way to a loaded `.so`, proving the pipeline end-to-end on a real
-    /// kernel graph; the rest wait on specialization.
+    /// Because the graph is fused - every fork resolved to `Frag`/const,
+    /// hash-consed - no `Free`/`Split` survives, so all real shapes compile
+    /// and load, not just the fork-free ones. This proves the whole pipeline
+    /// (trace -> specialize -> assemble) end-to-end on real kernel graphs.
+    /// One assembly kernel per shape.
     #[test]
-    fn every_start_room_kernel_graph_asm_extracts_and_compiles() {
+    fn every_start_room_kernel_graph_asm_compiles_the_fused_graph() {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
             return;
         }
@@ -1687,42 +1679,57 @@ mod tests {
             Err(e) => panic!("{:#}", e),
         };
         assert!(!refs.is_empty(), "no start-room kernels traced");
-        let mut compiled_ok = 0usize;
+        let mut total_roots = 0usize;
         for (si, r) in refs.iter().enumerate() {
-            let (roots, reprs) = crate::trace::emit::asm_roots_and_reprs(&r.bound)
-                .unwrap_or_else(|e| panic!("shape {si} extraction failed: {e:#}"));
+            let room = crate::transpile::graph::Room {
+                cart: r.cart.clone(),
+                cache: r.cache.clone(),
+            };
+            let (fused, bodies, roots, reprs) =
+                crate::trace::emit::asm_fused(&r.bound, Some(&room), true)
+                    .unwrap_or_else(|e| panic!("shape {si} fused extraction failed: {e:#}"));
+            assert!(!bodies.is_empty(), "shape {si}: no bodies");
             assert!(!roots.is_empty(), "shape {si}: no roots");
-            match crate::transpile::asm::compile_and_load_reprs(
-                &r.bound.graph,
+            let (compiled, _loaded) = crate::transpile::asm::compile_and_load_reprs(
+                &fused,
                 &roots,
-                &format!("shape{si}"),
+                &format!("fused{si}"),
                 &reprs,
-            ) {
-                Ok((compiled, _loaded)) => {
-                    assert_eq!(compiled.n_roots, roots.len(), "shape {si}: root count");
-                    compiled_ok += 1;
+            )
+            .unwrap_or_else(|e| {
+                let msg = format!("{e:#}");
+                // Pull "node N" out and report its consumers, so a domain
+                // mismatch names the op that mishandled it.
+                let mut consumers = String::new();
+                if let Some(rest) = msg.split("node ").nth(1) {
+                    if let Ok(n) = rest
+                        .split(|c: char| !c.is_ascii_digit())
+                        .next()
+                        .unwrap_or("")
+                        .parse::<u32>()
+                    {
+                        for id in 0..fused.len() as u32 {
+                            if fused.get(id).args.contains(&n) {
+                                consumers.push_str(&format!(
+                                    " {}={:?}",
+                                    id,
+                                    fused.get(id).op
+                                ));
+                            }
+                        }
+                    }
                 }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    assert!(
-                        msg.contains("Free(")
-                            || msg.contains("Split(")
-                            || msg.contains("SplitValid("),
-                        "shape {si} failed on an op that is NOT a choice node \
-                         (Free/Split/SplitValid) - a regression: {msg}"
-                    );
-                }
-            }
+                panic!(
+                    "shape {si}: fused asm compile+load failed: {msg}\n  consumers:{consumers}"
+                )
+            });
+            assert_eq!(compiled.n_roots, roots.len(), "shape {si}: root count");
+            total_roots += roots.len();
         }
-        assert!(
-            compiled_ok > 0,
-            "no un-specialized shape compiled - the pipeline never ran end-to-end"
-        );
         eprintln!(
-            "[asm] {}/{} start-room shapes compile un-specialized; the rest await \
-             per-variant specialization (Split -> Frag)",
-            compiled_ok,
-            refs.len()
+            "[asm] {} start-room shapes: fused graph compiled+loaded, {} roots total",
+            refs.len(),
+            total_roots
         );
     }
 

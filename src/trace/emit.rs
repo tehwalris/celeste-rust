@@ -222,31 +222,13 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
     Ok(Bound { graph, forks: f.forks, inputs, uni, outcomes })
 }
 
-/// The flat ASM root list and per-cell input reprs for a bound frame, so
-/// the AVX-512 backend (`transpile::asm::compile`) can lower its COMPUTE
-/// core.
-///
-/// Roots, per outcome in order: every output field's node, then `live`,
-/// then `ok`. This is the same order `bind` builds and `root_legend`
-/// documents, MINUS the h1/h2 row-key fold - the ASM path recomputes the
-/// row key generically in Rust from the output cells (`Rt2::row_keys_
-/// canonical` / `boundary_finish`, whose seeds match the kernel's), so the
-/// `CellMix`/`AddW` nodes never need to reach the codegen.
-///
-/// Cell reprs come from the bound `inputs`/`uni` kinds: `bool` -> `Bool`,
-/// `num` -> `Num`. An `ival` (per-lane interval, e.g. `player.rem`) INPUT
-/// would need `ZI` input packing the codegen does not have yet - a loud
-/// error here rather than a silent miscompile reading two planes as one.
-pub fn asm_roots_and_reprs(
+/// The per-cell ASM input reprs for a bound frame (`bool`/`num`/`ival` from
+/// the bound cell kinds). Input cells survive specialization unchanged, so
+/// this is valid for both the raw and the fused graph.
+pub fn asm_input_reprs(
     bound: &Bound,
-) -> Result<(Vec<NodeId>, std::collections::HashMap<u32, crate::transpile::asm::CellRepr>)> {
+) -> Result<std::collections::HashMap<u32, crate::transpile::asm::CellRepr>> {
     use crate::transpile::asm::CellRepr;
-    let mut roots = Vec::new();
-    for o in &bound.outcomes {
-        roots.extend(o.outputs.iter().map(|(_, nd, _)| *nd));
-        roots.push(o.live);
-        roots.push(o.ok);
-    }
     let mut reprs = std::collections::HashMap::new();
     for (cell, kind) in bound.inputs.iter().chain(bound.uni.iter()) {
         let repr = match *kind {
@@ -257,7 +239,63 @@ pub fn asm_roots_and_reprs(
         };
         reprs.insert(*cell, repr);
     }
-    Ok((roots, reprs))
+    Ok(reprs)
+}
+
+/// One fused (specialized) body: which outcome it belongs to, the choices
+/// it resolved, and its roots in the FUSED graph - the outcome's output
+/// field nodes in order, then `ok`, then `live`.
+pub struct AsmBody {
+    pub outcome: usize,
+    pub frees: u8,
+    pub splits: u64,
+    /// `outputs.len() + 2` nodes: fields..., ok, live.
+    pub roots: Vec<NodeId>,
+}
+
+/// The FUSED ASM graph, its bodies, the flat root list, and the input
+/// reprs for a bound frame.
+///
+/// `lower::specialize_frame` resolves every (button, fork) configuration
+/// into ONE shared, hash-consed graph - `Free` -> constant, `Split` ->
+/// `Frag` - so the result holds only ordinary ops the codegen lowers, and
+/// it is the SAME compute the Rust kernel emits (both call
+/// `specialize_frame`). The h1/h2 row-key fold is NOT included: the ASM
+/// path recomputes the key in Rust from the output cells
+/// (`Rt2::row_keys_canonical`, whose seeds match the kernel's).
+///
+/// `flat_roots` is every body's roots concatenated (what `compile` wants);
+/// `bodies` keeps the per-body structure the append step needs.
+pub fn asm_fused(
+    bound: &Bound,
+    room: Option<&crate::transpile::graph::Room>,
+    decide: bool,
+) -> Result<(
+    Graph,
+    Vec<AsmBody>,
+    Vec<NodeId>,
+    std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
+)> {
+    let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId)> = bound
+        .outcomes
+        .iter()
+        .map(|o| (o.outputs.iter().map(|(_, nd, _)| *nd).collect(), o.ok, o.live))
+        .collect();
+    let (fused, raw_bodies) = crate::transpile::lower::specialize_frame(
+        &bound.graph,
+        &outs_spec,
+        bound.forks,
+        decide,
+        room,
+    );
+    let mut flat_roots = Vec::new();
+    let mut bodies = Vec::with_capacity(raw_bodies.len());
+    for (outcome, frees, splits, roots) in raw_bodies {
+        flat_roots.extend(roots.iter().copied());
+        bodies.push(AsmBody { outcome, frees, splits, roots });
+    }
+    let reprs = asm_input_reprs(bound)?;
+    Ok((fused, bodies, flat_roots, reprs))
 }
 
 /// Lower a traced frame - ALL of its output shapes into ONE body.
