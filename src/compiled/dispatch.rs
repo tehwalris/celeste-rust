@@ -15,7 +15,6 @@
 //! left in it is dispatch and the diagnostic counters - the frame itself is
 //! `super::FrameEngine::step`.
 
-use celeste_engine::kernel;
 use celeste_engine::runtime2;
 
 /// Which traced set runs, and which boundary its accumulators take
@@ -93,19 +92,11 @@ pub(crate) fn kernel_strict() -> bool {
     *ON.get_or_init(|| std::env::var("CELESTE_KERNEL_STRICT").map_or(true, |v| v != "0"))
 }
 
-/// Every distinct miss reason with its lane count, for the strict-mode
-/// abort. Does NOT clear the census (`print_kernel_hits` does).
+/// A one-line miss summary for the strict-mode abort: how many lanes the
+/// ASM kernels could not serve (a shape with no assembled kernel, or a
+/// declined lane). The ASM path does not categorize by refusal step.
 pub(crate) fn miss_report() -> String {
-    let why = KERNEL_MISS_WHY.lock().unwrap();
-    if why.is_empty() {
-        return "  (no misses recorded)".to_string();
-    }
-    why.iter()
-        .map(|((class, step), lanes)| {
-            format!("  {} refused at {} ({} lanes)", class, step, lanes)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    format!("  {} lanes missed the ASM kernels", missed_lanes())
 }
 
 pub(crate) fn run_chunk_kernel(
@@ -113,14 +104,11 @@ pub(crate) fn run_chunk_kernel(
     ids: &runtime2::BoundaryIds,
     done: &mut Vec<runtime2::Rt2>,
 ) -> bool {
-    // The ASM backend (CELESTE_ASM_KERNELS) replaces the generated Rust
-    // kernels: same fused compute graph, assembled at startup. Off by
-    // default until it passes the gates.
-    let hit = if super::asm_kernel::enabled() {
-        super::asm_kernel::run_chunk(chunk, ids, done)
-    } else {
-        run_traced_kernel(chunk, ids, done)
-    };
+    // The ASM backend is THE kernel implementation: the fused compute graph
+    // assembled at startup (`asm_kernel`), which replaced the generated Rust
+    // kernels. A miss (no shape, or a declined lane) falls through to the
+    // reference path, counted below.
+    let hit = super::asm_kernel::run_chunk(chunk, ids, done);
     if hit {
         KERNEL_HITS[0].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
         return true;
@@ -129,46 +117,24 @@ pub(crate) fn run_chunk_kernel(
     false
 }
 
-/// Where the traced set refused a chunk, by step: "shape" is a heap shape
-/// no kernel has, "bind" a uniform/kind mismatch, "declined" a lane whose
-/// `ok` the kernel could not discharge.
-static KERNEL_MISS_WHY: std::sync::Mutex<
-    std::collections::BTreeMap<(&'static str, &'static str), u64>,
-> = std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-fn note_miss(class: &'static str, step: &'static str, lanes: usize) {
-    *KERNEL_MISS_WHY.lock().unwrap().entry((class, step)).or_insert(0) += lanes as u64;
-}
-
 /// Lanes the engine routed through the PLAIN program (kernel deopt
 /// sub-chunks; see `FrameEngine::plain_block`).
 pub(crate) static PLAIN_ROUTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// The active set's content hash for an explicit mode (the checkpoint
-/// fingerprint of another precision level - see `traced_mode_for`).
-/// Hashed into the campaign fingerprint whenever the compiled engine is
-/// on: nothing the fingerprint already reads determines which kernels
-/// ran, so the sets name themselves. Since the multi-room merge, each
-/// `FINGERPRINT` covers every room's sources in the set.
-pub(crate) fn set_fingerprint_for(mode: TracedMode) -> u64 {
-    match mode {
-        TracedMode::Level0 => celeste_kernels::traced::FINGERPRINT,
-        // Tagged so the modes never share checkpoints, even in the
-        // unlikely event two sets' rendered sources hashed equal.
-        TracedMode::Level0Agnostic => celeste_kernels::ladder::FINGERPRINT ^ 0x6c61_6464_6572,
-        TracedMode::ExactRem => celeste_kernels::exact::FINGERPRINT ^ 0x6578_6163_74,
-    }
+/// The kernel backend's content hash, hashed into the campaign fingerprint
+/// whenever the compiled engine is on: nothing else the fingerprint reads
+/// determines what the kernels compute. `mode` is ignored - the rem rung is
+/// already a separate fingerprint component (`CampaignConfig::precision`),
+/// so the ASM engine's identity is mode-independent (see
+/// `asm_kernel::engine_fingerprint`), which is also what lets the band
+/// loader recompute a previous level's fingerprint in-process and match.
+pub(crate) fn set_fingerprint_for(_mode: TracedMode) -> u64 {
+    super::asm_kernel::engine_fingerprint()
 }
 
-/// Lanes [0] the traced set ran, [1] missed.
+/// Lanes [0] the kernels ran, [1] missed.
 static KERNEL_HITS: [std::sync::atomic::AtomicU64; 2] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
-
-/// Kernel rows [materialized by append_out, surviving within-chunk dedup].
-static KROWS: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
@@ -203,116 +169,17 @@ pub fn print_kernel_hits() {
             v[0], v[1], plain
         );
     }
-    {
-        let mut why = KERNEL_MISS_WHY.lock().unwrap();
-        for ((class, step), lanes) in why.iter() {
-            eprintln!("kernel miss: {} refused at {} ({} lanes)", class, step, lanes);
-        }
-        why.clear();
-    }
-    let rows: Vec<u64> = KROWS
-        .iter()
-        .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))
-        .collect();
-    if rows[0] > 0 {
-        eprintln!(
-            "kernel rows: materialized {} -> {} after within-chunk dedup ({:.1}:1)",
-            rows[0],
-            rows[1],
-            rows[0] as f64 / rows[1].max(1) as f64
-        );
-    }
 }
 
-/// The shape index over the checked-in traced set, built once.
-///
-/// `Dispatch::new` REFUSES two kernels for one shape rather than picking
-/// by hash order, so a generator bug is a panic here at startup instead
-/// of a run that depends on which duplicate a map happened to keep.
-fn traced_dispatch() -> &'static crate::trace::dispatch::Dispatch {
-    static D: std::sync::OnceLock<crate::trace::dispatch::Dispatch> =
-        std::sync::OnceLock::new();
-    D.get_or_init(|| {
-        // Every room's table of the active set, in ONE registry. A
-        // cross-room shape collision is refused at startup
-        // (`Dispatch::new_multi`), not resolved.
-        let sets = match traced_mode() {
-            TracedMode::Level0 => celeste_kernels::traced::SETS,
-            TracedMode::Level0Agnostic => celeste_kernels::ladder::SETS,
-            TracedMode::ExactRem => celeste_kernels::exact::SETS,
-        };
-        crate::trace::dispatch::Dispatch::new_multi(sets)
-            .expect("the checked-in kernel sets index by shape")
-    })
-}
-
-fn run_traced_kernel(
-    chunk: &runtime2::Rt2,
-    ids: &runtime2::BoundaryIds,
-    done: &mut Vec<runtime2::Rt2>,
-) -> bool {
-    // `chunk.shape_hash` is the cached hash the boundary wrote, and every
-    // chunk reaching here came off the frontier through one.
-    let Some(k) = traced_dispatch().find_by_shape(chunk.shape_hash) else {
-        note_miss("traced", "shape", chunk.width);
-        return false;
-    };
-    // One row set per outcome, made once per chunk: the kernel dedups its
-    // own output, and allocating the table per slice cost more than the
-    // dedup saved (244 MB a frame, trace::run).
-    let mut seen: Vec<kernel::RowSet> =
-        (0..k.outcomes).map(|_| kernel::RowSet::new()).collect();
-    let mut accs: Vec<runtime2::Rt2> = (0..k.outcomes)
-        .map(|i| (k.acc)(i, chunk.cart.clone(), chunk.cache.clone()))
-        .collect();
-    // Option 1 (frozen-frontier check before materialize): the kernel
-    // skips materializing any output row whose key is already in the
-    // FROZEN frontier this thread was pointed at (`with_frozen_frontier`,
-    // set by the worker only when the frontier is frozen/buffered). Off =>
-    // `frontier_hit` returns false => byte-identical to no skip.
-    // Skip a successor already in the frozen frontier (Option 1) OR already
-    // emitted this frame by a sibling chunk (Option 4, race-sound).
-    let skip = |key: (u64, u64)| frontier_hit(key) || within_frame_dup(key);
-    let mut lo = 0usize;
-    while lo < chunk.width {
-        let n = kernel::W.min(chunk.width - lo);
-        let Some(declined) = (k.step)(chunk, lo, n, &mut accs, &mut seen, &skip) else {
-            note_miss("traced", "bind", chunk.width);
-            return false;
-        };
-        if declined != 0 {
-            // A lane whose `ok` the kernel could not discharge. Drop
-            // everything and let the chunk take the reference path: the
-            // rows already in `accs` are a PREFIX of the answer, and
-            // half a chunk in `done` plus the whole chunk again from the
-            // reference would double-count it.
-            note_miss("traced", "declined", chunk.width);
-            return false;
-        }
-        lo += n;
-    }
-    for mut acc in accs {
-        if acc.width > 0 {
-            let before = acc.width as u64;
-            match traced_mode() {
-                // The level-0 set pre-widened in the graph; the boundary's
-                // own widening pass is then a free check that they agree.
-                TracedMode::Level0 => {
-                    acc.boundary(ids);
-                }
-                // The rung-agnostic and exact sets hand back EXACT rows;
-                // widening here would pre-empt the campaign's rung with
-                // Bits(0).
-                TracedMode::Level0Agnostic | TracedMode::ExactRem => {
-                    acc.boundary_exact();
-                }
-            }
-            KROWS[0].fetch_add(before, std::sync::atomic::Ordering::Relaxed);
-            KROWS[1].fetch_add(acc.width as u64, std::sync::atomic::Ordering::Relaxed);
-            done.push(acc);
-        }
-    }
-    true
+/// The frozen-frontier + within-frame skip, for the ASM append. A row whose
+/// key is already in the frozen frontier (Option 1) or was already emitted
+/// this frame by a sibling chunk (Option 4, race-sound) need not be exported
+/// - the frontier subtract would drop it anyway, so this only saves the
+/// export/merge. Off (no guard) => both return false => byte-identical to no
+/// skip. Applied POST-boundary in `asm_kernel`, since the boundary is what
+/// computes the row keys.
+pub(crate) fn chunk_skip(key: (u64, u64)) -> bool {
+    frontier_hit(key) || within_frame_dup(key)
 }
 
 // ---- Option 1: frozen-frontier skip before materialization ----

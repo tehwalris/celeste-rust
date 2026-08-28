@@ -165,7 +165,20 @@ impl AsmKernel {
                     // and computes the row keys + dedups within the block.
                     acc.boundary(ids);
                 }
-                done.push(acc);
+                // Option 1/4: drop rows already in the frozen frontier or
+                // emitted this frame (the boundary just computed the keys).
+                // Off (no frozen frontier) => chunk_skip is false => no-op.
+                if !acc.row_keys.is_empty() {
+                    let keep: Vec<u32> = (0..acc.width as u32)
+                        .filter(|&i| !super::dispatch::chunk_skip(acc.row_keys[i as usize]))
+                        .collect();
+                    if keep.len() < acc.width {
+                        acc.retain_lanes(&keep);
+                    }
+                }
+                if acc.width > 0 {
+                    done.push(acc);
+                }
             }
         }
         true
@@ -397,12 +410,14 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
 }
 
 /// The process-wide registry, built once on a big stack (the retrace's init
-/// interpret recurses deeper than a worker thread's default). `None` until
-/// `CELESTE_ASM_KERNELS` is set; the root is `CELESTE_ROOT` or the CWD.
+/// interpret recurses deeper than a worker thread's default). The ASM
+/// kernels are THE kernel backend now, so this always builds when the
+/// compiled engine runs a chunk; `CELESTE_NO_ASM_KERNELS` opts out (pure
+/// reference, for debugging). The root is `CELESTE_ROOT` or the CWD.
 pub(crate) fn registry() -> Option<&'static Registry> {
     static REG: std::sync::OnceLock<Option<Registry>> = std::sync::OnceLock::new();
     REG.get_or_init(|| {
-        if std::env::var_os("CELESTE_ASM_KERNELS").is_none() {
+        if std::env::var_os("CELESTE_NO_ASM_KERNELS").is_some() {
             return None;
         }
         let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
@@ -435,9 +450,60 @@ pub(crate) fn registry() -> Option<&'static Registry> {
     .as_ref()
 }
 
-/// Whether the ASM kernels are the active backend.
-pub(crate) fn enabled() -> bool {
-    registry().is_some()
+/// A stable structural hash of a graph's nodes (op + args), so a change to
+/// what the kernels COMPUTE changes the fingerprint.
+fn graph_fingerprint(g: &crate::transpile::graph::Graph) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    for id in 0..g.len() as crate::transpile::graph::NodeId {
+        let n = g.get(id);
+        n.op.hash(&mut h);
+        n.args.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// The ASM engine's content identity, for the checkpoint fingerprint
+/// (`compiled_engine`). MODE-INDEPENDENT on purpose: the rem rung is already
+/// a separate fingerprint component (`CampaignConfig::precision`), so this
+/// only has to (a) differ from the interpreter / any other engine and (b)
+/// change when the assembled COMPUTE changes. It hashes the fused graphs of
+/// ALL THREE lattice sets, so a codegen or tracer change in any of them
+/// moves it, and every process computes the same value regardless of which
+/// rung it runs (the band loader recomputes a previous level's fingerprint
+/// in-process and must match). Retraced once, on a big stack, then cached.
+pub(crate) fn engine_fingerprint() -> u64 {
+    static FP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FP.get_or_init(|| {
+        use crate::trace::shapes::WalkOpts;
+        let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let mut acc: u64 = 0xa500_f16e_1230_0001;
+                for (tag, opts) in [
+                    (1u64, WalkOpts::LEVEL0),
+                    (2, WalkOpts::LADDER),
+                    (3, WalkOpts::EXACT),
+                ] {
+                    let refs = crate::trace::kernel::lattice_kernel_refs(Path::new(&root), opts)
+                        .expect("retrace for ASM fingerprint");
+                    for r in &refs {
+                        let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
+                        let (fused, _, _, _) = crate::trace::emit::asm_fused(&r.bound, Some(&room), true)
+                            .expect("fuse for ASM fingerprint");
+                        // Order-independent over shapes: XOR each shape's
+                        // (graph hash mixed with its shape hash and set tag).
+                        let shape = r.frame.in_rt2.shape_hash_of();
+                        acc ^= runtime2::mix64(graph_fingerprint(&fused) ^ shape.rotate_left(17) ^ tag);
+                    }
+                }
+                acc
+            })
+            .expect("spawn ASM fingerprint builder")
+            .join()
+            .expect("ASM fingerprint builder panicked")
+    })
 }
 
 /// Run one chunk through the ASM kernels. `false` = miss or declined (the
