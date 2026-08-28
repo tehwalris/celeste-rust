@@ -5,6 +5,12 @@
 # the concrete optimum. Level>=1 runs are tube-confined and cheap; they are
 # rebuilt per (k,H).
 set -euo pipefail
+
+# Binary to run. Default is the release build (every recorded benchmark
+# number was measured under it). Override with BIN=./target/quick/rewrite to
+# run the ladder without paying the fat-LTO relink - the numbers are then
+# quick-profile and must be labelled as such.
+BIN=${BIN:-./target/release/rewrite}
 cd "$(dirname "$0")"
 # ROOM=x,y selects the start room (default 1,0). Must match
 # game_runner::room_dir_stem: "room1" for the default, "room<x><y>" else.
@@ -196,7 +202,7 @@ for H in $(seq "$FROM" "$TO"); do
     echo "level 0 already covers f$H - skipping the extend"
   else
   stage "l0-bench-h$H" /tmp/l0-h$H.log \
-      ./target/release/rewrite --recipe "$RECIPE" bench --frames "$H" --deopt \
+      "$BIN" --recipe "$RECIPE" bench --frames "$H" --deopt \
       --checkpoint-dir "$L0" --save-frames --resume $FUSE_ARG \
       ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
   tail -2 /tmp/l0-h$H.log
@@ -228,11 +234,11 @@ for H in $(seq "$FROM" "$TO"); do
   # frames, since glibc keeps the arenas between frames. `rewrite pos-graph
   # --frames N` extends an existing table, so staging it is just a loop.
   stage "l0-posgraph-h$H" /tmp/l0posgraph-h$H.log \
-      ./target/release/rewrite --recipe "$RECIPE" pos-graph \
+      "$BIN" --recipe "$RECIPE" pos-graph \
       --checkpoint-dir "$L0" --frames "$H" \
       ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
   stage "l0-sweep-h$H" /tmp/l0sweep-h$H.log \
-      ./target/release/rewrite --recipe "$RECIPE" sweep \
+      "$BIN" --recipe "$RECIPE" sweep \
       --checkpoint-dir "$L0" --frames "$H" --horizon "$H" \
       ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
   grep -E "abstract optimal|win seeds" /tmp/l0sweep-h$H.log
@@ -244,7 +250,7 @@ for H in $(seq "$FROM" "$TO"); do
     echo "=== horizon $H: k=$K banded (band from bits $PREV_BITS) ==="
     rm -rf "$KDIR"
     stage "k$K-bench-h$H" "/tmp/k$K-h$H.log" \
-        env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" bench \
+        env CELESTE_REM_BITS=$K "$BIN" --recipe "$RECIPE" bench \
         --frames "$H" --deopt --checkpoint-dir "$KDIR" --save-frames \
         --band-dir "$PREV" --band-horizon "$H" --band-prev-bits "$PREV_BITS" \
         ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
@@ -260,12 +266,12 @@ for H in $(seq "$FROM" "$TO"); do
     else
       SHARE_ARGS=()
       stage "k$K-posgraph-h$H" "/tmp/k${K}posgraph-h$H.log" \
-          env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" pos-graph \
+          env CELESTE_REM_BITS=$K "$BIN" --recipe "$RECIPE" pos-graph \
           --checkpoint-dir "$KDIR" --frames "$H" \
           ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
     fi
     stage "k$K-sweep-h$H" "/tmp/k${K}sweep-h$H.log" \
-        env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
+        env CELESTE_REM_BITS=$K "$BIN" --recipe "$RECIPE" sweep --banded \
         --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H" \
         ${SHARE_ARGS[@]+"${SHARE_ARGS[@]}"} \
         ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}

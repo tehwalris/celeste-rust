@@ -10,8 +10,8 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
-use celeste_rust::program::Program;
 use celeste_rust::program::recipe::Recipe;
+use celeste_rust::program::Program;
 use celeste_rust::search::differential::differential_abstract;
 
 const DEFAULT_RECIPE: &str = "rewrites.jsonl";
@@ -396,6 +396,32 @@ enum Command {
         #[arg(long = "variant")]
         variants: Vec<String>,
     },
+    /// The whole precision ladder in ONE process - the in-binary
+    /// replacement for `ladder.sh` (default path: SHARE_POSGRAPH=1, no
+    /// variants). For each horizon it extends level 0 (forward + fused
+    /// position graph), sweeps it, then runs banded rungs k=1..=maxk;
+    /// a rung that never reaches the exit REFUTES the horizon, and a
+    /// horizon every rung wins is the concrete optimum. Sets the ladder's
+    /// standard env itself (frontier-only compiled forward, deopt-collect,
+    /// strict kernels, 8000-lane cap) so one command runs the campaign.
+    Ladder {
+        /// First (and, without --to, only) horizon to test.
+        #[arg(long, default_value_t = 94)]
+        from: u32,
+        /// Last horizon to test. Defaults to --from (a single horizon).
+        #[arg(long)]
+        to: Option<u32>,
+        /// Deepest refinement rung to run per horizon.
+        #[arg(long, default_value_t = 16)]
+        maxk: u8,
+        /// Base checkpoint dir; each level lands under
+        /// `<dir>/<room-stem>[-k<k>]` (same layout as ladder.sh's L0/KROOT).
+        #[arg(long)]
+        checkpoint_dir: String,
+        /// Start room "x,y" (feeds CELESTE_START_ROOM).
+        #[arg(long, default_value = "1,0")]
+        room: String,
+    },
     /// Derive `frames/*.rowkeys` for a checkpoint dir written before the
     /// rowkeys era, so its artifacts work with the mmap visited engine
     /// (`CELESTE_VISITED_ENGINE=mmap`) and remain loadable once
@@ -472,7 +498,10 @@ fn parse_shapes(text: &str) -> Result<Vec<Vec<String>>> {
             shape.split(',').map(|t| t.trim().to_string()).collect()
         })
         .collect();
-    if shapes.iter().any(|s: &Vec<String>| s.iter().any(|t| t.is_empty())) {
+    if shapes
+        .iter()
+        .any(|s: &Vec<String>| s.iter().any(|t| t.is_empty()))
+    {
         return Err(anyhow!("empty shape or object type name in {:?}", text));
     }
     Ok(shapes)
@@ -495,7 +524,10 @@ fn parse_pm1(text: &str) -> Result<Vec<(String, celeste_rust::pico8_num::Pico8Nu
                 .trim()
                 .parse()
                 .with_context(|| format!("pm1 condition {:?}: integer value expected", pair))?;
-            Ok((name.to_string(), celeste_rust::pico8_num::Pico8Num::from_i16(value)))
+            Ok((
+                name.to_string(),
+                celeste_rust::pico8_num::Pico8Num::from_i16(value),
+            ))
         })
         .collect()
 }
@@ -561,10 +593,9 @@ fn build_variants(
                 parse_pm1(pm1_part).with_context(|| format!("--variant {:?}", spec))?,
             ),
         };
-        let shapes = parse_shapes(shapes_part)
-            .with_context(|| format!("--variant {:?}", spec))?;
-        let recipe = Recipe::load(path)
-            .with_context(|| format!("--variant {:?}: loading recipe", spec))?;
+        let shapes = parse_shapes(shapes_part).with_context(|| format!("--variant {:?}", spec))?;
+        let recipe =
+            Recipe::load(path).with_context(|| format!("--variant {:?}: loading recipe", spec))?;
         let program = celeste_rust::program::frozen::rewritten(path)
             .with_context(|| format!("--variant {:?}: the frozen program", spec))?;
         out.push(make_variant(
@@ -594,7 +625,9 @@ fn resolve_variant_host(args: &VariantOf) -> Result<Option<VariantHost>> {
     match (&args.host, &args.shapes) {
         (None, None) => {
             if args.pm1.is_some() {
-                return Err(anyhow!("--variant-pm1 requires --variant-of and --variant-shapes"));
+                return Err(anyhow!(
+                    "--variant-pm1 requires --variant-of and --variant-shapes"
+                ));
             }
             Ok(None)
         }
@@ -619,7 +652,9 @@ fn resolve_variant_host(args: &VariantOf) -> Result<Option<VariantHost>> {
                 label,
             }))
         }
-        _ => Err(anyhow!("--variant-of and --variant-shapes must be given together")),
+        _ => Err(anyhow!(
+            "--variant-of and --variant-shapes must be given together"
+        )),
     }
 }
 
@@ -633,6 +668,14 @@ struct CheckpointCfg {
     fingerprint: String,
 }
 
+/// What a forward pass concluded, for callers that orchestrate several of
+/// them (the `ladder` subcommand). `first_win` is the frame the first
+/// room-exit lane appeared at - `None` means the room exit was never
+/// reached within the horizon, which is exactly the k-rung REFUTED test.
+struct BenchOutcome {
+    first_win: Option<u32>,
+}
+
 fn bench(
     label: &str,
     program: &Program,
@@ -644,7 +687,7 @@ fn bench(
     variants: Vec<celeste_rust::search::run::Variant>,
     variant_base_mapping: Option<celeste_rust::search::state_mapping::StateMapping>,
     record_pos_graph: bool,
-) -> Result<()> {
+) -> Result<BenchOutcome> {
     use celeste_rust::search::checkpoint;
     let mut run = match deopt {
         Some((plain, mapping)) => celeste_rust::search::run::AbstractRun::start_with_deopt(
@@ -677,14 +720,12 @@ fn bench(
                 let (meta, states, visited) = if frontier && mmap_engine_selected() {
                     // The mmap engine's keys are the frames/*.rowkeys
                     // files; no 25 GiB map rebuild on resume.
-                    let (meta, states) =
-                        checkpoint::load_light(&cfg.dir, frame, &cfg.fingerprint)?;
+                    let (meta, states) = checkpoint::load_light(&cfg.dir, frame, &cfg.fingerprint)?;
                     let visited = Visited::mmap_open(&cfg.dir, meta.watermarks.clone())?;
                     (meta, states, Some(visited))
                 } else {
                     let loaded = checkpoint::load(&cfg.dir, frame, &cfg.fingerprint)?;
-                    let visited = frontier
-                        .then(|| Visited::map_with_dir(loaded.visited, &cfg.dir));
+                    let visited = frontier.then(|| Visited::map_with_dir(loaded.visited, &cfg.dir));
                     (loaded.meta, loaded.states, visited)
                 };
                 run.restore(
@@ -716,20 +757,19 @@ fn bench(
     // to cover them and does not.
     if record_pos_graph {
         let existing = match checkpoint.as_ref() {
-            Some(cfg) => celeste_rust::search::pos_graph::PosGraph::load(&cfg.dir)?
-                .filter(|g| {
-                    if g.fingerprint() == cfg.fingerprint {
-                        true
-                    } else {
-                        panic!(
-                            "{}/posgraph.bin was recorded from the forward pass {}, \
+            Some(cfg) => celeste_rust::search::pos_graph::PosGraph::load(&cfg.dir)?.filter(|g| {
+                if g.fingerprint() == cfg.fingerprint {
+                    true
+                } else {
+                    panic!(
+                        "{}/posgraph.bin was recorded from the forward pass {}, \
                              but this configuration is {}. Delete it.",
-                            cfg.dir.display(),
-                            g.fingerprint(),
-                            cfg.fingerprint
-                        )
-                    }
-                }),
+                        cfg.dir.display(),
+                        g.fingerprint(),
+                        cfg.fingerprint
+                    )
+                }
+            }),
             None => None,
         };
         match existing {
@@ -873,7 +913,11 @@ fn bench(
             current_rss_kb() as f64 / 1048576.0,
             peak_rss_kb() as f64 / 1048576.0,
             if win_lanes > 0 {
-                format!("  WIN: {} lanes {}", win_lanes, celeste_rust::interpreter::abstraction::win_label())
+                format!(
+                    "  WIN: {} lanes {}",
+                    win_lanes,
+                    celeste_rust::interpreter::abstraction::win_label()
+                )
             } else {
                 String::new()
             }
@@ -989,12 +1033,10 @@ fn bench(
                         return false;
                     }
                     let name = match origin {
-                        celeste_rust::interpreter::virtual_merge::Origin::Heap(cell) => {
-                            names
-                                .get(cell)
-                                .cloned()
-                                .unwrap_or_else(|| format!("cell{}", cell))
-                        }
+                        celeste_rust::interpreter::virtual_merge::Origin::Heap(cell) => names
+                            .get(cell)
+                            .cloned()
+                            .unwrap_or_else(|| format!("cell{}", cell)),
                         other => format!("{:?}", other),
                     };
                     let matched = patterns
@@ -1012,7 +1054,10 @@ fn bench(
             let distinct = |cols: &[&celeste_rust::interpreter::virtual_merge::Column]| {
                 let hashes =
                     celeste_rust::interpreter::virtual_merge::hash_rows(cols, state.vector_size);
-                hashes.iter().collect::<std::collections::HashSet<_>>().len()
+                hashes
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
             };
             println!(
                 "distinct-modulo [{}]: {} lanes, {} full cols -> {} kept, {} distinct full, {} distinct modulo ({:.1}x multiplicity)",
@@ -1037,7 +1082,7 @@ fn bench(
         "", fragments, mean_fragments, max_fragments
     );
 
-    Ok(())
+    Ok(BenchOutcome { first_win })
 }
 
 /// Checkpoint dir for a refinement level under the base dir, for the
@@ -1051,6 +1096,348 @@ fn level_checkpoint_dir(base_dir: &str, level: u8) -> std::path::PathBuf {
     } else {
         std::path::PathBuf::from(base_dir).join(format!("{}-k{}", stem, level))
     }
+}
+
+/// Build a band filter from a previous precision level's checkpoint dir -
+/// the same construction the `bench` handler inlines, factored out so the
+/// in-process `ladder` can call it per rung. `prev_bits` is the previous
+/// level's rem precision (0 = level 0's full widening, 16 = exact).
+fn build_band(
+    recipe_text: &str,
+    prev_dir: &std::path::Path,
+    horizon: u32,
+    prev_bits: u8,
+) -> Result<celeste_rust::search::run::BandFilter> {
+    use celeste_rust::interpreter::abstraction::{LadderPrecision, RemPrecision, SpdPrecision};
+    use celeste_rust::search::{checkpoint, sweep};
+    let prev_precision = LadderPrecision {
+        // The rem ladder leaves spd Exact at every level (plans/spd-rung.md).
+        spd: SpdPrecision::Exact,
+        rem: if prev_bits >= 16 {
+            RemPrecision::Exact
+        } else {
+            RemPrecision::Bits(prev_bits)
+        },
+    };
+    let prev_fp = checkpoint::config_fingerprint_with_precision(recipe_text, prev_precision);
+    let prev_frame = checkpoint::latest(prev_dir)?
+        .ok_or_else(|| anyhow!("band dir {} has no checkpoint", prev_dir.display()))?;
+    if prev_frame < horizon {
+        return Err(anyhow!(
+            "band dir's latest checkpoint f{:03} is before the horizon {}",
+            prev_frame,
+            horizon
+        ));
+    }
+    let ck = checkpoint::load(prev_dir, prev_frame, &prev_fp)?;
+    let g_prev = sweep::load_g(prev_dir)?;
+    if g_prev.len() != ck.visited.len() {
+        return Err(anyhow!(
+            "g.bin has {} rows but the row table has {}",
+            g_prev.len(),
+            ck.visited.len()
+        ));
+    }
+    println!(
+        "band: previous level {:?}, {} rows, horizon {}",
+        prev_precision,
+        ck.visited.len(),
+        horizon
+    );
+    Ok(celeste_rust::search::run::BandFilter {
+        prev_table: ck.visited,
+        g_prev,
+        horizon,
+        prev_precision,
+    })
+}
+
+/// One ladder stage's wall clock and peak RSS.
+struct StageTiming {
+    name: String,
+    wall_s: f64,
+    peak_gb: f64,
+}
+
+/// Per-stage peak RSS in a SINGLE process. `/proc/self/status`' VmHWM is a
+/// process-lifetime high-water mark, so it cannot attribute a peak to one
+/// stage; instead sample VmRSS on a background thread and take the max over
+/// the stage. Stages are multi-second, so 150 ms sampling is plenty.
+struct RssSampler {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    peak_kb: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RssSampler {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peak_kb = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (s, p) = (stop.clone(), peak_kb.clone());
+        let handle = std::thread::spawn(move || {
+            while !s.load(Relaxed) {
+                p.fetch_max(current_rss_kb(), Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            p.fetch_max(current_rss_kb(), Relaxed);
+        });
+        Self {
+            stop,
+            peak_kb,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> f64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.stop.store(true, Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        self.peak_kb.load(Relaxed) as f64 / 1048576.0
+    }
+}
+
+/// Run one ladder stage, timing wall clock and peak RSS around `f`. Prints a
+/// `name\twall\tpeak\trc` line matching ladder.sh's `stage` for grep-parity.
+fn stage<T>(
+    timings: &mut Vec<StageTiming>,
+    name: &str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    println!("=== stage {} ===", name);
+    let sampler = RssSampler::start();
+    let t0 = std::time::Instant::now();
+    let r = f();
+    let wall = t0.elapsed().as_secs_f64();
+    let peak = sampler.finish();
+    println!(
+        "{}\t{:.0}\t{:.2}\t{}",
+        name,
+        wall,
+        peak,
+        i32::from(r.is_err())
+    );
+    timings.push(StageTiming {
+        name: name.to_string(),
+        wall_s: wall,
+        peak_gb: peak,
+    });
+    r
+}
+
+/// The whole precision ladder in one process: for each horizon, extend
+/// level 0 (forward with the fused position graph) and sweep it, then run
+/// the banded refinement rungs k=1..=maxk. A rung that never reaches the
+/// room exit REFUTES the horizon; if every rung wins, the concrete optimum
+/// is that horizon. This replaces `ladder.sh`'s default (SHARE_POSGRAPH=1,
+/// no variants) path with no subprocess orchestration - every stage calls
+/// the same `bench` / `backward_sweep_time` the individual subcommands do.
+fn run_ladder(
+    recipe_path: &str,
+    recipe: &Recipe,
+    from: u32,
+    to: u32,
+    maxk: u8,
+    base_dir: &str,
+    room: &str,
+) -> Result<()> {
+    use celeste_rust::search::state_mapping::StateMapping;
+    use celeste_rust::search::{checkpoint, sweep, sweep_time};
+
+    // The env the ladder defines (matches ladder.sh): a frontier-only
+    // compiled forward with deopt-collect-first, strict kernels, and the
+    // 8000-lane chunk cap. START_ROOM feeds a OnceLock, so it MUST be set
+    // before any state init - which is here, before the first bench().
+    std::env::set_var("CELESTE_START_ROOM", room);
+    std::env::set_var("CELESTE_FRONTIER_ONLY", "1");
+    std::env::set_var("CELESTE_DEOPT_COLLECT_FIRST", "1");
+    // NOTE: the ladder does NOT force the compiled forward. The compiled
+    // engine (CELESTE_COMPILED_FORWARD=1) currently writes a checkpoint the
+    // backward sweep cannot read - the saved-frame keys it stores (the
+    // kernel-emitted engine key, Option 1) do not match what the sweep's
+    // `row_keys()` recomputes, so the sweep fails with "a saved lane's row
+    // is not in the row table". The interpreter forward is checkpoint-
+    // compatible with the sweep and is what ladder.sh runs by default (it
+    // only sets COMPILED_FORWARD under KERNELS=1). Left to the environment so
+    // the ladder stays correct; see plans/pos-graph-and-memory.md.
+    if std::env::var_os("CELESTE_MAX_STATE_LANES").is_none() {
+        std::env::set_var("CELESTE_MAX_STATE_LANES", "8000");
+    }
+    // CHUNKING IS SEMANTIC ON ROOMS WITH FRUIT (ladder.sh) - the fruit chunk
+    // cap is part of the config fingerprint and changes the row SET, not just
+    // ids. Missing it made the room (1,0) forward produce 651M rows instead
+    // of 178M. Must match ladder.sh's 8000.
+    if std::env::var_os("CELESTE_FRUIT_CHUNK_LANES").is_none() {
+        std::env::set_var("CELESTE_FRUIT_CHUNK_LANES", "8000");
+    }
+
+    let recipe_text = std::fs::read_to_string(recipe_path).unwrap_or_default();
+    let no_variants: Vec<String> = Vec::new();
+    let build_none = |p: &Program| build_variants(&no_variants, p);
+    let mut timings: Vec<StageTiming> = Vec::new();
+    let mut concrete_optimum: Option<u32> = None;
+
+    'horizons: for h in from..=to {
+        println!("=== horizon {}: level 0 extend + sweep ===", h);
+        // Level 0 is the default precision, Bits(0). Set BOTH the override
+        // (which rem_precision_from_env honours in-process) and the env var
+        // (so a subprocess or a direct env read agrees).
+        std::env::remove_var("CELESTE_REM_BITS");
+        celeste_rust::interpreter::abstraction::set_rem_precision_override(
+            celeste_rust::interpreter::abstraction::RemPrecision::Bits(0),
+        );
+        let l0 = level_checkpoint_dir(base_dir, 0);
+        let plain = Program::compile_executable_from_disk()?;
+        let program = celeste_rust::program::frozen::rewritten(recipe_path)?;
+        let mapping = StateMapping::from_recipe(recipe);
+        let fp = checkpoint::config_fingerprint(&recipe_text);
+
+        if l0.join(format!("f{:03}", h)).is_dir() {
+            println!("level 0 already covers f{} - skipping the extend", h);
+        } else {
+            let ckcfg = CheckpointCfg {
+                dir: l0.clone(),
+                every: h,
+                resume: true,
+                save_frames: true,
+                fingerprint: fp.clone(),
+            };
+            stage(&mut timings, &format!("l0-bench-h{}", h), || {
+                bench(
+                    "rewritten",
+                    &program,
+                    h,
+                    false,
+                    Some((&plain, mapping.clone())),
+                    Some(ckcfg),
+                    None,
+                    vec![],
+                    None,
+                    true,
+                )
+            })?;
+        }
+
+        // Level 0 backward sweep. It loads the fused posgraph.bin the forward
+        // just wrote (NOT banded, no borrow).
+        let l0_sweep = stage(&mut timings, &format!("l0-sweep-h{}", h), || {
+            let res = sweep_time::backward_sweep_time(
+                &l0,
+                h,
+                h,
+                &fp,
+                &recipe_text,
+                None,
+                &program,
+                &plain,
+                mapping.clone(),
+                &build_none,
+                false,
+            )?;
+            sweep::save_g(&l0, &res.g)?;
+            Ok(res)
+        })?;
+        println!(
+            "=== horizon {} level 0: optimal win frame {:?} ===",
+            h, l0_sweep.optimal_frame
+        );
+
+        let mut refuted = false;
+        for k in 1..=maxk {
+            // Each rung's rem precision, read by the fingerprint and the
+            // abstraction, exactly as ladder.sh's `env CELESTE_REM_BITS=$K` -
+            // but via the override, since the env read is a read-once OnceLock
+            // and this process already ran level 0.
+            std::env::set_var("CELESTE_REM_BITS", k.to_string());
+            celeste_rust::interpreter::abstraction::set_rem_precision_override(if k >= 16 {
+                celeste_rust::interpreter::abstraction::RemPrecision::Exact
+            } else {
+                celeste_rust::interpreter::abstraction::RemPrecision::Bits(k)
+            });
+            let prev_dir = level_checkpoint_dir(base_dir, k - 1);
+            let kdir = level_checkpoint_dir(base_dir, k);
+            std::fs::remove_dir_all(&kdir).ok();
+            let kfp = checkpoint::config_fingerprint(&recipe_text);
+            let program_k = celeste_rust::program::frozen::rewritten(recipe_path)?;
+            let band = build_band(&recipe_text, &prev_dir, h, k - 1)?;
+            let kck = CheckpointCfg {
+                dir: kdir.clone(),
+                every: h,
+                resume: false,
+                save_frames: true,
+                fingerprint: kfp.clone(),
+            };
+            let outcome = stage(&mut timings, &format!("k{}-bench-h{}", k, h), || {
+                bench(
+                    "rewritten",
+                    &program_k,
+                    h,
+                    false,
+                    Some((&plain, mapping.clone())),
+                    Some(kck),
+                    Some(band),
+                    vec![],
+                    None,
+                    false,
+                )
+            })?;
+            if outcome.first_win.is_none() {
+                println!("=== horizon {} REFUTED at k={} ===", h, k);
+                refuted = true;
+                break;
+            }
+            let ksweep = stage(&mut timings, &format!("k{}-sweep-h{}", k, h), || {
+                let res = sweep_time::backward_sweep_time(
+                    &kdir,
+                    h,
+                    h,
+                    &kfp,
+                    &recipe_text,
+                    Some(l0.as_path()),
+                    &program_k,
+                    &plain,
+                    mapping.clone(),
+                    &build_none,
+                    true,
+                )?;
+                sweep::save_g(&kdir, &res.g)?;
+                Ok(res)
+            })?;
+            println!(
+                "=== horizon {} k={}: optimal win frame {:?} ===",
+                h, k, ksweep.optimal_frame
+            );
+        }
+        if !refuted {
+            println!(
+                "=== ALL LEVELS THROUGH k={} WIN AT HORIZON {}: CONCRETE OPTIMUM = {} ===",
+                maxk, h, h
+            );
+            concrete_optimum = Some(h);
+            break 'horizons;
+        }
+    }
+
+    println!("\n=== ladder stage timings (name  wall_s  peak_GB) ===");
+    let mut total = 0.0;
+    for t in &timings {
+        println!(
+            "  {:<22} {:>7.0} s  {:>7.2} GB",
+            t.name, t.wall_s, t.peak_gb
+        );
+        total += t.wall_s;
+    }
+    println!("  {:<22} {:>7.0} s", "TOTAL", total);
+    match concrete_optimum {
+        Some(h) => println!("ladder: CONCRETE OPTIMUM = {}", h),
+        None => println!(
+            "ladder: no horizon in {}..={} confirmed (all refuted or range exhausted)",
+            from, to
+        ),
+    }
+    Ok(())
 }
 
 /// A refinement level's persisted result, loaded with the level's own
@@ -1070,16 +1457,15 @@ struct LoadedLevel {
 /// The rem precision of ladder level `k`: 16 means exact.
 fn precision_for_level(k: u8) -> celeste_rust::interpreter::abstraction::RemPrecision {
     use celeste_rust::interpreter::abstraction::RemPrecision;
-    if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) }
+    if k >= 16 {
+        RemPrecision::Exact
+    } else {
+        RemPrecision::Bits(k)
+    }
 }
 
 /// Load level `k`'s row table (and g array) from under `base_dir`.
-fn load_level(
-    recipe_path: &str,
-    base_dir: &str,
-    k: u8,
-    g_required: bool,
-) -> Result<LoadedLevel> {
+fn load_level(recipe_path: &str, base_dir: &str, k: u8, g_required: bool) -> Result<LoadedLevel> {
     use celeste_rust::search::{checkpoint, sweep};
     let precision = precision_for_level(k);
     let dir = level_checkpoint_dir(base_dir, k);
@@ -1107,7 +1493,13 @@ fn load_level(
         Err(e) if g_required => return Err(e),
         Err(_) => Vec::new(),
     };
-    Ok(LoadedLevel { k, precision, frame, table: ck.visited, g })
+    Ok(LoadedLevel {
+        k,
+        precision,
+        frame,
+        table: ck.visited,
+        g,
+    })
 }
 
 /// The row key of an already-canonical concrete state at `precision`:
@@ -1135,10 +1527,13 @@ fn parse_tas(path: &str) -> Result<Vec<u8>> {
         .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
         .flat_map(|l| l.split(','))
         .filter(|t| !t.trim().is_empty())
-        .map(|t| t.trim().parse::<u8>().map_err(|e| anyhow!("bad input byte: {}", e)))
+        .map(|t| {
+            t.trim()
+                .parse::<u8>()
+                .map_err(|e| anyhow!("bad input byte: {}", e))
+        })
         .collect()
 }
-
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1206,8 +1601,7 @@ fn main() -> Result<()> {
             // The member's state layout differs from canonical (promote_capture
             // etc.); cross-feeding states goes through the same mapping the
             // campaign's dispatch/deopt uses.
-            let mapping =
-                celeste_rust::search::state_mapping::StateMapping::from_recipe(&recipe);
+            let mapping = celeste_rust::search::state_mapping::StateMapping::from_recipe(&recipe);
             let plain = Program::compile_executable_from_disk()?;
             let inputs = parse_tas(&tas)?;
             let n = frames.unwrap_or(inputs.len() as u32);
@@ -1246,10 +1640,9 @@ fn main() -> Result<()> {
                             *skip_sites.entry(format!("{})", site)).or_default() += 1;
                             skipped += 1;
                         } else {
-                            return Err(e.context(format!(
-                                "member failed non-assert at frame {}",
-                                frame
-                            )));
+                            return Err(
+                                e.context(format!("member failed non-assert at frame {}", frame))
+                            );
                         }
                     }
                     Ok(mstates) => {
@@ -1265,7 +1658,10 @@ fn main() -> Result<()> {
                         let pobs = observe_frame(std::slice::from_ref(&state));
                         if mobs != pobs {
                             mismatches += 1;
-                            println!("frame {}: MISMATCH (member applied, observation differs)", frame);
+                            println!(
+                                "frame {}: MISMATCH (member applied, observation differs)",
+                                frame
+                            );
                         } else {
                             println!("frame {}: member applied, observation identical", frame);
                         }
@@ -1355,9 +1751,9 @@ fn main() -> Result<()> {
         }
         Command::Simdcheck { frames, max_lanes } => {
             use celeste_rust::interpreter::state::State;
+            use celeste_rust::search::run::AbstractRun;
             use celeste_rust::search::state_mapping::StateMapping;
             use celeste_rust::search::sweep;
-            use celeste_rust::search::run::AbstractRun;
             use std::collections::BTreeSet;
 
             // The frontier subtract must be off for the PROBE runs - a
@@ -1414,8 +1810,7 @@ fn main() -> Result<()> {
                 rows_of(run.states())
             };
 
-            let mut run =
-                AbstractRun::start_with_deopt(&program, &plain, mapping.clone(), false)?;
+            let mut run = AbstractRun::start_with_deopt(&program, &plain, mapping.clone(), false)?;
             let mut checked_lanes = 0usize;
             let mut violations = 0usize;
             for frame in 1..=frames {
@@ -1436,10 +1831,8 @@ fn main() -> Result<()> {
                     for &i in &picked {
                         mask[i] = true;
                     }
-                    let group = state.filter_by_mask_clone(
-                        &mask,
-                        celeste_rust::interpreter::state::FILTER_BAND,
-                    );
+                    let group = state
+                        .filter_by_mask_clone(&mask, celeste_rust::interpreter::state::FILTER_BAND);
 
                     let batched = run_once(vec![group.clone()])?;
 
@@ -1495,8 +1888,8 @@ fn main() -> Result<()> {
             }
         }
         Command::Deoptcheck { frames } => {
-            use celeste_rust::search::state_mapping::StateMapping;
             use celeste_rust::search::run::{observe_frame, AbstractRun};
+            use celeste_rust::search::state_mapping::StateMapping;
             let plain = Program::compile_executable_from_disk()?;
             let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
@@ -1509,8 +1902,7 @@ fn main() -> Result<()> {
             // then both merge under the specialized partition key, exactly as
             // `differential_abstract` does.
             let mut plain_run = AbstractRun::start(&plain)?;
-            let mut forced =
-                AbstractRun::start_with_deopt(&program, &plain, mapping, true)?;
+            let mut forced = AbstractRun::start_with_deopt(&program, &plain, mapping, true)?;
             for frame in 1..=frames {
                 plain_run.step()?;
                 forced.step()?;
@@ -1543,7 +1935,10 @@ fn main() -> Result<()> {
                 frames
             );
         }
-        Command::ShapeCensus { checkpoint_dir, frame } => {
+        Command::ShapeCensus {
+            checkpoint_dir,
+            frame,
+        } => {
             use celeste_rust::interpreter::abstraction::object_shape;
             use celeste_rust::interpreter::inspect::StateHelper;
             use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
@@ -1578,7 +1973,9 @@ fn main() -> Result<()> {
                             let HeapValue::ObjectTable(obj) = helper.load(obj_id) else {
                                 continue;
                             };
-                            let Some(off_cell) = obj.get("off") else { continue };
+                            let Some(off_cell) = obj.get("off") else {
+                                continue;
+                            };
                             match helper.load(*off_cell) {
                                 HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => {
                                     off_values.insert(n.as_raw_u32() as i32);
@@ -1595,7 +1992,12 @@ fn main() -> Result<()> {
                 }
             }
             let total_lanes: usize = by_shape.values().map(|(_, l)| l).sum();
-            println!("frame f{:03}: {} states, {} lanes", frame, states.len(), total_lanes);
+            println!(
+                "frame f{:03}: {} states, {} lanes",
+                frame,
+                states.len(),
+                total_lanes
+            );
             for (shape, (st, lanes)) in &by_shape {
                 println!(
                     "  [{}] {} states, {} lanes ({:.1}%)",
@@ -1635,7 +2037,18 @@ fn main() -> Result<()> {
             variants,
         } => {
             if baseline {
-                bench("original", &Program::compile_executable_from_disk()?, frames, profile, None, None, None, vec![], None, false)?;
+                bench(
+                    "original",
+                    &Program::compile_executable_from_disk()?,
+                    frames,
+                    profile,
+                    None,
+                    None,
+                    None,
+                    vec![],
+                    None,
+                    false,
+                )?;
             }
             let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let deopt_setup = if deopt {
@@ -1665,9 +2078,7 @@ fn main() -> Result<()> {
                         ),
                     })
                 }
-                None if resume => {
-                    return Err(anyhow!("--resume requires --checkpoint-dir"))
-                }
+                None if resume => return Err(anyhow!("--resume requires --checkpoint-dir")),
                 None => None,
             };
             let band = match (band_dir, band_horizon, band_prev_bits) {
@@ -1690,10 +2101,8 @@ fn main() -> Result<()> {
                     };
                     let dir = std::path::PathBuf::from(dir);
                     let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
-                    let prev_fp = checkpoint::config_fingerprint_with_precision(
-                        &recipe_text,
-                        prev_precision,
-                    );
+                    let prev_fp =
+                        checkpoint::config_fingerprint_with_precision(&recipe_text, prev_precision);
                     let prev_frame = checkpoint::latest(&dir)?
                         .ok_or_else(|| anyhow!("--band-dir has no checkpoint"))?;
                     if prev_frame < horizon {
@@ -1746,7 +2155,12 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Command::TraceWitness { tas, horizon, levels, base_dir } => {
+        Command::TraceWitness {
+            tas,
+            horizon,
+            levels,
+            base_dir,
+        } => {
             use celeste_rust::search::state_mapping::StateMapping;
             use celeste_rust::search::sweep;
 
@@ -1758,7 +2172,10 @@ fn main() -> Result<()> {
             // only).
             let mut level_data: Vec<LoadedLevel> = Vec::new();
             for part in levels.split(',') {
-                let k: u8 = part.trim().parse().map_err(|e| anyhow!("bad level: {}", e))?;
+                let k: u8 = part
+                    .trim()
+                    .parse()
+                    .map_err(|e| anyhow!("bad level: {}", e))?;
                 let level = load_level(&cli.recipe, &base_dir, k, false)?;
                 println!(
                     "level {}: {} rows (through f{:03})",
@@ -1773,9 +2190,8 @@ fn main() -> Result<()> {
             let fixed_env = plain.fixed_env();
             let mut state = celeste_rust::concrete::initial_state(&plain, &fixed_env)?;
 
-            let frame_cfg = celeste_rust::interpreter::fixed_env::PreparedCfg::new(
-                plain.frame_cfg().clone(),
-            );
+            let frame_cfg =
+                celeste_rust::interpreter::fixed_env::PreparedCfg::new(plain.frame_cfg().clone());
             let mut first_fail: Option<(u32, u8, String)> = None;
             for frame in 1..=horizon {
                 let byte = inputs.get(frame as usize - 1).copied().unwrap_or(0);
@@ -1805,8 +2221,8 @@ fn main() -> Result<()> {
                                 }
                             } else {
                                 let g = level.g[id as usize];
-                                let g_ok = g != sweep::G_UNREACHABLE
-                                    && (g as u32) <= horizon - frame;
+                                let g_ok =
+                                    g != sweep::G_UNREACHABLE && (g as u32) <= horizon - frame;
                                 if e_ok && g_ok {
                                     format!("ok(e={},g={})", e, g)
                                 } else {
@@ -1833,15 +2249,18 @@ fn main() -> Result<()> {
                      this level's band there",
                     frame, k, status
                 ),
-                None => println!(
-                    "witness trace PASSES every probed level's band at every frame"
-                ),
+                None => println!("witness trace PASSES every probed level's band at every frame"),
             }
         }
-        Command::ExtractTas { horizon, level, base_dir, tas } => {
+        Command::ExtractTas {
+            horizon,
+            level,
+            base_dir,
+            tas,
+        } => {
+            use celeste_rust::interpreter::abstraction::count_win_lanes;
             use celeste_rust::interpreter::fixed_env::PreparedCfg;
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
-            use celeste_rust::interpreter::abstraction::count_win_lanes;
             use celeste_rust::interpreter::state::State;
             use celeste_rust::search::state_mapping::StateMapping;
             use celeste_rust::search::sweep;
@@ -1873,9 +2292,9 @@ fn main() -> Result<()> {
                 let mut canon = s.clone();
                 mapping.from_canonical(&mut canon)?;
                 let key = widened_row_key(canon, precision)?;
-                Ok(table.id_of(key).map(|id| {
-                    (table.earliest_frame(id).unwrap_or(u32::MAX), g[id as usize])
-                }))
+                Ok(table
+                    .id_of(key)
+                    .map(|id| (table.earliest_frame(id).unwrap_or(u32::MAX), g[id as usize])))
             };
 
             let mut extracted: Vec<u8> = Vec::new();
@@ -1898,10 +2317,7 @@ fn main() -> Result<()> {
                     }
                     let s = result.into_iter().next().unwrap().0;
                     if let Some((e, gv)) = probe(&s)? {
-                        if e <= frame
-                            && gv != sweep::G_UNREACHABLE
-                            && (gv as u32) <= budget
-                        {
+                        if e <= frame && gv != sweep::G_UNREACHABLE && (gv as u32) <= budget {
                             candidates.push((byte, s));
                         }
                     }
@@ -1912,14 +2328,18 @@ fn main() -> Result<()> {
                         frame
                     ));
                 }
-                let ref_byte =
-                    reference.as_ref().and_then(|r| r.get(frame as usize - 1).copied());
-                let ref_ok =
-                    ref_byte.is_some_and(|b| candidates.iter().any(|(c, _)| *c == b));
+                let ref_byte = reference
+                    .as_ref()
+                    .and_then(|r| r.get(frame as usize - 1).copied());
+                let ref_ok = ref_byte.is_some_and(|b| candidates.iter().any(|(c, _)| *c == b));
                 if ref_byte.is_some() && !ref_ok {
                     ref_missing_frames.push(frame);
                 }
-                let chosen = if ref_ok { ref_byte.unwrap() } else { candidates[0].0 };
+                let chosen = if ref_ok {
+                    ref_byte.unwrap()
+                } else {
+                    candidates[0].0
+                };
                 let n = candidates.len();
                 state = candidates
                     .into_iter()
@@ -1932,7 +2352,11 @@ fn main() -> Result<()> {
                     frame,
                     chosen,
                     n,
-                    if ref_byte.is_some() && !ref_ok { ", reference byte NOT optimal" } else { "" }
+                    if ref_byte.is_some() && !ref_ok {
+                        ", reference byte NOT optimal"
+                    } else {
+                        ""
+                    }
                 );
             }
 
@@ -1962,8 +2386,8 @@ fn main() -> Result<()> {
                     .join(",")
             );
             if let Some(r) = &reference {
-                let identical = r.len() == extracted.len()
-                    && r.iter().zip(&extracted).all(|(a, b)| a == b);
+                let identical =
+                    r.len() == extracted.len() && r.iter().zip(&extracted).all(|(a, b)| a == b);
                 if identical {
                     println!("extracted TAS is byte-identical to the reference");
                 } else if ref_missing_frames.is_empty() {
@@ -1979,19 +2403,26 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::CountOptimal { horizon, level, base_dir } => {
+        Command::CountOptimal {
+            horizon,
+            level,
+            base_dir,
+        } => {
+            use celeste_rust::interpreter::abstraction::{count_win_lanes, player_xy_per_lane};
             use celeste_rust::interpreter::fixed_env::PreparedCfg;
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
-            use celeste_rust::interpreter::abstraction::{
-                count_win_lanes, player_xy_per_lane,
-            };
             use celeste_rust::interpreter::state::State;
             use celeste_rust::search::state_mapping::StateMapping;
             use std::collections::HashMap;
 
             let loaded = load_level(&cli.recipe, &base_dir, level, true)?;
             let (precision, table, g) = (loaded.precision, loaded.table, loaded.g);
-            println!("level {}: {} rows, enumerating horizon {}", level, table.len(), horizon);
+            println!(
+                "level {}: {} rows, enumerating horizon {}",
+                level,
+                table.len(),
+                horizon
+            );
 
             let plain = Program::compile_executable_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
@@ -2005,7 +2436,11 @@ fn main() -> Result<()> {
                 mapping.from_canonical(&mut canon)?;
                 let key = widened_row_key(canon, precision)?;
                 Ok(table.id_of(key).map(|id| {
-                    (key, table.earliest_frame(id).unwrap_or(u32::MAX), g[id as usize])
+                    (
+                        key,
+                        table.earliest_frame(id).unwrap_or(u32::MAX),
+                        g[id as usize],
+                    )
                 }))
             };
             let position = |s: &State| -> (i16, i16) {
@@ -2028,7 +2463,14 @@ fn main() -> Result<()> {
                 let p = probe(&spawn)?;
                 p.map(|(k, _, _)| k).unwrap_or((0, 0))
             };
-            layer.insert(spawn_key, Node { state: spawn, traj: 1, byte_seqs: 1.0 });
+            layer.insert(
+                spawn_key,
+                Node {
+                    state: spawn,
+                    traj: 1,
+                    byte_seqs: 1.0,
+                },
+            );
             // Position-sequence classes: distinct position histories collapse
             // when they lead to the same set of current rows, so track
             // (sorted row-key set) -> number of distinct position sequences.
@@ -2053,7 +2495,9 @@ fn main() -> Result<()> {
                             return Err(anyhow!("frame {}: branching", frame));
                         }
                         let s = result.into_iter().next().unwrap().0;
-                        let Some((key, e, gv)) = probe(&s)? else { continue };
+                        let Some((key, e, gv)) = probe(&s)? else {
+                            continue;
+                        };
                         // Tight band: winning exactly at the horizon needs
                         // g == budget (g < budget would beat the optimum).
                         if e > frame || gv != budget {
@@ -2061,10 +2505,7 @@ fn main() -> Result<()> {
                         }
                         let entry = edge_bytes.entry((*src_key, key)).or_insert(0);
                         if *entry == 0 {
-                            succs
-                                .entry(*src_key)
-                                .or_default()
-                                .push((key, position(&s)));
+                            succs.entry(*src_key).or_default().push((key, position(&s)));
                             next.entry(key).or_insert_with(|| Node {
                                 state: s,
                                 traj: 0,
@@ -2092,8 +2533,7 @@ fn main() -> Result<()> {
                 for (rows, mult) in &pos_classes {
                     let mut by_pos: HashMap<(i16, i16), Vec<Key>> = HashMap::new();
                     for row in rows {
-                        for (dst, pos) in succs.get(row).map(|v| v.as_slice()).unwrap_or(&[])
-                        {
+                        for (dst, pos) in succs.get(row).map(|v| v.as_slice()).unwrap_or(&[]) {
                             let set = by_pos.entry(*pos).or_default();
                             if !set.contains(dst) {
                                 set.push(*dst);
@@ -2105,10 +2545,8 @@ fn main() -> Result<()> {
                         *next_classes.entry(set).or_insert(0) += mult;
                     }
                 }
-                let positions: std::collections::BTreeSet<(i16, i16)> = next
-                    .values()
-                    .map(|n| position(&n.state))
-                    .collect();
+                let positions: std::collections::BTreeSet<(i16, i16)> =
+                    next.values().map(|n| position(&n.state)).collect();
                 let pos_str = if positions.len() <= 4 {
                     format!(
                         "  at {}",
@@ -2154,15 +2592,21 @@ fn main() -> Result<()> {
                 byte_seqs.log10()
             );
         }
-        Command::Sweep { checkpoint_dir, frames, horizon, banded, pos_graph_from, variants } => {
+        Command::Sweep {
+            checkpoint_dir,
+            frames,
+            horizon,
+            banded,
+            pos_graph_from,
+            variants,
+        } => {
             use celeste_rust::search::state_mapping::StateMapping;
             use celeste_rust::search::{sweep, sweep_time};
             let horizon = horizon.unwrap_or(frames);
             let dir = std::path::PathBuf::from(checkpoint_dir);
             let from = pos_graph_from.map(std::path::PathBuf::from);
             let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
-            let fingerprint =
-                celeste_rust::search::checkpoint::config_fingerprint(&recipe_text);
+            let fingerprint = celeste_rust::search::checkpoint::config_fingerprint(&recipe_text);
             let plain = Program::compile_executable_from_disk()?;
             let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
@@ -2181,8 +2625,11 @@ fn main() -> Result<()> {
                 banded,
             )?;
             sweep::save_g(&dir, &result.g)?;
-            let reachable =
-                result.g.iter().filter(|&&v| v != sweep::G_UNREACHABLE).count();
+            let reachable = result
+                .g
+                .iter()
+                .filter(|&&v| v != sweep::G_UNREACHABLE)
+                .count();
             println!(
                 "sweep: {} of {} rows can reach the exit within the horizon; \
                  {} expansions, {} successors outside the row table",
@@ -2218,13 +2665,16 @@ fn main() -> Result<()> {
                 ],
             );
         }
-        Command::PosGraph { checkpoint_dir, frames, variants } => {
+        Command::PosGraph {
+            checkpoint_dir,
+            frames,
+            variants,
+        } => {
             use celeste_rust::search::state_mapping::StateMapping;
             use celeste_rust::search::sweep_time;
             let dir = std::path::PathBuf::from(checkpoint_dir);
             let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
-            let fingerprint =
-                celeste_rust::search::checkpoint::config_fingerprint(&recipe_text);
+            let fingerprint = celeste_rust::search::checkpoint::config_fingerprint(&recipe_text);
             let plain = Program::compile_executable_from_disk()?;
             let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
@@ -2239,6 +2689,23 @@ fn main() -> Result<()> {
                 &plain,
                 mapping,
                 &build,
+            )?;
+        }
+        Command::Ladder {
+            from,
+            to,
+            maxk,
+            checkpoint_dir,
+            room,
+        } => {
+            run_ladder(
+                &cli.recipe,
+                &recipe,
+                from,
+                to.unwrap_or(from),
+                maxk,
+                &checkpoint_dir,
+                &room,
             )?;
         }
         Command::MigrateVisited { checkpoint_dir } => {
@@ -2260,7 +2727,11 @@ fn main() -> Result<()> {
                 let t = std::time::Instant::now();
                 let states = checkpoint::load_frame_states(&dir, f)?;
                 t_load += t.elapsed().as_secs_f64();
-                let prev = if f == 1 { 0 } else { meta.watermarks[f as usize - 2] };
+                let prev = if f == 1 {
+                    0
+                } else {
+                    meta.watermarks[f as usize - 2]
+                };
                 let end = meta.watermarks[f as usize - 1];
                 let t = std::time::Instant::now();
                 let mut records: Vec<((u64, u64), u32)> = Vec::with_capacity((end - prev) as usize);
@@ -2320,7 +2791,10 @@ fn main() -> Result<()> {
                 meta.row_count
             );
         }
-        Command::LeadingEdge { checkpoint_dir, frames } => {
+        Command::LeadingEdge {
+            checkpoint_dir,
+            frames,
+        } => {
             use celeste_rust::search::checkpoint;
             let dir = std::path::PathBuf::from(checkpoint_dir);
             println!("frame\tmin_x\tmax_x\tlanes");
@@ -2385,28 +2859,33 @@ fn main() -> Result<()> {
                         // Label: the object-type global names of the objects
                         // array, in array order. Type tables are found by
                         // reverse lookup over the global env.
-                        let type_name = |type_target: celeste_rust::interpreter::heap::HeapId|
-                            -> String {
-                            for (name, gcell) in state.global_env.iter() {
-                                if let HeapValue::Value(Value::Pointer(t)) = helper.load(*gcell) {
-                                    if *t == type_target {
-                                        return name.clone();
+                        let type_name =
+                            |type_target: celeste_rust::interpreter::heap::HeapId| -> String {
+                                for (name, gcell) in state.global_env.iter() {
+                                    if let HeapValue::Value(Value::Pointer(t)) = helper.load(*gcell)
+                                    {
+                                        if *t == type_target {
+                                            return name.clone();
+                                        }
                                     }
                                 }
-                            }
-                            format!("?type@{:?}", type_target)
-                        };
+                                format!("?type@{:?}", type_target)
+                            };
                         let label = (|| -> Option<String> {
                             let objects = helper.find_global("objects")?;
-                            let HeapValue::Value(Value::Pointer(arr)) = helper.load(objects)
-                            else { return None };
+                            let HeapValue::Value(Value::Pointer(arr)) = helper.load(objects) else {
+                                return None;
+                            };
                             let HeapValue::ArrayTable(items) = helper.load(*arr) else {
                                 return None;
                             };
                             let mut parts = Vec::new();
                             for item in items {
                                 let HeapValue::Value(Value::Pointer(obj)) = helper.load(*item)
-                                else { parts.push("?".into()); continue };
+                                else {
+                                    parts.push("?".into());
+                                    continue;
+                                };
                                 let HeapValue::ObjectTable(fields) = helper.load(*obj) else {
                                     parts.push("?".into());
                                     continue;
@@ -2424,13 +2903,9 @@ fn main() -> Result<()> {
                             Some(parts.join("+"))
                         })()
                         .unwrap_or_else(|| "<no objects array>".to_string());
-                        let entry = census.entry(shape.cached_hash()).or_insert((
-                            label,
-                            0,
-                            0,
-                            f,
-                            f,
-                        ));
+                        let entry = census
+                            .entry(shape.cached_hash())
+                            .or_insert((label, 0, 0, f, f));
                         entry.1 += 1;
                         entry.2 += state.vector_size;
                         entry.4 = f;
@@ -2457,8 +2932,3 @@ fn main() -> Result<()> {
 
     Ok(())
 }
-
-
-
-
-

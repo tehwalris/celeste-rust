@@ -56,7 +56,10 @@ pub fn object_shape(state: &State) -> anyhow::Result<Vec<String>> {
     let items: Vec<HeapId> = match helper.load(arr_id) {
         HeapValue::ArrayTable(items) => items.clone(),
         other => {
-            return Err(anyhow!("object_shape: `objects` is not an ArrayTable: {:?}", other))
+            return Err(anyhow!(
+                "object_shape: `objects` is not an ArrayTable: {:?}",
+                other
+            ))
         }
     };
     // Reverse map: heap id of a pointed-to table -> global names pointing at
@@ -78,7 +81,10 @@ pub fn object_shape(state: &State) -> anyhow::Result<Vec<String>> {
         let obj = match helper.load(obj_id) {
             HeapValue::ObjectTable(t) => t,
             other => {
-                return Err(anyhow!("object_shape: object is not an ObjectTable: {:?}", other))
+                return Err(anyhow!(
+                    "object_shape: object is not an ObjectTable: {:?}",
+                    other
+                ))
             }
         };
         let type_ptr = obj
@@ -137,7 +143,8 @@ pub fn mark_heap(state: &State) -> HeapMarks {
 
     // Find player objects
     if let Some(objects_array_id) = helper.get_objects_array_id() {
-        let players = helper.find_objects_by_type(objects_array_id, "player")
+        let players = helper
+            .find_objects_by_type(objects_array_id, "player")
             .expect("get_objects_array_id returned non-ArrayTable");
         for player_heap_id in players {
             if let HeapValue::ObjectTable(player) = helper.load(player_heap_id) {
@@ -218,13 +225,44 @@ impl RemPrecision {
     /// `Bits(16)` and above are read as `Exact` by the env parser, so 0..16
     /// is the whole `Bits` range.
     pub fn all() -> impl Iterator<Item = RemPrecision> {
-        (0..16u8).map(RemPrecision::Bits).chain(std::iter::once(RemPrecision::Exact))
+        (0..16u8)
+            .map(RemPrecision::Bits)
+            .chain(std::iter::once(RemPrecision::Exact))
     }
 }
 
-/// The session's rem precision: CELESTE_REM_BITS=k (16 or CELESTE_EXACT_REM
-/// mean exact; unset means the historic Bits(0)). Read once.
+/// A process-lifetime override of the rem precision, for a single process
+/// that runs SEVERAL precision levels (the in-process `ladder`): the env
+/// read below is a read-once OnceLock, so it cannot express "level 0 then
+/// k=1 then k=2" in one process. When set, this takes precedence over
+/// CELESTE_REM_BITS. `NONE` = fall back to the env. Encoding: 0..=15 =
+/// `Bits(n)`, `EXACT` = `Exact`.
+static REM_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(REM_OVERRIDE_NONE);
+const REM_OVERRIDE_NONE: u8 = 0xFF;
+const REM_OVERRIDE_EXACT: u8 = 0xFE;
+
+/// Override the session rem precision for the rest of the process. Set by
+/// `run_ladder` before each level's stages. Idempotent; last write wins.
+pub fn set_rem_precision_override(p: RemPrecision) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = match p {
+        RemPrecision::Exact => REM_OVERRIDE_EXACT,
+        RemPrecision::Bits(b) if b >= 16 => REM_OVERRIDE_EXACT,
+        RemPrecision::Bits(b) => b,
+    };
+    REM_OVERRIDE.store(v, Relaxed);
+}
+
+/// The session's rem precision: the `set_rem_precision_override` value if
+/// set, else CELESTE_REM_BITS=k (16 or CELESTE_EXACT_REM mean exact; unset
+/// means the historic Bits(0)). The env branch is read once.
 pub fn rem_precision_from_env() -> RemPrecision {
+    match REM_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        REM_OVERRIDE_NONE => {}
+        REM_OVERRIDE_EXACT => return RemPrecision::Exact,
+        b => return RemPrecision::Bits(b),
+    }
     static PRECISION: std::sync::OnceLock<RemPrecision> = std::sync::OnceLock::new();
     *PRECISION.get_or_init(|| {
         if std::env::var_os("CELESTE_EXACT_REM").is_some() {
@@ -278,7 +316,10 @@ impl SpdPrecision {
     /// Every spd level this build can be configured for, coarsest first.
     /// The env parser asserts 8..=20, so that is the whole range.
     pub fn all() -> impl Iterator<Item = SpdPrecision> {
-        (8..=20u8).rev().map(SpdPrecision::WidthLog2).chain(std::iter::once(SpdPrecision::Exact))
+        (8..=20u8)
+            .rev()
+            .map(SpdPrecision::WidthLog2)
+            .chain(std::iter::once(SpdPrecision::Exact))
     }
 }
 
@@ -314,7 +355,10 @@ pub struct LadderPrecision {
 }
 
 pub fn ladder_precision_from_env() -> LadderPrecision {
-    LadderPrecision { spd: spd_precision_from_env(), rem: rem_precision_from_env() }
+    LadderPrecision {
+        spd: spd_precision_from_env(),
+        rem: rem_precision_from_env(),
+    }
 }
 
 impl LadderPrecision {
@@ -387,9 +431,7 @@ pub fn erase_provenance_hints(mut state: State) -> State {
     for i in 0..state.heap.len() {
         let id = HeapId::from_raw(i);
         let erased = match state.heap.get_opt(id) {
-            Some(HeapValue::Value(Value::Nil(Some(_)))) => {
-                Some(HeapValue::Value(Value::Nil(None)))
-            }
+            Some(HeapValue::Value(Value::Nil(Some(_)))) => Some(HeapValue::Value(Value::Nil(None))),
             Some(HeapValue::Value(Value::NilPointer(s))) if !s.is_empty() => {
                 Some(HeapValue::Value(Value::NilPointer(String::new())))
             }
@@ -403,9 +445,7 @@ pub fn erase_provenance_hints(mut state: State) -> State {
                     .iter()
                     .map(|c| match c {
                         Value::Nil(Some(_)) => Value::Nil(None),
-                        Value::NilPointer(s) if !s.is_empty() => {
-                            Value::NilPointer(String::new())
-                        }
+                        Value::NilPointer(s) if !s.is_empty() => Value::NilPointer(String::new()),
                         other => other.clone(),
                     })
                     .collect();
@@ -435,7 +475,9 @@ pub fn erase_provenance_hints(mut state: State) -> State {
 /// one bucket and the move only shifts and renormalizes them), so a
 /// straddle spans at most two adjacent buckets; this is asserted.
 pub fn split_rem_straddles(state: State) -> Vec<State> {
-    let RemPrecision::Bits(bits) = rem_precision_from_env() else { return vec![state] };
+    let RemPrecision::Bits(bits) = rem_precision_from_env() else {
+        return vec![state];
+    };
     if bits == 0 {
         return vec![state];
     }
@@ -452,7 +494,9 @@ pub fn split_rem_straddles(state: State) -> Vec<State> {
 /// intervals in a way the design did not price, and that should FAIL,
 /// not widen silently.
 pub fn split_spd_straddles(state: State) -> Vec<State> {
-    let SpdPrecision::WidthLog2(w) = spd_precision_from_env() else { return vec![state] };
+    let SpdPrecision::WidthLog2(w) = spd_precision_from_env() else {
+        return vec![state];
+    };
     split_marked_straddles(state, "player_spd_xy", 1i32 << w, 8)
 }
 
@@ -478,14 +522,15 @@ fn split_marked_straddles(state: State, mark: &str, width: i32, max_span: i32) -
     let from_raw = |r: i32| Pico8Num::from_parts((r >> 16) as i16, r as u16);
 
     let marks = mark_heap(&state);
-    let Some(cells) = marks.marks.get(mark).cloned() else { return vec![state] };
+    let Some(cells) = marks.marks.get(mark).cloned() else {
+        return vec![state];
+    };
 
     let mut work = vec![state];
     for cell in cells {
         let mut next = Vec::with_capacity(work.len());
         for state in work {
-            let Some(HeapValue::Value(Value::NumberInterval(mv))) = state.heap.get_opt(cell)
-            else {
+            let Some(HeapValue::Value(Value::NumberInterval(mv))) = state.heap.get_opt(cell) else {
                 // Numbers (and anything else) lie in a single bucket.
                 next.push(state);
                 continue;
@@ -538,10 +583,8 @@ fn split_marked_straddles(state: State, mark: &str, width: i32, max_span: i32) -
             // clipped to it.
             for depth in 2..=deepest {
                 let reaches: Vec<bool> = spans.iter().map(|s| *s >= depth).collect();
-                let depth_state = state.filter_by_mask_clone(
-                    &reaches,
-                    crate::interpreter::state::FILTER_SPLIT_FLR,
-                );
+                let depth_state = state
+                    .filter_by_mask_clone(&reaches, crate::interpreter::state::FILTER_SPLIT_FLR);
                 let clipped: Vec<Pico8NumInterval> = intervals
                     .iter()
                     .zip(&spans)
@@ -576,23 +619,30 @@ fn split_marked_straddles(state: State, mark: &str, width: i32, max_span: i32) -
 /// - it exists to catch a heap-shape bug loudly rather than bucket
 /// garbage.
 pub fn make_state_abstract_spd(mut state: State, precision: SpdPrecision) -> State {
-    let SpdPrecision::WidthLog2(w) = precision else { return state };
+    let SpdPrecision::WidthLog2(w) = precision else {
+        return state;
+    };
     let width: i32 = 1i32 << w;
-    let sane = Pico8NumInterval::new(
-        Pico8Num::from_parts(-16, 0),
-        Pico8Num::from_parts(16, 0),
-    );
+    let sane = Pico8NumInterval::new(Pico8Num::from_parts(-16, 0), Pico8Num::from_parts(16, 0));
     let bucket = |raw_low: i32| -> Pico8NumInterval {
         let from_raw = |r: i32| Pico8Num::from_parts((r >> 16) as i16, r as u16);
         Pico8NumInterval::new(from_raw(raw_low), from_raw(raw_low + width - 1))
     };
     let floor_of = |n: Pico8Num| (n.as_raw_u32() as i32).div_euclid(width) * width;
     let widen_number = |n: Pico8Num| -> Pico8NumInterval {
-        assert!(sane.contains_number(n), "player spd {:?} outside +/-16 px/frame", n);
+        assert!(
+            sane.contains_number(n),
+            "player spd {:?} outside +/-16 px/frame",
+            n
+        );
         bucket(floor_of(n))
     };
     let widen_interval = |iv: &Pico8NumInterval| -> Pico8NumInterval {
-        assert!(sane.contains_interval(iv), "player spd interval {:?} outside +/-16 px/frame", iv);
+        assert!(
+            sane.contains_interval(iv),
+            "player spd interval {:?} outside +/-16 px/frame",
+            iv
+        );
         Pico8NumInterval::new(bucket(floor_of(iv.low)).low, bucket(floor_of(iv.high)).high)
     };
 
@@ -610,11 +660,9 @@ pub fn make_state_abstract_spd(mut state: State, precision: SpdPrecision) -> Sta
                     Value::NumberInterval(MaybeVector::Scalar(interval)) => {
                         Value::NumberInterval(MaybeVector::Scalar(widen_interval(interval)))
                     }
-                    Value::NumberInterval(MaybeVector::Vector(intervals)) => {
-                        Value::NumberInterval(MaybeVector::vector(
-                            intervals.iter().map(widen_interval).collect(),
-                        ))
-                    }
+                    Value::NumberInterval(MaybeVector::Vector(intervals)) => Value::NumberInterval(
+                        MaybeVector::vector(intervals.iter().map(widen_interval).collect()),
+                    ),
                     other => panic!(
                         "Unexpected value type for player_spd at {:?}: {:?}",
                         heap_id, other
@@ -759,9 +807,10 @@ pub fn make_state_abstract_rem(mut state: State, precision: RemPrecision) -> Sta
                 let HeapValue::ObjectTable(obj) = helper.load(obj_id) else {
                     panic!("fruit-off widening: fruit is not an ObjectTable");
                 };
-                off_cells.push(*obj.get("off").unwrap_or_else(|| {
-                    panic!("fruit-off widening: fruit has no `off` field")
-                }));
+                off_cells.push(
+                    *obj.get("off")
+                        .unwrap_or_else(|| panic!("fruit-off widening: fruit has no `off` field")),
+                );
                 let field = |name: &str| {
                     *obj.get(name).unwrap_or_else(|| {
                         panic!("fruit-off widening: fruit has no `{}` field", name)
@@ -784,7 +833,8 @@ pub fn make_state_abstract_rem(mut state: State, precision: RemPrecision) -> Sta
         }
         // sin(off/40) * 2.5, for an unknown phase: the whole bob band.
         let amplitude = Pico8Num::from_parts(2, 0x8000);
-        let band_of = |start: &Pico8Num| Pico8NumInterval::new(*start - amplitude, *start + amplitude);
+        let band_of =
+            |start: &Pico8Num| Pico8NumInterval::new(*start - amplitude, *start + amplitude);
         for (y_cell, start_cell) in bob_cells {
             let bands: MaybeVector<Pico8NumInterval> = match state.heap.get(start_cell) {
                 HeapValue::Value(Value::Number(MaybeVector::Scalar(start))) => {
@@ -807,7 +857,9 @@ pub fn make_state_abstract_rem(mut state: State, precision: RemPrecision) -> Sta
             for i in 0..state.vector_size {
                 let contained = match &old_y {
                     Value::Number(MaybeVector::Scalar(n)) => band_of_lane(i).contains_number(*n),
-                    Value::Number(MaybeVector::Vector(ns)) => band_of_lane(i).contains_number(ns[i]),
+                    Value::Number(MaybeVector::Vector(ns)) => {
+                        band_of_lane(i).contains_number(ns[i])
+                    }
                     Value::NumberInterval(MaybeVector::Scalar(iv)) => {
                         band_of_lane(i).contains_interval(iv)
                     }
@@ -857,10 +909,14 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
                             MaybeVector::Scalar(if *n < zero { zero } else { *n })
                         }
                         MaybeVector::Vector(ns) => MaybeVector::vector(
-                            ns.iter().map(|n| if *n < zero { zero } else { *n }).collect(),
+                            ns.iter()
+                                .map(|n| if *n < zero { zero } else { *n })
+                                .collect(),
                         ),
                     };
-                    state.heap.set(heap_id, HeapValue::Value(Value::Number(clamped)));
+                    state
+                        .heap
+                        .set(heap_id, HeapValue::Value(Value::Number(clamped)));
                 }
                 other => panic!("player dash_effect_time is not a number: {:?}", other),
             }
@@ -936,7 +992,11 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
                             MaybeVector::Scalar(iv) => ok(iv),
                             MaybeVector::Vector(ivs) => ivs.iter().all(ok),
                         };
-                        assert!(all_ok, "fruit-off pin: widened off outside [0, 40]: {:?}", mv);
+                        assert!(
+                            all_ok,
+                            "fruit-off pin: widened off outside [0, 40]: {:?}",
+                            mv
+                        );
                     }
                     other => panic!("fruit-off pin: off is not a number: {:?}", other),
                 }
@@ -965,11 +1025,12 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
     // never needs re-expansion later). It also merges died-and-respawned
     // lanes with never-died ones (`deaths` is lane-varying after a death).
     for name in ["frames", "seconds", "minutes", "deaths"] {
-        let cell = state
-            .global_env
-            .get(name)
-            .copied()
-            .unwrap_or_else(|| panic!("timer global {} missing - pinning would silently not apply", name));
+        let cell = state.global_env.get(name).copied().unwrap_or_else(|| {
+            panic!(
+                "timer global {} missing - pinning would silently not apply",
+                name
+            )
+        });
         match state.heap.get(cell) {
             HeapValue::Value(Value::Number(_)) => {
                 state.heap.set(
@@ -1067,7 +1128,9 @@ pub fn room_x_lane_mask(state: &State, x: i16) -> Vec<bool> {
 pub fn room_xy_per_lane(state: &State) -> Option<Vec<(i16, i16)>> {
     let helper = StateHelper::new(state);
     let table_id = helper.unwrap_pointer(helper.load(helper.find_global("room")?))?;
-    let HeapValue::ObjectTable(room) = helper.load(table_id) else { return None };
+    let HeapValue::ObjectTable(room) = helper.load(table_id) else {
+        return None;
+    };
     let axis = |name: &str| -> Option<Vec<i16>> {
         let HeapValue::Value(Value::Number(n)) = helper.load(*room.get(name)?) else {
             return None;
@@ -1104,10 +1167,14 @@ pub fn player_xy_per_lane(state: &State) -> Option<Vec<(i16, i16)>> {
                 .ok()
                 .and_then(|v| v.first().copied())
         })?;
-    let HeapValue::ObjectTable(obj) = helper.load(obj_id) else { return None };
+    let HeapValue::ObjectTable(obj) = helper.load(obj_id) else {
+        return None;
+    };
     let axis = |name: &str| -> Option<Vec<i16>> {
         let cell = *obj.get(name)?;
-        let HeapValue::Value(Value::Number(n)) = helper.load(cell) else { return None };
+        let HeapValue::Value(Value::Number(n)) = helper.load(cell) else {
+            return None;
+        };
         Some(match n {
             MaybeVector::Scalar(v) => vec![v.whole_part_as_i16(); state.vector_size.max(1)],
             MaybeVector::Vector(vs) => vs.iter().map(|v| v.whole_part_as_i16()).collect(),
@@ -1120,7 +1187,6 @@ pub fn player_xy_per_lane(state: &State) -> Option<Vec<(i16, i16)>> {
     }
     Some(xs.into_iter().zip(ys).collect())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1162,7 +1228,11 @@ mod tests {
         for raw in [-0x2_8000i32, -0x1_0000, -1, 0, 0x7FFF, 0x1_2345, 0x5_0000] {
             let (lo16, hi16) = bucket(raw, 16);
             let (lo17, hi17) = bucket(raw, 17);
-            assert!(lo17 <= lo16 && hi16 <= hi17, "w=16 bucket of {:#x} not nested", raw);
+            assert!(
+                lo17 <= lo16 && hi16 <= hi17,
+                "w=16 bucket of {:#x} not nested",
+                raw
+            );
             // And the coarse bucket of the fine bucket's endpoints agrees.
             assert_eq!(bucket(lo16, 17), (lo17, hi17));
             assert_eq!(bucket(hi16, 17), (lo17, hi17));
@@ -1182,7 +1252,16 @@ mod tests {
             let low = raw.div_euclid(width) * width;
             (low, low + width - 1)
         };
-        let probes = [-0x2_8000i32, -0x1_0000, -0x4CCC, -1, 0, 0x1234, 0x7FFF, 0x1_2345];
+        let probes = [
+            -0x2_8000i32,
+            -0x1_0000,
+            -0x4CCC,
+            -1,
+            0,
+            0x1234,
+            0x7FFF,
+            0x1_2345,
+        ];
         for a in RemPrecision::all() {
             for b in RemPrecision::all() {
                 let (RemPrecision::Bits(ka), RemPrecision::Bits(kb)) = (a, b) else {
@@ -1216,15 +1295,27 @@ mod tests {
             }
         }
         // The product order, and the two ends of the ladder.
-        let l0 = LadderPrecision { spd: SpdPrecision::Exact, rem: RemPrecision::Bits(0) };
-        let k16 = LadderPrecision { spd: SpdPrecision::Exact, rem: RemPrecision::Exact };
+        let l0 = LadderPrecision {
+            spd: SpdPrecision::Exact,
+            rem: RemPrecision::Bits(0),
+        };
+        let k16 = LadderPrecision {
+            spd: SpdPrecision::Exact,
+            rem: RemPrecision::Exact,
+        };
         assert!(l0.coarser_or_equal(k16) && !k16.coarser_or_equal(l0));
         assert_eq!(LadderPrecision::all().count(), 17 * 14);
         assert!(LadderPrecision::all().all(|l| l.coarser_or_equal(l)));
         // Incomparable levels exist and must NOT be accepted either way:
         // coarser in rem but finer in spd is not an over-approximation.
-        let a = LadderPrecision { spd: SpdPrecision::Exact, rem: RemPrecision::Bits(0) };
-        let b = LadderPrecision { spd: SpdPrecision::WidthLog2(16), rem: RemPrecision::Exact };
+        let a = LadderPrecision {
+            spd: SpdPrecision::Exact,
+            rem: RemPrecision::Bits(0),
+        };
+        let b = LadderPrecision {
+            spd: SpdPrecision::WidthLog2(16),
+            rem: RemPrecision::Exact,
+        };
         assert!(!a.coarser_or_equal(b) && !b.coarser_or_equal(a));
     }
 
@@ -1263,13 +1354,13 @@ pub fn synthetic_win_xy() -> Option<(i16, i16)> {
     static TARGET: std::sync::OnceLock<Option<(i16, i16)>> = std::sync::OnceLock::new();
     *TARGET.get_or_init(|| {
         let raw = std::env::var("CELESTE_WIN_AT_XY").ok()?;
-        let (x, y) = raw.split_once(',').unwrap_or_else(|| {
-            panic!("CELESTE_WIN_AT_XY must be \"x,y\", got {:?}", raw)
-        });
+        let (x, y) = raw
+            .split_once(',')
+            .unwrap_or_else(|| panic!("CELESTE_WIN_AT_XY must be \"x,y\", got {:?}", raw));
         let parse = |s: &str, which: &str| -> i16 {
-            s.trim().parse().unwrap_or_else(|e| {
-                panic!("CELESTE_WIN_AT_XY {} coordinate {:?}: {}", which, s, e)
-            })
+            s.trim()
+                .parse()
+                .unwrap_or_else(|e| panic!("CELESTE_WIN_AT_XY {} coordinate {:?}: {}", which, s, e))
         };
         let target = (parse(x, "x"), parse(y, "y"));
         println!(
