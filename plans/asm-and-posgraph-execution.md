@@ -3,6 +3,20 @@
 Both scoped 2026-08-29 with Philippe. Do both, either order. Companion maps
 were produced by two Explore agents this session (findings distilled here).
 
+## A. Pos-graph partition recorder (P5, "the easy one") — DONE 2026-08-29 (9165bd5)
+
+Implemented as scoped: `partition_position_cells` (resolved by object type,
+not name pattern), `set_partition_player_position` augments
+`resolve_partition_cells`, `PosObserver::input_cell` asserts a uniform chunk
+and `record(c_in, outputs)` pairs it, tag path (`POS_ORIGIN`, `tag()`,
+`ORIGIN_TAGS` entry, the strip in `interpret_state_base`) deleted. Gated by
+three tests (row-set preserved off/on + provably splits; a real streaming
+recording pass never trips `input_cell`; the sweep passthrough test trimmed
+to SWEEP_ORIGIN). 301/301 quick. STILL TO DO: measure the room (0,0) memory
+payoff on a campaign run (was 101 GB with the tag).
+
+### Original scope below (kept for reference)
+
 ## A. Pos-graph partition recorder (P5, "the easy one")
 
 GOAL: replace the per-lane `POS_ORIGIN` tag (which defeats mid-frame dedup and
