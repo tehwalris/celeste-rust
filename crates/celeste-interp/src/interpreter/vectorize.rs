@@ -1280,37 +1280,6 @@ fn split_states_by_partition(states: Vec<State>, cells: &[usize]) -> Vec<State> 
 /// later, when their current values agree - the lane *set* is unchanged
 /// (splitting and merging are both semantics-preserving), which
 /// `rewrite verify` checks end to end.
-/// Frontier-only search: drop lanes whose canonical row was already reached
-/// at an earlier frame. A state reachable at frame m < n only expands to
-/// states reachable at m+1 <= n via the same input suffix, so re-expanding it
-/// can never discover a new earliest arrival - the search stays complete and
-/// win frames stay earliest-arrival (= optimal TAS length). Requires the
-/// state representation to be world-still (see the timer-global pinning in
-/// make_state_abstract) or cross-frame rows never match and this is a no-op.
-///
-/// EXPERIMENTAL SIZING VERSION: the visited set stores 64-bit row hashes with
-/// no exact verification, so a hash collision would silently drop a genuinely
-/// new state. Fine for measuring the win; NOT proof-grade. The hardened
-/// version must chunk-verify rows like the boundary merge does.
-///
-/// Returns (kept_states, lanes_before, lanes_after).
-pub fn subtract_visited(
-    states: Vec<State>,
-    visited: &mut crate::interpreter::visited::Visited,
-) -> (Vec<State>, usize, usize) {
-    let mut out = Vec::with_capacity(states.len());
-    let mut before = 0usize;
-    let mut after = 0usize;
-    for state in states {
-        let keys = visited_row_keys(&state, visited);
-        let (kept, b, a) = subtract_precomputed(state, keys, visited);
-        before += b;
-        after += a;
-        out.extend(kept);
-    }
-    (out, before, after)
-}
-
 /// A state's per-lane visited-set keys, plus a read-only verdict on which
 /// of them the table already holds.
 ///
@@ -1526,123 +1495,33 @@ pub fn quadrants_take() -> Option<[u64; 4]> {
     }))
 }
 
-/// Phase 1a of the PARTITIONED subtract (D4, plans/dedup-roofline-plan.md):
-/// hash every lane into its row key and stop - no seen set, no visited
-/// probe. The filter runs afterwards, hash-partitioned across threads, in
-/// `search::run`'s partition stage. The census sample and the offered
-/// dump live here because they observe the offered stream, which this
-/// function is the last common view of.
+/// Build the visited-set candidate list from PRECOMPUTED per-lane keys:
+/// local (within-chunk) first-lane dedup plus a read-only global probe, so
+/// only the lanes that are neither a within-chunk repeat nor already in the
+/// table reach the serial `insert_new`.
 ///
-/// Returns `None` exactly when `visited_row_keys` would (no columns), which
-/// downstream means `Survivors::All`.
-pub fn visited_lane_keys(state: &State) -> Option<Vec<(u64, u64)>> {
-    use crate::interpreter::virtual_merge::{collect_columns_labeled, row_key_hashes, Column};
-    let census = dedup_census_on();
-    let t_hash = census.then(std::time::Instant::now);
-    let shape_hash = shape_hash_of_state(state);
-    let (columns, _origins) = collect_columns_labeled(std::slice::from_ref(state))?;
-    let refs: Vec<&Column> = columns.iter().collect();
-    let keys = row_key_hashes(
-        shape_hash,
-        &refs,
-        state.vector_size,
-        crate::interpreter::row_table::ROW_HASH_SEED2,
-    );
-    if let Some(t) = t_hash {
-        KEYS_HASH_NS.fetch_add(
-            t.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-    if census {
-        dedup_census_sample(&keys);
-    }
-    offered_dump_fragment(&keys);
-    Some(keys)
-}
-
-/// PHASE 1 of the frontier subtract: canonicalize the state into columns,
-/// hash each lane into its 128-bit row key, and look each key up read-only.
-///
-/// This is the expensive half and it only needs `&RowTable`, so a worker
-/// thread can run it for its own chunk while the table sits still. At depth
-/// ~98% of offered lanes are already-visited rows (f60: 100.5M offered,
-/// 2.0M new), so almost all of the probe traffic - one cache miss per lane
-/// into a table of tens of millions of keys - parallelises, and the serial
-/// phase is left with only the misses.
-pub fn visited_row_keys(
-    state: &State,
+/// The keys are computed by the caller (the top crate's `engine_row_keys`,
+/// the ONE row key), so this crate no longer owns a key formula - it only
+/// filters. Everything the old `visited_row_keys` did downstream of the hash
+/// lives here unchanged; see that removed function's comment for why the
+/// local dedup and the probe order matter.
+pub fn candidates_from_keys(
+    keys: Vec<(u64, u64)>,
+    lanes: usize,
     visited: &crate::interpreter::visited::Visited,
-) -> Option<VisitedKeys> {
-    use crate::interpreter::virtual_merge::{collect_columns_labeled, row_key_hashes, Column};
+) -> VisitedKeys {
+    debug_assert_eq!(keys.len(), lanes);
     let census = dedup_census_on();
-    let t_hash = census.then(std::time::Instant::now);
-    let shape_hash = shape_hash_of_state(state);
-    let (columns, _origins) = collect_columns_labeled(std::slice::from_ref(state))?;
-    let refs: Vec<&Column> = columns.iter().collect();
-    // The row hash folds scalar/uniform pieces into every row, so it covers
-    // the full lane-varying AND lane-uniform value content; structure is
-    // covered by the shape hash keying the set. Two independently-seeded
-    // 64-bit hashes = a 128-bit row key: at ~10^8 rows the 64-bit birthday
-    // risk was ~10^-4 per run, which 128 bits make negligible. Both seeds
-    // are folded in ONE pass over the columns.
-    let keys = row_key_hashes(
-        shape_hash,
-        &refs,
-        state.vector_size,
-        crate::interpreter::row_table::ROW_HASH_SEED2,
-    );
-    // Two filters, both here in the worker, and the second one matters more
-    // than it looks. `visited` is the table as it stood when this BATCH
-    // started, so a row that a sibling chunk is about to discover is still
-    // absent from it - every lane carrying that row would reach the serial
-    // phase as a candidate. Worse, a chunk's own lanes repeat rows
-    // constantly: at f50 a frame offers 57M lanes and keeps 1.1M.
-    //
-    // So dedup locally as well. Keeping only the FIRST lane of each key is
-    // exactly what the serial `insert_new` would have decided for the rest
-    // (it returns `None` for every later lane with the same key), so this
-    // changes nothing but the amount of work handed across the thread
-    // boundary. The local set holds one chunk's distinct rows, which is
-    // small enough to stay in cache - unlike the global table.
-    //
-    // Order matters, and it depends on the ENGINE. Under the in-RAM map
-    // the global probe is one cache miss and probing the local set first
-    // was measured 4% WORSE (it makes `seen` hold every distinct row in
-    // the chunk instead of only the candidates, which are ~2% of them).
-    // Under the mmap engine a global probe is an fp-run search plus a
-    // sample-index confirm - several times a map probe - so the trade
-    // flips: dedup locally FIRST and pay the global probe only once per
-    // chunk-distinct key. The candidate set is identical either way
-    // (first-lane-wins is order-independent between the two filters), so
-    // this cannot change any decision, only who does the filtering work.
-    // CELESTE_DUMP_ROWS prints each newly-reached row as "ROW <key>
-    // <values>" on stderr. It exists to be a SECOND, independent view of
-    // the same rows that `visited.bin` records, and that is not idle
-    // redundancy: `visited.bin` is columnar and an off-by-one reading of
-    // it produced a convincing false report of broken batch invariance
-    // (see plans/roofline-plan.md). Cross-checking a checkpoint reader
-    // against this dump is what caught it, and is what to repeat if the
-    // reader is ever touched. Gated, and only reached for candidate lanes.
-    if let Some(t) = t_hash {
-        KEYS_HASH_NS.fetch_add(
-            t.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-    let dump_rows = std::env::var_os("CELESTE_DUMP_ROWS").is_some();
     if census {
         dedup_census_sample(&keys);
     }
     offered_dump_fragment(&keys);
+    let dump_rows = std::env::var_os("CELESTE_DUMP_ROWS").is_some();
     let t_probe = census.then(std::time::Instant::now);
     let local_first = visited.local_dedup_first();
     let mut seen: rustc_hash::FxHashSet<(u64, u64)> = rustc_hash::FxHashSet::default();
     let mut candidates: Vec<(u32, (u64, u64))> = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
-        // The global probe, counted when the census is on: the gap between
-        // this count and the frame's DISTINCT key count is exactly what a
-        // frame-wide local tier would remove, since `seen` is per-fragment.
         let probe = |key| {
             if census {
                 GLOBAL_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1656,35 +1535,7 @@ pub fn visited_row_keys(
         };
         if is_candidate {
             if dump_rows {
-                use std::fmt::Write as _;
-                let mut line = format!("{:016x}{:016x}", key.0, key.1);
-                for c in &refs {
-                    match c {
-                        Column::Numbers(p) => {
-                            let v = match &p[0] {
-                                crate::interpreter::virtual_merge::Piece::Slice(sl) => sl[i],
-                                crate::interpreter::virtual_merge::Piece::Scalar(v, _) => *v,
-                            };
-                            let _ = write!(line, " n{}", v.as_raw_u32());
-                        }
-                        Column::Bools(p) => {
-                            let v = match &p[0] {
-                                crate::interpreter::virtual_merge::Piece::Slice(sl) => sl[i],
-                                crate::interpreter::virtual_merge::Piece::Scalar(v, _) => *v,
-                            };
-                            let _ = write!(line, " b{}", v as u8);
-                        }
-                        Column::Intervals(p) => {
-                            let v = match &p[0] {
-                                crate::interpreter::virtual_merge::Piece::Slice(sl) => sl[i],
-                                crate::interpreter::virtual_merge::Piece::Scalar(v, _) => *v,
-                            };
-                            let _ =
-                                write!(line, " i{},{}", v.low.as_raw_u32(), v.high.as_raw_u32());
-                        }
-                    }
-                }
-                eprintln!("ROW {}", line);
+                eprintln!("ROW {:016x}{:016x}", key.0, key.1);
             }
             candidates.push((i as u32, key));
         }
@@ -1695,10 +1546,7 @@ pub fn visited_row_keys(
             std::sync::atomic::Ordering::Relaxed,
         );
     }
-    Some(VisitedKeys {
-        candidates,
-        lanes: state.vector_size,
-    })
+    VisitedKeys { candidates, lanes }
 }
 
 /// PHASE 2: decide which lanes survive, assigning ids to the genuinely new

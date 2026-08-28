@@ -1253,15 +1253,18 @@ fn run_ladder(
     std::env::set_var("CELESTE_START_ROOM", room);
     std::env::set_var("CELESTE_FRONTIER_ONLY", "1");
     std::env::set_var("CELESTE_DEOPT_COLLECT_FIRST", "1");
-    // NOTE: the ladder does NOT force the compiled forward. The compiled
-    // engine (CELESTE_COMPILED_FORWARD=1) currently writes a checkpoint the
-    // backward sweep cannot read - the saved-frame keys it stores (the
-    // kernel-emitted engine key, Option 1) do not match what the sweep's
-    // `row_keys()` recomputes, so the sweep fails with "a saved lane's row
-    // is not in the row table". The interpreter forward is checkpoint-
-    // compatible with the sweep and is what ladder.sh runs by default (it
-    // only sets COMPILED_FORWARD under KERNELS=1). Left to the environment so
-    // the ladder stays correct; see plans/pos-graph-and-memory.md.
+    // The ladder runs the COMPILED forward. Since the search keys everything
+    // on the ONE row key (the kernel/engine key, `compiled::engine_row_keys`),
+    // a compiled checkpoint is sweep-readable: the sweep recomputes the same
+    // key it stored, so the old "a saved lane's row is not in the row table"
+    // failure is gone. Strict so a missed chunk is fatal, not silently
+    // fallen-through. Overridable from the environment.
+    if std::env::var_os("CELESTE_COMPILED_FORWARD").is_none() {
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
+    }
+    if std::env::var_os("CELESTE_KERNEL_STRICT").is_none() {
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
+    }
     if std::env::var_os("CELESTE_MAX_STATE_LANES").is_none() {
         std::env::set_var("CELESTE_MAX_STATE_LANES", "8000");
     }

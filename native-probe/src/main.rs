@@ -111,8 +111,6 @@ fn main() {
     let mut interp_bench: Option<(String, u32)> = None;
     let mut frame_diff: Option<(String, u32, String)> = None;
     let mut dedup_bench: Option<(String, u32)> = None;
-    let mut key_gate: Option<(String, u32, u32)> = None;
-    let mut key_gate_outputs: Option<(String, u32)> = None;
     let mut reps: u32 = 10;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -159,17 +157,6 @@ fn main() {
                 let out = args.next().expect("OUTDIR");
                 frame_diff = Some((dir, f, out));
             }
-            "--key-gate" => {
-                let dir = args.next().expect("--key-gate needs DIR LO HI");
-                let lo: u32 = args.next().expect("LO").parse().unwrap();
-                let hi: u32 = args.next().expect("HI").parse().unwrap();
-                key_gate = Some((dir, lo, hi));
-            }
-            "--key-gate-outputs" => {
-                let dir = args.next().expect("--key-gate-outputs needs DIR FRAME");
-                let f: u32 = args.next().expect("FRAME").parse().unwrap();
-                key_gate_outputs = Some((dir, f));
-            }
             other => panic!("unknown argument {:?}", other),
         }
     }
@@ -186,17 +173,12 @@ fn main() {
         run_frame_diff(&dir, frame, &out);
     } else if let Some((dir, frame)) = dedup_bench {
         run_dedup_bench(&dir, frame, reps.min(3));
-    } else if let Some((dir, lo, hi)) = key_gate {
-        run_key_gate(&dir, lo, hi);
-    } else if let Some((dir, frame)) = key_gate_outputs {
-        run_key_gate_outputs(&dir, frame);
     } else if let Some((dir, frame)) = abstract_bench {
         run_abstract_bench(&dir, frame, reps);
     } else {
-        panic!("nothing to do - pass --abstract N, --abstract-bench DIR FRAME, --row-census, --emit-shape, --interp-bench, --frame-diff, --dedup-bench, --key-gate DIR LO HI or --key-gate-outputs DIR FRAME");
+        panic!("nothing to do - pass --abstract N, --abstract-bench DIR FRAME, --row-census, --emit-shape, --interp-bench, --frame-diff, --dedup-bench or --abstract-bench DIR FRAME");
     }
 }
-
 
 /// The columnar abstract engine (plans/columnar-engine.md): run the level-0
 /// abstract search natively for N frames from the room start, printing
@@ -1284,7 +1266,6 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
     }
 }
 
-
 /// D0's microscope (plans/dedup-roofline-plan.md): run ONE frame from a
 /// checkpoint under BOTH engines and dump every output lane as a readable
 /// canonical-boundary row, so a key divergence can be read as a VALUE
@@ -1469,299 +1450,6 @@ fn run_frame_diff(dir: &str, frame: u32, outdir: &str) {
         "[frame-diff] wrote {}/{{interp,compiled}}.{{rows,shapes}} - diff with comm/diff",
         outdir
     );
-}
-
-/// D2 (plans/dedup-roofline-plan.md): the dedup roofline, isolated.
-///
-/// D1's key gate (plans/dedup-roofline-plan.md): do the ENGINE's row keys
-/// (`Rt2::boundary`) and the INTERPRETER's (`visited_row_keys`) induce the
-/// same equivalence on lanes? They are different hash constructions and
-/// will never be numerically equal; what a shared dedup needs is that they
-/// merge exactly the same lanes. Two failure directions, both fatal:
-///
-/// * UNDER-split (an Rt2 key collides where the interpreter's keys
-///   differ): `run_frame_chunk`'s internal dedup drops a lane the
-///   campaign would have kept - silent row loss, the #148 bug class.
-/// * OVER-split (Rt2 distinguishes lanes the interpreter merges): the
-///   compiled path carries extra rows and the two dedups define
-///   different searches.
-///
-/// The pairing is per-lane and positional: each canonical state is keyed
-/// by `visited_lane_keys` AND by `import_block` + `boundary_canonicalize`
-/// (the boundary WITHOUT its dedup, so dropped lanes still have keys),
-/// and lane i's two keys go into two run-global maps (rt2->interp,
-/// interp->rt2). Any map conflict is a broken bijection.
-struct KeyGate {
-    r2i: rustc_hash::FxHashMap<(u64, u64), (u64, u64)>,
-    i2r: rustc_hash::FxHashMap<(u64, u64), (u64, u64)>,
-    lanes: u64,
-    under: u64,
-    over: u64,
-}
-
-impl KeyGate {
-    fn new() -> Self {
-        KeyGate {
-            r2i: Default::default(),
-            i2r: Default::default(),
-            lanes: 0,
-            under: 0,
-            over: 0,
-        }
-    }
-
-    /// Key one canonical state both ways; returns the interp keys (the
-    /// frontier gate cross-checks them against the recorded sidecar).
-    fn feed(&mut self, st: &celeste_rust::interpreter::state::State, ctx: &str) -> Vec<(u64, u64)> {
-        let eng = engine();
-        let (cart, cache) = world();
-        let interp = celeste_rust::interpreter::vectorize::visited_lane_keys(st)
-            .unwrap_or_else(|| panic!("{}: state with no keyable columns", ctx));
-        let mut b = import::import_block(st, cart.clone(), cache.clone());
-        b.boundary_canonicalize(eng.ids());
-        assert_eq!(
-            b.row_keys.len(),
-            st.vector_size,
-            "{}: boundary_canonicalize changed the lane count",
-            ctx
-        );
-        assert_eq!(interp.len(), st.vector_size, "{}: interp key count", ctx);
-        for i in 0..st.vector_size {
-            let (rk, ik) = (b.row_keys[i], interp[i]);
-            self.lanes += 1;
-            match self.r2i.entry(rk) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(ik);
-                }
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    if *e.get() != ik {
-                        self.under += 1;
-                        if self.under <= 8 {
-                            eprintln!(
-                                "[key-gate] UNDER-SPLIT {} lane {}: rt2 {:016x}{:016x} maps to interp {:016x}{:016x} AND {:016x}{:016x}",
-                                ctx, i, rk.0, rk.1, e.get().0, e.get().1, ik.0, ik.1
-                            );
-                        }
-                    }
-                }
-            }
-            match self.i2r.entry(ik) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(rk);
-                }
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    if *e.get() != rk {
-                        self.over += 1;
-                        if self.over <= 8 {
-                            eprintln!(
-                                "[key-gate] OVER-SPLIT {} lane {}: interp {:016x}{:016x} maps to rt2 {:016x}{:016x} AND {:016x}{:016x}",
-                                ctx, i, ik.0, ik.1, e.get().0, e.get().1, rk.0, rk.1
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        interp
-    }
-
-    fn report(&self, what: &str) {
-        eprintln!(
-            "[key-gate] {}: {} lanes, {} distinct rt2 keys, {} distinct interp keys, {} under-splits, {} over-splits",
-            what,
-            self.lanes,
-            self.r2i.len(),
-            self.i2r.len(),
-            self.under,
-            self.over
-        );
-        if self.under == 0 && self.over == 0 && self.r2i.len() == self.i2r.len() {
-            eprintln!("[key-gate] {}: BIJECTION HOLDS", what);
-        } else {
-            eprintln!("[key-gate] {}: BIJECTION BROKEN", what);
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Frontier gate: every stored frame state of a finished run, i.e. every
-/// DISTINCT row the search visited. The interpreter's keys are distinct
-/// across the whole run by construction (`insert_new` + the frontier
-/// subtract), and the sidecar cross-check pins that down per frame - so
-/// this direction exercises UNDER-splitting on the full visited set: any
-/// two of the run's ~56M distinct rows sharing an Rt2 key is a collision
-/// the compiled dedup would have merged.
-fn run_key_gate(dir: &str, lo: u32, hi: u32) {
-    use celeste_rust::interpreter::visited::FrameKeys;
-    let dirp = std::path::Path::new(dir);
-    let mut gate = KeyGate::new();
-    for frame in lo..=hi {
-        let states = load_states_any(dir, frame);
-        let mut frame_keys: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
-        for (si, st) in states.iter().enumerate() {
-            if st.vector_size == 0 {
-                continue;
-            }
-            let ctx = format!("f{:03} frag {}", frame, si);
-            frame_keys.extend(gate.feed(st, &ctx));
-        }
-        // Ground the interp side: the keys recomputed from the stored
-        // states must be EXACTLY the keys the campaign recorded for this
-        // frame. This is what makes "interp keys are globally distinct"
-        // a fact rather than an assumption.
-        let fk = FrameKeys::open(dirp, frame)
-            .unwrap_or_else(|e| panic!("f{:03}: no rowkeys sidecar: {}", frame, e));
-        let mut missing = 0u64;
-        let mut recorded = 0u64;
-        for (key, _id) in fk.iter() {
-            recorded += 1;
-            if !frame_keys.contains(&key) {
-                missing += 1;
-            }
-        }
-        assert_eq!(
-            (recorded, missing),
-            (frame_keys.len() as u64, 0),
-            "f{:03}: recomputed keys != recorded sidecar keys ({} recomputed, {} recorded, {} missing)",
-            frame,
-            frame_keys.len(),
-            recorded,
-            missing
-        );
-        eprintln!(
-            "[key-gate] f{:03}: {} lanes ok (sidecar match), cumulative {} lanes / {} rt2 keys",
-            frame,
-            frame_keys.len(),
-            gate.lanes,
-            gate.r2i.len()
-        );
-    }
-    gate.report(&format!("frontier f{:03}..f{:03}", lo, hi));
-}
-
-/// Output gate: one frame's RAW outputs, pre-subtract - the dup-heavy
-/// stream where the interpreter's keys DO repeat (a frame at depth offers
-/// each surviving row many times over). Runs the frame body on f-1's
-/// states with BOTH engines, canonicalizes exactly as the campaign would,
-/// and feeds every output lane. This is the direction the frontier gate
-/// cannot see: lanes the interpreter MERGES must also share an Rt2 key
-/// (no over-split), checked pair-by-pair through the interp->rt2 map.
-fn run_key_gate_outputs(dir: &str, frame: u32) {
-    use celeste_rust::interpreter::state::State;
-
-    let program =
-        celeste_rust::program::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
-    celeste_rust::interpreter::vectorize::set_merge_partition_patterns(
-        &program.merge_partition_cells,
-    );
-    let frame_cfg =
-        celeste_rust::interpreter::fixed_env::PreparedCfg::new(program.frame_cfg().clone());
-    let fixed_env = program.fixed_env();
-    let eng = engine();
-
-    let inputs = load_states_any(dir, frame - 1);
-    let lanes_in: usize = inputs.iter().map(|s| s.vector_size).sum();
-    eprintln!(
-        "[key-gate] outputs of f{:03} from {} input lanes in {} state(s)",
-        frame,
-        lanes_in,
-        inputs.len()
-    );
-
-    let canon = |states: Vec<State>| -> Vec<State> {
-        let mut out = Vec::new();
-        for s in states {
-            for s2 in celeste_rust::interpreter::abstraction::split_precision_straddles(s) {
-                out.push(celeste_rust::interpreter::abstraction::make_state_abstract(s2));
-            }
-        }
-        celeste_rust::interpreter::vectorize::gc_states(out)
-    };
-
-    let mut gate = KeyGate::new();
-    let mut skipped_frags = 0u64;
-    let mut skipped_lanes = 0u64;
-    for (si, st) in inputs.iter().enumerate() {
-        if st.vector_size == 0 {
-            continue;
-        }
-        // The INPUT fragments are canonical frontier states - feed them
-        // too. This is what keeps the already-dead rows in the map even
-        // when both frame bodies below refuse the fragment (next
-        // comment): any output lane elsewhere that re-reaches one of
-        // these rows still cross-checks against it.
-        gate.feed(st, &format!("f{:03} in-frag {} input", frame, si));
-        // Both recipes' premises fail on fragments whose input lanes are
-        // already dead (will_restart=true, empty object array - the K2
-        // census; in the campaign the optimistic deopt arm catches
-        // exactly this, panics included, and re-runs on the plain
-        // program). The gate does not need that deopt machinery: the
-        // key-equivalence property is about the two key FUNCTIONS on the
-        // same canonical states, not about which engine produced them.
-        // Death rows still reach the map via the input feed above and
-        // via alive fragments that die mid-frame (kill_player completes
-        // within the frame; only frames STARTING dead trip the premise).
-        // Skips are counted and reported, not silent.
-        match celeste_rust::interpreter::glue::interpret_prepared_cfg(
-            &frame_cfg,
-            st.clone(),
-            &fixed_env,
-        ) {
-            Ok(outs) => {
-                let interp_out: Vec<State> = outs.into_iter().map(|(s, _)| s).collect();
-                for (oi, out) in canon(interp_out).iter().enumerate() {
-                    if out.vector_size == 0 {
-                        continue;
-                    }
-                    gate.feed(out, &format!("f{:03} in-frag {} interp out {}", frame, si, oi));
-                }
-            }
-            Err(e) => {
-                skipped_frags += 1;
-                skipped_lanes += st.vector_size as u64;
-                eprintln!(
-                    "[key-gate] f{:03} in-frag {}: interp side skipped ({} lanes): {:#}",
-                    frame,
-                    si,
-                    st.vector_size,
-                    e
-                );
-            }
-        }
-        let compiled_out =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                eng.run_frame_chunk(st, None).into_iter().map(|(s, _)| s).collect::<Vec<_>>()
-            }));
-        match compiled_out {
-            Ok(outs) => {
-                for (oi, out) in canon(outs).iter().enumerate() {
-                    if out.vector_size == 0 {
-                        continue;
-                    }
-                    gate.feed(out, &format!("f{:03} in-frag {} compiled out {}", frame, si, oi));
-                }
-            }
-            Err(_) => {
-                skipped_frags += 1;
-                skipped_lanes += st.vector_size as u64;
-                eprintln!(
-                    "[key-gate] f{:03} in-frag {}: compiled side skipped ({} lanes): panic in run_frame_chunk (death-chunk premise; the campaign deopts these)",
-                    frame,
-                    si,
-                    st.vector_size
-                );
-            }
-        }
-    }
-    if skipped_frags > 0 {
-        eprintln!(
-            "[key-gate] f{:03}: {} frame-body runs skipped ({} input lanes total) - death-chunk premise failures; those rows entered the gate via the input feed",
-            frame,
-            skipped_frags,
-            skipped_lanes
-        );
-    }
-    gate.report(&format!("outputs f{:03}", frame));
 }
 
 /// Replays one frame's OFFERED key stream (dumped by the campaign with

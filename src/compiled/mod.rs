@@ -292,23 +292,32 @@ const COMPILE_RECIPE: &str = "rewrites-compile.jsonl";
 /// available regardless of `CELESTE_COMPILED_FORWARD`: the backward sweep and
 /// the band filter key on it even when the forward that wrote the checkpoint
 /// was the interpreter, so there is exactly one key space.
+static KEY_ENGINE: std::sync::OnceLock<FrameEngine> = std::sync::OnceLock::new();
+
+/// Build the row-key engine if it is not built yet, and hand it back.
+///
+/// The build loads the frozen compile program and runs its init - stack-heavy
+/// enough that doing it LAZILY inside a deep frontier-worker call stack
+/// overflows a 2 MB worker/test stack. `AbstractRun::start` calls this once
+/// on the shallow main-thread stack so every later `engine_row_keys` call
+/// (in a worker, per frame) only does the light import + boundary.
+pub fn prewarm_engine_row_keys() -> Result<&'static FrameEngine> {
+    use anyhow::Context;
+    if let Some(e) = KEY_ENGINE.get() {
+        return Ok(e);
+    }
+    let compile_program = crate::program::frozen::rewritten(COMPILE_RECIPE)
+        .with_context(|| format!("loading the frozen {}", COMPILE_RECIPE))?;
+    let engine = FrameEngine::new_for_start_room(&compile_program)?;
+    // Racing initializers build identical engines; keep whichever wins.
+    let _ = KEY_ENGINE.set(engine);
+    Ok(KEY_ENGINE.get().expect("just set"))
+}
+
 pub fn engine_row_keys(
     state: &crate::interpreter::state::State,
 ) -> Result<Vec<(u64, u64)>> {
-    use anyhow::Context;
-    static KEY_ENGINE: std::sync::OnceLock<FrameEngine> = std::sync::OnceLock::new();
-    let engine = match KEY_ENGINE.get() {
-        Some(e) => e,
-        None => {
-            let compile_program = crate::program::frozen::rewritten(COMPILE_RECIPE)
-                .with_context(|| format!("loading the frozen {}", COMPILE_RECIPE))?;
-            let engine = FrameEngine::new_for_start_room(&compile_program)?;
-            // Racing initializers build identical engines; keep whichever wins.
-            let _ = KEY_ENGINE.set(engine);
-            KEY_ENGINE.get().expect("just set")
-        }
-    };
-    Ok(engine.row_keys_lane_order(state))
+    Ok(prewarm_engine_row_keys()?.row_keys_lane_order(state))
 }
 
 pub struct FrameEngine {

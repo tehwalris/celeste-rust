@@ -2,9 +2,10 @@
 //! with a dense id assigned in discovery order.
 //!
 //! A "row" is one lane's complete canonical value tuple at a frame boundary -
-//! one distinct game state - identified by two independently-seeded 64-bit
-//! hashes with the state's shape hash mixed in (128 bits total; see
-//! `subtract_visited` for the collision-risk note).
+//! one distinct game state - identified by the search's ONE row key: the
+//! kernel/engine `(u64, u64)` with the shape hash mixed in (128 bits total),
+//! computed by `compiled::engine_row_keys`. The table only stores and looks
+//! up keys; it no longer owns a hash formula.
 //!
 //! The dense ids are what make the refinement passes cheap:
 //!
@@ -28,10 +29,6 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Seed of the second row hash (the first uses seed 0). Shared by the
-/// forward pass and the backward sweep so both compute identical row keys.
-pub const ROW_HASH_SEED2: u64 = 0xa076_1d64_78bd_642f;
-
 /// See module docs.
 #[derive(Default)]
 pub struct RowTable {
@@ -50,20 +47,7 @@ pub struct RowTable {
     pending: FxHashSet<(u64, u64)>,
 }
 
-/// Splitmix64 finalizer - used to mix the shape hash into both key halves
-/// independently so the combined key keeps its full 128-bit strength.
-fn mix(mut x: u64) -> u64 {
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
 impl RowTable {
-    /// Fold a state's shape hash and a row's two hashes into the table key.
-    pub fn key(shape_hash: u64, h1: u64, h2: u64) -> (u64, u64) {
-        (h1 ^ mix(shape_hash), h2 ^ mix(shape_hash.wrapping_add(0x9e37_79b9_7f4a_7c15)))
-    }
-
     /// Insert a row if new, returning `Some(id)` exactly when it was new.
     ///
     /// The frontier is FROZEN mid-frame: the row goes into `pending`/`recent`
@@ -198,12 +182,5 @@ mod tests {
         assert_eq!(b.rows_by_id(), vec![(1, 1), (2, 2), (3, 3), (4, 4)]);
         assert_eq!(b.watermarks(), &[4]);
         assert_eq!(b.id_of((3, 3)), Some(2));
-    }
-
-    #[test]
-    fn shape_mixing_separates_equal_row_hashes() {
-        let a = RowTable::key(10, 5, 5);
-        let b = RowTable::key(11, 5, 5);
-        assert_ne!(a, b, "same row hashes under different shapes must differ");
     }
 }

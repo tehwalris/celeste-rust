@@ -464,15 +464,15 @@ pub fn load_meta_and_table_unvalidated(dir: &Path, frame: u32) -> Result<(Meta, 
 /// smallest lane key. A fragment's membership is already deterministic (a row's
 /// (shape, pm1) is a function of its content), and post-dedup rows are distinct,
 /// so the smallest key per fragment is a total order across fragments. Any
-/// deterministic total order works; the interpreter row key is used because it
-/// is a pure function of the state and needs no engine at checkpoint time.
+/// deterministic total order works; the canonical (kernel/engine) row key is
+/// used because it is the search's one key.
 fn canonical_sort_frontier(states: &[State]) -> Vec<State> {
     let mut keyed: Vec<((u64, u64), State)> = states
         .iter()
         .filter(|s| s.vector_size > 0)
         .map(|s| {
             let mut s = s.clone();
-            let keys = crate::interpreter::vectorize::visited_lane_keys(&s)
+            let keys = crate::compiled::engine_row_keys(&s)
                 .expect("frontier fragment has row keys");
             let mut perm: Vec<u32> = (0..s.vector_size as u32).collect();
             perm.sort_by_key(|&i| keys[i as usize]);

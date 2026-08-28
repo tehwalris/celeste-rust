@@ -630,7 +630,8 @@ fn stream_boundary_prepare(
         let t_keys = std::time::Instant::now();
         let keys = if let Some(ck) = &carried {
             // Engine keys carried from the compiled body: the frontier is
-            // engine-keyed, so use them directly (no interpreter re-hash).
+            // engine-keyed, so use them directly (no re-hash). Same key as
+            // the branch below, which is why they can share a frontier.
             assert_eq!(
                 ck.len(),
                 state.vector_size,
@@ -639,12 +640,22 @@ fn stream_boundary_prepare(
                 state.vector_size
             );
             PreparedKeys::Raw(Some(ck.clone()))
-        } else if filter_now {
-            PreparedKeys::Filtered(crate::interpreter::vectorize::visited_row_keys(
-                &state, visited,
-            ))
         } else {
-            PreparedKeys::Raw(crate::interpreter::vectorize::visited_lane_keys(&state))
+            // An interpreter/fallback state that did not carry keys: recompute
+            // the ONE row key (the kernel/engine key) so it lands in the SAME
+            // frontier the carried lanes do.
+            let engine_keys = crate::compiled::engine_row_keys(&state)?;
+            if filter_now {
+                PreparedKeys::Filtered(Some(
+                    crate::interpreter::vectorize::candidates_from_keys(
+                        engine_keys,
+                        state.vector_size,
+                        visited,
+                    ),
+                ))
+            } else {
+                PreparedKeys::Raw(Some(engine_keys))
+            }
         };
         add_worker_ns(WORKER_KEYS, t_keys.elapsed().as_nanos() as u64);
         kept_out.push(PreparedRows { state, keys });
@@ -1483,6 +1494,10 @@ fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward
 impl AbstractRun {
     pub fn start(program: &Program) -> Result<Self> {
         crate::interpreter::vectorize::set_merge_partition_patterns(&program.merge_partition_cells);
+        // Build the row-key engine here, on the shallow main-thread stack: it
+        // is the ONE row key, recomputed per state in the frontier workers,
+        // and its lazy build is too stack-heavy to trigger inside a worker.
+        crate::compiled::prewarm_engine_row_keys()?;
         let fixed_env = program.fixed_env();
         let initial = create_initial_state_with_builtins(&fixed_env);
         let init_states = interpret_cfg(program.init_cfg().clone(), initial, &fixed_env)
@@ -2664,10 +2679,27 @@ impl AbstractRun {
         let Some(visited) = self.visited_rows.as_mut() else {
             return Ok(());
         };
-        let (kept, before, after) = crate::interpreter::vectorize::subtract_visited(
-            std::mem::take(&mut self.states),
-            visited,
-        );
+        // The ONE row key (kernel/engine key) recomputed per state at the top
+        // crate, then the interp-side local dedup + probe + insert. Replaces
+        // the removed `subtract_visited`, which owned an interpreter key
+        // formula this crate no longer has.
+        let (mut kept, mut before, mut after) = (Vec::new(), 0usize, 0usize);
+        for state in std::mem::take(&mut self.states) {
+            let engine_keys = crate::compiled::engine_row_keys(&state)?;
+            let vk = crate::interpreter::vectorize::candidates_from_keys(
+                engine_keys,
+                state.vector_size,
+                visited,
+            );
+            let (survivors, b, a) = crate::interpreter::vectorize::subtract_precomputed(
+                state,
+                Some(vk),
+                visited,
+            );
+            before += b;
+            after += a;
+            kept.extend(survivors);
+        }
         visited.end_frame()?;
         println!(
             "  frontier-only: {} -> {} new lanes, visited total {}",

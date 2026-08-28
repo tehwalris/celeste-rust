@@ -268,8 +268,26 @@ fn run_game_frames(
         // reached at an earlier frame; expand only the new ones next frame.
         // Experimental sizing version - see subtract_visited's soundness note.
         let new_states = if let Some(visited) = visited_rows.as_mut() {
-            let (kept, lanes_before, lanes_after) =
-                crate::interpreter::vectorize::subtract_visited(new_states, visited);
+            // The ONE row key (kernel/engine key), recomputed per state, then
+            // the local dedup + probe + insert.
+            let (mut kept, mut lanes_before, mut lanes_after) = (Vec::new(), 0usize, 0usize);
+            for state in new_states {
+                let engine_keys = celeste_rust::compiled::engine_row_keys(&state)
+                    .expect("engine row keys");
+                let vk = crate::interpreter::vectorize::candidates_from_keys(
+                    engine_keys,
+                    state.vector_size,
+                    visited,
+                );
+                let (survivors, b, a) = crate::interpreter::vectorize::subtract_precomputed(
+                    state,
+                    Some(vk),
+                    visited,
+                );
+                lanes_before += b;
+                lanes_after += a;
+                kept.extend(survivors);
+            }
             visited.end_frame().expect("in-memory visited end_frame cannot fail");
             println!(
                 "  (frontier-only: {} -> {} new lanes, visited total {})",

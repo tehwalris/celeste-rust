@@ -27,10 +27,8 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
-use crate::interpreter::row_table::{RowTable, ROW_HASH_SEED2};
+use crate::interpreter::row_table::RowTable;
 use crate::interpreter::state::State;
-use crate::interpreter::vectorize::shape_of_state;
-use crate::interpreter::virtual_merge::{collect_columns_labeled, row_key_hashes, Column};
 
 use super::checkpoint;
 
@@ -41,22 +39,12 @@ pub const SWEEP_ORIGIN: &str = "__sweep_origin";
 /// `g` value meaning "cannot reach the goal (within the explored graph)".
 pub const G_UNREACHABLE: u16 = u16::MAX;
 
-/// Row keys of every lane of a canonical boundary state - the same
-/// computation `subtract_visited` performs on the forward pass.
+/// Row keys of every lane of a canonical boundary state - the ONE row key
+/// of the search (the kernel/engine key), the same one the forward pass
+/// stored in the row table. Recomputed here from the state's content so a
+/// saved lane can be looked up; see `compiled::engine_row_keys`.
 pub fn row_keys(state: &State) -> Result<Vec<(u64, u64)>> {
-    let shape_hash = shape_of_state(state).cached_hash();
-    let Some((columns, _)) = collect_columns_labeled(std::slice::from_ref(state)) else {
-        return Err(anyhow!(
-            "state cannot be canonicalized for row keys (collect_columns failed)"
-        ));
-    };
-    let refs: Vec<&Column> = columns.iter().collect();
-    Ok(row_key_hashes(
-        shape_hash,
-        &refs,
-        state.vector_size,
-        ROW_HASH_SEED2,
-    ))
+    crate::compiled::engine_row_keys(state)
 }
 
 /// Write the g array next to the checkpoints (`<dir>/g.bin`, u16-LE columnar).
