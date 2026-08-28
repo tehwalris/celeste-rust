@@ -27,19 +27,25 @@ breaks.)
 
 ## STATUS (2026-08-28, in progress)
 
-- **P0 DONE (pending the end-to-end ladder gate):** unified the whole search on
-  the ONE kernel/engine row key (`compiled::engine_row_keys`), deleted the
-  interpreter key formula (`row_key_hashes`, `visited_lane_keys`,
-  `visited_row_keys`, `subtract_visited`, `RowTable::key`) and native-probe's
-  obsolete `--key-gate`. Frontier, band, sweep and checkpoint-sort all key on
-  it. Net -569 lines. Commits d2e80a8, ed34cd4. Ladder flipped to the compiled
-  forward (rewrite.rs). Gates passing: engine_row_keys_reproduce_the_carried_keys
-  + traced/ladder/exact kernels_reproduce_the_interpreter (quick). REMAINING:
-  run a COMPILED `rewrite ladder` and confirm f89/f93/REFUTED + no "not in the
-  row table". Then P6 = full ASM backend switch (Philippe, after P5).
-- Philippe's "split by shape" (per-shape sub-maps) is NOT yet done - the key is
-  the combined (u64,u64) with shape mixed in, which is correct; the per-shape
-  split is an organization win, evaluate after the ladder gate.
+- **P0 DONE + validated:** unified the whole search on the ONE kernel/engine row
+  key (`compiled::engine_row_keys`), deleted the interpreter key formula
+  (`row_key_hashes`, `visited_lane_keys`, `visited_row_keys`, `subtract_visited`,
+  `RowTable::key`) and native-probe's obsolete `--key-gate`. Frontier, band,
+  sweep and checkpoint-sort all key on it. Commits d2e80a8, ed34cd4, ca392b6,
+  fb94f12. The frontier keys the SAVED (abstracted) state, so the sweep
+  reproduces it. Gates: engine_row_keys_reproduce_the_carried_keys +
+  traced/ladder/exact kernels_reproduce (quick, pass); full quick suite 299/299;
+  a standalone COMPILED level-0 ladder swept 27047 rows with no "not in the row
+  table"; an interpreter ladder swept the SAME 27047 at f30. A full f89-94
+  interpreter ladder is running to reconfirm f89/f93/REFUTED.
+- **P1 DONE (50186e1):** static pos-graph replay builder removed.
+- **P2 DONE (36e5969):** settable precision config; set_rem_precision.
+- **P3-P5, P6 (ASM switch): pending.**
+- **Compiled forward at rungs diverges above Bits(1)** (pre-existing gap) - see
+  the FINDING section at the end. The ladder stays on the interpreter.
+- Philippe's "split by shape" (per-shape sub-maps) is NOT done - the key is the
+  combined (u64,u64) with shape mixed in, which is correct; the per-shape split
+  is an organization win, not a correctness need. Deferred.
 
 ## P0 (PRIORITY): fix compiled forward + backward sweep - unify on the ENGINE key
 
