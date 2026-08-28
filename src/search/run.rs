@@ -1057,18 +1057,6 @@ pub fn effective_chunk_cap() -> usize {
         .unwrap_or(default_cap)
 }
 
-/// The fruit-shape lane cap `chunk_states` will actually use, as a value.
-/// Clamped by the general cap exactly as the chunking does.
-pub fn effective_fruit_chunk_cap() -> usize {
-    let cap = effective_chunk_cap();
-    std::env::var("CELESTE_FRUIT_CHUNK_LANES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8_000)
-        .max(1)
-        .min(cap.max(1))
-}
-
 fn chunk_states(states: Vec<State>) -> Vec<State> {
     // The cap and the thread count are ONE setting, not two. Measured on
     // room (1,0), 60 frames (2026-08-08):
@@ -1095,37 +1083,13 @@ fn chunk_states(states: Vec<State>) -> Vec<State> {
     }
     let mut out = Vec::with_capacity(states.len());
     for state in states {
-        // Fruit-bearing states get a 10x tighter cap: their frames run
-        // under the plain program (the recipe path hits
-        // select-on-UnknownBool) where the widened fruit's UnknownBool
-        // collide branches copy ALL lanes down both arms repeatedly - the
-        // transient per input lane is an order of magnitude above a normal
-        // state's (h89 OOMed on exactly this with the uniform cap).
-        let cap = match crate::interpreter::abstraction::object_shape(&state) {
-            Ok(shape) if shape.iter().any(|t| t == "fruit") => {
-                // Fruit chunks are capped in ABSOLUTE lanes, not as a
-                // fraction of the ordinary cap.
-                //
-                // It used to be `cap / 10`, calibrated when the ordinary
-                // cap was 1,000,000 - so a fruit chunk was 100,000 lanes.
-                // When the parallel default brought the base to 8,000 that
-                // silently became 800, and since a fruit state runs the
-                // PLAIN program (its widened collide check is UnknownBool,
-                // which the specialized select cannot take), the result was
-                // one plain-program invocation per 800 lanes: room (0,0)
-                // f77 spent most of a 165-second frame in 1,355 separate
-                // plain runs of 1.08M deopted lanes.
-                //
-                // 8,000 keeps the in-flight fruit transient at 16 threads x
-                // 8,000 = 128k lanes, next to the 1 x 100,000 the serial
-                // build carried, while cutting the invocation count 10x.
-                // The sweep still wants far less (its origin column blocks
-                // all dedup, so the UnknownBool doubling multiplies on the
-                // full 64-input fan-out) and sets the env var.
-                effective_fruit_chunk_cap()
-            }
-            _ => cap,
-        };
+        // Every state chunks at the same `cap`. Fruit-bearing states used to
+        // get a 10x tighter cap to bound the widened fruit's UnknownBool
+        // collide branch, which copied a whole chunk down both arms - but the
+        // partition fixes removed that whole-chunk doubling, so the fruit cap
+        // no longer changes anything. VERIFIED on room (2,0): the per-frame
+        // row set is byte-identical at fruit cap 10 vs 8000 over 32 frames
+        // (offered reaching 2736 lanes, so states really were chunked).
         if state.vector_size <= cap {
             out.push(state);
             continue;

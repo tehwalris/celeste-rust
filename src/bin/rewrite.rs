@@ -1246,10 +1246,6 @@ fn run_ladder(
     if std::env::var_os("CELESTE_MAX_STATE_LANES").is_none() {
         std::env::set_var("CELESTE_MAX_STATE_LANES", "8000");
     }
-    // (The old CELESTE_FRUIT_CHUNK_LANES=8000 set here was a no-op:
-    // `effective_fruit_chunk_cap()` already defaults to 8000. The 651M-row
-    // blowup once blamed on it was the compiled-path key divergence, now
-    // fixed. The fruit cap itself is vestigial - see P3.)
 
     let recipe_text = std::fs::read_to_string(recipe_path).unwrap_or_default();
     let no_variants: Vec<String> = Vec::new();

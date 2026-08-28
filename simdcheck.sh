@@ -22,10 +22,10 @@ RECIPE=${3:-rewrites.jsonl}
 BIN=${SIMDCHECK_BIN:-./target/release/rewrite}
 export CELESTE_FRONTIER_ONLY=1 CELESTE_DEOPT_COLLECT_FIRST=1 CELESTE_START_ROOM="$ROOM"
 
-run() { # $1 label, $2 threads, $3 cap, $4 fruit cap
+run() { # $1 label, $2 threads, $3 cap (fruit cap removed - it is a no-op now)
   local dir=/tmp/simdcheck-$1
   rm -rf "$dir"
-  CELESTE_FRAME_THREADS=$2 CELESTE_MAX_STATE_LANES=$3 CELESTE_FRUIT_CHUNK_LANES=$4 \
+  CELESTE_FRAME_THREADS=$2 CELESTE_MAX_STATE_LANES=$3 \
     ./safe-run.sh -- "$BIN" --recipe "$RECIPE" bench --frames "$F" --deopt \
       --checkpoint-dir "$dir" --checkpoint-every "$F" > "/tmp/simdcheck-$1.log" 2>&1
   local d

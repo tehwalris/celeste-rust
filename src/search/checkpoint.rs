@@ -106,26 +106,21 @@ pub struct CampaignConfig {
     pub frontier_only: bool,
     /// Deopt frames run collect-first; CELESTE_DEOPT_COLLECT_FIRST.
     pub deopt_collect_first: bool,
-    /// The lane cap `chunk_states` will use, and the fruit-shape cap
-    /// (CELESTE_MAX_STATE_LANES, CELESTE_FRUIT_CHUNK_LANES).
+    /// The lane cap `chunk_states` will use (CELESTE_MAX_STATE_LANES).
     ///
-    /// CHUNKING IS SEMANTIC on rooms with fruit: a comparison against a
-    /// widened interval that straddles in any lane of a chunk used to
-    /// collapse to a whole-value `UnknownBool` and send the entire chunk
-    /// down both edges, so how lanes are grouped decided how coarse the
-    /// over-approximation was. The partition fixes remove that mechanism,
-    /// but "much less left to change" is not "nothing", and the caps also
-    /// steer the deopt and the merge. Two runs that disagree on them must
-    /// never share checkpoints.
-    ///
-    /// Stored as the EFFECTIVE values, not env-var presence, because the
+    /// Stored as the EFFECTIVE value, not env-var presence, because the
     /// default is a function of the thread count: 1M serial, 8k parallel.
-    /// A run that sets neither variable still has a definite cap, and two
-    /// runs at different thread counts differ without either naming a
-    /// chunk setting - which presence-hashing would have missed, the same
-    /// way it missed things twice before.
+    /// A run that sets no variable still has a definite cap, and two runs at
+    /// different thread counts differ without either naming a chunk setting -
+    /// which presence-hashing would have missed, the same way it missed
+    /// things twice before.
+    ///
+    /// The fruit-specific cap (CELESTE_FRUIT_CHUNK_LANES) is GONE: it was a
+    /// workaround for the widened-fruit UnknownBool whole-chunk doubling,
+    /// which the partition fixes removed. Verified: the per-frame row set on
+    /// room (2,0) is byte-identical at fruit cap 10 vs 8000. So it never
+    /// changed the search and is no longer part of the fingerprint.
     pub max_state_lanes: usize,
-    pub fruit_chunk_lanes: usize,
     /// The compiled-forward engine's identity (CELESTE_COMPILED_FORWARD):
     /// `None` when the frame body is the interpreter (the legacy
     /// fingerprint - existing interpreter checkpoints stay valid), else a
@@ -157,7 +152,6 @@ impl CampaignConfig {
             deopt_collect_first: std::env::var_os("CELESTE_DEOPT_COLLECT_FIRST")
                 .is_some(),
             max_state_lanes: crate::search::run::effective_chunk_cap(),
-            fruit_chunk_lanes: crate::search::run::effective_fruit_chunk_cap(),
             compiled_engine: Self::compiled_engine_fingerprint(
                 crate::interpreter::abstraction::rem_precision_from_env(),
             ),
@@ -271,7 +265,6 @@ pub fn config_fingerprint_for(recipe_text: &str, config: &CampaignConfig) -> Str
     config.frontier_only.hash(&mut h);
     config.deopt_collect_first.hash(&mut h);
     config.max_state_lanes.hash(&mut h);
-    config.fruit_chunk_lanes.hash(&mut h);
     // Conditionally, NOT `Option::hash`: `None` must reproduce the legacy
     // stream byte-for-byte so every existing interpreter checkpoint stays
     // valid. (The usual objection to presence-hashing - that two runs can
@@ -710,30 +703,23 @@ mod tests {
             frontier_only: true,
             deopt_collect_first: true,
             max_state_lanes: 8_000,
-            fruit_chunk_lanes: 8_000,
             compiled_engine: None,
             synthetic_win: None,
         }
     }
 
-    /// Chunking is SEMANTIC on rooms with fruit, so two runs that group
-    /// lanes differently can produce different over-approximations and must
-    /// never share checkpoints. Before this, they hashed the same and a
-    /// resume across a cap change was silently accepted - and the quiet
-    /// direction (a sweep chunked FINER than its forward pass) produces a
-    /// SUBSET of the edges, so `g` overestimates and the band prunes viable
-    /// rows with nothing reporting it.
+    /// The lane cap steers the deopt and the merge, so two runs that group
+    /// lanes differently must never share checkpoints. Before this, they
+    /// hashed the same and a resume across a cap change was silently accepted.
+    /// (The fruit-specific cap used to be hashed too; it is gone - the
+    /// partition fixes made it a no-op on the row set, verified on room (2,0).)
     #[test]
-    fn the_chunk_caps_change_the_fingerprint() {
+    fn the_chunk_cap_changes_the_fingerprint() {
         let a = config_fingerprint_for("recipe", &base());
 
         let mut finer = base();
         finer.max_state_lanes = 4_000;
         assert_ne!(a, config_fingerprint_for("recipe", &finer), "cap must count");
-
-        let mut fruit = base();
-        fruit.fruit_chunk_lanes = 1_000;
-        assert_ne!(a, config_fingerprint_for("recipe", &fruit), "fruit cap must count");
 
         // And the same configuration still agrees with itself, or every
         // resume in the campaign would break.

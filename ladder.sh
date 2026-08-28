@@ -69,7 +69,7 @@ export CELESTE_FRONTIER_ONLY=1 CELESTE_DEOPT_COLLECT_FIRST=1
 # rows); chunked COARSER it produces a superset and dies with "a successor
 # row is not in the row table". These used to differ - forward at
 # cap/10 and sweep at cap/100 - which is the quiet direction.
-export CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_LANES=8000
+export CELESTE_MAX_STATE_LANES=8000
 FROM=${1:-94}
 TO=${2:-104}
 MAXK=${3:-16}

@@ -41,7 +41,7 @@ MAXK=${MAXK:-3}
 export CELESTE_WIN_AT_XY=${CELESTE_WIN_AT_XY:-33,104}
 export CELESTE_START_ROOM="$ROOM"
 export CELESTE_FRONTIER_ONLY=1 CELESTE_DEOPT_COLLECT_FIRST=1
-export CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_LANES=8000
+export CELESTE_MAX_STATE_LANES=8000
 D=${D:-/tmp/posgraphsharecheck}
 rm -rf "$D"; mkdir -p "$D"
 R() { ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" "$@"; }
