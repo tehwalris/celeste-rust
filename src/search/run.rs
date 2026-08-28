@@ -465,7 +465,7 @@ fn stream_boundary_one(
     visited: &mut crate::interpreter::visited::Visited,
     counters: &mut StreamCounters,
 ) -> Result<Vec<State>> {
-    let prepared = stream_boundary_prepare(state, band, frame, counters, visited, true, None)?;
+    let prepared = stream_boundary_prepare(state, band, frame, counters, visited, true)?;
     Ok(stream_boundary_subtract(prepared, visited, counters))
 }
 
@@ -491,27 +491,10 @@ fn stream_boundary_prepare(
     counters: &mut StreamCounters,
     visited: &crate::interpreter::visited::Visited,
     filter_now: bool,
-    // ENGINE keys carried from the compiled body (Option 1). `Some` => the
-    // frontier is engine-keyed and these ARE the per-lane keys, so the
-    // interpreter re-hash is skipped. Only supported when the state does not
-    // rung-split (level 0, which is where Option 1 runs) and the partitioned
-    // filter is on.
-    carried: Option<Vec<(u64, u64)>>,
 ) -> Result<Vec<PreparedRows>> {
     let mut kept_out = Vec::new();
     let t_abs = std::time::Instant::now();
     let split = crate::interpreter::abstraction::split_precision_straddles(state);
-    if carried.is_some() {
-        assert_eq!(
-            split.len(),
-            1,
-            "engine-keyed frontier (Option 1) does not support a rung split; run level 0"
-        );
-        assert!(
-            !filter_now,
-            "engine-keyed frontier needs the partitioned filter"
-        );
-    }
     let mut abs_ns = t_abs.elapsed().as_nanos() as u64;
     for state in split {
         let t_abs = std::time::Instant::now();
@@ -628,34 +611,23 @@ fn stream_boundary_prepare(
         // per-lane cache miss lives, and it needs only `&RowTable`, so it
         // belongs on this side of the parallel/serial line.
         let t_keys = std::time::Instant::now();
-        let keys = if let Some(ck) = &carried {
-            // Engine keys carried from the compiled body: the frontier is
-            // engine-keyed, so use them directly (no re-hash). Same key as
-            // the branch below, which is why they can share a frontier.
-            assert_eq!(
-                ck.len(),
-                state.vector_size,
-                "carried engine keys ({}) != lanes ({}) after abstraction",
-                ck.len(),
-                state.vector_size
-            );
-            PreparedKeys::Raw(Some(ck.clone()))
+        // The ONE row key (kernel/engine key), computed from THIS abstracted +
+        // gc'd state - the exact state that gets checkpointed, so the backward
+        // sweep recomputes the identical key and finds it in the row table.
+        // (Computing it from the compiled body's raw pre-abstraction output
+        // instead - the old carried-key path - stored a key the sweep could
+        // not reproduce, since the saved state is the abstracted one.)
+        let engine_keys = crate::compiled::engine_row_keys(&state)?;
+        let keys = if filter_now {
+            PreparedKeys::Filtered(Some(
+                crate::interpreter::vectorize::candidates_from_keys(
+                    engine_keys,
+                    state.vector_size,
+                    visited,
+                ),
+            ))
         } else {
-            // An interpreter/fallback state that did not carry keys: recompute
-            // the ONE row key (the kernel/engine key) so it lands in the SAME
-            // frontier the carried lanes do.
-            let engine_keys = crate::compiled::engine_row_keys(&state)?;
-            if filter_now {
-                PreparedKeys::Filtered(Some(
-                    crate::interpreter::vectorize::candidates_from_keys(
-                        engine_keys,
-                        state.vector_size,
-                        visited,
-                    ),
-                ))
-            } else {
-                PreparedKeys::Raw(Some(engine_keys))
-            }
+            PreparedKeys::Raw(Some(engine_keys))
         };
         add_worker_ns(WORKER_KEYS, t_keys.elapsed().as_nanos() as u64);
         kept_out.push(PreparedRows { state, keys });
@@ -679,25 +651,6 @@ enum PreparedKeys {
     Raw(Option<Vec<(u64, u64)>>),
 }
 
-thread_local! {
-    /// Per-output-state ENGINE row keys stashed by `CompiledForward::run_chunk`
-    /// and consumed by the streaming worker on the SAME thread immediately
-    /// after `interpret_state_base` returns (Option 1's engine-keyed frontier).
-    /// `Some(keys)` = engine keys carried from a kernel/merged block; `None` =
-    /// an interpreter/fallback state that takes the interpreter key path.
-    static CARRIED_KEYS: std::cell::RefCell<Vec<Option<Vec<(u64, u64)>>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-fn set_carried_keys(keys: Vec<Option<Vec<(u64, u64)>>>) {
-    CARRIED_KEYS.with(|c| *c.borrow_mut() = keys);
-}
-
-/// Take (and clear) the keys stashed for the just-produced outputs. Returns
-/// empty when the frame body did not carry any (interpreter/deopt path).
-fn take_carried_keys() -> Vec<Option<Vec<(u64, u64)>>> {
-    CARRIED_KEYS.with(|c| std::mem::take(&mut *c.borrow_mut()))
-}
 
 /// The process-wide within-frame set, reused across frames (cleared per frame).
 /// 2^22 slots (~4M) for ~1.2M distinct successors/frame - load factor ~0.3.
@@ -1243,16 +1196,17 @@ impl CompiledForward {
         state: State,
     ) -> Result<Vec<State>> {
         if !self.check {
-            // Carry the engine keys (b.row_keys) out-of-band so the frontier is
-            // ENGINE-keyed (Option 1) without threading them through every
-            // interpret/variant/deopt path: the worker reads them right after
-            // this returns, on the same thread. See `take_carried_keys`.
-            let keyed = self
+            // The engine's own per-lane keys are dropped here: the frontier
+            // recomputes the row key from each ABSTRACTED output state (the one
+            // it checkpoints) via `engine_row_keys`, so the backward sweep can
+            // reproduce it. Carrying the engine's pre-abstraction key instead
+            // stored a key the sweep could not recompute from the saved state.
+            let states: Vec<State> = self
                 .engine
-                .run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
-            let (states, keys): (Vec<State>, Vec<Option<Vec<(u64, u64)>>>) =
-                keyed.into_iter().unzip();
-            set_carried_keys(keys);
+                .run_frame_chunk(&state, Some((frame_cfg, fixed_env)))
+                .into_iter()
+                .map(|(s, _keys)| s)
+                .collect();
             return Ok(states);
         }
         let reference: Vec<State> = interpret_prepared_cfg(frame_cfg, state.clone(), fixed_env)
@@ -1330,8 +1284,7 @@ impl CompiledForward {
         // reference it is being judged against.
         drop(got);
         // Check mode carries the interpreter's reference states forward (see
-        // above); they take the interpreter key path (None carried) downstream.
-        set_carried_keys(vec![None; reference.len()]);
+        // above); the frontier recomputes their row key like any other state.
         Ok(reference)
     }
 }
@@ -1988,19 +1941,9 @@ impl AbstractRun {
                                         variants, deopt, frame_cfg, fixed_env, state, &mut ev,
                                         pos_obs, compiled,
                                     )?;
-                                    // Engine keys the compiled body carried for
-                                    // these outputs (Option 1). Empty on the
-                                    // interpreter path.
-                                    let carried = take_carried_keys();
-                                    let use_carried = !carried.is_empty();
                                     let t1 = std::time::Instant::now();
                                     let mut prepared = Vec::new();
-                                    for (oi, out) in outputs.into_iter().enumerate() {
-                                        let ck = if use_carried {
-                                            carried.get(oi).cloned().flatten()
-                                        } else {
-                                            None
-                                        };
+                                    for out in outputs {
                                         prepared.extend(stream_boundary_prepare(
                                             out,
                                             band,
@@ -2008,7 +1951,6 @@ impl AbstractRun {
                                             &mut sc,
                                             visited_ro,
                                             !partitioned,
-                                            ck,
                                         )?);
                                     }
                                     add_worker_ns(WORKER_BODY, (t1 - t0).as_nanos() as u64);
