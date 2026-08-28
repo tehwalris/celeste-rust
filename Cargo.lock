@@ -112,41 +112,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "celeste-kernels"
-version = "0.1.0"
-dependencies = [
- "celeste-core",
- "celeste-engine",
- "celeste-kernels-room00",
- "celeste-kernels-room10",
- "celeste-kernels-room20",
-]
-
-[[package]]
-name = "celeste-kernels-room00"
-version = "0.1.0"
-dependencies = [
- "celeste-core",
- "celeste-engine",
-]
-
-[[package]]
-name = "celeste-kernels-room10"
-version = "0.1.0"
-dependencies = [
- "celeste-core",
- "celeste-engine",
-]
-
-[[package]]
-name = "celeste-kernels-room20"
-version = "0.1.0"
-dependencies = [
- "celeste-core",
- "celeste-engine",
-]
-
-[[package]]
 name = "celeste-names"
 version = "0.1.0"
 
@@ -160,7 +125,6 @@ dependencies = [
  "celeste-engine",
  "celeste-interp",
  "celeste-ir",
- "celeste-kernels",
  "celeste-names",
  "clap",
  "elsa",
@@ -465,7 +429,6 @@ version = "0.1.0"
 dependencies = [
  "celeste-core",
  "celeste-engine",
- "celeste-kernels",
  "celeste-names",
  "celeste-rust",
  "mimalloc",

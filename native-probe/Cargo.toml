@@ -24,7 +24,6 @@ edition = "2021"
 [dependencies]
 celeste-core = { path = "../crates/celeste-core" }
 celeste-engine = { path = "../crates/celeste-engine" }
-celeste-kernels = { path = "../crates/celeste-kernels" }
 celeste-names = { path = "../crates/celeste-names" }
 celeste-rust = { path = ".." }
 mimalloc = "0.1"

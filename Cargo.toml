@@ -5,10 +5,6 @@ members = [
     "crates/celeste-interp",
     "crates/celeste-names",
     "crates/celeste-engine",
-    "crates/celeste-kernels-room00",
-    "crates/celeste-kernels-room10",
-    "crates/celeste-kernels-room20",
-    "crates/celeste-kernels",
     "native-probe",
 ]
 # Without this, a bare `cargo build` in the repo root builds ONLY the root
@@ -25,10 +21,6 @@ default-members = [
     "crates/celeste-interp",
     "crates/celeste-names",
     "crates/celeste-engine",
-    "crates/celeste-kernels-room00",
-    "crates/celeste-kernels-room10",
-    "crates/celeste-kernels-room20",
-    "crates/celeste-kernels",
     "native-probe",
 ]
 
@@ -42,7 +34,6 @@ celeste-core = { path = "crates/celeste-core" }
 celeste-ir = { path = "crates/celeste-ir" }
 celeste-interp = { path = "crates/celeste-interp" }
 celeste-engine = { path = "crates/celeste-engine" }
-celeste-kernels = { path = "crates/celeste-kernels" }
 celeste-names = { path = "crates/celeste-names" }
 mimalloc = { version = "0.1", default-features = false }
 anyhow = "1.0.62"
@@ -120,32 +111,7 @@ debug = 1
 # purely the 6%.
 [profile.release.package.celeste-engine]
 debug = false
-[profile.release.package.celeste-kernels]
-debug = false
-[profile.release.package.celeste-kernels-room00]
-debug = false
-[profile.release.package.celeste-kernels-room10]
-debug = false
-[profile.release.package.celeste-kernels-room20]
-debug = false
 [profile.release.package.native-probe]
-debug = false
-# The DWARF crash above is NOT gone for the kernel crates in dev: adding
-# the rung-agnostic `ladder` set (2026-08-25, plans/kernel-ladder.md) - a
-# second ~20k-line generated `frame` beside the traced one - overflows
-# rustc's stack in LLVM's DwarfCompileUnit::createAndAddScopeChildren at
-# debuginfo=2 (SIGSEGV, "rustc unexpectedly overflowed its stack"). Nobody
-# debugs generated kernels source-level, so debuginfo buys nothing there.
-# The generated code moved from one `celeste-kernels` crate into one crate
-# per room (task: split celeste-kernels for dev-loop compile time) - the
-# override moves with it, per room crate.
-[profile.dev.package.celeste-kernels]
-debug = false
-[profile.dev.package.celeste-kernels-room00]
-debug = false
-[profile.dev.package.celeste-kernels-room10]
-debug = false
-[profile.dev.package.celeste-kernels-room20]
 debug = false
 
 [[bin]]

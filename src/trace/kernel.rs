@@ -1279,8 +1279,6 @@ pub(crate) fn lattice_kernel_refs(
             bound.forks,
         )
         .map_err(|e| anyhow::anyhow!("lattice shape {} lower: {:#}", i, name_cells(&f, e)))?;
-        render(&f, &bound, &lowered, &format!("shape {}", i))
-            .map_err(|e| anyhow::anyhow!("lattice shape {} render: {:#}", i, e))?;
         refs.push(Reference {
             frame: f,
             graph: lw.graph.clone(),
@@ -1543,121 +1541,6 @@ fn write_kernels_from_refs(refs: &[Reference], dir: &std::path::Path) -> Result<
 
 #[cfg(test)]
 mod tests {
-    /// Byte-for-byte staleness for one variant's checked-in set.
-    ///
-    /// The checked-in sets are committed, so nothing in the build forces
-    /// them to match the generator that claims to produce them - and a
-    /// stale kernel does not fail to compile, it computes a frame the
-    /// tracer no longer agrees with.
-    ///
-    /// Three checks, sized so the gate stays on every commit:
-    ///
-    /// 1. Regenerate the DEFAULT room's ((1,0)) subset and compare byte
-    ///    for byte, both directions. Regenerating every room costs
-    ///    minutes (room (2,0)'s lattice fixpoint alone is ~35 s per
-    ///    variant); the emitter is shared across rooms, so generator
-    ///    drift shows up in room (1,0)'s bytes. The other rooms' own
-    ///    gates are `room00_kernels_are_current` /
-    ///    `room20_kernels_are_current` (#[ignore], run them when
-    ///    touching the tracer or the emitters).
-    /// 2. Compare the room crate's thin wrapper `mod.rs` (just
-    ///    `pub mod room<xy>;`) the same way.
-    /// 3. Recompute the AGGREGATOR `mod.rs`
-    ///    (`crates/celeste-kernels/src/<set>/mod.rs`) from every
-    ///    COMMITTED room crate and compare. `FINGERPRINT` re-hashes
-    ///    every room's sources, so hand-editing ANY room's kernels -
-    ///    including the ones this gate does not regenerate - fails
-    ///    here.
-    fn variant_set_is_current(
-        set: &str,
-        regen: fn(&std::path::Path, &std::path::Path) -> anyhow::Result<Vec<usize>>,
-    ) {
-        let dir = std::env::temp_dir()
-            .join(format!("celeste-{}-{}", set, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        regen(std::path::Path::new("."), &dir).unwrap_or_else(|e| {
-            panic!("regenerate the {} kernel set (run from the repo root): {:#}", set, e)
-        });
-        let room = super::kernel_room_mod();
-        let committed_root = std::path::PathBuf::from("crates")
-            .join(format!("celeste-kernels-{}", room))
-            .join("src")
-            .join(set);
-        let committed = committed_root.join(&room);
-        let fresh = dir.join(&room);
-        let listing = |d: &std::path::Path| -> std::collections::BTreeSet<String> {
-            std::fs::read_dir(d)
-                .unwrap_or_else(|e| panic!("read {}: {}", d.display(), e))
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .collect()
-        };
-        // Both directions. One shape FEWER than last time leaves a
-        // stale `kernelN.rs` behind that still compiles and is still
-        // reachable through nothing - comparing only the files the
-        // tracer just wrote would pass over it.
-        assert_eq!(
-            listing(&fresh),
-            listing(&committed),
-            "the {} kernel set has a different FILE LIST for {} than what is \
-             committed. Run ./regen-generated.sh.",
-            set,
-            room
-        );
-        for name in listing(&fresh) {
-            let a = std::fs::read_to_string(committed.join(&name)).unwrap();
-            let b = std::fs::read_to_string(fresh.join(&name)).unwrap();
-            if a != b {
-                let first =
-                    a.lines().zip(b.lines()).position(|(x, y)| x != y).map(|i| i + 1);
-                panic!(
-                    "{}/{}/{} is STALE: on disk {} lines, tracer says {} lines, \
-                     first differing line {:?}. Run ./regen-generated.sh and read \
-                     the diff.",
-                    committed_root.display(),
-                    room,
-                    name,
-                    a.lines().count(),
-                    b.lines().count(),
-                    first
-                );
-            }
-        }
-        let committed_wrapper = std::fs::read_to_string(committed_root.join("mod.rs"))
-            .unwrap_or_else(|e| panic!("read {}/mod.rs: {}", committed_root.display(), e));
-        let fresh_wrapper = std::fs::read_to_string(dir.join("mod.rs"))
-            .unwrap_or_else(|e| panic!("read {}/mod.rs: {}", dir.display(), e));
-        assert_eq!(
-            fresh_wrapper,
-            committed_wrapper,
-            "{}/mod.rs (the room-crate wrapper) is STALE. Run ./regen-generated.sh.",
-            committed_root.display()
-        );
-        let room_dirs: Vec<std::path::PathBuf> = super::room_kernel_crate_dirs(std::path::Path::new("."))
-            .unwrap_or_else(|e| panic!("discover room crates: {:#}", e))
-            .into_iter()
-            .map(|(_, p)| p.join("src").join(set))
-            .collect();
-        let (_, want) = super::merged_mod_rs(set, &room_dirs)
-            .unwrap_or_else(|e| panic!("recompute {}/mod.rs: {:#}", set, e));
-        let aggregator = std::path::PathBuf::from("crates/celeste-kernels/src").join(set);
-        let got = std::fs::read_to_string(aggregator.join("mod.rs")).unwrap();
-        assert_eq!(
-            got,
-            want,
-            "{}/mod.rs does not match its room crates (room list or \
-             FINGERPRINT drift). Run ./regen-generated.sh.",
-            aggregator.display()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The gate that makes the CHECKED-IN base (level-0) set safe.
-    /// Not `#[ignore]`d - it costs a few seconds for room (1,0) and it
-    /// guards what runs on every campaign frame.
-    #[test]
-    fn traced_kernels_are_current() {
-        variant_set_is_current("traced", super::write_room_kernels);
-    }
 
     /// The ASM cutover's compute gate (plans/asm-and-posgraph-execution.md
     /// B): pull out the FUSED graph (`emit::asm_fused` ->
@@ -1733,42 +1616,6 @@ mod tests {
         );
     }
 
-    /// The RUNG-AGNOSTIC set's staleness gate (plans/kernel-ladder.md).
-    #[test]
-    fn ladder_kernels_are_current() {
-        variant_set_is_current("ladder", super::write_room_kernels_ladder);
-    }
-
-    /// The EXACT-REM set's staleness gate (plans/kernel-ladder.md).
-    #[test]
-    fn exact_kernels_are_current() {
-        variant_set_is_current("exact", super::write_room_kernels_exact);
-    }
-
-    /// Regenerate ONE non-default room across all three variants and
-    /// compare byte for byte. `#[ignore]` for cost (the room (2,0)
-    /// fixpoint is ~35 s per variant); run when touching the tracer,
-    /// the emitters, or anything feeding the kernels. Room selection is
-    /// per PROCESS (`CELESTE_START_ROOM` feeds a OnceLock), which is
-    /// why this is one test per room rather than a loop.
-    fn room_set_is_current(room_env: &str) {
-        std::env::set_var("CELESTE_START_ROOM", room_env);
-        variant_set_is_current("traced", super::write_room_kernels);
-        variant_set_is_current("ladder", super::write_room_kernels_ladder);
-        variant_set_is_current("exact", super::write_room_kernels_exact);
-    }
-
-    #[test]
-    #[ignore]
-    fn room00_kernels_are_current() {
-        room_set_is_current("0,0");
-    }
-
-    #[test]
-    #[ignore]
-    fn room20_kernels_are_current() {
-        room_set_is_current("2,0");
-    }
 
     /// How much of the row amplification is STATICALLY removable?
     ///

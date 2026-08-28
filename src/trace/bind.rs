@@ -621,8 +621,8 @@ mod tests {
     #[test]
     fn every_path_in_a_shape_witness_resolves_to_the_cell_it_names() {
         for w in [
-            "crates/celeste-kernels/witness/steady-shape.json",
-            "crates/celeste-kernels/witness/r20-steady-shape.json",
+            "test-fixtures/witness/steady-shape.json",
+            "test-fixtures/witness/r20-steady-shape.json",
         ] {
             let rt2 = block_from_witness(w);
             let text = std::fs::read_to_string(w).expect("witness");
@@ -803,7 +803,7 @@ mod tests {
     /// looks like from the binder's side.
     #[test]
     fn two_paths_landing_on_one_cell_are_refused() {
-        let rt2 = block_from_witness("crates/celeste-kernels/witness/steady-shape.json");
+        let rt2 = block_from_witness("test-fixtures/witness/steady-shape.json");
         let p: Path = vec![key("objects"), Step::Idx(0)];
         assert!(resolve_all(&rt2, &[p.clone()]).is_ok(), "one path is fine");
         let e = resolve_all(&rt2, &[p.clone(), p])
@@ -817,7 +817,7 @@ mod tests {
     /// handed the wrong shape declines to bind.
     #[test]
     fn a_path_outside_the_shape_is_refused() {
-        let rt2 = block_from_witness("crates/celeste-kernels/witness/steady-shape.json");
+        let rt2 = block_from_witness("test-fixtures/witness/steady-shape.json");
         for bad in [
             vec![key("no_such_global")],
             vec![key("objects"), Step::Idx(99)],

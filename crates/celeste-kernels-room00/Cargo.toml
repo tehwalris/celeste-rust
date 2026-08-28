@@ -1,8 +1,0 @@
-[package]
-name = "celeste-kernels-room00"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-celeste-core = { path = "../celeste-core" }
-celeste-engine = { path = "../celeste-engine" }
