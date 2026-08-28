@@ -500,6 +500,67 @@ mod tests {
         );
     }
 
+    /// The ASM kernels reproduce the interpreter, per chunk, on room (1,0).
+    ///
+    /// Same gate as `traced_kernels_reproduce_the_interpreter` but with
+    /// `CELESTE_ASM_KERNELS=1`, so the compiled engine dispatches to the
+    /// runtime-assembled AVX-512 kernels (the fused graph, `asm_kernel`)
+    /// instead of the generated Rust ones. `CELESTE_COMPILED_FORWARD=check`
+    /// runs BOTH the engine and the interpreter on every chunk and compares
+    /// their row-key sets, so a divergence is a hard error, not a silent
+    /// lane-count match. `missed_lanes() == 0` proves the ASM kernels
+    /// actually covered every chunk (a miss would fall through to the
+    /// interpreter and pass vacuously).
+    ///
+    /// The registry retraces the start room and shells out to `gcc` on
+    /// first dispatch, so this is slower than the Rust-kernel gate -
+    /// `#[ignore]` over an env check would hide the cost; it runs, and if it
+    /// is too slow for every commit it can be moved behind `#[ignore]`.
+    #[test]
+    fn asm_kernels_reproduce_the_interpreter() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+
+        let frames = 30;
+        let mut baseline = AbstractRun::start(&program).expect("start baseline");
+        let mut want = Vec::new();
+        for _ in 1..=frames {
+            baseline.step().expect("baseline step");
+            want.push(baseline.lane_count());
+        }
+        drop(baseline);
+
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        std::env::set_var("CELESTE_ASM_KERNELS", "1");
+        let mut run = AbstractRun::start(&program).expect("start compiled run");
+        assert!(run.compiled.is_some(), "the compiled engine did not engage");
+        for (frame, want) in (1..=frames).zip(want) {
+            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
+            assert_eq!(
+                run.lane_count(),
+                want,
+                "the ASM kernels have a different lane count at frame {}",
+                frame
+            );
+        }
+        assert!(
+            crate::compiled::dispatch::traced_lanes() > 0,
+            "no chunk ever reached an ASM kernel - the registry covers no shape \
+             this run produces, so this test checked nothing"
+        );
+        assert_eq!(
+            crate::compiled::dispatch::missed_lanes(),
+            0,
+            "the ASM kernels missed lanes on room (1,0)"
+        );
+    }
+
     /// The kernel-driven LADDER gate (plans/kernel-ladder.md): at rem
     /// rung Bits(1), the RUNG-AGNOSTIC kernel set reproduces the
     /// interpreter's row sets, per chunk, at the rung's own abstraction.

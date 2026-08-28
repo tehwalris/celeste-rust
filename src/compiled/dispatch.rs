@@ -113,7 +113,15 @@ pub(crate) fn run_chunk_kernel(
     ids: &runtime2::BoundaryIds,
     done: &mut Vec<runtime2::Rt2>,
 ) -> bool {
-    if run_traced_kernel(chunk, ids, done) {
+    // The ASM backend (CELESTE_ASM_KERNELS) replaces the generated Rust
+    // kernels: same fused compute graph, assembled at startup. Off by
+    // default until it passes the gates.
+    let hit = if super::asm_kernel::enabled() {
+        super::asm_kernel::run_chunk(chunk, ids, done)
+    } else {
+        run_traced_kernel(chunk, ids, done)
+    };
+    if hit {
         KERNEL_HITS[0].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
         return true;
     }

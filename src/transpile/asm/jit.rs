@@ -77,6 +77,15 @@ pub struct Loaded {
     pub func: KernelFn,
 }
 
+// The `handle` is a dlopen token used only by `dlclose` on drop (single
+// owner), and `func` is a pure, reentrant, stateless kernel - it reads its
+// input buffer and writes its output buffer, with call-outs through the
+// caller-provided `AsmCtx`, and holds no shared mutable state. So a `Loaded`
+// is safe to share and call across threads (the engine dispatches chunks on
+// a worker pool against one shared registry).
+unsafe impl Send for Loaded {}
+unsafe impl Sync for Loaded {}
+
 impl Loaded {
     /// `dlopen` `path` and resolve `sym` to a `KernelFn`.
     pub fn open(path: &Path, sym: &str) -> Result<Loaded> {

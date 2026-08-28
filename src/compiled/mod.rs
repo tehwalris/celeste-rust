@@ -36,6 +36,7 @@ use celeste_names as gen;
 
 use crate::program::Program;
 
+pub(crate) mod asm_kernel;
 pub mod bridge;
 pub mod dispatch;
 
