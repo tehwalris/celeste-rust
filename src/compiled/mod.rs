@@ -179,8 +179,9 @@ pub fn print_chunk_phase_times() {
 
 /// The per-lane origin tags the engine carries as METADATA rather than
 /// state (plans/kernel-ladder.md "the passthrough column"): the backward
-/// sweep's row-id column and the pos-graph recorder's cell column. At most
-/// one is ever present - they belong to different replay modes.
+/// sweep's row-id column. (The pos-graph recorder used to carry a cell
+/// column here too; it now partitions merges by input position instead of
+/// tagging, so it needs no passthrough - see `pos_graph::PosObserver`.)
 ///
 /// Outside the engine the tag stays what it always was, a per-lane heap
 /// global (`deopt_collect::inject_named`), because that is what the
@@ -188,10 +189,7 @@ pub fn print_chunk_phase_times() {
 /// where the representations meet: `run_frame_chunk` strips the global
 /// into `Rt2::origin` on import (import drops unknown globals anyway, so
 /// the kernels bind the untagged shape) and re-injects it on export.
-const ORIGIN_TAGS: [&str; 2] = [
-    crate::search::sweep::SWEEP_ORIGIN,
-    crate::search::pos_graph::POS_ORIGIN,
-];
+const ORIGIN_TAGS: [&str; 1] = [crate::search::sweep::SWEEP_ORIGIN];
 
 /// The origin tag `state` carries, if any.
 fn origin_tag_of(state: &crate::interpreter::state::State) -> Option<&'static str> {

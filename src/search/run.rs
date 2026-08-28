@@ -1586,15 +1586,19 @@ impl AbstractRun {
     }
 
     /// Record the position-transition table while stepping
-    /// (`search::pos_graph`). Read-only: it does not change what any frame
-    /// computes, only what is observed about it.
+    /// (`search::pos_graph`). Does not change what any frame COMPUTES or the
+    /// reachable row set, only how merges are grouped: it adds the player
+    /// position to the merge partition so every frame-input chunk is uniform
+    /// in position and the recorder can attribute it to one input cell.
     pub fn record_pos_graph(&mut self) {
+        crate::interpreter::vectorize::set_partition_player_position(true);
         self.pos_obs = Some(super::pos_graph::PosObserver::default());
     }
 
     /// Record while stepping, but keep everything an earlier run of the
     /// same search already recorded - the resumed case.
     pub fn record_pos_graph_from(&mut self, graph: super::pos_graph::PosGraph) {
+        crate::interpreter::vectorize::set_partition_player_position(true);
         self.pos_obs = Some(super::pos_graph::PosObserver::seeded(graph));
     }
 
@@ -2201,7 +2205,7 @@ fn interpret_state_base(
     deopt: Option<&DeoptTarget>,
     frame_cfg: &crate::interpreter::fixed_env::PreparedCfg,
     fixed_env: &crate::interpreter::fixed_env::FixedEnv,
-    mut state: State,
+    state: State,
     counters: &mut FrameEventCounters,
     pos_obs: Option<&super::pos_graph::PosObserver>,
     compiled: Option<&'static CompiledForward>,
@@ -2220,13 +2224,16 @@ fn interpret_state_base(
     if compiled.is_some() && variants.is_some() {
         anyhow::bail!("CELESTE_COMPILED_FORWARD does not support --variant dispatch");
     }
-    // Tag each input lane with its own cell before the state is consumed.
-    // This is the only place that has both sides of a chunk's transition.
-    // The variant path sits below the tag and above the record, so a
-    // dispatched frame contributes its transitions like any other.
-    if let Some(obs) = pos_obs {
-        obs.tag(&mut state)?;
-    }
+    // Record the frame-input chunk's single position cell before the state
+    // is consumed - this is the only place that has both sides of a chunk's
+    // transition. The position partition (installed while recording) makes
+    // the chunk uniform in position, so one cell attributes the whole
+    // chunk's outputs; `input_cell` errors loudly if the partition is
+    // missing rather than recording a cross product.
+    let pos_in = match pos_obs {
+        Some(obs) => Some(obs.input_cell(&state)?),
+        None => None,
+    };
     let mut new_states = Vec::new();
     let declined = match variants {
         Some(vd) => match dispatch_variant_frame(vd, state, counters) {
@@ -2328,30 +2335,16 @@ fn interpret_state_base(
             }
         }
     }
-    if let Some(obs) = pos_obs {
-        obs.record(&new_states)?;
-        // STRIP THE TAG HERE, before the states go anywhere else.
-        //
-        // The tag exists only to attribute this frame's outputs to this
-        // frame's inputs; nothing downstream wants it. Removing it now is
-        // what lets recording run on a STREAMING frontier pass at all: the
-        // objection to a tagged forward pass was that a per-lane column
-        // rides into the boundary row keys and forbids the frontier dedup
-        // that sets how coarse the abstraction is. A tag that never reaches
-        // the boundary cannot do that.
-        //
-        // What this does NOT make identical is mid-frame grouping: the
-        // column is per-lane distinct, so lane merges inside the frame
-        // still see it and still decline. That is deliberate - a merge
-        // would fold two source cells into one lane and the table would
-        // MISS a pair, which is the unsound direction (g too large, band
-        // over-prunes, nothing reports it). So the fragments differ from an
-        // untagged run and the reachable set has to be CHECKED equal, not
-        // assumed - see the gate in BENCHMARK_DATA.md.
-        for state in &mut new_states {
-            state.global_env.remove(super::pos_graph::POS_ORIGIN);
-            state.gc();
-        }
+    if let (Some(obs), Some(c_in)) = (pos_obs, pos_in) {
+        // Pair this chunk's single input cell with every output cell. No tag
+        // is injected, so nothing rides into the boundary row keys and the
+        // frontier dedup is untouched; mid-frame dedup within the chunk fires
+        // normally (lanes that share this input position and converge
+        // collapse), which is the whole point over the per-lane tag. The
+        // partition makes the merge grouping finer but never changes the
+        // reachable row SET, so this fuses into the forward pass without
+        // becoming a different search - CHECKED equal, see BENCHMARK_DATA.md.
+        obs.record(c_in, &new_states)?;
     }
     Ok(new_states)
 }

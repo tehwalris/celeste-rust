@@ -1142,6 +1142,19 @@ pub fn set_merge_partition_patterns(patterns: &[String]) {
     *PROGRAM_PATTERNS.write().unwrap() = patterns.to_vec();
 }
 
+/// Also partition merges on the player position cells (`room.x`/`room.y`
+/// and the player object's `x`/`y`). Set by the pos-graph recorder so every
+/// merged state - hence every frame-input chunk - is uniform in position;
+/// see `abstraction::partition_position_cells`. Off by default: position is
+/// content and partitioning on it never changes the reachable row set, but
+/// it does make merges finer, which only the recorder wants to pay for.
+static PARTITION_PLAYER_POS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_partition_player_position(on: bool) {
+    PARTITION_PLAYER_POS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn partition_cell_patterns() -> Vec<String> {
     static ENV: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
     let env = ENV.get_or_init(|| {
@@ -1164,20 +1177,28 @@ fn partition_cell_patterns() -> Vec<String> {
 /// "dash_effect_time").
 fn resolve_partition_cells(state: &State) -> Vec<usize> {
     let patterns = partition_cell_patterns();
-    if patterns.is_empty() {
-        return Vec::new();
+    let mut cells: Vec<usize> = if patterns.is_empty() {
+        Vec::new()
+    } else {
+        let names = super::merge_dump::cell_names(state);
+        names
+            .iter()
+            .filter(|(_, name)| {
+                patterns
+                    .iter()
+                    .any(|p| *name == p || name.ends_with(&format!(".{}", p)))
+            })
+            .map(|(&cell, _)| cell)
+            .collect()
+    };
+    // The recorder's position partition: resolved directly by object type
+    // (not by name pattern, which is fragile for the array-indexed player
+    // path) so it is exact regardless of the object's slot.
+    if PARTITION_PLAYER_POS.load(std::sync::atomic::Ordering::Relaxed) {
+        cells.extend(super::abstraction::partition_position_cells(state));
     }
-    let names = super::merge_dump::cell_names(state);
-    let mut cells: Vec<usize> = names
-        .iter()
-        .filter(|(_, name)| {
-            patterns
-                .iter()
-                .any(|p| *name == p || name.ends_with(&format!(".{}", p)))
-        })
-        .map(|(&cell, _)| cell)
-        .collect();
     cells.sort_unstable();
+    cells.dedup();
     cells
 }
 

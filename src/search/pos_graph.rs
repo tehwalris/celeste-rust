@@ -357,32 +357,25 @@ impl PosGraphBuilder {
 }
 
 
-/// The per-lane origin column the recorder injects: each lane carries the
-/// CELL its frame-input lane was in. Distinct from the sweep's
-/// `SWEEP_ORIGIN`, which carries a row id.
-pub const POS_ORIGIN: &str = "__pos_origin";
-
 /// Collects the table while a run steps frames.
 ///
-/// Attribution is PER LANE, via `POS_ORIGIN`: the recorder tags each input
-/// lane with its own cell and reads the tag back off each output lane, so a
-/// pair is a real transition rather than a chunk-wide cross product. The
-/// first version of this was read-only and recorded every source cell of a
-/// chunk against every destination cell of it; that is conservative and
-/// completely useless - it kept 93.6% of the unfiltered candidate set,
-/// because an 8,000-lane chunk spans thousands of cells and the cross
-/// product squares that. See BENCHMARK_DATA.md.
+/// Attribution is by PARTITION, not by a per-lane tag: while recording, the
+/// forward pass adds the player position cells to the merge partition
+/// (`vectorize::set_partition_player_position`), so every merged state - and
+/// hence every frame-input chunk `chunk_states` cuts from it - is uniform in
+/// position. The recorder reads that ONE input cell off the chunk
+/// (`input_cell`) and pairs it with every output cell, which is exact rather
+/// than a cross product: all the chunk's lanes really did start at that cell.
 ///
-/// The tag never reaches the boundary: `interpret_state_base` strips it
-/// off every output right after `record`, which is what lets recording
-/// FUSE into a streaming forward pass without becoming a different
-/// search (see the history in `AbstractRun::step_inner`'s comment). On
-/// the compiled engine the tag rides `Rt2::origin` as block metadata
-/// through the kernels and comes back as the global on export
-/// (`compiled::run_frame_chunk`), so recording runs on kernels too.
-///
-/// The tag is a cell, not a row id, on purpose: ~8,000 distinct values
-/// instead of 213M, so what lane dedup remains inside a frame still fires.
+/// The first version of this was read-only and recorded every source cell of
+/// a chunk against every destination cell of it - conservative and useless
+/// (kept 93.6% of the unfiltered candidate set, because an 8,000-lane chunk
+/// spans thousands of cells and the cross product squares that). The second
+/// used a per-lane `POS_ORIGIN` tag; that attributed correctly but, being
+/// per-lane distinct, forbade ALL mid-frame dedup and ballooned room (0,0) to
+/// 101 GB. Partitioning by input position keeps attribution exact while
+/// letting lanes that share an input position AND converge still dedup within
+/// the chunk. See BENCHMARK_DATA.md.
 pub struct PosObserver {
     /// Per-lane `(src cell, dst cell)` pairs, pushed under a lock by
     /// whichever worker ran the chunk. Folded into the table in `flush`, off
@@ -411,29 +404,39 @@ impl PosObserver {
         }
     }
 
-    /// Tag every input lane with its own cell, so the outputs can be
-    /// attributed back to it.
-    pub fn tag(&self, state: &mut State) -> Result<()> {
+    /// The single input cell of a frame-input chunk. Every lane must be at
+    /// the same cell - which the position partition guarantees while
+    /// recording (see the struct doc). A non-uniform chunk is a loud error,
+    /// not a silent cross product: it means the position partition was not
+    /// installed, and recording without it would attribute every source cell
+    /// to every destination cell (the useless first version).
+    pub fn input_cell(&self, state: &State) -> Result<u32> {
         let cells = state_cells(state)?;
-        crate::interpreter::deopt_collect::inject_named(state, POS_ORIGIN, &cells);
-        Ok(())
+        let Some((&first, rest)) = cells.split_first() else {
+            return Err(anyhow!("pos observer: empty input chunk"));
+        };
+        if let Some(&other) = rest.iter().find(|&&c| c != first) {
+            return Err(anyhow!(
+                "pos observer: input chunk spans cells {} and {} - the position \
+                 partition must be installed while recording (see \
+                 `vectorize::set_partition_player_position`)",
+                first,
+                other
+            ));
+        }
+        Ok(first)
     }
 
-    /// Read the tags back off one chunk's outputs and pair each with the
-    /// cell that output lane is in.
-    pub fn record(&self, outputs: &[State]) -> Result<()> {
+    /// Pair the chunk's single input cell with every output cell. Sound
+    /// because the input is uniform in position (`input_cell`): all the
+    /// chunk's lanes started at `c_in`, so every output really is a
+    /// successor of it.
+    pub fn record(&self, c_in: u32, outputs: &[State]) -> Result<()> {
         let mut pairs = Vec::new();
         for out in outputs {
-            let srcs = crate::interpreter::deopt_collect::read_origins_named(out, POS_ORIGIN);
-            let dsts = state_cells(out)?;
-            if srcs.len() != dsts.len() {
-                return Err(anyhow!(
-                    "pos observer: {} origins for {} lanes",
-                    srcs.len(),
-                    dsts.len()
-                ));
+            for d in state_cells(out)? {
+                pairs.push((c_in, d));
             }
-            pairs.extend(srcs.iter().zip(&dsts).map(|(&s, &d)| (s, d)));
         }
         pairs.sort_unstable();
         pairs.dedup();

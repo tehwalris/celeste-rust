@@ -842,15 +842,13 @@ mod tests {
 
     /// The engine-carried origin column (plans/kernel-ladder.md "the
     /// passthrough column"): an origin-tagged replay - the frame
-    /// primitive of the backward sweep and of the pos-graph recorder -
-    /// produces the SAME (origin, row key) pair set on the traced
-    /// kernels as on the interpreter. Two taggings, because they stress
-    /// different parts of the dedup:
-    ///
-    /// * distinct per-lane ids (the sweep's `SWEEP_ORIGIN`), where no
-    ///   dedup across origins is legal at all;
-    /// * position cells (the recorder's `POS_ORIGIN`), where origins
-    ///   REPEAT across lanes and same-origin duplicates may collapse.
+    /// primitive of the backward sweep - produces the SAME (origin, row
+    /// key) pair set on the traced kernels as on the interpreter. The
+    /// sweep tags each lane with a DISTINCT id, so no dedup across origins
+    /// is legal at all; this checks the engine carries them through the
+    /// kernels intact. (The pos-graph recorder no longer tags at all - it
+    /// partitions merges by input position - so only the sweep exercises
+    /// the passthrough now.)
     ///
     /// 26 frames of forward pass so the batch is past the first rem
     /// straddle (frame 25) - the same rationale as
@@ -860,7 +858,6 @@ mod tests {
     #[test]
     fn kernel_replays_carry_origins_like_the_interpreter() {
         use crate::interpreter::deopt_collect;
-        use crate::search::pos_graph::POS_ORIGIN;
         use crate::search::sweep::SWEEP_ORIGIN;
 
         let _partition = crate::interpreter::partition_straddles_test_lock();
@@ -882,23 +879,17 @@ mod tests {
         let lanes: usize = batch.iter().map(|s| s.vector_size).sum();
         assert!(lanes > 16, "the batch is too small to exercise the passthrough");
 
-        // Tag a clone of the batch: distinct ids per lane, or each
-        // lane's own position cell (exactly what the sweep / recorder
-        // inject).
-        let tagged = |tag: &str, cells: bool| -> Vec<crate::interpreter::state::State> {
+        // Tag a clone of the batch with distinct ids per lane (exactly what
+        // the sweep injects).
+        let tagged = || -> Vec<crate::interpreter::state::State> {
             let mut next = 0u32;
             batch
                 .iter()
                 .map(|s| {
                     let mut s = s.clone();
-                    let values: Vec<u32> = if cells {
-                        crate::search::pos_graph::state_cells(&s).expect("state cells")
-                    } else {
-                        let ids = (next..next + s.vector_size as u32).collect();
-                        next += s.vector_size as u32;
-                        ids
-                    };
-                    deopt_collect::inject_named(&mut s, tag, &values);
+                    let ids = (next..next + s.vector_size as u32).collect::<Vec<_>>();
+                    next += s.vector_size as u32;
+                    deopt_collect::inject_named(&mut s, SWEEP_ORIGIN, &ids);
                     s
                 })
                 .collect()
@@ -907,7 +898,6 @@ mod tests {
         // One origin-tagged frame, exactly as `backward_sweep_time`
         // reads it back: strip the tag, gc, key, pair.
         let pairs_of = |mut run: AbstractRun,
-                        tag: &str,
                         input: Vec<crate::interpreter::state::State>|
          -> std::collections::BTreeSet<(u32, (u64, u64))> {
             run.disable_frontier();
@@ -917,8 +907,8 @@ mod tests {
             run.step().expect("replay step");
             let mut pairs = std::collections::BTreeSet::new();
             for mut s in run.take_states() {
-                let origins = deopt_collect::read_origins_named(&s, tag);
-                s.global_env.remove(tag);
+                let origins = deopt_collect::read_origins_named(&s, SWEEP_ORIGIN);
+                s.global_env.remove(SWEEP_ORIGIN);
                 s.gc();
                 let keys = crate::search::sweep::row_keys(&s).expect("row keys");
                 assert_eq!(keys.len(), origins.len(), "origin/key length mismatch");
@@ -927,23 +917,15 @@ mod tests {
             pairs
         };
 
-        // Interpreter references FIRST, while the engine env is unset.
-        let want_ids = pairs_of(
-            AbstractRun::start(&program).expect("start"),
-            SWEEP_ORIGIN,
-            tagged(SWEEP_ORIGIN, false),
-        );
-        let want_cells = pairs_of(
-            AbstractRun::start(&program).expect("start"),
-            POS_ORIGIN,
-            tagged(POS_ORIGIN, true),
-        );
+        // Interpreter reference FIRST, while the engine env is unset.
+        let want_ids =
+            pairs_of(AbstractRun::start(&program).expect("start"), tagged());
 
         std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
         std::env::set_var("CELESTE_KERNEL_STRICT", "1");
         let run = AbstractRun::start(&program).expect("start compiled");
         assert!(run.compiled.is_some(), "the compiled engine did not engage");
-        let got_ids = pairs_of(run, SWEEP_ORIGIN, tagged(SWEEP_ORIGIN, false));
+        let got_ids = pairs_of(run, tagged());
         assert!(
             crate::compiled::dispatch::traced_lanes() > 0,
             "no tagged chunk ever reached a traced kernel - the passthrough was \
@@ -960,13 +942,124 @@ mod tests {
             "the kernel replay's (origin id, row key) pairs differ from the \
              interpreter's"
         );
+    }
 
-        let run = AbstractRun::start(&program).expect("start compiled");
-        let got_cells = pairs_of(run, POS_ORIGIN, tagged(POS_ORIGIN, true));
-        assert_eq!(
-            got_cells, want_cells,
-            "the kernel replay's (cell, row key) pairs differ from the \
-             interpreter's"
+    /// Adding the player position to the merge partition (what the pos-graph
+    /// recorder does) must NOT change the reachable row set - position is
+    /// content and concrete per lane, so partitioning on it only regroups
+    /// lanes into more, narrower states. This is the soundness gate for the
+    /// recorder: if partitioning changed the search, the recorded table
+    /// would describe a different one. Compare the per-frame row-key SET
+    /// with the partition off vs on.
+    #[test]
+    fn position_partition_preserves_the_forward_row_set() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(position_partition_preserves_the_forward_row_set_body)
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    fn position_partition_preserves_the_forward_row_set_body() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+        {
+            return;
+        }
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+
+        // Past the first rem straddle (frame 25), where lanes fan out to
+        // distinct positions that merge by shape - which is exactly what the
+        // position partition then splits back apart.
+        let frames = 30;
+        type Frame = (std::collections::BTreeSet<(u64, u64)>, usize);
+        let per_frame = |partition: bool| -> Vec<Frame> {
+            crate::interpreter::vectorize::set_partition_player_position(partition);
+            let mut run = AbstractRun::start(&program).expect("start");
+            let mut out = Vec::new();
+            for _ in 1..=frames {
+                run.step().expect("step");
+                let mut rows = std::collections::BTreeSet::new();
+                for s in run.states() {
+                    rows.extend(crate::search::sweep::row_keys(s).expect("row keys"));
+                }
+                out.push((rows, run.states().len()));
+            }
+            crate::interpreter::vectorize::set_partition_player_position(false);
+            out
+        };
+
+        let plain = per_frame(false);
+        let split = per_frame(true);
+        let mut split_grew = false;
+        for f in 0..frames as usize {
+            assert_eq!(
+                plain[f].0, split[f].0,
+                "frame {}: the position partition changed the reachable row set \
+                 ({} rows plain vs {} split)",
+                f + 1,
+                plain[f].0.len(),
+                split[f].0.len()
+            );
+            // Same rows, but the partition holds them in MORE states (one per
+            // position) once lanes occupy more than one cell.
+            assert!(
+                split[f].1 >= plain[f].1,
+                "frame {}: the partition produced fewer states than plain",
+                f + 1
+            );
+            split_grew |= split[f].1 > plain[f].1;
+        }
+        // The partition must actually have SPLIT something by frame 30, or
+        // the equality above proves nothing.
+        assert!(
+            split_grew,
+            "the position partition never split a state - the forward pass is \
+             too small, or the partition cells are wrong"
+        );
+    }
+
+    /// End-to-end recorder gate: recording a real forward pass must run
+    /// without `input_cell` ever erroring - which it does IFF the position
+    /// partition makes every frame-input chunk uniform in position (the
+    /// recorder's soundness precondition) - and must accumulate transitions.
+    /// This is what validates `partition_position_cells` names the right
+    /// cells: a wrong cell would leave chunks non-uniform and the run would
+    /// bail loudly here.
+    #[test]
+    fn recording_a_forward_pass_keeps_chunks_uniform_in_position() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(recording_a_forward_pass_keeps_chunks_uniform_in_position_body)
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    fn recording_a_forward_pass_keeps_chunks_uniform_in_position_body() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+        {
+            return;
+        }
+        // Streaming path (the one the balloon lived on): frontier-only +
+        // multi-thread routes through step_parallel, exactly production.
+        std::env::set_var("CELESTE_FRONTIER_ONLY", "1");
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+        let mut run = AbstractRun::start(&program).expect("start");
+        run.record_pos_graph();
+        for _ in 1..=20 {
+            // A non-uniform chunk makes `input_cell` return Err, which
+            // propagates here - so a clean run IS the uniformity guarantee.
+            run.step().expect("recording step stayed uniform in position");
+        }
+        let graph = run.take_pos_graph(20, "test-fingerprint").expect("recording enabled");
+        assert!(
+            graph.pairs() > 0,
+            "the recording pass observed no position transitions"
         );
     }
 
