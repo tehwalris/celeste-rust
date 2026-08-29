@@ -493,6 +493,16 @@ pub fn backward_sweep_time(
     let mut engine = AbstractRun::start_with_deopt(program, plain, mapping.clone(), false)?;
     register_variants(&mut engine, mapping, variants(program)?)?;
     engine.disable_frontier();
+    // Turn OFF the player-position merge partition. It is a process global
+    // that the forward's `--record-pos-graph` set and never cleared; the
+    // sweep READS the pos-graph, it does not record, so it does not need
+    // position-uniform chunks. Leaving it on splits every replayed state
+    // into one-per-position sub-states for nothing - a 3x+ memory
+    // multiplier on the compiled path's wide states, which OOM'd the
+    // in-process kernel ladder's sweep at f94 (room (1,0)). Row keys are
+    // partition-independent, so the transition relation `g` is walked over
+    // is identical either way.
+    crate::interpreter::vectorize::set_partition_player_position(false);
     // The origin column rides the compiled engine as block METADATA
     // (`Rt2::origin`, plans/kernel-ladder.md "the passthrough column"),
     // so this replay runs on the kernels whenever the forward pass does.
