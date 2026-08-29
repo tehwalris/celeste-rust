@@ -261,6 +261,38 @@ pub(crate) fn lattice_kernel_refs(
 #[cfg(test)]
 mod tests {
 
+    /// DEBUG probe (Bits(2) divergence): dump each LADDER kernel shape's
+    /// `player.rem` output node - is it a passthrough (`Op::Cell`) or the
+    /// real `rem += spd; rem -= flr(rem+0.5)` update DAG?
+    #[test]
+    #[ignore]
+    fn dump_rem_output_node() {
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
+            return;
+        }
+        let refs = super::lattice_kernel_refs(
+            std::path::Path::new("."),
+            crate::trace::shapes::WalkOpts::LADDER,
+        )
+        .expect("trace ladder");
+        for (si, r) in refs.iter().enumerate() {
+            if si != 1 {
+                continue;
+            }
+            for (oi, o) in r.bound.outcomes.iter().enumerate() {
+                let has_ival = o.outputs.iter().any(|(_, _, ty)| ty.contains("ZI"));
+                if !has_ival {
+                    continue;
+                }
+                eprintln!(
+                    "shape {si} outcome {oi} OK node {}:\n  {}",
+                    o.ok,
+                    crate::trace::emit::show_tree(&r.bound.graph, o.ok, 9),
+                );
+            }
+        }
+    }
+
     /// The ASM cutover's compute gate (plans/asm-and-posgraph-execution.md
     /// B): pull out the FUSED graph (`emit::asm_fused` ->
     /// `lower::specialize_frame`, the same fused, fork-free graph the Rust

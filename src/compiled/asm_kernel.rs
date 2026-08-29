@@ -150,12 +150,21 @@ impl AsmKernel {
             }
             let valid = ((1u32 << n) - 1) as u16;
             for body in &self.bodies {
-                let ok = read_val_mask(&outbuf, body.ok_root);
-                let live = read_val_mask(&outbuf, body.live_root);
+                // `ok`/`live` are tri-state ZB masks; the kernel keeps a lane
+                // only where they are KNOWN-TRUE (val & known - `zb_holds`,
+                // exactly what the generated `frame` applied). Reading `val`
+                // alone dropped the decidedness check: an UNKNOWN condition
+                // (a comparison landing inside an interval, e.g. a rem-derived
+                // guard at a fine rem rung) would silently use the garbage
+                // `val` bit instead of declining. A lane whose `ok` is unknown
+                // must fall to the reference, so the trace's failure to
+                // fork/decide it surfaces instead of producing a coarse row.
+                let ok = read_zb_holds(&outbuf, body.ok_root);
+                let live = read_zb_holds(&outbuf, body.live_root);
                 if live & !ok & valid != 0 {
-                    // Declined: a live lane the kernel could not keep. The
-                    // rows already in accs are only a prefix, so drop and let
-                    // the whole chunk take the reference path.
+                    // Declined: a live lane the kernel could not keep (or
+                    // could not DECIDE). Drop and let the whole chunk take the
+                    // reference path.
                     return false;
                 }
                 let take = live & ok & valid;
@@ -287,10 +296,13 @@ fn ival_raw(av: AV) -> (i32, i32) {
     }
 }
 
-/// The `val` plane (a 16-lane mask) of a Bool root's 128-byte slot.
-fn read_val_mask(buf: &[u8], root: usize) -> u16 {
+/// `zb_holds` of a Bool root: the lanes where it is KNOWN-TRUE (val & known).
+/// `val` at +0, `known` at +2 of the 128-byte slot.
+fn read_zb_holds(buf: &[u8], root: usize) -> u16 {
     let off = root * 128;
-    u16::from_le_bytes([buf[off], buf[off + 1]])
+    let val = u16::from_le_bytes([buf[off], buf[off + 1]]);
+    let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
+    val & known
 }
 
 /// The boundary's row-key mix seeds (see `runtime2::boundary_finish`); the
