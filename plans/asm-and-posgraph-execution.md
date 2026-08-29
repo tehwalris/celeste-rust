@@ -58,7 +58,40 @@ Risk: associating each output with its input group's cell without the tag needs
 the frame body to process a uniform-position input and record per-input-state.
 Check where interpret_state_base calls tag/record and thread c_in through.
 
-## B. ASM kernel cutover (P6) — PROGRESS 2026-08-29
+## B. ASM kernel cutover (P6) — DONE 2026-08-29
+
+The generated Rust kernels are DELETED (~923k lines, `d027f7e`) and the
+AVX-512 ASM backend is the engine's kernel implementation, gated against the
+interpreter on all three sets. Commit trail on `census`:
+- `e986a9e` bool inputs, `b029e74` ival inputs + fused extraction gate,
+  `ba96ecc` assemble the FUSED graph (one per shape, Sel joined-domain fix),
+  `e564744` the runtime ASM backend + generic append + interpreter gate,
+  `ce25b34` mode-aware (Level0/ladder/exact), `8137132` make ASM THE backend
+  + decouple dispatch (ASM fingerprint), `d027f7e` DELETE the crates,
+  `d7e1448` trim the transpile CLI + drop the regen scripts.
+
+How it works: `compiled::asm_kernel` retraces `start_room()` at startup
+(single-room search, so that covers every shape a process dispatches),
+`asm_fused` -> `lower::specialize_frame` gives the fused fork-free graph,
+`transpile::asm` assembles it with gcc+dlopen, and a generic append
+(reshape the traced output template + OutField uniform/varying/UBool
+decisions, push each `live & ok` lane, `Rt2::boundary` recomputes the keys)
+turns the ASM output into `done` blocks. `CELESTE_NO_ASM_KERNELS` opts back
+to pure reference. Gates: `asm_kernels_reproduce_the_interpreter` (+ ladder /
+exact variants), `every_start_room_kernel_graph_asm_compiles_the_fused_graph`,
+plus the per-op bit-exact unit tests in `transpile::asm::tests`.
+
+REMAINING (follow-up, not blocking): the emitter cluster in
+`trace::kernel` (`render`, `write_room_kernels*`, `write_lattice_set`,
+`merge_kernel_sets`, `merged_mod_rs`, ...) is now pub-but-uncalled dead code
+(`render` is still exercised by `verify::the_kernel_emitter_lowers_a_traced_graph`).
+Deleting it is ~1.2k lines laced with format-string brace soup - do it
+carefully, and delete that verify test with it. Also: CLAUDE.md /
+BENCHMARK_DATA still describe the generated-kernel + regen workflow and need
+a pass. And measure the ASM runtime slowdown vs the old Rust kernels
+(tolerated up to ~1.3x) + the startup retrace cost.
+
+### Earlier progress notes 2026-08-29
 
 Committed increments (branch census):
 - `e986a9e` — **bool inputs** in the ASM codegen (`CellRepr::Bool`, a

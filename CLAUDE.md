@@ -249,6 +249,20 @@ re-check that the parallel path stays byte-identical to the serial one.
 
 ## Crate layout
 
+> **STALE AS OF 2026-08-29 — the generated Rust kernels are DELETED.** The
+> AVX-512 ASM backend (`src/compiled/asm_kernel.rs`) replaced them: it
+> retraces `start_room()` at startup, assembles each shape's FUSED graph
+> (`trace::emit::asm_fused` -> `lower::specialize_frame` -> `transpile::asm`,
+> gcc + dlopen), and dispatches chunks to it — gated against the interpreter
+> on all three sets (`asm_kernels_reproduce_the_interpreter` + ladder/exact).
+> The `celeste-kernels{,-room00,-room10,-room20}` crates, `traced-kernel-check`,
+> `regen-generated.sh`, `check-traced-kernel.sh`, and the
+> `*_kernels_are_current` gates are GONE. `CELESTE_NO_ASM_KERNELS` opts back
+> to pure reference. The `trace::kernel` emitter (`render`, `write_room_kernels*`)
+> is now vestigial dead code pending a cleanup pass. Everything below about
+> "the generated files are CHECKED IN" / one-crate-per-room / regen is
+> HISTORICAL. See `plans/asm-and-posgraph-execution.md`.
+
 A cargo workspace since 2026-08-18 (task #150). The dependency order is
 load-bearing, not cosmetic:
 
