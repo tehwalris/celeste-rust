@@ -299,7 +299,23 @@ impl Registry {
     ) -> bool {
         match self.by_shape.get(&chunk.shape_hash) {
             Some(k) => k.run(chunk, ids, done, self.exact_boundary),
-            None => false,
+            None => {
+                // Diagnose a coverage gap: which shape has no assembled
+                // kernel. Printed once per distinct missing shape.
+                static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+                    std::sync::OnceLock::new();
+                let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+                if seen.lock().unwrap().insert(chunk.shape_hash) {
+                    eprintln!(
+                        "[asm] MISS: no kernel for shape {:#018x} ({} lanes); registry has {} shapes: {:?}",
+                        chunk.shape_hash,
+                        chunk.width,
+                        self.by_shape.len(),
+                        self.by_shape.keys().map(|k| format!("{k:#018x}")).collect::<Vec<_>>(),
+                    );
+                }
+                false
+            }
         }
     }
 

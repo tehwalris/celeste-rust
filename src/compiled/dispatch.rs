@@ -179,6 +179,14 @@ pub fn print_kernel_hits() {
 /// skip. Applied POST-boundary in `asm_kernel`, since the boundary is what
 /// computes the row keys.
 pub(crate) fn chunk_skip(key: (u64, u64)) -> bool {
+    // The skip reduces a chunk's materialized rows, which makes the
+    // per-chunk `check` comparison see fewer rows than the interpreter (a
+    // sibling chunk covers the within-frame dups). CELESTE_ASM_NO_SKIP turns
+    // it off so `check` compares full frame outputs.
+    static NO_SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NO_SKIP.get_or_init(|| std::env::var_os("CELESTE_ASM_NO_SKIP").is_some()) {
+        return false;
+    }
     frontier_hit(key) || within_frame_dup(key)
 }
 
