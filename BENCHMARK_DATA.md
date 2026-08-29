@@ -1,3 +1,36 @@
+# ASM kernels vs the deleted Rust lattice kernels, room (1,0) forward @ f94 (2026-08-29, release)
+
+First perf number for the ASM backend after the append dedup fix. Room (1,0)
+forward to f94, `celeste-rust --rewritten -n 94`, `CELESTE_COMPILED_FORWARD=1`
+`CELESTE_FRONTIER_ONLY=1`, release. Ends at **5,949,326 expanded** - identical
+to the LATTICE-kernel baseline below, i.e. the SAME search.
+
+| backend | forward wall | note |
+|---|---|---|
+| LATTICE Rust kernels (2026-08-26, `bench --frames 94 --deopt`) | 175.73 s | the deleted set |
+| **ASM (this run)** | **155.0 s** (frame-sum; +~4 s startup retrace) | at parity - slightly FASTER |
+
+So the ASM backend is AT PARITY with (a touch faster than) the Rust kernels it
+replaced - comfortably inside the ~1.3x Philippe budgeted, and the compile-time
+win (gcc-assemble a graph in ms vs a >30 min fat-LTO relink of 1.3M lines) is
+free on top.
+
+The append dedup (2a41ba9) is what got it there: before it, the generic append
+over-materialized ~76:1 (materialize-then-boundary-dedup) and the forward ran
+~2.3x the Rust kernels; porting the Rust `seen` (h1,h2) fold to skip
+duplicate rows before materializing cut a heavy frame from 2.77 s to 0.95 s.
+Residual over-materialize is still ~10:1 - CROSS-CHUNK within-frame dups the
+per-chunk `seen` does not catch (the post-boundary frozen-frontier skip drops
+them, but after materializing). Closing that (a shared within-frame set keyed
+by the real boundary key) is the next perf lever if wanted; we are already at
+parity without it.
+
+CAVEATS: not a perfectly clean A/B - this run has no `--deopt`/collect-first
+(the baseline did; ASM needs neither, it covers every shape), the machine was
+not certified idle, and 155 s is the frame-sum not total wall. But the search
+is byte-identical (same final expanded count) and the direction is
+unambiguous: parity or better.
+
 > **ASM cutover note (2026-08-29).** The generated Rust kernel crates,
 > `regen-generated.sh` and the whole checked-in-kernel workflow are GONE
 > (plans/asm-and-posgraph-execution.md B); the kernel backend is now the
