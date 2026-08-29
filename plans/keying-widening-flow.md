@@ -373,3 +373,35 @@ a pure performance optimization. It needs (a) provenance threaded into
 in-process ladder to rebuild the rung-SPECIFIC registry per rung (the
 OnceLock caches one rung's kernels), and (c) a before/after benchmark.
 None of it is required for correctness; B fixes the keying bug on its own.
+
+### Phase 3 (2026-08-29): widen-in-graph is the DEFAULT
+
+`dispatch::widen_in_graph()` now defaults ON (`CELESTE_WIDEN_IN_GRAPH=0`
+is the kill-switch). The exact-ladder-then-wrapper-widen path is no longer
+the default; the ladder set (Bits 1..15) always bakes the widening into
+the graph. Safe for the production ladder because `ladder.sh` runs one
+rung PER PROCESS, so the rung-specific registry OnceLock is correct.
+
+A/B measured (quick profile, room (1,0), Bits(2), n=33 - RELATIVE only, a
+release re-measure is owed before these land in BENCHMARK_DATA.md):
+
+| frame | off (exact+wrapper) | default (widen-in-graph) | delta |
+|---|---|---|---|
+| f30 | 114 ms | 90 ms | -21% |
+| f31 | 211 ms | 131 ms | -38% |
+| f32 | 329 ms | 207 ms | -37% |
+| peak RSS | 724 MB | 530 MB | -27% |
+
+The win is ROW REDUCTION: the kernel's within-frame dedup collapses rows
+on the widened key before they reach the boundary, so fewer rows are
+exported, widened, keyed and subtracted. Total wall is ~0.4 s higher only
+because `LADDER_WIDEN` has +3.1% nodes -> marginally slower one-time gcc;
+over a real f94+ run the per-frame win dominates. This refutes the earlier
+"could be slower" caution, which was reasoning (the double-widen does more
+work) rather than measurement (the row reduction more than pays for it).
+
+Still redundant: `stream_boundary` re-runs `make_state_abstract` on the
+already-widened kernel output (idempotent, guarded by the assert-noop).
+Dropping it is a further micro-opt - the big win is captured by the
+default flip - and it touches the proof-critical boundary across three
+parallel worker paths, so it is a separate, carefully-gated step.

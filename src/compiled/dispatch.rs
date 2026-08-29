@@ -95,16 +95,24 @@ pub(crate) fn kernel_strict() -> bool {
 /// Whether the ladder (`Level0Agnostic`) kernel set bakes the rem rung
 /// widening into the graph (`WalkOpts::LADDER_WIDEN`, `WidenMode::RemRung`)
 /// instead of emitting exact rows and leaving the rung widening to the
-/// campaign boundary. Phase 1 of moving the ladder widening into the
-/// graph (plans/keying-widening-flow.md): OFF by default, opt-in via
-/// `CELESTE_WIDEN_IN_GRAPH=1`, so the production path is byte-unchanged
-/// until the gates are green. Rung-SPECIFIC when on, so the process must
-/// not change rem precision after the registry is built (the OnceLock
-/// caches one rung's kernels) - the in-process ladder is not yet
-/// supported here.
+/// campaign boundary (plans/keying-widening-flow.md).
+///
+/// DEFAULT ON (2026-08-29): the exact-ladder-then-wrapper-widen path was
+/// the source of the Bits(2) keying artifact - the kernel's own
+/// `chunk_skip` acted on the pre-widening key while the frontier stored
+/// the widened key - and moving the widening into the graph fixes it AND
+/// is FASTER per frame (the within-frame dedup collapses rows on the
+/// widened key before they reach the boundary; measured -34% on room
+/// (1,0) f31 at Bits(2)). `CELESTE_WIDEN_IN_GRAPH=0` is the kill-switch
+/// for debugging / A-B. Rung-SPECIFIC, so a process must not change rem
+/// precision after the registry is built (the OnceLock caches one rung's
+/// kernels); the production ladder runs one rung PER PROCESS
+/// (`ladder.sh`), so this holds. Level 0 already widens in the graph
+/// (`WidenMode::Level0`) and the exact-rem set has no rem intervals, so
+/// this only governs the Bits(1..15) ladder set.
 pub(crate) fn widen_in_graph() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CELESTE_WIDEN_IN_GRAPH").map_or(false, |v| v != "0"))
+    *ON.get_or_init(|| std::env::var("CELESTE_WIDEN_IN_GRAPH").map_or(true, |v| v != "0"))
 }
 
 /// The assert-noop guard (plans/keying-widening-flow.md, Phase 1 point 1):
