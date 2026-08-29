@@ -679,6 +679,58 @@ mod tests {
         );
     }
 
+    /// The wrapper-widen SKIP is a no-op (plans/keying-widening-flow.md,
+    /// Phase 3): with the widening in the graph, the REAL compiled forward
+    /// (not check) skips `stream_boundary`'s `make_state_abstract` on its
+    /// own output, and must reach the SAME frontier as the interpreter
+    /// (which widens). `CELESTE_KERNEL_WIDEN_NOOP=1` asserts, per kernel
+    /// output, that re-widening would not move a row key - so the skip
+    /// removes a proven no-op. Lane counts are checked against the
+    /// interpreter baseline on top. Bits(2), through the rem fork (f26).
+    #[test]
+    fn wrapper_widen_skip_reproduces_the_interpreter_at_bits2() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        std::env::set_var("CELESTE_REM_BITS", "2");
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+        let frames = 26;
+        let mut baseline = AbstractRun::start(&program).expect("start baseline");
+        let mut want = Vec::new();
+        for _ in 1..=frames {
+            baseline.step().expect("baseline step");
+            want.push(baseline.lane_count());
+        }
+        drop(baseline);
+
+        // REAL compiled forward (=1, not check), so the skip is ACTIVE.
+        std::env::set_var("CELESTE_ASM_KERNELS", "1");
+        std::env::set_var("CELESTE_WIDEN_IN_GRAPH", "1");
+        std::env::set_var("CELESTE_KERNEL_WIDEN_NOOP", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
+        let mut run = AbstractRun::start(&program).expect("start compiled run");
+        assert!(run.compiled.is_some(), "the compiled engine did not engage");
+        for (frame, want) in (1..=frames).zip(want) {
+            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
+            assert_eq!(
+                run.lane_count(),
+                want,
+                "wrapper-skip frontier differs from the interpreter at frame {}",
+                frame
+            );
+        }
+        assert_eq!(
+            crate::compiled::dispatch::missed_lanes(),
+            0,
+            "the widen-in-graph kernels missed lanes under the wrapper skip"
+        );
+    }
+
     /// The assert-noop guard end to end (plans/keying-widening-flow.md,
     /// Phase 1 point 1): with the widening in the graph
     /// (`CELESTE_WIDEN_IN_GRAPH=1`) and `CELESTE_KERNEL_WIDEN_NOOP=1`,

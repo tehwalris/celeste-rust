@@ -464,8 +464,9 @@ fn stream_boundary_one(
     frame: u32,
     visited: &mut crate::interpreter::visited::Visited,
     counters: &mut StreamCounters,
+    pre_widened: bool,
 ) -> Result<Vec<State>> {
-    let prepared = stream_boundary_prepare(state, band, frame, counters, visited, true)?;
+    let prepared = stream_boundary_prepare(state, band, frame, counters, visited, true, pre_widened)?;
     Ok(stream_boundary_subtract(prepared, visited, counters))
 }
 
@@ -491,14 +492,21 @@ fn stream_boundary_prepare(
     counters: &mut StreamCounters,
     visited: &crate::interpreter::visited::Visited,
     filter_now: bool,
+    // The input is already a fixed point of the widening (Phase 3): the
+    // compiled engine widened it in the graph, so re-widening is redundant.
+    pre_widened: bool,
 ) -> Result<Vec<PreparedRows>> {
     let mut kept_out = Vec::new();
     let t_abs = std::time::Instant::now();
-    let split = crate::interpreter::abstraction::split_precision_straddles(state);
+    let split = if pre_widened {
+        vec![state]
+    } else {
+        crate::interpreter::abstraction::split_precision_straddles(state)
+    };
     let mut abs_ns = t_abs.elapsed().as_nanos() as u64;
     for state in split {
         let t_abs = std::time::Instant::now();
-        let state = make_state_abstract(state);
+        let state = if pre_widened { state } else { make_state_abstract(state) };
         abs_ns += t_abs.elapsed().as_nanos() as u64;
         add_worker_ns(WORKER_ABSTRACT, std::mem::take(&mut abs_ns));
         let state = if let Some(band) = band {
@@ -2034,6 +2042,7 @@ impl AbstractRun {
         let mut stream_counters = StreamCounters::default();
         let mut stream_survivors: Vec<State> = Vec::new();
         let mut new_states: Vec<State> = Vec::new();
+        let pre_widened = self.outputs_pre_widened();
         for state in input_states {
             let outputs = {
                 let _t = ScopedPhase::new("fwd.interpret");
@@ -2065,6 +2074,7 @@ impl AbstractRun {
                         frame_no,
                         visited,
                         &mut stream_counters,
+                        pre_widened,
                     )?);
                 }
             } else {
@@ -2098,6 +2108,25 @@ impl AbstractRun {
     /// one. The batch (rather than a queue) is also what bounds memory:
     /// at most `threads` chunks' raw outputs are alive at once, which is
     /// why the chunk cap has to come down as the thread count goes up.
+    /// Is every output of this frame's body already a fixed point of
+    /// `split_precision_straddles` + `make_state_abstract` (Phase 3)? Only
+    /// when the compiled engine ran the whole frame, under strict mode, and
+    /// the active set widens in the graph.
+    ///
+    /// CHECK mode is EXCLUDED even though the compiled engine ran: it
+    /// returns the raw INTERPRETER REFERENCE states as the frame output
+    /// (`Ok(reference)`), not the kernel output, and those are NOT widened
+    /// - so the boundary must still widen them or the next frame's kernels
+    /// miss their (un-widened) shape.
+    fn outputs_pre_widened(&self) -> bool {
+        crate::compiled::dispatch::wrapper_skip()
+            && !self.rem_only_abstraction
+            && self.compiled.is_some_and(|c| !c.check)
+            && self.deopt.is_none()
+            && crate::compiled::dispatch::kernel_strict()
+            && crate::compiled::dispatch::kernel_output_is_prewidened()
+    }
+
     fn step_parallel(&mut self, input_states: Vec<State>, frame_no: u32) -> Result<()> {
         let threads = frame_threads();
         let mut counters = FrameEventCounters::default();
@@ -2110,7 +2139,7 @@ impl AbstractRun {
         let band = self.band.as_ref();
         let pos_obs = self.pos_obs.as_ref();
         let compiled = self.compiled;
-
+        let pre_widened = self.outputs_pre_widened();
         let partitioned = partitioned_filter_on();
         // One seen set per thread, disjoint by key hash, alive for the
         // WHOLE frame - this scope is the entire point (D2: fragment- and
@@ -2197,6 +2226,7 @@ impl AbstractRun {
                                             &mut sc,
                                             visited_ro,
                                             !partitioned,
+                                            pre_widened,
                                         )?);
                                     }
                                     add_worker_ns(WORKER_BODY, (t1 - t0).as_nanos() as u64);
@@ -2761,9 +2791,12 @@ impl AbstractRun {
     /// Phased epilogue: abstract the whole frame's outputs, merge, then
     /// band-filter and frontier-subtract the merged states.
     fn finish_phased_boundary(&mut self, new_states: Vec<State>, frame_no: u32) -> Result<()> {
+        let pre_widened = self.outputs_pre_widened();
         let new_states: Vec<State> = {
             let _t = ScopedPhase::new("fwd.abstract");
-            if self.rem_only_abstraction {
+            if pre_widened {
+                new_states
+            } else if self.rem_only_abstraction {
                 new_states
                     .into_iter()
                     .map(crate::interpreter::abstraction::make_state_abstract_rem_only)

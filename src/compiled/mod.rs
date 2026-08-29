@@ -248,6 +248,34 @@ fn assert_widen_is_noop(state: &crate::interpreter::state::State) {
         let w = crate::interpreter::abstraction::make_state_abstract(st);
         after.extend(keys(&w));
     }
+    if before != after {
+        // Robust cell-by-cell diff: make_state_abstract does not change the
+        // heap LENGTH (widening rewrites values in place; erase rewrites
+        // nils in place), so compare each cell's Debug form directly and
+        // name every one the boundary moved.
+        let w = crate::interpreter::abstraction::make_state_abstract(state.clone());
+        let n = state.heap.len().min(w.heap.len());
+        let mut shown = 0;
+        for i in 0..n {
+            let id = crate::interpreter::heap::HeapId::from_raw(i);
+            let (a, b) = (state.heap.get_opt(id), w.heap.get_opt(id));
+            if format!("{:?}", a) != format!("{:?}", b) {
+                eprintln!("[widen-noop diff] cell {}: kernel={:?} boundary={:?}", i, a, b);
+                shown += 1;
+                if shown >= 12 {
+                    eprintln!("[widen-noop diff] ... (more)");
+                    break;
+                }
+            }
+        }
+        if state.heap.len() != w.heap.len() {
+            eprintln!(
+                "[widen-noop diff] heap LENGTH changed: kernel {} boundary {}",
+                state.heap.len(),
+                w.heap.len()
+            );
+        }
+    }
     assert_eq!(
         before, after,
         "KERNEL WIDEN-NOOP VIOLATION: re-abstracting a widen-in-graph kernel output \

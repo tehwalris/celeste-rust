@@ -115,6 +115,28 @@ pub(crate) fn widen_in_graph() -> bool {
     *ON.get_or_init(|| std::env::var("CELESTE_WIDEN_IN_GRAPH").map_or(true, |v| v != "0"))
 }
 
+/// Whether the boundary SKIPS re-widening kernel output that is already a
+/// fixed point of `make_state_abstract` (Phase 3). DEFAULT ON;
+/// `CELESTE_WRAPPER_SKIP=0` restores the (idempotent) re-widen for A/B and
+/// debugging. Only takes effect where `kernel_output_is_prewidened` holds
+/// and the caller's other guards pass (strict, non-check, no deopt).
+pub(crate) fn wrapper_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CELESTE_WRAPPER_SKIP").map_or(true, |v| v != "0"))
+}
+
+/// Does the ACTIVE kernel set emit output already a fixed point of
+/// `make_state_abstract` (Phase 3)? Level-0 set always; ladder set when
+/// `widen_in_graph`; exact-rem set never. The caller also requires strict
+/// mode (a miss panics, so no raw fallback state).
+pub(crate) fn kernel_output_is_prewidened() -> bool {
+    match traced_mode() {
+        TracedMode::Level0 => true,
+        TracedMode::Level0Agnostic => widen_in_graph(),
+        TracedMode::ExactRem => false,
+    }
+}
+
 /// The assert-noop guard (plans/keying-widening-flow.md, Phase 1 point 1):
 /// when the kernels widen in the graph, re-applying the campaign's
 /// `make_state_abstract` to their output must be a no-op on the row keys.
