@@ -443,3 +443,40 @@ a distinct reachable state that does NOT widen away - which is why the rung chec
 genuinely fails (904 vs 184, 0 extra). The fix is unchanged (reproduce the
 interpreter's rem fragmentation at the fine rung so all move amounts, hence all
 positions, are produced); part 3's rem-only framing was at the wrong layer.
+
+## RESOLUTION (2026-08-29): the Bits(2) "divergence" is a CHECK ARTIFACT (frontier-only), not a real bug
+
+Built the repro-bisect harness (src/bin/repro.rs) Philippe asked for: it applies
+ONE frame to the captured diverging input state (CELESTE_DUMP_STATE) through BOTH
+engines and reports the rung row-set difference, so the campaign context can be
+stripped away piece by piece. The FIRST thing it stripped - the campaign's
+frontier-only mode - made the divergence vanish:
+
+- Harness on the captured f25 state (no frontier-only): interp 904 == asm 904, MATCH.
+- Full `CELESTE_COMPILED_FORWARD=check` WITHOUT `CELESTE_FRONTIER_ONLY=1`: passes
+  all 30 frames, no divergence.
+- Full check WITH frontier-only AND `CELESTE_ASM_NO_SKIP=1`: passes all 30 frames.
+
+So the sole trigger is `chunk_skip` under frontier-only. The check compares:
+- reference = interpret_prepared_cfg(state)  -- the FULL frame output.
+- got       = engine.run_frame_chunk(state)  -- the ASM output, which applies
+              `chunk_skip` (drops rows already in the frozen frontier).
+The interpreter reference is NOT frontier-subtracted, so the ASM's legitimately
+skipped rows (already visited) read as "missing". The "720 missing rows" are
+exactly the frozen-frontier rows. The ASM/graph/tracer are CORRECT at Bits(2).
+
+Everything in parts 1-4 above (eval-check asm==graph, liveok all-kept, the
+position/rem analysis) is consistent and was chasing this artifact: chunk_skip
+runs in the append, AFTER the per-lane compute those probes verified.
+
+THE ACTUAL FIX (in the CHECK, not the kernels): make the comparison symmetric
+under frontier-only. Cleanest: `CELESTE_COMPILED_FORWARD=check` forces
+`chunk_skip` OFF (compare the frame's full compute; the frontier subtraction is a
+separate optimization the raw-interpret reference does not model). Alternative:
+subtract the same frozen frontier from the reference. Then the compiled ladder
+can run rungs under frontier-only. The `*_at_bits2` gate to add is a NO-frontier
+differential (which already passes), plus a frontier-symmetric check-mode test.
+
+Diagnostics added this session (all env-gated, reusable):
+CELESTE_ASM_EVAL_CHECK, CELESTE_CHECK_LANES, CELESTE_ASM_LIVEOK, CELESTE_CHECK_DUMP
+(now with rung categorization + position), CELESTE_DUMP_STATE, and src/bin/repro.rs.

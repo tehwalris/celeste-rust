@@ -1472,6 +1472,22 @@ impl CompiledForward {
                 only.len(),
             );
         }
+        if (!missing.is_empty() || !extra.is_empty())
+            && std::env::var_os("CELESTE_DUMP_STATE").is_some()
+        {
+            // Capture the diverging INPUT chunk so the repro-bisect harness
+            // (src/bin/repro.rs) can apply an editable frame to this fixed
+            // state through both engines without re-running the trajectory.
+            let path = std::env::var("CELESTE_DUMP_STATE")
+                .unwrap_or_else(|_| "diverging-state.json".to_string());
+            match crate::interpreter::inspect::state_to_json(&state) {
+                Ok(j) => {
+                    let _ = std::fs::write(&path, j);
+                    eprintln!("[dump state] wrote diverging {}-lane input to {}", state.vector_size, path);
+                }
+                Err(e) => eprintln!("[dump state] serialize failed: {e}"),
+            }
+        }
         if !missing.is_empty() || !extra.is_empty() {
             // The keys themselves, because "24 rows differ" was exactly the
             // level of detail that left the divergence unexplained for a
