@@ -211,3 +211,67 @@ the only thing lost).
   make_state_abstract at Bits(0)).
 - Decide property 4 vs 3: intersection test vs canonical-widening guarantee. The
   TODO leans toward the k=1 assertion (cheap) now and intersection later.
+
+## The plan: move widening INTO the graph (agreed 2026-08-29)
+
+Goal state: the kernel emits ALREADY-WIDENED rows, so the one key (still folded
+in Rust today, ASM later) is computed on the widened = stored state. No widening
+in the wrapper on the kernel path. The current bug - key the exact state, store
+the widened one - goes away because there is one state and one key.
+
+Corrected gate (replaces the weaker interp-based "property 3" above): the
+canonical-match gate is a KERNEL-vs-KERNEL differential that isolates the
+widening from both the frame compute and the interpreter:
+- Kernel A (exact, today's): emit exact -> widen EXTERNALLY
+  (`split_precision_straddles` + `make_state_abstract`, already the
+  `stream_boundary` path) -> dedup -> set X.
+- Kernel B (new): emit widened in the graph (bucket-fork + snap) -> dedup -> Y.
+- Assert X == Y.
+A and B share the exact same frame compute, so any diff is purely the widening.
+Composes with the existing no-frontier check (`A == interp` exact) to give
+`B == widen(interp)` = what should be stored. This gate covers the FORWARD
+widening at the current rung ONLY. The band coarsening (`coarsen_to` to the
+previous level, exact-equality lookup - the fruit off/y class) is a SEPARATE
+operation, already exists, and consumes B's widened output as its input, so it
+is out of scope here.
+
+### Execution order
+
+Phase 1 - rem widening in the graph + de-risk + gates.
+  1a. Prototype the rem bucket-fork+widen in the fused graph tail (rem.x/y):
+      bucket-edge fork = `scale by 2^k -> zi_fork_flr -> scale back`, then snap
+      each fragment to its full bucket. Behind a flag. MEASURE node count per
+      shape at a rung, before/after. Expectation: hash-consing shares most of it
+      with the existing `__split_by_flr` forks; confirm it is cheap. If it is
+      not, stop and reconsider before going wider.
+  1b. Build the A-vs-B differential gate and the assert-noop gate
+      (`make_state_abstract`+`split` on B's output is a fixed point - catches
+      UNDER-widening; A-vs-B catches WIDENED-DIFFERENTLY). Iterate rem until
+      both green across rungs and shapes. No behavior change yet: B is behind a
+      flag, `stream_boundary` still runs (idempotent double-widen).
+
+Phase 2 - the rest of `make_state_abstract` in the graph.
+  Add the spd rung (same bucket-fork shape), fruit `off` -> [0,39], and
+  `apply_conservative_widenings`. Confirm `erase_provenance_hints` (bridge
+  already exports hint-less) and the gc/canonical numbering (boundary's
+  `canonicalize_ids`) are already covered. Extend the two gates to these; green
+  across rungs, shapes, AND a room with a live fruit (room 2,0) - the assert-noop
+  fruit case is exactly where a non-canonical widening hides.
+
+Phase 3 - make B default + turn the wrapper widening OFF on the kernel path.
+  Flip B on. Disable `split_precision_straddles`+`make_state_abstract` in
+  `stream_boundary` for KERNEL-provenance output (branch by provenance; the
+  interpreter-fallback output keeps them). The assert-noop gate is the guard.
+  `stream_boundary` still keys, band-filters, subtracts, and INSERTS into
+  `visited` for both paths. Re-benchmark (fork-count growth is the perf watch).
+
+Phase 4 - make the check frontier-symmetric (the real fix, not off-for-both).
+  With B keying the widened state, both engines share one widened key space.
+  Fix `CELESTE_COMPILED_FORWARD=check` to widen the reference (idempotent for B)
+  and apply the SAME read-only frontier subtraction to BOTH sides before
+  comparing - "on for both". Add a no-frontier `*_at_bits2` differential gate
+  (already passes) and a frontier-symmetric check-mode test. The compiled ladder
+  can then run rungs under frontier-only.
+
+Later / out of scope now: fold the key HASH into the ASM (currently Rust
+`boundary_finish`); the band-coarsening canonical property (separate, exists).
