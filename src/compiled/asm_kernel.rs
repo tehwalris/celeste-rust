@@ -34,11 +34,19 @@ use crate::transpile::asm::{AsmCtx, CellRepr, CollisionEnv, Compiled, Loaded, Ro
 use crate::transpile::graph::Room;
 
 /// One output field of a body: which output cell it writes, the flat root
-/// slot the assembly wrote it to, and how to read that slot.
+/// slot the assembly wrote it to, and how to read that slot. `fold` is true
+/// for a field that enters the per-row dedup key: a per-row column
+/// (`konst_av` = None) that the boundary does NOT widen to a uniform value
+/// (`widen_uniform` = None). A konst field is uniform (in `part`, written
+/// once); a widen_uniform field (rem/timers at level 0) is pushed per row but
+/// keyed as the widened uniform, so it too is out of the per-lane fold - just
+/// like the generated kernel's `KPART`. Every non-konst field is still PUSHED
+/// (`push_field` no-ops on the konst `Col::U` cells).
 struct AsmField {
     cell: usize,
     root: usize,
     kind: RootKind,
+    fold: bool,
 }
 
 /// One fused body (a distinct (outcome, choices) with distinct outputs):
@@ -110,6 +118,17 @@ impl AsmKernel {
         let env = CollisionEnv { cart: &chunk.cart, cache: &chunk.cache };
         let ctx = AsmCtx::new(&env as *const CollisionEnv as *const c_void);
         let track_origin = !chunk.origin.is_empty();
+        // Within-chunk dedup, per outcome: the same row key (the boundary's,
+        // via the (h1,h2) fold - the uniform `part` is constant per outcome,
+        // so deduping on the fold is exactly deduping on the key) skips
+        // materializing a row a sibling body already produced. This is the
+        // generated kernel's `seen` set: without it the fused graph's many
+        // configurations re-emit the same row ~76x before the boundary dedup
+        // drops them. The boundary is still the final authority.
+        let mut seen: Vec<celeste_engine::kernel::RowSet> =
+            (0..self.acc_templates.len())
+                .map(|_| celeste_engine::kernel::RowSet::new())
+                .collect();
 
         let mut lo = 0usize;
         while lo < chunk.width {
@@ -137,8 +156,31 @@ impl AsmKernel {
                     continue;
                 }
                 let acc = &mut accs[body.outcome];
+                let seen = &mut seen[body.outcome];
                 for i in 0..n {
                     if take & (1 << i) == 0 {
+                        continue;
+                    }
+                    // The row's (h1,h2) fold over the varying, non-widened
+                    // cells - equivalent to the boundary key (constant part
+                    // per outcome). Origin (sweep/pos-graph) is mixed in so
+                    // rows with different origins never dedup, matching the
+                    // boundary's origin mixing.
+                    let (mut h1, mut h2) = (0u64, 0u64);
+                    for f in &body.fields {
+                        if !f.fold {
+                            continue;
+                        }
+                        let av = read_field_av(f, &outbuf, i);
+                        h1 = h1.wrapping_add(runtime2::cell_mix(f.cell as u64, av, KEY_SEED1));
+                        h2 = h2.wrapping_add(runtime2::cell_mix(f.cell as u64, av, KEY_SEED2));
+                    }
+                    if track_origin {
+                        let om = runtime2::mix64(ORIGIN_KEY_SEED ^ chunk.origin[lo + i] as u64);
+                        h1 ^= om;
+                        h2 ^= om;
+                    }
+                    if !seen.insert((h1, h2)) {
                         continue;
                     }
                     for f in &body.fields {
@@ -155,6 +197,7 @@ impl AsmKernel {
 
         for mut acc in accs {
             if acc.width > 0 {
+                MATERIALIZED.fetch_add(acc.width as u64, std::sync::atomic::Ordering::Relaxed);
                 if exact {
                     // The rung-agnostic / exact sets hand back EXACT rows;
                     // widening here would pre-empt the campaign's rung.
@@ -176,6 +219,7 @@ impl AsmKernel {
                         acc.retain_lanes(&keep);
                     }
                 }
+                KEPT.fetch_add(acc.width as u64, std::sync::atomic::Ordering::Relaxed);
                 if acc.width > 0 {
                     done.push(acc);
                 }
@@ -242,6 +286,40 @@ fn read_val_mask(buf: &[u8], root: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off + 1]])
 }
 
+/// The boundary's row-key mix seeds (see `runtime2::boundary_finish`); the
+/// append folds the same cell_mix so its dedup key equals the boundary's.
+const KEY_SEED1: u64 = 0x5bf0_3635;
+const KEY_SEED2: u64 = 0x27d4_eb2f;
+const ORIGIN_KEY_SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+/// The `AV` a field root holds for lane `i` (for the dedup fold).
+fn read_field_av(f: &AsmField, buf: &[u8], i: usize) -> AV {
+    let base = f.root * 128;
+    match f.kind {
+        RootKind::Num => {
+            AV::Num(P8::from_raw(i32::from_le_bytes(
+                buf[base + i * 4..base + i * 4 + 4].try_into().unwrap(),
+            )))
+        }
+        RootKind::Bool => {
+            let val = u16::from_le_bytes([buf[base], buf[base + 1]]);
+            let known = u16::from_le_bytes([buf[base + 2], buf[base + 3]]);
+            if known & (1 << i) != 0 {
+                AV::Bool(val & (1 << i) != 0)
+            } else {
+                AV::UBool
+            }
+        }
+        RootKind::Ival => {
+            let lo = i32::from_le_bytes(buf[base + i * 4..base + i * 4 + 4].try_into().unwrap());
+            let hi =
+                i32::from_le_bytes(buf[base + 64 + i * 4..base + 64 + i * 4 + 4].try_into().unwrap());
+            AV::Ival(P8::from_raw(lo), P8::from_raw(hi))
+        }
+        RootKind::Word => unreachable!("an output field cannot be a Word root"),
+    }
+}
+
 fn push_field(acc: &mut Rt2, f: &AsmField, buf: &[u8], i: usize) {
     let base = f.root * 128;
     match f.kind {
@@ -272,6 +350,27 @@ fn push_field(acc: &mut Rt2, f: &AsmField, buf: &[u8], i: usize) {
             }
         }
         RootKind::Word => panic!("an output field cannot be a Word root"),
+    }
+}
+
+/// Rows the generic append materialized [MATERIALIZED] before the boundary,
+/// and [KEPT] after boundary_dedup + the frozen-frontier skip. The ratio is
+/// the within-chunk waste the Rust kernels' seen/skip avoided pre-materialize.
+static MATERIALIZED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Print the append materialize/kept ratio (a rough measure of how much the
+/// generic append over-materializes vs a skip-before-materialize path).
+pub fn print_append_stats() {
+    let m = MATERIALIZED.load(std::sync::atomic::Ordering::Relaxed);
+    let k = KEPT.load(std::sync::atomic::Ordering::Relaxed);
+    if m > 0 {
+        eprintln!(
+            "[asm] append: materialized {} -> kept {} ({:.2}:1 over-materialize)",
+            m,
+            k,
+            m as f64 / k.max(1) as f64
+        );
     }
 }
 
@@ -361,11 +460,18 @@ impl Registry {
                     outputs.len(),
                     nfields
                 );
+                // A field enters the dedup fold iff it is per-row (no konst)
+                // AND the boundary does not widen it to uniform (rem/timers).
+                // outputs[j] and lowered.outs[oi].fields[j] are the same cell
+                // in the same order (both from the outcome's o.fields).
+                let out_fields = &r.lowered.outs[b.outcome].fields;
                 let fields = (0..nfields)
                     .map(|j| AsmField {
                         cell: outputs[j].0 as usize,
                         root: off + j,
                         kind: compiled.root_kinds[off + j],
+                        fold: out_fields[j].konst_av.is_none()
+                            && out_fields[j].widen_uniform.is_none(),
                     })
                     .collect();
                 asm_bodies.push(AsmBody {

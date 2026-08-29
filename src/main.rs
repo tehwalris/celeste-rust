@@ -65,6 +65,13 @@ fn main() -> Result<()> {
         for frame in 1..=args.frames {
             let t = std::time::Instant::now();
             run.step()?;
+            // Won lanes have exited the room; they are absorbing (their
+            // arrival frame is the result) and must NOT be expanded - the
+            // next-room state is out of scope and, on the kernel engine, has
+            // no kernel for that room's shape. The ladder/bench drivers do
+            // this; the raw forward must too, or it re-dispatches an exit
+            // state and hits a coverage gap near the exit frame.
+            run.absorb_won_lanes();
             println!(
                 "Frame {}: {} states ({} expanded) in {:?}",
                 frame,
@@ -79,6 +86,7 @@ fn main() -> Result<()> {
             run.lane_count(),
             args.frames
         );
+        celeste_rust::compiled::print_asm_append_stats();
         return Ok(());
     }
     run_game_frames(

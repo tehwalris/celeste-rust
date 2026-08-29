@@ -40,6 +40,11 @@ pub(crate) mod asm_kernel;
 pub mod bridge;
 pub mod dispatch;
 
+/// Print the ASM append materialize/kept ratio (diagnostic).
+pub fn print_asm_append_stats() {
+    asm_kernel::print_append_stats();
+}
+
 /// The lane kernels are the compiled engine (plans/kernel-plan.md); chunks
 /// they refuse fall through to the reference. The retired tile engines
 /// (CELESTE_TILE=1 concrete-button tiles, =2 dynamic expand) are gone - the
