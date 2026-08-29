@@ -224,6 +224,42 @@ fn export_block_tagged(block: &runtime2::Rt2, tag: Option<&str>) -> crate::inter
     state
 }
 
+/// The assert-noop guard body (`dispatch::widen_noop_check`): a
+/// widen-in-graph kernel's output state must be a FIXED POINT of the
+/// campaign's `split_precision_straddles` + `make_state_abstract`. Keys
+/// both the state as-is and its re-abstraction with the SAME
+/// `sweep::row_keys` (so it is a pure "did the boundary move anything"
+/// test, no cross-keyer question), and panics on the first difference -
+/// naming itself, under the never-deopt doctrine.
+fn assert_widen_is_noop(state: &crate::interpreter::state::State) {
+    use std::collections::HashSet;
+    if state.vector_size == 0 {
+        return;
+    }
+    let keys = |s: &crate::interpreter::state::State| -> HashSet<(u64, u64)> {
+        crate::search::sweep::row_keys(s)
+            .expect("widen-noop: row_keys")
+            .into_iter()
+            .collect()
+    };
+    let before = keys(state);
+    let mut after: HashSet<(u64, u64)> = HashSet::new();
+    for st in crate::interpreter::abstraction::split_precision_straddles(state.clone()) {
+        let w = crate::interpreter::abstraction::make_state_abstract(st);
+        after.extend(keys(&w));
+    }
+    assert_eq!(
+        before, after,
+        "KERNEL WIDEN-NOOP VIOLATION: re-abstracting a widen-in-graph kernel output \
+         changed its row keys ({} before, {} after; {} boundary-only, {} kernel-only). \
+         The graph UNDER-widened a field the campaign boundary still moves.",
+        before.len(),
+        after.len(),
+        after.difference(&before).count(),
+        before.difference(&after).count(),
+    );
+}
+
 pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
     let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));
     let f = |name: &str| gen::field_id(name).unwrap_or_else(|| panic!("no field {}", name));
@@ -660,6 +696,11 @@ impl FrameEngine {
         let keeps = Self::dedup_keeps_serial(&done);
         let merged = self.regroup_and_merge(done, keeps, &mut |_| {});
         t.mark(CHUNK_MERGE);
+        if dispatch::widen_noop_check() {
+            for b in &merged {
+                assert_widen_is_noop(&export_block_tagged(b, origin_tag));
+            }
+        }
         out.extend(
             merged.iter().map(|b| {
                 // Carry the engine keys unconditionally - the engine-keyed

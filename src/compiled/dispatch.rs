@@ -107,6 +107,20 @@ pub(crate) fn widen_in_graph() -> bool {
     *ON.get_or_init(|| std::env::var("CELESTE_WIDEN_IN_GRAPH").map_or(false, |v| v != "0"))
 }
 
+/// The assert-noop guard (plans/keying-widening-flow.md, Phase 1 point 1):
+/// when the kernels widen in the graph, re-applying the campaign's
+/// `make_state_abstract` to their output must be a no-op on the row keys.
+/// A failure means the graph UNDER-widened some field the boundary would
+/// still move - the exact class the fruit `off`/`y` bug was in. OFF by
+/// default (a per-frame re-abstraction + double keying); opt-in via
+/// `CELESTE_KERNEL_WIDEN_NOOP=1`. Only meaningful with
+/// `CELESTE_WIDEN_IN_GRAPH=1` (an exact-rem kernel is not a fixed point of
+/// the rung widening by construction).
+pub(crate) fn widen_noop_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CELESTE_KERNEL_WIDEN_NOOP").map_or(false, |v| v != "0"))
+}
+
 /// A one-line miss summary for the strict-mode abort: how many lanes the
 /// ASM kernels could not serve (a shape with no assembled kernel, or a
 /// declined lane). The ASM path does not categorize by refusal step.
@@ -196,10 +210,23 @@ pub fn print_kernel_hits() {
 pub(crate) fn chunk_skip(key: (u64, u64)) -> bool {
     // The skip reduces a chunk's materialized rows, which makes the
     // per-chunk `check` comparison see fewer rows than the interpreter (a
-    // sibling chunk covers the within-frame dups). CELESTE_ASM_NO_SKIP turns
-    // it off so `check` compares full frame outputs.
+    // sibling chunk covers the within-frame dups, and under
+    // CELESTE_FRONTIER_ONLY the frozen frontier drops already-visited rows
+    // - neither of which the per-chunk interpreter reference does). So the
+    // skip is a per-chunk comparison asymmetry BY CONSTRUCTION, on the
+    // WITHIN-FRAME axis as well as the frontier one - "on for both" cannot
+    // fix the within-frame half without cross-chunk deduping the reference
+    // too. CELESTE_ASM_NO_SKIP turns it off so `check` compares full frame
+    // outputs ("off for both"), and CHECK MODE forces that automatically
+    // (plans/keying-widening-flow.md, Phase 4): the skip is a pure
+    // export/merge optimization the campaign's own boundary re-does, so
+    // dropping it in check changes no stored result, only what the
+    // comparison sees.
     static NO_SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *NO_SKIP.get_or_init(|| std::env::var_os("CELESTE_ASM_NO_SKIP").is_some()) {
+    if *NO_SKIP.get_or_init(|| {
+        std::env::var_os("CELESTE_ASM_NO_SKIP").is_some()
+            || std::env::var("CELESTE_COMPILED_FORWARD").as_deref() == Ok("check")
+    }) {
         return false;
     }
     frontier_hit(key) || within_frame_dup(key)

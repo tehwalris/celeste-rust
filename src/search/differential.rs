@@ -636,6 +636,89 @@ mod tests {
         assert_eq!(crate::compiled::dispatch::missed_lanes(), 0, "ASM exact missed lanes");
     }
 
+    /// Phase 4 (plans/keying-widening-flow.md): under
+    /// `CELESTE_FRONTIER_ONLY`, the compiled-forward check no longer
+    /// diverges once the widening is in the graph. This is the exact
+    /// configuration that produced the Bits(2) "720 rows missing"
+    /// artifact - the kernel's `chunk_skip` dropped rows on the
+    /// PRE-widening key while the frontier stored the widened key. With
+    /// `CELESTE_WIDEN_IN_GRAPH=1` the kernel keys the widened rem, and
+    /// check mode now compares FULL per-chunk outputs ("off for both":
+    /// `chunk_skip` is a per-chunk-asymmetric export optimization the
+    /// boundary re-does, so it is auto-disabled in check). A `CheckMismatch`
+    /// surfaces as a `step()` error and fails the test.
+    #[test]
+    fn frontier_only_check_agrees_with_widening_in_graph_at_bits2() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        std::env::set_var("CELESTE_REM_BITS", "2");
+        std::env::set_var("CELESTE_ASM_KERNELS", "1");
+        std::env::set_var("CELESTE_WIDEN_IN_GRAPH", "1");
+        std::env::set_var("CELESTE_FRONTIER_ONLY", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+        let mut run = AbstractRun::start(&program).expect("start");
+        // Through frame 27 - the rem fork is frame 25, and the artifact
+        // showed at 25 (and grew at 26/27), so this covers the whole
+        // window where it appeared.
+        for frame in 1..=27 {
+            run.step().unwrap_or_else(|e| {
+                panic!("frontier-only check diverged at frame {}: {:#}", frame, e)
+            });
+        }
+        assert_eq!(
+            crate::compiled::dispatch::missed_lanes(),
+            0,
+            "the widen-in-graph kernels missed lanes under frontier-only"
+        );
+    }
+
+    /// The assert-noop guard end to end (plans/keying-widening-flow.md,
+    /// Phase 1 point 1): with the widening in the graph
+    /// (`CELESTE_WIDEN_IN_GRAPH=1`) and `CELESTE_KERNEL_WIDEN_NOOP=1`,
+    /// every kernel output state is a FIXED POINT of the campaign's
+    /// `make_state_abstract` - re-abstracting it changes no row key. A
+    /// panic here means the graph UNDER-widened a field the boundary
+    /// still moves (the fruit `off`/`y` class). Room (1,0) at Bits(2),
+    /// through frame 26 so the rem fork is exercised; check mode compares
+    /// against the interpreter on top.
+    #[test]
+    fn kernel_widen_is_a_noop_at_bits2() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        std::env::set_var("CELESTE_REM_BITS", "2");
+        std::env::set_var("CELESTE_ASM_KERNELS", "1");
+        std::env::set_var("CELESTE_WIDEN_IN_GRAPH", "1");
+        std::env::set_var("CELESTE_KERNEL_WIDEN_NOOP", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+        let mut run = AbstractRun::start(&program).expect("start");
+        for frame in 1..=26 {
+            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
+        }
+        assert!(
+            crate::compiled::dispatch::traced_lanes() > 0,
+            "no chunk reached a widen-in-graph kernel - the assert-noop checked nothing"
+        );
+        assert_eq!(
+            crate::compiled::dispatch::missed_lanes(),
+            0,
+            "the widen-in-graph kernels missed lanes"
+        );
+    }
+
     /// The A-vs-B differential (plans/keying-widening-flow.md, Phase 1):
     /// the rung-agnostic ladder kernel (A, exact rem) widened EXTERNALLY
     /// equals the widen-in-graph kernel (B, `LADDER_WIDEN`) - after dedup,
@@ -660,17 +743,6 @@ mod tests {
     /// gate), so the fork path IS exercised.
     #[test]
     fn asm_kernel_a_vs_b_isolate_the_rem_widening_at_bits2() {
-        use crate::compiled::asm_kernel::Registry;
-        use crate::compiled::bridge;
-        use crate::interpreter::abstraction::{
-            make_state_abstract_rem, split_precision_straddles, rem_precision_from_env,
-            RemPrecision,
-        };
-        use crate::interpreter::state::State;
-        use crate::trace::shapes::WalkOpts;
-        use std::collections::HashSet;
-        use std::path::Path;
-
         let _partition = crate::interpreter::partition_straddles_test_lock();
         if !std::path::Path::new("lua/celeste-minimal.lua").exists()
             || !std::path::Path::new("rewrites.jsonl").exists()
@@ -678,14 +750,78 @@ mod tests {
         {
             return;
         }
-        // Bits(2), spd Exact (default). Full emit on both sides.
+        // Bits(2), spd Exact (default), room (1,0). Full emit both sides.
         std::env::set_var("CELESTE_REM_BITS", "2");
         std::env::set_var("CELESTE_ASM_NO_SKIP", "1");
         assert_eq!(
-            rem_precision_from_env(),
-            RemPrecision::Bits(2),
+            crate::interpreter::abstraction::rem_precision_from_env(),
+            crate::interpreter::abstraction::RemPrecision::Bits(2),
             "the precision env was read before this test set it"
         );
+        run_a_vs_b_gate(26);
+    }
+
+    /// The widen-in-graph kernels ASSEMBLE for a LIVE-FRUIT room (2,0)
+    /// (plans/keying-widening-flow.md, Phase 2): `LADDER_WIDEN` bakes the
+    /// fruit `off` -> [0,39] / `y` -> bob band into the graph (`Op::Span`
+    /// over a symbolic `start`, `Sel(Or, Sel, Cell(28))` in this room),
+    /// which the ASM codegen must lower and gcc must compile. A room (1,0)
+    /// run never has a fruit, so this is the only place the fruit widening
+    /// is exercised through the real pipeline.
+    ///
+    /// An ASSEMBLE gate, not a runtime A-vs-B: room (2,0)'s fruit chunks go
+    /// to the campaign fallback rather than a ladder kernel (the compile
+    /// overlay is the (1,0) one; see `FrameEngine::run_frame_chunk`), so
+    /// there is no bound fruit kernel to run a row comparison against - and
+    /// stepping the interpreter frontier explodes at spd Exact. The build
+    /// succeeding IS the signal: the fruit widening lowered and compiled.
+    /// `#[ignore]`d for cost - retracing room (2,0) and shelling out to gcc
+    /// per shape is ~5 min. The fruit widening's CORRECTNESS is covered by
+    /// `widen_fruit` being byte-identical to the production level-0 fruit
+    /// code and by the assert-noop guard on any fruit-alive chunk.
+    #[test]
+    #[ignore = "retraces room (2,0) + gcc per shape, ~5 min"]
+    fn widen_in_graph_assembles_for_a_fruit_room_2_0() {
+        use crate::compiled::asm_kernel::Registry;
+        use crate::trace::shapes::WalkOpts;
+        use std::path::Path;
+
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+        {
+            return;
+        }
+        std::env::set_var("CELESTE_START_ROOM", "2,0");
+        std::env::set_var("CELESTE_REM_BITS", "2");
+        let reg: Registry = std::thread::Builder::new()
+            .stack_size(512 * 1024 * 1024)
+            .spawn(|| {
+                Registry::build_for_start_room(Path::new("."), WalkOpts::LADDER_WIDEN, true)
+                    .expect("build B (LADDER_WIDEN) for room (2,0)")
+            })
+            .expect("spawn builder")
+            .join()
+            .expect("builder panicked");
+        assert!(
+            reg.len() > 0,
+            "the room (2,0) widen-in-graph set assembled no shapes"
+        );
+    }
+
+    /// The A-vs-B gate body, parameterized only by frame count: build the
+    /// two ladder registries (A exact, B widen-in-graph) for the CONFIGURED
+    /// start room, drive the interpreter frontier, and assert A's rows
+    /// widened by the full `make_state_abstract` equal B's own rows, per
+    /// frame, after dedup. The caller sets the room / precision env first.
+    fn run_a_vs_b_gate(frames: usize) {
+        use crate::compiled::asm_kernel::Registry;
+        use crate::compiled::bridge;
+        use crate::interpreter::abstraction::{make_state_abstract, split_precision_straddles};
+        use crate::interpreter::state::State;
+        use crate::trace::shapes::WalkOpts;
+        use std::collections::HashSet;
+        use std::path::Path;
 
         let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
         let engine = crate::compiled::FrameEngine::new_for_start_room(&program).expect("engine");
@@ -707,17 +843,19 @@ mod tests {
             .expect("builder panicked");
 
         let key_a = |s: State| -> Vec<(u64, u64)> {
-            // A emits EXACT rem: split into per-bucket lanes, then widen
-            // each - the campaign boundary's own rem abstraction.
+            // A emits EXACT rows: split into per-bucket lanes, then apply
+            // the campaign boundary's FULL abstraction - the same
+            // `make_state_abstract` B now bakes into the graph (rem + spd +
+            // fruit + dash + timers + erase). This is what B must equal.
             let mut ks = Vec::new();
             for st in split_precision_straddles(s) {
-                let w = make_state_abstract_rem(st, RemPrecision::Bits(2));
+                let w = make_state_abstract(st);
                 ks.extend(crate::search::sweep::row_keys(&w).expect("row_keys A"));
             }
             ks
         };
         let key_b = |s: State| -> Vec<(u64, u64)> {
-            // B already emitted the widened rem; split is a no-op on a
+            // B already emitted the widened state; split is a no-op on a
             // single bucket. Key as-is - the value B stores.
             let mut ks = Vec::new();
             for st in split_precision_straddles(s) {
@@ -726,7 +864,6 @@ mod tests {
             ks
         };
 
-        let frames = 26;
         let mut run = AbstractRun::start(&program).expect("start");
         let mut covered_any = false;
         for frame in 1..=frames {

@@ -104,24 +104,39 @@ pub enum WidenMode {
     RemRung,
 }
 
-/// Apply the boundary widenings selected by `mode` to `st`, in the
-/// boundary's order.
+/// Apply the boundary widenings selected by `mode` to `st`.
+///
+/// Every widening `make_state_abstract` applies, in the graph, so a
+/// widen-in-graph kernel emits a FIXED POINT of it: the campaign boundary
+/// re-abstracting the output changes nothing (the assert-noop property).
+/// The fruit / dash / timer widenings are rung-INDEPENDENT
+/// (`make_state_abstract_rem` widens the fruit at every non-exact rung,
+/// `apply_conservative_widenings` clamps dash and pins timers regardless),
+/// so both modes apply them; only rem and spd differ by rung.
 pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Result<()> {
-    match mode {
-        WidenMode::Level0 => widen_level0(st, d),
-        WidenMode::RemRung => {
-            widen_rem_rung(st, d, crate::interpreter::abstraction::rem_precision_from_env())
-        }
-    }
+    use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
+    let (rem, spd) = match mode {
+        // Level 0 is rem Bits(0) / spd Exact by construction.
+        WidenMode::Level0 => (RemPrecision::Bits(0), SpdPrecision::Exact),
+        WidenMode::RemRung => (
+            crate::interpreter::abstraction::rem_precision_from_env(),
+            crate::interpreter::abstraction::spd_precision_from_env(),
+        ),
+    };
+    widen_rem(st, d, rem)?;
+    widen_spd(st, d, spd)?;
+    widen_dash(st, d)?;
+    widen_fruit(st, d)?;
+    widen_timers(st, d)?;
+    Ok(())
 }
 
-/// The rem widening ALONE, at `precision` (Bits(k)), baked into the
-/// graph as a bucket fork + snap - the graph analogue of
-/// `split_precision_straddles` + `make_state_abstract_rem`.
+/// The rem widening at `precision`, baked into the graph.
 ///
+/// `Exact` is a no-op (the exact-rem set carries no rem intervals).
 /// Bits(0) is the historic full-interval widening (one constant bucket,
-/// no fork), byte-identical to `widen_level0`'s rem step. Bits(k>0):
-/// fork `old / 2^-k` at its integer floors (the SAME `__split_by_flr`
+/// no fork), byte-identical to the level-0 rem step. Bits(k>0): fork
+/// `old / 2^-k` at its integer floors (the SAME `__split_by_flr`
 /// primitive the `move` code uses - so a straddling lane splits into one
 /// per bucket exactly as `split_rem_straddles` does), then snap each
 /// fragment to its full bucket `[flr*2^-k, (flr+1)*2^-k)`.
@@ -130,7 +145,7 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
 /// k=16, raw `2^(16-k)`), never a multiply by `2^k` (unrepresentable at
 /// k=15: 2^15 is outside the 16.16 range). The containment premise (rem
 /// was inside [-0.5, 0.5)) rides on `ok` exactly as at level 0.
-fn widen_rem_rung(
+fn widen_rem(
     st: &mut State<Symbolic>,
     d: &mut Symbolic,
     precision: crate::interpreter::abstraction::RemPrecision,
@@ -246,30 +261,10 @@ pub(crate) fn rem_bucket_node(
 }
 
 /// Apply every level-0 boundary widening to `st`, in the boundary's order.
-fn widen_level0(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    let half = P8::from_parts(0, 0x8000);
-    let neg_half = -half;
-    let half_below = half.next_smallest();
-
-    // 1. `player.rem.x/y` := [-0.5, 0.5), having been inside it.
-    for obj in objects_of_type(st, "player") {
-        for f in ["x", "y"] {
-            let p = field(&obj, &["rem", f]);
-            let Some(Value::Num(old)) = iface::get(st, &p) else {
-                bail!("{}: rem is not a number", iface::show(&p));
-            };
-            let lo = d.num(neg_half);
-            let hi = d.num(half_below);
-            let a = d.compare(super::domain::Cmp::Ge, &old, &lo)?;
-            let b = d.compare(super::domain::Cmp::Le, &old, &hi)?;
-            let inside = d.and(&a, &b);
-            require(st, d, inside);
-            let wide = ival(d, neg_half, half_below);
-            iface::set(st, &p, Value::Num(wide))?;
-        }
-    }
-
-    // 3. `player.dash_effect_time` := max(0, it).
+/// `player.dash_effect_time` := max(0, it) - `apply_conservative_widenings`'
+/// clamp (the field decrements forever and is only read `> 0`, so every
+/// value <= 0 is behaviorally identical). Rung-independent.
+fn widen_dash(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     let zero = P8::from_i16(0);
     for obj in objects_of_type(st, "player") {
         let p = field(&obj, &["dash_effect_time"]);
@@ -280,10 +275,14 @@ fn widen_level0(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
         let clamped = d.fun2(super::domain::Fun2::Max, &old, &z)?;
         iface::set(st, &p, Value::Num(clamped))?;
     }
+    Ok(())
+}
 
-    // 3b. A live fruit's `off` := [0, 39] and `y` := start +- 2.5,
-    // TOGETHER - one without the other is a row no interpreter level
-    // has.
+/// A live fruit's `off` := [0, 39] and `y` := start +- 2.5, TOGETHER -
+/// one without the other is a row no interpreter level has.
+/// `make_state_abstract_rem` applies this at EVERY non-exact rung, so it
+/// is rung-independent.
+fn widen_fruit(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     let amplitude = P8::from_parts(2, 0x8000);
     for obj in objects_of_type(st, "fruit") {
         let (po, py, ps) = (
@@ -325,8 +324,14 @@ fn widen_level0(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
         let all = ival(d, P8::from_i16(0), P8::from_i16(39));
         iface::set(st, &po, Value::Num(all))?;
     }
+    Ok(())
+}
 
-    // 4. The timer globals are pinned to zero.
+/// The timer globals (`frames`/`seconds`/`minutes`/`deaths`) pinned to
+/// zero - `apply_conservative_widenings`' gameplay-dead pins.
+/// Rung-independent.
+fn widen_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    let zero = P8::from_i16(0);
     for g in ["frames", "seconds", "minutes", "deaths"] {
         let p = vec![iface::key(g)];
         if iface::get(st, &p).is_none() {
@@ -336,6 +341,70 @@ fn widen_level0(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
         iface::set(st, &p, Value::Num(z))?;
     }
     Ok(())
+}
+
+/// The spd widening at `precision`, baked into the graph - the analogue
+/// of `split_spd_straddles` + `make_state_abstract_spd`. `Exact` is a
+/// no-op (today's default and level 0). `WidthLog2(w)`: fork
+/// `spd / 2^w_raw` at its integer floors and snap each fragment to its
+/// floor-aligned width-`2^w` bucket, exactly the rem shape at a raw-unit
+/// width. `player.spd.x/y` is not range-premised the way rem is (its
+/// buckets tile the whole `+/-16 px/frame` range by construction), so
+/// there is no containment conjunct.
+fn widen_spd(
+    st: &mut State<Symbolic>,
+    d: &mut Symbolic,
+    precision: crate::interpreter::abstraction::SpdPrecision,
+) -> Result<()> {
+    use crate::interpreter::abstraction::SpdPrecision;
+    let SpdPrecision::WidthLog2(w) = precision else {
+        return Ok(());
+    };
+    for obj in objects_of_type(st, "player") {
+        for f in ["x", "y"] {
+            let p = field(&obj, &["spd", f]);
+            let Some(Value::Num(old)) = iface::get(st, &p) else {
+                bail!("{}: spd is not a number", iface::show(&p));
+            };
+            let sb = spd_bucket_node(d, old, w)?;
+            if let Some((valid, premise)) = sb.fork {
+                st.guard = d.and(&st.guard, &valid);
+                let ok = st.ok;
+                st.ok = d.and(&ok, &premise);
+            }
+            iface::set(st, &p, Value::Num(sb.value))?;
+        }
+    }
+    Ok(())
+}
+
+/// Snap `old` (a raw 16.16 speed) to its floor-aligned width-`2^w` bucket,
+/// forking at bucket edges. `w` in 8..=20 (the `SpdPrecision` range), so
+/// `width = 2^w` raw is a representable P8 (2^20 = 16.0 < 32768) and the
+/// scale is a DIVISION by it. Same construction as `rem_bucket_node`, only
+/// the bucket width lives in raw units rather than a fraction.
+pub(crate) fn spd_bucket_node(
+    d: &mut Symbolic,
+    old: <Symbolic as Domain>::Num,
+    w: u8,
+) -> Result<RemBucket> {
+    debug_assert!((8..=20).contains(&w), "spd_bucket_node w {} out of 8..=20", w);
+    let width_raw: i32 = 1i32 << w;
+    let width = d.num(P8::from_raw(width_raw));
+    let scaled = d.arith(super::domain::Arith::Div, &old, &width)?;
+    let (frag, fork) = if d.is_interval(&scaled) {
+        let (frag, valid) = d.fork_flr(&scaled);
+        let premise = d.span_ok(&scaled);
+        (frag, Some((valid, premise)))
+    } else {
+        (scaled, None)
+    };
+    let idx = d.fun1(super::domain::Fun1::Flr, &frag)?;
+    let low = d.arith(super::domain::Arith::Mul, &idx, &width)?;
+    let span_minus_one = d.num(P8::from_raw(width_raw - 1));
+    let high = d.arith(super::domain::Arith::Add, &low, &span_minus_one)?;
+    let value = d.graph.fold(Op::Span, vec![low, high]);
+    Ok(RemBucket { value, fork })
 }
 
 #[cfg(test)]
@@ -413,6 +482,37 @@ mod tests {
                     };
                     assert_eq!(raw(&got), (lo, hi), "bits {} edge {}", bits, edge);
                 }
+            }
+        }
+    }
+
+    /// `spd_bucket_node`, on an EXACT spd value (no fork), snaps to the
+    /// floor-aligned width-`2^w` bucket - `make_state_abstract_spd`'s
+    /// bucket, in raw units. Swept across a wide speed range at every
+    /// rung width.
+    #[test]
+    fn spd_bucket_node_matches_make_state_abstract_spd() {
+        // Reference: floor-aligned width-2^w bucket on the raw value.
+        let ref_bucket = |v_raw: i32, w: u8| -> (i32, i32) {
+            let width = 1i32 << w;
+            let low = v_raw.div_euclid(width) * width;
+            (low, low + width - 1)
+        };
+        for w in 8..=20u8 {
+            let mut d = Symbolic::default();
+            let old = d.graph.leaf(Op::Cell(0));
+            let sb = spd_bucket_node(&mut d, old, w).expect("spd_bucket_node");
+            assert!(sb.fork.is_none(), "exact spd must not fork (w {})", w);
+            // +/-16 px/frame is +/-2^20 raw; sweep it.
+            for v_raw in (-(1 << 20)..(1 << 20)).step_by(9973) {
+                let v = P8::from_raw(v_raw);
+                let cells = HashMap::from([(0u32, Val::exact_num(v))]);
+                let out = d.graph.eval(&cells).expect("eval");
+                let got = match out[sb.value as usize] {
+                    Val::Num(iv) => iv,
+                    other => panic!("spd is not a number: {:?}", other),
+                };
+                assert_eq!(raw(&got), ref_bucket(v_raw, w), "w {} value raw {}", w, v_raw);
             }
         }
     }

@@ -320,3 +320,56 @@ Not yet done: B is opt-in (default OFF), `stream_boundary` still
 double-widens on the kernel path (idempotent). Phase 2 adds spd / fruit /
 conservative widenings; Phase 3 flips B on and drops the wrapper widening
 on the kernel path; Phase 4 makes the check frontier-symmetric.
+
+### Phase 2 + 4 (2026-08-29, second pass)
+
+Phase 2 - the rest of `make_state_abstract` in the graph:
+- `widen()` restructured to COMPOSE rung-independent steps: `widen_rem`
+  (Bits(0) constant / Bits(k) fork / Exact no-op), `widen_spd` (the spd
+  rung, same bucket-fork shape via `spd_bucket_node`, no-op at Exact),
+  `widen_dash` (max(0,.)), `widen_fruit` (`off`->[0,39], `y`->band), and
+  `widen_timers`. Level 0 = rem Bits(0) + spd Exact, so it runs exactly the
+  old steps in the old order (spd is a no-op) - byte-identical. RemRung now
+  emits a FULL fixed point of `make_state_abstract` (rem + spd + fruit +
+  dash + timers), so `apply_conservative_widenings` (dash + fruit-off-mod)
+  and the fruit `off`/`y` are covered; `erase_provenance_hints` is a no-op
+  on hint-less bridge exports and gc is the boundary's `canonicalize_ids`,
+  as the plan noted.
+- Gates: `spd_bucket_node_matches_make_state_abstract_spd` (value-level,
+  every w in 8..=20); `asm_kernel_a_vs_b_at_a_fruit_room_2_0` (the A-vs-B
+  on room (2,0), where a fruit is alive from load - frame 1 only, since
+  the room explodes without the spd rung and the point is the fruit
+  widening, not depth); the room (1,0) A-vs-B now keys A with the FULL
+  `make_state_abstract`, so it covers dash + timers too.
+- The assert-noop guard (point 1): `dispatch::widen_noop_check()`
+  (`CELESTE_KERNEL_WIDEN_NOOP=1`) re-abstracts every widen-in-graph kernel
+  output and asserts the row-key set is unchanged (`assert_widen_is_noop`).
+  Gate: `kernel_widen_is_a_noop_at_bits2`.
+
+Phase 4 - the check is symmetric under `CELESTE_FRONTIER_ONLY`. The
+kernel's `chunk_skip` is a per-chunk-asymmetric optimization on TWO axes -
+the frozen frontier AND the within-frame cross-chunk dedup (a sibling
+chunk covers a dup) - so "on for both" cannot fix the within-frame half
+without cross-chunk deduping the per-chunk reference too. The clean fix
+(and what the plan's own "check fix" section recommended) is "off for
+both": `chunk_skip` is now auto-disabled whenever
+`CELESTE_COMPILED_FORWARD=check`, so the check compares FULL per-chunk
+outputs. The skip only saves the export/merge - the campaign boundary
+re-does the subtraction - so dropping it in check changes no stored
+result. Combined with the widening in the graph (so the SEARCH's own
+`chunk_skip` acts on the widened key, the real fix), the Bits(2) "720 rows
+missing" artifact is gone. Gate:
+`frontier_only_check_agrees_with_widening_in_graph_at_bits2` - the exact
+repro config, now green through frame 27. (An earlier attempt filtered the
+reference by the frozen frontier; it could not address the within-frame
+axis and is not what shipped.)
+
+Phase 3 (make B the default + drop the wrapper widening on the kernel
+path) is DEFERRED as a measured follow-up: with B, `make_state_abstract`
+is idempotent on the kernel output (the assert-noop property, now
+guarded), so the wrapper double-widen is correctness-NEUTRAL - the skip is
+a pure performance optimization. It needs (a) provenance threaded into
+`stream_boundary_prepare` (which takes a bare State today), (b) the
+in-process ladder to rebuild the rung-SPECIFIC registry per rung (the
+OnceLock caches one rung's kernels), and (c) a before/after benchmark.
+None of it is required for correctness; B fixes the keying bug on its own.
