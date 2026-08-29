@@ -1521,21 +1521,31 @@ impl CompiledForward {
                 got_keys.len(),
             ))));
         }
-        // Carry the REFERENCE states forward, not the engine's. The two
-        // partitions carry the same row set (just verified), but the
-        // trajectories they induce differ: the engine's regrouping can
-        // form states the interpreter's own flow never would, and on
-        // room (2,0) f40 the reference side of the NEXT frame ground for
-        // hours in split_by_condition on exactly such states. Check mode
-        // gates "the engine reproduces the interpreter's transition on
-        // the interpreter's own frontier", frame by frame - so the
-        // frontier stays the interpreter's, and an engine-side partition
-        // pathology cannot compound across frames or contaminate the
-        // reference it is being judged against.
-        drop(got);
-        // Check mode carries the interpreter's reference states forward (see
-        // above); the frontier recomputes their row key like any other state.
-        Ok(reference)
+        // Which trajectory does check mode explore? The two partitions
+        // carry the SAME row set (just verified), so either is sound, but
+        // they induce different next-frame states.
+        //
+        // Historic (default): carry the INTERPRETER reference forward. The
+        // engine's regrouping can form states the interpreter's own flow
+        // never would, and on room (2,0) f40 the reference side of the
+        // NEXT frame ground for hours in split_by_condition on exactly
+        // such states - so the frontier stayed the interpreter's, and
+        // check gated "the engine reproduces the interpreter's transition
+        // on the interpreter's own frontier", frame by frame.
+        //
+        // `CELESTE_CHECK_KERNEL_FRONTIER`: carry the KERNEL's own output
+        // forward instead, so check drives the REAL compiled trajectory
+        // (skip and all) with the interpreter alongside for comparison -
+        // the "run the kernel path untouched, interpreter on the side"
+        // model. Under evaluation to decide if the room (2,0) grind is
+        // stale.
+        if crate::compiled::dispatch::check_kernel_frontier() {
+            drop(reference);
+            Ok(got_states)
+        } else {
+            drop(got);
+            Ok(reference)
+        }
     }
 }
 
@@ -2119,9 +2129,15 @@ impl AbstractRun {
     /// - so the boundary must still widen them or the next frame's kernels
     /// miss their (un-widened) shape.
     fn outputs_pre_widened(&self) -> bool {
+        // Check mode's output is the interpreter REFERENCE (raw) unless it
+        // is driving the frontier with the kernel, in which case the output
+        // is the widened kernel state like the real path.
+        let compiled_widened_output = self
+            .compiled
+            .is_some_and(|c| !c.check || crate::compiled::dispatch::check_kernel_frontier());
         crate::compiled::dispatch::wrapper_skip()
             && !self.rem_only_abstraction
-            && self.compiled.is_some_and(|c| !c.check)
+            && compiled_widened_output
             && self.deopt.is_none()
             && crate::compiled::dispatch::kernel_strict()
             && crate::compiled::dispatch::kernel_output_is_prewidened()

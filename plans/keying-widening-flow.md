@@ -431,3 +431,31 @@ identical. Gate: `wrapper_widen_skip_reproduces_the_interpreter_at_bits2`
 (real forward, lane counts == interpreter, assert-noop on). Perf A/B
 (Bits(2), n=33): -5% / -9% on f31/f32 on top of the default flip's
 -37%/-27%. Full quick suite 310/310.
+
+### Check mode drives with the KERNEL now (2026-08-29)
+
+Philippe: excluding check mode from the wrapper-skip was a smell - check
+should run the kernel path untouched with the interpreter alongside, not
+alter what the kernel does. Correct. The deeper cause was that check mode
+DROVE the frontier with the interpreter reference (`Ok(reference)`), not
+the kernel, so the frontier was raw and my skip-exclusion was patching
+that.
+
+`CELESTE_CHECK_KERNEL_FRONTIER` (DEFAULT ON) makes check carry the
+KERNEL's own output forward and run the interpreter only for the per-frame
+comparison. Now check validates the REAL compiled trajectory - skip and
+all - and the check gates EXERCISE the skip (the frontier is the widened
+kernel output). The skip's check-mode branch collapses to "always skip in
+check too". Full quick suite 310/310; room (1,0) kernel-driven check is
+the same wall as interpreter-driven (n=30).
+
+The historic interpreter-driven frontier is kept as
+`CELESTE_CHECK_KERNEL_FRONTIER=0`. Its rationale is likely STRUCTURAL, not
+stale: the engine merges frontier states by SHAPE while the interpreter
+splits by BRANCH CONDITION, so feeding the reference engine-merged states
+can make it re-split every frame (room (2,0) f40 ground for hours). Room
+(1,0) shows no such cost. Not re-tested at room (2,0) f40 - if a check
+there ever grinds, flip the switch. This is a check-mode PERFORMANCE
+concern (not correctness: the per-frame row-set assertion holds either
+way), and check is a diagnostic, so defaulting to the faithful
+kernel-driven mode is the right call.

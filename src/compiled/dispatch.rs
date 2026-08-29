@@ -115,6 +115,31 @@ pub(crate) fn widen_in_graph() -> bool {
     *ON.get_or_init(|| std::env::var("CELESTE_WIDEN_IN_GRAPH").map_or(true, |v| v != "0"))
 }
 
+/// Whether `CELESTE_COMPILED_FORWARD=check` drives the search with the
+/// KERNEL's own output (running the interpreter alongside for the
+/// per-frame comparison), rather than with the interpreter reference.
+///
+/// DEFAULT ON (2026-08-29): check now validates the REAL compiled
+/// trajectory - the kernel path untouched, skip and all, interpreter on
+/// the side - which is what a check should do, and it makes the check
+/// gates EXERCISE the boundary widen-skip (the frontier is the widened
+/// kernel output). Because check asserts the row sets identical every
+/// frame, the two trajectories cannot silently diverge.
+///
+/// `CELESTE_CHECK_KERNEL_FRONTIER=0` restores the historic
+/// interpreter-driven frontier. Its rationale (kept as a fallback, not
+/// re-verified as stale): the engine merges frontier states BY SHAPE while
+/// the interpreter's own flow splits BY BRANCH CONDITION
+/// (`split_by_condition`), so feeding the interpreter reference the
+/// engine's merged states can make it re-split every frame - measured
+/// grinding for hours on room (2,0) f40. Room (1,0) shows no such cost
+/// (kernel-driven check is same wall as interpreter-driven, n=30). If a
+/// room (2,0) check ever grinds, this is the switch.
+pub(crate) fn check_kernel_frontier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CELESTE_CHECK_KERNEL_FRONTIER").map_or(true, |v| v != "0"))
+}
+
 /// Whether the boundary SKIPS re-widening kernel output that is already a
 /// fixed point of `make_state_abstract` (Phase 3). DEFAULT ON;
 /// `CELESTE_WRAPPER_SKIP=0` restores the (idempotent) re-widen for A/B and
