@@ -160,6 +160,25 @@ impl AsmKernel {
                 self.eval_check(chunk, lo, n, &outbuf);
             }
             let valid = ((1u32 << n) - 1) as u16;
+            if liveok_on() {
+                // Per-lane coverage census: OR of live&ok over all bodies
+                // (lane kept by SOME outcome), and OR of live&!ok (lane
+                // DECLINED by some outcome). A lane that is neither kept nor
+                // declined is DROPPED as not-live - the graph considers it dead.
+                let (mut kept, mut declined, mut any_live) = (0u16, 0u16, 0u16);
+                for body in &self.bodies {
+                    let ok = read_zb_holds(&outbuf, body.ok_root);
+                    let live = read_zb_holds(&outbuf, body.live_root);
+                    kept |= live & ok & valid;
+                    declined |= live & !ok & valid;
+                    any_live |= live & valid;
+                }
+                let dropped = valid & !kept & !declined;
+                eprintln!(
+                    "[liveok] slice lanes={n} valid={valid:04x} kept={kept:04x} \
+                     declined={declined:04x} dropped(not-live)={dropped:04x} any_live={any_live:04x}"
+                );
+            }
             for body in &self.bodies {
                 // `ok`/`live` are tri-state ZB masks; the kernel keeps a lane
                 // only where they are KNOWN-TRUE (val & known - `zb_holds`,
@@ -356,6 +375,11 @@ impl AsmKernel {
 }
 
 /// DEBUG gate for the per-lane fused-graph re-evaluation (`eval_check`).
+fn liveok_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_ASM_LIVEOK").is_some())
+}
+
 fn eval_check_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CELESTE_ASM_EVAL_CHECK").is_some())

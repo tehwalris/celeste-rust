@@ -1182,6 +1182,56 @@ impl CompiledForward {
             .engine
             .run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
         let got_states: Vec<State> = got.iter().map(|(s, _)| s.clone()).collect();
+
+        // DEBUG (CELESTE_CHECK_LANES): run each INPUT lane on its own through
+        // both engines and compare, then compare the UNION of the single-lane
+        // interpreter outputs to the whole-chunk interpreter output. If every
+        // single lane matches but the whole chunk does not, the divergence is
+        // the interpreter's CROSS-LANE `__split_by_flr` (it splits by the union
+        // of all lanes' rem intervals; the graph forks each lane independently).
+        if std::env::var_os("CELESTE_CHECK_LANES").is_some() && state.vector_size > 1 {
+            let rung = |ss: &[State]| -> std::collections::HashSet<(u64, u64)> {
+                rung_row_key_set(ss).unwrap_or_default().into_iter().collect()
+            };
+            let full_ref = rung(&reference);
+            let mut per_lane_mismatch = 0usize;
+            let mut union_single_ref: std::collections::HashSet<(u64, u64)> = Default::default();
+            let mut union_single_got: std::collections::HashSet<(u64, u64)> = Default::default();
+            for i in 0..state.vector_size {
+                let mut mask = vec![false; state.vector_size];
+                mask[i] = true;
+                let si = state.clone().filter_by_mask(
+                    &mask,
+                    crate::interpreter::state::FILTER_CHUNK,
+                );
+                let ref_i: Vec<State> = interpret_prepared_cfg(frame_cfg, si.clone(), fixed_env)
+                    .map(|v| v.into_iter().map(|(s, _)| s).collect())
+                    .unwrap_or_default();
+                let got_i: Vec<State> = self
+                    .engine
+                    .run_frame_chunk(&si, Some((frame_cfg, fixed_env)))
+                    .into_iter()
+                    .map(|(s, _)| s)
+                    .collect();
+                let (rk, gk) = (rung(&ref_i), rung(&got_i));
+                if rk != gk {
+                    per_lane_mismatch += 1;
+                }
+                union_single_ref.extend(rk);
+                union_single_got.extend(gk);
+            }
+            eprintln!(
+                "[check lanes] {} of {} single lanes DIFFER (interp vs graph, alone). \
+                 union(single interp)={}, whole-chunk interp={}, they are {}. \
+                 union(single graph)={}.",
+                per_lane_mismatch,
+                state.vector_size,
+                union_single_ref.len(),
+                full_ref.len(),
+                if union_single_ref == full_ref { "EQUAL" } else { "DIFFERENT" },
+                union_single_got.len(),
+            );
+        }
         // The comparator must compare AT THE CONFIGURED RUNG's
         // abstraction. `FrameEngine::row_key_set` funnels through
         // `Rt2::boundary`, which widens at Bits(0) - fine (and cheap)
