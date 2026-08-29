@@ -29,7 +29,11 @@ use crate::transpile::kernel::{Emit, Line, OutField, OutFields};
 pub struct Lowered {
     pub body: Vec<Line>,
     /// One entry per DISTINCT button assignment, each carrying its
-    /// result for every outcome.
+    /// result for every outcome. Nothing renders these to Rust any more;
+    /// the `#[ignore]` diagnostics in `trace::kernel::tests` still read
+    /// them to size a lowering - which is a cfg(test) read, hence the
+    /// scoped allow.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) variants: Vec<crate::transpile::lower::Variant>,
     /// One per output shape, with `expr` and `tainted` filled in by
     /// `emit_body`: `tainted` cells differ between variants and live in

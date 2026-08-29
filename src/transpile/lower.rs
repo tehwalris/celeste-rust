@@ -841,9 +841,8 @@ fn conjunct_term(ctx: &Ctx, cond: NodeId) -> Result<Term> {
 
 /// One free-choice assignment's result: what it writes and whether it
 /// counts. Assignments that agree on all three collapse to one of these,
-/// so `mask` is a REPRESENTATIVE, not an enumeration.
+/// so a variant is a REPRESENTATIVE, not an enumeration.
 pub(crate) struct Variant {
-    pub(crate) mask: u8,
     /// One entry per OUTCOME - per output shape the frame can end in.
     ///
     /// A frame that kills an object ends in a different heap shape than
@@ -858,34 +857,16 @@ pub(crate) struct Variant {
     /// contains those forks. Outcome 13 varying over forks 12 and 13 has
     /// nothing to say about a variant that resolved forks 0 and 1.
     pub(crate) per: Vec<Option<VarOut>>,
-    /// The fork configuration this variant resolved, for diagnostics.
-    pub(crate) fork: u64,
 }
 
-/// What one assignment produces FOR ONE OUTCOME.
+/// What one assignment produces FOR ONE OUTCOME. It used to also carry
+/// the variant's `ok`/`bd`/`live`/row-key variable NAMES for the Rust
+/// renderer; those went with it (2026-08-29) - the corresponding `Line`s
+/// are still emitted into the body, this just stopped recording their
+/// names.
 pub(crate) struct VarOut {
     /// cell -> the expression holding its value under this assignment.
     pub(crate) outputs: BTreeMap<u32, String>,
-    pub(crate) ok: String,
-    /// The block-level deopt: `Some(var)` names a `bool` that, when true,
-    /// means a block-uniform obligation this body cannot discharge holds -
-    /// the WHOLE block is out of the kernel's domain and every live lane is
-    /// DECLINED (reported), never silently dropped. `None` when the body
-    /// has no block-level obligation (the abstract kernels: their `bd` is
-    /// always the literal `false`, so nothing is wired and their output is
-    /// unchanged).
-    pub(crate) bd: Option<String>,
-    /// The lanes that REACH this outcome, as a `u16` expression.
-    ///
-    /// A frame with several output shapes has to say which lanes take
-    /// which successor, or the caller cannot route a single row.
-    pub(crate) live: String,
-    /// The two halves of this successor's row key, as `ZW` expressions -
-    /// the fold `append` used to run per lane, now 16 lanes wide and
-    /// sharing its whole button-independent prefix across variants.
-    ///
-    /// `None` when `Emit::row_key` is off.
-    pub(crate) key: Option<(String, String)>,
 }
 
 /// One output shape: the cells it writes, and the two booleans that say
@@ -1200,7 +1181,7 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
     // --- one variant per body ---
     let mut variants: Vec<Variant> = Vec::new();
     for (bi, b) in bodies.iter().enumerate() {
-        let (oi, mask, fork) = (b.0, b.1, b.2);
+        let (oi, mask) = (b.0, b.1);
         let sfx = format!("_b{}", bi);
         let (mut lanes, mut blocks) = (Vec::new(), Vec::new());
         for c in &conj_of[bi] {
@@ -1209,10 +1190,8 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                 Term::Block(x) => blocks.push(x),
             }
         }
-        let ok = format!("ok_v{}{}", mask, sfx);
-        let bd = format!("bd_v{}{}", mask, sfx);
         body.push(Line::Let {
-            name: ok.clone(),
+            name: format!("ok_v{}{}", mask, sfx),
             ty: "u16",
             expr: if lanes.is_empty() {
                 "ALL".into()
@@ -1220,18 +1199,17 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                 format!("ALL & {}", lanes.join(" & "))
             },
         });
-        let bd_trivial = blocks.is_empty();
         body.push(Line::Let {
-            name: bd.clone(),
+            name: format!("bd_v{}{}", mask, sfx),
             ty: "bool",
-            expr: if bd_trivial { "false".into() } else { blocks.join(" || ") },
+            expr: if blocks.is_empty() { "false".into() } else { blocks.join(" || ") },
         });
         // ALWAYS emitted, even at one outcome. The loop path can fall
         // back on `valid{d}` because its `continue` has already taken
         // the invalid lanes off; here nothing has, so a body's fork
         // validity has to reach `take` through `live` or the rows of a
         // configuration a lane is not in would be written anyway.
-        let live_s = {
+        {
             let (mut lanes, mut blocks) = (Vec::new(), Vec::new());
             for c in &live_of[bi] {
                 match conjunct_term(&ctx, *c)? {
@@ -1239,10 +1217,9 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                     Term::Block(x) => blocks.push(x),
                 }
             }
-            if lanes.is_empty() && blocks.is_empty() {
-                "ALL".to_string()
-            } else {
-                let name = format!("live_v{}{}", mask, sfx);
+            // Trivially-ALL `live` emits no line, matching the old
+            // renderer's elision.
+            if !(lanes.is_empty() && blocks.is_empty()) {
                 let m = if lanes.is_empty() {
                     "ALL".to_string()
                 } else {
@@ -1253,10 +1230,9 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                 } else {
                     format!("if {} {{ 0 }} else {{ {} }}", blocks.join(" || "), m)
                 };
-                body.push(Line::Let { name: name.clone(), ty: "u16", expr });
-                name
+                body.push(Line::Let { name: format!("live_v{}{}", mask, sfx), ty: "u16", expr });
             }
-        };
+        }
         let mut outputs: BTreeMap<u32, String> = BTreeMap::new();
         for (fi, f) in outs[oi].of.fields.iter().enumerate() {
             let node = b.3[fi];
@@ -1267,19 +1243,9 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                 coerce(ctx.expr[node as usize].as_deref().unwrap(), have, want)?,
             );
         }
-        let w = Repr::word(true);
-        let key = match hash_of[bi] {
-            None => None,
-            Some((h1, h2)) => {
-                let f = |h: NodeId| -> Result<String> {
-                    coerce(ctx.expr[h as usize].as_deref().unwrap(), ctx.repr[h as usize], w)
-                };
-                Some((f(h1)?, f(h2)?))
-            }
-        };
         let mut per: Vec<Option<VarOut>> = (0..outs.len()).map(|_| None).collect();
-        per[oi] = Some(VarOut { outputs, ok, bd: if bd_trivial { None } else { Some(bd) }, live: live_s, key });
-        variants.push(Variant { mask, per, fork });
+        per[oi] = Some(VarOut { outputs });
+        variants.push(Variant { per });
     }
 
     // --- which cells actually vary, per outcome ---

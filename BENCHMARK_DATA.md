@@ -1,3 +1,13 @@
+> **ASM cutover note (2026-08-29).** The generated Rust kernel crates,
+> `regen-generated.sh` and the whole checked-in-kernel workflow are GONE
+> (plans/asm-and-posgraph-execution.md B); the kernel backend is now the
+> runtime-assembled AVX-512 set (`compiled::asm_kernel`, retrace at
+> startup, `CELESTE_NO_ASM_KERNELS` opts out). Entries below that measure
+> "traced"/"lattice" KERNELS measured the deleted generated-Rust set;
+> they stand as history, but no kernel-side number below has been
+> remeasured under the ASM backend yet - do that before quoting one as
+> current.
+
 # WHOLE room (1,0) campaign via the in-process `ladder` (2026-08-28, QUICK profile, interpreter forward)
 
 Tonight's run of the NEW single-process ladder: `rewrite ladder --from 94
@@ -611,8 +621,13 @@ so an A/B pair means two full runs from frame 1.)
 
 ## The TRACED kernels at the production horizon (2026-08-24)
 
+(The checked-in traced set this measures was deleted 2026-08-29 - the ASM
+backend replaced it. The zero-deopt COVERAGE result carries over, since the
+ASM kernels are assembled from the same fused graphs; the WALL/PEAK numbers
+need remeasuring under `compiled::asm_kernel`.)
+
 Stage 5 of plans/tracing.md: the per-shape kernels the AST tracer emits,
-checked in at `crates/celeste-kernels/src/traced/`, wired into
+checked in (then) at `crates/celeste-kernels/src/traced/`, wired into
 `run_chunk_kernel`. Room (1,0), `rewrites.jsonl`, `bench --frames 94
 --deopt`, ladder env (frontier-only, collect-first, 8000-lane caps, 16
 threads, `--save-frames`), ONE release binary, no `--features fused`,
@@ -913,7 +928,8 @@ Two traps found en route, both worth remembering:
    row gate caught it (1.18M missing / 2.59M extra). The fused
    callback now leads with a fork-combo counter `cfg` and the
    executor resets its caches when it changes.
-2. **regen-generated.sh clobbers the fused native-probe.** Its final
+2. **regen-generated.sh clobbers the fused native-probe.** (Historical -
+   the script and the fused feature are both gone now.) Its final
    workspace build rewrites target/release/native-probe WITHOUT the
    fused feature, and a subsequent `cargo build -p native-probe
    --features celeste-rust/fused` may see a fresh fingerprint and

@@ -4,10 +4,13 @@
 //! graph (`transpile::graph`) into straight-line, branch-free, fully-typed
 //! lane code, and `Line` is the stream it fills: one `Let` per bound node,
 //! `Raw` for structure. `trace::emit::lower_frame` builds an `Emit::bare`
-//! around the tracer's graph, `trace::kernel::render` assembles the lines
-//! into the checked-in per-shape kernels, one crate per room
-//! (`crates/celeste-kernels-room00/src/traced/` etc., aggregated by
-//! `crates/celeste-kernels`).
+//! around the tracer's graph. The Rust-source renderer that used to turn
+//! the line stream into checked-in per-room kernel crates is gone with
+//! those crates (2026-08-29, plans/asm-and-posgraph-execution.md B); what
+//! survives of `Emit` is the SPECIALIZED graph and the per-variant roots,
+//! which `trace::emit::asm_fused` hands to the ASM backend
+//! (`compiled::asm_kernel`). `body` is still filled - the analysis probes
+//! and diagnostics size a lowering by it.
 //!
 //! Every value has a static class - emit-time constant, block-uniform
 //! scalar (computed once per block), or per-lane (16 rows per zmm) - and
@@ -26,10 +29,9 @@ use super::graph::{Graph, NodeId};
 
 /// One line of an emitted kernel body - and, for `Let`, one NODE of the
 /// member's pure expression graph (plans/shape-tag-plan.md step 2b). The
-/// bindings are kept structured rather than streamed as text so
-/// `trace::kernel::render` can inspect them (`bd_v*` must be `false`, no
-/// fork loop may be open) before it assembles the checked-in kernels
-/// (`traced_kernels_are_current` is the gate on that).
+/// bindings are kept structured rather than streamed as text; nothing
+/// renders them to Rust any more, but the probes still inspect and count
+/// them.
 #[derive(Clone, Debug)]
 pub enum Line {
     /// A structural or effect statement: row-input loads, `zguard`/`*bd`
@@ -43,23 +45,6 @@ pub enum Line {
         ty: &'static str,
         expr: String,
     },
-}
-
-pub(crate) fn render_lines(lines: &[Line]) -> String {
-    let mut out = String::new();
-    for line in lines {
-        match line {
-            Line::Raw(s) => {
-                out.push_str("    ");
-                out.push_str(s);
-                out.push('\n');
-            }
-            Line::Let { name, ty, expr } => {
-                out.push_str(&format!("    let {}: {} = {};\n", name, ty, expr));
-            }
-        }
-    }
-    out
 }
 
 pub(crate) struct Emit {
@@ -141,16 +126,16 @@ pub(crate) struct OutField {
     pub(crate) konst: Option<String>,
     /// Set when `Rt2::boundary` WIDENS this cell to a UNIFORM value at level
     /// 0 (rem -> the [-0.5, 0.5) interval, a timer -> 0). The kernel key must
-    /// then contribute the WIDENED value from the constant `KPART` prefix, not
+    /// then contribute the WIDENED value from the constant key prefix, not
     /// the raw per-lane value - so the field is EXCLUDED from the per-lane
-    /// fold (`transpile::lower`) and added to `KPART` with this value
-    /// (`trace::kernel::outcome_part`). Without it `mix64(KPART+h)` differs
-    /// from `b.row_keys` and the Option-1 probe misses.
+    /// fold (`transpile::lower`). Without it the folded key differs from
+    /// `b.row_keys` and the key gate misses.
     pub(crate) widen_uniform: Option<celeste_engine::runtime2::AV>,
     /// The konst field's VALUE as an `AV` (mirrors `konst`, which is the code
-    /// string). `outcome_part` folds THIS into KPART - `structure_of`'s rt2
-    /// leaves some konst cells `Nil`, so keying by rt2 there is wrong; the acc
-    /// (and thus the boundary) uses this value.
+    /// string). The ASM backend's acc template writes THIS as the column's
+    /// uniform value - `structure_of`'s rt2 leaves some konst cells `Nil`,
+    /// so keying by rt2 there is wrong; the acc (and thus the boundary)
+    /// uses this value.
     pub(crate) konst_av: Option<celeste_engine::runtime2::AV>,
 }
 

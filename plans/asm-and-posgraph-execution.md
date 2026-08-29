@@ -81,15 +81,15 @@ to pure reference. Gates: `asm_kernels_reproduce_the_interpreter` (+ ladder /
 exact variants), `every_start_room_kernel_graph_asm_compiles_the_fused_graph`,
 plus the per-op bit-exact unit tests in `transpile::asm::tests`.
 
-REMAINING (follow-up, not blocking): the emitter cluster in
-`trace::kernel` (`render`, `write_room_kernels*`, `write_lattice_set`,
-`merge_kernel_sets`, `merged_mod_rs`, ...) is now pub-but-uncalled dead code
-(`render` is still exercised by `verify::the_kernel_emitter_lowers_a_traced_graph`).
-Deleting it is ~1.2k lines laced with format-string brace soup - do it
-carefully, and delete that verify test with it. Also: CLAUDE.md /
-BENCHMARK_DATA still describe the generated-kernel + regen workflow and need
-a pass. And measure the ASM runtime slowdown vs the old Rust kernels
-(tolerated up to ~1.3x) + the startup retrace cost.
+REMAINING follow-ups, resolved 2026-08-29: the vestigial emitter cluster in
+`trace::kernel` (`render`, `typecheck_rendered`, `write_room_kernels*`,
+`write_lattice_set`, `merge_kernel_sets`, `merged_mod_rs`, the render-only
+helpers) is DELETED, along with `verify::the_kernel_emitter_lowers_a_traced_graph`
+and the render-only `Variant`/`VarOut` fields (`Lowered.body`/`variants`
+stay - the `#[ignore]` diagnostics read them); CLAUDE.md and
+BENCHMARK_DATA.md got their generated-kernel/regen pass. STILL OPEN:
+measure the ASM runtime slowdown vs the old Rust kernels (tolerated up to
+~1.3x) + the startup retrace cost.
 
 ### Earlier progress notes 2026-08-29
 

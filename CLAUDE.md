@@ -106,7 +106,7 @@ habit. Measured 2026-08-22, after the crate split:
 | "does the whole suite still pass" | `cargo nextest run --cargo-profile quick` | **47 s** build + run |
 | the pre-commit run | `cargo nextest run --cargo-profile quick` | **47 s**, same as above |
 | anything you will quote a NUMBER from | `--release` | ~110 s build + run |
-| deliberately re-checking the generated files / recipes | `--cargo-profile quick --run-ignored all` | ~6 min |
+| deliberately running the `#[ignore]`d tests (pm1 key walk, diagnostics) | `--cargo-profile quick --run-ignored all` | ~6 min |
 
 **Never use `--release` for unit tests.** This is the actual trap. The
 release profile is `lto = "fat"` + `codegen-units = 1`, so a one-line edit
@@ -114,23 +114,21 @@ relinks the whole workspace - ~100 s to run a test that EXECUTES in 6 ms.
 I did this repeatedly on 2026-08-22 before noticing. `[profile.quick]`
 exists for when a test genuinely needs optimization (the compute-bound
 ones: `traced_kernels_reproduce_the_interpreter`,
-`shape_variant_dispatch_reproduces_the_baseline`,
-`traced_kernels_are_current`).
+`asm_kernels_reproduce_the_interpreter` and its ladder/exact variants,
+`shape_variant_dispatch_reproduces_the_baseline`).
 
 Do NOT run the full suite in plain debug: those same tests are
 compute-bound (`compiled_forward_reproduces_the_interpreter`, since
 deleted, went 20 s -> 153 s). Debug wins
 when a filter keeps them out; `--cargo-profile quick` wins when it cannot.
 
-**Tools get `--profile quick`, not `--release`.** `transpile` prints text;
-no number anyone quotes comes out of it, so fat LTO buys nothing. 15 s to
-build under quick against ~78 s under release, for a generator that runs
-24.6 s instead of 22.3 s. `regen-generated.sh` uses quick throughout and
-no longer refreshes `target/release` - build that yourself before
-benchmarking. (I wrote the rule below and then immediately reached for
-`--release` to build `transpile`, because it is genuinely too slow in
-debug. "Too slow in debug" argues for OPTIMIZATION, not for the gate's
-profile.)
+**Tools get `--profile quick`, not `--release`.** `transpile` (now just
+the analysis probes: `--room-consts`, `--spec-probe`) prints text; no
+number anyone quotes comes out of it, so fat LTO buys nothing. 15 s to
+build under quick against ~78 s under release. (I wrote the rule below
+and then immediately reached for `--release` to build `transpile`,
+because it is genuinely too slow in debug. "Too slow in debug" argues
+for OPTIMIZATION, not for the gate's profile.)
 
 **`--release` is for the gate and for benchmarks only.** Every number in
 BENCHMARK_DATA.md was measured under it. Never make `[profile.release]`
@@ -158,11 +156,6 @@ result. Add a profile instead.
 - **`touch` the file you care about** to measure what an edit really
   costs: `touch src/transpile/lower.rs && time cargo nextest run transpile`.
   Guessing at build cost is how the stale table this replaced survived.
-- **`./regen-generated.sh`** is a quick build of `transpile`, ONE
-  generation job (the traced set, `--room-kernels`) and a quick
-  workspace build to prove the result compiles; no release build. It
-  used to be ~2 min for nine jobs; the other eight went with the walk
-  kernels.
 
 **The pre-commit run is `--cargo-profile quick`, and it does NOT include
 the ignored tests.** `--release` is for numbers only; gating correctness
@@ -173,8 +166,10 @@ three lines above.
 The slow test that is `#[ignore]`d is
 `every_reachable_pm1_key_gets_its_own_body` (~240 s).
 (`every_checked_in_recipe_replays` went with the rewrite rules,
-`generated_is_current{,_r20}` with the walk kernels - their successor
-`traced_kernels_are_current` is ~8 s and NOT ignored.) `#[ignore]` over an
+`generated_is_current{,_r20}` with the walk kernels, and the
+`*_kernels_are_current` staleness gates with the generated kernel crates
+themselves, 2026-08-29 - there is no checked-in artifact left to go
+stale.) `#[ignore]` over an
 env check on purpose: nextest prints them as skipped, so the skip is
 visible rather than silent.
 
@@ -183,14 +178,11 @@ visible rather than silent.
 back to it is lower than paying that on every commit. Run them when you
 have a REASON to think they will fire:
 
-- touched an emitter or anything feeding the traced kernels ->
-  `traced_kernels_are_current` runs on every commit, but READ ITS DIFF
-  after `./regen-generated.sh` (its predecessor `generated_is_current`
-  caught a real stale-kernel commit, `a8f4635`), and run the
-  `#[ignore]`d `room00_kernels_are_current` /
-  `room20_kernels_are_current` (the fast gates only regenerate room
-  (1,0); the fingerprint check catches hand-edits to the other rooms
-  but not generator drift there);
+- touched the tracer, the lowering, or the ASM codegen -> nothing extra:
+  the `asm_kernels_reproduce_the_interpreter` gates (+ ladder/exact) and
+  `every_start_room_kernel_graph_asm_compiles_the_fused_graph` already
+  run on every commit, and there is no staleness gate to run by hand
+  because the kernels are assembled at startup, not checked in;
 - touched the tracer's pinning or key walk ->
   `every_reachable_pm1_key_gets_its_own_body`.
 
@@ -249,75 +241,54 @@ re-check that the parallel path stays byte-identical to the serial one.
 
 ## Crate layout
 
-> **STALE AS OF 2026-08-29 — the generated Rust kernels are DELETED.** The
-> AVX-512 ASM backend (`src/compiled/asm_kernel.rs`) replaced them: it
-> retraces `start_room()` at startup, assembles each shape's FUSED graph
-> (`trace::emit::asm_fused` -> `lower::specialize_frame` -> `transpile::asm`,
-> gcc + dlopen), and dispatches chunks to it — gated against the interpreter
-> on all three sets (`asm_kernels_reproduce_the_interpreter` + ladder/exact).
-> The `celeste-kernels{,-room00,-room10,-room20}` crates, `traced-kernel-check`,
-> `regen-generated.sh`, `check-traced-kernel.sh`, and the
-> `*_kernels_are_current` gates are GONE. `CELESTE_NO_ASM_KERNELS` opts back
-> to pure reference. The `trace::kernel` emitter (`render`, `write_room_kernels*`)
-> is now vestigial dead code pending a cleanup pass. Everything below about
-> "the generated files are CHECKED IN" / one-crate-per-room / regen is
-> HISTORICAL. See `plans/asm-and-posgraph-execution.md`.
-
 A cargo workspace since 2026-08-18 (task #150). The dependency order is
 load-bearing, not cosmetic:
 
 ```
 crates/celeste-core      pico8_num, cart_data, collision_cache   deps: -
-crates/celeste-names     GENERATED name tables                   deps: -
+crates/celeste-names     FROZEN name tables                      deps: -
 crates/celeste-ir        ir, frontend (Lua -> IR), builtins,     deps: core
                          print
 crates/celeste-interp    the INTERPRETER (the oracle),           deps: core, ir
                          game_runner, its instrumentation
 crates/celeste-engine    Rt2 block model, boundary/dedup/merge,  deps: core, names
                          row keys, kernel.rs lane primitives
-crates/celeste-kernels-room00  GENERATED room (0,0) kernels       deps: core, engine
-crates/celeste-kernels-room10  GENERATED room (1,0) kernels       deps: core, engine
-crates/celeste-kernels-room20  GENERATED room (2,0) kernels       deps: core, engine
-crates/celeste-kernels   THIN AGGREGATOR of the three room crates deps: engine, the
-                         (SETS/FINGERPRINT per variant)               3 room crates
 .  (celeste-rust)        search driver, program assembly,        deps: all
-                         AST tracer, transpile emitters,
+                         AST tracer, graph lowering, the ASM
+                         assembler + runtime kernel registry,
                          compiled dispatch, campaign bins
 native-probe             bench/gate binary for the engine        deps: all
 ```
 
-The kernel crate is split ONE PER ROOM (task: split celeste-kernels for
-dev-loop compile time) so that touching one room's generated kernels
-only recompiles that room's crate: before the split the three rooms'
-generated code (~900k lines) was ONE compilation unit, so a one-line
-edit to a room (2,0) kernel forced a full relink of room (0,0) and
-(1,0) too. `crates/celeste-kernels` is now a thin aggregator that
-re-exports each room crate's `traced`/`ladder`/`exact::room<xy>` module
-and assembles `SETS`/`FINGERPRINT` from them - the public API
-(`celeste_kernels::{traced,ladder,exact}::{SETS,FINGERPRINT,room00,
-room10,room20}`) is unchanged, so every consumer (the dispatcher,
-`native-probe`, `traced-kernel-check`) still just depends on
-`celeste-kernels`.
+There used to be four more crates here: `celeste-kernels` plus one
+GENERATED kernel crate per room (~923k lines between them). They were
+deleted 2026-08-29 (`d027f7e`, plans/asm-and-posgraph-execution.md B)
+when the AVX-512 ASM backend (`compiled::asm_kernel`) became the
+engine's kernel implementation - the kernels are now assembled at
+startup, so there is nothing generated to check in, split, aggregate,
+or keep current.
 
-The split is HALF DONE (plans/tracing.md stage 1). The 38k lines of
-rewrite rules that used to be the next thing to extract are DELETED
-(`plans/deletion.md`); what is left in `celeste-rust` is laid out as:
+The 38k lines of rewrite rules that used to be the next thing to
+extract are DELETED (`plans/deletion.md`); what is left in
+`celeste-rust` is laid out as:
 
 ```
 src/program/   Program assembly, recipes, and the frozen artifacts
 src/search/    the abstract forward search: run, differential, checkpoint,
                sweep, sweep_time, pos_graph, state_mapping
 src/trace/     the AST tracer (Lua -> transpile::graph::Graph)
-src/transpile/ the emitters and the graph IR
-src/compiled/  FrameEngine dispatch and the State <-> block bridge
+src/transpile/ the graph IR, the lowering, and the ASM assembler
+               (transpile::asm)
+src/compiled/  FrameEngine dispatch, the ASM kernel registry
+               (compiled::asm_kernel), and the State <-> block bridge
 ```
 
 `src/search` was called `src/rewrite` until 2026-08-23, which was a lie by
 then - only the `program` half was ever about rewriting.
 
 One frame of the abstract search is `celeste_rust::compiled::FrameEngine`
-`::step` - `(shape, rows) -> [(shape, rows)]`, the generated traced kernels
-where they bind and the interpreter where they do not. It lives in
+`::step` - `(shape, rows) -> [(shape, rows)]`, the runtime-assembled ASM
+kernels where they bind and the interpreter where they do not. It lives in
 celeste-rust so both the forward search and the backward sweep can call it;
 `compiled::bridge` is the `State` <-> block translation and is the only
 module that names both.
@@ -327,58 +298,55 @@ frame body, and `CELESTE_COMPILED_FORWARD=1` puts it there. **Default
 OFF, but the right setting is PER ROOM, by measurement** (2026-08-20,
 BENCHMARK_DATA.md "Engine adoption validation at depth"): on room (1,0)
 at the production horizon (f094) the compiled+fused engine is -23% wall
-/ -40% peak with all 94 per-frame rowkey sets identical. (The old room
-(0,0) "4x SLOWER" number was measured when no kernel bound there - the
-kernels were room (1,0) shapes; since 2026-08-26 every set carries rooms
-(0,0), (1,0) and (2,0), and that number needs remeasuring.) The engine's
-identity (the active set's content hash) is hashed into the campaign
-fingerprint when it is on, so engines never share checkpoints. The
-kernel sets are the CONSTANT-LATTICE sets,
-`celeste_kernels::{traced,ladder,exact}` (generated one crate per room,
-`crates/celeste-kernels-room{00,10,20}`, aggregated by
-`crates/celeste-kernels`), in ONE binary with
-no cargo features: the per-class "walk" kernels and the `fused` artifact
-were deleted 2026-08-25 (plans/delete-the-interpreter.md Phase 1) after
-the traced set took every lane at f94 (BENCHMARK_DATA.md 2026-08-24:
-missed 0, plain-routed 0), and the non-lattice sets were replaced by the
-lattice-specialized ones 2026-08-26 (plans/specialize.md). When the
-engine is on, a missed chunk is FATAL by default
+/ -40% peak with all 94 per-frame rowkey sets identical. (Both numbers
+predate the ASM cutover - they were measured against the generated Rust
+kernels, and the old room (0,0) "4x SLOWER" number was measured when no
+kernel bound there at all. Remeasure under `compiled::asm_kernel`
+before quoting either.) The engine's identity
+(`asm_kernel::engine_fingerprint`, a content hash over the assembled
+set) is hashed into the campaign fingerprint when it is on, so engines
+never share checkpoints. The kernel backend is `compiled::asm_kernel`:
+one binary, no cargo features, no checked-in kernel artifact - it
+retraces the start room's shapes at startup, specializes each on the
+CONSTANT LATTICE for the active precision mode (Level0 / ladder /
+exact, matching `dispatch::traced_mode`), and assembles the fused
+fork-free graph with gcc + dlopen. `CELESTE_NO_ASM_KERNELS` opts back
+to the pure reference engine (debugging only). The per-class "walk"
+kernels and the `fused` artifact were deleted 2026-08-25
+(plans/delete-the-interpreter.md Phase 1) after the traced set took
+every lane at f94 (BENCHMARK_DATA.md 2026-08-24: missed 0, plain-routed
+0); the non-lattice sets were replaced by the lattice-specialized ones
+2026-08-26 (plans/specialize.md); and the generated Rust kernel crates
+themselves went 2026-08-29 (plans/asm-and-posgraph-execution.md B).
+When the engine is on, a missed chunk is FATAL by default
 (`CELESTE_KERNEL_STRICT=0` opts back into the counted fall-through).
 `CELESTE_COMPILED_FORWARD=check` runs both engines and compares row-key
 sets per chunk; that is the gate, and also a test.
 
-The generated code is TWO crates because the engine reads
-`celeste_names::FIELD_NAMES` while the generated kernels read
-`celeste_engine::{Rt2, Col, AV}`; in one crate that is a cycle. Name
-tables below the engine, kernels above it.
-
 `celeste-rust` re-exports `pico8_num` / `cart_data` / `collision_cache` at
 its own root, so `celeste_rust::pico8_num::...` still resolves everywhere.
 
-### The generated files are CHECKED IN
+### There is NO checked-in kernel artifact
 
-`crates/celeste-kernels-room00/src/{traced,ladder,exact}/room00/`
-(and the `-room10`/`-room20` siblings) - the three CONSTANT-LATTICE
-kernel sets (base / rung-agnostic / exact-rem), one crate per generated
-room ((0,0), (1,0), (2,0)), each variant dir holding that room's
-`room<x><y>/` kernels plus a thin `mod.rs` wrapper. The AGGREGATOR,
-`crates/celeste-kernels/src/{traced,ladder,exact}/mod.rs`, `pub use`s
-every room crate's module and assembles the `SETS` table the dispatcher
-flattens, plus a `FINGERPRINT` that re-hashes every room's kernel
-sources regardless of which crate they live in (plans/specialize.md
-"Spec: latticeify everything"). Regenerate with:
+The kernels are assembled at startup: `compiled::asm_kernel::registry`
+retraces the configured start room (`trace::kernel::room_kernels_in`),
+fuses each shape's graph (`trace::emit::asm_fused` ->
+`lower::specialize_frame` - every fork resolved at compile time, one
+hash-consed arena), and `transpile::asm` assembles it with gcc + dlopen,
+one .so per shape, in milliseconds where rustc+LLVM took minutes over
+~900k generated lines. There is no regen step, no staleness gate, and
+no diff to read: what runs is always what the tracer produces from the
+Lua in this checkout. The set's content hash
+(`asm_kernel::engine_fingerprint`) goes into the campaign fingerprint,
+so two builds that assemble different kernels never share checkpoints.
+`CELESTE_NO_ASM_KERNELS` opts out to the pure reference engine, for
+debugging.
 
-```bash
-./regen-generated.sh     # then READ THE DIFF, then commit
-```
-
-`trace::kernel::tests::{traced,ladder,exact}_kernels_are_current` fail
-until you do (they regenerate room (1,0) and re-check every room's
-fingerprint; the `#[ignore]`d `room00_kernels_are_current` /
-`room20_kernels_are_current` regenerate the other rooms). Byte-for-byte,
-on purpose: a diff there is a change to what the kernels compute, and
-the gate on THAT is `traced_kernels_reproduce_the_interpreter` (plus the
-per-rung and per-room differentials) plus a
+The gates on what the kernels COMPUTE:
+`asm_kernels_reproduce_the_interpreter` (plus its ladder/exact
+variants), `every_start_room_kernel_graph_asm_compiles_the_fused_graph`
+(every start-room shape assembles and loads), the per-op bit-exact unit
+tests in `transpile::asm::tests`, and a
 `CELESTE_COMPILED_FORWARD=check` run.
 
 `crates/celeste-names/src/gen.rs` is FROZEN, not generated. Its generator
@@ -387,17 +355,6 @@ kernels; `FIELD_NAMES`' ORDER is the canonical field ordering the boundary
 hashes, so it feeds the shape hash, the row key, and what the search
 dedups on. A reordering is a different search. New names (only possible
 if the Lua changes) may be APPENDED by hand, never inserted.
-
-There is a bootstrap to know about: the emitter lives in `celeste-rust`,
-which depends on `celeste-kernels` and its three room crates, whose
-contents it produces. Change what the kernel emitter emits and the
-committed kernels stop compiling, which stops `cargo build --bin
-transpile` from building the tool that would fix them.
-`regen-generated.sh` avoids it by generating into a scratch dir and only
-installing what builds; if you get stuck anyway, `git checkout
-crates/celeste-kernels/src crates/celeste-kernels-room00/src
-crates/celeste-kernels-room10/src crates/celeste-kernels-room20/src`,
-build, regenerate.
 
 ## Useful entry points
 
