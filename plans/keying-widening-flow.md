@@ -405,3 +405,32 @@ already-widened kernel output (idempotent, guarded by the assert-noop).
 Dropping it is a further micro-opt - the big win is captured by the
 default flip - and it touches the proof-critical boundary across three
 parallel worker paths, so it is a separate, carefully-gated step.
+
+### Phase 3b (2026-08-29): the wrapper-widen drop is BLOCKED - kept for now
+
+Tried to drop `stream_boundary`'s redundant `split` + `make_state_abstract`
+on kernel output (skip it when `compiled && !deopt && strict &&
+kernel_output_is_prewidened`). It BROKE 5 gates with kernel COVERAGE GAPS,
+and the assert-noop guard (`CELESTE_KERNEL_WIDEN_NOOP=1`) fires 1 row at
+`ladder`-forced Bits(0) and under `strict=0`.
+
+Root cause: the in-graph widening finds the player via
+`objects_of_type(st, "player")`, but the SPAWN-animation state's player is
+not matched by that rule (the interpreter's `mark_heap` catches it via a
+different rule), so the graph UNDER-widens one field of the spawn state.
+The wrapper `make_state_abstract` fixes it, so:
+- WITH the wrapper (default flip): correct. The kernel's own `chunk_skip`
+  on the under-widened spawn key is CONSERVATIVE (an under-widened key is
+  not in the widened frontier, so it never wrongly drops a row - it keeps
+  more, and the wrapper subtracts correctly). Sound, all gates green.
+- WITHOUT the wrapper (the skip): the un-widened spawn state's SHAPE
+  differs from what the next frame's kernels were compiled for, so
+  dispatch misses -> coverage gap.
+
+So the wrapper is NOT purely redundant: it is load-bearing for the ~24
+spawn frames the graph widening does not cover. Dropping it needs the
+in-graph widening to match `mark_heap`'s player rule (cover the spawn
+player), which is a separate change. Reverted the skip; kept the default
+flip (the -37%/-27% win, which does not depend on it). The wrapper's cost
+on the reduced row set is small (it is the row REDUCTION, not the second
+widen, that the -37% comes from).
