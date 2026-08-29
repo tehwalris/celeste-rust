@@ -92,6 +92,21 @@ pub(crate) fn kernel_strict() -> bool {
     *ON.get_or_init(|| std::env::var("CELESTE_KERNEL_STRICT").map_or(true, |v| v != "0"))
 }
 
+/// Whether the ladder (`Level0Agnostic`) kernel set bakes the rem rung
+/// widening into the graph (`WalkOpts::LADDER_WIDEN`, `WidenMode::RemRung`)
+/// instead of emitting exact rows and leaving the rung widening to the
+/// campaign boundary. Phase 1 of moving the ladder widening into the
+/// graph (plans/keying-widening-flow.md): OFF by default, opt-in via
+/// `CELESTE_WIDEN_IN_GRAPH=1`, so the production path is byte-unchanged
+/// until the gates are green. Rung-SPECIFIC when on, so the process must
+/// not change rem precision after the registry is built (the OnceLock
+/// caches one rung's kernels) - the in-process ladder is not yet
+/// supported here.
+pub(crate) fn widen_in_graph() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CELESTE_WIDEN_IN_GRAPH").map_or(false, |v| v != "0"))
+}
+
 /// A one-line miss summary for the strict-mode abort: how many lanes the
 /// ASM kernels could not serve (a shape with no assembled kernel, or a
 /// declined lane). The ASM path does not categorize by refusal step.

@@ -682,7 +682,18 @@ pub(crate) fn registry() -> Option<&'static Registry> {
         use crate::trace::shapes::WalkOpts;
         let (opts, exact) = match super::dispatch::traced_mode() {
             super::dispatch::TracedMode::Level0 => (WalkOpts::LEVEL0, false),
-            super::dispatch::TracedMode::Level0Agnostic => (WalkOpts::LADDER, true),
+            super::dispatch::TracedMode::Level0Agnostic => {
+                // Phase 1: the opt-in rung-specific variant bakes the rem
+                // widening into the graph (`LADDER_WIDEN`), still through
+                // `boundary_exact` (it emits the widened rem and keys the
+                // emitted field). Default `LADDER` is unchanged.
+                let opts = if super::dispatch::widen_in_graph() {
+                    WalkOpts::LADDER_WIDEN
+                } else {
+                    WalkOpts::LADDER
+                };
+                (opts, true)
+            }
             super::dispatch::TracedMode::ExactRem => (WalkOpts::EXACT, true),
         };
         let built = std::thread::Builder::new()
@@ -737,9 +748,20 @@ pub(crate) fn engine_fingerprint() -> u64 {
             .stack_size(256 * 1024 * 1024)
             .spawn(move || {
                 let mut acc: u64 = 0xa500_f16e_1230_0001;
+                // Phase 1: when the ladder set bakes the rem widening into
+                // the graph, its assembled compute differs, so the
+                // fingerprint must move - two builds that assemble
+                // different kernels must never share checkpoints. Swap the
+                // ladder opts AND fold a distinct tag so the change is
+                // unambiguous.
+                let (ladder_opts, ladder_tag) = if super::dispatch::widen_in_graph() {
+                    (WalkOpts::LADDER_WIDEN, 0x2000u64)
+                } else {
+                    (WalkOpts::LADDER, 2u64)
+                };
                 for (tag, opts) in [
                     (1u64, WalkOpts::LEVEL0),
-                    (2, WalkOpts::LADDER),
+                    (ladder_tag, ladder_opts),
                     (3, WalkOpts::EXACT),
                 ] {
                     let refs = crate::trace::kernel::lattice_kernel_refs(Path::new(&root), opts)

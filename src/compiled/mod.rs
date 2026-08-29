@@ -831,7 +831,7 @@ impl FrameEngine {
     /// Splitting on `freeze` up front is what keeps the kernels' premise of
     /// a class-uniform chunk true - the update-side freeze gate is a real
     /// per-lane branch (pm1's precedent).
-    fn partition_chunks(&self, blocks: Vec<runtime2::Rt2>, chunk_rows: usize) -> Vec<runtime2::Rt2> {
+    pub(crate) fn partition_chunks(&self, blocks: Vec<runtime2::Rt2>, chunk_rows: usize) -> Vec<runtime2::Rt2> {
         let mut pending = Vec::new();
         for block in blocks {
             let freeze_cell = block.globals[self.g_freeze as usize];

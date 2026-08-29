@@ -636,6 +636,214 @@ mod tests {
         assert_eq!(crate::compiled::dispatch::missed_lanes(), 0, "ASM exact missed lanes");
     }
 
+    /// The A-vs-B differential (plans/keying-widening-flow.md, Phase 1):
+    /// the rung-agnostic ladder kernel (A, exact rem) widened EXTERNALLY
+    /// equals the widen-in-graph kernel (B, `LADDER_WIDEN`) - after dedup,
+    /// per frame, at Bits(2). A and B share the exact same frame compute,
+    /// so any difference is purely the rem widening: A applies
+    /// `make_state_abstract_rem` to its exact rows; B bakes the bucket
+    /// fork + snap into the graph. This is the gate that catches
+    /// "widened DIFFERENTLY" - a wrong bucket, a widened-wrong axis, a
+    /// key computed on the wrong value. The value-level
+    /// `rem_bucket_node_*` tests cover the arithmetic; this covers the
+    /// WIRING into the real start-room graphs.
+    ///
+    /// Built directly (not through the process-global registry, which
+    /// caches one set), both on a big stack. `CELESTE_ASM_NO_SKIP` turns
+    /// off the per-chunk frontier / within-frame drop so both sides emit
+    /// their FULL row set and the comparison is symmetric; the HashSet
+    /// dedups cross-chunk repeats. Bits(2), spd Exact, so the only
+    /// abstraction in play is the rem rung.
+    ///
+    /// Two registries + gcc, so slower than the single-set gates. It runs
+    /// to frame 26 - the first rem fork is frame 25 (see the Bits(1)
+    /// gate), so the fork path IS exercised.
+    #[test]
+    fn asm_kernel_a_vs_b_isolate_the_rem_widening_at_bits2() {
+        use crate::compiled::asm_kernel::Registry;
+        use crate::compiled::bridge;
+        use crate::interpreter::abstraction::{
+            make_state_abstract_rem, split_precision_straddles, rem_precision_from_env,
+            RemPrecision,
+        };
+        use crate::interpreter::state::State;
+        use crate::trace::shapes::WalkOpts;
+        use std::collections::HashSet;
+        use std::path::Path;
+
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        // Bits(2), spd Exact (default). Full emit on both sides.
+        std::env::set_var("CELESTE_REM_BITS", "2");
+        std::env::set_var("CELESTE_ASM_NO_SKIP", "1");
+        assert_eq!(
+            rem_precision_from_env(),
+            RemPrecision::Bits(2),
+            "the precision env was read before this test set it"
+        );
+
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+        let engine = crate::compiled::FrameEngine::new_for_start_room(&program).expect("engine");
+        let ids = engine.ids();
+
+        // Build A (exact rem) and B (widen-in-graph) directly, big stack.
+        let (reg_a, reg_b): (Registry, Registry) = std::thread::Builder::new()
+            .stack_size(512 * 1024 * 1024)
+            .spawn(|| {
+                let root = Path::new(".");
+                let a = Registry::build_for_start_room(root, WalkOpts::LADDER, true)
+                    .expect("build A (LADDER)");
+                let b = Registry::build_for_start_room(root, WalkOpts::LADDER_WIDEN, true)
+                    .expect("build B (LADDER_WIDEN)");
+                (a, b)
+            })
+            .expect("spawn builder")
+            .join()
+            .expect("builder panicked");
+
+        let key_a = |s: State| -> Vec<(u64, u64)> {
+            // A emits EXACT rem: split into per-bucket lanes, then widen
+            // each - the campaign boundary's own rem abstraction.
+            let mut ks = Vec::new();
+            for st in split_precision_straddles(s) {
+                let w = make_state_abstract_rem(st, RemPrecision::Bits(2));
+                ks.extend(crate::search::sweep::row_keys(&w).expect("row_keys A"));
+            }
+            ks
+        };
+        let key_b = |s: State| -> Vec<(u64, u64)> {
+            // B already emitted the widened rem; split is a no-op on a
+            // single bucket. Key as-is - the value B stores.
+            let mut ks = Vec::new();
+            for st in split_precision_straddles(s) {
+                ks.extend(crate::search::sweep::row_keys(&st).expect("row_keys B"));
+            }
+            ks
+        };
+
+        let frames = 26;
+        let mut run = AbstractRun::start(&program).expect("start");
+        let mut covered_any = false;
+        for frame in 1..=frames {
+            let inputs: Vec<State> = run.states().to_vec();
+            let mut x: HashSet<(u64, u64)> = HashSet::new();
+            let mut y: HashSet<(u64, u64)> = HashSet::new();
+            for st in &inputs {
+                if st.vector_size == 0 {
+                    continue;
+                }
+                let block = bridge::import_block(st, engine.cart(), engine.cache());
+                for chunk in engine.partition_chunks(vec![block], 1 << 20) {
+                    let mut done_a = Vec::new();
+                    let ok_a = reg_a.run_chunk(&chunk, ids, &mut done_a);
+                    let mut done_b = Vec::new();
+                    let ok_b = reg_b.run_chunk(&chunk, ids, &mut done_b);
+                    assert_eq!(
+                        ok_a, ok_b,
+                        "frame {}: A and B disagree on chunk coverage (shape {:#018x})",
+                        frame, chunk.shape_hash
+                    );
+                    if !ok_a {
+                        continue;
+                    }
+                    covered_any = true;
+                    for blk in &done_a {
+                        x.extend(key_a(bridge::export_block(blk)));
+                    }
+                    for blk in &done_b {
+                        y.extend(key_b(bridge::export_block(blk)));
+                    }
+                }
+            }
+            assert_eq!(
+                x, y,
+                "frame {}: A(exact + external rem widen) != B(in-graph rem widen): \
+                 {} A-only, {} B-only",
+                frame,
+                x.difference(&y).count(),
+                y.difference(&x).count(),
+            );
+            if frame < frames {
+                run.step().unwrap_or_else(|e| panic!("frame {} step: {:#}", frame, e));
+            }
+        }
+        assert!(
+            covered_any,
+            "no chunk ever bound both kernels - the A-vs-B gate checked nothing"
+        );
+    }
+
+    /// Node-count de-risk (plans/keying-widening-flow.md, Phase 1a):
+    /// baking the rem widening into the graph (`LADDER_WIDEN`) must be
+    /// CHEAP - the hypothesis is that fusion + hash-consing share the rem
+    /// fork with the frame's existing arithmetic, so the fused graphs
+    /// grow by a small handful of nodes per shape, not a multiple. If this
+    /// ever regresses (a widening that duplicates a large downstream cone
+    /// per fork configuration), the assertion fires before the change goes
+    /// wider. Prints the per-set totals so the number is on the record.
+    #[test]
+    fn widen_in_graph_is_cheap_in_nodes_at_bits2() {
+        use crate::transpile::graph::Room;
+        use crate::trace::shapes::WalkOpts;
+        use std::path::Path;
+
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+        {
+            return;
+        }
+        std::env::set_var("CELESTE_REM_BITS", "2");
+
+        let total = |opts: WalkOpts| -> (usize, usize) {
+            std::thread::Builder::new()
+                .stack_size(512 * 1024 * 1024)
+                .spawn(move || {
+                    let refs = crate::trace::kernel::lattice_kernel_refs(Path::new("."), opts)
+                        .expect("retrace");
+                    let mut nodes = 0usize;
+                    for r in &refs {
+                        let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
+                        let (fused, _, _, _) =
+                            crate::trace::emit::asm_fused(&r.bound, Some(&room), true)
+                                .expect("fuse");
+                        nodes += fused.len();
+                    }
+                    (refs.len(), nodes)
+                })
+                .expect("spawn")
+                .join()
+                .expect("panicked")
+        };
+
+        let (shapes_a, nodes_a) = total(WalkOpts::LADDER);
+        let (shapes_b, nodes_b) = total(WalkOpts::LADDER_WIDEN);
+        eprintln!(
+            "[widen-nodes] LADDER: {} shapes, {} fused nodes; \
+             LADDER_WIDEN: {} shapes, {} fused nodes ({:+.1}%)",
+            shapes_a,
+            nodes_a,
+            shapes_b,
+            nodes_b,
+            100.0 * (nodes_b as f64 - nodes_a as f64) / nodes_a as f64,
+        );
+        assert_eq!(shapes_a, shapes_b, "the two sets cover different shape counts");
+        // Fusion + hash-consing keep it cheap: a small multiple, not a
+        // large one. If this fires, the rem fork stopped sharing with the
+        // frame's arithmetic - measure before going wider.
+        assert!(
+            nodes_b < nodes_a + nodes_a / 2,
+            "widen-in-graph grew the fused node count by more than 50% ({} -> {})",
+            nodes_a,
+            nodes_b
+        );
+    }
+
     /// The kernel-driven LADDER gate (plans/kernel-ladder.md): at rem
     /// rung Bits(1), the RUNG-AGNOSTIC kernel set reproduces the
     /// interpreter's row sets, per chunk, at the rung's own abstraction.

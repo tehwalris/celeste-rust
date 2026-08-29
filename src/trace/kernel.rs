@@ -92,7 +92,7 @@ pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
         roots.push(vec![iface::key(g)]);
     }
     let pin = pm1_key(&player, &st, &it.d)?;
-    let frame = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &[], false)?;
+    let frame = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &[], None)?;
 
     let graph = std::mem::take(&mut it.d.graph);
     let bound = super::emit::bind(&frame, &graph, true)?;
@@ -1343,12 +1343,12 @@ pub fn specialize_probe(
     }
 
     // Base: same shape, NO pins.
-    let base = trace_frame(&mut it, &reset, &fr, st.clone(), &roots, &[], &ival, true)
+    let base = trace_frame(&mut it, &reset, &fr, st.clone(), &roots, &[], &ival, Some(crate::trace::widen::WidenMode::Level0))
         .map_err(|e| anyhow!("base trace of shape {}: {:#}", shape_idx, e))?;
     let (bn, bf, _) = measure(&it.d.graph, &base);
 
     // Pinned.
-    let f = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, true)
+    let f = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, Some(crate::trace::widen::WidenMode::Level0))
         .map_err(|e| anyhow!("pinned trace of shape {}: {:#}", shape_idx, e))?;
     let (pn, pf, ptop) = measure(&it.d.graph, &f);
 
@@ -1504,7 +1504,7 @@ pub fn room_constant_lattice(
             .filter(|(p, _)| roots.iter().any(|r| r == *p))
             .map(|(p, c)| (p.clone(), *c))
             .collect();
-        let f = match trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, opts.widen) {
+        let f = match trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, opts.widen_mode()) {
             Ok(f) => f,
             Err(e) => {
                 // Remember the refusal instead of silently skipping: a

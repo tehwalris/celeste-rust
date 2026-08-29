@@ -647,6 +647,18 @@ impl<'a> Lower<'a> {
         self.qbin_comm(op, tag, Src::Reg(a), b)
     }
 
+    /// The raw value of `id` if it is a positive constant scalar (a
+    /// degenerate `Op::Const(v, v)` with `v > 0`) - the only scalar an
+    /// interval scale/divide is monotone by. Used to gate the interval
+    /// `Mul`/`Div` paths, matching `graph.eval`'s exact-positive-scalar
+    /// requirement.
+    fn pos_const_scalar(&self, id: NodeId) -> Option<i32> {
+        match self.g.get(id).op {
+            Op::Const(lo, hi) if lo == hi && lo > 0 => Some(lo),
+            _ => None,
+        }
+    }
+
     fn as_num(&self, id: NodeId) -> Result<NumVal> {
         match self.vals[id as usize] {
             Some(Value::Num(n)) => Ok(n),
@@ -768,10 +780,66 @@ impl<'a> Lower<'a> {
                 Value::Num(NumVal::Reg(dst))
             }
             Op::Mul => {
-                let x = self.as_num(a[0])?;
-                let y = self.as_num(a[1])?;
-                let (xr, yr) = (self.num_reg(x), self.num_reg(y));
-                Value::Num(NumVal::Reg(self.zn_mul(xr, yr)))
+                // Interval * positive-constant scalar: scale each endpoint
+                // (monotone), matching `Pico8NumInterval::scale_positive`
+                // and `graph.eval`. The rem-rung widening
+                // (`trace::widen::rem_bucket_node`) is the only source; a
+                // frame never multiplies an interval otherwise.
+                if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
+                    let (ivn, scn) = if self.dom(a[0]) == 2 { (a[0], a[1]) } else { (a[1], a[0]) };
+                    if self.dom(scn) == 2 {
+                        bail!("node {}: Mul of two intervals is not modelled", id);
+                    }
+                    if self.pos_const_scalar(scn).is_none() {
+                        bail!(
+                            "node {}: interval Mul by a non-positive / non-constant scalar \
+                             is not modelled",
+                            id
+                        );
+                    }
+                    let iv = self.as_ival(ivn)?;
+                    let ar = self.ival_regs(iv);
+                    let s = self.as_num(scn)?;
+                    let sreg = self.num_reg(s);
+                    let lo = self.zn_mul(ar[0], sreg);
+                    let hi = self.zn_mul(ar[1], sreg);
+                    Value::Ival([NumVal::Reg(lo), NumVal::Reg(hi)])
+                } else {
+                    let x = self.as_num(a[0])?;
+                    let y = self.as_num(a[1])?;
+                    let (xr, yr) = (self.num_reg(x), self.num_reg(y));
+                    Value::Num(NumVal::Reg(self.zn_mul(xr, yr)))
+                }
+            }
+            // Interval / positive-constant scalar: divide each endpoint
+            // (monotone, truncating like the scalar `Div`), matching
+            // `Pico8NumInterval::div_positive` and `graph.eval`. Placed
+            // before the scalar `Op::Div` Call arm below, which only reads
+            // `as_num`. Source: `rem_bucket_node`'s `old / 2^-k` scale.
+            Op::Div if self.dom(a[0]) == 2 => {
+                if self.pos_const_scalar(a[1]).is_none() {
+                    bail!(
+                        "node {}: interval Div by a non-positive / non-constant scalar \
+                         is not modelled",
+                        id
+                    );
+                }
+                let iv = self.as_ival(a[0])?;
+                let ar = self.ival_regs(iv);
+                let s = self.as_num(a[1])?;
+                let sreg = self.num_reg(s);
+                let mut ends = [ar[0]; 2];
+                for (k, &e) in ar.iter().enumerate() {
+                    let dst = self.fresh();
+                    self.insts.push(Inst::Call {
+                        op: CallOp::Div,
+                        dst,
+                        args: vec![e, sreg],
+                        scalars: Vec::new(),
+                    });
+                    ends[k] = dst;
+                }
+                Value::Ival([NumVal::Reg(ends[0]), NumVal::Reg(ends[1])])
             }
             Op::Neg => {
                 if self.dom(a[0]) == 2 {

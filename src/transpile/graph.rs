@@ -789,6 +789,15 @@ impl Graph {
         self.eval_inner(cells, false, false, Some(room))
     }
 
+    /// `eval_narrow_top_in` WITHOUT a room: forks resolved via `Frag`
+    /// (narrowing), any node the evaluator cannot model (`SplitOk`,
+    /// `Mget`, `TileFlagAt`) becomes TOP. For evaluating a bare
+    /// arithmetic sub-DAG - the rem-bucket gate builds one with no cart
+    /// lookups, so no room is needed.
+    pub fn eval_narrow_top(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
+        self.eval_inner(cells, false, false, None)
+    }
+
     fn eval_inner(
         &self,
         cells: &HashMap<u32, Val>,
@@ -828,6 +837,12 @@ impl Graph {
                 Op::Split(d) | Op::SplitValid(d) => {
                     bail!("node {}: split {} has no value outside an outcome", i, d)
                 }
+                // The span premise: whether the interval fits in the
+                // fork's fragment count. Unmodellable here (the resolved
+                // form is `zi_span_ok`, runtime-only), so it becomes TOP
+                // under narrow-top eval - like `Mget`/`TileFlagAt`
+                // without a room - and only errors under strict eval.
+                Op::SplitOk if !strict_err => Val::Bool(None),
                 Op::SplitOk => bail!("node {}: SplitOk needs the interval's floor span", i),
                 // The RESOLVED fork: `zi_fork_flr`'s three cases, on one
                 // interval instead of sixteen lanes. Exact, and it is

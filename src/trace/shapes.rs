@@ -272,15 +272,43 @@ pub struct WalkOpts {
     /// carry them as plain per-lane numbers, so `__split_by_flr` is the
     /// identity and the set has no rem forks at all.
     pub ival: bool,
+    /// Bake ONLY the rem widening, at the configured Bits(k) rung, into
+    /// each traced frame (`trace::widen`, `WidenMode::RemRung`) - Phase 1
+    /// of moving the ladder widening into the graph
+    /// (plans/keying-widening-flow.md). Rung-SPECIFIC (unlike `LADDER`),
+    /// so a process changing rem precision must rebuild. Mutually
+    /// exclusive with `widen` (the Bits(0) full widening);
+    /// `widen_mode` asserts that.
+    pub widen_rem_rung: bool,
 }
 
 impl WalkOpts {
     /// The checked-in level-0 set.
-    pub const LEVEL0: WalkOpts = WalkOpts { widen: true, ival: true };
+    pub const LEVEL0: WalkOpts = WalkOpts { widen: true, ival: true, widen_rem_rung: false };
     /// The rung-agnostic set for rem Bits(0..=15).
-    pub const LADDER: WalkOpts = WalkOpts { widen: false, ival: true };
+    pub const LADDER: WalkOpts = WalkOpts { widen: false, ival: true, widen_rem_rung: false };
     /// The exact-rem set for the top rung (k = 16).
-    pub const EXACT: WalkOpts = WalkOpts { widen: false, ival: false };
+    pub const EXACT: WalkOpts = WalkOpts { widen: false, ival: false, widen_rem_rung: false };
+    /// Like `LADDER`, but with the rem widening baked into the graph at
+    /// the configured rung (Phase 1 B-kernel, plans/keying-widening-flow.md).
+    pub const LADDER_WIDEN: WalkOpts =
+        WalkOpts { widen: false, ival: true, widen_rem_rung: true };
+
+    /// The `WidenMode` a traced frame under these opts applies, or `None`
+    /// if it leaves every widening to the boundary.
+    pub fn widen_mode(&self) -> Option<super::widen::WidenMode> {
+        assert!(
+            !(self.widen && self.widen_rem_rung),
+            "WalkOpts: widen (Bits(0) full) and widen_rem_rung (Bits(k) rem) are mutually exclusive"
+        );
+        if self.widen_rem_rung {
+            Some(super::widen::WidenMode::RemRung)
+        } else if self.widen {
+            Some(super::widen::WidenMode::Level0)
+        } else {
+            None
+        }
+    }
 }
 
 pub fn walk<'a>(
@@ -309,7 +337,7 @@ pub fn walk<'a>(
         let st = seen[&k].clone();
         let roots = state_paths(&st)?;
         let ival = if opts.ival { ival_paths(&st) } else { Vec::new() };
-        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival, opts.widen) {
+        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival, opts.widen_mode()) {
             Ok(f) => f,
             Err(e) => {
                 *out.refused.entry(format!("{:#}", e)).or_default() += 1;

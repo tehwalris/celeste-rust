@@ -275,3 +275,48 @@ Phase 4 - make the check frontier-symmetric (the real fix, not off-for-both).
 
 Later / out of scope now: fold the key HASH into the ASM (currently Rust
 `boundary_finish`); the band-coarsening canonical property (separate, exists).
+
+## Progress log
+
+### Phase 1 DONE (2026-08-29)
+
+The rem rung widening is in the graph, behind `CELESTE_WIDEN_IN_GRAPH=1`,
+with both gates green and the node-count de-risk measured.
+
+- `trace::widen::rem_bucket_node` - the rem bucket fork + snap:
+  `scaled = old / 2^-k` (a DIVISION by a representable constant, never a
+  multiply by the unrepresentable `2^k`), fork at its integer floors (the
+  `__split_by_flr` primitive), then `flr(frag) * 2^-k` snaps to the full
+  bucket. `widen_rem_rung` wraps it with the [-0.5, 0.5) containment
+  premise; `WidenMode::RemRung` selects it. `WidenMode::Level0` is the
+  unchanged full Bits(0) widening.
+- `WalkOpts::LADDER_WIDEN` (= LADDER + `widen_rem_rung`), threaded through
+  `trace_frame` (now `widen: Option<WidenMode>`) and selected in
+  `asm_kernel::registry()` / `engine_fingerprint()` when
+  `dispatch::widen_in_graph()`.
+- The ASM codegen gained interval `Mul`/`Div` by a positive-constant
+  scalar (endpoint scaling, matching `Pico8NumInterval::scale_positive` /
+  `div_positive` and `graph.eval`) - the rem scale is the only source. A
+  frame never scaled an interval before, so existing kernels are
+  unaffected. `graph.eval`'s `SplitOk` becomes TOP under narrow-top eval
+  (`eval_narrow_top`), so a bare fork sub-DAG is evaluable.
+- Gates (all green, full quick suite 306/306):
+  - `trace::widen::tests::rem_bucket_node_matches_rem_bucket_exact` /
+    `_is_idempotent` / `_forks_a_straddle_into_two_buckets` - the bucket
+    MATH, exhaustive over the rem range and every rung (the "widened the
+    same" + assert-noop properties at the value level).
+  - `asm_kernel_a_vs_b_isolate_the_rem_widening_at_bits2` - the A-vs-B
+    differential: A (exact rem + external `make_state_abstract_rem`) ==
+    B (`LADDER_WIDEN`, in-graph) after dedup, per frame to f26 (the fork
+    fires at f25), Bits(2). Both registries built directly;
+    `CELESTE_ASM_NO_SKIP` makes both emit full sets. Catches "widened
+    DIFFERENTLY" and the WIRING into the real start-room graphs.
+  - `widen_in_graph_is_cheap_in_nodes_at_bits2` - node-count de-risk:
+    +3.1% fused nodes (4166 -> 4295), well under the 50% guard. Fusion +
+    hash-consing share the rem fork with the frame's arithmetic, as
+    predicted.
+
+Not yet done: B is opt-in (default OFF), `stream_boundary` still
+double-widens on the kernel path (idempotent). Phase 2 adds spd / fruit /
+conservative widenings; Phase 3 flips B on and drops the wrapper widening
+on the kernel path; Phase 4 makes the check frontier-symmetric.
