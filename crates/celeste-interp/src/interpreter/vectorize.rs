@@ -1235,47 +1235,64 @@ fn partition_class(state: &State, cells: &[usize]) -> Option<u64> {
 /// Bounded by the cells' cardinality (<= a handful of values each).
 fn split_states_by_partition(states: Vec<State>, cells: &[usize]) -> Vec<State> {
     let mut out = Vec::with_capacity(states.len());
-    let mut work = states;
-    while let Some(state) = work.pop() {
-        let Some(varying) = cells.iter().copied().find(|&cell| {
-            matches!(
-                state.heap.get_opt(HeapId::from_raw(cell)),
-                Some(HeapValue::Value(
-                    Value::Number(MaybeVector::Vector(_))
-                        | Value::NumberInterval(MaybeVector::Vector(_))
-                        | Value::Bool(MaybeVector::Vector(_))
-                ))
-            )
-        }) else {
+    for state in states {
+        // The partition cells that actually VARY across lanes (a Vector);
+        // a Scalar cell is already uniform and contributes nothing.
+        let varying: Vec<usize> = cells
+            .iter()
+            .copied()
+            .filter(|&cell| {
+                matches!(
+                    state.heap.get_opt(HeapId::from_raw(cell)),
+                    Some(HeapValue::Value(
+                        Value::Number(MaybeVector::Vector(_))
+                            | Value::NumberInterval(MaybeVector::Vector(_))
+                            | Value::Bool(MaybeVector::Vector(_))
+                    ))
+                )
+            })
+            .collect();
+        if varying.is_empty() {
             out.push(state);
             continue;
-        };
-        // Mask: lanes equal to the first lane's value peel off as one
-        // uniform class; the remainder loops back for the next value.
-        let mask: Vec<bool> = match state.heap.get_opt(HeapId::from_raw(varying)) {
-            Some(HeapValue::Value(Value::Number(MaybeVector::Vector(v)))) => {
-                let first = v[0];
-                v.iter().map(|&x| x == first).collect()
-            }
-            Some(HeapValue::Value(Value::NumberInterval(MaybeVector::Vector(v)))) => {
-                let first = v[0];
-                v.iter().map(|&x| x == first).collect()
-            }
-            Some(HeapValue::Value(Value::Bool(MaybeVector::Vector(v)))) => {
-                let first = v[0];
-                v.iter().map(|&x| x == first).collect()
-            }
-            _ => unreachable!("checked varying above"),
-        };
-        let (uniform, rest) = state.split_by_condition(&mask, true);
-        // The uniform side collapses the cell to Scalar via the split's
-        // canonicalizing gathers; the rest still varies (or is now uniform
-        // in a different value) and loops.
-        if let Some(uniform) = uniform {
-            work.push(uniform);
         }
-        if let Some(rest) = rest {
-            work.push(rest);
+        // Group lanes by the TUPLE of their varying-cell values, in ONE
+        // pass - O(lanes * cells). The old code peeled one value at a time
+        // and cloned the whole state per distinct value, which is
+        // O(distinct^2) in the state width and hung on the pos-graph
+        // position partition at ~f28 once the compiled forward's wide
+        // (position-mixed) states reached it (each of ~thousands of
+        // positions triggered a full-state clone). Bucketing produces one
+        // sub-state per distinct position group directly.
+        let key_at = |cell: usize, lane: usize| -> i64 {
+            match state.heap.get_opt(HeapId::from_raw(cell)) {
+                Some(HeapValue::Value(Value::Number(MaybeVector::Vector(v)))) => {
+                    v[lane].as_raw_u32() as i64
+                }
+                Some(HeapValue::Value(Value::NumberInterval(MaybeVector::Vector(v)))) => {
+                    ((v[lane].low.as_raw_u32() as i64) << 32)
+                        | (v[lane].high.as_raw_u32() as i64 & 0xffff_ffff)
+                }
+                Some(HeapValue::Value(Value::Bool(MaybeVector::Vector(v)))) => v[lane] as i64,
+                _ => 0,
+            }
+        };
+        let n = state.vector_size;
+        let mut index: rustc_hash::FxHashMap<Vec<i64>, usize> = Default::default();
+        let mut masks: Vec<Vec<bool>> = Vec::new();
+        for lane in 0..n {
+            let key: Vec<i64> = varying.iter().map(|&c| key_at(c, lane)).collect();
+            let gi = *index.entry(key).or_insert_with(|| {
+                masks.push(vec![false; n]);
+                masks.len() - 1
+            });
+            masks[gi][lane] = true;
+        }
+        // `filter_by_mask` collapses each group's now-uniform partition
+        // cells to Scalar via its canonicalizing gathers, so a following
+        // `partition_class`/`resolve` sees them uniform.
+        for mask in masks {
+            out.push(state.filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_STRADDLE));
         }
     }
     out
