@@ -307,3 +307,44 @@ pos-graph WORKS today (fused forward, just heavy). Given P4 turned out moot and
 the priority (P0) is done + fully validated, this is DEFERRED with the spec in
 pos-graph-and-memory.md section 2 intact. Recommend implementing when a
 room-(0,0) campaign is next run, so the memory win can be measured.
+
+## DIAGNOSIS (2026-08-29): the Bits(2) divergence is in the TRACED GRAPH, not the engine
+
+Reproduced on the ASM engine (`CELESTE_REM_BITS=2 CELESTE_COMPILED_FORWARD=check
+CELESTE_FRONTIER_ONLY=1 CELESTE_KERNEL_STRICT=0`, room (1,0), f25). Instrumented
+with `CELESTE_CHECK_DUMP=1` (dumps raw output lanes + rem/spd interval sets on a
+check mismatch) and `CELESTE_ASM_NO_SEEN=1` (disables the append dedup).
+
+Ruled OUT:
+- The append dedup: `CELESTE_ASM_NO_SEEN=1` gives the identical divergence.
+- The engine bridge/boundary: `CELESTE_NO_ASM_KERNELS=1` (engine falls to the
+  reference interpreter) PASSES the Bits(2) check - so import/boundary/abstraction
+  are fine.
+- The ASM interval-fork primitives: `zi_fork_flr`/`zi_span_ok` in the codegen
+  match `celeste_engine::kernel` byte-for-byte.
+
+The mechanism (f25, a 19-lane chunk):
+- INPUT rem = the 4 clean Bits(2) buckets (`[-0.5,-0.25) [-0.25,0) [0,0.25)
+  [0.25,0.5)`).
+- ASM (kernel) OUTPUT rem = the SAME 4 buckets, UNCHANGED (full-bucket width).
+- Interpreter OUTPUT rem = 19 distinct NARROWER sub-intervals anchored at the
+  bucket edges. spd likewise: 12 distinct out of the ASM vs 16+ from the
+  interpreter.
+
+So the kernel keeps rem as the full input bucket where the interpreter's
+rem-renormalize (`rem += spd; amount = flr(rem+0.5); rem -= amount`) forks/
+intersects it into finer fragments; that coarseness cascades to spd and the row
+count (raw level-0 keys: interp 288 vs asm 126). The ASM faithfully executes the
+FUSED GRAPH, and the deleted generated kernels showed the same divergence - so
+the bug is in the TRACED KERNEL GRAPH (the tracer), shared by both backends, NOT
+the ASM codegen. Bits(1) happens to pass because its wider buckets straddle the
+flr boundary the same way the trace assumed.
+
+FIX DIRECTION (next session): the ladder kernel graph must reproduce the
+interpreter's rem narrowing at every rung - i.e. the traced rem-renormalize fork
+has to fire on the fine (Bits(2..15)) input, OR the kernel must DECLINE a chunk
+whose rem input is finer than the fork it was traced for (span_ok/SplitOk),
+sending it to the reference. Given the search is single-room and the rungs are
+rare, a decline-and-reference fallback at fine rungs may be the pragmatic fix;
+the exact narrowing is the correct one. Investigate `trace` rem-fork depth vs the
+runtime rem bucket width.

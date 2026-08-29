@@ -1210,6 +1210,83 @@ impl CompiledForward {
         };
         let missing: Vec<_> = want_keys.difference(&got_keys).collect();
         let extra: Vec<_> = got_keys.difference(&want_keys).collect();
+        if (!missing.is_empty() || !extra.is_empty())
+            && std::env::var_os("CELESTE_CHECK_DUMP").is_some()
+        {
+            let lanes = |ss: &[State]| ss.iter().map(|s| s.vector_size).sum::<usize>();
+            // Raw output lanes AND raw (level-0) row keys, before the rung
+            // abstraction, to tell a kernel under-production from a rung /
+            // straddle-split difference.
+            let raw_ref = self.engine.row_key_set(&reference);
+            let raw_got = self.engine.row_key_set(&got_states);
+            eprintln!(
+                "[check dump] raw output lanes: interp {} ({} states), asm {} ({} states); \
+                 raw(level0) row keys: interp {}, asm {} (raw missing {})",
+                lanes(&reference),
+                reference.len(),
+                lanes(&got_states),
+                got_states.len(),
+                raw_ref.len(),
+                raw_got.len(),
+                raw_ref.difference(&raw_got).count(),
+            );
+            let rem_ivals = |ss: &[State]| -> std::collections::BTreeSet<(i32, i32)> {
+                let mut out = std::collections::BTreeSet::new();
+                for s in ss {
+                    let marks = crate::interpreter::abstraction::mark_heap(s);
+                    let Some(cells) = marks.marks.get("player_rem_xy") else { continue };
+                    for &cell in cells {
+                        if let Some(HeapValue::Value(Value::NumberInterval(mv))) = s.heap.get_opt(cell)
+                        {
+                            let mut ins = |iv: &crate::pico8_num::Pico8NumInterval| {
+                                out.insert((
+                                    iv.low.as_raw_u32() as i32,
+                                    iv.high.as_raw_u32() as i32,
+                                ));
+                            };
+                            match mv {
+                                MaybeVector::Scalar(iv) => ins(iv),
+                                MaybeVector::Vector(v) => v.iter().for_each(|iv| ins(iv)),
+                            }
+                        }
+                    }
+                }
+                out
+            };
+            let ri = rem_ivals(&reference);
+            let ai = rem_ivals(&got_states);
+            let inp = rem_ivals(std::slice::from_ref(&state));
+            eprintln!(
+                "[check dump] rem intervals (raw): INPUT {} distinct, interp-out {}, asm-out {}",
+                inp.len(),
+                ri.len(),
+                ai.len(),
+            );
+            eprintln!("[check dump]   INPUT rems: {:x?}", inp.iter().take(24).collect::<Vec<_>>());
+            eprintln!("[check dump]   ASM-out rems: {:x?}", ai.iter().collect::<Vec<_>>());
+            let spd_nums = |ss: &[State]| -> std::collections::BTreeSet<i32> {
+                let mut out = std::collections::BTreeSet::new();
+                for s in ss {
+                    let marks = crate::interpreter::abstraction::mark_heap(s);
+                    let Some(cells) = marks.marks.get("player_spd_xy") else { continue };
+                    for &cell in cells {
+                        if let Some(HeapValue::Value(Value::Number(mv))) = s.heap.get_opt(cell) {
+                            match mv {
+                                MaybeVector::Scalar(n) => { out.insert(n.as_raw_u32() as i32); }
+                                MaybeVector::Vector(v) => v.iter().for_each(|n| { out.insert(n.as_raw_u32() as i32); }),
+                            }
+                        }
+                    }
+                }
+                out
+            };
+            eprintln!(
+                "[check dump]   spd: INPUT {:x?}, interp-out {:x?}, asm-out {:x?}",
+                spd_nums(std::slice::from_ref(&state)).iter().take(16).collect::<Vec<_>>(),
+                spd_nums(&reference).iter().take(16).collect::<Vec<_>>(),
+                spd_nums(&got_states).iter().take(16).collect::<Vec<_>>(),
+            );
+        }
         if !missing.is_empty() || !extra.is_empty() {
             // The keys themselves, because "24 rows differ" was exactly the
             // level of detail that left the divergence unexplained for a

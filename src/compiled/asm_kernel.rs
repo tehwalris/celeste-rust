@@ -129,6 +129,13 @@ impl AsmKernel {
             (0..self.acc_templates.len())
                 .map(|_| celeste_engine::kernel::RowSet::new())
                 .collect();
+        // Debug: CELESTE_ASM_NO_SEEN keeps the seen fold running (so its cost
+        // is unchanged) but never drops a row, to isolate the dedup from the
+        // compute when a divergence appears.
+        let no_seen = {
+            static NS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *NS.get_or_init(|| std::env::var_os("CELESTE_ASM_NO_SEEN").is_some())
+        };
 
         let mut lo = 0usize;
         while lo < chunk.width {
@@ -180,7 +187,7 @@ impl AsmKernel {
                         h1 ^= om;
                         h2 ^= om;
                     }
-                    if !seen.insert((h1, h2)) {
+                    if !seen.insert((h1, h2)) && !no_seen {
                         continue;
                     }
                     for f in &body.fields {
