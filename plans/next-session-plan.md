@@ -348,3 +348,73 @@ sending it to the reference. Given the search is single-room and the rungs are
 rare, a decline-and-reference fallback at fine rungs may be the pragmatic fix;
 the exact narrowing is the correct one. Investigate `trace` rem-fork depth vs the
 runtime rem bucket width.
+
+## DIAGNOSIS (2026-08-29, part 2): the Bits(2) divergence is UNDER-FORKING in the graph, NOT the ASM
+
+Followed up on part 1 with a per-lane cross-check that settles WHERE the bug
+is, decisively.
+
+New tooling (kept, env-gated, reusable - not tests):
+- `Graph::eval_narrow_top_in(cells, room)` (transpile/graph.rs): the interval
+  evaluator with forks RESOLVED via `Frag` (so it NARROWS, unlike
+  `eval_lenient*`) but unmodellable nodes (`Mget`, room-less `TileFlagAt`)
+  becoming TOP instead of erroring. Decoupled `eval_inner`'s single `lenient`
+  flag into `frag_lenient` + `strict_err`.
+- `CELESTE_ASM_EVAL_CHECK=1` (compiled/asm_kernel.rs): the kernel re-evaluates
+  its OWN fused graph with `eval_narrow_top_in` per lane and diffs every output
+  field against the assembled kernel's `outbuf`. `asm != eval` would be an ASM
+  codegen bug; agreement means the fused graph itself is what diverges.
+
+Result: `CELESTE_REM_BITS=2 CELESTE_COMPILED_FORWARD=check CELESTE_ASM_EVAL_CHECK=1`,
+room (1,0), 30 frames: **ZERO eval-check mismatches** across every lane of every
+chunk, all the way to the f25 failure. So:
+- The ASM codegen is FAITHFUL to the fused graph (H1 disproven, rigorously - not
+  just "the deleted Rust kernels matched").
+- The fused GRAPH is what diverges (H2). Evaluated exactly, it produces the 184
+  coarse rows; the interpreter produces 904. The eval-check can only compare the
+  bodies the graph HAS, so 0 mismatches + a 5x row deficit means the graph is
+  MISSING FORK VARIANTS, not miscomputing the ones it has.
+
+Mechanism (verified facts):
+- shape 1: `rem.x/rem.y` are `ival`, `spd.x/spd.y` are `num` (a decided point
+  per lane). So `moving = spd.x!=0 || spd.y!=0` (the real Lua guard, line 782:
+  `if obj.spd.x ~= 0 or obj.spd.y ~= 0 then obj.move(...)`) is DECIDED per lane -
+  the part-1 "undecided moving" idea was wrong (it assumed spd was an interval).
+- At f25 the interp fans out ~15 raw rows per input lane (288 raw from 19 lanes);
+  the graph makes 126. That is far more than the 2-way rem `__split_by_flr` fork,
+  so the graph under-forks BROADLY, not just on rem.
+- Root shape of the bug: the ladder graph's fork structure is BAKED at trace time
+  (the constant lattice). A condition that is DECIDED at the lattice abstraction
+  (rem/spd-derived, constant there) becomes UNDECIDED at Bits(2) (rem is a real
+  interval), where the interpreter FORKS (`__split_by_flr` = "one state in, one or
+  more fragments out", per floor spanned; abstraction.rs `split_rem_straddles`
+  then one lane per bucket). The graph cannot fork what the trace already decided.
+
+FIX DIRECTION (needs Philippe's call - a real tracer change, ground-rules say
+confirm first): the ladder trace must fork every rem/spd-derived condition that a
+FINE rung leaves undecided, so the fused graph carries all the interpreter's
+Bits(2..15) fork variants - i.e. trace `__split_by_flr` (and the guards downstream
+of it) at the FINEST rung the set will run at, not at the constant lattice. The
+alternative (make `ok` carry `Known(cond)` for every mergeable/decidable branch so
+a fine-rung lane DECLINES) only surfaces the gap under never-deopt; it does not
+COVER it. The exact-narrowing trace is the correct fix; scope it before building.
+
+### Per-lane set difference (2026-08-29, part 3): graph = coarse buckets, interp = buckets + fragments
+
+`CELESTE_CHECK_DUMP=1` now categorizes each interpreter output LANE at the f25
+divergence as interp-only vs shared (both keyed by the SAME raw canonical
+`row_keys_lane_order`), and prints the (rem, spd) signature of each bucket:
+
+- shared 192 lanes / 36 distinct: rem = the CLEAN full Bits(2) buckets
+  (e.g. rem.x=[-0.5,-0.25) `ffff8000..ffffbfff`, rem.y=[0,0.25) `0..3fff`).
+- interp-only 360 lanes / 126 distinct: rem = NARROWED / SHIFTED / POINT
+  intervals (e.g. rem.x=`ffff8000..ffff8000` a point at -0.5, rem.y=`35c2..75c1`
+  = [0.21,0.46] a shifted sub-bucket). ALL 126 interp-only signatures are
+  exclusively these refined rems - none share a signature with the graph output.
+
+So the graph emits ONLY the coarse full-bucket rem; the interpreter emits that
+PLUS every `__split_by_flr` floor-fragment. The graph's rows are a strict subset
+(0 graph-only), missing every refined-rem row. This is the visual confirmation of
+part 2: the fused graph does not fragment rem per floor at Bits(2). The fix is to
+make the ladder trace reproduce `__split_by_flr`'s fragmentation at the finest
+rung the set runs at.

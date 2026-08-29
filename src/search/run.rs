@@ -1286,6 +1286,98 @@ impl CompiledForward {
                 spd_nums(&reference).iter().take(16).collect::<Vec<_>>(),
                 spd_nums(&got_states).iter().take(16).collect::<Vec<_>>(),
             );
+
+            // Per-lane set difference: categorize each INTERPRETER output lane
+            // as interp-only (its row key is not in the compiled output) or
+            // shared, and print the (rem.x, rem.y, spd.x, spd.y) of each
+            // bucket. Since the compiled rows are a strict subset (0 extra),
+            // this shows WHAT distinguishes the rows the graph fails to
+            // produce. Uses the level-0 (raw) key set, computed the same way
+            // on both sides.
+            // Both sides keyed by the SAME raw canonical function
+            // (`row_keys_lane_order`, no widening/dedup) so membership is a
+            // true set comparison, not boundary-vs-canonical.
+            let graph_keys: std::collections::HashSet<(u64, u64)> = got_states
+                .iter()
+                .flat_map(|s| self.engine.row_keys_lane_order(s))
+                .collect();
+            // A lane's rem intervals and spd numbers, as sorted raw tuples
+            // (the mark cells are an unordered set, so sort for a canonical,
+            // comparable signature; x vs y is not separated but the pair of
+            // values is enough to see the missing fork dimension).
+            type LC = (Vec<(i32, i32)>, Vec<i32>);
+            let lane_content = |s: &State, lane: usize| -> LC {
+                let marks = crate::interpreter::abstraction::mark_heap(s);
+                let mut rems: Vec<(i32, i32)> = Vec::new();
+                if let Some(cells) = marks.marks.get("player_rem_xy") {
+                    for &cell in cells {
+                        if let Some(HeapValue::Value(Value::NumberInterval(mv))) = s.heap.get_opt(cell) {
+                            let iv = match mv {
+                                MaybeVector::Scalar(iv) => *iv,
+                                MaybeVector::Vector(v) => v[lane.min(v.len() - 1)],
+                            };
+                            rems.push((iv.low.as_raw_u32() as i32, iv.high.as_raw_u32() as i32));
+                        }
+                    }
+                }
+                let mut spds: Vec<i32> = Vec::new();
+                if let Some(cells) = marks.marks.get("player_spd_xy") {
+                    for &cell in cells {
+                        if let Some(HeapValue::Value(Value::Number(mv))) = s.heap.get_opt(cell) {
+                            let n = match mv {
+                                MaybeVector::Scalar(n) => *n,
+                                MaybeVector::Vector(v) => v[lane.min(v.len() - 1)],
+                            };
+                            spds.push(n.as_raw_u32() as i32);
+                        }
+                    }
+                }
+                rems.sort();
+                spds.sort();
+                (rems, spds)
+            };
+            let mut only: std::collections::BTreeSet<LC> = Default::default();
+            let mut both: std::collections::BTreeSet<LC> = Default::default();
+            let (mut n_only, mut n_both) = (0usize, 0usize);
+            for s in &reference {
+                let keys = self.engine.row_keys_lane_order(s);
+                for (lane, k) in keys.iter().enumerate() {
+                    let c = lane_content(s, lane);
+                    if graph_keys.contains(k) {
+                        both.insert(c);
+                        n_both += 1;
+                    } else {
+                        only.insert(c);
+                        n_only += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[check dump] per-lane categories: interp-only {} lanes ({} distinct rem/spd), \
+                 shared {} lanes ({} distinct)",
+                n_only,
+                only.len(),
+                n_both,
+                both.len(),
+            );
+            let show = |label: &str, set: &std::collections::BTreeSet<LC>| {
+                eprintln!("[check dump]   {label} (rems, spds) sample:");
+                for c in set.iter().take(20) {
+                    eprintln!("[check dump]     rems={:08x?} spds={:08x?}", c.0, c.1);
+                }
+            };
+            show("INTERP-ONLY", &only);
+            show("SHARED", &both);
+            // rem/spd signatures that appear ONLY in interp-only lanes (never
+            // shared) - the fork dimension the graph misses entirely.
+            let only_sig: std::collections::BTreeSet<&LC> = only.iter().collect();
+            let both_sig: std::collections::BTreeSet<&LC> = both.iter().collect();
+            let excl: Vec<_> = only_sig.difference(&both_sig).collect();
+            eprintln!(
+                "[check dump]   rem/spd signatures ONLY in interp-only lanes: {} of {} interp-only",
+                excl.len(),
+                only.len(),
+            );
         }
         if !missing.is_empty() || !extra.is_empty() {
             // The keys themselves, because "24 rows differ" was exactly the

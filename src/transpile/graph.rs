@@ -743,7 +743,7 @@ impl Graph {
     /// Nodes are appended after their operands, so a forward sweep is a
     /// valid evaluation order.
     pub fn eval(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
-        self.eval_inner(cells, false, None)
+        self.eval_inner(cells, false, true, None)
     }
 
     /// The same evaluator, but a node it cannot model becomes TOP for its
@@ -760,7 +760,7 @@ impl Graph {
     /// evaluator: two implementations of `Abs` over intervals is exactly
     /// the kind of divergence that is impossible to notice.
     pub fn eval_lenient(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
-        self.eval_inner(cells, true, None)
+        self.eval_inner(cells, true, false, None)
     }
 
     /// `eval_lenient` WITH the map, so `TileFlagAt` is decided instead of
@@ -771,15 +771,32 @@ impl Graph {
     /// depends on anything it cannot see - and `TileFlagAt` is one of the
     /// two ops through which TOP enters a traced graph at all.
     pub fn eval_lenient_in(&self, cells: &HashMap<u32, Val>, room: &Room) -> Result<Vec<Val>> {
-        self.eval_inner(cells, true, Some(room))
+        self.eval_inner(cells, true, false, Some(room))
+    }
+
+    /// Strict eval (forks RESOLVED via `Frag`, no top) WITH the room, so
+    /// `TileFlagAt` is decided. Exact where every node is modellable; used
+    /// by the Bits(2) narrowing probe to check `Frag` narrowing end-to-end.
+    pub fn eval_strict_in(&self, cells: &HashMap<u32, Val>, room: &Room) -> Result<Vec<Val>> {
+        self.eval_inner(cells, false, true, Some(room))
+    }
+
+    /// Forks RESOLVED via `Frag` (narrowing), but a node the evaluator
+    /// cannot model (`Mget`, and `TileFlagAt` without a room) becomes TOP
+    /// instead of an error. Lets the narrowing on the modellable part be
+    /// checked even when the graph also contains unmodellable ops.
+    pub fn eval_narrow_top_in(&self, cells: &HashMap<u32, Val>, room: &Room) -> Result<Vec<Val>> {
+        self.eval_inner(cells, false, false, Some(room))
     }
 
     fn eval_inner(
         &self,
         cells: &HashMap<u32, Val>,
-        lenient: bool,
+        frag_lenient: bool,
+        strict_err: bool,
         room: Option<&Room>,
     ) -> Result<Vec<Val>> {
+        let lenient = frag_lenient;
         let full = Val::Num(Pico8NumInterval::new(
             Pico8Num::from_raw(i32::MIN),
             Pico8Num::from_raw(i32::MAX),
@@ -981,7 +998,7 @@ impl Graph {
             let v = match computed {
                 Ok(v) => v,
                 Err(e) => {
-                    if !lenient {
+                    if strict_err {
                         return Err(e);
                     }
                     Self::top_of(&node.op, &node.args, &out, full)

@@ -97,6 +97,14 @@ struct AsmKernel {
     compiled: Compiled,
     bodies: Vec<AsmBody>,
     acc_templates: Vec<AccTemplate>,
+    /// DEBUG (CELESTE_ASM_EVAL_CHECK): the fused graph + its flat roots +
+    /// the room, so `run` can re-evaluate the SAME fused graph with the pure
+    /// interval evaluator (`eval_narrow_top_in`) per lane and diff it against the
+    /// assembled kernel's output. Separates an ASM-codegen bug (asm != eval)
+    /// from a fused-graph bug (asm == eval, both != interpreter).
+    fused: crate::transpile::graph::Graph,
+    flat_roots: Vec<crate::transpile::graph::NodeId>,
+    room: Room,
 }
 
 impl AsmKernel {
@@ -147,6 +155,9 @@ impl AsmKernel {
                     outbuf.as_mut_ptr(),
                     &ctx as *const AsmCtx as *const c_void,
                 );
+            }
+            if eval_check_on() {
+                self.eval_check(chunk, lo, n, &outbuf);
             }
             let valid = ((1u32 << n) - 1) as u16;
             for body in &self.bodies {
@@ -244,6 +255,69 @@ impl AsmKernel {
         true
     }
 
+    /// DEBUG: re-evaluate the fused graph with the pure interval evaluator
+    /// for lanes `[lo, lo+n)` and diff its per-field outputs against the
+    /// assembled kernel's `outbuf`. An `asm != eval` mismatch is an ASM
+    /// codegen bug; agreement means the fused graph itself is what diverges
+    /// from the interpreter. Prints at most a few mismatches per chunk.
+    fn eval_check(&self, chunk: &Rt2, lo: usize, n: usize, outbuf: &[u8]) {
+        use crate::transpile::graph::Val;
+        static PRINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        for i in 0..n {
+            // Build the per-lane input cells from the block columns.
+            let mut cells: std::collections::HashMap<u32, Val> = Default::default();
+            for &cell in &self.compiled.input_cells {
+                let v = match chunk.cols[cell as usize].at(lo + i) {
+                    AV::Num(p) => Val::Num(crate::pico8_num::Pico8NumInterval::new(p, p)),
+                    AV::Ival(a, b) => Val::Num(crate::pico8_num::Pico8NumInterval::new(a, b)),
+                    AV::Bool(b) => Val::Bool(Some(b)),
+                    AV::UBool => Val::Bool(None),
+                    _ => continue,
+                };
+                cells.insert(cell, v);
+            }
+            let vals = match self.fused.eval_narrow_top_in(&cells, &self.room) {
+                Ok(v) => v,
+                Err(e) => {
+                    if PRINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                        eprintln!("[eval-check] lane {} eval err: {e:#}", lo + i);
+                    }
+                    return;
+                }
+            };
+            for body in &self.bodies {
+                for f in &body.fields {
+                    let asm = read_field_av(f, outbuf, i);
+                    let node = self.flat_roots[f.root];
+                    let ev = vals[node as usize];
+                    let agree = match (asm, ev) {
+                        (AV::Num(p), Val::Num(iv)) => {
+                            p.as_raw_u32() == iv.low.as_raw_u32()
+                                && iv.low.as_raw_u32() == iv.high.as_raw_u32()
+                        }
+                        (AV::Ival(a, b), Val::Num(iv)) => {
+                            a.as_raw_u32() == iv.low.as_raw_u32()
+                                && b.as_raw_u32() == iv.high.as_raw_u32()
+                        }
+                        (AV::Bool(x), Val::Bool(Some(y))) => x == y,
+                        (AV::UBool, Val::Bool(None)) => true,
+                        _ => false,
+                    };
+                    if !agree && PRINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                        eprintln!(
+                            "[eval-check] lane {} cell {} root {}: ASM {:x?} vs EVAL {:x?}",
+                            lo + i,
+                            f.cell,
+                            f.root,
+                            asm,
+                            ev,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Pack `chunk`'s input columns for lanes `[lo, lo+16)` into `buf`. Tail
     /// lanes past `n` clamp to the last valid lane, so the assembly's
     /// per-lane call-outs (div/mget/...) never fault on garbage - the `take`
@@ -279,6 +353,12 @@ impl AsmKernel {
             }
         }
     }
+}
+
+/// DEBUG gate for the per-lane fused-graph re-evaluation (`eval_check`).
+fn eval_check_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_ASM_EVAL_CHECK").is_some())
 }
 
 fn num_raw(av: AV) -> i32 {
@@ -511,7 +591,18 @@ impl Registry {
                 .collect::<Result<Vec<_>>>()?;
 
             if by_shape
-                .insert(shape, AsmKernel { loaded, compiled, bodies: asm_bodies, acc_templates })
+                .insert(
+                    shape,
+                    AsmKernel {
+                        loaded,
+                        compiled,
+                        bodies: asm_bodies,
+                        acc_templates,
+                        fused,
+                        flat_roots,
+                        room,
+                    },
+                )
                 .is_some()
             {
                 anyhow::bail!("two start-room shapes hash to {shape:#x}");
