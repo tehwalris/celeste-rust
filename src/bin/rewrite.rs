@@ -1173,6 +1173,20 @@ impl RssSampler {
 }
 
 /// Run one ladder stage, timing wall clock and peak RSS around `f`. Prints a
+/// Hand freed heap pages back to the OS between ladder stages (glibc keeps
+/// them mapped otherwise). No-op off glibc.
+fn release_arenas() {
+    #[cfg(target_env = "gnu")]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+        }
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
+
 /// `name\twall\tpeak\trc` line matching ladder.sh's `stage` for grep-parity.
 fn stage<T>(
     timings: &mut Vec<StageTiming>,
@@ -1185,6 +1199,14 @@ fn stage<T>(
     let r = f();
     let wall = t0.elapsed().as_secs_f64();
     let peak = sampler.finish();
+    // Return this stage's freed transient to the OS before the next stage
+    // allocates. glibc's malloc keeps freed arenas mapped, so in ONE process
+    // the level-0 forward's ~13 GB would sit under the sweep's ~28 GB peak
+    // (room (0,0)'s 101 GB sweep is why ladder.sh used a separate process
+    // per stage). `malloc_trim(0)` hands the free pages back; the whole
+    // point of retiring ladder.sh is that the in-process ladder no longer
+    // needs per-stage processes to stay under the memory cap.
+    release_arenas();
     println!(
         "{}\t{:.0}\t{:.2}\t{}",
         name,
@@ -1226,25 +1248,50 @@ fn run_ladder(
     std::env::set_var("CELESTE_START_ROOM", room);
     std::env::set_var("CELESTE_FRONTIER_ONLY", "1");
     std::env::set_var("CELESTE_DEOPT_COLLECT_FIRST", "1");
-    // The ladder runs the INTERPRETER forward at every level. The compiled
-    // forward's checkpoints are NOW sweep-readable (the search keys everything
-    // on the one kernel/engine key, `compiled::engine_row_keys`, so the old "a
-    // saved lane's row is not in the row table" failure is gone - validated by
-    // a standalone level-0 compiled ladder), but two things keep the in-process
-    // ladder on the interpreter for now:
-    //   * the compiled forward diverges from the interpreter above Bits(1) - a
-    //     pre-existing kernel-set coverage gap on room (1,0) at Bits(2), 90
-    //     rows missing at f~25 under CELESTE_COMPILED_FORWARD=check (NOT the
-    //     key unification: the states come from run_frame_chunk, unchanged), so
-    //     a compiled rung gives a wrong verdict; and
-    //   * a compiled level-0 checkpoint and interpreter rungs cannot share a
-    //     band - the fingerprint's compiled_engine component differs - so the
-    //     ladder must be uniformly one engine.
-    // The interpreter is correct at every rung and its checkpoints are
-    // engine-keyed too, so the sweep reads them the same way. See
-    // plans/next-session-plan.md "compiled forward at rungs".
+    // The ladder runs the INTERPRETER forward by default. The plumbing for
+    // a KERNEL (compiled) forward is READY - checkpoints are sweep-readable
+    // (one `engine_row_keys`, gated), the compiled forward reproduces the
+    // interpreter at every rung (the Bits(2) artifact was fixed by moving
+    // the widening into the graph), the per-rung registry serves the right
+    // set per rung, and a uniformly-compiled ladder shares one
+    // `compiled_engine` fingerprint so the bands validate - but there is
+    // ONE open blocker: the ASM-kernel compiled forward + `--record-pos-graph`
+    // (which the sweep needs) GRINDS in `vectorize_states` /
+    // `split_by_condition` at ~f28 on room (1,0). It is PRE-EXISTING (the
+    // ASM cutover, not the widening work - it hangs with CELESTE_WIDEN_IN_GRAPH=0
+    // CELESTE_WRAPPER_SKIP=0), and it hits ladder.sh KERNELS=1 the same way,
+    // so it is not a shell-vs-binary issue. Until it is fixed,
+    // CELESTE_LADDER_KERNELS=1 opts into the compiled forward (for
+    // debugging the hang); the default stays on the correct interpreter.
+    if std::env::var_os("CELESTE_LADDER_KERNELS").is_some_and(|v| v != "0") {
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
+    }
     if std::env::var_os("CELESTE_MAX_STATE_LANES").is_none() {
         std::env::set_var("CELESTE_MAX_STATE_LANES", "8000");
+    }
+
+    // EAGER kernel assembly: build every rung's set (0..=maxk) UP FRONT -
+    // shapes within a rung assemble in parallel - so no rung stalls its
+    // forward pass building kernels mid-search. The registry is indexed by
+    // rem precision, so cycling the precision here fills each rung's slot;
+    // restored to Bits(0) for level 0's actual run. (Across-rung builds are
+    // sequential because the widening reads the process precision; the
+    // per-shape gcc is the parallel part.)
+    if std::env::var_os("CELESTE_COMPILED_FORWARD").is_some() {
+        let t0 = std::time::Instant::now();
+        for k in 0..=maxk {
+            celeste_rust::interpreter::abstraction::set_rem_precision(precision_for_level(k));
+            celeste_rust::compiled::prewarm_kernels();
+        }
+        celeste_rust::interpreter::abstraction::set_rem_precision(
+            celeste_rust::interpreter::abstraction::RemPrecision::Bits(0),
+        );
+        println!(
+            "=== eager kernel assembly: rungs 0..={} in {:.1}s ===",
+            maxk,
+            t0.elapsed().as_secs_f64()
+        );
     }
 
     let recipe_text = std::fs::read_to_string(recipe_path).unwrap_or_default();

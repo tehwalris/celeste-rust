@@ -551,89 +551,137 @@ impl Registry {
         opts: crate::trace::shapes::WalkOpts,
         exact_boundary: bool,
     ) -> Result<Registry> {
+        let t_trace = std::time::Instant::now();
         let refs = crate::trace::kernel::lattice_kernel_refs(root, opts)
             .context("retracing the start room for ASM kernels")?;
+        let trace_s = t_trace.elapsed().as_secs_f64();
+        let t_asm = std::time::Instant::now();
+        // Assemble every shape IN PARALLEL (`build_one_shape`: fuse ->
+        // specialize -> gcc -> dlopen, independent per shape). The traced
+        // graph is `Send + Sync` now (`Value::Str` is `Arc`), so workers
+        // share `&refs` and steal shapes off one atomic index; each gets a
+        // big stack because the fuse recurses. Insertion stays serial and
+        // ordered by shape index so the dup error is deterministic.
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(refs.len().max(1));
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let refs_ref = &refs;
+        let mut built: Vec<(usize, Result<(u64, AsmKernel)>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..n_workers)
+                .map(|_| {
+                    let next = &next;
+                    std::thread::Builder::new()
+                        .stack_size(128 * 1024 * 1024)
+                        .spawn_scoped(scope, move || {
+                            let mut out = Vec::new();
+                            loop {
+                                let si =
+                                    next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if si >= refs_ref.len() {
+                                    break;
+                                }
+                                out.push((si, build_one_shape(&refs_ref[si], si)));
+                            }
+                            out
+                        })
+                        .expect("spawn asm shape builder")
+                })
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        built.sort_by_key(|(si, _)| *si);
         let mut by_shape = HashMap::new();
-        for (si, r) in refs.iter().enumerate() {
-            let shape = r.frame.in_rt2.shape_hash_of();
-            let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
-            let (fused, bodies, flat_roots, reprs) =
-                crate::trace::emit::asm_fused(&r.bound, Some(&room), true)
-                    .with_context(|| format!("fusing shape {si} (hash {shape:#x})"))?;
-            let (compiled, loaded) = crate::transpile::asm::compile_and_load_reprs(
-                &fused,
-                &flat_roots,
-                &format!("k{shape:016x}"),
-                &reprs,
-            )
-            .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
-
-            // Map each fused body's roots onto flat root SLOTS. `flat_roots`
-            // is the bodies' roots concatenated in order, and `compile` keeps
-            // root k at slot k, so a running offset locates each body.
-            let mut off = 0usize;
-            let mut asm_bodies = Vec::with_capacity(bodies.len());
-            for b in &bodies {
-                let nfields = b.roots.len() - 2; // roots = [fields.., ok, live]
-                let outputs = &r.bound.outcomes[b.outcome].outputs;
-                anyhow::ensure!(
-                    outputs.len() == nfields,
-                    "shape {si} outcome {}: {} outputs vs {} field roots",
-                    b.outcome,
-                    outputs.len(),
-                    nfields
-                );
-                // A field enters the dedup fold iff it is per-row (no konst)
-                // AND the boundary does not widen it to uniform (rem/timers).
-                // outputs[j] and lowered.outs[oi].fields[j] are the same cell
-                // in the same order (both from the outcome's o.fields).
-                let out_fields = &r.lowered.outs[b.outcome].fields;
-                let fields = (0..nfields)
-                    .map(|j| AsmField {
-                        cell: outputs[j].0 as usize,
-                        root: off + j,
-                        kind: compiled.root_kinds[off + j],
-                        fold: out_fields[j].konst_av.is_none()
-                            && out_fields[j].widen_uniform.is_none(),
-                    })
-                    .collect();
-                asm_bodies.push(AsmBody {
-                    outcome: b.outcome,
-                    fields,
-                    ok_root: off + nfields,
-                    live_root: off + nfields + 1,
-                });
-                off += b.roots.len();
-            }
-
-            // Per-outcome acc templates, from the traced output structure +
-            // the OutField decisions (uniform-const vs varying-by-type) +
-            // the UBool cells - the runtime equivalent of the generated
-            // `acc{i}`.
-            let acc_templates = (0..r.bound.outcomes.len())
-                .map(|oi| acc_template(r, oi))
-                .collect::<Result<Vec<_>>>()?;
-
-            if by_shape
-                .insert(
-                    shape,
-                    AsmKernel {
-                        loaded,
-                        compiled,
-                        bodies: asm_bodies,
-                        acc_templates,
-                        fused,
-                        flat_roots,
-                        room,
-                    },
-                )
-                .is_some()
-            {
+        for (_si, res) in built {
+            let (shape, kernel) = res?;
+            if by_shape.insert(shape, kernel).is_some() {
                 anyhow::bail!("two start-room shapes hash to {shape:#x}");
             }
         }
+        eprintln!(
+            "[asm build] {} shapes: trace {:.2}s, assemble {:.2}s ({} workers)",
+            by_shape.len(),
+            trace_s,
+            t_asm.elapsed().as_secs_f64(),
+            n_workers,
+        );
         Ok(Registry { by_shape, exact_boundary })
     }
+}
+
+/// Assemble ONE start-room shape: fuse its graph, gcc + dlopen it, and map
+/// its bodies' roots onto flat slots. Independent per shape, so
+/// `build_for_start_room` runs these in parallel.
+fn build_one_shape(
+    r: &crate::trace::kernel::Reference,
+    si: usize,
+) -> Result<(u64, AsmKernel)> {
+    let shape = r.frame.in_rt2.shape_hash_of();
+    let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
+    let (fused, bodies, flat_roots, reprs) =
+        crate::trace::emit::asm_fused(&r.bound, Some(&room), true)
+            .with_context(|| format!("fusing shape {si} (hash {shape:#x})"))?;
+    let (compiled, loaded) = crate::transpile::asm::compile_and_load_reprs(
+        &fused,
+        &flat_roots,
+        &format!("k{shape:016x}"),
+        &reprs,
+    )
+    .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
+
+    // Map each fused body's roots onto flat root SLOTS. `flat_roots` is the
+    // bodies' roots concatenated in order, and `compile` keeps root k at slot
+    // k, so a running offset locates each body.
+    let mut off = 0usize;
+    let mut asm_bodies = Vec::with_capacity(bodies.len());
+    for b in &bodies {
+        let nfields = b.roots.len() - 2; // roots = [fields.., ok, live]
+        let outputs = &r.bound.outcomes[b.outcome].outputs;
+        anyhow::ensure!(
+            outputs.len() == nfields,
+            "shape {si} outcome {}: {} outputs vs {} field roots",
+            b.outcome,
+            outputs.len(),
+            nfields
+        );
+        // A field enters the dedup fold iff it is per-row (no konst) AND the
+        // boundary does not widen it to uniform (rem/timers).
+        let out_fields = &r.lowered.outs[b.outcome].fields;
+        let fields = (0..nfields)
+            .map(|j| AsmField {
+                cell: outputs[j].0 as usize,
+                root: off + j,
+                kind: compiled.root_kinds[off + j],
+                fold: out_fields[j].konst_av.is_none()
+                    && out_fields[j].widen_uniform.is_none(),
+            })
+            .collect();
+        asm_bodies.push(AsmBody {
+            outcome: b.outcome,
+            fields,
+            ok_root: off + nfields,
+            live_root: off + nfields + 1,
+        });
+        off += b.roots.len();
+    }
+
+    let acc_templates = (0..r.bound.outcomes.len())
+        .map(|oi| acc_template(r, oi))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((
+        shape,
+        AsmKernel {
+            loaded,
+            compiled,
+            bodies: asm_bodies,
+            acc_templates,
+            fused,
+            flat_roots,
+            room,
+        },
+    ))
 }
 
 /// The accumulator recipe for one outcome, mirroring the generated `acc{i}`:
@@ -670,9 +718,32 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
 /// kernels are THE kernel backend now, so this always builds when the
 /// compiled engine runs a chunk; `CELESTE_NO_ASM_KERNELS` opts out (pure
 /// reference, for debugging). The root is `CELESTE_ROOT` or the CWD.
+/// The kernel set for the CURRENT rung.
+///
+/// PER-RUNG cache (not a single process-wide set): with the widening in the
+/// graph the ladder kernels specialize to the active rem precision, so an
+/// IN-PROCESS ladder that walks rungs (`rewrite ladder`) needs a distinct
+/// set per rung - a single `OnceLock` would freeze it at level 0's set and
+/// serve the wrong kernels to every rung above. Indexed by rem precision
+/// (Bits(0..15) -> 0..15, Exact/Bits(>=16) -> 16); each slot is its own
+/// lock-free `OnceLock`, so per-chunk dispatch pays one atomic load once the
+/// rung is built. `traced_mode()` (which the build respects) is a function
+/// of the precision plus the process-constant `CELESTE_TRACED_SET` override,
+/// so precision alone keys the set within a process. `ladder.sh`'s
+/// per-process rungs no longer buy anything the in-process cache does not.
 pub(crate) fn registry() -> Option<&'static Registry> {
-    static REG: std::sync::OnceLock<Option<Registry>> = std::sync::OnceLock::new();
-    REG.get_or_init(|| {
+    use crate::interpreter::abstraction::{rem_precision_from_env, RemPrecision};
+    static REGS: [std::sync::OnceLock<Option<Registry>>; 17] =
+        [const { std::sync::OnceLock::new() }; 17];
+    let slot = match rem_precision_from_env() {
+        RemPrecision::Exact => 16,
+        RemPrecision::Bits(b) => (b as usize).min(16),
+    };
+    REGS[slot].get_or_init(build_registry_for_current_rung).as_ref()
+}
+
+fn build_registry_for_current_rung() -> Option<Registry> {
+    {
         if std::env::var_os("CELESTE_NO_ASM_KERNELS").is_some() {
             return None;
         }
@@ -713,8 +784,7 @@ pub(crate) fn registry() -> Option<&'static Registry> {
             }
             Err(e) => panic!("building ASM kernels: {e:#}"),
         }
-    })
-    .as_ref()
+    }
 }
 
 /// A stable structural hash of a graph's nodes (op + args), so a change to

@@ -679,6 +679,54 @@ mod tests {
         );
     }
 
+    /// The per-rung kernel registry serves EACH rung correctly within ONE
+    /// process (the in-process `rewrite ladder`'s core need). With the
+    /// widening in the graph the ladder kernels specialize per rem
+    /// precision, and the registry is now indexed by precision - so
+    /// switching the session precision mid-process (as the ladder does via
+    /// `set_rem_precision`) must build and serve the RIGHT set each time,
+    /// not freeze at the first rung's. Runs the compiled `check` forward at
+    /// Bits(1) then Bits(2) in one process; a stale registry would MISS
+    /// (strict panic) or DIVERGE (check mismatch).
+    #[test]
+    fn per_rung_registry_serves_each_rung_in_one_process() {
+        use crate::interpreter::abstraction::{set_rem_precision, RemPrecision};
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        std::env::set_var("CELESTE_ASM_KERNELS", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+        for k in [1u8, 2u8] {
+            set_rem_precision(RemPrecision::Bits(k));
+            assert_eq!(
+                crate::interpreter::abstraction::rem_precision_from_env(),
+                RemPrecision::Bits(k)
+            );
+            let mut run = AbstractRun::start(&program).expect("start");
+            assert!(run.compiled.is_some(), "compiled engine did not engage at Bits({})", k);
+            for frame in 1..=26 {
+                run.step().unwrap_or_else(|e| {
+                    panic!("Bits({}) frame {}: {:#}", k, frame, e)
+                });
+            }
+        }
+        assert!(
+            crate::compiled::dispatch::traced_lanes() > 0,
+            "no chunk reached a kernel - the per-rung registry checked nothing"
+        );
+        assert_eq!(
+            crate::compiled::dispatch::missed_lanes(),
+            0,
+            "a rung's kernels missed lanes - the per-rung registry served the wrong set"
+        );
+    }
+
     /// The wrapper-widen SKIP is a no-op (plans/keying-widening-flow.md,
     /// Phase 3): with the widening in the graph, the REAL compiled forward
     /// (not check) skips `stream_boundary`'s `make_state_abstract` on its

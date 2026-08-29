@@ -21,7 +21,7 @@
 //! capture semantics subtly wrong would cost a silently wrong graph.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -38,7 +38,7 @@ pub enum Value<D: Domain> {
     Nil,
     Num(D::Num),
     Bool(D::Bool),
-    Str(Rc<str>),
+    Str(Arc<str>),
     Table(TableId),
     /// A closure. A HEAP OBJECT, like a table, referred to by id.
     ///

@@ -45,6 +45,18 @@ pub fn print_asm_append_stats() {
     asm_kernel::print_append_stats();
 }
 
+/// Assemble the ACTIVE rung's kernel set now (retrace + gcc + dlopen),
+/// EAGERLY, instead of on the first mid-search dispatch. The registry is
+/// indexed by rem precision, so a caller stepping through rungs (the
+/// in-process ladder) calls this once per rung - after `set_rem_precision`
+/// - to move the whole build off the search's critical path. Idempotent:
+/// the per-rung `OnceLock` builds once and returns cached thereafter, and
+/// the shapes within a rung assemble in parallel. A no-op under
+/// `CELESTE_NO_ASM_KERNELS`.
+pub fn prewarm_kernels() {
+    let _ = asm_kernel::registry();
+}
+
 /// The lane kernels are the compiled engine (plans/kernel-plan.md); chunks
 /// they refuse fall through to the reference. The retired tile engines
 /// (CELESTE_TILE=1 concrete-button tiles, =2 dynamic expand) are gone - the
