@@ -1287,16 +1287,30 @@ impl CompiledForward {
                 spd_nums(&got_states).iter().take(16).collect::<Vec<_>>(),
             );
 
-            // Per-lane set difference: categorize each INTERPRETER output lane
-            // as interp-only (its row key is not in the compiled output) or
-            // shared, and print the (rem.x, rem.y, spd.x, spd.y) of each
-            // bucket. Since the compiled rows are a strict subset (0 extra),
-            // this shows WHAT distinguishes the rows the graph fails to
-            // produce. Uses the level-0 (raw) key set, computed the same way
-            // on both sides.
-            // Both sides keyed by the SAME raw canonical function
-            // (`row_keys_lane_order`, no widening/dedup) so membership is a
-            // true set comparison, not boundary-vs-canonical.
+            // Per-lane set difference at the RUNG (widened) layer - the same
+            // abstraction the failing comparison uses: split each output state
+            // on the session bucket boundary (`split_precision_straddles`) and
+            // widen to buckets (`make_state_abstract`) BEFORE categorizing, so
+            // the rem/spd shown are bucket-aligned. Keying on
+            // `row_keys_lane_order` of the abstracted states (same function
+            // both sides) makes membership a true set comparison, and the
+            // straddle-split gives each lane exactly one bucket.
+            let rung = |ss: &[State]| -> Vec<State> {
+                let mut out = Vec::new();
+                for s in ss {
+                    if s.vector_size == 0 {
+                        continue;
+                    }
+                    for st in crate::interpreter::abstraction::split_precision_straddles(s.clone()) {
+                        let mut st = crate::interpreter::abstraction::make_state_abstract(st);
+                        st.gc();
+                        out.push(st);
+                    }
+                }
+                out
+            };
+            let reference = rung(&reference);
+            let got_states = rung(&got_states);
             let graph_keys: std::collections::HashSet<(u64, u64)> = got_states
                 .iter()
                 .flat_map(|s| self.engine.row_keys_lane_order(s))
@@ -1305,8 +1319,8 @@ impl CompiledForward {
             // (the mark cells are an unordered set, so sort for a canonical,
             // comparable signature; x vs y is not separated but the pair of
             // values is enough to see the missing fork dimension).
-            type LC = (Vec<(i32, i32)>, Vec<i32>);
-            let lane_content = |s: &State, lane: usize| -> LC {
+            type LC = ((i16, i16), Vec<(i32, i32)>, Vec<i32>);
+            let lane_rs = |s: &State, lane: usize| -> (Vec<(i32, i32)>, Vec<i32>) {
                 let marks = crate::interpreter::abstraction::mark_heap(s);
                 let mut rems: Vec<(i32, i32)> = Vec::new();
                 if let Some(cells) = marks.marks.get("player_rem_xy") {
@@ -1336,6 +1350,13 @@ impl CompiledForward {
                 spds.sort();
                 (rems, spds)
             };
+            let lane_content = |s: &State, lane: usize| -> LC {
+                let xy = crate::interpreter::abstraction::player_xy_per_lane(s)
+                    .and_then(|v| v.get(lane).copied())
+                    .unwrap_or((-1, -1));
+                let (rems, spds) = lane_rs(s, lane);
+                (xy, rems, spds)
+            };
             let mut only: std::collections::BTreeSet<LC> = Default::default();
             let mut both: std::collections::BTreeSet<LC> = Default::default();
             let (mut n_only, mut n_both) = (0usize, 0usize);
@@ -1361,20 +1382,42 @@ impl CompiledForward {
                 both.len(),
             );
             let show = |label: &str, set: &std::collections::BTreeSet<LC>| {
-                eprintln!("[check dump]   {label} (rems, spds) sample:");
+                eprintln!("[check dump]   {label} (xy, rems, spds) sample:");
                 for c in set.iter().take(20) {
-                    eprintln!("[check dump]     rems={:08x?} spds={:08x?}", c.0, c.1);
+                    eprintln!("[check dump]     xy={:?} rems={:08x?} spds={:08x?}", c.0, c.1, c.2);
                 }
             };
             show("INTERP-ONLY", &only);
             show("SHARED", &both);
-            // rem/spd signatures that appear ONLY in interp-only lanes (never
-            // shared) - the fork dimension the graph misses entirely.
+            // Which coordinate actually discriminates: distinct xy, and
+            // distinct (rem,spd) IGNORING xy, in each bucket. If the xy sets
+            // differ but the (rem,spd) sets coincide, position is the missing
+            // fork dimension; if (rem,spd) differ, it is the physics.
+            let xy_set = |set: &std::collections::BTreeSet<LC>| -> std::collections::BTreeSet<(i16, i16)> {
+                set.iter().map(|c| c.0).collect()
+            };
+            let rs_set = |set: &std::collections::BTreeSet<LC>| -> std::collections::BTreeSet<(Vec<(i32, i32)>, Vec<i32>)> {
+                set.iter().map(|c| (c.1.clone(), c.2.clone())).collect()
+            };
+            let (only_xy, both_xy) = (xy_set(&only), xy_set(&both));
+            let (only_rs, both_rs) = (rs_set(&only), rs_set(&both));
+            eprintln!(
+                "[check dump]   distinct xy: interp-only {} (of which {} NOT in shared), shared {}",
+                only_xy.len(),
+                only_xy.difference(&both_xy).count(),
+                both_xy.len(),
+            );
+            eprintln!(
+                "[check dump]   distinct (rem,spd) ignoring xy: interp-only {} (of which {} NOT in shared), shared {}",
+                only_rs.len(),
+                only_rs.difference(&both_rs).count(),
+                both_rs.len(),
+            );
             let only_sig: std::collections::BTreeSet<&LC> = only.iter().collect();
             let both_sig: std::collections::BTreeSet<&LC> = both.iter().collect();
             let excl: Vec<_> = only_sig.difference(&both_sig).collect();
             eprintln!(
-                "[check dump]   rem/spd signatures ONLY in interp-only lanes: {} of {} interp-only",
+                "[check dump]   full signatures ONLY in interp-only lanes: {} of {} interp-only",
                 excl.len(),
                 only.len(),
             );

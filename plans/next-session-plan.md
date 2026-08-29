@@ -418,3 +418,28 @@ PLUS every `__split_by_flr` floor-fragment. The graph's rows are a strict subset
 part 2: the fused graph does not fragment rem per floor at Bits(2). The fix is to
 make the ladder trace reproduce `__split_by_flr`'s fragmentation at the finest
 rung the set runs at.
+
+### CORRECTION + part 4 (2026-08-29): the divergence survives widening as POSITION, not rem
+
+Philippe caught that part 3 keyed on the RAW (un-widened) canonical key, so its
+"126 interp-only narrowed rems" are pre-widening intervals that STRADDLE the
+Bits(2) bucket boundary - `split_precision_straddles` + `make_state_abstract`
+would widen them back to clean buckets. Re-ran the per-lane categorization at the
+RUNG layer (the abstraction the failing comparison actually uses: split straddles
++ widen), and added player position (`player_xy_per_lane`) to the signature.
+
+At the widened layer:
+- rem is CLEAN buckets on BOTH sides - the raw rem narrowing genuinely widens
+  away, exactly as Philippe expected.
+- The discriminator is POSITION: interp-only lanes sit at y=106; shared lanes at
+  y=109 (x in {4,6} both). The interp-only xy set is DISJOINT from the shared xy
+  set (5 vs 5, zero overlap). Graph is still a strict subset (0 graph-only).
+
+So the mechanism, correctly stated: the graph under-forks `__split_by_flr` on
+rem; the fragments it drops carry different `amount = flr(rem.y + spd.y + 0.5)`
+values, so the vertical move reaches player positions (y=106, ~3px further up)
+the graph never produces. rem widens back to a bucket, but the POSITION it fed is
+a distinct reachable state that does NOT widen away - which is why the rung check
+genuinely fails (904 vs 184, 0 extra). The fix is unchanged (reproduce the
+interpreter's rem fragmentation at the fine rung so all move amounts, hence all
+positions, are produced); part 3's rem-only framing was at the wrong layer.
