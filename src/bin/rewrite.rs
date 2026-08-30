@@ -89,18 +89,6 @@ enum Command {
         #[arg(long)]
         base_dir: String,
     },
-    /// Census of a saved frame batch: lanes grouped by object-array shape
-    /// (abstraction::object_shape), with the fruit `off`-counter spread when a
-    /// fruit is alive. For diagnosing frontier bloat - e.g. room (0,0)'s
-    /// post-break lanes, whose ever-incrementing `off` defeats cross-frame
-    /// dedup (plans/room00-plan.md).
-    ShapeCensus {
-        /// Checkpoint dir with saved frames (bench --save-frames).
-        #[arg(long)]
-        checkpoint_dir: String,
-        #[arg(long)]
-        frame: u32,
-    },
     Bench {
         #[arg(long, default_value_t = 34)]
         frames: u32,
@@ -1367,91 +1355,6 @@ fn main() -> Result<()> {
     let recipe = Recipe::load(&cli.recipe)?;
 
     match cli.command {
-        Command::ShapeCensus {
-            checkpoint_dir,
-            frame,
-        } => {
-            use celeste_rust::interpreter::abstraction::object_shape;
-            use celeste_rust::interpreter::inspect::StateHelper;
-            use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
-            use celeste_rust::search::checkpoint;
-            let dir = std::path::PathBuf::from(&checkpoint_dir);
-            let states = checkpoint::load_frame_states(&dir, frame)?;
-            // shape -> (states, lanes)
-            let mut by_shape: std::collections::BTreeMap<String, (usize, usize)> =
-                Default::default();
-            // Distinct fruit `off` values across all fruit-alive lanes.
-            let mut off_values: std::collections::BTreeSet<i32> = Default::default();
-            let mut fruit_lanes = 0usize;
-            for state in &states {
-                let shape = match object_shape(state) {
-                    Ok(v) => v.join(","),
-                    Err(e) => format!("<unreadable: {:#}>", e),
-                };
-                let entry = by_shape.entry(shape.clone()).or_insert((0, 0));
-                entry.0 += 1;
-                entry.1 += state.vector_size;
-                if shape.split(',').any(|t| t == "fruit") {
-                    fruit_lanes += state.vector_size;
-                    let helper = StateHelper::new(state);
-                    let arr = helper
-                        .find_global("objects")
-                        .and_then(|id| helper.unwrap_pointer(helper.load(id)));
-                    if let Some(arr_id) = arr {
-                        for obj_id in helper
-                            .find_objects_by_type(arr_id, "fruit")
-                            .map_err(|e| anyhow!("{}", e))?
-                        {
-                            let HeapValue::ObjectTable(obj) = helper.load(obj_id) else {
-                                continue;
-                            };
-                            let Some(off_cell) = obj.get("off") else {
-                                continue;
-                            };
-                            match helper.load(*off_cell) {
-                                HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => {
-                                    off_values.insert(n.as_raw_u32() as i32);
-                                }
-                                HeapValue::Value(Value::Number(MaybeVector::Vector(ns))) => {
-                                    for n in ns.iter() {
-                                        off_values.insert(n.as_raw_u32() as i32);
-                                    }
-                                }
-                                other => println!("  fruit off is not a number: {:?}", other),
-                            }
-                        }
-                    }
-                }
-            }
-            let total_lanes: usize = by_shape.values().map(|(_, l)| l).sum();
-            println!(
-                "frame f{:03}: {} states, {} lanes",
-                frame,
-                states.len(),
-                total_lanes
-            );
-            for (shape, (st, lanes)) in &by_shape {
-                println!(
-                    "  [{}] {} states, {} lanes ({:.1}%)",
-                    shape,
-                    st,
-                    lanes,
-                    100.0 * *lanes as f64 / total_lanes.max(1) as f64
-                );
-            }
-            if fruit_lanes > 0 {
-                let min = off_values.iter().next().copied().unwrap_or(0);
-                let max = off_values.iter().next_back().copied().unwrap_or(0);
-                println!(
-                    "  fruit off: {} distinct raw values across {} fruit lanes, raw range [{}, {}]",
-                    off_values.len(),
-                    fruit_lanes,
-                    min,
-                    max
-                );
-            }
-        }
-
         Command::Bench {
             frames,
             baseline,
