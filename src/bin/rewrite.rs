@@ -27,17 +27,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Certify the canonical-state mapping and the deopt path: run the
-    /// rewritten program with deopt *forced* on every state of every frame -
-    /// so each frame goes specialized-input -> to_canonical -> plain program
-    /// -> from_canonical - and compare observations frame by frame against a
-    /// plain-program run. Equal through N frames means both mapping
-    /// directions and the plain re-run are exercised on every reachable state
-    /// without changing meaning.
-    Deoptcheck {
-        #[arg(long, default_value_t = 34)]
-        frames: u32,
-    },
     /// Replay a concrete input sequence (the reference TAS) and probe every
     /// refinement level's row table and (e, g) band per frame. The first
     /// frame where the true winning path is missing from a level's table or
@@ -1378,54 +1367,6 @@ fn main() -> Result<()> {
     let recipe = Recipe::load(&cli.recipe)?;
 
     match cli.command {
-        Command::Deoptcheck { frames } => {
-            use celeste_rust::search::run::{observe_frame, AbstractRun};
-            use celeste_rust::search::state_mapping::StateMapping;
-            let plain = Program::compile_executable_from_disk()?;
-            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
-            let mapping = StateMapping::from_recipe(&recipe);
-            println!(
-                "canonical-state mapping: {} (function, capture) pair(s)",
-                mapping.pair_count()
-            );
-            // Order matters: `set_merge_partition_patterns` is process-global,
-            // so start the plain run first and the specialized run second -
-            // then both merge under the specialized partition key, exactly as
-            // `differential_abstract` does.
-            let mut plain_run = AbstractRun::start(&plain)?;
-            let mut forced = AbstractRun::start_with_deopt(&program, &plain, mapping, true)?;
-            for frame in 1..=frames {
-                plain_run.step()?;
-                forced.step()?;
-                let a = observe_frame(plain_run.states());
-                let b = observe_frame(forced.states());
-                if a != b {
-                    println!(
-                        "DIVERGED at frame {}: plain run != forced-deopt run ({} vs {} \
-                         state observations). The canonical-state mapping or the deopt \
-                         path changed meaning.",
-                        frame,
-                        a.len(),
-                        b.len()
-                    );
-                    std::process::exit(1);
-                }
-                if frame % 5 == 0 || frame == frames {
-                    println!(
-                        "frame {}: identical ({} lanes, {} deopted states so far)",
-                        frame,
-                        forced.lane_count(),
-                        forced.deopt_events().0
-                    );
-                }
-            }
-            println!(
-                "ok: deopt path certified through frame {} - every state of every frame \
-                 went specialized -> canonical -> plain program -> specialized without \
-                 changing the reachable set",
-                frames
-            );
-        }
         Command::ShapeCensus {
             checkpoint_dir,
             frame,
