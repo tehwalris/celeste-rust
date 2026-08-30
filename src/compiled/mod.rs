@@ -181,52 +181,11 @@ pub fn print_chunk_phase_times() {
     }
 }
 
-/// The per-lane origin tags the engine carries as METADATA rather than
-/// state (plans/kernel-ladder.md "the passthrough column"): the backward
-/// sweep's row-id column. (The pos-graph recorder used to carry a cell
-/// column here too; it now partitions merges by input position instead of
-/// tagging, so it needs no passthrough - see `pos_graph::PosObserver`.)
-///
-/// Outside the engine the tag stays what it always was, a per-lane heap
-/// global (`deopt_collect::inject_named`), because that is what the
-/// interpreter path executes and what the observers read. The bridge is
-/// where the representations meet: `run_frame_chunk` strips the global
-/// into `Rt2::origin` on import (import drops unknown globals anyway, so
-/// the kernels bind the untagged shape) and re-injects it on export.
-const ORIGIN_TAGS: [&str; 1] = [crate::search::sweep::SWEEP_ORIGIN];
-
-/// The origin tag `state` carries, if any.
-fn origin_tag_of(state: &crate::interpreter::state::State) -> Option<&'static str> {
-    let mut found = None;
-    for tag in ORIGIN_TAGS {
-        if state.global_env.contains_key(tag) {
-            assert!(found.is_none(), "a state with two origin tags");
-            found = Some(tag);
-        }
-    }
-    found
-}
-
-/// `bridge::export_block`, plus the origin metadata back as the named
-/// global so the interpreter path (and the observers) see the same state
-/// the interpreter itself would have carried.
-fn export_block_tagged(block: &runtime2::Rt2, tag: Option<&str>) -> crate::interpreter::state::State {
-    let mut state = bridge::export_block(block);
-    if let Some(tag) = tag {
-        assert!(
-            !block.origin.is_empty(),
-            "an origin-tagged chunk lost its origin metadata in the engine"
-        );
-        crate::interpreter::deopt_collect::inject_named(&mut state, tag, &block.origin);
-    }
-    state
-}
-
 /// The assert-noop guard body (`dispatch::widen_noop_check`): a
 /// widen-in-graph kernel's output state must be a FIXED POINT of the
 /// campaign's `split_precision_straddles` + `make_state_abstract`. Keys
 /// both the state as-is and its re-abstraction with the SAME
-/// `sweep::row_keys` (so it is a pure "did the boundary move anything"
+/// `engine_row_keys` (so it is a pure "did the boundary move anything"
 /// test, no cross-keyer question), and panics on the first difference -
 /// naming itself, under the never-deopt doctrine.
 fn assert_widen_is_noop(state: &crate::interpreter::state::State) {
@@ -235,7 +194,7 @@ fn assert_widen_is_noop(state: &crate::interpreter::state::State) {
         return;
     }
     let keys = |s: &crate::interpreter::state::State| -> HashSet<(u64, u64)> {
-        crate::search::sweep::row_keys(s)
+        engine_row_keys(s)
             .expect("widen-noop: row_keys")
             .into_iter()
             .collect()
@@ -474,18 +433,7 @@ impl FrameEngine {
         state: &crate::interpreter::state::State,
     ) -> Vec<KeyedState> {
         let mut t = ChunkTimer::start();
-        // An origin-tagged chunk (the backward sweep, the pos-graph
-        // recorder): the per-lane tag global becomes engine metadata for
-        // the duration of the frame. `import_block` drops the global (it
-        // is outside GLOBAL_NAMES), so the block's shape is the untagged
-        // one and the kernels bind it; the metadata rides `Rt2::origin`
-        // through partition, kernel appends, dedup and merge, and is
-        // re-injected as the global on every exit back to `State`.
-        let origin_tag = origin_tag_of(state);
-        let mut block = bridge::import_block(state, self.cart.clone(), self.cache.clone());
-        if let Some(tag) = origin_tag {
-            block.origin = crate::interpreter::deopt_collect::read_origins_named(state, tag);
-        }
+        let block = bridge::import_block(state, self.cart.clone(), self.cache.clone());
         t.mark(CHUNK_IMPORT);
         let mut pending: Vec<(runtime2::Rt2, bool)> = self
             .partition_chunks(vec![block], campaign_chunk_rows())
@@ -575,14 +523,14 @@ impl FrameEngine {
         t.mark(CHUNK_MERGE);
         if dispatch::widen_noop_check() {
             for b in &merged {
-                assert_widen_is_noop(&export_block_tagged(b, origin_tag));
+                assert_widen_is_noop(&bridge::export_block(b));
             }
         }
         out.extend(
             merged.iter().map(|b| {
                 // Carry the engine keys unconditionally - the engine-keyed
                 // frontier is the only frontier.
-                (export_block_tagged(b, origin_tag), Some(b.row_keys.clone()))
+                (bridge::export_block(b), Some(b.row_keys.clone()))
             }),
         );
         t.mark(CHUNK_EXPORT);
@@ -597,17 +545,12 @@ impl FrameEngine {
     /// Reproduces exactly what a compiled forward's boundary stored for the
     /// same already-abstracted content, so the backward sweep and the band
     /// filter can recompute a saved state's keys and find them in the row
-    /// table. `import_block` + `Rt2::row_keys_canonical`; origin-tagged
-    /// states (sweep / pos-graph replays) carry their tag into `Rt2::origin`
-    /// exactly as `row_key_set` does, so the mixed keys match.
+    /// table. `import_block` + `Rt2::row_keys_canonical`.
     pub fn row_keys_lane_order(
         &self,
         state: &crate::interpreter::state::State,
     ) -> Vec<(u64, u64)> {
         let mut b = bridge::import_block(state, self.cart.clone(), self.cache.clone());
-        if let Some(tag) = origin_tag_of(state) {
-            b.origin = crate::interpreter::deopt_collect::read_origins_named(state, tag);
-        }
         b.row_keys_canonical()
     }
 
@@ -635,15 +578,6 @@ impl FrameEngine {
                 continue;
             }
             let mut b = bridge::import_block(s, self.cart.clone(), self.cache.clone());
-            // Origin-tagged states (the sweep / pos-graph replays under
-            // check mode): compare (origin, row) PAIRS, not the row
-            // projection - `boundary` mixes `Rt2::origin` into the keys.
-            // Import drops the tag global, so without this the comparator
-            // would pass on outputs whose rows match but whose
-            // attributions do not.
-            if let Some(tag) = origin_tag_of(s) {
-                b.origin = crate::interpreter::deopt_collect::read_origins_named(s, tag);
-            }
             b.boundary(&self.ids);
             keys.extend(b.row_keys.iter().copied());
         }

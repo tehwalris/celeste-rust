@@ -125,7 +125,6 @@ impl AsmKernel {
         let mut outbuf = vec![0u8; self.compiled.n_roots * 128];
         let env = CollisionEnv { cart: &chunk.cart, cache: &chunk.cache };
         let ctx = AsmCtx::new(&env as *const CollisionEnv as *const c_void);
-        let track_origin = !chunk.origin.is_empty();
         // Within-chunk dedup, per outcome: the same row key (the boundary's,
         // via the (h1,h2) fold - the uniform `part` is constant per outcome,
         // so deduping on the fold is exactly deduping on the key) skips
@@ -222,9 +221,7 @@ impl AsmKernel {
                     }
                     // The row's (h1,h2) fold over the varying, non-widened
                     // cells - equivalent to the boundary key (constant part
-                    // per outcome). Origin (sweep/pos-graph) is mixed in so
-                    // rows with different origins never dedup, matching the
-                    // boundary's origin mixing.
+                    // per outcome).
                     let (mut h1, mut h2) = (0u64, 0u64);
                     for f in &body.fields {
                         if !f.fold {
@@ -234,19 +231,11 @@ impl AsmKernel {
                         h1 = h1.wrapping_add(runtime2::cell_mix(f.cell as u64, av, KEY_SEED1));
                         h2 = h2.wrapping_add(runtime2::cell_mix(f.cell as u64, av, KEY_SEED2));
                     }
-                    if track_origin {
-                        let om = runtime2::mix64(ORIGIN_KEY_SEED ^ chunk.origin[lo + i] as u64);
-                        h1 ^= om;
-                        h2 ^= om;
-                    }
                     if !seen.insert((h1, h2)) && !no_seen {
                         continue;
                     }
                     for f in &body.fields {
                         push_field(acc, f, &outbuf, i);
-                    }
-                    if track_origin {
-                        acc.origin.push(chunk.origin[lo + i]);
                     }
                     acc.width += 1;
                 }
@@ -426,7 +415,6 @@ fn read_zb_holds(buf: &[u8], root: usize) -> u16 {
 /// append folds the same cell_mix so its dedup key equals the boundary's.
 const KEY_SEED1: u64 = 0x5bf0_3635;
 const KEY_SEED2: u64 = 0x27d4_eb2f;
-const ORIGIN_KEY_SEED: u64 = 0x517c_c1b7_2722_0a95;
 
 /// The `AV` a field root holds for lane `i` (for the dedup fold).
 fn read_field_av(f: &AsmField, buf: &[u8], i: usize) -> AV {

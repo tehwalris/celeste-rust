@@ -1,5 +1,4 @@
 pub mod abstraction;
-pub mod deopt_collect;
 pub mod fixed_env;
 pub mod heap;
 pub mod inspect;
