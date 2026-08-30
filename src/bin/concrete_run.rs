@@ -7,13 +7,11 @@
 
 use anyhow::Result;
 use celeste_rust::concrete;
-use celeste_rust::interpreter::fixed_env::PreparedCfg;
 use celeste_rust::interpreter::inspect::StateHelper;
 use celeste_rust::interpreter::heap::HeapId;
 use celeste_rust::interpreter::state::State;
 use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
 use celeste_rust::pico8_num::Pico8Num;
-use celeste_rust::program::Program;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -172,12 +170,9 @@ fn main() -> Result<()> {
     );
     println!();
 
-    let program = Program::compile_executable_from_disk()?;
-    let fixed_env = program.fixed_env();
-    let frame_cfg = PreparedCfg::new(program.frame_cfg().clone());
-
     println!("Running game init...");
-    let mut state = concrete::initial_state(&program, &fixed_env)?;
+    let mut ce = concrete::ConcreteEngine::new()?;
+    let mut state = ce.initial_state()?;
     println!("Init complete.\n");
 
     // Print initial state
@@ -206,7 +201,7 @@ fn main() -> Result<()> {
         } else {
             0
         };
-        state = concrete::step_frame(&frame_cfg, state, &fixed_env, input_byte)?;
+        state = ce.step_frame(state, input_byte)?;
         print_frame(&state, frame_num, input_byte);
     }
 

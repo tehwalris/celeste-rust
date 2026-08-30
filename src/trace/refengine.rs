@@ -29,6 +29,11 @@ use crate::trace::verify::run_one;
 pub struct RefEngine {
     it: Interp<'static, RefDomain>,
     body: &'static ast::Ast,
+    /// The concrete frame body: `_update();_draw()` with NO button reset, so
+    /// a caller that has already set the six buttons concretely gets one
+    /// deterministic leaf (the concrete replay path: `concrete_run`, the TAS
+    /// walks). The forking body (`body`) resets and re-forks the buttons.
+    body_concrete: &'static ast::Ast,
     base: TState<RefDomain>,
     fn_info: FnInfo,
 }
@@ -44,6 +49,8 @@ impl RefEngine {
         let body: &'static ast::Ast = Box::leak(Box::new(full_moon::parse(
             "__reset_button_states()\n_update()\n_draw()",
         )?));
+        let body_concrete: &'static ast::Ast =
+            Box::leak(Box::new(full_moon::parse("_update()\n_draw()")?));
 
         let cart = Arc::new(CartData::load("cart")?);
         let (rx, ry) = crate::game_runner::start_room();
@@ -56,7 +63,38 @@ impl RefEngine {
         let base = run_one(&mut it, init, st0)?;
         let fn_info = fn_info_of(&base)?;
 
-        Ok(RefEngine { it, body, base, fn_info })
+        Ok(RefEngine { it, body, body_concrete, base, fn_info })
+    }
+
+    /// The frame-0 state (post-`_init`, with the native `tile_flag_at`
+    /// injected) as a one-lane old-interpreter boundary state - the
+    /// RefEngine equivalent of `interpret_cfg(init_cfg, ...)`. Used to seed
+    /// the search and the frame-0 blocks now that the CFG interpreter is
+    /// gone. The bridge gate proves each subsequent frame reproduces the
+    /// interpreter; the init is frame 0 of that same derivation.
+    pub fn initial_state(&self) -> Result<OState> {
+        crate::trace::refbridge::to_interp_state(&self.base)
+    }
+
+    /// One CONCRETE frame of a single-lane state whose six buttons the caller
+    /// has already set (`concrete::set_concrete_buttons`). Runs
+    /// `_update();_draw()` with no reset and no forking, so a fully concrete
+    /// input yields exactly one successor - the drop-in for
+    /// `concrete::step_frame`'s `interpret_prepared_cfg`.
+    pub fn run_frame_concrete(&mut self, input: &OState) -> Result<OState> {
+        use anyhow::bail;
+        if input.vector_size != 1 {
+            bail!("run_frame_concrete expects one lane, got {}", input.vector_size);
+        }
+        let mut d = RefDomain::new();
+        let mut bridged = to_trace_state(input, 0, &mut d)?;
+        patch_closures_for(&mut bridged, &self.fn_info)?;
+        add_missing_builtins(&mut bridged, &self.base);
+        let leaves = run_frame_all(&mut self.it, self.body_concrete, &bridged)?;
+        if leaves.len() != 1 {
+            bail!("concrete frame produced {} leaves (expected exactly 1)", leaves.len());
+        }
+        to_interp_state(&leaves[0])
     }
 
     /// Run one frame of every lane of `input`, returning all successor states

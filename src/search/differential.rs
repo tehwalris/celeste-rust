@@ -266,375 +266,6 @@ fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::Instruction;
-
-    /// A differential checker that never fails is worthless. Deliberately
-    /// corrupt the program and confirm the checker notices.
-    ///
-    /// The corruption is a single changed numeric constant in a function that
-    /// runs every frame - about the smallest semantic change expressible.
-    #[test]
-    fn differential_run_catches_a_changed_constant() {
-        let baseline = match Program::compile_from_disk() {
-            Ok(p) => p,
-            // The test needs lua/ next to the working directory; skip rather
-            // than fail when run from somewhere else.
-            Err(_) => return,
-        };
-        let mut broken = baseline.clone();
-
-        let fun = broken
-            .get_mut("player_spawn.update_24")
-            .expect("player_spawn.update_24 exists");
-        let mut patched = false;
-        for block in std::iter::once(&mut fun.cfg.entry).chain(fun.cfg.named.values_mut()) {
-            for (_, instr) in block.instructions.iter_mut() {
-                if let Instruction::NumberConstant { value } = instr {
-                    *value = *value + crate::pico8_num::Pico8Num::from_i16(1);
-                    patched = true;
-                    break;
-                }
-            }
-            if patched {
-                break;
-            }
-        }
-        assert!(patched, "expected a numeric constant to corrupt");
-
-        let result = differential_abstract(&baseline, &broken, 26)
-            .expect("differential run should complete");
-        assert!(
-            result.is_some(),
-            "differential verification passed a program with a changed constant"
-        );
-    }
-
-    /// End-to-end check of the lane-granular deopt machinery: corrupt the
-    /// rewritten program with a synthetic premise that only *some* lanes
-    /// satisfy - an `assert_true` on an `expand`-produced button bool, so
-    /// half the expanded lanes falsify it every frame - and run with deopt.
-    /// The captured lanes re-run under the plain program through the
-    /// canonical-state mapping; the result must match the unmodified
-    /// rewritten program's observations exactly, every frame.
-    ///
-    /// This exercises: origin injection and stripping, collect-mode capture
-    /// and mid-fragment filtering, the lane-coverage accounting, the plain
-    /// re-run of only the failed lanes, and the merge of both output sets.
-    #[test]
-    fn granular_deopt_reproduces_the_baseline() {
-        // Serialise against the partition-toggle tests: this test compares
-        // a baseline run against a candidate run, and a toggle flip
-        // between the two makes them diverge spuriously.
-        let _partition =
-            crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-        {
-            return;
-        }
-        let recipe = crate::program::recipe::Recipe::load("rewrites.jsonl").expect("load recipe");
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-        let plain = Program::compile_from_disk().expect("compile plain");
-        let mapping = crate::search::state_mapping::StateMapping::from_recipe(&recipe);
-        assert!(!mapping.is_identity());
-
-        // Corrupt: assert the outputs of the first few comparisons in the
-        // fused frame body. Comparisons on player state are lane-mixed once
-        // the input fan-out starts, so some lanes falsify these synthetic
-        // premises every frame - the partial-capture path - while scalar
-        // frames and uniform fragments exercise the capture-all path.
-        let mut corrupted = program.clone();
-        let fun = corrupted
-            .get_mut("anonymous_61")
-            .expect("the fused frame body exists");
-        let mut next_id: usize = std::iter::once(&fun.cfg.entry)
-            .chain(fun.cfg.named.values())
-            .flat_map(|b| {
-                b.instructions
-                    .iter()
-                    .map(|(id, _)| usize::from(*id))
-                    .chain(std::iter::once(usize::from(b.terminator.0)))
-            })
-            .max()
-            .unwrap_or(0)
-            + 1;
-        // Entry first, then the named blocks BY LABEL. `named` is an
-        // `FxHashMap`, so `values_mut()` visits it in an order that
-        // depends on how the map was BUILT - and the program is loaded
-        // from a frozen artifact now, i.e. `collect()`ed in one go
-        // rather than grown one rule at a time. That changed which three
-        // comparisons got corrupted, the new three happened to hold on
-        // every lane, and the premise never fired - while the program
-        // under test was identical. Sorting is what `blocks_in_order`
-        // does for printing, for exactly this reason.
-        let mut order: Vec<crate::ir::Label> = fun.cfg.named.keys().cloned().collect();
-        order.sort();
-        let mut inserted = 0;
-        let corrupt = |block: &mut crate::ir::Block, next_id: &mut usize, n: &mut usize| {
-            let mut index = 0;
-            while index < block.instructions.len() && *n < 3 {
-                if matches!(
-                    block.instructions[index].1,
-                    Instruction::BinaryOp {
-                        op: crate::ir::BinaryOp::LessThan | crate::ir::BinaryOp::GreaterThan,
-                        ..
-                    }
-                ) {
-                    let target = block.instructions[index].0;
-                    block.instructions.insert(
-                        index + 1,
-                        (
-                            crate::ir::LocalId::from(*next_id),
-                            Instruction::AssertTrue { value: target },
-                        ),
-                    );
-                    *next_id += 1;
-                    *n += 1;
-                    index += 1;
-                }
-                index += 1;
-            }
-        };
-        corrupt(&mut fun.cfg.entry, &mut next_id, &mut inserted);
-        for label in &order {
-            if inserted >= 3 {
-                break;
-            }
-            let block = fun.cfg.named.get_mut(label).expect("label came from the map");
-            corrupt(block, &mut next_id, &mut inserted);
-        }
-        assert!(inserted > 0, "no comparison found to corrupt");
-
-        let frames = 28;
-        let baseline = observation_trace(&program, frames).expect("baseline trace");
-        let mut run = AbstractRun::start_with_deopt(&corrupted, &plain, mapping, false)
-            .expect("start deopt run");
-        for frame in 1..=frames {
-            run.step().expect("step");
-            assert_eq!(
-                observe_frame(run.states()),
-                baseline[frame as usize],
-                "granular deopt diverged from the baseline at frame {}",
-                frame
-            );
-        }
-        let (states, lanes) = run.deopt_events();
-        assert!(states > 0, "the synthetic premise never fired");
-        assert!(lanes > 0, "no lanes re-ran under the plain program");
-    }
-
-    /// The compiled frame body - the TRACED kernels - produces the
-    /// interpreter's rows (P1 stage 3, tracing.md stage 5).
-    ///
-    /// `CELESTE_COMPILED_FORWARD=check` runs BOTH engines on every chunk
-    /// and compares canonical row-key SETS, failing the step on the first
-    /// difference. Set equality is the right claim and the only one
-    /// available: the compiled path returns a different PARTITION of the
-    /// same rows (different block count, lane order and heap layout), so
-    /// `observe_frame` would differ for a correct run. Every chunk the
-    /// traced set claims is therefore checked against the interpreter.
-    ///
-    /// Lane counts are checked against an interpreted baseline on top,
-    /// because a bug that dropped a row from both sides symmetrically
-    /// would pass the key comparison. The traced-lane assertion matters
-    /// more: the traced set is indexed by heap SHAPE, so a set generated
-    /// for shapes this run never reaches would miss every chunk, fall
-    /// through to the interpreter, and pass this test having run none of
-    /// the code it names.
-    ///
-    /// Sets a process-global env var and relies on nextest's
-    /// process-per-test isolation, like the other global-state tests here.
-    #[test]
-    fn traced_kernels_reproduce_the_interpreter() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-
-        // 30, not 12. The spawn animation holds the search at ONE lane
-        // until about frame 24, and the first `rem` straddle - the first
-        // frame where a fork actually splits a lane - is frame 25. At 12
-        // frames this test was green on a kernel set that lost 38 rows at
-        // frame 25 (the flat-fork set of 6a2672c, found by the 30-frame
-        // CELESTE_COMPILED_FORWARD=check run in the Phase 1 gate).
-        let frames = 30;
-        let mut baseline = AbstractRun::start(&program).expect("start baseline");
-        let mut want = Vec::new();
-        for _ in 1..=frames {
-            baseline.step().expect("baseline step");
-            want.push(baseline.lane_count());
-        }
-        drop(baseline);
-
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
-        let mut run = AbstractRun::start(&program).expect("start compiled run");
-        assert!(run.compiled.is_some(), "the compiled engine did not engage");
-        for (frame, want) in (1..=frames).zip(want) {
-            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
-            assert_eq!(
-                run.lane_count(),
-                want,
-                "the traced kernels have a different lane count at frame {}",
-                frame
-            );
-        }
-        assert!(
-            crate::compiled::dispatch::traced_lanes() > 0,
-            "no chunk ever reached a traced kernel - the set covers no shape this run \
-             produces, so this test checked nothing"
-        );
-        // Since the lattice campaign the base set carries pin_guard
-        // obligations, so a miss here can also mean a DECLINED lane -
-        // a lattice constant the real run disagrees with. In check mode
-        // a missed chunk falls through to the interpreter on both sides
-        // and the comparison passes vacuously, which is exactly the
-        // silent coverage collapse this assert exists to catch.
-        assert_eq!(
-            crate::compiled::dispatch::missed_lanes(),
-            0,
-            "the base lattice set missed lanes on room (1,0)"
-        );
-    }
-
-    /// The ASM kernels reproduce the interpreter, per chunk, on room (1,0).
-    ///
-    /// Same gate as `traced_kernels_reproduce_the_interpreter` but with
-    /// `CELESTE_ASM_KERNELS=1`, so the compiled engine dispatches to the
-    /// runtime-assembled AVX-512 kernels (the fused graph, `asm_kernel`)
-    /// instead of the generated Rust ones. `CELESTE_COMPILED_FORWARD=check`
-    /// runs BOTH the engine and the interpreter on every chunk and compares
-    /// their row-key sets, so a divergence is a hard error, not a silent
-    /// lane-count match. `missed_lanes() == 0` proves the ASM kernels
-    /// actually covered every chunk (a miss would fall through to the
-    /// interpreter and pass vacuously).
-    ///
-    /// The registry retraces the start room and shells out to `gcc` on
-    /// first dispatch, so this is slower than the Rust-kernel gate -
-    /// `#[ignore]` over an env check would hide the cost; it runs, and if it
-    /// is too slow for every commit it can be moved behind `#[ignore]`.
-    #[test]
-    fn asm_kernels_reproduce_the_interpreter() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-
-        let frames = 30;
-        let mut baseline = AbstractRun::start(&program).expect("start baseline");
-        let mut want = Vec::new();
-        for _ in 1..=frames {
-            baseline.step().expect("baseline step");
-            want.push(baseline.lane_count());
-        }
-        drop(baseline);
-
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
-        std::env::set_var("CELESTE_ASM_KERNELS", "1");
-        let mut run = AbstractRun::start(&program).expect("start compiled run");
-        assert!(run.compiled.is_some(), "the compiled engine did not engage");
-        for (frame, want) in (1..=frames).zip(want) {
-            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
-            assert_eq!(
-                run.lane_count(),
-                want,
-                "the ASM kernels have a different lane count at frame {}",
-                frame
-            );
-        }
-        assert!(
-            crate::compiled::dispatch::traced_lanes() > 0,
-            "no chunk ever reached an ASM kernel - the registry covers no shape \
-             this run produces, so this test checked nothing"
-        );
-        assert_eq!(
-            crate::compiled::dispatch::missed_lanes(),
-            0,
-            "the ASM kernels missed lanes on room (1,0)"
-        );
-    }
-
-    /// The ASM LADDER set reproduces the interpreter at rem rung Bits(1)
-    /// (the rung-agnostic set, `boundary_exact`). Mirror of
-    /// `ladder_kernels_reproduce_the_interpreter_at_bits1` with the ASM
-    /// backend on.
-    #[test]
-    fn asm_ladder_kernels_reproduce_the_interpreter_at_bits1() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        std::env::set_var("CELESTE_REM_BITS", "1");
-        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
-        std::env::set_var("CELESTE_ASM_KERNELS", "1");
-        assert_eq!(
-            crate::interpreter::abstraction::rem_precision_from_env(),
-            crate::interpreter::abstraction::RemPrecision::Bits(1),
-            "the precision env was read before this test set it"
-        );
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-        let frames = 28;
-        let mut baseline = AbstractRun::start(&program).expect("start baseline");
-        let mut want = Vec::new();
-        for _ in 1..=frames {
-            baseline.step().expect("baseline step");
-            want.push(baseline.lane_count());
-        }
-        drop(baseline);
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
-        let mut run = AbstractRun::start(&program).expect("start compiled run");
-        for (frame, want) in (1..=frames).zip(want) {
-            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
-            assert_eq!(run.lane_count(), want, "ASM ladder lane count at frame {}", frame);
-        }
-        assert!(crate::compiled::dispatch::traced_lanes() > 0, "no ASM ladder kernel ran");
-        assert_eq!(crate::compiled::dispatch::missed_lanes(), 0, "ASM ladder missed lanes");
-    }
-
-    /// The ASM EXACT set reproduces the interpreter at the top rung
-    /// (k = 16, rem `Exact`). Mirror of
-    /// `exact_kernels_reproduce_the_interpreter_at_k16` with the ASM
-    /// backend on.
-    #[test]
-    fn asm_exact_kernels_reproduce_the_interpreter_at_k16() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        std::env::set_var("CELESTE_REM_BITS", "16");
-        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
-        std::env::set_var("CELESTE_ASM_KERNELS", "1");
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-        let frames = 28;
-        let mut baseline = AbstractRun::start(&program).expect("start baseline");
-        let mut want = Vec::new();
-        for _ in 1..=frames {
-            baseline.step().expect("baseline step");
-            want.push(baseline.lane_count());
-        }
-        drop(baseline);
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
-        let mut run = AbstractRun::start(&program).expect("start compiled run");
-        for (frame, want) in (1..=frames).zip(want) {
-            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
-            assert_eq!(run.lane_count(), want, "ASM exact lane count at frame {}", frame);
-        }
-        assert!(crate::compiled::dispatch::traced_lanes() > 0, "no ASM exact kernel ran");
-        assert_eq!(crate::compiled::dispatch::missed_lanes(), 0, "ASM exact missed lanes");
-    }
 
     /// Phase 4 (plans/keying-widening-flow.md): under
     /// `CELESTE_FRONTIER_ONLY`, the compiled-forward check no longer
@@ -649,7 +280,6 @@ mod tests {
     /// surfaces as a `step()` error and fails the test.
     #[test]
     fn frontier_only_check_agrees_with_widening_in_graph_at_bits2() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
         if !std::path::Path::new("lua/celeste-minimal.lua").exists()
             || !std::path::Path::new("rewrites.jsonl").exists()
             || !std::path::Path::new("rewrites-compile.jsonl").exists()
@@ -661,7 +291,8 @@ mod tests {
         std::env::set_var("CELESTE_WIDEN_IN_GRAPH", "1");
         std::env::set_var("CELESTE_FRONTIER_ONLY", "1");
         std::env::set_var("CELESTE_KERNEL_STRICT", "1");
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
         let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
         let mut run = AbstractRun::start(&program).expect("start");
         // Through frame 27 - the rem fork is frame 25, and the artifact
@@ -691,7 +322,6 @@ mod tests {
     #[test]
     fn per_rung_registry_serves_each_rung_in_one_process() {
         use crate::interpreter::abstraction::{set_rem_precision, RemPrecision};
-        let _partition = crate::interpreter::partition_straddles_test_lock();
         if !std::path::Path::new("lua/celeste-minimal.lua").exists()
             || !std::path::Path::new("rewrites.jsonl").exists()
             || !std::path::Path::new("rewrites-compile.jsonl").exists()
@@ -700,7 +330,8 @@ mod tests {
         }
         std::env::set_var("CELESTE_ASM_KERNELS", "1");
         std::env::set_var("CELESTE_KERNEL_STRICT", "1");
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
         let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
         for k in [1u8, 2u8] {
             set_rem_precision(RemPrecision::Bits(k));
@@ -727,58 +358,6 @@ mod tests {
         );
     }
 
-    /// The wrapper-widen SKIP is a no-op (plans/keying-widening-flow.md,
-    /// Phase 3): with the widening in the graph, the REAL compiled forward
-    /// (not check) skips `stream_boundary`'s `make_state_abstract` on its
-    /// own output, and must reach the SAME frontier as the interpreter
-    /// (which widens). `CELESTE_KERNEL_WIDEN_NOOP=1` asserts, per kernel
-    /// output, that re-widening would not move a row key - so the skip
-    /// removes a proven no-op. Lane counts are checked against the
-    /// interpreter baseline on top. Bits(2), through the rem fork (f26).
-    #[test]
-    fn wrapper_widen_skip_reproduces_the_interpreter_at_bits2() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        std::env::set_var("CELESTE_REM_BITS", "2");
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-        let frames = 26;
-        let mut baseline = AbstractRun::start(&program).expect("start baseline");
-        let mut want = Vec::new();
-        for _ in 1..=frames {
-            baseline.step().expect("baseline step");
-            want.push(baseline.lane_count());
-        }
-        drop(baseline);
-
-        // REAL compiled forward (=1, not check), so the skip is ACTIVE.
-        std::env::set_var("CELESTE_ASM_KERNELS", "1");
-        std::env::set_var("CELESTE_WIDEN_IN_GRAPH", "1");
-        std::env::set_var("CELESTE_KERNEL_WIDEN_NOOP", "1");
-        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
-        let mut run = AbstractRun::start(&program).expect("start compiled run");
-        assert!(run.compiled.is_some(), "the compiled engine did not engage");
-        for (frame, want) in (1..=frames).zip(want) {
-            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
-            assert_eq!(
-                run.lane_count(),
-                want,
-                "wrapper-skip frontier differs from the interpreter at frame {}",
-                frame
-            );
-        }
-        assert_eq!(
-            crate::compiled::dispatch::missed_lanes(),
-            0,
-            "the widen-in-graph kernels missed lanes under the wrapper skip"
-        );
-    }
-
     /// The assert-noop guard end to end (plans/keying-widening-flow.md,
     /// Phase 1 point 1): with the widening in the graph
     /// (`CELESTE_WIDEN_IN_GRAPH=1`) and `CELESTE_KERNEL_WIDEN_NOOP=1`,
@@ -790,7 +369,6 @@ mod tests {
     /// against the interpreter on top.
     #[test]
     fn kernel_widen_is_a_noop_at_bits2() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
         if !std::path::Path::new("lua/celeste-minimal.lua").exists()
             || !std::path::Path::new("rewrites.jsonl").exists()
             || !std::path::Path::new("rewrites-compile.jsonl").exists()
@@ -802,7 +380,8 @@ mod tests {
         std::env::set_var("CELESTE_WIDEN_IN_GRAPH", "1");
         std::env::set_var("CELESTE_KERNEL_WIDEN_NOOP", "1");
         std::env::set_var("CELESTE_KERNEL_STRICT", "1");
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
         let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
         let mut run = AbstractRun::start(&program).expect("start");
         for frame in 1..=26 {
@@ -817,48 +396,6 @@ mod tests {
             0,
             "the widen-in-graph kernels missed lanes"
         );
-    }
-
-    /// The A-vs-B differential (plans/keying-widening-flow.md, Phase 1):
-    /// the rung-agnostic ladder kernel (A, exact rem) widened EXTERNALLY
-    /// equals the widen-in-graph kernel (B, `LADDER_WIDEN`) - after dedup,
-    /// per frame, at Bits(2). A and B share the exact same frame compute,
-    /// so any difference is purely the rem widening: A applies
-    /// `make_state_abstract_rem` to its exact rows; B bakes the bucket
-    /// fork + snap into the graph. This is the gate that catches
-    /// "widened DIFFERENTLY" - a wrong bucket, a widened-wrong axis, a
-    /// key computed on the wrong value. The value-level
-    /// `rem_bucket_node_*` tests cover the arithmetic; this covers the
-    /// WIRING into the real start-room graphs.
-    ///
-    /// Built directly (not through the process-global registry, which
-    /// caches one set), both on a big stack. `CELESTE_ASM_NO_SKIP` turns
-    /// off the per-chunk frontier / within-frame drop so both sides emit
-    /// their FULL row set and the comparison is symmetric; the HashSet
-    /// dedups cross-chunk repeats. Bits(2), spd Exact, so the only
-    /// abstraction in play is the rem rung.
-    ///
-    /// Two registries + gcc, so slower than the single-set gates. It runs
-    /// to frame 26 - the first rem fork is frame 25 (see the Bits(1)
-    /// gate), so the fork path IS exercised.
-    #[test]
-    fn asm_kernel_a_vs_b_isolate_the_rem_widening_at_bits2() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        // Bits(2), spd Exact (default), room (1,0). Full emit both sides.
-        std::env::set_var("CELESTE_REM_BITS", "2");
-        std::env::set_var("CELESTE_ASM_NO_SKIP", "1");
-        assert_eq!(
-            crate::interpreter::abstraction::rem_precision_from_env(),
-            crate::interpreter::abstraction::RemPrecision::Bits(2),
-            "the precision env was read before this test set it"
-        );
-        run_a_vs_b_gate(26);
     }
 
     /// The widen-in-graph kernels ASSEMBLE for a LIVE-FRUIT room (2,0)
@@ -886,7 +423,6 @@ mod tests {
         use crate::trace::shapes::WalkOpts;
         use std::path::Path;
 
-        let _partition = crate::interpreter::partition_straddles_test_lock();
         if !std::path::Path::new("lua/celeste-minimal.lua").exists()
             || !std::path::Path::new("rewrites.jsonl").exists()
         {
@@ -909,112 +445,6 @@ mod tests {
         );
     }
 
-    /// The A-vs-B gate body, parameterized only by frame count: build the
-    /// two ladder registries (A exact, B widen-in-graph) for the CONFIGURED
-    /// start room, drive the interpreter frontier, and assert A's rows
-    /// widened by the full `make_state_abstract` equal B's own rows, per
-    /// frame, after dedup. The caller sets the room / precision env first.
-    fn run_a_vs_b_gate(frames: usize) {
-        use crate::compiled::asm_kernel::Registry;
-        use crate::compiled::bridge;
-        use crate::interpreter::abstraction::{make_state_abstract, split_precision_straddles};
-        use crate::interpreter::state::State;
-        use crate::trace::shapes::WalkOpts;
-        use std::collections::HashSet;
-        use std::path::Path;
-
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-        let engine = crate::compiled::FrameEngine::new_for_start_room(&program).expect("engine");
-        let ids = engine.ids();
-
-        // Build A (exact rem) and B (widen-in-graph) directly, big stack.
-        let (reg_a, reg_b): (Registry, Registry) = std::thread::Builder::new()
-            .stack_size(512 * 1024 * 1024)
-            .spawn(|| {
-                let root = Path::new(".");
-                let a = Registry::build_for_start_room(root, WalkOpts::LADDER, true)
-                    .expect("build A (LADDER)");
-                let b = Registry::build_for_start_room(root, WalkOpts::LADDER_WIDEN, true)
-                    .expect("build B (LADDER_WIDEN)");
-                (a, b)
-            })
-            .expect("spawn builder")
-            .join()
-            .expect("builder panicked");
-
-        let key_a = |s: State| -> Vec<(u64, u64)> {
-            // A emits EXACT rows: split into per-bucket lanes, then apply
-            // the campaign boundary's FULL abstraction - the same
-            // `make_state_abstract` B now bakes into the graph (rem + spd +
-            // fruit + dash + timers + erase). This is what B must equal.
-            let mut ks = Vec::new();
-            for st in split_precision_straddles(s) {
-                let w = make_state_abstract(st);
-                ks.extend(crate::search::sweep::row_keys(&w).expect("row_keys A"));
-            }
-            ks
-        };
-        let key_b = |s: State| -> Vec<(u64, u64)> {
-            // B already emitted the widened state; split is a no-op on a
-            // single bucket. Key as-is - the value B stores.
-            let mut ks = Vec::new();
-            for st in split_precision_straddles(s) {
-                ks.extend(crate::search::sweep::row_keys(&st).expect("row_keys B"));
-            }
-            ks
-        };
-
-        let mut run = AbstractRun::start(&program).expect("start");
-        let mut covered_any = false;
-        for frame in 1..=frames {
-            let inputs: Vec<State> = run.states().to_vec();
-            let mut x: HashSet<(u64, u64)> = HashSet::new();
-            let mut y: HashSet<(u64, u64)> = HashSet::new();
-            for st in &inputs {
-                if st.vector_size == 0 {
-                    continue;
-                }
-                let block = bridge::import_block(st, engine.cart(), engine.cache());
-                for chunk in engine.partition_chunks(vec![block], 1 << 20) {
-                    let mut done_a = Vec::new();
-                    let ok_a = reg_a.run_chunk(&chunk, ids, &mut done_a);
-                    let mut done_b = Vec::new();
-                    let ok_b = reg_b.run_chunk(&chunk, ids, &mut done_b);
-                    assert_eq!(
-                        ok_a, ok_b,
-                        "frame {}: A and B disagree on chunk coverage (shape {:#018x})",
-                        frame, chunk.shape_hash
-                    );
-                    if !ok_a {
-                        continue;
-                    }
-                    covered_any = true;
-                    for blk in &done_a {
-                        x.extend(key_a(bridge::export_block(blk)));
-                    }
-                    for blk in &done_b {
-                        y.extend(key_b(bridge::export_block(blk)));
-                    }
-                }
-            }
-            assert_eq!(
-                x, y,
-                "frame {}: A(exact + external rem widen) != B(in-graph rem widen): \
-                 {} A-only, {} B-only",
-                frame,
-                x.difference(&y).count(),
-                y.difference(&x).count(),
-            );
-            if frame < frames {
-                run.step().unwrap_or_else(|e| panic!("frame {} step: {:#}", frame, e));
-            }
-        }
-        assert!(
-            covered_any,
-            "no chunk ever bound both kernels - the A-vs-B gate checked nothing"
-        );
-    }
-
     /// Node-count de-risk (plans/keying-widening-flow.md, Phase 1a):
     /// baking the rem widening into the graph (`LADDER_WIDEN`) must be
     /// CHEAP - the hypothesis is that fusion + hash-consing share the rem
@@ -1029,7 +459,6 @@ mod tests {
         use crate::trace::shapes::WalkOpts;
         use std::path::Path;
 
-        let _partition = crate::interpreter::partition_straddles_test_lock();
         if !std::path::Path::new("lua/celeste-minimal.lua").exists()
             || !std::path::Path::new("rewrites.jsonl").exists()
         {
@@ -1081,135 +510,6 @@ mod tests {
         );
     }
 
-    /// The kernel-driven LADDER gate (plans/kernel-ladder.md): at rem
-    /// rung Bits(1), the RUNG-AGNOSTIC kernel set reproduces the
-    /// interpreter's row sets, per chunk, at the rung's own abstraction.
-    ///
-    /// Bits(1), not Bits(0): the point is that a rung ABOVE level 0 runs
-    /// on kernels at all. The precision envs are process-global
-    /// `OnceLock`s, so they are set before anything reads them - nextest
-    /// gives the test its own process, which is what makes that sound.
-    ///
-    /// 28 frames: the first rem straddle - the first frame where a fork
-    /// actually splits a lane, and at Bits(1) the first frame where the
-    /// bucket boundary matters - is frame 25, so anything shorter checks
-    /// no fork and Bits(1)'s frontier grows faster than level 0's, so
-    /// every frame past coverage costs real time.
-    #[test]
-    fn ladder_kernels_reproduce_the_interpreter_at_bits1() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        std::env::set_var("CELESTE_REM_BITS", "1");
-        // Strict: a chunk with no kernel would PANIC instead of falling
-        // through, so this test also runs the exact configuration the
-        // kernel ladder driver uses (ladder.sh KERNELS=1).
-        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
-        assert_eq!(
-            crate::interpreter::abstraction::rem_precision_from_env(),
-            crate::interpreter::abstraction::RemPrecision::Bits(1),
-            "the precision env was read before this test set it; the run \
-             below would gate the wrong rung"
-        );
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-
-        let frames = 28;
-        let mut baseline = AbstractRun::start(&program).expect("start baseline");
-        let mut want = Vec::new();
-        for _ in 1..=frames {
-            baseline.step().expect("baseline step");
-            want.push(baseline.lane_count());
-        }
-        drop(baseline);
-
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
-        let mut run = AbstractRun::start(&program).expect("start compiled run");
-        assert!(run.compiled.is_some(), "the compiled engine did not engage");
-        for (frame, want) in (1..=frames).zip(want) {
-            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
-            assert_eq!(
-                run.lane_count(),
-                want,
-                "the ladder kernels have a different lane count at frame {}",
-                frame
-            );
-        }
-        assert!(
-            crate::compiled::dispatch::traced_lanes() > 0,
-            "no chunk ever reached a ladder kernel - the set covers no shape this run \
-             produces, so this test checked nothing"
-        );
-        assert_eq!(
-            crate::compiled::dispatch::missed_lanes(),
-            0,
-            "some chunks fell through to the reference path - those chunks were \
-             checked interpreter-against-interpreter, which gates nothing"
-        );
-    }
-
-    /// The TOP rung (k = 16, rem `Exact`) on the exact-rem kernel set:
-    /// the ladder's "concrete optimum" claim rests on this rung being
-    /// exact in every coordinate, so it is the one rung that most needs
-    /// to run on kernels rather than be the interpreter exception.
-    /// Auto-selected from `CELESTE_REM_BITS=16` (parsed as Exact);
-    /// compared at the rung's abstraction, strict, coverage asserted.
-    #[test]
-    fn exact_kernels_reproduce_the_interpreter_at_k16() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        std::env::set_var("CELESTE_REM_BITS", "16");
-        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
-        assert_eq!(
-            crate::interpreter::abstraction::rem_precision_from_env(),
-            crate::interpreter::abstraction::RemPrecision::Exact,
-            "the precision env was read before this test set it; the run \
-             below would gate the wrong rung"
-        );
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-
-        let frames = 28;
-        let mut baseline = AbstractRun::start(&program).expect("start baseline");
-        let mut want = Vec::new();
-        for _ in 1..=frames {
-            baseline.step().expect("baseline step");
-            want.push(baseline.lane_count());
-        }
-        drop(baseline);
-
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
-        let mut run = AbstractRun::start(&program).expect("start compiled run");
-        assert!(run.compiled.is_some(), "the compiled engine did not engage");
-        for (frame, want) in (1..=frames).zip(want) {
-            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
-            assert_eq!(
-                run.lane_count(),
-                want,
-                "the exact kernels have a different lane count at frame {}",
-                frame
-            );
-        }
-        assert!(
-            crate::compiled::dispatch::traced_lanes() > 0,
-            "no chunk ever reached an exact kernel - the set covers no shape this run \
-             produces, so this test checked nothing"
-        );
-        assert_eq!(
-            crate::compiled::dispatch::missed_lanes(),
-            0,
-            "some chunks fell through to the reference path - those chunks were \
-             checked interpreter-against-interpreter, which gates nothing"
-        );
-    }
-
     /// `engine_row_keys` (the canonical row key, recomputed from a state's
     /// content by re-importing and re-hashing) reproduces the keys a
     /// compiled forward CARRIES out of its boundary, byte for byte, per lane.
@@ -1233,7 +533,6 @@ mod tests {
     }
 
     fn engine_row_keys_reproduce_the_carried_keys_body() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
         if !std::path::Path::new("lua/celeste-minimal.lua").exists()
             || !std::path::Path::new("rewrites-compile.jsonl").exists()
         {
@@ -1249,25 +548,14 @@ mod tests {
         let engine = crate::compiled::FrameEngine::new_for_start_room(&compile_program)
             .expect("build engine");
 
-        // Seed exactly as AbstractRun::start does.
-        let fixed_env = compile_program.fixed_env();
-        let initial =
-            crate::game_runner::create_initial_state_with_builtins(&fixed_env);
-        let init_states = crate::interpreter::glue::interpret_cfg(
-            compile_program.init_cfg().clone(),
-            initial,
-            &fixed_env,
-        )
-        .expect("init");
+        // Seed exactly as AbstractRun::start does (via the reference
+        // interpreter now that the CFG interpreter is gone).
         let mut states: Vec<crate::interpreter::state::State> =
-            init_states.into_iter().map(|(s, _)| s).collect();
-        for s in &mut states {
-            crate::game_runner::inject_tile_flag_at_builtin(s);
-        }
+            vec![crate::trace::refengine::RefEngine::new()
+                .expect("reference engine")
+                .initial_state()
+                .expect("init")];
 
-        let frame_cfg = crate::interpreter::fixed_env::PreparedCfg::new(
-            compile_program.frame_cfg().clone(),
-        );
         let mut checked_lanes = 0usize;
         // 26 frames: enough to reach the first fork (frame 25) so the check
         // spans multi-lane blocks, not just the single spawn lane.
@@ -1277,7 +565,7 @@ mod tests {
                 if state.vector_size == 0 {
                     continue;
                 }
-                let outputs = engine.run_frame_chunk(&state, Some((&frame_cfg, &fixed_env)));
+                let outputs = engine.run_frame_chunk(&state);
                 for (out, carried) in outputs {
                     let carried = carried.unwrap_or_else(|| {
                         panic!("frame {}: the engine did not carry keys", frame)
@@ -1304,227 +592,6 @@ mod tests {
         );
     }
 
-    /// The rung-agnostic set at LEVEL 0 (`CELESTE_TRACED_SET=ladder`,
-    /// rem Bits(0)): exercises `Rt2::boundary_exact` plus the campaign's
-    /// full Bits(0) widening downstream, compared with the level-0
-    /// comparator - the configuration a gate run uses to compare the two
-    /// kernel sets against one interpreter.
-    #[test]
-    fn ladder_kernels_reproduce_the_interpreter_at_level0() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        std::env::set_var("CELESTE_TRACED_SET", "ladder");
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-
-        let frames = 28;
-        let mut baseline = AbstractRun::start(&program).expect("start baseline");
-        let mut want = Vec::new();
-        for _ in 1..=frames {
-            baseline.step().expect("baseline step");
-            want.push(baseline.lane_count());
-        }
-        drop(baseline);
-
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
-        let mut run = AbstractRun::start(&program).expect("start compiled run");
-        assert!(run.compiled.is_some(), "the compiled engine did not engage");
-        for (frame, want) in (1..=frames).zip(want) {
-            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
-            assert_eq!(
-                run.lane_count(),
-                want,
-                "the ladder kernels have a different lane count at frame {}",
-                frame
-            );
-        }
-        assert!(
-            crate::compiled::dispatch::traced_lanes() > 0,
-            "no chunk ever reached a ladder kernel - the set covers no shape this run \
-             produces, so this test checked nothing"
-        );
-        assert_eq!(
-            crate::compiled::dispatch::missed_lanes(),
-            0,
-            "some chunks fell through to the reference path - those chunks were \
-             checked interpreter-against-interpreter, which gates nothing"
-        );
-    }
-
-    /// End-to-end check of the shape-dispatch machinery (`Variant`): run the
-    /// plain-compiled program as the base with the full recipe registered as
-    /// a variant for the singleton shapes. Every state in room (1,0) is a
-    /// singleton, so every frame of every state dispatches to the variant -
-    /// base -> canonical -> variant on the way in, back on the way out - and
-    /// the observations must match a plain-only run exactly, every frame.
-    ///
-    /// This exercises: the object-shape probe, shape matching, both mapping
-    /// directions around a variant frame, and the zero-fallback invariant.
-    #[test]
-    fn shape_variant_dispatch_reproduces_the_baseline() {
-        // Serialise against the partition-toggle tests: this test compares
-        // a baseline run against a candidate run, and a toggle flip
-        // between the two makes them diverge spuriously.
-        let _partition =
-            crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-        {
-            return;
-        }
-        let plain = Program::compile_from_disk().expect("compile plain");
-        let recipe = crate::program::recipe::Recipe::load("rewrites.jsonl").expect("load recipe");
-        let rewritten = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-        let mapping = crate::search::state_mapping::StateMapping::from_recipe(&recipe);
-        assert!(!mapping.is_identity());
-
-        let frames = 28;
-        let baseline = observation_trace(&plain, frames).expect("baseline trace");
-        let mut run = AbstractRun::start(&plain).expect("start base run");
-        // Shape probe sanity: room (1,0) starts as a lone player_spawn.
-        assert_eq!(
-            crate::interpreter::abstraction::object_shape(&run.states()[0]).expect("shape probe"),
-            vec!["player_spawn".to_string()]
-        );
-        run.set_variants(
-            // The base program is the plain one: its layout IS canonical.
-            crate::search::state_mapping::StateMapping::default(),
-            vec![Variant {
-                label: "rewrites.jsonl[test]".to_string(),
-                shapes: vec![
-                    vec!["player".to_string()],
-                    vec!["player_spawn".to_string()],
-                ],
-                pm1: Vec::new(),
-                frame_cfg: crate::interpreter::fixed_env::PreparedCfg::new(
-                    rewritten.frame_cfg().clone(),
-                ),
-                fixed_env: rewritten.fixed_env(),
-                mapping,
-            }],
-        );
-        for frame in 1..=frames {
-            run.step().expect("step");
-            assert_eq!(
-                observe_frame(run.states()),
-                baseline[frame as usize],
-                "variant dispatch diverged from the baseline at frame {}",
-                frame
-            );
-        }
-        let (states, lanes, fallbacks) = run.variant_events();
-        assert!(states > 0 && lanes > 0, "no frames ran under the variant");
-        assert_eq!(fallbacks, 0, "variant frames fell back to the base program");
-    }
-
-    /// The engine-carried origin column (plans/kernel-ladder.md "the
-    /// passthrough column"): an origin-tagged replay - the frame
-    /// primitive of the backward sweep - produces the SAME (origin, row
-    /// key) pair set on the traced kernels as on the interpreter. The
-    /// sweep tags each lane with a DISTINCT id, so no dedup across origins
-    /// is legal at all; this checks the engine carries them through the
-    /// kernels intact. (The pos-graph recorder no longer tags at all - it
-    /// partitions merges by input position - so only the sweep exercises
-    /// the passthrough now.)
-    ///
-    /// 26 frames of forward pass so the batch is past the first rem
-    /// straddle (frame 25) - the same rationale as
-    /// `traced_kernels_reproduce_the_interpreter`'s 30. Strict, with
-    /// coverage asserted, so a run where every tagged chunk quietly fell
-    /// through to the reference would fail rather than gate nothing.
-    #[test]
-    fn kernel_replays_carry_origins_like_the_interpreter() {
-        use crate::interpreter::deopt_collect;
-        use crate::search::sweep::SWEEP_ORIGIN;
-
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-
-        let frames = 26;
-        let mut fwd = AbstractRun::start(&program).expect("start forward");
-        for _ in 1..=frames {
-            fwd.step().expect("forward step");
-        }
-        let batch = fwd.take_states();
-        drop(fwd);
-        let lanes: usize = batch.iter().map(|s| s.vector_size).sum();
-        assert!(lanes > 16, "the batch is too small to exercise the passthrough");
-
-        // Tag a clone of the batch with distinct ids per lane (exactly what
-        // the sweep injects).
-        let tagged = || -> Vec<crate::interpreter::state::State> {
-            let mut next = 0u32;
-            batch
-                .iter()
-                .map(|s| {
-                    let mut s = s.clone();
-                    let ids = (next..next + s.vector_size as u32).collect::<Vec<_>>();
-                    next += s.vector_size as u32;
-                    deopt_collect::inject_named(&mut s, SWEEP_ORIGIN, &ids);
-                    s
-                })
-                .collect()
-        };
-
-        // One origin-tagged frame, exactly as `backward_sweep_time`
-        // reads it back: strip the tag, gc, key, pair.
-        let pairs_of = |mut run: AbstractRun,
-                        input: Vec<crate::interpreter::state::State>|
-         -> std::collections::BTreeSet<(u32, (u64, u64))> {
-            run.disable_frontier();
-            run.skip_boundary_merge();
-            let deopt_events = run.deopt_events();
-            run.restore(input, None, deopt_events).expect("restore");
-            run.step().expect("replay step");
-            let mut pairs = std::collections::BTreeSet::new();
-            for mut s in run.take_states() {
-                let origins = deopt_collect::read_origins_named(&s, SWEEP_ORIGIN);
-                s.global_env.remove(SWEEP_ORIGIN);
-                s.gc();
-                let keys = crate::search::sweep::row_keys(&s).expect("row keys");
-                assert_eq!(keys.len(), origins.len(), "origin/key length mismatch");
-                pairs.extend(origins.into_iter().zip(keys));
-            }
-            pairs
-        };
-
-        // Interpreter reference FIRST, while the engine env is unset.
-        let want_ids =
-            pairs_of(AbstractRun::start(&program).expect("start"), tagged());
-
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
-        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
-        let run = AbstractRun::start(&program).expect("start compiled");
-        assert!(run.compiled.is_some(), "the compiled engine did not engage");
-        let got_ids = pairs_of(run, tagged());
-        assert!(
-            crate::compiled::dispatch::traced_lanes() > 0,
-            "no tagged chunk ever reached a traced kernel - the passthrough was \
-             never exercised"
-        );
-        assert_eq!(
-            crate::compiled::dispatch::missed_lanes(),
-            0,
-            "tagged chunks fell through to the reference path - those pairs were \
-             checked interpreter-against-interpreter, which gates nothing"
-        );
-        assert_eq!(
-            got_ids, want_ids,
-            "the kernel replay's (origin id, row key) pairs differ from the \
-             interpreter's"
-        );
-    }
-
     /// Adding the player position to the merge partition (what the pos-graph
     /// recorder does) must NOT change the reachable row set - position is
     /// content and concrete per lane, so partitioning on it only regroups
@@ -1543,12 +610,15 @@ mod tests {
     }
 
     fn position_partition_preserves_the_forward_row_set_body() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
         if !std::path::Path::new("lua/celeste-minimal.lua").exists()
             || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
         {
             return;
         }
+        // Compiled-only search now: drive the compiled engine both ways.
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
         let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
 
         // Past the first rem straddle (frame 25), where lanes fan out to
@@ -1620,15 +690,17 @@ mod tests {
     }
 
     fn recording_a_forward_pass_keeps_chunks_uniform_in_position_body() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
         if !std::path::Path::new("lua/celeste-minimal.lua").exists()
             || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
         {
             return;
         }
         // Streaming path (the one the balloon lived on): frontier-only +
         // multi-thread routes through step_parallel, exactly production.
         std::env::set_var("CELESTE_FRONTIER_ONLY", "1");
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
         let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
         let mut run = AbstractRun::start(&program).expect("start");
         run.record_pos_graph();
@@ -1644,63 +716,4 @@ mod tests {
         );
     }
 
-    /// Check mode on an origin-tagged replay: `row_key_set` mixes
-    /// `Rt2::origin` into the keys on both sides, so the per-chunk gate
-    /// compares (origin, row) PAIR sets - and must come out equal, not
-    /// cry wolf, on a tagged frame the kernels and the interpreter both
-    /// run. Its own test (= its own nextest process) because the
-    /// engine's check flag is decided once per process.
-    #[test]
-    fn check_mode_compares_origin_pairs_without_false_alarms() {
-        use crate::interpreter::deopt_collect;
-        use crate::search::sweep::SWEEP_ORIGIN;
-
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-
-        let frames = 26;
-        let mut fwd = AbstractRun::start(&program).expect("start forward");
-        for _ in 1..=frames {
-            fwd.step().expect("forward step");
-        }
-        let mut batch = fwd.take_states();
-        drop(fwd);
-        let mut next = 0u32;
-        for s in batch.iter_mut() {
-            let ids: Vec<u32> = (next..next + s.vector_size as u32).collect();
-            next += s.vector_size as u32;
-            deopt_collect::inject_named(s, SWEEP_ORIGIN, &ids);
-        }
-
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
-        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
-        let mut run = AbstractRun::start(&program).expect("start check run");
-        assert!(run.compiled.is_some(), "the compiled engine did not engage");
-        run.disable_frontier();
-        run.skip_boundary_merge();
-        let deopt_events = run.deopt_events();
-        run.restore(batch, None, deopt_events).expect("restore");
-        run.step().expect("an origin-tagged frame failed the check-mode pair gate");
-        assert!(
-            crate::compiled::dispatch::traced_lanes() > 0,
-            "no tagged chunk ever reached a traced kernel - check mode compared \
-             nothing"
-        );
-    }
-
-    /// And it must not cry wolf: the program compared against itself is equal.
-    #[test]
-    fn differential_run_accepts_an_identical_program() {
-        let Ok(baseline) = Program::compile_from_disk() else { return };
-        let candidate = baseline.clone();
-        let result = differential_abstract(&baseline, &candidate, 26)
-            .expect("differential run should complete");
-        assert!(result.is_none(), "identical programs reported as diverging");
-    }
 }

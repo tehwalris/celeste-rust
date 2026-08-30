@@ -67,20 +67,6 @@ fn use_kernel() -> bool {
     std::env::var("CELESTE_KERNEL").map(|v| v != "0").unwrap_or(true)
 }
 
-/// Rate-limited stderr note for per-chunk engine deopts: the first few
-/// print in full, the rest only count (dispatch's PLAIN_ROUTED counter
-/// carries the lane totals either way).
-fn deopt_note(msg: &str) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEEN: AtomicU64 = AtomicU64::new(0);
-    let n = SEEN.fetch_add(1, Ordering::Relaxed);
-    if n < 40 {
-        eprintln!("  {}", msg);
-    } else if n == 40 {
-        eprintln!("  (further engine fallback notes suppressed)");
-    }
-}
-
 /// Chunk cap. Cross-chunk dedup at the boundary makes chunking invisible to
 /// the result (batching invariance is the certified doctrine), so this is
 /// purely a cost knob - and pre-dedup INVERTED it. While every emitted row
@@ -344,20 +330,6 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
 /// Speed of the reference path is a measured non-issue rather than a hope:
 /// since the class kernels reached 100% of player lanes it runs on spawn
 /// shapes only, 0.72 ms at f20.
-/// The plain (unrewritten) program plus the canonical-state mapping of the
-/// recipe this engine runs - the deopt path of plans/shape-tag-plan.md
-/// Phase C. The kernels' deopt sub-chunks (dying representatives, class-
-/// leaving rows) FAIL the specialized program's premises by construction,
-/// and without this path that failure aborts the whole compiled attempt:
-/// the caller's optimistic deopt arm then re-runs the ENTIRE state under
-/// granular deopt and throws the kernel's rows away. Routing the sub-chunks
-/// straight to the plain program (sound for every lane - it is the
-/// reference semantics) keeps the attempt alive.
-pub struct PlainPath {
-    pub plain_cfg: crate::interpreter::fixed_env::PreparedCfg,
-    pub plain_env: crate::interpreter::fixed_env::FixedEnv,
-    pub mapping: crate::search::state_mapping::StateMapping,
-}
 
 /// The recipe the kernels and the name tables were generated from - the
 /// program whose boundary defines the canonical row key.
@@ -402,10 +374,6 @@ pub fn engine_row_keys(
 
 pub struct FrameEngine {
     ids: runtime2::BoundaryIds,
-    frame_cfg: crate::interpreter::fixed_env::PreparedCfg,
-    fixed_env: crate::interpreter::fixed_env::FixedEnv,
-    plain: Option<PlainPath>,
-    init_cfg: crate::ir::Cfg,
     /// The freeze global. Every block is pre-partitioned on it before the
     /// frame runs: the update-side freeze gate is a real per-lane branch,
     /// and splitting on it up front is what keeps the kernels' premise of
@@ -439,12 +407,6 @@ impl FrameEngine {
         );
         FrameEngine {
             ids: boundary_ids(),
-            frame_cfg: crate::interpreter::fixed_env::PreparedCfg::new(
-                program.frame_cfg().clone(),
-            ),
-            fixed_env: program.fixed_env(),
-            plain: None,
-            init_cfg: program.init_cfg().clone(),
             g_freeze: gen::global_id("freeze").expect("no freeze global"),
             cart,
             cache,
@@ -472,63 +434,6 @@ impl FrameEngine {
 
     pub fn cache(&self) -> Arc<CollisionCache> {
         self.cache.clone()
-    }
-
-    /// Attach the plain-program deopt path (see `PlainPath`). Without it,
-    /// the kernels' deopt sub-chunks run the specialized interpreter and a
-    /// premise failure aborts the whole frame chunk.
-    pub fn set_plain_path(&mut self, plain: PlainPath) {
-        self.plain = Some(plain);
-    }
-
-    /// One frame of a kernel deopt sub-chunk through the PLAIN program:
-    /// to_canonical -> plain -> from_canonical, sound for every lane.
-    fn plain_block(
-        &self,
-        plain: &PlainPath,
-        block: runtime2::Rt2,
-        tag: Option<&str>,
-    ) -> Vec<crate::interpreter::state::State> {
-        let state = export_block_tagged(&block, tag);
-        drop(block);
-        self.plain_state(plain, state)
-    }
-
-    fn plain_state(
-        &self,
-        plain: &PlainPath,
-        mut state: crate::interpreter::state::State,
-    ) -> Vec<crate::interpreter::state::State> {
-        let width = state.vector_size as u64;
-        plain
-            .mapping
-            .to_canonical(&mut state)
-            .expect("plain path: mapping the frame input to canonical");
-        let result = crate::interpreter::glue::interpret_prepared_cfg(
-            &plain.plain_cfg,
-            state,
-            &plain.plain_env,
-        )
-        .expect("plain path: the frame failed under the plain program too");
-        dispatch::PLAIN_ROUTED.fetch_add(width, std::sync::atomic::Ordering::Relaxed);
-        result
-            .into_iter()
-            .map(|(mut s, _)| {
-                plain
-                    .mapping
-                    .from_canonical(&mut s)
-                    .expect("plain path: mapping a frame output back from canonical");
-                // The campaign abstraction, applied HERE rather than
-                // trusted to the caller: the plain program does not pin
-                // the timer globals (task #75) or apply the boundary
-                // widenings, so its raw outputs carry different row keys
-                // than the specialized program's for the same states.
-                // The campaign path would re-abstract anyway
-                // (idempotent); `step` boundaries directly and needs it.
-                crate::interpreter::abstraction::make_state_abstract(s)
-            })
-            .filter(|s| s.vector_size > 0)
-            .collect()
     }
 
     /// One frame of ONE campaign chunk: `State -> [State]`.
@@ -567,19 +472,6 @@ impl FrameEngine {
     pub fn run_frame_chunk(
         &self,
         state: &crate::interpreter::state::State,
-        // The CAMPAIGN's frame body, for missed chunks the COMPILE
-        // program cannot run. On room (2,0) the compile overlay is the
-        // (1,0) one, so its premises fail on every fruit-interaction
-        // chunk - and the PLAIN program is not a usable fallback there:
-        // fruit states under plain blow up on UnknownBool branch
-        // doubling (ladder.sh's sweep cap exists for exactly this; the
-        // f39 check gate ground for 7.5h in split_by_condition before
-        // this parameter). The campaign program is certified for its own
-        // room, so the fallback chain is compile -> campaign -> plain.
-        campaign: Option<(
-            &crate::interpreter::fixed_env::PreparedCfg,
-            &crate::interpreter::fixed_env::FixedEnv,
-        )>,
     ) -> Vec<KeyedState> {
         let mut t = ChunkTimer::start();
         // An origin-tagged chunk (the backward sweep, the pos-graph
@@ -650,77 +542,22 @@ impl FrameEngine {
         // partially-covered state is forfeited - at real coverage that is
         // rare, and the miss dump still records exactly what to cover
         // next.
-        if !misses.is_empty() && dispatch::kernel_strict() {
-            // The doctrine (plans/tracing.md "Doctrine"): a chunk the
-            // kernels cannot take is a COVERAGE GAP, not a degraded mode.
-            // Every chunk of this state was dispatched before this point,
-            // so the census is complete; report every distinct reason
-            // with lane counts and stop. The search checkpoints per
-            // completed frame, so the run resumes from the previous
-            // frame once the gap is fixed.
+        if !misses.is_empty() {
+            // A chunk the kernels cannot take is a COVERAGE GAP, not a
+            // degraded mode (plans/tracing.md "Doctrine",
+            // plans/delete-the-interpreter.md): the CFG-interpreter
+            // fallback was removed. Every chunk of this state was
+            // dispatched before this point, so the census is complete;
+            // report every distinct reason with lane counts and stop. The
+            // search checkpoints per completed frame, so the run resumes
+            // from the previous frame once the missing shape is traced.
             let missed_lanes: usize = misses.iter().map(|(b, _)| b.width).sum();
             panic!(
-                "KERNEL COVERAGE GAP (CELESTE_KERNEL_STRICT=1): {} lanes in {} \
-                 chunks have no kernel; reasons:\n{}\nfix the gap (trace the \
-                 missing shape / raise the bound) and resume from the last \
-                 checkpoint",
+                "KERNEL COVERAGE GAP: {} lanes in {} chunks have no kernel and                  the interpreter fallback was removed; reasons:\n{}\ntrace the                  missing shape / raise the bound and resume from the last                  checkpoint",
                 missed_lanes,
                 misses.len(),
                 dispatch::miss_report(),
             );
-        }
-        if !misses.is_empty() {
-            if let Some((cfg, env)) = campaign {
-                let missed_lanes: usize = misses.iter().map(|(b, _)| b.width).sum();
-                dispatch::PLAIN_ROUTED
-                    .fetch_add(missed_lanes as u64, std::sync::atomic::Ordering::Relaxed);
-                match self.interpret_state_with(state.clone(), cfg, env) {
-                    Ok(states) => {
-                        t.mark(CHUNK_RUN);
-                        t.mark(CHUNK_MERGE);
-                        return states.into_iter().map(|s| (s, None)).collect();
-                    }
-                    Err(e) => {
-                        // The campaign's own premises fail on this state:
-                        // the caller's deopt machinery (run_deopt_frame,
-                        // canonical mapping, collect-first) is the right
-                        // owner of that case, exactly as it is for the
-                        // interpreter path.
-                        panic!(
-                            "engine fallback: the campaign frame failed on a state \
-                             with {} missed lanes: {:#}",
-                            missed_lanes, e
-                        );
-                    }
-                }
-            }
-            for (block, kernel_ok) in misses {
-                if self.plain.is_none() {
-                    // The strict path (no plain program registered): the
-                    // compile program, loudly fatal on a premise failure.
-                    out.extend(self.interpret_block(block, origin_tag).into_iter().map(|s| (s, None)));
-                    continue;
-                }
-                let plain = self.plain.as_ref().unwrap();
-                if kernel_ok {
-                    // No campaign cfg (native-probe harnesses): the
-                    // compile program per chunk, plain on failure.
-                    match self.try_interpret_block(&block, origin_tag) {
-                        Ok(states) => out.extend(states.into_iter().map(|s| (s, None))),
-                        Err(e) => {
-                            deopt_note(&format!(
-                                "engine chunk -> plain ({} lanes): {:#}",
-                                block.width, e
-                            ));
-                            out.extend(self.plain_block(plain, block, origin_tag).into_iter().map(|s| (s, None)));
-                        }
-                    }
-                } else {
-                    // A kernel's deopt sub-chunk fails the compile
-                    // program's premises by construction.
-                    out.extend(self.plain_block(plain, block, origin_tag).into_iter().map(|s| (s, None)));
-                }
-            }
         }
         t.mark(CHUNK_RUN);
         // Dedup and merge the kernel's blocks BEFORE exporting them.
@@ -870,42 +707,6 @@ impl FrameEngine {
     }
 
     /// One frame of `block` through the interpreter, as interpreter states.
-    fn interpret_block(
-        &self,
-        block: runtime2::Rt2,
-        tag: Option<&str>,
-    ) -> Vec<crate::interpreter::state::State> {
-        self.try_interpret_block(&block, tag)
-            .expect("the interpreter fallback failed a frame")
-    }
-
-    /// `interpret_block`, but a frame failure (a compile-recipe premise
-    /// this chunk falsifies) is returned instead of panicking, so the
-    /// caller can deopt the CHUNK to the plain program.
-    fn try_interpret_block(
-        &self,
-        block: &runtime2::Rt2,
-        tag: Option<&str>,
-    ) -> anyhow::Result<Vec<crate::interpreter::state::State>> {
-        if std::env::var_os("CELESTE_FALLBACK_ROUNDTRIP").is_some() {
-            bridge::assert_block_round_trips(block);
-        }
-        self.interpret_state_with(export_block_tagged(block, tag), &self.frame_cfg, &self.fixed_env)
-    }
-
-    fn interpret_state_with(
-        &self,
-        state: crate::interpreter::state::State,
-        cfg: &crate::interpreter::fixed_env::PreparedCfg,
-        env: &crate::interpreter::fixed_env::FixedEnv,
-    ) -> anyhow::Result<Vec<crate::interpreter::state::State>> {
-        Ok(crate::interpreter::glue::interpret_prepared_cfg(cfg, state, env)?
-            .into_iter()
-            .map(|(s, _)| s)
-            .filter(|s| s.vector_size > 0)
-            .collect())
-    }
-
     /// The pre-partition every path shares: split on `freeze`, then on the
     /// moving key, then slice to `chunk_rows` lanes.
     ///
@@ -955,63 +756,22 @@ impl FrameEngine {
     /// implementations of a starting position is one too many, and this one
     /// cannot drift.
     pub fn initial_blocks(&self) -> Vec<runtime2::Rt2> {
-        let initial = crate::game_runner::create_initial_state_with_builtins(&self.fixed_env);
-        let states =
-            crate::interpreter::glue::interpret_cfg(self.init_cfg.clone(), initial, &self.fixed_env)
-                .expect("init failed");
-        states
-            .into_iter()
-            .map(|(mut s, _)| {
-                crate::game_runner::inject_tile_flag_at_builtin(&mut s);
-                bridge::import_block(&s, self.cart.clone(), self.cache.clone())
-            })
-            .collect()
+        // The frame-0 frontier via the REFERENCE interpreter (`RefEngine`
+        // runs the original Lua = the plain program; init equivalence is
+        // proven by `refgate`). One init state, with `tile_flag_at`
+        // already injected.
+        let s = crate::trace::refengine::RefEngine::new()
+            .expect("build reference engine")
+            .initial_state()
+            .expect("init failed");
+        vec![bridge::import_block(&s, self.cart.clone(), self.cache.clone())]
     }
 }
 
-/// Run one frame of `block` through the interpreter and return the
-/// boundary blocks. The output goes through the SAME `Rt2::boundary` the
-/// compiled path uses, so the canonical form has one implementation
-/// whichever engine produced the rows.
 impl FrameEngine {
-fn run_chunk_interpreted(&self, block: runtime2::Rt2) -> Vec<runtime2::Rt2> {
-    let ids = &self.ids;
-    let (cart, cache) = (block.cart.clone(), block.cache.clone());
-    // CELESTE_FALLBACK_ROUNDTRIP=1 checks export against import on the
-    // way in, which is what separates "the exporter lost something" from
-    // "the frame did something different" when the gate disagrees.
-    if std::env::var_os("CELESTE_FALLBACK_ROUNDTRIP").is_some() {
-        bridge::assert_block_round_trips(&block);
-    }
-    let state = bridge::export_block(&block);
-    drop(block);
-    let outputs = crate::interpreter::glue::interpret_prepared_cfg(
-        &self.frame_cfg,
-        state,
-        &self.fixed_env,
-    )
-    .expect("the interpreter fallback failed a frame");
-    outputs
-        .into_iter()
-        .map(|(s, _)| s)
-        // A frame can split a chunk into pieces and leave one empty; an
-        // empty block has no rows to contribute and `import_block` has
-        // nothing to build a shape from.
-        .filter(|s| s.vector_size > 0)
-        .map(|s| {
-            let mut b = bridge::import_block(&s, cart.clone(), cache.clone());
-            b.boundary(ids);
-            b
-        })
-        .collect()
-}
-
 /// One abstract frame forward: pre-partition (freeze, moving key), chunk,
-/// run tiles across threads (SplitReq -> partition + rerun), boundary,
-/// cross-block dedup, k-way same-shape merge. Rows in -> rows out.
-/// One abstract frame: pre-partition (freeze, then the moving key), chunk,
-/// run the chunks across threads, boundary, cross-block dedup, k-way
-/// same-shape merge. Rows in, rows out.
+/// run tiles across threads, boundary, cross-block dedup, k-way
+/// same-shape merge. Rows in -> rows out.
 pub fn step(
     &self,
     blocks: Vec<runtime2::Rt2>,
@@ -1068,7 +828,6 @@ pub fn step(
             .into_iter()
             .map(|mut local| {
                 let ids = &ids;
-                let this = &self;
                 scope.spawn(move || {
                     let mut done: Vec<runtime2::Rt2> = Vec::new();
                     while let Some((block, kernel_ok)) = local.pop() {
@@ -1102,34 +861,15 @@ pub fn step(
                         // is empty by construction. The bench's gate 2 is
                         // frontier-aware now (extras must be visited
                         // rows); step() and the campaign path agree.
-                        if !kernel_ok {
-                            if let Some(plain) = &this.plain {
-                                let (cart, cache) =
-                                    (block.cart.clone(), block.cache.clone());
-                                done.extend(
-                                    this.plain_block(plain, block, None).iter().map(|s| {
-                                        let mut b = bridge::import_block(
-                                            s,
-                                            cart.clone(),
-                                            cache.clone(),
-                                        );
-                                        b.boundary(ids);
-                                        b
-                                    }),
-                                );
-                                continue;
-                            }
-                        }
-                        // The reference: the interpreter, on the block
-                        // exported back to a State. This replaced the
-                        // transpiled-program path (gen::call_fn over the
-                        // Rt2 Engine impl) and its SplitReq worklist -
-                        // a divergent branch used to panic out so the
-                        // driver could partition the frame-start block
-                        // by the condition's per-origin truth and rerun
-                        // both halves; the interpreter splits internally
-                        // and just returns more than one output state.
-                        done.extend(this.run_chunk_interpreted(block));
+                        // A chunk no kernel binds is a COVERAGE GAP, not a
+                        // degraded mode: the CFG-interpreter fallback was
+                        // removed (plans/delete-the-interpreter.md). Trace
+                        // the missing shape and resume from the last
+                        // checkpoint.
+                        panic!(
+                            "KERNEL COVERAGE GAP: {} lanes in a chunk have no                              kernel and the interpreter fallback was removed",
+                            block.width
+                        );
                     }
                     done
                 })

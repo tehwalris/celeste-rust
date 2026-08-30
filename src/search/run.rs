@@ -16,9 +16,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 
-use crate::game_runner::{create_initial_state_with_builtins, inject_tile_flag_at_builtin};
 use crate::interpreter::abstraction::make_state_abstract;
-use crate::interpreter::glue::{interpret_cfg, interpret_prepared_cfg};
 use crate::interpreter::state::State;
 use crate::interpreter::value::{HeapValue, MaybeVector, Value};
 use crate::interpreter::vectorize::vectorize_states;
@@ -348,8 +346,6 @@ pub struct BandFilter {
 /// from the specialized ones - and the mapping translates the frame-input
 /// state to canonical before the re-run and the outputs back after it.
 struct DeoptTarget {
-    plain_cfg: crate::interpreter::fixed_env::PreparedCfg,
-    plain_env: crate::interpreter::fixed_env::FixedEnv,
     mapping: super::state_mapping::StateMapping,
     /// Deopt *every* state instead of only failing ones. This is the
     /// certification mode of `rewrite deoptcheck`: it pushes every frame of
@@ -960,30 +956,17 @@ fn dispatch_variant_frame(
 }
 
 fn run_variant_frame(
-    base_mapping: &super::state_mapping::StateMapping,
-    variant: &Variant,
-    mut state: State,
+    _base_mapping: &super::state_mapping::StateMapping,
+    _variant: &Variant,
+    _state: State,
 ) -> Result<Vec<State>> {
-    base_mapping
-        .to_canonical(&mut state)
-        .context("variant: mapping base layout to canonical")?;
-    variant
-        .mapping
-        .from_canonical(&mut state)
-        .context("variant: mapping canonical to the variant layout")?;
-    let result = interpret_prepared_cfg(&variant.frame_cfg, state, &variant.fixed_env)?;
-    let mut out = Vec::with_capacity(result.len());
-    for (mut s, _) in result {
-        variant
-            .mapping
-            .to_canonical(&mut s)
-            .context("variant: mapping a frame output back to canonical")?;
-        base_mapping
-            .from_canonical(&mut s)
-            .context("variant: mapping a frame output back to base layout")?;
-        out.push(s);
-    }
-    Ok(out)
+    // Shape-variant dispatch runs a variant program's REWRITTEN CFG, which
+    // only the removed CFG interpreter could execute (RefEngine runs the
+    // original Lua). The search is compiled-only and variant dispatch and
+    // the compiled engine were already mutually exclusive.
+    anyhow::bail!(
+        "shape-variant dispatch is unsupported: it required the CFG          interpreter, which was removed (the search is compiled-only)"
+    );
 }
 
 /// Per-frame deopt and variant event tallies, reported by
@@ -1137,436 +1120,28 @@ fn chunk_states(states: Vec<State>) -> Vec<State> {
 ///   the interpreted run, so it is for gating and not for campaigns.
 pub struct CompiledForward {
     engine: crate::compiled::FrameEngine,
-    check: bool,
 }
-
-/// A `check`-mode row-set mismatch, as its own error type so the optimistic
-/// deopt arm can tell it from a premise failure. Without the distinction a
-/// mismatch on a deopt-eligible chunk is CAUGHT by the arm's catch, logged
-/// as a deopt, and the chunk silently re-run by the interpreter - the gate
-/// reports success while the thing it gates just failed. That is exactly
-/// the frame range (f58+) where the 24-row divergence lives, so the gate
-/// was blind precisely where it was needed.
-#[derive(Debug)]
-struct CheckMismatch(String);
-
-impl std::fmt::Display for CheckMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for CheckMismatch {}
 
 impl CompiledForward {
     /// One chunk's frame body. `Ok` carries the compiled engine's output
     /// states, which are NOT the interpreter's states - see the type doc.
-    fn run_chunk(
-        &self,
-        frame_cfg: &crate::interpreter::fixed_env::PreparedCfg,
-        fixed_env: &crate::interpreter::fixed_env::FixedEnv,
-        state: State,
-    ) -> Result<Vec<State>> {
-        if !self.check {
-            // The engine's own per-lane keys are dropped here: the frontier
-            // recomputes the row key from each ABSTRACTED output state (the one
-            // it checkpoints) via `engine_row_keys`, so the backward sweep can
-            // reproduce it. Carrying the engine's pre-abstraction key instead
-            // stored a key the sweep could not recompute from the saved state.
-            let states: Vec<State> = self
-                .engine
-                .run_frame_chunk(&state, Some((frame_cfg, fixed_env)))
-                .into_iter()
-                .map(|(s, _keys)| s)
-                .collect();
-            return Ok(states);
-        }
-        let reference: Vec<State> = interpret_prepared_cfg(frame_cfg, state.clone(), fixed_env)
-            .context("frame failed (compiled-forward check: reference side)")?
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        let got = self
+    ///
+    /// The old `check` mode (run the CFG interpreter alongside every chunk
+    /// and compare row-key sets) is gone with the interpreter; the sampled
+    /// kernel gate (`trace::refgate`) now provides the kernels-vs-reference
+    /// guarantee.
+    fn run_chunk(&self, state: State) -> Result<Vec<State>> {
+        // The engine's own per-lane keys are dropped here: the frontier
+        // recomputes the row key from each ABSTRACTED output state (the one
+        // it checkpoints) via `engine_row_keys`, so the backward sweep can
+        // reproduce it.
+        Ok(self
             .engine
-            .run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
-        let got_states: Vec<State> = got.iter().map(|(s, _)| s.clone()).collect();
-
-        // DEBUG (CELESTE_CHECK_LANES): run each INPUT lane on its own through
-        // both engines and compare, then compare the UNION of the single-lane
-        // interpreter outputs to the whole-chunk interpreter output. If every
-        // single lane matches but the whole chunk does not, the divergence is
-        // the interpreter's CROSS-LANE `__split_by_flr` (it splits by the union
-        // of all lanes' rem intervals; the graph forks each lane independently).
-        if std::env::var_os("CELESTE_CHECK_LANES").is_some() && state.vector_size > 1 {
-            let rung = |ss: &[State]| -> std::collections::HashSet<(u64, u64)> {
-                rung_row_key_set(ss).unwrap_or_default().into_iter().collect()
-            };
-            let full_ref = rung(&reference);
-            let mut per_lane_mismatch = 0usize;
-            let mut union_single_ref: std::collections::HashSet<(u64, u64)> = Default::default();
-            let mut union_single_got: std::collections::HashSet<(u64, u64)> = Default::default();
-            for i in 0..state.vector_size {
-                let mut mask = vec![false; state.vector_size];
-                mask[i] = true;
-                let si = state.clone().filter_by_mask(
-                    &mask,
-                    crate::interpreter::state::FILTER_CHUNK,
-                );
-                let ref_i: Vec<State> = interpret_prepared_cfg(frame_cfg, si.clone(), fixed_env)
-                    .map(|v| v.into_iter().map(|(s, _)| s).collect())
-                    .unwrap_or_default();
-                let got_i: Vec<State> = self
-                    .engine
-                    .run_frame_chunk(&si, Some((frame_cfg, fixed_env)))
-                    .into_iter()
-                    .map(|(s, _)| s)
-                    .collect();
-                let (rk, gk) = (rung(&ref_i), rung(&got_i));
-                if rk != gk {
-                    per_lane_mismatch += 1;
-                }
-                union_single_ref.extend(rk);
-                union_single_got.extend(gk);
-            }
-            eprintln!(
-                "[check lanes] {} of {} single lanes DIFFER (interp vs graph, alone). \
-                 union(single interp)={}, whole-chunk interp={}, they are {}. \
-                 union(single graph)={}.",
-                per_lane_mismatch,
-                state.vector_size,
-                union_single_ref.len(),
-                full_ref.len(),
-                if union_single_ref == full_ref { "EQUAL" } else { "DIFFERENT" },
-                union_single_got.len(),
-            );
-        }
-        // The comparator must compare AT THE CONFIGURED RUNG's
-        // abstraction. `FrameEngine::row_key_set` funnels through
-        // `Rt2::boundary`, which widens at Bits(0) - fine (and cheap)
-        // when the rung IS Bits(0), but at a finer rung two
-        // rung-distinct row sets can coarsen equal, so the level-0 keys
-        // are too weak a claim there. The rung comparator abstracts both
-        // sides with the campaign's own `split_precision_straddles` +
-        // `make_state_abstract` and compares `sweep::row_keys` sets -
-        // sound to compare across the two engines' different lane
-        // groupings because every step is a per-lane function of the
-        // lane's values and its state's (identical) heap structure.
-        let level0 = crate::interpreter::abstraction::rem_precision_from_env()
-            == crate::interpreter::abstraction::RemPrecision::Bits(0);
-        let (want_keys, got_keys) = if level0 {
-            (
-                self.engine.row_key_set(&reference),
-                self.engine.row_key_set(&got_states),
-            )
-        } else {
-            (
-                rung_row_key_set(&reference)
-                    .context("rung-abstracting the reference side of the check")?,
-                rung_row_key_set(&got_states)
-                    .context("rung-abstracting the compiled side of the check")?,
-            )
-        };
-        let missing: Vec<_> = want_keys.difference(&got_keys).collect();
-        let extra: Vec<_> = got_keys.difference(&want_keys).collect();
-        if (!missing.is_empty() || !extra.is_empty())
-            && std::env::var_os("CELESTE_CHECK_DUMP").is_some()
-        {
-            let lanes = |ss: &[State]| ss.iter().map(|s| s.vector_size).sum::<usize>();
-            // Raw output lanes AND raw (level-0) row keys, before the rung
-            // abstraction, to tell a kernel under-production from a rung /
-            // straddle-split difference.
-            let raw_ref = self.engine.row_key_set(&reference);
-            let raw_got = self.engine.row_key_set(&got_states);
-            eprintln!(
-                "[check dump] raw output lanes: interp {} ({} states), asm {} ({} states); \
-                 raw(level0) row keys: interp {}, asm {} (raw missing {})",
-                lanes(&reference),
-                reference.len(),
-                lanes(&got_states),
-                got_states.len(),
-                raw_ref.len(),
-                raw_got.len(),
-                raw_ref.difference(&raw_got).count(),
-            );
-            let rem_ivals = |ss: &[State]| -> std::collections::BTreeSet<(i32, i32)> {
-                let mut out = std::collections::BTreeSet::new();
-                for s in ss {
-                    let marks = crate::interpreter::abstraction::mark_heap(s);
-                    let Some(cells) = marks.marks.get("player_rem_xy") else { continue };
-                    for &cell in cells {
-                        if let Some(HeapValue::Value(Value::NumberInterval(mv))) = s.heap.get_opt(cell)
-                        {
-                            let mut ins = |iv: &crate::pico8_num::Pico8NumInterval| {
-                                out.insert((
-                                    iv.low.as_raw_u32() as i32,
-                                    iv.high.as_raw_u32() as i32,
-                                ));
-                            };
-                            match mv {
-                                MaybeVector::Scalar(iv) => ins(iv),
-                                MaybeVector::Vector(v) => v.iter().for_each(|iv| ins(iv)),
-                            }
-                        }
-                    }
-                }
-                out
-            };
-            let ri = rem_ivals(&reference);
-            let ai = rem_ivals(&got_states);
-            let inp = rem_ivals(std::slice::from_ref(&state));
-            eprintln!(
-                "[check dump] rem intervals (raw): INPUT {} distinct, interp-out {}, asm-out {}",
-                inp.len(),
-                ri.len(),
-                ai.len(),
-            );
-            eprintln!("[check dump]   INPUT rems: {:x?}", inp.iter().take(24).collect::<Vec<_>>());
-            eprintln!("[check dump]   ASM-out rems: {:x?}", ai.iter().collect::<Vec<_>>());
-            let spd_nums = |ss: &[State]| -> std::collections::BTreeSet<i32> {
-                let mut out = std::collections::BTreeSet::new();
-                for s in ss {
-                    let marks = crate::interpreter::abstraction::mark_heap(s);
-                    let Some(cells) = marks.marks.get("player_spd_xy") else { continue };
-                    for &cell in cells {
-                        if let Some(HeapValue::Value(Value::Number(mv))) = s.heap.get_opt(cell) {
-                            match mv {
-                                MaybeVector::Scalar(n) => { out.insert(n.as_raw_u32() as i32); }
-                                MaybeVector::Vector(v) => v.iter().for_each(|n| { out.insert(n.as_raw_u32() as i32); }),
-                            }
-                        }
-                    }
-                }
-                out
-            };
-            eprintln!(
-                "[check dump]   spd: INPUT {:x?}, interp-out {:x?}, asm-out {:x?}",
-                spd_nums(std::slice::from_ref(&state)).iter().take(16).collect::<Vec<_>>(),
-                spd_nums(&reference).iter().take(16).collect::<Vec<_>>(),
-                spd_nums(&got_states).iter().take(16).collect::<Vec<_>>(),
-            );
-
-            // Per-lane set difference at the RUNG (widened) layer - the same
-            // abstraction the failing comparison uses: split each output state
-            // on the session bucket boundary (`split_precision_straddles`) and
-            // widen to buckets (`make_state_abstract`) BEFORE categorizing, so
-            // the rem/spd shown are bucket-aligned. Keying on
-            // `row_keys_lane_order` of the abstracted states (same function
-            // both sides) makes membership a true set comparison, and the
-            // straddle-split gives each lane exactly one bucket.
-            let rung = |ss: &[State]| -> Vec<State> {
-                let mut out = Vec::new();
-                for s in ss {
-                    if s.vector_size == 0 {
-                        continue;
-                    }
-                    for st in crate::interpreter::abstraction::split_precision_straddles(s.clone()) {
-                        let mut st = crate::interpreter::abstraction::make_state_abstract(st);
-                        st.gc();
-                        out.push(st);
-                    }
-                }
-                out
-            };
-            let reference = rung(&reference);
-            let got_states = rung(&got_states);
-            let graph_keys: std::collections::HashSet<(u64, u64)> = got_states
-                .iter()
-                .flat_map(|s| self.engine.row_keys_lane_order(s))
-                .collect();
-            // A lane's rem intervals and spd numbers, as sorted raw tuples
-            // (the mark cells are an unordered set, so sort for a canonical,
-            // comparable signature; x vs y is not separated but the pair of
-            // values is enough to see the missing fork dimension).
-            type LC = ((i16, i16), Vec<(i32, i32)>, Vec<i32>);
-            let lane_rs = |s: &State, lane: usize| -> (Vec<(i32, i32)>, Vec<i32>) {
-                let marks = crate::interpreter::abstraction::mark_heap(s);
-                let mut rems: Vec<(i32, i32)> = Vec::new();
-                if let Some(cells) = marks.marks.get("player_rem_xy") {
-                    for &cell in cells {
-                        if let Some(HeapValue::Value(Value::NumberInterval(mv))) = s.heap.get_opt(cell) {
-                            let iv = match mv {
-                                MaybeVector::Scalar(iv) => *iv,
-                                MaybeVector::Vector(v) => v[lane.min(v.len() - 1)],
-                            };
-                            rems.push((iv.low.as_raw_u32() as i32, iv.high.as_raw_u32() as i32));
-                        }
-                    }
-                }
-                let mut spds: Vec<i32> = Vec::new();
-                if let Some(cells) = marks.marks.get("player_spd_xy") {
-                    for &cell in cells {
-                        if let Some(HeapValue::Value(Value::Number(mv))) = s.heap.get_opt(cell) {
-                            let n = match mv {
-                                MaybeVector::Scalar(n) => *n,
-                                MaybeVector::Vector(v) => v[lane.min(v.len() - 1)],
-                            };
-                            spds.push(n.as_raw_u32() as i32);
-                        }
-                    }
-                }
-                rems.sort();
-                spds.sort();
-                (rems, spds)
-            };
-            let lane_content = |s: &State, lane: usize| -> LC {
-                let xy = crate::interpreter::abstraction::player_xy_per_lane(s)
-                    .and_then(|v| v.get(lane).copied())
-                    .unwrap_or((-1, -1));
-                let (rems, spds) = lane_rs(s, lane);
-                (xy, rems, spds)
-            };
-            let mut only: std::collections::BTreeSet<LC> = Default::default();
-            let mut both: std::collections::BTreeSet<LC> = Default::default();
-            let (mut n_only, mut n_both) = (0usize, 0usize);
-            for s in &reference {
-                let keys = self.engine.row_keys_lane_order(s);
-                for (lane, k) in keys.iter().enumerate() {
-                    let c = lane_content(s, lane);
-                    if graph_keys.contains(k) {
-                        both.insert(c);
-                        n_both += 1;
-                    } else {
-                        only.insert(c);
-                        n_only += 1;
-                    }
-                }
-            }
-            eprintln!(
-                "[check dump] per-lane categories: interp-only {} lanes ({} distinct rem/spd), \
-                 shared {} lanes ({} distinct)",
-                n_only,
-                only.len(),
-                n_both,
-                both.len(),
-            );
-            let show = |label: &str, set: &std::collections::BTreeSet<LC>| {
-                eprintln!("[check dump]   {label} (xy, rems, spds) sample:");
-                for c in set.iter().take(20) {
-                    eprintln!("[check dump]     xy={:?} rems={:08x?} spds={:08x?}", c.0, c.1, c.2);
-                }
-            };
-            show("INTERP-ONLY", &only);
-            show("SHARED", &both);
-            // Which coordinate actually discriminates: distinct xy, and
-            // distinct (rem,spd) IGNORING xy, in each bucket. If the xy sets
-            // differ but the (rem,spd) sets coincide, position is the missing
-            // fork dimension; if (rem,spd) differ, it is the physics.
-            let xy_set = |set: &std::collections::BTreeSet<LC>| -> std::collections::BTreeSet<(i16, i16)> {
-                set.iter().map(|c| c.0).collect()
-            };
-            let rs_set = |set: &std::collections::BTreeSet<LC>| -> std::collections::BTreeSet<(Vec<(i32, i32)>, Vec<i32>)> {
-                set.iter().map(|c| (c.1.clone(), c.2.clone())).collect()
-            };
-            let (only_xy, both_xy) = (xy_set(&only), xy_set(&both));
-            let (only_rs, both_rs) = (rs_set(&only), rs_set(&both));
-            eprintln!(
-                "[check dump]   distinct xy: interp-only {} (of which {} NOT in shared), shared {}",
-                only_xy.len(),
-                only_xy.difference(&both_xy).count(),
-                both_xy.len(),
-            );
-            eprintln!(
-                "[check dump]   distinct (rem,spd) ignoring xy: interp-only {} (of which {} NOT in shared), shared {}",
-                only_rs.len(),
-                only_rs.difference(&both_rs).count(),
-                both_rs.len(),
-            );
-            let only_sig: std::collections::BTreeSet<&LC> = only.iter().collect();
-            let both_sig: std::collections::BTreeSet<&LC> = both.iter().collect();
-            let excl: Vec<_> = only_sig.difference(&both_sig).collect();
-            eprintln!(
-                "[check dump]   full signatures ONLY in interp-only lanes: {} of {} interp-only",
-                excl.len(),
-                only.len(),
-            );
-        }
-        if (!missing.is_empty() || !extra.is_empty())
-            && std::env::var_os("CELESTE_DUMP_STATE").is_some()
-        {
-            // Capture the diverging INPUT chunk so the repro-bisect harness
-            // (src/bin/repro.rs) can apply an editable frame to this fixed
-            // state through both engines without re-running the trajectory.
-            let path = std::env::var("CELESTE_DUMP_STATE")
-                .unwrap_or_else(|_| "diverging-state.json".to_string());
-            match crate::interpreter::inspect::state_to_json(&state) {
-                Ok(j) => {
-                    let _ = std::fs::write(&path, j);
-                    eprintln!("[dump state] wrote diverging {}-lane input to {}", state.vector_size, path);
-                }
-                Err(e) => eprintln!("[dump state] serialize failed: {e}"),
-            }
-        }
-        if !missing.is_empty() || !extra.is_empty() {
-            // The keys themselves, because "24 rows differ" was exactly the
-            // level of detail that left the divergence unexplained for a
-            // day. A handful is enough to grep for in a rowkeys sidecar.
-            let fmt_keys = |keys: &[&(u64, u64)]| {
-                keys.iter()
-                    .take(8)
-                    .map(|(lo, hi)| format!("{:016x}{:016x}", lo, hi))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            return Err(anyhow::Error::new(CheckMismatch(format!(
-                "compiled-forward check FAILED on a {}-lane chunk: {} rows the \
-                 interpreter produced are missing from the compiled output \
-                 [{}], {} rows are extra [{}] (interpreter {} rows, compiled \
-                 {} rows)",
-                state.vector_size,
-                missing.len(),
-                fmt_keys(&missing),
-                extra.len(),
-                fmt_keys(&extra),
-                want_keys.len(),
-                got_keys.len(),
-            ))));
-        }
-        // Which trajectory does check mode explore? The two partitions
-        // carry the SAME row set (just verified), so either is sound, but
-        // they induce different next-frame states.
-        //
-        // Historic (default): carry the INTERPRETER reference forward. The
-        // engine's regrouping can form states the interpreter's own flow
-        // never would, and on room (2,0) f40 the reference side of the
-        // NEXT frame ground for hours in split_by_condition on exactly
-        // such states - so the frontier stayed the interpreter's, and
-        // check gated "the engine reproduces the interpreter's transition
-        // on the interpreter's own frontier", frame by frame.
-        //
-        // `CELESTE_CHECK_KERNEL_FRONTIER`: carry the KERNEL's own output
-        // forward instead, so check drives the REAL compiled trajectory
-        // (skip and all) with the interpreter alongside for comparison -
-        // the "run the kernel path untouched, interpreter on the side"
-        // model. Under evaluation to decide if the room (2,0) grind is
-        // stale.
-        if crate::compiled::dispatch::check_kernel_frontier() {
-            drop(reference);
-            Ok(got_states)
-        } else {
-            drop(got);
-            Ok(reference)
-        }
+            .run_frame_chunk(&state)
+            .into_iter()
+            .map(|(s, _keys)| s)
+            .collect())
     }
-}
-
-/// The canonical row-key set of some raw frame-output states at the
-/// CONFIGURED ladder rung: the campaign's own boundary abstraction
-/// (`split_precision_straddles` + `make_state_abstract`), then
-/// `sweep::row_keys` per surviving state. This is check mode's comparator
-/// at every rung above Bits(0) - see the call site.
-fn rung_row_key_set(states: &[State]) -> Result<rustc_hash::FxHashSet<(u64, u64)>> {
-    let mut keys: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
-    for s in states {
-        if s.vector_size == 0 {
-            continue;
-        }
-        for st in crate::interpreter::abstraction::split_precision_straddles(s.clone()) {
-            let mut st = make_state_abstract(st);
-            st.gc();
-            keys.extend(super::sweep::row_keys(&st)?);
-        }
-    }
-    Ok(keys)
 }
 
 /// The process's compiled forward engine, if this run opted into one.
@@ -1587,14 +1162,16 @@ fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward
         Ok(v) if v == "0" => return Ok(None),
         Ok(v) => v,
     };
-    let check = match mode.as_str() {
-        "1" => false,
-        "check" => true,
+    match mode.as_str() {
+        "1" => {}
+        "check" => anyhow::bail!(
+            "CELESTE_COMPILED_FORWARD=check was removed with the CFG interpreter;              the sampled kernel gate (trace::refgate) now compares the kernels              against the reference. Use CELESTE_COMPILED_FORWARD=1."
+        ),
         other => anyhow::bail!(
-            "CELESTE_COMPILED_FORWARD={:?}: expected 1, check or 0",
+            "CELESTE_COMPILED_FORWARD={:?}: expected 1 or 0",
             other
         ),
-    };
+    }
 
     // What the compiled path cannot serve, refused up front rather than
     // silently mis-abstracted (plans/kernel-ladder.md). The LEVEL-0 set
@@ -1646,11 +1223,6 @@ fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward
 
     static ENGINE: std::sync::OnceLock<CompiledForward> = std::sync::OnceLock::new();
     if ENGINE.get().is_none() {
-        // The RECIPE is still parsed - `StateMapping::from_recipe` reads
-        // the instruction list as DATA - but it is no longer replayed:
-        // the program itself comes from the frozen artifact next to it.
-        let recipe = crate::program::recipe::Recipe::load(COMPILE_RECIPE)
-            .with_context(|| format!("loading {} (run from the repo root)", COMPILE_RECIPE))?;
         let compile_program = crate::program::frozen::rewritten(COMPILE_RECIPE)
             .with_context(|| format!("loading the frozen {}", COMPILE_RECIPE))?;
         // The pm1 partition cells are a PROCESS GLOBAL that
@@ -1668,39 +1240,11 @@ fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward
             compile_program.merge_partition_cells,
             program.merge_partition_cells,
         );
-        let mut engine = crate::compiled::FrameEngine::new_for_start_room(&compile_program)?;
-        // The plain-program path for the kernels' deopt sub-chunks (dying
-        // representatives, class-leaving rows). The mapping must be the
-        // COMPILE recipe's - the sub-chunks are in the layout the compile
-        // program produced. Without this, one dying representative fails
-        // the specialized fallback, the whole compiled attempt is
-        // discarded, and the outer deopt arm re-runs the entire state
-        // (plans/shape-tag-plan.md, "Phase C scoping measurement").
-        let plain_program = Program::compile_from_disk()
-            .context("compiling the plain program for the engine's deopt path")?;
-        engine.set_plain_path(crate::compiled::PlainPath {
-            plain_cfg: crate::interpreter::fixed_env::PreparedCfg::new(
-                plain_program.frame_cfg().clone(),
-            ),
-            plain_env: plain_program.fixed_env(),
-            mapping: super::state_mapping::StateMapping::from_recipe(&recipe),
-        });
-        let _ = ENGINE.set(CompiledForward { engine, check });
+        let engine = crate::compiled::FrameEngine::new_for_start_room(&compile_program)?;
+        let _ = ENGINE.set(CompiledForward { engine });
     }
     let engine = ENGINE.get().expect("just initialized");
-    anyhow::ensure!(
-        engine.check == check,
-        "CELESTE_COMPILED_FORWARD changed mid-process"
-    );
-    println!(
-        "compiled forward engine ENABLED ({}), program {}",
-        if check {
-            "check mode: both paths, row-key sets compared"
-        } else {
-            "compiled only"
-        },
-        COMPILE_RECIPE
-    );
+    println!("compiled forward engine ENABLED, program {}", COMPILE_RECIPE);
     Ok(Some(engine))
 }
 
@@ -1712,13 +1256,13 @@ impl AbstractRun {
         // and its lazy build is too stack-heavy to trigger inside a worker.
         crate::compiled::prewarm_engine_row_keys()?;
         let fixed_env = program.fixed_env();
-        let initial = create_initial_state_with_builtins(&fixed_env);
-        let init_states = interpret_cfg(program.init_cfg().clone(), initial, &fixed_env)
-            .context("init failed")?;
-        let mut states: Vec<State> = init_states.into_iter().map(|(s, _)| s).collect();
-        for state in &mut states {
-            inject_tile_flag_at_builtin(state);
-        }
+        // Frame-0 via the REFERENCE interpreter (`RefEngine` runs the
+        // original Lua = the plain program; init equivalence is proven by
+        // `refgate`). One init state, `tile_flag_at` already injected.
+        let states: Vec<State> = vec![crate::trace::refengine::RefEngine::new()
+            .context("build reference engine")?
+            .initial_state()
+            .context("init failed")?];
         let frame_cfg =
             crate::interpreter::fixed_env::PreparedCfg::new(program.frame_cfg().clone());
         let visited_rows = if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
@@ -1760,14 +1304,12 @@ impl AbstractRun {
     /// `program`, and `plain` must be the unrewritten program.
     pub fn start_with_deopt(
         program: &Program,
-        plain: &Program,
+        _plain: &Program,
         mapping: super::state_mapping::StateMapping,
         force: bool,
     ) -> Result<Self> {
         let mut run = Self::start(program)?;
         run.deopt = Some(DeoptTarget {
-            plain_cfg: crate::interpreter::fixed_env::PreparedCfg::new(plain.frame_cfg().clone()),
-            plain_env: plain.fixed_env(),
             mapping,
             force,
             collect_first: std::env::var_os("CELESTE_DEOPT_COLLECT_FIRST").is_some(),
@@ -2132,9 +1674,9 @@ impl AbstractRun {
         // Check mode's output is the interpreter REFERENCE (raw) unless it
         // is driving the frontier with the kernel, in which case the output
         // is the widened kernel state like the real path.
-        let compiled_widened_output = self
-            .compiled
-            .is_some_and(|c| !c.check || crate::compiled::dispatch::check_kernel_frontier());
+        // The compiled output is the widened kernel state, always (the
+        // interpreter-reference `check` mode is gone).
+        let compiled_widened_output = self.compiled.is_some();
         crate::compiled::dispatch::wrapper_skip()
             && !self.rem_only_abstraction
             && compiled_widened_output
@@ -2577,15 +2119,12 @@ fn interpret_state_base(
                 // dispatch. Everything around it (the boundary, the
                 // frontier subtract, the band, the row table) stays the
                 // campaign's; see `FrameEngine::run_frame_chunk`.
-                let result = match compiled {
-                    Some(c) => c.run_chunk(frame_cfg, fixed_env, state)?,
-                    None => interpret_prepared_cfg(frame_cfg, state, fixed_env)
-                        .context("frame failed")?
-                        .into_iter()
-                        .map(|(s, _)| s)
-                        .collect(),
+                let Some(c) = compiled else {
+                    anyhow::bail!(
+                        "the search is compiled-only: the CFG interpreter frame                          body was removed. Set CELESTE_COMPILED_FORWARD=1."
+                    );
                 };
-                new_states.extend(result);
+                new_states.extend(c.run_chunk(state)?);
             }
             Some(deopt) if deopt.force => {
                 counters.deopt.0 += 1;
@@ -2627,21 +2166,17 @@ fn interpret_state_base(
                 let t_snap = std::time::Instant::now();
                 let snapshot = state.clone();
                 add_worker_ns(WORKER_SNAPSHOT, t_snap.elapsed().as_nanos() as u64);
-                let attempt =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match compiled {
-                        Some(c) => c.run_chunk(frame_cfg, fixed_env, state),
-                        None => interpret_prepared_cfg(frame_cfg, state, fixed_env)
-                            .map(|r| r.into_iter().map(|(s, _)| s).collect()),
-                    }));
+                let Some(c) = compiled else {
+                    anyhow::bail!(
+                        "the search is compiled-only: the CFG interpreter frame                          body was removed. Set CELESTE_COMPILED_FORWARD=1."
+                    );
+                };
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    c.run_chunk(state)
+                }));
                 match attempt {
                     Ok(Ok(result)) => new_states.extend(result),
                     Ok(Err(err)) => {
-                        // A check-mode row-set mismatch is the GATE failing,
-                        // not a premise failing - propagate it instead of
-                        // deopting over it. See `CheckMismatch`.
-                        if err.downcast_ref::<CheckMismatch>().is_some() {
-                            return Err(err);
-                        }
                         log_deopt(&mut counters.deopt, &snapshot, &format!("{:#}", err));
                         let (states, plain_lanes) =
                             run_deopt_frame_granular(deopt, frame_cfg, fixed_env, snapshot, true)?;
@@ -3008,125 +2543,19 @@ fn timed_deopt_frame(deopt: &DeoptTarget, state: State) -> Result<Vec<State>> {
 /// Returns the frame outputs plus how many lanes actually re-ran under plain.
 fn run_deopt_frame_granular(
     deopt: &DeoptTarget,
-    frame_cfg: &crate::interpreter::fixed_env::PreparedCfg,
-    fixed_env: &crate::interpreter::fixed_env::FixedEnv,
+    _frame_cfg: &crate::interpreter::fixed_env::PreparedCfg,
+    _fixed_env: &crate::interpreter::fixed_env::FixedEnv,
     snapshot: State,
-    expect_failure: bool,
+    _expect_failure: bool,
 ) -> Result<(Vec<State>, usize)> {
-    use crate::interpreter::deopt_collect;
-    use crate::interpreter::state::FILTER_DEOPT;
-
+    // The lane-granular collect path used the CFG interpreter's origin
+    // column (`deopt_collect`) to re-run only the premise-violating lanes.
+    // With the interpreter gone the deopt re-runs the WHOLE state under the
+    // REFERENCE (`run_deopt_frame` -> `RefEngine`); a deopt is rare (the
+    // doctrine is it should be near-zero), so re-doing the clean lanes too
+    // is a non-issue. Every lane counts as re-run under the reference.
     let n = snapshot.vector_size;
-    // Same clone as the optimistic path's, for the same reason, and timed
-    // the same way - collect-first keeps the input around so a captured
-    // lane can be re-run under the plain program.
-    let t_snap = std::time::Instant::now();
-    let mut tagged = snapshot.clone();
-    add_worker_ns(WORKER_SNAPSHOT, t_snap.elapsed().as_nanos() as u64);
-    inject_origin(&mut tagged);
-    deopt_collect::begin();
-    // The origin-tagged run of the SPECIALIZED program. On the
-    // collect-first path this is the frame; on the optimistic path it is a
-    // second frame after the first one failed, which is what collect-first
-    // exists to avoid.
-    let t_tagged = std::time::Instant::now();
-    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        interpret_prepared_cfg(frame_cfg, tagged, fixed_env)
-    }));
-    add_worker_ns(WORKER_TAGGED, t_tagged.elapsed().as_nanos() as u64);
-    let captured = deopt_collect::take();
-    let result = match attempt {
-        // Collect-first mode: no premise fired - the common case. Strip the
-        // origin column and hand the outputs straight back.
-        Ok(Ok(result)) if captured.is_empty() && !expect_failure => {
-            let mut out = Vec::with_capacity(result.len());
-            for (mut state, _) in result {
-                state.global_env.remove(deopt_collect::ORIGIN_GLOBAL);
-                out.push(state);
-            }
-            return Ok((out, 0));
-        }
-        Ok(Ok(result)) if !captured.is_empty() => result,
-        Ok(Ok(_)) => {
-            // The first attempt failed but the retry captured nothing and
-            // succeeded - nondeterminism somewhere. Ground truth is plain.
-            println!("  deopt: retry captured nothing; whole-state fallback");
-            return Ok((timed_deopt_frame(deopt, snapshot)?, n));
-        }
-        Ok(Err(err)) => {
-            let one_line = format!("{:#}", err).replace('\n', " | ");
-            println!(
-                "  deopt: retry failed for a non-premise reason ({}); whole-state fallback",
-                one_line.chars().take(400).collect::<String>()
-            );
-            return Ok((timed_deopt_frame(deopt, snapshot)?, n));
-        }
-        Err(panic) => {
-            println!(
-                "  deopt: retry panicked ({}); whole-state fallback",
-                panic_text(&panic).chars().take(400).collect::<String>()
-            );
-            return Ok((timed_deopt_frame(deopt, snapshot)?, n));
-        }
-    };
-
-    let failed: rustc_hash::FxHashSet<u32> = captured.iter().copied().collect();
-
-    // Accounting: every input lane must end up either in the specialized
-    // outputs or in the captured set. A lane in neither vanished silently -
-    // that is a machinery bug, and the whole-state path is the sound answer.
-    let mut covered = vec![false; n];
-    let mut in_range = true;
-    for &o in &captured {
-        match covered.get_mut(o as usize) {
-            Some(c) => *c = true,
-            None => in_range = false,
-        }
-    }
-
-    let mut out = Vec::new();
-    for (state, _) in result {
-        let origins = deopt_collect::read_origins(&state);
-        for &o in &origins {
-            match covered.get_mut(o as usize) {
-                Some(c) => *c = true,
-                None => in_range = false,
-            }
-        }
-        let mask: Vec<bool> = origins.iter().map(|o| !failed.contains(o)).collect();
-        let mut state = if mask.iter().all(|k| *k) {
-            state
-        } else if mask.iter().any(|k| *k) {
-            state.filter_by_mask_clone(&mask, FILTER_DEOPT)
-        } else {
-            continue;
-        };
-        state.global_env.remove(deopt_collect::ORIGIN_GLOBAL);
-        out.push(state);
-    }
-
-    if !in_range || !covered.iter().all(|c| *c) {
-        println!("  deopt: lane accounting mismatch on the retry; whole-state fallback");
-        return Ok((run_deopt_frame(deopt, snapshot)?, n));
-    }
-
-    let plain_mask: Vec<bool> = (0..n).map(|i| failed.contains(&(i as u32))).collect();
-    let plain_input = snapshot.filter_by_mask_clone(&plain_mask, FILTER_DEOPT);
-    let plain_lanes = plain_input.vector_size;
-    out.extend(timed_deopt_frame(deopt, plain_input)?);
-    Ok((out, plain_lanes))
-}
-
-/// Give every lane of `state` a distinct origin index (a synthetic global the
-/// program never reads; see `deopt_collect::ORIGIN_GLOBAL`). The index is the
-/// lane position, bijectively encoded in the raw Pico8Num bits.
-fn inject_origin(state: &mut State) {
-    let ids: Vec<u32> = (0..state.vector_size.max(1) as u32).collect();
-    crate::interpreter::deopt_collect::inject_named(
-        state,
-        crate::interpreter::deopt_collect::ORIGIN_GLOBAL,
-        &ids,
-    );
+    Ok((timed_deopt_frame(deopt, snapshot)?, n))
 }
 
 /// One frame of one state under the plain program: map the input to canonical,
@@ -3145,10 +2574,20 @@ fn run_deopt_frame_inner(deopt: &DeoptTarget, mut state: State) -> Result<Vec<St
         .mapping
         .to_canonical(&mut state)
         .context("deopt: mapping the frame input to canonical")?;
-    let result = interpret_prepared_cfg(&deopt.plain_cfg, state, &deopt.plain_env)
-        .context("deopt: the frame failed under the plain program too")?;
+    // The plain program is now the REFERENCE interpreter (`RefEngine` runs
+    // the original Lua = the plain program). One reference engine per worker
+    // thread, built lazily.
+    let result = DEOPT_REFENGINE.with(|cell| -> Result<Vec<State>> {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(crate::trace::refengine::RefEngine::new()
+                .context("deopt: building the reference engine")?);
+        }
+        slot.as_mut().unwrap().run_frame(&state)
+            .context("deopt: the frame failed under the reference program too")
+    })?;
     let mut out = Vec::with_capacity(result.len());
-    for (mut s, _) in result {
+    for mut s in result {
         deopt
             .mapping
             .from_canonical(&mut s)
@@ -3156,6 +2595,11 @@ fn run_deopt_frame_inner(deopt: &DeoptTarget, mut state: State) -> Result<Vec<St
         out.push(s);
     }
     Ok(out)
+}
+
+thread_local! {
+    static DEOPT_REFENGINE: std::cell::RefCell<Option<crate::trace::refengine::RefEngine>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Count a deopt event; print the trigger for the first one each frame (the

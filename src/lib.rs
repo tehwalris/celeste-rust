@@ -25,6 +25,4 @@ pub use celeste_ir::{builtins, frontend, ir};
 // emitters and the search can depend on it without any of them being in
 // the same compilation unit (plans/build-time.md). Re-exported at the old
 // paths.
-pub use celeste_interp::{ block_flow, game_runner, instr_time,
-    instruction_flow, interpreter, liveness,
-};
+pub use celeste_interp::{ game_runner, instr_time, interpreter };

@@ -39,29 +39,10 @@ const COMPILE_RECIPE: &str = "rewrites-compile.jsonl";
 fn engine() -> &'static FrameEngine {
     static ENGINE: std::sync::OnceLock<FrameEngine> = std::sync::OnceLock::new();
     ENGINE.get_or_init(|| {
-        // The RECIPE is still parsed - `StateMapping::from_recipe` below
-        // reads the instruction list as DATA - but it is not replayed:
-        // the program comes from the frozen artifact next to it.
-        let recipe = celeste_rust::program::recipe::Recipe::load(COMPILE_RECIPE).unwrap_or_else(
-            |e| panic!("loading {} (run from the repo root): {}", COMPILE_RECIPE, e),
-        );
         let program = celeste_rust::program::frozen::rewritten(COMPILE_RECIPE)
             .unwrap_or_else(|e| panic!("loading the frozen {}: {}", COMPILE_RECIPE, e));
         let (cart, cache) = world();
-        let mut engine = FrameEngine::new(&program, cart.clone(), cache.clone());
-        // The plain-program path for kernel deopt sub-chunks (dying
-        // representatives etc.), which fail the specialized program's
-        // premises by construction. Same wiring as the campaign's
-        // `compiled_engine`.
-        let plain_program = celeste_rust::program::Program::compile_from_disk()
-            .expect("compiling the plain program for the engine's deopt path");
-        engine.set_plain_path(celeste_rust::compiled::PlainPath {
-            plain_cfg: celeste_rust::interpreter::fixed_env::PreparedCfg::new(
-                plain_program.frame_cfg().clone(),
-            ),
-            plain_env: plain_program.fixed_env(),
-            mapping: celeste_rust::search::state_mapping::StateMapping::from_recipe(&recipe),
-        });
+        let engine = FrameEngine::new(&program, cart.clone(), cache.clone());
         engine
     })
 }
@@ -108,7 +89,6 @@ fn main() {
     let mut abstract_bench: Option<(String, u32)> = None;
     let mut row_census: Option<(String, u32)> = None;
     let mut emit_shape: Option<(String, u32, String, String, String)> = None;
-    let mut interp_bench: Option<(String, u32)> = None;
     let mut frame_diff: Option<(String, u32, String)> = None;
     let mut dedup_bench: Option<(String, u32)> = None;
     let mut reps: u32 = 10;
@@ -141,11 +121,6 @@ fn main() {
                 let shape = args.next().unwrap_or_else(|| "player".to_string());
                 emit_shape = Some((dir, frame, out, class, shape));
             }
-            "--interp-bench" => {
-                let dir = args.next().expect("--interp-bench needs DIR FRAME");
-                let f: u32 = args.next().expect("FRAME").parse().unwrap();
-                interp_bench = Some((dir, f));
-            }
             "--dedup-bench" => {
                 let dir = args.next().expect("--dedup-bench needs DIR FRAME");
                 let f: u32 = args.next().expect("FRAME").parse().unwrap();
@@ -167,8 +142,6 @@ fn main() {
         run_row_census(&dir, frame);
     } else if let Some((dir, frame, out, class, shape)) = emit_shape {
         run_emit_shape(&dir, frame, &out, &class, &shape);
-    } else if let Some((dir, frame)) = interp_bench {
-        run_interp_bench(&dir, frame, reps);
     } else if let Some((dir, frame, out)) = frame_diff {
         run_frame_diff(&dir, frame, &out);
     } else if let Some((dir, frame)) = dedup_bench {
@@ -176,7 +149,7 @@ fn main() {
     } else if let Some((dir, frame)) = abstract_bench {
         run_abstract_bench(&dir, frame, reps);
     } else {
-        panic!("nothing to do - pass --abstract N, --abstract-bench DIR FRAME, --row-census, --emit-shape, --interp-bench, --frame-diff, --dedup-bench or --abstract-bench DIR FRAME");
+        panic!("nothing to do - pass --abstract N, --abstract-bench DIR FRAME, --row-census, --emit-shape, --frame-diff, --dedup-bench or --abstract-bench DIR FRAME");
     }
 }
 
@@ -617,117 +590,6 @@ fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str, shape: &st
         vary.iter().filter(|v| **v).count(),
         blocks.len(),
         out_path
-    );
-}
-
-/// The INTERPRETER's frame body on the same input, for scale.
-///
-/// `--interp-bench DIR FRAME` was the class-kernel `--kernel-bench`'s
-/// counterpart (that mode went with the class kernels): same checkpoint
-/// states, "frame body only" boundary (no abstraction, no dedup, no
-/// merge), best-of-N, normalization. What it runs is
-/// `interpret_prepared_cfg` on the CAMPAIGN's recipe (`rewrites.jsonl`),
-/// not the compile overlay - the overlay's `expand_bool` was measured at
-/// +19% on the interpreter, so this is the interpreter at its best rather
-/// than the interpreter handicapped by the compiled path's program.
-///
-/// Two knobs: `CELESTE_KERNEL_BENCH_THREADS=T` and
-/// `CELESTE_INTERP_BENCH_LANES=N` (the per-chunk lane cap, which is what
-/// the interpreter's vectorization amortizes over).
-fn run_interp_bench(dir: &str, frame: u32, reps: u32) {
-    use celeste_rust::interpreter::state::State;
-    use std::time::Instant;
-
-    let program =
-        celeste_rust::program::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
-    celeste_rust::interpreter::vectorize::set_merge_partition_patterns(
-        &program.merge_partition_cells,
-    );
-    let frame_cfg =
-        celeste_rust::interpreter::fixed_env::PreparedCfg::new(program.frame_cfg().clone());
-    let fixed_env = program.fixed_env();
-
-    let states = load_states_any(dir, frame);
-    let lanes_in: usize = states.iter().map(|s| s.vector_size).sum();
-    let cap: usize = std::env::var("CELESTE_INTERP_BENCH_LANES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8000);
-    let chunks: Vec<State> = {
-        use celeste_rust::interpreter::value::KeptLanes;
-        let mut out = Vec::new();
-        for st in &states {
-            let n = st.vector_size;
-            if n <= cap {
-                out.push(st.clone());
-                continue;
-            }
-            for lo in (0..n).step_by(cap) {
-                let hi = (lo + cap).min(n);
-                out.push(st.filter_by_kept_clone(
-                    &KeptLanes::from_range(lo, hi),
-                    celeste_rust::interpreter::state::FILTER_CHUNK,
-                ));
-            }
-        }
-        out
-    };
-    let threads: usize = std::env::var("CELESTE_KERNEL_BENCH_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
-    eprintln!(
-        "[interp-bench] f{:03}: {} lanes in {} state(s) -> {} chunk(s) of <={} lanes, {} thread(s)",
-        frame,
-        lanes_in,
-        states.len(),
-        chunks.len(),
-        cap,
-        threads
-    );
-
-    let mut best = f64::INFINITY;
-    for _ in 0..reps {
-        // Cloned outside the timer: the interpreter consumes its state.
-        let work: Vec<State> = chunks.clone();
-        let t0 = Instant::now();
-        std::thread::scope(|scope| {
-            for tid in 0..threads {
-                let work = &work;
-                let frame_cfg = &frame_cfg;
-                let fixed_env = &fixed_env;
-                scope.spawn(move || {
-                    celeste_rust::interpreter::virtual_merge::set_nested_parallel(threads > 1);
-                    let mut sink = 0usize;
-                    for (i, st) in work.iter().enumerate() {
-                        if i % threads != tid {
-                            continue;
-                        }
-                        let out = celeste_rust::interpreter::glue::interpret_prepared_cfg(
-                            frame_cfg,
-                            st.clone(),
-                            fixed_env,
-                        )
-                        .expect("frame failed");
-                        sink += out.len();
-                    }
-                    std::hint::black_box(sink);
-                });
-            }
-        });
-        best = best.min(t0.elapsed().as_secs_f64());
-    }
-    let row_btns = lanes_in as f64 * 64.0;
-    println!(
-        "interp: {} lanes x 64 inputs, {} thread(s), cap {}, best of {}: {:.2} ms  \
-         ({:.2} ns per row-input-frame, {:.0} ns/input-lane)",
-        lanes_in,
-        threads,
-        cap,
-        reps,
-        best * 1e3,
-        best * 1e9 / row_btns,
-        best * 1e9 / lanes_in as f64
     );
 }
 
@@ -1283,15 +1145,10 @@ fn run_frame_diff(dir: &str, frame: u32, outdir: &str) {
     use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
     use std::fmt::Write as _;
 
-    // Interpreter side: the CAMPAIGN program, exactly as run_interp_bench.
-    let program =
-        celeste_rust::program::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
-    celeste_rust::interpreter::vectorize::set_merge_partition_patterns(
-        &program.merge_partition_cells,
-    );
-    let frame_cfg =
-        celeste_rust::interpreter::fixed_env::PreparedCfg::new(program.frame_cfg().clone());
-    let fixed_env = program.fixed_env();
+    // Reference side: the REFERENCE interpreter (`RefEngine`), the oracle
+    // that replaced the CFG interpreter.
+    let mut refeng =
+        celeste_rust::trace::refengine::RefEngine::new().expect("reference engine");
     let eng = engine();
 
     let inputs = load_states_any(dir, frame - 1);
@@ -1317,17 +1174,8 @@ fn run_frame_diff(dir: &str, frame: u32, outdir: &str) {
     let mut out_interp = Vec::new();
     let mut out_compiled = Vec::new();
     for st in &inputs {
-        out_interp.extend(
-            celeste_rust::interpreter::glue::interpret_prepared_cfg(
-                &frame_cfg,
-                st.clone(),
-                &fixed_env,
-            )
-            .expect("interpreter frame failed")
-            .into_iter()
-            .map(|(s, _)| s),
-        );
-        out_compiled.extend(eng.run_frame_chunk(st, None).into_iter().map(|(s, _)| s));
+        out_interp.extend(refeng.run_frame(st).expect("reference frame failed"));
+        out_compiled.extend(eng.run_frame_chunk(st).into_iter().map(|(s, _)| s));
     }
     let a = canon(out_interp);
     let b = canon(out_compiled);

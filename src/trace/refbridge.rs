@@ -493,6 +493,17 @@ pub fn to_interp_state(ts: &TState<RefDomain>) -> Result<OState> {
     let entries: Vec<(String, TValue<RefDomain>)> =
         globals.hash.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     for (name, v) in entries {
+        // The tracer's base registers COMPILE-TIME hint builtins
+        // (`_hint_normalize` etc.) that the frontend consumes, so a real
+        // interpreter state never holds them and re-importing one
+        // (`to_trace_state`/`builtin_static`) would fail. They sit outside
+        // `GLOBAL_NAMES`, so no row key sees them; drop them on export, the
+        // inverse of `add_missing_builtins` adding them on import.
+        if let TValue::Builtin(n) = &v {
+            if !BUILTIN_NAMES.iter().any(|b| b == n) {
+                continue;
+            }
+        }
         let ubool = name_is_buttons(&name);
         let bid = cx.box_slot(&v, ubool)?;
         cx.st.global_env.insert(name, bid);
@@ -587,158 +598,5 @@ mod tests {
         assert_eq!(bad, 0, "{} lanes did not round-trip", bad);
     }
 
-    /// The GATE: one checkpoint frame through BOTH interpreters must produce
-    /// the same abstracted row SET, per lane.
-    ///
-    /// OLD path: the compile program's frame on the single-lane input. NEW
-    /// path: `to_trace_state` -> `patch_closures_for` -> `run_frame_all` ->
-    /// `to_interp_state`. Both output sets funnel through `abstract_keys` -
-    /// the SAME `split_precision_straddles` + `make_state_abstract` +
-    /// `engine_row_keys` the search applies before it keys or checkpoints a
-    /// frame - so the comparison is of frame SEMANTICS in the search's own key
-    /// space, not of raw hashing (raw multi-lane outputs are not in that
-    /// space; see `abstract_keys`).
-    #[test]
-    #[ignore]
-    fn gate_frame_matches_reference() {
-        use crate::trace::refdriver::{fresh_interp, run_frame_all};
-        use crate::trace::verify::run_one;
-        use std::collections::BTreeSet;
 
-        let dir = Path::new(CKPT);
-        let frame = std::env::var("FRAME").ok().and_then(|s| s.parse().ok()).unwrap_or(5u32);
-        let max_lanes: usize =
-            std::env::var("MAXLANES").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
-        let states = crate::search::checkpoint::load_frame_states(dir, frame).expect("load frame");
-
-        // Reference-driver setup: parse once (bodies borrow the ASTs), build
-        // the interp, register bodies by running the cart toplevel + `_init`.
-        let src = crate::trace::cart::sources().expect("sources");
-        let top = full_moon::parse(&src).expect("parse top");
-        let init = full_moon::parse("_init()").expect("parse _init");
-        let body = full_moon::parse("__reset_button_states()\n_update()\n_draw()")
-            .expect("parse body");
-
-        let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").unwrap());
-        let (rx, ry) = crate::game_runner::start_room();
-        let cache = std::sync::Arc::new(
-            celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).unwrap(),
-        );
-        let mut it = fresh_interp(cart.clone(), cache.clone());
-        let st0 = crate::trace::cart::fresh_state::<RefDomain>(&mut it.d);
-        let mut st0 = run_one(&mut it, &top, st0).expect("toplevel");
-        crate::trace::cart::inject_tile_flag_at(&mut st0);
-        let base = run_one(&mut it, &init, st0).expect("_init");
-        let fn_info = fn_info_of(&base).expect("fn_info");
-
-        // OLD-path setup: the plain executable program's frame.
-        let program =
-            crate::program::frozen::rewritten("rewrites-compile.jsonl").expect("compile program");
-        crate::interpreter::vectorize::set_merge_partition_patterns(&program.merge_partition_cells);
-        let plain_cfg =
-            crate::interpreter::fixed_env::PreparedCfg::new(program.frame_cfg().clone());
-        let fixed_env = program.fixed_env();
-
-        let mut d = RefDomain::new();
-        let mut lanes_checked = 0usize;
-        let mut matched = 0usize;
-        let mut mism = 0usize;
-        let mut errored = 0usize;
-
-        'outer: for (si, s) in states.iter().enumerate() {
-            for lane in 0..s.vector_size {
-                if lanes_checked >= max_lanes {
-                    break 'outer;
-                }
-                lanes_checked += 1;
-
-                // OLD path: single-lane input -> compile frame -> abstract keys.
-                let one = single_lane(s, lane);
-                let a: BTreeSet<(u64, u64)> = match crate::interpreter::glue::interpret_prepared_cfg(
-                    &plain_cfg,
-                    one,
-                    &fixed_env,
-                ) {
-                    Ok(outs) => {
-                        let mut set = BTreeSet::new();
-                        for (os, _) in &outs {
-                            set.extend(abstract_keys(os.clone()));
-                        }
-                        set
-                    }
-                    Err(e) => {
-                        eprintln!("  s{} l{}: OLD path failed: {:#}", si, lane, e);
-                        errored += 1;
-                        continue;
-                    }
-                };
-
-                // NEW path: bridge -> patch -> enumerate the fork tree -> keys.
-                let mut bridged = match to_trace_state(s, lane, &mut d) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("  s{} l{}: to_trace_state failed: {:#}", si, lane, e);
-                        errored += 1;
-                        continue;
-                    }
-                };
-                if let Err(e) = patch_closures_for(&mut bridged, &fn_info) {
-                    eprintln!("  s{} l{}: patch failed: {:#}", si, lane, e);
-                    errored += 1;
-                    continue;
-                }
-                add_missing_builtins(&mut bridged, &base);
-                let b: BTreeSet<(u64, u64)> = match run_frame_all(&mut it, &body, &bridged) {
-                    Ok(outs) => {
-                        let mut set = BTreeSet::new();
-                        let mut path_err = None;
-                        for o in &outs {
-                            match to_interp_state(o) {
-                                Ok(os) => set.extend(abstract_keys(os)),
-                                Err(e) => path_err = Some(e),
-                            }
-                        }
-                        if let Some(e) = path_err {
-                            eprintln!("  s{} l{}: NEW path to_interp_state failed: {:#}", si, lane, e);
-                        }
-                        set
-                    }
-                    Err(e) => {
-                        eprintln!("  s{} l{}: run_frame_all failed: {:#}", si, lane, e);
-                        errored += 1;
-                        continue;
-                    }
-                };
-
-                if a == b {
-                    matched += 1;
-                } else {
-                    mism += 1;
-                    let only_a: Vec<_> = a.difference(&b).collect();
-                    let only_b: Vec<_> = b.difference(&a).collect();
-                    eprintln!(
-                        "  s{} l{}: MISMATCH  |A|={} |B|={}  A-only={} B-only={}",
-                        si, lane, a.len(), b.len(), only_a.len(), only_b.len()
-                    );
-                }
-            }
-        }
-
-        eprintln!(
-            "gate frame {}: {} lanes | matched {} | mismatched {} | errored {}",
-            frame, lanes_checked, matched, mism, errored
-        );
-        assert_eq!(mism, 0, "{} lanes mismatched", mism);
-        assert_eq!(errored, 0, "{} lanes errored", errored);
-    }
-
-
-    /// Filter an old boundary state down to a single lane.
-    fn single_lane(s: &OState, lane: usize) -> OState {
-        if s.vector_size == 1 {
-            return s.clone();
-        }
-        let mask: Vec<bool> = (0..s.vector_size).map(|i| i == lane).collect();
-        s.filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_CHUNK)
-    }
 }

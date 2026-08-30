@@ -1610,104 +1610,11 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Membercheck { tas, frames } => {
-            use celeste_rust::concrete;
-            use celeste_rust::interpreter::fixed_env::PreparedCfg;
-            use celeste_rust::interpreter::glue::interpret_prepared_cfg;
-            use celeste_rust::interpreter::state::State;
-            use celeste_rust::search::run::observe_frame;
-
-            let member = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
-            // The member's state layout differs from canonical (promote_capture
-            // etc.); cross-feeding states goes through the same mapping the
-            // campaign's dispatch/deopt uses.
-            let mapping = celeste_rust::search::state_mapping::StateMapping::from_recipe(&recipe);
-            let plain = Program::compile_executable_from_disk()?;
-            let inputs = parse_tas(&tas)?;
-            let n = frames.unwrap_or(inputs.len() as u32);
-
-            let plain_env = plain.fixed_env();
-            let plain_cfg = PreparedCfg::new(plain.frame_cfg().clone());
-            let member_env = member.fixed_env();
-            let member_cfg = PreparedCfg::new(member.frame_cfg().clone());
-
-            let mut state = concrete::initial_state(&plain, &plain_env)?;
-            let mut applied: Vec<u32> = Vec::new();
-            let mut skipped = 0u32;
-            let mut skip_sites: std::collections::BTreeMap<String, u32> =
-                std::collections::BTreeMap::new();
-            let mut mismatches = 0u32;
-
-            for frame in 1..=n {
-                let byte = *inputs.get(frame as usize - 1).unwrap_or(&0);
-
-                // Member attempt from the same pre-state, mapped into the
-                // member's representation.
-                let mut mstate = state.clone();
-                mapping.from_canonical(&mut mstate)?;
-                concrete::set_concrete_buttons(&mut mstate, byte)?;
-                let member_result = interpret_prepared_cfg(&member_cfg, mstate, &member_env);
-
-                // Plain step (the reference trajectory).
-                state = concrete::step_frame(&plain_cfg, state, &plain_env, byte)?;
-
-                match member_result {
-                    Err(e) => {
-                        let text = format!("{:#}", e);
-                        if let Some(pos) = text.find("AssertTrue(") {
-                            let site: String =
-                                text[pos..].chars().take_while(|c| *c != ')').collect();
-                            *skip_sites.entry(format!("{})", site)).or_default() += 1;
-                            skipped += 1;
-                        } else {
-                            return Err(
-                                e.context(format!("member failed non-assert at frame {}", frame))
-                            );
-                        }
-                    }
-                    Ok(mstates) => {
-                        applied.push(frame);
-                        let member_states: Vec<_> = mstates
-                            .into_iter()
-                            .map(|(mut s, _)| -> Result<State> {
-                                mapping.to_canonical(&mut s)?;
-                                Ok(s)
-                            })
-                            .collect::<Result<_>>()?;
-                        let mobs = observe_frame(&member_states);
-                        let pobs = observe_frame(std::slice::from_ref(&state));
-                        if mobs != pobs {
-                            mismatches += 1;
-                            println!(
-                                "frame {}: MISMATCH (member applied, observation differs)",
-                                frame
-                            );
-                        } else {
-                            println!("frame {}: member applied, observation identical", frame);
-                        }
-                    }
-                }
-            }
-
-            println!();
-            println!(
-                "membercheck: {} frames, member applied on {:?}, skipped {} (premise)",
-                n, applied, skipped
+        Command::Membercheck { tas: _, frames: _ } => {
+            anyhow::bail!(
+                "membercheck ran a recipe MEMBER's rewritten CFG against the plain                  program on a concrete TAS; it required the CFG interpreter, which                  has been removed. Member-vs-reference agreement is now covered at                  the row-key level by the bridge and sampled kernel gates."
             );
-            for (site, count) in &skip_sites {
-                println!("  skipped at {}: {} frame(s)", site, count);
-            }
-            if mismatches > 0 {
-                return Err(anyhow!("{} mismatched frame(s)", mismatches));
-            }
-            if applied.is_empty() {
-                return Err(anyhow!(
-                    "member never applied - vacuous pass is a rejection by design"
-                ));
-            }
-            println!("ok");
         }
-
         Command::Observe { frames } => {
             let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let trace = celeste_rust::search::differential::observation_trace(&program, frames)?;
@@ -2205,17 +2112,14 @@ fn main() -> Result<()> {
                 );
                 level_data.push(level);
             }
-            let plain = Program::compile_executable_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
-            let fixed_env = plain.fixed_env();
-            let mut state = celeste_rust::concrete::initial_state(&plain, &fixed_env)?;
+            let mut ce = celeste_rust::concrete::ConcreteEngine::new()?;
+            let mut state = ce.initial_state()?;
 
-            let frame_cfg =
-                celeste_rust::interpreter::fixed_env::PreparedCfg::new(plain.frame_cfg().clone());
             let mut first_fail: Option<(u32, u8, String)> = None;
             for frame in 1..=horizon {
                 let byte = inputs.get(frame as usize - 1).copied().unwrap_or(0);
-                state = celeste_rust::concrete::step_frame(&frame_cfg, state, &fixed_env, byte)?;
+                state = ce.step_frame(state, byte)?;
 
                 // Canonicalize per level and probe.
                 let mut canon = state.clone();
@@ -2279,8 +2183,6 @@ fn main() -> Result<()> {
             tas,
         } => {
             use celeste_rust::interpreter::abstraction::count_win_lanes;
-            use celeste_rust::interpreter::fixed_env::PreparedCfg;
-            use celeste_rust::interpreter::glue::interpret_prepared_cfg;
             use celeste_rust::interpreter::state::State;
             use celeste_rust::search::state_mapping::StateMapping;
             use celeste_rust::search::sweep;
@@ -2299,11 +2201,9 @@ fn main() -> Result<()> {
                 horizon
             );
 
-            let plain = Program::compile_executable_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
-            let fixed_env = plain.fixed_env();
-            let mut state = celeste_rust::concrete::initial_state(&plain, &fixed_env)?;
-            let frame_cfg = PreparedCfg::new(plain.frame_cfg().clone());
+            let mut ce = celeste_rust::concrete::ConcreteEngine::new()?;
+            let mut state = ce.initial_state()?;
 
             // Probe one concrete state's row in the level's band. A concrete
             // rem is a point value, so widening lands in exactly one bucket -
@@ -2325,17 +2225,7 @@ fn main() -> Result<()> {
                 // keep those whose successor stays in the band.
                 let mut candidates: Vec<(u8, State)> = Vec::new();
                 for byte in 0u8..64 {
-                    let mut s = state.clone();
-                    celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
-                    let result = interpret_prepared_cfg(&frame_cfg, s, &fixed_env)?;
-                    if result.len() != 1 {
-                        return Err(anyhow!(
-                            "frame {}: {} states (branching!)",
-                            frame,
-                            result.len()
-                        ));
-                    }
-                    let s = result.into_iter().next().unwrap().0;
+                    let s = ce.step_frame(state.clone(), byte)?;
                     if let Some((e, gv)) = probe(&s)? {
                         if e <= frame && gv != sweep::G_UNREACHABLE && (gv as u32) <= budget {
                             candidates.push((byte, s));
@@ -2429,8 +2319,6 @@ fn main() -> Result<()> {
             base_dir,
         } => {
             use celeste_rust::interpreter::abstraction::{count_win_lanes, player_xy_per_lane};
-            use celeste_rust::interpreter::fixed_env::PreparedCfg;
-            use celeste_rust::interpreter::glue::interpret_prepared_cfg;
             use celeste_rust::interpreter::state::State;
             use celeste_rust::search::state_mapping::StateMapping;
             use std::collections::HashMap;
@@ -2444,11 +2332,9 @@ fn main() -> Result<()> {
                 horizon
             );
 
-            let plain = Program::compile_executable_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
-            let fixed_env = plain.fixed_env();
-            let spawn = celeste_rust::concrete::initial_state(&plain, &fixed_env)?;
-            let frame_cfg = PreparedCfg::new(plain.frame_cfg().clone());
+            let mut ce = celeste_rust::concrete::ConcreteEngine::new()?;
+            let spawn = ce.initial_state()?;
 
             type Key = (u64, u64);
             let probe = |s: &State| -> Result<Option<(Key, u32, u16)>> {
@@ -2508,13 +2394,7 @@ fn main() -> Result<()> {
                 let mut edge_bytes: HashMap<(Key, Key), u32> = HashMap::new();
                 for (src_key, node) in &layer {
                     for byte in 0u8..64 {
-                        let mut s = node.state.clone();
-                        celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
-                        let result = interpret_prepared_cfg(&frame_cfg, s, &fixed_env)?;
-                        if result.len() != 1 {
-                            return Err(anyhow!("frame {}: branching", frame));
-                        }
-                        let s = result.into_iter().next().unwrap().0;
+                        let s = ce.step_frame(node.state.clone(), byte)?;
                         let Some((key, e, gv)) = probe(&s)? else {
                             continue;
                         };

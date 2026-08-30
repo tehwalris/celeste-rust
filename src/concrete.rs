@@ -11,11 +11,8 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::interpreter::fixed_env::{FixedEnv, PreparedCfg};
-use crate::interpreter::glue::{interpret_cfg, interpret_prepared_cfg};
 use crate::interpreter::state::State;
 use crate::interpreter::value::{HeapValue, MaybeVector, Value};
-use crate::program::Program;
 
 /// Button flags of an input byte:
 /// bit 0 = left, 1 = right, 2 = up, 3 = down, 4 = jump, 5 = dash.
@@ -69,35 +66,33 @@ pub fn set_concrete_buttons(state: &mut State, byte: u8) -> Result<()> {
     Ok(())
 }
 
-/// Run the program's init chunk to the single pre-frame-1 concrete state
-/// (the canonical spawn state), with the native `tile_flag_at` injected -
-/// exactly what the abstract search starts from.
-pub fn initial_state(program: &Program, fixed_env: &FixedEnv) -> Result<State> {
-    let initial = crate::game_runner::create_initial_state_with_builtins(fixed_env);
-    let init_states = interpret_cfg(program.init_cfg().clone(), initial, fixed_env)?;
-    let mut states: Vec<_> = init_states.into_iter().map(|(s, _)| s).collect();
-    for s in &mut states {
-        crate::game_runner::inject_tile_flag_at_builtin(s);
-    }
-    if states.len() != 1 {
-        return Err(anyhow!("init produced {} states", states.len()));
-    }
-    Ok(states.pop().unwrap())
+/// Single-lane concrete execution, backed by the REFERENCE interpreter
+/// (`RefEngine`, the AST oracle) now that the CFG interpreter is gone. Hold
+/// one across a walk: `RefEngine` owns the parsed cart and the registered
+/// function bodies, so rebuilding per frame would re-parse the cart.
+///
+/// It runs the ORIGINAL Lua (equivalent to the plain program - proven by
+/// `refgate`'s concrete walk), so it needs no `Program`; the layout it
+/// produces is the plain program's.
+pub struct ConcreteEngine {
+    eng: crate::trace::refengine::RefEngine,
 }
 
-/// One concrete frame: set the buttons, run the frame chunk (which ends
-/// with the button-state reset), and require the run to stay single-lane.
-pub fn step_frame(
-    frame_cfg: &PreparedCfg,
-    state: State,
-    fixed_env: &FixedEnv,
-    byte: u8,
-) -> Result<State> {
-    let mut state = state;
-    set_concrete_buttons(&mut state, byte)?;
-    let result = interpret_prepared_cfg(frame_cfg, state, fixed_env)?;
-    if result.len() != 1 {
-        return Err(anyhow!("frame branched into {} states", result.len()));
+impl ConcreteEngine {
+    pub fn new() -> Result<Self> {
+        Ok(Self { eng: crate::trace::refengine::RefEngine::new()? })
     }
-    Ok(result.into_iter().next().unwrap().0)
+
+    /// The single pre-frame-1 concrete spawn state, with the native
+    /// `tile_flag_at` injected - what the abstract search starts from.
+    pub fn initial_state(&self) -> Result<State> {
+        self.eng.initial_state()
+    }
+
+    /// One concrete frame: set the buttons and run `_update();_draw()`
+    /// (no reset, no forking), requiring the run to stay single-lane.
+    pub fn step_frame(&mut self, mut state: State, byte: u8) -> Result<State> {
+        set_concrete_buttons(&mut state, byte)?;
+        self.eng.run_frame_concrete(&state)
+    }
 }

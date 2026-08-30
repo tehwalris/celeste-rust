@@ -35,7 +35,6 @@ mod tests {
     use std::path::Path;
 
     use crate::compiled::FrameEngine;
-    use crate::interpreter::fixed_env::PreparedCfg;
     use crate::interpreter::state::State as OState;
     use crate::trace::refbridge::abstract_keys;
     use crate::trace::refengine::RefEngine;
@@ -84,11 +83,6 @@ mod tests {
         );
         let engine =
             FrameEngine::new_for_start_room(&program).expect("build compiled engine");
-        // Fallback for any chunk the kernels decline - the SAME program, so a
-        // fall-through would still be correct, but `missed_lanes() == 0` is
-        // asserted to prove no lane took it.
-        let fallback_cfg = PreparedCfg::new(program.frame_cfg().clone());
-        let fallback_env = program.fixed_env();
 
         let mut refeng = RefEngine::new().expect("build reference engine");
 
@@ -119,7 +113,7 @@ mod tests {
                     // the ASM kernels; its output states funnel through the
                     // campaign abstraction + keying.
                     let a: BTreeSet<(u64, u64)> = engine
-                        .run_frame_chunk(&one, Some((&fallback_cfg, &fallback_env)))
+                        .run_frame_chunk(&one)
                         .into_iter()
                         .flat_map(|(os, _keys)| abstract_keys(os))
                         .collect();
@@ -169,4 +163,5 @@ mod tests {
             missed
         );
     }
+
 }
