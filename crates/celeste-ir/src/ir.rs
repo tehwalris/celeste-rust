@@ -512,48 +512,6 @@ impl Instruction {
         }
     }
 
-    /// True if removing this instruction when its result is unused would change
-    /// program behaviour.
-    ///
-    /// Note `GetField`/`GetIndex` with `create_if_missing` are *not* pure: they
-    /// allocate a cell and mutate the receiver table, promoting `UnknownTable`
-    /// to `ObjectTable`. The previous optimizer's DCE classified them as pure
-    /// and would silently change the heap shape.
-    pub fn has_side_effects(&self) -> bool {
-        match self {
-            Self::Store { .. } | Self::StoreEmptyTable { .. } | Self::StoreClosure { .. } => true,
-            Self::Call { .. } => true,
-            Self::GetGlobal { create_if_missing, .. }
-            | Self::GetField { create_if_missing, .. }
-            | Self::GetIndex { create_if_missing, .. } => *create_if_missing,
-            Self::Alloc
-            | Self::Load { .. }
-            | Self::NumberConstant { .. }
-            | Self::BoolConstant { .. }
-            | Self::StringConstant { .. }
-            | Self::NilConstant
-            | Self::UnaryOp { .. }
-            | Self::BinaryOp { .. }
-            | Self::Select { .. }
-            | Self::Phi { .. } => false,
-            // A kill changes the environment, so it must never be reordered
-            // away or dropped as pure.
-            Self::Kill { .. } => true,
-            // Not a side effect on the heap, but they must never be optimised
-            // away: their whole purpose is to fail.
-            Self::AssertClosure { .. }
-            | Self::AssertPointer { .. }
-            | Self::AssertValueCell { .. }
-            | Self::AssertTrue { .. } => true,
-            // Pure in the heap, but it asserts, and the original `call` it
-            // replaced would have run and could have failed. Same answer as
-            // `Call` for the same reason.
-            Self::CallBuiltin { .. } => true,
-            // Rewrites the whole state: every lane doubles. Removing it when
-            // the result is unused would remove the input fan-out itself.
-            Self::Expand { .. } => true,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -597,17 +555,6 @@ impl Terminator {
         }
     }
 
-    /// Successor labels, in order (true target then false target).
-    pub fn successor_labels(&self) -> Vec<&Label> {
-        match self {
-            Self::Return { .. } => vec![],
-            Self::UnconditionalBranch { target } => vec![target],
-            Self::ConditionalBranch { true_target, false_target, .. } => {
-                vec![true_target, false_target]
-            }
-        }
-    }
-
     pub fn map_local_ids(&self, mut f: impl FnMut(LocalId) -> LocalId) -> Self {
         match self {
             Self::Return { value } => Self::Return {
@@ -647,42 +594,6 @@ impl Block {
         &self.terminator.1
     }
 
-    /// Splits block instructions into (phi_instructions, non_phi_instructions).
-    /// Phi instructions must come first in the block, followed by non-phi instructions.
-    pub fn split_block_phi_instructions(
-        &self,
-    ) -> (&[(LocalId, Instruction)], &[(LocalId, Instruction)]) {
-        let is_phi = |id_and_instr| match id_and_instr {
-            &(_, Instruction::Phi { .. }) => true,
-            _ => false,
-        };
-
-        // Find the first non-phi instruction
-        let split_index = self
-            .instructions
-            .iter()
-            .position(|instr| !is_phi(instr))
-            .unwrap_or(self.instructions.len());
-
-        let (phi_instructions, non_phi_instructions) = self.instructions.split_at(split_index);
-
-        // Verify all phi instructions are before the split
-        if phi_instructions.iter().any(|instr| !is_phi(instr)) {
-            panic!("Non-phi instructions found before phi instructions in the block");
-        }
-
-        // Verify no phi instructions after the split
-        if non_phi_instructions.iter().any(is_phi) {
-            panic!("Phi instructions found after non-phi instructions in the block");
-        }
-
-        (phi_instructions, non_phi_instructions)
-    }
-}
-
-/// A fresh, empty map of the kind `Cfg::named` uses.
-pub fn new_label_map() -> FxHashMap<Label, Block> {
-    FxHashMap::default()
 }
 
 /// Maps the logical name of a value (`LocalId`, unique per definition, SSA) to
@@ -725,18 +636,6 @@ impl SlotMap {
 
     pub fn is_identity(&self) -> bool {
         self.of_local.is_empty()
-    }
-
-    /// The slot of a `LocalId`, or `None` if the map does not cover it. An
-    /// uncovered id means the map is stale with respect to the CFG.
-    pub fn try_slot_of(&self, id: LocalId) -> Option<usize> {
-        if self.of_local.is_empty() {
-            return Some(usize::from(id));
-        }
-        match self.of_local.get(usize::from(id)) {
-            Some(&s) if s != u32::MAX => Some(s as usize),
-            _ => None,
-        }
     }
 
     #[inline]
@@ -784,29 +683,6 @@ impl Cfg {
 
     pub fn iter_blocks(&self) -> impl Iterator<Item = &Block> {
         std::iter::once(&self.entry).chain(self.named.values())
-    }
-
-    /// Rewrite every block, dropping the slot allocation.
-    ///
-    /// Callers change instructions, and a map built for the old instructions
-    /// says nothing about the new ones. Re-run `allocate_slots` afterwards.
-    pub fn map_blocks(&self, f: impl Fn(&Block) -> Block) -> Self {
-        let mut out = Self::new(
-            f(&self.entry),
-            self.named.iter().map(|(k, v)| (k.clone(), f(v))).collect(),
-        );
-        // Names are CARRIED, unlike slots which are deliberately dropped.
-        //
-        // Rewriting a block does not rename anything, so erasing the names
-        // here would silently destroy the recipe's addressing the moment
-        // the naming pass populates them - a rule would simply return a
-        // function whose locals had no names, and the next entry that
-        // referred to one would fail with "unknown name" far from the
-        // cause. A name left pointing at an instruction the rewrite
-        // DELETED is caught by validation instead, which is the loud
-        // direction.
-        out.names = self.names.clone();
-        out
     }
 
     /// Rename every block label: the map's keys, every branch target and

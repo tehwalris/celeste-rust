@@ -20,10 +20,6 @@ pub fn local_name(id: LocalId) -> String {
     format!("%{}", usize::from(id))
 }
 
-pub fn parse_local_name(name: &str) -> Option<LocalId> {
-    name.strip_prefix('%')?.parse::<usize>().ok().map(LocalId::from)
-}
-
 fn unary_op_str(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Minus => "-",
@@ -155,22 +151,6 @@ pub fn format_terminator(term: &Terminator) -> String {
             false_target.as_str()
         ),
     }
-}
-
-/// One block's instructions and terminator, without its label. Used by rule
-/// verifiers to compare blocks structurally.
-pub fn format_block(block: &Block) -> String {
-    let mut out = String::new();
-    for (id, instr) in &block.instructions {
-        let _ = writeln!(out, "{} = {}", local_name(*id), format_instruction(instr));
-    }
-    let _ = writeln!(
-        out,
-        "{} = {}",
-        local_name(block.terminator_id()),
-        format_terminator(block.terminator_kind())
-    );
-    out
 }
 
 fn write_block(out: &mut String, label: &str, block: &Block) {
