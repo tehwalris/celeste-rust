@@ -53,6 +53,7 @@ pub mod refdomain;
 pub mod refdriver;
 pub mod refengine;
 pub mod refbridge;
+pub mod refgate;
 pub mod bind;
 pub mod cart;
 pub mod dispatch;

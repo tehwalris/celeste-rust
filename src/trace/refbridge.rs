@@ -511,6 +511,27 @@ pub fn row_key_of(st: &TState<RefDomain>) -> Result<(u64, u64)> {
     Ok(keys[0])
 }
 
+/// The engine keys of an interpreter output, put through the SAME campaign
+/// abstraction the search applies before it keys or checkpoints a frame
+/// (`split_precision_straddles` + `make_state_abstract`). Raw, un-abstracted
+/// multi-lane outputs are NOT in the search's key space - `engine_row_keys`
+/// is only consistent on abstracted states - so both sides of a differential
+/// (the bridge gate AND the sampled kernel gate) must abstract before keying.
+#[cfg(test)]
+pub(crate) fn abstract_keys(os: OState) -> std::collections::BTreeSet<(u64, u64)> {
+    let mut set = std::collections::BTreeSet::new();
+    for st in crate::interpreter::abstraction::split_precision_straddles(os) {
+        let w = crate::interpreter::abstraction::make_state_abstract(st);
+        if w.vector_size == 0 {
+            continue;
+        }
+        for k in crate::compiled::engine_row_keys(&w).expect("engine keys") {
+            set.insert(k);
+        }
+    }
+    set
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,26 +732,6 @@ mod tests {
         assert_eq!(errored, 0, "{} lanes errored", errored);
     }
 
-
-    /// The engine keys of an interpreter output, put through the SAME
-    /// campaign abstraction the search applies before it keys or checkpoints
-    /// a frame (`split_precision_straddles` + `make_state_abstract`). Raw,
-    /// un-abstracted multi-lane outputs are NOT in the search's key space -
-    /// `engine_row_keys` is only consistent on abstracted states - so both
-    /// sides of the gate must abstract before keying.
-    fn abstract_keys(os: OState) -> std::collections::BTreeSet<(u64, u64)> {
-        let mut set = std::collections::BTreeSet::new();
-        for st in crate::interpreter::abstraction::split_precision_straddles(os) {
-            let w = crate::interpreter::abstraction::make_state_abstract(st);
-            if w.vector_size == 0 {
-                continue;
-            }
-            for k in crate::compiled::engine_row_keys(&w).expect("engine keys") {
-                set.insert(k);
-            }
-        }
-        set
-    }
 
     /// Filter an old boundary state down to a single lane.
     fn single_lane(s: &OState, lane: usize) -> OState {
