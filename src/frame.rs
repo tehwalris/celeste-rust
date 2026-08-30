@@ -536,6 +536,74 @@ impl Visited {
     }
 }
 
+/// The outcome of a ladder run.
+pub enum LadderOutcome {
+    /// A win survived to the top rung: the minimal abstract win frame.
+    Optimal { frame: u32, bits: u8 },
+    /// Some precision level, filtered by the coarser level's marks, found no
+    /// win - the horizon is refuted at this precision (and, since finer includes
+    /// concrete, refuted for good).
+    Refuted { bits: u8 },
+}
+
+/// The refinement ladder - SKELETON, semantics are a DESIGN POINT, not blessed.
+///
+/// For bits 0..=max_bits: build the engine at that precision, run forward
+/// (filtered by the previous, coarser level's marked set - discarding any state
+/// whose widened form was not marked), and if a win is found run the backward
+/// mark and carry it to the next level. If a level finds no win, the horizon is
+/// refuted. Engine-agnostic: the caller supplies `make_engine(precision)` and
+/// `make_initial()` so this composes the tested `forward_run`/`backward_run`/
+/// `MarkFilter` without naming the compiled engine.
+///
+/// OPEN (do not trust the termination yet): whether the reported optimum is the
+/// top rung's win frame, and exactly how a per-level horizon interacts with
+/// refutation vs. re-running at a larger horizon, is the soundness-critical bit
+/// still to pin down with Philippe. This wires the mechanically-sound pieces so
+/// the shape is real; it is not yet a correctness claim.
+pub fn ladder(
+    mut make_engine: impl FnMut(
+        crate::interpreter::abstraction::RemPrecision,
+    ) -> Result<Box<dyn FrameStep>>,
+    mut make_initial: impl FnMut() -> Result<Vec<Block>>,
+    base_dir: &std::path::Path,
+    max_frames: u32,
+    max_bits: u8,
+) -> Result<LadderOutcome> {
+    use crate::interpreter::abstraction::RemPrecision;
+    let mut prev: Option<(Visited, u8)> = None;
+    let mut last_win: Option<u32> = None;
+    for bits in 0..=max_bits {
+        let mut engine = make_engine(RemPrecision::Bits(bits))?;
+        let level_dir = base_dir.join(format!("rem{:02}", bits));
+        let filter = prev
+            .as_ref()
+            .map(|(m, b)| MarkFilter::new(m, RemPrecision::Bits(*b)));
+        let fwd = forward_run(
+            engine.as_mut(),
+            make_initial()?,
+            &level_dir,
+            max_frames,
+            true,
+            filter.as_ref(),
+        )?;
+        let Some(h) = fwd.win_frame else {
+            return Ok(LadderOutcome::Refuted { bits });
+        };
+        last_win = Some(h);
+        let graph = fwd
+            .pos_graph
+            .as_ref()
+            .expect("record mode always builds the pos graph");
+        let bwd = backward_run(engine.as_mut(), &level_dir, h, graph)?;
+        prev = Some((bwd.marked, bits));
+    }
+    Ok(LadderOutcome::Optimal {
+        frame: last_win.expect("at least one level ran"),
+        bits: max_bits,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
