@@ -418,13 +418,19 @@ pub fn build_cell_store(dir: &Path, frames: u32, table: &RowTable) -> Result<Cel
         let t = std::time::Instant::now();
         let states = checkpoint::load_frame_states(dir, f)
             .with_context(|| format!("loading frame batch f{:03}", f))?;
-        for state in states {
+        // Sequential: validate, place every row, and record the sub metadata.
+        // This is cheap and MUST stay ordered (it defines `sub_off`); the
+        // expensive filter+compress is deferred to the parallel pass below.
+        // `work` lists (cell, saved-state index, lanes) in the exact order the
+        // sub metadata was pushed per cell.
+        let mut work: Vec<(usize, usize, Vec<u32>)> = Vec::new();
+        for (si, state) in states.iter().enumerate() {
             if state.vector_size == 0 {
                 continue;
             }
-            let keys = row_keys(&state)?;
-            let cells = pos_graph::state_cells(&state)?;
-            let won = win_lane_mask(&state);
+            let keys = row_keys(state)?;
+            let cells = pos_graph::state_cells(state)?;
+            let won = win_lane_mask(state);
             if keys.len() != state.vector_size
                 || cells.len() != state.vector_size
                 || won.len() != state.vector_size
@@ -440,7 +446,7 @@ pub fn build_cell_store(dir: &Path, frames: u32, table: &RowTable) -> Result<Cel
             }
             // Split this saved state by cell (usually a no-op: the pos-graph
             // forward partitions by position, so a saved state is already
-            // position-uniform), then compress each piece.
+            // position-uniform).
             let mut by_cell: std::collections::HashMap<u32, Vec<u32>> =
                 std::collections::HashMap::new();
             for (l, &c) in cells.iter().enumerate() {
@@ -474,13 +480,48 @@ pub fn build_cell_store(dir: &Path, frames: u32, table: &RowTable) -> Result<Cel
                     store.rows[c].push(id as u32);
                     placed += 1;
                 }
-                let sub = state
-                    .filter_by_kept_clone(&KeptLanes::from_sorted_indices(&lanes), FILTER_BAND);
-                store.n_lanes += sub.vector_size;
+                store.n_lanes += lanes.len();
                 store.n_states += 1;
-                store.blob[c].push(zpack_state(&sub)?);
                 store.sub_frame[c].push(f);
                 store.sub_off[c].push(store.rows[c].len() as u32);
+                work.push((c, si, lanes));
+            }
+        }
+        // Parallel: filter each sub-state out of its saved state and compress
+        // it - the build's dominant cost. State is Send+Sync (Arc heap), so
+        // threads share `&states`. Chunks are contiguous, so concatenating
+        // results in thread order reproduces `work` order, which is exactly
+        // the per-cell `sub_frame`/`sub_off` order - keeping blobs aligned.
+        let nthreads = std::thread::available_parallelism()
+            .map(|n| n.get().min(16))
+            .unwrap_or(4)
+            .min(work.len().max(1));
+        let chunk = work.len().div_ceil(nthreads).max(1);
+        let states_ref = &states;
+        let work_ref = &work;
+        let parts: Vec<Result<Vec<(usize, Vec<u8>)>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..nthreads)
+                .map(|ti| {
+                    let lo = (ti * chunk).min(work_ref.len());
+                    let hi = ((ti + 1) * chunk).min(work_ref.len());
+                    scope.spawn(move || {
+                        let mut out = Vec::with_capacity(hi - lo);
+                        for (c, si, lanes) in &work_ref[lo..hi] {
+                            let sub = states_ref[*si].filter_by_kept_clone(
+                                &KeptLanes::from_sorted_indices(lanes),
+                                FILTER_BAND,
+                            );
+                            out.push((*c, zpack_state(&sub)?));
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for part in parts {
+            for (c, blob) in part? {
+                store.blob[c].push(blob);
             }
         }
         if f % 20 == 0 || f == frames {
