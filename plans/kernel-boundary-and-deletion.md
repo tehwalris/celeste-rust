@@ -511,3 +511,20 @@ Encoded (frame.rs, NOT YET end-to-end validated):
   H loop; returns the first Confirmed horizon.
 Follow-ups: (a) incremental rem-0 forward extension (currently reruns per H);
 (b) concrete-level trace EXTRACTION as the witness; (c) real-room validation.
+
+### Update 2026-08-30 (cont): forward differential PASSES at scale -> deletions start
+
+new_forward_matches_old_on_compiled_engine, CELESTE_DIFF_FRAMES=45 on the start
+room: the new forward_run and the old AbstractRun forward produce IDENTICAL
+per-frame row-key sets through deep fan-out - frame 45 = 620,364 keys, every
+frame 1..45 matches. The new orchestration IS the old one on the real engine.
+(6.9 min; the intro is 1 key/frame until ~f38, then fan-out.)
+
+Deletions started:
+- DONE: src/search/differential.rs (719 lines, dead - only a mod line, no
+  callers).
+- NEXT (migration-gated): wire bin/rewrite's forward onto forward_run so
+  run.rs's step machinery has no consumers, then delete it; then backward onto
+  backward_run so sweep.rs/sweep_time.rs (the g/e/band numbering, 1401 lines)
+  and the forward origin plumbing come out. Soundness-critical - do with
+  Philippe watching.

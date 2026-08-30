@@ -15,7 +15,6 @@
 //!                      `plans/strategy.md`
 //!   * `state_mapping` - the `State` <-> lane-block correspondence
 pub mod checkpoint;
-pub mod differential;
 pub mod pos_graph;
 pub mod run;
 pub mod state_mapping;
