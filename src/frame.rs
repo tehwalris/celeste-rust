@@ -778,6 +778,59 @@ mod tests {
         RefEngine::new().expect("ref engine")
     }
 
+    /// THE LADDER VALIDATION (Philippe's "validate the per-rem-level forwards,
+    /// backward equality is implied"). Run the new ladder over rem 0 then rem 1
+    /// on the compiled engine, with a synthetic early win at (8,107) in room
+    /// (1,0) - reached ~frame 8 on the fall path, with many states per frame.
+    /// rem-1's forward is filtered by rem-0's backward marks; if it still finds
+    /// the win, `Confirmed`, the backward did NOT drop the winning path. A
+    /// backward that under-marks would over-filter rem 1 and it would refute.
+    /// This exercises forward + backward + MarkFilter end to end on the kernels.
+    #[test]
+    #[ignore]
+    fn new_ladder_backward_preserves_win_across_rem_levels() {
+        use crate::interpreter::abstraction::{set_rem_precision, RemPrecision};
+        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        std::env::set_var("CELESTE_WIN_AT_XY", "8,107");
+
+        let program = crate::program::frozen::rewritten("rewrites-compile.jsonl")
+            .expect("program");
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-test");
+        let _ = std::fs::remove_dir_all(dir);
+
+        let make_engine = |precision: RemPrecision| {
+            set_rem_precision(precision);
+            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room(&program)?)
+                as Box<dyn FrameStep>)
+        };
+        let make_initial = || {
+            Ok(vec![Block::new(
+                crate::trace::refengine::RefEngine::new()?.initial_state()?,
+            )])
+        };
+
+        let outcome = ladder_at_horizon(
+            make_engine,
+            make_initial,
+            dir,
+            14,
+            &[RemPrecision::Bits(0), RemPrecision::Bits(1)],
+        )
+        .expect("ladder");
+        match outcome {
+            HorizonOutcome::Confirmed => {
+                eprintln!("[ladder] rem0 and rem1 both reached the synthetic win - backward preserved it");
+            }
+            HorizonOutcome::Refuted { level } => {
+                panic!(
+                    "level {level} lost the win that a coarser level found - \
+                     the backward under-marked (dropped a winning-path state)"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// THE BRIDGE: the new forward_run on the compiled engine must produce the
     /// same per-frame row-key SETS as the old AbstractRun forward, given the same
     /// program, engine, and seed. Runs a handful of frames on the start room and
