@@ -127,19 +127,23 @@ pub fn forward_frame(
             None => None,
         };
         let outputs = engine.run(&block)?;
-        if let (Some(p), Some(c_in)) = (pos, c_in) {
-            let mut dsts = Vec::new();
-            for out in &outputs {
-                dsts.extend(out.positions()?);
-            }
-            p.record_dsts(c_in, &dsts);
-        }
         for out in outputs {
             let keys = out.keys()?;
-            // insert() reports true for a key not seen before (in this frontier
-            // or any earlier one). Building the mask also records the survivors,
-            // so a duplicate later in the same frame is caught too.
-            let mask: Vec<bool> = keys.iter().map(|k| visited.insert(*k)).collect();
+            let cells = out.positions()?;
+            // Pos-graph edge: record ALL raw outputs' positions (before dedup);
+            // dedup drops duplicate keys, not reachable positions.
+            if let (Some(p), Some(c_in)) = (pos, c_in) {
+                p.record_dsts(c_in, &cells);
+            }
+            // Dedup at the door, SHARDED by (shape, cell): insert() reports true
+            // for a (key, cell) not seen before in this or any earlier frontier.
+            // Building the mask also records the survivors, so a duplicate later
+            // in the same frame is caught too.
+            let mask: Vec<bool> = keys
+                .iter()
+                .zip(&cells)
+                .map(|(k, &c)| visited.insert(*k, c))
+                .collect();
             if let Some(kept) = out.keep(&mask) {
                 won |= is_win(&kept)?;
                 survivors.push(kept.into_state());
@@ -202,8 +206,10 @@ pub fn forward_run(
 
     let mut visited = Visited::new();
     for b in &initial {
-        for k in b.keys()? {
-            visited.insert(k);
+        let keys = b.keys()?;
+        let cells = b.positions()?;
+        for (k, c) in keys.iter().zip(&cells) {
+            visited.insert(*k, *c);
         }
     }
     checkpoint_frontier(dir, 0, &initial)?;
@@ -308,25 +314,33 @@ fn load_frame_filtered(
 /// `insert`/`contains`, not part of this interface.
 #[derive(Default)]
 pub struct Visited {
-    seen: rustc_hash::FxHashSet<(u64, u64)>,
+    /// Sharded by (shape hash, cell) - the same partition as storage, the
+    /// blocks and the marked bitmask. A shard holds only the CONTENT hashes
+    /// seen at that (shape, cell). Two states in different shards can never be
+    /// duplicates (different shape or different content -> different cell), so
+    /// the sharding is a free refinement: smaller buckets, per-shard locality.
+    shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashSet<u64>>,
 }
 
 impl Visited {
     pub fn new() -> Self {
         Self::default()
     }
-    /// True if `key` was NOT already present (i.e. this lane is new, keep it).
-    pub fn insert(&mut self, key: (u64, u64)) -> bool {
-        self.seen.insert(key)
+    /// True if `key` (with its `cell`) was NOT already present - this lane is
+    /// new, keep it. Shard picked by (shape, cell); membership by content hash.
+    pub fn insert(&mut self, key: (u64, u64), cell: u32) -> bool {
+        self.shards.entry((key.0, cell)).or_default().insert(key.1)
     }
-    pub fn contains(&self, key: &(u64, u64)) -> bool {
-        self.seen.contains(key)
+    pub fn contains(&self, key: (u64, u64), cell: u32) -> bool {
+        self.shards
+            .get(&(key.0, cell))
+            .is_some_and(|s| s.contains(&key.1))
     }
     pub fn len(&self) -> usize {
-        self.seen.len()
+        self.shards.values().map(|s| s.len()).sum()
     }
     pub fn is_empty(&self) -> bool {
-        self.seen.is_empty()
+        self.shards.values().all(|s| s.is_empty())
     }
 }
 
