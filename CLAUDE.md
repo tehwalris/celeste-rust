@@ -3,19 +3,26 @@
 ## What this project is
 
 An abstract interpreter for PICO-8 Celeste, used to search for a provably
-optimal TAS. It compiles the original Lua to a CFG IR and runs a vectorized
-abstract interpreter over sets of game states.
+optimal TAS. It traces the original Lua into a graph IR, assembles that into
+branch-free ASM kernels at startup, and runs a forward / backward /
+precision-ladder search over columnar blocks of abstract game states.
 
 Read these before doing anything substantial:
 
-- `plans/strategy.md` - the overall search strategy (forward/backward
-  refinement). Mostly still future work.
-- `plans/rewrite-plan.md` - the current work: rewriting the compiled program
-  into a branch-free, call-free, compilable form via a checked-in list of
-  individually-verifiable rewrite instructions.
-- `BENCHMARK_DATA.md` - current performance baseline. Keep it current; the
-  previous version of that file was stale by 25x and nearly caused bad
-  decisions.
+- `plans/architecture.md` - the agreed, load-bearing design: the three
+  interfaces (frame step / block / kernel set), the outer loop, and a
+  post-rebuild "Deferred follow-ups" list. This is the current work, and the
+  ONLY surviving `plans/` doc (the other ~45 were deleted in the tear-out).
+- `src/frame.rs` - the rebuilt search itself (~950 lines): `Block`, the
+  `FrameStep` trait (implemented by the compiled `FrameEngine` and the
+  reference `RefEngine`), `forward_run` / `forward_resume` / `backward_run` /
+  `ladder_at_horizon` / `find_optimum`, the precision ladder, sharded
+  checkpoints, and `MarkFilter` (the cross-precision link).
+- `BENCHMARK_DATA.md` - performance baseline, but STALE: every number in it was
+  measured against the pre-rebuild search path (the now-deleted
+  `run.rs` / `sweep*.rs`) and needs re-benchmarking for `rewrite search`. Keep
+  it current once remeasured; the previous version was stale by 25x and nearly
+  caused bad decisions.
 
 The original OCaml implementation is at `~/src/github.com/tehwalris/celeste_ocaml`
 and is still the reference for interpreter semantics. Read it when implementing
@@ -43,12 +50,10 @@ Rust equivalents.
   field census 2026-08-16), so: the cost of a new abstraction is the
   abstraction PLUS its refinement ladder, and anything advertised as a free
   merge is mispriced.
-- **Never deopt to the interpreter.** A deopt is a coverage gap, not a
-  degraded mode. The search checkpoints every frame; a deopt confirms the
-  checkpoint, reports every distinct reason with lane counts, and exits
-  with a distinct status. Fix the gap and resume. Once Stage 4 removes
-  the interpreter's vectorization, absorbing a deopt costs orders of
-  magnitude more than fixing it. See `plans/tracing.md` "Doctrine".
+- **Never deopt to the interpreter silently.** A deopt is a coverage gap, not
+  a degraded mode. When the compiled engine has no kernel for a chunk it is
+  FATAL by default (`CELESTE_KERNEL_STRICT=0` opts back into a counted
+  fall-through). Fix the gap rather than absorbing it.
 - **Measure before and after.** Any change that claims a performance effect
   needs numbers from an actual run, not reasoning.
 - Do not leave dead code behind. The build is warning-free; keep it that way.
@@ -62,13 +67,13 @@ There was a previous attempt (Jan 2026, now the
 Roughly 11k lines. Most of it was never wired into the game runner, some of it
 produced CFGs the interpreter cannot execute, and its validation did not check
 dominance. That branch is kept as reading material only. Do not reintroduce
-untested passes; see `plans/rewrite-plan.md` for the approach that replaces it.
+untested passes; see `plans/architecture.md` for the approach that replaces it.
 
 ## Branches
 
-`interpreter` is the live line (the rewrite campaign plus the current
-interpreter work). `parallel-experiments` holds the overnight parallelism,
-which is deliberately not merged - see BENCHMARK_DATA.md.
+`develop` is the main line; the search rebuild happens on feature branches off
+it (this work is on `census`). `parallel-experiments` holds the overnight
+parallelism, which is deliberately not merged - see BENCHMARK_DATA.md.
 `interpreter-abandoned-2026-01-11` is the January CFG optimizer above.
 
 ## Running safely
@@ -91,7 +96,8 @@ exactly the thing that fails.
 cargo nextest run <filter>                                      # DEV LOOP, 1.3 s
 ./safe-run.sh -- cargo nextest run --cargo-profile quick         # PRE-COMMIT, 47 s
 ./safe-run.sh -- cargo nextest run --cargo-profile quick --run-ignored all  # rare, ~6 min
-./safe-run.sh -- ./target/release/celeste-rust -n 40
+./safe-run.sh -- ./target/release/rewrite search --checkpoint-dir /tmp/ck --room 1,0  # THE SEARCH
+./safe-run.sh -- ./target/release/celeste-rust -n 40             # legacy ref runner
 ```
 
 ### Iterating quickly - read this before running anything
@@ -222,22 +228,17 @@ suite has twice been observed degrading to ~70-85 MINUTES at one core.
 nextest runs each test in its own process, which contains every such
 leak by construction.
 
-Exit code 137 means OOM. One job needs MORE than the 60 GB default:
-room (0,0)'s level-0 position-graph replay peaks at 101.08 GB on its last
-frame, so that campaign runs `ladder.sh` with `MEM=108G` and builds the
-graph a few frames per process. See BENCHMARK_DATA.md; do not raise the cap
-past what `free` leaves after /tmp, which is a tmpfs.
+Exit code 137 means OOM. Peak memory for the rebuilt `rewrite search` has not
+been re-benchmarked (BENCHMARK_DATA.md predates it), so run it sandboxed under
+`./safe-run.sh` with the 60 GB default and watch. The legacy `celeste-rust -n 40`
+reference runner is unvectorized and memory-heavy (the old ~29 GB) - do not run
+higher frame counts unsandboxed. Do not raise the cap past what `free` leaves
+after /tmp, which is a tmpfs.
 
-Peak memory is much lower than it used to be (the
-chunk-parallel work took frame 60 of the rewritten path from 4.3 GB to
-2.4 GB), but the unrewritten `celeste-rust -n 40` runner is still the old
-~29 GB - do not run higher frame counts unsandboxed.
-
-The search runs on 16 threads with an 8,000-lane chunk cap by default.
-Those two are ONE setting: threads without chunking undoes the streaming
-boundary's memory bound, and chunking without threads is a ~23% loss. See
-`plans/roofline-plan.md` before changing either, and `./parcheck.sh` to
-re-check that the parallel path stays byte-identical to the serial one.
+The pre-rebuild search's 16-thread / 8,000-lane chunked parallel path and its
+`./parcheck.sh` byte-identity gate went with `run.rs` / `sweep*.rs`. The rebuilt
+loop is `src/frame.rs`; see `plans/architecture.md` "Deferred follow-ups" for
+where parallelism lands next.
 
 ## Crate layout
 
@@ -262,21 +263,25 @@ native-probe             bench/gate binary for the engine        deps: all
 
 There used to be four more crates here: `celeste-kernels` plus one
 GENERATED kernel crate per room (~923k lines between them). They were
-deleted 2026-08-29 (`d027f7e`, plans/asm-and-posgraph-execution.md B)
+deleted 2026-08-29 (`d027f7e`)
 when the AVX-512 ASM backend (`compiled::asm_kernel`) became the
 engine's kernel implementation - the kernels are now assembled at
 startup, so there is nothing generated to check in, split, aggregate,
 or keep current.
 
 The 38k lines of rewrite rules that used to be the next thing to
-extract are DELETED (`plans/deletion.md`); what is left in
-`celeste-rust` is laid out as:
+extract are DELETED; what is left in `celeste-rust` is laid out as:
 
 ```
+src/frame.rs   the REBUILT search: `Block`, the `FrameStep` trait, forward_run /
+               forward_resume / backward_run / ladder_at_horizon / find_optimum,
+               the precision ladder, sharded checkpoints, MarkFilter
 src/program/   Program assembly, recipes, and the frozen artifacts
-src/search/    the abstract forward search: run, differential, checkpoint,
-               sweep, sweep_time, pos_graph, state_mapping
-src/trace/     the AST tracer (Lua -> transpile::graph::Graph)
+src/search/    the search's supporting pieces: checkpoint, pos_graph,
+               state_mapping. (run.rs and the sweep*.rs g/e/band numbering are
+               DELETED - the loop is src/frame.rs now.)
+src/trace/     the AST tracer (Lua -> transpile::graph::Graph) and the reference
+               engine (trace::refengine, the RefEngine oracle)
 src/transpile/ the graph IR, the lowering, and the ASM assembler
                (transpile::asm)
 src/compiled/  FrameEngine dispatch, the ASM kernel registry
@@ -288,8 +293,9 @@ then - only the `program` half was ever about rewriting.
 
 One frame of the abstract search is `celeste_rust::compiled::FrameEngine`
 `::step` - `(shape, rows) -> [(shape, rows)]`, the runtime-assembled ASM
-kernels where they bind and the interpreter where they do not. It lives in
-celeste-rust so both the forward search and the backward sweep can call it;
+kernels where they bind and the interpreter where they do not. It is one impl of
+the `FrameStep` trait (`src/frame.rs`); the reference `RefEngine` is the other.
+It lives in celeste-rust so both `forward_run` and `backward_run` can call it;
 `compiled::bridge` is the `State` <-> block translation and is the only
 module that names both.
 
@@ -312,12 +318,10 @@ CONSTANT LATTICE for the active precision mode (Level0 / ladder /
 exact, matching `dispatch::traced_mode`), and assembles the fused
 fork-free graph with gcc + dlopen. `CELESTE_NO_ASM_KERNELS` opts back
 to the pure reference engine (debugging only). The per-class "walk"
-kernels and the `fused` artifact were deleted 2026-08-25
-(plans/delete-the-interpreter.md Phase 1) after the traced set took
-every lane at f94 (BENCHMARK_DATA.md 2026-08-24: missed 0, plain-routed
+kernels and the `fused` artifact were deleted 2026-08-25 after the traced set
+took every lane at f94 (BENCHMARK_DATA.md 2026-08-24: missed 0, plain-routed
 0); the non-lattice sets were replaced by the lattice-specialized ones
-2026-08-26 (plans/specialize.md); and the generated Rust kernel crates
-themselves went 2026-08-29 (plans/asm-and-posgraph-execution.md B).
+2026-08-26; and the generated Rust kernel crates themselves went 2026-08-29.
 When the engine is on, a missed chunk is FATAL by default
 (`CELESTE_KERNEL_STRICT=0` opts back into the counted fall-through).
 `CELESTE_COMPILED_FORWARD=check` runs both engines and compares row-key
@@ -359,13 +363,24 @@ if the Lua changes) may be APPENDED by hand, never inserted.
 ## Useful entry points
 
 ```bash
-# Abstract forward search for N frames (the main thing)
+# THE SEARCH: find the minimal winning frame via the full precision ladder
+# (Bits 0..=15 then Exact), driven by find_optimum over sharded checkpoints.
+# --checkpoint-dir is required; --win-at x,y forces a cheap synthetic win.
+./safe-run.sh -- ./target/release/rewrite search \
+    --checkpoint-dir /tmp/ck --room 1,0 --from 94 [--to H] [--maxk 15]
+
+# Legacy single-lane-per-fork reference runner (RefEngine, the AST oracle).
+# Unvectorized and far slower than the compiled search; kept for its per-frame
+# dump/checkpoint diagnostics, NOT for the search.
 ./safe-run.sh -- ./target/release/celeste-rust -n 30
 
 # Single-lane concrete execution with a fixed input sequence - fast, and the
-# basis for differential testing of rewrites
+# basis for differential testing.
 ./target/release/concrete_run -i 42,0,0,0,0,16,2,2,2,2 -f 10
 
+# Tracer analysis probes (text only): the reachable constant lattice, and the
+# specialization collapse for one shape.
+./target/release/transpile --room-consts
 ```
 
 ## Installing packages
@@ -373,14 +388,18 @@ if the Lua changes) may be APPENDED by hand, never inserted.
 Feel free to install pacman packages when needed (e.g., for profiling tools
 like `perf`).
 
-## A note on deleted tooling (2026-08-23)
+## A note on deleted tooling
 
 `--profile`, `--trace`, the op census, the Chrome-trace `server/`
 workflow, `measure_k` and the rewrite-finding half of `bin/rewrite` were
-all deleted with the rewrite campaign (`plans/deletion.md`). They were
-instrumentation for the interpreter and for finding rewrites, and both
-of those jobs are done. They are in git history if a number is ever
-needed again.
+deleted with the rewrite campaign (2026-08-23). Then the 2026-08-31 tear-out
+replaced the old forward/backward-sweep search: `src/search/run.rs`,
+`sweep.rs`, `sweep_time.rs`, the deopt-collection path, shape-variant dispatch,
+banding, and the g/e/band numbering are GONE, and `bin/rewrite` lost every
+subcommand except `search` (Bench, Sweep, Ladder, ExtractTas, TraceWitness,
+CountOptimal, Widencheck, Simdcheck, Deoptcheck, ShapeCensus, LeadingEdge,
+ShapeInventory, MigrateVisited - all gone). They are in git history if a
+number is ever needed again.
 
 Never commit generated JSON - a 28 MB `cfg_analysis.json` blob used to
 live in git and dominated the whole diff.
