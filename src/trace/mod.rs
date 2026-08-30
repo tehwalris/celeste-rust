@@ -49,6 +49,7 @@
 //! It also keeps the graph topologically ordered across branches for
 //! free, since a node is only ever created after its operands exist.
 
+pub mod refdomain;
 pub mod bind;
 pub mod cart;
 pub mod dispatch;
