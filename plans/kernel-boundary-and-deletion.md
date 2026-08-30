@@ -338,3 +338,23 @@ Next, still inside-out on top of `forward_frame`:
 
 The line count rises first (frame.rs added: 50,362 -> 50,497); the big drop is
 step 3, when run.rs's machinery is deleted after the migration.
+
+### Update 2026-08-30 (cont): forward driver done; pos-graph is coupled to backward
+
+Added on top of the frame-step core, committed, tested:
+- `forward_run(engine, initial, dir, max_frames) -> Option<win_frame>` - the
+  whole outer forward loop (seed visited + checkpoint f0; loop forward_frame +
+  checkpoint survivors until win/empty/horizon). No chunking, no variants.
+- `block_wins()` wraps the existing per-lane `win_lane_mask`.
+- Checkpoint = REUSE of `save_frame_states` (bincode+zstd over the whole
+  frontier as one batch). Added `save_frame_state_refs` so the frontier is saved
+  by BORROW, not cloned; byte-identical file.
+- e2e `forward_run_drives_the_reference_engine`: 5 frames over the reference,
+  every frontier checkpointed and reloaded. 0.47s, green.
+
+Finding: `PosObserver::input_cell` REQUIRES each recorded block to be uniform in
+player position (the position partition, `vectorize::set_partition_player_
+position`, installed while recording). So pos-graph recording is structural, not
+a bolt-on - and it is precisely backward's input. Next push builds pos-graph
+recording + backward + ladder together against the same FrameStep, then migrates
+bin/rewrite (Ladder/Sweep) onto frame.rs and deletes run.rs's step machinery.
