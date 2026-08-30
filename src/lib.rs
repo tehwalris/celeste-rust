@@ -1,5 +1,6 @@
 
 pub mod compiled;
+pub mod frame;
 pub mod concrete;
 pub mod metrics;
 pub mod program;
@@ -25,4 +26,4 @@ pub use celeste_ir::{builtins, frontend, ir};
 // emitters and the search can depend on it without any of them being in
 // the same compilation unit (plans/build-time.md). Re-exported at the old
 // paths.
-pub use celeste_interp::{ game_runner, instr_time, interpreter };
+pub use celeste_interp::{ game_runner, interpreter };
