@@ -50,6 +50,7 @@
 //! free, since a node is only ever created after its operands exist.
 
 pub mod refdomain;
+pub mod refdriver;
 pub mod bind;
 pub mod cart;
 pub mod dispatch;

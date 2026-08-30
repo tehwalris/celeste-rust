@@ -255,7 +255,7 @@ pub fn trace_frame<'a>(
 /// The player is the object with a `djump` field. Naming it by
 /// position would be wrong the moment an object dies: `objects` is a
 /// list and things are deleted from it.
-pub fn find_player(st: &State<Symbolic>) -> Option<Path> {
+pub fn find_player<D: Domain>(st: &State<D>) -> Option<Path> {
     let objs = vec![iface::key("objects")];
     let Some(Value::Table(t)) = iface::get(st, &objs) else { return None };
     for i in 0..st.heap.tables[&t].arr.len() {
