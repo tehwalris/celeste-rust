@@ -118,6 +118,58 @@ pub fn forward_frame(
     Ok((next, won))
 }
 
+/// A row wins if any lane sits on the room's win target. Pure position (the
+/// existing per-lane predicate); no peeking inside the state.
+pub fn block_wins(block: &Block) -> bool {
+    crate::interpreter::abstraction::win_lane_mask(block.state())
+        .iter()
+        .any(|&w| w)
+}
+
+/// The forward search driver: from `initial` (frame 0), run frames until a lane
+/// wins or `max_frames` is reached, checkpointing each frontier. Returns the
+/// winning frame, or `None` if the frontier empties or the horizon is hit with
+/// no win.
+///
+/// The whole outer forward loop is this: seed the visited set + checkpoint frame
+/// 0, then repeatedly `forward_frame` (which dedups at the door) and checkpoint
+/// the survivors. No chunking, no phased/parallel variants - the frame step and
+/// `Visited` hide everything else.
+pub fn forward_run(
+    engine: &mut dyn FrameStep,
+    initial: Vec<Block>,
+    dir: &std::path::Path,
+    max_frames: u32,
+) -> Result<Option<u32>> {
+    let mut visited = Visited::new();
+    for b in &initial {
+        for k in b.keys()? {
+            visited.insert(k);
+        }
+    }
+    checkpoint_frontier(dir, 0, &initial)?;
+    let mut frontier = initial;
+    for frame in 1..=max_frames {
+        let (next, won) = forward_frame(engine, frontier, &mut visited, |b| Ok(block_wins(b)))?;
+        checkpoint_frontier(dir, frame, &next)?;
+        if won {
+            return Ok(Some(frame));
+        }
+        if next.is_empty() {
+            return Ok(None);
+        }
+        frontier = next;
+    }
+    Ok(None)
+}
+
+/// Checkpoint a frontier as one compact batched (zstd) file - borrowing each
+/// block's state, so the frontier is not cloned to be saved.
+fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &[Block]) -> Result<()> {
+    let refs: Vec<&State> = frontier.iter().map(|b| b.state()).collect();
+    crate::search::checkpoint::save_frame_state_refs(dir, frame, &refs)
+}
+
 /// The visited set: the keys of every lane ever kept into a frontier. A lane is
 /// kept iff its key was not already here (this is both the within-frame and the
 /// across-frame dedup - one structure, one lookup at the door).
@@ -154,45 +206,32 @@ mod tests {
     use super::*;
     use crate::trace::refengine::RefEngine;
 
-    /// End-to-end proof that the rebuilt spine runs: seed the frontier with the
-    /// initial block, drive `forward_frame` over the trusted reference engine
-    /// for a few frames, and check the loop's invariants - the frontier stays
-    /// non-empty, and the visited set only grows (every kept lane's key is new).
-    /// Uses the interpreter (the oracle), so it is slow and needs the cart on
-    /// disk; run explicitly.
+    /// End-to-end proof that the rebuilt outer loop runs: drive `forward_run`
+    /// over the trusted reference engine for a few frames from the initial
+    /// block, checkpointing each frontier, and prove the checkpoint round-trips
+    /// (reload a frame's states and match the count). Uses the interpreter (the
+    /// oracle), so it is slow and needs the cart on disk; run explicitly.
     #[test]
     #[ignore]
-    fn forward_frame_drives_the_reference_engine() {
+    fn forward_run_drives_the_reference_engine() {
         let mut engine = RefEngine::new().expect("ref engine");
-        let mut visited = Visited::new();
-        let init = Block::new(engine.initial_state().expect("initial state"));
+        let init = vec![Block::new(engine.initial_state().expect("initial state"))];
 
-        // Seed: the initial block's own keys go into visited.
-        for k in init.keys().expect("initial keys") {
-            visited.insert(k);
-        }
-        let mut frontier = vec![init];
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-test");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("mkdir");
 
-        for frame in 1..=4 {
-            let before = visited.len();
-            let (next, _won) =
-                forward_frame(&mut engine, frontier, &mut visited, |_b| Ok(false))
-                    .expect("frame");
-            assert!(!next.is_empty(), "frame {frame} emptied the frontier");
-            assert!(
-                visited.len() >= before,
-                "frame {frame} shrank the visited set"
-            );
-            let lanes: usize = next
-                .iter()
-                .map(|b| b.keys().expect("keys").len())
-                .sum();
-            eprintln!(
-                "[frame] f{frame}: {} blocks, {lanes} lanes, visited={}",
-                next.len(),
-                visited.len()
-            );
-            frontier = next;
+        let win = forward_run(&mut engine, init, dir, 4).expect("forward_run");
+        // No win in the 4-frame intro; the run reaches the horizon.
+        assert_eq!(win, None, "unexpected early win in the intro");
+
+        // Every frame 0..=4 was checkpointed and reloads.
+        for frame in 0..=4 {
+            let states = crate::search::checkpoint::load_frame_states(dir, frame)
+                .unwrap_or_else(|e| panic!("reload frame {frame}: {e}"));
+            assert!(!states.is_empty(), "frame {frame} checkpoint is empty");
+            eprintln!("[forward_run] f{frame}: reloaded {} states", states.len());
         }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

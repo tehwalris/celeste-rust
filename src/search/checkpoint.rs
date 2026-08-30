@@ -317,6 +317,15 @@ impl<W: Write> Write for CountingWriter<W> {
 /// Save one frame's post-subtract boundary states (`<dir>/frames/fNNN.bin`).
 /// Self-contained: header + zstd content checksum; no meta entry.
 pub fn save_frame_states(dir: &Path, frame: u32, states: &[State]) -> Result<()> {
+    let refs: Vec<&State> = states.iter().collect();
+    save_frame_state_refs(dir, frame, &refs)
+}
+
+/// Same, from borrowed references. The forward frontier is kept as the next
+/// frame's input, so it is checkpointed WITHOUT cloning every state. Bincode
+/// serializes `&[&State]` byte-identically to `&[State]`, so the file is
+/// interchangeable with `save_frame_states`'.
+pub fn save_frame_state_refs(dir: &Path, frame: u32, states: &[&State]) -> Result<()> {
     let fdir = dir.join("frames");
     std::fs::create_dir_all(&fdir)?;
     let tmp = fdir.join(format!("tmp-f{:03}.bin", frame));
