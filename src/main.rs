@@ -15,12 +15,6 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = 30)]
     frames: u32,
 
-    /// Run the RECIPE-REWRITTEN program through the same search loop
-    /// (states verified identical; see rewrite verify). Prototype for
-    /// making the rewritten program the search's program.
-    #[arg(long)]
-    rewritten: bool,
-
     /// Show detailed state info for frames starting at this number
     #[arg(long, default_value_t = 25)]
     detail_from: u32,
@@ -58,36 +52,6 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.rewritten {
-        let program = celeste_rust::program::frozen::rewritten("rewrites.jsonl")?;
-        let mut run = celeste_rust::search::run::AbstractRun::start(&program)?;
-        for frame in 1..=args.frames {
-            let t = std::time::Instant::now();
-            run.step()?;
-            // Won lanes have exited the room; they are absorbing (their
-            // arrival frame is the result) and must NOT be expanded - the
-            // next-room state is out of scope and, on the kernel engine, has
-            // no kernel for that room's shape. The ladder/bench drivers do
-            // this; the raw forward must too, or it re-dispatches an exit
-            // state and hits a coverage gap near the exit frame.
-            run.absorb_won_lanes();
-            println!(
-                "Frame {}: {} states ({} expanded) in {:?}",
-                frame,
-                run.states().len(),
-                run.lane_count(),
-                t.elapsed()
-            );
-        }
-        println!(
-            "\nTotal: {} states ({} expanded) after {} frames",
-            run.states().len(),
-            run.lane_count(),
-            args.frames
-        );
-        celeste_rust::compiled::print_asm_append_stats();
-        return Ok(());
-    }
     run_game_frames(
         args.frames,
         args.detail_from,
@@ -153,9 +117,9 @@ fn run_game_frames(
 
     // Single-lane-per-fork execution via the REFERENCE interpreter
     // (`RefEngine`, the AST oracle that replaced the CFG interpreter). This
-    // legacy runner is unvectorized now, so it is far slower than
-    // `--rewritten` (the compiled AbstractRun) and `rewrite bench/ladder`;
-    // it is kept for its dump/checkpoint diagnostics.
+    // legacy runner is unvectorized now, so it is far slower than the
+    // compiled `rewrite search`; it is kept for its dump/checkpoint
+    // diagnostics.
     let mut refeng = celeste_rust::trace::refengine::RefEngine::new()
         .expect("Failed to build the reference engine");
 
