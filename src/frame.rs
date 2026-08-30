@@ -67,6 +67,20 @@ impl Block {
         let (kept, _) = self.state.split_by_condition(mask, true);
         kept.map(Block::new)
     }
+
+    /// The block's shard cell. A regrouped block is uniform in position, so its
+    /// whole position column is one value - the shard's cell.
+    pub fn shard_cell(&self) -> Result<u32> {
+        self.positions()?
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("empty block has no shard cell"))
+    }
+
+    /// The block's shard shape. A regrouped block is one shape.
+    pub fn shard_shape(&self) -> u64 {
+        crate::interpreter::vectorize::shape_hash_of_state(&self.state)
+    }
 }
 
 /// The one interface between the outer loop and the engines (interface #1).
@@ -222,11 +236,67 @@ pub fn forward_run(
     Ok(ForwardResult { win_frame, frames: last, pos_graph })
 }
 
-/// Checkpoint a frontier as one compact batched (zstd) file - borrowing each
-/// block's state, so the frontier is not cloned to be saved.
+/// Checkpoint a frontier SHARDED by (shape, cell): one file per block, under
+/// `frames/fNNN/`, named `c{cell}_s{shape}_{seq}.bin`. A regrouped block is
+/// already uniform in (shape, position), so a block IS one shard and needs no
+/// re-splitting. The cell leads the filename so backward can select the cells
+/// it needs by name, without opening a file.
 fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &[Block]) -> Result<()> {
-    let refs: Vec<&State> = frontier.iter().map(|b| b.state()).collect();
-    crate::search::checkpoint::save_frame_state_refs(dir, frame, &refs)
+    let fdir = dir.join("frames").join(format!("f{:03}", frame));
+    // Fresh: a re-run / resumed frame must not leave stale shard files behind.
+    let _ = std::fs::remove_dir_all(&fdir);
+    std::fs::create_dir_all(&fdir)?;
+    for (seq, block) in frontier.iter().enumerate() {
+        let cell = block.shard_cell()?;
+        let shape = block.shard_shape();
+        let path = fdir.join(format!("c{:010}_s{:016x}_{:04}.bin", cell, shape, seq));
+        crate::search::checkpoint::save_states_to(&path, &[block.state()])?;
+    }
+    Ok(())
+}
+
+/// Load every block of a checkpointed frame.
+pub fn load_frame(dir: &std::path::Path, frame: u32) -> Result<Vec<Block>> {
+    load_frame_filtered(dir, frame, |_cell| true)
+}
+
+/// Load only the blocks whose cell is in `cells` - backward's per-cell load,
+/// the whole point of the sharding. Files are selected by their name's cell
+/// prefix; only the chosen shards are opened and decompressed.
+pub fn load_frame_cells(
+    dir: &std::path::Path,
+    frame: u32,
+    cells: &rustc_hash::FxHashSet<u32>,
+) -> Result<Vec<Block>> {
+    load_frame_filtered(dir, frame, |cell| cells.contains(&cell))
+}
+
+fn load_frame_filtered(
+    dir: &std::path::Path,
+    frame: u32,
+    keep: impl Fn(u32) -> bool,
+) -> Result<Vec<Block>> {
+    let fdir = dir.join("frames").join(format!("f{:03}", frame));
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&fdir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Shard files are `c{cell:010}_s{shape}_{seq}.bin`; skip tmp/others.
+        let Some(rest) = name.strip_prefix('c') else { continue };
+        if !name.ends_with(".bin") {
+            continue;
+        }
+        let Some(cell_str) = rest.get(..10) else { continue };
+        let Ok(cell) = cell_str.parse::<u32>() else { continue };
+        if !keep(cell) {
+            continue;
+        }
+        for st in crate::search::checkpoint::load_states_from(&entry.path())? {
+            out.push(Block::new(st));
+        }
+    }
+    Ok(out)
 }
 
 /// The visited set: the keys of every lane ever kept into a frontier. A lane is
@@ -288,12 +358,21 @@ mod tests {
         let pg = result.pos_graph.expect("pos graph built in record mode");
         eprintln!("[forward_run] pos-graph: {} live cells", pg.live_cells());
 
-        // Every frame 0..=4 was checkpointed and reloads.
+        // Every frame 0..=4 was checkpointed sharded and reloads block-by-block.
         for frame in 0..=4 {
-            let states = crate::search::checkpoint::load_frame_states(dir, frame)
+            let blocks = load_frame(dir, frame)
                 .unwrap_or_else(|e| panic!("reload frame {frame}: {e}"));
-            assert!(!states.is_empty(), "frame {frame} checkpoint is empty");
-            eprintln!("[forward_run] f{frame}: reloaded {} states", states.len());
+            assert!(!blocks.is_empty(), "frame {frame} checkpoint is empty");
+            // Per-cell load returns exactly the shards at those cells.
+            let cells: rustc_hash::FxHashSet<u32> =
+                blocks.iter().map(|b| b.shard_cell().unwrap()).collect();
+            let by_cell = load_frame_cells(dir, frame, &cells).expect("per-cell load");
+            assert_eq!(
+                by_cell.len(),
+                blocks.len(),
+                "per-cell load lost blocks at frame {frame}"
+            );
+            eprintln!("[forward_run] f{frame}: {} blocks across {} cells", blocks.len(), cells.len());
         }
         let _ = std::fs::remove_dir_all(dir);
     }

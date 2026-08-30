@@ -328,10 +328,29 @@ pub fn save_frame_states(dir: &Path, frame: u32, states: &[State]) -> Result<()>
 pub fn save_frame_state_refs(dir: &Path, frame: u32, states: &[&State]) -> Result<()> {
     let fdir = dir.join("frames");
     std::fs::create_dir_all(&fdir)?;
-    let tmp = fdir.join(format!("tmp-f{:03}.bin", frame));
-    write_bin(&tmp, |w| bincode::serialize_into(w, states).context("serializing frame states"))?;
-    std::fs::rename(&tmp, fdir.join(format!("f{:03}.bin", frame)))?;
+    save_states_to(&fdir.join(format!("f{:03}.bin", frame)), states)
+}
+
+/// Save a batch of states to an explicit path (atomic: a `tmp-` sibling is
+/// written then renamed). Same magic + version + one zstd stream as the frame
+/// files, so the sharded per-(frame,shape,cell) checkpoint reuses exactly this.
+pub fn save_states_to(path: &Path, states: &[&State]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_file_name(format!(
+        "tmp-{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("state.bin")
+    ));
+    write_bin(&tmp, |w| bincode::serialize_into(w, states).context("serializing states"))?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Load a batch saved by `save_states_to` (or any of the frame savers).
+pub fn load_states_from(path: &Path) -> Result<Vec<State>> {
+    let r = read_bin_header_len(path)?;
+    bincode::deserialize_from(r).with_context(|| format!("deserializing {}", path.display()))
 }
 
 /// Load one frame's saved boundary states.
