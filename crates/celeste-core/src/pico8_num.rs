@@ -222,10 +222,6 @@ impl Pico8Vec2 {
         }
     }
 
-    pub fn as_i16s_or_err(&self) -> Result<(i16, i16)> {
-        Ok((self.x.as_i16_or_err()?, self.y.as_i16_or_err()?))
-    }
-
     pub const fn zero() -> Pico8Vec2 {
         Self::from_i16s(0, 0)
     }
