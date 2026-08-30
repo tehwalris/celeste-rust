@@ -259,3 +259,47 @@ Next after the gate is green on early (concrete) frames:
   (`asm_kernels_reproduce_the_interpreter` et al.), re-point the live
   consumers (`run.rs`, `compiled/mod.rs`, `concrete.rs`, `native-probe`,
   `program/mod.rs`), then delete the old CFG interpreter + IR.
+
+## GATE RESULT (2026-08-30): the new interpreter reproduces the oracle
+
+Verified: `RefDomain` == old interpreter, EXACT row-key sets, all lanes, at
+f5/f10/f20/f30/f40/f60/f94 (concrete AND widened rem-interval frames), 0
+mismatched, 0 errored; bridge round-trips exact. Committed `f16df8c`. The
+oracle contract holds - the new AST scalar interpreter is a correct
+replacement.
+
+## The deletion phase and its ONE real blocker: RefDomain per-lane cost
+
+RefDomain is ~6 s PER LANE at f94 (the DFS re-runs the whole frame once per
+button/fork path, ~64+ paths, no vectorization - by design). Correct, but
+~1e5-1e6x slower per lane than the old vectorized interpreter. This does NOT
+matter for its reference role on a few states, but it DOES matter for the
+existing consumers/gates that run the reference on THOUSANDS of lanes:
+
+- `differential.rs` kernel gates check the kernel against the interpreter over
+  a frame's worth of states. With RefDomain that is hours-to-days unless they
+  SAMPLE (check N lanes/frame). Sampling is the intended answer - strong,
+  bounded-time coverage - but it is a real change to those gates.
+- `run.rs`'s per-frame non-compiled search step (`None => interpret_prepared_cfg`,
+  ~2582/2633) is high-volume. RefDomain cannot replace it at scale. To delete
+  the old interpreter this fallback must be REMOVED (the search always uses the
+  compiled engine - which strict mode, `CELESTE_KERNEL_STRICT` default on,
+  already assumes: a missed chunk is fatal). That is an architectural commitment
+  aligned with the never-deopt doctrine, but it touches the live search and
+  needs care (some interpreter-only tests exercise the fallback).
+
+So the cut order is:
+1. Build the bridge WRAPPER `interp::State -> Vec<interp::State>` via
+   RefDomain (drop-in shape for `interpret_prepared_cfg`), gated against it.
+2. Re-point the LOW-VOLUME consumers (init, deopt-single-state, `concrete.rs`
+   oracle, `native-probe`) to the wrapper; make the multi-lane gates SAMPLE.
+3. Remove the interpreter search fallback (search := compiled-only); re-point
+   `run.rs` init/reference.
+4. Now `interpret_cfg`/`interpret_prepared_cfg`/`frontend::compile` have no
+   consumers -> delete `glue.rs` + CFG interp (`core_interpreter`/`op`/`flow`)
+   + IR (`frontend`/`ir`/`print`). ~6k lines.
+5. Consolidate the widenings (`abstraction.rs` <-> `trace/widen.rs`).
+
+Steps 2-3 touch the live search, so they are done with the full suite as the
+guardrail (revert any step that reddens it), NOT rushed unattended. Step 1 is
+safe and additive; it is the next thing.
