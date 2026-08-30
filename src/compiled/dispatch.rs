@@ -146,17 +146,6 @@ pub(crate) fn run_chunk_kernel(
 pub(crate) static PLAIN_ROUTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// The kernel backend's content hash, hashed into the campaign fingerprint
-/// whenever the compiled engine is on: nothing else the fingerprint reads
-/// determines what the kernels compute. `mode` is ignored - the rem rung is
-/// already a separate fingerprint component (`CampaignConfig::precision`),
-/// so the ASM engine's identity is mode-independent (see
-/// `asm_kernel::engine_fingerprint`), which is also what lets the band
-/// loader recompute a previous level's fingerprint in-process and match.
-pub(crate) fn set_fingerprint_for(_mode: TracedMode) -> u64 {
-    super::asm_kernel::engine_fingerprint()
-}
-
 /// Lanes [0] the kernels ran, [1] missed.
 static KERNEL_HITS: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
