@@ -408,3 +408,23 @@ Build order (each on the last, build-then-delete):
 
 Occupancy caveat to instrument at step 1: mean lanes/block under shape vs
 shape*position at a real horizon (finer partition must not starve AVX-512).
+
+### Update 2026-08-30 (cont): steps 1-2 DONE (partition + pos-graph, no tags)
+
+- Step 1 (regroup boundary): forward_frame regroups survivors via
+  vectorize_states -> canonical (shape, partition-class) blocks. Committed.
+- Step 2 (pos-graph): forward_run `record` mode installs
+  set_partition_player_position, so blocks are (shape,position)-uniform, and
+  records the graph as a direct read (input cell -> output positions) via
+  PosObserver::record_dsts. ForwardResult { win_frame, frames, pos_graph }.
+  No per-lane origin tag anywhere. e2e green (4 live cells over the intro).
+
+Remaining:
+- Step 3 (NEXT, the bigger build): new backward on (PosGraph + FrameStep re-run
+  + checkpoints). Walk H-1..1; a checkpointed block is kept if re-running the
+  frame step on it produces a kept-key output; narrow candidates by the pos-graph
+  (only cells that reach a kept cell). Replaces sweep_time.rs's CellStore/origin
+  path. This is what removes the tag's last consumer.
+- Step 4 (delete, after 3): Rt2::origin + append/dedup propagation,
+  origin_tag_of/export_block_tagged, deopt_collect read/inject, asm_kernel
+  track_origin, SWEEP_ORIGIN, sweep_time origin path.
