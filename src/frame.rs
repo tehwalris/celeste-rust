@@ -710,6 +710,36 @@ mod tests {
         RefEngine::new().expect("ref engine")
     }
 
+    /// End-to-end wiring of the ladder's forward+refute path: run one level with
+    /// the reference over the intro (which has no win in 4 frames), and check
+    /// the ladder reports Refuted. Exercises make_engine/make_initial, the
+    /// filtered forward, and the no-win -> Refuted branch. (The Optimal/backward
+    /// branch needs a real winning room - the "together" validation.)
+    #[test]
+    #[ignore]
+    fn ladder_refutes_when_no_win_by_horizon() {
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-ladder-test");
+        let _ = std::fs::remove_dir_all(dir);
+        let outcome = ladder(
+            |_precision| Ok(Box::new(RefEngine::new()?) as Box<dyn FrameStep>),
+            || Ok(vec![Block::new(RefEngine::new()?.initial_state()?)]),
+            dir,
+            4,
+            0,
+        )
+        .expect("ladder");
+        match outcome {
+            LadderOutcome::Refuted { bits } => {
+                assert_eq!(bits, 0, "refuted at the wrong level");
+                eprintln!("[ladder] refuted at bits={bits} (no win in the 4-frame intro)");
+            }
+            LadderOutcome::Optimal { frame, bits } => {
+                panic!("ladder wrongly reported Optimal {{ frame: {frame}, bits: {bits} }}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Mechanical proof of the backward walk (the intro has no real win, so we
     /// seed artificially). Run 4 forward frames recording the pos-graph, then
     /// seed the backward from ALL of frame 4's states and walk back. The intro
