@@ -81,3 +81,26 @@ without knowing kernels-from-interpreter.
 This file is the AGREED, load-bearing architecture - keep it current. Session
 scratch (progress logs, deletion inventories) lives in
 `plans/kernel-boundary-and-deletion.md` and is freely deletable.
+
+## Deferred follow-ups (post-rebuild, 2026-08-31)
+
+The rebuild replaced the old search (`run.rs`/`sweep*.rs`, deleted) with
+`src/frame.rs` + the `rewrite search` command. Still open, in rough priority:
+
+1. **Trace extraction** - the winning input sequence at the concrete level. The
+   old `ExtractTas`/`TraceWitness` were deleted with the old backward; the new
+   `find_optimum` reports the optimal FRAME but not yet the witness trace.
+   Rebuild minimally on the sharded checkpoints + concrete-level backward.
+2. **Incremental rem-0 horizon extension** - `find_optimum` re-runs the whole
+   ladder fresh per horizon; `forward_resume` exists to extend rem-0 by one frame
+   instead (Philippe: "one more frame at rem zero"). Wire it in.
+3. **Wide + lane-bitmask provenance backward** - `backward_run` re-runs one input
+   lane at a time (correct, slow). Make the kernel emit a per-output source-lane
+   bitmask so backward runs 16-wide (design agreed; the narrow per-call reuse of
+   the old origin-union-on-merge).
+4. **Re-home the batch-invariance test** - `a_lanes_key_does_not_depend_on_its_
+   neighbours` went with `sweep.rs`; re-point onto `engine_row_keys` if wanted
+   (parcheck's byte-identity was the stronger property, now also gone with the
+   parallel path).
+5. **A new-path widening-soundness check** - `Widencheck` validated the old
+   forward's widening; the new path widens in `MarkFilter`. Add an equivalent.
