@@ -897,68 +897,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// THE BRIDGE: the new forward_run on the compiled engine must produce the
-    /// same per-frame row-key SETS as the old AbstractRun forward, given the same
-    /// program, engine, and seed. Runs a handful of frames on the start room and
-    /// compares frame by frame. If this holds, the new orchestration IS the old
-    /// one on the real engine - the gate to migrating and deleting run.rs.
-    #[test]
-    #[ignore]
-    fn new_forward_matches_old_on_compiled_engine() {
-        use rustc_hash::FxHashSet;
-        // Both sides do cross-frame dedup (the new forward always does; the old
-        // needs frontier-only). Isolated per-process by nextest.
-        std::env::set_var("CELESTE_FRONTIER_ONLY", "1");
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
-
-        let program = crate::program::frozen::rewritten("rewrites-compile.jsonl")
-            .expect("program");
-        let n: u32 = std::env::var("CELESTE_DIFF_FRAMES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6);
-
-        // Old forward: AbstractRun on the compiled engine.
-        let mut old = crate::search::run::AbstractRun::start(&program).expect("old start");
-        let seed: Vec<State> = old.states().to_vec();
-
-        // New forward: same seed, the compiled FrameEngine behind FrameStep.
-        let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-diff-test");
-        let _ = std::fs::remove_dir_all(dir);
-        std::fs::create_dir_all(dir).expect("mkdir");
-        let mut engine =
-            crate::compiled::FrameEngine::new_for_start_room(&program).expect("frame engine");
-        let initial: Vec<Block> = seed.into_iter().map(Block::new).collect();
-        forward_run(&mut engine, initial, dir, n, false, None).expect("new forward");
-
-        let key_union = |states: &[State]| -> FxHashSet<(u64, u64)> {
-            states
-                .iter()
-                .flat_map(|s| crate::compiled::engine_row_keys(s).expect("keys"))
-                .collect()
-        };
-
-        for f in 1..=n {
-            old.step().expect("old step");
-            let old_keys = key_union(old.states());
-            let new_blocks = load_frame(dir, f).expect("load new frame");
-            let new_keys: FxHashSet<(u64, u64)> = new_blocks
-                .iter()
-                .flat_map(|b| b.keys().expect("keys"))
-                .collect();
-            assert_eq!(
-                new_keys.len(),
-                old_keys.len(),
-                "frame {f}: new {} keys vs old {} keys",
-                new_keys.len(),
-                old_keys.len()
-            );
-            assert_eq!(new_keys, old_keys, "frame {f}: row-key sets differ");
-            eprintln!("[diff] frame {f}: {} keys match", new_keys.len());
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     /// forward_resume, extending a checkpointed forward, reproduces a fresh run:
     /// run fresh to frame 4, capture frame 4's key set, then resume from frame 2
     /// out to 4 (rebuilding visited from the checkpoints) and check frame 4 is

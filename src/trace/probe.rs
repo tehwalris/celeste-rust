@@ -287,11 +287,12 @@ mod encoding {
         let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
         let engine =
             crate::compiled::FrameEngine::new_for_start_room(&program).expect("engine");
-        let run = crate::search::run::AbstractRun::start(&program).expect("start");
-        let states = run.states();
-        assert_eq!(states.len(), 1, "_init should leave exactly one state");
+        let init = crate::trace::refengine::RefEngine::new()
+            .expect("refengine")
+            .initial_state()
+            .expect("init");
         let mut theirs =
-            crate::compiled::bridge::import_block(&states[0], engine.cart(), engine.cache());
+            crate::compiled::bridge::import_block(&init, engine.cart(), engine.cache());
         // CANONICAL on both sides. `import_block` numbers cells in its
         // own discovery order and the boundary renumbers them; comparing
         // the raw outputs compares two orderings, not two encodings.
