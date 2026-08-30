@@ -72,15 +72,6 @@ pub fn eval(g: &Graph, root: NodeId, env: &Env) -> Result<Conc> {
     val[root as usize].ok_or_else(|| anyhow!("root {} was not evaluated", root))
 }
 
-/// Every node in the graph at one point, `None` where it does not
-/// evaluate. For CENSUS work - fingerprinting nodes by what they compute,
-/// to find ones that are equal without being identical - where one root
-/// at a time would be quadratic.
-pub fn eval_all(g: &Graph, env: &Env) -> Vec<Option<Conc>> {
-    let need = vec![true; g.len()];
-    run(g, &need, env, false).expect("lenient run cannot fail")
-}
-
 /// One forward pass. Operands always have smaller ids, so this is linear
 /// and needs no recursion. `strict` decides whether a node that cannot be
 /// evaluated is an error or just a `None` that propagates.

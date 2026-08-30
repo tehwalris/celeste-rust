@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
@@ -238,34 +238,3 @@ impl Run {
     }
 }
 
-/// The block a traced room's run starts from: the state after `_init`,
-/// with every scalar at its real value.
-pub fn start_block(
-    root: &std::path::Path,
-) -> Result<(Rt2, Arc<CartData>, Arc<CollisionCache>)> {
-    use super::domain::Symbolic;
-    use super::interp::Interp;
-    use super::verify::run_one;
-    use super::cart;
-    use anyhow::anyhow;
-
-    let src = cart::sources_in(root)?;
-    let top = full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?;
-    let init = full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?;
-
-    let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-    let cart_data = Arc::new(CartData::load(root.join("cart"))?);
-    let (rx, ry) = celeste_interp::game_runner::start_room();
-    let cache = Arc::new(CollisionCache::new(&cart_data, rx, ry)?);
-    it.cache = Some(cache.clone());
-    it.cart = Some(cart_data.clone());
-
-    let st = cart::fresh_state::<Symbolic>(&mut it.d);
-    let mut st = run_one(&mut it, &top, st)?;
-    cart::inject_tile_flag_at(&mut st);
-    let st = run_one(&mut it, &init, st)?;
-
-    let b = super::bind::concrete_block(&st, &it.d, cart_data.clone(), cache.clone())
-        .context("the state after _init is not a concrete block")?;
-    Ok((b, cart_data, cache))
-}

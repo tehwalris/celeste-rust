@@ -23,17 +23,6 @@ pub mod recipe;
 /// `Program` printer stays here, because only it needs `Program`.
 pub mod print {
     pub use celeste_ir::print::*;
-
-    use super::Program;
-
-    pub fn format_program(program: &Program) -> String {
-        let mut out = String::new();
-        for fun in program.functions.values() {
-            out.push_str(&format_function(fun));
-            out.push('\n');
-        }
-        out
-    }
 }
 
 
@@ -247,20 +236,6 @@ impl Program {
         env
     }
 
-    /// Total instruction count, for progress tracking.
-    pub fn instruction_count(&self) -> usize {
-        self.functions
-            .values()
-            .map(|f| f.cfg.iter_blocks().map(|b| b.instructions.len() + 1).sum::<usize>())
-            .sum()
-    }
-
-    pub fn block_count(&self) -> usize {
-        self.functions
-            .values()
-            .map(|f| f.cfg.iter_blocks().count())
-            .sum()
-    }
 }
 
 pub fn is_synthetic(name: &str) -> bool {

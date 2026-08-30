@@ -774,13 +774,6 @@ impl Graph {
         self.eval_inner(cells, true, false, Some(room))
     }
 
-    /// Strict eval (forks RESOLVED via `Frag`, no top) WITH the room, so
-    /// `TileFlagAt` is decided. Exact where every node is modellable; used
-    /// by the Bits(2) narrowing probe to check `Frag` narrowing end-to-end.
-    pub fn eval_strict_in(&self, cells: &HashMap<u32, Val>, room: &Room) -> Result<Vec<Val>> {
-        self.eval_inner(cells, false, true, Some(room))
-    }
-
     /// Forks RESOLVED via `Frag` (narrowing), but a node the evaluator
     /// cannot model (`Mget`, and `TileFlagAt` without a room) becomes TOP
     /// instead of an error. Lets the narrowing on the modellable part be

@@ -536,46 +536,6 @@ impl Rule {
         }
     }
 
-    /// Every field of this entry that names a LOCAL, with the function it is
-    /// resolved against - the exact set `resolve_cell` is called on.
-    ///
-    /// One place, so that migrating the recipe from `%N` to stable names is a
-    /// walk rather than thirty-five hand-written cases that can silently omit
-    /// one. `PartitionMerge`'s `cells` are field-path patterns, not locals,
-    /// and are deliberately absent.
-    ///
-    /// Returns the function name by value: the borrow checker will not let a
-    /// shared read of `function` coexist with the mutable field borrows, and
-    /// cloning one short string per entry is not worth a lifetime dance.
-    pub fn cell_fields_mut(&mut self) -> Option<(String, Vec<&mut String>)> {
-        let (function, fields): (&mut String, Vec<&mut String>) = match self {
-            Rule::Inline { function, at, captures, .. } => {
-                let mut fields = vec![at];
-                fields.extend(captures.iter_mut());
-                (function, fields)
-            }
-            Rule::SplitAt { function, at, .. }
-            | Rule::PinBuiltin { function, at, .. }
-            | Rule::DemoteCreate { function, at }
-            | Rule::SinkStore { function, at }
-            | Rule::DecomposeBranch { function, at } => (function, vec![at]),
-            Rule::DecomposeTruthy { function, root } => (function, vec![root]),
-            Rule::PromoteCell { function, cell } => (function, vec![cell]),
-            Rule::DropDeadCell { function, cell } => (function, vec![cell]),
-            Rule::AssumeEq { function, a, b } => (function, vec![a, b]),
-            Rule::SplitCall { function, at, on, .. } => (function, vec![at, on]),
-            Rule::Speculate { function, guards, .. } => {
-                let mut fields = Vec::new();
-                for guard in guards.iter_mut() {
-                    fields.push(&mut guard.load);
-                    fields.push(&mut guard.store);
-                }
-                (function, fields)
-            }
-            _ => return None,
-        };
-        Some((function.clone(), fields))
-    }
 }
 
 /// One declared crossing for `Rule::Speculate`'s `guards` field.
@@ -642,14 +602,6 @@ impl Recipe {
         Self::parse(&std::fs::read_to_string(path)?)
     }
 
-    pub fn to_text(&self) -> Result<String> {
-        let mut out = String::new();
-        for entry in &self.entries {
-            out.push_str(&serde_json::to_string(entry)?);
-            out.push('\n');
-        }
-        Ok(out)
-    }
 }
 
 pub struct StepReport {
