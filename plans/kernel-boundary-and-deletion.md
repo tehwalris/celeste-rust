@@ -108,3 +108,123 @@ kept-or-dropped as it leaves the kernel, through cheap-local -> within-frame ->
 historic tiers, and only survivors are written, already in final form. No
 materialize-then-filter, no output buffer, no flush - the memory bound falls
 out of never materializing the pre-dedup fan-out.
+
+## Where the ~15k deletion actually lives: gut the interpreter
+
+The interpreter is now ONLY a correctness reference (the kernels are the engine).
+But it was originally built to be the fast engine, which is where all its
+complexity comes from: the vectorized abstract execution, and running off the
+IR/CFG (the IR was built for the deleted rewrite campaign). Reference does not
+need any of that. Simplify the interpreter to:
+
+1. **Not vectorized** - one scalar abstract lane at a time. Deletes the
+   interpreter's vectorization (`vectorize.rs`, `virtual_merge`, the per-lane
+   column/split machinery, the state-set/work-list management).
+2. **Run directly off the AST, not the IR** - exactly like the tracer already
+   does. The tracer's `Interp<'a, D: Domain>` walks `full_moon::ast` with a
+   pluggable domain; the reference interpreter is that walker plus a
+   concrete/abstract-value domain. This deletes the IR/CFG entirely
+   (`celeste-ir`'s `frontend` CFG builder, `ir`, the CFG printer, and the
+   interpreter's CFG glue `interpret_cfg`/`interpret_prepared_cfg`), because
+   the IR is consumed ONLY by the interpreter path (concrete.rs, the compiled
+   fallback in compiled/mod.rs, program setup). Lua PARSING (full_moon) and the
+   builtin table stay.
+3. **Forks by decision-counting DFS, not a work list.** Run one scalar path.
+   At a fork that must go N ways, consult a decision cursor: if this fork is
+   within the cursor, take the recorded choice; if it is a NEW fork past the
+   cursor, take choice 0 and append `(0, N)`. At a leaf (frame end) emit the
+   state (with its shape + value hashes). Then ADVANCE the cursor and RE-RUN
+   FROM THE START instead of backtracking: increment the last decision; if it
+   hits N, pop it and increment the new last; empty list => done. This is a
+   depth-first search over the decision tree by re-execution - no continuation
+   capture, no state snapshots, no work list. Correctness needs: deterministic
+   execution (input + cursor -> the same path), a stable fork order with a
+   consistent N per fork, truncate-on-advance (diverging at fork i discards the
+   old choices after i, re-derived fresh), and a finite fork tree (a game frame
+   terminates, so it is). The enumerated leaf SET must equal what the vectorized
+   split produces today - that is the gate. Re-execution cost is fine: this is a
+   reference, and per-lane fan-out is small.
+
+Sequencing (this is not a blind delete - it is delete the OLD oracle only after
+the NEW one is gated against it):
+
+1. Build the AST scalar DFS interpreter behind the kernel interface (reuse the
+   tracer's `Interp<D>` walker + a reference domain).
+2. Gate it: identical output keys to the current interpreter (and to the
+   kernels, which are gated against the current interpreter) across many states.
+3. THEN delete the old vectorized IR interpreter + the whole IR/CFG layer +
+   `vectorize`/`virtual_merge`. This is the bulk of the ~15k.
+
+This pairs with packing the interpreter behind the kernel interface - same work,
+one boundary.
+
+## Concrete design (from the 2026-08-30 architecture map)
+
+The tracer's `Interp<D>` (`src/trace/interp.rs`) is ALREADY an abstract
+interpreter over the Lua AST, generic over a `Domain` (`src/trace/domain.rs`),
+with two impls: `Concrete` (Num=P8, Bool=bool, the oracle) and `Symbolic`
+(the tracer). It owns control flow, the state/heap model, the split builtins,
+fork/merge/collapse - and does NOT touch the IR. So the new reference
+interpreter is a THIRD domain plus a driver, not a new engine.
+
+Key decision - keep it SCALAR + DFS, do NOT add a lane-vector domain. The
+map's first instinct (a vectorized lane domain) re-creates the very
+vectorization we are deleting. Instead:
+
+- **`DecisionDomain`**: Num = an abstract number that is either a point or a
+  closed interval (the only widened numeric form); Bool = definite or
+  undecided. Its `decide` NEVER returns `None`: on an undecided condition it
+  consults a **decision cursor** (choice i of N), records the decision, and
+  returns that choice - narrowing the interval/bool to the chosen side. So
+  `Interp`'s own fork-merge (the `sel_*` path) is never triggered; `Interp`
+  runs ONE scalar path. The fork points - straddling compare, `unknown_bool`,
+  `fork_flr`/`__split_by_flr`, `__split_at` - all route through the cursor.
+- **DFS driver**: run the frame via `Interp<DecisionDomain>` to a leaf, emit
+  the output state's `(shape_hash, content_hash)`, then advance the cursor
+  (increment last decision; pop-and-increment on overflow) and RE-RUN from the
+  start. Depth-first over the decision tree by re-execution; no merge, no
+  snapshots, no work list. The enumerated leaf SET must equal the vectorized
+  split's output set - the gate.
+- **Abstract Num ops** replicate the OLD interpreter's semantics (`op.rs`,
+  `game_runner.rs`): interval endpoint arithmetic, `sin(interval)=[-1,1]`,
+  interval compares -> definite / cursor-fork, `flr` on an interval -> fork.
+- **Widenings**: reuse `src/trace/widen.rs` (already replicates rem/spd/
+  dash-clamp/fruit-off/timer pins and imports `RemPrecision`/`SpdPrecision`).
+- **Bridge**: import a checkpoint `State` (one lane) into `trace::State<D>` for
+  the initial heap; extract the output `(u64,u64)` row key the SAME way
+  `engine_row_keys` does (`runtime2::boundary_finish`: shape hash + per-cell
+  `cell_mix` sum, two seeds). Gate: identical row-key SET to the engine and
+  the old interpreter, replayed over the on-disk checkpoints
+  (`/var/tmp/celeste-checkpoints/{kfwd,ladder-kern3}`, 94 frames each).
+
+## Honest deletion scope (this corrects the ~20-30k estimate)
+
+A large part of `celeste-interp` is NOT the interpreter - it is the SEARCH's
+dedup / frontier-subtract / boundary-merge, which the LIVE compiled search
+calls around every frame (the kernel only replaces the frame BODY):
+`vectorize.rs` (2744) + `virtual_merge.rs` (1263) ~= 4k lines. These are
+SHARED and must be PORTED/KEPT, not deleted by the interpreter work. (Their
+simplification is the separate decide-at-the-door boundary redesign above.)
+
+Deleting the old interpreter is GATED: re-point its live consumers first -
+`src/search/run.rs`, `src/compiled/mod.rs`, `src/concrete.rs`, `native-probe`,
+`src/program/mod.rs` - and make the NEW interpreter the oracle for the
+kernel-correctness gates in `src/search/differential.rs`
+(`asm_kernels_reproduce_the_interpreter` et al., which run every commit).
+Keep `game_runner` room setup and `abstraction::{Rem,Spd}Precision`.
+
+What the interpreter rewrite cleanly deletes once the new one is gated and the
+consumers re-pointed:
+
+- the IR/CFG: `celeste-ir` `frontend.rs` (1421) + `ir.rs` (999) + `print.rs`
+  (238) ~= 2.7k, IF no CFG consumer remains;
+- the CFG interpreter core: `core_interpreter.rs` (1379) + `op.rs` (1363) +
+  `flow.rs` (523) + `glue.rs` (316) ~= 3.6k;
+- one copy of the widenings (`abstraction.rs` 1476) if consolidated with
+  `trace/widen.rs`;
+- relocating (not deleting) the 52 e2e tests now stranded in `src/main.rs`.
+
+So the INTERPRETER work is ~6-8k of clean deletion, not 20-30k. Reaching
+"about half" needs the OTHER two redesigns too - decide-at-the-door (which
+shrinks the 4k dedup layer) and the chunking removal. Same direction, three
+fronts; this doc is the interpreter front.
