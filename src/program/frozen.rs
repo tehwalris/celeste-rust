@@ -1,111 +1,27 @@
-//! The rewritten program, FROZEN as data.
+//! The rewritten program, collapsed to a constant.
 //!
-//! A `Program` is normally *derived*: compile the Lua, then replay a
-//! recipe of ~1000 rewrite instructions through the 40 rules in
-//! the (now deleted) rewrite rules. That derivation is the only thing keeping ~28k lines
-//! of rules alive (`plans/deletion.md`), and it is pure - same Lua, same
-//! recipe, same program, no cart, no clock, no RNG.
+//! A `Program` used to be *derived*: compile the Lua, replay a recipe of
+//! rewrite instructions, freeze the result as a checked-in `.program.zst`
+//! artifact, and read it back here. The runtime only ever consumed one field
+//! of that program - `merge_partition_cells` - and for the compile recipe
+//! that field is a constant (`program::MERGE_PARTITION_CELLS`). So the whole
+//! derivation and its artifact are gone; `rewritten` returns the constant.
 //!
-//! So it can be done ONCE and checked in, exactly the way
-//! `crates/celeste-names/src/gen.rs` already is. This module is that
-//! artifact's reader and writer.
-//!
-//! The cost, stated out loud because it is real: once the rules are gone,
-//! a change to `lua/*.lua` or to a recipe can no longer be turned into a
-//! new program. The rules stay in git history and can be restored; the
-//! campaign that needed them is over. `freeze` exists so the artifact can
-//! be regenerated for as long as they are still here.
-//!
-//! Ordering is EXPLICIT. `Program::functions` is an insertion-ordered
-//! `IndexMap` and that order is what `FN_NAMES` and every deterministic
-//! print depend on, so the artifact stores a `Vec` of pairs rather than a
-//! map - a `HashMap` round-trip would not promise to give it back.
+//! The `recipe` name is now vestigial. Callers still pass one (and the
+//! `.jsonl` files are still checked in as the provenance of what the constant
+//! encodes and as existence gates for a couple of ignored tests), but it is
+//! no longer read as an input.
 
-use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-
-use celeste_ir::ir::{FunDef, GlobalId};
+use anyhow::Result;
 
 use crate::program::Program;
 
-/// Bumped whenever the encoding changes in a way that makes an existing
-/// artifact unreadable. A mismatch is an error rather than a silent
-/// reinterpretation of the bytes.
-const VERSION: u32 = 1;
-
-#[derive(Serialize, Deserialize)]
-struct Frozen {
-    version: u32,
-    /// The recipe this was built from, for provenance in the file itself.
-    recipe: String,
-    functions: Vec<(GlobalId, FunDef)>,
-    merge_partition_cells: Vec<String>,
-}
-
-/// Where the frozen program for a recipe lives: alongside it, same stem.
-pub fn artifact_path(recipe: &Path) -> PathBuf {
-    let mut p = recipe.to_path_buf();
-    p.set_extension("program.zst");
-    p
-}
-
-/// Write `program` as the frozen artifact for `recipe`.
-pub fn freeze(program: &Program, recipe: &Path) -> Result<PathBuf> {
-    let f = Frozen {
-        version: VERSION,
-        recipe: recipe.display().to_string(),
-        functions: program.functions.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        merge_partition_cells: program.merge_partition_cells.clone(),
-    };
-    let raw = bincode::serialize(&f).context("encode the frozen program")?;
-    let out = artifact_path(recipe);
-    let file = std::fs::File::create(&out)
-        .with_context(|| format!("create {}", out.display()))?;
-    let mut enc = zstd::Encoder::new(file, 19).context("zstd encoder")?;
-    std::io::Write::write_all(&mut enc, &raw).context("write the frozen program")?;
-    enc.finish().context("finish the frozen program")?;
-    Ok(out)
-}
-
-/// Read the frozen program for `recipe`.
-pub fn load(recipe: &Path) -> Result<Program> {
-    let path = artifact_path(recipe);
-    let file = std::fs::File::open(&path).with_context(|| {
-        format!(
-            "open {} - the frozen program for {}. Regenerate it with `cargo run --bin freeze`.",
-            path.display(),
-            recipe.display()
-        )
-    })?;
-    let raw = zstd::decode_all(file).with_context(|| format!("decompress {}", path.display()))?;
-    let f: Frozen =
-        bincode::deserialize(&raw).with_context(|| format!("decode {}", path.display()))?;
-    anyhow::ensure!(
-        f.version == VERSION,
-        "{} is version {}, this build reads version {}",
-        path.display(),
-        f.version,
-        VERSION
-    );
-    Ok(Program {
-        functions: f.functions.into_iter().collect(),
-        merge_partition_cells: f.merge_partition_cells,
-    })
-}
-
-/// Is there a frozen artifact for this recipe?
-pub fn exists(recipe: &Path) -> bool {
-    artifact_path(recipe).exists()
-}
-
-/// The rewritten program for a recipe, read from the frozen artifact.
+/// The rewritten program for a recipe: the constant partition-cell program.
 ///
-/// This is what every caller that used to say
-/// `recipe::build(&Recipe::load(p)?)?` says instead. The recipe file
-/// itself is no longer read - it stays checked in as the provenance of
-/// the artifact next to it, not as an input.
-pub fn rewritten(recipe: &str) -> Result<Program> {
-    load(Path::new(recipe))
+/// Every recipe yields the same program now - the only thing the runtime
+/// read from a rewritten program was `merge_partition_cells`, and that is a
+/// constant. The argument is kept so the callers that name a recipe do not
+/// have to change.
+pub fn rewritten(_recipe: &str) -> Result<Program> {
+    Ok(Program::partitioned())
 }
