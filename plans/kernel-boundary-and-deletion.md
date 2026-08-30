@@ -460,3 +460,28 @@ Existing code map (Philippe asked what does-this vs does-other):
 
 Open (proceeding on defaults, flag inline): narrowing precision (position-only,
 load all shapes at candidate cells) - Philippe to confirm.
+
+### Update 2026-08-30 (cont): frame.rs architecture logic complete (mostly draft)
+
+The rebuilt core now has every logical piece, each committed:
+- Forward: forward_run (dedup at door, sharded checkpoint, pos-graph). TESTED.
+- Storage + visited: sharded by (shape, cell). TESTED.
+- Backward: backward_run/backward_walk - single-pass, position-narrowed, cost-
+  bounded. DRAFT (per-lane, no provenance). Machinery TESTED on the intro chain.
+- MarkFilter: the ladder forward discard-filter (widen-to-coarser + membership),
+  replacing e/g/band. TESTED (keeps marked, discards unmarked).
+- ladder(): SKELETON tying it together; termination semantics OPEN.
+
+None of this is wired into the real driver (bin/rewrite still uses run.rs/sweep).
+Remaining, roughly in order:
+1. Ladder termination semantics (soundness, WITH Philippe): per-level horizon vs
+   refutation vs re-run-at-larger-horizon; what the reported optimum is.
+2. Real-room validation of backward + ladder (the "together" step; needs a full
+   room, the compiled engine, a real win).
+3. Wide + per-lane-bitmask provenance for backward (kernel-side work; validate
+   equal marks vs the per-lane draft).
+4. Migrate the real driver (bin/rewrite Ladder/Sweep) onto frame.rs.
+5. DELETE: e/g/band numbering (sweep.rs g/save_g/load_g, FILTER_BAND, banded
+   rungs) + forward/global origin (Rt2::origin, origin_tag_of, read/inject,
+   asm_kernel track_origin) - KEEPING SWEEP_ORIGIN re-typed as the narrow
+   per-call backward lane mask.
