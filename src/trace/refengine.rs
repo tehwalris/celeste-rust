@@ -114,3 +114,18 @@ impl RefEngine {
         Ok(out)
     }
 }
+
+/// The interpreter as the trusted `FrameStep` implementation (interface #1).
+/// `&mut self` because the `Interp` is reused across lanes and paths; the
+/// kernel engine ignores the mutability. Each fork leaf is one single-lane
+/// output block - correct but unvectorized, which is exactly the reference's
+/// contract (callers that run it wide sample).
+impl crate::frame::FrameStep for RefEngine {
+    fn run(&mut self, block: &crate::frame::Block) -> Result<Vec<crate::frame::Block>> {
+        Ok(self
+            .run_frame(block.state())?
+            .into_iter()
+            .map(crate::frame::Block::new)
+            .collect())
+    }
+}
