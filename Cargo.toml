@@ -61,10 +61,6 @@ path = "src/bin/concrete_run.rs"
 name = "rewrite"
 path = "src/bin/rewrite.rs"
 
-[[bin]]
-name = "lua_run"
-path = "src/bin/lua_run.rs"
-
 # The EDIT LOOP profile. Optimized enough that compute-bound tests finish,
 # cheap enough that a one-line change is not a full-workspace relink:
 # `lto = "fat"` + `codegen-units = 1` on the release profile costs ~100 s

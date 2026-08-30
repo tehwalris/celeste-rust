@@ -144,6 +144,15 @@ impl AsmKernel {
             static NS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *NS.get_or_init(|| std::env::var_os("CELESTE_ASM_NO_SEEN").is_some())
         };
+        // Pure-kernel throughput floor (CELESTE_KERNEL_DRYRUN=1): pack the
+        // inputs and call the kernel, then discard - no fold, no seen-dedup,
+        // no materialize, no boundary. Produces no rows, so it is a
+        // MEASUREMENT MODE ONLY (the frame comes out empty). Isolates the raw
+        // kernel compute from all the dedup/store machinery around it.
+        let dryrun = {
+            static DR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *DR.get_or_init(|| std::env::var_os("CELESTE_KERNEL_DRYRUN").is_some())
+        };
 
         let mut lo = 0usize;
         while lo < chunk.width {
@@ -155,6 +164,10 @@ impl AsmKernel {
                     outbuf.as_mut_ptr(),
                     &ctx as *const AsmCtx as *const c_void,
                 );
+            }
+            if dryrun {
+                lo += n;
+                continue;
             }
             if eval_check_on() {
                 self.eval_check(chunk, lo, n, &outbuf);
