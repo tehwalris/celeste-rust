@@ -99,11 +99,28 @@ pub fn forward_frame(
     frontier: Vec<Block>,
     visited: &mut Visited,
     is_win: impl Fn(&Block) -> Result<bool>,
+    pos: Option<&crate::search::pos_graph::PosObserver>,
 ) -> Result<(Vec<Block>, bool)> {
     let mut survivors: Vec<State> = Vec::new();
     let mut won = false;
     for block in frontier {
-        for out in engine.run(&block)? {
+        // Pos-graph edge: the block is uniform in position (record mode's
+        // partition), so its single input cell reaches every output cell.
+        // Record ALL raw outputs' positions (before dedup) - dedup drops
+        // duplicate keys, not reachable positions.
+        let c_in = match pos {
+            Some(p) => Some(p.input_cell(block.state())?),
+            None => None,
+        };
+        let outputs = engine.run(&block)?;
+        if let (Some(p), Some(c_in)) = (pos, c_in) {
+            let mut dsts = Vec::new();
+            for out in &outputs {
+                dsts.extend(out.positions()?);
+            }
+            p.record_dsts(c_in, &dsts);
+        }
+        for out in outputs {
             let keys = out.keys()?;
             // insert() reports true for a key not seen before (in this frontier
             // or any earlier one). Building the mask also records the survivors,
@@ -145,12 +162,30 @@ pub fn block_wins(block: &Block) -> bool {
 /// 0, then repeatedly `forward_frame` (which dedups at the door) and checkpoint
 /// the survivors. No chunking, no phased/parallel variants - the frame step and
 /// `Visited` hide everything else.
+pub struct ForwardResult {
+    /// The frame a lane first won, if any.
+    pub win_frame: Option<u32>,
+    /// The number of frames actually run (the last checkpointed frame).
+    pub frames: u32,
+    /// The position graph, when recording was on - backward's input.
+    pub pos_graph: Option<crate::search::pos_graph::PosGraph>,
+}
+
 pub fn forward_run(
     engine: &mut dyn FrameStep,
     initial: Vec<Block>,
     dir: &std::path::Path,
     max_frames: u32,
-) -> Result<Option<u32>> {
+    record: bool,
+) -> Result<ForwardResult> {
+    // Record mode installs the position partition, so every regrouped block
+    // (see forward_frame) is uniform in position and the pos-graph's input cell
+    // is well defined. Off for a forward-only run: position is content, so
+    // partitioning on it never changes the reachable row set, only makes the
+    // merge finer (which only the recorder pays for).
+    crate::interpreter::vectorize::set_partition_player_position(record);
+    let observer = record.then(crate::search::pos_graph::PosObserver::default);
+
     let mut visited = Visited::new();
     for b in &initial {
         for k in b.keys()? {
@@ -159,18 +194,32 @@ pub fn forward_run(
     }
     checkpoint_frontier(dir, 0, &initial)?;
     let mut frontier = initial;
+    let mut last = 0;
+    let mut win_frame = None;
     for frame in 1..=max_frames {
-        let (next, won) = forward_frame(engine, frontier, &mut visited, |b| Ok(block_wins(b)))?;
+        let (next, won) = forward_frame(
+            engine,
+            frontier,
+            &mut visited,
+            |b| Ok(block_wins(b)),
+            observer.as_ref(),
+        )?;
         checkpoint_frontier(dir, frame, &next)?;
+        if let Some(o) = observer.as_ref() {
+            o.flush();
+        }
+        last = frame;
         if won {
-            return Ok(Some(frame));
+            win_frame = Some(frame);
+            break;
         }
         if next.is_empty() {
-            return Ok(None);
+            break;
         }
         frontier = next;
     }
-    Ok(None)
+    let pos_graph = observer.map(|o| o.build(last, "rebuild-forward"));
+    Ok(ForwardResult { win_frame, frames: last, pos_graph })
 }
 
 /// Checkpoint a frontier as one compact batched (zstd) file - borrowing each
@@ -231,9 +280,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("mkdir");
 
-        let win = forward_run(&mut engine, init, dir, 4).expect("forward_run");
+        let result = forward_run(&mut engine, init, dir, 4, true).expect("forward_run");
         // No win in the 4-frame intro; the run reaches the horizon.
-        assert_eq!(win, None, "unexpected early win in the intro");
+        assert_eq!(result.win_frame, None, "unexpected early win in the intro");
+        assert_eq!(result.frames, 4, "expected 4 frames run");
+        // Recording was on: a position graph was built.
+        let pg = result.pos_graph.expect("pos graph built in record mode");
+        eprintln!("[forward_run] pos-graph: {} live cells", pg.live_cells());
 
         // Every frame 0..=4 was checkpointed and reloads.
         for frame in 0..=4 {

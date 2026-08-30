@@ -444,6 +444,18 @@ impl PosObserver {
         Ok(())
     }
 
+    /// Record edges from one input cell to a set of already-computed output
+    /// cells. Same as `record`, but the caller supplies the output positions
+    /// (the block already carries its position column), so no output state is
+    /// re-walked. Sound for the same reason: the input chunk is uniform in
+    /// position, so every `dst` really is a successor of `c_in`.
+    pub fn record_dsts(&self, c_in: u32, dsts: &[u32]) {
+        let mut pairs: Vec<(u32, u32)> = dsts.iter().map(|&d| (c_in, d)).collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        self.pending.lock().expect("pos observer").extend(pairs);
+    }
+
     /// Fold the frame's observations into the table. Called once per frame
     /// so the pending list stays a frame's worth, not a run's.
     pub fn flush(&self) {
