@@ -303,3 +303,38 @@ So the cut order is:
 Steps 2-3 touch the live search, so they are done with the full suite as the
 guardrail (revert any step that reddens it), NOT rushed unattended. Step 1 is
 safe and additive; it is the next thing.
+
+## Rebuild progress (inside-out minimal copy, 2026-08-30)
+
+Building the target architecture (plans/architecture.md) inside-out by writing
+the interfaces fresh and wiring the existing engines behind them. Add the clean
+core first, delete the old machinery last.
+
+Done (committed, all compiles warning-free):
+- `src/frame.rs` (198 lines) - the whole innermost contract:
+  - `Block` = opaque multi-lane `State` + exposed key/position columns
+    (`keys()`=engine_row_keys, `positions()`=state_cells) + `keep(mask)` split
+    (via `State::split_by_condition`) + an optional engine-supplied key cache.
+  - `trait FrameStep { run(&mut self, &Block) -> Vec<Block> }` - interface #1.
+  - `forward_frame()` - the minimal forward frame: run each frontier block,
+    dedup at the door by a per-lane is-key-new mask, keep survivors. ~20 lines.
+  - `Visited` - the frontier key set behind insert/contains.
+- `RefEngine` impls `FrameStep` (trace/refengine.rs) - the trusted reference.
+- `FrameEngine` impls `FrameStep` (compiled/mod.rs) - the fast kernels, handing
+  back the precomputed key column.
+- e2e test `forward_frame_drives_the_reference_engine` (#[ignore], 0.46s):
+  4 frames from the initial block, visited grows 2->3->4->5. Passes.
+- refgate already proves RefEngine == FrameEngine key sets (the trait impls are
+  thin wrappers over the exact methods it compares).
+
+Next, still inside-out on top of `forward_frame`:
+1. The forward DRIVER: frames-until-win loop + win detection (is_win over the
+   position column) + block checkpoint (compact batched serialize) + the
+   position-graph recording. Copy the minimum from run.rs's step machinery.
+2. Backward + ladder against the same FrameStep.
+3. Migrate the real search (bin/rewrite Ladder/Sweep/Bench) onto frame.rs; then
+   DELETE run.rs's step_inner/step_parallel/chunking/phased machinery (~2.6k)
+   and whatever else the migration orphans.
+
+The line count rises first (frame.rs added: 50,362 -> 50,497); the big drop is
+step 3, when run.rs's machinery is deleted after the migration.
