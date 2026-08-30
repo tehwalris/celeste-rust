@@ -23,11 +23,19 @@ pub struct Block {
     /// the frame step, asks for its key/position columns, splits it by a lane
     /// mask, or serializes it. That is the entire vocabulary.
     state: State,
+    /// The key column when the engine already computed it (interface #1 says
+    /// keying happens inside the frame step - the kernels hand it back rather
+    /// than have the loop re-hash). `None` means "compute on demand".
+    keys: Option<Vec<(u64, u64)>>,
 }
 
 impl Block {
     pub fn new(state: State) -> Self {
-        Self { state }
+        Self { state, keys: None }
+    }
+    /// A block whose key column the frame step already computed.
+    pub fn with_keys(state: State, keys: Vec<(u64, u64)>) -> Self {
+        Self { state, keys: Some(keys) }
     }
     pub fn into_state(self) -> State {
         self.state
@@ -38,8 +46,12 @@ impl Block {
 
     /// The key column: the 128-bit canonical row key per lane (shape + content).
     /// Identity for dedup, the visited set, and checkpoints. One entry per lane.
+    /// Returns the engine-supplied column when present, else computes it.
     pub fn keys(&self) -> Result<Vec<(u64, u64)>> {
-        crate::compiled::engine_row_keys(&self.state)
+        match &self.keys {
+            Some(k) => Ok(k.clone()),
+            None => crate::compiled::engine_row_keys(&self.state),
+        }
     }
 
     /// The position column: the player-position cell per lane, for grouping and

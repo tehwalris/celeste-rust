@@ -941,3 +941,20 @@ pub fn step(
     out
 }
 }
+
+/// The compiled kernels as the fast `FrameStep` implementation (interface #1),
+/// the counterpart to `RefEngine`. `run_frame_chunk` already hands back each
+/// output block's engine key column, so the block carries it and the loop
+/// never re-hashes. `&mut self` per the trait; the engine itself is `&self`.
+impl crate::frame::FrameStep for FrameEngine {
+    fn run(&mut self, block: &crate::frame::Block) -> anyhow::Result<Vec<crate::frame::Block>> {
+        Ok(self
+            .run_frame_chunk(block.state())
+            .into_iter()
+            .map(|(state, keys)| match keys {
+                Some(k) => crate::frame::Block::with_keys(state, k),
+                None => crate::frame::Block::new(state),
+            })
+            .collect())
+    }
+}
