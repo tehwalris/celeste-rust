@@ -358,3 +358,53 @@ position`, installed while recording). So pos-graph recording is structural, not
 a bolt-on - and it is precisely backward's input. Next push builds pos-graph
 recording + backward + ladder together against the same FrameStep, then migrates
 bin/rewrite (Ladder/Sweep) onto frame.rs and deletes run.rs's step machinery.
+
+### Update 2026-08-30 (cont): the (shape,position) partition kills origin tracking
+
+Philippe's design: make (shape, position) the BLOCK IDENTITY - store/group
+states by shape AND position, so every block is uniform in both. Then the frame
+step's lanes all share one input position, so:
+- the kernel needs NO per-lane origin tag (its whole job - "which input did this
+  lane come from" - is answered by the block's position), and
+- the pos-graph is a direct read: input block at cell c_in -> edge to every
+  output position. No tracking.
+
+Three unrelated things are named "origin"; only #3 is deleted:
+1. virtual_merge::Origin (Heap/Local/Outer) - merged-column provenance, feeds
+   ShapeCensus. KEEP.
+2. pos_graph grid ORIGIN - cell-numbering coordinate origin. KEEP.
+3. Rt2::origin + origin_tag_of + deopt_collect::read_origins_named/inject_named
+   + asm_kernel track_origin + SWEEP_ORIGIN - the per-lane input->output tag.
+   DELETE.
+
+Why the delete is safe (the coupling): the tag's main consumer is the backward
+SWEEP (sweep_time.rs reads SWEEP_ORIGIN for exact src-key->dst-key edges). The
+tag is a STORED-EDGE OPTIMIZATION to avoid re-running the frame step in backward.
+The clean backward (architecture.md sentence 8) RE-RUNS the frame step on
+candidates and keeps those that reach a kept key, using the pos-graph only to
+NARROW candidates by position. Re-run + narrow replaces stored edges -> the tag
+has no consumers -> delete.
+
+All the primitives already exist (reuse, not rewrite):
+- regroup survivors -> canonical (shape,position) blocks:
+  vectorize::split_states_by_partition (position cells via
+  set_partition_player_position/abstraction::partition_position_cells) +
+  virtual_merge::merge_dedup_group (canonicalize a group).
+- pos-graph: pos_graph::PosObserver::record(c_in, outputs), position partition on.
+- backward: FrameStep::run re-run + PosGraph narrowing + the checkpoints.
+
+Build order (each on the last, build-then-delete):
+1. Clean regroup/boundary in the forward loop: after forward_frame's dedup,
+   group survivors by (shape,position) and merge_dedup_group each -> next
+   frontier of canonical position-uniform blocks. (Handle the no-player
+   "no position" class explicitly.)
+2. Pos-graph recording in forward_run (record c_in->output positions per input
+   block; build+save the PosGraph at the end).
+3. New backward on PosGraph + FrameStep re-run + checkpoints; replaces the
+   CellStore/sweep_time backward.
+4. DELETE origin #3 everywhere once (3) lands: Rt2::origin field + append/dedup
+   propagation, origin_tag_of/export_block_tagged, deopt_collect read/inject,
+   asm_kernel track_origin, SWEEP_ORIGIN, sweep_time's origin path.
+
+Occupancy caveat to instrument at step 1: mean lanes/block under shape vs
+shape*position at a real horizon (finer partition must not starve AVX-512).
