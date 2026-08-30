@@ -404,10 +404,56 @@ pub fn forward_run(
         }
     }
     checkpoint_frontier(dir, 0, &initial)?;
-    let mut frontier = initial;
-    let mut last = 0;
+    drive_forward(engine, dir, initial, visited, observer, 1, max_frames, filter)
+}
+
+/// Resume/extend a checkpointed forward: from `from_frame` (whose frontier is on
+/// disk) out to `to_frame`, rebuilding the visited set from the checkpoints
+/// 0..=from_frame. This is the outer loop's cheap rem-0 EXTENSION path - bump
+/// the horizon by re-running only the tail, not the whole search.
+///
+/// record=false for now: seeding the pos-graph across a resume is a follow-up,
+/// and the outer loop rebuilds the finer levels fresh anyway. So a resumed run
+/// returns no pos_graph.
+pub fn forward_resume(
+    engine: &mut dyn FrameStep,
+    dir: &std::path::Path,
+    from_frame: u32,
+    to_frame: u32,
+    filter: Option<&MarkFilter>,
+) -> Result<ForwardResult> {
+    crate::interpreter::vectorize::set_partition_player_position(false);
+    let mut visited = Visited::new();
+    for f in 0..=from_frame {
+        for b in load_frame(dir, f)? {
+            let keys = b.keys()?;
+            let cells = b.positions()?;
+            for (k, c) in keys.iter().zip(&cells) {
+                visited.insert(*k, *c);
+            }
+        }
+    }
+    let frontier = load_frame(dir, from_frame)?;
+    drive_forward(engine, dir, frontier, visited, None, from_frame + 1, to_frame, filter)
+}
+
+/// The shared forward loop: from `frontier` (the states at `start_frame - 1`),
+/// compute and checkpoint frames `start_frame..=end_frame`, stopping early on a
+/// win or an empty frontier. `visited` and `observer` are already seeded.
+#[allow(clippy::too_many_arguments)]
+fn drive_forward(
+    engine: &mut dyn FrameStep,
+    dir: &std::path::Path,
+    mut frontier: Vec<Block>,
+    mut visited: Visited,
+    observer: Option<crate::search::pos_graph::PosObserver>,
+    start_frame: u32,
+    end_frame: u32,
+    filter: Option<&MarkFilter>,
+) -> Result<ForwardResult> {
+    let mut last = start_frame.saturating_sub(1);
     let mut win_frame = None;
-    for frame in 1..=max_frames {
+    for frame in start_frame..=end_frame {
         let (next, won) = forward_frame(
             engine,
             frontier,
@@ -730,6 +776,45 @@ mod tests {
     /// its own since run takes &mut). Cheap enough for a test.
     fn engine_clone(_e: &RefEngine) -> RefEngine {
         RefEngine::new().expect("ref engine")
+    }
+
+    /// forward_resume, extending a checkpointed forward, reproduces a fresh run:
+    /// run fresh to frame 4, capture frame 4's key set, then resume from frame 2
+    /// out to 4 (rebuilding visited from the checkpoints) and check frame 4 is
+    /// byte-for-byte the same key set.
+    #[test]
+    #[ignore]
+    fn forward_resume_matches_fresh() {
+        use rustc_hash::FxHashSet;
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-resume-test");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("mkdir");
+        let keyset = |frame: u32| -> FxHashSet<(u64, u64)> {
+            load_frame(dir, frame)
+                .expect("load")
+                .iter()
+                .flat_map(|b| b.keys().expect("keys"))
+                .collect()
+        };
+
+        {
+            let mut e = RefEngine::new().expect("engine");
+            let init = vec![Block::new(e.initial_state().expect("init"))];
+            forward_run(&mut e, init, dir, 4, false, None).expect("fresh");
+        }
+        let fresh4 = keyset(4);
+        assert!(!fresh4.is_empty(), "fresh frame 4 empty");
+
+        // Resume from frame 2 -> recomputes frames 3 and 4.
+        {
+            let mut e = RefEngine::new().expect("engine");
+            let r = forward_resume(&mut e, dir, 2, 4, None).expect("resume");
+            assert_eq!(r.frames, 4, "resume did not reach frame 4");
+        }
+        let resumed4 = keyset(4);
+        assert_eq!(fresh4, resumed4, "resume diverged from fresh at frame 4");
+        eprintln!("[resume] frame 4 key set identical: {} keys", fresh4.len());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// End-to-end wiring of the ladder's forward+refute path: run one level with
