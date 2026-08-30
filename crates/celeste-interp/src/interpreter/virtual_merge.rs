@@ -231,11 +231,6 @@ impl<'a> Column<'a> {
         }
     }
 
-    /// True when no two rows can be told apart by this column.
-    pub fn is_uniform(&self) -> bool {
-        self.uniform_scalar().is_some()
-    }
-
     /// How many u32 words a packed value of this column occupies.
     fn words(&self) -> usize {
         match self {

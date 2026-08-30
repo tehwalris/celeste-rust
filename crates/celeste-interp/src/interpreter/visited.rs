@@ -41,29 +41,6 @@ const ROWKEYS_VERSION: u32 = 1;
 const HEADER_BYTES: usize = 32;
 const RECORD_BYTES: usize = 24;
 
-/// Env-selected engine for runs WITH a checkpoint dir. `mmap` (the
-/// default) is the fp-run + mmap engine; `map` is the historic in-RAM
-/// hash map, kept selectable for differential gating. Runs without a
-/// dir always use the in-RAM map (the mmap engine's data structure IS
-/// the files). Deliberately NOT part of the campaign fingerprint, for
-/// the same reason the variant list is not: the trajectories are
-/// certified byte-identical and checkpoints are interchangeable.
-///
-/// Measured at room (1,0) f100->f101 (386M offered lanes, 225M rows):
-/// map 110.4s / 17.5 GB peak; mmap 95.9s / 16.5 GB peak, of which the
-/// pinned (unreclaimable) share is ~2.3 GB of fp-runs against the map's
-/// ~7.4 GB - the rest of the mmap engine's residency is evictable page
-/// cache, so under cgroup pressure it degrades to I/O instead of an
-/// OOM kill.
-pub fn mmap_engine_selected() -> bool {
-    match std::env::var("CELESTE_VISITED_ENGINE") {
-        Ok(v) if v == "map" => false,
-        Ok(v) if v == "mmap" || v.is_empty() => true,
-        Ok(v) => panic!("CELESTE_VISITED_ENGINE={} (expected 'map' or 'mmap')", v),
-        Err(_) => true,
-    }
-}
-
 pub fn rowkeys_path(dir: &Path, frame: u32) -> PathBuf {
     dir.join("frames").join(format!("f{:03}.rowkeys", frame))
 }
@@ -560,19 +537,6 @@ impl Visited {
     /// set is identical either way.
     pub fn local_dedup_first(&self) -> bool {
         self.is_mmap()
-    }
-
-    /// Attach (or change) the artifact dir. Used by `bench` once the
-    /// checkpoint dir is known - the engine is constructed before it is.
-    pub fn set_dir(&mut self, dir: &Path) {
-        if let Engine::Mmap(m) = &mut self.engine {
-            assert!(
-                m.frames.is_empty() && m.watermarks.is_empty(),
-                "cannot move an mmap engine's dir after frames were written"
-            );
-            m.dir = dir.to_path_buf();
-        }
-        self.dir = Some(dir.to_path_buf());
     }
 
     /// Phase-1 membership against COMPLETED frames (plus, for the map

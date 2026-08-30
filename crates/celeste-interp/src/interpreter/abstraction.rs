@@ -685,16 +685,6 @@ pub fn make_state_abstract_spd(mut state: State, precision: SpdPrecision) -> Sta
     state
 }
 
-/// Only the historic rem widening - the baseline abstraction the search has
-/// always used. The widen-check (rewrite widencheck) runs the search with
-/// this alone and applies `apply_conservative_widenings` post hoc, to certify
-/// that the newer widenings are conservative: widening at every boundary
-/// must yield exactly the post-hoc-widened exact sets, or the widened field
-/// influenced gameplay and the widening changed the reachable set.
-pub fn make_state_abstract_rem_only(state: State) -> State {
-    make_state_abstract_rem(state, RemPrecision::Bits(0))
-}
-
 /// The floor-aligned width-2^-bits bucket containing `n` (bits in 1..=15).
 fn rem_bucket(n: Pico8Num, bits: u8) -> Pico8NumInterval {
     let width: i32 = 0x1_0000 >> bits;
@@ -1420,16 +1410,3 @@ pub fn win_lane_mask(state: &State) -> Vec<bool> {
     }
 }
 
-/// Count of `win_lane_mask`.
-pub fn count_win_lanes(state: &State) -> usize {
-    win_lane_mask(state).into_iter().filter(|w| *w).count()
-}
-
-/// How to describe the configured win in a log line, so a synthetic run is
-/// never mistaken for a real one when reading output later.
-pub fn win_label() -> String {
-    match synthetic_win_xy() {
-        None => format!("in room ({},_)", crate::game_runner::win_room_x()),
-        Some((x, y)) => format!("at SYNTHETIC target ({}, {})", x, y),
-    }
-}

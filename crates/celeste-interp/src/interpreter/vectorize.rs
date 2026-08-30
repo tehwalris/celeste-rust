@@ -138,11 +138,6 @@ fn normalize_heap_value_for_shape(value: &HeapValue) -> HeapValueShape {
     }
 }
 
-/// Debug function to get the shape of a state (for testing)
-pub fn debug_shape_of_state(state: &State) -> StateShape {
-    shape_of_state(state)
-}
-
 /// Get the shape of a state for vectorization grouping
 /// `shape_of_state(state).cached_hash()` without building the shape.
 ///
@@ -1292,17 +1287,6 @@ pub struct VisitedKeys {
     /// depth that is ~98% of the lanes offered.
     candidates: Vec<(u32, (u64, u64))>,
     lanes: usize,
-}
-
-impl VisitedKeys {
-    /// For the partitioned filter (`search::run`), which computes the
-    /// candidate list outside this module. The contract is the same one
-    /// `visited_row_keys` satisfies: candidates ascend by lane, each is
-    /// not `contains_historic`, and each key appears at most once in the
-    /// scope the caller dedups over (`insert_new` resolves the rest).
-    pub fn from_candidates(candidates: Vec<(u32, (u64, u64))>, lanes: usize) -> Self {
-        Self { candidates, lanes }
-    }
 }
 
 /// Dedup census (`CELESTE_DEDUP_CENSUS=1`): how much of the frontier's

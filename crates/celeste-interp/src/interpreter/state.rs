@@ -38,10 +38,6 @@ pub const FILTER_DEDUP: FilterReason = "filter_dedup";
 /// the same input suffix, so re-expanding them finds nothing new).
 pub const FILTER_VISITED: FilterReason = "filter_visited";
 
-/// Precision refinement: dropping lanes whose coarsened row is outside the
-/// previous level's band (cannot be on a winning path within the horizon).
-pub const FILTER_BAND: FilterReason = "filter_band";
-
 /// Lane-chunking of oversized states before a frame (see
 /// `AbstractRun::step`, CELESTE_MAX_STATE_LANES): pure mechanics, no
 /// semantic filtering - the chunks re-merge at the boundary.

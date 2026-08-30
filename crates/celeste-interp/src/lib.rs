@@ -2,13 +2,8 @@
 //!
 //! This is the ORACLE: the thing the compiled path is checked against, and
 //! ultimately the definition of what the program means. It sits above
-//! `celeste-ir` and below everything that transforms or compiles - the
-//! rewrites, the emitters and the search all depend on it, and it depends
-//! on none of them.
-//!
-//! That direction used to be violated by exactly one call - the
-//! interpreter formatting an instruction through `program::print` - which
-//! is why the printer now lives in `celeste-ir`.
+//! `celeste-core` and below everything that transforms or compiles - the
+//! emitters and the search all depend on it, and it depends on none of them.
 //!
 //! The instrumentation modules travel with it because they instrument it:
 //! `op_census` alone has ~100 call sites inside the interpreter. Several
