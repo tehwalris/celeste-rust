@@ -127,11 +127,19 @@ impl<'a> MarkFilter<'a> {
     /// Rem widening never moves the integer cell and (coarsening) never splits
     /// a lane, so the widened block is lane-aligned with the input.
     pub fn allowed(&self, state: &State) -> Result<Vec<bool>> {
+        use crate::interpreter::abstraction::{
+            apply_conservative_widenings, make_state_abstract_rem,
+        };
         let lanes = state.vector_size.max(1);
-        let widened = crate::interpreter::abstraction::make_state_abstract_rem(
-            state.clone(),
-            self.coarser,
-        );
+        // The COMPLETE coarsening the coarse engine bakes into its states - rem
+        // bucketing AND the conservative widenings (p_jump/p_dash/fruit), then
+        // gc - matching the old `widened_row_key`. Without the conservative
+        // widenings, an Exact state keeps p_jump/p_dash concrete while the coarse
+        // marks have them widened, so its coarsened key matches nothing and the
+        // winning path is wrongly filtered at the Bits->Exact rung.
+        let mut widened = make_state_abstract_rem(state.clone(), self.coarser);
+        widened = apply_conservative_widenings(widened);
+        widened.gc();
         anyhow::ensure!(
             widened.vector_size.max(1) == lanes,
             "rem widening changed the lane count ({} -> {}); the filter's lane \
@@ -631,6 +639,7 @@ pub fn ladder_at_horizon(
             filter.as_ref(),
         )?;
         let Some(h) = fwd.win_frame else {
+            eprintln!("[ladder] level {level} ({precision:?}): NO WIN by {horizon} -> Refuted");
             return Ok(HorizonOutcome::Refuted { level });
         };
         let graph = fwd
@@ -638,6 +647,10 @@ pub fn ladder_at_horizon(
             .as_ref()
             .expect("record mode always builds the pos graph");
         let bwd = backward_run(engine.as_mut(), &level_dir, h, graph)?;
+        eprintln!(
+            "[ladder] level {level} ({precision:?}): win at f{h}, marked {} states",
+            bwd.marked.len()
+        );
         prev = Some((bwd.marked, precision));
     }
     Ok(HorizonOutcome::Confirmed)
@@ -776,6 +789,59 @@ mod tests {
     /// its own since run takes &mut). Cheap enough for a test.
     fn engine_clone(_e: &RefEngine) -> RefEngine {
         RefEngine::new().expect("ref engine")
+    }
+
+    /// The FULL ladder to the concrete level: run every precision - Bits 0..=16
+    /// then Exact - on the compiled engine with the synthetic early win, and
+    /// require Confirmed (every level, including fully concrete, reaches the win
+    /// when filtered by the coarser level's backward marks). This proves the new
+    /// search works end to end through refinement, the gate for deleting the old
+    /// search. Slow (many compiled forward+backward passes); run explicitly.
+    #[test]
+    #[ignore]
+    fn new_ladder_confirms_to_concrete() {
+        use crate::interpreter::abstraction::{set_rem_precision, RemPrecision};
+        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        std::env::set_var("CELESTE_WIN_AT_XY", "8,107");
+        let program = crate::program::frozen::rewritten("rewrites-compile.jsonl")
+            .expect("program");
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-full");
+        let _ = std::fs::remove_dir_all(dir);
+
+        // The real ladder maps k>=16 to Exact (rewrite.rs: `if prev_bits >= 16
+        // { Exact }`), so the distinct precisions are Bits(0..=15) then Exact.
+        // CELESTE_LADDER_MAXBITS bisects: Bits(0..=maxbits) then Exact.
+        let maxbits: u8 = std::env::var("CELESTE_LADDER_MAXBITS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15);
+        let precisions: Vec<RemPrecision> = (0u8..=maxbits)
+            .map(RemPrecision::Bits)
+            .chain(std::iter::once(RemPrecision::Exact))
+            .collect();
+
+        let make_engine = |precision: RemPrecision| {
+            set_rem_precision(precision);
+            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room(&program)?)
+                as Box<dyn FrameStep>)
+        };
+        let make_initial = || {
+            Ok(vec![Block::new(
+                crate::trace::refengine::RefEngine::new()?.initial_state()?,
+            )])
+        };
+
+        let outcome =
+            ladder_at_horizon(make_engine, make_initial, dir, 14, &precisions).expect("ladder");
+        match outcome {
+            HorizonOutcome::Confirmed => {
+                eprintln!("[ladder-full] all 17 levels through Exact reached the win");
+            }
+            HorizonOutcome::Refuted { level } => {
+                panic!("level {level} (of 17) refuted - the new ladder breaks before concrete");
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// THE LADDER VALIDATION (Philippe's "validate the per-rem-level forwards,
