@@ -1,5 +1,4 @@
 pub mod abstraction;
-pub mod fixed_env;
 pub mod heap;
 pub mod inspect;
 pub mod local_env;

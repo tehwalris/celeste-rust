@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 celeste-core = { path = "../celeste-core" }
-celeste-ir = { path = "../celeste-ir" }
 anyhow = "1.0.62"
 im = { version = "15.1.0", features = ["serde"] }
 lazy_static = "1.4.0"

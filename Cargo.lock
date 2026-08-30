@@ -84,7 +84,6 @@ dependencies = [
  "anyhow",
  "bincode",
  "celeste-core",
- "celeste-ir",
  "elsa",
  "hex",
  "im",
@@ -100,18 +99,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "celeste-ir"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "celeste-core",
- "full_moon",
- "itertools",
- "rustc-hash 1.1.0",
- "serde",
-]
-
-[[package]]
 name = "celeste-names"
 version = "0.1.0"
 
@@ -124,7 +111,6 @@ dependencies = [
  "celeste-core",
  "celeste-engine",
  "celeste-interp",
- "celeste-ir",
  "celeste-names",
  "clap",
  "elsa",

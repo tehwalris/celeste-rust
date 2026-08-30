@@ -15,11 +15,12 @@ pub mod transpile;
 // the ~2,000 call sites and to anything that reads a fingerprint.
 pub use celeste_core::{cart_data, collision_cache, pico8_num};
 
-// The IR, the Lua frontend, the builtin table and the printer moved to
-// `celeste-ir` so that the interpreter and the emitters can have them
-// without the rewrite machinery (plans/build-time.md). Re-exported at the
-// old paths: `crate::ir::...` keeps resolving everywhere.
-pub use celeste_ir::{builtins, frontend, ir};
+// The IR crate is gone (the CFG and its Lua frontend went with the
+// recipe/compile pipeline). The only survivors were the builtin-name ABI
+// and the two id newtypes, folded down into `celeste-core`. Re-exported at
+// the old paths: `crate::builtins::...` and `crate::ir::GlobalId` keep
+// resolving.
+pub use celeste_core::{builtins, ids as ir};
 
 // The interpreter - the ORACLE - and the game setup and instrumentation
 // that travel with it now live in `celeste-interp`, so the rewrites, the

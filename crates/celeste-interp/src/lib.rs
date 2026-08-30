@@ -24,8 +24,12 @@ extern crate anyhow;
 // invisible to a few thousand call sites, including grouped imports like
 // `use crate::{ir::GlobalId, pico8_num::Pico8Num}` that no mechanical
 // rewrite handles cleanly.
+//
+// The IR crate is gone; the only survivors the interpreter still names are
+// the two id newtypes, folded down into `celeste-core::ids`. `crate::ir`
+// stays as their path so those grouped imports keep resolving.
 pub use celeste_core::{cart_data, collision_cache, pico8_num};
-pub use celeste_ir::{builtins, ir, print};
+pub use celeste_core::ids as ir;
 
 pub mod game_runner;
 pub mod interpreter;

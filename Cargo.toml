@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "crates/celeste-core",
-    "crates/celeste-ir",
     "crates/celeste-interp",
     "crates/celeste-names",
     "crates/celeste-engine",
@@ -13,7 +12,6 @@ members = [
 default-members = [
     ".",
     "crates/celeste-core",
-    "crates/celeste-ir",
     "crates/celeste-interp",
     "crates/celeste-names",
     "crates/celeste-engine",
@@ -26,7 +24,6 @@ edition = "2021"
 
 [dependencies]
 celeste-core = { path = "crates/celeste-core" }
-celeste-ir = { path = "crates/celeste-ir" }
 celeste-interp = { path = "crates/celeste-interp" }
 celeste-engine = { path = "crates/celeste-engine" }
 celeste-names = { path = "crates/celeste-names" }

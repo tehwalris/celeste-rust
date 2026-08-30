@@ -16,7 +16,7 @@ use super::{
     value::{HeapValue, MaybeVector, Value},
 };
 use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
-use celeste_ir::ir::GlobalId;
+use crate::ir::GlobalId;
 
 /// A "shape" is a state with all vectorizable values normalized to placeholder values.
 /// States with the same shape can be merged by vectorizing their values.
@@ -1052,7 +1052,7 @@ pub fn assert_state_vector_lengths(state: &State) {
 /// Under the identity map occupant and slot are the same number, so the extra
 /// condition changes nothing.
 fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
-    use celeste_ir::ir::LocalId;
+    use crate::ir::LocalId;
 
     if states.len() <= 1 {
         return states;
@@ -2230,7 +2230,7 @@ mod tests {
     /// column, a non-vectorizable leaf, and locals.
     #[test]
     fn test_virtual_merge_matches_materialized_pipeline() {
-        use celeste_ir::ir::LocalId;
+        use crate::ir::LocalId;
 
         // Deterministic pseudo-random lane values (no RNG in tests).
         let mut seed: u64 = 0x9e3779b97f4a7c15;

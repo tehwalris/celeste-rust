@@ -213,7 +213,7 @@ pub fn structure_of(
                 // cells, which shifted every id past the first one:
                 // 290 cells against the importer's 274, and 151
                 // differences produced by one unfinished match arm.
-                let i = celeste_ir::builtins::BUILTIN_NAMES
+                let i = crate::builtins::BUILTIN_NAMES
                     .iter()
                     .position(|n| *n == name)
                     .ok_or_else(|| anyhow!("unknown builtin {:?}", name))?;

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use celeste_ir::ir::{LocalId, SlotMap};
+use crate::ir::{LocalId, SlotMap};
 
 use super::value::Value;
 
