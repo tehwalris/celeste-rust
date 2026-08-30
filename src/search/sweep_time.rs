@@ -75,7 +75,7 @@ use crate::interpreter::state::{State, FILTER_BAND};
 use crate::interpreter::value::KeptLanes;
 
 use super::checkpoint;
-use super::pos_graph::{self, PosGraph, CELL_WORDS, NO_CELL};
+use super::pos_graph::{self, PosGraph, CELL_COUNT, CELL_WORDS, NO_CELL};
 use crate::program::Program;
 use super::state_mapping::StateMapping;
 use super::sweep::{row_keys, G_UNREACHABLE, SWEEP_ORIGIN};
@@ -127,6 +127,18 @@ fn set_bit(bits: &mut [u64], i: usize) -> bool {
     let was = bits[w] & b != 0;
     bits[w] |= b;
     !was
+}
+
+/// Iterate the set bit indices of a bitmap, skipping empty words. Used to
+/// walk the candidate cells without scanning every row id.
+fn iter_set_bits(bits: &[u64]) -> impl Iterator<Item = u32> + '_ {
+    bits.iter()
+        .enumerate()
+        .filter(|(_, &w)| w != 0)
+        .flat_map(|(w, &word)| {
+            let base = (w * 64) as u32;
+            (0..64).filter_map(move |b| ((word >> b) & 1 != 0).then_some(base + b))
+        })
 }
 
 /// One pass over every saved batch, recording where each row's lane lives.
@@ -223,6 +235,279 @@ pub fn build_index(dir: &Path, frames: u32, table: &RowTable) -> Result<RowIndex
         wins
     );
     Ok(idx)
+}
+
+/// The forward pass's states regrouped BY POSITION CELL and held COMPRESSED.
+///
+/// `RowIndex` above loads every frame batch and keeps it decompressed and
+/// resident for the whole sweep - 25.7 GB on disk for room (1,0) at H=94,
+/// which inflates past 60 GB in RAM and OOM'd the in-process kernel sweep
+/// BEFORE its loop even started. This is the fix: the boundary states are
+/// bucketed by their player-position cell and each sub-state is stored
+/// zstd-compressed (the whole set is ~0.8 GB compressed), so the backward
+/// walk decompresses only the cells its frontier touches - and the position
+/// filter means most cells are never touched at all. Peak resident is the
+/// compressed blobs plus one frame's working set, a few GB instead of 60+.
+///
+/// The build is one frame at a time and compresses each sub-state as it goes,
+/// so it never holds the whole forward pass decompressed even while building.
+/// It yields the SAME `(row -> cell, win)` facts `build_index` does (checked
+/// by `cell_store_matches_the_hold_index`), and lossless round-trip plus the
+/// grouping-invariance of `g` (module docs) make the swept `g` byte-identical
+/// to the hold path's - gated end to end by `Sweep`'s `CELESTE_SWEEP_LEGACY`.
+pub struct CellStore {
+    /// cell -> its sub-states, each `zstd(bincode(State))`, in ASCENDING
+    /// frame order (the build fills frames 1..=F in order). One entry per
+    /// (saved state, cell) pair.
+    blob: Vec<Vec<Vec<u8>>>,
+    /// cell -> the earliest-arrival frame of each sub-state, same order as
+    /// `blob[cell]`. A sub-state's rows ALL have this earliest frame, so at
+    /// sweep frame `i` only sub-states with `frame <= i` can hold a candidate
+    /// (`frame <= i` is exactly `row_id < r_end`) - and since the list is
+    /// sorted the gather stops at the first `frame > i` instead of touching,
+    /// let alone decompressing, the rest.
+    sub_frame: Vec<Vec<u32>>,
+    /// cell -> cumulative lane offsets into `rows[cell]`, `len + 1` entries
+    /// (`sub j` covers `rows[cell][sub_off[j]..sub_off[j+1]]`).
+    sub_off: Vec<Vec<u32>>,
+    /// cell -> the row id of each lane, in the (sub-state, lane) order the
+    /// blobs decompress to - so a decompressed cell's lanes map back to rows.
+    rows: Vec<Vec<u32>>,
+    /// row id -> its cell (win seeding and `mark_dst_cell` on a qualifier).
+    cell: Vec<u32>,
+    /// row ids already in the next room - the seeds of `B(H)`.
+    win: Vec<u64>,
+    n_states: usize,
+    n_lanes: usize,
+}
+
+impl CellStore {
+    /// Live cells (those any forward lane occupied).
+    fn cells_with_data(&self) -> usize {
+        self.blob.iter().filter(|v| !v.is_empty()).count()
+    }
+    fn lanes(&self) -> usize {
+        self.n_lanes
+    }
+    /// Decompress one cell's sub-states. Owned and dropped by the caller, so
+    /// only the touched cells are ever resident. (No cache yet: memory is the
+    /// goal; a hot-cell LRU is a speed follow-up if re-decompression bites.)
+    fn decompress(&self, cell: u32) -> Result<Vec<State>> {
+        self.blob[cell as usize]
+            .iter()
+            .map(|b| zunpack_state(b))
+            .collect()
+    }
+}
+
+fn zpack_state(s: &State) -> Result<Vec<u8>> {
+    let raw = bincode::serialize(s).context("serializing a cell-store sub-state")?;
+    // Level 1: the checkpoint's own level; fast, and the payload is already
+    // the compact boundary form.
+    zstd::encode_all(&raw[..], 1).context("compressing a cell-store sub-state")
+}
+
+fn zunpack_state(b: &[u8]) -> Result<State> {
+    let raw = zstd::decode_all(b).context("decompressing a cell-store sub-state")?;
+    bincode::deserialize(&raw).context("deserializing a cell-store sub-state")
+}
+
+/// Cross-check a freshly built cell store against the hold index on the same
+/// checkpoint: identical `(row -> cell, win)` placement, and every cell
+/// decompresses to lanes whose row keys map back to exactly `rows[cell]` (the
+/// (sub-state, lane) -> row-id alignment the gather relies on). Gated by
+/// `CELESTE_SWEEP_VERIFY_STORE=1` and meant for a small checkpoint - it builds
+/// the hold index too, so it needs the memory that store exists to avoid.
+fn verify_cell_store_against_index(
+    store: &CellStore,
+    index: &RowIndex,
+    table: &RowTable,
+) -> Result<()> {
+    if store.win != index.win {
+        return Err(anyhow!("cell store and hold index disagree on the win seeds"));
+    }
+    if store.cell != index.cell {
+        return Err(anyhow!("cell store and hold index disagree on row -> cell"));
+    }
+    let mut checked = 0usize;
+    for cell in 0..CELL_COUNT {
+        if store.blob[cell].is_empty() {
+            continue;
+        }
+        let subs = store.decompress(cell as u32)?;
+        // Metadata the gather indexes with: one frame + offset per sub, frame
+        // list ascending, offsets cumulative and terminated at the row count.
+        if store.sub_frame[cell].len() != subs.len()
+            || store.sub_off[cell].len() != subs.len() + 1
+            || store.sub_off[cell][0] != 0
+        {
+            return Err(anyhow!("cell {}: sub metadata length mismatch", cell));
+        }
+        let mut off = 0usize;
+        let mut last_frame = 0u32;
+        for (j, sub) in subs.iter().enumerate() {
+            if store.sub_off[cell][j] as usize != off {
+                return Err(anyhow!("cell {} sub {}: offset mismatch", cell, j));
+            }
+            if store.sub_frame[cell][j] < last_frame {
+                return Err(anyhow!("cell {}: sub frames not ascending", cell));
+            }
+            last_frame = store.sub_frame[cell][j];
+            let keys = row_keys(sub)?;
+            if keys.len() != sub.vector_size {
+                return Err(anyhow!("cell {}: {} keys for {} lanes", cell, keys.len(), sub.vector_size));
+            }
+            for (l, key) in keys.iter().enumerate() {
+                let want = store.rows[cell][off + l];
+                let got = table.id_of(*key).ok_or_else(|| {
+                    anyhow!("cell {}: a decompressed lane's row is not in the table", cell)
+                })?;
+                if got != want {
+                    return Err(anyhow!(
+                        "cell {} lane {}: decompressed row {} but rows[] says {}",
+                        cell, off + l, got, want
+                    ));
+                }
+                // The sub's stamped frame must be every row's earliest frame.
+                if table.earliest_frame(got) != Some(store.sub_frame[cell][j]) {
+                    return Err(anyhow!(
+                        "cell {} sub {}: row {} earliest {:?} != sub frame {}",
+                        cell, j, got, table.earliest_frame(got), store.sub_frame[cell][j]
+                    ));
+                }
+                checked += 1;
+            }
+            off += sub.vector_size;
+        }
+        if off != store.rows[cell].len()
+            || *store.sub_off[cell].last().unwrap() as usize != off
+        {
+            return Err(anyhow!(
+                "cell {}: {} decompressed lanes but {} row ids",
+                cell, off, store.rows[cell].len()
+            ));
+        }
+    }
+    println!(
+        "cell store verified against the hold index: {} rows, win/cell placement identical",
+        checked
+    );
+    Ok(())
+}
+
+/// Build the position-keyed compressed store in one frame-at-a-time pass.
+/// Same per-row validation as `build_index` (every row in exactly one batch,
+/// stamped with that batch's frame), so a batches/row-table disagreement is
+/// still caught loudly rather than drawing candidates from the wrong states.
+pub fn build_cell_store(dir: &Path, frames: u32, table: &RowTable) -> Result<CellStore> {
+    let n_rows = table.len();
+    let mut store = CellStore {
+        blob: vec![Vec::new(); CELL_COUNT],
+        sub_frame: vec![Vec::new(); CELL_COUNT],
+        sub_off: vec![Vec::new(); CELL_COUNT],
+        rows: vec![Vec::new(); CELL_COUNT],
+        cell: vec![NO_CELL; n_rows],
+        win: vec![0u64; n_rows.div_ceil(64)],
+        n_states: 0,
+        n_lanes: 0,
+    };
+    let mut placed_bits = vec![0u64; n_rows.div_ceil(64)];
+    let mut placed = 0usize;
+    let mut wins = 0usize;
+    for f in 1..=frames {
+        let t = std::time::Instant::now();
+        let states = checkpoint::load_frame_states(dir, f)
+            .with_context(|| format!("loading frame batch f{:03}", f))?;
+        for state in states {
+            if state.vector_size == 0 {
+                continue;
+            }
+            let keys = row_keys(&state)?;
+            let cells = pos_graph::state_cells(&state)?;
+            let won = win_lane_mask(&state);
+            if keys.len() != state.vector_size
+                || cells.len() != state.vector_size
+                || won.len() != state.vector_size
+            {
+                return Err(anyhow!(
+                    "f{:03}: {} keys / {} cells / {} win flags for {} lanes",
+                    f,
+                    keys.len(),
+                    cells.len(),
+                    won.len(),
+                    state.vector_size
+                ));
+            }
+            // Split this saved state by cell (usually a no-op: the pos-graph
+            // forward partitions by position, so a saved state is already
+            // position-uniform), then compress each piece.
+            let mut by_cell: std::collections::HashMap<u32, Vec<u32>> =
+                std::collections::HashMap::new();
+            for (l, &c) in cells.iter().enumerate() {
+                by_cell.entry(c).or_default().push(l as u32);
+            }
+            for (c, lanes) in by_cell {
+                let c = c as usize;
+                if store.sub_off[c].is_empty() {
+                    store.sub_off[c].push(0);
+                }
+                for &l in &lanes {
+                    let id = table.id_of(keys[l as usize]).ok_or_else(|| {
+                        anyhow!("f{:03}: a saved lane's row is not in the row table", f)
+                    })? as usize;
+                    if table.earliest_frame(id as u32) != Some(f) {
+                        return Err(anyhow!(
+                            "f{:03}: row {} is stamped with frame {:?}, not this batch's",
+                            f,
+                            id,
+                            table.earliest_frame(id as u32)
+                        ));
+                    }
+                    if !set_bit(&mut placed_bits, id) {
+                        return Err(anyhow!("row {} appears in two frontier batches", id));
+                    }
+                    store.cell[id] = c as u32;
+                    if won[l as usize] {
+                        set_bit(&mut store.win, id);
+                        wins += 1;
+                    }
+                    store.rows[c].push(id as u32);
+                    placed += 1;
+                }
+                let sub = state
+                    .filter_by_kept_clone(&KeptLanes::from_sorted_indices(&lanes), FILTER_BAND);
+                store.n_lanes += sub.vector_size;
+                store.n_states += 1;
+                store.blob[c].push(zpack_state(&sub)?);
+                store.sub_frame[c].push(f);
+                store.sub_off[c].push(store.rows[c].len() as u32);
+            }
+        }
+        if f % 20 == 0 || f == frames {
+            println!(
+                "  cellstore f{:03}: {} of {} rows placed ({:.1}s this frame)",
+                f,
+                placed,
+                n_rows,
+                t.elapsed().as_secs_f64()
+            );
+        }
+    }
+    if placed != n_rows {
+        return Err(anyhow!(
+            "{} of {} rows are in the row table but in no frontier batch",
+            n_rows - placed,
+            n_rows
+        ));
+    }
+    println!(
+        "cellstore: {} rows over {} sub-states / {} live cells, {} already in the next room",
+        placed,
+        store.n_states,
+        store.cells_with_data(),
+        wins
+    );
+    Ok(store)
 }
 
 /// Add `cell` to the live destination set, folding its recorded predecessor
@@ -480,15 +765,59 @@ pub fn backward_sweep_time(
         ));
     }
 
+    // Default: the streaming position-keyed compressed store. `CELESTE_SWEEP_LEGACY=1`
+    // uses the old hold-everything `RowIndex` instead - kept ONLY so the two
+    // can be diffed end to end (`g.bin` byte-for-byte) at a horizon small
+    // enough that the hold path fits in memory.
+    let legacy_index = std::env::var("CELESTE_SWEEP_LEGACY").as_deref() == Ok("1");
     let t = std::time::Instant::now();
-    let index = build_index(dir, frames, &table)?;
-    println!(
-        "sweep: re-index built in {:.1}s ({} states, {} lanes)",
-        t.elapsed().as_secs_f64(),
-        index.states(),
-        index.lanes()
-    );
+    let index_opt = if legacy_index {
+        Some(build_index(dir, frames, &table)?)
+    } else {
+        None
+    };
+    let store_opt = if legacy_index {
+        None
+    } else {
+        Some(build_cell_store(dir, frames, &table)?)
+    };
+    match (&index_opt, &store_opt) {
+        (Some(ix), None) => println!(
+            "sweep: re-index built in {:.1}s ({} states, {} lanes)",
+            t.elapsed().as_secs_f64(),
+            ix.states(),
+            ix.lanes()
+        ),
+        (None, Some(st)) => println!(
+            "sweep: cell store built in {:.1}s ({} live cells, {} lanes)",
+            t.elapsed().as_secs_f64(),
+            st.cells_with_data(),
+            st.lanes()
+        ),
+        _ => unreachable!(),
+    }
     crate::metrics::record("bwdt.index", t.elapsed());
+    // Optional structural gate: build the hold index too and cross-check the
+    // store against it (placement + decompression alignment). Small
+    // checkpoints only - it needs the memory the store exists to avoid.
+    if let Some(store) = store_opt.as_ref() {
+        if std::env::var("CELESTE_SWEEP_VERIFY_STORE").as_deref() == Ok("1") {
+            let index = build_index(dir, frames, &table)?;
+            verify_cell_store_against_index(store, &index, &table)?;
+        }
+    }
+    // Read-only views over whichever store was built: the win seeds and each
+    // row's cell are the same facts either way.
+    let win_bits: &[u64] = match (&index_opt, &store_opt) {
+        (Some(ix), None) => &ix.win,
+        (None, Some(st)) => &st.win,
+        _ => unreachable!(),
+    };
+    let row_cell: &[u32] = match (&index_opt, &store_opt) {
+        (Some(ix), None) => &ix.cell,
+        (None, Some(st)) => &st.cell,
+        _ => unreachable!(),
+    };
 
     let mut engine = AbstractRun::start_with_deopt(program, plain, mapping.clone(), false)?;
     register_variants(&mut engine, mapping, variants(program)?)?;
@@ -534,10 +863,10 @@ pub fn backward_sweep_time(
     let seed_end = watermarks[horizon as usize - 1] as usize;
     let mut seeds = 0u64;
     for (id, gv) in g[..seed_end].iter_mut().enumerate() {
-        if get_bit(&index.win, id) {
+        if get_bit(win_bits, id) {
             *gv = 0;
             set_bit(&mut in_b, id);
-            mark_dst_cell(&graph, index.cell[id], &mut dst_seen, &mut cand_cells);
+            mark_dst_cell(&graph, row_cell[id], &mut dst_seen, &mut cand_cells);
             seeds += 1;
         }
     }
@@ -551,8 +880,10 @@ pub fn backward_sweep_time(
         .and_then(|v| v.parse().ok())
         .unwrap_or(250_000);
     // Reused across frames so the per-frame bucketing is an append per
-    // candidate, not an allocation.
-    let mut by_state: Vec<Vec<(u32, u32)>> = vec![Vec::new(); index.states()];
+    // candidate, not an allocation. Only the legacy hold-index path uses
+    // these (the cell store buckets by cell, not by owner state).
+    let mut by_state: Vec<Vec<(u32, u32)>> =
+        vec![Vec::new(); index_opt.as_ref().map_or(0, |ix| ix.states())];
     let mut touched: Vec<u32> = Vec::new();
     let mut expansions = 0u64;
     let mut out_of_table = 0u64;
@@ -562,66 +893,18 @@ pub fn backward_sweep_time(
         let r_end = watermarks[i as usize - 1] as usize;
 
         // Candidates: R(i) \ B(i+1), restricted to the cells the position
-        // graph says can step into a cell B(i+1) occupies.
-        let t_scan = std::time::Instant::now();
-        for s in touched.drain(..) {
-            by_state[s as usize].clear();
-        }
-        let mut candidates = 0u64;
-        for id in 0..r_end {
-            if get_bit(&in_b, id) {
-                continue;
-            }
-            let cell = index.cell[id];
-            if !get_bit(&cand_cells, cell as usize) {
-                continue;
-            }
-            let owner = index.owner[id] as usize;
-            if by_state[owner].is_empty() {
-                touched.push(owner as u32);
-            }
-            by_state[owner].push((index.lane[id], id as u32));
-            candidates += 1;
-        }
-        crate::metrics::record("bwdt.scan", t_scan.elapsed());
-        if candidates == 0 {
-            continue;
-        }
-
-        // Gather the candidate lanes back into states. A saved state is up
-        // to a few hundred thousand lanes wide, so this is a gather of the
-        // candidate lanes, never a scan of the state per candidate.
-        let t_gather = std::time::Instant::now();
-        let mut batch: Vec<State> = Vec::new();
-        for &s in &touched {
-            let lanes = &mut by_state[s as usize];
-            lanes.sort_unstable();
-            let kept: Vec<u32> = lanes.iter().map(|(l, _)| *l).collect();
-            let ids: Vec<u32> = lanes.iter().map(|(_, id)| *id).collect();
-            let mut sub = index.states[s as usize]
-                .filter_by_kept_clone(&KeptLanes::from_sorted_indices(&kept), FILTER_BAND);
-            deopt_collect::inject_named(&mut sub, SWEEP_ORIGIN, &ids);
-            batch.push(sub);
-        }
-        crate::metrics::record("bwdt.gather", t_gather.elapsed());
-
-        // Expand in groups of bounded input-lane count: the origin column
-        // prevents boundary dedup, so the successor fan-out is the full
-        // pre-dedup lane count and a whole frame at once is tens of GB of
-        // transient.
-        let mut group: Vec<State> = Vec::new();
-        let mut group_lanes = 0usize;
-        let mut queue: std::collections::VecDeque<State> = batch.into();
-        while let Some(state) = queue.pop_front() {
-            group_lanes += state.vector_size;
-            expansions += state.vector_size as u64;
-            group.push(state);
-            if group_lanes < chunk_lanes_cap && !queue.is_empty() {
-                continue;
+        // graph says can step into a cell B(i+1) occupies. `flush` steps a
+        // bounded group, reads its (origin, row key) pairs, folds membership
+        // into `newly`, and drops everything - so the replay adds a bounded
+        // transient rather than a per-frame spike. Grouping order does not
+        // affect `g` (membership is order-independent and `newly` is
+        // idempotent), so the two gather paths below produce the same `g`.
+        let mut flush = |group: &mut Vec<State>| -> Result<()> {
+            if group.is_empty() {
+                return Ok(());
             }
             let deopt_events = engine.deopt_events();
-            engine.restore(std::mem::take(&mut group), None, deopt_events)?;
-            group_lanes = 0;
+            engine.restore(std::mem::take(group), None, deopt_events)?;
             crate::metrics::time("bwdt.replay", || {
                 engine
                     .step()
@@ -657,7 +940,116 @@ pub fn backward_sweep_time(
             crate::metrics::record("bwdt.keys", t_keys.elapsed());
             let deopt_events = engine.deopt_events();
             engine.restore(Vec::new(), None, deopt_events)?;
+            Ok(())
+        };
+
+        let mut candidates = 0u64;
+        let mut group: Vec<State> = Vec::new();
+        let mut group_lanes = 0usize;
+        let t_scan = std::time::Instant::now();
+
+        if let Some(index) = index_opt.as_ref() {
+            // LEGACY hold-index path (CELESTE_SWEEP_LEGACY=1): scan R(i) for
+            // candidate rows and bucket them by their owner state, then gather
+            // from the resident, decompressed states.
+            for s in touched.drain(..) {
+                by_state[s as usize].clear();
+            }
+            for id in 0..r_end {
+                if get_bit(&in_b, id) {
+                    continue;
+                }
+                let cell = row_cell[id];
+                if !get_bit(&cand_cells, cell as usize) {
+                    continue;
+                }
+                let owner = index.owner[id] as usize;
+                if by_state[owner].is_empty() {
+                    touched.push(owner as u32);
+                }
+                by_state[owner].push((index.lane[id], id as u32));
+                candidates += 1;
+            }
+            for &s in &touched {
+                let lanes = &mut by_state[s as usize];
+                lanes.sort_unstable();
+                let kept: Vec<u32> = lanes.iter().map(|(l, _)| *l).collect();
+                let ids: Vec<u32> = lanes.iter().map(|(_, id)| *id).collect();
+                let mut sub = index.states[s as usize]
+                    .filter_by_kept_clone(&KeptLanes::from_sorted_indices(&kept), FILTER_BAND);
+                deopt_collect::inject_named(&mut sub, SWEEP_ORIGIN, &ids);
+                group_lanes += sub.vector_size;
+                expansions += sub.vector_size as u64;
+                group.push(sub);
+                if group_lanes >= chunk_lanes_cap {
+                    flush(&mut group)?;
+                    group_lanes = 0;
+                }
+            }
+        } else {
+            // STREAMING cell-store path (default): walk only the candidate
+            // cells; for each, cheap-check its uncompressed row ids and skip
+            // the cell entirely if it has no candidate this frame. Only a cell
+            // that DOES gets decompressed, its candidate lanes filtered out,
+            // and its origin (row id) column injected - so the resident set is
+            // the compressed blobs plus one group, not the whole forward pass.
+            let store = store_opt.as_ref().unwrap();
+            for cell in iter_set_bits(&cand_cells) {
+                let cell = cell as usize;
+                let frames_of = &store.sub_frame[cell];
+                let offs = &store.sub_off[cell];
+                let rows_c = &store.rows[cell];
+                for j in 0..frames_of.len() {
+                    // Sub-states are frame-sorted, so once past the horizon
+                    // frame none of the rest can hold a candidate either -
+                    // and, crucially, we never decompress them.
+                    if frames_of[j] > i {
+                        break;
+                    }
+                    let lo = offs[j] as usize;
+                    let hi = offs[j + 1] as usize;
+                    let sub_rows = &rows_c[lo..hi];
+                    // `frame <= i` means every row here has earliest <= i
+                    // (row < r_end already), so candidacy is just "not yet in
+                    // B" - and a sub-state fully in B is skipped without a
+                    // decompress.
+                    if !sub_rows.iter().any(|&r| !get_bit(&in_b, r as usize)) {
+                        continue;
+                    }
+                    let sub = zunpack_state(&store.blob[cell][j])?;
+                    if sub.vector_size != sub_rows.len() {
+                        return Err(anyhow!(
+                            "cell {} sub {}: {} decompressed lanes but {} row ids",
+                            cell,
+                            j,
+                            sub.vector_size,
+                            sub_rows.len()
+                        ));
+                    }
+                    let mut kept: Vec<u32> = Vec::new();
+                    let mut ids: Vec<u32> = Vec::new();
+                    for (l, &row) in sub_rows.iter().enumerate() {
+                        if !get_bit(&in_b, row as usize) {
+                            kept.push(l as u32);
+                            ids.push(row);
+                        }
+                    }
+                    candidates += kept.len() as u64;
+                    let mut cand = sub
+                        .filter_by_kept_clone(&KeptLanes::from_sorted_indices(&kept), FILTER_BAND);
+                    deopt_collect::inject_named(&mut cand, SWEEP_ORIGIN, &ids);
+                    group_lanes += cand.vector_size;
+                    expansions += cand.vector_size as u64;
+                    group.push(cand);
+                    if group_lanes >= chunk_lanes_cap {
+                        flush(&mut group)?;
+                        group_lanes = 0;
+                    }
+                }
+            }
         }
+        crate::metrics::record("bwdt.scan", t_scan.elapsed());
+        flush(&mut group)?;
 
         // Fold the frame's qualifiers into B. A row that first qualifies at
         // frame i has g = H - i exactly.
@@ -667,7 +1059,7 @@ pub fn backward_sweep_time(
             newly[id / 64] &= !(1u64 << (id % 64));
             g[id] = g_here;
             set_bit(&mut in_b, id);
-            mark_dst_cell(&graph, index.cell[id], &mut dst_seen, &mut cand_cells);
+            mark_dst_cell(&graph, row_cell[id], &mut dst_seen, &mut cand_cells);
         }
 
         if i % 10 == 0 || i == horizon - 1 || i == 1 {
