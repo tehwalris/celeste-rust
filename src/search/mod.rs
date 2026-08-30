@@ -8,10 +8,8 @@
 //!                       identity so engines never share one
 //!   * `pos_graph`     - the position-transition graph, the backward pass's
 //!                       predecessor filter (`plans/strategy.md`)
-//!   * `state_mapping` - the `State` <-> lane-block correspondence
 //!
 //! The forward driver itself is `frame::forward_run` (src/frame.rs), on a
 //! `compiled::FrameEngine`.
 pub mod checkpoint;
 pub mod pos_graph;
-pub mod state_mapping;
