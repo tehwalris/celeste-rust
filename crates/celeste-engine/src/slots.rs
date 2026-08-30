@@ -19,11 +19,6 @@
 //! last step lands on the `Val` cell that holds the scalar, which is the
 //! cell a kernel reads and writes.
 
-use std::sync::Arc;
-
-use celeste_core::cart_data::CartData;
-use celeste_core::collision_cache::CollisionCache;
-
 use crate::runtime2::{Cell2, Col, Rt2, AV, NONE};
 
 /// One step of a path. Mirrors the tracer's `iface::Step`, which
@@ -169,11 +164,6 @@ pub fn resolve_steps(rt2: &Rt2, p: &[PathStep]) -> Result<u32, String> {
     cur.ok_or_else(|| "empty path".to_string())
 }
 
-/// The canonical cell id the textual path names in this block.
-pub fn resolve_path(rt2: &Rt2, s: &str) -> Result<u32, String> {
-    resolve_steps(rt2, &parse_path(s)?)
-}
-
 fn kind(c: &Cell2) -> &'static str {
     match c {
         Cell2::Val => "value",
@@ -208,48 +198,6 @@ pub enum SCell {
     /// A table with no kind yet - an empty constructor, which is neither
     /// an object nor an array until something is put in it.
     Unk,
-}
-
-/// Build an empty block with a kernel's static output shape.
-///
-/// Everything a shape determines is filled in: the structure, the
-/// globals, and the pointer columns (`ptrs`, as (cell, target) pairs).
-/// Every other value cell is left `AV::Nil` for the kernel to write.
-///
-/// This is what replaces the walk's `acc_init`, which clones the chunk's
-/// structure and overwrites the columns the frame wrote. That works only
-/// when the output shape IS the input shape. A traced frame ends in
-/// several shapes - three of the four measured on room (0,0) f40 are not
-/// the input's - so an outcome's block is BUILT, not patched.
-pub fn build_block(
-    shape: &[SCell],
-    globals: &[u32],
-    ptrs: &[(u32, u32)],
-    width: usize,
-    cart: Arc<CartData>,
-    cache: Arc<CollisionCache>,
-) -> Rt2 {
-    let mut rt2 = Rt2::empty(width, globals.len(), celeste_names::STRINGS, cart, cache);
-    rt2.globals = globals.to_vec();
-    rt2.structure = shape
-        .iter()
-        .map(|c| match c {
-            SCell::Val => Cell2::Val,
-            SCell::Obj(fields) => Cell2::Obj(fields.to_vec()),
-            SCell::Arr(items) => Cell2::Arr(items.to_vec()),
-            SCell::Clo(f, caps) => Cell2::Clo(
-                *f,
-                caps.iter().map(|t| Col::U(AV::Ptr(*t))).collect::<Vec<_>>().into_boxed_slice(),
-            ),
-            SCell::Bi(b) => Cell2::Bi(*b),
-            SCell::Unk => Cell2::Unk,
-        })
-        .collect();
-    rt2.cols = vec![Col::U(AV::Nil); shape.len()];
-    for (cell, target) in ptrs {
-        rt2.cols[*cell as usize] = Col::U(AV::Ptr(*target));
-    }
-    rt2
 }
 
 /// A fresh block with the same SHAPE as `src` and a new width.
