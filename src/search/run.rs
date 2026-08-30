@@ -14,7 +14,6 @@
 
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
-use std::hash::{Hash, Hasher};
 
 use crate::interpreter::abstraction::make_state_abstract;
 use crate::interpreter::state::State;
@@ -86,23 +85,6 @@ pub struct StateObservation {
     /// heap order.
     pub(super) rows: BTreeSet<Vec<Cell>>,
     prints: Vec<String>,
-}
-
-impl StateObservation {
-    pub fn digest(&self) -> u64 {
-        let mut hasher = rustc_hash::FxHasher::default();
-        self.hash_into(&mut hasher);
-        hasher.finish()
-    }
-
-    fn hash_into<H: Hasher>(&self, hasher: &mut H) {
-        self.structure.hash(hasher);
-        self.globals.hash(hasher);
-        for row in &self.rows {
-            row.hash(hasher);
-        }
-        self.prints.hash(hasher);
-    }
 }
 
 /// Observe a closure's capture by the value it *denotes*, not by the identity
