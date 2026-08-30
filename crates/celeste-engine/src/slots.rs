@@ -40,41 +40,6 @@ pub enum PathStep {
     Int(i16),
 }
 
-/// Parse the textual form a generated kernel carries: `a.b[0].c`, with
-/// `[#n]` for an integer key outside the array part.
-pub fn parse_path(s: &str) -> Result<Vec<PathStep>, String> {
-    let mut out = Vec::new();
-    let mut rest = s;
-    while !rest.is_empty() {
-        if let Some(tail) = rest.strip_prefix('[') {
-            let end = tail.find(']').ok_or_else(|| format!("{}: unclosed `[`", s))?;
-            let body = &tail[..end];
-            let step = match body.strip_prefix('#') {
-                Some(n) => PathStep::Int(
-                    n.parse().map_err(|_| format!("{}: `{}` is not an integer key", s, body))?,
-                ),
-                None => PathStep::Idx(
-                    body.parse().map_err(|_| format!("{}: `{}` is not an index", s, body))?,
-                ),
-            };
-            out.push(step);
-            rest = &tail[end + 1..];
-        } else {
-            let rest2 = rest.strip_prefix('.').unwrap_or(rest);
-            let end = rest2.find(['.', '[']).unwrap_or(rest2.len());
-            if end == 0 {
-                return Err(format!("{}: empty name", s));
-            }
-            out.push(PathStep::Key(rest2[..end].to_string()));
-            rest = &rest2[end..];
-        }
-    }
-    if out.is_empty() {
-        return Err(format!("{}: empty path", s));
-    }
-    Ok(out)
-}
-
 /// Follow a cell holding a pointer to the cell it points at. A cell that
 /// is already a table is returned unchanged, so this is idempotent.
 ///
@@ -173,31 +138,6 @@ fn kind(c: &Cell2) -> &'static str {
         Cell2::Clo(..) => "closure",
         Cell2::Bi(_) => "builtin",
     }
-}
-
-/// One cell of a kernel's STATIC output shape.
-///
-/// A traced frame's outcome ends in a fixed heap layout - which cells
-/// are objects, which are arrays, and which points where - and that
-/// layout is a compile-time constant of the kernel. This is that layout
-/// in a form a `const` can hold: `Cell2` owns a `Vec` and a `Box`, so it
-/// cannot be one.
-#[derive(Clone, Copy, Debug)]
-pub enum SCell {
-    Val,
-    Obj(&'static [(u32, u32)]),
-    Arr(&'static [u32]),
-    /// A closure cell: its index in `FN_NAMES`, and the cells its
-    /// captures point at. No generated code reads through one, but both
-    /// parts are hashed into the shape - so a `Clo` that forgot them
-    /// would be a different shape from the one the importer builds.
-    Clo(u32, &'static [u32]),
-    /// A builtin cell, by index into `BUILTIN_NAMES`. Stored IN PLACE at
-    /// the slot, not behind a pointer, which is what the importer does.
-    Bi(u32),
-    /// A table with no kind yet - an empty constructor, which is neither
-    /// an object nor an array until something is put in it.
-    Unk,
 }
 
 /// A fresh block with the same SHAPE as `src` and a new width.
