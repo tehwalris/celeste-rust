@@ -142,6 +142,39 @@ pub struct CampaignConfig {
     pub synthetic_win: Option<(i16, i16)>,
 }
 
+/// The number of worker threads a streaming frame runs on (CELESTE_FRAME_THREADS,
+/// else the merge pool's default). One, minimum.
+fn frame_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CELESTE_FRAME_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(crate::interpreter::virtual_merge::worker_threads)
+            .max(1)
+    })
+}
+
+/// The lane cap a run WILL use, as a value: the campaign fingerprint must
+/// hash what the run does, not which environment variables happen to be set.
+/// The default is a function of the thread count, so a run that sets neither
+/// CELESTE_MAX_STATE_LANES nor CELESTE_FRAME_THREADS still has a definite cap,
+/// and two runs at different thread counts have DIFFERENT caps without either
+/// naming a chunk setting. 0 disables chunking entirely.
+pub fn effective_chunk_cap() -> usize {
+    const SERIAL_CAP: usize = 1_000_000;
+    const PARALLEL_CAP: usize = 8_000;
+    let default_cap = if frame_threads() > 1 {
+        PARALLEL_CAP
+    } else {
+        SERIAL_CAP
+    };
+    std::env::var("CELESTE_MAX_STATE_LANES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default_cap)
+}
+
 impl CampaignConfig {
     pub fn from_env() -> Self {
         Self {
@@ -151,7 +184,7 @@ impl CampaignConfig {
             frontier_only: std::env::var_os("CELESTE_FRONTIER_ONLY").is_some(),
             deopt_collect_first: std::env::var_os("CELESTE_DEOPT_COLLECT_FIRST")
                 .is_some(),
-            max_state_lanes: crate::search::run::effective_chunk_cap(),
+            max_state_lanes: effective_chunk_cap(),
             compiled_engine: Self::compiled_engine_fingerprint(
                 crate::interpreter::abstraction::rem_precision_from_env(),
             ),
