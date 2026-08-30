@@ -536,72 +536,94 @@ impl Visited {
     }
 }
 
-/// The outcome of a ladder run.
-pub enum LadderOutcome {
-    /// A win survived to the top rung: the minimal abstract win frame.
-    Optimal { frame: u32, bits: u8 },
-    /// Some precision level, filtered by the coarser level's marks, found no
-    /// win - the horizon is refuted at this precision (and, since finer includes
-    /// concrete, refuted for good).
-    Refuted { bits: u8 },
+/// A fixed-horizon ladder result (`ladder_at_horizon`).
+pub enum HorizonOutcome {
+    /// Every precision level - through fully concrete - won by the horizon. The
+    /// horizon is achievable; the concrete level yields a real winning trace.
+    Confirmed,
+    /// A precision level, filtered by the coarser level's marks, found no win by
+    /// the horizon. A coarser level over-approximates concrete reachability, so
+    /// this SOUNDLY excludes the horizon: no concrete play wins by it. `level`
+    /// is the index into `precisions` that refuted.
+    Refuted { level: usize },
 }
 
-/// The refinement ladder - SKELETON, semantics are a DESIGN POINT, not blessed.
+/// The INNER ladder at a FIXED horizon (semantics pinned with Philippe,
+/// 2026-08-30). Run every precision level in `precisions` (coarsest first,
+/// ending at `RemPrecision::Exact` = fully concrete). Each level's forward is
+/// filtered by the previous, coarser level's marked set. The instant a level
+/// finds no win by `horizon`, return `Refuted` - the horizon is excluded. Only
+/// if EVERY level, through concrete, wins by `horizon` is it `Confirmed`.
 ///
-/// For bits 0..=max_bits: build the engine at that precision, run forward
-/// (filtered by the previous, coarser level's marked set - discarding any state
-/// whose widened form was not marked), and if a win is found run the backward
-/// mark and carry it to the next level. If a level finds no win, the horizon is
-/// refuted. Engine-agnostic: the caller supplies `make_engine(precision)` and
-/// `make_initial()` so this composes the tested `forward_run`/`backward_run`/
-/// `MarkFilter` without naming the compiled engine.
+/// Engine-agnostic: the caller supplies `make_engine(precision)` and
+/// `make_initial()`, so this composes the tested forward_run / backward_run /
+/// MarkFilter without naming the compiled engine.
 ///
-/// OPEN (do not trust the termination yet): whether the reported optimum is the
-/// top rung's win frame, and exactly how a per-level horizon interacts with
-/// refutation vs. re-running at a larger horizon, is the soundness-critical bit
-/// still to pin down with Philippe. This wires the mechanically-sound pieces so
-/// the shape is real; it is not yet a correctness claim.
-pub fn ladder(
+/// NOT YET VALIDATED end to end (needs a real winning room + the compiled engine
+/// at each precision); the shape is correct, and the trace extraction at the
+/// concrete level is still to add.
+pub fn ladder_at_horizon(
     mut make_engine: impl FnMut(
         crate::interpreter::abstraction::RemPrecision,
     ) -> Result<Box<dyn FrameStep>>,
     mut make_initial: impl FnMut() -> Result<Vec<Block>>,
     base_dir: &std::path::Path,
-    max_frames: u32,
-    max_bits: u8,
-) -> Result<LadderOutcome> {
-    use crate::interpreter::abstraction::RemPrecision;
-    let mut prev: Option<(Visited, u8)> = None;
-    let mut last_win: Option<u32> = None;
-    for bits in 0..=max_bits {
-        let mut engine = make_engine(RemPrecision::Bits(bits))?;
-        let level_dir = base_dir.join(format!("rem{:02}", bits));
-        let filter = prev
-            .as_ref()
-            .map(|(m, b)| MarkFilter::new(m, RemPrecision::Bits(*b)));
+    horizon: u32,
+    precisions: &[crate::interpreter::abstraction::RemPrecision],
+) -> Result<HorizonOutcome> {
+    let mut prev: Option<(Visited, crate::interpreter::abstraction::RemPrecision)> = None;
+    for (level, &precision) in precisions.iter().enumerate() {
+        let mut engine = make_engine(precision)?;
+        let level_dir = base_dir.join(format!("level{:02}", level));
+        let filter = prev.as_ref().map(|(m, p)| MarkFilter::new(m, *p));
         let fwd = forward_run(
             engine.as_mut(),
             make_initial()?,
             &level_dir,
-            max_frames,
+            horizon,
             true,
             filter.as_ref(),
         )?;
         let Some(h) = fwd.win_frame else {
-            return Ok(LadderOutcome::Refuted { bits });
+            return Ok(HorizonOutcome::Refuted { level });
         };
-        last_win = Some(h);
         let graph = fwd
             .pos_graph
             .as_ref()
             .expect("record mode always builds the pos graph");
         let bwd = backward_run(engine.as_mut(), &level_dir, h, graph)?;
-        prev = Some((bwd.marked, bits));
+        prev = Some((bwd.marked, precision));
     }
-    Ok(LadderOutcome::Optimal {
-        frame: last_win.expect("at least one level ran"),
-        bits: max_bits,
-    })
+    Ok(HorizonOutcome::Confirmed)
+}
+
+/// The OUTER loop: the minimal winning frame. From `first_win` (rem-0's first
+/// win frame) step the horizon up by one until `ladder_at_horizon` Confirms it -
+/// that horizon is the abstract optimum, and (once trace extraction lands) the
+/// concrete level's winning trace is the witness. `None` if nothing confirms by
+/// `max_horizon`.
+///
+/// FOLLOW-UP: the rem-0 forward should be EXTENDED by one frame per step, not
+/// rerun from scratch (Philippe: "one more frame at rem zero"); here every
+/// horizon reruns fresh. Correctness first, the incremental resume after.
+pub fn find_optimum(
+    mut make_engine: impl FnMut(
+        crate::interpreter::abstraction::RemPrecision,
+    ) -> Result<Box<dyn FrameStep>>,
+    mut make_initial: impl FnMut() -> Result<Vec<Block>>,
+    base_dir: &std::path::Path,
+    first_win: u32,
+    max_horizon: u32,
+    precisions: &[crate::interpreter::abstraction::RemPrecision],
+) -> Result<Option<u32>> {
+    for horizon in first_win..=max_horizon {
+        let dir = base_dir.join(format!("h{:03}", horizon));
+        match ladder_at_horizon(&mut make_engine, &mut make_initial, &dir, horizon, precisions)? {
+            HorizonOutcome::Confirmed => return Ok(Some(horizon)),
+            HorizonOutcome::Refuted { .. } => continue,
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -720,21 +742,22 @@ mod tests {
     fn ladder_refutes_when_no_win_by_horizon() {
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-ladder-test");
         let _ = std::fs::remove_dir_all(dir);
-        let outcome = ladder(
+        use crate::interpreter::abstraction::RemPrecision;
+        let outcome = ladder_at_horizon(
             |_precision| Ok(Box::new(RefEngine::new()?) as Box<dyn FrameStep>),
             || Ok(vec![Block::new(RefEngine::new()?.initial_state()?)]),
             dir,
             4,
-            0,
+            &[RemPrecision::Bits(0)],
         )
         .expect("ladder");
         match outcome {
-            LadderOutcome::Refuted { bits } => {
-                assert_eq!(bits, 0, "refuted at the wrong level");
-                eprintln!("[ladder] refuted at bits={bits} (no win in the 4-frame intro)");
+            HorizonOutcome::Refuted { level } => {
+                assert_eq!(level, 0, "refuted at the wrong level");
+                eprintln!("[ladder] refuted at level={level} (no win in the 4-frame intro)");
             }
-            LadderOutcome::Optimal { frame, bits } => {
-                panic!("ladder wrongly reported Optimal {{ frame: {frame}, bits: {bits} }}");
+            HorizonOutcome::Confirmed => {
+                panic!("ladder wrongly reported Confirmed for the win-less intro");
             }
         }
         let _ = std::fs::remove_dir_all(dir);

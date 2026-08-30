@@ -485,3 +485,29 @@ Remaining, roughly in order:
    rungs) + forward/global origin (Rt2::origin, origin_tag_of, read/inject,
    asm_kernel track_origin) - KEEPING SWEEP_ORIGIN re-typed as the narrow
    per-call backward lane mask.
+
+### Update 2026-08-30 (cont): ladder TERMINATION semantics pinned (Philippe)
+
+The optimum search is TWO nested loops:
+- OUTER over horizon H, starting at rem-0's first-win frame, +1 each step.
+- INNER = the precision ladder at a FIXED H: levels rem0, rem1, ..., rem16,
+  then FULLY CONCRETE (Exact). Each level's forward is filtered by the previous
+  (coarser) level's marks; each must win by H, then backward-mark.
+
+Rules:
+- If ANY inner level finds no win by H -> H is SOUNDLY EXCLUDED (a coarser level
+  over-approximates concrete, so if the over-approx can't win by H, concrete
+  can't either). Bump to H+1.
+- Bumping H is cheap: EXTEND the rem-0 forward by ONE frame (resume from its
+  checkpoint); the inner rem1..concrete rerun fresh.
+- Stop when some H is Confirmed - every level through fully concrete wins by H.
+  The concrete level then yields a REAL winning trace, which is the answer
+  (return the trace, not just the frame).
+
+Encoded (frame.rs, NOT YET end-to-end validated):
+- ladder_at_horizon(make_engine, make_initial, dir, horizon, precisions) ->
+  HorizonOutcome::{Confirmed, Refuted{level}}. precisions ends at Exact.
+- find_optimum(..., first_win, max_horizon, precisions) -> Option<u32>: the outer
+  H loop; returns the first Confirmed horizon.
+Follow-ups: (a) incremental rem-0 forward extension (currently reruns per H);
+(b) concrete-level trace EXTRACTION as the witness; (c) real-room validation.
