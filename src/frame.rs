@@ -102,6 +102,53 @@ impl Block {
     }
 }
 
+/// The ladder's forward discard-filter. A state generated at precision r+1 is
+/// KEPT only if its widened-to-precision-r form was marked by the previous
+/// level's backward pass - "immediately, during the forward, the whole time".
+/// The marked set is coarse, so this narrows every finer level to the coarse
+/// winning envelope. This is what replaces the e/g/band numbering as the
+/// cross-precision link: a set membership, not a distance threshold.
+pub struct MarkFilter<'a> {
+    /// The marked set from the previous, COARSER precision level.
+    marked: &'a Visited,
+    /// The coarser precision to widen down to before the membership test.
+    coarser: crate::interpreter::abstraction::RemPrecision,
+}
+
+impl<'a> MarkFilter<'a> {
+    pub fn new(
+        marked: &'a Visited,
+        coarser: crate::interpreter::abstraction::RemPrecision,
+    ) -> Self {
+        Self { marked, coarser }
+    }
+
+    /// Per-lane: keep lane `i` iff its widened-to-coarser form was marked.
+    /// Rem widening never moves the integer cell and (coarsening) never splits
+    /// a lane, so the widened block is lane-aligned with the input.
+    pub fn allowed(&self, state: &State) -> Result<Vec<bool>> {
+        let lanes = state.vector_size.max(1);
+        let widened = crate::interpreter::abstraction::make_state_abstract_rem(
+            state.clone(),
+            self.coarser,
+        );
+        anyhow::ensure!(
+            widened.vector_size.max(1) == lanes,
+            "rem widening changed the lane count ({} -> {}); the filter's lane \
+             correspondence is broken",
+            lanes,
+            widened.vector_size.max(1)
+        );
+        let keys = crate::compiled::engine_row_keys(&widened)?;
+        let cells = crate::search::pos_graph::state_cells(&widened)?;
+        Ok(keys
+            .iter()
+            .zip(&cells)
+            .map(|(k, &c)| self.marked.contains(*k, c))
+            .collect())
+    }
+}
+
 /// The one interface between the outer loop and the engines (interface #1).
 /// `run` takes a block of input lanes and returns every output block - all
 /// internal branching enumerated, already widened for the engine's precision,
@@ -133,6 +180,7 @@ pub fn forward_frame(
     visited: &mut Visited,
     is_win: impl Fn(&Block) -> Result<bool>,
     pos: Option<&crate::search::pos_graph::PosObserver>,
+    filter: Option<&MarkFilter>,
 ) -> Result<(Vec<Block>, bool)> {
     let mut survivors: Vec<State> = Vec::new();
     let mut won = false;
@@ -154,14 +202,25 @@ pub fn forward_frame(
             if let (Some(p), Some(c_in)) = (pos, c_in) {
                 p.record_dsts(c_in, &cells);
             }
+            // Ladder filter (coarser level's marked set): discard a lane whose
+            // widened-to-coarser form was not marked. Computed before the
+            // visited insert so a discarded lane never enters the visited set.
+            let allow = match filter {
+                Some(f) => Some(f.allowed(out.state())?),
+                None => None,
+            };
             // Dedup at the door, SHARDED by (shape, cell): insert() reports true
             // for a (key, cell) not seen before in this or any earlier frontier.
             // Building the mask also records the survivors, so a duplicate later
-            // in the same frame is caught too.
+            // in the same frame is caught too. `&&` short-circuits, so a
+            // filtered-out lane is never inserted into `visited`.
             let mask: Vec<bool> = keys
                 .iter()
                 .zip(&cells)
-                .map(|(k, &c)| visited.insert(*k, c))
+                .enumerate()
+                .map(|(i, (k, &c))| {
+                    allow.as_ref().map_or(true, |a| a[i]) && visited.insert(*k, c)
+                })
                 .collect();
             if let Some(kept) = out.keep(&mask) {
                 won |= is_win(&kept)?;
@@ -326,6 +385,7 @@ pub fn forward_run(
     dir: &std::path::Path,
     max_frames: u32,
     record: bool,
+    filter: Option<&MarkFilter>,
 ) -> Result<ForwardResult> {
     // Record mode installs the position partition, so every regrouped block
     // (see forward_frame) is uniform in position and the pos-graph's input cell
@@ -354,6 +414,7 @@ pub fn forward_run(
             &mut visited,
             |b| Ok(block_wins(b)),
             observer.as_ref(),
+            filter,
         )?;
         checkpoint_frontier(dir, frame, &next)?;
         if let Some(o) = observer.as_ref() {
@@ -495,7 +556,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("mkdir");
 
-        let result = forward_run(&mut engine, init, dir, 4, true).expect("forward_run");
+        let result = forward_run(&mut engine, init, dir, 4, true, None).expect("forward_run");
         // No win in the 4-frame intro; the run reaches the horizon.
         assert_eq!(result.win_frame, None, "unexpected early win in the intro");
         assert_eq!(result.frames, 4, "expected 4 frames run");
@@ -522,6 +583,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Mechanical proof of the ladder forward filter: one frame, then re-run it
+    /// with (a) a marked set containing exactly the widened frame-1 states -
+    /// nothing is discarded - and (b) an empty marked set - everything is
+    /// discarded and the frontier empties. Uses Bits(0) as the coarser level.
+    #[test]
+    #[ignore]
+    fn forward_filter_keeps_marked_and_discards_unmarked() {
+        use crate::interpreter::abstraction::{make_state_abstract_rem, RemPrecision};
+        let bits0 = RemPrecision::Bits(0);
+        let engine = RefEngine::new().expect("ref engine");
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-filter-test");
+        let seed = || vec![Block::new(engine_clone(&engine).initial_state().expect("init"))];
+
+        // Baseline one frame, no filter.
+        {
+            let mut e = engine_clone(&engine);
+            forward_run(&mut e, seed(), dir, 1, false, None).expect("baseline");
+        }
+        let frame1 = load_frame(dir, 1).expect("load f1");
+        assert!(!frame1.is_empty(), "baseline produced no frame 1");
+
+        // marked_full = the widened-to-Bits(0) keys of every frame-1 state.
+        let mut marked_full = Visited::new();
+        for b in &frame1 {
+            let w = make_state_abstract_rem(b.state().clone(), bits0);
+            let keys = crate::compiled::engine_row_keys(&w).expect("keys");
+            let cells = crate::search::pos_graph::state_cells(&w).expect("cells");
+            for (k, &c) in keys.iter().zip(&cells) {
+                marked_full.insert(*k, c);
+            }
+        }
+
+        // With the full marked set, frame 1 survives.
+        {
+            let f = MarkFilter::new(&marked_full, bits0);
+            let mut e = engine_clone(&engine);
+            forward_run(&mut e, seed(), dir, 1, false, Some(&f)).expect("full-filter run");
+            let kept = load_frame(dir, 1).expect("load f1 full");
+            assert!(!kept.is_empty(), "full marked set wrongly discarded frame 1");
+        }
+
+        // With an empty marked set, everything is discarded.
+        {
+            let empty = Visited::new();
+            let f = MarkFilter::new(&empty, bits0);
+            let mut e = engine_clone(&engine);
+            forward_run(&mut e, seed(), dir, 1, false, Some(&f)).expect("empty-filter run");
+            let kept = load_frame(dir, 1).expect("load f1 empty");
+            assert!(kept.is_empty(), "empty marked set failed to discard frame 1");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A fresh reference engine (RefEngine isn't Clone; each forward_run needs
+    /// its own since run takes &mut). Cheap enough for a test.
+    fn engine_clone(_e: &RefEngine) -> RefEngine {
+        RefEngine::new().expect("ref engine")
+    }
+
     /// Mechanical proof of the backward walk (the intro has no real win, so we
     /// seed artificially). Run 4 forward frames recording the pos-graph, then
     /// seed the backward from ALL of frame 4's states and walk back. The intro
@@ -538,7 +658,7 @@ mod tests {
         std::fs::create_dir_all(dir).expect("mkdir");
 
         let horizon = 4;
-        let fwd = forward_run(&mut engine, init, dir, horizon, true).expect("forward");
+        let fwd = forward_run(&mut engine, init, dir, horizon, true, None).expect("forward");
         let graph = fwd.pos_graph.expect("pos graph");
 
         // Seed from every state at the horizon frame.
