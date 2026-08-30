@@ -100,7 +100,7 @@ pub fn forward_frame(
     visited: &mut Visited,
     is_win: impl Fn(&Block) -> Result<bool>,
 ) -> Result<(Vec<Block>, bool)> {
-    let mut next = Vec::new();
+    let mut survivors: Vec<State> = Vec::new();
     let mut won = false;
     for block in frontier {
         for out in engine.run(&block)? {
@@ -111,10 +111,20 @@ pub fn forward_frame(
             let mask: Vec<bool> = keys.iter().map(|k| visited.insert(*k)).collect();
             if let Some(kept) = out.keep(&mask) {
                 won |= is_win(&kept)?;
-                next.push(kept);
+                survivors.push(kept.into_state());
             }
         }
     }
+    // Regroup the surviving lanes into canonical blocks - group by (shape,
+    // partition-class) and merge each group into one wide vectorized block.
+    // With the position partition on (`forward_run` record mode), the class
+    // includes position, so every block comes out uniform in (shape, position):
+    // the block identity the pos-graph and backward are built on. This is also
+    // where cross-block duplicate lanes collapse.
+    let next: Vec<Block> = crate::interpreter::vectorize::vectorize_states(survivors)
+        .into_iter()
+        .map(Block::new)
+        .collect();
     Ok((next, won))
 }
 
