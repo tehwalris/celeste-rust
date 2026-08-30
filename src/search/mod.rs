@@ -15,4 +15,3 @@
 pub mod checkpoint;
 pub mod pos_graph;
 pub mod state_mapping;
-pub mod sweep;
