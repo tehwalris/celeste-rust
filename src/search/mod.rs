@@ -4,8 +4,8 @@
 //! class kernels where they bind and the interpreter where they do not. This
 //! module is everything around that:
 //!
-//!   * `checkpoint`    - save and resume a run, fingerprinted by the engine
-//!                       identity so engines never share one
+//!   * `checkpoint`    - batch (de)serialization of boundary states (header +
+//!                       zstd) for the sharded frontier and the reference gates
 //!   * `pos_graph`     - the position-transition graph, the backward pass's
 //!                       predecessor filter (`plans/strategy.md`)
 //!

@@ -630,8 +630,7 @@ impl Visited {
         }
     }
 
-    /// The in-RAM table, when this is the map engine - what
-    /// `checkpoint::save` serializes as `visited.bin`. The mmap engine
+    /// The in-RAM table, when this is the map engine. The mmap engine
     /// has no map; its checkpoint is the `.rowkeys` files themselves.
     pub fn row_table(&self) -> Option<&RowTable> {
         match &self.engine {

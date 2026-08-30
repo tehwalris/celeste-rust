@@ -1378,10 +1378,9 @@ mod tests {
 /// through EARLY gives the same pipeline, with real wins, at a fraction of
 /// the horizon; two such points then bracket a cost extrapolation.
 ///
-/// It is in the campaign fingerprint (`CampaignConfig`). A checkpoint or a
-/// `g` produced under a synthetic win describes a different search, and
-/// must never be resumable from, or comparable to, a real campaign's.
-/// Read once.
+/// A checkpoint or a `g` produced under a synthetic win describes a
+/// different search, and must never be resumable from, or comparable to, a
+/// real campaign's. Read once.
 pub fn synthetic_win_xy() -> Option<(i16, i16)> {
     static TARGET: std::sync::OnceLock<Option<(i16, i16)>> = std::sync::OnceLock::new();
     *TARGET.get_or_init(|| {
