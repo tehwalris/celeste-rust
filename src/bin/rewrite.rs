@@ -12,7 +12,6 @@ use clap::{Parser, Subcommand};
 
 use celeste_rust::program::recipe::Recipe;
 use celeste_rust::program::Program;
-use celeste_rust::search::differential::differential_abstract;
 
 const DEFAULT_RECIPE: &str = "rewrites.jsonl";
 
@@ -26,86 +25,8 @@ struct Cli {
     command: Command,
 }
 
-/// Treat `--recipe` as a shape VARIANT of another recipe instead of as the
-/// whole program (see `verify::Variant`). Without `--variant-of` both flags
-/// are absent and the command behaves as before.
-///
-/// Why a variant needs its own mode at all: an S2 = [fake_wall, player]
-/// recipe devirtualises `type.update` to `fake_wall.update` and
-/// `player.update`, and room (0,0) spends its first 27 frames in
-/// S1 = [fake_wall, player_spawn], where that premise is false. Run as the
-/// whole program it fails at frame 1 and there is nothing to screen. Hosted,
-/// it runs exactly on the frames whose shape it claims.
-#[derive(clap::Args, Clone)]
-struct VariantOf {
-    /// The HOST recipe. It runs every state whose object-array shape is not
-    /// one of `--variant-shapes`; the trial program runs the rest. The
-    /// baseline compared against is the host's own observation trace, since
-    /// what a variant promises is that dispatch is invisible.
-    #[arg(long = "variant-of")]
-    host: Option<String>,
-    /// |-separated object-array shapes, each a comma-separated type-name
-    /// list, e.g. 'fake_wall,player'. Same spelling as `bench --variant`.
-    #[arg(long = "variant-shapes")]
-    shapes: Option<String>,
-    /// Optional pm1-class conditions extending the dispatch key to
-    /// (shape, pm1 class): comma-separated NAME:VALUE pairs, e.g.
-    /// 'freeze:0,dash_time:0'. NAME is matched like a `partition_merge`
-    /// cell (exact or `.NAME` suffix), VALUE is an integer PICO-8 number.
-    /// The trial program runs only states whose shape matches AND whose
-    /// named cells are per-state scalars equal to VALUE; everything else
-    /// runs the host. Same spelling as the `@PM1` suffix of `bench
-    /// --variant`.
-    #[arg(long = "variant-pm1")]
-    pm1: Option<String>,
-}
-
 #[derive(Subcommand)]
 enum Command {
-    /// Differentially run the rewritten program against the original.
-    Verify {
-        #[arg(long, default_value_t = 30)]
-        frames: u32,
-        #[command(flatten)]
-        variant_of: VariantOf,
-    },
-    /// Concrete check of a specialization-set MEMBER (plans/shape-tag-plan.md).
-    ///
-    /// A member recipe pins a structurally-divergent branch with
-    /// `guard_branch`, so its asserts state a premise most frames falsify -
-    /// `verify` cannot run it (assert failure is a hard error there). This
-    /// replays a TAS on the plain program and, at every frame, ALSO attempts
-    /// the same frame under `--recipe` from the same pre-state:
-    ///
-    ///   * an `AssertTrue` failure means the premise does not hold on this
-    ///     frame - the attempt is SKIPPED and counted;
-    ///   * any other error is a hard failure;
-    ///   * success means the premise held, and the member's post-frame
-    ///     observation must equal the plain program's exactly.
-    ///
-    /// A run where the member never applies exits nonzero: a vacuous pass
-    /// is a rejection by design (pick a TAS that exercises the premise).
-    Membercheck {
-        /// TAS file: comment lines, then comma-separated input bytes.
-        #[arg(long)]
-        tas: String,
-        /// Frames to run (default: the input count).
-        #[arg(long)]
-        frames: Option<u32>,
-    },
-    /// Print a digest of the canonical observation after each frame.
-    ///
-    /// `verify` compares two programs built from the same sources, so it cannot
-    /// check a change to the *harness* - a new builtin, a different lane
-    /// layout. This prints something stable that can be compared across such a
-    /// change by hand: run it, make the change, run it again, diff.
-    ///
-    /// The digest is over lane content, and lane rows are a set, so it is
-    /// deliberately blind to how lanes are distributed across states.
-    Observe {
-        #[arg(long, default_value_t = 30)]
-        frames: u32,
-    },
     /// Run the rewritten program and report time, memory and lane counts.
     ///
     /// Note peak RSS is the process-wide high-water mark, so with `--baseline`
@@ -239,9 +160,6 @@ enum Command {
         /// Also run the unmodified program, for comparison.
         #[arg(long)]
         baseline: bool,
-        /// Print a self-time breakdown by span. Costs a few percent.
-        #[arg(long)]
-        profile: bool,
         /// On a frame failure (a specialization premise such as the collapsed
         /// loops' "#objects == 1" firing), re-run that state's frame under the
         /// plain program via the canonical-state mapping instead of aborting.
@@ -583,54 +501,6 @@ fn build_variants(
     Ok(out)
 }
 
-/// `--variant-of` resolved: the host program that dispatches to the recipe
-/// under test, and the shapes that recipe claims.
-struct VariantHost {
-    program: Program,
-    mapping: celeste_rust::search::state_mapping::StateMapping,
-    shapes: Vec<Vec<String>>,
-    pm1: Vec<(String, celeste_rust::pico8_num::Pico8Num)>,
-    label: String,
-}
-
-fn resolve_variant_host(args: &VariantOf) -> Result<Option<VariantHost>> {
-    use celeste_rust::search::state_mapping::StateMapping;
-    match (&args.host, &args.shapes) {
-        (None, None) => {
-            if args.pm1.is_some() {
-                return Err(anyhow!(
-                    "--variant-pm1 requires --variant-of and --variant-shapes"
-                ));
-            }
-            Ok(None)
-        }
-        (Some(path), Some(shapes)) => {
-            let recipe = Recipe::load(path)
-                .with_context(|| format!("--variant-of {:?}: loading recipe", path))?;
-            let program = celeste_rust::program::frozen::rewritten(path)
-                .with_context(|| format!("--variant-of {:?}: the frozen program", path))?;
-            let pm1 = match &args.pm1 {
-                None => Vec::new(),
-                Some(text) => parse_pm1(text).context("--variant-pm1")?,
-            };
-            let label = match &args.pm1 {
-                None => format!("[{}]", shapes),
-                Some(text) => format!("[{}@{}]", shapes, text),
-            };
-            Ok(Some(VariantHost {
-                mapping: StateMapping::from_recipe(&recipe),
-                program,
-                shapes: parse_shapes(shapes).context("--variant-shapes")?,
-                pm1,
-                label,
-            }))
-        }
-        _ => Err(anyhow!(
-            "--variant-of and --variant-shapes must be given together"
-        )),
-    }
-}
-
 /// Checkpoint configuration for a bench run.
 struct CheckpointCfg {
     dir: std::path::PathBuf,
@@ -653,7 +523,6 @@ fn bench(
     label: &str,
     program: &Program,
     frames: u32,
-    profile: bool,
     deopt: Option<(&Program, celeste_rust::search::state_mapping::StateMapping)>,
     checkpoint: Option<CheckpointCfg>,
     band: Option<celeste_rust::search::run::BandFilter>,
@@ -775,13 +644,6 @@ fn bench(
                 }
                 run.record_pos_graph();
             }
-        }
-    }
-    if profile {
-        celeste_rust::instr_time::reset();
-        celeste_rust::instr_time::enable();
-        if std::env::var("CELESTE_INSTR_CARD").is_ok() {
-            celeste_rust::instr_time::enable_cardinality();
         }
     }
     // Per-coordinate saturation dump (analysis): one CSV line per occupied
@@ -1330,7 +1192,6 @@ fn run_ladder(
                     "rewritten",
                     &program,
                     h,
-                    false,
                     Some((&plain, mapping.clone())),
                     Some(ckcfg),
                     None,
@@ -1394,7 +1255,6 @@ fn run_ladder(
                     "rewritten",
                     &program_k,
                     h,
-                    false,
                     Some((&plain, mapping.clone())),
                     Some(kck),
                     Some(band),
@@ -1560,78 +1420,6 @@ fn main() -> Result<()> {
     let recipe = Recipe::load(&cli.recipe)?;
 
     match cli.command {
-        Command::Verify { frames, variant_of } => {
-            let candidate = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
-            let host = resolve_variant_host(&variant_of)?;
-            let start = std::time::Instant::now();
-            let divergence = match host.as_ref() {
-                None => {
-                    let baseline = Program::compile_executable_from_disk()?;
-                    println!("running {} frames of both programs...", frames);
-                    differential_abstract(&baseline, &candidate, frames)?
-                }
-                Some(host) => {
-                    println!(
-                        "running {} frames of the host, then of the host dispatching \
-                         {} to {:?}...",
-                        frames, cli.recipe, host.shapes
-                    );
-                    let trace = celeste_rust::search::differential::observation_trace(
-                        &host.program,
-                        frames,
-                    )?;
-                    let variant = make_variant(
-                        &candidate,
-                        celeste_rust::search::state_mapping::StateMapping::from_recipe(&recipe),
-                        host.shapes.clone(),
-                        host.pm1.clone(),
-                        host.label.clone(),
-                        &host.program,
-                    )?;
-                    celeste_rust::search::differential::differential_variant_against_trace(
-                        &trace,
-                        &host.program,
-                        host.mapping.clone(),
-                        variant,
-                        frames,
-                    )?
-                }
-            };
-            match divergence {
-                None => println!(
-                    "ok: identical through frame {} ({:.1}s)",
-                    frames,
-                    start.elapsed().as_secs_f64()
-                ),
-                Some(d) => {
-                    println!("DIVERGED at frame {}:\n  {}", d.frame, d.detail);
-                    return Err(anyhow!("differential verification failed"));
-                }
-            }
-        }
-
-        Command::Membercheck { tas: _, frames: _ } => {
-            anyhow::bail!(
-                "membercheck ran a recipe MEMBER's rewritten CFG against the plain                  program on a concrete TAS; it required the CFG interpreter, which                  has been removed. Member-vs-reference agreement is now covered at                  the row-key level by the bridge and sampled kernel gates."
-            );
-        }
-        Command::Observe { frames } => {
-            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
-            let trace = celeste_rust::search::differential::observation_trace(&program, frames)?;
-            println!("{:>6} {:>8} {:>20}", "frame", "states", "digest");
-            for (frame, observation) in trace.iter().enumerate() {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = rustc_hash::FxHasher::default();
-                format!("{:?}", observation).hash(&mut hasher);
-                println!(
-                    "{:>6} {:>8} {:>20x}",
-                    frame,
-                    observation.len(),
-                    hasher.finish()
-                );
-            }
-        }
-
         Command::Widencheck { frames } => {
             use celeste_rust::interpreter::abstraction::apply_conservative_widenings;
             use celeste_rust::interpreter::vectorize::vectorize_states;
@@ -1950,7 +1738,6 @@ fn main() -> Result<()> {
         Command::Bench {
             frames,
             baseline,
-            profile,
             deopt,
             checkpoint_dir,
             checkpoint_every,
@@ -1968,7 +1755,6 @@ fn main() -> Result<()> {
                     "original",
                     &Program::compile_executable_from_disk()?,
                     frames,
-                    profile,
                     None,
                     None,
                     None,
@@ -2072,7 +1858,6 @@ fn main() -> Result<()> {
                 "rewritten",
                 &program,
                 frames,
-                profile,
                 deopt_setup.as_ref().map(|(p, m)| (p, m.clone())),
                 checkpoint_cfg,
                 band,

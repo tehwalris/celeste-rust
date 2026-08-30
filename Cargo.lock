@@ -424,19 +424,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "native-probe"
-version = "0.1.0"
-dependencies = [
- "celeste-core",
- "celeste-engine",
- "celeste-names",
- "celeste-rust",
- "mimalloc",
- "rustc-hash 2.1.3",
- "serde_json",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -5,15 +5,11 @@ members = [
     "crates/celeste-interp",
     "crates/celeste-names",
     "crates/celeste-engine",
-    "native-probe",
 ]
 # Without this, a bare `cargo build` in the repo root builds ONLY the root
-# package, because the root is itself a package. native-probe depends on
-# celeste-rust, so it is exactly the member a change to celeste-rust can
-# break - and it broke silently that way once (`FrameEngine::step` lost two
-# parameters and the probe kept its stale binary in target/, so three
-# `cargo build --release`s and a green `nextest` all passed over a member
-# that did not compile). Building it by default costs one extra link.
+# package, because the root is itself a package. Building every member by
+# default costs one extra link but keeps a change to celeste-rust from
+# silently breaking a member that kept a stale binary in target/.
 default-members = [
     ".",
     "crates/celeste-core",
@@ -21,7 +17,6 @@ default-members = [
     "crates/celeste-interp",
     "crates/celeste-names",
     "crates/celeste-engine",
-    "native-probe",
 ]
 
 [package]
@@ -106,8 +101,6 @@ debug = 1
 # is gone with the 29k-line transpiled body (K4 stage 4), so today this is
 # purely the 6%.
 [profile.release.package.celeste-engine]
-debug = false
-[profile.release.package.native-probe]
 debug = false
 
 [[bin]]
