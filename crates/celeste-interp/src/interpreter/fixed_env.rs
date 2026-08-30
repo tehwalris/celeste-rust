@@ -63,10 +63,6 @@ pub fn is_pure_builtin(name: &str) -> bool {
 /// new failure mode on that axis.
 pub const REFINEMENT_BUILTINS: &[&str] = &["__split_by_flr", "__split_at"];
 
-pub fn is_refinement_builtin(name: &str) -> bool {
-    REFINEMENT_BUILTINS.contains(&name)
-}
-
 /// PreparedCfg holds a CFG along with precomputed analysis data.
 /// This caches the label set to avoid recomputing it on every interpret_cfg call.
 #[derive(Clone)]

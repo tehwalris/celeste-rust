@@ -30,7 +30,7 @@ pub struct Lowered {
     pub body: Vec<Line>,
     /// One entry per DISTINCT button assignment, each carrying its
     /// result for every outcome. Nothing renders these to Rust any more;
-    /// the `#[ignore]` diagnostics in `trace::kernel::tests` still read
+    /// the `every_reachable_pm1_key_gets_its_own_body` test still reads
     /// them to size a lowering - which is a cfg(test) read, hence the
     /// scoped allow.
     #[cfg_attr(not(test), allow(dead_code))]

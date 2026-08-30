@@ -209,33 +209,7 @@ pub enum Column<'a> {
     Intervals(Vec<Piece<'a, Pico8NumInterval>>),
 }
 
-/// A column's single value, when it has one. The untyped `uniform_scalar`
-/// wraps it in a `Value` (an allocation-bearing enum); the row-key hash
-/// wants the raw payload to hash, once, per column.
-pub enum UniformValue {
-    Number(Pico8Num),
-    Bool(bool),
-    Interval(Pico8NumInterval),
-}
-
 impl<'a> Column<'a> {
-    /// The single value every row of this column holds, if there is one.
-    /// `None` also covers the empty column, which has nothing to fold.
-    pub fn uniform_value(&self) -> Option<UniformValue> {
-        fn check<T: Copy + PartialEq>(pieces: &[Piece<T>]) -> Option<T> {
-            let first = pieces.iter().find_map(|p| p.first())?;
-            pieces
-                .iter()
-                .all(|p| p.all_equal_to(&first))
-                .then_some(first)
-        }
-        match self {
-            Column::Numbers(p) => check(p).map(UniformValue::Number),
-            Column::Bools(p) => check(p).map(UniformValue::Bool),
-            Column::Intervals(p) => check(p).map(UniformValue::Interval),
-        }
-    }
-
     /// The single scalar this column collapses to, if no two rows can be
     /// told apart by it. Such a column leaves the dedup key and the merged
     /// state stores it as a `Scalar` - the collapse that materialising
@@ -360,16 +334,6 @@ impl<'a> Column<'a> {
     }
 }
 
-/// Collects every vectorizable leaf of the group as a virtual column.
-///
-/// The traversal must visit leaves in the same order as the merge itself
-/// (heap cells ascending, then `local_env` slots, then each outer env), and
-/// must include leaves that are `Scalar` in some fragments - shape equality
-/// does not distinguish a scalar from a vector, so a column can be mixed.
-pub fn collect_columns<'a>(states: &'a [State]) -> Option<Vec<Column<'a>>> {
-    collect_columns_labeled(states).map(|(c, _)| c)
-}
-
 /// Where a column came from, so the state builder can check it is placing
 /// each column at the leaf the traversal collected it from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,6 +344,12 @@ pub enum Origin {
     Outer(usize, usize),
 }
 
+/// Collects every vectorizable leaf of the group as a virtual column.
+///
+/// The traversal must visit leaves in the same order as the merge itself
+/// (heap cells ascending, then `local_env` slots, then each outer env), and
+/// must include leaves that are `Scalar` in some fragments - shape equality
+/// does not distinguish a scalar from a vector, so a column can be mixed.
 pub fn collect_columns_labeled<'a>(
     states: &'a [State],
 ) -> Option<(Vec<Column<'a>>, Vec<Origin>)> {

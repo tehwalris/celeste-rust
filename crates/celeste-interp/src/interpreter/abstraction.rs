@@ -13,8 +13,8 @@
 //! * `apply_conservative_widenings` - the boundary pins (gameplay-dead
 //!   timers, dash_effect_time clamp) certified by `rewrite widencheck`.
 //! * `object_shape` - what shape dispatch (`verify::Variant`) routes on.
-//! * The lane probes (`count_room_x_lanes`, `room_x_lane_mask`,
-//!   `player_xy_per_lane`) that win detection and the tools read.
+//! * The lane probes (`room_x_lane_mask`, `player_xy_per_lane`) that win
+//!   detection and the tools read.
 //!
 //! Every widening here must be an OVER-approximation: it may only grow the
 //! reachable set, never drop a state a concrete run could visit. If a
@@ -369,13 +369,6 @@ pub fn spd_precision_from_env() -> SpdPrecision {
 pub struct LadderPrecision {
     pub spd: SpdPrecision,
     pub rem: RemPrecision,
-}
-
-pub fn ladder_precision_from_env() -> LadderPrecision {
-    LadderPrecision {
-        spd: spd_precision_from_env(),
-        rem: rem_precision_from_env(),
-    }
 }
 
 impl LadderPrecision {
@@ -1081,39 +1074,6 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
 ///
 /// Loud on structural surprises: `room` missing or non-numeric means the
 /// probe would silently never fire, which is worse than a crash.
-pub fn count_room_x_lanes(state: &State, x: i16) -> usize {
-    let helper = StateHelper::new(state);
-    // The global cell holds a pointer to the table (globals are boxed like
-    // locals); follow the one indirection.
-    let cell = helper
-        .find_global("room")
-        .unwrap_or_else(|| panic!("count_room_x_lanes: no `room` global"));
-    let table_id = helper
-        .unwrap_pointer(helper.load(cell))
-        .unwrap_or_else(|| panic!("count_room_x_lanes: `room` global is not a table pointer"));
-    let HeapValue::ObjectTable(room) = helper.load(table_id) else {
-        panic!("count_room_x_lanes: `room` does not point at a table");
-    };
-    let x_id = *room
-        .get("x")
-        .unwrap_or_else(|| panic!("count_room_x_lanes: room table has no x field"));
-    let HeapValue::Value(Value::Number(n)) = helper.load(x_id) else {
-        panic!("count_room_x_lanes: room.x is not a number");
-    };
-    let want = Pico8Num::from_i16(x);
-    match n {
-        MaybeVector::Scalar(s) => {
-            if *s == want {
-                state.vector_size
-            } else {
-                0
-            }
-        }
-        MaybeVector::Vector(v) => v.iter().filter(|s| **s == want).count(),
-    }
-}
-
-/// Per-lane version of `count_room_x_lanes`: which lanes have `room.x == x`.
 pub fn room_x_lane_mask(state: &State, x: i16) -> Vec<bool> {
     let helper = StateHelper::new(state);
     let cell = helper

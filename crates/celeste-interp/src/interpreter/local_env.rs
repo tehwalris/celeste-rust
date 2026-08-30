@@ -124,20 +124,6 @@ impl LocalEnv {
         self.data.values.iter().all(|v| v.is_none())
     }
 
-    /// Move to a different slot map. Only legal while empty - there is no
-    /// meaningful way to reinterpret occupied slots under a different map, and
-    /// the only place this is needed is entering a CFG.
-    pub fn reslot(&mut self, slots: &Arc<SlotMap>) {
-        if Arc::ptr_eq(&self.slots, slots) {
-            return;
-        }
-        assert!(
-            self.is_empty(),
-            "cannot change the slot map of a non-empty local environment"
-        );
-        *self = Self::with_slots(Arc::clone(slots));
-    }
-
     pub fn with_capacity(_max_locals: usize) -> Self {
         Self::new()
     }
@@ -163,20 +149,6 @@ impl LocalEnv {
                 usize::from(id)
             ),
             None => panic!("LocalId %{} should be set before get", usize::from(id)),
-        }
-    }
-
-    /// Non-panicking lookup: `Some` only if `id` is still the occupant of its
-    /// slot. For diagnostics that probe whether an instruction bound a value,
-    /// where "not set" is an answer rather than a bug.
-    #[inline]
-    pub fn try_get(&self, id: LocalId) -> Option<&Value> {
-        let slot = self.slots.slot_of(id);
-        match self.data.occupant.get(slot) {
-            Some(&occupant) if occupant == usize::from(id) as u32 => {
-                self.data.values.get(slot).and_then(|v| v.as_ref())
-            }
-            _ => None,
         }
     }
 

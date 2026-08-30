@@ -160,14 +160,6 @@ pub const MAYBE_BOOL_ESCAPED: &str =
      resolved by resolve_maybe_bool at the instruction that produced it \
      (see plans/tristate-plan.md)";
 
-/// Count true values in a mask using SIMD-friendly byte sum
-#[inline(always)]
-pub fn count_true(mask: &[bool]) -> usize {
-    // Since bool is represented as 0 or 1, we can sum directly
-    // This is more SIMD-friendly than filter().count()
-    mask.iter().map(|&b| b as usize).sum()
-}
-
 /// The lanes a filter keeps, as sorted half-open `[start, end)` ranges.
 ///
 /// Kept lanes come in contiguous stretches - measured 30.6 lanes per run at
@@ -316,11 +308,6 @@ impl SplitRuns {
         self.total_false
     }
 
-    /// Contiguous runs per side, for the filter census.
-    pub fn runs_per_side(&self) -> (usize, usize) {
-        let t = self.runs.iter().filter(|&&(_, _, m)| m).count();
-        (t, self.runs.len() - t)
-    }
 }
 
 /// Split a vector into its matching and non-matching lanes in one pass.

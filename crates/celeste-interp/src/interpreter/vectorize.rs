@@ -1084,45 +1084,6 @@ fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
         .collect()
 }
 
-/// Vectorize a collection of states.
-/// States with the same "shape" are merged into single states with vector values.
-/// This reduces the number of states while preserving all the information.
-/// Timing stats for vectorize_states (for profiling)
-#[derive(Default)]
-pub struct VectorizeTimingStats {
-    pub input_validation_ns: u64,
-    pub clean_local_envs_ns: u64,
-    pub shape_grouping_ns: u64,
-    pub vectorize_groups_ns: u64,
-    pub output_validation_ns: u64,
-    pub input_count: usize,
-    pub output_count: usize,
-    pub group_count: usize,
-}
-
-thread_local! {
-    static LAST_VECTORIZE_STATS: std::cell::RefCell<Option<VectorizeTimingStats>> = std::cell::RefCell::new(None);
-}
-
-pub fn get_last_vectorize_stats() -> Option<VectorizeTimingStats> {
-    LAST_VECTORIZE_STATS.with(|s| s.borrow().clone())
-}
-
-impl Clone for VectorizeTimingStats {
-    fn clone(&self) -> Self {
-        Self {
-            input_validation_ns: self.input_validation_ns,
-            clean_local_envs_ns: self.clean_local_envs_ns,
-            shape_grouping_ns: self.shape_grouping_ns,
-            vectorize_groups_ns: self.vectorize_groups_ns,
-            output_validation_ns: self.output_validation_ns,
-            input_count: self.input_count,
-            output_count: self.output_count,
-            group_count: self.group_count,
-        }
-    }
-}
-
 lazy_static::lazy_static! {
     /// Program-carried patterns (the `partition_merge` annotation). Set by
     /// the harness when a run starts; never cleared, because partitioning
@@ -1702,39 +1663,32 @@ pub fn gc_states(states: Vec<State>) -> Vec<State> {
     }
 }
 
+/// Vectorize a collection of states.
+///
+/// States with the same "shape" are merged into single states with vector
+/// values. This reduces the number of states while preserving all the
+/// information.
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
-    let mut stats = VectorizeTimingStats::default();
-    stats.input_count = states.len();
-
     // GC all states before shape grouping.
     // This removes garbage from heaps, allowing states to match shapes better.
     let states: Vec<State> = gc_states(states);
 
     if states.is_empty() {
-        LAST_VECTORIZE_STATS.with(|s| *s.borrow_mut() = Some(stats));
         return states;
     }
 
-    // Diagnostic: how compressible is the whole merge, post-gc?
-    let dump_before = super::merge_dump::measure(&states, true);
-
     // Validate input states (only in debug mode)
-    let t0 = std::time::Instant::now();
     #[cfg(debug_assertions)]
     for state in &states {
         assert_state_vector_lengths(state);
     }
-    stats.input_validation_ns = t0.elapsed().as_nanos() as u64;
 
     // Clean local_envs: remove variables that don't appear in all states.
     // This allows states with different dead temporaries to merge.
-    let t1 = std::time::Instant::now();
     let states = clean_local_envs_for_merging(states);
-    stats.clean_local_envs_ns = t1.elapsed().as_nanos() as u64;
 
     // Partition on the configured cells, if any: split lane-varying states
     // per class first, then group by (shape, class) so classes never merge.
-    let t2 = std::time::Instant::now();
     let partition_cells = states
         .first()
         .map(resolve_partition_cells)
@@ -1795,8 +1749,6 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
             states_by_shape.entry(key).or_default().push(state);
         }
     }
-    stats.shape_grouping_ns = t2.elapsed().as_nanos() as u64;
-    stats.group_count = states_by_shape.len();
 
     // Vectorize each group. Each shape group is INDEPENDENT, so the merges
     // run across threads (work-stolen from a shared queue, since group sizes
@@ -1805,7 +1757,6 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     // back), so this is byte-identical to the sequential map regardless of
     // finish order (parcheck holds it). Nested fan-out is disabled: each
     // worker IS the parallelism, so the hashing inside must not fan out.
-    let t3 = std::time::Instant::now();
     let merge_one = |group: Vec<State>| -> State {
         if group.len() > 1 {
             // Merge + dedup over the virtual concatenation - never
@@ -1856,97 +1807,16 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
             out.into_iter().map(|(_, s)| s).collect()
         }
     };
-    stats.vectorize_groups_ns = t3.elapsed().as_nanos() as u64;
-    super::merge_dump::report(dump_before, &result);
-    super::merge_dump::report_structure(&result);
 
     // Validate output states (only in debug mode)
-    let t4 = std::time::Instant::now();
     #[cfg(debug_assertions)]
     for state in &result {
         assert_state_vector_lengths(state);
     }
-    stats.output_validation_ns = t4.elapsed().as_nanos() as u64;
-    stats.output_count = result.len();
 
-    LAST_VECTORIZE_STATS.with(|s| *s.borrow_mut() = Some(stats));
     result
 }
 
-/// Compute union and diff of two state sets at a `hint_normalize` block.
-///
-/// Given `accumulated` (states from previous fixed-point rounds) and
-/// `potentially_new` (states just arrived), returns the union and the
-/// states that were not already accumulated - the ones that still need to
-/// be executed onward.
-///
-/// In the current programs this is a checked pass-through, not a real
-/// dedup, because both structural facts below hold and are guarded:
-///
-///   * The arrivals come from one `vectorize_states` call, which emits
-///     exactly one state per shape group - so they are pairwise distinct
-///     by construction (checked: pairwise-distinct direct shape hashes;
-///     the arrivals are post-gc, so their shapes compare canonically).
-///   * Every hint fixed point converges in one round, so `accumulated` is
-///     empty (measured: merge_hint_normalize span count == frames x hint
-///     blocks, exactly).
-///
-/// There used to be a real dedup here, comparing states by their
-/// per-column sorted unique value sets. That is an over-approximation of
-/// state equality in the unsound direction - two states with equal value
-/// sets but different row pairings compared EQUAL and one would be
-/// silently dropped from the search, invisibly to the differential
-/// verifier (both programs shared the mechanism). It never fired (the
-/// facts above), so it was removed rather than fixed. If either guard
-/// ever fails, this panics with instructions instead of guessing:
-/// a correct dedup must compare actual lane-row sets, which is the same
-/// computation `vectorize_states`' dedup already performs - build it on
-/// that machinery, not on per-column summaries.
-pub fn union_diff_states(
-    accumulated: Vec<State>,
-    potentially_new: Vec<State>,
-) -> (Vec<State>, Vec<State>) {
-    assert!(
-        accumulated.is_empty(),
-        "a hint_normalize fixed point took a second round: union_diff_states \
-         no longer contains a state dedup (the old per-column one was unsound \
-         and never fired). Implement an exact dedup on the vectorize_states \
-         row machinery before relying on multi-round fixed points."
-    );
-    // With merge partitioning active, vectorize_states legitimately emits
-    // one state per (shape, class) - the distinctness guard must use the
-    // same key, or same-shape different-class arrivals trip it (this
-    // happened, loudly, the first time a partition key varied at a hint
-    // site). The cells are resolved PER STATE, exactly as vectorize's own
-    // grouping does: resolving from the first arrival and applying those
-    // cell ids across different shapes misclassifies - concretely, when a
-    // dead state (no player, so no partition cells resolve) arrives first,
-    // every alive state's class collapses to one constant and same-shape
-    // different-freeze arrivals trip the guard. The backward sweep's
-    // restored batch ordering exposed this; the forward pass had dodged it
-    // by arrival order alone.
-    let mut shape_classes: FxHashSet<(u64, u64)> = FxHashSet::default();
-    let all_distinct = potentially_new.iter().all(|state| {
-        let cells = resolve_partition_cells(state);
-        let class = partition_class(state, &cells).unwrap_or(u64::MAX);
-        shape_classes.insert((shape_of_state(state).cached_hash, class))
-    });
-    if !all_distinct {
-        // Same-(shape, class) arrivals DO occur since the fruit-off interval
-        // widening: a branch on a whole-value UnknownBool (an interval
-        // comparison with a straddling lane) copies ALL lanes down both
-        // arms, and when neither arm writes anything class-distinguishing
-        // before the join, both arrivals carry the same shape and class with
-        // overlapping lane sets. The exact answer is the row-level union -
-        // vectorize_states' own merge/dedup machinery - which is precisely
-        // the "exact dedup" the old panic here demanded. This never fires
-        // on interval-free rooms (the guard was a hard panic through the
-        // whole room-(1,0) campaign).
-        let merged = vectorize_states(potentially_new);
-        return (merged.clone(), merged);
-    }
-    (potentially_new.clone(), potentially_new)
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2451,294 +2321,5 @@ mod tests {
 
         assert!(virtual_merged.vector_size < 14, "dedup must remove rows");
         assert_eq!(virtual_merged, materialized);
-    }
-}
-
-// ============================================================================
-// Watermark-based Auto-Renormalization
-// ============================================================================
-
-/// Tracks vectorization watermark for automatic renormalization decisions.
-///
-/// The watermark represents the "good" state count after the last successful
-/// vectorization. When the current state count exceeds the threshold multiplier
-/// times the watermark, we should trigger renormalization.
-#[derive(Clone, Debug)]
-pub struct VectorizationWatermark {
-    /// Shape count after last successful vectorization
-    last_shape_count: usize,
-    /// Total expanded count (sum of vector_size) after last vectorization
-    last_expanded_count: usize,
-    /// Threshold multiplier - renormalize when shapes > watermark * threshold
-    threshold_multiplier: f64,
-    /// Number of times auto-renormalization was triggered
-    pub auto_renorm_count: usize,
-}
-
-impl Default for VectorizationWatermark {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl VectorizationWatermark {
-    pub fn new() -> Self {
-        Self {
-            last_shape_count: 1,
-            last_expanded_count: 1,
-            threshold_multiplier: 5.0,
-            auto_renorm_count: 0,
-        }
-    }
-
-    /// Create with a custom threshold multiplier
-    pub fn with_threshold(threshold_multiplier: f64) -> Self {
-        Self {
-            threshold_multiplier,
-            ..Self::new()
-        }
-    }
-
-    /// Check if we should auto-renormalize based on current shape count
-    pub fn should_renormalize(&self, current_shape_count: usize) -> bool {
-        let threshold = (self.last_shape_count as f64 * self.threshold_multiplier) as usize;
-        current_shape_count > threshold
-    }
-
-    /// Update watermark after successful vectorization
-    pub fn update(&mut self, new_shape_count: usize, new_expanded_count: usize) {
-        self.last_shape_count = new_shape_count.max(1);
-        self.last_expanded_count = new_expanded_count.max(1);
-    }
-
-    /// Get the current watermark values
-    pub fn watermark(&self) -> (usize, usize) {
-        (self.last_shape_count, self.last_expanded_count)
-    }
-}
-
-/// A set of states with watermark tracking for auto-renormalization.
-///
-/// This wraps a Vec<State> and tracks vectorization watermarks to decide
-/// when to automatically trigger renormalization.
-#[derive(Clone, Debug)]
-pub struct StateSet {
-    states: Vec<State>,
-    watermark: VectorizationWatermark,
-}
-
-impl StateSet {
-    /// Create a new StateSet from a vec of states
-    pub fn new(states: Vec<State>) -> Self {
-        let mut set = Self {
-            states,
-            watermark: VectorizationWatermark::new(),
-        };
-        // Initialize watermark based on initial states
-        set.watermark
-            .update(set.shape_count(), set.expanded_count());
-        set
-    }
-
-    /// Create an empty StateSet
-    pub fn empty() -> Self {
-        Self {
-            states: Vec::new(),
-            watermark: VectorizationWatermark::new(),
-        }
-    }
-
-    /// Get the number of distinct state shapes (number of State objects)
-    pub fn shape_count(&self) -> usize {
-        self.states.len()
-    }
-
-    /// Get the total expanded count (sum of vector_size across all states)
-    pub fn expanded_count(&self) -> usize {
-        self.states.iter().map(|s| s.vector_size).sum()
-    }
-
-    /// Check if we should auto-renormalize and do it if needed
-    /// Returns true if renormalization was performed
-    pub fn maybe_renormalize(&mut self) -> bool {
-        if self.states.len() <= 1 {
-            return false;
-        }
-
-        if self.watermark.should_renormalize(self.states.len()) {
-            self.force_renormalize();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Force renormalization regardless of watermark
-    pub fn force_renormalize(&mut self) {
-        if self.states.is_empty() {
-            return;
-        }
-
-        let old_count = self.states.len();
-        self.states = vectorize_states(std::mem::take(&mut self.states));
-        let new_count = self.states.len();
-
-        // Update watermark with new counts
-        self.watermark.update(new_count, self.expanded_count());
-        self.watermark.auto_renorm_count += 1;
-
-        // Log if significant reduction
-        if old_count > new_count * 2 {
-            // Could add profiling/tracing here
-        }
-    }
-
-    /// Get the underlying states (consuming self)
-    pub fn into_states(self) -> Vec<State> {
-        self.states
-    }
-
-    /// Get a reference to the underlying states
-    pub fn states(&self) -> &[State] {
-        &self.states
-    }
-
-    /// Get a mutable reference to the underlying states
-    pub fn states_mut(&mut self) -> &mut Vec<State> {
-        &mut self.states
-    }
-
-    /// Add states and maybe renormalize
-    pub fn extend(&mut self, other: Vec<State>) {
-        self.states.extend(other);
-        self.maybe_renormalize();
-    }
-
-    /// Add a single state and maybe renormalize
-    pub fn push(&mut self, state: State) {
-        self.states.push(state);
-        self.maybe_renormalize();
-    }
-
-    /// Check if empty
-    pub fn is_empty(&self) -> bool {
-        self.states.is_empty()
-    }
-
-    /// Get the number of auto-renormalizations that occurred
-    pub fn auto_renorm_count(&self) -> usize {
-        self.watermark.auto_renorm_count
-    }
-
-    /// Get the watermark reference
-    pub fn watermark(&self) -> &VectorizationWatermark {
-        &self.watermark
-    }
-
-    /// Take states out, leaving empty vec
-    pub fn take(&mut self) -> Vec<State> {
-        std::mem::take(&mut self.states)
-    }
-}
-
-impl From<Vec<State>> for StateSet {
-    fn from(states: Vec<State>) -> Self {
-        StateSet::new(states)
-    }
-}
-
-impl From<StateSet> for Vec<State> {
-    fn from(set: StateSet) -> Self {
-        set.into_states()
-    }
-}
-
-#[cfg(test)]
-mod watermark_tests {
-    use super::*;
-    use crate::interpreter::value::MaybeVector;
-    use celeste_core::pico8_num::Pico8Num;
-
-    #[test]
-    fn test_watermark_initial_values() {
-        let wm = VectorizationWatermark::new();
-        assert_eq!(wm.last_shape_count, 1);
-        assert_eq!(wm.last_expanded_count, 1);
-        assert!(!wm.should_renormalize(1));
-        assert!(!wm.should_renormalize(5));
-        assert!(wm.should_renormalize(6)); // > 1 * 5
-    }
-
-    #[test]
-    fn test_watermark_update() {
-        let mut wm = VectorizationWatermark::new();
-        wm.update(10, 100);
-        assert_eq!(wm.watermark(), (10, 100));
-        assert!(!wm.should_renormalize(50)); // <= 10 * 5
-        assert!(wm.should_renormalize(51)); // > 10 * 5
-    }
-
-    #[test]
-    fn test_state_set_basic() {
-        let state = State::new();
-        let set = StateSet::new(vec![state]);
-        assert_eq!(set.shape_count(), 1);
-        assert_eq!(set.expanded_count(), 1);
-    }
-
-    #[test]
-    fn test_state_set_auto_renormalize() {
-        // Create many states with the same shape that should merge
-        let mut states = Vec::new();
-        for i in 0..10 {
-            let mut state = State::new();
-            state.vector_size = 1;
-            let id = state.heap.alloc();
-            state.heap.set(
-                id,
-                HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(i)))),
-            );
-            state.local_env.set(
-                celeste_ir::ir::LocalId::from(0),
-                Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(i))),
-            );
-            states.push(state);
-        }
-
-        let mut set = StateSet::new(states);
-        // Initial watermark is 10 (all different shapes due to different heap values)
-        // But actually they have the same shape, so vectorize should merge them
-
-        // Force renormalize
-        set.force_renormalize();
-
-        // After vectorization, should have fewer shapes
-        // (depends on whether they have same shape)
-        assert!(set.shape_count() <= 10);
-    }
-
-    #[test]
-    fn test_state_set_threshold_trigger() {
-        // Create initial set with 1 state
-        let state = State::new();
-        let mut set = StateSet::new(vec![state]);
-        assert_eq!(set.watermark().last_shape_count, 1);
-
-        // Add states until we hit threshold (> 5 for threshold_multiplier=5)
-        for _ in 0..5 {
-            set.push(State::new());
-        }
-        // 6 states now, threshold is 5, so should have auto-renormalized
-        // But State::new() creates states with same shape, so they merge to 1
-
-        // The auto_renorm_count should have increased
-        // (unless all states merged before threshold was hit)
-    }
-
-    #[test]
-    fn test_watermark_custom_threshold() {
-        let wm = VectorizationWatermark::with_threshold(2.0);
-        assert!(!wm.should_renormalize(2)); // <= 1 * 2
-        assert!(wm.should_renormalize(3)); // > 1 * 2
     }
 }

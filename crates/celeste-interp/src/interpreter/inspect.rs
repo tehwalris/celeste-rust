@@ -363,24 +363,6 @@ impl<'a> StateHelper<'a> {
         self.state.heap.get(id)
     }
 
-    /// Load a global as an object table
-    pub fn load_global_object(&self, name: &str) -> Option<&FxHashMap<String, HeapId>> {
-        let id = self.find_global(name)?;
-        match self.load(id) {
-            HeapValue::ObjectTable(table) => Some(table),
-            _ => None,
-        }
-    }
-
-    /// Load a global as an array table
-    pub fn load_global_array(&self, name: &str) -> Option<&Vec<HeapId>> {
-        let id = self.find_global(name)?;
-        match self.load(id) {
-            HeapValue::ArrayTable(items) => Some(items),
-            _ => None,
-        }
-    }
-
     /// Get a pointer from a heap value (unwrap Value::Pointer)
     pub fn unwrap_pointer(&self, value: &HeapValue) -> Option<HeapId> {
         match value {
@@ -431,70 +413,6 @@ impl<'a> StateHelper<'a> {
     }
 }
 
-/// One-line description of the objects array (count + resolved type names),
-/// for premise-failure diagnostics.
-pub fn describe_objects(state: &State) -> String {
-    let helper = StateHelper::new(state);
-    let Some(arr_id) = helper.get_objects_array_id() else {
-        return "objects: <no array>".to_string();
-    };
-    let HeapValue::ArrayTable(items) = helper.load(arr_id) else {
-        return "objects: <not an array>".to_string();
-    };
-    let items = items.clone();
-    let mut parts: Vec<String> = Vec::new();
-    for item_ptr in &items {
-        let type_target = match helper.load(*item_ptr) {
-            HeapValue::Value(Value::Pointer(obj_id)) => match helper.load(*obj_id) {
-                HeapValue::ObjectTable(obj) => obj.get("type").and_then(|type_ptr| {
-                    match helper.load(*type_ptr) {
-                        HeapValue::Value(Value::Pointer(t)) => Some(*t),
-                        _ => None,
-                    }
-                }),
-                _ => None,
-            },
-            _ => None,
-        };
-        let name = type_target
-            .and_then(|t| {
-                state.global_env.iter().find_map(|(name, gid)| {
-                    match helper.load(*gid) {
-                        HeapValue::Value(Value::Pointer(p)) if *p == t => Some(name.clone()),
-                        _ => None,
-                    }
-                })
-            })
-            .unwrap_or_else(|| "?".to_string());
-        parts.push(name);
-    }
-    // The globals that decide which trace class a state is in - premise
-    // failures are diagnosed by exactly these (freeze/restart gates, pm1).
-    let mut globals: Vec<String> = Vec::new();
-    for name in ["freeze", "will_restart", "delay_restart", "has_dashed"] {
-        if let Some(gid) = state.global_env.get(name) {
-            // Compact: downstream prints truncate hard, so the wrapper enums
-            // are stripped for the scalar cases that matter.
-            let text = match helper.load(*gid) {
-                HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => format!("{:?}", n),
-                HeapValue::Value(Value::Bool(MaybeVector::Scalar(b))) => format!("{}", b),
-                HeapValue::Value(Value::Nil(_)) => "nil".to_string(),
-                HeapValue::Value(v) => format!("{:?}", v).chars().take(30).collect(),
-                _ => continue,
-            };
-            globals.push(format!("{}={}", name, text));
-        }
-    }
-    // Globals first: downstream prints truncate, and the class globals are
-    // the diagnosis.
-    format!(
-        "{}; objects: {} [{}]",
-        globals.join(", "),
-        items.len(),
-        parts.join(", ")
-    )
-}
-
 // ============================================================================
 // Full State Serialization (for debugging)
 // ============================================================================
@@ -502,11 +420,6 @@ pub fn describe_objects(state: &State) -> String {
 /// Dump a single state to JSON string
 pub fn state_to_json(state: &State) -> serde_json::Result<String> {
     serde_json::to_string(state)
-}
-
-/// Dump a single state to pretty JSON string
-pub fn state_to_json_pretty(state: &State) -> serde_json::Result<String> {
-    serde_json::to_string_pretty(state)
 }
 
 /// Load a state from JSON string
