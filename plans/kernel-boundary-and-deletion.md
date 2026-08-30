@@ -428,3 +428,35 @@ Remaining:
 - Step 4 (delete, after 3): Rt2::origin + append/dedup propagation,
   origin_tag_of/export_block_tagged, deopt_collect read/inject, asm_kernel
   track_origin, SWEEP_ORIGIN, sweep_time origin path.
+
+### Update 2026-08-30 (cont): sharding + backward design pinned
+
+Design decisions agreed with Philippe (the horizon-anchored minimal ladder;
+DELETE the e/g/band numbering):
+- Backward is SINGLE-PASS (H-1..1), not a distance DP. g is redundant: g =
+  H - mark-frame; band = the marked set. Delete g.bin/save_g/load_g, e+g,
+  FILTER_BAND, banded-rung plumbing.
+- Ladder: forward at rem0 -> mark backward -> forward at rem1 discarding any
+  state whose widened-to-rem0 form is not marked -> mark -> ... until full
+  precision or empty (impossible). The marked set is the cross-rem filter.
+- Backward marking needs input->output lane PROVENANCE (dedup makes it a SET:
+  one output can come from several of the 16 inputs; on a hit, mark ALL). Carry
+  it as a per-output lane BITMASK column (u16/u64), OR-ed on merge - a NARROW,
+  per-call reuse of the origin-union logic, NOT the deleted cross-frame plumbing.
+  So origin deletion is PARTIAL: delete forward/global origin; keep a per-call
+  backward lane mask.
+- Everything shards by (shape, cell): storage (done), visited (done), and the
+  marked bitmask (one bit per row-offset within each shard file).
+
+Existing code map (Philippe asked what does-this vs does-other):
+- sweep_time.rs ALREADY does the frame-walk + re-derive-successors + pos-graph
+  candidate cells (mark_dst_cell) + bitmap + position-keyed CellStore = the
+  design. KEEP the shape.
+- sweep_time.rs + sweep.rs ALSO compute/store g + e + band = the numbering.
+  DELETE. Blast radius: checkpoint.rs band loader, dispatch, asm_kernel
+  fingerprint references.
+- SWEEP_ORIGIN is the backward lane-provenance -> KEEP (re-typed to per-call
+  lane bitmask), contradicting the earlier "delete all origin".
+
+Open (proceeding on defaults, flag inline): narrowing precision (position-only,
+load all shapes at candidate cells) - Philippe to confirm.
