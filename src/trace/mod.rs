@@ -51,6 +51,7 @@
 
 pub mod refdomain;
 pub mod refdriver;
+pub mod refbridge;
 pub mod bind;
 pub mod cart;
 pub mod dispatch;

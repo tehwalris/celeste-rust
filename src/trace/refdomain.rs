@@ -113,12 +113,15 @@ fn floor_span(v: &Iv) -> u32 {
 fn floor_fragment(v: &Iv, k: u32) -> Iv {
     let base = v.low.flr().as_i16_or_err().unwrap_or(0) + k as i16;
     let frag_lo = P8::from_i16(base);
-    let frag_hi_excl = P8::from_i16(base + 1);
+    // The HIGHEST value that still floors to `base` is `base+1 - eps`, NOT
+    // `base+1` (which floors to `base+1`). Clamping to `base+1` inclusive left
+    // the fragment spanning two floors, so the subsequent `flr` refused it -
+    // exposed by the bridge gate on a fractional-speed `move` (rem widened,
+    // spd non-integer). See `floor_span`: a fragment must span exactly one.
+    let frag_hi_top = P8::from_i16(base + 1).next_smallest();
     // Clip [base, base+1) to v.
     let lo = if v.low > frag_lo { v.low } else { frag_lo };
-    // Highest value that still floors to `base`: min(v.high, base+1 - eps).
-    // Represent the fragment as a point when v is already within one floor.
-    let hi = if v.high < frag_hi_excl { v.high } else { frag_hi_excl };
+    let hi = if v.high < frag_hi_top { v.high } else { frag_hi_top };
     Iv::new(lo, hi)
 }
 

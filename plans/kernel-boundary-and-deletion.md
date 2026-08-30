@@ -228,3 +228,34 @@ So the INTERPRETER work is ~6-8k of clean deletion, not 20-30k. Reaching
 "about half" needs the OTHER two redesigns too - decide-at-the-door (which
 shrinks the 4k dedup layer) and the chunking removal. Same direction, three
 fronts; this doc is the interpreter front.
+
+## Progress log (interpreter front)
+
+Committed:
+- `refdomain.rs` - `RefDomain` (Num=interval, Bool=bool) + the DFS `Cursor`,
+  the value ops (interval arithmetic, compares fork-or-definite, unknown_bool,
+  fork_flr). Unit-tested (cursor DFS incl. path-dependent trees, interval fork).
+- `refdriver.rs` - `run_frame_all` enumerates a frame's fork tree by
+  re-execution over one shared `Interp<RefDomain>`. An ignored smoke test warms
+  the REAL cart to the player and runs a real frame end to end through
+  RefDomain (arithmetic, control flow, collision, buttons, builtins) - it
+  PASSES (~11s). So the domain handles the real game on the concrete path.
+- `verify::find_player` generalized to `<D: Domain>`.
+
+In flight:
+- `refbridge.rs` - the state bridge (checkpoint `interp::State` lane <->
+  `trace::State<RefDomain>`) + `row_key_of` (via the trusted `engine_row_keys`)
+  + the first real GATE: old interpreter vs RefDomain on an early checkpoint
+  frame, comparing output row-key SETS.
+
+Next after the gate is green on early (concrete) frames:
+- Generalize `trace/widen.rs` from `State<Symbolic>` to `<D: Domain>` so
+  RefDomain states widen (needed to gate mid/late frames, and it consolidates
+  the widening with `abstraction.rs` - a deletion).
+- A RefDomain forward loop (frontier + widen + dedup by row key), gated
+  per-frame against the kernel checkpoint rowkeys
+  (`/var/tmp/celeste-checkpoints/kfwd/room1/frames/*.rowkeys`).
+- Make RefDomain the oracle for the `differential.rs` kernel gates
+  (`asm_kernels_reproduce_the_interpreter` et al.), re-point the live
+  consumers (`run.rs`, `compiled/mod.rs`, `concrete.rs`, `native-probe`,
+  `program/mod.rs`), then delete the old CFG interpreter + IR.
