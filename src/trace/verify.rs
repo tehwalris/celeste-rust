@@ -1098,11 +1098,10 @@ mod tests {
         };
         let g = std::mem::take(&mut it.d.graph);
 
-        let mut total_lines = 0usize;
         let mut total_variants = 0usize;
         let mut refused = 0usize;
         for (key, f) in &bodies {
-            let (mut lines, mut variants) = (0usize, 0usize);
+            let mut variants = 0usize;
             // Every key was traced from the same state, so they share an
             // input shape and the binding is the same one 24 times over.
             // Doing it per body anyway is what would SAY SO if a key ever
@@ -1115,29 +1114,25 @@ mod tests {
             );
             match super::super::emit::bind(f, &g, true)
                 .and_then(|b| super::super::emit::lower_frame(
-                    &b.graph, &b.inputs, &b.uni, &b.outcomes, room.clone(), b.forks,
+                    &b.graph, &b.outcomes, room.clone(), b.forks,
                 ))
             {
                 Ok(l) => {
-                    lines = l.body.len();
-                    variants = l.variants.len();
+                    variants = l.bodies;
                 }
                 Err(_) => refused += 1,
             }
             eprintln!(
-                "[keys] {:<64} {} outcomes, {} lines, {} variants",
+                "[keys] {:<64} {} outcomes, {} bodies",
                 show_key(key),
                 f.outs.len(),
-                lines,
                 variants
             );
-            total_lines += lines;
             total_variants += variants;
         }
         eprintln!(
-            "[keys] TOTAL {} bodies, {} lines, {} variants, {} outcomes refused by the emitter",
+            "[keys] TOTAL {} keys, {} bodies, {} outcomes refused by the emitter",
             bodies.len(),
-            total_lines,
             total_variants,
             refused
         );

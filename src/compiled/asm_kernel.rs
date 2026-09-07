@@ -427,7 +427,6 @@ fn read_field_av(f: &AsmField, buf: &[u8], i: usize) -> AV {
                 i32::from_le_bytes(buf[base + 64 + i * 4..base + 64 + i * 4 + 4].try_into().unwrap());
             AV::Ival(P8::from_raw(lo), P8::from_raw(hi))
         }
-        RootKind::Word => unreachable!("an output field cannot be a Word root"),
     }
 }
 
@@ -460,7 +459,6 @@ fn push_field(acc: &mut Rt2, f: &AsmField, buf: &[u8], i: usize) {
                 v.push((P8::from_raw(lo), P8::from_raw(hi)));
             }
         }
-        RootKind::Word => panic!("an output field cannot be a Word root"),
     }
 }
 

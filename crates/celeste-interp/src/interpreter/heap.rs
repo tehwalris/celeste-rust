@@ -54,46 +54,6 @@ impl std::fmt::Debug for Heap {
     }
 }
 
-impl Serialize for Heap {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        // Serialize as a simple Vec of Option<HeapValue>
-        let values: Vec<Option<HeapValue>> = (0..self.next_id)
-            .map(|i| self.get_opt(HeapId(i)).cloned())
-            .collect();
-        values.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for Heap {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let values: Vec<Option<HeapValue>> = Vec::deserialize(deserializer)?;
-        let storage = Arc::new(FrozenVec::new());
-        let mut base_index = Vec::with_capacity(values.len());
-
-        for value_opt in &values {
-            if let Some(value) = value_opt {
-                // Use push_get_index for consistency (even though this isn't shared yet)
-                let idx = storage.push_get_index(Box::new(value.clone()));
-                base_index.push(idx);
-            } else {
-                base_index.push(usize::MAX); // Sentinel for None
-            }
-        }
-
-        Ok(Heap {
-            storage,
-            overlay: Vec::new(),
-            base_index: Arc::new(base_index),
-            next_id: values.len(),
-        })
-    }
-}
 
 impl PartialEq for Heap {
     fn eq(&self, other: &Self) -> bool {
@@ -217,27 +177,6 @@ impl Heap {
             }
         }
 
-        self.base_index = Arc::new(new_base);
-        self.overlay.clear();
-    }
-
-    pub fn map_in_place(&mut self, f: impl Fn(HeapValue) -> HeapValue) {
-        // Build new base index directly instead of updating overlay incrementally.
-        // This avoids O(n^2) behavior from repeated overlay.insert() calls.
-        let mut new_base = Vec::with_capacity(self.next_id);
-
-        for id in 0..self.next_id {
-            if let Some(value) = self.get_opt(HeapId(id)) {
-                let new_value = f(value.clone());
-                // Use push_get_index for atomic index assignment
-                let storage_idx = self.storage.push_get_index(Box::new(new_value));
-                new_base.push(storage_idx);
-            } else {
-                new_base.push(usize::MAX); // Sentinel for None
-            }
-        }
-
-        // Replace base index and clear overlay
         self.base_index = Arc::new(new_base);
         self.overlay.clear();
     }

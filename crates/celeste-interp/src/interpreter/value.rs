@@ -83,7 +83,7 @@ pub enum Value {
     /// between the instruction that computes it and that instruction's
     /// result being assigned, where `resolve_maybe_bool` turns it into a
     /// definite `Bool` by duplicating the ambiguous lanes. It must never
-    /// reach local_env, the heap, a checkpoint or a row hash.
+    /// reach the heap, a checkpoint or a row hash.
     ///
     /// The invariant is enforced rather than accommodated: the lane
     /// filters, splitters and expanders reject it loudly. A per-lane

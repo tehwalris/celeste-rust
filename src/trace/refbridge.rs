@@ -202,10 +202,6 @@ pub fn to_trace_state(
     lane: usize,
     _d: &mut RefDomain,
 ) -> Result<TState<RefDomain>> {
-    assert!(
-        old.local_env.iter().count() == 0 && old.outer_local_envs.is_empty(),
-        "to_trace_state expects a boundary state (empty local envs)"
-    );
     if lane >= old.vector_size {
         bail!("lane {} out of range (vector_size {})", lane, old.vector_size);
     }

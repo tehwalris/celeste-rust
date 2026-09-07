@@ -29,10 +29,6 @@ pub fn import_block(
     cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 ) -> Rt2 {
-    assert!(
-        state.local_env.iter().count() == 0 && state.outer_local_envs.is_empty(),
-        "boundary states must have empty local envs"
-    );
     let mut rt2 = Rt2::empty(
         state.vector_size,
         gen::GLOBAL_NAMES.len(),

@@ -1,10 +1,9 @@
 //! `transpile::graph::Graph` -> native AVX-512 GAS assembly.
 //!
-//! The row-key hashing slice: numeric arithmetic (`Add/Sub/Min/Max/Neg/
-//! Abs/Flr`) over cells and constants, `Bits` (zw_bits_n), and the `Mix`
-//! fold (`zw_mix1`/`zw_mix2`), stored as packed output columns. Every
-//! instruction is chosen to match `celeste_engine::kernel` bit-for-bit;
-//! `super::tests` proves it. See `plans/asm-backend.md`.
+//! Numeric, interval and tri-state boolean arithmetic over cells and
+//! constants, stored as packed output columns. Every instruction is chosen
+//! to match `celeste_engine::kernel` bit-for-bit; `super::tests` proves
+//! it. See `plans/asm-backend.md`.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -15,16 +14,13 @@ use crate::transpile::graph::{Graph, NodeId, Op};
 
 // ---- physical register-file partition ----
 //
-// `mix64` and the `Mix` fold are lowered to PRIMITIVE vreg instructions
-// (shift/xor/mul/add), each temporary its own allocator-managed vreg, so
-// there is no fixed scratch serializing the independent mix chains. Six
-// registers are reserved (ZERO for Neg, two reload-scratch, two remat
-// helpers, one spilled-result scratch), leaving 26 homes.
+// Every temporary is its own allocator-managed vreg. Six registers are
+// reserved (ZERO for Neg, two reload-scratch, two remat helpers, one
+// spilled-result scratch), leaving 26 homes.
 const ZERO: u8 = 31; // constant 0, for Neg
 const OPA: u8 = 30; // reload/remat scratch, operand A
 const OPB: u8 = 29; // reload/remat scratch, operand B
 const H0: u8 = 28; // remat helper (recompute a sub-operand)
-const H1: u8 = 27; // remat helper (BitsHi extract temp)
 const RES: u8 = 26; // scratch for a spilled result
 const N_ALLOC: u8 = 26; // homes zmm0..=zmm25
 
@@ -54,8 +50,6 @@ enum CallOp {
     TileFlagLanes,
 }
 
-const C1: u64 = 0xbf58_476d_1ce4_e5b9; // mix64 multiplier 1
-const C2: u64 = 0x94d0_49bb_1331_11eb; // mix64 multiplier 2
 const FLR_MASK: i32 = 0xffff_0000u32 as i32;
 const ONE_FIXED: i32 = 0x0001_0000; // P8::from_i16(1) raw
 
@@ -66,13 +60,6 @@ type Vreg = u32;
 enum NumVal {
     Reg(Vreg),
     ConstI32(i32),
-}
-
-/// One half of a word (ZW) node value.
-#[derive(Clone, Copy)]
-enum WordHalf {
-    Reg(Vreg),
-    ConstU64(u64),
 }
 
 /// One plane of a tri-state boolean (`ZB`): a per-lane VECTOR mask (each
@@ -92,7 +79,6 @@ enum Value {
     Bool([MaskVal; 2]),
     /// `[lo, hi]` interval planes.
     Ival([NumVal; 2]),
-    Word([WordHalf; 2]),
 }
 
 /// A source operand for an emitted instruction.
@@ -100,7 +86,6 @@ enum Value {
 enum Src {
     Reg(Vreg),
     BI32(i32),
-    BU64(u64),
 }
 
 #[derive(Clone, Copy)]
@@ -116,27 +101,17 @@ enum ROp {
     AndnD,
 }
 
-/// 64-bit lane binary ops (the row-key word layer).
-#[derive(Clone, Copy)]
-enum QOp {
-    AddQ,
-    XorQ,
-    MullQ,
-}
-
 /// A source operand's value identity, for GVN.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum SrcKey {
     Reg(Vreg),
     I32(i32),
-    U64(u64),
 }
 impl Src {
     fn key(self) -> SrcKey {
         match self {
             Src::Reg(v) => SrcKey::Reg(v),
             Src::BI32(c) => SrcKey::I32(c),
-            Src::BU64(c) => SrcKey::U64(c),
         }
     }
 }
@@ -144,9 +119,8 @@ impl Src {
 /// A pure instruction's value identity: its op and operand identities,
 /// excluding the destination vreg. Two insts with equal keys compute the
 /// same value, so the second reuses the first's vreg (global value
-/// numbering). This is what dedups the inner `mix64(bit^c)` shared by every
-/// row - the CSE that closes most of the gap to LLVM. Commutative ops sort
-/// their register operands so `a^b` and `b^a` share.
+/// numbering). Commutative ops sort their register operands so `a+b` and
+/// `b+a` share.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Key {
     Load(u32),
@@ -155,26 +129,12 @@ enum Key {
     RBin(u8, Vreg, SrcKey),
     Neg(Vreg),
     Abs(Vreg),
-    BitsLo(Vreg),
-    BitsHi(Vreg),
-    Srlq(Vreg, u8),
-    QBin(u8, SrcKey, SrcKey),
     Muldq(Vreg, Vreg),
     Sraq(Vreg, u8),
     Sllq(Vreg, u8),
     BlendImm(u16, Vreg, Vreg),
     Cmp(u8, Vreg, SrcKey),
     Ternlog(Vreg, Vreg, Vreg, u8),
-}
-
-/// A total order on operand keys so commutative ops canonicalize. Registers
-/// sort before constants, which keeps a register as the first operand.
-fn key_ord(k: SrcKey) -> (u8, i64) {
-    match k {
-        SrcKey::Reg(v) => (0, v as i64),
-        SrcKey::I32(c) => (1, c as i64),
-        SrcKey::U64(c) => (2, c as i64),
-    }
 }
 
 /// The SSA instruction stream, over vregs. Each writes exactly one vreg
@@ -190,12 +150,6 @@ enum Inst {
     RBin { dst: Vreg, op: ROp, a: Vreg, b: Src },
     Neg { dst: Vreg, a: Vreg },
     Abs { dst: Vreg, a: Vreg },
-    BitsLo { dst: Vreg, src: Vreg },
-    BitsHi { dst: Vreg, src: Vreg },
-    /// 64-bit right shift by a compile-time immediate (`vpsrlq`).
-    Srlq { dst: Vreg, a: Vreg, imm: u8 },
-    /// 64-bit lane binary op; `b` may be a broadcast constant.
-    QBin { dst: Vreg, op: QOp, a: Vreg, b: Src },
     /// Signed 32x32 -> 64 multiply of the EVEN lanes (`vpmuldq`).
     Muldq { dst: Vreg, a: Vreg, b: Vreg },
     /// Arithmetic 64-bit right shift by an immediate (`vpsraq`).
@@ -227,7 +181,6 @@ pub enum RootKind {
     Num,
     Bool,
     Ival,
-    Word,
 }
 
 /// How an `Op::Cell` INPUT column is packed in the input buffer, so the
@@ -288,17 +241,9 @@ pub struct Compiled {
 
 #[derive(Default)]
 struct Pool {
-    q: Vec<u64>,
     d: Vec<i32>,
 }
 impl Pool {
-    fn q(&mut self, v: u64) -> String {
-        let i = self.q.iter().position(|x| *x == v).unwrap_or_else(|| {
-            self.q.push(v);
-            self.q.len() - 1
-        });
-        format!(".LCq{i}")
-    }
     fn d(&mut self, v: i32) -> String {
         let i = self.d.iter().position(|x| *x == v).unwrap_or_else(|| {
             self.d.push(v);
@@ -320,8 +265,7 @@ struct Lower<'a> {
     /// Per-cell input repr (absent = `Num`); decides how `Op::Cell` loads.
     cell_reprs: &'a HashMap<u32, CellRepr>,
     /// Global value numbering: a pure op's `Key` -> the vreg that already
-    /// holds its result. This is the CSE that shares the inner `mix64`
-    /// across rows.
+    /// holds its result.
     memo: HashMap<Key, Vreg>,
 }
 
@@ -345,28 +289,6 @@ impl<'a> Lower<'a> {
         d
     }
 
-    /// A commutative 64-bit binary op with GVN-canonical operand order.
-    fn qbin_comm(&mut self, op: QOp, tag: u8, x: Src, y: Src) -> Vreg {
-        // Sort the two operand keys so `a op b` and `b op a` share.
-        let (mut ka, mut kb) = (x.key(), y.key());
-        let (mut a, mut b) = (x, y);
-        if key_ord(kb) < key_ord(ka) {
-            std::mem::swap(&mut a, &mut b);
-            std::mem::swap(&mut ka, &mut kb);
-        }
-        // The destination form needs `a` to be a register (broadcast is only
-        // valid on the memory operand `b`). If after sorting `a` is a
-        // constant, both are constants (impossible here) or swap back.
-        let (areg, bsrc) = match a {
-            Src::Reg(v) => (v, b),
-            _ => match b {
-                Src::Reg(v) => (v, a),
-                _ => unreachable!("qbin over two constants"),
-            },
-        };
-        self.pure(Key::QBin(tag, ka, kb), move |d| Inst::QBin { dst: d, op, a: areg, b: bsrc })
-    }
-
     /// A numeric value as a register operand, materializing a constant.
     fn num_reg(&mut self, nv: NumVal) -> Vreg {
         match nv {
@@ -380,32 +302,6 @@ impl<'a> Lower<'a> {
             NumVal::ConstI32(c) => Src::BI32(c),
         }
     }
-    fn word_src(&mut self, wh: WordHalf) -> Src {
-        match wh {
-            WordHalf::Reg(v) => Src::Reg(v),
-            WordHalf::ConstU64(c) => Src::BU64(c),
-        }
-    }
-
-    /// Emit `mix64_v(x)` as a chain of per-value vreg instructions and
-    /// return the result vreg. Every temporary is a fresh vreg, so the
-    /// allocator (not a fixed scratch reg) places them and independent
-    /// mix chains do not alias.
-    fn mix64(&mut self, x: Vreg) -> Vreg {
-        let t1 = self.srlq(x, 30);
-        let t2 = self.qbin(QOp::XorQ, x, Src::Reg(t1));
-        let t3 = self.qbin(QOp::MullQ, t2, Src::BU64(C1));
-        let t4 = self.srlq(t3, 27);
-        let t5 = self.qbin(QOp::XorQ, t3, Src::Reg(t4));
-        let t6 = self.qbin(QOp::MullQ, t5, Src::BU64(C2));
-        let t7 = self.srlq(t6, 31);
-        self.qbin(QOp::XorQ, t6, Src::Reg(t7))
-    }
-
-    fn srlq(&mut self, a: Vreg, imm: u8) -> Vreg {
-        self.pure(Key::Srlq(a, imm), move |d| Inst::Srlq { dst: d, a, imm })
-    }
-
     fn muldq(&mut self, a: Vreg, b: Vreg) -> Vreg {
         // vpmuldq is commutative in its two source lanes.
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
@@ -615,38 +511,6 @@ impl<'a> Lower<'a> {
         [t, known]
     }
 
-    /// `zw_bits_n`: zero-extend an i32 column to the two u64 ZW halves.
-    fn bits_n(&mut self, v: Vreg) -> [Vreg; 2] {
-        let lo = self.pure(Key::BitsLo(v), move |d| Inst::BitsLo { dst: d, src: v });
-        let hi = self.pure(Key::BitsHi(v), move |d| Inst::BitsHi { dst: d, src: v });
-        [lo, hi]
-    }
-    /// One `zw_bits_i` ZW half: `(lo_half << 32) | hi_half`.
-    fn pack_i(&mut self, lo_half: Vreg, hi_half: Vreg) -> Vreg {
-        let shifted = self.sllq(lo_half, 32);
-        self.dbin(ROp::OrD, shifted, hi_half)
-    }
-    /// `zw_bits_b`: `(val&1) | ((known&1)<<1)` per lane, as the two ZW halves.
-    fn bits_b(&mut self, val: Vreg, known: Vreg) -> (Vreg, Vreg) {
-        let vbit = self.dbin_c(ROp::AndD, val, 1);
-        let kbit = self.dbin_c(ROp::AndD, known, 1);
-        let kshift = self.dbin(ROp::AddD, kbit, kbit); // kbit << 1
-        let comb = self.dbin(ROp::OrD, vbit, kshift);
-        let h = self.bits_n(comb);
-        (h[0], h[1])
-    }
-
-    /// `a op b` on words (all three word ops are commutative), memoized and
-    /// operand-order-canonical so equal values share a vreg.
-    fn qbin(&mut self, op: QOp, a: Vreg, b: Src) -> Vreg {
-        let tag = match op {
-            QOp::AddQ => 0,
-            QOp::XorQ => 1,
-            QOp::MullQ => 2,
-        };
-        self.qbin_comm(op, tag, Src::Reg(a), b)
-    }
-
     /// The raw value of `id` if it is a positive constant scalar (a
     /// degenerate `Op::Const(v, v)` with `v > 0`) - the only scalar an
     /// interval scale/divide is monotone by. Used to gate the interval
@@ -694,14 +558,7 @@ impl<'a> Lower<'a> {
             Some(Value::Num(_)) => 0,
             Some(Value::Bool(_)) => 1,
             Some(Value::Ival(_)) => 2,
-            Some(Value::Word(_)) => 3,
             None => 0,
-        }
-    }
-    fn as_word(&self, id: NodeId) -> Result<[WordHalf; 2]> {
-        match self.vals[id as usize] {
-            Some(Value::Word(w)) => Ok(w),
-            _ => bail!("node {} is not a word value where one was needed", id),
         }
     }
 
@@ -744,7 +601,6 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            Op::Word(w) => Value::Word([WordHalf::ConstU64(*w), WordHalf::ConstU64(*w)]),
             op @ (Op::Add | Op::Sub | Op::Min | Op::Max) => {
                 if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
                     let (ia, ib) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
@@ -873,68 +729,6 @@ impl<'a> Lower<'a> {
                 let iv = self.as_ival(a[0])?;
                 let lo = self.num_reg(iv[0]);
                 Value::Num(NumVal::Reg(self.flr(lo)))
-            }
-            Op::Bits => match self.dom(a[0]) {
-                2 => {
-                    // zw_bits_i: pack (lo << 32) | hi per lane, on each ZW half.
-                    let iv = self.as_ival(a[0])?;
-                    let ar = self.ival_regs(iv);
-                    let lo = self.bits_n(ar[0]);
-                    let hi = self.bits_n(ar[1]);
-                    let h0 = self.pack_i(lo[0], hi[0]);
-                    let h1 = self.pack_i(lo[1], hi[1]);
-                    Value::Word([WordHalf::Reg(h0), WordHalf::Reg(h1)])
-                }
-                1 => {
-                    // zw_bits_b: (val bit) | (known bit << 1) per lane.
-                    let b = self.as_bool(a[0])?;
-                    let (v, k) = (self.mask_reg(b[0]), self.mask_reg(b[1]));
-                    let (h0, h1) = self.bits_b(v, k);
-                    Value::Word([WordHalf::Reg(h0), WordHalf::Reg(h1)])
-                }
-                _ => {
-                    let n = self.as_num(a[0])?;
-                    let src = self.num_reg(n);
-                    let lo = self.pure(Key::BitsLo(src), move |d| Inst::BitsLo { dst: d, src });
-                    let hi = self.pure(Key::BitsHi(src), move |d| Inst::BitsHi { dst: d, src });
-                    Value::Word([WordHalf::Reg(lo), WordHalf::Reg(hi)])
-                }
-            }
-            Op::Mix(c, half) => {
-                let h = self.as_word(a[0])?;
-                let v = self.as_word(a[1])?;
-                let c = *c as u64;
-                let mut out = [WordHalf::ConstU64(0); 2];
-                for i in 0..2 {
-                    let vreg = match v[i] {
-                        WordHalf::Reg(r) => r,
-                        WordHalf::ConstU64(_) => {
-                            bail!("node {}: Mix value operand half {} is a constant, unsupported", id, i)
-                        }
-                    };
-                    // Combine `h` (register or broadcast constant) with `x`.
-                    let combine = |lo: &mut Self, op: QOp, hh: WordHalf, x: Vreg| -> Vreg {
-                        match hh {
-                            WordHalf::Reg(hr) => lo.qbin(op, hr, Src::Reg(x)),
-                            WordHalf::ConstU64(hc) => lo.qbin(op, x, Src::BU64(hc)),
-                        }
-                    };
-                    let dst = if *half == 0 {
-                        // zw_mix1: mix64(h ^ mix64(v ^ c))
-                        let a0 = self.qbin(QOp::XorQ, vreg, Src::BU64(c));
-                        let inner = self.mix64(a0);
-                        let d = combine(self, QOp::XorQ, h[i], inner);
-                        self.mix64(d)
-                    } else {
-                        // zw_mix2: h + mix64(v * ((c<<1)|1))
-                        let k = (c << 1) | 1;
-                        let a0 = self.qbin(QOp::MullQ, vreg, Src::BU64(k));
-                        let inner = self.mix64(a0);
-                        combine(self, QOp::AddQ, h[i], inner)
-                    };
-                    out[i] = WordHalf::Reg(dst);
-                }
-                Value::Word(out)
             }
             Op::ConstBool(b) => Value::Bool([MaskVal::Const(*b), MaskVal::Const(true)]),
             op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
@@ -1268,12 +1062,6 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
             push_src(b, out);
         }
         Inst::Neg { a, .. } | Inst::Abs { a, .. } => out.push(*a),
-        Inst::BitsLo { src, .. } | Inst::BitsHi { src, .. } => out.push(*src),
-        Inst::Srlq { a, .. } => out.push(*a),
-        Inst::QBin { a, b, .. } => {
-            out.push(*a);
-            push_src(b, out);
-        }
         Inst::Muldq { a, b, .. } | Inst::BlendImm { a, b, .. } => {
             out.push(*a);
             out.push(*b);
@@ -1414,10 +1202,6 @@ fn inst_def(inst: &Inst) -> Option<Vreg> {
         | Inst::RBin { dst, .. }
         | Inst::Neg { dst, .. }
         | Inst::Abs { dst, .. }
-        | Inst::BitsLo { dst, .. }
-        | Inst::BitsHi { dst, .. }
-        | Inst::Srlq { dst, .. }
-        | Inst::QBin { dst, .. }
         | Inst::Muldq { dst, .. }
         | Inst::Sraq { dst, .. }
         | Inst::Sllq { dst, .. }
@@ -1567,17 +1351,6 @@ impl<'a> Emitter<'a> {
             Inst::Load { off, .. } => {
                 writeln!(self.out, "    vmovdqu64 {}(%r13), %zmm{}", off, dst).unwrap();
             }
-            Inst::BitsLo { src, .. } => {
-                let src = *src;
-                self.rematerialize(src, H0);
-                writeln!(self.out, "    vpmovzxdq %ymm{}, %zmm{}", H0, dst).unwrap();
-            }
-            Inst::BitsHi { src, .. } => {
-                let src = *src;
-                self.rematerialize(src, H0);
-                writeln!(self.out, "    vextracti64x4 $1, %zmm{}, %ymm{}", H0, H1).unwrap();
-                writeln!(self.out, "    vpmovzxdq %ymm{}, %zmm{}", H1, dst).unwrap();
-            }
             other => {
                 unreachable!("non-rematerializable def marked remat: {:?}", std::mem::discriminant(other))
             }
@@ -1610,17 +1383,12 @@ impl<'a> Emitter<'a> {
 
     /// A `Src` rendered as an instruction operand (register or broadcast
     /// memory), given the broadcast width in lanes (16 for d, 8 for q).
-    fn src_operand(&mut self, s: Src, scratch: u8, wide16: bool) -> String {
+    fn src_operand(&mut self, s: Src, scratch: u8) -> String {
         match s {
             Src::Reg(v) => format!("%zmm{}", self.use_reg(v, scratch)),
             Src::BI32(c) => {
                 let l = self.pool.d(c);
                 format!("{l}(%rip){{1to16}}")
-            }
-            Src::BU64(c) => {
-                let l = self.pool.q(c);
-                let dec = if wide16 { "1to16" } else { "1to8" };
-                format!("{l}(%rip){{{dec}}}")
             }
         }
     }
@@ -1655,7 +1423,7 @@ impl<'a> Emitter<'a> {
             }
             Inst::RBin { dst, op, a, b } => {
                 let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB, true);
+                let bop = self.src_operand(*b, OPB);
                 let d = self.def_reg(*dst);
                 let mn = match op {
                     ROp::AddD => "vpaddd",
@@ -1681,44 +1449,6 @@ impl<'a> Emitter<'a> {
                 let ra = self.use_reg(*a, OPA);
                 let d = self.def_reg(*dst);
                 writeln!(self.out, "    vpabsd %zmm{}, %zmm{}", ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::BitsLo { dst, src } => {
-                if self.skip_def(*dst) {
-                    return;
-                }
-                let rs = self.use_reg(*src, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpmovzxdq %ymm{}, %zmm{}", rs, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::BitsHi { dst, src } => {
-                if self.skip_def(*dst) {
-                    return;
-                }
-                let rs = self.use_reg(*src, OPA);
-                let d = self.def_reg(*dst);
-                // Extract the high 256 bits into OPB's ymm as a temporary.
-                writeln!(self.out, "    vextracti64x4 $1, %zmm{}, %ymm{}", rs, OPB).unwrap();
-                writeln!(self.out, "    vpmovzxdq %ymm{}, %zmm{}", OPB, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::Srlq { dst, a, imm } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpsrlq ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::QBin { dst, op, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB, false);
-                let d = self.def_reg(*dst);
-                let mn = match op {
-                    QOp::AddQ => "vpaddq",
-                    QOp::XorQ => "vpxorq",
-                    QOp::MullQ => "vpmullq",
-                };
-                writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
                 self.store_def(*dst, d);
             }
             Inst::Muldq { dst, a, b } => {
@@ -1753,7 +1483,7 @@ impl<'a> Emitter<'a> {
             }
             Inst::Cmp { dst, imm, a, b } => {
                 let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB, true);
+                let bop = self.src_operand(*b, OPB);
                 let d = self.def_reg(*dst);
                 // k1 = (a CMP b); expand mask to a per-lane vector mask.
                 writeln!(self.out, "    vpcmpd ${}, {}, %zmm{}, %k1", imm, bop, ra).unwrap();
@@ -1868,11 +1598,6 @@ impl<'a> Emitter<'a> {
                         writeln!(self.out, "    vpbroadcastd {}(%rip), %zmm{}", l, OPA).unwrap();
                         OPA
                     }
-                    Src::BU64(c) => {
-                        let l = self.pool.q(*c);
-                        writeln!(self.out, "    vpbroadcastq {}(%rip), %zmm{}", l, OPA).unwrap();
-                        OPA
-                    }
                 };
                 writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%r14)", r, off).unwrap();
             }
@@ -1948,13 +1673,6 @@ pub fn compile(
     for (ri, r) in roots.iter().enumerate() {
         let base = ri as u32 * 128;
         let kind = match lo.vals[*r as usize] {
-            Some(Value::Word(w)) => {
-                for half in 0..2 {
-                    let src = lo.word_src(w[half]);
-                    lo.insts.push(Inst::Store { off: base + half as u32 * 64, src });
-                }
-                RootKind::Word
-            }
             Some(Value::Num(n)) => {
                 let src = lo.num_src(n);
                 lo.insts.push(Inst::Store { off: base, src });
@@ -1994,15 +1712,8 @@ pub fn compile(
     for (i, inst) in lo.insts.iter().enumerate() {
         if let Some(d) = inst_def(inst) {
             def_of[d as usize] = i as u32;
-            // A load is rematerializable (reads `%rdi`). Bits-of-a-load is
-            // too, but Bits-of-arithmetic is NOT - its source is neither a
-            // load nor kept live at the remat point. Transitive, and insts
-            // are in emission order so the source's flag is already set.
-            remat[d as usize] = match inst {
-                Inst::Load { .. } => true,
-                Inst::BitsLo { src, .. } | Inst::BitsHi { src, .. } => remat[*src as usize],
-                _ => false,
-            };
+            // A load is rematerializable (reads `%rdi`); nothing else is.
+            remat[d as usize] = matches!(inst, Inst::Load { .. });
         }
     }
 
@@ -2067,9 +1778,6 @@ pub fn compile(
     // Constant pool.
     writeln!(asm, ".section .rodata").unwrap();
     writeln!(asm, ".align 64").unwrap();
-    for (i, v) in em.pool.q.iter().enumerate() {
-        writeln!(asm, ".LCq{i}: .quad {}", v).unwrap();
-    }
     for (i, v) in em.pool.d.iter().enumerate() {
         writeln!(asm, ".LCd{i}: .long {}", *v as u32).unwrap();
     }

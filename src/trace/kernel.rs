@@ -1,25 +1,15 @@
 //! The traced-frame KERNEL pipeline's front half: trace a room's shapes,
-//! bind and lower each one, and hand the result on.
+//! bind and lower each one, and hand the result to the ASM backend
+//! (`compiled::asm_kernel`, which retraces at startup and consumes
+//! `lattice_kernel_refs` through `trace::emit::asm_fused`).
 //!
-//! The back half used to be here too - `render`, which assembled a
-//! lowered frame into the checked-in per-room Rust kernel crates, plus
-//! the `write_room_kernels*`/`merge_kernel_sets` file plumbing around
-//! it. That whole emitter went with the generated crates (2026-08-29,
-//! plans/asm-and-posgraph-execution.md B): the runtime backend is now
-//! `compiled::asm_kernel`, which retraces at startup and consumes the
-//! SAME `lattice_kernel_refs` output this module still produces, via
-//! `trace::emit::asm_fused` instead of rendered Rust source.
-//!
-//! What remains: `Reference` (one traced frame, everything owned),
-//! `reference_frame`/`room_kernels_in` (trace and lower the start
-//! room's shapes), `input_block`, `room_constant_lattice` (the
-//! per-shape constant fixpoint the specialization bakes in), and the
+//! `Reference` (one traced frame, everything owned), `room_kernels_in`
+//! (trace and lower the start room's shapes), `room_constant_lattice`
+//! (the per-shape constant fixpoint the specialization bakes in), and the
 //! analysis probes (`specialize_probe`, `room_constants`) behind
 //! `bin/transpile`.
 
 use anyhow::Result;
-
-
 
 use super::emit::{Bound, Lowered};
 use super::verify::Frame;
@@ -109,8 +99,6 @@ pub(crate) fn lattice_kernel_refs(
             .map_err(|e| anyhow::anyhow!("lattice shape {} bind: {:#}", i, e))?;
         let lowered = super::emit::lower_frame(
             &bound.graph,
-            &bound.inputs,
-            &bound.uni,
             &bound.outcomes,
             Some(room.clone()),
             bound.forks,
@@ -734,11 +722,11 @@ pub fn room_constants(root: &std::path::Path) -> Result<String> {
         room_constant_lattice(root, super::shapes::WalkOpts::LEVEL0)?;
     let room = crate::transpile::graph::Room { cart: cart.clone(), cache: cache.clone() };
     // Bind+lower each converged frame to get the emitted size.
-    let mut lines_by_shape: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut bodies_by_shape: std::collections::BTreeMap<String, usize> = Default::default();
     for (k, f) in frames.iter_mut() {
         if let Ok(bound) = super::emit::bind(f, &graph, true) {
-            if let Ok(low) = super::emit::lower_frame(&bound.graph, &bound.inputs, &bound.uni, &bound.outcomes, Some(room.clone()), bound.forks) {
-                lines_by_shape.insert(k.clone(), low.body.len());
+            if let Ok(low) = super::emit::lower_frame(&bound.graph, &bound.outcomes, Some(room.clone()), bound.forks) {
+                bodies_by_shape.insert(k.clone(), low.bodies);
             }
         }
     }
@@ -747,13 +735,13 @@ pub fn room_constants(root: &std::path::Path) -> Result<String> {
     for (i, (k, cm)) in lattice.iter().enumerate() {
         let spd: Vec<String> = cm.keys().map(super::iface::show)
             .filter(|s| s.contains("objects[") && s.contains(".spd")).collect();
-        out.push_str(&format!("shape {}: {} const fields, {} forks, {} body lines\n",
-            i, cm.len(), forks.get(k).copied().unwrap_or(999), lines_by_shape.get(k).copied().unwrap_or(0)));
+        out.push_str(&format!("shape {}: {} const fields, {} forks, {} bodies\n",
+            i, cm.len(), forks.get(k).copied().unwrap_or(999), bodies_by_shape.get(k).copied().unwrap_or(0)));
         if let Some(ops) = forkops.get(k) {
             for o in ops.iter().take(4) { out.push_str(&format!("    fork: {}\n", o)); }
         }
         let _ = spd;
     }
-    out.push_str(&format!("total body lines (lattice): {}\n", lines_by_shape.values().sum::<usize>()));
+    out.push_str(&format!("total bodies (lattice): {}\n", bodies_by_shape.values().sum::<usize>()));
     Ok(out)
 }

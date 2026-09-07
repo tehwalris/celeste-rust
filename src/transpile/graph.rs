@@ -278,40 +278,6 @@ pub enum Op {
     Mget,
     TileFlagAt,
 
-    // ---- row key ----
-    //
-    // The one part of the graph that is not an abstract game value.
-    // These read the REPRESENTATION of a value and produce machine
-    // words; nothing feeds back the other way, so the value layer stays
-    // exactly what the interpreter can be checked against.
-    //
-    // They are here rather than in a scalar loop inside `append` because
-    // the fold is over CELLS - each step needs the last - while the
-    // parallelism lives across LANES, and a graph node is already 16
-    // lanes wide. Hash-consing then shares the whole prefix of the fold
-    // over the cells that do not depend on the buttons, which is the
-    // other half of the win. See `plans/successors.md`.
-    /// A machine-word literal: the fold's seed.
-    Word(u64),
-    /// The representation BITS of one value, as a machine word per lane.
-    /// Not a hash - just the bit pattern, packed so that two abstract
-    /// values which differ differ here too.
-    Bits,
-    /// `Mix(cell, half)(acc, bits)` - one step of the fold. `half` picks
-    /// which of the two accumulators (and so which mixing) this is; the
-    /// pair of them is the 128-bit key. `cell` goes into the mixing, so
-    /// the key is not invariant under moving a value between fields.
-    Mix(u32, u8),
-    /// `CellMix(cell, half)(value)` - one cell's ADDITIVE contribution to
-    /// the SOUND (full boundary) row key: `cell_mix(cell, value, seed[half])`
-    /// (see `celeste_engine::kernel::zw_cellmix_*`). Unlike `Mix`, this reads
-    /// the VALUE directly (not `Bits`) and is order-independent, because the
-    /// boundary key is a commutative SUM of these. The per-outcome constant
-    /// prefix (shape hash + the uniform cells) is added, and the closing
-    /// `mix64`, in the generated `append` - see `trace::kernel::render`.
-    CellMix(u32, u8),
-    /// `AddW(a, b)` - 64-bit wrapping add, the row-key sum's accumulate step.
-    AddW,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -987,15 +953,6 @@ impl Graph {
                 }
                 Op::Mget | Op::TileFlagAt => {
                     bail!("{:?} needs the cart; not supported by the pure evaluator yet", node.op)
-                }
-                // The row-key layer has no abstract value: it reads the
-                // REPRESENTATION of one, and `Val` is the value. Nothing
-                // asks - the fold is built after `ival::fold` has run,
-                // which is the only caller - and if something ever does,
-                // the honest answer is that this evaluator is the wrong
-                // tool rather than that the answer is top.
-                Op::Word(_) | Op::Bits | Op::Mix(..) | Op::CellMix(..) | Op::AddW => {
-                    bail!("node {}: {:?} is a row-key node, not an abstract value", i, node.op)
                 }
                 })
             })();

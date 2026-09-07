@@ -23,22 +23,16 @@
 use anyhow::Result;
 
 use crate::transpile::graph::{Graph, NodeId};
-use crate::transpile::kernel::{Emit, Line, OutField, OutFields};
+use crate::transpile::kernel::{Emit, OutField, OutFields};
 
-/// What a traced frame hands the emitter.
+/// What a lowered frame hands the kernel builder.
 pub struct Lowered {
-    pub body: Vec<Line>,
-    /// One entry per DISTINCT button assignment, each carrying its
-    /// result for every outcome. Nothing renders these to Rust any more;
-    /// the `every_reachable_pm1_key_gets_its_own_body` test still reads
-    /// them to size a lowering - which is a cfg(test) read, hence the
-    /// scoped allow.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) variants: Vec<crate::transpile::lower::Variant>,
-    /// One per output shape, with `expr` and `tainted` filled in by
-    /// `emit_body`: `tainted` cells differ between variants and live in
-    /// the per-variant struct, the rest are computed once.
+    /// One per output shape, with each field's `konst_av` filled in by
+    /// `lower::lower_outcomes`.
     pub(crate) outs: Vec<OutFields>,
+    /// Number of distinct (outcome, roots) bodies the fused graph has - a
+    /// size measure for the probes.
+    pub bodies: usize,
 }
 
 /// A node's subtree, to a bounded depth, as text. For DIAGNOSTICS: the
@@ -262,11 +256,9 @@ pub struct AsmBody {
 ///
 /// `lower::specialize_frame` resolves every (button, fork) configuration
 /// into ONE shared, hash-consed graph - `Free` -> constant, `Split` ->
-/// `Frag` - so the result holds only ordinary ops the codegen lowers, and
-/// it is the SAME compute the Rust kernel emits (both call
-/// `specialize_frame`). The h1/h2 row-key fold is NOT included: the ASM
-/// path recomputes the key in Rust from the output cells
-/// (`Rt2::row_keys_canonical`, whose seeds match the kernel's).
+/// `Frag` - so the result holds only ordinary ops the codegen lowers. The
+/// row key is not in the graph: the ASM path computes it in Rust from the
+/// output cells (`Rt2::boundary`, the one definition of the key).
 ///
 /// `flat_roots` is every body's roots concatenated (what `compile` wants);
 /// `bodies` keeps the per-body structure the append step needs.
@@ -311,8 +303,6 @@ pub fn asm_fused(
 /// the emitter binds a node once.
 pub fn lower_frame(
     graph: &Graph,
-    inputs: &[(u32, &'static str)],
-    uni: &[(u32, &'static str)],
     outcomes: &[FrameOutcome],
     room: Option<crate::transpile::graph::Room>,
     forks: u8,
@@ -320,15 +310,6 @@ pub fn lower_frame(
     let mut e = Emit::bare(graph.clone());
     e.room = room;
     e.fork_depth = forks as usize;
-    for (cell, kind) in inputs {
-        e.vary_in.insert(*cell, *kind);
-    }
-    // Block-uniform inputs. The emitter needs the distinction: some
-    // primitives take a uniform `P8` and refuse a per-lane `ZN`, since
-    // narrowing is always a derivation bug.
-    for (cell, kind) in uni {
-        e.uni.insert(*cell, *kind);
-    }
     let mut outs: Vec<crate::transpile::lower::Outcome> = outcomes
         .iter()
         .map(|o| crate::transpile::lower::Outcome {
@@ -339,10 +320,7 @@ pub fn lower_frame(
                     .map(|(cell, node, ty)| OutField {
                         cell: *cell,
                         ty,
-                        expr: String::new(),
-                        tainted: false,
                         node: *node,
-                        konst: None,
                         konst_av: None,
                         // Boundary-widened-to-uniform cells (rem, timers): the
                         // key emitter excludes them from the per-lane fold.
@@ -358,10 +336,6 @@ pub fn lower_frame(
             live: o.live,
         })
         .collect();
-    crate::transpile::lower::emit_body(&mut e, &mut outs)?;
-    Ok(Lowered {
-        body: e.body,
-        variants: e.variants,
-        outs: outs.into_iter().map(|o| o.of).collect(),
-    })
+    let bodies = crate::transpile::lower::lower_outcomes(&e, &mut outs);
+    Ok(Lowered { outs: outs.into_iter().map(|o| o.of).collect(), bodies })
 }

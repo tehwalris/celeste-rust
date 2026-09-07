@@ -1,11 +1,9 @@
 use std::hash::BuildHasherDefault;
 
 use rustc_hash::FxHasher;
-use serde::{Deserialize, Serialize};
 
 use super::{
     heap::{Heap, HeapId},
-    local_env::LocalEnv,
     value::{HeapValue, Value},
 };
 
@@ -52,75 +50,10 @@ pub const FILTER_STRADDLE: FilterReason = "filter_straddle";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub heap: Heap,
-    pub local_env: LocalEnv,
-    pub outer_local_envs: Vec<LocalEnv>,
     pub global_env: ImOrdMap<String, HeapId>,
     pub prints: Vec<String>,
     /// Length of stored vectors (changes when vectors are filtered by branching or GC)
     pub vector_size: usize,
-}
-
-impl Serialize for State {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        // Create a serializable representation
-        #[derive(Serialize)]
-        struct StateSerialize<'a> {
-            heap: &'a Heap,
-            local_env: &'a LocalEnv,
-            outer_local_envs: &'a Vec<LocalEnv>,
-            global_env: Vec<(String, HeapId)>,
-            prints: &'a Vec<String>,
-            vector_size: usize,
-        }
-
-        let global_env: Vec<(String, HeapId)> = self.global_env.iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-
-        StateSerialize {
-            heap: &self.heap,
-            local_env: &self.local_env,
-            outer_local_envs: &self.outer_local_envs,
-            global_env,
-            prints: &self.prints,
-            vector_size: self.vector_size,
-        }.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for State {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct StateDeserialize {
-            heap: Heap,
-            local_env: LocalEnv,
-            outer_local_envs: Vec<LocalEnv>,
-            global_env: Vec<(String, HeapId)>,
-            prints: Vec<String>,
-            vector_size: usize,
-        }
-
-        let s = StateDeserialize::deserialize(deserializer)?;
-        let mut global_env = ImOrdMap::new();
-        for (k, v) in s.global_env {
-            global_env.insert(k, v);
-        }
-
-        Ok(State {
-            heap: s.heap,
-            local_env: s.local_env,
-            outer_local_envs: s.outer_local_envs,
-            global_env,
-            prints: s.prints,
-            vector_size: s.vector_size,
-        })
-    }
 }
 
 impl Default for State {
@@ -133,8 +66,6 @@ impl State {
     pub fn new() -> Self {
         Self {
             heap: Heap::new(),
-            local_env: LocalEnv::new(),
-            outer_local_envs: Vec::new(),
             global_env: ImOrdMap::new(),
             prints: Vec::new(),
             vector_size: 1,
@@ -160,17 +91,7 @@ impl State {
         reason: FilterReason,
     ) {
 
-        // Filter values in heap - use optimized method that only clones vectors
         self.heap.filter_vectors_in_place(kept);
-
-        // Filter values in local env - use optimized method
-        self.local_env.filter_vectors_in_place(kept);
-
-        // Filter values in outer local envs
-        for env in &mut self.outer_local_envs {
-            env.filter_vectors_in_place(kept);
-        }
-
         self.vector_size = kept.len();
 
         if reason == FILTER_BRANCH {
@@ -191,7 +112,7 @@ impl State {
     /// the same heap IDs, which is critical for vectorization to work correctly.
     ///
     /// The algorithm:
-    /// 1. Visit all reachable heap values from global_env, local_env, outer_local_envs
+    /// 1. Visit all reachable heap values from global_env
     /// 2. Assign new HeapIds in the order values are visited
     /// 3. Create a compacted heap with only reachable values
     ///
@@ -306,38 +227,6 @@ impl State {
             new_global_env.insert(key.clone(), new_id);
         }
 
-        // Visit all roots from local_env (sorted for deterministic order)
-        // Note: We must clone values since LocalEnv doesn't support draining
-        // `iter` yields *slots*, so the rebuild must be positional and must
-        // carry the occupant across. Using `set(LocalId::from(slot), ..)` would
-        // map the slot through the slot table a second time.
-        let mut local_entries: Vec<_> = self.local_env.iter().collect();
-        local_entries.sort_by_key(|(k, _)| *k);
-        let mut new_local_env = self.local_env.empty_like();
-        for (slot, value) in local_entries {
-            let new_value = map_value(value.clone(), &mut |id| {
-                visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
-            });
-            let occupant = self.local_env.occupant_of_slot(slot);
-            new_local_env.set_slot(slot, occupant, new_value);
-        }
-
-        // Visit all roots from outer_local_envs
-        let mut new_outer_local_envs = Vec::new();
-        for env in &self.outer_local_envs {
-            let mut entries: Vec<_> = env.iter().collect();
-            entries.sort_by_key(|(k, _)| *k);
-            let mut new_env = env.empty_like();
-            for (slot, value) in entries {
-                let new_value = map_value(value.clone(), &mut |id| {
-                    visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
-                });
-                let occupant = env.occupant_of_slot(slot);
-                new_env.set_slot(slot, occupant, new_value);
-            }
-            new_outer_local_envs.push(new_env);
-        }
-
         // Build the new compacted heap
         let mut new_heap = Heap::new();
         for value in new_heap_values {
@@ -350,8 +239,6 @@ impl State {
         // Update state
         self.heap = new_heap;
         self.global_env = new_global_env;
-        self.local_env = new_local_env;
-        self.outer_local_envs = new_outer_local_envs;
     }
 }
 
