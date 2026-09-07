@@ -75,6 +75,7 @@ dependencies = [
  "celeste-core",
  "celeste-names",
  "rustc-hash 2.1.3",
+ "serde",
 ]
 
 [[package]]

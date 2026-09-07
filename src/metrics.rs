@@ -25,6 +25,18 @@ pub fn record(name: &'static str, dur: Duration) {
     entry.1 += 1;
 }
 
+/// This process's peak resident set (`VmHWM`), in GB; 0 if unreadable.
+pub fn peak_rss_gb() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
+        })
+        .map_or(0.0, |kb| kb / 1e6)
+}
+
 /// Time a closure under `name`.
 pub fn time<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     let t = std::time::Instant::now();

@@ -45,6 +45,7 @@ use std::path::Path;
 
 use crate::interpreter::abstraction::{player_xy_per_lane, room_xy_per_lane};
 use crate::interpreter::state::State;
+use celeste_engine::runtime2::{Col, Rt2, AV};
 
 /// Side of the position grid, in pixels. A room is 128x128; the grid holds
 /// the start room plus a whole room's width past it in each axis, because a
@@ -91,6 +92,65 @@ pub fn cell_of(x: i32, y: i32) -> Result<u32> {
 /// Human-readable start-room-relative pixels of a cell.
 pub fn cell_xy(cell: u32) -> Option<(i32, i32)> {
     (cell != NO_CELL).then(|| (cell as i32 % GRID + ORIGIN, cell as i32 / GRID + ORIGIN))
+}
+
+/// A numeric column's whole parts, one per lane, or `None` if any lane is
+/// not a plain number (an interval, a pointer, nil).
+pub(crate) fn whole_i16_col(rt2: &Rt2, cell: u32) -> Option<Vec<i16>> {
+    match &rt2.cols[cell as usize] {
+        Col::U(AV::Num(n)) => Some(vec![n.whole_part_as_i16(); rt2.width]),
+        Col::N(vs) => Some(vs.iter().map(|n| n.whole_part_as_i16()).collect()),
+        Col::V(vs) => vs
+            .iter()
+            .map(|v| match v {
+                AV::Num(n) => Some(n.whole_part_as_i16()),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// The player object of a block - the `player` instance, or the
+/// `player_spawn` one during the spawn animation - if it has one. Blocks
+/// share structure across lanes, so this is per block, not per lane.
+pub(crate) fn player_object(rt2: &Rt2) -> Option<u32> {
+    let ids = crate::compiled::ids();
+    rt2.player_objects(ids)
+        .first()
+        .copied()
+        .or_else(|| rt2.objects_of_type(ids, ids.g_player_spawn).first().copied())
+}
+
+/// Per-lane cell of an engine block: the SAME rule as `state_cells`, read
+/// off the block's columns. `room.x`/`room.y` must be numbers (a block
+/// without a readable room is an error); a block with no player object, or
+/// a player whose `x`/`y` is not a plain number, is at `NO_CELL`.
+pub fn block_cells(rt2: &Rt2) -> Result<Vec<u32>> {
+    let ids = crate::compiled::ids();
+    let start = crate::game_runner::start_room();
+    let lanes = rt2.width;
+    let axis = |obj: u32, f: u32| rt2.obj_field_cell(obj, f).and_then(|c| whole_i16_col(rt2, c));
+    let room = rt2
+        .global_target(ids.g_room)
+        .ok_or_else(|| anyhow!("block_cells: no readable `room` global"))?;
+    let (Some(rx), Some(ry)) = (axis(room, ids.f_x), axis(room, ids.f_y)) else {
+        return Err(anyhow!("block_cells: room.x/room.y are not numbers"));
+    };
+    let Some(obj) = player_object(rt2) else {
+        return Ok(vec![NO_CELL; lanes]);
+    };
+    let (Some(px), Some(py)) = (axis(obj, ids.f_x), axis(obj, ids.f_y)) else {
+        return Ok(vec![NO_CELL; lanes]);
+    };
+    (0..lanes)
+        .map(|i| {
+            cell_of(
+                px[i] as i32 + (rx[i] - start.0) as i32 * ROOM_PX,
+                py[i] as i32 + (ry[i] - start.1) as i32 * ROOM_PX,
+            )
+        })
+        .collect()
 }
 
 /// Per-lane cell of a boundary state.
@@ -360,12 +420,12 @@ impl PosGraphBuilder {
 /// Collects the table while a run steps frames.
 ///
 /// Attribution is by PARTITION, not by a per-lane tag: while recording, the
-/// forward pass adds the player position cells to the merge partition
-/// (`vectorize::set_partition_player_position`), so every merged state - and
-/// hence every frame-input chunk `chunk_states` cuts from it - is uniform in
-/// position. The recorder reads that ONE input cell off the chunk
-/// (`input_cell`) and pairs it with every output cell, which is exact rather
-/// than a cross product: all the chunk's lanes really did start at that cell.
+/// forward pass regroups its frontier by player-position cell
+/// (`frame::forward_frame`'s `by_cell`), so every frame-input block is
+/// uniform in position. The recorder reads that ONE input cell off the
+/// block's position column (`input_cell`) and pairs it with every output
+/// cell, which is exact rather than a cross product: all the block's lanes
+/// really did start at that cell.
 ///
 /// The first version of this was read-only and recorded every source cell of
 /// a chunk against every destination cell of it - conservative and useless
@@ -404,22 +464,22 @@ impl PosObserver {
         }
     }
 
-    /// The single input cell of a frame-input chunk. Every lane must be at
-    /// the same cell - which the position partition guarantees while
-    /// recording (see the struct doc). A non-uniform chunk is a loud error,
-    /// not a silent cross product: it means the position partition was not
-    /// installed, and recording without it would attribute every source cell
-    /// to every destination cell (the useless first version).
-    pub fn input_cell(&self, state: &State) -> Result<u32> {
-        let cells = state_cells(state)?;
+    /// The single input cell of a frame-input block, given its position
+    /// column. Every lane must be at the same cell - which the by-cell
+    /// regrouping guarantees while recording (see the struct doc). A
+    /// non-uniform block is a loud error, not a silent cross product: it
+    /// means the regrouping was not by cell, and recording without it would
+    /// attribute every source cell to every destination cell (the useless
+    /// first version).
+    pub fn input_cell(&self, cells: &[u32]) -> Result<u32> {
         let Some((&first, rest)) = cells.split_first() else {
-            return Err(anyhow!("pos observer: empty input chunk"));
+            return Err(anyhow!("pos observer: empty input block"));
         };
         if let Some(&other) = rest.iter().find(|&&c| c != first) {
             return Err(anyhow!(
-                "pos observer: input chunk spans cells {} and {} - the position \
-                 partition must be installed while recording (see \
-                 `vectorize::set_partition_player_position`)",
+                "pos observer: input block spans cells {} and {} - the frontier \
+                 must be regrouped by cell while recording (`forward_frame`'s \
+                 `by_cell`)",
                 first,
                 other
             ));
@@ -427,28 +487,10 @@ impl PosObserver {
         Ok(first)
     }
 
-    /// Pair the chunk's single input cell with every output cell. Sound
-    /// because the input is uniform in position (`input_cell`): all the
-    /// chunk's lanes started at `c_in`, so every output really is a
-    /// successor of it.
-    pub fn record(&self, c_in: u32, outputs: &[State]) -> Result<()> {
-        let mut pairs = Vec::new();
-        for out in outputs {
-            for d in state_cells(out)? {
-                pairs.push((c_in, d));
-            }
-        }
-        pairs.sort_unstable();
-        pairs.dedup();
-        self.pending.lock().expect("pos observer").extend(pairs);
-        Ok(())
-    }
-
-    /// Record edges from one input cell to a set of already-computed output
-    /// cells. Same as `record`, but the caller supplies the output positions
-    /// (the block already carries its position column), so no output state is
-    /// re-walked. Sound for the same reason: the input chunk is uniform in
-    /// position, so every `dst` really is a successor of `c_in`.
+    /// Record edges from one input cell to a set of output cells (the output
+    /// block's position column). Sound because the input block is uniform in
+    /// position (`input_cell`): all its lanes started at `c_in`, so every
+    /// `dst` really is a successor of it.
     pub fn record_dsts(&self, c_in: u32, dsts: &[u32]) {
         let mut pairs: Vec<(u32, u32)> = dsts.iter().map(|&d| (c_in, d)).collect();
         pairs.sort_unstable();

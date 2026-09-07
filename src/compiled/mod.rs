@@ -251,6 +251,8 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
     runtime2::BoundaryIds {
         g_objects: g("objects"),
         g_player: g("player"),
+        g_player_spawn: g("player_spawn"),
+        g_room: g("room"),
         g_timers: ["frames", "seconds", "minutes", "deaths"].iter().map(|n| g(n)).collect(),
         f_type: f("type"),
         f_rem: f("rem"),
@@ -266,6 +268,31 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
         g_pm1: ["has_dashed", "freeze"].iter().map(|n| g(n)).collect(),
         f_pm1: ["dash_time", "djump", "p_dash", "p_jump"].iter().map(|n| f(n)).collect(),
     }
+}
+
+/// The boundary ids, resolved once: the block's own column readers (the
+/// search's position and win columns, `frame::Block`) need them without an
+/// engine in hand.
+pub fn ids() -> &'static runtime2::BoundaryIds {
+    static IDS: std::sync::OnceLock<runtime2::BoundaryIds> = std::sync::OnceLock::new();
+    IDS.get_or_init(boundary_ids)
+}
+
+/// The start room's cart and collision cache, loaded once. Every block
+/// carries these two `Arc`s (the kernels read tiles through them), so
+/// anything that builds a block outside an engine - the checkpoint loader,
+/// the bridge from a reference `State` - attaches the same pair.
+pub fn room_context() -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
+    static CTX: std::sync::OnceLock<(Arc<CartData>, Arc<CollisionCache>)> =
+        std::sync::OnceLock::new();
+    if let Some(c) = CTX.get() {
+        return Ok(c.clone());
+    }
+    let (room_x, room_y) = crate::game_runner::start_room();
+    let cart = Arc::new(CartData::load("cart")?);
+    let cache = Arc::new(CollisionCache::new(&cart, room_x, room_y)?);
+    let _ = CTX.set((cart, cache));
+    Ok(CTX.get().expect("just set").clone())
 }
 
 /// One frame of the abstract search, for whoever wants it.
@@ -375,9 +402,7 @@ impl FrameEngine {
     /// The same construction with the cart and collision cache loaded for
     /// the campaign's start room.
     pub fn new_for_start_room(program: &Program) -> Result<Self> {
-        let (room_x, room_y) = crate::game_runner::start_room();
-        let cart = Arc::new(CartData::load("cart")?);
-        let cache = Arc::new(CollisionCache::new(&cart, room_x, room_y)?);
+        let (cart, cache) = room_context()?;
         Ok(Self::new(program, cart, cache))
     }
 
@@ -435,6 +460,26 @@ impl FrameEngine {
         let mut t = ChunkTimer::start();
         let block = bridge::import_block(state, self.cart.clone(), self.cache.clone());
         t.mark(CHUNK_IMPORT);
+        let merged = self.run_frame_block(block);
+        t = ChunkTimer::start();
+        // Each output state carries its ENGINE row keys (`b.row_keys`): the
+        // forward frontier is engine-keyed and the redundant re-hash is
+        // dropped.
+        let out: Vec<KeyedState> = merged
+            .iter()
+            .map(|b| (bridge::export_block(b), Some(b.row_keys.clone())))
+            .collect();
+        t.mark(CHUNK_EXPORT);
+        out
+    }
+
+    /// One frame of one block, block in and blocks out: partition on the
+    /// frame-start uniform branches, run every chunk on its kernel, dedup
+    /// and merge the outputs per (shape, pm1 class). Every output carries
+    /// its row keys. This is the search's frame step; `run_frame_chunk` is
+    /// the same thing wrapped in the `State` bridge for the gates.
+    pub fn run_frame_block(&self, block: runtime2::Rt2) -> Vec<runtime2::Rt2> {
+        let mut t = ChunkTimer::start();
         let mut pending: Vec<(runtime2::Rt2, bool)> = self
             .partition_chunks(vec![block], campaign_chunk_rows())
             .into_iter()
@@ -443,11 +488,6 @@ impl FrameEngine {
         t.mark(CHUNK_PARTITION);
         let use_kernel = use_kernel();
         let mut done: Vec<runtime2::Rt2> = Vec::new();
-        // Each output state carries its ENGINE row keys (`b.row_keys`) when it
-        // came off a kernel/merged block, so the forward frontier is engine-keyed
-        // (Option 1) and the redundant re-hash is dropped. `None` = an
-        // interpreter-fallback state whose engine key must be derived downstream.
-        let mut out: Vec<KeyedState> = Vec::new();
         // DISPATCH EVERY CHUNK BEFORE INTERPRETING ANY. A premise failure
         // in `interpret_block` panics out of the whole state, and with the
         // interleaved loop that panic landed before the remaining chunks
@@ -526,15 +566,7 @@ impl FrameEngine {
                 assert_widen_is_noop(&bridge::export_block(b));
             }
         }
-        out.extend(
-            merged.iter().map(|b| {
-                // Carry the engine keys unconditionally - the engine-keyed
-                // frontier is the only frontier.
-                (bridge::export_block(b), Some(b.row_keys.clone()))
-            }),
-        );
-        t.mark(CHUNK_EXPORT);
-        out
+        merged
     }
 
     /// The kernel/engine row keys of one state, per lane in LANE ORDER (no
@@ -877,18 +909,16 @@ pub fn step(
 }
 
 /// The compiled kernels as the fast `FrameStep` implementation (interface #1),
-/// the counterpart to `RefEngine`. `run_frame_chunk` already hands back each
-/// output block's engine key column, so the block carries it and the loop
-/// never re-hashes. `&mut self` per the trait; the engine itself is `&self`.
+/// the counterpart to `RefEngine`. The block IS the engine's block, so this
+/// is `run_frame_block` and nothing else: no bridge, and every output
+/// carries the key column the kernel computed. `&mut self` per the trait;
+/// the engine itself is `&self`.
 impl crate::frame::FrameStep for FrameEngine {
-    fn run(&mut self, block: &crate::frame::Block) -> anyhow::Result<Vec<crate::frame::Block>> {
+    fn run(&mut self, block: crate::frame::Block) -> anyhow::Result<Vec<crate::frame::Block>> {
         Ok(self
-            .run_frame_chunk(block.state())
+            .run_frame_block(block.into_rt2())
             .into_iter()
-            .map(|(state, keys)| match keys {
-                Some(k) => crate::frame::Block::with_keys(state, k),
-                None => crate::frame::Block::new(state),
-            })
+            .map(crate::frame::Block::from_rt2)
             .collect())
     }
 }

@@ -121,11 +121,14 @@ impl RefEngine {
 /// output block - correct but unvectorized, which is exactly the reference's
 /// contract (callers that run it wide sample).
 impl crate::frame::FrameStep for RefEngine {
-    fn run(&mut self, block: &crate::frame::Block) -> Result<Vec<crate::frame::Block>> {
-        Ok(self
-            .run_frame(block.state())?
-            .into_iter()
-            .map(crate::frame::Block::new)
-            .collect())
+    fn run(&mut self, block: crate::frame::Block) -> Result<Vec<crate::frame::Block>> {
+        // The reference runs on interpreter `State`s: cross the bridge both
+        // ways. `Block::from_state` keys each leaf by the one canonical rule,
+        // so the loop sees the same key column the kernels would attach.
+        let input = block.to_state();
+        self.run_frame(&input)?
+            .iter()
+            .map(crate::frame::Block::from_state)
+            .collect()
     }
 }

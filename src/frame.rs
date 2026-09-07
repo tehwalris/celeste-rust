@@ -12,60 +12,124 @@
 use anyhow::Result;
 
 use crate::interpreter::state::State;
+use celeste_engine::runtime2::Rt2;
 
-/// The data currency (interface #2). A columnar batch of lanes, carried as one
-/// opaque multi-lane `State`. Two columns are EXPOSED - the per-lane key and the
-/// per-lane position - and nothing else; the field data stays inside the state.
-/// A whole block serializes/compresses compactly (batches share structure), so
+/// The data currency (interface #2). A columnar batch of lanes - the engine's
+/// own block (`Rt2`: one shape, one column per value cell, the key column the
+/// boundary computed), carried as-is. Two columns are EXPOSED - the per-lane
+/// key and the per-lane position - and nothing else; the field data stays
+/// inside. A whole block serializes compactly (the lanes share structure), so
 /// the loop always moves blocks, never individual lanes.
+///
+/// It IS the kernel's block, so there is no bridge in the loop: the frame
+/// step consumes and produces it directly, `keep` is a column filter, the
+/// regroup is a column append, and the checkpoint is the columns. The
+/// interpreter `State` appears only at the edges - the initial state, the
+/// reference engine, and the ladder filter's coarsening - through
+/// `from_state` / `to_state`.
 pub struct Block {
-    /// Opaque. The loop never reads inside it - it passes the block back into
-    /// the frame step, asks for its key/position columns, splits it by a lane
-    /// mask, or serializes it. That is the entire vocabulary.
-    state: State,
-    /// The key column when the engine already computed it (interface #1 says
-    /// keying happens inside the frame step - the kernels hand it back rather
-    /// than have the loop re-hash). `None` means "compute on demand".
-    keys: Option<Vec<(u64, u64)>>,
+    rt2: Rt2,
 }
 
 impl Block {
-    pub fn new(state: State) -> Self {
-        Self { state, keys: None }
+    /// Wrap an engine block. Its key column must be present: every producer
+    /// (the kernel boundary, `from_state`, the checkpoint loader) attaches
+    /// it, and nothing downstream re-hashes.
+    pub fn from_rt2(rt2: Rt2) -> Self {
+        assert_eq!(
+            rt2.row_keys.len(),
+            rt2.width,
+            "block without its key column ({} keys for {} lanes)",
+            rt2.row_keys.len(),
+            rt2.width
+        );
+        Block { rt2 }
     }
-    /// A block whose key column the frame step already computed.
-    pub fn with_keys(state: State, keys: Vec<(u64, u64)>) -> Self {
-        Self { state, keys: Some(keys) }
+
+    /// A block from a reference-interpreter `State`, keyed by the one
+    /// canonical rule (`Rt2::row_keys_canonical`: what `engine_row_keys`
+    /// computed). The state must already be at its rung's abstraction.
+    pub fn from_state(state: &State) -> Result<Self> {
+        let (cart, cache) = crate::compiled::room_context()?;
+        let mut rt2 = crate::compiled::bridge::import_block(state, cart, cache);
+        rt2.row_keys_canonical();
+        Ok(Block { rt2 })
     }
-    pub fn into_state(self) -> State {
-        self.state
+
+    /// The block as an interpreter `State` (`bridge::export_block`), for the
+    /// reference engine and the ladder filter's coarsening.
+    pub fn to_state(&self) -> State {
+        crate::compiled::bridge::export_block(&self.rt2)
     }
-    pub fn state(&self) -> &State {
-        &self.state
+
+    pub fn into_rt2(self) -> Rt2 {
+        self.rt2
     }
 
     /// The key column: the 128-bit canonical row key per lane (shape + content).
     /// Identity for dedup, the visited set, and checkpoints. One entry per lane.
-    /// Returns the engine-supplied column when present, else computes it.
-    pub fn keys(&self) -> Result<Vec<(u64, u64)>> {
-        match &self.keys {
-            Some(k) => Ok(k.clone()),
-            None => crate::compiled::engine_row_keys(&self.state),
-        }
+    pub fn keys(&self) -> &[(u64, u64)] {
+        &self.rt2.row_keys
     }
 
     /// The position column: the player-position cell per lane, for grouping and
     /// the position graph. Same length as `keys`.
     pub fn positions(&self) -> Result<Vec<u32>> {
-        crate::search::pos_graph::state_cells(&self.state)
+        crate::search::pos_graph::block_cells(&self.rt2)
+    }
+
+    /// Per lane: does it sit on the room's win target? The room-exit test
+    /// (`room.x` past the start room) or, under `CELESTE_WIN_AT_XY`, the
+    /// synthetic player-position target. Pure position; no peeking inside.
+    pub fn wins(&self) -> Result<Vec<bool>> {
+        use celeste_engine::runtime2::{Col, AV};
+        let ids = crate::compiled::ids();
+        let rt2 = &self.rt2;
+        let lanes = rt2.width;
+        if let Some(target) = crate::interpreter::abstraction::synthetic_win_xy() {
+            let Some(obj) = crate::search::pos_graph::player_object(rt2) else {
+                return Ok(vec![false; lanes]);
+            };
+            let axis = |f: u32| {
+                rt2.obj_field_cell(obj, f)
+                    .and_then(|c| crate::search::pos_graph::whole_i16_col(rt2, c))
+            };
+            return Ok(match (axis(ids.f_x), axis(ids.f_y)) {
+                (Some(xs), Some(ys)) => {
+                    xs.iter().zip(&ys).map(|(&x, &y)| (x, y) == target).collect()
+                }
+                _ => vec![false; lanes],
+            });
+        }
+        let want = crate::pico8_num::Pico8Num::from_i16(crate::game_runner::win_room_x());
+        let room = rt2
+            .global_target(ids.g_room)
+            .ok_or_else(|| anyhow::anyhow!("wins: no `room` global"))?;
+        let x = rt2
+            .obj_field_cell(room, ids.f_x)
+            .ok_or_else(|| anyhow::anyhow!("wins: room table has no x field"))?;
+        Ok(match &rt2.cols[x as usize] {
+            Col::U(AV::Num(n)) => vec![*n == want; lanes],
+            Col::N(vs) => vs.iter().map(|n| *n == want).collect(),
+            Col::V(vs) => vs.iter().map(|v| *v == AV::Num(want)).collect(),
+            other => anyhow::bail!("wins: room.x is not a number column: {:?}", other),
+        })
     }
 
     /// Keep only the lanes whose mask entry is true, as a new block; `None` if
     /// none survive. The one splitting primitive the loop needs (dedup at the
     /// door repacks with this).
-    pub fn keep(self, mask: &[bool]) -> Option<Block> {
-        let (kept, _) = self.state.split_by_condition(mask, true);
-        kept.map(Block::new)
+    pub fn keep(mut self, mask: &[bool]) -> Option<Block> {
+        let keep: Vec<u32> = mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &m)| m.then_some(i as u32))
+            .collect();
+        if keep.is_empty() {
+            return None;
+        }
+        self.rt2.retain_lanes(&keep);
+        Some(self)
     }
 
     /// The block's shard cell. A regrouped block is uniform in position, so its
@@ -77,29 +141,82 @@ impl Block {
             .ok_or_else(|| anyhow::anyhow!("empty block has no shard cell"))
     }
 
-    /// The block's shard shape. A regrouped block is one shape.
+    /// The block's shard shape. A block is one shape.
     pub fn shard_shape(&self) -> u64 {
-        crate::interpreter::vectorize::shape_hash_of_state(&self.state)
+        self.rt2.shape_hash
     }
 
     /// Number of lanes in this block.
     pub fn lanes(&self) -> usize {
-        self.state.vector_size.max(1)
+        self.rt2.width
     }
 
-    /// A one-lane block holding just lane `i` (clones the state, then keeps the
-    /// single lane). Used by the DRAFT backward, which re-runs one input at a
-    /// time so every output trivially belongs to it (no provenance needed). The
-    /// wide+lane-bitmask version replaces this.
+    /// A one-lane block holding just lane `i`. Used by the DRAFT backward,
+    /// which re-runs one input at a time so every output trivially belongs
+    /// to it (no provenance needed). The wide+lane-bitmask version replaces
+    /// this.
     pub fn lane(&self, i: usize) -> Option<Block> {
-        let lanes = self.lanes();
-        let mut mask = vec![false; lanes];
-        if i < lanes {
-            mask[i] = true;
+        if i >= self.lanes() {
+            return None;
         }
-        let (kept, _) = self.state.clone().split_by_condition(&mask, true);
-        kept.map(Block::new)
+        let mut rt2 = self.rt2.slice_lanes(i, i + 1);
+        rt2.row_keys = vec![self.rt2.row_keys[i]];
+        Some(Block { rt2 })
     }
+}
+
+/// Regroup surviving lanes into canonical blocks: one block per (shape, pm1
+/// class) and - `by_cell`, the recorder's partition - player-position cell,
+/// each the column-wise append (`Rt2::merge_many`) of its members. With
+/// `by_cell` every block comes out uniform in (shape, position): the block
+/// identity the pos-graph and backward are built on. Without it, position
+/// is content and the grouping is merely coarser; the reachable row set is
+/// the same either way.
+///
+/// Survivors arrive already pm1-partitioned (the engine's own regroup) and
+/// `retain_lanes` preserves that, so `partition_pm1` is a check that costs
+/// a scan; the cell split is real. The merged block's all-equal columns are
+/// stored uniform (`collapse_uniform_cols`), which is what the next frame's
+/// kernel bind keys on.
+fn regroup(survivors: Vec<Rt2>, by_cell: bool) -> Result<Vec<Block>> {
+    let ids = crate::compiled::ids();
+    let mut index: rustc_hash::FxHashMap<(u64, u64, u32), usize> = Default::default();
+    let mut groups: Vec<Vec<Rt2>> = Vec::new();
+    for rt2 in survivors {
+        for part in rt2.partition_pm1(ids) {
+            let pm1 = part.pm1_key_hash(ids);
+            let parts: Vec<(Rt2, u32)> = if by_cell {
+                let cells = crate::search::pos_graph::block_cells(&part)?;
+                // `partition_by_key` emits parts in first-occurrence order of
+                // the key, so the distinct cells in that order label them.
+                let mut order: Vec<u32> = Vec::new();
+                for &c in &cells {
+                    if !order.contains(&c) {
+                        order.push(c);
+                    }
+                }
+                part.partition_by_key(&cells).into_iter().zip(order).collect()
+            } else {
+                vec![(part, 0)]
+            };
+            for (p, cell) in parts {
+                let key = (p.shape_hash, pm1, cell);
+                let g = *index.entry(key).or_insert_with(|| {
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                });
+                groups[g].push(p);
+            }
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .map(|g| {
+            let mut merged = Rt2::merge_many(g);
+            merged.collapse_uniform_cols();
+            Block::from_rt2(merged)
+        })
+        .collect())
 }
 
 /// The ladder's forward discard-filter. A state generated at precision r+1 is
@@ -126,18 +243,23 @@ impl<'a> MarkFilter<'a> {
     /// Per-lane: keep lane `i` iff its widened-to-coarser form was marked.
     /// Rem widening never moves the integer cell and (coarsening) never splits
     /// a lane, so the widened block is lane-aligned with the input.
-    pub fn allowed(&self, state: &State) -> Result<Vec<bool>> {
+    ///
+    /// Crosses to the interpreter `State` for the coarsening: the widenings
+    /// live there (`abstraction.rs`) and this is the one place the loop
+    /// still needs them. Paid only at levels >= 1, whose frontiers the
+    /// filter itself keeps small.
+    pub fn allowed(&self, block: &Block) -> Result<Vec<bool>> {
         use crate::interpreter::abstraction::{
             apply_conservative_widenings, make_state_abstract_rem,
         };
-        let lanes = state.vector_size.max(1);
+        let lanes = block.lanes();
         // The COMPLETE coarsening the coarse engine bakes into its states - rem
         // bucketing AND the conservative widenings (p_jump/p_dash/fruit), then
         // gc - matching the old `widened_row_key`. Without the conservative
         // widenings, an Exact state keeps p_jump/p_dash concrete while the coarse
         // marks have them widened, so its coarsened key matches nothing and the
         // winning path is wrongly filtered at the Bits->Exact rung.
-        let mut widened = make_state_abstract_rem(state.clone(), self.coarser);
+        let mut widened = make_state_abstract_rem(block.to_state(), self.coarser);
         widened = apply_conservative_widenings(widened);
         widened.gc();
         anyhow::ensure!(
@@ -167,7 +289,7 @@ impl<'a> MarkFilter<'a> {
 /// the scalar interpreter (`trace::refengine`, the trusted reference). The loop
 /// holds a `&dyn FrameStep` and never knows which.
 pub trait FrameStep {
-    fn run(&mut self, block: &Block) -> Result<Vec<Block>>;
+    fn run(&mut self, block: Block) -> Result<Vec<Block>>;
 }
 
 /// The minimal forward frame: run the frame step over every block in the
@@ -189,22 +311,31 @@ pub fn forward_frame(
     is_win: impl Fn(&Block) -> Result<bool>,
     pos: Option<&crate::search::pos_graph::PosObserver>,
     filter: Option<&MarkFilter>,
-) -> Result<(Vec<Block>, bool)> {
-    let mut survivors: Vec<State> = Vec::new();
+    by_cell: bool,
+) -> Result<(Vec<Block>, bool, FrameStats)> {
+    use std::time::Instant;
+    let mut st = FrameStats::default();
+    let mut survivors: Vec<Rt2> = Vec::new();
     let mut won = false;
+    st.blocks_in = frontier.len();
     for block in frontier {
+        st.lanes_in += block.lanes();
         // Pos-graph edge: the block is uniform in position (record mode's
-        // partition), so its single input cell reaches every output cell.
-        // Record ALL raw outputs' positions (before dedup) - dedup drops
-        // duplicate keys, not reachable positions.
+        // by-cell regroup), so its single input cell reaches every output
+        // cell. Record ALL raw outputs' positions (before dedup) - dedup
+        // drops duplicate keys, not reachable positions.
         let c_in = match pos {
-            Some(p) => Some(p.input_cell(block.state())?),
+            Some(p) => Some(p.input_cell(&block.positions()?)?),
             None => None,
         };
-        let outputs = engine.run(&block)?;
+        let t = Instant::now();
+        let outputs = engine.run(block)?;
+        st.t_engine += t.elapsed();
         for out in outputs {
-            let keys = out.keys()?;
+            st.lanes_raw += out.lanes();
+            let t = Instant::now();
             let cells = out.positions()?;
+            st.t_keys += t.elapsed();
             // Pos-graph edge: record ALL raw outputs' positions (before dedup);
             // dedup drops duplicate keys, not reachable positions.
             if let (Some(p), Some(c_in)) = (pos, c_in) {
@@ -213,16 +344,20 @@ pub fn forward_frame(
             // Ladder filter (coarser level's marked set): discard a lane whose
             // widened-to-coarser form was not marked. Computed before the
             // visited insert so a discarded lane never enters the visited set.
+            let t = Instant::now();
             let allow = match filter {
-                Some(f) => Some(f.allowed(out.state())?),
+                Some(f) => Some(f.allowed(&out)?),
                 None => None,
             };
+            st.t_filter += t.elapsed();
             // Dedup at the door, SHARDED by (shape, cell): insert() reports true
             // for a (key, cell) not seen before in this or any earlier frontier.
             // Building the mask also records the survivors, so a duplicate later
             // in the same frame is caught too. `&&` short-circuits, so a
             // filtered-out lane is never inserted into `visited`.
-            let mask: Vec<bool> = keys
+            let t = Instant::now();
+            let mask: Vec<bool> = out
+                .keys()
                 .iter()
                 .zip(&cells)
                 .enumerate()
@@ -230,31 +365,51 @@ pub fn forward_frame(
                     allow.as_ref().map_or(true, |a| a[i]) && visited.insert(*k, c)
                 })
                 .collect();
+            st.t_visited += t.elapsed();
+            let t = Instant::now();
             if let Some(kept) = out.keep(&mask) {
+                st.lanes_kept += kept.lanes();
                 won |= is_win(&kept)?;
-                survivors.push(kept.into_state());
+                survivors.push(kept.into_rt2());
             }
+            st.t_keep += t.elapsed();
         }
     }
-    // Regroup the surviving lanes into canonical blocks - group by (shape,
-    // partition-class) and merge each group into one wide vectorized block.
-    // With the position partition on (`forward_run` record mode), the class
-    // includes position, so every block comes out uniform in (shape, position):
-    // the block identity the pos-graph and backward are built on. This is also
-    // where cross-block duplicate lanes collapse.
-    let next: Vec<Block> = crate::interpreter::vectorize::vectorize_states(survivors)
-        .into_iter()
-        .map(Block::new)
-        .collect();
-    Ok((next, won))
+    // Regroup the surviving lanes into canonical blocks (`regroup`): one
+    // block per (shape, pm1 class[, cell]), a column append per group.
+    let t = Instant::now();
+    let next = regroup(survivors, by_cell)?;
+    st.t_vectorize += t.elapsed();
+    st.blocks_out = next.len();
+    st.lanes_out = next.iter().map(Block::lanes).sum();
+    Ok((next, won, st))
 }
 
-/// A row wins if any lane sits on the room's win target. Pure position (the
-/// existing per-lane predicate); no peeking inside the state.
-pub fn block_wins(block: &Block) -> bool {
-    crate::interpreter::abstraction::win_lane_mask(block.state())
-        .iter()
-        .any(|&w| w)
+/// Where one forward frame's time went and what it moved, for the per-frame
+/// log line and the phase totals. Phases are the loop's own seams; the frame
+/// step's internal split is the engine's business (`CELESTE_CHUNK_PHASE_TIME`).
+#[derive(Default, Clone, Copy)]
+pub struct FrameStats {
+    pub blocks_in: usize,
+    pub lanes_in: usize,
+    /// Output lanes as the engine handed them back, before the filter/dedup.
+    pub lanes_raw: usize,
+    /// Lanes that passed the filter and were new to `visited`.
+    pub lanes_kept: usize,
+    pub blocks_out: usize,
+    /// Lanes after regrouping (cross-block duplicates collapsed).
+    pub lanes_out: usize,
+    pub t_engine: std::time::Duration,
+    pub t_keys: std::time::Duration,
+    pub t_filter: std::time::Duration,
+    pub t_visited: std::time::Duration,
+    pub t_keep: std::time::Duration,
+    pub t_vectorize: std::time::Duration,
+}
+
+/// A block wins if any lane sits on the room's win target (`Block::wins`).
+pub fn block_wins(block: &Block) -> Result<bool> {
+    Ok(block.wins()?.iter().any(|&w| w))
 }
 
 /// The result of a backward pass: the marked set (sharded by shape+cell) plus
@@ -290,10 +445,9 @@ pub fn backward_run(
     // frame-`horizon` marks).
     let mut seed: Vec<((u64, u64), u32)> = Vec::new();
     for block in load_frame(dir, horizon)? {
-        let keys = block.keys()?;
         let cells = block.positions()?;
-        let wins = crate::interpreter::abstraction::win_lane_mask(block.state());
-        for ((k, &c), w) in keys.iter().zip(&cells).zip(wins) {
+        let wins = block.wins()?;
+        for ((k, &c), w) in block.keys().iter().zip(&cells).zip(wins) {
             if w {
                 seed.push((*k, c));
             }
@@ -339,20 +493,18 @@ pub fn backward_walk(
 
         let mut new_frontier: Vec<((u64, u64), u32)> = Vec::new();
         for block in load_frame_cells(dir, i, &cand_cells)? {
-            let keys = block.keys()?;
             let cells = block.positions()?;
             for lane in 0..block.lanes() {
-                let (key, cell) = (keys[lane], cells[lane]);
+                let (key, cell) = (block.keys()[lane], cells[lane]);
                 if marked.contains(key, cell) {
                     continue; // already marked by another target - skip the re-run
                 }
                 let Some(single) = block.lane(lane) else { continue };
                 reruns += 1;
                 let mut hit = false;
-                'outs: for out in engine.run(&single)? {
-                    let ok = out.keys()?;
+                'outs: for out in engine.run(single)? {
                     let oc = out.positions()?;
-                    for (k, &c) in ok.iter().zip(&oc) {
+                    for (k, &c) in out.keys().iter().zip(&oc) {
                         if targets.contains(&(k.0, k.1, c)) {
                             hit = true;
                             break 'outs;
@@ -395,24 +547,22 @@ pub fn forward_run(
     record: bool,
     filter: Option<&MarkFilter>,
 ) -> Result<ForwardResult> {
-    // Record mode installs the position partition, so every regrouped block
-    // (see forward_frame) is uniform in position and the pos-graph's input cell
-    // is well defined. Off for a forward-only run: position is content, so
-    // partitioning on it never changes the reachable row set, only makes the
-    // merge finer (which only the recorder pays for).
-    crate::interpreter::vectorize::set_partition_player_position(record);
+    // Record mode regroups by cell, so every block (see `regroup`) is
+    // uniform in position and the pos-graph's input cell is well defined.
+    // Off for a forward-only run: position is content, so grouping on it
+    // never changes the reachable row set, only makes the blocks finer
+    // (which only the recorder pays for).
     let observer = record.then(crate::search::pos_graph::PosObserver::default);
 
     let mut visited = Visited::new();
     for b in &initial {
-        let keys = b.keys()?;
         let cells = b.positions()?;
-        for (k, c) in keys.iter().zip(&cells) {
+        for (k, c) in b.keys().iter().zip(&cells) {
             visited.insert(*k, *c);
         }
     }
     checkpoint_frontier(dir, 0, &initial)?;
-    drive_forward(engine, dir, initial, visited, observer, 1, max_frames, filter)
+    drive_forward(engine, dir, initial, visited, observer, 1, max_frames, filter, record)
 }
 
 /// Resume/extend a checkpointed forward: from `from_frame` (whose frontier is on
@@ -430,19 +580,17 @@ pub fn forward_resume(
     to_frame: u32,
     filter: Option<&MarkFilter>,
 ) -> Result<ForwardResult> {
-    crate::interpreter::vectorize::set_partition_player_position(false);
     let mut visited = Visited::new();
     for f in 0..=from_frame {
         for b in load_frame(dir, f)? {
-            let keys = b.keys()?;
             let cells = b.positions()?;
-            for (k, c) in keys.iter().zip(&cells) {
+            for (k, c) in b.keys().iter().zip(&cells) {
                 visited.insert(*k, *c);
             }
         }
     }
     let frontier = load_frame(dir, from_frame)?;
-    drive_forward(engine, dir, frontier, visited, None, from_frame + 1, to_frame, filter)
+    drive_forward(engine, dir, frontier, visited, None, from_frame + 1, to_frame, filter, false)
 }
 
 /// The shared forward loop: from `frontier` (the states at `start_frame - 1`),
@@ -458,22 +606,30 @@ fn drive_forward(
     start_frame: u32,
     end_frame: u32,
     filter: Option<&MarkFilter>,
+    by_cell: bool,
 ) -> Result<ForwardResult> {
     let mut last = start_frame.saturating_sub(1);
     let mut win_frame = None;
     for frame in start_frame..=end_frame {
-        let (next, won) = forward_frame(
+        let t_frame = std::time::Instant::now();
+        let (next, won, st) = forward_frame(
             engine,
             frontier,
             &mut visited,
-            |b| Ok(block_wins(b)),
+            block_wins,
             observer.as_ref(),
             filter,
+            by_cell,
         )?;
+        let t = std::time::Instant::now();
         checkpoint_frontier(dir, frame, &next)?;
+        let t_ckpt = t.elapsed();
+        let t = std::time::Instant::now();
         if let Some(o) = observer.as_ref() {
             o.flush();
         }
+        let t_pos = t.elapsed();
+        log_frame(frame, &st, t_ckpt, t_pos, t_frame.elapsed(), visited.len());
         last = frame;
         if won {
             win_frame = Some(frame);
@@ -486,6 +642,51 @@ fn drive_forward(
     }
     let pos_graph = observer.map(|o| o.build(last, "rebuild-forward"));
     Ok(ForwardResult { win_frame, frames: last, pos_graph })
+}
+
+/// One line per forward frame on stderr, plus the phase totals under
+/// `metrics` (`fwd.*`), so a run's wall time is attributable without
+/// re-running it under a profiler. Times in ms.
+fn log_frame(
+    frame: u32,
+    st: &FrameStats,
+    t_ckpt: std::time::Duration,
+    t_pos: std::time::Duration,
+    t_total: std::time::Duration,
+    visited: usize,
+) {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    eprintln!(
+        "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
+         engine {:.0} keys {:.0} filter {:.0} visited {:.0} keep {:.0} vec {:.0} \
+         ckpt {:.0} pos {:.0} total {:.0} ms | rss {:.2} GB",
+        st.blocks_in,
+        st.lanes_in,
+        st.lanes_raw,
+        st.lanes_kept,
+        st.blocks_out,
+        st.lanes_out,
+        visited,
+        ms(st.t_engine),
+        ms(st.t_keys),
+        ms(st.t_filter),
+        ms(st.t_visited),
+        ms(st.t_keep),
+        ms(st.t_vectorize),
+        ms(t_ckpt),
+        ms(t_pos),
+        ms(t_total),
+        crate::metrics::peak_rss_gb(),
+    );
+    crate::metrics::record("fwd.engine", st.t_engine);
+    crate::metrics::record("fwd.keys", st.t_keys);
+    crate::metrics::record("fwd.filter", st.t_filter);
+    crate::metrics::record("fwd.visited", st.t_visited);
+    crate::metrics::record("fwd.keep", st.t_keep);
+    crate::metrics::record("fwd.vectorize", st.t_vectorize);
+    crate::metrics::record("fwd.checkpoint", t_ckpt);
+    crate::metrics::record("fwd.posgraph", t_pos);
+    crate::metrics::record("fwd.frame", t_total);
 }
 
 /// Checkpoint a frontier SHARDED by (shape, cell): one file per block, under
@@ -502,7 +703,7 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &[Block]) ->
         let cell = block.shard_cell()?;
         let shape = block.shard_shape();
         let path = fdir.join(format!("c{:010}_s{:016x}_{:04}.bin", cell, shape, seq));
-        crate::search::checkpoint::save_states_to(&path, &[block.state()])?;
+        crate::search::checkpoint::save_block_to(&path, &block.rt2)?;
     }
     Ok(())
 }
@@ -544,9 +745,7 @@ fn load_frame_filtered(
         if !keep(cell) {
             continue;
         }
-        for st in crate::search::checkpoint::load_states_from(&entry.path())? {
-            out.push(Block::new(st));
-        }
+        out.push(Block::from_rt2(crate::search::checkpoint::load_block_from(&entry.path())?));
     }
     Ok(out)
 }
@@ -699,7 +898,7 @@ mod tests {
     #[ignore]
     fn forward_run_drives_the_reference_engine() {
         let mut engine = RefEngine::new().expect("ref engine");
-        let init = vec![Block::new(engine.initial_state().expect("initial state"))];
+        let init = vec![Block::from_state(&engine.initial_state().expect("initial state")).expect("block")];
 
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-test");
         let _ = std::fs::remove_dir_all(dir);
@@ -743,7 +942,7 @@ mod tests {
         let bits0 = RemPrecision::Bits(0);
         let engine = RefEngine::new().expect("ref engine");
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-filter-test");
-        let seed = || vec![Block::new(engine_clone(&engine).initial_state().expect("init"))];
+        let seed = || vec![Block::from_state(&engine_clone(&engine).initial_state().expect("init")).expect("block")];
 
         // Baseline one frame, no filter.
         {
@@ -756,7 +955,7 @@ mod tests {
         // marked_full = the widened-to-Bits(0) keys of every frame-1 state.
         let mut marked_full = Visited::new();
         for b in &frame1 {
-            let w = make_state_abstract_rem(b.state().clone(), bits0);
+            let w = make_state_abstract_rem(b.to_state(), bits0);
             let keys = crate::compiled::engine_row_keys(&w).expect("keys");
             let cells = crate::search::pos_graph::state_cells(&w).expect("cells");
             for (k, &c) in keys.iter().zip(&cells) {
@@ -826,9 +1025,9 @@ mod tests {
                 as Box<dyn FrameStep>)
         };
         let make_initial = || {
-            Ok(vec![Block::new(
-                crate::trace::refengine::RefEngine::new()?.initial_state()?,
-            )])
+            Ok(vec![Block::from_state(
+                &crate::trace::refengine::RefEngine::new()?.initial_state()?,
+            )?])
         };
 
         let outcome =
@@ -870,9 +1069,9 @@ mod tests {
                 as Box<dyn FrameStep>)
         };
         let make_initial = || {
-            Ok(vec![Block::new(
-                crate::trace::refengine::RefEngine::new()?.initial_state()?,
-            )])
+            Ok(vec![Block::from_state(
+                &crate::trace::refengine::RefEngine::new()?.initial_state()?,
+            )?])
         };
 
         let outcome = ladder_at_horizon(
@@ -912,13 +1111,13 @@ mod tests {
             load_frame(dir, frame)
                 .expect("load")
                 .iter()
-                .flat_map(|b| b.keys().expect("keys"))
+                .flat_map(|b| b.keys().to_vec())
                 .collect()
         };
 
         {
             let mut e = RefEngine::new().expect("engine");
-            let init = vec![Block::new(e.initial_state().expect("init"))];
+            let init = vec![Block::from_state(&e.initial_state().expect("init")).expect("block")];
             forward_run(&mut e, init, dir, 4, false, None).expect("fresh");
         }
         let fresh4 = keyset(4);
@@ -949,7 +1148,7 @@ mod tests {
         use crate::interpreter::abstraction::RemPrecision;
         let outcome = ladder_at_horizon(
             |_precision| Ok(Box::new(RefEngine::new()?) as Box<dyn FrameStep>),
-            || Ok(vec![Block::new(RefEngine::new()?.initial_state()?)]),
+            || Ok(vec![Block::from_state(&RefEngine::new()?.initial_state()?)?]),
             dir,
             4,
             &[RemPrecision::Bits(0)],
@@ -977,7 +1176,7 @@ mod tests {
     #[ignore]
     fn backward_walk_propagates_along_the_intro_chain() {
         let mut engine = RefEngine::new().expect("ref engine");
-        let init = vec![Block::new(engine.initial_state().expect("initial state"))];
+        let init = vec![Block::from_state(&engine.initial_state().expect("initial state")).expect("block")];
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-bwd-test");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("mkdir");
@@ -991,7 +1190,7 @@ mod tests {
             .expect("load horizon")
             .iter()
             .flat_map(|b| {
-                let keys = b.keys().expect("keys");
+                let keys = b.keys().to_vec();
                 let cells = b.positions().expect("cells");
                 keys.into_iter().zip(cells).collect::<Vec<_>>()
             })

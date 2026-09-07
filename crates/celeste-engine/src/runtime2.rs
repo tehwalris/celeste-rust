@@ -25,6 +25,7 @@ use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::pico8_num::Pico8Num;
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 
 pub type P8 = Pico8Num;
 
@@ -69,7 +70,7 @@ pub fn cell_mix(c: u64, v: AV, seed: u64) -> u64 {
 
 /// One lane's abstract value. `Copy`, 12 bytes + tag.
 /// Mirrors `interpreter::value::Value` scalar variants plus intervals.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub enum AV {
     Num(P8),
     /// Closed interval [low, high] (`Value::NumberInterval`).
@@ -85,7 +86,7 @@ pub enum AV {
 /// A column: one value per lane, or one value for EVERY lane. Uniform is
 /// the load-bearing case - appending lanes to it is free, and ops on two
 /// uniforms cost one scalar op regardless of width.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Col {
     U(AV),
     V(Vec<AV>),
@@ -114,7 +115,7 @@ impl Col {
 /// `Rt2::cols` at the same index; the other kinds are uniform by the
 /// shape premise. Closure captures are SNAPSHOTS of the capture columns
 /// (the interpreter copies capture VALUES into the closure).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Cell2 {
     Val,
     Obj(Vec<(u32, u32)>),
@@ -129,6 +130,12 @@ pub enum Cell2 {
 pub struct BoundaryIds {
     pub g_objects: u32,
     pub g_player: u32,
+    /// The spawn-animation type table: the search's position column reads
+    /// the `player` instance, or the `player_spawn` one before it exists.
+    pub g_player_spawn: u32,
+    /// The `room` table (`x`/`y` fields via `f_x`/`f_y`): the position
+    /// column is start-room-relative, and the win test is `room.x`.
+    pub g_room: u32,
     pub g_timers: Vec<u32>, // frames, seconds, minutes, deaths
     pub f_type: u32,
     pub f_rem: u32,
@@ -406,7 +413,9 @@ impl Rt2 {
 
 
 impl Rt2 {
-    fn global_target(&self, g: u32) -> Option<u32> {
+    /// The cell a table-valued global points at (`None` if unset or not a
+    /// table pointer).
+    pub fn global_target(&self, g: u32) -> Option<u32> {
         let cell = self.globals[g as usize];
         if cell == NONE {
             return None;
@@ -421,7 +430,8 @@ impl Rt2 {
         }
     }
 
-    fn obj_field_cell(&self, obj: u32, f: u32) -> Option<u32> {
+    /// The cell holding field `f` of object `obj`, if the object has it.
+    pub fn obj_field_cell(&self, obj: u32, f: u32) -> Option<u32> {
         match &self.structure[obj as usize] {
             Cell2::Obj(fields) => fields.iter().find(|(k, _)| *k == f).map(|(_, c)| *c),
             _ => None,
@@ -1104,9 +1114,12 @@ impl Rt2 {
         Some(key)
     }
 
-    /// Split into sub-blocks of lanes sharing a key value.
-    pub fn partition_by_key(self, key: &[u8]) -> Vec<Rt2> {
-        let mut order: Vec<u8> = Vec::new();
+    /// Split into sub-blocks of lanes sharing a key value, in
+    /// first-occurrence order. Representation is untouched: a column that
+    /// became uniform in a part stays a vector (see `partition_by_cell` for
+    /// the collapsing variant).
+    pub fn partition_by_key<K: PartialEq + Copy>(self, key: &[K]) -> Vec<Rt2> {
+        let mut order: Vec<K> = Vec::new();
         let mut groups: Vec<Vec<u32>> = Vec::new();
         for (i, k) in key.iter().enumerate() {
             match order.iter().position(|o| o == k) {

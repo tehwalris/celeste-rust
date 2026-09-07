@@ -1155,61 +1155,6 @@ pub fn player_xy_per_lane(state: &State) -> Option<Vec<(i16, i16)>> {
     Some(xs.into_iter().zip(ys).collect())
 }
 
-/// The heap cells that determine a state's cell in the pos-graph grid: the
-/// `room.x`/`room.y` globals and the player object's `x`/`y` (found BY TYPE,
-/// falling back to `player_spawn` for the spawn phase - the same lookup
-/// `player_xy_per_lane` and `pos_graph::state_cells` use).
-///
-/// The pos-graph recorder partitions merges on exactly these cells (only
-/// while `--record-pos-graph` is active). That makes every merged state -
-/// and hence every frame-input chunk `chunk_states` cuts - uniform in
-/// position, so the recorder can attribute a whole chunk's outputs to ONE
-/// input cell without the per-lane origin tag that used to defeat mid-frame
-/// dedup and balloon room (0,0) to 101 GB. Position (x/y) is CONTENT and is
-/// concrete per lane, so partitioning on it never changes the reachable row
-/// SET - it only makes the merge grouping finer.
-///
-/// Empty when there is no player object (dead/countdown states are all at
-/// `NO_CELL`, already uniform, so no partition cell is needed for them).
-pub fn partition_position_cells(state: &State) -> Vec<usize> {
-    let helper = StateHelper::new(state);
-    let mut cells = Vec::new();
-    if let Some(room_id) = helper
-        .find_global("room")
-        .and_then(|id| helper.unwrap_pointer(helper.load(id)))
-    {
-        if let HeapValue::ObjectTable(room) = helper.load(room_id) {
-            for axis in ["x", "y"] {
-                if let Some(&c) = room.get(axis) {
-                    cells.push(c.raw());
-                }
-            }
-        }
-    }
-    let player = helper.get_objects_array_id().and_then(|arr| {
-        helper
-            .find_objects_by_type(arr, "player")
-            .ok()
-            .and_then(|v| v.first().copied())
-            .or_else(|| {
-                helper
-                    .find_objects_by_type(arr, "player_spawn")
-                    .ok()
-                    .and_then(|v| v.first().copied())
-            })
-    });
-    if let Some(obj_id) = player {
-        if let HeapValue::ObjectTable(obj) = helper.load(obj_id) {
-            for axis in ["x", "y"] {
-                if let Some(&c) = obj.get(axis) {
-                    cells.push(c.raw());
-                }
-            }
-        }
-    }
-    cells
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
