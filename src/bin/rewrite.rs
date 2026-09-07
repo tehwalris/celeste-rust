@@ -1,18 +1,19 @@
-//! Driver for the program rewriting system. See plans/rewrite-plan.md.
-//!
-//!     rewrite search --checkpoint-dir DIR   # the rebuilt precision-ladder search
+//! The search driver: `rewrite search` (the precision ladder), `rewrite
+//! forward` (one forward pass with timing), `rewrite ckhash` (checkpoint
+//! fingerprints).
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-const DEFAULT_RECIPE: &str = "rewrites.jsonl";
+/// On DISK, not `/tmp`: `/tmp` is a tmpfs capped at 1,048,576 inodes, and
+/// the sharded frontier is one file per block - a full room (1,0) forward is
+/// ~2-3M files, so it dies of ENOSPC there with the bytes barely used
+/// (2026-09-07).
+const DEFAULT_CHECKPOINT_DIR: &str = "/var/tmp/celeste-checkpoints";
 
 #[derive(Parser)]
-#[command(about = "Apply and verify program rewrites")]
+#[command(about = "The abstract TAS search")]
 struct Cli {
-    #[arg(long, default_value = DEFAULT_RECIPE)]
-    recipe: String,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -33,7 +34,7 @@ enum Command {
         #[arg(long, default_value_t = 15)]
         maxk: u8,
         /// Base checkpoint dir (per-horizon, per-level subdirs land under it).
-        #[arg(long)]
+        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
         /// Start room "x,y".
         #[arg(long, default_value = "1,0")]
@@ -53,7 +54,7 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         k: u8,
         /// Checkpoint dir (frames land under it).
-        #[arg(long)]
+        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
         /// Start room "x,y".
         #[arg(long, default_value = "1,0")]
@@ -64,7 +65,7 @@ enum Command {
     /// here reached the same states; the format they stored them in is
     /// irrelevant.
     Ckhash {
-        #[arg(long)]
+        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
         /// Last frame to fingerprint.
         #[arg(long)]
@@ -93,14 +94,13 @@ fn main() -> Result<()> {
             if let Some(xy) = &win_at {
                 std::env::set_var("CELESTE_WIN_AT_XY", xy);
             }
-            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let precisions: Vec<RemPrecision> = (0u8..=maxk.min(15))
                 .map(RemPrecision::Bits)
                 .chain(std::iter::once(RemPrecision::Exact))
                 .collect();
             let make_engine = |p: RemPrecision| {
                 set_rem_precision(p);
-                Ok(Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room(&program)?)
+                Ok(Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)
                     as Box<dyn FrameStep>)
             };
             let make_initial = || {
@@ -123,11 +123,10 @@ fn main() -> Result<()> {
             use celeste_rust::frame::{forward_run, Block};
             use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
-            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let precision = if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) };
             set_rem_precision(precision);
             let t = std::time::Instant::now();
-            let mut engine = celeste_rust::compiled::FrameEngine::new_for_start_room(&program)?;
+            let mut engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
             eprintln!("[fwd] engine up in {:.2} s ({precision:?})", t.elapsed().as_secs_f64());
             let initial = vec![Block::from_state(
                 &celeste_rust::trace::refengine::RefEngine::new()?.initial_state()?,

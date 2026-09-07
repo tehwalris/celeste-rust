@@ -1,11 +1,11 @@
 //! The abstract forward search, and the checks that keep it honest.
 //!
-//! One frame of the search is `compiled::FrameEngine::step` - the generated
+//! One frame of the search is `compiled::FrameEngine::run_frame_block` - the assembled
 //! class kernels where they bind and the interpreter where they do not. This
 //! module is everything around that:
 //!
-//!   * `checkpoint`    - batch (de)serialization of boundary states (header +
-//!                       zstd) for the sharded frontier and the reference gates
+//!   * `checkpoint`    - block (de)serialization (header + zstd) for the
+//!                       sharded frontier
 //!   * `pos_graph`     - the position-transition graph, the backward pass's
 //!                       predecessor filter (`plans/strategy.md`)
 //!

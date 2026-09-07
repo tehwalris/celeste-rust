@@ -41,7 +41,6 @@
 //! cells no longer fit in a u16.
 
 use anyhow::{anyhow, Result};
-use std::path::Path;
 
 use crate::interpreter::abstraction::{player_xy_per_lane, room_xy_per_lane};
 use crate::interpreter::state::State;
@@ -69,9 +68,6 @@ pub const NO_CELL: u32 = (GRID * GRID) as u32;
 
 /// Number of nodes, including `NO_CELL`.
 pub const CELL_COUNT: usize = (GRID * GRID) as usize + 1;
-/// `u64` words in a bitmap over all nodes.
-pub const CELL_WORDS: usize = CELL_COUNT.div_ceil(64);
-
 /// Grid cell of a whole-pixel START-ROOM-RELATIVE position. Loud rather
 /// than clamping: a position outside the grid would silently distort the
 /// whole table.
@@ -187,48 +183,11 @@ pub struct PosGraph {
     /// `srcs[offsets[d] .. offsets[d + 1]]` for destination cell `d`.
     offsets: Vec<u32>,
     srcs: Vec<u32>,
-    /// The `frames` the table was recorded for: it has seen every
-    /// transition taken out of frames `1..frames`. Horizon-independent but
-    /// NOT frame-independent - extending the forward pass adds frames whose
-    /// transitions this has never seen, and a missing pair means the sweep's
-    /// filter never generates that candidate and nothing notices. Stored so
-    /// the sweep can check it rather than assume.
-    frames: u32,
-    /// The config fingerprint of the forward pass whose batches were
-    /// replayed. A table records the transitions of ONE search; replayed
-    /// against a different one - a recipe change, a precision level, or an
-    /// interpreter fix that makes the abstraction finer - it describes
-    /// positions that search never visits and, worse, misses ones it does.
-    /// Checked on load, because the failure is silent: a missing pair means
-    /// the sweep never generates that candidate.
-    fingerprint: String,
 }
 
 impl PosGraph {
     pub fn pairs(&self) -> usize {
         self.srcs.len()
-    }
-
-    /// The frame count this table covers (transitions out of `1..frames`).
-    pub fn frames(&self) -> u32 {
-        self.frames
-    }
-
-    /// The forward pass this table was recorded from.
-    pub fn fingerprint(&self) -> &str {
-        &self.fingerprint
-    }
-
-    /// Back to a builder, so a table can be extended over new frames.
-    pub fn into_builder(self) -> PosGraphBuilder {
-        let mut by_dst: rustc_hash::FxHashMap<u32, Vec<u32>> = Default::default();
-        for d in 0..self.offsets.len().saturating_sub(1) {
-            let (lo, hi) = (self.offsets[d] as usize, self.offsets[d + 1] as usize);
-            if lo != hi {
-                by_dst.insert(d as u32, self.srcs[lo..hi].to_vec());
-            }
-        }
-        PosGraphBuilder { by_dst }
     }
 
     /// Destination cells with at least one recorded predecessor.
@@ -242,127 +201,6 @@ impl PosGraph {
         }
         let (lo, hi) = (self.offsets[dst as usize] as usize, self.offsets[dst as usize + 1] as usize);
         &self.srcs[lo..hi]
-    }
-
-    /// Union of the predecessor cells of `dsts`, as a node bitmap.
-    ///
-    /// A destination with no recorded predecessor keeps only ITSELF. That is
-    /// the sound reading: the forward pass recorded every transition, so a
-    /// cell nothing was ever seen to step into is only reachable by being
-    /// there already (the start row), and dropping it entirely would lose
-    /// that row.
-    pub fn union_into(&self, dsts: &[u32], out: &mut [u64]) {
-        out.fill(0);
-        for &d in dsts {
-            let srcs = self.srcs_of(d);
-            if srcs.is_empty() {
-                out[d as usize / 64] |= 1 << (d % 64);
-                continue;
-            }
-            for &s in srcs {
-                out[s as usize / 64] |= 1 << (s % 64);
-            }
-        }
-    }
-
-    /// `<dir>/posgraph.bin`.
-    ///
-    /// The header carries the frame coverage, the grid the cells are
-    /// numbered in, and the fingerprint of the forward pass they came from;
-    /// `load` refuses anything it does not recognise. A table short of the
-    /// horizon silently under-generates candidates, one numbered in a
-    /// different grid is a permutation of the room, and one from a different
-    /// search describes transitions that search never took. `C8PW` (no
-    /// frame count), `C8PX` (no grid) and `C8PY` (no fingerprint) are all
-    /// refused rather than guessed at.
-    pub fn save(&self, dir: &Path) -> Result<()> {
-        use std::io::Write;
-        let tmp = dir.join("tmp-posgraph.bin");
-        {
-            let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-            w.write_all(b"C8PZ")?;
-            w.write_all(&GRID.to_le_bytes())?;
-            w.write_all(&ORIGIN.to_le_bytes())?;
-            w.write_all(&self.frames.to_le_bytes())?;
-            w.write_all(&(self.fingerprint.len() as u32).to_le_bytes())?;
-            w.write_all(self.fingerprint.as_bytes())?;
-            w.write_all(&(self.srcs.len() as u64).to_le_bytes())?;
-            for v in &self.offsets {
-                w.write_all(&v.to_le_bytes())?;
-            }
-            for v in &self.srcs {
-                w.write_all(&v.to_le_bytes())?;
-            }
-            w.flush()?;
-        }
-        std::fs::rename(&tmp, dir.join("posgraph.bin"))?;
-        Ok(())
-    }
-
-    /// Load `save`'s output, or `None` when the forward pass never wrote one.
-    pub fn load(dir: &Path) -> Result<Option<PosGraph>> {
-        use std::io::Read;
-        let path = dir.join("posgraph.bin");
-        if !path.exists() {
-            return Ok(None);
-        }
-        let mut file = std::io::BufReader::new(std::fs::File::open(&path)?);
-        let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
-        for (old, missing) in
-            [(b"C8PW", "frame coverage"), (b"C8PX", "position grid"), (b"C8PY", "forward pass")]
-        {
-            if &magic == old {
-                return Err(anyhow!(
-                    "{}: written by an older version, whose header does not pin \
-                     the {} - delete it and let the sweep rebuild it",
-                    path.display(),
-                    missing
-                ));
-            }
-        }
-        if &magic != b"C8PZ" {
-            return Err(anyhow!("{}: bad magic", path.display()));
-        }
-        let mut buf4 = [0u8; 4];
-        file.read_exact(&mut buf4)?;
-        let grid = i32::from_le_bytes(buf4);
-        file.read_exact(&mut buf4)?;
-        let origin = i32::from_le_bytes(buf4);
-        if (grid, origin) != (GRID, ORIGIN) {
-            return Err(anyhow!(
-                "{}: cells are numbered in a {}px grid at origin {}, this \
-                 build uses {}px at {} - the numbering is a permutation of \
-                 the room, so delete it and let the sweep rebuild it",
-                path.display(),
-                grid,
-                origin,
-                GRID,
-                ORIGIN
-            ));
-        }
-        file.read_exact(&mut buf4)?;
-        let frames = u32::from_le_bytes(buf4);
-        file.read_exact(&mut buf4)?;
-        let mut fp = vec![0u8; u32::from_le_bytes(buf4) as usize];
-        file.read_exact(&mut fp)?;
-        let fingerprint = String::from_utf8(fp)
-            .map_err(|_| anyhow!("{}: fingerprint is not text", path.display()))?;
-        let mut buf8 = [0u8; 8];
-        file.read_exact(&mut buf8)?;
-        let pairs = u64::from_le_bytes(buf8) as usize;
-        let mut buf = vec![0u8; (CELL_COUNT + 1) * 4];
-        file.read_exact(&mut buf)?;
-        let offsets: Vec<u32> =
-            buf.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-        let mut buf = vec![0u8; pairs * 4];
-        file.read_exact(&mut buf)?;
-        let srcs: Vec<u32> =
-            buf.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-        if offsets[CELL_COUNT] as usize != pairs {
-            return Err(anyhow!("{}: offsets end at {}, not {}", path.display(), offsets[CELL_COUNT], pairs));
-        }
-        Ok(Some(PosGraph { offsets, srcs, frames, fingerprint }))
     }
 }
 
@@ -387,21 +225,11 @@ impl PosGraphBuilder {
         }
     }
 
-    pub fn merge(&mut self, other: PosGraphBuilder) {
-        for (dst, srcs) in other.by_dst {
-            for src in srcs {
-                self.record(src, dst);
-            }
-        }
-    }
-
     pub fn pairs(&self) -> usize {
         self.by_dst.values().map(|v| v.len()).sum()
     }
 
-    /// `frames` and `fingerprint` record WHAT the table has seen (see the
-    /// fields); they are the caller's claim, not a measurement.
-    pub fn build(self, frames: u32, fingerprint: &str) -> PosGraph {
+    pub fn build(self) -> PosGraph {
         let mut offsets = Vec::with_capacity(CELL_COUNT + 1);
         let mut srcs = Vec::with_capacity(self.pairs());
         let mut by_dst = self.by_dst;
@@ -412,7 +240,7 @@ impl PosGraphBuilder {
             }
         }
         offsets.push(srcs.len() as u32);
-        PosGraph { offsets, srcs, frames, fingerprint: fingerprint.to_string() }
+        PosGraph { offsets, srcs }
     }
 }
 
@@ -451,19 +279,6 @@ impl Default for PosObserver {
 }
 
 impl PosObserver {
-    /// Start from an already-built table, so a RESUMED forward pass keeps
-    /// the transitions of the frames it is not re-running. Without this the
-    /// fused recording writes a table stamped with the full horizon but
-    /// holding only the resumed tail, and a table that is too small makes
-    /// the sweep drop real predecessors - silently, and in the direction
-    /// that loses winning paths.
-    pub fn seeded(graph: PosGraph) -> Self {
-        Self {
-            pending: std::sync::Mutex::new(Vec::new()),
-            graph: std::sync::Mutex::new(graph.into_builder()),
-        }
-    }
-
     /// The single input cell of a frame-input block, given its position
     /// column. Every lane must be at the same cell - which the by-cell
     /// regrouping guarantees while recording (see the struct doc). A
@@ -512,9 +327,9 @@ impl PosObserver {
         self.graph.lock().expect("pos observer").pairs()
     }
 
-    pub fn build(self, frames: u32, fingerprint: &str) -> PosGraph {
+    pub fn build(self) -> PosGraph {
         self.flush();
-        self.graph.into_inner().expect("pos observer").build(frames, fingerprint)
+        self.graph.into_inner().expect("pos observer").build()
     }
 }
 
@@ -544,86 +359,11 @@ mod tests {
         b.record(7, 3); // duplicate
         b.record(9, NO_CELL);
         assert_eq!(b.pairs(), 3);
-        let g = b.build(42, "fp");
-        assert_eq!(g.frames(), 42);
+        let g = b.build();
         assert_eq!(g.srcs_of(3), &[5, 7], "sorted and deduped");
         assert_eq!(g.srcs_of(NO_CELL), &[9], "the no-position node participates");
         assert_eq!(g.srcs_of(4), &[] as &[u32]);
         assert_eq!(g.pairs(), 3);
         assert_eq!(g.live_cells(), 2);
-    }
-
-    #[test]
-    fn union_keeps_an_unrecorded_destination_as_itself() {
-        let mut b = PosGraphBuilder::default();
-        b.record(7, 3);
-        let g = b.build(1, "fp");
-        let mut out = vec![0u64; CELL_WORDS];
-        let is_set = |out: &[u64], c: u16| out[c as usize / 64] & (1 << (c % 64)) != 0;
-
-        g.union_into(&[3], &mut out);
-        assert!(is_set(&out, 7));
-        assert!(!is_set(&out, 3), "the destination itself is not a predecessor");
-
-        // A destination nothing was ever seen to step into: the row that is
-        // already there must survive, so the cell keeps itself.
-        g.union_into(&[4], &mut out);
-        assert!(is_set(&out, 4));
-        assert_eq!(out.iter().map(|w| w.count_ones()).sum::<u32>(), 1);
-    }
-
-    #[test]
-    fn merge_is_the_union_of_two_builders() {
-        let mut a = PosGraphBuilder::default();
-        a.record(1, 10);
-        a.record(2, 10);
-        let mut b = PosGraphBuilder::default();
-        b.record(2, 10);
-        b.record(3, 11);
-        a.merge(b);
-        let g = a.build(7, "fp");
-        assert_eq!(g.srcs_of(10), &[1, 2]);
-        assert_eq!(g.srcs_of(11), &[3]);
-    }
-
-    /// A table that covers fewer frames than the sweep needs would silently
-    /// under-generate candidates, so the coverage travels with the file -
-    /// and the format that had no room for it is refused, not guessed at.
-    #[test]
-    fn a_saved_table_carries_its_frame_coverage_and_extends() {
-        let dir = std::env::temp_dir().join(format!("posgraph-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut b = PosGraphBuilder::default();
-        b.record(1, 10);
-        b.build(50, "abc123").save(&dir).unwrap();
-        let loaded = PosGraph::load(&dir).unwrap().expect("just saved");
-        assert_eq!(loaded.frames(), 50);
-        assert_eq!(loaded.fingerprint(), "abc123");
-        assert_eq!(loaded.srcs_of(10), &[1]);
-
-        // Extension: the old table back to a builder, plus the new frames.
-        let mut extended = loaded.into_builder();
-        extended.record(2, 10);
-        let extended = extended.build(60, "abc123");
-        assert_eq!(extended.srcs_of(10), &[1, 2]);
-        assert_eq!(extended.frames(), 60);
-
-        // Each older format left out something the sweep cannot infer, so
-        // each is refused by name rather than read hopefully.
-        for (magic, missing) in
-            [(b"C8PW", "frame coverage"), (b"C8PX", "position grid"), (b"C8PY", "forward pass")]
-        {
-            let mut raw = std::fs::read(dir.join("posgraph.bin")).unwrap();
-            raw[..4].copy_from_slice(magic);
-            std::fs::write(dir.join("posgraph.bin"), &raw).unwrap();
-            let err = match PosGraph::load(&dir) {
-                Err(e) => e.to_string(),
-                Ok(_) => panic!("the {:?} format must be refused", magic),
-            };
-            assert!(err.contains(missing), "{}", err);
-        }
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

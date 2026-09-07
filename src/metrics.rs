@@ -37,14 +37,6 @@ pub fn peak_rss_gb() -> f64 {
         .map_or(0.0, |kb| kb / 1e6)
 }
 
-/// Time a closure under `name`.
-pub fn time<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
-    let t = std::time::Instant::now();
-    let out = f();
-    record(name, t.elapsed());
-    out
-}
-
 /// Print the phase summary and, when `dir` is known, append one JSON line
 /// to `<dir>/metrics.jsonl`: {"kind", "phases": {name: {"s", "calls"}},
 /// "extra": ...}. Failures to write are loud on stderr but never fatal -

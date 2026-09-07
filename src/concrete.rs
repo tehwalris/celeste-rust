@@ -71,9 +71,8 @@ pub fn set_concrete_buttons(state: &mut State, byte: u8) -> Result<()> {
 /// one across a walk: `RefEngine` owns the parsed cart and the registered
 /// function bodies, so rebuilding per frame would re-parse the cart.
 ///
-/// It runs the ORIGINAL Lua (equivalent to the plain program - proven by
-/// `refgate`'s concrete walk), so it needs no `Program`; the layout it
-/// produces is the plain program's.
+/// It runs the ORIGINAL Lua, so the layout it produces is the plain
+/// program's.
 pub struct ConcreteEngine {
     eng: crate::trace::refengine::RefEngine,
 }

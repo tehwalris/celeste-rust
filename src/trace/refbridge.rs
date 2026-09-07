@@ -6,10 +6,10 @@
 //!   into a `trace::state::State<RefDomain>` (a fresh heap). This is the
 //!   INPUT bridge: it feeds the reference driver a mid-game state that the
 //!   old interpreter (or a checkpoint) produced.
-//! * `to_interp_state` is its inverse for a single-lane trace state, and
-//!   `row_key_of` runs that inverse through `engine_row_keys` so a reference
-//!   output gets the SAME canonical `(shape_hash, content_hash)` the compiled
-//!   engine assigns. Going through `engine_row_keys` rather than re-deriving
+//! * `to_interp_state` is its inverse for a single-lane trace state; the
+//!   search keys the result through `frame::Block::from_state` so a
+//!   reference output gets the SAME canonical `(shape_hash, content_hash)`
+//!   the compiled engine assigns. Going through the one keyer rather than re-deriving
 //!   the hash is deliberate - there is exactly one keyer and both sides use
 //!   it.
 //! * `gate` (behind an ignored test) runs an early checkpoint frame through
@@ -509,94 +509,4 @@ pub fn to_interp_state(ts: &TState<RefDomain>) -> Result<OState> {
         cx.st.global_env.insert(name, bid);
     }
     Ok(cx.st)
-}
-
-/// The canonical `(shape_hash, content_hash)` of a single-lane reference
-/// output, exactly as `engine_row_keys` computes it for the old interpreter.
-pub fn row_key_of(st: &TState<RefDomain>) -> Result<(u64, u64)> {
-    let ostate = to_interp_state(st)?;
-    let keys = crate::compiled::engine_row_keys(&ostate)?;
-    if keys.len() != 1 {
-        bail!("row_key_of: expected 1 lane, got {}", keys.len());
-    }
-    Ok(keys[0])
-}
-
-/// The engine keys of an interpreter output, put through the SAME campaign
-/// abstraction the search applies before it keys or checkpoints a frame
-/// (`split_precision_straddles` + `make_state_abstract`). Raw, un-abstracted
-/// multi-lane outputs are NOT in the search's key space - `engine_row_keys`
-/// is only consistent on abstracted states - so both sides of a differential
-/// (the bridge gate AND the sampled kernel gate) must abstract before keying.
-#[cfg(test)]
-pub(crate) fn abstract_keys(os: OState) -> std::collections::BTreeSet<(u64, u64)> {
-    let mut set = std::collections::BTreeSet::new();
-    for st in crate::interpreter::abstraction::split_precision_straddles(os) {
-        let w = crate::interpreter::abstraction::make_state_abstract(st);
-        if w.vector_size == 0 {
-            continue;
-        }
-        for k in crate::compiled::engine_row_keys(&w).expect("engine keys") {
-            set.insert(k);
-        }
-    }
-    set
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    const CKPT: &str = "/var/tmp/celeste-checkpoints/kfwd/room1";
-
-
-    /// The conversion round-trips: old lane -> trace -> old must reproduce the
-    /// SAME engine row key the original lane has. Isolates the two bridge
-    /// functions from the reference driver.
-    #[test]
-    #[ignore]
-    fn bridge_round_trips_engine_keys() {
-        let dir = Path::new(CKPT);
-        let frame = std::env::var("FRAME").ok().and_then(|s| s.parse().ok()).unwrap_or(5u32);
-        let states = crate::search::checkpoint::load_frame_states(dir, frame).expect("load frame");
-        let cap: usize = std::env::var("MAXLANES").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
-        let mut d = RefDomain::new();
-        let mut ok = 0usize;
-        let mut bad = 0usize;
-        'outer: for (si, s) in states.iter().enumerate() {
-            let want = crate::compiled::engine_row_keys(s).expect("engine keys");
-            for lane in 0..s.vector_size {
-                if ok + bad >= cap {
-                    break 'outer;
-                }
-                let ts = match to_trace_state(s, lane, &mut d) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("  state {} lane {}: to_trace_state FAILED: {:#}", si, lane, e);
-                        bad += 1;
-                        continue;
-                    }
-                };
-                match row_key_of(&ts) {
-                    Ok(got) if got == want[lane] => ok += 1,
-                    Ok(got) => {
-                        eprintln!(
-                            "  state {} lane {}: KEY MISMATCH got={:?} want={:?}",
-                            si, lane, got, want[lane]
-                        );
-                        bad += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("  state {} lane {}: row_key_of FAILED: {:#}", si, lane, e);
-                        bad += 1;
-                    }
-                }
-            }
-        }
-        eprintln!("round-trip: {} ok, {} bad", ok, bad);
-        assert_eq!(bad, 0, "{} lanes did not round-trip", bad);
-    }
-
-
 }

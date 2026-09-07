@@ -12,9 +12,8 @@
 //!   make equal rows hash differently).
 //! * `apply_conservative_widenings` - the boundary pins (gameplay-dead
 //!   timers, dash_effect_time clamp) certified by `rewrite widencheck`.
-//! * `object_shape` - what shape dispatch (`verify::Variant`) routes on.
-//! * The lane probes (`room_x_lane_mask`, `player_xy_per_lane`) that win
-//!   detection and the tools read.
+//! * The lane probes (`player_xy_per_lane`, `room_xy_per_lane`) that the
+//!   position column and the tools read.
 //!
 //! Every widening here must be an OVER-approximation: it may only grow the
 //! reachable set, never drop a state a concrete run could visit. If a
@@ -22,9 +21,6 @@
 //! and let the run fail loudly instead.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHasher;
 
 use super::{
     heap::HeapId,
@@ -34,85 +30,6 @@ use super::{
 };
 use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 
-type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-
-/// The object-array shape of a state: the sequence of type-table global
-/// names of the objects currently alive, in array order - e.g.
-/// `["fake_wall", "player"]` for room (0,0) after the spawn finishes.
-///
-/// Pointers are per-state structure, never lane-varying, so the shape is a
-/// property of the whole state: every lane in a state shares it. This is
-/// what makes shape dispatch (`verify::Variant`) a per-state decision.
-///
-/// Loud on structural surprises: an object whose `type` does not resolve
-/// unambiguously to a global would make shape dispatch silently misroute,
-/// which is worse than a crash.
-pub fn object_shape(state: &State) -> anyhow::Result<Vec<String>> {
-    use anyhow::anyhow;
-    let helper = StateHelper::new(state);
-    let arr_id = helper
-        .get_objects_array_id()
-        .ok_or_else(|| anyhow!("object_shape: no `objects` array global"))?;
-    let items: Vec<HeapId> = match helper.load(arr_id) {
-        HeapValue::ArrayTable(items) => items.clone(),
-        other => {
-            return Err(anyhow!(
-                "object_shape: `objects` is not an ArrayTable: {:?}",
-                other
-            ))
-        }
-    };
-    // Reverse map: heap id of a pointed-to table -> global names pointing at
-    // it. Built per call; the global env is small and boundary states are
-    // few. Ambiguity (two globals aliasing one type table) is an error at
-    // the point of use, not a silent pick - global_env iteration order is
-    // not deterministic.
-    let mut names: FxHashMap<HeapId, Vec<&str>> = FxHashMap::default();
-    for (name, cell) in &state.global_env {
-        if let HeapValue::Value(Value::Pointer(target)) = helper.load(*cell) {
-            names.entry(*target).or_default().push(name.as_str());
-        }
-    }
-    let mut shape = Vec::with_capacity(items.len());
-    for item in items {
-        let obj_id = helper
-            .unwrap_pointer(helper.load(item))
-            .ok_or_else(|| anyhow!("object_shape: objects element is not a pointer"))?;
-        let obj = match helper.load(obj_id) {
-            HeapValue::ObjectTable(t) => t,
-            other => {
-                return Err(anyhow!(
-                    "object_shape: object is not an ObjectTable: {:?}",
-                    other
-                ))
-            }
-        };
-        let type_ptr = obj
-            .get("type")
-            .ok_or_else(|| anyhow!("object_shape: object has no `type` field"))?;
-        let type_id = helper
-            .unwrap_pointer(helper.load(*type_ptr))
-            .ok_or_else(|| anyhow!("object_shape: object `type` is not a pointer"))?;
-        match names.get(&type_id).map(Vec::as_slice) {
-            Some([name]) => shape.push(name.to_string()),
-            Some(many) => {
-                let mut many: Vec<&str> = many.to_vec();
-                many.sort_unstable();
-                return Err(anyhow!(
-                    "object_shape: object type table is aliased by several globals: {:?}",
-                    many
-                ));
-            }
-            None => {
-                return Err(anyhow!(
-                    "object_shape: object type at heap {:?} matches no global",
-                    type_id
-                ))
-            }
-        }
-    }
-    Ok(shape)
-}
 
 /// Marks to apply when making state abstract
 pub struct HeapMarks {
@@ -359,46 +276,6 @@ pub fn spd_precision_from_env() -> SpdPrecision {
         }
         Err(_) => SpdPrecision::Exact,
     })
-}
-
-/// The composite ladder precision: spd rungs below level 0, rem rungs
-/// above it (plans/spd-rung.md). The ladder refines spd to Exact FIRST,
-/// then rem - a level is always coarsened to another by applying BOTH
-/// components of the coarser level's precision.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct LadderPrecision {
-    pub spd: SpdPrecision,
-    pub rem: RemPrecision,
-}
-
-impl LadderPrecision {
-    /// Does `self` over-approximate `finer`?
-    ///
-    /// The PRODUCT order, deliberately, not the ladder's own visiting
-    /// order: `coarsen_to` applies both components independently, so a
-    /// level that widens each coordinate at least as much abstracts every
-    /// state of the finer level into one of its own. That is the property
-    /// anything reusing a coarser level's artifacts needs, and it does not
-    /// depend on how the ladder happens to walk the levels.
-    pub fn coarser_or_equal(self, finer: LadderPrecision) -> bool {
-        self.spd.coarser_or_equal(finer.spd) && self.rem.coarser_or_equal(finer.rem)
-    }
-
-    /// Every level this build can be configured for (238 of them - small
-    /// enough to enumerate, which is how a "coarser than" claim about a
-    /// hashed fingerprint gets checked rather than assumed).
-    pub fn all() -> impl Iterator<Item = LadderPrecision> {
-        SpdPrecision::all()
-            .flat_map(|spd| RemPrecision::all().map(move |rem| LadderPrecision { spd, rem }))
-    }
-}
-
-/// Coarsen a state to `precision` - the band mapping between ladder
-/// levels. No straddle splitting is needed here: a finer level's
-/// buckets nest inside the coarser level's (rem and spd both), so the
-/// widened value is always exactly one coarse bucket.
-pub fn coarsen_to(state: State, precision: LadderPrecision) -> State {
-    make_state_abstract_spd(make_state_abstract_rem(state, precision.rem), precision.spd)
 }
 
 pub fn make_state_abstract(state: State) -> State {
@@ -1053,41 +930,6 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
     state
 }
 
-/// Lanes whose global `room.x` equals `x`.
-///
-/// `next_room()` writes the new room index when the player crosses the top of
-/// the screen, so for a search confined to one room the lanes whose `room.x`
-/// equals the next room's x (`game_runner::win_room_x()`) at a frame boundary
-/// are exactly the ones that exited - the win condition. The earliest frame
-/// where any appear is the optimal TAS length (under the search's stated
-/// abstractions).
-///
-/// Loud on structural surprises: `room` missing or non-numeric means the
-/// probe would silently never fire, which is worse than a crash.
-pub fn room_x_lane_mask(state: &State, x: i16) -> Vec<bool> {
-    let helper = StateHelper::new(state);
-    let cell = helper
-        .find_global("room")
-        .unwrap_or_else(|| panic!("room_x_lane_mask: no `room` global"));
-    let table_id = helper
-        .unwrap_pointer(helper.load(cell))
-        .unwrap_or_else(|| panic!("room_x_lane_mask: `room` global is not a table pointer"));
-    let HeapValue::ObjectTable(room) = helper.load(table_id) else {
-        panic!("room_x_lane_mask: `room` does not point at a table");
-    };
-    let x_id = *room
-        .get("x")
-        .unwrap_or_else(|| panic!("room_x_lane_mask: room table has no x field"));
-    let HeapValue::Value(Value::Number(n)) = helper.load(x_id) else {
-        panic!("room_x_lane_mask: room.x is not a number");
-    };
-    let want = Pico8Num::from_i16(x);
-    match n {
-        MaybeVector::Scalar(s) => vec![*s == want; state.vector_size.max(1)],
-        MaybeVector::Vector(v) => v.iter().map(|s| *s == want).collect(),
-    }
-}
-
 /// Per-lane `(room.x, room.y)`. Object coordinates are ROOM-LOCAL, so a
 /// room transition wraps the player's x from ~128 back to ~0; anything that
 /// measures distance between two frames has to add `room * 128` first or
@@ -1113,7 +955,7 @@ pub fn room_xy_per_lane(state: &State) -> Option<Vec<(i16, i16)>> {
 /// Per-lane (x, y) whole-pixel positions of the first object (the player or
 /// the spawn animation), or `None` when the objects array is empty (dead
 /// countdown states) or missing. Used by the per-coordinate saturation dump
-/// (`CELESTE_XY_DUMP`); analysis-only, so unexpected shapes return `None`
+/// (the position column); unexpected shapes return `None`
 /// rather than panicking - a missing histogram row is visible in the plot,
 /// and this must not take a search down.
 pub fn player_xy_per_lane(state: &State) -> Option<Vec<(i16, i16)>> {
@@ -1261,29 +1103,6 @@ mod tests {
                 assert_eq!(a.coarser_or_equal(b), nests, "spd {:?} vs {:?}", a, b);
             }
         }
-        // The product order, and the two ends of the ladder.
-        let l0 = LadderPrecision {
-            spd: SpdPrecision::Exact,
-            rem: RemPrecision::Bits(0),
-        };
-        let k16 = LadderPrecision {
-            spd: SpdPrecision::Exact,
-            rem: RemPrecision::Exact,
-        };
-        assert!(l0.coarser_or_equal(k16) && !k16.coarser_or_equal(l0));
-        assert_eq!(LadderPrecision::all().count(), 17 * 14);
-        assert!(LadderPrecision::all().all(|l| l.coarser_or_equal(l)));
-        // Incomparable levels exist and must NOT be accepted either way:
-        // coarser in rem but finer in spd is not an over-approximation.
-        let a = LadderPrecision {
-            spd: SpdPrecision::Exact,
-            rem: RemPrecision::Bits(0),
-        };
-        let b = LadderPrecision {
-            spd: SpdPrecision::WidthLog2(16),
-            rem: RemPrecision::Exact,
-        };
-        assert!(!a.coarser_or_equal(b) && !b.coarser_or_equal(a));
     }
 
     /// `SpdPrecision::Exact` must leave any state bit-identical (it is the
@@ -1336,22 +1155,5 @@ pub fn synthetic_win_xy() -> Option<(i16, i16)> {
         );
         Some(target)
     })
-}
-
-/// Which lanes have won, under whichever win condition is configured.
-///
-/// The single definition every consumer uses - the forward pass's
-/// absorbing set, the sweep's B(H) seed, the position graph's exclusion,
-/// and the CLI probes - so a synthetic target cannot be honoured by some
-/// of them and not others, which would be a silently inconsistent search.
-pub fn win_lane_mask(state: &State) -> Vec<bool> {
-    match synthetic_win_xy() {
-        None => room_x_lane_mask(state, crate::game_runner::win_room_x()),
-        Some(target) => match player_xy_per_lane(state) {
-            // No player object: nothing here can be at the target.
-            None => vec![false; state.vector_size.max(1)],
-            Some(xy) => xy.into_iter().map(|p| p == target).collect(),
-        },
-    }
 }
 

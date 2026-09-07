@@ -1,8 +1,5 @@
-//! Batch serialization of boundary states for the abstract search.
-//!
-//! The sharded frontier checkpoint (`frame::forward_run`) and the reference
-//! gates (`trace::refgate`, `trace::refbridge`) write and read batches of
-//! `State`s through these helpers. Each `.bin` is self-contained: a 16-byte
+//! Block serialization for the sharded frontier checkpoint
+//! (`frame::forward_run`). Each `.bin` is self-contained: a 16-byte
 //! header (magic + format version + payload length) followed by one zstd
 //! frame with zstd's content checksum enabled. The reader refuses any
 //! mismatch - magic or version - loudly; integrity of the payload comes from
@@ -18,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::interpreter::state::State;
 use celeste_engine::runtime2::{Cell2, Col, Rt2};
 
 const MAGIC: &[u8; 4] = b"C8TB";
@@ -70,11 +66,6 @@ struct BlockImage {
 /// Save one block to an explicit path (atomic, same header + zstd stream as
 /// every other checkpoint file).
 pub fn save_block_to(path: &Path, rt2: &Rt2) -> Result<()> {
-    assert!(
-        rt2.arena.is_empty(),
-        "checkpointing a mid-frame block: the local arena is live ({} slots)",
-        rt2.arena.len()
-    );
     assert_eq!(rt2.row_keys.len(), rt2.width, "checkpointing a block without its key column");
     // Borrow, don't clone: the image is written straight from the block.
     #[derive(Serialize)]
@@ -163,52 +154,6 @@ impl<W: Write> Write for CountingWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
-}
-
-/// Save one frame's post-subtract boundary states (`<dir>/frames/fNNN.bin`).
-/// Self-contained: header + zstd content checksum; no meta entry.
-pub fn save_frame_states(dir: &Path, frame: u32, states: &[State]) -> Result<()> {
-    let refs: Vec<&State> = states.iter().collect();
-    save_frame_state_refs(dir, frame, &refs)
-}
-
-/// Same, from borrowed references. The forward frontier is kept as the next
-/// frame's input, so it is checkpointed WITHOUT cloning every state. Bincode
-/// serializes `&[&State]` byte-identically to `&[State]`, so the file is
-/// interchangeable with `save_frame_states`'.
-pub fn save_frame_state_refs(dir: &Path, frame: u32, states: &[&State]) -> Result<()> {
-    let fdir = dir.join("frames");
-    std::fs::create_dir_all(&fdir)?;
-    save_states_to(&fdir.join(format!("f{:03}.bin", frame)), states)
-}
-
-/// Save a batch of states to an explicit path (atomic: a `tmp-` sibling is
-/// written then renamed). Same magic + version + one zstd stream as the frame
-/// files, so the sharded per-(frame,shape,cell) checkpoint reuses exactly this.
-pub fn save_states_to(path: &Path, states: &[&State]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_file_name(format!(
-        "tmp-{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("state.bin")
-    ));
-    write_bin(&tmp, |w| bincode::serialize_into(w, states).context("serializing states"))?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-/// Load a batch saved by `save_states_to` (or any of the frame savers).
-pub fn load_states_from(path: &Path) -> Result<Vec<State>> {
-    let r = read_bin_header_len(path)?;
-    bincode::deserialize_from(r).with_context(|| format!("deserializing {}", path.display()))
-}
-
-/// Load one frame's saved boundary states.
-pub fn load_frame_states(dir: &Path, frame: u32) -> Result<Vec<State>> {
-    let path = dir.join("frames").join(format!("f{:03}.bin", frame));
-    let r = read_bin_header_len(&path)?;
-    bincode::deserialize_from(r).with_context(|| format!("deserializing {}", path.display()))
 }
 
 /// `read_bin` trusting the header's own payload length (for self-contained

@@ -29,17 +29,6 @@ pub fn import_block(
     cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 ) -> Rt2 {
-    import_block_mapped(state, cart, cache).0
-}
-
-/// `import_block` plus the canonical-id -> interpreter `HeapId` map
-/// (index = canonical cell id), for tooling that needs to NAME columns
-/// (the kernel row census). Execution paths use `import_block`.
-pub fn import_block_mapped(
-    state: &State,
-    cart: std::sync::Arc<celeste_core::cart_data::CartData>,
-    cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
-) -> (Rt2, Vec<Option<HeapId>>) {
     assert!(
         state.local_env.iter().count() == 0 && state.outer_local_envs.is_empty(),
         "boundary states must have empty local envs"
@@ -73,12 +62,7 @@ pub fn import_block_mapped(
     // The BFS order IS the canonical order, so the shape key is valid
     // right away (the slot-binding shape gate reads it).
     rt2.shape_hash = rt2.shape_hash_of();
-    let _ = NONE;
-    let mut rev: Vec<Option<HeapId>> = vec![None; rt2.structure.len()];
-    for (heap_id, canon) in memo.iter() {
-        rev[*canon as usize] = Some(*heap_id);
-    }
-    (rt2, rev)
+    rt2
 }
 
 // ---- export: columnar block -> interpreter State ----
@@ -103,11 +87,6 @@ pub fn import_block_mapped(
 ///   COW history this does not read. Both are checked below rather than
 ///   assumed: a mixed column is a hard error, not a guess.
 pub fn export_block(rt2: &Rt2) -> State {
-    assert!(
-        rt2.arena.is_empty(),
-        "export_block on a mid-frame block: the local arena is live ({} slots)",
-        rt2.arena.len()
-    );
     assert!(rt2.width > 0, "export_block on a zero-lane block");
     let mut state = State::new();
     let ids: Vec<HeapId> = (0..rt2.structure.len()).map(|_| state.heap.alloc()).collect();
@@ -228,46 +207,6 @@ fn export_col(rt2: &Rt2, col: &Col, ids: &[HeapId], cell: usize) -> Value {
                      (pointer topology is lane-uniform by the block's shape premise)",
                     cell, other
                 ),
-            }
-        }
-    }
-}
-
-/// `import_block(export_block(b))` must reproduce `b`'s structure and
-/// columns exactly. This is the fallback's correctness premise stated as
-/// a check: if export loses or reorders anything, every frame the
-/// interpreter runs for the engine is silently wrong.
-pub fn assert_block_round_trips(rt2: &Rt2) {
-    let state = export_block(rt2);
-    let back = import_block(&state, rt2.cart.clone(), rt2.cache.clone());
-    assert_eq!(back.width, rt2.width, "round trip changed the lane count");
-    assert_eq!(
-        back.structure.len(),
-        rt2.structure.len(),
-        "round trip changed the cell count"
-    );
-    assert_eq!(back.globals, rt2.globals, "round trip changed the globals table");
-    for (i, (a, b)) in rt2.structure.iter().zip(back.structure.iter()).enumerate() {
-        assert_eq!(
-            format!("{:?}", a),
-            format!("{:?}", b),
-            "round trip changed cell {}'s structure",
-            i
-        );
-    }
-    for (i, (a, b)) in rt2.cols.iter().zip(back.cols.iter()).enumerate() {
-        // Uniform vs a materialized all-equal column are the same VALUE;
-        // compare per lane so a legitimate representation change is not
-        // reported as a content change.
-        if matches!(rt2.structure[i], Cell2::Val) {
-            for lane in 0..rt2.width {
-                assert_eq!(
-                    a.at(lane),
-                    b.at(lane),
-                    "round trip changed cell {} lane {}",
-                    i,
-                    lane
-                );
             }
         }
     }

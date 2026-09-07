@@ -52,8 +52,8 @@ Rust equivalents.
   merge is mispriced.
 - **Never deopt to the interpreter silently.** A deopt is a coverage gap, not
   a degraded mode. When the compiled engine has no kernel for a chunk it is
-  FATAL by default (`CELESTE_KERNEL_STRICT=0` opts back into a counted
-  fall-through). Fix the gap rather than absorbing it.
+  FATAL (`KERNEL COVERAGE GAP`, with a miss report); there is no
+  fall-through. Fix the gap rather than absorbing it.
 - **Measure before and after.** Any change that claims a performance effect
   needs numbers from an actual run, not reasoning.
 - Do not leave dead code behind. The build is warning-free; keep it that way.
@@ -96,8 +96,8 @@ exactly the thing that fails.
 cargo nextest run <filter>                                      # DEV LOOP, 1.3 s
 ./safe-run.sh -- cargo nextest run --cargo-profile quick         # PRE-COMMIT, 47 s
 ./safe-run.sh -- cargo nextest run --cargo-profile quick --run-ignored all  # rare, ~6 min
-./safe-run.sh -- ./target/release/rewrite search --checkpoint-dir /tmp/ck --room 1,0  # THE SEARCH
-./safe-run.sh -- ./target/release/celeste-rust -n 40             # legacy ref runner
+./safe-run.sh -- ./target/release/rewrite search --room 1,0        # THE SEARCH (checkpoints: /var/tmp/celeste-checkpoints)
+./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0   # one timed forward pass
 ```
 
 ### Iterating quickly - read this before running anything
@@ -222,18 +222,22 @@ finding it exists to defend.
 
 Run the suite with NEXTEST, never bare `cargo test --release`: the tests
 are fine (21 s wall for all 515 under nextest, 2026-08-16) but several
-of them mutate process-global state (instr_time, partition toggles),
+of them mutate process-global state (the rem precision, the kernel registry),
 and under cargo test's shared-process harness the
 suite has twice been observed degrading to ~70-85 MINUTES at one core.
 nextest runs each test in its own process, which contains every such
 leak by construction.
 
 Exit code 137 means OOM. Peak memory for the rebuilt `rewrite search` has not
-been re-benchmarked (BENCHMARK_DATA.md predates it), so run it sandboxed under
-`./safe-run.sh` with the 60 GB default and watch. The legacy `celeste-rust -n 40`
-reference runner is unvectorized and memory-heavy (the old ~29 GB) - do not run
-higher frame counts unsandboxed. Do not raise the cap past what `free` leaves
-after /tmp, which is a tmpfs.
+been re-benchmarked to the horizon (2026-09-07: the level-0 forward on room
+(1,0) was at 16 GB and a 4.2M-lane frontier at f65, still growing), so run
+it sandboxed under `./safe-run.sh` with the 60 GB default and watch. Do not
+raise the cap past what `free` leaves after /tmp, which is a tmpfs.
+
+Checkpoints go on DISK (`/var/tmp/celeste-checkpoints`, the default), never
+under /tmp: the sharded frontier is one file per block, and tmpfs caps /tmp
+at 1,048,576 inodes - a full room forward has more files than that and dies
+of ENOSPC with the bytes barely used (2026-09-07).
 
 The pre-rebuild search's 16-thread / 8,000-lane chunked parallel path and its
 `./parcheck.sh` byte-identity gate went with `run.rs` / `sweep*.rs`. The rebuilt
@@ -246,20 +250,29 @@ A cargo workspace since 2026-08-18 (task #150). The dependency order is
 load-bearing, not cosmetic:
 
 ```
-crates/celeste-core      pico8_num, cart_data, collision_cache   deps: -
+crates/celeste-core      pico8_num, cart_data, collision_cache,  deps: -
+                         ids, builtins
 crates/celeste-names     FROZEN name tables                      deps: -
-crates/celeste-ir        ir, frontend (Lua -> IR), builtins,     deps: core
-                         print
-crates/celeste-interp    the INTERPRETER (the oracle),           deps: core, ir
-                         game_runner, its instrumentation
+crates/celeste-interp    the old interpreter's `State` model     deps: core
+                         (heap/value/local_env/state), the
+                         abstraction layer (rem/spd widenings,
+                         precision ladder), game_runner. The
+                         reference engine is `trace::refengine`
+                         in celeste-rust; this crate is what it
+                         and the bridge speak.
 crates/celeste-engine    Rt2 block model, boundary/dedup/merge,  deps: core, names
                          row keys, kernel.rs lane primitives
-.  (celeste-rust)        search driver, program assembly,        deps: all
-                         AST tracer, graph lowering, the ASM
-                         assembler + runtime kernel registry,
-                         compiled dispatch, campaign bins
-native-probe             bench/gate binary for the engine        deps: all
+                         (the ASM call-outs + the codegen oracle)
+.  (celeste-rust)        the search (frame.rs), the AST tracer,  deps: all
+                         graph lowering, the ASM assembler +
+                         runtime kernel registry, the bins
 ```
+
+`celeste-ir` (2026-09) and `native-probe`, `src/main.rs` (the legacy
+runner) and the `src/program/` recipe machinery (all 2026-09-07) are gone;
+with them went the interpreter's merge/dedup/visited machinery
+(`vectorize`, `virtual_merge`, `visited`, `row_table`, `merge_dump`), which
+only the legacy runner reached.
 
 There used to be four more crates here: `celeste-kernels` plus one
 GENERATED kernel crate per room (~923k lines between them). They were
@@ -273,59 +286,38 @@ The 38k lines of rewrite rules that used to be the next thing to
 extract are DELETED; what is left in `celeste-rust` is laid out as:
 
 ```
-src/frame.rs   the REBUILT search: `Block`, the `FrameStep` trait, forward_run /
-               forward_resume / backward_run / ladder_at_horizon / find_optimum,
-               the precision ladder, sharded checkpoints, MarkFilter
-src/program/   Program assembly, recipes, and the frozen artifacts
-src/search/    the search's supporting pieces: checkpoint, pos_graph,
-               state_mapping. (run.rs and the sweep*.rs g/e/band numbering are
-               DELETED - the loop is src/frame.rs now.)
+src/frame.rs   the search: `Block` (an `Rt2` with its key column), the
+               `FrameStep` trait, forward_run / forward_resume / backward_run /
+               ladder_at_horizon / find_optimum, the precision ladder, the
+               per-(shape, pm1, cell) regroup, sharded checkpoints, MarkFilter
+src/search/    checkpoint (block serialization), pos_graph (the position
+               graph + the block's position column)
 src/trace/     the AST tracer (Lua -> transpile::graph::Graph) and the reference
                engine (trace::refengine, the RefEngine oracle)
 src/transpile/ the graph IR, the lowering, and the ASM assembler
                (transpile::asm)
-src/compiled/  FrameEngine dispatch, the ASM kernel registry
-               (compiled::asm_kernel), and the State <-> block bridge
+src/compiled/  FrameEngine (`run_frame_block`), the ASM kernel registry
+               (compiled::asm_kernel), dispatch counters, and the
+               State <-> block bridge
 ```
 
-`src/search` was called `src/rewrite` until 2026-08-23, which was a lie by
-then - only the `program` half was ever about rewriting.
-
 One frame of the abstract search is `celeste_rust::compiled::FrameEngine`
-`::step` - `(shape, rows) -> [(shape, rows)]`, the runtime-assembled ASM
-kernels where they bind and the interpreter where they do not. It is one impl of
-the `FrameStep` trait (`src/frame.rs`); the reference `RefEngine` is the other.
-It lives in celeste-rust so both `forward_run` and `backward_run` can call it;
-`compiled::bridge` is the `State` <-> block translation and is the only
-module that names both.
+`::run_frame_block` - `(shape, rows) -> [(shape, rows)]` over `Rt2` blocks:
+pre-partition (freeze, moving key), the runtime-assembled ASM kernels,
+boundary, cross-chunk dedup, merge per (shape, pm1 class). It is one impl of
+the `FrameStep` trait (`src/frame.rs`); the reference `RefEngine` is the
+other, and crosses `compiled::bridge` (the only module that names both
+`State` and `Rt2`) at its edge. The loop itself never touches a `State`:
+keys, positions, wins, keep, regroup and checkpoints are all column reads
+on the block (2026-09-07, `31002e3`: -43% wall, -56% peak RSS on the f44
+forward, identical (key, cell) sets).
 
-`FrameEngine::run_frame_chunk` is the same engine as ONE campaign chunk's
-frame body, and `CELESTE_COMPILED_FORWARD=1` puts it there. **Default
-OFF, but the right setting is PER ROOM, by measurement** (2026-08-20,
-BENCHMARK_DATA.md "Engine adoption validation at depth"): on room (1,0)
-at the production horizon (f094) the compiled+fused engine is -23% wall
-/ -40% peak with all 94 per-frame rowkey sets identical. (Both numbers
-predate the ASM cutover - they were measured against the generated Rust
-kernels, and the old room (0,0) "4x SLOWER" number was measured when no
-kernel bound there at all. Remeasure under `compiled::asm_kernel`
-before quoting either.) The engine's identity
-(`asm_kernel::engine_fingerprint`, a content hash over the assembled
-set) is hashed into the campaign fingerprint when it is on, so engines
-never share checkpoints. The kernel backend is `compiled::asm_kernel`:
-one binary, no cargo features, no checked-in kernel artifact - it
-retraces the start room's shapes at startup, specializes each on the
-CONSTANT LATTICE for the active precision mode (Level0 / ladder /
-exact, matching `dispatch::traced_mode`), and assembles the fused
-fork-free graph with gcc + dlopen. `CELESTE_NO_ASM_KERNELS` opts back
-to the pure reference engine (debugging only). The per-class "walk"
-kernels and the `fused` artifact were deleted 2026-08-25 after the traced set
-took every lane at f94 (BENCHMARK_DATA.md 2026-08-24: missed 0, plain-routed
-0); the non-lattice sets were replaced by the lattice-specialized ones
-2026-08-26; and the generated Rust kernel crates themselves went 2026-08-29.
-When the engine is on, a missed chunk is FATAL by default
-(`CELESTE_KERNEL_STRICT=0` opts back into the counted fall-through).
-`CELESTE_COMPILED_FORWARD=check` runs both engines and compares row-key
-sets per chunk; that is the gate, and also a test.
+The kernel backend is `compiled::asm_kernel`: one binary, no cargo
+features, no checked-in kernel artifact - it retraces the start room's
+shapes at startup, specializes each on the CONSTANT LATTICE for the active
+precision mode (Level0 / ladder / exact, `dispatch::traced_mode`), and
+assembles the fused fork-free graph with gcc + dlopen. There is no other
+engine to switch to: a chunk the kernels cannot take is FATAL.
 
 `celeste-rust` re-exports `pico8_num` / `cart_data` / `collision_cache` at
 its own root, so `celeste_rust::pico8_num::...` still resolves everywhere.
@@ -340,18 +332,18 @@ hash-consed arena), and `transpile::asm` assembles it with gcc + dlopen,
 one .so per shape, in milliseconds where rustc+LLVM took minutes over
 ~900k generated lines. There is no regen step, no staleness gate, and
 no diff to read: what runs is always what the tracer produces from the
-Lua in this checkout. The set's content hash
-(`asm_kernel::engine_fingerprint`) goes into the campaign fingerprint,
-so two builds that assemble different kernels never share checkpoints.
-`CELESTE_NO_ASM_KERNELS` opts out to the pure reference engine, for
-debugging.
+Lua in this checkout.
 
 The gates on what the kernels COMPUTE:
 `asm_kernels_reproduce_the_interpreter` (plus its ladder/exact
 variants), `every_start_room_kernel_graph_asm_compiles_the_fused_graph`
 (every start-room shape assembles and loads), the per-op bit-exact unit
-tests in `transpile::asm::tests`, and a
-`CELESTE_COMPILED_FORWARD=check` run.
+tests in `transpile::asm::tests`, and `rewrite ckhash` - the per-frame
+(key, cell)-set fingerprint of a checkpoint tree. The pinned reference is
+`gates/ckhash_room10_f000-044.txt` (room (1,0), level 0, f0-f44, taken
+2026-09-07 before the block rewrite and reproduced after it and after the
+cleanup): `rewrite forward --to 44 --room 1,0 && rewrite ckhash --to 44
+--room 1,0 | diff - gates/ckhash_room10_f000-044.txt` must be empty.
 
 `crates/celeste-names/src/gen.rs` is FROZEN, not generated. Its generator
 (`transpile::names`) walked the rewritten IR and was deleted with the walk
@@ -365,14 +357,17 @@ if the Lua changes) may be APPENDED by hand, never inserted.
 ```bash
 # THE SEARCH: find the minimal winning frame via the full precision ladder
 # (Bits 0..=15 then Exact), driven by find_optimum over sharded checkpoints.
-# --checkpoint-dir is required; --win-at x,y forces a cheap synthetic win.
+# --checkpoint-dir defaults to /var/tmp/celeste-checkpoints - ON DISK, never /tmp: the
+# sharded frontier is one file per block and /tmp (tmpfs) caps out at 1,048,576
+# inodes, which a full room forward exceeds. --win-at x,y forces a cheap synthetic win.
 ./safe-run.sh -- ./target/release/rewrite search \
-    --checkpoint-dir /tmp/ck --room 1,0 --from 94 [--to H] [--maxk 15]
+    --room 1,0 --from 94 [--to H] [--maxk 15] [--checkpoint-dir DIR]
 
-# Legacy single-lane-per-fork reference runner (RefEngine, the AST oracle).
-# Unvectorized and far slower than the compiled search; kept for its per-frame
-# dump/checkpoint diagnostics, NOT for the search.
-./safe-run.sh -- ./target/release/celeste-rust -n 30
+# One forward pass at one precision with the per-frame timing line
+# (engine / keys / dedup / regroup / checkpoint ms, lanes in/raw/kept, RSS),
+# and the checkpoint-tree fingerprint to compare two runs.
+./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0
+./target/release/rewrite ckhash --to 44 --room 1,0
 
 # Single-lane concrete execution with a fixed input sequence - fast, and the
 # basis for differential testing.

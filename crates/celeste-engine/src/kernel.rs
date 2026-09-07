@@ -26,24 +26,6 @@ pub const W: usize = 16;
 
 pub use crate::runtime2::{cell_mix, mix64};
 
-/// Which of a kernel's `KEY_CELLS` boundary canonicalizes before hashing,
-/// as bit masks in KEY_CELLS order. Built per chunk from `Rt2::mark_walk`,
-/// because "which cell is the player's rem" is a fact about the heap walk,
-/// not about the shape witness the kernel was emitted against.
-///
-/// - `rem`: boundary replaces the cell with ONE wide interval, so it makes
-///   no per-lane contribution and the key skips it entirely;
-/// - `det`: boundary clamps the value at 0 (dash_effect_time), so the key
-///   clamps before mixing.
-///
-/// Getting these wrong costs dedup ratio, never soundness - a key that
-/// separates two rows boundary would merge just materializes both.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct KeyPlan {
-    pub rem: u64,
-    pub det: u64,
-}
-
 /// One num column: 16 `Pico8Num`s, which is 16 raw `i32`s, which is one
 /// zmm register.
 ///
@@ -145,18 +127,9 @@ pub fn zn_splat(v: P8) -> ZN {
     ZN(m512(v.as_raw_u32() as i32))
 }
 #[inline(always)]
-pub fn zi_splat(lo: P8, hi: P8) -> ZI {
-    ZI { lo: zn_splat(lo), hi: zn_splat(hi) }
-}
-#[inline(always)]
 pub fn zb_splat(b: bool) -> ZB {
     ZB { val: if b { ALL } else { 0 }, known: ALL }
 }
-#[inline(always)]
-pub fn zi_of_zn(v: ZN) -> ZI {
-    ZI { lo: v, hi: v }
-}
-
 /// One machine-word column slice: the row-key fold's accumulator, and the
 /// bits of one cell's value, 16 lanes at a time.
 ///
@@ -286,66 +259,6 @@ unsafe fn mix64_v(x: __m512i) -> __m512i {
 // `zw_mix1/2` chain over only the non-const cells (which is unsound to
 // dedup on ACROSS shapes; see plans/dedup-frontier.md). Each is gated
 // byte-identical against the scalar `cell_mix` in tests.
-
-#[inline(always)]
-fn zw_or(a: ZW, b: ZW) -> ZW {
-    unsafe { ZW(_mm512_or_si512(a.0, b.0), _mm512_or_si512(a.1, b.1)) }
-}
-#[inline(always)]
-fn zw_xor(a: ZW, b: ZW) -> ZW {
-    unsafe { ZW(_mm512_xor_si512(a.0, b.0), _mm512_xor_si512(a.1, b.1)) }
-}
-
-/// 64-bit wrapping add, lane for lane - the row-key accumulation step.
-#[inline(always)]
-pub fn zw_add(a: ZW, b: ZW) -> ZW {
-    unsafe { ZW(_mm512_add_epi64(a.0, b.0), _mm512_add_epi64(a.1, b.1)) }
-}
-
-/// `mix64` over a whole ZW - the row key's final fold (and the interval
-/// inner mix). Public so the emitter can spell the closing `mix64(part + Σ)`.
-#[inline(always)]
-pub fn zw_mix64(x: ZW) -> ZW {
-    unsafe { ZW(mix64_v(x.0), mix64_v(x.1)) }
-}
-
-/// `cell_mix(c, AV::Num(v), seed)` for a whole ZN column.
-#[inline(always)]
-pub fn zw_cellmix_n(c: u64, x: ZN, seed: u64) -> ZW {
-    // av_code(Num) = 1<<56 | bits(v); cell_mix = mix64(seed ^ c*GOLD ^ av_code)
-    let base = zw_splat(seed ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-    let code = zw_or(zw_splat(1u64 << 56), zw_bits_n(x));
-    zw_mix64(zw_xor(base, code))
-}
-
-/// `cell_mix(c, AV::Ival(lo, hi), seed)` for a ZI column.
-#[inline(always)]
-pub fn zw_cellmix_i(c: u64, x: ZI, seed: u64) -> ZW {
-    // av_code(Ival) = 2<<56 | ((lo<<24) ^ mix64(hi<<1))
-    let base = zw_splat(seed ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-    let lo = zw_bits_n(x.lo);
-    let hi = zw_bits_n(x.hi);
-    let lo24 = unsafe { ZW(_mm512_slli_epi64::<24>(lo.0), _mm512_slli_epi64::<24>(lo.1)) };
-    let hi1 = unsafe { ZW(_mm512_slli_epi64::<1>(hi.0), _mm512_slli_epi64::<1>(hi.1)) };
-    let inner = zw_xor(lo24, zw_mix64(hi1));
-    let code = zw_or(zw_splat(2u64 << 56), inner);
-    zw_mix64(zw_xor(base, code))
-}
-
-/// `cell_mix(c, AV::Bool(v)|UBool, seed)` for a ZB column: per lane the
-/// `known` bit selects Bool(val) (av_code 3<<56|val) vs UBool (4<<56).
-#[inline(always)]
-pub fn zw_cellmix_b(c: u64, x: ZB, seed: u64) -> ZW {
-    let base = seed ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    let code: [u64; W] = std::array::from_fn(|i| {
-        if (x.known >> i) & 1 != 0 {
-            3u64 << 56 | ((x.val >> i) & 1) as u64
-        } else {
-            4u64 << 56
-        }
-    });
-    zw_mix64(zw_xor(zw_splat(base), ZW::from_array(code)))
-}
 
 
 // ---- 16-lane PICO-8 arithmetic ----
@@ -553,59 +466,12 @@ pub fn zi_abs(a: ZI) -> ZI {
     }
 }
 
-/// av_mul interval arm: interval * positive num, per lane.
-///
-/// The multiplier's POSITIVITY is a premise, not a branch: the emitter
-/// records `b > 0` as a conjunct of the member's validity, and a lane
-/// that fails it is filtered out downstream. Lanes that fail it here are
-/// left UNCHANGED rather than scaled, matching the scalar version, whose
-/// `scale_positive` asserts - the value of a filtered lane is never read.
-#[inline(always)]
-pub fn zi_mul_pos(a: ZI, b: ZN) -> ZI {
-    unsafe {
-        let ok = _mm512_cmpgt_epi32_mask(b.0, _mm512_setzero_si512());
-        let lo = zn_mul(a.lo, b);
-        let hi = zn_mul(a.hi, b);
-        ZI {
-            lo: ZN(_mm512_mask_blend_epi32(ok, a.lo.0, lo.0)),
-            hi: ZN(_mm512_mask_blend_epi32(ok, a.hi.0, hi.0)),
-        }
-    }
-}
-
-/// The dividing twin of `zi_mul_pos`, and a HOLE for the same reason
-/// `zn_div` is: `((a as i64) << 16) / b` has no vector instruction. Four
-/// sites in the room's kernels.
-#[inline(always)]
-pub fn zi_div_pos(a: ZI, b: ZN) -> ZI {
-    let zero = P8::from_i16(0);
-    let (alo, ahi, bb) = (a.lo.to_array(), a.hi.to_array(), b.to_array());
-    let mut lo = alo;
-    let mut hi = ahi;
-    for i in 0..W {
-        if bb[i] > zero {
-            let r = IV::new(alo[i], ahi[i]).div_positive(bb[i]);
-            lo[i] = r.low;
-            hi[i] = r.high;
-        }
-    }
-    ZI { lo: ZN::from_array(lo), hi: ZN::from_array(hi) }
-}
-
 /// av_flr interval arm. Whether the floor is UNIQUE is a premise
-/// (`zi_flr_ok`), so this just takes the low endpoint's floor - which is
+/// (the floor premise), so this just takes the low endpoint's floor - which is
 /// the floor, on every lane that survives the premise.
 #[inline(always)]
 pub fn zi_flr(a: ZI) -> ZN {
     zn_flr(a.lo)
-}
-
-/// The premise `zi_flr` is taken under: this lane's interval has ONE
-/// floor. `known: ALL` because the answer is a fact about the interval,
-/// never itself undecided.
-#[inline(always)]
-pub fn zi_flr_ok(a: ZI) -> ZB {
-    ZB { val: mask_eq(zn_flr(a.lo), zn_flr(a.hi)), known: ALL }
 }
 
 /// The premise `zi_fork_flr` is taken under: this lane's interval spans
@@ -683,53 +549,6 @@ pub fn zi_cmp(op: Cmp, a: ZI, b: ZI) -> ZB {
 }
 
 
-/// `zi_cmp`'s scalar sibling: one block-uniform interval pair, tri-state
-/// out. `Some` when every value pair decides the comparison the same way,
-/// `None` when the intervals straddle - the caller (a `K::STri`) deopts
-/// the slice on `None` if the result feeds a branch-like consumer.
-#[inline(always)]
-pub fn si_cmp(op: Cmp, a: (P8, P8), b: (P8, P8)) -> Option<bool> {
-    let (al, ah, bl, bh) = (a.0, a.1, b.0, b.1);
-    match op {
-        Cmp::Lt => {
-            if ah < bl {
-                Some(true)
-            } else if al >= bh {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        Cmp::Le => {
-            if ah <= bl {
-                Some(true)
-            } else if al > bh {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        Cmp::Gt => {
-            if al > bh {
-                Some(true)
-            } else if ah <= bl {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        Cmp::Ge => {
-            if al >= bh {
-                Some(true)
-            } else if ah < bl {
-                Some(false)
-            } else {
-                None
-            }
-        }
-    }
-}
-
 // ---- bool ops ----
 
 #[inline(always)]
@@ -791,14 +610,6 @@ pub fn zsel_b(c: ZB, t: ZB, f: ZB) -> ZB {
         val: (c.val & t.val) | (!c.val & f.val),
         known: (c.val & t.known) | (!c.val & f.known),
     }
-}
-
-/// The lanes on which `c` is DEFINITELY TRUE - known, and true. Validity
-/// is the AND of these masks, so this is the one place a tri-state
-/// becomes a plain lane mask.
-#[inline(always)]
-pub fn zb_holds(c: ZB) -> u16 {
-    c.val & c.known
 }
 
 // ---- refinement splits ----
@@ -938,16 +749,6 @@ pub fn zn_tile_flag_at_lanes(
     ZB { val, known: ALL }
 }
 
-pub fn si_add(a: (P8, P8), b: (P8, P8)) -> (P8, P8) {
-    let r = IV::new(a.0, a.1) + IV::new(b.0, b.1);
-    (r.low, r.high)
-}
-#[inline(always)]
-pub fn si_sub(a: (P8, P8), b: (P8, P8)) -> (P8, P8) {
-    let r = IV::new(a.0, a.1) - IV::new(b.0, b.1);
-    (r.low, r.high)
-}
-
 /// A slice-local set of row keys, for a kernel deduping its own output.
 ///
 /// Open-addressed, because the key IS already a 128-bit hash: a
@@ -986,21 +787,6 @@ impl RowSet {
     pub fn new() -> Self {
         RowSet { slots: vec![(0, 0, 0); 4096], mask: 4095, gen: 1, len: 0 }
     }
-
-    /// CHUNK-scoped, not slice-scoped (2026-08-27). The set is allocated
-    /// fresh per chunk in `dispatch::run_chunk_kernel`; keeping it live
-    /// across the chunk's 16-lane slices means a successor two different
-    /// input lanes both produce is deduped BEFORE it is materialized,
-    /// instead of being written twice and second-passed by the boundary.
-    /// The forward profile showed 9.9B rows materialized -> 3.66B after
-    /// the boundary (2.7:1): those cross-slice duplicates dominate the
-    /// memory-bound append, and this catches them at the door - the
-    /// kernel "run" phase dropped ~2.24x and the whole compiled frame
-    /// ~1.9x. A no-op so the generated kernels' per-slice calls stay
-    /// valid; the table GROWS (below) instead of degrading, because a
-    /// chunk holds far more than one slice's rows.
-    #[inline(always)]
-    pub fn next_slice(&mut self) {}
 
     fn grow(&mut self) {
         let cap = self.slots.len() * 2;
@@ -1257,59 +1043,6 @@ mod tests {
         let _ = zi_add(a, a);
     }
 
-    /// The premises the fork is taken under, and the fork itself,
-    /// against the case analysis they encode.
-    #[test]
-    fn the_floor_premises_and_the_fork_agree_with_their_definition() {
-        let one = P8::from_i16(1);
-        for seed in 0..96 {
-            let a = ival(seed);
-            let (al, ah) = (a.lo.to_array(), a.hi.to_array());
-            let (mut uniq, mut span) = (0u16, 0u16);
-            for i in 0..W {
-                let (fl, fh) = (al[i].flr(), ah[i].flr());
-                if fl == fh {
-                    uniq |= 1 << i;
-                }
-                if fl == fh || fh == fl + one {
-                    span |= 1 << i;
-                }
-            }
-            assert_eq!(zi_flr_ok(a).val, uniq, "zi_flr_ok {}", seed);
-            assert_eq!(zi_span_ok(a).val, span, "zi_span_ok {}", seed);
-            assert_eq!(zi_flr(a), zn_flr(a.lo), "zi_flr {}", seed);
-
-            // The fork, both configurations, against `zi_fork_flr`'s
-            // three cases written out.
-            for c in 0..2usize {
-                let (got, gv) = zi_fork_flr(a, c);
-                let (mut lo, mut hi) = (al, ah);
-                let mut valid = 0u16;
-                for i in 0..W {
-                    let (fl, fh) = (al[i].flr(), ah[i].flr());
-                    if fh == fl + one {
-                        valid |= 1 << i;
-                        if c == 0 {
-                            hi[i] = fh.next_smallest();
-                        } else {
-                            lo[i] = fh;
-                        }
-                    } else if c == 0 {
-                        valid |= 1 << i;
-                    }
-                }
-                assert_eq!(gv, valid, "fork {} validity, seed {}", c, seed);
-                // Only the VALID lanes' values are ever read.
-                for i in 0..W {
-                    if valid & (1 << i) != 0 {
-                        assert_eq!(got.lo.lane(i), lo[i], "fork {} lo lane {}", c, i);
-                        assert_eq!(got.hi.lane(i), hi[i], "fork {} hi lane {}", c, i);
-                    }
-                }
-            }
-        }
-    }
-
     /// The row-key fold, eight lanes at a time, against the scalar
     /// `mix64` that DEFINES the key. A disagreement here does not fail
     /// loudly anywhere else - it silently changes which successors are
@@ -1361,52 +1094,6 @@ mod tests {
             assert_eq!(zw_bits_b(b).to_array(), want, "bits_b {:04x}/{:04x}", val, known);
         }
     }
-    /// The vectorized `cell_mix` (full row-key contribution) for every
-    /// per-lane output-column type, gated BYTE-IDENTICAL against the scalar
-    /// `cell_mix` that DEFINES the boundary row key. This is the primitive a
-    /// sound canonical-emission kernel folds over all cells; a disagreement
-    /// here silently changes which successors are distinct, so it is checked
-    /// directly against the definition rather than any second copy.
-    #[test]
-    fn vector_cell_mix_agrees_with_the_scalar_definition() {
-        use crate::runtime2::{cell_mix, AV};
-        let seeds = [0x5bf0_3635u64, 0x27d4_eb2f, 0, 1, 0xdead_beef_cafe_f00d];
-        let cells = [0u64, 1, 20, 39, 41, 255, 0xffff_ffff];
-        for s in seeds {
-            for c in cells {
-                for k in 0..24usize {
-                    let col = column(k);
-                    let got = zw_cellmix_n(c, col, s).to_array();
-                    for i in 0..W {
-                        let want = cell_mix(c, AV::Num(col.lane(i)), s);
-                        assert_eq!(got[i], want, "n c={} s={:x} k={} i={}", c, s, k, i);
-                    }
-                    let lo = column(k);
-                    let hi = column(k + 5);
-                    let iv = ZI { lo, hi };
-                    let got = zw_cellmix_i(c, iv, s).to_array();
-                    for i in 0..W {
-                        let want = cell_mix(c, AV::Ival(lo.lane(i), hi.lane(i)), s);
-                        assert_eq!(got[i], want, "i c={} s={:x} k={} i={}", c, s, k, i);
-                    }
-                }
-                for (val, known) in [(0u16, 0u16), (ALL, ALL), (0x5555, 0xaaaa), (1, 0xffff), (0xf0f0, 0x0ff0)] {
-                    let b = ZB { val, known };
-                    let got = zw_cellmix_b(c, b, s).to_array();
-                    for i in 0..W {
-                        let av = if (known >> i) & 1 != 0 {
-                            AV::Bool((val >> i) & 1 != 0)
-                        } else {
-                            AV::UBool
-                        };
-                        let want = cell_mix(c, av, s);
-                        assert_eq!(got[i], want, "b c={} s={:x} v={:x}/{:x} i={}", c, s, val, known, i);
-                    }
-                }
-            }
-        }
-    }
-
     /// Round-tripping a column through an array must be the identity,
     /// which is the premise `append` and the row-key walk rely on when
     /// they read one lane at a time.
@@ -1468,19 +1155,4 @@ mod tests {
         }
     }
 
-    /// A degenerate interval must judge exactly like the number.
-    #[test]
-    fn degenerate_intervals_agree_with_numbers() {
-        for seed in 0..32 {
-            let (a, b) = (column(seed), column(seed + 17));
-            let (ia, ib) = (zi_of_zn(a), zi_of_zn(b));
-            assert_eq!(zi_cmp(Cmp::Lt, ia, ib).val, zn_lt(a, b).val);
-            assert_eq!(zi_cmp(Cmp::Le, ia, ib).val, zn_le(a, b).val);
-            assert_eq!(zi_cmp(Cmp::Gt, ia, ib).val, zn_gt(a, b).val);
-            assert_eq!(zi_cmp(Cmp::Ge, ia, ib).val, zn_ge(a, b).val);
-            for op in [Cmp::Lt, Cmp::Le, Cmp::Gt, Cmp::Ge] {
-                assert_eq!(zi_cmp(op, ia, ib).known, ALL, "a point is always decided");
-            }
-        }
-    }
 }

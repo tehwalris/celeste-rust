@@ -1,23 +1,13 @@
-//! Columnar abstract runtime (plans/columnar-engine.md).
+//! The columnar block (plans/columnar-engine.md): the search's data
+//! currency and the ASM kernels' input/output.
 //!
-//! The SAME generated program (gen.rs, via the `Engine` trait) runs over a
-//! BLOCK of abstract lanes: heap structure is shared (uniform across lanes
-//! by the shape premise), values are per-lane columns, and the
-//! lane-multiplying instructions (`expand`, `__split_by_flr`, `__split_at`)
-//! append lanes to the block mid-flight instead of forking control flow -
-//! which the zero-divergence census makes legal.
-//!
-//! Per-lane value semantics are ports of the interpreter's scalar-state
-//! arms, with file:line pointers:
-//!   op.rs:397-666  (binary ops, interval compares -> tri-state)
-//!   op.rs:12-49    (unary ops)
-//!   flow.rs:343    (branch truthiness; UnknownBool branch = fork, which
-//!                   this engine treats as a loud error - the compiled
-//!                   shape program has no such branch)
-//!   game_runner.rs (builtin interval arms: min/max/abs/flr/sin, splits)
-//!
-//! Boundary abstraction ports abstraction.rs (rem widening, dash_effect_time
-//! clamp, timer pins); the mark walk runs over the shared structure heap.
+//! A BLOCK of abstract lanes: heap structure is shared (uniform across
+//! lanes by the shape premise), values are per-lane columns. The kernels
+//! append output lanes to accumulator blocks; this module owns the block's
+//! partition/retain/merge primitives and the BOUNDARY - the Bits(0)
+//! widenings ported from abstraction.rs (rem widening, dash_effect_time
+//! clamp, fruit off/y), canonical renumbering, the row keys and the
+//! within-block dedup.
 
 use std::sync::Arc;
 
@@ -29,9 +19,9 @@ use serde::{Deserialize, Serialize};
 
 pub type P8 = Pico8Num;
 
-/// Row-key primitives. Shared with the generated kernels, whose per-chunk
-/// pre-dedup keys must collapse exactly what `boundary`'s keys collapse -
-/// so they mix the same way rather than approximating it.
+/// Row-key primitives. Shared with the ASM kernels' per-chunk pre-dedup
+/// (`compiled::asm_kernel`), which must collapse exactly what `boundary`'s
+/// keys collapse - so they mix the same way rather than approximating it.
 #[inline]
 pub fn mix64(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -51,16 +41,6 @@ pub fn av_code(v: AV) -> u64 {
         AV::Ptr(p) => 7u64 << 56 | p as u64,
         AV::NilPtr => 8u64 << 56,
     }
-}
-
-/// Gate for the per-row kernel-key VALUE check (`CELESTE_KERNEL_KEY_CHECK=1`):
-/// when on, the generated `append` records its emitted key in `row_keys` and
-/// `boundary_finish` ASSERTS the boundary recomputes the same key, byte for
-/// byte, per row. This is the gate that proves `mix64(KPART+h)` == `b.row_keys`
-/// (not just the same partition) and guards it forever.
-pub fn key_check() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_KEY_CHECK").is_some())
 }
 
 #[inline]
@@ -161,30 +141,11 @@ pub struct Rt2 {
     /// Per-cell value columns, parallel to `structure` (meaningful for
     /// `Cell2::Val`).
     pub cols: Vec<Col>,
-    /// Local-value arena. `None` = killed (use-after-kill panics loudly).
-    /// Cleared at every frame boundary - all locals are dead there.
-    pub arena: Vec<Option<Col>>,
     pub globals: Vec<u32>,
     pub strings: Vec<String>,
     pub cart: Arc<CartData>,
     pub cache: Arc<CollisionCache>,
     pub prints: Vec<String>,
-    // stats
-    pub stat_splits: u64,
-    pub stat_appended: u64,
-    pub stat_arena_peak: usize,
-    /// COW lane maps (plans/columnar-engine.md "COW/lane-indirection"):
-    /// one entry per widen this frame, (width_before, map current-lane ->
-    /// that width's lane space; identity on 0..width_before). A column
-    /// whose len is smaller than the block width reads appended lanes
-    /// through the matching map instead of being physically widened.
-    history: Vec<(usize, Vec<u32>)>,
-    /// Recycled column buffers (killed/overwritten varying columns).
-    pool: Vec<Vec<AV>>,
-    /// Per-category time census (CELESTE_OP_CENSUS=1): name -> (ns, calls,
-    /// lanes). The data that decides the next optimization, op_census
-    /// doctrine.
-    pub census: Option<FxHashMap<&'static str, (u64, u64, u64)>>,
     /// Set by `boundary`: the canonical structure hash (the shape key).
     pub shape_hash: u64,
     /// Set by `boundary`: per-lane 128-bit canonical row keys.
@@ -267,143 +228,13 @@ impl Rt2 {
             width,
             structure: Vec::new(),
             cols: Vec::new(),
-            arena: Vec::new(),
             globals: vec![NONE; globals_len],
             strings: static_strings.iter().map(|s| s.to_string()).collect(),
             cart,
             cache,
             prints: Vec::new(),
-            stat_splits: 0,
-            stat_appended: 0,
-            stat_arena_peak: 0,
-            pool: Vec::new(),
-            census: std::env::var_os("CELESTE_OP_CENSUS").map(|_| FxHashMap::default()),
-            history: Vec::new(),
             shape_hash: 0,
             row_keys: Vec::new(),
-        }
-    }
-
-    /// Append lanes: `srcs[k]` is the source lane the k-th appended lane
-    /// copies. Uniform columns are untouched (appending a copy preserves
-    /// uniformity); varying columns extend. Covers every live local column
-    /// (the whole call stack - the arena is shared) and every heap value
-    /// column.
-    fn widen(&mut self, srcs: &[usize]) {
-        if srcs.is_empty() {
-            return;
-        }
-        let t = self.t0();
-        self.stat_splits += 1;
-        self.stat_appended += srcs.len() as u64;
-        let old_w = self.width;
-        // COW: no column is touched. Extend every existing map, then
-        // record this width's map (identity below old_w, srcs above).
-        for (_, map) in self.history.iter_mut() {
-            map.reserve(srcs.len());
-            for &s in srcs {
-                let m = map[s];
-                map.push(m);
-            }
-        }
-        let mut map: Vec<u32> = Vec::with_capacity(old_w + srcs.len());
-        map.extend(0..old_w as u32);
-        map.extend(srcs.iter().map(|&s| s as u32));
-        self.history.push((old_w, map));
-        self.width += srcs.len();
-        self.rec("widen", t);
-    }
-
-    #[inline]
-    fn rec(&mut self, name: &'static str, t0: Option<std::time::Instant>) {
-        if let (Some(census), Some(t0)) = (self.census.as_mut(), t0) {
-            let e = census.entry(name).or_insert((0, 0, 0));
-            e.0 += t0.elapsed().as_nanos() as u64;
-            e.1 += 1;
-        }
-    }
-
-    #[inline]
-    fn t0(&self) -> Option<std::time::Instant> {
-        if self.census.is_some() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        }
-    }
-
-    /// Merge a sub-block's census into an accumulator map.
-    pub fn drain_census(&mut self, into: &mut FxHashMap<&'static str, (u64, u64, u64)>) {
-        if let Some(census) = self.census.take() {
-            for (k, v) in census {
-                let e = into.entry(k).or_insert((0, 0, 0));
-                e.0 += v.0;
-                e.1 += v.1;
-                e.2 += v.2;
-            }
-            self.census = Some(FxHashMap::default());
-        }
-    }
-
-    /// Length of a column's physical data (width means "not stale").
-    #[inline]
-    fn col_len(c: &Col) -> usize {
-        match c {
-            Col::U(_) => usize::MAX,
-            Col::V(v) => v.len(),
-            Col::N(v) => v.len(),
-            Col::I(v) => v.len(),
-        }
-    }
-
-    /// The physical index a (possibly stale) column uses for `lane`:
-    /// direct below its length, through the COW map above it.
-    #[inline]
-    fn phys(&self, len: usize, lane: usize) -> usize {
-        if lane < len {
-            return lane;
-        }
-        let (_, map) = self
-            .history
-            .iter()
-            .find(|(w, _)| *w == len)
-            .unwrap_or_else(|| panic!("stale column of len {} has no COW map", len));
-        map[lane] as usize
-    }
-
-    /// Physically widen a stale column to the block width.
-    fn materialize_col(&self, c: &Col) -> Option<Col> {
-        let len = Self::col_len(c);
-        if len >= self.width {
-            return None;
-        }
-        Some(match c {
-            Col::U(_) => unreachable!(),
-            Col::V(v) => {
-                let mut nv = Vec::with_capacity(self.width);
-                nv.extend_from_slice(v);
-                nv.extend((len..self.width).map(|i| v[self.phys(len, i)]));
-                Col::V(nv)
-            }
-            Col::N(v) => {
-                let mut nv = Vec::with_capacity(self.width);
-                nv.extend_from_slice(v);
-                nv.extend((len..self.width).map(|i| v[self.phys(len, i)]));
-                Col::N(nv)
-            }
-            Col::I(v) => {
-                let mut nv = Vec::with_capacity(self.width);
-                nv.extend_from_slice(v);
-                nv.extend((len..self.width).map(|i| v[self.phys(len, i)]));
-                Col::I(nv)
-            }
-        })
-    }
-
-    /// Materialize a heap column in place.
-    fn resolve_cell(&mut self, p: usize) {
-        if let Some(m) = self.materialize_col(&self.cols[p]) {
-            self.cols[p] = m;
         }
     }
 
@@ -763,25 +594,24 @@ impl Rt2 {
     /// boundary walks whole columns - BFS pointer scan, hashing,
     /// compaction) and clear the widen history.
     fn boundary_prepare(&mut self) {
-        for p in 0..self.cols.len() {
-            self.resolve_cell(p);
-        }
-        for ci in 0..self.structure.len() {
-            let stale: Vec<(usize, Col)> = match &self.structure[ci] {
-                Cell2::Clo(_, caps) => caps
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, c)| self.materialize_col(c).map(|m| (i, m)))
-                    .collect(),
-                _ => continue,
-            };
-            if let Cell2::Clo(_, caps) = &mut self.structure[ci] {
-                for (i, m) in stale {
-                    caps[i] = m;
-                }
-            }
-        }
-        self.history.clear();
+        // Every producer keeps its columns physically at the block width
+        // (the kernels push one lane at a time; retain/slice/merge preserve
+        // it). The boundary walks whole columns, so check rather than
+        // assume.
+        let full = |c: &Col| match c {
+            Col::U(_) => true,
+            Col::V(v) => v.len() == self.width,
+            Col::N(v) => v.len() == self.width,
+            Col::I(v) => v.len() == self.width,
+        };
+        debug_assert!(self.cols.iter().all(full), "boundary: a column is not at block width");
+        debug_assert!(
+            self.structure.iter().all(|c| match c {
+                Cell2::Clo(_, caps) => caps.iter().all(full),
+                _ => true,
+            }),
+            "boundary: a closure capture is not at block width"
+        );
     }
 
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
@@ -922,15 +752,6 @@ impl Rt2 {
         let shape_hash = self.shape_hash_of();
         self.shape_hash = shape_hash;
 
-        // Per-row kernel-key VALUE gate (CELESTE_KERNEL_KEY_CHECK=1): the
-        // generated `append` recorded its emitted key in `row_keys`; capture
-        // it before we recompute, then assert equality at the end.
-        let kernel_keys: Vec<(u64, u64)> = if key_check() {
-            std::mem::take(&mut self.row_keys)
-        } else {
-            Vec::new()
-        };
-
         // Per-lane 128-bit row key over the compacted value cells:
         // ORDER-INDEPENDENT per-cell mixes summed per lane (the
         // interpreter's row key is order-independent for the same reason).
@@ -987,34 +808,10 @@ impl Rt2 {
                 mix64(part2.wrapping_add(h2[i])),
             ))
             .collect();
-
-        if !kernel_keys.is_empty() {
-            assert_eq!(
-                kernel_keys.len(),
-                self.row_keys.len(),
-                "kernel key count != boundary key count"
-            );
-            for (i, (k, b)) in kernel_keys.iter().zip(&self.row_keys).enumerate() {
-                if k != b {
-                    let mut dump = String::new();
-                    for (c, cell) in self.structure.iter().enumerate() {
-                        if matches!(cell, Cell2::Val) {
-                            use std::fmt::Write as _;
-                            let _ = write!(dump, "\n  cell {}: {:?}", c, self.cols[c].at(i));
-                        }
-                    }
-                    panic!(
-                        "KERNEL KEY != BOUNDARY KEY at row {}: kernel {:016x}{:016x} vs boundary {:016x}{:016x} (shape {:016x}, width {}){}",
-                        i, k.0, k.1, b.0, b.1, self.shape_hash, self.width, dump
-                    );
-                }
-            }
-        }
     }
 
     /// The boundary's tail: dedup within the block (keeping the first lane
-    /// of each row key) and recycle the local arena. `boundary` =
-    /// `boundary_canonicalize` + this.
+    /// of each row key). `boundary` = `boundary_canonicalize` + this.
     fn boundary_dedup(&mut self) -> usize {
         let w = self.width;
         // Dedup within the block, keeping the first lane of each row.
@@ -1029,17 +826,6 @@ impl Rt2 {
             }
         }
         self.retain_lanes(&keep);
-
-        // All locals are dead at the boundary; recycle their buffers.
-        self.stat_arena_peak = self.stat_arena_peak.max(self.arena.len());
-        for slot in self.arena.drain(..) {
-            if let Some(Col::V(vec)) = slot {
-                if self.pool.len() < 48 {
-                    self.pool.push(vec);
-                }
-            }
-        }
-
         self.width
     }
 
@@ -1141,42 +927,6 @@ impl Rt2 {
                 b
             })
             .collect()
-    }
-
-    /// Frame-start button expansion (#47). MEASURED OUT (2026-08-18): it
-    /// makes each widen nearly free (empty arena) but the whole frame then
-    /// runs 64x wide from instruction 0 - f30 serial went 2.2s -> 7.0s.
-    /// The interpreter's lazy expansion wins for the same reason. Kept
-    /// (unused) as the measurement's artifact; delete on next cleanup.
-    #[allow(dead_code)]
-    pub fn expand_buttons(&mut self, g_button_states: u32) {
-        let arr = match self.global_target(g_button_states) {
-            Some(a) => a,
-            None => return,
-        };
-        let items = match &self.structure[arr as usize] {
-            Cell2::Arr(items) => items.clone(),
-            _ => return,
-        };
-        for item in items {
-            let target = match &self.structure[item as usize] {
-                Cell2::Val => match self.cols[item as usize] {
-                    Col::U(AV::Ptr(t)) => t,
-                    _ => item,
-                },
-                _ => item,
-            };
-            if !matches!(self.cols[target as usize], Col::U(AV::UBool)) {
-                continue;
-            }
-            let w = self.width;
-            let srcs: Vec<usize> = (0..w).collect();
-            self.widen(&srcs);
-            let mut col: Vec<AV> = Vec::with_capacity(2 * w);
-            col.extend(std::iter::repeat(AV::Bool(true)).take(w));
-            col.extend(std::iter::repeat(AV::Bool(false)).take(w));
-            self.cols[target as usize] = Col::V(col);
-        }
     }
 
     /// Keep only the given lanes (ascending indices), in every value
@@ -1390,18 +1140,11 @@ impl Rt2 {
                 })
                 .collect(),
             cols: self.cols.iter().map(&slice_col).collect(),
-            arena: Vec::new(),
             globals: self.globals.clone(),
             strings: self.strings.clone(),
             cart: self.cart.clone(),
             cache: self.cache.clone(),
             prints: self.prints.clone(),
-            stat_splits: self.stat_splits,
-            stat_appended: self.stat_appended,
-            stat_arena_peak: self.stat_arena_peak,
-            pool: Vec::new(),
-            census: self.census.as_ref().map(|_| FxHashMap::default()),
-            history: Vec::new(),
             shape_hash: self.shape_hash,
             row_keys: Vec::new(),
         }
@@ -1413,18 +1156,11 @@ impl Rt2 {
             width: self.width,
             structure: self.structure.clone(),
             cols: self.cols.clone(),
-            arena: Vec::new(),
             globals: self.globals.clone(),
             strings: self.strings.clone(),
             cart: self.cart.clone(),
             cache: self.cache.clone(),
             prints: self.prints.clone(),
-            stat_splits: self.stat_splits,
-            stat_appended: self.stat_appended,
-            stat_arena_peak: self.stat_arena_peak,
-            pool: Vec::new(),
-            census: self.census.as_ref().map(|_| FxHashMap::default()),
-            history: Vec::new(),
             shape_hash: self.shape_hash,
             row_keys: self.row_keys.clone(),
         }

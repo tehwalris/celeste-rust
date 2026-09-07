@@ -640,7 +640,7 @@ fn drive_forward(
         }
         frontier = next;
     }
-    let pos_graph = observer.map(|o| o.build(last, "rebuild-forward"));
+    let pos_graph = observer.map(|o| o.build());
     Ok(ForwardResult { win_frame, frames: last, pos_graph })
 }
 
@@ -1002,8 +1002,6 @@ mod tests {
         use crate::interpreter::abstraction::{set_rem_precision, RemPrecision};
         std::env::set_var("CELESTE_START_ROOM", "1,0");
         std::env::set_var("CELESTE_WIN_AT_XY", "8,107");
-        let program = crate::program::frozen::rewritten("rewrites-compile.jsonl")
-            .expect("program");
         let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-full");
         let _ = std::fs::remove_dir_all(dir);
 
@@ -1021,7 +1019,7 @@ mod tests {
 
         let make_engine = |precision: RemPrecision| {
             set_rem_precision(precision);
-            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room(&program)?)
+            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?)
                 as Box<dyn FrameStep>)
         };
         let make_initial = || {
@@ -1058,14 +1056,12 @@ mod tests {
         std::env::set_var("CELESTE_START_ROOM", "1,0");
         std::env::set_var("CELESTE_WIN_AT_XY", "8,107");
 
-        let program = crate::program::frozen::rewritten("rewrites-compile.jsonl")
-            .expect("program");
         let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-test");
         let _ = std::fs::remove_dir_all(dir);
 
         let make_engine = |precision: RemPrecision| {
             set_rem_precision(precision);
-            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room(&program)?)
+            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?)
                 as Box<dyn FrameStep>)
         };
         let make_initial = || {

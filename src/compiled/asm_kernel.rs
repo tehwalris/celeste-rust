@@ -245,7 +245,6 @@ impl AsmKernel {
 
         for mut acc in accs {
             if acc.width > 0 {
-                MATERIALIZED.fetch_add(acc.width as u64, std::sync::atomic::Ordering::Relaxed);
                 if exact {
                     // The rung-agnostic / exact sets hand back EXACT rows;
                     // widening here would pre-empt the campaign's rung.
@@ -256,18 +255,6 @@ impl AsmKernel {
                     // and computes the row keys + dedups within the block.
                     acc.boundary(ids);
                 }
-                // Option 1/4: drop rows already in the frozen frontier or
-                // emitted this frame (the boundary just computed the keys).
-                // Off (no frozen frontier) => chunk_skip is false => no-op.
-                if !acc.row_keys.is_empty() {
-                    let keep: Vec<u32> = (0..acc.width as u32)
-                        .filter(|&i| !super::dispatch::chunk_skip(acc.row_keys[i as usize]))
-                        .collect();
-                    if keep.len() < acc.width {
-                        acc.retain_lanes(&keep);
-                    }
-                }
-                KEPT.fetch_add(acc.width as u64, std::sync::atomic::Ordering::Relaxed);
                 if acc.width > 0 {
                     done.push(acc);
                 }
@@ -474,27 +461,6 @@ fn push_field(acc: &mut Rt2, f: &AsmField, buf: &[u8], i: usize) {
             }
         }
         RootKind::Word => panic!("an output field cannot be a Word root"),
-    }
-}
-
-/// Rows the generic append materialized [MATERIALIZED] before the boundary,
-/// and [KEPT] after boundary_dedup + the frozen-frontier skip. The ratio is
-/// the within-chunk waste the Rust kernels' seen/skip avoided pre-materialize.
-static MATERIALIZED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Print the append materialize/kept ratio (a rough measure of how much the
-/// generic append over-materializes vs a skip-before-materialize path).
-pub fn print_append_stats() {
-    let m = MATERIALIZED.load(std::sync::atomic::Ordering::Relaxed);
-    let k = KEPT.load(std::sync::atomic::Ordering::Relaxed);
-    if m > 0 {
-        eprintln!(
-            "[asm] append: materialized {} -> kept {} ({:.2}:1 over-materialize)",
-            m,
-            k,
-            m as f64 / k.max(1) as f64
-        );
     }
 }
 
@@ -714,12 +680,9 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
     Ok(AccTemplate { skeleton, inits })
 }
 
-/// The process-wide registry, built once on a big stack (the retrace's init
-/// interpret recurses deeper than a worker thread's default). The ASM
-/// kernels are THE kernel backend now, so this always builds when the
-/// compiled engine runs a chunk; `CELESTE_NO_ASM_KERNELS` opts out (pure
-/// reference, for debugging). The root is `CELESTE_ROOT` or the CWD.
-/// The kernel set for the CURRENT rung.
+/// The kernel set for the CURRENT rung, built once per rung on a big stack
+/// (the retrace's init interpret recurses deeper than a worker thread's
+/// default). The root is `CELESTE_ROOT` or the CWD.
 ///
 /// PER-RUNG cache (not a single process-wide set): with the widening in the
 /// graph the ladder kernels specialize to the active rem precision, so an
@@ -745,9 +708,6 @@ pub(crate) fn registry() -> Option<&'static Registry> {
 
 fn build_registry_for_current_rung() -> Option<Registry> {
     {
-        if std::env::var_os("CELESTE_NO_ASM_KERNELS").is_some() {
-            return None;
-        }
         let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
         // Build for the active rem-precision mode, matching the generated
         // set the engine would otherwise dispatch (dispatch::traced_mode).

@@ -64,56 +64,6 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
         }
         MaybeVector::Vector(std::sync::Arc::new(lanes))
     }
-    pub fn map(&self, f: impl Fn(&T) -> T) -> Self {
-        match self {
-            MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
-            MaybeVector::Vector(v) => {
-                let out: Vec<T> = v.iter().map(f).collect();
-                MaybeVector::vector(out)
-            }
-        }
-    }
-
-    /// Maps over values, potentially changing the type
-    pub fn map_to<O: std::fmt::Debug + Clone + PartialEq + Eq>(
-        &self,
-        f: impl Fn(&T) -> O,
-    ) -> MaybeVector<O> {
-        match self {
-            MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
-            MaybeVector::Vector(v) => {
-                let out: Vec<O> = v.iter().map(f).collect();
-                MaybeVector::vector(out)
-            }
-        }
-    }
-
-    pub fn map2<O: std::fmt::Debug + Clone + PartialEq + Eq>(
-        a: &Self,
-        b: &Self,
-        f: impl Fn(&T, &T) -> O,
-    ) -> MaybeVector<O> {
-        match (a, b) {
-            (MaybeVector::Scalar(a), MaybeVector::Scalar(b)) => MaybeVector::Scalar(f(a, b)),
-            (MaybeVector::Vector(a), MaybeVector::Vector(b)) => {
-                // One length check up front instead of `zip_eq`'s check per
-                // element - this is the arithmetic inner loop, and the
-                // per-element branch blocks auto-vectorization.
-                assert_eq!(a.len(), b.len(), "map2 on vectors of different sizes");
-                let out: Vec<O> = a.iter().zip(b.iter()).map(|(a, b)| f(a, b)).collect();
-                MaybeVector::vector(out)
-            }
-            // Broadcast scalar to match vector size
-            (MaybeVector::Scalar(a), MaybeVector::Vector(b)) => {
-                let out: Vec<O> = b.iter().map(|bi| f(a, bi)).collect();
-                MaybeVector::vector(out)
-            }
-            (MaybeVector::Vector(a), MaybeVector::Scalar(b)) => {
-                let out: Vec<O> = a.iter().map(|ai| f(ai, b)).collect();
-                MaybeVector::vector(out)
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,34 +125,6 @@ pub struct KeptLanes {
 }
 
 impl KeptLanes {
-    /// Runs from an ASCENDING list of kept lane indices.
-    ///
-    /// The frontier subtract knows its survivors as a short index list (at
-    /// depth ~2% of the lanes offered), so materialising a full bool mask
-    /// just to scan it back into runs is two passes over a vector that is
-    /// 50x larger than the answer. Debug-asserts ascendingness, since a
-    /// caller that got the order wrong would silently build overlapping
-    /// runs and gather the same lane twice.
-    pub fn from_sorted_indices(indices: &[u32]) -> Self {
-        let mut ranges: Vec<(u32, u32)> = Vec::new();
-        for &i in indices {
-            match ranges.last_mut() {
-                Some(last) if last.1 == i => last.1 = i + 1,
-                _ => {
-                    debug_assert!(
-                        ranges.last().is_none_or(|last| last.1 < i),
-                        "kept indices must be strictly ascending"
-                    );
-                    ranges.push((i, i + 1));
-                }
-            }
-        }
-        Self {
-            ranges,
-            total: indices.len(),
-        }
-    }
-
     pub fn from_mask(mask: &[bool]) -> Self {
         let mut ranges = Vec::new();
         let mut total = 0usize;
@@ -230,161 +152,15 @@ impl KeptLanes {
         self.total == 0
     }
 
-    /// Number of contiguous runs.
-    pub fn runs(&self) -> usize {
-        self.ranges.len()
-    }
-
     pub fn first(&self) -> Option<u32> {
         self.ranges.first().map(|&(s, _)| s)
     }
 }
 
-/// A branch condition's lanes as alternating runs: `(start, end, matches)`.
-///
-/// Built with one scan of the condition vector; both sides of a split read
-/// it, so a conditional branch scans its condition once instead of once
-/// per edge, and each vector is *split* in a single pass - every run is an
-/// `extend_from_slice` into one of the two outputs, touching each source
-/// cache line once where filtering each side separately touched nearly all
-/// of them twice.
-pub struct SplitRuns {
-    runs: Vec<(u32, u32, bool)>,
-    total_true: usize,
-    total_false: usize,
-}
-
-impl SplitRuns {
-    /// Runs of `lane == target` over the condition vector.
-    pub fn from_condition(condition: &[bool], target: bool) -> Self {
-        let mut runs = Vec::new();
-        let mut total_true = 0usize;
-        let mut total_false = 0usize;
-        let mut i = 0usize;
-        while i < condition.len() {
-            let matches = condition[i] == target;
-            let start = i;
-            while i < condition.len() && (condition[i] == target) == matches {
-                i += 1;
-            }
-            runs.push((start as u32, i as u32, matches));
-            if matches {
-                total_true += i - start;
-            } else {
-                total_false += i - start;
-            }
-        }
-        Self {
-            runs,
-            total_true,
-            total_false,
-        }
-    }
-
-    /// Lanes on the matching side.
-    pub fn total_true(&self) -> usize {
-        self.total_true
-    }
-
-    /// Lanes on the non-matching side.
-    pub fn total_false(&self) -> usize {
-        self.total_false
-    }
-
-}
-
-/// Split a vector into its matching and non-matching lanes in one pass.
-#[inline]
-fn split_vec<T>(vec: &[T], runs: &SplitRuns) -> (MaybeVector<T>, MaybeVector<T>)
-where
-    T: std::fmt::Debug + Clone + PartialEq + Eq,
-{
-    let mut out_true: Vec<T> = Vec::with_capacity(runs.total_true);
-    let mut out_false: Vec<T> = Vec::with_capacity(runs.total_false);
-    for &(start, end, matches) in &runs.runs {
-        let side = if matches { &mut out_true } else { &mut out_false };
-        side.extend_from_slice(&vec[start as usize..end as usize]);
-    }
-    // `vector` collapses uniform or single-lane sides to `Scalar`, matching
-    // what two separate filters would have produced.
-    (MaybeVector::vector(out_true), MaybeVector::vector(out_false))
-}
-
 impl Value {
-    /// Split vectors into both sides at once; `None` for scalars, which
-    /// broadcast over any lane count and stay shared.
-    #[inline]
-    pub fn split_vectors_if_vector(&self, runs: &SplitRuns) -> Option<(Self, Self)> {
-        match self {
-            Value::Bool(MaybeVector::Vector(vec)) => {
-                let (a, b) = split_vec(vec, runs);
-                Some((Value::Bool(a), Value::Bool(b)))
-            }
-            Value::Number(MaybeVector::Vector(vec)) => {
-                let (a, b) = split_vec(vec, runs);
-                Some((Value::Number(a), Value::Number(b)))
-            }
-            Value::NumberInterval(MaybeVector::Vector(vec)) => {
-                let (a, b) = split_vec(vec, runs);
-                Some((Value::NumberInterval(a), Value::NumberInterval(b)))
-            }
-            // As above: an unsplit vector desyncs both sides of the branch.
-            Value::MaybeBool(_) => panic!("{}", MAYBE_BOOL_ESCAPED),
-            _ => None,
-        }
-    }
 }
 
 impl HeapValue {
-    /// Split vectors in this heap value into both sides at once; `None` if
-    /// it holds no vectors (both sides share it unchanged).
-    #[inline]
-    pub fn split_vectors_if_needed(&self, runs: &SplitRuns) -> Option<(Self, Self)> {
-        match self {
-            HeapValue::Value(v) => v
-                .split_vectors_if_vector(runs)
-                .map(|(a, b)| (HeapValue::Value(a), HeapValue::Value(b))),
-            HeapValue::Closure(id, captures) => {
-                let any_vector = captures.iter().any(|cap| {
-                    matches!(
-                        cap,
-                        Value::Bool(MaybeVector::Vector(_))
-                            | Value::Number(MaybeVector::Vector(_))
-                            | Value::NumberInterval(MaybeVector::Vector(_))
-                            // Listed so a stray MaybeBool routes into the
-                            // per-value path and trips its guard, instead of
-                            // being skipped as "this closure has no vectors".
-                            | Value::MaybeBool(_)
-                    )
-                });
-                if !any_vector {
-                    return None;
-                }
-                let mut caps_a = Vec::with_capacity(captures.len());
-                let mut caps_b = Vec::with_capacity(captures.len());
-                for cap in captures {
-                    match cap.split_vectors_if_vector(runs) {
-                        Some((a, b)) => {
-                            caps_a.push(a);
-                            caps_b.push(b);
-                        }
-                        None => {
-                            caps_a.push(cap.clone());
-                            caps_b.push(cap.clone());
-                        }
-                    }
-                }
-                Some((
-                    HeapValue::Closure(id.clone(), caps_a),
-                    HeapValue::Closure(id.clone(), caps_b),
-                ))
-            }
-            HeapValue::ObjectTable(_)
-            | HeapValue::ArrayTable(_)
-            | HeapValue::UnknownTable
-            | HeapValue::BuiltinFun(_) => None,
-        }
-    }
 }
 
 /// Filter a vector down to the kept lanes. O(kept) per vector instead of

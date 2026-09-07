@@ -144,12 +144,6 @@ impl CollisionCache {
         })
     }
 
-    /// Lookup solid_at for player hitbox (w=6, h=5, with hitbox offset x+1, y+3)
-    #[inline]
-    pub fn solid_player(&self, x: i16, y: i16) -> Option<bool> {
-        self.solid_player_hitbox.get(x, y)
-    }
-
     /// Lookup solid_at for 1x1 area
     #[inline]
     pub fn solid_1x1(&self, x: i16, y: i16) -> Option<bool> {
@@ -183,11 +177,6 @@ impl CollisionCache {
     /// Generic solid_at lookup - falls back to computation if not cached
     pub fn solid_at(&self, cart_data: &CartData, x: i16, y: i16, w: i16, h: i16) -> Result<bool> {
         // Try cached lookups first for common cases
-        if w == 6 && h == 5 {
-            // This is the player hitbox case - but solid_player expects pre-offset coords
-            // The caller should use solid_player directly if they know the offset
-        }
-
         if w == 1 && h == 1 {
             if let Some(v) = self.solid_1x1(x, y) {
                 return Ok(v);

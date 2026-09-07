@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     heap::{Heap, HeapId},
     local_env::LocalEnv,
-    value::{HeapValue, MaybeVector, Value},
+    value::{HeapValue, Value},
 };
 
 // Use FxHash for faster hashing
@@ -38,8 +38,7 @@ pub const FILTER_DEDUP: FilterReason = "filter_dedup";
 /// the same input suffix, so re-expanding them finds nothing new).
 pub const FILTER_VISITED: FilterReason = "filter_visited";
 
-/// Lane-chunking of oversized states before a frame (see
-/// `AbstractRun::step`, CELESTE_MAX_STATE_LANES): pure mechanics, no
+/// Lane-chunking of oversized states before a frame: pure mechanics, no
 /// semantic filtering - the chunks re-merge at the boundary.
 pub const FILTER_CHUNK: FilterReason = "filter_chunk";
 
@@ -142,38 +141,6 @@ impl State {
         }
     }
 
-    pub fn map_values_in_place(&mut self, f: impl Fn(Value) -> Value) {
-        let f = &f;
-        self.heap.map_in_place(|v| match v {
-            HeapValue::Value(v) => HeapValue::Value(f(v)),
-            HeapValue::Closure(id, values) => {
-                HeapValue::Closure(id, values.into_iter().map(f).collect())
-            }
-            HeapValue::ObjectTable(_)
-            | HeapValue::ArrayTable(_)
-            | HeapValue::UnknownTable
-            | HeapValue::BuiltinFun(_) => v,
-        });
-        self.local_env.map_in_place(f);
-        for env in &mut self.outer_local_envs {
-            env.map_in_place(f);
-        }
-    }
-
-    /// Filters all vector values in the state by a mask, consuming self.
-    /// The resulting state's vector_size will be the number of true values in the mask.
-    ///
-    /// `reason` names the call site and becomes the trace span name. Filtering is
-    /// a large share of runtime, and the three reasons have very different
-    /// meanings: `FILTER_BRANCH` is overhead we intend to eliminate by making
-    /// the program branch-free, whereas `FILTER_SPLIT_FLR` is semantically
-    /// necessary interval refinement. Keeping them apart in traces is the only
-    /// way to size that prize. See plans/rewrite-plan.md.
-    pub fn filter_by_mask(mut self, mask: &[bool], reason: FilterReason) -> Self {
-        self.filter_by_mask_in_place(mask, reason);
-        self
-    }
-
     fn filter_by_mask_in_place(&mut self, mask: &[bool], reason: FilterReason) {
         // The mask is scanned once here; every vector below gathers the
         // kept lanes directly, O(kept) per vector instead of O(mask), and
@@ -211,140 +178,11 @@ impl State {
         }
     }
 
-    /// Split the state at a conditional branch: one pass over the condition
-    /// and one pass over every vector, producing both edges' states.
-    /// Semantically identical to filtering twice (once per edge with
-    /// negated masks), but the condition is scanned once, the state is
-    /// cloned once (COW), and each vector's cache lines are touched once
-    /// instead of nearly twice - `filter_branch` was 9.8 s at frame 44.
-    ///
-    /// `None` on a side means no lanes took that edge.
-    pub fn split_by_condition(self, condition: &[bool], target: bool) -> (Option<Self>, Option<Self>) {
-        let runs = super::value::SplitRuns::from_condition(condition, target);
-        if runs.total_false() == 0 {
-            return (Some(self), None);
-        }
-        if runs.total_true() == 0 {
-            return (None, Some(self));
-        }
-
-        let mut state_true = self;
-        let mut state_false = state_true.clone();
-        state_true
-            .heap
-            .split_vectors_in_place(&mut state_false.heap, &runs);
-        state_true
-            .local_env
-            .split_vectors_in_place(&mut state_false.local_env, &runs);
-        for (env_true, env_false) in state_true
-            .outer_local_envs
-            .iter_mut()
-            .zip(state_false.outer_local_envs.iter_mut())
-        {
-            env_true.split_vectors_in_place(env_false, &runs);
-        }
-        state_true.vector_size = runs.total_true();
-        state_false.vector_size = runs.total_false();
-
-        // Census parity with the two filters this replaces: one branch-
-        // filter event and one reason event per side.
-
-        (Some(state_true), Some(state_false))
-    }
-
-    /// Duplicates every lane of the state: lanes `[l1..lN]` become
-    /// `[l1..lN, l1..lN]` and `vector_size` doubles. Scalars broadcast over
-    /// any lane count and stay scalar, so only vectors are touched.
-    ///
-    /// The engine behind `Instruction::Expand`, which follows this with a
-    /// per-lane bool that is `true` on the first copy and `false` on the
-    /// second - together they enumerate both values of an unknown bool
-    /// without splitting the state.
-    pub fn expand_lanes(&mut self) {
-        fn double<T: std::fmt::Debug + Clone + PartialEq + Eq>(
-            v: MaybeVector<T>,
-        ) -> MaybeVector<T> {
-            match v {
-                MaybeVector::Scalar(s) => MaybeVector::Scalar(s),
-                MaybeVector::Vector(mut arc) => {
-                    // Copies only if another state still shares the lanes.
-                    std::sync::Arc::make_mut(&mut arc).extend_from_within(..);
-                    MaybeVector::Vector(arc)
-                }
-            }
-        }
-        self.map_values_in_place(|value| match value {
-            Value::Number(v) => Value::Number(double(v)),
-            Value::NumberInterval(v) => Value::NumberInterval(double(v)),
-            Value::Bool(v) => Value::Bool(double(v)),
-            // A per-lane variant that is NOT doubled here would desync every
-            // downstream lane index, silently. It is transient by design so
-            // it cannot arrive; say so loudly if it ever does.
-            Value::MaybeBool(_) => panic!("{}", super::value::MAYBE_BOOL_ESCAPED),
-            other @ (Value::UnknownBool
-            | Value::String(_)
-            | Value::Nil(_)
-            | Value::Pointer(_)
-            | Value::NilPointer(_)) => other,
-        });
-        self.vector_size *= 2;
-    }
-
     /// Filters all vector values in the state by a mask, cloning first.
     /// The resulting state's vector_size will be the number of true values in the mask.
     pub fn filter_by_mask_clone(&self, mask: &[bool], reason: FilterReason) -> Self {
         let mut new_state = self.clone();
         new_state.filter_by_mask_in_place(mask, reason);
-        new_state
-    }
-
-    /// `filter_by_mask_clone` for a caller that already knows its survivors
-    /// as runs, skipping the bool mask entirely.
-    /// Reorder the lanes by `perm` (a permutation of `0..vector_size`): new
-    /// lane `i` gets old lane `perm[i]`. Scalars broadcast and stay scalar;
-    /// only per-lane vectors are gathered. Used to canonicalize a frontier
-    /// fragment (sort its lanes by row key) so a checkpoint is a pure function
-    /// of the row SET, not the materialization order (Option 4).
-    pub fn permute_lanes(&mut self, perm: &[u32]) {
-        assert_eq!(
-            perm.len(),
-            self.vector_size,
-            "permute_lanes must cover exactly the current lanes"
-        );
-        fn gather<T: std::fmt::Debug + Clone + PartialEq + Eq>(
-            v: super::value::MaybeVector<T>,
-            perm: &[u32],
-        ) -> super::value::MaybeVector<T> {
-            match v {
-                super::value::MaybeVector::Scalar(s) => super::value::MaybeVector::Scalar(s),
-                super::value::MaybeVector::Vector(arc) => {
-                    let src = arc.as_ref();
-                    let out: Vec<T> = perm.iter().map(|&i| src[i as usize].clone()).collect();
-                    super::value::MaybeVector::Vector(std::sync::Arc::new(out))
-                }
-            }
-        }
-        let perm = &perm;
-        self.map_values_in_place(|value| match value {
-            Value::Number(v) => Value::Number(gather(v, perm)),
-            Value::NumberInterval(v) => Value::NumberInterval(gather(v, perm)),
-            Value::Bool(v) => Value::Bool(gather(v, perm)),
-            Value::MaybeBool(_) => panic!("{}", super::value::MAYBE_BOOL_ESCAPED),
-            other @ (Value::UnknownBool
-            | Value::String(_)
-            | Value::Nil(_)
-            | Value::Pointer(_)
-            | Value::NilPointer(_)) => other,
-        });
-    }
-
-    pub fn filter_by_kept_clone(
-        &self,
-        kept: &super::value::KeptLanes,
-        reason: FilterReason,
-    ) -> Self {
-        let mut new_state = self.clone();
-        new_state.filter_by_kept_in_place(kept, None, reason);
         new_state
     }
 

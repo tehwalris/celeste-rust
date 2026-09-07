@@ -204,41 +204,6 @@ impl Pico8Num {
     }
 }
 
-pub const fn int(v: i16) -> Pico8Num {
-    Pico8Num::from_i16(v)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Pico8Vec2 {
-    pub x: Pico8Num,
-    pub y: Pico8Num,
-}
-
-impl Pico8Vec2 {
-    pub const fn from_i16s(x: i16, y: i16) -> Self {
-        Self {
-            x: int(x),
-            y: int(y),
-        }
-    }
-
-    pub const fn zero() -> Pico8Vec2 {
-        Self::from_i16s(0, 0)
-    }
-}
-
-pub mod constants {
-    use super::Pico8Num;
-
-    pub const PICO8_NUM_0_6: Pico8Num = Pico8Num(0x0000_9999);
-    pub const PICO8_NUM_0_15: Pico8Num = Pico8Num(0x0000_2666);
-    pub const PICO8_NUM_0_4: Pico8Num = Pico8Num(0x0000_6666);
-    pub const PICO8_NUM_0_21: Pico8Num = Pico8Num(0x0000_35C2);
-    pub const PICO8_NUM_0_5: Pico8Num = Pico8Num(0x0000_8000);
-    pub const PICO8_NUM_0_70710678118: Pico8Num = Pico8Num(0x0000_B504);
-    pub const PICO8_NUM_1_5: Pico8Num = Pico8Num(0x0001_8000);
-    pub const PICO8_NUM_0_75: Pico8Num = Pico8Num(0x0000_C000);
-}
 
 impl fmt::Debug for Pico8Num {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -394,16 +359,6 @@ impl Pico8NumInterval {
         }
     }
 
-    pub fn intersect(&self, other: &Self) -> Option<Self> {
-        if self.low <= other.high && other.low <= self.high {
-            Some(Self {
-                low: std::cmp::max(self.low, other.low),
-                high: std::cmp::min(self.high, other.high),
-            })
-        } else {
-            None
-        }
-    }
 }
 
 impl Pico8NumInterval {
@@ -437,13 +392,6 @@ impl Pico8NumInterval {
         } else {
             None
         }
-    }
-
-    /// Every representable 16.16 value. Closed under wrapping arithmetic,
-    /// which is what makes it the sound answer when endpoint arithmetic
-    /// leaves the range.
-    pub fn full() -> Self {
-        Self::new(Pico8Num(i32::MIN), Pico8Num(i32::MAX))
     }
 
     /// `+` and `-` that report a wrap instead of panicking on it.
@@ -527,7 +475,14 @@ impl fmt::Debug for Pico8NumInterval {
 
 #[cfg(test)]
 mod tests {
-    use crate::pico8_num::{constants, int, Pico8Num};
+    use crate::pico8_num::Pico8Num;
+
+    const fn int(v: i16) -> Pico8Num {
+        Pico8Num::from_i16(v)
+    }
+
+    /// 0.15 in 16.16.
+    const P0_15: Pico8Num = Pico8Num(0x0000_2666);
 
     /// PICO-8's `%` is floored: the result takes the divisor's sign, and the
     /// fixed-point fraction participates.
@@ -596,9 +551,9 @@ mod tests {
 
     #[test]
     fn test_flr() {
-        assert_eq!((int(4) + constants::PICO8_NUM_0_15).flr(), int(4));
+        assert_eq!((int(4) + P0_15).flr(), int(4));
         assert_eq!(int(4).flr(), int(4));
-        assert_eq!((int(-2) - constants::PICO8_NUM_0_15).flr(), int(-3));
+        assert_eq!((int(-2) - P0_15).flr(), int(-3));
         assert_eq!(int(-2).flr(), int(-2));
     }
 
@@ -607,12 +562,12 @@ mod tests {
         assert_eq!(int(4).abs(), int(4));
         assert_eq!(int(-4).abs(), int(4));
         assert_eq!(
-            (int(4) + constants::PICO8_NUM_0_15).abs(),
-            int(4) + constants::PICO8_NUM_0_15
+            (int(4) + P0_15).abs(),
+            int(4) + P0_15
         );
         assert_eq!(
-            (int(-4) - constants::PICO8_NUM_0_15).abs(),
-            int(4) + constants::PICO8_NUM_0_15
+            (int(-4) - P0_15).abs(),
+            int(4) + P0_15
         );
     }
 

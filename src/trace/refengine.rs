@@ -1,6 +1,6 @@
-//! `RefEngine`: the new reference interpreter packaged as a drop-in for the
-//! old `interpret_prepared_cfg` - one multi-lane boundary `State` in, its
-//! frame successors out, keyed identically (the gate proves it).
+//! `RefEngine`: the reference interpreter as a frame step - one multi-lane
+//! boundary `State` in, its frame successors out, keyed identically to the
+//! kernels (the gate proves it).
 //!
 //! It owns the parsed cart ASTs (leaked to `'static` so the `Interp` can
 //! borrow the function bodies for its whole life) and a base state with the
@@ -80,7 +80,7 @@ impl RefEngine {
     /// has already set (`concrete::set_concrete_buttons`). Runs
     /// `_update();_draw()` with no reset and no forking, so a fully concrete
     /// input yields exactly one successor - the drop-in for
-    /// `concrete::step_frame`'s `interpret_prepared_cfg`.
+    /// `concrete::step_frame`.
     pub fn run_frame_concrete(&mut self, input: &OState) -> Result<OState> {
         use anyhow::bail;
         if input.vector_size != 1 {

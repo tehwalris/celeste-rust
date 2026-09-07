@@ -19,7 +19,7 @@
 
 use anyhow::Result;
 
-use celeste_engine::runtime2::{Col, AV};
+
 
 use super::emit::{Bound, Lowered};
 use super::verify::Frame;
@@ -41,73 +41,6 @@ pub struct Reference {
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 }
 
-/// Trace the frame this kernel is rendered from: room (1,0), warmed up
-/// to the first frame that has a player, pinned to its pm1 key.
-pub fn reference_frame() -> Result<Reference> {
-    reference_frame_in(std::path::Path::new("."))
-}
-
-/// As `reference_frame`, with the repo root given explicitly - the run
-/// check is a crate outside the workspace, so its working directory is
-/// not the repo root.
-pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
-    use super::domain::Symbolic;
-    use super::interp::Interp;
-    use super::verify::{pm1_key, run_one, trace_frame};
-    use super::{cart, iface};
-    use anyhow::{anyhow, bail};
-
-    let src = cart::sources_in(root)?;
-    let top = full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?;
-    let init = full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?;
-    let reset = full_moon::parse("__reset_button_states()")
-        .map_err(|e| anyhow!("parse reset: {:?}", e))?;
-    let fr = full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("parse frame: {:?}", e))?;
-
-    let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-    let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
-    let (rx, ry) = celeste_interp::game_runner::start_room();
-    let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(
-        &cart_data, rx, ry,
-    )?);
-    it.cache = Some(cache.clone());
-    it.cart = Some(cart_data.clone());
-
-    let st = cart::fresh_state::<Symbolic>(&mut it.d);
-    let mut st = run_one(&mut it, &top, st)?;
-    cart::inject_tile_flag_at(&mut st);
-    let mut st = run_one(&mut it, &init, st)?;
-    let mut player: Option<super::iface::Path> = None;
-    for _ in 0..40 {
-        if let Some(p) = super::verify::find_player(&st) {
-            player = Some(p);
-            break;
-        }
-        st = run_one(&mut it, &fr, st)?;
-    }
-    let Some(player) = player else { bail!("no player after 40 frames") };
-
-    let mut roots = vec![player.clone()];
-    for g in ["freeze", "has_dashed", "frames", "will_restart", "delay_restart", "max_djump"] {
-        roots.push(vec![iface::key(g)]);
-    }
-    let pin = pm1_key(&player, &st, &it.d)?;
-    let frame = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &[], None)?;
-
-    let graph = std::mem::take(&mut it.d.graph);
-    let bound = super::emit::bind(&frame, &graph, true)?;
-    let room = crate::transpile::graph::Room { cart: cart_data.clone(), cache: cache.clone() };
-    let lowered = super::emit::lower_frame(
-        &bound.graph,
-        &bound.inputs,
-        &bound.uni,
-        &bound.outcomes,
-        Some(room),
-        bound.forks,
-    )?;
-    Ok(Reference { frame, graph, bound, lowered, cart: cart_data, cache })
-}
-
 /// One kernel per heap SHAPE the room reaches - the CONSTANT-LATTICE
 /// level-0 references (the production base set). The walk-based
 /// generator this used to name was retired with the non-lattice sets
@@ -125,68 +58,6 @@ pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
 /// reason is in hand.
 pub fn room_kernels_in(root: &std::path::Path) -> Result<Vec<Reference>> {
     lattice_kernel_refs(root, super::shapes::WalkOpts::LEVEL0)
-}
-
-/// A block holding `rows` concrete input assignments, one per lane.
-///
-/// The kernel reads its inputs off a block by path, so checking it
-/// against the graph needs a block that holds exactly the values the
-/// graph is evaluated at. This builds one: the traced input shape, with
-/// each row's values written into the cells the interface named.
-pub fn input_block(r: &Reference, rows: &[Vec<super::iface::Conc>]) -> Result<celeste_engine::Rt2> {
-    use super::iface::Conc;
-
-    let mut b = celeste_engine::slots::reshape(&r.frame.in_rt2, rows.len());
-    // The BLOCK-UNIFORM inputs go in as uniform columns, because that is
-    // what the kernel's `bind` accepts - it takes them as `P8`, not as a
-    // lane array, and a per-lane column there is a narrowing it refuses.
-    // Every row therefore has to agree about them, and this says so
-    // rather than silently taking row 0.
-    let uni: std::collections::BTreeSet<u32> = r.bound.uni.iter().map(|(c, _)| *c).collect();
-    for (i, cell) in r.frame.in_cells.iter().enumerate() {
-        if !uni.contains(cell) {
-            continue;
-        }
-        for (k, row) in rows.iter().enumerate() {
-            if row[i] != rows[0][i] {
-                anyhow::bail!(
-                    "row {} disagrees with row 0 about the block-uniform slot {}",
-                    k,
-                    super::iface::show(&r.frame.iface.slots[i])
-                );
-            }
-        }
-        b.cols[*cell as usize] = Col::U(match rows[0][i] {
-            Conc::Num(v) => AV::Num(v),
-            Conc::Bool(v) => AV::Bool(v),
-        });
-    }
-    for (i, cell) in r.frame.in_cells.iter().enumerate() {
-        if uni.contains(cell) {
-            continue;
-        }
-        let col = match rows[0].get(i) {
-            Some(Conc::Num(_)) => Col::N(
-                rows.iter()
-                    .map(|row| match row[i] {
-                        Conc::Num(v) => v,
-                        Conc::Bool(_) => celeste_core::pico8_num::Pico8Num::from_i16(0),
-                    })
-                    .collect(),
-            ),
-            Some(Conc::Bool(_)) => Col::V(
-                rows.iter()
-                    .map(|row| match row[i] {
-                        Conc::Bool(v) => AV::Bool(v),
-                        Conc::Num(_) => AV::Nil,
-                    })
-                    .collect(),
-            ),
-            None => anyhow::bail!("row is shorter than the interface"),
-        };
-        b.cols[*cell as usize] = col;
-    }
-    Ok(b)
 }
 
 /// Restate a lowering failure with its `Cell(n)`s NAMED.

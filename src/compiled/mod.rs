@@ -1,17 +1,11 @@
 //! ONE frame of the abstract search, behind one interface.
 //!
-//! `FrameEngine::step` is `(shape, rows) -> [(shape, rows)]`: the compiled
-//! traced kernels where they bind, the celeste-rust interpreter where they
-//! do not, with the boundary abstraction, cross-block dedup and the k-way
-//! same-shape merge around both. `bridge` translates an interpreter `State`
+//! `FrameEngine::run_frame_block` is `(shape, rows) -> [(shape, rows)]`: the
+//! runtime-assembled ASM kernels (`asm_kernel`) over the engine's columnar
+//! blocks, with the pre-partition, cross-block dedup and the k-way
+//! same-shape merge around them. `bridge` translates an interpreter `State`
 //! into a block and back - the one place in the codebase that names both
 //! `State` and `Rt2`, which is why it is HERE and not in celeste-engine.
-//!
-//! This module is the point of the P1 crate split (task #150). All of it
-//! used to be native-probe's `main.rs`, and native-probe depends on
-//! celeste-rust rather than the other way round, so the campaign could not
-//! call any of it. Now it can, and a kernel that lands lands in the forward
-//! loop and the backward sweep at once.
 
 use std::sync::Arc;
 
@@ -20,91 +14,31 @@ use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_engine::runtime2;
 
-/// An output state plus the ENGINE row key of each of its lanes (`Rt2::boundary`'s
-/// `row_keys`), when the state came off a kernel/merged block. `None` marks an
-/// interpreter-fallback state, whose engine key the boundary derives downstream.
-/// This is how the compiled forward path keeps the frontier ENGINE-keyed - the
-/// same key the kernels emit and probe (Option 1) - and drops the redundant
-/// interpreter re-hash.
-pub type KeyedState = (crate::interpreter::state::State, Option<Vec<(u64, u64)>>);
-
 // The engine's hasher, not celeste-rust's. rustc-hash 1 and 2 hash
 // differently and this crate is still on 1; the row machinery's maps
 // belong to the engine, so they use the engine's.
 use celeste_engine::FxHashMap;
 use celeste_names as gen;
 
-use crate::program::Program;
-
 pub(crate) mod asm_kernel;
 pub mod bridge;
 pub mod dispatch;
 
-/// Print the ASM append materialize/kept ratio (diagnostic).
-pub fn print_asm_append_stats() {
-    asm_kernel::print_append_stats();
-}
-
-/// Assemble the ACTIVE rung's kernel set now (retrace + gcc + dlopen),
-/// EAGERLY, instead of on the first mid-search dispatch. The registry is
-/// indexed by rem precision, so a caller stepping through rungs (the
-/// in-process ladder) calls this once per rung - after `set_rem_precision`
-/// - to move the whole build off the search's critical path. Idempotent:
-/// the per-rung `OnceLock` builds once and returns cached thereafter, and
-/// the shapes within a rung assemble in parallel. A no-op under
-/// `CELESTE_NO_ASM_KERNELS`.
-pub fn prewarm_kernels() {
-    let _ = asm_kernel::registry();
-}
-
-/// The lane kernels are the compiled engine (plans/kernel-plan.md); chunks
-/// they refuse fall through to the reference. The retired tile engines
-/// (CELESTE_TILE=1 concrete-button tiles, =2 dynamic expand) are gone - the
-/// kernels cover every player class and are ~5x faster
-/// (plans/k4-retirement-plan.md). CELESTE_KERNEL=0 routes everything to the
-/// reference for A/B.
-fn use_kernel() -> bool {
-    std::env::var("CELESTE_KERNEL").map(|v| v != "0").unwrap_or(true)
-}
-
-/// Chunk cap. Cross-chunk dedup at the boundary makes chunking invisible to
-/// the result (batching invariance is the certified doctrine), so this is
-/// purely a cost knob - and pre-dedup INVERTED it. While every emitted row
-/// was materialized, a chunk's mid-frame traffic dominated and small chunks
-/// won; now duplicates die as a hash probe and a bigger chunk simply catches
-/// more of them, so the dedup ratio wins instead. Measured at f35 (min of 5
-/// reps, peak RSS), all gates exact:
-///
-/// ```text
-///   lanes:  64      128     256     512     1024    4096
-///   before: 348 ms  489     584     673     -       -
-///   after:  133 ms  98      91      86      82      85
-///   RSS:    0.99 GB  -      1.12    1.44    2.02    4.82
-/// ```
-///
-/// 256 is the knee: 1.46x over the old default for +13% memory, and the mean
-/// stays as tight as the min (512's does not).
-fn chunk_rows() -> usize {
-    std::env::var("CELESTE_CHUNK_ROWS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256)
-}
-
-/// The same cap for `run_frame_chunk`, which has its own knee because its
-/// input is ALREADY a campaign chunk (`CELESTE_MAX_STATE_LANES`, 8,000
-/// under the parallel default) rather than a whole frame. Cutting 8,000
-/// lanes into 256-row pieces pays the kernel's per-chunk fixed costs -
-/// bind, key plan, the `seen` set, `boundary` on the output - 31 times over.
-/// Measured, room (1,0), f50, frontier-only + deopt, wall clock:
+/// The kernel chunk cap: an input block is cut into pieces of at most this
+/// many lanes before dispatch. Cutting into small pieces pays the kernel's
+/// per-chunk fixed costs - bind, the `seen` set, `boundary` on the output -
+/// once per piece. Measured, room (1,0), f50, on 8,000-lane inputs, wall
+/// clock:
 ///
 /// ```text
 ///   rows:  256     512     1024    2048    8000
 ///   wall:  8.71 s  7.81    7.50    7.43    7.89
 /// ```
 ///
-/// Flat from 1,024 to 2,048 and up again at the campaign cap itself, where
-/// there is one piece and the dedup no longer sees across pieces.
+/// Flat from 1,024 to 2,048 and up again at 8,000, where there is one piece
+/// and the dedup no longer sees across pieces. (The search's blocks are far
+/// smaller than this today - see `frame::regroup` - so the cap rarely
+/// bites.)
 fn campaign_chunk_rows() -> usize {
     std::env::var("CELESTE_CHUNK_ROWS")
         .ok()
@@ -112,22 +46,14 @@ fn campaign_chunk_rows() -> usize {
         .unwrap_or(2048)
 }
 
-/// Where `run_frame_chunk`'s time goes, under `CELESTE_CHUNK_PHASE_TIME=1`.
-///
+/// Where `run_frame_block`'s time goes, under `CELESTE_CHUNK_PHASE_TIME=1`.
 /// Off by default and gated on a `OnceLock` bool rather than an env read
-/// per chunk, because the chunks are small and there are a lot of them.
-/// Atomics because the campaign runs one chunk per worker thread; the sum
-/// over threads is what the ratios are read off, so contention on five
-/// counters per chunk is acceptable where per-slice counters would not be.
-pub const CHUNK_IMPORT: usize = 0;
-pub const CHUNK_PARTITION: usize = 1;
-pub const CHUNK_RUN: usize = 2;
-pub const CHUNK_MERGE: usize = 3;
-pub const CHUNK_EXPORT: usize = 4;
-const CHUNK_PHASE_NAMES: [&str; 5] = ["import", "partition", "run", "dedup+merge", "export"];
-static CHUNK_NS: [std::sync::atomic::AtomicU64; 5] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
+/// per block, because the blocks are small and there are a lot of them.
+const CHUNK_PARTITION: usize = 0;
+const CHUNK_RUN: usize = 1;
+const CHUNK_MERGE: usize = 2;
+const CHUNK_PHASE_NAMES: [&str; 3] = ["partition", "run", "dedup+merge"];
+static CHUNK_NS: [std::sync::atomic::AtomicU64; 3] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -156,7 +82,7 @@ impl ChunkTimer {
     }
 }
 
-/// Print and reset the `run_frame_chunk` phase split. A no-op unless
+/// Print and reset the `run_frame_block` phase split. A no-op unless
 /// `CELESTE_CHUNK_PHASE_TIME` is set.
 pub fn print_chunk_phase_times() {
     if !chunk_phase_time() {
@@ -170,7 +96,7 @@ pub fn print_chunk_phase_times() {
     if total == 0 {
         return;
     }
-    eprintln!("compiled chunk phases (summed over worker threads):");
+    eprintln!("compiled chunk phases:");
     for (name, n) in CHUNK_PHASE_NAMES.iter().zip(&ns) {
         eprintln!(
             "  {:12} {:8.2}s  {:5.1}%",
@@ -295,67 +221,22 @@ pub fn room_context() -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
     Ok(CTX.get().expect("just set").clone())
 }
 
-/// One frame of the abstract search, for whoever wants it.
-///
-/// `(shape, rows) -> [(shape, rows)]`. This is the interface P1 exists to
-/// create: before it, the block model, the kernels and this driver all
-/// lived in native-probe, which DEPENDS on celeste-rust, so the campaign
-/// could not call any of it. Now the forward loop and the backward sweep's
-/// replay can both go through `step`, and a kernel that lands lands in both.
-///
-/// The engine is a pair of paths and a policy for choosing between them.
-/// The compiled path is the generated traced kernels
-/// (`dispatch::run_chunk_kernel`). The reference path is the celeste-rust
-/// INTERPRETER, on the block exported back to a `State` - the same
-/// `Program`, the same `interpret_prepared_cfg`, the same code the campaign
-/// and `concrete_run` execute (plans/k4-retirement-plan.md stage 2). A
-/// chunk no kernel binds takes the reference, so a coverage gap is slow and
-/// never wrong. Coverage is room-shaped today: room (1,0)'s shapes have
-/// traced kernels, rooms (0,0)/(2,0) do not.
-///
-/// Speed of the reference path is a measured non-issue rather than a hope:
-/// since the class kernels reached 100% of player lanes it runs on spawn
-/// shapes only, 0.72 ms at f20.
-
-/// The recipe the kernels and the name tables were generated from - the
-/// program whose boundary defines the canonical row key.
-const COMPILE_RECIPE: &str = "rewrites-compile.jsonl";
-
 /// The canonical (kernel/engine) row keys of a state, per lane in lane
 /// order - the ONE row key of the search.
 ///
-/// Backed by a process-wide `FrameEngine` built from the COMPILE recipe's
-/// frozen program, so the ids/cart/cache match every compiled forward's and
-/// the keys it produces are byte-identical to what a forward stored. This is
-/// available regardless of `CELESTE_COMPILED_FORWARD`: the backward sweep and
-/// the band filter key on it even when the forward that wrote the checkpoint
-/// was the interpreter, so there is exactly one key space.
+/// Backed by a process-wide `FrameEngine` for the start room, so the
+/// ids/cart/cache match every forward's and the keys are byte-identical to
+/// what a forward stored: there is exactly one key space.
 static KEY_ENGINE: std::sync::OnceLock<FrameEngine> = std::sync::OnceLock::new();
-
-/// Build the row-key engine if it is not built yet, and hand it back.
-///
-/// The build loads the frozen compile program and runs its init - stack-heavy
-/// enough that doing it LAZILY inside a deep frontier-worker call stack
-/// overflows a 2 MB worker/test stack. `AbstractRun::start` calls this once
-/// on the shallow main-thread stack so every later `engine_row_keys` call
-/// (in a worker, per frame) only does the light import + boundary.
-pub fn prewarm_engine_row_keys() -> Result<&'static FrameEngine> {
-    use anyhow::Context;
-    if let Some(e) = KEY_ENGINE.get() {
-        return Ok(e);
-    }
-    let compile_program = crate::program::frozen::rewritten(COMPILE_RECIPE)
-        .with_context(|| format!("loading the frozen {}", COMPILE_RECIPE))?;
-    let engine = FrameEngine::new_for_start_room(&compile_program)?;
-    // Racing initializers build identical engines; keep whichever wins.
-    let _ = KEY_ENGINE.set(engine);
-    Ok(KEY_ENGINE.get().expect("just set"))
-}
 
 pub fn engine_row_keys(
     state: &crate::interpreter::state::State,
 ) -> Result<Vec<(u64, u64)>> {
-    Ok(prewarm_engine_row_keys()?.row_keys_lane_order(state))
+    if KEY_ENGINE.get().is_none() {
+        // Racing initializers build identical engines; keep whichever wins.
+        let _ = KEY_ENGINE.set(FrameEngine::new_for_start_room()?);
+    }
+    Ok(KEY_ENGINE.get().expect("just set").row_keys_lane_order(state))
 }
 
 pub struct FrameEngine {
@@ -370,27 +251,7 @@ pub struct FrameEngine {
 }
 
 impl FrameEngine {
-    /// Build the engine for `program`.
-    ///
-    /// The program MUST be the one the kernels and the name tables were
-    /// generated from - `transpile --recipe rewrites-compile.jsonl`, the
-    /// REWRITTEN program, not the plain one. This cost an afternoon once:
-    /// the plain program's frame boxes a captured `self` where the recipe's
-    /// `demote_create` does not, so the output heap gains one cell, every
-    /// later cell id shifts, and the gate reports 204 rows missing and 204
-    /// extra - a total mismatch produced by an aliasing difference in ONE
-    /// closure capture.
-    pub fn new(program: &Program, cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Self {
-        // The recipe's partition_merge (pm1) cells are a PROCESS GLOBAL in
-        // the interpreter, and `AbstractRun::start` sets them before it
-        // runs anything. Any frame this engine interprets - the reference
-        // path, and `initial_blocks` - has to run under the same setting or
-        // it merges differently from the reference it claims to be. Setting
-        // it here rather than asking the caller to means the engine cannot
-        // be constructed into an inconsistent state.
-        crate::interpreter::vectorize::set_merge_partition_patterns(
-            &program.merge_partition_cells,
-        );
+    pub fn new(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Self {
         FrameEngine {
             ids: boundary_ids(),
             g_freeze: gen::global_id("freeze").expect("no freeze global"),
@@ -399,11 +260,10 @@ impl FrameEngine {
         }
     }
 
-    /// The same construction with the cart and collision cache loaded for
-    /// the campaign's start room.
-    pub fn new_for_start_room(program: &Program) -> Result<Self> {
+    /// The engine for the configured start room (`room_context`).
+    pub fn new_for_start_room() -> Result<Self> {
         let (cart, cache) = room_context()?;
-        Ok(Self::new(program, cart, cache))
+        Ok(Self::new(cart, cache))
     }
 
     pub fn ids(&self) -> &runtime2::BoundaryIds {
@@ -420,91 +280,26 @@ impl FrameEngine {
         self.cache.clone()
     }
 
-    /// One frame of ONE campaign chunk: `State -> [State]`.
-    ///
-    /// This is the campaign's entry point (P1 stage 3). `step` owns a whole
-    /// frame - partition, run, boundary, cross-block dedup, k-way merge -
-    /// but the campaign already owns the last three, and they are not
-    /// interchangeable: the campaign's boundary is where the frontier
-    /// subtract, the band filter and the row table's id assignment live,
-    /// and those are proof-critical. So the campaign keeps them, and what
-    /// it hands over is the FRAME BODY - exactly the call this replaces,
-    /// `interpret_prepared_cfg` on one chunk.
-    ///
-    /// Consequences of that boundary, all of which the caller must live
-    /// with:
-    ///
-    /// * The outputs are a MIXTURE. Kernel chunks come back already
-    ///   canonicalized by `Rt2::boundary`; the reference path's come back
-    ///   raw, exactly as the interpreter produced them. That is fine only
-    ///   because the campaign re-applies its own abstraction to everything
-    ///   afterwards and that abstraction is IDEMPOTENT on already-abstract
-    ///   states (the same property gate 2 relies on when it funnels the
-    ///   interpreter's states through `boundary` to compare keys).
-    /// * `Rt2::boundary` hardcodes the LEVEL-0 rem widening, so this path
-    ///   is only valid at `CELESTE_REM_BITS=0`. Checked by the caller, in
-    ///   `AbstractRun::compiled_engine`, and not here, because here there
-    ///   is nothing useful to say if it fails.
-    /// * The output STATES are not the ones the interpreter would have
-    ///   produced - different in number, in lane order and in heap layout.
-    ///   The output row SET is (that is gate 2). So a compiled forward run
-    ///   assigns row ids in a different order than an interpreted one, and
-    ///   its `g.bin` is isomorphic to rather than byte-identical with the
-    ///   interpreted run's.
-    ///
-    /// Serial on purpose: the campaign is already one thread per chunk.
-    pub fn run_frame_chunk(
-        &self,
-        state: &crate::interpreter::state::State,
-    ) -> Vec<KeyedState> {
-        let mut t = ChunkTimer::start();
-        let block = bridge::import_block(state, self.cart.clone(), self.cache.clone());
-        t.mark(CHUNK_IMPORT);
-        let merged = self.run_frame_block(block);
-        t = ChunkTimer::start();
-        // Each output state carries its ENGINE row keys (`b.row_keys`): the
-        // forward frontier is engine-keyed and the redundant re-hash is
-        // dropped.
-        let out: Vec<KeyedState> = merged
-            .iter()
-            .map(|b| (bridge::export_block(b), Some(b.row_keys.clone())))
-            .collect();
-        t.mark(CHUNK_EXPORT);
-        out
-    }
-
     /// One frame of one block, block in and blocks out: partition on the
     /// frame-start uniform branches, run every chunk on its kernel, dedup
     /// and merge the outputs per (shape, pm1 class). Every output carries
-    /// its row keys. This is the search's frame step; `run_frame_chunk` is
-    /// the same thing wrapped in the `State` bridge for the gates.
+    /// its row keys. This is the search's frame step.
     pub fn run_frame_block(&self, block: runtime2::Rt2) -> Vec<runtime2::Rt2> {
         let mut t = ChunkTimer::start();
-        let mut pending: Vec<(runtime2::Rt2, bool)> = self
-            .partition_chunks(vec![block], campaign_chunk_rows())
-            .into_iter()
-            .map(|b| (b, true))
-            .collect();
+        let mut pending = self.partition_chunks(vec![block], campaign_chunk_rows());
         t.mark(CHUNK_PARTITION);
-        let use_kernel = use_kernel();
         let mut done: Vec<runtime2::Rt2> = Vec::new();
-        // DISPATCH EVERY CHUNK BEFORE INTERPRETING ANY. A premise failure
-        // in `interpret_block` panics out of the whole state, and with the
-        // interleaved loop that panic landed before the remaining chunks
-        // were ever OFFERED to the kernels - so kernel coverage observed
-        // only the first-popped partitions of each state, a class-skewed
-        // sample. Chunks are independent and the output is a row SET, so
-        // running the kernel pass to completion first changes no result -
-        // it only moves the abort after the point where every chunk has
-        // been dispatched and counted.
-        let mut misses: Vec<(runtime2::Rt2, bool)> = Vec::new();
-        while let Some((block, kernel_ok)) = pending.pop() {
-            if use_kernel && kernel_ok {
-                if dispatch::run_chunk_kernel(&block, &self.ids, &mut done) {
-                    continue;
-                }
+        // DISPATCH EVERY CHUNK BEFORE ABORTING ON ANY: chunks are
+        // independent and the output is a row SET, so running the kernel
+        // pass to completion first changes no result - it only moves the
+        // abort after the point where every chunk has been dispatched and
+        // counted, so the miss report is complete rather than a
+        // class-skewed sample of the first-popped partitions.
+        let mut misses: Vec<runtime2::Rt2> = Vec::new();
+        while let Some(block) = pending.pop() {
+            if !dispatch::run_chunk_kernel(&block, &self.ids, &mut done) {
+                misses.push(block);
             }
-            misses.push((block, kernel_ok));
         }
         // FALLBACK IS ALL-OR-NOTHING AT THE STATE LEVEL. When any chunk
         // misses the kernels and a campaign frame body is available, the
@@ -539,7 +334,7 @@ impl FrameEngine {
             // report every distinct reason with lane counts and stop. The
             // search checkpoints per completed frame, so the run resumes
             // from the previous frame once the missing shape is traced.
-            let missed_lanes: usize = misses.iter().map(|(b, _)| b.width).sum();
+            let missed_lanes: usize = misses.iter().map(|b| b.width).sum();
             panic!(
                 "KERNEL COVERAGE GAP: {} lanes in {} chunks have no kernel and                  the interpreter fallback was removed; reasons:\n{}\ntrace the                  missing shape / raise the bound and resume from the last                  checkpoint",
                 missed_lanes,
@@ -548,18 +343,11 @@ impl FrameEngine {
             );
         }
         t.mark(CHUNK_RUN);
-        // Dedup and merge the kernel's blocks BEFORE exporting them.
-        //
-        // Not an optimization of the campaign's merge - the campaign merges
-        // again afterwards and would reach the same set either way - but of
-        // the BRIDGE. An 8,000-lane campaign chunk becomes ~31 kernel
-        // chunks of 256 rows, and exporting each one separately builds ~31
-        // whole interpreter heaps where one will do. Measured at f40, 40
-        // frames: exporting per chunk put `fwd.interpret` at 2.17 s, ABOVE
-        // the interpreter's own 1.39 s; the win only appears once the
-        // bridge is crossed once per output group.
+        // Dedup across the kernel's output chunks and merge per (shape,
+        // pm1 class), so the loop sees one block per class rather than one
+        // per kernel chunk.
         let keeps = Self::dedup_keeps_serial(&done);
-        let merged = self.regroup_and_merge(done, keeps, &mut |_| {});
+        let merged = self.regroup_and_merge(done, keeps);
         t.mark(CHUNK_MERGE);
         if dispatch::widen_noop_check() {
             for b in &merged {
@@ -586,36 +374,6 @@ impl FrameEngine {
         b.row_keys_canonical()
     }
 
-    /// The canonical row-key SET of some interpreter states, as the
-    /// boundary computes it.
-    ///
-    /// This is gate 2's comparator, exposed: both sides of a comparison
-    /// funnel through the SAME canonicalizer (import, then `boundary`,
-    /// whose widenings are idempotent on already-abstract states), so key
-    /// equality means one engine's surviving row set IS the other's, not
-    /// merely the same size. Set, not sequence: what the search carries
-    /// forward is a set of rows, and neither the order nor the block
-    /// partition is part of the answer.
-    pub fn row_key_set(
-        &self,
-        states: &[crate::interpreter::state::State],
-    ) -> rustc_hash::FxHashSet<(u64, u64)> {
-        // celeste-rust's rustc-hash (1.x), not the engine's (2.x): this is
-        // a comparison set, not one of the row machinery's maps, so the
-        // hasher is an implementation detail and set equality does not
-        // depend on it.
-        let mut keys: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
-        for s in states {
-            if s.vector_size == 0 {
-                continue;
-            }
-            let mut b = bridge::import_block(s, self.cart.clone(), self.cache.clone());
-            b.boundary(&self.ids);
-            keys.extend(b.row_keys.iter().copied());
-        }
-        keys
-    }
-
     /// Retain each block's surviving lanes, re-partition on the pm1 key and
     /// k-way merge same-`(shape, pm1)` blocks.
     ///
@@ -628,7 +386,6 @@ impl FrameEngine {
         &self,
         ran: Vec<runtime2::Rt2>,
         keeps: Vec<Vec<u32>>,
-        phase: &mut impl FnMut(&str),
     ) -> Vec<runtime2::Rt2> {
         let ids = &self.ids;
         let mut groups: Vec<((u64, u64), Vec<runtime2::Rt2>)> = Vec::new();
@@ -645,17 +402,11 @@ impl FrameEngine {
                 }
             }
         }
-        phase("retain");
-        let out: Vec<runtime2::Rt2> =
-            groups.into_iter().map(|(_, g)| runtime2::Rt2::merge_many(g)).collect();
-        phase("merge");
-        out
+        groups.into_iter().map(|(_, g)| runtime2::Rt2::merge_many(g)).collect()
     }
 
-    /// Cross-block dedup, serial: keep the first occurrence of each row key
-    /// across `ran` in block order. `step`'s 32-shard parallel version is
-    /// the same function - a row's shard is a function of its key, so the
-    /// shards are independent and the surviving SET is the same.
+    /// Cross-block dedup: keep the first occurrence of each row key across
+    /// `ran` in block order.
     fn dedup_keeps_serial(ran: &[runtime2::Rt2]) -> Vec<Vec<u32>> {
         let mut seen: FxHashMap<(u64, u64), ()> = Default::default();
         ran.iter()
@@ -672,9 +423,8 @@ impl FrameEngine {
             .collect()
     }
 
-    /// One frame of `block` through the interpreter, as interpreter states.
-    /// The pre-partition every path shares: split on `freeze`, then on the
-    /// moving key, then slice to `chunk_rows` lanes.
+    /// The pre-partition: split on `freeze`, then on the moving key, then
+    /// slice to `chunk_rows` lanes.
     ///
     /// Splitting on `freeze` up front is what keeps the kernels' premise of
     /// a class-uniform chunk true - the update-side freeze gate is a real
@@ -710,202 +460,9 @@ impl FrameEngine {
         pending
     }
 
-    /// The frame-0 frontier: run `__init` through the interpreter and
-    /// import the resulting states as blocks.
-    ///
-    /// Same construction as `verify.rs`'s `AbstractRun::start` - same
-    /// program, same `create_initial_state_with_builtins`, same
-    /// `inject_tile_flag_at_builtin` afterwards - which is what makes a
-    /// compiled run comparable to `rewrite bench --frames N` at all. The
-    /// retired scalar runtime used to reimplement this by executing the
-    /// transpiled `__init` and hand-placing the builtin cells; two
-    /// implementations of a starting position is one too many, and this one
-    /// cannot drift.
-    pub fn initial_blocks(&self) -> Vec<runtime2::Rt2> {
-        // The frame-0 frontier via the REFERENCE interpreter (`RefEngine`
-        // runs the original Lua = the plain program; init equivalence is
-        // proven by `refgate`). One init state, with `tile_flag_at`
-        // already injected.
-        let s = crate::trace::refengine::RefEngine::new()
-            .expect("build reference engine")
-            .initial_state()
-            .expect("init failed");
-        vec![bridge::import_block(&s, self.cart.clone(), self.cache.clone())]
-    }
 }
 
 impl FrameEngine {
-/// One abstract frame forward: pre-partition (freeze, moving key), chunk,
-/// run tiles across threads, boundary, cross-block dedup, k-way
-/// same-shape merge. Rows in -> rows out.
-pub fn step(
-    &self,
-    blocks: Vec<runtime2::Rt2>,
-    census_total: &mut FxHashMap<&'static str, (u64, u64, u64)>,
-) -> Vec<runtime2::Rt2> {
-    let ids = &self.ids;
-    let use_kernel = use_kernel();
-    // `step`'s output rows are FINAL - no campaign abstraction runs
-    // after it, unlike `run_frame_chunk`'s. The rung-agnostic set hands
-    // back exact, unwidened rows on purpose (plans/kernel-ladder.md),
-    // so under this entry point they would leak out as boundary rows
-    // that no interpreter level produces. Loud, because the mix would
-    // otherwise only show as a row-count anomaly far downstream.
-    assert!(
-        !use_kernel
-            || matches!(dispatch::traced_mode(), dispatch::TracedMode::Level0),
-        "FrameEngine::step emits final boundary rows and supports the \
-         level-0 traced set only; the rung-agnostic (ladder) set runs \
-         through run_frame_chunk, whose caller re-applies the campaign's \
-         abstraction"
-    );
-    // CELESTE_PHASE_TIME=1: print the per-frame wall split across the
-    // serial/parallel phases (goal 7's measurement harness).
-    let phase_time = std::env::var("CELESTE_PHASE_TIME").is_ok();
-    let mut t_mark = std::time::Instant::now();
-    let mut phase = |name: &str| {
-        if phase_time {
-            eprintln!("    phase {:8} {:9.3?}", name, t_mark.elapsed());
-        }
-        t_mark = std::time::Instant::now();
-    };
-    let mut ran: Vec<runtime2::Rt2> = Vec::new();
-    let mut pending: Vec<runtime2::Rt2> = self.partition_chunks(blocks, chunk_rows());
-    phase("part");
-    // Chunks are independent (lane independence is the certified
-    // batching-invariance property); run them across threads. Each
-    // worker owns a local pending stack seeded round-robin.
-    let n_workers = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(1)
-        .min(pending.len().max(1));
-    // (block, kernel_ok): kernel-deopted leftovers and SplitReq halves
-    // must not re-enter the kernel (a lane the kernel deopted once would
-    // deopt forever - an infinite requeue).
-    let queues: Vec<Vec<(runtime2::Rt2, bool)>> = {
-        let mut qs: Vec<Vec<(runtime2::Rt2, bool)>> = (0..n_workers).map(|_| Vec::new()).collect();
-        for (i, b) in pending.drain(..).enumerate() {
-            qs[i % n_workers].push((b, true));
-        }
-        qs
-    };
-    let results: Vec<Vec<runtime2::Rt2>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = queues
-            .into_iter()
-            .map(|mut local| {
-                let ids = &ids;
-                scope.spawn(move || {
-                    let mut done: Vec<runtime2::Rt2> = Vec::new();
-                    while let Some((block, kernel_ok)) = local.pop() {
-                        if use_kernel && kernel_ok {
-                            // KERNEL mode (plans/kernel-plan.md K3): the
-                            // traced kernel for the chunk's shape; a
-                            // chunk it cannot bind or declines falls
-                            // through whole.
-                            if dispatch::run_chunk_kernel(&block, ids, &mut done) {
-                                continue;
-                            }
-                        }
-                        // A kernel deopt sub-chunk fails the specialized
-                        // program's premises by construction - the plain
-                        // path, as in `run_frame_chunk`.
-                        //
-                        // The 2026-08-19 "step-gate mystery" (0 missing /
-                        // 4.12M extra keys at f065->f066) RESOLVED the
-                        // same day, in this path's favor: the reference
-                        // dir was a FRONTIER-ONLY campaign, whose saved
-                        // frames are the NEW rows of each frame, while
-                        // `step` returns the raw successor set - and all
-                        // 4,123,936 extras are rows visited in f000..
-                        // f065, checked in the engine's own key space
-                        // (import + boundary of every saved frame). An
-                        // earlier check against the frames/*.rowkeys
-                        // sidecars had "refuted" this - wrongly: the
-                        // sidecars hold the INTERPRETER's keys, a
-                        // different key space related to the engine's
-                        // only by the D1 bijection, so that intersection
-                        // is empty by construction. The bench's gate 2 is
-                        // frontier-aware now (extras must be visited
-                        // rows); step() and the campaign path agree.
-                        // A chunk no kernel binds is a COVERAGE GAP, not a
-                        // degraded mode: the CFG-interpreter fallback was
-                        // removed (plans/delete-the-interpreter.md). Trace
-                        // the missing shape and resume from the last
-                        // checkpoint.
-                        panic!(
-                            "KERNEL COVERAGE GAP: {} lanes in a chunk have no                              kernel and the interpreter fallback was removed",
-                            block.width
-                        );
-                    }
-                    done
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    phase("run");
-    for done in results {
-        ran.extend(done);
-    }
-    for sub in ran.iter_mut() {
-        sub.drain_census(census_total);
-    }
-    // Drop rows already seen this frame (SHARDED parallel dedup: a
-    // row's shard is a function of its key, so shards are
-    // independent; first-occurrence order within the block sequence
-    // is preserved per shard, and the surviving SET - which is all
-    // identity requires - is order-independent), then k-way merge
-    // same-shape blocks.
-    let n_shards = 32usize;
-    let keeps: Vec<Vec<u32>> = {
-        // (block, lane, key) triples grouped by shard, in block order.
-        let mut per_shard_keeps: Vec<Vec<Vec<u32>>> =
-            (0..n_shards).map(|_| vec![Vec::new(); ran.len()]).collect();
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..n_shards)
-                .map(|shard| {
-                    let ran = &ran;
-                    scope.spawn(move || {
-                        let mut seen: FxHashMap<(u64, u64), ()> = Default::default();
-                        let mut keeps: Vec<Vec<u32>> = vec![Vec::new(); ran.len()];
-                        for (bi, sub) in ran.iter().enumerate() {
-                            for (i, &k) in sub.row_keys.iter().enumerate() {
-                                if (k.0 as usize) % n_shards != shard {
-                                    continue;
-                                }
-                                if let std::collections::hash_map::Entry::Vacant(e) =
-                                    seen.entry(k)
-                                {
-                                    e.insert(());
-                                    keeps[bi].push(i as u32);
-                                }
-                            }
-                        }
-                        keeps
-                    })
-                })
-                .collect();
-            for (shard, h) in handles.into_iter().enumerate() {
-                per_shard_keeps[shard] = h.join().unwrap();
-            }
-        });
-        // Merge shards' keeps per block, sorted (retain_lanes needs
-        // ascending indices).
-        (0..ran.len())
-            .map(|bi| {
-                let mut keep: Vec<u32> = per_shard_keeps
-                    .iter()
-                    .flat_map(|s| s[bi].iter().copied())
-                    .collect();
-                keep.sort_unstable();
-                keep
-            })
-            .collect()
-    };
-    phase("dedup");
-    let out = self.regroup_and_merge(ran, keeps, &mut phase);
-    out
-}
 }
 
 /// The compiled kernels as the fast `FrameStep` implementation (interface #1),

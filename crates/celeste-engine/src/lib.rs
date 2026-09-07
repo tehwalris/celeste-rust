@@ -17,7 +17,6 @@
 //! up in `celeste-rust` where the interpreter types are.
 
 pub mod kernel;
-pub mod traced;
 pub mod runtime2;
 pub mod slots;
 

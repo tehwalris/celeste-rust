@@ -281,12 +281,7 @@ mod encoding {
         use crate::trace::verify::run_one;
         use crate::trace::cart;
 
-        if !std::path::Path::new("rewrites.jsonl").exists() {
-            return;
-        }
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-        let engine =
-            crate::compiled::FrameEngine::new_for_start_room(&program).expect("engine");
+        let engine = crate::compiled::FrameEngine::new_for_start_room().expect("engine");
         let init = crate::trace::refengine::RefEngine::new()
             .expect("refengine")
             .initial_state()

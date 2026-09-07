@@ -74,10 +74,6 @@ impl SlotMap {
         Self { of_local, num_slots }
     }
 
-    pub fn is_identity(&self) -> bool {
-        self.of_local.is_empty()
-    }
-
     #[inline]
     pub fn slot_of(&self, id: LocalId) -> usize {
         if self.of_local.is_empty() {

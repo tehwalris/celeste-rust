@@ -108,24 +108,8 @@ impl LocalEnv {
         }
     }
 
-    /// An empty environment with the same slot map as this one.
-    pub fn empty_like(&self) -> Self {
-        Self::with_slots(Arc::clone(&self.slots))
-    }
-
     pub fn slots(&self) -> &Arc<SlotMap> {
         &self.slots
-    }
-
-    /// True when no slot holds a value. Note that an environment stays empty
-    /// across a `Return` with no value, which is what lets the frame chunk hand
-    /// its state to the next frame.
-    pub fn is_empty(&self) -> bool {
-        self.data.values.iter().all(|v| v.is_none())
-    }
-
-    pub fn with_capacity(_max_locals: usize) -> Self {
-        Self::new()
     }
 
     #[inline]
@@ -164,46 +148,6 @@ impl LocalEnv {
         data.occupant[slot] = usize::from(id) as u32;
     }
 
-    pub fn retain(&mut self, f: impl Fn(LocalId) -> bool) {
-        let data = Arc::make_mut(&mut self.data);
-        for (slot, v) in data.values.iter_mut().enumerate() {
-            if v.is_none() {
-                continue;
-            }
-            let occupant = data.occupant[slot];
-            if occupant == NO_OCCUPANT || !f(LocalId::from(occupant as usize)) {
-                *v = None;
-                data.occupant[slot] = NO_OCCUPANT;
-            }
-        }
-    }
-
-    /// Drops one local, if it is still the occupant of its slot.
-    ///
-    /// A slot whose occupant has moved on already lost this value - slots are
-    /// shared between locals with disjoint live ranges - so that case is a
-    /// no-op. What must not happen is dropping a *different* local's value,
-    /// which the occupant check prevents.
-    pub fn kill(&mut self, id: LocalId) {
-        let slot = self.slots.slot_of(id);
-        let Some(&occupant) = self.data.occupant.get(slot) else {
-            return;
-        };
-        if occupant != usize::from(id) as u32 {
-            return;
-        }
-        let data = Arc::make_mut(&mut self.data);
-        data.values[slot] = None;
-        data.occupant[slot] = NO_OCCUPANT;
-    }
-
-    pub fn clear(&mut self) {
-        self.data = Arc::new(EnvData {
-            values: vec![None; self.slots.num_slots()],
-            occupant: vec![NO_OCCUPANT; self.slots.num_slots()],
-        });
-    }
-
     #[inline]
     pub fn map_in_place(&mut self, f: impl Fn(Value) -> Value) {
         let data = Arc::make_mut(&mut self.data);
@@ -228,34 +172,9 @@ impl LocalEnv {
         }
     }
 
-    /// Split vector values into two environments in one walk: `self` keeps
-    /// the matching lanes, `other` (a clone of the pre-split env) gets the
-    /// rest. Scalars stay shared. Occupancy is untouched on both sides.
-    pub fn split_vectors_in_place(&mut self, other: &mut Self, runs: &super::value::SplitRuns) {
-        let data_a = Arc::make_mut(&mut self.data);
-        let data_b = Arc::make_mut(&mut other.data);
-        debug_assert_eq!(data_a.values.len(), data_b.values.len(), "split of diverged envs");
-        for (slot_a, slot_b) in data_a.values.iter_mut().zip(data_b.values.iter_mut()) {
-            if let Some(value) = slot_a.as_ref() {
-                if let Some((a, b)) = value.split_vectors_if_vector(runs) {
-                    *slot_a = Some(a);
-                    *slot_b = Some(b);
-                }
-            }
-        }
-    }
-
-    /// Iterate over occupied `(slot, value)` pairs.
-    ///
-    /// Yields slots, not `LocalId`s. Callers that rebuild an environment
-    /// (garbage collection, vectorisation) work positionally and must preserve
-    /// occupancy - use `set_slot` for that.
-    pub fn iter(&self) -> impl Iterator<Item = (usize, &Value)> {
-        self.data
-            .values
-            .iter()
-            .enumerate()
-            .filter_map(|(i, v)| v.as_ref().map(|v| (i, v)))
+    /// An empty environment with the same slot map as this one.
+    pub fn empty_like(&self) -> Self {
+        Self::with_slots(Arc::clone(&self.slots))
     }
 
     /// The `LocalId` currently occupying a slot, if any.
@@ -266,21 +185,9 @@ impl LocalEnv {
         }
     }
 
-    /// Positional read, bypassing the occupant check. For code that rebuilds an
-    /// environment slot by slot.
+    /// Positional write that preserves the slot's existing occupant.
     #[inline]
-    pub fn get_by_raw_id(&self, slot: usize) -> &Value {
-        self.data
-            .values
-            .get(slot)
-            .and_then(|v| v.as_ref())
-            .expect("slot should be set before get")
-    }
-
-    /// Positional write that preserves the slot's existing occupant. Used when
-    /// rebuilding an environment from another one.
-    #[inline]
-    pub fn set_by_raw_id(&mut self, slot: usize, value: Value) {
+    fn set_by_raw_id(&mut self, slot: usize, value: Value) {
         let data = Arc::make_mut(&mut self.data);
         if slot >= data.values.len() {
             data.values.resize(slot + 1, None);
@@ -296,6 +203,20 @@ impl LocalEnv {
         let data = Arc::make_mut(&mut self.data);
         data.occupant[slot] = occupant.map_or(NO_OCCUPANT, |id| usize::from(id) as u32);
     }
+
+    /// Iterate over occupied `(slot, value)` pairs.
+    ///
+    /// Yields slots, not `LocalId`s. Callers that rebuild an environment
+    /// (garbage collection, vectorisation) work positionally and must preserve
+    /// occupancy - use `set_slot` for that.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &Value)> {
+        self.data
+            .values
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.as_ref().map(|v| (i, v)))
+    }
+
 }
 
 #[cfg(test)]
