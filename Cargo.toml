@@ -103,3 +103,16 @@ debug = false
 [[bin]]
 name = "transpile"
 path = "src/bin/transpile.rs"
+
+# THROWAWAY spike probe (branch fiber-spike); remove before merge.
+[[bin]]
+name = "fiber_probe"
+path = "src/bin/fiber_probe.rs"
+
+[[bin]]
+name = "fiber_bfs"
+path = "src/bin/fiber_bfs.rs"
+
+[[bin]]
+name = "fiber_fwd"
+path = "src/bin/fiber_fwd.rs"
