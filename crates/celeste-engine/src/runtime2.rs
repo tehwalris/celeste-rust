@@ -673,36 +673,86 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
+        self.widen_to(ids, Some(0));
+    }
+
+    /// The boundary widenings at a rem precision - `rem_bits` = `Some(k)` for
+    /// Bits(k), `None` for Exact - on this block's columns, per lane. This
+    /// is `make_state_abstract_rem` + `apply_conservative_widenings`
+    /// (abstraction.rs) on a block: it is what the ladder's filter applies to
+    /// a finer level's rows to look them up in the coarser level's marks.
+    ///
+    ///   1. rem: Bits(0) -> the full [-0.5, 0.5) interval; Bits(k) -> the
+    ///      floor-aligned bucket of width 2^-k containing the value (an
+    ///      interval spans its endpoints' buckets); Exact -> untouched.
+    ///   3. dash_effect_time clamped at 0 from below.
+    ///   3b. fruit: at a non-exact level, off := [0, 39] and y := its bob
+    ///       band, together; at Exact, off := off mod 40 (the pin).
+    ///   4. timer globals pinned to 0.
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: Option<u8>) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
-        // 1. rem widening, Bits(0).
+        // 1. rem widening.
         let half = P8::from_parts(0, 0x8000);
         let neg_half = -half;
         let half_below = half.next_smallest();
         let wide = AV::Ival(neg_half, half_below);
-        for c in rem_cells {
-            let col = &self.cols[c as usize];
-            let check = |v: AV| match v {
-                AV::Num(n) => assert!(
-                    n >= neg_half && n <= half_below,
-                    "player_rem value {:?} not in expected interval",
-                    n
-                ),
-                AV::Ival(a, b) => assert!(
-                    a >= neg_half && b <= half_below,
-                    "player_rem interval [{:?}, {:?}] not in expected interval",
-                    a,
-                    b
-                ),
-                other => panic!("Unexpected value type for player_rem: {:?}", other),
-            };
-            match col {
-                Col::U(v) => check(*v),
-                Col::V(vs) => vs.iter().for_each(|v| check(*v)),
-                Col::N(vs) => vs.iter().for_each(|n| check(AV::Num(*n))),
-                Col::I(vs) => vs.iter().for_each(|(a, b)| check(AV::Ival(*a, *b))),
+        // The floor-aligned bucket of width 2^-bits containing `n`
+        // (abstraction.rs `rem_bucket`).
+        let bucket = |n: P8, bits: u8| -> (P8, P8) {
+            let width: i32 = 0x1_0000 >> bits;
+            let low = n.to_bits().cast_signed().div_euclid(width) * width;
+            (P8::from_raw(low), P8::from_raw(low + width - 1))
+        };
+        if let Some(bits) = rem_bits {
+            for c in rem_cells {
+                let widen = |v: AV| -> AV {
+                    match v {
+                        AV::Num(n) => {
+                            assert!(
+                                n >= neg_half && n <= half_below,
+                                "player_rem value {:?} not in expected interval",
+                                n
+                            );
+                            if bits == 0 {
+                                wide
+                            } else {
+                                let (lo, hi) = bucket(n, bits);
+                                AV::Ival(lo, hi)
+                            }
+                        }
+                        AV::Ival(a, b) => {
+                            assert!(
+                                a >= neg_half && b <= half_below,
+                                "player_rem interval [{:?}, {:?}] not in expected interval",
+                                a,
+                                b
+                            );
+                            if bits == 0 {
+                                wide
+                            } else {
+                                AV::Ival(bucket(a, bits).0, bucket(b, bits).1)
+                            }
+                        }
+                        other => panic!("Unexpected value type for player_rem: {:?}", other),
+                    }
+                };
+                self.cols[c as usize] = match &self.cols[c as usize] {
+                    Col::U(v) => Col::U(widen(*v)),
+                    Col::V(vs) => Col::V(vs.iter().map(|v| widen(*v)).collect()),
+                    Col::N(vs) => Col::V(vs.iter().map(|n| widen(AV::Num(*n))).collect()),
+                    Col::I(vs) => Col::V(vs.iter().map(|(a, b)| widen(AV::Ival(*a, *b))).collect()),
+                };
+                if bits > 0 {
+                    // A per-lane bucket column: raw intervals where every
+                    // lane is one, uniform where all agree.
+                    let col = std::mem::replace(&mut self.cols[c as usize], Col::U(AV::Nil));
+                    self.cols[c as usize] = collapse_uniform(match col {
+                        Col::V(vs) => compress_num_v(vs),
+                        other => other,
+                    });
+                }
             }
-            self.cols[c as usize] = Col::U(wide);
         }
 
         // 3. dash_effect_time clamp.
@@ -725,13 +775,52 @@ impl Rt2 {
         // 3b. Fruit off/y widening (abstraction.rs:720): each live fruit's
         // bob counter becomes the full period [0, 39] and its y the whole
         // bob band start +/- 2.5 (sin is in [-1, 1]) - bit for bit the
-        // interpreter's behavior at every NON-EXACT level, which this
-        // boundary is (it implements Bits(0) only, see the doc comment).
-        // `off` and `y` widen TOGETHER (one without the other produces a
-        // row no interpreter level has - room20-plan.md "only half a
-        // widening"), and the widening must only ever grow the value it
-        // replaces (asserted per lane, like the interpreter).
-        for obj in self.objects_of_type(ids, ids.g_fruit) {
+        // interpreter's behavior at every NON-EXACT level. `off` and `y`
+        // widen TOGETHER (one without the other produces a row no
+        // interpreter level has - room20-plan.md "only half a widening"),
+        // and the widening must only ever grow the value it replaces
+        // (asserted per lane, like the interpreter). At Exact, `off` is
+        // pinned modulo its period instead (`apply_conservative_widenings`).
+        if rem_bits.is_none() {
+            for obj in self.objects_of_type(ids, ids.g_fruit) {
+                let off_cell = self
+                    .obj_field_cell(obj, ids.f_off)
+                    .unwrap_or_else(|| panic!("fruit-off pin: fruit has no `off` field"));
+                let reduce = |v: AV| -> AV {
+                    match v {
+                        AV::Num(n) => {
+                            let i = n
+                                .as_i16()
+                                .unwrap_or_else(|| panic!("fruit-off pin: off {:?} is not an integer", n));
+                            assert!(i >= 0, "fruit-off pin: off {} is negative", i);
+                            AV::Num(P8::from_i16(i % 40))
+                        }
+                        AV::Ival(a, b) => {
+                            assert!(
+                                a >= P8::from_i16(0) && b <= P8::from_i16(40),
+                                "fruit-off pin: widened off outside [0, 40]: [{:?}, {:?}]",
+                                a,
+                                b
+                            );
+                            v
+                        }
+                        other => panic!("fruit-off pin: off is not a number: {:?}", other),
+                    }
+                };
+                self.cols[off_cell as usize] = match &self.cols[off_cell as usize] {
+                    Col::U(v) => Col::U(reduce(*v)),
+                    Col::V(vs) => Col::V(vs.iter().map(|v| reduce(*v)).collect()),
+                    Col::N(vs) => Col::V(vs.iter().map(|n| reduce(AV::Num(*n))).collect()),
+                    Col::I(vs) => Col::V(vs.iter().map(|(a, b)| reduce(AV::Ival(*a, *b))).collect()),
+                };
+            }
+        }
+        let widened_fruit = if rem_bits.is_some() {
+            self.objects_of_type(ids, ids.g_fruit)
+        } else {
+            Vec::new()
+        };
+        for obj in widened_fruit {
             let field = |rt: &Self, name: &str, f: u32| {
                 rt.obj_field_cell(obj, f).unwrap_or_else(|| {
                     panic!("fruit-off widening: fruit has no `{}` field", name)
@@ -788,7 +877,7 @@ impl Rt2 {
             let cell = self.globals[g as usize];
             assert!(cell != NONE, "timer global missing - pin would silently not apply");
             match &self.cols[cell as usize] {
-                Col::U(AV::Num(_)) | Col::V(_) => {
+                Col::U(AV::Num(_)) | Col::V(_) | Col::N(_) => {
                     self.cols[cell as usize] = Col::U(AV::Num(zero));
                 }
                 other => panic!("timer global is not a number: {:?}", other),

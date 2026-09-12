@@ -42,8 +42,6 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::interpreter::abstraction::{player_xy_per_lane, room_xy_per_lane};
-use crate::interpreter::state::State;
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
 /// Side of the position grid, in pixels. A room is 128x128; the grid holds
@@ -144,32 +142,6 @@ pub fn block_cells(rt2: &Rt2) -> Result<Vec<u32>> {
             cell_of(
                 px[i] as i32 + (rx[i] - start.0) as i32 * ROOM_PX,
                 py[i] as i32 + (ry[i] - start.1) as i32 * ROOM_PX,
-            )
-        })
-        .collect()
-}
-
-/// Per-lane cell of a boundary state.
-pub fn state_cells(state: &State) -> Result<Vec<u32>> {
-    let start = crate::game_runner::start_room();
-    let rooms = room_xy_per_lane(state)
-        .ok_or_else(|| anyhow!("state_cells: no readable `room` global"))?;
-    let lanes = state.vector_size.max(1);
-    if rooms.len() != lanes {
-        return Err(anyhow!("state_cells: {} rooms for {} lanes", rooms.len(), lanes));
-    }
-    let Some(xy) = player_xy_per_lane(state) else {
-        return Ok(vec![NO_CELL; lanes]);
-    };
-    if xy.len() != lanes {
-        return Err(anyhow!("state_cells: {} positions for {} lanes", xy.len(), lanes));
-    }
-    xy.iter()
-        .zip(&rooms)
-        .map(|(&(px, py), &(rx, ry))| {
-            cell_of(
-                px as i32 + (rx - start.0) as i32 * ROOM_PX,
-                py as i32 + (ry - start.1) as i32 * ROOM_PX,
             )
         })
         .collect()

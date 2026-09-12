@@ -116,14 +116,6 @@ impl Block {
         })
     }
 
-    /// A new block holding just `rows` of this one (copies only those rows).
-    pub fn select(&self, rows: &[u32]) -> Block {
-        let mut b = celeste_engine::slots::reshape(&self.rt2, 0);
-        b.shape_hash = self.rt2.shape_hash;
-        b.append_rows(&self.rt2, rows);
-        Block { rt2: b }
-    }
-
     /// Keep only the lanes whose mask entry is true, as a new block; `None` if
     /// none survive. The one splitting primitive the loop needs (dedup at the
     /// door repacks with this).
@@ -269,34 +261,28 @@ impl<'a> MarkFilter<'a> {
 }
 
 /// Each lane's `(key, cell)` after widening to `coarser` - what `MarkFilter`
-/// looks up. Public for the ladder diagnostics.
+/// looks up. The COMPLETE coarsening the coarse engine bakes into its rows
+/// (`Rt2::widen_to`: rem bucketing, the dash clamp, the fruit widening or
+/// pin, the timer pins), then the canonical key - on the block's columns,
+/// lane for lane. Public for the ladder diagnostics.
 pub fn widened_keys(
     block: &Block,
     coarser: crate::interpreter::abstraction::RemPrecision,
 ) -> Result<(Vec<(u64, u64)>, Vec<u32>)> {
-    use crate::interpreter::abstraction::{apply_conservative_widenings, make_state_abstract_rem};
-    {
-        let lanes = block.lanes();
-        // The COMPLETE coarsening the coarse engine bakes into its states - rem
-        // bucketing AND the conservative widenings (p_jump/p_dash/fruit), then
-        // gc - matching the old `widened_row_key`. Without the conservative
-        // widenings, an Exact state keeps p_jump/p_dash concrete while the coarse
-        // marks have them widened, so its coarsened key matches nothing and the
-        // winning path is wrongly filtered at the Bits->Exact rung.
-        let mut widened = make_state_abstract_rem(block.to_state(), coarser);
-        widened = apply_conservative_widenings(widened);
-        widened.gc();
-        anyhow::ensure!(
-            widened.vector_size.max(1) == lanes,
-            "rem widening changed the lane count ({} -> {}); the filter's lane \
-             correspondence is broken",
-            lanes,
-            widened.vector_size.max(1)
-        );
-        let keys = crate::compiled::engine_row_keys(&widened)?;
-        let cells = crate::search::pos_graph::state_cells(&widened)?;
-        Ok((keys, cells))
-    }
+    use crate::interpreter::abstraction::RemPrecision;
+    let bits = match coarser {
+        RemPrecision::Bits(b) if b < 16 => Some(b),
+        _ => None,
+    };
+    let mut w = block.rt2.clone_block();
+    w.widen_to(crate::compiled::ids(), bits);
+    let keys = w.row_keys_canonical();
+    let cells = crate::search::pos_graph::block_cells(&w)?;
+    anyhow::ensure!(
+        keys.len() == block.lanes() && cells.len() == block.lanes(),
+        "the widening changed the lane count"
+    );
+    Ok((keys, cells))
 }
 
 /// The one interface between the outer loop and the engines (interface #1).
@@ -494,17 +480,7 @@ pub fn backward_walk(
             frontier.push((k, c));
         }
     }
-    // The layers 0..=horizon-1, in memory: iteration i needs every layer
-    // <= i, and drops layer i+1 as it passes it.
-    let t = std::time::Instant::now();
-    let mut layers: Vec<Vec<Block>> = Vec::with_capacity(horizon as usize);
-    for f in 0..horizon {
-        layers.push(load_frame(dir, f)?);
-    }
-    crate::metrics::record("bwd.load", t.elapsed());
-
     for i in (1..horizon).rev() {
-        layers.truncate(i as usize + 1);
         let t_frame = std::time::Instant::now();
         // Candidate cells = pos-graph predecessors of the target (marked) cells.
         let mut cand_cells: FxHashSet<u32> = FxHashSet::default();
@@ -521,24 +497,24 @@ pub fn backward_walk(
         let (mut t_load, mut t_run) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         let (mut loaded, mut frame_reruns) = (0usize, 0u64);
         let t = std::time::Instant::now();
-        // Candidates: unmarked rows of every layer <= i in the narrowed cells.
+        // Candidates: unmarked rows of every layer <= i in the narrowed
+        // cells. The layers are streamed from disk per iteration (a level's
+        // layers do not fit in memory at a real horizon); `load_frame_cells`
+        // keeps only the rows in the narrowed cells.
         let mut cands: Vec<Block> = Vec::new();
-        for layer in &layers {
-            for block in layer {
+        for f in 0..=i {
+            for block in load_frame_cells(dir, f, &cand_cells)? {
+                loaded += block.lanes();
                 let cells = block.positions()?;
                 let mask: Vec<bool> = block
                     .keys()
                     .iter()
                     .zip(&cells)
-                    .map(|(k, &c)| cand_cells.contains(&c) && !marked.contains(*k, c))
+                    .map(|(k, &c)| !marked.contains(*k, c))
                     .collect();
-                if !mask.iter().any(|&m| m) {
-                    continue;
+                if let Some(cand) = block.keep(&mask) {
+                    cands.push(cand);
                 }
-                loaded += block.lanes();
-                let rows: Vec<u32> =
-                    mask.iter().enumerate().filter_map(|(r, &m)| m.then_some(r as u32)).collect();
-                cands.push(block.select(&rows));
             }
         }
         t_load += t.elapsed();
@@ -660,7 +636,24 @@ impl ForwardState {
                 self.win_frame = Some(frame);
                 eprintln!("[fwd] first win at f{frame}");
             }
-            self.frontier = next;
+            // A won row is checkpointed (it is a backward seed) but never
+            // expanded: its successors have left the room, and the search
+            // is about reaching the exit, not what lies past it (and the
+            // start room's kernel set does not cover the next room's
+            // shapes).
+            self.frontier = if won {
+                let mut kept = Vec::with_capacity(next.len());
+                for b in next {
+                    let wins = b.wins()?;
+                    let mask: Vec<bool> = wins.iter().map(|w| !w).collect();
+                    if let Some(k) = b.keep(&mask) {
+                        kept.push(k);
+                    }
+                }
+                kept
+            } else {
+                next
+            };
         }
         Ok(())
     }
@@ -1088,9 +1081,8 @@ mod tests {
     /// nothing is discarded - and (b) an empty marked set - everything is
     /// discarded and the frontier empties. Uses Bits(0) as the coarser level.
     #[test]
-    #[ignore]
     fn forward_filter_keeps_marked_and_discards_unmarked() {
-        use crate::interpreter::abstraction::{make_state_abstract_rem, RemPrecision};
+        use crate::interpreter::abstraction::RemPrecision;
         let bits0 = RemPrecision::Bits(0);
         let engine = RefEngine::new().expect("ref engine");
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-filter-test");
@@ -1107,9 +1099,7 @@ mod tests {
         // marked_full = the widened-to-Bits(0) keys of every frame-1 state.
         let mut marked_full = Visited::new();
         for b in &frame1 {
-            let w = make_state_abstract_rem(b.to_state(), bits0);
-            let keys = crate::compiled::engine_row_keys(&w).expect("keys");
-            let cells = crate::search::pos_graph::state_cells(&w).expect("cells");
+            let (keys, cells) = widened_keys(b, bits0).expect("widened keys");
             for (k, &c) in keys.iter().zip(&cells) {
                 marked_full.insert(*k, c);
             }

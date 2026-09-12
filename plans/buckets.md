@@ -50,7 +50,10 @@ regrouping, and 17k checkpoint files per frame.
   fingerprints per (horizon, level) == `gates/marks_room10_win9-101_h29-33.txt`
   (the backward on a real fan-out, across horizons; must end in
   `OPTIMAL win frame: 33`, which the unfiltered Exact forward's first win
-  confirms).
+  confirms). Re-pinned 2026-09-12 when won rows stopped being expanded:
+  h32/h33 levels 0-1 lost 18/36 marks with IDENTICAL re-run counts - the
+  post-win rows that re-entered (9,101) and counted as seeds, nothing
+  else - and the Exact lines and the optimum are unchanged.
 - `cargo nextest run --cargo-profile quick` green; `kernel lanes: missed 0`.
 
 ## Stages
@@ -84,6 +87,7 @@ regrouping, and 17k checkpoint files per frame.
 
 ## Transition points that remain on `State`
 
-The initial state (`RefEngine::initial_state` -> one bucket), the `RefEngine`
-oracle (bridge at its edge), and `MarkFilter` at levels >= 1 (re-widening
-through `State`; an `Rt2` widening later).
+The initial state (`RefEngine::initial_state` -> one bucket) and the
+`RefEngine` oracle (bridge at its edge). `MarkFilter` widens on the columns
+(`Rt2::widen_to`) since 2026-09-12: exporting whole buckets through `State`
+reached 62.8 GB in the level-1 forward at H=55.

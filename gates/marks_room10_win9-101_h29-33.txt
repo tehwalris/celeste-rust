@@ -7,10 +7,10 @@
 [ladder] h31 level 0 (Bits(0)): first win f29, marked 297 states (fingerprint b8cb8529101035c9), 17950 re-runs
 [ladder] h31 level 1 (Bits(1)): first win f29, marked 181 states (fingerprint b57da063b57a24cd), 485 re-runs
 [ladder] h31 level 2 (Exact): NO WIN -> Refuted
-[ladder] h32 level 0 (Bits(0)): first win f29, marked 979 states (fingerprint 87fb681c889bddd9), 45280 re-runs
+[ladder] h32 level 0 (Bits(0)): first win f29, marked 961 states (fingerprint e6c41a3f4b757eb3), 45280 re-runs
 [ladder] h32 level 1 (Bits(1)): first win f29, marked 543 states (fingerprint af8214b806fdec81), 2059 re-runs
 [ladder] h32 level 2 (Exact): NO WIN -> Refuted
-[ladder] h33 level 0 (Bits(0)): first win f29, marked 2889 states (fingerprint 69cf982ebef6388d), 86603 re-runs
-[ladder] h33 level 1 (Bits(1)): first win f29, marked 2454 states (fingerprint ef40c714f1656d89), 11160 re-runs
+[ladder] h33 level 0 (Bits(0)): first win f29, marked 2853 states (fingerprint 8ce4d8ab078f39dd), 86603 re-runs
+[ladder] h33 level 1 (Bits(1)): first win f29, marked 2418 states (fingerprint aaf63a9a40599317), 11160 re-runs
 [ladder] h33 level 2 (Exact): first win f33, marked 262 states (fingerprint 7d25c8eac8fc818b), 1924 re-runs
 OPTIMAL win frame: 33
