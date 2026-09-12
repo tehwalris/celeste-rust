@@ -132,15 +132,6 @@ impl Block {
         Some(self)
     }
 
-    /// The block's shard cell. A regrouped block is uniform in position, so its
-    /// whole position column is one value - the shard's cell.
-    pub fn shard_cell(&self) -> Result<u32> {
-        self.positions()?
-            .first()
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("empty block has no shard cell"))
-    }
-
     /// The block's shard shape. A block is one shape.
     pub fn shard_shape(&self) -> u64 {
         self.rt2.shape_hash
@@ -165,58 +156,55 @@ impl Block {
     }
 }
 
-/// Regroup surviving lanes into canonical blocks: one block per (shape, pm1
-/// class) and - `by_cell`, the recorder's partition - player-position cell,
-/// each the column-wise append (`Rt2::merge_many`) of its members. With
-/// `by_cell` every block comes out uniform in (shape, position): the block
-/// identity the pos-graph and backward are built on. Without it, position
-/// is content and the grouping is merely coarser; the reachable row set is
-/// the same either way.
-///
-/// Survivors arrive already pm1-partitioned (the engine's own regroup) and
-/// `retain_lanes` preserves that, so `partition_pm1` is a check that costs
-/// a scan; the cell split is real. The merged block's all-equal columns are
-/// stored uniform (`collapse_uniform_cols`), which is what the next frame's
-/// kernel bind keys on.
-fn regroup(survivors: Vec<Rt2>, by_cell: bool) -> Result<Vec<Block>> {
+/// Route a block's rows into next frame's BUCKETS: one bucket per
+/// (shape, class), class = `Rt2::class_keys` (freeze, moving key, pm1
+/// cells). A column append per row group (`Rt2::append_rows`); no clone,
+/// no merge, no re-partition - the bucket IS the block the next frame's
+/// kernel call runs on, packed as it is built (plans/buckets.md).
+fn route(
+    rt2: Rt2,
+    buckets: &mut rustc_hash::FxHashMap<(u64, u64), Rt2>,
+    g_freeze: u32,
+) {
     let ids = crate::compiled::ids();
-    let mut index: rustc_hash::FxHashMap<(u64, u64, u32), usize> = Default::default();
-    let mut groups: Vec<Vec<Rt2>> = Vec::new();
-    for rt2 in survivors {
-        for part in rt2.partition_pm1(ids) {
-            let pm1 = part.pm1_key_hash(ids);
-            let parts: Vec<(Rt2, u32)> = if by_cell {
-                let cells = crate::search::pos_graph::block_cells(&part)?;
-                // `partition_by_key` emits parts in first-occurrence order of
-                // the key, so the distinct cells in that order label them.
-                let mut order: Vec<u32> = Vec::new();
-                for &c in &cells {
-                    if !order.contains(&c) {
-                        order.push(c);
-                    }
-                }
-                part.partition_by_key(&cells).into_iter().zip(order).collect()
-            } else {
-                vec![(part, 0)]
-            };
-            for (p, cell) in parts {
-                let key = (p.shape_hash, pm1, cell);
-                let g = *index.entry(key).or_insert_with(|| {
-                    groups.push(Vec::new());
-                    groups.len() - 1
-                });
-                groups[g].push(p);
-            }
-        }
+    let classes = rt2.class_keys(ids, g_freeze);
+    let mut groups: rustc_hash::FxHashMap<u64, Vec<u32>> = Default::default();
+    for (i, &c) in classes.iter().enumerate() {
+        groups.entry(c).or_default().push(i as u32);
     }
-    Ok(groups
-        .into_iter()
-        .map(|g| {
-            let mut merged = Rt2::merge_many(g);
-            merged.collapse_uniform_cols();
-            Block::from_rt2(merged)
-        })
-        .collect())
+    for (class, rows) in groups {
+        let bucket = buckets.entry((rt2.shape_hash, class)).or_insert_with(|| {
+            let mut b = celeste_engine::slots::reshape(&rt2, 0);
+            b.shape_hash = rt2.shape_hash;
+            b
+        });
+        bucket.append_rows(&rt2, &rows);
+    }
+}
+
+/// What a frame step EMITS INTO (interface #1's output side). The step
+/// consumes provenance at emission - it knows which input row each output
+/// row came from - and reports through this: the pos-graph edges
+/// `(input cell, output cell)` of every raw output (before any dedup),
+/// and the output rows themselves, at the boundary and keyed, per output
+/// block. When `visited` is present the step dedups AT THE DOOR - a row
+/// already in the search is never materialized; when absent (a filtered
+/// ladder level, the backward's re-runs) every row the step's own
+/// within-call dedup keeps is handed back.
+pub struct ForwardSink<'a> {
+    pub visited: Option<&'a mut Visited>,
+    /// Record `edges` at all (off for the backward, which has the graph).
+    pub edges_on: bool,
+    pub edges: Vec<(u32, u32)>,
+    /// Rows emitted after the step's within-call dedup (the raw fan-out).
+    pub emitted: u64,
+    pub out: Vec<Rt2>,
+}
+
+impl<'a> ForwardSink<'a> {
+    pub fn new(visited: Option<&'a mut Visited>, edges_on: bool) -> Self {
+        ForwardSink { visited, edges_on, edges: Vec::new(), emitted: 0, out: Vec::new() }
+    }
 }
 
 /// The ladder's forward discard-filter. A state generated at precision r+1 is
@@ -289,21 +277,21 @@ impl<'a> MarkFilter<'a> {
 /// the scalar interpreter (`trace::refengine`, the trusted reference). The loop
 /// holds a `&dyn FrameStep` and never knows which.
 pub trait FrameStep {
-    fn run(&mut self, block: Block) -> Result<Vec<Block>>;
+    /// One frame of `block`, emitted into `sink`.
+    fn run(&mut self, block: Block, sink: &mut ForwardSink) -> Result<()>;
+    /// The freeze global's id, for bucket routing.
+    fn freeze_global(&self) -> u32;
 }
 
-/// The minimal forward frame: run the frame step over every block in the
-/// frontier and keep, from each output block, only the lanes whose key is new.
-/// Returns the next frontier (the survivor blocks) and whether any survivor
-/// wins.
+/// The minimal forward frame: run the frame step over every bucket of the
+/// frontier, dedup at the door, and route the survivors into next frame's
+/// buckets. Returns the next frontier and whether any survivor wins.
 ///
-/// This is the whole of it. Dedup is decided AT THE DOOR - a lane is kept iff
-/// `visited.insert` reports its key as new, and the block is split to just those
-/// lanes - so the pre-dedup fan-out never accumulates and there is no
-/// materialize-then-filter. One structure (`visited`) covers both the
-/// within-frame and across-frame dedup. No chunking, no serial/parallel/phased
-/// variants: everything the old `step_inner` did beyond this served machinery we
-/// are cutting.
+/// Level 0 (no `filter`): the step carries the visited set and only
+/// materializes rows new to the search. A filtered level: the step hands
+/// back every row it keeps, the ladder filter decides per row, and the
+/// visited insert follows - a filtered-out lane never enters `visited`.
+/// Either way the pos-graph sees every raw output's edge.
 pub fn forward_frame(
     engine: &mut dyn FrameStep,
     frontier: Vec<Block>,
@@ -311,75 +299,60 @@ pub fn forward_frame(
     is_win: impl Fn(&Block) -> Result<bool>,
     pos: Option<&crate::search::pos_graph::PosObserver>,
     filter: Option<&MarkFilter>,
-    by_cell: bool,
 ) -> Result<(Vec<Block>, bool, FrameStats)> {
     use std::time::Instant;
     let mut st = FrameStats::default();
-    let mut survivors: Vec<Rt2> = Vec::new();
     let mut won = false;
+    let g_freeze = engine.freeze_global();
+    let mut buckets: rustc_hash::FxHashMap<(u64, u64), Rt2> = Default::default();
     st.blocks_in = frontier.len();
     for block in frontier {
         st.lanes_in += block.lanes();
-        // Pos-graph edge: the block is uniform in position (record mode's
-        // by-cell regroup), so its single input cell reaches every output
-        // cell. Record ALL raw outputs' positions (before dedup) - dedup
-        // drops duplicate keys, not reachable positions.
-        let c_in = match pos {
-            Some(p) => Some(p.input_cell(&block.positions()?)?),
-            None => None,
-        };
+        let door = if filter.is_none() { Some(&mut *visited) } else { None };
+        let mut sink = ForwardSink::new(door, pos.is_some());
         let t = Instant::now();
-        let outputs = engine.run(block)?;
+        engine.run(block, &mut sink)?;
         st.t_engine += t.elapsed();
-        for out in outputs {
-            st.lanes_raw += out.lanes();
-            let t = Instant::now();
-            let cells = out.positions()?;
-            st.t_keys += t.elapsed();
-            // Pos-graph edge: record ALL raw outputs' positions (before dedup);
-            // dedup drops duplicate keys, not reachable positions.
-            if let (Some(p), Some(c_in)) = (pos, c_in) {
-                p.record_dsts(c_in, &cells);
-            }
-            // Ladder filter (coarser level's marked set): discard a lane whose
-            // widened-to-coarser form was not marked. Computed before the
-            // visited insert so a discarded lane never enters the visited set.
-            let t = Instant::now();
-            let allow = match filter {
-                Some(f) => Some(f.allowed(&out)?),
-                None => None,
+        if let Some(p) = pos {
+            p.record_pairs(&mut sink.edges);
+        }
+        st.lanes_raw += sink.emitted as usize;
+        let outs = std::mem::take(&mut sink.out);
+        drop(sink);
+        for out in outs {
+            let out = Block::from_rt2(out);
+            let kept = match filter {
+                None => Some(out),
+                Some(f) => {
+                    // Ladder filter (coarser level's marked set), then the
+                    // door: `&&` short-circuits, so a filtered-out lane is
+                    // never inserted into `visited`.
+                    let t = Instant::now();
+                    let allow = f.allowed(&out)?;
+                    st.t_filter += t.elapsed();
+                    let t = Instant::now();
+                    let cells = out.positions()?;
+                    let mask: Vec<bool> = out
+                        .keys()
+                        .iter()
+                        .zip(&cells)
+                        .enumerate()
+                        .map(|(i, (k, &c))| allow[i] && visited.insert(*k, c))
+                        .collect();
+                    st.t_visited += t.elapsed();
+                    out.keep(&mask)
+                }
             };
-            st.t_filter += t.elapsed();
-            // Dedup at the door, SHARDED by (shape, cell): insert() reports true
-            // for a (key, cell) not seen before in this or any earlier frontier.
-            // Building the mask also records the survivors, so a duplicate later
-            // in the same frame is caught too. `&&` short-circuits, so a
-            // filtered-out lane is never inserted into `visited`.
-            let t = Instant::now();
-            let mask: Vec<bool> = out
-                .keys()
-                .iter()
-                .zip(&cells)
-                .enumerate()
-                .map(|(i, (k, &c))| {
-                    allow.as_ref().map_or(true, |a| a[i]) && visited.insert(*k, c)
-                })
-                .collect();
-            st.t_visited += t.elapsed();
-            let t = Instant::now();
-            if let Some(kept) = out.keep(&mask) {
+            if let Some(kept) = kept {
                 st.lanes_kept += kept.lanes();
                 won |= is_win(&kept)?;
-                survivors.push(kept.into_rt2());
+                let t = Instant::now();
+                route(kept.into_rt2(), &mut buckets, g_freeze);
+                st.t_route += t.elapsed();
             }
-            st.t_keep += t.elapsed();
         }
     }
-    // Regroup the surviving lanes into canonical blocks (`regroup`): one
-    // block per (shape, pm1 class[, cell]), a column append per group.
-    let t = Instant::now();
-    let next = regroup(survivors, by_cell)?;
-    st.t_vectorize += t.elapsed();
+    let next: Vec<Block> = buckets.into_values().map(Block::from_rt2).collect();
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
     Ok((next, won, st))
@@ -387,7 +360,7 @@ pub fn forward_frame(
 
 /// Where one forward frame's time went and what it moved, for the per-frame
 /// log line and the phase totals. Phases are the loop's own seams; the frame
-/// step's internal split is the engine's business (`CELESTE_CHUNK_PHASE_TIME`).
+/// step keeps its own counters (`kernel calls:` in the run summary).
 #[derive(Default, Clone, Copy)]
 pub struct FrameStats {
     pub blocks_in: usize,
@@ -400,11 +373,9 @@ pub struct FrameStats {
     /// Lanes after regrouping (cross-block duplicates collapsed).
     pub lanes_out: usize,
     pub t_engine: std::time::Duration,
-    pub t_keys: std::time::Duration,
     pub t_filter: std::time::Duration,
     pub t_visited: std::time::Duration,
-    pub t_keep: std::time::Duration,
-    pub t_vectorize: std::time::Duration,
+    pub t_route: std::time::Duration,
 }
 
 /// A block wins if any lane sits on the room's win target (`Block::wins`).
@@ -502,7 +473,9 @@ pub fn backward_walk(
                 let Some(single) = block.lane(lane) else { continue };
                 reruns += 1;
                 let mut hit = false;
-                'outs: for out in engine.run(single)? {
+                let mut sink = ForwardSink::new(None, false);
+                engine.run(single, &mut sink)?;
+                'outs: for out in sink.out.into_iter().map(Block::from_rt2) {
                     let oc = out.positions()?;
                     for (k, &c) in out.keys().iter().zip(&oc) {
                         if targets.contains(&(k.0, k.1, c)) {
@@ -547,11 +520,6 @@ pub fn forward_run(
     record: bool,
     filter: Option<&MarkFilter>,
 ) -> Result<ForwardResult> {
-    // Record mode regroups by cell, so every block (see `regroup`) is
-    // uniform in position and the pos-graph's input cell is well defined.
-    // Off for a forward-only run: position is content, so grouping on it
-    // never changes the reachable row set, only makes the blocks finer
-    // (which only the recorder pays for).
     let observer = record.then(crate::search::pos_graph::PosObserver::default);
 
     let mut visited = Visited::new();
@@ -562,7 +530,7 @@ pub fn forward_run(
         }
     }
     checkpoint_frontier(dir, 0, &initial)?;
-    drive_forward(engine, dir, initial, visited, observer, 1, max_frames, filter, record)
+    drive_forward(engine, dir, initial, visited, observer, 1, max_frames, filter)
 }
 
 /// Resume/extend a checkpointed forward: from `from_frame` (whose frontier is on
@@ -590,7 +558,7 @@ pub fn forward_resume(
         }
     }
     let frontier = load_frame(dir, from_frame)?;
-    drive_forward(engine, dir, frontier, visited, None, from_frame + 1, to_frame, filter, false)
+    drive_forward(engine, dir, frontier, visited, None, from_frame + 1, to_frame, filter)
 }
 
 /// The shared forward loop: from `frontier` (the states at `start_frame - 1`),
@@ -606,7 +574,6 @@ fn drive_forward(
     start_frame: u32,
     end_frame: u32,
     filter: Option<&MarkFilter>,
-    by_cell: bool,
 ) -> Result<ForwardResult> {
     let mut last = start_frame.saturating_sub(1);
     let mut win_frame = None;
@@ -619,7 +586,6 @@ fn drive_forward(
             block_wins,
             observer.as_ref(),
             filter,
-            by_cell,
         )?;
         let t = std::time::Instant::now();
         checkpoint_frontier(dir, frame, &next)?;
@@ -658,7 +624,7 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         engine {:.0} keys {:.0} filter {:.0} visited {:.0} keep {:.0} vec {:.0} \
+         engine {:.0} filter {:.0} visited {:.0} route {:.0} \
          ckpt {:.0} pos {:.0} total {:.0} ms | rss {:.2} GB",
         st.blocks_in,
         st.lanes_in,
@@ -668,41 +634,32 @@ fn log_frame(
         st.lanes_out,
         visited,
         ms(st.t_engine),
-        ms(st.t_keys),
         ms(st.t_filter),
         ms(st.t_visited),
-        ms(st.t_keep),
-        ms(st.t_vectorize),
+        ms(st.t_route),
         ms(t_ckpt),
         ms(t_pos),
         ms(t_total),
         crate::metrics::peak_rss_gb(),
     );
     crate::metrics::record("fwd.engine", st.t_engine);
-    crate::metrics::record("fwd.keys", st.t_keys);
     crate::metrics::record("fwd.filter", st.t_filter);
     crate::metrics::record("fwd.visited", st.t_visited);
-    crate::metrics::record("fwd.keep", st.t_keep);
-    crate::metrics::record("fwd.vectorize", st.t_vectorize);
+    crate::metrics::record("fwd.route", st.t_route);
     crate::metrics::record("fwd.checkpoint", t_ckpt);
     crate::metrics::record("fwd.posgraph", t_pos);
     crate::metrics::record("fwd.frame", t_total);
 }
 
-/// Checkpoint a frontier SHARDED by (shape, cell): one file per block, under
-/// `frames/fNNN/`, named `c{cell}_s{shape}_{seq}.bin`. A regrouped block is
-/// already uniform in (shape, position), so a block IS one shard and needs no
-/// re-splitting. The cell leads the filename so backward can select the cells
-/// it needs by name, without opening a file.
+/// Checkpoint a frontier: one file per BUCKET under `frames/fNNN/`, named
+/// `b{seq}_s{shape}.bin`.
 fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &[Block]) -> Result<()> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
-    // Fresh: a re-run / resumed frame must not leave stale shard files behind.
+    // Fresh: a re-run / resumed frame must not leave stale files behind.
     let _ = std::fs::remove_dir_all(&fdir);
     std::fs::create_dir_all(&fdir)?;
     for (seq, block) in frontier.iter().enumerate() {
-        let cell = block.shard_cell()?;
-        let shape = block.shard_shape();
-        let path = fdir.join(format!("c{:010}_s{:016x}_{:04}.bin", cell, shape, seq));
+        let path = fdir.join(format!("b{:05}_s{:016x}.bin", seq, block.shard_shape()));
         crate::search::checkpoint::save_block_to(&path, &block.rt2)?;
     }
     Ok(())
@@ -713,9 +670,10 @@ pub fn load_frame(dir: &std::path::Path, frame: u32) -> Result<Vec<Block>> {
     load_frame_filtered(dir, frame, |_cell| true)
 }
 
-/// Load only the blocks whose cell is in `cells` - backward's per-cell load,
-/// the whole point of the sharding. Files are selected by their name's cell
-/// prefix; only the chosen shards are opened and decompressed.
+/// Load only the ROWS whose cell is in `cells` - backward's per-cell load.
+/// Every bucket file is read and filtered by its position column; a
+/// per-bucket cell index that makes this a range read is plans/buckets.md
+/// stage 5.
 pub fn load_frame_cells(
     dir: &std::path::Path,
     frame: u32,
@@ -730,22 +688,21 @@ fn load_frame_filtered(
     keep: impl Fn(u32) -> bool,
 ) -> Result<Vec<Block>> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
+    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            n.starts_with('b') && n.ends_with(".bin")
+        })
+        .collect();
+    names.sort();
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&fdir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // Shard files are `c{cell:010}_s{shape}_{seq}.bin`; skip tmp/others.
-        let Some(rest) = name.strip_prefix('c') else { continue };
-        if !name.ends_with(".bin") {
-            continue;
+    for path in names {
+        let block = Block::from_rt2(crate::search::checkpoint::load_block_from(&path)?);
+        let mask: Vec<bool> = block.positions()?.iter().map(|&c| keep(c)).collect();
+        if let Some(b) = block.keep(&mask) {
+            out.push(b);
         }
-        let Some(cell_str) = rest.get(..10) else { continue };
-        let Ok(cell) = cell_str.parse::<u32>() else { continue };
-        if !keep(cell) {
-            continue;
-        }
-        out.push(Block::from_rt2(crate::search::checkpoint::load_block_from(&entry.path())?));
     }
     Ok(out)
 }
@@ -931,16 +888,16 @@ mod tests {
             let blocks = load_frame(dir, frame)
                 .unwrap_or_else(|e| panic!("reload frame {frame}: {e}"));
             assert!(!blocks.is_empty(), "frame {frame} checkpoint is empty");
-            // Per-cell load returns exactly the shards at those cells.
-            let cells: rustc_hash::FxHashSet<u32> =
-                blocks.iter().map(|b| b.shard_cell().unwrap()).collect();
+            // Per-cell load of every cell returns every row.
+            let cells: rustc_hash::FxHashSet<u32> = blocks
+                .iter()
+                .flat_map(|b| b.positions().unwrap())
+                .collect();
             let by_cell = load_frame_cells(dir, frame, &cells).expect("per-cell load");
-            assert_eq!(
-                by_cell.len(),
-                blocks.len(),
-                "per-cell load lost blocks at frame {frame}"
-            );
-            eprintln!("[forward_run] f{frame}: {} blocks across {} cells", blocks.len(), cells.len());
+            let lanes: usize = blocks.iter().map(Block::lanes).sum();
+            let lanes_by_cell: usize = by_cell.iter().map(Block::lanes).sum();
+            assert_eq!(lanes_by_cell, lanes, "per-cell load lost rows at frame {frame}");
+            eprintln!("[forward_run] f{frame}: {} buckets across {} cells", blocks.len(), cells.len());
         }
         let _ = std::fs::remove_dir_all(dir);
     }

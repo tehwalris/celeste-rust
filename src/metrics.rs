@@ -42,10 +42,6 @@ pub fn peak_rss_gb() -> f64 {
 /// "extra": ...}. Failures to write are loud on stderr but never fatal -
 /// metrics must not kill a run that already computed its answer.
 pub fn dump(kind: &str, dir: Option<&std::path::Path>, extra: &[(&str, String)]) {
-    // The compiled frame body's own split, when it was asked for. It sits
-    // INSIDE `fwd.interpret`, so it belongs next to the phase totals rather
-    // than in them.
-    crate::compiled::print_chunk_phase_times();
     // Kernel coverage, when a compiled run was in play. Which lanes the
     // class kernels actually took is the difference between "the compiled
     // engine is slow" and "the compiled engine barely ran".

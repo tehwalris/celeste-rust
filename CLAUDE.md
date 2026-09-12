@@ -15,9 +15,11 @@ Read these before doing anything substantial:
   ONLY surviving `plans/` doc (the other ~45 were deleted in the tear-out).
 - `src/frame.rs` - the rebuilt search itself (~950 lines): `Block`, the
   `FrameStep` trait (implemented by the compiled `FrameEngine` and the
-  reference `RefEngine`), `forward_run` / `forward_resume` / `backward_run` /
-  `ladder_at_horizon` / `find_optimum`, the precision ladder, sharded
-  checkpoints, and `MarkFilter` (the cross-precision link).
+  reference `RefEngine`), `ForwardSink` (what a frame step emits into),
+  `forward_run` / `forward_resume` / `backward_run` / `ladder_at_horizon` /
+  `find_optimum`, the precision ladder, per-bucket checkpoints, and
+  `MarkFilter` (the cross-precision link). `plans/buckets.md` is the
+  design of the loop's data flow (2026-09-12).
 - `BENCHMARK_DATA.md` - performance baseline, but STALE: every number in it was
   measured against the pre-rebuild search path (the now-deleted
   `run.rs` / `sweep*.rs`) and needs re-benchmarking for `rewrite search`. Keep
@@ -234,10 +236,10 @@ been re-benchmarked to the horizon (2026-09-07: the level-0 forward on room
 it sandboxed under `./safe-run.sh` with the 60 GB default and watch. Do not
 raise the cap past what `free` leaves after /tmp, which is a tmpfs.
 
-Checkpoints go on DISK (`/var/tmp/celeste-checkpoints`, the default), never
-under /tmp: the sharded frontier is one file per block, and tmpfs caps /tmp
-at 1,048,576 inodes - a full room forward has more files than that and dies
-of ENOSPC with the bytes barely used (2026-09-07).
+Checkpoints go on DISK (`/var/tmp/celeste-checkpoints`, the default), not
+under the tmpfs at /tmp. (The inode blow-up that forced this - one file per
+17k cell-uniform blocks per frame - went with buckets, which are dozens of
+files per frame; the default stays on disk anyway.)
 
 The pre-rebuild search's 16-thread / 8,000-lane chunked parallel path and its
 `./parcheck.sh` byte-identity gate went with `run.rs` / `sweep*.rs`. The rebuilt
@@ -287,30 +289,38 @@ extract are DELETED; what is left in `celeste-rust` is laid out as:
 
 ```
 src/frame.rs   the search: `Block` (an `Rt2` with its key column), the
-               `FrameStep` trait, forward_run / forward_resume / backward_run /
-               ladder_at_horizon / find_optimum, the precision ladder, the
-               per-(shape, pm1, cell) regroup, sharded checkpoints, MarkFilter
+               `FrameStep` trait + `ForwardSink`, forward_run / forward_resume /
+               backward_run / ladder_at_horizon / find_optimum, the precision
+               ladder, bucket routing, per-bucket checkpoints, MarkFilter
 src/search/    checkpoint (block serialization), pos_graph (the position
                graph + the block's position column)
 src/trace/     the AST tracer (Lua -> transpile::graph::Graph) and the reference
                engine (trace::refengine, the RefEngine oracle)
 src/transpile/ the graph IR, the lowering, and the ASM assembler
                (transpile::asm)
-src/compiled/  FrameEngine (`run_frame_block`), the ASM kernel registry
-               (compiled::asm_kernel), dispatch counters, and the
-               State <-> block bridge
+src/compiled/  FrameEngine (`run_bucket`), the ASM kernel registry
+               (compiled::asm_kernel, whose append step is where rows are
+               keyed, deduped at the door and given their pos-graph edge),
+               dispatch counters, and the State <-> block bridge
 ```
 
 One frame of the abstract search is `celeste_rust::compiled::FrameEngine`
-`::run_frame_block` - `(shape, rows) -> [(shape, rows)]` over `Rt2` blocks:
-pre-partition (freeze, moving key), the runtime-assembled ASM kernels,
-boundary, cross-chunk dedup, merge per (shape, pm1 class). It is one impl of
-the `FrameStep` trait (`src/frame.rs`); the reference `RefEngine` is the
-other, and crosses `compiled::bridge` (the only module that names both
-`State` and `Rt2`) at its edge. The loop itself never touches a `State`:
-keys, positions, wins, keep, regroup and checkpoints are all column reads
-on the block (2026-09-07, `31002e3`: -43% wall, -56% peak RSS on the f44
-forward, identical (key, cell) sets).
+`::run_bucket` - one BUCKET in (a class-uniform `Rt2`: one shape, one
+freeze value, one moving key, one pm1 class), rows out through a
+`ForwardSink`. The frontier IS a set of buckets, one kernel call each
+(2,000+ rows per call, <1% lane padding), and the kernel's append step
+emits each surviving row already at the boundary - canonical structure,
+exact row key, `visited` consulted at the door, its `(input cell, output
+cell)` pos-graph edge recorded from the slice lane it came from - so the
+loop only routes rows into next frame's buckets (`Rt2::append_rows`).
+There is no regroup, no merge, no per-block `boundary`, and no
+provenance stored anywhere: it is consumed at emission (plans/buckets.md).
+`FrameEngine` is one impl of the `FrameStep` trait (`src/frame.rs`); the
+reference `RefEngine` is the other, and crosses `compiled::bridge` (the
+only module that names both `State` and `Rt2`) at its edge. The loop
+itself never touches a `State`. Measured 2026-09-12, room (1,0) f0-f44:
+53 s -> 26 s, f44 9.4 s -> 4.8 s, 115k kernel calls -> 879, identical
+frontier sets and pos-graph.
 
 The kernel backend is `compiled::asm_kernel`: one binary, no cargo
 features, no checked-in kernel artifact - it retraces the start room's
@@ -356,16 +366,17 @@ if the Lua changes) may be APPENDED by hand, never inserted.
 
 ```bash
 # THE SEARCH: find the minimal winning frame via the full precision ladder
-# (Bits 0..=15 then Exact), driven by find_optimum over sharded checkpoints.
-# --checkpoint-dir defaults to /var/tmp/celeste-checkpoints - ON DISK, never /tmp: the
-# sharded frontier is one file per block and /tmp (tmpfs) caps out at 1,048,576
-# inodes, which a full room forward exceeds. --win-at x,y forces a cheap synthetic win.
+# (Bits 0..=15 then Exact), driven by find_optimum over per-bucket checkpoints.
+# --checkpoint-dir defaults to /var/tmp/celeste-checkpoints (on disk, not the
+# tmpfs). --win-at x,y forces a cheap synthetic win.
 ./safe-run.sh -- ./target/release/rewrite search \
     --room 1,0 --from 94 [--to H] [--maxk 15] [--checkpoint-dir DIR]
 
 # One forward pass at one precision with the per-frame timing line
-# (engine / keys / dedup / regroup / checkpoint ms, lanes in/raw/kept, RSS),
-# and the checkpoint-tree fingerprint to compare two runs.
+# (engine / filter / visited / route / checkpoint ms, lanes in/raw/kept, RSS)
+# and the pos-graph fingerprint; then the checkpoint-tree fingerprint.
+# The three pinned oracles are under gates/ (frontier sets, pos-graph edges,
+# backward marks); every change to the loop or the kernels must reproduce them.
 ./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0
 ./target/release/rewrite ckhash --to 44 --room 1,0
 

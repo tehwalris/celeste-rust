@@ -5,10 +5,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// On DISK, not `/tmp`: `/tmp` is a tmpfs capped at 1,048,576 inodes, and
-/// the sharded frontier is one file per block - a full room (1,0) forward is
-/// ~2-3M files, so it dies of ENOSPC there with the bytes barely used
-/// (2026-09-07).
+/// On DISK, not the tmpfs at `/tmp` (a full-room tree is gigabytes, and the
+/// per-block version of it once exhausted /tmp's inodes, 2026-09-07).
 const DEFAULT_CHECKPOINT_DIR: &str = "/var/tmp/celeste-checkpoints";
 
 #[derive(Parser)]

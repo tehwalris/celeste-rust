@@ -57,6 +57,19 @@ struct AsmBody {
     fields: Vec<AsmField>,
     ok_root: usize,
     live_root: usize,
+    /// Where an emitted row's player x, player y, room x, room y come from
+    /// (`search::pos_graph::block_cells`' inputs), so the append step can
+    /// compute the row's position cell straight off the output buffer.
+    /// `None`: this outcome has no player object (every row is `NO_CELL`).
+    pos: Option<[FieldSrc; 4]>,
+}
+
+/// One value of an emitted row: an output field of the body, or a
+/// constant the outcome's template holds for every row.
+#[derive(Clone, Copy)]
+enum FieldSrc {
+    Field(usize),
+    Konst(AV),
 }
 
 /// How to initialize one output column of an accumulator: a uniform
@@ -129,9 +142,12 @@ impl AsmKernel {
         &self,
         chunk: &Rt2,
         ids: &runtime2::BoundaryIds,
-        done: &mut Vec<Rt2>,
+        cell_in: &[u32],
+        sink: &mut crate::frame::ForwardSink,
         exact: bool,
     ) -> bool {
+        debug_assert_eq!(cell_in.len(), chunk.width, "one input cell per input row");
+        let start = crate::game_runner::start_room();
         let mut accs: Vec<Rt2> = self.acc_templates.iter().map(|t| t.build()).collect();
         // Per-acc row keys, pushed alongside the rows: the exact boundary
         // key, `mix64(part + h)`.
@@ -249,17 +265,42 @@ impl AsmKernel {
                         h1 = h1.wrapping_add(runtime2::cell_mix(f.cell as u64, av, KEY_SEED1));
                         h2 = h2.wrapping_add(runtime2::cell_mix(f.cell as u64, av, KEY_SEED2));
                     }
-                    if !seen.insert((h1, h2)) && !no_seen {
-                        continue;
+                    let part = self.acc_templates[body.outcome].part;
+                    let key = (
+                        runtime2::mix64(part.0.wrapping_add(h1)),
+                        runtime2::mix64(part.1.wrapping_add(h2)),
+                    );
+                    let cin = cell_in[lo + i];
+                    // EMISSION-TIME PROVENANCE (plans/buckets.md). The
+                    // source of this row is lane `i` of this slice, and
+                    // everything that needs to know is told right here:
+                    // the pos-graph edge, and the door dedup.
+                    if !no_seen {
+                        if let Some(first_cin) = seen.insert_tagged(key, cin) {
+                            // A re-emission of a row this call already
+                            // produced. Nothing to materialize - but if it
+                            // came from a DIFFERENT input cell, that is a
+                            // pos-graph edge the first emission did not record.
+                            if sink.edges_on && first_cin != cin {
+                                sink.edges.push((cin, cell_out(body, &outbuf, i, start)));
+                            }
+                            continue;
+                        }
+                    }
+                    let cout = cell_out(body, &outbuf, i, start);
+                    if sink.edges_on {
+                        sink.edges.push((cin, cout));
+                    }
+                    sink.emitted += 1;
+                    if let Some(v) = sink.visited.as_deref_mut() {
+                        if !v.insert(key, cout) {
+                            continue;
+                        }
                     }
                     for f in &body.fields {
                         push_field(acc, f, &outbuf, i);
                     }
-                    let part = self.acc_templates[body.outcome].part;
-                    keys[body.outcome].push((
-                        runtime2::mix64(part.0.wrapping_add(h1)),
-                        runtime2::mix64(part.1.wrapping_add(h2)),
-                    ));
+                    keys[body.outcome].push(key);
                     acc.width += 1;
                 }
             }
@@ -281,7 +322,7 @@ impl AsmKernel {
             if key_check_on() {
                 self.check_against_boundary(&acc, ids, exact, oi);
             }
-            done.push(acc);
+            sink.out.push(acc);
         }
         true
     }
@@ -541,10 +582,11 @@ impl Registry {
         &self,
         chunk: &Rt2,
         ids: &runtime2::BoundaryIds,
-        done: &mut Vec<Rt2>,
+        cell_in: &[u32],
+        sink: &mut crate::frame::ForwardSink,
     ) -> bool {
         match self.by_shape.get(&chunk.shape_hash) {
-            Some(k) => k.run(chunk, ids, done, self.exact_boundary),
+            Some(k) => k.run(chunk, ids, cell_in, sink, self.exact_boundary),
             None => {
                 // Diagnose a coverage gap: which shape has no assembled
                 // kernel. Printed once per distinct missing shape.
@@ -686,6 +728,7 @@ fn build_one_shape(
             fields,
             ok_root: off + nfields,
             live_root: off + nfields + 1,
+            pos: None,
         });
         off += b.roots.len();
     }
@@ -693,6 +736,9 @@ fn build_one_shape(
     let acc_templates = (0..r.bound.outcomes.len())
         .map(|oi| acc_template(r, oi))
         .collect::<Result<Vec<_>>>()?;
+    for b in asm_bodies.iter_mut() {
+        b.pos = pos_sources(&acc_templates[b.outcome].build(), &b.fields)?;
+    }
 
     Ok((
         shape,
@@ -706,6 +752,72 @@ fn build_one_shape(
             room,
         },
     ))
+}
+
+/// Where a body's emitted rows carry their position: the player object's
+/// `x`/`y` and the room's `x`/`y`, each either an output field of the body
+/// or a constant of the outcome's template. `None` when the outcome has no
+/// player object (the death countdown), so every row is at `NO_CELL`.
+fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[FieldSrc; 4]>> {
+    let ids = crate::compiled::ids();
+    let Some(obj) = crate::search::pos_graph::player_object(template) else {
+        return Ok(None);
+    };
+    let room = template
+        .global_target(ids.g_room)
+        .ok_or_else(|| anyhow::anyhow!("outcome template has no `room` global"))?;
+    let src_of = |cell: u32| -> Result<FieldSrc> {
+        if let Some(j) = fields.iter().position(|f| f.cell == cell as usize) {
+            return Ok(FieldSrc::Field(j));
+        }
+        match template.cols[cell as usize] {
+            Col::U(av) => Ok(FieldSrc::Konst(av)),
+            _ => anyhow::bail!("position cell {cell} is neither an output field nor a constant"),
+        }
+    };
+    let cell = |o: u32, f: u32, what: &str| -> Result<u32> {
+        template
+            .obj_field_cell(o, f)
+            .ok_or_else(|| anyhow::anyhow!("outcome template: no `{what}` field"))
+    };
+    Ok(Some([
+        src_of(cell(obj, ids.f_x, "player.x")?)?,
+        src_of(cell(obj, ids.f_y, "player.y")?)?,
+        src_of(cell(room, ids.f_x, "room.x")?)?,
+        src_of(cell(room, ids.f_y, "room.y")?)?,
+    ]))
+}
+
+/// The position cell of lane `i` of a body's output, read straight off the
+/// output buffer - the same rule as `pos_graph::block_cells`: a player
+/// whose `x`/`y` is not a plain number is at `NO_CELL`.
+#[inline]
+fn cell_out(body: &AsmBody, buf: &[u8], i: usize, start: (i16, i16)) -> u32 {
+    use crate::search::pos_graph::{cell_of, NO_CELL};
+    let Some(srcs) = &body.pos else {
+        return NO_CELL;
+    };
+    let read = |s: FieldSrc| -> Option<i16> {
+        let av = match s {
+            FieldSrc::Field(j) => read_field_av(&body.fields[j], buf, i),
+            FieldSrc::Konst(av) => av,
+        };
+        match av {
+            AV::Num(n) => Some(n.whole_part_as_i16()),
+            _ => None,
+        }
+    };
+    let (Some(rx), Some(ry)) = (read(srcs[2]), read(srcs[3])) else {
+        panic!("emitted row: room.x/room.y are not numbers");
+    };
+    let (Some(px), Some(py)) = (read(srcs[0]), read(srcs[1])) else {
+        return NO_CELL;
+    };
+    cell_of(
+        px as i32 + (rx - start.0) as i32 * 128,
+        py as i32 + (ry - start.1) as i32 * 128,
+    )
+    .unwrap_or_else(|e| panic!("emitted row: {e}"))
 }
 
 /// The accumulator recipe for one outcome: the outcome's structural
@@ -864,10 +976,11 @@ fn build_registry_for_current_rung() -> Option<Registry> {
 pub(crate) fn run_chunk(
     chunk: &Rt2,
     ids: &runtime2::BoundaryIds,
-    done: &mut Vec<Rt2>,
+    cell_in: &[u32],
+    sink: &mut crate::frame::ForwardSink,
 ) -> bool {
     match registry() {
-        Some(reg) => reg.run_chunk(chunk, ids, done),
+        Some(reg) => reg.run_chunk(chunk, ids, cell_in, sink),
         None => false,
     }
 }

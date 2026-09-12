@@ -260,13 +260,11 @@ impl PosGraphBuilder {
 
 /// Collects the table while a run steps frames.
 ///
-/// Attribution is by PARTITION, not by a per-lane tag: while recording, the
-/// forward pass regroups its frontier by player-position cell
-/// (`frame::forward_frame`'s `by_cell`), so every frame-input block is
-/// uniform in position. The recorder reads that ONE input cell off the
-/// block's position column (`input_cell`) and pairs it with every output
-/// cell, which is exact rather than a cross product: all the block's lanes
-/// really did start at that cell.
+/// Attribution is AT EMISSION: the frame step knows, for every output row it
+/// produces, the input row it came from (the kernel's slice bit; the
+/// reference engine's lane), and records `(cell of that input row, cell of
+/// the output row)` right there, before any dedup. Nothing is stored on a
+/// row and nothing is inferred from a partition.
 ///
 /// The first version of this was read-only and recorded every source cell of
 /// a chunk against every destination cell of it - conservative and useless
@@ -292,38 +290,13 @@ impl Default for PosObserver {
 }
 
 impl PosObserver {
-    /// The single input cell of a frame-input block, given its position
-    /// column. Every lane must be at the same cell - which the by-cell
-    /// regrouping guarantees while recording (see the struct doc). A
-    /// non-uniform block is a loud error, not a silent cross product: it
-    /// means the regrouping was not by cell, and recording without it would
-    /// attribute every source cell to every destination cell (the useless
-    /// first version).
-    pub fn input_cell(&self, cells: &[u32]) -> Result<u32> {
-        let Some((&first, rest)) = cells.split_first() else {
-            return Err(anyhow!("pos observer: empty input block"));
-        };
-        if let Some(&other) = rest.iter().find(|&&c| c != first) {
-            return Err(anyhow!(
-                "pos observer: input block spans cells {} and {} - the frontier \
-                 must be regrouped by cell while recording (`forward_frame`'s \
-                 `by_cell`)",
-                first,
-                other
-            ));
-        }
-        Ok(first)
-    }
-
-    /// Record edges from one input cell to a set of output cells (the output
-    /// block's position column). Sound because the input block is uniform in
-    /// position (`input_cell`): all its lanes started at `c_in`, so every
-    /// `dst` really is a successor of it.
-    pub fn record_dsts(&self, c_in: u32, dsts: &[u32]) {
-        let mut pairs: Vec<(u32, u32)> = dsts.iter().map(|&d| (c_in, d)).collect();
+    /// Record `(src cell, dst cell)` edges, as the frame step observed them
+    /// AT EMISSION: every raw output row, before any dedup, paired with the
+    /// cell of the input row that produced it.
+    pub fn record_pairs(&self, pairs: &mut Vec<(u32, u32)>) {
         pairs.sort_unstable();
         pairs.dedup();
-        self.pending.lock().expect("pos observer").extend(pairs);
+        self.pending.lock().expect("pos observer").extend(pairs.drain(..));
     }
 
     /// Fold the frame's observations into the table. Called once per frame

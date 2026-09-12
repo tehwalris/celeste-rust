@@ -628,20 +628,13 @@ pub fn zn_tile_flag_at_lanes(
 /// to 279 ms - the dedup paid for itself downstream (boundary 138 -> 24
 /// ms) and lost it all again at the door.
 ///
-/// GENERATION-STAMPED rather than cleared. The set is per 16-lane slice,
-/// and a room frame has hundreds of slices; allocating or zeroing a
-/// table each time cost more than everything else put together
-/// (`RowSet::new()` per slice was ~244 MB of allocation per frame, and
-/// the append phase sat at 212 ms because of it). `next_slice` bumps a
-/// counter instead, so a stale slot is simply one whose stamp is old.
-///
-/// Sized for one slice: at most 16 lanes x 64 assignments x 2^f fork
-/// configurations, and in practice far fewer, so linear probing
-/// terminates quickly. A full table degrades to "no dedup" rather than
-/// to wrongness - `insert` reports NEW, which appends a row that would
-/// have been a duplicate, and the boundary still removes it.
+/// The within-call dedup set: one per outcome per kernel call, keyed by
+/// the row key, carrying one `u32` TAG per key - the source cell of the
+/// row's first emitter, so a re-emission of the same row from a different
+/// cell can record its pos-graph edge without materializing anything
+/// (`compiled::asm_kernel`). Open addressing, grown at 0.75 load.
 pub struct RowSet {
-    slots: Vec<(u64, u64, u32)>,
+    slots: Vec<(u64, u64, u32, u32)>,
     mask: usize,
     gen: u32,
     len: usize,
@@ -655,12 +648,12 @@ impl Default for RowSet {
 
 impl RowSet {
     pub fn new() -> Self {
-        RowSet { slots: vec![(0, 0, 0); 4096], mask: 4095, gen: 1, len: 0 }
+        RowSet { slots: vec![(0, 0, 0, 0); 4096], mask: 4095, gen: 1, len: 0 }
     }
 
     fn grow(&mut self) {
         let cap = self.slots.len() * 2;
-        let old = std::mem::replace(&mut self.slots, vec![(0, 0, 0); cap]);
+        let old = std::mem::replace(&mut self.slots, vec![(0, 0, 0, 0); cap]);
         self.mask = cap - 1;
         let gen = self.gen;
         for s in old {
@@ -674,12 +667,11 @@ impl RowSet {
         }
     }
 
-    /// True if `k` was not already present in this chunk.
+    /// Insert `k` with `tag`: `None` if it was new, `Some(tag of the first
+    /// insert)` if it was already present.
     #[inline(always)]
-    pub fn insert(&mut self, k: (u64, u64)) -> bool {
-        // Grow at 0.75 load so linear probing stays short; a full table
-        // used to "degrade to no dedup", which at chunk scale would be no
-        // dedup at all.
+    pub fn insert_tagged(&mut self, k: (u64, u64), tag: u32) -> Option<u32> {
+        // Grow at 0.75 load so linear probing stays short.
         if (self.len + 1) * 4 >= self.slots.len() * 3 {
             self.grow();
         }
@@ -687,12 +679,12 @@ impl RowSet {
         loop {
             let s = self.slots[i];
             if s.2 != self.gen {
-                self.slots[i] = (k.0, k.1, self.gen);
+                self.slots[i] = (k.0, k.1, self.gen, tag);
                 self.len += 1;
-                return true;
+                return None;
             }
             if s.0 == k.0 && s.1 == k.1 {
-                return false;
+                return Some(s.3);
             }
             i = (i + 1) & self.mask;
         }

@@ -97,21 +97,16 @@ impl RefEngine {
         to_interp_state(&leaves[0])
     }
 
-    /// Run one frame of every lane of `input`, returning all successor states
-    /// (across every lane and every fork path). The successors carry the same
-    /// canonical row key `engine_row_keys` would compute.
-    pub fn run_frame(&mut self, input: &OState) -> Result<Vec<OState>> {
-        let mut out = Vec::new();
-        for lane in 0..input.vector_size.max(1) {
-            let mut d = RefDomain::new();
-            let mut bridged = to_trace_state(input, lane, &mut d)?;
-            patch_closures_for(&mut bridged, &self.fn_info)?;
-            add_missing_builtins(&mut bridged, &self.base);
-            for leaf in run_frame_all(&mut self.it, self.body, &bridged)? {
-                out.push(to_interp_state(&leaf)?);
-            }
-        }
-        Ok(out)
+    /// One frame of ONE lane of `input`: every fork leaf as a state.
+    pub fn run_lane(&mut self, input: &OState, lane: usize) -> Result<Vec<OState>> {
+        let mut d = RefDomain::new();
+        let mut bridged = to_trace_state(input, lane, &mut d)?;
+        patch_closures_for(&mut bridged, &self.fn_info)?;
+        add_missing_builtins(&mut bridged, &self.base);
+        run_frame_all(&mut self.it, self.body, &bridged)?
+            .iter()
+            .map(to_interp_state)
+            .collect()
     }
 }
 
@@ -121,14 +116,39 @@ impl RefEngine {
 /// output block - correct but unvectorized, which is exactly the reference's
 /// contract (callers that run it wide sample).
 impl crate::frame::FrameStep for RefEngine {
-    fn run(&mut self, block: crate::frame::Block) -> Result<Vec<crate::frame::Block>> {
+    fn run(
+        &mut self,
+        block: crate::frame::Block,
+        sink: &mut crate::frame::ForwardSink,
+    ) -> Result<()> {
         // The reference runs on interpreter `State`s: cross the bridge both
         // ways. `Block::from_state` keys each leaf by the one canonical rule,
         // so the loop sees the same key column the kernels would attach.
+        // Provenance is per lane here: every leaf of lane `l` came from row
+        // `l`, and the sink is told at emission exactly as the kernel does.
+        let cells_in = block.positions()?;
         let input = block.to_state();
-        self.run_frame(&input)?
-            .iter()
-            .map(crate::frame::Block::from_state)
-            .collect()
+        for lane in 0..input.vector_size.max(1) {
+            for leaf in self.run_lane(&input, lane)? {
+                let b = crate::frame::Block::from_state(&leaf)?;
+                let cell_out = b.positions()?[0];
+                let key = b.keys()[0];
+                if sink.edges_on {
+                    sink.edges.push((cells_in[lane], cell_out));
+                }
+                sink.emitted += 1;
+                if let Some(v) = sink.visited.as_deref_mut() {
+                    if !v.insert(key, cell_out) {
+                        continue;
+                    }
+                }
+                sink.out.push(b.into_rt2());
+            }
+        }
+        Ok(())
+    }
+
+    fn freeze_global(&self) -> u32 {
+        celeste_names::global_id("freeze").expect("no freeze global")
     }
 }

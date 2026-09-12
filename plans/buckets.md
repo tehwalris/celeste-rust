@@ -53,13 +53,16 @@ regrouping, and 17k checkpoint files per frame.
 
 ## Stages
 
-1. Exact key in the append step (`part` per outcome), canonical template
-   asserted, `boundary()` per acc removed. Gate: ckhash.
-2. Buckets: frontier = map (shape, class) -> Rt2; one call per bucket; rows
-   routed into next-frame buckets at emission; the regroup/merge/partition
-   machinery deleted. Gate: ckhash (the by-cell regroup is dropped at this
-   point, so the pos-graph is recorded by stage 3's mechanism from here).
-3. Emission-time pos-graph edges. Gate: posgraph fingerprint.
+1. DONE `a2cb8fd`. Exact key in the append step (`part` per outcome),
+   canonical template asserted, `boundary()` per acc removed.
+2. DONE (with 3). Buckets: frontier = map (shape, class) -> Rt2; one call
+   per bucket; rows routed into next-frame buckets after emission
+   (`frame::route` / `Rt2::append_rows`); the regroup/merge/partition
+   machinery deleted. Room (1,0) f0-f44: 53 s -> 26 s, 115k calls -> 879,
+   0.4% padding.
+3. DONE. Emission-time pos-graph edges (`ForwardSink::edges`, the tagged
+   `RowSet` for re-emissions from another cell) and the door dedup inside
+   the append step (`ForwardSink::visited`).
 4. Wide backward with the target-set consumer and input bitset; the per-lane
    draft stays until the marks fingerprint matches, then goes. Gate: marks.
 5. Checkpoint per bucket + cell index; backward loads by cell range. Gate:

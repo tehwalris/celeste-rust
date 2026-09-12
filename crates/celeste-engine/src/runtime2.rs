@@ -154,6 +154,52 @@ pub struct Rt2 {
 
 pub const NONE: u32 = u32::MAX;
 
+/// Push one value onto a column of `width` lanes, materializing a uniform
+/// column only when the value differs from it, and keeping the raw
+/// `N`/`I` forms while the kinds allow.
+fn col_push(col: &mut Col, width: usize, v: AV) {
+    match col {
+        Col::U(a) if *a == v => {} // still uniform
+        Col::U(a) => {
+            let a = *a;
+            *col = match (a, v) {
+                (AV::Num(x), AV::Num(y)) => {
+                    let mut vs = vec![x; width];
+                    vs.push(y);
+                    Col::N(vs)
+                }
+                (AV::Ival(x0, x1), AV::Ival(y0, y1)) => {
+                    let mut vs = vec![(x0, x1); width];
+                    vs.push((y0, y1));
+                    Col::I(vs)
+                }
+                _ => {
+                    let mut vs = vec![a; width];
+                    vs.push(v);
+                    Col::V(vs)
+                }
+            };
+        }
+        Col::N(vs) => match v {
+            AV::Num(n) => vs.push(n),
+            other => {
+                let mut nv: Vec<AV> = vs.iter().map(|n| AV::Num(*n)).collect();
+                nv.push(other);
+                *col = Col::V(nv);
+            }
+        },
+        Col::I(vs) => match v {
+            AV::Ival(a, b) => vs.push((a, b)),
+            other => {
+                let mut nv: Vec<AV> = vs.iter().map(|(a, b)| AV::Ival(*a, *b)).collect();
+                nv.push(other);
+                *col = Col::V(nv);
+            }
+        },
+        Col::V(vs) => vs.push(v),
+    }
+}
+
 /// V -> N / I when every lane is a plain number / interval.
 pub(crate) fn compress_num_v(vs: Vec<AV>) -> Col {
     if vs.iter().all(|v| matches!(v, AV::Num(_))) {
@@ -900,35 +946,6 @@ impl Rt2 {
         Some(key)
     }
 
-    /// Split into sub-blocks of lanes sharing a key value, in
-    /// first-occurrence order. Representation is untouched: a column that
-    /// became uniform in a part stays a vector (see `partition_by_cell` for
-    /// the collapsing variant).
-    pub fn partition_by_key<K: PartialEq + Copy>(self, key: &[K]) -> Vec<Rt2> {
-        let mut order: Vec<K> = Vec::new();
-        let mut groups: Vec<Vec<u32>> = Vec::new();
-        for (i, k) in key.iter().enumerate() {
-            match order.iter().position(|o| o == k) {
-                Some(g) => groups[g].push(i as u32),
-                None => {
-                    order.push(*k);
-                    groups.push(vec![i as u32]);
-                }
-            }
-        }
-        if groups.len() == 1 {
-            return vec![self];
-        }
-        groups
-            .into_iter()
-            .map(|keep| {
-                let mut b = self.clone_block();
-                b.retain_lanes(&keep);
-                b
-            })
-            .collect()
-    }
-
     /// Keep only the given lanes (ascending indices), in every value
     /// column, closure capture and row key.
     pub fn retain_lanes(&mut self, keep: &[u32]) {
@@ -995,125 +1012,75 @@ impl Rt2 {
         cells
     }
 
-    /// The pm1 partition (the recipe's partition_merge entry, ported to
-    /// the engine's frame boundary): split a post-boundary block so the
-    /// fork-condition cells are per-block UNIFORM. This is the
-    /// interpreter's fragment representation - the measured reason it
-    /// beats one-wide-block-per-shape: key-correlated columns stay
-    /// Col::U through storage, merge and row hashing.
-    pub fn partition_pm1(self, ids: &BoundaryIds) -> Vec<Rt2> {
-        let cells = self.pm1_cells(ids);
-        let mut parts = vec![self];
-        for c in cells {
-            parts = parts.into_iter().flat_map(|b| b.partition_by_cell(c)).collect();
+    /// Per-row CLASS key: a hash of the values the search buckets a row
+    /// by - the freeze global, the moving key (which objects have a
+    /// nonzero spd) and the pm1 cells. Two rows with equal class keys can
+    /// share a bucket and a kernel call; the kernel's pre-partition
+    /// premises (freeze, moving key) and the pm1 grouping are exactly
+    /// this, so a bucket is class-uniform by construction.
+    pub fn class_keys(&self, ids: &BoundaryIds, g_freeze: u32) -> Vec<u64> {
+        let mut cells: Vec<u32> = self.pm1_cells(ids);
+        let freeze = self.globals[g_freeze as usize];
+        if freeze != NONE && !cells.contains(&freeze) {
+            cells.push(freeze);
         }
-        parts
-    }
-
-    /// Group key for same-shape merging under pm1: a hash of the key
-    /// cells' (uniform) values. Call on pm1-partitioned blocks.
-    pub fn pm1_key_hash(&self, ids: &BoundaryIds) -> u64 {
-        use std::hash::Hasher;
-        let mut h = rustc_hash::FxHasher::default();
-        for c in self.pm1_cells(ids) {
-            let v = match &self.cols[c as usize] {
-                Col::U(v) => *v,
-                // Non-uniform key cell: only possible when a caller skips
-                // partition_pm1; fold lane 0 so grouping stays legal
-                // (concat requires identical shapes, not key uniformity).
-                Col::V(vs) => vs[0],
-                Col::N(vs) => AV::Num(vs[0]),
-                Col::I(vs) => AV::Ival(vs[0].0, vs[0].1),
-            };
-            h.write_u32(c);
-            h.write_u64(match v {
-                AV::Num(n) => 1u64 << 56 | n.to_bits() as u64,
-                AV::Ival(a, b) => {
-                    2u64 << 56 | (a.to_bits() as u64) << 24 ^ (b.to_bits() as u64)
+        let moving = self.moving_key(ids).unwrap_or_else(|| vec![0; self.width]);
+        (0..self.width)
+            .map(|i| {
+                let mut h: u64 = 0x9e37_79b9_7f4a_7c15 ^ moving[i] as u64;
+                for &c in &cells {
+                    h = mix64(h ^ av_code(self.cols[c as usize].at(i)) ^ (c as u64) << 48);
                 }
-                AV::Bool(b) => 3u64 << 56 | b as u64,
-                AV::UBool => 4u64 << 56,
-                AV::Str(x) => 5u64 << 56 | x as u64,
-                AV::Nil => 6u64 << 56,
-                AV::Ptr(p) => 7u64 << 56 | p as u64,
-                AV::NilPtr => 8u64 << 56,
-            });
-        }
-        h.finish()
-    }
-
-    /// Split the block into sub-blocks whose lanes agree on the value in
-    /// `cell` (the frame-start uniform-branch pre-partition; the freeze
-    /// gate is the pm1 precedent). Groups in first-occurrence order.
-    /// Store every all-equal column as uniform. Representation-only (see
-    /// `collapse_uniform`) and idempotent.
-    pub fn collapse_uniform_cols(&mut self) {
-        for p in 0..self.cols.len() {
-            let col = std::mem::replace(&mut self.cols[p], Col::U(AV::Nil));
-            self.cols[p] = collapse_uniform(col);
-        }
-    }
-
-    pub fn partition_by_cell(self, cell: u32) -> Vec<Rt2> {
-        let by_vals = |vals: Vec<AV>| -> Vec<Vec<u32>> {
-            let mut order: Vec<AV> = Vec::new();
-            let mut groups: Vec<Vec<u32>> = Vec::new();
-            for (i, v) in vals.iter().enumerate() {
-                match order.iter().position(|o| o == v) {
-                    Some(g) => groups[g].push(i as u32),
-                    None => {
-                        order.push(*v);
-                        groups.push(vec![i as u32]);
-                    }
-                }
-            }
-            groups
-        };
-        let groups: Vec<Vec<u32>> = match &self.cols[cell as usize] {
-            Col::U(_) => return vec![self],
-            Col::N(vs) => by_vals(vs.iter().map(|n| AV::Num(*n)).collect()),
-            Col::I(vs) => by_vals(vs.iter().map(|(a, b)| AV::Ival(*a, *b)).collect()),
-            Col::V(vs) => {
-                let mut order: Vec<AV> = Vec::new();
-                let mut groups: Vec<Vec<u32>> = Vec::new();
-                for (i, v) in vs.iter().enumerate() {
-                    match order.iter().position(|o| o == v) {
-                        Some(g) => groups[g].push(i as u32),
-                        None => {
-                            order.push(*v);
-                            groups.push(vec![i as u32]);
-                        }
-                    }
-                }
-                groups
-            }
-        };
-        if groups.len() == 1 {
-            // Already pure for this cell - but "pure" means UNIFORM, and
-            // saying so in the representation is the whole point (a
-            // constant Col::N does not bind). This early path is the
-            // COMMON one, so skipping the collapse here left nearly every
-            // block unbindable even after it had been partitioned.
-            let mut b = self;
-            let col = std::mem::replace(&mut b.cols[cell as usize], Col::U(AV::Nil));
-            b.cols[cell as usize] = collapse_uniform(col);
-            return vec![b];
-        }
-        groups
-            .into_iter()
-            .map(|keep| {
-                let mut b = self.clone_block();
-                b.retain_lanes(&keep);
-                // A partition exists to make some cell single-valued;
-                // say so in the representation. Without this the split
-                // column stays a constant Col::N, and every kernel bind
-                // (which wants Col::U for its block-uniform inputs)
-                // refuses the very blocks partitioning just made
-                // bindable.
-                b.collapse_uniform_cols();
-                b
+                h
             })
             .collect()
+    }
+
+    /// Append `rows` of `src` (a same-shape block) to this block, column
+    /// by column, keeping a column uniform for as long as every appended
+    /// value equals it. This is the bucket write: no clone, no merge, no
+    /// re-partition - rows land in the block they belong to.
+    pub fn append_rows(&mut self, src: &Rt2, rows: &[u32]) {
+        assert_eq!(self.shape_hash, src.shape_hash, "append_rows: different shapes");
+        assert_eq!(self.structure.len(), src.structure.len());
+        let w = self.width;
+        for c in 0..self.cols.len() {
+            if !matches!(self.structure[c], Cell2::Val) {
+                continue;
+            }
+            let dst = &mut self.cols[c];
+            let sc = &src.cols[c];
+            // Fast path: both uniform and equal.
+            if let (Col::U(a), Col::U(b)) = (&*dst, sc) {
+                if a == b {
+                    continue;
+                }
+            }
+            if w == 0 {
+                // An empty block takes the first append's column as-is:
+                // uniform if the rows agree, else the raw typed form.
+                let vs: Vec<AV> = rows.iter().map(|&r| sc.at(r as usize)).collect();
+                *dst = collapse_uniform(compress_num_v(vs));
+            } else {
+                // The running width: a uniform column that first diverges
+                // at the n-th appended row materializes `w + n` copies.
+                for (n, &r) in rows.iter().enumerate() {
+                    col_push(dst, w + n, sc.at(r as usize));
+                }
+            }
+        }
+        for cell in self.structure.iter_mut() {
+            if let Cell2::Clo(_, caps) = cell {
+                for cap in caps.iter_mut() {
+                    if let Col::U(_) = cap {
+                        continue;
+                    }
+                    panic!("append_rows: a closure capture is not uniform");
+                }
+            }
+        }
+        self.row_keys.extend(rows.iter().map(|&r| src.row_keys[r as usize]));
+        self.width = w + rows.len();
     }
 
     /// A copy of just the lanes in `[lo, hi)` - the chunking fast path
@@ -1164,49 +1131,6 @@ impl Rt2 {
             shape_hash: self.shape_hash,
             row_keys: self.row_keys.clone(),
         }
-    }
-
-    /// K-way merge of same-shape blocks (all after `boundary`): one pass
-    /// per column, no repeated re-materialization of uniform columns.
-    pub fn merge_many(mut blocks: Vec<Rt2>) -> Rt2 {
-        if blocks.len() == 1 {
-            return blocks.pop().unwrap();
-        }
-        let total: usize = blocks.iter().map(|b| b.width).sum();
-        let mut host = blocks.swap_remove(0);
-        for b in &blocks {
-            assert_eq!(host.shape_hash, b.shape_hash, "merge of different shapes");
-            assert_eq!(host.structure.len(), b.structure.len());
-        }
-        for (c, col) in host.cols.iter_mut().enumerate() {
-            let all_same_uniform = match col {
-                Col::U(a) => blocks
-                    .iter()
-                    .all(|b| matches!(&b.cols[c], Col::U(x) if x == a)),
-                Col::V(_) | Col::N(_) | Col::I(_) => false,
-            };
-            if all_same_uniform {
-                continue;
-            }
-            let mut vs: Vec<AV> = Vec::with_capacity(total);
-            let push_col = |vs: &mut Vec<AV>, c: &Col, w: usize| match c {
-                Col::U(a) => vs.extend(std::iter::repeat(*a).take(w)),
-                Col::V(v) => vs.extend_from_slice(v),
-                Col::N(v) => vs.extend(v.iter().map(|n| AV::Num(*n))),
-                Col::I(v) => vs.extend(v.iter().map(|(a, b)| AV::Ival(*a, *b))),
-            };
-            let hw = host.width;
-            push_col(&mut vs, col, hw);
-            for b in &blocks {
-                push_col(&mut vs, &b.cols[c], b.width);
-            }
-            *col = compress_num_v(vs);
-        }
-        for b in &blocks {
-            host.row_keys.extend_from_slice(&b.row_keys);
-        }
-        host.width = total;
-        host
     }
 
 }
