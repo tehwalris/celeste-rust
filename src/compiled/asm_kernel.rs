@@ -306,14 +306,14 @@ impl AsmKernel {
                             // came from a DIFFERENT input cell, that is a
                             // pos-graph edge the first emission did not record.
                             if sink.edges_on && first_cin != cin {
-                                sink.edges.push((cin, cell_out(body, &outbuf, i, start)));
+                                sink.edges.insert((cin, cell_out(body, &outbuf, i, start)));
                             }
                             continue;
                         }
                     }
                     let cout = cell_out(body, &outbuf, i, start);
                     if sink.edges_on {
-                        sink.edges.push((cin, cout));
+                        sink.edges.insert((cin, cout));
                     }
                     sink.emitted += 1;
                     if let Some(v) = sink.visited.as_deref_mut() {

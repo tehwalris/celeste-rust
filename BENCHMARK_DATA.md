@@ -4255,3 +4255,31 @@ work. Do not use them for extrapolation.
 The `interpreter` branch's unverified `mem2reg` + `block_coalesce` were dropped
 along with the rest of that optimizer, which cost 1.3x time and 1.9x memory at
 frame 40. `promote_cell` won that back and then some.
+
+# The bucket loop (2026-09-12, plans/buckets.md)
+
+Room (1,0), level-0 forward f0-f44, release, single thread, `rewrite
+forward --to 44` (record mode = the ladder's forward). Every row below
+reproduces `gates/ckhash_room10_f000-044.txt`, `gates/posgraph_room10_f044.txt`
+and `gates/marks_room10_win9-101_h35.txt` bit for bit.
+
+| | State-bridged loop (`93313b6`) | Rt2 blocks (`31002e3`) | buckets (`78d0276`) |
+|---|---|---|---|
+| f0-f44 wall (incl. ~4 s kernel assembly) | 92.6 s | 53.2 s | **26.2 s** |
+| f44 frame | 15.1 s | 9.4 s | **4.8 s** |
+| kernel calls / rows per call | 115,039 / 17.2 | 115,039 / 17.2 | **879 / 2,252** |
+| executed AVX-512 lanes that are padding | 39.2% | 39.2% | **0.4%** |
+| blocks per frame at f44 | 17,578 | 17,578 | **42** |
+| checkpoint at f44 | 2.3 s | 1.28 s | 0.12 s |
+| peak RSS | 3.66 GB | 1.60 GB | **0.62 GB** |
+
+Where the buckets' f0-f44 time goes: `fwd.engine` 24.0 s of 25.8 s (the
+kernel call including its append step: key fold, door dedup, column
+pushes), `fwd.checkpoint` 0.62 s, `fwd.route` 0.24 s. Before buckets the
+profile was 5% assembled-kernel arithmetic and ~55% bookkeeping (per-call
+setup on 17-row calls, structure clones, the row key hashed twice in
+scalar Rust, three rounds of regrouping).
+
+Backward (synthetic win (9,101), horizon 35, levels Bits(0)/Bits(1)): the
+wide re-run marks the same 48 / 40 states with the same 525 / 34 row
+re-runs as the per-lane draft it replaced.

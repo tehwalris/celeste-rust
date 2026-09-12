@@ -141,7 +141,7 @@ impl crate::frame::FrameStep for RefEngine {
                     continue;
                 }
                 if sink.edges_on {
-                    sink.edges.push((cells_in[lane], cell_out));
+                    sink.edges.insert((cells_in[lane], cell_out));
                 }
                 sink.emitted += 1;
                 if let Some(v) = sink.visited.as_deref_mut() {

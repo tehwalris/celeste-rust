@@ -182,7 +182,9 @@ pub struct ForwardSink<'a> {
     pub visited: Option<&'a mut Visited>,
     /// Record `edges` at all (off for the backward, which has the graph).
     pub edges_on: bool,
-    pub edges: Vec<(u32, u32)>,
+    /// The distinct edges this call produced (a set: a bucket's rows fan
+    /// out into a few hundred distinct cell pairs, not one per row).
+    pub edges: rustc_hash::FxHashSet<(u32, u32)>,
     /// Rows emitted after the step's within-call dedup (the raw fan-out).
     pub emitted: u64,
     pub out: Vec<Rt2>,
@@ -202,7 +204,7 @@ impl<'a> ForwardSink<'a> {
         ForwardSink {
             visited,
             edges_on,
-            edges: Vec::new(),
+            edges: Default::default(),
             emitted: 0,
             out: Vec::new(),
             targets: None,
@@ -326,7 +328,7 @@ pub fn forward_frame(
         engine.run(block, &mut sink)?;
         st.t_engine += t.elapsed();
         if let Some(p) = pos {
-            p.record_pairs(&mut sink.edges);
+            p.record_pairs(sink.edges.drain());
         }
         st.lanes_raw += sink.emitted as usize;
         let outs = std::mem::take(&mut sink.out);
@@ -473,8 +475,15 @@ pub fn backward_walk(
         let targets: FxHashSet<(u64, u64, u32)> =
             frontier.iter().map(|&(k, c)| (k.0, k.1, c)).collect();
 
+        let t_frame = std::time::Instant::now();
         let mut new_frontier: Vec<((u64, u64), u32)> = Vec::new();
-        for block in load_frame_cells(dir, i, &cand_cells)? {
+        let (mut t_load, mut t_run) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let (mut loaded, mut frame_reruns) = (0usize, 0u64);
+        let t = std::time::Instant::now();
+        let blocks = load_frame_cells(dir, i, &cand_cells)?;
+        t_load += t.elapsed();
+        for block in blocks {
+            loaded += block.lanes();
             // Only the rows not already marked by another target need the
             // re-run.
             let cells = block.positions()?;
@@ -487,15 +496,34 @@ pub fn backward_walk(
             let Some(cand) = block.keep(&mask) else { continue };
             let keys: Vec<(u64, u64)> = cand.keys().to_vec();
             let cells = cand.positions()?;
-            reruns += cand.lanes() as u64;
+            frame_reruns += cand.lanes() as u64;
             let mut sink = ForwardSink::backward(&targets, cand.lanes());
+            let t = std::time::Instant::now();
             engine.run(cand, &mut sink)?;
+            t_run += t.elapsed();
             for (lane, hit) in sink.hits.iter().enumerate() {
                 if *hit && marked.insert(keys[lane], cells[lane]) {
                     new_frontier.push((keys[lane], cells[lane]));
                 }
             }
         }
+        reruns += frame_reruns;
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "[bwd] f{i:03} targets {} cand-cells {} loaded {} rerun {} marked {} | \
+             load {:.0} run {:.0} total {:.0} ms",
+            frontier.len(),
+            cand_cells.len(),
+            loaded,
+            frame_reruns,
+            new_frontier.len(),
+            ms(t_load),
+            ms(t_run),
+            ms(t_frame.elapsed()),
+        );
+        crate::metrics::record("bwd.load", t_load);
+        crate::metrics::record("bwd.run", t_run);
+        crate::metrics::record("bwd.frame", t_frame.elapsed());
         frontier = new_frontier;
     }
     Ok(BackwardResult { marked, reruns })

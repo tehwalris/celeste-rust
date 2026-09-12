@@ -293,10 +293,8 @@ impl PosObserver {
     /// Record `(src cell, dst cell)` edges, as the frame step observed them
     /// AT EMISSION: every raw output row, before any dedup, paired with the
     /// cell of the input row that produced it.
-    pub fn record_pairs(&self, pairs: &mut Vec<(u32, u32)>) {
-        pairs.sort_unstable();
-        pairs.dedup();
-        self.pending.lock().expect("pos observer").extend(pairs.drain(..));
+    pub fn record_pairs(&self, pairs: impl Iterator<Item = (u32, u32)>) {
+        self.pending.lock().expect("pos observer").extend(pairs);
     }
 
     /// Fold the frame's observations into the table. Called once per frame
