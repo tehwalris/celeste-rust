@@ -73,6 +73,10 @@ enum Command {
         /// Start room "x,y" (the cell numbering depends on it).
         #[arg(long, default_value = "1,0")]
         room: String,
+        /// Also list the N most populated player positions at frame `to`
+        /// (to pick a synthetic `--win-at` target with real fan-out).
+        #[arg(long)]
+        cells: Option<usize>,
     },
 }
 
@@ -139,15 +143,21 @@ fn main() -> Result<()> {
                 Some(h) => println!("win at f{h} ({wall:.2} s)"),
                 None => println!("no win by f{} ({wall:.2} s)", fwd.frames),
             }
+            if let Some(pg) = &fwd.pos_graph {
+                let (pairs, fp) = pg.fingerprint();
+                println!("posgraph f{:03} {pairs} {fp:016x}", fwd.frames);
+            }
             celeste_rust::metrics::dump("forward", Some(dir), &[("k", k.to_string())]);
         }
         Command::Ckhash {
             checkpoint_dir,
             to,
             room,
+            cells: top_cells,
         } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
             let dir = std::path::Path::new(&checkpoint_dir);
+            let mut by_cell: rustc_hash::FxHashMap<u32, usize> = Default::default();
             for frame in 0..=to {
                 let mut n = 0usize;
                 let mut acc: u64 = 0;
@@ -158,9 +168,22 @@ fn main() -> Result<()> {
                             k.0 ^ celeste_engine::runtime2::mix64(k.1 ^ (c as u64) << 1),
                         ));
                         n += 1;
+                        if frame == to && top_cells.is_some() {
+                            *by_cell.entry(c).or_default() += 1;
+                        }
                     }
                 }
                 println!("f{frame:03} {n} {acc:016x}");
+            }
+            if let Some(top) = top_cells {
+                let mut v: Vec<(u32, usize)> = by_cell.into_iter().collect();
+                v.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c));
+                for (c, n) in v.into_iter().take(top) {
+                    match celeste_rust::search::pos_graph::cell_xy(c) {
+                        Some((x, y)) => println!("cell {c}: player ({x},{y}) x{n}"),
+                        None => println!("cell {c}: no player x{n}"),
+                    }
+                }
             }
         }
     }

@@ -69,10 +69,22 @@ enum ColInit {
 }
 
 /// A per-outcome accumulator recipe: an empty structural skeleton plus the
-/// column initializers, so a fresh acc is `reshape` + apply.
+/// column initializers, so a fresh acc is `reshape` + apply - and the
+/// boundary's per-outcome constants, so the append step can hand back a
+/// block that IS at the boundary (canonical structure, exact row keys)
+/// without running `Rt2::boundary` over it.
 struct AccTemplate {
     skeleton: Rt2,
     inits: Vec<(usize, ColInit)>,
+    /// The skeleton's canonical structure hash - the block's shape key.
+    shape_hash: u64,
+    /// The boundary key's uniform part `(part1, part2)`
+    /// (`Rt2::boundary_finish`): the shape hash plus every cell that is
+    /// uniform AT THE BOUNDARY - pointers, nils, konst outputs, UBool
+    /// cells, and the level-0 widened-to-uniform cells (rem, timers) at
+    /// their WIDENED value. A row's key is `mix64(part + h)` with `h` the
+    /// per-row fold over the remaining (varying) fields.
+    part: (u64, u64),
 }
 
 impl AccTemplate {
@@ -121,6 +133,9 @@ impl AsmKernel {
         exact: bool,
     ) -> bool {
         let mut accs: Vec<Rt2> = self.acc_templates.iter().map(|t| t.build()).collect();
+        // Per-acc row keys, pushed alongside the rows: the exact boundary
+        // key, `mix64(part + h)`.
+        let mut keys: Vec<Vec<(u64, u64)>> = vec![Vec::new(); accs.len()];
         let mut inbuf = vec![0u8; self.compiled.input_bytes as usize];
         let mut outbuf = vec![0u8; self.compiled.n_roots * 128];
         let env = CollisionEnv { cart: &chunk.cart, cache: &chunk.cache };
@@ -240,30 +255,64 @@ impl AsmKernel {
                     for f in &body.fields {
                         push_field(acc, f, &outbuf, i);
                     }
+                    let part = self.acc_templates[body.outcome].part;
+                    keys[body.outcome].push((
+                        runtime2::mix64(part.0.wrapping_add(h1)),
+                        runtime2::mix64(part.1.wrapping_add(h2)),
+                    ));
                     acc.width += 1;
                 }
             }
             lo += n;
         }
 
-        for mut acc in accs {
-            if acc.width > 0 {
-                if exact {
-                    // The rung-agnostic / exact sets hand back EXACT rows;
-                    // widening here would pre-empt the campaign's rung.
-                    acc.boundary_exact();
-                } else {
-                    // The level-0 traced set pre-widened in the graph; the
-                    // boundary's own widening is then a free agreement check
-                    // and computes the row keys + dedups within the block.
-                    acc.boundary(ids);
-                }
-                if acc.width > 0 {
-                    done.push(acc);
-                }
+        for (oi, mut acc) in accs.into_iter().enumerate() {
+            if acc.width == 0 {
+                continue;
             }
+            // The acc IS at the boundary: its structure is the outcome's
+            // canonical one (`bind::structure_of`, checked below), the
+            // graph applied every level-0 widening (`trace::widen`), `seen`
+            // deduped on the key, and the key itself was computed per row
+            // above. So no `Rt2::boundary` here - just the two fields it
+            // would have set.
+            acc.shape_hash = self.acc_templates[oi].shape_hash;
+            acc.row_keys = std::mem::take(&mut keys[oi]);
+            if key_check_on() {
+                self.check_against_boundary(&acc, ids, exact, oi);
+            }
+            done.push(acc);
         }
         true
+    }
+
+    /// `CELESTE_KERNEL_KEY_CHECK=1`: run the real `Rt2::boundary` over a
+    /// copy of the finished acc and demand it changes NOTHING - same
+    /// structure, same shape hash, same row keys, same width (no
+    /// within-block duplicates left for its dedup). This is the gate that
+    /// the append step's shortcut is exact; a difference here would
+    /// silently change what the search dedups on.
+    fn check_against_boundary(&self, acc: &Rt2, ids: &runtime2::BoundaryIds, exact: bool, oi: usize) {
+        let mut b = acc.clone_block();
+        if exact {
+            b.boundary_exact();
+        } else {
+            b.boundary(ids);
+        }
+        assert!(
+            b.width == acc.width
+                && b.shape_hash == acc.shape_hash
+                && b.structure == acc.structure
+                && b.row_keys == acc.row_keys,
+            "KERNEL KEY CHECK: outcome {oi}: the boundary disagrees with the append step \
+             (width {} vs {}, shape {:#x} vs {:#x}, structure {}, keys {})",
+            b.width,
+            acc.width,
+            b.shape_hash,
+            acc.shape_hash,
+            if b.structure == acc.structure { "same" } else { "DIFFERENT" },
+            if b.row_keys == acc.row_keys { "same" } else { "DIFFERENT" },
+        );
     }
 
     /// DEBUG: re-evaluate the fused graph with the pure interval evaluator
@@ -370,6 +419,13 @@ impl AsmKernel {
 fn liveok_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CELESTE_ASM_LIVEOK").is_some())
+}
+
+/// `CELESTE_KERNEL_KEY_CHECK=1`: verify every finished acc against
+/// `Rt2::boundary` (see `check_against_boundary`).
+fn key_check_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_KEY_CHECK").is_some())
 }
 
 fn eval_check_on() -> bool {
@@ -652,12 +708,24 @@ fn build_one_shape(
     ))
 }
 
-/// The accumulator recipe for one outcome, mirroring the generated `acc{i}`:
-/// the outcome's structural template, each output field as a uniform
-/// constant (`konst_av`) or an empty typed column (by `ty`), and the UBool
-/// cells.
+/// The accumulator recipe for one outcome: the outcome's structural
+/// template, each output field as a uniform constant (`konst_av`) or an
+/// empty typed column (by `ty`), the UBool cells - and the boundary's
+/// per-outcome constants (`shape_hash`, `part`).
 fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTemplate> {
     let skeleton = reshape(&r.frame.outs[oi].rt2, 0);
+    // The structure must be canonical already: the boundary's renumbering
+    // is a no-op on it. Checked against the one implementation of the rule
+    // rather than trusted.
+    {
+        let mut probe = skeleton.clone_block();
+        probe.canonicalize_ids();
+        anyhow::ensure!(
+            probe.structure == skeleton.structure,
+            "outcome {oi}: the traced output structure is not canonical"
+        );
+    }
+    let shape_hash = skeleton.shape_hash_of();
     let mut inits: Vec<(usize, ColInit)> = Vec::new();
     for f in &r.lowered.outs[oi].fields {
         let cell = f.cell as usize;
@@ -678,7 +746,35 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
     for &cell in &r.frame.outs[oi].ubool_cells {
         inits.push((cell as usize, ColInit::Uniform(AV::UBool)));
     }
-    Ok(AccTemplate { skeleton, inits })
+    let mut t = AccTemplate { skeleton, inits, shape_hash, part: (0, 0) };
+    // The uniform part of the key, exactly as `boundary_finish` folds it:
+    // every `Cell2::Val` cell that is `Col::U` at the boundary. Non-output
+    // cells are uniform in the skeleton (pointers, nils); konst and UBool
+    // outputs are uniform by `inits`; the level-0 widened cells (rem,
+    // timers) are pushed per row but the boundary replaces them with the
+    // widened uniform value, so they fold in at that value.
+    let widen = &r.bound.outcomes[oi].widen;
+    let empty = t.build();
+    let mut part1: u64 = shape_hash;
+    let mut part2: u64 = 0xa076_1d64_78bd_642f ^ shape_hash;
+    for (c, cell) in empty.structure.iter().enumerate() {
+        if !matches!(cell, celeste_engine::runtime2::Cell2::Val) {
+            continue;
+        }
+        let uniform = match widen.iter().find(|(wc, _)| *wc as usize == c) {
+            Some((_, av)) => Some(*av),
+            None => match empty.cols[c] {
+                Col::U(v) => Some(v),
+                _ => None,
+            },
+        };
+        if let Some(v) = uniform {
+            part1 = part1.wrapping_add(runtime2::cell_mix(c as u64, v, KEY_SEED1));
+            part2 = part2.wrapping_add(runtime2::cell_mix(c as u64, v, KEY_SEED2));
+        }
+    }
+    t.part = (part1, part2);
+    Ok(t)
 }
 
 /// The kernel set for the CURRENT rung, built once per rung on a big stack

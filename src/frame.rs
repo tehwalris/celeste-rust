@@ -771,6 +771,18 @@ impl Visited {
     pub fn new() -> Self {
         Self::default()
     }
+    /// `(entries, order-independent hash of the (shape, content, cell) set)`
+    /// - the gate that two backward passes marked the same states.
+    pub fn fingerprint(&self) -> (usize, u64) {
+        use celeste_engine::runtime2::mix64;
+        let mut acc = 0u64;
+        for ((shape, cell), keys) in &self.shards {
+            for &k in keys {
+                acc = acc.wrapping_add(mix64(*shape ^ mix64(k ^ (*cell as u64) << 1)));
+            }
+        }
+        (self.len(), acc)
+    }
     /// True if `key` (with its `cell`) was NOT already present - this lane is
     /// new, keep it. Shard picked by (shape, cell); membership by content hash.
     pub fn insert(&mut self, key: (u64, u64), cell: u32) -> bool {
@@ -846,9 +858,11 @@ pub fn ladder_at_horizon(
             .as_ref()
             .expect("record mode always builds the pos graph");
         let bwd = backward_run(engine.as_mut(), &level_dir, h, graph)?;
+        let (n, fp) = bwd.marked.fingerprint();
         eprintln!(
-            "[ladder] level {level} ({precision:?}): win at f{h}, marked {} states",
-            bwd.marked.len()
+            "[ladder] level {level} ({precision:?}): win at f{h}, marked {n} states \
+             (fingerprint {fp:016x}), {} re-runs",
+            bwd.reruns
         );
         prev = Some((bwd.marked, precision));
     }

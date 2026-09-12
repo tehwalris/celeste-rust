@@ -195,6 +195,19 @@ impl PosGraph {
         self.offsets.windows(2).filter(|w| w[1] > w[0]).count()
     }
 
+    /// `(pairs, order-independent hash of the edge set)` - the gate that two
+    /// recorders built the same graph.
+    pub fn fingerprint(&self) -> (usize, u64) {
+        use celeste_engine::runtime2::mix64;
+        let mut acc = 0u64;
+        for d in 0..self.offsets.len().saturating_sub(1) {
+            for &s in self.srcs_of(d as u32) {
+                acc = acc.wrapping_add(mix64((d as u64) << 32 ^ mix64(s as u64 + 1)));
+            }
+        }
+        (self.pairs(), acc)
+    }
+
     pub fn srcs_of(&self, dst: u32) -> &[u32] {
         if self.offsets.is_empty() {
             return &[];
