@@ -101,6 +101,23 @@ enum Command {
         #[arg(long)]
         cells: Option<usize>,
     },
+    /// Extract a concrete input sequence that wins by `horizon` from one
+    /// level's marks: a DFS from the initial state through the reference
+    /// engine's concrete single-input step, admitting a successor only if
+    /// it is a marked state in the NEXT BFS layer of that level's tree.
+    /// Prints the input bytes for `concrete_run -i`, or reports where the
+    /// marked chain has no concrete continuation (a spurious win).
+    Witness {
+        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
+        checkpoint_dir: String,
+        #[arg(long)]
+        horizon: u32,
+        /// Ladder level (0..=15 = Bits(k), 16 = Exact).
+        #[arg(long, default_value_t = 16)]
+        level: usize,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -313,6 +330,211 @@ fn main() -> Result<()> {
                         None => println!("cell {c}: no player x{n}"),
                     }
                 }
+            }
+        }
+        Command::Witness {
+            checkpoint_dir,
+            horizon,
+            level,
+            room,
+        } => {
+            use celeste_rust::frame::{block_wins, frame_files, marks_path, widened_keys, Block, Visited};
+            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
+            use rustc_hash::FxHashMap;
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            let precision = if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level as u8) };
+            set_rem_precision(precision);
+            let base = std::path::Path::new(&checkpoint_dir);
+            let dir = if level == 0 {
+                base.join("level00")
+            } else {
+                base.join(format!("h{:03}", horizon)).join(format!("level{:02}", level))
+            };
+            let marks = Visited::load(&marks_path(base, horizon, level))?;
+            // (key, cell) -> the layer it was first reached at.
+            let mut layer_of: FxHashMap<(u64, u64, u32), u32> = FxHashMap::default();
+            for f in 0..=horizon {
+                for file in frame_files(&dir, f)? {
+                    if let Some(rt2) = file.load_all()? {
+                        let b = Block::from_rt2(rt2);
+                        let cells = b.positions()?;
+                        for (k, &c) in b.keys().iter().zip(&cells) {
+                            layer_of.entry((k.0, k.1, c)).or_insert(f);
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "[witness] h{horizon} level {level} ({precision:?}): {} marks, {} rows in the tree",
+                marks.len(),
+                layer_of.len()
+            );
+            let mut eng = celeste_rust::trace::refengine::RefEngine::new()?;
+            let initial = eng.initial_state()?;
+            {
+                let b = Block::from_state(&initial)?;
+                let (keys, cells) = widened_keys(&b, precision)?;
+                let id = (keys[0].0, keys[0].1, cells[0]);
+                eprintln!(
+                    "[witness] initial state: cell {} layer {:?} (expected Some(0))",
+                    cells[0],
+                    layer_of.get(&id)
+                );
+            }
+            // The search's rows carry the buttons as the boundary leaves
+            // them (read symbolically inside the frame); a concretely
+            // stepped state carries the bytes it was stepped with. Restore
+            // the boundary's representation before keying.
+            fn restore_buttons(
+                from: &celeste_rust::interpreter::state::State,
+                to: &mut celeste_rust::interpreter::state::State,
+            ) -> Result<()> {
+                use celeste_rust::interpreter::value::{HeapValue, Value};
+                let arr_of = |st: &celeste_rust::interpreter::state::State| -> Result<Vec<_>> {
+                    let cell = *st
+                        .global_env
+                        .get("__button_states")
+                        .ok_or_else(|| anyhow::anyhow!("no __button_states"))?;
+                    let arr = match st.heap.get_opt(cell) {
+                        Some(HeapValue::Value(Value::Pointer(id))) => *id,
+                        _ => cell,
+                    };
+                    let items = match st.heap.get_opt(arr) {
+                        Some(HeapValue::ArrayTable(items)) => items.clone(),
+                        other => anyhow::bail!("button array shape: {:?}", other),
+                    };
+                    Ok(items
+                        .iter()
+                        .map(|item| match st.heap.get_opt(*item) {
+                            Some(HeapValue::Value(Value::Pointer(id))) => *id,
+                            _ => *item,
+                        })
+                        .collect())
+                };
+                let src = arr_of(from)?;
+                let dst = arr_of(to)?;
+                anyhow::ensure!(src.len() == dst.len(), "button arrays differ in length");
+                for (s, d) in src.iter().zip(&dst) {
+                    let v = from.heap.get(*s).clone();
+                    to.heap.set(*d, v);
+                }
+                Ok(())
+            }
+            // DFS with memoized dead ends per (key, cell).
+            let mut dead: rustc_hash::FxHashSet<(u64, u64, u32)> = Default::default();
+            let mut path: Vec<u8> = Vec::new();
+            let mut steps: u64 = 0;
+            fn dfs(
+                eng: &mut celeste_rust::trace::refengine::RefEngine,
+                initial: &celeste_rust::interpreter::state::State,
+                state: &celeste_rust::interpreter::state::State,
+                f: u32,
+                horizon: u32,
+                precision: RemPrecision,
+                marks: &Visited,
+                layer_of: &FxHashMap<(u64, u64, u32), u32>,
+                dead: &mut rustc_hash::FxHashSet<(u64, u64, u32)>,
+                path: &mut Vec<u8>,
+                steps: &mut u64,
+                dir: &std::path::Path,
+            ) -> Result<bool> {
+                if f >= horizon {
+                    return Ok(false);
+                }
+                for byte in 0u8..64 {
+                    let mut s = state.clone();
+                    celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
+                    let mut succ = eng.run_frame_concrete(&s)?;
+                    restore_buttons(initial, &mut succ)?;
+                    *steps += 1;
+                    let block = Block::from_state(&succ)?;
+                    if block_wins(&block)? {
+                        path.push(byte);
+                        eprintln!("[witness] WIN at f{} via input {}", f + 1, byte);
+                        return Ok(true);
+                    }
+                    let (keys, cells) = widened_keys(&block, precision)?;
+                    let id = (keys[0].0, keys[0].1, cells[0]);
+                    if f == 0 && byte == 0 && layer_of.get(&id) != Some(&1) {
+                        eprintln!(
+                            "[witness] f1 successor: cell {} layer {:?} marked {} - diffing against layer 1",
+                            cells[0],
+                            layer_of.get(&id),
+                            marks.contains(keys[0], cells[0])
+                        );
+                        // Column-by-column diff of the widened concrete
+                        // successor against every layer-1 row.
+                        let mut mine = block.into_rt2();
+                        if let RemPrecision::Bits(b) = precision {
+                            mine.widen_to(celeste_rust::compiled::ids(), b);
+                        }
+                        for file in frame_files(dir, 1)? {
+                            let Some(theirs) = file.load_all()? else { continue };
+                            eprintln!(
+                                "[witness]   layer-1 file shape {:#x} width {} (mine shape {:#x}); structures {}",
+                                theirs.shape_hash,
+                                theirs.width,
+                                mine.shape_hash,
+                                if theirs.structure == mine.structure { "EQUAL" } else { "DIFFER" }
+                            );
+                            let name_of = |cell: usize| -> String {
+                                for (g, &c) in mine.globals.iter().enumerate() {
+                                    if c as usize == cell {
+                                        return format!("global {}", celeste_names::GLOBAL_NAMES[g]);
+                                    }
+                                }
+                                for (obj, node) in mine.structure.iter().enumerate() {
+                                    if let celeste_engine::runtime2::Cell2::Obj(fields) = node {
+                                        for &(fid, c) in fields {
+                                            if c as usize == cell {
+                                                return format!("obj#{obj}.{}", celeste_names::FIELD_NAMES[fid as usize]);
+                                            }
+                                        }
+                                    }
+                                }
+                                String::from("?")
+                            };
+                            let n = mine.cols.len().min(theirs.cols.len());
+                            let mut shown = 0;
+                            for c in 0..n {
+                                if !matches!(mine.structure[c], celeste_engine::runtime2::Cell2::Val) {
+                                    continue;
+                                }
+                                for lane in 0..theirs.width {
+                                    let (a, b) = (mine.cols[c].at(0), theirs.cols[c].at(lane));
+                                    if a != b && shown < 40 {
+                                        eprintln!("[witness]   cell {c} ({}): mine {:?} vs theirs[{lane}] {:?}", name_of(c), a, b);
+                                        shown += 1;
+                                    }
+                                }
+                            }
+                        }
+                        anyhow::bail!("stopping after the diff");
+                    }
+                    if dead.contains(&id) || !marks.contains(keys[0], cells[0]) {
+                        continue;
+                    }
+                    if layer_of.get(&id) != Some(&(f + 1)) {
+                        continue;
+                    }
+                    path.push(byte);
+                    if dfs(eng, initial, &succ, f + 1, horizon, precision, marks, layer_of, dead, path, steps, dir)? {
+                        return Ok(true);
+                    }
+                    path.pop();
+                    dead.insert(id);
+                }
+                Ok(false)
+            }
+            let found = dfs(
+                &mut eng, &initial, &initial, 0, horizon, precision, &marks, &layer_of, &mut dead, &mut path,
+                &mut steps, &dir,
+            )?;
+            eprintln!("[witness] {} concrete steps, {} dead ends", steps, dead.len());
+            if found {
+                println!("win at f{}: {}", path.len(), path.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
+            } else {
+                println!("NO WITNESS: no marked chain has a concrete continuation to a win by f{horizon}");
             }
         }
     }

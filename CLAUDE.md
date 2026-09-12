@@ -47,6 +47,9 @@ Rust equivalents.
   if the coarse pass finds no win by H, the concrete game has none - but the
   ladder reports "concrete optimum = H" when all 17 levels win at H, and
   that conclusion rests on the top rung being EXACT in every coordinate.
+  (When the ladder reported 99 for room (1,0) against a "proven" 100 on
+  2026-09-13, the answer was `rewrite witness` + a real-PICO-8 replay,
+  not trust in either number: the 99 was real.)
   `player.rem` is fully widened at level 0 and gets away with it only
   because k=16 narrows it back, so a spurious coarse win is refuted by a
   finer level. A widening applied at EVERY level is refuted by nothing: it
@@ -391,9 +394,18 @@ if the Lua changes) may be APPENDED by hand, never inserted.
 ./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0
 ./target/release/rewrite ckhash --to 44 --room 1,0
 
+# The concrete witness behind a ladder result: DFS through one level's
+# marks with the reference engine's single-input step. Prints the input
+# bytes, or "NO WITNESS" - which is what a spurious win looks like.
+./target/release/rewrite witness --horizon 99 --level 16 --room 1,0
+
 # Single-lane concrete execution with a fixed input sequence - fast, and the
 # basis for differential testing.
 ./target/release/concrete_run -i 42,0,0,0,0,16,2,2,2,2 -f 10
+
+# The same sequence on a REAL PICO-8 (~/pico-8/pico8), headless: the
+# fidelity check that made the 99-frame room (1,0) result believable.
+pico8_diff/replay.py tas/room_1_0_exit_frame_99.txt
 
 # Tracer analysis probes (text only): the reachable constant lattice, and the
 # specialization collapse for one shape.

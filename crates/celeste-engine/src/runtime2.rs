@@ -669,23 +669,22 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, Some(0));
+        self.widen_to(ids, 0);
     }
 
-    /// The boundary widenings at a rem precision - `rem_bits` = `Some(k)` for
-    /// Bits(k), `None` for Exact - on this block's columns, per lane. This
-    /// is `make_state_abstract_rem` + `apply_conservative_widenings`
-    /// (abstraction.rs) on a block: it is what the ladder's filter applies to
-    /// a finer level's rows to look them up in the coarser level's marks.
+    /// The boundary widenings of the `Bits(rem_bits)` level on this block's
+    /// columns, per lane - what the level's kernels bake into their rows
+    /// (`trace::widen`, `WidenMode::RemRung`), so the ladder's filter can
+    /// look a finer level's rows up in that level's marks. (The Exact level
+    /// widens nothing; its rows are the concrete state.)
     ///
     ///   1. rem: Bits(0) -> the full [-0.5, 0.5) interval; Bits(k) -> the
     ///      floor-aligned bucket of width 2^-k containing the value (an
-    ///      interval spans its endpoints' buckets); Exact -> untouched.
+    ///      interval spans its endpoints' buckets).
     ///   3. dash_effect_time clamped at 0 from below.
-    ///   3b. fruit: at a non-exact level, off := [0, 39] and y := its bob
-    ///       band, together; at Exact, off := off mod 40 (the pin).
+    ///   3b. fruit: off := [0, 39] and y := its bob band, together.
     ///   4. timer globals pinned to 0.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: Option<u8>) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 1. rem widening.
@@ -700,7 +699,8 @@ impl Rt2 {
             let low = n.to_bits().cast_signed().div_euclid(width) * width;
             (P8::from_raw(low), P8::from_raw(low + width - 1))
         };
-        if let Some(bits) = rem_bits {
+        {
+            let bits = rem_bits;
             for c in rem_cells {
                 let widen = |v: AV| -> AV {
                     match v {
@@ -771,52 +771,12 @@ impl Rt2 {
         // 3b. Fruit off/y widening (abstraction.rs:720): each live fruit's
         // bob counter becomes the full period [0, 39] and its y the whole
         // bob band start +/- 2.5 (sin is in [-1, 1]) - bit for bit the
-        // interpreter's behavior at every NON-EXACT level. `off` and `y`
-        // widen TOGETHER (one without the other produces a row no
-        // interpreter level has - room20-plan.md "only half a widening"),
-        // and the widening must only ever grow the value it replaces
-        // (asserted per lane, like the interpreter). At Exact, `off` is
-        // pinned modulo its period instead (`apply_conservative_widenings`).
-        if rem_bits.is_none() {
-            for obj in self.objects_of_type(ids, ids.g_fruit) {
-                let off_cell = self
-                    .obj_field_cell(obj, ids.f_off)
-                    .unwrap_or_else(|| panic!("fruit-off pin: fruit has no `off` field"));
-                let reduce = |v: AV| -> AV {
-                    match v {
-                        AV::Num(n) => {
-                            let i = n
-                                .as_i16()
-                                .unwrap_or_else(|| panic!("fruit-off pin: off {:?} is not an integer", n));
-                            assert!(i >= 0, "fruit-off pin: off {} is negative", i);
-                            AV::Num(P8::from_i16(i % 40))
-                        }
-                        AV::Ival(a, b) => {
-                            assert!(
-                                a >= P8::from_i16(0) && b <= P8::from_i16(40),
-                                "fruit-off pin: widened off outside [0, 40]: [{:?}, {:?}]",
-                                a,
-                                b
-                            );
-                            v
-                        }
-                        other => panic!("fruit-off pin: off is not a number: {:?}", other),
-                    }
-                };
-                self.cols[off_cell as usize] = match &self.cols[off_cell as usize] {
-                    Col::U(v) => Col::U(reduce(*v)),
-                    Col::V(vs) => Col::V(vs.iter().map(|v| reduce(*v)).collect()),
-                    Col::N(vs) => Col::V(vs.iter().map(|n| reduce(AV::Num(*n))).collect()),
-                    Col::I(vs) => Col::V(vs.iter().map(|(a, b)| reduce(AV::Ival(*a, *b))).collect()),
-                };
-            }
-        }
-        let widened_fruit = if rem_bits.is_some() {
-            self.objects_of_type(ids, ids.g_fruit)
-        } else {
-            Vec::new()
-        };
-        for obj in widened_fruit {
+        // interpreter's behavior at every Bits level. `off` and `y` widen
+        // TOGETHER (one without the other produces a row no interpreter
+        // level has - room20-plan.md "only half a widening"), and the
+        // widening must only ever grow the value it replaces (asserted per
+        // lane, like the interpreter).
+        for obj in self.objects_of_type(ids, ids.g_fruit) {
             let field = |rt: &Self, name: &str, f: u32| {
                 rt.obj_field_cell(obj, f).unwrap_or_else(|| {
                     panic!("fruit-off widening: fruit has no `{}` field", name)

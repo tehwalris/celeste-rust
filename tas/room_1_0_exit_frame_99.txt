@@ -1,0 +1,29 @@
+# Room (1,0) exit witness for celeste-minimal, 99 frames - one better than
+# room_1_0_exit_frame_100.txt (the 2022 searcher's "proven" optimum).
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py, one per frame
+# starting at frame 1. bit0=left bit1=right bit2=up bit3=down bit4=jump
+# bit5=dash. The room transition to (2,0) fires DURING FRAME 99.
+#
+# Derived 2026-09-13 by `rewrite witness --horizon 99 --level 16` from the
+# Exact level's marks of the full ladder run (`rewrite search --room 1,0`,
+# commit cff5913: every level Bits(0..15) and Exact wins by 99, 98 refuted
+# at Bits(6)), and VERIFIED ON A REAL PICO-8 (0.2.6) with
+# `pico8_diff/replay.py`: the console transitions during frame 99 on this
+# sequence and during frame 100 on the old witness.
+#
+# The frame it gains: the first dash (right+down+dash) is pressed on frame
+# 24, the frame the player object is created. `foreach(objects, ...)` is
+# `for o in all(objects)`, and `all` visits an element appended during the
+# walk, so the player's first update is frame 24, not 25; the 2022
+# searcher's model started inputs at 25.
+0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0
+0,0,0,42,0,0,0,0,0,0
+16,0,0,16,0,0,0,0,16,0
+0,0,0,16,0,0,0,36,0,0
+0,0,0,0,0,2,2,0,2,2
+2,2,2,2,2,42,0,0,0,0
+0,0,16,0,0,0,0,16,0,0
+0,0,0,0,0,2,16,0,0,0
+0,16,0,0,0,0,16,0,0

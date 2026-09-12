@@ -87,10 +87,14 @@ scratch (progress logs, deletion inventories) lives in
 The rebuild replaced the old search (`run.rs`/`sweep*.rs`, deleted) with
 `src/frame.rs` + the `rewrite search` command. Still open, in rough priority:
 
-1. **Trace extraction** - the winning input sequence at the concrete level. The
-   old `ExtractTas`/`TraceWitness` were deleted with the old backward; the new
-   `find_optimum` reports the optimal FRAME but not yet the witness trace.
-   Rebuild minimally on the sharded checkpoints + concrete-level backward.
+1. DONE 2026-09-13. **Trace extraction** - `rewrite witness --horizon H
+   --level L`: a DFS from the initial state through the reference engine's
+   concrete single-input step, admitting a successor only if it is a marked
+   state in the next BFS layer of that level's tree. On the Exact level's
+   326 marks at H=99 it found the 99-frame room (1,0) witness in 0.2 s
+   (`tas/room_1_0_exit_frame_99.txt`), which `pico8_diff/replay.py` then
+   confirmed on a real PICO-8 - one frame better than the 2022 searcher's
+   proven 100.
 2. DONE 2026-09-12. **Incremental rem-0 horizon extension** - `Ladder` keeps
    level 0's `ForwardState` (frontier, visited, pos-graph observer) across
    horizons and extends it by the frames each new horizon adds; the finer,

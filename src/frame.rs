@@ -251,22 +251,23 @@ impl<'a> MarkFilter<'a> {
     }
 }
 
-/// Each lane's `(key, cell)` after widening to `coarser` - what `MarkFilter`
-/// looks up. The COMPLETE coarsening the coarse engine bakes into its rows
-/// (`Rt2::widen_to`: rem bucketing, the dash clamp, the fruit widening or
-/// pin, the timer pins), then the canonical key - on the block's columns,
-/// lane for lane. Public for the ladder diagnostics.
+/// Each lane's `(key, cell)` as the `coarser` level keys it - what
+/// `MarkFilter` looks up. At `Bits(k)` that is the COMPLETE coarsening the
+/// level's kernels bake into their rows (`Rt2::widen_to`: rem bucketing,
+/// the dash clamp, the fruit widening, the timer pins), then the canonical
+/// key - on the block's columns, lane for lane. At `Exact` it is the plain
+/// canonical key: the Exact kernel set (`WalkOpts::EXACT`) widens NOTHING,
+/// its rows are the concrete state, timers included. Public for the ladder
+/// diagnostics and the witness extraction.
 pub fn widened_keys(
     block: &Block,
     coarser: crate::interpreter::abstraction::RemPrecision,
 ) -> Result<(Vec<(u64, u64)>, Vec<u32>)> {
     use crate::interpreter::abstraction::RemPrecision;
-    let bits = match coarser {
-        RemPrecision::Bits(b) if b < 16 => Some(b),
-        _ => None,
-    };
     let mut w = block.rt2.clone_block();
-    w.widen_to(crate::compiled::ids(), bits);
+    if let RemPrecision::Bits(b) = coarser {
+        w.widen_to(crate::compiled::ids(), b);
+    }
     let keys = w.row_keys_canonical();
     let cells = crate::search::pos_graph::block_cells(&w)?;
     anyhow::ensure!(

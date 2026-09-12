@@ -4328,3 +4328,87 @@ worth a profile once the full ladder has run.
 The layers are streamed from disk per backward iteration; before that the
 level-1 forward re-widened whole buckets through `State` and was OOM-killed
 at 62.8 GB.
+
+## Room (1,0) end to end on the bucket loop, checkpoint v8 (2026-09-13, release, 1 thread)
+
+`rewrite search --room 1,0 --to 110`, commit `cff5913`: level 0 to its
+first win, then the full ladder per horizon. **1 h 10 min wall, peak
+32.4 GB**, `OPTIMAL win frame: 99` - see the caveat at the end.
+
+Per (horizon, level), wall seconds summed from the per-frame / per-iteration
+lines. Level 0's forward at H=89 is f0-f89; at every later horizon it is
+the one-frame extension. A refuted level has no backward.
+
+| H | level | forward s | backward s | result |
+|---|---|---|---|---|
+| 89 | Bits(0) | 791 (f0-f89) | 1.3 | win f89, 7,857 marks, 392k re-runs |
+| 89 | Bits(1) | 5.2 | - | refuted |
+| 90 | Bits(0) | 26 | 4.9 | 38.6k marks |
+| 90 | Bits(1) | 0.5 | - | refuted |
+| 91 | Bits(0) | 27 | 15 | 136k |
+| 91 | Bits(1) | 2.1 | - | refuted |
+| 92 | Bits(0) | 27 | 29 | 373k |
+| 92 | Bits(1) | 6.2 | - | refuted |
+| 93 | Bits(0) | 30 | 49 | 803k |
+| 93 | Bits(1) | 14 | 2.9 | win f93, 7,762 |
+| 93 | Bits(2) | 5.2 | - | refuted |
+| 94 | Bits(0) | 30 | 74 | 1.42M |
+| 94 | Bits(1) | 24 | 11 | 64.6k |
+| 94 | Bits(2) | 0.9 | - | refuted |
+| 95 | Bits(0) | 33 | 113 | 2.30M |
+| 95 | Bits(1) | 38 | 26 | 230k |
+| 95 | Bits(2) | 4.2 | - | refuted |
+| 96 | Bits(0) | 34 | 156 | 3.55M |
+| 96 | Bits(1) | 59 | 55 | 558k |
+| 96 | Bits(2) | 11 | 4.6 | win f96, 44.0k |
+| 96 | Bits(3) | 5.4 | - | refuted |
+| 97 | Bits(0) | 39 | 214 | 5.03M |
+| 97 | Bits(1) | 83 | 98 | 1.11M |
+| 97 | Bits(2) | 22 | 15 | 226k |
+| 97 | Bits(3) | 3.2 | 2.8 | win f97, 70.9k |
+| 97 | Bits(4) | 5.6 | 0.2 | 2.7k |
+| 97 | Bits(5) | 5.1 | - | refuted |
+| 98 | Bits(0) | 40 | 282 | 6.73M |
+| 98 | Bits(1) | 114 | 165 | 1.94M |
+| 98 | Bits(2) | 39 | 44 | 639k |
+| 98 | Bits(3) | 12 | 16 | 400k |
+| 98 | Bits(4) | 5.2 | 5.0 | 206k |
+| 98 | Bits(5) | 1.6 | 2.0 | win f98, 95.6k |
+| 98 | Bits(6) | 5.6 | - | refuted |
+| 99 | Bits(0) | 41 | 370 | 8.82M, 98.3M re-runs |
+| 99 | Bits(1) | 157 | 272 | 3.08M |
+| 99 | Bits(2..5) | | | 1.37M / 1.17M / 993k / 1.06M |
+| 99 | Bits(6..14) | | | win f99: 376k / 176k / 92k / 91k / 86k / 86k / 86k / 66k / 30k |
+| 99 | Bits(15) | | | win f99, 326 |
+| 99 | Exact | | | win f99, 326 -> `OPTIMAL win frame: 99` |
+
+Per horizon: 89: 798 s (791 of it the forward), 90: 31, 91: 44, 92: 62,
+93: 101, 94: 139, 95: 214, 96: 325, 97: 487, 98: 731, 99: ~1,200.
+
+Reading:
+- The refuting level is always cheap (1-10 s). A horizon's cost is the
+  levels below it, dominated by level 0's backward (redone from scratch
+  each horizon, x1.4 per horizon, ~1,310 s summed over 89..99 - the
+  incremental level-0 backward is now a measured saving) and level 1's
+  forward + backward.
+- With checkpoint v8 the backward's load is 2-80 ms per iteration; the
+  same H=89 level-0 backward took ~27 min under v7 (35 s of zstd/bincode
+  decode per iteration).
+- The old 16-thread campaign (2026-08-26/28) refuted H=94 in ~590-680 s;
+  this single-threaded run reached the same point in 1,175 s.
+
+The 99 against the 2022 searcher's "proven" 100
+(`tas/room_1_0_exit_frame_100.txt`, which still exits during frame 100
+here) was treated as a suspected spurious win until it had a concrete
+witness: `rewrite witness --horizon 99 --level 16` (added the same day)
+extracted a 99-frame input sequence from the Exact level's 326 marks in
+0.2 s, `concrete_run` replays it with the transition during frame 99, and
+`pico8_diff/replay.py` replays it on a REAL PICO-8 0.2.6 with the same
+result (and the old witness at 100, positions/spd/rem identical to ours).
+`tas/room_1_0_exit_frame_99.txt`. The frame comes from a dash pressed on
+frame 24, the frame the player object is created and - under PICO-8's
+`all()` - first updated; the 2022 model started inputs on frame 25.
+
+Found on the way: the Exact kernel set widens nothing (`WalkOpts::EXACT`),
+so its rows carry live timers and `widened_keys(_, Exact)` must not pin
+them (it did; nothing had looked an Exact row up before the witness tool).
