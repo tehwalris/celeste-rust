@@ -154,8 +154,4 @@ impl crate::frame::FrameStep for RefEngine {
         }
         Ok(())
     }
-
-    fn freeze_global(&self) -> u32 {
-        celeste_names::global_id("freeze").expect("no freeze global")
-    }
 }

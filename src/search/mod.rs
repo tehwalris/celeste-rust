@@ -1,11 +1,12 @@
 //! The abstract forward search, and the checks that keep it honest.
 //!
-//! One frame of the search is `compiled::FrameEngine::run_frame_block` - the assembled
-//! class kernels where they bind and the interpreter where they do not. This
-//! module is everything around that:
+//! One frame of the search is `compiled::FrameEngine::run_bucket` - one
+//! shape's block through its assembled kernel. This module is everything
+//! around that:
 //!
-//!   * `checkpoint`    - block (de)serialization (header + zstd) for the
-//!                       sharded frontier
+//!   * `checkpoint`    - the frame checkpoint files: one per (frame, shape),
+//!                       rows sorted by (cell, key) with a cell index, raw
+//!                       fixed-width columns loadable by cell range
 //!   * `pos_graph`     - the position-transition graph, the backward pass's
 //!                       predecessor filter (`plans/strategy.md`)
 //!

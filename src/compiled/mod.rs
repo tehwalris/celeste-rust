@@ -102,10 +102,6 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
         g_fruit: g("fruit"),
         f_off: f("off"),
         f_start: f("start"),
-        // The recipe's partition_merge (pm1) key. `has_dashed` and
-        // `freeze` are globals; the rest are player fields.
-        g_pm1: ["has_dashed", "freeze"].iter().map(|n| g(n)).collect(),
-        f_pm1: ["dash_time", "djump", "p_dash", "p_jump"].iter().map(|n| f(n)).collect(),
     }
 }
 
@@ -154,11 +150,6 @@ pub fn engine_row_keys(
 
 pub struct FrameEngine {
     ids: runtime2::BoundaryIds,
-    /// The freeze global. Every block is pre-partitioned on it before the
-    /// frame runs: the update-side freeze gate is a real per-lane branch,
-    /// and splitting on it up front is what keeps the kernels' premise of
-    /// a class-uniform chunk true (pm1's precedent).
-    g_freeze: u32,
     cart: Arc<CartData>,
     cache: Arc<CollisionCache>,
 }
@@ -167,7 +158,6 @@ impl FrameEngine {
     pub fn new(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Self {
         FrameEngine {
             ids: boundary_ids(),
-            g_freeze: gen::global_id("freeze").expect("no freeze global"),
             cart,
             cache,
         }
@@ -193,14 +183,13 @@ impl FrameEngine {
         self.cache.clone()
     }
 
-    /// One frame of one BUCKET (a class-uniform block: one shape, one freeze
-    /// value, one moving key, one pm1 class - `Rt2::class_keys`), emitted
+    /// One frame of one BUCKET (one shape's block of the frontier), emitted
     /// into `sink`: every output row the kernel keeps lands in `sink.out`
     /// (per outcome, at the boundary, keyed), its pos-graph edge in
     /// `sink.edges`, and - when the sink carries the visited set - only
-    /// rows new to the search are materialized at all. No pre-partition (a
-    /// bucket is one class), no chunking (the kernel slices by 16 itself),
-    /// no post-merge (the caller routes rows into next frame's buckets).
+    /// rows new to the search are materialized at all. No pre-partition,
+    /// no chunking (the kernel slices by 16 itself), no post-merge (the
+    /// caller routes rows into next frame's buckets).
     pub fn run_bucket(
         &self,
         bucket: &runtime2::Rt2,
@@ -260,9 +249,5 @@ impl crate::frame::FrameStep for FrameEngine {
         let cell_in = block.positions()?;
         self.run_bucket(&block.into_rt2(), &cell_in, sink);
         Ok(())
-    }
-
-    fn freeze_global(&self) -> u32 {
-        self.g_freeze
     }
 }

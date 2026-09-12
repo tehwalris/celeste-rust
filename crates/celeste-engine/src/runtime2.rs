@@ -139,10 +139,6 @@ pub struct BoundaryIds {
     pub g_fruit: u32,
     pub f_off: u32,
     pub f_start: u32,
-    /// The recipe's partition_merge (pm1) key: globals (has_dashed,
-    /// freeze) and player fields (dash_time, djump, p_dash, p_jump).
-    pub g_pm1: Vec<u32>,
-    pub f_pm1: Vec<u32>,
 }
 
 pub struct Rt2 {
@@ -974,83 +970,18 @@ impl Rt2 {
         self.width
     }
 
-    /// Per-lane key of the "is the object moving" gates (anonymous_61
-    /// __entry: `spd.x ~= 0 or spd.y ~= 0`, evaluated on FRAME-START spd -
-    /// obj.move runs before update touches spd). One bit per object in
-    /// walk order. Pre-partitioning by this removes the SplitReq rerun
-    /// for the known divergent gates; novel gates still throw.
-    pub fn moving_key(&self, ids: &BoundaryIds) -> Option<Vec<u8>> {
-        let arr = self.global_target(ids.g_objects)?;
-        let Cell2::Arr(items) = &self.structure[arr as usize] else {
-            return None;
-        };
-        let mut key = vec![0u8; self.width];
-        let zero = P8::from_i16(0);
-        let nonzero = |v: AV| -> bool {
-            match v {
-                AV::Num(n) => n != zero,
-                // An interval counts as nonzero exactly when `~= 0` is true,
-                // which for `Ival == _ -> false` is always.
-                AV::Ival(..) => true,
-                other => panic!("moving_key: spd is not numeric: {:?}", other),
-            }
-        };
-        for (bit, item) in items.iter().enumerate() {
-            let obj = match &self.structure[*item as usize] {
-                Cell2::Val => match self.cols[*item as usize] {
-                    Col::U(AV::Ptr(o)) => o,
-                    _ => continue,
-                },
-                _ => *item,
-            };
-            let Some(spd_cell) = self.obj_field_cell(obj, ids.f_spd) else {
-                continue;
-            };
-            let Col::U(AV::Ptr(spd_obj)) = self.cols[spd_cell as usize] else {
-                continue;
-            };
-            for f in [ids.f_x, ids.f_y] {
-                let Some(c) = self.obj_field_cell(spd_obj, f) else { continue };
-                match &self.cols[c as usize] {
-                    Col::U(v) => {
-                        if nonzero(*v) {
-                            for k in key.iter_mut() {
-                                *k |= 1 << (bit % 8);
-                            }
-                        }
-                    }
-                    Col::V(vs) => {
-                        for (i, v) in vs.iter().enumerate() {
-                            if nonzero(*v) {
-                                key[i] |= 1 << (bit % 8);
-                            }
-                        }
-                    }
-                    Col::N(vs) => {
-                        for (i, n) in vs.iter().enumerate() {
-                            if *n != zero {
-                                key[i] |= 1 << (bit % 8);
-                            }
-                        }
-                    }
-                    // Interval spd: `~= 0` is always true (Ival == _ -> false).
-                    Col::I(_) => {
-                        for k in key.iter_mut() {
-                            *k |= 1 << (bit % 8);
-                        }
-                    }
-                }
-            }
-        }
-        Some(key)
-    }
-
     /// Keep only the given lanes (ascending indices), in every value
     /// column, closure capture and row key.
     pub fn retain_lanes(&mut self, keep: &[u32]) {
-        if keep.len() == self.width {
+        if keep.len() == self.width && keep.iter().enumerate().all(|(i, &k)| k as usize == i) {
             return;
         }
+        self.gather_lanes(keep);
+    }
+
+    /// Rebuild every column as `keep`'s lanes in `keep`'s order - a
+    /// gather, so a permutation reorders and a subset filters.
+    pub fn gather_lanes(&mut self, keep: &[u32]) {
         let retain_col = |col: &mut Col| match col {
             Col::U(_) => {}
             Col::V(vs) => {
@@ -1080,59 +1011,6 @@ impl Rt2 {
             self.row_keys = keep.iter().map(|&i| self.row_keys[i as usize]).collect();
         }
         self.width = keep.len();
-    }
-
-    /// Resolve the pm1 key cells on this block (canonical ids, so the
-    /// same for every block of a shape). Missing pieces (no player at
-    /// spawn, absent global) just drop out of the key.
-    pub fn pm1_cells(&self, ids: &BoundaryIds) -> Vec<u32> {
-        let mut cells: Vec<u32> = Vec::new();
-        for &g in &ids.g_pm1 {
-            let c = self.globals[g as usize];
-            if c != NONE {
-                cells.push(c);
-            }
-        }
-        // `g_player` holds the player TYPE table, not the instance - the
-        // instance is the object in `objects` whose `type` points at it,
-        // exactly as mark_walk finds it. Resolving fields off the type
-        // table silently found nothing, so pm1 partitioning only ever
-        // split on the two globals: engine-produced blocks kept mixed
-        // dash_time / p_jump / p_dash and no class kernel could bind them
-        // (at f35 that cost the whole next frame - 269,059 lanes - its
-        // kernel coverage).
-        for obj in self.player_objects(ids) {
-            for &f in &ids.f_pm1 {
-                if let Some(c) = self.obj_field_cell(obj, f) {
-                    cells.push(c);
-                }
-            }
-        }
-        cells
-    }
-
-    /// Per-row CLASS key: a hash of the values the search buckets a row
-    /// by - the freeze global, the moving key (which objects have a
-    /// nonzero spd) and the pm1 cells. Two rows with equal class keys can
-    /// share a bucket and a kernel call; the kernel's pre-partition
-    /// premises (freeze, moving key) and the pm1 grouping are exactly
-    /// this, so a bucket is class-uniform by construction.
-    pub fn class_keys(&self, ids: &BoundaryIds, g_freeze: u32) -> Vec<u64> {
-        let mut cells: Vec<u32> = self.pm1_cells(ids);
-        let freeze = self.globals[g_freeze as usize];
-        if freeze != NONE && !cells.contains(&freeze) {
-            cells.push(freeze);
-        }
-        let moving = self.moving_key(ids).unwrap_or_else(|| vec![0; self.width]);
-        (0..self.width)
-            .map(|i| {
-                let mut h: u64 = 0x9e37_79b9_7f4a_7c15 ^ moving[i] as u64;
-                for &c in &cells {
-                    h = mix64(h ^ av_code(self.cols[c as usize].at(i)) ^ (c as u64) << 48);
-                }
-                h
-            })
-            .collect()
     }
 
     /// Append `rows` of `src` (a same-shape block) to this block, column

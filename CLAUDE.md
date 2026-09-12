@@ -241,8 +241,11 @@ raise the cap past what `free` leaves after /tmp, which is a tmpfs.
 
 Checkpoints go on DISK (`/var/tmp/celeste-checkpoints`, the default), not
 under the tmpfs at /tmp. (The inode blow-up that forced this - one file per
-17k cell-uniform blocks per frame - went with buckets, which are dozens of
-files per frame; the default stays on disk anyway.)
+17k cell-uniform blocks per frame - is gone: a frame is one file per SHAPE,
+rows sorted by (cell, key) with a cell index (`search::checkpoint`, format
+v8), so the backward reads a cell's rows as a range instead of decoding the
+layer. Uncompressed: ~3x the zstd size on disk, and the decode that cost
+the H=89 backward 35 s per iteration is gone.)
 
 The pre-rebuild search's 16-thread / 8,000-lane chunked parallel path and its
 `./parcheck.sh` byte-identity gate went with `run.rs` / `sweep*.rs`. The rebuilt
@@ -308,8 +311,9 @@ src/compiled/  FrameEngine (`run_bucket`), the ASM kernel registry
 ```
 
 One frame of the abstract search is `celeste_rust::compiled::FrameEngine`
-`::run_bucket` - one BUCKET in (a class-uniform `Rt2`: one shape, one
-freeze value, one moving key, one pm1 class), rows out through a
+`::run_bucket` - one BUCKET in (one shape's `Rt2`; the old per-class
+split on freeze / moving key / pm1 cells was the generated kernels'
+premise and went 2026-09-12 with every gate identical), rows out through a
 `ForwardSink`. The frontier IS a set of buckets, one kernel call each
 (2,000+ rows per call, <1% lane padding), and the kernel's append step
 emits each surviving row already at the boundary - canonical structure,

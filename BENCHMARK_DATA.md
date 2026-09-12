@@ -4283,3 +4283,48 @@ scalar Rust, three rounds of regrouping).
 Backward (synthetic win (9,101), horizon 35, levels Bits(0)/Bits(1)): the
 wide re-run marks the same 48 / 40 states with the same 525 / 34 row
 re-runs as the per-lane draft it replaced.
+
+## Depth: the level-0 forward to the real win, and an H=55 ladder (2026-09-12, release, 1 thread)
+
+Room (1,0), `rewrite search` level 0 (Bits(0)) extended to the first real
+win, single thread, `d5f5495`:
+
+| frame | frontier in | raw emitted | kept (new) | visited | frame wall | RSS |
+|---|---|---|---|---|---|---|
+| f50 | 1.08M | 5.8M | 1.19M | 8.0M | 6.2 s | 1.9 GB |
+| f60 | 2.00M | 11.0M | 2.20M | 25.0M | 12.2 s | 3.8 GB |
+| f70 | 5.14M | 30.9M | 5.21M | 66.3M | 34.0 s | 14.5 GB |
+| f75 | 5.19M | 32.7M | 5.24M | 92.2M | 34.2 s | 14.5 GB |
+| f80 | 4.48M | 28.4M | 4.20M | 115.4M | 30.2 s | 15.0 GB |
+| f85 | 3.78M | 25.5M | 3.95M | 134.5M | 25.9 s | 27.4 GB |
+| f89 | 4.29M | 28.3M | 4.67M | 151.6M | 30.6 s | 27.4 GB |
+
+**First win at f89** (the old engine's frame), **1,013 s wall** for f0-f89,
+peak **27.4 GB**, checkpoints f0-f89 2.7 GB on disk. The frontier plateaus
+at 5.24M (the old engine's 5.24M at f76). Per frame ~6.5 us per input row,
+of which the kernel call (including its append step) is ~95%. The RSS is
+the `Visited` set (151.6M `(shape, cell) -> {content hash}` entries in
+`FxHashMap<_, FxHashSet<u64>>`) plus the two frontier generations; the
+old 16-thread engine reached f89 in 424 s wall (~6,800 thread-seconds).
+
+Ladder at a synthetic horizon, `rewrite search --from 55 --to 55 --maxk 1
+--win-at 31,108` (win = player at cell (31,108); levels Bits(0), Bits(1),
+Exact):
+
+| stage | wall | peak RSS | result |
+|---|---|---|---|
+| level 0 forward f0-f55 | ~240 s | 3.66 GB | first win f34, frontier 1.66M at f55 |
+| level 0 backward H=55 | 116 s | (3.66) | 3,527,818 marks, 25.6M re-runs |
+| level 1 forward f0-f55 (filtered by level-0 marks) | ~60 s | 5.01 GB | frontier 42,874 at f55 |
+| level 1 backward H=55 | 256 s | (5.01) | 5,479,092 marks, 35.0M re-runs |
+| Exact forward under the level-1 marks | killed at f43 | 20.7 GB and x1.5 per frame | 26M rows at f43 |
+
+The last row is the reason the ladder has Bits(2..15) between Bits(1) and
+Exact: `--maxk 1` jumps straight to Exact, and a Bits(1) mark admits every
+exact `rem` in a half-unit bucket. The level-1 backward re-runs a row 2.3x
+slower than level 0 (23 s vs 10 s for ~3.5M rows at f50) - unexplained,
+worth a profile once the full ladder has run.
+
+The layers are streamed from disk per backward iteration; before that the
+level-1 forward re-widened whole buckets through `State` and was OOM-killed
+at 62.8 GB.

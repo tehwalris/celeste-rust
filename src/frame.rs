@@ -9,7 +9,7 @@
 //! Impls (kernel runner + `trace::refengine`) and the loop's checkpoint /
 //! position-graph growth come next; this is the interface + the frame spine.
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 
 use crate::interpreter::state::State;
 use celeste_engine::runtime2::Rt2;
@@ -143,29 +143,20 @@ impl Block {
     }
 }
 
-/// Route a block's rows into next frame's BUCKETS: one bucket per
-/// (shape, class), class = `Rt2::class_keys` (freeze, moving key, pm1
-/// cells). A column append per row group (`Rt2::append_rows`); no clone,
-/// no merge, no re-partition - the bucket IS the block the next frame's
-/// kernel call runs on, packed as it is built (plans/buckets.md).
-fn route(
-    rt2: Rt2,
-    buckets: &mut rustc_hash::FxHashMap<(u64, u64), Rt2>,
-    g_freeze: u32,
-) {
-    let ids = crate::compiled::ids();
-    let classes = rt2.class_keys(ids, g_freeze);
-    let mut groups: rustc_hash::FxHashMap<u64, Vec<u32>> = Default::default();
-    for (i, &c) in classes.iter().enumerate() {
-        groups.entry(c).or_default().push(i as u32);
-    }
-    for (class, rows) in groups {
-        let bucket = buckets.entry((rt2.shape_hash, class)).or_insert_with(|| {
-            let mut b = celeste_engine::slots::reshape(&rt2, 0);
-            b.shape_hash = rt2.shape_hash;
-            b
-        });
-        bucket.append_rows(&rt2, &rows);
+/// Route a block's rows into next frame's BUCKETS: one bucket per shape.
+/// (The old per-class split - freeze, moving key, pm1 cells - was the
+/// generated kernels' uniformity premise; the fused ASM graph resolves
+/// those per lane, and bucketing by shape alone reproduces every gate,
+/// 2026-09-12.)
+fn route(rt2: Rt2, buckets: &mut rustc_hash::FxHashMap<u64, Rt2>) {
+    match buckets.entry(rt2.shape_hash) {
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(rt2);
+        }
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            let rows: Vec<u32> = (0..rt2.width as u32).collect();
+            e.get_mut().append_rows(&rt2, &rows);
+        }
     }
 }
 
@@ -297,8 +288,6 @@ pub fn widened_keys(
 pub trait FrameStep {
     /// One frame of `block`, emitted into `sink`.
     fn run(&mut self, block: Block, sink: &mut ForwardSink) -> Result<()>;
-    /// The freeze global's id, for bucket routing.
-    fn freeze_global(&self) -> u32;
 }
 
 /// The minimal forward frame: run the frame step over every bucket of the
@@ -321,8 +310,7 @@ pub fn forward_frame(
     use std::time::Instant;
     let mut st = FrameStats::default();
     let mut won = false;
-    let g_freeze = engine.freeze_global();
-    let mut buckets: rustc_hash::FxHashMap<(u64, u64), Rt2> = Default::default();
+    let mut buckets: rustc_hash::FxHashMap<u64, Rt2> = Default::default();
     st.blocks_in = frontier.len();
     for block in frontier {
         st.lanes_in += block.lanes();
@@ -365,7 +353,7 @@ pub fn forward_frame(
                 st.lanes_kept += kept.lanes();
                 won |= is_win(&kept)?;
                 let t = Instant::now();
-                route(kept.into_rt2(), &mut buckets, g_freeze);
+                route(kept.into_rt2(), &mut buckets);
                 st.t_route += t.elapsed();
             }
         }
@@ -442,17 +430,12 @@ pub fn backward_run(
     horizon: u32,
     graph: &crate::search::pos_graph::PosGraph,
 ) -> Result<BackwardResult> {
-    // Seeds: the win states of every layer 1..=horizon.
+    // Seeds: the win states of every layer 1..=horizon (listed in each
+    // checkpoint file's header; nothing is decoded).
     let mut seeds: Vec<((u64, u64), u32)> = Vec::new();
     for f in 1..=horizon {
-        for block in load_frame(dir, f)? {
-            let cells = block.positions()?;
-            let wins = block.wins()?;
-            for ((k, &c), w) in block.keys().iter().zip(&cells).zip(wins) {
-                if w {
-                    seeds.push((*k, c));
-                }
-            }
+        for file in frame_files(dir, f)? {
+            seeds.extend(file.wins());
         }
     }
     backward_walk(engine, dir, horizon, graph, seeds)
@@ -581,7 +564,7 @@ pub struct ForwardResult {
 impl ForwardState {
     /// Frame 0: seed the visited set from `initial`, checkpoint it, start
     /// recording the position graph if `record`.
-    pub fn start(initial: Vec<Block>, dir: &std::path::Path, record: bool) -> Result<Self> {
+    pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool) -> Result<Self> {
         let mut visited = Visited::new();
         for b in &initial {
             let cells = b.positions()?;
@@ -589,7 +572,7 @@ impl ForwardState {
                 visited.insert(*k, *c);
             }
         }
-        checkpoint_frontier(dir, 0, &initial)?;
+        checkpoint_frontier(dir, 0, &mut initial)?;
         Ok(ForwardState {
             frontier: initial,
             visited,
@@ -614,7 +597,7 @@ impl ForwardState {
             let frame = self.frames + 1;
             let t_frame = std::time::Instant::now();
             let frontier = std::mem::take(&mut self.frontier);
-            let (next, won, st) = forward_frame(
+            let (mut next, won, st) = forward_frame(
                 engine,
                 frontier,
                 &mut self.visited,
@@ -623,7 +606,7 @@ impl ForwardState {
                 filter,
             )?;
             let t = std::time::Instant::now();
-            checkpoint_frontier(dir, frame, &next)?;
+            checkpoint_frontier(dir, frame, &mut next)?;
             let t_ckpt = t.elapsed();
             let t = std::time::Instant::now();
             if let Some(o) = self.observer.as_ref() {
@@ -722,55 +705,72 @@ fn log_frame(
 
 /// Checkpoint a frontier: one file per BUCKET under `frames/fNNN/`, named
 /// `b{seq}_s{shape}.bin`.
-fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &[Block]) -> Result<()> {
+fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]) -> Result<()> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
     // Fresh: a re-run / resumed frame must not leave stale files behind.
     let _ = std::fs::remove_dir_all(&fdir);
     std::fs::create_dir_all(&fdir)?;
-    for (seq, block) in frontier.iter().enumerate() {
-        let path = fdir.join(format!("b{:05}_s{:016x}.bin", seq, block.shard_shape()));
-        crate::search::checkpoint::save_block_to(&path, &block.rt2)?;
+    let mut seen_shapes: rustc_hash::FxHashSet<u64> = Default::default();
+    for block in frontier.iter_mut() {
+        ensure!(
+            seen_shapes.insert(block.shard_shape()),
+            "checkpoint f{frame}: two blocks of shape {:#x} - the frontier is one block per shape",
+            block.shard_shape()
+        );
+        // Canonical order: by (cell, key). The frontier itself is sorted in
+        // place, so the file order and the kernel's lane order agree and
+        // neither depends on how the frame was scheduled.
+        let cells = block.positions()?;
+        let mut perm: Vec<u32> = (0..block.lanes() as u32).collect();
+        perm.sort_unstable_by_key(|&i| (cells[i as usize], block.rt2.row_keys[i as usize]));
+        block.rt2.gather_lanes(&perm);
+        let cells: Vec<u32> = perm.iter().map(|&i| cells[i as usize]).collect();
+        let wins = block.wins()?;
+        let path = fdir.join(format!("s{:016x}.bin", block.shard_shape()));
+        crate::search::checkpoint::save_block(&path, &block.rt2, &cells, &wins)?;
     }
     Ok(())
 }
 
-/// Load every block of a checkpointed frame.
-pub fn load_frame(dir: &std::path::Path, frame: u32) -> Result<Vec<Block>> {
-    load_frame_filtered(dir, frame, |_cell| true)
-}
-
-/// Load only the ROWS whose cell is in `cells` - backward's per-cell load.
-/// Every bucket file is read and filtered by its position column; a
-/// per-bucket cell index that makes this a range read is plans/buckets.md
-/// stage 5.
-pub fn load_frame_cells(
+/// The checkpoint files of a frame, one per shape, mapped.
+pub fn frame_files(
     dir: &std::path::Path,
     frame: u32,
-    cells: &rustc_hash::FxHashSet<u32>,
-) -> Result<Vec<Block>> {
-    load_frame_filtered(dir, frame, |cell| cells.contains(&cell))
-}
-
-fn load_frame_filtered(
-    dir: &std::path::Path,
-    frame: u32,
-    keep: impl Fn(u32) -> bool,
-) -> Result<Vec<Block>> {
+) -> Result<Vec<crate::search::checkpoint::FrameFile>> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
     let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
             let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            n.starts_with('b') && n.ends_with(".bin")
+            n.starts_with('s') && n.ends_with(".bin")
         })
         .collect();
     names.sort();
+    names.iter().map(|p| crate::search::checkpoint::FrameFile::open(p)).collect()
+}
+
+/// Load every block of a checkpointed frame.
+pub fn load_frame(dir: &std::path::Path, frame: u32) -> Result<Vec<Block>> {
     let mut out = Vec::new();
-    for path in names {
-        let block = Block::from_rt2(crate::search::checkpoint::load_block_from(&path)?);
-        let mask: Vec<bool> = block.positions()?.iter().map(|&c| keep(c)).collect();
-        if let Some(b) = block.keep(&mask) {
-            out.push(b);
+    for file in frame_files(dir, frame)? {
+        if let Some(rt2) = file.load_all()? {
+            out.push(Block::from_rt2(rt2));
+        }
+    }
+    Ok(out)
+}
+
+/// Load only the ROWS whose cell is in `cells` - the backward's per-cell
+/// load, a range copy per (file, cell) out of the cell index.
+pub fn load_frame_cells(
+    dir: &std::path::Path,
+    frame: u32,
+    cells: &rustc_hash::FxHashSet<u32>,
+) -> Result<Vec<Block>> {
+    let mut out = Vec::new();
+    for file in frame_files(dir, frame)? {
+        if let Some(rt2) = file.load_cells(cells)? {
+            out.push(Block::from_rt2(rt2));
         }
     }
     Ok(out)

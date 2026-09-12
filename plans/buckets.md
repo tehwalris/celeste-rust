@@ -12,13 +12,16 @@ regrouping, and 17k checkpoint files per frame.
 ## Invariants
 
 1. **The unit of storage is the unit of kernel invocation.** The frontier is
-   a set of BUCKETS keyed by what the kernel is specialized/partitioned on:
-   `(output shape, class)` with class = the values of the freeze global, the
-   moving key and the pm1 cells. A bucket is one packed `Rt2`; one kernel
-   call per bucket. Position is a column, not part of the key.
+   a set of BUCKETS keyed by what the kernel is dispatched on: the output
+   shape. A bucket is one packed `Rt2`; one kernel call per bucket.
+   Position is a column, not part of the key. (Until 2026-09-12 the key
+   also carried a CLASS - freeze global, moving key, pm1 cells - inherited
+   from the generated kernels' uniformity premise; the fused ASM graph
+   resolves those per lane, and dropping it reproduced every gate with
+   44 calls for f0-f44 instead of 879.)
 2. **Rows are routed on emission, never regrouped.** The kernel's append step
-   knows each emitted row's outcome (per body) and class values (output
-   fields), so it appends the row straight into the NEXT frame's bucket.
+   knows each emitted row's outcome (per body), so it appends the row
+   straight into the NEXT frame's bucket.
    `regroup_and_merge`, `partition_pm1`, `frame::regroup`,
    `collapse_uniform_cols`, `clone_block`-per-group: gone.
 3. **Canonicalization is precomputed per outcome shape.** The accumulator
@@ -37,8 +40,11 @@ regrouping, and 17k checkpoint files per frame.
 5. **Dedup happens once, at the door.** `visited.insert(key, cell)` decides
    whether an emitted row is appended at all. `seen` stays as the cheap
    pre-filter for same-source re-emissions.
-6. **Checkpoint per bucket**, rows sorted by cell with a cell -> row-range
-   index, so the backward loads "rows in these cells" as range reads.
+6. **Checkpoint per (frame, shape)**, rows sorted by `(cell, key)` with a
+   cell -> row-range index and raw fixed-width columns, so the backward
+   loads "rows in these cells" as range copies out of an mmap. The
+   partition is the search's own: shape (dispatch + row format), cell
+   (locality), frame (write time).
 
 ## Gates (every stage must hold all of them)
 
@@ -64,7 +70,7 @@ regrouping, and 17k checkpoint files per frame.
    per bucket; rows routed into next-frame buckets after emission
    (`frame::route` / `Rt2::append_rows`); the regroup/merge/partition
    machinery deleted. Room (1,0) f0-f44: 53 s -> 26 s, 115k calls -> 879,
-   0.4% padding.
+   0.4% padding. The class went 2026-09-12 (invariant 1): 44 calls.
 3. DONE. Emission-time pos-graph edges (`ForwardSink::edges`, the tagged
    `RowSet` for re-emissions from another cell) and the door dedup inside
    the append step (`ForwardSink::visited`).
@@ -73,11 +79,12 @@ regrouping, and 17k checkpoint files per frame.
    and reports a hit flag per input row (the `RowSet` tag is the hit bit
    for re-emissions). Marks and re-run counts identical to the per-lane
    draft, which is deleted.
-5. Checkpoint per bucket + cell index; backward loads by cell range. Gate:
-   ckhash + marks.
-5. Deferred: the backward reads whole bucket files and filters rows by
-   cell (`load_frame_cells`); a per-bucket cell index becomes worth it only
-   if a profile of a deep backward shows the load dominating.
+5. DONE 2026-09-12. Checkpoint per (frame, shape) with a cell index
+   (format v8); the backward loads by cell range and seeds from the win
+   list in each file's header. Forced by the first real-horizon run: the
+   H=89 level-0 backward spent 35 s per iteration decoding every layer
+   <= i (2.5 GB of zstd bincode, ~100M rows) to keep a few hundred rows,
+   ~27 min per horizon against ~1 s of actual re-runs.
 6. DONE. The row key as two kernel roots per body (`Op::CellMix`/`AddW`/
    `Word`, lowered to 64-bit lane ops + `mix64` in AVX-512); the append
    step reads `(h1, h2)` off the output buffer and nothing hashes a row in
