@@ -133,6 +133,13 @@ impl crate::frame::FrameStep for RefEngine {
                 let b = crate::frame::Block::from_state(&leaf)?;
                 let cell_out = b.positions()?[0];
                 let key = b.keys()[0];
+                if let Some(targets) = sink.targets {
+                    sink.emitted += 1;
+                    if targets.contains(&(key.0, key.1, cell_out)) {
+                        sink.hits[lane] = true;
+                    }
+                    continue;
+                }
                 if sink.edges_on {
                     sink.edges.push((cells_in[lane], cell_out));
                 }

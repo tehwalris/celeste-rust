@@ -63,8 +63,11 @@ regrouping, and 17k checkpoint files per frame.
 3. DONE. Emission-time pos-graph edges (`ForwardSink::edges`, the tagged
    `RowSet` for re-emissions from another cell) and the door dedup inside
    the append step (`ForwardSink::visited`).
-4. Wide backward with the target-set consumer and input bitset; the per-lane
-   draft stays until the marks fingerprint matches, then goes. Gate: marks.
+4. DONE. Wide backward: `ForwardSink::backward(targets, width)` runs every
+   unmarked candidate row of a bucket in one call, materializes nothing,
+   and reports a hit flag per input row (the `RowSet` tag is the hit bit
+   for re-emissions). Marks and re-run counts identical to the per-lane
+   draft, which is deleted.
 5. Checkpoint per bucket + cell index; backward loads by cell range. Gate:
    ckhash + marks.
 6. (Perf, after the structure) the row key as two kernel roots, so nothing

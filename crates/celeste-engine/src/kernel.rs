@@ -629,15 +629,18 @@ pub fn zn_tile_flag_at_lanes(
 /// ms) and lost it all again at the door.
 ///
 /// The within-call dedup set: one per outcome per kernel call, keyed by
-/// the row key, carrying one `u32` TAG per key - the source cell of the
-/// row's first emitter, so a re-emission of the same row from a different
-/// cell can record its pos-graph edge without materializing anything
+/// the row key, carrying one `u32` TAG per key - what the row's first
+/// emission learned that a re-emission of the same row needs (its source
+/// cell for the pos-graph in the forward; whether it hit a target in the
+/// backward), so the re-emission never materializes anything
 /// (`compiled::asm_kernel`). Open addressing, grown at 0.75 load.
 pub struct RowSet {
     slots: Vec<(u64, u64, u32, u32)>,
     mask: usize,
     gen: u32,
     len: usize,
+    /// The slot of the last NEW insert, for `set_last_tag`.
+    last: usize,
 }
 
 impl Default for RowSet {
@@ -648,7 +651,7 @@ impl Default for RowSet {
 
 impl RowSet {
     pub fn new() -> Self {
-        RowSet { slots: vec![(0, 0, 0, 0); 4096], mask: 4095, gen: 1, len: 0 }
+        RowSet { slots: vec![(0, 0, 0, 0); 4096], mask: 4095, gen: 1, len: 0, last: 0 }
     }
 
     fn grow(&mut self) {
@@ -667,6 +670,12 @@ impl RowSet {
         }
     }
 
+    /// Overwrite the tag of the last NEW insert (`insert_tagged` -> `None`).
+    #[inline(always)]
+    pub fn set_last_tag(&mut self, tag: u32) {
+        self.slots[self.last].3 = tag;
+    }
+
     /// Insert `k` with `tag`: `None` if it was new, `Some(tag of the first
     /// insert)` if it was already present.
     #[inline(always)]
@@ -681,6 +690,7 @@ impl RowSet {
             if s.2 != self.gen {
                 self.slots[i] = (k.0, k.1, self.gen, tag);
                 self.len += 1;
+                self.last = i;
                 return None;
             }
             if s.0 == k.0 && s.1 == k.1 {

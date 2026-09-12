@@ -274,7 +274,31 @@ impl AsmKernel {
                     // EMISSION-TIME PROVENANCE (plans/buckets.md). The
                     // source of this row is lane `i` of this slice, and
                     // everything that needs to know is told right here:
-                    // the pos-graph edge, and the door dedup.
+                    // the pos-graph edge, the door dedup - or, in backward
+                    // mode, the mark on the input row.
+                    if let Some(targets) = sink.targets {
+                        // BACKWARD: does this output hit a marked state? Then
+                        // input row `lo + i` is marked. Nothing is
+                        // materialized. The `seen` tag is the hit bit, so a
+                        // re-emission from another input row marks it too.
+                        if !no_seen {
+                            if let Some(prev) = seen.insert_tagged(key, 0) {
+                                if prev != 0 {
+                                    sink.hits[lo + i] = true;
+                                }
+                                continue;
+                            }
+                        }
+                        sink.emitted += 1;
+                        let cout = cell_out(body, &outbuf, i, start);
+                        if targets.contains(&(key.0, key.1, cout)) {
+                            sink.hits[lo + i] = true;
+                            if !no_seen {
+                                seen.set_last_tag(1);
+                            }
+                        }
+                        continue;
+                    }
                     if !no_seen {
                         if let Some(first_cin) = seen.insert_tagged(key, cin) {
                             // A re-emission of a row this call already

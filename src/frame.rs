@@ -141,19 +141,6 @@ impl Block {
     pub fn lanes(&self) -> usize {
         self.rt2.width
     }
-
-    /// A one-lane block holding just lane `i`. Used by the DRAFT backward,
-    /// which re-runs one input at a time so every output trivially belongs
-    /// to it (no provenance needed). The wide+lane-bitmask version replaces
-    /// this.
-    pub fn lane(&self, i: usize) -> Option<Block> {
-        if i >= self.lanes() {
-            return None;
-        }
-        let mut rt2 = self.rt2.slice_lanes(i, i + 1);
-        rt2.row_keys = vec![self.rt2.row_keys[i]];
-        Some(Block { rt2 })
-    }
 }
 
 /// Route a block's rows into next frame's BUCKETS: one bucket per
@@ -199,11 +186,36 @@ pub struct ForwardSink<'a> {
     /// Rows emitted after the step's within-call dedup (the raw fan-out).
     pub emitted: u64,
     pub out: Vec<Rt2>,
+    /// BACKWARD MODE: the marked `(shape, content, cell)` set at frame i+1.
+    /// When set, the step materializes NOTHING; an emitted row that is in
+    /// the set marks its INPUT row in `hits`. Provenance consumed at
+    /// emission, as in the forward - the step's within-call dedup carries
+    /// "hit" as its tag so a re-emission from another input row marks that
+    /// row too.
+    pub targets: Option<&'a rustc_hash::FxHashSet<(u64, u64, u32)>>,
+    /// Backward mode: one flag per input row of the block being run.
+    pub hits: Vec<bool>,
 }
 
 impl<'a> ForwardSink<'a> {
     pub fn new(visited: Option<&'a mut Visited>, edges_on: bool) -> Self {
-        ForwardSink { visited, edges_on, edges: Vec::new(), emitted: 0, out: Vec::new() }
+        ForwardSink {
+            visited,
+            edges_on,
+            edges: Vec::new(),
+            emitted: 0,
+            out: Vec::new(),
+            targets: None,
+            hits: Vec::new(),
+        }
+    }
+
+    /// The backward's sink for a block of `width` candidate rows.
+    pub fn backward(targets: &'a rustc_hash::FxHashSet<(u64, u64, u32)>, width: usize) -> Self {
+        let mut s = Self::new(None, false);
+        s.targets = Some(targets);
+        s.hits = vec![false; width];
+        s
     }
 }
 
@@ -400,12 +412,11 @@ pub struct BackwardResult {
 /// that can step into a marked cell. The marked set is the cross-rem filter for
 /// the next precision level.
 ///
-/// DRAFT - NOT BLESSED. Two shortcuts, both correctness-preserving and both
-/// flagged for follow-up: (1) it re-runs ONE input lane at a time, so every
-/// output belongs to that input and no provenance is needed - the wide call with
-/// a per-lane bitmask is the optimization; (2) marks are matched by key, held as
-/// a sharded set rather than a dense per-shard bitmask. Built behind the
-/// reference to be validated before it is trusted.
+/// The re-run is WIDE: every unmarked candidate row of a bucket goes through
+/// the frame step in one call, in backward mode (`ForwardSink::backward`) -
+/// the step materializes nothing and reports, per input row, whether any of
+/// its outputs is a target (provenance consumed at emission,
+/// plans/buckets.md). Marks are matched by key.
 pub fn backward_run(
     engine: &mut dyn FrameStep,
     dir: &std::path::Path,
@@ -464,28 +475,24 @@ pub fn backward_walk(
 
         let mut new_frontier: Vec<((u64, u64), u32)> = Vec::new();
         for block in load_frame_cells(dir, i, &cand_cells)? {
+            // Only the rows not already marked by another target need the
+            // re-run.
             let cells = block.positions()?;
-            for lane in 0..block.lanes() {
-                let (key, cell) = (block.keys()[lane], cells[lane]);
-                if marked.contains(key, cell) {
-                    continue; // already marked by another target - skip the re-run
-                }
-                let Some(single) = block.lane(lane) else { continue };
-                reruns += 1;
-                let mut hit = false;
-                let mut sink = ForwardSink::new(None, false);
-                engine.run(single, &mut sink)?;
-                'outs: for out in sink.out.into_iter().map(Block::from_rt2) {
-                    let oc = out.positions()?;
-                    for (k, &c) in out.keys().iter().zip(&oc) {
-                        if targets.contains(&(k.0, k.1, c)) {
-                            hit = true;
-                            break 'outs;
-                        }
-                    }
-                }
-                if hit && marked.insert(key, cell) {
-                    new_frontier.push((key, cell));
+            let mask: Vec<bool> = block
+                .keys()
+                .iter()
+                .zip(&cells)
+                .map(|(k, &c)| !marked.contains(*k, c))
+                .collect();
+            let Some(cand) = block.keep(&mask) else { continue };
+            let keys: Vec<(u64, u64)> = cand.keys().to_vec();
+            let cells = cand.positions()?;
+            reruns += cand.lanes() as u64;
+            let mut sink = ForwardSink::backward(&targets, cand.lanes());
+            engine.run(cand, &mut sink)?;
+            for (lane, hit) in sink.hits.iter().enumerate() {
+                if *hit && marked.insert(keys[lane], cells[lane]) {
+                    new_frontier.push((keys[lane], cells[lane]));
                 }
             }
         }
