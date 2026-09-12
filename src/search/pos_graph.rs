@@ -224,7 +224,7 @@ impl PosGraph {
 /// frame of room (0,0) that is the wrong shape. Instead each destination
 /// keeps a small sorted set, which is what the pairs actually are: 47
 /// sources per destination on room (1,0).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct PosGraphBuilder {
     /// Destination cell -> its (small) sorted set of source cells.
     by_dst: rustc_hash::FxHashMap<u32, Vec<u32>>,
@@ -314,6 +314,14 @@ impl PosObserver {
     pub fn build(self) -> PosGraph {
         self.flush();
         self.graph.into_inner().expect("pos observer").build()
+    }
+
+    /// The table as recorded so far, leaving the observer recording - the
+    /// level-0 forward is EXTENDED across horizons and the backward wants
+    /// the graph at each.
+    pub fn snapshot(&self) -> PosGraph {
+        self.flush();
+        self.graph.lock().expect("pos observer").clone().build()
     }
 }
 

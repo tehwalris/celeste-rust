@@ -1,4 +1,0 @@
-[ladder] level 0 (Bits(0)): win at f29, marked 48 states (fingerprint 3e65b1d0c72c8c9d), 525 re-runs
-[ladder] level 1 (Bits(1)): win at f29, marked 40 states (fingerprint 0d60c9433da203d4), 34 re-runs
-[ladder] level 2 (Exact): NO WIN by 35 -> Refuted
-no win confirmed up to horizon 35

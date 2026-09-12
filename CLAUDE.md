@@ -16,10 +16,13 @@ Read these before doing anything substantial:
 - `src/frame.rs` - the rebuilt search itself (~950 lines): `Block`, the
   `FrameStep` trait (implemented by the compiled `FrameEngine` and the
   reference `RefEngine`), `ForwardSink` (what a frame step emits into),
-  `forward_run` / `forward_resume` / `backward_run` / `ladder_at_horizon` /
-  `find_optimum`, the precision ladder, per-bucket checkpoints, and
-  `MarkFilter` (the cross-precision link). `plans/buckets.md` is the
-  design of the loop's data flow (2026-09-12).
+  `ForwardState` (a forward that is EXTENDED frame by frame) /
+  `backward_run` / `Ladder` / `find_optimum`, the precision ladder,
+  per-bucket checkpoints, and `MarkFilter` (the cross-precision link).
+  `plans/buckets.md` is the design of the loop's data flow (2026-09-12).
+  Every level runs TO the horizon and the backward seeds from the wins at
+  every frame <= it; level 0 persists across horizons and is extended by
+  one frame per step (2026-09-12).
 - `BENCHMARK_DATA.md` - performance baseline, but STALE: every number in it was
   measured against the pre-rebuild search path (the now-deleted
   `run.rs` / `sweep*.rs`) and needs re-benchmarking for `rewrite search`. Keep
@@ -289,9 +292,9 @@ extract are DELETED; what is left in `celeste-rust` is laid out as:
 
 ```
 src/frame.rs   the search: `Block` (an `Rt2` with its key column), the
-               `FrameStep` trait + `ForwardSink`, forward_run / forward_resume /
-               backward_run / ladder_at_horizon / find_optimum, the precision
-               ladder, bucket routing, per-bucket checkpoints, MarkFilter
+               `FrameStep` trait + `ForwardSink`, ForwardState (extend) /
+               backward_run / Ladder / find_optimum, the precision ladder,
+               bucket routing, per-bucket checkpoints, MarkFilter
 src/search/    checkpoint (block serialization), pos_graph (the position
                graph + the block's position column)
 src/trace/     the AST tracer (Lua -> transpile::graph::Graph) and the reference
@@ -353,7 +356,11 @@ tests in `transpile::asm::tests`, and `rewrite ckhash` - the per-frame
 `gates/ckhash_room10_f000-044.txt` (room (1,0), level 0, f0-f44, taken
 2026-09-07 before the block rewrite and reproduced after it and after the
 cleanup): `rewrite forward --to 44 --room 1,0 && rewrite ckhash --to 44
---room 1,0 | diff - gates/ckhash_room10_f000-044.txt` must be empty.
+--room 1,0 | diff - gates/ckhash_room10_f000-044.txt` must be empty. The
+same run's `posgraph` line must equal `gates/posgraph_room10_f044.txt`, and
+`rewrite search --from 29 --to 35 --maxk 1 --win-at 9,101` must reproduce
+`gates/marks_room10_win9-101_h29-33.txt` (the backward's marked sets per
+horizon and level, ending in `OPTIMAL win frame: 33`).
 
 `crates/celeste-names/src/gen.rs` is FROZEN, not generated. Its generator
 (`transpile::names`) walked the rewritten IR and was deleted with the walk
@@ -370,7 +377,7 @@ if the Lua changes) may be APPENDED by hand, never inserted.
 # --checkpoint-dir defaults to /var/tmp/celeste-checkpoints (on disk, not the
 # tmpfs). --win-at x,y forces a cheap synthetic win.
 ./safe-run.sh -- ./target/release/rewrite search \
-    --room 1,0 --from 94 [--to H] [--maxk 15] [--checkpoint-dir DIR]
+    --room 1,0 [--from H0] [--to H] [--maxk 15] [--checkpoint-dir DIR]
 
 # One forward pass at one precision with the per-frame timing line
 # (engine / filter / visited / route / checkpoint ms, lanes in/raw/kept, RSS)

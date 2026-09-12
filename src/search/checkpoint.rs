@@ -101,6 +101,26 @@ pub fn save_block_to(path: &Path, rt2: &Rt2) -> Result<()> {
     Ok(())
 }
 
+/// Save any serializable value under the same header + zstd stream.
+pub fn save_value_to<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_file_name(format!(
+        "tmp-{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("value.bin")
+    ));
+    write_bin(&tmp, |w| bincode::serialize_into(w, value).context("serializing"))?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Load a value saved by `save_value_to`.
+pub fn load_value_from<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let r = read_bin_header_len(path)?;
+    bincode::deserialize_from(r).with_context(|| format!("deserializing {}", path.display()))
+}
+
 /// Load a block saved by `save_block_to`, attached to the start room's cart
 /// and collision cache.
 pub fn load_block_from(path: &Path) -> Result<Rt2> {

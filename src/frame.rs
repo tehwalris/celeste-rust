@@ -116,6 +116,14 @@ impl Block {
         })
     }
 
+    /// A new block holding just `rows` of this one (copies only those rows).
+    pub fn select(&self, rows: &[u32]) -> Block {
+        let mut b = celeste_engine::slots::reshape(&self.rt2, 0);
+        b.shape_hash = self.rt2.shape_hash;
+        b.append_rows(&self.rt2, rows);
+        Block { rt2: b }
+    }
+
     /// Keep only the lanes whose mask entry is true, as a new block; `None` if
     /// none survive. The one splitting primitive the loop needs (dedup at the
     /// door repacks with this).
@@ -251,9 +259,23 @@ impl<'a> MarkFilter<'a> {
     /// still needs them. Paid only at levels >= 1, whose frontiers the
     /// filter itself keeps small.
     pub fn allowed(&self, block: &Block) -> Result<Vec<bool>> {
-        use crate::interpreter::abstraction::{
-            apply_conservative_widenings, make_state_abstract_rem,
-        };
+        let (keys, cells) = widened_keys(block, self.coarser)?;
+        Ok(keys
+            .iter()
+            .zip(&cells)
+            .map(|(k, &c)| self.marked.contains(*k, c))
+            .collect())
+    }
+}
+
+/// Each lane's `(key, cell)` after widening to `coarser` - what `MarkFilter`
+/// looks up. Public for the ladder diagnostics.
+pub fn widened_keys(
+    block: &Block,
+    coarser: crate::interpreter::abstraction::RemPrecision,
+) -> Result<(Vec<(u64, u64)>, Vec<u32>)> {
+    use crate::interpreter::abstraction::{apply_conservative_widenings, make_state_abstract_rem};
+    {
         let lanes = block.lanes();
         // The COMPLETE coarsening the coarse engine bakes into its states - rem
         // bucketing AND the conservative widenings (p_jump/p_dash/fruit), then
@@ -261,7 +283,7 @@ impl<'a> MarkFilter<'a> {
         // widenings, an Exact state keeps p_jump/p_dash concrete while the coarse
         // marks have them widened, so its coarsened key matches nothing and the
         // winning path is wrongly filtered at the Bits->Exact rung.
-        let mut widened = make_state_abstract_rem(block.to_state(), self.coarser);
+        let mut widened = make_state_abstract_rem(block.to_state(), coarser);
         widened = apply_conservative_widenings(widened);
         widened.gc();
         anyhow::ensure!(
@@ -273,11 +295,7 @@ impl<'a> MarkFilter<'a> {
         );
         let keys = crate::compiled::engine_row_keys(&widened)?;
         let cells = crate::search::pos_graph::state_cells(&widened)?;
-        Ok(keys
-            .iter()
-            .zip(&cells)
-            .map(|(k, &c)| self.marked.contains(*k, c))
-            .collect())
+        Ok((keys, cells))
     }
 }
 
@@ -407,12 +425,25 @@ pub struct BackwardResult {
 }
 
 /// Backward marking - SINGLE PASS, position-narrowed (plans/architecture.md
-/// sentence 8; the horizon-anchored minimal form, no distance DP). From the win
-/// states at `horizon`, walk frames horizon-1..1; a frame-i state is MARKED if
-/// re-running it one frame produces an output that hits a state marked at frame
-/// i+1. Candidates at frame i are narrowed, via the position graph, to the cells
-/// that can step into a marked cell. The marked set is the cross-rem filter for
-/// the next precision level.
+/// sentence 8; the horizon-anchored minimal form, no distance DP). The
+/// marked set is "the states that can reach a win by `horizon`": the
+/// filter the next precision level needs at that horizon.
+///
+/// It is a reverse BFS from ALL the win states, `horizon - 1` steps deep,
+/// with the frame as the anchor. The forward dedups across frames, so
+/// checkpoint f holds the states FIRST reached at f - a BFS distance
+/// layer, not "the states at frame f" - and a state reached at or before
+/// frame i may be at frame i. So: the initial targets are the wins of
+/// EVERY layer <= horizon; at iteration i the candidates are the unmarked
+/// rows of every layer <= i (narrowed to the cells that can step into a
+/// target), re-run against the marks added at iteration i+1. A state marked
+/// at iteration i lies in a layer <= i and is `horizon - i` steps from a
+/// win: a path of length <= horizon. Complete for the same reason: a state
+/// that wins by the horizon from frame f >= its layer has a marked successor
+/// at the right iteration. (Two earlier forms of this walk were wrong:
+/// candidates from layer i only, and wins injected at their own layer's
+/// iteration - each missed every path link whose other end was first reached
+/// earlier, and refuted achievable horizons.)
 ///
 /// The re-run is WIDE: every unmarked candidate row of a bucket goes through
 /// the frame step in one call, in backward mode (`ForwardSink::backward`) -
@@ -425,45 +456,56 @@ pub fn backward_run(
     horizon: u32,
     graph: &crate::search::pos_graph::PosGraph,
 ) -> Result<BackwardResult> {
-    // Seed: the win lanes at the horizon become the first frontier (= the
-    // frame-`horizon` marks).
-    let mut seed: Vec<((u64, u64), u32)> = Vec::new();
-    for block in load_frame(dir, horizon)? {
-        let cells = block.positions()?;
-        let wins = block.wins()?;
-        for ((k, &c), w) in block.keys().iter().zip(&cells).zip(wins) {
-            if w {
-                seed.push((*k, c));
+    // Seeds: the win states of every layer 1..=horizon.
+    let mut seeds: Vec<((u64, u64), u32)> = Vec::new();
+    for f in 1..=horizon {
+        for block in load_frame(dir, f)? {
+            let cells = block.positions()?;
+            let wins = block.wins()?;
+            for ((k, &c), w) in block.keys().iter().zip(&cells).zip(wins) {
+                if w {
+                    seeds.push((*k, c));
+                }
             }
         }
     }
-    backward_walk(engine, dir, horizon, graph, seed)
+    backward_walk(engine, dir, horizon, graph, seeds)
 }
 
-/// The backward walk itself, given a seed frontier (the marks at `horizon`).
-/// Factored out so a test can seed it directly; `backward_run` seeds from the
-/// win lanes.
+/// The backward walk itself, given the seeds (the states that count as
+/// marked on their own, i.e. the wins, from any layer). Factored out so a
+/// test can seed it directly; `backward_run` seeds from the win lanes.
 pub fn backward_walk(
     engine: &mut dyn FrameStep,
     dir: &std::path::Path,
     horizon: u32,
     graph: &crate::search::pos_graph::PosGraph,
-    seed: Vec<((u64, u64), u32)>,
+    seeds: Vec<((u64, u64), u32)>,
 ) -> Result<BackwardResult> {
     use rustc_hash::FxHashSet;
 
     let mut marked = Visited::new();
     let mut reruns: u64 = 0;
+    // `frontier` is the marks added in the previous iteration - the only
+    // targets a candidate's successor can newly hit (single pass).
     let mut frontier: Vec<((u64, u64), u32)> = Vec::new();
-    for (k, c) in seed {
+    for (k, c) in seeds {
         if marked.insert(k, c) {
             frontier.push((k, c));
         }
     }
+    // The layers 0..=horizon-1, in memory: iteration i needs every layer
+    // <= i, and drops layer i+1 as it passes it.
+    let t = std::time::Instant::now();
+    let mut layers: Vec<Vec<Block>> = Vec::with_capacity(horizon as usize);
+    for f in 0..horizon {
+        layers.push(load_frame(dir, f)?);
+    }
+    crate::metrics::record("bwd.load", t.elapsed());
 
-    // Walk back. `frontier` is always the marks added at frame i+1 - the only
-    // targets a frame-i state's successor may legitimately hit (single pass).
     for i in (1..horizon).rev() {
+        layers.truncate(i as usize + 1);
+        let t_frame = std::time::Instant::now();
         // Candidate cells = pos-graph predecessors of the target (marked) cells.
         let mut cand_cells: FxHashSet<u32> = FxHashSet::default();
         for &(_, c) in &frontier {
@@ -475,25 +517,32 @@ pub fn backward_walk(
         let targets: FxHashSet<(u64, u64, u32)> =
             frontier.iter().map(|&(k, c)| (k.0, k.1, c)).collect();
 
-        let t_frame = std::time::Instant::now();
         let mut new_frontier: Vec<((u64, u64), u32)> = Vec::new();
         let (mut t_load, mut t_run) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         let (mut loaded, mut frame_reruns) = (0usize, 0u64);
         let t = std::time::Instant::now();
-        let blocks = load_frame_cells(dir, i, &cand_cells)?;
+        // Candidates: unmarked rows of every layer <= i in the narrowed cells.
+        let mut cands: Vec<Block> = Vec::new();
+        for layer in &layers {
+            for block in layer {
+                let cells = block.positions()?;
+                let mask: Vec<bool> = block
+                    .keys()
+                    .iter()
+                    .zip(&cells)
+                    .map(|(k, &c)| cand_cells.contains(&c) && !marked.contains(*k, c))
+                    .collect();
+                if !mask.iter().any(|&m| m) {
+                    continue;
+                }
+                loaded += block.lanes();
+                let rows: Vec<u32> =
+                    mask.iter().enumerate().filter_map(|(r, &m)| m.then_some(r as u32)).collect();
+                cands.push(block.select(&rows));
+            }
+        }
         t_load += t.elapsed();
-        for block in blocks {
-            loaded += block.lanes();
-            // Only the rows not already marked by another target need the
-            // re-run.
-            let cells = block.positions()?;
-            let mask: Vec<bool> = block
-                .keys()
-                .iter()
-                .zip(&cells)
-                .map(|(k, &c)| !marked.contains(*k, c))
-                .collect();
-            let Some(cand) = block.keep(&mask) else { continue };
+        for cand in cands {
             let keys: Vec<(u64, u64)> = cand.keys().to_vec();
             let cells = cand.positions()?;
             frame_reruns += cand.lanes() as u64;
@@ -529,15 +578,21 @@ pub fn backward_walk(
     Ok(BackwardResult { marked, reruns })
 }
 
-/// The forward search driver: from `initial` (frame 0), run frames until a lane
-/// wins or `max_frames` is reached, checkpointing each frontier. Returns the
-/// winning frame, or `None` if the frontier empties or the horizon is hit with
-/// no win.
-///
-/// The whole outer forward loop is this: seed the visited set + checkpoint frame
-/// 0, then repeatedly `forward_frame` (which dedups at the door) and checkpoint
-/// the survivors. No chunking, no phased/parallel variants - the frame step and
-/// `Visited` hide everything else.
+/// The forward search driver's state: the frontier, the visited set and
+/// the position-graph observer, held in memory so a forward can be
+/// EXTENDED frame by frame (the outer loop's "one more frame at rem zero")
+/// rather than rerun. Every frame is checkpointed as it is produced.
+pub struct ForwardState {
+    frontier: Vec<Block>,
+    visited: Visited,
+    observer: Option<crate::search::pos_graph::PosObserver>,
+    /// The last frame computed (and checkpointed).
+    pub frames: u32,
+    /// The first frame a lane won, if any so far.
+    pub win_frame: Option<u32>,
+}
+
+/// What a forward run reports.
 pub struct ForwardResult {
     /// The frame a lane first won, if any.
     pub win_frame: Option<u32>,
@@ -547,6 +602,77 @@ pub struct ForwardResult {
     pub pos_graph: Option<crate::search::pos_graph::PosGraph>,
 }
 
+impl ForwardState {
+    /// Frame 0: seed the visited set from `initial`, checkpoint it, start
+    /// recording the position graph if `record`.
+    pub fn start(initial: Vec<Block>, dir: &std::path::Path, record: bool) -> Result<Self> {
+        let mut visited = Visited::new();
+        for b in &initial {
+            let cells = b.positions()?;
+            for (k, c) in b.keys().iter().zip(&cells) {
+                visited.insert(*k, *c);
+            }
+        }
+        checkpoint_frontier(dir, 0, &initial)?;
+        Ok(ForwardState {
+            frontier: initial,
+            visited,
+            observer: record.then(crate::search::pos_graph::PosObserver::default),
+            frames: 0,
+            win_frame: None,
+        })
+    }
+
+    /// Compute and checkpoint frames `frames+1 ..= to`. A win does NOT stop
+    /// the run: a horizon is a bound on the win frame, and the backward
+    /// needs every frame up to it (its seeds are the wins at each). Only an
+    /// empty frontier stops it.
+    pub fn extend(
+        &mut self,
+        engine: &mut dyn FrameStep,
+        dir: &std::path::Path,
+        to: u32,
+        filter: Option<&MarkFilter>,
+    ) -> Result<()> {
+        while self.frames < to && !self.frontier.is_empty() {
+            let frame = self.frames + 1;
+            let t_frame = std::time::Instant::now();
+            let frontier = std::mem::take(&mut self.frontier);
+            let (next, won, st) = forward_frame(
+                engine,
+                frontier,
+                &mut self.visited,
+                block_wins,
+                self.observer.as_ref(),
+                filter,
+            )?;
+            let t = std::time::Instant::now();
+            checkpoint_frontier(dir, frame, &next)?;
+            let t_ckpt = t.elapsed();
+            let t = std::time::Instant::now();
+            if let Some(o) = self.observer.as_ref() {
+                o.flush();
+            }
+            let t_pos = t.elapsed();
+            log_frame(frame, &st, t_ckpt, t_pos, t_frame.elapsed(), self.visited.len());
+            self.frames = frame;
+            if won && self.win_frame.is_none() {
+                self.win_frame = Some(frame);
+                eprintln!("[fwd] first win at f{frame}");
+            }
+            self.frontier = next;
+        }
+        Ok(())
+    }
+
+    /// The position graph recorded so far (None when not recording).
+    pub fn pos_graph(&self) -> Option<crate::search::pos_graph::PosGraph> {
+        self.observer.as_ref().map(|o| o.snapshot())
+    }
+}
+
+/// A whole forward run in one call: frame 0 from `initial`, then frames
+/// `1..=max_frames`.
 pub fn forward_run(
     engine: &mut dyn FrameStep,
     initial: Vec<Block>,
@@ -555,94 +681,9 @@ pub fn forward_run(
     record: bool,
     filter: Option<&MarkFilter>,
 ) -> Result<ForwardResult> {
-    let observer = record.then(crate::search::pos_graph::PosObserver::default);
-
-    let mut visited = Visited::new();
-    for b in &initial {
-        let cells = b.positions()?;
-        for (k, c) in b.keys().iter().zip(&cells) {
-            visited.insert(*k, *c);
-        }
-    }
-    checkpoint_frontier(dir, 0, &initial)?;
-    drive_forward(engine, dir, initial, visited, observer, 1, max_frames, filter)
-}
-
-/// Resume/extend a checkpointed forward: from `from_frame` (whose frontier is on
-/// disk) out to `to_frame`, rebuilding the visited set from the checkpoints
-/// 0..=from_frame. This is the outer loop's cheap rem-0 EXTENSION path - bump
-/// the horizon by re-running only the tail, not the whole search.
-///
-/// record=false for now: seeding the pos-graph across a resume is a follow-up,
-/// and the outer loop rebuilds the finer levels fresh anyway. So a resumed run
-/// returns no pos_graph.
-pub fn forward_resume(
-    engine: &mut dyn FrameStep,
-    dir: &std::path::Path,
-    from_frame: u32,
-    to_frame: u32,
-    filter: Option<&MarkFilter>,
-) -> Result<ForwardResult> {
-    let mut visited = Visited::new();
-    for f in 0..=from_frame {
-        for b in load_frame(dir, f)? {
-            let cells = b.positions()?;
-            for (k, c) in b.keys().iter().zip(&cells) {
-                visited.insert(*k, *c);
-            }
-        }
-    }
-    let frontier = load_frame(dir, from_frame)?;
-    drive_forward(engine, dir, frontier, visited, None, from_frame + 1, to_frame, filter)
-}
-
-/// The shared forward loop: from `frontier` (the states at `start_frame - 1`),
-/// compute and checkpoint frames `start_frame..=end_frame`, stopping early on a
-/// win or an empty frontier. `visited` and `observer` are already seeded.
-#[allow(clippy::too_many_arguments)]
-fn drive_forward(
-    engine: &mut dyn FrameStep,
-    dir: &std::path::Path,
-    mut frontier: Vec<Block>,
-    mut visited: Visited,
-    observer: Option<crate::search::pos_graph::PosObserver>,
-    start_frame: u32,
-    end_frame: u32,
-    filter: Option<&MarkFilter>,
-) -> Result<ForwardResult> {
-    let mut last = start_frame.saturating_sub(1);
-    let mut win_frame = None;
-    for frame in start_frame..=end_frame {
-        let t_frame = std::time::Instant::now();
-        let (next, won, st) = forward_frame(
-            engine,
-            frontier,
-            &mut visited,
-            block_wins,
-            observer.as_ref(),
-            filter,
-        )?;
-        let t = std::time::Instant::now();
-        checkpoint_frontier(dir, frame, &next)?;
-        let t_ckpt = t.elapsed();
-        let t = std::time::Instant::now();
-        if let Some(o) = observer.as_ref() {
-            o.flush();
-        }
-        let t_pos = t.elapsed();
-        log_frame(frame, &st, t_ckpt, t_pos, t_frame.elapsed(), visited.len());
-        last = frame;
-        if won {
-            win_frame = Some(frame);
-            break;
-        }
-        if next.is_empty() {
-            break;
-        }
-        frontier = next;
-    }
-    let pos_graph = observer.map(|o| o.build());
-    Ok(ForwardResult { win_frame, frames: last, pos_graph })
+    let mut st = ForwardState::start(initial, dir, record)?;
+    st.extend(engine, dir, max_frames, filter)?;
+    Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
 /// One line per forward frame on stderr, plus the phase totals under
@@ -788,6 +829,24 @@ impl Visited {
     pub fn len(&self) -> usize {
         self.shards.values().map(|s| s.len()).sum()
     }
+
+    /// Persist the set as `(shape, cell, content)` triples.
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        let mut v: Vec<(u64, u32, u64)> = Vec::with_capacity(self.len());
+        for ((shape, cell), keys) in &self.shards {
+            v.extend(keys.iter().map(|&k| (*shape, *cell, k)));
+        }
+        crate::search::checkpoint::save_value_to(path, &v)
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let v: Vec<(u64, u32, u64)> = crate::search::checkpoint::load_value_from(path)?;
+        let mut out = Self::new();
+        for (shape, cell, k) in v {
+            out.insert((shape, k), cell);
+        }
+        Ok(out)
+    }
     pub fn is_empty(&self) -> bool {
         self.shards.values().all(|s| s.is_empty())
     }
@@ -805,86 +864,173 @@ pub enum HorizonOutcome {
     Refuted { level: usize },
 }
 
-/// The INNER ladder at a FIXED horizon (semantics pinned with Philippe,
-/// 2026-08-30). Run every precision level in `precisions` (coarsest first,
-/// ending at `RemPrecision::Exact` = fully concrete). Each level's forward is
-/// filtered by the previous, coarser level's marked set. The instant a level
-/// finds no win by `horizon`, return `Refuted` - the horizon is excluded. Only
-/// if EVERY level, through concrete, wins by `horizon` is it `Confirmed`.
+/// The precision ladder over rising horizons (semantics pinned with Philippe
+/// 2026-08-30; incremental level 0 2026-09-12).
 ///
-/// Engine-agnostic: the caller supplies `make_engine(precision)` and
-/// `make_initial()`, so this composes the tested forward_run / backward_run /
-/// MarkFilter without naming the compiled engine.
+/// At a horizon H, every level in `precisions` (coarsest first, ending at
+/// `RemPrecision::Exact` = fully concrete) runs its forward TO H, filtered
+/// by the previous level's marks, and its backward marks every state that
+/// can reach a win by H. The instant a level has no win by H the horizon is
+/// `Refuted` - a coarser level over-approximates concrete reachability, so
+/// that soundly excludes it. Only if EVERY level wins by H is it `Confirmed`.
 ///
-/// NOT YET VALIDATED end to end (needs a real winning room + the compiled engine
-/// at each precision); the shape is correct, and the trace extraction at the
-/// concrete level is still to add.
+/// Level 0 is PERSISTENT across horizons: its forward is extended by the
+/// frames the new horizon adds (`ForwardState::extend`), never rerun, and
+/// its backward is recomputed from the extended checkpoints. The finer
+/// levels are filtered by marks that change with H, so they rerun.
+pub struct Ladder<'a, E, I>
+where
+    E: FnMut(crate::interpreter::abstraction::RemPrecision) -> Result<Box<dyn FrameStep>>,
+    I: FnMut() -> Result<Vec<Block>>,
+{
+    make_engine: E,
+    make_initial: I,
+    base_dir: &'a std::path::Path,
+    precisions: &'a [crate::interpreter::abstraction::RemPrecision],
+    level0: Option<(Box<dyn FrameStep>, ForwardState)>,
+}
+
+impl<'a, E, I> Ladder<'a, E, I>
+where
+    E: FnMut(crate::interpreter::abstraction::RemPrecision) -> Result<Box<dyn FrameStep>>,
+    I: FnMut() -> Result<Vec<Block>>,
+{
+    pub fn new(
+        make_engine: E,
+        make_initial: I,
+        base_dir: &'a std::path::Path,
+        precisions: &'a [crate::interpreter::abstraction::RemPrecision],
+    ) -> Self {
+        Ladder { make_engine, make_initial, base_dir, precisions, level0: None }
+    }
+
+    fn level_dir(&self, horizon: u32, level: usize) -> std::path::PathBuf {
+        if level == 0 {
+            self.base_dir.join("level00")
+        } else {
+            self.base_dir.join(format!("h{:03}", horizon)).join(format!("level{:02}", level))
+        }
+    }
+
+    /// Extend level 0 to `horizon` (starting it if needed) and report its
+    /// first win frame, if it has one by then.
+    pub fn extend_level0(&mut self, horizon: u32) -> Result<Option<u32>> {
+        anyhow::ensure!(!self.precisions.is_empty(), "an empty ladder");
+        // The kernel set an engine dispatches to follows the PROCESS-GLOBAL
+        // rem precision (`asm_kernel::registry`), and a finer level ran
+        // since level 0 last did: say which level is running before it runs.
+        crate::interpreter::abstraction::set_rem_precision(self.precisions[0]);
+        let dir = self.level_dir(horizon, 0);
+        if self.level0.is_none() {
+            let engine = (self.make_engine)(self.precisions[0])?;
+            let state = ForwardState::start((self.make_initial)()?, &dir, true)?;
+            self.level0 = Some((engine, state));
+        }
+        let (engine, state) = self.level0.as_mut().expect("just started");
+        state.extend(engine.as_mut(), &dir, horizon, None)?;
+        Ok(state.win_frame.filter(|&h| h <= horizon))
+    }
+
+    pub fn at_horizon(&mut self, horizon: u32) -> Result<HorizonOutcome> {
+        let mut prev: Option<(Visited, crate::interpreter::abstraction::RemPrecision)> = None;
+        for level in 0..self.precisions.len() {
+            let precision = self.precisions[level];
+            let dir = self.level_dir(horizon, level);
+            // The level's forward to `horizon`: level 0 extended in place,
+            // a finer level fresh, under the previous level's marks.
+            let mut fresh: Option<Box<dyn FrameStep>> = None;
+            let (win, graph) = if level == 0 {
+                let win = self.extend_level0(horizon)?;
+                let state = &self.level0.as_ref().expect("started by extend_level0").1;
+                (win, state.pos_graph().expect("level 0 records"))
+            } else {
+                crate::interpreter::abstraction::set_rem_precision(precision);
+                let mut engine = (self.make_engine)(precision)?;
+                let filter = prev.as_ref().map(|(m, p)| MarkFilter::new(m, *p));
+                let fwd = forward_run(
+                    engine.as_mut(),
+                    (self.make_initial)()?,
+                    &dir,
+                    horizon,
+                    true,
+                    filter.as_ref(),
+                )?;
+                fresh = Some(engine);
+                (fwd.win_frame, fwd.pos_graph.expect("record mode always builds the pos graph"))
+            };
+            let Some(h) = win else {
+                eprintln!("[ladder] h{horizon} level {level} ({precision:?}): NO WIN -> Refuted");
+                return Ok(HorizonOutcome::Refuted { level });
+            };
+            let engine: &mut dyn FrameStep = match fresh.as_mut() {
+                Some(e) => e.as_mut(),
+                None => self.level0.as_mut().expect("level 0").0.as_mut(),
+            };
+            let bwd = backward_run(engine, &dir, horizon, &graph)?;
+            bwd.marked.save(&marks_path(self.base_dir, horizon, level))?;
+            let (n, fp) = bwd.marked.fingerprint();
+            eprintln!(
+                "[ladder] h{horizon} level {level} ({precision:?}): first win f{h}, marked {n} states \
+                 (fingerprint {fp:016x}), {} re-runs",
+                bwd.reruns
+            );
+            prev = Some((bwd.marked, precision));
+        }
+        Ok(HorizonOutcome::Confirmed)
+    }
+}
+
+/// Where a level's marked set at a horizon is saved (level 0's checkpoints
+/// are shared across horizons; its marks are not).
+pub fn marks_path(base_dir: &std::path::Path, horizon: u32, level: usize) -> std::path::PathBuf {
+    base_dir.join(format!("h{:03}", horizon)).join(format!("level{:02}.marks.bin", level))
+}
+
+/// The inner ladder at ONE horizon, from scratch - the tests' entry point;
+/// the search uses `Ladder` so level 0 persists across horizons.
 pub fn ladder_at_horizon(
-    mut make_engine: impl FnMut(
+    make_engine: impl FnMut(
         crate::interpreter::abstraction::RemPrecision,
     ) -> Result<Box<dyn FrameStep>>,
-    mut make_initial: impl FnMut() -> Result<Vec<Block>>,
+    make_initial: impl FnMut() -> Result<Vec<Block>>,
     base_dir: &std::path::Path,
     horizon: u32,
     precisions: &[crate::interpreter::abstraction::RemPrecision],
 ) -> Result<HorizonOutcome> {
-    let mut prev: Option<(Visited, crate::interpreter::abstraction::RemPrecision)> = None;
-    for (level, &precision) in precisions.iter().enumerate() {
-        let mut engine = make_engine(precision)?;
-        let level_dir = base_dir.join(format!("level{:02}", level));
-        let filter = prev.as_ref().map(|(m, p)| MarkFilter::new(m, *p));
-        let fwd = forward_run(
-            engine.as_mut(),
-            make_initial()?,
-            &level_dir,
-            horizon,
-            true,
-            filter.as_ref(),
-        )?;
-        let Some(h) = fwd.win_frame else {
-            eprintln!("[ladder] level {level} ({precision:?}): NO WIN by {horizon} -> Refuted");
-            return Ok(HorizonOutcome::Refuted { level });
-        };
-        let graph = fwd
-            .pos_graph
-            .as_ref()
-            .expect("record mode always builds the pos graph");
-        let bwd = backward_run(engine.as_mut(), &level_dir, h, graph)?;
-        let (n, fp) = bwd.marked.fingerprint();
-        eprintln!(
-            "[ladder] level {level} ({precision:?}): win at f{h}, marked {n} states \
-             (fingerprint {fp:016x}), {} re-runs",
-            bwd.reruns
-        );
-        prev = Some((bwd.marked, precision));
-    }
-    Ok(HorizonOutcome::Confirmed)
+    Ladder::new(make_engine, make_initial, base_dir, precisions).at_horizon(horizon)
 }
 
-/// The OUTER loop: the minimal winning frame. From `first_win` (rem-0's first
-/// win frame) step the horizon up by one until `ladder_at_horizon` Confirms it -
-/// that horizon is the abstract optimum, and (once trace extraction lands) the
-/// concrete level's winning trace is the witness. `None` if nothing confirms by
-/// `max_horizon`.
-///
-/// FOLLOW-UP: the rem-0 forward should be EXTENDED by one frame per step, not
-/// rerun from scratch (Philippe: "one more frame at rem zero"); here every
-/// horizon reruns fresh. Correctness first, the incremental resume after.
+/// The OUTER loop: the minimal winning frame. Level 0 is extended until it
+/// first wins (the abstract lower bound, or `first_win` if that is later);
+/// from there the horizon steps up by one until the ladder Confirms it -
+/// that horizon is the optimum, and (once trace extraction lands) the
+/// concrete level's winning trace is the witness. `None` if nothing confirms
+/// by `max_horizon`.
 pub fn find_optimum(
-    mut make_engine: impl FnMut(
+    make_engine: impl FnMut(
         crate::interpreter::abstraction::RemPrecision,
     ) -> Result<Box<dyn FrameStep>>,
-    mut make_initial: impl FnMut() -> Result<Vec<Block>>,
+    make_initial: impl FnMut() -> Result<Vec<Block>>,
     base_dir: &std::path::Path,
     first_win: u32,
     max_horizon: u32,
     precisions: &[crate::interpreter::abstraction::RemPrecision],
 ) -> Result<Option<u32>> {
-    for horizon in first_win..=max_horizon {
-        let dir = base_dir.join(format!("h{:03}", horizon));
-        match ladder_at_horizon(&mut make_engine, &mut make_initial, &dir, horizon, precisions)? {
+    let mut ladder = Ladder::new(make_engine, make_initial, base_dir, precisions);
+    let mut horizon = first_win.max(1);
+    // Level 0 first: extend until it wins, one frame at a time past
+    // `first_win`, without touching the finer levels.
+    while horizon <= max_horizon && ladder.extend_level0(horizon)?.is_none() {
+        eprintln!("[search] level 0 has no win by f{horizon}");
+        horizon += 1;
+    }
+    while horizon <= max_horizon {
+        match ladder.at_horizon(horizon)? {
             HorizonOutcome::Confirmed => return Ok(Some(horizon)),
-            HorizonOutcome::Refuted { .. } => continue,
+            HorizonOutcome::Refuted { level } => {
+                eprintln!("[search] horizon {horizon} refuted at level {level}");
+                horizon += 1;
+            }
         }
     }
     Ok(None)
@@ -1104,7 +1250,7 @@ mod tests {
     /// byte-for-byte the same key set.
     #[test]
     #[ignore]
-    fn forward_resume_matches_fresh() {
+    fn forward_extended_frame_by_frame_matches_fresh() {
         use rustc_hash::FxHashSet;
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-resume-test");
         let _ = std::fs::remove_dir_all(dir);
@@ -1120,20 +1266,26 @@ mod tests {
         {
             let mut e = RefEngine::new().expect("engine");
             let init = vec![Block::from_state(&e.initial_state().expect("init")).expect("block")];
-            forward_run(&mut e, init, dir, 4, false, None).expect("fresh");
+            forward_run(&mut e, init, dir, 4, true, None).expect("fresh");
         }
         let fresh4 = keyset(4);
         assert!(!fresh4.is_empty(), "fresh frame 4 empty");
 
-        // Resume from frame 2 -> recomputes frames 3 and 4.
+        // The same run extended one frame at a time - the outer loop's
+        // "one more frame at rem zero" - lands on the same key set.
         {
             let mut e = RefEngine::new().expect("engine");
-            let r = forward_resume(&mut e, dir, 2, 4, None).expect("resume");
-            assert_eq!(r.frames, 4, "resume did not reach frame 4");
+            let init = vec![Block::from_state(&e.initial_state().expect("init")).expect("block")];
+            let mut st = ForwardState::start(init, dir, true).expect("start");
+            for to in 1..=4 {
+                st.extend(&mut e, dir, to, None).expect("extend");
+                assert_eq!(st.frames, to);
+            }
+            assert!(st.pos_graph().is_some());
         }
-        let resumed4 = keyset(4);
-        assert_eq!(fresh4, resumed4, "resume diverged from fresh at frame 4");
-        eprintln!("[resume] frame 4 key set identical: {} keys", fresh4.len());
+        let extended4 = keyset(4);
+        assert_eq!(fresh4, extended4, "extension diverged from fresh at frame 4");
+        eprintln!("[extend] frame 4 key set identical: {} keys", fresh4.len());
         let _ = std::fs::remove_dir_all(dir);
     }
 

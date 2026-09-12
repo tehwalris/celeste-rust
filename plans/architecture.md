@@ -91,9 +91,14 @@ The rebuild replaced the old search (`run.rs`/`sweep*.rs`, deleted) with
    old `ExtractTas`/`TraceWitness` were deleted with the old backward; the new
    `find_optimum` reports the optimal FRAME but not yet the witness trace.
    Rebuild minimally on the sharded checkpoints + concrete-level backward.
-2. **Incremental rem-0 horizon extension** - `find_optimum` re-runs the whole
-   ladder fresh per horizon; `forward_resume` exists to extend rem-0 by one frame
-   instead (Philippe: "one more frame at rem zero"). Wire it in.
+2. DONE 2026-09-12. **Incremental rem-0 horizon extension** - `Ladder` keeps
+   level 0's `ForwardState` (frontier, visited, pos-graph observer) across
+   horizons and extends it by the frames each new horizon adds; the finer,
+   filtered levels rerun per horizon. Found and fixed along the way: the
+   forward stopped at the first win and the backward seeded only from that
+   frame, so no horizon past level 0's first win could ever be Confirmed.
+   Every level now runs to the horizon and seeds from the wins at every
+   frame <= it.
 3. **Wide + lane-bitmask provenance backward** - `backward_run` re-runs one input
    lane at a time (correct, slow). Make the kernel emit a per-output source-lane
    bitmask so backward runs 16-wide (design agreed; the narrow per-call reuse of

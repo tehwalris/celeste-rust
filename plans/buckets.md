@@ -46,9 +46,11 @@ regrouping, and 17k checkpoint files per frame.
   `gates/ckhash_room10_f000-044.txt` (frontier sets, all 45 frames).
 - `rewrite forward --to 44` pos-graph fingerprint (pairs, hash) ==
   `gates/posgraph_room10_f044.txt`.
-- `rewrite search --from H --to H --maxk 1 --win-at X,Y` marked-set
-  fingerprints per level == `gates/marks_room10_*.txt` (the backward, on a
-  horizon with real fan-out).
+- `rewrite search --from 29 --to 35 --maxk 1 --win-at 9,101` marked-set
+  fingerprints per (horizon, level) == `gates/marks_room10_win9-101_h29-33.txt`
+  (the backward on a real fan-out, across horizons; must end in
+  `OPTIMAL win frame: 33`, which the unfiltered Exact forward's first win
+  confirms).
 - `cargo nextest run --cargo-profile quick` green; `kernel lanes: missed 0`.
 
 ## Stages
