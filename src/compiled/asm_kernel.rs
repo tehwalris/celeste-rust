@@ -153,6 +153,9 @@ impl AsmKernel {
             *DR.get_or_init(|| std::env::var_os("CELESTE_KERNEL_DRYRUN").is_some())
         };
 
+        CALL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CALL_STATS[1].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        CALL_STATS[2].fetch_add(chunk.width.div_ceil(16) as u64 * 16, std::sync::atomic::Ordering::Relaxed);
         let mut lo = 0usize;
         while lo < chunk.width {
             let n = 16.min(chunk.width - lo);
@@ -693,6 +696,20 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
 /// of the precision plus the process-constant `CELESTE_TRACED_SET` override,
 /// so precision alone keys the set within a process. `ladder.sh`'s
 /// per-process rungs no longer buy anything the in-process cache does not.
+/// Kernel call shape: [0] calls, [1] rows offered, [2] slice-lanes executed
+/// (16 per slice, so `[2] - [1]` is the padding). The per-call fixed cost
+/// (accumulators, buffers, seen sets, boundary) is paid once per [0].
+static CALL_STATS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Take (and reset) the call-shape counters.
+pub(crate) fn take_call_stats() -> [u64; 3] {
+    std::array::from_fn(|i| CALL_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 pub(crate) fn registry() -> Option<&'static Registry> {
     use crate::interpreter::abstraction::{rem_precision_from_env, RemPrecision};
     static REGS: [std::sync::OnceLock<Option<Registry>>; 17] =

@@ -135,4 +135,16 @@ pub fn print_kernel_hits() {
     if v.iter().any(|x| *x > 0) {
         eprintln!("kernel lanes: traced {} missed {}", v[0], v[1]);
     }
+    let [calls, rows, slice_lanes] = super::asm_kernel::take_call_stats();
+    if calls > 0 {
+        eprintln!(
+            "kernel calls: {} calls, {} rows ({:.1} rows/call), {} slice-lanes executed \
+             ({:.1}% padding)",
+            calls,
+            rows,
+            rows as f64 / calls as f64,
+            slice_lanes,
+            100.0 * (slice_lanes - rows) as f64 / slice_lanes as f64
+        );
+    }
 }
