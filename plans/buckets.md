@@ -70,8 +70,15 @@ regrouping, and 17k checkpoint files per frame.
    draft, which is deleted.
 5. Checkpoint per bucket + cell index; backward loads by cell range. Gate:
    ckhash + marks.
-6. (Perf, after the structure) the row key as two kernel roots, so nothing
-   hashes a row in Rust. Gate: per-row key equality vs `Rt2::boundary`.
+5. Deferred: the backward reads whole bucket files and filters rows by
+   cell (`load_frame_cells`); a per-bucket cell index becomes worth it only
+   if a profile of a deep backward shows the load dominating.
+6. DONE. The row key as two kernel roots per body (`Op::CellMix`/`AddW`/
+   `Word`, lowered to 64-bit lane ops + `mix64` in AVX-512); the append
+   step reads `(h1, h2)` off the output buffer and nothing hashes a row in
+   Rust. Gated per row by `CELESTE_KERNEL_KEY_CHECK=1` (kernel key ==
+   `Rt2::boundary` key over f0-f44) and by `asm_cell_mix_matches_the_
+   boundary_cell_mix` against the scalar `cell_mix`. f44: 4.8 s -> 2.7 s.
 
 ## Transition points that remain on `State`
 

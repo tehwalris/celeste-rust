@@ -24,8 +24,8 @@ pub type P8 = Pico8Num;
 /// keys collapse - so they mix the same way rather than approximating it.
 #[inline]
 pub fn mix64(mut x: u64) -> u64 {
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x = (x ^ (x >> 30)).wrapping_mul(MIX_C1);
+    x = (x ^ (x >> 27)).wrapping_mul(MIX_C2);
     x ^ (x >> 31)
 }
 
@@ -43,9 +43,19 @@ pub fn av_code(v: AV) -> u64 {
     }
 }
 
+/// The two seeds of the 128-bit row key (one per half) and the cell-id
+/// multiplier. Shared with the ASM kernels, which compute the key in the
+/// graph (`transpile::graph::Op::CellMix`).
+pub const KEY_SEED1: u64 = 0x5bf0_3635;
+pub const KEY_SEED2: u64 = 0x27d4_eb2f;
+pub const CELL_K: u64 = 0x9e37_79b9_7f4a_7c15;
+/// `mix64`'s two multipliers.
+pub const MIX_C1: u64 = 0xbf58_476d_1ce4_e5b9;
+pub const MIX_C2: u64 = 0x94d0_49bb_1331_11eb;
+
 #[inline]
 pub fn cell_mix(c: u64, v: AV, seed: u64) -> u64 {
-    mix64(seed ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ av_code(v))
+    mix64(seed ^ c.wrapping_mul(CELL_K) ^ av_code(v))
 }
 
 /// One lane's abstract value. `Copy`, 12 bytes + tag.
@@ -818,21 +828,21 @@ impl Rt2 {
             let ci = c as u64;
             match &self.cols[c] {
                 Col::U(v) => {
-                    part1 = part1.wrapping_add(cell_mix(ci, *v, 0x5bf0_3635));
-                    part2 = part2.wrapping_add(cell_mix(ci, *v, 0x27d4_eb2f));
+                    part1 = part1.wrapping_add(cell_mix(ci, *v, KEY_SEED1));
+                    part2 = part2.wrapping_add(cell_mix(ci, *v, KEY_SEED2));
                 }
                 Col::V(vs) => {
                     for i in 0..w {
-                        h1[i] = h1[i].wrapping_add(cell_mix(ci, vs[i], 0x5bf0_3635));
-                        h2[i] = h2[i].wrapping_add(cell_mix(ci, vs[i], 0x27d4_eb2f));
+                        h1[i] = h1[i].wrapping_add(cell_mix(ci, vs[i], KEY_SEED1));
+                        h2[i] = h2[i].wrapping_add(cell_mix(ci, vs[i], KEY_SEED2));
                     }
                 }
                 Col::N(vs) => {
                     // Same key as cell_mix(ci, AV::Num(v), seed), with
                     // the per-cell constants hoisted so the loop is a
                     // flat elementwise xor/mix chain (vectorizable).
-                    let c1 = 0x5bf0_3635u64 ^ ci.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                    let c2 = 0x27d4_eb2fu64 ^ ci.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    let c1 = KEY_SEED1 ^ ci.wrapping_mul(CELL_K);
+                    let c2 = KEY_SEED2 ^ ci.wrapping_mul(CELL_K);
                     for i in 0..w {
                         let code = 1u64 << 56 | vs[i].to_bits() as u64;
                         h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
@@ -842,8 +852,8 @@ impl Rt2 {
                 Col::I(vs) => {
                     for i in 0..w {
                         let v = AV::Ival(vs[i].0, vs[i].1);
-                        h1[i] = h1[i].wrapping_add(cell_mix(ci, v, 0x5bf0_3635));
-                        h2[i] = h2[i].wrapping_add(cell_mix(ci, v, 0x27d4_eb2f));
+                        h1[i] = h1[i].wrapping_add(cell_mix(ci, v, KEY_SEED1));
+                        h2[i] = h2[i].wrapping_add(cell_mix(ci, v, KEY_SEED2));
                     }
                 }
             }

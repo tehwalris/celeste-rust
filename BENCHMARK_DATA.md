@@ -4263,15 +4263,15 @@ forward --to 44` (record mode = the ladder's forward). Every row below
 reproduces `gates/ckhash_room10_f000-044.txt`, `gates/posgraph_room10_f044.txt`
 and `gates/marks_room10_win9-101_h35.txt` bit for bit.
 
-| | State-bridged loop (`93313b6`) | Rt2 blocks (`31002e3`) | buckets (`78d0276`) |
-|---|---|---|---|
-| f0-f44 wall (incl. ~4 s kernel assembly) | 92.6 s | 53.2 s | **26.2 s** |
-| f44 frame | 15.1 s | 9.4 s | **4.8 s** |
-| kernel calls / rows per call | 115,039 / 17.2 | 115,039 / 17.2 | **879 / 2,252** |
-| executed AVX-512 lanes that are padding | 39.2% | 39.2% | **0.4%** |
-| blocks per frame at f44 | 17,578 | 17,578 | **42** |
-| checkpoint at f44 | 2.3 s | 1.28 s | 0.12 s |
-| peak RSS | 3.66 GB | 1.60 GB | **0.62 GB** |
+| | State-bridged loop (`93313b6`) | Rt2 blocks (`31002e3`) | buckets (`78d0276`) | key in the kernel (stage 6) |
+|---|---|---|---|---|
+| f0-f44 wall (incl. ~4 s kernel assembly) | 92.6 s | 53.2 s | 26.2 s | **16.7 s** |
+| f44 frame | 15.1 s | 9.4 s | 4.8 s | **2.7 s** |
+| kernel calls / rows per call | 115,039 / 17.2 | 115,039 / 17.2 | 879 / 2,252 | 879 / 2,252 |
+| executed AVX-512 lanes that are padding | 39.2% | 39.2% | 0.4% | 0.4% |
+| blocks per frame at f44 | 17,578 | 17,578 | 42 | 42 |
+| checkpoint at f44 | 2.3 s | 1.28 s | 0.12 s | 0.12 s |
+| peak RSS | 3.66 GB | 1.60 GB | 0.62 GB | **0.59 GB** |
 
 Where the buckets' f0-f44 time goes: `fwd.engine` 24.0 s of 25.8 s (the
 kernel call including its append step: key fold, door dedup, column

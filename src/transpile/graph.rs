@@ -278,6 +278,23 @@ pub enum Op {
     Mget,
     TileFlagAt,
 
+    // ---- the row key, as graph nodes ----
+    //
+    // The boundary's 128-bit row key is `mix64(part + Σ_cells cell_mix(cell,
+    // value, seed))` per half (`runtime2::boundary_finish`); the per-lane
+    // sum over an outcome's varying fields is computed HERE, 16 rows at a
+    // time, and handed back as two word roots per body, so nothing hashes
+    // a row in Rust. Words are the only non-game value kind in the graph;
+    // nothing feeds them back into the value layer.
+    /// A machine-word literal: the sum's zero.
+    Word(u64),
+    /// `CellMix(cell, half)(value)` = `runtime2::cell_mix(cell, value,
+    /// KEY_SEED{half+1})` per lane, over the value's REPRESENTATION - which
+    /// `av_code` variant applies is decided by the argument's domain (num,
+    /// interval, tri-state bool) at lowering.
+    CellMix(u32, u8),
+    /// 64-bit wrapping add of two words: the key's commutative sum.
+    AddW,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -953,6 +970,13 @@ impl Graph {
                 }
                 Op::Mget | Op::TileFlagAt => {
                     bail!("{:?} needs the cart; not supported by the pure evaluator yet", node.op)
+                }
+                // The row-key layer has no abstract value: it reads the
+                // REPRESENTATION of one, and `Val` is the value. No field
+                // root depends on a word node, so an evaluator that reads
+                // field roots never needs one; in lenient mode it gets TOP.
+                Op::Word(_) | Op::CellMix(..) | Op::AddW => {
+                    bail!("node {}: {:?} is a row-key node, not an abstract value", i, node.op)
                 }
                 })
             })();

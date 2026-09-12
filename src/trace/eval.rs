@@ -199,6 +199,11 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
             Op::Split(_) | Op::SplitValid(_) | Op::SplitOk | Op::Frag(_) | Op::FragOk(_) => {
                 bail!("node {} is {:?}, which the tracer does not build", id, node.op)
             }
+            // The row-key layer is added to the FUSED graph after tracing; a
+            // concrete value has no row key.
+            Op::Word(_) | Op::CellMix(..) | Op::AddW => {
+                bail!("node {} is {:?}, a row-key node with no concrete value", id, node.op)
+            }
         };
         Ok(v)
         }();

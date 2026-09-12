@@ -34,19 +34,16 @@ use crate::transpile::asm::{AsmCtx, CellRepr, CollisionEnv, Compiled, Loaded, Ro
 use crate::transpile::graph::Room;
 
 /// One output field of a body: which output cell it writes, the flat root
-/// slot the assembly wrote it to, and how to read that slot. `fold` is true
-/// for a field that enters the per-row dedup key: a per-row column
-/// (`konst_av` = None) that the boundary does NOT widen to a uniform value
-/// (`widen_uniform` = None). A konst field is uniform (in `part`, written
-/// once); a widen_uniform field (rem/timers at level 0) is pushed per row but
-/// keyed as the widened uniform, so it too is out of the per-lane fold - just
-/// like the generated kernel's `KPART`. Every non-konst field is still PUSHED
-/// (`push_field` no-ops on the konst `Col::U` cells).
+/// slot the assembly wrote it to, and how to read that slot. Which fields
+/// enter the per-row key is decided at build (`build_one_shape`): a per-row
+/// column (`konst_av` = None) that the boundary does not widen to uniform
+/// (`widen_uniform` = None); the rest are in the outcome's `part`. Every
+/// non-konst field is still PUSHED (`push_field` no-ops on the konst
+/// `Col::U` cells).
 struct AsmField {
     cell: usize,
     root: usize,
     kind: RootKind,
-    fold: bool,
 }
 
 /// One fused body (a distinct (outcome, choices) with distinct outputs):
@@ -57,6 +54,9 @@ struct AsmBody {
     fields: Vec<AsmField>,
     ok_root: usize,
     live_root: usize,
+    /// The two row-key word roots: `Σ cell_mix` over the body's varying
+    /// fields, per half, computed in the kernel (`Op::CellMix`/`AddW`).
+    key_roots: (usize, usize),
     /// Where an emitted row's player x, player y, room x, room y come from
     /// (`search::pos_graph::block_cells`' inputs), so the append step can
     /// compute the row's position cell straight off the output buffer.
@@ -254,17 +254,9 @@ impl AsmKernel {
                         continue;
                     }
                     // The row's (h1,h2) fold over the varying, non-widened
-                    // cells - equivalent to the boundary key (constant part
-                    // per outcome).
-                    let (mut h1, mut h2) = (0u64, 0u64);
-                    for f in &body.fields {
-                        if !f.fold {
-                            continue;
-                        }
-                        let av = read_field_av(f, &outbuf, i);
-                        h1 = h1.wrapping_add(runtime2::cell_mix(f.cell as u64, av, KEY_SEED1));
-                        h2 = h2.wrapping_add(runtime2::cell_mix(f.cell as u64, av, KEY_SEED2));
-                    }
+                    // cells, computed by the kernel (the body's key roots).
+                    let h1 = read_word(&outbuf, body.key_roots.0, i);
+                    let h2 = read_word(&outbuf, body.key_roots.1, i);
                     let part = self.acc_templates[body.outcome].part;
                     let key = (
                         runtime2::mix64(part.0.wrapping_add(h1)),
@@ -524,8 +516,15 @@ fn read_zb_holds(buf: &[u8], root: usize) -> u16 {
 
 /// The boundary's row-key mix seeds (see `runtime2::boundary_finish`); the
 /// append folds the same cell_mix so its dedup key equals the boundary's.
-const KEY_SEED1: u64 = 0x5bf0_3635;
-const KEY_SEED2: u64 = 0x27d4_eb2f;
+use celeste_engine::runtime2::{KEY_SEED1, KEY_SEED2};
+
+/// Lane `i` of a word root: lanes 0-7 in the slot's first 64 bytes, 8-15
+/// in the second.
+#[inline]
+fn read_word(buf: &[u8], root: usize, i: usize) -> u64 {
+    let base = root * 128 + (i / 8) * 64 + (i % 8) * 8;
+    u64::from_le_bytes(buf[base..base + 8].try_into().unwrap())
+}
 
 /// The `AV` a field root holds for lane `i` (for the dedup fold).
 fn read_field_av(f: &AsmField, buf: &[u8], i: usize) -> AV {
@@ -551,6 +550,7 @@ fn read_field_av(f: &AsmField, buf: &[u8], i: usize) -> AV {
                 i32::from_le_bytes(buf[base + 64 + i * 4..base + 64 + i * 4 + 4].try_into().unwrap());
             AV::Ival(P8::from_raw(lo), P8::from_raw(hi))
         }
+        RootKind::Word => unreachable!("an output field is never a word root"),
     }
 }
 
@@ -583,6 +583,7 @@ fn push_field(acc: &mut Rt2, f: &AsmField, buf: &[u8], i: usize) {
                 v.push((P8::from_raw(lo), P8::from_raw(hi)));
             }
         }
+        RootKind::Word => unreachable!("an output field is never a word root"),
     }
 }
 
@@ -709,9 +710,36 @@ fn build_one_shape(
 ) -> Result<(u64, AsmKernel)> {
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
-    let (fused, bodies, flat_roots, reprs) =
+    let (mut fused, bodies, mut flat_roots, reprs) =
         crate::trace::emit::asm_fused(&r.bound, Some(&room), true)
             .with_context(|| format!("fusing shape {si} (hash {shape:#x})"))?;
+    // THE ROW KEY, AS GRAPH ROOTS. Per body, the per-lane sum of
+    // `cell_mix` over its varying fields (a per-row column that the
+    // boundary does not widen to uniform), one node chain per half,
+    // appended AFTER every body's own roots so the field/ok/live slots
+    // keep their layout. `mix64(part + this)` is the exact boundary key
+    // (`acc_template` computes `part`; `check_against_boundary` gates it).
+    let mut key_roots: Vec<(usize, usize)> = Vec::with_capacity(bodies.len());
+    for b in &bodies {
+        use crate::transpile::graph::Op;
+        let nfields = b.roots.len() - 2;
+        let outputs = &r.bound.outcomes[b.outcome].outputs;
+        let out_fields = &r.lowered.outs[b.outcome].fields;
+        let (mut h1, mut h2) = (fused.leaf(Op::Word(0)), fused.leaf(Op::Word(0)));
+        for j in 0..nfields {
+            if out_fields[j].konst_av.is_some() || out_fields[j].widen_uniform.is_some() {
+                continue;
+            }
+            let cell = outputs[j].0;
+            let m1 = fused.add(Op::CellMix(cell, 0), vec![b.roots[j]]);
+            let m2 = fused.add(Op::CellMix(cell, 1), vec![b.roots[j]]);
+            h1 = fused.add(Op::AddW, vec![h1, m1]);
+            h2 = fused.add(Op::AddW, vec![h2, m2]);
+        }
+        key_roots.push((flat_roots.len(), flat_roots.len() + 1));
+        flat_roots.push(h1);
+        flat_roots.push(h2);
+    }
     let (compiled, loaded) = crate::transpile::asm::compile_and_load_reprs(
         &fused,
         &flat_roots,
@@ -725,7 +753,7 @@ fn build_one_shape(
     // k, so a running offset locates each body.
     let mut off = 0usize;
     let mut asm_bodies = Vec::with_capacity(bodies.len());
-    for b in &bodies {
+    for (bi, b) in bodies.iter().enumerate() {
         let nfields = b.roots.len() - 2; // roots = [fields.., ok, live]
         let outputs = &r.bound.outcomes[b.outcome].outputs;
         anyhow::ensure!(
@@ -735,16 +763,11 @@ fn build_one_shape(
             outputs.len(),
             nfields
         );
-        // A field enters the dedup fold iff it is per-row (no konst) AND the
-        // boundary does not widen it to uniform (rem/timers).
-        let out_fields = &r.lowered.outs[b.outcome].fields;
         let fields = (0..nfields)
             .map(|j| AsmField {
                 cell: outputs[j].0 as usize,
                 root: off + j,
                 kind: compiled.root_kinds[off + j],
-                fold: out_fields[j].konst_av.is_none()
-                    && out_fields[j].widen_uniform.is_none(),
             })
             .collect();
         asm_bodies.push(AsmBody {
@@ -752,6 +775,7 @@ fn build_one_shape(
             fields,
             ok_root: off + nfields,
             live_root: off + nfields + 1,
+            key_roots: key_roots[bi],
             pos: None,
         });
         off += b.roots.len();

@@ -61,6 +61,8 @@ enum V {
     N(ZN),
     B(ZB),
     I(ZI),
+    /// A row-key word, per lane.
+    W([u64; 16]),
 }
 
 /// Evaluate every node with the REAL `celeste_engine::kernel` primitives.
@@ -161,6 +163,7 @@ fn eval_nodes(
                         V::B(z) => (z.known, ()),
                         V::N(_) => (ALL, ()),
                         V::I(z) => (zn_eq(z.lo, z.hi).val, ()),
+                        V::W(_) => panic!("Known of a word"),
                     };
                     V::B(ZB { val, known: ALL })
                 }
@@ -172,6 +175,35 @@ fn eval_nodes(
                     V::I(_) => V::I(zsel_i(c, iv(1), iv(2))),
                     _ => V::N(zsel_n(c, n(1), n(2))),
                 }
+            }
+            Op::Word(w) => V::W([*w; 16]),
+            Op::AddW => {
+                let (x, y) = match (vals[node.args[0] as usize], vals[node.args[1] as usize]) {
+                    (V::W(x), V::W(y)) => (x, y),
+                    _ => panic!("node {id}: AddW of non-words"),
+                };
+                V::W(std::array::from_fn(|l| x[l].wrapping_add(y[l])))
+            }
+            Op::CellMix(c, half) => {
+                // The oracle is the boundary's own scalar `cell_mix` on the
+                // lane's `AV`.
+                use celeste_engine::runtime2::{cell_mix, AV, KEY_SEED1, KEY_SEED2};
+                let seed = if *half == 0 { KEY_SEED1 } else { KEY_SEED2 };
+                let av_of = |l: usize| -> AV {
+                    match vals[node.args[0] as usize] {
+                        V::N(z) => AV::Num(z.to_array()[l]),
+                        V::I(z) => AV::Ival(z.lo.to_array()[l], z.hi.to_array()[l]),
+                        V::B(z) => {
+                            if z.known & (1 << l) != 0 {
+                                AV::Bool(z.val & (1 << l) != 0)
+                            } else {
+                                AV::UBool
+                            }
+                        }
+                        V::W(_) => panic!("node {id}: CellMix of a word"),
+                    }
+                };
+                V::W(std::array::from_fn(|l| cell_mix(*c as u64, av_of(l), seed)))
             }
             Op::Span => V::I(ZI { lo: iv(0).lo, hi: iv(1).hi }),
             Op::Frag(c) => V::I(zi_fork_flr(iv(0), *c as usize).0),
@@ -247,6 +279,13 @@ fn check_typed(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
                     assert_eq!(val, z.val, "{tag}: bool val root {ri}");
                     assert_eq!(known, z.known, "{tag}: bool known root {ri}");
                 }
+                (RootKind::Word, V::W(z)) => {
+                    let got: [u64; 16] = std::array::from_fn(|l| {
+                        let o = base + (l / 8) * 64 + (l % 8) * 8;
+                        u64::from_le_bytes(out[o..o + 8].try_into().unwrap())
+                    });
+                    assert_eq!(got, z, "{tag}: word root {ri}");
+                }
                 (k, _) => panic!("{tag}: root {ri} kind {k:?} vs oracle type mismatch"),
             }
         }
@@ -319,6 +358,13 @@ fn check_typed_small(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
                     let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
                     assert_eq!(known, z.known, "{tag}: bool known root {ri}");
                     assert_eq!(val & known, z.val & known, "{tag}: bool val root {ri}");
+                }
+                (RootKind::Word, V::W(z)) => {
+                    let got: [u64; 16] = std::array::from_fn(|l| {
+                        let o = base + (l / 8) * 64 + (l % 8) * 8;
+                        u64::from_le_bytes(out[o..o + 8].try_into().unwrap())
+                    });
+                    assert_eq!(got, z, "{tag}: word root {ri}");
                 }
                 (k, _) => panic!("{tag}: root {ri} kind {k:?} vs oracle type mismatch"),
             }
@@ -410,6 +456,13 @@ fn check_typed_ctx(
                     assert_eq!(known, z.known, "{tag}: bool known {ri}");
                     assert_eq!(val & known, z.val & known, "{tag}: bool val {ri}");
                 }
+                (RootKind::Word, V::W(z)) => {
+                    let got: [u64; 16] = std::array::from_fn(|l| {
+                        let o = base + (l / 8) * 64 + (l % 8) * 8;
+                        u64::from_le_bytes(out[o..o + 8].try_into().unwrap())
+                    });
+                    assert_eq!(got, z, "{tag}: word root {ri}");
+                }
                 (k, _) => panic!("{tag}: root {ri} kind {k:?} mismatch"),
             }
         }
@@ -497,6 +550,13 @@ fn asm_callout_collision_matches_primitives() {
                     let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
                     assert_eq!(known, z.known, "collision bool known {ri}");
                     assert_eq!(val & known, z.val & known, "collision bool val {ri}");
+                }
+                (RootKind::Word, V::W(z)) => {
+                    let got: [u64; 16] = std::array::from_fn(|l| {
+                        let o = base + (l / 8) * 64 + (l % 8) * 8;
+                        u64::from_le_bytes(out[o..o + 8].try_into().unwrap())
+                    });
+                    assert_eq!(got, z, "collision word root {ri}");
                 }
                 (k, _) => panic!("collision root {ri} kind {k:?} mismatch"),
             }
@@ -658,3 +718,43 @@ fn asm_ival_input_matches_primitives() {
 // runtime numbers. #[ignore] because it shells out to rustc (~0.3 s) and is
 // only meaningful under an optimized profile.
 // ---------------------------------------------------------------------------
+
+/// The row key in the graph: `CellMix` over a number, an interval and a
+/// tri-state bool, summed with `AddW`, against the boundary's scalar
+/// `runtime2::cell_mix` per lane. This is what makes `compiled::asm_kernel`'s
+/// keys the boundary's keys.
+#[test]
+fn asm_cell_mix_matches_the_boundary_cell_mix() {
+    let mut rng = Lcg(0x5eed_5eed);
+    let mut g = Graph::new();
+    let two = g.leaf(Op::Const(ONE_FIXED2, ONE_FIXED2));
+    let cells: Vec<u32> = (0..4u32).map(|i| i * 5 + 3).collect();
+    let cs: Vec<NodeId> = cells.iter().map(|c| g.leaf(Op::Cell(*c))).collect();
+    let mut roots = Vec::new();
+    for half in 0..2u8 {
+        let mut h = g.leaf(Op::Word(0));
+        for (i, &c) in cs.iter().enumerate() {
+            // a number
+            let m = g.add(Op::CellMix(cells[i], half), vec![c]);
+            h = g.add(Op::AddW, vec![h, m]);
+            // an interval [c, c + 2]
+            let hi = g.add(Op::Add, vec![c, two]);
+            let iv = g.add(Op::Span, vec![c, hi]);
+            let m = g.add(Op::CellMix(cells[i] + 100, half), vec![iv]);
+            h = g.add(Op::AddW, vec![h, m]);
+            // a tri-state bool: an interval compare (unknown where they overlap)
+            let other = cs[(i + 1) % cs.len()];
+            let hi2 = g.add(Op::Add, vec![other, two]);
+            let iv2 = g.add(Op::Span, vec![other, hi2]);
+            let lt = g.add(Op::Lt, vec![iv, iv2]);
+            let m = g.add(Op::CellMix(cells[i] + 200, half), vec![lt]);
+            h = g.add(Op::AddW, vec![h, m]);
+            // a decided bool
+            let eq = g.add(Op::Eq, vec![c, other]);
+            let m = g.add(Op::CellMix(cells[i] + 300, half), vec![eq]);
+            h = g.add(Op::AddW, vec![h, m]);
+        }
+        roots.push(h);
+    }
+    check_typed_small(&g, &roots, "cellmix", &mut rng);
+}
