@@ -4265,8 +4265,8 @@ and `gates/marks_room10_win9-101_h35.txt` bit for bit.
 
 | | State-bridged loop (`93313b6`) | Rt2 blocks (`31002e3`) | buckets (`78d0276`) | key in the kernel (stage 6) |
 |---|---|---|---|---|
-| f0-f44 wall (incl. ~4 s kernel assembly) | 92.6 s | 53.2 s | 26.2 s | **16.7 s** |
-| f44 frame | 15.1 s | 9.4 s | 4.8 s | **2.7 s** |
+| f0-f44 wall (incl. ~4 s kernel assembly) | 92.6 s | 53.2 s | 26.2 s | **15.5 s** |
+| f44 frame | 15.1 s | 9.4 s | 4.8 s | **2.4 s** |
 | kernel calls / rows per call | 115,039 / 17.2 | 115,039 / 17.2 | 879 / 2,252 | 879 / 2,252 |
 | executed AVX-512 lanes that are padding | 39.2% | 39.2% | 0.4% | 0.4% |
 | blocks per frame at f44 | 17,578 | 17,578 | 42 | 42 |

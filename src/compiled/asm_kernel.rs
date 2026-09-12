@@ -60,16 +60,18 @@ struct AsmBody {
     /// Where an emitted row's player x, player y, room x, room y come from
     /// (`search::pos_graph::block_cells`' inputs), so the append step can
     /// compute the row's position cell straight off the output buffer.
-    /// `None`: this outcome has no player object (every row is `NO_CELL`).
-    pos: Option<[FieldSrc; 4]>,
+    /// `None`: this outcome has no player object, or its `x`/`y` is not a
+    /// plain number (every row is `NO_CELL`, as `block_cells` says).
+    pos: Option<[PosSrc; 4]>,
 }
 
-/// One value of an emitted row: an output field of the body, or a
-/// constant the outcome's template holds for every row.
+/// One coordinate of an emitted row, as a whole pixel: read from a numeric
+/// output root of the body (its byte base in the output buffer), or a
+/// constant of the outcome's template.
 #[derive(Clone, Copy)]
-enum FieldSrc {
-    Field(usize),
-    Konst(AV),
+enum PosSrc {
+    Root(usize),
+    Konst(i16),
 }
 
 /// How to initialize one output column of an accumulator: a uniform
@@ -148,6 +150,9 @@ impl AsmKernel {
     ) -> bool {
         debug_assert_eq!(cell_in.len(), chunk.width, "one input cell per input row");
         let start = crate::game_runner::start_room();
+        // Consecutive emissions mostly repeat one (input cell, output cell)
+        // pair; skip the set insert for those.
+        let mut last_edge = (u32::MAX, u32::MAX);
         let mut accs: Vec<Rt2> = self.acc_templates.iter().map(|t| t.build()).collect();
         // Per-acc row keys, pushed alongside the rows: the exact boundary
         // key, `mix64(part + h)`.
@@ -304,7 +309,8 @@ impl AsmKernel {
                         }
                     }
                     let cout = cell_out(body, &outbuf, i, start);
-                    if sink.edges_on {
+                    if sink.edges_on && last_edge != (cin, cout) {
+                        last_edge = (cin, cout);
                         sink.edges.insert((cin, cout));
                     }
                     sink.emitted += 1;
@@ -803,10 +809,13 @@ fn build_one_shape(
 }
 
 /// Where a body's emitted rows carry their position: the player object's
-/// `x`/`y` and the room's `x`/`y`, each either an output field of the body
-/// or a constant of the outcome's template. `None` when the outcome has no
-/// player object (the death countdown), so every row is at `NO_CELL`.
-fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[FieldSrc; 4]>> {
+/// `x`/`y` and the room's `x`/`y`, each either a numeric output root of the
+/// body or a numeric constant of the outcome's template. `None` when the
+/// outcome has no player object (the death countdown) or its `x`/`y` is
+/// not a plain number - every row is then at `NO_CELL`, the
+/// `pos_graph::block_cells` rule. A non-numeric room coordinate is an
+/// error, as there.
+fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]>> {
     let ids = crate::compiled::ids();
     let Some(obj) = crate::search::pos_graph::player_object(template) else {
         return Ok(None);
@@ -814,12 +823,17 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[FieldSrc; 
     let room = template
         .global_target(ids.g_room)
         .ok_or_else(|| anyhow::anyhow!("outcome template has no `room` global"))?;
-    let src_of = |cell: u32| -> Result<FieldSrc> {
-        if let Some(j) = fields.iter().position(|f| f.cell == cell as usize) {
-            return Ok(FieldSrc::Field(j));
+    // `None` = not a plain number in every row.
+    let src_of = |cell: u32| -> Result<Option<PosSrc>> {
+        if let Some(f) = fields.iter().find(|f| f.cell == cell as usize) {
+            return Ok(match f.kind {
+                RootKind::Num => Some(PosSrc::Root(f.root * 128)),
+                _ => None,
+            });
         }
         match template.cols[cell as usize] {
-            Col::U(av) => Ok(FieldSrc::Konst(av)),
+            Col::U(AV::Num(n)) => Ok(Some(PosSrc::Konst(n.whole_part_as_i16()))),
+            Col::U(_) => Ok(None),
             _ => anyhow::bail!("position cell {cell} is neither an output field nor a constant"),
         }
     };
@@ -828,39 +842,37 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[FieldSrc; 
             .obj_field_cell(o, f)
             .ok_or_else(|| anyhow::anyhow!("outcome template: no `{what}` field"))
     };
-    Ok(Some([
-        src_of(cell(obj, ids.f_x, "player.x")?)?,
-        src_of(cell(obj, ids.f_y, "player.y")?)?,
-        src_of(cell(room, ids.f_x, "room.x")?)?,
-        src_of(cell(room, ids.f_y, "room.y")?)?,
-    ]))
+    let (Some(rx), Some(ry)) =
+        (src_of(cell(room, ids.f_x, "room.x")?)?, src_of(cell(room, ids.f_y, "room.y")?)?)
+    else {
+        anyhow::bail!("outcome template: room.x/room.y are not numbers");
+    };
+    let (Some(px), Some(py)) =
+        (src_of(cell(obj, ids.f_x, "player.x")?)?, src_of(cell(obj, ids.f_y, "player.y")?)?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some([px, py, rx, ry]))
 }
 
 /// The position cell of lane `i` of a body's output, read straight off the
-/// output buffer - the same rule as `pos_graph::block_cells`: a player
-/// whose `x`/`y` is not a plain number is at `NO_CELL`.
+/// output buffer. `Pico8Num::whole_part_as_i16` is `raw >> 16`.
 #[inline]
 fn cell_out(body: &AsmBody, buf: &[u8], i: usize, start: (i16, i16)) -> u32 {
     use crate::search::pos_graph::{cell_of, NO_CELL};
     let Some(srcs) = &body.pos else {
         return NO_CELL;
     };
-    let read = |s: FieldSrc| -> Option<i16> {
-        let av = match s {
-            FieldSrc::Field(j) => read_field_av(&body.fields[j], buf, i),
-            FieldSrc::Konst(av) => av,
-        };
-        match av {
-            AV::Num(n) => Some(n.whole_part_as_i16()),
-            _ => None,
+    let read = |s: PosSrc| -> i16 {
+        match s {
+            PosSrc::Root(base) => {
+                let o = base + i * 4;
+                (i32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) >> 16) as i16
+            }
+            PosSrc::Konst(v) => v,
         }
     };
-    let (Some(rx), Some(ry)) = (read(srcs[2]), read(srcs[3])) else {
-        panic!("emitted row: room.x/room.y are not numbers");
-    };
-    let (Some(px), Some(py)) = (read(srcs[0]), read(srcs[1])) else {
-        return NO_CELL;
-    };
+    let (px, py, rx, ry) = (read(srcs[0]), read(srcs[1]), read(srcs[2]), read(srcs[3]));
     cell_of(
         px as i32 + (rx - start.0) as i32 * 128,
         py as i32 + (ry - start.1) as i32 * 128,
