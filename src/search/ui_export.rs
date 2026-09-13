@@ -187,10 +187,12 @@ fn parse_fwd(line: &str) -> Result<FwdLine> {
         out_blocks: num(ob)?,
         out_lanes: num(ol)?,
         visited: num(after(&t, "visited", 0)?)?,
-        emit_ms: num(after(&t, "emit", 0)?)?,
+        // The waves frame (2026-09-13) logs `wave` / `door` where the
+        // two-phase frame logged `emit` / `own`; both read.
+        emit_ms: num(after(&t, "wave", 0).or_else(|_| after(&t, "emit", 0))?)?,
         emit_idle: num(after(&t, "(idle", 0)?)?,
-        own_ms: num(after(&t, "own", 0)?)?,
-        own_idle: num(after(&t, "(idle", 1)?)?,
+        own_ms: num(after(&t, "door", 0).or_else(|_| after(&t, "own", 0))?)?,
+        own_idle: after(&t, "(idle", 1).ok().map(num).transpose()?.unwrap_or(0),
         ckpt_ms: num(after(&t, "ckpt", 0)?)?,
         pos_ms: num(after(&t, "pos", 0)?)?,
         total_ms: num(after(&t, "total", 0)?)?,

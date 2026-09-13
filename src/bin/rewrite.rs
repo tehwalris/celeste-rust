@@ -458,7 +458,8 @@ fn main() -> Result<()> {
             reps,
             room,
         } => {
-            use celeste_rust::frame::{forward_frame, load_frame, threads, Block, Visited};
+            use celeste_rust::frame::{forward_frame, load_frame, threads, Block};
+            use celeste_rust::search::door::Door;
             use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
             set_rem_precision(RemPrecision::Bits(0));
@@ -479,24 +480,24 @@ fn main() -> Result<()> {
                 let n = b.lanes();
                 let mask: Vec<bool> = (0..n).map(|i| i < 64).collect();
                 let small = vec![b.keep(&mask).expect("a non-empty block")];
-                let mut v: Vec<Visited> = (0..threads()).map(|_| Visited::new()).collect();
-                forward_frame(&engine, small, &mut v, None, None)?;
+                forward_frame(&engine, small, &Door::new(), None, None)?;
             }
             for rep in 0..reps {
                 let input: Vec<Block> = frontier.iter().map(|b| Block::from_rt2(b.rt2().clone_block())).collect();
-                let mut visited: Vec<Visited> = (0..threads()).map(|_| Visited::new()).collect();
+                let door = Door::new();
                 let t = std::time::Instant::now();
-                let (next, _won, st) = forward_frame(&engine, input, &mut visited, None, None)?;
+                let (next, _won, st) = forward_frame(&engine, input, &door, None, None)?;
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
                 println!(
-                    "[bench] rep {rep}: raw {} kept {} | emit {:.0} ms (idle {:.0}%) own {:.0} ms (idle {:.0}%) total {:.0} ms | {} out blocks",
+                    "[bench] rep {rep}: raw {} kept {} | wave {:.0} ms (idle {:.0}%) door {:.0} total {:.0} ms | flushes {} ({:.0} rows avg) | {} out blocks",
                     st.lanes_raw,
                     st.lanes_kept,
-                    ms(st.t_emit),
-                    st.emit_idle * 100.0,
-                    ms(st.t_own),
-                    st.own_idle * 100.0,
+                    ms(st.t_wave),
+                    st.wave_idle * 100.0,
+                    ms(st.t_door),
                     ms(t.elapsed()),
+                    st.flushes,
+                    st.flushed_rows as f64 / st.flushes.max(1) as f64,
                     next.len()
                 );
             }
@@ -533,7 +534,7 @@ fn main() -> Result<()> {
             units.sort();
             let mut w = std::io::BufWriter::new(std::fs::File::create(&out)?);
             w.write_all(&(units.len() as u64).to_le_bytes())?;
-            let mut sink = ForwardSink::new(1, false);
+            let mut sink = ForwardSink::recording();
             let (mut rows_total, mut runs) = (0u64, 0u64);
             let t = std::time::Instant::now();
             for &(_, bi, lo, hi) in &units {

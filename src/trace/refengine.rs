@@ -151,7 +151,7 @@ impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
                 if sink.edges_on {
                     sink.edges.insert((cell_in[lane], cell_out));
                 }
-                sink.emit_row(b.rt2(), cell_out);
+                sink.emit_row(b.rt2(), cell_out)?;
             }
         }
         Ok(())

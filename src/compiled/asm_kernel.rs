@@ -174,10 +174,8 @@ impl AsmKernel {
         let body_cols: Vec<BodyCols> = self
             .bodies
             .iter()
-            .map(|b| BodyCols::of(b, &crate::frame::Slot::new(0, self.acc_templates[b.outcome].build())))
+            .map(|b| BodyCols::of(b, &crate::frame::Slot::new(self.acc_templates[b.outcome].build())))
             .collect();
-        // The sink's slot for (outcome, owner), found once.
-        let mut slot_ids: Vec<Vec<usize>> = vec![vec![usize::MAX; sink.owners as usize]; self.acc_templates.len()];
         // Pure-kernel throughput floor (CELESTE_KERNEL_DRYRUN=1): pack the
         // inputs and call the kernel, then discard - no dedup, no
         // materialize. Produces no rows, so it is a MEASUREMENT MODE ONLY
@@ -318,17 +316,16 @@ impl AsmKernel {
                         last_edge = (cin, cout);
                         sink.edges.insert((cin, cout));
                     }
-                    let owner = crate::frame::owner_of(sink.owners, template.shape_hash, cout) as usize;
-                    let sid = &mut slot_ids[body.outcome][owner];
-                    if *sid == usize::MAX {
-                        let outcome_id = template as *const AccTemplate as usize as u64;
-                        *sid = sink.slot_id(owner as u32, outcome_id, || {
-                            let mut b = template.build();
-                            b.shape_hash = template.shape_hash;
-                            b
-                        });
-                    }
-                    cols.push_row(&mut sink.slots[*sid], outbuf, i, key, cout);
+                    // The queue for (outcome, cell): the run cache makes
+                    // this one compare for a run of rows at one cell.
+                    let outcome_id = template as *const AccTemplate as usize as u64;
+                    let q = sink.queue(outcome_id, cout, || {
+                        let mut b = template.build();
+                        b.shape_hash = template.shape_hash;
+                        b
+                    });
+                    cols.push_row(&mut sink.slots[q], outbuf, i, key, cout);
+                    sink.pushed(q).expect("flushing a full queue");
                 }
             }
             lo += n;
