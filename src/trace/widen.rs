@@ -101,7 +101,7 @@ pub enum WidenMode {
     /// the widened rem so the row is keyed on the value it stores.
     /// Everything else (spd, fruit, timers, conservative widenings) is
     /// still left to the boundary in this phase.
-    RemRung,
+    RemRung(crate::interpreter::abstraction::RemPrecision),
 }
 
 /// Apply the boundary widenings selected by `mode` to `st`.
@@ -118,10 +118,7 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
     let (rem, spd) = match mode {
         // Level 0 is rem Bits(0) / spd Exact by construction.
         WidenMode::Level0 => (RemPrecision::Bits(0), SpdPrecision::Exact),
-        WidenMode::RemRung => (
-            crate::interpreter::abstraction::rem_precision_from_env(),
-            crate::interpreter::abstraction::spd_precision_from_env(),
-        ),
+        WidenMode::RemRung(rem) => (rem, crate::interpreter::abstraction::spd_precision_from_env()),
     };
     widen_rem(st, d, rem)?;
     widen_spd(st, d, spd)?;

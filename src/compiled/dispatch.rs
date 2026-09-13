@@ -34,9 +34,8 @@ pub(crate) enum TracedMode {
 /// every rung refuse its own set): `CELESTE_TRACED_SET=traced|ladder|exact`
 /// overrides; otherwise the rem rung picks (Bits(0) -> the level-0 set,
 /// Bits(1..15) -> the rung-agnostic set, Exact -> the exact set).
-pub(crate) fn traced_mode() -> TracedMode {
+pub(crate) fn traced_mode_for(rem: crate::interpreter::abstraction::RemPrecision) -> TracedMode {
     use crate::interpreter::abstraction::RemPrecision;
-    let rem = crate::interpreter::abstraction::rem_precision_from_env();
     match std::env::var("CELESTE_TRACED_SET").as_deref() {
         Ok("traced") => TracedMode::Level0,
         Ok("ladder") => TracedMode::Level0Agnostic,

@@ -272,37 +272,40 @@ pub struct WalkOpts {
     /// carry them as plain per-lane numbers, so `__split_by_flr` is the
     /// identity and the set has no rem forks at all.
     pub ival: bool,
-    /// Bake ONLY the rem widening, at the configured Bits(k) rung, into
-    /// each traced frame (`trace::widen`, `WidenMode::RemRung`) - Phase 1
-    /// of moving the ladder widening into the graph
-    /// (plans/keying-widening-flow.md). Rung-SPECIFIC (unlike `LADDER`),
-    /// so a process changing rem precision must rebuild. Mutually
-    /// exclusive with `widen` (the Bits(0) full widening);
-    /// `widen_mode` asserts that.
-    pub widen_rem_rung: bool,
+    /// Bake ONLY the rem widening, at this Bits(k) rung, into each traced
+    /// frame (`trace::widen`, `WidenMode::RemRung`) - Phase 1 of moving
+    /// the ladder widening into the graph (plans/keying-widening-flow.md).
+    /// Rung-SPECIFIC (unlike `LADDER`), which is why the rung is carried
+    /// here and not read from the process-global precision: every rung's
+    /// set can be built at once. Mutually exclusive with `widen` (the
+    /// Bits(0) full widening); `widen_mode` asserts that.
+    pub rem_rung: Option<u8>,
 }
 
 impl WalkOpts {
     /// The checked-in level-0 set.
-    pub const LEVEL0: WalkOpts = WalkOpts { widen: true, ival: true, widen_rem_rung: false };
+    pub const LEVEL0: WalkOpts = WalkOpts { widen: true, ival: true, rem_rung: None };
     /// The rung-agnostic set for rem Bits(0..=15).
-    pub const LADDER: WalkOpts = WalkOpts { widen: false, ival: true, widen_rem_rung: false };
+    pub const LADDER: WalkOpts = WalkOpts { widen: false, ival: true, rem_rung: None };
     /// The exact-rem set for the top rung (k = 16).
-    pub const EXACT: WalkOpts = WalkOpts { widen: false, ival: false, widen_rem_rung: false };
+    pub const EXACT: WalkOpts = WalkOpts { widen: false, ival: false, rem_rung: None };
     /// Like `LADDER`, but with the rem widening baked into the graph at
-    /// the configured rung (Phase 1 B-kernel, plans/keying-widening-flow.md).
-    pub const LADDER_WIDEN: WalkOpts =
-        WalkOpts { widen: false, ival: true, widen_rem_rung: true };
+    /// rung `Bits(bits)` (Phase 1 B-kernel, plans/keying-widening-flow.md).
+    pub const fn ladder_widen(bits: u8) -> WalkOpts {
+        WalkOpts { widen: false, ival: true, rem_rung: Some(bits) }
+    }
 
     /// The `WidenMode` a traced frame under these opts applies, or `None`
     /// if it leaves every widening to the boundary.
     pub fn widen_mode(&self) -> Option<super::widen::WidenMode> {
         assert!(
-            !(self.widen && self.widen_rem_rung),
-            "WalkOpts: widen (Bits(0) full) and widen_rem_rung (Bits(k) rem) are mutually exclusive"
+            !(self.widen && self.rem_rung.is_some()),
+            "WalkOpts: widen (Bits(0) full) and rem_rung (Bits(k) rem) are mutually exclusive"
         );
-        if self.widen_rem_rung {
-            Some(super::widen::WidenMode::RemRung)
+        if let Some(bits) = self.rem_rung {
+            Some(super::widen::WidenMode::RemRung(
+                crate::interpreter::abstraction::RemPrecision::Bits(bits),
+            ))
         } else if self.widen {
             Some(super::widen::WidenMode::Level0)
         } else {

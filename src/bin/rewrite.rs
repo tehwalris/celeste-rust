@@ -153,6 +153,7 @@ fn main() -> Result<()> {
                 )?])
             };
             let dir = std::path::Path::new(&checkpoint_dir);
+            celeste_rust::compiled::prebuild_kernels(&precisions);
             match find_optimum(make_engine, make_initial, dir, from, to.unwrap_or(from), &precisions)? {
                 Some(h) => println!("OPTIMAL win frame: {h}"),
                 None => println!("no win confirmed up to horizon {}", to.unwrap_or(from)),

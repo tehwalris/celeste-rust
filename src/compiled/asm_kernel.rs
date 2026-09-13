@@ -957,56 +957,73 @@ pub(crate) fn take_call_stats() -> [u64; 3] {
     std::array::from_fn(|i| CALL_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// The kernel set of the process-global rem precision (built on first use).
 pub(crate) fn registry() -> Option<&'static Registry> {
-    use crate::interpreter::abstraction::{rem_precision_from_env, RemPrecision};
+    registry_for(crate::interpreter::abstraction::rem_precision_from_env())
+}
+
+/// One kernel set per rung, each built once, on first use or by
+/// `prebuild` - the rung is an explicit input of the build, not read from
+/// the process-global precision, so the sets can be built in parallel.
+fn registry_for(rem: crate::interpreter::abstraction::RemPrecision) -> Option<&'static Registry> {
+    use crate::interpreter::abstraction::RemPrecision;
     static REGS: [std::sync::OnceLock<Option<Registry>>; 17] =
         [const { std::sync::OnceLock::new() }; 17];
-    let slot = match rem_precision_from_env() {
+    let slot = match rem {
         RemPrecision::Exact => 16,
         RemPrecision::Bits(b) => (b as usize).min(16),
     };
-    REGS[slot].get_or_init(build_registry_for_current_rung).as_ref()
+    REGS[slot].get_or_init(|| build_registry_for_rung(rem)).as_ref()
 }
 
-fn build_registry_for_current_rung() -> Option<Registry> {
-    {
-        let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
-        // Build for the active rem-precision mode, matching the generated
-        // set the engine would otherwise dispatch (dispatch::traced_mode).
-        use crate::trace::shapes::WalkOpts;
-        let (opts, exact) = match super::dispatch::traced_mode() {
-            super::dispatch::TracedMode::Level0 => (WalkOpts::LEVEL0, false),
-            super::dispatch::TracedMode::Level0Agnostic => {
-                // Phase 1: the opt-in rung-specific variant bakes the rem
-                // widening into the graph (`LADDER_WIDEN`), still through
-                // `boundary_exact` (it emits the widened rem and keys the
-                // emitted field). Default `LADDER` is unchanged.
-                let opts = if super::dispatch::widen_in_graph() {
-                    WalkOpts::LADDER_WIDEN
-                } else {
-                    WalkOpts::LADDER
-                };
-                (opts, true)
-            }
-            super::dispatch::TracedMode::ExactRem => (WalkOpts::EXACT, true),
-        };
-        let built = std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
-            .spawn(move || Registry::build_for_start_room(Path::new(&root), opts, exact))
-            .expect("spawn asm-kernel builder")
-            .join()
-            .expect("asm-kernel builder panicked");
-        match built {
-            Ok(reg) => {
-                eprintln!(
-                    "ASM kernels ENABLED ({:?}): {} start-room shapes assembled",
-                    super::dispatch::traced_mode(),
-                    reg.len()
-                );
-                Some(reg)
-            }
-            Err(e) => panic!("building ASM kernels: {e:#}"),
+/// Build every rung's kernel set now, all rungs at once (one builder
+/// thread per rung, each assembling its shapes in parallel). The ladder
+/// calls this up front: lazily, the 17 builds landed one at a time inside
+/// the first frame of each level - 82 s of a 524 s room (1,0) run.
+pub fn prebuild(precisions: &[crate::interpreter::abstraction::RemPrecision]) {
+    let t = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for &p in precisions {
+            scope.spawn(move || {
+                registry_for(p);
+            });
         }
+    });
+    eprintln!("[asm build] {} rungs prebuilt in {:.1} s", precisions.len(), t.elapsed().as_secs_f64());
+}
+
+fn build_registry_for_rung(rem: crate::interpreter::abstraction::RemPrecision) -> Option<Registry> {
+    use crate::interpreter::abstraction::RemPrecision;
+    use crate::trace::shapes::WalkOpts;
+    let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
+    let mode = super::dispatch::traced_mode_for(rem);
+    let (opts, exact) = match mode {
+        super::dispatch::TracedMode::Level0 => (WalkOpts::LEVEL0, false),
+        super::dispatch::TracedMode::Level0Agnostic => {
+            // Phase 1: the opt-in rung-specific variant bakes the rem
+            // widening into the graph (`ladder_widen`), still through
+            // `boundary_exact` (it emits the widened rem and keys the
+            // emitted field). Default `LADDER` is unchanged.
+            let opts = match (super::dispatch::widen_in_graph(), rem) {
+                (true, RemPrecision::Bits(b)) => WalkOpts::ladder_widen(b),
+                _ => WalkOpts::LADDER,
+            };
+            (opts, true)
+        }
+        super::dispatch::TracedMode::ExactRem => (WalkOpts::EXACT, true),
+    };
+    let built = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || Registry::build_for_start_room(Path::new(&root), opts, exact))
+        .expect("spawn asm-kernel builder")
+        .join()
+        .expect("asm-kernel builder panicked");
+    match built {
+        Ok(reg) => {
+            eprintln!("ASM kernels ENABLED ({mode:?}, {rem:?}): {} start-room shapes assembled", reg.len());
+            Some(reg)
+        }
+        Err(e) => panic!("building ASM kernels for {rem:?}: {e:#}"),
     }
 }
 

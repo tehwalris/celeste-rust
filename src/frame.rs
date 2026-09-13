@@ -424,18 +424,19 @@ pub fn forward_frame(
     let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
     let units = units_of(frontier.iter().map(Block::lanes), unit_lanes(st.lanes_in, workers));
     let next_unit = AtomicUsize::new(0);
-    let sinks: Vec<ForwardSink> = std::thread::scope(|scope| {
+    let sinks: Vec<(ForwardSink, std::time::Duration)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 let (frontier, cells, units, next_unit) = (&frontier, &cells, &units, &next_unit);
-                scope.spawn(move || -> Result<ForwardSink> {
+                scope.spawn(move || -> Result<(ForwardSink, std::time::Duration)> {
+                    let t = Instant::now();
                     let mut sink = ForwardSink::new(owners, pos.is_some());
                     loop {
                         let u = next_unit.fetch_add(1, Ordering::Relaxed);
                         let Some(&(bi, lo, hi)) = units.get(u) else { break };
                         engine.run(&frontier[bi], &cells[bi], lo..hi, &mut sink)?;
                     }
-                    Ok(sink)
+                    Ok((sink, t.elapsed()))
                 })
             })
             .collect();
@@ -445,6 +446,8 @@ pub fn forward_frame(
             .collect::<Result<Vec<_>>>()
     })?;
     st.t_emit = t.elapsed();
+    st.emit_idle = idle_fraction(st.t_emit, sinks.iter().map(|(_, busy)| *busy));
+    let sinks: Vec<ForwardSink> = sinks.into_iter().map(|(s, _)| s).collect();
     st.lanes_raw = sinks.iter().map(|s| s.emitted as usize).sum();
     if let Some(p) = pos {
         for sink in &sinks {
@@ -454,13 +457,14 @@ pub fn forward_frame(
 
     // Phase 2: own.
     let t = Instant::now();
-    let owned: Vec<(Vec<Rt2>, usize, bool)> = std::thread::scope(|scope| {
+    let owned: Vec<(Vec<Rt2>, usize, bool, std::time::Duration)> = std::thread::scope(|scope| {
         let handles: Vec<_> = visited
             .iter_mut()
             .enumerate()
             .map(|(o, vis)| {
                 let sinks = &sinks;
-                scope.spawn(move || -> Result<(Vec<Rt2>, usize, bool)> {
+                scope.spawn(move || -> Result<(Vec<Rt2>, usize, bool, std::time::Duration)> {
+                    let t = Instant::now();
                     let mut pieces: rustc_hash::FxHashMap<u64, Rt2> = Default::default();
                     let (mut kept_n, mut won) = (0usize, false);
                     for sink in sinks {
@@ -510,7 +514,7 @@ pub fn forward_frame(
                             piece.append_rows(&slot.rt2, &rows);
                         }
                     }
-                    Ok((pieces.into_values().collect(), kept_n, won))
+                    Ok((pieces.into_values().collect(), kept_n, won, t.elapsed()))
                 })
             })
             .collect();
@@ -520,9 +524,10 @@ pub fn forward_frame(
             .collect::<Result<Vec<_>>>()
     })?;
     st.t_own = t.elapsed();
+    st.own_idle = idle_fraction(st.t_own, owned.iter().map(|(_, _, _, busy)| *busy));
     let mut won = false;
     let mut next: Vec<Block> = Vec::new();
-    for (pieces, kept, w) in owned {
+    for (pieces, kept, w, _) in owned {
         st.lanes_kept += kept;
         won |= w;
         next.extend(pieces.into_iter().map(Block::from_rt2));
@@ -530,6 +535,16 @@ pub fn forward_frame(
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
     Ok((next, won, st))
+}
+
+/// The share of `workers x wall` a phase's workers spent waiting at its
+/// barrier: 1 - sum(busy) / (workers * wall).
+fn idle_fraction(wall: std::time::Duration, busy: impl Iterator<Item = std::time::Duration>) -> f64 {
+    let (n, total) = busy.fold((0usize, 0.0f64), |(n, t), b| (n + 1, t + b.as_secs_f64()));
+    if n == 0 || wall.is_zero() {
+        return 0.0;
+    }
+    (1.0 - total / (n as f64 * wall.as_secs_f64())).max(0.0)
 }
 
 /// Where one forward frame's time went and what it moved, for the
@@ -548,6 +563,9 @@ pub struct FrameStats {
     pub t_emit: std::time::Duration,
     /// The own phase (filter, door, append, partitioned by owner), wall.
     pub t_own: std::time::Duration,
+    /// Barrier idle fractions of the two phases (`idle_fraction`).
+    pub emit_idle: f64,
+    pub own_idle: f64,
 }
 
 /// The result of a backward pass: the marked set plus how many row re-runs
@@ -814,31 +832,40 @@ pub fn backward_walk(
             unit_lanes(frame_reruns as usize, threads()),
         );
         let next_unit = AtomicUsize::new(0);
-        let hits: Vec<(usize, usize, Vec<bool>)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..threads())
-                .map(|_| {
-                    let (cands, cand_cells_of, units, next_unit, targets) =
-                        (&cands, &cand_cells_of, &units, &next_unit, &targets);
-                    scope.spawn(move || -> Result<Vec<(usize, usize, Vec<bool>)>> {
-                        let mut out = Vec::new();
-                        loop {
-                            let u = next_unit.fetch_add(1, Ordering::Relaxed);
-                            let Some(&(bi, lo, hi)) = units.get(u) else { break };
-                            let mut sink = ForwardSink::backward(targets, lo..hi);
-                            engine.run(&cands[bi], &cand_cells_of[bi], lo..hi, &mut sink)?;
-                            out.push((bi, lo, sink.hits().to_vec()));
-                        }
-                        Ok(out)
+        let (hits, busy): (Vec<(usize, usize, Vec<bool>)>, Vec<std::time::Duration>) =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads())
+                    .map(|_| {
+                        let (cands, cand_cells_of, units, next_unit, targets) =
+                            (&cands, &cand_cells_of, &units, &next_unit, &targets);
+                        scope.spawn(move || -> Result<(Vec<(usize, usize, Vec<bool>)>, std::time::Duration)> {
+                            let t = std::time::Instant::now();
+                            let mut out = Vec::new();
+                            loop {
+                                let u = next_unit.fetch_add(1, Ordering::Relaxed);
+                                let Some(&(bi, lo, hi)) = units.get(u) else { break };
+                                let mut sink = ForwardSink::backward(targets, lo..hi);
+                                engine.run(&cands[bi], &cand_cells_of[bi], lo..hi, &mut sink)?;
+                                out.push((bi, lo, sink.hits().to_vec()));
+                            }
+                            Ok((out, t.elapsed()))
+                        })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("backward worker panicked"))
-                .collect::<Result<Vec<_>>>()
-                .map(|v| v.into_iter().flatten().collect())
-        })?;
+                    .collect();
+                let per_worker = handles
+                    .into_iter()
+                    .map(|h| h.join().expect("backward worker panicked"))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut hits = Vec::new();
+                let mut busy = Vec::new();
+                for (h, b) in per_worker {
+                    hits.extend(h);
+                    busy.push(b);
+                }
+                Ok::<_, anyhow::Error>((hits, busy))
+            })?;
         t_run += t.elapsed();
+        let run_idle = idle_fraction(t.elapsed(), busy.into_iter());
         for (bi, lo, unit_hits) in hits {
             let keys = cands[bi].keys();
             let cells = &cand_cells_of[bi];
@@ -854,7 +881,7 @@ pub fn backward_walk(
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
         eprintln!(
             "[bwd] f{i:03} targets {}+{} cand-cells {} loaded {} rerun {} marked {} | \
-             load {:.0} run {:.0} total {:.0} ms",
+             load {:.0} run {:.0} (idle {:.0}%) total {:.0} ms",
             old_targets.len(),
             new_targets.len(),
             cells_layer_i.len(),
@@ -863,6 +890,7 @@ pub fn backward_walk(
             marked_now,
             ms(t_load),
             ms(t_run),
+            run_idle * 100.0,
             ms(t_frame.elapsed()),
         );
         crate::metrics::record("bwd.load", t_load);
@@ -1023,7 +1051,7 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         emit {:.0} own {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | rss {:.2} GB",
+         emit {:.0} (idle {:.0}%) own {:.0} (idle {:.0}%) ckpt {:.0} pos {:.0} total {:.0} ms | rss {:.2} GB",
         st.blocks_in,
         st.lanes_in,
         st.lanes_raw,
@@ -1032,7 +1060,9 @@ fn log_frame(
         st.lanes_out,
         visited,
         ms(st.t_emit),
+        st.emit_idle * 100.0,
         ms(st.t_own),
+        st.own_idle * 100.0,
         ms(t_ckpt),
         ms(t_pos),
         ms(t_total),

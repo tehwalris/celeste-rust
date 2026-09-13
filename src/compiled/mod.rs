@@ -108,6 +108,11 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
 /// The boundary ids, resolved once: the block's own column readers (the
 /// search's position and win columns, `frame::Block`) need them without an
 /// engine in hand.
+/// Build every rung's kernel set up front, in parallel (`asm_kernel::prebuild`).
+pub fn prebuild_kernels(precisions: &[crate::interpreter::abstraction::RemPrecision]) {
+    asm_kernel::prebuild(precisions)
+}
+
 pub fn ids() -> &'static runtime2::BoundaryIds {
     static IDS: std::sync::OnceLock<runtime2::BoundaryIds> = std::sync::OnceLock::new();
     IDS.get_or_init(boundary_ids)
