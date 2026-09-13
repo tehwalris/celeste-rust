@@ -271,6 +271,16 @@ impl FrameFile {
         self.header.width
     }
 
+    /// Drop the mapping's resident pages (they stay in the page cache and
+    /// fault back in on the next read). A backward keeps every layer mapped
+    /// and touches a slice of each per iteration; without this the touched
+    /// pages accumulate in RSS for the whole walk (42 GB at H=99).
+    pub fn release(&self) {
+        // SAFETY: a read-only, file-backed private mapping: MADV_DONTNEED
+        // discards resident pages, and a later access re-reads the file.
+        let _ = unsafe { self.map.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+    }
+
     pub fn shape_hash(&self) -> u64 {
         self.header.shape_hash
     }

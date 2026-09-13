@@ -282,14 +282,14 @@ impl<'a> ForwardSink<'a> {
 /// cross-precision link: a set membership, not a distance threshold.
 pub struct MarkFilter<'a> {
     /// The marked set from the previous, COARSER precision level.
-    marked: &'a Marks,
+    marked: &'a Visited,
     /// The coarser precision to widen down to before the membership test.
     coarser: crate::interpreter::abstraction::RemPrecision,
 }
 
 impl<'a> MarkFilter<'a> {
     pub fn new(
-        marked: &'a Marks,
+        marked: &'a Visited,
         coarser: crate::interpreter::abstraction::RemPrecision,
     ) -> Self {
         Self { marked, coarser }
@@ -572,112 +572,45 @@ pub struct FrameStats {
 /// it cost - the number to compare against the forward pass (backward must
 /// not exceed it; if it does, the narrowing is broken).
 pub struct BackwardResult {
-    pub marked: Marks,
+    pub marked: Visited,
     pub reruns: u64,
 }
 
-/// A backward pass's marked set: every state that can reach a win by the
-/// horizon, with its DISTANCE - the length of the shortest path from it to
-/// a win (0 = a win itself). Sharded like `Visited`. The distance is what
-/// makes the set INCREMENTAL across horizons (`backward_walk`): a state's
-/// distance does not depend on the horizon, only on whether it is marked
-/// at all, so the marks of horizon H are a subset of those of H+1 and a
-/// run at H+1 starts from them.
-#[derive(Default, Clone)]
-pub struct Marks {
-    /// `(shape, cell)` -> key -> `(dist, generation)`; the generation is
-    /// the run that last set the distance.
-    shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashMap<(u64, u64), (u32, u32)>>,
-    /// Marks by distance, for the targets of an iteration. May hold a
-    /// state at a distance it has since improved on; `at_dist` filters.
-    by_dist: Vec<Vec<(u64, (u64, u64), u32)>>,
-    /// The current run.
-    generation: u32,
+/// A level's checkpoint tree, every layer's files mapped once for the
+/// duration of a backward: a cell's rows in layer f are a cell-index lookup
+/// and a range copy per file.
+struct Tree {
+    layers: Vec<Vec<crate::search::checkpoint::FrameFile>>,
 }
 
-impl Marks {
-    pub fn new() -> Self {
-        Self::default()
+impl Tree {
+    fn open(dir: &std::path::Path, horizon: u32) -> Result<Self> {
+        Ok(Tree { layers: (0..=horizon).map(|f| frame_files(dir, f)).collect::<Result<_>>()? })
     }
-    /// Start a run: marks set from now on carry a new generation.
-    pub fn next_generation(&mut self) {
-        self.generation += 1;
-    }
-    /// Mark at `dist`, if the state is new or `dist` is shorter than its
-    /// current distance. True if it changed.
-    pub fn mark(&mut self, shape: u64, key: (u64, u64), cell: u32, dist: u32) -> bool {
-        let e = self.shards.entry((shape, cell)).or_default().entry(key).or_insert((u32::MAX, 0));
-        if e.0 <= dist {
-            return false;
-        }
-        *e = (dist, self.generation);
-        if self.by_dist.len() <= dist as usize {
-            self.by_dist.resize(dist as usize + 1, Vec::new());
-        }
-        self.by_dist[dist as usize].push((shape, key, cell));
-        true
-    }
-    pub fn contains(&self, shape: u64, key: (u64, u64), cell: u32) -> bool {
-        self.dist_of(shape, key, cell).is_some()
-    }
-    pub fn dist_of(&self, shape: u64, key: (u64, u64), cell: u32) -> Option<u32> {
-        self.shards.get(&(shape, cell)).and_then(|s| s.get(&key)).map(|e| e.0)
-    }
-    /// The marks at exactly `dist`, split into (set by an earlier run,
-    /// set by the current run).
-    fn at_dist(&self, dist: u32) -> (Vec<((u64, u64), u32)>, Vec<((u64, u64), u32)>) {
-        let (mut old, mut new) = (Vec::new(), Vec::new());
-        if let Some(v) = self.by_dist.get(dist as usize) {
-            for &(shape, key, cell) in v {
-                let Some(&(d, g)) = self.shards.get(&(shape, cell)).and_then(|s| s.get(&key)) else {
+
+    /// Every row at `cell` in layers `0..=upto`, one block per shape, in
+    /// layer order. Returns `(blocks, rows)`.
+    fn cell_rows(&self, cell: u32, upto: u32) -> Result<(Vec<Rt2>, usize)> {
+        let mut by_shape: Vec<Rt2> = Vec::new();
+        let mut loaded = 0usize;
+        for layer in &self.layers[..=upto as usize] {
+            for file in layer {
+                let r = file.rows_of_cell(cell);
+                if r.is_empty() {
                     continue;
-                };
-                if d != dist {
-                    continue; // improved on since
                 }
-                if g == self.generation {
-                    new.push((key, cell));
-                } else {
-                    old.push((key, cell));
+                let Some(rows) = file.load_rows(&[r])? else { continue };
+                loaded += rows.width;
+                match by_shape.iter_mut().find(|b| b.shape_hash == rows.shape_hash) {
+                    Some(acc) => {
+                        let all: Vec<u32> = (0..rows.width as u32).collect();
+                        acc.append_rows(&rows, &all);
+                    }
+                    None => by_shape.push(rows),
                 }
             }
         }
-        (old, new)
-    }
-    pub fn len(&self) -> usize {
-        self.shards.values().map(|s| s.len()).sum()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.shards.values().all(|s| s.is_empty())
-    }
-    /// `(entries, order-independent hash of the (content, cell) set)` - the
-    /// gate that two backward passes marked the same states. Distances and
-    /// sharding are not part of it.
-    pub fn fingerprint(&self) -> (usize, u64) {
-        use celeste_engine::runtime2::mix64;
-        let mut acc = 0u64;
-        for ((_shape, cell), keys) in &self.shards {
-            for &(k0, k1) in keys.keys() {
-                acc = acc.wrapping_add(mix64(k0 ^ mix64(k1 ^ (*cell as u64) << 1)));
-            }
-        }
-        (self.len(), acc)
-    }
-    /// Persist as `(shape, cell, key, dist)` rows.
-    pub fn save(&self, path: &std::path::Path) -> Result<()> {
-        let mut v: Vec<(u64, u32, u64, u64, u32)> = Vec::with_capacity(self.len());
-        for ((shape, cell), keys) in &self.shards {
-            v.extend(keys.iter().map(|(&(k0, k1), &(d, _))| (*shape, *cell, k0, k1, d)));
-        }
-        crate::search::checkpoint::save_value_to(path, &v)
-    }
-    pub fn load(path: &std::path::Path) -> Result<Self> {
-        let v: Vec<(u64, u32, u64, u64, u32)> = crate::search::checkpoint::load_value_from(path)?;
-        let mut out = Self::new();
-        for (shape, cell, k0, k1, d) in v {
-            out.mark(shape, (k0, k1), cell, d);
-        }
-        Ok(out)
+        Ok((by_shape, loaded))
     }
 }
 
@@ -690,214 +623,176 @@ impl Marks {
 /// with the frame as the anchor. The forward dedups across frames, so
 /// checkpoint f holds the states FIRST reached at f - a BFS distance
 /// layer, not "the states at frame f" - and a state reached at or before
-/// frame i may be at frame i. So: the initial targets are the wins of
-/// EVERY layer <= horizon; at iteration i the candidates are the rows of
-/// every layer <= i (narrowed to the cells that can step into a target)
-/// not yet marked at distance <= horizon - i, re-run against the marks
-/// at distance horizon - i - 1. A state marked at iteration i lies in a
-/// layer <= i and is `horizon - i` steps from a win: a path of length <=
-/// horizon. Complete for the same reason: a state that wins by the horizon
-/// from frame f >= its layer has a marked successor at the right
-/// iteration. (Two earlier forms of this walk were wrong: candidates from
-/// layer i only, and wins injected at their own layer's iteration - each
-/// missed every path link whose other end was first reached earlier, and
-/// refuted achievable horizons.)
+/// frame i may be at frame i. That is why the seeds are the wins of EVERY
+/// layer <= horizon (a win state at frame H may be filed under an earlier
+/// layer) and why at iteration i the candidates are the unmarked rows of
+/// every layer <= i, narrowed to the cells that can step into a target,
+/// re-run against the marks added at iteration i+1. A state marked at
+/// iteration i lies in a layer <= i and is `horizon - i` steps from a win:
+/// a path of length <= horizon. Complete for the same reason: a state that
+/// wins by the horizon from frame f >= its layer has a marked successor at
+/// the right iteration. (Two earlier forms of this walk were wrong:
+/// candidates from layer i only, and wins injected at their own layer's
+/// iteration - each missed every path link whose other end was first
+/// reached earlier, and refuted achievable horizons.)
 ///
-/// INCREMENTAL over `prev`, the marks of an earlier horizon on the same
-/// tree (level 0 persists across horizons): a mark's distance does not
-/// depend on the horizon, so `prev`'s marks are all still marks, and the
-/// only pairs (candidate, target) an earlier run has not already tested
-/// are (a) rows of the NEWLY admitted layer i against the old targets at
-/// distance `horizon - i - 1`, and (b) rows of every layer <= i against
-/// the targets this run marked (fresh, or an old mark now at a shorter
-/// distance). Everything else was tested with the same outcome. Without
-/// `prev` this is the from-scratch walk.
-///
-/// The re-run is WIDE: every candidate row goes through the frame step in
-/// backward mode (`ForwardSink::backward`) - the step materializes nothing
-/// and reports, per input row, whether any of its outputs is a target
-/// (provenance consumed at emission, plans/buckets.md). Marks are matched
-/// by key.
+/// One iteration is one parallel pass over the candidate CELLS, one cell
+/// per unit, pulled dynamically: a unit gathers the cell's rows from every
+/// layer <= i, drops the ones already marked (the marked set is read-only
+/// during the iteration), runs them through the frame step in backward
+/// mode (`ForwardSink::backward` - nothing materialized; per input row,
+/// does any output hit a target) and hands back the hits. The one barrier
+/// per iteration applies the hits to the marked set; they are the next
+/// iteration's targets. Marks are matched by key.
 pub fn backward_run(
     engine: &dyn FrameStep,
     dir: &std::path::Path,
     horizon: u32,
     graph: &crate::search::pos_graph::PosGraph,
-    prev: Option<Marks>,
 ) -> Result<BackwardResult> {
+    let tree = Tree::open(dir, horizon)?;
     // Seeds: the win states of every layer 1..=horizon (listed in each
     // checkpoint file's header; nothing is decoded).
-    let mut seeds: Vec<(u64, (u64, u64), u32)> = Vec::new();
-    for f in 1..=horizon {
-        for file in frame_files(dir, f)? {
-            seeds.extend(file.wins());
-        }
-    }
-    backward_walk(engine, dir, horizon, graph, seeds, prev)
+    let seeds: Vec<(u64, (u64, u64), u32)> =
+        tree.layers[1..].iter().flatten().flat_map(|f| f.wins()).collect();
+    backward_walk(engine, &tree, horizon, graph, seeds)
 }
 
 /// The backward walk itself, given the seeds (the states that count as
 /// marked on their own, i.e. the wins, from any layer). Factored out so a
 /// test can seed it directly; `backward_run` seeds from the win lanes.
-pub fn backward_walk(
+pub fn backward_walk_in(
     engine: &dyn FrameStep,
     dir: &std::path::Path,
     horizon: u32,
     graph: &crate::search::pos_graph::PosGraph,
     seeds: Vec<(u64, (u64, u64), u32)>,
-    prev: Option<Marks>,
+) -> Result<BackwardResult> {
+    backward_walk(engine, &Tree::open(dir, horizon)?, horizon, graph, seeds)
+}
+
+fn backward_walk(
+    engine: &dyn FrameStep,
+    tree: &Tree,
+    horizon: u32,
+    graph: &crate::search::pos_graph::PosGraph,
+    seeds: Vec<(u64, (u64, u64), u32)>,
 ) -> Result<BackwardResult> {
     use rustc_hash::FxHashSet;
 
-    let mut marks = prev.unwrap_or_default();
-    marks.next_generation();
+    let mut marked = Visited::new();
     let mut reruns: u64 = 0;
+    // `frontier` is the marks added in the previous iteration - the only
+    // targets a candidate's successor can newly hit (single pass).
+    let mut frontier: Vec<(u64, (u64, u64), u32)> = Vec::new();
     for (shape, k, c) in seeds {
-        marks.mark(shape, k, c, 0);
-    }
-    let cells_of = |targets: &[((u64, u64), u32)]| -> FxHashSet<u32> {
-        let mut cells = FxHashSet::default();
-        for &(_, c) in targets {
-            cells.extend(graph.srcs_of(c).iter().copied());
+        if marked.insert(shape, k, c) {
+            frontier.push((shape, k, c));
         }
-        cells
-    };
+    }
     for i in (1..horizon).rev() {
         let t_frame = std::time::Instant::now();
-        // The targets: the marks at distance `horizon - i - 1`, split into
-        // those an earlier run set (already tested against every layer
-        // < i) and this run's (tested against nothing yet).
-        let (old_targets, new_targets) = marks.at_dist(horizon - i - 1);
-        let d_mark = horizon - i;
-        let targets: FxHashSet<(u64, u64, u32)> = old_targets
+        let targets: FxHashSet<(u64, u64, u32)> =
+            frontier.iter().map(|&(_, k, c)| (k.0, k.1, c)).collect();
+        // Candidate cells = pos-graph predecessors of the targets' cells,
+        // sorted so the units (and the marks' insertion order) are a
+        // function of the frame, not of scheduling.
+        let mut cells: Vec<u32> = frontier
             .iter()
-            .chain(&new_targets)
-            .map(|&(k, c)| (k.0, k.1, c))
+            .flat_map(|&(_, _, c)| graph.srcs_of(c).iter().copied())
+            .collect::<FxHashSet<u32>>()
+            .into_iter()
             .collect();
-        let cells_new = cells_of(&new_targets);
-        let cells_old = cells_of(&old_targets);
-        let cells_layer_i: FxHashSet<u32> = cells_new.union(&cells_old).copied().collect();
+        cells.sort_unstable();
 
-        let (mut t_load, mut t_run) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-        let (mut loaded, mut frame_reruns, mut marked_now) = (0usize, 0u64, 0usize);
-        let t = std::time::Instant::now();
-        // Candidates: rows of every layer <= i in the narrowed cells - and
-        // in the old targets' cells only layer i, the one layer an earlier
-        // run did not test against them (at iteration i-1); at i == 1
-        // there was no iteration 0, so layers 0 and 1 are both untested.
-        // Not yet marked at distance <= d_mark. The layers are loaded in
-        // parallel, a range copy per file and cell.
-        let old_from = if i == 1 { 0 } else { i };
-        let layers: Vec<Vec<Block>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..=i)
-                .map(|f| {
-                    let cells = if f >= old_from { &cells_layer_i } else { &cells_new };
-                    scope.spawn(move || {
-                        if cells.is_empty() {
-                            Ok(Vec::new())
-                        } else {
-                            load_frame_cells(dir, f, cells)
+        // One unit per cell: gather, drop the marked, run, report hits.
+        struct UnitOut {
+            cell_idx: usize,
+            hits: Vec<(u64, (u64, u64), u32)>,
+            loaded: usize,
+            reruns: u64,
+            t_load: std::time::Duration,
+        }
+        let next_cell = AtomicUsize::new(0);
+        let per_worker: Vec<(Vec<UnitOut>, std::time::Duration)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads())
+                .map(|_| {
+                    let (cells, next_cell, targets, marked) = (&cells, &next_cell, &targets, &marked);
+                    scope.spawn(move || -> Result<(Vec<UnitOut>, std::time::Duration)> {
+                        let t_busy = std::time::Instant::now();
+                        let mut out = Vec::new();
+                        loop {
+                            let ci = next_cell.fetch_add(1, Ordering::Relaxed);
+                            let Some(&cell) = cells.get(ci) else { break };
+                            let t = std::time::Instant::now();
+                            let (blocks, loaded) = tree.cell_rows(cell, i)?;
+                            let t_load = t.elapsed();
+                            let mut u = UnitOut { cell_idx: ci, hits: Vec::new(), loaded, reruns: 0, t_load };
+                            for block in blocks {
+                                let shape = block.shape_hash;
+                                let block = Block::from_rt2(block);
+                                let mask: Vec<bool> =
+                                    block.keys().iter().map(|k| !marked.contains(shape, *k, cell)).collect();
+                                let Some(cand) = block.keep(&mask) else { continue };
+                                let cell_in = vec![cell; cand.lanes()];
+                                let mut sink = ForwardSink::backward(targets, 0..cand.lanes());
+                                engine.run(&cand, &cell_in, 0..cand.lanes(), &mut sink)?;
+                                u.reruns += cand.lanes() as u64;
+                                for (lane, hit) in sink.hits().iter().enumerate() {
+                                    if *hit {
+                                        u.hits.push((shape, cand.keys()[lane], cell));
+                                    }
+                                }
+                            }
+                            out.push(u);
                         }
+                        Ok((out, t_busy.elapsed()))
                     })
                 })
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().expect("layer loader panicked"))
+                .map(|h| h.join().expect("backward worker panicked"))
                 .collect::<Result<Vec<_>>>()
         })?;
-        let mut cands: Vec<Block> = Vec::new();
-        for block in layers.into_iter().flatten() {
-            loaded += block.lanes();
-            let cells = block.positions()?;
-            let shape = block.shard_shape();
-            let mask: Vec<bool> = block
-                .keys()
-                .iter()
-                .zip(&cells)
-                .map(|(k, &c)| marks.dist_of(shape, *k, c).is_none_or(|d| d > d_mark))
-                .collect();
-            if let Some(cand) = block.keep(&mask) {
-                cands.push(cand);
-            }
-        }
-        t_load += t.elapsed();
-        // The re-runs: units of candidate lanes over the workers, each
-        // reporting which of its input rows hit a target.
-        let t = std::time::Instant::now();
-        let cand_cells_of: Vec<Vec<u32>> = cands.iter().map(Block::positions).collect::<Result<_>>()?;
-        frame_reruns += cands.iter().map(|b| b.lanes() as u64).sum::<u64>();
-        let units = units_of(
-            cands.iter().map(Block::lanes),
-            unit_lanes(frame_reruns as usize, threads()),
-        );
-        let next_unit = AtomicUsize::new(0);
-        let (hits, busy): (Vec<(usize, usize, Vec<bool>)>, Vec<std::time::Duration>) =
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..threads())
-                    .map(|_| {
-                        let (cands, cand_cells_of, units, next_unit, targets) =
-                            (&cands, &cand_cells_of, &units, &next_unit, &targets);
-                        scope.spawn(move || -> Result<(Vec<(usize, usize, Vec<bool>)>, std::time::Duration)> {
-                            let t = std::time::Instant::now();
-                            let mut out = Vec::new();
-                            loop {
-                                let u = next_unit.fetch_add(1, Ordering::Relaxed);
-                                let Some(&(bi, lo, hi)) = units.get(u) else { break };
-                                let mut sink = ForwardSink::backward(targets, lo..hi);
-                                engine.run(&cands[bi], &cand_cells_of[bi], lo..hi, &mut sink)?;
-                                out.push((bi, lo, sink.hits().to_vec()));
-                            }
-                            Ok((out, t.elapsed()))
-                        })
-                    })
-                    .collect();
-                let per_worker = handles
-                    .into_iter()
-                    .map(|h| h.join().expect("backward worker panicked"))
-                    .collect::<Result<Vec<_>>>()?;
-                let mut hits = Vec::new();
-                let mut busy = Vec::new();
-                for (h, b) in per_worker {
-                    hits.extend(h);
-                    busy.push(b);
-                }
-                Ok::<_, anyhow::Error>((hits, busy))
-            })?;
-        t_run += t.elapsed();
-        let run_idle = idle_fraction(t.elapsed(), busy.into_iter());
-        for (bi, lo, unit_hits) in hits {
-            let keys = cands[bi].keys();
-            let cells = &cand_cells_of[bi];
-            let shape = cands[bi].shard_shape();
-            for (j, hit) in unit_hits.iter().enumerate() {
-                let lane = lo + j;
-                if *hit && marks.mark(shape, keys[lane], cells[lane], d_mark) {
-                    marked_now += 1;
+        let t_par = t_frame.elapsed();
+        let idle = idle_fraction(t_par, per_worker.iter().map(|(_, b)| *b));
+
+        // The barrier: apply the hits, in cell order.
+        let mut units: Vec<UnitOut> = per_worker.into_iter().flat_map(|(u, _)| u).collect();
+        units.sort_by_key(|u| u.cell_idx);
+        let (mut loaded, mut frame_reruns, mut t_load) = (0usize, 0u64, std::time::Duration::ZERO);
+        let mut new_frontier: Vec<(u64, (u64, u64), u32)> = Vec::new();
+        for u in units {
+            loaded += u.loaded;
+            frame_reruns += u.reruns;
+            t_load += u.t_load;
+            for (shape, k, c) in u.hits {
+                if marked.insert(shape, k, c) {
+                    new_frontier.push((shape, k, c));
                 }
             }
         }
         reruns += frame_reruns;
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
         eprintln!(
-            "[bwd] f{i:03} targets {}+{} cand-cells {} loaded {} rerun {} marked {} | \
-             load {:.0} run {:.0} (idle {:.0}%) total {:.0} ms",
-            old_targets.len(),
-            new_targets.len(),
-            cells_layer_i.len(),
+            "[bwd] f{i:03} targets {} cand-cells {} loaded {} rerun {} marked {} | \
+             load {:.0} (thread-ms) par {:.0} (idle {:.0}%) total {:.0} ms",
+            frontier.len(),
+            cells.len(),
             loaded,
             frame_reruns,
-            marked_now,
+            new_frontier.len(),
             ms(t_load),
-            ms(t_run),
-            run_idle * 100.0,
+            ms(t_par),
+            idle * 100.0,
             ms(t_frame.elapsed()),
         );
-        crate::metrics::record("bwd.load", t_load);
-        crate::metrics::record("bwd.run", t_run);
         crate::metrics::record("bwd.frame", t_frame.elapsed());
+        frontier = new_frontier;
+        tree.layers.iter().flatten().for_each(|f| f.release());
     }
-    Ok(BackwardResult { marked: marks, reruns })
+    Ok(BackwardResult { marked, reruns })
 }
 
 /// The forward search driver's state: the frontier, the visited set and
@@ -1264,9 +1159,6 @@ where
     base_dir: &'a std::path::Path,
     precisions: &'a [crate::interpreter::abstraction::RemPrecision],
     level0: Option<(Box<dyn FrameStep>, ForwardState)>,
-    /// Level 0's marks from the last horizon, the next horizon's backward
-    /// starts from them (`backward_walk` is incremental).
-    level0_marks: Option<Marks>,
 }
 
 impl<'a, E, I> Ladder<'a, E, I>
@@ -1280,7 +1172,7 @@ where
         base_dir: &'a std::path::Path,
         precisions: &'a [crate::interpreter::abstraction::RemPrecision],
     ) -> Self {
-        Ladder { make_engine, make_initial, base_dir, precisions, level0: None, level0_marks: None }
+        Ladder { make_engine, make_initial, base_dir, precisions, level0: None }
     }
 
     fn level_dir(&self, horizon: u32, level: usize) -> std::path::PathBuf {
@@ -1311,7 +1203,7 @@ where
     }
 
     pub fn at_horizon(&mut self, horizon: u32) -> Result<HorizonOutcome> {
-        let mut prev: Option<(Marks, crate::interpreter::abstraction::RemPrecision)> = None;
+        let mut prev: Option<(Visited, crate::interpreter::abstraction::RemPrecision)> = None;
         for level in 0..self.precisions.len() {
             let precision = self.precisions[level];
             let dir = self.level_dir(horizon, level);
@@ -1345,15 +1237,8 @@ where
                 Some(e) => e.as_ref(),
                 None => self.level0.as_ref().expect("level 0").0.as_ref(),
             };
-            // `CELESTE_BACKWARD_SCRATCH=1`: level 0's backward from scratch at
-            // every horizon - the A/B for the incremental walk.
-            let scratch = std::env::var_os("CELESTE_BACKWARD_SCRATCH").is_some();
-            let prev_marks = if level == 0 && !scratch { self.level0_marks.take() } else { None };
-            let bwd = backward_run(engine, &dir, horizon, &graph, prev_marks)?;
+            let bwd = backward_run(engine, &dir, horizon, &graph)?;
             bwd.marked.save(&marks_path(self.base_dir, horizon, level))?;
-            if level == 0 {
-                self.level0_marks = Some(bwd.marked.clone());
-            }
             let (n, fp) = bwd.marked.fingerprint();
             eprintln!(
                 "[ladder] h{horizon} level {level} ({precision:?}): first win f{h}, marked {n} states \
@@ -1491,11 +1376,11 @@ mod tests {
         assert!(!frame1.is_empty(), "baseline produced no frame 1");
 
         // marked_full = the widened-to-Bits(0) keys of every frame-1 state.
-        let mut marked_full = Marks::new();
+        let mut marked_full = Visited::new();
         for b in &frame1 {
             let (shape, keys, cells) = widened_keys(b, bits0).expect("widened keys");
             for (k, &c) in keys.iter().zip(&cells) {
-                marked_full.mark(shape, *k, c, 0);
+                marked_full.insert(shape, *k, c);
             }
         }
 
@@ -1510,7 +1395,7 @@ mod tests {
 
         // With an empty marked set, everything is discarded.
         {
-            let empty = Marks::new();
+            let empty = Visited::new();
             let f = MarkFilter::new(&empty, bits0);
             let e = engine_clone(&engine);
             forward_run(&e, seed(), dir, 1, false, Some(&f)).expect("empty-filter run");
@@ -1738,7 +1623,7 @@ mod tests {
             .collect();
         assert!(!seed.is_empty(), "no states at the horizon to seed from");
 
-        let bwd = backward_walk(&engine, dir, horizon, &graph, seed, None).expect("backward");
+        let bwd = backward_walk_in(&engine, dir, horizon, &graph, seed).expect("backward");
         eprintln!(
             "[backward] marked {} states, {} re-runs",
             bwd.marked.len(),

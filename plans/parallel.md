@@ -69,24 +69,28 @@ owner the visited set is still per-cell.
 - The `class` bucketing (already gone) is not coming back for this: the
   owner's pieces are per shape.
 
-## The incremental level-0 backward (same night)
+## The backward: one unit per cell, one barrier per iteration (2026-09-13)
 
-`Marks` carries each marked state's DISTANCE to a win (0 = a win). A
-distance does not depend on the horizon, so the marks of horizon H are a
-subset of those of H+1, and `backward_walk` takes the previous horizon's
-marks as `prev`. At iteration i (targets = marks at distance H-i-1) the
-only pairs an earlier run has not tested are the newly admitted layer i
-against the OLD targets (an earlier run tested layers <= i-1 against them
-at its iteration i-1 - except at i == 1, where iteration 0 never ran, so
-layers 0 and 1 are both untested; the first draft missed exactly one
-state per horizon there) and every layer <= i against this run's NEW
-targets (fresh marks, or old marks now at a shorter distance). Marks are
-matched by key; a re-run only ever shortens a distance.
+The first parallel backward kept the phased shape of the serial one -
+load every layer, filter, re-run as lane units, mark - with two barriers
+and three serial passes per iteration. Philippe's version replaced it:
+the unit is a (cell, all layers <= i); a worker gathers the cell's rows
+from every mapped layer file (cell index + range copy), drops the rows
+the read-only marked set already holds, runs them through the frame
+step in backward mode against the read-only target set, and hands back
+the hits. The one barrier per iteration applies the hits to the marked
+set, in cell order; they are the next iteration's targets. All of a
+cell's rows go through the kernel together (same collision tiles, same
+few target cells), and nothing is shared for writing.
 
-Gate: `CELESTE_BACKWARD_SCRATCH=1` runs level 0 from scratch at every
-horizon; the marks (sets AND distances) must be identical to the
-incremental run's, and the marks gate file carries the incremental
-re-run counts.
+The incremental variant (marks with distances, only untested pairs
+re-run) was built, measured exact against from-scratch, and REMOVED the
+same day: it saved ~15 s of a 524 s run and did not fit the per-cell
+structure. Non-incremental and simple wins.
+
+Seeds are the win rows of every layer <= H, not layer H alone: a win
+state reached at frame H is filed under the layer where the forward
+FIRST reached it, which may be earlier.
 
 ## Measurements
 
