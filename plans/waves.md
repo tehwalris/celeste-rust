@@ -370,6 +370,14 @@ door 0.35 s, ckpt 0.8 s) against 9.5 s two-phase, door 5.96 GB against
 8.8 GB of hash sets, queues 0.25 GB against ~8 GB of slots. The three
 memory cuts compose: 44 GB (glibc) -> 24.8 (mimalloc) -> 14.2 (waves).
 
+## Room (0,0): 93 (2026-09-13)
+
+The full search: OPTIMAL 93 in 2 h 32 min, 31.1 GB peak, matching the
+reference solution frame for frame (BENCHMARK_DATA.md has the per-step
+table). Of the 9,036 s of horizon steps, the finer levels are 7,255 s -
+and at h93 they are 2,829 of 3,125 s. That is the tail the next two
+sections are about.
+
 ## The finer rungs (2026-09-13, measured on the room (0,0) run)
 
 The ladder's cost past the first level-0 win grows ~x1.3-1.6 per horizon

@@ -1,3 +1,37 @@
+# Room (0,0) full search (2026-09-13, release, 16 threads, waves frame)
+
+`rewrite search --room 0,0 --from 1 --to 130`: **OPTIMAL win frame: 93**,
+2 h 32 min (9,099 s), peak RSS 31.1 GB. 93 is the community any% 100m
+TAS's exit frame in the original cart (66 inputs after a 27-frame
+offset), and `tas/room_0_0_reference_frame_93.txt` is the same path
+found for our game by `rewrite trajectory` and replayed on a real
+PICO-8. Level 0 first wins at f79; the ladder climbs 14 horizons. Per
+horizon step (the level-0 backward, then every finer level's forward +
+backward; "reached" = the deepest level that ran):
+
+| horizon | level-0 backward | finer levels | reached level |
+|---|---|---|---|
+| h79 | 179 s | 0 s | 1 |
+| h80 | 15 s | 1 s | 1 |
+| h81 | 19 s | 3 s | 1 |
+| h82 | 27 s | 8 s | 1 |
+| h83 | 35 s | 10 s | 1 |
+| h84 | 44 s | 22 s | 1 |
+| h85 | 59 s | 37 s | 1 |
+| h86 | 75 s | 60 s | 1 |
+| h87 | 96 s | 151 s | 3 |
+| h88 | 125 s | 250 s | 3 |
+| h89 | 149 s | 426 s | 3 |
+| h90 | 200 s | 684 s | 4 |
+| h91 | 214 s | 1061 s | 5 |
+| h92 | 249 s | 1713 s | 7 |
+| h93 | 296 s | 2829 s | 16 |
+
+The level-0 backward grows x1.2 per step; the finer levels x1.6 and they
+are 90% of the last step. The finer rungs' kernels were the 4x
+fork-enumeration blow-up (plans/waves.md "The finer rungs"), fixed the
+same evening by the single-grid fork.
+
 # The waves frame vs the two-phase frame, room (1,0) f0-f70 (2026-09-13, release, 16 threads)
 
 `./safe-run.sh -- ./target/release/rewrite forward --to 70 --room 1,0`,
