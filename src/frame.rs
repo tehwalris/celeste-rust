@@ -1131,6 +1131,11 @@ impl ForwardState {
                 next
             };
         }
+        // The level's graph so far, beside its frames: a backward can then
+        // run on the tree alone (`rewrite bench-backward`).
+        if let Some(o) = self.observer.as_ref() {
+            o.snapshot().save(&pos_graph_path(dir))?;
+        }
         Ok(())
     }
 
@@ -1138,6 +1143,11 @@ impl ForwardState {
     pub fn pos_graph(&self) -> Option<crate::search::pos_graph::PosGraph> {
         self.observer.as_ref().map(|o| o.snapshot())
     }
+}
+
+/// Where a level's position graph is saved alongside its frames.
+pub fn pos_graph_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("posgraph.bin")
 }
 
 /// A whole forward run in one call: frame 0 from `initial`, then frames

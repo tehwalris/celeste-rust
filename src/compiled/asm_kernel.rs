@@ -190,6 +190,10 @@ impl AsmKernel {
         CALL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         CALL_STATS[1].fetch_add(lanes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         CALL_STATS[2].fetch_add(lanes.len().div_ceil(16) as u64 * 16, std::sync::atomic::Ordering::Relaxed);
+        // The call's utilization tallies (folded into `CALL_STATS` once at
+        // the end): (body, slice) pairs evaluated and those with any taken
+        // lane, lane emissions before and after the dedup cache.
+        let (mut n_bodies, mut n_bodies_taken, mut n_lanes, mut n_unique) = (0u64, 0u64, 0u64, 0u64);
         let mut lo = lanes.start;
         while lo < lanes.end {
             let n = 16.min(lanes.end - lo);
@@ -246,9 +250,12 @@ impl AsmKernel {
                     return false;
                 }
                 let mut take = live & ok & valid;
+                n_bodies += 1;
                 if take == 0 {
                     continue;
                 }
+                n_bodies_taken += 1;
+                n_lanes += take.count_ones() as u64;
                 let template = &self.acc_templates[body.outcome];
                 while take != 0 {
                     let i = take.trailing_zeros() as usize;
@@ -280,6 +287,7 @@ impl AsmKernel {
                             continue;
                         }
                         sink.emitted += 1;
+                        n_unique += 1;
                         let cout = cell_out(body, outbuf, i, start);
                         if targets.contains(&(key.0, key.1, cout)) {
                             sink.hit(lo + i);
@@ -298,6 +306,7 @@ impl AsmKernel {
                         continue;
                     }
                     sink.emitted += 1;
+                    n_unique += 1;
                     let cout = cell_out(body, outbuf, i, start);
                     if sink.edges_on && last_edge != (cin, cout) {
                         last_edge = (cin, cout);
@@ -319,6 +328,9 @@ impl AsmKernel {
             lo += n;
         }
         sc.put_back();
+        for (i, n) in [n_bodies, n_bodies_taken, n_lanes, n_unique].into_iter().enumerate() {
+            CALL_STATS[3 + i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
         true
     }
 
@@ -1089,14 +1101,11 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
 /// Kernel call shape: [0] calls, [1] rows offered, [2] slice-lanes executed
 /// (16 per slice, so `[2] - [1]` is the padding). The per-call fixed cost
 /// (accumulators, buffers, seen sets, boundary) is paid once per [0].
-static CALL_STATS: [std::sync::atomic::AtomicU64; 3] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
+static CALL_STATS: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// Take (and reset) the call-shape counters.
-pub(crate) fn take_call_stats() -> [u64; 3] {
+pub(crate) fn take_call_stats() -> [u64; 7] {
     std::array::from_fn(|i| CALL_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 

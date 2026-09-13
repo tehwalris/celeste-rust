@@ -150,7 +150,7 @@ pub fn block_cells(rt2: &Rt2) -> Result<Vec<u32>> {
 /// The finished table: for each destination cell, the cells a predecessor
 /// of it was ever in, as a sorted CSR. Deliberately the transpose - the
 /// sweep only ever asks the backward question.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct PosGraph {
     /// `srcs[offsets[d] .. offsets[d + 1]]` for destination cell `d`.
     offsets: Vec<u32>,
@@ -158,6 +158,16 @@ pub struct PosGraph {
 }
 
 impl PosGraph {
+    /// Persist (`ForwardState::extend` writes a level's graph after every
+    /// extension, so a backward can be run on the tree alone).
+    pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        crate::search::checkpoint::save_value_to(path, self)
+    }
+
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        crate::search::checkpoint::load_value_from(path)
+    }
+
     pub fn pairs(&self) -> usize {
         self.srcs.len()
     }

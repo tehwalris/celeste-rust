@@ -115,6 +115,17 @@ enum Command {
         #[arg(long, default_value = "1,0")]
         room: String,
     },
+    /// Microbenchmark of ONE backward: a level's tree and pos-graph
+    /// (`frames/` and `posgraph.bin` under `level_dir`, as `rewrite forward`
+    /// writes them), the walk at `horizon`, timed.
+    BenchBackward {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long, default_value_t = 99)]
+        horizon: u32,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+    },
     /// Extract a concrete input sequence that wins by `horizon` from one
     /// level's marks: a DFS from the initial state through the reference
     /// engine's concrete single-input step, admitting a successor only if
@@ -398,6 +409,30 @@ fn main() -> Result<()> {
                 );
             }
             celeste_rust::compiled::dispatch::print_kernel_hits();
+        }
+        Command::BenchBackward {
+            level_dir,
+            horizon,
+            room,
+        } => {
+            use celeste_rust::frame::{backward_run, pos_graph_path, threads};
+            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            set_rem_precision(RemPrecision::Bits(0));
+            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+            let dir = std::path::Path::new(&level_dir);
+            let graph = celeste_rust::search::pos_graph::PosGraph::load(&pos_graph_path(dir))?;
+            eprintln!("[bench] level-0 tree {}, pos-graph {} pairs; {} threads", dir.display(), graph.pairs(), threads());
+            let t = std::time::Instant::now();
+            let bwd = backward_run(&engine, dir, horizon, &graph)?;
+            let (n, fp) = bwd.marked.fingerprint();
+            println!(
+                "[bench] backward h{horizon}: {:.2} s, marked {n} (fingerprint {fp:016x}), {} re-runs",
+                t.elapsed().as_secs_f64(),
+                bwd.reruns
+            );
+            celeste_rust::compiled::dispatch::print_kernel_hits();
+            celeste_rust::metrics::dump("bench-backward", None, &[]);
         }
         Command::Witness {
             checkpoint_dir,

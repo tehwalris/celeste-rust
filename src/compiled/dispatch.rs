@@ -136,7 +136,8 @@ pub fn print_kernel_hits() {
     if v.iter().any(|x| *x > 0) {
         eprintln!("kernel lanes: traced {} missed {}", v[0], v[1]);
     }
-    let [calls, rows, slice_lanes] = super::asm_kernel::take_call_stats();
+    let [calls, rows, slice_lanes, bodies, bodies_taken, lane_emits, unique] =
+        super::asm_kernel::take_call_stats();
     if calls > 0 {
         eprintln!(
             "kernel calls: {} calls, {} rows ({:.1} rows/call), {} slice-lanes executed \
@@ -146,6 +147,17 @@ pub fn print_kernel_hits() {
             rows as f64 / calls as f64,
             slice_lanes,
             100.0 * (slice_lanes - rows) as f64 / slice_lanes as f64
+        );
+        eprintln!(
+            "kernel utilization: {} (body, slice) evaluations, {} ({:.1}%) took a lane; \
+             {} lane emissions ({:.1} per input row), {} after the call's dedup cache ({:.1}%)",
+            bodies,
+            bodies_taken,
+            100.0 * bodies_taken as f64 / bodies.max(1) as f64,
+            lane_emits,
+            lane_emits as f64 / rows.max(1) as f64,
+            unique,
+            100.0 * unique as f64 / lane_emits.max(1) as f64
         );
     }
 }
