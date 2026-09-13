@@ -1,3 +1,19 @@
+# Synthetic early-finish A/B for the single-grid fork, room (0,0) (2026-09-13)
+
+`rewrite search --room 0,0 --from 1 --to 80 --win-at 36,85` (a synthetic
+win at a position the reference path reaches at f40; level 0 first wins
+at f39 and h39 confirms through Exact: one horizon step, 17 rungs), same
+marked sets and fingerprints at every level:
+
+| binary | wall | peak RSS |
+|---|---|---|
+| before the single-grid fork (`43a9f1f`) | 48.9 s | 7.8 GB |
+| single-grid fork (`740e093`) | 27.8 s | 9.8 GB |
+
+Both include the ~9 s kernel prebuild and the level-0 forward to f39,
+which are unchanged, so the ladder part itself is ~3x faster here; the
+per-step table below (the real search to h92) is the better measure.
+
 # Room (0,0) search with the single-grid fork, stopped at h92 (2026-09-13)
 
 The same `rewrite search --room 0,0` as below, on the single-grid fork
