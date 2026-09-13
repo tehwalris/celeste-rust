@@ -651,8 +651,11 @@ pub fn zn_tile_flag_at_lanes(
 /// megabytes per unit and every probe was a cache miss - a third of the
 /// append loop (2026-09-14).
 pub struct RowCache {
-    /// `(key.1, generation, tag)`; the slot index comes from `key.0`.
-    slots: Vec<(u64, u32, u32)>,
+    /// `(key.1, generation, tag, row ref)`; the slot index comes from
+    /// `key.0`. The row ref is the emitter's handle on the row it pushed
+    /// for this key (the forward's queue and row), so a later emission of
+    /// the same key from another lane can mark itself as a predecessor.
+    slots: Vec<(u64, u32, u32, u32)>,
     mask: usize,
     gen: u32,
 }
@@ -664,13 +667,12 @@ impl Default for RowCache {
 }
 
 impl RowCache {
-    /// 32k entries of 16 bytes: 512 KB, half a core's L2 (two threads
-    /// share a core).
+    /// 32k entries of 24 bytes: 768 KB, most of a core's L2.
     pub const CAPACITY: usize = 1 << 15;
     const PROBES: usize = 4;
 
     pub fn new() -> Self {
-        RowCache { slots: vec![(0, 0, 0); Self::CAPACITY], mask: Self::CAPACITY - 1, gen: 1 }
+        RowCache { slots: vec![(0, 0, 0, 0); Self::CAPACITY], mask: Self::CAPACITY - 1, gen: 1 }
     }
 
     /// Forget every key (O(1): bumps the generation).
@@ -688,6 +690,28 @@ impl RowCache {
     /// insert)` if it was.
     #[inline(always)]
     pub fn insert_tagged(&mut self, k: (u64, u64), tag: u32) -> Option<u32> {
+        self.insert_ref(k, tag, 0).map(|(t, _)| t)
+    }
+
+    /// Set the row ref of `k`'s entry (just inserted). A miss (evicted
+    /// since) is fine: the next emission of `k` will push the row again.
+    #[inline(always)]
+    pub fn set_ref(&mut self, k: (u64, u64), row_ref: u32) {
+        let base = k.0 as usize;
+        for p in 0..Self::PROBES {
+            let i = (base + p) & self.mask;
+            let s = &mut self.slots[i];
+            if s.1 == self.gen && s.0 == k.1 {
+                s.3 = row_ref;
+                return;
+            }
+        }
+    }
+
+    /// `insert_tagged` with a row ref: `Some((tag, row ref) of the first
+    /// insert)` if `k` was present.
+    #[inline(always)]
+    pub fn insert_ref(&mut self, k: (u64, u64), tag: u32, row_ref: u32) -> Option<(u32, u32)> {
         let base = k.0 as usize;
         let mut victim = base & self.mask;
         for p in 0..Self::PROBES {
@@ -698,10 +722,10 @@ impl RowCache {
                 break;
             }
             if s.0 == k.1 {
-                return Some(s.2);
+                return Some((s.2, s.3));
             }
         }
-        self.slots[victim] = (k.1, self.gen, tag);
+        self.slots[victim] = (k.1, self.gen, tag, row_ref);
         None
     }
 }

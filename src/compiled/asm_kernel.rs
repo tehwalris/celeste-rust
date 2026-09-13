@@ -203,6 +203,14 @@ impl AsmKernel {
         let mut lo = lanes.start;
         while lo < lanes.end {
             let n = 16.min(lanes.end - lo);
+            // The slice's first input id (ids are consecutive within a
+            // block), and the lanes to skip (won rows: checkpointed, never
+            // expanded).
+            let slice_base: Option<u64> = sink.ids_in.map(|ids| ids[lo]);
+            let skip: u16 = match sink.skip_in {
+                Some(sk) => (0..n).filter(|&i| sk[lo + i]).fold(0u16, |m, i| m | (1 << i)),
+                None => 0,
+            };
             self.pack_input(&views, lo, n, inbuf);
             unsafe {
                 (self.loaded.func)(
@@ -258,7 +266,7 @@ impl AsmKernel {
                     // could not DECIDE). A coverage gap for the whole call.
                     return false;
                 }
-                let mut take = live & ok & valid;
+                let mut take = live & ok & valid & !skip;
                 n_bodies += 1;
                 if take == 0 {
                     continue;
@@ -303,29 +311,29 @@ impl AsmKernel {
                         runtime2::mix64(part.1.wrapping_add(h2)),
                     );
                     let cin = cell_in[lo + i];
-                    // Graph mode: the input row's id rides along, and the
-                    // call's dedup is per (row, input) rather than per row,
-                    // since every (pred, state) pair is an edge.
-                    let pid = sink.ids_in.map(|ids| ids[lo + i]);
-                    // (The cache indexes by the first half and compares the
-                    // second, so BOTH halves carry the input's id.)
-                    let seen_key = match pid {
-                        Some(p) => (key.0 ^ runtime2::mix64(p), key.1 ^ runtime2::mix64(p ^ 0x9e37_79b9_7f4a_7c15)),
-                        None => key,
-                    };
                     // EMISSION-TIME PROVENANCE (plans/buckets.md). The
                     // source of this row is lane `i` of this slice, and
                     // everything that needs to know is told right here:
-                    // the pos-graph edge and the owner.
-                    if let Some(first_cin) = seen.insert_tagged(seen_key, cin) {
+                    // the pos-graph edge and THE EDGE (plans/waves.md, the
+                    // explicit graph): the input rows are lanes `lo..lo+n`,
+                    // consecutive ids from `slice_base`, and a queued row
+                    // carries a 16-bit mask of the lanes that produced it,
+                    // reached through the cache's row ref.
+                    if let Some((first_cin, row_ref)) = seen.insert_ref(key, cin, 0) {
                         // A re-emission of a row this call already produced.
                         // Nothing to push - but if it came from a DIFFERENT
                         // input cell, that is a pos-graph edge the first
-                        // emission did not record.
+                        // emission did not record - and this lane is one
+                        // more predecessor of it.
                         if sink.edges_on && first_cin != cin {
                             sink.edges.insert((cin, cell_out(body, outbuf, i, start)));
                         }
-                        continue;
+                        match slice_base {
+                            // The row was flushed since: push it again (the
+                            // flush merges duplicates by key).
+                            Some(b) if !sink.mark_pred(row_ref, b, i) => {}
+                            _ => continue,
+                        }
                     }
                     sink.emitted += 1;
                     n_unique += 1;
@@ -339,8 +347,10 @@ impl AsmKernel {
                     // run of rows at one cell.
                     let q = sink.queue(template.shape_hash, cout, || (*template.union).clone_block());
                     cols.push_row(&mut sink.slots[q], outbuf, i, key, cout);
-                    if let Some(p) = pid {
-                        sink.slots[q].preds.push(p);
+                    if let Some(b) = slice_base {
+                        sink.slots[q].pred_base.push(b);
+                        sink.slots[q].pred_mask.push(1 << i);
+                        seen.set_ref(key, sink.row_ref(q));
                     }
                     sink.pushed(q).expect("flushing a full queue");
                 }

@@ -39,6 +39,10 @@ pub struct Block {
     ids: Vec<u64>,
     /// The piece's file seq within its layer (`s{shape}_{seq}.bin`).
     seq: u32,
+    /// Lanes the frame step must not expand (won rows: checkpointed as
+    /// backward seeds, never expanded); empty when none. Kept as a mask
+    /// rather than dropped so the rows' ids stay consecutive.
+    skip: Vec<bool>,
 }
 
 /// A state's stable id: its layer (the frame it was first reached), the
@@ -73,7 +77,7 @@ impl Block {
             rt2.row_keys.len(),
             rt2.width
         );
-        Block { rt2, ids: Vec::new(), seq: 0 }
+        Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() }
     }
 
     /// A block from a reference-interpreter `State`, keyed by the one
@@ -83,7 +87,7 @@ impl Block {
         let (cart, cache) = crate::compiled::room_context()?;
         let mut rt2 = crate::compiled::bridge::import_block(state, cart, cache);
         rt2.row_keys_canonical();
-        Ok(Block { rt2, ids: Vec::new(), seq: 0 })
+        Ok(Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() })
     }
 
     /// The block as an interpreter `State` (`bridge::export_block`), for the
@@ -137,7 +141,25 @@ impl Block {
         if !self.ids.is_empty() {
             self.ids = keep.iter().map(|&i| self.ids[i as usize]).collect();
         }
+        if !self.skip.is_empty() {
+            self.skip = keep.iter().map(|&i| self.skip[i as usize]).collect();
+        }
         Some(self)
+    }
+
+    /// Mark lanes the frame step must not expand.
+    pub fn set_skip(&mut self, skip: Vec<bool>) {
+        assert_eq!(skip.len(), self.lanes());
+        self.skip = if skip.iter().any(|&s| s) { skip } else { Vec::new() };
+    }
+
+    pub fn skip(&self) -> &[bool] {
+        &self.skip
+    }
+
+    /// Lanes that will be expanded (not skipped).
+    pub fn active_lanes(&self) -> usize {
+        self.lanes() - self.skip.iter().filter(|&&s| s).count()
     }
 
     /// A piece of a layer: its rows' ids and its file seq.
@@ -263,8 +285,18 @@ pub struct Slot {
     pub cols: Vec<(usize, TCol)>,
     pub keys: Vec<(u64, u64)>,
     pub cells: Vec<u32>,
-    /// GRAPH MODE (`ForwardSink::ids_in`): the input row's id per row.
-    pub preds: Vec<u64>,
+    /// The row's predecessors in the slice that emitted it: the slice's
+    /// first input id and a bit per lane (`ForwardSink::ids_in`).
+    pub pred_base: Vec<u64>,
+    pub pred_mask: Vec<u16>,
+    /// Predecessors from OTHER slices of the same kernel call (the call
+    /// dedups its emissions, so a row is pushed once per call and its
+    /// later producers land here): `(row, slice base, lane mask)`.
+    pub extra: Vec<(u32, u64, u16)>,
+    /// Bumped at every flush; a row ref (`ForwardSink::row_ref`) carries
+    /// the generation it was made under, so a ref into a flushed queue is
+    /// recognised as stale rather than reaching another cell's rows.
+    pub gen: u16,
 }
 
 impl Slot {
@@ -293,7 +325,10 @@ impl Slot {
             cols,
             keys: Vec::new(),
             cells: Vec::new(),
-            preds: Vec::new(),
+            pred_base: Vec::new(),
+            pred_mask: Vec::new(),
+            extra: Vec::new(),
+            gen: 0,
         }
     }
 
@@ -326,7 +361,10 @@ impl Slot {
         }
         self.keys.clear();
         self.cells.clear();
-        self.preds.clear();
+        self.pred_base.clear();
+        self.pred_mask.clear();
+        self.extra.clear();
+        self.gen = self.gen.wrapping_add(1);
     }
 
     /// An empty block of this slot's shape for the rows to land in.
@@ -480,9 +518,22 @@ impl Slot {
     }
 }
 
-/// Graph mode's state ids: the tree's rows by their 128-bit key
-/// (`rewrite graph`).
-pub type GraphIds = rustc_hash::FxHashMap<(u64, u64), u32>;
+/// A worker's per-layer edge buffer is appended to its file at this size.
+const EDGE_BUF_BYTES: usize = 1 << 20;
+
+/// One edge record on disk: target id, slice base id, lane mask.
+pub const EDGE_RECORD_BYTES: usize = 18;
+
+/// Append `buf` to `<dir>/l{layer}/w{worker}.bin` and clear it.
+fn write_edges(dir: &std::path::Path, layer: usize, worker: u32, buf: &mut Vec<u8>) -> Result<()> {
+    use std::io::Write;
+    let ldir = dir.join(format!("l{:03}", layer));
+    std::fs::create_dir_all(&ldir)?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(ldir.join(format!("w{:03}.bin", worker)))?;
+    f.write_all(buf)?;
+    buf.clear();
+    Ok(())
+}
 
 /// The backward's target set - the marks of the previous iteration as
 /// `(key, cell)` - with a bitmap in front of it: one bit per low-22-bit
@@ -573,14 +624,19 @@ pub struct ForwardSink<'a> {
     last: ((u64, u32), u32),
     door: Option<&'a crate::search::door::Door>,
     filter: Option<&'a MarkFilter<'a>>,
-    /// GRAPH MODE (`rewrite graph`): no door; every flushed row becomes
-    /// the edge (its input row's id -> the state's id, looked up here).
-    graph: Option<&'a GraphIds>,
     /// The ids of the block being run, per lane (set by the worker before
-    /// each unit in graph mode); the step reads `ids_in[lane]`.
+    /// each unit); the step reads `ids_in[lo]` as the slice's base and
+    /// records predecessors as masks over the slice.
     pub ids_in: Option<&'a [u64]>,
-    /// Graph mode's output: `(target id, pred id)` per flushed row.
-    pub graph_edges: Vec<(u32, u32)>,
+    /// Lanes of the block being run that must not be expanded.
+    pub skip_in: Option<&'a [bool]>,
+    /// Where the edges go: `<dir>/l{target layer}/w{worker}.bin`, records
+    /// of `(target id u64, slice base id u64, lane mask u16)`, appended as
+    /// the per-layer buffers fill. `None`: no recording.
+    edges_dir: Option<std::path::PathBuf>,
+    edge_bufs: Vec<Vec<u8>>,
+    pub edge_records: u64,
+
     /// This worker's next-frame rows, one piece per shape: the block, its
     /// file seq in the layer (`worker * 256 + k`), and its rows' ids.
     pieces: rustc_hash::FxHashMap<u64, (Rt2, u32, Vec<u64>)>,
@@ -594,6 +650,8 @@ pub struct ForwardSink<'a> {
     pub flushed_rows: u64,
     sort_buf: Vec<((u64, u64), u32)>,
     keys_buf: Vec<(u64, u64)>,
+    uniq_buf: Vec<u32>,
+    row_uniq: Vec<u32>,
     new_buf: Vec<u32>,
     ids_buf: Vec<u64>,
     rows_buf: Vec<u32>,
@@ -628,9 +686,11 @@ impl<'a> ForwardSink<'a> {
             last: NO_QUEUE,
             door: None,
             filter: None,
-            graph: None,
             ids_in: None,
-            graph_edges: Vec::new(),
+            skip_in: None,
+            edges_dir: None,
+            edge_bufs: Vec::new(),
+            edge_records: 0,
             pieces: Default::default(),
             frame: 0,
             worker: 0,
@@ -640,6 +700,8 @@ impl<'a> ForwardSink<'a> {
             flushed_rows: 0,
             sort_buf: Vec::with_capacity(QUEUE_ROWS),
             keys_buf: Vec::with_capacity(QUEUE_ROWS),
+            uniq_buf: Vec::with_capacity(QUEUE_ROWS),
+            row_uniq: Vec::with_capacity(QUEUE_ROWS),
             new_buf: Vec::with_capacity(QUEUE_ROWS),
             ids_buf: Vec::with_capacity(QUEUE_ROWS),
             rows_buf: Vec::with_capacity(QUEUE_ROWS),
@@ -660,21 +722,44 @@ impl<'a> ForwardSink<'a> {
         edges_on: bool,
         frame: u32,
         worker: u32,
+        edges_dir: Option<&std::path::Path>,
     ) -> Self {
         let mut s = Self::empty(edges_on);
         s.door = Some(door);
         s.filter = filter;
         s.frame = frame;
         s.worker = worker;
+        s.edges_dir = edges_dir.map(|p| p.to_path_buf());
         s
     }
 
-    /// A graph-recording sink (`rewrite graph`): rows are not kept, their
-    /// (input id -> state id) edges are.
-    pub fn graph(ids: &'a GraphIds) -> Self {
-        let mut s = Self::empty(false);
-        s.graph = Some(ids);
-        s
+    /// The step's handle on the row it just pushed into queue `q` (its
+    /// last row): the queue's generation, the queue and the row.
+    #[inline]
+    pub fn row_ref(&self, q: usize) -> u32 {
+        const _: () = assert!(POOL_QUEUES <= 256 && QUEUE_ROWS <= 256);
+        let s = &self.slots[q];
+        ((s.gen as u32) << 16) | ((q as u32) << 8) | (s.rows() as u32 - 1)
+    }
+
+    /// Lane `lane` of the slice based at `base` also produced the row
+    /// `row_ref` points at. False if that queue was flushed since (the row
+    /// is gone; the caller pushes the row again).
+    #[inline]
+    pub fn mark_pred(&mut self, row_ref: u32, base: u64, lane: usize) -> bool {
+        let (gen, q, r) = ((row_ref >> 16) as u16, ((row_ref >> 8) & 0xff) as usize, (row_ref & 0xff) as usize);
+        let s = &mut self.slots[q];
+        if !s.live || s.gen != gen || r >= s.pred_mask.len() {
+            return false;
+        }
+        if s.pred_base[r] == base {
+            s.pred_mask[r] |= 1 << lane;
+        } else if let Some(last) = s.extra.last_mut().filter(|e| e.0 == r as u32 && e.1 == base) {
+            last.2 |= 1 << lane;
+        } else {
+            s.extra.push((r as u32, base, 1 << lane));
+        }
+        true
     }
 
     /// The backward's sink for the candidate rows `lanes` of a block.
@@ -763,27 +848,6 @@ impl<'a> ForwardSink<'a> {
     /// admit at the door, gather the admitted rows into this worker's
     /// piece of the shape; the queue goes back to its outcome's spares.
     fn flush(&mut self, q: usize) -> Result<()> {
-        if let Some(ids) = self.graph {
-            let slot = &mut self.slots[q];
-            for r in 0..slot.rows() {
-                let key = slot.keys[r];
-                let Some(&target) = ids.get(&key) else {
-                    anyhow::bail!("graph: emitted state {:?} at cell {} is not in the tree", key, slot.cells[r]);
-                };
-                self.graph_edges.push((target, slot.preds[r] as u32));
-            }
-            self.flushes += 1;
-            self.flushed_rows += slot.rows() as u64;
-            slot.clear();
-            slot.live = false;
-            slot.touched = false;
-            self.index.remove(&(slot.outcome, slot.cell));
-            self.spare.entry(slot.outcome).or_default().push(q as u32);
-            if self.last.1 == q as u32 {
-                self.last = NO_QUEUE;
-            }
-            return Ok(());
-        }
         let door = self.door.expect("flush without a door");
         let slot = &mut self.slots[q];
         let n = slot.rows();
@@ -806,9 +870,23 @@ impl<'a> ForwardSink<'a> {
                     .map(|(r, k)| (*k, r as u32)),
             );
             self.sort_buf.sort_unstable();
-            self.sort_buf.dedup_by_key(|e| e.0);
+            // The distinct keys, and each row's index among them: rows
+            // sharing a key are one state with several predecessor masks.
             self.keys_buf.clear();
-            self.keys_buf.extend(self.sort_buf.iter().map(|e| e.0));
+            self.uniq_buf.clear();
+            for e in &self.sort_buf {
+                if self.keys_buf.last() != Some(&e.0) {
+                    self.keys_buf.push(e.0);
+                }
+                self.uniq_buf.push(self.keys_buf.len() as u32 - 1);
+            }
+            // Per ROW, its index among the distinct keys (`u32::MAX` if
+            // filtered out): what the extra edges are resolved through.
+            self.row_uniq.clear();
+            self.row_uniq.resize(n, u32::MAX);
+            for (e, &u) in self.sort_buf.iter().zip(&self.uniq_buf) {
+                self.row_uniq[e.1 as usize] = u;
+            }
             self.new_buf.clear();
             self.ids_buf.clear();
             // The piece the new rows land in, and the id the first of them
@@ -822,9 +900,39 @@ impl<'a> ForwardSink<'a> {
                 .or_insert_with(|| (slot.empty_piece(), worker * 256 + n_pieces, Vec::new()));
             let first_new = pack_id(frame, *seq, piece.width as u32);
             door.admit(slot.shape, slot.cell, &self.keys_buf, first_new, &mut self.ids_buf, &mut self.new_buf);
+            // The edges: every row (each a predecessor mask) to its state,
+            // plus the extra masks. Rows without ids (a step run on
+            // id-less blocks, e.g. the tests' reference engine) have no
+            // predecessor columns and record nothing.
+            if self.edges_dir.is_some() && slot.pred_base.len() == n {
+                let rows = slot.pred_base.iter().zip(&slot.pred_mask).enumerate().map(|(r, (&b, &m))| (r as u32, b, m));
+                for (r, base, mask) in rows.chain(slot.extra.iter().copied()) {
+                    let u = self.row_uniq[r as usize];
+                    if u == u32::MAX {
+                        continue;
+                    }
+                    let target = self.ids_buf[u as usize];
+                    let layer = id_layer(target) as usize;
+                    if self.edge_bufs.len() <= layer {
+                        self.edge_bufs.resize_with(layer + 1, Vec::new);
+                    }
+                    let buf = &mut self.edge_bufs[layer];
+                    buf.extend_from_slice(&target.to_le_bytes());
+                    buf.extend_from_slice(&base.to_le_bytes());
+                    buf.extend_from_slice(&mask.to_le_bytes());
+                    self.edge_records += 1;
+                    if buf.len() >= EDGE_BUF_BYTES {
+                        write_edges(self.edges_dir.as_deref().unwrap(), layer, self.worker, buf)?;
+                    }
+                }
+            }
             if !self.new_buf.is_empty() {
                 self.rows_buf.clear();
-                self.rows_buf.extend(self.new_buf.iter().map(|&i| self.sort_buf[i as usize].1));
+                // The first row of a new key's group is the one kept.
+                self.rows_buf.extend(self.new_buf.iter().map(|&u| {
+                    let first = self.uniq_buf.partition_point(|&x| x < u);
+                    self.sort_buf[first].1
+                }));
                 self.kept += self.rows_buf.len();
                 self.won |= slot.any_win(&self.rows_buf)?;
                 slot.gather_into(piece, &self.rows_buf);
@@ -850,6 +958,13 @@ impl<'a> ForwardSink<'a> {
         for q in 0..self.slots.len() {
             if self.slots[q].live {
                 self.flush(q)?;
+            }
+        }
+        if let Some(dir) = self.edges_dir.clone() {
+            for (layer, buf) in self.edge_bufs.iter_mut().enumerate() {
+                if !buf.is_empty() {
+                    write_edges(&dir, layer, self.worker, buf)?;
+                }
             }
         }
         let mut out = Vec::new();
@@ -1036,6 +1151,7 @@ pub fn forward_frame(
     pos: Option<&crate::search::pos_graph::PosObserver>,
     filter: Option<&MarkFilter>,
     frame: u32,
+    edges_dir: Option<&std::path::Path>,
 ) -> Result<(Vec<Block>, bool, FrameStats)> {
     use std::time::Instant;
     let mut st = FrameStats::default();
@@ -1062,6 +1178,7 @@ pub fn forward_frame(
         emitted: u64,
         edges: rustc_hash::FxHashSet<(u32, u32)>,
         queue_bytes: usize,
+        edge_records: u64,
         busy: std::time::Duration,
     }
     let done: Vec<Done> = std::thread::scope(|scope| {
@@ -1074,11 +1191,14 @@ pub fn forward_frame(
                 // level 1 (2026-09-13).
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
                     let t = Instant::now();
-                    let mut sink = ForwardSink::forward(door, filter, pos.is_some(), frame, w as u32);
+                    let mut sink = ForwardSink::forward(door, filter, pos.is_some(), frame, w as u32, edges_dir);
                     loop {
                         let u = next_unit.fetch_add(1, Ordering::Relaxed);
                         let Some(&(bi, lo, hi)) = units.get(u) else { break };
-                        engine.run(&frontier[bi], &cells[bi], lo..hi, &mut sink)?;
+                        let b = &frontier[bi];
+                        sink.ids_in = (!b.ids.is_empty()).then_some(b.ids.as_slice());
+                        sink.skip_in = (!b.skip.is_empty()).then_some(b.skip.as_slice());
+                        engine.run(b, &cells[bi], lo..hi, &mut sink)?;
                     }
                     let pieces = sink.finish()?;
                     Ok(Done {
@@ -1090,6 +1210,7 @@ pub fn forward_frame(
                         emitted: sink.emitted,
                         edges: std::mem::take(&mut sink.edges),
                         queue_bytes: sink.alloc_bytes(),
+                        edge_records: sink.edge_records,
                         busy: t.elapsed(),
                     })
                 }).expect("spawn wave worker")
@@ -1118,6 +1239,7 @@ pub fn forward_frame(
         st.flushes += d.flushes;
         st.flushed_rows += d.flushed_rows;
         st.queue_bytes += d.queue_bytes;
+        st.edge_records += d.edge_records;
         won |= d.won;
         if let Some(p) = pos {
             p.record_pairs(d.edges.iter().copied());
@@ -1166,6 +1288,8 @@ pub struct FrameStats {
     pub t_door: std::time::Duration,
     pub flushes: u64,
     pub flushed_rows: u64,
+    /// Edge records written (`EDGE_RECORD_BYTES` each).
+    pub edge_records: u64,
     /// The input frontier's row storage, bytes.
     pub bytes_in: usize,
     /// Bytes allocated in the workers' queue pools, and in the door.
@@ -1528,14 +1652,11 @@ impl ForwardState {
         }
         let door = crate::search::door::Door::from_shards(shards);
         // The frontier: the last layer minus its won rows.
-        let frontier: Vec<Block> = load_frame(dir, last)?
-            .into_iter()
-            .filter_map(|b| {
-                let wins = b.wins().ok()?;
-                let mask: Vec<bool> = wins.iter().map(|w| !w).collect();
-                b.keep(&mask)
-            })
-            .collect();
+        let mut frontier: Vec<Block> = load_frame(dir, last)?;
+        for b in &mut frontier {
+            let wins = b.wins()?;
+            b.set_skip(wins);
+        }
         let observer = if record {
             let path = pos_graph_path(dir);
             let graph = crate::search::pos_graph::PosGraph::load(&path)
@@ -1577,7 +1698,7 @@ impl ForwardState {
             let t_frame = std::time::Instant::now();
             let frontier = std::mem::take(&mut self.frontier);
             let (mut next, won, st) =
-                forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filter, frame)?;
+                forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filter, frame, Some(&dir.join("edges")))?;
             let t = std::time::Instant::now();
             checkpoint_frontier(dir, frame, &mut next)?;
             let t_ckpt = t.elapsed();
@@ -1601,22 +1722,19 @@ impl ForwardState {
                 std::thread::scope(|scope| {
                     let handles: Vec<_> = next
                         .into_iter()
-                        .map(|b| {
-                            scope.spawn(move || -> Result<Option<Block>> {
+                        .map(|mut b| {
+                            scope.spawn(move || -> Result<Block> {
                                 let wins = b.wins()?;
-                                let mask: Vec<bool> = wins.iter().map(|w| !w).collect();
-                                Ok(b.keep(&mask))
+                                b.set_skip(wins);
+                                Ok(b)
                             })
                         })
                         .collect();
                     handles
                         .into_iter()
-                        .map(|h| h.join().expect("win-drop worker panicked"))
+                        .map(|h| h.join().expect("win-skip worker panicked"))
                         .collect::<Result<Vec<_>>>()
                 })?
-                .into_iter()
-                .flatten()
-                .collect()
             } else {
                 next
             };
@@ -1670,7 +1788,7 @@ fn log_frame(
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
          wave {:.0} (idle {:.0}%) door {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
-         flushes {} ({:.0} rows avg) | \
+         flushes {} ({:.0} rows avg) edges {} | \
          in {:.2} queues {:.2} door {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
         st.blocks_in,
         st.lanes_in,
@@ -1687,6 +1805,7 @@ fn log_frame(
         ms(t_total),
         st.flushes,
         st.flushed_rows as f64 / st.flushes.max(1) as f64,
+        st.edge_records,
         st.bytes_in as f64 / 1e9,
         st.queue_bytes as f64 / 1e9,
         st.door_bytes as f64 / 1e9,
