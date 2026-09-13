@@ -531,11 +531,32 @@ comparison-sorted whole, several at a time) 1.2 s, for 605 MB of runs
 per frame (5.0 B/pair) - BENCHMARK_DATA.md. f0-f44: 204 MB of runs
 beside 315 MB of frames.
 
-**Left on the table.** The compaction is serial with the frame (it runs
-before the checkpoint, so a resume can trust the runs it finds); it
-could overlap the next wave behind a `done` marker for ~1 s/frame at
-f70. Wider masks (64 lanes: adjacent slices of one call often share a
-target - the sample's base deltas were p90 32) would cut pairs 2-3x.
+**Room (1,0) end to end (2026-09-14):** 6:33 against 7:13, every
+ladder fingerprint identical (BENCHMARK_DATA.md). Three bugs only that
+scale reached: empty pieces renumbered into a real seq, all-won units
+reaching the kernel, and the queue index overflowing the row ref's 8
+bits (spares are per outcome, so the slot vector grows past
+`POOL_QUEUES`; 29k spurious marks from h91). `bench-backward --diff`
+expands disputed states and lists the recorded edges from them against
+their real successors; `CELESTE_DIFF_RERUN=1` re-runs the frame with
+the tree's door to tell recording from context.
+
+**The forward-cost pass (2026-09-14).** The frame was ~1.8x the
+baseline with recording. What changed: (1) a predecessor GROUP is 64
+lanes (`ids[lo & !63]`, a `u64` mask), so adjacent slices of one call
+share a record; (2) records are layer-local 20 bytes (target (seq,
+row), base (seq, row), mask) under `edges/raw/f{frame}/l{layer}_w{w}.bin`,
+and the run stream encodes a mask as its popcount and lane list (raw 8
+bytes past 4 lanes); (3) every layer >= 512k records takes the parallel
+counting sort (a 4M-record single-threaded pdqsort was the critical
+path); (4) the compaction runs in a background thread BEHIND the next
+frame's wave and is joined before that frame's checkpoint, and
+`edges/done.txt` names the last frame whose runs are complete - a
+resume trusts frames up to it and discards the rest (at most one);
+(5) the BFS's lookups run in parallel over the frontier (h99 level 0
+was 17 s single-threaded: 29M lookups), the inserts sequential and in
+frontier order so the marks are a function of the graph.
+
 The kernel walk (`backward_run`, ~250 lines with `Tree::cell_rows`,
-`TargetSet`, `ForwardSink::backward`) stays as the BFS's oracle until a
-full room's marks have been reproduced end to end, then goes.
+`TargetSet`, `ForwardSink::backward`) stays as the BFS's oracle until
+room (0,0)'s marks have been reproduced end to end, then goes.

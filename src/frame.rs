@@ -288,11 +288,11 @@ pub struct Slot {
     /// The row's predecessors in the slice that emitted it: the slice's
     /// first input id and a bit per lane (`ForwardSink::ids_in`).
     pub pred_base: Vec<u64>,
-    pub pred_mask: Vec<u16>,
+    pub pred_mask: Vec<u64>,
     /// Predecessors from OTHER slices of the same kernel call (the call
     /// dedups its emissions, so a row is pushed once per call and its
     /// later producers land here): `(row, slice base, lane mask)`.
-    pub extra: Vec<(u32, u64, u16)>,
+    pub extra: Vec<(u32, u64, u64)>,
     /// Per row, the index of its latest `extra` entry (`u32::MAX`: none).
     /// The kernel emits slice by slice, so a row's producers from the
     /// current slice always merge into that entry.
@@ -529,9 +529,6 @@ const EDGE_BUF_BYTES: usize = 1 << 20;
 /// Slots of the direct-mapped edge merge cache (`ForwardSink::direct_edge`).
 const DIRECT_SLOTS: usize = 1 << 12;
 
-/// One edge record on disk: target id, slice base id, lane mask.
-pub const EDGE_RECORD_BYTES: usize = 18;
-
 /// Append one record to the target layer's buffer (`ForwardSink::edge_bufs`),
 /// writing the buffer out when full.
 #[inline]
@@ -539,32 +536,32 @@ fn append_record(
     edge_bufs: &mut Vec<Vec<u8>>,
     edge_records: &mut u64,
     dir: &std::path::Path,
+    frame: u32,
     worker: u32,
     target: u64,
     base: u64,
-    mask: u16,
+    mask: u64,
 ) -> Result<()> {
     let layer = id_layer(target) as usize;
     if edge_bufs.len() <= layer {
         edge_bufs.resize_with(layer + 1, Vec::new);
     }
     let buf = &mut edge_bufs[layer];
-    buf.extend_from_slice(&target.to_le_bytes());
-    buf.extend_from_slice(&base.to_le_bytes());
-    buf.extend_from_slice(&mask.to_le_bytes());
+    crate::search::edges::encode_record(buf, target, base, mask);
     *edge_records += 1;
     if buf.len() >= EDGE_BUF_BYTES {
-        write_edges(dir, layer, worker, buf)?;
+        write_edges(dir, frame, layer, worker, buf)?;
     }
     Ok(())
 }
 
-/// Append `buf` to `<dir>/l{layer}/w{worker}.bin` and clear it.
-fn write_edges(dir: &std::path::Path, layer: usize, worker: u32, buf: &mut Vec<u8>) -> Result<()> {
+/// Append `buf` to the worker's raw file for `layer` at `frame`
+/// (`edges::raw_path`) and clear it.
+fn write_edges(dir: &std::path::Path, frame: u32, layer: usize, worker: u32, buf: &mut Vec<u8>) -> Result<()> {
     use std::io::Write;
-    let ldir = dir.join(format!("l{:03}", layer));
-    std::fs::create_dir_all(&ldir)?;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(ldir.join(format!("w{:03}.bin", worker)))?;
+    let path = crate::search::edges::raw_path(dir, frame, layer as u32, worker);
+    std::fs::create_dir_all(path.parent().expect("a raw dir"))?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     f.write_all(buf)?;
     buf.clear();
     Ok(())
@@ -676,7 +673,7 @@ pub struct ForwardSink<'a> {
     /// Direct-mapped merge of the edges to already-flushed states:
     /// `(target, base, mask)` per slot, an entry evicted or drained at the
     /// call's end becomes a record.
-    direct: Vec<(u64, u64, u16)>,
+    direct: Vec<(u64, u64, u64)>,
     /// Time spent encoding and writing edge records (this worker).
     pub t_edges: std::time::Duration,
 
@@ -782,9 +779,9 @@ impl<'a> ForwardSink<'a> {
     /// One edge record: `target` (a state id) has the lanes of `mask` in
     /// the slice based at `base` as predecessors.
     #[inline]
-    fn record(&mut self, target: u64, base: u64, mask: u16) -> Result<()> {
+    fn record(&mut self, target: u64, base: u64, mask: u64) -> Result<()> {
         let dir = self.edges_dir.as_deref().expect("recording without an edges dir");
-        append_record(&mut self.edge_bufs, &mut self.edge_records, dir, self.worker, target, base, mask)
+        append_record(&mut self.edge_bufs, &mut self.edge_records, dir, self.frame, self.worker, target, base, mask)
     }
 
     /// Lane `lane` of the slice based at `base` produced the (already
@@ -801,13 +798,13 @@ impl<'a> ForwardSink<'a> {
         let i = (celeste_engine::runtime2::mix64(target ^ base.rotate_left(17)) as usize) & (DIRECT_SLOTS - 1);
         let e = self.direct[i];
         if e.0 == target && e.1 == base {
-            self.direct[i].2 |= 1 << lane;
+            self.direct[i].2 |= 1u64 << lane;
             return;
         }
         if e.0 != u64::MAX {
             self.record(e.0, e.1, e.2).expect("recording an edge");
         }
-        self.direct[i] = (target, base, 1 << lane);
+        self.direct[i] = (target, base, 1u64 << lane);
     }
 
     /// The step's end of a kernel call: the merge cache drains.
@@ -846,15 +843,15 @@ impl<'a> ForwardSink<'a> {
             return false;
         }
         if s.pred_base[r] == base {
-            s.pred_mask[r] |= 1 << lane;
+            s.pred_mask[r] |= 1u64 << lane;
             return true;
         }
         let last = s.last_extra[r];
         if last != u32::MAX && s.extra[last as usize].1 == base {
-            s.extra[last as usize].2 |= 1 << lane;
+            s.extra[last as usize].2 |= 1u64 << lane;
         } else {
             s.last_extra[r] = s.extra.len() as u32;
-            s.extra.push((r as u32, base, 1 << lane));
+            s.extra.push((r as u32, base, 1u64 << lane));
         }
         true
     }
@@ -1004,12 +1001,12 @@ impl<'a> ForwardSink<'a> {
             if let Some(edges_dir) = self.edges_dir.as_deref().filter(|_| slot.pred_base.len() == n) {
                 let t_e = std::time::Instant::now();
                 let (row_uniq, ids_buf) = (&self.row_uniq, &self.ids_buf);
-                let (edge_bufs, edge_records, worker) = (&mut self.edge_bufs, &mut self.edge_records, self.worker);
+                let (edge_bufs, edge_records, frame, worker) = (&mut self.edge_bufs, &mut self.edge_records, self.frame, self.worker);
                 let rows = slot.pred_base.iter().zip(&slot.pred_mask).enumerate().map(|(r, (&b, &m))| (r as u32, b, m));
                 for (r, b, m) in rows.chain(slot.extra.iter().copied()) {
                     let u = row_uniq[r as usize];
                     if u != u32::MAX {
-                        append_record(edge_bufs, edge_records, edges_dir, worker, ids_buf[u as usize], b, m)?;
+                        append_record(edge_bufs, edge_records, edges_dir, frame, worker, ids_buf[u as usize], b, m)?;
                     }
                 }
                 // Write each row's fate back into the dedup cache: a later
@@ -1063,7 +1060,7 @@ impl<'a> ForwardSink<'a> {
         if let Some(dir) = self.edges_dir.clone() {
             for (layer, buf) in self.edge_bufs.iter_mut().enumerate() {
                 if !buf.is_empty() {
-                    write_edges(&dir, layer, self.worker, buf)?;
+                    write_edges(&dir, self.frame, layer, self.worker, buf)?;
                 }
             }
         }
@@ -1659,6 +1656,9 @@ pub struct ForwardState {
     pub frames: u32,
     /// The first frame a lane won, if any so far.
     pub win_frame: Option<u32>,
+    /// The compaction of the last frame's edge records, running behind
+    /// the next frame's wave (`join_compaction`).
+    compaction: Option<(u32, std::thread::JoinHandle<Result<crate::search::edges::CompactStats>>)>,
 }
 
 /// What a forward run reports.
@@ -1678,6 +1678,7 @@ impl ForwardState {
         // The checkpoint assigns the initial rows their ids (layer 0); the
         // door then takes each row under that id.
         checkpoint_frontier(dir, 0, &mut initial)?;
+        crate::search::edges::set_done_frame(&dir.join("edges"), 0)?;
         let door = crate::search::door::Door::new();
         for b in &initial {
             let cells = b.positions()?;
@@ -1694,6 +1695,7 @@ impl ForwardState {
             observer: record.then(crate::search::pos_graph::PosObserver::default),
             frames: 0,
             win_frame: None,
+            compaction: None,
         })
     }
 
@@ -1709,9 +1711,22 @@ impl ForwardState {
         while dir.join("frames").join(format!("f{:03}", last.map_or(0, |f| f + 1))).is_dir() {
             last = Some(last.map_or(0, |f| f + 1));
         }
-        let Some(last) = last else { return Ok(None) };
+        let Some(mut last) = last else { return Ok(None) };
         let t = std::time::Instant::now();
-        crate::search::edges::discard_after(&dir.join("edges"), last)?;
+        // The frames a resume can trust are those whose edge runs are
+        // complete (`edges/done.txt`, written when a frame's compaction
+        // joined - before the NEXT frame's checkpoint, so at most the last
+        // frame is discarded).
+        let edges_dir = dir.join("edges");
+        let done = crate::search::edges::done_frame(&edges_dir).unwrap_or(last);
+        if done < last {
+            for f in done + 1..=last {
+                std::fs::remove_dir_all(dir.join("frames").join(format!("f{:03}", f)))?;
+            }
+            eprintln!("[resume] frames f{} to f{last} discarded: their edge runs were not complete", done + 1);
+            last = done;
+        }
+        crate::search::edges::discard_after(&edges_dir, last)?;
         // Every layer's keys into the door, one file per unit of work.
         let seq_of = |p: &std::path::Path| -> u32 {
             p.file_name()
@@ -1794,7 +1809,7 @@ impl ForwardState {
             win_frame,
             t.elapsed().as_secs_f64()
         );
-        Ok(Some(ForwardState { frontier, door, observer, frames: last, win_frame }))
+        Ok(Some(ForwardState { frontier, door, observer, frames: last, win_frame, compaction: None }))
     }
 
     /// Compute and checkpoint frames `frames+1 ..= to`. A win does NOT stop
@@ -1808,6 +1823,20 @@ impl ForwardState {
 
     pub fn door(&self) -> &crate::search::door::Door {
         &self.door
+    }
+
+    /// Wait for the compaction running behind the current frame (the
+    /// previous frame's), then mark its frame done for a resume. Returns
+    /// its stats and the time waited.
+    fn join_compaction(
+        &mut self,
+        edges_dir: &std::path::Path,
+    ) -> Result<Option<(crate::search::edges::CompactStats, std::time::Duration)>> {
+        let Some((frame, handle)) = self.compaction.take() else { return Ok(None) };
+        let t = std::time::Instant::now();
+        let st = handle.join().expect("compaction thread panicked")?;
+        crate::search::edges::set_done_frame(edges_dir, frame)?;
+        Ok(Some((st, t.elapsed())))
     }
 
     pub fn extend(
@@ -1824,21 +1853,30 @@ impl ForwardState {
             let edges_dir = dir.join("edges");
             let (mut next, won, st) =
                 forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filter, frame, Some(&edges_dir))?;
-            // The frame's edge records into per-layer runs BEFORE the
-            // checkpoint: a resume discards runs past its last checkpointed
-            // frame (`edges::discard_after`), never the other way round.
-            let t = std::time::Instant::now();
-            let compact = crate::search::edges::compact_frame(&edges_dir, frame)?;
-            let t_edges = t.elapsed();
+            // The PREVIOUS frame's compaction ran behind this wave; it is
+            // joined and marked done before this frame is checkpointed, so
+            // a resume (which trusts frames up to `done.txt`) never sees a
+            // frame whose runs are incomplete.
+            let joined = self.join_compaction(&edges_dir)?;
+            let (t_edges, compact_records) = joined.as_ref().map_or((std::time::Duration::ZERO, 0), |(c, w)| (*w, c.records));
             let t = std::time::Instant::now();
             checkpoint_frontier(dir, frame, &mut next)?;
             let t_ckpt = t.elapsed();
+            // This frame's raw records into runs, in the background.
+            {
+                let edges_dir = edges_dir.clone();
+                let handle = std::thread::Builder::new()
+                    .name(format!("compact-f{frame}"))
+                    .spawn(move || crate::search::edges::compact_frame(&edges_dir, frame))
+                    .expect("spawn compaction");
+                self.compaction = Some((frame, handle));
+            }
             let t = std::time::Instant::now();
             if let Some(o) = self.observer.as_ref() {
                 o.flush();
             }
             let t_pos = t.elapsed();
-            log_frame(frame, &st, t_edges, compact.records, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
+            log_frame(frame, &st, t_edges, compact_records, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
             self.frames = frame;
             if won && self.win_frame.is_none() {
                 self.win_frame = Some(frame);
@@ -1870,6 +1908,8 @@ impl ForwardState {
                 next
             };
         }
+        // The last frame's runs, before anything reads them (the backward).
+        self.join_compaction(&dir.join("edges"))?;
         // The level's graph so far, beside its frames: a backward can then
         // run on the tree alone (`rewrite bench-backward`).
         if let Some(o) = self.observer.as_ref() {
@@ -2427,7 +2467,10 @@ mod tests {
         assert_eq!(sink.slots[43].pred_mask[0], 1, "no other queue's row was touched");
         // Another slice of the same call: an extra entry on the same row.
         assert!(sink.mark_pred(r, 5000, 2));
-        assert_eq!(sink.slots[299].extra, vec![(0, 5000, 0b100)]);
+        assert_eq!(sink.slots[299].extra, vec![(0, 5000, 0b100u64)]);
+        // Lanes up to 63 (a 64-lane group).
+        assert!(sink.mark_pred(r, 1000 + 299 * 16, 63));
+        assert_eq!(sink.slots[299].pred_mask[0], 0b1001 | (1 << 63));
         // A flushed queue's ref is stale.
         sink.slots[299].clear();
         assert!(!sink.mark_pred(r, 1000 + 299 * 16, 0));

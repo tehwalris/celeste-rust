@@ -209,7 +209,13 @@ impl AsmKernel {
             // The slice's first input id (ids are consecutive within a
             // block), and the lanes to skip (won rows: checkpointed, never
             // expanded).
-            let slice_base: Option<u64> = sink.ids_in.map(|ids| ids[lo]);
+            // The slice's predecessor GROUP: 64 consecutive input lanes
+            // (ids are consecutive within a block, units start at
+            // multiples of 64), so a state's producers from four adjacent
+            // slices share one record. `lane0` is this slice's first lane
+            // within the group.
+            let slice_base: Option<u64> = sink.ids_in.map(|ids| ids[lo & !63]);
+            let lane0 = lo & 63;
             let skip: u16 = match sink.skip_in {
                 Some(sk) => (0..n).filter(|&i| sk[lo + i]).fold(0u16, |m, i| m | (1 << i)),
                 None => 0,
@@ -335,14 +341,14 @@ impl AsmKernel {
                         }
                         match slice_base {
                             Some(b) if r & RowCache::ID_FLAG != 0 => {
-                                sink.direct_edge(r & !RowCache::ID_FLAG, b, i);
+                                sink.direct_edge(r & !RowCache::ID_FLAG, b, lane0 + i);
                                 continue;
                             }
                             Some(_) if r & RowCache::DROP_FLAG != 0 => continue,
                             // The row was flushed (a stale ref, only if
                             // the cache lost the flush's write-back): push
                             // it again; the flush merges duplicates by key.
-                            Some(b) if !sink.mark_pred(r, b, i) => {}
+                            Some(b) if !sink.mark_pred(r, b, lane0 + i) => {}
                             _ => continue,
                         }
                     }
@@ -360,7 +366,7 @@ impl AsmKernel {
                     cols.push_row(&mut sink.slots[q], outbuf, i, key, cout);
                     if let Some(b) = slice_base {
                         sink.slots[q].pred_base.push(b);
-                        sink.slots[q].pred_mask.push(1 << i);
+                        sink.slots[q].pred_mask.push(1u64 << (lane0 + i));
                         sink.slots[q].last_extra.push(u32::MAX);
                         sink.seen.set_ref(key, sink.row_ref(q));
                     }

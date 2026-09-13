@@ -1,3 +1,34 @@
+# The forward-cost pass on the explicit graph (2026-09-14)
+
+plans/waves.md "The forward-cost pass": 64-lane predecessor groups,
+20-byte layer-local records, the counting sort for every layer >= 512k
+records, the compaction overlapped with the next wave (`edges/done.txt`
+for the resume), the BFS's lookups in parallel.
+
+Room (1,0) f70 (`bench-frame --edges`, tree door, quick, 16 threads):
+
+| | before the pass | after |
+|---|---|---|
+| records / pairs per frame | 120.5M / 119.9M | 72.9M / 71.8M |
+| runs on disk per frame | 605 MB (5.0 B/pair) | 620 MB (8.6 B/pair: masks as lane lists) |
+| compaction wall | 1.2 s (serial with the frame) | 0.85 s (read 0.1, sort 0.45, write 0.3), hidden behind the next wave |
+| wave | 2.58 s | 2.44 s |
+
+Room (1,0) end to end (release, 32 threads), every ladder fingerprint
+identical to the kernel-walk baseline:
+
+| | kernel walk | graph, before the pass | graph, after |
+|---|---|---|---|
+| whole search wall | 7:13 | 6:33 | **4:57** |
+| level-0 f89 frame | 1.76 s | 3.26 s (wave 1.92, edges 0.92) | 2.37 s (wave 1.91, edges 0 - joined behind the wave) |
+| level-0 backward at H=99 | 22.9 s | 17.4 s | 3.1 s (29.2M lookups, 16 threads) |
+| peak RSS | ~12.6 GB | 25.9 GB | 24.0 GB |
+
+The f89 frame is now 1.35x the kernel-walk baseline's (the door +
+checkpoint + pos steps are the same; the wave carries the per-hit
+bookkeeping and the record stream); the level-0 backward is ~7x cheaper
+than the walk at H=99 and hardly matters at any horizon.
+
 # Room (0,0) end to end on the explicit backward graph (2026-09-14, release, 16 threads)
 
 `rewrite search --room 0,0 --from 1 --to 130`, the same run as the
