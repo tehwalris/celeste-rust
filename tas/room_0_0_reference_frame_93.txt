@@ -1,0 +1,10 @@
+# Room (0,0) reference solution for celeste-minimal, exit at frame 93: the
+# community any% 100m TAS (tasdatabase classic/any/TAS1.tas, offset 27 in
+# the original cart on a real PICO-8) replayed as a trajectory of player
+# positions, then `rewrite trajectory` found inputs for OUR game that
+# follow it frame by frame (2026-09-13). Same path, same time, valid here.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 0,0, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,18,2,2,42,0,0,0,0,0,0,0,16,0,0,34,0,0,0,0,0,0,34,0,0,0,0,0,0,16,0,0,0,0,0,16,0,0,0,0,0,0,0,38,0,0,0,0,0,0,0,0,0,2,2,18,0,2,2,2,2,36,0,0,0,0,0

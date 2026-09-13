@@ -170,6 +170,23 @@ enum Command {
         #[arg(long)]
         to: Option<u32>,
     },
+    /// A concrete input sequence that follows a given TRAJECTORY of player
+    /// positions frame by frame (one "x,y" per line, frame 1 first; a
+    /// line `-` accepts any position, e.g. during the spawn), found by a
+    /// breadth-first search over the reference engine's concrete step:
+    /// every frame, all 64 inputs of every surviving state, keeping the
+    /// successors at the trajectory's position, deduplicated exactly.
+    /// Prints the input bytes for `concrete_run -i` / `pico8_diff/replay.py`,
+    /// or the first frame the trajectory could not be followed.
+    Trajectory {
+        #[arg(long)]
+        trajectory: String,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+        /// Stop once a win is reached (default), else follow to the end.
+        #[arg(long, default_value_t = true)]
+        stop_at_win: bool,
+    },
     /// Extract a concrete input sequence that wins by `horizon` from one
     /// level's marks: a DFS from the initial state through the reference
     /// engine's concrete single-input step, admitting a successor only if
@@ -779,6 +796,83 @@ fn main() -> Result<()> {
                 (rx, ry),
             )?;
         }
+        Command::Trajectory {
+            trajectory,
+            room,
+            stop_at_win,
+        } => {
+            use celeste_rust::frame::{wins_of, Block};
+            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            set_rem_precision(RemPrecision::Exact);
+            let traj: Vec<Option<(i32, i32)>> = std::fs::read_to_string(&trajectory)?
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| {
+                    if l == "-" {
+                        None
+                    } else {
+                        let (x, y) = l.split_once(',').expect("x,y");
+                        Some((x.trim().parse().expect("x"), y.trim().parse().expect("y")))
+                    }
+                })
+                .collect();
+            let mut eng = celeste_rust::trace::refengine::RefEngine::new()?;
+            let initial = eng.initial_state()?;
+            // (state, the inputs that led to it)
+            let mut layer: Vec<(celeste_rust::interpreter::state::State, Vec<u8>)> = vec![(initial.clone(), Vec::new())];
+            for (i, want) in traj.iter().enumerate() {
+                let f = i as u32 + 1;
+                let mut next: Vec<(celeste_rust::interpreter::state::State, Vec<u8>)> = Vec::new();
+                let mut seen: rustc_hash::FxHashSet<(u64, u64, u32)> = Default::default();
+                let mut tried = 0usize;
+                // A `-` frame (any position: the spawn) takes only the idle
+                // input; the inputs before the player exists cannot matter
+                // to a witness, and 64 x 24 frames of them would.
+                let inputs: std::ops::Range<u8> = if want.is_some() { 0..64 } else { 0..1 };
+                for (st, path) in &layer {
+                    for byte in inputs.clone() {
+                        let mut s = st.clone();
+                        celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
+                        let mut succ = eng.run_frame_concrete(&s)?;
+                        celeste_rust::concrete::restore_buttons(&initial, &mut succ)?;
+                        tried += 1;
+                        let block = Block::from_state(&succ)?;
+                        let cell = block.positions()?[0];
+                        let pos = celeste_rust::search::pos_graph::cell_xy(cell);
+                        if let Some(w) = want {
+                            if pos != Some(*w) {
+                                continue;
+                            }
+                        }
+                        let key = block.keys()[0];
+                        if !seen.insert((key.0, key.1, cell)) {
+                            continue;
+                        }
+                        let mut p = path.clone();
+                        p.push(byte);
+                        if stop_at_win && wins_of(block.rt2())?.iter().any(|&w| w) {
+                            println!("[trajectory] WIN at f{f} after {} frames; inputs:", p.len());
+                            println!("{}", p.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
+                            return Ok(());
+                        }
+                        next.push((succ, p));
+                    }
+                }
+                eprintln!(
+                    "[trajectory] f{f:03} want {:?}: {} states ({tried} steps)",
+                    want,
+                    next.len()
+                );
+                if next.is_empty() {
+                    anyhow::bail!("the trajectory cannot be followed at f{f} (wanted {:?})", want);
+                }
+                layer = next;
+            }
+            println!("[trajectory] followed to the end: {} states; one input sequence:", layer.len());
+            println!("{}", layer[0].1.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
+        }
         Command::Witness {
             checkpoint_dir,
             horizon,
@@ -832,42 +926,6 @@ fn main() -> Result<()> {
             // them (read symbolically inside the frame); a concretely
             // stepped state carries the bytes it was stepped with. Restore
             // the boundary's representation before keying.
-            fn restore_buttons(
-                from: &celeste_rust::interpreter::state::State,
-                to: &mut celeste_rust::interpreter::state::State,
-            ) -> Result<()> {
-                use celeste_rust::interpreter::value::{HeapValue, Value};
-                let arr_of = |st: &celeste_rust::interpreter::state::State| -> Result<Vec<_>> {
-                    let cell = *st
-                        .global_env
-                        .get("__button_states")
-                        .ok_or_else(|| anyhow::anyhow!("no __button_states"))?;
-                    let arr = match st.heap.get_opt(cell) {
-                        Some(HeapValue::Value(Value::Pointer(id))) => *id,
-                        _ => cell,
-                    };
-                    let items = match st.heap.get_opt(arr) {
-                        Some(HeapValue::ArrayTable(items)) => items.clone(),
-                        other => anyhow::bail!("button array shape: {:?}", other),
-                    };
-                    Ok(items
-                        .iter()
-                        .map(|item| match st.heap.get_opt(*item) {
-                            Some(HeapValue::Value(Value::Pointer(id))) => *id,
-                            _ => *item,
-                        })
-                        .collect())
-                };
-                let src = arr_of(from)?;
-                let dst = arr_of(to)?;
-                anyhow::ensure!(src.len() == dst.len(), "button arrays differ in length");
-                for (s, d) in src.iter().zip(&dst) {
-                    let v = from.heap.get(*s).clone();
-                    to.heap.set(*d, v);
-                }
-                Ok(())
-            }
-            // DFS with memoized dead ends per (key, cell).
             let mut dead: rustc_hash::FxHashSet<(u64, u64, u32)> = Default::default();
             let mut path: Vec<u8> = Vec::new();
             let mut steps: u64 = 0;
@@ -892,7 +950,7 @@ fn main() -> Result<()> {
                     let mut s = state.clone();
                     celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
                     let mut succ = eng.run_frame_concrete(&s)?;
-                    restore_buttons(initial, &mut succ)?;
+                    celeste_rust::concrete::restore_buttons(initial, &mut succ)?;
                     *steps += 1;
                     let block = Block::from_state(&succ)?;
                     if wins_of(block.rt2())?.iter().any(|&w| w) {

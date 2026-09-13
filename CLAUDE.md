@@ -419,7 +419,18 @@ if the Lua changes) may be APPENDED by hand, never inserted.
 
 # The same sequence on a REAL PICO-8 (~/pico-8/pico8), headless: the
 # fidelity check that made the 99-frame room (1,0) result believable.
+# --room x,y for another room; --lua FILE --begin-game runs the ORIGINAL
+# cart's Lua (~/src/github.com/tehwalris/celeste_ocaml/celeste.lua).
 pico8_diff/replay.py tas/room_1_0_exit_frame_99.txt
+pico8_diff/replay.py --room 0,0 tas/room_0_0_reference_frame_93.txt
+
+# A reference solution for OUR game from a community TAS: replay the TAS
+# in the original cart (above), take its per-frame player positions, and
+# let the concrete reference engine find inputs that follow them exactly
+# (a breadth-first search over the 64 inputs per frame, position-pruned;
+# ~1 min). Same path and time as the reference, valid for celeste-minimal.
+# Room (0,0): tasdatabase classic/any/TAS1.tas at offset 27 -> exit f93.
+./target/quick/rewrite trajectory --trajectory positions.txt --room 0,0
 
 # Tracer analysis probes (text only): the reachable constant lattice, and the
 # specialization collapse for one shape.

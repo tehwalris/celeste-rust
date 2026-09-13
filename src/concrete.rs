@@ -95,3 +95,43 @@ impl ConcreteEngine {
         self.eng.run_frame_concrete(&state)
     }
 }
+
+/// Copy the `__button_states` array of `from` over `to`'s: after a
+/// concrete frame the successor carries the frame's buttons, and the
+/// search's states must agree on them (the initial state's).
+pub fn restore_buttons(
+    from: &State,
+    to: &mut State,
+) -> Result<()> {
+    use crate::interpreter::value::{HeapValue, Value};
+    let arr_of = |st: &State| -> Result<Vec<_>> {
+        let cell = *st
+            .global_env
+            .get("__button_states")
+            .ok_or_else(|| anyhow::anyhow!("no __button_states"))?;
+        let arr = match st.heap.get_opt(cell) {
+            Some(HeapValue::Value(Value::Pointer(id))) => *id,
+            _ => cell,
+        };
+        let items = match st.heap.get_opt(arr) {
+            Some(HeapValue::ArrayTable(items)) => items.clone(),
+            other => anyhow::bail!("button array shape: {:?}", other),
+        };
+        Ok(items
+            .iter()
+            .map(|item| match st.heap.get_opt(*item) {
+                Some(HeapValue::Value(Value::Pointer(id))) => *id,
+                _ => *item,
+            })
+            .collect())
+    };
+    let src = arr_of(from)?;
+    let dst = arr_of(to)?;
+    anyhow::ensure!(src.len() == dst.len(), "button arrays differ in length");
+    for (s, d) in src.iter().zip(&dst) {
+        let v = from.heap.get(*s).clone();
+        to.heap.set(*d, v);
+    }
+    Ok(())
+}
+// DFS with memoized dead ends per (key, cell).

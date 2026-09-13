@@ -862,6 +862,10 @@ pub trait FrameStep: Sync {
 /// (`seen`) spans the grab; the grab, not the unit, sets the dedup window.
 const UNIT_LANES: usize = 16384;
 
+/// Stack per frame worker: the ASM kernels keep their spill frames on the
+/// stack (~0.5 MB at level 0, more at the finer rungs).
+const WORKER_STACK: usize = 64 << 20;
+
 /// Cut `blocks` (by lane count) into `(block, lo, hi)` units.
 fn units_of(lanes: impl Iterator<Item = usize>, unit: usize) -> Vec<(usize, usize, usize)> {
     let mut units = Vec::new();
@@ -924,7 +928,11 @@ pub fn forward_frame(
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 let (frontier, cells, units, next_unit) = (&frontier, &cells, &units, &next_unit);
-                scope.spawn(move || -> Result<Done> {
+                // The kernels' spill frames are large (hundreds of KB at
+                // level 0, more at the finer rungs, whose graphs are bigger);
+                // the default 2 MB thread stack overflowed on room (0,0)'s
+                // level 1 (2026-09-13).
+                std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
                     let t = Instant::now();
                     let mut sink = ForwardSink::forward(door, filter, pos.is_some());
                     loop {
@@ -944,7 +952,7 @@ pub fn forward_frame(
                         queue_bytes: sink.alloc_bytes(),
                         busy: t.elapsed(),
                     })
-                })
+                }).expect("spawn wave worker")
             })
             .collect();
         handles
@@ -1178,7 +1186,7 @@ fn backward_walk(
             let handles: Vec<_> = (0..threads())
                 .map(|_| {
                     let (cells, next_cell, targets, marked) = (&cells, &next_cell, &targets, &marked);
-                    scope.spawn(move || -> Result<(Vec<UnitOut>, std::time::Duration)> {
+                    std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<(Vec<UnitOut>, std::time::Duration)> {
                         let t_busy = std::time::Instant::now();
                         let mut out = Vec::new();
                         loop {
@@ -1207,7 +1215,7 @@ fn backward_walk(
                             out.push(u);
                         }
                         Ok((out, t_busy.elapsed()))
-                    })
+                    }).expect("spawn backward worker")
                 })
                 .collect();
             handles

@@ -33,11 +33,18 @@ def hexbytes(path, n):
     return bytes.fromhex(h)
 
 
-def build_cart(inputs, frames, out):
-    lua = open(os.path.join(ROOT, "lua", "celeste-minimal.lua")).read()
+def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None):
+    lua = open(lua_path or os.path.join(ROOT, "lua", "celeste-minimal.lua")).read()
+    if room is not None:
+        # The minimal cart's _init loads room (1,0); the search patches the
+        # same call (celeste-interp game_runner) to start elsewhere.
+        pat = "load_room(1, 0)"
+        assert lua.count(pat) == 1, f"expected exactly one {pat!r} in the Lua"
+        lua = lua.replace(pat, f"load_room({room[0]}, {room[1]})")
     map_data = hexbytes(os.path.join(ROOT, "cart", "map-data.txt"), 8192)
     flags = hexbytes(os.path.join(ROOT, "cart", "flag-data.txt"), 256)
     prelude = [
+        "__begin_game = " + ("true" if begin_game else "false"),
         # The interpreter's hooks: the interval splitter (identity on a
         # concrete value) and the state-normalization hint (a no-op).
         "function __split_by_flr(x) return x end",
@@ -51,6 +58,10 @@ def build_cart(inputs, frames, out):
     ]
     driver = [
         "_init()",
+        # The ORIGINAL cart's _init shows the title screen; begin_game()
+        # is what the first button press does. Frame 1 is then the first
+        # _update after load_room, which is the TAS tool's convention.
+        "if __begin_game then begin_game() end",
         f"for f = 1, {frames} do",
         "  __frame = f",
         "  _update()",
@@ -93,6 +104,9 @@ def main():
     ap.add_argument("--inputs", help="comma-separated input bytes instead of a file")
     ap.add_argument("--frames", type=int, help="frames to run (default: number of inputs)")
     ap.add_argument("--keep", action="store_true", help="keep the generated cart")
+    ap.add_argument("--lua", help="the game's Lua (default lua/celeste-minimal.lua)")
+    ap.add_argument("--begin-game", action="store_true", help="call begin_game() after _init() (the original cart)")
+    ap.add_argument("--room", help="start room \"x,y\" for the minimal cart (default 1,0)")
     args = ap.parse_args()
     if args.inputs:
         inputs = [int(x) for x in args.inputs.split(",")]
@@ -104,7 +118,8 @@ def main():
     pico8 = os.environ.get("PICO8", os.path.expanduser("~/pico-8/pico8"))
     work = tempfile.mkdtemp(prefix="celeste-replay-")
     cart = os.path.join(work, "replay.p8")
-    build_cart(inputs, frames, cart)
+    room = tuple(int(v) for v in args.room.split(",")) if args.room else None
+    build_cart(inputs, frames, cart, args.lua, args.begin_game, room)
     print(f"[replay] {len(inputs)} inputs, {frames} frames, cart {cart}", file=sys.stderr)
     proc = subprocess.run([pico8, "-x", cart], capture_output=True, text=True, timeout=120)
     lines = [l[len("@P8@ "):] for l in proc.stdout.splitlines() if l.startswith("@P8@ ")]
