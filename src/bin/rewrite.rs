@@ -199,6 +199,48 @@ enum Command {
         #[arg(long, default_value_t = true)]
         stop_at_win: bool,
     },
+    /// PROTOTYPE (plans/waves.md): materialize a finished level's whole
+    /// BACKWARD GRAPH - every (input row -> emitted state) edge of every
+    /// frame, states named by their stable id (layer, file, index) - by
+    /// replaying each layer through the kernels, then report its degrees
+    /// and size and run a BFS backward over it per horizon, checking the
+    /// marked sets against the run log's fingerprints.
+    Graph {
+        /// A level dir (`frames/` under it).
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+        /// Last layer to include.
+        #[arg(long)]
+        to: u32,
+        /// Horizons to BFS, "a..b" inclusive.
+        #[arg(long)]
+        horizons: Option<String>,
+        /// The run's log: `[ladder] hNN level 0 ... (fingerprint X)` lines
+        /// to check the BFS's marked sets against.
+        #[arg(long)]
+        log: Option<String>,
+        /// Write the graph (offsets + preds, little-endian) under this dir.
+        #[arg(long)]
+        out: Option<String>,
+        /// Reuse the CSR files already under `out` (skip the replay).
+        #[arg(long, default_value_t = false)]
+        reuse: bool,
+        /// The tree's synthetic win position, if it was searched with one.
+        #[arg(long)]
+        win_at: Option<String>,
+        /// The search's base dir (`hNNN/level00.marks.bin` under it): diff
+        /// the BFS's marked set against the kernel backward's per horizon.
+        #[arg(long)]
+        marks_dir: Option<String>,
+        /// Inspect this many target cells of the last expanded layer: their
+        /// predecessors grouped by source (layer, cell), and what the edges
+        /// cost as flat pairs vs per-(target cell, source cell) blocks of
+        /// in-cell ranks.
+        #[arg(long, default_value_t = 0)]
+        inspect_cells: usize,
+    },
     /// Extract a concrete input sequence that wins by `horizon` from one
     /// level's marks: a DFS from the initial state through the reference
     /// engine's concrete single-input step, admitting a successor only if
@@ -850,6 +892,429 @@ fn main() -> Result<()> {
                 std::path::Path::new(&out),
                 (rx, ry),
             )?;
+        }
+        Command::Graph {
+            level_dir,
+            room,
+            to,
+            horizons,
+            log,
+            out,
+            reuse,
+            inspect_cells,
+            win_at,
+            marks_dir,
+        } => {
+            use celeste_rust::frame::{threads, Block, ForwardSink, FrameStep, GraphIds, Visited};
+            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
+            use rustc_hash::FxHashMap;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            if let Some(xy) = &win_at {
+                std::env::set_var("CELESTE_WIN_AT_XY", xy);
+            }
+            set_rem_precision(RemPrecision::Bits(0));
+            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+            let dir = std::path::Path::new(&level_dir);
+            let workers = threads();
+
+            // ---- 1. The id space: (layer, file, index) -> a dense u32, plus
+            // per-id layer / cell / shape / key, and the win rows.
+            let t = std::time::Instant::now();
+            struct FileInfo { layer: u32, path: std::path::PathBuf, base: u32, width: u32, shape: u64 }
+            let mut files: Vec<FileInfo> = Vec::new();
+            let mut n_ids: u32 = 0;
+            for f in 0..=to {
+                let fdir = dir.join("frames").join(format!("f{:03}", f));
+                let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")))
+                    .collect();
+                paths.sort();
+                for path in paths {
+                    let file = celeste_rust::search::checkpoint::FrameFile::open(&path)?;
+                    files.push(FileInfo { layer: f, path, base: n_ids, width: file.width(), shape: file.shape_hash() });
+                    n_ids += file.width();
+                }
+            }
+            let n = n_ids as usize;
+            let mut layer_of: Vec<u8> = vec![0; n];
+            let mut cell_of: Vec<u32> = vec![0; n];
+            let mut key_of: Vec<(u64, u64)> = vec![(0, 0); n];
+            let mut shape_of_file: Vec<u64> = Vec::with_capacity(files.len());
+            let mut file_of: Vec<u32> = vec![0; n];
+            let mut wins: Vec<u32> = Vec::new();
+            let mut ids: GraphIds = GraphIds::default();
+            ids.reserve(n);
+            for (fi, info) in files.iter().enumerate() {
+                let file = celeste_rust::search::checkpoint::FrameFile::open(&info.path)?;
+                shape_of_file.push(info.shape);
+                for (r, (cell, key)) in file.cell_keys().enumerate() {
+                    let id = info.base + r as u32;
+                    layer_of[id as usize] = info.layer as u8;
+                    cell_of[id as usize] = cell;
+                    key_of[id as usize] = key;
+                    file_of[id as usize] = fi as u32;
+                    ids.insert(key, id);
+                }
+                for (_, key, _) in file.wins() {
+                    wins.push(*ids.get(&key).expect("a win row is in its own file"));
+                }
+            }
+            anyhow::ensure!(ids.len() == n, "duplicate keys across layers: {} ids for {} rows", ids.len(), n);
+            eprintln!("[graph] {} states in {} files over layers 0..={to}, {} win rows; ids built in {:.1} s", n, files.len(), wins.len(), t.elapsed().as_secs_f64());
+
+            // ---- 2. Materialize: replay every layer < to through the kernels
+            // with the ids riding along; every flushed row is an edge. A
+            // frame's edges are sorted by target and written per TARGET
+            // LAYER (`l{j}/f{f}.bin`, u32 pairs): the on-disk layout the real
+            // forward would produce, and what keeps this within memory (a
+            // state has ~50 distinct successors).
+            let out = std::path::PathBuf::from(out.unwrap_or_else(|| format!("{}/graph", level_dir)));
+            if !reuse {
+            let _ = std::fs::remove_dir_all(&out);
+            std::fs::create_dir_all(&out)?;
+            let layer_base: Vec<u32> = (0..=to)
+                .map(|f| files.iter().find(|i| i.layer == f).map_or(n_ids, |i| i.base))
+                .collect();
+            let layer_end = |j: u32| -> u32 { if j + 1 > to { n_ids } else { layer_base[j as usize + 1] } };
+            let write_pairs = |path: &std::path::Path, pairs: &[(u32, u32)]| -> Result<()> {
+                let mut buf: Vec<u8> = Vec::with_capacity(pairs.len() * 8);
+                for (t, p) in pairs {
+                    buf.extend_from_slice(&t.to_le_bytes());
+                    buf.extend_from_slice(&p.to_le_bytes());
+                }
+                Ok(std::fs::write(path, &buf)?)
+            };
+            let t = std::time::Instant::now();
+            let mut total_edges: u64 = 0;
+            let mut total_raw: u64 = 0;
+            for f in 0..to {
+                let mut blocks: Vec<(Block, Vec<u64>)> = Vec::new();
+                for info in files.iter().filter(|i| i.layer == f) {
+                    let file = celeste_rust::search::checkpoint::FrameFile::open(&info.path)?;
+                    let Some(rt2) = file.load_all()? else { continue };
+                    let b = Block::from_rt2(rt2);
+                    let ws = b.wins()?;
+                    let all_ids: Vec<u64> = (0..info.width as u64).map(|r| info.base as u64 + r).collect();
+                    // Won rows are never expanded (`ForwardState::extend`).
+                    let mask: Vec<bool> = ws.iter().map(|w| !w).collect();
+                    let kept_ids: Vec<u64> = all_ids.iter().zip(&mask).filter(|(_, m)| **m).map(|(i, _)| *i).collect();
+                    if let Some(b) = b.keep(&mask) {
+                        blocks.push((b, kept_ids));
+                    }
+                }
+                let cells: Vec<Vec<u32>> = blocks.iter().map(|(b, _)| b.positions()).collect::<Result<_>>()?;
+                let mut units: Vec<(usize, usize, usize)> = Vec::new();
+                for (bi, (b, _)) in blocks.iter().enumerate() {
+                    let mut lo = 0;
+                    while lo < b.lanes() {
+                        let hi = (lo + 16384).min(b.lanes());
+                        units.push((bi, lo, hi));
+                        lo = hi;
+                    }
+                }
+                let next = AtomicUsize::new(0);
+                let frame_edges: Vec<Vec<(u32, u32)>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..workers)
+                        .map(|_| {
+                            let (blocks, cells, units, next, ids) = (&blocks, &cells, &units, &next, &ids);
+                            let engine = &engine;
+                            std::thread::Builder::new()
+                                .stack_size(64 << 20)
+                                .spawn_scoped(scope, move || -> Result<Vec<(u32, u32)>> {
+                                    let mut sink = ForwardSink::graph(ids);
+                                    loop {
+                                        let u = next.fetch_add(1, Ordering::Relaxed);
+                                        let Some(&(bi, lo, hi)) = units.get(u) else { break };
+                                        sink.ids_in = Some(&blocks[bi].1);
+                                        engine.run(&blocks[bi].0, &cells[bi], lo..hi, &mut sink)?;
+                                    }
+                                    sink.finish()?;
+                                    Ok(std::mem::take(&mut sink.graph_edges))
+                                })
+                                .expect("spawn")
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().expect("graph worker")).collect::<Result<Vec<_>>>()
+                })?;
+                let mut edges: Vec<(u32, u32)> = frame_edges.into_iter().flatten().collect();
+                let raw = edges.len();
+                edges.sort_unstable();
+                edges.dedup();
+                total_edges += edges.len() as u64;
+                total_raw += raw as u64;
+                // Split by target layer (ids are contiguous per layer).
+                let mut start = 0usize;
+                for j in 0..=to {
+                    let end_id = layer_end(j);
+                    let end = start + edges[start..].partition_point(|e| e.0 < end_id);
+                    if end > start {
+                        let ldir = out.join(format!("l{:03}", j));
+                        std::fs::create_dir_all(&ldir)?;
+                        write_pairs(&ldir.join(format!("f{:03}.bin", f)), &edges[start..end])?;
+                    }
+                    start = end;
+                }
+                let lanes: usize = blocks.iter().map(|(b, _)| b.lanes()).sum();
+                eprintln!("[graph] layer {f:03}: {lanes} rows expanded, {} edges ({:.1} per row; {raw} before dedup)", edges.len(), edges.len() as f64 / lanes.max(1) as f64);
+            }
+            eprintln!("[graph] {total_edges} edges ({total_raw} before per-frame dedup), materialized and written in {:.1} s", t.elapsed().as_secs_f64());
+
+            // ---- 3. Per target layer: merge its per-frame files into a CSR
+            // (offsets u64 per row, preds u32), with the degree stats.
+            let t = std::time::Instant::now();
+            let mut outdeg: Vec<u32> = vec![0; n];
+            let mut indeg: Vec<u64> = Vec::with_capacity(n);
+            let mut late = 0u64;
+            let mut csr_bytes = 0u64;
+            for j in 0..=to {
+                let ldir = out.join(format!("l{:03}", j));
+                let (base, end) = (layer_base[j as usize], layer_end(j));
+                let mut pairs: Vec<(u32, u32)> = Vec::new();
+                if ldir.is_dir() {
+                    for e in std::fs::read_dir(&ldir)? {
+                        let path = e?.path();
+                        if path.extension().is_some_and(|x| x == "bin") {
+                            let bytes = std::fs::read(&path)?;
+                            for c in bytes.chunks_exact(8) {
+                                pairs.push((u32::from_le_bytes(c[0..4].try_into().unwrap()), u32::from_le_bytes(c[4..8].try_into().unwrap())));
+                            }
+                        }
+                    }
+                }
+                pairs.sort_unstable();
+                pairs.dedup();
+                let width = (end - base) as usize;
+                let mut offsets: Vec<u64> = vec![0; width + 1];
+                for &(tgt, p) in &pairs {
+                    offsets[(tgt - base) as usize + 1] += 1;
+                    outdeg[p as usize] += 1;
+                    if layer_of[p as usize] as u32 + 1 != j {
+                        late += 1;
+                    }
+                }
+                for i in 0..width {
+                    offsets[i + 1] += offsets[i];
+                    indeg.push(offsets[i + 1] - offsets[i]);
+                }
+                let mut buf: Vec<u8> = Vec::with_capacity(pairs.len() * 4);
+                for (_, p) in &pairs {
+                    buf.extend_from_slice(&p.to_le_bytes());
+                }
+                std::fs::write(out.join(format!("l{:03}.preds.u32", j)), &buf)?;
+                buf.clear();
+                for o in &offsets {
+                    buf.extend_from_slice(&o.to_le_bytes());
+                }
+                std::fs::write(out.join(format!("l{:03}.offsets.u64", j)), &buf)?;
+                csr_bytes += (pairs.len() * 4 + offsets.len() * 8) as u64;
+                let _ = std::fs::remove_dir_all(&ldir);
+            }
+            eprintln!("[graph] CSR per layer merged and written in {:.1} s", t.elapsed().as_secs_f64());
+            let dist = |name: &str, v: Vec<u64>| {
+                let mut c = v;
+                c.sort_unstable();
+                let m = c.len().max(1);
+                let zero = c.iter().filter(|&&x| x == 0).count();
+                println!("[graph] {name}: median {} p90 {} p99 {} max {}; {} of {} rows have none", c[m / 2], c[m * 9 / 10], c[m * 99 / 100], c[m - 1], zero, c.len());
+            };
+            dist("in-degree (preds per state)", indeg);
+            dist("out-degree (successors per state)", outdeg.iter().map(|&d| d as u64).collect());
+            let tree_bytes: u64 = files.iter().map(|i| std::fs::metadata(&i.path).map(|m| m.len()).unwrap_or(0)).sum();
+            println!(
+                "[graph] {} states, {} edges ({:.1} per state), {:.1}% late (pred not in the layer before the target); CSR {:.2} GB on disk vs tree files {:.2} GB",
+                n, total_edges, total_edges as f64 / n as f64, 100.0 * late as f64 / total_edges.max(1) as f64, csr_bytes as f64 / 1e9, tree_bytes as f64 / 1e9
+            );
+            } // !reuse
+            let layer_base: Vec<u32> = (0..=to)
+                .map(|f| files.iter().find(|i| i.layer == f).map_or(n_ids, |i| i.base))
+                .collect();
+            // The CSRs, mapped for the BFS.
+            let maps: Vec<(memmap2::Mmap, memmap2::Mmap)> = (0..=to)
+                .map(|j| -> Result<_> {
+                    let o = std::fs::File::open(out.join(format!("l{:03}.offsets.u64", j)))?;
+                    let p = std::fs::File::open(out.join(format!("l{:03}.preds.u32", j)))?;
+                    Ok((unsafe { memmap2::Mmap::map(&o)? }, unsafe { memmap2::Mmap::map(&p)? }))
+                })
+                .collect::<Result<_>>()?;
+            let preds_of = |id: u32| -> &[u8] {
+                let j = layer_of[id as usize] as usize;
+                let local = (id - layer_base[j]) as usize;
+                let (o, p) = &maps[j];
+                let lo = u64::from_le_bytes(o[local * 8..local * 8 + 8].try_into().unwrap()) as usize;
+                let hi = u64::from_le_bytes(o[local * 8 + 8..local * 8 + 16].try_into().unwrap()) as usize;
+                &p[lo * 4..hi * 4]
+            };
+
+            // ---- 3b. Inspect target cells: preds grouped by source (layer, cell).
+            if inspect_cells > 0 {
+                // Rank of every id within its (layer, cell), in id order.
+                let mut rank_of: Vec<u32> = vec![0; n];
+                let mut counters: FxHashMap<(u8, u32), u32> = FxHashMap::default();
+                for id in 0..n {
+                    let e = counters.entry((layer_of[id], cell_of[id])).or_default();
+                    rank_of[id] = *e;
+                    *e += 1;
+                }
+                let j = to - 1;
+                let (base, end) = (layer_base[j as usize] as usize, if j + 1 > to { n } else { layer_base[j as usize + 1] as usize });
+                // Cells of layer j by row count, descending; pick the biggest,
+                // the median, and evenly spaced ones between.
+                let mut by_cell: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+                for id in base..end {
+                    by_cell.entry(cell_of[id]).or_default().push(id as u32);
+                }
+                let mut cells: Vec<(u32, Vec<u32>)> = by_cell.into_iter().collect();
+                cells.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+                let picks: Vec<usize> = (0..inspect_cells).map(|k| k * (cells.len() - 1) / inspect_cells.max(2).saturating_sub(1).max(1)).collect();
+                println!("[inspect] layer {j}: {} cells, {} rows; per target cell: rows, preds, distinct source (layer, cell) groups, flat CSR bytes (4/edge + 8/row), grouped bytes (9/group + 4/edge as u16 ranks), grouped+delta bytes (varint target-rank deltas + u16 source rank)", cells.len(), end - base);
+                for pi in picks {
+                    let (cell, ids) = &cells[pi.min(cells.len() - 1)];
+                    let mut groups: FxHashMap<(u8, u32), Vec<(u32, u32)>> = FxHashMap::default();
+                    let mut edges = 0usize;
+                    for &id in ids {
+                        for c in preds_of(id).chunks_exact(4) {
+                            let p = u32::from_le_bytes(c.try_into().unwrap());
+                            groups.entry((layer_of[p as usize], cell_of[p as usize])).or_default().push((rank_of[id as usize], rank_of[p as usize]));
+                            edges += 1;
+                        }
+                    }
+                    let flat = edges * 4 + ids.len() * 8;
+                    let grouped = groups.len() * 9 + edges * 4;
+                    let mut delta = groups.len() * 9;
+                    let mut max_group = 0usize;
+                    for g in groups.values_mut() {
+                        g.sort_unstable();
+                        max_group = max_group.max(g.len());
+                        let mut last = 0u32;
+                        for &(t, _) in g.iter() {
+                            let d = t - last;
+                            delta += if d < 128 { 1 } else if d < 16384 { 2 } else { 3 };
+                            delta += 2;
+                            last = t;
+                        }
+                    }
+                    let (x, y) = celeste_rust::search::pos_graph::cell_xy(*cell).unwrap_or((-1, -1));
+                    println!("[inspect] cell {cell} ({x},{y}): {} rows, {edges} preds ({:.1}/row), {} source groups (largest {max_group} edges, {:.1} edges/group): flat {} B, grouped {} B ({:.2}x), grouped+delta {} B ({:.2}x)",
+                        ids.len(), edges as f64 / ids.len().max(1) as f64, groups.len(), edges as f64 / groups.len().max(1) as f64, flat, grouped, grouped as f64 / flat as f64, delta, delta as f64 / flat as f64);
+                }
+            }
+
+            // ---- 4. BFS backward per horizon, checked against the log.
+            let expected: FxHashMap<u32, (u64, String)> = match &log {
+                Some(l) => std::fs::read_to_string(l)?
+                    .lines()
+                    .filter_map(|line| {
+                        let caps = regex_lite(line)?;
+                        Some(caps)
+                    })
+                    .collect(),
+                None => FxHashMap::default(),
+            };
+            fn regex_lite(line: &str) -> Option<(u32, (u64, String))> {
+                // [ladder] h93 level 0 (Bits(0)): first win f79, marked 24380528 states (fingerprint fd67...), ...
+                let rest = line.strip_prefix("[ladder] h")?;
+                let (h, rest) = rest.split_once(" level 0 ")?;
+                let (_, rest) = rest.split_once("marked ")?;
+                let (n, rest) = rest.split_once(" states (fingerprint ")?;
+                let (fp, _) = rest.split_once(')')?;
+                Some((h.parse().ok()?, (n.parse().ok()?, fp.to_string())))
+            }
+            if let Some(hs) = &horizons {
+                let (a, b) = hs.split_once("..").expect("a..b");
+                let (a, b): (u32, u32) = (a.parse()?, b.parse()?);
+                for h in a..=b.min(to) {
+                    let t = std::time::Instant::now();
+                    let mut marked: Vec<u64> = vec![0; n.div_ceil(64)];
+                    let mut mark_iter: FxHashMap<u32, u32> = FxHashMap::default();
+                    let mut frontier: Vec<u32> = Vec::new();
+                    let mut count = 0usize;
+                    for &w in &wins {
+                        if layer_of[w as usize] as u32 <= h {
+                            marked[w as usize / 64] |= 1 << (w % 64);
+                            mark_iter.insert(w, h);
+                            frontier.push(w);
+                            count += 1;
+                        }
+                    }
+                    let mut iters = 0;
+                    // Down to layer 1, like the kernel backward (the root's
+                    // mark is never consulted: the filter sees emitted rows).
+                    for i in (1..h).rev() {
+                        if frontier.is_empty() {
+                            break;
+                        }
+                        let mut next: Vec<u32> = Vec::new();
+                        for &tgt in &frontier {
+                            for c in preds_of(tgt).chunks_exact(4) {
+                                let p = u32::from_le_bytes(c.try_into().unwrap());
+                                if layer_of[p as usize] as u32 <= i && marked[p as usize / 64] & (1 << (p % 64)) == 0 {
+                                    marked[p as usize / 64] |= 1 << (p % 64);
+                                    if marks_dir.is_some() {
+                                        mark_iter.insert(p, i);
+                                    }
+                                    next.push(p);
+                                }
+                            }
+                        }
+                        count += next.len();
+                        frontier = next;
+                        iters += 1;
+                    }
+                    let bfs_ms = t.elapsed().as_secs_f64() * 1e3;
+                    let t = std::time::Instant::now();
+                    let mut v = Visited::new();
+                    for id in 0..n {
+                        if marked[id / 64] & (1 << (id % 64)) != 0 {
+                            v.insert(shape_of_file[file_of[id] as usize], key_of[id], cell_of[id]);
+                        }
+                    }
+                    let (nn, fp) = v.fingerprint();
+                    let verdict = match expected.get(&h) {
+                        Some((en, efp)) => if *en == nn as u64 && *efp == format!("{fp:016x}") { "IDENTICAL to the log" } else { "DIFFERS from the log" },
+                        None => "(no log line)",
+                    };
+                    println!("[graph] h{h}: BFS {iters} iterations, marked {count} ({nn} in the set, fingerprint {fp:016x}) in {bfs_ms:.0} ms (+{:.0} ms fingerprint) - {verdict}", t.elapsed().as_secs_f64() * 1e3);
+                    if let Some(md) = &marks_dir {
+                        let path = celeste_rust::frame::marks_path(std::path::Path::new(md), h, 0);
+                        if let Ok(kernel) = Visited::load(&path) {
+                            let is_win: FxHashMap<u32, bool> = wins.iter().map(|&w| (w, true)).collect();
+                            let describe = |id: usize| -> String {
+                                let (x, y) = celeste_rust::search::pos_graph::cell_xy(cell_of[id]).unwrap_or((-1, -1));
+                                let np = preds_of(id as u32).len() / 4;
+                                format!("id {id} layer {} cell ({x},{y}) win {} preds {np}", layer_of[id], is_win.contains_key(&(id as u32)))
+                            };
+                            let mut only_bfs = Vec::new();
+                            let mut only_kernel = 0usize;
+                            for id in 0..n {
+                                let m = marked[id / 64] & (1 << (id % 64)) != 0;
+                                let k = kernel.contains(shape_of_file[file_of[id] as usize], key_of[id], cell_of[id]);
+                                if m && !k {
+                                    only_bfs.push(describe(id));
+                                }
+                                if k && !m {
+                                    only_kernel += 1;
+                                    println!("[graph]   only the kernel marked: {}", describe(id));
+                                    // Its successors: every state listing it as a pred.
+                                    for t in 0..n {
+                                        if preds_of(t as u32).chunks_exact(4).any(|c| u32::from_le_bytes(c.try_into().unwrap()) == id as u32) {
+                                            let tm = marked[t / 64] & (1 << (t % 64)) != 0;
+                                            let tk = kernel.contains(shape_of_file[file_of[t] as usize], key_of[t], cell_of[t]);
+                                            let seed_pred = wins.iter().filter(|&&w| layer_of[w as usize] as u32 <= h).any(|&w| preds_of(w).chunks_exact(4).any(|c| u32::from_le_bytes(c.try_into().unwrap()) == t as u32));
+                                            println!("[graph]     successor {} - BFS marked {tm} (at iteration {:?}), kernel marked {tk}, direct pred of a seed: {seed_pred}", describe(t), mark_iter.get(&(t as u32)));
+                                        }
+                                    }
+                                }
+                            }
+                            for d in &only_bfs {
+                                println!("[graph]   only the BFS marked: {d}");
+                            }
+                            println!("[graph]   diff vs {}: {} only BFS, {only_kernel} only kernel", path.display(), only_bfs.len());
+                        }
+                    }
+                }
+            }
         }
         Command::Trajectory {
             trajectory,

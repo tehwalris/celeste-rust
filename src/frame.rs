@@ -216,6 +216,8 @@ pub struct Slot {
     pub cols: Vec<(usize, TCol)>,
     pub keys: Vec<(u64, u64)>,
     pub cells: Vec<u32>,
+    /// GRAPH MODE (`ForwardSink::ids_in`): the input row's id per row.
+    pub preds: Vec<u64>,
 }
 
 impl Slot {
@@ -244,6 +246,7 @@ impl Slot {
             cols,
             keys: Vec::new(),
             cells: Vec::new(),
+            preds: Vec::new(),
         }
     }
 
@@ -276,6 +279,7 @@ impl Slot {
         }
         self.keys.clear();
         self.cells.clear();
+        self.preds.clear();
     }
 
     /// An empty block of this slot's shape for the rows to land in.
@@ -429,6 +433,10 @@ impl Slot {
     }
 }
 
+/// Graph mode's state ids: the tree's rows by their 128-bit key
+/// (`rewrite graph`).
+pub type GraphIds = rustc_hash::FxHashMap<(u64, u64), u32>;
+
 /// The backward's target set - the marks of the previous iteration as
 /// `(key, cell)` - with a bitmap in front of it: one bit per low-22-bit
 /// slice of `key.0` (512 KB: L2-resident, read-only), so the
@@ -518,6 +526,14 @@ pub struct ForwardSink<'a> {
     last: ((u64, u32), u32),
     door: Option<&'a crate::search::door::Door>,
     filter: Option<&'a MarkFilter<'a>>,
+    /// GRAPH MODE (`rewrite graph`): no door; every flushed row becomes
+    /// the edge (its input row's id -> the state's id, looked up here).
+    graph: Option<&'a GraphIds>,
+    /// The ids of the block being run, per lane (set by the worker before
+    /// each unit in graph mode); the step reads `ids_in[lane]`.
+    pub ids_in: Option<&'a [u64]>,
+    /// Graph mode's output: `(target id, pred id)` per flushed row.
+    pub graph_edges: Vec<(u32, u32)>,
     /// This worker's next-frame rows, one block per shape.
     pieces: rustc_hash::FxHashMap<u64, Rt2>,
     pub won: bool,
@@ -559,6 +575,9 @@ impl<'a> ForwardSink<'a> {
             last: NO_QUEUE,
             door: None,
             filter: None,
+            graph: None,
+            ids_in: None,
+            graph_edges: Vec::new(),
             pieces: Default::default(),
             won: false,
             kept: 0,
@@ -582,6 +601,14 @@ impl<'a> ForwardSink<'a> {
         let mut s = Self::empty(edges_on);
         s.door = Some(door);
         s.filter = filter;
+        s
+    }
+
+    /// A graph-recording sink (`rewrite graph`): rows are not kept, their
+    /// (input id -> state id) edges are.
+    pub fn graph(ids: &'a GraphIds) -> Self {
+        let mut s = Self::empty(false);
+        s.graph = Some(ids);
         s
     }
 
@@ -671,6 +698,27 @@ impl<'a> ForwardSink<'a> {
     /// admit at the door, gather the admitted rows into this worker's
     /// piece of the shape; the queue goes back to its outcome's spares.
     fn flush(&mut self, q: usize) -> Result<()> {
+        if let Some(ids) = self.graph {
+            let slot = &mut self.slots[q];
+            for r in 0..slot.rows() {
+                let key = slot.keys[r];
+                let Some(&target) = ids.get(&key) else {
+                    anyhow::bail!("graph: emitted state {:?} at cell {} is not in the tree", key, slot.cells[r]);
+                };
+                self.graph_edges.push((target, slot.preds[r] as u32));
+            }
+            self.flushes += 1;
+            self.flushed_rows += slot.rows() as u64;
+            slot.clear();
+            slot.live = false;
+            slot.touched = false;
+            self.index.remove(&(slot.outcome, slot.cell));
+            self.spare.entry(slot.outcome).or_default().push(q as u32);
+            if self.last.1 == q as u32 {
+                self.last = NO_QUEUE;
+            }
+            return Ok(());
+        }
         let door = self.door.expect("flush without a door");
         let slot = &mut self.slots[q];
         let n = slot.rows();

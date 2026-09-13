@@ -303,11 +303,21 @@ impl AsmKernel {
                         runtime2::mix64(part.1.wrapping_add(h2)),
                     );
                     let cin = cell_in[lo + i];
+                    // Graph mode: the input row's id rides along, and the
+                    // call's dedup is per (row, input) rather than per row,
+                    // since every (pred, state) pair is an edge.
+                    let pid = sink.ids_in.map(|ids| ids[lo + i]);
+                    // (The cache indexes by the first half and compares the
+                    // second, so BOTH halves carry the input's id.)
+                    let seen_key = match pid {
+                        Some(p) => (key.0 ^ runtime2::mix64(p), key.1 ^ runtime2::mix64(p ^ 0x9e37_79b9_7f4a_7c15)),
+                        None => key,
+                    };
                     // EMISSION-TIME PROVENANCE (plans/buckets.md). The
                     // source of this row is lane `i` of this slice, and
                     // everything that needs to know is told right here:
                     // the pos-graph edge and the owner.
-                    if let Some(first_cin) = seen.insert_tagged(key, cin) {
+                    if let Some(first_cin) = seen.insert_tagged(seen_key, cin) {
                         // A re-emission of a row this call already produced.
                         // Nothing to push - but if it came from a DIFFERENT
                         // input cell, that is a pos-graph edge the first
@@ -329,6 +339,9 @@ impl AsmKernel {
                     // run of rows at one cell.
                     let q = sink.queue(template.shape_hash, cout, || (*template.union).clone_block());
                     cols.push_row(&mut sink.slots[q], outbuf, i, key, cout);
+                    if let Some(p) = pid {
+                        sink.slots[q].preds.push(p);
+                    }
                     sink.pushed(q).expect("flushing a full queue");
                 }
             }
