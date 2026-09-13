@@ -32,6 +32,11 @@ enum Command {
         /// Deepest bits rung (>=16 means Exact is the top rung).
         #[arg(long, default_value_t = 15)]
         maxk: u8,
+        /// The rungs to run, explicitly: comma-separated bits, 16 = Exact
+        /// (e.g. "0,1,6,8,15,16"). Overrides `--maxk`. Must start at 0 and
+        /// end at 16; any ascending subsequence is a sound ladder.
+        #[arg(long)]
+        rungs: Option<String>,
         /// Base checkpoint dir (per-horizon, per-level subdirs land under it).
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
@@ -153,6 +158,7 @@ fn main() -> Result<()> {
             from,
             to,
             maxk,
+            rungs,
             checkpoint_dir,
             room,
             win_at,
@@ -163,10 +169,25 @@ fn main() -> Result<()> {
             if let Some(xy) = &win_at {
                 std::env::set_var("CELESTE_WIN_AT_XY", xy);
             }
-            let precisions: Vec<RemPrecision> = (0u8..=maxk.min(15))
-                .map(RemPrecision::Bits)
-                .chain(std::iter::once(RemPrecision::Exact))
-                .collect();
+            let precisions: Vec<RemPrecision> = match rungs {
+                Some(list) => {
+                    let ks: Vec<u8> = list
+                        .split(',')
+                        .map(|s| s.trim().parse::<u8>())
+                        .collect::<Result<_, _>>()
+                        .map_err(|e| anyhow::anyhow!("--rungs: {e}"))?;
+                    anyhow::ensure!(
+                        ks.first() == Some(&0) && ks.last() == Some(&16) && ks.windows(2).all(|w| w[0] < w[1]),
+                        "--rungs must be ascending, start at 0 and end at 16 (Exact)"
+                    );
+                    ks.into_iter().map(|k| if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) }).collect()
+                }
+                None => (0u8..=maxk.min(15))
+                    .map(RemPrecision::Bits)
+                    .chain(std::iter::once(RemPrecision::Exact))
+                    .collect(),
+            };
+            eprintln!("[search] rungs: {precisions:?}");
             let make_engine = |p: RemPrecision| {
                 set_rem_precision(p);
                 Ok(Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)
