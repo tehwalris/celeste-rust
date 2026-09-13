@@ -120,6 +120,18 @@ enum Command {
         reps: usize,
         #[arg(long, default_value = "1,0")]
         room: String,
+        /// A level dir (`frames/` under it) instead of `<checkpoint_dir>/level00`.
+        #[arg(long)]
+        level_dir: Option<String>,
+        /// The rung to run at: bits 0..=15, or 16 for Exact (default 0).
+        #[arg(long, default_value_t = 0)]
+        precision: u8,
+        /// A coarser level's marks file: run under its MarkFilter (the
+        /// finer levels' path), widening to `--coarser` bits.
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        coarser: u8,
     },
     /// Microbenchmark of ONE backward: a level's tree and pos-graph
     /// (`frames/` and `posgraph.bin` under `level_dir`, as `rewrite forward`
@@ -426,14 +438,28 @@ fn main() -> Result<()> {
             frame,
             reps,
             room,
+            level_dir,
+            precision,
+            filter,
+            coarser,
         } => {
-            use celeste_rust::frame::{forward_frame, load_frame, threads, Block};
+            use celeste_rust::frame::{forward_frame, load_frame, threads, Block, MarkFilter, Visited};
             use celeste_rust::search::door::Door;
             use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
-            set_rem_precision(RemPrecision::Bits(0));
+            let rung = |k: u8| if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) };
+            set_rem_precision(rung(precision));
             let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
-            let dir = std::path::Path::new(&checkpoint_dir).join("level00");
+            let dir = match &level_dir {
+                Some(d) => std::path::PathBuf::from(d),
+                None => std::path::Path::new(&checkpoint_dir).join("level00"),
+            };
+            let marks: Option<Visited> = match &filter {
+                Some(p) => Some(Visited::load(std::path::Path::new(p))?),
+                None => None,
+            };
+            let mark_filter = marks.as_ref().map(|m| MarkFilter::new(m, rung(coarser)));
+            let mark_filter = mark_filter.as_ref();
             let t = std::time::Instant::now();
             let frontier = load_frame(&dir, frame)?;
             let lanes: usize = frontier.iter().map(Block::lanes).sum();
@@ -449,13 +475,13 @@ fn main() -> Result<()> {
                 let n = b.lanes();
                 let mask: Vec<bool> = (0..n).map(|i| i < 64).collect();
                 let small = vec![b.keep(&mask).expect("a non-empty block")];
-                forward_frame(&engine, small, &Door::new(), None, None)?;
+                forward_frame(&engine, small, &Door::new(), None, mark_filter)?;
             }
             for rep in 0..reps {
                 let input: Vec<Block> = frontier.iter().map(|b| Block::from_rt2(b.rt2().clone_block())).collect();
                 let door = Door::new();
                 let t = std::time::Instant::now();
-                let (next, _won, st) = forward_frame(&engine, input, &door, None, None)?;
+                let (next, _won, st) = forward_frame(&engine, input, &door, None, mark_filter)?;
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
                 println!(
                     "[bench] rep {rep}: raw {} kept {} | wave {:.0} ms (idle {:.0}%) door {:.0} total {:.0} ms | flushes {} ({:.0} rows avg) | {} out blocks",

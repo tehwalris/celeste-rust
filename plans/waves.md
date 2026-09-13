@@ -369,3 +369,50 @@ same pos-graph fingerprint; at f90 the frame is 10.1 s (wave 8.8 s,
 door 0.35 s, ckpt 0.8 s) against 9.5 s two-phase, door 5.96 GB against
 8.8 GB of hash sets, queues 0.25 GB against ~8 GB of slots. The three
 memory cuts compose: 44 GB (glibc) -> 24.8 (mimalloc) -> 14.2 (waves).
+
+## The finer rungs (2026-09-13, measured on the room (0,0) run)
+
+The ladder's cost past the first level-0 win grows ~x1.3-1.6 per horizon
+step and the finer levels dominate late (room (1,0) h99: 112 of 137 s),
+so the finer levels' per-row cost is the base of that exponential.
+Microbenchmark (`rewrite bench-frame --level-dir <h084/level01> --frame
+83 --precision 1 [--filter <h083/level00.marks.bin> --coarser 0]`, room
+(0,0), 88k lanes, 16 threads, the search running alongside):
+
+| | wave | idle | per lane |
+|---|---|---|---|
+| level 1 (Bits(1)) with the level-0 marks filter | 3.1-4.5 s | 61-66% | ~40 us |
+| level 1 without the filter | 2.2-2.6 s | 63-68% | ~28 us |
+| level 0 (Bits(0)), for reference | | 1-2% | ~0.5 us |
+
+Two findings, in order of size:
+
+1. **The ladder rungs' kernels have 3.4x the bodies.** Bodies and fused
+   nodes over room (0,0)'s 8 input shapes: rung 0: 723 bodies / 32k
+   nodes; rungs 1-15 (one traced set, `WidenMode::RemRung`): **2,451 /
+   54k**; Exact: 225 / 12k. Every (body, slice) pair is evaluated - the
+   kernel utilization line at level 1 reads 13.2M evaluations for 5.5k
+   slices, 16.5% taking a lane, 84 lane emissions per input row of which
+   5.4% survive the call's dedup - so a rung-1 lane costs ~5x a rung-0
+   lane before anything else, and the small frames (a few units) leave
+   most workers idle on top. The extra bodies are the rem forks that the
+   interval widening makes live at Bits(k) (the floor of `spd + rem`
+   splits) times the button configurations. This is the same body
+   enumeration the motion-free specialization would shrink, and the
+   first place a runtime fork (branch per lane instead of a body per
+   path) would pay.
+2. **The marks filter is ~30% of a level-1 frame** and pure waste: at
+   every flush it clones the queue as a block, widens it to the coarser
+   rung, recomputes canonical keys and cells, and looks them up
+   (`MarkFilter::allowed` -> `widened_keys_rt2`; all at the `Rt2` level -
+   the comment about crossing into the interpreter `State` is stale).
+   Philippe's fix: the rung-k kernel should EMIT, next to the row's own
+   key, the key of the row widened to rung k-1 (the same fold over the
+   coarser widening of the same output values, traced once; two more
+   roots per body, 16 bytes per row), and the filter becomes one lookup
+   per row at flush time with no widening after the fact. Nothing in
+   the loop should ever convert to a plain state.
+
+Both are for after the room (0,0) run; (2) first (contained: the
+tracer's key fold with the coarser widening, two roots per body, the
+flush's lookup), then (1) with the specialization work.

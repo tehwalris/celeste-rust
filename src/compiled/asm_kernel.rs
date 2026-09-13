@@ -970,10 +970,13 @@ fn unify(by_shape: &mut HashMap<u64, AsmKernel>) -> Result<()> {
         kernel.body_cols = body_cols;
     }
     let templates: usize = by_shape.values().map(|k| k.acc_templates.len()).sum();
+    let bodies: usize = by_shape.values().map(|k| k.bodies.len()).sum();
+    let fused: usize = by_shape.values().map(|k| k.fused.len()).sum();
     eprintln!(
-        "[asm build] {} output shapes over {templates} outcome templates; {widened} template cells widened uniform -> typed by the union ({:.2} per template)",
+        "[asm build] {} output shapes over {templates} outcome templates; {widened} template cells widened uniform -> typed by the union ({:.2} per template); {bodies} bodies, {fused} fused nodes over {} input shapes",
         unions.len(),
-        widened as f64 / templates.max(1) as f64
+        widened as f64 / templates.max(1) as f64,
+        by_shape.len()
     );
     Ok(())
 }
