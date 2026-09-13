@@ -418,6 +418,29 @@ pico8_diff/replay.py tas/room_1_0_exit_frame_99.txt
 ./target/release/transpile --room-consts
 ```
 
+### The UI (`ui/`)
+
+A phone-first web view of one finished search: the room as a heatmap
+per (horizon, level, pass, frame) with the ladder's bands, set sizes,
+and the timing waterfall. Static: `rewrite export-ui` turns a finished
+checkpoint tree + its run log into ~9 MB of `run.json` + per-level
+binaries (headers and marks only, no row decoded, ~6 s); a Vite build
+plus `ui/serve.mjs` serve it under `/celeste/` on port 3011
+(UI-HOSTING.md). The control model and the data layout are in
+`ui/README.md` and at the top of `src/search/ui_export.rs`.
+
+```bash
+cp /tmp/room10f.log /var/tmp/celeste-ui/room10f.log      # the run's log is the timing source
+./one-cargo.sh ./safe-run.sh -- cargo build --profile quick --bin rewrite
+./safe-run.sh -- ./target/quick/rewrite export-ui --log /var/tmp/celeste-ui/room10f.log \
+    --out /var/tmp/celeste-ui/data --room 1,0             # from the repo root (loads cart/)
+cd ui && npm install && npm run typecheck && npm run build
+systemd-run --user --scope -p MemoryMax=2G --quiet node serve.mjs &   # http://localhost:3011/celeste/
+```
+
+Never serve uncapped, never on another port, and nothing generated
+(`ui/dist`, `ui/node_modules`, the exported data) is committed.
+
 ## Installing packages
 
 Feel free to install pacman packages when needed (e.g., for profiling tools
