@@ -1,3 +1,28 @@
+# Room (1,0) end to end on the explicit backward graph (2026-09-14, release, 32 threads)
+
+`rewrite search --room 1,0 --to 110` on `edges::backward` (the BFS over
+the recorded edges) against the same run on the kernel walk
+(/tmp/room10f.log, 2026-09-13). Every `[ladder]` fingerprint identical,
+`OPTIMAL win frame: 99`.
+
+| | kernel walk | explicit graph |
+|---|---|---|
+| whole search wall | 7 min 13 s | **6 min 33 s** |
+| peak RSS | ~12.6 GB (f89) | 25.9 GB (the runs mapped by the BFS) |
+| level-0 forward f89 | 1.76 s (emit 1.37) | 3.26 s (wave 1.92, edges 0.92, ckpt 0.13) |
+| level-0 backward at H=99 | 22.9 s (98M re-runs) | 17.4 s: 29.2M lookups, 90.4M edges, single-threaded |
+| level-0 backward, H=89..99 summed | ~85 s | (see the log; h89 6 ms) |
+| level-0 runs on disk, f0-f99 | - | 22 GB beside 27 GB of frames |
+
+Room (1,0) was never the case for the graph (its backward was ~85 s of
+433); the frame is ~1.8x slower with recording and the deep-horizon BFS
+is serial. Three bugs only a real room's scale reached, all fixed and
+gated on the way: empty pieces renumbered into a real seq (h89 crash),
+all-won units reaching the kernel (KERNEL COVERAGE GAP at level 1), and
+a queue index >= 256 aliasing another queue's row in the 32-bit row ref
+(29k spurious level-0 marks from h91; `bench-backward --diff` +
+`CELESTE_DIFF_RERUN` found it).
+
 # The explicit backward graph: recording cost at room (1,0) f70 (2026-09-13, quick profile, 16 threads)
 
 `rewrite bench-frame --level-dir <level 0 tree to f70> --frame 70 --edges`

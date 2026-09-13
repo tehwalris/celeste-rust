@@ -582,6 +582,40 @@ impl EdgeGraph {
         Ok(EdgeGraph { runs, records, bytes })
     }
 
+    /// DIAGNOSTIC: every `(pred, target)` edge recorded at frame `frame`
+    /// whose pred is in `preds` - a full scan of that frame's runs.
+    pub fn edges_from(&self, frame: u32, preds: &[u64]) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        for runs in &self.runs {
+            let Some(Some(run)) = runs.get(frame as usize) else { continue };
+            let b = &run.map[run.stream..];
+            let mut pos = 0usize;
+            let mut blk = 0usize;
+            if run.index.is_empty() {
+                continue;
+            }
+            let (mut prev_t, mut prev_b) = (run.index[0].0, 0u64);
+            while pos < b.len() {
+                if blk + 1 < run.index.len() && pos >= run.index[blk + 1].1 as usize {
+                    blk += 1;
+                    prev_t = run.index[blk].0;
+                    prev_b = 0;
+                }
+                let t = prev_t + get_varint(b, &mut pos);
+                let base = (prev_b as i64 + unzigzag(get_varint(b, &mut pos))) as u64;
+                let mask = get_varint(b, &mut pos) as u16;
+                prev_t = t;
+                prev_b = base;
+                for &p in preds {
+                    if p >= base && p < base + 16 && mask & (1 << (p - base)) != 0 {
+                        out.push((p, t));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The predecessors of `target` recorded at frame `frame`.
     pub fn preds_at(&self, target: u64, frame: u32, buf: &mut Vec<Edge>) {
         if let Some(Some(run)) = self.runs.get(id_layer(target) as usize).and_then(|v| v.get(frame as usize)) {
@@ -743,6 +777,11 @@ pub fn backward(dir: &Path, horizon: u32) -> Result<BackwardResult> {
         let cells = file.row_cells();
         for &id in &ids[lo..hi] {
             let row = crate::frame::id_row(id);
+            ensure!(
+                row < file.width(),
+                "edges: marked id l{layer} s{seq} r{row} is past its file's {} rows",
+                file.width()
+            );
             marked.insert(file.shape_hash(), file.key_at(row), cells[row as usize]);
             i += 1;
         }

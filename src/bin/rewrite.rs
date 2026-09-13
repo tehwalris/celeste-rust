@@ -898,9 +898,21 @@ fn main() -> Result<()> {
                 }
                 println!("[diff] kernel {} states, bfs {} states", a.len(), b.len());
                 let edges = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
-                for k in sa.difference(&sb) {
+                let only_kernel: Vec<_> = sa.difference(&sb).copied().collect();
+                let only_bfs: Vec<_> = sb.difference(&sa).copied().collect();
+                println!("[diff] only kernel: {} states; only bfs: {} states", only_kernel.len(), only_bfs.len());
+                let mut by_layer: std::collections::BTreeMap<u32, usize> = Default::default();
+                for k in &only_bfs {
+                    for &id in where_is.get(k).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        *by_layer.entry(celeste_rust::frame::id_layer(id)).or_default() += 1;
+                    }
+                }
+                println!("[diff] only-bfs states per layer: {:?}", by_layer);
+                let shown: Vec<_> = only_kernel.iter().map(|k| ("only kernel", *k)).chain(only_bfs.iter().take(6).map(|k| ("only bfs", *k))).collect();
+                for (which, k) in shown {
+                    let k = &k;
                     let ids: Vec<String> = where_is.get(k).map(|v| v.iter().map(|&id| format!("l{} s{} r{}", celeste_rust::frame::id_layer(id), celeste_rust::frame::id_seq(id), celeste_rust::frame::id_row(id))).collect()).unwrap_or_default();
-                    println!("[diff] only kernel: shape {:016x} cell {} key {:016x}{:016x} at {:?}", k.0, k.1, k.2 .0, k.2 .1, ids);
+                    println!("[diff] {which}: shape {:016x} cell {} key {:016x}{:016x} at {:?}", k.0, k.1, k.2 .0, k.2 .1, ids);
                     // Expand the disputed row alone and look at its successors.
                     for &id in where_is.get(k).map(|v| v.as_slice()).unwrap_or(&[]) {
                         let (layer, seq, row) = (celeste_rust::frame::id_layer(id), celeste_rust::frame::id_seq(id), celeste_rust::frame::id_row(id));
@@ -914,6 +926,68 @@ fn main() -> Result<()> {
                         let door = celeste_rust::search::door::Door::new();
                         let (next, _won, _st) = celeste_rust::frame::forward_frame(&engine, vec![block], &door, None, None, layer + 1, Some(&tmp))?;
                         println!("[diff]   win row: {win}; successors: {} blocks", next.len());
+                        // Every recorded edge FROM this row, against its real successors.
+                        let claimed = edges.edges_from(layer + 1, &[id]);
+                        let mut real: Vec<(u64, (u64, u64), u32)> = Vec::new();
+                        for b in &next {
+                            let cells = celeste_rust::search::pos_graph::block_cells(b.rt2())?;
+                            for (i, key) in b.keys().iter().enumerate() {
+                                real.push((b.rt2().shape_hash, *key, cells[i]));
+                            }
+                        }
+                        for &(_, t) in &claimed {
+                            let (tl, ts, tr) = (celeste_rust::frame::id_layer(t), celeste_rust::frame::id_seq(t), celeste_rust::frame::id_row(t));
+                            let files = celeste_rust::frame::frame_files_seq(dir, tl)?;
+                            let desc = match files.iter().find(|(s, _)| *s == ts) {
+                                Some((_, f)) if tr < f.width() => {
+                                    let k = (f.shape_hash(), f.key_at(tr), f.row_cells()[tr as usize]);
+                                    let is_real = real.contains(&k);
+                                    format!("cell {} key {:016x}{:016x} real successor: {is_real}, marked kernel {} bfs {}", k.2, k.1 .0, k.1 .1, kern.marked.contains(k.0, k.1, k.2), bfs.marked.contains(k.0, k.1, k.2))
+                                }
+                                _ => "NOT IN THE TREE".to_string(),
+                            };
+                            println!("[diff]   recorded edge -> l{tl} s{ts} r{tr}: {desc}");
+                        }
+                        println!("[diff]   ({} recorded edges from this row, {} real successors)", claimed.len(), real.len());
+                        // Real successors with no record.
+                        let mut recorded_keys: Vec<(u64, (u64, u64), u32)> = Vec::new();
+                        for &(_, t) in &claimed {
+                            let (tl, ts, tr) = (celeste_rust::frame::id_layer(t), celeste_rust::frame::id_seq(t), celeste_rust::frame::id_row(t));
+                            let files = celeste_rust::frame::frame_files_seq(dir, tl)?;
+                            if let Some((_, f)) = files.iter().find(|(s, _)| *s == ts) {
+                                if tr < f.width() {
+                                    recorded_keys.push((f.shape_hash(), f.key_at(tr), f.row_cells()[tr as usize]));
+                                }
+                            }
+                        }
+                        for k in &real {
+                            if !recorded_keys.contains(k) {
+                                println!("[diff]   UNRECORDED real successor: cell {} key {:016x}{:016x}", k.2, k.1 .0, k.1 .1);
+                            }
+                        }
+                        if which == "only bfs" && std::env::var_os("CELESTE_DIFF_RERUN").is_some() {
+                            // The whole frame again with the tree's door: is the
+                            // spurious edge reproduced?
+                            let state = celeste_rust::frame::ForwardState::resume(dir, false)?.expect("a tree");
+                            let blocks = celeste_rust::frame::load_frame(dir, layer)?;
+                            let tmp2 = dir.join("diff-edges-full");
+                            let _ = std::fs::remove_dir_all(&tmp2);
+                            let _ = celeste_rust::frame::forward_frame(&engine, blocks, state.door(), None, None, layer + 1, Some(&tmp2))?;
+                            celeste_rust::search::edges::compact_frame(&tmp2, layer + 1)?;
+                            let g2 = celeste_rust::search::edges::EdgeGraph::open(&tmp2, layer + 1)?;
+                            let again = g2.edges_from(layer + 1, &[id]);
+                            let spurious: Vec<u64> = claimed.iter().map(|&(_, t)| t).filter(|&t| {
+                                let (tl, ts, tr) = (celeste_rust::frame::id_layer(t), celeste_rust::frame::id_seq(t), celeste_rust::frame::id_row(t));
+                                let files = celeste_rust::frame::frame_files_seq(dir, tl).unwrap();
+                                match files.iter().find(|(s, _)| *s == ts) { Some((_, f)) if tr < f.width() => !real.contains(&(f.shape_hash(), f.key_at(tr), f.row_cells()[tr as usize])), _ => true }
+                            }).collect();
+                            for t in &spurious {
+                                println!("[diff]   full re-run f{}: spurious target l{} s{} r{} recorded again: {}", layer + 1, celeste_rust::frame::id_layer(*t), celeste_rust::frame::id_seq(*t), celeste_rust::frame::id_row(*t), again.iter().any(|&(_, x)| x == *t));
+                            }
+                            println!("[diff]   full re-run f{}: {} recorded edges from this row (was {})", layer + 1, again.len(), claimed.len());
+                            let _ = std::fs::remove_dir_all(&tmp2);
+                            std::process::exit(0);
+                        }
                         for b in &next {
                             let cells = celeste_rust::search::pos_graph::block_cells(b.rt2())?;
                             for (i, key) in b.keys().iter().enumerate() {
@@ -956,10 +1030,6 @@ fn main() -> Result<()> {
                         let _ = std::fs::remove_dir_all(&tmp);
                         let _ = std::fs::remove_dir_all(&tmp);
                     }
-                }
-                for k in sb.difference(&sa) {
-                    let ids: Vec<String> = where_is.get(k).map(|v| v.iter().map(|&id| format!("l{} s{} r{}", celeste_rust::frame::id_layer(id), celeste_rust::frame::id_seq(id), celeste_rust::frame::id_row(id))).collect()).unwrap_or_default();
-                    println!("[diff] only bfs: shape {:016x} cell {} key {:016x}{:016x} at {:?}", k.0, k.1, k.2 .0, k.2 .1, ids);
                 }
                 return Ok(());
             }

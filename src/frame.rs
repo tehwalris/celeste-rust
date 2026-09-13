@@ -822,20 +822,25 @@ impl<'a> ForwardSink<'a> {
     }
 
     /// The step's handle on the row it just pushed into queue `q` (its
-    /// last row): the queue's generation, the queue and the row.
+    /// last row): the row (8 bits), the queue (24 bits: the pool is
+    /// `POOL_QUEUES` LIVE queues, but spares are kept per outcome so the
+    /// slot vector grows past that - room (1,0) f65 had a queue index >=
+    /// 256 alias another queue's row, 2026-09-14) and the queue's
+    /// generation (16 bits), below the cache's flag bits.
     #[inline]
-    pub fn row_ref(&self, q: usize) -> u32 {
-        const _: () = assert!(POOL_QUEUES <= 256 && QUEUE_ROWS <= 256);
+    pub fn row_ref(&self, q: usize) -> u64 {
+        const _: () = assert!(QUEUE_ROWS <= 256);
+        assert!(q < 1 << 24, "queue pool past 2^24 slots");
         let s = &self.slots[q];
-        ((s.gen as u32) << 16) | ((q as u32) << 8) | (s.rows() as u32 - 1)
+        ((s.gen as u64) << 32) | ((q as u64) << 8) | (s.rows() as u64 - 1)
     }
 
     /// Lane `lane` of the slice based at `base` also produced the row
     /// `row_ref` points at. False if that queue was flushed since (the row
     /// is gone; the caller pushes the row again).
     #[inline]
-    pub fn mark_pred(&mut self, row_ref: u32, base: u64, lane: usize) -> bool {
-        let (gen, q, r) = ((row_ref >> 16) as u16, ((row_ref >> 8) & 0xff) as usize, (row_ref & 0xff) as usize);
+    pub fn mark_pred(&mut self, row_ref: u64, base: u64, lane: usize) -> bool {
+        let (gen, q, r) = ((row_ref >> 32) as u16, ((row_ref >> 8) & 0xff_ffff) as usize, (row_ref & 0xff) as usize);
         let s = &mut self.slots[q];
         if !s.live || s.gen != gen || r >= s.pred_mask.len() {
             return false;
@@ -1064,6 +1069,14 @@ impl<'a> ForwardSink<'a> {
         }
         let mut out = Vec::new();
         for (mut p, seq, ids) in std::mem::take(&mut self.pieces).into_values() {
+            // A piece a flush opened but never appended to (every key it
+            // admitted was old) is nothing: an empty block would be
+            // id-less and get renumbered at the checkpoint, colliding
+            // with a real seq of this layer (room (1,0) f89, 2026-09-13).
+            if p.width == 0 {
+                continue;
+            }
+            debug_assert_eq!(ids.len(), p.width);
             // A queue's columns are typed by its skeleton, not by its rows: a
             // column every row agrees on goes back to the uniform it is (the
             // old append step's rule; the State bridge, which the reference
@@ -1260,6 +1273,12 @@ pub fn forward_frame(
     // Units in WAVE order: by first cell across the (cell-sorted) pieces,
     // so consecutive units are neighbours in the room.
     let mut units = units_of(frontier.iter().map(Block::lanes), UNIT_LANES);
+    // A unit of nothing but skipped lanes (won rows: checkpointed, never
+    // expanded - their shape has no kernel) is not run.
+    units.retain(|&(bi, lo, hi)| {
+        let sk = &frontier[bi].skip;
+        sk.is_empty() || sk[lo..hi].iter().any(|&s| !s)
+    });
     units.sort_by_key(|&(bi, lo, _)| (cells[bi][lo], bi, lo));
     let next_unit = AtomicUsize::new(0);
 
@@ -1946,6 +1965,12 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
     // One file per piece, written in parallel, in the piece's own row
     // order: a row's position is its id (`pack_id`), assigned when it was
     // admitted. A block without ids (the initial frontier) gets them here.
+    // Ids are (layer, seq, row): the seqs of a frame must be distinct.
+    {
+        let mut seqs: Vec<u32> = frontier.iter().filter(|b| !b.ids.is_empty()).map(|b| b.seq).collect();
+        seqs.sort_unstable();
+        anyhow::ensure!(seqs.windows(2).all(|w| w[0] != w[1]), "checkpoint f{frame}: two pieces share a seq");
+    }
     std::thread::scope(|scope| {
         let handles: Vec<_> = frontier
             .iter_mut()
@@ -1954,6 +1979,7 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
                 let fdir = &fdir;
                 scope.spawn(move || -> Result<()> {
                     if block.ids.is_empty() {
+                        anyhow::ensure!(frame == 0, "checkpoint f{frame}: an id-less block past the initial frontier");
                         block.seq = i as u32;
                         block.ids = (0..block.lanes() as u32).map(|r| pack_id(frame, i as u32, r)).collect();
                     }
@@ -2374,6 +2400,38 @@ pub fn find_optimum(
 
 #[cfg(test)]
 mod tests {
+
+    /// A row ref names its queue in full: with spares kept per outcome the
+    /// slot vector grows past `POOL_QUEUES`, and a queue index above 255
+    /// used to alias another queue's row (room (1,0) f65, 2026-09-14).
+    #[test]
+    fn row_refs_survive_more_than_256_queue_slots() {
+        let mut sink = ForwardSink::empty(false);
+        let engine = RefEngine::new().expect("ref engine");
+        let skeleton = Block::from_state(&engine.initial_state().expect("initial state")).expect("block").into_rt2();
+        for q in 0..300 {
+            sink.slots.push(Slot::new(skeleton.clone_block()));
+            let s = &mut sink.slots[q];
+            s.live = true;
+            s.gen = (q * 7) as u16;
+            s.keys.push((q as u64, 1));
+            s.cells.push(0);
+            s.pred_base.push(1000 + q as u64 * 16);
+            s.pred_mask.push(1);
+            s.last_extra.push(u32::MAX);
+        }
+        let r = sink.row_ref(299);
+        assert!(r & celeste_engine::kernel::RowCache::ID_FLAG == 0);
+        assert!(sink.mark_pred(r, 1000 + 299 * 16, 3));
+        assert_eq!(sink.slots[299].pred_mask[0], 0b1001);
+        assert_eq!(sink.slots[43].pred_mask[0], 1, "no other queue's row was touched");
+        // Another slice of the same call: an extra entry on the same row.
+        assert!(sink.mark_pred(r, 5000, 2));
+        assert_eq!(sink.slots[299].extra, vec![(0, 5000, 0b100)]);
+        // A flushed queue's ref is stale.
+        sink.slots[299].clear();
+        assert!(!sink.mark_pred(r, 1000 + 299 * 16, 0));
+    }
     use super::*;
     use crate::trace::refengine::RefEngine;
     use std::sync::Mutex;

@@ -342,7 +342,7 @@ impl AsmKernel {
                             // The row was flushed (a stale ref, only if
                             // the cache lost the flush's write-back): push
                             // it again; the flush merges duplicates by key.
-                            Some(b) if !sink.mark_pred(r as u32, b, i) => {}
+                            Some(b) if !sink.mark_pred(r, b, i) => {}
                             _ => continue,
                         }
                     }
@@ -362,7 +362,7 @@ impl AsmKernel {
                         sink.slots[q].pred_base.push(b);
                         sink.slots[q].pred_mask.push(1 << i);
                         sink.slots[q].last_extra.push(u32::MAX);
-                        sink.seen.set_ref(key, sink.row_ref(q) as u64);
+                        sink.seen.set_ref(key, sink.row_ref(q));
                     }
                     sink.pushed(q).expect("flushing a full queue");
                 }
