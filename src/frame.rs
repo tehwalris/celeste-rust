@@ -716,7 +716,10 @@ pub trait FrameStep: Sync {
 /// of one block. A worker pulls a GRAB of consecutive units at a time and
 /// runs the contiguous ones as one call, so the step's within-call dedup
 /// (`seen`) spans the grab; the grab, not the unit, sets the dedup window.
-const UNIT_LANES: usize = 2048;
+const UNIT_LANES: usize = 16384;
+
+/// Lanes per chunk of the canonical frontier (`canonical_chunks`).
+const CHUNK_LANES: usize = 1 << 19;
 
 /// The largest lane range one kernel call covers: ~16 grabs per worker for
 /// balance, clamped to [1, 8] units (2048..16384 lanes: bigger grabs
@@ -802,9 +805,12 @@ pub fn forward_frame(
     // `emit_budget()` bytes or the units run out, and is owned before the
     // next one is emitted. One batch is the common case.
     let budget = emit_budget();
-    let units = units_of(frontier.iter().map(Block::lanes), UNIT_LANES);
-    let grab_max = max_grab(st.lanes_in, workers);
     let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
+    // Units in WAVE order: by first cell across the (cell-sorted) chunks,
+    // so consecutive units are neighbours in the room (plans/waves.md).
+    let mut units = units_of(frontier.iter().map(Block::lanes), UNIT_LANES);
+    units.sort_by_key(|&(bi, lo, _)| (cells[bi][lo], bi, lo));
+    let grab_max = max_grab(st.lanes_in, workers);
     let next_unit = AtomicUsize::new(0);
     let mut sinks: Vec<ForwardSink> = (0..workers).map(|_| ForwardSink::new(owners, pos.is_some())).collect();
     let mut grabs: Vec<usize> = vec![grab_max; workers];
@@ -952,15 +958,104 @@ pub fn forward_frame(
     drop(sinks);
     st.visited_bytes = visited.iter().map(Visited::alloc_bytes).sum();
     let mut won = false;
-    let mut next: Vec<Block> = Vec::new();
+    let mut pieces: Vec<Rt2> = Vec::new();
     for acc in owned {
         st.lanes_kept += acc.kept;
         won |= acc.won;
-        next.extend(acc.pieces.into_values().map(Block::from_rt2));
+        pieces.extend(acc.pieces.into_values());
     }
+    let t = Instant::now();
+    let next = canonical_chunks(pieces, workers)?;
+    st.t_canon = t.elapsed();
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
     Ok((next, won, st))
+}
+
+/// The next frontier in CANONICAL form (plans/waves.md, invariant 1):
+/// per shape, the workers' pieces merged into one cell-sorted sequence
+/// and cut into chunks of ~`CHUNK_LANES` lanes on CELL boundaries, each
+/// chunk sorted by (cell, key). A function of the row set alone, not of
+/// how the frame was scheduled; a cell's rows are in exactly one chunk.
+/// Chunks are built in parallel: each scans every piece for its cell
+/// range, appends, sorts.
+fn canonical_chunks(pieces: Vec<Rt2>, workers: usize) -> Result<Vec<Block>> {
+    let mut by_shape: rustc_hash::FxHashMap<u64, Vec<(Rt2, Vec<u32>)>> = Default::default();
+    let mut shapes: Vec<u64> = Vec::new();
+    for p in pieces {
+        if p.width == 0 {
+            continue;
+        }
+        let cells = crate::search::pos_graph::block_cells(&p)?;
+        let e = by_shape.entry(p.shape_hash).or_default();
+        if e.is_empty() {
+            shapes.push(p.shape_hash);
+        }
+        e.push((p, cells));
+    }
+    shapes.sort_unstable();
+    // The chunk plan: (shape, cell range) with ~CHUNK_LANES lanes each.
+    let mut plan: Vec<(u64, u32, u32)> = Vec::new();
+    for &shape in &shapes {
+        let mut hist: rustc_hash::FxHashMap<u32, usize> = Default::default();
+        for (_, cells) in &by_shape[&shape] {
+            for &c in cells {
+                *hist.entry(c).or_default() += 1;
+            }
+        }
+        let mut order: Vec<(u32, usize)> = hist.into_iter().collect();
+        order.sort_unstable();
+        let (mut lo, mut n) = (0u32, 0usize);
+        for (i, &(_, k)) in order.iter().enumerate() {
+            n += k;
+            if n >= CHUNK_LANES || i + 1 == order.len() {
+                let hi = if i + 1 == order.len() { u32::MAX } else { order[i + 1].0 };
+                plan.push((shape, lo, hi));
+                lo = hi;
+                n = 0;
+            }
+        }
+    }
+    let next = AtomicUsize::new(0);
+    let mut out: Vec<Option<Block>> = (0..plan.len()).map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let mut slots: Vec<&mut Option<Block>> = out.iter_mut().collect();
+        let handles: Vec<_> = (0..workers.max(1))
+            .map(|_| {
+                let (plan, by_shape, next) = (&plan, &by_shape, &next);
+                scope.spawn(move || -> Result<Vec<(usize, Block)>> {
+                    let mut built = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(shape, lo, hi)) = plan.get(i) else { break };
+                        let srcs = &by_shape[&shape];
+                        let mut b = celeste_engine::slots::reshape(&srcs[0].0, 0);
+                        b.shape_hash = shape;
+                        for (p, cells) in srcs {
+                            let rows: Vec<u32> =
+                                (0..p.width as u32).filter(|&r| (lo..hi).contains(&cells[r as usize])).collect();
+                            if !rows.is_empty() {
+                                b.append_rows(p, &rows);
+                            }
+                        }
+                        let cells = crate::search::pos_graph::block_cells(&b)?;
+                        let mut perm: Vec<u32> = (0..b.width as u32).collect();
+                        perm.sort_unstable_by_key(|&r| (cells[r as usize], b.row_keys[r as usize]));
+                        b.gather_lanes(&perm);
+                        built.push((i, Block::from_rt2(b)));
+                    }
+                    Ok(built)
+                })
+            })
+            .collect();
+        for h in handles {
+            for (i, b) in h.join().expect("canonical chunk worker panicked")? {
+                *slots[i] = Some(b);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(out.into_iter().flatten().collect())
 }
 
 /// The share of `workers x wall` a phase's workers spent waiting at its
@@ -988,6 +1083,8 @@ pub struct FrameStats {
     pub t_emit: std::time::Duration,
     /// The own phase (filter, door, append, partitioned by owner), wall.
     pub t_own: std::time::Duration,
+    /// Canonicalizing the next frontier (`canonical_chunks`), wall.
+    pub t_canon: std::time::Duration,
     /// Barrier idle fractions of the two phases (`idle_fraction`).
     pub emit_idle: f64,
     pub own_idle: f64,
@@ -1394,7 +1491,7 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         emit {:.0} (idle {:.0}%) own {:.0} (idle {:.0}%) ckpt {:.0} pos {:.0} total {:.0} ms x{} | \
+         emit {:.0} (idle {:.0}%) own {:.0} (idle {:.0}%) canon {:.0} ckpt {:.0} pos {:.0} total {:.0} ms x{} | \
          in {:.2} sinks {:.2} visited {:.2} GB rss start {:.2} emit {:.2} own {:.2} peak {:.2} GB",
         st.blocks_in,
         st.lanes_in,
@@ -1407,6 +1504,7 @@ fn log_frame(
         st.emit_idle * 100.0,
         ms(st.t_own),
         st.own_idle * 100.0,
+        ms(st.t_canon),
         ms(t_ckpt),
         ms(t_pos),
         ms(t_total),
