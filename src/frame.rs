@@ -504,7 +504,6 @@ pub const POOL_QUEUES: usize = 256;
 /// per shard for the admission only), and the survivors appended into
 /// this worker's piece of the shape. In backward mode (`targets`) nothing
 /// is materialized: an emitted row that is a target marks its input row.
-/// With no door and no targets (recording), rows accumulate in the queues.
 pub struct ForwardSink<'a> {
     /// The pool: every queue ever created by this sink, live or spare.
     pub slots: Vec<Slot>,
@@ -586,12 +585,6 @@ impl<'a> ForwardSink<'a> {
         s
     }
 
-    /// A recording sink: no door, no flushes; rows accumulate in the
-    /// queues for the caller to read (`slots`) and `clear`.
-    pub fn recording() -> Self {
-        Self::empty(false)
-    }
-
     /// The backward's sink for the candidate rows `lanes` of a block.
     pub fn backward(targets: &'a TargetSet, lanes: Range<usize>) -> Self {
         let mut s = Self::empty(false);
@@ -621,7 +614,7 @@ impl<'a> ForwardSink<'a> {
         let q = match self.index.get(&(outcome, cell)) {
             Some(&q) => q,
             None => {
-                if self.door.is_some() && self.index.len() >= POOL_QUEUES {
+                if self.index.len() >= POOL_QUEUES {
                     self.evict_one();
                 }
                 let q = match self.spare.get_mut(&outcome).and_then(Vec::pop) {
@@ -668,7 +661,7 @@ impl<'a> ForwardSink<'a> {
     pub fn pushed(&mut self, q: usize) -> Result<()> {
         let s = &mut self.slots[q];
         s.touched = true;
-        if self.door.is_some() && s.rows() >= QUEUE_ROWS {
+        if s.rows() >= QUEUE_ROWS {
             self.flush(q)?;
         }
         Ok(())
@@ -735,17 +728,6 @@ impl<'a> ForwardSink<'a> {
             }
         }
         Ok(std::mem::take(&mut self.pieces).into_values().collect())
-    }
-
-    /// Recording mode: drop every queue's rows (columns kept).
-    pub fn clear(&mut self) {
-        for s in &mut self.slots {
-            s.clear();
-            s.live = false;
-        }
-        self.index.clear();
-        self.spare.clear();
-        self.last = NO_QUEUE;
     }
 
     /// Bytes allocated across the pool (capacities).

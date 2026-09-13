@@ -10,8 +10,7 @@
 //! big set is only READ while a frame runs, and each entry costs 16 bytes.
 //!
 //! `HashDoor` is the same contract over a hash set per shard (the
-//! pre-2026-09-13 representation), kept as the oracle for `Door`'s tests
-//! and the benchmark's comparison point.
+//! pre-2026-09-13 representation), kept as the oracle for `Door`'s tests.
 
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -224,9 +223,6 @@ impl Door {
         self.shards.write().expect("door").entry((shape, cell)).or_default().clone()
     }
 
-    pub fn shards(&self) -> usize {
-        self.shards.read().expect("door").len()
-    }
 }
 
 thread_local! {
@@ -282,23 +278,16 @@ impl Admit for Door {
 }
 
 /// The hash-set door: the same contract over `FxHashSet` shards.
+#[cfg(test)]
 #[derive(Default)]
 pub struct HashDoor {
     shards: RwLock<FxHashMap<(u64, u32), Arc<Mutex<rustc_hash::FxHashSet<Key>>>>>,
 }
 
+#[cfg(test)]
 impl HashDoor {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn from_shards(entries: impl IntoIterator<Item = ((u64, u32), Vec<Key>)>) -> Self {
-        let mut shards = FxHashMap::default();
-        for (k, keys) in entries {
-            let set: rustc_hash::FxHashSet<Key> = keys.into_iter().collect();
-            shards.insert(k, Arc::new(Mutex::new(set)));
-        }
-        HashDoor { shards: RwLock::new(shards) }
     }
 
     fn shard(&self, shape: u64, cell: u32) -> Arc<Mutex<rustc_hash::FxHashSet<Key>>> {
@@ -309,6 +298,7 @@ impl HashDoor {
     }
 }
 
+#[cfg(test)]
 impl Admit for HashDoor {
     fn admit(&self, shape: u64, cell: u32, keys: &[Key], new: &mut Vec<u32>) {
         let shard = self.shard(shape, cell);

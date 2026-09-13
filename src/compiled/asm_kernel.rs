@@ -100,6 +100,15 @@ struct AccTemplate {
     /// their WIDENED value. A row's key is `mix64(part + h)` with `h` the
     /// per-row fold over the remaining (varying) fields.
     part: (u64, u64),
+    /// This outcome's own skeleton (`build()`), kept for the uniform
+    /// writes: cells this outcome holds uniform that the shape's union
+    /// makes typed.
+    own: Rt2,
+    /// The SHAPE's skeleton: the union over every outcome of this shape
+    /// in the registry of the cells any of them varies (plans/waves.md,
+    /// invariant 3). Every queue and piece of the shape has these columns,
+    /// so a flush appends column for column. Set by `Registry::unify`.
+    union: std::sync::Arc<Rt2>,
 }
 
 impl AccTemplate {
@@ -124,6 +133,9 @@ struct AsmKernel {
     compiled: Compiled,
     bodies: Vec<AsmBody>,
     acc_templates: Vec<AccTemplate>,
+    /// Per body: where its output roots (and its outcome's uniform cells)
+    /// go in the shape's union columns. Built by `Registry::unify`.
+    body_cols: Vec<BodyCols>,
     /// DEBUG (CELESTE_ASM_EVAL_CHECK): the fused graph + its flat roots +
     /// the room, so `run` can re-evaluate the SAME fused graph with the pure
     /// interval evaluator (`eval_narrow_top_in`) per lane and diff it against the
@@ -168,14 +180,7 @@ impl AsmKernel {
         // catches those (keyed by the row key, which is unique across
         // outcomes) and the owner's door catches the rest.
         seen.clear();
-        // Where each body's output roots go: the slot's typed columns, by
-        // kind. Every slot of an outcome has the same columns (its
-        // template's varying cells, in cell order).
-        let body_cols: Vec<BodyCols> = self
-            .bodies
-            .iter()
-            .map(|b| BodyCols::of(b, &crate::frame::Slot::new(self.acc_templates[b.outcome].build())))
-            .collect();
+        let body_cols = &self.body_cols;
         // Pure-kernel throughput floor (CELESTE_KERNEL_DRYRUN=1): pack the
         // inputs and call the kernel, then discard - no dedup, no
         // materialize. Produces no rows, so it is a MEASUREMENT MODE ONLY
@@ -233,7 +238,7 @@ impl AsmKernel {
             // BACKWARD: lanes already known to reach a target; nothing more
             // to learn from them.
             let mut hit_lanes: u16 = 0;
-            for (body, cols) in self.bodies.iter().zip(&body_cols) {
+            for (body, cols) in self.bodies.iter().zip(body_cols) {
                 // `ok`/`live` are tri-state ZB masks; the kernel keeps a lane
                 // only where they are KNOWN-TRUE (val & known - `zb_holds`,
                 // exactly what the generated `frame` applied). Reading `val`
@@ -316,14 +321,10 @@ impl AsmKernel {
                         last_edge = (cin, cout);
                         sink.edges.insert((cin, cout));
                     }
-                    // The queue for (outcome, cell): the run cache makes
-                    // this one compare for a run of rows at one cell.
-                    let outcome_id = template as *const AccTemplate as usize as u64;
-                    let q = sink.queue(outcome_id, cout, || {
-                        let mut b = template.build();
-                        b.shape_hash = template.shape_hash;
-                        b
-                    });
+                    // The queue for (shape, cell), over the shape's union
+                    // skeleton: the run cache makes this one compare for a
+                    // run of rows at one cell.
+                    let q = sink.queue(template.shape_hash, cout, || (*template.union).clone_block());
                     cols.push_row(&mut sink.slots[q], outbuf, i, key, cout);
                     sink.pushed(q).expect("flushing a full queue");
                 }
@@ -525,33 +526,57 @@ impl Scratch {
 }
 
 /// A body's output roots, grouped by kind, each paired with the index of
-/// its slot column (`Slot::cols`).
+/// its queue column (`Slot::cols`, the shape's union skeleton) - plus the
+/// union columns this body's outcome holds UNIFORM, with the value to
+/// write per row.
 struct BodyCols {
     num: Vec<(usize, usize)>,
     ival: Vec<(usize, usize)>,
     bool_: Vec<(usize, usize)>,
+    uniform_num: Vec<(usize, u32)>,
+    uniform_ival: Vec<(usize, (u32, u32))>,
+    uniform_bool: Vec<(usize, u8)>,
 }
 
 impl BodyCols {
-    fn of(body: &AsmBody, proto: &crate::frame::Slot) -> Self {
+    fn of(body: &AsmBody, proto: &crate::frame::Slot, own: &Rt2) -> Result<Self> {
         use crate::frame::TCol;
         let (mut num, mut ival, mut bool_) = (Vec::new(), Vec::new(), Vec::new());
+        let mut written = vec![false; proto.cols.len()];
         for f in &body.fields {
-            // A field whose output column the template makes uniform (a
-            // widened-to-uniform cell, e.g. level 0's `rem`) is computed by
-            // the kernel but not stored: the column already holds the
-            // widened value.
+            // A field whose output column the union makes uniform (a
+            // widened-to-uniform cell in every outcome of the shape, e.g.
+            // level 0's `rem`) is computed by the kernel but not stored:
+            // the column already holds the widened value.
             let Some(ci) = proto.cols.iter().position(|(cell, _)| *cell == f.cell) else {
                 continue;
             };
+            written[ci] = true;
             match (f.kind, &proto.cols[ci].1) {
                 (RootKind::Num, TCol::Num(_)) => num.push((ci, f.root)),
                 (RootKind::Ival, TCol::Ival(_)) => ival.push((ci, f.root)),
                 (RootKind::Bool, TCol::Bool(_)) => bool_.push((ci, f.root)),
-                (k, _) => panic!("body field cell {} kind {:?} disagrees with its outcome's column", f.cell, k),
+                (k, _) => anyhow::bail!("body field cell {} kind {:?} disagrees with the shape's column", f.cell, k),
             }
         }
-        BodyCols { num, ival, bool_ }
+        let (mut uniform_num, mut uniform_ival, mut uniform_bool) = (Vec::new(), Vec::new(), Vec::new());
+        for (ci, (cell, col)) in proto.cols.iter().enumerate() {
+            if written[ci] {
+                continue;
+            }
+            let Col::U(av) = &own.cols[*cell] else {
+                anyhow::bail!("union column at cell {cell} is neither a body root nor uniform in its outcome");
+            };
+            match (col, av) {
+                (TCol::Num(_), AV::Num(n)) => uniform_num.push((ci, n.as_raw_u32())),
+                (TCol::Ival(_), AV::Ival(a, b)) => uniform_ival.push((ci, (a.as_raw_u32(), b.as_raw_u32()))),
+                (TCol::Ival(_), AV::Num(n)) => uniform_ival.push((ci, (n.as_raw_u32(), n.as_raw_u32()))),
+                (TCol::Bool(_), AV::Bool(x)) => uniform_bool.push((ci, *x as u8)),
+                (TCol::Bool(_), AV::UBool) => uniform_bool.push((ci, 2)),
+                (_, v) => anyhow::bail!("union column at cell {cell}: the outcome's uniform {v:?} does not fit its kind"),
+            }
+        }
+        Ok(BodyCols { num, ival, bool_, uniform_num, uniform_ival, uniform_bool })
     }
 
     /// Append lane `i` of the output buffer to `slot` as one row.
@@ -574,6 +599,21 @@ impl BodyCols {
                 let val = u16::from_le_bytes([buf[root * 128], buf[root * 128 + 1]]);
                 let known = u16::from_le_bytes([buf[root * 128 + 2], buf[root * 128 + 3]]);
                 v.push(if known >> i & 1 == 0 { 2 } else { (val >> i & 1) as u8 });
+            }
+        }
+        for &(ci, n) in &self.uniform_num {
+            if let TCol::Num(v) = &mut slot.cols[ci].1 {
+                v.push(n);
+            }
+        }
+        for &(ci, ab) in &self.uniform_ival {
+            if let TCol::Ival(v) = &mut slot.cols[ci].1 {
+                v.push(ab);
+            }
+        }
+        for &(ci, b) in &self.uniform_bool {
+            if let TCol::Bool(v) = &mut slot.cols[ci].1 {
+                v.push(b);
             }
         }
         slot.keys.push(key);
@@ -833,6 +873,7 @@ impl Registry {
                 anyhow::bail!("two start-room shapes hash to {shape:#x}");
             }
         }
+        unify(&mut by_shape)?;
         eprintln!(
             "[asm build] {} shapes: trace {:.2}s, assemble {:.2}s ({} workers)",
             by_shape.len(),
@@ -842,6 +883,99 @@ impl Registry {
         );
         Ok(Registry { by_shape, exact_boundary })
     }
+}
+
+/// The kind of a typed column or of a uniform value that a typed column
+/// could hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Num,
+    Ival,
+    Bool,
+}
+
+fn kind_of(col: &Col) -> Option<Kind> {
+    match col {
+        Col::N(_) | Col::U(AV::Num(_)) => Some(Kind::Num),
+        Col::I(_) | Col::U(AV::Ival(..)) => Some(Kind::Ival),
+        Col::V(_) | Col::U(AV::Bool(_)) | Col::U(AV::UBool) => Some(Kind::Bool),
+        _ => None,
+    }
+}
+
+fn typed(kind: Kind) -> Col {
+    match kind {
+        Kind::Num => Col::N(Vec::new()),
+        Kind::Ival => Col::I(Vec::new()),
+        Kind::Bool => Col::V(Vec::new()),
+    }
+}
+
+/// Give every outcome template of a SHAPE the shape's union skeleton: a
+/// cell is typed in the union if any outcome of the shape varies it or
+/// two outcomes hold it uniform at different values (Num and Ival unify
+/// to Ival); otherwise it stays uniform at the common value. Then map
+/// every body's roots and its outcome's uniform cells onto the union's
+/// columns (`BodyCols`). The reference engine's rule (every numeric and
+/// boolean cell typed) is the same idea without the registry to narrow
+/// it.
+fn unify(by_shape: &mut HashMap<u64, AsmKernel>) -> Result<()> {
+    let mut unions: HashMap<u64, Rt2> = HashMap::new();
+    for kernel in by_shape.values() {
+        for t in &kernel.acc_templates {
+            let own = &t.own;
+            match unions.get_mut(&t.shape_hash) {
+                None => {
+                    let mut u = own.clone_block();
+                    u.shape_hash = t.shape_hash;
+                    unions.insert(t.shape_hash, u);
+                }
+                Some(u) => {
+                    anyhow::ensure!(u.cols.len() == own.cols.len(), "shape {:#x}: outcomes with different widths", t.shape_hash);
+                    for c in 0..u.cols.len() {
+                        let (a, b) = (&u.cols[c], &own.cols[c]);
+                        if let (Col::U(x), Col::U(y)) = (a, b) {
+                            if x == y {
+                                continue;
+                            }
+                        }
+                        let (ka, kb) = (kind_of(a), kind_of(b));
+                        let k = match (ka, kb) {
+                            (Some(x), Some(y)) if x == y => x,
+                            (Some(Kind::Num), Some(Kind::Ival)) | (Some(Kind::Ival), Some(Kind::Num)) => Kind::Ival,
+                            _ => anyhow::bail!(
+                                "shape {:#x} cell {c}: outcomes disagree on a cell that cannot be a typed column ({a:?} vs {b:?})",
+                                t.shape_hash
+                            ),
+                        };
+                        u.cols[c] = typed(k);
+                    }
+                }
+            }
+        }
+    }
+    let unions: HashMap<u64, std::sync::Arc<Rt2>> = unions.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
+    let mut widened = 0usize;
+    for kernel in by_shape.values_mut() {
+        for t in &mut kernel.acc_templates {
+            t.union = unions[&t.shape_hash].clone();
+            widened += t.union.cols.iter().zip(&t.own.cols).filter(|(u, o)| !matches!(u, Col::U(_)) && matches!(o, Col::U(_))).count();
+        }
+        let mut body_cols = Vec::with_capacity(kernel.bodies.len());
+        for b in &kernel.bodies {
+            let t = &kernel.acc_templates[b.outcome];
+            let proto = crate::frame::Slot::new((*t.union).clone_block());
+            body_cols.push(BodyCols::of(b, &proto, &t.own)?);
+        }
+        kernel.body_cols = body_cols;
+    }
+    let templates: usize = by_shape.values().map(|k| k.acc_templates.len()).sum();
+    eprintln!(
+        "[asm build] {} output shapes over {templates} outcome templates; {widened} template cells widened uniform -> typed by the union ({:.2} per template)",
+        unions.len(),
+        widened as f64 / templates.max(1) as f64
+    );
+    Ok(())
 }
 
 /// Assemble ONE start-room shape: fuse its graph, gcc + dlopen it, and map
@@ -938,6 +1072,7 @@ fn build_one_shape(
             compiled,
             bodies: asm_bodies,
             acc_templates,
+            body_cols: Vec::new(),
             fused,
             flat_roots,
             room,
@@ -1055,7 +1190,17 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
     for &cell in &r.frame.outs[oi].ubool_cells {
         inits.push((cell as usize, ColInit::Uniform(AV::UBool)));
     }
-    let mut t = AccTemplate { skeleton, inits, shape_hash, part: (0, 0) };
+    let empty0 = reshape(&skeleton, 0);
+    let mut t = AccTemplate {
+        skeleton,
+        inits,
+        shape_hash,
+        part: (0, 0),
+        own: empty0.clone_block(),
+        union: std::sync::Arc::new(empty0),
+    };
+    t.own = t.build();
+    t.union = std::sync::Arc::new(t.build());
     // The uniform part of the key, exactly as `boundary_finish` folds it:
     // every `Cell2::Val` cell that is `Col::U` at the boundary. Non-output
     // cells are uniform in the skeleton (pointers, nils); konst and UBool
