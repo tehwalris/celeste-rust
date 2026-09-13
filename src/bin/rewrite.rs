@@ -499,6 +499,17 @@ fn main() -> Result<()> {
                 forward_frame(&engine, small, &Door::new(), None, mark_filter, frame + 1, None)?;
             }
             let edges_dir = dir.join("bench-edges");
+            // With edges, the tree's own door: every re-emitted old state
+            // then resolves to its real (earlier) layer, as in the search,
+            // which is what the compaction's per-layer split sees.
+            let tree_door = if edges {
+                let t = std::time::Instant::now();
+                let state = celeste_rust::frame::ForwardState::resume(&dir, false)?.expect("a checkpoint tree");
+                eprintln!("[bench] tree door loaded in {:.1} s", t.elapsed().as_secs_f64());
+                Some(state)
+            } else {
+                None
+            };
             for rep in 0..reps {
                 // With their ids (as the search runs them: predecessor masks
                 // are tracked whenever the input has ids).
@@ -506,11 +517,12 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|b| Block::with_ids(b.rt2().clone_block(), b.ids().to_vec(), b.seq()))
                     .collect();
-                let door = Door::new();
+                let fresh = Door::new();
+                let door: &Door = tree_door.as_ref().map_or(&fresh, |s| s.door());
                 let _ = std::fs::remove_dir_all(&edges_dir);
                 let t = std::time::Instant::now();
                 let (next, _won, st) =
-                    forward_frame(&engine, input, &door, None, mark_filter, frame + 1, edges.then_some(edges_dir.as_path()))?;
+                    forward_frame(&engine, input, door, None, mark_filter, frame + 1, edges.then_some(edges_dir.as_path()))?;
                 let t_fwd = t.elapsed();
                 let (t_compact, records) = if edges {
                     let t = std::time::Instant::now();

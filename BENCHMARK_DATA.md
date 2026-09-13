@@ -1,3 +1,27 @@
+# The explicit backward graph: recording cost at room (1,0) f70 (2026-09-13, quick profile, 16 threads)
+
+`rewrite bench-frame --level-dir <level 0 tree to f70> --frame 70 --edges`
+(the tree's own door, so re-emitted old states resolve to their real
+layers) against the same binary without recording. plans/waves.md "The
+explicit backward graph".
+
+| | no recording (`6b139db`) | recording |
+|---|---|---|
+| raw rows | 33.65M | 34.06M (+1%) |
+| wave | 3.0-3.2 s | 3.6-3.8 s (fresh door) / 2.6 s (tree door: 5.1M kept) |
+| edge records | - | 120.5M (18 B each, 2.2 GB written by the workers) |
+| compaction (per-frame runs) | - | 1.2 s: read 0.1, counting sort + small layers 0.85, write 0.2 |
+| runs on disk | - | 605 MB (119.9M pairs, 5.0 B/pair) |
+
+The records went 255M -> 120M when the flush started writing each row's
+id back into the dedup cache (a stale row ref used to re-push the whole
+row: raw +16%). The compaction went 17 s (one permutation sort per layer)
+-> 2.3 s (range buckets, pdqsort) -> 1.2 s (a parallel counting sort on
+the target's rank for layers >= 4M records, comparison sorts for the
+small layers in a pool). f0-f44 of room (1,0): 204 MB of runs beside
+315 MB of frames. The BFS itself is milliseconds at the marks gate (h33:
+4283 lookups, 12.8k edges, 2 ms).
+
 # Synthetic early-finish A/B for the single-grid fork, room (0,0) (2026-09-13)
 
 `rewrite search --room 0,0 --from 1 --to 80 --win-at 36,85` (a synthetic

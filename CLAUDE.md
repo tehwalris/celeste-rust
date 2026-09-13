@@ -17,12 +17,21 @@ Read these before doing anything substantial:
   `FrameStep` trait (implemented by the compiled `FrameEngine` and the
   reference `RefEngine`), `ForwardSink` (what a frame step emits into),
   `ForwardState` (a forward that is EXTENDED frame by frame) /
-  `backward_run` / `Ladder` / `find_optimum`, the precision ladder,
-  per-bucket checkpoints, and `MarkFilter` (the cross-precision link).
+  `Ladder` / `find_optimum`, the precision ladder, per-bucket checkpoints,
+  and `MarkFilter` (the cross-precision link).
   `plans/buckets.md` is the design of the loop's data flow (2026-09-12).
   Every level runs TO the horizon and the backward seeds from the wins at
   every frame <= it; level 0 persists across horizons and is extended by
   one frame per step (2026-09-12).
+- `src/search/edges.rs` - THE BACKWARD (2026-09-13, plans/waves.md "The
+  explicit backward graph"): the forward records every (state <- input
+  slice, lane mask) edge at flush, compacted per frame into runs sorted by
+  target under `<level>/edges/l{layer}/f{frame}.bin`; the backward is a
+  BFS over them (`edges::backward`) that re-runs no kernel. The kernel
+  re-run walk (`frame::backward_run`) is kept as the oracle:
+  `CELESTE_BACKWARD=kernel` selects it, and `rewrite bench-backward
+  --level-dir D --horizon H --diff` prints the two walks' symmetric
+  difference, which must be empty.
 - `BENCHMARK_DATA.md` - performance baseline, but STALE: every number in it was
   measured against the pre-rebuild search path (the now-deleted
   `run.rs` / `sweep*.rs`) and needs re-benchmarking for `rewrite search`. Keep
@@ -321,11 +330,14 @@ The 38k lines of rewrite rules that used to be the next thing to
 extract are DELETED; what is left in `celeste-rust` is laid out as:
 
 ```
-src/frame.rs   the search: `Block` (an `Rt2` with its key column), the
-               `FrameStep` trait + `ForwardSink`, ForwardState (extend) /
-               backward_run / Ladder / find_optimum, the precision ladder,
-               bucket routing, per-bucket checkpoints, MarkFilter
-src/search/    checkpoint (block serialization), pos_graph (the position
+src/frame.rs   the search: `Block` (an `Rt2` with its key column and its
+               rows' ids), the `FrameStep` trait + `ForwardSink`,
+               ForwardState (extend) / Ladder / find_optimum, the precision
+               ladder, per-bucket checkpoints, MarkFilter, and the kernel
+               re-run backward (`backward_run`, the BFS's oracle)
+src/search/    checkpoint (block serialization), door (the sorted visited
+               set with each key's id), edges (the recorded backward graph:
+               compaction, runs, the BFS backward), pos_graph (the position
                graph + the block's position column)
 src/trace/     the AST tracer (Lua -> transpile::graph::Graph) and the reference
                engine (trace::refengine, the RefEngine oracle)
@@ -392,7 +404,9 @@ cleanup): `rewrite forward --to 44 --room 1,0 && rewrite ckhash --to 44
 same run's `posgraph` line must equal `gates/posgraph_room10_f044.txt`, and
 `rewrite search --from 29 --to 35 --maxk 1 --win-at 9,101` must reproduce
 `gates/marks_room10_win9-101_h29-33.txt` (the backward's marked sets per
-horizon and level, ending in `OPTIMAL win frame: 33`).
+horizon and level, ending in `OPTIMAL win frame: 33`; the same
+fingerprints under `CELESTE_BACKWARD=kernel`, whose lines end in
+"re-runs" instead of "edges read").
 
 `crates/celeste-names/src/gen.rs` is FROZEN, not generated. Its generator
 (`transpile::names`) walked the rewritten IR and was deleted with the walk
