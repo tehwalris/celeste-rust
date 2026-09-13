@@ -41,7 +41,7 @@
 //! this proves constant folds through `Graph::fold` when the graph is
 //! rebuilt.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use super::graph::{Graph, NodeId, Op};
 
@@ -67,8 +67,8 @@ struct Triple {
 /// A reduced ordered BDD over a set of opaque atoms.
 pub struct Bdd {
     nodes: Vec<Triple>,
-    intern: HashMap<Triple, Ref>,
-    memo: HashMap<(Ref, Ref, Ref), Ref>,
+    intern: FxHashMap<Triple, Ref>,
+    memo: FxHashMap<(Ref, Ref, Ref), Ref>,
     /// The budget. An ROBDD can be exponential in its variable count, and
     /// a guard chain over hundreds of atoms is exactly the shape that
     /// blows up, so the cap is not decoration.
@@ -84,8 +84,8 @@ impl Bdd {
         let dummy = Triple { var: u32::MAX, lo: 0, hi: 0 };
         Bdd {
             nodes: vec![dummy, dummy],
-            intern: HashMap::new(),
-            memo: HashMap::new(),
+            intern: FxHashMap::default(),
+            memo: FxHashMap::default(),
             cap,
             overflowed: false,
         }
@@ -187,7 +187,7 @@ pub struct Analysis {
     pub of: Vec<Option<Ref>>,
     /// For each variable, the graph node it stands for. `simplify` will
     /// only ever substitute one of these, or a constant.
-    pub atom_of: HashMap<Ref, NodeId>,
+    pub atom_of: FxHashMap<Ref, NodeId>,
     pub atoms: usize,
     pub overflowed: bool,
     pub bdd_nodes: usize,
@@ -244,7 +244,7 @@ pub fn analyze(g: &Graph, need: &[bool], cap: usize) -> (Bdd, Analysis) {
     // Atoms are minted ON DEMAND, by the first boolean node that uses
     // one. Minting eagerly for every node would spend variable-order
     // slots on the numeric layer, which never appears in a formula.
-    let mut atom_of: HashMap<Ref, NodeId> = HashMap::new();
+    let mut atom_of: FxHashMap<Ref, NodeId> = FxHashMap::default();
     let mut n_atoms: u32 = 0;
     // Two comparisons over the same operands can be exact COMPLEMENTS,
     // and then they are one variable and its negation rather than two
@@ -252,7 +252,7 @@ pub fn analyze(g: &Graph, need: &[bool], cap: usize) -> (Bdd, Analysis) {
     // rewrites `Not(Lt(x,y))` to `Ge(x,y)`, so normalization itself is
     // what turns a negated atom into a second atom, and without this the
     // analysis would be blinded by a rewrite meant to help it.
-    let mut cmp: HashMap<(Op, Vec<NodeId>), Ref> = HashMap::new();
+    let mut cmp: FxHashMap<(Op, Vec<NodeId>), Ref> = FxHashMap::default();
 
     for id in 0..g.len() {
         if !need[id] {
@@ -565,7 +565,7 @@ pub fn simplify(g: &Graph, roots: &[NodeId], cap: usize) -> (Graph, Vec<NodeId>,
     let (mut bdd, a) = analyze(g, &need, cap);
     let mut out = Graph::new();
     let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
-    let mut seen: HashMap<Ref, NodeId> = HashMap::new();
+    let mut seen: FxHashMap<Ref, NodeId> = FxHashMap::default();
     let mut st = Stats {
         before: need.iter().filter(|x| **x).count(),
         atoms: a.atoms,

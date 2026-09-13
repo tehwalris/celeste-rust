@@ -310,7 +310,7 @@ pub struct Node {
 #[derive(Default, Clone)]
 pub struct Graph {
     nodes: Vec<Node>,
-    intern: HashMap<Node, NodeId>,
+    intern: rustc_hash::FxHashMap<Node, NodeId>,
 }
 
 impl Graph {
