@@ -5,6 +5,12 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+/// mimalloc, not glibc: glibc retained ~23 GB of freed slot chunks across
+/// its arenas at room (0,0) f90 (RSS 44 GB against ~21 GB live); mimalloc
+/// runs the same frame at 24.8 GB and the same speed (plans/memory.md).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// On DISK, not the tmpfs at `/tmp` (a full-room tree is gigabytes, and the
 /// per-block version of it once exhausted /tmp's inodes, 2026-09-07).
 const DEFAULT_CHECKPOINT_DIR: &str = "/var/tmp/celeste-checkpoints";
