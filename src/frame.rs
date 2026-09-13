@@ -376,6 +376,45 @@ impl Slot {
     }
 }
 
+/// The backward's target set - the marks of the previous iteration as
+/// `(key, cell)` - with a bitmap in front of it: one bit per low-22-bit
+/// slice of `key.0` (512 KB: L2-resident, read-only), so the
+/// ~90% of emissions that are not targets cost one bit test instead of a
+/// probe into a set that lives in L3.
+pub struct TargetSet {
+    set: rustc_hash::FxHashSet<(u64, u64, u32)>,
+    bits: Vec<u64>,
+}
+
+impl TargetSet {
+    const BITS: u32 = 22;
+
+    pub fn new(targets: impl Iterator<Item = ((u64, u64), u32)>) -> Self {
+        let mut bits = vec![0u64; 1 << (Self::BITS - 6)];
+        let mut set = rustc_hash::FxHashSet::default();
+        for (k, c) in targets {
+            let b = (k.0 & ((1 << Self::BITS) - 1)) as usize;
+            bits[b >> 6] |= 1 << (b & 63);
+            set.insert((k.0, k.1, c));
+        }
+        TargetSet { set, bits }
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, key: (u64, u64), cell: u32) -> bool {
+        let b = (key.0 & ((1 << Self::BITS) - 1)) as usize;
+        self.bits[b >> 6] >> (b & 63) & 1 == 1 && self.set.contains(&(key.0, key.1, cell))
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+}
+
 /// A number column of a slot as `any_win` reads it.
 enum NumView<'a> {
     Uniform(P8),
@@ -423,7 +462,7 @@ pub struct ForwardSink<'a> {
     /// emission, as in the forward - the step's within-call dedup carries
     /// "hit" as its tag so a re-emission from another input row marks that
     /// row too.
-    pub targets: Option<&'a rustc_hash::FxHashSet<(u64, u64, u32)>>,
+    pub targets: Option<&'a TargetSet>,
     /// Backward mode: one flag per input row of the lane range being run.
     hits: Vec<bool>,
     hit_base: usize,
@@ -445,7 +484,7 @@ impl<'a> ForwardSink<'a> {
     }
 
     /// The backward's sink for the candidate rows `lanes` of a block.
-    pub fn backward(targets: &'a rustc_hash::FxHashSet<(u64, u64, u32)>, lanes: Range<usize>) -> Self {
+    pub fn backward(targets: &'a TargetSet, lanes: Range<usize>) -> Self {
         let mut s = Self::new(1, false);
         s.targets = Some(targets);
         s.hits = vec![false; lanes.len()];
@@ -915,8 +954,7 @@ fn backward_walk(
     }
     for i in (1..horizon).rev() {
         let t_frame = std::time::Instant::now();
-        let targets: FxHashSet<(u64, u64, u32)> =
-            frontier.iter().map(|&(_, k, c)| (k.0, k.1, c)).collect();
+        let targets = TargetSet::new(frontier.iter().map(|&(_, k, c)| (k, c)));
         // Candidate cells = pos-graph predecessors of the targets' cells,
         // sorted so the units (and the marks' insertion order) are a
         // function of the frame, not of scheduling.

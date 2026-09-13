@@ -639,8 +639,6 @@ pub struct RowCache {
     slots: Vec<(u64, u32, u32)>,
     mask: usize,
     gen: u32,
-    /// The slot of the last NEW insert, for `set_last_tag`.
-    last: usize,
 }
 
 impl Default for RowCache {
@@ -656,7 +654,7 @@ impl RowCache {
     const PROBES: usize = 4;
 
     pub fn new() -> Self {
-        RowCache { slots: vec![(0, 0, 0); Self::CAPACITY], mask: Self::CAPACITY - 1, gen: 1, last: 0 }
+        RowCache { slots: vec![(0, 0, 0); Self::CAPACITY], mask: Self::CAPACITY - 1, gen: 1 }
     }
 
     /// Forget every key (O(1): bumps the generation).
@@ -668,10 +666,6 @@ impl RowCache {
         }
     }
 
-    /// Overwrite the tag of the most recently inserted key.
-    pub fn set_last_tag(&mut self, tag: u32) {
-        self.slots[self.last].2 = tag;
-    }
 
     /// Insert `k` with `tag`: `None` if it was not present (it is now, or
     /// it evicted the oldest of its probe window), `Some(tag of the first
@@ -692,7 +686,6 @@ impl RowCache {
             }
         }
         self.slots[victim] = (k.1, self.gen, tag);
-        self.last = victim;
         None
     }
 }

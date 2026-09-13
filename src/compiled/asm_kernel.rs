@@ -232,6 +232,9 @@ impl AsmKernel {
                      declined={declined:04x} dropped(not-live)={dropped:04x} any_live={any_live:04x}"
                 );
             }
+            // BACKWARD: lanes already known to reach a target; nothing more
+            // to learn from them.
+            let mut hit_lanes: u16 = 0;
             for (body, cols) in self.bodies.iter().zip(&body_cols) {
                 // `ok`/`live` are tri-state ZB masks; the kernel keeps a lane
                 // only where they are KNOWN-TRUE (val & known - `zb_holds`,
@@ -257,6 +260,30 @@ impl AsmKernel {
                 n_bodies_taken += 1;
                 n_lanes += take.count_ones() as u64;
                 let template = &self.acc_templates[body.outcome];
+                if let Some(targets) = sink.targets {
+                    // BACKWARD: per lane not yet hit, is this output in the
+                    // target set? One bit per input row is the whole result:
+                    // no dedup, nothing materialized, and a lane that has
+                    // hit is done for the rest of the slice.
+                    take &= !hit_lanes;
+                    while take != 0 {
+                        let i = take.trailing_zeros() as usize;
+                        take &= take - 1;
+                        let h1 = read_word(outbuf, body.key_roots.0, i);
+                        let h2 = read_word(outbuf, body.key_roots.1, i);
+                        let key = (
+                            runtime2::mix64(template.part.0.wrapping_add(h1)),
+                            runtime2::mix64(template.part.1.wrapping_add(h2)),
+                        );
+                        n_unique += 1;
+                        let cout = cell_out(body, outbuf, i, start);
+                        if targets.contains(key, cout) {
+                            sink.hit(lo + i);
+                            hit_lanes |= 1 << i;
+                        }
+                    }
+                    continue;
+                }
                 while take != 0 {
                     let i = take.trailing_zeros() as usize;
                     take &= take - 1;
@@ -273,28 +300,7 @@ impl AsmKernel {
                     // EMISSION-TIME PROVENANCE (plans/buckets.md). The
                     // source of this row is lane `i` of this slice, and
                     // everything that needs to know is told right here:
-                    // the pos-graph edge, the owner - or, in backward mode,
-                    // the mark on the input row.
-                    if let Some(targets) = sink.targets {
-                        // BACKWARD: does this output hit a marked state? Then
-                        // input row `lo + i` is marked. Nothing is
-                        // materialized. The cache tag is the hit bit, so a
-                        // re-emission from another input row marks it too.
-                        if let Some(prev) = seen.insert_tagged(key, 0) {
-                            if prev != 0 {
-                                sink.hit(lo + i);
-                            }
-                            continue;
-                        }
-                        sink.emitted += 1;
-                        n_unique += 1;
-                        let cout = cell_out(body, outbuf, i, start);
-                        if targets.contains(&(key.0, key.1, cout)) {
-                            sink.hit(lo + i);
-                            seen.set_last_tag(1);
-                        }
-                        continue;
-                    }
+                    // the pos-graph edge and the owner.
                     if let Some(first_cin) = seen.insert_tagged(key, cin) {
                         // A re-emission of a row this call already produced.
                         // Nothing to push - but if it came from a DIFFERENT

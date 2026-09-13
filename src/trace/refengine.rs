@@ -143,7 +143,7 @@ impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
                 let key = b.keys()[0];
                 if let Some(targets) = sink.targets {
                     sink.emitted += 1;
-                    if targets.contains(&(key.0, key.1, cell_out)) {
+                    if targets.contains(key, cell_out) {
                         sink.hit(lane);
                     }
                     continue;
