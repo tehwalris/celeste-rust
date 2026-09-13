@@ -196,7 +196,12 @@ fn parse_fwd(line: &str) -> Result<FwdLine> {
         ckpt_ms: num(after(&t, "ckpt", 0)?)?,
         pos_ms: num(after(&t, "pos", 0)?)?,
         total_ms: num(after(&t, "total", 0)?)?,
-        rss_gb: num(after(&t, "rss", 0)?)?,
+        // `rss X GB` before 2026-09-13; `rss start A wave B end C peak D
+        // GB` since - the frame's end value is the one the old line gave.
+        rss_gb: match after(&t, "rss", 0)? {
+            "start" => num(after(&t, "end", 0)?)?,
+            v => num(v)?,
+        },
     })
 }
 
@@ -289,6 +294,9 @@ pub fn parse_log(text: &str) -> Result<(Vec<HorizonRun>, Option<f64>, Option<f64
             prebuild = Some(num(t[t.len() - 2]).with_context(ctx)?);
         } else if line.starts_with("OPTIMAL win frame: ") {
             optimal = Some(num(line.rsplit(' ').next().unwrap_or("")).with_context(ctx)?);
+        } else if line.starts_with("ELAPSED ") {
+            // The search's own `ELAPSED 9098.66 s` line (no GNU time).
+            wall = Some(num(line.split_whitespace().nth(1).unwrap_or("")).with_context(ctx)?);
         } else if line.contains("Elapsed (wall clock) time") {
             // `h:mm:ss or m:ss`.
             let clock = line.rsplit(' ').next().unwrap_or("");
@@ -786,10 +794,12 @@ mod tests {
 [fwd] f003 in 1/1 raw 1 kept 1 out 1/1 visited 2 | emit 1 (idle 100%) own 1 (idle 100%) ckpt 0 pos 0 total 1 ms | rss 13.35 GB
 [bwd] f002 targets 1 cand-cells 29 loaded 160 rerun 160 marked 160 | load 5 (thread-ms) par 2 (idle 54%) total 3 ms
 [ladder] h3 level 0 (Bits(0)): first win f2, marked 9 states (fingerprint cda9202a7cbb2234), 10 re-runs
+[fwd] f003 in 1/1 raw 1 kept 1 out 1/1 visited 4 | wave 7 (idle 94%) door 3 ckpt 0 pos 0 total 11 ms | flushes 1 (1 rows avg) | in 0.00 queues 0.00 door 0.00 GB rss start 1.26 wave 1.27 end 1.28 peak 8.25 GB
 [ladder] h3 level 16 (Exact): first win f3, marked 1 states (fingerprint cda9202a7cbb2234), 2 re-runs
 OPTIMAL win frame: 3
 	Elapsed (wall clock) time (h:mm:ss or m:ss): 7:13.31
 ";
+        assert_eq!(parse_log("[ladder] h3 level 0 (Bits(0)): NO WIN -> Refuted\nELAPSED 9098.66 s\n").unwrap().1, Some(9098.66));
         let (hs, wall, prebuild, optimal) = parse_log(log).unwrap();
         assert_eq!(hs.len(), 2);
         assert_eq!((hs[0].h, hs[1].h), (2, 3));
@@ -808,6 +818,9 @@ OPTIMAL win frame: 3
         assert_eq!(hs[1].levels[0].fwd.len(), 1);
         assert_eq!(hs[1].levels[0].first_win, Some(2));
         assert_eq!(hs[1].levels[1].precision, "Exact");
+        let waves = &hs[1].levels[1].fwd[0];
+        assert_eq!((waves.emit_ms, waves.emit_idle, waves.own_ms, waves.own_idle, waves.total_ms), (7, 94, 3, 0, 11));
+        assert_eq!(waves.rss_gb, 1.28);
         assert_eq!(wall, Some(433.31));
         assert_eq!(prebuild, Some(8.8));
         assert_eq!(optimal, Some(3));
