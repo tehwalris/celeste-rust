@@ -1,9 +1,10 @@
 # Waves: the frame as one pass with flush-on-full queues (design, 2026-09-13)
 
 The successor to the batched two-phase frame (plans/parallel.md,
-plans/memory.md). Not built yet; this is the design with its boundaries,
-the reasons each piece is shaped the way it is, what it costs, and the
-order to build it in so that every step is gate-checked.
+plans/memory.md): the design with its boundaries, the reasons each piece
+is shaped the way it is, what it costs, and the order it was built in
+(every step gate-checked). Steps 1-2 are IN (2026-09-13, "What landed"
+at the end); step 3 follows.
 
 ## What it replaces and why
 
@@ -337,3 +338,27 @@ What the prototype decided:
 - `end_frame` is 160 ms for 115M entries (a sequential merge + index
   rebuild per shard, parallel): ~1.4 ns/entry, so ~1.3 s at room (0,0)
   f110's ~1G entries, against a ~27 s frame.
+
+## What landed (2026-09-13)
+
+Steps 1 and 2 are in (`f8834cb`, `44559b0`), with one deviation from
+the design above: **there is no cross-piece merge.** The canonical
+frontier is the workers' pieces, each sorted by (cell, key) by the
+checkpoint (which it did already); a cell's rows may sit in several
+pieces. The merge into "one cell in exactly one chunk" was built first
+and cost ~250 ms per frame at f70 through the generic `append_rows` /
+`gather_lanes` (12% of the frame) to save ~50 ms of queue pushes: the
+door's delta already catches every cross-piece duplicate within the
+frame, so the merge only ever saved push work. The units are still
+pulled in cell order across pieces (the wave), and the kernel's window
+is still 16k lanes.
+
+Room (1,0) f0-f70, 16 threads, release, gates identical:
+
+| | f0-f70 | peak RSS | f70 frame | f70 raw rows | f70 transient | f70 door |
+|---|---|---|---|---|---|---|
+| two-phase + batches (before) | 25.5 s | 9.45 GB | 1984 ms (emit 1452, own 283, ckpt 218) | 41.3M | 4.94 GB slots | 1.62 GB hash sets |
+| waves (steps 1-2) | 25.4 s | **4.08 GB** | 1907 ms (wave 1601, door 72, ckpt 207) | 28.9M | 0.08 GB queues | 1.11 GB |
+
+Same speed, 43% of the memory. The wave is kernel-bound as before; the
+flushes run at ~180 rows each (162k per frame at f70).

@@ -1,5 +1,11 @@
 # Parallelism: emit by source, own by destination (2026-09-13)
 
+**SUPERSEDED the same day by plans/waves.md**: the two-phase frame
+(emit into per-owner slots, barrier, own) and its batches were replaced
+by the one-pass waves frame (queue pools flushed through the sorted
+door). Kept for the reasoning and the measurements; the design below
+is no longer what runs.
+
 Overnight work, decided alone where a decision was needed (listed at the
 end). Target: the level-0 forward's wall time, with the code staying one
 layer simpler than before, not one layer more.

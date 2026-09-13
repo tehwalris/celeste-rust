@@ -1,3 +1,24 @@
+# The waves frame vs the two-phase frame, room (1,0) f0-f70 (2026-09-13, release, 16 threads)
+
+`./safe-run.sh -- ./target/release/rewrite forward --to 70 --room 1,0`,
+mimalloc as the global allocator in both, gates identical (ckhash,
+posgraph, marks). Details and the per-phase split in plans/waves.md.
+
+| frame structure | f0-f70 wall | peak RSS | f70 frame | f70 raw rows | f70 transient | f70 door/visited |
+|---|---|---|---|---|---|---|
+| two-phase + batches (`27a1891`) | 25.5 s | 9.45 GB | 1984 ms | 41.3M | 4.94 GB slots | 1.62 GB hash sets |
+| **waves** (`44559b0`) | **25.4 s** | **4.08 GB** | 1907 ms | 28.9M | 0.08 GB queues | 1.11 GB sorted door |
+
+Same speed (the frame is kernel-bound), 43% of the memory. Earlier the
+same day: glibc -> mimalloc took room (0,0) f90 from 44.1 to 24.8 GB RSS
+at the same speed (plans/memory.md), and batching the two-phase frame's
+emit/own under a 4 GB budget was what first got room (0,0) past its
+f88 OOM (58 GB -> 44 GB at f90 under glibc).
+
+The rest of this file predates the 2026-08-31 tear-out and the waves
+frame; its numbers are for code paths that no longer exist and are kept
+as history.
+
 # ASM kernels vs the deleted Rust lattice kernels, room (1,0) forward @ f94 (2026-08-29, release)
 
 First perf number for the ASM backend after the append dedup fix. Room (1,0)

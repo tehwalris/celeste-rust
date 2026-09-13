@@ -250,14 +250,23 @@ v8), so the backward reads a cell's rows as a range instead of decoding the
 layer. Uncompressed: ~3x the zstd size on disk, and the decode that cost
 the H=89 backward 35 s per iteration is gone.)
 
-The loop is parallel since 2026-09-13 (`plans/parallel.md`): every frame
-is two phases - EMIT, units of lanes over `threads()` workers, each
-sorting its rows by OWNER; OWN, one worker per owner doing the filter,
-the door (its private visited shard) and the append into its own
-next-frame pieces - with nothing shared and one barrier. `CELESTE_THREADS`
-overrides the default of one worker per physical core. The result is a
-function of the frame and the thread count, not of scheduling: the gates
-are identical at 1, 16 and 32 threads.
+The loop is parallel since 2026-09-13, and since the same evening it is
+the WAVES frame (`plans/waves.md`, which supersedes `plans/parallel.md`):
+one pass per frame. Units of 16k lanes are pulled by `threads()` workers
+in CELL order across the (cell-sorted) frontier pieces; each worker's
+`ForwardSink` holds a pool of small fixed queues keyed by (shape, cell),
+and a queue that fills or is evicted is flushed by that worker right
+there - ladder filter, sort, admission at the DOOR
+(`search::door::Door`: sorted per-(shape, cell) shards, 16 B/entry, a
+bucket index, a per-frame delta; the one shared structure, locked per
+shard for the admission only), survivors into the worker's piece. One
+barrier at the end: the door merges its deltas, the pieces are the next
+frontier. `CELESTE_THREADS` overrides the default of one worker per
+physical core. The result is a function of the frame, not of
+scheduling: the gates are identical at 1, 16 and 32 threads. The
+transient is the queue pools (~80 MB total); the persistent memory is
+the door and the frontier (room (1,0) f0-f70: peak RSS 4.1 GB against
+9.5 GB for the two-phase frame at the same speed, plans/waves.md).
 
 ## Crate layout
 
@@ -321,16 +330,15 @@ One frame of the abstract search is `celeste_rust::compiled::FrameEngine`
 `::run_bucket` - one BUCKET in (one shape's `Rt2`; the old per-class
 split on freeze / moving key / pm1 cells was the generated kernels'
 premise and went 2026-09-12 with every gate identical), rows out through a
-`ForwardSink`. The frontier IS a set of buckets (one block per shape per
-owner), run as units of lanes (<1% lane padding), and the kernel's append
-step emits each surviving row already at the boundary - canonical
-structure, exact row key, its `(input cell, output cell)` pos-graph edge
-recorded from the slice lane it came from - straight into the slot of
-the row's OWNER; the owner then consults its visited shard at the door
-and appends the survivors into its next-frame pieces (`Rt2::append_rows`).
+`ForwardSink`. The frontier IS a set of pieces (one block per shape per
+worker, each sorted by (cell, key) by the checkpoint), run as 16k-lane
+units in cell order, and the kernel's append step emits each surviving
+row already at the boundary - canonical structure, exact row key, its
+`(input cell, output cell)` pos-graph edge recorded from the slice lane
+it came from - straight into the worker's queue for the row's (shape,
+cell); the queue's flush is the door and the append (plans/waves.md).
 There is no regroup, no merge, no per-block `boundary`, and no
-provenance stored anywhere: it is consumed at emission (plans/buckets.md,
-plans/parallel.md).
+provenance stored anywhere: it is consumed at emission (plans/buckets.md).
 `FrameEngine` is one impl of the `FrameStep` trait (`src/frame.rs`); the
 reference `RefEngine` is the other, and crosses `compiled::bridge` (the
 only module that names both `State` and `Rt2`) at its edge. The loop
