@@ -163,6 +163,61 @@ enum Command {
         #[arg(long, default_value = "1,0")]
         room: String,
     },
+    /// PROTOTYPE (plans/waves.md): record one real frame's emission stream
+    /// - every row the kernels emit after the within-call dedup, as
+    /// (shape, cell, key), unit by unit, with the input canonicalized to
+    /// cell-sorted chunks per shape and run in wave order - to a file for
+    /// `bench-door`.
+    DumpEmissions {
+        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
+        checkpoint_dir: String,
+        /// The INPUT frame (level 0); the stream is what frame+1 is made of.
+        #[arg(long, default_value_t = 80)]
+        frame: u32,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+        #[arg(long)]
+        out: String,
+        /// Lanes per kernel call (the within-call dedup window).
+        #[arg(long, default_value_t = 16384)]
+        grab: usize,
+    },
+    /// PROTOTYPE (plans/waves.md): the dedup tiers on a recorded emission
+    /// stream, without the kernels: N workers pull the stream's units in
+    /// order, push rows into fixed per-worker queue pools keyed by (shape,
+    /// cell), flush full/evicted queues (sort, admit at the door, copy
+    /// the survivors' payload into the worker's piece), then end the
+    /// frame. The door is preloaded with layers 0..=frame. The admitted
+    /// count must equal the real frame+1's row count.
+    BenchDoor {
+        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
+        checkpoint_dir: String,
+        #[arg(long, default_value_t = 80)]
+        frame: u32,
+        #[arg(long)]
+        dump: String,
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Queues per worker.
+        #[arg(long, default_value_t = 256)]
+        pool: usize,
+        /// Rows per queue.
+        #[arg(long, default_value_t = 4096)]
+        queue_rows: usize,
+        /// Payload bytes per row beyond the key (the typed columns).
+        #[arg(long, default_value_t = 96)]
+        payload: usize,
+        /// `sorted` (base + delta), `hash` (today's sets).
+        #[arg(long, default_value = "sorted")]
+        door: String,
+        #[arg(long, default_value_t = 3)]
+        reps: usize,
+        /// `wave`: every worker pulls the next unit (one wave, all workers
+        /// in one band); `regions`: worker w takes the w-th contiguous
+        /// block of units (its own band).
+        #[arg(long, default_value = "wave")]
+        assign: String,
+    },
     /// Extract a concrete input sequence that wins by `horizon` from one
     /// level's marks: a DFS from the initial state through the reference
     /// engine's concrete single-input step, admitting a successor only if
@@ -446,6 +501,243 @@ fn main() -> Result<()> {
                 );
             }
             celeste_rust::compiled::dispatch::print_kernel_hits();
+        }
+        Command::DumpEmissions {
+            checkpoint_dir,
+            frame,
+            room,
+            out,
+            grab,
+        } => {
+            use celeste_rust::frame::{load_frame, Block, ForwardSink, FrameStep};
+            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
+            use std::io::Write;
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            set_rem_precision(RemPrecision::Bits(0));
+            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+            let dir = std::path::Path::new(&checkpoint_dir).join("level00");
+            let frontier = canonical_frontier(load_frame(&dir, frame)?)?;
+            let lanes: usize = frontier.iter().map(Block::lanes).sum();
+            eprintln!("[dump] f{frame}: {} shapes, {lanes} lanes, canonical (cell-sorted)", frontier.len());
+            // Units in wave order: every chunk's lane ranges, sorted by first cell.
+            let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
+            let mut units: Vec<(u32, usize, usize, usize)> = Vec::new();
+            for (bi, b) in frontier.iter().enumerate() {
+                let mut lo = 0;
+                while lo < b.lanes() {
+                    let hi = (lo + grab).min(b.lanes());
+                    units.push((cells[bi][lo], bi, lo, hi));
+                    lo = hi;
+                }
+            }
+            units.sort();
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&out)?);
+            w.write_all(&(units.len() as u64).to_le_bytes())?;
+            let mut sink = ForwardSink::new(1, false);
+            let (mut rows_total, mut runs) = (0u64, 0u64);
+            let t = std::time::Instant::now();
+            for &(_, bi, lo, hi) in &units {
+                sink.clear();
+                engine.run(&frontier[bi], &cells[bi], lo..hi, &mut sink)?;
+                let n: usize = sink.slots.iter().map(|s| s.rows()).sum();
+                w.write_all(&((hi - lo) as u32).to_le_bytes())?;
+                w.write_all(&(n as u32).to_le_bytes())?;
+                let mut last = (u64::MAX, u32::MAX);
+                for slot in &sink.slots {
+                    for i in 0..slot.rows() {
+                        let (k, c) = (slot.keys[i], slot.cells[i]);
+                        if (slot.shape, c) != last {
+                            runs += 1;
+                            last = (slot.shape, c);
+                        }
+                        w.write_all(&slot.shape.to_le_bytes())?;
+                        w.write_all(&c.to_le_bytes())?;
+                        w.write_all(&k.0.to_le_bytes())?;
+                        w.write_all(&k.1.to_le_bytes())?;
+                    }
+                }
+                rows_total += n as u64;
+            }
+            w.flush()?;
+            eprintln!(
+                "[dump] {} units, {rows_total} rows ({:.1} per lane), {runs} (shape, cell) runs ({:.1} rows/run), {:.1} s -> {out}",
+                units.len(),
+                rows_total as f64 / lanes as f64,
+                rows_total as f64 / runs.max(1) as f64,
+                t.elapsed().as_secs_f64()
+            );
+        }
+        Command::BenchDoor {
+            checkpoint_dir,
+            frame,
+            dump,
+            threads,
+            pool,
+            queue_rows,
+            payload,
+            door,
+            reps,
+            assign,
+        } => {
+            use celeste_rust::frame::frame_files;
+            use celeste_rust::search::door::{Admit, Door, HashDoor, Key};
+            use rustc_hash::FxHashMap;
+            let workers = threads.unwrap_or_else(celeste_rust::frame::threads);
+            let dir = std::path::Path::new(&checkpoint_dir).join("level00");
+            // The stream.
+            let t = std::time::Instant::now();
+            let bytes = std::fs::read(&dump)?;
+            let mut units: Vec<(u32, Vec<(u64, u32, Key)>)> = Vec::new();
+            let mut p = 8usize;
+            let n_units = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+            let rd32 = |p: usize| u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+            let rd64 = |p: usize| u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
+            for _ in 0..n_units {
+                let lanes = rd32(p);
+                let n = rd32(p + 4) as usize;
+                p += 8;
+                let mut rows = Vec::with_capacity(n);
+                for _ in 0..n {
+                    rows.push((rd64(p), rd32(p + 8), (rd64(p + 12), rd64(p + 20))));
+                    p += 28;
+                }
+                units.push((lanes, rows));
+            }
+            let stream_rows: usize = units.iter().map(|(_, r)| r.len()).sum();
+            eprintln!("[bench-door] stream: {n_units} units, {stream_rows} rows, read in {:.1} s", t.elapsed().as_secs_f64());
+            // The expected admissions: the real frame+1's rows.
+            let expected: usize = frame_files(&dir, frame + 1)?.iter().map(|f| f.width() as usize).sum();
+            // The door's base: layers 0..=frame, per (shape, cell).
+            let t = std::time::Instant::now();
+            let files: Vec<(u32, std::path::PathBuf)> = (0..=frame)
+                .flat_map(|f| {
+                    let fdir = dir.join("frames").join(format!("f{:03}", f));
+                    std::fs::read_dir(&fdir)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| e.ok().map(|e| e.path()))
+                        .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")))
+                        .map(move |p| (f, p))
+                })
+                .collect();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let partial: Vec<FxHashMap<(u64, u32), Vec<Key>>> = std::thread::scope(|scope| {
+                let hs: Vec<_> = (0..workers)
+                    .map(|_| {
+                        let (files, next) = (&files, &next);
+                        scope.spawn(move || -> Result<FxHashMap<(u64, u32), Vec<Key>>> {
+                            let mut m: FxHashMap<(u64, u32), Vec<Key>> = FxHashMap::default();
+                            loop {
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some((_, path)) = files.get(i) else { break };
+                                let file = celeste_rust::search::checkpoint::FrameFile::open(path)?;
+                                let shape = file.shape_hash();
+                                for (cell, key) in file.cell_keys() {
+                                    m.entry((shape, cell)).or_default().push(key);
+                                }
+                            }
+                            Ok(m)
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().expect("loader")).collect::<Result<Vec<_>>>()
+            })?;
+            let mut shards: FxHashMap<(u64, u32), Vec<Key>> = FxHashMap::default();
+            for m in partial {
+                for (k, mut v) in m {
+                    shards.entry(k).or_default().append(&mut v);
+                }
+            }
+            let base_entries: usize = shards.values().map(Vec::len).sum();
+            eprintln!(
+                "[bench-door] base: layers 0..={frame}, {} shards, {base_entries} entries, loaded in {:.1} s; expecting {expected} admissions",
+                shards.len(),
+                t.elapsed().as_secs_f64()
+            );
+            for rep in 0..reps {
+                let t = std::time::Instant::now();
+                let d: Box<dyn Admit> = match door.as_str() {
+                    "sorted" => Box::new(Door::from_shards(shards.clone())),
+                    "hash" => Box::new(HashDoor::from_shards(shards.clone())),
+                    other => anyhow::bail!("--door {other}: sorted | hash"),
+                };
+                let t_build = t.elapsed();
+                let door_bytes0 = d.alloc_bytes();
+                let rss0 = celeste_rust::metrics::current_rss_gb();
+                let t = std::time::Instant::now();
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let regions = assign == "regions";
+                let stats: Vec<WaveStats> = std::thread::scope(|scope| {
+                    let hs: Vec<_> = (0..workers)
+                        .map(|wi| {
+                            let (units, next, d) = (&units, &next, d.as_ref());
+                            scope.spawn(move || {
+                                let mut w = Wave::new(pool, queue_rows, payload);
+                                let per = units.len().div_ceil(workers);
+                                let mut i = wi * per;
+                                loop {
+                                    let u = if regions {
+                                        let u = i;
+                                        i += 1;
+                                        if u >= ((wi + 1) * per).min(units.len()) {
+                                            break;
+                                        }
+                                        u
+                                    } else {
+                                        next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    };
+                                    let Some((_, rows)) = units.get(u) else { break };
+                                    for &(shape, cell, key) in rows {
+                                        w.push(shape, cell, key, d);
+                                    }
+                                }
+                                w.finish(d)
+                            })
+                        })
+                        .collect();
+                    hs.into_iter().map(|h| h.join().expect("wave worker")).collect()
+                });
+                let t_wave = t.elapsed();
+                let rss1 = celeste_rust::metrics::current_rss_gb();
+                let t = std::time::Instant::now();
+                d.end_frame(workers);
+                let t_end = t.elapsed();
+                let mut sum = WaveStats::default();
+                for s in &stats {
+                    sum.add(s);
+                }
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+                println!(
+                    "[bench-door] rep {rep} {door} {assign} x{workers}: admitted {} (expected {expected}{}) | wave {:.0} ms ({:.0} ns/row; busy {:.0}%; thread-ms push {:.0} sort {:.0} admit {:.0} gather {:.0}) end_frame {:.0} ms build {:.0} ms | flushes {} ({:.0} rows avg; {} full, {} evicted, {} final) run-cache {:.1}% | queues {:.2} GB pieces {:.2} GB door {:.2} -> {:.2} GB ({:.1} B/entry) rss {:.2} -> {:.2} GB",
+                    sum.admitted,
+                    if sum.admitted == expected { ", OK" } else { ", MISMATCH" },
+                    ms(t_wave),
+                    t_wave.as_nanos() as f64 / stream_rows as f64 * workers as f64,
+                    100.0 * sum.busy.as_secs_f64() / (workers as f64 * t_wave.as_secs_f64()),
+                    ms(sum.busy.saturating_sub(sum.t_sort + sum.t_admit + sum.t_gather)),
+                    ms(sum.t_sort),
+                    ms(sum.t_admit),
+                    ms(sum.t_gather),
+                    ms(t_end),
+                    ms(t_build),
+                    sum.flushes,
+                    sum.flushed_rows as f64 / sum.flushes.max(1) as f64,
+                    sum.full,
+                    sum.evicted,
+                    sum.final_,
+                    100.0 * sum.cache_hits as f64 / stream_rows as f64,
+                    (workers * pool * queue_rows * (payload + 20)) as f64 / 1e9,
+                    sum.piece_bytes as f64 / 1e9,
+                    door_bytes0 as f64 / 1e9,
+                    d.alloc_bytes() as f64 / 1e9,
+                    d.alloc_bytes() as f64 / d.len().max(1) as f64,
+                    rss0,
+                    rss1,
+                );
+                if sum.admitted != expected {
+                    anyhow::bail!("admitted {} != expected {}", sum.admitted, expected);
+                }
+            }
         }
         Command::Census {
             level_dir,
@@ -870,4 +1162,234 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The frontier as ONE cell-sorted block per shape (plans/waves.md,
+/// invariant 1): every block of a shape appended into one, then sorted by
+/// (cell, key).
+fn canonical_frontier(blocks: Vec<celeste_rust::frame::Block>) -> Result<Vec<celeste_rust::frame::Block>> {
+    use celeste_rust::frame::Block;
+    let mut by_shape: rustc_hash::FxHashMap<u64, celeste_engine::runtime2::Rt2> = Default::default();
+    let mut order: Vec<u64> = Vec::new();
+    for b in blocks {
+        let shape = b.shard_shape();
+        let rt2 = b.rt2();
+        let rows: Vec<u32> = (0..rt2.width as u32).collect();
+        let piece = by_shape.entry(shape).or_insert_with(|| {
+            order.push(shape);
+            let mut p = celeste_engine::slots::reshape(rt2, 0);
+            p.shape_hash = rt2.shape_hash;
+            p
+        });
+        piece.append_rows(rt2, &rows);
+    }
+    let mut out = Vec::new();
+    for shape in order {
+        let mut b = Block::from_rt2(by_shape.remove(&shape).unwrap());
+        let cells = b.positions()?;
+        let mut perm: Vec<u32> = (0..b.lanes() as u32).collect();
+        perm.sort_unstable_by_key(|&i| (cells[i as usize], b.rt2().row_keys[i as usize]));
+        b.rt2_mut().gather_lanes(&perm);
+        out.push(b);
+    }
+    Ok(out)
+}
+
+/// PROTOTYPE of the worker's queue pool (plans/waves.md): fixed queues of
+/// fixed capacity keyed by (shape, cell), a run cache, second-chance
+/// eviction, flush = sort + door + payload copy into the worker's piece.
+struct Queue {
+    shape: u64,
+    cell: u32,
+    keys: Vec<(u64, u64)>,
+    payload: Vec<u8>,
+    touched: bool,
+    live: bool,
+}
+
+#[derive(Default, Clone)]
+struct WaveStats {
+    admitted: usize,
+    flushes: u64,
+    flushed_rows: u64,
+    full: u64,
+    evicted: u64,
+    final_: u64,
+    cache_hits: u64,
+    piece_bytes: usize,
+    busy: std::time::Duration,
+    t_sort: std::time::Duration,
+    t_admit: std::time::Duration,
+    t_gather: std::time::Duration,
+}
+
+impl WaveStats {
+    fn add(&mut self, o: &WaveStats) {
+        self.admitted += o.admitted;
+        self.flushes += o.flushes;
+        self.flushed_rows += o.flushed_rows;
+        self.full += o.full;
+        self.evicted += o.evicted;
+        self.final_ += o.final_;
+        self.cache_hits += o.cache_hits;
+        self.piece_bytes += o.piece_bytes;
+        self.busy += o.busy;
+        self.t_sort += o.t_sort;
+        self.t_admit += o.t_admit;
+        self.t_gather += o.t_gather;
+    }
+}
+
+struct Wave {
+    queues: Vec<Queue>,
+    index: rustc_hash::FxHashMap<(u64, u32), u32>,
+    free: Vec<u32>,
+    last: ((u64, u32), u32),
+    clock: usize,
+    cap: usize,
+    payload: usize,
+    pieces: rustc_hash::FxHashMap<u64, Vec<u8>>,
+    row: Vec<u8>,
+    sort_buf: Vec<((u64, u64), u32)>,
+    new: Vec<u32>,
+    stats: WaveStats,
+    t0: std::time::Instant,
+}
+
+impl Wave {
+    fn new(pool: usize, cap: usize, payload: usize) -> Self {
+        // Allocated once per level in the real thing and reused every
+        // frame; pre-touch so the bench does not time the page faults.
+        let queues = (0..pool)
+            .map(|_| {
+                let mut keys = vec![(0u64, 0u64); cap];
+                keys.clear();
+                let mut payload_v = vec![0u8; cap * payload];
+                payload_v.clear();
+                Queue { shape: 0, cell: 0, keys, payload: payload_v, touched: false, live: false }
+            })
+            .collect();
+        Wave {
+            queues,
+            index: Default::default(),
+            free: (0..pool as u32).rev().collect(),
+            last: ((u64::MAX, u32::MAX), u32::MAX),
+            clock: 0,
+            cap,
+            payload,
+            pieces: Default::default(),
+            row: vec![0u8; payload],
+            sort_buf: Vec::with_capacity(cap),
+            new: Vec::with_capacity(cap),
+            stats: WaveStats::default(),
+            t0: std::time::Instant::now(), // after the pool's allocation
+        }
+    }
+
+    fn queue_for(&mut self, shape: u64, cell: u32, door: &dyn celeste_rust::search::door::Admit) -> u32 {
+        if self.last.0 == (shape, cell) {
+            self.stats.cache_hits += 1;
+            return self.last.1;
+        }
+        let q = if let Some(&q) = self.index.get(&(shape, cell)) {
+            q
+        } else {
+            let q = match self.free.pop() {
+                Some(q) => q,
+                None => {
+                    // Second chance: skip queues touched since the hand last passed.
+                    let n = self.queues.len();
+                    loop {
+                        let i = self.clock % n;
+                        self.clock += 1;
+                        if self.queues[i].touched {
+                            self.queues[i].touched = false;
+                        } else {
+                            self.stats.evicted += 1;
+                            self.flush(i as u32, door);
+                            // The flush returned it to the free list; take it back.
+                            break self.free.pop().expect("the flushed queue is free");
+                        }
+                    }
+                }
+            };
+            let qq = &mut self.queues[q as usize];
+            qq.shape = shape;
+            qq.cell = cell;
+            qq.live = true;
+            self.index.insert((shape, cell), q);
+            q
+        };
+        self.last = ((shape, cell), q);
+        q
+    }
+
+    fn push(&mut self, shape: u64, cell: u32, key: (u64, u64), door: &dyn celeste_rust::search::door::Admit) {
+        let q = self.queue_for(shape, cell, door);
+        // The payload: what the kernel's typed columns would hold.
+        if self.row.len() >= 8 {
+            self.row[0..8].copy_from_slice(&key.0.to_le_bytes());
+        }
+        let qq = &mut self.queues[q as usize];
+        qq.keys.push(key);
+        qq.payload.extend_from_slice(&self.row);
+        qq.touched = true;
+        if qq.keys.len() == self.cap {
+            self.stats.full += 1;
+            self.flush(q, door);
+        }
+    }
+
+    fn flush(&mut self, q: u32, door: &dyn celeste_rust::search::door::Admit) {
+        let payload = self.payload;
+        let qq = &mut self.queues[q as usize];
+        if !qq.live {
+            return;
+        }
+        self.stats.flushes += 1;
+        self.stats.flushed_rows += qq.keys.len() as u64;
+        // Sort (key, row) and collapse duplicates within the queue.
+        let t = std::time::Instant::now();
+        self.sort_buf.clear();
+        self.sort_buf.extend(qq.keys.iter().enumerate().map(|(i, k)| (*k, i as u32)));
+        self.sort_buf.sort_unstable();
+        self.sort_buf.dedup_by_key(|e| e.0);
+        // Reuse the queue's key vector as the sorted key batch.
+        qq.keys.clear();
+        qq.keys.extend(self.sort_buf.iter().map(|e| e.0));
+        self.new.clear();
+        let t1 = std::time::Instant::now();
+        self.stats.t_sort += t1 - t;
+        door.admit(qq.shape, qq.cell, &qq.keys, &mut self.new);
+        let t2 = std::time::Instant::now();
+        self.stats.t_admit += t2 - t1;
+        let piece = self.pieces.entry(qq.shape).or_default();
+        for &i in &self.new {
+            let r = self.sort_buf[i as usize].1 as usize;
+            piece.extend_from_slice(&qq.payload[r * payload..(r + 1) * payload]);
+        }
+        self.stats.t_gather += t2.elapsed();
+        self.stats.admitted += self.new.len();
+        qq.keys.clear();
+        qq.payload.clear();
+        qq.live = false;
+        qq.touched = false;
+        self.index.remove(&(qq.shape, qq.cell));
+        if self.last.1 == q {
+            self.last = ((u64::MAX, u32::MAX), u32::MAX);
+        }
+        self.free.push(q);
+    }
+
+    fn finish(mut self, door: &dyn celeste_rust::search::door::Admit) -> WaveStats {
+        for q in 0..self.queues.len() as u32 {
+            if self.queues[q as usize].live {
+                self.stats.final_ += 1;
+                self.flush(q, door);
+            }
+        }
+        self.stats.piece_bytes = self.pieces.values().map(Vec::len).sum();
+        self.stats.busy = self.t0.elapsed();
+        self.stats
+    }
 }

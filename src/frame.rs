@@ -73,6 +73,10 @@ impl Block {
         &self.rt2
     }
 
+    pub fn rt2_mut(&mut self) -> &mut Rt2 {
+        &mut self.rt2
+    }
+
     /// The key column: the 128-bit canonical row key per lane (shape + content).
     /// Identity for dedup, the visited set, and checkpoints. One entry per lane.
     pub fn keys(&self) -> &[(u64, u64)] {

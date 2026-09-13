@@ -281,3 +281,59 @@ sort. `visited_len()` -> `door.len()`. Everything above it (`Ladder`,
   transient is larger than it needs to be (too big).
 - Whether `delta` is worth having over merge-per-flush: the memmove math
   says yes at f90 and more so later; step 1's test covers both.
+
+## Prototype results (2026-09-13, `rewrite dump-emissions` / `rewrite bench-door`)
+
+The tiers on real data without the kernels: room (1,0) f80's emission
+stream (23.3M post-`RowCache` rows from a canonical cell-sorted
+frontier - 5.5 per input lane, against 30.9M from owner-hashed blocks:
+invariant 1 alone buys the full 16k dedup window), the door preloaded
+with layers 0..=80 (115M entries), 16 threads, `--profile quick`. The
+admitted count equals the real f81's 3,912,529 rows in every
+configuration (the check caught one pool bug: an evicted queue handed
+out while still on the free list).
+
+| door / queues | wave wall | thread-ms push / sort / admit / gather | end_frame | transient | door B/entry |
+|---|---|---|---|---|---|
+| hash sets, 256 x 4096 rows, one wave | 378 ms | 1095 / 703 / 1954 / 711 | 0 | 1.95 GB | 24.9 |
+| sorted + gallop, 256 x 4096, one wave | 485 ms | 1266 / 727 / 3505 / 499 | 134 ms | 1.95 GB | 16.0 |
+| sorted + bucket index, 256 x 4096, regions | 413 ms | 1003 / 710 / 1912 / 541 | 147 ms | 1.95 GB | 16.7 |
+| sorted + bucket index, 256 x 128, regions | 258 ms | 353 / 389 / 2356 / 147 | 166 ms | **60 MB** | 16.7 |
+| + prefetch, 256 x 128, regions | **217 ms** | 555 / 397 / 1642 / 184 | 160 ms | 60 MB | 16.7 |
+| same, payload 0 (keys only) | 145 ms | 260 / 389 / 1195 / 15 | 173 ms | | |
+| same, 1 thread | 1563 ms | 226 / 361 / 904 / 72 | 442 ms | 3.8 MB | |
+
+What the prototype decided:
+
+- **Small queues, not big ones.** 128-256 rows per queue beat 4096 by
+  1.9x on wall time: the per-worker pool stays cache-resident (3.8 MB
+  instead of 120 MB), so pushes stop paying a read-for-ownership miss
+  per line, and sort/gather shrink with the batch. The transient of the
+  whole frame is 60 MB. The "arena" question is moot at this size.
+- **The sorted shard needs an index.** A merge-join or gallop over a
+  ~19k-entry base costs more than a hash probe when the batch is ~100
+  keys: it touches the whole shard per flush. A bucket index by the top
+  bits of `key.0` (~8 entries per bucket, 0.5 B/entry) plus software
+  prefetch of the next 8 keys' buckets makes a lookup one index word and
+  one line, overlapped: admit 3505 -> 1642 thread-ms, below the hash
+  door's 1954 at 16.7 B/entry instead of 24.9.
+- **Regions, not one wave.** Worker w taking the w-th contiguous run of
+  units (its own band of the room) instead of all workers pulling the
+  next unit: 20% less admit time (shard locks no longer collide) and
+  fuller flushes (990 vs 844 rows at 4096-row queues). Balance suffers
+  (busy 58-80%); a hybrid (regions first, then stealing) is the obvious
+  fix if it matters.
+- **The wave's shape is set by the cell order.** A cell receives its
+  rows from ~9 predecessor cells that a (cell-id)-sorted frontier visits
+  in ~3 separate bursts (the neighbours in the other axis are a column
+  away), so a cell is flushed ~3-5 times a frame whatever the pool
+  size; a Morton/Hilbert cell order would make it ~2. Not needed now.
+- **Cost per row, all-in** (queue push + 96 B payload, sort, door,
+  gather): ~120 ns at 16 threads (2.8 thread-s / 23.3M), against
+  today's own phase alone at ~130 ns/row (256 ms wall for 30.9M rows)
+  PLUS the slot pushes inside `AsmKernel::run`. So the tiers are at
+  worst a wash on time with ~30x less transient and -33% door memory,
+  and the frame's cost stays where it was: the kernel.
+- `end_frame` is 160 ms for 115M entries (a sequential merge + index
+  rebuild per shard, parallel): ~1.4 ns/entry, so ~1.3 s at room (0,0)
+  f110's ~1G entries, against a ~27 s frame.

@@ -15,5 +15,6 @@
 //! The forward driver itself is `frame::forward_run` (src/frame.rs), on a
 //! `compiled::FrameEngine`.
 pub mod checkpoint;
+pub mod door;
 pub mod pos_graph;
 pub mod ui_export;
