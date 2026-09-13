@@ -229,11 +229,12 @@ fn main() -> Result<()> {
             for f in 1..=coarse_h {
                 for block in load_frame(&coarse_dir, f)? {
                     let cells = block.positions()?;
+                    let shape = block.shard_shape();
                     let marked: Vec<bool> = block
                         .keys()
                         .iter()
                         .zip(&cells)
-                        .map(|(k, &c)| coarse_marks.contains(*k, c))
+                        .map(|(k, &c)| coarse_marks.contains(shape, *k, c))
                         .collect();
                     if !marked.iter().any(|&m| m) {
                         continue;
@@ -259,24 +260,25 @@ fn main() -> Result<()> {
                 for b in &coarse_blocks {
                     let cells = b.positions()?;
                     for (k, &c) in b.keys().iter().zip(&cells) {
-                        reachable.insert(*k, c);
+                        reachable.insert(b.shard_shape(), *k, c);
                     }
                 }
                 for block in load_frame(&fine_dir, f)? {
                     let cells = block.positions()?;
+                    let shape = block.shard_shape();
                     let mask: Vec<bool> = block
                         .keys()
                         .iter()
                         .zip(&cells)
-                        .map(|(k, &c)| fine_marks.contains(*k, c))
+                        .map(|(k, &c)| fine_marks.contains(shape, *k, c))
                         .collect();
                     let Some(win_rows) = block.keep(&mask) else { continue };
-                    let (wk, wc) = widened_keys(&win_rows, coarser)?;
+                    let (ws, wk, wc) = widened_keys(&win_rows, coarser)?;
                     let fine_cells = win_rows.positions()?;
                     for i in 0..win_rows.lanes() {
                         n += 1;
-                        let m = coarse_marks.contains(wk[i], wc[i]);
-                        let r = reachable.contains(wk[i], wc[i]);
+                        let m = coarse_marks.contains(ws, wk[i], wc[i]);
+                        let r = reachable.contains(ws, wk[i], wc[i]);
                         marked_ok += m as usize;
                         reach_ok += r as usize;
                         if !m && first_miss.is_none() {
@@ -373,7 +375,7 @@ fn main() -> Result<()> {
             let initial = eng.initial_state()?;
             {
                 let b = Block::from_state(&initial)?;
-                let (keys, cells) = widened_keys(&b, precision)?;
+                let (_, keys, cells) = widened_keys(&b, precision)?;
                 let id = (keys[0].0, keys[0].1, cells[0]);
                 eprintln!(
                     "[witness] initial state: cell {} layer {:?} (expected Some(0))",
@@ -453,14 +455,14 @@ fn main() -> Result<()> {
                         eprintln!("[witness] WIN at f{} via input {}", f + 1, byte);
                         return Ok(true);
                     }
-                    let (keys, cells) = widened_keys(&block, precision)?;
+                    let (shape, keys, cells) = widened_keys(&block, precision)?;
                     let id = (keys[0].0, keys[0].1, cells[0]);
                     if f == 0 && byte == 0 && layer_of.get(&id) != Some(&1) {
                         eprintln!(
                             "[witness] f1 successor: cell {} layer {:?} marked {} - diffing against layer 1",
                             cells[0],
                             layer_of.get(&id),
-                            marks.contains(keys[0], cells[0])
+                            marks.contains(shape, keys[0], cells[0])
                         );
                         // Column-by-column diff of the widened concrete
                         // successor against every layer-1 row.
@@ -511,7 +513,7 @@ fn main() -> Result<()> {
                         }
                         anyhow::bail!("stopping after the diff");
                     }
-                    if dead.contains(&id) || !marks.contains(keys[0], cells[0]) {
+                    if dead.contains(&id) || !marks.contains(shape, keys[0], cells[0]) {
                         continue;
                     }
                     if layer_of.get(&id) != Some(&(f + 1)) {

@@ -304,11 +304,11 @@ impl<'a> MarkFilter<'a> {
     /// still needs them. Paid only at levels >= 1, whose frontiers the
     /// filter itself keeps small.
     pub fn allowed(&self, rt2: &Rt2) -> Result<Vec<bool>> {
-        let (keys, cells) = widened_keys_rt2(rt2, self.coarser)?;
+        let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser)?;
         Ok(keys
             .iter()
             .zip(&cells)
-            .map(|(k, &c)| self.marked.contains(*k, c))
+            .map(|(k, &c)| self.marked.contains(shape, *k, c))
             .collect())
     }
 }
@@ -324,14 +324,16 @@ impl<'a> MarkFilter<'a> {
 pub fn widened_keys(
     block: &Block,
     coarser: crate::interpreter::abstraction::RemPrecision,
-) -> Result<(Vec<(u64, u64)>, Vec<u32>)> {
+) -> Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
     widened_keys_rt2(&block.rt2, coarser)
 }
 
+/// `(shape, keys, cells)` of the widened rows - the shape is the widened
+/// block's, which is what the coarser level's marks are sharded by.
 pub fn widened_keys_rt2(
     rt2: &Rt2,
     coarser: crate::interpreter::abstraction::RemPrecision,
-) -> Result<(Vec<(u64, u64)>, Vec<u32>)> {
+) -> Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
     use crate::interpreter::abstraction::RemPrecision;
     let mut w = rt2.clone_block();
     if let RemPrecision::Bits(b) = coarser {
@@ -343,7 +345,7 @@ pub fn widened_keys_rt2(
         keys.len() == rt2.width && cells.len() == rt2.width,
         "the widening changed the lane count"
     );
-    Ok((keys, cells))
+    Ok((w.shape_hash, keys, cells))
 }
 
 /// The one interface between the outer loop and the engines (interface #1).
@@ -474,13 +476,25 @@ pub fn forward_frame(
                                 Some(f) => Some(f.allowed(&slot.rt2)?),
                                 None => None,
                             };
+                            // The door, one shard lookup per run of rows at
+                            // the same cell (a slice's lanes are spatially
+                            // sorted, so runs are common).
                             let mut rows: Vec<u32> = Vec::new();
-                            for i in 0..slot.rt2.width {
-                                if allow.as_ref().is_none_or(|a| a[i])
-                                    && vis.insert(slot.rt2.row_keys[i], slot.cells[i])
-                                {
-                                    rows.push(i as u32);
+                            let (keys, cells) = (&slot.rt2.row_keys, &slot.cells);
+                            let mut i = 0;
+                            while i < keys.len() {
+                                let cell = cells[i];
+                                let mut j = i;
+                                while j < keys.len() && cells[j] == cell {
+                                    j += 1;
                                 }
+                                let shard = vis.shard_mut(shape, cell);
+                                for r in i..j {
+                                    if allow.as_ref().is_none_or(|a| a[r]) && shard.insert(keys[r]) {
+                                        rows.push(r as u32);
+                                    }
+                                }
+                                i = j;
                             }
                             if rows.is_empty() {
                                 continue;
@@ -579,7 +593,7 @@ pub fn backward_run(
 ) -> Result<BackwardResult> {
     // Seeds: the win states of every layer 1..=horizon (listed in each
     // checkpoint file's header; nothing is decoded).
-    let mut seeds: Vec<((u64, u64), u32)> = Vec::new();
+    let mut seeds: Vec<(u64, (u64, u64), u32)> = Vec::new();
     for f in 1..=horizon {
         for file in frame_files(dir, f)? {
             seeds.extend(file.wins());
@@ -596,7 +610,7 @@ pub fn backward_walk(
     dir: &std::path::Path,
     horizon: u32,
     graph: &crate::search::pos_graph::PosGraph,
-    seeds: Vec<((u64, u64), u32)>,
+    seeds: Vec<(u64, (u64, u64), u32)>,
 ) -> Result<BackwardResult> {
     use rustc_hash::FxHashSet;
 
@@ -605,8 +619,8 @@ pub fn backward_walk(
     // `frontier` is the marks added in the previous iteration - the only
     // targets a candidate's successor can newly hit (single pass).
     let mut frontier: Vec<((u64, u64), u32)> = Vec::new();
-    for (k, c) in seeds {
-        if marked.insert(k, c) {
+    for (shape, k, c) in seeds {
+        if marked.insert(shape, k, c) {
             frontier.push((k, c));
         }
     }
@@ -649,11 +663,12 @@ pub fn backward_walk(
         for block in layers.into_iter().flatten() {
             loaded += block.lanes();
             let cells = block.positions()?;
+            let shape = block.shard_shape();
             let mask: Vec<bool> = block
                 .keys()
                 .iter()
                 .zip(&cells)
-                .map(|(k, &c)| !marked.contains(*k, c))
+                .map(|(k, &c)| !marked.contains(shape, *k, c))
                 .collect();
             if let Some(cand) = block.keep(&mask) {
                 cands.push(cand);
@@ -700,7 +715,7 @@ pub fn backward_walk(
             let cells = &cand_cells_of[bi];
             for (j, hit) in unit_hits.iter().enumerate() {
                 let lane = lo + j;
-                if *hit && marked.insert(keys[lane], cells[lane]) {
+                if *hit && marked.insert(cands[bi].shard_shape(), keys[lane], cells[lane]) {
                     new_frontier.push((keys[lane], cells[lane]));
                 }
             }
@@ -761,7 +776,8 @@ impl ForwardState {
         for b in &initial {
             let cells = b.positions()?;
             for (k, c) in b.keys().iter().zip(&cells) {
-                visited[owner_of(owners as u32, k.0, *c) as usize].insert(*k, *c);
+                let shape = b.shard_shape();
+                visited[owner_of(owners as u32, shape, *c) as usize].insert(shape, *k, *c);
             }
         }
         checkpoint_frontier(dir, 0, &mut initial)?;
@@ -988,58 +1004,62 @@ pub fn load_frame_cells(
 /// `insert`/`contains`, not part of this interface.
 #[derive(Default)]
 pub struct Visited {
-    /// Sharded by (shape hash, cell) - the same partition as storage, the
-    /// blocks and the marked bitmask. A shard holds only the CONTENT hashes
-    /// seen at that (shape, cell). Two states in different shards can never be
-    /// duplicates (different shape or different content -> different cell), so
-    /// the sharding is a free refinement: smaller buckets, per-shard locality.
-    shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashSet<u64>>,
+    /// Sharded by (shape hash, cell): a shard holds the 128-bit content
+    /// keys seen at that shape and cell. Two states in different shards can
+    /// never be duplicates (different shape or different content ->
+    /// different cell), so the sharding is a free refinement: small sets,
+    /// per-cell locality, and a run of rows at one cell is one outer
+    /// lookup (`shard_mut`).
+    shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashSet<(u64, u64)>>,
 }
 
 impl Visited {
     pub fn new() -> Self {
         Self::default()
     }
-    /// `(entries, order-independent hash of the (shape, content, cell) set)`
-    /// - the gate that two backward passes marked the same states.
+    /// `(entries, order-independent hash of the (content, cell) set)` - the
+    /// gate that two backward passes marked the same states. A function of
+    /// the keys and cells only, not of how they are sharded.
     pub fn fingerprint(&self) -> (usize, u64) {
         use celeste_engine::runtime2::mix64;
         let mut acc = 0u64;
-        for ((shape, cell), keys) in &self.shards {
-            for &k in keys {
-                acc = acc.wrapping_add(mix64(*shape ^ mix64(k ^ (*cell as u64) << 1)));
+        for ((_shape, cell), keys) in &self.shards {
+            for &(k0, k1) in keys {
+                acc = acc.wrapping_add(mix64(k0 ^ mix64(k1 ^ (*cell as u64) << 1)));
             }
         }
         (self.len(), acc)
     }
-    /// True if `key` (with its `cell`) was NOT already present - this lane is
-    /// new, keep it. Shard picked by (shape, cell); membership by content hash.
-    pub fn insert(&mut self, key: (u64, u64), cell: u32) -> bool {
-        self.shards.entry((key.0, cell)).or_default().insert(key.1)
+    /// True if `key` (at `shape`, `cell`) was NOT already present - this
+    /// lane is new, keep it.
+    pub fn insert(&mut self, shape: u64, key: (u64, u64), cell: u32) -> bool {
+        self.shard_mut(shape, cell).insert(key)
     }
-    pub fn contains(&self, key: (u64, u64), cell: u32) -> bool {
-        self.shards
-            .get(&(key.0, cell))
-            .is_some_and(|s| s.contains(&key.1))
+    /// The key set of one `(shape, cell)` shard, created if absent.
+    pub fn shard_mut(&mut self, shape: u64, cell: u32) -> &mut rustc_hash::FxHashSet<(u64, u64)> {
+        self.shards.entry((shape, cell)).or_default()
+    }
+    pub fn contains(&self, shape: u64, key: (u64, u64), cell: u32) -> bool {
+        self.shards.get(&(shape, cell)).is_some_and(|s| s.contains(&key))
     }
     pub fn len(&self) -> usize {
         self.shards.values().map(|s| s.len()).sum()
     }
 
-    /// Persist the set as `(shape, cell, content)` triples.
+    /// Persist the set as `(shape, cell, key)` rows.
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
-        let mut v: Vec<(u64, u32, u64)> = Vec::with_capacity(self.len());
+        let mut v: Vec<(u64, u32, u64, u64)> = Vec::with_capacity(self.len());
         for ((shape, cell), keys) in &self.shards {
-            v.extend(keys.iter().map(|&k| (*shape, *cell, k)));
+            v.extend(keys.iter().map(|&(k0, k1)| (*shape, *cell, k0, k1)));
         }
         crate::search::checkpoint::save_value_to(path, &v)
     }
 
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let v: Vec<(u64, u32, u64)> = crate::search::checkpoint::load_value_from(path)?;
+        let v: Vec<(u64, u32, u64, u64)> = crate::search::checkpoint::load_value_from(path)?;
         let mut out = Self::new();
-        for (shape, cell, k) in v {
-            out.insert((shape, k), cell);
+        for (shape, cell, k0, k1) in v {
+            out.insert(shape, (k0, k1), cell);
         }
         Ok(out)
     }
@@ -1303,9 +1323,9 @@ mod tests {
         // marked_full = the widened-to-Bits(0) keys of every frame-1 state.
         let mut marked_full = Visited::new();
         for b in &frame1 {
-            let (keys, cells) = widened_keys(b, bits0).expect("widened keys");
+            let (shape, keys, cells) = widened_keys(b, bits0).expect("widened keys");
             for (k, &c) in keys.iter().zip(&cells) {
-                marked_full.insert(*k, c);
+                marked_full.insert(shape, *k, c);
             }
         }
 
@@ -1536,13 +1556,14 @@ mod tests {
         let graph = fwd.pos_graph.expect("pos graph");
 
         // Seed from every state at the horizon frame.
-        let seed: Vec<((u64, u64), u32)> = load_frame(dir, horizon)
+        let seed: Vec<(u64, (u64, u64), u32)> = load_frame(dir, horizon)
             .expect("load horizon")
             .iter()
             .flat_map(|b| {
+                let shape = b.shard_shape();
                 let keys = b.keys().to_vec();
                 let cells = b.positions().expect("cells");
-                keys.into_iter().zip(cells).collect::<Vec<_>>()
+                keys.into_iter().zip(cells).map(move |(k, c)| (shape, k, c)).collect::<Vec<_>>()
             })
             .collect();
         assert!(!seed.is_empty(), "no states at the horizon to seed from");

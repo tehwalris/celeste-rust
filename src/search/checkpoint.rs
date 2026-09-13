@@ -287,8 +287,8 @@ impl FrameFile {
         }
     }
 
-    /// The win rows as `(key, cell)` - the backward's seeds.
-    pub fn wins(&self) -> Vec<((u64, u64), u32)> {
+    /// The win rows as `(shape, key, cell)` - the backward's seeds.
+    pub fn wins(&self) -> Vec<(u64, (u64, u64), u32)> {
         let mut out = Vec::with_capacity(self.header.wins.len());
         let mut idx = 0usize;
         for &r in &self.header.wins {
@@ -297,7 +297,7 @@ impl FrameFile {
             while idx + 1 < self.header.index.len() && self.header.index[idx + 1].1 <= r {
                 idx += 1;
             }
-            out.push((self.key(r), self.header.index[idx].0));
+            out.push((self.header.shape_hash, self.key(r), self.header.index[idx].0));
         }
         out
     }
