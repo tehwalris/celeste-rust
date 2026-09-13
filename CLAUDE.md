@@ -31,7 +31,16 @@ Read these before doing anything substantial:
   re-run walk (`frame::backward_run`) is kept as the oracle:
   `CELESTE_BACKWARD=kernel` selects it, and `rewrite bench-backward
   --level-dir D --horizon H --diff` prints the two walks' symmetric
-  difference, which must be empty.
+  difference, which must be empty - and for each disputed state, its
+  successors and the recorded edges from it against its real successors
+  (`CELESTE_DIFF_RERUN=1` re-runs the frame with the tree's door). That
+  diff found every graph bug so far (a lookup across an index block, a
+  queue index overflowing the row ref); run it on a real room's tree
+  after any change to the recording, not just the marks gate.
+  The forward's records go to `edges/raw/f{frame}/`, are compacted into
+  runs BEHIND the next frame's wave, and `edges/done.txt` names the last
+  frame whose runs are complete: a resume trusts frames up to it and
+  discards the rest (at most one).
 - `BENCHMARK_DATA.md` - performance baseline, but STALE: every number in it was
   measured against the pre-rebuild search path (the now-deleted
   `run.rs` / `sweep*.rs`) and needs re-benchmarking for `rewrite search`. Keep
@@ -448,6 +457,7 @@ if the Lua changes) may be APPENDED by hand, never inserted.
 # cart's Lua (~/src/github.com/tehwalris/celeste_ocaml/celeste.lua).
 pico8_diff/replay.py tas/room_1_0_exit_frame_99.txt
 pico8_diff/replay.py --room 0,0 tas/room_0_0_reference_frame_93.txt
+pico8_diff/replay.py --room 2,0 tas/room_2_0_exit_frame_95.txt   # 300 m: 25 spawn + TAS3's 70 inputs
 
 # A reference solution for OUR game from a community TAS: replay the TAS
 # in the original cart (above), take its per-frame player positions, and
