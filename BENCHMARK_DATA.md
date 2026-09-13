@@ -1,3 +1,32 @@
+# Room (0,0) search with the single-grid fork, stopped at h92 (2026-09-13)
+
+The same `rewrite search --room 0,0` as below, on the single-grid fork
+kernels (`740e093`), stopped by hand after h92's level-0 backward
+(32.6 min in; the queue behind it needed the machine). Identical marked
+sets at every horizon. Per step, old -> new:
+
+| horizon | level-0 bwd old | new | finer levels old | new |
+|---|---|---|---|---|
+| h79 | 179 s | 173 s | 0 s | 0 s |
+| h80 | 15 s | 16 s | 0 s | 0 s |
+| h81 | 19 s | 19 s | 3 s | 2 s |
+| h82 | 27 s | 29 s | 8 s | 2 s |
+| h83 | 35 s | 40 s | 10 s | 4 s |
+| h84 | 44 s | 46 s | 22 s | 6 s |
+| h85 | 59 s | 61 s | 37 s | 8 s |
+| h86 | 75 s | 78 s | 60 s | 10 s |
+| h87 | 96 s | 100 s | 151 s | 20 s |
+| h88 | 125 s | 125 s | 250 s | 33 s |
+| h89 | 149 s | 155 s | 426 s | 53 s |
+| h90 | 200 s | 185 s | 684 s | 82 s |
+| h91 | 214 s | 223 s | 1061 s | 126 s |
+| h92 | 249 s | 265 s | 1713 s | 0 s |
+
+The finer levels run 7-9x cheaper (h91: 1061 -> 126 s); the level-0
+backward is unchanged (rung 0 has no snap fork) and is now the dominant
+term - the case for the explicit backward graph (plans/waves.md).
+Projected total ~48 min against 2 h 32 min.
+
 # Room (0,0) full search (2026-09-13, release, 16 threads, waves frame)
 
 `rewrite search --room 0,0 --from 1 --to 130`: **OPTIMAL win frame: 93**,
