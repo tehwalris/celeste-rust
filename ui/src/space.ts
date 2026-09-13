@@ -197,7 +197,7 @@ export function spaceView(run: Run): HTMLElement {
     let p = fileCache.get(key);
     if (!p) {
       p = (async () => {
-        const [frames, layers] = await Promise.all([loadFrames(lr.frames_file), lr.mlayers_file ? loadLayers(lr.mlayers_file) : null]);
+        const [frames, layers] = await Promise.all([loadFrames(run.id, lr.frames_file), lr.mlayers_file ? loadLayers(run.id, lr.mlayers_file) : null]);
         let frameMax = 1;
         let marksMax = 1;
         const cum = new Float32Array(ncell);
@@ -1065,6 +1065,12 @@ export function spaceView(run: Run): HTMLElement {
   let acc = 0;
   function tick(t: number) {
     if (!st.playing) return;
+    // Detached (another tab, or another run replaced this view): pause
+    // rather than animate into a canvas nobody sees.
+    if (!root.isConnected) {
+      stop();
+      return;
+    }
     const sp = SPEEDS[st.speed];
     const units = last ? ((t - last) / 1000) * (byPass() ? sp.passes : sp.steps) : 0;
     last = t;

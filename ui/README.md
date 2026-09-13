@@ -1,11 +1,17 @@
 # Search UI
 
-A phone-first web UI that shows how one `rewrite search` run played out:
+A phone-first web UI that shows how a `rewrite search` run played out:
 the state space as the room's pixel grid, the set sizes, and where the
-time went. Static: a Vite build plus the data exported from a finished
+time went. Static: a Vite build plus the data exported from each finished
 checkpoint tree, served by a small node server under `/celeste/` on port
 3011 (see `UI-HOSTING.md` at the repo root). Live at
 <https://taxw-ux.porgy-vimba.ts.net/celeste/>.
+
+The **run strip** under the title picks which finished search is shown -
+`Room (1,0)` (the default) or `Room (0,0)`, the runs `runs.json` lists -
+and everything below it (all three tabs) is that run; the route is
+`#<tab>` for the default run and `#<run>/<tab>` for any other, so a
+link to a run survives a reload.
 
 ## What it shows
 
@@ -58,28 +64,50 @@ reset.
 
 ## Regenerating the data
 
-The data is produced by `rewrite export-ui` (`src/search/ui_export.rs`)
-from a finished run's checkpoint tree and its log. It reads only the
-checkpoint headers (per-cell counts = the cell index, win cells = the win
-list), the marks files, and - to split the marks by layer - each frame
-file's `(cell, key)` rows. Room (1,0)'s full ladder to 99 exports in ~6 s
-to 8.8 MB.
+The data directory (`/var/tmp/celeste-ui/data`) holds one subdirectory
+per run and `runs.json`, the hand-written list of the runs to offer, in
+order, the first one the default:
+
+```json
+{
+  "runs": [
+    { "id": "room10", "label": "Room (1,0)" },
+    { "id": "room00", "label": "Room (0,0)" }
+  ]
+}
+```
+
+Each run's subdirectory (`id`) is produced by `rewrite export-ui`
+(`src/search/ui_export.rs`) from that run's checkpoint tree and its log.
+It reads only the checkpoint headers (per-cell counts = the cell index,
+win cells = the win list), the marks files, and - to split the marks by
+layer - each frame file's `(cell, key)` rows. Room (1,0)'s full ladder
+to 99 exports in ~6 s to 8.8 MB; room (0,0)'s ladder to 93 (15
+horizons, 64 levels) in ~20 s to 18 MB.
 
 ```bash
 # 1. Keep the run's log somewhere stable (it is the timing source).
 cp /tmp/room10f.log /var/tmp/celeste-ui/room10f.log
+cp /tmp/room00_search.log /var/tmp/celeste-ui/room00.log
 
-# 2. Export (from the repo root: it loads cart/ for the room's tiles).
+# 2. Export each run into its own subdirectory (from the repo root: it
+#    loads cart/ for the room's tiles).
 ./one-cargo.sh ./safe-run.sh -- cargo build --profile quick --bin rewrite
 ./safe-run.sh -- ./target/quick/rewrite export-ui \
     --checkpoint-dir /var/tmp/celeste-checkpoints \
     --log /var/tmp/celeste-ui/room10f.log \
-    --out /var/tmp/celeste-ui/data --room 1,0
+    --out /var/tmp/celeste-ui/data/room10 --room 1,0
+./safe-run.sh -- ./target/quick/rewrite export-ui \
+    --checkpoint-dir /var/tmp/celeste-search-room00 \
+    --log /var/tmp/celeste-ui/room00.log \
+    --out /var/tmp/celeste-ui/data/room00 --room 0,0
+
+# 3. List it in /var/tmp/celeste-ui/data/runs.json (above).
 ```
 
-The output layout (`run.json` + one binary per horizon/level) is
-documented at the top of `src/search/ui_export.rs`; `ui/src/data.ts` is
-its reader.
+A run's layout (`run.json` + one binary per horizon/level) is documented
+at the top of `src/search/ui_export.rs`; `ui/src/data.ts` is its reader,
+with every file fetched as `data/<run>/<file>`.
 
 ## Building and serving
 

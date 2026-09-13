@@ -1,7 +1,9 @@
-// The exported run (`rewrite export-ui`, src/search/ui_export.rs): run.json
-// plus one binary per (horizon, level) for frames, marks and marks-by-layer.
-// Every binary is little-endian u32 at 4-byte alignment, read as
-// Uint32Array views; nothing is parsed.
+// The exported runs (`rewrite export-ui`, src/search/ui_export.rs): the
+// data directory holds `runs.json` - the runs to offer, in order, the
+// first one the default - and one subdirectory per run with its
+// run.json plus one binary per (horizon, level) for frames, marks and
+// marks-by-layer. Every binary is little-endian u32 at 4-byte alignment,
+// read as Uint32Array views; nothing is parsed.
 
 export interface FwdLine {
   f: number;
@@ -75,7 +77,15 @@ export interface Tiles {
   solid: boolean[];
 }
 
+/** One entry of `runs.json`: `id` is the run's subdirectory. */
+export interface RunInfo {
+  id: string;
+  label: string;
+}
+
 export interface Run {
+  /** The run's id in `runs.json` (its subdirectory); set by `loadRun`. */
+  id: string;
   format: number;
   room: [number, number];
   cell_box: Box2;
@@ -143,47 +153,60 @@ export class MarksBin {
 }
 
 const base = (import.meta.env.BASE_URL as string).replace(/\/?$/, "/");
-export const dataUrl = (name: string) => `${base}data/${name}`;
+export const dataUrl = (path: string) => `${base}data/${path}`;
 
+// Every cache is keyed by `runId/name`, so two runs' files never collide.
 const binCache = new Map<string, Promise<ArrayBuffer>>();
-function fetchBin(name: string): Promise<ArrayBuffer> {
-  let p = binCache.get(name);
+function fetchBin(path: string): Promise<ArrayBuffer> {
+  let p = binCache.get(path);
   if (!p) {
-    p = fetch(dataUrl(name)).then((r) => {
-      if (!r.ok) throw new Error(`${name}: HTTP ${r.status}`);
+    p = fetch(dataUrl(path)).then((r) => {
+      if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
       return r.arrayBuffer();
     });
-    binCache.set(name, p);
+    binCache.set(path, p);
   }
   return p;
 }
 
 const framesCache = new Map<string, Promise<FramesBin>>();
-export function loadFrames(name: string, magic = "CUF1"): Promise<FramesBin> {
-  let p = framesCache.get(name);
+export function loadFrames(runId: string, name: string, magic = "CUF1"): Promise<FramesBin> {
+  const path = `${runId}/${name}`;
+  let p = framesCache.get(path);
   if (!p) {
-    p = fetchBin(name).then((b) => new FramesBin(b, magic));
-    framesCache.set(name, p);
+    p = fetchBin(path).then((b) => new FramesBin(b, magic));
+    framesCache.set(path, p);
   }
   return p;
 }
-export const loadLayers = (name: string) => loadFrames(name, "CUL1");
+export const loadLayers = (runId: string, name: string) => loadFrames(runId, name, "CUL1");
 
 const marksCache = new Map<string, Promise<MarksBin>>();
-export function loadMarks(name: string): Promise<MarksBin> {
-  let p = marksCache.get(name);
+export function loadMarks(runId: string, name: string): Promise<MarksBin> {
+  const path = `${runId}/${name}`;
+  let p = marksCache.get(path);
   if (!p) {
-    p = fetchBin(name).then((b) => new MarksBin(b));
-    marksCache.set(name, p);
+    p = fetchBin(path).then((b) => new MarksBin(b));
+    marksCache.set(path, p);
   }
   return p;
 }
 
-export async function loadRun(): Promise<Run> {
-  const r = await fetch(dataUrl("run.json"));
-  if (!r.ok) throw new Error(`run.json: HTTP ${r.status}`);
+/** The runs on offer, in order; the first is the default. */
+export async function loadRuns(): Promise<RunInfo[]> {
+  const r = await fetch(dataUrl("runs.json"));
+  if (!r.ok) throw new Error(`runs.json: HTTP ${r.status}`);
+  const { runs } = (await r.json()) as { runs: RunInfo[] };
+  if (!Array.isArray(runs) || runs.length === 0) throw new Error("runs.json lists no runs");
+  return runs;
+}
+
+export async function loadRun(id: string): Promise<Run> {
+  const r = await fetch(dataUrl(`${id}/run.json`));
+  if (!r.ok) throw new Error(`${id}/run.json: HTTP ${r.status}`);
   const run = (await r.json()) as Run;
-  if (run.format !== 1) throw new Error(`run.json format ${run.format}, expected 1`);
+  if (run.format !== 1) throw new Error(`${id}/run.json format ${run.format}, expected 1`);
+  run.id = id;
   return run;
 }
 
