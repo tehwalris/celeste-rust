@@ -482,6 +482,9 @@ fn main() -> Result<()> {
             let mut classes_xy: FxHashMap<(u32, u32), u64> = FxHashMap::default();
             let mut classes_xys: FxHashMap<(u32, u32, u32, u32), u64> = FxHashMap::default();
             let mut classes_nopos: FxHashMap<Vec<(u32, u32, u32)>, u64> = FxHashMap::default();
+            // Every scalar except the player's MOTION (x, y, spd, rem): the
+            // variants a motion-free kernel specialization would compile.
+            let mut classes_nomotion: FxHashMap<Vec<(u32, u32, u32)>, u64> = FxHashMap::default();
             let mut no_player = 0usize;
             for b in &blocks {
                 let rt2 = b.rt2();
@@ -536,6 +539,7 @@ fn main() -> Result<()> {
                 for lane in 0..rt2.width {
                     let mut tuple: Vec<(u32, u32, u32)> = Vec::with_capacity(names.len());
                     let mut nopos: Vec<(u32, u32, u32)> = Vec::with_capacity(names.len());
+                    let mut nomotion: Vec<(u32, u32, u32)> = Vec::with_capacity(names.len());
                     for (name, cell) in &fields {
                         let v = enc(rt2.cols[*cell as usize].at(lane));
                         let ni = names.iter().position(|n| n == name).unwrap();
@@ -546,10 +550,14 @@ fn main() -> Result<()> {
                         tuple.push(v);
                         if name != "x" && name != "y" {
                             nopos.push(v);
+                            if !name.starts_with("spd.") {
+                                nomotion.push(v);
+                            }
                         }
                     }
                     *classes.entry(tuple).or_default() += 1;
                     *classes_nopos.entry(nopos).or_default() += 1;
+                    *classes_nomotion.entry(nomotion).or_default() += 1;
                     if let (Some(cx), Some(cy)) = (cx, cy) {
                         let x = enc(rt2.cols[cx as usize].at(lane)).1;
                         let y = enc(rt2.cols[cy as usize].at(lane)).1;
@@ -573,6 +581,7 @@ fn main() -> Result<()> {
             println!("[census] distinct (x, y, spd.x, spd.y): {}", classes_xys.len());
             println!("[census] all scalar fields except rem: {}", dist(&classes));
             println!("[census] all scalar fields except rem and x, y: {}", dist(&classes_nopos));
+            println!("[census] all scalar fields except rem, x, y and spd (motion-free classes): {}", dist(&classes_nomotion));
             println!("[census] per-field cardinality (distinct values over the frame):");
             let mut order: Vec<usize> = (0..names.len()).collect();
             order.sort_by_key(|&i| std::cmp::Reverse(card[i].len()));

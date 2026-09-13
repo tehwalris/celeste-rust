@@ -294,7 +294,11 @@ pub fn specialize_probe(
 
     let mut pin: Vec<(Vec<Step>, Conc)> = Vec::new();
     // The player position.
-    let nopos = std::env::var("CELESTE_SPEC_NOPOS").is_ok();
+    let groups: std::collections::HashSet<String> = std::env::var("CELESTE_SPEC_GROUPS")
+        .unwrap_or_default().split(',').map(|s| s.trim().to_string()).collect();
+    // `motionfree` leaves the player's motion (x, y, spd, rem) symbolic
+    // and pins everything else, so the position pin is off too.
+    let nopos = std::env::var("CELESTE_SPEC_NOPOS").is_ok() || groups.contains("motionfree");
     if let Some(pl) = players.first() {
         if !nopos { pin.push((fld(pl, &["x"]), num(player_xy.0))); pin.push((fld(pl, &["y"]), num(player_xy.1))); }
         // pm1 key on the player, canonical "steady" values.
@@ -307,8 +311,7 @@ pub fn specialize_probe(
     //   spd        - pin the player spd.x/spd.y to 0
     //   springall  - pin every spring scalar (freeze the springs)
     //   playerall  - pin every player scalar except rem (the fork input)
-    let groups: std::collections::HashSet<String> = std::env::var("CELESTE_SPEC_GROUPS")
-        .unwrap_or_default().split(',').map(|s| s.trim().to_string()).collect();
+    //   motionfree - pin every player scalar except x, y, spd and rem
     for (i, sp) in springs.iter().enumerate() {
         if let Some((x, y)) = spring_xy.get(i) {
             pin.push((fld(sp, &["x"]), num(*x)));
@@ -367,10 +370,16 @@ pub fn specialize_probe(
                 }
             }
         }
-        if groups.contains("playerall") {
+        if groups.contains("playerall") || groups.contains("motionfree") {
+            let motion = groups.contains("motionfree");
             for f in super::shapes::state_paths(&st).unwrap_or_default() {
+                let shown = iface::show(&f);
                 let is_rem = f.starts_with(pl) && f.iter().any(|s| format!("{:?}", s).contains("rem"));
-                if f.starts_with(pl) && !is_rem && !pin.iter().any(|(q, _)| q == &f) {
+                let is_motion = motion
+                    && f.starts_with(pl)
+                    && (shown.ends_with(".x") || shown.ends_with(".y"))
+                    && (f.len() == pl.len() + 1 || shown.contains("spd"));
+                if f.starts_with(pl) && !is_rem && !is_motion && !pin.iter().any(|(q, _)| q == &f) {
                     match iface::get(&st, &f) {
                         Some(Value::Bool(_)) => pin.push((f, Conc::Bool(false))),
                         Some(Value::Num(_)) => pin.push((f, num(0))),
@@ -473,11 +482,22 @@ pub fn specialize_probe(
             eprintln!("  slot {} = {}", i, iface::show(sp));
         }
     }
+    // The assembled kernel's shape: bind + fuse (every fork and button
+    // configuration resolved), then count the fused graph's nodes and
+    // its BODIES - one body is one distinct output row an input row can
+    // produce, so the body count bounds the fan-out per input row.
+    let fused_of = |fr: &super::verify::Frame| -> Result<(usize, usize)> {
+        let bound = super::emit::bind(fr, &it.d.graph, true)?;
+        let (g, bodies, _, _) = super::emit::asm_fused(&bound, None, true)?;
+        Ok((g.len(), bodies.len()))
+    };
+    let (b_fused, b_bodies) = fused_of(&base)?;
+    let (p_fused, p_bodies) = fused_of(&f)?;
     let mut out = String::new();
     out.push_str(&format!("shape {}: {} outcomes, {} players, {} springs\n", shape_idx, f.outs.len(), players.len(), springs.len()));
     out.push_str(&format!("  pinned: {}\n", pinned_paths.join(", ")));
-    out.push_str(&format!("  BASE   : {} nodes, {} live forks {:?}, counter {}\n", bn, bf.len(), bf, base_forks));
-    out.push_str(&format!("  PINNED : {} nodes, {} live forks {:?}, counter {}\n", pn, pf.len(), pf, f.forks));
+    out.push_str(&format!("  BASE   : {} nodes, {} live forks {:?}, counter {}; fused {} nodes, {} bodies\n", bn, bf.len(), bf, base_forks, b_fused, b_bodies));
+    out.push_str(&format!("  PINNED : {} nodes, {} live forks {:?}, counter {}; fused {} nodes, {} bodies\n", pn, pf.len(), pf, f.forks, p_fused, p_bodies));
     out.push_str(&format!("  pinned op census: {}\n", ptop.join(", ")));
     // CELESTE_SPEC_CMPS: dump symbolic comparison nodes (box tests etc).
     if std::env::var("CELESTE_SPEC_CMPS").is_ok() {
