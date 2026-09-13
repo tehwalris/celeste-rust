@@ -529,13 +529,13 @@ fn main() -> Result<()> {
                 let n = b.lanes();
                 let mask: Vec<bool> = (0..n).map(|i| i < 64).collect();
                 let small = vec![b.keep(&mask).expect("a non-empty block")];
-                forward_frame(&engine, small, &Door::new(), None, mark_filter)?;
+                forward_frame(&engine, small, &Door::new(), None, mark_filter, frame + 1)?;
             }
             for rep in 0..reps {
                 let input: Vec<Block> = frontier.iter().map(|b| Block::from_rt2(b.rt2().clone_block())).collect();
                 let door = Door::new();
                 let t = std::time::Instant::now();
-                let (next, _won, st) = forward_frame(&engine, input, &door, None, mark_filter)?;
+                let (next, _won, st) = forward_frame(&engine, input, &door, None, mark_filter, frame + 1)?;
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
                 println!(
                     "[bench] rep {rep}: raw {} kept {} | wave {:.0} ms (idle {:.0}%) door {:.0} total {:.0} ms | flushes {} ({:.0} rows avg) | {} out blocks",

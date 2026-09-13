@@ -7,7 +7,9 @@
 //! frame) plus a small sorted `delta` (this frame's admissions). A flush
 //! `admit`s a sorted batch of keys with one merge-join sweep over both;
 //! `end_frame` merges every delta into its base, once per frame. So the
-//! big set is only READ while a frame runs, and each entry costs 16 bytes.
+//! big set is only READ while a frame runs. Each entry is the key and the
+//! state's id (`(layer, file seq, row)`): what an edge to an old state
+//! is written as (plans/waves.md, the explicit graph).
 //!
 //! `HashDoor` is the same contract over a hash set per shard (the
 //! pre-2026-09-13 representation), kept as the oracle for `Door`'s tests.
@@ -17,12 +19,19 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub type Key = (u64, u64);
 
+/// A shard entry: the key and the state's id `(layer, file seq, row)`,
+/// packed by `crate::frame::pack_id`.
+pub type Entry = (Key, u64);
+
 /// The door's contract: admit sorted, deduplicated key batches; merge at
 /// the end of a frame.
 pub trait Admit: Sync {
-    /// `keys` sorted ascending with no duplicates. Pushes into `new` the
-    /// indices of the keys NOT already in the shard, and records them.
-    fn admit(&self, shape: u64, cell: u32, keys: &[Key], new: &mut Vec<u32>);
+    /// `keys` sorted ascending with no duplicates. For each key, its id:
+    /// an existing entry's, or - for a key NOT in the shard - a fresh one,
+    /// `first_new + k` for the k-th new key in order, which the shard
+    /// records. `ids` receives one id per key (in `keys`' order), `new`
+    /// the indices of the new keys.
+    fn admit(&self, shape: u64, cell: u32, keys: &[Key], first_new: u64, ids: &mut Vec<u64>, new: &mut Vec<u32>);
     /// The frame is over: fold this frame's admissions into the base.
     fn end_frame(&self, workers: usize);
     fn len(&self) -> usize;
@@ -35,13 +44,13 @@ pub trait Admit: Sync {
 
 #[derive(Default)]
 struct Shard {
-    base: Vec<Key>,
+    base: Vec<Entry>,
     /// Bucket starts into `base` by the top bits of `key.0` (the keys are
     /// uniform hashes): `index.len() - 1` buckets of ~8 entries, so a
     /// lookup touches one index word and one or two lines of `base`
     /// instead of galloping through it. 0.5 B/entry. Rebuilt with `base`.
     index: Vec<u32>,
-    delta: Vec<Key>,
+    delta: Vec<Entry>,
 }
 
 /// log2 of the bucket count for `n` entries: ~8 entries per bucket.
@@ -49,12 +58,12 @@ fn index_bits(n: usize) -> u32 {
     (n / 8).max(1).next_power_of_two().trailing_zeros()
 }
 
-fn build_index(base: &[Key]) -> Vec<u32> {
+fn build_index(base: &[Entry]) -> Vec<u32> {
     let bits = index_bits(base.len());
     let nb = 1usize << bits;
     let mut index = vec![0u32; nb + 1];
     let mut b = 0usize;
-    for (i, k) in base.iter().enumerate() {
+    for (i, (k, _)) in base.iter().enumerate() {
         let kb = if bits == 0 { 0 } else { (k.0 >> (64 - bits)) as usize };
         while b < kb {
             b += 1;
@@ -69,12 +78,9 @@ fn build_index(base: &[Key]) -> Vec<u32> {
 }
 
 impl Shard {
-    /// Merge-join `keys` against `base` and `delta`; the misses go to
-    /// `new` (by index) and are appended to `delta`, which stays sorted
-    /// because the appended keys are sorted and... not necessarily above
-    /// the existing delta - so the delta is re-sorted by a merge when the
-    /// batch interleaves with it (`merge_into`).
-    fn admit(&mut self, keys: &[Key], new: &mut Vec<u32>, scratch: &mut Vec<Key>) {
+    /// Merge-join `keys` against `base` and `delta`; the misses get fresh
+    /// ids and go to `delta`, kept sorted by key.
+    fn admit(&mut self, keys: &[Key], first_new: u64, ids: &mut Vec<u64>, new: &mut Vec<u32>, scratch: &mut Vec<Entry>) {
         let mut d = 0usize;
         let (base, delta) = (&self.base, &self.delta);
         scratch.clear();
@@ -83,6 +89,7 @@ impl Shard {
         for k in keys.iter().take(AHEAD) {
             self.prefetch(bits, k);
         }
+        let mut n_new = 0u64;
         for (i, k) in keys.iter().enumerate() {
             if let Some(k2) = keys.get(i + AHEAD) {
                 self.prefetch(bits, k2);
@@ -91,22 +98,27 @@ impl Shard {
                 let kb = if bits == 0 { 0 } else { (k.0 >> (64 - bits)) as usize };
                 let (lo, hi) = (self.index[kb] as usize, self.index[kb + 1] as usize);
                 let bucket = &base[lo..hi];
-                let b = lo + bucket.partition_point(|x| x < k);
-                if b < hi && base[b] == *k {
+                let b = lo + bucket.partition_point(|x| x.0 < *k);
+                if b < hi && base[b].0 == *k {
+                    ids.push(base[b].1);
                     continue;
                 }
             }
             d = gallop(delta, d, k);
-            if d < delta.len() && delta[d] == *k {
+            if d < delta.len() && delta[d].0 == *k {
+                ids.push(delta[d].1);
                 continue;
             }
+            let id = first_new + n_new;
+            n_new += 1;
+            ids.push(id);
             new.push(i as u32);
-            scratch.push(*k);
+            scratch.push((*k, id));
         }
         if scratch.is_empty() {
             return;
         }
-        if self.delta.last().is_some_and(|last| *last < scratch[0]) || self.delta.is_empty() {
+        if self.delta.last().is_some_and(|last| last.0 < scratch[0].0) || self.delta.is_empty() {
             self.delta.extend_from_slice(scratch);
         } else {
             let merged = merge_sorted(&self.delta, scratch);
@@ -136,7 +148,7 @@ impl Shard {
         if self.delta.is_empty() {
             return;
         }
-        if self.base.last().is_some_and(|last| *last < self.delta[0]) || self.base.is_empty() {
+        if self.base.last().is_some_and(|last| last.0 < self.delta[0].0) || self.base.is_empty() {
             self.base.append(&mut self.delta);
         } else {
             self.base = merge_sorted(&self.base, &self.delta);
@@ -148,19 +160,17 @@ impl Shard {
 }
 
 /// The first index `>= from` whose key is `>= k` in the sorted `a`, by
-/// exponential then binary search from `from`: the batch's keys are
-/// sorted too, so the answer is usually a few entries ahead and the cost
-/// is ~2 log2(gap) probes rather than a linear sweep of the shard.
+/// exponential then binary search from `from`.
 #[inline]
-fn gallop(a: &[Key], from: usize, k: &Key) -> usize {
+fn gallop(a: &[Entry], from: usize, k: &Key) -> usize {
     let n = a.len();
-    if from >= n || a[from] >= *k {
+    if from >= n || a[from].0 >= *k {
         return from;
     }
     let mut step = 1;
     let mut lo = from;
     let mut hi = from + 1;
-    while hi < n && a[hi] < *k {
+    while hi < n && a[hi].0 < *k {
         lo = hi;
         step *= 2;
         hi = (hi + step).min(n);
@@ -168,17 +178,16 @@ fn gallop(a: &[Key], from: usize, k: &Key) -> usize {
             break;
         }
     }
-    // a[lo] < k <= a[hi] (or hi == n)
-    lo + 1 + a[lo + 1..hi.min(n)].partition_point(|x| x < k)
+    lo + 1 + a[lo + 1..hi.min(n)].partition_point(|x| x.0 < *k)
 }
 
 /// Two sorted, individually duplicate-free, mutually disjoint slices
 /// merged into one.
-fn merge_sorted(a: &[Key], b: &[Key]) -> Vec<Key> {
+fn merge_sorted(a: &[Entry], b: &[Entry]) -> Vec<Entry> {
     let mut out = Vec::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        if a[i] < b[j] {
+        if a[i].0 < b[j].0 {
             out.push(a[i]);
             i += 1;
         } else {
@@ -202,13 +211,13 @@ impl Door {
         Self::default()
     }
 
-    /// A door already holding `entries` (each shard's keys, in any order,
-    /// duplicates allowed) - the union of a level's layers so far.
-    pub fn from_shards(entries: impl IntoIterator<Item = ((u64, u32), Vec<Key>)>) -> Self {
+    /// A door already holding `entries` (each shard's `(key, id)`s, in any
+    /// order) - the union of a level's layers so far.
+    pub fn from_shards(entries: impl IntoIterator<Item = ((u64, u32), Vec<Entry>)>) -> Self {
         let mut shards = FxHashMap::default();
         for ((shape, cell), mut keys) in entries {
             keys.sort_unstable();
-            keys.dedup();
+            keys.dedup_by_key(|e| e.0);
             keys.shrink_to_fit();
             let index = build_index(&keys);
             shards.insert((shape, cell), Arc::new(Mutex::new(Shard { base: keys, index, delta: Vec::new() })));
@@ -222,19 +231,18 @@ impl Door {
         }
         self.shards.write().expect("door").entry((shape, cell)).or_default().clone()
     }
-
 }
 
 thread_local! {
-    static SCRATCH: std::cell::RefCell<Vec<Key>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SCRATCH: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl Admit for Door {
-    fn admit(&self, shape: u64, cell: u32, keys: &[Key], new: &mut Vec<u32>) {
+    fn admit(&self, shape: u64, cell: u32, keys: &[Key], first_new: u64, ids: &mut Vec<u64>, new: &mut Vec<u32>) {
         debug_assert!(keys.windows(2).all(|w| w[0] < w[1]), "admit: keys sorted and deduplicated");
         let shard = self.shard(shape, cell);
         let mut shard = shard.lock().expect("door shard");
-        SCRATCH.with(|s| shard.admit(keys, new, &mut s.borrow_mut()));
+        SCRATCH.with(|s| shard.admit(keys, first_new, ids, new, &mut s.borrow_mut()));
     }
 
     fn end_frame(&self, workers: usize) {
@@ -271,17 +279,17 @@ impl Admit for Door {
             .values()
             .map(|s| {
                 let s = s.lock().expect("door shard");
-                (s.base.capacity() + s.delta.capacity()) * 16 + s.index.capacity() * 4
+                (s.base.capacity() + s.delta.capacity()) * std::mem::size_of::<Entry>() + s.index.capacity() * 4
             })
             .sum()
     }
 }
 
-/// The hash-set door: the same contract over `FxHashSet` shards.
+/// The hash-set door: the same contract over `FxHashMap` shards.
 #[cfg(test)]
 #[derive(Default)]
 pub struct HashDoor {
-    shards: RwLock<FxHashMap<(u64, u32), Arc<Mutex<rustc_hash::FxHashSet<Key>>>>>,
+    shards: RwLock<FxHashMap<(u64, u32), Arc<Mutex<FxHashMap<Key, u64>>>>>,
 }
 
 #[cfg(test)]
@@ -290,7 +298,7 @@ impl HashDoor {
         Self::default()
     }
 
-    fn shard(&self, shape: u64, cell: u32) -> Arc<Mutex<rustc_hash::FxHashSet<Key>>> {
+    fn shard(&self, shape: u64, cell: u32) -> Arc<Mutex<FxHashMap<Key, u64>>> {
         if let Some(s) = self.shards.read().expect("door").get(&(shape, cell)) {
             return s.clone();
         }
@@ -300,12 +308,20 @@ impl HashDoor {
 
 #[cfg(test)]
 impl Admit for HashDoor {
-    fn admit(&self, shape: u64, cell: u32, keys: &[Key], new: &mut Vec<u32>) {
+    fn admit(&self, shape: u64, cell: u32, keys: &[Key], first_new: u64, ids: &mut Vec<u64>, new: &mut Vec<u32>) {
         let shard = self.shard(shape, cell);
         let mut set = shard.lock().expect("door shard");
+        let mut n_new = 0u64;
         for (i, k) in keys.iter().enumerate() {
-            if set.insert(*k) {
-                new.push(i as u32);
+            match set.get(k) {
+                Some(&id) => ids.push(id),
+                None => {
+                    let id = first_new + n_new;
+                    n_new += 1;
+                    set.insert(*k, id);
+                    ids.push(id);
+                    new.push(i as u32);
+                }
             }
         }
     }
@@ -321,7 +337,7 @@ impl Admit for HashDoor {
             .read()
             .expect("door")
             .values()
-            .map(|s| s.lock().expect("door shard").capacity() * 17 + 16)
+            .map(|s| s.lock().expect("door shard").capacity() * 25 + 16)
             .sum()
     }
 }
@@ -358,14 +374,18 @@ mod tests {
 
     fn run(door: &dyn Admit, frames: &[Vec<(u64, u32, Vec<Key>)>]) -> Vec<Vec<(u64, u32, Key)>> {
         let mut out = Vec::new();
+        let mut next_id = 0u64;
         for frame in frames {
             let mut admitted = Vec::new();
             for (shape, cell, keys) in frame {
                 let mut sorted = keys.clone();
                 sorted.sort_unstable();
                 sorted.dedup();
-                let mut new = Vec::new();
-                door.admit(*shape, *cell, &sorted, &mut new);
+                let (mut new, mut ids) = (Vec::new(), Vec::new());
+                door.admit(*shape, *cell, &sorted, next_id, &mut ids, &mut new);
+                next_id += new.len() as u64;
+                // Every key gets an id; an old key's id is the one it got when admitted.
+                assert_eq!(ids.len(), sorted.len());
                 admitted.extend(new.iter().map(|&i| (*shape, *cell, sorted[i as usize])));
             }
             admitted.sort_unstable();
@@ -395,29 +415,35 @@ mod tests {
 
     #[test]
     fn from_shards_preloads_the_base() {
-        let door = Door::from_shards([((1, 2), vec![(5, 0), (1, 0), (5, 0)])]);
+        let door = Door::from_shards([((1, 2), vec![((5, 0), 50), ((1, 0), 10), ((5, 0), 50)])]);
         assert_eq!(door.len(), 2);
-        let mut new = Vec::new();
-        door.admit(1, 2, &[(0, 0), (1, 0), (5, 0), (6, 0)], &mut new);
+        let (mut new, mut ids) = (Vec::new(), Vec::new());
+        door.admit(1, 2, &[(0, 0), (1, 0), (5, 0), (6, 0)], 100, &mut ids, &mut new);
         assert_eq!(new, vec![0, 3]);
+        assert_eq!(ids, vec![100, 10, 50, 101], "old keys keep their ids, new ones get first_new + k");
         new.clear();
-        door.admit(1, 2, &[(0, 0), (6, 0), (7, 0)], &mut new);
+        ids.clear();
+        door.admit(1, 2, &[(0, 0), (6, 0), (7, 0)], 200, &mut ids, &mut new);
         assert_eq!(new, vec![2]);
+        assert_eq!(ids, vec![100, 101, 200]);
         door.end_frame(2);
         assert_eq!(door.len(), 5);
         new.clear();
-        door.admit(1, 2, &[(7, 0), (8, 0)], &mut new);
+        ids.clear();
+        door.admit(1, 2, &[(7, 0), (8, 0)], 300, &mut ids, &mut new);
         assert_eq!(new, vec![1]);
+        assert_eq!(ids, vec![200, 300]);
     }
 
     #[test]
     fn admit_interleaving_with_the_delta_keeps_it_sorted() {
         let door = Door::new();
-        let mut new = Vec::new();
-        door.admit(0, 0, &[(10, 0), (30, 0)], &mut new);
-        door.admit(0, 0, &[(20, 0), (40, 0)], &mut new);
-        door.admit(0, 0, &[(5, 0), (20, 0), (35, 0)], &mut new);
+        let (mut new, mut ids) = (Vec::new(), Vec::new());
+        door.admit(0, 0, &[(10, 0), (30, 0)], 0, &mut ids, &mut new);
+        door.admit(0, 0, &[(20, 0), (40, 0)], 2, &mut ids, &mut new);
+        door.admit(0, 0, &[(5, 0), (20, 0), (35, 0)], 4, &mut ids, &mut new);
         assert_eq!(new, vec![0, 1, 0, 1, 0, 2]);
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 2, 5]);
         assert_eq!(door.len(), 6);
     }
 }

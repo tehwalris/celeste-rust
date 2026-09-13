@@ -35,7 +35,12 @@ const MAGIC: &[u8; 4] = b"C8TB";
 /// by `(cell, key)` with a cell index, raw fixed-width columns, no
 /// compression, win rows listed in the header. A v7 tree is a different
 /// layout altogether and is refused.
-pub const FORMAT_VERSION: u32 = 8;
+/// 8 -> 9: rows in FLUSH order (a piece is appended to by its worker's
+/// queue flushes, each a run of one cell), so a row's file position is
+/// its stable id `(layer, file seq, row)` from the moment it is admitted;
+/// the cell index lists RUNS `(cell, start, len)` instead of one range per
+/// cell; win rows carry their cell. A v8 tree is refused.
+pub const FORMAT_VERSION: u32 = 9;
 
 /// Where one column lives: uniform (in the header) or raw in the data
 /// region at a byte offset, `width` entries of the kind's fixed width.
@@ -66,11 +71,12 @@ struct Header {
     cols: Vec<ColMeta>,
     /// Data offset of the key column, 16 bytes per row.
     keys: u64,
-    /// `(cell, first row)` per distinct cell, ascending by cell. The rows
-    /// of entry `i` are `[start_i, start_{i+1})` (or `width` for the last).
-    index: Vec<(u32, u32)>,
-    /// The rows that are wins (`Block::wins`), ascending.
-    wins: Vec<u32>,
+    /// The runs of rows at one cell: `(cell, start, len)`, sorted by
+    /// `(cell, start)`. A cell has one run per flush that appended to
+    /// this piece.
+    index: Vec<(u32, u32, u32)>,
+    /// The rows that are wins (`Block::wins`), ascending, with their cell.
+    wins: Vec<(u32, u32)>,
 }
 
 /// A row's `AV` as 16 fixed bytes: tag, two payload words, zero.
@@ -107,15 +113,14 @@ fn decode_av(bytes: &[u8]) -> Result<AV> {
     })
 }
 
-/// Save one shape's block of a frame. `cells` is the block's per-row cell
-/// and the rows MUST already be sorted by it (the caller sorts by
-/// `(cell, key)` so the file order is canonical); `wins` marks the win
-/// rows. Atomic: written to a `tmp-` sibling, renamed into place.
+/// Save one shape's block of a frame in ITS OWN row order (the piece's
+/// flush order: runs of one cell each). `cells` is the block's per-row
+/// cell; `wins` marks the win rows. Atomic: written to a `tmp-` sibling,
+/// renamed into place.
 pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Result<()> {
     let width = rt2.width;
     ensure!(rt2.row_keys.len() == width, "checkpointing a block without its key column");
     ensure!(cells.len() == width && wins.len() == width, "save_block: column lengths");
-    ensure!(cells.windows(2).all(|w| w[0] <= w[1]), "save_block: rows are not sorted by cell");
     for cell in &rt2.structure {
         if let Cell2::Clo(_, caps) = cell {
             ensure!(
@@ -152,12 +157,14 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
     off += (width * KEY_BYTES) as u64;
     let data_len = off as usize;
 
-    let mut index: Vec<(u32, u32)> = Vec::new();
+    let mut index: Vec<(u32, u32, u32)> = Vec::new();
     for (i, &c) in cells.iter().enumerate() {
-        if index.last().map(|e| e.0) != Some(c) {
-            index.push((c, i as u32));
+        match index.last_mut() {
+            Some(run) if run.0 == c => run.2 += 1,
+            _ => index.push((c, i as u32, 1)),
         }
     }
+    index.sort_unstable();
     let header = Header {
         width: width as u32,
         structure: rt2.structure.clone(),
@@ -171,7 +178,7 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
         wins: wins
             .iter()
             .enumerate()
-            .filter_map(|(i, &w)| w.then_some(i as u32))
+            .filter_map(|(i, &w)| w.then_some((i as u32, cells[i])))
             .collect(),
     };
     let header_bytes = bincode::serialize(&header).context("serializing checkpoint header")?;
@@ -289,48 +296,39 @@ impl FrameFile {
     /// cell - straight off the index, no row decoded. The UI export's
     /// per-cell state counts are exactly this.
     pub fn cell_counts(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        // Runs are sorted by cell: sum each cell's.
         let idx = &self.header.index;
-        idx.iter().enumerate().map(move |(i, &(cell, start))| {
-            let end = idx.get(i + 1).map(|e| e.1).unwrap_or(self.header.width);
-            (cell, end - start)
-        })
+        idx.chunk_by(|a, b| a.0 == b.0).map(|runs| (runs[0].0, runs.iter().map(|r| r.2).sum()))
     }
 
-    /// Every row's `(cell, key)` in file order (ascending by cell, then
-    /// key): the cell from the index, the key straight off the map.
+    /// Every row's `(cell, key)`, cell by cell (a cell's runs in file
+    /// order): the cell from the index, the key straight off the map.
     pub fn cell_keys(&self) -> impl Iterator<Item = (u32, (u64, u64))> + '_ {
-        let idx = &self.header.index;
-        idx.iter().enumerate().flat_map(move |(i, &(cell, start))| {
-            let end = idx.get(i + 1).map(|e| e.1).unwrap_or(self.header.width);
-            (start..end).map(move |r| (cell, self.key(r)))
-        })
+        self.header.index.iter().flat_map(move |&(cell, start, len)| (start..start + len).map(move |r| (cell, self.key(r))))
     }
 
-    /// The row range holding `cell` (empty if the file has none).
-    pub fn rows_of_cell(&self, cell: u32) -> std::ops::Range<u32> {
-        match self.header.index.binary_search_by_key(&cell, |e| e.0) {
-            Ok(i) => {
-                let start = self.header.index[i].1;
-                let end = self.header.index.get(i + 1).map(|e| e.1).unwrap_or(self.header.width);
-                start..end
-            }
-            Err(_) => 0..0,
-        }
+    /// Every row's `(row, (cell, key))`, cell by cell - `cell_keys` with the
+    /// row position, which is the row's id within this file.
+    pub fn cell_keys_rows(&self) -> impl Iterator<Item = (u32, (u32, (u64, u64)))> + '_ {
+        self.header.index.iter().flat_map(move |&(cell, start, len)| (start..start + len).map(move |r| (r, (cell, self.key(r)))))
+    }
+
+    /// The row ranges holding `cell`, ascending (empty if the file has none).
+    pub fn rows_of_cell(&self, cell: u32) -> Vec<std::ops::Range<u32>> {
+        let idx = &self.header.index;
+        let lo = idx.partition_point(|e| e.0 < cell);
+        let hi = idx.partition_point(|e| e.0 <= cell);
+        idx[lo..hi].iter().map(|&(_, s, n)| s..s + n).collect()
     }
 
     /// The win rows as `(shape, key, cell)` - the backward's seeds.
     pub fn wins(&self) -> Vec<(u64, (u64, u64), u32)> {
-        let mut out = Vec::with_capacity(self.header.wins.len());
-        let mut idx = 0usize;
-        for &r in &self.header.wins {
-            // Rows are sorted by cell and the win list ascends, so the
-            // index entry only ever moves forward.
-            while idx + 1 < self.header.index.len() && self.header.index[idx + 1].1 <= r {
-                idx += 1;
-            }
-            out.push((self.header.shape_hash, self.key(r), self.header.index[idx].0));
-        }
-        out
+        self.header.wins.iter().map(|&(r, cell)| (self.header.shape_hash, self.key(r), cell)).collect()
+    }
+
+    /// The win rows' positions with their cells.
+    pub fn win_rows(&self) -> &[(u32, u32)] {
+        &self.header.wins
     }
 
     fn key(&self, row: u32) -> (u64, u64) {
@@ -404,8 +402,8 @@ impl FrameFile {
             .header
             .index
             .iter()
-            .filter(|(c, _)| cells.contains(c))
-            .map(|(c, _)| self.rows_of_cell(*c))
+            .filter(|(c, _, _)| cells.contains(c))
+            .map(|&(_, s, n)| s..s + n)
             .collect();
         ranges.sort_by_key(|r| r.start);
         self.load_rows(&ranges)

@@ -33,6 +33,32 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 /// `from_state` / `to_state`.
 pub struct Block {
     rt2: Rt2,
+    /// The rows' stable ids `pack_id(layer, seq, row)` - set when the block
+    /// is a checkpointed layer's piece (or a piece being built for one);
+    /// empty for a block that is not part of a tree yet.
+    ids: Vec<u64>,
+    /// The piece's file seq within its layer (`s{shape}_{seq}.bin`).
+    seq: u32,
+}
+
+/// A state's stable id: its layer (the frame it was first reached), the
+/// piece file within that layer, and its row in the file. Assigned when
+/// the row is admitted (a piece is appended to in flush order, so the row's
+/// position in the file is known then), never renumbered.
+pub fn pack_id(layer: u32, seq: u32, row: u32) -> u64 {
+    ((layer as u64) << 48) | ((seq as u64) << 32) | row as u64
+}
+
+pub fn id_layer(id: u64) -> u32 {
+    (id >> 48) as u32
+}
+
+pub fn id_seq(id: u64) -> u32 {
+    ((id >> 32) & 0xffff) as u32
+}
+
+pub fn id_row(id: u64) -> u32 {
+    id as u32
 }
 
 impl Block {
@@ -47,7 +73,7 @@ impl Block {
             rt2.row_keys.len(),
             rt2.width
         );
-        Block { rt2 }
+        Block { rt2, ids: Vec::new(), seq: 0 }
     }
 
     /// A block from a reference-interpreter `State`, keyed by the one
@@ -57,7 +83,7 @@ impl Block {
         let (cart, cache) = crate::compiled::room_context()?;
         let mut rt2 = crate::compiled::bridge::import_block(state, cart, cache);
         rt2.row_keys_canonical();
-        Ok(Block { rt2 })
+        Ok(Block { rt2, ids: Vec::new(), seq: 0 })
     }
 
     /// The block as an interpreter `State` (`bridge::export_block`), for the
@@ -108,7 +134,28 @@ impl Block {
             return None;
         }
         self.rt2.retain_lanes(&keep);
+        if !self.ids.is_empty() {
+            self.ids = keep.iter().map(|&i| self.ids[i as usize]).collect();
+        }
         Some(self)
+    }
+
+    /// A piece of a layer: its rows' ids and its file seq.
+    pub fn with_ids(rt2: Rt2, ids: Vec<u64>, seq: u32) -> Self {
+        assert_eq!(ids.len(), rt2.width, "one id per row");
+        let mut b = Block::from_rt2(rt2);
+        b.ids = ids;
+        b.seq = seq;
+        b
+    }
+
+    /// The rows' ids (empty if the block is not a layer's piece).
+    pub fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+
+    pub fn seq(&self) -> u32 {
+        self.seq
     }
 
     /// The block's shard shape. A block is one shape.
@@ -534,8 +581,13 @@ pub struct ForwardSink<'a> {
     pub ids_in: Option<&'a [u64]>,
     /// Graph mode's output: `(target id, pred id)` per flushed row.
     pub graph_edges: Vec<(u32, u32)>,
-    /// This worker's next-frame rows, one block per shape.
-    pieces: rustc_hash::FxHashMap<u64, Rt2>,
+    /// This worker's next-frame rows, one piece per shape: the block, its
+    /// file seq in the layer (`worker * 256 + k`), and its rows' ids.
+    pieces: rustc_hash::FxHashMap<u64, (Rt2, u32, Vec<u64>)>,
+    /// The frame being computed (the layer the new rows belong to) and
+    /// this worker's index: what a new row's id is made of.
+    frame: u32,
+    worker: u32,
     pub won: bool,
     pub kept: usize,
     pub flushes: u64,
@@ -543,6 +595,7 @@ pub struct ForwardSink<'a> {
     sort_buf: Vec<((u64, u64), u32)>,
     keys_buf: Vec<(u64, u64)>,
     new_buf: Vec<u32>,
+    ids_buf: Vec<u64>,
     rows_buf: Vec<u32>,
     /// Record `edges` at all (off for the backward, which has the graph).
     pub edges_on: bool,
@@ -579,6 +632,8 @@ impl<'a> ForwardSink<'a> {
             ids_in: None,
             graph_edges: Vec::new(),
             pieces: Default::default(),
+            frame: 0,
+            worker: 0,
             won: false,
             kept: 0,
             flushes: 0,
@@ -586,6 +641,7 @@ impl<'a> ForwardSink<'a> {
             sort_buf: Vec::with_capacity(QUEUE_ROWS),
             keys_buf: Vec::with_capacity(QUEUE_ROWS),
             new_buf: Vec::with_capacity(QUEUE_ROWS),
+            ids_buf: Vec::with_capacity(QUEUE_ROWS),
             rows_buf: Vec::with_capacity(QUEUE_ROWS),
             edges_on,
             edges: Default::default(),
@@ -596,11 +652,20 @@ impl<'a> ForwardSink<'a> {
         }
     }
 
-    /// A forward worker's sink: flushes through `door` (and `filter`).
-    pub fn forward(door: &'a crate::search::door::Door, filter: Option<&'a MarkFilter<'a>>, edges_on: bool) -> Self {
+    /// Worker `worker`'s sink for `frame`: flushes through `door` (and
+    /// `filter`); its pieces' rows get ids in layer `frame`.
+    pub fn forward(
+        door: &'a crate::search::door::Door,
+        filter: Option<&'a MarkFilter<'a>>,
+        edges_on: bool,
+        frame: u32,
+        worker: u32,
+    ) -> Self {
         let mut s = Self::empty(edges_on);
         s.door = Some(door);
         s.filter = filter;
+        s.frame = frame;
+        s.worker = worker;
         s
     }
 
@@ -745,14 +810,26 @@ impl<'a> ForwardSink<'a> {
             self.keys_buf.clear();
             self.keys_buf.extend(self.sort_buf.iter().map(|e| e.0));
             self.new_buf.clear();
-            door.admit(slot.shape, slot.cell, &self.keys_buf, &mut self.new_buf);
+            self.ids_buf.clear();
+            // The piece the new rows land in, and the id the first of them
+            // gets: the door hands the k-th new key `first_new + k`, and the
+            // rows are appended in that same order.
+            let n_pieces = self.pieces.len() as u32;
+            let (frame, worker) = (self.frame, self.worker);
+            let (piece, seq, ids) = self
+                .pieces
+                .entry(slot.shape)
+                .or_insert_with(|| (slot.empty_piece(), worker * 256 + n_pieces, Vec::new()));
+            let first_new = pack_id(frame, *seq, piece.width as u32);
+            door.admit(slot.shape, slot.cell, &self.keys_buf, first_new, &mut self.ids_buf, &mut self.new_buf);
             if !self.new_buf.is_empty() {
                 self.rows_buf.clear();
                 self.rows_buf.extend(self.new_buf.iter().map(|&i| self.sort_buf[i as usize].1));
                 self.kept += self.rows_buf.len();
                 self.won |= slot.any_win(&self.rows_buf)?;
-                let piece = self.pieces.entry(slot.shape).or_insert_with(|| slot.empty_piece());
                 slot.gather_into(piece, &self.rows_buf);
+                ids.extend((0..self.rows_buf.len() as u32).map(|k| first_new + k as u64));
+                debug_assert_eq!(ids.len(), piece.width);
             }
             slot.clear();
         }
@@ -769,26 +846,27 @@ impl<'a> ForwardSink<'a> {
     /// End of the worker's frame: flush every live queue, hand back the
     /// pieces. The counters (`kept`, `won`, `flushes`, ...) are final only
     /// after this.
-    pub fn finish(&mut self) -> Result<Vec<Rt2>> {
+    pub fn finish(&mut self) -> Result<Vec<Block>> {
         for q in 0..self.slots.len() {
             if self.slots[q].live {
                 self.flush(q)?;
             }
         }
-        let mut pieces: Vec<Rt2> = std::mem::take(&mut self.pieces).into_values().collect();
-        // A queue's columns are typed by its skeleton, not by its rows: a
-        // column every row agrees on goes back to the uniform it is (the
-        // old append step's rule; the State bridge, which the reference
-        // engine's rows cross, has no per-lane form for an unknown bool).
-        for p in &mut pieces {
+        let mut out = Vec::new();
+        for (mut p, seq, ids) in std::mem::take(&mut self.pieces).into_values() {
+            // A queue's columns are typed by its skeleton, not by its rows: a
+            // column every row agrees on goes back to the uniform it is (the
+            // old append step's rule; the State bridge, which the reference
+            // engine's rows cross, has no per-lane form for an unknown bool).
             for c in p.cols.iter_mut() {
                 if !matches!(c, Col::U(_)) {
                     let taken = std::mem::replace(c, Col::U(AV::Nil));
                     *c = celeste_engine::runtime2::collapse_uniform(taken);
                 }
             }
+            out.push(Block::with_ids(p, ids, seq));
         }
-        Ok(pieces)
+        Ok(out)
     }
 
     /// Bytes allocated across the pool (capacities).
@@ -957,6 +1035,7 @@ pub fn forward_frame(
     door: &crate::search::door::Door,
     pos: Option<&crate::search::pos_graph::PosObserver>,
     filter: Option<&MarkFilter>,
+    frame: u32,
 ) -> Result<(Vec<Block>, bool, FrameStats)> {
     use std::time::Instant;
     let mut st = FrameStats::default();
@@ -975,7 +1054,7 @@ pub fn forward_frame(
 
     let t = Instant::now();
     struct Done {
-        pieces: Vec<Rt2>,
+        pieces: Vec<Block>,
         won: bool,
         kept: usize,
         flushes: u64,
@@ -987,7 +1066,7 @@ pub fn forward_frame(
     }
     let done: Vec<Done> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
-            .map(|_| {
+            .map(|w| {
                 let (frontier, cells, units, next_unit) = (&frontier, &cells, &units, &next_unit);
                 // The kernels' spill frames are large (hundreds of KB at
                 // level 0, more at the finer rungs, whose graphs are bigger);
@@ -995,7 +1074,7 @@ pub fn forward_frame(
                 // level 1 (2026-09-13).
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
                     let t = Instant::now();
-                    let mut sink = ForwardSink::forward(door, filter, pos.is_some());
+                    let mut sink = ForwardSink::forward(door, filter, pos.is_some(), frame, w as u32);
                     loop {
                         let u = next_unit.fetch_add(1, Ordering::Relaxed);
                         let Some(&(bi, lo, hi)) = units.get(u) else { break };
@@ -1032,7 +1111,7 @@ pub fn forward_frame(
     st.door_bytes = door.alloc_bytes();
 
     let mut won = false;
-    let mut pieces: Vec<Rt2> = Vec::new();
+    let mut pieces: Vec<Block> = Vec::new();
     for d in done {
         st.lanes_raw += d.emitted as usize;
         st.lanes_kept += d.kept;
@@ -1049,7 +1128,7 @@ pub fn forward_frame(
     // by (cell, key) in place, which is the order the next frame's units
     // follow; a cell's rows may sit in several pieces (one per worker
     // that flushed it), which only the door's delta ever sees.
-    let next: Vec<Block> = pieces.into_iter().map(Block::from_rt2).collect();
+    let next: Vec<Block> = pieces;
     st.rss_end = crate::metrics::current_rss_gb();
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
@@ -1125,11 +1204,11 @@ impl Tree {
         let mut loaded = 0usize;
         for layer in &self.layers[..=upto as usize] {
             for file in layer {
-                let r = file.rows_of_cell(cell);
-                if r.is_empty() {
+                let rs = file.rows_of_cell(cell);
+                if rs.is_empty() {
                     continue;
                 }
-                let Some(rows) = file.load_rows(&[r])? else { continue };
+                let Some(rows) = file.load_rows(&rs)? else { continue };
                 loaded += rows.width;
                 match by_shape.iter_mut().find(|b| b.shape_hash == rows.shape_hash) {
                     Some(acc) => {
@@ -1353,21 +1432,19 @@ impl ForwardState {
     /// Frame 0: seed the visited set from `initial`, checkpoint it, start
     /// recording the position graph if `record`.
     pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool) -> Result<Self> {
+        // The checkpoint assigns the initial rows their ids (layer 0); the
+        // door then takes each row under that id.
+        checkpoint_frontier(dir, 0, &mut initial)?;
         let door = crate::search::door::Door::new();
         for b in &initial {
             let cells = b.positions()?;
             let shape = b.shard_shape();
-            let mut rows: Vec<(u32, (u64, u64))> = cells.iter().copied().zip(b.keys().iter().copied()).collect();
-            rows.sort_unstable();
-            rows.dedup();
-            let mut new = Vec::new();
-            for run in rows.chunk_by(|a, b| a.0 == b.0) {
-                let keys: Vec<(u64, u64)> = run.iter().map(|r| r.1).collect();
-                door.admit(shape, run[0].0, &keys, &mut new);
+            let (mut new, mut ids) = (Vec::new(), Vec::new());
+            for ((&cell, &key), &id) in cells.iter().zip(b.keys()).zip(b.ids()) {
+                door.admit(shape, cell, &[key], id, &mut ids, &mut new);
             }
         }
         door.end_frame(1);
-        checkpoint_frontier(dir, 0, &mut initial)?;
         Ok(ForwardState {
             frontier: initial,
             door,
@@ -1392,6 +1469,13 @@ impl ForwardState {
         let Some(last) = last else { return Ok(None) };
         let t = std::time::Instant::now();
         // Every layer's keys into the door, one file per unit of work.
+        let seq_of = |p: &std::path::Path| -> u32 {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .and_then(|n| n.trim_end_matches(".bin").rsplit('_').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        };
         let files: Vec<(u32, std::path::PathBuf)> = (0..=last)
             .flat_map(|f| {
                 let fdir = dir.join("frames").join(format!("f{:03}", f));
@@ -1404,21 +1488,22 @@ impl ForwardState {
             })
             .collect();
         let next = AtomicUsize::new(0);
-        let partial: Vec<(rustc_hash::FxHashMap<(u64, u32), Vec<(u64, u64)>>, Option<u32>)> =
+        let partial: Vec<(rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>>, Option<u32>)> =
             std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..threads())
                     .map(|_| {
-                        let (files, next) = (&files, &next);
+                        let (files, next, seq_of) = (&files, &next, &seq_of);
                         scope.spawn(move || -> Result<_> {
-                            let mut m: rustc_hash::FxHashMap<(u64, u32), Vec<(u64, u64)>> = Default::default();
+                            let mut m: rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>> = Default::default();
                             let mut win: Option<u32> = None;
                             loop {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
                                 let Some((f, path)) = files.get(i) else { break };
                                 let file = crate::search::checkpoint::FrameFile::open(path)?;
                                 let shape = file.shape_hash();
-                                for (cell, key) in file.cell_keys() {
-                                    m.entry((shape, cell)).or_default().push(key);
+                                let seq = seq_of(path);
+                                for (row, (cell, key)) in file.cell_keys_rows() {
+                                    m.entry((shape, cell)).or_default().push((key, pack_id(*f, seq, row)));
                                 }
                                 if !file.wins().is_empty() {
                                     win = Some(win.map_or(*f, |w| w.min(*f)));
@@ -1430,7 +1515,7 @@ impl ForwardState {
                     .collect();
                 handles.into_iter().map(|h| h.join().expect("resume loader panicked")).collect::<Result<Vec<_>>>()
             })?;
-        let mut shards: rustc_hash::FxHashMap<(u64, u32), Vec<(u64, u64)>> = Default::default();
+        let mut shards: rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>> = Default::default();
         let mut win_frame: Option<u32> = None;
         for (m, w) in partial {
             for (k, mut v) in m {
@@ -1492,7 +1577,7 @@ impl ForwardState {
             let t_frame = std::time::Instant::now();
             let frontier = std::mem::take(&mut self.frontier);
             let (mut next, won, st) =
-                forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filter)?;
+                forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filter, frame)?;
             let t = std::time::Instant::now();
             checkpoint_frontier(dir, frame, &mut next)?;
             let t_ckpt = t.elapsed();
@@ -1624,24 +1709,23 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
     // Fresh: a re-run / resumed frame must not leave stale files behind.
     let _ = std::fs::remove_dir_all(&fdir);
     std::fs::create_dir_all(&fdir)?;
-    // One file per block (an owner's piece of a shape), written in
-    // parallel. Canonical order inside each: by (cell, key), and the block
-    // itself is sorted in place, so the file order and the kernel's lane
-    // order agree and neither depends on how the frame was scheduled.
+    // One file per piece, written in parallel, in the piece's own row
+    // order: a row's position is its id (`pack_id`), assigned when it was
+    // admitted. A block without ids (the initial frontier) gets them here.
     std::thread::scope(|scope| {
         let handles: Vec<_> = frontier
             .iter_mut()
             .enumerate()
-            .map(|(seq, block)| {
+            .map(|(i, block)| {
                 let fdir = &fdir;
                 scope.spawn(move || -> Result<()> {
+                    if block.ids.is_empty() {
+                        block.seq = i as u32;
+                        block.ids = (0..block.lanes() as u32).map(|r| pack_id(frame, i as u32, r)).collect();
+                    }
                     let cells = block.positions()?;
-                    let mut perm: Vec<u32> = (0..block.lanes() as u32).collect();
-                    perm.sort_unstable_by_key(|&i| (cells[i as usize], block.rt2.row_keys[i as usize]));
-                    block.rt2.gather_lanes(&perm);
-                    let cells: Vec<u32> = perm.iter().map(|&i| cells[i as usize]).collect();
                     let wins = block.wins()?;
-                    let path = fdir.join(format!("s{:016x}_{:03}.bin", block.shard_shape(), seq));
+                    let path = fdir.join(format!("s{:016x}_{:04}.bin", block.shard_shape(), block.seq));
                     crate::search::checkpoint::save_block(&path, &block.rt2, &cells, &wins)
                 })
             })
@@ -1673,12 +1757,42 @@ pub fn frame_files(
 /// Load every block of a checkpointed frame.
 pub fn load_frame(dir: &std::path::Path, frame: u32) -> Result<Vec<Block>> {
     let mut out = Vec::new();
-    for file in frame_files(dir, frame)? {
+    for (seq, file) in frame_files_seq(dir, frame)? {
         if let Some(rt2) = file.load_all()? {
-            out.push(Block::from_rt2(rt2));
+            let ids: Vec<u64> = (0..rt2.width as u32).map(|r| pack_id(frame, seq, r)).collect();
+            out.push(Block::with_ids(rt2, ids, seq));
         }
     }
     Ok(out)
+}
+
+/// A frame's files with their seq (from the name `s{shape}_{seq}.bin`).
+pub fn frame_files_seq(
+    dir: &std::path::Path,
+    frame: u32,
+) -> Result<Vec<(u32, crate::search::checkpoint::FrameFile)>> {
+    let fdir = dir.join("frames").join(format!("f{:03}", frame));
+    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            n.starts_with('s') && n.ends_with(".bin")
+        })
+        .collect();
+    names.sort();
+    names
+        .iter()
+        .map(|p| {
+            let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let seq: u32 = n
+                .trim_end_matches(".bin")
+                .rsplit('_')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow::anyhow!("{}: no seq in the file name", p.display()))?;
+            Ok((seq, crate::search::checkpoint::FrameFile::open(p)?))
+        })
+        .collect()
 }
 
 /// Load only the ROWS whose cell is in `cells` - the backward's per-cell
