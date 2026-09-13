@@ -525,4 +525,17 @@ re-pushed row: raw +16%, and the same (target, slice) recorded up to
 3.5x); the wave is 3.0-3.2 s -> 3.65 s with recording (+15-20%: the
 write-back probe per flushed row, the merge cache, the 18 B/record
 stream). The naive compaction (one permutation sort per layer) was
-17 s/frame; the bucketed one is measured below.
+17 s/frame; range buckets + pdqsort 2.3 s; the parallel counting sort on
+the target's dense rank (layers >= 4M records; smaller layers
+comparison-sorted whole, several at a time) 1.2 s, for 605 MB of runs
+per frame (5.0 B/pair) - BENCHMARK_DATA.md. f0-f44: 204 MB of runs
+beside 315 MB of frames.
+
+**Left on the table.** The compaction is serial with the frame (it runs
+before the checkpoint, so a resume can trust the runs it finds); it
+could overlap the next wave behind a `done` marker for ~1 s/frame at
+f70. Wider masks (64 lanes: adjacent slices of one call often share a
+target - the sample's base deltas were p90 32) would cut pairs 2-3x.
+The kernel walk (`backward_run`, ~250 lines with `Tree::cell_rows`,
+`TargetSet`, `ForwardSink::backward`) stays as the BFS's oracle until a
+full room's marks have been reproduced end to end, then goes.
