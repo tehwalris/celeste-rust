@@ -4470,3 +4470,33 @@ iteration, which is inherent to the layer-anchored walk. What remains of
 a horizon's cost at H=99 (~190 s): level 0's backward 24 s, level 1's
 forward + backward 50 s, then the finer levels, each a filtered forward to
 H plus a backward, 2-20 s apiece.
+
+## The append loop (2026-09-14, `rewrite bench-frame --frame 70`, 32 threads, release)
+
+The microbenchmark: level 0's f70 frontier (5.2M rows) through
+`forward_frame` three times, empty visited set. `emit` is the kernel plus
+the append loop around it; `own` the door and the piece appends.
+
+| step | emit | own | raw rows |
+|---|---|---|---|
+| baseline (`c6d4716`) | 2.00 s | 0.34 s | 31.7M |
+| pack from column views (no `col.at()` per value) | 1.90 s | | |
+| per-lane dedup (WRONG: the ~8x re-emission is cross-lane) | 9.2 s | | 272M |
+| bounded direct-mapped dedup cache, typed staging + owner partition | 1.73 s | | 33.5M |
+| one shared 512 KB cache, per-thread scratch | 1.63 s | | 40.5M |
+| rows written once into typed per-(owner, outcome) slots; no staging | **1.28 s** | 0.34 s | 40.5M |
+
+Profile at the end (whole bench): kernel 38%, `push_row` 9%, dedup cache
+9%, the loop 8%, own ~11%, `gather_into` 3%. Per emitted row the append
+went from ~1.0 us of thread time to ~0.45 us. Level-0 forward f0-f89:
+65.6 s -> 52.7 s; f70: 2.22 -> 1.70 s (emit 1.78 -> 1.25 s); peak RSS
+12.3 -> 10.5 GB. ckhash, pos-graph and marks gates identical; suite 105.
+
+Two things the gates caught on the way: a `key == last_key` shortcut
+before the dedup cache skipped the backward's hit propagation (marks
+gate: 45 marks instead of 48); and slots keyed by output SHAPE collide
+when two outcomes of a kernel share a shape but differ in which cells
+vary (a crash at f45+; the previous Rt2 slots silently dropped the
+differing cell's value into the other outcome's uniform column - it
+never fired at level 0, the fingerprints say, but it was a hole). Slots
+are keyed per outcome template; the owner merges same-shape slots.

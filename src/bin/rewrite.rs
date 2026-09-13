@@ -101,6 +101,20 @@ enum Command {
         #[arg(long)]
         cells: Option<usize>,
     },
+    /// Microbenchmark of ONE forward frame: load a checkpointed frame of a
+    /// level-0 tree and run `forward_frame` on it `reps` times (empty
+    /// visited set, no filter, no pos-graph), printing the per-rep phase
+    /// times. Isolates the kernel + append loop from the search around it.
+    BenchFrame {
+        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
+        checkpoint_dir: String,
+        #[arg(long, default_value_t = 70)]
+        frame: u32,
+        #[arg(long, default_value_t = 3)]
+        reps: usize,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+    },
     /// Extract a concrete input sequence that wins by `horizon` from one
     /// level's marks: a DFS from the initial state through the reference
     /// engine's concrete single-input step, admitting a successor only if
@@ -334,6 +348,56 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        Command::BenchFrame {
+            checkpoint_dir,
+            frame,
+            reps,
+            room,
+        } => {
+            use celeste_rust::frame::{forward_frame, load_frame, threads, Block, Visited};
+            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            set_rem_precision(RemPrecision::Bits(0));
+            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+            let dir = std::path::Path::new(&checkpoint_dir).join("level00");
+            let t = std::time::Instant::now();
+            let frontier = load_frame(&dir, frame)?;
+            let lanes: usize = frontier.iter().map(Block::lanes).sum();
+            eprintln!(
+                "[bench] f{frame}: {} blocks, {lanes} lanes loaded in {:.2} s; {} threads",
+                frontier.len(),
+                t.elapsed().as_secs_f64(),
+                threads()
+            );
+            // Warm the kernel registry outside the timed reps.
+            {
+                let b = Block::from_rt2(frontier[0].rt2().clone_block());
+                let n = b.lanes();
+                let mask: Vec<bool> = (0..n).map(|i| i < 64).collect();
+                let small = vec![b.keep(&mask).expect("a non-empty block")];
+                let mut v: Vec<Visited> = (0..threads()).map(|_| Visited::new()).collect();
+                forward_frame(&engine, small, &mut v, None, None)?;
+            }
+            for rep in 0..reps {
+                let input: Vec<Block> = frontier.iter().map(|b| Block::from_rt2(b.rt2().clone_block())).collect();
+                let mut visited: Vec<Visited> = (0..threads()).map(|_| Visited::new()).collect();
+                let t = std::time::Instant::now();
+                let (next, _won, st) = forward_frame(&engine, input, &mut visited, None, None)?;
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+                println!(
+                    "[bench] rep {rep}: raw {} kept {} | emit {:.0} ms (idle {:.0}%) own {:.0} ms (idle {:.0}%) total {:.0} ms | {} out blocks",
+                    st.lanes_raw,
+                    st.lanes_kept,
+                    ms(st.t_emit),
+                    st.emit_idle * 100.0,
+                    ms(st.t_own),
+                    st.own_idle * 100.0,
+                    ms(t.elapsed()),
+                    next.len()
+                );
+            }
+            celeste_rust::compiled::dispatch::print_kernel_hits();
         }
         Command::Witness {
             checkpoint_dir,

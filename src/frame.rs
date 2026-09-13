@@ -14,7 +14,8 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::interpreter::state::State;
-use celeste_engine::runtime2::Rt2;
+use celeste_core::pico8_num::Pico8Num as P8;
+use celeste_engine::runtime2::{Col, Rt2, AV};
 
 /// The data currency (interface #2). A columnar batch of lanes - the engine's
 /// own block (`Rt2`: one shape, one column per value cell, the key column the
@@ -178,11 +179,216 @@ pub fn owner_of(owners: u32, shape: u64, cell: u32) -> u32 {
     (h % owners as u64) as u32
 }
 
-/// Rows emitted for one owner at one output shape: a packed block (its key
-/// column filled as rows land) and the rows' cells.
+/// A typed varying column of emitted rows, as the kernel writes it: raw
+/// 16.16 words, (low, high) pairs, or a tri-state byte per bool (0 false,
+/// 1 true, 2 unknown).
+pub enum TCol {
+    Num(Vec<u32>),
+    Ival(Vec<(u32, u32)>),
+    Bool(Vec<u8>),
+}
+
+/// Rows emitted for one owner at one outcome, written ONCE, typed column by
+/// typed column: the outcome's skeleton (canonical structure, the uniform
+/// columns), one `TCol` per varying cell, the key and cell per row. The
+/// owner gathers the rows it keeps straight from here into its pieces.
 pub struct Slot {
-    pub rt2: Rt2,
+    pub owner: u32,
+    pub shape: u64,
+    skeleton: Rt2,
+    /// `(cell, column)` per varying cell, in the kernel's order.
+    pub cols: Vec<(usize, TCol)>,
+    pub keys: Vec<(u64, u64)>,
     pub cells: Vec<u32>,
+}
+
+impl Slot {
+    /// A slot over `skeleton`: a width-0 block whose varying cells hold
+    /// EMPTY typed columns (`Col::N`/`Col::I` for numbers / intervals,
+    /// `Col::V` for bools) and whose other cells are uniform.
+    pub fn new(owner: u32, skeleton: Rt2) -> Self {
+        let cols = skeleton
+            .cols
+            .iter()
+            .enumerate()
+            .filter_map(|(cell, c)| match c {
+                Col::N(_) => Some((cell, TCol::Num(Vec::new()))),
+                Col::I(_) => Some((cell, TCol::Ival(Vec::new()))),
+                Col::V(_) => Some((cell, TCol::Bool(Vec::new()))),
+                Col::U(_) => None,
+            })
+            .collect();
+        Slot { owner, shape: skeleton.shape_hash, skeleton, cols, keys: Vec::new(), cells: Vec::new() }
+    }
+
+    pub fn rows(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// An empty block of this slot's shape for the rows to land in.
+    pub fn empty_piece(&self) -> Rt2 {
+        let mut b = celeste_engine::slots::reshape(&self.skeleton, 0);
+        b.cols = self
+            .skeleton
+            .cols
+            .iter()
+            .map(|c| match c {
+                Col::N(_) => Col::N(Vec::new()),
+                Col::I(_) => Col::I(Vec::new()),
+                Col::V(_) => Col::V(Vec::new()),
+                u => u.clone(),
+            })
+            .collect();
+        b.shape_hash = self.shape;
+        b
+    }
+
+    /// Append `rows` of this slot to `piece` (a block of this shape).
+    /// Typed columns extend the piece's typed columns directly; a cell
+    /// that the piece holds differently (uniform here, varying there, or
+    /// two outcomes' uniform values disagreeing) goes through `col_push`.
+    pub fn gather_into(&self, piece: &mut Rt2, rows: &[u32]) {
+        use celeste_engine::runtime2::col_push;
+        let w = piece.width;
+        let mut ti = 0;
+        for (cell, c) in self.skeleton.cols.iter().enumerate() {
+            if !matches!(piece.structure[cell], celeste_engine::runtime2::Cell2::Val) {
+                continue;
+            }
+            let typed = if ti < self.cols.len() && self.cols[ti].0 == cell {
+                ti += 1;
+                Some(&self.cols[ti - 1].1)
+            } else {
+                None
+            };
+            let dst = &mut piece.cols[cell];
+            match (typed, c) {
+                (None, Col::U(v)) => {
+                    if !matches!(dst, Col::U(d) if d == v) {
+                        for (n, _) in rows.iter().enumerate() {
+                            col_push(dst, w + n, *v);
+                        }
+                    }
+                }
+                (None, _) => unreachable!("a non-uniform skeleton column without a typed column"),
+                (Some(TCol::Num(v)), _) => match dst {
+                    Col::N(d) => d.extend(rows.iter().map(|&r| P8::from_raw(v[r as usize] as i32))),
+                    _ => {
+                        for (n, &r) in rows.iter().enumerate() {
+                            col_push(dst, w + n, AV::Num(P8::from_raw(v[r as usize] as i32)));
+                        }
+                    }
+                },
+                (Some(TCol::Ival(v)), _) => match dst {
+                    Col::I(d) => d.extend(rows.iter().map(|&r| {
+                        let (a, b) = v[r as usize];
+                        (P8::from_raw(a as i32), P8::from_raw(b as i32))
+                    })),
+                    _ => {
+                        for (n, &r) in rows.iter().enumerate() {
+                            let (a, b) = v[r as usize];
+                            col_push(dst, w + n, AV::Ival(P8::from_raw(a as i32), P8::from_raw(b as i32)));
+                        }
+                    }
+                },
+                (Some(TCol::Bool(v)), _) => {
+                    let av = |r: u32| match v[r as usize] {
+                        0 => AV::Bool(false),
+                        1 => AV::Bool(true),
+                        _ => AV::UBool,
+                    };
+                    match dst {
+                        Col::V(d) => d.extend(rows.iter().map(|&r| av(r))),
+                        _ => {
+                            for (n, &r) in rows.iter().enumerate() {
+                                col_push(dst, w + n, av(r));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        piece.row_keys.extend(rows.iter().map(|&r| self.keys[r as usize]));
+        piece.width = w + rows.len();
+    }
+
+    /// The whole slot as a block (the ladder filter and the checks read
+    /// blocks).
+    pub fn to_rt2(&self) -> Rt2 {
+        let mut b = self.empty_piece();
+        let all: Vec<u32> = (0..self.rows() as u32).collect();
+        self.gather_into(&mut b, &all);
+        b
+    }
+
+    /// Does any of `rows` sit on the win target? `wins_of`'s test on the
+    /// slot's columns: the target cells are uniform in the skeleton or
+    /// typed numbers here.
+    pub fn any_win(&self, rows: &[u32]) -> Result<bool> {
+        let ids = crate::compiled::ids();
+        let sk = &self.skeleton;
+        let num_at = |cell: u32| -> Result<NumView<'_>> {
+            match &sk.cols[cell as usize] {
+                Col::U(AV::Num(n)) => Ok(NumView::Uniform(*n)),
+                Col::N(_) => match self.cols.iter().find(|(c, _)| *c == cell as usize) {
+                    Some((_, TCol::Num(v))) => Ok(NumView::Rows(v)),
+                    _ => anyhow::bail!("any_win: cell {cell} is not a typed number column"),
+                },
+                other => anyhow::bail!("any_win: cell {cell} is not a number: {:?}", other),
+            }
+        };
+        if let Some((tx, ty)) = crate::interpreter::abstraction::synthetic_win_xy() {
+            let Some(obj) = crate::search::pos_graph::player_object(sk) else {
+                return Ok(false);
+            };
+            let (Some(cx), Some(cy)) = (sk.obj_field_cell(obj, ids.f_x), sk.obj_field_cell(obj, ids.f_y)) else {
+                return Ok(false);
+            };
+            let (xs, ys) = (num_at(cx)?, num_at(cy)?);
+            return Ok(rows.iter().any(|&r| {
+                xs.at(r).whole_part_as_i16() == tx && ys.at(r).whole_part_as_i16() == ty
+            }));
+        }
+        let want = P8::from_i16(crate::game_runner::win_room_x());
+        let room = sk.global_target(ids.g_room).ok_or_else(|| anyhow::anyhow!("any_win: no `room` global"))?;
+        let x = sk.obj_field_cell(room, ids.f_x).ok_or_else(|| anyhow::anyhow!("any_win: room has no x"))?;
+        let xs = num_at(x)?;
+        Ok(rows.iter().any(|&r| xs.at(r) == want))
+    }
+
+    /// Push one materialized row (the reference engine's path): its
+    /// varying cells' values into the typed columns.
+    pub fn push_row(&mut self, row: &Rt2, key: (u64, u64), cell: u32) {
+        debug_assert_eq!(row.width, 1);
+        for (c, col) in self.cols.iter_mut() {
+            let v = row.cols[*c].at(0);
+            match (col, v) {
+                (TCol::Num(d), AV::Num(n)) => d.push(n.as_raw_u32()),
+                (TCol::Ival(d), AV::Ival(a, b)) => d.push((a.as_raw_u32(), b.as_raw_u32())),
+                (TCol::Ival(d), AV::Num(n)) => d.push((n.as_raw_u32(), n.as_raw_u32())),
+                (TCol::Bool(d), AV::Bool(x)) => d.push(x as u8),
+                (TCol::Bool(d), AV::UBool) => d.push(2),
+                (_, v) => panic!("emitted row's cell {c} holds {v:?}, not its column's kind"),
+            }
+        }
+        self.keys.push(key);
+        self.cells.push(cell);
+    }
+}
+
+/// A number column of a slot as `any_win` reads it.
+enum NumView<'a> {
+    Uniform(P8),
+    Rows(&'a [u32]),
+}
+
+impl NumView<'_> {
+    fn at(&self, row: u32) -> P8 {
+        match self {
+            NumView::Uniform(n) => *n,
+            NumView::Rows(v) => P8::from_raw(v[row as usize] as i32),
+        }
+    }
 }
 
 /// What a frame step EMITS INTO (interface #1's output side): one worker's
@@ -196,8 +402,14 @@ pub struct Slot {
 /// within-call dedup is the only dedup at emission.
 pub struct ForwardSink<'a> {
     pub owners: u32,
-    /// `(owner, output shape)` -> the rows emitted for it.
-    pub slots: rustc_hash::FxHashMap<(u32, u64), Slot>,
+    /// The rows emitted, one slot per (owner, outcome).
+    pub slots: Vec<Slot>,
+    /// `(owner, outcome id)` -> slot. The outcome id is the emitter's: a
+    /// kernel's template address, the reference engine's shape hash. Two
+    /// outcomes can share a shape and differ in which cells vary, so the
+    /// shape is not the key; the owner merges same-shape slots into one
+    /// piece (`Slot::gather_into` handles the differing cells).
+    index: rustc_hash::FxHashMap<(u32, u64), usize>,
     /// Record `edges` at all (off for the backward, which has the graph).
     pub edges_on: bool,
     /// The distinct edges this worker produced (a set: a block's rows fan
@@ -221,7 +433,8 @@ impl<'a> ForwardSink<'a> {
     pub fn new(owners: u32, edges_on: bool) -> Self {
         ForwardSink {
             owners,
-            slots: Default::default(),
+            slots: Vec::new(),
+            index: Default::default(),
             edges_on,
             edges: Default::default(),
             emitted: 0,
@@ -250,26 +463,40 @@ impl<'a> ForwardSink<'a> {
         &self.hits
     }
 
-    /// The slot for `(owner, shape)`, created from `init` on first use.
-    pub fn slot(&mut self, owner: u32, shape: u64, init: impl FnOnce() -> Rt2) -> &mut Slot {
-        self.slots
-            .entry((owner, shape))
-            .or_insert_with(|| Slot { rt2: init(), cells: Vec::new() })
+    /// The index of the slot for `(owner, outcome)`, created over the
+    /// skeleton `init` returns on first use.
+    pub fn slot_id(&mut self, owner: u32, outcome: u64, init: impl FnOnce() -> Rt2) -> usize {
+        *self.index.entry((owner, outcome)).or_insert_with(|| {
+            self.slots.push(Slot::new(owner, init()));
+            self.slots.len() - 1
+        })
     }
 
     /// Emit one materialized single-row block at `cell` (the reference
-    /// engine's path; the kernels push fields into the slot directly).
+    /// engine's path; the kernels push into the slots directly).
     pub fn emit_row(&mut self, row: &Rt2, cell: u32) {
         debug_assert_eq!(row.width, 1);
         debug_assert_eq!(row.row_keys.len(), 1, "an emitted row carries its key");
         let owner = owner_of(self.owners, row.shape_hash, cell);
-        let slot = self.slot(owner, row.shape_hash, || {
+        let id = self.slot_id(owner, row.shape_hash, || {
+            // The skeleton from the row itself: numeric and boolean cells
+            // vary (typed, empty), the rest is uniform - which every row
+            // of a shape agrees on, the shape hash being the structure.
             let mut b = celeste_engine::slots::reshape(row, 0);
+            b.cols = row
+                .cols
+                .iter()
+                .map(|c| match c.at(0) {
+                    AV::Num(_) => Col::N(Vec::new()),
+                    AV::Ival(..) => Col::I(Vec::new()),
+                    AV::Bool(_) | AV::UBool => Col::V(Vec::new()),
+                    v => Col::U(v),
+                })
+                .collect();
             b.shape_hash = row.shape_hash;
             b
         });
-        slot.rt2.append_rows(row, &[0]);
-        slot.cells.push(cell);
+        self.slots[id].push_row(row, row.row_keys[0], cell);
         self.emitted += 1;
     }
 }
@@ -468,23 +695,24 @@ pub fn forward_frame(
                     let mut pieces: rustc_hash::FxHashMap<u64, Rt2> = Default::default();
                     let (mut kept_n, mut won) = (0usize, false);
                     for sink in sinks {
-                        for (&(owner, shape), slot) in &sink.slots {
-                            if owner != o as u32 {
+                        for slot in &sink.slots {
+                            if slot.owner != o as u32 {
                                 continue;
                             }
-                            crate::compiled::asm_kernel::key_check(&slot.rt2);
+                            let shape = slot.shape;
+                            crate::compiled::asm_kernel::key_check(slot);
                             // Ladder filter (coarser level's marked set), then
                             // the door: `&&` short-circuits, so a filtered-out
                             // row is never inserted into `visited`.
                             let allow = match filter {
-                                Some(f) => Some(f.allowed(&slot.rt2)?),
+                                Some(f) => Some(f.allowed(&slot.to_rt2())?),
                                 None => None,
                             };
                             // The door, one shard lookup per run of rows at
                             // the same cell (a slice's lanes are spatially
                             // sorted, so runs are common).
                             let mut rows: Vec<u32> = Vec::new();
-                            let (keys, cells) = (&slot.rt2.row_keys, &slot.cells);
+                            let (keys, cells) = (&slot.keys, &slot.cells);
                             let mut i = 0;
                             while i < keys.len() {
                                 let cell = cells[i];
@@ -504,14 +732,9 @@ pub fn forward_frame(
                                 continue;
                             }
                             kept_n += rows.len();
-                            let wins = wins_of(&slot.rt2)?;
-                            won |= rows.iter().any(|&r| wins[r as usize]);
-                            let piece = pieces.entry(shape).or_insert_with(|| {
-                                let mut b = celeste_engine::slots::reshape(&slot.rt2, 0);
-                                b.shape_hash = shape;
-                                b
-                            });
-                            piece.append_rows(&slot.rt2, &rows);
+                            won |= slot.any_win(&rows)?;
+                            let piece = pieces.entry(shape).or_insert_with(|| slot.empty_piece());
+                            slot.gather_into(piece, &rows);
                         }
                     }
                     Ok((pieces.into_values().collect(), kept_n, won, t.elapsed()))

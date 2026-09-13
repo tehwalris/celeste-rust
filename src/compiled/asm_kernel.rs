@@ -154,30 +154,33 @@ impl AsmKernel {
         // Consecutive emissions mostly repeat one (input cell, output cell)
         // pair; skip the set insert for those.
         let mut last_edge = (u32::MAX, u32::MAX);
-        let mut inbuf = vec![0u8; self.compiled.input_bytes as usize];
-        let mut outbuf = vec![0u8; self.compiled.n_roots * 128];
+        let views = self.input_views(chunk);
         let env = CollisionEnv { cart: &chunk.cart, cache: &chunk.cache };
         let ctx = AsmCtx::new(&env as *const CollisionEnv as *const c_void);
-        // Within-call dedup, per outcome: the same row key (the boundary's,
-        // via the (h1,h2) fold - the uniform `part` is constant per outcome,
-        // so deduping on the fold is exactly deduping on the key) skips
-        // pushing a row a sibling body already produced. Without it the
-        // fused graph's many configurations re-emit the same row ~76x
-        // before the owner's door drops them.
-        let mut seen: Vec<celeste_engine::kernel::RowSet> =
-            (0..self.acc_templates.len())
-                .map(|_| celeste_engine::kernel::RowSet::new())
-                .collect();
-        // Debug: CELESTE_ASM_NO_SEEN keeps the seen fold running (so its cost
-        // is unchanged) but never drops a row, to isolate the dedup from the
-        // compute when a divergence appears.
-        let no_seen = {
-            static NS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *NS.get_or_init(|| std::env::var_os("CELESTE_ASM_NO_SEEN").is_some())
-        };
+        // The call's scratch - buffers, the per-outcome staging, the dedup
+        // cache - lives with the thread and is reused call after call
+        // (`Scratch::take`); a fresh multi-megabyte allocation per unit
+        // was a page fault per page.
+        let mut sc = Scratch::take(self);
+        let Scratch { inbuf, outbuf, seen, .. } = &mut sc;
+        // Within-call dedup (`RowCache`): the fused graph's configurations
+        // re-emit the same row from neighbouring lanes ~8x over; the cache
+        // catches those (keyed by the row key, which is unique across
+        // outcomes) and the owner's door catches the rest.
+        seen.clear();
+        // Where each body's output roots go: the slot's typed columns, by
+        // kind. Every slot of an outcome has the same columns (its
+        // template's varying cells, in cell order).
+        let body_cols: Vec<BodyCols> = self
+            .bodies
+            .iter()
+            .map(|b| BodyCols::of(b, &crate::frame::Slot::new(0, self.acc_templates[b.outcome].build())))
+            .collect();
+        // The sink's slot for (outcome, owner), found once.
+        let mut slot_ids: Vec<Vec<usize>> = vec![vec![usize::MAX; sink.owners as usize]; self.acc_templates.len()];
         // Pure-kernel throughput floor (CELESTE_KERNEL_DRYRUN=1): pack the
-        // inputs and call the kernel, then discard - no fold, no seen-dedup,
-        // no materialize. Produces no rows, so it is a MEASUREMENT MODE ONLY
+        // inputs and call the kernel, then discard - no dedup, no
+        // materialize. Produces no rows, so it is a MEASUREMENT MODE ONLY
         // (the frame comes out empty).
         let dryrun = {
             static DR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -190,7 +193,7 @@ impl AsmKernel {
         let mut lo = lanes.start;
         while lo < lanes.end {
             let n = 16.min(lanes.end - lo);
-            self.pack_input(chunk, lo, n, &mut inbuf);
+            self.pack_input(&views, lo, n, inbuf);
             unsafe {
                 (self.loaded.func)(
                     inbuf.as_ptr(),
@@ -203,7 +206,7 @@ impl AsmKernel {
                 continue;
             }
             if eval_check_on() {
-                self.eval_check(chunk, lo, n, &outbuf);
+                self.eval_check(chunk, lo, n, outbuf);
             }
             let valid = ((1u32 << n) - 1) as u16;
             if liveok_on() {
@@ -213,8 +216,8 @@ impl AsmKernel {
                 // declined is DROPPED as not-live - the graph considers it dead.
                 let (mut kept, mut declined, mut any_live) = (0u16, 0u16, 0u16);
                 for body in &self.bodies {
-                    let ok = read_zb_holds(&outbuf, body.ok_root);
-                    let live = read_zb_holds(&outbuf, body.live_root);
+                    let ok = read_zb_holds(outbuf, body.ok_root);
+                    let live = read_zb_holds(outbuf, body.live_root);
                     kept |= live & ok & valid;
                     declined |= live & !ok & valid;
                     any_live |= live & valid;
@@ -225,7 +228,7 @@ impl AsmKernel {
                      declined={declined:04x} dropped(not-live)={dropped:04x} any_live={any_live:04x}"
                 );
             }
-            for body in &self.bodies {
+            for (body, cols) in self.bodies.iter().zip(&body_cols) {
                 // `ok`/`live` are tri-state ZB masks; the kernel keeps a lane
                 // only where they are KNOWN-TRUE (val & known - `zb_holds`,
                 // exactly what the generated `frame` applied). Reading `val`
@@ -235,27 +238,25 @@ impl AsmKernel {
                 // `val` bit instead of declining. A lane whose `ok` is unknown
                 // must fall to the reference, so the trace's failure to
                 // fork/decide it surfaces instead of producing a coarse row.
-                let ok = read_zb_holds(&outbuf, body.ok_root);
-                let live = read_zb_holds(&outbuf, body.live_root);
+                let ok = read_zb_holds(outbuf, body.ok_root);
+                let live = read_zb_holds(outbuf, body.live_root);
                 if live & !ok & valid != 0 {
                     // Declined: a live lane the kernel could not keep (or
                     // could not DECIDE). A coverage gap for the whole call.
                     return false;
                 }
-                let take = live & ok & valid;
+                let mut take = live & ok & valid;
                 if take == 0 {
                     continue;
                 }
                 let template = &self.acc_templates[body.outcome];
-                let seen = &mut seen[body.outcome];
-                for i in 0..n {
-                    if take & (1 << i) == 0 {
-                        continue;
-                    }
+                while take != 0 {
+                    let i = take.trailing_zeros() as usize;
+                    take &= take - 1;
                     // The row's (h1,h2) fold over the varying, non-widened
                     // cells, computed by the kernel (the body's key roots).
-                    let h1 = read_word(&outbuf, body.key_roots.0, i);
-                    let h2 = read_word(&outbuf, body.key_roots.1, i);
+                    let h1 = read_word(outbuf, body.key_roots.0, i);
+                    let h2 = read_word(outbuf, body.key_roots.1, i);
                     let part = template.part;
                     let key = (
                         runtime2::mix64(part.0.wrapping_add(h1)),
@@ -265,65 +266,59 @@ impl AsmKernel {
                     // EMISSION-TIME PROVENANCE (plans/buckets.md). The
                     // source of this row is lane `i` of this slice, and
                     // everything that needs to know is told right here:
-                    // the pos-graph edge, the owner slot - or, in backward
-                    // mode, the mark on the input row.
+                    // the pos-graph edge, the owner - or, in backward mode,
+                    // the mark on the input row.
                     if let Some(targets) = sink.targets {
                         // BACKWARD: does this output hit a marked state? Then
                         // input row `lo + i` is marked. Nothing is
-                        // materialized. The `seen` tag is the hit bit, so a
+                        // materialized. The cache tag is the hit bit, so a
                         // re-emission from another input row marks it too.
-                        if !no_seen {
-                            if let Some(prev) = seen.insert_tagged(key, 0) {
-                                if prev != 0 {
-                                    sink.hit(lo + i);
-                                }
-                                continue;
-                            }
-                        }
-                        sink.emitted += 1;
-                        let cout = cell_out(body, &outbuf, i, start);
-                        if targets.contains(&(key.0, key.1, cout)) {
-                            sink.hit(lo + i);
-                            if !no_seen {
-                                seen.set_last_tag(1);
-                            }
-                        }
-                        continue;
-                    }
-                    if !no_seen {
-                        if let Some(first_cin) = seen.insert_tagged(key, cin) {
-                            // A re-emission of a row this call already
-                            // produced. Nothing to push - but if it came
-                            // from a DIFFERENT input cell, that is a
-                            // pos-graph edge the first emission did not record.
-                            if sink.edges_on && first_cin != cin {
-                                sink.edges.insert((cin, cell_out(body, &outbuf, i, start)));
+                        if let Some(prev) = seen.insert_tagged(key, 0) {
+                            if prev != 0 {
+                                sink.hit(lo + i);
                             }
                             continue;
                         }
+                        sink.emitted += 1;
+                        let cout = cell_out(body, outbuf, i, start);
+                        if targets.contains(&(key.0, key.1, cout)) {
+                            sink.hit(lo + i);
+                            seen.set_last_tag(1);
+                        }
+                        continue;
                     }
-                    let cout = cell_out(body, &outbuf, i, start);
+                    if let Some(first_cin) = seen.insert_tagged(key, cin) {
+                        // A re-emission of a row this call already produced.
+                        // Nothing to push - but if it came from a DIFFERENT
+                        // input cell, that is a pos-graph edge the first
+                        // emission did not record.
+                        if sink.edges_on && first_cin != cin {
+                            sink.edges.insert((cin, cell_out(body, outbuf, i, start)));
+                        }
+                        continue;
+                    }
+                    sink.emitted += 1;
+                    let cout = cell_out(body, outbuf, i, start);
                     if sink.edges_on && last_edge != (cin, cout) {
                         last_edge = (cin, cout);
                         sink.edges.insert((cin, cout));
                     }
-                    sink.emitted += 1;
-                    let owner = crate::frame::owner_of(sink.owners, template.shape_hash, cout);
-                    let slot = sink.slot(owner, template.shape_hash, || {
-                        let mut b = template.build();
-                        b.shape_hash = template.shape_hash;
-                        b
-                    });
-                    for f in &body.fields {
-                        push_field(&mut slot.rt2, f, &outbuf, i);
+                    let owner = crate::frame::owner_of(sink.owners, template.shape_hash, cout) as usize;
+                    let sid = &mut slot_ids[body.outcome][owner];
+                    if *sid == usize::MAX {
+                        let outcome_id = template as *const AccTemplate as usize as u64;
+                        *sid = sink.slot_id(owner as u32, outcome_id, || {
+                            let mut b = template.build();
+                            b.shape_hash = template.shape_hash;
+                            b
+                        });
                     }
-                    slot.rt2.row_keys.push(key);
-                    slot.rt2.width += 1;
-                    slot.cells.push(cout);
+                    cols.push_row(&mut sink.slots[*sid], outbuf, i, key, cout);
                 }
             }
             lo += n;
         }
+        sc.put_back();
         true
     }
 
@@ -386,39 +381,218 @@ impl AsmKernel {
         }
     }
 
-    /// Pack `chunk`'s input columns for lanes `[lo, lo+16)` into `buf`. Tail
+    /// The input columns of `chunk` as slices, resolved once per call:
+    /// packing a slice is then a copy per field, not a `col.at()` match
+    /// per value.
+    fn input_views<'c>(&self, chunk: &'c Rt2) -> Vec<InputView<'c>> {
+        self.compiled
+            .input_cells
+            .iter()
+            .zip(&self.compiled.input_reprs)
+            .map(|(&cell, repr)| InputView::of(&chunk.cols[cell as usize], *repr))
+            .collect()
+    }
+
+    /// Pack lanes `[lo, lo+16)` into `buf` from the resolved `views`. Tail
     /// lanes past `n` clamp to the last valid lane, so the assembly's
     /// per-lane call-outs (div/mget/...) never fault on garbage - the `take`
     /// mask discards those lanes anyway.
-    fn pack_input(&self, chunk: &Rt2, lo: usize, n: usize, buf: &mut [u8]) {
-        for i in 0..self.compiled.input_cells.len() {
-            let cell = self.compiled.input_cells[i] as usize;
-            let off = self.compiled.input_offsets[i] as usize;
-            let col = &chunk.cols[cell];
-            match self.compiled.input_reprs[i] {
-                CellRepr::Num => {
+    fn pack_input(&self, views: &[InputView], lo: usize, n: usize, buf: &mut [u8]) {
+        for (view, &off) in views.iter().zip(&self.compiled.input_offsets) {
+            let off = off as usize;
+            let lane = |l: usize| lo + l.min(n - 1);
+            match view {
+                InputView::Num(col) => {
                     for l in 0..16 {
-                        let raw = num_raw(col.at(lo + l.min(n - 1)));
+                        let raw = col[lane(l)].as_raw_u32();
                         buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&raw.to_le_bytes());
                     }
                 }
-                CellRepr::Bool => {
+                InputView::NumU(raw) => {
+                    for l in 0..16 {
+                        buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&raw.to_le_bytes());
+                    }
+                }
+                InputView::Ival(col) => {
+                    for l in 0..16 {
+                        let (a, b) = col[lane(l)];
+                        buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&a.as_raw_u32().to_le_bytes());
+                        buf[off + 64 + l * 4..off + 64 + l * 4 + 4]
+                            .copy_from_slice(&b.as_raw_u32().to_le_bytes());
+                    }
+                }
+                InputView::IvalOfNum(col) => {
+                    for l in 0..16 {
+                        let raw = col[lane(l)].as_raw_u32().to_le_bytes();
+                        buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&raw);
+                        buf[off + 64 + l * 4..off + 64 + l * 4 + 4].copy_from_slice(&raw);
+                    }
+                }
+                InputView::IvalU(a, b) => {
+                    for l in 0..16 {
+                        buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&a.to_le_bytes());
+                        buf[off + 64 + l * 4..off + 64 + l * 4 + 4].copy_from_slice(&b.to_le_bytes());
+                    }
+                }
+                InputView::BoolU(mask) => {
+                    buf[off..off + 2].copy_from_slice(&mask.to_le_bytes());
+                }
+                InputView::Bool(col) => {
                     let mut mask = 0u16;
                     for l in 0..16 {
-                        if let AV::Bool(true) = col.at(lo + l.min(n - 1)) {
+                        if let AV::Bool(true) = col[lane(l)] {
                             mask |= 1 << l;
                         }
                     }
                     buf[off..off + 2].copy_from_slice(&mask.to_le_bytes());
                 }
-                CellRepr::Ival => {
+                InputView::Any(col, repr) => {
+                    // The general case (a materialized `AV` column feeding a
+                    // numeric input): per value, as before.
                     for l in 0..16 {
-                        let (a, b) = ival_raw(col.at(lo + l.min(n - 1)));
-                        buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&a.to_le_bytes());
-                        buf[off + 64 + l * 4..off + 64 + l * 4 + 4].copy_from_slice(&b.to_le_bytes());
+                        let v = col.at(lane(l));
+                        match repr {
+                            CellRepr::Num => {
+                                let raw = num_raw(v);
+                                buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&raw.to_le_bytes());
+                            }
+                            CellRepr::Ival => {
+                                let (a, b) = ival_raw(v);
+                                buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&a.to_le_bytes());
+                                buf[off + 64 + l * 4..off + 64 + l * 4 + 4]
+                                    .copy_from_slice(&b.to_le_bytes());
+                            }
+                            CellRepr::Bool => unreachable!("bool inputs are Bool/BoolU views"),
+                        }
                     }
                 }
             }
+        }
+    }
+}
+
+/// A thread's reusable scratch for one kernel: the packed input and the
+/// output buffer and the dedup cache. Kept per (thread, kernel) across
+/// calls so no unit allocates them afresh.
+struct Scratch {
+    kernel: usize,
+    inbuf: Vec<u8>,
+    outbuf: Vec<u8>,
+    seen: celeste_engine::kernel::RowCache,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Vec<Scratch>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Scratch {
+    /// This thread's scratch for `k`, created on first use. Taken out of
+    /// the thread-local for the duration of the call (`put_back`).
+    fn take(k: &AsmKernel) -> Scratch {
+        let id = k as *const AsmKernel as usize;
+        SCRATCH.with(|c| {
+            let mut c = c.borrow_mut();
+            match c.iter().position(|s| s.kernel == id) {
+                Some(i) => c.swap_remove(i),
+                None => Scratch {
+                    kernel: id,
+                    inbuf: vec![0u8; k.compiled.input_bytes as usize],
+                    outbuf: vec![0u8; k.compiled.n_roots * 128],
+                    seen: celeste_engine::kernel::RowCache::new(),
+                },
+            }
+        })
+    }
+
+    fn put_back(self) {
+        SCRATCH.with(|c| c.borrow_mut().push(self));
+    }
+}
+
+/// A body's output roots, grouped by kind, each paired with the index of
+/// its slot column (`Slot::cols`).
+struct BodyCols {
+    num: Vec<(usize, usize)>,
+    ival: Vec<(usize, usize)>,
+    bool_: Vec<(usize, usize)>,
+}
+
+impl BodyCols {
+    fn of(body: &AsmBody, proto: &crate::frame::Slot) -> Self {
+        use crate::frame::TCol;
+        let (mut num, mut ival, mut bool_) = (Vec::new(), Vec::new(), Vec::new());
+        for f in &body.fields {
+            // A field whose output column the template makes uniform (a
+            // widened-to-uniform cell, e.g. level 0's `rem`) is computed by
+            // the kernel but not stored: the column already holds the
+            // widened value.
+            let Some(ci) = proto.cols.iter().position(|(cell, _)| *cell == f.cell) else {
+                continue;
+            };
+            match (f.kind, &proto.cols[ci].1) {
+                (RootKind::Num, TCol::Num(_)) => num.push((ci, f.root)),
+                (RootKind::Ival, TCol::Ival(_)) => ival.push((ci, f.root)),
+                (RootKind::Bool, TCol::Bool(_)) => bool_.push((ci, f.root)),
+                (k, _) => panic!("body field cell {} kind {:?} disagrees with its outcome's column", f.cell, k),
+            }
+        }
+        BodyCols { num, ival, bool_ }
+    }
+
+    /// Append lane `i` of the output buffer to `slot` as one row.
+    #[inline]
+    fn push_row(&self, slot: &mut crate::frame::Slot, buf: &[u8], i: usize, key: (u64, u64), cell: u32) {
+        use crate::frame::TCol;
+        let word = |base: usize| u32::from_le_bytes(buf[base..base + 4].try_into().unwrap());
+        for &(ci, root) in &self.num {
+            if let TCol::Num(v) = &mut slot.cols[ci].1 {
+                v.push(word(root * 128 + i * 4));
+            }
+        }
+        for &(ci, root) in &self.ival {
+            if let TCol::Ival(v) = &mut slot.cols[ci].1 {
+                v.push((word(root * 128 + i * 4), word(root * 128 + 64 + i * 4)));
+            }
+        }
+        for &(ci, root) in &self.bool_ {
+            if let TCol::Bool(v) = &mut slot.cols[ci].1 {
+                let val = u16::from_le_bytes([buf[root * 128], buf[root * 128 + 1]]);
+                let known = u16::from_le_bytes([buf[root * 128 + 2], buf[root * 128 + 3]]);
+                v.push(if known >> i & 1 == 0 { 2 } else { (val >> i & 1) as u8 });
+            }
+        }
+        slot.keys.push(key);
+        slot.cells.push(cell);
+    }
+}
+
+/// One input column of a call, resolved to what the packer copies from.
+enum InputView<'c> {
+    Num(&'c [P8]),
+    NumU(u32),
+    Ival(&'c [(P8, P8)]),
+    IvalOfNum(&'c [P8]),
+    IvalU(u32, u32),
+    Bool(&'c [AV]),
+    BoolU(u16),
+    Any(&'c Col, CellRepr),
+}
+
+impl<'c> InputView<'c> {
+    fn of(col: &'c Col, repr: CellRepr) -> Self {
+        match (repr, col) {
+            (CellRepr::Num, Col::N(v)) => InputView::Num(v),
+            (CellRepr::Num, Col::U(AV::Num(n))) => InputView::NumU(n.as_raw_u32()),
+            (CellRepr::Ival, Col::I(v)) => InputView::Ival(v),
+            (CellRepr::Ival, Col::N(v)) => InputView::IvalOfNum(v),
+            (CellRepr::Ival, Col::U(AV::Ival(a, b))) => InputView::IvalU(a.as_raw_u32(), b.as_raw_u32()),
+            (CellRepr::Ival, Col::U(AV::Num(n))) => InputView::IvalU(n.as_raw_u32(), n.as_raw_u32()),
+            (CellRepr::Bool, Col::V(v)) => InputView::Bool(v),
+            (CellRepr::Bool, Col::U(v)) => {
+                InputView::BoolU(if matches!(v, AV::Bool(true)) { 0xffff } else { 0 })
+            }
+            (CellRepr::Bool, other) => panic!("ASM bool input column is {:?}", other),
+            (repr, other) => InputView::Any(other, repr),
         }
     }
 }
@@ -429,10 +603,11 @@ impl AsmKernel {
 /// duplicates left for its dedup). This is the gate that the append step's
 /// shortcut is exact; a difference here would silently change what the
 /// search dedups on. A no-op unless the variable is set.
-pub(crate) fn key_check(acc: &Rt2) {
+pub(crate) fn key_check(slot: &crate::frame::Slot) {
     if !key_check_on() {
         return;
     }
+    let acc = slot.to_rt2();
     let exact = registry().map(|r| r.exact_boundary).unwrap_or(false);
     let mut b = acc.clone_block();
     if exact {
@@ -539,38 +714,6 @@ fn read_field_av(f: &AsmField, buf: &[u8], i: usize) -> AV {
     }
 }
 
-fn push_field(acc: &mut Rt2, f: &AsmField, buf: &[u8], i: usize) {
-    let base = f.root * 128;
-    match f.kind {
-        RootKind::Num => {
-            let raw = i32::from_le_bytes(buf[base + i * 4..base + i * 4 + 4].try_into().unwrap());
-            if let Col::N(v) = &mut acc.cols[f.cell] {
-                v.push(P8::from_raw(raw));
-            }
-        }
-        RootKind::Bool => {
-            let val = u16::from_le_bytes([buf[base], buf[base + 1]]);
-            let known = u16::from_le_bytes([buf[base + 2], buf[base + 3]]);
-            let av = if known & (1 << i) != 0 {
-                AV::Bool(val & (1 << i) != 0)
-            } else {
-                AV::UBool
-            };
-            if let Col::V(v) = &mut acc.cols[f.cell] {
-                v.push(av);
-            }
-        }
-        RootKind::Ival => {
-            let lo = i32::from_le_bytes(buf[base + i * 4..base + i * 4 + 4].try_into().unwrap());
-            let hi =
-                i32::from_le_bytes(buf[base + 64 + i * 4..base + 64 + i * 4 + 4].try_into().unwrap());
-            if let Col::I(v) = &mut acc.cols[f.cell] {
-                v.push((P8::from_raw(lo), P8::from_raw(hi)));
-            }
-        }
-        RootKind::Word => unreachable!("an output field is never a word root"),
-    }
-}
 
 /// The start room's assembled kernels, keyed by input shape hash, for one
 /// rem-precision mode.

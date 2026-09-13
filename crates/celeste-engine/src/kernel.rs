@@ -619,85 +619,81 @@ pub fn zn_tile_flag_at_lanes(
     ZB { val, known: ALL }
 }
 
-/// A slice-local set of row keys, for a kernel deduping its own output.
-///
-/// Open-addressed, because the key IS already a 128-bit hash: a
-/// `HashSet` would hash it a second time, and std's SipHash costs far
-/// more than the handful of column pushes the dedup exists to avoid.
-/// Measured 2026-08-23: with `HashSet` the append phase went from 175 ms
-/// to 279 ms - the dedup paid for itself downstream (boundary 138 -> 24
-/// ms) and lost it all again at the door.
-///
-/// The within-call dedup set: one per outcome per kernel call, keyed by
+/// The within-call dedup CACHE: one per outcome per kernel call, keyed by
 /// the row key, carrying one `u32` TAG per key - what the row's first
 /// emission learned that a re-emission of the same row needs (its source
 /// cell for the pos-graph in the forward; whether it hit a target in the
 /// backward), so the re-emission never materializes anything
-/// (`compiled::asm_kernel`). Open addressing, grown at 0.75 load.
-pub struct RowSet {
-    slots: Vec<(u64, u64, u32, u32)>,
+/// (`compiled::asm_kernel`).
+///
+/// A cache, not a set: fixed capacity, direct-mapped with a short probe,
+/// a colliding new key evicts. The fused graph re-emits the same row
+/// from NEIGHBOURING input lanes ~8x over (inputs are sorted by cell, so
+/// the duplicates are close in time), which a bounded, L2-resident table
+/// catches; whatever it misses reaches the owner's door, which is the
+/// dedup of record. The unbounded open-addressing set it replaced grew to
+/// megabytes per unit and every probe was a cache miss - a third of the
+/// append loop (2026-09-14).
+pub struct RowCache {
+    /// `(key.1, generation, tag)`; the slot index comes from `key.0`.
+    slots: Vec<(u64, u32, u32)>,
     mask: usize,
     gen: u32,
-    len: usize,
     /// The slot of the last NEW insert, for `set_last_tag`.
     last: usize,
 }
 
-impl Default for RowSet {
+impl Default for RowCache {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RowSet {
+impl RowCache {
+    /// 32k entries of 16 bytes: 512 KB, half a core's L2 (two threads
+    /// share a core).
+    pub const CAPACITY: usize = 1 << 15;
+    const PROBES: usize = 4;
+
     pub fn new() -> Self {
-        RowSet { slots: vec![(0, 0, 0, 0); 4096], mask: 4095, gen: 1, len: 0, last: 0 }
+        RowCache { slots: vec![(0, 0, 0); Self::CAPACITY], mask: Self::CAPACITY - 1, gen: 1, last: 0 }
     }
 
-    fn grow(&mut self) {
-        let cap = self.slots.len() * 2;
-        let old = std::mem::replace(&mut self.slots, vec![(0, 0, 0, 0); cap]);
-        self.mask = cap - 1;
-        let gen = self.gen;
-        for s in old {
-            if s.2 == gen {
-                let mut i = (s.0 as usize) & self.mask;
-                while self.slots[i].2 == gen {
-                    i = (i + 1) & self.mask;
-                }
-                self.slots[i] = s;
-            }
+    /// Forget every key (O(1): bumps the generation).
+    pub fn clear(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.slots.iter_mut().for_each(|s| s.1 = 0);
+            self.gen = 1;
         }
     }
 
-    /// Overwrite the tag of the last NEW insert (`insert_tagged` -> `None`).
-    #[inline(always)]
+    /// Overwrite the tag of the most recently inserted key.
     pub fn set_last_tag(&mut self, tag: u32) {
-        self.slots[self.last].3 = tag;
+        self.slots[self.last].2 = tag;
     }
 
-    /// Insert `k` with `tag`: `None` if it was new, `Some(tag of the first
-    /// insert)` if it was already present.
+    /// Insert `k` with `tag`: `None` if it was not present (it is now, or
+    /// it evicted the oldest of its probe window), `Some(tag of the first
+    /// insert)` if it was.
     #[inline(always)]
     pub fn insert_tagged(&mut self, k: (u64, u64), tag: u32) -> Option<u32> {
-        // Grow at 0.75 load so linear probing stays short.
-        if (self.len + 1) * 4 >= self.slots.len() * 3 {
-            self.grow();
-        }
-        let mut i = (k.0 as usize) & self.mask;
-        loop {
+        let base = k.0 as usize;
+        let mut victim = base & self.mask;
+        for p in 0..Self::PROBES {
+            let i = (base + p) & self.mask;
             let s = self.slots[i];
-            if s.2 != self.gen {
-                self.slots[i] = (k.0, k.1, self.gen, tag);
-                self.len += 1;
-                self.last = i;
-                return None;
+            if s.1 != self.gen {
+                victim = i;
+                break;
             }
-            if s.0 == k.0 && s.1 == k.1 {
-                return Some(s.3);
+            if s.0 == k.1 {
+                return Some(s.2);
             }
-            i = (i + 1) & self.mask;
         }
+        self.slots[victim] = (k.1, self.gen, tag);
+        self.last = victim;
+        None
     }
 }
 

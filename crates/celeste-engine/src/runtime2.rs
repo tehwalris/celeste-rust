@@ -163,7 +163,7 @@ pub const NONE: u32 = u32::MAX;
 /// Push one value onto a column of `width` lanes, materializing a uniform
 /// column only when the value differs from it, and keeping the raw
 /// `N`/`I` forms while the kinds allow.
-fn col_push(col: &mut Col, width: usize, v: AV) {
+pub fn col_push(col: &mut Col, width: usize, v: AV) {
     match col {
         Col::U(a) if *a == v => {} // still uniform
         Col::U(a) => {

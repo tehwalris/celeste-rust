@@ -217,8 +217,8 @@ impl FrameEngine {
             );
         }
         if dispatch::widen_noop_check() {
-            for slot in sink.slots.values() {
-                assert_widen_is_noop(&bridge::export_block(&slot.rt2));
+            for slot in &sink.slots {
+                assert_widen_is_noop(&bridge::export_block(&slot.to_rt2()));
             }
         }
     }
