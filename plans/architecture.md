@@ -103,6 +103,9 @@ The rebuild replaced the old search (`run.rs`/`sweep*.rs`, deleted) with
    frame, so no horizon past level 0's first win could ever be Confirmed.
    Every level now runs to the horizon and seeds from the wins at every
    frame <= it.
+   Its BACKWARD is incremental too since 2026-09-13 (`Marks` with
+   distances; plans/parallel.md): a horizon's level-0 backward starts from
+   the previous horizon's marks and re-runs only the untested pairs.
 3. **Wide + lane-bitmask provenance backward** - `backward_run` re-runs one input
    lane at a time (correct, slow). Make the kernel emit a per-output source-lane
    bitmask so backward runs 16-wide (design agreed; the narrow per-call reuse of

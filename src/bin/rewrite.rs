@@ -198,7 +198,7 @@ fn main() -> Result<()> {
             coarse_bits,
             room,
         } => {
-            use celeste_rust::frame::{load_frame, widened_keys, MarkFilter, Visited};
+            use celeste_rust::frame::{load_frame, widened_keys, MarkFilter, Marks, Visited};
             use celeste_rust::interpreter::abstraction::RemPrecision;
             std::env::set_var("CELESTE_START_ROOM", &room);
             let base = std::path::Path::new(&checkpoint_dir);
@@ -212,9 +212,9 @@ fn main() -> Result<()> {
             let fine_dir = level_dir(fine_h, fine_level);
             let coarse_dir = level_dir(coarse_h, coarse_level);
             let fine_marks =
-                Visited::load(&celeste_rust::frame::marks_path(base, fine_h, fine_level))?;
+                Marks::load(&celeste_rust::frame::marks_path(base, fine_h, fine_level))?;
             let coarse_marks =
-                Visited::load(&celeste_rust::frame::marks_path(base, coarse_h, coarse_level))?;
+                Marks::load(&celeste_rust::frame::marks_path(base, coarse_h, coarse_level))?;
             let coarser = RemPrecision::Bits(coarse_bits);
             println!(
                 "fine (h{fine_h} level {fine_level}): {} marked; coarse (h{coarse_h} level {coarse_level}, {coarser:?}): {} marked",
@@ -340,7 +340,7 @@ fn main() -> Result<()> {
             level,
             room,
         } => {
-            use celeste_rust::frame::{frame_files, marks_path, widened_keys, wins_of, Block, Visited};
+            use celeste_rust::frame::{frame_files, marks_path, widened_keys, wins_of, Block, Marks};
             use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
             use rustc_hash::FxHashMap;
             std::env::set_var("CELESTE_START_ROOM", &room);
@@ -352,7 +352,7 @@ fn main() -> Result<()> {
             } else {
                 base.join(format!("h{:03}", horizon)).join(format!("level{:02}", level))
             };
-            let marks = Visited::load(&marks_path(base, horizon, level))?;
+            let marks = Marks::load(&marks_path(base, horizon, level))?;
             // (key, cell) -> the layer it was first reached at.
             let mut layer_of: FxHashMap<(u64, u64, u32), u32> = FxHashMap::default();
             for f in 0..=horizon {
@@ -433,7 +433,7 @@ fn main() -> Result<()> {
                 f: u32,
                 horizon: u32,
                 precision: RemPrecision,
-                marks: &Visited,
+                marks: &Marks,
                 layer_of: &FxHashMap<(u64, u64, u32), u32>,
                 dead: &mut rustc_hash::FxHashSet<(u64, u64, u32)>,
                 path: &mut Vec<u8>,

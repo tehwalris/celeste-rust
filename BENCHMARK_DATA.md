@@ -4412,3 +4412,61 @@ frame 24, the frame the player object is created and - under PICO-8's
 Found on the way: the Exact kernel set widens nothing (`WalkOpts::EXACT`),
 so its rows carry live timers and `widened_keys(_, Exact)` must not pin
 them (it did; nothing had looked an Exact row up before the witness tool).
+
+## The parallel loop (2026-09-13, plans/parallel.md, release)
+
+Room (1,0) level-0 forward f0-f89 (`rewrite forward --to 89`), the
+emit-by-source / own-by-destination frame (`6edea0b`) and the shape-sharded
+visited set (`9d39343`). 16 physical cores / 32 threads (7950X3D).
+
+| | 1 thread, before (`d4eaca2`) | 16 threads | 32 threads | 32 threads + visited fix |
+|---|---|---|---|---|
+| f0-f89 wall | 791 s | 95.5 s | 88.5 s | **65.6 s** |
+| f70 frame | 34.0 s | 2.69 s | 2.47 s | **2.22 s** |
+| f70 emit (kernel + append) | 32.3 s (incl. the door) | 1.93 s | 1.73 s | 1.78 s |
+| f70 own (filter, door, append) | - | 0.58 s | 0.53 s | **0.24 s** |
+| f70 checkpoint | 1.1 s | 0.18 s | 0.19 s | 0.19 s |
+| peak RSS | 27.4 GB | 28.2 GB | 28.6 GB | **12.3 GB** |
+| f0-f44 (1 thread, same commit) | 14.6 s | 14.2 s | | |
+
+- Per-frame speedup at f70: 34.0 -> 2.22 s = 15.3x on 16 cores; the emit
+  phase alone 32.3 -> 1.78 s (the single-thread number included the door,
+  now in `own`). SMT (32 threads) is worth ~8% on the emit phase.
+- The visited set was documented as sharded by (shape, cell) but keyed
+  its outer map by the first half of the content key - a singleton inner
+  set per state, ~180 B each. Sharding by the block's shape hash (full
+  128-bit keys inside) halved the own phase and cut the peak from 28 GB
+  to 12 GB.
+- Units are adaptive (2048..16384 lanes, ~16 per worker): at 2048 the
+  within-unit `seen` dedup let 45.6M raw rows through at f70 instead of
+  30.9M; adaptive units bring it back to 29.4M.
+- Serial per frame: the unit list, the stats fold, the pos-graph flush;
+  f70's total (2.22 s) is emit + own + checkpoint to within 10 ms.
+- ckhash f0-44, the pos-graph fingerprint and the marks gate are identical
+  at 1, 16 and 32 threads.
+
+## The whole ladder at 32 threads, and the incremental level-0 backward (2026-09-13)
+
+`rewrite search --room 1,0 --to 110`, 32 threads, release. Both runs
+reproduce every `[ladder]` mark fingerprint of the single-threaded run
+(11 horizons x up to 17 levels) and `OPTIMAL win frame: 99`.
+
+| | 1 thread (`cff5913`) | 32 threads, scratch backward | 32 threads, incremental backward |
+|---|---|---|---|
+| whole search wall | 1 h 10 min | **8 min 51 s** | **8 min 44 s** |
+| peak RSS | 32.4 GB | 18.9 GB | 20.3 GB |
+| level-0 forward f0-f89 | 791 s | 65 s | 65 s |
+| level-0 backward, summed over H=89..99 | ~1,310 s | 111 s | 96 s |
+| level-0 backward at H=99 | 370 s | 28.8 s | 24.1 s |
+| level-0 re-runs at H=99 | 98.3M | 98.3M | 76.0M |
+| level 1 forward + backward at H=99 | 157 + 272 s | 20 + 30 s | 20 + 30 s |
+
+The incremental backward (plans/parallel.md) is exact - marks AND
+distances identical to the from-scratch walk (`CELESTE_BACKWARD_SCRATCH=1`)
+at every horizon - but saves only ~15-20% of the re-runs: the pairs an
+earlier horizon has not tested are dominated by the newly admitted layer
+i against the old targets at every iteration, i.e. one whole layer per
+iteration, which is inherent to the layer-anchored walk. What remains of
+a horizon's cost at H=99 (~190 s): level 0's backward 24 s, level 1's
+forward + backward 50 s, then the finer levels, each a filtered forward to
+H plus a backward, 2-20 s apiece.
