@@ -135,39 +135,35 @@ struct AsmKernel {
 }
 
 impl AsmKernel {
-    /// Run one chunk. Mirrors `dispatch::run_traced_kernel`: per 16-lane
-    /// slice, pack inputs, call the assembly, and for each body materialize
-    /// its `live & ok` lanes into the outcome's acc; a nonzero `live & !ok`
-    /// (declined) drops the whole chunk to the reference path. Then
-    /// `boundary` for keys + within-block dedup, and push to `done`.
+    /// Run lanes `lanes` of one block. Per 16-lane slice: pack inputs, call
+    /// the assembly, and for each body push its `live & ok` lanes into the
+    /// sink's slot for (owner, outcome shape) - keyed, at the boundary, with
+    /// the pos-graph edge recorded - or, in backward mode, mark the input
+    /// rows whose outputs hit a target. A nonzero `live & !ok` (declined)
+    /// fails the whole call (a coverage gap).
     fn run(
         &self,
         chunk: &Rt2,
-        ids: &runtime2::BoundaryIds,
         cell_in: &[u32],
+        lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
-        exact: bool,
     ) -> bool {
         debug_assert_eq!(cell_in.len(), chunk.width, "one input cell per input row");
+        debug_assert!(lanes.end <= chunk.width);
         let start = crate::game_runner::start_room();
         // Consecutive emissions mostly repeat one (input cell, output cell)
         // pair; skip the set insert for those.
         let mut last_edge = (u32::MAX, u32::MAX);
-        let mut accs: Vec<Rt2> = self.acc_templates.iter().map(|t| t.build()).collect();
-        // Per-acc row keys, pushed alongside the rows: the exact boundary
-        // key, `mix64(part + h)`.
-        let mut keys: Vec<Vec<(u64, u64)>> = vec![Vec::new(); accs.len()];
         let mut inbuf = vec![0u8; self.compiled.input_bytes as usize];
         let mut outbuf = vec![0u8; self.compiled.n_roots * 128];
         let env = CollisionEnv { cart: &chunk.cart, cache: &chunk.cache };
         let ctx = AsmCtx::new(&env as *const CollisionEnv as *const c_void);
-        // Within-chunk dedup, per outcome: the same row key (the boundary's,
+        // Within-call dedup, per outcome: the same row key (the boundary's,
         // via the (h1,h2) fold - the uniform `part` is constant per outcome,
         // so deduping on the fold is exactly deduping on the key) skips
-        // materializing a row a sibling body already produced. This is the
-        // generated kernel's `seen` set: without it the fused graph's many
-        // configurations re-emit the same row ~76x before the boundary dedup
-        // drops them. The boundary is still the final authority.
+        // pushing a row a sibling body already produced. Without it the
+        // fused graph's many configurations re-emit the same row ~76x
+        // before the owner's door drops them.
         let mut seen: Vec<celeste_engine::kernel::RowSet> =
             (0..self.acc_templates.len())
                 .map(|_| celeste_engine::kernel::RowSet::new())
@@ -181,20 +177,19 @@ impl AsmKernel {
         };
         // Pure-kernel throughput floor (CELESTE_KERNEL_DRYRUN=1): pack the
         // inputs and call the kernel, then discard - no fold, no seen-dedup,
-        // no materialize, no boundary. Produces no rows, so it is a
-        // MEASUREMENT MODE ONLY (the frame comes out empty). Isolates the raw
-        // kernel compute from all the dedup/store machinery around it.
+        // no materialize. Produces no rows, so it is a MEASUREMENT MODE ONLY
+        // (the frame comes out empty).
         let dryrun = {
             static DR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *DR.get_or_init(|| std::env::var_os("CELESTE_KERNEL_DRYRUN").is_some())
         };
 
         CALL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        CALL_STATS[1].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
-        CALL_STATS[2].fetch_add(chunk.width.div_ceil(16) as u64 * 16, std::sync::atomic::Ordering::Relaxed);
-        let mut lo = 0usize;
-        while lo < chunk.width {
-            let n = 16.min(chunk.width - lo);
+        CALL_STATS[1].fetch_add(lanes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        CALL_STATS[2].fetch_add(lanes.len().div_ceil(16) as u64 * 16, std::sync::atomic::Ordering::Relaxed);
+        let mut lo = lanes.start;
+        while lo < lanes.end {
+            let n = 16.min(lanes.end - lo);
             self.pack_input(chunk, lo, n, &mut inbuf);
             unsafe {
                 (self.loaded.func)(
@@ -244,15 +239,14 @@ impl AsmKernel {
                 let live = read_zb_holds(&outbuf, body.live_root);
                 if live & !ok & valid != 0 {
                     // Declined: a live lane the kernel could not keep (or
-                    // could not DECIDE). Drop and let the whole chunk take the
-                    // reference path.
+                    // could not DECIDE). A coverage gap for the whole call.
                     return false;
                 }
                 let take = live & ok & valid;
                 if take == 0 {
                     continue;
                 }
-                let acc = &mut accs[body.outcome];
+                let template = &self.acc_templates[body.outcome];
                 let seen = &mut seen[body.outcome];
                 for i in 0..n {
                     if take & (1 << i) == 0 {
@@ -262,7 +256,7 @@ impl AsmKernel {
                     // cells, computed by the kernel (the body's key roots).
                     let h1 = read_word(&outbuf, body.key_roots.0, i);
                     let h2 = read_word(&outbuf, body.key_roots.1, i);
-                    let part = self.acc_templates[body.outcome].part;
+                    let part = template.part;
                     let key = (
                         runtime2::mix64(part.0.wrapping_add(h1)),
                         runtime2::mix64(part.1.wrapping_add(h2)),
@@ -271,7 +265,7 @@ impl AsmKernel {
                     // EMISSION-TIME PROVENANCE (plans/buckets.md). The
                     // source of this row is lane `i` of this slice, and
                     // everything that needs to know is told right here:
-                    // the pos-graph edge, the door dedup - or, in backward
+                    // the pos-graph edge, the owner slot - or, in backward
                     // mode, the mark on the input row.
                     if let Some(targets) = sink.targets {
                         // BACKWARD: does this output hit a marked state? Then
@@ -281,7 +275,7 @@ impl AsmKernel {
                         if !no_seen {
                             if let Some(prev) = seen.insert_tagged(key, 0) {
                                 if prev != 0 {
-                                    sink.hits[lo + i] = true;
+                                    sink.hit(lo + i);
                                 }
                                 continue;
                             }
@@ -289,7 +283,7 @@ impl AsmKernel {
                         sink.emitted += 1;
                         let cout = cell_out(body, &outbuf, i, start);
                         if targets.contains(&(key.0, key.1, cout)) {
-                            sink.hits[lo + i] = true;
+                            sink.hit(lo + i);
                             if !no_seen {
                                 seen.set_last_tag(1);
                             }
@@ -299,8 +293,8 @@ impl AsmKernel {
                     if !no_seen {
                         if let Some(first_cin) = seen.insert_tagged(key, cin) {
                             // A re-emission of a row this call already
-                            // produced. Nothing to materialize - but if it
-                            // came from a DIFFERENT input cell, that is a
+                            // produced. Nothing to push - but if it came
+                            // from a DIFFERENT input cell, that is a
                             // pos-graph edge the first emission did not record.
                             if sink.edges_on && first_cin != cin {
                                 sink.edges.insert((cin, cell_out(body, &outbuf, i, start)));
@@ -314,74 +308,25 @@ impl AsmKernel {
                         sink.edges.insert((cin, cout));
                     }
                     sink.emitted += 1;
-                    if let Some(v) = sink.visited.as_deref_mut() {
-                        if !v.insert(key, cout) {
-                            continue;
-                        }
-                    }
+                    let owner = crate::frame::owner_of(sink.owners, template.shape_hash, cout);
+                    let slot = sink.slot(owner, template.shape_hash, || {
+                        let mut b = template.build();
+                        b.shape_hash = template.shape_hash;
+                        b
+                    });
                     for f in &body.fields {
-                        push_field(acc, f, &outbuf, i);
+                        push_field(&mut slot.rt2, f, &outbuf, i);
                     }
-                    keys[body.outcome].push(key);
-                    acc.width += 1;
+                    slot.rt2.row_keys.push(key);
+                    slot.rt2.width += 1;
+                    slot.cells.push(cout);
                 }
             }
             lo += n;
         }
-
-        for (oi, mut acc) in accs.into_iter().enumerate() {
-            if acc.width == 0 {
-                continue;
-            }
-            // The acc IS at the boundary: its structure is the outcome's
-            // canonical one (`bind::structure_of`, checked below), the
-            // graph applied every level-0 widening (`trace::widen`), `seen`
-            // deduped on the key, and the key itself was computed per row
-            // above. So no `Rt2::boundary` here - just the two fields it
-            // would have set.
-            acc.shape_hash = self.acc_templates[oi].shape_hash;
-            acc.row_keys = std::mem::take(&mut keys[oi]);
-            if key_check_on() {
-                self.check_against_boundary(&acc, ids, exact, oi);
-            }
-            sink.out.push(acc);
-        }
         true
     }
 
-    /// `CELESTE_KERNEL_KEY_CHECK=1`: run the real `Rt2::boundary` over a
-    /// copy of the finished acc and demand it changes NOTHING - same
-    /// structure, same shape hash, same row keys, same width (no
-    /// within-block duplicates left for its dedup). This is the gate that
-    /// the append step's shortcut is exact; a difference here would
-    /// silently change what the search dedups on.
-    fn check_against_boundary(&self, acc: &Rt2, ids: &runtime2::BoundaryIds, exact: bool, oi: usize) {
-        let mut b = acc.clone_block();
-        if exact {
-            b.boundary_exact();
-        } else {
-            b.boundary(ids);
-        }
-        assert!(
-            b.width == acc.width
-                && b.shape_hash == acc.shape_hash
-                && b.structure == acc.structure
-                && b.row_keys == acc.row_keys,
-            "KERNEL KEY CHECK: outcome {oi}: the boundary disagrees with the append step \
-             (width {} vs {}, shape {:#x} vs {:#x}, structure {}, keys {})",
-            b.width,
-            acc.width,
-            b.shape_hash,
-            acc.shape_hash,
-            if b.structure == acc.structure { "same" } else { "DIFFERENT" },
-            if b.row_keys == acc.row_keys { "same" } else { "DIFFERENT" },
-        );
-    }
-
-    /// DEBUG: re-evaluate the fused graph with the pure interval evaluator
-    /// for lanes `[lo, lo+n)` and diff its per-field outputs against the
-    /// assembled kernel's `outbuf`. An `asm != eval` mismatch is an ASM
-    /// codegen bug; agreement means the fused graph itself is what diverges
     /// from the interpreter. Prints at most a few mismatches per chunk.
     fn eval_check(&self, chunk: &Rt2, lo: usize, n: usize, outbuf: &[u8]) {
         use crate::transpile::graph::Val;
@@ -476,6 +421,40 @@ impl AsmKernel {
             }
         }
     }
+}
+
+/// `CELESTE_KERNEL_KEY_CHECK=1`: run the real `Rt2::boundary` over a copy
+/// of an emitted slot block and demand it changes NOTHING - same
+/// structure, same shape hash, same row keys, same width (no within-block
+/// duplicates left for its dedup). This is the gate that the append step's
+/// shortcut is exact; a difference here would silently change what the
+/// search dedups on. A no-op unless the variable is set.
+pub(crate) fn key_check(acc: &Rt2) {
+    if !key_check_on() {
+        return;
+    }
+    let exact = registry().map(|r| r.exact_boundary).unwrap_or(false);
+    let mut b = acc.clone_block();
+    if exact {
+        b.boundary_exact();
+    } else {
+        b.boundary(&super::boundary_ids());
+    }
+    assert!(
+        b.width == acc.width
+            && b.shape_hash == acc.shape_hash
+            && b.structure == acc.structure
+            && b.row_keys == acc.row_keys,
+        "KERNEL KEY CHECK: shape {:#x}: the boundary disagrees with the append step \
+         (width {} vs {}, shape {:#x} vs {:#x}, structure {}, keys {})",
+        acc.shape_hash,
+        b.width,
+        acc.width,
+        b.shape_hash,
+        acc.shape_hash,
+        if b.structure == acc.structure { "same" } else { "DIFFERENT" },
+        if b.row_keys == acc.row_keys { "same" } else { "DIFFERENT" },
+    );
 }
 
 /// DEBUG gate for the per-lane fused-graph re-evaluation (`eval_check`).
@@ -612,12 +591,12 @@ impl Registry {
     pub fn run_chunk(
         &self,
         chunk: &Rt2,
-        ids: &runtime2::BoundaryIds,
         cell_in: &[u32],
+        lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
     ) -> bool {
         match self.by_shape.get(&chunk.shape_hash) {
-            Some(k) => k.run(chunk, ids, cell_in, sink, self.exact_boundary),
+            Some(k) => k.run(chunk, cell_in, lanes, sink),
             None => {
                 // Diagnose a coverage gap: which shape has no assembled
                 // kernel. Printed once per distinct missing shape.
@@ -1035,12 +1014,12 @@ fn build_registry_for_current_rung() -> Option<Registry> {
 /// caller routes to the reference path).
 pub(crate) fn run_chunk(
     chunk: &Rt2,
-    ids: &runtime2::BoundaryIds,
     cell_in: &[u32],
+    lanes: std::ops::Range<usize>,
     sink: &mut crate::frame::ForwardSink,
 ) -> bool {
     match registry() {
-        Some(reg) => reg.run_chunk(chunk, ids, cell_in, sink),
+        Some(reg) => reg.run_chunk(chunk, cell_in, lanes, sink),
         None => false,
     }
 }

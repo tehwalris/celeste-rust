@@ -9,7 +9,9 @@
 //! Impls (kernel runner + `trace::refengine`) and the loop's checkpoint /
 //! position-graph growth come next; this is the interface + the frame spine.
 
-use anyhow::{ensure, Result};
+use anyhow::Result;
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::interpreter::state::State;
 use celeste_engine::runtime2::Rt2;
@@ -66,6 +68,10 @@ impl Block {
         self.rt2
     }
 
+    pub fn rt2(&self) -> &Rt2 {
+        &self.rt2
+    }
+
     /// The key column: the 128-bit canonical row key per lane (shape + content).
     /// Identity for dedup, the visited set, and checkpoints. One entry per lane.
     pub fn keys(&self) -> &[(u64, u64)] {
@@ -78,42 +84,9 @@ impl Block {
         crate::search::pos_graph::block_cells(&self.rt2)
     }
 
-    /// Per lane: does it sit on the room's win target? The room-exit test
-    /// (`room.x` past the start room) or, under `CELESTE_WIN_AT_XY`, the
-    /// synthetic player-position target. Pure position; no peeking inside.
+    /// Per lane: does it sit on the room's win target (`wins_of`)?
     pub fn wins(&self) -> Result<Vec<bool>> {
-        use celeste_engine::runtime2::{Col, AV};
-        let ids = crate::compiled::ids();
-        let rt2 = &self.rt2;
-        let lanes = rt2.width;
-        if let Some(target) = crate::interpreter::abstraction::synthetic_win_xy() {
-            let Some(obj) = crate::search::pos_graph::player_object(rt2) else {
-                return Ok(vec![false; lanes]);
-            };
-            let axis = |f: u32| {
-                rt2.obj_field_cell(obj, f)
-                    .and_then(|c| crate::search::pos_graph::whole_i16_col(rt2, c))
-            };
-            return Ok(match (axis(ids.f_x), axis(ids.f_y)) {
-                (Some(xs), Some(ys)) => {
-                    xs.iter().zip(&ys).map(|(&x, &y)| (x, y) == target).collect()
-                }
-                _ => vec![false; lanes],
-            });
-        }
-        let want = crate::pico8_num::Pico8Num::from_i16(crate::game_runner::win_room_x());
-        let room = rt2
-            .global_target(ids.g_room)
-            .ok_or_else(|| anyhow::anyhow!("wins: no `room` global"))?;
-        let x = rt2
-            .obj_field_cell(room, ids.f_x)
-            .ok_or_else(|| anyhow::anyhow!("wins: room table has no x field"))?;
-        Ok(match &rt2.cols[x as usize] {
-            Col::U(AV::Num(n)) => vec![*n == want; lanes],
-            Col::N(vs) => vs.iter().map(|n| *n == want).collect(),
-            Col::V(vs) => vs.iter().map(|v| *v == AV::Num(want)).collect(),
-            other => anyhow::bail!("wins: room.x is not a number column: {:?}", other),
-        })
+        wins_of(&self.rt2)
     }
 
     /// Keep only the lanes whose mask entry is true, as a new block; `None` if
@@ -143,72 +116,161 @@ impl Block {
     }
 }
 
-/// Route a block's rows into next frame's BUCKETS: one bucket per shape.
-/// (The old per-class split - freeze, moving key, pm1 cells - was the
-/// generated kernels' uniformity premise; the fused ASM graph resolves
-/// those per lane, and bucketing by shape alone reproduces every gate,
-/// 2026-09-12.)
-fn route(rt2: Rt2, buckets: &mut rustc_hash::FxHashMap<u64, Rt2>) {
-    match buckets.entry(rt2.shape_hash) {
-        std::collections::hash_map::Entry::Vacant(e) => {
-            e.insert(rt2);
-        }
-        std::collections::hash_map::Entry::Occupied(mut e) => {
-            let rows: Vec<u32> = (0..rt2.width as u32).collect();
-            e.get_mut().append_rows(&rt2, &rows);
-        }
+/// Per lane: does it sit on the room's win target? The room-exit test
+/// (`room.x` past the start room) or, under `CELESTE_WIN_AT_XY`, the
+/// synthetic player-position target. Pure position; no peeking inside.
+pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
+    use celeste_engine::runtime2::{Col, AV};
+    let ids = crate::compiled::ids();
+    let lanes = rt2.width;
+    if let Some(target) = crate::interpreter::abstraction::synthetic_win_xy() {
+        let Some(obj) = crate::search::pos_graph::player_object(rt2) else {
+            return Ok(vec![false; lanes]);
+        };
+        let axis = |f: u32| {
+            rt2.obj_field_cell(obj, f)
+                .and_then(|c| crate::search::pos_graph::whole_i16_col(rt2, c))
+        };
+        return Ok(match (axis(ids.f_x), axis(ids.f_y)) {
+            (Some(xs), Some(ys)) => {
+                xs.iter().zip(&ys).map(|(&x, &y)| (x, y) == target).collect()
+            }
+            _ => vec![false; lanes],
+        });
     }
+    let want = crate::pico8_num::Pico8Num::from_i16(crate::game_runner::win_room_x());
+    let room = rt2
+        .global_target(ids.g_room)
+        .ok_or_else(|| anyhow::anyhow!("wins: no `room` global"))?;
+    let x = rt2
+        .obj_field_cell(room, ids.f_x)
+        .ok_or_else(|| anyhow::anyhow!("wins: room table has no x field"))?;
+    Ok(match &rt2.cols[x as usize] {
+        Col::U(AV::Num(n)) => vec![*n == want; lanes],
+        Col::N(vs) => vs.iter().map(|n| *n == want).collect(),
+        Col::V(vs) => vs.iter().map(|v| *v == AV::Num(want)).collect(),
+        other => anyhow::bail!("wins: room.x is not a number column: {:?}", other),
+    })
 }
 
-/// What a frame step EMITS INTO (interface #1's output side). The step
-/// consumes provenance at emission - it knows which input row each output
-/// row came from - and reports through this: the pos-graph edges
-/// `(input cell, output cell)` of every raw output (before any dedup),
-/// and the output rows themselves, at the boundary and keyed, per output
-/// block. When `visited` is present the step dedups AT THE DOOR - a row
-/// already in the search is never materialized; when absent (a filtered
-/// ladder level, the backward's re-runs) every row the step's own
-/// within-call dedup keeps is handed back.
+/// Worker (and owner) count: `CELESTE_THREADS`, else half the logical
+/// CPUs - one per physical core; the kernels are AVX-512 bound and SMT
+/// siblings share those units - and at least 1.
+pub fn threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CELESTE_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or_else(|| {
+                (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2).max(1)
+            })
+    })
+}
+
+/// The OWNER of a `(shape, cell)`: the worker whose visited shard, output
+/// pieces and checkpoint files hold every row at that shape and cell. A
+/// hash of the cell (not a range) for balance; the two-tier visited set
+/// keeps the per-cell locality inside the owner.
+pub fn owner_of(owners: u32, shape: u64, cell: u32) -> u32 {
+    let h = celeste_engine::runtime2::mix64(shape ^ (cell as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    (h % owners as u64) as u32
+}
+
+/// Rows emitted for one owner at one output shape: a packed block (its key
+/// column filled as rows land) and the rows' cells.
+pub struct Slot {
+    pub rt2: Rt2,
+    pub cells: Vec<u32>,
+}
+
+/// What a frame step EMITS INTO (interface #1's output side): one worker's
+/// emission state for a frame. The step consumes provenance at emission -
+/// it knows which input row each output row came from - and reports
+/// through this: the pos-graph edges `(input cell, output cell)` of every
+/// raw output, and the output rows themselves, keyed and PARTITIONED BY
+/// OWNER (`owner_of` of their shape and cell). Nothing here is shared: the
+/// door dedup happens afterwards, owner by owner (`forward_frame`'s second
+/// phase), against that owner's private visited shard. The step's own
+/// within-call dedup is the only dedup at emission.
 pub struct ForwardSink<'a> {
-    pub visited: Option<&'a mut Visited>,
+    pub owners: u32,
+    /// `(owner, output shape)` -> the rows emitted for it.
+    pub slots: rustc_hash::FxHashMap<(u32, u64), Slot>,
     /// Record `edges` at all (off for the backward, which has the graph).
     pub edges_on: bool,
-    /// The distinct edges this call produced (a set: a bucket's rows fan
+    /// The distinct edges this worker produced (a set: a block's rows fan
     /// out into a few hundred distinct cell pairs, not one per row).
     pub edges: rustc_hash::FxHashSet<(u32, u32)>,
     /// Rows emitted after the step's within-call dedup (the raw fan-out).
     pub emitted: u64,
-    pub out: Vec<Rt2>,
     /// BACKWARD MODE: the marked `(shape, content, cell)` set at frame i+1.
     /// When set, the step materializes NOTHING; an emitted row that is in
-    /// the set marks its INPUT row in `hits`. Provenance consumed at
+    /// the set marks its INPUT row (`hit`). Provenance consumed at
     /// emission, as in the forward - the step's within-call dedup carries
     /// "hit" as its tag so a re-emission from another input row marks that
     /// row too.
     pub targets: Option<&'a rustc_hash::FxHashSet<(u64, u64, u32)>>,
-    /// Backward mode: one flag per input row of the block being run.
-    pub hits: Vec<bool>,
+    /// Backward mode: one flag per input row of the lane range being run.
+    hits: Vec<bool>,
+    hit_base: usize,
 }
 
 impl<'a> ForwardSink<'a> {
-    pub fn new(visited: Option<&'a mut Visited>, edges_on: bool) -> Self {
+    pub fn new(owners: u32, edges_on: bool) -> Self {
         ForwardSink {
-            visited,
+            owners,
+            slots: Default::default(),
             edges_on,
             edges: Default::default(),
             emitted: 0,
-            out: Vec::new(),
             targets: None,
             hits: Vec::new(),
+            hit_base: 0,
         }
     }
 
-    /// The backward's sink for a block of `width` candidate rows.
-    pub fn backward(targets: &'a rustc_hash::FxHashSet<(u64, u64, u32)>, width: usize) -> Self {
-        let mut s = Self::new(None, false);
+    /// The backward's sink for the candidate rows `lanes` of a block.
+    pub fn backward(targets: &'a rustc_hash::FxHashSet<(u64, u64, u32)>, lanes: Range<usize>) -> Self {
+        let mut s = Self::new(1, false);
         s.targets = Some(targets);
-        s.hits = vec![false; width];
+        s.hits = vec![false; lanes.len()];
+        s.hit_base = lanes.start;
         s
+    }
+
+    /// Backward mode: input row `lane` (a block lane index) reaches a target.
+    pub fn hit(&mut self, lane: usize) {
+        self.hits[lane - self.hit_base] = true;
+    }
+
+    /// Backward mode: the hit flags, one per lane of the range run.
+    pub fn hits(&self) -> &[bool] {
+        &self.hits
+    }
+
+    /// The slot for `(owner, shape)`, created from `init` on first use.
+    pub fn slot(&mut self, owner: u32, shape: u64, init: impl FnOnce() -> Rt2) -> &mut Slot {
+        self.slots
+            .entry((owner, shape))
+            .or_insert_with(|| Slot { rt2: init(), cells: Vec::new() })
+    }
+
+    /// Emit one materialized single-row block at `cell` (the reference
+    /// engine's path; the kernels push fields into the slot directly).
+    pub fn emit_row(&mut self, row: &Rt2, cell: u32) {
+        debug_assert_eq!(row.width, 1);
+        debug_assert_eq!(row.row_keys.len(), 1, "an emitted row carries its key");
+        let owner = owner_of(self.owners, row.shape_hash, cell);
+        let slot = self.slot(owner, row.shape_hash, || {
+            let mut b = celeste_engine::slots::reshape(row, 0);
+            b.shape_hash = row.shape_hash;
+            b
+        });
+        slot.rt2.append_rows(row, &[0]);
+        slot.cells.push(cell);
+        self.emitted += 1;
     }
 }
 
@@ -241,8 +303,8 @@ impl<'a> MarkFilter<'a> {
     /// live there (`abstraction.rs`) and this is the one place the loop
     /// still needs them. Paid only at levels >= 1, whose frontiers the
     /// filter itself keeps small.
-    pub fn allowed(&self, block: &Block) -> Result<Vec<bool>> {
-        let (keys, cells) = widened_keys(block, self.coarser)?;
+    pub fn allowed(&self, rt2: &Rt2) -> Result<Vec<bool>> {
+        let (keys, cells) = widened_keys_rt2(rt2, self.coarser)?;
         Ok(keys
             .iter()
             .zip(&cells)
@@ -263,15 +325,22 @@ pub fn widened_keys(
     block: &Block,
     coarser: crate::interpreter::abstraction::RemPrecision,
 ) -> Result<(Vec<(u64, u64)>, Vec<u32>)> {
+    widened_keys_rt2(&block.rt2, coarser)
+}
+
+pub fn widened_keys_rt2(
+    rt2: &Rt2,
+    coarser: crate::interpreter::abstraction::RemPrecision,
+) -> Result<(Vec<(u64, u64)>, Vec<u32>)> {
     use crate::interpreter::abstraction::RemPrecision;
-    let mut w = block.rt2.clone_block();
+    let mut w = rt2.clone_block();
     if let RemPrecision::Bits(b) = coarser {
         w.widen_to(crate::compiled::ids(), b);
     }
     let keys = w.row_keys_canonical();
     let cells = crate::search::pos_graph::block_cells(&w)?;
     anyhow::ensure!(
-        keys.len() == block.lanes() && cells.len() == block.lanes(),
+        keys.len() == rt2.width && cells.len() == rt2.width,
         "the widening changed the lane count"
     );
     Ok((keys, cells))
@@ -286,108 +355,185 @@ pub fn widened_keys(
 /// Two implementations behind this one trait: the compiled kernels (fast) and
 /// the scalar interpreter (`trace::refengine`, the trusted reference). The loop
 /// holds a `&dyn FrameStep` and never knows which.
-pub trait FrameStep {
-    /// One frame of `block`, emitted into `sink`.
-    fn run(&mut self, block: Block, sink: &mut ForwardSink) -> Result<()>;
+pub trait FrameStep: Sync {
+    /// One frame of lanes `lanes` of `block` (whose per-lane cells are
+    /// `cell_in`), emitted into `sink`. Called from many workers at once on
+    /// disjoint lane ranges: an implementation keeps its scratch in the
+    /// sink or behind a lock.
+    fn run(&self, block: &Block, cell_in: &[u32], lanes: Range<usize>, sink: &mut ForwardSink) -> Result<()>;
 }
 
-/// The minimal forward frame: run the frame step over every bucket of the
-/// frontier, dedup at the door, and route the survivors into next frame's
-/// buckets. Returns the next frontier and whether any survivor wins.
+/// Lanes per unit of the emit phase for `lanes` lanes over `workers`: the
+/// kernel runs 16-lane slices, and the step's within-call dedup (`seen`)
+/// only sees one unit, so bigger units re-emit fewer rows to the owners;
+/// ~16 units per worker keeps them balanced. Clamped to [2048, 16384].
+fn unit_lanes(lanes: usize, workers: usize) -> usize {
+    (lanes / (workers * 16)).clamp(2048, 16384)
+}
+
+/// Cut `blocks` (by lane count) into `(block, lo, hi)` units.
+fn units_of(lanes: impl Iterator<Item = usize>, unit: usize) -> Vec<(usize, usize, usize)> {
+    let mut units = Vec::new();
+    for (bi, n) in lanes.enumerate() {
+        let mut lo = 0;
+        while lo < n {
+            let hi = (lo + unit).min(n);
+            units.push((bi, lo, hi));
+            lo = hi;
+        }
+    }
+    units
+}
+
+/// One forward frame, in two parallel phases with one barrier between
+/// them (plans/parallel.md):
 ///
-/// Level 0 (no `filter`): the step carries the visited set and only
-/// materializes rows new to the search. A filtered level: the step hands
-/// back every row it keeps, the ladder filter decides per row, and the
-/// visited insert follows - a filtered-out lane never enters `visited`.
-/// Either way the pos-graph sees every raw output's edge.
+/// 1. EMIT, partitioned by input: units of `UNIT_LANES` lanes of the
+///    frontier's blocks, pulled by `threads()` workers. Each worker runs
+///    the frame step on its units into its own `ForwardSink`, which sorts
+///    every emitted row into the slot of its OWNER (`owner_of` of the
+///    row's shape and cell). No shared state is touched.
+/// 2. OWN, partitioned by output: worker `o` walks every sink's slots
+///    addressed to it, applies the ladder filter, dedups at the door
+///    against ITS OWN visited shard, and appends the survivors into its
+///    own next-frame pieces (one per shape). No shared state, no locks; the
+///    door sees each `(shape, cell)` on exactly one thread.
+///
+/// The next frontier is the union of the owners' pieces (up to
+/// `threads()` blocks per shape); the pos-graph sees every raw output's
+/// edge. Rows emitted twice by different units are both handed to the
+/// owner and the door keeps the first - the same set as one call would.
 pub fn forward_frame(
-    engine: &mut dyn FrameStep,
+    engine: &dyn FrameStep,
     frontier: Vec<Block>,
-    visited: &mut Visited,
-    is_win: impl Fn(&Block) -> Result<bool>,
+    visited: &mut [Visited],
     pos: Option<&crate::search::pos_graph::PosObserver>,
     filter: Option<&MarkFilter>,
 ) -> Result<(Vec<Block>, bool, FrameStats)> {
     use std::time::Instant;
     let mut st = FrameStats::default();
-    let mut won = false;
-    let mut buckets: rustc_hash::FxHashMap<u64, Rt2> = Default::default();
+    let owners = visited.len() as u32;
+    let workers = threads();
     st.blocks_in = frontier.len();
-    for block in frontier {
-        st.lanes_in += block.lanes();
-        let door = if filter.is_none() { Some(&mut *visited) } else { None };
-        let mut sink = ForwardSink::new(door, pos.is_some());
-        let t = Instant::now();
-        engine.run(block, &mut sink)?;
-        st.t_engine += t.elapsed();
-        if let Some(p) = pos {
-            p.record_pairs(sink.edges.drain());
-        }
-        st.lanes_raw += sink.emitted as usize;
-        let outs = std::mem::take(&mut sink.out);
-        drop(sink);
-        for out in outs {
-            let out = Block::from_rt2(out);
-            let kept = match filter {
-                None => Some(out),
-                Some(f) => {
-                    // Ladder filter (coarser level's marked set), then the
-                    // door: `&&` short-circuits, so a filtered-out lane is
-                    // never inserted into `visited`.
-                    let t = Instant::now();
-                    let allow = f.allowed(&out)?;
-                    st.t_filter += t.elapsed();
-                    let t = Instant::now();
-                    let cells = out.positions()?;
-                    let mask: Vec<bool> = out
-                        .keys()
-                        .iter()
-                        .zip(&cells)
-                        .enumerate()
-                        .map(|(i, (k, &c))| allow[i] && visited.insert(*k, c))
-                        .collect();
-                    st.t_visited += t.elapsed();
-                    out.keep(&mask)
-                }
-            };
-            if let Some(kept) = kept {
-                st.lanes_kept += kept.lanes();
-                won |= is_win(&kept)?;
-                let t = Instant::now();
-                route(kept.into_rt2(), &mut buckets);
-                st.t_route += t.elapsed();
-            }
+    st.lanes_in = frontier.iter().map(Block::lanes).sum();
+
+    // Phase 1: emit.
+    let t = Instant::now();
+    let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
+    let units = units_of(frontier.iter().map(Block::lanes), unit_lanes(st.lanes_in, workers));
+    let next_unit = AtomicUsize::new(0);
+    let sinks: Vec<ForwardSink> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let (frontier, cells, units, next_unit) = (&frontier, &cells, &units, &next_unit);
+                scope.spawn(move || -> Result<ForwardSink> {
+                    let mut sink = ForwardSink::new(owners, pos.is_some());
+                    loop {
+                        let u = next_unit.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(bi, lo, hi)) = units.get(u) else { break };
+                        engine.run(&frontier[bi], &cells[bi], lo..hi, &mut sink)?;
+                    }
+                    Ok(sink)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("emit worker panicked"))
+            .collect::<Result<Vec<_>>>()
+    })?;
+    st.t_emit = t.elapsed();
+    st.lanes_raw = sinks.iter().map(|s| s.emitted as usize).sum();
+    if let Some(p) = pos {
+        for sink in &sinks {
+            p.record_pairs(sink.edges.iter().copied());
         }
     }
-    let next: Vec<Block> = buckets.into_values().map(Block::from_rt2).collect();
+
+    // Phase 2: own.
+    let t = Instant::now();
+    let owned: Vec<(Vec<Rt2>, usize, bool)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = visited
+            .iter_mut()
+            .enumerate()
+            .map(|(o, vis)| {
+                let sinks = &sinks;
+                scope.spawn(move || -> Result<(Vec<Rt2>, usize, bool)> {
+                    let mut pieces: rustc_hash::FxHashMap<u64, Rt2> = Default::default();
+                    let (mut kept_n, mut won) = (0usize, false);
+                    for sink in sinks {
+                        for (&(owner, shape), slot) in &sink.slots {
+                            if owner != o as u32 {
+                                continue;
+                            }
+                            crate::compiled::asm_kernel::key_check(&slot.rt2);
+                            // Ladder filter (coarser level's marked set), then
+                            // the door: `&&` short-circuits, so a filtered-out
+                            // row is never inserted into `visited`.
+                            let allow = match filter {
+                                Some(f) => Some(f.allowed(&slot.rt2)?),
+                                None => None,
+                            };
+                            let mut rows: Vec<u32> = Vec::new();
+                            for i in 0..slot.rt2.width {
+                                if allow.as_ref().is_none_or(|a| a[i])
+                                    && vis.insert(slot.rt2.row_keys[i], slot.cells[i])
+                                {
+                                    rows.push(i as u32);
+                                }
+                            }
+                            if rows.is_empty() {
+                                continue;
+                            }
+                            kept_n += rows.len();
+                            let wins = wins_of(&slot.rt2)?;
+                            won |= rows.iter().any(|&r| wins[r as usize]);
+                            let piece = pieces.entry(shape).or_insert_with(|| {
+                                let mut b = celeste_engine::slots::reshape(&slot.rt2, 0);
+                                b.shape_hash = shape;
+                                b
+                            });
+                            piece.append_rows(&slot.rt2, &rows);
+                        }
+                    }
+                    Ok((pieces.into_values().collect(), kept_n, won))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("owner worker panicked"))
+            .collect::<Result<Vec<_>>>()
+    })?;
+    st.t_own = t.elapsed();
+    let mut won = false;
+    let mut next: Vec<Block> = Vec::new();
+    for (pieces, kept, w) in owned {
+        st.lanes_kept += kept;
+        won |= w;
+        next.extend(pieces.into_iter().map(Block::from_rt2));
+    }
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
     Ok((next, won, st))
 }
 
-/// Where one forward frame's time went and what it moved, for the per-frame
-/// log line and the phase totals. Phases are the loop's own seams; the frame
-/// step keeps its own counters (`kernel calls:` in the run summary).
+/// Where one forward frame's time went and what it moved, for the
+/// per-frame log line and the phase totals.
 #[derive(Default, Clone, Copy)]
 pub struct FrameStats {
     pub blocks_in: usize,
     pub lanes_in: usize,
-    /// Output lanes as the engine handed them back, before the filter/dedup.
+    /// Output lanes as the workers emitted them, before the filter/door.
     pub lanes_raw: usize,
     /// Lanes that passed the filter and were new to `visited`.
     pub lanes_kept: usize,
     pub blocks_out: usize,
-    /// Lanes after regrouping (cross-block duplicates collapsed).
     pub lanes_out: usize,
-    pub t_engine: std::time::Duration,
-    pub t_filter: std::time::Duration,
-    pub t_visited: std::time::Duration,
-    pub t_route: std::time::Duration,
-}
-
-/// A block wins if any lane sits on the room's win target (`Block::wins`).
-pub fn block_wins(block: &Block) -> Result<bool> {
-    Ok(block.wins()?.iter().any(|&w| w))
+    /// The emit phase (kernel calls, partitioned by input), wall.
+    pub t_emit: std::time::Duration,
+    /// The own phase (filter, door, append, partitioned by owner), wall.
+    pub t_own: std::time::Duration,
 }
 
 /// The result of a backward pass: the marked set (sharded by shape+cell) plus
@@ -426,7 +572,7 @@ pub struct BackwardResult {
 /// its outputs is a target (provenance consumed at emission,
 /// plans/buckets.md). Marks are matched by key.
 pub fn backward_run(
-    engine: &mut dyn FrameStep,
+    engine: &dyn FrameStep,
     dir: &std::path::Path,
     horizon: u32,
     graph: &crate::search::pos_graph::PosGraph,
@@ -446,7 +592,7 @@ pub fn backward_run(
 /// marked on their own, i.e. the wins, from any layer). Factored out so a
 /// test can seed it directly; `backward_run` seeds from the win lanes.
 pub fn backward_walk(
-    engine: &mut dyn FrameStep,
+    engine: &dyn FrameStep,
     dir: &std::path::Path,
     horizon: u32,
     graph: &crate::search::pos_graph::PosGraph,
@@ -485,32 +631,75 @@ pub fn backward_walk(
         // cells. The layers are streamed from disk per iteration (a level's
         // layers do not fit in memory at a real horizon); `load_frame_cells`
         // keeps only the rows in the narrowed cells.
+        // The layers <= i, loaded in parallel (a range copy per file and
+        // candidate cell), then the unmarked rows of each.
+        let layers: Vec<Vec<Block>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..=i)
+                .map(|f| {
+                    let cand_cells = &cand_cells;
+                    scope.spawn(move || load_frame_cells(dir, f, cand_cells))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("layer loader panicked"))
+                .collect::<Result<Vec<_>>>()
+        })?;
         let mut cands: Vec<Block> = Vec::new();
-        for f in 0..=i {
-            for block in load_frame_cells(dir, f, &cand_cells)? {
-                loaded += block.lanes();
-                let cells = block.positions()?;
-                let mask: Vec<bool> = block
-                    .keys()
-                    .iter()
-                    .zip(&cells)
-                    .map(|(k, &c)| !marked.contains(*k, c))
-                    .collect();
-                if let Some(cand) = block.keep(&mask) {
-                    cands.push(cand);
-                }
+        for block in layers.into_iter().flatten() {
+            loaded += block.lanes();
+            let cells = block.positions()?;
+            let mask: Vec<bool> = block
+                .keys()
+                .iter()
+                .zip(&cells)
+                .map(|(k, &c)| !marked.contains(*k, c))
+                .collect();
+            if let Some(cand) = block.keep(&mask) {
+                cands.push(cand);
             }
         }
         t_load += t.elapsed();
-        for cand in cands {
-            let keys: Vec<(u64, u64)> = cand.keys().to_vec();
-            let cells = cand.positions()?;
-            frame_reruns += cand.lanes() as u64;
-            let mut sink = ForwardSink::backward(&targets, cand.lanes());
-            let t = std::time::Instant::now();
-            engine.run(cand, &mut sink)?;
-            t_run += t.elapsed();
-            for (lane, hit) in sink.hits.iter().enumerate() {
+        // The re-runs: units of candidate lanes over the workers, each
+        // reporting which of its input rows hit a target.
+        let t = std::time::Instant::now();
+        let cand_cells_of: Vec<Vec<u32>> = cands.iter().map(Block::positions).collect::<Result<_>>()?;
+        frame_reruns += cands.iter().map(|b| b.lanes() as u64).sum::<u64>();
+        let units = units_of(
+            cands.iter().map(Block::lanes),
+            unit_lanes(frame_reruns as usize, threads()),
+        );
+        let next_unit = AtomicUsize::new(0);
+        let hits: Vec<(usize, usize, Vec<bool>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads())
+                .map(|_| {
+                    let (cands, cand_cells_of, units, next_unit, targets) =
+                        (&cands, &cand_cells_of, &units, &next_unit, &targets);
+                    scope.spawn(move || -> Result<Vec<(usize, usize, Vec<bool>)>> {
+                        let mut out = Vec::new();
+                        loop {
+                            let u = next_unit.fetch_add(1, Ordering::Relaxed);
+                            let Some(&(bi, lo, hi)) = units.get(u) else { break };
+                            let mut sink = ForwardSink::backward(targets, lo..hi);
+                            engine.run(&cands[bi], &cand_cells_of[bi], lo..hi, &mut sink)?;
+                            out.push((bi, lo, sink.hits().to_vec()));
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("backward worker panicked"))
+                .collect::<Result<Vec<_>>>()
+                .map(|v| v.into_iter().flatten().collect())
+        })?;
+        t_run += t.elapsed();
+        for (bi, lo, unit_hits) in hits {
+            let keys = cands[bi].keys();
+            let cells = &cand_cells_of[bi];
+            for (j, hit) in unit_hits.iter().enumerate() {
+                let lane = lo + j;
                 if *hit && marked.insert(keys[lane], cells[lane]) {
                     new_frontier.push((keys[lane], cells[lane]));
                 }
@@ -544,7 +733,8 @@ pub fn backward_walk(
 /// rather than rerun. Every frame is checkpointed as it is produced.
 pub struct ForwardState {
     frontier: Vec<Block>,
-    visited: Visited,
+    /// One visited shard per owner (`owner_of`).
+    visited: Vec<Visited>,
     observer: Option<crate::search::pos_graph::PosObserver>,
     /// The last frame computed (and checkpointed).
     pub frames: u32,
@@ -566,11 +756,12 @@ impl ForwardState {
     /// Frame 0: seed the visited set from `initial`, checkpoint it, start
     /// recording the position graph if `record`.
     pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool) -> Result<Self> {
-        let mut visited = Visited::new();
+        let owners = threads();
+        let mut visited: Vec<Visited> = (0..owners).map(|_| Visited::new()).collect();
         for b in &initial {
             let cells = b.positions()?;
             for (k, c) in b.keys().iter().zip(&cells) {
-                visited.insert(*k, *c);
+                visited[owner_of(owners as u32, k.0, *c) as usize].insert(*k, *c);
             }
         }
         checkpoint_frontier(dir, 0, &mut initial)?;
@@ -587,9 +778,14 @@ impl ForwardState {
     /// the run: a horizon is a bound on the win frame, and the backward
     /// needs every frame up to it (its seeds are the wins at each). Only an
     /// empty frontier stops it.
+    /// The visited set's size, over all owners.
+    pub fn visited_len(&self) -> usize {
+        self.visited.iter().map(Visited::len).sum()
+    }
+
     pub fn extend(
         &mut self,
-        engine: &mut dyn FrameStep,
+        engine: &dyn FrameStep,
         dir: &std::path::Path,
         to: u32,
         filter: Option<&MarkFilter>,
@@ -598,14 +794,8 @@ impl ForwardState {
             let frame = self.frames + 1;
             let t_frame = std::time::Instant::now();
             let frontier = std::mem::take(&mut self.frontier);
-            let (mut next, won, st) = forward_frame(
-                engine,
-                frontier,
-                &mut self.visited,
-                block_wins,
-                self.observer.as_ref(),
-                filter,
-            )?;
+            let (mut next, won, st) =
+                forward_frame(engine, frontier, &mut self.visited, self.observer.as_ref(), filter)?;
             let t = std::time::Instant::now();
             checkpoint_frontier(dir, frame, &mut next)?;
             let t_ckpt = t.elapsed();
@@ -614,7 +804,7 @@ impl ForwardState {
                 o.flush();
             }
             let t_pos = t.elapsed();
-            log_frame(frame, &st, t_ckpt, t_pos, t_frame.elapsed(), self.visited.len());
+            log_frame(frame, &st, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
             self.frames = frame;
             if won && self.win_frame.is_none() {
                 self.win_frame = Some(frame);
@@ -626,15 +816,25 @@ impl ForwardState {
             // start room's kernel set does not cover the next room's
             // shapes).
             self.frontier = if won {
-                let mut kept = Vec::with_capacity(next.len());
-                for b in next {
-                    let wins = b.wins()?;
-                    let mask: Vec<bool> = wins.iter().map(|w| !w).collect();
-                    if let Some(k) = b.keep(&mask) {
-                        kept.push(k);
-                    }
-                }
-                kept
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = next
+                        .into_iter()
+                        .map(|b| {
+                            scope.spawn(move || -> Result<Option<Block>> {
+                                let wins = b.wins()?;
+                                let mask: Vec<bool> = wins.iter().map(|w| !w).collect();
+                                Ok(b.keep(&mask))
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("win-drop worker panicked"))
+                        .collect::<Result<Vec<_>>>()
+                })?
+                .into_iter()
+                .flatten()
+                .collect()
             } else {
                 next
             };
@@ -651,7 +851,7 @@ impl ForwardState {
 /// A whole forward run in one call: frame 0 from `initial`, then frames
 /// `1..=max_frames`.
 pub fn forward_run(
-    engine: &mut dyn FrameStep,
+    engine: &dyn FrameStep,
     initial: Vec<Block>,
     dir: &std::path::Path,
     max_frames: u32,
@@ -677,8 +877,7 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         engine {:.0} filter {:.0} visited {:.0} route {:.0} \
-         ckpt {:.0} pos {:.0} total {:.0} ms | rss {:.2} GB",
+         emit {:.0} own {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | rss {:.2} GB",
         st.blocks_in,
         st.lanes_in,
         st.lanes_raw,
@@ -686,19 +885,15 @@ fn log_frame(
         st.blocks_out,
         st.lanes_out,
         visited,
-        ms(st.t_engine),
-        ms(st.t_filter),
-        ms(st.t_visited),
-        ms(st.t_route),
+        ms(st.t_emit),
+        ms(st.t_own),
         ms(t_ckpt),
         ms(t_pos),
         ms(t_total),
         crate::metrics::peak_rss_gb(),
     );
-    crate::metrics::record("fwd.engine", st.t_engine);
-    crate::metrics::record("fwd.filter", st.t_filter);
-    crate::metrics::record("fwd.visited", st.t_visited);
-    crate::metrics::record("fwd.route", st.t_route);
+    crate::metrics::record("fwd.emit", st.t_emit);
+    crate::metrics::record("fwd.own", st.t_own);
     crate::metrics::record("fwd.checkpoint", t_ckpt);
     crate::metrics::record("fwd.posgraph", t_pos);
     crate::metrics::record("fwd.frame", t_total);
@@ -711,29 +906,36 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
     // Fresh: a re-run / resumed frame must not leave stale files behind.
     let _ = std::fs::remove_dir_all(&fdir);
     std::fs::create_dir_all(&fdir)?;
-    let mut seen_shapes: rustc_hash::FxHashSet<u64> = Default::default();
-    for block in frontier.iter_mut() {
-        ensure!(
-            seen_shapes.insert(block.shard_shape()),
-            "checkpoint f{frame}: two blocks of shape {:#x} - the frontier is one block per shape",
-            block.shard_shape()
-        );
-        // Canonical order: by (cell, key). The frontier itself is sorted in
-        // place, so the file order and the kernel's lane order agree and
-        // neither depends on how the frame was scheduled.
-        let cells = block.positions()?;
-        let mut perm: Vec<u32> = (0..block.lanes() as u32).collect();
-        perm.sort_unstable_by_key(|&i| (cells[i as usize], block.rt2.row_keys[i as usize]));
-        block.rt2.gather_lanes(&perm);
-        let cells: Vec<u32> = perm.iter().map(|&i| cells[i as usize]).collect();
-        let wins = block.wins()?;
-        let path = fdir.join(format!("s{:016x}.bin", block.shard_shape()));
-        crate::search::checkpoint::save_block(&path, &block.rt2, &cells, &wins)?;
-    }
-    Ok(())
+    // One file per block (an owner's piece of a shape), written in
+    // parallel. Canonical order inside each: by (cell, key), and the block
+    // itself is sorted in place, so the file order and the kernel's lane
+    // order agree and neither depends on how the frame was scheduled.
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = frontier
+            .iter_mut()
+            .enumerate()
+            .map(|(seq, block)| {
+                let fdir = &fdir;
+                scope.spawn(move || -> Result<()> {
+                    let cells = block.positions()?;
+                    let mut perm: Vec<u32> = (0..block.lanes() as u32).collect();
+                    perm.sort_unstable_by_key(|&i| (cells[i as usize], block.rt2.row_keys[i as usize]));
+                    block.rt2.gather_lanes(&perm);
+                    let cells: Vec<u32> = perm.iter().map(|&i| cells[i as usize]).collect();
+                    let wins = block.wins()?;
+                    let path = fdir.join(format!("s{:016x}_{:03}.bin", block.shard_shape(), seq));
+                    crate::search::checkpoint::save_block(&path, &block.rt2, &cells, &wins)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("checkpoint worker panicked"))
+            .collect::<Result<()>>()
+    })
 }
 
-/// The checkpoint files of a frame, one per shape, mapped.
+/// The checkpoint files of a frame (one per block written), mapped.
 pub fn frame_files(
     dir: &std::path::Path,
     frame: u32,
@@ -921,7 +1123,7 @@ where
             self.level0 = Some((engine, state));
         }
         let (engine, state) = self.level0.as_mut().expect("just started");
-        state.extend(engine.as_mut(), &dir, horizon, None)?;
+        state.extend(engine.as_ref(), &dir, horizon, None)?;
         Ok(state.win_frame.filter(|&h| h <= horizon))
     }
 
@@ -939,10 +1141,10 @@ where
                 (win, state.pos_graph().expect("level 0 records"))
             } else {
                 crate::interpreter::abstraction::set_rem_precision(precision);
-                let mut engine = (self.make_engine)(precision)?;
+                let engine = (self.make_engine)(precision)?;
                 let filter = prev.as_ref().map(|(m, p)| MarkFilter::new(m, *p));
                 let fwd = forward_run(
-                    engine.as_mut(),
+                    engine.as_ref(),
                     (self.make_initial)()?,
                     &dir,
                     horizon,
@@ -956,9 +1158,9 @@ where
                 eprintln!("[ladder] h{horizon} level {level} ({precision:?}): NO WIN -> Refuted");
                 return Ok(HorizonOutcome::Refuted { level });
             };
-            let engine: &mut dyn FrameStep = match fresh.as_mut() {
-                Some(e) => e.as_mut(),
-                None => self.level0.as_mut().expect("level 0").0.as_mut(),
+            let engine: &dyn FrameStep = match fresh.as_ref() {
+                Some(e) => e.as_ref(),
+                None => self.level0.as_ref().expect("level 0").0.as_ref(),
             };
             let bwd = backward_run(engine, &dir, horizon, &graph)?;
             bwd.marked.save(&marks_path(self.base_dir, horizon, level))?;
@@ -1034,6 +1236,7 @@ pub fn find_optimum(
 mod tests {
     use super::*;
     use crate::trace::refengine::RefEngine;
+    use std::sync::Mutex;
 
     /// End-to-end proof that the rebuilt outer loop runs: drive `forward_run`
     /// over the trusted reference engine for a few frames from the initial
@@ -1043,14 +1246,14 @@ mod tests {
     #[test]
     #[ignore]
     fn forward_run_drives_the_reference_engine() {
-        let mut engine = RefEngine::new().expect("ref engine");
+        let engine = RefEngine::new().expect("ref engine");
         let init = vec![Block::from_state(&engine.initial_state().expect("initial state")).expect("block")];
 
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-test");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("mkdir");
 
-        let result = forward_run(&mut engine, init, dir, 4, true, None).expect("forward_run");
+        let result = forward_run(&Mutex::new(engine), init, dir, 4, true, None).expect("forward_run");
         // No win in the 4-frame intro; the run reaches the horizon.
         assert_eq!(result.win_frame, None, "unexpected early win in the intro");
         assert_eq!(result.frames, 4, "expected 4 frames run");
@@ -1087,12 +1290,12 @@ mod tests {
         let bits0 = RemPrecision::Bits(0);
         let engine = RefEngine::new().expect("ref engine");
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-filter-test");
-        let seed = || vec![Block::from_state(&engine_clone(&engine).initial_state().expect("init")).expect("block")];
+        let seed = || vec![Block::from_state(&engine.initial_state().expect("init")).expect("block")];
 
         // Baseline one frame, no filter.
         {
-            let mut e = engine_clone(&engine);
-            forward_run(&mut e, seed(), dir, 1, false, None).expect("baseline");
+            let e = engine_clone(&engine);
+            forward_run(&e, seed(), dir, 1, false, None).expect("baseline");
         }
         let frame1 = load_frame(dir, 1).expect("load f1");
         assert!(!frame1.is_empty(), "baseline produced no frame 1");
@@ -1109,8 +1312,8 @@ mod tests {
         // With the full marked set, frame 1 survives.
         {
             let f = MarkFilter::new(&marked_full, bits0);
-            let mut e = engine_clone(&engine);
-            forward_run(&mut e, seed(), dir, 1, false, Some(&f)).expect("full-filter run");
+            let e = engine_clone(&engine);
+            forward_run(&e, seed(), dir, 1, false, Some(&f)).expect("full-filter run");
             let kept = load_frame(dir, 1).expect("load f1 full");
             assert!(!kept.is_empty(), "full marked set wrongly discarded frame 1");
         }
@@ -1119,18 +1322,18 @@ mod tests {
         {
             let empty = Visited::new();
             let f = MarkFilter::new(&empty, bits0);
-            let mut e = engine_clone(&engine);
-            forward_run(&mut e, seed(), dir, 1, false, Some(&f)).expect("empty-filter run");
+            let e = engine_clone(&engine);
+            forward_run(&e, seed(), dir, 1, false, Some(&f)).expect("empty-filter run");
             let kept = load_frame(dir, 1).expect("load f1 empty");
             assert!(kept.is_empty(), "empty marked set failed to discard frame 1");
         }
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A fresh reference engine (RefEngine isn't Clone; each forward_run needs
-    /// its own since run takes &mut). Cheap enough for a test.
-    fn engine_clone(_e: &RefEngine) -> RefEngine {
-        RefEngine::new().expect("ref engine")
+    /// A fresh reference engine behind the lock the `FrameStep` impl needs
+    /// (RefEngine isn't Clone). Cheap enough for a test.
+    fn engine_clone(_e: &RefEngine) -> Mutex<RefEngine> {
+        Mutex::new(RefEngine::new().expect("ref engine"))
     }
 
     /// The FULL ladder to the concrete level: run every precision - Bits 0..=16
@@ -1255,9 +1458,9 @@ mod tests {
         };
 
         {
-            let mut e = RefEngine::new().expect("engine");
+            let e = RefEngine::new().expect("engine");
             let init = vec![Block::from_state(&e.initial_state().expect("init")).expect("block")];
-            forward_run(&mut e, init, dir, 4, true, None).expect("fresh");
+            forward_run(&Mutex::new(e), init, dir, 4, true, None).expect("fresh");
         }
         let fresh4 = keyset(4);
         assert!(!fresh4.is_empty(), "fresh frame 4 empty");
@@ -1265,11 +1468,12 @@ mod tests {
         // The same run extended one frame at a time - the outer loop's
         // "one more frame at rem zero" - lands on the same key set.
         {
-            let mut e = RefEngine::new().expect("engine");
+            let e = RefEngine::new().expect("engine");
             let init = vec![Block::from_state(&e.initial_state().expect("init")).expect("block")];
+            let e = Mutex::new(e);
             let mut st = ForwardState::start(init, dir, true).expect("start");
             for to in 1..=4 {
-                st.extend(&mut e, dir, to, None).expect("extend");
+                st.extend(&e, dir, to, None).expect("extend");
                 assert_eq!(st.frames, to);
             }
             assert!(st.pos_graph().is_some());
@@ -1292,7 +1496,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         use crate::interpreter::abstraction::RemPrecision;
         let outcome = ladder_at_horizon(
-            |_precision| Ok(Box::new(RefEngine::new()?) as Box<dyn FrameStep>),
+            |_precision| Ok(Box::new(Mutex::new(RefEngine::new()?)) as Box<dyn FrameStep>),
             || Ok(vec![Block::from_state(&RefEngine::new()?.initial_state()?)?]),
             dir,
             4,
@@ -1320,14 +1524,15 @@ mod tests {
     #[test]
     #[ignore]
     fn backward_walk_propagates_along_the_intro_chain() {
-        let mut engine = RefEngine::new().expect("ref engine");
+        let engine = RefEngine::new().expect("ref engine");
         let init = vec![Block::from_state(&engine.initial_state().expect("initial state")).expect("block")];
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-bwd-test");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("mkdir");
 
         let horizon = 4;
-        let fwd = forward_run(&mut engine, init, dir, horizon, true, None).expect("forward");
+        let engine = Mutex::new(engine);
+        let fwd = forward_run(&engine, init, dir, horizon, true, None).expect("forward");
         let graph = fwd.pos_graph.expect("pos graph");
 
         // Seed from every state at the horizon frame.
@@ -1342,7 +1547,7 @@ mod tests {
             .collect();
         assert!(!seed.is_empty(), "no states at the horizon to seed from");
 
-        let bwd = backward_walk(&mut engine, dir, horizon, &graph, seed).expect("backward");
+        let bwd = backward_walk(&engine, dir, horizon, &graph, seed).expect("backward");
         eprintln!(
             "[backward] marked {} states, {} re-runs",
             bwd.marked.len(),

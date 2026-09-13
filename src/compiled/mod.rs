@@ -194,9 +194,10 @@ impl FrameEngine {
         &self,
         bucket: &runtime2::Rt2,
         cell_in: &[u32],
+        lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
     ) {
-        if !dispatch::run_chunk_kernel(bucket, &self.ids, cell_in, sink) {
+        if !dispatch::run_chunk_kernel(bucket, cell_in, lanes, sink) {
             // A chunk the kernels cannot take is a COVERAGE GAP, not a
             // degraded mode (CLAUDE.md "Never deopt to the interpreter"):
             // there is no fallback. The search checkpoints per completed
@@ -211,8 +212,8 @@ impl FrameEngine {
             );
         }
         if dispatch::widen_noop_check() {
-            for b in &sink.out {
-                assert_widen_is_noop(&bridge::export_block(b));
+            for slot in sink.slots.values() {
+                assert_widen_is_noop(&bridge::export_block(&slot.rt2));
             }
         }
     }
@@ -242,12 +243,13 @@ impl FrameEngine {
 /// engine itself is `&self`.
 impl crate::frame::FrameStep for FrameEngine {
     fn run(
-        &mut self,
-        block: crate::frame::Block,
+        &self,
+        block: &crate::frame::Block,
+        cell_in: &[u32],
+        lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
     ) -> anyhow::Result<()> {
-        let cell_in = block.positions()?;
-        self.run_bucket(&block.into_rt2(), &cell_in, sink);
+        self.run_bucket(block.rt2(), cell_in, lanes, sink);
         Ok(())
     }
 }

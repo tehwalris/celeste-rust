@@ -38,6 +38,12 @@ pub struct RefEngine {
     fn_info: FnInfo,
 }
 
+// The raw pointers inside (`FnInfo`'s function-body keys, the `Interp`'s
+// AST references) all point into the `'static` ASTs leaked in `new` -
+// immutable and never freed - so moving the engine to another thread
+// (behind the `Mutex` the `FrameStep` impl uses) is sound.
+unsafe impl Send for RefEngine {}
+
 impl RefEngine {
     /// Set up the reference interpreter for the configured start room: parse
     /// the cart, register the function bodies, and capture the base state the
@@ -110,46 +116,42 @@ impl RefEngine {
     }
 }
 
-/// The interpreter as the trusted `FrameStep` implementation (interface #1).
-/// `&mut self` because the `Interp` is reused across lanes and paths; the
-/// kernel engine ignores the mutability. Each fork leaf is one single-lane
-/// output block - correct but unvectorized, which is exactly the reference's
+/// The interpreter as the trusted `FrameStep` implementation (interface #1),
+/// behind a lock: the `Interp` is reused across lanes and paths, and the
+/// loop runs the step from many workers. Each fork leaf is one single-lane
+/// row - correct but unvectorized, which is exactly the reference's
 /// contract (callers that run it wide sample).
-impl crate::frame::FrameStep for RefEngine {
+impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
     fn run(
-        &mut self,
-        block: crate::frame::Block,
+        &self,
+        block: &crate::frame::Block,
+        cell_in: &[u32],
+        lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
     ) -> Result<()> {
+        let mut engine = self.lock().expect("reference engine lock");
         // The reference runs on interpreter `State`s: cross the bridge both
         // ways. `Block::from_state` keys each leaf by the one canonical rule,
         // so the loop sees the same key column the kernels would attach.
         // Provenance is per lane here: every leaf of lane `l` came from row
         // `l`, and the sink is told at emission exactly as the kernel does.
-        let cells_in = block.positions()?;
         let input = block.to_state();
-        for lane in 0..input.vector_size.max(1) {
-            for leaf in self.run_lane(&input, lane)? {
+        for lane in lanes {
+            for leaf in engine.run_lane(&input, lane)? {
                 let b = crate::frame::Block::from_state(&leaf)?;
                 let cell_out = b.positions()?[0];
                 let key = b.keys()[0];
                 if let Some(targets) = sink.targets {
                     sink.emitted += 1;
                     if targets.contains(&(key.0, key.1, cell_out)) {
-                        sink.hits[lane] = true;
+                        sink.hit(lane);
                     }
                     continue;
                 }
                 if sink.edges_on {
-                    sink.edges.insert((cells_in[lane], cell_out));
+                    sink.edges.insert((cell_in[lane], cell_out));
                 }
-                sink.emitted += 1;
-                if let Some(v) = sink.visited.as_deref_mut() {
-                    if !v.insert(key, cell_out) {
-                        continue;
-                    }
-                }
-                sink.out.push(b.into_rt2());
+                sink.emit_row(b.rt2(), cell_out);
             }
         }
         Ok(())

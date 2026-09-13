@@ -98,19 +98,20 @@ pub(crate) fn miss_report() -> String {
 
 pub(crate) fn run_chunk_kernel(
     chunk: &runtime2::Rt2,
-    ids: &runtime2::BoundaryIds,
     cell_in: &[u32],
+    lanes: std::ops::Range<usize>,
     sink: &mut crate::frame::ForwardSink,
 ) -> bool {
     // The ASM backend is THE kernel implementation: the fused compute graph
     // assembled at startup (`asm_kernel`). A miss (no shape, or a declined
     // lane) is counted here and is fatal in the caller.
-    let hit = super::asm_kernel::run_chunk(chunk, ids, cell_in, sink);
+    let n = lanes.len() as u64;
+    let hit = super::asm_kernel::run_chunk(chunk, cell_in, lanes, sink);
     if hit {
-        KERNEL_HITS[0].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        KERNEL_HITS[0].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         return true;
     }
-    KERNEL_HITS[1].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+    KERNEL_HITS[1].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     false
 }
 

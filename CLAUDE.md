@@ -250,10 +250,14 @@ v8), so the backward reads a cell's rows as a range instead of decoding the
 layer. Uncompressed: ~3x the zstd size on disk, and the decode that cost
 the H=89 backward 35 s per iteration is gone.)
 
-The pre-rebuild search's 16-thread / 8,000-lane chunked parallel path and its
-`./parcheck.sh` byte-identity gate went with `run.rs` / `sweep*.rs`. The rebuilt
-loop is `src/frame.rs`; see `plans/architecture.md` "Deferred follow-ups" for
-where parallelism lands next.
+The loop is parallel since 2026-09-13 (`plans/parallel.md`): every frame
+is two phases - EMIT, units of lanes over `threads()` workers, each
+sorting its rows by OWNER; OWN, one worker per owner doing the filter,
+the door (its private visited shard) and the append into its own
+next-frame pieces - with nothing shared and one barrier. `CELESTE_THREADS`
+overrides the default of one worker per physical core. The result is a
+function of the frame and the thread count, not of scheduling: the gates
+are identical at 1, 16 and 32 threads.
 
 ## Crate layout
 
@@ -317,14 +321,16 @@ One frame of the abstract search is `celeste_rust::compiled::FrameEngine`
 `::run_bucket` - one BUCKET in (one shape's `Rt2`; the old per-class
 split on freeze / moving key / pm1 cells was the generated kernels'
 premise and went 2026-09-12 with every gate identical), rows out through a
-`ForwardSink`. The frontier IS a set of buckets, one kernel call each
-(2,000+ rows per call, <1% lane padding), and the kernel's append step
-emits each surviving row already at the boundary - canonical structure,
-exact row key, `visited` consulted at the door, its `(input cell, output
-cell)` pos-graph edge recorded from the slice lane it came from - so the
-loop only routes rows into next frame's buckets (`Rt2::append_rows`).
+`ForwardSink`. The frontier IS a set of buckets (one block per shape per
+owner), run as units of lanes (<1% lane padding), and the kernel's append
+step emits each surviving row already at the boundary - canonical
+structure, exact row key, its `(input cell, output cell)` pos-graph edge
+recorded from the slice lane it came from - straight into the slot of
+the row's OWNER; the owner then consults its visited shard at the door
+and appends the survivors into its next-frame pieces (`Rt2::append_rows`).
 There is no regroup, no merge, no per-block `boundary`, and no
-provenance stored anywhere: it is consumed at emission (plans/buckets.md).
+provenance stored anywhere: it is consumed at emission (plans/buckets.md,
+plans/parallel.md).
 `FrameEngine` is one impl of the `FrameStep` trait (`src/frame.rs`); the
 reference `RefEngine` is the other, and crosses `compiled::bridge` (the
 only module that names both `State` and `Rt2`) at its edge. The loop
@@ -387,7 +393,7 @@ if the Lua changes) may be APPENDED by hand, never inserted.
     --room 1,0 [--from H0] [--to H] [--maxk 15] [--checkpoint-dir DIR]
 
 # One forward pass at one precision with the per-frame timing line
-# (engine / filter / visited / route / checkpoint ms, lanes in/raw/kept, RSS)
+# (emit / own / checkpoint ms, lanes in/raw/kept, RSS; CELESTE_THREADS=N)
 # and the pos-graph fingerprint; then the checkpoint-tree fingerprint.
 # The three pinned oracles are under gates/ (frontier sets, pos-graph edges,
 # backward marks); every change to the loop or the kernels must reproduce them.

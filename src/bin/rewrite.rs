@@ -170,14 +170,14 @@ fn main() -> Result<()> {
             let precision = if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) };
             set_rem_precision(precision);
             let t = std::time::Instant::now();
-            let mut engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
             eprintln!("[fwd] engine up in {:.2} s ({precision:?})", t.elapsed().as_secs_f64());
             let initial = vec![Block::from_state(
                 &celeste_rust::trace::refengine::RefEngine::new()?.initial_state()?,
             )?];
             let dir = std::path::Path::new(&checkpoint_dir);
             let t = std::time::Instant::now();
-            let fwd = forward_run(&mut engine, initial, dir, to, true, None)?;
+            let fwd = forward_run(&engine, initial, dir, to, true, None)?;
             let wall = t.elapsed().as_secs_f64();
             match fwd.win_frame {
                 Some(h) => println!("win at f{h} ({wall:.2} s)"),
@@ -238,7 +238,7 @@ fn main() -> Result<()> {
                     if !marked.iter().any(|&m| m) {
                         continue;
                     }
-                    let allow = filter.allowed(&block)?;
+                    let allow = filter.allowed(block.rt2())?;
                     for (i, &m) in marked.iter().enumerate() {
                         if m {
                             self_total += 1;
@@ -338,7 +338,7 @@ fn main() -> Result<()> {
             level,
             room,
         } => {
-            use celeste_rust::frame::{block_wins, frame_files, marks_path, widened_keys, Block, Visited};
+            use celeste_rust::frame::{frame_files, marks_path, widened_keys, wins_of, Block, Visited};
             use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
             use rustc_hash::FxHashMap;
             std::env::set_var("CELESTE_START_ROOM", &room);
@@ -448,7 +448,7 @@ fn main() -> Result<()> {
                     restore_buttons(initial, &mut succ)?;
                     *steps += 1;
                     let block = Block::from_state(&succ)?;
-                    if block_wins(&block)? {
+                    if wins_of(block.rt2())?.iter().any(|&w| w) {
                         path.push(byte);
                         eprintln!("[witness] WIN at f{} via input {}", f + 1, byte);
                         return Ok(true);
