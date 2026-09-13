@@ -132,6 +132,10 @@ enum Command {
         filter: Option<String>,
         #[arg(long, default_value_t = 0)]
         coarser: u8,
+        /// Record the frame's edges (into `<level dir>/bench-edges`, compacted
+        /// and deleted per rep, both timed) - the search's forward path.
+        #[arg(long, default_value_t = false)]
+        edges: bool,
     },
     /// Microbenchmark of ONE backward: a level's tree and pos-graph
     /// (`frames/` and `posgraph.bin` under `level_dir`, as `rewrite forward`
@@ -143,6 +147,10 @@ enum Command {
         horizon: u32,
         #[arg(long, default_value = "1,0")]
         room: String,
+        /// Run BOTH the kernel walk and the BFS and print the states marked
+        /// by only one of them (with their layer and cell).
+        #[arg(long, default_value_t = false)]
+        diff: bool,
     },
     /// Export a finished run for the web UI (`ui/`): per (horizon, level,
     /// frame) the states per player-position cell and the win cells, per
@@ -454,6 +462,7 @@ fn main() -> Result<()> {
             precision,
             filter,
             coarser,
+            edges,
         } => {
             use celeste_rust::frame::{forward_frame, load_frame, threads, Block, MarkFilter, Visited};
             use celeste_rust::search::door::Door;
@@ -489,25 +498,55 @@ fn main() -> Result<()> {
                 let small = vec![b.keep(&mask).expect("a non-empty block")];
                 forward_frame(&engine, small, &Door::new(), None, mark_filter, frame + 1, None)?;
             }
+            let edges_dir = dir.join("bench-edges");
             for rep in 0..reps {
-                let input: Vec<Block> = frontier.iter().map(|b| Block::from_rt2(b.rt2().clone_block())).collect();
+                // With their ids (as the search runs them: predecessor masks
+                // are tracked whenever the input has ids).
+                let input: Vec<Block> = frontier
+                    .iter()
+                    .map(|b| Block::with_ids(b.rt2().clone_block(), b.ids().to_vec(), b.seq()))
+                    .collect();
                 let door = Door::new();
+                let _ = std::fs::remove_dir_all(&edges_dir);
                 let t = std::time::Instant::now();
-                let (next, _won, st) = forward_frame(&engine, input, &door, None, mark_filter, frame + 1, None)?;
+                let (next, _won, st) =
+                    forward_frame(&engine, input, &door, None, mark_filter, frame + 1, edges.then_some(edges_dir.as_path()))?;
+                let t_fwd = t.elapsed();
+                let (t_compact, records) = if edges {
+                    let t = std::time::Instant::now();
+                    let c = celeste_rust::search::edges::compact_frame(&edges_dir, frame + 1)?;
+                    println!(
+                        "[bench]   compaction: {} records -> {} pairs, {:.1} MB runs ({:.2} B/pair); read {:.0} sort {:.0} write {:.0} ms",
+                        c.records,
+                        c.pairs,
+                        c.bytes as f64 / 1e6,
+                        c.bytes as f64 / c.pairs.max(1) as f64,
+                        c.t_read.as_secs_f64() * 1e3,
+                        c.t_sort.as_secs_f64() * 1e3,
+                        c.t_write.as_secs_f64() * 1e3
+                    );
+                    (t.elapsed(), c.records)
+                } else {
+                    (std::time::Duration::ZERO, 0)
+                };
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
                 println!(
-                    "[bench] rep {rep}: raw {} kept {} | wave {:.0} ms (idle {:.0}%) door {:.0} total {:.0} ms | flushes {} ({:.0} rows avg) | {} out blocks",
+                    "[bench] rep {rep}: raw {} kept {} | wave {:.0} ms (idle {:.0}%) door {:.0} total {:.0} ms | flushes {} ({:.0} rows avg) | {} out blocks | edges {} written {:.0} compact {:.0} ms",
                     st.lanes_raw,
                     st.lanes_kept,
                     ms(st.t_wave),
                     st.wave_idle * 100.0,
                     ms(st.t_door),
-                    ms(t.elapsed()),
+                    ms(t_fwd),
                     st.flushes,
                     st.flushed_rows as f64 / st.flushes.max(1) as f64,
-                    next.len()
+                    next.len(),
+                    records,
+                    ms(st.t_edges),
+                    ms(t_compact),
                 );
             }
+            let _ = std::fs::remove_dir_all(&edges_dir);
             celeste_rust::compiled::dispatch::print_kernel_hits();
         }
         Command::Census {
@@ -814,6 +853,7 @@ fn main() -> Result<()> {
             level_dir,
             horizon,
             room,
+            diff,
         } => {
             use celeste_rust::frame::{backward_run, pos_graph_path, threads};
             use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
@@ -824,6 +864,103 @@ fn main() -> Result<()> {
             let graph = celeste_rust::search::pos_graph::PosGraph::load(&pos_graph_path(dir))?;
             eprintln!("[bench] level-0 tree {}, pos-graph {} pairs; {} threads", dir.display(), graph.pairs(), threads());
             let t = std::time::Instant::now();
+            if diff {
+                let kern = backward_run(&engine, dir, horizon, &graph)?;
+                let bfs = celeste_rust::search::edges::backward(dir, horizon)?;
+                let a = kern.marked.entries();
+                let b = bfs.marked.entries();
+                let sa: std::collections::BTreeSet<_> = a.iter().copied().collect();
+                let sb: std::collections::BTreeSet<_> = b.iter().copied().collect();
+                // Where a state lives: its (layer, seq, row) through the tree.
+                let mut where_is: rustc_hash::FxHashMap<(u64, u32, (u64, u64)), Vec<u64>> = Default::default();
+                for layer in 0..=horizon {
+                    for (seq, file) in celeste_rust::frame::frame_files_seq(dir, layer)? {
+                        let cells = file.row_cells();
+                        for row in 0..file.width() {
+                            let k = (file.shape_hash(), cells[row as usize], file.key_at(row));
+                            if sa.contains(&k) != sb.contains(&k) {
+                                where_is.entry(k).or_default().push(celeste_rust::frame::pack_id(layer, seq, row));
+                            }
+                        }
+                    }
+                }
+                println!("[diff] kernel {} states, bfs {} states", a.len(), b.len());
+                let edges = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
+                for k in sa.difference(&sb) {
+                    let ids: Vec<String> = where_is.get(k).map(|v| v.iter().map(|&id| format!("l{} s{} r{}", celeste_rust::frame::id_layer(id), celeste_rust::frame::id_seq(id), celeste_rust::frame::id_row(id))).collect()).unwrap_or_default();
+                    println!("[diff] only kernel: shape {:016x} cell {} key {:016x}{:016x} at {:?}", k.0, k.1, k.2 .0, k.2 .1, ids);
+                    // Expand the disputed row alone and look at its successors.
+                    for &id in where_is.get(k).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        let (layer, seq, row) = (celeste_rust::frame::id_layer(id), celeste_rust::frame::id_seq(id), celeste_rust::frame::id_row(id));
+                        let files = celeste_rust::frame::frame_files_seq(dir, layer)?;
+                        let (_, file) = files.iter().find(|(s, _)| *s == seq).expect("the file");
+                        let win = file.win_rows().iter().any(|&(r, _)| r == row);
+                        let rt2 = file.load_rows(&[row..row + 1])?.expect("the row");
+                        let block = celeste_rust::frame::Block::with_ids(rt2, vec![id], seq);
+                        let tmp = dir.join("diff-edges");
+                        let _ = std::fs::remove_dir_all(&tmp);
+                        let door = celeste_rust::search::door::Door::new();
+                        let (next, _won, _st) = celeste_rust::frame::forward_frame(&engine, vec![block], &door, None, None, layer + 1, Some(&tmp))?;
+                        println!("[diff]   win row: {win}; successors: {} blocks", next.len());
+                        for b in &next {
+                            let cells = celeste_rust::search::pos_graph::block_cells(b.rt2())?;
+                            for (i, key) in b.keys().iter().enumerate() {
+                                let shape = b.rt2().shape_hash;
+                                let km = kern.marked.contains(shape, *key, cells[i]);
+                                let bm = bfs.marked.contains(shape, *key, cells[i]);
+                                if !km && !bm {
+                                    continue;
+                                }
+                                // Where is this successor in the tree?
+                                let mut found: Vec<u64> = Vec::new();
+                                for l2 in 0..=horizon {
+                                    for (s2, f2) in celeste_rust::frame::frame_files_seq(dir, l2)? {
+                                        if f2.shape_hash() != shape {
+                                            continue;
+                                        }
+                                        let c2 = f2.row_cells();
+                                        for r2 in 0..f2.width() {
+                                            if f2.key_at(r2) == *key && c2[r2 as usize] == cells[i] {
+                                                found.push(celeste_rust::frame::pack_id(l2, s2, r2));
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut recorded = Vec::new();
+                                for &t in &found {
+                                    let mut buf = Vec::new();
+                                    edges.preds_at(t, layer + 1, &mut buf);
+                                    recorded.push((t, buf.iter().filter(|e| e.base <= id && id < e.base + 16 && e.mask & (1 << (id - e.base)) != 0).count(), buf.len()));
+                                }
+                                println!(
+                                    "[diff]   succ cell {} key {:016x}{:016x} marked kernel {km} bfs {bm}; in tree at {:?}; edges from this row at f{}: {:?}",
+                                    cells[i], key.0, key.1,
+                                    found.iter().map(|&t| format!("l{} s{} r{}", celeste_rust::frame::id_layer(t), celeste_rust::frame::id_seq(t), celeste_rust::frame::id_row(t))).collect::<Vec<_>>(),
+                                    layer + 1,
+                                    recorded
+                                );
+                            }
+                        }
+                        let _ = std::fs::remove_dir_all(&tmp);
+                        let _ = std::fs::remove_dir_all(&tmp);
+                    }
+                }
+                for k in sb.difference(&sa) {
+                    let ids: Vec<String> = where_is.get(k).map(|v| v.iter().map(|&id| format!("l{} s{} r{}", celeste_rust::frame::id_layer(id), celeste_rust::frame::id_seq(id), celeste_rust::frame::id_row(id))).collect()).unwrap_or_default();
+                    println!("[diff] only bfs: shape {:016x} cell {} key {:016x}{:016x} at {:?}", k.0, k.1, k.2 .0, k.2 .1, ids);
+                }
+                return Ok(());
+            }
+            if celeste_rust::frame::bfs_backward() {
+                let bwd = celeste_rust::search::edges::backward(dir, horizon)?;
+                let (n, fp) = bwd.marked.fingerprint();
+                println!(
+                    "[bench] BFS backward h{horizon}: {:.2} s, marked {n} (fingerprint {fp:016x}), {} edges read",
+                    t.elapsed().as_secs_f64(),
+                    bwd.stats.edges_read
+                );
+                return Ok(());
+            }
             let bwd = backward_run(&engine, dir, horizon, &graph)?;
             let (n, fp) = bwd.marked.fingerprint();
             println!(

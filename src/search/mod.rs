@@ -16,5 +16,6 @@
 //! `compiled::FrameEngine`.
 pub mod checkpoint;
 pub mod door;
+pub mod edges;
 pub mod pos_graph;
 pub mod ui_export;

@@ -466,3 +466,63 @@ level 0 to the horizon, a no-op on a resumed tree). Pieces now collapse
 columns that every row agrees on back to uniform at `finish` - the
 append step's old rule, needed by the State bridge the reference
 engine's rows cross (an all-unknown bool column has no per-lane form).
+
+## The explicit backward graph (2026-09-13)
+
+The level-0 backward was the search's dominant REPEATED term: the
+kernel walk re-runs every candidate row in the pos-graph predecessor
+cells of the frontier (room (1,0) H=99: 3.9M re-runs for 7857 marks,
+25 s, once per horizon step). The graph is now recorded once, by the
+forward, and the backward is a BFS over it that re-runs nothing.
+
+**Ids.** A state's id is `pack_id(layer, seq, row)` (`frame::pack_id`:
+layer << 48 | piece seq << 32 | row): the checkpoint file it is in and
+its row there. Pieces are checkpointed in FLUSH order (format v9, one
+run index of `(cell, start, len)` per file), so the id a row gets at
+the door - `first_new + k` for the k-th new key of a flush - is its
+row in the file. The door stores the id with the key (`door::Entry`),
+so a re-emission of an old state resolves to its id; a resume rebuilds
+that from the files.
+
+**Recording.** The kernel emits a 16-lane slice at a time; the slice's
+inputs are consecutive ids from `base = ids[lo]`. A queued row carries
+`(pred_base, pred_mask)` - the slice and the lanes that produced it -
+and the call's dedup cache (`RowCache`, now `ForwardSink::seen`) keeps
+per key a ref to that row, so a re-emission from another lane ORs its
+bit in (`mark_pred`; producers from a later slice of the same call go
+to the row's `extra` list). When the row is flushed the door's id is
+written back into the cache (`ID_FLAG | id`), and re-emissions from
+then on go through `direct_edge`, a 4096-slot direct-mapped merge of
+`(target, base) -> mask` drained at the call's end - never a re-pushed
+row. Every mask becomes one 18-byte record `(target id, base id, mask)`
+in `<level>/edges/l{target layer}/w{worker}.bin`.
+
+**Runs.** At the end of each frame (`edges::compact_frame`, before the
+checkpoint so a resume can `discard_after` the last checkpointed
+frame), each layer's records are range-partitioned by target, sorted
+by `(target, base)` in parallel, equal pairs merged, and delta-varint
+encoded in 256-pair blocks with an in-memory index of `(first target,
+offset)` per block: the run `l{layer}/f{frame}.bin`. Run f of layer j
+holds every edge into layer j's states recorded at frame f; their
+sources are all rows of layer f-1.
+
+**The BFS** (`edges::bfs`). Seeds: the win rows of layers 1..=H. For
+i = H-1 down to 1: each state in the frontier (marked in the previous
+iteration) has its runs f = layer..=i+1 looked up once - the
+predecessors in run f have layer f-1 <= i, which is exactly the kernel
+walk's eligibility rule, and runs past i+1 are never eligible again.
+Marks are bitmaps per (layer, seq); `edges::backward` resolves them to
+`(shape, key, cell)` through the checkpoint headers for the ladder's
+`MarkFilter`. Gate: the marks fingerprints at every level of
+`gates/marks_room10_win9-101_h29-33.txt` are reproduced, and
+`bench-backward --diff` prints the symmetric difference of the two
+walks (empty). The one discrepancy found on the way was a lookup bug -
+a target whose records straddled an index block - not a lost edge.
+
+**Cost, room (1,0) f70 (quick profile, 16 threads).** Records per frame
+went 255M -> 120M with the write-back (a stale row ref used to mean a
+re-pushed row: raw +16%, and the same (target, slice) recorded up to
+3.5x); the wave is 3.0-3.2 s -> 3.65 s with recording (+15-20%: the
+write-back probe per flushed row, the merge cache, the 18 B/record
+stream). The naive compaction (one permutation sort per layer) was
+17 s/frame; the bucketed one is measured below.

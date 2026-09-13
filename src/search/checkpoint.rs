@@ -331,6 +331,19 @@ impl FrameFile {
         &self.header.wins
     }
 
+    /// The cell of every row (the run index inverted).
+    pub fn row_cells(&self) -> Vec<u32> {
+        let mut cells = vec![u32::MAX; self.header.width as usize];
+        for &(cell, start, len) in &self.header.index {
+            cells[start as usize..(start + len) as usize].fill(cell);
+        }
+        cells
+    }
+
+    pub fn key_at(&self, row: u32) -> (u64, u64) {
+        self.key(row)
+    }
+
     fn key(&self, row: u32) -> (u64, u64) {
         let base = self.data + self.header.keys as usize + row as usize * KEY_BYTES;
         (

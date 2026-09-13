@@ -651,11 +651,12 @@ pub fn zn_tile_flag_at_lanes(
 /// megabytes per unit and every probe was a cache miss - a third of the
 /// append loop (2026-09-14).
 pub struct RowCache {
-    /// `(key.1, generation, tag, row ref)`; the slot index comes from
-    /// `key.0`. The row ref is the emitter's handle on the row it pushed
-    /// for this key (the forward's queue and row), so a later emission of
-    /// the same key from another lane can mark itself as a predecessor.
-    slots: Vec<(u64, u32, u32, u32)>,
+    /// `(key.1, ref, generation, tag)`; the slot index comes from `key.0`.
+    /// The ref is the emitter's handle on what it did with this key: the
+    /// queued row (the forward's queue and row), or - once that row was
+    /// flushed - the state's id, so a later emission of the same key from
+    /// another lane can record itself as a predecessor either way.
+    slots: Vec<(u64, u64, u32, u32)>,
     mask: usize,
     gen: u32,
 }
@@ -675,6 +676,11 @@ impl RowCache {
         RowCache { slots: vec![(0, 0, 0, 0); Self::CAPACITY], mask: Self::CAPACITY - 1, gen: 1 }
     }
 
+    /// The ref of a flushed row: the state's id, flagged.
+    pub const ID_FLAG: u64 = 1 << 63;
+    /// The ref of a row the ladder filter dropped: nothing to record.
+    pub const DROP_FLAG: u64 = 1 << 62;
+
     /// Forget every key (O(1): bumps the generation).
     pub fn clear(&mut self) {
         self.gen = self.gen.wrapping_add(1);
@@ -693,39 +699,39 @@ impl RowCache {
         self.insert_ref(k, tag, 0).map(|(t, _)| t)
     }
 
-    /// Set the row ref of `k`'s entry (just inserted). A miss (evicted
-    /// since) is fine: the next emission of `k` will push the row again.
+    /// Set the ref of `k`'s entry. A miss (evicted since) is fine: the
+    /// next emission of `k` will push the row again.
     #[inline(always)]
-    pub fn set_ref(&mut self, k: (u64, u64), row_ref: u32) {
+    pub fn set_ref(&mut self, k: (u64, u64), r: u64) {
         let base = k.0 as usize;
         for p in 0..Self::PROBES {
             let i = (base + p) & self.mask;
             let s = &mut self.slots[i];
-            if s.1 == self.gen && s.0 == k.1 {
-                s.3 = row_ref;
+            if s.2 == self.gen && s.0 == k.1 {
+                s.1 = r;
                 return;
             }
         }
     }
 
-    /// `insert_tagged` with a row ref: `Some((tag, row ref) of the first
-    /// insert)` if `k` was present.
+    /// `insert_tagged` with a ref: `Some((tag, ref) of the first insert)`
+    /// if `k` was present.
     #[inline(always)]
-    pub fn insert_ref(&mut self, k: (u64, u64), tag: u32, row_ref: u32) -> Option<(u32, u32)> {
+    pub fn insert_ref(&mut self, k: (u64, u64), tag: u32, r: u64) -> Option<(u32, u64)> {
         let base = k.0 as usize;
         let mut victim = base & self.mask;
         for p in 0..Self::PROBES {
             let i = (base + p) & self.mask;
             let s = self.slots[i];
-            if s.1 != self.gen {
+            if s.2 != self.gen {
                 victim = i;
                 break;
             }
             if s.0 == k.1 {
-                return Some((s.2, s.3));
+                return Some((s.3, s.1));
             }
         }
-        self.slots[victim] = (k.1, self.gen, tag, row_ref);
+        self.slots[victim] = (k.1, r, self.gen, tag);
         None
     }
 }

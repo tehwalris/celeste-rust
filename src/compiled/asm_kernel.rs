@@ -27,6 +27,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use celeste_core::pico8_num::Pico8Num as P8;
+use celeste_engine::kernel::RowCache;
 use celeste_engine::runtime2::{self, Col, Rt2, AV};
 use celeste_engine::slots::reshape;
 
@@ -177,12 +178,14 @@ impl AsmKernel {
         // (`Scratch::take`); a fresh multi-megabyte allocation per unit
         // was a page fault per page.
         let mut sc = Scratch::take(self);
-        let Scratch { inbuf, outbuf, seen, .. } = &mut sc;
-        // Within-call dedup (`RowCache`): the fused graph's configurations
-        // re-emit the same row from neighbouring lanes ~8x over; the cache
-        // catches those (keyed by the row key, which is unique across
-        // outcomes) and the owner's door catches the rest.
-        seen.clear();
+        let Scratch { inbuf, outbuf, .. } = &mut sc;
+        // Within-call dedup (`ForwardSink::seen`, a `RowCache`): the fused
+        // graph's configurations re-emit the same row from neighbouring
+        // lanes ~8x over; the cache catches those (keyed by the row key,
+        // which is unique across outcomes) and the owner's door catches
+        // the rest. It lives in the sink because the flush writes each
+        // row's id back into it (the edges).
+        sink.seen.clear();
         let body_cols = &self.body_cols;
         // Pure-kernel throughput floor (CELESTE_KERNEL_DRYRUN=1): pack the
         // inputs and call the kernel, then discard - no dedup, no
@@ -319,19 +322,27 @@ impl AsmKernel {
                     // consecutive ids from `slice_base`, and a queued row
                     // carries a 16-bit mask of the lanes that produced it,
                     // reached through the cache's row ref.
-                    if let Some((first_cin, row_ref)) = seen.insert_ref(key, cin, 0) {
+                    if let Some((first_cin, r)) = sink.seen.insert_ref(key, cin, 0) {
                         // A re-emission of a row this call already produced.
                         // Nothing to push - but if it came from a DIFFERENT
                         // input cell, that is a pos-graph edge the first
                         // emission did not record - and this lane is one
-                        // more predecessor of it.
+                        // more predecessor of it: onto the queued row's
+                        // mask, or straight to a record if the row was
+                        // flushed (its id is in the cache then).
                         if sink.edges_on && first_cin != cin {
                             sink.edges.insert((cin, cell_out(body, outbuf, i, start)));
                         }
                         match slice_base {
-                            // The row was flushed since: push it again (the
-                            // flush merges duplicates by key).
-                            Some(b) if !sink.mark_pred(row_ref, b, i) => {}
+                            Some(b) if r & RowCache::ID_FLAG != 0 => {
+                                sink.direct_edge(r & !RowCache::ID_FLAG, b, i);
+                                continue;
+                            }
+                            Some(_) if r & RowCache::DROP_FLAG != 0 => continue,
+                            // The row was flushed (a stale ref, only if
+                            // the cache lost the flush's write-back): push
+                            // it again; the flush merges duplicates by key.
+                            Some(b) if !sink.mark_pred(r as u32, b, i) => {}
                             _ => continue,
                         }
                     }
@@ -350,13 +361,15 @@ impl AsmKernel {
                     if let Some(b) = slice_base {
                         sink.slots[q].pred_base.push(b);
                         sink.slots[q].pred_mask.push(1 << i);
-                        seen.set_ref(key, sink.row_ref(q));
+                        sink.slots[q].last_extra.push(u32::MAX);
+                        sink.seen.set_ref(key, sink.row_ref(q) as u64);
                     }
                     sink.pushed(q).expect("flushing a full queue");
                 }
             }
             lo += n;
         }
+        sink.end_call();
         sc.put_back();
         for (i, n) in [n_bodies, n_bodies_taken, n_lanes, n_unique].into_iter().enumerate() {
             CALL_STATS[3 + i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -520,7 +533,6 @@ struct Scratch {
     kernel: usize,
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
-    seen: celeste_engine::kernel::RowCache,
 }
 
 thread_local! {
@@ -540,7 +552,6 @@ impl Scratch {
                     kernel: id,
                     inbuf: vec![0u8; k.compiled.input_bytes as usize],
                     outbuf: vec![0u8; k.compiled.n_roots * 128],
-                    seen: celeste_engine::kernel::RowCache::new(),
                 },
             }
         })

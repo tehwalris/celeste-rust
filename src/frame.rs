@@ -293,6 +293,10 @@ pub struct Slot {
     /// dedups its emissions, so a row is pushed once per call and its
     /// later producers land here): `(row, slice base, lane mask)`.
     pub extra: Vec<(u32, u64, u16)>,
+    /// Per row, the index of its latest `extra` entry (`u32::MAX`: none).
+    /// The kernel emits slice by slice, so a row's producers from the
+    /// current slice always merge into that entry.
+    pub last_extra: Vec<u32>,
     /// Bumped at every flush; a row ref (`ForwardSink::row_ref`) carries
     /// the generation it was made under, so a ref into a flushed queue is
     /// recognised as stale rather than reaching another cell's rows.
@@ -328,6 +332,7 @@ impl Slot {
             pred_base: Vec::new(),
             pred_mask: Vec::new(),
             extra: Vec::new(),
+            last_extra: Vec::new(),
             gen: 0,
         }
     }
@@ -364,6 +369,7 @@ impl Slot {
         self.pred_base.clear();
         self.pred_mask.clear();
         self.extra.clear();
+        self.last_extra.clear();
         self.gen = self.gen.wrapping_add(1);
     }
 
@@ -520,9 +526,38 @@ impl Slot {
 
 /// A worker's per-layer edge buffer is appended to its file at this size.
 const EDGE_BUF_BYTES: usize = 1 << 20;
+/// Slots of the direct-mapped edge merge cache (`ForwardSink::direct_edge`).
+const DIRECT_SLOTS: usize = 1 << 12;
 
 /// One edge record on disk: target id, slice base id, lane mask.
 pub const EDGE_RECORD_BYTES: usize = 18;
+
+/// Append one record to the target layer's buffer (`ForwardSink::edge_bufs`),
+/// writing the buffer out when full.
+#[inline]
+fn append_record(
+    edge_bufs: &mut Vec<Vec<u8>>,
+    edge_records: &mut u64,
+    dir: &std::path::Path,
+    worker: u32,
+    target: u64,
+    base: u64,
+    mask: u16,
+) -> Result<()> {
+    let layer = id_layer(target) as usize;
+    if edge_bufs.len() <= layer {
+        edge_bufs.resize_with(layer + 1, Vec::new);
+    }
+    let buf = &mut edge_bufs[layer];
+    buf.extend_from_slice(&target.to_le_bytes());
+    buf.extend_from_slice(&base.to_le_bytes());
+    buf.extend_from_slice(&mask.to_le_bytes());
+    *edge_records += 1;
+    if buf.len() >= EDGE_BUF_BYTES {
+        write_edges(dir, layer, worker, buf)?;
+    }
+    Ok(())
+}
 
 /// Append `buf` to `<dir>/l{layer}/w{worker}.bin` and clear it.
 fn write_edges(dir: &std::path::Path, layer: usize, worker: u32, buf: &mut Vec<u8>) -> Result<()> {
@@ -636,6 +671,14 @@ pub struct ForwardSink<'a> {
     edges_dir: Option<std::path::PathBuf>,
     edge_bufs: Vec<Vec<u8>>,
     pub edge_records: u64,
+    /// The within-call dedup cache (`RowCache`), written back by the flush.
+    pub seen: celeste_engine::kernel::RowCache,
+    /// Direct-mapped merge of the edges to already-flushed states:
+    /// `(target, base, mask)` per slot, an entry evicted or drained at the
+    /// call's end becomes a record.
+    direct: Vec<(u64, u64, u16)>,
+    /// Time spent encoding and writing edge records (this worker).
+    pub t_edges: std::time::Duration,
 
     /// This worker's next-frame rows, one piece per shape: the block, its
     /// file seq in the layer (`worker * 256 + k`), and its rows' ids.
@@ -691,6 +734,9 @@ impl<'a> ForwardSink<'a> {
             edges_dir: None,
             edge_bufs: Vec::new(),
             edge_records: 0,
+            seen: celeste_engine::kernel::RowCache::new(),
+            direct: Vec::new(),
+            t_edges: std::time::Duration::ZERO,
             pieces: Default::default(),
             frame: 0,
             worker: 0,
@@ -733,6 +779,48 @@ impl<'a> ForwardSink<'a> {
         s
     }
 
+    /// One edge record: `target` (a state id) has the lanes of `mask` in
+    /// the slice based at `base` as predecessors.
+    #[inline]
+    fn record(&mut self, target: u64, base: u64, mask: u16) -> Result<()> {
+        let dir = self.edges_dir.as_deref().expect("recording without an edges dir");
+        append_record(&mut self.edge_bufs, &mut self.edge_records, dir, self.worker, target, base, mask)
+    }
+
+    /// Lane `lane` of the slice based at `base` produced the (already
+    /// flushed) state `target`: merged with the slice's other lanes in
+    /// the direct-mapped cache, recorded on eviction.
+    #[inline]
+    pub fn direct_edge(&mut self, target: u64, base: u64, lane: usize) {
+        if self.edges_dir.is_none() {
+            return;
+        }
+        if self.direct.is_empty() {
+            self.direct = vec![(u64::MAX, 0, 0); DIRECT_SLOTS];
+        }
+        let i = (celeste_engine::runtime2::mix64(target ^ base.rotate_left(17)) as usize) & (DIRECT_SLOTS - 1);
+        let e = self.direct[i];
+        if e.0 == target && e.1 == base {
+            self.direct[i].2 |= 1 << lane;
+            return;
+        }
+        if e.0 != u64::MAX {
+            self.record(e.0, e.1, e.2).expect("recording an edge");
+        }
+        self.direct[i] = (target, base, 1 << lane);
+    }
+
+    /// The step's end of a kernel call: the merge cache drains.
+    pub fn end_call(&mut self) {
+        for i in 0..self.direct.len() {
+            let e = self.direct[i];
+            if e.0 != u64::MAX {
+                self.record(e.0, e.1, e.2).expect("recording an edge");
+                self.direct[i] = (u64::MAX, 0, 0);
+            }
+        }
+    }
+
     /// The step's handle on the row it just pushed into queue `q` (its
     /// last row): the queue's generation, the queue and the row.
     #[inline]
@@ -754,9 +842,13 @@ impl<'a> ForwardSink<'a> {
         }
         if s.pred_base[r] == base {
             s.pred_mask[r] |= 1 << lane;
-        } else if let Some(last) = s.extra.last_mut().filter(|e| e.0 == r as u32 && e.1 == base) {
-            last.2 |= 1 << lane;
+            return true;
+        }
+        let last = s.last_extra[r];
+        if last != u32::MAX && s.extra[last as usize].1 == base {
+            s.extra[last as usize].2 |= 1 << lane;
         } else {
+            s.last_extra[r] = s.extra.len() as u32;
             s.extra.push((r as u32, base, 1 << lane));
         }
         true
@@ -904,27 +996,30 @@ impl<'a> ForwardSink<'a> {
             // plus the extra masks. Rows without ids (a step run on
             // id-less blocks, e.g. the tests' reference engine) have no
             // predecessor columns and record nothing.
-            if self.edges_dir.is_some() && slot.pred_base.len() == n {
+            if let Some(edges_dir) = self.edges_dir.as_deref().filter(|_| slot.pred_base.len() == n) {
+                let t_e = std::time::Instant::now();
+                let (row_uniq, ids_buf) = (&self.row_uniq, &self.ids_buf);
+                let (edge_bufs, edge_records, worker) = (&mut self.edge_bufs, &mut self.edge_records, self.worker);
                 let rows = slot.pred_base.iter().zip(&slot.pred_mask).enumerate().map(|(r, (&b, &m))| (r as u32, b, m));
-                for (r, base, mask) in rows.chain(slot.extra.iter().copied()) {
-                    let u = self.row_uniq[r as usize];
-                    if u == u32::MAX {
-                        continue;
-                    }
-                    let target = self.ids_buf[u as usize];
-                    let layer = id_layer(target) as usize;
-                    if self.edge_bufs.len() <= layer {
-                        self.edge_bufs.resize_with(layer + 1, Vec::new);
-                    }
-                    let buf = &mut self.edge_bufs[layer];
-                    buf.extend_from_slice(&target.to_le_bytes());
-                    buf.extend_from_slice(&base.to_le_bytes());
-                    buf.extend_from_slice(&mask.to_le_bytes());
-                    self.edge_records += 1;
-                    if buf.len() >= EDGE_BUF_BYTES {
-                        write_edges(self.edges_dir.as_deref().unwrap(), layer, self.worker, buf)?;
+                for (r, b, m) in rows.chain(slot.extra.iter().copied()) {
+                    let u = row_uniq[r as usize];
+                    if u != u32::MAX {
+                        append_record(edge_bufs, edge_records, edges_dir, worker, ids_buf[u as usize], b, m)?;
                     }
                 }
+                // Write each row's fate back into the dedup cache: a later
+                // re-emission in this call records an edge to the id
+                // directly (or nothing, for a filtered-out row).
+                for (r, key) in slot.keys.iter().enumerate() {
+                    let u = row_uniq[r];
+                    let v = if u == u32::MAX {
+                        celeste_engine::kernel::RowCache::DROP_FLAG
+                    } else {
+                        celeste_engine::kernel::RowCache::ID_FLAG | ids_buf[u as usize]
+                    };
+                    self.seen.set_ref(*key, v);
+                }
+                self.t_edges += t_e.elapsed();
             }
             if !self.new_buf.is_empty() {
                 self.rows_buf.clear();
@@ -1179,6 +1274,7 @@ pub fn forward_frame(
         edges: rustc_hash::FxHashSet<(u32, u32)>,
         queue_bytes: usize,
         edge_records: u64,
+        t_edges: std::time::Duration,
         busy: std::time::Duration,
     }
     let done: Vec<Done> = std::thread::scope(|scope| {
@@ -1211,6 +1307,7 @@ pub fn forward_frame(
                         edges: std::mem::take(&mut sink.edges),
                         queue_bytes: sink.alloc_bytes(),
                         edge_records: sink.edge_records,
+                        t_edges: sink.t_edges,
                         busy: t.elapsed(),
                     })
                 }).expect("spawn wave worker")
@@ -1240,6 +1337,7 @@ pub fn forward_frame(
         st.flushed_rows += d.flushed_rows;
         st.queue_bytes += d.queue_bytes;
         st.edge_records += d.edge_records;
+        st.t_edges += d.t_edges;
         won |= d.won;
         if let Some(p) = pos {
             p.record_pairs(d.edges.iter().copied());
@@ -1288,8 +1386,10 @@ pub struct FrameStats {
     pub t_door: std::time::Duration,
     pub flushes: u64,
     pub flushed_rows: u64,
-    /// Edge records written (`EDGE_RECORD_BYTES` each).
+    /// Edge records written (`EDGE_RECORD_BYTES` each), and the workers'
+    /// summed time encoding and writing them (thread-time).
     pub edge_records: u64,
+    pub t_edges: std::time::Duration,
     /// The input frontier's row storage, bytes.
     pub bytes_in: usize,
     /// Bytes allocated in the workers' queue pools, and in the door.
@@ -1592,6 +1692,7 @@ impl ForwardState {
         }
         let Some(last) = last else { return Ok(None) };
         let t = std::time::Instant::now();
+        crate::search::edges::discard_after(&dir.join("edges"), last)?;
         // Every layer's keys into the door, one file per unit of work.
         let seq_of = |p: &std::path::Path| -> u32 {
             p.file_name()
@@ -1686,6 +1787,10 @@ impl ForwardState {
         self.door.len()
     }
 
+    pub fn door(&self) -> &crate::search::door::Door {
+        &self.door
+    }
+
     pub fn extend(
         &mut self,
         engine: &dyn FrameStep,
@@ -1697,8 +1802,15 @@ impl ForwardState {
             let frame = self.frames + 1;
             let t_frame = std::time::Instant::now();
             let frontier = std::mem::take(&mut self.frontier);
+            let edges_dir = dir.join("edges");
             let (mut next, won, st) =
-                forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filter, frame, Some(&dir.join("edges")))?;
+                forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filter, frame, Some(&edges_dir))?;
+            // The frame's edge records into per-layer runs BEFORE the
+            // checkpoint: a resume discards runs past its last checkpointed
+            // frame (`edges::discard_after`), never the other way round.
+            let t = std::time::Instant::now();
+            let compact = crate::search::edges::compact_frame(&edges_dir, frame)?;
+            let t_edges = t.elapsed();
             let t = std::time::Instant::now();
             checkpoint_frontier(dir, frame, &mut next)?;
             let t_ckpt = t.elapsed();
@@ -1707,7 +1819,7 @@ impl ForwardState {
                 o.flush();
             }
             let t_pos = t.elapsed();
-            log_frame(frame, &st, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
+            log_frame(frame, &st, t_edges, compact.records, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
             self.frames = frame;
             if won && self.win_frame.is_none() {
                 self.win_frame = Some(frame);
@@ -1779,6 +1891,8 @@ pub fn forward_run(
 fn log_frame(
     frame: u32,
     st: &FrameStats,
+    t_edges: std::time::Duration,
+    edge_records: u64,
     t_ckpt: std::time::Duration,
     t_pos: std::time::Duration,
     t_total: std::time::Duration,
@@ -1787,7 +1901,7 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         wave {:.0} (idle {:.0}%) door {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
+         wave {:.0} (idle {:.0}%) door {:.0} edges {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
          flushes {} ({:.0} rows avg) edges {} | \
          in {:.2} queues {:.2} door {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
         st.blocks_in,
@@ -1800,12 +1914,13 @@ fn log_frame(
         ms(st.t_wave),
         st.wave_idle * 100.0,
         ms(st.t_door),
+        ms(t_edges),
         ms(t_ckpt),
         ms(t_pos),
         ms(t_total),
         st.flushes,
         st.flushed_rows as f64 / st.flushes.max(1) as f64,
-        st.edge_records,
+        edge_records,
         st.bytes_in as f64 / 1e9,
         st.queue_bytes as f64 / 1e9,
         st.door_bytes as f64 / 1e9,
@@ -1999,6 +2114,16 @@ impl Visited {
     pub fn is_empty(&self) -> bool {
         self.shards.values().all(|s| s.is_empty())
     }
+    /// Every entry as `(shape, cell, key)`, sorted.
+    pub fn entries(&self) -> Vec<(u64, u32, (u64, u64))> {
+        let mut v: Vec<(u64, u32, (u64, u64))> = self
+            .shards
+            .iter()
+            .flat_map(|((s, c), keys)| keys.iter().map(move |&k| (*s, *c, k)))
+            .collect();
+        v.sort_unstable();
+        v
+    }
 }
 
 /// A fixed-horizon ladder result (`ladder_at_horizon`).
@@ -2165,18 +2290,30 @@ where
                 Some(e) => e.as_ref(),
                 None => self.level0.as_ref().expect("level 0").0.as_ref(),
             };
-            let bwd = backward_run(engine, &dir, horizon, &graph)?;
-            bwd.marked.save(&marks_path(self.base_dir, horizon, level))?;
-            let (n, fp) = bwd.marked.fingerprint();
+            let (marked, work) = if bfs_backward() {
+                let bwd = crate::search::edges::backward(&dir, horizon)?;
+                (bwd.marked, format!("{} edges read", bwd.stats.edges_read))
+            } else {
+                let bwd = backward_run(engine, &dir, horizon, &graph)?;
+                (bwd.marked, format!("{} re-runs", bwd.reruns))
+            };
+            marked.save(&marks_path(self.base_dir, horizon, level))?;
+            let (n, fp) = marked.fingerprint();
             eprintln!(
                 "[ladder] h{horizon} level {level} ({precision:?}): first win f{h}, marked {n} states \
-                 (fingerprint {fp:016x}), {} re-runs",
-                bwd.reruns
+                 (fingerprint {fp:016x}), {work}"
             );
-            prev = Some((bwd.marked, precision));
+            prev = Some((marked, precision));
         }
         Ok(HorizonOutcome::Confirmed)
     }
+}
+
+/// The backward is the BFS over the recorded edges (`search::edges`);
+/// `CELESTE_BACKWARD=kernel` selects the kernel re-run walk instead (the
+/// oracle the BFS is gated against, `bench-backward --diff`).
+pub fn bfs_backward() -> bool {
+    !std::env::var("CELESTE_BACKWARD").is_ok_and(|v| v == "kernel")
 }
 
 /// Where a level's marked set at a horizon is saved (level 0's checkpoints
