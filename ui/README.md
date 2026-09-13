@@ -23,7 +23,11 @@ The control model has four axes; every control is bound to exactly one:
 | **look** | *Full*: the accumulated set dim under the moving set bright, the closed levels' marks as dark bands underneath, wins as rings; *Sweep only*: just what moves (the frontier, or the states this iteration marks); *Height map*: the levels collapsed into seven bands (L0 / L1 / L2–5 / L6–7 / L8–12 / L13–14 / L15+exact), each cell in the flat colour of the finest band whose set still contains it, forward and backward alike; the broad coarse bands dark and desaturated, lightness and chroma rising with the band so the exact route is the brightest thing on screen (the two thinnest bands get a one-cell halo); the moving set magenta. The last pass is the still that shows the bands narrowing; scrubbing paints them over in order | the Full / Sweep / Height map chips |
 
 Playback speed is three presets (slow / normal / fast: 15, 60, 250
-steps per second; Passes runs one, two, four passes per second). The
+steps per second; Passes runs one, two, four passes per second), and
+pacing is *uniform* (every step the same) or *real time* (each step's
+share of the playback is its share of the run's logged time - the
+level-0 passes crawl, the high-bit passes flick by - normalised so a
+playthrough lasts as long as the uniform one at the same speed). The
 bottom bar is fixed and one-thumb reachable; the room, then the grain /
 look / speed chips and the legend, scroll above it. Press or drag on the
 room to read a cell's counts.

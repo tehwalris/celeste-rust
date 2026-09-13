@@ -23,6 +23,11 @@ import { button, chips, clear, el, scrubber } from "./ui";
 type Phase = "fwd" | "bwd";
 type Grain = "room" | "grid" | "passes";
 type Look = "full" | "sweep" | "last";
+/** Uniform: every step takes the same time. Real: a step's share of the
+ *  playback is its share of the run's logged time (the level-0 passes
+ *  crawl, the high-bit passes flick by), normalised so a playthrough
+ *  lasts as long as the uniform one at the same speed. */
+type Pacing = "uniform" | "real";
 
 interface LevelFiles {
   frames: FramesBin;
@@ -73,6 +78,9 @@ export function spaceView(run: Run): HTMLElement {
     grain: "room" as Grain,
     look: "full" as Look,
     speed: 1,
+    pacing: "uniform" as Pacing,
+    /** Real pacing: the playhead in uniform-step units (a float). */
+    pos: 0,
     playing: false,
   };
 
@@ -110,6 +118,62 @@ export function spaceView(run: Run): HTMLElement {
     }
     const pass = tl[lo];
     return { pass, i: Math.max(0, Math.min(pass.frames.length - 1, step - pass.start)) };
+  }
+
+  // ---- real-time pacing: the log's ms per step, normalised -------------------------
+  // Level 0's forward frames are logged across horizons (each horizon's
+  // level 0 holds the frames it was extended by), so its ms are one map.
+  const l0ms = new Map<number, number>();
+  for (const hr of run.horizons) for (const lr of hr.levels) if (lr.level === 0) for (const l of lr.fwd) l0ms.set(l.f, l.total_ms);
+  function stepMs(p: Pass, f: number): number {
+    if (p.phase === "fwd") {
+      const ms = p.lr.level === 0 ? l0ms.get(f) : p.lr.fwd.find((l) => l.f === f)?.total_ms;
+      return Math.max(1, ms ?? 1);
+    }
+    return Math.max(1, p.lr.bwd.find((l) => l.f === f)?.total_ms ?? 1);
+  }
+  /** Cumulative weights, one entry per step plus the end, scaled so the
+   *  last entry equals the step count (uniform-step units). */
+  function cumulative(weights: number[]): Float64Array {
+    const n = weights.length;
+    const cum = new Float64Array(n + 1);
+    let total = 0;
+    for (const w of weights) total += w;
+    const k = total > 0 ? n / total : 1;
+    for (let i = 0; i < n; i++) cum[i + 1] = cum[i] + weights[i] * k;
+    return cum;
+  }
+  const stepCums = new Map<number, Float64Array>();
+  function stepCum(hIndex: number): Float64Array {
+    let c = stepCums.get(hIndex);
+    if (!c) {
+      const ws: number[] = [];
+      for (const p of timeline(hIndex)) for (const f of p.frames) ws.push(stepMs(p, f));
+      c = cumulative(ws);
+      stepCums.set(hIndex, c);
+    }
+    return c;
+  }
+  const passCums = new Map<number, Float64Array>();
+  function passCum(hIndex: number): Float64Array {
+    let c = passCums.get(hIndex);
+    if (!c) {
+      c = cumulative(timeline(hIndex).map((p) => p.frames.reduce((a, f) => a + stepMs(p, f), 0)));
+      passCums.set(hIndex, c);
+    }
+    return c;
+  }
+  /** The step whose span holds `pos`. */
+  function indexAt(cum: Float64Array, pos: number): number {
+    const n = cum.length - 1;
+    let lo = 0;
+    let hi = n - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (cum[mid] <= pos) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
   }
 
   // ---- level files, cached ---------------------------------------------------
@@ -474,7 +538,19 @@ export function spaceView(run: Run): HTMLElement {
     },
     { label: "speed" },
   );
-  const optionCard = el("div", { class: "card" }, [grainRow, el("div", { style: "height:8px" }), lookRow, el("div", { style: "height:8px" }), speedRow]);
+  const pacingRow = chips<Pacing>(
+    [
+      { value: "uniform", label: "uniform", title: "every frame / iteration takes the same time" },
+      { value: "real", label: "real time", title: "each step takes its share of the run's logged time; same overall duration" },
+    ],
+    new Set([st.pacing]),
+    (sel) => {
+      st.pacing = [...sel][0];
+      st.pos = (st.grain === "passes" ? passCum(st.h) : stepCum(st.h))[st.grain === "passes" ? st.pass : st.step];
+    },
+    { label: "pacing" },
+  );
+  const optionCard = el("div", { class: "card" }, [grainRow, el("div", { style: "height:8px" }), lookRow, el("div", { style: "height:8px" }), el("div", { class: "chips" }, [speedRow, pacingRow])]);
 
   const legend = el("div", { class: "legend" }, [
     el("span", { class: "key" }, [el("i", { style: `background:${rgbCss(levelRamp(0, "bright")[55])}` }), "moving (frontier)"]),
@@ -585,6 +661,8 @@ export function spaceView(run: Run): HTMLElement {
   let renderToken = 0;
   function render() {
     const token = ++renderToken;
+    // A scrub / jump moved the step under the float playhead: follow it.
+    if (!st.playing) st.pos = (st.grain === "passes" ? passCum(st.h) : stepCum(st.h))[Math.max(0, st.grain === "passes" ? st.pass : st.step)] ?? 0;
     const hr = run.horizons[st.h];
     const tl = timeline(st.h);
     const need = hr.levels;
@@ -697,11 +775,23 @@ export function spaceView(run: Run): HTMLElement {
   function tick(t: number) {
     if (!st.playing) return;
     const sp = SPEEDS[st.speed];
-    if (last) acc += ((t - last) / 1000) * (st.grain === "passes" ? sp.passes : sp.steps);
+    const units = last ? ((t - last) / 1000) * (st.grain === "passes" ? sp.passes : sp.steps) : 0;
     last = t;
-    const n = Math.floor(acc);
-    if (n > 0) {
+    let n = 0;
+    if (st.pacing === "uniform") {
+      acc += units;
+      n = Math.floor(acc);
       acc -= n;
+    } else {
+      // Advance the float playhead by uniform-step units; the step it
+      // lands in is set by the log's weights.
+      const passes = st.grain === "passes";
+      const cum = passes ? passCum(st.h) : stepCum(st.h);
+      const cur = passes ? st.pass : st.step;
+      st.pos = Math.max(st.pos, cum[cur]) + units;
+      n = Math.min(cum.length - 2, indexAt(cum, st.pos)) - cur;
+    }
+    if (n > 0) {
       const tl = timeline(st.h);
       const atEnd = st.grain === "passes" ? st.pass + n >= tl.length - 1 : st.step + n >= stepsOf(tl) - 1;
       if (atEnd) {
@@ -710,6 +800,7 @@ export function spaceView(run: Run): HTMLElement {
           st.h += 1;
           st.step = 0;
           st.pass = 0;
+          st.pos = 0;
           buildHStrip();
           layout();
         } else {
