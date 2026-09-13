@@ -1,5 +1,11 @@
 # Memory: where a frame's bytes are, what the peak will be (2026-09-13)
 
+**Update, the same evening:** the two-phase frame, its batches and
+`CELESTE_EMIT_BUDGET_GB` are gone; the waves frame (plans/waves.md)
+replaced them. The accounting below still holds term by term, with the
+transient now the queue pools (~80 MB) and the visited set the sorted
+door at 16.7 B/entry: room (1,0) f0-f70 peaks at 4.1 GB instead of 9.5.
+
 Room (0,0)'s level-0 forward was OOM-killed at f88 (RSS 58 GB against the
 60 GB cap) before reaching its horizon. This is the accounting behind
 that, the options for the frame's structure compared, and the estimate
