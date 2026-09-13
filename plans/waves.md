@@ -453,3 +453,16 @@ state can reach the win through it - so the filtered forward is the
 marks and the backward on them is the marks again: a fixpoint after one
 round. Only precision narrows the band. (The repeated rounds cost ~1/10
 of the first: the filtered forward is tiny.)
+
+## Resume (2026-09-13)
+
+`ForwardState::resume(dir)`: the last `frames/fNNN` is the frontier
+(minus won rows), the door is `Door::from_shards` over every layer's
+`(shape, cell, key)` (parallel per file; ~10 s for a 6 GB door), the pos
+graph reloads from `posgraph.bin`, the first win from the layers' win
+lists. `Ladder::at_horizon` writes `hNNN/outcome.txt` when a horizon
+settles and returns it without recomputing on a rerun (still extending
+level 0 to the horizon, a no-op on a resumed tree). Pieces now collapse
+columns that every row agrees on back to uniform at `finish` - the
+append step's old rule, needed by the State bridge the reference
+engine's rows cross (an all-unknown bool column has no per-lane form).

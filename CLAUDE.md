@@ -242,6 +242,17 @@ been re-benchmarked to the horizon (2026-09-07: the level-0 forward on room
 it sandboxed under `./safe-run.sh` with the 60 GB default and watch. Do not
 raise the cap past what `free` leaves after /tmp, which is a tmpfs.
 
+A search RESUMES from its checkpoint directory (2026-09-13): the level-0
+tree (`level00/frames/`) reloads as the forward's state (frontier, door
+rebuilt from every layer's keys, pos graph, first win), and every
+horizon with an `hNNN/outcome.txt` (written when its ladder finished:
+`confirmed` / `refuted L`) is skipped. Rerun the same `rewrite search`
+command after a crash or a kill; delete the directory for a fresh run.
+The finer levels of the horizon in progress are recomputed (they are
+small); the resumed forward is byte-identical to the original
+(`forward_extended_frame_by_frame_matches_fresh`, ignored: ~4 s with
+the reference engine).
+
 Checkpoints go on DISK (`/var/tmp/celeste-checkpoints`, the default), not
 under the tmpfs at /tmp. (The inode blow-up that forced this - one file per
 17k cell-uniform blocks per frame - is gone: a frame is one file per SHAPE,

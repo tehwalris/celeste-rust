@@ -272,6 +272,19 @@ impl Default for PosObserver {
 }
 
 impl PosObserver {
+    /// An observer that already holds `graph`'s pairs: how a resumed
+    /// level-0 forward keeps recording where the checkpointed one left off.
+    pub fn from_graph(graph: &PosGraph) -> Self {
+        let mut b = PosGraphBuilder::default();
+        for d in 0..CELL_COUNT {
+            let (lo, hi) = (graph.offsets[d] as usize, graph.offsets[d + 1] as usize);
+            if lo < hi {
+                b.by_dst.insert(d as u32, graph.srcs[lo..hi].to_vec());
+            }
+        }
+        Self { pending: std::sync::Mutex::new(Vec::new()), graph: std::sync::Mutex::new(b) }
+    }
+
     /// Record `(src cell, dst cell)` edges, as the frame step observed them
     /// AT EMISSION: every raw output row, before any dedup, paired with the
     /// cell of the input row that produced it.

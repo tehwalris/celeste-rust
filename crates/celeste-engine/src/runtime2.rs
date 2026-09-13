@@ -249,7 +249,12 @@ fn compress_num(c: Col) -> Col {
 /// `Col::U` for its block-uniform inputs) refuses engine output: at f35
 /// the engine's own next frame ran 269,059 lanes with zero kernel
 /// coverage purely for this reason.
-fn collapse_uniform(c: Col) -> Col {
+/// A typed column whose rows all hold one value becomes that uniform
+/// value; anything else is returned as-is. The append step's rule, also
+/// applied to a worker's finished pieces (`ForwardSink::finish`), so a
+/// column that only LOOKED varying (a queue's typed skeleton) is stored,
+/// keyed and exported as the uniform it is.
+pub fn collapse_uniform(c: Col) -> Col {
     let all_same = match &c {
         Col::U(_) => return c,
         Col::N(vs) => vs.first().map_or(false, |f| vs.iter().all(|x| x == f)),

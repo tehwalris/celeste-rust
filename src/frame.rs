@@ -9,7 +9,7 @@
 //! Impls (kernel runner + `trace::refengine`) and the loop's checkpoint /
 //! position-graph growth come next; this is the interface + the frame spine.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crate::search::door::Admit;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -727,7 +727,20 @@ impl<'a> ForwardSink<'a> {
                 self.flush(q)?;
             }
         }
-        Ok(std::mem::take(&mut self.pieces).into_values().collect())
+        let mut pieces: Vec<Rt2> = std::mem::take(&mut self.pieces).into_values().collect();
+        // A queue's columns are typed by its skeleton, not by its rows: a
+        // column every row agrees on goes back to the uniform it is (the
+        // old append step's rule; the State bridge, which the reference
+        // engine's rows cross, has no per-lane form for an unknown bool).
+        for p in &mut pieces {
+            for c in p.cols.iter_mut() {
+                if !matches!(c, Col::U(_)) {
+                    let taken = std::mem::replace(c, Col::U(AV::Nil));
+                    *c = celeste_engine::runtime2::collapse_uniform(taken);
+                }
+            }
+        }
+        Ok(pieces)
     }
 
     /// Bytes allocated across the pool (capacities).
@@ -1316,6 +1329,100 @@ impl ForwardState {
         })
     }
 
+    /// The forward as its checkpoint tree left it, if `dir` has one: the
+    /// last frame's rows as the frontier (minus the won rows, as `extend`
+    /// leaves them), the door rebuilt from every layer's keys, the first
+    /// win frame from the layers' win lists, the pos graph reloaded. `None`
+    /// when there is no tree. Extending a resumed forward is byte-identical
+    /// to extending the original (`forward_resume_matches_fresh`).
+    pub fn resume(dir: &std::path::Path, record: bool) -> Result<Option<Self>> {
+        use crate::search::door::Admit;
+        let mut last: Option<u32> = None;
+        while dir.join("frames").join(format!("f{:03}", last.map_or(0, |f| f + 1))).is_dir() {
+            last = Some(last.map_or(0, |f| f + 1));
+        }
+        let Some(last) = last else { return Ok(None) };
+        let t = std::time::Instant::now();
+        // Every layer's keys into the door, one file per unit of work.
+        let files: Vec<(u32, std::path::PathBuf)> = (0..=last)
+            .flat_map(|f| {
+                let fdir = dir.join("frames").join(format!("f{:03}", f));
+                std::fs::read_dir(&fdir)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")))
+                    .map(move |p| (f, p))
+            })
+            .collect();
+        let next = AtomicUsize::new(0);
+        let partial: Vec<(rustc_hash::FxHashMap<(u64, u32), Vec<(u64, u64)>>, Option<u32>)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads())
+                    .map(|_| {
+                        let (files, next) = (&files, &next);
+                        scope.spawn(move || -> Result<_> {
+                            let mut m: rustc_hash::FxHashMap<(u64, u32), Vec<(u64, u64)>> = Default::default();
+                            let mut win: Option<u32> = None;
+                            loop {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                let Some((f, path)) = files.get(i) else { break };
+                                let file = crate::search::checkpoint::FrameFile::open(path)?;
+                                let shape = file.shape_hash();
+                                for (cell, key) in file.cell_keys() {
+                                    m.entry((shape, cell)).or_default().push(key);
+                                }
+                                if !file.wins().is_empty() {
+                                    win = Some(win.map_or(*f, |w| w.min(*f)));
+                                }
+                            }
+                            Ok((m, win))
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().expect("resume loader panicked")).collect::<Result<Vec<_>>>()
+            })?;
+        let mut shards: rustc_hash::FxHashMap<(u64, u32), Vec<(u64, u64)>> = Default::default();
+        let mut win_frame: Option<u32> = None;
+        for (m, w) in partial {
+            for (k, mut v) in m {
+                shards.entry(k).or_default().append(&mut v);
+            }
+            win_frame = match (win_frame, w) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        let door = crate::search::door::Door::from_shards(shards);
+        // The frontier: the last layer minus its won rows.
+        let frontier: Vec<Block> = load_frame(dir, last)?
+            .into_iter()
+            .filter_map(|b| {
+                let wins = b.wins().ok()?;
+                let mask: Vec<bool> = wins.iter().map(|w| !w).collect();
+                b.keep(&mask)
+            })
+            .collect();
+        let observer = if record {
+            let path = pos_graph_path(dir);
+            let graph = crate::search::pos_graph::PosGraph::load(&path)
+                .with_context(|| format!("resuming {}: no pos graph at {}", dir.display(), path.display()))?;
+            Some(crate::search::pos_graph::PosObserver::from_graph(&graph))
+        } else {
+            None
+        };
+        eprintln!(
+            "[resume] {}: f{last} ({} lanes), door {} entries from {} files, first win {:?}, {:.1} s",
+            dir.display(),
+            frontier.iter().map(Block::lanes).sum::<usize>(),
+            door.len(),
+            files.len(),
+            win_frame,
+            t.elapsed().as_secs_f64()
+        );
+        Ok(Some(ForwardState { frontier, door, observer, frames: last, win_frame }))
+    }
+
     /// Compute and checkpoint frames `frames+1 ..= to`. A win does NOT stop
     /// the run: a horizon is a bound on the win frame, and the backward
     /// needs every frame up to it (its seeds are the wins at each). Only an
@@ -1614,6 +1721,7 @@ impl Visited {
 }
 
 /// A fixed-horizon ladder result (`ladder_at_horizon`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HorizonOutcome {
     /// Every precision level - through fully concrete - won by the horizon. The
     /// horizon is achievable; the concrete level yields a real winning trace.
@@ -1623,6 +1731,31 @@ pub enum HorizonOutcome {
     /// this SOUNDLY excludes the horizon: no concrete play wins by it. `level`
     /// is the index into `precisions` that refuted.
     Refuted { level: usize },
+}
+
+impl HorizonOutcome {
+    /// Persist beside the horizon's levels, so a rerun of the search skips
+    /// horizons it already settled.
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = match self {
+            HorizonOutcome::Confirmed => "confirmed\n".to_string(),
+            HorizonOutcome::Refuted { level } => format!("refuted {level}\n"),
+        };
+        Ok(std::fs::write(path, text)?)
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Option<Self>> {
+        let Ok(text) = std::fs::read_to_string(path) else { return Ok(None) };
+        let mut it = text.split_whitespace();
+        Ok(Some(match (it.next(), it.next()) {
+            (Some("confirmed"), None) => HorizonOutcome::Confirmed,
+            (Some("refuted"), Some(l)) => HorizonOutcome::Refuted { level: l.parse()? },
+            _ => anyhow::bail!("{}: unreadable outcome {text:?}", path.display()),
+        }))
+    }
 }
 
 /// The precision ladder over rising horizons (semantics pinned with Philippe
@@ -1684,7 +1817,13 @@ where
         let dir = self.level_dir(horizon, 0);
         if self.level0.is_none() {
             let engine = (self.make_engine)(self.precisions[0])?;
-            let state = ForwardState::start((self.make_initial)()?, &dir, true)?;
+            // A tree left by an earlier run resumes; the ladder's finer
+            // levels are recomputed per horizon (their outcome is on disk,
+            // `outcome_path`, so completed horizons are skipped).
+            let state = match ForwardState::resume(&dir, true)? {
+                Some(s) => s,
+                None => ForwardState::start((self.make_initial)()?, &dir, true)?,
+            };
             self.level0 = Some((engine, state));
         }
         let (engine, state) = self.level0.as_mut().expect("just started");
@@ -1693,6 +1832,24 @@ where
     }
 
     pub fn at_horizon(&mut self, horizon: u32) -> Result<HorizonOutcome> {
+        // A horizon an earlier run finished: its outcome is on disk. Level 0
+        // still has to be extended to it (a no-op when the resumed tree
+        // already reaches it) so later horizons find their frames.
+        if let Some(outcome) = HorizonOutcome::load(&self.outcome_path(horizon))? {
+            self.extend_level0(horizon)?;
+            eprintln!("[ladder] h{horizon}: {outcome:?} (from an earlier run)");
+            return Ok(outcome);
+        }
+        let outcome = self.at_horizon_fresh(horizon)?;
+        outcome.save(&self.outcome_path(horizon))?;
+        Ok(outcome)
+    }
+
+    fn outcome_path(&self, horizon: u32) -> std::path::PathBuf {
+        self.base_dir.join(format!("h{:03}", horizon)).join("outcome.txt")
+    }
+
+    fn at_horizon_fresh(&mut self, horizon: u32) -> Result<HorizonOutcome> {
         let mut prev: Option<(Visited, crate::interpreter::abstraction::RemPrecision)> = None;
         for level in 0..self.precisions.len() {
             let precision = self.precisions[level];
@@ -2046,7 +2203,33 @@ mod tests {
         let extended4 = keyset(4);
         assert_eq!(fresh4, extended4, "extension diverged from fresh at frame 4");
         eprintln!("[extend] frame 4 key set identical: {} keys", fresh4.len());
+
+        // RESUME: a fresh run to 6 versus the tree above resumed at 4 and
+        // extended to 6 (door and pos graph rebuilt from the layers).
+        let fresh_dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-resume-test-fresh6");
+        let _ = std::fs::remove_dir_all(fresh_dir);
+        std::fs::create_dir_all(fresh_dir).expect("mkdir");
+        {
+            let e = RefEngine::new().expect("engine");
+            let init = vec![Block::from_state(&e.initial_state().expect("init")).expect("block")];
+            forward_run(&Mutex::new(e), init, fresh_dir, 6, true, None).expect("fresh 6");
+        }
+        {
+            let e = Mutex::new(RefEngine::new().expect("engine"));
+            let mut st = ForwardState::resume(dir, true).expect("resume").expect("a tree to resume");
+            assert_eq!(st.frames, 4);
+            let door_before = st.visited_len();
+            st.extend(&e, dir, 6, None).expect("extend resumed");
+            assert!(st.visited_len() >= door_before);
+        }
+        let keyset_in = |d: &std::path::Path, frame: u32| -> FxHashSet<(u64, u64)> {
+            load_frame(d, frame).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect()
+        };
+        assert_eq!(keyset_in(fresh_dir, 6), keyset_in(dir, 6), "resumed run diverged from fresh at frame 6");
+        assert_eq!(keyset_in(fresh_dir, 5), keyset_in(dir, 5), "resumed run diverged from fresh at frame 5");
+        eprintln!("[resume] frames 5 and 6 identical after resuming at 4");
         let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(fresh_dir);
     }
 
     /// End-to-end wiring of the ladder's forward+refute path: run one level with
