@@ -9,8 +9,11 @@
 //!                       fixed-width columns loadable by cell range
 //!   * `pos_graph`     - the position-transition graph, the backward pass's
 //!                       predecessor filter (`plans/strategy.md`)
+//!   * `ui_export`     - `rewrite export-ui`: a finished run's tree + log
+//!                       -> the static data the web UI (`ui/`) renders
 //!
 //! The forward driver itself is `frame::forward_run` (src/frame.rs), on a
 //! `compiled::FrameEngine`.
 pub mod checkpoint;
 pub mod pos_graph;
+pub mod ui_export;

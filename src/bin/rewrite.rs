@@ -1,6 +1,6 @@
 //! The search driver: `rewrite search` (the precision ladder), `rewrite
 //! forward` (one forward pass with timing), `rewrite ckhash` (checkpoint
-//! fingerprints).
+//! fingerprints), `rewrite export-ui` (the web UI's data).
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -123,6 +123,23 @@ enum Command {
         level_dir: String,
         #[arg(long, default_value_t = 99)]
         horizon: u32,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+    },
+    /// Export a finished run for the web UI (`ui/`): per (horizon, level,
+    /// frame) the states per player-position cell and the win cells, per
+    /// (horizon, level) the marks per cell by distance, and the log's
+    /// per-frame / per-iteration timings - from the checkpoint HEADERS and
+    /// the marks files only. See `search::ui_export` for the layout.
+    ExportUi {
+        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
+        checkpoint_dir: String,
+        /// The run's log (the `[fwd]` / `[bwd]` / `[ladder]` lines).
+        #[arg(long)]
+        log: String,
+        /// Output directory (the UI serves it as `data/`).
+        #[arg(long, default_value = "/var/tmp/celeste-ui/data")]
+        out: String,
         #[arg(long, default_value = "1,0")]
         room: String,
     },
@@ -433,6 +450,23 @@ fn main() -> Result<()> {
             );
             celeste_rust::compiled::dispatch::print_kernel_hits();
             celeste_rust::metrics::dump("bench-backward", None, &[]);
+        }
+        Command::ExportUi {
+            checkpoint_dir,
+            log,
+            out,
+            room,
+        } => {
+            let (rx, ry) = room
+                .split_once(',')
+                .and_then(|(a, b)| Some((a.parse::<i16>().ok()?, b.parse::<i16>().ok()?)))
+                .ok_or_else(|| anyhow::anyhow!("--room must be \"x,y\", got {room:?}"))?;
+            celeste_rust::search::ui_export::export(
+                std::path::Path::new(&checkpoint_dir),
+                std::path::Path::new(&log),
+                std::path::Path::new(&out),
+                (rx, ry),
+            )?;
         }
         Command::Witness {
             checkpoint_dir,

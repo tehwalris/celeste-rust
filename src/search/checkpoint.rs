@@ -285,6 +285,27 @@ impl FrameFile {
         self.header.shape_hash
     }
 
+    /// `(cell, rows at that cell)` for every distinct cell, ascending by
+    /// cell - straight off the index, no row decoded. The UI export's
+    /// per-cell state counts are exactly this.
+    pub fn cell_counts(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        let idx = &self.header.index;
+        idx.iter().enumerate().map(move |(i, &(cell, start))| {
+            let end = idx.get(i + 1).map(|e| e.1).unwrap_or(self.header.width);
+            (cell, end - start)
+        })
+    }
+
+    /// Every row's `(cell, key)` in file order (ascending by cell, then
+    /// key): the cell from the index, the key straight off the map.
+    pub fn cell_keys(&self) -> impl Iterator<Item = (u32, (u64, u64))> + '_ {
+        let idx = &self.header.index;
+        idx.iter().enumerate().flat_map(move |(i, &(cell, start))| {
+            let end = idx.get(i + 1).map(|e| e.1).unwrap_or(self.header.width);
+            (start..end).map(move |r| (cell, self.key(r)))
+        })
+    }
+
     /// The row range holding `cell` (empty if the file has none).
     pub fn rows_of_cell(&self, cell: u32) -> std::ops::Range<u32> {
         match self.header.index.binary_search_by_key(&cell, |e| e.0) {
