@@ -162,6 +162,13 @@ enum Command {
         frame: u32,
         #[arg(long, default_value = "1,0")]
         room: String,
+        /// With `--to`: the MOTION-FREE kernel variants over frames
+        /// `frame..=to` - per frame the distinct (shape, every scalar cell
+        /// except the player's x, y, spd, rem) classes over the WHOLE row
+        /// (every object, the globals), how many are new, and the union
+        /// so far: what a motion-free specialization would compile.
+        #[arg(long)]
+        to: Option<u32>,
     },
     /// Extract a concrete input sequence that wins by `horizon` from one
     /// level's marks: a DFS from the initial state through the reference
@@ -452,6 +459,7 @@ fn main() -> Result<()> {
             level_dir,
             frame,
             room,
+            to,
         } => {
             use celeste_engine::runtime2::{Cell2, Col, AV};
             use celeste_rust::frame::{frame_files, load_frame};
@@ -459,6 +467,105 @@ fn main() -> Result<()> {
             std::env::set_var("CELESTE_START_ROOM", &room);
             let dir = std::path::Path::new(&level_dir);
             let ids = celeste_rust::compiled::ids();
+            if let Some(to) = to {
+                let mix = celeste_engine::runtime2::mix64;
+                let mut union: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+                let mut by_cell: FxHashMap<(u64, u32), u64> = FxHashMap::default();
+                let mut by_class: FxHashMap<(u64, u64), u64> = FxHashMap::default();
+                let mut by_cell_class: FxHashMap<(u64, u32, u64), u64> = FxHashMap::default();
+                println!("[variants] frame | rows | shapes | classes this frame | new | union so far");
+                for f in frame..=to {
+                    let blocks = load_frame(dir, f)?;
+                    let mut here: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+                    let mut rows = 0usize;
+                    let mut shapes: rustc_hash::FxHashSet<u64> = Default::default();
+                    for b in &blocks {
+                        let rt2 = b.rt2();
+                        rows += rt2.width;
+                        shapes.insert(rt2.shape_hash);
+                        // The six motion cells of the player, if any.
+                        let mut motion: Vec<u32> = Vec::new();
+                        if let Some(obj) = celeste_rust::search::pos_graph::player_object(rt2) {
+                            motion.extend(rt2.obj_field_cell(obj, ids.f_x));
+                            motion.extend(rt2.obj_field_cell(obj, ids.f_y));
+                            for sub in [ids.f_spd, ids.f_rem] {
+                                if let Some(c) = rt2.obj_field_cell(obj, sub) {
+                                    if let Col::U(AV::Ptr(sp)) = rt2.cols[c as usize] {
+                                        motion.extend(rt2.obj_field_cell(sp, ids.f_x));
+                                        motion.extend(rt2.obj_field_cell(sp, ids.f_y));
+                                    }
+                                }
+                            }
+                        }
+                        let mut h: Vec<u64> = vec![rt2.shape_hash; rt2.width];
+                        for (c, col) in rt2.cols.iter().enumerate() {
+                            if !matches!(rt2.structure[c], Cell2::Val) || motion.contains(&(c as u32)) {
+                                continue;
+                            }
+                            let fold = |acc: u64, v: AV| -> u64 {
+                                let (k, a, b) = match v {
+                                    AV::Num(n) => (0u64, n.as_raw_u32() as u64, 0u64),
+                                    AV::Ival(a, b) => (1, a.as_raw_u32() as u64, b.as_raw_u32() as u64),
+                                    AV::Bool(x) => (2, x as u64, 0),
+                                    AV::UBool => (3, 0, 0),
+                                    AV::Str(s) => (4, s as u64, 0),
+                                    AV::Nil => (5, 0, 0),
+                                    AV::Ptr(p) => (6, p as u64, 0),
+                                    AV::NilPtr => (7, 0, 0),
+                                };
+                                mix(acc ^ mix((c as u64) << 56 | k << 48 | a << 16 ^ b))
+                            };
+                            match col {
+                                Col::U(v) => {
+                                    let hv = fold(0, *v);
+                                    for x in h.iter_mut() {
+                                        *x = mix(*x ^ hv);
+                                    }
+                                }
+                                _ => {
+                                    for (r, x) in h.iter_mut().enumerate() {
+                                        *x = mix(*x ^ fold(0, col.at(r)));
+                                    }
+                                }
+                            }
+                        }
+                        let cells = b.positions()?;
+                        for (r, x) in h.into_iter().enumerate() {
+                            here.insert((rt2.shape_hash, x));
+                            if f == to || f % 10 == 0 {
+                                *by_cell.entry((rt2.shape_hash, cells[r])).or_default() += 1;
+                                *by_class.entry((rt2.shape_hash, x)).or_default() += 1;
+                                *by_cell_class.entry((rt2.shape_hash, cells[r], x)).or_default() += 1;
+                            }
+                        }
+                    }
+                    let new = here.iter().filter(|k| !union.contains(k)).count();
+                    union.extend(here.iter().copied());
+                    println!("[variants] f{f:03} | {rows} | {} | {} | {new} | {}", shapes.len(), here.len(), union.len());
+                    if f == to || f % 10 == 0 {
+                        let dist = |name: &str, sizes: Vec<u64>| {
+                            let mut c = sizes;
+                            c.sort_unstable();
+                            let n = c.len().max(1);
+                            let total: u64 = c.iter().sum();
+                            let small: u64 = c.iter().filter(|&&k| k < 16).sum();
+                            println!(
+                                "[buckets] f{f:03} {name}: {} buckets; rows/bucket median {} p90 {} max {}; {:.1}% of rows in buckets < 16",
+                                c.len(),
+                                c[n / 2],
+                                c[n * 9 / 10],
+                                c[n - 1],
+                                100.0 * small as f64 / total.max(1) as f64
+                            );
+                        };
+                        dist("(shape, cell)", by_cell.drain().map(|(_, v)| v).collect());
+                        dist("(shape, class)", by_class.drain().map(|(_, v)| v).collect());
+                        dist("(shape, cell, class)", by_cell_class.drain().map(|(_, v)| v).collect());
+                    }
+                }
+                println!("[variants] union over f{frame}..=f{to}: {} (shape, motion-free class) variants", union.len());
+                return Ok(());
+            }
             let blocks = load_frame(dir, frame)?;
             let rows: usize = blocks.iter().map(|b| b.lanes()).sum();
             println!("[census] {} f{frame}: {} blocks, {rows} rows", dir.display(), blocks.len());
