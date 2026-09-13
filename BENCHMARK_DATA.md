@@ -9,6 +9,10 @@ posgraph, marks). Details and the per-phase split in plans/waves.md.
 | two-phase + batches (`27a1891`) | 25.5 s | 9.45 GB | 1984 ms | 41.3M | 4.94 GB slots | 1.62 GB hash sets |
 | **waves** (`44559b0`) | **25.4 s** | **4.08 GB** | 1907 ms | 28.9M | 0.08 GB queues | 1.11 GB sorted door |
 
+Room (0,0) f0-f90 under the waves frame: 277 s, **14.15 GB peak** (the
+two-phase frame: 24.8 GB under mimalloc, 44.1 GB under glibc, killed at
+f88 unbatched), same pos-graph fingerprint, f90 frame 10.1 s vs 9.5 s.
+
 Same speed (the frame is kernel-bound), 43% of the memory. Earlier the
 same day: glibc -> mimalloc took room (0,0) f90 from 44.1 to 24.8 GB RSS
 at the same speed (plans/memory.md), and batching the two-phase frame's

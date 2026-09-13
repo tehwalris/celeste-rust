@@ -362,3 +362,10 @@ Room (1,0) f0-f70, 16 threads, release, gates identical:
 
 Same speed, 43% of the memory. The wave is kernel-bound as before; the
 flushes run at ~180 rows each (162k per frame at f70).
+
+Room (0,0) f0-f90 (the run that was OOM-killed at f88 under glibc and
+needed 24.8 GB batched under mimalloc): **14.15 GB peak**, 277 s, the
+same pos-graph fingerprint; at f90 the frame is 10.1 s (wave 8.8 s,
+door 0.35 s, ckpt 0.8 s) against 9.5 s two-phase, door 5.96 GB against
+8.8 GB of hash sets, queues 0.25 GB against ~8 GB of slots. The three
+memory cuts compose: 44 GB (glibc) -> 24.8 (mimalloc) -> 14.2 (waves).
