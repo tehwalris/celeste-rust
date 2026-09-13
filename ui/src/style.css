@@ -293,6 +293,12 @@ main {
 .grid-panels .panel.not-run canvas:not(.room-overlay) {
   opacity: 0.35;
 }
+.grid-panels .panel.animating canvas:not(.room-overlay) {
+  border-color: rgba(255, 255, 255, 0.55);
+}
+.grid-panels .panel .lab .state {
+  color: var(--muted);
+}
 .grid-panels .panel .lab {
   position: absolute;
   left: 6px;

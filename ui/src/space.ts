@@ -383,6 +383,30 @@ export function spaceView(run: Run): HTMLElement {
     return { scene: { layers, rings }, probe, off };
   }
 
+  /** A level after its last pass: everything it reached, dim, with all
+   *  its marks (or, in the height map, the passes painted through it). */
+  function finalScene(lr: LevelRun, last: Pass, h: number): Built {
+    const layers: HeatLayer[] = [];
+    const probe: Named[] = [];
+    if (st.look === "last") {
+      paintPasses(run.horizons[st.h], timeline(st.h), last.index + 1, layers, probe);
+      return { scene: { layers, rings: [] }, probe, off: 0 };
+    }
+    const files = have(lr);
+    if (!files) return { scene: { layers, rings: [] }, probe, off: 0 };
+    if (st.look === "full") {
+      const g = cumGrid(files.frames, 0, h);
+      layers.push({ grid: g.grid, max: files.cumMax, ramp: levelRamp(lr.level, "dim"), alpha: 0.95 });
+      probe.push({ name: `visited L${lr.level}`, grid: g.grid });
+    }
+    if (files.layers) {
+      const g = cumGrid(files.layers, 0, h);
+      layers.push({ grid: g.grid, max: files.marksMax, ramp: marksRamp("bright"), alpha: 1 });
+      probe.push({ name: `marked L${lr.level}`, grid: g.grid });
+    }
+    return { scene: { layers, rings: st.look === "full" ? files.winRings : [] }, probe, off: 0 };
+  }
+
   /** Grid grain: one level's panel at (phase, f). */
   function panelScene(lr: LevelRun, phase: Phase, f: number, h: number): Built {
     const layers: HeatLayer[] = [];
@@ -583,6 +607,8 @@ export function spaceView(run: Run): HTMLElement {
   interface Panel {
     lr: LevelRun | null;
     level: number;
+    root: HTMLElement;
+    state: HTMLElement;
     canvas: HTMLCanvasElement;
     overlay: HTMLCanvasElement;
   }
@@ -600,9 +626,11 @@ export function spaceView(run: Run): HTMLElement {
       const c = el("canvas", { "aria-label": `level ${level}` });
       const o = el("canvas", { class: "room-overlay" });
       const name = level === 16 ? "exact" : `${level} bit${level === 1 ? "" : "s"}`;
+      const state = el("span", { class: "state" });
       const lab = el("div", { class: "lab" }, [
         el("i", { style: `background:${levelCss(level)}` }),
         lr ? `${name}${lr.refuted ? " · refuted" : lr.first_win != null ? ` · win f${lr.first_win}` : ""}` : `${name} · not run at h${hr.h}`,
+        state,
       ]);
       const p = el("div", { class: `panel${lr ? "" : " not-run"}` }, [c, o, lab]);
       if (lr) {
@@ -620,7 +648,7 @@ export function spaceView(run: Run): HTMLElement {
         });
       }
       gridBox.append(p);
-      panels.push({ lr, level, canvas: c, overlay: o });
+      panels.push({ lr, level, root: p, state, canvas: c, overlay: o });
     }
   }
 
@@ -700,10 +728,28 @@ export function spaceView(run: Run): HTMLElement {
       renderer.render(canvas, built.scene, overlay);
       describePass(hr, pass, i, built.off);
     } else {
+      // The grid walks the same timeline as the room: only the current
+      // pass's level animates; levels whose passes are done sit at their
+      // final state, levels not yet reached are blank.
       const f = pass.frames[i];
       for (const p of panels) {
-        const built = p.lr ? panelScene(p.lr, pass.phase, f, hr.h) : { scene: { layers: [], rings: [] } };
+        let built: Built = { scene: { layers: [], rings: [] }, probe: [], off: 0 };
+        let state: "animating" | "done" | "not yet" | "not run" = "not run";
+        if (p.lr) {
+          const own = tl.filter((x) => x.lr === p.lr);
+          const last = own[own.length - 1];
+          if (own.some((x) => x.index === pass.index)) {
+            built = panelScene(p.lr, pass.phase, f, hr.h);
+            state = "animating";
+          } else if (last && last.index < pass.index) {
+            built = finalScene(p.lr, last, hr.h);
+            state = "done";
+          } else state = "not yet";
+        }
         renderer.render(p.canvas, built.scene, p.overlay);
+        p.root.classList.toggle("not-run", state === "not run" || state === "not yet");
+        p.root.classList.toggle("animating", state === "animating");
+        p.state.textContent = state === "animating" ? ` · ${pass.phase === "fwd" ? "forward" : "backward"} f${f}` : state === "done" ? " · done" : state === "not yet" ? " · not yet" : "";
       }
       describePass(hr, pass, i, 0);
     }
