@@ -421,6 +421,35 @@ Two findings, in order of size:
    per row at flush time with no widening after the fact. Nothing in
    the loop should ever convert to a plain state.
 
-Both are for after the room (0,0) run; (2) first (contained: the
-tracer's key fold with the coarser widening, two roots per body, the
-flush's lookup), then (1) with the specialization work.
+**(1) is DONE, differently and better than a runtime fork (the
+single-grid fork, `f1...`, 2026-09-13 evening).** The two forks per axis
+were one cut made twice: `move` split `t = rem + spd + 0.5` at the
+integers and the boundary snap split the new rem at the bucket edges,
+but at rung k the integers ARE bucket edges (0.5 and every integer are
+multiples of 2^-k), and an arc of width 2^-k contains exactly one grid
+point - so the four fragment combinations per axis were one
+contradictory pair and two per-lane-exclusive pairs. Now the fork grid
+is a property of the graph (`Graph::fork_bits`, set from the rung),
+`move` cuts once at the bucket grid, the floor of each piece is single
+by construction, and the boundary only snaps, asserting
+`Known(Flr(rem / width))` into `ok`. Rung 1's bodies went from 2451 to
+723 (= rung 0's) over room (0,0)'s shapes, and the level-1 frame f83
+microbenchmark from ~2.2 s to 0.19 s (0.16 s with the marks filter,
+same rows). Gates identical. One trap on the way: the interval pass
+evaluates premises on hulls, and `Known` of an undecided hull must stay
+undecided (it folded to false and refused every lane).
+
+(2), the in-kernel coarser key, is still open; it was ~30% of a
+level-1 frame before (1) and is a smaller share now.
+
+## Does a second forward/backward round at one rung narrow? No (2026-09-13)
+
+`CELESTE_LADDER_RUNGS=0,0,0,1,16` on the marks-gate config (room (1,0),
+synthetic win at 9,101, h29-33): every repeated Bits(0) rung reproduces
+the previous one's marked set exactly (48/48/48 states at h29 with the
+same fingerprint, 124/124/124 at h30, ... 2853/2853/2853 at h33). The
+marks are closed under predecessors - a state on a path to a marked
+state can reach the win through it - so the filtered forward is the
+marks and the backward on them is the marks again: a fixpoint after one
+round. Only precision narrows the band. (The repeated rounds cost ~1/10
+of the first: the filtered forward is tiny.)

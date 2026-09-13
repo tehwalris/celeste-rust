@@ -236,10 +236,22 @@ fn main() -> Result<()> {
             if let Some(xy) = &win_at {
                 std::env::set_var("CELESTE_WIN_AT_XY", xy);
             }
-            let precisions: Vec<RemPrecision> = (0u8..=maxk.min(15))
-                .map(RemPrecision::Bits)
-                .chain(std::iter::once(RemPrecision::Exact))
-                .collect();
+            // CELESTE_LADDER_RUNGS="0,0,1,16": an explicit rung list (16 =
+            // Exact), for experiments on the ladder itself - e.g. the same
+            // rung twice to see whether a second forward/backward round at
+            // one precision narrows anything (it does not: the marks are
+            // closed under predecessors, so it is a fixpoint).
+            let precisions: Vec<RemPrecision> = match std::env::var("CELESTE_LADDER_RUNGS") {
+                Ok(list) => list
+                    .split(',')
+                    .map(|k| k.trim().parse::<u8>().expect("CELESTE_LADDER_RUNGS: comma-separated rung numbers"))
+                    .map(|k| if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) })
+                    .collect(),
+                Err(_) => (0u8..=maxk.min(15))
+                    .map(RemPrecision::Bits)
+                    .chain(std::iter::once(RemPrecision::Exact))
+                    .collect(),
+            };
             let make_engine = |p: RemPrecision| {
                 set_rem_precision(p);
                 Ok(Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)
@@ -631,6 +643,8 @@ fn main() -> Result<()> {
             let mut classes: FxHashMap<Vec<(u32, u32, u32)>, u64> = FxHashMap::default();
             let mut classes_xy: FxHashMap<(u32, u32), u64> = FxHashMap::default();
             let mut classes_xys: FxHashMap<(u32, u32, u32, u32), u64> = FxHashMap::default();
+            let mut classes_spd: FxHashMap<(u32, u32), u64> = FxHashMap::default();
+            let (mut card_sx, mut card_sy): (FxHashMap<u32, u64>, FxHashMap<u32, u64>) = Default::default();
             let mut classes_nopos: FxHashMap<Vec<(u32, u32, u32)>, u64> = FxHashMap::default();
             // Every scalar except the player's MOTION (x, y, spd, rem): the
             // variants a motion-free kernel specialization would compile.
@@ -716,6 +730,9 @@ fn main() -> Result<()> {
                             let vx = enc(rt2.cols[sx as usize].at(lane));
                             let vy = enc(rt2.cols[sy as usize].at(lane));
                             *classes_xys.entry((x, y, vx.1 ^ vx.2.rotate_left(16), vy.1 ^ vy.2.rotate_left(16))).or_default() += 1;
+                            *classes_spd.entry((vx.1 ^ vx.2.rotate_left(16), vy.1 ^ vy.2.rotate_left(16))).or_default() += 1;
+                            *card_sx.entry(vx.1).or_default() += 1;
+                            *card_sy.entry(vy.1).or_default() += 1;
                         }
                     }
                 }
@@ -729,6 +746,18 @@ fn main() -> Result<()> {
             println!("[census] rows without a player object: {no_player}");
             println!("[census] distinct (x, y): {}", classes_xy.len());
             println!("[census] distinct (x, y, spd.x, spd.y): {}", classes_xys.len());
+            let frac = |m: &FxHashMap<u32, u64>| -> (usize, f64) {
+                let n = m.len();
+                let rows: u64 = m.values().sum();
+                let fractional: u64 = m.iter().filter(|(v, _)| **v & 0xffff != 0).map(|(_, n)| *n).sum();
+                (n, 100.0 * fractional as f64 / rows.max(1) as f64)
+            };
+            let (nx, fx) = frac(&card_sx);
+            let (ny, fy) = frac(&card_sy);
+            println!(
+                "[census] distinct (spd.x, spd.y): {}; spd.x {nx} distinct ({fx:.1}% of rows fractional), spd.y {ny} distinct ({fy:.1}% fractional)",
+                classes_spd.len()
+            );
             println!("[census] all scalar fields except rem: {}", dist(&classes));
             println!("[census] all scalar fields except rem and x, y: {}", dist(&classes_nopos));
             println!("[census] all scalar fields except rem, x, y and spd (motion-free classes): {}", dist(&classes_nomotion));
