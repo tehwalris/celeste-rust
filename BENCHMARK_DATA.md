@@ -1,3 +1,27 @@
+# Room (0,0) end to end on the explicit backward graph (2026-09-14, release, 16 threads)
+
+`rewrite search --room 0,0 --from 1 --to 130`, the same run as the
+2 h 32 min one below, on `edges::backward`. Every `[ladder]` fingerprint
+identical, `OPTIMAL win frame: 93`: **23 min 50 s** (against 2 h 32 min
+measured on the kernel walk before the single-grid fork, and ~48 min
+projected with the fork). Peak RSS 45.6 GB; level 0's runs 42 GB beside
+50 GB of frames.
+
+| horizon | level-0 backward, kernel walk (fork run) | BFS (this run, single-threaded) |
+|---|---|---|
+| h82 | 29 s | 0.7 s |
+| h85 | 61 s | 3.7 s |
+| h89 | 155 s | 17 s |
+| h90 | 185 s | 24 s (39M lookups, 127M edges) |
+| h92 | 265 s | 43 s |
+| h93 | - | 57 s (98M lookups, 287M edges) |
+
+The level-0 forward frame is 1.66x the baseline's with recording (f79:
+12.9 s vs 7.75 s), which the forward-cost pass (plans/waves.md) is for;
+with the BFS parallel and the frame near 1x the projection is ~22 min,
+and the finer levels (17 rungs of filtered forward + backward per
+horizon) are then the dominant term.
+
 # Room (1,0) end to end on the explicit backward graph (2026-09-14, release, 32 threads)
 
 `rewrite search --room 1,0 --to 110` on `edges::backward` (the BFS over
