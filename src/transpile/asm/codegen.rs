@@ -51,7 +51,6 @@ enum CallOp {
 }
 
 const FLR_MASK: i32 = 0xffff_0000u32 as i32;
-const ONE_FIXED: i32 = 0x0001_0000; // P8::from_i16(1) raw
 
 type Vreg = u32;
 
@@ -522,6 +521,17 @@ impl<'a> Lower<'a> {
     fn flr(&mut self, a: Vreg) -> Vreg {
         self.dbin_c(ROp::AndD, a, FLR_MASK)
     }
+    /// Floor to the graph's fork grid (`Graph::fork_bits`): the multiples
+    /// of `2^-bits`, the integers when `bits == 0`.
+    fn flr_grid(&mut self, a: Vreg) -> Vreg {
+        let (_, mask) = self.grid();
+        self.dbin_c(ROp::AndD, a, mask)
+    }
+    /// One fork-grid step in raw units, and the mask that floors to it.
+    fn grid(&self) -> (i32, i32) {
+        let step = 1i32 << (16 - self.g.fork_bits() as i32);
+        (step, !(step - 1))
+    }
     /// `mask_eq(a, b)` as a vector mask.
     fn mask_eq(&mut self, a: Vreg, b: Vreg) -> Vreg {
         self.cmp(0, a, Src::Reg(b))
@@ -570,18 +580,20 @@ impl<'a> Lower<'a> {
     }
     /// `zi_span_ok`: does it span at most two floors?
     fn zi_span_ok(&mut self, a: [Vreg; 2]) -> Vreg {
-        let fl = self.flr(a[0]);
-        let fh = self.flr(a[1]);
+        let (step, _) = self.grid();
+        let fl = self.flr_grid(a[0]);
+        let fh = self.flr_grid(a[1]);
         let e0 = self.mask_eq(fl, fh);
-        let one = self.dbin_c(ROp::AddD, fl, ONE_FIXED);
+        let one = self.dbin_c(ROp::AddD, fl, step);
         let e1 = self.mask_eq(fh, one);
         self.dbin(ROp::OrD, e0, e1)
     }
     /// `zi_fork_flr(a, c)`: (fragment interval, valid mask).
     fn zi_fork_flr(&mut self, a: [Vreg; 2], c: u8) -> ([Vreg; 2], Vreg) {
-        let fl = self.flr(a[0]);
-        let fh = self.flr(a[1]);
-        let one = self.dbin_c(ROp::AddD, fl, ONE_FIXED);
+        let (step, _) = self.grid();
+        let fl = self.flr_grid(a[0]);
+        let fh = self.flr_grid(a[1]);
+        let one = self.dbin_c(ROp::AddD, fl, step);
         let two = self.mask_eq(fh, one);
         let all = self.num_reg(NumVal::ConstI32(-1));
         if c == 0 {

@@ -103,7 +103,7 @@ pub fn fold(g: &Graph, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph, 
         None => g.eval_lenient(&cells)?,
     };
 
-    let mut out = Graph::new();
+    let mut out = g.like();
     let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
     let mut st = Stats {
         before: need.iter().filter(|x| **x).count(),
@@ -272,6 +272,29 @@ mod tests {
         let ok1 = g.fold(Op::FragOk(1), vec![x]);
         let (out, map, _) = fold(&g, &[ok1], None).expect("folds");
         assert_eq!(out.get(map[ok1 as usize]).op, Op::ConstBool(false));
+    }
+
+    /// `Known` is a per-lane fact too: a hull that spans several floors
+    /// contains lanes whose floor IS decided, so `Known(Flr(hull))` must
+    /// stay undecided under the interval pass, not fold to false. This is
+    /// the boundary's one-bucket premise at the finer rungs; folding it to
+    /// false refused every lane (2026-09-13).
+    #[test]
+    fn known_of_a_wide_hull_is_undecided() {
+        let mut g = Graph::new();
+        let x = g.leaf(Op::Cell(0));
+        let fl = g.fold(Op::Flr, vec![x]);
+        let known = g.fold(Op::Known, vec![fl]);
+        let (out, map, _) = fold(&g, &[known], None).expect("folds");
+        assert_eq!(out.get(map[known as usize]).op, Op::Known, "wide hull: undecided");
+
+        // A point hull is decided everywhere.
+        let mut g = Graph::new();
+        let p = g.leaf(Op::Const(65536 * 3 + 1000, 65536 * 3 + 1000));
+        let fl = g.fold(Op::Flr, vec![p]);
+        let known = g.fold(Op::Known, vec![fl]);
+        let (out, map, _) = fold(&g, &[known], None).expect("folds");
+        assert_eq!(out.get(map[known as usize]).op, Op::ConstBool(true));
     }
 
     /// Folding must not change what the graph computes. Sampled, because

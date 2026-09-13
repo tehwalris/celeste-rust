@@ -348,10 +348,25 @@ pub fn zi_flr(a: ZI) -> ZN {
 /// at most TWO floors, so the two fork outcomes can represent it. A
 /// boundary-widened interval has width < 1 and always passes.
 #[inline(always)]
-pub fn zi_span_ok(a: ZI) -> ZB {
-    let (fl, fh) = (zn_flr(a.lo), zn_flr(a.hi));
-    let one = zn_splat(P8::from_i16(1));
-    ZB { val: mask_eq(fl, fh) | mask_eq(fh, zn_add(fl, one)), known: ALL }
+pub fn zi_span_ok(a: ZI, bits: u8) -> ZB {
+    let (step, mask) = grid(bits);
+    let (fl, fh) = (zn_flr_grid(a.lo, mask), zn_flr_grid(a.hi, mask));
+    ZB { val: mask_eq(fl, fh) | mask_eq(fh, zn_add(fl, zn_splat(step))), known: ALL }
+}
+
+/// The fork grid for `bits` (`Graph::fork_bits`): one step of `2^-bits`
+/// in raw 16.16 units, and the mask that floors to it. `bits == 0` is
+/// the integer grid.
+#[inline(always)]
+pub fn grid(bits: u8) -> (P8, i32) {
+    let step = 1i32 << (16 - bits as i32);
+    (P8::from_raw(step), !(step - 1))
+}
+
+/// Floor to a grid: `x & mask` (`zn_flr` is the integer grid).
+#[inline(always)]
+pub fn zn_flr_grid(a: ZN, mask: i32) -> ZN {
+    ZN(unsafe { _mm512_and_si512(a.0, m512(mask)) })
 }
 
 // ---- comparisons ----
@@ -494,15 +509,16 @@ pub fn zsel_b(c: ZB, t: ZB, f: ZB) -> ZB {
 /// valid in outcome 0 only, so the driver sees them exactly once, and
 /// `zi_span_ok` is the premise that filters them out.
 #[inline(always)]
-pub fn zi_fork_flr(a: ZI, c: usize) -> (ZI, u16) {
-    let (fl, fh) = (zn_flr(a.lo), zn_flr(a.hi));
+pub fn zi_fork_flr(a: ZI, c: usize, bits: u8) -> (ZI, u16) {
+    let (step, mask) = grid(bits);
+    let (fl, fh) = (zn_flr_grid(a.lo, mask), zn_flr_grid(a.hi, mask));
     // The one case that actually splits: the interval spans EXACTLY two
     // floors, so fragment 0 is everything below the boundary and
     // fragment 1 everything from it up. One floor needs no split, and
     // more than two cannot be represented by two fragments - those
     // lanes stay whole and go down configuration 0, where `zi_span_ok`
     // is what takes them off the kernel.
-    let two = mask_eq(fh, zn_add(fl, zn_splat(P8::from_i16(1))));
+    let two = mask_eq(fh, zn_add(fl, zn_splat(step)));
     unsafe {
         if c == 0 {
             // `next_smallest` is minus one raw unit.

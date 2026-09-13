@@ -563,7 +563,7 @@ fn factor_common(
 pub fn simplify(g: &Graph, roots: &[NodeId], cap: usize) -> (Graph, Vec<NodeId>, Stats) {
     let need = reachable(g, roots);
     let (mut bdd, a) = analyze(g, &need, cap);
-    let mut out = Graph::new();
+    let mut out = g.like();
     let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
     let mut seen: FxHashMap<Ref, NodeId> = FxHashMap::default();
     let mut st = Stats {

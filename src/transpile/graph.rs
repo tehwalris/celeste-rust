@@ -311,11 +311,40 @@ pub struct Node {
 pub struct Graph {
     nodes: Vec<Node>,
     intern: rustc_hash::FxHashMap<Node, NodeId>,
+    /// The fork grid: `Split`/`Frag`/`FragOk`/`SplitOk` cut an interval at
+    /// the multiples of `2^-fork_bits` (0 = the integers, the historic
+    /// meaning). One value per graph, because it is one value per traced
+    /// set: the rung's rem bucket width. Rung k's `move` forks at the
+    /// bucket grid, which contains the integers, so one fork per axis
+    /// settles both the integer move and the bucket the new rem lands in
+    /// (plans/waves.md "The finer rungs").
+    fork_bits: u8,
 }
 
 impl Graph {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty graph on the same fork grid: what every pass that builds
+    /// an output graph from this one starts from.
+    pub fn like(&self) -> Self {
+        Graph { fork_bits: self.fork_bits, ..Default::default() }
+    }
+
+    pub fn fork_bits(&self) -> u8 {
+        self.fork_bits
+    }
+
+    pub fn set_fork_bits(&mut self, bits: u8) {
+        debug_assert!(bits <= 16, "fork grid 2^-{bits}");
+        self.fork_bits = bits;
+    }
+
+    /// One grid step in raw 16.16 units, and the mask that floors to it.
+    fn grid(&self) -> (i32, i32) {
+        let step = 1i32 << (16 - self.fork_bits as i32);
+        (step, !(step - 1))
     }
 
     pub fn add(&mut self, op: Op, args: Vec<NodeId>) -> NodeId {
@@ -430,6 +459,7 @@ impl Graph {
         splits: Option<u64>,
         out: &mut Graph,
     ) -> Vec<NodeId> {
+        out.fork_bits = self.fork_bits;
         self.specialize_subset_into(frees, splits, None, out)
     }
 
@@ -452,6 +482,7 @@ impl Graph {
         need: Option<&[bool]>,
         out: &mut Graph,
     ) -> Vec<NodeId> {
+        out.fork_bits = self.fork_bits;
         const UNBUILT: NodeId = NodeId::MAX;
         let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
         for (i, node) in self.nodes.iter().enumerate() {
@@ -826,8 +857,10 @@ impl Graph {
                 // against.
                 Op::Frag(c) | Op::FragOk(c) => {
                     let iv = a(0).as_num("Frag")?;
-                    let (fl, fh) = (iv.low.flr(), iv.high.flr());
-                    let two = fh == fl + Pico8Num::from_i16(1);
+                    let (step, mask) = self.grid();
+                    let gflr = |p: Pico8Num| Pico8Num::from_raw(p.as_raw_u32() as i32 & mask);
+                    let (fl, fh) = (gflr(iv.low), gflr(iv.high));
+                    let two = fh == Pico8Num::from_raw(fl.as_raw_u32() as i32 + step);
                     // Under `lenient` the operand is a HULL over many lanes,
                     // not one lane's interval, and `two` is not a property
                     // a hull inherits: a lane inside a 40-floor hull can
@@ -961,10 +994,26 @@ impl Graph {
                     // The join is the sound one.
                     None => Self::join(a(1), a(2))?,
                 },
-                Op::Known => Val::Bool(Some(match a(0) {
-                    Val::Bool(b) => b.is_some(),
-                    Val::Num(i) => i.to_number().is_some(),
-                })),
+                // Decidedness is a per-LANE fact. Under `lenient` the
+                // operand is a HULL over many lanes: a decided hull means
+                // every lane is decided (true), an undecided hull says
+                // nothing about any one lane (undecided, NOT false).
+                // Answering false from a hull folded the boundary's
+                // one-bucket premise `Known(Flr(rem/w))` to a constant and
+                // refused every lane of every finer rung (2026-09-13).
+                Op::Known => {
+                    let decided = match a(0) {
+                        Val::Bool(b) => b.is_some(),
+                        Val::Num(i) => i.to_number().is_some(),
+                    };
+                    if decided {
+                        Val::Bool(Some(true))
+                    } else if lenient {
+                        Val::Bool(None)
+                    } else {
+                        Val::Bool(Some(false))
+                    }
+                }
                 Op::TileFlagAt if room.is_some() => {
                     Self::tile_flag_over(room.unwrap(), a(0), a(1), a(2), a(3), a(4))?
                 }

@@ -206,12 +206,12 @@ fn eval_nodes(
                 V::W(std::array::from_fn(|l| cell_mix(*c as u64, av_of(l), seed)))
             }
             Op::Span => V::I(ZI { lo: iv(0).lo, hi: iv(1).hi }),
-            Op::Frag(c) => V::I(zi_fork_flr(iv(0), *c as usize).0),
+            Op::Frag(c) => V::I(zi_fork_flr(iv(0), *c as usize, g.fork_bits()).0),
             Op::FragOk(c) => {
-                let (_, ok) = zi_fork_flr(iv(0), *c as usize);
+                let (_, ok) = zi_fork_flr(iv(0), *c as usize, g.fork_bits());
                 V::B(ZB { val: ok, known: ALL })
             }
-            Op::SplitOk => V::B(zi_span_ok(iv(0))),
+            Op::SplitOk => V::B(zi_span_ok(iv(0), g.fork_bits())),
             Op::Mget => {
                 let (cart, _) = room.expect("Mget needs a room");
                 V::N(zn_mget(cart, n(0), n(1)))
@@ -376,8 +376,9 @@ fn check_typed_small(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
 /// ops: zi_add/sub/min/max/neg/abs, zi_flr + Known(Flr), zi_cmp (all four
 /// orders), Frag/FragOk/SplitOk, Sel over intervals, and Bits-of-interval
 /// feeding the hash.
-fn build_interval_graph(cells: &[u32]) -> (Graph, Vec<NodeId>) {
+fn build_interval_graph(cells: &[u32], fork_bits: u8) -> (Graph, Vec<NodeId>) {
     let mut g = Graph::new();
+    g.set_fork_bits(fork_bits);
     let two = g.leaf(Op::Const(ONE_FIXED2, ONE_FIXED2)); // +2.0
     let band = g.leaf(Op::Const(-0x8000, 0x8000)); // a widened +-0.5 literal
     let mut roots = Vec::new();
@@ -421,10 +422,14 @@ fn build_interval_graph(cells: &[u32]) -> (Graph, Vec<NodeId>) {
 #[test]
 fn asm_interval_layer_matches_primitives() {
     let mut rng = Lcg(0x1234_9999);
-    for k in [2usize, 4, 7] {
-        let cells: Vec<u32> = (0..k as u32).map(|i| i * 3 + 2).collect();
-        let (g, roots) = build_interval_graph(&cells);
-        check_typed_small(&g, &roots, &format!("iv{k}"), &mut rng);
+    // The fork grid: integers (rung 0), quarter units (rung 2), the
+    // finest rung.
+    for bits in [0u8, 2, 15] {
+        for k in [2usize, 4, 7] {
+            let cells: Vec<u32> = (0..k as u32).map(|i| i * 3 + 2).collect();
+            let (g, roots) = build_interval_graph(&cells, bits);
+            check_typed_small(&g, &roots, &format!("iv{k}b{bits}"), &mut rng);
+        }
     }
 }
 

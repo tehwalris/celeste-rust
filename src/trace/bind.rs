@@ -390,7 +390,7 @@ pub fn renumber_cells(
     canon: &[u32],
     roots: &[crate::transpile::graph::NodeId],
 ) -> Result<(crate::transpile::graph::Graph, Vec<crate::transpile::graph::NodeId>)> {
-    use crate::transpile::graph::{Graph, NodeId, Op};
+    use crate::transpile::graph::{NodeId, Op};
     let mut seen: std::collections::HashMap<u32, usize> = Default::default();
     for (i, c) in canon.iter().enumerate() {
         if let Some(j) = seen.insert(*c, i) {
@@ -412,7 +412,7 @@ pub fn renumber_cells(
         stack.extend(g.get(n).args.iter().copied());
     }
 
-    let mut out = Graph::new();
+    let mut out = g.like();
     let mut map: Vec<NodeId> = Vec::with_capacity(g.len());
     for id in 0..g.len() {
         if !live[id] {

@@ -69,7 +69,7 @@ pub(crate) fn specialize_frame(
     };
 
     // --- 2. specialize, per outcome, over (button, its own forks) ---
-    let mut sp = Graph::new();
+    let mut sp = graph.like();
     // (outcome, button, fork configuration, roots) where roots is the
     // outcome's fields in order, then `ok`, then `live`.
     let mut cands: Vec<(usize, u8, u64, Vec<NodeId>)> = Vec::new();
@@ -88,7 +88,7 @@ pub(crate) fn specialize_frame(
         // equality - so this prunes the product soundly, and cheaply
         // enough to be worth a separate pass.
         let reps: Vec<u8> = {
-            let mut probe = Graph::new();
+            let mut probe = graph.like();
             let mut seen: BTreeMap<Vec<NodeId>, u8> = BTreeMap::new();
             for m in 0u8..64 {
                 let map = graph.specialize_subset_into(m, None, Some(&need), &mut probe);

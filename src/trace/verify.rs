@@ -182,6 +182,14 @@ pub fn trace_frame<'a>(
     // Fork choices are per FRAME, like the six buttons above.
     it.d.forks = 0;
     it.d.fork_memo.clear();
+    // The fork grid is the rung's rem bucket width: `move` forks at the
+    // bucket edges (which include the integers), so one fork per axis
+    // settles the integer move AND the output bucket, and the boundary
+    // snap below never has to fork again.
+    it.d.graph.set_fork_bits(match widen {
+        Some(super::widen::WidenMode::RemRung(crate::interpreter::abstraction::RemPrecision::Bits(k))) => k,
+        _ => 0,
+    });
     // One frame has exactly six free choices, `Free(0..5)`. The counter
     // is on the domain rather than the frame, so tracing a SECOND frame
     // through one interpreter - which compiling per pm1 key does - would
@@ -783,7 +791,7 @@ mod tests {
             }
             snaps.push(snap);
         }
-        d.graph = crate::transpile::graph::Graph::new();
+        d.graph = d.graph.like();
         for (st, snap) in states.into_iter().zip(snaps) {
             // A state to be traced from is unconditional, so these are
             // simply true. They live on the state rather than in the

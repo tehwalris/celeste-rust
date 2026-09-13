@@ -184,40 +184,36 @@ fn widen_rem(
             }
 
             let rb = rem_bucket_node(d, old, bits)?;
-            if let Some((valid, premise)) = rb.fork {
-                st.guard = d.and(&st.guard, &valid);
-                let ok = st.ok;
-                st.ok = d.and(&ok, &premise);
-            }
+            let ok = st.ok;
+            st.ok = d.and(&ok, &rb.premise);
             iface::set(st, &p, Value::Num(rb.value))?;
         }
     }
     Ok(())
 }
 
-/// The widened rem for one value, plus the fork obligations the caller
-/// must conjoin.
+/// The widened rem for one value, plus the premise the caller conjoins
+/// into `ok`.
 pub(crate) struct RemBucket {
     /// The widened rem: `Span(bucket_low, bucket_high)`, the
     /// floor-aligned Bits(k) bucket `rem_bucket(., bits)`.
     pub value: <Symbolic as Domain>::Num,
-    /// `(valid, premise)` when `old` was an interval and forked: `valid`
-    /// narrows the guard (a lane in no fragment is not a lane), `premise`
-    /// rides on `ok` (a lane spanning more buckets than fragments is
-    /// REAL). `None` when `old` was not an interval - no fork, no
-    /// obligation.
+    /// `old` lies within ONE bucket - `Known(Flr(old / width))`. Rides on
+    /// `ok`: a lane whose rem straddles a bucket edge here is REAL and
+    /// this body cannot represent it, so it is refused, never widened
+    /// past its bucket. By construction it never fires: `move` forked at
+    /// the bucket grid (`Graph::fork_bits`), so every fragment's new rem
+    /// is one bucket shifted by a multiple of the bucket width.
+    pub premise: <Symbolic as Domain>::Bool,
+    /// `(valid, premise)` when the value forked here (`spd_bucket_node`:
+    /// spd has no earlier split to fold into); `None` for rem.
     pub fork: Option<(<Symbolic as Domain>::Bool, <Symbolic as Domain>::Bool)>,
 }
 
 /// Snap `old` (assumed in [-0.5, 0.5)) to its floor-aligned Bits(`bits`)
-/// bucket, forking at bucket edges so a straddling interval splits into
-/// one fragment per bucket. `bits` in 1..=16.
-///
-/// The graph analogue of `split_precision_straddles` +
-/// `make_state_abstract_rem` for one rem coordinate: the fork IS the
-/// straddle split (the same `__split_by_flr` primitive `move` uses), and
-/// the snap IS `rem_bucket`. Factored out of `widen_rem_rung` so the gate
-/// can drive it on a bare graph, without a whole symbolic frame.
+/// bucket - WITHOUT forking. The straddle split happened once already,
+/// at `move`'s `__split_by_flr`, on the bucket grid; here a straddling
+/// value is a violated premise, not a case. `bits` in 1..=16.
 pub(crate) fn rem_bucket_node(
     d: &mut Symbolic,
     old: <Symbolic as Domain>::Num,
@@ -228,33 +224,23 @@ pub(crate) fn rem_bucket_node(
     // representable for k in 1..=16.
     let width_raw: i32 = 0x1_0000 >> bits;
     let width = d.num(P8::from_raw(width_raw));
-
     // scaled = old / width = old * 2^k. The DIVIDEND fits (i64
     // intermediate in P8 Div) and the RESULT fits i32 for old in
     // [-0.5, 0.5): |old*2^k| <= 2^(k-1) <= 2^14. Its integer floors are
     // exactly the bucket boundaries.
     let scaled = d.arith(super::domain::Arith::Div, &old, &width)?;
-
-    // Fork at the floors, exactly like `__split_by_flr`. A rem interval
-    // spans at most two buckets by construction, which is one binary
-    // fork.
-    let (frag, fork) = if d.is_interval(&scaled) {
-        let (frag, valid) = d.fork_flr(&scaled);
-        let premise = d.span_ok(&scaled);
-        (frag, Some((valid, premise)))
-    } else {
-        (scaled, None)
-    };
-
-    // bucket index m = flr(frag); low = m * width; high = low +
-    // (width - 1 raw). Snap rem to the constant-width bucket [low, high]
-    // = `rem_bucket(., bits)`.
-    let idx = d.fun1(super::domain::Fun1::Flr, &frag)?;
+    // bucket index m = flr(scaled) - single-valued iff `old` is inside
+    // one bucket, which `Known` asks of it (the emitter reads
+    // `Known(Flr(interval))` as "the floors agree").
+    let idx = d.fun1(super::domain::Fun1::Flr, &scaled)?;
+    let premise = d.graph.fold(Op::Known, vec![idx]);
+    // low = m * width; high = low + (width - 1 raw). Snap rem to the
+    // constant-width bucket [low, high] = `rem_bucket(., bits)`.
     let low = d.arith(super::domain::Arith::Mul, &idx, &width)?;
     let span_minus_one = d.num(P8::from_raw(width_raw - 1));
     let high = d.arith(super::domain::Arith::Add, &low, &span_minus_one)?;
     let value = d.graph.fold(Op::Span, vec![low, high]);
-    Ok(RemBucket { value, fork })
+    Ok(RemBucket { value, premise, fork: None })
 }
 
 /// Apply every level-0 boundary widening to `st`, in the boundary's order.
@@ -369,6 +355,8 @@ fn widen_spd(
                 let ok = st.ok;
                 st.ok = d.and(&ok, &premise);
             }
+            let ok = st.ok;
+            st.ok = d.and(&ok, &sb.premise);
             iface::set(st, &p, Value::Num(sb.value))?;
         }
     }
@@ -397,17 +385,18 @@ pub(crate) fn spd_bucket_node(
         (scaled, None)
     };
     let idx = d.fun1(super::domain::Fun1::Flr, &frag)?;
+    let premise = d.graph.fold(Op::Known, vec![idx]);
     let low = d.arith(super::domain::Arith::Mul, &idx, &width)?;
     let span_minus_one = d.num(P8::from_raw(width_raw - 1));
     let high = d.arith(super::domain::Arith::Add, &low, &span_minus_one)?;
     let value = d.graph.fold(Op::Span, vec![low, high]);
-    Ok(RemBucket { value, fork })
+    Ok(RemBucket { value, premise, fork })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transpile::graph::{Graph, Op, Val};
+    use crate::transpile::graph::{Op, Val};
     use std::collections::HashMap;
 
     /// The reference floor-aligned Bits(`bits`) bucket, in raw units -
@@ -514,41 +503,29 @@ mod tests {
         }
     }
 
-    /// The fork IS the straddle split: an interval spanning two buckets
-    /// forks into fragment 0 = the lower bucket, fragment 1 = the upper,
-    /// each snapped to its full bucket. This is what
-    /// `split_precision_straddles` + `make_state_abstract_rem` produce for
-    /// a straddling lane, now in the graph.
+    /// The boundary snap does NOT fork (the straddle split happened once,
+    /// at `move`, on the bucket grid): an interval inside one bucket snaps
+    /// to that bucket, and the one-bucket premise is what a straddling
+    /// value would violate.
     #[test]
-    fn rem_bucket_node_forks_a_straddle_into_two_buckets() {
-        // bits=2: buckets are 0x4000 wide. [-100, 100] raw straddles the
-        // 0 boundary -> buckets [-0x4000, -1] and [0, 0x3fff].
+    fn rem_bucket_node_snaps_without_forking() {
+        // bits=2: buckets are 0x4000 wide.
         let bits = 2u8;
         let mut d = Symbolic::default();
         d.ival_cells.insert(0);
         let old = d.graph.leaf(Op::Cell(0));
         let rb = rem_bucket_node(&mut d, old, bits).expect("rem_bucket_node");
-        assert!(rb.fork.is_some(), "an interval input must fork");
+        assert!(rb.fork.is_none(), "the boundary snap must not fork");
+        assert_eq!(d.forks, 0, "no fork registered");
 
-        let input = celeste_core::pico8_num::Pico8NumInterval::new(
-            P8::from_raw(-100),
-            P8::from_raw(100),
-        );
-        let cells = HashMap::from([(0u32, Val::Num(input))]);
-
-        // Fragment 0 (splits bit clear) and fragment 1 (set).
-        let mut buckets = Vec::new();
-        for splits in [0u64, 1u64] {
-            let mut out = Graph::default();
-            let map = d.graph.specialize_config_into(0, Some(splits), &mut out);
-            let vals = out.eval_narrow_top(&cells).expect("eval fragment");
-            let got = match vals[map[rb.value as usize] as usize] {
-                Val::Num(iv) => iv,
-                other => panic!("rem is not a number: {:?}", other),
-            };
-            buckets.push(raw(&got));
-        }
-        assert_eq!(buckets[0], (-0x4000, -1), "fragment 0 = lower bucket");
-        assert_eq!(buckets[1], (0, 0x3fff), "fragment 1 = upper bucket");
+        // Inside the bucket [0, 0x3fff]: snaps to it.
+        let inside = celeste_core::pico8_num::Pico8NumInterval::new(P8::from_raw(100), P8::from_raw(0x3000));
+        let cells = HashMap::from([(0u32, Val::Num(inside))]);
+        let vals = d.graph.eval_narrow_top(&cells).expect("eval");
+        let got = match vals[rb.value as usize] {
+            Val::Num(iv) => iv,
+            other => panic!("rem is not a number: {:?}", other),
+        };
+        assert_eq!(raw(&got), (0, 0x3fff), "snapped to its bucket");
     }
 }
