@@ -133,6 +133,9 @@ struct AsmKernel {
     compiled: Compiled,
     bodies: Vec<AsmBody>,
     acc_templates: Vec<AccTemplate>,
+    /// The traced frame's fork count (`Frame::forks`): binary splits the
+    /// bodies enumerate.
+    forks: u8,
     /// Per body: where its output roots (and its outcome's uniform cells)
     /// go in the shape's union columns. Built by `Registry::unify`.
     body_cols: Vec<BodyCols>,
@@ -972,11 +975,14 @@ fn unify(by_shape: &mut HashMap<u64, AsmKernel>) -> Result<()> {
     let templates: usize = by_shape.values().map(|k| k.acc_templates.len()).sum();
     let bodies: usize = by_shape.values().map(|k| k.bodies.len()).sum();
     let fused: usize = by_shape.values().map(|k| k.fused.len()).sum();
+    let mut per_shape: Vec<(usize, u8, usize)> = by_shape.values().map(|k| (k.bodies.len(), k.forks, k.fused.len())).collect();
+    per_shape.sort_unstable_by_key(|s| std::cmp::Reverse(s.0));
     eprintln!(
-        "[asm build] {} output shapes over {templates} outcome templates; {widened} template cells widened uniform -> typed by the union ({:.2} per template); {bodies} bodies, {fused} fused nodes over {} input shapes",
+        "[asm build] {} output shapes over {templates} outcome templates; {widened} template cells widened uniform -> typed by the union ({:.2} per template); {bodies} bodies, {fused} fused nodes over {} input shapes; per input shape (bodies, forks, fused nodes): {:?}",
         unions.len(),
         widened as f64 / templates.max(1) as f64,
-        by_shape.len()
+        by_shape.len(),
+        per_shape
     );
     Ok(())
 }
@@ -1075,6 +1081,7 @@ fn build_one_shape(
             compiled,
             bodies: asm_bodies,
             acc_templates,
+            forks: r.bound.forks,
             body_cols: Vec::new(),
             fused,
             flat_roots,
