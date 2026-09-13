@@ -26,6 +26,18 @@ pub fn record(name: &'static str, dur: Duration) {
 }
 
 /// This process's peak resident set (`VmHWM`), in GB; 0 if unreadable.
+/// The process's CURRENT resident set (VmRSS), in GB.
+pub fn current_rss_gb() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
+        })
+        .map_or(0.0, |kb| kb / 1e6)
+}
+
 pub fn peak_rss_gb() -> f64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()

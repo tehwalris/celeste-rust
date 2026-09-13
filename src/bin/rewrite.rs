@@ -143,6 +143,20 @@ enum Command {
         #[arg(long, default_value = "1,0")]
         room: String,
     },
+    /// Census of one checkpointed frame: how many distinct concrete player
+    /// classes (position, spd, every scalar field) its rows fall into, how
+    /// many rows each holds, and each field's cardinality - what a
+    /// per-class kernel specialization would have to compile for. Also the
+    /// visited set's shard model over frames 0..=frame.
+    Census {
+        /// A level dir (`frames/` under it).
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long, default_value_t = 70)]
+        frame: u32,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+    },
     /// Extract a concrete input sequence that wins by `horizon` from one
     /// level's marks: a DFS from the initial state through the reference
     /// engine's concrete single-input step, admitting a successor only if
@@ -426,6 +440,180 @@ fn main() -> Result<()> {
                 );
             }
             celeste_rust::compiled::dispatch::print_kernel_hits();
+        }
+        Command::Census {
+            level_dir,
+            frame,
+            room,
+        } => {
+            use celeste_engine::runtime2::{Cell2, Col, AV};
+            use celeste_rust::frame::{frame_files, load_frame};
+            use rustc_hash::FxHashMap;
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            let dir = std::path::Path::new(&level_dir);
+            let ids = celeste_rust::compiled::ids();
+            let blocks = load_frame(dir, frame)?;
+            let rows: usize = blocks.iter().map(|b| b.lanes()).sum();
+            println!("[census] {} f{frame}: {} blocks, {rows} rows", dir.display(), blocks.len());
+            // Per row: the player's scalar fields (one level of sub-tables).
+            // `(name, value code)` with AV encoded as 3 words.
+            let enc = |v: AV| -> (u32, u32, u32) {
+                match v {
+                    AV::Num(n) => (0, n.as_raw_u32(), 0),
+                    AV::Ival(a, b) => (1, a.as_raw_u32(), b.as_raw_u32()),
+                    AV::Bool(x) => (2, x as u32, 0),
+                    AV::UBool => (3, 0, 0),
+                    AV::Str(s) => (4, s, 0),
+                    AV::Nil => (5, 0, 0),
+                    AV::Ptr(p) => (6, p, 0),
+                    AV::NilPtr => (7, 0, 0),
+                }
+            };
+            let mut names: Vec<String> = Vec::new();
+            let mut card: Vec<FxHashMap<(u32, u32, u32), u64>> = Vec::new();
+            let mut classes: FxHashMap<Vec<(u32, u32, u32)>, u64> = FxHashMap::default();
+            let mut classes_xy: FxHashMap<(u32, u32), u64> = FxHashMap::default();
+            let mut classes_xys: FxHashMap<(u32, u32, u32, u32), u64> = FxHashMap::default();
+            let mut classes_nopos: FxHashMap<Vec<(u32, u32, u32)>, u64> = FxHashMap::default();
+            let mut no_player = 0usize;
+            for b in &blocks {
+                let rt2 = b.rt2();
+                let Some(obj) = celeste_rust::search::pos_graph::player_object(rt2) else {
+                    no_player += b.lanes();
+                    continue;
+                };
+                // The field list of this shape's player (name -> cell).
+                let mut fields: Vec<(String, u32)> = Vec::new();
+                if let Cell2::Obj(fs) = &rt2.structure[obj as usize] {
+                    for &(fid, cell) in fs {
+                        let name = celeste_names::FIELD_NAMES[fid as usize].to_string();
+                        match &rt2.structure[cell as usize] {
+                            Cell2::Val => match &rt2.cols[cell as usize] {
+                                Col::U(AV::Ptr(sub)) => {
+                                    if let Cell2::Obj(sfs) = &rt2.structure[*sub as usize] {
+                                        for &(sfid, scell) in sfs {
+                                            if matches!(rt2.structure[scell as usize], Cell2::Val) {
+                                                fields.push((format!("{name}.{}", celeste_names::FIELD_NAMES[sfid as usize]), scell));
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => fields.push((name, cell)),
+                            },
+                            Cell2::Obj(sfs) => {
+                                for &(sfid, scell) in sfs {
+                                    if matches!(rt2.structure[scell as usize], Cell2::Val) {
+                                        fields.push((format!("{name}.{}", celeste_names::FIELD_NAMES[sfid as usize]), scell));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                for (name, _) in &fields {
+                    if !names.contains(name) {
+                        names.push(name.clone());
+                        card.push(FxHashMap::default());
+                    }
+                }
+                let (cx, cy) = (rt2.obj_field_cell(obj, ids.f_x), rt2.obj_field_cell(obj, ids.f_y));
+                let spd = rt2.obj_field_cell(obj, ids.f_spd).and_then(|c| match rt2.cols[c as usize] {
+                    Col::U(AV::Ptr(s)) => Some(s),
+                    _ => None,
+                });
+                let (sx, sy) = match spd {
+                    Some(s) => (rt2.obj_field_cell(s, ids.f_x), rt2.obj_field_cell(s, ids.f_y)),
+                    None => (None, None),
+                };
+                for lane in 0..rt2.width {
+                    let mut tuple: Vec<(u32, u32, u32)> = Vec::with_capacity(names.len());
+                    let mut nopos: Vec<(u32, u32, u32)> = Vec::with_capacity(names.len());
+                    for (name, cell) in &fields {
+                        let v = enc(rt2.cols[*cell as usize].at(lane));
+                        let ni = names.iter().position(|n| n == name).unwrap();
+                        *card[ni].entry(v).or_default() += 1;
+                        if name.starts_with("rem.") {
+                            continue;
+                        }
+                        tuple.push(v);
+                        if name != "x" && name != "y" {
+                            nopos.push(v);
+                        }
+                    }
+                    *classes.entry(tuple).or_default() += 1;
+                    *classes_nopos.entry(nopos).or_default() += 1;
+                    if let (Some(cx), Some(cy)) = (cx, cy) {
+                        let x = enc(rt2.cols[cx as usize].at(lane)).1;
+                        let y = enc(rt2.cols[cy as usize].at(lane)).1;
+                        *classes_xy.entry((x, y)).or_default() += 1;
+                        if let (Some(sx), Some(sy)) = (sx, sy) {
+                            let vx = enc(rt2.cols[sx as usize].at(lane));
+                            let vy = enc(rt2.cols[sy as usize].at(lane));
+                            *classes_xys.entry((x, y, vx.1 ^ vx.2.rotate_left(16), vy.1 ^ vy.2.rotate_left(16))).or_default() += 1;
+                        }
+                    }
+                }
+            }
+            let dist = |m: &FxHashMap<Vec<(u32, u32, u32)>, u64>| -> String {
+                let mut c: Vec<u64> = m.values().copied().collect();
+                c.sort_unstable();
+                let n = c.len().max(1);
+                format!("{} classes; rows/class median {} p90 {} max {}", c.len(), c[n / 2], c[n * 9 / 10], c[n - 1])
+            };
+            println!("[census] rows without a player object: {no_player}");
+            println!("[census] distinct (x, y): {}", classes_xy.len());
+            println!("[census] distinct (x, y, spd.x, spd.y): {}", classes_xys.len());
+            println!("[census] all scalar fields except rem: {}", dist(&classes));
+            println!("[census] all scalar fields except rem and x, y: {}", dist(&classes_nopos));
+            println!("[census] per-field cardinality (distinct values over the frame):");
+            let mut order: Vec<usize> = (0..names.len()).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(card[i].len()));
+            for i in order {
+                let mut top: Vec<(&(u32, u32, u32), &u64)> = card[i].iter().collect();
+                top.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+                let p8 = |raw: u32| -> String {
+                    let r = raw as i32;
+                    if r & 0xffff == 0 { format!("{}", r >> 16) } else { format!("{:.3}", r as f64 / 65536.0) }
+                };
+                let show = |v: &(u32, u32, u32)| -> String {
+                    match v.0 {
+                        0 => p8(v.1),
+                        1 => format!("[{},{}]", p8(v.1), p8(v.2)),
+                        2 => format!("{}", v.1 == 1),
+                        3 => "?".into(),
+                        _ => format!("#{}", v.1),
+                    }
+                };
+                let tops: Vec<String> = top.iter().take(4).map(|(v, n)| format!("{}:{:.0}%", show(v), 100.0 * **n as f64 / rows as f64)).collect();
+                println!("  {:20} {:6} distinct   {}", names[i], card[i].len(), tops.join(" "));
+            }
+            // The visited set's shard model over frames 0..=frame: entries
+            // per (shape, cell), and hashbrown's bytes for them.
+            let mut shards: FxHashMap<(u64, u32), u64> = FxHashMap::default();
+            for f in 0..=frame {
+                for file in frame_files(dir, f)? {
+                    for (cell, n) in file.cell_counts() {
+                        *shards.entry((file.shape_hash(), cell)).or_default() += n as u64;
+                    }
+                }
+            }
+            let entries: u64 = shards.values().sum();
+            let modeled: u64 = shards
+                .values()
+                .map(|&n| {
+                    // hashbrown: buckets = next_power_of_two(n * 8 / 7), 16 B key + 1 control byte each, plus 16 B of header.
+                    let buckets = ((n * 8).div_ceil(7)).max(4).next_power_of_two();
+                    buckets * 17 + 16 + 64
+                })
+                .sum();
+            println!(
+                "[census] visited model through f{frame}: {} shards, {entries} entries, ~{:.2} GB in hashbrown sets ({:.0} B/entry); shards with <= 8 entries: {}",
+                shards.len(),
+                modeled as f64 / 1e9,
+                modeled as f64 / entries.max(1) as f64,
+                shards.values().filter(|&&n| n <= 8).count()
+            );
         }
         Command::BenchBackward {
             level_dir,

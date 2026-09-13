@@ -115,6 +115,22 @@ impl Block {
     pub fn lanes(&self) -> usize {
         self.rt2.width
     }
+
+    /// The block's row storage in bytes: its varying columns and keys.
+    pub fn bytes(&self) -> usize {
+        let w = self.rt2.width;
+        self.rt2
+            .cols
+            .iter()
+            .map(|c| match c {
+                Col::U(_) => 0,
+                Col::N(_) => 4 * w,
+                Col::I(_) => 8 * w,
+                Col::V(_) => 16 * w,
+            })
+            .sum::<usize>()
+            + 16 * w
+    }
 }
 
 /// Per lane: does it sit on the room's win target? The room-exit test
@@ -223,6 +239,48 @@ impl Slot {
 
     pub fn rows(&self) -> usize {
         self.keys.len()
+    }
+
+    /// Bytes allocated for this slot's rows (capacities, not lengths).
+    pub fn alloc_bytes(&self) -> usize {
+        self.cols
+            .iter()
+            .map(|(_, c)| match c {
+                TCol::Num(v) => v.capacity() * 4,
+                TCol::Ival(v) => v.capacity() * 8,
+                TCol::Bool(v) => v.capacity(),
+            })
+            .sum::<usize>()
+            + self.keys.capacity() * 16
+            + self.cells.capacity() * 4
+    }
+
+    /// Bytes this slot's rows occupy (lengths, not capacities).
+    pub fn data_bytes(&self) -> usize {
+        let per_row: usize = self
+            .cols
+            .iter()
+            .map(|(_, c)| match c {
+                TCol::Num(_) => 4,
+                TCol::Ival(_) => 8,
+                TCol::Bool(_) => 1,
+            })
+            .sum::<usize>()
+            + 20;
+        per_row * self.keys.len()
+    }
+
+    /// Drop the rows, keeping the skeleton and the columns' capacity.
+    pub fn clear(&mut self) {
+        for (_, c) in &mut self.cols {
+            match c {
+                TCol::Num(v) => v.clear(),
+                TCol::Ival(v) => v.clear(),
+                TCol::Bool(v) => v.clear(),
+            }
+        }
+        self.keys.clear();
+        self.cells.clear();
     }
 
     /// An empty block of this slot's shape for the rows to land in.
@@ -502,6 +560,25 @@ impl<'a> ForwardSink<'a> {
         &self.hits
     }
 
+    /// Bytes of rows currently held across the slots (lengths).
+    pub fn data_bytes(&self) -> usize {
+        self.slots.iter().map(Slot::data_bytes).sum()
+    }
+
+    /// Bytes allocated across the slots (capacities).
+    pub fn alloc_bytes(&self) -> usize {
+        self.slots.iter().map(Slot::alloc_bytes).sum()
+    }
+
+    /// Drop every slot's rows for the next batch; the slots, their
+    /// skeletons and capacities stay (the next batch refills them in
+    /// place), and so do `edges` and `emitted`, which are per frame.
+    pub fn clear(&mut self) {
+        for s in &mut self.slots {
+            s.clear();
+        }
+    }
+
     /// The index of the slot for `(owner, outcome)`, created over the
     /// skeleton `init` returns on first use.
     pub fn slot_id(&mut self, owner: u32, outcome: u64, init: impl FnOnce() -> Rt2) -> usize {
@@ -631,12 +708,30 @@ pub trait FrameStep: Sync {
     fn run(&self, block: &Block, cell_in: &[u32], lanes: Range<usize>, sink: &mut ForwardSink) -> Result<()>;
 }
 
-/// Lanes per unit of the emit phase for `lanes` lanes over `workers`: the
-/// kernel runs 16-lane slices, and the step's within-call dedup (`seen`)
-/// only sees one unit, so bigger units re-emit fewer rows to the owners;
-/// ~16 units per worker keeps them balanced. Clamped to [2048, 16384].
-fn unit_lanes(lanes: usize, workers: usize) -> usize {
-    (lanes / (workers * 16)).clamp(2048, 16384)
+/// The emit phase's unit: one kernel call covers at most this many lanes
+/// of one block. A worker pulls a GRAB of consecutive units at a time and
+/// runs the contiguous ones as one call, so the step's within-call dedup
+/// (`seen`) spans the grab; the grab, not the unit, sets the dedup window.
+const UNIT_LANES: usize = 2048;
+
+/// The largest lane range one kernel call covers: ~16 grabs per worker for
+/// balance, clamped to [1, 8] units (2048..16384 lanes: bigger grabs
+/// re-emit fewer rows to the owners, ~29M vs ~46M raw at room (1,0) f70).
+fn max_grab(lanes: usize, workers: usize) -> usize {
+    (lanes / (workers * 16 * UNIT_LANES)).clamp(1, 8)
+}
+
+/// Bytes of emitted rows the workers' sinks may hold before the frame
+/// pauses to own them (`CELESTE_EMIT_BUDGET_GB`, default 4). A frame whose
+/// whole fan-out fits runs as one batch; a bigger one runs several, each
+/// owned before the next is emitted, so the transient is bounded whatever
+/// the frame's size. Grabs are sized to overshoot it by at most ~1/4.
+fn emit_budget() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        let gb = std::env::var("CELESTE_EMIT_BUDGET_GB").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(4.0);
+        (gb * 1e9) as usize
+    })
 }
 
 /// Cut `blocks` (by lane count) into `(block, lo, hi)` units.
@@ -651,6 +746,18 @@ fn units_of(lanes: impl Iterator<Item = usize>, unit: usize) -> Vec<(usize, usiz
         }
     }
     units
+}
+
+/// Merge consecutive units of the same block into contiguous runs.
+fn runs_of(units: &[(usize, usize, usize)]) -> Vec<(usize, usize, usize)> {
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    for &(bi, lo, hi) in units {
+        match runs.last_mut() {
+            Some(r) if r.0 == bi && r.2 == lo => r.2 = hi,
+            _ => runs.push((bi, lo, hi)),
+        }
+    }
+    runs
 }
 
 /// One forward frame, in two parallel phases with one barrier between
@@ -684,115 +791,168 @@ pub fn forward_frame(
     let workers = threads();
     st.blocks_in = frontier.len();
     st.lanes_in = frontier.iter().map(Block::lanes).sum();
+    st.bytes_in = frontier.iter().map(Block::bytes).sum();
+    st.rss_start = crate::metrics::current_rss_gb();
 
-    // Phase 1: emit.
-    let t = Instant::now();
+    // Fine units, pulled in grabs; a batch ends when the sinks hold
+    // `emit_budget()` bytes or the units run out, and is owned before the
+    // next one is emitted. One batch is the common case.
+    let budget = emit_budget();
+    let units = units_of(frontier.iter().map(Block::lanes), UNIT_LANES);
+    let grab_max = max_grab(st.lanes_in, workers);
     let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
-    let units = units_of(frontier.iter().map(Block::lanes), unit_lanes(st.lanes_in, workers));
     let next_unit = AtomicUsize::new(0);
-    let sinks: Vec<(ForwardSink, std::time::Duration)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                let (frontier, cells, units, next_unit) = (&frontier, &cells, &units, &next_unit);
-                scope.spawn(move || -> Result<(ForwardSink, std::time::Duration)> {
-                    let t = Instant::now();
-                    let mut sink = ForwardSink::new(owners, pos.is_some());
-                    loop {
-                        let u = next_unit.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(bi, lo, hi)) = units.get(u) else { break };
-                        engine.run(&frontier[bi], &cells[bi], lo..hi, &mut sink)?;
-                    }
-                    Ok((sink, t.elapsed()))
+    let mut sinks: Vec<ForwardSink> = (0..workers).map(|_| ForwardSink::new(owners, pos.is_some())).collect();
+    let mut grabs: Vec<usize> = vec![grab_max; workers];
+    struct Owner {
+        pieces: rustc_hash::FxHashMap<u64, Rt2>,
+        kept: usize,
+        won: bool,
+    }
+    let mut owned: Vec<Owner> =
+        (0..owners).map(|_| Owner { pieces: Default::default(), kept: 0, won: false }).collect();
+    let (mut emit_busy, mut own_busy) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    loop {
+        // Phase 1: emit.
+        let t = Instant::now();
+        let batch_bytes = AtomicUsize::new(0);
+        let busy: Vec<std::time::Duration> = std::thread::scope(|scope| {
+            let handles: Vec<_> = sinks
+                .iter_mut()
+                .zip(grabs.iter_mut())
+                .map(|(sink, grab)| {
+                    let (frontier, cells, units, next_unit, batch_bytes) =
+                        (&frontier, &cells, &units, &next_unit, &batch_bytes);
+                    scope.spawn(move || -> Result<std::time::Duration> {
+                        let t = Instant::now();
+                        loop {
+                            if batch_bytes.load(Ordering::Relaxed) >= budget {
+                                break;
+                            }
+                            let u0 = next_unit.fetch_add(*grab, Ordering::Relaxed);
+                            let u1 = (u0 + *grab).min(units.len());
+                            if u0 >= u1 {
+                                break;
+                            }
+                            let before = sink.data_bytes();
+                            let mut lanes = 0;
+                            for (bi, lo, hi) in runs_of(&units[u0..u1]) {
+                                engine.run(&frontier[bi], &cells[bi], lo..hi, sink)?;
+                                lanes += hi - lo;
+                            }
+                            let delta = sink.data_bytes() - before;
+                            batch_bytes.fetch_add(delta, Ordering::Relaxed);
+                            // Size the next grab so one grab's fan-out is at
+                            // most 1/4 of this worker's share of the budget.
+                            let per_lane = (delta / lanes.max(1)).max(1);
+                            let want = budget / (4 * workers) / (per_lane * UNIT_LANES);
+                            *grab = want.clamp(1, grab_max);
+                        }
+                        Ok(t.elapsed())
+                    })
                 })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("emit worker panicked"))
-            .collect::<Result<Vec<_>>>()
-    })?;
-    st.t_emit = t.elapsed();
-    st.emit_idle = idle_fraction(st.t_emit, sinks.iter().map(|(_, busy)| *busy));
-    let sinks: Vec<ForwardSink> = sinks.into_iter().map(|(s, _)| s).collect();
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("emit worker panicked"))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let wall = t.elapsed();
+        st.t_emit += wall;
+        emit_busy += busy.iter().sum::<std::time::Duration>();
+        st.rss_emit = st.rss_emit.max(crate::metrics::current_rss_gb());
+        st.sink_bytes = st.sink_bytes.max(sinks.iter().map(ForwardSink::alloc_bytes).sum());
+        st.batches += 1;
+
+        // Phase 2: own.
+        let t = Instant::now();
+        let busy: Vec<std::time::Duration> = std::thread::scope(|scope| {
+            let handles: Vec<_> = visited
+                .iter_mut()
+                .zip(owned.iter_mut())
+                .enumerate()
+                .map(|(o, (vis, acc))| {
+                    let sinks = &sinks;
+                    scope.spawn(move || -> Result<std::time::Duration> {
+                        let t = Instant::now();
+                        for sink in sinks {
+                            for slot in &sink.slots {
+                                if slot.owner != o as u32 || slot.rows() == 0 {
+                                    continue;
+                                }
+                                let shape = slot.shape;
+                                crate::compiled::asm_kernel::key_check(slot);
+                                // Ladder filter (coarser level's marked set), then
+                                // the door: `&&` short-circuits, so a filtered-out
+                                // row is never inserted into `visited`.
+                                let allow = match filter {
+                                    Some(f) => Some(f.allowed(&slot.to_rt2())?),
+                                    None => None,
+                                };
+                                // The door, one shard lookup per run of rows at
+                                // the same cell (a slice's lanes are spatially
+                                // sorted, so runs are common).
+                                let mut rows: Vec<u32> = Vec::new();
+                                let (keys, cells) = (&slot.keys, &slot.cells);
+                                let mut i = 0;
+                                while i < keys.len() {
+                                    let cell = cells[i];
+                                    let mut j = i;
+                                    while j < keys.len() && cells[j] == cell {
+                                        j += 1;
+                                    }
+                                    let shard = vis.shard_mut(shape, cell);
+                                    for r in i..j {
+                                        if allow.as_ref().is_none_or(|a| a[r]) && shard.insert(keys[r]) {
+                                            rows.push(r as u32);
+                                        }
+                                    }
+                                    i = j;
+                                }
+                                if rows.is_empty() {
+                                    continue;
+                                }
+                                acc.kept += rows.len();
+                                acc.won |= slot.any_win(&rows)?;
+                                let piece = acc.pieces.entry(shape).or_insert_with(|| slot.empty_piece());
+                                slot.gather_into(piece, &rows);
+                            }
+                        }
+                        Ok(t.elapsed())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("owner worker panicked"))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        st.t_own += t.elapsed();
+        own_busy += busy.iter().sum::<std::time::Duration>();
+        st.rss_own = st.rss_own.max(crate::metrics::current_rss_gb());
+        if next_unit.load(Ordering::Relaxed) >= units.len() {
+            break;
+        }
+        for s in &mut sinks {
+            s.clear();
+        }
+    }
+    st.emit_idle = idle_fraction(st.t_emit, workers, emit_busy);
+    st.own_idle = idle_fraction(st.t_own, owners as usize, own_busy);
     st.lanes_raw = sinks.iter().map(|s| s.emitted as usize).sum();
     if let Some(p) = pos {
         for sink in &sinks {
             p.record_pairs(sink.edges.iter().copied());
         }
     }
-
-    // Phase 2: own.
-    let t = Instant::now();
-    let owned: Vec<(Vec<Rt2>, usize, bool, std::time::Duration)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = visited
-            .iter_mut()
-            .enumerate()
-            .map(|(o, vis)| {
-                let sinks = &sinks;
-                scope.spawn(move || -> Result<(Vec<Rt2>, usize, bool, std::time::Duration)> {
-                    let t = Instant::now();
-                    let mut pieces: rustc_hash::FxHashMap<u64, Rt2> = Default::default();
-                    let (mut kept_n, mut won) = (0usize, false);
-                    for sink in sinks {
-                        for slot in &sink.slots {
-                            if slot.owner != o as u32 {
-                                continue;
-                            }
-                            let shape = slot.shape;
-                            crate::compiled::asm_kernel::key_check(slot);
-                            // Ladder filter (coarser level's marked set), then
-                            // the door: `&&` short-circuits, so a filtered-out
-                            // row is never inserted into `visited`.
-                            let allow = match filter {
-                                Some(f) => Some(f.allowed(&slot.to_rt2())?),
-                                None => None,
-                            };
-                            // The door, one shard lookup per run of rows at
-                            // the same cell (a slice's lanes are spatially
-                            // sorted, so runs are common).
-                            let mut rows: Vec<u32> = Vec::new();
-                            let (keys, cells) = (&slot.keys, &slot.cells);
-                            let mut i = 0;
-                            while i < keys.len() {
-                                let cell = cells[i];
-                                let mut j = i;
-                                while j < keys.len() && cells[j] == cell {
-                                    j += 1;
-                                }
-                                let shard = vis.shard_mut(shape, cell);
-                                for r in i..j {
-                                    if allow.as_ref().is_none_or(|a| a[r]) && shard.insert(keys[r]) {
-                                        rows.push(r as u32);
-                                    }
-                                }
-                                i = j;
-                            }
-                            if rows.is_empty() {
-                                continue;
-                            }
-                            kept_n += rows.len();
-                            won |= slot.any_win(&rows)?;
-                            let piece = pieces.entry(shape).or_insert_with(|| slot.empty_piece());
-                            slot.gather_into(piece, &rows);
-                        }
-                    }
-                    Ok((pieces.into_values().collect(), kept_n, won, t.elapsed()))
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("owner worker panicked"))
-            .collect::<Result<Vec<_>>>()
-    })?;
-    st.t_own = t.elapsed();
-    st.own_idle = idle_fraction(st.t_own, owned.iter().map(|(_, _, _, busy)| *busy));
+    drop(sinks);
+    st.visited_bytes = visited.iter().map(Visited::alloc_bytes).sum();
     let mut won = false;
     let mut next: Vec<Block> = Vec::new();
-    for (pieces, kept, w, _) in owned {
-        st.lanes_kept += kept;
-        won |= w;
-        next.extend(pieces.into_iter().map(Block::from_rt2));
+    for acc in owned {
+        st.lanes_kept += acc.kept;
+        won |= acc.won;
+        next.extend(acc.pieces.into_values().map(Block::from_rt2));
     }
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
@@ -800,13 +960,12 @@ pub fn forward_frame(
 }
 
 /// The share of `workers x wall` a phase's workers spent waiting at its
-/// barrier: 1 - sum(busy) / (workers * wall).
-fn idle_fraction(wall: std::time::Duration, busy: impl Iterator<Item = std::time::Duration>) -> f64 {
-    let (n, total) = busy.fold((0usize, 0.0f64), |(n, t), b| (n + 1, t + b.as_secs_f64()));
-    if n == 0 || wall.is_zero() {
+/// barrier: 1 - busy / (workers * wall), `busy` summed over the workers.
+fn idle_fraction(wall: std::time::Duration, workers: usize, busy: std::time::Duration) -> f64 {
+    if workers == 0 || wall.is_zero() {
         return 0.0;
     }
-    (1.0 - total / (n as f64 * wall.as_secs_f64())).max(0.0)
+    (1.0 - busy.as_secs_f64() / (workers as f64 * wall.as_secs_f64())).max(0.0)
 }
 
 /// Where one forward frame's time went and what it moved, for the
@@ -828,6 +987,20 @@ pub struct FrameStats {
     /// Barrier idle fractions of the two phases (`idle_fraction`).
     pub emit_idle: f64,
     pub own_idle: f64,
+    /// The input frontier's row storage, bytes.
+    pub bytes_in: usize,
+    /// Bytes allocated in the workers' slots after emit, and in the
+    /// visited shards after own.
+    pub sink_bytes: usize,
+    pub visited_bytes: usize,
+    /// Resident set at the frame's start, after emit (the sinks hold every
+    /// raw row), after own (the pieces built, the sinks still alive).
+    pub rss_start: f64,
+    pub rss_emit: f64,
+    pub rss_own: f64,
+    /// Emit/own batches the frame took (1 unless its fan-out exceeded
+    /// `emit_budget()`).
+    pub batches: usize,
 }
 
 /// The result of a backward pass: the marked set plus how many row re-runs
@@ -1017,7 +1190,7 @@ fn backward_walk(
                 .collect::<Result<Vec<_>>>()
         })?;
         let t_par = t_frame.elapsed();
-        let idle = idle_fraction(t_par, per_worker.iter().map(|(_, b)| *b));
+        let idle = idle_fraction(t_par, per_worker.len(), per_worker.iter().map(|(_, b)| *b).sum());
 
         // The barrier: apply the hits, in cell order.
         let mut units: Vec<UnitOut> = per_worker.into_iter().flat_map(|(u, _)| u).collect();
@@ -1217,7 +1390,8 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         emit {:.0} (idle {:.0}%) own {:.0} (idle {:.0}%) ckpt {:.0} pos {:.0} total {:.0} ms | rss {:.2} GB",
+         emit {:.0} (idle {:.0}%) own {:.0} (idle {:.0}%) ckpt {:.0} pos {:.0} total {:.0} ms x{} | \
+         in {:.2} sinks {:.2} visited {:.2} GB rss start {:.2} emit {:.2} own {:.2} peak {:.2} GB",
         st.blocks_in,
         st.lanes_in,
         st.lanes_raw,
@@ -1232,6 +1406,13 @@ fn log_frame(
         ms(t_ckpt),
         ms(t_pos),
         ms(t_total),
+        st.batches,
+        st.bytes_in as f64 / 1e9,
+        st.sink_bytes as f64 / 1e9,
+        st.visited_bytes as f64 / 1e9,
+        st.rss_start,
+        st.rss_emit,
+        st.rss_own,
         crate::metrics::peak_rss_gb(),
     );
     crate::metrics::record("fwd.emit", st.t_emit);
@@ -1370,6 +1551,12 @@ impl Visited {
     }
     pub fn len(&self) -> usize {
         self.shards.values().map(|s| s.len()).sum()
+    }
+
+    /// Bytes the shards' tables occupy (hashbrown: 16-byte keys plus a
+    /// control byte per bucket, at each set's capacity).
+    pub fn alloc_bytes(&self) -> usize {
+        self.shards.values().map(|s| s.capacity() * 17 + 64).sum::<usize>() + self.shards.capacity() * 48
     }
 
     /// Persist the set as `(shape, cell, key)` rows.

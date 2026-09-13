@@ -108,7 +108,7 @@ pub(crate) fn whole_i16_col(rt2: &Rt2, cell: u32) -> Option<Vec<i16>> {
 /// The player object of a block - the `player` instance, or the
 /// `player_spawn` one during the spawn animation - if it has one. Blocks
 /// share structure across lanes, so this is per block, not per lane.
-pub(crate) fn player_object(rt2: &Rt2) -> Option<u32> {
+pub fn player_object(rt2: &Rt2) -> Option<u32> {
     let ids = crate::compiled::ids();
     rt2.player_objects(ids)
         .first()

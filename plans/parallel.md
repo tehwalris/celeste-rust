@@ -99,3 +99,30 @@ f0-f89: 791 s single-threaded -> 65.6 s at 32 threads (per frame at f70:
 34.0 s -> 2.2 s); peak RSS 27 GB -> 12 GB with the visited set sharded
 by shape. The full ladder to the optimum: 1 h 10 min -> 8 min 51 s at 32
 threads before the incremental backward. Tables in BENCHMARK_DATA.md.
+
+## Batches: bounding the transient (2026-09-13)
+
+The frame's peak memory was the EMITTED rows, not anything persistent:
+room (0,0) f84 held 10.5 GB of raw rows in the workers' slots against a
+1.6 GB frontier and a 6.5 GB visited set, and RSS reached 50 GB (the
+allocator's fragmentation on top; `MALLOC_MMAP_THRESHOLD_=1048576` alone
+took f80 from 38.8 to 31.1 GB). The fan-out is ~85 raw rows per input
+lane at level 0, so the transient grows with the frontier and was what
+killed room (0,0) at f88.
+
+`forward_frame` now runs emit/own in BATCHES. The units are fine (2048
+lanes); a worker pulls a GRAB of consecutive units and runs the
+contiguous ones as one kernel call (the grab is the within-call dedup
+window, so nothing is lost against the old adaptive units). Every
+worker adds what it emitted to a shared counter and stops pulling once
+the batch holds `CELESTE_EMIT_BUDGET_GB` (default 4) of rows; each
+worker sizes its next grab from its own measured bytes per lane so one
+grab is at most 1/4 of its share of the budget, which bounds the
+overshoot. The owner phase then drains the sinks into the same
+per-owner pieces and visited shards, the slots are cleared IN PLACE
+(capacity kept: the next batch refills the same allocations, no churn),
+and the workers resume from the shared unit counter. A frame whose
+fan-out fits the budget is one batch, exactly the old two-phase frame;
+a bigger one pays one extra barrier per 4 GB emitted. The result is
+batch-independent: the door is a set, the pieces are sorted at the
+checkpoint, the edges are a set.
