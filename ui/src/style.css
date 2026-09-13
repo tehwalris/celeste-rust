@@ -296,8 +296,17 @@ main {
 .grid-panels .panel.animating canvas:not(.room-overlay) {
   border-color: rgba(255, 255, 255, 0.55);
 }
-.grid-panels .panel .lab .state {
+.grid-panels .panel .state {
+  position: absolute;
+  right: 6px;
+  bottom: 4px;
+  font-size: 11px;
   color: var(--muted);
+  text-shadow: 0 1px 2px #000, 0 0 5px #000;
+}
+.grid-panels .panel.animating .state {
+  color: var(--ink);
+  font-weight: 600;
 }
 .grid-panels .panel .lab {
   position: absolute;

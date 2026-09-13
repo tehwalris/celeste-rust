@@ -626,23 +626,26 @@ export function spaceView(run: Run): HTMLElement {
       const c = el("canvas", { "aria-label": `level ${level}` });
       const o = el("canvas", { class: "room-overlay" });
       const name = level === 16 ? "exact" : `${level} bit${level === 1 ? "" : "s"}`;
-      const state = el("span", { class: "state" });
+      // The panel's state (playing / done / not yet) sits in its own
+      // corner so the label does not wrap on a phone.
+      const state = el("div", { class: "state" });
       const lab = el("div", { class: "lab" }, [
         el("i", { style: `background:${levelCss(level)}` }),
         lr ? `${name}${lr.refuted ? " · refuted" : lr.first_win != null ? ` · win f${lr.first_win}` : ""}` : `${name} · not run at h${hr.h}`,
-        state,
       ]);
-      const p = el("div", { class: `panel${lr ? "" : " not-run"}` }, [c, o, lab]);
+      const p = el("div", { class: `panel${lr ? "" : " not-run"}` }, [c, o, lab, state]);
       if (lr) {
         p.addEventListener("click", () => {
-          // Tap a panel: open that level's pass at the same phase and time.
+          // Tap a panel: open that level in Room where the sequence has
+          // it - mid-sweep if it is playing, at the end of its last pass
+          // if it is done, at the start of its first pass if not yet.
           const tl = timeline(st.h);
-          const { pass, i } = locate(tl, st.step);
-          const target = tl.find((x) => x.lr === lr && x.phase === pass.phase) ?? tl.find((x) => x.lr === lr);
-          if (!target) return;
-          const f = pass.frames[i];
-          const j = target.frames.indexOf(f);
-          st.step = target.start + Math.max(0, j);
+          const { pass } = locate(tl, st.step);
+          const own = tl.filter((x) => x.lr === lr);
+          const last = own[own.length - 1];
+          if (!last) return;
+          if (last.index < pass.index) st.step = last.start + last.frames.length - 1;
+          else if (!own.some((x) => x.index === pass.index)) st.step = own[0].start;
           setGrain("room");
           grainRow.querySelectorAll(".chip").forEach((b, k) => b.classList.toggle("on", k === 0));
         });
@@ -749,7 +752,7 @@ export function spaceView(run: Run): HTMLElement {
         renderer.render(p.canvas, built.scene, p.overlay);
         p.root.classList.toggle("not-run", state === "not run" || state === "not yet");
         p.root.classList.toggle("animating", state === "animating");
-        p.state.textContent = state === "animating" ? ` · ${pass.phase === "fwd" ? "forward" : "backward"} f${f}` : state === "done" ? " · done" : state === "not yet" ? " · not yet" : "";
+        p.state.textContent = state === "animating" ? `${pass.phase === "fwd" ? "forward" : "backward"} f${f}` : state === "done" ? "done" : state === "not yet" ? "not yet" : "";
       }
       describePass(hr, pass, i, 0);
     }
@@ -784,9 +787,9 @@ export function spaceView(run: Run): HTMLElement {
     caption.replaceChildren(el("div", {}, [el("b", { text: head })]), el("div", { text: detail }));
     // The bar's status is the numbers; the room's caption already names the pass.
     status.replaceChildren(
-      el("b", { text: st.grain === "grid" ? `h${hr.h} · ${phase}${i == null ? "" : ` f${pass.frames[i]}`}` : `pass ${pass.index + 1}/${tl.length} · ${phase}` }),
+      el("b", { text: st.grain === "grid" ? `h${hr.h} · L${lr.level} ${phase}${i == null ? "" : ` f${pass.frames[i]}`}` : `pass ${pass.index + 1}/${tl.length} · ${phase}` }),
       el("br"),
-      el("small", { text: st.grain === "grid" ? "every level at this phase and frame" : i == null ? detail : `${detail} · ${sub}` }),
+      el("small", { text: st.grain === "grid" ? `level ${lr.level} plays · earlier levels final · later ones not yet` : i == null ? detail : `${detail} · ${sub}` }),
     );
     const verdict = lr.refuted ? "no win → refuted" : lr.first_win != null ? `first win f${lr.first_win}${lr.marked != null ? `, ${fmtCompact(lr.marked)} marked` : ""}` : "";
     passLabel.textContent = `pass ${pass.index + 1}/${tl.length}: ${phase} of level ${lr.level} at h${hr.h}${verdict ? " · " + verdict : ""}`;
