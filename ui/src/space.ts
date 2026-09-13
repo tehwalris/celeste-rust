@@ -6,8 +6,10 @@
 //              ran (L0 forward, L0 backward, L1 forward, ...), a forward
 //              sweeping frames 0..H and a backward sweeping iterations
 //              H-1..1; the scrubber, ‹ ›, Play.
-//   grain    - Room (the current pass, big) / Grid (every level's panel at
-//              the same phase and time) / Passes (a step is a whole pass).
+//   grain    - Room (the current pass, big) / Grid (every level's panel,
+//              one playing at a time in ladder order) / Passes (a step is
+//              a whole pass) / 3D (the room as columns or a stack of
+//              layers, orbited; view3d.ts).
 //   look     - Full (accumulated under moving, closed levels' bands, wins)
 //              / Sweep only (just what moves).
 //
@@ -16,12 +18,16 @@
 
 import type { FramesBin, HorizonRun, LevelRun, Run } from "./data";
 import { fmtCompact, fmtInt, levelName, loadFrames, loadLayers } from "./data";
-import { levelCss, levelRamp, marksRamp, heightBand, bandColor, bandHalo, movingColor, HEIGHT_BANDS, winColor, rgbCss, levelColor, LEVELS } from "./color";
+import { levelCss, levelRamp, marksRamp, heightBand, bandColor, bandHalo, movingColor, HEIGHT_BANDS, winColor, rgbCss, levelColor, LEVELS, type RGB } from "./color";
 import { addSparse, RoomRenderer, sparseMax, type HeatLayer, type Ring, type Scene } from "./room";
 import { button, chips, clear, el, scrubber } from "./ui";
+import { Instances, View3D } from "./view3d";
 
 type Phase = "fwd" | "bwd";
-type Grain = "room" | "grid" | "passes";
+type Grain = "room" | "grid" | "passes" | "3d";
+/** The 3D grain: columns (a cell's height is its count, on the step
+ *  timeline) or stack (one layer of cubes per pass, on the pass timeline). */
+type Mode3 = "columns" | "stack";
 type Look = "full" | "sweep" | "last";
 /** Uniform: every step takes the same time. Real: a step's share of the
  *  playback is its share of the run's logged time (the level-0 passes
@@ -76,6 +82,7 @@ export function spaceView(run: Run): HTMLElement {
     step: 0,
     pass: 0,
     grain: "room" as Grain,
+    mode3: "columns" as Mode3,
     look: "full" as Look,
     speed: 1,
     pacing: "uniform" as Pacing,
@@ -83,6 +90,9 @@ export function spaceView(run: Run): HTMLElement {
     pos: 0,
     playing: false,
   };
+  /** Whether the timeline is walked a pass at a time (Passes, 3D stack)
+   *  rather than a frame / iteration at a time. */
+  const byPass = () => st.grain === "passes" || (st.grain === "3d" && st.mode3 === "stack");
 
   // ---- the timeline of a horizon --------------------------------------------
   const timelines = new Map<number, Pass[]>();
@@ -482,6 +492,13 @@ export function spaceView(run: Run): HTMLElement {
   const roomCard = el("div", { class: "card stage" }, [roomWrap]);
   const gridBox = el("div", { class: "grid-panels" });
   const gridCard = el("div", { class: "card stage" }, [gridBox]);
+  const caption3 = el("div", { class: "room-caption" });
+  const view3dTools = el("div", { class: "view3d-tools" });
+  const view3dWrap = el("div", { class: "view3d-wrap" }, [caption3, view3dTools]);
+  const view3dCard = el("div", { class: "card stage" }, [
+    view3dWrap,
+    el("p", { class: "note", text: "One finger orbits (sideways turns, up and down tilts from top-down to edge-on); two fingers pan and pinch; double-tap resets. Columns: a cell's height is its count (log), the moving set as the bright cap. Stack: one layer of cubes per pass, a forward's reached set in the level's colour, a backward's marked set in warm white." }),
+  ]);
 
   // ---- DOM: the bottom bar (horizon, time) ---------------------------------------
   const status = el("div", { class: "status" });
@@ -491,7 +508,7 @@ export function spaceView(run: Run): HTMLElement {
   const transport = el("div", { class: "transport" }, [playBtn, prevBtn, nextBtn, status]);
   const scrub = scrubber(
     (v) => {
-      if (st.grain === "passes") st.pass = v;
+      if (byPass()) st.pass = v;
       else st.step = v;
       stop();
       render();
@@ -536,11 +553,22 @@ export function spaceView(run: Run): HTMLElement {
       { value: "room", label: "Room" },
       { value: "grid", label: "Grid" },
       { value: "passes", label: "Passes" },
+      { value: "3d", label: "3D" },
     ],
     new Set([st.grain]),
     (sel) => setGrain([...sel][0]),
     { label: "grain" },
   );
+  const mode3Row = chips<Mode3>(
+    [
+      { value: "columns", label: "Columns", title: "each cell a column as tall as its count (log); the step timeline" },
+      { value: "stack", label: "Stack", title: "one layer of cubes per pass, stacking up as the passes go; the pass timeline" },
+    ],
+    new Set([st.mode3]),
+    (sel) => setMode3([...sel][0]),
+    { label: "3D" },
+  );
+  mode3Row.hidden = true;
   const lookRow = chips<Look>(
     [
       { value: "full", label: "Full", title: "accumulated under moving, closed levels' bands, wins" },
@@ -570,11 +598,11 @@ export function spaceView(run: Run): HTMLElement {
     new Set([st.pacing]),
     (sel) => {
       st.pacing = [...sel][0];
-      st.pos = (st.grain === "passes" ? passCum(st.h) : stepCum(st.h))[st.grain === "passes" ? st.pass : st.step];
+      st.pos = (byPass() ? passCum(st.h) : stepCum(st.h))[byPass() ? st.pass : st.step];
     },
     { label: "pacing" },
   );
-  const optionCard = el("div", { class: "card" }, [grainRow, el("div", { style: "height:8px" }), lookRow, el("div", { style: "height:8px" }), el("div", { class: "chips" }, [speedRow, pacingRow])]);
+  const optionCard = el("div", { class: "card" }, [grainRow, el("div", { style: "height:8px" }), lookRow, mode3Row, el("div", { style: "height:8px" }), el("div", { class: "chips" }, [speedRow, pacingRow])]);
 
   const legend = el("div", { class: "legend" }, [
     el("span", { class: "key" }, [el("i", { style: `background:${rgbCss(levelRamp(0, "bright")[55])}` }), "moving (frontier)"]),
@@ -601,7 +629,8 @@ export function spaceView(run: Run): HTMLElement {
     el("p", { class: "note", text: "One cell is one player pixel. Brightness is the number of states in the cell (log). A forward sweeps the frames to the horizon: the frontier is what was first reached at that frame, the accumulated set everything before. A backward sweeps its iterations from the horizon back to frame 1: the marks are the states that can still win by the horizon, drawn by the frame they were first reached at (this tree stores no per-mark distance). Closed levels' marks recede to dark bands; the next level searches only inside them." }),
   ]);
 
-  root.append(roomCard, gridCard, optionCard, legendCard, bar);
+  view3dCard.hidden = true;
+  root.append(roomCard, gridCard, view3dCard, optionCard, legendCard, bar);
 
   // ---- grid panels -----------------------------------------------------------------
   interface Panel {
@@ -657,20 +686,37 @@ export function spaceView(run: Run): HTMLElement {
 
   // ---- layout + render -------------------------------------------------------------
   function setGrain(g: Grain) {
-    const tl = timeline(st.h);
-    if (g === "passes" && st.grain !== "passes") st.pass = locate(tl, st.step).pass.index;
-    if (g !== "passes" && st.grain === "passes") st.step = tl[Math.min(st.pass, tl.length - 1)]?.start ?? 0;
+    const was = byPass();
     st.grain = g;
+    convertPlayhead(was);
     stop();
     layout();
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
+  function setMode3(m: Mode3) {
+    const was = byPass();
+    st.mode3 = m;
+    convertPlayhead(was);
+    stop();
+    layout();
+  }
+  /** The playhead keeps its place when the timeline's unit changes. */
+  function convertPlayhead(wasByPass: boolean) {
+    const tl = timeline(st.h);
+    if (byPass() && !wasByPass) st.pass = locate(tl, st.step).pass.index;
+    if (!byPass() && wasByPass) st.step = tl[Math.min(st.pass, tl.length - 1)]?.start ?? 0;
+  }
 
   function layout() {
     const grid = st.grain === "grid";
-    roomCard.hidden = grid;
+    const is3d = st.grain === "3d";
+    roomCard.hidden = grid || is3d;
     gridCard.hidden = !grid;
+    view3dCard.hidden = !is3d;
+    lookRow.hidden = is3d;
+    mode3Row.hidden = !is3d;
     if (grid) buildPanels();
+    if (is3d) view3();
     paintBackdrop();
     render();
   }
@@ -678,11 +724,11 @@ export function spaceView(run: Run): HTMLElement {
   function paintBackdrop() {
     const tl = timeline(st.h);
     const total = stepsOf(tl);
-    const byPass = st.grain === "passes";
+    const perPass = byPass();
     scrub.backdrop((ctx, w, h) => {
       for (const p of tl) {
-        const x0 = byPass ? (p.index / tl.length) * w : (p.start / total) * w;
-        const x1 = byPass ? ((p.index + 1) / tl.length) * w : ((p.start + p.frames.length) / total) * w;
+        const x0 = perPass ? (p.index / tl.length) * w : (p.start / total) * w;
+        const x1 = perPass ? ((p.index + 1) / tl.length) * w : ((p.start + p.frames.length) / total) * w;
         ctx.fillStyle = rgbCss(levelColor(p.lr.level), p.phase === "fwd" ? 0.7 : 0.32);
         ctx.fillRect(x0, 0, Math.max(1, x1 - x0 - 0.5), h);
       }
@@ -693,12 +739,12 @@ export function spaceView(run: Run): HTMLElement {
   function render() {
     const token = ++renderToken;
     // A scrub / jump moved the step under the float playhead: follow it.
-    if (!st.playing) st.pos = (st.grain === "passes" ? passCum(st.h) : stepCum(st.h))[Math.max(0, st.grain === "passes" ? st.pass : st.step)] ?? 0;
+    if (!st.playing) st.pos = (byPass() ? passCum(st.h) : stepCum(st.h))[Math.max(0, byPass() ? st.pass : st.step)] ?? 0;
     const hr = run.horizons[st.h];
     const tl = timeline(st.h);
     const need = hr.levels;
     const ready = need.every((l) => have(l));
-    const stage = st.grain === "grid" ? gridBox : roomWrap;
+    const stage = st.grain === "grid" ? gridBox : st.grain === "3d" ? view3dWrap : roomWrap;
     if (!ready) {
       stage.style.opacity = "0.55";
       ensure(need).then(() => {
@@ -711,6 +757,10 @@ export function spaceView(run: Run): HTMLElement {
     // Prefetch the next horizon so Play runs into it without a pause.
     if (st.h + 1 < run.horizons.length) ensure(run.horizons[st.h + 1].levels);
 
+    if (st.grain === "3d") {
+      render3d(hr, tl);
+      return;
+    }
     if (st.grain === "passes") {
       st.pass = Math.max(0, Math.min(tl.length - 1, st.pass));
       scrub.set(st.pass, tl.length - 1);
@@ -784,7 +834,7 @@ export function spaceView(run: Run): HTMLElement {
       detail = `f${f} · ${fmtCompact(lr.marks_by_layer[f] ?? 0)} marked, ${fmtCompact(soFar)} so far`;
       sub = line ? `${fmtInt(line.targets)} targets · ${fmtInt(line.rerun)} re-run · ${line.total_ms} ms` : "";
     }
-    caption.replaceChildren(el("div", {}, [el("b", { text: head })]), el("div", { text: detail }));
+    for (const c of [caption, caption3]) c.replaceChildren(el("div", {}, [el("b", { text: head })]), el("div", { text: detail }));
     // The bar's status is the numbers; the room's caption already names the pass.
     status.replaceChildren(
       el("b", { text: st.grain === "grid" ? `h${hr.h} · L${lr.level} ${phase}${i == null ? "" : ` f${pass.frames[i]}`}` : `pass ${pass.index + 1}/${tl.length} · ${phase}` }),
@@ -793,6 +843,198 @@ export function spaceView(run: Run): HTMLElement {
     );
     const verdict = lr.refuted ? "no win → refuted" : lr.first_win != null ? `first win f${lr.first_win}${lr.marked != null ? `, ${fmtCompact(lr.marked)} marked` : ""}` : "";
     passLabel.textContent = `pass ${pass.index + 1}/${tl.length}: ${phase} of level ${lr.level} at h${hr.h}${verdict ? " · " + verdict : ""}`;
+  }
+
+  // ---- the 3D grain -------------------------------------------------------------------
+  // World units are cells. Columns: a cell's height is log(count) against
+  // the level's max over the run (as the 2D brightness), capped at HMAX.
+  // Stack: each pass is a layer LAYER tall; the whole stack of a horizon
+  // is built once and pass p draws its first prefix[p + 1] instances.
+  const HMAX = 36;
+  const LAYER = 1;
+  const FOOT = 0.88;
+  const PAD = (1 - FOOT) / 2;
+  let v3: View3D | null = null;
+  const inst3 = new Instances(1 << 15);
+  /** What the dynamic buffer holds: "columns" (rebuilt per render) or a horizon's stack. */
+  let uploaded3 = "";
+  function view3(): View3D | null {
+    if (v3) return v3;
+    try {
+      v3 = new View3D({ width: run.cell_box.w, height: run.cell_box.h });
+    } catch (e) {
+      view3dWrap.replaceChildren(el("div", { class: "err", text: `The 3D view needs WebGL2: ${(e as Error).message}` }));
+      return null;
+    }
+    view3dWrap.prepend(v3.canvas);
+    const stat = staticScene();
+    v3.setStatic(stat.data, stat.count);
+    const v = v3;
+    view3dTools.append(button("top", () => v.topDown(), "small"), button("reset", () => v.resetView(), "small"));
+    return v3;
+  }
+  /** The floor and the room's tiles, once. */
+  function staticScene(): Instances {
+    const b = run.cell_box;
+    const t = run.tiles;
+    const s = new Instances(t.w * t.h + 2);
+    s.push(0, 0, -1, 1, b.w, b.h, 0.075, 0.075, 0.07);
+    const solid = [58 / 255, 58 / 255, 55 / 255];
+    const far = [40 / 255, 40 / 255, 38 / 255];
+    const spike = [120 / 255, 70 / 255, 60 / 255];
+    const spring = [130 / 255, 110 / 255, 50 / 255];
+    const fruit = [70 / 255, 120 / 255, 70 / 255];
+    for (let ty = 0; ty < t.h; ty++) {
+      for (let tx = 0; tx < t.w; tx++) {
+        const i = tx + ty * t.w;
+        const id = t.ids[i];
+        const x0 = Math.max(0, tx * 8 - b.x0);
+        const x1 = Math.min(b.w, tx * 8 + 8 - b.x0);
+        const z0 = Math.max(0, ty * 8 - b.y0);
+        const z1 = Math.min(b.h, ty * 8 + 8 - b.y0);
+        if (x1 <= x0 || z1 <= z0) continue;
+        let c: number[] | null = null;
+        let h = 0;
+        if (t.solid[i]) {
+          c = tx < 16 ? solid : far;
+          h = 2.5;
+        } else if ([17, 27, 43, 59].includes(id)) {
+          c = spike;
+          h = 0.7;
+        } else if (id === 18) {
+          c = spring;
+          h = 0.5;
+        } else if (id === 26) {
+          c = fruit;
+          h = 1.2;
+        }
+        if (!c) continue;
+        s.push(x0 + 0.1, z0 + 0.1, 0, h, x1 - x0 - 0.2, z1 - z0 - 0.2, c[0], c[1], c[2]);
+      }
+    }
+    return s;
+  }
+  const marksCumMaxCache = new WeakMap<LevelFiles, number>();
+  function marksCumMax(files: LevelFiles, h: number): number {
+    let m = marksCumMaxCache.get(files);
+    if (m == null) {
+      m = 1;
+      if (files.layers) {
+        const g = cumGrid(files.layers, 0, h).grid;
+        for (let i = 0; i < ncell; i++) if (g[i] > m) m = g[i];
+      }
+      marksCumMaxCache.set(files, m);
+    }
+    return m;
+  }
+  /** Columns at (pass, i): forward = the accumulated count as a dim
+   *  column with the frontier's share as a bright cap; backward = the
+   *  reached set as a slab, the marks as warm-white columns (so far dim,
+   *  this iteration bright). Returns the off-grid count. */
+  function columnsScene(hr: HorizonRun, pass: Pass, i: number): number {
+    const files = have(pass.lr);
+    inst3.reset();
+    if (!files) return 0;
+    const w = run.cell_box.w;
+    const f = pass.frames[i];
+    const col = (c: RGB): [number, number, number] => [c[0] / 255, c[1] / 255, c[2] / 255];
+    const put = (c: number, y0: number, h: number, rgb: [number, number, number]) => {
+      const x = c % w;
+      inst3.push(x + PAD, (c - x) / w + PAD, y0, h, FOOT, FOOT, rgb[0], rgb[1], rgb[2]);
+    };
+    let base: Float32Array;
+    let top: Float32Array;
+    let lmax: number;
+    let dim: [number, number, number];
+    let bright: [number, number, number];
+    let off = 0;
+    if (pass.phase === "fwd") {
+      base = cumGrid(files.frames, 0, f - 1).grid;
+      top = new Float32Array(ncell);
+      off = addSparse(top, files.frames.cells(f));
+      lmax = Math.log1p(Math.max(1, files.cumMax));
+      dim = col(levelRamp(pass.lr.level, "dim")[38]);
+      bright = col(levelRamp(pass.lr.level, "bright")[54]);
+    } else {
+      // The reached set, as a slab under the marks.
+      const reached = cumGrid(files.frames, 0, hr.h).grid;
+      const slab = col(levelRamp(pass.lr.level, "band")[30]);
+      for (let c = 0; c < ncell; c++) if (reached[c] > 0) put(c, 0, 0.45, slab);
+      if (!files.layers) return 0;
+      base = cumGrid(files.layers, f + 1, hr.h).grid;
+      top = new Float32Array(ncell);
+      addSparse(top, files.layers.cells(f));
+      lmax = Math.log1p(Math.max(1, marksCumMax(files, hr.h)));
+      dim = col(marksRamp("dim")[40]);
+      bright = col(marksRamp("bright")[56]);
+    }
+    const y0 = pass.phase === "fwd" ? 0 : 0.45;
+    for (let c = 0; c < ncell; c++) {
+      const v = base[c];
+      const m = top[c];
+      if (v <= 0 && m <= 0) continue;
+      const hb = v > 0 ? (Math.log1p(v) / lmax) * HMAX : 0;
+      const ht = (Math.log1p(v + m) / lmax) * HMAX;
+      if (v > 0) put(c, y0, Math.max(0.3, hb), dim);
+      if (m > 0) put(c, y0 + hb, Math.max(0.4, ht - hb), bright);
+    }
+    return off;
+  }
+  const stacks = new Map<number, { inst: Instances; prefix: number[] }>();
+  /** A horizon's whole stack: pass q's set as a layer of cubes at height q. */
+  function stackOf(hr: HorizonRun, tl: Pass[]): { inst: Instances; prefix: number[] } {
+    let s = stacks.get(st.h);
+    if (s) return s;
+    const inst = new Instances(1 << 16);
+    const prefix = [0];
+    const w = run.cell_box.w;
+    const warm = marksRamp("bright")[52];
+    for (const p of tl) {
+      const files = have(p.lr);
+      const g = !files ? null : p.phase === "fwd" ? cumGrid(files.frames, 0, hr.h).grid : files.layers ? cumGrid(files.layers, 0, hr.h).grid : null;
+      if (g) {
+        const lc = levelColor(p.lr.level);
+        // A backward's layer: warm white with a trace of the level's hue.
+        const c: RGB = p.phase === "fwd" ? lc : [0.8 * warm[0] + 0.2 * lc[0], 0.8 * warm[1] + 0.2 * lc[1], 0.8 * warm[2] + 0.2 * lc[2]];
+        const y0 = p.index * LAYER;
+        for (let i = 0; i < ncell; i++) {
+          if (g[i] <= 0) continue;
+          const x = i % w;
+          inst.push(x + PAD, (i - x) / w + PAD, y0, LAYER * FOOT, FOOT, FOOT, c[0] / 255, c[1] / 255, c[2] / 255);
+        }
+      }
+      prefix.push(inst.count);
+    }
+    s = { inst, prefix };
+    stacks.set(st.h, s);
+    return s;
+  }
+  function render3d(hr: HorizonRun, tl: Pass[]) {
+    const v = view3();
+    if (!v) return;
+    if (st.mode3 === "stack") {
+      st.pass = Math.max(0, Math.min(tl.length - 1, st.pass));
+      scrub.set(st.pass, tl.length - 1);
+      const s = stackOf(hr, tl);
+      const key = `stack:${st.h}`;
+      if (uploaded3 !== key) {
+        v.setDynamic(s.inst.data, s.inst.count);
+        uploaded3 = key;
+      }
+      v.setDynamicLimit(s.prefix[st.pass + 1]);
+      v.setDimBelow(st.pass * LAYER, 0.62);
+      describePass(hr, tl[st.pass], null, 0);
+      return;
+    }
+    const total = stepsOf(tl);
+    st.step = Math.max(0, Math.min(total - 1, st.step));
+    scrub.set(st.step, total - 1);
+    const { pass, i } = locate(tl, st.step);
+    const off = columnsScene(hr, pass, i);
+    v.setDynamic(inst3.data, inst3.count);
+    v.setDimBelow(-1e9, 1);
+    uploaded3 = "columns";
+    describePass(hr, pass, i, off);
   }
 
   // ---- probe (press / drag on the room) ----------------------------------------------
@@ -824,7 +1066,7 @@ export function spaceView(run: Run): HTMLElement {
   function tick(t: number) {
     if (!st.playing) return;
     const sp = SPEEDS[st.speed];
-    const units = last ? ((t - last) / 1000) * (st.grain === "passes" ? sp.passes : sp.steps) : 0;
+    const units = last ? ((t - last) / 1000) * (byPass() ? sp.passes : sp.steps) : 0;
     last = t;
     let n = 0;
     if (st.pacing === "uniform") {
@@ -834,7 +1076,7 @@ export function spaceView(run: Run): HTMLElement {
     } else {
       // Advance the float playhead by uniform-step units; the step it
       // lands in is set by the log's weights.
-      const passes = st.grain === "passes";
+      const passes = byPass();
       const cum = passes ? passCum(st.h) : stepCum(st.h);
       const cur = passes ? st.pass : st.step;
       st.pos = Math.max(st.pos, cum[cur]) + units;
@@ -842,7 +1084,7 @@ export function spaceView(run: Run): HTMLElement {
     }
     if (n > 0) {
       const tl = timeline(st.h);
-      const atEnd = st.grain === "passes" ? st.pass + n >= tl.length - 1 : st.step + n >= stepsOf(tl) - 1;
+      const atEnd = byPass() ? st.pass + n >= tl.length - 1 : st.step + n >= stepsOf(tl) - 1;
       if (atEnd) {
         // Run on into the next horizon; stop after the last one.
         if (st.h + 1 < run.horizons.length) {
@@ -853,14 +1095,14 @@ export function spaceView(run: Run): HTMLElement {
           buildHStrip();
           layout();
         } else {
-          if (st.grain === "passes") st.pass = tl.length - 1;
+          if (byPass()) st.pass = tl.length - 1;
           else st.step = stepsOf(tl) - 1;
           st.playing = false;
           syncPlay();
           render();
         }
       } else {
-        if (st.grain === "passes") st.pass += n;
+        if (byPass()) st.pass += n;
         else st.step += n;
         render();
       }
@@ -884,7 +1126,7 @@ export function spaceView(run: Run): HTMLElement {
   function togglePlay() {
     if (!st.playing) {
       const tl = timeline(st.h);
-      const finished = st.grain === "passes" ? st.pass >= tl.length - 1 : st.step >= stepsOf(tl) - 1;
+      const finished = byPass() ? st.pass >= tl.length - 1 : st.step >= stepsOf(tl) - 1;
       if (finished && st.h === run.horizons.length - 1) {
         st.step = 0;
         st.pass = 0;
@@ -895,7 +1137,7 @@ export function spaceView(run: Run): HTMLElement {
   }
   function jumpPass(d: number) {
     const tl = timeline(st.h);
-    if (st.grain === "passes") st.pass = Math.max(0, Math.min(tl.length - 1, st.pass + d));
+    if (byPass()) st.pass = Math.max(0, Math.min(tl.length - 1, st.pass + d));
     else {
       const { pass } = locate(tl, st.step);
       st.step = tl[Math.max(0, Math.min(tl.length - 1, pass.index + d))].start;
@@ -912,7 +1154,7 @@ export function spaceView(run: Run): HTMLElement {
       togglePlay();
     } else if (ev.key === "ArrowRight" || ev.key === "ArrowLeft") {
       const d = (ev.key === "ArrowRight" ? 1 : -1) * (ev.shiftKey ? 10 : 1);
-      if (st.grain === "passes") st.pass += d;
+      if (byPass()) st.pass += d;
       else st.step += d;
       stop();
       render();
