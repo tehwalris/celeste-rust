@@ -41,10 +41,12 @@ Read these before doing anything substantial:
   runs BEHIND the next frame's wave, and `edges/done.txt` names the last
   frame whose runs are complete: a resume trusts frames up to it and
   discards the rest (at most one).
-- `plans/regions.md` - GUARDED REGIONS in the fused kernels (2026-09-14):
-  why a room with springs ran at 15% body utilization, and how the
-  emitter skips a fork configuration's block when no lane of the slice
-  can take it (`transpile::asm::regions`, `codegen::compile_regions`).
+- `plans/regions.md` - GUARDED REGIONS in the fused kernels, tried and
+  REVERTED 2026-09-14 (the code is at `07b3a15`): why a room with springs
+  ran at 15% body utilization, what skipping fork configurations inside
+  the kernel bought (~1.5x) and why not more. Kept as the measurement
+  behind the next design (a static split of the frame with dedupe and
+  bucketing between the halves, no branches in the kernels).
 - `BENCHMARK_DATA.md` - performance baseline, but STALE: every number in it was
   measured against the pre-rebuild search path (the now-deleted
   `run.rs` / `sweep*.rs`) and needs re-benchmarking for `rewrite search`. Keep

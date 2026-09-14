@@ -204,11 +204,6 @@ enum Inst {
     /// Store a vector mask as a 16-bit lane mask: `vpmovd2m` to k1, `kmovw`
     /// to eax, `movw` to memory. Used for `ZB` roots.
     StoreMask { off: u32, src: Vreg },
-    /// A REGION GUARD (`regions`): skip to `label` when no lane of `mask`
-    /// (a per-lane vector mask) is set. A scheduling and allocation
-    /// barrier - `reschedule` never moves an instruction across it.
-    Guard { mask: Vreg, label: u32 },
-    Label(u32),
 }
 
 /// The type of a root value, so a caller knows how to read its 128-byte
@@ -1173,19 +1168,13 @@ impl<'a> Lower<'a> {
 /// refer downward; an operand's depth is strictly smaller, so depth-major
 /// order is a valid evaluation order.
 fn schedule(g: &Graph, live: &[bool], roots: &[NodeId], batch: usize) -> Vec<NodeId> {
-    let depth = alap_depth(g, live);
-    let mut scheduled = vec![false; g.len()];
-    schedule_in(g, &depth, live, roots, batch, &mut scheduled)
-}
-
-/// ALAP depth (as-late-as-possible): a node placed just before its
-/// earliest consumer. ASAP order computes every shared inner `mix64`
-/// up front (their inputs are shallow), so they live the whole program
-/// and spill; ALAP places each one right before the cell-step that uses
-/// it, so its live range is one step. Backward pass in reverse id order:
-/// an operand's consumers all have larger ids, so they are finalized
-/// first.
-fn alap_depth(g: &Graph, live: &[bool]) -> Vec<u32> {
+    // ALAP depth (as-late-as-possible): a node placed just before its
+    // earliest consumer. ASAP order computes every shared inner `mix64`
+    // up front (their inputs are shallow), so they live the whole program
+    // and spill; ALAP places each one right before the cell-step that uses
+    // it, so its live range is one step. Backward pass in reverse id order:
+    // an operand's consumers all have larger ids, so they are finalized
+    // first.
     let maxd = g.len() as u32;
     let mut depth = vec![maxd; g.len()];
     for id in (0..g.len() as NodeId).rev() {
@@ -1198,22 +1187,8 @@ fn alap_depth(g: &Graph, live: &[bool]) -> Vec<u32> {
             *e = (*e).min(d.saturating_sub(1));
         }
     }
-    depth
-}
-
-/// `schedule` over the nodes with `member` set that are not yet
-/// `scheduled` (a region's own nodes; its operands in other regions were
-/// scheduled by an earlier call), marking what it places.
-fn schedule_in(
-    g: &Graph,
-    depth: &[u32],
-    member: &[bool],
-    roots: &[NodeId],
-    batch: usize,
-    scheduled: &mut [bool],
-) -> Vec<NodeId> {
-    let live = member;
     let batch = batch.max(1);
+    let mut scheduled = vec![false; g.len()];
     let mut order: Vec<NodeId> = Vec::new();
     let mut stack: Vec<NodeId> = Vec::new();
     for chunk in roots.chunks(batch) {
@@ -1304,8 +1279,6 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
         Inst::Call { args, .. } => out.extend(args.iter().copied()),
         Inst::Store { src, .. } => push_src(src, out),
         Inst::StoreMask { src, .. } => out.push(*src),
-        Inst::Guard { mask, .. } => out.push(*mask),
-        Inst::Label(_) => {}
     }
 }
 
@@ -1319,26 +1292,6 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
 /// sit adjacent with nothing to hide their latency. Spills are free here
 /// (proven: runtime is flat across 120..671 spills), so pressure is ignored.
 fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
-    // Guards and labels are barriers: each segment between them is
-    // scheduled on its own, so no instruction crosses a region boundary.
-    if insts.iter().any(|i| matches!(i, Inst::Guard { .. } | Inst::Label(_))) {
-        let mut out: Vec<Inst> = Vec::with_capacity(insts.len());
-        let mut seg: Vec<Inst> = Vec::new();
-        for inst in insts {
-            if matches!(inst, Inst::Guard { .. } | Inst::Label(_)) {
-                out.extend(reschedule_segment(std::mem::take(&mut seg), n_vregs));
-                out.push(inst);
-            } else {
-                seg.push(inst);
-            }
-        }
-        out.extend(reschedule_segment(seg, n_vregs));
-        return out;
-    }
-    reschedule_segment(insts, n_vregs)
-}
-
-fn reschedule_segment(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
     let n = insts.len();
     let mut def_inst = vec![u32::MAX; n_vregs as usize];
     for (i, inst) in insts.iter().enumerate() {
@@ -1462,7 +1415,7 @@ fn inst_def(inst: &Inst) -> Option<Vreg> {
         | Inst::Cmp { dst, .. }
         | Inst::Ternlog { dst, .. }
         | Inst::Call { dst, .. } => Some(*dst),
-        Inst::Store { .. } | Inst::StoreMask { .. } | Inst::Guard { .. } | Inst::Label(_) => None,
+        Inst::Store { .. } | Inst::StoreMask { .. } => None,
     }
 }
 
@@ -1879,15 +1832,6 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    kmovw %k1, %eax").unwrap();
                 writeln!(self.out, "    movw %ax, {}(%r14)", off).unwrap();
             }
-            Inst::Guard { mask, label } => {
-                let rm = self.use_reg(*mask, OPA);
-                writeln!(self.out, "    vptestmd %zmm{}, %zmm{}, %k1", rm, rm).unwrap();
-                writeln!(self.out, "    kortestw %k1, %k1").unwrap();
-                writeln!(self.out, "    jz .Lr{}", label).unwrap();
-            }
-            Inst::Label(label) => {
-                writeln!(self.out, ".Lr{}:", label).unwrap();
-            }
             Inst::Store { off, src } => {
                 let r = match src {
                     Src::Reg(v) => self.use_reg(*v, OPA),
@@ -1914,20 +1858,6 @@ pub fn compile(
     roots: &[NodeId],
     sym: &str,
     cell_reprs: &HashMap<u32, CellRepr>,
-) -> Result<Compiled> {
-    compile_regions(g, roots, sym, cell_reprs, None)
-}
-
-/// `compile` with GUARDED REGIONS (`super::regions`): the nodes are
-/// lowered region by region in the regions' order, each non-root region
-/// between a `Guard` on its guard node's holds-mask and a `Label`, so a
-/// slice with no lane consistent with the region skips its block.
-pub fn compile_regions(
-    g: &Graph,
-    roots: &[NodeId],
-    sym: &str,
-    cell_reprs: &HashMap<u32, CellRepr>,
-    regions: Option<&super::regions::Regions>,
 ) -> Result<Compiled> {
     let live = reachable(g, roots);
 
@@ -1980,70 +1910,9 @@ pub fn compile_regions(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(4);
-    match regions {
-        None => {
-            let order = schedule(g, &live, roots, batch);
-            for id in order {
-                lo.lower_node(id)?;
-            }
-        }
-        Some(rg) => {
-            // Region by region. A region's roots are its nodes with no
-            // consumer inside it (its exits); the cone walk stops at nodes
-            // other regions placed. The value-numbering memo is scoped to
-            // a region: a load or constant materialized inside a skippable
-            // block must not be reused outside it.
-            let depth = alap_depth(g, &live);
-            let mut consumers_in: Vec<bool> = vec![false; g.len()];
-            let mut scheduled = vec![false; g.len()];
-            let mut next_label = 0u32;
-            let n_regions = rg.keys.len();
-            for &r in &rg.order {
-                let member: Vec<bool> = (0..g.len()).map(|i| live[i] && rg.of_node[i] == r).collect();
-                consumers_in.iter_mut().for_each(|x| *x = false);
-                for i in 0..g.len() {
-                    if member[i] {
-                        for &a in &g.get(i as NodeId).args {
-                            if member[a as usize] {
-                                consumers_in[a as usize] = true;
-                            }
-                        }
-                    }
-                }
-                let exits: Vec<NodeId> = (0..g.len()).filter(|&i| member[i] && !consumers_in[i]).map(|i| i as NodeId).collect();
-                let order = schedule_in(g, &depth, &member, &exits, batch, &mut scheduled);
-                if r == 0 {
-                    for id in order {
-                        lo.lower_node(id)?;
-                    }
-                    continue;
-                }
-                anyhow::ensure!(r < n_regions, "region index out of range");
-                let guard_node = rg.guard[r].expect("a non-root region has a guard");
-                let [val, known] = lo.as_bool(guard_node)?;
-                let mask = match (val, known) {
-                    (MaskVal::Const(v), MaskVal::Const(k)) => {
-                        let c = if v && k { -1i32 } else { 0i32 };
-                        lo.pure(Key::BcastD(c), move |d| Inst::BcastD { dst: d, val: c })
-                    }
-                    (MaskVal::Const(true), MaskVal::Reg(k)) => k,
-                    (MaskVal::Reg(v), MaskVal::Const(true)) => v,
-                    (MaskVal::Const(false), _) | (_, MaskVal::Const(false)) => {
-                        lo.pure(Key::BcastD(0), |d| Inst::BcastD { dst: d, val: 0 })
-                    }
-                    (MaskVal::Reg(v), MaskVal::Reg(k)) => lo.dbin(ROp::AndD, v, k),
-                };
-                let label = next_label;
-                next_label += 1;
-                lo.insts.push(Inst::Guard { mask, label });
-                let memo = lo.memo.clone();
-                for id in order {
-                    lo.lower_node(id)?;
-                }
-                lo.memo = memo;
-                lo.insts.push(Inst::Label(label));
-            }
-        }
+    let order = schedule(g, &live, roots, batch);
+    for id in order {
+        lo.lower_node(id)?;
     }
 
     // Roots -> typed stores, each into its own 128-byte slot.

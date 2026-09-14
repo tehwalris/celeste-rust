@@ -108,25 +108,6 @@ fn raw_files(dir: &Path, frame: u32) -> Vec<(u32, Vec<PathBuf>, u64)> {
         .collect()
 }
 
-/// Where frame `frame`'s permutation of piece `seq` goes (plans/regions.md
-/// "Lane grouping"): the real row per virtual position, little-endian u32.
-pub fn perm_path(dir: &Path, frame: u32, seq: u32) -> PathBuf {
-    dir.join("perm").join(format!("f{:03}", frame)).join(format!("s{:04}.u32", seq))
-}
-
-pub fn write_perm(dir: &Path, frame: u32, seq: u32, perm: &[u32]) -> Result<()> {
-    let path = perm_path(dir, frame, seq);
-    std::fs::create_dir_all(path.parent().expect("a perm dir"))?;
-    let mut buf: Vec<u8> = Vec::with_capacity(perm.len() * 4);
-    for &r in perm {
-        buf.extend_from_slice(&r.to_le_bytes());
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &buf)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
 /// The last frame whose runs are complete (`<dir>/done.txt`, written as
 /// 0 when a forward starts). `None` if there is no marker at all: a tree
 /// written before the marker existed, whose frames are all trusted.
@@ -580,13 +561,6 @@ pub fn discard_after(dir: &Path, last: u32) -> Result<()> {
     if dir.join("raw").is_dir() {
         std::fs::remove_dir_all(dir.join("raw"))?;
     }
-    for e in std::fs::read_dir(dir.join("perm")).into_iter().flatten().flatten() {
-        let p = e.path();
-        let f: Option<u32> = p.file_name().and_then(|s| s.to_str()).and_then(|n| n.strip_prefix('f')).and_then(|s| s.parse().ok());
-        if f.is_some_and(|f| f > last) {
-            std::fs::remove_dir_all(&p)?;
-        }
-    }
     for layer in layers(dir) {
         let ldir = layer_dir(dir, layer);
         for e in std::fs::read_dir(&ldir)?.flatten() {
@@ -667,12 +641,9 @@ impl Run {
     }
 }
 
-/// A level's graph up to a horizon: `runs[layer][frame]`, and the
-/// frames' permutations (`perms[(frame, seq)]`: the real row of a virtual
-/// position; absent = identity).
+/// A level's graph up to a horizon: `runs[layer][frame]`.
 pub struct EdgeGraph {
     runs: Vec<Vec<Option<Run>>>,
-    perms: rustc_hash::FxHashMap<(u32, u32), memmap2::Mmap>,
     pub records: u64,
     pub bytes: u64,
 }
@@ -703,41 +674,7 @@ impl EdgeGraph {
                 v[frame as usize] = run;
             }
         }
-        let mut perms = rustc_hash::FxHashMap::default();
-        for e in std::fs::read_dir(dir.join("perm")).into_iter().flatten().flatten() {
-            let fdir = e.path();
-            let Some(frame) = fdir.file_name().and_then(|s| s.to_str()).and_then(|n| n.strip_prefix('f')).and_then(|s| s.parse::<u32>().ok()) else { continue };
-            if frame > horizon {
-                continue;
-            }
-            for e2 in std::fs::read_dir(&fdir)?.flatten() {
-                let p = e2.path();
-                let Some(seq) = p.file_name().and_then(|s| s.to_str()).and_then(|n| n.strip_prefix('s')).and_then(|s| s.strip_suffix(".u32")).and_then(|s| s.parse::<u32>().ok()) else { continue };
-                let file = std::fs::File::open(&p)?;
-                // SAFETY: written once (renamed into place), never modified.
-                let map = unsafe { memmap2::Mmap::map(&file)? };
-                ensure!(map.len() % 4 == 0, "{}: truncated permutation", p.display());
-                perms.insert((frame, seq), map);
-            }
-        }
-        Ok(EdgeGraph { runs, perms, records, bytes })
-    }
-
-    /// The real id of lane `lane` of the group based at the VIRTUAL id
-    /// `base`, recorded at frame `frame` (the base's piece was grouped by
-    /// configuration for that frame; without a permutation on file the
-    /// virtual order is the real one).
-    #[inline]
-    pub fn real_pred(&self, frame: u32, base: u64, lane: u32) -> u64 {
-        let (layer, seq, pos) = (id_layer(base), crate::frame::id_seq(base), crate::frame::id_row(base) + lane);
-        match self.perms.get(&(frame, seq)) {
-            Some(m) => {
-                let i = pos as usize * 4;
-                let row = u32::from_le_bytes(m[i..i + 4].try_into().expect("a permutation entry"));
-                pack_id(layer, seq, row)
-            }
-            None => pack_id(layer, seq, pos),
-        }
+        Ok(EdgeGraph { runs, records, bytes })
     }
 
     /// DIAGNOSTIC: every `(pred, target)` edge recorded at frame `frame`
@@ -764,12 +701,8 @@ impl EdgeGraph {
                 let mask = get_mask(b, &mut pos);
                 prev_t = t;
                 prev_b = base;
-                let mut m = mask;
-                while m != 0 {
-                    let lane = m.trailing_zeros();
-                    m &= m - 1;
-                    let p = self.real_pred(frame, base, lane);
-                    if preds.contains(&p) {
+                for &p in preds {
+                    if p >= base && p < base + 64 && mask & (1u64 << (p - base)) != 0 {
                         out.push((p, t));
                     }
                 }
@@ -891,7 +824,7 @@ pub fn bfs(graph: &EdgeGraph, horizon: u32, seeds: impl IntoIterator<Item = u64>
                                     while m != 0 {
                                         let lane = m.trailing_zeros();
                                         m &= m - 1;
-                                        let p = graph.real_pred(frame, e.base, lane);
+                                        let p = e.base + lane as u64;
                                         debug_assert_eq!(id_layer(p), frame - 1);
                                         if !marks.contains(p) {
                                             out.push(p);

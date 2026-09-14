@@ -256,9 +256,12 @@ pub fn parse_log(text: &str) -> Result<(Vec<HorizonRun>, Option<f64>, Option<f64
             let (marked, reruns) = if refuted {
                 (None, None)
             } else {
+                // `N re-runs` (the kernel walk) or `N edges read` (the BFS,
+                // 2026-09-13): the number before the trailing word(s).
+                let work = if line.ends_with("edges read") { t[t.len() - 3] } else { t[t.len() - 2] };
                 (
                     Some(num(after(&t, "marked", 0)?).with_context(ctx)?),
-                    Some(num(t[t.len() - 2]).with_context(ctx)?),
+                    Some(num(work).with_context(ctx)?),
                 )
             };
             let run = LevelRun {
@@ -826,6 +829,8 @@ OPTIMAL win frame: 3
         assert_eq!(hs[1].levels[0].first_win, Some(2));
         assert_eq!(hs[1].levels[1].precision, "Exact");
         assert_eq!(l0.precision, "Bits(0)", "the inner paren survives");
+        let hs2 = parse_log("[ladder] h5 level 0 (Bits(0)): first win f5, marked 12 states (fingerprint cda9202a7cbb2234), 34 edges read\n").unwrap().0;
+        assert_eq!(hs2[0].levels[0].reruns, Some(34), "the BFS's line");
         let waves = &hs[1].levels[1].fwd[0];
         assert_eq!((waves.emit_ms, waves.emit_idle, waves.own_ms, waves.own_idle, waves.total_ms), (7, 94, 3, 0, 11));
         assert_eq!(waves.rss_gb, 1.28);

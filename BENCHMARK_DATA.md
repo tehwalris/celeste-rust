@@ -1,4 +1,4 @@
-# Rooms (1,0) and (0,0) end to end on the guarded, grouped kernels (2026-09-14, release)
+# Rooms (1,0) and (0,0) end to end on the guarded, grouped kernels (2026-09-14, release) - REVERTED, code at 07b3a15
 
 Same commands as the runs below; every ladder fingerprint identical.
 
@@ -12,7 +12,7 @@ grouping a piece by configuration costs the within-call dedup its cell
 locality (f89 raw rows 21.7M -> 29.1M), which cancels the kernel's gain.
 Room (0,0)'s finer levels (many regions) are where the 8 minutes went.
 
-# Guarded regions + lane grouping in the kernels (2026-09-14, quick profile, 16 threads)
+# Guarded regions + lane grouping in the kernels (2026-09-14, quick profile, 16 threads) - REVERTED, code at 07b3a15
 
 plans/regions.md. `rewrite bench-frame`, wave time of one frame:
 

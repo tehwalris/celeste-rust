@@ -1,4 +1,11 @@
-# Guarded regions in the fused kernels (2026-09-14)
+# Guarded regions in the fused kernels (2026-09-14) - TRIED AND REVERTED
+
+**Reverted the same morning** (Philippe: the kernels stay compiled up
+front and branch-free; the idea is worth keeping as a STATIC split of
+the frame into halves with dedupe and bucketing between them). The
+implementation is at commit `07b3a15` (regions + lane grouping) on
+`census`; what follows is the design and what it measured, kept for
+the next attempt.
 
 ## The problem
 

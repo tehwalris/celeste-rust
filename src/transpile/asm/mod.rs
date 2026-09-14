@@ -10,10 +10,9 @@
 mod callout;
 mod codegen;
 mod jit;
-pub mod regions;
 
 pub use callout::{AsmCtx, CollisionEnv};
-pub use codegen::{compile, compile_regions, CellRepr, Compiled, RootKind};
+pub use codegen::{compile, CellRepr, Compiled, RootKind};
 pub use jit::{assemble, KernelFn, Loaded};
 
 use anyhow::Result;
@@ -39,19 +38,8 @@ pub fn compile_and_load_reprs(
     tag: &str,
     cell_reprs: &HashMap<u32, CellRepr>,
 ) -> Result<(Compiled, Loaded)> {
-    compile_and_load_regions(g, roots, tag, cell_reprs, None)
-}
-
-/// `compile_and_load_reprs` with guarded regions (`regions`).
-pub fn compile_and_load_regions(
-    g: &crate::transpile::graph::Graph,
-    roots: &[crate::transpile::graph::NodeId],
-    tag: &str,
-    cell_reprs: &HashMap<u32, CellRepr>,
-    regions: Option<&regions::Regions>,
-) -> Result<(Compiled, Loaded)> {
     let sym = format!("kernel_{tag}");
-    let compiled = compile_regions(g, roots, &sym, cell_reprs, regions)?;
+    let compiled = compile(g, roots, &sym, cell_reprs)?;
     let so: PathBuf = assemble(&compiled.asm, tag)?;
     let loaded = Loaded::open(&so, &sym)?;
     Ok((compiled, loaded))
