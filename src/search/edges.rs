@@ -641,6 +641,10 @@ impl Run {
     }
 }
 
+/// Per-row group membership, `(layer, seq) -> mask per row` (see
+/// `EdgeGraph::push_groups`).
+pub type GroupMasks = rustc_hash::FxHashMap<(u32, u32), Vec<u64>>;
+
 /// A level's graph up to a horizon: `runs[layer][frame]`.
 pub struct EdgeGraph {
     runs: Vec<Vec<Option<Run>>>,
@@ -709,6 +713,64 @@ impl EdgeGraph {
             }
         }
         out
+    }
+
+    /// DIAGNOSTIC (`rewrite partition-probe`): push per-row GROUP masks
+    /// one frame forward. `preds[(layer, seq)][row]` is the set of groups
+    /// (a bit each) a frame-`frame - 1` state belongs to; the result is
+    /// the same for the targets of every edge recorded at `frame` - the
+    /// OR of its preds' masks. Also returns how many targets have a layer
+    /// below `frame` (states the full run had already seen, whose own
+    /// successors were recorded at THEIR layer and are not followed here).
+    pub fn push_groups(&self, frame: u32, preds: &GroupMasks) -> (GroupMasks, u64) {
+        let mut out: GroupMasks = Default::default();
+        let mut old = 0u64;
+        for runs in &self.runs {
+            let Some(Some(run)) = runs.get(frame as usize) else { continue };
+            let b = &run.map[run.stream..];
+            let mut pos = 0usize;
+            let mut blk = 0usize;
+            if run.index.is_empty() {
+                continue;
+            }
+            let (mut prev_t, mut prev_b) = (run.index[0].0, 0u64);
+            while pos < b.len() {
+                if blk + 1 < run.index.len() && pos >= run.index[blk + 1].1 as usize {
+                    blk += 1;
+                    prev_t = run.index[blk].0;
+                    prev_b = 0;
+                }
+                let t = prev_t + get_varint(b, &mut pos);
+                let base = (prev_b as i64 + unzigzag(get_varint(b, &mut pos))) as u64;
+                let mask = get_mask(b, &mut pos);
+                prev_t = t;
+                prev_b = base;
+                let Some(rows) = preds.get(&(id_layer(base), crate::frame::id_seq(base))) else { continue };
+                let row0 = crate::frame::id_row(base) as usize;
+                let mut m = 0u64;
+                let mut bits = mask;
+                while bits != 0 {
+                    let i = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if let Some(&g) = rows.get(row0 + i) {
+                        m |= g;
+                    }
+                }
+                if m == 0 {
+                    continue;
+                }
+                let v = out.entry((id_layer(t), crate::frame::id_seq(t))).or_default();
+                let r = crate::frame::id_row(t) as usize;
+                if v.len() <= r {
+                    v.resize(r + 1, 0);
+                }
+                if v[r] == 0 && id_layer(t) < frame {
+                    old += 1;
+                }
+                v[r] |= m;
+            }
+        }
+        (out, old)
     }
 
     /// The predecessors of `target` recorded at frame `frame`.

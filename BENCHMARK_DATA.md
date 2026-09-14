@@ -1,3 +1,41 @@
+# Splitting room (2,0)'s level 0: waypoint partition and a distance bound (2026-09-14, exact tree f0-f69)
+
+Two diagnostics on last night's exact-speed room (2,0) tree (`/var/tmp/celeste-room20`,
+55.3M kept at f69, 499M visited, 45 GB peak RSS, 221 s/frame).
+
+**`rewrite partition-probe`** groups frame 50's 5.44M states by the square
+the player stands in and pushes the groups through the recorded edges:
+what running each group as its own search (own door) would cost. `sum`
+is the groups' work added up, `distinct` the single run's; the largest
+group's share is the memory saving.
+
+| square | groups | f69 largest group | f69 sum / distinct |
+|---|---|---|---|
+| 32 px | 16 | 55.5M of 86.9M (64%) | x1.18 |
+| 16 px | 38 | 34.2M of 86.9M (39%) | x1.67 |
+
+The room funnels everything back through the same places: one square at
+f50 reaches most of the f69 frontier, and its share GROWS with the frame
+(16 px: 20% at f55, 39% at f69). A position split buys ~2.5x on memory
+for 1.7x the time, worsening; nested splits would compound. (Counts
+include re-reached older states - 31.6M of the 86.9M at f69 - whose
+successors the probe does not follow; the duplication is a slight
+under-estimate.)
+
+**`rewrite prune-probe`** reverse-BFSes the recorded position graph from
+the room's top and counts states too far from it to make a ceiling
+(the 95-frame concrete solution): ZERO at every frame to f69. Every
+state is within 30 frames of the top by position alone; a
+position-only relaxation cannot prune this room.
+
+**What the exact numbers say instead:** the frontier grows 11%/frame at
+f69 and is at ~7,500 states per position, the census's figure for the
+room, so it is close to saturating. Projected to f95: ~70 GB peak
+(door 8 -> ~30 GB, frontier 14 -> ~20 GB, ~20 GB transient) and ~1.5 h
+more of level 0 - within a third of the 60 GB cap. The plan is a memory
+diet on the exact-speed loop (transient, door on disk) with the
+partition as the fallback.
+
 # The speed bucket on room (2,0): fork arity, the silent drop, slot dedup (2026-09-14, release, 16 threads)
 
 Three findings from making `CELESTE_SPD_LADDER=level0` run on room (2,0)

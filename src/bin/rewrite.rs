@@ -152,6 +152,41 @@ enum Command {
         #[arg(long, default_value_t = false)]
         diff: bool,
     },
+    /// DIAGNOSTIC: how a waypoint partition would behave. Group the
+    /// level's states at `--frame` by the `--square`-pixel square their
+    /// player stands in (the biggest 63 squares, the rest lumped), push
+    /// the groups forward through the recorded edges to `--to`, and print
+    /// per frame each group's states, their sum (the work of running the
+    /// groups separately), the distinct states (the work of one run), and
+    /// how many states belong to several groups.
+    PartitionProbe {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long, default_value_t = 50)]
+        frame: u32,
+        #[arg(long, default_value_t = 69)]
+        to: u32,
+        #[arg(long, default_value_t = 16)]
+        square: i32,
+    },
+    /// DIAGNOSTIC: how much a distance-to-exit bound would prune under a
+    /// known ceiling. Reverse-BFS the level's recorded position graph
+    /// from the top of the room (the exit is `y < -4`; the goal cells are
+    /// the graph's cells within 8 px of its highest), then per frame
+    /// count the states whose cell is more frames from the goal than the
+    /// ceiling leaves. An ESTIMATE: the graph only has the edges the
+    /// forward recorded (missing edges over-state the pruning) and the
+    /// goal is the top region, not the exit (under-states it).
+    PruneProbe {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long, default_value_t = 95)]
+        ceiling: u32,
+        #[arg(long, default_value_t = 50)]
+        from: u32,
+        #[arg(long, default_value_t = 69)]
+        to: u32,
+    },
     /// Export a finished run for the web UI (`ui/`): per (horizon, level,
     /// frame) the states per player-position cell and the win cells, per
     /// (horizon, level) the marks per cell by distance, and the log's
@@ -1082,6 +1117,179 @@ fn main() -> Result<()> {
             );
             celeste_rust::compiled::dispatch::print_kernel_hits();
             celeste_rust::metrics::dump("bench-backward", None, &[]);
+        }
+        Command::PartitionProbe { level_dir, frame, to, square } => {
+            use celeste_rust::search::checkpoint::FrameFile;
+            use celeste_rust::search::edges::{EdgeGraph, GroupMasks};
+            use celeste_rust::search::pos_graph::cell_xy;
+            let dir = std::path::Path::new(&level_dir);
+            let fdir = dir.join("frames").join(format!("f{frame:03}"));
+            // Square -> (count, rows) over the frame's files.
+            let mut files: Vec<(u32, FrameFile)> = Vec::new();
+            for e in std::fs::read_dir(&fdir)? {
+                let p = e?.path();
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                if !(name.starts_with('s') && name.ends_with(".bin")) {
+                    continue;
+                }
+                let seq: u32 = name.trim_end_matches(".bin").rsplit('_').next().unwrap().parse()?;
+                files.push((seq, FrameFile::open(&p)?));
+            }
+            let mut per_square: std::collections::BTreeMap<(i32, i32), u64> = Default::default();
+            let mut row_sq: Vec<Vec<(i32, i32)>> = Vec::new();
+            for (_, f) in &files {
+                let sq: Vec<(i32, i32)> = f
+                    .row_cells()
+                    .iter()
+                    .map(|&c| match cell_xy(c) {
+                        Some((x, y)) => (x.div_euclid(square), y.div_euclid(square)),
+                        None => (i32::MIN, i32::MIN),
+                    })
+                    .collect();
+                for s in &sq {
+                    *per_square.entry(*s).or_default() += 1;
+                }
+                row_sq.push(sq);
+            }
+            let mut ranked: Vec<((i32, i32), u64)> = per_square.iter().map(|(k, v)| (*k, *v)).collect();
+            ranked.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+            let total: u64 = ranked.iter().map(|x| x.1).sum();
+            let mut group_of: std::collections::HashMap<(i32, i32), u32> = Default::default();
+            let mut names: Vec<String> = Vec::new();
+            for (i, (sq, n)) in ranked.iter().enumerate() {
+                let g = i.min(63) as u32;
+                group_of.insert(*sq, g);
+                if i < 63 {
+                    names.push(format!("sq({},{}) {}px n={}", sq.0 * square, sq.1 * square, square, n));
+                } else if i == 63 {
+                    names.push(format!("rest ({} squares)", ranked.len() - 63));
+                }
+            }
+            println!("frame {frame}: {total} states in {} squares of {square} px -> {} groups", ranked.len(), names.len());
+            for (g, nm) in names.iter().enumerate() {
+                println!("  g{g:02} {nm}");
+            }
+            let mut masks: GroupMasks = Default::default();
+            for ((seq, f), sq) in files.iter().zip(&row_sq) {
+                let v: Vec<u64> = sq.iter().map(|s| 1u64 << group_of[s]).collect();
+                assert_eq!(v.len(), f.width() as usize);
+                masks.insert((frame, *seq), v);
+            }
+            let graph = EdgeGraph::open(&dir.join("edges"), to)?;
+            {
+                let (seq, f) = &files[0];
+                let id = celeste_rust::frame::pack_id(frame, *seq, 0);
+                let succ = graph.edges_from(frame + 1, &[id]);
+                println!(
+                    "graph: {} records, {} MB; probe state l{frame} s{seq} r0 (of {} rows): {} successors at f{}",
+                    graph.records,
+                    graph.bytes >> 20,
+                    f.width(),
+                    succ.len(),
+                    frame + 1
+                );
+            }
+            println!("frame | per-group states (g00..)                | sum | distinct | in>1 groups | old-layer targets");
+            for f in frame + 1..=to {
+                let t = std::time::Instant::now();
+                let (next, old) = graph.push_groups(f, &masks);
+                let mut per = vec![0u64; names.len()];
+                let (mut distinct, mut multi) = (0u64, 0u64);
+                for v in next.values() {
+                    for &m in v {
+                        if m == 0 {
+                            continue;
+                        }
+                        distinct += 1;
+                        if m.count_ones() > 1 {
+                            multi += 1;
+                        }
+                        let mut b = m;
+                        while b != 0 {
+                            per[b.trailing_zeros() as usize] += 1;
+                            b &= b - 1;
+                        }
+                    }
+                }
+                let sum: u64 = per.iter().sum();
+                let top: Vec<String> = per.iter().take(8).map(|n| n.to_string()).collect();
+                println!(
+                    "f{f:03} | {} | {sum} | {distinct} | {multi} | {old} | {:.1} s",
+                    top.join(" "),
+                    t.elapsed().as_secs_f64()
+                );
+                masks = next;
+            }
+        }
+        Command::PruneProbe { level_dir, ceiling, from, to } => {
+            use celeste_rust::search::checkpoint::FrameFile;
+            use celeste_rust::search::pos_graph::{cell_xy, PosGraph, CELL_COUNT};
+            let dir = std::path::Path::new(&level_dir);
+            let graph = PosGraph::load(&celeste_rust::frame::pos_graph_path(dir))?;
+            // Live cells and the room's top.
+            let mut live = vec![false; CELL_COUNT];
+            let mut top = i32::MAX;
+            for d in 0..CELL_COUNT as u32 {
+                let srcs = graph.srcs_of(d);
+                if srcs.is_empty() {
+                    continue;
+                }
+                live[d as usize] = true;
+                for &sc in srcs {
+                    live[sc as usize] = true;
+                }
+                if let Some((_, y)) = cell_xy(d) {
+                    top = top.min(y);
+                }
+            }
+            let mut dist = vec![u32::MAX; CELL_COUNT];
+            let mut queue = std::collections::VecDeque::new();
+            for c in 0..CELL_COUNT as u32 {
+                if live[c as usize] && cell_xy(c).is_some_and(|(_, y)| y <= top + 8) {
+                    dist[c as usize] = 0;
+                    queue.push_back(c);
+                }
+            }
+            let goals = queue.len();
+            while let Some(d) = queue.pop_front() {
+                let nd = dist[d as usize] + 1;
+                for &sc in graph.srcs_of(d) {
+                    if dist[sc as usize] == u32::MAX {
+                        dist[sc as usize] = nd;
+                        queue.push_back(sc);
+                    }
+                }
+            }
+            let reached = dist.iter().filter(|&&d| d != u32::MAX).count();
+            println!("pos graph: {} pairs; top y = {top}; {goals} goal cells; {reached} cells reach the goal", graph.pairs());
+            println!("frame | states | dead under ceiling {ceiling} | unreachable-in-graph | dist histogram (0-9,10-19,..)");
+            for f in from..=to {
+                let fdir = dir.join("frames").join(format!("f{f:03}"));
+                let (mut n, mut dead, mut unreach) = (0u64, 0u64, 0u64);
+                let mut hist = vec![0u64; 12];
+                for e in std::fs::read_dir(&fdir)? {
+                    let p = e?.path();
+                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    if !(name.starts_with('s') && name.ends_with(".bin")) {
+                        continue;
+                    }
+                    let ff = FrameFile::open(&p)?;
+                    for (cell, rows) in ff.cell_counts() {
+                        n += rows as u64;
+                        let d = dist[cell as usize];
+                        if d == u32::MAX {
+                            unreach += rows as u64;
+                            continue;
+                        }
+                        hist[(d as usize / 10).min(11)] += rows as u64;
+                        if f + d > ceiling {
+                            dead += rows as u64;
+                        }
+                    }
+                }
+                let h: Vec<String> = hist.iter().map(|x| x.to_string()).collect();
+                println!("f{f:03} | {n} | {dead} ({:.1}%) | {unreach} | {}", 100.0 * dead as f64 / n.max(1) as f64, h.join(" "));
+            }
         }
         Command::ExportUi {
             checkpoint_dir,
