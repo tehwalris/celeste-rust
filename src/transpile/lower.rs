@@ -51,6 +51,9 @@ pub(crate) struct Outcome {
 /// backend assembles it (`trace::emit::asm_fused`) and `lower_outcomes`
 /// reads the per-outcome constants off it, so both see byte-for-byte the
 /// same thing - there is no parallel specialization.
+/// One specialized body: `(outcome, frees, splits, roots)`.
+pub(crate) type SpecializedBody = (usize, u8, u64, Vec<NodeId>);
+
 pub(crate) fn specialize_frame(
     graph: &Graph,
     outs: &[(Vec<NodeId>, NodeId, NodeId)],
@@ -167,7 +170,7 @@ pub(crate) fn specialize_frame(
 /// accumulator writes such a column ONCE as `Col::U` instead of pushing
 /// it per row, and the within-chunk dedup fold skips it. Returns the
 /// number of distinct bodies (a size measure for the probes).
-pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> usize {
+pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> (Graph, Vec<SpecializedBody>) {
     let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId)> = outs
         .iter()
         .map(|o| (o.of.fields.iter().map(|f| f.node).collect(), o.ok, o.live))
@@ -200,5 +203,5 @@ pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> usize {
             };
         }
     }
-    bodies.len()
+    (sp, bodies)
 }

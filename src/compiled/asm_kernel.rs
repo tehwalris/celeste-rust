@@ -1172,7 +1172,7 @@ fn build_one_shape(
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
     let (mut fused, bodies, mut flat_roots, reprs) =
-        crate::trace::emit::asm_fused(&r.bound, Some(&room), true)
+        crate::trace::emit::asm_fused_from(&r.bound, &r.lowered.spec)
             .with_context(|| format!("fusing shape {si} (hash {shape:#x})"))?;
     // THE ROW KEY, AS GRAPH ROOTS. Per body, the per-lane sum of
     // `cell_mix` over its varying fields (a per-row column that the

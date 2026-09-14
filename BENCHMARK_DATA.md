@@ -1,3 +1,21 @@
+# Kernel build time (2026-09-14, release)
+
+`CELESTE_BUILD_TRACE=1` prints per-shape phase timings. Two fixes: the
+list scheduler's ready-list scan was O(n^2) (124 s on the 493k-instruction
+main shape of room (2,0) in bucket mode; now two heaps, 0.1 s), and
+specialize + decide ran twice per shape (once for the per-outcome
+constants, once for the fused graph) in a serial loop over the shapes
+(now once, shapes in parallel).
+
+| | before | after |
+|---|---|---|
+| room (2,0), speed ladder, level-0 set alone | trace 24 s + assemble 130 s | trace 10.6 s + assemble 1.0 s |
+| room (2,0), speed ladder, all 17 rung sets (the search's prebuild) | > 11 min, not finished | **69 s** (RSS 33 GB: 17 sets traced at once) |
+| room (1,0), exact speed, all 17 rung sets | - | 2.8 s |
+
+The remaining 10 s is the tracer plus one decide pass (BDD simplify +
+interval folds, ~5 s on a 2,880-candidate shape).
+
 # The speed ladder on room (1,0): a loss (2026-09-14, release, 32 threads)
 
 `CELESTE_SPD_LADDER=bucket` (level 0: rem full, spd 1 px; both refine

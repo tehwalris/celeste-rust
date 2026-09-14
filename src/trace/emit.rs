@@ -33,6 +33,11 @@ pub struct Lowered {
     /// Number of distinct (outcome, roots) bodies the fused graph has - a
     /// size measure for the probes.
     pub bodies: usize,
+    /// THE specialization (`lower::specialize_frame`): the fused graph and
+    /// its bodies, computed once here and consumed by `asm_fused_from` -
+    /// specialize + decide were half a kernel build, and used to run
+    /// twice per shape (2026-09-14).
+    pub(crate) spec: (Graph, Vec<crate::transpile::lower::SpecializedBody>),
 }
 
 /// A node's subtree, to a bounded depth, as text. For DIAGNOSTICS: the
@@ -284,6 +289,32 @@ pub fn asm_fused(
         decide,
         room,
     );
+    asm_fused_of(bound, fused, raw_bodies)
+}
+
+/// `asm_fused` on a specialization already computed (`Lowered::spec`).
+pub fn asm_fused_from(
+    bound: &Bound,
+    spec: &(Graph, Vec<crate::transpile::lower::SpecializedBody>),
+) -> Result<(
+    Graph,
+    Vec<AsmBody>,
+    Vec<NodeId>,
+    std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
+)> {
+    asm_fused_of(bound, spec.0.clone(), spec.1.clone())
+}
+
+fn asm_fused_of(
+    bound: &Bound,
+    fused: Graph,
+    raw_bodies: Vec<crate::transpile::lower::SpecializedBody>,
+) -> Result<(
+    Graph,
+    Vec<AsmBody>,
+    Vec<NodeId>,
+    std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
+)> {
     let mut flat_roots = Vec::new();
     let mut bodies = Vec::with_capacity(raw_bodies.len());
     for (outcome, frees, splits, roots) in raw_bodies {
@@ -336,6 +367,7 @@ pub fn lower_frame(
             live: o.live,
         })
         .collect();
-    let bodies = crate::transpile::lower::lower_outcomes(&e, &mut outs);
-    Ok(Lowered { outs: outs.into_iter().map(|o| o.of).collect(), bodies })
+    let spec = crate::transpile::lower::lower_outcomes(&e, &mut outs);
+    let bodies = spec.1.len();
+    Ok(Lowered { outs: outs.into_iter().map(|o| o.of).collect(), bodies, spec })
 }

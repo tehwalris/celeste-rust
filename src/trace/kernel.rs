@@ -93,26 +93,39 @@ pub(crate) fn lattice_kernel_refs(
 ) -> Result<Vec<Reference>> {
     let mut lw = room_constant_lattice(root, opts)?;
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
-    let mut refs: Vec<Reference> = Vec::new();
-    for (i, (_k, f)) in std::mem::take(&mut lw.frames).into_iter().enumerate() {
-        let bound = super::emit::bind(&f, &lw.graph, opts.widen)
-            .map_err(|e| anyhow::anyhow!("lattice shape {} bind: {:#}", i, e))?;
-        let lowered = super::emit::lower_frame(
-            &bound.graph,
-            &bound.outcomes,
-            Some(room.clone()),
-            bound.forks,
-        )
-        .map_err(|e| anyhow::anyhow!("lattice shape {} lower: {:#}", i, name_cells(&f, e)))?;
-        refs.push(Reference {
-            frame: f,
-            graph: lw.graph.clone(),
-            bound,
-            lowered,
-            cart: lw.cart.clone(),
-            cache: lw.cache.clone(),
-        });
-    }
+    // Bind + lower (specialize + decide, the expensive half of a kernel
+    // build) per shape, shapes in parallel.
+    let frames: Vec<_> = std::mem::take(&mut lw.frames).into_iter().collect();
+    let lw = &lw;
+    let room = &room;
+    let refs: Vec<Reference> = std::thread::scope(|scope| {
+        let handles: Vec<_> = frames
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_k, f))| {
+                scope.spawn(move || -> Result<Reference> {
+                    let bound = super::emit::bind(&f, &lw.graph, opts.widen)
+                        .map_err(|e| anyhow::anyhow!("lattice shape {} bind: {:#}", i, e))?;
+                    let lowered = super::emit::lower_frame(
+                        &bound.graph,
+                        &bound.outcomes,
+                        Some(room.clone()),
+                        bound.forks,
+                    )
+                    .map_err(|e| anyhow::anyhow!("lattice shape {} lower: {:#}", i, name_cells(&f, e)))?;
+                    Ok(Reference {
+                        frame: f,
+                        graph: lw.graph.clone(),
+                        bound,
+                        lowered,
+                        cart: lw.cart.clone(),
+                        cache: lw.cache.clone(),
+                    })
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("lattice shape worker panicked")).collect::<Result<Vec<_>>>()
+    })?;
     Ok(refs)
 }
 
