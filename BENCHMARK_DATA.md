@@ -1,3 +1,22 @@
+# Ladder orderings on synthetic targets (2026-09-14, release, `CELESTE_LADDER`)
+
+`rewrite search --win-at` with four ladders; `tools/ladder_model.py` sums
+the levels' forwards (kernel prebuilds excluded). Every ladder confirms the
+target's optimum (33 / 39).
+
+| ladder | room (1,0) win-at 9,101 | room (0,0) win-at 36,85 | level-0 first win |
+|---|---|---|---|
+| A rem Bits(0..15) then exact, speed exact (default) | 2 s | 2 s | f29 / f39 |
+| C speed 1 px at level 0 only, exact above (`CELESTE_SPD_LADDER=level0`) | 2 s | 4 s | f28 / f37 |
+| D speed at the rem grid to rung 3, exact after | 10 s | 6 s | f28 / f37 |
+| B speed at the rem grid to rung 10 (W6), exact after (`bucket`) | 18 s | 6 s | f28 / f37 |
+
+Bucketing speed only at the coarsest level costs about what rem-only
+costs and keeps level 0's collapse; every speed refinement step above
+level 0 is pure cost (interval arithmetic at full price for a weaker
+level). The experiment also caught the W1 overflow (the both-ladder
+refuted 33..36 at Bits(15)/W1 before the cap).
+
 # Kernel build time (2026-09-14, release)
 
 `CELESTE_BUILD_TRACE=1` prints per-shape phase timings. Two fixes: the

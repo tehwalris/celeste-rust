@@ -21,7 +21,7 @@ def parse(path):
         m = re.match(r"\[fwd\] f\d+ in \d+/(\d+) raw (\d+) .* total (\d+) ms", l)
         if m:
             fwd_rows += int(m.group(2)); fwd_ms += int(m.group(3)); continue
-        m = re.match(r"\[ladder\] h(\d+) level (\d+) \((\w+\(?\d*\)?)\): (.*)", l)
+        m = re.match(r"\[ladder\] h(\d+) level (\d+) \((.+?)\): (.*)", l)
         if m:
             h, lv, prec, rest = int(m.group(1)), int(m.group(2)), m.group(3), m.group(4)
             win = re.search(r"first win f(\d+)", rest)
