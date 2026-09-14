@@ -174,17 +174,29 @@ pub trait Domain {
     /// returns ONE node, not two states: the fragment is a choice, like
     /// a button, and specialization enumerates it (`Choice::Split`).
     ///
+    /// `ways` is the fork's arity - how many floors the fragments cover.
+    ///
     /// The default is the identity, which is what an exact value needs:
     /// one fragment, always valid.
-    fn fork_flr(&mut self, v: &Self::Num) -> (Self::Num, Self::Bool) {
+    fn fork_flr(&mut self, v: &Self::Num, _ways: u8) -> (Self::Num, Self::Bool) {
         (v.clone(), self.boolean(true))
     }
 
     /// The premise a fork is taken under: this lane's interval spans at
-    /// most as many floors as there are fragments. An obligation, not a
-    /// guard - a lane that fails it is REAL and this body cannot run it.
-    fn span_ok(&mut self, _v: &Self::Num) -> Self::Bool {
+    /// most `ways` floors, as many as there are fragments. An
+    /// obligation, not a guard - a lane that fails it is REAL and this
+    /// body cannot run it.
+    fn span_ok(&mut self, _v: &Self::Num, _ways: u8) -> Self::Bool {
         self.boolean(true)
+    }
+
+    /// The arity of the `move` fork (`__split_by_flr`): 2 unless the
+    /// traced set buckets the player's speed, where an object updating
+    /// before the player (the spring: `hit.spd.x *= 0.2`) can hand
+    /// `move` a bucket no longer aligned to the grid, and `rem + spd +
+    /// 0.5` then spans THREE floors (room (2,0) f36, 2026-09-14).
+    fn move_ways(&self) -> u8 {
+        2
     }
 }
 
@@ -289,6 +301,10 @@ pub struct Symbolic {
     /// How many FORK choices have been handed out this frame. The other
     /// half of `ChoiceSet`, above the six buttons.
     pub forks: u8,
+    /// The arity of the `move` fork for the set being traced (see
+    /// `Domain::move_ways`); `trace_frame` sets it from the widen mode.
+    /// 0 (the default) reads as 2.
+    pub move_ways: u8,
     /// Fork choices already handed out THIS FRAME, by the value forked.
     ///
     /// Two call sites that floor the same value do not need two choice
@@ -304,7 +320,7 @@ pub struct Symbolic {
     /// configurations instead of 16,384.
     ///
     /// Per frame, like `forks` itself - cleared beside it.
-    pub fork_memo: std::collections::HashMap<NodeId, (NodeId, NodeId)>,
+    pub fork_memo: std::collections::HashMap<NodeId, (u8, (NodeId, NodeId))>,
     /// Input cells that hold an INTERVAL rather than a number - the
     /// player's `rem.x`/`rem.y`, which the boundary widens.
     ///
@@ -513,26 +529,33 @@ impl Domain for Symbolic {
         go(&self.graph, &self.ival_cells, &mut memo, *v)
     }
 
-    fn fork_flr(&mut self, v: &NodeId) -> (NodeId, NodeId) {
+    fn fork_flr(&mut self, v: &NodeId, ways: u8) -> (NodeId, NodeId) {
         // Already forked this exact value this frame? Reuse the choice.
         // See `fork_memo`. Hash-consing is what makes this sound and
         // also what makes it FIRE: two `move` calls on values that are
         // structurally the same expression are the same node id.
         if let Some(hit) = self.fork_memo.get(v) {
-            return *hit;
+            let (d, out) = *hit;
+            self.graph.set_fork_ways(d, ways);
+            return out;
         }
         let d = self.forks;
         self.forks += 1;
+        self.graph.set_fork_ways(d, ways);
         let out = (
             self.graph.fold(Op::Split(d), vec![*v]),
             self.graph.fold(Op::SplitValid(d), vec![*v]),
         );
-        self.fork_memo.insert(*v, out);
+        self.fork_memo.insert(*v, (d, out));
         out
     }
 
-    fn span_ok(&mut self, v: &NodeId) -> NodeId {
-        self.graph.fold(Op::SplitOk, vec![*v])
+    fn span_ok(&mut self, v: &NodeId, ways: u8) -> NodeId {
+        self.graph.fold(Op::SplitOk(ways), vec![*v])
+    }
+
+    fn move_ways(&self) -> u8 {
+        self.move_ways.max(2)
     }
 
     fn as_const(&self, v: &NodeId) -> Option<P8> {

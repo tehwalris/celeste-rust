@@ -393,8 +393,11 @@ pub(crate) fn spd_bucket_node(
         "spd bucket width 2^{w} raw does not match the fork grid 2^-{fb}"
     );
     let (frag, fork) = if d.is_interval(&old) {
-        let (frag, valid) = d.fork_flr(&old);
-        let premise = d.span_ok(&old);
+        // Two-way: the boundary snap sees the frame's OUTPUT speed, at
+        // most one grid cell wide plus the frame's shifts (`appr`'s
+        // 0.6, gravity's 0.21) - two cells.
+        let (frag, valid) = d.fork_flr(&old, 2);
+        let premise = d.span_ok(&old, 2);
         (frag, Some((valid, premise)))
     } else {
         (old, None)

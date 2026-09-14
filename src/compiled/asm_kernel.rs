@@ -52,6 +52,8 @@ struct AsmField {
 /// into outcome `outcome`'s block iff `live & ok`.
 struct AsmBody {
     outcome: usize,
+    /// The fork configuration (two bits per fork), for diagnostics.
+    splits: u64,
     fields: Vec<AsmField>,
     ok_root: usize,
     live_root: usize,
@@ -244,7 +246,7 @@ impl AsmKernel {
                 let (mut kept, mut declined, mut any_live) = (0u16, 0u16, 0u16);
                 for body in &self.bodies {
                     let ok = read_zb_holds(outbuf, body.ok_root);
-                    let live = read_zb_holds(outbuf, body.live_root);
+                    let live = read_zb_live(outbuf, body.live_root);
                     kept |= live & ok & valid;
                     declined |= live & !ok & valid;
                     any_live |= live & valid;
@@ -254,6 +256,9 @@ impl AsmKernel {
                     "[liveok] slice lanes={n} valid={valid:04x} kept={kept:04x} \
                      declined={declined:04x} dropped(not-live)={dropped:04x} any_live={any_live:04x}"
                 );
+                if dropped != 0 {
+                    self.explain_dropped(chunk, lo + dropped.trailing_zeros() as usize, dropped.trailing_zeros() as usize, outbuf);
+                }
             }
             // DIAGNOSTIC (CELESTE_BODYSETS=1): which bodies take each lane -
             // the per-lane body SET, whose distinct count over a frame is
@@ -273,7 +278,7 @@ impl AsmKernel {
                 // must fall to the reference, so the trace's failure to
                 // fork/decide it surfaces instead of producing a coarse row.
                 let ok = read_zb_holds(outbuf, body.ok_root);
-                let live = read_zb_holds(outbuf, body.live_root);
+                let live = read_zb_live(outbuf, body.live_root);
                 if live & !ok & valid != 0 {
                     // Declined: a live lane the kernel could not keep (or
                     // could not DECIDE). A coverage gap for the whole call -
@@ -436,6 +441,119 @@ impl AsmKernel {
     }
 
     /// from the interpreter. Prints at most a few mismatches per chunk.
+    /// A lane no body is live for: evaluate the fused graph for it and
+    /// print every fork node's value and each body's (live, ok) under
+    /// the evaluator against the kernel's. Diagnostic for the liveok
+    /// census (`CELESTE_ASM_LIVEOK`), first such lane per call.
+    fn explain_dropped(&self, chunk: &Rt2, lane: usize, i: usize, outbuf: &[u8]) {
+        use crate::transpile::graph::{Op, Val};
+        static SHOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2 {
+            return;
+        }
+        let ids = crate::compiled::ids();
+        let mut desc = String::new();
+        for obj in chunk.player_objects(ids) {
+            for (name, f) in [("rem", ids.f_rem), ("spd", ids.f_spd)] {
+                if let Some(pc) = chunk.obj_field_cell(obj, f) {
+                    if let Col::U(AV::Ptr(sub)) = chunk.cols[pc as usize] {
+                        for (axis, g) in [("x", ids.f_x), ("y", ids.f_y)] {
+                            if let Some(c) = chunk.obj_field_cell(sub, g) {
+                                desc.push_str(&format!(" {name}.{axis}={:?}", chunk.cols[c as usize].at(lane)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("[dropped] shape {:#x} lane {lane}:{desc}", chunk.shape_hash);
+        let mut cells: std::collections::HashMap<u32, Val> = Default::default();
+        for &cell in &self.compiled.input_cells {
+            let v = match chunk.cols[cell as usize].at(lane) {
+                AV::Num(p) => Val::Num(crate::pico8_num::Pico8NumInterval::new(p, p)),
+                AV::Ival(a, b) => Val::Num(crate::pico8_num::Pico8NumInterval::new(a, b)),
+                AV::Bool(b) => Val::Bool(Some(b)),
+                AV::UBool => Val::Bool(None),
+                _ => continue,
+            };
+            cells.insert(cell, v);
+        }
+        let vals = match self.fused.eval_narrow_top_in(&cells, &self.room) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[dropped]   graph evaluation failed: {e:#}");
+                return;
+            }
+        };
+        for id in 0..self.fused.len() as crate::transpile::graph::NodeId {
+            let node = self.fused.get(id);
+            if matches!(node.op, Op::SplitOk(_) | Op::FragOk(_) | Op::Frag(_)) {
+                let x = node.args[0];
+                eprintln!("[dropped]   {id} {:?} = {:?}; operand {x} {:?} = {:?}", node.op, vals[id as usize], self.fused.get(x).op, vals[x as usize]);
+            }
+        }
+        let mut n_live_eval = 0;
+        for (bi, body) in self.bodies.iter().enumerate() {
+            let live_asm = read_zb_live(outbuf, body.live_root) & (1 << i) != 0;
+            let ok_asm = read_zb_holds(outbuf, body.ok_root) & (1 << i) != 0;
+            let live_ev = vals[self.flat_roots[body.live_root] as usize];
+            let ok_ev = vals[self.flat_roots[body.ok_root] as usize];
+            if live_ev != Val::Bool(Some(false)) || live_asm {
+                n_live_eval += 1;
+                if n_live_eval <= 6 {
+                    eprintln!("[dropped]   body {bi} outcome {} splits {:#x}: live eval {:?} asm {live_asm}; ok eval {:?} asm {ok_asm}", body.outcome, body.splits, live_ev, ok_ev);
+                    eprintln!("[dropped]   the live leaves the evaluator cannot decide:");
+                    self.explain_bool(chunk, lane, self.flat_roots[body.live_root]);
+                }
+            }
+        }
+        eprintln!("[dropped]   {n_live_eval} bodies live under the evaluator or the kernel");
+    }
+
+    /// Descend a boolean DAG from `root` through And/Or/Not along the
+    /// undecided operands and print the undecided LEAVES (comparisons,
+    /// forks, cart lookups) with their operands' values.
+    fn explain_bool(&self, chunk: &Rt2, lane: usize, root: crate::transpile::graph::NodeId) {
+        use crate::transpile::graph::{Op, Val};
+        let mut cells: std::collections::HashMap<u32, Val> = Default::default();
+        for &cell in &self.compiled.input_cells {
+            let v = match chunk.cols[cell as usize].at(lane) {
+                AV::Num(p) => Val::Num(crate::pico8_num::Pico8NumInterval::new(p, p)),
+                AV::Ival(a, b) => Val::Num(crate::pico8_num::Pico8NumInterval::new(a, b)),
+                AV::Bool(b) => Val::Bool(Some(b)),
+                AV::UBool => Val::Bool(None),
+                _ => continue,
+            };
+            cells.insert(cell, v);
+        }
+        let Ok(vals) = self.fused.eval_narrow_top_in(&cells, &self.room) else { return };
+        let mut stack = vec![root];
+        let mut seen = std::collections::HashSet::new();
+        let mut shown = 0;
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) || shown >= 10 {
+                continue;
+            }
+            let node = self.fused.get(n);
+            let v = vals[n as usize];
+            match node.op {
+                Op::And => stack.extend(node.args.iter().copied().filter(|&a| vals[a as usize] != Val::Bool(Some(true)))),
+                Op::Or => stack.extend(node.args.iter().copied().filter(|&a| vals[a as usize] != Val::Bool(Some(false)))),
+                Op::Not => stack.push(node.args[0]),
+                Op::Sel => stack.extend(node.args.iter().copied()),
+                _ => {
+                    shown += 1;
+                    let args: Vec<String> = node
+                        .args
+                        .iter()
+                        .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
+                        .collect();
+                    eprintln!("[kernel]   leaf {} {:?} = {:?}; args {}", n, node.op, v, args.join(", "));
+                }
+            }
+        }
+    }
+
     /// On a decline: evaluate the fused graph for `lane` and print the
     /// conjuncts of the body's `ok` (its And-tree's leaves) that are not
     /// decided true - the premise the lane fails.
@@ -471,7 +589,7 @@ impl AsmKernel {
                 stack.extend(node.args.iter().copied());
                 continue;
             }
-            if vals[n as usize] != Val::Bool(Some(true)) && shown < 8 {
+            if vals[n as usize] != Val::Bool(Some(true)) && shown < 6 {
                 shown += 1;
                 let args: Vec<String> = node
                     .args
@@ -479,6 +597,69 @@ impl AsmKernel {
                     .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
                     .collect();
                 eprintln!("[kernel]   ok conjunct {} {:?} = {:?}; args {}", n, node.op, vals[n as usize], args.join(", "));
+                // The whole sub-DAG under it (bounded), when asked: what
+                // `CELESTE_EXPLAIN_DEPTH=N` prints is every node within N
+                // steps of the conjunct, once, with its value.
+                if let Some(depth) = std::env::var("CELESTE_EXPLAIN_DEPTH").ok().and_then(|v| v.parse::<usize>().ok()) {
+                    let mut frontier = vec![n];
+                    let mut printed = std::collections::HashSet::new();
+                    for _ in 0..depth {
+                        let mut next = Vec::new();
+                        for id in frontier {
+                            if !printed.insert(id) {
+                                continue;
+                            }
+                            let nd = self.fused.get(id);
+                            if matches!(nd.op, Op::Const(..) | Op::ConstBool(_)) {
+                                continue;
+                            }
+                            let args: Vec<String> = nd.args.iter().map(|&a| format!("{a}")).collect();
+                            eprintln!("[kernel]     {} {:?} = {:?}; args {}", id, nd.op, vals[id as usize], args.join(","));
+                            next.extend(nd.args.iter().copied());
+                        }
+                        frontier = next;
+                    }
+                }
+                // The undecided CONDITION behind it: follow Sels through
+                // their known conditions (and a comparison's Sel operands)
+                // to the first condition the lane cannot decide.
+                let mut cur = n;
+                for _ in 0..12 {
+                    let nd = self.fused.get(cur);
+                    let next = match nd.op {
+                        Op::Sel => match vals[nd.args[0] as usize] {
+                            Val::Bool(Some(true)) => Some(nd.args[1]),
+                            Val::Bool(Some(false)) => Some(nd.args[2]),
+                            _ => {
+                                let c = nd.args[0];
+                                let cn = self.fused.get(c);
+                                let cargs: Vec<String> = cn
+                                    .args
+                                    .iter()
+                                    .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
+                                    .collect();
+                                eprintln!("[kernel]     undecided condition {} {:?} = {:?}; args {}", c, cn.op, vals[c as usize], cargs.join(", "));
+                                // and one level into the comparison's operands
+                                for &a in &cn.args {
+                                    let an = self.fused.get(a);
+                                    if matches!(an.op, Op::Sel) {
+                                        let aargs: Vec<String> = an.args.iter().map(|&b| format!("{}={:?}<{:?}>", b, self.fused.get(b).op, vals[b as usize])).collect();
+                                        eprintln!("[kernel]       operand {} Sel; args {}", a, aargs.join(", "));
+                                    }
+                                }
+                                None
+                            }
+                        },
+                        Op::Le | Op::Ge | Op::Lt | Op::Gt | Op::Eq | Op::SplitOk(_) => {
+                            nd.args.iter().copied().find(|&a| matches!(self.fused.get(a).op, Op::Sel))
+                        }
+                        _ => None,
+                    };
+                    match next {
+                        Some(x) => cur = x,
+                        None => break,
+                    }
+                }
             }
         }
     }
@@ -899,6 +1080,25 @@ fn ival_raw(av: AV) -> (i32, i32) {
 
 /// `zb_holds` of a Bool root: the lanes where it is KNOWN-TRUE (val & known).
 /// `val` at +0, `known` at +2 of the 128-byte slot.
+/// A body's `live` per lane: KNOWN-TRUE or UNKNOWN. An unknown guard is
+/// a branch condition on a value the lane holds an INTERVAL of (a
+/// bucketed speed: `spd.x ~= 0` on `[0, 1)`), which the tracer could not
+/// merge away - the two arms have different shapes, or the merged guard
+/// `Or(g & c, g & !c)` is itself unknown where `c` is. The lane stands
+/// for points on both sides, so the body's hull covers some of them:
+/// emitting the row over-approximates (a finer level, where the speed is
+/// exact and `c` decided, refutes the spurious half), while NOT emitting
+/// it loses real successors. Before this read unknown as not-live, and
+/// room (2,0) under `CELESTE_SPD_LADDER=level0` silently dropped lanes
+/// in 813 slices of its first 32 frames (2026-09-14). `ok` keeps the
+/// strict reading: an undecided OBLIGATION is a decline.
+fn read_zb_live(buf: &[u8], root: usize) -> u16 {
+    let off = root * 128;
+    let val = u16::from_le_bytes([buf[off], buf[off + 1]]);
+    let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
+    val | !known
+}
+
 fn read_zb_holds(buf: &[u8], root: usize) -> u16 {
     let off = root * 128;
     let val = u16::from_le_bytes([buf[off], buf[off + 1]]);
@@ -1201,6 +1401,27 @@ fn build_one_shape(
         flat_roots.push(h1);
         flat_roots.push(h2);
     }
+    // One output SLOT per DISTINCT root node. Bodies share most of their
+    // roots (a fork configuration changes a handful of fields), and the
+    // kernel writes every slot per slice: room (2,0)'s level-0 bucket set
+    // has a 6,369-body shape whose bodies' roots concatenated were ~255k
+    // slots - 32 MB of stores per 16-lane slice, most of them the same
+    // value again (2026-09-14). `slot_of[k]` is the slot of concatenated
+    // root k.
+    let mut slot_of: Vec<usize> = Vec::with_capacity(flat_roots.len());
+    let mut distinct: Vec<crate::transpile::graph::NodeId> = Vec::new();
+    {
+        let mut index: std::collections::HashMap<crate::transpile::graph::NodeId, usize> =
+            std::collections::HashMap::with_capacity(flat_roots.len());
+        for &n in &flat_roots {
+            let slot = *index.entry(n).or_insert_with(|| {
+                distinct.push(n);
+                distinct.len() - 1
+            });
+            slot_of.push(slot);
+        }
+    }
+    let flat_roots = distinct;
     let (compiled, loaded) = crate::transpile::asm::compile_and_load_reprs(
         &fused,
         &flat_roots,
@@ -1209,9 +1430,8 @@ fn build_one_shape(
     )
     .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
 
-    // Map each fused body's roots onto flat root SLOTS. `flat_roots` is the
-    // bodies' roots concatenated in order, and `compile` keeps root k at slot
-    // k, so a running offset locates each body.
+    // Map each fused body's roots onto their SLOTS: the bodies' roots
+    // concatenated in order, through `slot_of`.
     let mut off = 0usize;
     let mut asm_bodies = Vec::with_capacity(bodies.len());
     for (bi, b) in bodies.iter().enumerate() {
@@ -1227,16 +1447,17 @@ fn build_one_shape(
         let fields = (0..nfields)
             .map(|j| AsmField {
                 cell: outputs[j].0 as usize,
-                root: off + j,
-                kind: compiled.root_kinds[off + j],
+                root: slot_of[off + j],
+                kind: compiled.root_kinds[slot_of[off + j]],
             })
             .collect();
         asm_bodies.push(AsmBody {
             outcome: b.outcome,
+            splits: b.splits,
             fields,
-            ok_root: off + nfields,
-            live_root: off + nfields + 1,
-            key_roots: key_roots[bi],
+            ok_root: slot_of[off + nfields],
+            live_root: slot_of[off + nfields + 1],
+            key_roots: (slot_of[key_roots[bi].0], slot_of[key_roots[bi].1]),
             pos: None,
         });
         off += b.roots.len();

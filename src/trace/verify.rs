@@ -190,6 +190,16 @@ pub fn trace_frame<'a>(
         Some(super::widen::WidenMode::RemRung(crate::interpreter::abstraction::RemPrecision::Bits(k), _)) => k,
         _ => 0,
     });
+    // The `move` fork's arity: three under a bucketed speed (see
+    // `Domain::move_ways`), two otherwise.
+    it.d.move_ways = match widen {
+        Some(super::widen::WidenMode::Level0(spd)) | Some(super::widen::WidenMode::RemRung(_, spd))
+            if matches!(spd, crate::interpreter::abstraction::SpdPrecision::WidthLog2(_)) =>
+        {
+            3
+        }
+        _ => 2,
+    };
     // One frame has exactly six free choices, `Free(0..5)`. The counter
     // is on the domain rather than the frame, so tracing a SECOND frame
     // through one interpreter - which compiling per pm1 key does - would

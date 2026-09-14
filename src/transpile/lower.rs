@@ -63,6 +63,7 @@ pub(crate) fn specialize_frame(
 ) -> (Graph, Vec<(usize, u8, u64, Vec<NodeId>)>) {
     let trace = std::env::var_os("CELESTE_BUILD_TRACE").is_some();
     let t0 = std::time::Instant::now();
+    assert!(forks <= 32, "{forks} forks: the split mask holds two bits per fork");
     // --- 1. which forks each outcome actually depends on ---
     let cones = graph.split_cones();
     let bits_of = |fields: &[NodeId], ok: NodeId, live: NodeId| -> Vec<u8> {
@@ -104,13 +105,20 @@ pub(crate) fn specialize_frame(
             v.sort_unstable();
             v
         };
+        // Every fork configuration: mixed radix over the forks' arities
+        // (`Graph::fork_ways`), two bits per fork in the split mask.
+        let ways: Vec<u64> = bits.iter().map(|&d| graph.fork_ways(d) as u64).collect();
+        let total: u64 = ways.iter().product();
+        if trace {
+            eprintln!("[build]   outcome {oi}: forks {bits:?} ways {ways:?} -> {total} configurations x {} button reps", reps.len());
+        }
         for m in reps {
-            for k in 0..(1u64 << bits.len()) {
+            for k in 0..total {
                 let mut sm = 0u64;
+                let mut r = k;
                 for (i, d) in bits.iter().enumerate() {
-                    if k & (1 << i) != 0 {
-                        sm |= 1u64 << d;
-                    }
+                    sm |= (r % ways[i]) << (2 * d);
+                    r /= ways[i];
                 }
                 let map = graph.specialize_subset_into(m, Some(sm), Some(&need), &mut sp);
                 let roots: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();

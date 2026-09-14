@@ -578,33 +578,34 @@ impl<'a> Lower<'a> {
         let fh = self.flr(a[1]);
         self.mask_eq(fl, fh)
     }
-    /// `zi_span_ok`: does it span at most two floors?
-    fn zi_span_ok(&mut self, a: [Vreg; 2]) -> Vreg {
+    /// `zi_span_ok(a, ways)`: does it span at most `ways` grid cells?
+    fn zi_span_ok(&mut self, a: [Vreg; 2], ways: u8) -> Vreg {
         let (step, _) = self.grid();
         let fl = self.flr_grid(a[0]);
         let fh = self.flr_grid(a[1]);
-        let e0 = self.mask_eq(fl, fh);
-        let one = self.dbin_c(ROp::AddD, fl, step);
-        let e1 = self.mask_eq(fh, one);
-        self.dbin(ROp::OrD, e0, e1)
+        let top = self.dbin_c(ROp::AddD, fl, step * (ways as i32 - 1));
+        // fh <= fl + (ways - 1) * step  (vpcmpd LE)
+        self.cmp(2, fh, Src::Reg(top))
     }
-    /// `zi_fork_flr(a, c)`: (fragment interval, valid mask).
+    /// `zi_fork_flr(a, c)`: (fragment interval, valid mask). Fragment
+    /// `c` is the `c`-th grid cell from the low end's, clipped to the
+    /// interval; valid iff the interval reaches it.
     fn zi_fork_flr(&mut self, a: [Vreg; 2], c: u8) -> ([Vreg; 2], Vreg) {
         let (step, _) = self.grid();
         let fl = self.flr_grid(a[0]);
-        let fh = self.flr_grid(a[1]);
-        let one = self.dbin_c(ROp::AddD, fl, step);
-        let two = self.mask_eq(fh, one);
-        let all = self.num_reg(NumVal::ConstI32(-1));
+        let base = if c == 0 { fl } else { self.dbin_c(ROp::AddD, fl, step * c as i32) };
+        let top = self.dbin_c(ROp::AddD, base, step - 1);
+        let hi = self.dbin(ROp::MinSD, a[1], top);
         if c == 0 {
-            // hi = two ? (fh - 1 raw) : a.hi ; valid = ALL
-            let below = self.dbin_c(ROp::AddD, fh, -1);
-            let hi = self.vsel(two, below, a[1]);
+            // lo = a.lo (its own cell's base is at or below it); valid = ALL
+            let all = self.num_reg(NumVal::ConstI32(-1));
             ([a[0], hi], all)
         } else {
-            // lo = two ? fh : a.lo ; valid = two
-            let lo = self.vsel(two, fh, a[0]);
-            ([lo, a[1]], two)
+            let fh = self.flr_grid(a[1]);
+            let lo = self.dbin(ROp::MaxSD, a[0], base);
+            // base <= fh  (vpcmpd LE)
+            let valid = self.cmp(2, base, Src::Reg(fh));
+            ([lo, hi], valid)
         }
     }
     /// `zi_cmp`: tri-state (val, known) for an ORDERED interval comparison.
@@ -1108,10 +1109,10 @@ impl<'a> Lower<'a> {
                 let (_, ok) = self.zi_fork_flr(ar, *c);
                 Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
             }
-            Op::SplitOk => {
+            Op::SplitOk(ways) => {
                 let iv = self.as_ival(a[0])?;
                 let ar = self.ival_regs(iv);
-                let ok = self.zi_span_ok(ar);
+                let ok = self.zi_span_ok(ar, *ways);
                 Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
             }
             Op::Div | Op::Rem | Op::Sin | Op::Mget => {

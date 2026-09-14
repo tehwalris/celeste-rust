@@ -256,8 +256,13 @@ pub enum Op {
     SplitValid(u8),
     /// `Split(d)` after specialization: fragment `c` of an interval,
     /// `c` being a CONCRETE fork configuration rather than a runtime
-    /// loop variable. `Frag` narrows, `FragOk` says whether the fragment
-    /// is non-empty - together they are exactly `zi_fork_flr(x, c)`.
+    /// loop variable. Fragment `c` is the interval's `c`-th grid cell
+    /// counted from the cell its low end lies in, clipped to the
+    /// interval: `Frag` narrows to it, `FragOk` says whether the
+    /// interval reaches it - together they are exactly
+    /// `zi_fork_flr(x, c)`. How many fragments a fork HAS is the fork's
+    /// arity (`Graph::fork_ways`): 2 for every fork but the player's
+    /// `move` under a bucketed speed, which is 3 (`Symbolic::move_ways`).
     ///
     /// Ordinary unary ops, which is the whole point: they intern and
     /// fold like anything else, so the configurations SHARE every node
@@ -265,14 +270,14 @@ pub enum Op {
     /// frame once per configuration. See `specialize_into`.
     Frag(u8),
     FragOk(u8),
-    /// `SplitOk` over the same operand: does this lane's interval span at
-    /// most TWO floors? Below that the split is exact; above it there is
-    /// no third outcome to put the remaining fragment in, so the lane
-    /// deopts. OUTCOME-INDEPENDENT, hence no index - and unindexed on
-    /// purpose, so two splits of the same operand share the one node. It
-    /// exists so the validity chain accounts for every lane
-    /// `zi_fork_flr` gives up on.
-    SplitOk,
+    /// `SplitOk(n)` over the same operand: does this lane's interval span
+    /// at most `n` floors, `n` being the fork's arity? Below that the
+    /// fragments partition the lane; above it there is no fragment to
+    /// put the rest in, so the lane deopts. OUTCOME-INDEPENDENT (indexed
+    /// by the arity, not the outcome), so every configuration of one
+    /// fork shares the one node. It exists so the validity chain
+    /// accounts for every lane `zi_fork_flr` gives up on.
+    SplitOk(u8),
 
     // ---- cart lookups ----
     Mget,
@@ -319,6 +324,9 @@ pub struct Graph {
     /// settles both the integer move and the bucket the new rem lands in
     /// (plans/waves.md "The finer rungs").
     fork_bits: u8,
+    /// Per fork `d`, how many fragments it has (absent = 2). Set by the
+    /// tracer's `fork_flr`; read by the specialization's enumeration.
+    fork_ways: Vec<u8>,
 }
 
 impl Graph {
@@ -329,7 +337,23 @@ impl Graph {
     /// An empty graph on the same fork grid: what every pass that builds
     /// an output graph from this one starts from.
     pub fn like(&self) -> Self {
-        Graph { fork_bits: self.fork_bits, ..Default::default() }
+        Graph { fork_bits: self.fork_bits, fork_ways: self.fork_ways.clone(), ..Default::default() }
+    }
+
+    /// Fork `d`'s arity: how many fragments `Split(d)` resolves to.
+    pub fn fork_ways(&self, d: u8) -> u8 {
+        self.fork_ways.get(d as usize).copied().unwrap_or(2)
+    }
+
+    /// Give fork `d` (at least) `ways` fragments. Monotone: a value forked
+    /// twice (`fork_memo`) keeps the wider request, since each site's own
+    /// `SplitOk` premise is what bounds the lanes IT admits.
+    pub fn set_fork_ways(&mut self, d: u8, ways: u8) {
+        debug_assert!((2..=4).contains(&ways), "fork arity {ways}: 2 bits per fork in the split mask");
+        if self.fork_ways.len() <= d as usize {
+            self.fork_ways.resize(d as usize + 1, 2);
+        }
+        self.fork_ways[d as usize] = self.fork_ways[d as usize].max(ways);
     }
 
     pub fn fork_bits(&self) -> u8 {
@@ -459,7 +483,6 @@ impl Graph {
         splits: Option<u64>,
         out: &mut Graph,
     ) -> Vec<NodeId> {
-        out.fork_bits = self.fork_bits;
         self.specialize_subset_into(frees, splits, None, out)
     }
 
@@ -483,6 +506,7 @@ impl Graph {
         out: &mut Graph,
     ) -> Vec<NodeId> {
         out.fork_bits = self.fork_bits;
+        out.fork_ways = self.fork_ways.clone();
         const UNBUILT: NodeId = NodeId::MAX;
         let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
         for (i, node) in self.nodes.iter().enumerate() {
@@ -495,20 +519,21 @@ impl Graph {
             let arg = |map: &Vec<NodeId>, k: usize| map[node.args[k] as usize];
             let id = match (node.op.clone(), splits) {
                 (Op::Free(b), _) => out.leaf(Op::ConstBool(frees & (1 << b) != 0)),
-                // `d` indexes a fork, and `splits` is one bit per fork.
-                // It is a `u64` rather than a `u8` because room (2,0)
-                // forks 14 times and `(s >> 13) & 1` on a `u8` is
-                // always 0 - which would have silently measured 16,384
-                // configurations as 256 distinct ones and reported the
-                // collapse as sharing. Fourth member of the
-                // shift-overflow family; see `ChoiceSet`.
+                // `d` indexes a fork, and `splits` is TWO bits per fork
+                // (the fragment index, arity up to 4). It is a `u64`
+                // rather than a `u8` because room (2,0) forks 14 times
+                // and `(s >> 13) & 1` on a `u8` is always 0 - which
+                // would have silently measured 16,384 configurations
+                // as 256 distinct ones and reported the collapse as
+                // sharing. Fourth member of the shift-overflow family;
+                // see `ChoiceSet`.
                 (Op::Split(d), Some(s)) => {
-                    debug_assert!((d as u32) < u64::BITS, "fork {} past a u64 split mask", d);
-                    out.fold(Op::Frag(((s >> d) & 1) as u8), vec![arg(&map, 0)])
+                    debug_assert!((2 * d as u32) < u64::BITS, "fork {} past a u64 split mask", d);
+                    out.fold(Op::Frag(((s >> (2 * d)) & 3) as u8), vec![arg(&map, 0)])
                 }
                 (Op::SplitValid(d), Some(s)) => {
-                    debug_assert!((d as u32) < u64::BITS, "fork {} past a u64 split mask", d);
-                    out.fold(Op::FragOk(((s >> d) & 1) as u8), vec![arg(&map, 0)])
+                    debug_assert!((2 * d as u32) < u64::BITS, "fork {} past a u64 split mask", d);
+                    out.fold(Op::FragOk(((s >> (2 * d)) & 3) as u8), vec![arg(&map, 0)])
                 }
                 _ => {
                     let args: Vec<NodeId> =
@@ -563,12 +588,11 @@ impl Graph {
             })
         };
         match op {
-            // Fragment 0 of any interval is non-empty, always: a single
-            // floor keeps the whole interval, two floors keep the lower
-            // one, and more than two floors also route the lane through
-            // configuration 0 (`zi_span_ok` is what takes it off the
-            // kernel). So `FragOk(0)` is a constant, and folding it is
-            // what makes configuration 0 as cheap as no fork at all.
+            // Fragment 0 of any interval is non-empty, always: it is the
+            // cell the low end lies in, whatever the span (`zi_span_ok`
+            // is what takes an over-wide lane off the kernel). So
+            // `FragOk(0)` is a constant, and folding it is what makes
+            // configuration 0 as cheap as no fork at all.
             //
             // EXACT, not a refinement: `eval`'s `FragOk(0)` arm returns
             // `Some(true)` for every operand, and the two are checked
@@ -849,18 +873,22 @@ impl Graph {
                 // form is `zi_span_ok`, runtime-only), so it becomes TOP
                 // under narrow-top eval - like `Mget`/`TileFlagAt`
                 // without a room - and only errors under strict eval.
-                Op::SplitOk if !strict_err => Val::Bool(None),
-                Op::SplitOk => bail!("node {}: SplitOk needs the interval's floor span", i),
-                // The RESOLVED fork: `zi_fork_flr`'s three cases, on one
-                // interval instead of sixteen lanes. Exact, and it is
-                // the definition `fold`'s `FragOk(0)` rule is checked
+                Op::SplitOk(_) if !strict_err => Val::Bool(None),
+                Op::SplitOk(_) => bail!("node {}: SplitOk needs the interval's floor span", i),
+                // The RESOLVED fork: `zi_fork_flr`, on one interval
+                // instead of sixteen lanes. Exact, and it is the
+                // definition `fold`'s `FragOk(0)` rule is checked
                 // against.
                 Op::Frag(c) | Op::FragOk(c) => {
                     let iv = a(0).as_num("Frag")?;
                     let (step, mask) = self.grid();
                     let gflr = |p: Pico8Num| Pico8Num::from_raw(p.as_raw_u32() as i32 & mask);
                     let (fl, fh) = (gflr(iv.low), gflr(iv.high));
-                    let two = fh == Pico8Num::from_raw(fl.as_raw_u32() as i32 + step);
+                    // Cells the interval spans, minus one: `fh = fl + n * step`.
+                    // In i64: the full-range hull (`i32::MIN..=i32::MAX`)
+                    // overflows the subtraction.
+                    let n = (fh.as_raw_u32() as i32 as i64 - fl.as_raw_u32() as i32 as i64) / step as i64;
+                    let c = *c as i64;
                     // Under `lenient` the operand is a HULL over many lanes,
                     // not one lane's interval, and `two` is not a property
                     // a hull inherits: a lane inside a 40-floor hull can
@@ -877,26 +905,30 @@ impl Graph {
                     // floor is that lane's whole interval, which the
                     // "exactly two floors" split below would exclude.
                     if lenient {
-                        return Ok(match (&node.op, *c) {
+                        return Ok(match (&node.op, c) {
                             (Op::Frag(_), _) => a(0),
                             (_, 0) => Val::Bool(Some(true)),
-                            _ if fl == fh => Val::Bool(Some(false)),
+                            // A hull spanning fewer cells than fragment
+                            // `c` needs contains no lane that reaches it.
+                            _ if n < c => Val::Bool(Some(false)),
                             _ => Val::Bool(None),
                         });
                     }
-                    match (&node.op, *c) {
-                        // Exactly two floors: fragment 0 is everything
-                        // below the boundary, fragment 1 everything from
-                        // it up. One floor, or more than two, leaves the
-                        // interval alone in both fragments - fragment 1
-                        // is simply not valid there.
-                        (Op::Frag(_), 0) if two => {
-                            Val::Num(Pico8NumInterval::new(iv.low, fh.next_smallest()))
+                    // Fragment `c` is the `c`-th cell from the low end's,
+                    // clipped to the interval; valid iff the interval
+                    // reaches it. An interval that does not keeps its
+                    // whole value there (the fragment is invalid, so the
+                    // value is never taken).
+                    let valid = n >= c;
+                    match &node.op {
+                        Op::Frag(_) if valid => {
+                            let base = fl.as_raw_u32() as i32 as i64 + c * step as i64;
+                            let lo = (iv.low.as_raw_u32() as i32 as i64).max(base);
+                            let hi = (iv.high.as_raw_u32() as i32 as i64).min(base + step as i64 - 1);
+                            Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(lo as i32), Pico8Num::from_raw(hi as i32)))
                         }
-                        (Op::Frag(_), _) if two => Val::Num(Pico8NumInterval::new(fh, iv.high)),
-                        (Op::Frag(_), _) => a(0),
-                        (_, 0) => Val::Bool(Some(true)),
-                        _ => Val::Bool(Some(two)),
+                        Op::Frag(_) => a(0),
+                        _ => Val::Bool(Some(valid)),
                     }
                 }
                 Op::Cell(c) => match cells.get(c) {
@@ -1017,6 +1049,18 @@ impl Graph {
                 Op::TileFlagAt if room.is_some() => {
                     Self::tile_flag_over(room.unwrap(), a(0), a(1), a(2), a(3), a(4))?
                 }
+                // `mget` on EXACT coordinates, the only form the kernels
+                // take (`zn_mget` panics on a fractional or out-of-range
+                // one); an interval coordinate is TOP.
+                Op::Mget if room.is_some() => {
+                    let (x, y) = (a(0).as_num("Mget")?, a(1).as_num("Mget")?);
+                    if x.low != x.high || y.low != y.high {
+                        bail!("node {}: mget over an interval coordinate", i);
+                    }
+                    let t = room.unwrap().cart.mget(x.low, y.low)?;
+                    let t = Pico8Num::from_i16(t as i16);
+                    Val::Num(Pico8NumInterval::new(t, t))
+                }
                 Op::Mget | Op::TileFlagAt => {
                     bail!("{:?} needs the cart; not supported by the pure evaluator yet", node.op)
                 }
@@ -1055,7 +1099,7 @@ impl Graph {
             Op::ConstBool(_)
             | Op::Free(_)
             | Op::SplitValid(_)
-            | Op::SplitOk
+            | Op::SplitOk(_)
             | Op::FragOk(_)
             | Op::Lt
             | Op::Le

@@ -459,6 +459,33 @@ against 4:51 for the whole exact-speed search). plans/architecture.md
 "Deferred follow-ups": the census-driven automatic choice, galloping
 horizons, persisting the finer levels across horizons (after room 2).
 
+A bucketed speed changes the `move` fork's ARITY. `move` runs before
+`update`, so it normally sees the boundary's integer-aligned bucket and
+`rem + spd + 0.5` spans exactly two floors - but an object that updates
+BEFORE the player can rewrite the player's speed first (the spring:
+`hit.spd.x *= 0.2`), and a misaligned bucket plus a full-width rem spans
+THREE (room (2,0) f36: `KERNEL COVERAGE GAP`, `SplitOk` false,
+2026-09-14). So every fork has an arity (`Graph::fork_ways`, 2 bits per
+fork in the split mask): 2 everywhere, 3 for the player's `move` under a
+`WidthLog2` speed (`Symbolic::move_ways`, set by `trace_frame` from the
+widen mode). Fragment `c` is the `c`-th floor from the low end's
+(`zi_fork_flr`), and `SplitOk(n)` is the runtime premise that a lane
+spans at most `n` - so an arity that is too small is a fatal decline,
+never a lost row. The price is configurations: 3x3 instead of 2x2 for
+the two move forks of the level-0 bucket set only; the exact-speed sets
+(the default, and every finer level) are unchanged and reproduce the
+pinned gates.
+
+An interval speed also leaves branch conditions on it UNDECIDED per
+lane, and where the arms cannot merge the body's `live` is unknown. The
+kernel reads an unknown `live` as live (`read_zb_live`: the row's hull
+covers both sides, emitting over-approximates and the exact-speed levels
+refute); reading it as not-live silently dropped lanes, which is what
+every speed-bucket run before 2026-09-14 did. `ok` stays strict. The
+result of all this is in BENCHMARK_DATA.md: the bucket is sound and a
+loss on room (2,0) (the hulls at every speed condition over-approximate
+past the census's 19x), so `exact` remains the default.
+
 ## Useful entry points
 
 ```bash

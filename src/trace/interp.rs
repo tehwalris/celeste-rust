@@ -1717,8 +1717,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                 if !self.d.is_interval(&x) {
                     (st, args[0].clone())
                 } else {
-                    let (v, valid) = self.d.fork_flr(&x);
-                    let premise = self.d.span_ok(&x);
+                    let ways = self.d.move_ways();
+                    let (v, valid) = self.d.fork_flr(&x, ways);
+                    let premise = self.d.span_ok(&x, ways);
                     let mut st = st;
                     st.guard = self.d.and(&st.guard, &valid);
                     st.ok = self.d.and(&st.ok, &premise);

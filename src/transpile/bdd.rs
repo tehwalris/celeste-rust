@@ -205,7 +205,7 @@ fn inherently_bool(op: &Op) -> bool {
             | Op::Or
             | Op::Known
             | Op::SplitValid(_)
-            | Op::SplitOk
+            | Op::SplitOk(_)
             | Op::Free(_)
             | Op::Lt
             | Op::Le

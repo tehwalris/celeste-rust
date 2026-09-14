@@ -1,3 +1,58 @@
+# The speed bucket on room (2,0): fork arity, the silent drop, slot dedup (2026-09-14, release, 16 threads)
+
+Three findings from making `CELESTE_SPD_LADDER=level0` run on room (2,0)
+(the run that hit `KERNEL COVERAGE GAP` at f36).
+
+**1. The gap: `move` needs a 3-way fork under a bucketed speed.** `move`
+runs before `update`, so it normally sees the integer-aligned bucket and
+`rem + spd + 0.5` spans two floors; the spring's update runs BEFORE the
+player's move and does `hit.spd.x *= 0.2`, and `[5, 6) * 0.2 =
+[0.99998, 1.2)` plus a full-width rem spans three. Every fork now has an
+arity (`Graph::fork_ways`; 3 for the player's move under a `WidthLog2`
+speed, 2 everywhere else), `Frag(c)` is the c-th floor slice, and
+`SplitOk(n)` is the runtime premise. Cost: the level-0 bucket set's
+bodies, room (2,0) main shape 1,862 -> 6,369 (exact set: 688); room (1,0)
+400 -> 952. Exact-speed sets unchanged (gates identical).
+
+**2. The silent drop.** With an interval speed, a branch condition on it
+(`spd.x ~= 0`, `abs(spd.x) > maxrun`, ...) is undecided per lane; where
+the two arms could not merge (different shapes) or the merged guard
+`Or(g & c, g & !c)` stays unknown, `live` was UNKNOWN and the kernel read
+that as not-live. The pre-change binary (e1f4f9a) dropped lanes in 813
+slices of room (2,0)'s first 32 frames; every earlier speed-bucket number
+(the ladder table below, the room (1,0) speed-ladder loss) ran on that
+under-approximation. Fixed: an unknown `live` EMITS (over-approximates;
+the exact-speed levels refute the spurious half), `ok` stays strict.
+Level-0 bucket frontier, room (2,0) f32: 18,394 kept (dropping) ->
+36,152 (exact speed: 14,028).
+
+**3. Output-slot dedup.** Each body had its own slot for every root, and
+the kernel stores every slot per 16-lane slice: 6,369 bodies x ~40 roots
+= 32 MB of stores per slice. Slots are now per distinct root node.
+
+| room (2,0) f32 wave | before | after dedup |
+|---|---|---|
+| exact speed (688 bodies) | 137 ms | 80 ms |
+| 1 px bucket (6,369 bodies) | 12,325 ms | 2,573 ms |
+
+**The verdict on the bucket.** Sound now, and a LOSS on room (2,0): the
+Sel hulls at every condition on the speed over-approximate far beyond
+the census (which bucketed the exact run's states - a partition, not the
+abstract dynamics).
+
+| room (2,0) level 0 | exact speed | 1 px bucket |
+|---|---|---|
+| f32 kept | 14,028 | 36,152 |
+| f47 kept | - | 7,682,937 (peak), 249 s/frame |
+| f50 kept / frame | 4.5M / 23 s | 4,511,428 / 169 s |
+| wave total to f50 | not measured (f50 alone 23 s) | 1,784 s |
+
+Per-lane the bucket kernel is ~7x the exact one at f50 (bodies), and the
+frontier is no smaller. Recovering the precision would take forks on the
+straddled conditions (a partition instead of a hull), i.e. the exact
+run's case split again, at fork-configuration prices. Not pursued; the
+default stays exact speed.
+
 # Ladder orderings on synthetic targets (2026-09-14, release, `CELESTE_LADDER`)
 
 `rewrite search --win-at` with four ladders; `tools/ladder_model.py` sums

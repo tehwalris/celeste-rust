@@ -348,10 +348,13 @@ pub fn zi_flr(a: ZI) -> ZN {
 /// at most TWO floors, so the two fork outcomes can represent it. A
 /// boundary-widened interval has width < 1 and always passes.
 #[inline(always)]
-pub fn zi_span_ok(a: ZI, bits: u8) -> ZB {
+pub fn zi_span_ok(a: ZI, bits: u8, ways: u8) -> ZB {
     let (step, mask) = grid(bits);
     let (fl, fh) = (zn_flr_grid(a.lo, mask), zn_flr_grid(a.hi, mask));
-    ZB { val: mask_eq(fl, fh) | mask_eq(fh, zn_add(fl, zn_splat(step))), known: ALL }
+    // At most `ways` cells: the high end's cell is within `ways - 1`
+    // steps of the low end's.
+    let top = zn_add(fl, zn_splat(P8::from_raw(step.as_raw_u32() as i32 * (ways as i32 - 1))));
+    ZB { val: mask_le(fh, top), known: ALL }
 }
 
 /// The fork grid for `bits` (`Graph::fork_bits`): one step of `2^-bits`
@@ -510,35 +513,31 @@ pub fn zsel_b(c: ZB, t: ZB, f: ZB) -> ZB {
 
 // ---- refinement splits ----
 
-/// __split_by_flr as a <=2-way FORK (plans/kernel-plan.md K2): a
-/// boundary-widened interval has width < 1, so it spans at most two
-/// floors. Fragment 0 is the low-floor part (always non-empty);
-/// fragment 1 is the high-floor part (empty on single-floor lanes).
-/// Returns (fragment `c` per lane, valid mask); a lane with an empty
-/// fragment simply produces no row in this fork configuration. Lanes
-/// spanning >2 floors cannot be represented by two outcomes - they stay
-/// valid in outcome 0 only, so the driver sees them exactly once, and
-/// `zi_span_ok` is the premise that filters them out.
+/// __split_by_flr as an n-way FORK (plans/kernel-plan.md K2): a
+/// boundary-widened rem has width < 1 and an exact speed, so `rem +
+/// spd + 0.5` spans at most two floors and the fork has two fragments;
+/// under a BUCKETED speed the player's `move` fork has three (the
+/// spring's `spd.x *= 0.2` misaligns the bucket, 2026-09-14). Fragment
+/// `c` is the `c`-th floor from the low end's, clipped to the lane;
+/// fragment 0 is always non-empty. Returns (fragment `c` per lane,
+/// valid mask); a lane with an empty fragment simply produces no row in
+/// this fork configuration. A lane spanning more floors than the fork
+/// has fragments is what `zi_span_ok` (the premise) takes off the
+/// kernel.
 #[inline(always)]
 pub fn zi_fork_flr(a: ZI, c: usize, bits: u8) -> (ZI, u16) {
     let (step, mask) = grid(bits);
+    let step = step.as_raw_u32() as i32;
     let (fl, fh) = (zn_flr_grid(a.lo, mask), zn_flr_grid(a.hi, mask));
-    // The one case that actually splits: the interval spans EXACTLY two
-    // floors, so fragment 0 is everything below the boundary and
-    // fragment 1 everything from it up. One floor needs no split, and
-    // more than two cannot be represented by two fragments - those
-    // lanes stay whole and go down configuration 0, where `zi_span_ok`
-    // is what takes them off the kernel.
-    let two = mask_eq(fh, zn_add(fl, zn_splat(step)));
-    unsafe {
-        if c == 0 {
-            // `next_smallest` is minus one raw unit.
-            let below = _mm512_sub_epi32(fh.0, _mm512_set1_epi32(1));
-            (ZI { lo: a.lo, hi: ZN(_mm512_mask_blend_epi32(two, a.hi.0, below)) }, ALL)
-        } else {
-            (ZI { lo: ZN(_mm512_mask_blend_epi32(two, a.lo.0, fh.0)), hi: a.hi }, two)
-        }
-    }
+    // Fragment `c` is the `c`-th grid cell from the one the low end
+    // lies in, clipped to the interval, and valid iff the interval
+    // reaches that cell. The fragments of a fork of arity `n` partition
+    // every lane spanning at most `n` cells; a wider lane is what
+    // `zi_span_ok` takes off the kernel.
+    let base = zn_add(fl, zn_splat(P8::from_raw(step * c as i32)));
+    let top = zn_add(base, zn_splat(P8::from_raw(step - 1)));
+    let valid = if c == 0 { ALL } else { mask_le(base, fh) };
+    (ZI { lo: zn_max(a.lo, base), hi: zn_min(a.hi, top) }, valid)
 }
 
 // ---- cart / collision builtins (per-lane; x/y vary, w/h/flag uniform) ----

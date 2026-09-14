@@ -279,13 +279,13 @@ impl Domain for RefDomain {
         }
     }
 
-    fn fork_flr(&mut self, v: &Iv) -> (Iv, bool) {
+    fn fork_flr(&mut self, v: &Iv, _ways: u8) -> (Iv, bool) {
         let n = floor_span(v);
         let k = self.cursor.choose(n);
         (floor_fragment(v, k), true)
     }
 
-    fn span_ok(&mut self, _v: &Iv) -> bool {
+    fn span_ok(&mut self, _v: &Iv, _ways: u8) -> bool {
         // We fork on the ACTUAL floor span, so the premise holds by construction.
         true
     }
