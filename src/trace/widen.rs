@@ -374,7 +374,11 @@ pub(crate) fn spd_bucket_node(
     old: <Symbolic as Domain>::Num,
     w: u8,
 ) -> Result<RemBucket> {
-    debug_assert!((1..=20).contains(&w), "spd_bucket_node w {} out of 1..=20", w);
+    anyhow::ensure!(
+        (crate::interpreter::abstraction::SPD_MIN_WIDTH_LOG2..=20).contains(&w),
+        "spd_bucket_node w {w}: spd / 2^w raw overflows 16.16 below w = {}",
+        crate::interpreter::abstraction::SPD_MIN_WIDTH_LOG2
+    );
     let width_raw: i32 = 1i32 << w;
     let width = d.num(P8::from_raw(width_raw));
     // The fork is on the RAW value: every fork in the graph cuts at the

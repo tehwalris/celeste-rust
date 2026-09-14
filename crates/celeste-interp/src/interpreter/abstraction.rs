@@ -260,13 +260,17 @@ impl SpdPrecision {
 /// (2,0) (3,200 spd.x values against 60 in rooms (0,0)/(1,0)), and
 /// bucketing them to 1 px collapsed its frontier 19x (BENCHMARK_DATA.md).
 /// `CELESTE_SPD_WIDTH_LOG2=w` overrides the rule for experiments.
+/// The finest speed bucket the bucket node can compute without
+/// overflowing 16.16 (`Level::grid_consistent`): 2^6 raw = 1/1024 px.
+pub const SPD_MIN_WIDTH_LOG2: u8 = 6;
+
 pub fn spd_precision_for(rem: RemPrecision) -> SpdPrecision {
     if let Some(w) = spd_width_override() {
         return SpdPrecision::WidthLog2(w);
     }
     match (spd_ladder_preset(), rem) {
         (SpdLadder::Exact, _) => SpdPrecision::Exact,
-        (SpdLadder::Bucket, RemPrecision::Bits(k)) if k < 16 => SpdPrecision::WidthLog2(16 - k),
+        (SpdLadder::Bucket, RemPrecision::Bits(k)) if k < 16 && 16 - k >= SPD_MIN_WIDTH_LOG2 => SpdPrecision::WidthLog2(16 - k),
         (SpdLadder::Level0Only, RemPrecision::Bits(0)) => SpdPrecision::WidthLog2(16),
         _ => SpdPrecision::Exact,
     }
@@ -316,10 +320,17 @@ impl Level {
     /// Every fork in a rung's graph cuts on ONE grid (2^-k for rem
     /// `Bits(k)`), and a fragment must fit two cells, so a level's spd
     /// bucket is either exact or exactly the grid (`WidthLog2(16 - k)`).
+    /// And the bucket node computes `spd / width` in 16.16: with |spd| up
+    /// to 16 px that is 16 * 2^(16-w), which fits the integer part only
+    /// for w >= `SPD_MIN_WIDTH_LOG2` (w = 1 overflowed: the kernel's
+    /// buckets disagreed with the interpreter's, the filter dropped the
+    /// real states and level 15 refuted a horizon the concrete game wins,
+    /// 2026-09-14). Finer speed buckets than 1/1024 px never paid anyway
+    /// (interval arithmetic at full price for < 4x collapse).
     pub fn grid_consistent(self) -> bool {
         match (self.rem, self.spd) {
             (_, SpdPrecision::Exact) => true,
-            (RemPrecision::Bits(k), SpdPrecision::WidthLog2(w)) => k < 16 && w == 16 - k,
+            (RemPrecision::Bits(k), SpdPrecision::WidthLog2(w)) => k < 16 && w == 16 - k && w >= SPD_MIN_WIDTH_LOG2,
             (RemPrecision::Exact, SpdPrecision::WidthLog2(_)) => false,
         }
     }
@@ -350,8 +361,8 @@ impl Level {
             "x" => SpdPrecision::Exact,
             w => {
                 let w: u8 = w.parse().map_err(|e| format!("level {spec:?}: spd width: {e}"))?;
-                if !(1..=20).contains(&w) {
-                    return Err(format!("level {spec:?}: spd width log2 {w} outside 1..=20"));
+                if !(SPD_MIN_WIDTH_LOG2..=20).contains(&w) {
+                    return Err(format!("level {spec:?}: spd width log2 {w} outside {SPD_MIN_WIDTH_LOG2}..=20 (finer overflows the bucket node)"));
                 }
                 SpdPrecision::WidthLog2(w)
             }
@@ -449,10 +460,11 @@ fn spd_width_override() -> Option<u8> {
                 .parse()
                 .unwrap_or_else(|_| panic!("CELESTE_SPD_WIDTH_LOG2={:?} is not a number", v));
             assert!(
-                (1..=20).contains(&w),
-                "CELESTE_SPD_WIDTH_LOG2={} outside the sane range 1..=20 \
-                 (16 = 1 px/frame buckets)",
-                w
+                (SPD_MIN_WIDTH_LOG2..=20).contains(&w),
+                "CELESTE_SPD_WIDTH_LOG2={} outside the range {}..=20 \
+                 (16 = 1 px/frame buckets; finer overflows the bucket node)",
+                w,
+                SPD_MIN_WIDTH_LOG2
             );
             Some(w)
         }
@@ -1235,7 +1247,8 @@ mod tests {
         match spd_ladder_preset() {
             SpdLadder::Bucket => {
                 assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::WidthLog2(16));
-                assert_eq!(spd_precision_for(RemPrecision::Bits(15)), SpdPrecision::WidthLog2(1));
+                assert_eq!(spd_precision_for(RemPrecision::Bits(10)), SpdPrecision::WidthLog2(6));
+                assert_eq!(spd_precision_for(RemPrecision::Bits(11)), SpdPrecision::Exact, "finer would overflow");
             }
             SpdLadder::Level0Only => {
                 assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::WidthLog2(16));
@@ -1252,6 +1265,7 @@ mod tests {
         assert!(Level::parse_ladder("r0s16,r1s15").is_err(), "must end exact");
         assert!(Level::parse_ladder("r0s16,r1s16,rxsx").is_err(), "spd bucket must be the rem grid");
         assert!(Level::parse_ladder("r0s16,r0s15,rxsx").is_err(), "speed cannot refine on its own");
+        assert!(Level::parse_ladder("r0s16,r15s1,rxsx").is_err(), "W1 overflows the bucket node");
         set_level(Level::EXACT);
         assert_eq!(split_spd_straddles(State::new()).len(), 1);
     }
