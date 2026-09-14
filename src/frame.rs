@@ -676,6 +676,8 @@ pub struct ForwardSink<'a> {
     direct: Vec<(u64, u64, u64)>,
     /// Time spent encoding and writing edge records (this worker).
     pub t_edges: std::time::Duration,
+    /// Time spent in the ladder filter (this worker).
+    pub t_filter: std::time::Duration,
 
     /// This worker's next-frame rows, one piece per shape: the block, its
     /// file seq in the layer (`worker * 256 + k`), and its rows' ids.
@@ -734,6 +736,7 @@ impl<'a> ForwardSink<'a> {
             seen: celeste_engine::kernel::RowCache::new(),
             direct: Vec::new(),
             t_edges: std::time::Duration::ZERO,
+            t_filter: std::time::Duration::ZERO,
             pieces: Default::default(),
             frame: 0,
             worker: 0,
@@ -952,7 +955,12 @@ impl<'a> ForwardSink<'a> {
             // Ladder filter (coarser level's marked set) first: a
             // filtered-out row is never admitted.
             let allow = match self.filter {
-                Some(f) => Some(f.allowed(&slot.to_rt2())?),
+                Some(f) => {
+                    let t_f = std::time::Instant::now();
+                    let a = f.allowed(&slot.to_rt2())?;
+                    self.t_filter += t_f.elapsed();
+                    Some(a)
+                }
                 None => None,
             };
             self.sort_buf.clear();
@@ -1291,6 +1299,7 @@ pub fn forward_frame(
         queue_bytes: usize,
         edge_records: u64,
         t_edges: std::time::Duration,
+        t_filter: std::time::Duration,
         busy: std::time::Duration,
     }
     let done: Vec<Done> = std::thread::scope(|scope| {
@@ -1324,6 +1333,7 @@ pub fn forward_frame(
                         queue_bytes: sink.alloc_bytes(),
                         edge_records: sink.edge_records,
                         t_edges: sink.t_edges,
+                        t_filter: sink.t_filter,
                         busy: t.elapsed(),
                     })
                 }).expect("spawn wave worker")
@@ -1354,6 +1364,7 @@ pub fn forward_frame(
         st.queue_bytes += d.queue_bytes;
         st.edge_records += d.edge_records;
         st.t_edges += d.t_edges;
+        st.t_filter += d.t_filter;
         won |= d.won;
         if let Some(p) = pos {
             p.record_pairs(d.edges.iter().copied());
@@ -1406,6 +1417,8 @@ pub struct FrameStats {
     /// summed time encoding and writing them (thread-time).
     pub edge_records: u64,
     pub t_edges: std::time::Duration,
+    /// The workers' summed time in the ladder filter (thread-time).
+    pub t_filter: std::time::Duration,
     /// The input frontier's row storage, bytes.
     pub bytes_in: usize,
     /// Bytes allocated in the workers' queue pools, and in the door.

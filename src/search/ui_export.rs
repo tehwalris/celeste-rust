@@ -244,7 +244,14 @@ pub fn parse_log(text: &str) -> Result<(Vec<HorizonRun>, Option<f64>, Option<f64
             let t: Vec<&str> = line.split_whitespace().collect();
             let h: u32 = num(t[1]).with_context(ctx)?;
             let level: usize = num(t[3]).with_context(ctx)?;
-            let precision = t[4].trim_matches(|c| c == '(' || c == ')' || c == ':').to_string();
+            // `(Bits(0)):` -> `Bits(0)`: strip exactly the wrapping parens and
+            // the colon (a `trim_matches` on ')' ate the inner one too).
+            let precision = t[4]
+                .strip_suffix("):")
+                .or_else(|| t[4].strip_suffix(')'))
+                .and_then(|s| s.strip_prefix('('))
+                .unwrap_or(t[4])
+                .to_string();
             let refuted = line.contains("NO WIN");
             let (marked, reruns) = if refuted {
                 (None, None)
@@ -818,6 +825,7 @@ OPTIMAL win frame: 3
         assert_eq!(hs[1].levels[0].fwd.len(), 1);
         assert_eq!(hs[1].levels[0].first_win, Some(2));
         assert_eq!(hs[1].levels[1].precision, "Exact");
+        assert_eq!(l0.precision, "Bits(0)", "the inner paren survives");
         let waves = &hs[1].levels[1].fwd[0];
         assert_eq!((waves.emit_ms, waves.emit_idle, waves.own_ms, waves.own_idle, waves.total_ms), (7, 94, 3, 0, 11));
         assert_eq!(waves.rss_gb, 1.28);

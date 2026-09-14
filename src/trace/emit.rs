@@ -249,6 +249,9 @@ pub struct AsmBody {
     pub splits: u64,
     /// `outputs.len() + 2` nodes: fields..., ok, live.
     pub roots: Vec<NodeId>,
+    /// Per fork the body depends on: `(fork, node)` - a lane resolves the
+    /// fork the body's way iff the node holds (`lower::specialize_frame`).
+    pub premises: Vec<(u8, NodeId)>,
 }
 
 /// The FUSED ASM graph, its bodies, the flat root list, and the input
@@ -286,9 +289,9 @@ pub fn asm_fused(
     );
     let mut flat_roots = Vec::new();
     let mut bodies = Vec::with_capacity(raw_bodies.len());
-    for (outcome, frees, splits, roots) in raw_bodies {
+    for (outcome, frees, splits, roots, premises) in raw_bodies {
         flat_roots.extend(roots.iter().copied());
-        bodies.push(AsmBody { outcome, frees, splits, roots });
+        bodies.push(AsmBody { outcome, frees, splits, roots, premises });
     }
     let reprs = asm_input_reprs(bound)?;
     Ok((fused, bodies, flat_roots, reprs))

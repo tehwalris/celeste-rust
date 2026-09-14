@@ -41,6 +41,10 @@ Read these before doing anything substantial:
   runs BEHIND the next frame's wave, and `edges/done.txt` names the last
   frame whose runs are complete: a resume trusts frames up to it and
   discards the rest (at most one).
+- `plans/regions.md` - GUARDED REGIONS in the fused kernels (2026-09-14):
+  why a room with springs ran at 15% body utilization, and how the
+  emitter skips a fork configuration's block when no lane of the slice
+  can take it (`transpile::asm::regions`, `codegen::compile_regions`).
 - `BENCHMARK_DATA.md` - performance baseline, but STALE: every number in it was
   measured against the pre-rebuild search path (the now-deleted
   `run.rs` / `sweep*.rs`) and needs re-benchmarking for `rewrite search`. Keep
@@ -145,9 +149,8 @@ release profile is `lto = "fat"` + `codegen-units = 1`, so a one-line edit
 relinks the whole workspace - ~100 s to run a test that EXECUTES in 6 ms.
 I did this repeatedly on 2026-08-22 before noticing. `[profile.quick]`
 exists for when a test genuinely needs optimization (the compute-bound
-ones: `traced_kernels_reproduce_the_interpreter`,
-`asm_kernels_reproduce_the_interpreter` and its ladder/exact variants,
-`shape_variant_dispatch_reproduces_the_baseline`).
+ones: `every_start_room_kernel_graph_asm_compiles_the_fused_graph`,
+`a_traced_frame_agrees_with_the_oracle`, the `new_ladder_*` tests).
 
 Do NOT run the full suite in plain debug: those same tests are
 compute-bound (`compiled_forward_reproduces_the_interpreter`, since
@@ -210,10 +213,12 @@ visible rather than silent.
 back to it is lower than paying that on every commit. Run them when you
 have a REASON to think they will fire:
 
-- touched the tracer, the lowering, or the ASM codegen -> nothing extra:
-  the `asm_kernels_reproduce_the_interpreter` gates (+ ladder/exact) and
-  `every_start_room_kernel_graph_asm_compiles_the_fused_graph` already
-  run on every commit, and there is no staleness gate to run by hand
+- touched the tracer, the lowering, or the ASM codegen -> nothing extra
+  in the suite (`every_start_room_kernel_graph_asm_compiles_the_fused_graph`,
+  the per-op `transpile::asm::tests`, the `new_ladder_*` tests run on
+  every commit), but DO run the three pinned oracles (ckhash / posgraph /
+  marks, below): they are what checks what the kernels COMPUTE against
+  the frontier sets the reference produced
   because the kernels are assembled at startup, not checked in;
 - touched the tracer's pinning or key walk ->
   `every_reachable_pm1_key_gets_its_own_body`.
@@ -401,10 +406,10 @@ no diff to read: what runs is always what the tracer produces from the
 Lua in this checkout.
 
 The gates on what the kernels COMPUTE:
-`asm_kernels_reproduce_the_interpreter` (plus its ladder/exact
-variants), `every_start_room_kernel_graph_asm_compiles_the_fused_graph`
-(every start-room shape assembles and loads), the per-op bit-exact unit
-tests in `transpile::asm::tests`, and `rewrite ckhash` - the per-frame
+`every_start_room_kernel_graph_asm_compiles_the_fused_graph` (every
+start-room shape assembles and loads), the per-op bit-exact unit tests
+in `transpile::asm::tests`, `a_traced_frame_agrees_with_the_oracle`
+(the tracer against the interpreter), and `rewrite ckhash` - the per-frame
 (key, cell)-set fingerprint of a checkpoint tree. The pinned reference is
 `gates/ckhash_room10_f000-044.txt` (room (1,0), level 0, f0-f44, taken
 2026-09-07 before the block rewrite and reproduced after it and after the

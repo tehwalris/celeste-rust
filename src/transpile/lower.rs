@@ -43,21 +43,37 @@ pub(crate) struct Outcome {
 /// unary ops), so NO fork node survives and configurations that agree
 /// share nodes ("duplicate, then fuse again"). Steps 1-4 of the frame
 /// lowering. Returns the fused graph and one body per DISTINCT (outcome,
-/// roots): `(outcome, frees, splits, roots)`, where `roots` is that
-/// outcome's fields in order, then `ok`, then `live`, as node ids in the
-/// fused graph.
+/// roots): `(outcome, frees, splits, roots, premises)`, where `roots` is
+/// that outcome's fields in order, then `ok`, then `live`, as node ids in
+/// the fused graph, and `premises` is, per fork the body depends on, the
+/// node saying whether a lane resolves that fork the body's way (the
+/// `FragOk` the trace's `SplitValid(d)` became; a constant if the fold
+/// decided it). A lane the body keeps satisfies all of them - they are
+/// what the guarded emission tests before a fork configuration's nodes
+/// (`transpile::asm::regions`).
 ///
 /// This is the SINGLE source of the specialized compute: the AVX-512
 /// backend assembles it (`trace::emit::asm_fused`) and `lower_outcomes`
 /// reads the per-outcome constants off it, so both see byte-for-byte the
 /// same thing - there is no parallel specialization.
+pub(crate) type SpecializedBody = (usize, u8, u64, Vec<NodeId>, Vec<(u8, NodeId)>);
+
 pub(crate) fn specialize_frame(
     graph: &Graph,
     outs: &[(Vec<NodeId>, NodeId, NodeId)],
     forks: u8,
     decide: bool,
     room: Option<&crate::transpile::graph::Room>,
-) -> (Graph, Vec<(usize, u8, u64, Vec<NodeId>)>) {
+) -> (Graph, Vec<SpecializedBody>) {
+    // The trace's fork premises: per fork d, its `SplitValid(d)` nodes.
+    let mut split_valid: Vec<Vec<NodeId>> = vec![Vec::new(); forks as usize];
+    for id in 0..graph.len() as NodeId {
+        if let Op::SplitValid(d) = graph.get(id).op {
+            if (d as usize) < split_valid.len() {
+                split_valid[d as usize].push(id);
+            }
+        }
+    }
     // --- 1. which forks each outcome actually depends on ---
     let cones = graph.split_cones();
     let bits_of = |fields: &[NodeId], ok: NodeId, live: NodeId| -> Vec<u8> {
@@ -70,9 +86,9 @@ pub(crate) fn specialize_frame(
 
     // --- 2. specialize, per outcome, over (button, its own forks) ---
     let mut sp = graph.like();
-    // (outcome, button, fork configuration, roots) where roots is the
-    // outcome's fields in order, then `ok`, then `live`.
-    let mut cands: Vec<(usize, u8, u64, Vec<NodeId>)> = Vec::new();
+    // (outcome, button, fork configuration, roots, premises) where roots
+    // is the outcome's fields in order, then `ok`, then `live`.
+    let mut cands: Vec<SpecializedBody> = Vec::new();
     for (oi, (fields, ok, live)) in outs.iter().enumerate() {
         let mut want: Vec<NodeId> = fields.clone();
         want.push(*ok);
@@ -109,14 +125,25 @@ pub(crate) fn specialize_frame(
                 }
                 let map = graph.specialize_subset_into(m, Some(sm), Some(&need), &mut sp);
                 let roots: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
-                cands.push((oi, m, sm, roots));
+                let mut premises: Vec<(u8, NodeId)> = Vec::new();
+                for &d in &bits {
+                    for &n in &split_valid[d as usize] {
+                        if need[n as usize] {
+                            premises.push((d, map[n as usize]));
+                        }
+                    }
+                }
+                cands.push((oi, m, sm, roots, premises));
             }
         }
     }
 
     // --- 3. decide the boolean layer, on the RESOLVED graph ---
     if decide {
-        let all: Vec<NodeId> = cands.iter().flat_map(|c| c.3.iter().copied()).collect();
+        let all: Vec<NodeId> = cands
+            .iter()
+            .flat_map(|c| c.3.iter().copied().chain(c.4.iter().map(|p| p.1)))
+            .collect();
         let (g1, m1, _) =
             crate::transpile::ival::fold(&sp, &all, room).expect("interval fold");
         let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
@@ -129,12 +156,15 @@ pub(crate) fn specialize_frame(
             for r in c.3.iter_mut() {
                 *r = it.next().expect("one decided root per root");
             }
+            for p in c.4.iter_mut() {
+                p.1 = it.next().expect("one decided premise per premise");
+            }
         }
         sp = g3;
     }
 
     // --- 4. identical roots are the same body ---
-    let bodies: Vec<(usize, u8, u64, Vec<NodeId>)> = {
+    let bodies: Vec<SpecializedBody> = {
         let mut seen: BTreeSet<(usize, Vec<NodeId>)> = BTreeSet::new();
         cands
             .into_iter()

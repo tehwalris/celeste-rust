@@ -543,7 +543,7 @@ fn main() -> Result<()> {
                 };
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
                 println!(
-                    "[bench] rep {rep}: raw {} kept {} | wave {:.0} ms (idle {:.0}%) door {:.0} total {:.0} ms | flushes {} ({:.0} rows avg) | {} out blocks | edges {} written {:.0} compact {:.0} ms",
+                    "[bench] rep {rep}: raw {} kept {} | wave {:.0} ms (idle {:.0}%) door {:.0} total {:.0} ms | flushes {} ({:.0} rows avg) | {} out blocks | edges {} written {:.0} compact {:.0} ms | filter {:.0} thread-ms",
                     st.lanes_raw,
                     st.lanes_kept,
                     ms(st.t_wave),
@@ -556,10 +556,12 @@ fn main() -> Result<()> {
                     records,
                     ms(st.t_edges),
                     ms(t_compact),
+                    ms(st.t_filter),
                 );
             }
             let _ = std::fs::remove_dir_all(&edges_dir);
             celeste_rust::compiled::dispatch::print_kernel_hits();
+            celeste_rust::compiled::dispatch::print_bodysets();
         }
         Command::Census {
             level_dir,

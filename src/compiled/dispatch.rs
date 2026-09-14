@@ -161,3 +161,8 @@ pub fn print_kernel_hits() {
         );
     }
 }
+
+/// The per-lane body-set census (`CELESTE_BODYSETS=1`).
+pub fn print_bodysets() {
+    super::asm_kernel::print_bodysets();
+}

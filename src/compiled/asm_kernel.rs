@@ -58,6 +58,11 @@ struct AsmBody {
     /// The two row-key word roots: `Σ cell_mix` over the body's varying
     /// fields, per half, computed in the kernel (`Op::CellMix`/`AddW`).
     key_roots: (usize, usize),
+    /// The root slot of the body's REGION mask (`transpile::asm::regions`):
+    /// a lane the kernel could have taken with this body has its bit set;
+    /// where it is clear the body's block was skipped for the slice and
+    /// its roots are stale. `None`: the root region, always evaluated.
+    region_root: Option<usize>,
     /// Where an emitted row's player x, player y, room x, room y come from
     /// (`search::pos_graph::block_cells`' inputs), so the append step can
     /// compute the row's position cell straight off the output buffer.
@@ -244,7 +249,7 @@ impl AsmKernel {
                 let (mut kept, mut declined, mut any_live) = (0u16, 0u16, 0u16);
                 for body in &self.bodies {
                     let ok = read_zb_holds(outbuf, body.ok_root);
-                    let live = read_zb_holds(outbuf, body.live_root);
+                    let live = read_zb_holds(outbuf, body.live_root) & body.present(outbuf, valid);
                     kept |= live & ok & valid;
                     declined |= live & !ok & valid;
                     any_live |= live & valid;
@@ -255,10 +260,14 @@ impl AsmKernel {
                      declined={declined:04x} dropped(not-live)={dropped:04x} any_live={any_live:04x}"
                 );
             }
+            // DIAGNOSTIC (CELESTE_BODYSETS=1): which bodies take each lane -
+            // the per-lane body SET, whose distinct count over a frame is
+            // how many kernels a dispatch keyed on it would need.
+            let mut lane_sets: Option<Vec<Vec<u64>>> = bodysets_on().then(|| vec![vec![0u64; self.bodies.len().div_ceil(64)]; n]);
             // BACKWARD: lanes already known to reach a target; nothing more
             // to learn from them.
             let mut hit_lanes: u16 = 0;
-            for (body, cols) in self.bodies.iter().zip(body_cols) {
+            for (bi, (body, cols)) in self.bodies.iter().zip(body_cols).enumerate() {
                 // `ok`/`live` are tri-state ZB masks; the kernel keeps a lane
                 // only where they are KNOWN-TRUE (val & known - `zb_holds`,
                 // exactly what the generated `frame` applied). Reading `val`
@@ -269,7 +278,9 @@ impl AsmKernel {
                 // must fall to the reference, so the trace's failure to
                 // fork/decide it surfaces instead of producing a coarse row.
                 let ok = read_zb_holds(outbuf, body.ok_root);
-                let live = read_zb_holds(outbuf, body.live_root);
+                // A body whose region was skipped for this slice has stale
+                // roots: its lanes are not live (none could take it).
+                let live = read_zb_holds(outbuf, body.live_root) & body.present(outbuf, valid);
                 if live & !ok & valid != 0 {
                     // Declined: a live lane the kernel could not keep (or
                     // could not DECIDE). A coverage gap for the whole call.
@@ -279,6 +290,14 @@ impl AsmKernel {
                 n_bodies += 1;
                 if take == 0 {
                     continue;
+                }
+                if let Some(ls) = lane_sets.as_mut() {
+                    let mut t = take;
+                    while t != 0 {
+                        let i = t.trailing_zeros() as usize;
+                        t &= t - 1;
+                        ls[i][bi / 64] |= 1 << (bi % 64);
+                    }
                 }
                 n_bodies_taken += 1;
                 n_lanes += take.count_ones() as u64;
@@ -371,6 +390,13 @@ impl AsmKernel {
                         sink.seen.set_ref(key, sink.row_ref(q));
                     }
                     sink.pushed(q).expect("flushing a full queue");
+                }
+            }
+            if let Some(ls) = lane_sets {
+                let mut m = BODYSETS.lock().expect("bodysets");
+                let e = m.entry(chunk.shape_hash).or_default();
+                for s in ls {
+                    *e.entry(s).or_default() += 1;
                 }
             }
             lo += n;
@@ -535,6 +561,59 @@ impl AsmKernel {
 /// A thread's reusable scratch for one kernel: the packed input and the
 /// output buffer and the dedup cache. Kept per (thread, kernel) across
 /// calls so no unit allocates them afresh.
+/// Guarded regions in the kernels (default on; `CELESTE_ASM_REGIONS=0`
+/// emits the straight-line kernel for an A/B).
+fn regions_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CELESTE_ASM_REGIONS").map(|s| s != "0").unwrap_or(true))
+}
+
+impl AsmBody {
+    /// The lanes of the slice this body's region was evaluated for.
+    #[inline(always)]
+    fn present(&self, outbuf: &[u8], valid: u16) -> u16 {
+        match self.region_root {
+            Some(rr) => read_zb_holds(outbuf, rr),
+            None => valid,
+        }
+    }
+}
+
+fn bodysets_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_BODYSETS").is_some())
+}
+
+/// DIAGNOSTIC: per input shape, the distinct per-lane body sets and how
+/// many lanes had each (`CELESTE_BODYSETS=1`, printed by `print_bodysets`).
+static BODYSETS: std::sync::Mutex<std::collections::BTreeMap<u64, std::collections::HashMap<Vec<u64>, u64>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+pub fn print_bodysets() {
+    let m = BODYSETS.lock().expect("bodysets");
+    if m.is_empty() {
+        return;
+    }
+    for (shape, sets) in m.iter() {
+        let lanes: u64 = sets.values().sum();
+        let mut counts: Vec<u64> = sets.values().copied().collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let top: u64 = counts.iter().take(16).sum();
+        let top64: u64 = counts.iter().take(64).sum();
+        let sizes: Vec<u32> = sets.keys().map(|s| s.iter().map(|w| w.count_ones()).sum()).collect();
+        let avg_size = sizes.iter().map(|&x| x as f64).sum::<f64>() / sizes.len().max(1) as f64;
+        eprintln!(
+            "[bodysets] shape {:016x}: {} lanes, {} distinct body sets (avg {:.1} bodies per set); top 16 sets cover {:.1}% of lanes, top 64 {:.1}%",
+            shape,
+            lanes,
+            sets.len(),
+            avg_size,
+            100.0 * top as f64 / lanes.max(1) as f64,
+            100.0 * top64 as f64 / lanes.max(1) as f64
+        );
+    }
+}
+
 struct Scratch {
     kernel: usize,
     inbuf: Vec<u8>,
@@ -1040,6 +1119,57 @@ fn build_one_shape(
     let (mut fused, bodies, mut flat_roots, reprs) =
         crate::trace::emit::asm_fused(&r.bound, Some(&room), true)
             .with_context(|| format!("fusing shape {si} (hash {shape:#x})"))?;
+    if std::env::var_os("CELESTE_CONE_CENSUS").is_some() {
+        // DIAGNOSTIC: how much of the fused graph the bodies' ok/live cones
+        // are (what a guard-only kernel would cost), and how the nodes
+        // split by the number of distinct fork configurations reaching them.
+        let reach = |roots: &[crate::transpile::graph::NodeId]| -> Vec<bool> {
+            let mut live = vec![false; fused.len()];
+            let mut stack = roots.to_vec();
+            while let Some(n) = stack.pop() {
+                if live[n as usize] {
+                    continue;
+                }
+                live[n as usize] = true;
+                stack.extend(fused.get(n).args.iter().copied());
+            }
+            live
+        };
+        let all = reach(&flat_roots);
+        let guards: Vec<_> = bodies.iter().flat_map(|b| b.roots[b.roots.len() - 2..].iter().copied()).collect();
+        let gl = reach(&guards);
+        let n_all = all.iter().filter(|&&x| x).count();
+        let n_guard = gl.iter().filter(|&&x| x).count();
+        // Per node: the set of fork configs (splits) of the bodies reaching it.
+        let mut configs: Vec<std::collections::BTreeSet<u64>> = vec![Default::default(); fused.len()];
+        let mut all_configs: std::collections::BTreeSet<u64> = Default::default();
+        for b in &bodies {
+            all_configs.insert(b.splits);
+            let r = reach(&b.roots);
+            for (i, &x) in r.iter().enumerate() {
+                if x {
+                    configs[i].insert(b.splits);
+                }
+            }
+        }
+        let nc = all_configs.len();
+        let mut hist: std::collections::BTreeMap<usize, usize> = Default::default();
+        for (i, c) in configs.iter().enumerate() {
+            if all[i] {
+                *hist.entry(c.len()).or_default() += 1;
+            }
+        }
+        let shared = hist.get(&nc).copied().unwrap_or(0);
+        eprintln!(
+            "[cone] shape {si} ({shape:#x}): {} bodies, {nc} fork configs, {n_all} live nodes, ok/live cones {n_guard} ({:.0}%); nodes reached by every config {shared} ({:.0}%), by one config {} ({:.0}%); histogram (configs -> nodes) {:?}",
+            bodies.len(),
+            100.0 * n_guard as f64 / n_all.max(1) as f64,
+            100.0 * shared as f64 / n_all.max(1) as f64,
+            hist.get(&1).copied().unwrap_or(0),
+            100.0 * hist.get(&1).copied().unwrap_or(0) as f64 / n_all.max(1) as f64,
+            hist.iter().take(12).collect::<Vec<_>>()
+        );
+    }
     // THE ROW KEY, AS GRAPH ROOTS. Per body, the per-lane sum of
     // `cell_mix` over its varying fields (a per-row column that the
     // boundary does not widen to uniform), one node chain per half,
@@ -1067,11 +1197,62 @@ fn build_one_shape(
         flat_roots.push(h1);
         flat_roots.push(h2);
     }
-    let (compiled, loaded) = crate::transpile::asm::compile_and_load_reprs(
+    // GUARDED REGIONS (`transpile::asm::regions`): each body's assignment
+    // of the forks it depends on, the regions, and their guards as extra
+    // roots after every body's - `region_roots[b]` is the root slot of
+    // body b's region mask (`None`: the root region, always evaluated).
+    let regions = {
+        let body_roots: Vec<Vec<crate::transpile::graph::NodeId>> = bodies
+            .iter()
+            .zip(&key_roots)
+            .map(|(b, &(k1, k2))| {
+                let mut v = b.roots.clone();
+                v.push(flat_roots[k1]);
+                v.push(flat_roots[k2]);
+                v
+            })
+            .collect();
+        let premises: Vec<Vec<(u8, crate::transpile::graph::NodeId)>> = bodies.iter().map(|b| b.premises.clone()).collect();
+        let config: Vec<crate::transpile::asm::regions::Assignment> = bodies
+            .iter()
+            .map(|b| {
+                let mut forks: Vec<u8> = b.premises.iter().map(|p| p.0).collect();
+                forks.sort_unstable();
+                forks.dedup();
+                forks.into_iter().map(|d| (d, ((b.splits >> d) & 1) as u8)).collect()
+            })
+            .collect();
+        crate::transpile::asm::regions::Regions::build(&mut fused, &body_roots, &premises, &config)
+    };
+    let region_slot: Vec<Option<usize>> = {
+        let mut slot_of_region: Vec<Option<usize>> = vec![None; regions.keys.len()];
+        for r in 1..regions.keys.len() {
+            slot_of_region[r] = Some(flat_roots.len());
+            flat_roots.push(regions.guard[r].expect("a non-root region has a guard"));
+        }
+        regions.of_body.iter().map(|&r| slot_of_region[r]).collect()
+    };
+    if std::env::var_os("CELESTE_CONE_CENSUS").is_some() {
+        let live = {
+            let mut live = vec![false; fused.len()];
+            let mut stack = flat_roots.clone();
+            while let Some(n) = stack.pop() {
+                if live[n as usize] {
+                    continue;
+                }
+                live[n as usize] = true;
+                stack.extend(fused.get(n).args.iter().copied());
+            }
+            live
+        };
+        eprintln!("[regions] shape {si} ({shape:#x}): {}", regions.census(&fused, &live));
+    }
+    let (compiled, loaded) = crate::transpile::asm::compile_and_load_regions(
         &fused,
         &flat_roots,
         &format!("k{shape:016x}"),
         &reprs,
+        regions_on().then_some(&regions),
     )
     .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
 
@@ -1103,6 +1284,7 @@ fn build_one_shape(
             ok_root: off + nfields,
             live_root: off + nfields + 1,
             key_roots: key_roots[bi],
+            region_root: region_slot[bi],
             pos: None,
         });
         off += b.roots.len();
