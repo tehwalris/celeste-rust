@@ -91,8 +91,8 @@ pub enum WidenMode {
     /// The full Bits(0) boundary widenings (rem -> [-0.5, 0.5), the
     /// timer globals -> 0, `dash_effect_time` -> max(0, .), a live
     /// fruit's `off`/`y` -> its bob band), all in the graph. The
-    /// production level-0 set.
-    Level0,
+    /// production level-0 set. Carries the level's spd precision.
+    Level0(crate::interpreter::abstraction::SpdPrecision),
     /// ONLY the rem widening, at the configured Bits(k) rung, via a
     /// bucket fork + snap. Phase 1 of moving the ladder widening into
     /// the graph (plans/keying-widening-flow.md): the rung-agnostic
@@ -101,7 +101,7 @@ pub enum WidenMode {
     /// the widened rem so the row is keyed on the value it stores.
     /// Everything else (spd, fruit, timers, conservative widenings) is
     /// still left to the boundary in this phase.
-    RemRung(crate::interpreter::abstraction::RemPrecision),
+    RemRung(crate::interpreter::abstraction::RemPrecision, crate::interpreter::abstraction::SpdPrecision),
 }
 
 /// Apply the boundary widenings selected by `mode` to `st`.
@@ -115,13 +115,12 @@ pub enum WidenMode {
 /// so both modes apply them; only rem and spd differ by rung.
 pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Result<()> {
     use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
-    // The ladder refines rem and spd together (`spd_precision_for`: the
-    // same bucket width at every rung; level 0 is Bits(0) / 1 px).
-    let rem = match mode {
-        WidenMode::Level0 => RemPrecision::Bits(0),
-        WidenMode::RemRung(rem) => rem,
+    // The level's rem and spd precisions (`abstraction::Level`), explicit
+    // so every level's set can be traced at once.
+    let (rem, spd): (RemPrecision, SpdPrecision) = match mode {
+        WidenMode::Level0(spd) => (RemPrecision::Bits(0), spd),
+        WidenMode::RemRung(rem, spd) => (rem, spd),
     };
-    let spd: SpdPrecision = crate::interpreter::abstraction::spd_precision_for(rem);
     widen_rem(st, d, rem)?;
     widen_spd(st, d, spd)?;
     widen_dash(st, d)?;

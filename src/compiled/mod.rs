@@ -109,8 +109,8 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
 /// search's position and win columns, `frame::Block`) need them without an
 /// engine in hand.
 /// Build every rung's kernel set up front, in parallel (`asm_kernel::prebuild`).
-pub fn prebuild_kernels(precisions: &[crate::interpreter::abstraction::RemPrecision]) {
-    asm_kernel::prebuild(precisions)
+pub fn prebuild_kernels(levels: &[crate::interpreter::abstraction::Level]) {
+    asm_kernel::prebuild(levels)
 }
 
 pub fn ids() -> &'static runtime2::BoundaryIds {

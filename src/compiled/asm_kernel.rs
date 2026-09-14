@@ -1444,53 +1444,60 @@ pub(crate) fn take_call_stats() -> [u64; 7] {
 
 /// The kernel set of the process-global rem precision (built on first use).
 pub(crate) fn registry() -> Option<&'static Registry> {
-    registry_for(crate::interpreter::abstraction::rem_precision_from_env())
+    registry_for(crate::interpreter::abstraction::current_level())
 }
 
-/// One kernel set per rung, each built once, on first use or by
-/// `prebuild` - the rung is an explicit input of the build, not read from
-/// the process-global precision, so the sets can be built in parallel.
-fn registry_for(rem: crate::interpreter::abstraction::RemPrecision) -> Option<&'static Registry> {
-    use crate::interpreter::abstraction::RemPrecision;
-    static REGS: [std::sync::OnceLock<Option<Registry>>; 17] =
-        [const { std::sync::OnceLock::new() }; 17];
-    let slot = match rem {
+/// One kernel set per LEVEL (rem rung x spd precision), each built once,
+/// on first use or by `prebuild` - the level is an explicit input of the
+/// build, not read from the process-global precision, so the sets can
+/// be built in parallel.
+fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'static Registry> {
+    use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
+    const SPD_SLOTS: usize = 21;
+    static REGS: [std::sync::OnceLock<Option<Registry>>; 17 * SPD_SLOTS] =
+        [const { std::sync::OnceLock::new() }; 17 * SPD_SLOTS];
+    let rem_slot = match level.rem {
         RemPrecision::Exact => 16,
         RemPrecision::Bits(b) => (b as usize).min(16),
     };
-    REGS[slot].get_or_init(|| build_registry_for_rung(rem)).as_ref()
+    let spd_slot = match level.spd {
+        SpdPrecision::Exact => 20,
+        SpdPrecision::WidthLog2(w) => (w as usize).clamp(1, 20) - 1,
+    };
+    REGS[rem_slot * SPD_SLOTS + spd_slot].get_or_init(|| build_registry_for_rung(level)).as_ref()
 }
 
 /// Build every rung's kernel set now, all rungs at once (one builder
 /// thread per rung, each assembling its shapes in parallel). The ladder
 /// calls this up front: lazily, the 17 builds landed one at a time inside
 /// the first frame of each level - 82 s of a 524 s room (1,0) run.
-pub fn prebuild(precisions: &[crate::interpreter::abstraction::RemPrecision]) {
+pub fn prebuild(levels: &[crate::interpreter::abstraction::Level]) {
     let t = std::time::Instant::now();
     std::thread::scope(|scope| {
-        for &p in precisions {
+        for &l in levels {
             scope.spawn(move || {
-                registry_for(p);
+                registry_for(l);
             });
         }
     });
-    eprintln!("[asm build] {} rungs prebuilt in {:.1} s", precisions.len(), t.elapsed().as_secs_f64());
+    eprintln!("[asm build] {} levels prebuilt in {:.1} s", levels.len(), t.elapsed().as_secs_f64());
 }
 
-fn build_registry_for_rung(rem: crate::interpreter::abstraction::RemPrecision) -> Option<Registry> {
+fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Option<Registry> {
     use crate::interpreter::abstraction::RemPrecision;
     use crate::trace::shapes::WalkOpts;
+    let rem = level.rem;
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
     let mode = super::dispatch::traced_mode_for(rem);
     let (opts, exact) = match mode {
-        super::dispatch::TracedMode::Level0 => (WalkOpts::LEVEL0, false),
+        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd), false),
         super::dispatch::TracedMode::Level0Agnostic => {
             // Phase 1: the opt-in rung-specific variant bakes the rem
             // widening into the graph (`ladder_widen`), still through
             // `boundary_exact` (it emits the widened rem and keys the
             // emitted field). Default `LADDER` is unchanged.
             let opts = match (super::dispatch::widen_in_graph(), rem) {
-                (true, RemPrecision::Bits(b)) => WalkOpts::ladder_widen(b),
+                (true, RemPrecision::Bits(b)) => WalkOpts::ladder_widen(b, level.spd),
                 _ => WalkOpts::LADDER,
             };
             (opts, true)

@@ -239,29 +239,38 @@ fn main() -> Result<()> {
             win_at,
         } => {
             use celeste_rust::frame::{find_optimum, Block, FrameStep};
-            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
+            use celeste_rust::interpreter::abstraction::{set_level, Level, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
             if let Some(xy) = &win_at {
                 std::env::set_var("CELESTE_WIN_AT_XY", xy);
             }
-            // CELESTE_LADDER_RUNGS="0,0,1,16": an explicit rung list (16 =
-            // Exact), for experiments on the ladder itself - e.g. the same
-            // rung twice to see whether a second forward/backward round at
-            // one precision narrows anything (it does not: the marks are
-            // closed under predecessors, so it is a fixpoint).
-            let precisions: Vec<RemPrecision> = match std::env::var("CELESTE_LADDER_RUNGS") {
-                Ok(list) => list
+            // THE LADDER. `CELESTE_LADDER="r0s16,r1sx,...,rxsx"`: an explicit
+            // list of (rem rung, spd width) levels, coarsest first, for
+            // experiments on the ladder itself (which refinement to take
+            // first, how to interleave rem and speed). `CELESTE_LADDER_RUNGS`
+            // ("0,0,1,16", 16 = Exact) is the older rem-only form (e.g. the
+            // same rung twice: a second round at one precision narrows
+            // nothing, the marks are a fixpoint). Otherwise rem Bits(0..=maxk)
+            // then Exact, speed by the `CELESTE_SPD_LADDER` preset.
+            let precisions: Vec<Level> = match (std::env::var("CELESTE_LADDER"), std::env::var("CELESTE_LADDER_RUNGS")) {
+                (Ok(spec), _) => Level::parse_ladder(&spec).unwrap_or_else(|e| panic!("CELESTE_LADDER: {e}")),
+                (_, Ok(list)) => list
                     .split(',')
                     .map(|k| k.trim().parse::<u8>().expect("CELESTE_LADDER_RUNGS: comma-separated rung numbers"))
-                    .map(|k| if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) })
+                    .map(|k| Level::for_rem(if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) }))
                     .collect(),
-                Err(_) => (0u8..=maxk.min(15))
-                    .map(RemPrecision::Bits)
-                    .chain(std::iter::once(RemPrecision::Exact))
-                    .collect(),
+                _ => Level::default_ladder(maxk),
             };
-            let make_engine = |p: RemPrecision| {
-                set_rem_precision(p);
+            eprintln!(
+                "[ladder] levels: {}",
+                precisions
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            let make_engine = |p: Level| {
+                set_level(p);
                 Ok(Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)
                     as Box<dyn FrameStep>)
             };
@@ -334,7 +343,7 @@ fn main() -> Result<()> {
                 Visited::load(&celeste_rust::frame::marks_path(base, fine_h, fine_level))?;
             let coarse_marks =
                 Visited::load(&celeste_rust::frame::marks_path(base, coarse_h, coarse_level))?;
-            let coarser = RemPrecision::Bits(coarse_bits);
+            let coarser = celeste_rust::interpreter::abstraction::Level::for_rem(RemPrecision::Bits(coarse_bits));
             println!(
                 "fine (h{fine_h} level {fine_level}): {} marked; coarse (h{coarse_h} level {coarse_level}, {coarser:?}): {} marked",
                 fine_marks.len(),
@@ -466,10 +475,10 @@ fn main() -> Result<()> {
         } => {
             use celeste_rust::frame::{forward_frame, load_frame, threads, Block, MarkFilter, Visited};
             use celeste_rust::search::door::Door;
-            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
+            use celeste_rust::interpreter::abstraction::{set_level, Level, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
-            let rung = |k: u8| if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) };
-            set_rem_precision(rung(precision));
+            let rung = |k: u8| Level::for_rem(if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) });
+            set_level(rung(precision));
             let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
             let dir = match &level_dir {
                 Some(d) => std::path::PathBuf::from(d),
@@ -889,9 +898,9 @@ fn main() -> Result<()> {
             diff,
         } => {
             use celeste_rust::frame::{backward_run, pos_graph_path, threads};
-            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
+            use celeste_rust::interpreter::abstraction::{set_level, Level, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
-            set_rem_precision(RemPrecision::Bits(0));
+            set_level(Level::for_rem(RemPrecision::Bits(0)));
             let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
             let dir = std::path::Path::new(&level_dir);
             let graph = celeste_rust::search::pos_graph::PosGraph::load(&pos_graph_path(dir))?;
@@ -1175,11 +1184,11 @@ fn main() -> Result<()> {
             room,
         } => {
             use celeste_rust::frame::{frame_files, marks_path, widened_keys, wins_of, Block, Visited};
-            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
+            use celeste_rust::interpreter::abstraction::{set_level, Level, RemPrecision};
             use rustc_hash::FxHashMap;
             std::env::set_var("CELESTE_START_ROOM", &room);
-            let precision = if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level as u8) };
-            set_rem_precision(precision);
+            let precision = Level::for_rem(if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level as u8) });
+            set_level(precision);
             let base = std::path::Path::new(&checkpoint_dir);
             let dir = if level == 0 {
                 base.join("level00")
@@ -1230,7 +1239,7 @@ fn main() -> Result<()> {
                 state: &celeste_rust::interpreter::state::State,
                 f: u32,
                 horizon: u32,
-                precision: RemPrecision,
+                precision: Level,
                 marks: &Visited,
                 layer_of: &FxHashMap<(u64, u64, u32), u32>,
                 dead: &mut rustc_hash::FxHashSet<(u64, u64, u32)>,
@@ -1265,8 +1274,8 @@ fn main() -> Result<()> {
                         // Column-by-column diff of the widened concrete
                         // successor against every layer-1 row.
                         let mut mine = block.into_rt2();
-                        if let RemPrecision::Bits(b) = precision {
-                            mine.widen_to(celeste_rust::compiled::ids(), b, celeste_rust::frame::spd_width_log2(RemPrecision::Bits(b)));
+                        if let RemPrecision::Bits(b) = precision.rem {
+                            mine.widen_to(celeste_rust::compiled::ids(), b, celeste_rust::frame::spd_width_log2(precision.spd));
                         }
                         for file in frame_files(dir, 1)? {
                             let Some(theirs) = file.load_all()? else { continue };

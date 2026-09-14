@@ -210,8 +210,8 @@ pub struct Walk {
 /// player's `rem` (ival_paths) and every live fruit's `off`/`y`
 /// (widen.rs). The lattice must not bake these, or a mid-game block whose
 /// `off` is an interval will not bind a kernel that expects a number.
-pub fn boundary_widened_paths(st: &State<Symbolic>) -> std::collections::BTreeSet<Path> {
-    let mut out: std::collections::BTreeSet<Path> = ival_paths(st).into_iter().collect();
+pub fn boundary_widened_paths(st: &State<Symbolic>, spd_ival: bool) -> std::collections::BTreeSet<Path> {
+    let mut out: std::collections::BTreeSet<Path> = ival_paths(st, spd_ival).into_iter().collect();
     let Some(Value::Table(fruit)) = iface::get(st, &[iface::key("fruit")]) else { return out };
     let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else { return out };
     let n = st.heap.tables[&objects].arr.len();
@@ -230,10 +230,11 @@ pub fn boundary_widened_paths(st: &State<Symbolic>) -> std::collections::BTreeSe
 pub fn field_constants(
     st: &State<Symbolic>,
     d: &Symbolic,
+    spd_ival: bool,
 ) -> Result<std::collections::BTreeMap<Path, super::iface::Conc>> {
     use super::domain::Domain;
     use super::iface::Conc;
-    let widened = boundary_widened_paths(st);
+    let widened = boundary_widened_paths(st, spd_ival);
     let mut out = std::collections::BTreeMap::new();
     for p in state_paths(st)? {
         if widened.contains(&p) { continue; }
@@ -280,19 +281,33 @@ pub struct WalkOpts {
     /// set can be built at once. Mutually exclusive with `widen` (the
     /// Bits(0) full widening); `widen_mode` asserts that.
     pub rem_rung: Option<u8>,
+    /// The level's spd precision (the speed ladder, `abstraction::Level`):
+    /// `WidthLog2(w)` makes the player's `spd.x/y` interval input slots
+    /// and bakes the bucket into the graph; `Exact` leaves them numbers.
+    pub spd: crate::interpreter::abstraction::SpdPrecision,
 }
 
 impl WalkOpts {
-    /// The checked-in level-0 set.
-    pub const LEVEL0: WalkOpts = WalkOpts { widen: true, ival: true, rem_rung: None };
+    /// The checked-in level-0 set (exact speed).
+    pub const LEVEL0: WalkOpts = WalkOpts { widen: true, ival: true, rem_rung: None, spd: crate::interpreter::abstraction::SpdPrecision::Exact };
     /// The rung-agnostic set for rem Bits(0..=15).
-    pub const LADDER: WalkOpts = WalkOpts { widen: false, ival: true, rem_rung: None };
+    pub const LADDER: WalkOpts = WalkOpts { widen: false, ival: true, rem_rung: None, spd: crate::interpreter::abstraction::SpdPrecision::Exact };
     /// The exact-rem set for the top rung (k = 16).
-    pub const EXACT: WalkOpts = WalkOpts { widen: false, ival: false, rem_rung: None };
+    pub const EXACT: WalkOpts = WalkOpts { widen: false, ival: false, rem_rung: None, spd: crate::interpreter::abstraction::SpdPrecision::Exact };
+    /// The level-0 set at spd precision `spd`.
+    pub const fn level0(spd: crate::interpreter::abstraction::SpdPrecision) -> WalkOpts {
+        WalkOpts { widen: true, ival: true, rem_rung: None, spd }
+    }
     /// Like `LADDER`, but with the rem widening baked into the graph at
-    /// rung `Bits(bits)` (Phase 1 B-kernel, plans/keying-widening-flow.md).
-    pub const fn ladder_widen(bits: u8) -> WalkOpts {
-        WalkOpts { widen: false, ival: true, rem_rung: Some(bits) }
+    /// rung `Bits(bits)` (Phase 1 B-kernel, plans/keying-widening-flow.md),
+    /// and the spd widening at `spd`.
+    pub const fn ladder_widen(bits: u8, spd: crate::interpreter::abstraction::SpdPrecision) -> WalkOpts {
+        WalkOpts { widen: false, ival: true, rem_rung: Some(bits), spd }
+    }
+
+    /// Are the player's `spd.x/y` interval input slots under these opts?
+    pub fn spd_ival(&self) -> bool {
+        self.ival && self.spd != crate::interpreter::abstraction::SpdPrecision::Exact
     }
 
     /// The `WidenMode` a traced frame under these opts applies, or `None`
@@ -305,9 +320,10 @@ impl WalkOpts {
         if let Some(bits) = self.rem_rung {
             Some(super::widen::WidenMode::RemRung(
                 crate::interpreter::abstraction::RemPrecision::Bits(bits),
+                self.spd,
             ))
         } else if self.widen {
-            Some(super::widen::WidenMode::Level0)
+            Some(super::widen::WidenMode::Level0(self.spd))
         } else {
             None
         }
@@ -339,7 +355,7 @@ pub fn walk<'a>(
     while let Some(k) = queue.pop() {
         let st = seen[&k].clone();
         let roots = state_paths(&st)?;
-        let ival = if opts.ival { ival_paths(&st) } else { Vec::new() };
+        let ival = if opts.ival { ival_paths(&st, opts.spd_ival()) } else { Vec::new() };
         let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival, opts.widen_mode()) {
             Ok(f) => f,
             Err(e) => {
@@ -381,7 +397,7 @@ pub fn walk<'a>(
 /// is the `player` global - rather than by position, because which
 /// object is the player changes within a room and the widening follows
 /// the type, not the index.
-pub fn ival_paths(st: &State<Symbolic>) -> Vec<Path> {
+pub fn ival_paths(st: &State<Symbolic>, spd_ival: bool) -> Vec<Path> {
     let Some(Value::Table(player)) = iface::get(st, &[iface::key("player")]) else {
         return Vec::new();
     };
@@ -401,7 +417,7 @@ pub fn ival_paths(st: &State<Symbolic>) -> Vec<Path> {
         // `abstraction::spd_precision_for`) `spd.x/y` too: every non-exact
         // rung widens the player's speed to a bucket, so a mid-game block
         // carries it as an interval.
-        let subs: &[&str] = if crate::interpreter::abstraction::spd_ladder_on() { &["rem", "spd"] } else { &["rem"] };
+        let subs: &[&str] = if spd_ival { &["rem", "spd"] } else { &["rem"] };
         for sub in subs {
             for f in ["x", "y"] {
                 let mut p = base.clone();

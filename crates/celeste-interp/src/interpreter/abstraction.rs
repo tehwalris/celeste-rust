@@ -264,33 +264,181 @@ pub fn spd_precision_for(rem: RemPrecision) -> SpdPrecision {
     if let Some(w) = spd_width_override() {
         return SpdPrecision::WidthLog2(w);
     }
-    if !spd_ladder_on() {
-        return SpdPrecision::Exact;
-    }
-    match rem {
-        RemPrecision::Bits(k) if k < 16 => SpdPrecision::WidthLog2(16 - k),
+    match (spd_ladder_preset(), rem) {
+        (SpdLadder::Exact, _) => SpdPrecision::Exact,
+        (SpdLadder::Bucket, RemPrecision::Bits(k)) if k < 16 => SpdPrecision::WidthLog2(16 - k),
+        (SpdLadder::Level0Only, RemPrecision::Bits(0)) => SpdPrecision::WidthLog2(16),
         _ => SpdPrecision::Exact,
     }
 }
 
-/// `CELESTE_SPD_LADDER=bucket` turns the speed ladder on. Off by default:
-/// a coarser level 0 wins earlier and its finer levels refute later, so
-/// rooms whose speeds do not explode (room (1,0): ~2 min per horizon
-/// against 4:51 for the whole search) pay for a collapse they do not
-/// need. Rooms with springs need it (room (2,0)'s `spd.x *= 0.2`, 19x).
-pub fn spd_ladder_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("CELESTE_SPD_LADDER").as_deref() {
-        Ok("bucket") => true,
-        Ok("exact") | Err(_) => false,
-        Ok(other) => panic!("CELESTE_SPD_LADDER={other:?}: expected bucket or exact"),
+/// The speed ladder PRESETS (`CELESTE_SPD_LADDER`), for the commands that
+/// take a rem rung and derive the level: `exact` (the default, the ladder
+/// the pinned gates were taken with), `bucket` (the same bucket width as
+/// rem's at every rung), `level0` (1 px at level 0 only, exact above).
+/// The search itself takes a full ladder spec (`Level::parse_ladder`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpdLadder {
+    Exact,
+    Bucket,
+    Level0Only,
+}
+
+pub fn spd_ladder_preset() -> SpdLadder {
+    static P: std::sync::OnceLock<SpdLadder> = std::sync::OnceLock::new();
+    *P.get_or_init(|| match std::env::var("CELESTE_SPD_LADDER").as_deref() {
+        Ok("bucket") => SpdLadder::Bucket,
+        Ok("level0") => SpdLadder::Level0Only,
+        Ok("exact") | Err(_) => SpdLadder::Exact,
+        Ok(other) => panic!("CELESTE_SPD_LADDER={other:?}: expected exact, bucket or level0"),
     })
 }
 
-/// The session's spd precision: derived from the rem precision
-/// (`spd_precision_for(rem_precision_from_env())`).
+/// ONE LEVEL of the ladder: its rem and spd precisions. The search's
+/// levels are a list of these (`parse_ladder`); the process-global
+/// precisions (`set_level`) name the level whose kernels the engine
+/// dispatches to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Level {
+    pub rem: RemPrecision,
+    pub spd: SpdPrecision,
+}
+
+impl Level {
+    /// The level at rem rung `rem` under the spd preset.
+    pub fn for_rem(rem: RemPrecision) -> Level {
+        Level { rem, spd: spd_precision_for(rem) }
+    }
+
+    /// Both exact: the top of every ladder.
+    pub const EXACT: Level = Level { rem: RemPrecision::Exact, spd: SpdPrecision::Exact };
+
+    /// Every fork in a rung's graph cuts on ONE grid (2^-k for rem
+    /// `Bits(k)`), and a fragment must fit two cells, so a level's spd
+    /// bucket is either exact or exactly the grid (`WidthLog2(16 - k)`).
+    pub fn grid_consistent(self) -> bool {
+        match (self.rem, self.spd) {
+            (_, SpdPrecision::Exact) => true,
+            (RemPrecision::Bits(k), SpdPrecision::WidthLog2(w)) => k < 16 && w == 16 - k,
+            (RemPrecision::Exact, SpdPrecision::WidthLog2(_)) => false,
+        }
+    }
+
+    /// Does `self` widen at least as much as `finer` in BOTH coordinates?
+    pub fn coarser_or_equal(self, finer: Level) -> bool {
+        self.rem.coarser_or_equal(finer.rem) && self.spd.coarser_or_equal(finer.spd)
+    }
+
+    /// One level from `r<k|x>s<w|x>`: rem rung k (0..=15) or exact, spd
+    /// bucket width 2^w raw units (1..=20) or exact.
+    pub fn parse(spec: &str) -> Result<Level, String> {
+        let s = spec.trim();
+        let (r, sp) = s
+            .strip_prefix('r')
+            .and_then(|t| t.split_once('s'))
+            .ok_or_else(|| format!("level {spec:?}: expected r<k|x>s<w|x>"))?;
+        let rem = match r {
+            "x" => RemPrecision::Exact,
+            k => RemPrecision::Bits(k.parse::<u8>().map_err(|e| format!("level {spec:?}: rem rung: {e}"))?),
+        };
+        if let RemPrecision::Bits(k) = rem {
+            if k > 15 {
+                return Err(format!("level {spec:?}: rem rung {k} > 15 (use x for exact)"));
+            }
+        }
+        let spd = match sp {
+            "x" => SpdPrecision::Exact,
+            w => {
+                let w: u8 = w.parse().map_err(|e| format!("level {spec:?}: spd width: {e}"))?;
+                if !(1..=20).contains(&w) {
+                    return Err(format!("level {spec:?}: spd width log2 {w} outside 1..=20"));
+                }
+                SpdPrecision::WidthLog2(w)
+            }
+        };
+        Ok(Level { rem, spd })
+    }
+
+    /// A ladder from a comma-separated list of levels, coarsest first,
+    /// each level coarser-or-equal to the next in both coordinates and the
+    /// last exact in both (the ladder's soundness argument).
+    pub fn parse_ladder(spec: &str) -> Result<Vec<Level>, String> {
+        let levels: Vec<Level> = spec.split(',').map(Level::parse).collect::<Result<_, _>>()?;
+        if levels.is_empty() {
+            return Err("an empty ladder".into());
+        }
+        for l in &levels {
+            if !l.grid_consistent() {
+                return Err(format!(
+                    "ladder: {l} - with the single-grid fork a level's spd bucket must be the rem grid \
+                     (r<k>s<16-k>) or exact; speed cannot be refined independently of rem"
+                ));
+            }
+        }
+        for w in levels.windows(2) {
+            if !w[0].coarser_or_equal(w[1]) {
+                return Err(format!("ladder: {} is not coarser-or-equal to the next level {}", w[0], w[1]));
+            }
+        }
+        if *levels.last().unwrap() != Level::EXACT {
+            return Err("ladder: the last level must be rxsx (exact in both)".into());
+        }
+        Ok(levels)
+    }
+
+    /// The default ladder: rem Bits(0..=15) then exact, spd by the preset.
+    pub fn default_ladder(maxk: u8) -> Vec<Level> {
+        (0u8..=maxk.min(15))
+            .map(|k| Level::for_rem(RemPrecision::Bits(k)))
+            .chain(std::iter::once(Level::EXACT))
+            .collect()
+    }
+}
+
+impl std::fmt::Display for Level {
+    /// `Bits(k)` / `Exact` with exact speed (the form the pinned marks
+    /// gate was taken with), `Bits(k)/W<w>` with a speed bucket.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.spd {
+            SpdPrecision::Exact => write!(f, "{:?}", self.rem),
+            SpdPrecision::WidthLog2(w) => write!(f, "{:?}/W{w}", self.rem),
+        }
+    }
+}
+
+static SPD_PRECISION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SPD_UNSET);
+const SPD_UNSET: u8 = 0xFF;
+const SPD_EXACT: u8 = 0xFE;
+
+fn encode_spd(p: SpdPrecision) -> u8 {
+    match p {
+        SpdPrecision::Exact => SPD_EXACT,
+        SpdPrecision::WidthLog2(w) => w,
+    }
+}
+
+/// The process-global spd precision: the level the engine dispatches to
+/// (`set_level`). Unset: derived from the rem precision by the preset.
 pub fn spd_precision() -> SpdPrecision {
-    spd_precision_for(rem_precision_from_env())
+    match SPD_PRECISION.load(std::sync::atomic::Ordering::Relaxed) {
+        SPD_UNSET => spd_precision_for(rem_precision_from_env()),
+        SPD_EXACT => SpdPrecision::Exact,
+        w => SpdPrecision::WidthLog2(w),
+    }
+}
+
+pub fn set_spd_precision(p: SpdPrecision) {
+    SPD_PRECISION.store(encode_spd(p), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The level whose kernels the engine dispatches to, from here on.
+pub fn set_level(l: Level) {
+    set_rem_precision(l.rem);
+    set_spd_precision(l.spd);
+}
+
+pub fn current_level() -> Level {
+    Level { rem: rem_precision_from_env(), spd: spd_precision() }
 }
 
 fn spd_width_override() -> Option<u8> {
@@ -1083,15 +1231,28 @@ mod tests {
         assert_eq!(out.vector_size, state.vector_size);
         // ...and the ladder rule: the same bucket width as rem's rung,
         // exact with exact rem.
-        // (The ladder rule itself, independent of the CELESTE_SPD_LADDER switch.)
         assert_eq!(spd_precision_for(RemPrecision::Exact), SpdPrecision::Exact);
-        if spd_ladder_on() {
-            assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::WidthLog2(16));
-            assert_eq!(spd_precision_for(RemPrecision::Bits(15)), SpdPrecision::WidthLog2(1));
-        } else {
-            assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::Exact);
+        match spd_ladder_preset() {
+            SpdLadder::Bucket => {
+                assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::WidthLog2(16));
+                assert_eq!(spd_precision_for(RemPrecision::Bits(15)), SpdPrecision::WidthLog2(1));
+            }
+            SpdLadder::Level0Only => {
+                assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::WidthLog2(16));
+                assert_eq!(spd_precision_for(RemPrecision::Bits(1)), SpdPrecision::Exact);
+            }
+            SpdLadder::Exact => assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::Exact),
         }
-        set_rem_precision(RemPrecision::Exact);
+        // The ladder spec.
+        let l = Level::parse_ladder("r0s16,r1s15,r2sx,rxsx").unwrap();
+        assert_eq!(l.len(), 4);
+        assert_eq!(l[0], Level { rem: RemPrecision::Bits(0), spd: SpdPrecision::WidthLog2(16) });
+        assert_eq!(l[2], Level { rem: RemPrecision::Bits(2), spd: SpdPrecision::Exact });
+        assert!(Level::parse_ladder("r0sx,r0s16,rxsx").is_err(), "spd may not get coarser");
+        assert!(Level::parse_ladder("r0s16,r1s15").is_err(), "must end exact");
+        assert!(Level::parse_ladder("r0s16,r1s16,rxsx").is_err(), "spd bucket must be the rem grid");
+        assert!(Level::parse_ladder("r0s16,r0s15,rxsx").is_err(), "speed cannot refine on its own");
+        set_level(Level::EXACT);
         assert_eq!(split_spd_straddles(State::new()).len(), 1);
     }
 }

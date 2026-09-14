@@ -187,7 +187,7 @@ pub fn trace_frame<'a>(
     // settles the integer move AND the output bucket, and the boundary
     // snap below never has to fork again.
     it.d.graph.set_fork_bits(match widen {
-        Some(super::widen::WidenMode::RemRung(crate::interpreter::abstraction::RemPrecision::Bits(k))) => k,
+        Some(super::widen::WidenMode::RemRung(crate::interpreter::abstraction::RemPrecision::Bits(k), _)) => k,
         _ => 0,
     });
     // One frame has exactly six free choices, `Free(0..5)`. The counter

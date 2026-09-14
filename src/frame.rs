@@ -1141,14 +1141,14 @@ impl<'a> ForwardSink<'a> {
 pub struct MarkFilter<'a> {
     /// The marked set from the previous, COARSER precision level.
     marked: &'a Visited,
-    /// The coarser precision to widen down to before the membership test.
-    coarser: crate::interpreter::abstraction::RemPrecision,
+    /// The coarser LEVEL to widen down to before the membership test.
+    coarser: crate::interpreter::abstraction::Level,
 }
 
 impl<'a> MarkFilter<'a> {
     pub fn new(
         marked: &'a Visited,
-        coarser: crate::interpreter::abstraction::RemPrecision,
+        coarser: crate::interpreter::abstraction::Level,
     ) -> Self {
         Self { marked, coarser }
     }
@@ -1181,15 +1181,14 @@ impl<'a> MarkFilter<'a> {
 /// diagnostics and the witness extraction.
 pub fn widened_keys(
     block: &Block,
-    coarser: crate::interpreter::abstraction::RemPrecision,
+    coarser: crate::interpreter::abstraction::Level,
 ) -> Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
     widened_keys_rt2(&block.rt2, coarser)
 }
 
-/// The speed bucket (log2 raw units) a level widens to, `None` for exact
-/// (`abstraction::spd_precision_for`, the spd ladder).
-pub fn spd_width_log2(rem: crate::interpreter::abstraction::RemPrecision) -> Option<u8> {
-    match crate::interpreter::abstraction::spd_precision_for(rem) {
+/// The speed bucket (log2 raw units) a level widens to, `None` for exact.
+pub fn spd_width_log2(spd: crate::interpreter::abstraction::SpdPrecision) -> Option<u8> {
+    match spd {
         crate::interpreter::abstraction::SpdPrecision::WidthLog2(w) => Some(w),
         crate::interpreter::abstraction::SpdPrecision::Exact => None,
     }
@@ -1199,12 +1198,12 @@ pub fn spd_width_log2(rem: crate::interpreter::abstraction::RemPrecision) -> Opt
 /// block's, which is what the coarser level's marks are sharded by.
 pub fn widened_keys_rt2(
     rt2: &Rt2,
-    coarser: crate::interpreter::abstraction::RemPrecision,
+    coarser: crate::interpreter::abstraction::Level,
 ) -> Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
     use crate::interpreter::abstraction::RemPrecision;
     let mut w = rt2.clone_block();
-    if let RemPrecision::Bits(b) = coarser {
-        w.widen_to(crate::compiled::ids(), b, spd_width_log2(RemPrecision::Bits(b)));
+    if let RemPrecision::Bits(b) = coarser.rem {
+        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd));
     }
     let keys = w.row_keys_canonical();
     let cells = crate::search::pos_graph::block_cells(&w)?;
@@ -2268,26 +2267,26 @@ impl HorizonOutcome {
 /// levels are filtered by marks that change with H, so they rerun.
 pub struct Ladder<'a, E, I>
 where
-    E: FnMut(crate::interpreter::abstraction::RemPrecision) -> Result<Box<dyn FrameStep>>,
+    E: FnMut(crate::interpreter::abstraction::Level) -> Result<Box<dyn FrameStep>>,
     I: FnMut() -> Result<Vec<Block>>,
 {
     make_engine: E,
     make_initial: I,
     base_dir: &'a std::path::Path,
-    precisions: &'a [crate::interpreter::abstraction::RemPrecision],
+    precisions: &'a [crate::interpreter::abstraction::Level],
     level0: Option<(Box<dyn FrameStep>, ForwardState)>,
 }
 
 impl<'a, E, I> Ladder<'a, E, I>
 where
-    E: FnMut(crate::interpreter::abstraction::RemPrecision) -> Result<Box<dyn FrameStep>>,
+    E: FnMut(crate::interpreter::abstraction::Level) -> Result<Box<dyn FrameStep>>,
     I: FnMut() -> Result<Vec<Block>>,
 {
     pub fn new(
         make_engine: E,
         make_initial: I,
         base_dir: &'a std::path::Path,
-        precisions: &'a [crate::interpreter::abstraction::RemPrecision],
+        precisions: &'a [crate::interpreter::abstraction::Level],
     ) -> Self {
         Ladder { make_engine, make_initial, base_dir, precisions, level0: None }
     }
@@ -2307,7 +2306,7 @@ where
         // The kernel set an engine dispatches to follows the PROCESS-GLOBAL
         // rem precision (`asm_kernel::registry`), and a finer level ran
         // since level 0 last did: say which level is running before it runs.
-        crate::interpreter::abstraction::set_rem_precision(self.precisions[0]);
+        crate::interpreter::abstraction::set_level(self.precisions[0]);
         let dir = self.level_dir(horizon, 0);
         if self.level0.is_none() {
             let engine = (self.make_engine)(self.precisions[0])?;
@@ -2344,7 +2343,7 @@ where
     }
 
     fn at_horizon_fresh(&mut self, horizon: u32) -> Result<HorizonOutcome> {
-        let mut prev: Option<(Visited, crate::interpreter::abstraction::RemPrecision)> = None;
+        let mut prev: Option<(Visited, crate::interpreter::abstraction::Level)> = None;
         for level in 0..self.precisions.len() {
             let precision = self.precisions[level];
             let dir = self.level_dir(horizon, level);
@@ -2356,7 +2355,7 @@ where
                 let state = &self.level0.as_ref().expect("started by extend_level0").1;
                 (win, state.pos_graph().expect("level 0 records"))
             } else {
-                crate::interpreter::abstraction::set_rem_precision(precision);
+                crate::interpreter::abstraction::set_level(precision);
                 let engine = (self.make_engine)(precision)?;
                 let filter = prev.as_ref().map(|(m, p)| MarkFilter::new(m, *p));
                 let fwd = forward_run(
@@ -2371,7 +2370,7 @@ where
                 (fwd.win_frame, fwd.pos_graph.expect("record mode always builds the pos graph"))
             };
             let Some(h) = win else {
-                eprintln!("[ladder] h{horizon} level {level} ({precision:?}): NO WIN -> Refuted");
+                eprintln!("[ladder] h{horizon} level {level} ({precision}): NO WIN -> Refuted");
                 return Ok(HorizonOutcome::Refuted { level });
             };
             let engine: &dyn FrameStep = match fresh.as_ref() {
@@ -2388,7 +2387,7 @@ where
             marked.save(&marks_path(self.base_dir, horizon, level))?;
             let (n, fp) = marked.fingerprint();
             eprintln!(
-                "[ladder] h{horizon} level {level} ({precision:?}): first win f{h}, marked {n} states \
+                "[ladder] h{horizon} level {level} ({precision}): first win f{h}, marked {n} states \
                  (fingerprint {fp:016x}), {work}"
             );
             prev = Some((marked, precision));
@@ -2414,12 +2413,12 @@ pub fn marks_path(base_dir: &std::path::Path, horizon: u32, level: usize) -> std
 /// the search uses `Ladder` so level 0 persists across horizons.
 pub fn ladder_at_horizon(
     make_engine: impl FnMut(
-        crate::interpreter::abstraction::RemPrecision,
+        crate::interpreter::abstraction::Level,
     ) -> Result<Box<dyn FrameStep>>,
     make_initial: impl FnMut() -> Result<Vec<Block>>,
     base_dir: &std::path::Path,
     horizon: u32,
-    precisions: &[crate::interpreter::abstraction::RemPrecision],
+    precisions: &[crate::interpreter::abstraction::Level],
 ) -> Result<HorizonOutcome> {
     Ladder::new(make_engine, make_initial, base_dir, precisions).at_horizon(horizon)
 }
@@ -2432,13 +2431,13 @@ pub fn ladder_at_horizon(
 /// by `max_horizon`.
 pub fn find_optimum(
     make_engine: impl FnMut(
-        crate::interpreter::abstraction::RemPrecision,
+        crate::interpreter::abstraction::Level,
     ) -> Result<Box<dyn FrameStep>>,
     make_initial: impl FnMut() -> Result<Vec<Block>>,
     base_dir: &std::path::Path,
     first_win: u32,
     max_horizon: u32,
-    precisions: &[crate::interpreter::abstraction::RemPrecision],
+    precisions: &[crate::interpreter::abstraction::Level],
 ) -> Result<Option<u32>> {
     let mut ladder = Ladder::new(make_engine, make_initial, base_dir, precisions);
     let mut horizon = first_win.max(1);
@@ -2550,7 +2549,7 @@ mod tests {
     #[test]
     fn forward_filter_keeps_marked_and_discards_unmarked() {
         use crate::interpreter::abstraction::RemPrecision;
-        let bits0 = RemPrecision::Bits(0);
+        let bits0 = crate::interpreter::abstraction::Level::for_rem(RemPrecision::Bits(0));
         let engine = RefEngine::new().expect("ref engine");
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-filter-test");
         let seed = || vec![Block::from_state(&engine.initial_state().expect("init")).expect("block")];
@@ -2608,7 +2607,6 @@ mod tests {
     #[test]
     #[ignore]
     fn new_ladder_confirms_to_concrete() {
-        use crate::interpreter::abstraction::{set_rem_precision, RemPrecision};
         std::env::set_var("CELESTE_START_ROOM", "1,0");
         std::env::set_var("CELESTE_WIN_AT_XY", "8,107");
         let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-full");
@@ -2621,13 +2619,11 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(15);
-        let precisions: Vec<RemPrecision> = (0u8..=maxbits)
-            .map(RemPrecision::Bits)
-            .chain(std::iter::once(RemPrecision::Exact))
-            .collect();
+        let precisions: Vec<crate::interpreter::abstraction::Level> =
+            crate::interpreter::abstraction::Level::default_ladder(maxbits);
 
-        let make_engine = |precision: RemPrecision| {
-            set_rem_precision(precision);
+        let make_engine = |precision: crate::interpreter::abstraction::Level| {
+            crate::interpreter::abstraction::set_level(precision);
             Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?)
                 as Box<dyn FrameStep>)
         };
@@ -2661,15 +2657,15 @@ mod tests {
     #[test]
     #[ignore]
     fn new_ladder_backward_preserves_win_across_rem_levels() {
-        use crate::interpreter::abstraction::{set_rem_precision, RemPrecision};
+        use crate::interpreter::abstraction::RemPrecision;
         std::env::set_var("CELESTE_START_ROOM", "1,0");
         std::env::set_var("CELESTE_WIN_AT_XY", "8,107");
 
         let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-test");
         let _ = std::fs::remove_dir_all(dir);
 
-        let make_engine = |precision: RemPrecision| {
-            set_rem_precision(precision);
+        let make_engine = |precision: crate::interpreter::abstraction::Level| {
+            crate::interpreter::abstraction::set_level(precision);
             Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?)
                 as Box<dyn FrameStep>)
         };
@@ -2684,7 +2680,10 @@ mod tests {
             make_initial,
             dir,
             14,
-            &[RemPrecision::Bits(0), RemPrecision::Bits(1)],
+            &[
+                crate::interpreter::abstraction::Level::for_rem(RemPrecision::Bits(0)),
+                crate::interpreter::abstraction::Level::for_rem(RemPrecision::Bits(1)),
+            ],
         )
         .expect("ladder");
         match outcome {
@@ -2789,7 +2788,7 @@ mod tests {
             || Ok(vec![Block::from_state(&RefEngine::new()?.initial_state()?)?]),
             dir,
             4,
-            &[RemPrecision::Bits(0)],
+            &[crate::interpreter::abstraction::Level::for_rem(RemPrecision::Bits(0))],
         )
         .expect("ladder");
         match outcome {

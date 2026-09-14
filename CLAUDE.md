@@ -431,12 +431,25 @@ hashes, so it feeds the shape hash, the row key, and what the search
 dedups on. A reordering is a different search. New names (only possible
 if the Lua changes) may be APPENDED by hand, never inserted.
 
-## The speed ladder (2026-09-14)
+## The ladder is a list of levels (2026-09-14)
 
-`CELESTE_SPD_LADDER=bucket` widens the player's `spd.x`/`spd.y` at every
-non-exact rung to the SAME bucket width as rem's (level 0: 1 px/frame;
-both exact together - `abstraction::spd_precision_for`). Off by default
-(exact speed, the ladder the pinned gates were taken with). It exists for
+A level is `abstraction::Level { rem, spd }`. `CELESTE_LADDER="r0s16,r1sx,
+...,rxsx"` gives the search an explicit list (rem rung k or x, spd bucket
+width 2^w raw units or x; each level coarser-or-equal to the next in both
+coordinates, the last exact in both) - the instrument for experiments on
+WHICH refinement to take first (`tools/ladder_model.py` reports each
+level's lower bound, marks and rows per horizon). Without it the ladder
+is rem Bits(0..=15) then exact, with the speed of each level from the
+`CELESTE_SPD_LADDER` preset: `exact` (default, the ladder the pinned
+gates were taken with), `bucket` (speed at the same bucket width as rem
+at every rung), `level0` (1 px at level 0, exact above). Kernel sets are
+keyed by the level.
+
+### The speed ladder
+
+`bucket` widens the player's `spd.x`/`spd.y` at every non-exact rung to
+the SAME bucket width as rem's (level 0: 1 px/frame; both exact together
+- `abstraction::spd_precision_for`). It exists for
 rooms whose speeds explode - room (2,0)'s spring does `spd.x *= 0.2`,
 3,200 distinct `spd.x` values against 60 in rooms (0,0)/(1,0), and 1 px
 buckets collapse its f69 frontier 19x - and it is a LOSS where they do
