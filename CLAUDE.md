@@ -445,6 +445,31 @@ gates were taken with), `bucket` (speed at the same bucket width as rem
 at every rung), `level0` (1 px at level 0, exact above). Kernel sets are
 keyed by the level.
 
+### The position rung (2026-09-14)
+
+`rem` is the sub-pixel position, so a level that knows the player's
+`x`/`y` only to a 2 px bucket is the same ladder ONE RUNG BELOW level 0:
+`Level { pos: PosPrecision { x, y }, rem, spd }`, spec `[x2][y2]r0sx`
+(`y2r0sx` = level 0 with 2 px y-buckets; `x2y2r0sx` both axes; the
+axes are independent rungs and y merges more - BENCHMARK_DATA.md "Position
+widening census": 2 px halves a frame's states, y alone 1.6x, x alone
+1.3x). Unlike the speed bucket, the frame never runs an interval
+position: the bucket arrives as an interval input, `widen::fork_pos_inputs`
+forks it into its whole-pixel points (`Op::SplitInt` -> `IntFrag(c)`, an
+EXACT number per fork configuration, validity `FragOk`, premise
+`SplitOk`), the frame runs exact collisions, and `widen_pos` snaps the
+output back to `Span(low, low + w - 1)`. So the only over-approximation is
+the boundary snap (the same mechanism as rem's), at the price of one more
+2-way fork per bucketed axis. The bucket's fork is on the integer grid,
+so a position bucket needs rem Bits(0) (`Level::grid_consistent`), and
+widths above 2 are refused (`PosPrecision::MAX_WIDTH`). A bucket's CELL
+(pos graph, door sharding, checkpoint index) is its low corner
+(`pos_graph::whole_i16_col`, the kernel's `pos_sources`). The reference
+engine forks the same points through its cursor (`refdriver::run_frame_all`
+-> `fork_pos_inputs`) and widens with `make_state_abstract_pos`; the mark
+filter widens level 0's keys with `Rt2::widen_to(.., pos)`. Kernel sets
+are keyed by the level including `pos`.
+
 ### The speed ladder
 
 `bucket` widens the player's `spd.x`/`spd.y` at every non-exact rung to

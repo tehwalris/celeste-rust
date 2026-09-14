@@ -1761,7 +1761,7 @@ fn main() -> Result<()> {
                         // successor against every layer-1 row.
                         let mut mine = block.into_rt2();
                         if let RemPrecision::Bits(b) = precision.rem {
-                            mine.widen_to(celeste_rust::compiled::ids(), b, celeste_rust::frame::spd_width_log2(precision.spd));
+                            mine.widen_to(celeste_rust::compiled::ids(), b, celeste_rust::frame::spd_width_log2(precision.spd), (precision.pos.x, precision.pos.y));
                         }
                         for file in frame_files(dir, 1)? {
                             let Some(theirs) = file.load_all()? else { continue };

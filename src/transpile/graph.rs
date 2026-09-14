@@ -270,6 +270,16 @@ pub enum Op {
     /// frame once per configuration. See `specialize_into`.
     Frag(u8),
     FragOk(u8),
+    /// A fork like `Split(d)` over an interval of WHOLE numbers whose
+    /// fragments are the numbers themselves, EXACT: `SplitInt(d)` resolves
+    /// to `IntFrag(c)`, the low end of fragment `c` as a plain number (the
+    /// player's position under a bucket: the frame runs an exact integer
+    /// position per configuration). Validity is `SplitValid(d)` /
+    /// `FragOk(c)` and the premise `SplitOk(n)`, shared with `Split`, on
+    /// the same operand - so the fork grid must be the integers (rem
+    /// Bits(0), `Level::grid_consistent`).
+    SplitInt(u8),
+    IntFrag(u8),
     /// `SplitOk(n)` over the same operand: does this lane's interval span
     /// at most `n` floors, `n` being the fork's arity? Below that the
     /// fragments partition the lane; above it there is no fragment to
@@ -413,7 +423,7 @@ impl Graph {
         for (i, node) in self.nodes.iter().enumerate() {
             let mut m = match node.op {
                 Op::Free(b) => Choice::Free(b).bit(),
-                Op::Split(d) | Op::SplitValid(d) => Choice::Split(d).bit(),
+                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) => Choice::Split(d).bit(),
                 _ => 0,
             };
             for a in &node.args {
@@ -534,6 +544,10 @@ impl Graph {
                 (Op::SplitValid(d), Some(s)) => {
                     debug_assert!((2 * d as u32) < u64::BITS, "fork {} past a u64 split mask", d);
                     out.fold(Op::FragOk(((s >> (2 * d)) & 3) as u8), vec![arg(&map, 0)])
+                }
+                (Op::SplitInt(d), Some(s)) => {
+                    debug_assert!((2 * d as u32) < u64::BITS, "fork {} past a u64 split mask", d);
+                    out.fold(Op::IntFrag(((s >> (2 * d)) & 3) as u8), vec![arg(&map, 0)])
                 }
                 _ => {
                     let args: Vec<NodeId> =
@@ -865,8 +879,28 @@ impl Graph {
                     let _ = d;
                     a(0)
                 }
-                Op::Split(d) | Op::SplitValid(d) => {
+                Op::SplitInt(_) if lenient => a(0),
+                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) => {
                     bail!("node {}: split {} has no value outside an outcome", i, d)
+                }
+                // The low end of fragment `c`, exact; under `lenient` the
+                // hull of that over the lanes: `[fl + c, fh + c]` cells.
+                Op::IntFrag(c) => {
+                    let iv = a(0).as_num("IntFrag")?;
+                    let (step, mask) = self.grid();
+                    let gflr = |p: Pico8Num| p.as_raw_u32() as i32 as i64 & mask as i64;
+                    let (fl, fh) = (gflr(iv.low), gflr(iv.high));
+                    // Clamped to the 16.16 range: the full-range hull's
+                    // high end plus a step would wrap.
+                    let clamp = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                    let base = fl + *c as i64 * step as i64;
+                    let lo = clamp((iv.low.as_raw_u32() as i32 as i64).max(base));
+                    if lenient {
+                        let hi = clamp((iv.high.as_raw_u32() as i32 as i64).max(fh + *c as i64 * step as i64));
+                        Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(lo), Pico8Num::from_raw(hi.max(lo))))
+                    } else {
+                        Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(lo), Pico8Num::from_raw(lo)))
+                    }
                 }
                 // The span premise: whether the interval fits in the
                 // fork's fragment count. Unmodellable here (the resolved

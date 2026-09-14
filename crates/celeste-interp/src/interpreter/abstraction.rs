@@ -92,6 +92,13 @@ pub fn mark_heap(state: &State) -> HeapMarks {
                         }
                     }
                 }
+                // The player's own `x`/`y`: the position widening's target
+                // (`make_state_abstract_pos`, `split_pos_points`).
+                for key in ["x", "y"] {
+                    if let Some(ptr) = player.get(key) {
+                        marks.add_mark(if key == "x" { "player_x" } else { "player_y" }, *ptr);
+                    }
+                }
                 // Mark dash_effect_time for the boundary clamp (see
                 // make_state_abstract): it decrements unconditionally every
                 // frame, so without a clamp it drifts negative forever and
@@ -298,24 +305,53 @@ pub fn spd_ladder_preset() -> SpdLadder {
     })
 }
 
-/// ONE LEVEL of the ladder: its rem and spd precisions. The search's
-/// levels are a list of these (`parse_ladder`); the process-global
-/// precisions (`set_level`) name the level whose kernels the engine
-/// dispatches to.
+/// The player's POSITION precision: the bucket width in whole pixels per
+/// axis, 1 = exact. `rem` is the sub-pixel position, so a 2 px bucket is
+/// the same ladder one rung below level 0 (which knows the position to a
+/// pixel). Only 1 or 2 today: the frame runs an EXACT integer position
+/// per fork configuration (`IntFrag`), so a bucket of width w is a w-way
+/// fork per axis, and the bucket's fork must be on the integer grid, i.e.
+/// rem Bits(0) (`Level::grid_consistent`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PosPrecision {
+    pub x: u8,
+    pub y: u8,
+}
+
+impl PosPrecision {
+    pub const EXACT: PosPrecision = PosPrecision { x: 1, y: 1 };
+    pub const MAX_WIDTH: u8 = 2;
+
+    pub fn is_exact(self) -> bool {
+        self == Self::EXACT
+    }
+
+    /// Wider-or-equal on both axes.
+    pub fn coarser_or_equal(self, finer: PosPrecision) -> bool {
+        self.x >= finer.x && self.y >= finer.y
+    }
+}
+
+/// ONE LEVEL of the ladder: its position, rem and spd precisions. The
+/// search's levels are a list of these (`parse_ladder`); the
+/// process-global precisions (`set_level`) name the level whose kernels
+/// the engine dispatches to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Level {
+    pub pos: PosPrecision,
     pub rem: RemPrecision,
     pub spd: SpdPrecision,
 }
 
 impl Level {
-    /// The level at rem rung `rem` under the spd preset.
+    /// The level at rem rung `rem` under the spd preset, exact position.
     pub fn for_rem(rem: RemPrecision) -> Level {
-        Level { rem, spd: spd_precision_for(rem) }
+        Level { pos: PosPrecision::EXACT, rem, spd: spd_precision_for(rem) }
     }
 
-    /// Both exact: the top of every ladder.
-    pub const EXACT: Level = Level { rem: RemPrecision::Exact, spd: SpdPrecision::Exact };
+    /// Exact in every coordinate: the top of every ladder.
+    pub const EXACT: Level =
+        Level { pos: PosPrecision::EXACT, rem: RemPrecision::Exact, spd: SpdPrecision::Exact };
 
     /// Every fork in a rung's graph cuts on ONE grid (2^-k for rem
     /// `Bits(k)`), and a fragment must fit two cells, so a level's spd
@@ -328,6 +364,10 @@ impl Level {
     /// 2026-09-14). Finer speed buckets than 1/1024 px never paid anyway
     /// (interval arithmetic at full price for < 4x collapse).
     pub fn grid_consistent(self) -> bool {
+        // A position bucket forks on the integer grid: rem Bits(0) only.
+        if !self.pos.is_exact() && self.rem != RemPrecision::Bits(0) {
+            return false;
+        }
         match (self.rem, self.spd) {
             (_, SpdPrecision::Exact) => true,
             (RemPrecision::Bits(k), SpdPrecision::WidthLog2(w)) => k < 16 && w == 16 - k && w >= SPD_MIN_WIDTH_LOG2,
@@ -335,15 +375,34 @@ impl Level {
         }
     }
 
-    /// Does `self` widen at least as much as `finer` in BOTH coordinates?
+    /// Does `self` widen at least as much as `finer` in EVERY coordinate?
     pub fn coarser_or_equal(self, finer: Level) -> bool {
-        self.rem.coarser_or_equal(finer.rem) && self.spd.coarser_or_equal(finer.spd)
+        self.pos.coarser_or_equal(finer.pos)
+            && self.rem.coarser_or_equal(finer.rem)
+            && self.spd.coarser_or_equal(finer.spd)
     }
 
-    /// One level from `r<k|x>s<w|x>`: rem rung k (0..=15) or exact, spd
-    /// bucket width 2^w raw units (1..=20) or exact.
+    /// One level from `[x<w>][y<w>]r<k|x>s<w|x>`: an optional position
+    /// bucket width per axis in pixels (2; absent = exact), rem rung k
+    /// (0..=15) or exact, spd bucket width 2^w raw units or exact.
     pub fn parse(spec: &str) -> Result<Level, String> {
-        let s = spec.trim();
+        let mut s = spec.trim();
+        let mut pos = PosPrecision::EXACT;
+        for axis in ['x', 'y'] {
+            if let Some(rest) = s.strip_prefix(axis) {
+                let n = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+                let w: u8 = rest[..n].parse().map_err(|e| format!("level {spec:?}: {axis} bucket: {e}"))?;
+                if !(1..=PosPrecision::MAX_WIDTH).contains(&w) {
+                    return Err(format!("level {spec:?}: {axis} bucket {w} px outside 1..={}", PosPrecision::MAX_WIDTH));
+                }
+                if axis == 'x' {
+                    pos.x = w;
+                } else {
+                    pos.y = w;
+                }
+                s = &rest[n..];
+            }
+        }
         let (r, sp) = s
             .strip_prefix('r')
             .and_then(|t| t.split_once('s'))
@@ -367,7 +426,7 @@ impl Level {
                 SpdPrecision::WidthLog2(w)
             }
         };
-        Ok(Level { rem, spd })
+        Ok(Level { pos, rem, spd })
     }
 
     /// A ladder from a comma-separated list of levels, coarsest first,
@@ -382,7 +441,7 @@ impl Level {
             if !l.grid_consistent() {
                 return Err(format!(
                     "ladder: {l} - with the single-grid fork a level's spd bucket must be the rem grid \
-                     (r<k>s<16-k>) or exact; speed cannot be refined independently of rem"
+                     (r<k>s<16-k>) or exact, and a position bucket needs rem Bits(0)"
                 ));
             }
         }
@@ -411,10 +470,29 @@ impl std::fmt::Display for Level {
     /// gate was taken with), `Bits(k)/W<w>` with a speed bucket.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.spd {
-            SpdPrecision::Exact => write!(f, "{:?}", self.rem),
-            SpdPrecision::WidthLog2(w) => write!(f, "{:?}/W{w}", self.rem),
+            SpdPrecision::Exact => write!(f, "{:?}", self.rem)?,
+            SpdPrecision::WidthLog2(w) => write!(f, "{:?}/W{w}", self.rem)?,
         }
+        if !self.pos.is_exact() {
+            write!(f, "/P{}x{}", self.pos.x, self.pos.y)?;
+        }
+        Ok(())
     }
+}
+
+/// The process-global position precision (`set_level`): `x | y << 4`,
+/// bucket widths in pixels; 0 (unset) reads as exact.
+static POS_PRECISION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn pos_precision() -> PosPrecision {
+    match POS_PRECISION.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => PosPrecision::EXACT,
+        v => PosPrecision { x: v & 0xf, y: v >> 4 },
+    }
+}
+
+pub fn set_pos_precision(p: PosPrecision) {
+    POS_PRECISION.store(p.x | (p.y << 4), std::sync::atomic::Ordering::Relaxed);
 }
 
 static SPD_PRECISION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SPD_UNSET);
@@ -444,12 +522,13 @@ pub fn set_spd_precision(p: SpdPrecision) {
 
 /// The level whose kernels the engine dispatches to, from here on.
 pub fn set_level(l: Level) {
+    set_pos_precision(l.pos);
     set_rem_precision(l.rem);
     set_spd_precision(l.spd);
 }
 
 pub fn current_level() -> Level {
-    Level { rem: rem_precision_from_env(), spd: spd_precision() }
+    Level { pos: pos_precision(), rem: rem_precision_from_env(), spd: spd_precision() }
 }
 
 fn spd_width_override() -> Option<u8> {
@@ -473,10 +552,85 @@ fn spd_width_override() -> Option<u8> {
 }
 
 pub fn make_state_abstract(state: State) -> State {
-    erase_provenance_hints(apply_conservative_widenings(make_state_abstract_spd(
-        make_state_abstract_rem(state, rem_precision_from_env()),
-        spd_precision(),
+    erase_provenance_hints(apply_conservative_widenings(make_state_abstract_pos(
+        make_state_abstract_spd(make_state_abstract_rem(state, rem_precision_from_env()), spd_precision()),
+        pos_precision(),
     )))
+}
+
+/// The position widening at `precision`: the player's `x`/`y` (whole
+/// pixels) snapped to their floor-aligned bucket of `precision.x`/`.y`
+/// pixels as a closed interval `[low, low + w - 1]`. Exact is a no-op.
+pub fn make_state_abstract_pos(mut state: State, precision: PosPrecision) -> State {
+    if precision.is_exact() {
+        return state;
+    }
+    let marks = mark_heap(&state);
+    for (axis, w) in [("player_x", precision.x), ("player_y", precision.y)] {
+        if w <= 1 {
+            continue;
+        }
+        let Some(heap_ids) = marks.marks.get(axis) else { continue };
+        let width = w as i32;
+        let bucket = |n: Pico8Num| -> Pico8NumInterval {
+            let whole = n.as_i16().unwrap_or_else(|| panic!("player {axis} {n:?} is not a whole pixel")) as i32;
+            let low = whole.div_euclid(width) * width;
+            Pico8NumInterval::new(Pico8Num::from_i16(low as i16), Pico8Num::from_i16((low + width - 1) as i16))
+        };
+        let widen_interval = |iv: &Pico8NumInterval| -> Pico8NumInterval {
+            Pico8NumInterval::new(bucket(iv.low).low, bucket(iv.high).high)
+        };
+        for &heap_id in heap_ids {
+            if let HeapValue::Value(value) = state.heap.get(heap_id) {
+                let new_value = match value {
+                    Value::Number(MaybeVector::Scalar(n)) => Value::NumberInterval(MaybeVector::Scalar(bucket(*n))),
+                    Value::Number(MaybeVector::Vector(nums)) => {
+                        Value::NumberInterval(MaybeVector::vector(nums.iter().map(|n| bucket(*n)).collect()))
+                    }
+                    Value::NumberInterval(MaybeVector::Scalar(iv)) => {
+                        Value::NumberInterval(MaybeVector::Scalar(widen_interval(iv)))
+                    }
+                    Value::NumberInterval(MaybeVector::Vector(ivs)) => {
+                        Value::NumberInterval(MaybeVector::vector(ivs.iter().map(widen_interval).collect()))
+                    }
+                    other => panic!("Unexpected value type for {axis} at {:?}: {:?}", heap_id, other),
+                };
+                state.heap.set(heap_id, HeapValue::Value(new_value));
+            }
+        }
+    }
+    state
+}
+
+/// The reference's INPUT side of the position widening: a state whose
+/// player `x`/`y` is a bucket interval becomes one state per whole-pixel
+/// point in it (the kernels run the same points as fork configurations,
+/// `IntFrag`). Scalar (single-lane) states only - the reference engine
+/// runs one lane at a time.
+pub fn split_pos_points(state: State) -> Vec<State> {
+    let marks = mark_heap(&state);
+    let mut work = vec![state];
+    for axis in ["player_x", "player_y"] {
+        let Some(cells) = marks.marks.get(axis).cloned() else { continue };
+        for cell in cells {
+            let mut next = Vec::new();
+            for st in work {
+                let Some(HeapValue::Value(Value::NumberInterval(MaybeVector::Scalar(iv)))) = st.heap.get_opt(cell) else {
+                    next.push(st);
+                    continue;
+                };
+                let lo = iv.low.as_i16().unwrap_or_else(|| panic!("{axis} bucket {iv:?} is not whole pixels"));
+                let hi = iv.high.as_i16().unwrap_or_else(|| panic!("{axis} bucket {iv:?} is not whole pixels"));
+                for p in lo..=hi {
+                    let mut s = st.clone();
+                    s.heap.set(cell, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(p)))));
+                    next.push(s);
+                }
+            }
+            work = next;
+        }
+    }
+    work
 }
 
 /// Canonicalize provenance strings at the frame boundary: `Nil(Some(hint))`
@@ -1234,6 +1388,31 @@ mod tests {
 
     /// `SpdPrecision::Exact` must leave any state bit-identical (it is the
     /// default; existing campaigns and gates depend on this being a no-op).
+    /// The position rung: `y2r0sx` is level 0 with 2 px y-buckets, coarser
+    /// than level 0 and finer than nothing narrower; a bucket needs rem
+    /// Bits(0) (the fork grid is the integers); widths above 2 are refused.
+    #[test]
+    fn position_levels_parse_and_order() {
+        let y2 = Level::parse("y2r0sx").unwrap();
+        assert_eq!(y2.pos, PosPrecision { x: 1, y: 2 });
+        assert_eq!(y2.rem, RemPrecision::Bits(0));
+        assert_eq!(y2.to_string(), "Bits(0)/P1x2");
+        let xy = Level::parse("x2y2r0sx").unwrap();
+        assert_eq!(xy.pos, PosPrecision { x: 2, y: 2 });
+        assert!(xy.coarser_or_equal(y2) && !y2.coarser_or_equal(xy));
+        assert!(y2.coarser_or_equal(Level::for_rem(RemPrecision::Bits(0))));
+        assert!(!Level::for_rem(RemPrecision::Bits(0)).coarser_or_equal(y2));
+        assert!(Level::parse("y2r1sx").unwrap().grid_consistent() == false);
+        assert!(Level::parse("y3r0sx").is_err());
+        assert_eq!(Level::parse("r0sx").unwrap().pos, PosPrecision::EXACT);
+        let ladder = Level::parse_ladder("x2y2r0sx,y2r0sx,r0sx,r1sx,rxsx").unwrap();
+        assert_eq!(ladder.len(), 5);
+        assert!(Level::parse_ladder("y2r0sx,x2r0sx,rxsx").is_err(), "x2 is not finer than y2");
+        // The reference widening and its input split round-trip a point.
+        let l = Level::parse("x2y2r0sx").unwrap();
+        assert_eq!(l.pos.x, 2);
+    }
+
     #[test]
     fn spd_exact_is_a_no_op_and_split_passthrough() {
         // Cheap structural check without building a game state: the
@@ -1259,8 +1438,8 @@ mod tests {
         // The ladder spec.
         let l = Level::parse_ladder("r0s16,r1s15,r2sx,rxsx").unwrap();
         assert_eq!(l.len(), 4);
-        assert_eq!(l[0], Level { rem: RemPrecision::Bits(0), spd: SpdPrecision::WidthLog2(16) });
-        assert_eq!(l[2], Level { rem: RemPrecision::Bits(2), spd: SpdPrecision::Exact });
+        assert_eq!(l[0], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(0), spd: SpdPrecision::WidthLog2(16) });
+        assert_eq!(l[2], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(2), spd: SpdPrecision::Exact });
         assert!(Level::parse_ladder("r0sx,r0s16,rxsx").is_err(), "spd may not get coarser");
         assert!(Level::parse_ladder("r0s16,r1s15").is_err(), "must end exact");
         assert!(Level::parse_ladder("r0s16,r1s16,rxsx").is_err(), "spd bucket must be the rem grid");

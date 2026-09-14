@@ -182,6 +182,7 @@ pub fn trace_frame<'a>(
     // Fork choices are per FRAME, like the six buttons above.
     it.d.forks = 0;
     it.d.fork_memo.clear();
+    it.d.fork_memo_int.clear();
     // The fork grid is the rung's rem bucket width: `move` forks at the
     // bucket edges (which include the integers), so one fork per axis
     // settles the integer move AND the output bucket, and the boundary
@@ -193,7 +194,7 @@ pub fn trace_frame<'a>(
     // The `move` fork's arity: three under a bucketed speed (see
     // `Domain::move_ways`), two otherwise.
     it.d.move_ways = match widen {
-        Some(super::widen::WidenMode::Level0(spd)) | Some(super::widen::WidenMode::RemRung(_, spd))
+        Some(super::widen::WidenMode::Level0(spd, _)) | Some(super::widen::WidenMode::RemRung(_, spd))
             if matches!(spd, crate::interpreter::abstraction::SpdPrecision::WidthLog2(_)) =>
         {
             3
@@ -219,6 +220,16 @@ pub fn trace_frame<'a>(
     };
     let in_rt2 = super::bind::structure_of(&st, cart.clone(), cache.clone())?;
     let in_cells = super::bind::bind_inputs(&in_rt2, &iface)?;
+    // A position bucket in the input runs as one exact position per fork
+    // configuration. After the input shape is taken (the block carries
+    // the bucket), before anything reads the position.
+    let mut st = st;
+    if let Some(super::widen::WidenMode::Level0(_, pos)) = widen {
+        super::widen::fork_pos_inputs(&mut st, &mut it.d, pos)?;
+        if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+            eprintln!("[build] trace_frame {widen:?}: {} forks after fork_pos_inputs, {} ival slots", it.d.forks, iface.ival.iter().filter(|b| **b).count());
+        }
+    }
     let st = run_one(it, reset, st)?;
     let mut outs = Vec::new();
     for (s, f) in it.exec_block(frame.nodes(), st)? {
@@ -266,6 +277,9 @@ pub fn trace_frame<'a>(
             ubool_cells: ubool_cells.to_vec(),
             st: s,
         });
+    }
+    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+        eprintln!("[build] trace_frame {widen:?}: {} forks at the end, {} outcomes, {} pins", it.d.forks, outs.len(), pin.len());
     }
     Ok(Frame { iface, forks: it.d.forks, outs, in_cells, in_rt2 })
 }

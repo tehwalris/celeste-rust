@@ -1504,8 +1504,12 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]
     // `None` = not a plain number in every row.
     let src_of = |cell: u32| -> Result<Option<PosSrc>> {
         if let Some(f) = fields.iter().find(|f| f.cell == cell as usize) {
+            // A position bucket (`Span`, the rung below level 0) is an
+            // interval root whose low lanes sit at the same offset as a
+            // number's; its cell is the bucket's low corner
+            // (`pos_graph::whole_i16_col`).
             return Ok(match f.kind {
-                RootKind::Num => Some(PosSrc::Root(f.root * 128)),
+                RootKind::Num | RootKind::Ival => Some(PosSrc::Root(f.root * 128)),
                 _ => None,
             });
         }
@@ -1675,8 +1679,9 @@ pub(crate) fn registry() -> Option<&'static Registry> {
 fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'static Registry> {
     use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
     const SPD_SLOTS: usize = 21;
-    static REGS: [std::sync::OnceLock<Option<Registry>>; 17 * SPD_SLOTS] =
-        [const { std::sync::OnceLock::new() }; 17 * SPD_SLOTS];
+    const POS_SLOTS: usize = 4;
+    static REGS: [std::sync::OnceLock<Option<Registry>>; 17 * SPD_SLOTS * POS_SLOTS] =
+        [const { std::sync::OnceLock::new() }; 17 * SPD_SLOTS * POS_SLOTS];
     let rem_slot = match level.rem {
         RemPrecision::Exact => 16,
         RemPrecision::Bits(b) => (b as usize).min(16),
@@ -1685,7 +1690,8 @@ fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'stati
         SpdPrecision::Exact => 20,
         SpdPrecision::WidthLog2(w) => (w as usize).clamp(1, 20) - 1,
     };
-    REGS[rem_slot * SPD_SLOTS + spd_slot].get_or_init(|| build_registry_for_rung(level)).as_ref()
+    let pos_slot = (level.pos.x.clamp(1, 2) as usize - 1) + 2 * (level.pos.y.clamp(1, 2) as usize - 1);
+    REGS[(rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot].get_or_init(|| build_registry_for_rung(level)).as_ref()
 }
 
 /// Build every rung's kernel set now, all rungs at once (one builder
@@ -1711,7 +1717,7 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
     let mode = super::dispatch::traced_mode_for(rem);
     let (opts, exact) = match mode {
-        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd), false),
+        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos), false),
         super::dispatch::TracedMode::Level0Agnostic => {
             // Phase 1: the opt-in rung-specific variant bakes the rem
             // widening into the graph (`ladder_widen`), still through
@@ -1733,7 +1739,7 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
         .expect("asm-kernel builder panicked");
     match built {
         Ok(reg) => {
-            eprintln!("ASM kernels ENABLED ({mode:?}, {rem:?}): {} start-room shapes assembled", reg.len());
+            eprintln!("ASM kernels ENABLED ({mode:?}, {level}): {} start-room shapes assembled", reg.len());
             Some(reg)
         }
         Err(e) => panic!("building ASM kernels for {rem:?}: {e:#}"),

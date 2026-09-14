@@ -89,19 +89,45 @@ pub fn cell_xy(cell: u32) -> Option<(i32, i32)> {
 }
 
 /// A numeric column's whole parts, one per lane, or `None` if any lane is
-/// not a plain number (an interval, a pointer, nil).
+/// not a number or an interval (a pointer, nil). An INTERVAL is a position
+/// bucket (the rung below level 0, `abstraction::PosPrecision`) and its
+/// cell is the bucket's low corner - the one rule every reader of a
+/// position shares (`block_cells`, the kernel's `pos_sources`).
 pub(crate) fn whole_i16_col(rt2: &Rt2, cell: u32) -> Option<Vec<i16>> {
     match &rt2.cols[cell as usize] {
         Col::U(AV::Num(n)) => Some(vec![n.whole_part_as_i16(); rt2.width]),
+        Col::U(AV::Ival(a, _)) => Some(vec![a.whole_part_as_i16(); rt2.width]),
         Col::N(vs) => Some(vs.iter().map(|n| n.whole_part_as_i16()).collect()),
+        Col::I(vs) => Some(vs.iter().map(|(a, _)| a.whole_part_as_i16()).collect()),
         Col::V(vs) => vs
             .iter()
             .map(|v| match v {
                 AV::Num(n) => Some(n.whole_part_as_i16()),
+                AV::Ival(a, _) => Some(a.whole_part_as_i16()),
                 _ => None,
             })
             .collect(),
         _ => None,
+    }
+}
+
+/// A position column's whole-pixel RANGE per lane: `(w, w)` for a number,
+/// the bucket's corners for an interval (the position rung); `None` if any
+/// lane is neither. The win tests use this: a bucket wins where the
+/// target lies inside it.
+pub(crate) fn whole_range_col(rt2: &Rt2, cell: u32) -> Option<Vec<(i16, i16)>> {
+    let one = |v: AV| -> Option<(i16, i16)> {
+        match v {
+            AV::Num(n) => Some((n.whole_part_as_i16(), n.whole_part_as_i16())),
+            AV::Ival(a, b) => Some((a.whole_part_as_i16(), b.whole_part_as_i16())),
+            _ => None,
+        }
+    };
+    match &rt2.cols[cell as usize] {
+        Col::U(v) => one(*v).map(|r| vec![r; rt2.width]),
+        Col::N(vs) => Some(vs.iter().map(|n| (n.whole_part_as_i16(), n.whole_part_as_i16())).collect()),
+        Col::I(vs) => Some(vs.iter().map(|(a, b)| (a.whole_part_as_i16(), b.whole_part_as_i16())).collect()),
+        Col::V(vs) => vs.iter().map(|v| one(*v)).collect(),
     }
 }
 

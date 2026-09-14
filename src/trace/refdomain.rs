@@ -285,6 +285,14 @@ impl Domain for RefDomain {
         (floor_fragment(v, k), true)
     }
 
+    fn fork_int(&mut self, v: &Iv, _ways: u8) -> (Iv, bool) {
+        let n = floor_span(v);
+        let k = self.cursor.choose(n);
+        let base = v.low.flr().as_i16_or_err().unwrap_or(0) + k as i16;
+        let p = P8::from_i16(base);
+        (Iv::new(p, p), true)
+    }
+
     fn span_ok(&mut self, _v: &Iv, _ways: u8) -> bool {
         // We fork on the ACTUAL floor span, so the premise holds by construction.
         true

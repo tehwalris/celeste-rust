@@ -44,7 +44,7 @@ use crate::transpile::graph::Op;
 /// Objects whose `type` is the global `name` - the rule `mark_walk` uses
 /// to find the player, rather than a position in the object list, since
 /// which object is the player changes within a room.
-fn objects_of_type(st: &State<Symbolic>, name: &str) -> Vec<Path> {
+fn objects_of_type<D: Domain>(st: &State<D>, name: &str) -> Vec<Path> {
     let Some(Value::Table(want)) = iface::get(st, &[iface::key(name)]) else {
         return Vec::new();
     };
@@ -91,8 +91,10 @@ pub enum WidenMode {
     /// The full Bits(0) boundary widenings (rem -> [-0.5, 0.5), the
     /// timer globals -> 0, `dash_effect_time` -> max(0, .), a live
     /// fruit's `off`/`y` -> its bob band), all in the graph. The
-    /// production level-0 set. Carries the level's spd precision.
-    Level0(crate::interpreter::abstraction::SpdPrecision),
+    /// production level-0 set. Carries the level's spd and position
+    /// precisions (the position rung below level 0 is a Level0 set with
+    /// a position bucket: `Level::grid_consistent`).
+    Level0(crate::interpreter::abstraction::SpdPrecision, crate::interpreter::abstraction::PosPrecision),
     /// ONLY the rem widening, at the configured Bits(k) rung, via a
     /// bucket fork + snap. Phase 1 of moving the ladder widening into
     /// the graph (plans/keying-widening-flow.md): the rung-agnostic
@@ -114,15 +116,16 @@ pub enum WidenMode {
 /// `apply_conservative_widenings` clamps dash and pins timers regardless),
 /// so both modes apply them; only rem and spd differ by rung.
 pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Result<()> {
-    use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
+    use crate::interpreter::abstraction::RemPrecision;
     // The level's rem and spd precisions (`abstraction::Level`), explicit
     // so every level's set can be traced at once.
-    let (rem, spd): (RemPrecision, SpdPrecision) = match mode {
-        WidenMode::Level0(spd) => (RemPrecision::Bits(0), spd),
-        WidenMode::RemRung(rem, spd) => (rem, spd),
+    let (rem, spd, pos) = match mode {
+        WidenMode::Level0(spd, pos) => (RemPrecision::Bits(0), spd, pos),
+        WidenMode::RemRung(rem, spd) => (rem, spd, crate::interpreter::abstraction::PosPrecision::EXACT),
     };
     widen_rem(st, d, rem)?;
     widen_spd(st, d, spd)?;
+    widen_pos(st, d, pos)?;
     widen_dash(st, d)?;
     widen_fruit(st, d)?;
     widen_timers(st, d)?;
@@ -359,6 +362,85 @@ fn widen_spd(
             let ok = st.ok;
             st.ok = d.and(&ok, &sb.premise);
             iface::set(st, &p, Value::Num(sb.value))?;
+        }
+    }
+    Ok(())
+}
+
+/// The position widening at `pos` (the OUTPUT side): the player's whole
+/// pixel `x`/`y` snapped to its floor-aligned bucket of `w` pixels,
+/// `Span(low, low + w - 1)` with `low = w * flr(x / w)`. The analogue of
+/// `make_state_abstract_pos`. No fork and no premise: the frame ran an
+/// exact integer position (`fork_pos_inputs`), so `x` is a number.
+fn widen_pos(
+    st: &mut State<Symbolic>,
+    d: &mut Symbolic,
+    pos: crate::interpreter::abstraction::PosPrecision,
+) -> Result<()> {
+    if pos.is_exact() {
+        return Ok(());
+    }
+    for obj in objects_of_type(st, "player") {
+        for (f, w) in [("x", pos.x), ("y", pos.y)] {
+            if w <= 1 {
+                continue;
+            }
+            let p = field(&obj, &[f]);
+            let Some(Value::Num(old)) = iface::get(st, &p) else {
+                bail!("{}: position is not a number", iface::show(&p));
+            };
+            anyhow::ensure!(!d.is_interval(&old), "{}: position is an interval at the output", iface::show(&p));
+            let width = d.num(P8::from_i16(w as i16));
+            let scaled = d.arith(super::domain::Arith::Div, &old, &width)?;
+            let idx = d.fun1(super::domain::Fun1::Flr, &scaled)?;
+            let low = d.arith(super::domain::Arith::Mul, &idx, &width)?;
+            let span_minus_one = d.num(P8::from_i16(w as i16 - 1));
+            let high = d.arith(super::domain::Arith::Add, &low, &span_minus_one)?;
+            let value = d.graph.fold(Op::Span, vec![low, high]);
+            iface::set(st, &p, Value::Num(value))?;
+        }
+    }
+    Ok(())
+}
+
+/// The position widening's INPUT side: a player `x`/`y` that arrives as a
+/// bucket interval is forked into its whole-pixel points (`fork_int`:
+/// `Op::SplitInt`, one exact position per configuration), with the fork's
+/// validity in the guard and its span premise (at most `w` pixels) in
+/// `ok`. Generic over the domain: the reference engine forks the same way
+/// through its cursor (`refdriver::run_frame_all`). A position that is
+/// already a number is left alone.
+pub fn fork_pos_inputs<D: Domain>(
+    st: &mut State<D>,
+    d: &mut D,
+    pos: crate::interpreter::abstraction::PosPrecision,
+) -> Result<()> {
+    if pos.is_exact() {
+        return Ok(());
+    }
+    for obj in objects_of_type(st, "player") {
+        for (f, w) in [("x", pos.x), ("y", pos.y)] {
+            if w <= 1 {
+                continue;
+            }
+            let p = field(&obj, &[f]);
+            let Some(Value::Num(old)) = iface::get(st, &p) else {
+                bail!("{}: position is not a number", iface::show(&p));
+            };
+            if !d.is_interval(&old) {
+                if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+                    eprintln!("[build] fork_pos_inputs: {} is not an interval, no fork", iface::show(&p));
+                }
+                continue;
+            }
+            if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+                eprintln!("[build] fork_pos_inputs: forking {} {w}-way", iface::show(&p));
+            }
+            let (v, valid) = d.fork_int(&old, w);
+            let premise = d.span_ok(&old, w);
+            st.guard = d.and(&st.guard, &valid);
+            st.ok = d.and(&st.ok, &premise);
+            iface::set(st, &p, Value::Num(v))?;
         }
     }
     Ok(())

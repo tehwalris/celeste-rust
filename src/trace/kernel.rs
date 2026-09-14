@@ -447,7 +447,7 @@ pub fn specialize_probe(
 
     // Only keep pins whose path is actually a scalar in this state.
     let roots = shapes::state_paths(&st)?;
-    let ival = shapes::ival_paths(&st, false);
+    let ival = shapes::ival_paths(&st, false, (false, false));
     pin.retain(|(p, _)| roots.iter().any(|r| r == p));
 
     let pinned_paths: Vec<String> = pin.iter().map(|(p, _)| iface::show(p)).collect();
@@ -480,12 +480,12 @@ pub fn specialize_probe(
     }
 
     // Base: same shape, NO pins.
-    let base = trace_frame(&mut it, &reset, &fr, st.clone(), &roots, &[], &ival, Some(crate::trace::widen::WidenMode::Level0(crate::interpreter::abstraction::SpdPrecision::Exact)))
+    let base = trace_frame(&mut it, &reset, &fr, st.clone(), &roots, &[], &ival, Some(crate::trace::widen::WidenMode::Level0(crate::interpreter::abstraction::SpdPrecision::Exact, crate::interpreter::abstraction::PosPrecision::EXACT)))
         .map_err(|e| anyhow!("base trace of shape {}: {:#}", shape_idx, e))?;
     let (bn, bf, _) = measure(&it.d.graph, &base);
 
     // Pinned.
-    let f = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, Some(crate::trace::widen::WidenMode::Level0(crate::interpreter::abstraction::SpdPrecision::Exact)))
+    let f = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, Some(crate::trace::widen::WidenMode::Level0(crate::interpreter::abstraction::SpdPrecision::Exact, crate::interpreter::abstraction::PosPrecision::EXACT)))
         .map_err(|e| anyhow!("pinned trace of shape {}: {:#}", shape_idx, e))?;
     let (pn, pf, ptop) = measure(&it.d.graph, &f);
 
@@ -633,7 +633,7 @@ pub fn room_constant_lattice(
     let mut refused: std::collections::BTreeMap<String, String> = Default::default();
 
     let sk = key(&start)?;
-    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival())?);
+    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival())?);
     reps.insert(sk.clone(), start.clone());
     let mut work: Vec<String> = vec![sk];
     let room0 = shapes::room_of(&start, &it.d);
@@ -644,7 +644,7 @@ pub fn room_constant_lattice(
         if guard > 20000 { bail!("constant-lattice fixpoint did not converge"); }
         let st = reps[&k].clone();
         let roots = shapes::state_paths(&st)?;
-        let ival = if opts.ival { shapes::ival_paths(&st, opts.spd_ival()) } else { Vec::new() };
+        let ival = if opts.ival { shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival()) } else { Vec::new() };
         // Pin the shape's known constants (only those that are real scalar
         // inputs here), everything else abstract.
         let pin: Vec<(super::iface::Path, super::iface::Conc)> = lattice[&k]
@@ -691,7 +691,7 @@ pub fn room_constant_lattice(
             if it.d.decide(&o.ok) == Some(false) { continue; }
             if shapes::room_of(&o.st, &it.d) != room0 { continue; }
             let tk = key(&o.st)?;
-            let fc = shapes::field_constants(&o.st, &it.d, opts.spd_ival())?;
+            let fc = shapes::field_constants(&o.st, &it.d, opts.spd_ival(), opts.pos_ival())?;
             let changed = match lattice.get_mut(&tk) {
                 None => {
                     lattice.insert(tk.clone(), fc);

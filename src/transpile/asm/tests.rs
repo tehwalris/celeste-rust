@@ -208,6 +208,7 @@ fn eval_nodes(
             }
             Op::Span => V::I(ZI { lo: iv(0).lo, hi: iv(1).hi }),
             Op::Frag(c) => V::I(zi_fork_flr(iv(0), *c as usize, g.fork_bits()).0),
+            Op::IntFrag(c) => V::N(zi_fork_flr(iv(0), *c as usize, g.fork_bits()).0.lo),
             Op::FragOk(c) => {
                 let (_, ok) = zi_fork_flr(iv(0), *c as usize, g.fork_bits());
                 V::B(ZB { val: ok, known: ALL })
@@ -413,6 +414,9 @@ fn build_interval_graph(cells: &[u32], fork_bits: u8) -> (Graph, Vec<NodeId>) {
         let ok1 = g.add(Op::FragOk(1), vec![mx]);
         let frag2 = g.add(Op::Frag(2), vec![mx]);
         let ok2 = g.add(Op::FragOk(2), vec![mx]);
+        // the exact-number fragments of a position bucket
+        let ifrag0 = g.add(Op::IntFrag(0), vec![mx]);
+        let ifrag1 = g.add(Op::IntFrag(1), vec![mx]);
         // select an interval on a decided bool
         let seli = g.add(Op::Sel, vec![spanok, frag0, frag1]);
         // a spread of typed roots
@@ -429,6 +433,8 @@ fn build_interval_graph(cells: &[u32], fork_bits: u8) -> (Graph, Vec<NodeId>) {
         roots.push(ok1);
         roots.push(frag2);
         roots.push(ok2);
+        roots.push(ifrag0);
+        roots.push(ifrag1);
         roots.push(seli);
     }
     (g, roots)

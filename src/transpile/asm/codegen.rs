@@ -638,10 +638,17 @@ impl<'a> Lower<'a> {
         match self.vals[id as usize] {
             Some(Value::Num(n)) => Ok(n),
             _ => bail!(
-                "node {} (op {:?}, domain {}) is not a numeric value where one was needed",
+                "node {} (op {:?}, domain {}; args {}) is not a numeric value where one was needed",
                 id,
                 self.g.get(id).op,
-                self.dom(id)
+                self.dom(id),
+                self.g
+                    .get(id)
+                    .args
+                    .iter()
+                    .map(|&a| format!("{a}={:?}/d{}", self.g.get(a).op, self.dom(a)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }
     }
@@ -1108,6 +1115,14 @@ impl<'a> Lower<'a> {
                 let ar = self.ival_regs(iv);
                 let (_, ok) = self.zi_fork_flr(ar, *c);
                 Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
+            }
+            // The low end of fragment `c` as an EXACT number (a whole-pixel
+            // position under a bucket).
+            Op::IntFrag(c) => {
+                let iv = self.as_ival(a[0])?;
+                let ar = self.ival_regs(iv);
+                let (frag, _) = self.zi_fork_flr(ar, *c);
+                Value::Num(NumVal::Reg(frag[0]))
             }
             Op::SplitOk(ways) => {
                 let iv = self.as_ival(a[0])?;

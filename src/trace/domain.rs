@@ -182,6 +182,13 @@ pub trait Domain {
         (v.clone(), self.boolean(true))
     }
 
+    /// A fork over an interval of WHOLE numbers whose fragments are the
+    /// numbers themselves, each EXACT (`Op::SplitInt`): the player's
+    /// position under a bucket. Same validity and premise as `fork_flr`.
+    fn fork_int(&mut self, v: &Self::Num, _ways: u8) -> (Self::Num, Self::Bool) {
+        (v.clone(), self.boolean(true))
+    }
+
     /// The premise a fork is taken under: this lane's interval spans at
     /// most `ways` floors, as many as there are fragments. An
     /// obligation, not a guard - a lane that fails it is REAL and this
@@ -321,6 +328,8 @@ pub struct Symbolic {
     ///
     /// Per frame, like `forks` itself - cleared beside it.
     pub fork_memo: std::collections::HashMap<NodeId, (u8, (NodeId, NodeId))>,
+    /// `fork_memo` for `fork_int` (a different op over the same value).
+    pub fork_memo_int: std::collections::HashMap<NodeId, (u8, (NodeId, NodeId))>,
     /// Input cells that hold an INTERVAL rather than a number - the
     /// player's `rem.x`/`rem.y`, which the boundary widens.
     ///
@@ -495,6 +504,8 @@ impl Domain for Symbolic {
                 Op::Cell(c) => ival.contains(&c),
                 Op::Const(lo, hi) => lo != hi,
                 Op::Split(_) => true,
+                // An exact whole number per configuration.
+                Op::SplitInt(_) => false,
                 // Unconditionally, like a non-degenerate `Const`: a
                 // span exists precisely because its two bounds are
                 // different nodes. (`fold` collapses a span of two
@@ -547,6 +558,23 @@ impl Domain for Symbolic {
             self.graph.fold(Op::SplitValid(d), vec![*v]),
         );
         self.fork_memo.insert(*v, (d, out));
+        out
+    }
+
+    fn fork_int(&mut self, v: &NodeId, ways: u8) -> (NodeId, NodeId) {
+        if let Some(hit) = self.fork_memo_int.get(v) {
+            let (d, out) = *hit;
+            self.graph.set_fork_ways(d, ways);
+            return out;
+        }
+        let d = self.forks;
+        self.forks += 1;
+        self.graph.set_fork_ways(d, ways);
+        let out = (
+            self.graph.fold(Op::SplitInt(d), vec![*v]),
+            self.graph.fold(Op::SplitValid(d), vec![*v]),
+        );
+        self.fork_memo_int.insert(*v, (d, out));
         out
     }
 

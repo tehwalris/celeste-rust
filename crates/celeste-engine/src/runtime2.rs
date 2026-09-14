@@ -686,7 +686,7 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, 0, None);
+        self.widen_to(ids, 0, None, (1, 1));
     }
 
     /// The boundary widenings of the `Bits(rem_bits)` level on this block's
@@ -705,8 +705,47 @@ impl Rt2 {
     /// players' `spd.x`/`spd.y` to, `None` for exact speed - the level's
     /// `abstraction::spd_precision_for`, which the caller passes because
     /// the switch lives above this crate.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<u8>) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<u8>, pos: (u8, u8)) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
+
+        // 0. position widening (the rung below level 0): the player's
+        // whole-pixel x/y to their floor-aligned bucket of `pos.0`/`pos.1`
+        // pixels (`abstraction::make_state_abstract_pos`).
+        for obj in self.player_objects(ids) {
+            for (f, w) in [(ids.f_x, pos.0), (ids.f_y, pos.1)] {
+                if w <= 1 {
+                    continue;
+                }
+                let Some(c) = self.obj_field_cell(obj, f) else { continue };
+                let width = w as i32;
+                let pbucket = |n: P8| -> (P8, P8) {
+                    let whole = n.whole_part_as_i16() as i32;
+                    let low = whole.div_euclid(width) * width;
+                    (P8::from_i16(low as i16), P8::from_i16((low + width - 1) as i16))
+                };
+                let widen = |v: AV| -> AV {
+                    match v {
+                        AV::Num(n) => {
+                            let (lo, hi) = pbucket(n);
+                            AV::Ival(lo, hi)
+                        }
+                        AV::Ival(a, b) => AV::Ival(pbucket(a).0, pbucket(b).1),
+                        other => panic!("Unexpected value type for player position: {:?}", other),
+                    }
+                };
+                self.cols[c as usize] = match &self.cols[c as usize] {
+                    Col::U(v) => Col::U(widen(*v)),
+                    Col::V(vs) => Col::V(vs.iter().map(|v| widen(*v)).collect()),
+                    Col::N(vs) => Col::V(vs.iter().map(|n| widen(AV::Num(*n))).collect()),
+                    Col::I(vs) => Col::V(vs.iter().map(|(a, b)| widen(AV::Ival(*a, *b))).collect()),
+                };
+                let col = std::mem::replace(&mut self.cols[c as usize], Col::U(AV::Nil));
+                self.cols[c as usize] = collapse_uniform(match col {
+                    Col::V(vs) => compress_num_v(vs),
+                    other => other,
+                });
+            }
+        }
 
         // 1. rem widening.
         let half = P8::from_parts(0, 0x8000);

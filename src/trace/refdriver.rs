@@ -54,10 +54,15 @@ pub fn run_frame_all<'a>(
     it.d.cursor = Cursor::new();
     let mut outputs = Vec::new();
     let mut paths = 0usize;
+    // A position bucket in the input (the rung below level 0) is one exact
+    // position per fork leaf, exactly as the kernels' `IntFrag`.
+    let pos = crate::interpreter::abstraction::current_level().pos;
     loop {
         it.d.cursor.reset();
         it.prints.clear();
-        let out = run_one(it, body, input.clone())?;
+        let mut st = input.clone();
+        crate::trace::widen::fork_pos_inputs(&mut st, &mut it.d, pos)?;
+        let out = run_one(it, body, st)?;
         outputs.push(out);
         paths += 1;
         if paths > 1_000_000 {

@@ -218,14 +218,18 @@ pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
         let Some(obj) = crate::search::pos_graph::player_object(rt2) else {
             return Ok(vec![false; lanes]);
         };
+        // A position bucket (the position rung) wins where the target
+        // lies inside it - the same rule as the queue's `any_win`.
         let axis = |f: u32| {
             rt2.obj_field_cell(obj, f)
-                .and_then(|c| crate::search::pos_graph::whole_i16_col(rt2, c))
+                .and_then(|c| crate::search::pos_graph::whole_range_col(rt2, c))
         };
         return Ok(match (axis(ids.f_x), axis(ids.f_y)) {
-            (Some(xs), Some(ys)) => {
-                xs.iter().zip(&ys).map(|(&x, &y)| (x, y) == target).collect()
-            }
+            (Some(xs), Some(ys)) => xs
+                .iter()
+                .zip(&ys)
+                .map(|(&(xl, xh), &(yl, yh))| xl <= target.0 && target.0 <= xh && yl <= target.1 && target.1 <= yh)
+                .collect(),
             _ => vec![false; lanes],
         });
     }
@@ -492,9 +496,39 @@ impl Slot {
             let (Some(cx), Some(cy)) = (sk.obj_field_cell(obj, ids.f_x), sk.obj_field_cell(obj, ids.f_y)) else {
                 return Ok(false);
             };
-            let (xs, ys) = (num_at(cx)?, num_at(cy)?);
+            // A position is a number, or a BUCKET under the position rung
+            // (`PosPrecision`): the lane wins if the target lies in it -
+            // the over-approximation a coarser level is entitled to, and
+            // what the finer levels refute.
+            let range_at = |cell: u32| -> Result<Box<dyn Fn(u32) -> (i16, i16) + '_>> {
+                Ok(match &sk.cols[cell as usize] {
+                    Col::U(AV::Num(n)) => {
+                        let w = n.whole_part_as_i16();
+                        Box::new(move |_| (w, w))
+                    }
+                    Col::U(AV::Ival(a, b)) => {
+                        let (lo, hi) = (a.whole_part_as_i16(), b.whole_part_as_i16());
+                        Box::new(move |_| (lo, hi))
+                    }
+                    Col::N(_) | Col::I(_) => match self.cols.iter().find(|(c, _)| *c == cell as usize) {
+                        Some((_, TCol::Num(v))) => Box::new(move |r| {
+                            let w = P8::from_raw(v[r as usize] as i32).whole_part_as_i16();
+                            (w, w)
+                        }),
+                        Some((_, TCol::Ival(v))) => Box::new(move |r| {
+                            let (a, b) = v[r as usize];
+                            (P8::from_raw(a as i32).whole_part_as_i16(), P8::from_raw(b as i32).whole_part_as_i16())
+                        }),
+                        _ => anyhow::bail!("any_win: cell {cell} is not a typed position column"),
+                    },
+                    other => anyhow::bail!("any_win: cell {cell} is not a position: {:?}", other),
+                })
+            };
+            let (xs, ys) = (range_at(cx)?, range_at(cy)?);
             return Ok(rows.iter().any(|&r| {
-                xs.at(r).whole_part_as_i16() == tx && ys.at(r).whole_part_as_i16() == ty
+                let (xl, xh) = xs(r);
+                let (yl, yh) = ys(r);
+                xl <= tx && tx <= xh && yl <= ty && ty <= yh
             }));
         }
         let want = P8::from_i16(crate::game_runner::win_room_x());
@@ -1203,7 +1237,7 @@ pub fn widened_keys_rt2(
     use crate::interpreter::abstraction::RemPrecision;
     let mut w = rt2.clone_block();
     if let RemPrecision::Bits(b) = coarser.rem {
-        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd));
+        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y));
     }
     let keys = w.row_keys_canonical();
     let cells = crate::search::pos_graph::block_cells(&w)?;
@@ -2611,6 +2645,7 @@ mod tests {
         std::env::set_var("CELESTE_WIN_AT_XY", "8,107");
         let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-full");
         let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("checkpoint dir");
 
         // The real ladder maps k>=16 to Exact (rewrite.rs: `if prev_bits >= 16
         // { Exact }`), so the distinct precisions are Bits(0..=15) then Exact.
@@ -2663,6 +2698,7 @@ mod tests {
 
         let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-test");
         let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("checkpoint dir");
 
         let make_engine = |precision: crate::interpreter::abstraction::Level| {
             crate::interpreter::abstraction::set_level(precision);
@@ -2698,6 +2734,51 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The position rung below level 0 (`PosPrecision`): a ladder that starts
+    /// at 2 px y-buckets, then level 0, then rem Bits(1), must still confirm
+    /// the synthetic win - the coarser level's marks (its keys widened to
+    /// the bucket) filter level 0 without losing the winning path, and the
+    /// bucket kernels (`IntFrag`: one exact position per fork configuration,
+    /// snapped back at the output) reach it at all.
+    #[test]
+    #[ignore]
+    fn new_ladder_position_rung_preserves_win() {
+        use crate::interpreter::abstraction::Level;
+        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        std::env::set_var("CELESTE_WIN_AT_XY", "8,107");
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-pos-test");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("checkpoint dir");
+        let make_engine = |precision: Level| {
+            crate::interpreter::abstraction::set_level(precision);
+            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?) as Box<dyn FrameStep>)
+        };
+        let make_initial = || {
+            Ok(vec![Block::from_state(&crate::trace::refengine::RefEngine::new()?.initial_state()?)?])
+        };
+        // `find_optimum` runs the level-0 forward first (the tree persists
+        // across horizons since 2026-09-12; `at_horizon` alone has no tree).
+        let levels = Level::parse_ladder("x2y2r0sx,y2r0sx,r0sx,r1sx,rxsx").expect("ladder");
+        let with_pos = find_optimum(make_engine, make_initial, dir, 1, 14, &levels[..4]).expect("ladder");
+        let _ = std::fs::remove_dir_all(dir);
+        let dir2 = std::path::Path::new("/var/tmp/celeste-frame-ladder-pos-test-ref");
+        let _ = std::fs::remove_dir_all(dir2);
+        std::fs::create_dir_all(dir2).expect("checkpoint dir");
+        let make_engine2 = |precision: Level| {
+            crate::interpreter::abstraction::set_level(precision);
+            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?) as Box<dyn FrameStep>)
+        };
+        let make_initial2 = || {
+            Ok(vec![Block::from_state(&crate::trace::refengine::RefEngine::new()?.initial_state()?)?])
+        };
+        let plain = Level::parse_ladder("r0sx,r1sx,rxsx").expect("ladder");
+        let without = find_optimum(make_engine2, make_initial2, dir2, 1, 14, &plain[..2]).expect("ladder");
+        let _ = std::fs::remove_dir_all(dir2);
+        eprintln!("[ladder] optimum through the position rung {with_pos:?}, without {without:?}");
+        assert!(with_pos.is_some(), "the position rung lost the synthetic win");
+        assert_eq!(with_pos, without, "the position rung changed the answer");
     }
 
     /// forward_resume, extending a checkpointed forward, reproduces a fresh run:
