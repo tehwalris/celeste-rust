@@ -532,6 +532,14 @@ past the census's 19x), so `exact` remains the default.
 # tmpfs). --win-at x,y forces a cheap synthetic win.
 ./safe-run.sh -- ./target/release/rewrite search \
     --room 1,0 [--from H0] [--to H] [--maxk 15] [--checkpoint-dir DIR]
+# With a KNOWN solution (the replayed community TAS: 93 / 99 / 95 for rooms
+# (0,0) / (1,0) / (2,0)) count DOWN from it instead: the ceiling must confirm
+# (a refutation there is an error), then each horizon below is tested until
+# one is refuted - two ladder runs when the ceiling is optimal, against one
+# per frame of slack counting up (room (1,0): one ladder at 99 is 2:56,
+# the count-up 4:51). Marks are monotone downward too (plans/... the
+# cheap narrowing of the finer levels' trees is not built).
+./safe-run.sh -- ./target/release/rewrite search --room 2,0 --ceiling 95
 
 # One forward pass at one precision with the per-frame timing line
 # (emit / own / checkpoint ms, lanes in/raw/kept, RSS; CELESTE_THREADS=N)
