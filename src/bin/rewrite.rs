@@ -187,6 +187,24 @@ enum Command {
         #[arg(long, default_value_t = 69)]
         to: u32,
     },
+    /// DIAGNOSTIC: how FULL the cells along the spawn-to-top diagonal are.
+    /// Per sampled cell, over every frame to `--to`: the states ever
+    /// there (each state is in one frame file, its layer), the dominant
+    /// shape's product of per-column cardinalities (the largest set of
+    /// states those fields could combine into), the fullness ratio, the
+    /// distinct player (spd.x, spd.y) pairs and the states per pair.
+    FullnessProbe {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long, default_value_t = 69)]
+        to: u32,
+        /// Explicit cells `x,y;x,y;...` (start-room-relative pixels);
+        /// default: `--auto` cells along the spawn-to-top segment.
+        #[arg(long)]
+        cells: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        auto: usize,
+    },
     /// Export a finished run for the web UI (`ui/`): per (horizon, level,
     /// frame) the states per player-position cell and the win cells, per
     /// (horizon, level) the marks per cell by distance, and the log's
@@ -1289,6 +1307,179 @@ fn main() -> Result<()> {
                 }
                 let h: Vec<String> = hist.iter().map(|x| x.to_string()).collect();
                 println!("f{f:03} | {n} | {dead} ({:.1}%) | {unreach} | {}", 100.0 * dead as f64 / n.max(1) as f64, h.join(" "));
+            }
+        }
+        Command::FullnessProbe { level_dir, to, cells, auto } => {
+            use celeste_engine::runtime2::{Col, AV};
+            use celeste_rust::search::checkpoint::FrameFile;
+            use celeste_rust::search::pos_graph::{cell_of, cell_xy, player_object, NO_CELL};
+            let dir = std::path::Path::new(&level_dir);
+            let frame_files = |f: u32| -> Result<Vec<std::path::PathBuf>> {
+                let fdir = dir.join("frames").join(format!("f{f:03}"));
+                let mut v = Vec::new();
+                if !fdir.is_dir() {
+                    return Ok(v);
+                }
+                for e in std::fs::read_dir(&fdir)? {
+                    let p = e?.path();
+                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    if name.starts_with('s') && name.ends_with(".bin") {
+                        v.push(p);
+                    }
+                }
+                Ok(v)
+            };
+            // Rows per cell over all frames; the spawn cell (first frame with a
+            // located player) and the top (lowest y among cells with >= 100 rows).
+            let mut rows_at: std::collections::HashMap<u32, u64> = Default::default();
+            let mut spawn: Option<u32> = None;
+            for f in 0..=to {
+                for p in frame_files(f)? {
+                    let ff = FrameFile::open(&p)?;
+                    for (cell, n) in ff.cell_counts() {
+                        if cell == NO_CELL {
+                            continue;
+                        }
+                        *rows_at.entry(cell).or_default() += n as u64;
+                        if spawn.is_none() {
+                            spawn = Some(cell);
+                        }
+                    }
+                }
+            }
+            let spawn = spawn.ok_or_else(|| anyhow::anyhow!("no located player in the tree"))?;
+            let (sx, sy) = cell_xy(spawn).unwrap();
+            let (mut tx, mut ty) = (sx, i32::MAX);
+            for (&c, &n) in &rows_at {
+                if n >= 100 {
+                    let (x, y) = cell_xy(c).unwrap();
+                    if y < ty {
+                        (tx, ty) = (x, y);
+                    }
+                }
+            }
+            let chosen: Vec<u32> = match cells {
+                Some(spec) => spec
+                    .split(';')
+                    .map(|xy| {
+                        let (x, y) = xy.split_once(',').ok_or_else(|| anyhow::anyhow!("cell {xy}"))?;
+                        cell_of(x.trim().parse()?, y.trim().parse()?)
+                    })
+                    .collect::<Result<_>>()?,
+                None => {
+                    let mut v = Vec::new();
+                    for t in 0..=auto {
+                        let px = sx + (tx - sx) * t as i32 / auto as i32;
+                        let py = sy + (ty - sy) * t as i32 / auto as i32;
+                        let mut best: Option<(u32, u64)> = None;
+                        for dx in -4..=4 {
+                            for dy in -4..=4 {
+                                if let Ok(c) = cell_of(px + dx, py + dy) {
+                                    let n = rows_at.get(&c).copied().unwrap_or(0);
+                                    if n > 0 && best.is_none_or(|b| n > b.1) {
+                                        best = Some((c, n));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((c, _)) = best {
+                            if !v.contains(&c) {
+                                v.push(c);
+                            }
+                        }
+                    }
+                    v
+                }
+            };
+            println!(
+                "spawn ({sx},{sy}), top ({tx},{ty}); {} cells with rows, {} rows total; sampling {} cells",
+                rows_at.len(),
+                rows_at.values().sum::<u64>(),
+                chosen.len()
+            );
+            let ids = celeste_rust::compiled::ids();
+            for cell in chosen {
+                let (cx, cy) = cell_xy(cell).unwrap();
+                // per shape: rows, per-column value sets, spd pairs
+                struct ShapeStats {
+                    rows: u64,
+                    cols: Vec<std::collections::HashSet<String>>,
+                    uniform: Vec<bool>,
+                    spd: std::collections::HashSet<(u32, u32)>,
+                }
+                let mut by_shape: std::collections::HashMap<u64, ShapeStats> = Default::default();
+                for f in 0..=to {
+                    for p in frame_files(f)? {
+                        let ff = FrameFile::open(&p)?;
+                        let ranges = ff.rows_of_cell(cell);
+                        if ranges.is_empty() {
+                            continue;
+                        }
+                        let Some(rt2) = ff.load_rows(&ranges)? else { continue };
+                        let st = by_shape.entry(ff.shape_hash()).or_insert_with(|| ShapeStats {
+                            rows: 0,
+                            cols: vec![Default::default(); rt2.cols.len()],
+                            uniform: vec![true; rt2.cols.len()],
+                            spd: Default::default(),
+                        });
+                        st.rows += rt2.width as u64;
+                        for (ci, col) in rt2.cols.iter().enumerate() {
+                            match col {
+                                Col::U(av) => {
+                                    st.cols[ci].insert(format!("{av:?}"));
+                                }
+                                _ => {
+                                    st.uniform[ci] = false;
+                                    for lane in 0..rt2.width {
+                                        st.cols[ci].insert(format!("{:?}", col.at(lane)));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(obj) = player_object(&rt2) {
+                            if let Some(pc) = rt2.obj_field_cell(obj, ids.f_spd) {
+                                if let Col::U(AV::Ptr(sub)) = rt2.cols[pc as usize] {
+                                    if let (Some(cxs), Some(cys)) = (rt2.obj_field_cell(sub, ids.f_x), rt2.obj_field_cell(sub, ids.f_y)) {
+                                        for lane in 0..rt2.width {
+                                            let raw = |av: AV| match av {
+                                                AV::Num(p) => p.as_raw_u32(),
+                                                AV::Ival(a, _) => a.as_raw_u32() ^ 0x8000_0000,
+                                                _ => u32::MAX,
+                                            };
+                                            st.spd.insert((raw(rt2.cols[cxs as usize].at(lane)), raw(rt2.cols[cys as usize].at(lane))));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let total: u64 = by_shape.values().map(|s| s.rows).sum();
+                let Some((shape, st)) = by_shape.iter().max_by_key(|(_, s)| s.rows) else {
+                    println!("cell ({cx},{cy}): no rows");
+                    continue;
+                };
+                let mut cards: Vec<(usize, usize)> = st
+                    .cols
+                    .iter()
+                    .enumerate()
+                    .filter(|(ci, _)| !st.uniform[*ci])
+                    .map(|(ci, set)| (set.len(), ci))
+                    .collect();
+                cards.sort_unstable_by(|a, b| b.cmp(a));
+                let product: f64 = cards.iter().map(|&(n, _)| n as f64).product();
+                let top: Vec<String> = cards.iter().take(8).map(|&(n, ci)| format!("c{ci}:{n}")).collect();
+                println!(
+                    "cell ({cx},{cy}): {total} states in {} shapes; dominant shape {shape:#x}: {} states, {} varying cols, product {:.3e}, fullness {:.2e}; spd pairs {}, states/pair {:.1}; top cols {}",
+                    by_shape.len(),
+                    st.rows,
+                    cards.len(),
+                    product,
+                    st.rows as f64 / product,
+                    st.spd.len(),
+                    st.rows as f64 / st.spd.len().max(1) as f64,
+                    top.join(" ")
+                );
             }
         }
         Command::ExportUi {

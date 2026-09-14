@@ -1,3 +1,25 @@
+# How full are the cells on the spawn-to-top diagonal? (2026-09-14, `rewrite fullness-probe`)
+
+Per sampled cell, over every frame of the level-0 tree: the states ever
+there, the dominant shape's product of per-column cardinalities, the
+distinct player (spd.x, spd.y) pairs, and the states per pair. The
+question behind it: could a meet-in-the-middle seed the second half from
+SYNTHETIC states (every combination of the fields at a boundary cell)?
+
+| room | states per diagonal cell | fullness (states / field product) | spd pairs per cell | states per spd pair |
+|---|---|---|---|---|
+| (2,0) f0-69 | 120k-545k (mid), 1k-6k (ends) | 3e-8 .. 2e-5 | 12k-23k (2,636 spd.x x 84 spd.y possible) | 10-38 |
+| (1,0) f0-99 | 36k-66k | 8e-6 .. 3e-5 | 1.3k-1.6k (of ~3k possible) | 18-42 |
+| (0,0) f0-93 | 19k-170k | 6e-6 .. 3e-5 | 0.9k-1.8k | 18-85 |
+
+Synthetic seeds are out by five to seven orders of magnitude. The
+REACHED states at a diagonal band (~100 cells) are tens of millions -
+the same order as the frontier - so a second half seeded from them
+costs about what the full search's second half costs; a split can only
+pay through the slack (the level-0 first win is ~10% early, and the
+finer levels' work over the horizons from there to the optimum is 75-80%
+of the total on rooms (0,0)/(1,0), growing 1.3-1.5x per frame of slack).
+
 # Splitting room (2,0)'s level 0: waypoint partition and a distance bound (2026-09-14, exact tree f0-f69)
 
 Two diagnostics on last night's exact-speed room (2,0) tree (`/var/tmp/celeste-room20`,
