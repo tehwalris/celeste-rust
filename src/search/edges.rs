@@ -933,6 +933,16 @@ pub struct BackwardResult {
 /// rows (layers 1..=horizon), the BFS over `<dir>/edges`, the marked ids
 /// resolved to `(shape, key, cell)` through the checkpoint files.
 pub fn backward(dir: &Path, horizon: u32) -> Result<BackwardResult> {
+    // A tree can END before the horizon (every lane won or died - the
+    // synthetic targets do this): the wins by `horizon` are then the
+    // wins the tree has, and there are no frames past its last to read.
+    let horizon = {
+        let mut last = 0u32;
+        while dir.join("frames").join(format!("f{:03}", last + 1)).is_dir() {
+            last += 1;
+        }
+        horizon.min(last)
+    };
     let t = std::time::Instant::now();
     let graph = EdgeGraph::open(&dir.join("edges"), horizon)?;
     let t_open = t.elapsed();

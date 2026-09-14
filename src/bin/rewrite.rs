@@ -47,6 +47,13 @@ enum Command {
         /// Optional synthetic win "x,y" (CELESTE_WIN_AT_XY) for a cheap run.
         #[arg(long)]
         win_at: Option<String>,
+        /// COUNT DOWN from a known concrete solution's frame (the replayed
+        /// TAS, `frame::find_optimum_from_ceiling`) instead of up from
+        /// level 0's first win: the ceiling must confirm, then each horizon
+        /// below is tested until one is refuted. Two ladder runs when the
+        /// ceiling is optimal. `--from`/`--to` are ignored.
+        #[arg(long)]
+        ceiling: Option<u32>,
     },
     /// ONE forward pass at ONE precision level, exactly as the ladder runs it
     /// (record mode, position partition, sharded checkpoints), with the
@@ -301,6 +308,7 @@ fn main() -> Result<()> {
             checkpoint_dir,
             room,
             win_at,
+            ceiling,
         } => {
             use celeste_rust::frame::{find_optimum, Block, FrameStep};
             use celeste_rust::interpreter::abstraction::{set_level, Level, RemPrecision};
@@ -345,7 +353,12 @@ fn main() -> Result<()> {
             };
             let dir = std::path::Path::new(&checkpoint_dir);
             celeste_rust::compiled::prebuild_kernels(&precisions);
-            match find_optimum(make_engine, make_initial, dir, from, to.unwrap_or(from), &precisions)? {
+            let found = if let Some(c) = ceiling {
+                Some(celeste_rust::frame::find_optimum_from_ceiling(make_engine, make_initial, dir, c, &precisions)?)
+            } else {
+                find_optimum(make_engine, make_initial, dir, from, to.unwrap_or(from), &precisions)?
+            };
+            match found {
                 Some(h) => println!("OPTIMAL win frame: {h}"),
                 None => println!("no win confirmed up to horizon {}", to.unwrap_or(from)),
             }

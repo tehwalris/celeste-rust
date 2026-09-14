@@ -2493,6 +2493,47 @@ pub fn find_optimum(
     Ok(None)
 }
 
+/// `find_optimum` COUNTING DOWN from a known concrete solution (the
+/// replayed community TAS, `--ceiling`). The ceiling must confirm - a
+/// refutation there means the model cannot reproduce a real run and is
+/// an error - and then each horizon below it is tested until one is
+/// refuted: the optimum is the last confirmed. With an optimal ceiling
+/// that is two ladder runs. Counting down is also the direction the
+/// marks are monotone in (marked at H-1 implies marked at H), which is
+/// what a cheap narrowing of the finer levels' trees can build on.
+pub fn find_optimum_from_ceiling(
+    make_engine: impl FnMut(
+        crate::interpreter::abstraction::Level,
+    ) -> Result<Box<dyn FrameStep>>,
+    make_initial: impl FnMut() -> Result<Vec<Block>>,
+    base_dir: &std::path::Path,
+    ceiling: u32,
+    precisions: &[crate::interpreter::abstraction::Level],
+) -> Result<u32> {
+    let mut ladder = Ladder::new(make_engine, make_initial, base_dir, precisions);
+    anyhow::ensure!(ceiling >= 1, "a ceiling of 0 frames");
+    match ladder.at_horizon(ceiling)? {
+        HorizonOutcome::Confirmed => eprintln!("[search] ceiling: horizon {ceiling} confirmed"),
+        HorizonOutcome::Refuted { level } => anyhow::bail!(
+            "ceiling {ceiling} REFUTED at level {level}: a known concrete solution the model cannot reproduce"
+        ),
+    }
+    let mut best = ceiling;
+    while best > 1 {
+        match ladder.at_horizon(best - 1)? {
+            HorizonOutcome::Confirmed => {
+                eprintln!("[search] horizon {} confirmed, counting down", best - 1);
+                best -= 1;
+            }
+            HorizonOutcome::Refuted { level } => {
+                eprintln!("[search] horizon {} refuted at level {level}", best - 1);
+                break;
+            }
+        }
+    }
+    Ok(best)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2779,6 +2820,20 @@ mod tests {
         eprintln!("[ladder] optimum through the position rung {with_pos:?}, without {without:?}");
         assert!(with_pos.is_some(), "the position rung lost the synthetic win");
         assert_eq!(with_pos, without, "the position rung changed the answer");
+        // Counting down from a ceiling finds the same optimum.
+        let dir3 = std::path::Path::new("/var/tmp/celeste-frame-ladder-pos-test-down");
+        let _ = std::fs::remove_dir_all(dir3);
+        std::fs::create_dir_all(dir3).expect("checkpoint dir");
+        let make_engine3 = |precision: Level| {
+            crate::interpreter::abstraction::set_level(precision);
+            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?) as Box<dyn FrameStep>)
+        };
+        let make_initial3 = || {
+            Ok(vec![Block::from_state(&crate::trace::refengine::RefEngine::new()?.initial_state()?)?])
+        };
+        let down = find_optimum_from_ceiling(make_engine3, make_initial3, dir3, 14, &levels[..4]).expect("ladder");
+        let _ = std::fs::remove_dir_all(dir3);
+        assert_eq!(Some(down), with_pos, "counting down from the ceiling changed the answer");
     }
 
     /// forward_resume, extending a checkpointed forward, reproduces a fresh run:
