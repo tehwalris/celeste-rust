@@ -1,3 +1,39 @@
+# The position rung end to end, and a ladder at the ceiling alone (2026-09-14, room (1,0), release, 16 threads)
+
+The position rung (`Level::pos`, 2 px buckets, one exact position per
+fork configuration) is built, gated (the room (1,0) synthetic-target
+ladder `x2y2r0sx,y2r0sx,r0sx,r1sx,rxsx` confirms 33 with every level from
+Bits(0) up bit-identical to the pinned marks) - and a loss as a coarse
+level on room (1,0):
+
+| room (1,0), one ladder at horizon 99 | wall | peak RSS | coarsest forward to f99 | coarsest frontier |
+|---|---|---|---|---|
+| default (level 0 = 1 px first) | 2:56 | 25.5 GB | 124 s | 4.7M at f89, 6.8M at f99 |
+| position rung first (P2x2, P1x2, then level 0..) | 9:32 | 25.4 GB | 219 s (5 s/frame, 4x fork configs) | 2.6M at f74, saturating |
+
+The rung does what the census promised for its OWN forward (half the
+frontier, 7 GB peak vs 8) and then filters nothing below it: it first
+wins at f74, so at horizon 99 - 25 frames past its own win - it marks
+73.4M of the 131M states it visited (56%; its backward read 923M edges),
+the y-only rung marks 63M of 99M, and the 1 px level under them still
+visits 95M against 212M unfiltered. A coarse level only cuts when the
+horizon is close to its own first win. Rule of thumb from this: a level
+whose backward marks more than a small fraction of its forward is not
+earning its place.
+
+Counting one horizon at a time from the rung's first win (26 horizons
+instead of 11) projected to 20-30 min; the run died at h94 when its
+per-horizon trees filled the disk (160 GB). Hence `search --ceiling`:
+with the replayed TAS as a ceiling the whole search is one ladder at the
+ceiling plus one refutation below it.
+
+The rungs stay in the code and off by default; the memory diet for room
+(2,0) is next. Where its exact level 0 stands at f69 (`[fwd]` line):
+frontier in 6.9 GB, door 12.3 GB (24 B/entry: a 128-bit key + the id),
+queues 0.35 GB, RSS at frame start 39.9 GB - and 8.6 GB of that is the
+17 prebuilt kernel sets (0.36 GB on room (1,0)), most of it the assembly
+TEXT kept after loading.
+
 # Position widening census (2026-09-14, `rewrite pos-census`)
 
 Post-hoc: the distinct states of a level-0 frame with the player's x/y

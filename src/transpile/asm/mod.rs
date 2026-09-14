@@ -40,7 +40,7 @@ pub fn compile_and_load_reprs(
 ) -> Result<(Compiled, Loaded)> {
     let sym = format!("kernel_{tag}");
     let t0 = std::time::Instant::now();
-    let compiled = compile(g, roots, &sym, cell_reprs)?;
+    let mut compiled = compile(g, roots, &sym, cell_reprs)?;
     let t_compile = t0.elapsed();
     let t1 = std::time::Instant::now();
     let so: PathBuf = assemble(&compiled.asm, tag)?;
@@ -54,6 +54,12 @@ pub fn compile_and_load_reprs(
             t_compile.as_secs_f64(),
             t_asm.as_secs_f64()
         );
+    }
+    // The assembly TEXT is only the assembler's input: dropped once the
+    // .so is loaded (room (2,0)'s 17 kernel sets held ~8 GB after their
+    // prebuild, 2026-09-14). `CELESTE_KEEP_ASM` keeps it for a dump.
+    if std::env::var_os("CELESTE_KEEP_ASM").is_none() {
+        compiled.asm = String::new();
     }
     Ok((compiled, loaded))
 }

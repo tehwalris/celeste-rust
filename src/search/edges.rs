@@ -258,15 +258,27 @@ fn encode_sorted(recs: &[(u64, u64, u64)]) -> (Vec<(u64, u64)>, Vec<u8>, u64) {
     (index, out, pairs)
 }
 
-/// One layer's records (all with targets in that layer) sorted by
-/// (target, base): a parallel counting sort by the target's dense rank
-/// (piece offset + row; the ranks come from the records themselves),
-/// then each target's group sorted by base. O(n) passes, no comparison
-/// sort over the whole layer. `files` are the raw worker files' contents.
-fn sort_layer(files: &[Vec<u8>], layer: u32, frame: u32) -> Vec<(u64, u64, u64)> {
+
+/// Records per sort chunk of a big layer: 32M x 24 B = 768 MB of sort
+/// buffer, whatever the layer's size.
+const CHUNK_RECORDS: usize = 32 << 20;
+
+/// `sort_layer` in CHUNKS of target ranks: the same rank histogram and
+/// claimed scatter, but one contiguous rank range at a time (each at most
+/// `chunk_records` records), each range scattered by a pass over every
+/// file, base-sorted, and appended to `writer`. Ranks are target order,
+/// so the run is sorted as a whole. Returns (sort time, write time).
+fn sort_layer_chunked(
+    files: &[&[u8]],
+    layer: u32,
+    frame: u32,
+    chunk_records: usize,
+    writer: &mut RunWriter,
+) -> Result<(std::time::Duration, std::time::Duration)> {
     use std::sync::atomic::{AtomicU32, Ordering};
+    let t_sort0 = std::time::Instant::now();
+    let mut t_write = std::time::Duration::ZERO;
     let n_total: usize = files.iter().map(|b| b.len() / RECORD_BYTES).sum();
-    // The layer's pieces: max row per seq, from a parallel scan.
     let per_file_max: Vec<Vec<u32>> = std::thread::scope(|scope| {
         let hs: Vec<_> = files
             .iter()
@@ -295,9 +307,6 @@ fn sort_layer(files: &[Vec<u8>], layer: u32, frame: u32) -> Vec<(u64, u64, u64)>
     }
     let n_ranks = piece_off[n_seq];
     let rank_of = |t: u64| piece_off[(t >> 32) as usize] + t as u32 as usize;
-    // One shared histogram over ranks (atomic adds from every file), its
-    // prefix sums, then the scatter claims positions with an atomic
-    // increment per record - files in parallel, disjoint positions.
     let hist: Vec<AtomicU32> = (0..n_ranks).map(|_| AtomicU32::new(0)).collect();
     std::thread::scope(|scope| {
         for b in files {
@@ -309,58 +318,155 @@ fn sort_layer(files: &[Vec<u8>], layer: u32, frame: u32) -> Vec<(u64, u64, u64)>
             });
         }
     });
+    // Prefix sums, and the chunk cuts in rank space: a chunk closes once
+    // it holds `chunk_records` (a single rank's group is never split).
+    let mut cuts: Vec<(usize, usize)> = vec![(0, 0)]; // (rank, first position)
     let mut acc = 0u32;
-    for h in &hist {
+    for (r, h) in hist.iter().enumerate() {
         let c = h.load(Ordering::Relaxed);
         h.store(acc, Ordering::Relaxed);
+        if acc as usize - cuts.last().unwrap().1 >= chunk_records && c > 0 {
+            cuts.push((r, acc as usize));
+        }
         acc += c;
     }
     debug_assert_eq!(acc as usize, n_total);
+    cuts.push((n_ranks, n_total));
     let next = hist;
-    let mut out: Vec<(u64, u64, u64)> = Vec::with_capacity(n_total);
-    // SAFETY: every position 0..n_total is written exactly once below
-    // (the claims partition 0..n_total); the element type has no drop
-    // glue.
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        out.set_len(n_total);
-    }
-    {
-        let out_ptr = out.as_mut_ptr() as usize;
-        std::thread::scope(|scope| {
-            for b in files {
-                let (next, rank_of) = (&next, &rank_of);
-                scope.spawn(move || {
-                    let out_ptr = out_ptr as *mut (u64, u64, u64);
-                    for i in 0..b.len() / RECORD_BYTES {
-                        let e = decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], layer, frame);
-                        let pos = next[rank_of(target_local(b, i))].fetch_add(1, Ordering::Relaxed) as usize;
-                        // SAFETY: a claimed position, unique and < n_total.
-                        unsafe { out_ptr.add(pos).write((e.target, e.base, e.mask)) };
-                    }
-                });
-            }
-        });
-    }
-    // Each target's group by base, ranges of the output in parallel
-    // (groups never straddle a chunk boundary: chunks are cut at target
-    // changes).
-    let cuts = cuts_at_target_changes(&out, crate::frame::threads().max(1));
-    {
-        let mut rest: &mut [(u64, u64, u64)] = &mut out;
-        let mut pieces: Vec<&mut [(u64, u64, u64)]> = Vec::new();
-        for w in cuts.windows(2) {
-            let (a, b) = rest.split_at_mut(w[1] - w[0]);
-            pieces.push(a);
-            rest = b;
+    for w in cuts.windows(2) {
+        let ((r_lo, base), (r_hi, end)) = (w[0], w[1]);
+        let n_chunk = end - base;
+        if n_chunk == 0 {
+            continue;
         }
-        std::thread::scope(|scope| {
-            for p in pieces {
-                scope.spawn(move || sort_groups_by_base(p));
+        let mut out: Vec<(u64, u64, u64)> = Vec::with_capacity(n_chunk);
+        // SAFETY: every position 0..n_chunk is written exactly once below
+        // (the claims of the ranks in [r_lo, r_hi) partition base..end);
+        // the element type has no drop glue.
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            out.set_len(n_chunk);
+        }
+        {
+            let out_ptr = out.as_mut_ptr() as usize;
+            std::thread::scope(|scope| {
+                for b in files {
+                    let (next, rank_of) = (&next, &rank_of);
+                    scope.spawn(move || {
+                        let out_ptr = out_ptr as *mut (u64, u64, u64);
+                        for i in 0..b.len() / RECORD_BYTES {
+                            let r = rank_of(target_local(b, i));
+                            if r < r_lo || r >= r_hi {
+                                continue;
+                            }
+                            let e = decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], layer, frame);
+                            let pos = next[r].fetch_add(1, Ordering::Relaxed) as usize - base;
+                            // SAFETY: a claimed position, unique and < n_chunk.
+                            unsafe { out_ptr.add(pos).write((e.target, e.base, e.mask)) };
+                        }
+                    });
+                }
+            });
+        }
+        let cuts_b = cuts_at_target_changes(&out, crate::frame::threads().max(1));
+        {
+            let mut rest: &mut [(u64, u64, u64)] = &mut out;
+            let mut pieces: Vec<&mut [(u64, u64, u64)]> = Vec::new();
+            for w in cuts_b.windows(2) {
+                let (a, b) = rest.split_at_mut(w[1] - w[0]);
+                pieces.push(a);
+                rest = b;
             }
-        });
+            std::thread::scope(|scope| {
+                for p in pieces {
+                    scope.spawn(move || sort_groups_by_base(p));
+                }
+            });
+        }
+        let t0 = std::time::Instant::now();
+        writer.append(&out, crate::frame::threads() * 2)?;
+        t_write += t0.elapsed();
     }
-    out
+    Ok((t_sort0.elapsed() - t_write, t_write))
+}
+
+/// A run file written in sorted slices: the index kept in memory, the
+/// stream appended to a temp file, and `finish` assembling header + index
+/// + stream (the format `write_run` writes in one go).
+struct RunWriter {
+    index: Vec<(u64, u64)>,
+    stream: std::io::BufWriter<std::fs::File>,
+    stream_path: PathBuf,
+    off: u64,
+    pairs: u64,
+}
+
+impl RunWriter {
+    fn new(stream_path: &Path) -> Result<Self> {
+        Ok(RunWriter {
+            index: Vec::new(),
+            stream: std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(stream_path)?),
+            stream_path: stream_path.to_path_buf(),
+            off: 0,
+            pairs: 0,
+        })
+    }
+
+    /// Append a sorted slice whose targets all follow the previous slice's.
+    fn append(&mut self, sorted: &[(u64, u64, u64)], encode_chunks: usize) -> Result<()> {
+        use std::io::Write;
+        debug_assert!(self.index.last().is_none_or(|&(t, _)| sorted.first().is_none_or(|r| r.0 > t)));
+        let cuts = cuts_at_target_changes(sorted, encode_chunks);
+        let encoded: Vec<(Vec<(u64, u64)>, Vec<u8>, u64)> = if encode_chunks <= 1 {
+            vec![encode_sorted(sorted)]
+        } else {
+            std::thread::scope(|scope| {
+                let hs: Vec<_> = cuts
+                    .windows(2)
+                    .map(|w| {
+                        let sl = &sorted[w[0]..w[1]];
+                        scope.spawn(move || encode_sorted(sl))
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().expect("edge encoder panicked")).collect()
+            })
+        };
+        for (ix, s, p) in &encoded {
+            for &(t, o) in ix {
+                self.index.push((t, o + self.off));
+            }
+            self.stream.write_all(s)?;
+            self.off += s.len() as u64;
+            self.pairs += p;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, path: &Path, tmp: &Path) -> Result<(u64, u64)> {
+        use std::io::Write;
+        self.stream.flush()?;
+        drop(self.stream);
+        let n_blocks = self.index.len();
+        let bytes;
+        {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(tmp)?);
+            w.write_all(RUN_MAGIC)?;
+            w.write_all(&RUN_VERSION.to_le_bytes())?;
+            w.write_all(&self.pairs.to_le_bytes())?;
+            w.write_all(&(n_blocks as u64).to_le_bytes())?;
+            for &(t, o) in &self.index {
+                w.write_all(&t.to_le_bytes())?;
+                w.write_all(&o.to_le_bytes())?;
+            }
+            let mut s = std::fs::File::open(&self.stream_path)?;
+            std::io::copy(&mut s, &mut w)?;
+            w.flush()?;
+            bytes = 24 + n_blocks as u64 * 16 + self.off;
+        }
+        std::fs::remove_file(&self.stream_path)?;
+        std::fs::rename(tmp, path)?;
+        Ok((self.pairs, bytes))
+    }
 }
 
 /// Boundaries of `chunks` ranges over `recs` (sorted by target), moved
@@ -476,36 +582,42 @@ pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
     let (big, small): (Vec<_>, Vec<_>) = layers.into_iter().partition(|(_, _, bytes)| *bytes as usize / RECORD_BYTES >= BIG_LAYER);
     for (layer, files, bytes) in &big {
         let t0 = std::time::Instant::now();
-        let contents: Vec<Vec<u8>> = std::thread::scope(|scope| {
-            let hs: Vec<_> = files
-                .iter()
-                .map(|f| {
-                    scope.spawn(move || -> Result<Vec<u8>> {
-                        let b = std::fs::read(f).with_context(|| f.display().to_string())?;
-                        ensure!(b.len() % RECORD_BYTES == 0, "{}: truncated edge file", f.display());
-                        Ok(b)
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("edge reader panicked")).collect::<Result<Vec<_>>>()
-        })?;
+        // The raw records are MAPPED, not read: a big layer is the frame's
+        // whole emission (room (2,0) f69: 323M records, 6.5 GB) and a copy
+        // of it in the heap sat in RSS for the whole of the next frame's
+        // wave, which the compaction runs behind. Mapped, it is page cache.
+        let maps: Vec<memmap2::Mmap> = files
+            .iter()
+            .map(|f| -> Result<memmap2::Mmap> {
+                let file = std::fs::File::open(f).with_context(|| f.display().to_string())?;
+                // SAFETY: the worker files are complete and never modified
+                // once the frame's wave is over; they are deleted below.
+                let m = unsafe { memmap2::Mmap::map(&file)? };
+                ensure!(m.len() % RECORD_BYTES == 0, "{}: truncated edge file", f.display());
+                Ok(m)
+            })
+            .collect::<Result<_>>()?;
+        let views: Vec<&[u8]> = maps.iter().map(|m| &m[..]).collect();
         st.records += *bytes / RECORD_BYTES as u64;
         st.t_read += t0.elapsed();
-        let t0 = std::time::Instant::now();
-        let sorted = sort_layer(&contents, *layer, frame);
-        drop(contents);
-        st.t_sort += t0.elapsed();
-        let t0 = std::time::Instant::now();
+        // Sorted in CHUNKS of target ranks, each streamed into the run as
+        // it is done, so the sort's own buffer is bounded (`CHUNK_RECORDS`
+        // x 24 B) instead of the whole layer's (7.8 GB at room (2,0) f69).
         let ldir = layer_dir(dir, *layer);
         std::fs::create_dir_all(&ldir)?;
-        let (pairs, bytes) = write_run(&sorted, crate::frame::threads() * 2, &run_path(dir, *layer, frame), &ldir.join(format!("tmp-f{:03}.bin", frame)))?;
-        drop(sorted);
+        let mut writer = RunWriter::new(&ldir.join(format!("tmp-f{:03}.stream", frame)))?;
+        let (t_sort, t_write) = sort_layer_chunked(&views, *layer, frame, CHUNK_RECORDS, &mut writer)?;
+        drop(views);
+        drop(maps);
+        st.t_sort += t_sort;
+        let t0 = std::time::Instant::now();
+        let (pairs, bytes) = writer.finish(&run_path(dir, *layer, frame), &ldir.join(format!("tmp-f{:03}.bin", frame)))?;
         for f in files {
             std::fs::remove_file(f)?;
         }
         st.pairs += pairs;
         st.bytes += bytes;
-        st.t_write += t0.elapsed();
+        st.t_write += t_write + t0.elapsed();
     }
     // The small layers: a pool of threads, a layer each.
     let t0 = std::time::Instant::now();
