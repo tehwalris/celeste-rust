@@ -954,8 +954,27 @@ impl<'a> Lower<'a> {
                 }
             }
             Op::Eq => {
-                // Boolean Eq (zb_eq) or numeric Eq (zn_eq), by operand domain.
+                // Boolean Eq (zb_eq), interval Eq, or numeric Eq (zn_eq), by
+                // operand domain.
                 match self.dom(a[0]) {
+                    _ if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 => {
+                        // `Graph::compare` on intervals: decided false when
+                        // the boxes are disjoint, decided when both are
+                        // singletons, undecided otherwise.
+                        let (ia, ib) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
+                        let (ar, br) = (self.ival_regs(ia), self.ival_regs(ib));
+                        let a_single = self.cmp(0, ar[0], Src::Reg(ar[1]));
+                        let b_single = self.cmp(0, br[0], Src::Reg(br[1]));
+                        let both = self.dbin(ROp::AndD, a_single, b_single);
+                        let lo_eq = self.cmp(0, ar[0], Src::Reg(br[0]));
+                        let val = self.dbin(ROp::AndD, both, lo_eq);
+                        // a.lo > b.hi (vpcmpd NLE) or b.lo > a.hi.
+                        let d1 = self.cmp(6, ar[0], Src::Reg(br[1]));
+                        let d2 = self.cmp(6, br[0], Src::Reg(ar[1]));
+                        let disjoint = self.dbin(ROp::OrD, d1, d2);
+                        let known = self.dbin(ROp::OrD, both, disjoint);
+                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                    }
                     1 => {
                         let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
                         let (pv, qv) = (self.mask_reg(p[0]), self.mask_reg(q[0]));

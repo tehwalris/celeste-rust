@@ -431,6 +431,21 @@ hashes, so it feeds the shape hash, the row key, and what the search
 dedups on. A reordering is a different search. New names (only possible
 if the Lua changes) may be APPENDED by hand, never inserted.
 
+## The speed ladder (2026-09-14)
+
+`CELESTE_SPD_LADDER=bucket` widens the player's `spd.x`/`spd.y` at every
+non-exact rung to the SAME bucket width as rem's (level 0: 1 px/frame;
+both exact together - `abstraction::spd_precision_for`). Off by default
+(exact speed, the ladder the pinned gates were taken with). It exists for
+rooms whose speeds explode - room (2,0)'s spring does `spd.x *= 0.2`,
+3,200 distinct `spd.x` values against 60 in rooms (0,0)/(1,0), and 1 px
+buckets collapse its f69 frontier 19x - and it is a LOSS where they do
+not: a coarser level 0 wins earlier and its finer levels refute later
+(room (1,0): ~2 min per horizon from h80, stopped at h88 after 24 min,
+against 4:51 for the whole exact-speed search). plans/architecture.md
+"Deferred follow-ups": the census-driven automatic choice, galloping
+horizons, persisting the finer levels across horizons (after room 2).
+
 ## Useful entry points
 
 ```bash

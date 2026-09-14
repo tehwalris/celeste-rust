@@ -375,7 +375,7 @@ pub fn walk<'a>(
 }
 
 /// The slots the boundary WIDENS to an interval: the player's
-/// `rem.x` and `rem.y`.
+/// `rem.x`, `rem.y`, `spd.x` and `spd.y` (and a live fruit's `off`/`y`).
 ///
 /// Found the way `Rt2::mark_walk` finds them - the objects whose `type`
 /// is the `player` global - rather than by position, because which
@@ -397,12 +397,19 @@ pub fn ival_paths(st: &State<Symbolic>) -> Vec<Path> {
         if iface::get(st, &ty) != Some(Value::Table(player)) {
             continue;
         }
-        for f in ["x", "y"] {
-            let mut p = base.clone();
-            p.push(iface::key("rem"));
-            p.push(iface::key(f));
-            if iface::get(st, &p).is_some() {
-                out.push(p);
+        // `rem.x/y`, and since the spd ladder (2026-09-14,
+        // `abstraction::spd_precision_for`) `spd.x/y` too: every non-exact
+        // rung widens the player's speed to a bucket, so a mid-game block
+        // carries it as an interval.
+        let subs: &[&str] = if crate::interpreter::abstraction::spd_ladder_on() { &["rem", "spd"] } else { &["rem"] };
+        for sub in subs {
+            for f in ["x", "y"] {
+                let mut p = base.clone();
+                p.push(iface::key(*sub));
+                p.push(iface::key(f));
+                if iface::get(st, &p).is_some() {
+                    out.push(p);
+                }
             }
         }
     }

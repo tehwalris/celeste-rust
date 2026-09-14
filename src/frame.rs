@@ -1186,6 +1186,15 @@ pub fn widened_keys(
     widened_keys_rt2(&block.rt2, coarser)
 }
 
+/// The speed bucket (log2 raw units) a level widens to, `None` for exact
+/// (`abstraction::spd_precision_for`, the spd ladder).
+pub fn spd_width_log2(rem: crate::interpreter::abstraction::RemPrecision) -> Option<u8> {
+    match crate::interpreter::abstraction::spd_precision_for(rem) {
+        crate::interpreter::abstraction::SpdPrecision::WidthLog2(w) => Some(w),
+        crate::interpreter::abstraction::SpdPrecision::Exact => None,
+    }
+}
+
 /// `(shape, keys, cells)` of the widened rows - the shape is the widened
 /// block's, which is what the coarser level's marks are sharded by.
 pub fn widened_keys_rt2(
@@ -1195,7 +1204,7 @@ pub fn widened_keys_rt2(
     use crate::interpreter::abstraction::RemPrecision;
     let mut w = rt2.clone_block();
     if let RemPrecision::Bits(b) = coarser {
-        w.widen_to(crate::compiled::ids(), b);
+        w.widen_to(crate::compiled::ids(), b, spd_width_log2(RemPrecision::Bits(b)));
     }
     let keys = w.row_keys_canonical();
     let cells = crate::search::pos_graph::block_cells(&w)?;

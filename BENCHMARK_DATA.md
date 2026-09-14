@@ -1,3 +1,13 @@
+# The speed ladder on room (1,0): a loss (2026-09-14, release, 32 threads)
+
+`CELESTE_SPD_LADDER=bucket` (level 0: rem full, spd 1 px; both refine
+together): level 0 first wins at f80 (exact speed: f89), level 1 (1/2 px)
+at f83, so the ladder climbs from h80 with level 2 refuting each horizon;
+level-1 marks 2.1M (h84), 5.2M (h85) and growing ~x1.5 per horizon, ~2 min
+per horizon at h87-h88. Stopped at h88 after 24 min against 4:51 for the
+exact-speed search - the coarser lower bound costs more than the state
+collapse saves where speeds do not explode. Default stays exact speed.
+
 # What a level-0 speed widening collapses (2026-09-14, `rewrite census`)
 
 The frontier near each room's level-0 win, its distinct states (every

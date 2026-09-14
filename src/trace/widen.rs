@@ -378,15 +378,26 @@ pub(crate) fn spd_bucket_node(
     debug_assert!((1..=20).contains(&w), "spd_bucket_node w {} out of 1..=20", w);
     let width_raw: i32 = 1i32 << w;
     let width = d.num(P8::from_raw(width_raw));
-    let scaled = d.arith(super::domain::Arith::Div, &old, &width)?;
-    let (frag, fork) = if d.is_interval(&scaled) {
-        let (frag, valid) = d.fork_flr(&scaled);
-        let premise = d.span_ok(&scaled);
+    // The fork is on the RAW value: every fork in the graph cuts at the
+    // grid (`Graph::fork_bits`, 2^-k), and the spd bucket at rung k is
+    // exactly one grid cell (`spd_precision_for`: width 2^(16-k) raw), so
+    // a fragment lies within one bucket. (Forking the SCALED value cut it
+    // on a 2^-k grid in bucket units - three cells for a one-bucket span
+    // - and every rung > 0 declined its lanes, 2026-09-14.)
+    let fb = d.graph.fork_bits();
+    anyhow::ensure!(
+        fb == 0 || w as u32 == 16 - fb as u32,
+        "spd bucket width 2^{w} raw does not match the fork grid 2^-{fb}"
+    );
+    let (frag, fork) = if d.is_interval(&old) {
+        let (frag, valid) = d.fork_flr(&old);
+        let premise = d.span_ok(&old);
         (frag, Some((valid, premise)))
     } else {
-        (scaled, None)
+        (old, None)
     };
-    let idx = d.fun1(super::domain::Fun1::Flr, &frag)?;
+    let scaled = d.arith(super::domain::Arith::Div, &frag, &width)?;
+    let idx = d.fun1(super::domain::Fun1::Flr, &scaled)?;
     let premise = d.graph.fold(Op::Known, vec![idx]);
     let low = d.arith(super::domain::Arith::Mul, &idx, &width)?;
     let span_minus_one = d.num(P8::from_raw(width_raw - 1));

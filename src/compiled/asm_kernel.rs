@@ -276,7 +276,40 @@ impl AsmKernel {
                 let live = read_zb_holds(outbuf, body.live_root);
                 if live & !ok & valid != 0 {
                     // Declined: a live lane the kernel could not keep (or
-                    // could not DECIDE). A coverage gap for the whole call.
+                    // could not DECIDE). A coverage gap for the whole call -
+                    // fatal in the caller, so say what was declined: the
+                    // body's outcome and the lanes' player rem / spd (the
+                    // interval slots the rungs fork on).
+                    let declined = live & !ok & valid;
+                    let ids = crate::compiled::ids();
+                    let mut rows = String::new();
+                    let mut m = declined;
+                    while m != 0 {
+                        let i = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        let lane = lo + i;
+                        let mut desc = format!("lane {lane}:");
+                        for obj in chunk.player_objects(ids) {
+                            for (name, f) in [("rem", ids.f_rem), ("spd", ids.f_spd)] {
+                                if let Some(pc) = chunk.obj_field_cell(obj, f) {
+                                    if let Col::U(AV::Ptr(sub)) = chunk.cols[pc as usize] {
+                                        for (axis, g) in [("x", ids.f_x), ("y", ids.f_y)] {
+                                            if let Some(c) = chunk.obj_field_cell(sub, g) {
+                                                desc.push_str(&format!(" {name}.{axis}={:?}", chunk.cols[c as usize].at(lane)));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        rows.push_str(&desc);
+                        rows.push('\n');
+                    }
+                    eprintln!(
+                        "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} ok {:#06x}):\n{rows}",
+                        chunk.shape_hash, body.outcome, declined, live, ok
+                    );
+                    self.explain_ok(chunk, lo + declined.trailing_zeros() as usize, self.flat_roots[body.ok_root]);
                     return false;
                 }
                 let mut take = live & ok & valid & !skip;
@@ -403,6 +436,53 @@ impl AsmKernel {
     }
 
     /// from the interpreter. Prints at most a few mismatches per chunk.
+    /// On a decline: evaluate the fused graph for `lane` and print the
+    /// conjuncts of the body's `ok` (its And-tree's leaves) that are not
+    /// decided true - the premise the lane fails.
+    fn explain_ok(&self, chunk: &Rt2, lane: usize, ok_node: crate::transpile::graph::NodeId) {
+        use crate::transpile::graph::{Op, Val};
+        let mut cells: std::collections::HashMap<u32, Val> = Default::default();
+        for &cell in &self.compiled.input_cells {
+            let v = match chunk.cols[cell as usize].at(lane) {
+                AV::Num(p) => Val::Num(crate::pico8_num::Pico8NumInterval::new(p, p)),
+                AV::Ival(a, b) => Val::Num(crate::pico8_num::Pico8NumInterval::new(a, b)),
+                AV::Bool(b) => Val::Bool(Some(b)),
+                AV::UBool => Val::Bool(None),
+                _ => continue,
+            };
+            cells.insert(cell, v);
+        }
+        let vals = match self.fused.eval_narrow_top_in(&cells, &self.room) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[kernel]   (graph evaluation failed: {e:#})");
+                return;
+            }
+        };
+        let mut stack = vec![ok_node];
+        let mut seen = std::collections::HashSet::new();
+        let mut shown = 0;
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            let node = self.fused.get(n);
+            if matches!(node.op, Op::And) {
+                stack.extend(node.args.iter().copied());
+                continue;
+            }
+            if vals[n as usize] != Val::Bool(Some(true)) && shown < 8 {
+                shown += 1;
+                let args: Vec<String> = node
+                    .args
+                    .iter()
+                    .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
+                    .collect();
+                eprintln!("[kernel]   ok conjunct {} {:?} = {:?}; args {}", n, node.op, vals[n as usize], args.join(", "));
+            }
+        }
+    }
+
     fn eval_check(&self, chunk: &Rt2, lo: usize, n: usize, outbuf: &[u8]) {
         use crate::transpile::graph::Val;
         static PRINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

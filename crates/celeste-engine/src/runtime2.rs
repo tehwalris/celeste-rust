@@ -686,7 +686,7 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, 0);
+        self.widen_to(ids, 0, None);
     }
 
     /// The boundary widenings of the `Bits(rem_bits)` level on this block's
@@ -701,7 +701,11 @@ impl Rt2 {
     ///   3. dash_effect_time clamped at 0 from below.
     ///   3b. fruit: off := [0, 39] and y := its bob band, together.
     ///   4. timer globals pinned to 0.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8) {
+    /// `spd_width_log2`: the speed bucket (2^w raw units) to widen the
+    /// players' `spd.x`/`spd.y` to, `None` for exact speed - the level's
+    /// `abstraction::spd_precision_for`, which the caller passes because
+    /// the switch lives above this crate.
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<u8>) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 1. rem widening.
@@ -768,11 +772,10 @@ impl Rt2 {
             }
         }
 
-        // 2. spd widening: the same bucket width as rem's at this rung
-        // (`abstraction::spd_precision_for`): 2^(16 - bits) raw units,
-        // floor-aligned (`make_state_abstract_spd`).
-        if rem_bits < 16 {
-            let width: i32 = 1i32 << (16 - rem_bits);
+        // 2. spd widening (the spd ladder, `abstraction::spd_precision_for`):
+        // floor-aligned buckets of 2^w raw units (`make_state_abstract_spd`).
+        if let Some(w) = spd_width_log2 {
+            let width: i32 = 1i32 << w;
             let sbucket = |n: P8| -> (P8, P8) {
                 let low = n.to_bits().cast_signed().div_euclid(width) * width;
                 (P8::from_raw(low), P8::from_raw(low + width - 1))

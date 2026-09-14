@@ -6,7 +6,7 @@ use std::collections::HashMap;
 const ONE_FIXED2: i32 = 0x0002_0000; // +2.0 in 16.16
 
 use celeste_engine::kernel::{
-    zb_and, zb_eq, zb_not, zb_or, zi_abs, zi_add, zi_cmp, zi_flr, zi_fork_flr, zi_max, zi_min,
+    zb_and, zb_eq, zb_not, zb_or, zi_abs, zi_add, zi_cmp, zi_eq, zi_flr, zi_fork_flr, zi_max, zi_min,
     zi_neg, zi_span_ok, zi_sub, zn_abs, zn_add, zn_eq, zn_flr, zn_ge, zn_gt, zn_le, zn_lt, zn_max,
     zn_min, zn_mul, zn_neg, zn_sub, zsel_b, zsel_i, zsel_n,
     zn_div, zn_mget, zn_rem, zn_sin, zn_tile_flag_at, Cmp, ZB, ZI,
@@ -133,6 +133,7 @@ fn eval_nodes(
             Op::Le => V::B(zn_le(n(0), n(1))),
             Op::Gt => V::B(zn_gt(n(0), n(1))),
             Op::Ge => V::B(zn_ge(n(0), n(1))),
+            Op::Eq if !dom_bool(0) && (wide(0) || wide(1)) => V::B(zi_eq(iv(0), iv(1))),
             Op::Eq => {
                 if dom_bool(0) {
                     V::B(zb_eq(b(0), b(1)))
@@ -397,6 +398,10 @@ fn build_interval_graph(cells: &[u32], fork_bits: u8) -> (Graph, Vec<NodeId>) {
         // interval comparisons
         let lt = g.add(Op::Lt, vec![ivl, shifted]);
         let ge = g.add(Op::Ge, vec![mx, ivl]);
+        // interval equality: interval vs interval, interval vs number
+        // (the spd ladder compares widened speeds with constants)
+        let eqi = g.add(Op::Eq, vec![ivl, shifted]);
+        let eqn = g.add(Op::Eq, vec![mx, base]);
         // fork
         let spanok = g.add(Op::SplitOk, vec![mx]);
         let frag0 = g.add(Op::Frag(0), vec![mx]);
@@ -411,6 +416,8 @@ fn build_interval_graph(cells: &[u32], fork_bits: u8) -> (Graph, Vec<NodeId>) {
         roots.push(flok);
         roots.push(lt);
         roots.push(ge);
+        roots.push(eqi);
+        roots.push(eqn);
         roots.push(spanok);
         roots.push(ok0);
         roots.push(ok1);

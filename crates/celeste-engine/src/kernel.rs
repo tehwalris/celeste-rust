@@ -433,6 +433,17 @@ pub fn zi_cmp(op: Cmp, a: ZI, b: ZI) -> ZB {
     ZB { val: t, known: t | f }
 }
 
+/// Interval equality, `Graph::compare`'s rule: decided false where the
+/// boxes are disjoint, decided (to the lows' equality) where both are
+/// singletons, unknown otherwise.
+#[inline(always)]
+pub fn zi_eq(a: ZI, b: ZI) -> ZB {
+    let both = mask_eq(a.lo, a.hi) & mask_eq(b.lo, b.hi);
+    let val = both & mask_eq(a.lo, b.lo);
+    let disjoint = mask_gt(a.lo, b.hi) | mask_gt(b.lo, a.hi);
+    ZB { val, known: both | disjoint }
+}
+
 
 // ---- bool ops ----
 

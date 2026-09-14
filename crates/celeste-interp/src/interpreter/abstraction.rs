@@ -264,10 +264,27 @@ pub fn spd_precision_for(rem: RemPrecision) -> SpdPrecision {
     if let Some(w) = spd_width_override() {
         return SpdPrecision::WidthLog2(w);
     }
+    if !spd_ladder_on() {
+        return SpdPrecision::Exact;
+    }
     match rem {
         RemPrecision::Bits(k) if k < 16 => SpdPrecision::WidthLog2(16 - k),
         _ => SpdPrecision::Exact,
     }
+}
+
+/// `CELESTE_SPD_LADDER=bucket` turns the speed ladder on. Off by default:
+/// a coarser level 0 wins earlier and its finer levels refute later, so
+/// rooms whose speeds do not explode (room (1,0): ~2 min per horizon
+/// against 4:51 for the whole search) pay for a collapse they do not
+/// need. Rooms with springs need it (room (2,0)'s `spd.x *= 0.2`, 19x).
+pub fn spd_ladder_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("CELESTE_SPD_LADDER").as_deref() {
+        Ok("bucket") => true,
+        Ok("exact") | Err(_) => false,
+        Ok(other) => panic!("CELESTE_SPD_LADDER={other:?}: expected bucket or exact"),
+    })
 }
 
 /// The session's spd precision: derived from the rem precision
@@ -1066,9 +1083,14 @@ mod tests {
         assert_eq!(out.vector_size, state.vector_size);
         // ...and the ladder rule: the same bucket width as rem's rung,
         // exact with exact rem.
-        assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::WidthLog2(16));
-        assert_eq!(spd_precision_for(RemPrecision::Bits(15)), SpdPrecision::WidthLog2(1));
+        // (The ladder rule itself, independent of the CELESTE_SPD_LADDER switch.)
         assert_eq!(spd_precision_for(RemPrecision::Exact), SpdPrecision::Exact);
+        if spd_ladder_on() {
+            assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::WidthLog2(16));
+            assert_eq!(spd_precision_for(RemPrecision::Bits(15)), SpdPrecision::WidthLog2(1));
+        } else {
+            assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::Exact);
+        }
         set_rem_precision(RemPrecision::Exact);
         assert_eq!(split_spd_straddles(State::new()).len(), 1);
     }
