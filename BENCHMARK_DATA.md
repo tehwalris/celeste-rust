@@ -1,3 +1,20 @@
+# Guarded regions + lane grouping in the kernels (2026-09-14, quick profile, 16 threads)
+
+plans/regions.md. `rewrite bench-frame`, wave time of one frame:
+
+| | straight-line kernel | regions | regions + grouping |
+|---|---|---|---|
+| room (2,0) level 0, f45 (1.5M lanes) | 9.0 s | 5.6-7.1 s | **5.6 s** |
+| room (0,0) level 1, f80 (0.84M lanes, filtered) | 1.15 s | 0.87 s | **0.75 s** |
+| room (1,0) level 0, f70 (5.2M lanes) | 3.35 s | 3.35 s | **2.25 s** |
+
+Body utilization before (room (2,0)): 14.6% of (body, slice) evaluations
+took a lane. Regions present per slice after grouping: 10.3 of 19.3 -
+the floor set by level 0's widened rem (both floors of a rem fork are
+non-empty for the same lane) and by dead outcomes' tails, which fork
+regions cannot skip. Same frontier sets, pos graph and marks (the three
+pinned oracles) and the diff oracle empty.
+
 # The forward-cost pass on the explicit graph (2026-09-14)
 
 plans/waves.md "The forward-cost pass": 64-lane predecessor groups,
