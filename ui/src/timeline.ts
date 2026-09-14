@@ -12,6 +12,7 @@ import type { Chapter, Run } from "./data";
 import { fmtInt, fmtMs, levelName } from "./data";
 import { bwdSplit, fwdSplit, levelCss, phaseColor, prebuildColor, inkMuted, gridline, inkSecondary } from "./color";
 import { button, el, fitCanvas } from "./ui";
+import type { View } from "./main";
 
 interface Block {
   row: number; // 0 horizon, 1 level, 2 phase, 3 step
@@ -26,7 +27,7 @@ interface Block {
   parts?: { name: string; ms: number; color: string }[];
 }
 
-export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
+export function timelineView(run: Run, chs: Chapter[]): View {
   const prebuildMs = (run.prebuild_s ?? 0) * 1000;
   const total = prebuildMs + chs.reduce((a, c) => a + c.totalMs, 0);
   const blocks: Block[] = [];
@@ -465,5 +466,5 @@ export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
   for (const b of blocks) if (b.row === 0 && (!slowest || b.t1 - b.t0 > slowest.t1 - slowest.t0)) slowest = b;
   selected = slowest;
   describe(slowest);
-  return root;
+  return { root };
 }

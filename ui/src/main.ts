@@ -1,31 +1,69 @@
 // The shell: the runs on offer (runs.json), the chosen run's run.json,
-// the three views, and the route - `#<tab>` for the default run,
-// `#<run>/<tab>` for any other.
+// the three views, and the route. The route is the hash:
+//
+//   #<tab>                     the default run
+//   #<run>/<tab>               another run
+//   #<run>/<tab>?h=99&t=3364   plus the view's own state (the space view:
+//                              horizon, position, grain, look, ...)
+//
+// so a link reproduces exactly what was on screen. A view reports its
+// state through `onState`; the shell writes it into the hash (replace,
+// never push - the back button leaves the app, it does not undo scrubs).
 import "./style.css";
-import { chapters, fmtMs, loadRun, loadRuns, type Chapter, type Run, type RunInfo } from "./data";
-import { chips, el, clear } from "./ui";
+import { chapters, fmtDuration, loadRun, loadRuns, type Chapter, type Run, type RunInfo } from "./data";
+import { chips, el, clear, button, type Chips } from "./ui";
 import { spaceView } from "./space";
 import { sizesView } from "./sizes";
 import { timelineView } from "./timeline";
 
 type Tab = "space" | "sizes" | "time";
-const TABS: { id: Tab; label: string }[] = [
-  { id: "space", label: "Space" },
-  { id: "sizes", label: "Sizes" },
-  { id: "time", label: "Time" },
+const TABS: { id: Tab; label: string; hint: string }[] = [
+  { id: "space", label: "Space", hint: "the room, frame by frame" },
+  { id: "sizes", label: "Sizes", hint: "how big the sets were" },
+  { id: "time", label: "Time", hint: "where the time went" },
 ];
 
-/** The route in the hash: `#space`, or `#room00/space`. */
-function route(runs: RunInfo[]): { runId: string; tab: Tab } {
-  const parts = location.hash.replace(/^#/, "").split("/");
+/** A view: its element, and optionally its state for the URL. */
+export interface View {
+  root: HTMLElement;
+  /** The view's state as query params (`h=99&t=12`), or "" for the default. */
+  params?(): string;
+  /** Adopt state from the URL (a back/forward, or a pasted link). */
+  apply?(p: URLSearchParams): void;
+}
+
+interface Route {
+  runId: string;
+  tab: Tab;
+  params: URLSearchParams;
+}
+
+function parseRoute(runs: RunInfo[]): Route {
+  const raw = location.hash.replace(/^#/, "");
+  const q = raw.indexOf("?");
+  const path = q < 0 ? raw : raw.slice(0, q);
+  const params = new URLSearchParams(q < 0 ? "" : raw.slice(q + 1));
+  const parts = path.split("/").filter(Boolean);
   const runPart = parts.length > 1 ? parts[0] : runs[0].id;
   const tabPart = parts.length > 1 ? parts[1] : parts[0];
   return {
     runId: runs.some((r) => r.id === runPart) ? runPart : runs[0].id,
     tab: TABS.some((t) => t.id === tabPart) ? (tabPart as Tab) : "space",
+    params,
   };
 }
-const hashOf = (runs: RunInfo[], runId: string, tab: Tab) => (runId === runs[0].id ? `#${tab}` : `#${runId}/${tab}`);
+const hashOf = (runs: RunInfo[], runId: string, tab: Tab, params: string) =>
+  `#${runId === runs[0].id ? tab : `${runId}/${tab}`}${params ? "?" + params : ""}`;
+
+function spinner(text: string): HTMLElement {
+  return el("div", { class: "loading", role: "status" }, [el("span", { class: "spinner", "aria-hidden": true }), el("span", { text })]);
+}
+
+function errorCard(title: string, detail: string, retry?: () => void): HTMLElement {
+  const card = el("div", { class: "card err-card", role: "alert" }, [el("h2", { text: title }), el("pre", { text: detail })]);
+  if (retry) card.append(button("Try again", retry, "small"));
+  return card;
+}
 
 async function main() {
   const app = document.getElementById("app")!;
@@ -34,98 +72,147 @@ async function main() {
     runs = await loadRuns();
   } catch (e) {
     clear(app);
-    app.append(el("div", { class: "err", text: `Could not load the run list: ${(e as Error).message}\n\nThe data directory needs runs.json and one subdirectory per run (rewrite export-ui --out <data dir>/<run>).` }));
+    app.append(
+      errorCard(
+        "No runs to show",
+        `${(e as Error).message}\n\nThe data directory needs runs.json and one subdirectory per run:\n  rewrite export-ui --out <data dir>/<run> --room X,Y`,
+        () => location.reload(),
+      ),
+    );
     return;
   }
 
+  // ---- the header: title, the run, the tabs ----------------------------------
   const title = el("h1", { text: "Celeste search" });
-  const sub = el("span", { class: "sub" });
-  const header = el("header", { class: "top" }, [title, sub]);
-  const runStrip = el("div", { class: "run-strip" });
-  const nav = el("nav", { class: "tabs" });
+  const sub = el("div", { class: "sub" });
+  const brand = el("div", { class: "brand" }, [title, sub]);
+  let runChips: Chips<string> | null = null;
+  const runBox = el("div", { class: "run-switch" });
+  const nav = el("nav", { class: "tabs", "aria-label": "views" });
+  const header = el("header", { class: "top" }, [brand, runBox, nav]);
   const main = el("main");
   clear(app);
-  app.append(header, runStrip, nav, main);
+  app.append(header, main);
 
   // The loaded run and its views, rebuilt from scratch on a run switch.
-  let current: { run: Run; chs: Chapter[]; views: Map<Tab, HTMLElement> } | null = null;
+  let current: { run: Run; chs: Chapter[]; views: Map<Tab, View> } | null = null;
   let tab: Tab | null = null;
   let loads = 0;
 
-  const go = (runId: string, t: Tab) => {
-    const h = hashOf(runs, runId, t);
-    if (location.hash !== h) history.replaceState(null, "", h);
-    void apply(runId, t);
+  /** Write the route (and the current view's state) into the hash. */
+  let writing = false;
+  const writeHash = () => {
+    if (!current || !tab) return;
+    const v = current.views.get(tab);
+    const h = hashOf(runs, current.run.id, tab, v?.params?.() ?? "");
+    if (location.hash === h) return;
+    writing = true;
+    try {
+      history.replaceState(null, "", h);
+    } catch {
+      // Safari rate-limits replaceState; the next write will catch up.
+    }
+    writing = false;
   };
 
-  const buttons = new Map<Tab, HTMLButtonElement>();
+  const go = (runId: string, t: Tab, params = new URLSearchParams()) => void apply(runId, t, params);
+
+  const tabButtons = new Map<Tab, HTMLButtonElement>();
   for (const t of TABS) {
-    const b = el("button", { type: "button", text: t.label });
+    const b = el("button", { type: "button", title: t.hint, "aria-current": "false" }, [el("span", { text: t.label })]);
     b.addEventListener("click", () => go(current?.run.id ?? runs[0].id, t.id));
-    buttons.set(t.id, b);
+    tabButtons.set(t.id, b);
     nav.append(b);
   }
 
-  const buildRunStrip = (runId: string) => {
-    clear(runStrip);
-    runStrip.append(
-      chips<string>(
-        runs.map((r) => ({ value: r.id, label: r.label })),
-        new Set([runId]),
-        (sel) => go([...sel][0], tab ?? "space"),
-        { label: "run" },
-      ),
+  const buildRunSwitch = (runId: string) => {
+    if (runChips) {
+      runChips.set(runId);
+      return;
+    }
+    runChips = chips<string>(
+      runs.map((r) => ({ value: r.id, label: r.label })),
+      runId,
+      (id) => go(id, tab ?? "space"),
+      { label: "run" },
     );
+    runBox.append(runChips.root);
   };
 
-  const build = (t: Tab) => {
+  const build = (t: Tab): View => {
     const c = current!;
-    let v = c.views.get(t);
-    if (!v) {
-      v = t === "space" ? spaceView(c.run) : t === "sizes" ? sizesView(c.run) : timelineView(c.run, c.chs);
-      c.views.set(t, v);
-    }
+    const have = c.views.get(t);
+    if (have) return have;
+    const v: View = t === "space" ? spaceView(c.run, writeHash) : t === "sizes" ? sizesView(c.run) : timelineView(c.run, c.chs);
+    c.views.set(t, v);
     return v;
   };
 
-  async function apply(runId: string, t: Tab) {
+  async function apply(runId: string, t: Tab, params: URLSearchParams) {
     if (!current || current.run.id !== runId) {
       const seq = ++loads;
       const label = runs.find((r) => r.id === runId)?.label ?? runId;
-      buildRunStrip(runId);
+      buildRunSwitch(runId);
       sub.textContent = "";
+      document.title = `Celeste search · ${label}`;
       clear(main);
-      main.append(el("div", { class: "loading", text: `Loading ${label}…` }));
+      main.append(spinner(`Loading ${label}…`));
       let run: Run;
       try {
         run = await loadRun(runId);
       } catch (e) {
         if (seq !== loads) return;
         clear(main);
-        main.append(el("div", { class: "err", text: `Could not load ${label}: ${(e as Error).message}\n\nRegenerate it with: rewrite export-ui --log <run log> --out <data dir>/${runId} --room ${runId.replace(/^room(\d)(\d)$/, "$1,$2")}` }));
+        main.append(
+          errorCard(
+            `Could not load ${label}`,
+            `${(e as Error).message}\n\nRegenerate it with:\n  rewrite export-ui --log <run log> --out <data dir>/${runId} --room ${runId.replace(/^room(\d)(\d)$/, "$1,$2")}`,
+            () => {
+              current = null;
+              void apply(runId, t, params);
+            },
+          ),
+        );
         return;
       }
       // A later switch superseded this load.
       if (seq !== loads) return;
+      if (run.horizons.length === 0) {
+        clear(main);
+        main.append(errorCard(`${label} is empty`, "run.json lists no horizons: the log had no ladder in it."));
+        return;
+      }
       current = { run, chs: chapters(run), views: new Map() };
       tab = null;
-      // The room is on the run chip; the sub is the run's numbers.
-      sub.textContent = `${run.horizons.length} horizons · optimum ${run.optimal ?? "?"} · ${run.wall_s != null ? fmtMs(run.wall_s * 1000) : ""}`;
+      const wall = run.wall_s != null ? fmtDuration(run.wall_s * 1000) : "";
+      // The room is on the run chip; the sub is the run's headline numbers.
+      sub.replaceChildren(el("span", { text: `optimum ${run.optimal != null ? `${run.optimal} frames` : "not found"}` }));
+      if (wall) sub.append(el("span", { text: wall }));
+      sub.append(el("span", { text: `${run.horizons.length} horizons` }));
     }
-    if (tab === t) return;
-    tab = t;
-    clear(main);
-    main.append(build(t));
-    for (const [id, b] of buttons) b.classList.toggle("on", id === t);
-    window.scrollTo({ top: 0 });
+    const v = build(t);
+    if (tab !== t) {
+      tab = t;
+      clear(main);
+      main.append(v.root);
+      main.dataset.tab = t;
+      for (const [id, b] of tabButtons) {
+        b.classList.toggle("on", id === t);
+        b.setAttribute("aria-current", id === t ? "page" : "false");
+      }
+      window.scrollTo({ top: 0 });
+    }
+    if ([...params.keys()].length) v.apply?.(params);
+    writeHash();
   }
 
   window.addEventListener("hashchange", () => {
-    const r = route(runs);
-    void apply(r.runId, r.tab);
+    if (writing) return;
+    const r = parseRoute(runs);
+    void apply(r.runId, r.tab, r.params);
   });
-  const r = route(runs);
-  void apply(r.runId, r.tab);
+  const r = parseRoute(runs);
+  void apply(r.runId, r.tab, r.params);
 }
 
 main();

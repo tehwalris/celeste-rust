@@ -8,8 +8,9 @@ import { fmtCompact, fmtInt, fmtMs, levelName } from "./data";
 import { levelCss, slots } from "./color";
 import { lineChart, legendFor, type Series } from "./chart";
 import { chips, el, clear } from "./ui";
+import type { View } from "./main";
 
-export function sizesView(run: Run): HTMLElement {
+export function sizesView(run: Run): View {
   const root = el("div");
   const last = run.horizons[run.horizons.length - 1];
   const l0Last = last.levels.find((l) => l.level === 0);
@@ -36,24 +37,25 @@ export function sizesView(run: Run): HTMLElement {
   const st = { h: run.horizons.length - 1, log: true, bwdMetric: "marked" as "marked" | "rerun" | "loaded" | "targets" };
   const hRow = chips<number>(
     run.horizons.map((x, i) => ({ value: i, label: `h${x.h}` })),
-    new Set([st.h]),
-    (sel) => {
-      st.h = [...sel][0];
+    st.h,
+    (i) => {
+      st.h = i;
       build();
     },
-    { label: "horizon" },
-  );
+    { label: "horizon", scroll: true },
+  ).root;
   const logRow = chips<string>(
     [
       { value: "log", label: "log scale" },
       { value: "lin", label: "linear" },
     ],
-    new Set([st.log ? "log" : "lin"]),
-    (sel) => {
-      st.log = [...sel][0] === "log";
+    st.log ? "log" : "lin",
+    (v) => {
+      st.log = v === "log";
       build();
     },
-  );
+    { label: "y axis" },
+  ).root;
   const metricRow = chips<typeof st.bwdMetric>(
     [
       { value: "marked", label: "marked" },
@@ -61,14 +63,14 @@ export function sizesView(run: Run): HTMLElement {
       { value: "loaded", label: "loaded" },
       { value: "targets", label: "targets" },
     ],
-    new Set([st.bwdMetric]),
-    (sel) => {
-      st.bwdMetric = [...sel][0];
+    st.bwdMetric,
+    (v) => {
+      st.bwdMetric = v;
       build();
     },
-    { label: "backward metric" },
-  );
-  root.append(el("div", { class: "card" }, [hRow, el("div", { style: "height:8px" }), logRow]));
+    { label: "metric" },
+  ).root;
+  root.append(el("div", { class: "card stack" }, [hRow, logRow]));
   const charts = el("div");
   root.append(charts);
 
@@ -183,5 +185,5 @@ export function sizesView(run: Run): HTMLElement {
     );
   }
   build();
-  return root;
+  return { root };
 }
