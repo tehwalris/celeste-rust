@@ -1,3 +1,19 @@
+# Position widening census (2026-09-14, `rewrite pos-census`)
+
+Post-hoc: the distinct states of a level-0 frame with the player's x/y
+bucketed to 2, 4, 8 px (every other field exact). The ceiling of what a
+coarser POSITION rung (rem is sub-pixel position; a 2 px bucket is the
+same ladder one rung below level 0) could merge, before its own spread
+at the boundary (the same doubling-on-straddle mechanism as rem, not the
+in-frame threshold fan-out that made the speed bucket a loss).
+
+| room, frame | rows | / 2 px | / 4 px | / 8 px |
+|---|---|---|---|---|
+| (2,0) f69 | 55.3M | 1.97x | 5.17x | 10.6x |
+| (2,0) f50 | 5.44M | 1.99x | 4.94x | 9.8x |
+| (1,0) f99 | 6.77M | 2.09x | 4.76x | 8.8x |
+| (0,0) f93 | 22.8M | 2.06x | 5.00x | 9.8x |
+
 # How full are the cells on the spawn-to-top diagonal? (2026-09-14, `rewrite fullness-probe`)
 
 Per sampled cell, over every frame of the level-0 tree: the states ever

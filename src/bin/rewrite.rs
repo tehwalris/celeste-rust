@@ -205,6 +205,17 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         auto: usize,
     },
+    /// DIAGNOSTIC: the post-hoc census of a POSITION widening. For each
+    /// listed frame, the distinct states with the player's x/y bucketed
+    /// to 1, 2, 4 and 8 px (every other field exact) - the ceiling of
+    /// what a coarser position rung could merge, before its own spread.
+    PosCensus {
+        #[arg(long)]
+        level_dir: String,
+        /// Frames, comma-separated.
+        #[arg(long)]
+        frames: String,
+    },
     /// Export a finished run for the web UI (`ui/`): per (horizon, level,
     /// frame) the states per player-position cell and the win cells, per
     /// (horizon, level) the marks per cell by distance, and the log's
@@ -1479,6 +1490,81 @@ fn main() -> Result<()> {
                     st.spd.len(),
                     st.rows as f64 / st.spd.len().max(1) as f64,
                     top.join(" ")
+                );
+            }
+        }
+        Command::PosCensus { level_dir, frames } => {
+            use celeste_engine::runtime2::{mix64, Cell2, Col, AV};
+            use celeste_rust::frame::load_frame;
+            let dir = std::path::Path::new(&level_dir);
+            let ids = celeste_rust::compiled::ids();
+            const SIZES: [i32; 4] = [1, 2, 4, 8];
+            println!("frame | rows | distinct at 1 px | 2 px | 4 px | 8 px");
+            for f in frames.split(',') {
+                let f: u32 = f.trim().parse()?;
+                let blocks = load_frame(dir, f)?;
+                let mut sets: Vec<rustc_hash::FxHashSet<u64>> = vec![Default::default(); SIZES.len()];
+                let mut rows = 0usize;
+                for b in &blocks {
+                    let rt2 = b.rt2();
+                    rows += rt2.width;
+                    let (px, py) = match celeste_rust::search::pos_graph::player_object(rt2) {
+                        Some(obj) => (rt2.obj_field_cell(obj, ids.f_x), rt2.obj_field_cell(obj, ids.f_y)),
+                        None => (None, None),
+                    };
+                    // Hash of everything but the player's x/y, per row.
+                    let mut h: Vec<u64> = vec![rt2.shape_hash; rt2.width];
+                    let fold = |acc: u64, c: usize, v: AV| -> u64 {
+                        let (k, a, bb) = match v {
+                            AV::Num(n) => (0u64, n.as_raw_u32() as u64, 0u64),
+                            AV::Ival(a, bb) => (1, a.as_raw_u32() as u64, bb.as_raw_u32() as u64),
+                            AV::Bool(x) => (2, x as u64, 0),
+                            AV::UBool => (3, 0, 0),
+                            AV::Str(s) => (4, s as u64, 0),
+                            AV::Nil => (5, 0, 0),
+                            AV::Ptr(p) => (6, p as u64, 0),
+                            AV::NilPtr => (7, 0, 0),
+                        };
+                        mix64(acc ^ mix64((c as u64) << 56 | k << 48 | a << 16 ^ bb))
+                    };
+                    for (c, col) in rt2.cols.iter().enumerate() {
+                        if !matches!(rt2.structure[c], Cell2::Val) || Some(c as u32) == px || Some(c as u32) == py {
+                            continue;
+                        }
+                        match col {
+                            Col::U(v) => {
+                                let hv = fold(0, c, *v);
+                                for x in h.iter_mut() {
+                                    *x = mix64(*x ^ hv);
+                                }
+                            }
+                            _ => {
+                                for (r, x) in h.iter_mut().enumerate() {
+                                    *x = mix64(*x ^ fold(0, c, col.at(r)));
+                                }
+                            }
+                        }
+                    }
+                    let whole = |c: Option<u32>, r: usize| -> i32 {
+                        match c.map(|c| rt2.cols[c as usize].at(r)) {
+                            Some(AV::Num(n)) => n.whole_part_as_i16() as i32,
+                            _ => i32::MIN / 2,
+                        }
+                    };
+                    for r in 0..rt2.width {
+                        let (x, y) = (whole(px, r), whole(py, r));
+                        for (si, &sz) in SIZES.iter().enumerate() {
+                            let bx = x.div_euclid(sz) as u64 as u32 as u64;
+                            let by = y.div_euclid(sz) as u64 as u32 as u64;
+                            sets[si].insert(mix64(h[r] ^ mix64(bx << 32 | by)));
+                        }
+                    }
+                }
+                let d: Vec<String> = sets.iter().map(|s| s.len().to_string()).collect();
+                println!(
+                    "f{f:03} | {rows} | {} | ratios vs 1 px: {}",
+                    d.join(" | "),
+                    sets.iter().map(|s| format!("{:.2}x", sets[0].len() as f64 / s.len().max(1) as f64)).collect::<Vec<_>>().join(" ")
                 );
             }
         }
