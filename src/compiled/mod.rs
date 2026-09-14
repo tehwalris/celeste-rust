@@ -257,4 +257,8 @@ impl crate::frame::FrameStep for FrameEngine {
         self.run_bucket(block.rt2(), cell_in, lanes, sink);
         Ok(())
     }
+
+    fn classify(&self, block: &crate::frame::Block, lanes: std::ops::Range<usize>) -> Option<Vec<u64>> {
+        asm_kernel::classify_chunk(block.rt2(), lanes)
+    }
 }

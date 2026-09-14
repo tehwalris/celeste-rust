@@ -69,10 +69,74 @@ ever read as a lane's.
 
 `CELESTE_ASM_REGIONS=0` emits the old straight-line kernel for an A/B.
 
-## What is left on the table
+## First A/B, and why it was small (2026-09-14, quick, 16 threads)
 
-Lanes are sliced in cell order, so a slice mixes configurations and a
-region runs if ANY of its 16 lanes needs it. Grouping a call's lanes by
-configuration before slicing (a cheap pre-pass on the premises, or a
-sort of the frontier by a configuration key at the checkpoint) would
-make most slices single-configuration and the skip near-complete.
+room (2,0) f45: wave 8.9-9.3 s -> 5.6-7.1 s; room (0,0) level 1 f80:
+1.13 -> 0.87 s; room (1,0) f70 unchanged (4 regions, all present). The
+census of what a slice needs (`CELESTE_BODYSETS=1`): room (2,0) 19.3
+non-root regions per slice, **12.3 present (64%)** - lanes are sliced in
+cell order, a slice of 16 mixes most configurations, and a region runs
+if ANY lane needs it. A single lane needs ONE configuration (its 32-54
+body set is one configuration times the button representatives), so
+grouping lanes by configuration before slicing is where the 5-8x is.
+
+## Lane grouping by configuration (the plan)
+
+- A GUARD KERNEL per shape: the fused graph compiled with the region
+  guards as its only roots - the root region, 3-7% of the nodes. Run
+  over a piece in natural order it yields per lane the set of regions
+  the lane can take (a small bitset: 4-33 regions).
+- At the start of a frame each piece's rows are physically sorted by
+  that bitset (a counting sort; the skip mask and cells follow) and the
+  PERMUTATION (real row per virtual position) is written beside the
+  frame's edges (`edges/perm/f{frame}/s{seq}.u32`). The step then sees
+  consecutive VIRTUAL ids, so the recording (64-lane groups, masks, the
+  dedup cache, the door) is untouched; only the edge runs' bases are
+  virtual, and the BFS translates `base + lane` through the permutation
+  of the run's frame and piece when it reads a record.
+- Units are still cut in cell order across pieces; within a piece the
+  rows are now ordered (configuration, cell), so a slice is one
+  configuration except at boundaries.
+
+## Lane grouping: what landed and what it measured (2026-09-14, quick, 16 threads)
+
+Implemented as planned: `GuardKernel` per shape (`AsmKernel::classify`),
+`FrameStep::classify`, `frame::group_by_configuration` (a piece's rows
+sorted by (region set, cell), virtual ids, `edges/perm/f{frame}/s{seq}.u32`),
+`EdgeGraph::real_pred` in the BFS and the diagnostics. Gates: ckhash,
+posgraph, marks fingerprints identical, `bench-backward --diff` 0/0.
+
+| | straight-line | regions | regions + grouping |
+|---|---|---|---|
+| room (2,0) f45 wave | 9.0 s | 5.6-7.1 s | 5.6 s |
+| room (0,0) level 1 f80 wave | 1.15 s | 0.87 s | 0.75 s |
+| room (1,0) f70 wave | 3.35 s | 3.35 s | 2.25 s |
+| room (2,0) regions present per slice (of 19.3) | - | 12.3 | 10.3 |
+
+About 1.5-1.6x everywhere, not the 5-8x the census suggested, and the
+reason is in the per-lane keys: after grouping a slice is one key, but
+the key itself holds ~10 regions. Two things the fork regions cannot
+express:
+
+1. **Spanning forks.** At level 0 `rem` is widened to a whole unit, so
+   `rem + spd` spans two floors on each axis and BOTH resolutions of a
+   rem fork are non-empty fragments for the same lane - the lane
+   genuinely takes ~4-5 of the 16 configurations (its 54-body set is
+   ~1.25 configurations' worth of bodies because only one OUTCOME is
+   live, not because one configuration is). Finer rungs narrow rem and
+   the span with it, which is why level 1 gains more.
+2. **Dead outcomes.** A body's `live` (its outcome's branch was taken)
+   is not in the guard - it is computed deep in the graph (the ok/live
+   cones are 63-73% of it) - so an outcome that is dead for the whole
+   slice still has its tail (fields and key chains, roughly half the
+   nodes) evaluated. Keying regions by outcome as well needs `live`
+   early, which it is not; a separable "outcome decided" predicate
+   would have to come from the tracer.
+
+Room (2,0) itself remains out of reach on this machine for a different
+reason: the level-0 tree passes 50M lanes and ~600M visited states at
+f69 (53 GB RSS) with the win around f95 (~10^8 lanes, 2-3 x 10^9 visited:
+the door alone ~40 GB, before the frontier and the compaction's
+transient). That is a state-count problem (the abstraction, the
+motion-free specialization census in BENCHMARK_DATA.md), not a kernel
+speed problem.

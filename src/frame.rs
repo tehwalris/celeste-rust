@@ -1221,6 +1221,73 @@ pub trait FrameStep: Sync {
     /// disjoint lane ranges: an implementation keeps its scratch in the
     /// sink or behind a lock.
     fn run(&self, block: &Block, cell_in: &[u32], lanes: Range<usize>, sink: &mut ForwardSink) -> Result<()>;
+
+    /// Per lane of `lanes`, a key such that lanes with equal keys take the
+    /// same fork configurations (the kernel's region set,
+    /// plans/regions.md "Lane grouping"); `None` if the step has none. The
+    /// frame sorts a piece's rows by it so a slice is one configuration.
+    fn classify(&self, _block: &Block, _lanes: Range<usize>) -> Option<Vec<u64>> {
+        None
+    }
+}
+
+/// Group a block's rows by the step's configuration key (then cell), in
+/// place: the rows are physically permuted, the ids become consecutive
+/// VIRTUAL ids for this frame, and the permutation (real row per virtual
+/// position) is returned so the recorded edges' bases can be translated
+/// back (`edges::EdgeGraph::real_pred`). `None` if nothing changed.
+fn group_by_configuration(engine: &dyn FrameStep, block: &mut Block, cells: &[u32]) -> Result<Option<Vec<u32>>> {
+    let n = block.lanes();
+    if n < 64 {
+        return Ok(None);
+    }
+    let Some(keys) = engine.classify(block, 0..n) else { return Ok(None) };
+    if std::env::var_os("CELESTE_CONE_CENSUS").is_some() {
+        let mut pop: std::collections::BTreeMap<u32, usize> = Default::default();
+        for k in &keys {
+            *pop.entry(k.count_ones()).or_default() += 1;
+        }
+        let distinct: std::collections::BTreeSet<u64> = keys.iter().copied().collect();
+        eprintln!("[group] block of {n} rows: {} distinct keys; regions per lane {:?}", distinct.len(), pop);
+    }
+    if keys.iter().all(|&k| k == keys[0]) {
+        return Ok(None);
+    }
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by_key(|&i| (keys[i as usize], cells[i as usize], i));
+    let mut rt2 = empty_like(&block.rt2);
+    rt2.append_rows(&block.rt2, &order);
+    if !block.skip.is_empty() {
+        block.skip = order.iter().map(|&i| block.skip[i as usize]).collect();
+    }
+    let perm: Vec<u32> = if block.ids.is_empty() {
+        Vec::new()
+    } else {
+        let (layer, seq) = (id_layer(block.ids[0]), id_seq(block.ids[0]));
+        let perm: Vec<u32> = order.iter().map(|&i| id_row(block.ids[i as usize])).collect();
+        block.ids = (0..n as u32).map(|pos| pack_id(layer, seq, pos)).collect();
+        perm
+    };
+    block.rt2 = rt2;
+    Ok(Some(perm))
+}
+
+/// An empty block of `rt2`'s shape with empty typed columns (what
+/// `Rt2::append_rows` fills).
+fn empty_like(rt2: &Rt2) -> Rt2 {
+    let mut b = celeste_engine::slots::reshape(rt2, 0);
+    b.shape_hash = rt2.shape_hash;
+    b.cols = rt2
+        .cols
+        .iter()
+        .map(|c| match c {
+            Col::N(_) => Col::N(Vec::new()),
+            Col::I(_) => Col::I(Vec::new()),
+            Col::V(_) => Col::V(Vec::new()),
+            Col::U(v) => Col::U(*v),
+        })
+        .collect();
+    b
 }
 
 /// The emit phase's unit: one kernel call covers at most this many lanes
@@ -1266,6 +1333,7 @@ pub fn forward_frame(
     frame: u32,
     edges_dir: Option<&std::path::Path>,
 ) -> Result<(Vec<Block>, bool, FrameStats)> {
+    let mut frontier = frontier;
     use std::time::Instant;
     let mut st = FrameStats::default();
     let workers = threads();
@@ -1274,7 +1342,32 @@ pub fn forward_frame(
     st.bytes_in = frontier.iter().map(Block::bytes).sum();
     st.rss_start = crate::metrics::current_rss_gb();
 
-    let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
+    let mut cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
+    // Rows grouped by configuration (plans/regions.md), pieces in parallel;
+    // the permutations beside the frame's edges for the backward.
+    {
+        let t = Instant::now();
+        let perms: Vec<Option<Vec<u32>>> = std::thread::scope(|scope| {
+            let hs: Vec<_> = frontier
+                .iter_mut()
+                .zip(cells.iter())
+                .map(|(b, c)| scope.spawn(move || group_by_configuration(engine, b, c)))
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("grouping worker panicked")).collect::<Result<Vec<_>>>()
+        })?;
+        let mut grouped = 0usize;
+        for (bi, p) in perms.into_iter().enumerate() {
+            let Some(perm) = p else { continue };
+            grouped += 1;
+            cells[bi] = frontier[bi].positions()?;
+            if let (Some(dir), false) = (edges_dir, perm.is_empty()) {
+                let seq = id_seq(frontier[bi].ids[0]);
+                crate::search::edges::write_perm(dir, frame, seq, &perm)?;
+            }
+        }
+        st.t_group = t.elapsed();
+        st.grouped = grouped;
+    }
     // Units in WAVE order: by first cell across the (cell-sorted) pieces,
     // so consecutive units are neighbours in the room.
     let mut units = units_of(frontier.iter().map(Block::lanes), UNIT_LANES);
@@ -1419,6 +1512,9 @@ pub struct FrameStats {
     pub t_edges: std::time::Duration,
     /// The workers' summed time in the ladder filter (thread-time).
     pub t_filter: std::time::Duration,
+    /// Grouping the pieces' rows by configuration: wall time, pieces grouped.
+    pub t_group: std::time::Duration,
+    pub grouped: usize,
     /// The input frontier's row storage, bytes.
     pub bytes_in: usize,
     /// Bytes allocated in the workers' queue pools, and in the door.
@@ -1973,7 +2069,7 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         wave {:.0} (idle {:.0}%) door {:.0} edges {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
+         group {:.0} wave {:.0} (idle {:.0}%) door {:.0} edges {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
          flushes {} ({:.0} rows avg) edges {} | \
          in {:.2} queues {:.2} door {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
         st.blocks_in,
@@ -1983,6 +2079,7 @@ fn log_frame(
         st.blocks_out,
         st.lanes_out,
         visited,
+        ms(st.t_group),
         ms(st.t_wave),
         st.wave_idle * 100.0,
         ms(st.t_door),

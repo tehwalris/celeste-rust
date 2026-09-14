@@ -1018,7 +1018,7 @@ fn main() -> Result<()> {
                                 for &t in &found {
                                     let mut buf = Vec::new();
                                     edges.preds_at(t, layer + 1, &mut buf);
-                                    recorded.push((t, buf.iter().filter(|e| e.base <= id && id < e.base + 64 && e.mask & (1u64 << (id - e.base)) != 0).count(), buf.len()));
+                                    recorded.push((t, buf.iter().filter(|e| (0..64u32).any(|l| e.mask & (1u64 << l) != 0 && edges.real_pred(layer + 1, e.base, l) == id)).count(), buf.len()));
                                 }
                                 println!(
                                     "[diff]   succ cell {} key {:016x}{:016x} marked kernel {km} bfs {bm}; in tree at {:?}; edges from this row at f{}: {:?}",
