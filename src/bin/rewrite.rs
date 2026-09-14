@@ -223,6 +223,18 @@ enum Command {
         #[arg(long)]
         frames: String,
     },
+    /// DIAGNOSTIC: how far back the states a frame RE-REACHES were first
+    /// seen. Per frame, the edge pairs recorded at it by target layer
+    /// (the layer is the target's first frame), as a histogram of the
+    /// distance frame - layer: what a door that forgot states older than
+    /// W frames would re-expand.
+    EdgeAge {
+        #[arg(long)]
+        level_dir: String,
+        /// Frames, comma-separated.
+        #[arg(long)]
+        frames: String,
+    },
     /// Export a finished run for the web UI (`ui/`): per (horizon, level,
     /// frame) the states per player-position cell and the win cells, per
     /// (horizon, level) the marks per cell by distance, and the log's
@@ -1580,6 +1592,22 @@ fn main() -> Result<()> {
                     d.join(" | "),
                     sets.iter().map(|s| format!("{:.2}x", sets[0].len() as f64 / s.len().max(1) as f64)).collect::<Vec<_>>().join(" ")
                 );
+            }
+        }
+        Command::EdgeAge { level_dir, frames } => {
+            use celeste_rust::search::edges::EdgeGraph;
+            let dir = std::path::Path::new(&level_dir);
+            for f in frames.split(',') {
+                let f: u32 = f.trim().parse()?;
+                let g = EdgeGraph::open(&dir.join("edges"), f)?;
+                let by_layer = g.pairs_by_layer(f);
+                let total: u64 = by_layer.iter().map(|x| x.1).sum();
+                let mut cum = 0u64;
+                println!("frame {f}: {total} pairs recorded; by target age (frame - layer): age pairs cumulative%");
+                for (layer, n) in by_layer.iter().rev() {
+                    cum += n;
+                    println!("  {:>3} {:>12} {:>6.2}%", f - layer, n, 100.0 * cum as f64 / total.max(1) as f64);
+                }
             }
         }
         Command::ExportUi {

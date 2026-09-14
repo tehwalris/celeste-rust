@@ -25,6 +25,12 @@ if [[ $# -eq 0 ]]; then
     exit 1
 fi
 
+# mimalloc: return freed pages to the OS immediately. The door rebuilds
+# every shard's sorted base each frame, and with the default 10 ms delayed
+# purge the freed copies stayed resident: 2 GB less anonymous RSS at room
+# (2,0) f55 for 5-8% more time (2026-09-14). Read by mimalloc at process
+# start, so it has to come from the environment, not from `main`.
+export MIMALLOC_PURGE_DELAY="${MIMALLOC_PURGE_DELAY:-0}"
 systemd-run --user --scope --quiet -p MemoryMax="$MEMORY_LIMIT" -p MemorySwapMax=0 -- "$@"
 EXIT_CODE=$?
 

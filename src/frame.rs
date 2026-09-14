@@ -1419,6 +1419,7 @@ pub fn forward_frame(
     // that flushed it), which only the door's delta ever sees.
     let next: Vec<Block> = pieces;
     st.rss_end = crate::metrics::current_rss_gb();
+    st.rss_file = crate::metrics::current_file_rss_gb();
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
     Ok((next, won, st))
@@ -1470,6 +1471,8 @@ pub struct FrameStats {
     pub rss_start: f64,
     pub rss_wave: f64,
     pub rss_end: f64,
+    /// File-backed resident pages at the end of the frame (page cache).
+    pub rss_file: f64,
 }
 
 /// The result of a backward pass: the marked set plus how many row re-runs
@@ -2017,7 +2020,7 @@ fn log_frame(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
          wave {:.0} (idle {:.0}%) door {:.0} edges {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
          flushes {} ({:.0} rows avg) edges {} | \
-         in {:.2} queues {:.2} door {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
+         in {:.2} queues {:.2} door {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2})",
         st.blocks_in,
         st.lanes_in,
         st.lanes_raw,
@@ -2042,6 +2045,7 @@ fn log_frame(
         st.rss_wave,
         st.rss_end,
         crate::metrics::peak_rss_gb(),
+        st.rss_file,
     );
     crate::metrics::record("fwd.wave", st.t_wave);
     crate::metrics::record("fwd.door", st.t_door);

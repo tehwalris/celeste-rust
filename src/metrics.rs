@@ -25,28 +25,36 @@ pub fn record(name: &'static str, dur: Duration) {
     entry.1 += 1;
 }
 
-/// This process's peak resident set (`VmHWM`), in GB; 0 if unreadable.
-/// The process's CURRENT resident set (VmRSS), in GB.
-pub fn current_rss_gb() -> f64 {
+fn status_gb(field: &str) -> f64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
             s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
+                .find(|l| l.starts_with(field))
                 .and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
         })
         .map_or(0.0, |kb| kb / 1e6)
 }
 
+/// The process's CURRENT ANONYMOUS resident set (`RssAnon`), in GB: the
+/// heap - what the door, the frontier and the queues occupy, and what a
+/// memory cap is really about. File-backed pages (`current_file_rss_gb`:
+/// the mapped raw edge files, the checkpoints being read) are page cache
+/// the kernel reclaims before it kills anything, and counting them
+/// (`VmRSS`) mistook the compaction's mmaps for heap (2026-09-14).
+pub fn current_rss_gb() -> f64 {
+    status_gb("RssAnon:")
+}
+
+/// The process's file-backed resident pages (`RssFile`), in GB.
+pub fn current_file_rss_gb() -> f64 {
+    status_gb("RssFile:")
+}
+
+/// This process's peak resident set (`VmHWM`, anonymous + file), in GB.
+
 pub fn peak_rss_gb() -> f64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmHWM:"))
-                .and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
-        })
-        .map_or(0.0, |kb| kb / 1e6)
+    status_gb("VmHWM:")
 }
 
 /// Print the phase summary and, when `dir` is known, append one JSON line

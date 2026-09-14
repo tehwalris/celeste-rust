@@ -261,6 +261,18 @@ suite has twice been observed degrading to ~70-85 MINUTES at one core.
 nextest runs each test in its own process, which contains every such
 leak by construction.
 
+`safe-run.sh` also sets `MIMALLOC_PURGE_DELAY=0` (freed pages go back to
+the OS at once: the door rebuilds every shard each frame and the delayed
+purge kept the freed copies resident, 2 GB at room (2,0) f55 for 5-8%
+time). Override it in the environment to experiment.
+
+The `[fwd]` line's `rss start/wave/end` is the ANONYMOUS resident set
+(`RssAnon`: the heap - door, frontier, queues); `file` is the file-backed
+resident pages (the compaction's mapped edge records, checkpoints being
+read), which the kernel reclaims before it kills anything. `peak` is
+`VmHWM`, both together. Reading `VmRSS` mistook the mmaps for heap
+(2026-09-14).
+
 Exit code 137 means OOM. Peak memory for the rebuilt `rewrite search` has not
 been re-benchmarked to the horizon (2026-09-07: the level-0 forward on room
 (1,0) was at 16 GB and a 4.2M-lane frontier at f65, still growing), so run

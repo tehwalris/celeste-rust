@@ -827,6 +827,18 @@ impl EdgeGraph {
         out
     }
 
+    /// DIAGNOSTIC (`rewrite edge-age`): the pairs recorded at `frame`, per
+    /// target layer, ascending by layer.
+    pub fn pairs_by_layer(&self, frame: u32) -> Vec<(u32, u64)> {
+        let mut out = Vec::new();
+        for (layer, runs) in self.runs.iter().enumerate() {
+            if let Some(Some(run)) = runs.get(frame as usize) {
+                out.push((layer as u32, run.pairs));
+            }
+        }
+        out
+    }
+
     /// DIAGNOSTIC (`rewrite partition-probe`): push per-row GROUP masks
     /// one frame forward. `preds[(layer, seq)][row]` is the set of groups
     /// (a bit each) a frame-`frame - 1` state belongs to; the result is
