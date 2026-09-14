@@ -143,7 +143,7 @@ async function main() {
     const c = current!;
     const have = c.views.get(t);
     if (have) return have;
-    const v: View = t === "space" ? spaceView(c.run, writeHash) : t === "sizes" ? sizesView(c.run) : timelineView(c.run, c.chs);
+    const v: View = t === "space" ? spaceView(c.run, writeHash) : t === "sizes" ? sizesView(c.run, writeHash) : timelineView(c.run, c.chs);
     c.views.set(t, v);
     return v;
   };

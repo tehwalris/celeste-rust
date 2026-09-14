@@ -252,11 +252,24 @@ export function spaceView(run: Run, onState: () => void): View {
   const ensure = (lrs: LevelRun[]) => Promise.all(lrs.map(levelFiles));
 
   // ---- grids -----------------------------------------------------------------
+  /** The whole-range sums (a level's reached set by H, a backward's whole
+   *  marked set) are drawn under every frame of every later pass, so they
+   *  are memoised per (file, H); the per-frame prefixes are not (a hundred
+   *  grids per level would cost more than the adds they save). */
   function cumGrid(bin: FramesBin, lo: number, hi: number): { grid: Float32Array; off: number } {
     const grid = new Float32Array(ncell);
     let off = 0;
     for (let f = Math.max(0, lo); f <= Math.min(hi, bin.nframes - 1); f++) off += addSparse(grid, bin.cells(f));
     return { grid, off };
+  }
+  const cumCache = new WeakMap<FramesBin, Map<number, { grid: Float32Array; off: number }>>();
+  /** `cumGrid(bin, 0, h)`, memoised: the sum to the horizon. */
+  function cumTo(bin: FramesBin, h: number): { grid: Float32Array; off: number } {
+    let m = cumCache.get(bin);
+    if (!m) cumCache.set(bin, (m = new Map()));
+    let out = m.get(h);
+    if (!out) m.set(h, (out = cumGrid(bin, 0, h)));
+    return out;
   }
   function ringsUpTo(files: LevelFiles, f: number): Ring[] {
     const out: Ring[] = [];
@@ -279,7 +292,7 @@ export function spaceView(run: Run, onState: () => void): View {
     closed.forEach((l, k) => {
       const fl = have(l);
       if (!fl || !fl.layers) return;
-      const g = cumGrid(fl.layers, 0, hr.h);
+      const g = cumTo(fl.layers, hr.h);
       layers.push({ grid: g.grid, max: fl.marksMax, ramp: levelRamp(l.level, "band"), alpha: k === closed.length - 1 ? 0.5 : 0.35 });
       probe.push({ name: `marked, level ${l.level}`, grid: g.grid });
     });
@@ -290,7 +303,7 @@ export function spaceView(run: Run, onState: () => void): View {
     const l0 = hr.levels.find((l) => l.level === 0);
     const f0 = l0 && have(l0);
     if (!l0 || !f0) return;
-    const g = cumGrid(f0.frames, 0, hr.h);
+    const g = cumTo(f0.frames, hr.h);
     layers.push({ grid: g.grid, max: f0.cumMax, ramp: levelRamp(0, "dim"), alpha: 0.95 });
     probe.push({ name: "reached, level 0", grid: g.grid });
   }
@@ -317,7 +330,7 @@ export function spaceView(run: Run, onState: () => void): View {
       if (full) rings = ringsUpTo(files, f);
     } else {
       if (full) {
-        const g = cumGrid(files.frames, 0, h);
+        const g = cumTo(files.frames, h);
         layers.push({ grid: g.grid, max: files.cumMax, ramp: levelRamp(lr.level, "dim"), alpha: 0.95 });
         probe.push({ name: `reached, level ${lr.level}`, grid: g.grid });
       }
@@ -347,7 +360,7 @@ export function spaceView(run: Run, onState: () => void): View {
     for (const p of tl.slice(0, upto)) {
       const files = have(p.lr);
       if (!files) continue;
-      const g = p.phase === "fwd" ? cumGrid(files.frames, 0, hr.h) : files.layers ? cumGrid(files.layers, 0, hr.h) : null;
+      const g = p.phase === "fwd" ? cumTo(files.frames, hr.h) : files.layers ? cumTo(files.layers, hr.h) : null;
       if (!g) continue;
       paintBand(g.grid, heightBand(p.lr.level), layers);
       probe.push({ name: `${p.phase === "fwd" ? "reached" : "marked"}, level ${p.lr.level}`, grid: g.grid });
@@ -430,12 +443,12 @@ export function spaceView(run: Run, onState: () => void): View {
     const files = have(lr);
     if (!files) return { scene: { layers, rings: [] }, probe, off: 0 };
     if (st.look === "full") {
-      const g = cumGrid(files.frames, 0, h);
+      const g = cumTo(files.frames, h);
       layers.push({ grid: g.grid, max: files.cumMax, ramp: levelRamp(lr.level, "dim"), alpha: 0.95 });
       probe.push({ name: `reached, level ${lr.level}`, grid: g.grid });
     }
     if (files.layers) {
-      const g = cumGrid(files.layers, 0, h);
+      const g = cumTo(files.layers, h);
       layers.push({ grid: g.grid, max: files.marksMax, ramp: marksRamp("bright"), alpha: 1 });
       probe.push({ name: `marked, level ${lr.level}`, grid: g.grid });
     }
@@ -463,7 +476,7 @@ export function spaceView(run: Run, onState: () => void): View {
       // No backward ran: the level's reached set, dimmed, and nothing else.
       const files = have(lr);
       if (files && full) {
-        const g = cumGrid(files.frames, 0, h);
+        const g = cumTo(files.frames, h);
         layers.push({ grid: g.grid, max: files.cumMax, ramp: levelRamp(lr.level, "dim"), alpha: 0.95 });
       }
       return { scene: { layers, rings: [] }, probe, off: 0 };
@@ -487,7 +500,7 @@ export function spaceView(run: Run, onState: () => void): View {
     if (!files) return { scene: { layers, rings: [] }, probe, off: 0 };
     if (full && pass.lr.level !== 0) base(hr, layers, probe);
     if (full) bands(hr, pass.lr.level, layers, probe);
-    const vis = cumGrid(files.frames, 0, hr.h);
+    const vis = cumTo(files.frames, hr.h);
     let rings: Ring[] = [];
     let scale: Scale | undefined;
     if (pass.phase === "fwd") {
@@ -500,7 +513,7 @@ export function spaceView(run: Run, onState: () => void): View {
         probe.push({ name: `reached, level ${pass.lr.level}`, grid: vis.grid });
       }
       if (files.layers) {
-        const g = cumGrid(files.layers, 0, hr.h);
+        const g = cumTo(files.layers, hr.h);
         layers.push({ grid: g.grid, max: files.marksMax, ramp: marksRamp("bright"), alpha: 1 });
         probe.push({ name: `marked, level ${pass.lr.level}`, grid: g.grid });
         scale = { ramp: marksRamp("bright"), max: files.marksMax, what: "marked states per cell" };
@@ -801,6 +814,7 @@ export function spaceView(run: Run, onState: () => void): View {
       ctx.font = "600 10px " + getComputedStyle(document.body).fontFamily;
       ctx.textBaseline = "middle";
       ctx.textAlign = "left";
+      // The same slot mapping as the knob: `total` (or `tl.length`) slots.
       for (const p of tl) {
         const x0 = perPass ? (p.index / tl.length) * w : (p.start / total) * w;
         const x1 = perPass ? ((p.index + 1) / tl.length) * w : ((p.start + p.frames.length) / total) * w;
@@ -1028,7 +1042,7 @@ export function spaceView(run: Run, onState: () => void): View {
     if (m == null) {
       m = 1;
       if (files.layers) {
-        const g = cumGrid(files.layers, 0, h).grid;
+        const g = cumTo(files.layers, h).grid;
         for (let i = 0; i < ncell; i++) if (g[i] > m) m = g[i];
       }
       marksCumMaxCache.set(files, m);
@@ -1065,7 +1079,7 @@ export function spaceView(run: Run, onState: () => void): View {
       bright = col(levelRamp(pass.lr.level, "bright")[54]);
     } else {
       // The reached set, as a slab under the marks.
-      const reached = cumGrid(files.frames, 0, hr.h).grid;
+      const reached = cumTo(files.frames, hr.h).grid;
       const slab = col(levelRamp(pass.lr.level, "band")[30]);
       for (let c = 0; c < ncell; c++) if (reached[c] > 0) put(c, 0, 0.45, slab);
       if (!files.layers) return 0;
@@ -1099,7 +1113,7 @@ export function spaceView(run: Run, onState: () => void): View {
     const warm = marksRamp("bright")[52];
     for (const p of tl) {
       const files = have(p.lr);
-      const g = !files ? null : p.phase === "fwd" ? cumGrid(files.frames, 0, hr.h).grid : files.layers ? cumGrid(files.layers, 0, hr.h).grid : null;
+      const g = !files ? null : p.phase === "fwd" ? cumTo(files.frames, hr.h).grid : files.layers ? cumTo(files.layers, hr.h).grid : null;
       if (g) {
         const lc = levelColor(p.lr.level);
         // A backward's layer: warm white with a trace of the level's hue.

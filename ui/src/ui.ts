@@ -118,8 +118,10 @@ export interface Scrubber {
   backdrop(draw: (ctx: CanvasRenderingContext2D, w: number, h: number) => void): void;
 }
 
-/** A scrubber over integer positions 0..max. Dragging anywhere on it
- *  moves the playhead; the track shows an optional backdrop. */
+/** A scrubber over integer positions 0..max: the track is max+1 equal
+ *  slots, the knob sits in the middle of the current one, a press picks
+ *  the slot under the finger. A backdrop drawn with the same slot
+ *  mapping (`slotX`) lines up with the knob. */
 export function scrubber(onScrub: (value: number) => void, onGrab?: (grabbing: boolean) => void): Scrubber {
   const canvas = el("canvas", { class: "scrub-track" });
   const knob = el("div", { class: "scrub-knob" });
@@ -131,7 +133,7 @@ export function scrubber(onScrub: (value: number) => void, onGrab?: (grabbing: b
   let drawBackdrop: ((ctx: CanvasRenderingContext2D, w: number, h: number) => void) | null = null;
   const place = () => {
     const w = root.clientWidth;
-    const x = max > 0 ? (value / max) * w : 0;
+    const x = ((value + 0.5) / (max + 1)) * w;
     knob.style.transform = `translateX(${x}px)`;
     // The bubble stays inside the track: clamp its centre.
     const bw = bubble.offsetWidth || 40;
@@ -157,7 +159,7 @@ export function scrubber(onScrub: (value: number) => void, onGrab?: (grabbing: b
   const fromEvent = (ev: PointerEvent) => {
     const r = root.getBoundingClientRect();
     const t = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
-    return Math.round(t * max);
+    return Math.min(max, Math.floor(t * (max + 1)));
   };
   const move = (v: number) => {
     if (v === value) return;
