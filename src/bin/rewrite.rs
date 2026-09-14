@@ -1498,8 +1498,9 @@ fn main() -> Result<()> {
             use celeste_rust::frame::load_frame;
             let dir = std::path::Path::new(&level_dir);
             let ids = celeste_rust::compiled::ids();
-            const SIZES: [i32; 4] = [1, 2, 4, 8];
-            println!("frame | rows | distinct at 1 px | 2 px | 4 px | 8 px");
+            // (x bucket, y bucket) in px: square buckets, then each axis alone.
+            const SIZES: [(i32, i32); 9] = [(1, 1), (2, 2), (4, 4), (8, 8), (2, 1), (1, 2), (4, 1), (1, 4), (4, 2)];
+            println!("frame | rows | distinct at (x,y) px: {}", SIZES.iter().map(|s| format!("{}x{}", s.0, s.1)).collect::<Vec<_>>().join(" | "));
             for f in frames.split(',') {
                 let f: u32 = f.trim().parse()?;
                 let blocks = load_frame(dir, f)?;
@@ -1553,16 +1554,16 @@ fn main() -> Result<()> {
                     };
                     for r in 0..rt2.width {
                         let (x, y) = (whole(px, r), whole(py, r));
-                        for (si, &sz) in SIZES.iter().enumerate() {
-                            let bx = x.div_euclid(sz) as u64 as u32 as u64;
-                            let by = y.div_euclid(sz) as u64 as u32 as u64;
+                        for (si, &(sx, sy)) in SIZES.iter().enumerate() {
+                            let bx = x.div_euclid(sx) as u64 as u32 as u64;
+                            let by = y.div_euclid(sy) as u64 as u32 as u64;
                             sets[si].insert(mix64(h[r] ^ mix64(bx << 32 | by)));
                         }
                     }
                 }
                 let d: Vec<String> = sets.iter().map(|s| s.len().to_string()).collect();
                 println!(
-                    "f{f:03} | {rows} | {} | ratios vs 1 px: {}",
+                    "f{f:03} | {rows} | {} | ratios: {}",
                     d.join(" | "),
                     sets.iter().map(|s| format!("{:.2}x", sets[0].len() as f64 / s.len().max(1) as f64)).collect::<Vec<_>>().join(" ")
                 );

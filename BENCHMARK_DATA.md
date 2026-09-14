@@ -14,6 +14,16 @@ in-frame threshold fan-out that made the speed bucket a loss).
 | (1,0) f99 | 6.77M | 2.09x | 4.76x | 8.8x |
 | (0,0) f93 | 22.8M | 2.06x | 5.00x | 9.8x |
 
+Per axis (the axes are independent rungs and their ratios multiply):
+
+| room, frame | x 2 px | y 2 px | x 4 px | y 4 px | x4 y2 |
+|---|---|---|---|---|---|
+| (2,0) f69 | 1.26x | 1.56x | 2.08x | 2.52x | 3.21x |
+| (1,0) f99 | 1.33x | 1.55x | 2.00x | 2.31x | 3.14x |
+| (0,0) f93 | 1.31x | 1.57x | 2.03x | 2.44x | 3.18x |
+
+y merges more than x at every width, so y is the better first rung.
+
 # How full are the cells on the spawn-to-top diagonal? (2026-09-14, `rewrite fullness-probe`)
 
 Per sampled cell, over every frame of the level-0 tree: the states ever
