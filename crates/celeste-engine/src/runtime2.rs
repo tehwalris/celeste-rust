@@ -373,20 +373,32 @@ impl Rt2 {
         let mut rem_cells = Vec::new();
         let mut det_cells = Vec::new();
         for obj in self.player_objects(ids) {
-            if let Some(rem_ptr_cell) = self.obj_field_cell(obj, ids.f_rem) {
-                if let Col::U(AV::Ptr(rem_obj)) = self.cols[rem_ptr_cell as usize] {
-                    for f in [ids.f_x, ids.f_y] {
-                        if let Some(c) = self.obj_field_cell(rem_obj, f) {
-                            rem_cells.push(c);
-                        }
-                    }
-                }
-            }
+            rem_cells.extend(self.xy_cells_of(obj, ids.f_rem, ids));
             if let Some(c) = self.obj_field_cell(obj, ids.f_dash_effect_time) {
                 det_cells.push(c);
             }
         }
         (rem_cells, det_cells)
+    }
+
+    /// The `x`/`y` cells of the table at `obj`'s field `f` (rem, spd).
+    fn xy_cells_of(&self, obj: u32, f: u32, ids: &BoundaryIds) -> Vec<u32> {
+        let mut out = Vec::new();
+        if let Some(ptr_cell) = self.obj_field_cell(obj, f) {
+            if let Col::U(AV::Ptr(sub)) = self.cols[ptr_cell as usize] {
+                for g in [ids.f_x, ids.f_y] {
+                    if let Some(c) = self.obj_field_cell(sub, g) {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The players' `spd.x`/`spd.y` cells.
+    pub fn spd_cells(&self, ids: &BoundaryIds) -> Vec<u32> {
+        self.player_objects(ids).into_iter().flat_map(|obj| self.xy_cells_of(obj, ids.f_spd, ids)).collect()
     }
 
     /// Boundary abstraction + canonical row dedup + compaction. Returns
@@ -753,6 +765,40 @@ impl Rt2 {
                         other => other,
                     });
                 }
+            }
+        }
+
+        // 2. spd widening: the same bucket width as rem's at this rung
+        // (`abstraction::spd_precision_for`): 2^(16 - bits) raw units,
+        // floor-aligned (`make_state_abstract_spd`).
+        if rem_bits < 16 {
+            let width: i32 = 1i32 << (16 - rem_bits);
+            let sbucket = |n: P8| -> (P8, P8) {
+                let low = n.to_bits().cast_signed().div_euclid(width) * width;
+                (P8::from_raw(low), P8::from_raw(low + width - 1))
+            };
+            for c in self.spd_cells(ids) {
+                let widen = |v: AV| -> AV {
+                    match v {
+                        AV::Num(n) => {
+                            let (lo, hi) = sbucket(n);
+                            AV::Ival(lo, hi)
+                        }
+                        AV::Ival(a, b) => AV::Ival(sbucket(a).0, sbucket(b).1),
+                        other => panic!("Unexpected value type for player spd: {:?}", other),
+                    }
+                };
+                self.cols[c as usize] = match &self.cols[c as usize] {
+                    Col::U(v) => Col::U(widen(*v)),
+                    Col::V(vs) => Col::V(vs.iter().map(|v| widen(*v)).collect()),
+                    Col::N(vs) => Col::V(vs.iter().map(|n| widen(AV::Num(*n))).collect()),
+                    Col::I(vs) => Col::V(vs.iter().map(|(a, b)| widen(AV::Ival(*a, *b))).collect()),
+                };
+                let col = std::mem::replace(&mut self.cols[c as usize], Col::U(AV::Nil));
+                self.cols[c as usize] = collapse_uniform(match col {
+                    Col::V(vs) => compress_num_v(vs),
+                    other => other,
+                });
             }
         }
 

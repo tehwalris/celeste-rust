@@ -115,11 +115,13 @@ pub enum WidenMode {
 /// so both modes apply them; only rem and spd differ by rung.
 pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Result<()> {
     use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
-    let (rem, spd) = match mode {
-        // Level 0 is rem Bits(0) / spd Exact by construction.
-        WidenMode::Level0 => (RemPrecision::Bits(0), SpdPrecision::Exact),
-        WidenMode::RemRung(rem) => (rem, crate::interpreter::abstraction::spd_precision_from_env()),
+    // The ladder refines rem and spd together (`spd_precision_for`: the
+    // same bucket width at every rung; level 0 is Bits(0) / 1 px).
+    let rem = match mode {
+        WidenMode::Level0 => RemPrecision::Bits(0),
+        WidenMode::RemRung(rem) => rem,
     };
+    let spd: SpdPrecision = crate::interpreter::abstraction::spd_precision_for(rem);
     widen_rem(st, d, rem)?;
     widen_spd(st, d, spd)?;
     widen_dash(st, d)?;
@@ -373,7 +375,7 @@ pub(crate) fn spd_bucket_node(
     old: <Symbolic as Domain>::Num,
     w: u8,
 ) -> Result<RemBucket> {
-    debug_assert!((8..=20).contains(&w), "spd_bucket_node w {} out of 8..=20", w);
+    debug_assert!((1..=20).contains(&w), "spd_bucket_node w {} out of 1..=20", w);
     let width_raw: i32 = 1i32 << w;
     let width = d.num(P8::from_raw(width_raw));
     let scaled = d.arith(super::domain::Arith::Div, &old, &width)?;

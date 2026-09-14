@@ -243,45 +243,62 @@ impl SpdPrecision {
     }
 
     /// Every spd level this build can be configured for, coarsest first.
-    /// The env parser asserts 8..=20, so that is the whole range.
     pub fn all() -> impl Iterator<Item = SpdPrecision> {
-        (8..=20u8)
+        (1..=20u8)
             .rev()
             .map(SpdPrecision::WidthLog2)
             .chain(std::iter::once(SpdPrecision::Exact))
     }
 }
 
-/// The session's spd precision: CELESTE_SPD_WIDTH_LOG2=w (unset means
-/// Exact - nothing changes for existing campaigns).
-///
-/// Still read-once from the env: unlike rem, no code path SETS spd
-/// in-process (the ladder refines rem, not spd), so there is nothing for a
-/// settable override to express. If an in-process spd ladder ever lands,
-/// mirror `set_rem_precision`.
-pub fn spd_precision_from_env() -> SpdPrecision {
-    static PRECISION: std::sync::OnceLock<SpdPrecision> = std::sync::OnceLock::new();
-    *PRECISION.get_or_init(|| match std::env::var("CELESTE_SPD_WIDTH_LOG2") {
+/// THE LADDER'S SPD PRECISION AT A REM PRECISION (2026-09-14): the same
+/// bucket width. `Bits(k)` buckets rem at 2^-k px; spd at `WidthLog2(16-k)`
+/// is 2^(16-k) raw units = 2^-k px; both are exact at `Exact`. So one
+/// ladder refines both, and both reach full precision on the same rung.
+/// Level 0 widens spd to whole pixels per frame - the spring's
+/// `spd.x *= 0.2` minted thousands of distinct fractional speeds in room
+/// (2,0) (3,200 spd.x values against 60 in rooms (0,0)/(1,0)), and
+/// bucketing them to 1 px collapsed its frontier 19x (BENCHMARK_DATA.md).
+/// `CELESTE_SPD_WIDTH_LOG2=w` overrides the rule for experiments.
+pub fn spd_precision_for(rem: RemPrecision) -> SpdPrecision {
+    if let Some(w) = spd_width_override() {
+        return SpdPrecision::WidthLog2(w);
+    }
+    match rem {
+        RemPrecision::Bits(k) if k < 16 => SpdPrecision::WidthLog2(16 - k),
+        _ => SpdPrecision::Exact,
+    }
+}
+
+/// The session's spd precision: derived from the rem precision
+/// (`spd_precision_for(rem_precision_from_env())`).
+pub fn spd_precision() -> SpdPrecision {
+    spd_precision_for(rem_precision_from_env())
+}
+
+fn spd_width_override() -> Option<u8> {
+    static W: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    *W.get_or_init(|| match std::env::var("CELESTE_SPD_WIDTH_LOG2") {
         Ok(v) => {
             let w: u8 = v
                 .parse()
                 .unwrap_or_else(|_| panic!("CELESTE_SPD_WIDTH_LOG2={:?} is not a number", v));
             assert!(
-                (8..=20).contains(&w),
-                "CELESTE_SPD_WIDTH_LOG2={} outside the sane range 8..=20 \
+                (1..=20).contains(&w),
+                "CELESTE_SPD_WIDTH_LOG2={} outside the sane range 1..=20 \
                  (16 = 1 px/frame buckets)",
                 w
             );
-            SpdPrecision::WidthLog2(w)
+            Some(w)
         }
-        Err(_) => SpdPrecision::Exact,
+        Err(_) => None,
     })
 }
 
 pub fn make_state_abstract(state: State) -> State {
     erase_provenance_hints(apply_conservative_widenings(make_state_abstract_spd(
         make_state_abstract_rem(state, rem_precision_from_env()),
-        spd_precision_from_env(),
+        spd_precision(),
     )))
 }
 
@@ -381,7 +398,7 @@ pub fn split_rem_straddles(state: State) -> Vec<State> {
 /// intervals in a way the design did not price, and that should FAIL,
 /// not widen silently.
 pub fn split_spd_straddles(state: State) -> Vec<State> {
-    let SpdPrecision::WidthLog2(w) = spd_precision_from_env() else {
+    let SpdPrecision::WidthLog2(w) = spd_precision() else {
         return vec![state];
     };
     split_marked_straddles(state, "player_spd_xy", 1i32 << w, 8)
@@ -1047,9 +1064,12 @@ mod tests {
         let state = State::new();
         let out = make_state_abstract_spd(state.clone(), SpdPrecision::Exact);
         assert_eq!(out.vector_size, state.vector_size);
-        // ...and the env default (unset in tests) is Exact, so the
-        // boundary splitter passes through.
-        assert_eq!(spd_precision_from_env(), SpdPrecision::Exact);
+        // ...and the ladder rule: the same bucket width as rem's rung,
+        // exact with exact rem.
+        assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::WidthLog2(16));
+        assert_eq!(spd_precision_for(RemPrecision::Bits(15)), SpdPrecision::WidthLog2(1));
+        assert_eq!(spd_precision_for(RemPrecision::Exact), SpdPrecision::Exact);
+        set_rem_precision(RemPrecision::Exact);
         assert_eq!(split_spd_straddles(State::new()).len(), 1);
     }
 }

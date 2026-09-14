@@ -698,6 +698,8 @@ fn main() -> Result<()> {
             let mut classes_xys: FxHashMap<(u32, u32, u32, u32), u64> = FxHashMap::default();
             let mut classes_spd: FxHashMap<(u32, u32), u64> = FxHashMap::default();
             let (mut card_sx, mut card_sy): (FxHashMap<u32, u64>, FxHashMap<u32, u64>) = Default::default();
+            let mut classes_w16: FxHashMap<Vec<(u32, u32, u32)>, u64> = FxHashMap::default();
+            let mut classes_w14: FxHashMap<Vec<(u32, u32, u32)>, u64> = FxHashMap::default();
             let mut classes_nopos: FxHashMap<Vec<(u32, u32, u32)>, u64> = FxHashMap::default();
             // Every scalar except the player's MOTION (x, y, spd, rem): the
             // variants a motion-free kernel specialization would compile.
@@ -757,6 +759,8 @@ fn main() -> Result<()> {
                     let mut tuple: Vec<(u32, u32, u32)> = Vec::with_capacity(names.len());
                     let mut nopos: Vec<(u32, u32, u32)> = Vec::with_capacity(names.len());
                     let mut nomotion: Vec<(u32, u32, u32)> = Vec::with_capacity(names.len());
+                    let mut spd_w16: Vec<(u32, u32, u32)> = Vec::with_capacity(names.len());
+                    let mut spd_w14: Vec<(u32, u32, u32)> = Vec::with_capacity(names.len());
                     for (name, cell) in &fields {
                         let v = enc(rt2.cols[*cell as usize].at(lane));
                         let ni = names.iter().position(|n| n == name).unwrap();
@@ -765,6 +769,17 @@ fn main() -> Result<()> {
                             continue;
                         }
                         tuple.push(v);
+                        // The same class with spd bucketed to 2^w raw units
+                        // (w=16: 1 px/frame, w=14: 1/4 px): what a level-0
+                        // spd widening would leave.
+                        if name.starts_with("spd.") {
+                            let raw = v.1 as i32;
+                            spd_w16.push((v.0, raw.div_euclid(1 << 16) as u32, 0));
+                            spd_w14.push((v.0, raw.div_euclid(1 << 14) as u32, 0));
+                        } else {
+                            spd_w16.push(v);
+                            spd_w14.push(v);
+                        }
                         if name != "x" && name != "y" {
                             nopos.push(v);
                             if !name.starts_with("spd.") {
@@ -773,6 +788,8 @@ fn main() -> Result<()> {
                         }
                     }
                     *classes.entry(tuple).or_default() += 1;
+                    *classes_w16.entry(spd_w16).or_default() += 1;
+                    *classes_w14.entry(spd_w14).or_default() += 1;
                     *classes_nopos.entry(nopos).or_default() += 1;
                     *classes_nomotion.entry(nomotion).or_default() += 1;
                     if let (Some(cx), Some(cy)) = (cx, cy) {
@@ -812,6 +829,8 @@ fn main() -> Result<()> {
                 classes_spd.len()
             );
             println!("[census] all scalar fields except rem: {}", dist(&classes));
+            println!("[census]   same with spd bucketed to 1 px (w=16): {}", dist(&classes_w16));
+            println!("[census]   same with spd bucketed to 1/4 px (w=14): {}", dist(&classes_w14));
             println!("[census] all scalar fields except rem and x, y: {}", dist(&classes_nopos));
             println!("[census] all scalar fields except rem, x, y and spd (motion-free classes): {}", dist(&classes_nomotion));
             println!("[census] per-field cardinality (distinct values over the frame):");

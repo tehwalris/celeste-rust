@@ -1,3 +1,21 @@
+# What a level-0 speed widening collapses (2026-09-14, `rewrite census`)
+
+The frontier near each room's level-0 win, its distinct states (every
+scalar field but rem), and the same count with `spd.x`/`spd.y` bucketed
+to 1 px/frame (`WidthLog2(16)`) and to 1/4 px (`WidthLog2(14)`):
+
+| room, frame | rows | states (except rem) | spd at 1 px | spd at 1/4 px | distinct spd.x / spd.y values |
+|---|---|---|---|---|---|
+| (0,0) f79 | 10.38M | 10.31M | 1.97M (5.2x) | 6.01M (1.7x) | 61 / 88 |
+| (1,0) f89 | 4.67M | 4.67M | 1.03M (4.5x) | 2.87M (1.6x) | 59 / 98 |
+| (2,0) f69 | 55.3M | 54.7M | **2.93M (19x)** | 13.2M (4.1x) | **3,200** / 161 |
+
+Room (2,0)'s multiplier is the spring's `spd.x *= 0.2`, which mints a
+fresh fractional speed on every bounce; the objects themselves add
+nothing (motion-free classes 4.6k vs 3.2k in room (0,0)). These are the
+exact states collapsed after the fact; the widened search explores an
+over-approximation, so its frontier lands above these counts.
+
 # Rooms (1,0) and (0,0) end to end on the guarded, grouped kernels (2026-09-14, release) - REVERTED, code at 07b3a15
 
 Same commands as the runs below; every ladder fingerprint identical.
