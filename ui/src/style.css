@@ -402,8 +402,8 @@ details summary:focus-visible {
   pointer-events: none;
   opacity: 0;
   transition: opacity 120ms;
-  margin-left: -50%;
-  translate: 0;
+  /* place() sets translateX(x) for the slot; this centres the bubble on it */
+  translate: -50% 0;
 }
 .scrub-bubble:empty {
   display: none;
