@@ -297,13 +297,21 @@ export const levelName = (lr: LevelRun) =>
 export function fmtInt(n: number): string {
   return n.toLocaleString("en-US");
 }
+/** 1.2K / 34M / 2B: three significant figures at most, no trailing ".0". */
 export function fmtCompact(n: number): string {
-  if (n >= 1e9) return (n / 1e9).toFixed(n >= 1e10 ? 0 : 1) + "B";
-  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "K";
-  return String(n);
+  const one = (v: number, unit: string) => (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1).replace(/\.0$/, "") : v.toFixed(2).replace(/\.?0+$/, "")) + unit;
+  if (n >= 1e9) return one(n / 1e9, "B");
+  if (n >= 1e6) return one(n / 1e6, "M");
+  if (n >= 1e3) return one(n / 1e3, "K");
+  return String(Math.round(n));
 }
+/** A duration for a timing label: `245 ms`, `2.3 s`, `1m 40s`, `2h 31m`. */
 export function fmtMs(ms: number): string {
+  if (ms >= 3_600_000) {
+    const h = Math.floor(ms / 3_600_000);
+    const m = Math.round((ms % 3_600_000) / 60_000);
+    return `${h}h ${m.toString().padStart(2, "0")}m`;
+  }
   if (ms >= 60_000) {
     const m = Math.floor(ms / 60_000);
     const s = Math.round((ms % 60_000) / 1000);
@@ -311,4 +319,18 @@ export function fmtMs(ms: number): string {
   }
   if (ms >= 1000) return (ms / 1000).toFixed(ms >= 10_000 ? 1 : 2) + " s";
   return `${Math.round(ms)} ms`;
+}
+/** A duration in words, for headline figures: `7 min 13 s`, `2 h 32 min`. */
+export function fmtDuration(ms: number): string {
+  if (ms >= 3_600_000) {
+    const h = Math.floor(ms / 3_600_000);
+    const m = Math.round((ms % 3_600_000) / 60_000);
+    return `${h} h ${m} min`;
+  }
+  if (ms >= 60_000) {
+    const m = Math.floor(ms / 60_000);
+    const s = Math.round((ms % 60_000) / 1000);
+    return `${m} min ${s} s`;
+  }
+  return fmtMs(ms);
 }

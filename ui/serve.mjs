@@ -29,7 +29,11 @@ const MIME = {
   ".map": "application/json",
 };
 
-function send(req, res, file, cacheable) {
+// `cache`: "immutable" for hashed assets, "revalidate" for the data (a
+// re-export shows on reload; unchanged files answer 304 to the browser's
+// If-Modified-Since, so a multi-MB binary is not re-sent), "none" for
+// index.html (1 KB, and the one file whose staleness hides a new build).
+function send(req, res, file, cache) {
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) {
       res.writeHead(404, { "content-type": "text/plain" });
@@ -39,8 +43,17 @@ function send(req, res, file, cacheable) {
     const ext = path.extname(file);
     const headers = {
       "content-type": MIME[ext] || "application/octet-stream",
-      "cache-control": cacheable ? "public, max-age=31536000, immutable" : "no-cache",
+      "cache-control": cache === "immutable" ? "public, max-age=31536000, immutable" : cache === "revalidate" ? "no-cache" : "no-store",
     };
+    if (cache === "revalidate") {
+      headers["last-modified"] = st.mtime.toUTCString();
+      const since = req.headers["if-modified-since"];
+      if (since && Math.floor(st.mtimeMs / 1000) <= Math.floor(Date.parse(since) / 1000)) {
+        res.writeHead(304, headers);
+        res.end();
+        return;
+      }
+    }
     const gz = /\bgzip\b/.test(req.headers["accept-encoding"] || "") && (ext === ".json" || ext === ".bin" || ext === ".js" || ext === ".css" || ext === ".html");
     if (gz) {
       headers["content-encoding"] = "gzip";
@@ -75,13 +88,13 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (p.startsWith("data/")) {
-    send(req, res, path.join(DATA_DIR, p.slice(5)), false);
+    send(req, res, path.join(DATA_DIR, p.slice(5)), "revalidate");
     return;
   }
   if (p === "" || p.endsWith("/")) p += "index.html";
   const file = path.join(DIST, p);
-  // Hashed assets are immutable; index.html is not.
-  send(req, res, file, p.startsWith("assets/"));
+  // Hashed assets are immutable; index.html is never cached.
+  send(req, res, file, p.startsWith("assets/") ? "immutable" : "none");
 });
 
 server.listen(PORT, "127.0.0.1", () => {

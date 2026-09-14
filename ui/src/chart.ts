@@ -1,9 +1,11 @@
 // A line chart on canvas: hairline grid, 2px lines, a crosshair that
 // snaps to the nearest x and a readout under the plot listing every series
-// (values lead, names follow). Touch: press and drag along the x axis.
+// (values lead, names follow). Touch: press and drag along the x axis;
+// mouse: hover. The axis names sit in a row above the plot, out of the
+// way of the ticks.
 
 import { fitCanvas, el } from "./ui";
-import { gridline, baseline, inkMuted, inkSecondary } from "./color";
+import { gridline, baseline, inkMuted } from "./color";
 import { fmtCompact } from "./data";
 
 export interface Series {
@@ -21,6 +23,8 @@ export interface LineChartOpts {
   yLabel?: string;
   xFormat?: (x: number) => string;
   yFormat?: (y: number) => string;
+  /** Explicit x tick positions (else nice ticks over the range). */
+  xTicks?: number[];
   /** Vertical marker lines (e.g. the horizon). */
   markers?: { x: number; label: string }[];
   tall?: boolean;
@@ -43,9 +47,11 @@ interface ReadoutRow {
   color?: string;
 }
 
+const HINT = "press or hover the plot to read values";
+
 function readout(): { root: HTMLElement; show(rows: ReadoutRow[], title: string): void; hide(): void } {
   const root = el("div", { class: "readout" });
-  const title = el("div", { class: "readout-title", text: "press the plot to read values" });
+  const title = el("div", { class: "readout-title", text: HINT });
   const list = el("div", { class: "readout-rows" });
   root.append(title, list);
   return {
@@ -63,7 +69,7 @@ function readout(): { root: HTMLElement; show(rows: ReadoutRow[], title: string)
       );
     },
     hide() {
-      title.textContent = "press the plot to read values";
+      title.textContent = HINT;
       list.replaceChildren();
     },
   };
@@ -71,7 +77,8 @@ function readout(): { root: HTMLElement; show(rows: ReadoutRow[], title: string)
 
 export function lineChart(opts: LineChartOpts): HTMLElement {
   const canvas = el("canvas");
-  const wrap = el("div", { class: `chart${opts.tall ? " tall" : ""}` }, [canvas]);
+  const head = el("div", { class: "chart-head" }, [el("span", { text: opts.yLabel ? `${opts.yLabel}${opts.yLog ? " (log)" : ""}` : "" }), el("span", { text: opts.xLabel ? `${opts.xLabel} →` : "" })]);
+  const wrap = el("div", { class: `chart${opts.tall ? " tall" : ""}` }, [head, canvas]);
   // The readout sits UNDER the plot (a floating tooltip covers most of a
   // phone-width chart); it lists every series at the crosshair's x.
   const tt = readout();
@@ -93,7 +100,8 @@ export function lineChart(opts: LineChartOpts): HTMLElement {
       ymax = Math.max(ymax, y);
     }
   }
-  if (!isFinite(xmin)) {
+  const empty = !isFinite(xmin);
+  if (empty) {
     xmin = 0;
     xmax = 1;
     ymin = 0;
@@ -106,7 +114,8 @@ export function lineChart(opts: LineChartOpts): HTMLElement {
     ymin = 0;
     ymax = ymax <= 0 ? 1 : ymax * 1.05;
   }
-  const m = { l: 44, r: 12, t: 10, b: 26 };
+  const yt = yLog ? Array.from({ length: Math.log10(ymax) - Math.log10(ymin) + 1 }, (_, i) => ymin * Math.pow(10, i)) : niceTicks(ymin, ymax, 4);
+  const m = { l: 44, r: 12, t: 8, b: 22 };
   let hoverX: number | null = null;
   let size = { w: 0, h: 0 };
 
@@ -119,9 +128,17 @@ export function lineChart(opts: LineChartOpts): HTMLElement {
   const draw = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
     size = { w, h };
     ctx.clearRect(0, 0, w, h);
-    ctx.font = "11px system-ui, sans-serif";
+    ctx.font = "11px " + getComputedStyle(canvas).fontFamily;
+    // The left margin fits the widest y tick label.
+    m.l = Math.ceil(Math.max(28, ...yt.map((y) => ctx.measureText(yF(y)).width))) + 10;
+    if (empty) {
+      ctx.fillStyle = inkMuted;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText("nothing to plot", w / 2, h / 2);
+      return;
+    }
     // Grid + y ticks.
-    const yt = yLog ? Array.from({ length: Math.log10(ymax) - Math.log10(ymin) + 1 }, (_, i) => ymin * Math.pow(10, i)) : niceTicks(ymin, ymax, 4);
     ctx.strokeStyle = gridline;
     ctx.lineWidth = 1;
     ctx.fillStyle = inkMuted;
@@ -133,43 +150,44 @@ export function lineChart(opts: LineChartOpts): HTMLElement {
       ctx.moveTo(m.l, py);
       ctx.lineTo(w - m.r, py);
       ctx.stroke();
-      ctx.fillText(yF(y), m.l - 5, py);
+      ctx.fillText(yF(y), m.l - 6, py);
     }
     // x ticks.
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
-    for (const x of niceTicks(xmin, xmax, Math.max(2, Math.floor((w - m.l - m.r) / 60)))) {
+    const xt = opts.xTicks ?? niceTicks(xmin, xmax, Math.max(2, Math.floor((w - m.l - m.r) / 60)));
+    let lastRight = -Infinity;
+    for (const x of xt) {
       const px = Math.round(sx(x)) + 0.5;
-      ctx.fillText(xF(x), px, h - m.b + 6);
+      const label = xF(x);
+      const half = ctx.measureText(label).width / 2 + 4;
+      if (px - half < lastRight) continue; // no overlapping labels
+      lastRight = px + half;
+      ctx.fillText(label, px, h - m.b + 5);
+      ctx.beginPath();
+      ctx.moveTo(px, h - m.b);
+      ctx.lineTo(px, h - m.b + 3);
+      ctx.stroke();
     }
     ctx.strokeStyle = baseline;
     ctx.beginPath();
     ctx.moveTo(m.l, Math.round(sy(ymin)) + 0.5);
     ctx.lineTo(w - m.r, Math.round(sy(ymin)) + 0.5);
     ctx.stroke();
-    if (opts.xLabel) {
-      ctx.fillStyle = inkMuted;
-      ctx.textAlign = "right";
-      ctx.fillText(opts.xLabel, w - m.r, h - 12);
-    }
-    if (opts.yLabel) {
-      ctx.textAlign = "left";
-      ctx.textBaseline = "top";
-      ctx.fillStyle = inkSecondary;
-      ctx.fillText(opts.yLabel, m.l + 4, m.t - 6);
-    }
     // Markers.
     for (const mk of opts.markers ?? []) {
       const px = Math.round(sx(mk.x)) + 0.5;
       ctx.strokeStyle = "rgba(255,255,255,0.35)";
+      ctx.setLineDash([3, 3]);
       ctx.beginPath();
       ctx.moveTo(px, m.t);
       ctx.lineTo(px, h - m.b);
       ctx.stroke();
+      ctx.setLineDash([]);
       ctx.fillStyle = inkMuted;
-      ctx.textAlign = "left";
+      ctx.textAlign = "right";
       ctx.textBaseline = "top";
-      ctx.fillText(mk.label, px + 3, m.t);
+      ctx.fillText(mk.label, px - 4, m.t);
     }
     // Lines.
     ctx.lineJoin = "round";
@@ -179,6 +197,7 @@ export function lineChart(opts: LineChartOpts): HTMLElement {
       ctx.lineWidth = s.width ?? 2;
       ctx.beginPath();
       let pen = false;
+      let n = 0;
       for (const [x, y] of s.points) {
         if (yLog && y <= 0) {
           pen = false;
@@ -190,8 +209,17 @@ export function lineChart(opts: LineChartOpts): HTMLElement {
           ctx.moveTo(px, py);
           pen = true;
         } else ctx.lineTo(px, py);
+        n++;
       }
       ctx.stroke();
+      // A one-point series is invisible as a line: draw the point.
+      if (n === 1) {
+        const p = s.points.find((q) => !(yLog && q[1] <= 0))!;
+        ctx.beginPath();
+        ctx.arc(sx(p[0]), sy(p[1]), 3, 0, Math.PI * 2);
+        ctx.fillStyle = s.color;
+        ctx.fill();
+      }
     }
     // Crosshair.
     if (hoverX != null) {
@@ -209,7 +237,7 @@ export function lineChart(opts: LineChartOpts): HTMLElement {
         ctx.arc(sx(p[0]), sy(p[1]), 4, 0, Math.PI * 2);
         ctx.fillStyle = s.color;
         ctx.fill();
-        ctx.strokeStyle = "#1a1a19";
+        ctx.strokeStyle = "#161617";
         ctx.lineWidth = 2;
         ctx.stroke();
       }
@@ -228,6 +256,7 @@ export function lineChart(opts: LineChartOpts): HTMLElement {
   };
   const showAt = (clientX: number) => {
     const x = snap(clientX);
+    if (x === hoverX) return;
     hoverX = x;
     redraw();
     if (x == null) return;
@@ -262,7 +291,7 @@ export function lineChart(opts: LineChartOpts): HTMLElement {
 export function legendFor(series: { name: string; color: string }[]): HTMLElement {
   return el(
     "div",
-    { class: "legend" },
-    series.map((s) => el("span", { class: "key" }, [el("i", { style: `background:${s.color};height:3px;border-radius:2px` }), s.name])),
+    { class: "legend", style: "margin-top:6px" },
+    series.map((s) => el("span", { class: "key" }, [el("i", { class: "line", style: `background:${s.color}` }), s.name])),
   );
 }

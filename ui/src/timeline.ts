@@ -11,7 +11,8 @@
 import type { Chapter, Run } from "./data";
 import { fmtInt, fmtMs, levelName } from "./data";
 import { bwdSplit, fwdSplit, levelCss, phaseColor, prebuildColor, inkMuted, gridline, inkSecondary } from "./color";
-import { button, el, fitCanvas } from "./ui";
+import { button, el, fitCanvas, kv } from "./ui";
+import type { View } from "./main";
 
 interface Block {
   row: number; // 0 horizon, 1 level, 2 phase, 3 step
@@ -26,7 +27,7 @@ interface Block {
   parts?: { name: string; ms: number; color: string }[];
 }
 
-export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
+export function timelineView(run: Run, chs: Chapter[]): View {
   const prebuildMs = (run.prebuild_s ?? 0) * 1000;
   const total = prebuildMs + chs.reduce((a, c) => a + c.totalMs, 0);
   const blocks: Block[] = [];
@@ -76,39 +77,44 @@ export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
   let selected: Block | null = null;
   const canvas = el("canvas", { "aria-label": "timing waterfall" });
   const overview = el("canvas", { class: "wf-overview", "aria-label": "whole run; drag to select a span" });
-  const backBtn = button("← back", () => popZoom(), "small");
-  const allBtn = button("whole run", () => setView(0, total, true), "small");
+  const backBtn = button("← back", () => popZoom(), "small", "back to the previous span");
+  const allBtn = button("whole run", () => setView(0, total, true), "small", "zoom out to the whole run");
   const crumb = el("span", { class: "wf-crumb" });
   const toolbar = el("div", { class: "wf-toolbar" }, [backBtn, allBtn, crumb]);
   const wrap = el("div", { class: "waterfall" }, [overview, toolbar, canvas]);
   const detail = el("div", { class: "wf-detail" });
   const bars = el("div", { class: "wf-bars" });
   const legend = el("div", { class: "legend" }, [
-    ...Object.entries({ "emit (kernel)": fwdSplit.emit, "own": fwdSplit.own, "checkpoint": fwdSplit.ckpt, "pos-graph": fwdSplit.pos, "backward parallel": bwdSplit.par, "backward serial": bwdSplit.load }).map(([k, c]) => el("span", { class: "key" }, [el("i", { style: `background:${c}` }), k])),
+    ...Object.entries({ "forward: emit (kernel)": fwdSplit.emit, "own (filter, door, append)": fwdSplit.own, checkpoint: fwdSplit.ckpt, "pos-graph": fwdSplit.pos, "backward: parallel (re-run)": bwdSplit.par, "serial (load, mark)": bwdSplit.load }).map(([k, c]) => el("span", { class: "key" }, [el("i", { style: `background:${c}` }), k])),
   ]);
   const accounted = chs.reduce((a, c) => a + c.totalMs, 0);
-  const note = el("p", { class: "note", text: `The log's per-frame and per-iteration totals account for ${fmtMs(accounted)} of the ${run.wall_s != null ? fmtMs(run.wall_s * 1000) : "?"} wall clock (plus ${fmtMs(prebuildMs)} kernel prebuild); the rest is between the lines - loading marks, building filters, writing the marked set. Drag across the strip or the waterfall to zoom to a span; tap a horizon / level / phase block to zoom to it; "back" returns.` });
-  const root = el("div", { class: "card" }, [el("h2", { text: "Where the time goes" }), wrap, detail, bars, legend, note]);
+  const note = el("p", { class: "note" }, [
+    el("b", { text: `${fmtMs(accounted)} of the ${run.wall_s != null ? fmtMs(run.wall_s * 1000) : "?"} wall clock` }),
+    ` is in the log's per-frame and per-iteration totals (plus ${fmtMs(prebuildMs)} kernel prebuild); the rest is between the lines: loading marks, building filters, writing the marked set. `,
+    "Drag across the strip or the waterfall to zoom to a span, pinch or scroll to zoom, tap a horizon / level / phase block to zoom to it and read its numbers; double-tap resets.",
+  ]);
+  const root = el("div", { class: "card" }, [el("h2", {}, ["Where the time went", el("small", { text: "x is the search's own accounting of time, laid end to end" })]), wrap, detail, bars, legend, note]);
 
   const ROWS = [
     { y: 0, h: 24, label: "horizon" },
     { y: 26, h: 24, label: "level" },
     { y: 52, h: 24, label: "phase" },
-    { y: 78, h: 0, label: "frames / iterations" },
+    { y: 78, h: 0, label: "frame" },
   ];
-  const LEFT = 0;
+  /** The gutter with the row labels. */
+  const LEFT = 50;
 
   const draw = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
     ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = "#151514";
+    ctx.fillStyle = "#121213";
     ctx.fillRect(0, 0, w, h);
     ROWS[3].h = h - 78 - 18;
     const sx = (t: number) => LEFT + ((t - v0) / (v1 - v0)) * (w - LEFT);
-    ctx.font = "11px system-ui, sans-serif";
+    ctx.font = "11px " + getComputedStyle(canvas).fontFamily;
     ctx.textBaseline = "middle";
     // Time ticks.
     const span = v1 - v0;
-    const step = niceStep(span / Math.max(2, w / 90));
+    const step = niceStep(span / Math.max(2, (w - LEFT) / 90));
     ctx.fillStyle = inkMuted;
     ctx.strokeStyle = gridline;
     ctx.textAlign = "left";
@@ -120,10 +126,14 @@ export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
       ctx.stroke();
       ctx.fillText(fmtMs(t), x + 3, h - 9);
     }
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(LEFT, 0, w - LEFT, h);
+    ctx.clip();
     for (const b of blocks) {
       const x0 = sx(b.t0);
       const x1 = sx(b.t1);
-      if (x1 < 0 || x0 > w) continue;
+      if (x1 < LEFT || x0 > w) continue;
       const r = ROWS[b.row];
       const bw = Math.max(b.row === 3 ? 0.5 : 1, x1 - x0 - (x1 - x0 > 3 ? 1 : 0));
       if (b.row === 3 && b.parts) {
@@ -148,9 +158,9 @@ export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
       if (b.row < 3 && x1 - x0 > 26) {
         ctx.fillStyle = b.row === 1 ? "#0d0d0d" : inkSecondary;
         ctx.textAlign = "left";
-        const tx = Math.max(x0, 0) + 4;
+        const tx = Math.max(x0, LEFT) + 4;
         const label = b.label;
-        if (ctx.measureText(label).width + 8 < x1 - Math.max(x0, 0)) ctx.fillText(label, tx, r.y + r.h / 2);
+        if (ctx.measureText(label).width + 8 < x1 - Math.max(x0, LEFT)) ctx.fillText(label, tx, r.y + r.h / 2);
       }
     }
     // A span being selected.
@@ -163,15 +173,14 @@ export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
       ctx.lineWidth = 1;
       ctx.strokeRect(a + 0.5, 0.5, b - a - 1, h - 19);
     }
-    // Row labels, on a dark backdrop so they stay legible over the blocks.
-    ctx.textAlign = "right";
+    ctx.restore();
+    // Row labels in the gutter.
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = inkMuted;
     for (const r of ROWS) {
       if (r.h <= 0) continue;
-      const tw = ctx.measureText(r.label).width;
-      ctx.fillStyle = "rgba(13,13,13,0.75)";
-      ctx.fillRect(w - tw - 10, r.y + 2, tw + 8, 14);
-      ctx.fillStyle = inkMuted;
-      ctx.fillText(r.label, w - 6, r.y + 9);
+      ctx.fillText(r.label, 4, r.y + Math.min(r.h / 2, 12));
     }
   };
   const redrawMain = fitCanvas(canvas, draw);
@@ -180,7 +189,7 @@ export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
   // the current span as a bright window.
   const drawOverview = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
     ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = "#151514";
+    ctx.fillStyle = "#121213";
     ctx.fillRect(0, 0, w, h);
     const ox = (t: number) => (t / total) * w;
     for (const b of blocks) {
@@ -188,7 +197,7 @@ export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
       ctx.fillStyle = b.color;
       ctx.fillRect(ox(b.t0), h * 0.5, Math.max(0.5, ox(b.t1) - ox(b.t0)), h * 0.5);
     }
-    ctx.font = "10px system-ui, sans-serif";
+    ctx.font = "10px " + getComputedStyle(overview).fontFamily;
     ctx.textBaseline = "middle";
     ctx.textAlign = "left";
     for (const b of blocks) {
@@ -222,8 +231,9 @@ export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
   const redraw = () => {
     redrawMain();
     redrawOverview();
-    crumb.textContent = v0 === 0 && v1 === total ? "whole run" : `${fmtMs(v0)} – ${fmtMs(v1)} (${fmtMs(v1 - v0)})`;
+    crumb.textContent = v0 === 0 && v1 === total ? `whole run · ${fmtMs(total)}` : `${fmtMs(v0)} – ${fmtMs(v1)} · ${fmtMs(v1 - v0)} of ${fmtMs(total)}`;
     backBtn.disabled = zoomStack.length === 0;
+    allBtn.disabled = v0 === 0 && v1 === total;
   };
 
   function niceStep(raw: number): number {
@@ -387,70 +397,89 @@ export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
     else redraw();
   }
 
+  /** The selected block's numbers: a headline, its split as a bar, and
+   *  the parts as key / value pairs (values lead). */
   function describe(b: Block | null) {
     detail.replaceChildren();
     bars.replaceChildren();
-    if (!b) return;
+    if (!b) {
+      detail.append(el("div", { class: "muted", text: "tap a block to read its numbers" }));
+      return;
+    }
     const ms = b.t1 - b.t0;
-    const head = el("div", {});
+    const head = (title: string, sub: string) => el("div", { class: "head" }, [el("b", { text: title }), ` · ${sub}`]);
+    const share = (p: { name: string; ms: number }[]): [string, string][] => p.map((x) => [x.name, `${fmtMs(x.ms)} (${((100 * x.ms) / Math.max(1, ms)).toFixed(0)}%)`]);
     if (b.row === 0 && b.hIndex != null) {
       const hr = run.horizons[b.hIndex];
-      head.append(el("b", { text: `horizon ${hr.h}` }), ` · ${fmtMs(ms)} · ${hr.levels.length} levels · ${hr.refuted_at != null ? `refuted at level ${hr.refuted_at}` : "confirmed"}`);
       const parts = hr.levels.map((l) => {
         const c = chs.filter((x) => x.hIndex === b.hIndex && x.level === l.level);
         return { name: `L${l.level}`, ms: c.reduce((a, x) => a + x.totalMs, 0), color: levelCss(l.level) };
       });
       showBars(parts, ms);
-      detail.append(head, el("div", { text: parts.map((p) => `${p.name} ${fmtMs(p.ms)}`).join(" · ") }));
+      detail.append(head(`horizon ${hr.h}`, `${fmtMs(ms)} · ${hr.levels.length} level${hr.levels.length === 1 ? "" : "s"} · ${hr.refuted_at != null ? `refuted at level ${hr.refuted_at}` : "confirmed"}`), kv(share(parts)));
     } else if (b.row === 1 && b.chapter) {
       const lr = b.chapter.levelRun;
       const fwd = chs.find((x) => x.hIndex === b.hIndex && x.level === b.level && x.phase === "fwd");
       const bwd = chs.find((x) => x.hIndex === b.hIndex && x.level === b.level && x.phase === "bwd");
-      head.append(el("b", { text: `h${b.chapter.h} level ${lr.level} (${levelName(lr)})` }), ` · ${fmtMs(ms)} · ${lr.refuted ? "no win → refuted" : `first win f${lr.first_win}, ${fmtInt(lr.marked ?? 0)} marked, ${fmtInt(lr.reruns ?? 0)} re-runs`}`);
       const parts = [
-        { name: "forward", ms: fwd?.totalMs ?? 0, color: phaseColor.fwd },
-        { name: "backward", ms: bwd?.totalMs ?? 0, color: phaseColor.bwd },
+        { name: `forward, ${fwd?.frames.length ?? 0} frames`, ms: fwd?.totalMs ?? 0, color: phaseColor.fwd },
+        { name: `backward, ${bwd?.frames.length ?? 0} iterations`, ms: bwd?.totalMs ?? 0, color: phaseColor.bwd },
       ];
       showBars(parts, ms);
-      detail.append(head, el("div", { text: `forward ${fwd?.frames.length ?? 0} frames ${fmtMs(fwd?.totalMs ?? 0)} · backward ${bwd?.frames.length ?? 0} iterations ${fmtMs(bwd?.totalMs ?? 0)}` }));
+      detail.append(
+        head(`h${b.chapter.h} · level ${lr.level} (${levelName(lr)})`, `${fmtMs(ms)} · ${lr.refuted ? "no win → refuted" : `first win f${lr.first_win}`}`),
+        kv([...share(parts), ...(lr.refuted ? [] : ([["marked", fmtInt(lr.marked ?? 0)], ["re-runs", fmtInt(lr.reruns ?? 0)]] as [string, string][]))]),
+      );
     } else if (b.row === 2 && b.chapter) {
       const c = b.chapter;
-      head.append(el("b", { text: `h${c.h} level ${c.level} ${b.label}` }), ` · ${fmtMs(ms)} · ${c.frames.length} ${c.phase === "fwd" ? "frames" : "iterations"}`);
       const parts =
         c.phase === "fwd"
           ? [
-              { name: "emit", ms: c.levelRun.fwd.reduce((a, l) => a + l.emit_ms, 0), color: fwdSplit.emit },
+              { name: "emit (kernel)", ms: c.levelRun.fwd.reduce((a, l) => a + l.emit_ms, 0), color: fwdSplit.emit },
               { name: "own", ms: c.levelRun.fwd.reduce((a, l) => a + l.own_ms, 0), color: fwdSplit.own },
               { name: "checkpoint", ms: c.levelRun.fwd.reduce((a, l) => a + l.ckpt_ms, 0), color: fwdSplit.ckpt },
               { name: "pos-graph", ms: c.levelRun.fwd.reduce((a, l) => a + l.pos_ms, 0), color: fwdSplit.pos },
             ]
           : [
-              { name: "parallel", ms: c.levelRun.bwd.reduce((a, l) => a + l.par_ms, 0), color: bwdSplit.par },
-              { name: "serial", ms: c.levelRun.bwd.reduce((a, l) => a + (l.total_ms - l.par_ms), 0), color: bwdSplit.load },
+              { name: "parallel (re-run)", ms: c.levelRun.bwd.reduce((a, l) => a + l.par_ms, 0), color: bwdSplit.par },
+              { name: "serial (load, mark)", ms: c.levelRun.bwd.reduce((a, l) => a + (l.total_ms - l.par_ms), 0), color: bwdSplit.load },
             ];
       showBars(parts, ms);
-      detail.append(head, el("div", { text: parts.map((p) => `${p.name} ${fmtMs(p.ms)}`).join(" · ") }));
+      detail.append(head(`h${c.h} · level ${c.level} · ${b.label}`, `${fmtMs(ms)} · ${c.frames.length} ${c.phase === "fwd" ? "frames" : "iterations"}`), kv(share(parts)));
     } else if (b.row === 2 && !b.chapter) {
-      head.append(el("b", { text: b.label }), ` · ${fmtMs(ms)}`);
-      detail.append(head);
+      detail.append(head(b.label, fmtMs(ms)), el("div", { class: "note", text: "Retracing the start room's shapes and assembling their kernels for every rung of the ladder, before the search starts." }));
     } else if (b.row === 3 && b.chapter && b.step != null) {
       const c = b.chapter;
       const f = c.frames[b.step];
       if (c.phase === "fwd") {
         const l = c.levelRun.fwd[b.step];
-        head.append(el("b", { text: `h${c.h} level ${c.level} forward frame ${f}` }), ` · ${fmtMs(ms)}`);
         detail.append(
-          head,
-          el("div", { text: `${fmtInt(l.in_lanes)} in (${l.in_blocks} blocks) · ${fmtInt(l.raw)} raw · ${fmtInt(l.kept)} kept · visited ${fmtInt(l.visited)} · rss ${l.rss_gb.toFixed(2)} GB` }),
-          el("div", { text: `emit ${l.emit_ms} ms (idle ${l.emit_idle}%) · own ${l.own_ms} ms (idle ${l.own_idle}%) · ckpt ${l.ckpt_ms} ms · pos ${l.pos_ms} ms` }),
+          head(`h${c.h} · level ${c.level} · forward frame ${f}`, fmtMs(ms)),
+          kv([
+            ["lanes in", `${fmtInt(l.in_lanes)} (${l.in_blocks} blocks)`],
+            ["raw", fmtInt(l.raw)],
+            ["kept", fmtInt(l.kept)],
+            ["visited", fmtInt(l.visited)],
+            ["rss", `${l.rss_gb.toFixed(2)} GB`],
+            ["emit", `${l.emit_ms} ms, ${l.emit_idle}% idle`],
+            ["own", `${l.own_ms} ms, ${l.own_idle}% idle`],
+            ["checkpoint", `${l.ckpt_ms} ms`],
+            ["pos-graph", `${l.pos_ms} ms`],
+          ]),
         );
       } else {
         const l = c.levelRun.bwd[b.step];
-        head.append(el("b", { text: `h${c.h} level ${c.level} backward iteration f${f}` }), ` · ${fmtMs(ms)}`);
         detail.append(
-          head,
-          el("div", { text: `${fmtInt(l.targets)} targets · ${fmtInt(l.cand_cells)} candidate cells · ${fmtInt(l.loaded)} loaded · ${fmtInt(l.rerun)} re-run · ${fmtInt(l.marked)} marked` }),
-          el("div", { text: `load ${l.load_thread_ms} thread-ms · parallel ${l.par_ms} ms (idle ${l.par_idle}%)` }),
+          head(`h${c.h} · level ${c.level} · backward iteration f${f}`, fmtMs(ms)),
+          kv([
+            ["targets", fmtInt(l.targets)],
+            ["candidate cells", fmtInt(l.cand_cells)],
+            ["loaded", fmtInt(l.loaded)],
+            ["re-run", fmtInt(l.rerun)],
+            ["marked", fmtInt(l.marked)],
+            ["load", `${l.load_thread_ms} thread-ms`],
+            ["parallel", `${l.par_ms} ms, ${l.par_idle}% idle`],
+          ]),
         );
       }
       if (b.parts) showBars(b.parts, ms);
@@ -465,5 +494,5 @@ export function timelineView(run: Run, chs: Chapter[]): HTMLElement {
   for (const b of blocks) if (b.row === 0 && (!slowest || b.t1 - b.t0 > slowest.t1 - slowest.t0)) slowest = b;
   selected = slowest;
   describe(slowest);
-  return root;
+  return { root };
 }
