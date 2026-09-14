@@ -58,6 +58,8 @@ pub(crate) fn specialize_frame(
     decide: bool,
     room: Option<&crate::transpile::graph::Room>,
 ) -> (Graph, Vec<(usize, u8, u64, Vec<NodeId>)>) {
+    let trace = std::env::var_os("CELESTE_BUILD_TRACE").is_some();
+    let t0 = std::time::Instant::now();
     // --- 1. which forks each outcome actually depends on ---
     let cones = graph.split_cones();
     let bits_of = |fields: &[NodeId], ok: NodeId, live: NodeId| -> Vec<u8> {
@@ -114,6 +116,9 @@ pub(crate) fn specialize_frame(
         }
     }
 
+    let t_spec = t0.elapsed();
+    let n_cands = cands.len();
+    let t1 = std::time::Instant::now();
     // --- 3. decide the boolean layer, on the RESOLVED graph ---
     if decide {
         let all: Vec<NodeId> = cands.iter().flat_map(|c| c.3.iter().copied()).collect();
@@ -133,6 +138,17 @@ pub(crate) fn specialize_frame(
         sp = g3;
     }
 
+    let t_decide = t1.elapsed();
+    if trace {
+        eprintln!(
+            "[build] specialize {} candidates, {} nodes: {:.1}s; decide: {:.1}s ({} nodes after)",
+            n_cands,
+            sp.len(),
+            t_spec.as_secs_f64(),
+            t_decide.as_secs_f64(),
+            sp.len()
+        );
+    }
     // --- 4. identical roots are the same body ---
     let bodies: Vec<(usize, u8, u64, Vec<NodeId>)> = {
         let mut seen: BTreeSet<(usize, Vec<NodeId>)> = BTreeSet::new();

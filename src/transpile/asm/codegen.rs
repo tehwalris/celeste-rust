@@ -1361,52 +1361,91 @@ fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
             rem[*v as usize] += 1;
         }
     }
-    let mut ready: Vec<u32> = (0..n as u32).filter(|i| indeg[*i as usize] == 0).collect();
+    // The ready set lives in two heaps - one per objective - with lazy
+    // invalidation: an emitted instruction's stale entries are skipped,
+    // and an entry whose delta has improved (a vreg it reads lost its
+    // other consumers) is re-pushed with the fresh key when that happens,
+    // so the pressure heap's top is exact. O(n log n) against the O(n^2)
+    // scan of a flat ready list, which cost 124 s on a 493k-instruction
+    // kernel (room (2,0) with the speed ladder, 2026-09-14).
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let delta = |i: u32, rem: &[u32]| -> i32 {
+        let i = i as usize;
+        let dies = uses[i].iter().filter(|v| rem[**v as usize] == 1).count() as i32;
+        // (`consumers` is per instruction: the ones reading what `i`
+        // defines.)
+        let gains = match inst_def(&insts[i]) {
+            Some(_) if !consumers[i].is_empty() => 1,
+            _ => 0,
+        };
+        gains - dies
+    };
+    // by_h: highest height, then smallest delta, then smallest id.
+    let mut by_h: BinaryHeap<(u32, Reverse<i32>, Reverse<u32>)> = BinaryHeap::new();
+    // by_d: smallest delta, then highest height, then smallest id.
+    let mut by_d: BinaryHeap<(Reverse<i32>, u32, Reverse<u32>)> = BinaryHeap::new();
+    let mut done = vec![false; n];
+    let push = |i: u32, rem: &[u32], by_h: &mut BinaryHeap<(u32, Reverse<i32>, Reverse<u32>)>, by_d: &mut BinaryHeap<(Reverse<i32>, u32, Reverse<u32>)>| {
+        let d = delta(i, rem);
+        by_h.push((height[i as usize], Reverse(d), Reverse(i)));
+        by_d.push((Reverse(d), height[i as usize], Reverse(i)));
+    };
+    for i in 0..n as u32 {
+        if indeg[i as usize] == 0 {
+            push(i, &rem, &mut by_h, &mut by_d);
+        }
+    }
     let mut order: Vec<u32> = Vec::with_capacity(n);
     let mut live: usize = 0;
-    while !ready.is_empty() {
-        // Live-set delta if `i` is emitted: +1 if its def has consumers,
-        // minus the operands whose last consumer is `i`.
-        let delta = |i: u32| -> i32 {
-            let i = i as usize;
-            let dies = uses[i].iter().filter(|v| rem[**v as usize] == 1).count() as i32;
-            // (`consumers` is per instruction: the ones reading what `i`
-            // defines.)
-            let gains = match inst_def(&insts[i]) {
-                Some(_) if !consumers[i].is_empty() => 1,
-                _ => 0,
-            };
-            gains - dies
-        };
-        // Pick: under pressure, minimize delta (free registers), breaking
-        // ties by higher height; otherwise maximize height, breaking ties by
-        // smaller delta and then original order for determinism.
+    while order.len() < n {
         let tight = live >= limit;
-        let best = ready
-            .iter()
-            .copied()
-            .enumerate()
-            .min_by(|&(_, a), &(_, b)| {
-                let (da, db) = (delta(a), delta(b));
-                let (ha, hb) = (height[a as usize], height[b as usize]);
-                if tight {
-                    da.cmp(&db).then(hb.cmp(&ha)).then(a.cmp(&b))
-                } else {
-                    hb.cmp(&ha).then(da.cmp(&db)).then(a.cmp(&b))
+        let i = if tight {
+            loop {
+                let Some((Reverse(d), h, Reverse(i))) = by_d.pop() else { break None };
+                if done[i as usize] {
+                    continue;
                 }
-            })
-            .map(|(pos, _)| pos)
-            .unwrap();
-        let i = ready.swap_remove(best);
+                let d2 = delta(i, &rem);
+                if d2 != d {
+                    by_d.push((Reverse(d2), h, Reverse(i)));
+                    continue;
+                }
+                break Some(i);
+            }
+        } else {
+            loop {
+                let Some((_, _, Reverse(i))) = by_h.pop() else { break None };
+                if done[i as usize] {
+                    continue;
+                }
+                break Some(i);
+            }
+        };
+        let Some(i) = i else { break };
+        done[i as usize] = true;
         order.push(i);
-        live = (live as i32 + delta(i)).max(0) as usize;
+        live = (live as i32 + delta(i, &rem)).max(0) as usize;
         for v in &uses[i as usize] {
             rem[*v as usize] -= 1;
+            // The vreg's last remaining consumer just got cheaper: refresh
+            // its pressure-heap key (its height-heap key is static).
+            if rem[*v as usize] == 1 {
+                let d = def_inst[*v as usize];
+                if d != u32::MAX {
+                    for &c in &consumers[d as usize] {
+                        if !done[c as usize] && indeg[c as usize] == 0 {
+                            let dc = delta(c, &rem);
+                            by_d.push((Reverse(dc), height[c as usize], Reverse(c)));
+                        }
+                    }
+                }
+            }
         }
         for &c in &consumers[i as usize] {
             indeg[c as usize] -= 1;
             if indeg[c as usize] == 0 {
-                ready.push(c);
+                push(c, &rem, &mut by_h, &mut by_d);
             }
         }
     }
@@ -1929,10 +1968,12 @@ pub fn compile(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(4);
+    let t_lower = std::time::Instant::now();
     let order = schedule(g, &live, roots, batch);
     for id in order {
         lo.lower_node(id)?;
     }
+    let t_lower = t_lower.elapsed();
 
     // Roots -> typed stores, each into its own 128-byte slot.
     let mut root_kinds: Vec<RootKind> = Vec::with_capacity(roots.len());
@@ -1974,7 +2015,11 @@ pub fn compile(
     // chains (see `reschedule`). On by default; CELESTE_ASM_SCHED=0 disables
     // it for A/B.
     if std::env::var("CELESTE_ASM_SCHED").map(|s| s != "0").unwrap_or(true) {
+        let t = std::time::Instant::now();
         lo.insts = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
+        if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+            eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
+        }
     }
 
     // Which vregs are cheap to recompute from input memory (a load, or bits
@@ -1990,7 +2035,11 @@ pub fn compile(
         }
     }
 
+    let t_alloc = std::time::Instant::now();
     let (home, spill_slots) = allocate(&lo.insts, lo.next_vreg, &remat);
+    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+        eprintln!("[build]   {sym}: allocate {:.1}s ({spill_slots} spill slots)", t_alloc.elapsed().as_secs_f64());
+    }
 
     // Any call-outs? They need a 32-zmm save area and arg buffers above the
     // spill region, and the r13/r14/r15 prologue.

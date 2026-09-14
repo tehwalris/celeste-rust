@@ -39,9 +39,22 @@ pub fn compile_and_load_reprs(
     cell_reprs: &HashMap<u32, CellRepr>,
 ) -> Result<(Compiled, Loaded)> {
     let sym = format!("kernel_{tag}");
+    let t0 = std::time::Instant::now();
     let compiled = compile(g, roots, &sym, cell_reprs)?;
+    let t_compile = t0.elapsed();
+    let t1 = std::time::Instant::now();
     let so: PathBuf = assemble(&compiled.asm, tag)?;
+    let t_asm = t1.elapsed();
     let loaded = Loaded::open(&so, &sym)?;
+    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+        eprintln!(
+            "[build] {tag}: {} roots, asm text {:.1} MB: compile {:.1}s, gcc+load {:.1}s",
+            roots.len(),
+            compiled.asm.len() as f64 / 1e6,
+            t_compile.as_secs_f64(),
+            t_asm.as_secs_f64()
+        );
+    }
     Ok((compiled, loaded))
 }
 
