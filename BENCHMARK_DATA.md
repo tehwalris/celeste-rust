@@ -1,3 +1,17 @@
+# Rooms (1,0) and (0,0) end to end on the guarded, grouped kernels (2026-09-14, release)
+
+Same commands as the runs below; every ladder fingerprint identical.
+
+| | kernel walk (2026-09-13) | explicit graph | + forward-cost pass | + regions & grouping |
+|---|---|---|---|---|
+| room (1,0), 32 threads | 7:13 | 6:33 | 4:57 | **4:51** (RSS 23.9 GB) |
+| room (0,0), 16 threads | 2 h 32 min | 23:50 | - | **15:31** (RSS 44.8 GB) |
+
+Room (1,0) barely moves: its shapes have 4 regions (nothing to skip) and
+grouping a piece by configuration costs the within-call dedup its cell
+locality (f89 raw rows 21.7M -> 29.1M), which cancels the kernel's gain.
+Room (0,0)'s finer levels (many regions) are where the 8 minutes went.
+
 # Guarded regions + lane grouping in the kernels (2026-09-14, quick profile, 16 threads)
 
 plans/regions.md. `rewrite bench-frame`, wave time of one frame:
