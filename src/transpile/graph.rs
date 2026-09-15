@@ -293,18 +293,23 @@ pub enum Op {
     /// at a TABLE of cuts be ordinary arithmetic after specialization.
     Lo,
     Hi,
-    /// A fork at a TABLE of cuts (`Graph::set_fork_table`): fragment `c`
-    /// of fork `d` is the operand clipped to the table's `c`-th range,
-    /// `Span(max(Lo(v), lo_c), min(Hi(v), hi_c))`, and `SplitValidTab(d)`
-    /// is whether the operand reaches it, `Lo(v) <= hi_c and Hi(v) >=
-    /// lo_c`. Unlike `Split`, which cuts at the graph's one grid, the
-    /// ranges are per fork and known when the fork is built - a body
-    /// specialized on its input speed BUCKET knows the static range of
-    /// its output speed, hence exactly which bucket edges it can cross
-    /// (2026-09-15, the bucket dispatch). Resolved by specialization into
-    /// the ordinary ops above, so nothing downstream knows it existed.
+    /// A fork at a TABLE of ranges (`Graph::set_fork_table`), RELATIVE
+    /// like `Split`: fragment `c` of fork `d` is the operand clipped to the
+    /// table entry `c` places above the one the lane's low end lies in
+    /// (while the entries in between are contiguous). `SplitValidTab(d)`
+    /// is whether the lane reaches that entry, `SplitKeyTab(d)` is the
+    /// entry itself (the row's bucket), and `SplitOkTab(d)` the premise
+    /// that fragments `0..arity` cover the lane. Which entry is a
+    /// per-lane select chain on `Lo(v)` - data, not control flow - so
+    /// the arity is what ONE lane can cross, not every entry any lane
+    /// reaches: enumerating absolute entries multiplied a button rep's
+    /// ground, air, ice and dash images into 10 x 8 configurations of
+    /// the same compute (2026-09-15, the bucket dispatch). Resolved by
+    /// specialization into the ordinary ops above.
     SplitTab(u8),
     SplitValidTab(u8),
+    SplitKeyTab(u8),
+    SplitOkTab(u8),
 
     // ---- cart lookups ----
     Mget,
@@ -357,6 +362,21 @@ pub struct Graph {
     /// Per fork `d`, the ranges of a table fork (`SplitTab`): fragment
     /// `c` is `[lo, hi]` raw, inclusive. Empty for a grid fork.
     fork_tables: Vec<Vec<(i32, i32)>>,
+    /// Each input cell's KIND, recorded where the cell is made
+    /// (`iface::symbolize`) and carried through every rebuild: what the
+    /// interval evaluator gives a cell as its weakest value (a number the
+    /// full range, a boolean unknown). Guessing it from the cell's uses
+    /// missed a boolean read only as a select's arm and seeded it as a
+    /// number (2026-09-15).
+    cell_kinds: rustc_hash::FxHashMap<u32, CellKind>,
+}
+
+/// The kind of an input cell (`Graph::cell_kind`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CellKind {
+    Num,
+    Ival,
+    Bool,
 }
 
 /// The most fragments one fork can have: a configuration names each
@@ -377,8 +397,56 @@ impl Graph {
             fork_bits: self.fork_bits,
             fork_ways: self.fork_ways.clone(),
             fork_tables: self.fork_tables.clone(),
+            cell_kinds: self.cell_kinds.clone(),
             ..Default::default()
         }
+    }
+
+    pub fn set_cell_kind(&mut self, cell: u32, kind: CellKind) {
+        self.cell_kinds.insert(cell, kind);
+    }
+
+    /// The recorded kind of `cell`; a cell never declared is a number (the
+    /// per-op tests' graphs, whose reprs come from the caller).
+    pub fn cell_kind(&self, cell: u32) -> CellKind {
+        self.cell_kinds.get(&cell).copied().unwrap_or(CellKind::Num)
+    }
+
+    /// The kinds, for a rebuild that renumbers the cells.
+    pub fn cell_kinds(&self) -> impl Iterator<Item = (u32, CellKind)> + '_ {
+        self.cell_kinds.iter().map(|(c, k)| (*c, *k))
+    }
+
+    /// Rebuild the nodes `need` reaches into `out` with the boolean nodes
+    /// of `assign` replaced by constants, folding as it goes (a decided
+    /// select drops its other arm). Returns the old -> new map (`UNBUILT`
+    /// for a node not rebuilt). The key fixpoint reads a frame's successor
+    /// keys per assignment of the conditions its dispatch fields select
+    /// on, so the fields' values are read JOINTLY (`dash_time = 4` with
+    /// the new target, not the old one).
+    pub fn substitute_bools(
+        &self,
+        need: &[bool],
+        assign: &std::collections::HashMap<NodeId, bool>,
+        out: &mut Graph,
+    ) -> Vec<NodeId> {
+        const UNBUILT: NodeId = NodeId::MAX;
+        let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !need[i] {
+                map.push(UNBUILT);
+                continue;
+            }
+            let id = match assign.get(&(i as NodeId)) {
+                Some(&b) => out.leaf(Op::ConstBool(b)),
+                None => {
+                    let args: Vec<NodeId> = node.args.iter().map(|a| map[*a as usize]).collect();
+                    out.fold(node.op.clone(), args)
+                }
+            };
+            map.push(id);
+        }
+        map
     }
 
     /// Forget every fork's arity and table: a new frame's forks start at 0
@@ -388,15 +456,18 @@ impl Graph {
         self.fork_tables.clear();
     }
 
-    /// Make fork `d` a table fork over `ranges` (its arity is their count).
-    pub fn set_fork_table(&mut self, d: u8, ranges: Vec<(i32, i32)>) {
+    /// Make fork `d` a table fork over `ranges` (sorted, disjoint) with
+    /// `arity` fragments: the most entries one lane can cross.
+    pub fn set_fork_table(&mut self, d: u8, ranges: Vec<(i32, i32)>, arity: u8) {
         assert!(!ranges.is_empty() && ranges.len() <= MAX_WAYS, "table fork {d}: {} ranges", ranges.len());
+        assert!(arity >= 1 && arity as usize <= ranges.len(), "table fork {d}: arity {arity} over {} ranges", ranges.len());
+        assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0), "table fork {d}: ranges not sorted and disjoint");
         // Set, not raised: the arena outlives a trace, and fork `d` of the
         // previous trace may have had a bigger table.
         if self.fork_ways.len() <= d as usize {
             self.fork_ways.resize(d as usize + 1, 2);
         }
-        self.fork_ways[d as usize] = ranges.len() as u8;
+        self.fork_ways[d as usize] = arity;
         if self.fork_tables.len() <= d as usize {
             self.fork_tables.resize(d as usize + 1, Vec::new());
         }
@@ -416,7 +487,7 @@ impl Graph {
     /// twice (`fork_memo`) keeps the wider request, since each site's own
     /// `SplitOk` premise is what bounds the lanes IT admits.
     pub fn set_fork_ways(&mut self, d: u8, ways: u8) {
-        debug_assert!(ways >= 2, "fork arity {ways}");
+        debug_assert!(ways >= 1, "fork arity {ways}");
         if self.fork_ways.len() <= d as usize {
             self.fork_ways.resize(d as usize + 1, 2);
         }
@@ -480,7 +551,9 @@ impl Graph {
         for (i, node) in self.nodes.iter().enumerate() {
             let mut m = match node.op {
                 Op::Free(b) => Choice::Free(b).bit(),
-                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) => Choice::Split(d).bit(),
+                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) | Op::SplitKeyTab(d) | Op::SplitOkTab(d) => {
+                    Choice::Split(d).bit()
+                }
                 _ => 0,
             };
             for a in &node.args {
@@ -550,7 +623,7 @@ impl Graph {
         splits: Option<&[u8]>,
         out: &mut Graph,
     ) -> Vec<NodeId> {
-        self.specialize_subset_into(frees, splits, None, out)
+        self.specialize_subset_into(frees, splits, None, None, out)
     }
 
     /// As `specialize_config_into`, over a SUBSET of the nodes.
@@ -565,10 +638,15 @@ impl Graph {
     ///
     /// Entries for unbuilt nodes are `UNBUILT`, which is not a valid id
     /// - reading one is a bug, and it should look like one.
+    ///
+    /// `tabs`, per fork, overrides a table fork's arity and entries with a
+    /// button rep's own (`lower::specialize_frame`: what that rep's lanes
+    /// can reach); an empty entry list keeps the fork's.
     pub fn specialize_subset_into(
         &self,
         frees: u8,
         splits: Option<&[u8]>,
+        tabs: Option<&[(u8, Vec<(i32, i32)>)]>,
         need: Option<&[bool]>,
         out: &mut Graph,
     ) -> Vec<NodeId> {
@@ -598,27 +676,58 @@ impl Graph {
                 (Op::Split(d), Some(s)) => out.fold(Op::Frag(s[d as usize]), vec![arg(&map, 0)]),
                 (Op::SplitValid(d), Some(s)) => out.fold(Op::FragOk(s[d as usize]), vec![arg(&map, 0)]),
                 (Op::SplitInt(d), Some(s)) => out.fold(Op::IntFrag(s[d as usize]), vec![arg(&map, 0)]),
-                // The table fork: ordinary arithmetic on the fragment's
-                // constant range (see `Op::SplitTab`).
-                (Op::SplitTab(d), Some(s)) | (Op::SplitValidTab(d), Some(s)) => {
+                // The relative table fork (see `Op::SplitTab`): per-lane
+                // select chains on `Lo(v)` over the entries.
+                (Op::SplitTab(d), Some(s)) | (Op::SplitValidTab(d), Some(s)) | (Op::SplitKeyTab(d), Some(s)) | (Op::SplitOkTab(d), Some(s)) => {
                     let c = s[d as usize] as usize;
-                    let table = self.fork_table(d);
-                    let (lo, hi) = *table.get(c).unwrap_or_else(|| {
-                        panic!("table fork {d}: configuration {c} of {} (fork_ways {}, {} forks with tables: {:?})", table.len(), self.fork_ways(d), self.fork_tables.len(), self.fork_tables.iter().map(|t| t.len()).collect::<Vec<_>>())
-                    });
+                    let (arity, table) = match tabs.and_then(|t| t.get(d as usize)).filter(|t| !t.1.is_empty()) {
+                        Some((k, t)) => (*k as usize, t.as_slice()),
+                        None => (self.fork_ways(d) as usize, self.fork_table(d)),
+                    };
+                    assert!(!table.is_empty() && c < arity, "table fork {d}: configuration {c} of arity {arity} over {} entries", table.len());
                     let v = arg(&map, 0);
                     let vlo = out.fold(Op::Lo, vec![v]);
                     let vhi = out.fold(Op::Hi, vec![v]);
-                    let klo = out.leaf(Op::Const(lo, lo));
-                    let khi = out.leaf(Op::Const(hi, hi));
-                    if matches!(node.op, Op::SplitTab(_)) {
-                        let a = out.fold(Op::Max, vec![vlo, klo]);
-                        let b = out.fold(Op::Min, vec![vhi, khi]);
-                        out.fold(Op::Span, vec![a, b])
-                    } else {
-                        let a = out.fold(Op::Le, vec![vlo, khi]);
-                        let b = out.fold(Op::Ge, vec![vhi, klo]);
-                        out.fold(Op::And, vec![a, b])
+                    let lo_of = |out: &mut Graph, c: usize| table_chain(out, table, vlo, |j| rel_entry(table, j, c).map_or(i32::MAX, |e| e.0), i32::MAX);
+                    let hi_of = |out: &mut Graph, c: usize| table_chain(out, table, vlo, |j| rel_entry(table, j, c).map_or(i32::MIN, |e| e.1), i32::MIN);
+                    match node.op {
+                        Op::SplitTab(_) => {
+                            let (l, h) = (lo_of(out, c), hi_of(out, c));
+                            let a = out.fold(Op::Max, vec![vlo, l]);
+                            let b = out.fold(Op::Min, vec![vhi, h]);
+                            out.fold(Op::Span, vec![a, b])
+                        }
+                        Op::SplitKeyTab(_) => {
+                            let (l, h) = (lo_of(out, c), hi_of(out, c));
+                            out.fold(Op::Span, vec![l, h])
+                        }
+                        // Fragment 0 holds the low end iff its entry does (a
+                        // low end in a gap has none); fragment c > 0 is reached
+                        // iff the high end is at or past its entry.
+                        Op::SplitValidTab(_) if c == 0 => {
+                            let h = hi_of(out, 0);
+                            out.fold(Op::Le, vec![vlo, h])
+                        }
+                        Op::SplitValidTab(_) => {
+                            let l = lo_of(out, c);
+                            out.fold(Op::Ge, vec![vhi, l])
+                        }
+                        // The lane is covered: its low end in an entry, its
+                        // high end within the contiguous run of `arity`
+                        // entries from there.
+                        _ => {
+                            let h0 = hi_of(out, 0);
+                            let reach = table_chain(
+                                out,
+                                table,
+                                vlo,
+                                |j| (0..arity).rev().find_map(|m| rel_entry(table, j, m)).map_or(i32::MIN, |e| e.1),
+                                i32::MIN,
+                            );
+                            let a = out.fold(Op::Le, vec![vlo, h0]);
+                            let b = out.fold(Op::Le, vec![vhi, reach]);
+                            out.fold(Op::And, vec![a, b])
+                        }
                     }
                 }
                 _ => {
@@ -684,6 +793,65 @@ impl Graph {
             // `Some(true)` for every operand, and the two are checked
             // against each other by `folding_is_exact`.
             Op::FragOk(0) => return self.leaf(Op::ConstBool(true)),
+            // Arithmetic on literal POINTS is a constant, in PICO-8's
+            // arithmetic (the concrete domain's). The tracer folds these
+            // before they reach the graph; a rebuild that substitutes the
+            // buttons or a condition leaves `Mul(Const, Const)` and
+            // `Eq(Mul(..), Const)` behind, and a select on such a
+            // comparison must fold or a later split takes both arms
+            // (2026-09-15: 48 dash-constant sets for 10).
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max => {
+                let point = |g: &Graph, i: usize| match g.nodes[args[i] as usize].op {
+                    Op::Const(lo, hi) if lo == hi => Some(Pico8Num::from_raw(lo)),
+                    _ => None,
+                };
+                if let (Some(x), Some(y)) = (point(self, 0), point(self, 1)) {
+                    let r = match op {
+                        Op::Add => Some(x + y),
+                        Op::Sub => Some(x - y),
+                        Op::Mul => Some(x * y),
+                        Op::Div if y.as_raw_u32() != 0 => Some(x / y),
+                        Op::Div => None,
+                        Op::Min => Some(if y < x { y } else { x }),
+                        _ => Some(if y > x { y } else { x }),
+                    };
+                    if let Some(r) = r {
+                        let raw = r.as_raw_u32() as i32;
+                        return self.leaf(Op::Const(raw, raw));
+                    }
+                }
+            }
+            Op::Neg | Op::Abs | Op::Flr => {
+                if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
+                    if lo == hi {
+                        let x = Pico8Num::from_raw(lo);
+                        let r = match op {
+                            Op::Neg => -x,
+                            Op::Abs => x.abs(),
+                            _ => x.flr(),
+                        };
+                        let raw = r.as_raw_u32() as i32;
+                        return self.leaf(Op::Const(raw, raw));
+                    }
+                }
+            }
+            // A comparison of two literal POINTS is a constant.
+            Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => {
+                let point = |g: &Graph, i: usize| match g.nodes[args[i] as usize].op {
+                    Op::Const(lo, hi) if lo == hi => Some(lo),
+                    _ => None,
+                };
+                if let (Some(x), Some(y)) = (point(self, 0), point(self, 1)) {
+                    let r = match op {
+                        Op::Lt => x < y,
+                        Op::Le => x <= y,
+                        Op::Gt => x > y,
+                        Op::Ge => x >= y,
+                        _ => x == y,
+                    };
+                    return self.leaf(Op::ConstBool(r));
+                }
+            }
             // A span of two literals IS a literal interval, and folding
             // it back to one is what keeps a `Span` built over constant
             // bounds identical to the `Const` the caller would have
@@ -958,17 +1126,37 @@ impl Graph {
                     a(0)
                 }
                 Op::SplitInt(_) | Op::SplitTab(_) if lenient => a(0),
-                Op::SplitValidTab(_) if !strict_err => Val::Bool(None),
-                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) => {
+                // A lane's bucket is one of the table's entries.
+                Op::SplitKeyTab(d) if lenient => {
+                    let t = self.fork_table(*d);
+                    match (t.first(), t.last()) {
+                        (Some(first), Some(last)) => Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(first.0), Pico8Num::from_raw(last.1))),
+                        _ => bail!("node {}: table fork {} has no table", i, d),
+                    }
+                }
+                Op::SplitValidTab(_) | Op::SplitOkTab(_) if !strict_err => Val::Bool(None),
+                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) | Op::SplitKeyTab(d) | Op::SplitOkTab(d) => {
                     bail!("node {}: split {} has no value outside an outcome", i, d)
                 }
-                Op::Lo => {
-                    let iv = a(0).as_num("Lo")?;
-                    Val::Num(Pico8NumInterval::new(iv.low, iv.low))
-                }
-                Op::Hi => {
-                    let iv = a(0).as_num("Hi")?;
-                    Val::Num(Pico8NumInterval::new(iv.high, iv.high))
+                // ONE lane's low (high) end, over the lanes. A value's `Val`
+                // is the hull of every lane's interval, so a lane's end is
+                // anywhere in it - except a span's, which IS its operand
+                // (anywhere in that operand's hull), and a literal
+                // interval's, the same in every lane. Returning the hull's
+                // end as a point let the interval fold replace `Lo(v)` by a
+                // constant and decide premises on it: every body of the
+                // relative table fork's kernels declined (2026-09-15).
+                Op::Lo | Op::Hi => {
+                    let low = matches!(node.op, Op::Lo);
+                    let arg = &self.nodes[node.args[0] as usize];
+                    match arg.op {
+                        Op::Span => Val::Num(out[arg.args[if low { 0 } else { 1 }] as usize].as_num("Lo/Hi of Span")?),
+                        Op::Const(l, h) => {
+                            let v = Pico8Num::from_raw(if low { l } else { h });
+                            Val::Num(Pico8NumInterval::new(v, v))
+                        }
+                        _ => Val::Num(a(0).as_num("Lo/Hi")?),
+                    }
                 }
                 // The low end of fragment `c`, exact; under `lenient` the
                 // hull of that over the lanes: `[fl + c, fh + c]` cells.
@@ -1221,6 +1409,7 @@ impl Graph {
             | Op::Free(_)
             | Op::SplitValid(_)
             | Op::SplitValidTab(_)
+            | Op::SplitOkTab(_)
             | Op::SplitOk(_)
             | Op::FragOk(_)
             | Op::Lt
@@ -1769,6 +1958,160 @@ mod tests {
         let err = g.eval(&cells).unwrap_err().to_string();
         assert!(err.contains("not modelled"), "unexpected error: {}", err);
     }
+
+    /// The pieces analysis: a select on a non-constant condition is the
+    /// UNION of its arms, not the hull, and arithmetic maps each piece.
+    #[test]
+    fn pieces_keep_a_select_as_a_union() {
+        let mut g = Graph::new();
+        let s = g.leaf(Op::Cell(0));
+        let five = g.leaf(Op::Const(5 << 16, 5 << 16));
+        let cond = g.leaf(Op::Cell(1));
+        let sel = g.add(Op::Sel, vec![cond, five, s]);
+        let neg = g.add(Op::Neg, vec![sel]);
+        let seeds: HashMap<NodeId, (i64, i64)> = HashMap::from([(s, (-(1i64 << 16), 1i64 << 16))]);
+        let mut memo = HashMap::new();
+        assert_eq!(pieces_of(&g, &seeds, &mut memo, sel), Some(vec![(-(1 << 16), 1 << 16), (5 << 16, 5 << 16)]));
+        assert_eq!(pieces_of(&g, &seeds, &mut memo, neg), Some(vec![(-(5 << 16), -(5 << 16)), (-(1 << 16), 1 << 16)]));
+        // An unseeded cell is unknown, and so is anything over it.
+        let other = g.leaf(Op::Cell(2));
+        let sum = g.add(Op::Add, vec![s, other]);
+        assert_eq!(pieces_of(&g, &seeds, &mut memo, sum), None);
+    }
+
+    /// The relative table fork PARTITIONS every lane it admits: over every
+    /// lane interval in a table with singleton and gapped entries, the
+    /// valid fragments' clips tile the lane in order, each keyed on the
+    /// entry holding it; a lane crossing more entries than the arity, or
+    /// touching a gap, fails the premise (declines) rather than losing a
+    /// piece. One lane at a time: the lane is `Span(lo, hi)` over two
+    /// point cells, whose ends the evaluator knows exactly.
+    #[test]
+    fn a_relative_table_fork_partitions_every_lane_it_admits() {
+        let table = vec![(-10, -1), (0, 0), (1, 10), (20, 30)];
+        let mut g = Graph::new();
+        let (vl, vh) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)));
+        let v = g.add(Op::Span, vec![vl, vh]);
+        g.set_fork_table(0, table.clone(), 3);
+        let frag = g.add(Op::SplitTab(0), vec![v]);
+        let valid = g.add(Op::SplitValidTab(0), vec![v]);
+        let key = g.add(Op::SplitKeyTab(0), vec![v]);
+        let ok = g.add(Op::SplitOkTab(0), vec![v]);
+        let iv = |lo: i32, hi: i32| Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(lo), Pico8Num::from_raw(hi)));
+        let num = |x: &Val| match x {
+            Val::Num(i) => (i.low.as_raw_u32() as i32, i.high.as_raw_u32() as i32),
+            other => panic!("{other:?}"),
+        };
+        for arity in 1..=3u8 {
+            let tabs = vec![(arity, table.clone())];
+            let resolved: Vec<(Graph, Vec<NodeId>)> = (0..arity)
+                .map(|c| {
+                    let mut out = g.like();
+                    let map = g.specialize_subset_into(0, Some(&[c]), Some(&tabs), None, &mut out);
+                    (out, map)
+                })
+                .collect();
+            for lo in -12..=32 {
+                for hi in lo..=32 {
+                    let cells = HashMap::from([(0u32, iv(lo, lo)), (1u32, iv(hi, hi))]);
+                    let mut pieces: Vec<((i32, i32), (i32, i32))> = Vec::new();
+                    let mut admitted = None;
+                    for (out, map) in &resolved {
+                        let vals = out.eval_lenient(&cells).expect("eval");
+                        let b = |n: NodeId| match vals[map[n as usize] as usize] {
+                            Val::Bool(Some(b)) => b,
+                            other => panic!("[{lo}, {hi}]: {other:?}"),
+                        };
+                        let here = b(ok);
+                        assert!(admitted.is_none_or(|a| a == here), "the premise does not depend on the fragment");
+                        admitted = Some(here);
+                        if b(valid) {
+                            pieces.push((num(&vals[map[frag as usize] as usize]), num(&vals[map[key as usize] as usize])));
+                        }
+                    }
+                    let entries: Vec<(i32, i32)> = table.iter().copied().filter(|e| e.0 <= hi && e.1 >= lo).collect();
+                    let covered = entries.first().is_some_and(|e| e.0 <= lo) && entries.last().is_some_and(|e| e.1 >= hi) && entries.windows(2).all(|w| w[0].1 + 1 == w[1].0);
+                    let want = covered && entries.len() <= arity as usize;
+                    assert_eq!(admitted, Some(want), "[{lo}, {hi}] arity {arity}: premise");
+                    if want {
+                        let tiles: Vec<((i32, i32), (i32, i32))> = entries.iter().map(|e| ((lo.max(e.0), hi.min(e.1)), *e)).collect();
+                        assert_eq!(pieces, tiles, "[{lo}, {hi}] arity {arity}: fragments");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Lo`/`Hi` of a value known only as a hull over lanes are not points:
+    /// a lane's end is anywhere in the hull, so neither the evaluator nor
+    /// the pieces analysis may decide a comparison on it that one lane
+    /// could fail - and the interval fold must not pin it.
+    #[test]
+    fn the_ends_of_a_hull_are_not_points() {
+        let mut g = Graph::new();
+        let v = g.leaf(Op::Cell(0));
+        let hi = g.add(Op::Hi, vec![v]);
+        let one = g.leaf(Op::Const(1 << 16, 1 << 16));
+        let le = g.add(Op::Le, vec![hi, one]);
+        let hull = Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(0), Pico8Num::from_raw(3 << 16)));
+        let vals = g.eval_lenient(&HashMap::from([(0u32, hull)])).expect("eval");
+        assert_eq!(vals[hi as usize], hull, "Hi of a hull is the hull");
+        assert_eq!(vals[le as usize], Val::Bool(None), "a lane [0, 0.5] has Hi <= 1, a lane [2, 3] does not");
+        let seeds: HashMap<NodeId, (i64, i64)> = HashMap::from([(v, (0, 3 << 16))]);
+        assert_eq!(pieces_of(&g, &seeds, &mut HashMap::new(), hi), Some(vec![(0, 3 << 16)]));
+        let (out, map, _) = crate::transpile::ival::fold_with(&g, &[le], None, &std::collections::HashMap::from([(0u32, (0, 3 << 16))])).expect("fold");
+        assert_eq!(out.get(map[le as usize]).op, Op::Le, "the fold leaves it to the lanes");
+    }
+
+    /// `substitute_bools` fixes a select's condition and drops the other arm.
+    #[test]
+    fn substituting_a_condition_folds_its_selects() {
+        let mut g = Graph::new();
+        let c = g.leaf(Op::Cell(0));
+        let (a, b) = (g.leaf(Op::Const(1, 1)), g.leaf(Op::Const(2, 2)));
+        let sel = g.add(Op::Sel, vec![c, a, b]);
+        let need = vec![true; g.len()];
+        for (want, k) in [(true, 1), (false, 2)] {
+            let mut out = g.like();
+            let map = g.substitute_bools(&need, &HashMap::from([(c, want)]), &mut out);
+            assert!(matches!(out.get(map[sel as usize]).op, Op::Const(lo, _) if lo == k));
+        }
+    }
+
+}
+
+/// A select chain on `lo` over a sorted, disjoint table: `pick(j)` for the
+/// LAST entry `j` whose low end is at or below `lo`, `default` below the
+/// first. What the relative table fork resolves to, per lane.
+fn table_chain(out: &mut Graph, table: &[(i32, i32)], lo: NodeId, pick: impl Fn(usize) -> i32, default: i32) -> NodeId {
+    let mut acc = out.leaf(Op::Const(default, default));
+    // An entry picking what the one below it picks adds nothing: at or above
+    // its low end the chain below already answers the same. The census of
+    // a bucketed kernel counted 6,088 such selects of 28,552 nodes
+    // (2026-09-15: a fragment past the end of a contiguous run picks the
+    // sentinel entry after entry).
+    let mut below = default;
+    for (j, (tlo, _)) in table.iter().enumerate() {
+        let v = pick(j);
+        if v == below {
+            continue;
+        }
+        below = v;
+        let edge = out.leaf(Op::Const(*tlo, *tlo));
+        let cond = out.fold(Op::Ge, vec![lo, edge]);
+        let arm = out.leaf(Op::Const(v, v));
+        acc = out.fold(Op::Sel, vec![cond, arm, acc]);
+    }
+    acc
+}
+
+/// Entry `j + c` of `table`, if the entries `j..=j + c` are contiguous: the
+/// entry a lane whose low end is in entry `j` reaches as its `c`-th.
+fn rel_entry(table: &[(i32, i32)], j: usize, c: usize) -> Option<(i32, i32)> {
+    if j + c >= table.len() {
+        return None;
+    }
+    (j..j + c).all(|i| table[i].1 as i64 + 1 == table[i + 1].0 as i64).then(|| table[j + c])
 }
 
 /// A static range as sorted, disjoint pieces (raw 16.16, inclusive).
@@ -1902,8 +2245,31 @@ pub fn pieces_of(
         }
         // A fragment lies within its operand.
         Op::Split(_) | Op::SplitInt(_) | Op::SplitTab(_) | Op::Frag(_) | Op::IntFrag(_) => rec(memo, 0),
-        Op::Lo => rec(memo, 0).map(|a| vec![(a[0].0, a[0].0)]),
-        Op::Hi => rec(memo, 0).map(|a| vec![(a[a.len() - 1].1, a[a.len() - 1].1)]),
+        // A lane's bucket: the entries the operand reaches.
+        Op::SplitKeyTab(d) => {
+            let a = rec(memo, 0)?;
+            normalize_pieces(
+                g.fork_table(d)
+                    .iter()
+                    .filter(|e| a.iter().any(|p| e.0 as i64 <= p.1 && e.1 as i64 >= p.0))
+                    .map(|e| (e.0 as i64, e.1 as i64))
+                    .collect(),
+            )
+        }
+        // A lane's end, over the lanes (see `eval`'s `Lo`): anywhere in the
+        // operand's pieces, but a span's operand and a literal's own end.
+        Op::Lo | Op::Hi => {
+            let low = matches!(op, Op::Lo);
+            let arg = g.get(args[0]).clone();
+            match arg.op {
+                Op::Span => pieces_of(g, seeds, memo, arg.args[if low { 0 } else { 1 }]),
+                Op::Const(l, h) => {
+                    let v = if low { l } else { h } as i64;
+                    Some(vec![(v, v)])
+                }
+                _ => rec(memo, 0),
+            }
+        }
         _ => None,
     };
     memo.insert(n, r.clone());

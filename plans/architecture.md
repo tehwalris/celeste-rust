@@ -116,3 +116,25 @@ The rebuild replaced the old search (`run.rs`/`sweep*.rs`, deleted) with
    parallel path).
 5. **A new-path widening-soundness check** - `Widencheck` validated the old
    forward's widening; the new path widens in `MarkFilter`. Add an equivalent.
+6. **One file per (shape, cell), the dispatch key packed inside**
+   (Philippe, 2026-09-15). The checkpoint layout - one file per (shape,
+   worker piece), rows sorted by (cell, row key) - mixes what every step
+   already partitions (the sink's queues, the door's shards, the dispatch)
+   and splits it again at run time: speed keys interleave within a cell, a
+   bucketed chunk runs as one kernel call per short run of one key with a
+   cold dedup cache (room (1,0) bucketed level 0 at f46: 9.4 s per frame
+   against 0.7 s exact, 4.6M flushes of 5 rows avg). The layout wanted:
+   - a FILE per (shape, cell): shape fixes the column layout, and the cell
+     is the spatial locality the wave order and the backward's per-cell
+     reads exploit;
+   - inside it, one BLOCK per dispatch key (the speed buckets, the dash
+     class, mid-dash the dash constants; one block at exact levels), each
+     in row-key order, with a key -> range index in the header - nothing
+     sorted by key inside a block, nothing regrouped at run time;
+   - units are (shape, cell, key) blocks (or 16k-lane chunks of one), and
+     the block names its kernel.
+   Not a pack of (shape, cell) files: combining shapes is the annoying part
+   and cells are the locality. The per-shape layout exists because one
+   file per cell-uniform block was an inode blow-up (~17k files per frame
+   on tmpfs): count (shape, cell) files and keys per file per frame on a
+   real tree before building it.

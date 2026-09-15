@@ -287,6 +287,9 @@ pub struct Slot {
     /// The queue's key while live (`ForwardSink::queue`).
     pub outcome: u64,
     pub cell: u32,
+    /// The rows' speed key (the bucket dispatch): a queue holds rows of
+    /// one key, so a piece is runs of one key.
+    pub dkey: Option<crate::trace::kernel::SpeedKey>,
     pub live: bool,
     pub touched: bool,
     skeleton: Rt2,
@@ -332,6 +335,7 @@ impl Slot {
             shape: skeleton.shape_hash,
             outcome: 0,
             cell: 0,
+            dkey: None,
             live: false,
             touched: false,
             skeleton,
@@ -707,13 +711,13 @@ pub struct ForwardSink<'a> {
     pub slots: Vec<Slot>,
     /// (outcome id, cell) -> live queue. The outcome id is the emitter's:
     /// a kernel's template address, the reference engine's shape hash.
-    index: rustc_hash::FxHashMap<(u64, u32), u32>,
+    index: rustc_hash::FxHashMap<(u64, u32, Option<crate::trace::kernel::SpeedKey>), u32>,
     /// Flushed, empty queues per outcome id, keeping their columns.
     spare: rustc_hash::FxHashMap<u64, Vec<u32>>,
     /// The second-chance hand over `slots`.
     clock: usize,
     /// The run cache: rows arrive in runs of one (outcome, cell).
-    last: ((u64, u32), u32),
+    last: ((u64, u32, Option<crate::trace::kernel::SpeedKey>), u32),
     door: Option<&'a crate::search::door::Door>,
     filter: Option<&'a MarkFilter<'a>>,
     /// The ids of the block being run, per lane (set by the worker before
@@ -780,7 +784,7 @@ pub struct ForwardSink<'a> {
     hit_base: usize,
 }
 
-const NO_QUEUE: ((u64, u32), u32) = ((u64::MAX, u32::MAX), u32::MAX);
+const NO_QUEUE: ((u64, u32, Option<crate::trace::kernel::SpeedKey>), u32) = ((u64::MAX, u32::MAX, None), u32::MAX);
 
 impl<'a> ForwardSink<'a> {
     fn empty(edges_on: bool) -> Self {
@@ -966,11 +970,11 @@ impl<'a> ForwardSink<'a> {
     /// The live queue for `(outcome, cell)`, created over the skeleton
     /// `init` returns (or a spare of the outcome) on first use, evicting
     /// the least recently touched queue when the pool is full.
-    pub fn queue(&mut self, outcome: u64, cell: u32, init: impl FnOnce() -> Rt2) -> usize {
-        if self.last.0 == (outcome, cell) {
+    pub fn queue(&mut self, outcome: u64, cell: u32, dkey: Option<crate::trace::kernel::SpeedKey>, init: impl FnOnce() -> Rt2) -> usize {
+        if self.last.0 == (outcome, cell, dkey) {
             return self.last.1 as usize;
         }
-        let q = match self.index.get(&(outcome, cell)) {
+        let q = match self.index.get(&(outcome, cell, dkey)) {
             Some(&q) => q,
             None => {
                 if self.index.len() >= POOL_QUEUES {
@@ -986,13 +990,14 @@ impl<'a> ForwardSink<'a> {
                 let s = &mut self.slots[q as usize];
                 s.outcome = outcome;
                 s.cell = cell;
+                s.dkey = dkey;
                 s.live = true;
                 s.touched = false;
-                self.index.insert((outcome, cell), q);
+                self.index.insert((outcome, cell, dkey), q);
                 q
             }
         };
-        self.last = ((outcome, cell), q);
+        self.last = ((outcome, cell, dkey), q);
         q as usize
     }
 
@@ -1165,7 +1170,7 @@ impl<'a> ForwardSink<'a> {
         }
         slot.live = false;
         slot.touched = false;
-        self.index.remove(&(slot.outcome, slot.cell));
+        self.index.remove(&(slot.outcome, slot.cell, slot.dkey));
         self.spare.entry(slot.outcome).or_default().push(q as u32);
         if self.last.1 == q as u32 {
             self.last = NO_QUEUE;
@@ -1224,7 +1229,8 @@ impl<'a> ForwardSink<'a> {
     pub fn emit_row(&mut self, row: &Rt2, cell: u32) -> Result<()> {
         debug_assert_eq!(row.width, 1);
         debug_assert_eq!(row.row_keys.len(), 1, "an emitted row carries its key");
-        let q = self.queue(row.shape_hash, cell, || {
+        let dkey = crate::compiled::asm_kernel::speed_key_of_row(row, 0);
+        let q = self.queue(row.shape_hash, cell, dkey, || {
             // The skeleton from the row itself: numeric and boolean cells
             // vary (typed, empty), the rest is uniform - which every row
             // of a shape agrees on, the shape hash being the structure.

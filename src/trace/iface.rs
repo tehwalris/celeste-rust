@@ -267,6 +267,15 @@ pub fn symbolize(
             (None, Conc::Num(v)) => (Conc::Num(v), Value::Num(cell)),
             (None, Conc::Bool(v)) => (Conc::Bool(v), Value::Bool(cell)),
         };
+        // The cell's kind, recorded on the graph for every later pass.
+        d.graph.set_cell_kind(
+            i as u32,
+            match (&c, ival.contains(p)) {
+                (_, true) => crate::transpile::graph::CellKind::Ival,
+                (Conc::Num(_), _) => crate::transpile::graph::CellKind::Num,
+                (Conc::Bool(_), _) => crate::transpile::graph::CellKind::Bool,
+            },
+        );
         init.push(c);
         set(st, p, new)?;
     }

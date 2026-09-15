@@ -25,6 +25,36 @@ fn main() -> Result<()> {
                         .context("--spec-probe SHAPE index")?,
                 );
             }
+            // --key-build: build the level-0 bucketed kernel set as the
+            // search does, with the per-phase build accounting.
+            "--key-build" => {
+                print!("{}", celeste_rust::trace::kernel::key_build(std::path::Path::new("."))?);
+                return Ok(());
+            }
+            // --key-census [N [FILE]]: the key fixpoint on its own; lower
+            // the first N nodes; write the node set to FILE.
+            "--key-census" => {
+                let lower: usize = args.next().map(|s| s.parse().context("--key-census N")).transpose()?.unwrap_or(0);
+                let dump = args.next().map(std::path::PathBuf::from);
+                let report = celeste_rust::trace::kernel::key_census(std::path::Path::new("."), lower, dump.as_deref())?;
+                print!("{}", report);
+                return Ok(());
+            }
+            // --key-probe FILE SEL: trace and lower the nodes of a
+            // --key-census node set at line indices SEL (comma-separated),
+            // with the body breakdown.
+            "--key-probe" => {
+                let dump = std::path::PathBuf::from(args.next().ok_or_else(|| anyhow!("--key-probe FILE SEL"))?);
+                let sel: Vec<usize> = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--key-probe FILE SEL"))?
+                    .split(',')
+                    .map(|s| s.trim().parse().context("--key-probe SEL index"))
+                    .collect::<Result<_>>()?;
+                let report = celeste_rust::trace::kernel::key_probe(std::path::Path::new("."), &dump, &sel)?;
+                print!("{}", report);
+                return Ok(());
+            }
             "--bucket-probe" => {
                 let idx: usize = args
                     .next()

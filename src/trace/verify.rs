@@ -92,6 +92,13 @@ pub struct Frame {
     /// a split lives at fork level 1 or deeper, and a body emitted at
     /// depth 0 silently drops every one of them.
     pub forks: u8,
+    /// The forks' arities and table-fork ranges AS TRACED (`Graph::
+    /// fork_ways` / `fork_table` at the end of this frame). The arena
+    /// outlives the frame and a later frame's forks overwrite them, so a
+    /// frame carries its own and `emit::bind` installs them in the bound
+    /// graph.
+    pub fork_ways: Vec<u8>,
+    pub fork_tables: Vec<Vec<(i32, i32)>>,
     pub outs: Vec<FrameOut>,
     /// The canonical cell each `Iface` slot names in the state the frame
     /// STARTS in - the engine's numbering for `Op::Cell(i)`.
@@ -186,6 +193,11 @@ pub fn trace_frame<'a>(
     bounds: &[(Path, (i32, i32))],
 ) -> Result<Frame> {
     let mut st = st;
+    // Key overrides are per FRAME too: a shape's representative is an
+    // OUTPUT state of an earlier trace and still carries that trace's
+    // overrides, whose key nodes name ITS forks - inherited, the kernel
+    // hashed a stale key (2026-09-15).
+    st.key_override.clear();
     // Fork choices are per FRAME, like the six buttons above.
     it.d.forks = 0;
     it.d.graph.reset_forks();
@@ -281,12 +293,18 @@ pub fn trace_frame<'a>(
         let ok = it.d.graph.fold(crate::transpile::graph::Op::And, vec![s.ok, pin_ok]);
         let (fields, ubool) = out_fields(&s, &it.d)?;
         // A widened slot no output holds (the outcome destroyed its
-        // object: a death) has no key to override.
+        // object: a death) has no key to override. Matched by PATH: two
+        // fields holding the same (hash-consed) node are still two fields.
         let keys: Vec<(usize, NodeId)> = s
             .key_override
             .iter()
-            .filter_map(|(held, key)| fields.iter().position(|(_, n, _)| n == held).map(|i| (i, *key)))
+            .filter_map(|(held, key)| fields.iter().position(|(p, _, _)| p == held).map(|i| (i, *key)))
             .collect();
+        anyhow::ensure!(
+            keys.iter().enumerate().all(|(k, (i, _))| keys[..k].iter().all(|(j, _)| j != i)),
+            "field {} has more than one key override",
+            keys.iter().find(|(i, _)| keys.iter().filter(|(j, _)| j == i).count() > 1).map(|(i, _)| super::iface::show(&fields[*i].0)).unwrap_or_default()
+        );
         // The engine's numbering for THIS outcome's shape. Fields and
         // dead cells are resolved together: they share one cell space,
         // so a collision between the two halves is exactly as wrong as
@@ -313,7 +331,9 @@ pub fn trace_frame<'a>(
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         eprintln!("[build] trace_frame {widen:?}: {} forks at the end, {} outcomes, {} pins", it.d.forks, outs.len(), pin.len());
     }
-    Ok(Frame { iface, forks: it.d.forks, outs, in_cells, in_rt2 })
+    let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
+    let fork_tables: Vec<Vec<(i32, i32)>> = (0..it.d.forks).map(|d| it.d.graph.fork_table(d).to_vec()).collect();
+    Ok(Frame { iface, forks: it.d.forks, fork_ways, fork_tables, outs, in_cells, in_rt2 })
 }
 
 /// The player is the object with a `djump` field. Naming it by
@@ -1177,9 +1197,7 @@ mod tests {
                 show_key(key)
             );
             match super::super::emit::bind(f, &g, true)
-                .and_then(|b| super::super::emit::lower_frame(
-                    &b.graph, &b.outcomes, room.clone(), b.forks, Default::default(),
-                ))
+                .and_then(|b| super::super::emit::lower_frame(&b, room.clone(), Default::default()))
             {
                 Ok(l) => {
                     variants = l.bodies;

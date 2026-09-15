@@ -195,11 +195,20 @@ pub trait Domain {
         (v.clone(), self.boolean(true))
     }
 
-    /// A fork at a TABLE of ranges (`Op::SplitTab`): fragment `c` is the
-    /// value clipped to `ranges[c]`, valid where the value reaches it.
+    /// A RELATIVE fork at a TABLE of ranges (`Op::SplitTab`) with `arity`
+    /// fragments: fragment `c` is the value clipped to the `c`-th entry
+    /// from the one its low end lies in, valid where the value reaches it.
     /// The default is the identity (an exact value is in one range).
-    fn fork_table(&mut self, v: &Self::Num, _ranges: &[(i32, i32)]) -> (Self::Num, Self::Bool) {
+    fn fork_table(&mut self, v: &Self::Num, _ranges: &[(i32, i32)], _arity: u8) -> (Self::Num, Self::Bool) {
         (v.clone(), self.boolean(true))
+    }
+
+    /// The arity of the fork `__split_by_flr` takes on `v`: `move_ways`,
+    /// or where the trace knows `v`'s static range (a kernel specialized
+    /// on its speed key) the most grid cells one piece of it crosses -
+    /// a lane's interval lies within one piece, and `SplitOk` checks it.
+    fn flr_ways(&mut self, _v: &Self::Num) -> u8 {
+        self.move_ways()
     }
 
     /// The premise a fork is taken under: this lane's interval spans at
@@ -360,10 +369,6 @@ pub struct Symbolic {
     range_memo: std::collections::HashMap<NodeId, Option<Pieces>>,
     /// Comparisons `compare` decided from ranges this frame (a probe stat).
     pub range_folds: u64,
-    /// The speed bucket edges per axis (raw, sorted) when the boundary
-    /// snap is to fork at a TABLE of buckets (`widen::widen_spd`) rather
-    /// than the uniform grid. Set by the bucket probe.
-    pub spd_edges: Option<[Vec<i32>; 2]>,
 }
 
 pub use crate::transpile::graph::Pieces;
@@ -578,7 +583,7 @@ impl Domain for Symbolic {
             let r = match node.op {
                 Op::Cell(c) => ival.contains(&c),
                 Op::Const(lo, hi) => lo != hi,
-                Op::Split(_) | Op::SplitTab(_) => true,
+                Op::Split(_) | Op::SplitTab(_) | Op::SplitKeyTab(_) => true,
                 // An exact whole number per configuration.
                 Op::SplitInt(_) | Op::Lo | Op::Hi => false,
                 // Unconditionally, like a non-degenerate `Const`: a
@@ -657,10 +662,25 @@ impl Domain for Symbolic {
         self.graph.fold(Op::SplitOk(ways), vec![*v])
     }
 
-    fn fork_table(&mut self, v: &NodeId, ranges: &[(i32, i32)]) -> (NodeId, NodeId) {
+    fn flr_ways(&mut self, v: &NodeId) -> u8 {
+        // Only a trace with seeded ranges knows a static range: an
+        // unspecialized trace keeps the fixed arity (and its gates).
+        if self.ranges.is_empty() {
+            return self.move_ways();
+        }
+        match self.range_of(*v) {
+            Some(ps) => {
+                let sh = 16 - self.graph.fork_bits() as u32;
+                ps.iter().map(|p| (p.1 >> sh) - (p.0 >> sh) + 1).max().unwrap_or(1).clamp(1, crate::transpile::graph::MAX_WAYS as i64) as u8
+            }
+            None => self.move_ways(),
+        }
+    }
+
+    fn fork_table(&mut self, v: &NodeId, ranges: &[(i32, i32)], arity: u8) -> (NodeId, NodeId) {
         let d = self.forks;
         self.forks += 1;
-        self.graph.set_fork_table(d, ranges.to_vec());
+        self.graph.set_fork_table(d, ranges.to_vec(), arity);
         (
             self.graph.fold(Op::SplitTab(d), vec![*v]),
             self.graph.fold(Op::SplitValidTab(d), vec![*v]),

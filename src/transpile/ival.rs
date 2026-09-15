@@ -29,7 +29,7 @@
 //! buckets were led by `Gt(Const(0), Abs(..))` and `Le(Const(0),
 //! Abs(..))`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::Result;
 
@@ -52,34 +52,6 @@ pub struct Stats {
 
 /// Which cells hold BOOLEANS, by where they are used.
 ///
-/// The evaluator needs a kind per input to give it a top, and the graph
-/// does not carry one: `Op::Cell(i)` is just a leaf. Use position - a
-/// cell under `Not`, under either side of `And`/`Or`, or in a `Sel`'s
-/// condition is a boolean - and default to number. A cell used in both
-/// positions would be a boundary bug, and shows up here as an evaluator
-/// type error rather than as a wrong answer.
-fn bool_cells(g: &Graph) -> HashSet<u32> {
-    let mut out = HashSet::new();
-    let mark = |g: &Graph, id: NodeId, out: &mut HashSet<u32>| {
-        if let Op::Cell(c) = g.get(id).op {
-            out.insert(c);
-        }
-    };
-    for id in 0..g.len() {
-        let node = g.get(id as NodeId);
-        match node.op {
-            Op::Not | Op::Known => mark(g, node.args[0], &mut out),
-            Op::And | Op::Or => {
-                mark(g, node.args[0], &mut out);
-                mark(g, node.args[1], &mut out);
-            }
-            Op::Sel => mark(g, node.args[0], &mut out),
-            _ => {}
-        }
-    }
-    out
-}
-
 /// Every node the interval evaluator can pin down, replaced by that
 /// constant, and the graph rebuilt over the nodes `roots` reach.
 ///
@@ -91,8 +63,8 @@ pub fn fold(g: &Graph, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph, 
 
 /// Every input cell at its weakest value - a bool cell unknown, a number
 /// cell the full range or, when `ranges` bounds it, that range.
+/// The kind is the graph's (`Graph::cell_kind`, recorded at `symbolize`).
 pub(crate) fn seed_cells(g: &Graph, ranges: &HashMap<u32, (i32, i32)>) -> HashMap<u32, Val> {
-    let bools = bool_cells(g);
     let full = Val::Num(Pico8NumInterval::new(
         Pico8Num::from_raw(i32::MIN),
         Pico8Num::from_raw(i32::MAX),
@@ -100,7 +72,7 @@ pub(crate) fn seed_cells(g: &Graph, ranges: &HashMap<u32, (i32, i32)>) -> HashMa
     let mut cells: HashMap<u32, Val> = HashMap::new();
     for id in 0..g.len() {
         if let Op::Cell(c) = g.get(id as NodeId).op {
-            let v = if bools.contains(&c) {
+            let v = if g.cell_kind(c) == super::graph::CellKind::Bool {
                 Val::Bool(None)
             } else if let Some((lo, hi)) = ranges.get(&c) {
                 Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(*lo), Pico8Num::from_raw(*hi)))

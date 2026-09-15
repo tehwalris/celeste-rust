@@ -22,9 +22,11 @@ pub(crate) struct Emit {
     pub(crate) fork_depth: usize,
     /// The member's value graph (plans/multi-output-fusion.md, P1').
     pub(crate) graph: Graph,
-    /// Run `bdd::simplify` on the SPECIALIZED arena before emitting. On
-    /// a TRACED graph it is the difference between 10,510 and 4,714
-    /// nodes.
+    /// Decide the boolean layer of the SPECIALIZED arena before emitting:
+    /// the interval fold, the local boolean simplification
+    /// (`bdd::simplify_local`), the interval fold again. On room (1,0)'s
+    /// exact-speed player shape the fused graph goes from 13,605 nodes to
+    /// 7,569 (2026-09-15).
     pub(crate) decide: bool,
     /// The map, when the caller has it. `Some` makes the interval pass
     /// decide collision tests instead of treating them as unknown.

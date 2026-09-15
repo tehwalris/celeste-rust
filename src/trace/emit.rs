@@ -125,8 +125,18 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
         roots.push(o.ok);
         roots.extend(o.keys.iter().map(|(_, nd)| *nd));
     }
-    let (graph, roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
+    let (mut graph, roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
         .map_err(|e| anyhow::anyhow!("{:#}\nwhere the roots are\n{}", e, root_legend(f)))?;
+    // The frame's own fork arities and tables (`Frame::fork_ways`).
+    graph.reset_forks();
+    for d in 0..f.forks {
+        if let Some(t) = f.fork_tables.get(d as usize).filter(|t| !t.is_empty()) {
+            let arity = f.fork_ways.get(d as usize).copied().ok_or_else(|| anyhow::anyhow!("table fork {d} has no recorded arity"))?;
+            graph.set_fork_table(d, t.clone(), arity);
+        } else if let Some(&w) = f.fork_ways.get(d as usize) {
+            graph.set_fork_ways(d, w);
+        }
+    }
 
     // Only the cells the graph actually READS.
     //
@@ -341,12 +351,11 @@ fn asm_fused_of(
 /// them together emits it once, because they are nodes in one graph and
 /// the emitter binds a node once.
 pub fn lower_frame(
-    graph: &Graph,
-    outcomes: &[FrameOutcome],
+    bound: &Bound,
     room: Option<crate::transpile::graph::Room>,
-    forks: u8,
     ranges: std::collections::HashMap<u32, (i32, i32)>,
 ) -> Result<Lowered> {
+    let (graph, outcomes, forks) = (&bound.graph, &bound.outcomes, bound.forks);
     let mut e = Emit::bare(graph.clone());
     e.room = room;
     e.fork_depth = forks as usize;

@@ -401,6 +401,21 @@ pub fn walk<'a>(
     Ok(out)
 }
 
+/// The path of the player INSTANCE in `objects` (the entry whose `type`
+/// is the `player` global), if the state has one.
+pub fn player_path(st: &State<Symbolic>) -> Option<Path> {
+    let Value::Table(want) = iface::get(st, &[iface::key("player")])? else { return None };
+    let Value::Table(objects) = iface::get(st, &[iface::key("objects")])? else { return None };
+    let n = st.heap.tables[&objects].arr.len();
+    (0..n)
+        .map(|i| vec![iface::key("objects"), Step::Idx(i)])
+        .find(|base| {
+            let mut ty = base.clone();
+            ty.push(iface::key("type"));
+            iface::get(st, &ty) == Some(Value::Table(want))
+        })
+}
+
 /// The slots the boundary WIDENS to an interval: the player's
 /// `rem.x`, `rem.y`, `spd.x` and `spd.y` (and a live fruit's `off`/`y`).
 ///

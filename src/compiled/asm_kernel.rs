@@ -66,6 +66,35 @@ struct AsmBody {
     /// `None`: this outcome has no player object, or its `x`/`y` is not a
     /// plain number (every row is `NO_CELL`, as `block_cells` says).
     pos: Option<[PosSrc; 4]>,
+    /// Where this body's rows' speed key comes from (the bucket dispatch,
+    /// `dkey_of`). `None` at an exact-speed level or without a player.
+    dkey: Option<DKey>,
+}
+
+/// A body's rows' speed key: the dash constants per body; the buckets and
+/// the dash class per ROW - the speed's key roots (`SplitKeyTab`: which
+/// bucket a lane lands in is data, not a configuration) and `dash_time`.
+#[derive(Clone, Copy)]
+struct DKey {
+    dash: [i32; 4],
+    /// The output slots of the speed's key roots (low end first), x and y.
+    bucket_slots: [usize; 2],
+    dash_time_slot: usize,
+    /// The edge tables, looked up once (`spd_buckets::edges` locks).
+    edges: [&'static [i32]; 2],
+}
+
+impl AsmBody {
+    /// Row `i`'s speed key: its buckets and dash class read off the row,
+    /// the dash constants only where it is dashing.
+    #[inline]
+    fn dkey_of(&self, buf: &[u8], i: usize) -> Option<SpeedKey> {
+        let k = self.dkey?;
+        let word = |slot: usize| u32::from_le_bytes(buf[slot * 128 + i * 4..slot * 128 + i * 4 + 4].try_into().unwrap()) as i32;
+        let dashing = word(k.dash_time_slot) > 0;
+        let bucket = |axis: usize| k.edges[axis].partition_point(|&e| e <= word(k.bucket_slots[axis])) as u16;
+        Some(SpeedKey { bx: bucket(0), by: bucket(1), dashing, dash: if dashing { k.dash } else { [0; 4] } })
+    }
 }
 
 /// One coordinate of an emitted row, as a whole pixel: read from a numeric
@@ -168,6 +197,51 @@ impl AsmKernel {
     ) -> bool {
         debug_assert_eq!(cell_in.len(), chunk.width, "one input cell per input row");
         debug_assert!(lanes.end <= chunk.width);
+        CALL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Within-call dedup (`ForwardSink::seen`, a `RowCache`): the fused
+        // graph's configurations re-emit the same row from neighbouring
+        // lanes ~8x over; the cache catches those (keyed by the row key,
+        // which is unique across outcomes) and the owner's door catches
+        // the rest. It lives in the sink because the flush writes each
+        // row's id back into it (the edges).
+        sink.seen.clear();
+        let mut lo = lanes.start;
+        let mut idx = [0usize; 16];
+        while lo < lanes.end {
+            // A slice never crosses a 64-lane id group: its predecessor
+            // records are (the group's first id, a bit per lane). A bucket
+            // dispatch's run of one speed key starts at any lane, and a
+            // 16-lane slice from lane 60 recorded lanes 64..75 against
+            // group 0 - edges to the wrong states, a backward that lost
+            // exact marks (2026-09-15).
+            let n = 16.min(lanes.end - lo).min(64 - (lo & 63));
+            for (i, l) in idx.iter_mut().enumerate().take(n) {
+                *l = lo + i;
+            }
+            if !self.run_slice(chunk, cell_in, &idx[..n], u16::MAX, sink) {
+                return false;
+            }
+            lo += n;
+        }
+        sink.end_call();
+        true
+    }
+
+    /// Run ONE slice: the up-to-16 lanes `lanes` of `chunk` (all within one
+    /// 64-lane id group, in any order - the bucket dispatch sorts a group's
+    /// lanes by speed bucket), keeping only the lanes of `only`. What the
+    /// contiguous `run` above and the bucket dispatch share.
+    fn run_slice(
+        &self,
+        chunk: &Rt2,
+        cell_in: &[u32],
+        lanes: &[usize],
+        only: u16,
+        sink: &mut crate::frame::ForwardSink,
+    ) -> bool {
+        let n = lanes.len();
+        debug_assert!((1..=16).contains(&n));
+        assert!(lanes.iter().all(|&l| l & !63 == lanes[0] & !63), "a slice within one id group: lanes {lanes:?}");
         let start = crate::game_runner::start_room();
         // Consecutive emissions mostly repeat one (input cell, output cell)
         // pair; skip the set insert for those.
@@ -181,13 +255,6 @@ impl AsmKernel {
         // was a page fault per page.
         let mut sc = Scratch::take(self);
         let Scratch { inbuf, outbuf, .. } = &mut sc;
-        // Within-call dedup (`ForwardSink::seen`, a `RowCache`): the fused
-        // graph's configurations re-emit the same row from neighbouring
-        // lanes ~8x over; the cache catches those (keyed by the row key,
-        // which is unique across outcomes) and the owner's door catches
-        // the rest. It lives in the sink because the flush writes each
-        // row's id back into it (the edges).
-        sink.seen.clear();
         let body_cols = &self.body_cols;
         // Pure-kernel throughput floor (CELESTE_KERNEL_DRYRUN=1): pack the
         // inputs and call the kernel, then discard - no dedup, no
@@ -198,31 +265,26 @@ impl AsmKernel {
             *DR.get_or_init(|| std::env::var_os("CELESTE_KERNEL_DRYRUN").is_some())
         };
 
-        CALL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        CALL_STATS[1].fetch_add(lanes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        CALL_STATS[2].fetch_add(lanes.len().div_ceil(16) as u64 * 16, std::sync::atomic::Ordering::Relaxed);
+        CALL_STATS[1].fetch_add(only.count_ones().min(n as u32) as u64, std::sync::atomic::Ordering::Relaxed);
+        CALL_STATS[2].fetch_add(16, std::sync::atomic::Ordering::Relaxed);
         // The call's utilization tallies (folded into `CALL_STATS` once at
         // the end): (body, slice) pairs evaluated and those with any taken
         // lane, lane emissions before and after the dedup cache.
         let (mut n_bodies, mut n_bodies_taken, mut n_lanes, mut n_unique) = (0u64, 0u64, 0u64, 0u64);
-        let mut lo = lanes.start;
-        while lo < lanes.end {
-            let n = 16.min(lanes.end - lo);
-            // The slice's first input id (ids are consecutive within a
-            // block), and the lanes to skip (won rows: checkpointed, never
-            // expanded).
+        {
+            let lo = lanes[0];
             // The slice's predecessor GROUP: 64 consecutive input lanes
             // (ids are consecutive within a block, units start at
             // multiples of 64), so a state's producers from four adjacent
-            // slices share one record. `lane0` is this slice's first lane
-            // within the group.
+            // slices share one record. Lane `i` of the slice is lane
+            // `lanes[i] & 63` of the group.
             let slice_base: Option<u64> = sink.ids_in.map(|ids| ids[lo & !63]);
-            let lane0 = lo & 63;
+            let glane = |i: usize| lanes[i] & 63;
             let skip: u16 = match sink.skip_in {
-                Some(sk) => (0..n).filter(|&i| sk[lo + i]).fold(0u16, |m, i| m | (1 << i)),
+                Some(sk) => (0..n).filter(|&i| sk[lanes[i]]).fold(0u16, |m, i| m | (1 << i)),
                 None => 0,
             };
-            self.pack_input(&views, lo, n, inbuf);
+            self.pack_input(&views, lanes, inbuf);
             unsafe {
                 (self.loaded.func)(
                     inbuf.as_ptr(),
@@ -231,13 +293,13 @@ impl AsmKernel {
                 );
             }
             if dryrun {
-                lo += n;
-                continue;
+                sc.put_back();
+                return true;
             }
             if eval_check_on() {
-                self.eval_check(chunk, lo, n, outbuf);
+                self.eval_check(chunk, lanes, outbuf);
             }
-            let valid = ((1u32 << n) - 1) as u16;
+            let valid = (((1u32 << n) - 1) as u16) & only;
             if liveok_on() {
                 // Per-lane coverage census: OR of live&ok over all bodies
                 // (lane kept by SOME outcome), and OR of live&!ok (lane
@@ -257,7 +319,7 @@ impl AsmKernel {
                      declined={declined:04x} dropped(not-live)={dropped:04x} any_live={any_live:04x}"
                 );
                 if dropped != 0 {
-                    self.explain_dropped(chunk, lo + dropped.trailing_zeros() as usize, dropped.trailing_zeros() as usize, outbuf);
+                    self.explain_dropped(chunk, lanes[dropped.trailing_zeros() as usize], dropped.trailing_zeros() as usize, outbuf);
                 }
             }
             // DIAGNOSTIC (CELESTE_BODYSETS=1): which bodies take each lane -
@@ -292,7 +354,7 @@ impl AsmKernel {
                     while m != 0 {
                         let i = m.trailing_zeros() as usize;
                         m &= m - 1;
-                        let lane = lo + i;
+                        let lane = lanes[i];
                         let mut desc = format!("lane {lane}:");
                         for obj in chunk.player_objects(ids) {
                             for (name, f) in [("rem", ids.f_rem), ("spd", ids.f_spd)] {
@@ -314,7 +376,8 @@ impl AsmKernel {
                         "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} ok {:#06x}):\n{rows}",
                         chunk.shape_hash, body.outcome, declined, live, ok
                     );
-                    self.explain_ok(chunk, lo + declined.trailing_zeros() as usize, self.flat_roots[body.ok_root]);
+                    self.explain_ok(chunk, lanes[declined.trailing_zeros() as usize], self.flat_roots[body.ok_root]);
+                    sc.put_back();
                     return false;
                 }
                 let mut take = live & ok & valid & !skip;
@@ -351,7 +414,7 @@ impl AsmKernel {
                         n_unique += 1;
                         let cout = cell_out(body, outbuf, i, start);
                         if targets.contains(key, cout) {
-                            sink.hit(lo + i);
+                            sink.hit(lanes[i]);
                             hit_lanes |= 1 << i;
                         }
                     }
@@ -369,7 +432,7 @@ impl AsmKernel {
                         runtime2::mix64(part.0.wrapping_add(h1)),
                         runtime2::mix64(part.1.wrapping_add(h2)),
                     );
-                    let cin = cell_in[lo + i];
+                    let cin = cell_in[lanes[i]];
                     // EMISSION-TIME PROVENANCE (plans/buckets.md). The
                     // source of this row is lane `i` of this slice, and
                     // everything that needs to know is told right here:
@@ -398,7 +461,7 @@ impl AsmKernel {
                         let hull = cols.lane_hull(outbuf, i);
                         match slice_base {
                             Some(b) if r & RowCache::ID_FLAG != 0 && hull.is_none() => {
-                                sink.direct_edge(r & !RowCache::ID_FLAG, b, lane0 + i);
+                                sink.direct_edge(r & !RowCache::ID_FLAG, b, glane(i));
                                 continue;
                             }
                             Some(_) if r & RowCache::ID_FLAG != 0 => {}
@@ -406,7 +469,7 @@ impl AsmKernel {
                             // The row was flushed (a stale ref, only if
                             // the cache lost the flush's write-back): push
                             // it again; the flush merges duplicates by key.
-                            Some(b) if !sink.mark_pred(r, b, lane0 + i) => {}
+                            Some(b) if !sink.mark_pred(r, b, glane(i)) => {}
                             Some(_) => {
                                 if let (Some(h), Some(s)) = (hull, cols.spd) {
                                     sink.hull_union_at(r, s[0].0, s[1].0, h);
@@ -426,11 +489,11 @@ impl AsmKernel {
                     // The queue for (shape, cell), over the shape's union
                     // skeleton: the run cache makes this one compare for a
                     // run of rows at one cell.
-                    let q = sink.queue(template.shape_hash, cout, || (*template.union).clone_block());
+                    let q = sink.queue(template.shape_hash, cout, body.dkey_of(outbuf, i), || (*template.union).clone_block());
                     cols.push_row(&mut sink.slots[q], outbuf, i, key, cout);
                     if let Some(b) = slice_base {
                         sink.slots[q].pred_base.push(b);
-                        sink.slots[q].pred_mask.push(1u64 << (lane0 + i));
+                        sink.slots[q].pred_mask.push(1u64 << (glane(i)));
                         sink.slots[q].last_extra.push(u32::MAX);
                         sink.seen.set_ref(key, sink.row_ref(q));
                     }
@@ -444,9 +507,7 @@ impl AsmKernel {
                     *e.entry(s).or_default() += 1;
                 }
             }
-            lo += n;
         }
-        sink.end_call();
         sc.put_back();
         for (i, n) in [n_bodies, n_bodies_taken, n_lanes, n_unique].into_iter().enumerate() {
             CALL_STATS[3 + i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -678,14 +739,15 @@ impl AsmKernel {
         }
     }
 
-    fn eval_check(&self, chunk: &Rt2, lo: usize, n: usize, outbuf: &[u8]) {
+    fn eval_check(&self, chunk: &Rt2, lanes: &[usize], outbuf: &[u8]) {
+        let n = lanes.len();
         use crate::transpile::graph::Val;
         static PRINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         for i in 0..n {
             // Build the per-lane input cells from the block columns.
             let mut cells: std::collections::HashMap<u32, Val> = Default::default();
             for &cell in &self.compiled.input_cells {
-                let v = match chunk.cols[cell as usize].at(lo + i) {
+                let v = match chunk.cols[cell as usize].at(lanes[i]) {
                     AV::Num(p) => Val::Num(crate::pico8_num::Pico8NumInterval::new(p, p)),
                     AV::Ival(a, b) => Val::Num(crate::pico8_num::Pico8NumInterval::new(a, b)),
                     AV::Bool(b) => Val::Bool(Some(b)),
@@ -698,7 +760,7 @@ impl AsmKernel {
                 Ok(v) => v,
                 Err(e) => {
                     if PRINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-                        eprintln!("[eval-check] lane {} eval err: {e:#}", lo + i);
+                        eprintln!("[eval-check] lane {} eval err: {e:#}", lanes[i]);
                     }
                     return;
                 }
@@ -724,7 +786,7 @@ impl AsmKernel {
                     if !agree && PRINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
                         eprintln!(
                             "[eval-check] lane {} cell {} root {}: ASM {:x?} vs EVAL {:x?}",
-                            lo + i,
+                            lanes[i],
                             f.cell,
                             f.root,
                             asm,
@@ -752,10 +814,11 @@ impl AsmKernel {
     /// lanes past `n` clamp to the last valid lane, so the assembly's
     /// per-lane call-outs (div/mget/...) never fault on garbage - the `take`
     /// mask discards those lanes anyway.
-    fn pack_input(&self, views: &[InputView], lo: usize, n: usize, buf: &mut [u8]) {
+    fn pack_input(&self, views: &[InputView], lanes: &[usize], buf: &mut [u8]) {
+        let n = lanes.len();
         for (view, &off) in views.iter().zip(&self.compiled.input_offsets) {
             let off = off as usize;
-            let lane = |l: usize| lo + l.min(n - 1);
+            let lane = |l: usize| lanes[l.min(n - 1)];
             match view {
                 InputView::Num(col) => {
                     for l in 0..16 {
@@ -1097,13 +1160,39 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
         }
         b.boundary(&super::boundary_ids());
     }
-    assert!(
-        b.width == acc.width
-            && b.shape_hash == acc.shape_hash
-            && b.structure == acc.structure
-            && b.row_keys == acc.row_keys,
+    // A queue holds rows from SEVERAL kernel calls (the call's dedup cache
+    // is per call; a bucketed chunk is one call per speed key), and the
+    // flush collapses equal keys - so the append step's DISTINCT keys must
+    // be the boundary's, duplicates allowed. Demanding no duplicates fired
+    // on the exact-speed forward that reproduces every pinned gate
+    // (width 56 vs 57, 2026-09-15).
+    let mut distinct = acc.row_keys.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let mut bkeys = b.row_keys.clone();
+    bkeys.sort_unstable();
+    if b.shape_hash == acc.shape_hash && b.structure == acc.structure && bkeys == distinct {
+        return;
+    }
+    // Say WHICH rows and cells: each block's first rows, their keys, and the
+    // cells whose values are not the same in every row of the append step's
+    // block (the fields that tell its rows apart).
+    let varying: Vec<usize> = (0..acc.cols.len())
+        .filter(|&c| matches!(acc.structure.get(c), Some(celeste_engine::runtime2::Cell2::Val)))
+        .filter(|&c| (1..acc.width).any(|i| acc.cols[c].at(i) != acc.cols[c].at(0)))
+        .collect();
+    let rows = |blk: &Rt2| -> String {
+        (0..blk.width.min(8))
+            .map(|i| {
+                let cells: Vec<String> = varying.iter().filter(|&&c| c < blk.cols.len()).map(|&c| format!("{c}={:?}", blk.cols[c].at(i))).collect();
+                format!("    row {i} key {:?}: {}", blk.row_keys.get(i), cells.join(" "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    panic!(
         "KERNEL KEY CHECK: shape {:#x}: the boundary disagrees with the append step \
-         (width {} vs {}, shape {:#x} vs {:#x}, structure {}, keys {})",
+         (width {} vs {}, shape {:#x} vs {:#x}, structure {}, keys {})\n  append step:\n{}\n  boundary:\n{}",
         acc.shape_hash,
         b.width,
         acc.width,
@@ -1111,6 +1200,8 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
         acc.shape_hash,
         if b.structure == acc.structure { "same" } else { "DIFFERENT" },
         if b.row_keys == acc.row_keys { "same" } else { "DIFFERENT" },
+        rows(&acc),
+        rows(&b),
     );
 }
 
@@ -1219,19 +1310,82 @@ fn read_field_av(f: &AsmField, buf: &[u8], i: usize) -> AV {
 /// The start room's assembled kernels, keyed by input shape hash, for one
 /// rem-precision mode.
 pub(crate) struct Registry {
-    by_shape: HashMap<u64, AsmKernel>,
+    /// One kernel per (input shape, speed key): the key is `None` at an
+    /// exact-speed level and for a shape without a player; at a bucketed
+    /// level every key the key fixpoint reached (`trace::kernel::
+    /// key_fixpoint`) has its kernel here, built up front, and a row with
+    /// a key that is not here is a coverage gap.
+    kernels: HashMap<(u64, Option<SpeedKey>), AsmKernel>,
     /// The rung-agnostic / exact sets go through `boundary_exact`; the
     /// level-0 set through `boundary`.
     exact_boundary: bool,
+    /// The grid width `2^w` of a bucketed level's edge tables.
+    w: Option<u8>,
+}
+
+use crate::trace::kernel::SpeedKey;
+
+/// The speed key of row `lane` of `rt2` at the current level: `None` at an
+/// exact-speed level or without a player (the reference path's rows).
+pub fn speed_key_of_row(rt2: &Rt2, lane: usize) -> Option<SpeedKey> {
+    match crate::interpreter::abstraction::spd_precision() {
+        crate::interpreter::abstraction::SpdPrecision::WidthLog2(w) => speed_keys(rt2, w).map(|k| k[lane]),
+        crate::interpreter::abstraction::SpdPrecision::Exact => None,
+    }
+}
+
+/// Per lane of `chunk`, what its kernel is specialized on; `None` for a
+/// shape without a player.
+fn speed_keys(chunk: &Rt2, w: u8) -> Option<Vec<SpeedKey>> {
+    let ids = crate::compiled::ids();
+    let hulls = chunk.speed_hulls(ids)?;
+    let obj = *chunk.player_objects(ids).first()?;
+    let num_col = |f: u32| -> Option<u32> { chunk.obj_field_cell(obj, f) };
+    let xy = |f: u32| -> Option<(u32, u32)> {
+        let pc = chunk.obj_field_cell(obj, f)?;
+        let Col::U(AV::Ptr(sub)) = chunk.cols[pc as usize] else { return None };
+        Some((chunk.obj_field_cell(sub, ids.f_x)?, chunk.obj_field_cell(sub, ids.f_y)?))
+    };
+    let dt = num_col(ids.f_dash_time);
+    let (target, accel) = (xy(ids.f_dash_target), xy(ids.f_dash_accel));
+    let raw = |c: Option<u32>, lane: usize| -> i32 {
+        match c.map(|c| chunk.cols[c as usize].at(lane)) {
+            Some(AV::Num(n)) => n.as_raw_u32() as i32,
+            Some(other) => panic!("dispatch key cell holds {other:?}, not a number"),
+            None => 0,
+        }
+    };
+    Some(
+        (0..chunk.width)
+            .map(|lane| {
+                let h = hulls[lane];
+                let bx = celeste_core::spd_buckets::index(h[0], w, 0);
+                let by = celeste_core::spd_buckets::index(h[2], w, 1);
+                debug_assert!(
+                    celeste_core::spd_buckets::index(h[1], w, 0) == bx && celeste_core::spd_buckets::index(h[3], w, 1) == by,
+                    "lane {lane}: speed hull {h:?} straddles a bucket edge"
+                );
+                let dashing = raw(dt, lane) > 0;
+                let dash = if dashing {
+                    [raw(target.map(|t| t.0), lane), raw(target.map(|t| t.1), lane), raw(accel.map(|t| t.0), lane), raw(accel.map(|t| t.1), lane)]
+                } else {
+                    [0; 4]
+                };
+                SpeedKey { bx, by, dashing, dash }
+            })
+            .collect(),
+    )
 }
 
 impl Registry {
     pub fn len(&self) -> usize {
-        self.by_shape.len()
+        self.kernels.len()
     }
 
-    /// Run `chunk` on the matching shape's kernel; `false` if no kernel binds
-    /// (a miss) or the chunk declined.
+    /// Run `chunk` on the matching kernel; `false` if no kernel binds (a
+    /// miss) or the chunk declined. At a bucketed level the rows of a
+    /// block come in RUNS of one speed key (the queues are keyed by it),
+    /// and each run goes to its key's kernel as a contiguous range.
     pub fn run_chunk(
         &self,
         chunk: &Rt2,
@@ -1239,21 +1393,49 @@ impl Registry {
         lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
     ) -> bool {
-        match self.by_shape.get(&chunk.shape_hash) {
+        let Some(w) = self.w else {
+            return self.run_key(chunk, None, cell_in, lanes, sink);
+        };
+        let keys = speed_keys(chunk, w);
+        let key_of = |lane: usize| -> Option<SpeedKey> { keys.as_ref().map(|k| k[lane]) };
+        let mut lo = lanes.start;
+        while lo < lanes.end {
+            let k = key_of(lo);
+            let mut hi = lo + 1;
+            while hi < lanes.end && key_of(hi) == k {
+                hi += 1;
+            }
+            if !self.run_key(chunk, k, cell_in, lo..hi, sink) {
+                return false;
+            }
+            lo = hi;
+        }
+        true
+    }
+
+    fn run_key(
+        &self,
+        chunk: &Rt2,
+        key: Option<SpeedKey>,
+        cell_in: &[u32],
+        lanes: std::ops::Range<usize>,
+        sink: &mut crate::frame::ForwardSink,
+    ) -> bool {
+        match self.kernels.get(&(chunk.shape_hash, key)) {
             Some(k) => k.run(chunk, cell_in, lanes, sink),
             None => {
-                // Diagnose a coverage gap: which shape has no assembled
-                // kernel. Printed once per distinct missing shape.
-                static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+                // Diagnose a coverage gap: which (shape, key) has no
+                // assembled kernel. Printed once per distinct one.
+                static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u64, Option<SpeedKey>)>>> =
                     std::sync::OnceLock::new();
                 let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-                if seen.lock().unwrap().insert(chunk.shape_hash) {
+                if seen.lock().unwrap().insert((chunk.shape_hash, key)) {
                     eprintln!(
-                        "[asm] MISS: no kernel for shape {:#018x} ({} lanes); registry has {} shapes: {:?}",
+                        "[asm] MISS: no kernel for shape {:#018x} key {key:?} ({} lanes); registry has {} kernels over shapes {:?}",
                         chunk.shape_hash,
-                        chunk.width,
-                        self.by_shape.len(),
-                        self.by_shape.keys().map(|k| format!("{k:#018x}")).collect::<Vec<_>>(),
+                        lanes.len(),
+                        self.kernels.len(),
+                        self.kernels.keys().map(|k| format!("{:#018x}", k.0)).collect::<std::collections::BTreeSet<_>>(),
                     );
                 }
                 false
@@ -1266,6 +1448,11 @@ impl Registry {
     /// true` matches the Rust kernel so the assembled compute is the same
     /// fused graph. `exact_boundary` selects `boundary_exact` for the
     /// rung-agnostic / exact sets.
+    /// How many kernels the set has.
+    pub fn kernel_count(&self) -> usize {
+        self.kernels.len()
+    }
+
     pub fn build_for_start_room(
         root: &Path,
         opts: crate::trace::shapes::WalkOpts,
@@ -1274,21 +1461,19 @@ impl Registry {
         let t_trace = std::time::Instant::now();
         let refs = crate::trace::kernel::lattice_kernel_refs(root, opts)
             .context("retracing the start room for ASM kernels")?;
+        let w = match opts.spd {
+            crate::interpreter::abstraction::SpdPrecision::WidthLog2(w) => Some(w),
+            crate::interpreter::abstraction::SpdPrecision::Exact => None,
+        };
         let trace_s = t_trace.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
-        // Assemble every shape IN PARALLEL (`build_one_shape`: fuse ->
-        // specialize -> gcc -> dlopen, independent per shape). The traced
-        // graph is `Send + Sync` now (`Value::Str` is `Arc`), so workers
-        // share `&refs` and steal shapes off one atomic index; each gets a
-        // big stack because the fuse recurses. Insertion stays serial and
-        // ordered by shape index so the dup error is deterministic.
         let n_workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
             .min(refs.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let refs_ref = &refs;
-        let mut built: Vec<(usize, Result<(u64, AsmKernel)>)> = std::thread::scope(|scope| {
+        let mut built: Vec<(usize, Result<(u64, Option<SpeedKey>, AsmKernel)>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..n_workers)
                 .map(|_| {
                     let next = &next;
@@ -1302,7 +1487,8 @@ impl Registry {
                                 if si >= refs_ref.len() {
                                     break;
                                 }
-                                out.push((si, build_one_shape(&refs_ref[si], si)));
+                                let (key, r) = &refs_ref[si];
+                                out.push((si, build_one_shape(r, si, &format!("_{si}"), *key, w)));
                             }
                             out
                         })
@@ -1312,22 +1498,23 @@ impl Registry {
             handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         built.sort_by_key(|(si, _)| *si);
-        let mut by_shape = HashMap::new();
+        let mut kernels = HashMap::new();
         for (_si, res) in built {
-            let (shape, kernel) = res?;
-            if by_shape.insert(shape, kernel).is_some() {
-                anyhow::bail!("two start-room shapes hash to {shape:#x}");
+            let (shape, key, kernel) = res?;
+            if kernels.insert((shape, key), kernel).is_some() {
+                anyhow::bail!("two start-room frames hash to {shape:#x} with key {key:?}");
             }
         }
-        unify(&mut by_shape)?;
+        unify(&mut kernels)?;
         eprintln!(
-            "[asm build] {} shapes: trace {:.2}s, assemble {:.2}s ({} workers)",
-            by_shape.len(),
+            "[asm build] {} kernels: trace {:.2}s, assemble {:.2}s ({} workers)",
+            kernels.len(),
             trace_s,
             t_asm.elapsed().as_secs_f64(),
             n_workers,
         );
-        Ok(Registry { by_shape, exact_boundary })
+        eprintln!("[asm build]   phases, summed over workers and concurrent builds: {}", crate::transpile::lower::build_profile());
+        Ok(Registry { kernels, exact_boundary, w })
     }
 }
 
@@ -1365,7 +1552,7 @@ fn typed(kind: Kind) -> Col {
 /// columns (`BodyCols`). The reference engine's rule (every numeric and
 /// boolean cell typed) is the same idea without the registry to narrow
 /// it.
-fn unify(by_shape: &mut HashMap<u64, AsmKernel>) -> Result<()> {
+fn unify(by_shape: &mut HashMap<(u64, Option<SpeedKey>), AsmKernel>) -> Result<()> {
     let mut unions: HashMap<u64, Rt2> = HashMap::new();
     for kernel in by_shape.values() {
         for t in &kernel.acc_templates {
@@ -1403,23 +1590,17 @@ fn unify(by_shape: &mut HashMap<u64, AsmKernel>) -> Result<()> {
     let unions: HashMap<u64, std::sync::Arc<Rt2>> = unions.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
     let mut widened = 0usize;
     for kernel in by_shape.values_mut() {
-        for t in &mut kernel.acc_templates {
-            t.union = unions[&t.shape_hash].clone();
+        apply_union(kernel, &unions)?;
+        for t in &kernel.acc_templates {
             widened += t.union.cols.iter().zip(&t.own.cols).filter(|(u, o)| !matches!(u, Col::U(_)) && matches!(o, Col::U(_))).count();
         }
-        let mut body_cols = Vec::with_capacity(kernel.bodies.len());
-        for b in &kernel.bodies {
-            let t = &kernel.acc_templates[b.outcome];
-            let proto = crate::frame::Slot::new((*t.union).clone_block());
-            body_cols.push(BodyCols::of(b, &proto, &t.own)?);
-        }
-        kernel.body_cols = body_cols;
     }
     let templates: usize = by_shape.values().map(|k| k.acc_templates.len()).sum();
     let bodies: usize = by_shape.values().map(|k| k.bodies.len()).sum();
     let fused: usize = by_shape.values().map(|k| k.fused.len()).sum();
     let mut per_shape: Vec<(usize, u8, usize, u8)> =
         by_shape.values().map(|k| (k.bodies.len(), k.forks, k.fused.len(), k.fused.fork_bits())).collect();
+    per_shape.truncate(12);
     per_shape.sort_unstable_by_key(|s| std::cmp::Reverse(s.0));
     eprintln!(
         "[asm build] {} output shapes over {templates} outcome templates; {widened} template cells widened uniform -> typed by the union ({:.2} per template); {bodies} bodies, {fused} fused nodes over {} input shapes; per input shape (bodies, forks, fused nodes, fork grid bits): {:?}",
@@ -1431,15 +1612,39 @@ fn unify(by_shape: &mut HashMap<u64, AsmKernel>) -> Result<()> {
     Ok(())
 }
 
+/// Give `kernel`'s outcome templates the shape unions and map its bodies'
+/// roots onto the union columns.
+fn apply_union(kernel: &mut AsmKernel, unions: &HashMap<u64, std::sync::Arc<Rt2>>) -> Result<()> {
+    for t in &mut kernel.acc_templates {
+        t.union = unions
+            .get(&t.shape_hash)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no union skeleton for output shape {:#x}", t.shape_hash))?;
+    }
+    let mut body_cols = Vec::with_capacity(kernel.bodies.len());
+    for b in &kernel.bodies {
+        let t = &kernel.acc_templates[b.outcome];
+        let proto = crate::frame::Slot::new((*t.union).clone_block());
+        body_cols.push(BodyCols::of(b, &proto, &t.own)?);
+    }
+    kernel.body_cols = body_cols;
+    Ok(())
+}
+
 /// Assemble ONE start-room shape: fuse its graph, gcc + dlopen it, and map
 /// its bodies' roots onto flat slots. Independent per shape, so
-/// `build_for_start_room` runs these in parallel.
+/// `build_for_start_room` runs these in parallel. `tag` distinguishes the
+/// bucket-specialized kernels of one shape.
 fn build_one_shape(
     r: &crate::trace::kernel::Reference,
     si: usize,
-) -> Result<(u64, AsmKernel)> {
+    tag: &str,
+    key: Option<SpeedKey>,
+    w: Option<u8>,
+) -> Result<(u64, Option<SpeedKey>, AsmKernel)> {
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
+    let t_fuse = std::time::Instant::now();
     let (mut fused, bodies, mut flat_roots, reprs) =
         crate::trace::emit::asm_fused_from(&r.bound, &r.lowered.spec)
             .with_context(|| format!("fusing shape {si} (hash {shape:#x})"))?;
@@ -1458,14 +1663,24 @@ fn build_one_shape(
         let out_fields = &r.lowered.outs[b.outcome].fields;
         let (mut h1, mut h2) = (fused.leaf(Op::Word(0)), fused.leaf(Op::Word(0)));
         for j in 0..nfields {
-            if out_fields[j].konst_av.is_some() || out_fields[j].widen_uniform.is_some() {
+            let keyed = okeys.iter().position(|(fi, _)| *fi == j);
+            // A field keyed on another node (the speed under a bucket:
+            // stored tight, keyed on its bucket) is hashed HERE, per lane,
+            // even where its stored value is constant (`acc_template` leaves
+            // it out of `part`), and as an INTERVAL: the boundary keys it on
+            // `widen_to`'s `AV::Ival` bucket, and `av_code` tells a number
+            // from a point interval - a singleton bucket the fold pinned to
+            // `Const(t, t)` lowers as a number (25 of 262 exact marks lost,
+            // 2026-09-15). `add`, not `fold`: nothing collapses the span.
+            if keyed.is_none() && (out_fields[j].konst_av.is_some() || out_fields[j].widen_uniform.is_some()) {
                 continue;
             }
             let cell = outputs[j].0;
-            // A field keyed on another node (the speed under a bucket:
-            // stored tight, keyed on its bucket) hashes that node.
-            let key_root = match okeys.iter().position(|(fi, _)| *fi == j) {
-                Some(k) => b.roots[nfields + 2 + k],
+            let key_root = match keyed {
+                Some(k) => {
+                    let n = b.roots[nfields + 2 + k];
+                    fused.add(Op::Span, vec![n, n])
+                }
                 None => b.roots[j],
             };
             let m1 = fused.add(Op::CellMix(cell, 0), vec![key_root]);
@@ -1498,13 +1713,16 @@ fn build_one_shape(
         }
     }
     let flat_roots = distinct;
+    crate::transpile::lower::build_add(7, t_fuse);
+    let t_asm = std::time::Instant::now();
     let (compiled, loaded) = crate::transpile::asm::compile_and_load_reprs(
         &fused,
         &flat_roots,
-        &format!("k{shape:016x}"),
+        &format!("k{shape:016x}{tag}"),
         &reprs,
     )
     .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
+    crate::transpile::lower::build_add(8, t_asm);
 
     // Map each fused body's roots onto their SLOTS: the bodies' roots
     // concatenated in order, through `slot_of`.
@@ -1527,6 +1745,48 @@ fn build_one_shape(
                 kind: compiled.root_kinds[slot_of[off + j]],
             })
             .collect();
+        // The body's rows' speed key (the queue they land in): the bucket
+        // its speed KEY roots name (a constant per body: the table fork's
+        // fragment, or the one bucket) and its constant dash outputs.
+        let dkey = match (w, crate::trace::shapes::player_path(&r.frame.outs[b.outcome].st)) {
+            (Some(w), Some(pl)) => {
+                let paths = crate::trace::kernel::key_paths_of(&pl);
+                let out_fields = &r.frame.outs[b.outcome].fields;
+                let field_index = |p: &crate::trace::iface::Path| -> Result<usize> {
+                    out_fields.iter().position(|(q, _, _)| q == p).ok_or_else(|| anyhow::anyhow!("shape {si}: no output field {}", crate::trace::iface::show(p)))
+                };
+                let okeys = &r.bound.outcomes[b.outcome].keys;
+                // The speed's key root: the bucket, per lane (its low end at
+                // the slot's base, a number or an interval alike).
+                let bucket_slot = |axis: usize| -> Result<usize> {
+                    let fi = field_index(&paths[axis])?;
+                    let k = okeys.iter().position(|(j, _)| *j == fi).ok_or_else(|| anyhow::anyhow!("shape {si} body {bi}: spd axis {axis} has no key node"))?;
+                    Ok(slot_of[off + nfields + 2 + k])
+                };
+                // `dash_time` is read per ROW at append time (`dash_time_slot`):
+                // a mid-dash body's `dash_time - 1` ends the dash on some
+                // lanes and not others. The dash constants are per body,
+                // read only where the row is still dashing.
+                let dash_time_slot = slot_of[off + field_index(&paths[2])?];
+                let mut dash = [0i32; 4];
+                for (i, p) in paths[3..].iter().enumerate() {
+                    let root = b.roots[field_index(p)?];
+                    // Unchanged from the (unbounded) input on a lane that is
+                    // not dashing: only a constant where it is read.
+                    dash[i] = match fused.get(root).op {
+                        crate::transpile::graph::Op::Const(lo, _) => lo,
+                        _ => 0,
+                    };
+                }
+                Some(DKey {
+                    dash,
+                    bucket_slots: [bucket_slot(0)?, bucket_slot(1)?],
+                    dash_time_slot,
+                    edges: [celeste_core::spd_buckets::edges(w, 0), celeste_core::spd_buckets::edges(w, 1)],
+                })
+            }
+            _ => None,
+        };
         asm_bodies.push(AsmBody {
             outcome: b.outcome,
             splits: b.splits.clone(),
@@ -1535,6 +1795,7 @@ fn build_one_shape(
             live_root: slot_of[off + nfields + 1],
             key_roots: (slot_of[key_roots[bi].0], slot_of[key_roots[bi].1]),
             pos: None,
+            dkey,
         });
         off += b.roots.len();
     }
@@ -1548,6 +1809,7 @@ fn build_one_shape(
 
     Ok((
         shape,
+        key,
         AsmKernel {
             loaded,
             compiled,
@@ -1694,11 +1956,15 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
     // timers) are pushed per row but the boundary replaces them with the
     // widened uniform value, so they fold in at that value.
     let widen = &r.bound.outcomes[oi].widen;
+    // The cells keyed on another node (the speed's bucket) are hashed per
+    // lane by the kernel whatever their stored value (`build_one_shape`),
+    // never folded in here at that value.
+    let keyed: Vec<usize> = r.bound.outcomes[oi].keys.iter().map(|(fi, _)| r.bound.outcomes[oi].outputs[*fi].0 as usize).collect();
     let empty = t.build();
     let mut part1: u64 = shape_hash;
     let mut part2: u64 = 0xa076_1d64_78bd_642f ^ shape_hash;
     for (c, cell) in empty.structure.iter().enumerate() {
-        if !matches!(cell, celeste_engine::runtime2::Cell2::Val) {
+        if !matches!(cell, celeste_engine::runtime2::Cell2::Val) || keyed.contains(&c) {
             continue;
         }
         let uniform = match widen.iter().find(|(wc, _)| *wc as usize == c) {

@@ -133,6 +133,12 @@ pub struct BoundaryIds {
     pub f_x: u32,
     pub f_y: u32,
     pub f_dash_effect_time: u32,
+    /// The bucket dispatch's keys (`compiled::asm_kernel`): a kernel is
+    /// specialized on `dash_time` and, mid-dash, on the dash's target and
+    /// accel.
+    pub f_dash_time: u32,
+    pub f_dash_target: u32,
+    pub f_dash_accel: u32,
     /// Fruit-off widening ids (abstraction.rs:720): the `fruit` type
     /// global plus the `off`/`start` fields. `f_y` above doubles as the
     /// bob-band target.
@@ -869,12 +875,13 @@ impl Rt2 {
         // 2. spd widening (the spd ladder, `abstraction::spd_precision_for`):
         // floor-aligned buckets of 2^w raw units (`make_state_abstract_spd`).
         if let Some(w) = spd_width_log2 {
-            let width: i32 = 1i32 << w;
-            let sbucket = |n: P8| -> (P8, P8) {
-                let low = n.to_bits().cast_signed().div_euclid(width) * width;
-                (P8::from_raw(low), P8::from_raw(low + width - 1))
-            };
-            for c in self.spd_cells(ids) {
+            // The bucket is the edge table's (`celeste_core::spd_buckets`),
+            // per axis: the cells come as [x, y].
+            for (axis, c) in self.spd_cells(ids).into_iter().enumerate() {
+                let sbucket = |n: P8| -> (P8, P8) {
+                    let (lo, hi) = celeste_core::spd_buckets::bucket(n.to_bits().cast_signed(), w, axis);
+                    (P8::from_raw(lo), P8::from_raw(hi))
+                };
                 let widen = |v: AV| -> AV {
                     match v {
                         AV::Num(n) => {

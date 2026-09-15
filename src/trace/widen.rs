@@ -362,18 +362,27 @@ fn widen_spd(
             // speed, so the snap forks at exactly the bucket edges that
             // range crosses (`fork_table`), the row stores the fragment and
             // is keyed on its bucket - a per-configuration constant.
-            if let (Some(edges), Some(range)) = (d.spd_edges.clone(), d.range_of(old)) {
+            if let Some(range) = d.range_of(old) {
                 let ax = if f == "x" { 0 } else { 1 };
-                let sb = spd_table_node(d, old, &edges[ax], &range)?;
+                let sb = spd_table_node(d, old, celeste_core::spd_buckets::edges(w, ax), &range)?;
                 if let Some((valid, premise)) = sb.fork {
                     st.guard = d.and(&st.guard, &valid);
                     let ok = st.ok;
                     st.ok = d.and(&ok, &premise);
                 }
                 iface::set(st, &p, Value::Num(sb.tight))?;
-                st.key_override.push((sb.tight, sb.value));
+                st.key_override.push((p.clone(), sb.value));
                 continue;
             }
+            // A trace specialized on its input bucket must know its output
+            // range - a grid snap here would key on a grid bucket, not the
+            // table's. Only the unspecialized base trace (the union
+            // templates) snaps to the grid.
+            anyhow::ensure!(
+                d.ranges.is_empty(),
+                "{}: no static range for the output speed of a bucket-specialized trace",
+                iface::show(&p)
+            );
             let sb = spd_bucket_node(d, old, w)?;
             if let Some((valid, premise)) = sb.fork {
                 st.guard = d.and(&st.guard, &valid);
@@ -389,7 +398,7 @@ fn widen_spd(
             // the union, `door::Hull`), instead of the full bucket - which
             // fanned out at every threshold the bucket straddled.
             iface::set(st, &p, Value::Num(sb.tight))?;
-            st.key_override.push((sb.tight, sb.value));
+            st.key_override.push((p.clone(), sb.value));
         }
     }
     Ok(())
@@ -567,11 +576,21 @@ fn spd_table_node(
         let value = d.graph.leaf(Op::Const(lo, hi));
         return Ok(RemBucket { value, premise, fork: None, tight: old });
     }
-    let (frag, valid) = d.fork_table(&old, &crossed);
-    // The bucket of fragment `c`, as the same table fork applied to the
-    // whole range: `[lo_c, hi_c]` itself, a constant per configuration.
-    let full = d.graph.leaf(Op::Const(i32::MIN, i32::MAX));
-    let value = d.graph.fold(Op::SplitTab(d.forks - 1), vec![full]);
+    // The RELATIVE fork: its arity is the most buckets one lane can cross
+    // (a lane lies within one piece), not every bucket the range reaches;
+    // a button rep's own pieces refine it (`lower::specialize_frame`).
+    let arity = pieces
+        .iter()
+        .map(|p| crossed.iter().filter(|(lo, hi)| (*lo as i64) <= p.1 && (*hi as i64) >= p.0).count())
+        .max()
+        .unwrap_or(1);
+    let (frag, valid) = d.fork_table(&old, &crossed, arity as u8);
+    let fork = d.forks - 1;
+    // The row's bucket, per lane, and the premise that the fragments
+    // cover the lane.
+    let value = d.graph.fold(Op::SplitKeyTab(fork), vec![old]);
+    let covered = d.graph.fold(Op::SplitOkTab(fork), vec![old]);
+    let premise = d.graph.fold(Op::And, vec![premise, covered]);
     Ok(RemBucket { value, premise: d.boolean(true), fork: Some((valid, premise)), tight: frag })
 }
 

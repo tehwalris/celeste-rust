@@ -24,7 +24,6 @@ use super::verify::Frame;
 /// harness needs.
 pub struct Reference {
     pub frame: Frame,
-    pub graph: crate::transpile::graph::Graph,
     pub bound: Bound,
     pub lowered: Lowered,
     pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
@@ -47,7 +46,7 @@ pub struct Reference {
 /// doctrine that is a run that stops. Better to fail here, where the
 /// reason is in hand.
 pub fn room_kernels_in(root: &std::path::Path) -> Result<Vec<Reference>> {
-    lattice_kernel_refs(root, super::shapes::WalkOpts::LEVEL0)
+    Ok(lattice_kernel_refs(root, super::shapes::WalkOpts::LEVEL0)?.into_iter().map(|(_, r)| r).collect())
 }
 
 /// Restate a lowering failure with its `Cell(n)`s NAMED.
@@ -90,46 +89,1031 @@ fn name_cells(f: &super::verify::Frame, e: anyhow::Error) -> anyhow::Error {
 pub(crate) fn lattice_kernel_refs(
     root: &std::path::Path,
     opts: super::shapes::WalkOpts,
-) -> Result<Vec<Reference>> {
+) -> Result<Vec<(Option<SpeedKey>, Reference)>> {
     let mut lw = room_constant_lattice(root, opts)?;
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
+    // The frames to lower: per shape for an exact-speed set; per
+    // (shape, speed key) - the key fixpoint - for a bucketed one, whose
+    // kernels are specialized on the key (`key_frame`).
+    let frames: Vec<(Option<SpeedKey>, super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>)> = match opts.spd {
+        crate::interpreter::abstraction::SpdPrecision::WidthLog2(w) => {
+            key_fixpoint(&mut lw, w)?.into_iter().map(|n| (n.key, n.frame, n.bounds)).collect()
+        }
+        crate::interpreter::abstraction::SpdPrecision::Exact => {
+            std::mem::take(&mut lw.frames).into_values().map(|f| (None, f, Vec::new())).collect()
+        }
+    };
     // Bind + lower (specialize + decide, the expensive half of a kernel
-    // build) per shape, shapes in parallel.
-    let frames: Vec<_> = std::mem::take(&mut lw.frames).into_iter().collect();
-    let lw = &lw;
+    // build) per frame, frames in parallel.
+    let (graph, cart, cache) = (&lw.tracer.it.d.graph, lw.cart.clone(), lw.cache.clone());
     let room = &room;
-    let refs: Vec<Reference> = std::thread::scope(|scope| {
-        let handles: Vec<_> = frames
-            .into_iter()
-            .enumerate()
-            .map(|(i, (_k, f))| {
-                scope.spawn(move || -> Result<Reference> {
-                    let bound = super::emit::bind(&f, &lw.graph, opts.widen)
-                        .map_err(|e| anyhow::anyhow!("lattice shape {} bind: {:#}", i, e))?;
-                    let lowered = super::emit::lower_frame(
-                        &bound.graph,
-                        &bound.outcomes,
-                        Some(room.clone()),
-                        bound.forks,
-                        Default::default(),
-                    )
-                    .map_err(|e| anyhow::anyhow!("lattice shape {} lower: {:#}", i, name_cells(&f, e)))?;
-                    Ok(Reference {
-                        frame: f,
-                        graph: lw.graph.clone(),
-                        bound,
-                        lowered,
-                        cart: lw.cart.clone(),
-                        cache: lw.cache.clone(),
+    // A pool of one worker per core pulling frames off an atomic index
+    // (a thread per frame lowered 600 at once and hit the memory cap).
+    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(frames.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // Each frame is taken by exactly one worker (a `Frame` is not cloned).
+    let slots: Vec<std::sync::Mutex<Option<(Option<SpeedKey>, super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>)>>> =
+        frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
+    let slots = &slots;
+    let mut built: Vec<(usize, Result<(Option<SpeedKey>, Reference)>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..n_workers)
+            .map(|_| {
+                let (cart, cache, next) = (cart.clone(), cache.clone(), &next);
+                std::thread::Builder::new()
+                    .stack_size(128 * 1024 * 1024)
+                    .spawn_scoped(scope, move || {
+                        let mut out = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some((key, f, bounds)) = slots.get(i).and_then(|m| m.lock().unwrap().take()) else { break };
+                            let r = (|| -> Result<(Option<SpeedKey>, Reference)> {
+                                let t_phase = std::time::Instant::now();
+                                let bound = super::emit::bind(&f, graph, opts.widen)
+                                    .map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) bind: {:#}", i, key, e))?;
+                                crate::transpile::lower::build_add(2, t_phase);
+                                let lowered = super::emit::lower_frame(&bound, Some(room.clone()), engine_ranges(&f, &bounds))
+                                    .map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
+                                Ok((key, Reference { frame: f, bound, lowered, cart: cart.clone(), cache: cache.clone() }))
+                            })();
+                            out.push((i, r));
+                        }
+                        out
                     })
-                })
+                    .expect("spawn lattice frame worker")
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("lattice shape worker panicked")).collect::<Result<Vec<_>>>()
-    })?;
+        handles.into_iter().flat_map(|h| h.join().expect("lattice frame worker panicked")).collect()
+    });
+    built.sort_by_key(|(i, _)| *i);
+    let refs = built.into_iter().map(|(_, r)| r).collect::<Result<Vec<_>>>()?;
     Ok(refs)
 }
 
+/// What a bucket kernel is specialized on: the player's speed buckets,
+/// `dash_time`, and mid-dash the dash's target and accel (raw), which
+/// `appr` compares the speed against.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct SpeedKey {
+    pub bx: u16,
+    pub by: u16,
+    /// Mid-dash (`dash_time > 0`). The value itself is only decremented
+    /// and tested against 0, so one kernel covers 1..4 (Philippe).
+    pub dashing: bool,
+    /// `[target.x, target.y, accel.x, accel.y]`, all 0 when not mid-dash.
+    pub dash: [i32; 4],
+}
+
+/// The bounds `dash_time` is traced under per class: `> 0` folds either
+/// way. Half the 16.16 range on each side (Philippe): a value in it can
+/// neither wrap the decrement nor fall outside every kernel, and one
+/// beyond it declines loudly.
+pub const DASHING_RANGE: (i32, i32) = (1 << 16, i32::MAX / 2);
+pub const NOT_DASHING_RANGE: (i32, i32) = (i32::MIN / 2, 0);
+
+/// The player's dispatch fields, by path under `pl`: `spd.x`, `spd.y`,
+/// `dash_time`, `dash_target.x/y`, `dash_accel.x/y`.
+pub fn key_paths_of(pl: &super::iface::Path) -> [super::iface::Path; 7] {
+    key_paths(pl)
+}
+
+fn key_paths(pl: &super::iface::Path) -> [super::iface::Path; 7] {
+    let fld = |f: &[&str]| -> super::iface::Path {
+        let mut p = pl.clone();
+        for x in f {
+            p.push(super::iface::key(x));
+        }
+        p
+    };
+    [
+        fld(&["spd", "x"]),
+        fld(&["spd", "y"]),
+        fld(&["dash_time"]),
+        fld(&["dash_target", "x"]),
+        fld(&["dash_target", "y"]),
+        fld(&["dash_accel", "x"]),
+        fld(&["dash_accel", "y"]),
+    ]
+}
+
+/// THE BUCKET DISPATCH (2026-09-15): trace one shape specialized on the
+/// player's speed key at grid width `2^w` (`celeste_core::spd_buckets`) -
+/// or, for a shape without a player, unspecialized. The speed cells are
+/// bounded to the key's buckets and `rem` to its `[-0.5, 0.5)`
+/// (`Symbolic::ranges`: every comparison on them folds, and the boundary
+/// snap forks at exactly the edges the output can cross,
+/// `widen::spd_table_node`); `dash_time` and, mid-dash, the dash target
+/// and accel are pinned. Both are guarded in `ok`: a lane outside declines
+/// loudly. Returns the frame and the bounds it was traced under.
+pub fn key_frame(
+    lw: &mut LatticeWalk,
+    shape_hash: u64,
+    key: Option<SpeedKey>,
+    w: u8,
+    spd_range: [(i64, i64); 2],
+) -> Result<(super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>)> {
+    use super::iface::{self, Conc};
+    use super::{shapes, verify};
+    let skey = lw.by_hash.get(&shape_hash).cloned().ok_or_else(|| anyhow::anyhow!("no traced shape with hash {shape_hash:#x}"))?;
+    let st = lw.reps[&skey].clone();
+    let opts = lw.opts;
+    let roots = shapes::state_paths(&st)?;
+    let ival = if opts.ival { shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival()) } else { Vec::new() };
+    let mut pin: Vec<(iface::Path, Conc)> = lw.lattice[&skey]
+        .iter()
+        .filter(|(p, _)| roots.iter().any(|r| r == *p))
+        .map(|(p, c)| (p.clone(), *c))
+        .collect();
+    let mut bounds: Vec<(iface::Path, (i32, i32))> = Vec::new();
+    match (key, shapes::player_path(&st)) {
+        (Some(sk), Some(pl)) => {
+            use celeste_core::pico8_num::Pico8Num as P8;
+            let [px, py, pdt, ptx, pty, pax, pay] = key_paths(&pl);
+            // The range lattice's hull for this key, within its bucket.
+            for (axis, (p, b)) in [(px, sk.bx), (py, sk.by)].into_iter().enumerate() {
+                let (blo, bhi) = celeste_core::spd_buckets::range(b, w, axis);
+                let (lo, hi) = spd_range[axis];
+                anyhow::ensure!(
+                    lo >= blo as i64 && hi <= bhi as i64 && lo <= hi,
+                    "shape {shape_hash:#x} key {sk:?}: speed range {:?} outside bucket [{blo}, {bhi}] on axis {axis}",
+                    spd_range[axis]
+                );
+                bounds.push((p, (lo as i32, hi as i32)));
+            }
+            let mut rem = pl.clone();
+            rem.push(iface::key("rem"));
+            for ax in ["x", "y"] {
+                let mut p = rem.clone();
+                p.push(iface::key(ax));
+                bounds.push((p, (-0x8000, 0x7fff)));
+            }
+            let num = |v: i32| Conc::Num(P8::from_raw(v));
+            bounds.push((pdt, if sk.dashing { DASHING_RANGE } else { NOT_DASHING_RANGE }));
+            let mut pins = Vec::new();
+            if sk.dashing {
+                pins.push((ptx, num(sk.dash[0])));
+                pins.push((pty, num(sk.dash[1])));
+                pins.push((pax, num(sk.dash[2])));
+                pins.push((pay, num(sk.dash[3])));
+            }
+            for (p, c) in pins {
+                if roots.iter().any(|r| *r == p) && !pin.iter().any(|(q, _)| *q == p) {
+                    pin.push((p, c));
+                }
+            }
+            bounds.retain(|(p, _)| roots.iter().any(|r| r == p));
+        }
+        (None, None) => {}
+        (Some(_), None) => anyhow::bail!("shape {shape_hash:#x} has no player but a speed key"),
+        (None, Some(_)) => anyhow::bail!("shape {shape_hash:#x} has a player but no speed key"),
+    }
+    let t = &mut lw.tracer;
+    let f = verify::trace_frame(&mut t.it, t.reset, t.fr, st, &roots, &pin, &ival, opts.widen_mode(), &bounds)?;
+    Ok((f, bounds))
+}
+
+/// The speed key of a state whose dispatch fields are CONSTANTS (the
+/// start state), or `None` for a state without a player.
+fn concrete_key(st: &super::state::State<super::domain::Symbolic>, d: &super::domain::Symbolic, w: u8) -> Result<(Option<SpeedKey>, [(i64, i64); 2])> {
+    use super::domain::Domain;
+    use super::{iface, shapes};
+    let Some(pl) = shapes::player_path(st) else { return Ok((None, [(0, 0), (0, 0)])) };
+    let paths = key_paths(&pl);
+    let mut v = [0i32; 7];
+    for (i, p) in paths.iter().enumerate() {
+        let Some(super::heap::Value::Num(n)) = iface::get(st, p) else { anyhow::bail!("{}: not a number", iface::show(p)) };
+        let Some(c) = d.as_const(&n) else { anyhow::bail!("{}: not a constant in the start state", iface::show(p)) };
+        v[i] = c.as_raw_u32() as i32;
+    }
+    let dashing = v[2] > 0;
+    let dash = if dashing { [v[3], v[4], v[5], v[6]] } else { [0; 4] };
+    Ok((
+        Some(SpeedKey {
+            bx: celeste_core::spd_buckets::index(v[0], w, 0),
+            by: celeste_core::spd_buckets::index(v[1], w, 1),
+            dashing,
+            dash,
+        }),
+        [(v[0] as i64, v[0] as i64), (v[1] as i64, v[1] as i64)],
+    ))
+}
+
+/// The successor keys of one traced frame: per outcome, the outcome's
+/// shape and - if it has a player - every speed key its rows can carry,
+/// read per BUTTON CONFIGURATION (the buttons substituted, a graph
+/// rewrite, so the dash fields' values are the constants of that
+/// configuration rather than a product of per-field sets) from the
+/// pieces of the dispatch fields' output nodes: the buckets the speed's
+/// pieces touch, the constant `dash_time`, the constant target and accel
+/// where mid-dash.
+/// A successor: its shape, key, and the hull of the speeds that reach it,
+/// per axis (within the key's bucket) - the RANGE LATTICE: a kernel is
+/// traced with the join of these over every predecessor rather than the
+/// whole bucket, so a dash's exact speeds stay points instead of
+/// spreading bucket-wide across the four dash frames (15,000 keys, 2026-09-15).
+type Successor = (u64, Option<SpeedKey>, [(i64, i64); 2]);
+
+fn successor_keys(
+    d: &mut super::domain::Symbolic,
+    f: &super::verify::Frame,
+    w: u8,
+) -> Result<Vec<Successor>> {
+    use super::{iface, shapes};
+    use crate::transpile::graph::{Op, NodeId};
+    const NONE_RANGE: [(i64, i64); 2] = [(0, 0), (0, 0)];
+    let mut out: Vec<Successor> = Vec::new();
+    for o in &f.outs {
+        let shape = o.rt2.shape_hash_of();
+        let Some(pl) = shapes::player_path(&o.st) else {
+            out.push((shape, None, NONE_RANGE));
+            continue;
+        };
+        let paths = key_paths(&pl);
+        let mut nodes = [0 as NodeId; 7];
+        for (i, p) in paths.iter().enumerate() {
+            let Some(super::heap::Value::Num(n)) = iface::get(&o.st, p) else { anyhow::bail!("{}: not a number at the boundary", iface::show(p)) };
+            nodes[i] = n;
+        }
+        // The cone of the seven, per button configuration.
+        let mut need = vec![false; d.graph.len()];
+        let mut stack: Vec<NodeId> = nodes.to_vec();
+        while let Some(n) = stack.pop() {
+            if need[n as usize] {
+                continue;
+            }
+            need[n as usize] = true;
+            stack.extend(d.graph.get(n).args.iter().copied());
+        }
+        // Copy the cone ONCE: the 64 per-button passes below then walk it,
+        // not the shared arena every trace grows (reading successors went
+        // from 19 to 45 ms per node over room (1,0)'s fixpoint, the arena
+        // from 42k to 253k nodes, 2026-09-15).
+        let mut cone = d.graph.like();
+        let mut cmap: Vec<NodeId> = vec![NodeId::MAX; d.graph.len()];
+        for id in 0..d.graph.len() {
+            if !need[id] {
+                continue;
+            }
+            let nd = d.graph.get(id as NodeId);
+            let args: Vec<NodeId> = nd.args.iter().map(|a| cmap[*a as usize]).collect();
+            cmap[id] = cone.add(nd.op.clone(), args);
+        }
+        let cnodes: [NodeId; 7] = std::array::from_fn(|i| cmap[nodes[i] as usize]);
+        let seeds_by_node: Vec<(NodeId, (i64, i64))> =
+            d.ranges.iter().filter(|(n, _)| need[**n as usize]).map(|(n, r)| (cmap[*n as usize], *r)).collect();
+        let mut seen: std::collections::BTreeSet<[NodeId; 7]> = Default::default();
+        // Per button configuration, and within it per assignment of the
+        // conditions the fields select on (`djump > 0` decides both
+        // `dash_time` and the target: read jointly, or the target's set
+        // would include the unbounded old value under `dash_time = 4`).
+        let mut cases: Vec<(crate::transpile::graph::Graph, [NodeId; 7], std::collections::HashMap<NodeId, (i64, i64)>)> = Vec::new();
+        for m in 0u8..64 {
+            let mut probe = cone.like();
+            let map = cone.specialize_subset_into(m, None, None, None, &mut probe);
+            let sig: [NodeId; 7] = std::array::from_fn(|i| map[cnodes[i] as usize]);
+            if !seen.insert(sig) {
+                continue;
+            }
+            let seeds: std::collections::HashMap<NodeId, (i64, i64)> = seeds_by_node.iter().map(|(n, r)| (map[*n as usize], *r)).collect();
+            // The cone of the seven fields.
+            let mut pneed = vec![false; probe.len()];
+            let mut stack: Vec<NodeId> = sig.to_vec();
+            while let Some(n) = stack.pop() {
+                if pneed[n as usize] {
+                    continue;
+                }
+                pneed[n as usize] = true;
+                stack.extend(probe.get(n).args.iter().copied());
+            }
+            // Read the dash constants JOINTLY with `dash_time`. Phase 1:
+            // the paths of `dash_time`'s select tree (dash pressed, `djump
+            // > 0`, mid-dash), each fixing the conditions on its path.
+            // Phase 2: within a path, the selects the target and accel
+            // still depend on (`flip.x` for a no-direction dash), innermost
+            // first (ids are topological), so the outer `sign(..) > 0`
+            // folds once the inner speed is fixed. A comparison whose
+            // operands have static pieces is decided from them rather than
+            // split. The speeds' own conditions (on ground, on ice, the
+            // clamp) are left to the bucket product - splitting on every
+            // collision test in their cones ran to 65,536 cases
+            // (2026-09-15).
+            type Case = (crate::transpile::graph::Graph, [NodeId; 7], std::collections::HashMap<NodeId, (i64, i64)>);
+            const MAX_CASES_PER_REP: usize = 4096;
+            let cone_of = |g: &crate::transpile::graph::Graph, roots: &[NodeId]| -> Vec<bool> {
+                let mut v = vec![false; g.len()];
+                let mut stack: Vec<NodeId> = roots.to_vec();
+                while let Some(n) = stack.pop() {
+                    if v[n as usize] {
+                        continue;
+                    }
+                    v[n as usize] = true;
+                    stack.extend(g.get(n).args.iter().copied());
+                }
+                v
+            };
+            // The innermost undecided select cond in `cone`, or None.
+            let next_cond = |g: &crate::transpile::graph::Graph, cone: &[bool]| -> Option<NodeId> {
+                let mut best: Option<NodeId> = None;
+                for (n, &in_cone) in cone.iter().enumerate() {
+                    if !in_cone {
+                        continue;
+                    }
+                    let nd = g.get(n as NodeId);
+                    if matches!(nd.op, Op::Sel) && !matches!(g.get(nd.args[0]).op, Op::ConstBool(_)) {
+                        best = Some(n as NodeId);
+                        break;
+                    }
+                }
+                best.map(|n| g.get(n).args[0])
+            };
+            // A condition decided by the pieces of its operands.
+            let decide = |g: &crate::transpile::graph::Graph, seeds: &std::collections::HashMap<NodeId, (i64, i64)>, c: NodeId| -> Option<bool> {
+                let nd = g.get(c);
+                let mut memo = std::collections::HashMap::new();
+                let one = |op: &Op, x: (i64, i64), y: (i64, i64)| -> Option<bool> {
+                    match op {
+                        Op::Lt => if x.1 < y.0 { Some(true) } else if x.0 >= y.1 { Some(false) } else { None },
+                        Op::Le => if x.1 <= y.0 { Some(true) } else if x.0 > y.1 { Some(false) } else { None },
+                        Op::Gt => if x.0 > y.1 { Some(true) } else if x.1 <= y.0 { Some(false) } else { None },
+                        Op::Ge => if x.0 >= y.1 { Some(true) } else if x.1 < y.0 { Some(false) } else { None },
+                        Op::Eq => if x.0 == x.1 && y.0 == y.1 && x.0 == y.0 { Some(true) } else if x.1 < y.0 || y.1 < x.0 { Some(false) } else { None },
+                        _ => None,
+                    }
+                };
+                match nd.op {
+                    Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => {
+                        let xs = crate::transpile::graph::pieces_of(g, seeds, &mut memo, nd.args[0])?;
+                        let ys = crate::transpile::graph::pieces_of(g, seeds, &mut memo, nd.args[1])?;
+                        let mut r: Option<Option<bool>> = None;
+                        for x in &xs {
+                            for y in &ys {
+                                let d = one(&nd.op, *x, *y);
+                                match r {
+                                    None => r = Some(d),
+                                    Some(p) if p == d => {}
+                                    _ => return None,
+                                }
+                            }
+                        }
+                        r.flatten()
+                    }
+                    _ => None,
+                }
+            };
+            let split = |case: &Case, c: NodeId, b: bool| -> Case {
+                let (g2, sig2, seeds2) = case;
+                let need2 = cone_of(g2, sig2);
+                let mut g3 = g2.like();
+                let m3 = g2.substitute_bools(&need2, &std::collections::HashMap::from([(c, b)]), &mut g3);
+                let sig3: [NodeId; 7] = std::array::from_fn(|i| m3[sig2[i] as usize]);
+                let seeds3: std::collections::HashMap<NodeId, (i64, i64)> =
+                    seeds2.iter().filter(|(n, _)| need2[**n as usize]).map(|(n, r)| (m3[*n as usize], *r)).collect();
+                (g3, sig3, seeds3)
+            };
+            // Each phase walks one field's select TREE - `dash_time`, then
+            // `spd.x`, then `spd.y` - splitting on the conditions of the
+            // selects the field is built from, each condition opaque
+            // (splitting INSIDE a condition, through `on_ground`'s
+            // collision tests, ran to thousands of cases per rep). Once
+            // the speeds are fixed the dash target and accel, which are
+            // computed from them, fold to constants.
+            let mut done: Vec<Case> = Vec::new();
+            for field in [2usize, 0, 1] {
+                let start: Vec<Case> = if field == 2 { vec![(probe.clone(), sig, seeds.clone())] } else { std::mem::take(&mut done) };
+                let mut todo = start;
+                while let Some(case) = todo.pop() {
+                    let nd = case.0.get(case.1[field]);
+                    let cond = match nd.op {
+                        Op::Sel if !matches!(case.0.get(nd.args[0]).op, Op::ConstBool(_)) => Some(nd.args[0]),
+                        _ => None,
+                    };
+                    let phase = field;
+                    match cond {
+                        None => done.push(case),
+                        Some(c) => match decide(&case.0, &case.2, c) {
+                            Some(b) => todo.push(split(&case, c, b)),
+                            None => {
+                                todo.push(split(&case, c, true));
+                                todo.push(split(&case, c, false));
+                            }
+                        },
+                    }
+                    anyhow::ensure!(done.len() + todo.len() <= MAX_CASES_PER_REP, "outcome {shape:#x}: over {MAX_CASES_PER_REP} select cases for the dispatch fields in one button configuration (phase {phase})");
+                }
+            }
+            // Mid-dash, the dash target and accel are read JOINTLY, as one
+            // constant each: split on the undecided selects in their cones,
+            // innermost first, until all four are single points. They are
+            // arithmetic over selects (`2*sign(spd.x)` with `spd.x` the
+            // no-direction dash's `flip.x and -1 or 1`), which the select
+            // trees above do not reach, and their pieces taken field by
+            // field multiplied into dashes no cart state makes (target
+            // (2, 0) with accel (1.5, 1.5): 12 dash sets for 8 directions,
+            // 2026-09-15). A case with no condition left and a field still
+            // not a point is reported by the reader below.
+            let mut todo = std::mem::take(&mut done);
+            while let Some(case) = todo.pop() {
+                let mut memo = std::collections::HashMap::new();
+                let dashing = crate::transpile::graph::pieces_of(&case.0, &case.2, &mut memo, case.1[2]).is_some_and(|p| p.iter().any(|q| q.1 > 0));
+                let one_point = |n: NodeId, memo: &mut std::collections::HashMap<NodeId, Option<crate::transpile::graph::Pieces>>| {
+                    crate::transpile::graph::pieces_of(&case.0, &case.2, memo, n).is_some_and(|p| p.len() == 1 && p[0].0 == p[0].1)
+                };
+                if !dashing || (3..7).all(|i| one_point(case.1[i], &mut memo)) {
+                    done.push(case);
+                    continue;
+                }
+                let cone = cone_of(&case.0, &case.1[3..7]);
+                match next_cond(&case.0, &cone) {
+                    None => done.push(case),
+                    Some(c) => match decide(&case.0, &case.2, c) {
+                        Some(b) => todo.push(split(&case, c, b)),
+                        None => {
+                            todo.push(split(&case, c, true));
+                            todo.push(split(&case, c, false));
+                        }
+                    },
+                }
+                anyhow::ensure!(done.len() + todo.len() <= MAX_CASES_PER_REP, "outcome {shape:#x}: over {MAX_CASES_PER_REP} select cases for the dash constants in one button configuration");
+            }
+            cases.extend(done);
+        }
+        if std::env::var_os("CELESTE_KEY_TRACE").is_some() {
+            eprintln!("[keytrace] {shape:#x}: {} cases", cases.len());
+        }
+        for (probe, sig, seeds) in &cases {
+            let mut memo = std::collections::HashMap::new();
+            let mut pieces = |n: NodeId| crate::transpile::graph::pieces_of(probe, seeds, &mut memo, n);
+            // The buckets the pieces touch, each with the hull of the
+            // pieces inside it.
+            let buckets = |axis: usize, ps: &[(i64, i64)]| -> Vec<(u16, (i64, i64))> {
+                let e = celeste_core::spd_buckets::edges(w, axis);
+                let mut bs = Vec::new();
+                for j in 0..=e.len() {
+                    let (lo, hi) = celeste_core::spd_buckets::range(j as u16, w, axis);
+                    let (lo, hi) = (lo as i64, hi as i64);
+                    let mut hull: Option<(i64, i64)> = None;
+                    for p in ps {
+                        if lo <= p.1 && hi >= p.0 {
+                            let (a, b) = (p.0.max(lo), p.1.min(hi));
+                            hull = Some(match hull {
+                                Some((x, y)) => (x.min(a), y.max(b)),
+                                None => (a, b),
+                            });
+                        }
+                    }
+                    if let Some(h) = hull {
+                        bs.push((j as u16, h));
+                    }
+                }
+                bs
+            };
+            let sx = pieces(sig[0]).ok_or_else(|| anyhow::anyhow!("outcome {shape:#x}: no static range for the output spd.x"))?;
+            let sy = pieces(sig[1]).ok_or_else(|| anyhow::anyhow!("outcome {shape:#x}: no static range for the output spd.y"))?;
+            let dts = pieces(sig[2]).ok_or_else(|| anyhow::anyhow!("outcome {shape:#x}: no static range for the output dash_time"))?;
+            let points = |ps: &[(i64, i64)], what: &str| -> Result<Vec<i32>> {
+                let mut v = Vec::new();
+                for (lo, hi) in ps {
+                    anyhow::ensure!(lo == hi, "outcome {shape:#x}: the output {what} is a range [{lo}, {hi}], not constants");
+                    v.push(*lo as i32);
+                }
+                Ok(v)
+            };
+            let (bxs, bys) = (buckets(0, &sx), buckets(1, &sy));
+            if std::env::var_os("CELESTE_KEY_TRACE").is_some() {
+                let show = |ps: &[(i64, i64)]| ps.iter().map(|(a, b)| if a == b { format!("{:.3}", *a as f64 / 65536.0) } else { format!("[{:.3},{:.3}]", *a as f64 / 65536.0, *b as f64 / 65536.0) }).collect::<Vec<_>>().join("|");
+                let mut fields = vec![show(&sx), show(&sy), show(&dts)];
+                for i in 3..7 {
+                    fields.push(pieces(sig[i]).map(|p| show(&p)).unwrap_or_else(|| "?".into()));
+                }
+                eprintln!("[keytrace] {shape:#x} case: spd ({}, {}) dash_time {} target ({}, {}) accel ({}, {})", fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]);
+            }
+            // The classes the output `dash_time` can take: a piece above 0
+            // is mid-dash, a piece reaching 0 or below is not.
+            let mut classes: Vec<bool> = Vec::new();
+            if dts.iter().any(|p| p.1 > 0) {
+                classes.push(true);
+            }
+            if dts.iter().any(|p| p.0 <= 0) {
+                classes.push(false);
+            }
+            for dashing in classes {
+                let dashes: Vec<[i32; 4]> = if dashing {
+                    let mut vals: Vec<Vec<i32>> = Vec::new();
+                    for (i, what) in [(3, "dash_target.x"), (4, "dash_target.y"), (5, "dash_accel.x"), (6, "dash_accel.y")] {
+                        let ps = pieces(sig[i]).ok_or_else(|| anyhow::anyhow!("outcome {shape:#x}: no static range for the output {what}"))?;
+                        vals.push(points(&ps, what)?);
+                    }
+                    let mut combos = Vec::new();
+                    for &a in &vals[0] {
+                        for &b in &vals[1] {
+                            for &c in &vals[2] {
+                                for &e in &vals[3] {
+                                    combos.push([a, b, c, e]);
+                                }
+                            }
+                        }
+                    }
+                    combos
+                } else {
+                    vec![[0; 4]]
+                };
+                for &(bx, rx) in &bxs {
+                    for &(by, ry) in &bys {
+                        for &dash in &dashes {
+                            out.push((shape, Some(SpeedKey { bx, by, dashing, dash }), [rx, ry]));
+                        }
+                    }
+                }
+            }
+        }
+        let _ = Op::Cell;
+    }
+    // One entry per (shape, key): the hull of its ranges.
+    out.sort();
+    let mut merged: Vec<Successor> = Vec::new();
+    for s in out {
+        match merged.last_mut() {
+            Some(last) if (last.0, last.1) == (s.0, s.1) => {
+                for ax in 0..2 {
+                    last.2[ax] = (last.2[ax].0.min(s.2[ax].0), last.2[ax].1.max(s.2[ax].1));
+                }
+            }
+            _ => merged.push(s),
+        }
+    }
+    Ok(merged)
+}
+
+/// A key frame's bounds by ENGINE cell: what the lowering's decide step
+/// and fragment pruning read.
+fn engine_ranges(
+    f: &super::verify::Frame,
+    bounds: &[(super::iface::Path, (i32, i32))],
+) -> std::collections::HashMap<u32, (i32, i32)> {
+    bounds
+        .iter()
+        .filter_map(|(p, r)| f.iface.slots.iter().position(|q| q == p).map(|i| (f.in_cells[i], *r)))
+        .collect()
+}
+
+/// One node of the key fixpoint: a shape, its speed key (`None` for a
+/// shape without a player), the join of the speed ranges reaching it (raw,
+/// per axis, within the key's buckets), and its trace under that range.
+pub struct KeyNode {
+    pub shape: u64,
+    pub key: Option<SpeedKey>,
+    pub range: [(i64, i64); 2],
+    pub frame: super::verify::Frame,
+    pub bounds: Vec<(super::iface::Path, (i32, i32))>,
+}
+
+/// A node as one line of a `--key-census` node set: `shape bx by dashing
+/// target.x target.y accel.x accel.y xlo xhi ylo yhi` (raw), or `shape none`.
+fn node_line(n: &KeyNode) -> String {
+    match n.key {
+        None => format!("{:#x} none", n.shape),
+        Some(k) => format!(
+            "{:#x} {} {} {} {} {} {} {} {} {} {} {}",
+            n.shape, k.bx, k.by, k.dashing as u8, k.dash[0], k.dash[1], k.dash[2], k.dash[3], n.range[0].0, n.range[0].1, n.range[1].0, n.range[1].1
+        ),
+    }
+}
+
+fn parse_node_line(line: &str) -> Result<(u64, Option<SpeedKey>, [(i64, i64); 2])> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    let hex = f.first().and_then(|s| s.strip_prefix("0x")).ok_or_else(|| anyhow::anyhow!("bad node line {line:?}"))?;
+    let shape = u64::from_str_radix(hex, 16)?;
+    if f.get(1) == Some(&"none") {
+        return Ok((shape, None, [(0, 0), (0, 0)]));
+    }
+    anyhow::ensure!(f.len() == 12, "bad node line {line:?}");
+    let n = |i: usize| -> Result<i64> { Ok(f[i].parse::<i64>()?) };
+    let key = SpeedKey { bx: n(1)? as u16, by: n(2)? as u16, dashing: n(3)? != 0, dash: [n(4)? as i32, n(5)? as i32, n(6)? as i32, n(7)? as i32] };
+    Ok((shape, Some(key), [(n(8)?, n(9)?), (n(10)?, n(11)?)]))
+}
+
+/// The key fixpoint's output, for judging it: per shape and class the
+/// node count and how many ranges are single speeds; the dash constant
+/// sets; per axis the buckets reached; and the (x, y) bucket grid.
+fn census_report(nodes: &[KeyNode], w: u8) -> String {
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+    let px = |v: i64| v as f64 / 65536.0;
+    let bucket = |i: u16, axis: usize| -> String {
+        let (lo, hi) = celeste_core::spd_buckets::range(i, w, axis);
+        let end = |v: i32| if v == i32::MIN { "-inf".to_string() } else if v == i32::MAX { "inf".to_string() } else { format!("{:.4}", px(v as i64)) };
+        format!("[{}, {}]", end(lo), end(hi))
+    };
+    let mut out = String::new();
+    let mut per_shape: BTreeMap<u64, [usize; 3]> = BTreeMap::new();
+    let mut per_class: BTreeMap<bool, [usize; 3]> = BTreeMap::new();
+    let mut dashes: BTreeMap<[i32; 4], usize> = BTreeMap::new();
+    let mut axes: [BTreeMap<u16, ([usize; 2], (i64, i64))>; 2] = [BTreeMap::new(), BTreeMap::new()];
+    let mut grid: BTreeMap<(u16, u16), [bool; 2]> = BTreeMap::new();
+    for n in nodes {
+        let Some(k) = n.key else {
+            per_shape.entry(n.shape).or_default()[2] += 1;
+            continue;
+        };
+        per_shape.entry(n.shape).or_default()[k.dashing as usize] += 1;
+        let c = per_class.entry(k.dashing).or_default();
+        c[0] += 1;
+        c[1] += (n.range[0].0 == n.range[0].1) as usize;
+        c[2] += (n.range[1].0 == n.range[1].1) as usize;
+        if k.dashing {
+            *dashes.entry(k.dash).or_default() += 1;
+        }
+        for (axis, b) in [(0, k.bx), (1, k.by)] {
+            let e = axes[axis].entry(b).or_insert(([0, 0], n.range[axis]));
+            e.0[k.dashing as usize] += 1;
+            e.1 = (e.1 .0.min(n.range[axis].0), e.1 .1.max(n.range[axis].1));
+        }
+        grid.entry((k.bx, k.by)).or_default()[k.dashing as usize] = true;
+    }
+    for (s, [nd, d, none]) in &per_shape {
+        let _ = writeln!(out, "shape {s:#x}: {nd} not dashing, {d} dashing, {none} without a player");
+    }
+    for (dashing, [n, px_, py_]) in &per_class {
+        let _ = writeln!(out, "dashing {dashing}: {n} nodes; single-speed ranges: x {px_}, y {py_}");
+    }
+    for (d, n) in &dashes {
+        let _ = writeln!(out, "dash target ({:.4}, {:.4}) accel ({:.4}, {:.4}): {n} nodes", px(d[0] as i64), px(d[1] as i64), px(d[2] as i64), px(d[3] as i64));
+    }
+    for (axis, name) in [(0, "x"), (1, "y")] {
+        for (b, ([nd, d], hull)) in &axes[axis] {
+            let _ = writeln!(out, "{name} bucket {b:>2} {:<22} {nd:>3} not dashing {d:>3} dashing; ranges within [{:.4}, {:.4}]", bucket(*b, axis), px(hull.0), px(hull.1));
+        }
+    }
+    // The grid: columns x buckets, rows y buckets; `o` not dashing, `d`
+    // dashing, `*` both.
+    let xs: Vec<u16> = axes[0].keys().copied().collect();
+    let ys: Vec<u16> = axes[1].keys().copied().collect();
+    let _ = writeln!(out, "grid (columns: x buckets {}, rows: y buckets):", xs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" "));
+    for y in &ys {
+        let row: String = xs
+            .iter()
+            .map(|x| match grid.get(&(*x, *y)) {
+                None => '.',
+                Some([true, true]) => '*',
+                Some([true, false]) => 'o',
+                Some(_) => 'd',
+            })
+            .collect();
+        let _ = writeln!(out, "  y {y:>2} {:<22} {row}", bucket(*y, 1));
+    }
+    out
+}
+
+/// What a lowered kernel's bodies ARE, for finding why there are many:
+/// root slots against distinct root nodes and constants; per outcome the
+/// button reps, bodies per rep, bodies whose `ok` folded false, the forks
+/// whose fragments separate bodies (and the most fragments within one
+/// rep), which roots differ between the bodies of one rep, and the
+/// configurations of the largest rep.
+fn body_breakdown(
+    f: &super::verify::Frame,
+    bound: &Bound,
+    spec: &(crate::transpile::graph::Graph, Vec<crate::transpile::lower::SpecializedBody>),
+) -> String {
+    use crate::transpile::graph::Op;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Write as _;
+    let (sp, bodies) = spec;
+    let mut out = String::new();
+    let slots: usize = bodies.iter().map(|b| b.3.len()).sum();
+    let distinct: BTreeSet<u32> = bodies.iter().flat_map(|b| b.3.iter().copied()).collect();
+    let konst = |r: u32| matches!(sp.get(r).op, Op::Const(..) | Op::ConstBool(_));
+    let const_slots = bodies.iter().flat_map(|b| b.3.iter()).filter(|r| konst(**r)).count();
+    let _ = writeln!(
+        out,
+        "  {} bodies, {} fused nodes; {slots} root slots, {} distinct root nodes, {const_slots} slots hold constants",
+        bodies.len(),
+        sp.len(),
+        distinct.len()
+    );
+    let named = f.outs.len() == bound.outcomes.len();
+    for (oi, o) in bound.outcomes.iter().enumerate() {
+        let mine: Vec<&crate::transpile::lower::SpecializedBody> = bodies.iter().filter(|b| b.0 == oi).collect();
+        if mine.is_empty() {
+            let _ = writeln!(out, "  outcome {oi}: no bodies");
+            continue;
+        }
+        let nf = o.outputs.len();
+        let names: Vec<String> = if named && f.outs[oi].fields.len() == nf {
+            f.outs[oi].fields.iter().map(|(p, _, _)| super::iface::show(p)).collect()
+        } else {
+            (0..nf).map(|i| format!("field #{i}")).collect()
+        };
+        let root_name = |j: usize| -> String {
+            if j < nf {
+                names[j].clone()
+            } else if j == nf {
+                "ok".into()
+            } else if j == nf + 1 {
+                "live".into()
+            } else {
+                format!("key of {}", names.get(o.keys[j - nf - 2].0).cloned().unwrap_or_default())
+            }
+        };
+        let mut by_rep: BTreeMap<u8, Vec<&crate::transpile::lower::SpecializedBody>> = BTreeMap::new();
+        for b in &mine {
+            by_rep.entry(b.1).or_default().push(b);
+        }
+        let mut sizes: Vec<usize> = by_rep.values().map(|v| v.len()).collect();
+        sizes.sort_unstable();
+        let ok_false = mine.iter().filter(|b| matches!(sp.get(b.3[nf]).op, Op::ConstBool(false))).count();
+        let _ = writeln!(
+            out,
+            "  outcome {oi}: {} bodies over {} button reps (per rep min {} median {} max {}); {ok_false} with ok folded false; {} roots per body",
+            mine.len(),
+            by_rep.len(),
+            sizes[0],
+            sizes[sizes.len() / 2],
+            sizes[sizes.len() - 1],
+            mine[0].3.len()
+        );
+        for d in 0..bound.forks {
+            let vals: BTreeSet<u8> = mine.iter().map(|b| b.2[d as usize]).collect();
+            if vals.len() <= 1 {
+                continue;
+            }
+            let in_rep = by_rep.values().map(|v| v.iter().map(|b| b.2[d as usize]).collect::<BTreeSet<_>>().len()).max().unwrap_or(0);
+            let table = bound.graph.fork_table(d);
+            let kind = if table.is_empty() {
+                format!("move, {} ways", bound.graph.fork_ways(d))
+            } else {
+                format!(
+                    "table {}",
+                    table.iter().map(|(a, b)| format!("[{:.4},{:.4}]", *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>().join(" ")
+                )
+            };
+            let _ = writeln!(out, "    fork {d} ({kind}): fragments {vals:?} used, at most {in_rep} within one rep");
+        }
+        let nroots = mine[0].3.len();
+        let mut differ = vec![0usize; nroots];
+        let mut groups = 0usize;
+        for v in by_rep.values() {
+            if v.len() < 2 {
+                continue;
+            }
+            groups += 1;
+            for (j, dj) in differ.iter_mut().enumerate() {
+                if v.iter().any(|b| b.3[j] != v[0].3[j]) {
+                    *dj += 1;
+                }
+            }
+        }
+        let mut ranked: Vec<(usize, usize)> = differ.iter().copied().enumerate().filter(|(_, c)| *c > 0).collect();
+        ranked.sort_by_key(|(j, c)| (std::cmp::Reverse(*c), *j));
+        let _ = writeln!(
+            out,
+            "    roots differing between the bodies of one rep ({} of {nroots}, over {groups} reps with 2+ bodies): {}",
+            ranked.len(),
+            ranked.iter().take(30).map(|(j, c)| format!("{} ({c})", root_name(*j))).collect::<Vec<_>>().join(", ")
+        );
+        if let Some((m, v)) = by_rep.iter().max_by_key(|(_, v)| v.len()) {
+            let used: Vec<u8> = (0..bound.forks).filter(|d| v.iter().map(|b| b.2[*d as usize]).collect::<BTreeSet<_>>().len() > 1).collect();
+            let cfgs: Vec<String> = v.iter().take(40).map(|b| format!("{:?}", used.iter().map(|d| b.2[*d as usize]).collect::<Vec<_>>())).collect();
+            let _ = writeln!(out, "    largest rep {m}: {} bodies; configurations over forks {used:?}: {}", v.len(), cfgs.join(" "));
+        }
+    }
+    out
+}
+
+/// `bdd::census` of a lowered kernel's fused graph over all its bodies' roots.
+fn census_of(spec: &(crate::transpile::graph::Graph, Vec<crate::transpile::lower::SpecializedBody>)) -> String {
+    let roots: Vec<u32> = spec.1.iter().flat_map(|b| b.3.iter().copied()).collect();
+    crate::transpile::bdd::census(&spec.0, &roots)
+}
+
+/// `transpile --key-probe FILE SEL`: re-trace and lower the nodes of a
+/// `--key-census` node set at line indices SEL, each with its
+/// `body_breakdown`, after the exact-speed kernel of the same shape. The
+/// dev loop for a kernel's size: two shape lattices (~1 s) and one trace
+/// + lowering (~3 s) per node, not the fixpoint.
+pub fn key_probe(root: &std::path::Path, dump: &std::path::Path, sel: &[usize]) -> Result<String> {
+    use std::fmt::Write as _;
+    const W: u8 = 16;
+    let opts = super::shapes::WalkOpts::level0(
+        crate::interpreter::abstraction::SpdPrecision::WidthLog2(W),
+        crate::interpreter::abstraction::PosPrecision::EXACT,
+    );
+    let text = std::fs::read_to_string(dump).map_err(|e| anyhow::anyhow!("{}: {e}", dump.display()))?;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut lw = room_constant_lattice(root, opts)?;
+    let lwx = room_constant_lattice(root, super::shapes::WalkOpts::LEVEL0)?;
+    let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
+    let mut exact_done: std::collections::BTreeSet<u64> = Default::default();
+    let mut out = String::new();
+    for &i in sel {
+        let line = lines.get(i).ok_or_else(|| anyhow::anyhow!("node set has {} lines, no line {i}", lines.len()))?;
+        let (shape, key, range) = parse_node_line(line)?;
+        if exact_done.insert(shape) {
+            let skey = lwx.by_hash.get(&shape).ok_or_else(|| anyhow::anyhow!("the exact-speed lattice has no shape {shape:#x}"))?;
+            let f = &lwx.frames[skey];
+            let bound = super::emit::bind(f, &lwx.tracer.it.d.graph, lwx.opts.widen)?;
+            let t = std::time::Instant::now();
+            let lowered = super::emit::lower_frame(&bound, Some(room.clone()), Default::default())?;
+            writeln!(out, "=== exact-speed kernel of shape {shape:#x}: lower {:.2} s", t.elapsed().as_secs_f64())?;
+            out.push_str(&body_breakdown(f, &bound, &lowered.spec));
+            out.push_str(&census_of(&lowered.spec));
+        }
+        writeln!(out, "=== node {i}: {key:?}, range x [{:.4}, {:.4}] y [{:.4}, {:.4}]", range[0].0 as f64 / 65536.0, range[0].1 as f64 / 65536.0, range[1].0 as f64 / 65536.0, range[1].1 as f64 / 65536.0)?;
+        let t = std::time::Instant::now();
+        let (f, bounds) = key_frame(&mut lw, shape, key, W, range)?;
+        let t_trace = t.elapsed();
+        let bound = super::emit::bind(&f, &lw.tracer.it.d.graph, opts.widen)?;
+        let t = std::time::Instant::now();
+        let lowered = super::emit::lower_frame(&bound, Some(room.clone()), engine_ranges(&f, &bounds))?;
+        writeln!(out, "  trace {:.2} s, lower {:.2} s", t_trace.as_secs_f64(), t.elapsed().as_secs_f64())?;
+        out.push_str(&body_breakdown(&f, &bound, &lowered.spec));
+        out.push_str(&census_of(&lowered.spec));
+    }
+    Ok(out)
+}
+
+/// `transpile --key-build`: build the start room's level-0 bucketed kernel
+/// set exactly as the search does (`Registry::build_for_start_room`), with
+/// nothing around it - the benchmark for the build. The phase accounting
+/// prints from the build; this returns the set's size and wall time.
+pub fn key_build(root: &std::path::Path) -> Result<String> {
+    let opts = super::shapes::WalkOpts::level0(
+        crate::interpreter::abstraction::SpdPrecision::WidthLog2(16),
+        crate::interpreter::abstraction::PosPrecision::EXACT,
+    );
+    let t = std::time::Instant::now();
+    let reg = crate::compiled::asm_kernel::Registry::build_for_start_room(root, opts, false)?;
+    Ok(format!("level-0 bucketed set: {} kernels in {:.1} s\n", reg.kernel_count(), t.elapsed().as_secs_f64()))
+}
+
+/// `transpile --key-census [N [FILE]]`: the key fixpoint of the start
+/// room's level-0 bucketed set on its own - the census and timings, the
+/// node set written to FILE (the input of `--key-probe`), and (with `N`)
+/// the lowering of the first N nodes as a microbenchmark.
+pub fn key_census(root: &std::path::Path, lower: usize, dump: Option<&std::path::Path>) -> Result<String> {
+    use std::fmt::Write as _;
+    const W: u8 = 16;
+    let opts = super::shapes::WalkOpts::level0(
+        crate::interpreter::abstraction::SpdPrecision::WidthLog2(W),
+        crate::interpreter::abstraction::PosPrecision::EXACT,
+    );
+    let t = std::time::Instant::now();
+    let mut lw = room_constant_lattice(root, opts)?;
+    let t_lattice = t.elapsed();
+    let t = std::time::Instant::now();
+    let nodes = key_fixpoint(&mut lw, W)?;
+    let t_fix = t.elapsed();
+    let mut out = String::new();
+    writeln!(out, "shape lattice {:.1} s ({} shapes); key fixpoint {:.1} s ({} nodes)", t_lattice.as_secs_f64(), lw.by_hash.len(), t_fix.as_secs_f64(), nodes.len())?;
+    out.push_str(&census_report(&nodes, W));
+    if let Some(path) = dump {
+        let text: String = nodes.iter().map(|n| node_line(n) + "\n").collect();
+        std::fs::write(path, text)?;
+        writeln!(out, "node set: {} ({} lines; `--key-probe` indexes them from 0)", path.display(), nodes.len())?;
+    }
+    let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
+    let graph = &lw.tracer.it.d.graph;
+    for n in nodes.iter().take(lower) {
+        let (key, f) = (&n.key, &n.frame);
+        let t = std::time::Instant::now();
+        let bound = super::emit::bind(f, graph, opts.widen)?;
+        let t_bind = t.elapsed();
+        let t = std::time::Instant::now();
+        let lowered = super::emit::lower_frame(&bound, Some(room.clone()), engine_ranges(f, &n.bounds))?;
+        let t_lower = t.elapsed();
+        let t = std::time::Instant::now();
+        let (fused, _, roots, reprs) = super::emit::asm_fused_from(&bound, &lowered.spec)?;
+        let n = roots.len();
+        let (compiled, _loaded) = crate::transpile::asm::compile_and_load_reprs(&fused, &roots, &format!("kc{}", t_lower.as_nanos()), &reprs)?;
+        let t_asm = t.elapsed();
+        writeln!(
+            out,
+            "key {key:?}: bind {:.2} s, lower {:.2} s ({} bodies, {} fused nodes), assemble {:.2} s ({} roots, {} slots)",
+            t_bind.as_secs_f64(), t_lower.as_secs_f64(), lowered.bodies, lowered.spec.0.len(), t_asm.as_secs_f64(), n, compiled.n_roots
+        )?;
+    }
+    Ok(out)
+}
+
+/// THE KEY FIXPOINT: every (shape, speed key) a run at grid width `2^w`
+/// can reach, from the start state, each traced once under its key; the
+/// successors of a key are read off its trace (`successor_keys`), and a
+/// key not in the result is a coverage gap at runtime. The shape lattice
+/// (`room_constant_lattice`) supplies the shapes, their representative
+/// states and their constant pins.
+pub fn key_fixpoint(lw: &mut LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
+    let t = std::time::Instant::now();
+    let (mut t_trace, mut t_succ) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let start_shape = lw.frames[&lw.start_key].in_rt2.shape_hash_of();
+    let (start_key, start_range) = concrete_key(&lw.reps[&lw.start_key], &lw.tracer.it.d, w)?;
+    type Node = (u64, Option<SpeedKey>);
+    // Per node: the join of the speed ranges reaching it (within its
+    // bucket). A node is (re)traced when its range is new or grew; the
+    // last trace, under the final range, is the one lowered.
+    let mut ranges: std::collections::HashMap<Node, [(i64, i64); 2]> = Default::default();
+    let mut traced: std::collections::HashMap<Node, (super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>)> = Default::default();
+    let mut queued: std::collections::HashSet<Node> = Default::default();
+    let mut work: Vec<Node> = vec![(start_shape, start_key)];
+    ranges.insert((start_shape, start_key), start_range);
+    queued.insert((start_shape, start_key));
+    let (mut n_traces, mut n_retraces) = (0usize, 0usize);
+    // The last 50 traces' times, so growth over the fixpoint shows.
+    let (mut w_trace, mut w_succ) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    while let Some(node) = work.pop() {
+        queued.remove(&node);
+        if n_traces % 50 == 0 && n_traces > 0 {
+            eprintln!(
+                "[asm build] key fixpoint: {} traces ({} re-traces), {} nodes, {} pending, {:.0} s; last 50: {:.0} ms trace + {:.0} ms successors per node, arena {} nodes",
+                n_traces,
+                n_retraces,
+                ranges.len(),
+                work.len(),
+                t.elapsed().as_secs_f64(),
+                w_trace.as_secs_f64() * 1000.0 / 50.0,
+                w_succ.as_secs_f64() * 1000.0 / 50.0,
+                lw.tracer.it.d.graph.len()
+            );
+            (w_trace, w_succ) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        }
+        let (shape, key) = node;
+        let range = ranges[&node];
+        let t1 = std::time::Instant::now();
+        let (f, bounds) = key_frame(lw, shape, key, w, range)
+            .map_err(|e| anyhow::anyhow!("key fixpoint: shape {shape:#x} key {key:?}: {e:#}"))?;
+        t_trace += t1.elapsed();
+        w_trace += t1.elapsed();
+        n_traces += 1;
+        if traced.contains_key(&node) {
+            n_retraces += 1;
+        }
+        let t1 = std::time::Instant::now();
+        let succs = successor_keys(&mut lw.tracer.it.d, &f, w)?;
+        t_succ += t1.elapsed();
+        w_succ += t1.elapsed();
+        for (s_shape, s_key, s_range) in succs {
+            // An outcome shape the shape lattice has no frame for is one it
+            // excluded on purpose (left the room, or `ok` folds false):
+            // there is no kernel for it in any set.
+            if !lw.by_hash.contains_key(&s_shape) {
+                continue;
+            }
+            let succ = (s_shape, s_key);
+            let grew = match ranges.get_mut(&succ) {
+                None => {
+                    ranges.insert(succ, s_range);
+                    true
+                }
+                Some(r) => {
+                    let joined = [
+                        (r[0].0.min(s_range[0].0), r[0].1.max(s_range[0].1)),
+                        (r[1].0.min(s_range[1].0), r[1].1.max(s_range[1].1)),
+                    ];
+                    let g = joined != *r;
+                    *r = joined;
+                    g
+                }
+            };
+            if grew && queued.insert(succ) {
+                work.push(succ);
+            }
+        }
+        traced.insert(node, (f, bounds));
+    }
+    // The census of the node set: per `dash_time`, how many nodes and how
+    // many distinct bucket pairs (so a blow-up names its axis).
+    {
+        let mut per_dt: std::collections::BTreeMap<bool, (usize, std::collections::BTreeSet<(u16, u16)>, std::collections::BTreeSet<[i32; 4]>)> = Default::default();
+        for ((_, key), _) in &traced {
+            if let Some(k) = key {
+                let e = per_dt.entry(k.dashing).or_default();
+                e.0 += 1;
+                e.1.insert((k.bx, k.by));
+                e.2.insert(k.dash);
+            }
+        }
+        for (dt, (n, pairs, dashes)) in &per_dt {
+            eprintln!("[asm build]   dashing {dt}: {n} nodes, {} bucket pairs, {} dash constant sets", pairs.len(), dashes.len());
+        }
+        eprintln!("[asm build]   edges: x {} y {}", celeste_core::spd_buckets::edges(w, 0).len(), celeste_core::spd_buckets::edges(w, 1).len());
+    }
+    let mut out: Vec<KeyNode> = traced
+        .into_iter()
+        .map(|((shape, key), (frame, bounds))| KeyNode { shape, key, range: ranges[&(shape, key)], frame, bounds })
+        .collect();
+    out.sort_by_key(|n| (n.shape, n.key));
+    crate::transpile::lower::build_add_duration(0, t_trace);
+    crate::transpile::lower::build_add_duration(1, t_succ);
+    eprintln!(
+        "[asm build] key fixpoint: {} (shape, key) nodes, {} traces ({} re-traces), {:.1} s (tracing {:.1} s, reading successors {:.1} s), arena {} nodes",
+        out.len(),
+        n_traces,
+        n_retraces,
+        t.elapsed().as_secs_f64(),
+        t_trace.as_secs_f64(),
+        t_succ.as_secs_f64(),
+        lw.tracer.it.d.graph.len()
+    );
+    Ok(out)
+}
 
 #[cfg(test)]
 mod tests {
@@ -208,6 +1192,44 @@ mod tests {
         );
     }
 
+    /// A speed's bucket key is attached to the SPEED fields, by path. At
+    /// rest both speeds are the constant 0 - one hash-consed node with
+    /// every other field that is 0 - and matching the override by node
+    /// gave the key to whichever field came first: the row key check
+    /// failed and the synthetic gate lost exact marks (2026-09-15).
+    #[test]
+    fn a_speed_key_names_the_speed_fields() {
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
+            return;
+        }
+        let opts = crate::trace::shapes::WalkOpts::level0(
+            crate::interpreter::abstraction::SpdPrecision::WidthLog2(16),
+            crate::interpreter::abstraction::PosPrecision::EXACT,
+        );
+        let mut lw = super::room_constant_lattice(std::path::Path::new("."), opts).expect("lattice");
+        let skey = lw.reps.iter().find(|(_, st)| crate::trace::shapes::player_path(st).is_some()).map(|(k, _)| k.clone()).expect("a shape with a player");
+        let shape = lw.frames[&skey].in_rt2.shape_hash_of();
+        let rest = super::SpeedKey {
+            bx: celeste_core::spd_buckets::index(0, 16, 0),
+            by: celeste_core::spd_buckets::index(0, 16, 1),
+            dashing: false,
+            dash: [0; 4],
+        };
+        let (f, _) = super::key_frame(&mut lw, shape, Some(rest), 16, [(0, 0), (0, 0)]).expect("rest key frame");
+        let mut checked = 0;
+        for o in &f.outs {
+            let Some(pl) = crate::trace::shapes::player_path(&o.st) else { continue };
+            let want = super::key_paths(&pl);
+            let mut named: Vec<String> = o.keys.iter().map(|(i, _)| crate::trace::iface::show(&o.fields[*i].0)).collect();
+            named.sort();
+            let mut expect = vec![crate::trace::iface::show(&want[0]), crate::trace::iface::show(&want[1])];
+            expect.sort();
+            assert_eq!(named, expect, "the key overrides name the speed fields");
+            checked += 1;
+        }
+        assert!(checked > 0, "no outcome with a player");
+    }
+
 
 }
 
@@ -219,33 +1241,6 @@ mod tests {
 // nodes, forks and their arities, bodies, loop bodies traced, comparisons
 // folded, merge premises left. Driven by `transpile --bucket-probe SHAPE`.
 // ---------------------------------------------------------------------------
-
-/// One speed axis's bucket edges (raw, sorted): the 1 px grid, the
-/// thresholds the cart compares the speed against, and singleton buckets
-/// (`t`, `t + 1`) at the equality tests' preimages.
-fn bucket_edges(axis: usize) -> Vec<i32> {
-    use celeste_core::pico8_num::Pico8Num as P8;
-    let raw = |s: &str| -> i32 { s.parse::<P8>().expect("literal").as_raw_u32() as i32 };
-    let mut es: std::collections::BTreeSet<i32> = Default::default();
-    for i in 1..=8 {
-        es.insert(i << 16);
-        es.insert(-(i << 16));
-    }
-    let (singles, plain): (Vec<&str>, Vec<&str>) = if axis == 0 {
-        (vec!["0", "0.05", "-0.05", "0.15", "-0.15", "0.4", "-0.4", "0.6", "-0.6"], vec!["1.5", "-1.5"])
-    } else {
-        (vec!["0", "-0.5"], vec!["0.15", "-0.15", "0.4", "1.5", "-1.5"])
-    };
-    for s in singles {
-        let t = raw(s);
-        es.insert(t);
-        es.insert(t + 1);
-    }
-    for s in plain {
-        es.insert(raw(s));
-    }
-    es.into_iter().collect()
-}
 
 /// The buckets of an edge list within `[-lim, lim]` raw: `(lo, hi)` inclusive.
 fn buckets_of(edges: &[i32], lim: i32) -> Vec<(i32, i32)> {
@@ -349,7 +1344,7 @@ fn probe_trace<'a>(
     static TAGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let build = || -> Result<(usize, usize, usize, usize)> {
         let b = super::emit::bind(&f, g, opts.widen)?;
-        let l = super::emit::lower_frame(&b.graph, &b.outcomes, Some(room.clone()), b.forks, ranges)?;
+        let l = super::emit::lower_frame(&b, Some(room.clone()), ranges)?;
         let (fused, _bodies, roots, reprs) = super::emit::asm_fused_from(&b, &l.spec)?;
         let tag = format!("bp{}", TAGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let (compiled, _loaded) = crate::transpile::asm::compile_and_load_reprs(&fused, &roots, &tag, &reprs)?;
@@ -368,7 +1363,6 @@ pub fn bucket_probe(root: &std::path::Path, shape_idx: usize) -> Result<String> 
     use super::interp::Interp;
     use super::iface::{self, Step};
     use super::verify::run_one;
-    use super::heap::Value;
     use super::{cart, shapes};
     use anyhow::{anyhow, bail};
     use celeste_core::pico8_num::Pico8Num as P8;
@@ -407,24 +1401,7 @@ pub fn bucket_probe(root: &std::path::Path, shape_idx: usize) -> Result<String> 
     let st = w.shapes[shape_idx].state.clone();
     let roots = shapes::state_paths(&st)?;
     let ival = shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival());
-    let players: Vec<Vec<Step>> = {
-        let mut out = Vec::new();
-        if let (Some(Value::Table(want)), Some(Value::Table(objects))) =
-            (iface::get(&st, &[iface::key("player")]), iface::get(&st, &[iface::key("objects")]))
-        {
-            let n = st.heap.tables[&objects].arr.len();
-            for i in 0..n {
-                let base = vec![iface::key("objects"), Step::Idx(i)];
-                let mut ty = base.clone();
-                ty.push(iface::key("type"));
-                if iface::get(&st, &ty) == Some(Value::Table(want)) {
-                    out.push(base);
-                }
-            }
-        }
-        out
-    };
-    let Some(pl) = players.first().cloned() else { bail!("shape {shape_idx} has no player") };
+    let Some(pl) = shapes::player_path(&st) else { bail!("shape {shape_idx} has no player") };
     let fld = |f: &[&str]| -> Vec<Step> {
         let mut p = pl.clone();
         for x in f {
@@ -468,8 +1445,8 @@ pub fn bucket_probe(root: &std::path::Path, shape_idx: usize) -> Result<String> 
     writeln!(rep, "shape {shape_idx} of {} ({} objects): baseline (1 px buckets, grid fork)", w.shapes.len(), roots.iter().filter(|p| p.len() == 3 && p[0] == iface::key("objects")).map(|p| p[1].clone()).collect::<std::collections::BTreeSet<_>>().len())?;
     writeln!(rep, "  {}", line(&base))?;
 
-    let ex = bucket_edges(0);
-    let ey = bucket_edges(1);
+    let ex: Vec<i32> = celeste_core::spd_buckets::edges(16, 0).to_vec();
+    let ey: Vec<i32> = celeste_core::spd_buckets::edges(16, 1).to_vec();
     let lim = 2 << 16;
     let xs = buckets_of(&ex, lim);
     let yonly = std::env::var_os("CELESTE_BUCKET_YONLY").is_some();
@@ -485,7 +1462,6 @@ pub fn bucket_probe(root: &std::path::Path, shape_idx: usize) -> Result<String> 
         if lo == hi { format!("{{{:.4}}}", f(lo)) } else { format!("[{:.4},{:.4}]", f(lo), f(hi)) }
     };
     writeln!(rep, "x buckets {} ({} edges), y buckets {} ({} edges); tracing {} pairs", xs.len(), ex.len(), ys.len(), ey.len(), xs.len() * ys.len())?;
-    it.d.spd_edges = Some([ex.clone(), ey.clone()]);
     let (mut sum_bodies, mut sum_fused, mut max_ways) = (0usize, 0usize, 0u8);
     let base_max = base.forks.iter().map(|f| f.trim_end_matches(['g', 't']).parse::<u8>().unwrap_or(0)).max().unwrap_or(0);
     for (pname, pin) in &pins {
@@ -506,7 +1482,6 @@ pub fn bucket_probe(root: &std::path::Path, shape_idx: usize) -> Result<String> 
             }
         }
     }
-    it.d.spd_edges = None;
     writeln!(rep, "totals over {} (pin, pair)s: bodies {} (baseline {}), fused nodes {} (baseline {}), max fork arity {} (baseline {})",
         pins.len() * xs.len() * ys.len(), sum_bodies, base.bodies, sum_fused, base.fused, max_ways, base_max)?;
     Ok(rep)
@@ -907,12 +1882,16 @@ pub fn room_constant_lattice(
     type Cmap = std::collections::BTreeMap<super::iface::Path, super::iface::Conc>;
 
     let src = cart::sources_in(root)?;
-    let top = full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?;
-    let init = full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?;
-    let reset = full_moon::parse("__reset_button_states()").map_err(|e| anyhow!("reset: {:?}", e))?;
-    let fr = full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("frame: {:?}", e))?;
+    // The ASTs outlive the walk: the tracer is kept (`LatticeWalk::tracer`)
+    // to re-trace a shape under a speed bucket on demand (the bucket
+    // dispatch), and `Interp` borrows what it ran.
+    let leak = |a: full_moon::ast::Ast| -> &'static full_moon::ast::Ast { Box::leak(Box::new(a)) };
+    let top = leak(full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?);
+    let init = leak(full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?);
+    let reset = leak(full_moon::parse("__reset_button_states()").map_err(|e| anyhow!("reset: {:?}", e))?);
+    let fr = leak(full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("frame: {:?}", e))?);
 
-    let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+    let mut it: Interp<'static, Symbolic> = Interp::new(Symbolic::default());
     let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
     let (rx, ry) = celeste_interp::game_runner::start_room();
     let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
@@ -920,10 +1899,10 @@ pub fn room_constant_lattice(
     it.cart = Some(cart_data.clone());
 
     let st = cart::fresh_state::<Symbolic>(&mut it.d);
-    let st = run_one(&mut it, &top, st)?;
+    let st = run_one(&mut it, top, st)?;
     let mut st = st;
     cart::inject_tile_flag_at(&mut st);
-    let start = run_one(&mut it, &init, st)?;
+    let start = run_one(&mut it, init, st)?;
 
     let key = |st: &super::state::State<Symbolic>| -> Result<String> { Ok(format!("{:?}", st.shape()?)) };
 
@@ -935,6 +1914,7 @@ pub fn room_constant_lattice(
     let mut refused: std::collections::BTreeMap<String, String> = Default::default();
 
     let sk = key(&start)?;
+    let start_key = sk.clone();
     lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival())?);
     reps.insert(sk.clone(), start.clone());
     let mut work: Vec<String> = vec![sk];
@@ -954,7 +1934,7 @@ pub fn room_constant_lattice(
             .filter(|(p, _)| roots.iter().any(|r| r == *p))
             .map(|(p, c)| (p.clone(), *c))
             .collect();
-        let f = match trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, opts.widen_mode(), &[]) {
+        let f = match trace_frame(&mut it, reset, fr, st, &roots, &pin, &ival, opts.widen_mode(), &[]) {
             Ok(f) => f,
             Err(e) => {
                 // Remember the refusal instead of silently skipping: a
@@ -1035,12 +2015,30 @@ pub fn room_constant_lattice(
             missing.join("\n")
         );
     }
-    let graph = std::mem::take(&mut it.d.graph);
-    Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops })
+    let graph = it.d.graph.clone();
+    let mut by_hash = std::collections::HashMap::new();
+    for (k, f) in &frames {
+        by_hash.insert(f.in_rt2.shape_hash_of(), k.clone());
+    }
+    Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops, tracer: Tracer { it, reset, fr }, by_hash, opts, start_key })
+}
+
+/// The tracer a walk ran in, kept so a shape can be re-traced later in
+/// the same arena (the walk's states are graph nodes of it).
+pub struct Tracer {
+    pub it: super::interp::Interp<'static, super::domain::Symbolic>,
+    pub reset: &'static full_moon::ast::Ast,
+    pub fr: &'static full_moon::ast::Ast,
 }
 
 /// The output of `room_constant_lattice`.
 pub struct LatticeWalk {
+    pub tracer: Tracer,
+    /// Shape hash (of the input structure) -> the walk's shape key.
+    pub by_hash: std::collections::HashMap<u64, String>,
+    pub opts: super::shapes::WalkOpts,
+    /// The start state's shape key.
+    pub start_key: String,
     pub lattice: std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,
     pub reps: std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic>>,
     pub forks: std::collections::BTreeMap<String, usize>,
@@ -1060,7 +2058,7 @@ pub fn room_constants(root: &std::path::Path) -> Result<String> {
     let mut bodies_by_shape: std::collections::BTreeMap<String, usize> = Default::default();
     for (k, f) in frames.iter_mut() {
         if let Ok(bound) = super::emit::bind(f, &graph, true) {
-            if let Ok(low) = super::emit::lower_frame(&bound.graph, &bound.outcomes, Some(room.clone()), bound.forks, Default::default()) {
+            if let Ok(low) = super::emit::lower_frame(&bound, Some(room.clone()), Default::default()) {
                 bodies_by_shape.insert(k.clone(), low.bodies);
             }
         }

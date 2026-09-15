@@ -87,7 +87,11 @@ pub struct State<D: Domain> {
     /// 2026-09-15). Set on an outcome state by the boundary widening,
     /// matched by VALUE in `verify::trace_frame` (the scalar walk names
     /// the slot by another path than the widening does).
-    pub key_override: Vec<(D::Num, D::Num)>,
+    /// By the field's PATH, not the node it holds: nodes are hash-consed,
+    /// so a speed of 0 is the same node as every other field that is 0,
+    /// and matching by node gave the key to the wrong field (the row key
+    /// check, 2026-09-15).
+    pub key_override: Vec<(super::iface::Path, D::Num)>,
 }
 
 /// How many leading decisions two states share.
