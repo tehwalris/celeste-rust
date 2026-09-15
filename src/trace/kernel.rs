@@ -410,20 +410,60 @@ fn successor_keys(
                 }
                 v
             };
-            // The innermost undecided select cond in `cone`, or None.
-            let next_cond = |g: &crate::transpile::graph::Graph, cone: &[bool]| -> Option<NodeId> {
-                let mut best: Option<NodeId> = None;
-                for (n, &in_cone) in cone.iter().enumerate() {
-                    if !in_cone {
+            // The condition to split next for `roots`: the first undecided
+            // select on their VALUE paths (outermost first), and of its
+            // condition, the SOURCE - a numeric comparison (or its negation)
+            // computed through a select is split on that select's condition
+            // instead, recursively, so `spd.x ~= 0` over the no-direction
+            // dash's `flip and -1 or 1` splits on the flip and folds, rather
+            // than being split on its own and paired with a direction that
+            // contradicts it (target (2, 0) with accel (1.5, 1.5)). Any other
+            // condition - a boolean cell, a boolean select (the facing
+            // update), a collision test - is opaque: walking through those
+            // into the physics that decides them (the move's collision tests,
+            // the speed clamp) ran past 4096 cases once a coarse speed table
+            // left them undecided (2026-09-16).
+            fn cond_source(g: &crate::transpile::graph::Graph, c: NodeId) -> NodeId {
+                if !matches!(g.get(c).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Not) {
+                    return c;
+                }
+                let mut stack = vec![c];
+                let mut seen: std::collections::HashSet<NodeId> = Default::default();
+                while let Some(n) = stack.pop() {
+                    if !seen.insert(n) {
                         continue;
                     }
-                    let nd = g.get(n as NodeId);
-                    if matches!(nd.op, Op::Sel) && !matches!(g.get(nd.args[0]).op, Op::ConstBool(_)) {
-                        best = Some(n as NodeId);
-                        break;
+                    let nd = g.get(n);
+                    match nd.op {
+                        Op::Sel if !matches!(g.get(nd.args[0]).op, Op::ConstBool(_)) => return cond_source(g, nd.args[0]),
+                        Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Not | Op::Sel => stack.extend(nd.args.iter().rev().copied()),
+                        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Flr | Op::Min | Op::Max => {
+                            stack.extend(nd.args.iter().rev().copied())
+                        }
+                        _ => {}
                     }
                 }
-                best.map(|n| g.get(n).args[0])
+                c
+            }
+            let next_value_cond = |g: &crate::transpile::graph::Graph, roots: &[NodeId]| -> Option<NodeId> {
+                let mut seen: std::collections::HashSet<NodeId> = Default::default();
+                let mut stack: Vec<NodeId> = roots.iter().rev().copied().collect();
+                while let Some(n) = stack.pop() {
+                    if !seen.insert(n) {
+                        continue;
+                    }
+                    let nd = g.get(n);
+                    if matches!(nd.op, Op::Sel) {
+                        if !matches!(g.get(nd.args[0]).op, Op::ConstBool(_)) {
+                            return Some(cond_source(g, nd.args[0]));
+                        }
+                        stack.push(nd.args[2]);
+                        stack.push(nd.args[1]);
+                    } else {
+                        stack.extend(nd.args.iter().rev().copied());
+                    }
+                }
+                None
             };
             // A condition decided by the pieces of its operands.
             let decide = |g: &crate::transpile::graph::Graph, seeds: &std::collections::HashMap<NodeId, (i64, i64)>, c: NodeId| -> Option<bool> {
@@ -501,8 +541,8 @@ fn successor_keys(
                 }
             }
             // Mid-dash, the dash target and accel are read JOINTLY, as one
-            // constant each: split on the undecided selects in their cones,
-            // innermost first, until all four are single points. They are
+            // constant each: split on the undecided selects on their value
+            // paths (`next_value_cond`) until all four are single points. They are
             // arithmetic over selects (`2*sign(spd.x)` with `spd.x` the
             // no-direction dash's `flip.x and -1 or 1`), which the select
             // trees above do not reach, and their pieces taken field by
@@ -511,6 +551,8 @@ fn successor_keys(
             // 2026-09-15). A case with no condition left and a field still
             // not a point is reported by the reader below.
             let mut todo = std::mem::take(&mut done);
+            // The conditions split on, for the refusal below to name.
+            let mut dash_conds: Vec<String> = Vec::new();
             while let Some(case) = todo.pop() {
                 let mut memo = std::collections::HashMap::new();
                 let dashing = crate::transpile::graph::pieces_of(&case.0, &case.2, &mut memo, case.1[2]).is_some_and(|p| p.iter().any(|q| q.1 > 0));
@@ -521,18 +563,32 @@ fn successor_keys(
                     done.push(case);
                     continue;
                 }
-                let cone = cone_of(&case.0, &case.1[3..7]);
-                match next_cond(&case.0, &cone) {
+                match next_value_cond(&case.0, &case.1[3..7]) {
                     None => done.push(case),
-                    Some(c) => match decide(&case.0, &case.2, c) {
-                        Some(b) => todo.push(split(&case, c, b)),
-                        None => {
-                            todo.push(split(&case, c, true));
-                            todo.push(split(&case, c, false));
+                    Some(c) => {
+                        let nd = case.0.get(c);
+                        dash_conds.push(format!("{:?}({})", nd.op, nd.args.iter().map(|a| format!("{:?}", case.0.get(*a).op)).collect::<Vec<_>>().join(", ")));
+                        match decide(&case.0, &case.2, c) {
+                            Some(b) => todo.push(split(&case, c, b)),
+                            None => {
+                                todo.push(split(&case, c, true));
+                                todo.push(split(&case, c, false));
+                            }
                         }
-                    },
+                    }
                 }
-                anyhow::ensure!(done.len() + todo.len() <= MAX_CASES_PER_REP, "outcome {shape:#x}: over {MAX_CASES_PER_REP} select cases for the dash constants in one button configuration");
+                if done.len() + todo.len() > MAX_CASES_PER_REP {
+                    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+                    for s in &dash_conds {
+                        *counts.entry(s.as_str()).or_default() += 1;
+                    }
+                    let mut top: Vec<(&str, usize)> = counts.into_iter().collect();
+                    top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                    anyhow::bail!(
+                        "outcome {shape:#x}: over {MAX_CASES_PER_REP} select cases for the dash constants in one button configuration; split on: {}",
+                        top.iter().take(12).map(|(s, n)| format!("{s} x{n}")).collect::<Vec<_>>().join("; ")
+                    );
+                }
             }
             cases.extend(done);
         }
@@ -949,22 +1005,21 @@ pub fn key_build(root: &std::path::Path) -> Result<String> {
 /// room's level-0 bucketed set on its own - the census and timings, the
 /// node set written to FILE (the input of `--key-probe`), and (with `N`)
 /// the lowering of the first N nodes as a microbenchmark.
-pub fn key_census(root: &std::path::Path, lower: usize, dump: Option<&std::path::Path>) -> Result<String> {
+pub fn key_census(root: &std::path::Path, lower: usize, dump: Option<&std::path::Path>, w: u8) -> Result<String> {
     use std::fmt::Write as _;
-    const W: u8 = 16;
     let opts = super::shapes::WalkOpts::level0(
-        crate::interpreter::abstraction::SpdPrecision::WidthLog2(W),
+        crate::interpreter::abstraction::SpdPrecision::WidthLog2(w),
         crate::interpreter::abstraction::PosPrecision::EXACT,
     );
     let t = std::time::Instant::now();
     let mut lw = room_constant_lattice(root, opts)?;
     let t_lattice = t.elapsed();
     let t = std::time::Instant::now();
-    let nodes = key_fixpoint(&mut lw, W)?;
+    let nodes = key_fixpoint(&mut lw, w)?;
     let t_fix = t.elapsed();
     let mut out = String::new();
     writeln!(out, "shape lattice {:.1} s ({} shapes); key fixpoint {:.1} s ({} nodes)", t_lattice.as_secs_f64(), lw.by_hash.len(), t_fix.as_secs_f64(), nodes.len())?;
-    out.push_str(&census_report(&nodes, W));
+    out.push_str(&census_report(&nodes, w));
     if let Some(path) = dump {
         let text: String = nodes.iter().map(|n| node_line(n) + "\n").collect();
         std::fs::write(path, text)?;

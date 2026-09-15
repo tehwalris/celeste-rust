@@ -501,9 +501,9 @@ pub(crate) fn spd_bucket_node(
     let width_raw: i32 = 1i32 << w;
     let width = d.num(P8::from_raw(width_raw));
     // The fork is on the RAW value: every fork in the graph cuts at the
-    // grid (`Graph::fork_bits`, 2^-k), and the spd bucket at rung k is
-    // exactly one grid cell (`spd_precision_for`: width 2^(16-k) raw), so
-    // a fragment lies within one bucket. (Forking the SCALED value cut it
+    // grid (`Graph::fork_bits`, 2^-k), and the spd bucket at rung k is at
+    // least one grid cell (`Level::grid_consistent`: width 2^w raw, w >=
+    // 16-k), so a fragment lies within one bucket. (Forking the SCALED value cut it
     // on a 2^-k grid in bucket units - three cells for a one-bucket span
     // - and every rung > 0 declined its lanes, 2026-09-14.)
     let fb = d.graph.fork_bits();

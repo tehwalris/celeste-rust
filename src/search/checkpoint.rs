@@ -478,10 +478,16 @@ pub fn partition_census(level_dir: &Path, w: Option<u8>) -> Result<String> {
         let files = listing(fdir, &|n| n.starts_with('s') && n.ends_with(".bin"))?;
         let mut per_file: rustc_hash::FxHashMap<(u64, u32), u64> = Default::default();
         let mut per_block: rustc_hash::FxHashMap<(u64, u32, Option<crate::trace::kernel::SpeedKey>), u64> = Default::default();
+        // Distinct states: a key twice in one frame is a row re-emitted when
+        // its speed hull grew (`door::Hull`).
+        let mut states: rustc_hash::FxHashSet<(u64, u32, (u64, u64))> = Default::default();
         let mut rows = 0u64;
         for p in &files {
             let ff = FrameFile::open(p)?;
             let shape = ff.shape_hash();
+            for (cell, key) in ff.cell_keys() {
+                states.insert((shape, cell, key));
+            }
             match w {
                 None => {
                     for (cell, n) in ff.cell_counts() {
@@ -508,8 +514,10 @@ pub fn partition_census(level_dir: &Path, w: Option<u8>) -> Result<String> {
         let (fmed, fmax) = median_max(per_file.values().copied().collect());
         write!(
             out,
-            "{}: {rows} rows; {} shape files now; {} (shape, cell) files, rows per file median {fmed} max {fmax}",
+            "{}: {rows} rows, {} distinct states ({:.3} rows per state); {} shape files now; {} (shape, cell) files, rows per file median {fmed} max {fmax}",
             fdir.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+            states.len(),
+            rows as f64 / states.len().max(1) as f64,
             files.len(),
             per_file.len()
         )?;

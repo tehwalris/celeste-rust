@@ -63,6 +63,15 @@ trait DoorEntry: Copy + Send + 'static {
     fn grow(&mut self, h: &Hull, id: u64) -> Option<Hull>;
 }
 
+/// Admissions whose speed hull grew (an existing key re-emitted as a new
+/// row), process-wide, taken per frame (`take_hull_growths`).
+static HULL_GROWTHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The hull growths since the last call.
+pub fn take_hull_growths() -> u64 {
+    HULL_GROWTHS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// An exact-speed entry: the key and the id, 24 B.
 type Plain = (Key, u64);
 /// A bucketed-speed entry: the key, the id and the hull, 40 B.
@@ -204,6 +213,7 @@ impl<E: DoorEntry> Shard<E> {
         let hit = |e: &mut E, i: usize, ids: &mut Vec<u64>, new: &mut Vec<u32>, new_hulls: &mut Vec<Hull>, n_new: &mut u64| {
             if let Some(h) = hulls {
                 if let Some(union) = e.grow(&h[i], first_new + *n_new) {
+                    HULL_GROWTHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     *n_new += 1;
                     ids.push(e.id());
                     new.push(i as u32);

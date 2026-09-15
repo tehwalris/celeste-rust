@@ -36,7 +36,8 @@ fn main() -> Result<()> {
             "--key-census" => {
                 let lower: usize = args.next().map(|s| s.parse().context("--key-census N")).transpose()?.unwrap_or(0);
                 let dump = args.next().map(std::path::PathBuf::from);
-                let report = celeste_rust::trace::kernel::key_census(std::path::Path::new("."), lower, dump.as_deref())?;
+                let w: u8 = args.next().map(|s| s.parse().context("--key-census N FILE W")).transpose()?.unwrap_or(16);
+                let report = celeste_rust::trace::kernel::key_census(std::path::Path::new("."), lower, dump.as_deref(), w)?;
                 print!("{}", report);
                 return Ok(());
             }

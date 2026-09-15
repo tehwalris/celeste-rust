@@ -1,0 +1,95 @@
+# The speed abstraction: which table, whether it merges, when to refine (2026-09-16)
+
+The bucket dispatch (plans/bucket-dispatch.md) made speed-bucketed kernels
+correct and cheap to build, but the table (the cart's thresholds plus a
+1 px grid) and the ladder (bucket level 0, exact speed above it) were taken
+for implementation convenience, not measured. Philippe (2026-09-16): settle
+the questions properly. Three questions:
+
+1. **Which boundaries.** The thresholds are REQUIRED - they are what makes
+   every comparison on the speed decidable per bucket (plans/bucket-dispatch.md).
+   The grid is optional: it only sets the merge granularity (and the key
+   count). Candidates: thresholds only (`s20`: a 16 px grid, which on
+   +-16 px speeds adds nothing), + 4 px (`s18`), + 2 px (`s17`), + 1 px
+   (`s16`, today).
+2. **Realized against post-hoc merge.** A bucketed search explores an
+   over-approximation, and its rows re-emit when a key's speed hull grows
+   (`door::Hull`). How much of the merge a table promises survives.
+3. **The interleaving.** When to refine speed relative to rem: per level,
+   first-win frame (the lower bound), marks at the ceiling (what the finer
+   levels explore) and rows (the cost).
+
+## Tools
+
+- `rewrite spd-census --level-dir D --frame F --widths 20,18,17,16 --edge-table`:
+  the post-hoc CEILING - distinct states of an exact tree's frame under each
+  table (every other field exact).
+- `rewrite partition-census --level-dir D [--spd-w W]`: per frame rows and
+  distinct states (rows per state = the hull re-emission rate), files and
+  dispatch blocks.
+- `rewrite forward --to N --level SPEC`: a capped realized forward at any
+  level; the `[fwd]` line counts `hull growths`.
+- `tools/ladder_model.py`: per level and horizon, first win, marks, rows.
+
+## 1. The ceiling per table (post-hoc on exact level-0 trees)
+
+| | exact states | thresholds only / + 4 px | + 2 px | + 1 px |
+|---|---|---|---|---|
+| (1,0) f30 | 11.8k | 1.12x | 1.11x | 1.09x |
+| (1,0) f50 | 1.19M | 1.81x | 1.80x | 1.61x |
+| (1,0) f70 | 5.21M | 2.05x | 2.00x | 1.77x |
+| (1,0) f89 | 4.67M | 1.91x | 1.86x | 1.66x |
+| (1,0) f99 | 6.77M | 2.13x | 2.09x | 1.81x |
+| (2,0) f45 | 1.49M | 1.55x | 1.54x | 1.40x |
+| (2,0) f60 | 22.9M | 2.62x | 2.55x | 2.24x |
+| (2,0) f69 | 55.3M | **4.62x** | 4.47x | 3.87x |
+
+- The grid adds nothing past the thresholds: a 4 px grid merges exactly
+  what thresholds alone merge, 2 px barely less, 1 px noticeably less.
+- The thresholds cost most of the uniform-grid census's promise (1 px
+  without thresholds: 4.5x on (1,0) f89, 19x on (2,0) f69, BENCHMARK_DATA.md):
+  the singleton buckets at the cart's equality tests (0, +-0.05, +-0.15,
+  +-0.4, +-0.6) keep the common speeds apart.
+- On room (2,0) the ceiling grows with the frontier (1.6x -> 4.6x over 24
+  frames): the spring's fractional speeds are what explode there, and speed
+  IS the lever in principle.
+
+## 2. Realized (room (1,0), level 0, `s16`, the h99 bucketed tree to f50)
+
+| | exact states | bucketed states | bucketed rows | ceiling (1 px) |
+|---|---|---|---|---|
+| f30 | 11.8k | 12.0k | 13.3k (1.11 per state) | 10.8k |
+| f40 | 229k | 216k | 268k (1.24) | - |
+| f50 | 1.19M | 1.21M | 1.73M (1.42) | 739k |
+
+The realized search merges NOTHING on room (1,0): its distinct states track
+the exact count, against a ceiling of 1.6x, and hull growth re-emits 42% more
+rows by f50. Running: realized forwards at `s20` / `s18` / `s16` with the
+hull-growth counter.
+
+### Two bugs the coarse tables exposed (2026-09-16)
+
+- **The dash-constant reader** split on every undecided select in the dash
+  fields' cone, innermost first. Under `s20` that reached the facing update's
+  physics (collision tests, the speed clamp) and ran past 4096 cases. It now
+  walks the fields' VALUE paths outermost first and splits a numeric
+  comparison over a select on that select's condition (`cond_source`), so
+  `spd.x ~= 0` over `flip and -1 or 1` splits on the flip and folds, and
+  any other condition is opaque. The 1 px node set is byte-identical (593
+  nodes, 8 dash sets); `s20` builds 333 nodes and `s18` 337, each with the 8
+  real dash sets. (Taking conditions opaque without `cond_source` brought
+  back 12 sets: target (2, 0) with accel (1.5, 1.5).)
+- **The table put -1 on the wrong side.** `abs(spd.x) > 1` is `spd.x < -1`
+  below zero (edge AT -1), while `appr`'s `val > -1` needs the edge above
+  -1. With `Above` alone, -1 shared a bucket with (-1.5, -1). The 1 px grid's
+  edge at -1 hid it. At `s20` and `s18`, a hull reaching -1 left the clamp
+  undecided, and the merged arms crossed more buckets than the relative
+  fork's arity (computed per static piece). The kernel declined the lane:
+  `KERNEL COVERAGE GAP` at room (1,0) f33, the premise refusing and no row
+  lost. -1 is now a point bucket at every width.
+
+## 3. The interleaving
+
+Not measured yet. To follow once a table is chosen: explicit ladders
+(`CELESTE_LADDER`) through `tools/ladder_model.py`, first on the synthetic
+room (1,0) target, then as a real `--ceiling` run on room (2,0).

@@ -354,8 +354,14 @@ impl Level {
         Level { pos: PosPrecision::EXACT, rem: RemPrecision::Exact, spd: SpdPrecision::Exact };
 
     /// Every fork in a rung's graph cuts on ONE grid (2^-k for rem
-    /// `Bits(k)`), and a fragment must fit two cells, so a level's spd
-    /// bucket is either exact or exactly the grid (`WidthLog2(16 - k)`).
+    /// `Bits(k)`), and the unspecialized trace forks the speed on it and
+    /// snaps each fragment to its bucket, so a level's spd bucket is either
+    /// exact or at least one grid cell (`WidthLog2(w)`, `w >= 16 - k`: a
+    /// fragment then lies within one bucket). A coarser bucket is the
+    /// speed table's thresholds with a coarser grid (`spd_buckets`), and
+    /// its move fork's arity comes from the specialized ranges
+    /// (`Domain::flr_ways`). (Before the bucket dispatch it had to be
+    /// exactly the grid, 2026-09-14; relaxed 2026-09-16 for `r0s20`.)
     /// And the bucket node computes `spd / width` in 16.16: with |spd| up
     /// to 16 px that is 16 * 2^(16-w), which fits the integer part only
     /// for w >= `SPD_MIN_WIDTH_LOG2` (w = 1 overflowed: the kernel's
@@ -370,7 +376,7 @@ impl Level {
         }
         match (self.rem, self.spd) {
             (_, SpdPrecision::Exact) => true,
-            (RemPrecision::Bits(k), SpdPrecision::WidthLog2(w)) => k < 16 && w == 16 - k && w >= SPD_MIN_WIDTH_LOG2,
+            (RemPrecision::Bits(k), SpdPrecision::WidthLog2(w)) => k < 16 && w >= 16 - k && w >= SPD_MIN_WIDTH_LOG2,
             (RemPrecision::Exact, SpdPrecision::WidthLog2(_)) => false,
         }
     }
@@ -1418,6 +1424,11 @@ mod tests {
         assert!(y2.coarser_or_equal(Level::for_rem(RemPrecision::Bits(0))));
         assert!(!Level::for_rem(RemPrecision::Bits(0)).coarser_or_equal(y2));
         assert!(Level::parse("y2r1sx").unwrap().grid_consistent() == false);
+        // A speed bucket is at least one grid cell: thresholds-only at level
+        // 0, and speed refined as its own rung before rem.
+        assert!(Level::parse("r0s20").unwrap().grid_consistent());
+        assert!(!Level::parse("r1s14").unwrap().grid_consistent(), "a bucket finer than the rem grid");
+        assert_eq!(Level::parse_ladder("r0s20,r0s16,r0sx,r1sx,rxsx").unwrap().len(), 5);
         assert!(Level::parse("y3r0sx").is_err());
         assert_eq!(Level::parse("r0sx").unwrap().pos, PosPrecision::EXACT);
         let ladder = Level::parse_ladder("x2y2r0sx,y2r0sx,r0sx,r1sx,rxsx").unwrap();
@@ -1457,7 +1468,8 @@ mod tests {
         assert_eq!(l[2], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(2), spd: SpdPrecision::Exact });
         assert!(Level::parse_ladder("r0sx,r0s16,rxsx").is_err(), "spd may not get coarser");
         assert!(Level::parse_ladder("r0s16,r1s15").is_err(), "must end exact");
-        assert!(Level::parse_ladder("r0s16,r1s16,rxsx").is_err(), "spd bucket must be the rem grid");
+        assert!(Level::parse_ladder("r0s16,r1s16,rxsx").is_ok(), "a spd bucket of several rem grid cells");
+        assert!(Level::parse_ladder("r0s16,r1s14,rxsx").is_err(), "spd bucket finer than the rem grid");
         assert!(Level::parse_ladder("r0s16,r0s15,rxsx").is_err(), "speed cannot refine on its own");
         assert!(Level::parse_ladder("r0s16,r15s1,rxsx").is_err(), "W1 overflows the bucket node");
         set_level(Level::EXACT);

@@ -47,8 +47,14 @@ const X_CUTS: &[(&str, Cut)] = &[
     ("0.6", Cut::Point), ("-0.6", Cut::Point), ("0.4", Cut::Point), ("-0.4", Cut::Point),
     ("0.15", Cut::Point), ("-0.15", Cut::Point), ("0.05", Cut::Point), ("-0.05", Cut::Point),
     // `abs(spd.x) > maxrun` (1) and `appr`'s `val > target` with target
-    // `input * maxrun`: strict.
-    ("1", Cut::Above), ("-1", Cut::Above),
+    // `input * maxrun`: strict above 1. Below -1 the two disagree: `abs`
+    // flips the test to `spd.x < -1` (edge AT -1) while `appr` keeps `val >
+    // -1` (edge above it), so -1 is a point. With `Above` alone -1 shared
+    // a bucket with (-1.5, -1), `abs(spd.x) > 1` was undecided there, and
+    // only the 1 px grid's edge at -1 had hidden it: at `s20` a hull
+    // reaching -1 merged both arms past its fork's arity and the kernel
+    // declined it (room (1,0) f33, 2026-09-16).
+    ("1", Cut::Above), ("-1", Cut::Point),
     // Mid-dash `appr(spd.x, dash_target.x, ..)`: `val > target`, target
     // in {0, +-1.5, +-2}; the wall jump writes +-2.
     ("1.5", Cut::Above), ("-1.5", Cut::Above), ("2", Cut::Above), ("-2", Cut::Above),
@@ -156,5 +162,10 @@ mod tests {
         assert_eq!(bucket(65537, 16, 0).0, 65537);
         // y: `spd.y <= 0.15` decided on both sides of 0.15.
         assert_eq!(bucket(9830, 16, 1).1, 9830);
+        // x: `abs(spd.x) > 1` and `spd.x > -1` are both decided at -1 on
+        // every grid, not only where the grid has an edge there.
+        for w in [16, 18, 20] {
+            assert_eq!(bucket(-65536, w, 0), (-65536, -65536), "w {w}");
+        }
     }
 }

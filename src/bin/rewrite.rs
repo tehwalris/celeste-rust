@@ -62,6 +62,10 @@ enum Command {
         /// Last frame to compute.
         #[arg(long)]
         to: u32,
+        /// A full level spec (`Level::parse`, e.g. `r0s18`: rem rung 0,
+        /// speed buckets of the edge table at a 4 px grid), instead of `k`.
+        #[arg(long)]
+        level: Option<String>,
         /// Rem precision: bits 0..=15, or >=16 for Exact.
         #[arg(long, default_value_t = 0)]
         k: u8,
@@ -278,6 +282,11 @@ enum Command {
         /// Bucket widths, log2 raw units, comma-separated (16 = 1 px).
         #[arg(long, default_value = "8,10,12,14,16")]
         widths: String,
+        /// Bucket by the speed EDGE TABLE (`celeste_core::spd_buckets`: the
+        /// cart's thresholds plus a 2^w grid) instead of a uniform grid:
+        /// `20,18,17,16` is thresholds only, 4 px, 2 px, 1 px.
+        #[arg(long)]
+        edge_table: bool,
     },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed file by
     /// file and row range by row range (the whole-frame `census` loads the
@@ -434,18 +443,21 @@ fn main() -> Result<()> {
         }
         Command::Forward {
             to,
+            level,
             k,
             checkpoint_dir,
             room,
         } => {
             use celeste_rust::frame::{forward_run, Block};
-            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
+            use celeste_rust::interpreter::abstraction::{current_level, set_level, set_rem_precision, Level, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
-            let precision = if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) };
-            set_rem_precision(precision);
+            match &level {
+                Some(spec) => set_level(Level::parse(spec).map_err(|e| anyhow::anyhow!(e))?),
+                None => set_rem_precision(if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) }),
+            }
             let t = std::time::Instant::now();
             let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
-            eprintln!("[fwd] engine up in {:.2} s ({precision:?})", t.elapsed().as_secs_f64());
+            eprintln!("[fwd] engine up in {:.2} s ({:?})", t.elapsed().as_secs_f64(), current_level());
             let initial = vec![Block::from_state(
                 &celeste_rust::trace::refengine::RefEngine::new()?.initial_state()?,
             )?];
@@ -1752,7 +1764,7 @@ fn main() -> Result<()> {
         Command::PartitionCensus { level_dir, spd_w } => {
             print!("{}", celeste_rust::search::checkpoint::partition_census(std::path::Path::new(&level_dir), spd_w)?);
         }
-        Command::SpdCensus { level_dir, frame, widths } => {
+        Command::SpdCensus { level_dir, frame, widths, edge_table } => {
             use celeste_engine::runtime2::{mix64, Cell2, Col, AV};
             use celeste_rust::search::checkpoint::FrameFile;
             let dir = std::path::Path::new(&level_dir);
@@ -1823,8 +1835,13 @@ fn main() -> Result<()> {
                         let (x, y) = (raw(sx, r), raw(sy, r));
                         sets[0].insert(mix64(h[r] ^ mix64((x as u64) << 32 ^ y as u64 as u32 as u64)));
                         for (i, &w) in ws.iter().enumerate() {
-                            let bx = x.div_euclid(1i64 << w) as u64;
-                            let by = y.div_euclid(1i64 << w) as u64;
+                            let (bx, by) = if edge_table {
+                                // A non-number speed (no player) buckets as itself.
+                                let b = |v: i64, axis: usize| if v == i64::MIN / 4 { u64::MAX } else { celeste_core::spd_buckets::index(v as i32, w as u8, axis) as u64 };
+                                (b(x, 0), b(y, 1))
+                            } else {
+                                (x.div_euclid(1i64 << w) as u64, y.div_euclid(1i64 << w) as u64)
+                            };
                             sets[i + 1].insert(mix64(h[r] ^ mix64(bx << 32 ^ (by & 0xffff_ffff))));
                         }
                     }
@@ -1833,7 +1850,8 @@ fn main() -> Result<()> {
             }
             println!("f{frame:03}: {rows} rows, {} distinct exact", sets[0].len());
             for (i, &w) in ws.iter().enumerate() {
-                println!("  spd bucket 2^{w} raw ({:.4} px): {} distinct ({:.2}x)", (1u64 << w) as f64 / 65536.0, sets[i + 1].len(), sets[0].len() as f64 / sets[i + 1].len().max(1) as f64);
+                let what = if edge_table { format!("edge table s{w} (thresholds + {:.4} px grid)", (1u64 << w) as f64 / 65536.0) } else { format!("spd bucket 2^{w} raw ({:.4} px)", (1u64 << w) as f64 / 65536.0) };
+                println!("  {what}: {} distinct ({:.2}x)", sets[i + 1].len(), sets[0].len() as f64 / sets[i + 1].len().max(1) as f64);
             }
         }
         Command::ColCensus { level_dir, frame, cap } => {

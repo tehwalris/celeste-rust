@@ -1483,6 +1483,7 @@ pub fn forward_frame(
     let t = Instant::now();
     door.end_frame(workers);
     st.t_door = t.elapsed();
+    st.hull_grown = crate::search::door::take_hull_growths();
     st.door_bytes = door.alloc_bytes();
 
     let mut won = false;
@@ -1545,6 +1546,9 @@ pub struct FrameStats {
     pub t_door: std::time::Duration,
     pub flushes: u64,
     pub flushed_rows: u64,
+    /// Admissions whose speed hull grew: existing states re-emitted as new
+    /// rows (a bucketed level; `door::take_hull_growths`).
+    pub hull_grown: u64,
     /// Edge records written (`EDGE_RECORD_BYTES` each), and the workers'
     /// summed time encoding and writing them (thread-time).
     pub edge_records: u64,
@@ -2123,7 +2127,7 @@ fn log_frame(
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
          wave {:.0} (idle {:.0}%) door {:.0} edges {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
-         flushes {} ({:.0} rows avg) edges {} | \
+         flushes {} ({:.0} rows avg) edges {} hull growths {} | \
          in {:.2} queues {:.2} door {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2})",
         st.blocks_in,
         st.lanes_in,
@@ -2142,6 +2146,7 @@ fn log_frame(
         st.flushes,
         st.flushed_rows as f64 / st.flushes.max(1) as f64,
         edge_records,
+        st.hull_grown,
         st.bytes_in as f64 / 1e9,
         st.queue_bytes as f64 / 1e9,
         st.door_bytes as f64 / 1e9,
