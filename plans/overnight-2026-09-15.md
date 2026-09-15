@@ -40,3 +40,14 @@ and the replay check `pico8_diff/replay.py --room 2,0 tas/...` of the witness.
 ## Log
 
 (appended as the night goes)
+
+## 08:20 - the run died, and not for a fixable reason
+
+`EXIT 137` (OOM at the 90 GB cap) during frame 79. The frontier does NOT
+saturate: f69 55M kept -> f78 175M kept (+18%/frame), visited 1.48G, door
+36.6 GB, frontier 21 GB, f78 took 630 s with 1.0G raw emissions. f95 would
+be billions of states. The exact-speed level 0 is not viable for room
+(2,0); the f69 "7,500 states per position" was a point on a rising curve.
+Tree intact and resumable at f78 (`/var/tmp/celeste-room20`), disk 693 GB
+free. The `census` on f078 OOMs at 60 GB (it loads the whole frame); a
+streaming per-column census follows.

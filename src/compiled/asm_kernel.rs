@@ -53,7 +53,7 @@ struct AsmField {
 struct AsmBody {
     outcome: usize,
     /// The fork configuration (two bits per fork), for diagnostics.
-    splits: u64,
+    splits: Vec<u8>,
     fields: Vec<AsmField>,
     ok_root: usize,
     live_root: usize,
@@ -389,17 +389,31 @@ impl AsmKernel {
                         if sink.edges_on && first_cin != cin {
                             sink.edges.insert((cin, cell_out(body, outbuf, i, start)));
                         }
+                        // THE SPEED HULL: the same key with another speed
+                        // fragment is not the same row. Still queued: its
+                        // hull widens in place. Already flushed (an id in
+                        // the cache): pushed again, and the flush's door
+                        // decides - inside the hull, the old id; outside, a
+                        // grown row.
+                        let hull = cols.lane_hull(outbuf, i);
                         match slice_base {
-                            Some(b) if r & RowCache::ID_FLAG != 0 => {
+                            Some(b) if r & RowCache::ID_FLAG != 0 && hull.is_none() => {
                                 sink.direct_edge(r & !RowCache::ID_FLAG, b, lane0 + i);
                                 continue;
                             }
+                            Some(_) if r & RowCache::ID_FLAG != 0 => {}
                             Some(_) if r & RowCache::DROP_FLAG != 0 => continue,
                             // The row was flushed (a stale ref, only if
                             // the cache lost the flush's write-back): push
                             // it again; the flush merges duplicates by key.
                             Some(b) if !sink.mark_pred(r, b, lane0 + i) => {}
-                            _ => continue,
+                            Some(_) => {
+                                if let (Some(h), Some(s)) = (hull, cols.spd) {
+                                    sink.hull_union_at(r, s[0].0, s[1].0, h);
+                                }
+                                continue;
+                            }
+                            None => continue,
                         }
                     }
                     sink.emitted += 1;
@@ -501,7 +515,7 @@ impl AsmKernel {
             if live_ev != Val::Bool(Some(false)) || live_asm {
                 n_live_eval += 1;
                 if n_live_eval <= 6 {
-                    eprintln!("[dropped]   body {bi} outcome {} splits {:#x}: live eval {:?} asm {live_asm}; ok eval {:?} asm {ok_asm}", body.outcome, body.splits, live_ev, ok_ev);
+                    eprintln!("[dropped]   body {bi} outcome {} splits {:?}: live eval {:?} asm {live_asm}; ok eval {:?} asm {ok_asm}", body.outcome, body.splits, live_ev, ok_ev);
                     eprintln!("[dropped]   the live leaves the evaluator cannot decide:");
                     self.explain_bool(chunk, lane, self.flat_roots[body.live_root]);
                 }
@@ -890,7 +904,16 @@ impl Scratch {
 struct BodyCols {
     num: Vec<(usize, usize)>,
     ival: Vec<(usize, usize)>,
+    /// A NUMBER root into an interval column, stored as `[v, v]`: the
+    /// speed under a bucket is an interval column of the shape, and an
+    /// outcome that sets it exactly (`spd.x = 0` on a wall, the spring's
+    /// `spd.y = -3`) computes a number for it (the speed hull, 2026-09-15).
+    num_as_ival: Vec<(usize, usize)>,
     bool_: Vec<(usize, usize)>,
+    /// The speed hull's columns when the level buckets the speed: the
+    /// queue column and output root of `spd.x` and `spd.y`, each root a
+    /// number (`is_num`) or an interval. `None` at exact speed.
+    spd: Option<[(usize, usize, bool); 2]>,
     uniform_num: Vec<(usize, u32)>,
     uniform_ival: Vec<(usize, (u32, u32))>,
     uniform_bool: Vec<(usize, u8)>,
@@ -899,7 +922,7 @@ struct BodyCols {
 impl BodyCols {
     fn of(body: &AsmBody, proto: &crate::frame::Slot, own: &Rt2) -> Result<Self> {
         use crate::frame::TCol;
-        let (mut num, mut ival, mut bool_) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut num, mut ival, mut num_as_ival, mut bool_) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut written = vec![false; proto.cols.len()];
         for f in &body.fields {
             // A field whose output column the union makes uniform (a
@@ -913,6 +936,7 @@ impl BodyCols {
             match (f.kind, &proto.cols[ci].1) {
                 (RootKind::Num, TCol::Num(_)) => num.push((ci, f.root)),
                 (RootKind::Ival, TCol::Ival(_)) => ival.push((ci, f.root)),
+                (RootKind::Num, TCol::Ival(_)) => num_as_ival.push((ci, f.root)),
                 (RootKind::Bool, TCol::Bool(_)) => bool_.push((ci, f.root)),
                 (k, _) => anyhow::bail!("body field cell {} kind {:?} disagrees with the shape's column", f.cell, k),
             }
@@ -930,11 +954,38 @@ impl BodyCols {
                 (TCol::Ival(_), AV::Ival(a, b)) => uniform_ival.push((ci, (a.as_raw_u32(), b.as_raw_u32()))),
                 (TCol::Ival(_), AV::Num(n)) => uniform_ival.push((ci, (n.as_raw_u32(), n.as_raw_u32()))),
                 (TCol::Bool(_), AV::Bool(x)) => uniform_bool.push((ci, *x as u8)),
-                (TCol::Bool(_), AV::UBool) => uniform_bool.push((ci, 2)),
+                // A row never stores an undecided boolean: the kernel reads
+                // bool inputs as decided, and the ladder's mark filter
+                // matches widened DECIDED keys (`widen::fork_bools`).
+                (TCol::Bool(_), AV::UBool) => anyhow::bail!("union column at cell {cell} is a uniform undecided boolean"),
                 (_, v) => anyhow::bail!("union column at cell {cell}: the outcome's uniform {v:?} does not fit its kind"),
             }
         }
-        Ok(BodyCols { num, ival, bool_, uniform_num, uniform_ival, uniform_bool })
+        let spd = proto.speed_typed_cols().and_then(|(tx, ty)| {
+            let find = |ci: usize| -> Option<(usize, usize, bool)> {
+                ival.iter().find(|(c, _)| *c == ci).map(|&(c, r)| (c, r, false))
+                    .or_else(|| num_as_ival.iter().find(|(c, _)| *c == ci).map(|&(c, r)| (c, r, true)))
+            };
+            Some([find(tx)?, find(ty)?])
+        });
+        Ok(BodyCols { num, ival, num_as_ival, bool_, spd, uniform_num, uniform_ival, uniform_bool })
+    }
+
+    /// Lane `i`'s speed hull off the output buffer (`spd` columns).
+    #[inline]
+    fn lane_hull(&self, buf: &[u8], i: usize) -> Option<crate::search::door::Hull> {
+        let s = self.spd?;
+        let word = |base: usize| u32::from_le_bytes(buf[base..base + 4].try_into().unwrap()) as i32;
+        let range = |(_, root, is_num): (usize, usize, bool)| -> (i32, i32) {
+            let lo = word(root * 128 + i * 4);
+            if is_num {
+                (lo, lo)
+            } else {
+                (lo, word(root * 128 + 64 + i * 4))
+            }
+        };
+        let (x, y) = (range(s[0]), range(s[1]));
+        Some([x.0, x.1, y.0, y.1])
     }
 
     /// Append lane `i` of the output buffer to `slot` as one row.
@@ -952,11 +1003,25 @@ impl BodyCols {
                 v.push((word(root * 128 + i * 4), word(root * 128 + 64 + i * 4)));
             }
         }
+        for &(ci, root) in &self.num_as_ival {
+            if let TCol::Ival(v) = &mut slot.cols[ci].1 {
+                let n = word(root * 128 + i * 4);
+                v.push((n, n));
+            }
+        }
         for &(ci, root) in &self.bool_ {
             if let TCol::Bool(v) = &mut slot.cols[ci].1 {
                 let val = u16::from_le_bytes([buf[root * 128], buf[root * 128 + 1]]);
                 let known = u16::from_le_bytes([buf[root * 128 + 2], buf[root * 128 + 3]]);
-                v.push(if known >> i & 1 == 0 { 2 } else { (val >> i & 1) as u8 });
+                // FATAL, not a `2`: the boundary forks every boolean the
+                // typing cannot prove decided (`widen::fork_bools`), so an
+                // undecided one here means the typing was wrong - and a
+                // stored one would be read back as `false` next frame.
+                assert!(
+                    known >> i & 1 != 0,
+                    "emitted row holds an undecided boolean (column {ci}, root {root}): fork_bools missed it"
+                );
+                v.push((val >> i & 1) as u8);
             }
         }
         for &(ci, n) in &self.uniform_num {
@@ -1026,6 +1091,10 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     if exact {
         b.boundary_exact();
     } else {
+        // The key hashes the speed BUCKET (the row stores the hull).
+        if let crate::interpreter::abstraction::SpdPrecision::WidthLog2(w) = crate::interpreter::abstraction::spd_precision() {
+            b.widen_to(&super::boundary_ids(), 0, Some(w), (1, 1));
+        }
         b.boundary(&super::boundary_ids());
     }
     assert!(
@@ -1383,7 +1452,8 @@ fn build_one_shape(
     let mut key_roots: Vec<(usize, usize)> = Vec::with_capacity(bodies.len());
     for b in &bodies {
         use crate::transpile::graph::Op;
-        let nfields = b.roots.len() - 2;
+        let okeys = &r.bound.outcomes[b.outcome].keys;
+        let nfields = b.roots.len() - 2 - okeys.len();
         let outputs = &r.bound.outcomes[b.outcome].outputs;
         let out_fields = &r.lowered.outs[b.outcome].fields;
         let (mut h1, mut h2) = (fused.leaf(Op::Word(0)), fused.leaf(Op::Word(0)));
@@ -1392,8 +1462,14 @@ fn build_one_shape(
                 continue;
             }
             let cell = outputs[j].0;
-            let m1 = fused.add(Op::CellMix(cell, 0), vec![b.roots[j]]);
-            let m2 = fused.add(Op::CellMix(cell, 1), vec![b.roots[j]]);
+            // A field keyed on another node (the speed under a bucket:
+            // stored tight, keyed on its bucket) hashes that node.
+            let key_root = match okeys.iter().position(|(fi, _)| *fi == j) {
+                Some(k) => b.roots[nfields + 2 + k],
+                None => b.roots[j],
+            };
+            let m1 = fused.add(Op::CellMix(cell, 0), vec![key_root]);
+            let m2 = fused.add(Op::CellMix(cell, 1), vec![key_root]);
             h1 = fused.add(Op::AddW, vec![h1, m1]);
             h2 = fused.add(Op::AddW, vec![h2, m2]);
         }
@@ -1435,7 +1511,7 @@ fn build_one_shape(
     let mut off = 0usize;
     let mut asm_bodies = Vec::with_capacity(bodies.len());
     for (bi, b) in bodies.iter().enumerate() {
-        let nfields = b.roots.len() - 2; // roots = [fields.., ok, live]
+        let nfields = b.roots.len() - 2 - r.bound.outcomes[b.outcome].keys.len(); // roots = [fields.., ok, live, keys..]
         let outputs = &r.bound.outcomes[b.outcome].outputs;
         anyhow::ensure!(
             outputs.len() == nfields,
@@ -1453,7 +1529,7 @@ fn build_one_shape(
             .collect();
         asm_bodies.push(AsmBody {
             outcome: b.outcome,
-            splits: b.splits,
+            splits: b.splits.clone(),
             fields,
             ok_root: slot_of[off + nfields],
             live_root: slot_of[off + nfields + 1],

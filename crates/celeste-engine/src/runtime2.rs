@@ -163,6 +163,36 @@ pub const NONE: u32 = u32::MAX;
 /// Push one value onto a column of `width` lanes, materializing a uniform
 /// column only when the value differs from it, and keeping the raw
 /// `N`/`I` forms while the kinds allow.
+/// Overwrite lane `lane` of a column at block width `width` with `v`,
+/// promoting a uniform column that disagrees to a per-lane one.
+pub fn col_set(col: &mut Col, width: usize, lane: usize, v: AV) {
+    match col {
+        Col::U(u) if *u == v => {}
+        Col::U(u) => {
+            let mut vs = vec![*u; width];
+            vs[lane] = v;
+            *col = Col::V(vs);
+        }
+        Col::V(vs) => vs[lane] = v,
+        Col::N(vs) => match v {
+            AV::Num(n) => vs[lane] = n,
+            other => {
+                let mut all: Vec<AV> = vs.iter().map(|n| AV::Num(*n)).collect();
+                all[lane] = other;
+                *col = Col::V(all);
+            }
+        },
+        Col::I(vs) => match v {
+            AV::Ival(a, b) => vs[lane] = (a, b),
+            other => {
+                let mut all: Vec<AV> = vs.iter().map(|(a, b)| AV::Ival(*a, *b)).collect();
+                all[lane] = other;
+                *col = Col::V(all);
+            }
+        },
+    }
+}
+
 pub fn col_push(col: &mut Col, width: usize, v: AV) {
     match col {
         Col::U(a) if *a == v => {} // still uniform
@@ -394,6 +424,31 @@ impl Rt2 {
             }
         }
         out
+    }
+
+    /// Per lane, the player's speed hull `[x_lo, x_hi, y_lo, y_hi]` (raw),
+    /// `None` when the block has no player with a numeric or interval
+    /// speed on both axes.
+    pub fn speed_hulls(&self, ids: &BoundaryIds) -> Option<Vec<[i32; 4]>> {
+        let obj = *self.player_objects(ids).first()?;
+        let cells = self.xy_cells_of(obj, ids.f_spd, ids);
+        if cells.len() != 2 {
+            return None;
+        }
+        let range = |c: u32, lane: usize| -> Option<(i32, i32)> {
+            match self.cols[c as usize].at(lane) {
+                AV::Num(n) => Some((n.as_raw_u32() as i32, n.as_raw_u32() as i32)),
+                AV::Ival(a, b) => Some((a.as_raw_u32() as i32, b.as_raw_u32() as i32)),
+                _ => None,
+            }
+        };
+        (0..self.width)
+            .map(|l| {
+                let (xa, xb) = range(cells[0], l)?;
+                let (ya, yb) = range(cells[1], l)?;
+                Some([xa, xb, ya, yb])
+            })
+            .collect()
     }
 
     /// The players' `spd.x`/`spd.y` cells.

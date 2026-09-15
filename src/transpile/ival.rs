@@ -86,7 +86,12 @@ fn bool_cells(g: &Graph) -> HashSet<u32> {
 /// Returns the new graph, a FULL-length node map (`UNREACHABLE` where a
 /// node was not reached), and what it found.
 pub fn fold(g: &Graph, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph, Vec<NodeId>, Stats)> {
-    let need = super::bdd::reachable(g, roots);
+    fold_with(g, roots, room, &HashMap::new())
+}
+
+/// Every input cell at its weakest value - a bool cell unknown, a number
+/// cell the full range or, when `ranges` bounds it, that range.
+pub(crate) fn seed_cells(g: &Graph, ranges: &HashMap<u32, (i32, i32)>) -> HashMap<u32, Val> {
     let bools = bool_cells(g);
     let full = Val::Num(Pico8NumInterval::new(
         Pico8Num::from_raw(i32::MIN),
@@ -95,9 +100,31 @@ pub fn fold(g: &Graph, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph, 
     let mut cells: HashMap<u32, Val> = HashMap::new();
     for id in 0..g.len() {
         if let Op::Cell(c) = g.get(id as NodeId).op {
-            cells.insert(c, if bools.contains(&c) { Val::Bool(None) } else { full });
+            let v = if bools.contains(&c) {
+                Val::Bool(None)
+            } else if let Some((lo, hi)) = ranges.get(&c) {
+                Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(*lo), Pico8Num::from_raw(*hi)))
+            } else {
+                full
+            };
+            cells.insert(c, v);
         }
     }
+    cells
+}
+
+/// `fold` with input cells `ranges` known to lie in a range (raw,
+/// inclusive) - a body specialized on its speed bucket (2026-09-15). The
+/// evaluator sees the range instead of top, so a comparison or a table
+/// fork's validity the range decides folds to a constant.
+pub fn fold_with(
+    g: &Graph,
+    roots: &[NodeId],
+    room: Option<&Room>,
+    ranges: &HashMap<u32, (i32, i32)>,
+) -> Result<(Graph, Vec<NodeId>, Stats)> {
+    let need = super::bdd::reachable(g, roots);
+    let cells = seed_cells(g, ranges);
     let vals = match room {
         Some(r) => g.eval_lenient_in(&cells, r)?,
         None => g.eval_lenient(&cells)?,

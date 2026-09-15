@@ -117,6 +117,7 @@ pub fn fresh_state<D: Domain>(d: &mut D) -> State<D> {
         guard: t.clone(),
         ok: t,
         path: Vec::new(),
+        key_override: Vec::new(),
     };
     for name in NATIVE {
         st.heap

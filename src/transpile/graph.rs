@@ -288,6 +288,23 @@ pub enum Op {
     /// fork shares the one node. It exists so the validity chain
     /// accounts for every lane `zi_fork_flr` gives up on.
     SplitOk(u8),
+    /// An interval's endpoints as plain numbers (`Lo(v)` = its low end,
+    /// `Hi(v)` its high end; of a number, the number). What lets a fork
+    /// at a TABLE of cuts be ordinary arithmetic after specialization.
+    Lo,
+    Hi,
+    /// A fork at a TABLE of cuts (`Graph::set_fork_table`): fragment `c`
+    /// of fork `d` is the operand clipped to the table's `c`-th range,
+    /// `Span(max(Lo(v), lo_c), min(Hi(v), hi_c))`, and `SplitValidTab(d)`
+    /// is whether the operand reaches it, `Lo(v) <= hi_c and Hi(v) >=
+    /// lo_c`. Unlike `Split`, which cuts at the graph's one grid, the
+    /// ranges are per fork and known when the fork is built - a body
+    /// specialized on its input speed BUCKET knows the static range of
+    /// its output speed, hence exactly which bucket edges it can cross
+    /// (2026-09-15, the bucket dispatch). Resolved by specialization into
+    /// the ordinary ops above, so nothing downstream knows it existed.
+    SplitTab(u8),
+    SplitValidTab(u8),
 
     // ---- cart lookups ----
     Mget,
@@ -337,7 +354,16 @@ pub struct Graph {
     /// Per fork `d`, how many fragments it has (absent = 2). Set by the
     /// tracer's `fork_flr`; read by the specialization's enumeration.
     fork_ways: Vec<u8>,
+    /// Per fork `d`, the ranges of a table fork (`SplitTab`): fragment
+    /// `c` is `[lo, hi]` raw, inclusive. Empty for a grid fork.
+    fork_tables: Vec<Vec<(i32, i32)>>,
 }
+
+/// The most fragments one fork can have: a configuration names each
+/// fork's fragment with a byte (2026-09-15; the packed two-bits-per-fork
+/// `u64` mask went with the table fork, whose arity is the number of
+/// bucket edges an output speed can cross).
+pub const MAX_WAYS: usize = 255;
 
 impl Graph {
     pub fn new() -> Self {
@@ -347,7 +373,38 @@ impl Graph {
     /// An empty graph on the same fork grid: what every pass that builds
     /// an output graph from this one starts from.
     pub fn like(&self) -> Self {
-        Graph { fork_bits: self.fork_bits, fork_ways: self.fork_ways.clone(), ..Default::default() }
+        Graph {
+            fork_bits: self.fork_bits,
+            fork_ways: self.fork_ways.clone(),
+            fork_tables: self.fork_tables.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Forget every fork's arity and table: a new frame's forks start at 0
+    /// in an arena that outlives the frame.
+    pub fn reset_forks(&mut self) {
+        self.fork_ways.clear();
+        self.fork_tables.clear();
+    }
+
+    /// Make fork `d` a table fork over `ranges` (its arity is their count).
+    pub fn set_fork_table(&mut self, d: u8, ranges: Vec<(i32, i32)>) {
+        assert!(!ranges.is_empty() && ranges.len() <= MAX_WAYS, "table fork {d}: {} ranges", ranges.len());
+        // Set, not raised: the arena outlives a trace, and fork `d` of the
+        // previous trace may have had a bigger table.
+        if self.fork_ways.len() <= d as usize {
+            self.fork_ways.resize(d as usize + 1, 2);
+        }
+        self.fork_ways[d as usize] = ranges.len() as u8;
+        if self.fork_tables.len() <= d as usize {
+            self.fork_tables.resize(d as usize + 1, Vec::new());
+        }
+        self.fork_tables[d as usize] = ranges;
+    }
+
+    pub fn fork_table(&self, d: u8) -> &[(i32, i32)] {
+        self.fork_tables.get(d as usize).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Fork `d`'s arity: how many fragments `Split(d)` resolves to.
@@ -359,7 +416,7 @@ impl Graph {
     /// twice (`fork_memo`) keeps the wider request, since each site's own
     /// `SplitOk` premise is what bounds the lanes IT admits.
     pub fn set_fork_ways(&mut self, d: u8, ways: u8) {
-        debug_assert!((2..=4).contains(&ways), "fork arity {ways}: 2 bits per fork in the split mask");
+        debug_assert!(ways >= 2, "fork arity {ways}");
         if self.fork_ways.len() <= d as usize {
             self.fork_ways.resize(d as usize + 1, 2);
         }
@@ -423,7 +480,7 @@ impl Graph {
         for (i, node) in self.nodes.iter().enumerate() {
             let mut m = match node.op {
                 Op::Free(b) => Choice::Free(b).bit(),
-                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) => Choice::Split(d).bit(),
+                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) => Choice::Split(d).bit(),
                 _ => 0,
             };
             for a in &node.args {
@@ -490,7 +547,7 @@ impl Graph {
     pub fn specialize_config_into(
         &self,
         frees: u8,
-        splits: Option<u64>,
+        splits: Option<&[u8]>,
         out: &mut Graph,
     ) -> Vec<NodeId> {
         self.specialize_subset_into(frees, splits, None, out)
@@ -511,12 +568,13 @@ impl Graph {
     pub fn specialize_subset_into(
         &self,
         frees: u8,
-        splits: Option<u64>,
+        splits: Option<&[u8]>,
         need: Option<&[bool]>,
         out: &mut Graph,
     ) -> Vec<NodeId> {
         out.fork_bits = self.fork_bits;
         out.fork_ways = self.fork_ways.clone();
+        out.fork_tables = self.fork_tables.clone();
         const UNBUILT: NodeId = NodeId::MAX;
         let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
         for (i, node) in self.nodes.iter().enumerate() {
@@ -537,17 +595,31 @@ impl Graph {
                 // as 256 distinct ones and reported the collapse as
                 // sharing. Fourth member of the shift-overflow family;
                 // see `ChoiceSet`.
-                (Op::Split(d), Some(s)) => {
-                    debug_assert!((2 * d as u32) < u64::BITS, "fork {} past a u64 split mask", d);
-                    out.fold(Op::Frag(((s >> (2 * d)) & 3) as u8), vec![arg(&map, 0)])
-                }
-                (Op::SplitValid(d), Some(s)) => {
-                    debug_assert!((2 * d as u32) < u64::BITS, "fork {} past a u64 split mask", d);
-                    out.fold(Op::FragOk(((s >> (2 * d)) & 3) as u8), vec![arg(&map, 0)])
-                }
-                (Op::SplitInt(d), Some(s)) => {
-                    debug_assert!((2 * d as u32) < u64::BITS, "fork {} past a u64 split mask", d);
-                    out.fold(Op::IntFrag(((s >> (2 * d)) & 3) as u8), vec![arg(&map, 0)])
+                (Op::Split(d), Some(s)) => out.fold(Op::Frag(s[d as usize]), vec![arg(&map, 0)]),
+                (Op::SplitValid(d), Some(s)) => out.fold(Op::FragOk(s[d as usize]), vec![arg(&map, 0)]),
+                (Op::SplitInt(d), Some(s)) => out.fold(Op::IntFrag(s[d as usize]), vec![arg(&map, 0)]),
+                // The table fork: ordinary arithmetic on the fragment's
+                // constant range (see `Op::SplitTab`).
+                (Op::SplitTab(d), Some(s)) | (Op::SplitValidTab(d), Some(s)) => {
+                    let c = s[d as usize] as usize;
+                    let table = self.fork_table(d);
+                    let (lo, hi) = *table.get(c).unwrap_or_else(|| {
+                        panic!("table fork {d}: configuration {c} of {} (fork_ways {}, {} forks with tables: {:?})", table.len(), self.fork_ways(d), self.fork_tables.len(), self.fork_tables.iter().map(|t| t.len()).collect::<Vec<_>>())
+                    });
+                    let v = arg(&map, 0);
+                    let vlo = out.fold(Op::Lo, vec![v]);
+                    let vhi = out.fold(Op::Hi, vec![v]);
+                    let klo = out.leaf(Op::Const(lo, lo));
+                    let khi = out.leaf(Op::Const(hi, hi));
+                    if matches!(node.op, Op::SplitTab(_)) {
+                        let a = out.fold(Op::Max, vec![vlo, klo]);
+                        let b = out.fold(Op::Min, vec![vhi, khi]);
+                        out.fold(Op::Span, vec![a, b])
+                    } else {
+                        let a = out.fold(Op::Le, vec![vlo, khi]);
+                        let b = out.fold(Op::Ge, vec![vhi, klo]);
+                        out.fold(Op::And, vec![a, b])
+                    }
                 }
                 _ => {
                     let args: Vec<NodeId> =
@@ -623,7 +695,10 @@ impl Graph {
                     _ => None,
                 };
                 if let (Some((lo, _)), Some((_, hi))) = (lit(self, 0), lit(self, 1)) {
-                    return self.leaf(Op::Const(lo, hi));
+                    // Tolerant of `lo > hi`: a table-fork fragment the
+                    // lane never reaches (its validity is false, its
+                    // value unread) - a literal interval is never inverted.
+                    return self.leaf(Op::Const(lo.min(hi), lo.max(hi)));
                 }
             }
             // The one that matters: a decided condition picks its arm, so
@@ -867,10 +942,13 @@ impl Graph {
                 Op::ConstBool(b) => Val::Bool(Some(*b)),
                 // The hull, and the definition `fold`'s two-constant
                 // rule below is checked against.
-                Op::Span => Val::Num(Pico8NumInterval::new(
-                    a(0).as_num("Span")?.low,
-                    a(1).as_num("Span")?.high,
-                )),
+                // Tolerant of `lo > hi`: a table-fork fragment the lane
+                // never reaches (`SplitTab`'s clip past the other end),
+                // whose validity is false and whose value is unread.
+                Op::Span => {
+                    let (lo, hi) = (a(0).as_num("Span")?.low, a(1).as_num("Span")?.high);
+                    Val::Num(Pico8NumInterval::new(lo.min(hi), lo.max(hi)))
+                }
                 Op::Free(b) => bail!("node {}: free choice {} has no value outside a variant", i, b),
                 // A split RESTRICTS its operand, so under `lenient` the
                 // operand's own range still contains the result - which
@@ -879,9 +957,18 @@ impl Graph {
                     let _ = d;
                     a(0)
                 }
-                Op::SplitInt(_) if lenient => a(0),
-                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) => {
+                Op::SplitInt(_) | Op::SplitTab(_) if lenient => a(0),
+                Op::SplitValidTab(_) if !strict_err => Val::Bool(None),
+                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) => {
                     bail!("node {}: split {} has no value outside an outcome", i, d)
+                }
+                Op::Lo => {
+                    let iv = a(0).as_num("Lo")?;
+                    Val::Num(Pico8NumInterval::new(iv.low, iv.low))
+                }
+                Op::Hi => {
+                    let iv = a(0).as_num("Hi")?;
+                    Val::Num(Pico8NumInterval::new(iv.high, iv.high))
                 }
                 // The low end of fragment `c`, exact; under `lenient` the
                 // hull of that over the lanes: `[fl + c, fh + c]` cells.
@@ -1133,6 +1220,7 @@ impl Graph {
             Op::ConstBool(_)
             | Op::Free(_)
             | Op::SplitValid(_)
+            | Op::SplitValidTab(_)
             | Op::SplitOk(_)
             | Op::FragOk(_)
             | Op::Lt
@@ -1681,4 +1769,143 @@ mod tests {
         let err = g.eval(&cells).unwrap_err().to_string();
         assert!(err.contains("not modelled"), "unexpected error: {}", err);
     }
+}
+
+/// A static range as sorted, disjoint pieces (raw 16.16, inclusive).
+pub type Pieces = Vec<(i64, i64)>;
+
+/// The most pieces a range keeps; past that it is one hull.
+pub const MAX_PIECES: usize = 64;
+
+/// Sort, merge the overlapping and adjacent, refuse what the 16.16 range
+/// cannot hold (an overflow is "unknown": the kernel's arithmetic panics
+/// rather than wraps), and cap the count.
+pub fn normalize_pieces(mut v: Pieces) -> Option<Pieces> {
+    v.retain(|(lo, hi)| lo <= hi);
+    if v.is_empty() || v.iter().any(|(lo, hi)| *lo < i32::MIN as i64 || *hi > i32::MAX as i64) {
+        return None;
+    }
+    v.sort_unstable();
+    let mut out: Pieces = Vec::with_capacity(v.len());
+    for (lo, hi) in v {
+        match out.last_mut() {
+            Some(last) if lo <= last.1 + 1 => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    if out.len() > MAX_PIECES {
+        out = vec![(out[0].0, out[out.len() - 1].1)];
+    }
+    Some(out)
+}
+
+/// The static range of `n` in raw 16.16 units, if the analysis has one:
+/// from the seeded nodes (input cells known to lie in a range - a body
+/// specialized on the player's speed bucket) through the arithmetic the
+/// graph does on them, as PIECES. A select whose condition is not
+/// constant is the union of its arms, not their hull: the dash writes ±5
+/// next to a run speed under 1, and the hull would cross every bucket in
+/// between. `None` is "unknown", never a wrong bound; the runtime guard
+/// on the seeds is what makes a bound a fact rather than an assumption.
+/// `memo` persists across calls on one graph with the same seeds.
+pub fn pieces_of(
+    g: &Graph,
+    seeds: &HashMap<NodeId, (i64, i64)>,
+    memo: &mut HashMap<NodeId, Option<Pieces>>,
+    n: NodeId,
+) -> Option<Pieces> {
+    if let Some(r) = memo.get(&n) {
+        return r.clone();
+    }
+    let node = g.get(n);
+    let (op, args) = (node.op.clone(), node.args.clone());
+    let konst = |g: &Graph, n: NodeId| -> Option<Pico8Num> {
+        match g.get(n).op {
+            Op::Const(lo, hi) if lo == hi => Some(Pico8Num::from_raw(lo)),
+            _ => None,
+        }
+    };
+    let raw = |p: Pico8Num| p.as_raw_u32() as i32 as i64;
+    let p8 = |v: i64| Pico8Num::from_raw(v as i32);
+    let rec = |memo: &mut HashMap<NodeId, Option<Pieces>>, k: usize| pieces_of(g, seeds, memo, args[k]);
+    let r: Option<Pieces> = match op {
+        Op::Const(lo, hi) => Some(vec![(lo as i64, hi as i64)]),
+        Op::Cell(_) => seeds.get(&n).map(|r| vec![*r]),
+        Op::Add | Op::Sub | Op::Min | Op::Max => {
+            let (a, b) = (rec(memo, 0)?, rec(memo, 1)?);
+            let mut out = Vec::new();
+            for x in &a {
+                for y in &b {
+                    out.push(match op {
+                        Op::Add => (x.0 + y.0, x.1 + y.1),
+                        Op::Sub => (x.0 - y.1, x.1 - y.0),
+                        Op::Min => (x.0.min(y.0), x.1.min(y.1)),
+                        _ => (x.0.max(y.0), x.1.max(y.1)),
+                    });
+                }
+            }
+            normalize_pieces(out)
+        }
+        Op::Neg => normalize_pieces(rec(memo, 0)?.into_iter().map(|a| (-a.1, -a.0)).collect()),
+        Op::Abs => normalize_pieces(
+            rec(memo, 0)?
+                .into_iter()
+                .map(|a| {
+                    let lo = if a.0 <= 0 && a.1 >= 0 { 0 } else { a.0.abs().min(a.1.abs()) };
+                    (lo, a.0.abs().max(a.1.abs()))
+                })
+                .collect(),
+        ),
+        // A product or quotient by a CONSTANT is monotone in the other
+        // operand, so the endpoints map to the endpoints (in the exact
+        // 16.16 arithmetic, not a real-number bound).
+        Op::Mul | Op::Div => {
+            let (ka, kb) = (konst(g, args[0]), konst(g, args[1]));
+            let (k_of, k, is_div) = match (ka, kb) {
+                (_, Some(k)) => (0usize, k, matches!(op, Op::Div)),
+                (Some(k), None) if matches!(op, Op::Mul) => (1, k, false),
+                _ => {
+                    memo.insert(n, None);
+                    return None;
+                }
+            };
+            if is_div && k.as_raw_u32() == 0 {
+                memo.insert(n, None);
+                return None;
+            }
+            let a = rec(memo, k_of)?;
+            let f = |x: i64| -> i64 { raw(if is_div { p8(x) / k } else { p8(x) * k }) };
+            let mut out = Vec::new();
+            for a in a {
+                let (x, y) = (f(a.0), f(a.1));
+                out.push((x.min(y), x.max(y)));
+            }
+            normalize_pieces(out)
+        }
+        Op::Flr => {
+            let a = rec(memo, 0)?;
+            normalize_pieces(a.into_iter().map(|a| (raw(p8(a.0).flr()), raw(p8(a.1).flr()))).collect())
+        }
+        Op::Sin => Some(vec![(-(1i64 << 16), 1i64 << 16)]),
+        Op::Sel => match g.get(args[0]).op {
+            Op::ConstBool(true) => rec(memo, 1),
+            Op::ConstBool(false) => rec(memo, 2),
+            _ => {
+                let (mut a, b) = (rec(memo, 1)?, rec(memo, 2)?);
+                a.extend(b);
+                normalize_pieces(a)
+            }
+        },
+        Op::Span => {
+            let (a, b) = (rec(memo, 0)?, rec(memo, 1)?);
+            Some(vec![(a[0].0, b[b.len() - 1].1)])
+        }
+        // A fragment lies within its operand.
+        Op::Split(_) | Op::SplitInt(_) | Op::SplitTab(_) | Op::Frag(_) | Op::IntFrag(_) => rec(memo, 0),
+        Op::Lo => rec(memo, 0).map(|a| vec![(a[0].0, a[0].0)]),
+        Op::Hi => rec(memo, 0).map(|a| vec![(a[a.len() - 1].1, a[a.len() - 1].1)]),
+        _ => None,
+    };
+    memo.insert(n, r.clone());
+    r
 }

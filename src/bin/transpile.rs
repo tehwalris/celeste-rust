@@ -25,6 +25,16 @@ fn main() -> Result<()> {
                         .context("--spec-probe SHAPE index")?,
                 );
             }
+            "--bucket-probe" => {
+                let idx: usize = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--bucket-probe SHAPE"))?
+                    .parse()
+                    .context("--bucket-probe SHAPE index")?;
+                let report = celeste_rust::trace::kernel::bucket_probe(std::path::Path::new("."), idx)?;
+                print!("{}", report);
+                return Ok(());
+            }
             "--room-consts" => {
                 let report = celeste_rust::trace::kernel::room_constants(std::path::Path::new("."))?;
                 print!("{}", report);

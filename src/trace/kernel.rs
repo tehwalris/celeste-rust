@@ -111,6 +111,7 @@ pub(crate) fn lattice_kernel_refs(
                         &bound.outcomes,
                         Some(room.clone()),
                         bound.forks,
+                        Default::default(),
                     )
                     .map_err(|e| anyhow::anyhow!("lattice shape {} lower: {:#}", i, name_cells(&f, e)))?;
                     Ok(Reference {
@@ -208,6 +209,307 @@ mod tests {
     }
 
 
+}
+
+// ---------------------------------------------------------------------------
+// The bucket-dispatch probe (2026-09-15). NOT production: it re-traces one
+// shape with the player's speed cells bounded to one threshold bucket per
+// axis (`Symbolic::ranges`), the boundary snap forking at the bucket table
+// (`widen::spd_table_node`), and reports what the specialization buys:
+// nodes, forks and their arities, bodies, loop bodies traced, comparisons
+// folded, merge premises left. Driven by `transpile --bucket-probe SHAPE`.
+// ---------------------------------------------------------------------------
+
+/// One speed axis's bucket edges (raw, sorted): the 1 px grid, the
+/// thresholds the cart compares the speed against, and singleton buckets
+/// (`t`, `t + 1`) at the equality tests' preimages.
+fn bucket_edges(axis: usize) -> Vec<i32> {
+    use celeste_core::pico8_num::Pico8Num as P8;
+    let raw = |s: &str| -> i32 { s.parse::<P8>().expect("literal").as_raw_u32() as i32 };
+    let mut es: std::collections::BTreeSet<i32> = Default::default();
+    for i in 1..=8 {
+        es.insert(i << 16);
+        es.insert(-(i << 16));
+    }
+    let (singles, plain): (Vec<&str>, Vec<&str>) = if axis == 0 {
+        (vec!["0", "0.05", "-0.05", "0.15", "-0.15", "0.4", "-0.4", "0.6", "-0.6"], vec!["1.5", "-1.5"])
+    } else {
+        (vec!["0", "-0.5"], vec!["0.15", "-0.15", "0.4", "1.5", "-1.5"])
+    };
+    for s in singles {
+        let t = raw(s);
+        es.insert(t);
+        es.insert(t + 1);
+    }
+    for s in plain {
+        es.insert(raw(s));
+    }
+    es.into_iter().collect()
+}
+
+/// The buckets of an edge list within `[-lim, lim]` raw: `(lo, hi)` inclusive.
+fn buckets_of(edges: &[i32], lim: i32) -> Vec<(i32, i32)> {
+    edges
+        .windows(2)
+        .map(|w| (w[0], w[1] - 1))
+        .filter(|(lo, hi)| *lo >= -lim && *hi <= lim)
+        .collect()
+}
+
+/// One trace + lowering of the probe, and its statistics.
+struct Stat {
+    nodes: usize,
+    /// Per fork: arity and kind (`g` grid, `t` table).
+    forks: Vec<String>,
+    bodies: usize,
+    fused: usize,
+    /// The assembled kernel: instruction lines and output slots.
+    asm_lines: usize,
+    slots: usize,
+    iters: u64,
+    folds: u64,
+    premises: usize,
+    err: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_trace<'a>(
+    it: &mut super::interp::Interp<'a, super::domain::Symbolic>,
+    reset: &'a full_moon::ast::Ast,
+    fr: &'a full_moon::ast::Ast,
+    st: &super::state::State<super::domain::Symbolic>,
+    roots: &[super::iface::Path],
+    ival: &[super::iface::Path],
+    opts: super::shapes::WalkOpts,
+    room: &crate::transpile::graph::Room,
+    pin: &[(super::iface::Path, super::iface::Conc)],
+    bounds: &[(super::iface::Path, (i32, i32))],
+) -> Stat {
+    use crate::transpile::graph::Op;
+    let it0 = it.for_iterations;
+    let f = match super::verify::trace_frame(it, reset, fr, st.clone(), roots, pin, ival, opts.widen_mode(), bounds) {
+        Ok(f) => f,
+        Err(e) => {
+            return Stat { nodes: 0, forks: vec![], bodies: 0, fused: 0, asm_lines: 0, slots: 0, iters: it.for_iterations - it0, folds: it.d.range_folds, premises: 0, err: Some(format!("{e:#}")) }
+        }
+    };
+    // Nodes reachable from every outcome's roots, and the merge premises
+    // (`Known` of a non-constant) among them.
+    let g = &it.d.graph;
+    let mut seen = vec![false; g.len()];
+    let mut stack: Vec<u32> = Vec::new();
+    for o in &f.outs {
+        stack.extend(o.fields.iter().map(|(_, n, _)| *n));
+        stack.push(o.ok);
+        stack.push(o.guard);
+        stack.extend(o.keys.iter().map(|(_, n)| *n));
+    }
+    // A merge premise (`Known(cond)`) that can FAIL at runtime is one
+    // whose condition reads an interval: a comparison with an interval
+    // operand, or a connective / select over one.
+    fn reads_interval(d: &super::domain::Symbolic, n: u32, depth: usize) -> bool {
+        use super::domain::Domain;
+        let nd = d.graph.get(n);
+        match nd.op {
+            Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => nd.args.iter().any(|a| d.is_interval(a)),
+            Op::Not | Op::And | Op::Or | Op::Sel if depth > 0 => nd.args.iter().any(|a| reads_interval(d, *a, depth - 1)),
+            _ => false,
+        }
+    }
+    let (mut nodes, mut premises) = (0usize, 0usize);
+    let mut known_args: Vec<u32> = Vec::new();
+    while let Some(n) = stack.pop() {
+        if seen[n as usize] {
+            continue;
+        }
+        seen[n as usize] = true;
+        nodes += 1;
+        let nd = g.get(n);
+        if matches!(nd.op, Op::Known) && !matches!(g.get(nd.args[0]).op, Op::ConstBool(_) | Op::Flr) {
+            known_args.push(nd.args[0]);
+        }
+        stack.extend(nd.args.iter().copied());
+    }
+    for a in known_args {
+        if reads_interval(&it.d, a, 6) {
+            premises += 1;
+        }
+    }
+    let g = &it.d.graph;
+    let forks: Vec<String> = (0..f.forks)
+        .map(|d| format!("{}{}", g.fork_ways(d), if g.fork_table(d).is_empty() { "g" } else { "t" }))
+        .collect();
+    // The bounds, by ENGINE cell, for the decide step's folding.
+    let ranges: std::collections::HashMap<u32, (i32, i32)> = bounds
+        .iter()
+        .filter_map(|(p, r)| f.iface.slots.iter().position(|q| q == p).map(|i| (f.in_cells[i], *r)))
+        .collect();
+    // Lower and ASSEMBLE, for the kernel's size: the instruction count is
+    // the per-slice cost the fused node count only approximates.
+    static TAGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let build = || -> Result<(usize, usize, usize, usize)> {
+        let b = super::emit::bind(&f, g, opts.widen)?;
+        let l = super::emit::lower_frame(&b.graph, &b.outcomes, Some(room.clone()), b.forks, ranges)?;
+        let (fused, _bodies, roots, reprs) = super::emit::asm_fused_from(&b, &l.spec)?;
+        let tag = format!("bp{}", TAGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let (compiled, _loaded) = crate::transpile::asm::compile_and_load_reprs(&fused, &roots, &tag, &reprs)?;
+        let lines = compiled.asm.lines().filter(|l| l.starts_with('\t') || l.starts_with("    ")).count();
+        Ok((l.bodies, l.spec.0.len(), lines, compiled.n_roots))
+    };
+    let (bodies, fused, asm_lines, slots, err) = match build() {
+        Ok((b, n, a, s)) => (b, n, a, s, None),
+        Err(e) => (0, 0, 0, 0, Some(format!("lower: {e:#}"))),
+    };
+    Stat { nodes, forks, bodies, fused, asm_lines, slots, iters: it.for_iterations - it0, folds: it.d.range_folds, premises, err }
+}
+
+pub fn bucket_probe(root: &std::path::Path, shape_idx: usize) -> Result<String> {
+    use super::domain::Symbolic;
+    use super::interp::Interp;
+    use super::iface::{self, Step};
+    use super::verify::run_one;
+    use super::heap::Value;
+    use super::{cart, shapes};
+    use anyhow::{anyhow, bail};
+    use celeste_core::pico8_num::Pico8Num as P8;
+    use std::fmt::Write as _;
+
+    let src = cart::sources_in(root)?;
+    let top = full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?;
+    let init = full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?;
+    let reset = full_moon::parse("__reset_button_states()").map_err(|e| anyhow!("reset: {:?}", e))?;
+    let fr = full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("frame: {:?}", e))?;
+    // The assembled text is what the size metric counts.
+    std::env::set_var("CELESTE_KEEP_ASM", "1");
+
+    let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+    let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
+    let (rx, ry) = celeste_interp::game_runner::start_room();
+    let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
+    it.cache = Some(cache.clone());
+    it.cart = Some(cart_data.clone());
+    let room = crate::transpile::graph::Room { cart: cart_data.clone(), cache: cache.clone() };
+
+    let st0 = cart::fresh_state::<Symbolic>(&mut it.d);
+    let st0 = run_one(&mut it, &top, st0)?;
+    let mut st0 = st0;
+    cart::inject_tile_flag_at(&mut st0);
+    let st0 = run_one(&mut it, &init, st0)?;
+    // The hull's level-0 set: uniform 1 px speed buckets, the baseline.
+    let opts = shapes::WalkOpts::level0(
+        crate::interpreter::abstraction::SpdPrecision::WidthLog2(16),
+        crate::interpreter::abstraction::PosPrecision::EXACT,
+    );
+    let w = shapes::walk(&mut it, &reset, &fr, st0, 400, opts)?;
+    if shape_idx >= w.shapes.len() {
+        bail!("shape {} out of range ({} shapes)", shape_idx, w.shapes.len());
+    }
+    let st = w.shapes[shape_idx].state.clone();
+    let roots = shapes::state_paths(&st)?;
+    let ival = shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival());
+    let players: Vec<Vec<Step>> = {
+        let mut out = Vec::new();
+        if let (Some(Value::Table(want)), Some(Value::Table(objects))) =
+            (iface::get(&st, &[iface::key("player")]), iface::get(&st, &[iface::key("objects")]))
+        {
+            let n = st.heap.tables[&objects].arr.len();
+            for i in 0..n {
+                let base = vec![iface::key("objects"), Step::Idx(i)];
+                let mut ty = base.clone();
+                ty.push(iface::key("type"));
+                if iface::get(&st, &ty) == Some(Value::Table(want)) {
+                    out.push(base);
+                }
+            }
+        }
+        out
+    };
+    let Some(pl) = players.first().cloned() else { bail!("shape {shape_idx} has no player") };
+    let fld = |f: &[&str]| -> Vec<Step> {
+        let mut p = pl.clone();
+        for x in f {
+            p.push(iface::key(x));
+        }
+        p
+    };
+    let (px, py) = (fld(&["spd", "x"]), fld(&["spd", "y"]));
+    // The player's rem is within [-0.5, 0.5) at every rung by the
+    // boundary's construction, so its cells can be seeded too: that is
+    // what bounds `flr(rem + spd + 0.5)`, the move loop's trip count.
+    let rem: Vec<(Vec<Step>, (i32, i32))> = vec![(fld(&["rem", "x"]), (-0x8000, 0x7fff)), (fld(&["rem", "y"]), (-0x8000, 0x7fff))];
+    // The dash's target and accel are written from constants (0, ±2,
+    // ±1.5; 1.5, 1.06), so their cells are bounded too - the reachable
+    // constant lattice would say the same.
+    let dash: Vec<(Vec<Step>, (i32, i32))> = vec![
+        (fld(&["dash_target", "x"]), (-2 << 16, 2 << 16)),
+        (fld(&["dash_target", "y"]), (-2 << 16, 2 << 16)),
+        (fld(&["dash_accel", "x"]), (0, 3 << 15)),
+        (fld(&["dash_accel", "y"]), (0, 3 << 15)),
+    ];
+    // Two dispatch keys on top of the speed bucket: not mid-dash, and
+    // with / without a dash available - the old pm1 key's shape.
+    let pins: Vec<(&str, Vec<(Vec<Step>, super::iface::Conc)>)> = vec![
+        ("dash_time=0 djump=0", vec![(fld(&["dash_time"]), super::iface::Conc::Num(P8::from_i16(0))), (fld(&["djump"]), super::iface::Conc::Num(P8::from_i16(0)))]),
+        ("dash_time=0 djump=1", vec![(fld(&["dash_time"]), super::iface::Conc::Num(P8::from_i16(0))), (fld(&["djump"]), super::iface::Conc::Num(P8::from_i16(1)))]),
+    ];
+
+    let line = |s: &Stat| -> String {
+        match &s.err {
+            Some(e) => format!("ERROR {e}"),
+            None => format!(
+                "nodes {:>5} forks {:?} bodies {:>4} fused {:>6} asm {:>7} slots {:>5} loops {:>3} folds {:>3} premises {:>3}",
+                s.nodes, s.forks, s.bodies, s.fused, s.asm_lines, s.slots, s.iters, s.folds, s.premises
+            ),
+        }
+    };
+
+    let mut rep = String::new();
+    let base = probe_trace(&mut it, &reset, &fr, &st, &roots, &ival, opts, &room, &[], &[]);
+    writeln!(rep, "shape {shape_idx} of {} ({} objects): baseline (1 px buckets, grid fork)", w.shapes.len(), roots.iter().filter(|p| p.len() == 3 && p[0] == iface::key("objects")).map(|p| p[1].clone()).collect::<std::collections::BTreeSet<_>>().len())?;
+    writeln!(rep, "  {}", line(&base))?;
+
+    let ex = bucket_edges(0);
+    let ey = bucket_edges(1);
+    let lim = 2 << 16;
+    let xs = buckets_of(&ex, lim);
+    let yonly = std::env::var_os("CELESTE_BUCKET_YONLY").is_some();
+    let ys: Vec<(i32, i32)> = {
+        let raw = |s: &str| -> i32 { s.parse::<celeste_core::pico8_num::Pico8Num>().unwrap().as_raw_u32() as i32 };
+        let want = [0i32, 1, raw("1"), raw("-2")];
+        let all = buckets_of(&ey, 8 << 16);
+        let pick: Vec<(i32, i32)> = want.iter().filter_map(|w| all.iter().find(|(lo, _)| lo == w).copied()).collect();
+        if yonly { pick[..1].to_vec() } else { pick }
+    };
+    let show = |(lo, hi): (i32, i32)| -> String {
+        let f = |r: i32| r as f64 / 65536.0;
+        if lo == hi { format!("{{{:.4}}}", f(lo)) } else { format!("[{:.4},{:.4}]", f(lo), f(hi)) }
+    };
+    writeln!(rep, "x buckets {} ({} edges), y buckets {} ({} edges); tracing {} pairs", xs.len(), ex.len(), ys.len(), ey.len(), xs.len() * ys.len())?;
+    it.d.spd_edges = Some([ex.clone(), ey.clone()]);
+    let (mut sum_bodies, mut sum_fused, mut max_ways) = (0usize, 0usize, 0u8);
+    let base_max = base.forks.iter().map(|f| f.trim_end_matches(['g', 't']).parse::<u8>().unwrap_or(0)).max().unwrap_or(0);
+    for (pname, pin) in &pins {
+        writeln!(rep, "== {pname}")?;
+        for &yb in &ys {
+            writeln!(rep, "y {}:", show(yb))?;
+            for &xb in &xs {
+                let mut bounds = rem.clone();
+                bounds.extend(dash.iter().cloned());
+                bounds.push((px.clone(), xb));
+                bounds.push((py.clone(), yb));
+                let s = probe_trace(&mut it, &reset, &fr, &st, &roots, &ival, opts, &room, pin, &bounds);
+                eprintln!("[probe] {pname} x {} y {}: {}", show(xb), show(yb), line(&s));
+                writeln!(rep, "  x {:<18} {}", show(xb), line(&s))?;
+                sum_bodies += s.bodies;
+                sum_fused += s.fused;
+                max_ways = max_ways.max(s.forks.iter().map(|f| f.trim_end_matches(['g', 't']).parse::<u8>().unwrap_or(0)).max().unwrap_or(0));
+            }
+        }
+    }
+    it.d.spd_edges = None;
+    writeln!(rep, "totals over {} (pin, pair)s: bodies {} (baseline {}), fused nodes {} (baseline {}), max fork arity {} (baseline {})",
+        pins.len() * xs.len() * ys.len(), sum_bodies, base.bodies, sum_fused, base.fused, max_ways, base_max)?;
+    Ok(rep)
 }
 
 // ---------------------------------------------------------------------------
@@ -480,12 +782,12 @@ pub fn specialize_probe(
     }
 
     // Base: same shape, NO pins.
-    let base = trace_frame(&mut it, &reset, &fr, st.clone(), &roots, &[], &ival, Some(crate::trace::widen::WidenMode::Level0(crate::interpreter::abstraction::SpdPrecision::Exact, crate::interpreter::abstraction::PosPrecision::EXACT)))
+    let base = trace_frame(&mut it, &reset, &fr, st.clone(), &roots, &[], &ival, Some(crate::trace::widen::WidenMode::Level0(crate::interpreter::abstraction::SpdPrecision::Exact, crate::interpreter::abstraction::PosPrecision::EXACT)), &[])
         .map_err(|e| anyhow!("base trace of shape {}: {:#}", shape_idx, e))?;
     let (bn, bf, _) = measure(&it.d.graph, &base);
 
     // Pinned.
-    let f = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, Some(crate::trace::widen::WidenMode::Level0(crate::interpreter::abstraction::SpdPrecision::Exact, crate::interpreter::abstraction::PosPrecision::EXACT)))
+    let f = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, Some(crate::trace::widen::WidenMode::Level0(crate::interpreter::abstraction::SpdPrecision::Exact, crate::interpreter::abstraction::PosPrecision::EXACT)), &[])
         .map_err(|e| anyhow!("pinned trace of shape {}: {:#}", shape_idx, e))?;
     let (pn, pf, ptop) = measure(&it.d.graph, &f);
 
@@ -652,7 +954,7 @@ pub fn room_constant_lattice(
             .filter(|(p, _)| roots.iter().any(|r| r == *p))
             .map(|(p, c)| (p.clone(), *c))
             .collect();
-        let f = match trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, opts.widen_mode()) {
+        let f = match trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, opts.widen_mode(), &[]) {
             Ok(f) => f,
             Err(e) => {
                 // Remember the refusal instead of silently skipping: a
@@ -758,7 +1060,7 @@ pub fn room_constants(root: &std::path::Path) -> Result<String> {
     let mut bodies_by_shape: std::collections::BTreeMap<String, usize> = Default::default();
     for (k, f) in frames.iter_mut() {
         if let Ok(bound) = super::emit::bind(f, &graph, true) {
-            if let Ok(low) = super::emit::lower_frame(&bound.graph, &bound.outcomes, Some(room.clone()), bound.forks) {
+            if let Ok(low) = super::emit::lower_frame(&bound.graph, &bound.outcomes, Some(room.clone()), bound.forks, Default::default()) {
                 bodies_by_shape.insert(k.clone(), low.bodies);
             }
         }

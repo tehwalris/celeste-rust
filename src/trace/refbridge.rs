@@ -223,6 +223,7 @@ pub fn to_trace_state(
         guard: true,
         ok: true,
         path: Vec::new(),
+        key_override: Vec::new(),
     })
 }
 

@@ -169,6 +169,8 @@ fn eval_nodes(
                     V::B(ZB { val, known: ALL })
                 }
             }
+            Op::Lo => V::N(iv(0).lo),
+            Op::Hi => V::N(iv(0).hi),
             Op::Sel => {
                 let c = b(0);
                 match vals[node.args[1] as usize] {

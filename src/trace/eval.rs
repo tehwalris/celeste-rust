@@ -196,7 +196,8 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
             // The specialization ops. The tracer never builds one - a
             // split is a branch to it, not a node - so reaching here
             // means the graph came from somewhere else.
-            Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::IntFrag(_) | Op::SplitOk(_) | Op::Frag(_) | Op::FragOk(_) => {
+            Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::IntFrag(_) | Op::SplitOk(_) | Op::Frag(_) | Op::FragOk(_)
+            | Op::SplitTab(_) | Op::SplitValidTab(_) | Op::Lo | Op::Hi => {
                 bail!("node {} is {:?}, which the tracer does not build", id, node.op)
             }
             // The row-key layer is added to the FUSED graph after tracing; a

@@ -86,7 +86,12 @@ impl Block {
     pub fn from_state(state: &State) -> Result<Self> {
         let (cart, cache) = crate::compiled::room_context()?;
         let mut rt2 = crate::compiled::bridge::import_block(state, cart, cache);
+        // The key is the level's WIDENED row (the speed hull: a row stores
+        // its tight speed and is keyed on the bucket), the same rule the
+        // kernels' key layer applies (`asm_kernel`: the key node override).
+        let (_, keys, _) = widened_keys_rt2(&rt2, crate::interpreter::abstraction::current_level())?;
         rt2.row_keys_canonical();
+        rt2.row_keys = keys;
         Ok(Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() })
     }
 
@@ -357,6 +362,27 @@ impl Slot {
             .sum::<usize>()
             + self.keys.capacity() * 16
             + self.cells.capacity() * 4
+    }
+
+    /// The typed-column indices (into `cols`) of the player's `spd.x` and
+    /// `spd.y` when the level buckets the speed - they are interval
+    /// columns then. `None` at exact speed (numbers) or without a player.
+    pub fn speed_typed_cols(&self) -> Option<(usize, usize)> {
+        let ids = crate::compiled::ids();
+        let obj = crate::search::pos_graph::player_object(&self.skeleton)?;
+        let pc = self.skeleton.obj_field_cell(obj, ids.f_spd)?;
+        let Col::U(AV::Ptr(sub)) = self.skeleton.cols[pc as usize] else { return None };
+        let cx = self.skeleton.obj_field_cell(sub, ids.f_x)?;
+        let cy = self.skeleton.obj_field_cell(sub, ids.f_y)?;
+        let tx = self.cols.iter().position(|(c, t)| *c == cx as usize && matches!(t, TCol::Ival(_)))?;
+        let ty = self.cols.iter().position(|(c, t)| *c == cy as usize && matches!(t, TCol::Ival(_)))?;
+        Some((tx, ty))
+    }
+
+    /// Row `r`'s speed hull from the typed columns `speed_typed_cols` found.
+    pub fn speed_hull(&self, tx: usize, ty: usize, r: usize) -> crate::search::door::Hull {
+        let (TCol::Ival(x), TCol::Ival(y)) = (&self.cols[tx].1, &self.cols[ty].1) else { unreachable!("speed columns are intervals") };
+        [x[r].0 as i32, x[r].1 as i32, y[r].0 as i32, y[r].1 as i32]
     }
 
     /// Drop the rows, keeping the skeleton and the columns' capacity.
@@ -726,6 +752,10 @@ pub struct ForwardSink<'a> {
     pub flushed_rows: u64,
     sort_buf: Vec<((u64, u64), u32)>,
     keys_buf: Vec<(u64, u64)>,
+    /// Per distinct key of a flush, its rows' speed hull; and per new key,
+    /// the hull the emitted row carries (`door::Admit::admit`).
+    hull_buf: Vec<crate::search::door::Hull>,
+    new_hulls: Vec<crate::search::door::Hull>,
     uniq_buf: Vec<u32>,
     row_uniq: Vec<u32>,
     new_buf: Vec<u32>,
@@ -780,6 +810,8 @@ impl<'a> ForwardSink<'a> {
             flushed_rows: 0,
             sort_buf: Vec::with_capacity(QUEUE_ROWS),
             keys_buf: Vec::with_capacity(QUEUE_ROWS),
+            hull_buf: Vec::with_capacity(QUEUE_ROWS),
+            new_hulls: Vec::with_capacity(QUEUE_ROWS),
             uniq_buf: Vec::with_capacity(QUEUE_ROWS),
             row_uniq: Vec::with_capacity(QUEUE_ROWS),
             new_buf: Vec::with_capacity(QUEUE_ROWS),
@@ -889,6 +921,25 @@ impl<'a> ForwardSink<'a> {
         } else {
             s.last_extra[r] = s.extra.len() as u32;
             s.extra.push((r as u32, base, 1u64 << lane));
+        }
+        true
+    }
+
+    /// THE SPEED HULL at the call's dedup cache: a lane re-emitting a
+    /// queued row's key with another speed fragment widens that row's
+    /// hull in place (columns `tx`/`ty`, `Slot::speed_typed_cols`). False
+    /// if the queue was flushed since (the ref is stale).
+    pub fn hull_union_at(&mut self, row_ref: u64, tx: usize, ty: usize, h: crate::search::door::Hull) -> bool {
+        let (gen, q, r) = ((row_ref >> 32) as u16, ((row_ref >> 8) & 0xff_ffff) as usize, (row_ref & 0xff) as usize);
+        let s = &mut self.slots[q];
+        if !s.live || s.gen != gen || r >= s.pred_mask.len() {
+            return false;
+        }
+        if let TCol::Ival(x) = &mut s.cols[tx].1 {
+            x[r] = ((x[r].0 as i32).min(h[0]) as u32, (x[r].1 as i32).max(h[1]) as u32);
+        }
+        if let TCol::Ival(y) = &mut s.cols[ty].1 {
+            y[r] = ((y[r].0 as i32).min(h[2]) as u32, (y[r].1 as i32).max(h[3]) as u32);
         }
         true
     }
@@ -1025,6 +1076,19 @@ impl<'a> ForwardSink<'a> {
             }
             self.new_buf.clear();
             self.ids_buf.clear();
+            self.new_hulls.clear();
+            // THE SPEED HULL: per distinct key, the union of its rows'
+            // speed intervals (`door::Hull`), when the level buckets the
+            // speed (the slot's speed columns are intervals).
+            let spd_cols = slot.speed_typed_cols();
+            self.hull_buf.clear();
+            if let Some((cx, cy)) = spd_cols {
+                self.hull_buf.resize(self.keys_buf.len(), crate::search::door::NO_HULL);
+                for (e, &u) in self.sort_buf.iter().zip(&self.uniq_buf) {
+                    let h = slot.speed_hull(cx, cy, e.1 as usize);
+                    self.hull_buf[u as usize] = crate::search::door::hull_union(&self.hull_buf[u as usize], &h);
+                }
+            }
             // The piece the new rows land in, and the id the first of them
             // gets: the door hands the k-th new key `first_new + k`, and the
             // rows are appended in that same order.
@@ -1035,7 +1099,16 @@ impl<'a> ForwardSink<'a> {
                 .entry(slot.shape)
                 .or_insert_with(|| (slot.empty_piece(), worker * 256 + n_pieces, Vec::new()));
             let first_new = pack_id(frame, *seq, piece.width as u32);
-            door.admit(slot.shape, slot.cell, &self.keys_buf, first_new, &mut self.ids_buf, &mut self.new_buf);
+            door.admit(
+                slot.shape,
+                slot.cell,
+                &self.keys_buf,
+                first_new,
+                &mut self.ids_buf,
+                &mut self.new_buf,
+                spd_cols.map(|_| &self.hull_buf[..]),
+                &mut self.new_hulls,
+            );
             // The edges: every row (each a predecessor mask) to its state,
             // plus the extra masks. Rows without ids (a step run on
             // id-less blocks, e.g. the tests' reference engine) have no
@@ -1074,7 +1147,17 @@ impl<'a> ForwardSink<'a> {
                 }));
                 self.kept += self.rows_buf.len();
                 self.won |= slot.any_win(&self.rows_buf)?;
+                let w0 = piece.width;
                 slot.gather_into(piece, &self.rows_buf);
+                // An emitted row carries the hull the door handed back:
+                // its own for a new key, the union for a grown one.
+                if let Some((cx, cy)) = spd_cols {
+                    let (cx, cy) = (slot.cols[cx].0, slot.cols[cy].0);
+                    for (k, h) in self.new_hulls.iter().enumerate() {
+                        celeste_engine::runtime2::col_set(&mut piece.cols[cx], piece.width, w0 + k, AV::Ival(P8::from_raw(h[0]), P8::from_raw(h[1])));
+                        celeste_engine::runtime2::col_set(&mut piece.cols[cy], piece.width, w0 + k, AV::Ival(P8::from_raw(h[2]), P8::from_raw(h[3])));
+                    }
+                }
                 ids.extend((0..self.rows_buf.len() as u32).map(|k| first_new + k as u64));
                 debug_assert_eq!(ids.len(), piece.width);
             }
@@ -1742,8 +1825,10 @@ impl ForwardState {
             let cells = b.positions()?;
             let shape = b.shard_shape();
             let (mut new, mut ids) = (Vec::new(), Vec::new());
-            for ((&cell, &key), &id) in cells.iter().zip(b.keys()).zip(b.ids()) {
-                door.admit(shape, cell, &[key], id, &mut ids, &mut new);
+            let hulls = b.rt2().speed_hulls(crate::compiled::ids());
+            for (r, ((&cell, &key), &id)) in cells.iter().zip(b.keys()).zip(b.ids()).enumerate() {
+                let h = hulls.as_ref().map(|h| vec![h[r]]);
+                door.admit(shape, cell, &[key], id, &mut ids, &mut new, h.as_deref(), &mut Vec::new());
             }
         }
         door.end_frame(1);
@@ -1805,11 +1890,15 @@ impl ForwardState {
             })
             .collect();
         let next = AtomicUsize::new(0);
+        let hulled = matches!(
+            crate::interpreter::abstraction::spd_precision(),
+            crate::interpreter::abstraction::SpdPrecision::WidthLog2(_)
+        );
         let partial: Vec<(rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>>, Option<u32>)> =
             std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..threads())
                     .map(|_| {
-                        let (files, next, seq_of) = (&files, &next, &seq_of);
+                        let (files, next, seq_of, hulled) = (&files, &next, &seq_of, hulled);
                         scope.spawn(move || -> Result<_> {
                             let mut m: rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>> = Default::default();
                             let mut win: Option<u32> = None;
@@ -1819,8 +1908,17 @@ impl ForwardState {
                                 let file = crate::search::checkpoint::FrameFile::open(path)?;
                                 let shape = file.shape_hash();
                                 let seq = seq_of(path);
+                                // The door's speed hulls come back from the
+                                // rows (a bucketed level; decoding every layer,
+                                // which a resume can afford).
+                                let hulls: Option<Vec<crate::search::door::Hull>> = if hulled {
+                                    file.load_all()?.and_then(|rt2| rt2.speed_hulls(crate::compiled::ids()))
+                                } else {
+                                    None
+                                };
                                 for (row, (cell, key)) in file.cell_keys_rows() {
-                                    m.entry((shape, cell)).or_default().push((key, pack_id(*f, seq, row)));
+                                    let h = hulls.as_ref().map_or(crate::search::door::NO_HULL, |h| h[row as usize]);
+                                    m.entry((shape, cell)).or_default().push((key, pack_id(*f, seq, row), h));
                                 }
                                 if !file.wins().is_empty() {
                                     win = Some(win.map_or(*f, |w| w.min(*f)));

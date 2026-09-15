@@ -19,9 +19,31 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub type Key = (u64, u64);
 
-/// A shard entry: the key and the state's id `(layer, file seq, row)`,
-/// packed by `crate::frame::pack_id`.
-pub type Entry = (Key, u64);
+/// THE SPEED HULL of a key: the union of the player's `spd.x`/`spd.y`
+/// intervals (raw 16.16, `[x_lo, x_hi, y_lo, y_hi]`) of every row merged
+/// into it. A key is the state with its speed BUCKETED; the rows store
+/// the tight fragment. A new row whose fragment lies inside the hull is
+/// the old state (its id); one that widens the hull is a NEW row: the
+/// hull grows to the union, the key points at the row's fresh id, and
+/// the row is expanded with the union as its speed - so everything
+/// inside the hull has been expanded by some row containing it (the
+/// union, not the row's own fragment: a hull with a gap between two
+/// merged fragments would otherwise cover speeds nobody expanded).
+/// `NO_HULL` when speeds are exact: never widened, never grows.
+pub type Hull = [i32; 4];
+pub const NO_HULL: Hull = [i32::MAX, i32::MIN, i32::MAX, i32::MIN];
+
+pub fn hull_contains(outer: &Hull, inner: &Hull) -> bool {
+    outer[0] <= inner[0] && inner[1] <= outer[1] && outer[2] <= inner[2] && inner[3] <= outer[3]
+}
+
+pub fn hull_union(a: &Hull, b: &Hull) -> Hull {
+    [a[0].min(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].max(b[3])]
+}
+
+/// A shard entry: the key, the state's id `(layer, file seq, row)`
+/// packed by `crate::frame::pack_id`, and its speed hull.
+pub type Entry = (Key, u64, Hull);
 
 /// The door's contract: admit sorted, deduplicated key batches; merge at
 /// the end of a frame.
@@ -30,8 +52,22 @@ pub trait Admit: Sync {
     /// an existing entry's, or - for a key NOT in the shard - a fresh one,
     /// `first_new + k` for the k-th new key in order, which the shard
     /// records. `ids` receives one id per key (in `keys`' order), `new`
-    /// the indices of the new keys.
-    fn admit(&self, shape: u64, cell: u32, keys: &[Key], first_new: u64, ids: &mut Vec<u64>, new: &mut Vec<u32>);
+    /// the indices of the new keys. With `hulls` (one per key, the rows'
+    /// speed hull), an existing key whose hull does not contain the new
+    /// one is NEW too (`Hull`): its hull becomes the union, its id the
+    /// fresh one; `new_hulls` receives, per new key, the hull the emitted
+    /// row is to carry (its own, or the union).
+    fn admit(
+        &self,
+        shape: u64,
+        cell: u32,
+        keys: &[Key],
+        first_new: u64,
+        ids: &mut Vec<u64>,
+        new: &mut Vec<u32>,
+        hulls: Option<&[Hull]>,
+        new_hulls: &mut Vec<Hull>,
+    );
     /// The frame is over: fold this frame's admissions into the base.
     fn end_frame(&self, workers: usize);
     fn len(&self) -> usize;
@@ -63,7 +99,7 @@ fn build_index(base: &[Entry]) -> Vec<u32> {
     let nb = 1usize << bits;
     let mut index = vec![0u32; nb + 1];
     let mut b = 0usize;
-    for (i, (k, _)) in base.iter().enumerate() {
+    for (i, (k, _, _)) in base.iter().enumerate() {
         let kb = if bits == 0 { 0 } else { (k.0 >> (64 - bits)) as usize };
         while b < kb {
             b += 1;
@@ -80,40 +116,67 @@ fn build_index(base: &[Entry]) -> Vec<u32> {
 impl Shard {
     /// Merge-join `keys` against `base` and `delta`; the misses get fresh
     /// ids and go to `delta`, kept sorted by key.
-    fn admit(&mut self, keys: &[Key], first_new: u64, ids: &mut Vec<u64>, new: &mut Vec<u32>, scratch: &mut Vec<Entry>) {
+    fn admit(
+        &mut self,
+        keys: &[Key],
+        first_new: u64,
+        ids: &mut Vec<u64>,
+        new: &mut Vec<u32>,
+        hulls: Option<&[Hull]>,
+        new_hulls: &mut Vec<Hull>,
+        scratch: &mut Vec<Entry>,
+    ) {
         let mut d = 0usize;
-        let (base, delta) = (&self.base, &self.delta);
         scratch.clear();
-        let bits = index_bits(base.len());
+        let bits = index_bits(self.base.len());
         const AHEAD: usize = 8;
         for k in keys.iter().take(AHEAD) {
             self.prefetch(bits, k);
         }
         let mut n_new = 0u64;
+        // An existing entry: the old id, unless the row's hull escapes
+        // the entry's - then the entry takes the union and a fresh id,
+        // and the row is new (carrying the union).
+        let hit = |e: &mut Entry, i: usize, ids: &mut Vec<u64>, new: &mut Vec<u32>, new_hulls: &mut Vec<Hull>, n_new: &mut u64| {
+            if let Some(h) = hulls {
+                if !hull_contains(&e.2, &h[i]) {
+                    e.2 = hull_union(&e.2, &h[i]);
+                    let id = first_new + *n_new;
+                    *n_new += 1;
+                    e.1 = id;
+                    ids.push(id);
+                    new.push(i as u32);
+                    new_hulls.push(e.2);
+                    return;
+                }
+            }
+            ids.push(e.1);
+        };
         for (i, k) in keys.iter().enumerate() {
             if let Some(k2) = keys.get(i + AHEAD) {
                 self.prefetch(bits, k2);
             }
-            if !base.is_empty() {
+            if !self.base.is_empty() {
                 let kb = if bits == 0 { 0 } else { (k.0 >> (64 - bits)) as usize };
                 let (lo, hi) = (self.index[kb] as usize, self.index[kb + 1] as usize);
-                let bucket = &base[lo..hi];
-                let b = lo + bucket.partition_point(|x| x.0 < *k);
-                if b < hi && base[b].0 == *k {
-                    ids.push(base[b].1);
+                let b = lo + self.base[lo..hi].partition_point(|x| x.0 < *k);
+                if b < hi && self.base[b].0 == *k {
+                    hit(&mut self.base[b], i, ids, new, new_hulls, &mut n_new);
                     continue;
                 }
             }
-            d = gallop(delta, d, k);
-            if d < delta.len() && delta[d].0 == *k {
-                ids.push(delta[d].1);
+            d = gallop(&self.delta, d, k);
+            if d < self.delta.len() && self.delta[d].0 == *k {
+                hit(&mut self.delta[d], i, ids, new, new_hulls, &mut n_new);
                 continue;
             }
             let id = first_new + n_new;
             n_new += 1;
             ids.push(id);
             new.push(i as u32);
-            scratch.push((*k, id));
+            let h = hulls.map_or(NO_HULL, |h| h[i]);
+            new_hulls.push(h);
+            scratch.push((*k, id, h));
         }
         if scratch.is_empty() {
             return;
@@ -217,7 +280,17 @@ impl Door {
         let mut shards = FxHashMap::default();
         for ((shape, cell), mut keys) in entries {
             keys.sort_unstable();
-            keys.dedup_by_key(|e| e.0);
+            // A key present twice (a grown speed hull re-emitted a row for
+            // it): one entry, the newest id, the union of the hulls.
+            keys.dedup_by(|b, a| {
+                if a.0 == b.0 {
+                    a.1 = a.1.max(b.1);
+                    a.2 = hull_union(&a.2, &b.2);
+                    true
+                } else {
+                    false
+                }
+            });
             keys.shrink_to_fit();
             let index = build_index(&keys);
             shards.insert((shape, cell), Arc::new(Mutex::new(Shard { base: keys, index, delta: Vec::new() })));
@@ -238,11 +311,21 @@ thread_local! {
 }
 
 impl Admit for Door {
-    fn admit(&self, shape: u64, cell: u32, keys: &[Key], first_new: u64, ids: &mut Vec<u64>, new: &mut Vec<u32>) {
+    fn admit(
+        &self,
+        shape: u64,
+        cell: u32,
+        keys: &[Key],
+        first_new: u64,
+        ids: &mut Vec<u64>,
+        new: &mut Vec<u32>,
+        hulls: Option<&[Hull]>,
+        new_hulls: &mut Vec<Hull>,
+    ) {
         debug_assert!(keys.windows(2).all(|w| w[0] < w[1]), "admit: keys sorted and deduplicated");
         let shard = self.shard(shape, cell);
         let mut shard = shard.lock().expect("door shard");
-        SCRATCH.with(|s| shard.admit(keys, first_new, ids, new, &mut s.borrow_mut()));
+        SCRATCH.with(|s| shard.admit(keys, first_new, ids, new, hulls, new_hulls, &mut s.borrow_mut()));
     }
 
     fn end_frame(&self, workers: usize) {
@@ -289,7 +372,7 @@ impl Admit for Door {
 #[cfg(test)]
 #[derive(Default)]
 pub struct HashDoor {
-    shards: RwLock<FxHashMap<(u64, u32), Arc<Mutex<FxHashMap<Key, u64>>>>>,
+    shards: RwLock<FxHashMap<(u64, u32), Arc<Mutex<FxHashMap<Key, (u64, Hull)>>>>>,
 }
 
 #[cfg(test)]
@@ -298,7 +381,7 @@ impl HashDoor {
         Self::default()
     }
 
-    fn shard(&self, shape: u64, cell: u32) -> Arc<Mutex<FxHashMap<Key, u64>>> {
+    fn shard(&self, shape: u64, cell: u32) -> Arc<Mutex<FxHashMap<Key, (u64, Hull)>>> {
         if let Some(s) = self.shards.read().expect("door").get(&(shape, cell)) {
             return s.clone();
         }
@@ -308,19 +391,43 @@ impl HashDoor {
 
 #[cfg(test)]
 impl Admit for HashDoor {
-    fn admit(&self, shape: u64, cell: u32, keys: &[Key], first_new: u64, ids: &mut Vec<u64>, new: &mut Vec<u32>) {
+    fn admit(
+        &self,
+        shape: u64,
+        cell: u32,
+        keys: &[Key],
+        first_new: u64,
+        ids: &mut Vec<u64>,
+        new: &mut Vec<u32>,
+        hulls: Option<&[Hull]>,
+        new_hulls: &mut Vec<Hull>,
+    ) {
         let shard = self.shard(shape, cell);
         let mut set = shard.lock().expect("door shard");
         let mut n_new = 0u64;
         for (i, k) in keys.iter().enumerate() {
-            match set.get(k) {
-                Some(&id) => ids.push(id),
+            match set.get_mut(k) {
+                Some(e) => {
+                    if let Some(h) = hulls.filter(|h| !hull_contains(&e.1, &h[i])) {
+                        e.1 = hull_union(&e.1, &h[i]);
+                        let id = first_new + n_new;
+                        n_new += 1;
+                        e.0 = id;
+                        ids.push(id);
+                        new.push(i as u32);
+                        new_hulls.push(e.1);
+                    } else {
+                        ids.push(e.0);
+                    }
+                }
                 None => {
                     let id = first_new + n_new;
                     n_new += 1;
-                    set.insert(*k, id);
+                    let h = hulls.map_or(NO_HULL, |h| h[i]);
+                    set.insert(*k, (id, h));
                     ids.push(id);
                     new.push(i as u32);
+                    new_hulls.push(h);
                 }
             }
         }
@@ -382,7 +489,7 @@ mod tests {
                 sorted.sort_unstable();
                 sorted.dedup();
                 let (mut new, mut ids) = (Vec::new(), Vec::new());
-                door.admit(*shape, *cell, &sorted, next_id, &mut ids, &mut new);
+                door.admit(*shape, *cell, &sorted, next_id, &mut ids, &mut new, None, &mut Vec::new());
                 next_id += new.len() as u64;
                 // Every key gets an id; an old key's id is the one it got when admitted.
                 assert_eq!(ids.len(), sorted.len());
@@ -415,33 +522,58 @@ mod tests {
 
     #[test]
     fn from_shards_preloads_the_base() {
-        let door = Door::from_shards([((1, 2), vec![((5, 0), 50), ((1, 0), 10), ((5, 0), 50)])]);
+        let door = Door::from_shards([((1, 2), vec![((5, 0), 50, NO_HULL), ((1, 0), 10, NO_HULL), ((5, 0), 50, NO_HULL)])]);
         assert_eq!(door.len(), 2);
         let (mut new, mut ids) = (Vec::new(), Vec::new());
-        door.admit(1, 2, &[(0, 0), (1, 0), (5, 0), (6, 0)], 100, &mut ids, &mut new);
+        door.admit(1, 2, &[(0, 0), (1, 0), (5, 0), (6, 0)], 100, &mut ids, &mut new, None, &mut Vec::new());
         assert_eq!(new, vec![0, 3]);
         assert_eq!(ids, vec![100, 10, 50, 101], "old keys keep their ids, new ones get first_new + k");
         new.clear();
         ids.clear();
-        door.admit(1, 2, &[(0, 0), (6, 0), (7, 0)], 200, &mut ids, &mut new);
+        door.admit(1, 2, &[(0, 0), (6, 0), (7, 0)], 200, &mut ids, &mut new, None, &mut Vec::new());
         assert_eq!(new, vec![2]);
         assert_eq!(ids, vec![100, 101, 200]);
         door.end_frame(2);
         assert_eq!(door.len(), 5);
         new.clear();
         ids.clear();
-        door.admit(1, 2, &[(7, 0), (8, 0)], 300, &mut ids, &mut new);
+        door.admit(1, 2, &[(7, 0), (8, 0)], 300, &mut ids, &mut new, None, &mut Vec::new());
         assert_eq!(new, vec![1]);
         assert_eq!(ids, vec![200, 300]);
+    }
+
+    /// The speed hull: a key seen again with a speed inside its hull is
+    /// the old state; outside it, the hull grows to the union, the key
+    /// takes a fresh id and the row is new - carrying the union.
+    #[test]
+    fn a_grown_hull_is_a_new_row_carrying_the_union() {
+        let door = Door::new();
+        let (mut ids, mut new, mut nh) = (Vec::new(), Vec::new(), Vec::new());
+        door.admit(1, 2, &[(5, 0)], 100, &mut ids, &mut new, Some(&[[10, 20, 0, 0]]), &mut nh);
+        assert_eq!((ids.clone(), new.clone(), nh.clone()), (vec![100], vec![0], vec![[10, 20, 0, 0]]));
+        door.end_frame(1);
+        // inside: the old id
+        let (mut ids, mut new, mut nh) = (Vec::new(), Vec::new(), Vec::new());
+        door.admit(1, 2, &[(5, 0)], 200, &mut ids, &mut new, Some(&[[12, 18, 0, 0]]), &mut nh);
+        assert_eq!((ids, new, nh), (vec![100], vec![], vec![]));
+        // outside: grown, fresh id, the union
+        let (mut ids, mut new, mut nh) = (Vec::new(), Vec::new(), Vec::new());
+        door.admit(1, 2, &[(5, 0)], 300, &mut ids, &mut new, Some(&[[15, 30, -1, 1]]), &mut nh);
+        assert_eq!((ids, new, nh), (vec![300], vec![0], vec![[10, 30, -1, 1]]));
+        // and the union is what later rows are measured against
+        let (mut ids, mut new, mut nh) = (Vec::new(), Vec::new(), Vec::new());
+        door.admit(1, 2, &[(5, 0)], 400, &mut ids, &mut new, Some(&[[25, 30, 0, 0]]), &mut nh);
+        assert_eq!((ids, new, nh), (vec![300], vec![], vec![]));
+        assert_eq!(door.len(), 1);
     }
 
     #[test]
     fn admit_interleaving_with_the_delta_keeps_it_sorted() {
         let door = Door::new();
         let (mut new, mut ids) = (Vec::new(), Vec::new());
-        door.admit(0, 0, &[(10, 0), (30, 0)], 0, &mut ids, &mut new);
-        door.admit(0, 0, &[(20, 0), (40, 0)], 2, &mut ids, &mut new);
-        door.admit(0, 0, &[(5, 0), (20, 0), (35, 0)], 4, &mut ids, &mut new);
+        door.admit(0, 0, &[(10, 0), (30, 0)], 0, &mut ids, &mut new, None, &mut Vec::new());
+        door.admit(0, 0, &[(20, 0), (40, 0)], 2, &mut ids, &mut new, None, &mut Vec::new());
+        door.admit(0, 0, &[(5, 0), (20, 0), (35, 0)], 4, &mut ids, &mut new, None, &mut Vec::new());
         assert_eq!(new, vec![0, 1, 0, 1, 0, 2]);
         assert_eq!(ids, vec![0, 1, 2, 3, 4, 2, 5]);
         assert_eq!(door.len(), 6);

@@ -235,6 +235,52 @@ enum Command {
         #[arg(long)]
         frames: String,
     },
+    /// DIAGNOSTIC: the marked states one run has at a level and another
+    /// lacks, and where the other lost them: for each `(key, cell)` marked
+    /// in `--a`'s level `--level` at `--horizon` but not in `--b`'s, find
+    /// the row in `a`'s level tree, widen it to `--coarse` (the level
+    /// below in `b`'s ladder) and report whether that coarse state is in
+    /// `b`'s level-0 tree at all (a forward loss) or there but unmarked
+    /// (a backward loss).
+    MarksDiff {
+        #[arg(long)]
+        a: String,
+        #[arg(long)]
+        b: String,
+        #[arg(long)]
+        horizon: u32,
+        #[arg(long, default_value_t = 1)]
+        level: usize,
+        /// `b`'s coarsest level spec (e.g. r0s16).
+        #[arg(long, default_value = "r0s16")]
+        coarse: String,
+    },
+    /// DIAGNOSTIC: the post-hoc census of a SPEED widening, streamed: the
+    /// distinct states of one frame with the player's spd.x/spd.y bucketed
+    /// to 2^w raw units for each listed w (every other field exact) - the
+    /// ceiling of what a speed rung of that width could merge.
+    SpdCensus {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        frame: u32,
+        /// Bucket widths, log2 raw units, comma-separated (16 = 1 px).
+        #[arg(long, default_value = "8,10,12,14,16")]
+        widths: String,
+    },
+    /// DIAGNOSTIC: per-column cardinalities of one frame, streamed file by
+    /// file and row range by row range (the whole-frame `census` loads the
+    /// frame). Per shape: rows, then every varying column's distinct value
+    /// count (capped), the player's fields named, and the distinct
+    /// (spd.x, spd.y) pairs.
+    ColCensus {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        frame: u32,
+        #[arg(long, default_value_t = 1 << 24)]
+        cap: usize,
+    },
     /// Export a finished run for the web UI (`ui/`): per (horizon, level,
     /// frame) the states per player-position cell and the win cells, per
     /// (horizon, level) the marks per cell by distance, and the log's
@@ -1607,6 +1653,293 @@ fn main() -> Result<()> {
                 for (layer, n) in by_layer.iter().rev() {
                     cum += n;
                     println!("  {:>3} {:>12} {:>6.2}%", f - layer, n, 100.0 * cum as f64 / total.max(1) as f64);
+                }
+            }
+        }
+        Command::MarksDiff { a, b, horizon, level, coarse } => {
+            use celeste_rust::frame::{marks_path, widened_keys_rt2, Visited};
+            use celeste_rust::interpreter::abstraction::{set_level, Level};
+            use celeste_rust::search::checkpoint::FrameFile;
+            use celeste_rust::search::pos_graph::cell_xy;
+            let coarse_level = Level::parse(&coarse).map_err(|e| anyhow::anyhow!(e))?;
+            set_level(coarse_level);
+            let (a, b) = (std::path::Path::new(&a), std::path::Path::new(&b));
+            let ma = Visited::load(&marks_path(a, horizon, level))?;
+            let mb = Visited::load(&marks_path(b, horizon, level))?;
+            let missing: Vec<(u64, u32, (u64, u64))> =
+                ma.entries().into_iter().filter(|&(s, c, k)| !mb.contains(s, k, c)).collect();
+            println!("level {level} at h{horizon}: a marks {}, b marks {}, in a only {}", ma.len(), mb.len(), missing.len());
+            // b's level-0 tree and marks
+            let mb0 = Visited::load(&marks_path(b, horizon, 0))?;
+            let b0 = b.join("level00");
+            let mut b0_keys: Visited = Visited::new();
+            for f in 0..=horizon {
+                let fdir = b0.join("frames").join(format!("f{f:03}"));
+                if !fdir.is_dir() {
+                    continue;
+                }
+                for e in std::fs::read_dir(&fdir)? {
+                    let p = e?.path();
+                    if !p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")) {
+                        continue;
+                    }
+                    let ff = FrameFile::open(&p)?;
+                    let shape = ff.shape_hash();
+                    for (cell, key) in ff.cell_keys() {
+                        b0_keys.insert(shape, key, cell);
+                    }
+                }
+            }
+            // a's level tree: rows by (cell, key)
+            let adir = a.join(format!("h{horizon:03}")).join(format!("level{level:02}"));
+            let (mut absent, mut unmarked, mut shown) = (0, 0, 0);
+            'outer: for &(shape, cell, key) in &missing {
+                for f in 0..=horizon {
+                    let fdir = adir.join("frames").join(format!("f{f:03}"));
+                    if !fdir.is_dir() {
+                        continue;
+                    }
+                    for e in std::fs::read_dir(&fdir)? {
+                        let p = e?.path();
+                        if !p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")) {
+                            continue;
+                        }
+                        let ff = FrameFile::open(&p)?;
+                        if ff.shape_hash() != shape {
+                            continue;
+                        }
+                        for (row, (c, k)) in ff.cell_keys_rows() {
+                            if c != cell || k != key {
+                                continue;
+                            }
+                            let Some(rt2) = ff.load_rows(&[row..row + 1])? else { continue };
+                            let (cshape, ckeys, ccells) = widened_keys_rt2(&rt2, coarse_level)?;
+                            let present = b0_keys.contains(cshape, ckeys[0], ccells[0]);
+                            let marked = mb0.contains(cshape, ckeys[0], ccells[0]);
+                            if !present {
+                                absent += 1;
+                            } else if !marked {
+                                unmarked += 1;
+                            }
+                            if shown < 12 {
+                                shown += 1;
+                                let ids = celeste_rust::compiled::ids();
+                                let spd = rt2.speed_hulls(ids).map(|h| h[0]);
+                                println!(
+                                    "  a level{level} f{f:03} cell {:?} shape {shape:#x}: coarse key {:?} at {:?} -> in b's level-0 tree: {present}, marked: {marked}; spd raw {spd:?}",
+                                    cell_xy(cell), ckeys[0], cell_xy(ccells[0])
+                                );
+                            }
+                            continue 'outer;
+                        }
+                    }
+                }
+                println!("  (a's row for {key:?} at cell {cell} not found in its tree)");
+            }
+            println!("of the {} missing: coarse state absent from b's level-0 tree {absent} (forward loss), present but unmarked {unmarked} (backward loss)", missing.len());
+        }
+        Command::SpdCensus { level_dir, frame, widths } => {
+            use celeste_engine::runtime2::{mix64, Cell2, Col, AV};
+            use celeste_rust::search::checkpoint::FrameFile;
+            let dir = std::path::Path::new(&level_dir);
+            let ids = celeste_rust::compiled::ids();
+            let ws: Vec<u32> = widths.split(',').map(|w| w.trim().parse()).collect::<Result<_, _>>()?;
+            let fdir = dir.join("frames").join(format!("f{frame:03}"));
+            let mut sets: Vec<rustc_hash::FxHashSet<u64>> = vec![Default::default(); ws.len() + 1];
+            let mut rows = 0u64;
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")))
+                .collect();
+            files.sort();
+            for p in &files {
+                let ff = FrameFile::open(p)?;
+                let width = ff.width();
+                let mut lo = 0u32;
+                while lo < width {
+                    let hi = (lo + (1 << 20)).min(width);
+                    let Some(rt2) = ff.load_rows(&[lo..hi])? else { break };
+                    rows += rt2.width as u64;
+                    let (sx, sy) = match celeste_rust::search::pos_graph::player_object(&rt2)
+                        .and_then(|obj| rt2.obj_field_cell(obj, ids.f_spd))
+                        .and_then(|pc| match rt2.cols[pc as usize] { Col::U(AV::Ptr(sub)) => Some(sub), _ => None })
+                    {
+                        Some(sub) => (rt2.obj_field_cell(sub, ids.f_x), rt2.obj_field_cell(sub, ids.f_y)),
+                        None => (None, None),
+                    };
+                    let mut h: Vec<u64> = vec![rt2.shape_hash; rt2.width];
+                    let fold = |acc: u64, c: usize, v: AV| -> u64 {
+                        let (k, a, bb) = match v {
+                            AV::Num(n) => (0u64, n.as_raw_u32() as u64, 0u64),
+                            AV::Ival(a, bb) => (1, a.as_raw_u32() as u64, bb.as_raw_u32() as u64),
+                            AV::Bool(x) => (2, x as u64, 0),
+                            AV::UBool => (3, 0, 0),
+                            AV::Str(s) => (4, s as u64, 0),
+                            AV::Nil => (5, 0, 0),
+                            AV::Ptr(p) => (6, p as u64, 0),
+                            AV::NilPtr => (7, 0, 0),
+                        };
+                        mix64(acc ^ mix64((c as u64) << 56 | k << 48 | a << 16 ^ bb))
+                    };
+                    for (c, col) in rt2.cols.iter().enumerate() {
+                        if !matches!(rt2.structure[c], Cell2::Val) || Some(c as u32) == sx || Some(c as u32) == sy {
+                            continue;
+                        }
+                        match col {
+                            Col::U(v) => {
+                                let hv = fold(0, c, *v);
+                                for x in h.iter_mut() {
+                                    *x = mix64(*x ^ hv);
+                                }
+                            }
+                            _ => {
+                                for (r, x) in h.iter_mut().enumerate() {
+                                    *x = mix64(*x ^ fold(0, c, col.at(r)));
+                                }
+                            }
+                        }
+                    }
+                    let raw = |c: Option<u32>, r: usize| -> i64 {
+                        match c.map(|c| rt2.cols[c as usize].at(r)) {
+                            Some(AV::Num(n)) => n.as_raw_u32() as i32 as i64,
+                            _ => i64::MIN / 4,
+                        }
+                    };
+                    for r in 0..rt2.width {
+                        let (x, y) = (raw(sx, r), raw(sy, r));
+                        sets[0].insert(mix64(h[r] ^ mix64((x as u64) << 32 ^ y as u64 as u32 as u64)));
+                        for (i, &w) in ws.iter().enumerate() {
+                            let bx = x.div_euclid(1i64 << w) as u64;
+                            let by = y.div_euclid(1i64 << w) as u64;
+                            sets[i + 1].insert(mix64(h[r] ^ mix64(bx << 32 ^ (by & 0xffff_ffff))));
+                        }
+                    }
+                    lo = hi;
+                }
+            }
+            println!("f{frame:03}: {rows} rows, {} distinct exact", sets[0].len());
+            for (i, &w) in ws.iter().enumerate() {
+                println!("  spd bucket 2^{w} raw ({:.4} px): {} distinct ({:.2}x)", (1u64 << w) as f64 / 65536.0, sets[i + 1].len(), sets[0].len() as f64 / sets[i + 1].len().max(1) as f64);
+            }
+        }
+        Command::ColCensus { level_dir, frame, cap } => {
+            use celeste_engine::runtime2::{Cell2, Col, AV};
+            use celeste_rust::search::checkpoint::FrameFile;
+            let dir = std::path::Path::new(&level_dir);
+            let ids = celeste_rust::compiled::ids();
+            let fdir = dir.join("frames").join(format!("f{frame:03}"));
+            let code = |v: AV| -> u64 {
+                match v {
+                    AV::Num(n) => n.as_raw_u32() as u64,
+                    AV::Ival(a, b) => 1 << 40 | (a.as_raw_u32() as u64) << 8 ^ b.as_raw_u32() as u64,
+                    AV::Bool(x) => 2 << 40 | x as u64,
+                    AV::UBool => 3 << 40,
+                    AV::Str(s) => 4 << 40 | s as u64,
+                    AV::Nil => 5 << 40,
+                    AV::Ptr(p) => 6 << 40 | p as u64,
+                    AV::NilPtr => 7 << 40,
+                }
+            };
+            // shape -> (rows, per-column sets, player field names, spd pairs)
+            struct S {
+                rows: u64,
+                cols: Vec<rustc_hash::FxHashSet<u64>>,
+                varying: Vec<bool>,
+                names: std::collections::HashMap<usize, String>,
+                spd: rustc_hash::FxHashSet<u64>,
+                /// Per column: rows holding an interval, rows holding an unknown bool.
+                ivals: Vec<u64>,
+                ubools: Vec<u64>,
+            }
+            let mut by_shape: std::collections::BTreeMap<u64, S> = Default::default();
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")))
+                .collect();
+            files.sort();
+            for p in &files {
+                let ff = FrameFile::open(p)?;
+                let width = ff.width();
+                let mut lo = 0u32;
+                while lo < width {
+                    let hi = (lo + (1 << 20)).min(width);
+                    let Some(rt2) = ff.load_rows(&[lo..hi])? else { break };
+                    let st = by_shape.entry(ff.shape_hash()).or_insert_with(|| {
+                        let mut names = std::collections::HashMap::new();
+                        if let Some(obj) = celeste_rust::search::pos_graph::player_object(&rt2) {
+                            for (nm, f) in [("player.x", ids.f_x), ("player.y", ids.f_y), ("dash_effect_time", ids.f_dash_effect_time)] {
+                                if let Some(c) = rt2.obj_field_cell(obj, f) {
+                                    names.insert(c as usize, nm.to_string());
+                                }
+                            }
+                            for (nm, f) in [("spd", ids.f_spd), ("rem", ids.f_rem)] {
+                                if let Some(pc) = rt2.obj_field_cell(obj, f) {
+                                    if let Col::U(AV::Ptr(sub)) = rt2.cols[pc as usize] {
+                                        for (ax, g) in [("x", ids.f_x), ("y", ids.f_y)] {
+                                            if let Some(c) = rt2.obj_field_cell(sub, g) {
+                                                names.insert(c as usize, format!("{nm}.{ax}"));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        S { rows: 0, cols: vec![Default::default(); rt2.cols.len()], varying: vec![false; rt2.cols.len()], names, spd: Default::default(), ivals: vec![0; rt2.cols.len()], ubools: vec![0; rt2.cols.len()] }
+                    });
+                    st.rows += rt2.width as u64;
+                    for (c, col) in rt2.cols.iter().enumerate() {
+                        if !matches!(rt2.structure[c], Cell2::Val) {
+                            continue;
+                        }
+                        match col {
+                            Col::U(v) => {
+                                if st.cols[c].len() < cap {
+                                    st.cols[c].insert(code(*v));
+                                }
+                            }
+                            _ => {
+                                st.varying[c] = true;
+                                let set = &mut st.cols[c];
+                                for r in 0..rt2.width {
+                                    let v = col.at(r);
+                                    match v {
+                                        AV::Ival(a, b) if a != b => st.ivals[c] += 1,
+                                        AV::UBool => st.ubools[c] += 1,
+                                        _ => {}
+                                    }
+                                    if set.len() < cap {
+                                        set.insert(code(v));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let (sx, sy) = {
+                        let mut f = (None, None);
+                        for (c, nm) in &st.names {
+                            if nm == "spd.x" { f.0 = Some(*c) }
+                            if nm == "spd.y" { f.1 = Some(*c) }
+                        }
+                        f
+                    };
+                    if let (Some(sx), Some(sy)) = (sx, sy) {
+                        for r in 0..rt2.width {
+                            if st.spd.len() >= cap {
+                                break;
+                            }
+                            st.spd.insert(code(rt2.cols[sx].at(r)) << 32 ^ code(rt2.cols[sy].at(r)));
+                        }
+                    }
+                    lo = hi;
+                }
+            }
+            for (shape, st) in &by_shape {
+                let mut cards: Vec<(usize, usize)> = (0..st.cols.len()).filter(|&c| st.cols[c].len() > 1 || st.varying[c]).map(|c| (st.cols[c].len(), c)).collect();
+                cards.sort_unstable_by(|a, b| b.cmp(a));
+                let product: f64 = cards.iter().map(|&(n, _)| n as f64).product();
+                println!("shape {shape:#x}: {} rows, {} varying columns, cardinality product {:.2e}, spd pairs {}", st.rows, cards.len(), product, st.spd.len());
+                for &(n, c) in cards.iter().take(24) {
+                    println!("  c{c:<4} {n:>10} {:<18} intervals {:>10} unknown-bools {:>10}", st.names.get(&c).map(|s| s.as_str()).unwrap_or(""), st.ivals[c], st.ubools[c]);
                 }
             }
         }

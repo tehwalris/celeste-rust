@@ -209,6 +209,10 @@ pub(crate) struct RemBucket {
     /// the bucket grid (`Graph::fork_bits`), so every fragment's new rem
     /// is one bucket shifted by a multiple of the bucket width.
     pub premise: <Symbolic as Domain>::Bool,
+    /// The TIGHT value: the fork's fragment (the input clipped to its
+    /// bucket), or the input itself when it needed no fork. The speed
+    /// stores this and is keyed on `value` (the speed hull).
+    pub tight: <Symbolic as Domain>::Num,
     /// `(valid, premise)` when the value forked here (`spd_bucket_node`:
     /// spd has no earlier split to fold into); `None` for rem.
     pub fork: Option<(<Symbolic as Domain>::Bool, <Symbolic as Domain>::Bool)>,
@@ -244,7 +248,7 @@ pub(crate) fn rem_bucket_node(
     let span_minus_one = d.num(P8::from_raw(width_raw - 1));
     let high = d.arith(super::domain::Arith::Add, &low, &span_minus_one)?;
     let value = d.graph.fold(Op::Span, vec![low, high]);
-    Ok(RemBucket { value, premise, fork: None })
+    Ok(RemBucket { value, premise, fork: None, tight: value })
 }
 
 /// Apply every level-0 boundary widening to `st`, in the boundary's order.
@@ -353,6 +357,23 @@ fn widen_spd(
             let Some(Value::Num(old)) = iface::get(st, &p) else {
                 bail!("{}: spd is not a number", iface::show(&p));
             };
+            // THE BUCKET DISPATCH (2026-09-15, probe): a body specialized on
+            // its input speed bucket knows the static range of its output
+            // speed, so the snap forks at exactly the bucket edges that
+            // range crosses (`fork_table`), the row stores the fragment and
+            // is keyed on its bucket - a per-configuration constant.
+            if let (Some(edges), Some(range)) = (d.spd_edges.clone(), d.range_of(old)) {
+                let ax = if f == "x" { 0 } else { 1 };
+                let sb = spd_table_node(d, old, &edges[ax], &range)?;
+                if let Some((valid, premise)) = sb.fork {
+                    st.guard = d.and(&st.guard, &valid);
+                    let ok = st.ok;
+                    st.ok = d.and(&ok, &premise);
+                }
+                iface::set(st, &p, Value::Num(sb.tight))?;
+                st.key_override.push((sb.tight, sb.value));
+                continue;
+            }
             let sb = spd_bucket_node(d, old, w)?;
             if let Some((valid, premise)) = sb.fork {
                 st.guard = d.and(&st.guard, &valid);
@@ -361,7 +382,14 @@ fn widen_spd(
             }
             let ok = st.ok;
             st.ok = d.and(&ok, &sb.premise);
-            iface::set(st, &p, Value::Num(sb.value))?;
+            // THE SPEED HULL (2026-09-15): the row stores the tight
+            // fragment and is keyed on the bucket, so states that differ
+            // only within a bucket are one state whose interval is only as
+            // wide as the speeds actually merged into it (the door keeps
+            // the union, `door::Hull`), instead of the full bucket - which
+            // fanned out at every threshold the bucket straddled.
+            iface::set(st, &p, Value::Num(sb.tight))?;
+            st.key_override.push((sb.tight, sb.value));
         }
     }
     Ok(())
@@ -491,7 +519,60 @@ pub(crate) fn spd_bucket_node(
     let span_minus_one = d.num(P8::from_raw(width_raw - 1));
     let high = d.arith(super::domain::Arith::Add, &low, &span_minus_one)?;
     let value = d.graph.fold(Op::Span, vec![low, high]);
-    Ok(RemBucket { value, premise, fork })
+    Ok(RemBucket { value, premise, fork, tight: frag })
+}
+
+/// The snap of `old`, statically within `range`, to the buckets of
+/// `edges` (sorted raw edges; bucket `j` is `[edges[j], edges[j+1] - 1]`,
+/// the ends open): the buckets the range crosses become a table fork
+/// (`Op::SplitTab`), one bucket is no fork at all. `value` is the bucket
+/// (the key), `tight` the fragment, `premise` the runtime check that the
+/// range held.
+fn spd_table_node(
+    d: &mut Symbolic,
+    old: <Symbolic as Domain>::Num,
+    edges: &[i32],
+    pieces: &[(i64, i64)],
+) -> Result<RemBucket> {
+    let range = (pieces[0].0, pieces[pieces.len() - 1].1);
+    use crate::transpile::graph::Op;
+    let bucket = |j: usize| -> (i32, i32) {
+        let lo = if j == 0 { i32::MIN } else { edges[j - 1] };
+        let hi = if j == edges.len() { i32::MAX } else { edges[j] - 1 };
+        (lo, hi)
+    };
+    let crossed: Vec<(i32, i32)> = (0..=edges.len())
+        .map(bucket)
+        .filter(|(lo, hi)| pieces.iter().any(|p| (*lo as i64) <= p.1 && (*hi as i64) >= p.0))
+        .collect();
+    anyhow::ensure!(!crossed.is_empty(), "speed range {range:?} crosses no bucket");
+    anyhow::ensure!(
+        crossed.len() <= crate::transpile::graph::MAX_WAYS,
+        "speed range [{}, {}] crosses {} buckets, more than a fork holds ({})",
+        range.0 as f64 / 65536.0, range.1 as f64 / 65536.0, crossed.len(), crate::transpile::graph::MAX_WAYS
+    );
+    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+        eprintln!("[build]   spd_table_node: range [{:.4}, {:.4}] in {} pieces crosses {} buckets: {:?}", range.0 as f64 / 65536.0, range.1 as f64 / 65536.0, pieces.len(), crossed.len(),
+            pieces.iter().map(|(a, b)| format!("[{:.3},{:.3}]", *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>());
+    }
+    // The premise: the static range holds. On the graph directly, so
+    // the range analysis cannot fold its own obligation away.
+    let (rlo, rhi) = (d.graph.leaf(Op::Const(range.0 as i32, range.0 as i32)), d.graph.leaf(Op::Const(range.1 as i32, range.1 as i32)));
+    let (vlo, vhi) = (d.graph.fold(Op::Lo, vec![old]), d.graph.fold(Op::Hi, vec![old]));
+    let a = d.graph.fold(Op::Ge, vec![vlo, rlo]);
+    let b = d.graph.fold(Op::Le, vec![vhi, rhi]);
+    let premise = d.graph.fold(Op::And, vec![a, b]);
+    if crossed.len() == 1 {
+        let (lo, hi) = crossed[0];
+        let value = d.graph.leaf(Op::Const(lo, hi));
+        return Ok(RemBucket { value, premise, fork: None, tight: old });
+    }
+    let (frag, valid) = d.fork_table(&old, &crossed);
+    // The bucket of fragment `c`, as the same table fork applied to the
+    // whole range: `[lo_c, hi_c]` itself, a constant per configuration.
+    let full = d.graph.leaf(Op::Const(i32::MIN, i32::MAX));
+    let value = d.graph.fold(Op::SplitTab(d.forks - 1), vec![full]);
+    Ok(RemBucket { value, premise: d.boolean(true), fork: Some((valid, premise)), tight: frag })
 }
 
 #[cfg(test)]

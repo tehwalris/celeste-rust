@@ -367,7 +367,7 @@ pub fn walk<'a>(
         let st = seen[&k].clone();
         let roots = state_paths(&st)?;
         let ival = if opts.ival { ival_paths(&st, opts.spd_ival(), opts.pos_ival()) } else { Vec::new() };
-        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival, opts.widen_mode()) {
+        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival, opts.widen_mode(), &[]) {
             Ok(f) => f,
             Err(e) => {
                 *out.refused.entry(format!("{:#}", e)).or_default() += 1;

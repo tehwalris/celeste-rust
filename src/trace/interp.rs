@@ -106,6 +106,9 @@ pub struct Interp<'a, D: Domain> {
     /// compared line for line (`lua/probe/`), which is the only way to
     /// settle a question like what `#` does to a table with a hole in it.
     pub prints: Vec<String>,
+    /// Loop bodies traced (`for_body` calls): how far the unrolled loops
+    /// ran. A probe statistic.
+    pub for_iterations: u64,
     /// `(room x, room y, flag bit) -> does any tile in that room carry
     /// it`. Answering costs 256 map lookups, and `ice_at` asks every
     /// frame for every object.
@@ -130,6 +133,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             max_states: 256,
             max_nodes: 2_000_000,
             prints: Vec::new(),
+            for_iterations: 0,
             room_flags: std::collections::HashMap::new(),
             merge_fallbacks: 0,
         }
@@ -809,6 +813,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         iv: &D::Num,
         mut cur: State<D>,
     ) -> Result<Outcome<D>> {
+        self.for_iterations += 1;
         let body_scope = cur.heap.new_scope(Some(cur.scope));
         cur.heap.declare(body_scope, name, Value::Num(iv.clone()));
         let outer = cur.scope;
@@ -1840,7 +1845,7 @@ mod tests {
         let globals = heap.new_table();
         let scope = heap.new_scope(None);
         let t = d.boolean(true);
-        State { heap, globals, scope, stack: Vec::new(), guard: t.clone(), ok: t, path: Vec::new() }
+        State { heap, globals, scope, stack: Vec::new(), guard: t.clone(), ok: t, path: Vec::new(), key_override: Vec::new() }
     }
 
     /// Run `src` and read back the global `result`.

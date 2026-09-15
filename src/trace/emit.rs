@@ -61,6 +61,9 @@ pub fn show_tree(g: &Graph, root: NodeId, depth: usize) -> String {
 /// booleans that say which lanes reach it and which it may keep.
 pub struct FrameOutcome {
     pub outputs: Vec<(u32, NodeId, &'static str)>,
+    /// Outputs keyed on another node than they store: `(index into
+    /// outputs, key node)` - the speed under a bucket (`State::key_override`).
+    pub keys: Vec<(usize, NodeId)>,
     pub live: NodeId,
     pub ok: NodeId,
     /// Cells `Rt2::boundary` widens to a UNIFORM value at level 0 (rem x/y ->
@@ -120,6 +123,7 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
         roots.extend(o.fields.iter().map(|(_, nd, _)| *nd));
         roots.push(o.guard);
         roots.push(o.ok);
+        roots.extend(o.keys.iter().map(|(_, nd)| *nd));
     }
     let (graph, roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
         .map_err(|e| anyhow::anyhow!("{:#}\nwhere the roots are\n{}", e, root_legend(f)))?;
@@ -214,13 +218,16 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
                 }
             }
         }
+        let keys: Vec<(usize, NodeId)> =
+            o.keys.iter().enumerate().map(|(k, (fi, _))| (*fi, roots[at + n + 2 + k])).collect();
         outcomes.push(FrameOutcome {
             outputs,
+            keys,
             live: roots[at + n],
             ok: roots[at + n + 1],
             widen,
         });
-        at += n + 2;
+        at += n + 2 + o.keys.len();
     }
     Ok(Bound { graph, forks: f.forks, inputs, uni, outcomes })
 }
@@ -251,8 +258,8 @@ pub fn asm_input_reprs(
 pub struct AsmBody {
     pub outcome: usize,
     pub frees: u8,
-    pub splits: u64,
-    /// `outputs.len() + 2` nodes: fields..., ok, live.
+    pub splits: Vec<u8>,
+    /// `outputs.len() + 2 + keys` nodes: fields..., ok, live, key nodes...
     pub roots: Vec<NodeId>,
 }
 
@@ -277,10 +284,10 @@ pub fn asm_fused(
     Vec<NodeId>,
     std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
 )> {
-    let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId)> = bound
+    let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = bound
         .outcomes
         .iter()
-        .map(|o| (o.outputs.iter().map(|(_, nd, _)| *nd).collect(), o.ok, o.live))
+        .map(|o| (o.outputs.iter().map(|(_, nd, _)| *nd).collect(), o.ok, o.live, o.keys.iter().map(|(_, nd)| *nd).collect()))
         .collect();
     let (fused, raw_bodies) = crate::transpile::lower::specialize_frame(
         &bound.graph,
@@ -288,6 +295,7 @@ pub fn asm_fused(
         bound.forks,
         decide,
         room,
+        &std::collections::HashMap::new(),
     );
     asm_fused_of(bound, fused, raw_bodies)
 }
@@ -337,10 +345,12 @@ pub fn lower_frame(
     outcomes: &[FrameOutcome],
     room: Option<crate::transpile::graph::Room>,
     forks: u8,
+    ranges: std::collections::HashMap<u32, (i32, i32)>,
 ) -> Result<Lowered> {
     let mut e = Emit::bare(graph.clone());
     e.room = room;
     e.fork_depth = forks as usize;
+    e.ranges = ranges;
     let mut outs: Vec<crate::transpile::lower::Outcome> = outcomes
         .iter()
         .map(|o| crate::transpile::lower::Outcome {
@@ -365,6 +375,7 @@ pub fn lower_frame(
             },
             ok: o.ok,
             live: o.live,
+            keys: o.keys.clone(),
         })
         .collect();
     let spec = crate::transpile::lower::lower_outcomes(&e, &mut outs);

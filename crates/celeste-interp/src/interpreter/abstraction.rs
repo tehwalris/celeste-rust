@@ -853,7 +853,22 @@ fn split_marked_straddles(state: State, mark: &str, width: i32, max_span: i32) -
 /// load-bearing - floor-aligned buckets cover every representable value
 /// - it exists to catch a heap-shape bug loudly rather than bucket
 /// garbage.
-pub fn make_state_abstract_spd(mut state: State, precision: SpdPrecision) -> State {
+/// THE SPEED HULL (2026-09-15): a row stores its speed TIGHT and is keyed
+/// on its bucket (`Block::from_state`: the widened key; the kernels: the
+/// key node override). The straddle split (`split_spd_straddles`) clips a
+/// speed interval to its bucket; nothing widens it to the bucket any more,
+/// so this is the identity - kept as the boundary's named step, and as
+/// the place the sanity range check lives.
+pub fn make_state_abstract_spd(state: State, precision: SpdPrecision) -> State {
+    let SpdPrecision::WidthLog2(w) = precision else {
+        return state;
+    };
+    let _ = w;
+    state
+}
+
+#[allow(dead_code)]
+fn make_state_abstract_spd_full_bucket(mut state: State, precision: SpdPrecision) -> State {
     let SpdPrecision::WidthLog2(w) = precision else {
         return state;
     };

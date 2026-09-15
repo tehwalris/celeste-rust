@@ -80,6 +80,14 @@ pub struct State<D: Domain> {
     /// split, and merging ORs two guards together. The guard stays the
     /// authority on WHEN; the path only says WHICH WAY.
     pub path: Vec<(D::Bool, bool)>,
+    /// Fields whose ROW KEY hashes a different value than the field
+    /// stores: `(the value the field holds, the value it is keyed on)`.
+    /// The player's speed under a bucket stores its tight fragment and is
+    /// keyed on the bucket (`widen::widen_spd`; the speed hull,
+    /// 2026-09-15). Set on an outcome state by the boundary widening,
+    /// matched by VALUE in `verify::trace_frame` (the scalar walk names
+    /// the slot by another path than the widening does).
+    pub key_override: Vec<(D::Num, D::Num)>,
 }
 
 /// How many leading decisions two states share.
@@ -135,6 +143,7 @@ impl<D: Domain> Clone for State<D> {
             guard: self.guard.clone(),
             ok: self.ok.clone(),
             path: self.path.clone(),
+            key_override: self.key_override.clone(),
         }
     }
 }
@@ -266,8 +275,23 @@ pub fn merge<D: Domain>(
         // arm it actually took required, so this selects rather than
         // conjoining. Conjoining would be sound but would deopt lanes for
         // an obligation incurred on a path they did not take.
-        ok: d.sel_bool(cond, &t.ok, &f.ok),
+        //
+        // AND THE DECISION MUST BE DECIDED (2026-09-15). Every value below
+        // is `Sel(cond, t, f)`, and the kernel's select takes an arm by
+        // the condition's value bit: on a lane where `cond` is undecided
+        // (a comparison on an interval speed) that silently picked the
+        // false arm and dropped the other arm's successors - and `ok`
+        // itself was such a select. `Known(cond)` folds to true wherever
+        // the condition is decided at trace time (every exact-speed set),
+        // and elsewhere makes an undecided merge what it has to be: a
+        // fatal decline naming the lane, like an exceeded fork arity.
+        ok: {
+            let per_case = d.sel_bool(cond, &t.ok, &f.ok);
+            let decided = d.known(cond);
+            d.and(&per_case, &decided)
+        },
         path,
+        key_override: t.key_override,
     };
     Ok(Some(Merged { state, cond: cond.clone(), fell_back }))
 }
@@ -353,6 +377,7 @@ mod tests {
             guard: d.boolean(true),
             ok: d.boolean(true),
             path: Vec::new(),
+            key_override: Vec::new(),
         };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
@@ -405,7 +430,7 @@ mod tests {
     #[test]
     fn a_merge_selects_on_the_separating_decision_not_the_guard() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let a = d.num(P8::from_i16(1));
@@ -436,7 +461,7 @@ mod tests {
 
         // Two states whose paths do not diverge at one shared decision
         // fall back to the full guard, which is always correct.
-        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ok: d.boolean(true), path: vec![(g, true)] };
+        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ok: d.boolean(true), path: vec![(g, true)], key_override: Vec::new() };
         p.globals = p.heap.new_table();
         p.scope = p.heap.new_scope(None);
         let mut q = p.clone();
@@ -451,7 +476,7 @@ mod tests {
     #[test]
     fn differing_shapes_do_not_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let obj = s.heap.new_table();
@@ -476,7 +501,7 @@ mod tests {
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let mut f = s.clone();

@@ -165,6 +165,12 @@ pub trait Domain {
         false
     }
 
+    /// The premise that `b` is DECIDED on this lane (`Op::Known`). A
+    /// concrete boolean always is.
+    fn known(&mut self, _b: &Self::Bool) -> Self::Bool {
+        self.boolean(true)
+    }
+
     /// Fork at `flr`: the value restricted to a fresh fork choice, and
     /// which lanes fall in the chosen fragment.
     ///
@@ -186,6 +192,13 @@ pub trait Domain {
     /// numbers themselves, each EXACT (`Op::SplitInt`): the player's
     /// position under a bucket. Same validity and premise as `fork_flr`.
     fn fork_int(&mut self, v: &Self::Num, _ways: u8) -> (Self::Num, Self::Bool) {
+        (v.clone(), self.boolean(true))
+    }
+
+    /// A fork at a TABLE of ranges (`Op::SplitTab`): fragment `c` is the
+    /// value clipped to `ranges[c]`, valid where the value reaches it.
+    /// The default is the identity (an exact value is in one range).
+    fn fork_table(&mut self, v: &Self::Num, _ranges: &[(i32, i32)]) -> (Self::Num, Self::Bool) {
         (v.clone(), self.boolean(true))
     }
 
@@ -337,9 +350,37 @@ pub struct Symbolic {
     /// a graph node names. `is_interval` is a cone query against this
     /// set: a value is an interval exactly when it was computed from one.
     pub ival_cells: std::collections::BTreeSet<u32>,
+    /// STATIC RANGES (2026-09-15, the bucket dispatch): input cells whose
+    /// value is known to lie in a range - a body specialized on the
+    /// player's speed BUCKET - and the memo of the range analysis over
+    /// them (`range_of`). A comparison both of whose operands have ranges
+    /// that decide it folds to a constant (`compare`), so the branch is
+    /// never traced and the merge never built. Per frame, like `forks`.
+    pub ranges: std::collections::HashMap<NodeId, (i64, i64)>,
+    range_memo: std::collections::HashMap<NodeId, Option<Pieces>>,
+    /// Comparisons `compare` decided from ranges this frame (a probe stat).
+    pub range_folds: u64,
+    /// The speed bucket edges per axis (raw, sorted) when the boundary
+    /// snap is to fork at a TABLE of buckets (`widen::widen_spd`) rather
+    /// than the uniform grid. Set by the bucket probe.
+    pub spd_edges: Option<[Vec<i32>; 2]>,
 }
 
+pub use crate::transpile::graph::Pieces;
+
 impl Symbolic {
+    /// Forget the static ranges (a new frame, new cells).
+    pub fn clear_ranges(&mut self) {
+        self.ranges.clear();
+        self.range_memo.clear();
+        self.range_folds = 0;
+    }
+
+    /// The static range of `n` (`graph::pieces_of` over the seeded cells).
+    pub fn range_of(&mut self, n: NodeId) -> Option<Pieces> {
+        crate::transpile::graph::pieces_of(&self.graph, &self.ranges, &mut self.range_memo, n)
+    }
+
     fn konst(&mut self, v: P8) -> NodeId {
         let raw = v.as_raw_u32() as i32;
         self.graph.leaf(Op::Const(raw, raw))
@@ -419,6 +460,40 @@ impl Domain for Symbolic {
             let mut c = Concrete;
             let r = c.compare(op, &x, &y)?;
             return Ok(self.graph.leaf(Op::ConstBool(r)));
+        }
+        // Decided by the static ranges (the bucket dispatch): a branch
+        // the specialized body never takes is never traced. Decided iff
+        // every pair of pieces decides it the same way.
+        if !self.ranges.is_empty() {
+            if let (Some(xs), Some(ys)) = (self.range_of(*a), self.range_of(*b)) {
+                let one = |x: (i64, i64), y: (i64, i64)| -> Option<bool> {
+                    match op {
+                        Cmp::Lt => if x.1 < y.0 { Some(true) } else if x.0 >= y.1 { Some(false) } else { None },
+                        Cmp::Le => if x.1 <= y.0 { Some(true) } else if x.0 > y.1 { Some(false) } else { None },
+                        Cmp::Gt => if x.0 > y.1 { Some(true) } else if x.1 <= y.0 { Some(false) } else { None },
+                        Cmp::Ge => if x.0 >= y.1 { Some(true) } else if x.1 < y.0 { Some(false) } else { None },
+                        Cmp::Eq => if x.0 == x.1 && y.0 == y.1 && x.0 == y.0 { Some(true) } else if x.1 < y.0 || y.1 < x.0 { Some(false) } else { None },
+                    }
+                };
+                let mut decided: Option<Option<bool>> = None;
+                'pairs: for x in &xs {
+                    for y in &ys {
+                        let r = one(*x, *y);
+                        match (decided, r) {
+                            (None, r) => decided = Some(r),
+                            (Some(p), r) if p == r => {}
+                            _ => {
+                                decided = Some(None);
+                                break 'pairs;
+                            }
+                        }
+                    }
+                }
+                if let Some(Some(r)) = decided {
+                    self.range_folds += 1;
+                    return Ok(self.graph.leaf(Op::ConstBool(r)));
+                }
+            }
         }
         let g = match op {
             Cmp::Lt => Op::Lt,
@@ -503,9 +578,9 @@ impl Domain for Symbolic {
             let r = match node.op {
                 Op::Cell(c) => ival.contains(&c),
                 Op::Const(lo, hi) => lo != hi,
-                Op::Split(_) => true,
+                Op::Split(_) | Op::SplitTab(_) => true,
                 // An exact whole number per configuration.
-                Op::SplitInt(_) => false,
+                Op::SplitInt(_) | Op::Lo | Op::Hi => false,
                 // Unconditionally, like a non-degenerate `Const`: a
                 // span exists precisely because its two bounds are
                 // different nodes. (`fold` collapses a span of two
@@ -580,6 +655,20 @@ impl Domain for Symbolic {
 
     fn span_ok(&mut self, v: &NodeId, ways: u8) -> NodeId {
         self.graph.fold(Op::SplitOk(ways), vec![*v])
+    }
+
+    fn fork_table(&mut self, v: &NodeId, ranges: &[(i32, i32)]) -> (NodeId, NodeId) {
+        let d = self.forks;
+        self.forks += 1;
+        self.graph.set_fork_table(d, ranges.to_vec());
+        (
+            self.graph.fold(Op::SplitTab(d), vec![*v]),
+            self.graph.fold(Op::SplitValidTab(d), vec![*v]),
+        )
+    }
+
+    fn known(&mut self, b: &NodeId) -> NodeId {
+        self.graph.fold(Op::Known, vec![*b])
     }
 
     fn move_ways(&self) -> u8 {

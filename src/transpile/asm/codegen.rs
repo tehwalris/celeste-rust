@@ -638,7 +638,7 @@ impl<'a> Lower<'a> {
         match self.vals[id as usize] {
             Some(Value::Num(n)) => Ok(n),
             _ => bail!(
-                "node {} (op {:?}, domain {}; args {}) is not a numeric value where one was needed",
+                "node {} (op {:?}, domain {}; args {}) is not a numeric value where one was needed; interval source: {}",
                 id,
                 self.g.get(id).op,
                 self.dom(id),
@@ -648,9 +648,58 @@ impl<'a> Lower<'a> {
                     .iter()
                     .map(|&a| format!("{a}={:?}/d{}", self.g.get(a).op, self.dom(a)))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                self.interval_source(id)
             ),
         }
+    }
+
+    /// `id`'s subtree to `depth`, with each node's domain and (for a
+    /// boolean) whether its known-half is static.
+    fn describe(&self, id: NodeId, depth: usize) -> String {
+        let node = self.g.get(id);
+        let known = match self.vals[id as usize] {
+            Some(Value::Bool([_, MaskVal::Const(true)])) => "K",
+            Some(Value::Bool(_)) => "?",
+            _ => "",
+        };
+        if depth == 0 || node.args.is_empty() {
+            return format!("{id}={:?}/d{}{known}", node.op, self.dom(id));
+        }
+        format!(
+            "{id}={:?}/d{}{known}({})",
+            node.op,
+            self.dom(id),
+            node.args.iter().map(|&a| self.describe(a, depth - 1)).collect::<Vec<_>>().join(", ")
+        )
+    }
+
+    /// Why is `id` an interval: the chain of interval operands down to the
+    /// node that made it one (an interval cell, a split, a span, a literal
+    /// interval, or a select whose arm is one - shown with its condition).
+    /// For the error above.
+    fn interval_source(&self, id: NodeId) -> String {
+        let mut out = Vec::new();
+        let mut cur = id;
+        for _ in 0..64 {
+            let node = self.g.get(cur);
+            out.push(format!("{cur}={:?}", node.op));
+            let next = match node.op {
+                Op::Sel => {
+                    let arm = node.args[1..].iter().copied().find(|&x| self.dom(x) == 2);
+                    if arm.is_none() {
+                        out.push(format!("<- condition {}", self.describe(node.args[0], 5)));
+                    }
+                    arm
+                }
+                _ => node.args.iter().copied().find(|&x| self.dom(x) == 2),
+            };
+            match next {
+                Some(x) => cur = x,
+                None => break,
+            }
+        }
+        out.join(" <- ")
     }
 
     fn as_bool(&self, id: NodeId) -> Result<[MaskVal; 2]> {
@@ -1064,6 +1113,14 @@ impl<'a> Lower<'a> {
                         Value::Bool([MaskVal::Reg(val), MaskVal::Const(true)])
                     }
                     _ => Value::Bool([MaskVal::Const(true), MaskVal::Const(true)]),
+                }
+            }
+            Op::Lo | Op::Hi => {
+                if self.dom(a[0]) == 2 {
+                    let iv = self.as_ival(a[0])?;
+                    Value::Num(iv[if matches!(node.op, Op::Lo) { 0 } else { 1 }])
+                } else {
+                    Value::Num(self.as_num(a[0])?)
                 }
             }
             Op::Sel => {

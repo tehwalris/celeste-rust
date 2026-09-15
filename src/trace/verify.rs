@@ -39,6 +39,9 @@ pub struct FrameOut {
     /// re-deriving it from the node's op matters: `Op::Cell` and `Op::Sel`
     /// are both, and a guess there is a guess about the boundary.
     pub fields: Vec<(Path, NodeId, &'static str)>,
+    /// Fields keyed on another node than they store (`State::key_override`):
+    /// `(index into fields, key node)`.
+    pub keys: Vec<(usize, NodeId)>,
     /// Slots that are DEAD at the frame boundary: the six button cells.
     ///
     /// `btn(i)` writes as well as reads - it resolves the unknown to a
@@ -177,10 +180,16 @@ pub fn trace_frame<'a>(
     // moving the ladder widening into the graph); `None` leaves every
     // widening to the campaign boundary.
     widen: Option<super::widen::WidenMode>,
+    // Input slots known to lie in a RANGE (raw 16.16, inclusive): the
+    // body is specialized on them (`Symbolic::ranges`, the bucket
+    // dispatch), and guarded on them in `ok` like a pin.
+    bounds: &[(Path, (i32, i32))],
 ) -> Result<Frame> {
     let mut st = st;
     // Fork choices are per FRAME, like the six buttons above.
     it.d.forks = 0;
+    it.d.graph.reset_forks();
+    it.d.clear_ranges();
     it.d.fork_memo.clear();
     it.d.fork_memo_int.clear();
     // The fork grid is the rung's rem bucket width: `move` forks at the
@@ -209,7 +218,22 @@ pub fn trace_frame<'a>(
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
     // Built BEFORE the frame runs, so it names the input cells rather
     // than whatever the frame did to those slots.
-    let pin_ok = iface::pin_guard(&mut it.d, &iface);
+    let mut pin_ok = iface::pin_guard(&mut it.d, &iface);
+    for (p, (lo, hi)) in bounds {
+        let i = iface.slots.iter().position(|q| q == p).ok_or_else(|| anyhow!("bounded {} is not an input slot", iface::show(p)))?;
+        let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(i as u32));
+        it.d.ranges.insert(cell, (*lo as i64, *hi as i64));
+        // The obligation, built on the graph directly so the range
+        // analysis it seeds cannot fold it away: the lane's value (an
+        // interval: both ends) lies in the range.
+        use crate::transpile::graph::Op;
+        let (klo, khi) = (it.d.graph.leaf(Op::Const(*lo, *lo)), it.d.graph.leaf(Op::Const(*hi, *hi)));
+        let (vlo, vhi) = (it.d.graph.fold(Op::Lo, vec![cell]), it.d.graph.fold(Op::Hi, vec![cell]));
+        let a = it.d.graph.fold(Op::Ge, vec![vlo, klo]);
+        let b = it.d.graph.fold(Op::Le, vec![vhi, khi]);
+        let both = it.d.graph.fold(Op::And, vec![a, b]);
+        pin_ok = it.d.graph.fold(Op::And, vec![pin_ok, both]);
+    }
     // The engine's numbering for the INPUT shape. Here rather than in a
     // later pass because this is the last moment the input state exists;
     // `symbolize` changed the values in it and not the shape, so the
@@ -256,6 +280,13 @@ pub fn trace_frame<'a>(
         // which is why this reads `s.ok` after it rather than before.
         let ok = it.d.graph.fold(crate::transpile::graph::Op::And, vec![s.ok, pin_ok]);
         let (fields, ubool) = out_fields(&s, &it.d)?;
+        // A widened slot no output holds (the outcome destroyed its
+        // object: a death) has no key to override.
+        let keys: Vec<(usize, NodeId)> = s
+            .key_override
+            .iter()
+            .filter_map(|(held, key)| fields.iter().position(|(_, n, _)| n == held).map(|i| (i, *key)))
+            .collect();
         // The engine's numbering for THIS outcome's shape. Fields and
         // dead cells are resolved together: they share one cell space,
         // so a collision between the two halves is exactly as wrong as
@@ -270,6 +301,7 @@ pub fn trace_frame<'a>(
             guard,
             ok,
             fields,
+            keys,
             ubool,
             shape,
             rt2,
@@ -575,7 +607,7 @@ mod tests {
                 .filter(|p| !under_frozen(&st, p, &frozen))
                 .collect();
             frames += 1;
-            let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &[], &[], None) {
+            let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &[], &[], None, &[]) {
                 Ok(f) => f,
                 Err(e) => {
                     refused += 1;
@@ -924,7 +956,7 @@ mod tests {
         }
         let key = pm1_key(&player, &st, &it.d).expect("pm1 key");
         assert_eq!(key.len(), 6, "the pm1 key is six cells");
-        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[], None).expect("trace");
+        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[], None, &[]).expect("trace");
         assert_eq!(f.iface.pins.len(), 6, "all six pinned");
 
         // `ok` of whichever outcome claims this assignment.
@@ -1050,7 +1082,7 @@ mod tests {
         while let Some(key) = queue.pop() {
             let pin: Vec<(Path, Conc)> =
                 paths.iter().cloned().zip(key.iter().copied()).collect();
-            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin, &[], None) {
+            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin, &[], None, &[]) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("[keys] {} REFUSED: {:#}", show_key(&key), e);
@@ -1146,7 +1178,7 @@ mod tests {
             );
             match super::super::emit::bind(f, &g, true)
                 .and_then(|b| super::super::emit::lower_frame(
-                    &b.graph, &b.outcomes, room.clone(), b.forks,
+                    &b.graph, &b.outcomes, room.clone(), b.forks, Default::default(),
                 ))
             {
                 Ok(l) => {
@@ -1379,7 +1411,7 @@ end
         }
 
         let before = it.d.graph.len();
-        let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], None) {
+        let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], None, &[]) {
             Ok(f) => f,
             Err(e) => return eprintln!("[verify] symbolic frame stopped at: {:#}", e),
         };
