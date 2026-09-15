@@ -9,7 +9,8 @@
 //! `end_frame` merges every delta into its base, once per frame. So the
 //! big set is only READ while a frame runs. Each entry is the key and the
 //! state's id (`(layer, file seq, row)`): what an edge to an old state
-//! is written as (plans/waves.md, the explicit graph).
+//! is written as (plans/waves.md, the explicit graph) - and, at a level
+//! that buckets the player's speed, the key's speed hull (`Hull`).
 //!
 //! `HashDoor` is the same contract over a hash set per shard (the
 //! pre-2026-09-13 representation), kept as the oracle for `Door`'s tests.
@@ -41,9 +42,66 @@ pub fn hull_union(a: &Hull, b: &Hull) -> Hull {
     [a[0].min(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].max(b[3])]
 }
 
-/// A shard entry: the key, the state's id `(layer, file seq, row)`
-/// packed by `crate::frame::pack_id`, and its speed hull.
+/// A door entry as a resume loads it: the key, the state's id `(layer,
+/// file seq, row)` packed by `crate::frame::pack_id`, and its speed hull
+/// (`NO_HULL` at exact speed). A shard stores only what its level needs
+/// (`DoorEntry`).
 pub type Entry = (Key, u64, Hull);
+
+/// What a shard stores per key. An exact-speed level has no hull to keep,
+/// and carrying `NO_HULL` in every entry made the door 40 B/entry instead
+/// of 24 at every level: room (1,0)'s h99 exact-speed forward ran +34% in
+/// the wave and +65% at the door, +3.4 GB at frame start (2026-09-15,
+/// `180834b` against `dc29b4a`, same states).
+trait DoorEntry: Copy + Send + 'static {
+    fn key(&self) -> Key;
+    fn id(&self) -> u64;
+    fn fresh(key: Key, id: u64, hull: Hull) -> Self;
+    /// A row with speed hull `h` reached this entry's key: if `h` escapes
+    /// the entry's hull, the entry takes the union and `id`, and the union
+    /// is returned (the row is new, carrying it).
+    fn grow(&mut self, h: &Hull, id: u64) -> Option<Hull>;
+}
+
+/// An exact-speed entry: the key and the id, 24 B.
+type Plain = (Key, u64);
+/// A bucketed-speed entry: the key, the id and the hull, 40 B.
+type Hulled = (Key, u64, Hull);
+
+impl DoorEntry for Plain {
+    fn key(&self) -> Key {
+        self.0
+    }
+    fn id(&self) -> u64 {
+        self.1
+    }
+    fn fresh(key: Key, id: u64, _hull: Hull) -> Self {
+        (key, id)
+    }
+    fn grow(&mut self, _h: &Hull, _id: u64) -> Option<Hull> {
+        None
+    }
+}
+
+impl DoorEntry for Hulled {
+    fn key(&self) -> Key {
+        self.0
+    }
+    fn id(&self) -> u64 {
+        self.1
+    }
+    fn fresh(key: Key, id: u64, hull: Hull) -> Self {
+        (key, id, hull)
+    }
+    fn grow(&mut self, h: &Hull, id: u64) -> Option<Hull> {
+        if hull_contains(&self.2, h) {
+            return None;
+        }
+        self.2 = hull_union(&self.2, h);
+        self.1 = id;
+        Some(self.2)
+    }
+}
 
 /// The door's contract: admit sorted, deduplicated key batches; merge at
 /// the end of a frame.
@@ -78,15 +136,20 @@ pub trait Admit: Sync {
     fn alloc_bytes(&self) -> usize;
 }
 
-#[derive(Default)]
-struct Shard {
-    base: Vec<Entry>,
+struct Shard<E> {
+    base: Vec<E>,
     /// Bucket starts into `base` by the top bits of `key.0` (the keys are
     /// uniform hashes): `index.len() - 1` buckets of ~8 entries, so a
     /// lookup touches one index word and one or two lines of `base`
     /// instead of galloping through it. 0.5 B/entry. Rebuilt with `base`.
     index: Vec<u32>,
-    delta: Vec<Entry>,
+    delta: Vec<E>,
+}
+
+impl<E> Default for Shard<E> {
+    fn default() -> Self {
+        Shard { base: Vec::new(), index: Vec::new(), delta: Vec::new() }
+    }
 }
 
 /// log2 of the bucket count for `n` entries: ~8 entries per bucket.
@@ -94,12 +157,13 @@ fn index_bits(n: usize) -> u32 {
     (n / 8).max(1).next_power_of_two().trailing_zeros()
 }
 
-fn build_index(base: &[Entry]) -> Vec<u32> {
+fn build_index<E: DoorEntry>(base: &[E]) -> Vec<u32> {
     let bits = index_bits(base.len());
     let nb = 1usize << bits;
     let mut index = vec![0u32; nb + 1];
     let mut b = 0usize;
-    for (i, (k, _, _)) in base.iter().enumerate() {
+    for (i, e) in base.iter().enumerate() {
+        let k = e.key();
         let kb = if bits == 0 { 0 } else { (k.0 >> (64 - bits)) as usize };
         while b < kb {
             b += 1;
@@ -113,7 +177,7 @@ fn build_index(base: &[Entry]) -> Vec<u32> {
     index
 }
 
-impl Shard {
+impl<E: DoorEntry> Shard<E> {
     /// Merge-join `keys` against `base` and `delta`; the misses get fresh
     /// ids and go to `delta`, kept sorted by key.
     fn admit(
@@ -124,7 +188,7 @@ impl Shard {
         new: &mut Vec<u32>,
         hulls: Option<&[Hull]>,
         new_hulls: &mut Vec<Hull>,
-        scratch: &mut Vec<Entry>,
+        scratch: &mut Vec<E>,
     ) {
         let mut d = 0usize;
         scratch.clear();
@@ -137,20 +201,17 @@ impl Shard {
         // An existing entry: the old id, unless the row's hull escapes
         // the entry's - then the entry takes the union and a fresh id,
         // and the row is new (carrying the union).
-        let hit = |e: &mut Entry, i: usize, ids: &mut Vec<u64>, new: &mut Vec<u32>, new_hulls: &mut Vec<Hull>, n_new: &mut u64| {
+        let hit = |e: &mut E, i: usize, ids: &mut Vec<u64>, new: &mut Vec<u32>, new_hulls: &mut Vec<Hull>, n_new: &mut u64| {
             if let Some(h) = hulls {
-                if !hull_contains(&e.2, &h[i]) {
-                    e.2 = hull_union(&e.2, &h[i]);
-                    let id = first_new + *n_new;
+                if let Some(union) = e.grow(&h[i], first_new + *n_new) {
                     *n_new += 1;
-                    e.1 = id;
-                    ids.push(id);
+                    ids.push(e.id());
                     new.push(i as u32);
-                    new_hulls.push(e.2);
+                    new_hulls.push(union);
                     return;
                 }
             }
-            ids.push(e.1);
+            ids.push(e.id());
         };
         for (i, k) in keys.iter().enumerate() {
             if let Some(k2) = keys.get(i + AHEAD) {
@@ -159,14 +220,14 @@ impl Shard {
             if !self.base.is_empty() {
                 let kb = if bits == 0 { 0 } else { (k.0 >> (64 - bits)) as usize };
                 let (lo, hi) = (self.index[kb] as usize, self.index[kb + 1] as usize);
-                let b = lo + self.base[lo..hi].partition_point(|x| x.0 < *k);
-                if b < hi && self.base[b].0 == *k {
+                let b = lo + self.base[lo..hi].partition_point(|x| x.key() < *k);
+                if b < hi && self.base[b].key() == *k {
                     hit(&mut self.base[b], i, ids, new, new_hulls, &mut n_new);
                     continue;
                 }
             }
             d = gallop(&self.delta, d, k);
-            if d < self.delta.len() && self.delta[d].0 == *k {
+            if d < self.delta.len() && self.delta[d].key() == *k {
                 hit(&mut self.delta[d], i, ids, new, new_hulls, &mut n_new);
                 continue;
             }
@@ -176,12 +237,12 @@ impl Shard {
             new.push(i as u32);
             let h = hulls.map_or(NO_HULL, |h| h[i]);
             new_hulls.push(h);
-            scratch.push((*k, id, h));
+            scratch.push(E::fresh(*k, id, h));
         }
         if scratch.is_empty() {
             return;
         }
-        if self.delta.last().is_some_and(|last| last.0 < scratch[0].0) || self.delta.is_empty() {
+        if self.delta.last().is_some_and(|last| last.key() < scratch[0].key()) || self.delta.is_empty() {
             self.delta.extend_from_slice(scratch);
         } else {
             let merged = merge_sorted(&self.delta, scratch);
@@ -211,7 +272,7 @@ impl Shard {
         if self.delta.is_empty() {
             return;
         }
-        if self.base.last().is_some_and(|last| last.0 < self.delta[0].0) || self.base.is_empty() {
+        if self.base.last().is_some_and(|last| last.key() < self.delta[0].key()) || self.base.is_empty() {
             self.base.append(&mut self.delta);
         } else {
             self.base = merge_sorted(&self.base, &self.delta);
@@ -220,20 +281,28 @@ impl Shard {
         self.delta.shrink_to_fit();
         self.index = build_index(&self.base);
     }
+
+    fn len(&self) -> usize {
+        self.base.len() + self.delta.len()
+    }
+
+    fn alloc_bytes(&self) -> usize {
+        (self.base.capacity() + self.delta.capacity()) * std::mem::size_of::<E>() + self.index.capacity() * 4
+    }
 }
 
 /// The first index `>= from` whose key is `>= k` in the sorted `a`, by
 /// exponential then binary search from `from`.
 #[inline]
-fn gallop(a: &[Entry], from: usize, k: &Key) -> usize {
+fn gallop<E: DoorEntry>(a: &[E], from: usize, k: &Key) -> usize {
     let n = a.len();
-    if from >= n || a[from].0 >= *k {
+    if from >= n || a[from].key() >= *k {
         return from;
     }
     let mut step = 1;
     let mut lo = from;
     let mut hi = from + 1;
-    while hi < n && a[hi].0 < *k {
+    while hi < n && a[hi].key() < *k {
         lo = hi;
         step *= 2;
         hi = (hi + step).min(n);
@@ -241,16 +310,16 @@ fn gallop(a: &[Entry], from: usize, k: &Key) -> usize {
             break;
         }
     }
-    lo + 1 + a[lo + 1..hi.min(n)].partition_point(|x| x.0 < *k)
+    lo + 1 + a[lo + 1..hi.min(n)].partition_point(|x| x.key() < *k)
 }
 
 /// Two sorted, individually duplicate-free, mutually disjoint slices
 /// merged into one.
-fn merge_sorted(a: &[Entry], b: &[Entry]) -> Vec<Entry> {
+fn merge_sorted<E: DoorEntry>(a: &[E], b: &[E]) -> Vec<E> {
     let mut out = Vec::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        if a[i].0 < b[j].0 {
+        if a[i].key() < b[j].key() {
             out.push(a[i]);
             i += 1;
         } else {
@@ -263,20 +332,62 @@ fn merge_sorted(a: &[Entry], b: &[Entry]) -> Vec<Entry> {
     out
 }
 
+/// A shard of either kind; one door holds one kind (`Door::new`).
+enum AnyShard {
+    Plain(Shard<Plain>),
+    Hulled(Shard<Hulled>),
+}
+
+impl AnyShard {
+    fn end_frame(&mut self) {
+        match self {
+            AnyShard::Plain(s) => s.end_frame(),
+            AnyShard::Hulled(s) => s.end_frame(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            AnyShard::Plain(s) => s.len(),
+            AnyShard::Hulled(s) => s.len(),
+        }
+    }
+
+    fn alloc_bytes(&self) -> usize {
+        match self {
+            AnyShard::Plain(s) => s.alloc_bytes(),
+            AnyShard::Hulled(s) => s.alloc_bytes(),
+        }
+    }
+}
+
 /// The sorted door.
-#[derive(Default)]
 pub struct Door {
-    shards: RwLock<FxHashMap<(u64, u32), Arc<Mutex<Shard>>>>,
+    /// Whether the level buckets the player's speed: its entries carry the
+    /// speed hull.
+    hulled: bool,
+    shards: RwLock<FxHashMap<(u64, u32), Arc<Mutex<AnyShard>>>>,
 }
 
 impl Door {
-    pub fn new() -> Self {
-        Self::default()
+    /// An empty door; `hulled` iff the level buckets the player's speed
+    /// (its rows carry speed hulls).
+    pub fn new(hulled: bool) -> Self {
+        Door { hulled, shards: RwLock::new(FxHashMap::default()) }
     }
 
-    /// A door already holding `entries` (each shard's `(key, id)`s, in any
-    /// order) - the union of a level's layers so far.
-    pub fn from_shards(entries: impl IntoIterator<Item = ((u64, u32), Vec<Entry>)>) -> Self {
+    /// The door of the process's current level (`abstraction::spd_precision`).
+    pub fn for_current_level() -> Self {
+        Self::new(matches!(
+            crate::interpreter::abstraction::spd_precision(),
+            crate::interpreter::abstraction::SpdPrecision::WidthLog2(_)
+        ))
+    }
+
+    /// A door already holding `entries` (each shard's entries, in any
+    /// order) - the union of a level's layers so far. At an exact-speed
+    /// level (`hulled` false) every entry's hull must be `NO_HULL`.
+    pub fn from_shards(entries: impl IntoIterator<Item = ((u64, u32), Vec<Entry>)>, hulled: bool) -> Self {
         let mut shards = FxHashMap::default();
         for ((shape, cell), mut keys) in entries {
             keys.sort_unstable();
@@ -291,23 +402,40 @@ impl Door {
                     false
                 }
             });
-            keys.shrink_to_fit();
-            let index = build_index(&keys);
-            shards.insert((shape, cell), Arc::new(Mutex::new(Shard { base: keys, index, delta: Vec::new() })));
+            let shard = if hulled {
+                keys.shrink_to_fit();
+                let index = build_index(&keys);
+                AnyShard::Hulled(Shard { base: keys, index, delta: Vec::new() })
+            } else {
+                assert!(keys.iter().all(|e| e.2 == NO_HULL), "door: a speed hull in an exact-speed level's tree");
+                let base: Vec<Plain> = keys.iter().map(|e| (e.0, e.1)).collect();
+                let index = build_index(&base);
+                AnyShard::Plain(Shard { base, index, delta: Vec::new() })
+            };
+            shards.insert((shape, cell), Arc::new(Mutex::new(shard)));
         }
-        Door { shards: RwLock::new(shards) }
+        Door { hulled, shards: RwLock::new(shards) }
     }
 
-    fn shard(&self, shape: u64, cell: u32) -> Arc<Mutex<Shard>> {
+    fn shard(&self, shape: u64, cell: u32) -> Arc<Mutex<AnyShard>> {
         if let Some(s) = self.shards.read().expect("door").get(&(shape, cell)) {
             return s.clone();
         }
-        self.shards.write().expect("door").entry((shape, cell)).or_default().clone()
+        let hulled = self.hulled;
+        self.shards
+            .write()
+            .expect("door")
+            .entry((shape, cell))
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(if hulled { AnyShard::Hulled(Shard::default()) } else { AnyShard::Plain(Shard::default()) }))
+            })
+            .clone()
     }
 }
 
 thread_local! {
-    static SCRATCH: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SCRATCH_PLAIN: std::cell::RefCell<Vec<Plain>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SCRATCH_HULLED: std::cell::RefCell<Vec<Hulled>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl Admit for Door {
@@ -323,13 +451,20 @@ impl Admit for Door {
         new_hulls: &mut Vec<Hull>,
     ) {
         debug_assert!(keys.windows(2).all(|w| w[0] < w[1]), "admit: keys sorted and deduplicated");
+        assert!(
+            hulls.is_none() || self.hulled,
+            "door: speed hulls admitted into a door built without them - the level does not bucket its speed"
+        );
         let shard = self.shard(shape, cell);
         let mut shard = shard.lock().expect("door shard");
-        SCRATCH.with(|s| shard.admit(keys, first_new, ids, new, hulls, new_hulls, &mut s.borrow_mut()));
+        match &mut *shard {
+            AnyShard::Plain(s) => SCRATCH_PLAIN.with(|sc| s.admit(keys, first_new, ids, new, hulls, new_hulls, &mut sc.borrow_mut())),
+            AnyShard::Hulled(s) => SCRATCH_HULLED.with(|sc| s.admit(keys, first_new, ids, new, hulls, new_hulls, &mut sc.borrow_mut())),
+        }
     }
 
     fn end_frame(&self, workers: usize) {
-        let shards: Vec<Arc<Mutex<Shard>>> = self.shards.read().expect("door").values().cloned().collect();
+        let shards: Vec<Arc<Mutex<AnyShard>>> = self.shards.read().expect("door").values().cloned().collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..workers.max(1) {
@@ -344,27 +479,11 @@ impl Admit for Door {
     }
 
     fn len(&self) -> usize {
-        self.shards
-            .read()
-            .expect("door")
-            .values()
-            .map(|s| {
-                let s = s.lock().expect("door shard");
-                s.base.len() + s.delta.len()
-            })
-            .sum()
+        self.shards.read().expect("door").values().map(|s| s.lock().expect("door shard").len()).sum()
     }
 
     fn alloc_bytes(&self) -> usize {
-        self.shards
-            .read()
-            .expect("door")
-            .values()
-            .map(|s| {
-                let s = s.lock().expect("door shard");
-                (s.base.capacity() + s.delta.capacity()) * std::mem::size_of::<Entry>() + s.index.capacity() * 4
-            })
-            .sum()
+        self.shards.read().expect("door").values().map(|s| s.lock().expect("door shard").alloc_bytes()).sum()
     }
 }
 
@@ -504,25 +623,44 @@ mod tests {
 
     #[test]
     fn sorted_door_admits_exactly_what_the_hash_door_admits() {
-        for seed in 1..6u64 {
-            let frames = stream(seed);
-            let a = run(&Door::new(), &frames);
-            let b = run(&HashDoor::new(), &frames);
-            assert_eq!(a, b, "seed {seed}");
-            let total: usize = a.iter().map(Vec::len).sum();
-            assert!(total > 0);
-            // Every admitted (shape, cell, key) is admitted exactly once over the run.
-            let mut all: Vec<_> = a.concat();
-            let n = all.len();
-            all.sort_unstable();
-            all.dedup();
-            assert_eq!(all.len(), n, "seed {seed}: a key admitted twice");
+        for hulled in [false, true] {
+            for seed in 1..6u64 {
+                let frames = stream(seed);
+                let a = run(&Door::new(hulled), &frames);
+                let b = run(&HashDoor::new(), &frames);
+                assert_eq!(a, b, "seed {seed} hulled {hulled}");
+                let total: usize = a.iter().map(Vec::len).sum();
+                assert!(total > 0);
+                // Every admitted (shape, cell, key) is admitted exactly once over the run.
+                let mut all: Vec<_> = a.concat();
+                let n = all.len();
+                all.sort_unstable();
+                all.dedup();
+                assert_eq!(all.len(), n, "seed {seed}: a key admitted twice");
+            }
         }
+    }
+
+    /// The door's diet: an exact-speed level stores the key and the id,
+    /// nothing else; only a bucketed level pays for the hull.
+    #[test]
+    fn exact_speed_entries_carry_no_hull() {
+        assert_eq!(std::mem::size_of::<Plain>(), 24);
+        assert_eq!(std::mem::size_of::<Hulled>(), 40);
+    }
+
+    /// A hull reaching a door built without hulls is a level mismatch, and
+    /// it is refused rather than dropped.
+    #[test]
+    #[should_panic(expected = "speed hulls admitted into a door built without them")]
+    fn an_exact_speed_door_refuses_hulls() {
+        let door = Door::new(false);
+        door.admit(1, 2, &[(5, 0)], 100, &mut Vec::new(), &mut Vec::new(), Some(&[[10, 20, 0, 0]]), &mut Vec::new());
     }
 
     #[test]
     fn from_shards_preloads_the_base() {
-        let door = Door::from_shards([((1, 2), vec![((5, 0), 50, NO_HULL), ((1, 0), 10, NO_HULL), ((5, 0), 50, NO_HULL)])]);
+        let door = Door::from_shards([((1, 2), vec![((5, 0), 50, NO_HULL), ((1, 0), 10, NO_HULL), ((5, 0), 50, NO_HULL)])], false);
         assert_eq!(door.len(), 2);
         let (mut new, mut ids) = (Vec::new(), Vec::new());
         door.admit(1, 2, &[(0, 0), (1, 0), (5, 0), (6, 0)], 100, &mut ids, &mut new, None, &mut Vec::new());
@@ -547,7 +685,7 @@ mod tests {
     /// takes a fresh id and the row is new - carrying the union.
     #[test]
     fn a_grown_hull_is_a_new_row_carrying_the_union() {
-        let door = Door::new();
+        let door = Door::new(true);
         let (mut ids, mut new, mut nh) = (Vec::new(), Vec::new(), Vec::new());
         door.admit(1, 2, &[(5, 0)], 100, &mut ids, &mut new, Some(&[[10, 20, 0, 0]]), &mut nh);
         assert_eq!((ids.clone(), new.clone(), nh.clone()), (vec![100], vec![0], vec![[10, 20, 0, 0]]));
@@ -569,7 +707,7 @@ mod tests {
 
     #[test]
     fn admit_interleaving_with_the_delta_keeps_it_sorted() {
-        let door = Door::new();
+        let door = Door::new(false);
         let (mut new, mut ids) = (Vec::new(), Vec::new());
         door.admit(0, 0, &[(10, 0), (30, 0)], 0, &mut ids, &mut new, None, &mut Vec::new());
         door.admit(0, 0, &[(20, 0), (40, 0)], 2, &mut ids, &mut new, None, &mut Vec::new());

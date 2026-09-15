@@ -255,6 +255,17 @@ enum Command {
         #[arg(long, default_value = "r0s16")]
         coarse: String,
     },
+    /// DIAGNOSTIC: per frame of a level tree, the rows under the file layout
+    /// of plans/architecture.md follow-up 6 - one file per (shape, cell),
+    /// one block per dispatch key inside - next to today's per-shape files.
+    PartitionCensus {
+        #[arg(long)]
+        level_dir: String,
+        /// A bucketed level's speed bucket width (log2 raw units, 16 = 1 px):
+        /// count the dispatch-key blocks too.
+        #[arg(long)]
+        spd_w: Option<u8>,
+    },
     /// DIAGNOSTIC: the post-hoc census of a SPEED widening, streamed: the
     /// distinct states of one frame with the player's spd.x/spd.y bucketed
     /// to 2^w raw units for each listed w (every other field exact) - the
@@ -640,7 +651,7 @@ fn main() -> Result<()> {
                 let n = b.lanes();
                 let mask: Vec<bool> = (0..n).map(|i| i < 64).collect();
                 let small = vec![b.keep(&mask).expect("a non-empty block")];
-                forward_frame(&engine, small, &Door::new(), None, mark_filter, frame + 1, None)?;
+                forward_frame(&engine, small, &Door::for_current_level(), None, mark_filter, frame + 1, None)?;
             }
             let edges_dir = dir.join("bench-edges");
             // With edges, the tree's own door: every re-emitted old state
@@ -661,7 +672,7 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|b| Block::with_ids(b.rt2().clone_block(), b.ids().to_vec(), b.seq()))
                     .collect();
-                let fresh = Door::new();
+                let fresh = Door::for_current_level();
                 let door: &Door = tree_door.as_ref().map_or(&fresh, |s| s.door());
                 let _ = std::fs::remove_dir_all(&edges_dir);
                 let t = std::time::Instant::now();
@@ -1088,7 +1099,7 @@ fn main() -> Result<()> {
                         let block = celeste_rust::frame::Block::with_ids(rt2, vec![id], seq);
                         let tmp = dir.join("diff-edges");
                         let _ = std::fs::remove_dir_all(&tmp);
-                        let door = celeste_rust::search::door::Door::new();
+                        let door = celeste_rust::search::door::Door::for_current_level();
                         let (next, _won, _st) = celeste_rust::frame::forward_frame(&engine, vec![block], &door, None, None, layer + 1, Some(&tmp))?;
                         println!("[diff]   win row: {win}; successors: {} blocks", next.len());
                         // Every recorded edge FROM this row, against its real successors.
@@ -1737,6 +1748,9 @@ fn main() -> Result<()> {
                 println!("  (a's row for {key:?} at cell {cell} not found in its tree)");
             }
             println!("of the {} missing: coarse state absent from b's level-0 tree {absent} (forward loss), present but unmarked {unmarked} (backward loss)", missing.len());
+        }
+        Command::PartitionCensus { level_dir, spd_w } => {
+            print!("{}", celeste_rust::search::checkpoint::partition_census(std::path::Path::new(&level_dir), spd_w)?);
         }
         Command::SpdCensus { level_dir, frame, widths } => {
             use celeste_engine::runtime2::{mix64, Cell2, Col, AV};

@@ -1826,7 +1826,7 @@ impl ForwardState {
         // door then takes each row under that id.
         checkpoint_frontier(dir, 0, &mut initial)?;
         crate::search::edges::set_done_frame(&dir.join("edges"), 0)?;
-        let door = crate::search::door::Door::new();
+        let door = crate::search::door::Door::for_current_level();
         for b in &initial {
             let cells = b.positions()?;
             let shape = b.shard_shape();
@@ -1947,7 +1947,7 @@ impl ForwardState {
                 (a, b) => a.or(b),
             };
         }
-        let door = crate::search::door::Door::from_shards(shards);
+        let door = crate::search::door::Door::from_shards(shards, hulled);
         // The frontier: the last layer minus its won rows.
         let mut frontier: Vec<Block> = load_frame(dir, last)?;
         for b in &mut frontier {

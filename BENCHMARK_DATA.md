@@ -1,3 +1,28 @@
+# The h99 exact-speed slowdown, bisected (2026-09-15, room (1,0), release)
+
+`rewrite search --room 1,0 --ceiling 99` (exact speed at every level), each
+commit built in its own worktree and run alone:
+
+| commit | wall | level-0 forward to f99 |
+|---|---|---|
+| `dc29b4a` (the 2:56 below, same code today) | 3:41, 3:40 | 131.3 s, 132.9 s |
+| `180834b` the speed hull | 4:54 | 176.3 s |
+| `0a48525` bucket dispatch + local boolean pass | 4:13, 4:13 | 156.7 s, 157.2 s |
+| + door entries without the hull at exact speed | 3:54 | 139.1 s |
+
+The machine runs the baseline commit 25% slower than on 2026-09-14 (2:56,
+124 s); repeat runs agree within 1%. At the same states per frame (6.9M
+at f99), `180834b` against `dc29b4a` at f99: wave 4,003 -> 5,348 ms, door
+348 -> 573 ms, RSS at frame start 6.8 -> 10.2 GB. The door's entry became
+`(key, id, hull)`, 40 B instead of 24, at EVERY level - exact-speed levels
+stored `NO_HULL` in each. `0a48525`'s smaller kernels won back ~20 s of the
+forward. The door now keeps plain 24 B entries where the level does not
+bucket its speed (`door::Door::new(hulled)`): at f99 door 346 ms, wave
+4,210 ms, RSS at frame start 7.06 GB - the door back to the baseline's,
+the wave 5% over it. What remains (~6 s of forward, ~13 s of wall) is the
+rest of `180834b`'s runtime path (the queue index keyed on the speed key,
+the flush's speed-column check), not chased.
+
 # The position rung end to end, and a ladder at the ceiling alone (2026-09-14, room (1,0), release, 16 threads)
 
 The position rung (`Level::pos`, 2 px buckets, one exact position per

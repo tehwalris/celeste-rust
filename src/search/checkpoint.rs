@@ -447,6 +447,93 @@ pub fn save_value_to<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 /// Load a value saved by `save_value_to`.
+/// `rewrite partition-census`: per frame of a level's tree, how its rows
+/// split under the layout of plans/architecture.md follow-up 6 - one file
+/// per (shape, cell), one block per dispatch key inside - next to today's
+/// per-shape files: files and rows per file, and for a bucketed level (`w`,
+/// its speed bucket width, log2 raw units) keys per file and rows per
+/// block. At an exact level only the headers are read.
+pub fn partition_census(level_dir: &Path, w: Option<u8>) -> Result<String> {
+    use std::fmt::Write as _;
+    let median_max = |mut v: Vec<u64>| -> (u64, u64) {
+        if v.is_empty() {
+            return (0, 0);
+        }
+        v.sort_unstable();
+        (v[v.len() / 2], v[v.len() - 1])
+    };
+    let listing = |dir: &Path, keep: &dyn Fn(&str) -> bool| -> Result<Vec<std::path::PathBuf>> {
+        let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .with_context(|| format!("{}", dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(keep))
+            .collect();
+        v.sort();
+        Ok(v)
+    };
+    let frames = listing(&level_dir.join("frames"), &|n| n.starts_with('f'))?;
+    let mut out = String::new();
+    let (mut total_files, mut total_blocks, mut total_rows) = (0u64, 0u64, 0u64);
+    for fdir in &frames {
+        let files = listing(fdir, &|n| n.starts_with('s') && n.ends_with(".bin"))?;
+        let mut per_file: rustc_hash::FxHashMap<(u64, u32), u64> = Default::default();
+        let mut per_block: rustc_hash::FxHashMap<(u64, u32, Option<crate::trace::kernel::SpeedKey>), u64> = Default::default();
+        let mut rows = 0u64;
+        for p in &files {
+            let ff = FrameFile::open(p)?;
+            let shape = ff.shape_hash();
+            match w {
+                None => {
+                    for (cell, n) in ff.cell_counts() {
+                        *per_file.entry((shape, cell)).or_default() += n as u64;
+                        rows += n as u64;
+                    }
+                }
+                Some(w) => {
+                    let cells = ff.row_cells();
+                    if let Some(rt2) = ff.load_all()? {
+                        let keys = crate::compiled::asm_kernel::speed_keys(&rt2, w);
+                        for (r, cell) in cells.iter().enumerate() {
+                            *per_file.entry((shape, *cell)).or_default() += 1;
+                            *per_block.entry((shape, *cell, keys.as_ref().map(|k| k[r]))).or_default() += 1;
+                            rows += 1;
+                        }
+                    }
+                }
+            }
+            ff.release();
+        }
+        total_rows += rows;
+        total_files += per_file.len() as u64;
+        let (fmed, fmax) = median_max(per_file.values().copied().collect());
+        write!(
+            out,
+            "{}: {rows} rows; {} shape files now; {} (shape, cell) files, rows per file median {fmed} max {fmax}",
+            fdir.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+            files.len(),
+            per_file.len()
+        )?;
+        if w.is_some() {
+            let mut keys_per_file: rustc_hash::FxHashMap<(u64, u32), u64> = Default::default();
+            for (s, c, _) in per_block.keys() {
+                *keys_per_file.entry((*s, *c)).or_default() += 1;
+            }
+            let (kmed, kmax) = median_max(keys_per_file.values().copied().collect());
+            let (bmed, bmax) = median_max(per_block.values().copied().collect());
+            total_blocks += per_block.len() as u64;
+            write!(out, "; {} (shape, cell, key) blocks, keys per file median {kmed} max {kmax}, rows per block median {bmed} max {bmax}", per_block.len())?;
+        }
+        writeln!(out)?;
+    }
+    writeln!(
+        out,
+        "{} frames, {total_rows} rows: {total_files} (shape, cell) files{}",
+        frames.len(),
+        if w.is_some() { format!(", {total_blocks} (shape, cell, key) blocks") } else { String::new() }
+    )?;
+    Ok(out)
+}
+
 pub fn load_value_from<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = std::fs::read(path)?;
     ensure!(bytes.len() >= 16 && &bytes[0..4] == MAGIC, "{}: bad magic", path.display());

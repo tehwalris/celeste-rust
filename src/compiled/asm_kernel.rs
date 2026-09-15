@@ -1336,7 +1336,7 @@ pub fn speed_key_of_row(rt2: &Rt2, lane: usize) -> Option<SpeedKey> {
 
 /// Per lane of `chunk`, what its kernel is specialized on; `None` for a
 /// shape without a player.
-fn speed_keys(chunk: &Rt2, w: u8) -> Option<Vec<SpeedKey>> {
+pub(crate) fn speed_keys(chunk: &Rt2, w: u8) -> Option<Vec<SpeedKey>> {
     let ids = crate::compiled::ids();
     let hulls = chunk.speed_hulls(ids)?;
     let obj = *chunk.player_objects(ids).first()?;
