@@ -93,6 +93,7 @@ const GROUP: Record<VerdictKind, string> = {
   optimal: "optimal",
   confirmed: "confirmed above the optimum",
   refuted: "refuted: no level wins, by design",
+  partial: "a forward on its own: no backward, no verdict",
 };
 
 export function spaceView(run: Run, onState: () => void): View {

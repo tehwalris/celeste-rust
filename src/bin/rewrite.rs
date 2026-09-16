@@ -325,6 +325,38 @@ enum Command {
         #[arg(long)]
         at: Option<String>,
     },
+    /// DIAGNOSTIC: how coarse a level could be. Per frame, the distinct
+    /// states of a tree with the named cells (`cell_names`) whose names
+    /// start with any `--erase` prefix left out (comma-separated, e.g.
+    /// `spd.,rem.,player[3].dash`), and cumulatively through that frame.
+    CoarseCensus {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        #[arg(long, default_value = "")]
+        erase: String,
+    },
+    /// DIAGNOSTIC: does a cell's visited set saturate? A frame's rows are
+    /// the states NEW at it (the door dedupes across frames), so a cell's
+    /// visited set is the sum of its rows over frames. Reads the checkpoint
+    /// cell indexes only: the `top` cells by visited count (and `--at x,y`)
+    /// with their new states per frame, and every cell's new states at `to`
+    /// as a share of its visited set.
+    CellGrowth {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long, default_value_t = 0)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        #[arg(long, default_value_t = 8)]
+        top: usize,
+        #[arg(long)]
+        at: Option<String>,
+    },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed file by
     /// file and row range by row range (the whole-frame `census` loads the
     /// frame). Per shape: rows, then every varying column's distinct value
@@ -354,6 +386,10 @@ enum Command {
         out: String,
         #[arg(long, default_value = "1,0")]
         room: String,
+        /// The tree and log of one `rewrite forward` (frames under the
+        /// directory, no ladder): exported as one partial horizon.
+        #[arg(long)]
+        forward_only: bool,
     },
     /// Census of one checkpointed frame: how many distinct concrete player
     /// classes (position, spd, every scalar field) its rows fall into, how
@@ -432,11 +468,12 @@ struct Projection {
 fn project_frame(
     dir: &std::path::Path,
     frame: u32,
-    w: u8,
+    w: Option<u8>,
     x_only: bool,
     against: Option<&rustc_hash::FxHashSet<u64>>,
     max_examples: usize,
     at: Option<(i32, i32)>,
+    erase: &[&str],
 ) -> Result<Projection> {
     use celeste_engine::runtime2::{mix64, Cell2, Col, AV};
     use celeste_rust::search::checkpoint::FrameFile;
@@ -492,9 +529,12 @@ fn project_frame(
                     continue;
                 }
                 let nm = names.get(&c).cloned().unwrap_or_else(|| format!("cell{c}"));
-                let axis = match nm.as_str() {
-                    "spd.x" => Some(0),
-                    "spd.y" if !x_only => Some(1),
+                if erase.iter().any(|p| nm.starts_with(p)) {
+                    continue;
+                }
+                let axis = match (w, nm.as_str()) {
+                    (Some(_), "spd.x") => Some(0),
+                    (Some(_), "spd.y") if !x_only => Some(1),
                     _ => None,
                 };
                 cells.push((name_hash(&nm), c, axis, nm));
@@ -516,11 +556,13 @@ fn project_frame(
                 let mut acc = base;
                 for &i in &varying {
                     let (h, c, axis, _) = &cells[i];
+                    // A speed axis exists only with a bucket width.
+                    let bucket = |v: i32, ax: usize| celeste_core::spd_buckets::index(v, w.expect("a speed axis has a bucket width"), ax);
                     let cv = match (axis, rt2.cols[*c].at(r)) {
-                        (Some(ax), AV::Num(n)) => mix64(8 ^ (celeste_core::spd_buckets::index(n.as_raw_u32() as i32, w, *ax) as u64) << 8),
+                        (Some(ax), AV::Num(n)) => mix64(8 ^ (bucket(n.as_raw_u32() as i32, *ax) as u64) << 8),
                         (Some(ax), AV::Ival(a, b)) => {
-                            let ia = celeste_core::spd_buckets::index(a.as_raw_u32() as i32, w, *ax);
-                            if ia != celeste_core::spd_buckets::index(b.as_raw_u32() as i32, w, *ax) {
+                            let ia = bucket(a.as_raw_u32() as i32, *ax);
+                            if ia != bucket(b.as_raw_u32() as i32, *ax) {
                                 p.straddles += 1;
                             }
                             mix64(8 ^ (ia as u64) << 8)
@@ -1641,6 +1683,24 @@ fn main() -> Result<()> {
             }
             let reached = dist.iter().filter(|&&d| d != u32::MAX).count();
             println!("pos graph: {} pairs; top y = {top}; {goals} goal cells; {reached} cells reach the goal", graph.pairs());
+            // One frame's movement, over every recorded pair within the start
+            // room's placement (a crossing is labelled one room to the right):
+            // what a bound on frames-to-exit from height must respect.
+            let (mut up, mut down, mut side) = (0i32, 0i32, 0i32);
+            for d in 0..CELL_COUNT as u32 {
+                let Some((dx0, dy0)) = cell_xy(d) else { continue };
+                for &sc in graph.srcs_of(d) {
+                    let Some((sx0, sy0)) = cell_xy(sc) else { continue };
+                    let (mx, my) = (dx0 - sx0, dy0 - sy0);
+                    if mx.abs() > 64 {
+                        continue;
+                    }
+                    up = up.min(my);
+                    down = down.max(my);
+                    side = side.max(mx.abs());
+                }
+            }
+            println!("one frame moves at most {} px up, {down} px down, {side} px sideways", -up);
             println!("frame | states | dead under ceiling {ceiling} | unreachable-in-graph | dist histogram (0-9,10-19,..)");
             for f in from..=to {
                 let fdir = dir.join("frames").join(format!("f{f:03}"));
@@ -2145,6 +2205,87 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::CellGrowth { level_dir, from, to, top, at } => {
+            use celeste_rust::search::checkpoint::FrameFile;
+            use celeste_rust::search::pos_graph::{cell_of, cell_xy};
+            let dir = std::path::Path::new(&level_dir);
+            let n_frames = (to - from + 1) as usize;
+            // Per cell, its new states per frame.
+            let mut per: std::collections::HashMap<u32, Vec<u64>> = Default::default();
+            for f in from..=to {
+                let fdir = dir.join("frames").join(format!("f{f:03}"));
+                for e in std::fs::read_dir(&fdir)? {
+                    let p = e?.path();
+                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    if !(name.starts_with('s') && name.ends_with(".bin")) {
+                        continue;
+                    }
+                    for (cell, rows) in FrameFile::open(&p)?.cell_counts() {
+                        per.entry(cell as u32).or_insert_with(|| vec![0; n_frames])[(f - from) as usize] += rows as u64;
+                    }
+                }
+            }
+            let visited = |v: &[u64]| v.iter().sum::<u64>();
+            let mut by_visited: Vec<(u32, u64)> = per.iter().map(|(c, v)| (*c, visited(v))).collect();
+            by_visited.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c));
+            let mut chosen: Vec<u32> = by_visited.iter().take(top).map(|&(c, _)| c).collect();
+            if let Some(s) = at {
+                let (a, b) = s.split_once(',').ok_or_else(|| anyhow::anyhow!("--at x,y"))?;
+                let c = cell_of(a.trim().parse()?, b.trim().parse()?)?;
+                if !chosen.contains(&c) {
+                    chosen.push(c);
+                }
+            }
+            let shown = n_frames.min(12);
+            println!("cell: visited through f{to:03} | new per frame, f{:03}..f{to:03}", to - shown as u32 + 1);
+            for c in &chosen {
+                let where_ = cell_xy(*c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string());
+                match per.get(c) {
+                    Some(v) => {
+                        let tail: Vec<String> = v[n_frames - shown..].iter().map(|n| n.to_string()).collect();
+                        println!("{where_}: {} | {}", visited(v), tail.join(" "));
+                    }
+                    None => println!("{where_}: never visited"),
+                }
+            }
+            // Every cell's new states at `to` as a share of its visited set.
+            let edges = [0.01, 0.05, 0.20];
+            let mut cells_in = [0usize; 4];
+            let mut states_in = [0u64; 4];
+            for v in per.values() {
+                let share = v[n_frames - 1] as f64 / visited(v).max(1) as f64;
+                let b = edges.iter().filter(|&&e| share >= e).count();
+                cells_in[b] += 1;
+                states_in[b] += visited(v);
+            }
+            println!(
+                "{} cells visited; new at f{to:03} as a share of visited: under 1%: {} cells ({} states), 1-5%: {} ({}), 5-20%: {} ({}), 20% or more: {} ({})",
+                per.len(),
+                cells_in[0],
+                states_in[0],
+                cells_in[1],
+                states_in[1],
+                cells_in[2],
+                states_in[2],
+                cells_in[3],
+                states_in[3]
+            );
+        }
+        Command::CoarseCensus { level_dir, from, to, erase } => {
+            let prefixes: Vec<&str> = erase.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let mut through: rustc_hash::FxHashSet<u64> = Default::default();
+            for frame in from..=to {
+                let p = project_frame(std::path::Path::new(&level_dir), frame, None, false, None, 0, None, &prefixes)?;
+                through.extend(p.states.iter().copied());
+                println!(
+                    "f{frame:03}: {} rows -> {} states ({:.2}x fewer); {} states through f{frame:03}",
+                    p.rows,
+                    p.states.len(),
+                    p.rows as f64 / p.states.len().max(1) as f64,
+                    through.len()
+                );
+            }
+        }
         Command::BucketDiff { exact_dir, bucketed_dir, from, to, w, x_only, examples, at } => {
             let at: Option<(i32, i32)> = at
                 .map(|s| -> Result<(i32, i32)> {
@@ -2160,9 +2301,9 @@ fn main() -> Result<()> {
             // frame 0.
             let (mut ideal, mut realized): (rustc_hash::FxHashSet<u64>, rustc_hash::FxHashSet<u64>) = Default::default();
             for frame in from..=to {
-                let exact = project_frame(std::path::Path::new(&exact_dir), frame, w, x_only, None, 0, at)?;
+                let exact = project_frame(std::path::Path::new(&exact_dir), frame, Some(w), x_only, None, 0, at, &[])?;
                 ideal.extend(exact.states.iter().copied());
-                let bucketed = project_frame(std::path::Path::new(&bucketed_dir), frame, w, x_only, Some(&ideal), examples, at)?;
+                let bucketed = project_frame(std::path::Path::new(&bucketed_dir), frame, Some(w), x_only, Some(&ideal), examples, at, &[])?;
                 realized.extend(bucketed.states.iter().copied());
                 let over = realized.iter().filter(|h| !ideal.contains(*h)).count();
                 let lost = ideal.iter().filter(|h| !realized.contains(*h)).count();
@@ -2183,7 +2324,7 @@ fn main() -> Result<()> {
                 }
                 if lost > 0 && examples > 0 {
                     // This frame's exact states no realized state so far matches.
-                    for ex in project_frame(std::path::Path::new(&exact_dir), frame, w, x_only, Some(&realized), examples, None)?.examples {
+                    for ex in project_frame(std::path::Path::new(&exact_dir), frame, Some(w), x_only, Some(&realized), examples, None, &[])?.examples {
                         println!("  lost: {ex}");
                     }
                 }
@@ -2303,6 +2444,7 @@ fn main() -> Result<()> {
             log,
             out,
             room,
+            forward_only,
         } => {
             let (rx, ry) = room
                 .split_once(',')
@@ -2313,6 +2455,7 @@ fn main() -> Result<()> {
                 std::path::Path::new(&log),
                 std::path::Path::new(&out),
                 (rx, ry),
+                forward_only,
             )?;
         }
         Command::Trajectory {

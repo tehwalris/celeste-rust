@@ -120,6 +120,9 @@ pub struct HorizonRun {
     pub h: u32,
     pub levels: Vec<LevelRun>,
     pub refuted_at: Option<usize>,
+    /// A forward on its own (`export-ui --forward-only`): level 0's frames
+    /// up to `h`, no backward and no verdict.
+    pub partial: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -226,7 +229,9 @@ fn parse_bwd(line: &str) -> Result<BwdLine> {
 /// as that (horizon, level); the initial level-0 forward therefore lands
 /// in the first horizon's level 0, and each later horizon's level 0 holds
 /// the one frame it was extended by.
-pub fn parse_log(text: &str) -> Result<(Vec<HorizonRun>, Option<f64>, Option<f64>, Option<u32>)> {
+/// With `forward_only` the log is one forward (`rewrite forward`): its
+/// `[fwd]` lines are closed into one partial horizon at its last frame.
+pub fn parse_log(text: &str, forward_only: bool) -> Result<(Vec<HorizonRun>, Option<f64>, Option<f64>, Option<u32>)> {
     let mut horizons: Vec<HorizonRun> = Vec::new();
     let mut fwd: Vec<FwdLine> = Vec::new();
     let mut bwd: Vec<BwdLine> = Vec::new();
@@ -292,7 +297,7 @@ pub fn parse_log(text: &str) -> Result<(Vec<HorizonRun>, Option<f64>, Option<f64
             first_win = None;
             match horizons.last_mut() {
                 Some(hr) if hr.h == h => hr.levels.push(run),
-                _ => horizons.push(HorizonRun { h, levels: vec![run], refuted_at: None }),
+                _ => horizons.push(HorizonRun { h, levels: vec![run], refuted_at: None, partial: false }),
             }
         } else if line.starts_with("[search] horizon ") {
             let t: Vec<&str> = line.split_whitespace().collect();
@@ -316,6 +321,37 @@ pub fn parse_log(text: &str) -> Result<(Vec<HorizonRun>, Option<f64>, Option<f64
             }
             wall = Some(secs);
         }
+    }
+    if forward_only {
+        if !horizons.is_empty() || !bwd.is_empty() || fwd.is_empty() {
+            bail!(
+                "--forward-only wants the log of one forward: {} [ladder] horizons, {} backward lines, {} forward lines",
+                horizons.len(),
+                bwd.len(),
+                fwd.len()
+            );
+        }
+        let h = fwd.last().map_or(0, |l| l.f);
+        let run = LevelRun {
+            level: 0,
+            precision: "forward only".to_string(),
+            fwd: std::mem::take(&mut fwd),
+            bwd: Vec::new(),
+            first_win: first_win.take(),
+            marked: None,
+            reruns: None,
+            refuted: false,
+            frames: 0,
+            frames_file: String::new(),
+            marks_file: None,
+            frame_states: Vec::new(),
+            frame_wins: Vec::new(),
+            marks_have_dist: false,
+            marks_by_dist: Vec::new(),
+            mlayers_file: None,
+            marks_by_layer: Vec::new(),
+        };
+        horizons.push(HorizonRun { h, levels: vec![run], refuted_at: None, partial: true });
     }
     if !fwd.is_empty() || !bwd.is_empty() {
         bail!("log ends with {} forward / {} backward lines not closed by a [ladder] line", fwd.len(), bwd.len());
@@ -501,8 +537,12 @@ fn marks_by_layer(dir: &Path, sets: &[&MarksFile]) -> Result<Vec<Vec<Sparse>>> {
     Ok(out)
 }
 
-fn level_dir(base: &Path, h: u32, level: usize) -> PathBuf {
-    if level == 0 {
+/// A level's directory under a search's checkpoint base; a forward's
+/// tree (`forward_only`) is its own level 0.
+fn level_dir(base: &Path, h: u32, level: usize, forward_only: bool) -> PathBuf {
+    if forward_only {
+        base.to_path_buf()
+    } else if level == 0 {
         base.join("level00")
     } else {
         base.join(format!("h{h:03}")).join(format!("level{level:02}"))
@@ -614,9 +654,9 @@ fn room_tiles(room: (i16, i16)) -> Result<Tiles> {
 }
 
 /// The export. `room` is the start room the tree was searched from.
-pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i16)) -> Result<()> {
+pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i16), forward_only: bool) -> Result<()> {
     let text = std::fs::read_to_string(log_path).with_context(|| format!("reading {}", log_path.display()))?;
-    let (mut horizons, wall_s, prebuild_s, optimal) = parse_log(&text)?;
+    let (mut horizons, wall_s, prebuild_s, optimal) = parse_log(&text, forward_only)?;
     eprintln!(
         "[export-ui] log: {} horizons, {} levels, optimal {:?}",
         horizons.len(),
@@ -641,7 +681,8 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
                     jobs.push(Job::Frames { h: hr.h, level: 0 });
                     have_l0 = true;
                 }
-                if !lr.refuted {
+                // A forward on its own has no backward, so no marks.
+                if !lr.refuted && !forward_only {
                     l0_hs.push(hr.h);
                 }
             } else {
@@ -679,7 +720,7 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
                         let Some(job) = jobs.get(i) else { return Ok(()) };
                         let done = match *job {
                             Job::Frames { h, level } => {
-                                let dir = level_dir(checkpoint_dir, h, level);
+                                let dir = level_dir(checkpoint_dir, h, level, forward_only);
                                 let data = read_level_frames(&dir)
                                     .with_context(|| format!("frames of {}", dir.display()))?;
                                 Done::Frames { h, level, data }
@@ -693,7 +734,7 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
                                     })
                                     .collect::<Result<Vec<_>>>()?;
                                 let refs: Vec<&MarksFile> = files.iter().collect();
-                                let dir = level_dir(checkpoint_dir, hs[0], level);
+                                let dir = level_dir(checkpoint_dir, hs[0], level, forward_only);
                                 let layers = marks_by_layer(&dir, &refs)
                                     .with_context(|| format!("marks by layer over {}", dir.display()))?;
                                 let outs = hs
@@ -847,8 +888,8 @@ mod tests {
 OPTIMAL win frame: 3
 	Elapsed (wall clock) time (h:mm:ss or m:ss): 7:13.31
 ";
-        assert_eq!(parse_log("[ladder] h3 level 0 (Bits(0)): NO WIN -> Refuted\nELAPSED 9098.66 s\n").unwrap().1, Some(9098.66));
-        let (hs, wall, prebuild, optimal) = parse_log(log).unwrap();
+        assert_eq!(parse_log("[ladder] h3 level 0 (Bits(0)): NO WIN -> Refuted\nELAPSED 9098.66 s\n", false).unwrap().1, Some(9098.66));
+        let (hs, wall, prebuild, optimal) = parse_log(log, false).unwrap();
         assert_eq!(hs.len(), 2);
         assert_eq!((hs[0].h, hs[1].h), (2, 3));
         let l0 = &hs[0].levels[0];
@@ -867,7 +908,7 @@ OPTIMAL win frame: 3
         assert_eq!(hs[1].levels[0].first_win, Some(2));
         assert_eq!(hs[1].levels[1].precision, "Exact");
         assert_eq!(l0.precision, "Bits(0)", "the inner paren survives");
-        let hs2 = parse_log("[ladder] h5 level 0 (Bits(0)): first win f5, marked 12 states (fingerprint cda9202a7cbb2234), 34 edges read\n").unwrap().0;
+        let hs2 = parse_log("[ladder] h5 level 0 (Bits(0)): first win f5, marked 12 states (fingerprint cda9202a7cbb2234), 34 edges read\n", false).unwrap().0;
         assert_eq!(hs2[0].levels[0].reruns, Some(34), "the BFS's line");
         let waves = &hs[1].levels[1].fwd[0];
         assert_eq!((waves.emit_ms, waves.emit_idle, waves.own_ms, waves.own_idle, waves.total_ms), (7, 94, 3, 0, 11));

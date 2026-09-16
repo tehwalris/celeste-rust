@@ -337,6 +337,9 @@ main[data-tab="space"] {
 .h-picker[data-kind="refuted"] select {
   border-color: rgba(230, 103, 103, 0.45);
 }
+.h-picker[data-kind="partial"] .picker-box::before {
+  background: var(--muted);
+}
 
 /* --- chips: a choice, as a segmented control --------------------------- */
 .chips {
@@ -841,6 +844,9 @@ details summary:focus-visible {
 .verdict-line[data-kind="refuted"] {
   color: var(--danger);
 }
+.verdict-line[data-kind="partial"] {
+  color: var(--muted);
+}
 .ladder-head,
 .ladder-row {
   display: grid;
@@ -1319,6 +1325,9 @@ table.ladder td.muted {
 }
 .verdict-tag.refuted {
   color: var(--danger);
+}
+.verdict-tag.partial {
+  color: var(--muted);
 }
 .table-wrap {
   overflow: auto;

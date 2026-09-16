@@ -61,6 +61,9 @@ export interface HorizonRun {
   h: number;
   levels: LevelRun[];
   refuted_at: number | null;
+  /** A forward on its own (`export-ui --forward-only`): level 0's frames
+   *  up to `h`, no backward, no verdict. Absent in older exports. */
+  partial?: boolean;
 }
 
 export interface Box2 {
@@ -300,7 +303,7 @@ export function runsInGameOrder(runs: RunInfo[]): RunInfo[] {
 // ---------------------------------------------------------------------------
 // Horizons: what the ladder concluded at each, and the order to offer them.
 
-export type VerdictKind = "optimal" | "confirmed" | "refuted";
+export type VerdictKind = "optimal" | "confirmed" | "refuted" | "partial";
 export interface Verdict {
   kind: VerdictKind;
   /** `optimal` / `confirmed` / `refuted at L9`. */
@@ -316,6 +319,9 @@ export interface Verdict {
  *  above the optimum (a count-down's ceiling); `refuted` stopped at a level
  *  with no win by the horizon, so by design nothing on screen wins. */
 export function horizonVerdict(run: Run, hr: HorizonRun): Verdict {
+  if (hr.partial) {
+    return { kind: "partial", short: "partial", label: `forward only, f0 to f${hr.h}`, long: `a partial level-0 forward, frames 0 to ${hr.h}: no backward, no verdict` };
+  }
   if (hr.refuted_at != null) {
     return { kind: "refuted", short: `refuted at L${hr.refuted_at}`, label: `refuted at L${hr.refuted_at}, no win by f${hr.h}`, long: `refuted at level ${hr.refuted_at}: no win by frame ${hr.h}` };
   }
