@@ -357,6 +357,20 @@ enum Command {
         #[arg(long)]
         at: Option<String>,
     },
+    /// DIAGNOSTIC: how much speed variety a frame has. Per axis: the distinct
+    /// player speed values, how few of them hold 50/90/99% of the states,
+    /// the most common values, the states on the cart's 0.05 px step and on
+    /// that step after one and two spring multiplies (0.01, 0.002 px; within
+    /// 16 raw units, against fixed-point residue), and states and distinct
+    /// values per 0.25 px bin.
+    SpdHist {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        frame: u32,
+        #[arg(long, default_value_t = 12)]
+        top: usize,
+    },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed file by
     /// file and row range by row range (the whole-frame `census` loads the
     /// frame). Per shape: rows, then every varying column's distinct value
@@ -446,6 +460,21 @@ enum Command {
         #[arg(long, default_value = "1,0")]
         room: String,
     },
+}
+
+/// The player's `spd.x` and `spd.y` cells of a block, when it has a player
+/// with a speed table.
+fn player_spd_cells(rt2: &celeste_engine::runtime2::Rt2, ids: &celeste_engine::runtime2::BoundaryIds) -> (Option<u32>, Option<u32>) {
+    use celeste_engine::runtime2::{Col, AV};
+    match celeste_rust::search::pos_graph::player_object(rt2)
+        .and_then(|obj| rt2.obj_field_cell(obj, ids.f_spd))
+        .and_then(|pc| match rt2.cols[pc as usize] {
+            Col::U(AV::Ptr(sub)) => Some(sub),
+            _ => None,
+        }) {
+        Some(sub) => (rt2.obj_field_cell(sub, ids.f_x), rt2.obj_field_cell(sub, ids.f_y)),
+        None => (None, None),
+    }
 }
 
 /// One frame of a checkpoint tree projected for `bucket-diff`: per state, a
@@ -2110,13 +2139,7 @@ fn main() -> Result<()> {
                     let hi = (lo + (1 << 20)).min(width);
                     let Some(rt2) = ff.load_rows(&[lo..hi])? else { break };
                     rows += rt2.width as u64;
-                    let (sx, sy) = match celeste_rust::search::pos_graph::player_object(&rt2)
-                        .and_then(|obj| rt2.obj_field_cell(obj, ids.f_spd))
-                        .and_then(|pc| match rt2.cols[pc as usize] { Col::U(AV::Ptr(sub)) => Some(sub), _ => None })
-                    {
-                        Some(sub) => (rt2.obj_field_cell(sub, ids.f_x), rt2.obj_field_cell(sub, ids.f_y)),
-                        None => (None, None),
-                    };
+                    let (sx, sy) = player_spd_cells(&rt2, ids);
                     let mut h: Vec<u64> = vec![rt2.shape_hash; rt2.width];
                     let fold = |acc: u64, c: usize, v: AV| -> u64 {
                         let (k, a, bb) = match v {
@@ -2202,6 +2225,107 @@ fn main() -> Result<()> {
                     sets[i + 1].len(),
                     sets[0].len() as f64 / sets[i + 1].len().max(1) as f64,
                     if straddles[i] > 0 { format!("; {} rows' speed hulls span more than one bucket", straddles[i]) } else { String::new() }
+                );
+            }
+        }
+        Command::SpdHist { level_dir, frame, top } => {
+            use celeste_engine::runtime2::AV;
+            use celeste_rust::search::checkpoint::FrameFile;
+            let ids = celeste_rust::compiled::ids();
+            let fdir = std::path::Path::new(&level_dir).join("frames").join(format!("f{frame:03}"));
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")))
+                .collect();
+            files.sort();
+            // Per axis, states per raw speed value.
+            let mut per: [rustc_hash::FxHashMap<i32, u64>; 2] = Default::default();
+            let (mut rows, mut no_speed) = (0u64, 0u64);
+            for p in &files {
+                let ff = FrameFile::open(p)?;
+                let width = ff.width();
+                let mut lo = 0u32;
+                while lo < width {
+                    let hi = (lo + (1 << 20)).min(width);
+                    let Some(rt2) = ff.load_rows(&[lo..hi])? else { break };
+                    let (sx, sy) = player_spd_cells(&rt2, ids);
+                    for r in 0..rt2.width {
+                        rows += 1;
+                        for (ax, c) in [(0usize, sx), (1, sy)] {
+                            match c.map(|c| rt2.cols[c as usize].at(r)) {
+                                Some(AV::Num(n)) => *per[ax].entry(n.as_raw_u32() as i32).or_default() += 1,
+                                Some(AV::Ival(a, b)) if a.as_raw_u32() == b.as_raw_u32() => *per[ax].entry(a.as_raw_u32() as i32).or_default() += 1,
+                                _ => {
+                                    if ax == 0 {
+                                        no_speed += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    lo = hi;
+                }
+            }
+            println!("f{frame:03}: {rows} states ({no_speed} without a numeric player speed)");
+            for (ax, name) in [(0usize, "spd.x"), (1, "spd.y")] {
+                let mut v: Vec<(i32, u64)> = per[ax].iter().map(|(k, n)| (*k, *n)).collect();
+                v.sort_by_key(|&(k, n)| (std::cmp::Reverse(n), k));
+                let total: u64 = v.iter().map(|x| x.1).sum::<u64>().max(1);
+                let cover = |share: f64| -> usize {
+                    let mut acc = 0u64;
+                    for (i, x) in v.iter().enumerate() {
+                        acc += x.1;
+                        if acc as f64 >= share * total as f64 {
+                            return i + 1;
+                        }
+                    }
+                    v.len()
+                };
+                let px = |k: i32| k as f64 / 65536.0;
+                // On a step of `step_px`: within 16 raw of a multiple of it.
+                // 0.05 px is the cart's acceleration grid; 0.01 px and
+                // 0.002 px are that grid after one and two spring
+                // multiplies by 0.2.
+                let on_step = |step_px: f64| -> (usize, f64) {
+                    let step = step_px * 65536.0;
+                    let (s, n) = v
+                        .iter()
+                        .filter(|x| (x.0 as f64 - (x.0 as f64 / step).round() * step).abs() <= 16.0)
+                        .fold((0u64, 0usize), |(s, n), x| (s + x.1, n + 1));
+                    (n, 100.0 * s as f64 / total as f64)
+                };
+                let steps: Vec<String> = [0.05, 0.01, 0.002]
+                    .iter()
+                    .map(|&s| {
+                        let (n, share) = on_step(s);
+                        format!("{s} px step: {n} values, {share:.1}% of states")
+                    })
+                    .collect();
+                println!(
+                    "{name}: {} distinct values; {} / {} / {} of them hold 50% / 90% / 99% of states; on the {}",
+                    v.len(),
+                    cover(0.5),
+                    cover(0.9),
+                    cover(0.99),
+                    steps.join("; on the ")
+                );
+                println!(
+                    "  most common: {}",
+                    v.iter().take(top).map(|&(k, n)| format!("{:.5} ({:.1}%)", px(k), 100.0 * n as f64 / total as f64)).collect::<Vec<_>>().join(", ")
+                );
+                let mut bins: std::collections::BTreeMap<i32, (u64, usize)> = Default::default();
+                for &(k, n) in &v {
+                    let e = bins.entry(k.div_euclid(16384)).or_default();
+                    e.0 += n;
+                    e.1 += 1;
+                }
+                println!(
+                    "  per 0.25 px bin (states %, distinct values): {}",
+                    bins.iter()
+                        .filter(|(_, (n, _))| *n as f64 >= 0.001 * total as f64)
+                        .map(|(b, (n, d))| format!("[{:.2}] {:.1}%/{d}", *b as f64 * 0.25, 100.0 * *n as f64 / total as f64))
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 );
             }
         }
