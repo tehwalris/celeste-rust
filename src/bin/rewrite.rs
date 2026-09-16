@@ -291,7 +291,7 @@ enum Command {
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed file by
     /// file and row range by row range (the whole-frame `census` loads the
     /// frame). Per shape: rows, then every varying column's distinct value
-    /// count (capped), the player's fields named, and the distinct
+    /// count (capped), every object's fields named (`type[i].field`), and the distinct
     /// (spd.x, spd.y) pairs.
     ColCensus {
         #[arg(long)]
@@ -1911,6 +1911,47 @@ fn main() -> Result<()> {
                                             if let Some(c) = rt2.obj_field_cell(sub, g) {
                                                 names.insert(c as usize, format!("{nm}.{ax}"));
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Every other object's fields, named `type[i].field`
+                        // (and `type[i].field.sub` one table deeper): the
+                        // column that multiplies a frontier is as often a
+                        // platform's or a fall floor's as the player's.
+                        if let Some(arr) = rt2.global_target(ids.g_objects) {
+                            if let Cell2::Arr(items) = &rt2.structure[arr as usize] {
+                                let type_name = |t: u32| -> String {
+                                    (0..celeste_names::GLOBAL_NAMES.len() as u32)
+                                        .find(|&g| rt2.global_target(g) == Some(t))
+                                        .map(|g| celeste_names::GLOBAL_NAMES[g as usize].to_string())
+                                        .unwrap_or_else(|| "?".to_string())
+                                };
+                                let field_name = |f: u32| celeste_names::FIELD_NAMES.get(f as usize).copied().unwrap_or("?");
+                                for (i, item) in items.iter().enumerate() {
+                                    let Col::U(AV::Ptr(obj)) = rt2.cols[*item as usize] else { continue };
+                                    let Cell2::Obj(fields) = &rt2.structure[obj as usize] else { continue };
+                                    let ty = rt2
+                                        .obj_field_cell(obj, ids.f_type)
+                                        .and_then(|c| match rt2.cols[c as usize] {
+                                            Col::U(AV::Ptr(t)) => Some(type_name(t)),
+                                            _ => None,
+                                        })
+                                        .unwrap_or_else(|| "?".to_string());
+                                    for &(f, c) in fields {
+                                        match (&rt2.structure[c as usize], &rt2.cols[c as usize]) {
+                                            (Cell2::Val, Col::U(AV::Ptr(sub))) => {
+                                                if let Cell2::Obj(subs) = &rt2.structure[*sub as usize] {
+                                                    for &(g, c2) in subs {
+                                                        names.entry(c2 as usize).or_insert_with(|| format!("{ty}[{i}].{}.{}", field_name(f), field_name(g)));
+                                                    }
+                                                }
+                                            }
+                                            (Cell2::Val, _) => {
+                                                names.entry(c as usize).or_insert_with(|| format!("{ty}[{i}].{}", field_name(f)));
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
