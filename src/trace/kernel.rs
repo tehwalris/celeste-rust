@@ -2035,7 +2035,14 @@ pub fn room_constant_lattice(
         // Keep the converged frame for generation (last trace wins).
         let lattice_trace = std::env::var_os("CELESTE_LATTICE_TRACE").is_some();
         if lattice_trace {
-            eprintln!("[lattice] trace shape #{} ({} pinned): {} outcomes", lattice.keys().position(|x| *x == k).unwrap_or(usize::MAX), pin.len(), f.outs.len());
+            eprintln!(
+                "[lattice] trace shape #{} ({} pinned): {} outcomes, {} nodes added ({} in the arena)",
+                lattice.keys().position(|x| *x == k).unwrap_or(usize::MAX),
+                pin.len(),
+                f.outs.len(),
+                it.d.node_count().saturating_sub(it.trace_start_nodes),
+                it.d.node_count()
+            );
         }
         for o in &f.outs {
             if it.d.decide(&o.ok) == Some(false) {
