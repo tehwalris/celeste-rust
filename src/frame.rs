@@ -1842,10 +1842,16 @@ impl ForwardState {
             }
         }
         door.end_frame(1);
+        let observer = record.then(crate::search::pos_graph::PosObserver::default);
+        // A graph (empty) beside f0 from the start: every tree that has
+        // frames has a graph covering at least the trusted ones.
+        if let Some(o) = observer.as_ref() {
+            save_pos_graph(dir, &o.snapshot(), 0)?;
+        }
         Ok(ForwardState {
             frontier: initial,
             door,
-            observer: record.then(crate::search::pos_graph::PosObserver::default),
+            observer,
             frames: 0,
             win_frame: None,
             compaction: None,
@@ -1962,6 +1968,16 @@ impl ForwardState {
             let path = pos_graph_path(dir);
             let graph = crate::search::pos_graph::PosGraph::load(&path)
                 .with_context(|| format!("resuming {}: no pos graph at {}", dir.display(), path.display()))?;
+            // The graph must cover every trusted frame. A tree without the
+            // marker predates per-frame saves; its graph was saved when its
+            // forward ended, covering the whole tree.
+            if let Some(covered) = pos_graph_frame(dir) {
+                anyhow::ensure!(
+                    covered >= last,
+                    "resuming {}: the pos graph covers f0-f{covered}, but the trusted frames run to f{last}",
+                    dir.display()
+                );
+            }
             Some(crate::search::pos_graph::PosObserver::from_graph(&graph))
         } else {
             None
@@ -2039,7 +2055,7 @@ impl ForwardState {
             }
             let t = std::time::Instant::now();
             if let Some(o) = self.observer.as_ref() {
-                o.flush();
+                save_pos_graph(dir, &o.snapshot(), frame)?;
             }
             let t_pos = t.elapsed();
             log_frame(frame, &st, t_edges, compact_records, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
@@ -2079,7 +2095,7 @@ impl ForwardState {
         // The level's graph so far, beside its frames: a backward can then
         // run on the tree alone (`rewrite bench-backward`).
         if let Some(o) = self.observer.as_ref() {
-            o.snapshot().save(&pos_graph_path(dir))?;
+            save_pos_graph(dir, &o.snapshot(), self.frames)?;
         }
         Ok(())
     }
@@ -2091,6 +2107,31 @@ impl ForwardState {
 }
 
 /// Where a level's position graph is saved alongside its frames.
+/// Persist a level's position graph as it stands after `frame`, beside its
+/// frames: the graph to a temp file renamed over `posgraph.bin`, then the
+/// frame it covers to `posgraph.frame` the same way. Saved every frame, so a
+/// crash between frames leaves a tree `ForwardState::resume` can take up.
+/// Saving it only when a forward ended made every crash unresumable: room
+/// (4,0)'s search died at f62 with f0-f60 on disk and no graph (2026-09-16).
+/// The graph is a union of per-frame edge sets, so a graph saved at a frame
+/// the resume later discards only holds edges its re-run records again.
+pub fn save_pos_graph(dir: &std::path::Path, graph: &crate::search::pos_graph::PosGraph, frame: u32) -> Result<()> {
+    let tmp = dir.join("posgraph.tmp");
+    graph.save(&tmp)?;
+    std::fs::rename(&tmp, pos_graph_path(dir))?;
+    let ftmp = dir.join("posgraph.frame.tmp");
+    std::fs::write(&ftmp, format!("{frame}\n"))?;
+    std::fs::rename(&ftmp, dir.join("posgraph.frame"))?;
+    Ok(())
+}
+
+/// The last frame the saved position graph covers (`save_pos_graph`); `None`
+/// for a tree written before per-frame saves, whose graph was saved when its
+/// forward ended.
+pub fn pos_graph_frame(dir: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(dir.join("posgraph.frame")).ok().and_then(|s| s.trim().parse().ok())
+}
+
 pub fn pos_graph_path(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("posgraph.bin")
 }
@@ -2983,9 +3024,14 @@ mod tests {
             let init = vec![Block::from_state(&e.initial_state().expect("init")).expect("block")];
             let e = Mutex::new(e);
             let mut st = ForwardState::start(init, dir, true).expect("start");
+            assert_eq!(pos_graph_frame(dir), Some(0), "start must leave a graph beside f0");
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
                 assert_eq!(st.frames, to);
+                // Every frame boundary leaves a graph covering the frame: a
+                // crash here resumes (the graph was saved only when a
+                // forward ended, so a crash lost it, 2026-09-16).
+                assert_eq!(pos_graph_frame(dir), Some(to), "the pos graph must be saved with frame {to}");
             }
             assert!(st.pos_graph().is_some());
         }
