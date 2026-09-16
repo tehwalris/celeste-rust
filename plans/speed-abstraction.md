@@ -182,6 +182,15 @@ So the night went to the next rooms instead: (3,0), (4,0) and onward.
 | (1,1) | 4 fall floors | 94 (TAS10 with 25 prologue frames, replays on a real PICO-8) | killed by the 60 GB memory cap at f56 after 44:56. Level 0 grows ×1.4–1.5 per frame f41–f55 (131.9M kept at f55, 699 s/frame, 56 GB peak). The largest shape at f54 (55.9M rows): player `x` 94 values × `y` 72 × 2,022 speed pairs, `fall_floor[0].delay` 19 and `[1].delay` 16 (when each floor was touched), `dash_effect_time` 11 |
 | (6,0) | fly fruit, 10 platforms | 72 (TAS7, replays on a real PICO-8) | level 0 grows ×1.6 per frame f35–f42 (16.8M kept at f42, 33 s/frame, 12 GB); stopped at f43. The main shape has 52 varying columns; ten object columns, 10 cells apart, each hold 7 distinct values within one frame, so they depend on the player, not the clock. `col-census` now names every object's fields: those are the platforms' `rem.x` (7 values each; `x`/`last` 5), and the fly fruit's `spd.y` 46, `rem.y` 44, `step` 18, `y` 15. The fly fruit starts flying when the player first dashes (`has_dashed`), so its flight phase records when each state first dashed; it cannot be pinned away (collecting it refills the dash) |
 
+**A per-room pin that is real but not enough.** `dash_effect_time` has one
+read in the cart: `fake_wall.update`'s `hit.dash_effect_time > 0`. Fake walls
+come only from the map at room load, so in a room without one the field is
+gameplay-dead. It counts down from 10 after a dash and holds 11 values in room
+(1,1)'s largest shape at f54. Pinning it there, guarded at startup by "no
+fake wall in the start room", would merge up to ×11. That does not change
+room (1,1): at ×1.4 per frame, f55 to f94 is ×5×10^5, beyond any constant
+factor. It is recorded as a lever, not built.
+
 **The balloon's phase (room (5,0), for Philippe).** `balloon.init` draws
 `offset = rnd(1)`, which fixes its bob, and PICO-8 seeds `rnd` itself. The
 search models the draw as the whole interval [0, 1), so it explores every
