@@ -138,3 +138,14 @@ The rebuild replaced the old search (`run.rs`/`sweep*.rs`, deleted) with
    file per cell-uniform block was an inode blow-up (~17k files per frame
    on tmpfs): count (shape, cell) files and keys per file per frame on a
    real tree before building it.
+7. **A crash mid-forward must leave a resumable tree** (2026-09-16). Room
+   (4,0)'s search panicked at f62 (a number input read an interval, fixed
+   in `19a1599`). Rerunning the same command then refused:
+   `resuming .../level00: no pos graph at .../level00/posgraph.bin`. The
+   frames and edge runs to f60 were on disk, but the pos graph is written
+   only when a forward ends, so a crash leaves no graph and the resume
+   `CLAUDE.md` promises ("rerun the same command after a crash") is
+   impossible. Either persist the graph per frame alongside the edge runs
+   (`edges/done.txt` already marks the last complete frame), or rebuild it
+   on resume from the frames it trusts. Until then, delete the tree after a
+   crash.
