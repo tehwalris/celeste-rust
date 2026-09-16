@@ -172,6 +172,27 @@ What could still work, none of it built yet:
 
 So the night went to the next rooms instead: (3,0), (4,0) and onward.
 
+### The next rooms (2026-09-16, night)
+
+| room | objects | ceiling (TAS replayed, then followed in our game) | result |
+|---|---|---|---|
+| (3,0) | fly fruit, 12 fall floors | 89 (TAS4; the witness search stops when the route collects the fruit: the bridge has no integer-keyed table part) | kernels do not build: one shape's trace grows the graph by >2M nodes in the move loop's solid checks over the fall floors |
+| (4,0) | key, chest | 76 (TAS5, replays on a real PICO-8) | **OPTIMAL 76** (3:54), after pinning the key's `spr`/`flip.x` with `frames` |
+| (5,0) | balloon | 77 in the original cart; our witness does NOT exit on a real PICO-8 | open question, below |
+| (6,0) | fly fruit, 10 platforms | 72 (TAS7, replays on a real PICO-8) | running |
+
+**The balloon's phase (room (5,0), for Philippe).** `balloon.init` draws
+`offset = rnd(1)`, which fixes its bob, and PICO-8 seeds `rnd` itself. The
+search models the draw as the whole interval [0, 1), so it explores every
+phase, and its optimum is the fastest route over the most favourable phase:
+a lower bound for the real game, which may need a different phase. The
+trajectory witness that follows TAS6's positions in our model does not exit
+on a real PICO-8. The route relies on a phase this replay's seed did not
+produce. Options: report balloon rooms as optimal over all phases (sound as
+a lower bound, not always achievable); pin the phase to what the real game
+draws at room load, if the seed at load is deterministic; or fork the phase
+into buckets and report per phase. Not decided tonight; room (5,0) waits.
+
 ### Two bugs the coarse tables exposed (2026-09-16)
 
 - **The dash-constant reader** split on every undecided select in the dash

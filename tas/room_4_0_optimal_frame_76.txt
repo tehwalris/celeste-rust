@@ -1,0 +1,16 @@
+# Room (4,0) "500 m" OPTIMAL exit witness for celeste-minimal, 2026-09-16.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 4,0, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# `rewrite search --room 4,0 --ceiling 76` (e0d5852): the ceiling from
+# tas/room_4_0_exit_frame_76.txt confirmed at every level of the ladder
+# (Bits(0..=15) then Exact; exact level first win f76, 112,459 marked), and
+# h75 refuted -> OPTIMAL win frame: 76 (3:54 end to end).
+# `rewrite witness --horizon 76 --level 16 --room 4,0` walked the exact
+# level's marks with the reference engine (243 concrete steps, 0 dead ends)
+# to the inputs below. Replayed on a real PICO-8 in celeste-minimal, the
+# player is at (19,-2) on frame 75 and the room changes to (5,0) during
+# frame 76. No 75-frame solution exists in the model.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,0,0,0,2,2,2,38,0,0,0,0,0,0,0,0,0,0,0,0,0,16,36,0,0,0,0,0,0,0,0,0,0,1,1,37,0,0,0,0,0,0,16,0,0,0,0
