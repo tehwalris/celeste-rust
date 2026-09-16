@@ -230,6 +230,18 @@ Measured:
   830,750,403 states visited; to f94 in 27m53s; level 0's first win f77. The
   permanent version is a bound grounded in the game code: minimum frames to
   the exit from our own kernels run from each cell (Philippe, 2026-09-16).
+- **Room (2,0) search, OPTIMAL 95** (2026-09-16, 41m57s):
+  `CELESTE_LADDER="r0sxh,r1sxh,...,r15sxh,rxsx" CELESTE_BAND="95,8"
+  rewrite search --room 2,0 --ceiling 95`, 90 GB cap. h95 confirmed at every
+  level (marked: level 0 19,245,834; level 5 1,154,364; level 15 7,280; Exact
+  4,337). h94: level 0 marked 15,610,354, level 8 68,300, level 9 NO WIN ->
+  refuted. The first band had also dropped rows that had already left the room
+  (the next room's y read as far from the exit), refuting 95 at level 1; fixed
+  in `a2c9e84` before this run.
+  CAVEAT: the refutation of 94 rests on the band, and 8 px/frame is not a safe
+  bound: a spring snaps the player up to 8 px (`hit.y=this.y-4` from the deepest
+  overlap) and the player then moves with `spd.y=-3` in the same frame, 11 px.
+  95 itself is the replayed TAS, confirmed through Exact.
 
 ## Later
 
