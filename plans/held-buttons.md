@@ -196,9 +196,40 @@ Measured:
   | peak memory | 28.7 GB | 8.73 GB | 3.3x |
   | run to f68 | 10m12s | 2m21s | 4.3x |
 
-  The factor is 3.78x at f60 and 3.80x at f68: a constant factor. Growth per
-  frame stays about 1.10x (f60 6.14M, f68 13.32M), so level 0 alone would still
-  reach roughly 150M states per frame and about 100 GB by f94.
+  The factor is 3.78x at f60 and 3.80x at f68: a constant factor, not a slower
+  curve.
+- Room (2,0) `r0sxh` on to f80: growth does NOT slow, it rises.
+
+  | frame | kept | growth | frame | peak |
+  |---|---|---|---|---|
+  | f68 | 13,320,182 | x1.114 | 15.3 s | 8.8 GB |
+  | f72 | 21,159,387 | x1.128 | 28.8 s | 12.6 GB |
+  | f76 | 36,405,697 | x1.150 | 58.8 s | 19.3 GB |
+  | f80 | 62,810,806 | x1.158 | 135.0 s | 30.4 GB |
+
+  517,549,244 states visited by f80; the run to f80 took 13m44s. Level 0 alone
+  would reach roughly 400M states per frame by f94: surviving to the horizon
+  needs states cut before it (a time band, a cost-to-go bound).
+- **EXPERIMENT, the time band** (`CELESTE_BAND="94,8"`, `frame::band`): drop a
+  player cell when even 8 px per frame up cannot reach the exit (y < -4) by
+  f94, with one frame of slack. 8 px is the largest upward move in room
+  (2,0)'s recorded transitions, a measurement and not a proven bound, so this
+  shows level 0 CAN survive to the horizon, not that the cut is sound. Room
+  (2,0) `r0sxh`, 90 GB cap:
+
+  | frame | kept | frame | peak |
+  |---|---|---|---|
+  | f80 | 60,321,724 | 131.7 s | 30.0 GB |
+  | f82 | 68,341,073 | 186.6 s | 35.6 GB |
+  | f83 | 67,517,553 | 204.9 s | 37.5 GB |
+  | f84 | 55,436,002 | 168.7 s | 37.5 GB |
+  | f86 | 12,575,911 | 33.1 s | 37.5 GB |
+  | f90 | 2,130,640 | 3.3 s | 37.5 GB |
+  | f94 | 75,347 | 0.4 s | 37.5 GB |
+
+  830,750,403 states visited; to f94 in 27m53s; level 0's first win f77. The
+  permanent version is a bound grounded in the game code: minimum frames to
+  the exit from our own kernels run from each cell (Philippe, 2026-09-16).
 
 ## Later
 

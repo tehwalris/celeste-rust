@@ -1053,6 +1053,13 @@ impl<'a> ForwardSink<'a> {
                 }
                 None => None,
             };
+            // EXPERIMENT (not a default, not sound as a proof): the time band.
+            // A queue is one player cell; drop it when even the fastest recorded
+            // climb cannot reach the exit by the horizon.
+            let allow = match band() {
+                Some((h, px)) if cell_too_late(slot.cell, self.frame, h, px) => Some(vec![false; n]),
+                _ => allow,
+            };
             self.sort_buf.clear();
             self.sort_buf.extend(
                 slot.keys
@@ -1254,6 +1261,29 @@ impl<'a> ForwardSink<'a> {
     }
 }
 
+
+/// EXPERIMENT: `CELESTE_BAND="H,px"`, the time band. `px` is the largest upward
+/// movement per frame (8 on room (2,0)'s recorded transitions: a measurement,
+/// not a proven bound), `H` the horizon. Unset: no band.
+fn band() -> Option<(u32, i32)> {
+    static BAND: std::sync::OnceLock<Option<(u32, i32)>> = std::sync::OnceLock::new();
+    *BAND.get_or_init(|| {
+        let s = std::env::var("CELESTE_BAND").ok()?;
+        let (h, px) = s.split_once(',').expect("CELESTE_BAND=\"H,px\"");
+        let band = (h.trim().parse().expect("CELESTE_BAND horizon"), px.trim().parse().expect("CELESTE_BAND px per frame"));
+        eprintln!("[band] EXPERIMENT: dropping cells that cannot climb to the exit by f{} at {} px per frame", band.0, band.1);
+        Some(band)
+    })
+}
+
+/// Can a player at `cell` at frame `frame` not reach the exit (y < -4) by
+/// horizon `h`, at `px` pixels per frame up? One frame of slack for when the
+/// exit test runs. A cell with no player (a death, a room change) is kept.
+fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
+    let Some((_, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
+    let frames = ((y + 5).max(0) + px - 1) / px;
+    frame + (frames.max(1) - 1) as u32 > h
+}
 
 /// The ladder's forward discard-filter. A state generated at precision r+1 is
 /// KEPT only if its widened-to-precision-r form was marked by the previous
