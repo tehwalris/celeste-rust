@@ -37,8 +37,10 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None):
     lua = open(lua_path or os.path.join(ROOT, "lua", "celeste-minimal.lua")).read()
     if room is not None:
         # The minimal cart's _init loads room (1,0); the search patches the
-        # same call (celeste-interp game_runner) to start elsewhere.
-        pat = "load_room(1, 0)"
+        # same call (celeste-interp game_runner) to start elsewhere. The
+        # ORIGINAL cart's start is begin_game's `load_room(0,0)` - patched the
+        # same way, so a community TAS of any level replays from its room.
+        pat = "load_room(0,0)" if begin_game else "load_room(1, 0)"
         assert lua.count(pat) == 1, f"expected exactly one {pat!r} in the Lua"
         lua = lua.replace(pat, f"load_room({room[0]}, {room[1]})")
     map_data = hexbytes(os.path.join(ROOT, "cart", "map-data.txt"), 8192)
@@ -106,7 +108,7 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the generated cart")
     ap.add_argument("--lua", help="the game's Lua (default lua/celeste-minimal.lua)")
     ap.add_argument("--begin-game", action="store_true", help="call begin_game() after _init() (the original cart)")
-    ap.add_argument("--room", help="start room \"x,y\" for the minimal cart (default 1,0)")
+    ap.add_argument("--room", help="start room \"x,y\" (minimal cart: replaces _init's load_room(1, 0); with --begin-game: begin_game's load_room(0,0))")
     args = ap.parse_args()
     if args.inputs:
         inputs = [int(x) for x in args.inputs.split(",")]
