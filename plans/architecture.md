@@ -138,7 +138,19 @@ The rebuild replaced the old search (`run.rs`/`sweep*.rs`, deleted) with
    file per cell-uniform block was an inode blow-up (~17k files per frame
    on tmpfs): count (shape, cell) files and keys per file per frame on a
    real tree before building it.
-7. **A crash mid-forward must leave a resumable tree** (2026-09-16). Room
+7. DONE 2026-09-16 (`78fbb60`). The position graph is saved with every frame
+   (`frame::save_pos_graph`: the graph, then a `posgraph.frame` marker, each
+   temp file then rename, and an empty graph beside f0). `resume` requires the
+   marker to cover the trusted frames.
+   Tested with a real kill on `search --room 1,0 --ceiling 99`: `kill -9`
+   partway through level 0's f70 (frames f69/f70 on disk, `done.txt` 69, marker
+   70). The resume discarded f70, rebuilt the door from f0-f69 in 5.2 s and
+   reached `OPTIMAL win frame: 99` (3:27, against 3:58 uninterrupted). Every one
+   of the 24 ladder lines matches the reference's first win, marked count and
+   fingerprint. Only "edges read" differs (h99 level 0: 54,291,317 against
+   53,875,154): the resumed frontier is reloaded from the checkpoint files in
+   another lane order, so the edge records fall into other 64-lane groups.
+   The original finding, for the record: **a crash mid-forward must leave a resumable tree**. Room
    (4,0)'s search panicked at f62 (a number input read an interval, fixed
    in `19a1599`). Rerunning the same command then refused:
    `resuming .../level00: no pos graph at .../level00/posgraph.bin`. The
