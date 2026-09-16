@@ -1,3 +1,42 @@
+# Room (4,0) end to end: OPTIMAL 76 (2026-09-16, release, 32 threads)
+
+`rewrite search --room 4,0 --ceiling 76`: the ceiling is the community TAS5
+followed in our game (`tas/room_4_0_exit_frame_76.txt`, replays on a real
+PICO-8). Wall 3:54, ladder forwards 216 s.
+
+| horizon | levels run | rows through the kernels | forward seconds | outcome |
+|---|---|---|---|---|
+| 76 | 17 | 931.5M | 193.5 | confirmed at every level (exact level: first win f76, 112,459 marked) |
+| 75 | 10 | 42.8M | 22.1 | refuted at level 9 (Bits(9)) |
+
+Level 0 (rem Bits(0), exact speed) to f76:
+
+| frame | kept | frame time | peak RSS |
+|---|---|---|---|
+| f50 | 1.03M | 0.59 s | 1.45 GB |
+| f60 | 3.94M | 2.6 s | 3.62 GB |
+| f70 | 6.94M | 4.7 s | 6.44 GB |
+| f76 | 7.98M | 5.3 s | 8.01 GB |
+
+Level 0 first wins at f68 and marks 2.69M states at h76. `rewrite witness
+--horizon 76 --level 16` walks the exact level's marks to a 76-input sequence
+(243 steps, no dead ends) that changes room during frame 76 on a real PICO-8
+(`tas/room_4_0_optimal_frame_76.txt`).
+
+Getting here took four fixes, each loud when found:
+- `rnd` as an interval draw: room (5,0)'s balloon init ran inside (4,0)'s exit
+  frame, and the exit trace refused.
+- A refused re-trace drops its stale frame: the start shape's kernels had baked
+  the spawn's state at 0 (gap at f8).
+- The lattice walk discovers interval inputs: the chest's `rnd` shake panicked
+  a number input at f62.
+- The key's `spr`/`flip.x` are pinned with `frames`: without that, the exact
+  level's mark filter dropped every state at f2, and the ladder refuted a
+  solution that replays on a real PICO-8.
+
+Where the other rooms stand, with numbers: plans/speed-abstraction.md "The
+next rooms".
+
 # The h99 exact-speed slowdown, bisected (2026-09-15, room (1,0), release)
 
 `rewrite search --room 1,0 --ceiling 99` (exact speed at every level), each
