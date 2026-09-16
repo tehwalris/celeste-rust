@@ -1257,15 +1257,15 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
     //
     // `frames`, `seconds`, `minutes` and `deaths` form a closed subsystem in
     // celeste-minimal: they only ever feed each other (the timer cascade and
-    // the death counter), never gameplay. The single gameplay read is the
-    // key sprite wobble `sin(frames/30)` (celeste-minimal.lua, key.update).
-    // For the default room `sin` is absent from the fixed env, so a room
-    // where that read executes crashes loudly instead of silently depending
-    // on a pinned value. For non-default start rooms `sin` IS registered
-    // (game_runner), so the belt there is different: the pin is sound in a
-    // room iff no key object exists in it - room (0,0) has none (fruit bobs
-    // on its per-object `off` counter, not `frames`). Revisit before any
-    // key room. Erasing them at the
+    // the death counter), never gameplay. The one other read is the key's
+    // sprite wobble: `key.update` writes `spr = 9 + (sin(frames/30) + 0.5)`
+    // and toggles `flip.x` when `flr(spr)` reaches 10, and nothing but the
+    // key's update and its drawing reads either - so those two are pinned
+    // below WITH the timers (spr to the key tile 8, flip.x to false).
+    // Pinning `frames` alone left them varying on exact rows and constant on
+    // pinned ones: in room (4,0), the first key room, no exact state had a
+    // widened counterpart and the exact level refuted a real solution
+    // (2026-09-16). Erasing them at the
     // frame boundary makes the state representation world-still, which is
     // what allows cross-frame visited-set dedup (a state reached at frame n
     // never needs re-expansion later). It also merges died-and-respawned
@@ -1285,6 +1285,37 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
                 );
             }
             other => panic!("timer global {} is not a number: {:?}", name, other),
+        }
+    }
+    {
+        let helper = StateHelper::new(&state);
+        let mut key_updates: Vec<(HeapId, Value)> = Vec::new();
+        if let Some(arr_id) = helper
+            .find_global("objects")
+            .and_then(|id| helper.unwrap_pointer(helper.load(id)))
+        {
+            let keys = helper
+                .find_objects_by_type(arr_id, "key")
+                .unwrap_or_else(|e| panic!("key pin: {}", e));
+            for obj_id in keys {
+                let HeapValue::ObjectTable(obj) = helper.load(obj_id) else {
+                    panic!("key pin: key is not an ObjectTable");
+                };
+                let spr = *obj.get("spr").unwrap_or_else(|| panic!("key pin: key has no `spr` field"));
+                key_updates.push((spr, Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(8)))));
+                let flip = *obj.get("flip").unwrap_or_else(|| panic!("key pin: key has no `flip` field"));
+                let flip_table = helper
+                    .unwrap_pointer(helper.load(flip))
+                    .unwrap_or_else(|| panic!("key pin: key `flip` is not a table"));
+                let HeapValue::ObjectTable(ft) = helper.load(flip_table) else {
+                    panic!("key pin: key `flip` is not an ObjectTable");
+                };
+                let fx = *ft.get("x").unwrap_or_else(|| panic!("key pin: key `flip` has no `x`"));
+                key_updates.push((fx, Value::Bool(MaybeVector::Scalar(false))));
+            }
+        }
+        for (cell, value) in key_updates {
+            state.heap.set(cell, HeapValue::Value(value));
         }
     }
 

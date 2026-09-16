@@ -145,6 +145,11 @@ pub struct BoundaryIds {
     pub g_fruit: u32,
     pub f_off: u32,
     pub f_start: u32,
+    /// The key object type and the two fields its update derives from
+    /// `frames` (the sprite wobble and its flip): pinned with the timers.
+    pub g_key: u32,
+    pub f_spr: u32,
+    pub f_flip: u32,
 }
 
 pub struct Rt2 {
@@ -995,6 +1000,24 @@ impl Rt2 {
             }
         }
 
+        // 5. The key's `frames`-derived fields, pinned WITH the timers
+        // (`abstraction::apply_conservative_widenings`, `widen::widen_timers`):
+        // `key.update` writes `spr = 9 + (sin(frames/30) + 0.5)` and toggles
+        // `flip.x` when `flr(spr)` reaches 10, and nothing but the key's own
+        // update and its drawing reads either. Pinning `frames` alone left
+        // them varying on exact rows and constant on pinned ones, so no exact
+        // key-room state had a widened counterpart (room (4,0): the exact
+        // level's mark filter dropped every state at f2, 2026-09-16).
+        for obj in self.objects_of_type(ids, ids.g_key) {
+            let spr = self.obj_field_cell(obj, ids.f_spr).unwrap_or_else(|| panic!("key pin: key has no `spr` field"));
+            self.cols[spr as usize] = Col::U(AV::Num(P8::from_i16(8)));
+            let flip = self.obj_field_cell(obj, ids.f_flip).unwrap_or_else(|| panic!("key pin: key has no `flip` field"));
+            let Col::U(AV::Ptr(sub)) = self.cols[flip as usize] else {
+                panic!("key pin: key `flip` is not a table: {:?}", self.cols[flip as usize])
+            };
+            let fx = self.obj_field_cell(sub, ids.f_x).unwrap_or_else(|| panic!("key pin: key `flip` has no `x`"));
+            self.cols[fx as usize] = Col::U(AV::Bool(false));
+        }
     }
 
     /// Shared boundary tail: canonical ids, the shape hash, and the

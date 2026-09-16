@@ -319,7 +319,11 @@ fn widen_fruit(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
 }
 
 /// The timer globals (`frames`/`seconds`/`minutes`/`deaths`) pinned to
-/// zero - `apply_conservative_widenings`' gameplay-dead pins.
+/// zero - `apply_conservative_widenings`' gameplay-dead pins - and with
+/// them each key's `frames`-derived `spr` (to its tile, 8) and `flip.x` (to
+/// false): the key's update derives both from `frames` and nothing but its
+/// own update and drawing reads them, so pinning `frames` alone left exact
+/// key-room states with no widened counterpart (room (4,0), 2026-09-16).
 /// Rung-independent.
 fn widen_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     let zero = P8::from_i16(0);
@@ -330,6 +334,20 @@ fn widen_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
         }
         let z = d.num(zero);
         iface::set(st, &p, Value::Num(z))?;
+    }
+    for obj in objects_of_type(st, "key") {
+        let spr = field(&obj, &["spr"]);
+        if iface::get(st, &spr).is_none() {
+            bail!("{}: a key without `spr` - the pin would silently not apply", iface::show(&spr));
+        }
+        let tile = d.num(P8::from_i16(8));
+        iface::set(st, &spr, Value::Num(tile))?;
+        let fx = field(&obj, &["flip", "x"]);
+        if iface::get(st, &fx).is_none() {
+            bail!("{}: a key without `flip.x` - the pin would silently not apply", iface::show(&fx));
+        }
+        let f = d.boolean(false);
+        iface::set(st, &fx, Value::Bool(f))?;
     }
     Ok(())
 }

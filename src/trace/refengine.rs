@@ -103,6 +103,27 @@ impl RefEngine {
         to_interp_state(&leaves[0])
     }
 
+    /// `run_frame_concrete` where the frame may FORK: every leaf, each a
+    /// state. Buttons are the caller's, as there. A concrete input forks
+    /// only where the cart reads a value no input decides, e.g. `rnd`'s
+    /// draw (room (5,0)'s balloon phase is an interval, so a hit test near
+    /// it can go both ways). A caller that needs a concrete witness keeps
+    /// the leaves it wants and checks the result on a real PICO-8.
+    pub fn run_frame_concrete_all(&mut self, input: &OState) -> Result<Vec<OState>> {
+        use anyhow::bail;
+        if input.vector_size != 1 {
+            bail!("run_frame_concrete_all expects one lane, got {}", input.vector_size);
+        }
+        let mut d = RefDomain::new();
+        let mut bridged = to_trace_state(input, 0, &mut d)?;
+        patch_closures_for(&mut bridged, &self.fn_info)?;
+        add_missing_builtins(&mut bridged, &self.base);
+        run_frame_all(&mut self.it, self.body_concrete, &bridged)?
+            .iter()
+            .map(to_interp_state)
+            .collect()
+    }
+
     /// One frame of ONE lane of `input`: every fork leaf as a state.
     pub fn run_lane(&mut self, input: &OState, lane: usize) -> Result<Vec<OState>> {
         let mut d = RefDomain::new();

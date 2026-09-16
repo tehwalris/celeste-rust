@@ -105,6 +105,9 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
         g_fruit: g("fruit"),
         f_off: f("off"),
         f_start: f("start"),
+        g_key: g("key"),
+        f_spr: f("spr"),
+        f_flip: f("flip"),
     }
 }
 

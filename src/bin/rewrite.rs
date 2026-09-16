@@ -2031,29 +2031,34 @@ fn main() -> Result<()> {
                     for byte in inputs.clone() {
                         let mut s = st.clone();
                         celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
-                        let mut succ = eng.run_frame_concrete(&s)?;
-                        celeste_rust::concrete::restore_buttons(&initial, &mut succ)?;
-                        tried += 1;
-                        let block = Block::from_state(&succ)?;
-                        let cell = block.positions()?[0];
-                        let pos = celeste_rust::search::pos_graph::cell_xy(cell);
-                        if let Some(w) = want {
-                            if pos != Some(*w) {
+                        // Every leaf: a frame forks where the cart reads a
+                        // value no input decides (`rnd`), and a leaf at the
+                        // wanted position is as good a witness as the frame
+                        // has. The real-PICO-8 replay is what settles it.
+                        for mut succ in eng.run_frame_concrete_all(&s)? {
+                            celeste_rust::concrete::restore_buttons(&initial, &mut succ)?;
+                            tried += 1;
+                            let block = Block::from_state(&succ)?;
+                            let cell = block.positions()?[0];
+                            let pos = celeste_rust::search::pos_graph::cell_xy(cell);
+                            if let Some(w) = want {
+                                if pos != Some(*w) {
+                                    continue;
+                                }
+                            }
+                            let key = block.keys()[0];
+                            if !seen.insert((key.0, key.1, cell)) {
                                 continue;
                             }
+                            let mut p = path.clone();
+                            p.push(byte);
+                            if stop_at_win && wins_of(block.rt2())?.iter().any(|&w| w) {
+                                println!("[trajectory] WIN at f{f} after {} frames; inputs:", p.len());
+                                println!("{}", p.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
+                                return Ok(());
+                            }
+                            next.push((succ, p));
                         }
-                        let key = block.keys()[0];
-                        if !seen.insert((key.0, key.1, cell)) {
-                            continue;
-                        }
-                        let mut p = path.clone();
-                        p.push(byte);
-                        if stop_at_win && wins_of(block.rt2())?.iter().any(|&w| w) {
-                            println!("[trajectory] WIN at f{f} after {} frames; inputs:", p.len());
-                            println!("{}", p.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
-                            return Ok(());
-                        }
-                        next.push((succ, p));
                     }
                 }
                 eprintln!(
