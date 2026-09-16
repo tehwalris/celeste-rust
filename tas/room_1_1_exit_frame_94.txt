@@ -1,0 +1,18 @@
+# Room (1,1) "1000 m" exit witness for celeste-minimal, derived 2026-09-16.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 1,1, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Derived from ~/src/github.com/CelesteClassic/tasdatabase/classic/any/TAS10.tas
+# (69 inputs), replayed on a real PICO-8 in the ORIGINAL cart
+# (celeste_ocaml/celeste.lua, `replay.py --lua ... --begin-game --room 1,1`)
+# at prologue offsets 22-31. The earliest exit is during frame 94, with 25
+# prologue frames (= 25 + 69); 22-24 never exit. Its per-frame player
+# positions (frames 1-93, `-` during the spawn) went through
+# `rewrite trajectory --room 1,1`, which found the inputs below for OUR game
+# following that trajectory exactly. Replayed on a real PICO-8 in
+# celeste-minimal, the player is at (36,-3) on frame 93 and the room changes
+# to (2,1) during frame 94. So the exit at frame 94 is valid for
+# celeste-minimal: the search's --ceiling 94.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,18,2,40,0,0,0,0,0,0,0,16,0,0,0,0,0,0,0,2,2,18,2,2,2,2,2,0,0,0,36,0,0,0,0,0,0,1,1,0,1,1,0,17,1,1,1,1,1,16,0,0,0,0,16,0,0,0,36,0,0,0,0,0,0,0,0
