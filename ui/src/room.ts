@@ -23,15 +23,27 @@ export interface HeatLayer {
   flat?: boolean;
 }
 
-export interface Ring {
+/** A win: won states in one cell. The export draws a won state where its
+ *  player LEFT the room (ui_export.rs, `read_level_frames`), so the
+ *  marker sits on the exit the route takes. */
+export interface WinMark {
   idx: number;
-  color: RGB;
+  count: number;
+  /** The first frame a state won from this cell. */
+  frame: number;
 }
 
 export interface Scene {
   layers: HeatLayer[];
-  rings: Ring[];
+  wins: WinMark[];
 }
+
+/** The first x that is in the NEXT room: the cart moves the player back
+ *  inside at `x > 121`, so no in-room state has x >= 128. An export made
+ *  before the exit-placement fix put won states at the next room's spawn,
+ *  one room over (room (0,0): (136, 128) and (136, 124)); those cells are
+ *  not painted and not marked - the UI says so instead (space.ts). */
+export const NEXT_ROOM_X = 128;
 
 const SPIKE_IDS = new Set([17, 27, 43, 59]);
 
@@ -42,6 +54,8 @@ export class RoomRenderer {
   private readonly off: HTMLCanvasElement;
   private readonly img: ImageData;
   private readonly acc: Float32Array;
+  /** Per cell: whether a state can be there (x < NEXT_ROOM_X). */
+  private readonly inRoom: Uint8Array;
 
   constructor(box: Box2, tiles: Tiles) {
     this.box = box;
@@ -49,6 +63,8 @@ export class RoomRenderer {
     const n = box.w * box.h;
     this.base = new Float32Array(n * 3);
     this.acc = new Float32Array(n * 3);
+    this.inRoom = new Uint8Array(n);
+    for (let i = 0; i < n; i++) this.inRoom[i] = (i % box.w) + box.x0 < NEXT_ROOM_X ? 1 : 0;
     this.off = document.createElement("canvas");
     this.off.width = box.w;
     this.off.height = box.h;
@@ -134,6 +150,7 @@ export class RoomRenderer {
     const { w, h } = this.box;
     const n = w * h;
     const acc = this.acc;
+    const inRoom = this.inRoom;
     acc.set(this.base);
     for (const layer of scene.layers) {
       const { grid, ramp, alpha } = layer;
@@ -141,7 +158,7 @@ export class RoomRenderer {
       const top = ramp.length - 1;
       for (let i = 0; i < n; i++) {
         const v = grid[i];
-        if (v <= 0) continue;
+        if (v <= 0 || !inRoom[i]) continue;
         const t = layer.flat ? 1 : Math.min(1, Math.log1p(v) / lmax);
         const c = ramp[Math.round(t * top)];
         // Faint cells stay visible: alpha never drops below 55% of the layer's.
@@ -184,24 +201,65 @@ export class RoomRenderer {
       o.setTransform(1, 0, 0, 1, 0, 0);
       o.clearRect(0, 0, pw, ph);
       const s = pw / w;
-      for (const r of scene.rings) {
-        if (r.idx === NO_POSITION) continue;
-        const cx = ((r.idx % w) + 0.5) * s;
-        const cy = (Math.floor(r.idx / w) + 0.5) * s;
-        const rad = Math.max(3, s * 2.2);
-        o.beginPath();
-        o.arc(cx, cy, rad + 1.5, 0, Math.PI * 2);
-        o.strokeStyle = "rgba(0,0,0,0.8)";
-        o.lineWidth = 3.5;
-        o.stroke();
-        o.beginPath();
-        o.arc(cx, cy, rad, 0, Math.PI * 2);
-        o.strokeStyle = `rgb(${r.color[0]},${r.color[1]},${r.color[2]})`;
-        o.lineWidth = 2;
-        o.stroke();
+      for (const win of scene.wins) {
+        if (win.idx === NO_POSITION || !inRoom[win.idx]) continue;
+        drawReticle(o, ((win.idx % w) + 0.5) * s, (Math.floor(win.idx / w) + 0.5) * s, Math.max(3.5 * dpr, s * 1.8), dpr);
       }
     }
   }
+}
+
+/** The win marker: a ring with four ticks around the won cell, white over
+ *  a dark halo so it reads over every colour of every look. The cell
+ *  itself stays uncovered, so the state underneath is still visible. */
+function drawReticle(o: CanvasRenderingContext2D, cx: number, cy: number, r: number, dpr: number) {
+  const tick = Math.max(2.5 * dpr, r * 0.55);
+  const path = () => {
+    o.beginPath();
+    o.arc(cx, cy, r, 0, Math.PI * 2);
+    o.moveTo(cx + r, cy);
+    o.lineTo(cx + r + tick, cy);
+    o.moveTo(cx - r, cy);
+    o.lineTo(cx - r - tick, cy);
+    o.moveTo(cx, cy + r);
+    o.lineTo(cx, cy + r + tick);
+    o.moveTo(cx, cy - r);
+    o.lineTo(cx, cy - r - tick);
+  };
+  o.lineCap = "round";
+  path();
+  o.strokeStyle = "rgba(0,0,0,0.85)";
+  o.lineWidth = 4 * dpr;
+  o.stroke();
+  path();
+  o.strokeStyle = "#ffffff";
+  o.lineWidth = 1.75 * dpr;
+  o.stroke();
+}
+
+/** The win marker as an icon for legends, drawn like `drawReticle`. */
+export function winKeyIcon(size = 16): SVGSVGElement {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("width", String(size));
+  svg.setAttribute("height", String(size));
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("class", "win-icon");
+  const d = "M12 8a4 4 0 1 1-8 0 4 4 0 1 1 8 0M12 8h2.5M4 8H1.5M8 12v2.5M8 4V1.5";
+  for (const [stroke, width] of [
+    ["rgba(0,0,0,0.85)", "3.2"],
+    ["#ffffff", "1.4"],
+  ]) {
+    const p = document.createElementNS(ns, "path");
+    p.setAttribute("d", d);
+    p.setAttribute("fill", "none");
+    p.setAttribute("stroke", stroke);
+    p.setAttribute("stroke-width", width);
+    p.setAttribute("stroke-linecap", "round");
+    svg.append(p);
+  }
+  return svg;
 }
 
 /** Add a sparse record into a dense grid (NO_POSITION entries are
@@ -221,10 +279,4 @@ export function sparseMax(s: Sparse): number {
   let m = 0;
   for (let i = 0; i < s.count.length; i++) if (s.idx[i] !== NO_POSITION && s.count[i] > m) m = s.count[i];
   return m;
-}
-
-export function sparseTotal(s: Sparse): number {
-  let t = 0;
-  for (let i = 0; i < s.count.length; i++) t += s.count[i];
-  return t;
 }

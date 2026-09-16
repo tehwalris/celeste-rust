@@ -9,10 +9,6 @@
 
 export type RGB = [number, number, number];
 
-export const surface = "#1a1a19";
-export const surfaceRGB: RGB = [0x1a, 0x1a, 0x19];
-export const plane = "#0d0d0d";
-export const inkPrimary = "#ffffff";
 export const inkSecondary = "#c3c2b7";
 export const inkMuted = "#898781";
 export const gridline = "#2c2c2a";
@@ -21,16 +17,6 @@ export const baseline = "#383835";
 /** Dark-mode categorical slots (validated adjacent order). */
 export const slots = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"];
 
-/** Sequential blue ramp, light -> dark (steps 100..700). */
-export const blueRamp = [
-  "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7", "#3987e5",
-  "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b",
-];
-
-export function hexToRGB(h: string): RGB {
-  const v = parseInt(h.slice(1), 16);
-  return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
-}
 export const rgbCss = (c: RGB, a = 1) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
 
 // OKLCH -> sRGB (Björn Ottosson's OKLab), enough for a hue path.
@@ -167,8 +153,6 @@ export function bandHalo(band: number): RGB {
 /** The moving set in the height-map look: magenta, absent from the ramp. */
 export const movingColor: RGB = oklch(0.75, 0.22, 345);
 
-export const marksColor: RGB = [255, 245, 225];
-export const winColor: RGB = [255, 255, 255];
 
 /** Phase colors for the waterfall: forward and backward are the first two
  *  categorical slots; their splits are ordinal steps of the same hue. */
