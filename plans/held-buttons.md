@@ -182,6 +182,23 @@ Measured:
 
 - Level 0's first win on room (1,0) stays f89, the same as exact level 0: the
   held retriggers did not make it win earlier.
+- Room (1,0), `CELESTE_LADDER="r0sxh,r1sxh,...,r15sxh,rxsx"`, `--ceiling 99`:
+  99 confirmed at every level (326 states marked at Exact), 98 refuted at
+  level 6, OPTIMAL 99, 1m38s. The widened levels refute nothing the exact
+  ladder did not.
+- Room (2,0) level 0 to f68, release, 32 threads:
+
+  | f68 | exact `r0sx` | `r0sxh` | factor |
+  |---|---|---|---|
+  | kept | 50,674,573 | 13,320,182 | 3.80x |
+  | visited | 450,368,985 | 119,956,789 | 3.75x |
+  | frame | 81.1 s | 16.0 s | 5.1x |
+  | peak memory | 28.7 GB | 8.73 GB | 3.3x |
+  | run to f68 | 10m12s | 2m21s | 4.3x |
+
+  The factor is 3.78x at f60 and 3.80x at f68: a constant factor. Growth per
+  frame stays about 1.10x (f60 6.14M, f68 13.32M), so level 0 alone would still
+  reach roughly 150M states per frame and about 100 GB by f94.
 
 ## Later
 
