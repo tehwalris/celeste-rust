@@ -76,15 +76,42 @@ const Y_CUTS: &[(&str, Cut)] = &[
 /// sanity range).
 const EXTENT_PX: i32 = 16;
 
-fn build(w: u8, axis: usize) -> Vec<i32> {
-    let raw = |s: &str| -> i32 { s.parse::<Pico8Num>().expect("speed constant").as_raw_u32() as i32 };
-    let mut es: BTreeSet<i32> = BTreeSet::new();
-    let step = 1i32 << w;
-    let mut v = -(EXTENT_PX << 16);
-    while v <= EXTENT_PX << 16 {
-        es.insert(v);
-        v += step;
+/// The spring's `hit.spd.x = hit.spd.x * (0.2)`. The spring updates before
+/// the player, so every comparison of the player's update above can run on
+/// 0.2 times the speed the row was keyed on (room (2,0) f40, 2026-09-16:
+/// bucket [1, 0.05) keyed a lane whose `spd.x * 0.2` was 0 at 1..5 raw and
+/// positive from 6, `spd.x > 0` was undecided and the kernel declined it).
+const SPRING_MUL_X: &str = "0.2";
+
+fn raw(s: &str) -> i32 {
+    s.parse::<Pico8Num>().expect("speed constant").as_raw_u32() as i32
+}
+
+/// The smallest raw `v` with `v * m >= e` under PICO-8's multiply
+/// (`Pico8Num::const_mul`, the floor of `v * m / 2^16`), for `m > 0`: the
+/// edge a comparison against edge `e` AFTER the multiply puts on `v`. The
+/// multiply is monotone, so `floor(v * m / 2^16) >= e` iff `v * m >= e *
+/// 2^16` iff `v >= ceil(e * 2^16 / m)`.
+fn preimage_under_mul(e: i32, m: i32) -> i32 {
+    let num = (e as i64) << 16;
+    (-(-num).div_euclid(m as i64)) as i32
+}
+
+/// The edges on axis `axis`: the thresholds', and on x each of those again
+/// under the spring's multiply.
+fn cut_edges(axis: usize) -> BTreeSet<i32> {
+    let mut es = threshold_edges(axis);
+    if axis == 0 {
+        let m = raw(SPRING_MUL_X);
+        let pre: Vec<i32> = es.iter().map(|&e| preimage_under_mul(e, m)).collect();
+        es.extend(pre);
     }
+    es
+}
+
+/// The edges the cart's comparisons put on axis `axis` directly (`Cut`).
+fn threshold_edges(axis: usize) -> BTreeSet<i32> {
+    let mut es: BTreeSet<i32> = BTreeSet::new();
     for (s, cut) in if axis == 0 { X_CUTS } else { Y_CUTS } {
         let t = raw(s);
         match cut {
@@ -99,6 +126,17 @@ fn build(w: u8, axis: usize) -> Vec<i32> {
                 es.insert(t + 1);
             }
         }
+    }
+    es
+}
+
+fn build(w: u8, axis: usize) -> Vec<i32> {
+    let mut es = cut_edges(axis);
+    let step = 1i32 << w;
+    let mut v = -(EXTENT_PX << 16);
+    while v <= EXTENT_PX << 16 {
+        es.insert(v);
+        v += step;
     }
     es.into_iter().collect()
 }
@@ -166,6 +204,28 @@ mod tests {
         // every grid, not only where the grid has an edge there.
         for w in [16, 18, 20] {
             assert_eq!(bucket(-65536, w, 0), (-65536, -65536), "w {w}");
+        }
+    }
+
+    /// Every x bucket decides every threshold on the keyed speed AND on the
+    /// speed after the spring's multiply by 0.2, on every rung: checking a
+    /// bucket's two ends suffices, the multiply being monotone.
+    #[test]
+    fn every_x_threshold_is_decided_per_bucket_after_the_spring_too() {
+        let m = Pico8Num::from_raw(raw(SPRING_MUL_X));
+        let after = |v: i32| Pico8Num::from_raw(v).const_mul(&m).as_raw_u32() as i32;
+        assert_eq!(after(5), 0);
+        assert_eq!(after(6), 1);
+        let thresholds = threshold_edges(0);
+        for w in [16, 18, 20] {
+            let n = edges(w, 0).len();
+            for j in 1..n {
+                let (lo, hi) = range(j as u16, w, 0);
+                for &c in &thresholds {
+                    assert_eq!(lo >= c, hi >= c, "w {w}: bucket [{lo}, {hi}] straddles edge {c}");
+                    assert_eq!(after(lo) >= c, after(hi) >= c, "w {w}: bucket [{lo}, {hi}] * 0.2 straddles edge {c}");
+                }
+            }
         }
     }
 }

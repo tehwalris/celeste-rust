@@ -293,6 +293,10 @@ enum Command {
         /// "with these fields erased".
         #[arg(long, default_value = "")]
         erase: String,
+        /// Bucket spd.x only and keep spd.y exact: the ceiling of an x-only
+        /// level (`s<w>x`).
+        #[arg(long)]
+        x_only: bool,
     },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed file by
     /// file and row range by row range (the whole-frame `census` loads the
@@ -1770,7 +1774,7 @@ fn main() -> Result<()> {
         Command::PartitionCensus { level_dir, spd_w } => {
             print!("{}", celeste_rust::search::checkpoint::partition_census(std::path::Path::new(&level_dir), spd_w)?);
         }
-        Command::SpdCensus { level_dir, frame, widths, edge_table, erase } => {
+        Command::SpdCensus { level_dir, frame, widths, edge_table, erase, x_only } => {
             use celeste_engine::runtime2::{mix64, Cell2, Col, AV};
             use celeste_rust::search::checkpoint::FrameFile;
             let dir = std::path::Path::new(&level_dir);
@@ -1785,6 +1789,8 @@ fn main() -> Result<()> {
             let fdir = dir.join("frames").join(format!("f{frame:03}"));
             let mut sets: Vec<rustc_hash::FxHashSet<u64>> = vec![Default::default(); ws.len() + 1];
             let mut rows = 0u64;
+            // Per width, the rows whose speed hull spans more than one bucket.
+            let mut straddles = vec![0u64; ws.len()];
             let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
                 .filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")))
@@ -1842,23 +1848,34 @@ fn main() -> Result<()> {
                             }
                         }
                     }
-                    let raw = |c: Option<u32>, r: usize| -> i64 {
+                    // A speed as (low, high): a number is both ends; on a
+                    // bucketed level's tree the cell holds the speed HULL. The
+                    // exact count keys on both ends, a bucket on the low end.
+                    let raw = |c: Option<u32>, r: usize| -> (i64, i64) {
                         match c.map(|c| rt2.cols[c as usize].at(r)) {
-                            Some(AV::Num(n)) => n.as_raw_u32() as i32 as i64,
-                            _ => i64::MIN / 4,
+                            Some(AV::Num(n)) => {
+                                let v = n.as_raw_u32() as i32 as i64;
+                                (v, v)
+                            }
+                            Some(AV::Ival(a, b)) => (a.as_raw_u32() as i32 as i64, b.as_raw_u32() as i32 as i64),
+                            _ => (i64::MIN / 4, i64::MIN / 4),
                         }
                     };
                     for r in 0..rt2.width {
-                        let (x, y) = (raw(sx, r), raw(sy, r));
-                        sets[0].insert(mix64(h[r] ^ mix64((x as u64) << 32 ^ y as u64 as u32 as u64)));
+                        let ((x, xh), (y, yh)) = (raw(sx, r), raw(sy, r));
+                        sets[0].insert(mix64(h[r] ^ mix64((x as u64) << 32 ^ y as u64 as u32 as u64) ^ mix64(!((xh as u64) << 32 ^ yh as u64 as u32 as u64))));
                         for (i, &w) in ws.iter().enumerate() {
                             let (bx, by) = if edge_table {
                                 // A non-number speed (no player) buckets as itself.
                                 let b = |v: i64, axis: usize| if v == i64::MIN / 4 { u64::MAX } else { celeste_core::spd_buckets::index(v as i32, w as u8, axis) as u64 };
+                                if b(x, 0) != b(xh, 0) || b(y, 1) != b(yh, 1) {
+                                    straddles[i] += 1;
+                                }
                                 (b(x, 0), b(y, 1))
                             } else {
                                 (x.div_euclid(1i64 << w) as u64, y.div_euclid(1i64 << w) as u64)
                             };
+                            let by = if x_only { y as u64 } else { by };
                             sets[i + 1].insert(mix64(h[r] ^ mix64(bx << 32 ^ (by & 0xffff_ffff))));
                         }
                     }
@@ -1873,7 +1890,13 @@ fn main() -> Result<()> {
             println!("f{frame:03}: {rows} rows, {} distinct exact{erased_note}", sets[0].len());
             for (i, &w) in ws.iter().enumerate() {
                 let what = if edge_table { format!("edge table s{w} (thresholds + {:.4} px grid)", (1u64 << w) as f64 / 65536.0) } else { format!("spd bucket 2^{w} raw ({:.4} px)", (1u64 << w) as f64 / 65536.0) };
-                println!("  {what}: {} distinct ({:.2}x)", sets[i + 1].len(), sets[0].len() as f64 / sets[i + 1].len().max(1) as f64);
+                println!(
+                    "  {what}{}: {} distinct ({:.2}x){}",
+                    if x_only { ", x only (spd.y exact)" } else { "" },
+                    sets[i + 1].len(),
+                    sets[0].len() as f64 / sets[i + 1].len().max(1) as f64,
+                    if straddles[i] > 0 { format!("; {} rows' speed hulls span more than one bucket", straddles[i]) } else { String::new() }
+                );
             }
         }
         Command::ColCensus { level_dir, frame, cap } => {

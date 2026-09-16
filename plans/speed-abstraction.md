@@ -151,7 +151,8 @@ Every lever measured tonight fails to make room (2,0)'s level 0 reach f95:
   projects to ~2G at f94. The 2026-09-15 overnight run was killed by the
   90 GB memory cap at f79.
 - **Speed buckets (dispatch):** the kernels do not build (the key fixpoint
-  exceeds the graph limit).
+  exceeds the graph limit). Fixed the next day by bucketing x only and
+  tracing each key on its whole bucket: see "Room (2,0) at `s20x`" below.
 - **Fine speed precision:** post-hoc it merges nothing (1.2x at 1/64 px).
 - **Position rung `y2`:** realized it keeps 16% more states at 3x the cost.
 
@@ -171,6 +172,89 @@ What could still work, none of it built yet:
    of GB at f94.
 
 So the night went to the next rooms instead: (3,0), (4,0) and onward.
+
+### Room (2,0) at `s20x`: the kernels build (2026-09-16, day)
+
+The level buckets speed on x only (`s20x`: the thresholds, no grid inside
+±16 px) and keeps y exact. Each key is traced once, on its whole bucket.
+Keys and kernels are per bucket, never per hull.
+
+| key fixpoint | keys | wall |
+|---|---|---|
+| serial (`e305cd9`) | 430 | 97 s |
+| parallel rounds, 32 workers | 430 | 7.8 s |
+| + the spring's cuts | 698 | 12.4 s |
+| + every dash diagonal | 746 | 13.3 s |
+
+Discovery runs in rounds. Every worker traces in its own copy of the walk's
+tracer, reads the successors there, and binds the trace out of its arena;
+the coordinator adds each new (shape, key) once. A trace costs about twice
+as much under 32 workers (summed tracing 173 s against 84 s serially). The
+shape lattice before it is still serial (8.4 s, 18 shapes): its
+representatives live in the tracer's arena, so a worker's copy cannot hand
+new ones back.
+
+The forward found two bugs:
+
+1. **The spring's multiply** (f40, a failed premise). The spring updates
+   before the player and writes `spd.x *= 0.2`, so every threshold of the
+   player's update is also compared against 0.2 times the keyed speed.
+   Bucket [1, 0.05) raw held 1..5, which floor to 0 after the multiply, and
+   6 and up, which do not: `spd.x > 0` was undecided and the kernel
+   declined. The x table now also cuts at each threshold edge's preimage
+   under the multiply (`spd_buckets::cut_edges`; test
+   `every_x_threshold_is_decided_per_bucket_after_the_spring_too`).
+2. **One dash diagonal** (f37, no kernel for the key). `successor_keys`
+   skipped a button configuration whose seven dispatch fields had the same
+   node ids as an earlier one, but specialized each configuration into its
+   own graph, where symmetric configurations build different constants at
+   the same ids. Of the four diagonal dash starts only the first was read,
+   and a down-left dash after the spring hit had no kernel. The
+   configurations now specialize into one hash-consed graph, as the
+   lowering's already did (test `a_dash_start_is_read_in_every_direction`).
+
+Found with `transpile --shape-diff A B S` (where two shapes differ: here
+the spring's `delay` field, created by the hit) and the `[keysucc]` edges
+`CELESTE_KEY_TRACE` prints.
+
+With both fixed the kernels build (746 keys: lowering done at 28.5 s wall,
+assembly 13.0 s more) and the forward runs past f37 with no gap. But it
+keeps MORE states than exact speed (release, 32 threads):
+
+| frame | exact kept | exact raw | `s20x` kept | `s20x` raw | `s20x` / exact |
+|---|---|---|---|---|---|
+| f32 | 14,028 | 21,451 | 16,078 | 113,140 | 1.15 |
+| f38 | 142,671 | 352,374 | 179,111 | 1,842,292 | 1.26 |
+| f44 | 1,102,245 | 3,521,944 | 1,490,668 | 18,468,246 | 1.35 |
+
+f44 took 25 s against 0.9 s exact. Stopped at f45.
+
+Post-hoc on the exact tree, the most each table could merge
+(`spd-census --edge-table [--x-only]`):
+
+| | f44 | f50 | f55 |
+|---|---|---|---|
+| x only, thresholds (`s20x`) | 1.16x | 1.22x | 1.30x |
+| both axes, thresholds (`s20`) | 1.39x | 1.60x | 1.87x |
+| uniform 1 px, both axes, no thresholds | - | 3.68x | 5.73x |
+
+At f44 `s20x`'s 1,490,668 rows project onto 1,308,217 distinct states (the
+x bucket, every other field exact); exact's onto 947,936. So:
+
+- 182k rows (12%) repeat a projection: a key held under two hulls, the old
+  row and the grown union.
+- At least 360k projections are ones exact never reaches. Every field has
+  the same distinct count in both trees except the spd.x hulls (472 against
+  137 values), so these are new combinations of existing values. Erasing
+  one field at a time (`spd-census --erase`) leaves the ratio between 1.29x
+  and 1.40x: no single field carries them.
+
+The likely mechanism: a hull is the convex union of the speeds merged into
+it, and on the wide buckets ([-5, -3], [3.0001, 5.0002]) it spans speeds that
+move to different pixels. The kernel emits every position the hull allows,
+and the extra positions compound over frames. And even an exact realization
+of the x-only table merges at most 1.3x by f55: the large merges need y
+bucketed too and no singleton thresholds.
 
 ### The next rooms (2026-09-16, night)
 

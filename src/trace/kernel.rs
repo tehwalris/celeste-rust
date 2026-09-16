@@ -95,9 +95,11 @@ pub(crate) fn lattice_kernel_refs(
     // The frames to lower: per shape for an exact-speed set; per
     // (shape, speed key) - the key fixpoint - for a bucketed one, whose
     // kernels are specialized on the key (`key_frame`).
-    let frames: Vec<(Option<SpeedKey>, super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>)> = match opts.spd.width_log2() {
-        Some(w) => key_fixpoint(&mut lw, w)?.into_iter().map(|n| (n.key, n.frame, n.bounds)).collect(),
-        None => std::mem::take(&mut lw.frames).into_values().map(|f| (None, f, Vec::new())).collect(),
+    // A bucketed set's frames come bound out of the key fixpoint workers'
+    // arenas; an exact-speed set's frames are bound against the walk's.
+    let frames: Vec<(Option<SpeedKey>, super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>, Option<Bound>)> = match opts.spd.width_log2() {
+        Some(w) => key_fixpoint(&lw, w)?.into_iter().map(|n| (n.key, n.frame, n.bounds, Some(n.bound))).collect(),
+        None => std::mem::take(&mut lw.frames).into_values().map(|f| (None, f, Vec::new(), None)).collect(),
     };
     // Bind + lower (specialize + decide, the expensive half of a kernel
     // build) per frame, frames in parallel.
@@ -108,7 +110,7 @@ pub(crate) fn lattice_kernel_refs(
     let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(frames.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
     // Each frame is taken by exactly one worker (a `Frame` is not cloned).
-    let slots: Vec<std::sync::Mutex<Option<(Option<SpeedKey>, super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>)>>> =
+    let slots: Vec<std::sync::Mutex<Option<(Option<SpeedKey>, super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>, Option<Bound>)>>> =
         frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
     let slots = &slots;
     let mut built: Vec<(usize, Result<(Option<SpeedKey>, Reference)>)> = std::thread::scope(|scope| {
@@ -121,11 +123,14 @@ pub(crate) fn lattice_kernel_refs(
                         let mut out = Vec::new();
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some((key, f, bounds)) = slots.get(i).and_then(|m| m.lock().unwrap().take()) else { break };
+                            let Some((key, f, bounds, pre)) = slots.get(i).and_then(|m| m.lock().unwrap().take()) else { break };
                             let r = (|| -> Result<(Option<SpeedKey>, Reference)> {
                                 let t_phase = std::time::Instant::now();
-                                let bound = super::emit::bind(&f, graph, opts.widen)
-                                    .map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) bind: {:#}", i, key, e))?;
+                                let bound = match pre {
+                                    Some(b) => b,
+                                    None => super::emit::bind(&f, graph, opts.widen)
+                                        .map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) bind: {:#}", i, key, e))?,
+                                };
                                 crate::transpile::lower::build_add(2, t_phase);
                                 let lowered = super::emit::lower_frame(&bound, Some(room.clone()), engine_ranges(&f, &bounds))
                                     .map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
@@ -201,7 +206,8 @@ fn key_paths(pl: &super::iface::Path) -> [super::iface::Path; 7] {
 /// and accel are pinned. Both are guarded in `ok`: a lane outside declines
 /// loudly. Returns the frame and the bounds it was traced under.
 pub fn key_frame(
-    lw: &mut LatticeWalk,
+    t: &mut Tracer,
+    lw: &WalkView<'_>,
     shape_hash: u64,
     key: Option<SpeedKey>,
     w: u8,
@@ -264,7 +270,6 @@ pub fn key_frame(
         (Some(_), None) => anyhow::bail!("shape {shape_hash:#x} has no player but a speed key"),
         (None, Some(_)) => anyhow::bail!("shape {shape_hash:#x} has a player but no speed key"),
     }
-    let t = &mut lw.tracer;
     let f = verify::trace_frame(&mut t.it, t.reset, t.fr, st, &roots, &pin, &ival, opts.widen_mode(), &bounds)?;
     Ok((f, bounds))
 }
@@ -368,24 +373,48 @@ fn successor_keys(
         // `dash_time` and the target: read jointly, or the target's set
         // would include the unbounded old value under `dash_time = 4`).
         let mut cases: Vec<(crate::transpile::graph::Graph, [NodeId; 7], std::collections::HashMap<NodeId, (i64, i64)>)> = Vec::new();
+        // Every configuration specializes into ONE graph, which hash-conses,
+        // so two configurations with the same seven fields get the same ids
+        // and the second is skipped (as `lower::specialize_frame` does). A
+        // fresh graph per configuration compared ids ACROSS graphs:
+        // symmetric configurations built different constants at the same
+        // ids, and of the four diagonal dash starts only the first
+        // configuration's was ever read (room (2,0) f37: a down-left dash
+        // start with no kernel, 2026-09-16).
+        let mut shared = cone.like();
         for m in 0u8..64 {
-            let mut probe = cone.like();
-            let map = cone.specialize_subset_into(m, None, None, None, &mut probe);
-            let sig: [NodeId; 7] = std::array::from_fn(|i| map[cnodes[i] as usize]);
-            if !seen.insert(sig) {
+            let map = cone.specialize_subset_into(m, None, None, None, &mut shared);
+            let ssig: [NodeId; 7] = std::array::from_fn(|i| map[cnodes[i] as usize]);
+            if !seen.insert(ssig) {
                 continue;
             }
-            let seeds: std::collections::HashMap<NodeId, (i64, i64)> = seeds_by_node.iter().map(|(n, r)| (map[*n as usize], *r)).collect();
-            // The cone of the seven fields.
-            let mut pneed = vec![false; probe.len()];
-            let mut stack: Vec<NodeId> = sig.to_vec();
+            // This configuration's cone of the seven, copied out of the
+            // shared graph for the case analysis below to rewrite.
+            let mut sneed = vec![false; shared.len()];
+            let mut stack: Vec<NodeId> = ssig.to_vec();
             while let Some(n) = stack.pop() {
-                if pneed[n as usize] {
+                if sneed[n as usize] {
                     continue;
                 }
-                pneed[n as usize] = true;
-                stack.extend(probe.get(n).args.iter().copied());
+                sneed[n as usize] = true;
+                stack.extend(shared.get(n).args.iter().copied());
             }
+            let mut probe = shared.like();
+            let mut pmap: Vec<NodeId> = vec![NodeId::MAX; shared.len()];
+            for id in 0..shared.len() {
+                if !sneed[id] {
+                    continue;
+                }
+                let nd = shared.get(id as NodeId);
+                let args: Vec<NodeId> = nd.args.iter().map(|a| pmap[*a as usize]).collect();
+                pmap[id] = probe.add(nd.op.clone(), args);
+            }
+            let sig: [NodeId; 7] = std::array::from_fn(|i| pmap[ssig[i] as usize]);
+            let seeds: std::collections::HashMap<NodeId, (i64, i64)> = seeds_by_node
+                .iter()
+                .filter(|(n, _)| sneed[map[*n as usize] as usize])
+                .map(|(n, r)| (pmap[map[*n as usize] as usize], *r))
+                .collect();
             // Read the dash constants JOINTLY with `dash_time`. Phase 1:
             // the paths of `dash_time`'s select tree (dash pressed, `djump
             // > 0`, mid-dash), each fixing the conditions on its path.
@@ -726,14 +755,16 @@ fn engine_ranges(
 }
 
 /// One node of the key fixpoint: a shape, its speed key (`None` for a
-/// shape without a player), the join of the speed ranges reaching it (raw,
-/// per axis, within the key's buckets), and its trace under that range.
+/// shape without a player), its key's whole buckets (raw, per axis), its
+/// trace under them, and the trace bound out of the worker's arena it was
+/// traced in (`emit::bind`: self-contained, lowered from here).
 pub struct KeyNode {
     pub shape: u64,
     pub key: Option<SpeedKey>,
     pub range: [(i64, i64); 2],
     pub frame: super::verify::Frame,
     pub bounds: Vec<(super::iface::Path, (i32, i32))>,
+    pub bound: Bound,
 }
 
 /// A node as one line of a `--key-census` node set: `shape bx by dashing
@@ -966,7 +997,8 @@ pub fn key_probe(root: &std::path::Path, dump: &std::path::Path, sel: &[usize], 
     let opts = super::shapes::WalkOpts::level0(spd, crate::interpreter::abstraction::PosPrecision::EXACT);
     let text = std::fs::read_to_string(dump).map_err(|e| anyhow::anyhow!("{}: {e}", dump.display()))?;
     let lines: Vec<&str> = text.lines().collect();
-    let mut lw = room_constant_lattice(root, opts)?;
+    let lw = room_constant_lattice(root, opts)?;
+    let mut tr = lw.tracer.clone();
     let lwx = room_constant_lattice(root, super::shapes::WalkOpts::LEVEL0)?;
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
     let mut exact_done: std::collections::BTreeSet<u64> = Default::default();
@@ -986,9 +1018,9 @@ pub fn key_probe(root: &std::path::Path, dump: &std::path::Path, sel: &[usize], 
         }
         writeln!(out, "=== node {i}: {key:?}, range x [{:.4}, {:.4}] y [{:.4}, {:.4}]", range[0].0 as f64 / 65536.0, range[0].1 as f64 / 65536.0, range[1].0 as f64 / 65536.0, range[1].1 as f64 / 65536.0)?;
         let t = std::time::Instant::now();
-        let (f, bounds) = key_frame(&mut lw, shape, key, w, range)?;
+        let (f, bounds) = key_frame(&mut tr, &lw.view(), shape, key, w, range)?;
         let t_trace = t.elapsed();
-        let bound = super::emit::bind(&f, &lw.tracer.it.d.graph, opts.widen)?;
+        let bound = super::emit::bind(&f, &tr.it.d.graph, opts.widen)?;
         let t = std::time::Instant::now();
         let lowered = super::emit::lower_frame(&bound, Some(room.clone()), engine_ranges(&f, &bounds))?;
         writeln!(out, "  trace {:.2} s, lower {:.2} s", t_trace.as_secs_f64(), t.elapsed().as_secs_f64())?;
@@ -1012,6 +1044,51 @@ pub fn key_build(root: &std::path::Path) -> Result<String> {
     Ok(format!("level-0 bucketed set: {} kernels in {:.1} s\n", reg.kernel_count(), t.elapsed().as_secs_f64()))
 }
 
+/// `transpile --shape-diff A B [S]`: where two of the start room's shapes
+/// differ, by shape hash (as the dispatch and `--key-census` name them),
+/// under the walk at speed precision `S`: the tokens of their structures
+/// between the common prefix and the common suffix. Built to name what
+/// separates the shape a runtime row reached from the shape the key
+/// fixpoint predicted for it (room (2,0) f37, 2026-09-16).
+pub fn shape_diff(root: &std::path::Path, spd: crate::interpreter::abstraction::SpdPrecision, a: u64, b: u64) -> Result<String> {
+    use std::fmt::Write as _;
+    const SHOW: usize = 80;
+    let opts = super::shapes::WalkOpts::level0(spd, crate::interpreter::abstraction::PosPrecision::EXACT);
+    let lw = room_constant_lattice(root, opts)?;
+    let key = |h: u64| -> Result<&String> {
+        lw.by_hash.get(&h).ok_or_else(|| {
+            let mut known: Vec<String> = lw.by_hash.keys().map(|k| format!("{k:#018x}")).collect();
+            known.sort();
+            anyhow::anyhow!("no shape {h:#018x} in the walk; shapes: {}", known.join(" "))
+        })
+    };
+    let tokens = |s: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        for ch in s.chars() {
+            cur.push(ch);
+            if matches!(ch, ',' | '{' | '}' | '[' | ']' | '(' | ')') {
+                out.push(std::mem::take(&mut cur).trim().to_string());
+            }
+        }
+        if !cur.trim().is_empty() {
+            out.push(cur.trim().to_string());
+        }
+        out
+    };
+    let (ta, tb) = (tokens(key(a)?), tokens(key(b)?));
+    let pre = ta.iter().zip(&tb).take_while(|(x, y)| x == y).count();
+    let suf = ta[pre..].iter().rev().zip(tb[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let (da, db) = (&ta[pre..ta.len() - suf], &tb[pre..tb.len() - suf]);
+    let mut out = String::new();
+    writeln!(out, "{a:#018x}: {} tokens; {b:#018x}: {} tokens; {pre} in common before the difference, {suf} after", ta.len(), tb.len())?;
+    writeln!(out, "before: {}", ta[pre.saturating_sub(SHOW / 4)..pre].join(" "))?;
+    writeln!(out, "{a:#018x} ({} tokens): {}", da.len(), da.iter().take(SHOW).cloned().collect::<Vec<_>>().join(" "))?;
+    writeln!(out, "{b:#018x} ({} tokens): {}", db.len(), db.iter().take(SHOW).cloned().collect::<Vec<_>>().join(" "))?;
+    writeln!(out, "after: {}", ta[ta.len() - suf..].iter().take(SHOW / 4).cloned().collect::<Vec<_>>().join(" "))?;
+    Ok(out)
+}
+
 /// `transpile --key-census [N [FILE]]`: the key fixpoint of the start
 /// room's level-0 bucketed set on its own - the census and timings, the
 /// node set written to FILE (the input of `--key-probe`), and (with `N`)
@@ -1021,10 +1098,10 @@ pub fn key_census(root: &std::path::Path, lower: usize, dump: Option<&std::path:
     let w = spd.width_log2().ok_or_else(|| anyhow::anyhow!("the key census needs a bucketed speed precision, not {spd:?}"))?;
     let opts = super::shapes::WalkOpts::level0(spd, crate::interpreter::abstraction::PosPrecision::EXACT);
     let t = std::time::Instant::now();
-    let mut lw = room_constant_lattice(root, opts)?;
+    let lw = room_constant_lattice(root, opts)?;
     let t_lattice = t.elapsed();
     let t = std::time::Instant::now();
-    let nodes = key_fixpoint(&mut lw, w)?;
+    let nodes = key_fixpoint(&lw, w)?;
     let t_fix = t.elapsed();
     let mut out = String::new();
     writeln!(out, "shape lattice {:.1} s ({} shapes); key fixpoint {:.1} s ({} nodes)", t_lattice.as_secs_f64(), lw.by_hash.len(), t_fix.as_secs_f64(), nodes.len())?;
@@ -1035,24 +1112,20 @@ pub fn key_census(root: &std::path::Path, lower: usize, dump: Option<&std::path:
         writeln!(out, "node set: {} ({} lines; `--key-probe` indexes them from 0)", path.display(), nodes.len())?;
     }
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
-    let graph = &lw.tracer.it.d.graph;
     for n in nodes.iter().take(lower) {
-        let (key, f) = (&n.key, &n.frame);
+        let (key, f, bound) = (&n.key, &n.frame, &n.bound);
         let t = std::time::Instant::now();
-        let bound = super::emit::bind(f, graph, opts.widen)?;
-        let t_bind = t.elapsed();
-        let t = std::time::Instant::now();
-        let lowered = super::emit::lower_frame(&bound, Some(room.clone()), engine_ranges(f, &n.bounds))?;
+        let lowered = super::emit::lower_frame(bound, Some(room.clone()), engine_ranges(f, &n.bounds))?;
         let t_lower = t.elapsed();
         let t = std::time::Instant::now();
-        let (fused, _, roots, reprs) = super::emit::asm_fused_from(&bound, &lowered.spec)?;
+        let (fused, _, roots, reprs) = super::emit::asm_fused_from(bound, &lowered.spec)?;
         let n = roots.len();
         let (compiled, _loaded) = crate::transpile::asm::compile_and_load_reprs(&fused, &roots, &format!("kc{}", t_lower.as_nanos()), &reprs)?;
         let t_asm = t.elapsed();
         writeln!(
             out,
-            "key {key:?}: bind {:.2} s, lower {:.2} s ({} bodies, {} fused nodes), assemble {:.2} s ({} roots, {} slots)",
-            t_bind.as_secs_f64(), t_lower.as_secs_f64(), lowered.bodies, lowered.spec.0.len(), t_asm.as_secs_f64(), n, compiled.n_roots
+            "key {key:?}: lower {:.2} s ({} bodies, {} fused nodes), assemble {:.2} s ({} roots, {} slots)",
+            t_lower.as_secs_f64(), lowered.bodies, lowered.spec.0.len(), t_asm.as_secs_f64(), n, compiled.n_roots
         )?;
     }
     Ok(out)
@@ -1064,7 +1137,7 @@ pub fn key_census(root: &std::path::Path, lower: usize, dump: Option<&std::path:
 /// key not in the result is a coverage gap at runtime. The shape lattice
 /// (`room_constant_lattice`) supplies the shapes, their representative
 /// states and their constant pins.
-pub fn key_fixpoint(lw: &mut LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
+pub fn key_fixpoint(lw: &LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
     let t = std::time::Instant::now();
     let (mut t_trace, mut t_succ) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     let start_shape = lw.frames[&lw.start_key].in_rt2.shape_hash_of();
@@ -1090,99 +1163,108 @@ pub fn key_fixpoint(lw: &mut LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
     let start_range = whole(start_key, start_range);
     type Node = (u64, Option<SpeedKey>);
     // Per node: its key's whole buckets. A node is traced once, when it is
-    // first reached.
+    // first reached: in the round after the one that reached it.
     let mut ranges: std::collections::HashMap<Node, [(i64, i64); 2]> = Default::default();
-    let mut traced: std::collections::HashMap<Node, (super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>)> = Default::default();
-    let mut queued: std::collections::HashSet<Node> = Default::default();
-    let mut work: Vec<Node> = vec![(start_shape, start_key)];
     ranges.insert((start_shape, start_key), start_range);
-    queued.insert((start_shape, start_key));
-    let (mut n_traces, mut n_retraces) = (0usize, 0usize);
-    // The last 50 traces' times, so growth over the fixpoint shows.
-    let (mut w_trace, mut w_succ) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-    while let Some(node) = work.pop() {
-        queued.remove(&node);
-        if n_traces % 50 == 0 && n_traces > 0 {
-            eprintln!(
-                "[asm build] key fixpoint: {} traces ({} re-traces), {} nodes, {} pending, {:.0} s; last 50: {:.0} ms trace + {:.0} ms successors per node, arena {} nodes",
-                n_traces,
-                n_retraces,
-                ranges.len(),
-                work.len(),
-                t.elapsed().as_secs_f64(),
-                w_trace.as_secs_f64() * 1000.0 / 50.0,
-                w_succ.as_secs_f64() * 1000.0 / 50.0,
-                lw.tracer.it.d.graph.len()
-            );
-            (w_trace, w_succ) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-        }
-        let (shape, key) = node;
-        let range = ranges[&node];
-        let t1 = std::time::Instant::now();
-        let (f, bounds) = key_frame(lw, shape, key, w, range)
-            .map_err(|e| anyhow::anyhow!("key fixpoint: shape {shape:#x} key {key:?}: {e:#}"))?;
-        t_trace += t1.elapsed();
-        w_trace += t1.elapsed();
-        n_traces += 1;
-        let retrace = traced.contains_key(&node);
-        if retrace {
-            n_retraces += 1;
-        }
-        // Per trace, what it cost: a blow-up then names the keys whose
-        // traces grow before one refuses (room (2,0) refused key bx 18 after
-        // 23 min, 2026-09-16).
-        if std::env::var_os("CELESTE_KEY_TRACE").is_some() {
-            use super::domain::Domain;
-            let t = &lw.tracer.it;
-            eprintln!(
-                "[keytrace] trace {n_traces}{}: shape {shape:#x} key {key:?} range {range:?}: {} nodes added, {:.0} ms",
-                if retrace { " (re-trace)" } else { "" },
-                t.d.node_count().saturating_sub(t.trace_start_nodes),
-                t1.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        let t1 = std::time::Instant::now();
-        let succs = successor_keys(&mut lw.tracer.it.d, &f, w, buckets_y)?;
-        t_succ += t1.elapsed();
-        w_succ += t1.elapsed();
-        for (s_shape, s_key, s_range) in succs {
-            // An outcome shape the shape lattice has no frame for is one it
-            // excluded on purpose (left the room, or `ok` folds false):
-            // there is no kernel for it in any set.
-            if !lw.by_hash.contains_key(&s_shape) {
-                continue;
-            }
-            let succ = (s_shape, s_key);
-            // A node's range is its key's whole buckets: it never grows, so
-            // every node is traced once.
-            let s_range = whole(s_key, s_range);
-            let grew = match ranges.get_mut(&succ) {
-                None => {
-                    ranges.insert(succ, s_range);
-                    true
+    let mut frontier: Vec<Node> = vec![(start_shape, start_key)];
+    let mut out: Vec<KeyNode> = Vec::new();
+    // THE ROUNDS IN PARALLEL (2026-09-16): each worker traces in its own copy
+    // of the walk's tracer (copied once), reads its successors and binds the
+    // trace out of that arena. Serially, room (2,0)'s 430 keys took 107 s.
+    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let mut tracers: Vec<Tracer> = (0..n_workers).map(|_| lw.tracer.clone()).collect();
+    let view = lw.view();
+    let mut round = 0usize;
+    while !frontier.is_empty() {
+        round += 1;
+        let t_round = std::time::Instant::now();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        type Traced = (KeyNode, Vec<Successor>, std::time::Duration, std::time::Duration);
+        let (frontier_ref, ranges_ref, view_ref) = (&frontier, &ranges, &view);
+        let results: Vec<Result<Vec<Traced>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = tracers
+                .iter_mut()
+                .map(|tr| {
+                    let next = &next;
+                    std::thread::Builder::new()
+                        .stack_size(128 * 1024 * 1024)
+                        .spawn_scoped(scope, move || -> Result<Vec<Traced>> {
+                            let mut done = Vec::new();
+                            loop {
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some(&(shape, key)) = frontier_ref.get(i) else { break };
+                                let range = ranges_ref[&(shape, key)];
+                                let t1 = std::time::Instant::now();
+                                let (f, bounds) = key_frame(tr, view_ref, shape, key, w, range)
+                                    .map_err(|e| anyhow::anyhow!("key fixpoint: shape {shape:#x} key {key:?}: {e:#}"))?;
+                                let dt_trace = t1.elapsed();
+                                // Per trace, what it cost: a blow-up names the
+                                // keys whose traces grow before one refuses.
+                                if std::env::var_os("CELESTE_KEY_TRACE").is_some() {
+                                    use super::domain::Domain;
+                                    eprintln!(
+                                        "[keytrace] round {round}: shape {shape:#x} key {key:?} range {range:?}: {} nodes added, {:.0} ms",
+                                        tr.it.d.node_count().saturating_sub(tr.it.trace_start_nodes),
+                                        dt_trace.as_secs_f64() * 1000.0
+                                    );
+                                }
+                                let t1 = std::time::Instant::now();
+                                let succs = successor_keys(&mut tr.it.d, &f, w, buckets_y)?;
+                                let bound = super::emit::bind(&f, &tr.it.d.graph, view_ref.opts.widen)
+                                    .map_err(|e| anyhow::anyhow!("key fixpoint: shape {shape:#x} key {key:?} bind: {e:#}"))?;
+                                done.push((KeyNode { shape, key, range, frame: f, bounds, bound }, succs, dt_trace, t1.elapsed()));
+                            }
+                            Ok(done)
+                        })
+                        .expect("spawn key fixpoint worker")
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("key fixpoint worker panicked")).collect()
+        });
+        let traced_now = frontier.len();
+        let mut new_frontier: Vec<Node> = Vec::new();
+        for r in results {
+            for (node, succs, dt_trace, dt_succ) in r? {
+                t_trace += dt_trace;
+                t_succ += dt_succ;
+                for (s_shape, s_key, s_range) in succs {
+                    let known = lw.by_hash.contains_key(&s_shape);
+                    // The edge, from the coordinator so the lines of different
+                    // workers do not interleave: which node a key was read
+                    // from (room (2,0) f37: a runtime row with a key no node
+                    // produced, 2026-09-16).
+                    if std::env::var_os("CELESTE_KEY_TRACE").is_some() {
+                        eprintln!("[keysucc] {:#x} {:?} -> {s_shape:#x} {s_key:?}{}", node.shape, node.key, if known { "" } else { " (not in the walk)" });
+                    }
+                    // An outcome shape the shape lattice has no frame for is
+                    // one it excluded on purpose (left the room, or `ok` folds
+                    // false): there is no kernel for it in any set.
+                    if !known {
+                        continue;
+                    }
+                    let succ = (s_shape, s_key);
+                    if let std::collections::hash_map::Entry::Vacant(e) = ranges.entry(succ) {
+                        e.insert(whole(s_key, s_range));
+                        new_frontier.push(succ);
+                    }
                 }
-                Some(r) => {
-                    let joined = [
-                        (r[0].0.min(s_range[0].0), r[0].1.max(s_range[0].1)),
-                        (r[1].0.min(s_range[1].0), r[1].1.max(s_range[1].1)),
-                    ];
-                    let g = joined != *r;
-                    *r = joined;
-                    g
-                }
-            };
-            if grew && queued.insert(succ) {
-                work.push(succ);
+                out.push(node);
             }
         }
-        traced.insert(node, (f, bounds));
+        eprintln!(
+            "[asm build] key fixpoint round {round}: {traced_now} traced, {} new, {} nodes, {:.1} s ({n_workers} workers)",
+            new_frontier.len(),
+            ranges.len(),
+            t_round.elapsed().as_secs_f64()
+        );
+        frontier = new_frontier;
     }
     // The census of the node set: per `dash_time`, how many nodes and how
     // many distinct bucket pairs (so a blow-up names its axis).
     {
         let mut per_dt: std::collections::BTreeMap<bool, (usize, std::collections::BTreeSet<(u16, u16)>, std::collections::BTreeSet<[i32; 4]>)> = Default::default();
-        for ((_, key), _) in &traced {
-            if let Some(k) = key {
+        for n in &out {
+            if let Some(k) = n.key {
                 let e = per_dt.entry(k.dashing).or_default();
                 e.0 += 1;
                 e.1.insert((k.bx, k.by));
@@ -1194,22 +1276,16 @@ pub fn key_fixpoint(lw: &mut LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
         }
         eprintln!("[asm build]   edges: x {} y {}", celeste_core::spd_buckets::edges(w, 0).len(), celeste_core::spd_buckets::edges(w, 1).len());
     }
-    let mut out: Vec<KeyNode> = traced
-        .into_iter()
-        .map(|((shape, key), (frame, bounds))| KeyNode { shape, key, range: ranges[&(shape, key)], frame, bounds })
-        .collect();
     out.sort_by_key(|n| (n.shape, n.key));
     crate::transpile::lower::build_add_duration(0, t_trace);
     crate::transpile::lower::build_add_duration(1, t_succ);
     eprintln!(
-        "[asm build] key fixpoint: {} (shape, key) nodes, {} traces ({} re-traces), {:.1} s (tracing {:.1} s, reading successors {:.1} s), arena {} nodes",
+        "[asm build] key fixpoint: {} (shape, key) nodes in {round} rounds, {:.1} s wall (summed over workers: tracing {:.1} s, successors and bind {:.1} s), largest worker arena {} nodes",
         out.len(),
-        n_traces,
-        n_retraces,
         t.elapsed().as_secs_f64(),
         t_trace.as_secs_f64(),
         t_succ.as_secs_f64(),
-        lw.tracer.it.d.graph.len()
+        tracers.iter().map(|tr| tr.it.d.graph.len()).max().unwrap_or(0)
     );
     Ok(out)
 }
@@ -1305,7 +1381,8 @@ mod tests {
             crate::interpreter::abstraction::SpdPrecision::WidthLog2(16),
             crate::interpreter::abstraction::PosPrecision::EXACT,
         );
-        let mut lw = super::room_constant_lattice(std::path::Path::new("."), opts).expect("lattice");
+        let lw = super::room_constant_lattice(std::path::Path::new("."), opts).expect("lattice");
+        let mut tr = lw.tracer.clone();
         let skey = lw.reps.iter().find(|(_, st)| crate::trace::shapes::player_path(st).is_some()).map(|(k, _)| k.clone()).expect("a shape with a player");
         let shape = lw.frames[&skey].in_rt2.shape_hash_of();
         let rest = super::SpeedKey {
@@ -1314,7 +1391,7 @@ mod tests {
             dashing: false,
             dash: [0; 4],
         };
-        let (f, _) = super::key_frame(&mut lw, shape, Some(rest), 16, [(0, 0), (0, 0)]).expect("rest key frame");
+        let (f, _) = super::key_frame(&mut tr, &lw.view(), shape, Some(rest), 16, [(0, 0), (0, 0)]).expect("rest key frame");
         let mut checked = 0;
         for o in &f.outs {
             let Some(pl) = crate::trace::shapes::player_path(&o.st) else { continue };
@@ -1327,6 +1404,41 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no outcome with a player");
+    }
+
+    /// A player that is not dashing starts a dash in every direction or in
+    /// none: the direction is the buttons alone. The successor reader once
+    /// deduplicated button configurations by node ids across separately
+    /// built graphs and read only the first diagonal (room (2,0) f37: a
+    /// down-left dash start had no kernel, 2026-09-16).
+    #[test]
+    fn a_dash_start_is_read_in_every_direction() {
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
+            return;
+        }
+        let w = 20;
+        let opts = crate::trace::shapes::WalkOpts::level0(
+            crate::interpreter::abstraction::SpdPrecision::WidthLog2X(w),
+            crate::interpreter::abstraction::PosPrecision::EXACT,
+        );
+        let lw = super::room_constant_lattice(std::path::Path::new("."), opts).expect("lattice");
+        let mut tr = lw.tracer.clone();
+        let rest = super::SpeedKey { bx: celeste_core::spd_buckets::index(0, w, 0), by: 0, dashing: false, dash: [0; 4] };
+        let mut read = 0usize;
+        for (&shape, skey) in &lw.by_hash {
+            if crate::trace::shapes::player_path(&lw.reps[skey]).is_none() {
+                continue;
+            }
+            let (f, _) = super::key_frame(&mut tr, &lw.view(), shape, Some(rest), w, [(0, 0), (0, 0)]).expect("rest key frame");
+            let succs = super::successor_keys(&mut tr.it.d, &f, w, false).expect("successor keys");
+            let dirs: std::collections::BTreeSet<(i32, i32)> = succs
+                .iter()
+                .filter_map(|(_, k, _)| k.as_ref().filter(|k| k.dashing).map(|k| (k.dash[0].signum(), k.dash[1].signum())))
+                .collect();
+            assert!(dirs.is_empty() || dirs.len() == 8, "shape {shape:#x}: dash starts read in directions {dirs:?}");
+            read += usize::from(!dirs.is_empty());
+        }
+        assert!(read > 0, "no player shape read a dash start");
     }
 
 
@@ -2190,6 +2302,29 @@ pub struct Tracer {
     pub it: super::interp::Interp<'static, super::domain::Symbolic>,
     pub reset: &'static full_moon::ast::Ast,
     pub fr: &'static full_moon::ast::Ast,
+}
+
+// The raw pointers inside (`Interp::body_ids`' function-body keys and the
+// AST references) all point into the `'static` ASTs `room_constant_lattice`
+// leaks - immutable and never freed - so a copy of the tracer can move to a
+// key fixpoint worker (the same argument as `RefEngine`'s).
+unsafe impl Send for Tracer {}
+
+/// The parts of a lattice walk a key trace reads (`key_frame`), shared
+/// read-only by the key fixpoint's workers, each tracing in its own copy of
+/// the walk's `Tracer`.
+pub struct WalkView<'a> {
+    pub by_hash: &'a std::collections::HashMap<u64, String>,
+    pub reps: &'a std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic>>,
+    pub lattice: &'a std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,
+    pub ival_extra: &'a std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>>,
+    pub opts: super::shapes::WalkOpts,
+}
+
+impl LatticeWalk {
+    pub fn view(&self) -> WalkView<'_> {
+        WalkView { by_hash: &self.by_hash, reps: &self.reps, lattice: &self.lattice, ival_extra: &self.ival_extra, opts: self.opts }
+    }
 }
 
 /// The output of `room_constant_lattice`.

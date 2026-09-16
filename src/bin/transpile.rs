@@ -68,6 +68,20 @@ fn main() -> Result<()> {
                 print!("{}", report);
                 return Ok(());
             }
+            // --shape-diff A B [S]: where two shapes (by hash, as the
+            // dispatch names them) differ, under the walk at speed precision
+            // S as in `--key-census` (default 16).
+            "--shape-diff" => {
+                let hash = |s: Option<String>| -> Result<u64> {
+                    let s = s.ok_or_else(|| anyhow!("--shape-diff A B [S]"))?;
+                    u64::from_str_radix(s.trim_start_matches("0x"), 16).with_context(|| format!("--shape-diff shape hash {s:?}"))
+                };
+                let a = hash(args.next())?;
+                let b = hash(args.next())?;
+                let spd = spd_arg(args.next())?;
+                print!("{}", celeste_rust::trace::kernel::shape_diff(std::path::Path::new("."), spd, a, b)?);
+                return Ok(());
+            }
             "--bucket-probe" => {
                 let idx: usize = args
                     .next()
