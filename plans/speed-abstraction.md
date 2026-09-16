@@ -101,6 +101,35 @@ the output. So it emits ~6x the rows, and nearly all of them are revisits
 the door drops, or re-emissions when they widen a hull. The merge does not
 pay for that on room (1,0).
 
+### Room (2,0): the key fixpoint does not build (2026-09-16, release)
+
+| | exact | `s20` | `s16` |
+|---|---|---|---|
+| f50 kept | 5.51M, 5.2 s | - | - |
+| f55 kept | 11.78M, 12.6 s | - | - |
+| f60 kept | 23.22M, 28.5 s, 13.5 GB peak | - | - |
+| build | 3 s | key fixpoint: a trace for key (18, 1) grew past the 2M-node graph limit after 23 min | the same for key (18, 15) after 32 min |
+
+Post-hoc, a uniform speed grid on the exact tree (every other field
+exact):
+
+| | 1/4096 px | 1/1024 | 1/256 | 1/64 | 1/16 | 1/4 | 1 px |
+|---|---|---|---|---|---|---|---|
+| f55 (11.78M) | 1.15x | 1.15x | 1.15x | 1.16x | 1.24x | 1.83x | 5.73x |
+| f60 (23.22M) | 1.15x | 1.15x | 1.16x | 1.20x | 1.36x | 2.19x | 7.83x |
+
+A fine speed precision merges nothing. The spring's speeds are spread
+across the pixel, not clustered in sub-pixel noise, and only a 1 px grid
+without thresholds promises much. The realized 1 px bucket did not shrink
+the frontier on this room (BENCHMARK_DATA.md, 2026-09-14). So no speed
+abstraction is the lever for room (2,0).
+
+Exact speed grows ~14.5% per frame at f60. That projects to billions of
+states by f95, so exact-speed level 0 is not viable for room (2,0). The
+bucket dispatch cannot even build its kernels there: under the spring a
+coarse speed bucket leaves the move loop's collision tests undecided and
+the trace explodes.
+
 ### Two bugs the coarse tables exposed (2026-09-16)
 
 - **The dash-constant reader** split on every undecided select in the dash
