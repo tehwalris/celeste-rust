@@ -57,6 +57,12 @@ pub fn run_frame_all<'a>(
     // A position bucket in the input (the rung below level 0) is one exact
     // position per fork leaf, exactly as the kernels' `IntFrag`.
     let pos = crate::interpreter::abstraction::current_level().pos;
+    // The reference engine has no held-button fork (`widen::fork_held_inputs`):
+    // its bridge reads an unknown trail as false, which would silently drop
+    // the held twin. Refuse rather than compare against it.
+    if crate::interpreter::abstraction::current_level().held.is_unknown() {
+        anyhow::bail!("the reference engine does not run held-unknown levels (plans/held-buttons.md)");
+    }
     loop {
         it.d.cursor.reset();
         it.prints.clear();

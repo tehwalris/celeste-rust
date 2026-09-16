@@ -355,6 +355,29 @@ impl PosPrecision {
     }
 }
 
+/// The player's HELD-BUTTON trails `p_jump` / `p_dash` (plans/held-buttons.md).
+/// They only record last frame's jump / dash button, to detect a press, and
+/// each doubles the state count. `Unknown` at a non-exact level: the kernels
+/// write both unknown at the boundary and fork both values inside the frame,
+/// so one row covers both twins. Holding a button may then re-trigger a
+/// press - an over-approximation the EXACT rung, which keeps them, refutes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeldPrecision {
+    Unknown,
+    Exact,
+}
+
+impl HeldPrecision {
+    pub fn is_unknown(self) -> bool {
+        self == HeldPrecision::Unknown
+    }
+
+    /// Unknown covers exact.
+    pub fn coarser_or_equal(self, finer: HeldPrecision) -> bool {
+        self == HeldPrecision::Unknown || finer == HeldPrecision::Exact
+    }
+}
+
 /// ONE LEVEL of the ladder: its position, rem and spd precisions. The
 /// search's levels are a list of these (`parse_ladder`); the
 /// process-global precisions (`set_level`) name the level whose kernels
@@ -364,17 +387,19 @@ pub struct Level {
     pub pos: PosPrecision,
     pub rem: RemPrecision,
     pub spd: SpdPrecision,
+    pub held: HeldPrecision,
 }
 
 impl Level {
-    /// The level at rem rung `rem` under the spd preset, exact position.
+    /// The level at rem rung `rem` under the spd preset, exact position and
+    /// held buttons.
     pub fn for_rem(rem: RemPrecision) -> Level {
-        Level { pos: PosPrecision::EXACT, rem, spd: spd_precision_for(rem) }
+        Level { pos: PosPrecision::EXACT, rem, spd: spd_precision_for(rem), held: HeldPrecision::Exact }
     }
 
     /// Exact in every coordinate: the top of every ladder.
     pub const EXACT: Level =
-        Level { pos: PosPrecision::EXACT, rem: RemPrecision::Exact, spd: SpdPrecision::Exact };
+        Level { pos: PosPrecision::EXACT, rem: RemPrecision::Exact, spd: SpdPrecision::Exact, held: HeldPrecision::Exact };
 
     /// Every fork in a rung's graph cuts on ONE grid (2^-k for rem
     /// `Bits(k)`), and the unspecialized trace forks the speed on it and
@@ -393,6 +418,12 @@ impl Level {
     /// 2026-09-14). Finer speed buckets than 1/1024 px never paid anyway
     /// (interval arithmetic at full price for < 4x collapse).
     pub fn grid_consistent(self) -> bool {
+        // Held buttons unknown only at a rem rung: the exact rung is what
+        // narrows them back (plans/held-buttons.md), and the mark filter
+        // widens a finer row to a coarser key only at a rem rung.
+        if self.held.is_unknown() && !matches!(self.rem, RemPrecision::Bits(_)) {
+            return false;
+        }
         // A position bucket forks on the integer grid: rem Bits(0) only.
         if !self.pos.is_exact() && self.rem != RemPrecision::Bits(0) {
             return false;
@@ -409,11 +440,13 @@ impl Level {
         self.pos.coarser_or_equal(finer.pos)
             && self.rem.coarser_or_equal(finer.rem)
             && self.spd.coarser_or_equal(finer.spd)
+            && self.held.coarser_or_equal(finer.held)
     }
 
-    /// One level from `[x<w>][y<w>]r<k|x>s<w|x>`: an optional position
+    /// One level from `[x<w>][y<w>]r<k|x>s<w|x>[h]`: an optional position
     /// bucket width per axis in pixels (2; absent = exact), rem rung k
-    /// (0..=15) or exact, spd bucket width 2^w raw units or exact.
+    /// (0..=15) or exact, spd bucket width 2^w raw units or exact, and `h`
+    /// for held buttons unknown (absent = exact).
     pub fn parse(spec: &str) -> Result<Level, String> {
         let mut s = spec.trim();
         let mut pos = PosPrecision::EXACT;
@@ -445,6 +478,11 @@ impl Level {
                 return Err(format!("level {spec:?}: rem rung {k} > 15 (use x for exact)"));
             }
         }
+        // `h`: held buttons unknown. No speed token ends in `h`.
+        let (sp, held) = match sp.strip_suffix('h') {
+            Some(t) => (t, HeldPrecision::Unknown),
+            None => (sp, HeldPrecision::Exact),
+        };
         let spd = match sp {
             "x" => SpdPrecision::Exact,
             w => {
@@ -464,7 +502,7 @@ impl Level {
                 }
             }
         };
-        Ok(Level { pos, rem, spd })
+        Ok(Level { pos, rem, spd, held })
     }
 
     /// A ladder from a comma-separated list of levels, coarsest first,
@@ -515,6 +553,9 @@ impl std::fmt::Display for Level {
         if !self.pos.is_exact() {
             write!(f, "/P{}x{}", self.pos.x, self.pos.y)?;
         }
+        if self.held.is_unknown() {
+            write!(f, "/H")?;
+        }
         Ok(())
     }
 }
@@ -564,15 +605,32 @@ pub fn set_spd_precision(p: SpdPrecision) {
     SPD_PRECISION.store(encode_spd(p), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The process-global held-button precision (`set_level`); unset reads as
+/// exact.
+static HELD_UNKNOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn held_precision() -> HeldPrecision {
+    if HELD_UNKNOWN.load(std::sync::atomic::Ordering::Relaxed) {
+        HeldPrecision::Unknown
+    } else {
+        HeldPrecision::Exact
+    }
+}
+
+pub fn set_held_precision(p: HeldPrecision) {
+    HELD_UNKNOWN.store(p.is_unknown(), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The level whose kernels the engine dispatches to, from here on.
 pub fn set_level(l: Level) {
     set_pos_precision(l.pos);
     set_rem_precision(l.rem);
     set_spd_precision(l.spd);
+    set_held_precision(l.held);
 }
 
 pub fn current_level() -> Level {
-    Level { pos: pos_precision(), rem: rem_precision_from_env(), spd: spd_precision() }
+    Level { pos: pos_precision(), rem: rem_precision_from_env(), spd: spd_precision(), held: held_precision() }
 }
 
 fn spd_width_override() -> Option<u8> {
@@ -1148,12 +1206,16 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
     }
 
     // NOTE on p_jump/p_dash (2026-08-06): widening the held-button trails to
-    // unknown at the boundary was considered (it would merge the dominated
-    // held variants with their released twins) and REJECTED by Philippe: it
-    // is an over-approximation - it admits e.g. ground-jump at n followed by
-    // wall-jump at n+1, which the concrete game forbids (the press at n
-    // forces p_jump=true at n+1). Unlike the rem widening this changes the
-    // reachable set asymmetrically, so it stays out.
+    // unknown at the boundary at EVERY level was considered (it would merge
+    // the dominated held variants with their released twins) and REJECTED by
+    // Philippe: it is an over-approximation - it admits e.g. ground-jump at n
+    // followed by wall-jump at n+1, which the concrete game forbids (the
+    // press at n forces p_jump=true at n+1) - and nothing narrowed it back.
+    // Since 2026-09-16 a level can hold them unknown (`HeldPrecision`, spec
+    // `h`) only at a rem rung, with the exact rung keeping them exact, which
+    // refutes such spurious wins (plans/held-buttons.md). This function (the
+    // reference widenings) never widens them: the reference engine refuses
+    // held-unknown levels (`refdriver::run_frame_all`).
 
     // Reduce each live fruit's bob counter modulo its period 40.
     //
@@ -1473,8 +1535,16 @@ mod tests {
         // The ladder spec.
         let l = Level::parse_ladder("r0s16,r1s15,r2sx,rxsx").unwrap();
         assert_eq!(l.len(), 4);
-        assert_eq!(l[0], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(0), spd: SpdPrecision::WidthLog2(16) });
-        assert_eq!(l[2], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(2), spd: SpdPrecision::Exact });
+        assert_eq!(l[0], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(0), spd: SpdPrecision::WidthLog2(16), held: HeldPrecision::Exact });
+        assert_eq!(l[2], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(2), spd: SpdPrecision::Exact, held: HeldPrecision::Exact });
+        // Held buttons unknown: `h`, at rem rungs only, coarser than exact.
+        let h = Level::parse("r0sxh").unwrap();
+        assert_eq!(h, Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(0), spd: SpdPrecision::Exact, held: HeldPrecision::Unknown });
+        assert_eq!(Level::parse("r1s20xh").unwrap().spd, SpdPrecision::WidthLog2X(20));
+        assert!(!Level::parse("rxsxh").unwrap().grid_consistent());
+        assert!(Level::parse_ladder("r0sxh,r1sxh,rxsx").is_ok());
+        assert!(Level::parse_ladder("r0sx,r1sxh,rxsx").is_err());
+        assert_eq!(format!("{h}"), "Bits(0)/H");
         assert!(Level::parse_ladder("r0sx,r0s16,rxsx").is_err(), "spd may not get coarser");
         assert!(Level::parse_ladder("r0s16,r1s15").is_err(), "must end exact");
         assert!(Level::parse_ladder("r0s16,r1s16,rxsx").is_ok(), "a spd bucket of several rem grid cells");

@@ -905,8 +905,11 @@ impl AsmKernel {
                 InputView::Bool(col) => {
                     let mut mask = 0u16;
                     for l in 0..16 {
-                        if let AV::Bool(true) = col[lane(l)] {
-                            mask |= 1 << l;
+                        match col[lane(l)] {
+                            AV::Bool(true) => mask |= 1 << l,
+                            AV::Bool(false) => {}
+                            // See `InputView::of`: never pack an unknown as false.
+                            other => panic!("ASM bool input lane holds {other:?}: a kernel reads a boolean the block does not decide"),
                         }
                     }
                     buf[off..off + 2].copy_from_slice(&mask.to_le_bytes());
@@ -1064,9 +1067,11 @@ impl BodyCols {
                 (TCol::Ival(_), AV::Ival(a, b)) => uniform_ival.push((ci, (a.as_raw_u32(), b.as_raw_u32()))),
                 (TCol::Ival(_), AV::Num(n)) => uniform_ival.push((ci, (n.as_raw_u32(), n.as_raw_u32()))),
                 (TCol::Bool(_), AV::Bool(x)) => uniform_bool.push((ci, *x as u8)),
-                // A row never stores an undecided boolean: the kernel reads
-                // bool inputs as decided, and the ladder's mark filter
-                // matches widened DECIDED keys (`widen::fork_bools`).
+                // A per-row column never stores an undecided boolean: bool
+                // inputs are decided (`InputView::of` refuses an unknown), a
+                // branch on an unknown declines through its `Known` premise,
+                // and the one widened-to-unknown boolean (the held-button
+                // trails) is a uniform output column, not a root.
                 (TCol::Bool(_), AV::UBool) => anyhow::bail!("union column at cell {cell} is a uniform undecided boolean"),
                 (_, v) => anyhow::bail!("union column at cell {cell}: the outcome's uniform {v:?} does not fit its kind"),
             }
@@ -1123,13 +1128,13 @@ impl BodyCols {
             if let TCol::Bool(v) = &mut slot.cols[ci].1 {
                 let val = u16::from_le_bytes([buf[root * 128], buf[root * 128 + 1]]);
                 let known = u16::from_le_bytes([buf[root * 128 + 2], buf[root * 128 + 3]]);
-                // FATAL, not a `2`: the boundary forks every boolean the
-                // typing cannot prove decided (`widen::fork_bools`), so an
-                // undecided one here means the typing was wrong - and a
-                // stored one would be read back as `false` next frame.
+                // FATAL, not a `2`: an undecided boolean here means a branch
+                // on an unknown reached the output without its `Known`
+                // premise declining the lane - and a stored one would be
+                // refused as an input next frame (`InputView::of`).
                 assert!(
                     known >> i & 1 != 0,
-                    "emitted row holds an undecided boolean (column {ci}, root {root}): fork_bools missed it"
+                    "emitted row holds an undecided boolean (column {ci}, root {root}): no premise declined it"
                 );
                 v.push((val >> i & 1) as u8);
             }
@@ -1176,9 +1181,13 @@ impl<'c> InputView<'c> {
             (CellRepr::Ival, Col::U(AV::Ival(a, b))) => InputView::IvalU(a.as_raw_u32(), b.as_raw_u32()),
             (CellRepr::Ival, Col::U(AV::Num(n))) => InputView::IvalU(n.as_raw_u32(), n.as_raw_u32()),
             (CellRepr::Bool, Col::V(v)) => InputView::Bool(v),
-            (CellRepr::Bool, Col::U(v)) => {
-                InputView::BoolU(if matches!(v, AV::Bool(true)) { 0xffff } else { 0 })
-            }
+            (CellRepr::Bool, Col::U(v)) => match v {
+                AV::Bool(b) => InputView::BoolU(if *b { 0xffff } else { 0 }),
+                // A kernel reads this cell, and a bool input is DECIDED
+                // (`CellRepr::Bool`): packing an unknown as false would
+                // silently drop the true arm.
+                other => panic!("ASM bool input column holds {other:?}: a kernel reads a boolean the block does not decide"),
+            },
             (CellRepr::Bool, other) => panic!("ASM bool input column is {:?}", other),
             (repr, other) => InputView::Any(other, repr),
         }
@@ -1203,7 +1212,7 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     } else {
         // The key hashes the speed BUCKET (the row stores the hull).
         if let Some(w) = crate::interpreter::abstraction::spd_precision().width_log2() {
-            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1));
+            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1), false);
         }
         b.boundary(&super::boundary_ids());
     }
@@ -1972,7 +1981,11 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
     let mut inits: Vec<(usize, ColInit)> = Vec::new();
     for f in &r.lowered.outs[oi].fields {
         let cell = f.cell as usize;
-        if let Some(av) = f.konst_av {
+        // A boundary-widened-to-uniform cell holds its widened value, whatever
+        // the body computes for it: rem and the timers are constants in the
+        // graph too, the held-button trails are decided per body and written
+        // unknown (`emit::bind`) - the value its key folds into `part`.
+        if let Some(av) = f.widen_uniform.or(f.konst_av) {
             inits.push((cell, ColInit::Uniform(av)));
         } else {
             inits.push((
@@ -2074,8 +2087,10 @@ fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'stati
     // Widths 1..=20 both axes, 1..=20 x-only, and exact.
     const SPD_SLOTS: usize = 41;
     const POS_SLOTS: usize = 4;
-    static REGS: [std::sync::OnceLock<Option<Registry>>; 17 * SPD_SLOTS * POS_SLOTS] =
-        [const { std::sync::OnceLock::new() }; 17 * SPD_SLOTS * POS_SLOTS];
+    // Held buttons exact or unknown.
+    const HELD_SLOTS: usize = 2;
+    static REGS: [std::sync::OnceLock<Option<Registry>>; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS] =
+        [const { std::sync::OnceLock::new() }; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS];
     let rem_slot = match level.rem {
         RemPrecision::Exact => 16,
         RemPrecision::Bits(b) => (b as usize).min(16),
@@ -2086,7 +2101,8 @@ fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'stati
         SpdPrecision::WidthLog2X(w) => 20 + (w as usize).clamp(1, 20) - 1,
     };
     let pos_slot = (level.pos.x.clamp(1, 2) as usize - 1) + 2 * (level.pos.y.clamp(1, 2) as usize - 1);
-    REGS[(rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot].get_or_init(|| build_registry_for_rung(level)).as_ref()
+    let held_slot = level.held.is_unknown() as usize;
+    REGS[((rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot) * HELD_SLOTS + held_slot].get_or_init(|| build_registry_for_rung(level)).as_ref()
 }
 
 /// Build every rung's kernel set now, all rungs at once (one builder
@@ -2112,7 +2128,7 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
     let mode = super::dispatch::traced_mode_for(rem);
     let (opts, exact) = match mode {
-        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos), false),
+        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos).with_held(level.held.is_unknown()), false),
         super::dispatch::TracedMode::Level0Agnostic => {
             // Phase 1: the opt-in rung-specific variant bakes the rem
             // widening into the graph (`ladder_widen`), still through
@@ -2122,7 +2138,7 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
                 (true, RemPrecision::Bits(b)) => WalkOpts::ladder_widen(b, level.spd),
                 _ => WalkOpts::LADDER,
             };
-            (opts, true)
+            (opts.with_held(level.held.is_unknown()), true)
         }
         super::dispatch::TracedMode::ExactRem => (WalkOpts::EXACT, true),
     };

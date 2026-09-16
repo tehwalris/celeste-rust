@@ -87,6 +87,9 @@ pub struct FrameOut {
 
 pub struct Frame {
     pub iface: Iface,
+    /// Traced with held buttons unknown (`Symbolic::held_unknown`): every
+    /// outcome writes the player's `p_jump` / `p_dash` unknown (`emit::bind`).
+    pub held_unknown: bool,
     /// How many FORK choices this frame made (`__split_by_flr` on a
     /// widened value). The emitter needs it: a node whose cone contains
     /// a split lives at fork level 1 or deeper, and a body emitted at
@@ -267,6 +270,11 @@ pub fn trace_frame<'a>(
             eprintln!("[build] trace_frame {widen:?}: {} forks after fork_pos_inputs, {} ival slots", it.d.forks, iface.ival.iter().filter(|b| **b).count());
         }
     }
+    // Held buttons unknown: both trails run as a fork of both values, after
+    // the input shape is taken, before anything reads them.
+    if it.d.held_unknown {
+        super::widen::fork_held_inputs(&mut st, &mut it.d)?;
+    }
     let st = run_one(it, reset, st)?;
     let mut outs = Vec::new();
     for (s, f) in it.exec_block(frame.nodes(), st)? {
@@ -334,7 +342,7 @@ pub fn trace_frame<'a>(
     }
     let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
     let fork_tables: Vec<Vec<(i32, i32)>> = (0..it.d.forks).map(|d| it.d.graph.fork_table(d).to_vec()).collect();
-    Ok(Frame { iface, forks: it.d.forks, fork_ways, fork_tables, outs, in_cells, in_rt2 })
+    Ok(Frame { iface, held_unknown: it.d.held_unknown, forks: it.d.forks, fork_ways, fork_tables, outs, in_cells, in_rt2 })
 }
 
 /// The player is the object with a `djump` field. Naming it by

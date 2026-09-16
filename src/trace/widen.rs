@@ -502,6 +502,36 @@ pub fn fork_pos_inputs<D: Domain>(
     Ok(())
 }
 
+/// The held-button trails' INPUT side at a held-unknown level
+/// (plans/held-buttons.md): a block holds the player's `p_jump` / `p_dash`
+/// unknown, so each is replaced by a 2-way fork (`Op::SplitInt` over the
+/// constant `[0, 1]`: the configuration's value exactly), and the frame reads
+/// no input cell for them. Every configuration is valid for every lane - a
+/// lane whose trail is unknown can be either twin, and a decided one only
+/// over-approximates - so there is no validity or span premise. Per
+/// configuration `jump` / `dash` are decided and the two arms are two bodies.
+/// One fork per trail, never memoized: the two trails are independent.
+pub fn fork_held_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    use crate::transpile::graph::Op;
+    for obj in objects_of_type(st, "player") {
+        for f in ["p_jump", "p_dash"] {
+            let p = field(&obj, &[f]);
+            let Some(Value::Bool(_)) = iface::get(st, &p) else {
+                bail!("{}: not a boolean", iface::show(&p));
+            };
+            let fork = d.forks;
+            d.forks += 1;
+            d.graph.set_fork_ways(fork, 2);
+            let choices = d.graph.leaf(Op::Const(0, 1 << 16));
+            let choice = d.graph.fold(Op::SplitInt(fork), vec![choices]);
+            let zero = d.graph.leaf(Op::Const(0, 0));
+            let held = d.graph.fold(Op::Gt, vec![choice, zero]);
+            iface::set(st, &p, Value::Bool(held))?;
+        }
+    }
+    Ok(())
+}
+
 /// Snap `old` (a raw 16.16 speed) to its floor-aligned width-`2^w` bucket,
 /// forking at bucket edges. `w` in 8..=20 (the `SpdPrecision` range), so
 /// `width = 2^w` raw is a representable P8 (2^20 = 16.0 < 32768) and the

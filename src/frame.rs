@@ -1328,7 +1328,7 @@ pub fn widened_keys_rt2(
     use crate::interpreter::abstraction::RemPrecision;
     let mut w = rt2.clone_block();
     if let RemPrecision::Bits(b) = coarser.rem {
-        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y));
+        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y), coarser.held.is_unknown());
     }
     let keys = w.row_keys_canonical();
     let cells = crate::search::pos_graph::block_cells(&w)?;
@@ -2870,6 +2870,43 @@ mod tests {
             }
             HorizonOutcome::Refuted { level } => {
                 panic!("level {level} (of 17) refuted - the new ladder breaks before concrete");
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The held-button trails unknown at every non-exact level
+    /// (plans/held-buttons.md): the ladder still reaches the synthetic win
+    /// through Exact. A widened level's spurious retriggers only add states and
+    /// marks; if its backward under-marked, the exact rung's filtered forward
+    /// would lose the win and refute. Slow; run explicitly.
+    #[test]
+    #[ignore]
+    fn new_ladder_with_held_levels_confirms_to_concrete() {
+        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        std::env::set_var("CELESTE_WIN_AT_XY", "8,107");
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-held");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("checkpoint dir");
+
+        let spec: String = (0..=15).map(|k| format!("r{k}sxh,")).collect::<String>() + "rxsx";
+        let precisions = crate::interpreter::abstraction::Level::parse_ladder(&spec).expect("ladder spec");
+
+        let make_engine = |precision: crate::interpreter::abstraction::Level| {
+            crate::interpreter::abstraction::set_level(precision);
+            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?)
+                as Box<dyn FrameStep>)
+        };
+        let make_initial = || {
+            Ok(vec![Block::from_state(
+                &crate::trace::refengine::RefEngine::new()?.initial_state()?,
+            )?])
+        };
+
+        match ladder_at_horizon(make_engine, make_initial, dir, 14, &precisions).expect("ladder") {
+            HorizonOutcome::Confirmed => {}
+            HorizonOutcome::Refuted { level } => {
+                panic!("level {level} refuted the synthetic win with held-unknown levels")
             }
         }
         let _ = std::fs::remove_dir_all(dir);

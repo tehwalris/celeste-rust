@@ -150,6 +150,9 @@ pub struct BoundaryIds {
     pub g_key: u32,
     pub f_spr: u32,
     pub f_flip: u32,
+    /// The player's held-button trails (`abstraction::HeldPrecision`).
+    pub f_p_jump: u32,
+    pub f_p_dash: u32,
 }
 
 pub struct Rt2 {
@@ -752,7 +755,7 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, 0, None, (1, 1));
+        self.widen_to(ids, 0, None, (1, 1), false);
     }
 
     /// The boundary widenings of the `Bits(rem_bits)` level on this block's
@@ -771,7 +774,7 @@ impl Rt2 {
     /// players' `spd.x`/`spd.y` to, `None` for exact speed - the level's
     /// `abstraction::spd_precision_for`, which the caller passes because
     /// the switch lives above this crate.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8)) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 0. position widening (the rung below level 0): the player's
@@ -1021,6 +1024,17 @@ impl Rt2 {
             };
             let fx = self.obj_field_cell(sub, ids.f_x).unwrap_or_else(|| panic!("key pin: key `flip` has no `x`"));
             self.cols[fx as usize] = Col::U(AV::Bool(false));
+        }
+
+        // 6. The held-button trails at a held-unknown level (plans/held-buttons.md):
+        // unknown, as that level's kernels write them.
+        if held {
+            for obj in self.player_objects(ids) {
+                for f in [ids.f_p_jump, ids.f_p_dash] {
+                    let c = self.obj_field_cell(obj, f).unwrap_or_else(|| panic!("held widening: the player has no p_jump / p_dash field"));
+                    self.cols[c as usize] = Col::U(AV::UBool);
+                }
+            }
         }
     }
 

@@ -793,6 +793,19 @@ impl Graph {
             // `Some(true)` for every operand, and the two are checked
             // against each other by `folding_is_exact`.
             Op::FragOk(0) => return self.leaf(Op::ConstBool(true)),
+            // `IntFrag(c)` of a literal interval is a constant, by `eval`'s
+            // definition: the grid floor of the low end plus `c` steps, at
+            // least the low end. EXACT. The held-button fork
+            // (`widen::fork_held_inputs`) forks the literal `[0, 1]`, and
+            // folding it is what makes a body's trail, and so its `jump` /
+            // `dash`, a constant.
+            Op::IntFrag(c) if matches!(self.nodes[args[0] as usize].op, Op::Const(..)) => {
+                let Op::Const(lo, _) = self.nodes[args[0] as usize].op else { unreachable!("guarded above") };
+                let (step, mask) = self.grid();
+                let base = (lo & mask) as i64 + c as i64 * step as i64;
+                let v = (lo as i64).max(base).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                return self.leaf(Op::Const(v, v));
+            }
             // Arithmetic on literal POINTS is a constant, in PICO-8's
             // arithmetic (the concrete domain's). The tracer folds these
             // before they reach the graph; a rebuild that substitutes the

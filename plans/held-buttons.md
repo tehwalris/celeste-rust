@@ -148,6 +148,41 @@ whether `jump`/`dash` fire branches.
    - Kernel build time and body counts at level 0, before and after.
 7. **Update** `abstraction.rs:1150-1156` and CLAUDE.md's ladder section.
 
+## Progress (2026-09-16, evening)
+
+Built as designed, with one simplification and one fix:
+
+- **The input fork has no validity premise.** At a held-unknown level every
+  block writes the trails unknown, so forking both values for every lane is
+  exact for those lanes and only over-approximates a decided one (the spawn's
+  `false`). `widen::fork_held_inputs` emits `Op::SplitInt` over the literal
+  `[0, 1]`, one fork per trail (not the memoized `fork_int`, which would have
+  tied the two trails together); `Graph::fold` gained the exact `IntFrag` rule
+  on a literal interval, so a body's trail is a constant.
+- **The output columns.** `acc_template` initialized a column uniform only for
+  a lowering constant (`konst_av`), so the trails were stored per row while the
+  key folded them as uniform `UBool`: `CELESTE_KERNEL_KEY_CHECK` fired at room
+  (1,0) f24. `widen_uniform` now takes precedence.
+- Bool inputs that hold an unknown are refused (`InputView::of`, the packer),
+  and the reference driver refuses held-unknown levels.
+
+Measured:
+
+- `CELESTE_KERNEL_KEY_CHECK=1` room (1,0) `r0sxh` forward to f30: no mismatch,
+  no decline.
+- The three pinned gates at the default ladder: identical. Quick suite: 124
+  passed.
+- Room (1,0) level 0, `r0sxh` against exact:
+
+  | | f30 | f44 | f70 |
+  |---|---|---|---|
+  | exact kept | 11,774 | 515,997 | about 5.2M |
+  | `r0sxh` kept | 5,061 | 141,424 | 1,381,187 |
+  | factor | 2.33x | 3.65x | about 3.8x |
+
+- Level 0's first win on room (1,0) stays f89, the same as exact level 0: the
+  held retriggers did not make it win earlier.
+
 ## Later
 
 - **Dominance at the exact rung:** drop a held twin when its released twin is

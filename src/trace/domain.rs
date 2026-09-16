@@ -356,6 +356,10 @@ pub struct Symbolic {
     /// `Domain::move_ways`); `trace_frame` sets it from the widen mode.
     /// 0 (the default) reads as 2.
     pub move_ways: u8,
+    /// Held buttons unknown for the set being traced
+    /// (`abstraction::HeldPrecision`): `trace_frame` forks the player's
+    /// `p_jump` / `p_dash` (`widen::fork_held_inputs`). Set by the walk.
+    pub held_unknown: bool,
     /// Fork choices already handed out THIS FRAME, by the value forked.
     ///
     /// Two call sites that floor the same value do not need two choice

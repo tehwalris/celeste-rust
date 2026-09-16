@@ -2108,6 +2108,9 @@ pub fn room_constant_lattice(
     let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
     it.cache = Some(cache.clone());
     it.cart = Some(cart_data.clone());
+    // Every frame this walk traces (and its key traces, through copies of
+    // this tracer) forks the held-button trails (`widen::fork_held_inputs`).
+    it.d.held_unknown = opts.held;
 
     let st = cart::fresh_state::<Symbolic>(&mut it.d);
     let st = run_one(&mut it, top, st)?;
@@ -2127,7 +2130,7 @@ pub fn room_constant_lattice(
 
     let sk = key(&start)?;
     let start_key = sk.clone();
-    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival())?);
+    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held)?);
     reps.insert(sk.clone(), start.clone());
     let mut work: Vec<String> = vec![sk];
     let room0 = shapes::room_of(&start, &it.d);
@@ -2210,7 +2213,7 @@ pub fn room_constant_lattice(
                 continue;
             }
             let tk = key(&o.st)?;
-            let fc = shapes::field_constants(&o.st, &it.d, opts.spd_ival(), opts.pos_ival())?;
+            let fc = shapes::field_constants(&o.st, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held)?;
             // The slots this outcome wrote an interval to, outside the
             // boundary's own widenings: the next frame reads them as
             // interval inputs.

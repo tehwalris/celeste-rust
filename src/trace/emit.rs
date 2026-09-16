@@ -228,6 +228,17 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
                 }
             }
         }
+        // Held buttons unknown (plans/held-buttons.md): the player's trails
+        // are written unknown, uniform, off the per-lane key fold - the same
+        // route as rem above, and what `Rt2::widen_to(.., held)` writes.
+        if f.held_unknown {
+            for obj in o.rt2.player_objects(&ids) {
+                for fid in [ids.f_p_jump, ids.f_p_dash] {
+                    let c = o.rt2.obj_field_cell(obj, fid).ok_or_else(|| anyhow::anyhow!("held buttons unknown: the player has no p_jump / p_dash field"))?;
+                    widen.push((c, AV::UBool));
+                }
+            }
+        }
         let keys: Vec<(usize, NodeId)> =
             o.keys.iter().enumerate().map(|(k, (fi, _))| (*fi, roots[at + n + 2 + k])).collect();
         outcomes.push(FrameOutcome {
