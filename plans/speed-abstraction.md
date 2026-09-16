@@ -124,6 +124,19 @@ without thresholds promises much. The realized 1 px bucket did not shrink
 the frontier on this room (BENCHMARK_DATA.md, 2026-09-14). So no speed
 abstraction is the lever for room (2,0).
 
+The position rung realized (`y2r0sx`: 2 px y buckets, forked into points
+in-frame) is a loss on room (2,0) as well:
+
+| | f50 kept, frame | f53 kept, frame |
+|---|---|---|
+| exact `r0sx` | 5.51M, 5.2 s | 8.83M, 8.8 s |
+| `y2r0sx` | 6.31M, 17.3 s | 10.23M, 28.1 s |
+
+The post-hoc census promised 1.56x fewer states. Realized, the rung keeps
+16% more states at 3x the cost per frame: the boundary snap spreads
+straddling rows into two buckets, and each bucket runs both points. Stopped
+at f53, and `x2y2` was not run.
+
 Exact speed grows ~14.5% per frame at f60. That projects to billions of
 states by f95, so exact-speed level 0 is not viable for room (2,0). The
 bucket dispatch cannot even build its kernels there: under the spring a
