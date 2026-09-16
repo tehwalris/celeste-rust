@@ -8,10 +8,17 @@ checkpoint tree, served by a small node server under `/celeste/` on port
 <https://taxw-ux.porgy-vimba.ts.net/celeste/>.
 
 The header carries the title with the run's headline numbers (optimum,
-wall time, horizons), the **run switch** - `Room (1,0)` (the default) or
-`Room (0,0)`, the runs `runs.json` lists - and the three **tabs**; on a
-wide screen they share one row, on a phone the tabs take a second one.
-Everything below is that run.
+horizons tested, wall time), the **room switch** and the three **tabs**;
+on a wide screen they share one row, on a phone the switch and the tabs
+share the first and the numbers take a second. The switch is a native
+select listing the runs `runs.json` names in GAME order (level index
+`room.x%8 + room.y*8`), each with the altitude the game shows on entering
+the room - `Room (0,0) · 100 m`, `Room (1,0) · 200 m`, `Room (4,0) · 500 m`.
+The labels follow the original cart's `room_title.draw` (celeste.lua;
+celeste-minimal.lua strips the drawing): room (3,1) is "old site", level
+index 30 "summit", every other room `(1 + level_index) * 100 m`
+(`data.ts`, `roomTitle`). The default run is still `runs.json`'s first
+entry. Everything below is that run.
 
 ## The route
 
@@ -38,38 +45,66 @@ falls back to the default.
 states in the cell (log scale against the level's largest cell over the
 run, so one frame's brightness is comparable to the next), hue = the
 ladder level (blue = level 0, through violet and magenta to orange =
-exact), marks in warm white. A colour scale in the room's corner names
-the moving set's ramp and the count at its top.
+exact), marks in warm white. Nothing is drawn over the room but the win
+markers: the titles, the readout and the colour scale sit around it, so
+the exits at the top edge and the spawn at the bottom stay visible.
 
-The layout: the stage (the room, the grid of panels, or the 3D view) with
-the **transport** under it - fixed to the bottom of a phone, one-thumb
-reachable; in the flow on a wide screen, where the options and the
-legend sit in a sidebar. Status lives in one place each: the caption on
-the room names the *pass* (horizon, level, phase, its verdict); the
-transport's status names the *position* (the frame or iteration, the
-pass number, the counts); the scrubber's bubble names the step while it
-is held.
+The layout. On a phone: the **stage** card (the horizon picker, the pass
+title, the room / grid / 3D view, the readout under it), then the
+options, the **ladder** panel and the legend, with the **transport**
+fixed to the bottom, one-thumb reachable. On a wide screen (>= 1024 x
+620) the Space tab is an app frame that does not scroll: the stage fills
+the height the header and the transport leave (the room is as big as
+fits, never bigger than the viewport), the transport runs under it with
+the scrubber as wide as the stage, and the options, ladder and legend
+sit in a side column that scrolls on its own. In the Grid view the panel
+count per row is chosen so every panel fits the stage.
+
+Status lives in one place each: the stage's pass title names the *pass*
+(level, phase, the level's verdict); the transport's status names the
+*position* (the frame or iteration, the counts, the pass number); the
+scrubber's bubble names the step while it is held; the readout under the
+room names the probed cell (press and drag on a phone, hover with a
+mouse), the colour scale, and the wins on screen. The ladder panel lists
+every level of the horizon - its result (`win f76`, `no win by f75`,
+`not run`) and marked-set size - with the current pass's level tagged
+FWD / BWD; tap a level to jump to the start of its forward.
 
 The control model has four axes; every control is bound to exactly one:
 
 | axis | what it is | control |
 |---|---|---|
-| **horizon** | the win frame H the ladder tested; everything on screen is at H - every level's forward run out to H, its marks from H's backward, levels the ladder never reached at H shown "not run" | the `h89 … h99` row in the transport (the winning horizon carries a dot; default); the target button jumps back to it |
-| **time** | the position in H's ladder: which pass (level × forward / backward, in the order they ran) and where inside it - a forward sweeps frames 0..H, a backward sweeps iterations H-1 down to 1 | the scrubber (its backdrop is the passes, one band per level with its label, a backward's band dimmer with a warm hairline on top), the step buttons (one frame / iteration), the pass buttons (to the start of the previous / next pass), Play (sweeps and continues into the next horizon at the end; from the end of the last one it starts over) |
+| **horizon** | the win frame H the ladder tested; everything on screen is at H - every level's forward run out to H, its marks from H's backward, levels the ladder never reached at H shown "not run" | the horizon picker at the top of the stage: the OPTIMAL horizon first and the default, then the others highest first, grouped and labelled with their verdict (`h76 · optimal, every level wins`, `h75 · refuted at L9, no win by f75`, `confirmed` for a horizon above the optimum); the picker's dot and border wear the verdict colour. A refuted horizon shows no win by design. (`run.json` lists horizons in the order they RAN - a count-down from a ceiling runs 76 then 75 - so "the last one" is not the answer; `data.ts`, `defaultHorizon` / `horizonOrder`.) Switching horizon opens it at its last step |
+| **time** | the position in H's ladder: which pass (level × forward / backward, in the order they ran) and where inside it - a forward sweeps frames 0..H, a backward sweeps iterations H-1 down to 1 | the scrubber (its backdrop is the passes, one band per level with its label, a backward's band dimmer with a warm hairline on top), the step buttons (one frame / iteration), the pass buttons (to the start of the previous / next pass), the ladder panel's rows (to a level's forward), Play (sweeps to the end of the horizon and stops there - the horizon only changes by the picker; from the end it starts over) |
 | **grain** | how much of that position is shown at once: *Room* = the current pass, big; *Grid* = every level's panel while the same timeline is walked - only the current pass's level animates, levels already past their passes sit at their final state, levels not yet reached are blank (tap a panel to open it in Room); *Passes* = a step is a whole pass (a forward is its whole reached set, a backward its whole marked set) so the band is seen narrowing pass by pass; *3D* = the room as a WebGL scene you orbit (one finger), tilt from top-down to edge-on (drag up / down), pan and pinch (two fingers), double-tap to reset - *Columns* walks the step timeline with each cell a column as tall as its count (log; the accumulated set dim, the moving set as a bright cap on top; a backward's reached set is a flat slab under its marks), *Stack* walks the pass timeline with one layer of cubes per pass (a forward's reached set in the level's colour, a backward's marked set in warm white, the passes below the current one dimmed), so sweeping the passes stacks the ladder up into its pyramid. `src/view3d.ts` is the renderer (raw WebGL2, instanced boxes, no dependency; ~38k cubes for the full h99 stack) | the Room / Grid / Passes / 3D chips, and Columns / Stack in 3D |
-| **look** (2D grains) | *Full*: the accumulated set dim under the moving set bright, the closed levels' marks as dark bands underneath, wins as rings; *Sweep*: just what moves (the frontier, or the states this iteration marks); *Height map* (the default): the levels collapsed into seven bands (L0 / L1 / L2–5 / L6–7 / L8–12 / L13–14 / L15+exact), each cell in the flat colour of the finest band whose set still contains it, forward and backward alike; the broad coarse bands dark and desaturated, lightness and chroma rising with the band so the exact route is the brightest thing on screen (the two thinnest bands get a one-cell halo); the moving set magenta. The last pass is the still that shows the bands narrowing; scrubbing paints them over in order | the Full / Sweep / Height map chips |
+| **look** (2D grains) | *Full*: the accumulated set dim under the moving set bright, the closed levels' marks as dark bands underneath; *Sweep*: just what moves (the frontier, or the states this iteration marks); *Height map* (the default): the levels collapsed into seven bands (L0 / L1 / L2–5 / L6–7 / L8–12 / L13–14 / L15+exact), each cell in the flat colour of the finest band whose set still contains it, forward and backward alike; the broad coarse bands dark and desaturated, lightness and chroma rising with the band so the exact route is the brightest thing on screen (the two thinnest bands get a one-cell halo); the moving set magenta. The last pass is the still that shows the bands narrowing; scrubbing paints them over in order | the Full / Sweep / Height map chips |
 
-The view opens on the answer: the winning horizon's ladder at its last
+The view opens on the answer: the optimal horizon's ladder at its last
 step in the Height map look - the exact route, brightest, over every
 band the search narrowed through. Play from there sweeps from the top.
+
+**Wins** are drawn in every look as a reticle (a white ring with four
+ticks over a dark halo) around the cell a winning state left the room
+from; the cell itself stays uncovered. A forward shows the wins found so
+far, a backward (and a whole pass, and a finished grid panel) every win
+by H - capped at H, since level 0's frames file is shared by every
+horizon and holds wins past the earlier ones. The readout names each
+(`win: 2 at (28, -2) from f76`), and probing the cell adds `won from
+here`. The export places a won state where its player LEFT the room
+(`ui_export.rs`, `read_level_frames`, 2026-09-16); an export made before
+that put it at the next room's spawn, one room over - room (0,0)'s data
+still does, at (136, 128) and (136, 124). No in-room state can have x >=
+128 (the cart moves the player back inside at `x > 121`), so those cells
+are neither painted nor marked, and the readout says how many won states
+it left out: `N won states recorded in the next room by an old export:
+exit cell unknown, not drawn`. Re-exporting the run fixes it.
 
 Playback speed is three presets (slow / normal / fast: 15, 60, 250
 steps per second; Passes runs one, two, four passes per second), and
 pacing is *uniform* (every step the same) or *real time* (each step's
 share of the playback is its share of the run's logged time - the
 level-0 passes crawl, the high-bit passes flick by - normalised so a
-playthrough lasts as long as the uniform one at the same speed). Press
-or drag on the room (hover with a mouse) to read a cell's counts. The
+playthrough lasts as long as the uniform one at the same speed). The
 legend's "How to read this" holds the longer explanation and the keys:
 
 | key | |
