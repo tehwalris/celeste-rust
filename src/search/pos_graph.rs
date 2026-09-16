@@ -198,6 +198,15 @@ impl PosGraph {
         self.srcs.len()
     }
 
+    /// The recorded source cells of destination cell `dst`, sorted.
+    pub fn sources(&self, dst: u32) -> &[u32] {
+        let d = dst as usize;
+        if d + 1 >= self.offsets.len() {
+            return &[];
+        }
+        &self.srcs[self.offsets[d] as usize..self.offsets[d + 1] as usize]
+    }
+
     /// Destination cells with at least one recorded predecessor.
     pub fn live_cells(&self) -> usize {
         self.offsets.windows(2).filter(|w| w[1] > w[0]).count()

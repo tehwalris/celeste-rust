@@ -342,7 +342,16 @@ fn read_level_frames(dir: &Path) -> Result<LevelData> {
             nframes = nframes.max(n + 1);
         }
     }
-    let mut frames = Vec::with_capacity(nframes as usize);
+    let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(nframes as usize);
+    // The level's position graph, to draw a won state where its player left
+    // from (below). A tree without one draws wins at their own cells; one
+    // that exists and does not load is an error, not a silent skip.
+    let graph_path = dir.join("posgraph.bin");
+    let graph = if graph_path.exists() {
+        Some(crate::search::pos_graph::PosGraph::load(&graph_path).with_context(|| format!("loading {}", graph_path.display()))?)
+    } else {
+        None
+    };
     for f in 0..nframes {
         let mut cells: FxHashMap<u32, u32> = FxHashMap::default();
         let mut wins: FxHashMap<u32, u32> = FxHashMap::default();
@@ -357,6 +366,35 @@ fn read_level_frames(dir: &Path) -> Result<LevelData> {
             }
             for (_, _, cell) in file.wins() {
                 *wins.entry(cell).or_default() += 1;
+            }
+        }
+        // A won state has left the room: its cell is the NEXT room's spawn,
+        // one room over (`pos_graph::block_cells` adds `room.x - start.x`
+        // rooms), so drawn as-is the winning states sit in the box's far
+        // corner and the animation never shows the player reach the exit
+        // (room (4,0) f76 at (136,128), room (1,0) f99 at (136,124),
+        // 2026-09-16). Draw each win cell where its player LEFT from instead:
+        // of the cells with a recorded edge into it (the level's pos graph),
+        // the one holding the most states at the previous frame. The count
+        // moves whole, in both the states and the wins record, so totals are
+        // unchanged; with no graph or no occupied source the cell stays.
+        if let (Some(g), Some((prev, _))) = (graph.as_ref(), frames.last()) {
+            let prev: &Sparse = prev;
+            let busiest = |win: u32| -> Option<u32> {
+                g.sources(win)
+                    .iter()
+                    .filter_map(|&s| prev.binary_search_by_key(&s, |&(c, _)| c).ok().map(|i| prev[i]))
+                    .max_by_key(|&(c, n)| (n, std::cmp::Reverse(c)))
+                    .map(|(c, _)| c)
+            };
+            let moves: Vec<(u32, u32)> = wins.keys().filter_map(|&w| busiest(w).map(|at| (w, at))).collect();
+            for (from, to) in moves {
+                if let Some(n) = wins.remove(&from) {
+                    *wins.entry(to).or_default() += n;
+                }
+                if let Some(n) = cells.remove(&from) {
+                    *cells.entry(to).or_default() += n;
+                }
             }
         }
         let mut cells: Sparse = cells.into_iter().collect();
