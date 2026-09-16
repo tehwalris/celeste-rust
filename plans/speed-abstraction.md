@@ -176,7 +176,7 @@ So the night went to the next rooms instead: (3,0), (4,0) and onward.
 
 | room | objects | ceiling (TAS replayed, then followed in our game) | result |
 |---|---|---|---|
-| (3,0) | fly fruit, 12 fall floors | 89 (TAS4; the witness search stops when the route collects the fruit: the bridge has no integer-keyed table part) | kernels do not build: one shape's trace grows the graph by >2M nodes in the move loop's solid checks over the fall floors |
+| (3,0) | fly fruit, 12 fall floors | 89 (TAS4; the witness search stops when the route collects the fruit: the bridge has no integer-keyed table part) | kernels do not build. With `CELESTE_MAX_TRACE_NODES=16000000` and `CELESTE_LATTICE_TRACE=1`, every successful trace adds 273–10,744 nodes. The player shape's trace exceeds 16M nodes (refused at the raised budget, then re-traced until the 50-minute timeout) in the move loop's per-step `is_solid` → `check(fall_floor)` → `collide` over the room's 12 fall floors. That is runaway growth in one trace, not a budget set slightly too low |
 | (4,0) | key, chest | 76 (TAS5, replays on a real PICO-8) | **OPTIMAL 76** (3:54), after pinning the key's `spr`/`flip.x` with `frames` |
 | (5,0) | balloon | 77 in the original cart; our witness does NOT exit on a real PICO-8 | open question, below |
 | (1,1) | 4 fall floors | 94 (TAS10 with 25 prologue frames, replays on a real PICO-8) | killed by the 60 GB memory cap at f56 after 44:56. Level 0 grows ×1.4–1.5 per frame f41–f55 (131.9M kept at f55, 699 s/frame, 56 GB peak). The largest shape at f54 (55.9M rows): player `x` 94 values × `y` 72 × 2,022 speed pairs, `fall_floor[0].delay` 19 and `[1].delay` 16 (when each floor was touched), `dash_effect_time` 11 |
