@@ -193,10 +193,12 @@ pursued.
 read in the cart: `fake_wall.update`'s `hit.dash_effect_time > 0`. Fake walls
 come only from the map at room load, so in a room without one the field is
 gameplay-dead. It counts down from 10 after a dash and holds 11 values in room
-(1,1)'s largest shape at f54. Pinning it there, guarded at startup by "no
-fake wall in the start room", would merge up to ×11. That does not change
-room (1,1): at ×1.4 per frame, f55 to f94 is ×5×10^5, beyond any constant
-factor. It is recorded as a lever, not built.
+(1,1)'s largest shape at f54. **Measured, it merges almost nothing:** `rewrite
+spd-census --erase dash_effect_time` counts room (2,0) f60's distinct states
+at 23,198,480 against 23,220,146 exact (0.09%), and room (4,0) f76's at
+7,949,192 against 7,977,860 (0.36%). The countdown is implied by the rest of
+the state (speed, position, `dash_time`), so erasing it rarely makes two
+states equal: the `has_dashed` lesson again. Not built.
 
 **The balloon's phase (room (5,0), for Philippe).** `balloon.init` draws
 `offset = rnd(1)`, which fixes its bob, and PICO-8 seeds `rnd` itself. The

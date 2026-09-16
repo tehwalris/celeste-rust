@@ -287,6 +287,12 @@ enum Command {
         /// `20,18,17,16` is thresholds only, 4 px, 2 px, 1 px.
         #[arg(long)]
         edge_table: bool,
+        /// Player fields to ERASE from every state before counting
+        /// (comma-separated names, e.g. `dash_effect_time`): the merge a
+        /// gameplay-dead field would give if pinned. Every count then reads
+        /// "with these fields erased".
+        #[arg(long, default_value = "")]
+        erase: String,
     },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed file by
     /// file and row range by row range (the whole-frame `census` loads the
@@ -1764,12 +1770,18 @@ fn main() -> Result<()> {
         Command::PartitionCensus { level_dir, spd_w } => {
             print!("{}", celeste_rust::search::checkpoint::partition_census(std::path::Path::new(&level_dir), spd_w)?);
         }
-        Command::SpdCensus { level_dir, frame, widths, edge_table } => {
+        Command::SpdCensus { level_dir, frame, widths, edge_table, erase } => {
             use celeste_engine::runtime2::{mix64, Cell2, Col, AV};
             use celeste_rust::search::checkpoint::FrameFile;
             let dir = std::path::Path::new(&level_dir);
             let ids = celeste_rust::compiled::ids();
             let ws: Vec<u32> = widths.split(',').map(|w| w.trim().parse()).collect::<Result<_, _>>()?;
+            let erase_ids: Vec<(String, u32)> = erase
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|name| celeste_names::field_id(name).map(|f| (name.to_string(), f)).ok_or_else(|| anyhow::anyhow!("--erase {name:?}: no such field")))
+                .collect::<Result<_>>()?;
             let fdir = dir.join("frames").join(format!("f{frame:03}"));
             let mut sets: Vec<rustc_hash::FxHashSet<u64>> = vec![Default::default(); ws.len() + 1];
             let mut rows = 0u64;
@@ -1807,8 +1819,13 @@ fn main() -> Result<()> {
                         };
                         mix64(acc ^ mix64((c as u64) << 56 | k << 48 | a << 16 ^ bb))
                     };
+                    // The player's cells for the erased fields, left out of the hash.
+                    let erased: Vec<u32> = match celeste_rust::search::pos_graph::player_object(&rt2) {
+                        Some(obj) => erase_ids.iter().filter_map(|(_, f)| rt2.obj_field_cell(obj, *f)).collect(),
+                        None => Vec::new(),
+                    };
                     for (c, col) in rt2.cols.iter().enumerate() {
-                        if !matches!(rt2.structure[c], Cell2::Val) || Some(c as u32) == sx || Some(c as u32) == sy {
+                        if !matches!(rt2.structure[c], Cell2::Val) || Some(c as u32) == sx || Some(c as u32) == sy || erased.contains(&(c as u32)) {
                             continue;
                         }
                         match col {
@@ -1848,7 +1865,12 @@ fn main() -> Result<()> {
                     lo = hi;
                 }
             }
-            println!("f{frame:03}: {rows} rows, {} distinct exact", sets[0].len());
+            let erased_note = if erase_ids.is_empty() {
+                String::new()
+            } else {
+                format!(" (erasing {})", erase_ids.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "))
+            };
+            println!("f{frame:03}: {rows} rows, {} distinct exact{erased_note}", sets[0].len());
             for (i, &w) in ws.iter().enumerate() {
                 let what = if edge_table { format!("edge table s{w} (thresholds + {:.4} px grid)", (1u64 << w) as f64 / 65536.0) } else { format!("spd bucket 2^{w} raw ({:.4} px)", (1u64 << w) as f64 / 65536.0) };
                 println!("  {what}: {} distinct ({:.2}x)", sets[i + 1].len(), sets[0].len() as f64 / sets[i + 1].len().max(1) as f64);
