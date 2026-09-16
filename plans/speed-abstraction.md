@@ -179,7 +179,7 @@ So the night went to the next rooms instead: (3,0), (4,0) and onward.
 | (3,0) | fly fruit, 12 fall floors | 89 (TAS4; the witness search stops when the route collects the fruit: the bridge has no integer-keyed table part) | kernels do not build: one shape's trace grows the graph by >2M nodes in the move loop's solid checks over the fall floors |
 | (4,0) | key, chest | 76 (TAS5, replays on a real PICO-8) | **OPTIMAL 76** (3:54), after pinning the key's `spr`/`flip.x` with `frames` |
 | (5,0) | balloon | 77 in the original cart; our witness does NOT exit on a real PICO-8 | open question, below |
-| (6,0) | fly fruit, 10 platforms | 72 (TAS7, replays on a real PICO-8) | running |
+| (6,0) | fly fruit, 10 platforms | 72 (TAS7, replays on a real PICO-8) | level 0 grows ×1.6 per frame f35–f42 (16.8M kept at f42, 33 s/frame, 12 GB); stopped at f43. The main shape has 52 varying columns; ten object columns, 10 cells apart, each hold 7 distinct values within one frame, so they depend on the player, not the clock. Cause open |
 
 **The balloon's phase (room (5,0), for Philippe).** `balloon.init` draws
 `offset = rnd(1)`, which fixes its bob, and PICO-8 seeds `rnd` itself. The
