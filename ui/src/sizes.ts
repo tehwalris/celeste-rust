@@ -2,13 +2,14 @@
 // ladder curve (marked set and frontier peak per level), the frontier per
 // frame per level, the backward per iteration, the marked set by layer;
 // level 0's frontier against its visited total over the whole run; and
-// the ladder as a table (the WCAG twin of every chart here).
+// the ladder as a table (the WCAG twin of every chart here). On a wide
+// screen the charts sit two to a row.
 
 import type { Run, LevelRun } from "./data";
-import { fmtCompact, fmtDuration, fmtInt, fmtMs, levelName } from "./data";
+import { defaultHorizon, fmtCompact, fmtDuration, fmtInt, fmtMs, horizonOrder, horizonVerdict, levelName } from "./data";
 import { levelCss, slots } from "./color";
 import { lineChart, legendFor, type Series } from "./chart";
-import { chips, el, clear } from "./ui";
+import { chips, el, clear, select } from "./ui";
 import type { View } from "./main";
 
 type BwdMetric = "marked" | "rerun" | "loaded" | "targets";
@@ -20,13 +21,16 @@ const BWD_METRICS: { value: BwdMetric; label: string; title: string }[] = [
 ];
 
 export function sizesView(run: Run, onState: () => void): View {
-  const root = el("div", { class: "stack" });
-  const last = run.horizons[run.horizons.length - 1];
-  const l0Last = last.levels.find((l) => l.level === 0);
+  const root = el("div", { class: "sizes stack" });
+  const defH = defaultHorizon(run);
+  const hs = run.horizons.map((h) => h.h);
   const fwdFrames = run.horizons.reduce((a, h) => a + h.levels.reduce((b, l) => b + l.fwd.length, 0), 0);
   const bwdIters = run.horizons.reduce((a, h) => a + h.levels.reduce((b, l) => b + l.bwd.length, 0), 0);
   const reruns = run.horizons.reduce((a, h) => a + h.levels.reduce((b, l) => b + (l.reruns ?? 0), 0), 0);
-  const l0Visited = l0Last && l0Last.fwd.length ? l0Last.fwd[l0Last.fwd.length - 1].visited : 0;
+  // Level 0's forward is extended across horizons, a horizon's lines only
+  // the frames it added (a count-down's lower horizons add none): its
+  // visited total is the largest over every line.
+  const l0Visited = Math.max(0, ...run.horizons.flatMap((h) => h.levels.filter((l) => l.level === 0).flatMap((l) => l.fwd.map((x) => x.visited))));
   const levelsRun = run.horizons.reduce((a, h) => a + h.levels.length, 0);
   const stat = (label: string, value: string, unit?: string, fine?: string) =>
     el("div", { class: "stat" }, [
@@ -39,7 +43,7 @@ export function sizesView(run: Run, onState: () => void): View {
       el("div", { class: "stats" }, [
         stat("optimum", run.optimal != null ? String(run.optimal) : "–", "frames", run.optimal != null ? `every level wins by f${run.optimal}` : "not found"),
         stat("wall time", run.wall_s != null ? fmtDuration(run.wall_s * 1000) : "–", undefined, run.prebuild_s != null ? `after ${fmtMs(run.prebuild_s * 1000)} kernel prebuild` : undefined),
-        stat("horizons", String(run.horizons.length), undefined, `h${run.horizons[0].h} to h${last.h} · ${levelsRun} level runs`),
+        stat("horizons", String(run.horizons.length), undefined, `h${Math.min(...hs)} to h${Math.max(...hs)} · ${levelsRun} level runs`),
         stat("level-0 states", fmtCompact(l0Visited), undefined, `${fmtInt(l0Visited)} distinct states visited`),
         stat("forward frames", fmtInt(fwdFrames), undefined, "over every level of every horizon"),
         stat("backward iterations", fmtInt(bwdIters)),
@@ -48,16 +52,16 @@ export function sizesView(run: Run, onState: () => void): View {
     ]),
   );
 
-  const st = { h: run.horizons.length - 1, log: true, bwdMetric: "marked" as BwdMetric };
-  const hChips = chips<number>(
-    run.horizons.map((x, i) => ({ value: i, label: `h${x.h}`, title: x.refuted_at != null ? `refuted at level ${x.refuted_at}` : "the winning horizon" })),
+  const st = { h: defH, log: true, bwdMetric: "marked" as BwdMetric };
+  const hPicker = select<number>(
+    horizonOrder(run).map((i) => ({ value: i, label: `h${run.horizons[i].h} · ${horizonVerdict(run, run.horizons[i]).label}` })),
     st.h,
     (i) => {
       st.h = i;
       build();
       onState();
     },
-    { label: "horizon", scroll: true },
+    { label: "horizon", class: "h-picker" },
   );
   const logChips = chips<string>(
     [
@@ -77,8 +81,8 @@ export function sizesView(run: Run, onState: () => void): View {
     build();
     onState();
   });
-  root.append(el("div", { class: "card controls" }, [hChips.root, logChips.root]));
-  const charts = el("div", { class: "stack" });
+  root.append(el("div", { class: "card controls" }, [hPicker.root, logChips.root]));
+  const charts = el("div", { class: "chart-grid" });
   root.append(charts);
 
   const seriesOf = (lr: LevelRun, points: [number, number][]): Series => ({ name: `L${lr.level} (${levelName(lr)})`, color: levelCss(lr.level), points });
@@ -89,7 +93,8 @@ export function sizesView(run: Run, onState: () => void): View {
     const hr = run.horizons[st.h];
     const H = hr.h;
     const markers = [{ x: H, label: `h${H}` }];
-    const verdict = hr.refuted_at != null ? `refuted at level ${hr.refuted_at}` : "confirmed: every level wins";
+    const verdict = horizonVerdict(run, hr);
+    hPicker.root.dataset.kind = verdict.kind;
 
     // 0. The ladder curve: marked set per level, and the forward's peak.
     const ladder: Series = {
@@ -104,7 +109,7 @@ export function sizesView(run: Run, onState: () => void): View {
     };
     charts.append(
       el("div", { class: "card" }, [
-        el("h2", {}, [`The ladder at h${H}`, el("small", { text: verdict })]),
+        el("h2", {}, [`The ladder at h${H}`, el("small", { text: verdict.long })]),
         lineChart({ series: [peak, ladder], yLog: st.log, xLabel: "level", yLabel: "states", xFormat: levelLabel, xTicks: hr.levels.map((l) => l.level) }),
         legendFor([peak, ladder]),
         el("p", { class: "note", text: "The marked set is what the next level has to search inside; the frontier peak is the widest single frame of that level's forward. A refuted level has a peak but no marked set." }),
@@ -116,7 +121,7 @@ export function sizesView(run: Run, onState: () => void): View {
     charts.append(
       el("div", { class: "card" }, [
         el("h2", {}, ["Frontier per frame", el("small", { text: `h${H}, one line per level` })]),
-        lineChart({ series: frontier, yLog: st.log, xLabel: "frame", yLabel: "states first reached at the frame", markers, tall: true }),
+        lineChart({ series: frontier, yLog: st.log, xLabel: "frame", yLabel: "states first reached at the frame", markers }),
         legendFor(frontier),
         el("p", { class: "note", text: "Each level's forward runs to the horizon (level 0 persists across horizons and is extended a frame at a time). A refuted level's frontier dies out before it wins." }),
       ]),
@@ -126,13 +131,14 @@ export function sizesView(run: Run, onState: () => void): View {
     const bwd = hr.levels
       .filter((lr) => lr.bwd.length)
       .map((lr) => seriesOf(lr, [...lr.bwd].sort((a, b) => a.f - b.f).map((b) => [b.f, b[st.bwdMetric]] as [number, number])));
+    const metric = BWD_METRICS.find((m) => m.value === st.bwdMetric)!;
     charts.append(
       el("div", { class: "card" }, [
         el("h2", {}, ["Backward per iteration", el("small", { text: `h${H}, from f${H - 1} down to f1` })]),
         el("div", { class: "controls", style: "margin-bottom:8px" }, [metricChips.root]),
-        lineChart({ series: bwd, yLog: st.log, xLabel: "iteration (frame)", yLabel: `${st.bwdMetric === "rerun" ? "re-run" : st.bwdMetric} states`, markers }),
+        lineChart({ series: bwd, yLog: st.log, xLabel: "iteration (frame)", yLabel: `${metric.label} states`, markers }),
         legendFor(bwd),
-        el("p", { class: "note", text: `${BWD_METRICS.find((m) => m.value === st.bwdMetric)!.title[0].toUpperCase()}${BWD_METRICS.find((m) => m.value === st.bwdMetric)!.title.slice(1)}. At iteration f the candidates are the rows of every layer ≤ f in the cells that can step into a target; each is re-run through the kernel and marked if a successor is marked.` }),
+        el("p", { class: "note", text: `${metric.title[0].toUpperCase()}${metric.title.slice(1)}. At iteration f the candidates are the rows of every layer ≤ f in the cells that can step into a target; each is re-run through the kernel and marked if a successor is marked.` }),
       ]),
     );
 
@@ -148,7 +154,7 @@ export function sizesView(run: Run, onState: () => void): View {
     );
 
     // 4. Level 0: frontier vs visited.
-    const l0 = run.horizons.flatMap((h) => h.levels.filter((l) => l.level === 0).flatMap((l) => l.fwd));
+    const l0 = run.horizons.flatMap((h) => h.levels.filter((l) => l.level === 0).flatMap((l) => l.fwd)).sort((a, b) => a.f - b.f);
     const l0f: Series = { name: "frontier (kept after dedup)", color: slots[0], points: l0.map((l) => [l.f, l.kept]) };
     const l0v: Series = { name: "visited (distinct states so far)", color: slots[2], points: l0.map((l) => [l.f, l.visited]) };
     const l0r: Series = { name: "raw (emitted before dedup)", color: slots[3], points: l0.map((l) => [l.f, l.raw]) };
@@ -160,12 +166,13 @@ export function sizesView(run: Run, onState: () => void): View {
       ]),
     );
 
-    // 5. Table, grouped by horizon.
+    // 5. Table, grouped by horizon, in the order they ran.
     const rows: HTMLElement[] = [];
     for (const h of run.horizons) {
+      const v = horizonVerdict(run, h);
       rows.push(
         el("tr", { class: "h" }, [
-          el("td", { colspan: 7 }, [`horizon ${h.h}`, el("span", { class: "muted", text: ` · ${h.levels.length} level${h.levels.length === 1 ? "" : "s"} · ${h.refuted_at != null ? `refuted at level ${h.refuted_at}` : "confirmed"}` })]),
+          el("td", { colspan: 7 }, [`horizon ${h.h}`, el("span", { class: `verdict-tag ${v.kind}`, text: v.short }), el("span", { class: "muted", text: ` · ${h.levels.length} level${h.levels.length === 1 ? "" : "s"}` })]),
         ]),
       );
       for (const lr of h.levels) {
@@ -185,7 +192,7 @@ export function sizesView(run: Run, onState: () => void): View {
       }
     }
     charts.append(
-      el("div", { class: "card" }, [
+      el("div", { class: "card wide" }, [
         el("h2", {}, ["The ladder, run by run", el("small", { text: "every level of every horizon, in the order they ran" })]),
         el("div", { class: "table-wrap" }, [
           el("table", { class: "ladder" }, [
@@ -199,7 +206,7 @@ export function sizesView(run: Run, onState: () => void): View {
 
   function params(): string {
     const p = new URLSearchParams();
-    if (st.h !== run.horizons.length - 1) p.set("h", String(run.horizons[st.h].h));
+    if (st.h !== defH) p.set("h", String(run.horizons[st.h].h));
     if (!st.log) p.set("y", "lin");
     if (st.bwdMetric !== "marked") p.set("bm", st.bwdMetric);
     return p.toString();
@@ -207,11 +214,11 @@ export function sizesView(run: Run, onState: () => void): View {
   function apply(p: URLSearchParams) {
     const hv = p.has("h") ? Number(p.get("h")) : NaN;
     const hi = run.horizons.findIndex((x) => x.h === hv);
-    st.h = hi >= 0 ? hi : run.horizons.length - 1;
+    st.h = hi >= 0 ? hi : defH;
     st.log = p.get("y") !== "lin";
     const bm = p.get("bm") as BwdMetric | null;
     st.bwdMetric = bm && BWD_METRICS.some((m) => m.value === bm) ? bm : "marked";
-    hChips.set(st.h);
+    hPicker.set(st.h);
     logChips.set(st.log ? "log" : "lin");
     metricChips.set(st.bwdMetric);
     build();
