@@ -9,9 +9,15 @@
 // so a link reproduces exactly what was on screen. A view reports its
 // state through `onState`; the shell writes it into the hash (replace,
 // never push - the back button leaves the app, it does not undo scrubs).
+//
+// The header is one row on a wide screen (title and headline numbers,
+// the room, the tabs) and two on a phone (the room and the tabs, then
+// the numbers). The room switch lists the runs in GAME order (level
+// index) with the altitude the game shows on entering the room; the
+// default run is still runs.json's first entry.
 import "./style.css";
-import { chapters, fmtDuration, loadRun, loadRuns, type Chapter, type Run, type RunInfo } from "./data";
-import { chips, el, clear, button, type Chips } from "./ui";
+import { chapters, fmtDuration, loadRun, loadRuns, roomLabel, runsInGameOrder, type Chapter, type Run, type RunInfo } from "./data";
+import { el, clear, button, select, type Select } from "./ui";
 import { spaceView } from "./space";
 import { sizesView } from "./sizes";
 import { timelineView } from "./timeline";
@@ -81,12 +87,16 @@ async function main() {
     );
     return;
   }
+  const labelOf = (id: string) => {
+    const r = runs.find((x) => x.id === id);
+    return r ? roomLabel(r) : id;
+  };
 
   // ---- the header: title, the run, the tabs ----------------------------------
   const title = el("h1", { text: "Celeste search" });
   const sub = el("div", { class: "sub" });
   const brand = el("div", { class: "brand" }, [title, sub]);
-  let runChips: Chips<string> | null = null;
+  let runPicker: Select<string> | null = null;
   const runBox = el("div", { class: "run-switch" });
   const nav = el("nav", { class: "tabs", "aria-label": "views" });
   const header = el("header", { class: "top" }, [brand, runBox, nav]);
@@ -126,17 +136,17 @@ async function main() {
   }
 
   const buildRunSwitch = (runId: string) => {
-    if (runChips) {
-      runChips.set(runId);
+    if (runPicker) {
+      runPicker.set(runId);
       return;
     }
-    runChips = chips<string>(
-      runs.map((r) => ({ value: r.id, label: r.label })),
+    runPicker = select<string>(
+      runsInGameOrder(runs).map((r) => ({ value: r.id, label: roomLabel(r) })),
       runId,
       (id) => go(id, tab ?? "space"),
-      { label: "run" },
+      { label: "room", hideLabel: true, class: "run-picker" },
     );
-    runBox.append(runChips.root);
+    runBox.append(runPicker.root);
   };
 
   const build = (t: Tab): View => {
@@ -151,10 +161,10 @@ async function main() {
   async function apply(runId: string, t: Tab, params: URLSearchParams) {
     if (!current || current.run.id !== runId) {
       const seq = ++loads;
-      const label = runs.find((r) => r.id === runId)?.label ?? runId;
+      const label = labelOf(runId);
       buildRunSwitch(runId);
       sub.textContent = "";
-      document.title = `Celeste search · ${label}`;
+      document.title = `${label} · Celeste search`;
       clear(main);
       main.append(spinner(`Loading ${label}…`));
       let run: Run;
@@ -185,10 +195,10 @@ async function main() {
       current = { run, chs: chapters(run), views: new Map() };
       tab = null;
       const wall = run.wall_s != null ? fmtDuration(run.wall_s * 1000) : "";
-      // The room is on the run chip; the sub is the run's headline numbers.
-      sub.replaceChildren(el("span", { text: `optimum ${run.optimal != null ? `${run.optimal} frames` : "not found"}` }));
-      if (wall) sub.append(el("span", { text: wall }));
-      sub.append(el("span", { text: `${run.horizons.length} horizons` }));
+      // The room is on the switch; the sub is the run's headline numbers.
+      sub.replaceChildren(el("span", {}, [run.optimal != null ? el("b", { text: `optimum ${run.optimal} frames` }) : "no optimum found"]));
+      sub.append(el("span", { text: `${run.horizons.length} horizon${run.horizons.length === 1 ? "" : "s"} tested` }));
+      if (wall) sub.append(el("span", { text: `${wall} search` }));
     }
     const v = build(t);
     if (tab !== t) {
@@ -196,6 +206,7 @@ async function main() {
       clear(main);
       main.append(v.root);
       main.dataset.tab = t;
+      document.body.dataset.tab = t;
       for (const [id, b] of tabButtons) {
         b.classList.toggle("on", id === t);
         b.setAttribute("aria-current", id === t ? "page" : "false");

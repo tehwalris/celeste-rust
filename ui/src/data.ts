@@ -135,23 +135,6 @@ export class FramesBin {
   }
 }
 
-/** A marks binary (`CUM1`): (idx, dist, count) sorted by (dist, idx). */
-export class MarksBin {
-  readonly n: number;
-  readonly idx: Uint32Array;
-  readonly dist: Uint32Array;
-  readonly count: Uint32Array;
-  constructor(buf: ArrayBuffer) {
-    const m = String.fromCharCode(...new Uint8Array(buf, 0, 4));
-    if (m !== "CUM1") throw new Error(`bad magic ${m}`);
-    const w = new Uint32Array(buf);
-    this.n = w[1];
-    this.idx = w.subarray(2, 2 + this.n);
-    this.dist = w.subarray(2 + this.n, 2 + 2 * this.n);
-    this.count = w.subarray(2 + 2 * this.n, 2 + 3 * this.n);
-  }
-}
-
 const base = (import.meta.env.BASE_URL as string).replace(/\/?$/, "/");
 export const dataUrl = (path: string) => `${base}data/${path}`;
 
@@ -180,17 +163,6 @@ export function loadFrames(runId: string, name: string, magic = "CUF1"): Promise
   return p;
 }
 export const loadLayers = (runId: string, name: string) => loadFrames(runId, name, "CUL1");
-
-const marksCache = new Map<string, Promise<MarksBin>>();
-export function loadMarks(runId: string, name: string): Promise<MarksBin> {
-  const path = `${runId}/${name}`;
-  let p = marksCache.get(path);
-  if (!p) {
-    p = fetchBin(path).then((b) => new MarksBin(b));
-    marksCache.set(path, p);
-  }
-  return p;
-}
 
 /** The runs on offer, in order; the first is the default. */
 export async function loadRuns(): Promise<RunInfo[]> {
@@ -275,9 +247,6 @@ export function chapters(run: Run): Chapter[] {
   return out;
 }
 
-export const totalSteps = (chs: Chapter[]) =>
-  chs.length ? chs[chs.length - 1].startStep + chs[chs.length - 1].frames.length : 0;
-
 /** The chapter and step at a global step index. */
 export function locate(chs: Chapter[], globalStep: number): { chapter: Chapter; step: number } {
   let lo = 0;
@@ -293,6 +262,96 @@ export function locate(chs: Chapter[], globalStep: number): { chapter: Chapter; 
 
 export const levelName = (lr: LevelRun) =>
   lr.precision === "Exact" ? "exact" : `${lr.level} bit${lr.level === 1 ? "" : "s"}`;
+
+// ---------------------------------------------------------------------------
+// Rooms, in game order, with the altitude the game shows on entering them.
+
+/** The cart's `level_index()`: `room.x%8 + room.y*8`. */
+export const levelIndex = (x: number, y: number) => (x % 8) + y * 8;
+
+/** The room's title as the original cart draws it on entry
+ *  (`room_title.draw` in celeste.lua; celeste-minimal.lua keeps
+ *  `level_index` but strips the drawing): room (3,1) is "old site", level
+ *  index 30 is "summit", every other room `(1 + level_index) * 100 .. " m"`. */
+export function roomTitle(x: number, y: number): string {
+  if (x === 3 && y === 1) return "old site";
+  const i = levelIndex(x, y);
+  if (i === 30) return "summit";
+  return `${(1 + i) * 100} m`;
+}
+
+/** A run's room from its runs.json entry (`Room (4,0)`, or the id
+ *  `room40`), or null when neither names one. */
+export function roomOf(info: RunInfo): [number, number] | null {
+  const m = /\((\d+)\s*,\s*(\d+)\)/.exec(info.label) ?? /^room(\d)(\d)$/.exec(info.id);
+  return m ? [Number(m[1]), Number(m[2])] : null;
+}
+
+/** `Room (4,0) · 500 m`: the label the room switch shows. */
+export function roomLabel(info: RunInfo): string {
+  const r = roomOf(info);
+  return r ? `Room (${r[0]},${r[1]}) · ${roomTitle(r[0], r[1])}` : info.label;
+}
+
+/** The runs in game order (level index); unparseable labels keep their
+ *  runs.json order after the rooms. */
+export function runsInGameOrder(runs: RunInfo[]): RunInfo[] {
+  const key = (r: RunInfo) => {
+    const room = roomOf(r);
+    return room ? levelIndex(room[0], room[1]) : 1e9;
+  };
+  return runs.map((r, i) => ({ r, i })).sort((a, b) => key(a.r) - key(b.r) || a.i - b.i).map((e) => e.r);
+}
+
+// ---------------------------------------------------------------------------
+// Horizons: what the ladder concluded at each, and the order to offer them.
+
+export type VerdictKind = "optimal" | "confirmed" | "refuted";
+export interface Verdict {
+  kind: VerdictKind;
+  /** `optimal` / `confirmed` / `refuted at L9`. */
+  short: string;
+  /** What a picker shows: `optimal, every level wins` / `refuted at L9, no win by f75`. */
+  label: string;
+  /** `optimal: every level wins by frame 76` / `refuted at level 9: no win by frame 75`. */
+  long: string;
+}
+
+/** A horizon's verdict. `optimal` is the run's answer (every level won
+ *  there and it is the minimum); `confirmed` is a horizon every level won
+ *  above the optimum (a count-down's ceiling); `refuted` stopped at a level
+ *  with no win by the horizon, so by design nothing on screen wins. */
+export function horizonVerdict(run: Run, hr: HorizonRun): Verdict {
+  if (hr.refuted_at != null) {
+    return { kind: "refuted", short: `refuted at L${hr.refuted_at}`, label: `refuted at L${hr.refuted_at}, no win by f${hr.h}`, long: `refuted at level ${hr.refuted_at}: no win by frame ${hr.h}` };
+  }
+  if (run.optimal === hr.h) return { kind: "optimal", short: "optimal", label: "optimal, every level wins", long: `optimal: every level wins by frame ${hr.h}` };
+  return { kind: "confirmed", short: "confirmed", label: "confirmed, every level wins", long: `confirmed: every level wins by frame ${hr.h} (not the minimum)` };
+}
+
+/** The horizon a view opens on: the optimal one; else the lowest
+ *  confirmed one; else the last one that ran. */
+export function defaultHorizon(run: Run): number {
+  const hs = run.horizons;
+  const opt = hs.findIndex((h) => h.refuted_at == null && h.h === run.optimal);
+  if (opt >= 0) return opt;
+  let best = -1;
+  hs.forEach((h, i) => {
+    if (h.refuted_at == null && (best < 0 || h.h < hs[best].h)) best = i;
+  });
+  return best >= 0 ? best : hs.length - 1;
+}
+
+/** Horizon indices in the order to offer them: the default (optimal)
+ *  first, then the rest by horizon, highest first. The run's own order is
+ *  the order they RAN in - a count-down from a ceiling runs 76 then 75, a
+ *  count-up 89 .. 99 - which is no order to choose from. */
+export function horizonOrder(run: Run): number[] {
+  const d = defaultHorizon(run);
+  const rest = run.horizons.map((_, i) => i).filter((i) => i !== d);
+  rest.sort((a, b) => run.horizons[b].h - run.horizons[a].h);
+  return [d, ...rest];
+}
 
 export function fmtInt(n: number): string {
   return n.toLocaleString("en-US");

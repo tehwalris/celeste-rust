@@ -110,6 +110,60 @@ export function chips<T>(
   };
 }
 
+export interface SelectOption<T> {
+  value: T;
+  label: string;
+  /** Options with the same group are listed under one heading. */
+  group?: string;
+}
+
+export interface Select<T> {
+  root: HTMLElement;
+  /** Move the selection without firing onChange. */
+  set(value: T): void;
+}
+
+/** A labelled native select: the phone's own picker (a full-height list
+ *  a thumb can hit), a keyboard-friendly dropdown on a desktop, and
+ *  room for a long label per option ("h75 · refuted at level 9: ..."),
+ *  which a row of chips has not. */
+export function select<T>(
+  options: SelectOption<T>[],
+  selected: T,
+  onChange: (value: T) => void,
+  opts: { label: string; class?: string; hideLabel?: boolean },
+): Select<T> {
+  const sel = el("select", { "aria-label": opts.label });
+  let group: HTMLOptGroupElement | null = null;
+  options.forEach((o, i) => {
+    const opt = el("option", { value: String(i), text: o.label });
+    if (o.group) {
+      if (!group || group.label !== o.group) {
+        group = el("optgroup", { label: o.group });
+        sel.append(group);
+      }
+      group.append(opt);
+    } else {
+      group = null;
+      sel.append(opt);
+    }
+  });
+  const index = (v: T) => options.findIndex((o) => o.value === v);
+  sel.selectedIndex = Math.max(0, index(selected));
+  sel.addEventListener("change", () => onChange(options[Number(sel.value)].value));
+  const root = el("label", { class: `picker${opts.class ? " " + opts.class : ""}` }, [
+    opts.hideLabel ? null : el("span", { class: "picker-label", text: opts.label }),
+    el("span", { class: "picker-box" }, [sel, icon("chevronDown")]),
+  ]);
+  return {
+    root,
+    set(v) {
+      const i = index(v);
+      if (i >= 0) sel.value = String(i);
+    },
+  };
+}
+
 export interface Scrubber {
   root: HTMLElement;
   /** Move the playhead; `label` is what the bubble says while held. */
@@ -247,8 +301,9 @@ export function button(label: string | Node, onClick: () => void, cls = "", titl
 }
 
 /** Inline SVG icons (24-unit grid, currentColor). */
-export function icon(name: "play" | "pause" | "prev" | "next" | "stepBack" | "stepFwd" | "target" | "chevron"): SVGSVGElement {
+export function icon(name: "play" | "pause" | "prev" | "next" | "stepBack" | "stepFwd" | "target" | "chevron" | "chevronDown"): SVGSVGElement {
   const paths: Record<string, string> = {
+    chevronDown: "M5.5 8.5 12 15l6.5-6.5-1.4-1.4L12 12.2 6.9 7.1z",
     play: "M8 5.5v13l11-6.5z",
     pause: "M7 5h4v14H7zm6 0h4v14h-4z",
     prev: "M6 6h2v12H6zm12 0-9 6 9 6z",
