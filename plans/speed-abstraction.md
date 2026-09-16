@@ -143,6 +143,35 @@ bucket dispatch cannot even build its kernels there: under the spring a
 coarse speed bucket leaves the move loop's collision tests undecided and
 the trace explodes.
 
+### Room (2,0) end to end: where it stands (2026-09-16, night)
+
+Every lever measured tonight fails to make room (2,0)'s level 0 reach f95:
+
+- **Exact speed:** 23.2M states at f60, 14.5% growth per frame, which
+  projects to ~2G at f94. The 2026-09-15 overnight run was killed by the
+  90 GB memory cap at f79.
+- **Speed buckets (dispatch):** the kernels do not build (the key fixpoint
+  exceeds the graph limit).
+- **Fine speed precision:** post-hoc it merges nothing (1.2x at 1/64 px).
+- **Position rung `y2`:** realized it keeps 16% more states at 3x the cost.
+
+One correction came out of it. The exact-speed trees before `180834b` were
+produced with the fruit's hit test silently dropped (the kernel took the
+"no hit" arm on undecided lanes). At f55 the kept set is identical, but
+the old f69/f78 frontier numbers are not authoritative.
+
+What could still work, none of it built yet:
+
+1. A saturating coarse level whose marks prune: under `--ceiling` only
+   horizons 95 and 94 run, so a coarse level's early first win costs
+   nothing. But every widening measured here fans out in-frame.
+2. An admissible lower bound on frames to exit, stronger than
+   position-graph distance (which prunes nothing at f69).
+3. The door and the frontier on disk. That is days of work and hundreds
+   of GB at f94.
+
+So the night went to the next rooms instead: (3,0), (4,0) and onward.
+
 ### Two bugs the coarse tables exposed (2026-09-16)
 
 - **The dash-constant reader** split on every undecided select in the dash
