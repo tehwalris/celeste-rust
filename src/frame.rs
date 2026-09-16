@@ -1278,9 +1278,16 @@ fn band() -> Option<(u32, i32)> {
 
 /// Can a player at `cell` at frame `frame` not reach the exit (y < -4) by
 /// horizon `h`, at `px` pixels per frame up? One frame of slack for when the
-/// exit test runs. A cell with no player (a death, a room change) is kept.
+/// exit test runs. A cell with no player (a death) is kept, and so is a cell
+/// past the start room: the position grid places the next room one room to
+/// the right (`pos_graph`), so x >= 128 is a row that has LEFT the room - a
+/// win, which a band reading its new-room y dropped (room (1,0) refuted 99 at
+/// level 0, room (2,0) 95 at level 1, 2026-09-16).
 fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
-    let Some((_, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
+    let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
+    if x >= 128 {
+        return false;
+    }
     let frames = ((y + 5).max(0) + px - 1) / px;
     frame + (frames.max(1) - 1) as u32 > h
 }
