@@ -133,6 +133,13 @@ pub trait Domain {
     /// it is the difference between running the game and compiling it.
     fn unknown_bool(&mut self) -> Result<Self::Bool>;
 
+    /// A number known only to lie in `[lo, hi]` - `rnd`'s value. Like
+    /// `unknown_bool` this is a thing only an abstract domain has: the
+    /// concrete oracle refuses rather than inventing a draw.
+    fn range_num(&mut self, lo: P8, hi: P8) -> Result<Self::Num> {
+        bail!("a number in [{lo:?}, {hi:?}] has no concrete value - this domain runs real inputs only")
+    }
+
     /// How much graph there is, for the tracer's budget check. Zero for a
     /// domain that does not build one.
     fn node_count(&self) -> usize {
@@ -557,6 +564,9 @@ impl Domain for Symbolic {
         flag: &NodeId,
     ) -> Result<NodeId> {
         Ok(self.graph.fold(Op::TileFlagAt, vec![*x, *y, *w, *h, *flag]))
+    }
+    fn range_num(&mut self, lo: P8, hi: P8) -> Result<NodeId> {
+        Ok(self.graph.leaf(Op::Const(lo.as_raw_u32() as i32, hi.as_raw_u32() as i32)))
     }
     fn unknown_bool(&mut self) -> Result<NodeId> {
         if self.frees >= 6 {

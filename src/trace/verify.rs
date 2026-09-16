@@ -1635,7 +1635,13 @@ end
                     // matters and one panic would hide it.
                     Err(e) if format!("{}", e).contains("declined") => {
                         declined += 1;
-                        *declined_at.entry(label.to_string()).or_default() += 1;
+                        let n = declined_at.entry(label.to_string()).or_default();
+                        // The first refusal per sweep label, named: a count
+                        // alone does not say which premise refused.
+                        if *n == 0 {
+                            eprintln!("[verify] {label} {bits:?} declined: {e:#}");
+                        }
+                        *n += 1;
                     }
                     // A MISMATCH is a WRONG ANSWER, not a refusal - the
                     // refusals are counted above and are a measurement.

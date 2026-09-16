@@ -36,6 +36,7 @@ pub const NATIVE: &[&str] = &[
     "__split_at",
     "print",
     "sin",
+    "rnd",
     "mget",
     "fget",
     "_hint_normalize",

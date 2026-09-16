@@ -1732,6 +1732,25 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
             }
             "__new_unknown_boolean" => (st, Value::Bool(self.d.unknown_bool()?)),
+            // `rnd(x)`: PICO-8's generator draws in [0, x), `x` defaulting
+            // to 1. The draw depends on a seed nothing in the search
+            // models, so its value is the whole range - a sound
+            // over-approximation (room (5,0)'s balloon phase, the chest's
+            // shake). A bound that is not a positive constant is refused,
+            // not guessed.
+            "rnd" => {
+                let x = match args.first() {
+                    None => P8::from_i16(1),
+                    Some(Value::Num(n)) => self
+                        .d
+                        .as_const(n)
+                        .ok_or_else(|| anyhow!("rnd: a non-constant bound is not modelled"))?,
+                    Some(other) => bail!("rnd: expected a number, got {:?}", other),
+                };
+                anyhow::ensure!(x > P8::from_i16(0), "rnd: a non-positive bound {x:?} is not modelled");
+                let hi = P8::from_raw(x.as_raw_u32() as i32 - 1);
+                (st, Value::Num(self.d.range_num(P8::from_i16(0), hi)?))
+            }
             "min" | "max" => {
                 let f = if name == "min" { Fun2::Min } else { Fun2::Max };
                 let (a, b) = (num(0)?, num(1)?);

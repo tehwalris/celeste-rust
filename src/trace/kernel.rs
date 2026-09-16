@@ -1998,7 +1998,15 @@ pub fn room_constant_lattice(
                 // error. (A refusal on an early pass that a later
                 // re-trace of the same shape survives is fine - the
                 // successful frame lands in `frames`.)
+                //
+                // And the shape's EARLIER frame goes: it was traced under
+                // pins the lattice has since dropped, so a kernel built from
+                // it bakes constants the shape no longer has. Keeping it
+                // turned a refused re-trace into a runtime premise failure
+                // (room (4,0): the spawn's `state`/`delay` baked at 0, a
+                // KERNEL COVERAGE GAP at f8, 2026-09-16).
                 refused.insert(k.clone(), format!("{:#}", e));
+                frames.remove(&k);
                 continue;
             }
         };
@@ -2024,11 +2032,28 @@ pub fn room_constant_lattice(
             }
         }
         // Keep the converged frame for generation (last trace wins).
+        let lattice_trace = std::env::var_os("CELESTE_LATTICE_TRACE").is_some();
+        if lattice_trace {
+            eprintln!("[lattice] trace shape #{} ({} pinned): {} outcomes", lattice.keys().position(|x| *x == k).unwrap_or(usize::MAX), pin.len(), f.outs.len());
+        }
         for o in &f.outs {
-            if it.d.decide(&o.ok) == Some(false) { continue; }
-            if shapes::room_of(&o.st, &it.d) != room0 { continue; }
+            if it.d.decide(&o.ok) == Some(false) {
+                if lattice_trace { eprintln!("[lattice]   outcome skipped: ok folds false"); }
+                continue;
+            }
+            if shapes::room_of(&o.st, &it.d) != room0 {
+                if lattice_trace { eprintln!("[lattice]   outcome skipped: another room"); }
+                continue;
+            }
             let tk = key(&o.st)?;
             let fc = shapes::field_constants(&o.st, &it.d, opts.spd_ival(), opts.pos_ival())?;
+            if lattice_trace {
+                let known = lattice.get(&tk).map(|m| m.iter().filter(|(p, v)| fc.get(*p) != Some(*v)).map(|(p, _)| super::iface::show(p)).collect::<Vec<_>>());
+                match known {
+                    None => eprintln!("[lattice]   outcome: NEW shape, {} constants", fc.len()),
+                    Some(gone) => eprintln!("[lattice]   outcome: shape #{}, constants removed: {:?}", lattice.keys().position(|x| *x == tk).unwrap_or(usize::MAX), gone),
+                }
+            }
             let changed = match lattice.get_mut(&tk) {
                 None => {
                     lattice.insert(tk.clone(), fc);

@@ -264,6 +264,10 @@ impl Domain for RefDomain {
         Ok(self.cursor.choose(2) == 1)
     }
 
+    fn range_num(&mut self, lo: P8, hi: P8) -> Result<Iv> {
+        Ok(Iv::new(lo, hi))
+    }
+
     fn as_const(&self, v: &Iv) -> Option<P8> {
         v.to_number()
     }
