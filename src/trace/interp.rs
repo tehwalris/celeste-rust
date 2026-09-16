@@ -101,6 +101,13 @@ pub struct Interp<'a, D: Domain> {
     /// that stops at a limit tells you exactly which construct did it.
     pub max_states: usize,
     pub max_nodes: usize,
+    /// The graph's size when the current frame trace began
+    /// (`verify::trace_frame`): `max_nodes` bounds ONE trace's growth. A
+    /// walk traces many frames into one arena, and bounding the arena's
+    /// total made a trace refuse because of the traces before it (room
+    /// (3,0): 12 fall floors, two shapes refused at `__reset_button_states`,
+    /// 2026-09-16).
+    pub trace_start_nodes: usize,
     /// What `printh` has printed, in order. This exists so a program can
     /// be run in the tracer AND in real PICO-8 and the two outputs
     /// compared line for line (`lua/probe/`), which is the only way to
@@ -132,6 +139,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             cache: None,
             max_states: 256,
             max_nodes: 2_000_000,
+            trace_start_nodes: 0,
             prints: Vec::new(),
             for_iterations: 0,
             room_flags: std::collections::HashMap::new(),
@@ -365,11 +373,12 @@ impl<'a, D: Domain> Interp<'a, D> {
                     self.max_states
                 );
             }
-            if self.d.node_count() > self.max_nodes {
+            if self.d.node_count().saturating_sub(self.trace_start_nodes) > self.max_nodes {
                 bail!(
-                    "graph grew to {} nodes (limit {})",
-                    self.d.node_count(),
-                    self.max_nodes
+                    "the trace grew the graph by {} nodes (limit {}; {} in the arena)",
+                    self.d.node_count().saturating_sub(self.trace_start_nodes),
+                    self.max_nodes,
+                    self.d.node_count()
                 );
             }
             if live.iter().all(|(_, f)| !f.is_normal()) {

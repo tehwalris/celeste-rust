@@ -192,6 +192,7 @@ pub fn trace_frame<'a>(
     // dispatch), and guarded on them in `ok` like a pin.
     bounds: &[(Path, (i32, i32))],
 ) -> Result<Frame> {
+    it.trace_start_nodes = it.d.node_count();
     let mut st = st;
     // Key overrides are per FRAME too: a shape's representative is an
     // OUTPUT state of an earlier trace and still carries that trace's

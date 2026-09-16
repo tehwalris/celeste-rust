@@ -217,7 +217,7 @@ pub fn key_frame(
     let st = lw.reps[&skey].clone();
     let opts = lw.opts;
     let roots = shapes::state_paths(&st)?;
-    let ival = if opts.ival { shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival()) } else { Vec::new() };
+    let ival = if opts.ival { with_extra(shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival()), lw.ival_extra.get(&skey)) } else { Vec::new() };
     let mut pin: Vec<(iface::Path, Conc)> = lw.lattice[&skey]
         .iter()
         .filter(|(p, _)| roots.iter().any(|r| r == *p))
@@ -1967,6 +1967,7 @@ pub fn room_constant_lattice(
     let mut frames: std::collections::BTreeMap<String, super::verify::Frame> = Default::default();
     let mut forkops: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let mut refused: std::collections::BTreeMap<String, String> = Default::default();
+    let mut ival_extra: std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>> = Default::default();
 
     let sk = key(&start)?;
     let start_key = sk.clone();
@@ -1981,7 +1982,7 @@ pub fn room_constant_lattice(
         if guard > 20000 { bail!("constant-lattice fixpoint did not converge"); }
         let st = reps[&k].clone();
         let roots = shapes::state_paths(&st)?;
-        let ival = if opts.ival { shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival()) } else { Vec::new() };
+        let ival = if opts.ival { with_extra(shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival()), ival_extra.get(&k)) } else { Vec::new() };
         // Pin the shape's known constants (only those that are real scalar
         // inputs here), everything else abstract.
         let pin: Vec<(super::iface::Path, super::iface::Conc)> = lattice[&k]
@@ -2047,6 +2048,23 @@ pub fn room_constant_lattice(
             }
             let tk = key(&o.st)?;
             let fc = shapes::field_constants(&o.st, &it.d, opts.spd_ival(), opts.pos_ival())?;
+            // The slots this outcome wrote an interval to, outside the
+            // boundary's own widenings: the next frame reads them as
+            // interval inputs.
+            let widened = shapes::ival_paths(&o.st, opts.spd_ival(), opts.pos_ival());
+            let mut new_ival = false;
+            if opts.ival {
+                for p in shapes::state_paths(&o.st)? {
+                    if widened.contains(&p) {
+                        continue;
+                    }
+                    if let Some(super::heap::Value::Num(n)) = super::iface::get(&o.st, &p) {
+                        if it.d.is_interval(&n) {
+                            new_ival |= ival_extra.entry(tk.clone()).or_default().insert(p);
+                        }
+                    }
+                }
+            }
             if lattice_trace {
                 let known = lattice.get(&tk).map(|m| m.iter().filter(|(p, v)| fc.get(*p) != Some(*v)).map(|(p, _)| super::iface::show(p)).collect::<Vec<_>>());
                 match known {
@@ -2068,7 +2086,7 @@ pub fn room_constant_lattice(
                     m.len() != before
                 }
             };
-            if changed && !work.contains(&tk) { work.push(tk); }
+            if (changed || new_ival) && !work.contains(&tk) { work.push(tk); }
         }
         frames.insert(k.clone(), f);
     }
@@ -2100,7 +2118,18 @@ pub fn room_constant_lattice(
     for (k, f) in &frames {
         by_hash.insert(f.in_rt2.shape_hash_of(), k.clone());
     }
-    Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops, tracer: Tracer { it, reset, fr }, by_hash, opts, start_key })
+    Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops, tracer: Tracer { it, reset, fr }, by_hash, opts, start_key, ival_extra })
+}
+
+/// `ival_paths` plus a shape's discovered interval slots (`LatticeWalk::
+/// ival_extra`), each once.
+fn with_extra(mut ival: Vec<super::iface::Path>, extra: Option<&std::collections::BTreeSet<super::iface::Path>>) -> Vec<super::iface::Path> {
+    for p in extra.into_iter().flatten() {
+        if !ival.contains(p) {
+            ival.push(p.clone());
+        }
+    }
+    ival
 }
 
 /// The tracer a walk ran in, kept so a shape can be re-traced later in
@@ -2127,6 +2156,12 @@ pub struct LatticeWalk {
     pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
     pub forkops: std::collections::BTreeMap<String, Vec<String>>,
+    /// Per shape, the input slots a reachable frame WROTE an interval to,
+    /// beyond `shapes::ival_paths` (the boundary's widenings): a value from
+    /// `rnd` (the chest's shake), or computed from one. Typed as interval
+    /// inputs, since a number input reading an interval panicked (room
+    /// (4,0) f62, the chest's `x`). Monotone like the constants.
+    pub ival_extra: std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>>,
 }
 
 /// Report the constant lattice for `transpile --room-consts`.

@@ -436,6 +436,13 @@ horizon and level, ending in `OPTIMAL win frame: 33`; the same
 fingerprints under `CELESTE_BACKWARD=kernel`, whose lines end in
 "re-runs" instead of "edges read").
 
+Re-pinned 2026-09-16 (`4e2d2e9`) when `rnd` became a builtin global. That
+added one global to every state, so row keys, and with them the ckhash and
+marks FINGERPRINTS, moved. The sets did not: posgraph f044 is identical,
+every per-frame kept count f0-f44 is identical, every marked count, first
+win and the `OPTIMAL` line are identical. Re-pin only on evidence like that,
+and say so in the commit.
+
 `crates/celeste-names/src/gen.rs` is FROZEN, not generated. Its generator
 (`transpile::names`) walked the rewritten IR and was deleted with the walk
 kernels; `FIELD_NAMES`' ORDER is the canonical field ordering the boundary
