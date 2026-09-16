@@ -69,6 +69,9 @@ fn joinable<D: Domain>(a: &Value<D>, b: &Value<D>) -> bool {
 pub type Multi<D, T> = Vec<(State<D>, T)>;
 pub type Outcome<D> = Multi<D, Flow<D>>;
 
+/// Cloneable so key-set workers can each trace from a copy of one walked
+/// tracer (its arena holds the shapes' representative states).
+#[derive(Clone)]
 pub struct Interp<'a, D: Domain> {
     pub d: D,
     /// Function bodies, referred to by id from closures - the AST outlives

@@ -95,13 +95,9 @@ pub(crate) fn lattice_kernel_refs(
     // The frames to lower: per shape for an exact-speed set; per
     // (shape, speed key) - the key fixpoint - for a bucketed one, whose
     // kernels are specialized on the key (`key_frame`).
-    let frames: Vec<(Option<SpeedKey>, super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>)> = match opts.spd {
-        crate::interpreter::abstraction::SpdPrecision::WidthLog2(w) => {
-            key_fixpoint(&mut lw, w)?.into_iter().map(|n| (n.key, n.frame, n.bounds)).collect()
-        }
-        crate::interpreter::abstraction::SpdPrecision::Exact => {
-            std::mem::take(&mut lw.frames).into_values().map(|f| (None, f, Vec::new())).collect()
-        }
+    let frames: Vec<(Option<SpeedKey>, super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>)> = match opts.spd.width_log2() {
+        Some(w) => key_fixpoint(&mut lw, w)?.into_iter().map(|n| (n.key, n.frame, n.bounds)).collect(),
+        None => std::mem::take(&mut lw.frames).into_values().map(|f| (None, f, Vec::new())).collect(),
     };
     // Bind + lower (specialize + decide, the expensive half of a kernel
     // build) per frame, frames in parallel.
@@ -228,8 +224,10 @@ pub fn key_frame(
         (Some(sk), Some(pl)) => {
             use celeste_core::pico8_num::Pico8Num as P8;
             let [px, py, pdt, ptx, pty, pax, pay] = key_paths(&pl);
-            // The range lattice's hull for this key, within its bucket.
-            for (axis, (p, b)) in [(px, sk.bx), (py, sk.by)].into_iter().enumerate() {
+            // The key's WHOLE bucket on each bucketed axis (an x-only level
+            // bounds only x: y is exact and not part of the key).
+            let axes: Vec<(iface::Path, u16)> = if opts.spd.buckets_y() { vec![(px, sk.bx), (py, sk.by)] } else { vec![(px, sk.bx)] };
+            for (axis, (p, b)) in axes.into_iter().enumerate() {
                 let (blo, bhi) = celeste_core::spd_buckets::range(b, w, axis);
                 let (lo, hi) = spd_range[axis];
                 anyhow::ensure!(
@@ -273,7 +271,7 @@ pub fn key_frame(
 
 /// The speed key of a state whose dispatch fields are CONSTANTS (the
 /// start state), or `None` for a state without a player.
-fn concrete_key(st: &super::state::State<super::domain::Symbolic>, d: &super::domain::Symbolic, w: u8) -> Result<(Option<SpeedKey>, [(i64, i64); 2])> {
+fn concrete_key(st: &super::state::State<super::domain::Symbolic>, d: &super::domain::Symbolic, w: u8, buckets_y: bool) -> Result<(Option<SpeedKey>, [(i64, i64); 2])> {
     use super::domain::Domain;
     use super::{iface, shapes};
     let Some(pl) = shapes::player_path(st) else { return Ok((None, [(0, 0), (0, 0)])) };
@@ -289,7 +287,7 @@ fn concrete_key(st: &super::state::State<super::domain::Symbolic>, d: &super::do
     Ok((
         Some(SpeedKey {
             bx: celeste_core::spd_buckets::index(v[0], w, 0),
-            by: celeste_core::spd_buckets::index(v[1], w, 1),
+            by: if buckets_y { celeste_core::spd_buckets::index(v[1], w, 1) } else { 0 },
             dashing,
             dash,
         }),
@@ -306,16 +304,20 @@ fn concrete_key(st: &super::state::State<super::domain::Symbolic>, d: &super::do
 /// pieces touch, the constant `dash_time`, the constant target and accel
 /// where mid-dash.
 /// A successor: its shape, key, and the hull of the speeds that reach it,
-/// per axis (within the key's bucket) - the RANGE LATTICE: a kernel is
-/// traced with the join of these over every predecessor rather than the
-/// whole bucket, so a dash's exact speeds stay points instead of
-/// spreading bucket-wide across the four dash frames (15,000 keys, 2026-09-15).
+/// per axis (within the key's bucket). `key_fixpoint` traces every key on
+/// its WHOLE buckets instead (2026-09-16), so a node is traced once: the
+/// range lattice (the join of these over every predecessor) re-traced
+/// 42% of room (2,0)'s nodes and never finished in minutes, while x-only
+/// whole buckets converged at 430 nodes with no re-trace. (The lattice was
+/// introduced when both axes bucketed with no dash-constant reader spread
+/// to 15,000 keys, 2026-09-15.)
 type Successor = (u64, Option<SpeedKey>, [(i64, i64); 2]);
 
 fn successor_keys(
     d: &mut super::domain::Symbolic,
     f: &super::verify::Frame,
     w: u8,
+    buckets_y: bool,
 ) -> Result<Vec<Successor>> {
     use super::{iface, shapes};
     use crate::transpile::graph::{Op, NodeId};
@@ -623,7 +625,13 @@ fn successor_keys(
                 bs
             };
             let sx = pieces(sig[0]).ok_or_else(|| anyhow::anyhow!("outcome {shape:#x}: no static range for the output spd.x"))?;
-            let sy = pieces(sig[1]).ok_or_else(|| anyhow::anyhow!("outcome {shape:#x}: no static range for the output spd.y"))?;
+            // On an x-only level `spd.y` is exact and not in the key: it has
+            // no bucket bounds, so no static range is needed or asked for.
+            let sy = if !buckets_y {
+                Vec::new()
+            } else {
+                pieces(sig[1]).ok_or_else(|| anyhow::anyhow!("outcome {shape:#x}: no static range for the output spd.y"))?
+            };
             let dts = pieces(sig[2]).ok_or_else(|| anyhow::anyhow!("outcome {shape:#x}: no static range for the output dash_time"))?;
             let points = |ps: &[(i64, i64)], what: &str| -> Result<Vec<i32>> {
                 let mut v = Vec::new();
@@ -633,7 +641,13 @@ fn successor_keys(
                 }
                 Ok(v)
             };
-            let (bxs, bys) = (buckets(0, &sx), buckets(1, &sy));
+            let bxs = buckets(0, &sx);
+            // On an x-only level y is exact: one key value, no range.
+            let bys = if !buckets_y {
+                vec![(0u16, (0i64, 0i64))]
+            } else {
+                buckets(1, &sy)
+            };
             if std::env::var_os("CELESTE_KEY_TRACE").is_some() {
                 let show = |ps: &[(i64, i64)]| ps.iter().map(|(a, b)| if a == b { format!("{:.3}", *a as f64 / 65536.0) } else { format!("[{:.3},{:.3}]", *a as f64 / 65536.0, *b as f64 / 65536.0) }).collect::<Vec<_>>().join("|");
                 let mut fields = vec![show(&sx), show(&sy), show(&dts)];
@@ -946,13 +960,10 @@ fn census_of(spec: &(crate::transpile::graph::Graph, Vec<crate::transpile::lower
 /// `body_breakdown`, after the exact-speed kernel of the same shape. The
 /// dev loop for a kernel's size: two shape lattices (~1 s) and one trace
 /// + lowering (~3 s) per node, not the fixpoint.
-pub fn key_probe(root: &std::path::Path, dump: &std::path::Path, sel: &[usize]) -> Result<String> {
+pub fn key_probe(root: &std::path::Path, dump: &std::path::Path, sel: &[usize], spd: crate::interpreter::abstraction::SpdPrecision) -> Result<String> {
     use std::fmt::Write as _;
-    const W: u8 = 16;
-    let opts = super::shapes::WalkOpts::level0(
-        crate::interpreter::abstraction::SpdPrecision::WidthLog2(W),
-        crate::interpreter::abstraction::PosPrecision::EXACT,
-    );
+    let w = spd.width_log2().ok_or_else(|| anyhow::anyhow!("the key probe needs a bucketed speed precision, not {spd:?}"))?;
+    let opts = super::shapes::WalkOpts::level0(spd, crate::interpreter::abstraction::PosPrecision::EXACT);
     let text = std::fs::read_to_string(dump).map_err(|e| anyhow::anyhow!("{}: {e}", dump.display()))?;
     let lines: Vec<&str> = text.lines().collect();
     let mut lw = room_constant_lattice(root, opts)?;
@@ -975,7 +986,7 @@ pub fn key_probe(root: &std::path::Path, dump: &std::path::Path, sel: &[usize]) 
         }
         writeln!(out, "=== node {i}: {key:?}, range x [{:.4}, {:.4}] y [{:.4}, {:.4}]", range[0].0 as f64 / 65536.0, range[0].1 as f64 / 65536.0, range[1].0 as f64 / 65536.0, range[1].1 as f64 / 65536.0)?;
         let t = std::time::Instant::now();
-        let (f, bounds) = key_frame(&mut lw, shape, key, W, range)?;
+        let (f, bounds) = key_frame(&mut lw, shape, key, w, range)?;
         let t_trace = t.elapsed();
         let bound = super::emit::bind(&f, &lw.tracer.it.d.graph, opts.widen)?;
         let t = std::time::Instant::now();
@@ -1005,12 +1016,10 @@ pub fn key_build(root: &std::path::Path) -> Result<String> {
 /// room's level-0 bucketed set on its own - the census and timings, the
 /// node set written to FILE (the input of `--key-probe`), and (with `N`)
 /// the lowering of the first N nodes as a microbenchmark.
-pub fn key_census(root: &std::path::Path, lower: usize, dump: Option<&std::path::Path>, w: u8) -> Result<String> {
+pub fn key_census(root: &std::path::Path, lower: usize, dump: Option<&std::path::Path>, spd: crate::interpreter::abstraction::SpdPrecision) -> Result<String> {
     use std::fmt::Write as _;
-    let opts = super::shapes::WalkOpts::level0(
-        crate::interpreter::abstraction::SpdPrecision::WidthLog2(w),
-        crate::interpreter::abstraction::PosPrecision::EXACT,
-    );
+    let w = spd.width_log2().ok_or_else(|| anyhow::anyhow!("the key census needs a bucketed speed precision, not {spd:?}"))?;
+    let opts = super::shapes::WalkOpts::level0(spd, crate::interpreter::abstraction::PosPrecision::EXACT);
     let t = std::time::Instant::now();
     let mut lw = room_constant_lattice(root, opts)?;
     let t_lattice = t.elapsed();
@@ -1059,11 +1068,29 @@ pub fn key_fixpoint(lw: &mut LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
     let t = std::time::Instant::now();
     let (mut t_trace, mut t_succ) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     let start_shape = lw.frames[&lw.start_key].in_rt2.shape_hash_of();
-    let (start_key, start_range) = concrete_key(&lw.reps[&lw.start_key], &lw.tracer.it.d, w)?;
+    let buckets_y = lw.opts.spd.buckets_y();
+    let (start_key, start_range) = concrete_key(&lw.reps[&lw.start_key], &lw.tracer.it.d, w, buckets_y)?;
+    // A key's whole buckets, per bucketed axis; an unbucketed y keeps what
+    // it was given (exact speeds are not bounded by the key).
+    let whole = |key: Option<SpeedKey>, given: [(i64, i64); 2]| -> [(i64, i64); 2] {
+        match key {
+            Some(k) => {
+                let (xlo, xhi) = celeste_core::spd_buckets::range(k.bx, w, 0);
+                let y = if buckets_y {
+                    let (ylo, yhi) = celeste_core::spd_buckets::range(k.by, w, 1);
+                    (ylo as i64, yhi as i64)
+                } else {
+                    given[1]
+                };
+                [(xlo as i64, xhi as i64), y]
+            }
+            None => given,
+        }
+    };
+    let start_range = whole(start_key, start_range);
     type Node = (u64, Option<SpeedKey>);
-    // Per node: the join of the speed ranges reaching it (within its
-    // bucket). A node is (re)traced when its range is new or grew; the
-    // last trace, under the final range, is the one lowered.
+    // Per node: its key's whole buckets. A node is traced once, when it is
+    // first reached.
     let mut ranges: std::collections::HashMap<Node, [(i64, i64); 2]> = Default::default();
     let mut traced: std::collections::HashMap<Node, (super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>)> = Default::default();
     let mut queued: std::collections::HashSet<Node> = Default::default();
@@ -1097,11 +1124,25 @@ pub fn key_fixpoint(lw: &mut LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
         t_trace += t1.elapsed();
         w_trace += t1.elapsed();
         n_traces += 1;
-        if traced.contains_key(&node) {
+        let retrace = traced.contains_key(&node);
+        if retrace {
             n_retraces += 1;
         }
+        // Per trace, what it cost: a blow-up then names the keys whose
+        // traces grow before one refuses (room (2,0) refused key bx 18 after
+        // 23 min, 2026-09-16).
+        if std::env::var_os("CELESTE_KEY_TRACE").is_some() {
+            use super::domain::Domain;
+            let t = &lw.tracer.it;
+            eprintln!(
+                "[keytrace] trace {n_traces}{}: shape {shape:#x} key {key:?} range {range:?}: {} nodes added, {:.0} ms",
+                if retrace { " (re-trace)" } else { "" },
+                t.d.node_count().saturating_sub(t.trace_start_nodes),
+                t1.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let t1 = std::time::Instant::now();
-        let succs = successor_keys(&mut lw.tracer.it.d, &f, w)?;
+        let succs = successor_keys(&mut lw.tracer.it.d, &f, w, buckets_y)?;
         t_succ += t1.elapsed();
         w_succ += t1.elapsed();
         for (s_shape, s_key, s_range) in succs {
@@ -1112,6 +1153,9 @@ pub fn key_fixpoint(lw: &mut LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
                 continue;
             }
             let succ = (s_shape, s_key);
+            // A node's range is its key's whole buckets: it never grows, so
+            // every node is traced once.
+            let s_range = whole(s_key, s_range);
             let grew = match ranges.get_mut(&succ) {
                 None => {
                     ranges.insert(succ, s_range);
@@ -2141,6 +2185,7 @@ fn with_extra(mut ival: Vec<super::iface::Path>, extra: Option<&std::collections
 
 /// The tracer a walk ran in, kept so a shape can be re-traced later in
 /// the same arena (the walk's states are graph nodes of it).
+#[derive(Clone)]
 pub struct Tracer {
     pub it: super::interp::Interp<'static, super::domain::Symbolic>,
     pub reset: &'static full_moon::ast::Ast,

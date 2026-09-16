@@ -771,7 +771,7 @@ impl Rt2 {
     /// players' `spd.x`/`spd.y` to, `None` for exact speed - the level's
     /// `abstraction::spd_precision_for`, which the caller passes because
     /// the switch lives above this crate.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<u8>, pos: (u8, u8)) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8)) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 0. position widening (the rung below level 0): the player's
@@ -879,10 +879,14 @@ impl Rt2 {
 
         // 2. spd widening (the spd ladder, `abstraction::spd_precision_for`):
         // floor-aligned buckets of 2^w raw units (`make_state_abstract_spd`).
-        if let Some(w) = spd_width_log2 {
+        if let Some((w, buckets_y)) = spd_width_log2 {
             // The bucket is the edge table's (`celeste_core::spd_buckets`),
-            // per axis: the cells come as [x, y].
+            // per axis: the cells come as [x, y]. An x-only level
+            // (`buckets_y` false) leaves spd.y exact.
             for (axis, c) in self.spd_cells(ids).into_iter().enumerate() {
+                if axis == 1 && !buckets_y {
+                    continue;
+                }
                 let sbucket = |n: P8| -> (P8, P8) {
                     let (lo, hi) = celeste_core::spd_buckets::bucket(n.to_bits().cast_signed(), w, axis);
                     (P8::from_raw(lo), P8::from_raw(hi))

@@ -1310,10 +1310,12 @@ pub fn widened_keys(
 }
 
 /// The speed bucket (log2 raw units) a level widens to, `None` for exact.
-pub fn spd_width_log2(spd: crate::interpreter::abstraction::SpdPrecision) -> Option<u8> {
-    match spd {
-        crate::interpreter::abstraction::SpdPrecision::WidthLog2(w) => Some(w),
-        crate::interpreter::abstraction::SpdPrecision::Exact => None,
+/// The speed table width a level buckets at, and whether it buckets y as
+/// well as x (`Rt2::widen_to`'s speed step).
+pub fn spd_width_log2(spd: crate::interpreter::abstraction::SpdPrecision) -> Option<(u8, bool)> {
+    match spd.width_log2() {
+        Some(w) => Some((w, spd.buckets_y())),
+        None => None,
     }
 }
 
@@ -1906,10 +1908,7 @@ impl ForwardState {
             })
             .collect();
         let next = AtomicUsize::new(0);
-        let hulled = matches!(
-            crate::interpreter::abstraction::spd_precision(),
-            crate::interpreter::abstraction::SpdPrecision::WidthLog2(_)
-        );
+        let hulled = crate::interpreter::abstraction::spd_precision().width_log2().is_some();
         let partial: Vec<(rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>>, Option<u32>)> =
             std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..threads())

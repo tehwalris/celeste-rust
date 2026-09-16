@@ -230,30 +230,53 @@ pub fn rem_precision_from_env() -> RemPrecision {
 ///   assumption about which speeds occur. Power-of-two floor-aligned
 ///   buckets NEST, so a coarser level over-approximates a finer one and
 ///   band coarsening can never straddle.
+/// * `WidthLog2X(w)` - bucket `player.spd.x` the same way and keep
+///   `spd.y` EXACT (2026-09-16, Philippe). Room (2,0)'s dense speeds come
+///   from the spring's `spd.x *= 0.2` on x alone; bucketing y too only
+///   multiplied the kernel keys (3,202 against 430 with whole buckets).
+///   Spec `s<w>x`.
 /// * `Exact` - no spd widening (today's semantics; the env default).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SpdPrecision {
     WidthLog2(u8),
+    WidthLog2X(u8),
     Exact,
 }
 
 impl SpdPrecision {
     /// Does `self` widen spd AT LEAST as much as `finer`? Buckets are
     /// floor-aligned at width 2^w on the raw 16.16 value, so they nest for
-    /// w >= w', and `Exact` nests inside every `WidthLog2`.
+    /// w >= w', and `Exact` nests inside every bucketed precision. An exact
+    /// y is finer than a bucketed one, so `WidthLog2X` is never coarser than
+    /// `WidthLog2`.
     pub fn coarser_or_equal(self, finer: SpdPrecision) -> bool {
         match (self, finer) {
             (SpdPrecision::Exact, _) => finer == SpdPrecision::Exact,
-            (SpdPrecision::WidthLog2(_), SpdPrecision::Exact) => true,
-            (SpdPrecision::WidthLog2(a), SpdPrecision::WidthLog2(b)) => a >= b,
+            (SpdPrecision::WidthLog2(_) | SpdPrecision::WidthLog2X(_), SpdPrecision::Exact) => true,
+            (SpdPrecision::WidthLog2(a), SpdPrecision::WidthLog2(b) | SpdPrecision::WidthLog2X(b)) => a >= b,
+            (SpdPrecision::WidthLog2X(a), SpdPrecision::WidthLog2X(b)) => a >= b,
+            (SpdPrecision::WidthLog2X(_), SpdPrecision::WidthLog2(_)) => false,
         }
+    }
+
+    /// The speed table's grid width, if the level buckets speed at all.
+    pub fn width_log2(self) -> Option<u8> {
+        match self {
+            SpdPrecision::WidthLog2(w) | SpdPrecision::WidthLog2X(w) => Some(w),
+            SpdPrecision::Exact => None,
+        }
+    }
+
+    /// Does the level bucket `spd.y` as well as `spd.x`?
+    pub fn buckets_y(self) -> bool {
+        matches!(self, SpdPrecision::WidthLog2(_))
     }
 
     /// Every spd level this build can be configured for, coarsest first.
     pub fn all() -> impl Iterator<Item = SpdPrecision> {
         (1..=20u8)
             .rev()
-            .map(SpdPrecision::WidthLog2)
+            .flat_map(|w| [SpdPrecision::WidthLog2(w), SpdPrecision::WidthLog2X(w)])
             .chain(std::iter::once(SpdPrecision::Exact))
     }
 }
@@ -376,8 +399,8 @@ impl Level {
         }
         match (self.rem, self.spd) {
             (_, SpdPrecision::Exact) => true,
-            (RemPrecision::Bits(k), SpdPrecision::WidthLog2(w)) => k < 16 && w >= 16 - k && w >= SPD_MIN_WIDTH_LOG2,
-            (RemPrecision::Exact, SpdPrecision::WidthLog2(_)) => false,
+            (RemPrecision::Bits(k), SpdPrecision::WidthLog2(w) | SpdPrecision::WidthLog2X(w)) => k < 16 && w >= 16 - k && w >= SPD_MIN_WIDTH_LOG2,
+            (RemPrecision::Exact, SpdPrecision::WidthLog2(_) | SpdPrecision::WidthLog2X(_)) => false,
         }
     }
 
@@ -425,11 +448,20 @@ impl Level {
         let spd = match sp {
             "x" => SpdPrecision::Exact,
             w => {
-                let w: u8 = w.parse().map_err(|e| format!("level {spec:?}: spd width: {e}"))?;
+                // `s<w>x`: only spd.x bucketed, spd.y exact.
+                let (digits, x_only) = match w.strip_suffix('x') {
+                    Some(d) => (d, true),
+                    None => (w, false),
+                };
+                let w: u8 = digits.parse().map_err(|e| format!("level {spec:?}: spd width: {e}"))?;
                 if !(SPD_MIN_WIDTH_LOG2..=20).contains(&w) {
                     return Err(format!("level {spec:?}: spd width log2 {w} outside {SPD_MIN_WIDTH_LOG2}..=20 (finer overflows the bucket node)"));
                 }
-                SpdPrecision::WidthLog2(w)
+                if x_only {
+                    SpdPrecision::WidthLog2X(w)
+                } else {
+                    SpdPrecision::WidthLog2(w)
+                }
             }
         };
         Ok(Level { pos, rem, spd })
@@ -478,6 +510,7 @@ impl std::fmt::Display for Level {
         match self.spd {
             SpdPrecision::Exact => write!(f, "{:?}", self.rem)?,
             SpdPrecision::WidthLog2(w) => write!(f, "{:?}/W{w}", self.rem)?,
+            SpdPrecision::WidthLog2X(w) => write!(f, "{:?}/W{w}x", self.rem)?,
         }
         if !self.pos.is_exact() {
             write!(f, "/P{}x{}", self.pos.x, self.pos.y)?;
@@ -505,10 +538,14 @@ static SPD_PRECISION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8:
 const SPD_UNSET: u8 = 0xFF;
 const SPD_EXACT: u8 = 0xFE;
 
+/// `WidthLog2X(w)` stores `w | SPD_X_ONLY` (w <= 20, so the bit is free).
+const SPD_X_ONLY: u8 = 0x40;
+
 fn encode_spd(p: SpdPrecision) -> u8 {
     match p {
         SpdPrecision::Exact => SPD_EXACT,
         SpdPrecision::WidthLog2(w) => w,
+        SpdPrecision::WidthLog2X(w) => w | SPD_X_ONLY,
     }
 }
 
@@ -518,6 +555,7 @@ pub fn spd_precision() -> SpdPrecision {
     match SPD_PRECISION.load(std::sync::atomic::Ordering::Relaxed) {
         SPD_UNSET => spd_precision_for(rem_precision_from_env()),
         SPD_EXACT => SpdPrecision::Exact,
+        w if w & SPD_X_ONLY != 0 => SpdPrecision::WidthLog2X(w & !SPD_X_ONLY),
         w => SpdPrecision::WidthLog2(w),
     }
 }
@@ -735,7 +773,8 @@ pub fn split_rem_straddles(state: State) -> Vec<State> {
 /// intervals in a way the design did not price, and that should FAIL,
 /// not widen silently.
 pub fn split_spd_straddles(state: State) -> Vec<State> {
-    let SpdPrecision::WidthLog2(w) = spd_precision() else {
+    // A number lies in one bucket, so an exact y (`WidthLog2X`) never splits.
+    let Some(w) = spd_precision().width_log2() else {
         return vec![state];
     };
     split_marked_straddles(state, "player_spd_xy", 1i32 << w, 8)
@@ -866,68 +905,7 @@ fn split_marked_straddles(state: State, mark: &str, width: i32, max_span: i32) -
 /// so this is the identity - kept as the boundary's named step, and as
 /// the place the sanity range check lives.
 pub fn make_state_abstract_spd(state: State, precision: SpdPrecision) -> State {
-    let SpdPrecision::WidthLog2(w) = precision else {
-        return state;
-    };
-    let _ = w;
-    state
-}
-
-#[allow(dead_code)]
-fn make_state_abstract_spd_full_bucket(mut state: State, precision: SpdPrecision) -> State {
-    let SpdPrecision::WidthLog2(w) = precision else {
-        return state;
-    };
-    let width: i32 = 1i32 << w;
-    let sane = Pico8NumInterval::new(Pico8Num::from_parts(-16, 0), Pico8Num::from_parts(16, 0));
-    let bucket = |raw_low: i32| -> Pico8NumInterval {
-        let from_raw = |r: i32| Pico8Num::from_parts((r >> 16) as i16, r as u16);
-        Pico8NumInterval::new(from_raw(raw_low), from_raw(raw_low + width - 1))
-    };
-    let floor_of = |n: Pico8Num| (n.as_raw_u32() as i32).div_euclid(width) * width;
-    let widen_number = |n: Pico8Num| -> Pico8NumInterval {
-        assert!(
-            sane.contains_number(n),
-            "player spd {:?} outside +/-16 px/frame",
-            n
-        );
-        bucket(floor_of(n))
-    };
-    let widen_interval = |iv: &Pico8NumInterval| -> Pico8NumInterval {
-        assert!(
-            sane.contains_interval(iv),
-            "player spd interval {:?} outside +/-16 px/frame",
-            iv
-        );
-        Pico8NumInterval::new(bucket(floor_of(iv.low)).low, bucket(floor_of(iv.high)).high)
-    };
-
-    let marks = mark_heap(&state);
-    if let Some(heap_ids) = marks.marks.get("player_spd_xy") {
-        for &heap_id in heap_ids {
-            if let HeapValue::Value(value) = state.heap.get(heap_id) {
-                let new_value = match value {
-                    Value::Number(MaybeVector::Scalar(n)) => {
-                        Value::NumberInterval(MaybeVector::Scalar(widen_number(*n)))
-                    }
-                    Value::Number(MaybeVector::Vector(nums)) => Value::NumberInterval(
-                        MaybeVector::vector(nums.iter().map(|n| widen_number(*n)).collect()),
-                    ),
-                    Value::NumberInterval(MaybeVector::Scalar(interval)) => {
-                        Value::NumberInterval(MaybeVector::Scalar(widen_interval(interval)))
-                    }
-                    Value::NumberInterval(MaybeVector::Vector(intervals)) => Value::NumberInterval(
-                        MaybeVector::vector(intervals.iter().map(widen_interval).collect()),
-                    ),
-                    other => panic!(
-                        "Unexpected value type for player_spd at {:?}: {:?}",
-                        heap_id, other
-                    ),
-                };
-                state.heap.set(heap_id, HeapValue::Value(new_value));
-            }
-        }
-    }
+    let _ = precision;
     state
 }
 
@@ -1500,6 +1478,18 @@ mod tests {
         assert!(Level::parse_ladder("r0sx,r0s16,rxsx").is_err(), "spd may not get coarser");
         assert!(Level::parse_ladder("r0s16,r1s15").is_err(), "must end exact");
         assert!(Level::parse_ladder("r0s16,r1s16,rxsx").is_ok(), "a spd bucket of several rem grid cells");
+        // x-only buckets: `s<w>x`, never coarser than both axes bucketed.
+        let xo = Level::parse("r0s20x").unwrap();
+        assert_eq!(xo.spd, SpdPrecision::WidthLog2X(20));
+        assert_eq!(xo.to_string(), "Bits(0)/W20x");
+        assert!(xo.spd.coarser_or_equal(SpdPrecision::WidthLog2X(16)));
+        assert!(SpdPrecision::WidthLog2(20).coarser_or_equal(xo.spd));
+        assert!(!xo.spd.coarser_or_equal(SpdPrecision::WidthLog2(20)), "an exact y is finer than a bucketed one");
+        assert_eq!((xo.spd.width_log2(), xo.spd.buckets_y()), (Some(20), false));
+        assert!(Level::parse_ladder("r0s20x,r0sx,r1sx,rxsx").is_ok());
+        assert!(Level::parse_ladder("r0s20x,r0s20,rxsx").is_err(), "both axes bucketed is coarser, not finer");
+        crate::interpreter::abstraction::set_spd_precision(SpdPrecision::WidthLog2X(20));
+        assert_eq!(spd_precision(), SpdPrecision::WidthLog2X(20), "the process-global encoding round-trips");
         assert!(Level::parse_ladder("r0s16,r1s14,rxsx").is_err(), "spd bucket finer than the rem grid");
         assert!(Level::parse_ladder("r0s16,r0s15,rxsx").is_err(), "speed cannot refine on its own");
         assert!(Level::parse_ladder("r0s16,r15s1,rxsx").is_err(), "W1 overflows the bucket node");

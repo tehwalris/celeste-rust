@@ -365,12 +365,13 @@ fn widen_spd(
     d: &mut Symbolic,
     precision: crate::interpreter::abstraction::SpdPrecision,
 ) -> Result<()> {
-    use crate::interpreter::abstraction::SpdPrecision;
-    let SpdPrecision::WidthLog2(w) = precision else {
+    let Some(w) = precision.width_log2() else {
         return Ok(());
     };
+    // `WidthLog2X`: only spd.x is bucketed; spd.y stays exact.
+    let axes: &[&str] = if precision.buckets_y() { &["x", "y"] } else { &["x"] };
     for obj in objects_of_type(st, "player") {
-        for f in ["x", "y"] {
+        for &f in axes {
             let p = field(&obj, &["spd", f]);
             let Some(Value::Num(old)) = iface::get(st, &p) else {
                 bail!("{}: spd is not a number", iface::show(&p));

@@ -388,10 +388,7 @@ impl Door {
 
     /// The door of the process's current level (`abstraction::spd_precision`).
     pub fn for_current_level() -> Self {
-        Self::new(matches!(
-            crate::interpreter::abstraction::spd_precision(),
-            crate::interpreter::abstraction::SpdPrecision::WidthLog2(_)
-        ))
+        Self::new(crate::interpreter::abstraction::spd_precision().width_log2().is_some())
     }
 
     /// A door already holding `entries` (each shard's entries, in any

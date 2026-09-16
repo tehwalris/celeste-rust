@@ -217,7 +217,7 @@ pub fn trace_frame<'a>(
     // `Domain::move_ways`), two otherwise.
     it.d.move_ways = match widen {
         Some(super::widen::WidenMode::Level0(spd, _)) | Some(super::widen::WidenMode::RemRung(_, spd))
-            if matches!(spd, crate::interpreter::abstraction::SpdPrecision::WidthLog2(_)) =>
+            if spd.width_log2().is_some() =>
         {
             3
         }

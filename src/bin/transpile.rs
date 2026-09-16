@@ -8,6 +8,14 @@
 
 use anyhow::{anyhow, Context, Result};
 
+/// A speed precision argument as a level spec's `s<S>` (`20` both axes,
+/// `20x` x only), through the level parser; 16 when absent.
+fn spd_arg(s: Option<String>) -> Result<celeste_rust::interpreter::abstraction::SpdPrecision> {
+    let s = s.unwrap_or_else(|| "16".to_string());
+    let level = celeste_rust::interpreter::abstraction::Level::parse(&format!("r0s{s}")).map_err(|e| anyhow!("speed precision {s:?}: {e}"))?;
+    Ok(level.spd)
+}
+
 fn main() -> Result<()> {
     let mut spec_probe: Option<usize> = None;
     let mut args = std::env::args().skip(1);
@@ -31,28 +39,32 @@ fn main() -> Result<()> {
                 print!("{}", celeste_rust::trace::kernel::key_build(std::path::Path::new("."))?);
                 return Ok(());
             }
-            // --key-census [N [FILE]]: the key fixpoint on its own; lower
-            // the first N nodes; write the node set to FILE.
+            // --key-census [N [FILE [S]]]: the key fixpoint on its own; lower
+            // the first N nodes; write the node set to FILE. S is the speed
+            // precision as in a level spec's `s<S>`: `20` both axes, `20x`
+            // x only (default 16).
             "--key-census" => {
                 let lower: usize = args.next().map(|s| s.parse().context("--key-census N")).transpose()?.unwrap_or(0);
                 let dump = args.next().map(std::path::PathBuf::from);
-                let w: u8 = args.next().map(|s| s.parse().context("--key-census N FILE W")).transpose()?.unwrap_or(16);
-                let report = celeste_rust::trace::kernel::key_census(std::path::Path::new("."), lower, dump.as_deref(), w)?;
+                let spd = spd_arg(args.next())?;
+                let report = celeste_rust::trace::kernel::key_census(std::path::Path::new("."), lower, dump.as_deref(), spd)?;
                 print!("{}", report);
                 return Ok(());
             }
-            // --key-probe FILE SEL: trace and lower the nodes of a
+            // --key-probe FILE SEL [S]: trace and lower the nodes of a
             // --key-census node set at line indices SEL (comma-separated),
-            // with the body breakdown.
+            // with the body breakdown. S is the speed precision the node set
+            // was censused at, as in `--key-census` (default 16).
             "--key-probe" => {
-                let dump = std::path::PathBuf::from(args.next().ok_or_else(|| anyhow!("--key-probe FILE SEL"))?);
+                let dump = std::path::PathBuf::from(args.next().ok_or_else(|| anyhow!("--key-probe FILE SEL [W]"))?);
                 let sel: Vec<usize> = args
                     .next()
-                    .ok_or_else(|| anyhow!("--key-probe FILE SEL"))?
+                    .ok_or_else(|| anyhow!("--key-probe FILE SEL [W]"))?
                     .split(',')
                     .map(|s| s.trim().parse().context("--key-probe SEL index"))
                     .collect::<Result<_>>()?;
-                let report = celeste_rust::trace::kernel::key_probe(std::path::Path::new("."), &dump, &sel)?;
+                let spd = spd_arg(args.next())?;
+                let report = celeste_rust::trace::kernel::key_probe(std::path::Path::new("."), &dump, &sel, spd)?;
                 print!("{}", report);
                 return Ok(());
             }

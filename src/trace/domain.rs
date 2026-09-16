@@ -342,7 +342,7 @@ impl Domain for Concrete {
 // ---------------------------------------------------------------- symbolic
 
 /// The tracing domain. Owns the graph it is building.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Symbolic {
     pub graph: Graph,
     /// How many free choices have been handed out. `__reset_button_states`

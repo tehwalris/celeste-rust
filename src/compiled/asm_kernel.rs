@@ -77,8 +77,11 @@ struct AsmBody {
 #[derive(Clone, Copy)]
 struct DKey {
     dash: [i32; 4],
-    /// The output slots of the speed's key roots (low end first), x and y.
-    bucket_slots: [usize; 2],
+    /// The output slot of spd.x's key root (low end first).
+    bucket_x: usize,
+    /// spd.y's, where the level buckets y (`SpdPrecision::buckets_y`); an
+    /// x-only level has no y key root and every row's `by` is 0.
+    bucket_y: Option<usize>,
     dash_time_slot: usize,
     /// The edge tables, looked up once (`spd_buckets::edges` locks).
     edges: [&'static [i32]; 2],
@@ -92,8 +95,9 @@ impl AsmBody {
         let k = self.dkey?;
         let word = |slot: usize| u32::from_le_bytes(buf[slot * 128 + i * 4..slot * 128 + i * 4 + 4].try_into().unwrap()) as i32;
         let dashing = word(k.dash_time_slot) > 0;
-        let bucket = |axis: usize| k.edges[axis].partition_point(|&e| e <= word(k.bucket_slots[axis])) as u16;
-        Some(SpeedKey { bx: bucket(0), by: bucket(1), dashing, dash: if dashing { k.dash } else { [0; 4] } })
+        let bucket = |axis: usize, slot: usize| k.edges[axis].partition_point(|&e| e <= word(slot)) as u16;
+        let by = k.bucket_y.map_or(0, |s| bucket(1, s));
+        Some(SpeedKey { bx: bucket(0, k.bucket_x), by, dashing, dash: if dashing { k.dash } else { [0; 4] } })
     }
 }
 
@@ -1198,8 +1202,8 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
         b.boundary_exact();
     } else {
         // The key hashes the speed BUCKET (the row stores the hull).
-        if let crate::interpreter::abstraction::SpdPrecision::WidthLog2(w) = crate::interpreter::abstraction::spd_precision() {
-            b.widen_to(&super::boundary_ids(), 0, Some(w), (1, 1));
+        if let Some(w) = crate::interpreter::abstraction::spd_precision().width_log2() {
+            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1));
         }
         b.boundary(&super::boundary_ids());
     }
@@ -1371,15 +1375,15 @@ use crate::trace::kernel::SpeedKey;
 /// The speed key of row `lane` of `rt2` at the current level: `None` at an
 /// exact-speed level or without a player (the reference path's rows).
 pub fn speed_key_of_row(rt2: &Rt2, lane: usize) -> Option<SpeedKey> {
-    match crate::interpreter::abstraction::spd_precision() {
-        crate::interpreter::abstraction::SpdPrecision::WidthLog2(w) => speed_keys(rt2, w).map(|k| k[lane]),
-        crate::interpreter::abstraction::SpdPrecision::Exact => None,
-    }
+    let w = crate::interpreter::abstraction::spd_precision().width_log2()?;
+    speed_keys(rt2, w).map(|k| k[lane])
 }
 
 /// Per lane of `chunk`, what its kernel is specialized on; `None` for a
 /// shape without a player.
 pub(crate) fn speed_keys(chunk: &Rt2, w: u8) -> Option<Vec<SpeedKey>> {
+    // `WidthLog2X`: spd.y is exact and not part of the key.
+    let buckets_y = crate::interpreter::abstraction::spd_precision().buckets_y();
     let ids = crate::compiled::ids();
     let hulls = chunk.speed_hulls(ids)?;
     let obj = *chunk.player_objects(ids).first()?;
@@ -1403,9 +1407,9 @@ pub(crate) fn speed_keys(chunk: &Rt2, w: u8) -> Option<Vec<SpeedKey>> {
             .map(|lane| {
                 let h = hulls[lane];
                 let bx = celeste_core::spd_buckets::index(h[0], w, 0);
-                let by = celeste_core::spd_buckets::index(h[2], w, 1);
+                let by = if buckets_y { celeste_core::spd_buckets::index(h[2], w, 1) } else { 0 };
                 debug_assert!(
-                    celeste_core::spd_buckets::index(h[1], w, 0) == bx && celeste_core::spd_buckets::index(h[3], w, 1) == by,
+                    celeste_core::spd_buckets::index(h[1], w, 0) == bx && (!buckets_y || celeste_core::spd_buckets::index(h[3], w, 1) == by),
                     "lane {lane}: speed hull {h:?} straddles a bucket edge"
                 );
                 let dashing = raw(dt, lane) > 0;
@@ -1504,10 +1508,10 @@ impl Registry {
         let t_trace = std::time::Instant::now();
         let refs = crate::trace::kernel::lattice_kernel_refs(root, opts)
             .context("retracing the start room for ASM kernels")?;
-        let w = match opts.spd {
-            crate::interpreter::abstraction::SpdPrecision::WidthLog2(w) => Some(w),
-            crate::interpreter::abstraction::SpdPrecision::Exact => None,
-        };
+        let w = opts.spd.width_log2();
+        // Of the level being built, not the process-global one: the sets of
+        // several levels build in parallel.
+        let buckets_y = opts.spd.buckets_y();
         let trace_s = t_trace.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
         let n_workers = std::thread::available_parallelism()
@@ -1531,7 +1535,7 @@ impl Registry {
                                     break;
                                 }
                                 let (key, r) = &refs_ref[si];
-                                out.push((si, build_one_shape(r, si, &format!("_{si}"), *key, w)));
+                                out.push((si, build_one_shape(r, si, &format!("_{si}"), *key, w, buckets_y)));
                             }
                             out
                         })
@@ -1684,6 +1688,9 @@ fn build_one_shape(
     tag: &str,
     key: Option<SpeedKey>,
     w: Option<u8>,
+    // Does the level bucket spd.y (`SpdPrecision::buckets_y`): only then does
+    // a body have a y key root to dispatch on.
+    buckets_y: bool,
 ) -> Result<(u64, Option<SpeedKey>, AsmKernel)> {
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
@@ -1823,7 +1830,8 @@ fn build_one_shape(
                 }
                 Some(DKey {
                     dash,
-                    bucket_slots: [bucket_slot(0)?, bucket_slot(1)?],
+                    bucket_x: bucket_slot(0)?,
+                    bucket_y: if buckets_y { Some(bucket_slot(1)?) } else { None },
                     dash_time_slot,
                     edges: [celeste_core::spd_buckets::edges(w, 0), celeste_core::spd_buckets::edges(w, 1)],
                 })
@@ -2063,7 +2071,8 @@ pub(crate) fn registry() -> Option<&'static Registry> {
 /// be built in parallel.
 fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'static Registry> {
     use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
-    const SPD_SLOTS: usize = 21;
+    // Widths 1..=20 both axes, 1..=20 x-only, and exact.
+    const SPD_SLOTS: usize = 41;
     const POS_SLOTS: usize = 4;
     static REGS: [std::sync::OnceLock<Option<Registry>>; 17 * SPD_SLOTS * POS_SLOTS] =
         [const { std::sync::OnceLock::new() }; 17 * SPD_SLOTS * POS_SLOTS];
@@ -2072,8 +2081,9 @@ fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'stati
         RemPrecision::Bits(b) => (b as usize).min(16),
     };
     let spd_slot = match level.spd {
-        SpdPrecision::Exact => 20,
+        SpdPrecision::Exact => 40,
         SpdPrecision::WidthLog2(w) => (w as usize).clamp(1, 20) - 1,
+        SpdPrecision::WidthLog2X(w) => 20 + (w as usize).clamp(1, 20) - 1,
     };
     let pos_slot = (level.pos.x.clamp(1, 2) as usize - 1) + 2 * (level.pos.y.clamp(1, 2) as usize - 1);
     REGS[(rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot].get_or_init(|| build_registry_for_rung(level)).as_ref()
