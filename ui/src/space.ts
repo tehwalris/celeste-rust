@@ -17,8 +17,6 @@
 //
 // The renderer composites per-cell count grids over the room's tiles
 // (room.ts); this file decides which grids, in which ramp, at which alpha.
-// Wins are drawn as a reticle on the cell the winning state left the room
-// from, in every look.
 //
 // Layout: on a phone, the stage (horizon, pass title, the room, the cell
 // readout) then the options, the ladder and the legend, with the transport
@@ -27,9 +25,9 @@
 // and the ladder, options and legend sit in a scrolling side column.
 
 import type { FramesBin, HorizonRun, LevelRun, Run } from "./data";
-import { NO_POSITION, defaultHorizon, fmtCompact, fmtInt, horizonOrder, horizonVerdict, levelName, loadFrames, loadLayers, type VerdictKind } from "./data";
+import { defaultHorizon, fmtCompact, fmtInt, horizonOrder, horizonVerdict, levelName, loadFrames, loadLayers, type VerdictKind } from "./data";
 import { levelCss, levelRamp, marksRamp, heightBand, bandColor, bandHalo, movingColor, HEIGHT_BANDS, rgbCss, levelColor, LEVELS, type RGB } from "./color";
-import { addSparse, NEXT_ROOM_X, RoomRenderer, sparseMax, winKeyIcon, type HeatLayer, type Scene, type WinMark } from "./room";
+import { addSparse, RoomRenderer, sparseMax, type HeatLayer, type Scene } from "./room";
 import { button, chips, clear, el, icon, scrubber, select, show } from "./ui";
 import { Instances, View3D } from "./view3d";
 import type { View } from "./main";
@@ -46,20 +44,12 @@ type Look = "full" | "sweep" | "last";
  *  lasts as long as the uniform one at the same speed. */
 type Pacing = "uniform" | "real";
 
-/** One frame's wins of a level file, as recorded. */
-interface WinEntry {
-  f: number;
-  idx: number;
-  count: number;
-}
-
 interface LevelFiles {
   frames: FramesBin;
   layers: FramesBin | null;
   frameMax: number;
   cumMax: number;
   marksMax: number;
-  wins: WinEntry[];
 }
 
 /** One pass of a horizon's ladder: a level's forward or backward, with
@@ -89,11 +79,8 @@ interface Built {
   probe: Named[];
   off: number;
   scale?: Scale;
-  /** Won states whose recorded cell is in the next room (an export from
-   *  before the exit-placement fix): counted, not drawn. */
-  offRoom: number;
 }
-const empty = (): Built => ({ scene: { layers: [], wins: [] }, probe: [], off: 0, offRoom: 0 });
+const empty = (): Built => ({ scene: { layers: [] }, probe: [], off: 0 });
 
 const SPEEDS: { label: string; steps: number; passes: number }[] = [
   { label: "slow", steps: 15, passes: 1 },
@@ -240,18 +227,15 @@ export function spaceView(run: Run, onState: () => void): View {
         let frameMax = 1;
         let marksMax = 1;
         const cum = new Float32Array(ncell);
-        const wins: WinEntry[] = [];
         for (let f = 0; f < frames.nframes; f++) {
           const c = frames.cells(f);
           frameMax = Math.max(frameMax, sparseMax(c));
           addSparse(cum, c);
-          const w = frames.wins(f);
-          for (let i = 0; i < w.idx.length; i++) wins.push({ f, idx: w.idx[i], count: w.count[i] });
           if (layers) marksMax = Math.max(marksMax, sparseMax(layers.cells(f)));
         }
         let cumMax = 1;
         for (let i = 0; i < ncell; i++) if (cum[i] > cumMax) cumMax = cum[i];
-        const out = { frames, layers, frameMax, cumMax, marksMax, wins };
+        const out = { frames, layers, frameMax, cumMax, marksMax };
         loaded.set(key, out);
         return out;
       })();
@@ -283,37 +267,6 @@ export function spaceView(run: Run, onState: () => void): View {
     let out = m.get(h);
     if (!out) m.set(h, (out = cumGrid(bin, 0, h)));
     return out;
-  }
-
-  /** A level's wins at frames <= `upto`, one mark per cell. `upto` is
-   *  capped by the callers at the horizon: level 0's frames file is shared
-   *  by every horizon and holds wins past the earlier ones. A win recorded
-   *  in the next room (x >= 128: an old export's placement at the next
-   *  room's spawn) has no known exit cell and is only counted. */
-  function winsUpTo(lr: LevelRun, upto: number): { wins: WinMark[]; offRoom: number } {
-    const files = have(lr);
-    const by = new Map<number, WinMark>();
-    let offRoom = 0;
-    if (!files) return { wins: [], offRoom };
-    for (const e of files.wins) {
-      if (e.f > upto || e.idx === NO_POSITION) continue;
-      if (renderer.cellXY(e.idx)[0] >= NEXT_ROOM_X) {
-        offRoom += e.count;
-        continue;
-      }
-      const m = by.get(e.idx);
-      if (m) {
-        m.count += e.count;
-        m.frame = Math.min(m.frame, e.f);
-      } else by.set(e.idx, { idx: e.idx, count: e.count, frame: e.f });
-    }
-    return { wins: [...by.values()], offRoom };
-  }
-  /** The wins a pass shows at frame index `i` (null: the whole pass): a
-   *  forward the wins found so far, a backward every win by H (it marks
-   *  back from them). */
-  function passWins(hr: HorizonRun, pass: Pass, i: number | null) {
-    return winsUpTo(pass.lr, pass.phase === "fwd" && i != null ? Math.min(pass.frames[i], hr.h) : hr.h);
   }
 
   /** The closed levels of `hr` below `level`, as receding bands. */
@@ -446,17 +399,16 @@ export function spaceView(run: Run, onState: () => void): View {
   function roomScene(hr: HorizonRun, pass: Pass, i: number): Built {
     const layers: HeatLayer[] = [];
     const probe: Named[] = [];
-    const w = passWins(hr, pass, i);
     if (st.look === "last") {
       paintPasses(hr, timeline(st.h), pass.index, layers, probe);
       const off = paintCurrent(pass.lr, pass.phase, pass.frames[i], hr.h, layers, probe);
-      return { scene: { layers, wins: w.wins }, probe, off, offRoom: w.offRoom };
+      return { scene: { layers }, probe, off };
     }
     const full = st.look === "full";
     if (full && pass.lr.level !== 0) base(hr, layers, probe);
     if (full) bands(hr, pass.lr.level, layers, probe);
     const { off, scale } = levelAt(pass.lr, pass.phase, pass.frames[i], hr.h, full, layers, probe);
-    return { scene: { layers, wins: w.wins }, probe, off, scale, offRoom: w.offRoom };
+    return { scene: { layers }, probe, off, scale };
   }
 
   /** A level after its last pass: everything it reached, dim, with all
@@ -464,10 +416,9 @@ export function spaceView(run: Run, onState: () => void): View {
   function finalScene(lr: LevelRun, last: Pass, h: number): Built {
     const layers: HeatLayer[] = [];
     const probe: Named[] = [];
-    const w = winsUpTo(lr, h);
     if (st.look === "last") {
       paintPasses(run.horizons[st.h], timeline(st.h), last.index + 1, layers, probe);
-      return { scene: { layers, wins: w.wins }, probe, off: 0, offRoom: w.offRoom };
+      return { scene: { layers }, probe, off: 0 };
     }
     const files = have(lr);
     if (!files) return empty();
@@ -481,14 +432,13 @@ export function spaceView(run: Run, onState: () => void): View {
       layers.push({ grid: g.grid, max: files.marksMax, ramp: marksRamp("bright"), alpha: 1 });
       probe.push({ name: `marked, level ${lr.level}`, grid: g.grid });
     }
-    return { scene: { layers, wins: w.wins }, probe, off: 0, offRoom: w.offRoom };
+    return { scene: { layers }, probe, off: 0 };
   }
 
   /** Grid grain: one level's panel at (phase, f). */
   function panelScene(lr: LevelRun, phase: Phase, f: number, h: number): Built {
     const layers: HeatLayer[] = [];
     const probe: Named[] = [];
-    const w = winsUpTo(lr, phase === "fwd" ? Math.min(f, h) : h);
     if (st.look === "last") {
       // The passes before this level's (phase) pass, then its own sweep.
       const tl = timeline(st.h);
@@ -499,7 +449,7 @@ export function spaceView(run: Run, onState: () => void): View {
         if (own.phase === phase) paintCurrent(lr, phase, f, h, layers, probe);
         else if (phase === "bwd") paintPasses(hr, tl, own.index + 1, layers, probe); // no backward ran: the reached set stays
       }
-      return { scene: { layers, wins: w.wins }, probe, off: 0, offRoom: w.offRoom };
+      return { scene: { layers }, probe, off: 0 };
     }
     const full = st.look === "full";
     if (phase === "bwd" && (lr.refuted || !lr.mlayers_file)) {
@@ -509,10 +459,10 @@ export function spaceView(run: Run, onState: () => void): View {
         const g = cumTo(files.frames, h);
         layers.push({ grid: g.grid, max: files.cumMax, ramp: levelRamp(lr.level, "dim"), alpha: 0.95 });
       }
-      return { scene: { layers, wins: w.wins }, probe, off: 0, offRoom: w.offRoom };
+      return { scene: { layers }, probe, off: 0 };
     }
     const { off } = levelAt(lr, phase, f, h, full, layers, probe);
-    return { scene: { layers, wins: w.wins }, probe, off, offRoom: w.offRoom };
+    return { scene: { layers }, probe, off };
   }
 
   /** Passes grain: a whole pass. A forward is everything the level
@@ -521,10 +471,9 @@ export function spaceView(run: Run, onState: () => void): View {
   function passScene(hr: HorizonRun, pass: Pass): Built {
     const layers: HeatLayer[] = [];
     const probe: Named[] = [];
-    const w = passWins(hr, pass, null);
     if (st.look === "last") {
       paintPasses(hr, timeline(st.h), pass.index + 1, layers, probe);
-      return { scene: { layers, wins: w.wins }, probe, off: 0, offRoom: w.offRoom };
+      return { scene: { layers }, probe, off: 0 };
     }
     const full = st.look === "full";
     const files = have(pass.lr);
@@ -549,7 +498,7 @@ export function spaceView(run: Run, onState: () => void): View {
         scale = { ramp: marksRamp("bright"), max: files.marksMax, what: "marked states per cell" };
       }
     }
-    return { scene: { layers, wins: w.wins }, probe, off: vis.off, scale, offRoom: w.offRoom };
+    return { scene: { layers }, probe, off: vis.off, scale };
   }
 
   // ---- DOM: the stage --------------------------------------------------------------
@@ -570,8 +519,7 @@ export function spaceView(run: Run, onState: () => void): View {
   const stageHead = el("div", { class: "stage-head" }, [hPicker.root, passTitle]);
 
   const canvas = el("canvas", { class: "room-canvas", "aria-label": "the room: one cell per player pixel, colour = states in the cell" });
-  const overlay = el("canvas", { class: "room-overlay" });
-  const roomWrap = el("div", { class: "room-wrap" }, [canvas, overlay]);
+  const roomWrap = el("div", { class: "room-wrap" }, [canvas]);
   const gridBox = el("div", { class: "grid-panels" });
   const view3dTools = el("div", { class: "view3d-tools" });
   const view3dWrap = el("div", { class: "view3d-wrap" }, [view3dTools]);
@@ -580,8 +528,7 @@ export function spaceView(run: Run, onState: () => void): View {
 
   const probeEl = el("div", { class: "probe", "aria-live": "polite" });
   const scaleEl = el("div", { class: "scale" });
-  const winKey = el("div", { class: "win-key" });
-  const stageFoot = el("div", { class: "stage-foot" }, [probeEl, scaleEl, winKey]);
+  const stageFoot = el("div", { class: "stage-foot" }, [probeEl, scaleEl]);
   const stageCol = el("section", { class: "space-stage card" }, [stageHead, stage, stageFoot]);
 
   // ---- DOM: the transport (play, step, scrub) ------------------------------------------
@@ -696,16 +643,14 @@ export function spaceView(run: Run, onState: () => void): View {
 
   // ---- DOM: the legend --------------------------------------------------------------
   const key = (color: string, label: string, cls = "") => el("span", { class: "key" }, [el("i", { class: cls, style: color ? `background:${color}` : undefined }), label]);
-  const winLegend = () => el("span", { class: "key" }, [winKeyIcon(16), "win: where a winning state left the room"]);
   const legendFull = el("div", { class: "legend" }, [
     key(rgbCss(levelRamp(0, "bright")[55]), "moving: the frontier"),
     key(rgbCss(levelRamp(0, "dim")[40]), "accumulated: reached before"),
     key(rgbCss(marksRamp("bright")[55]), "marked now"),
     key(rgbCss(marksRamp("dim")[40]), "marked so far"),
     key(rgbCss(levelRamp(4, "band")[45]), "a closed level's marks"),
-    winLegend(),
   ]);
-  const legendSweep = el("div", { class: "legend" }, [key(rgbCss(levelRamp(0, "bright")[55]), "the frontier at this frame"), key(rgbCss(marksRamp("bright")[55]), "marked at this iteration"), winLegend()]);
+  const legendSweep = el("div", { class: "legend" }, [key(rgbCss(levelRamp(0, "bright")[55]), "the frontier at this frame"), key(rgbCss(marksRamp("bright")[55]), "marked at this iteration")]);
   const levelStrip = el("div", { class: "level-strip" });
   for (let i = 0; i < LEVELS; i++) levelStrip.append(el("i", { style: `background:${levelCss(i)}`, title: i === 16 ? "exact" : `level ${i}: ${i} bit${i === 1 ? "" : "s"}` }));
   const levelBlock = el("div", {}, [
@@ -719,7 +664,6 @@ export function spaceView(run: Run, onState: () => void): View {
   const bandBlock = el("div", {}, [
     el("div", { class: "legend-title", text: "colour = the finest band of levels that still contains the cell" }),
     bandStrip,
-    el("div", { class: "legend", style: "margin-top:8px" }, [winLegend()]),
   ]);
   const block3d = el("div", {}, [
     el("div", { class: "legend-title", text: "3D" }),
@@ -732,7 +676,6 @@ export function spaceView(run: Run, onState: () => void): View {
     el("p", { class: "note", text: "A horizon H asks: is there a win by frame H? The ladder answers it level by level, coarse to exact: each level's forward sweeps the frames out to H, then its backward marks the states that can still win by H, and the next level searches only inside those marks. A refuted horizon stops at the first level with no win, so nothing on screen wins there - that is the answer, not missing data." }),
     el("p", { class: "note", text: "The backward is drawn by the frame each marked state was first reached at (this tree stores no per-mark distance), swept from the horizon back to frame 1." }),
     el("p", { class: "note", text: "Height map: the levels collapsed into seven bands, each cell in the colour of the finest band whose set still contains it (forward and backward alike). The broad coarse bands are dark; lightness climbs with the band, so the exact route is the brightest thing on screen (the two thinnest bands carry a one-cell halo)." }),
-    el("p", { class: "note", text: "A win marker sits on the cell the winning state left the room from; the readout under the room names its count and frame." }),
     el("div", { class: "keys" }, [
       el("kbd", { text: "space" }), el("span", { text: "play / pause" }),
       el("kbd", { text: "← →" }), el("span", { text: "one step (shift: ten)" }),
@@ -821,7 +764,6 @@ export function spaceView(run: Run, onState: () => void): View {
     root: HTMLElement;
     state: HTMLElement;
     canvas: HTMLCanvasElement;
-    overlay: HTMLCanvasElement;
   }
   let panels: Panel[] = [];
   let panelsFor = -1;
@@ -834,7 +776,6 @@ export function spaceView(run: Run, onState: () => void): View {
     for (let level = 0; level < LEVELS; level++) {
       const lr = hr.levels.find((l) => l.level === level) ?? null;
       const c = el("canvas", { "aria-label": `level ${level}` });
-      const o = el("canvas", { class: "room-overlay" });
       const name = level === 16 ? "exact" : `${level} bit${level === 1 ? "" : "s"}`;
       // The panel's state (playing / done / not yet) sits in its own
       // corner so the label does not wrap on a phone.
@@ -843,7 +784,7 @@ export function spaceView(run: Run, onState: () => void): View {
         el("i", { style: `background:${levelCss(level)}` }),
         lr ? `${name}${lr.refuted ? " · refuted" : lr.first_win != null ? ` · win f${lr.first_win}` : ""}` : `${name} · not run`,
       ]);
-      const p = el("div", { class: `panel${lr ? "" : " not-run"}`, role: lr ? "button" : undefined, tabindex: lr ? 0 : undefined, title: lr ? `open level ${level} in Room` : undefined }, [c, o, lab, state]);
+      const p = el("div", { class: `panel${lr ? "" : " not-run"}`, role: lr ? "button" : undefined, tabindex: lr ? 0 : undefined, title: lr ? `open level ${level} in Room` : undefined }, [c, lab, state]);
       if (lr) {
         const open = () => {
           // Tap a panel: open that level in Room where the sequence has
@@ -869,7 +810,7 @@ export function spaceView(run: Run, onState: () => void): View {
         });
       }
       gridBox.append(p);
-      panels.push({ lr, level, root: p, state, canvas: c, overlay: o });
+      panels.push({ lr, level, root: p, state, canvas: c });
     }
     fitGrid();
   }
@@ -1009,7 +950,7 @@ export function spaceView(run: Run, onState: () => void): View {
       scrub.set(st.pass, tl.length - 1, `${pass.phase === "fwd" ? "forward" : "backward"} L${pass.lr.level}`);
       const built = passScene(hr, pass);
       shown(built);
-      renderer.render(canvas, built.scene, overlay);
+      renderer.render(canvas, built.scene);
       describePass(hr, pass, null, built.off);
       return;
     }
@@ -1020,14 +961,13 @@ export function spaceView(run: Run, onState: () => void): View {
     if (st.grain === "room") {
       const built = roomScene(hr, pass, i);
       shown(built);
-      renderer.render(canvas, built.scene, overlay);
+      renderer.render(canvas, built.scene);
       describePass(hr, pass, i, built.off);
     } else {
       // The grid walks the same timeline as the room: only the current
       // pass's level animates; levels whose passes are done sit at their
       // final state, levels not yet reached are blank.
       const f = pass.frames[i];
-      let offRoom = 0;
       for (const p of panels) {
         let built = empty();
         let state: "animating" | "done" | "not yet" | "not run" = "not run";
@@ -1042,35 +982,23 @@ export function spaceView(run: Run, onState: () => void): View {
             state = "done";
           } else state = "not yet";
         }
-        offRoom = Math.max(offRoom, built.offRoom);
-        renderer.render(p.canvas, built.scene, p.overlay);
+        renderer.render(p.canvas, built.scene);
         p.root.classList.toggle("not-run", state === "not run" || state === "not yet");
         p.root.classList.toggle("animating", state === "animating");
         p.state.textContent = state === "animating" ? `${pass.phase === "fwd" ? "forward" : "backward"} f${f}` : state === "done" ? "done" : state === "not yet" ? "not yet" : "";
       }
-      shown({ ...empty(), offRoom });
+      shown(empty());
       describePass(hr, pass, i, 0);
     }
   }
 
-  // ---- the readout under the stage: cell probe, colour scale, win key ---------------------
+  // ---- the readout under the stage: cell probe, colour scale --------------------------
   let lastBuilt: Built = empty();
   let probeIdx = -1;
-  /** What the stage shows now: the probe's source, the scale, the win key. */
+  /** What the stage shows now: the probe's source and the scale. */
   function shown(built: Built) {
     lastBuilt = built;
     showScale(st.grain === "grid" || st.grain === "3d" ? undefined : built.scale);
-    const off = built.offRoom > 0 ? `${fmtInt(built.offRoom)} won state${built.offRoom === 1 ? "" : "s"} recorded in the next room by an old export: exit cell unknown, not drawn` : "";
-    winKey.replaceChildren();
-    if (built.scene.wins.length || off) {
-      winKey.append(winKeyIcon(16));
-      winKey.append(
-        el("span", {
-          text: built.scene.wins.length ? `win${built.scene.wins.length === 1 ? "" : "s"}: ${built.scene.wins.map((w) => `${fmtInt(w.count)} at (${renderer.cellXY(w.idx).join(", ")}) from f${w.frame}`).join(" · ")}` : "no win drawn",
-        }),
-      );
-      if (off) winKey.append(el("span", { class: "warn", text: off }));
-    }
     if (probeIdx >= 0) probeAt(probeIdx);
     else probeHint();
   }
@@ -1097,8 +1025,6 @@ export function spaceView(run: Run, onState: () => void): View {
   function probeAt(idx: number) {
     const [x, y] = renderer.cellXY(idx);
     const rows = lastBuilt.probe.filter((p) => p.grid[idx] > 0).map((p) => `${fmtInt(p.grid[idx])} ${p.name}`);
-    const win = lastBuilt.scene.wins.find((w) => w.idx === idx);
-    if (win) rows.unshift(`${fmtInt(win.count)} won from here (first at f${win.frame})`);
     probeEl.replaceChildren(el("b", { text: `cell (${x}, ${y})` }), el("span", { text: rows.length ? rows.join(" · ") : "no states" }));
   }
 

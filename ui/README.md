@@ -45,9 +45,9 @@ falls back to the default.
 states in the cell (log scale against the level's largest cell over the
 run, so one frame's brightness is comparable to the next), hue = the
 ladder level (blue = level 0, through violet and magenta to orange =
-exact), marks in warm white. Nothing is drawn over the room but the win
-markers: the titles, the readout and the colour scale sit around it, so
-the exits at the top edge and the spawn at the bottom stay visible.
+exact), marks in warm white. Nothing is drawn over the room: the titles,
+the readout and the colour scale sit around it, so the exits at the top
+edge and the spawn at the bottom stay visible.
 
 The layout. On a phone: the **stage** card (the horizon picker, the pass
 title, the room / grid / 3D view, the readout under it), then the
@@ -65,7 +65,7 @@ Status lives in one place each: the stage's pass title names the *pass*
 *position* (the frame or iteration, the counts, the pass number); the
 scrubber's bubble names the step while it is held; the readout under the
 room names the probed cell (press and drag on a phone, hover with a
-mouse), the colour scale, and the wins on screen. The ladder panel lists
+mouse) and the colour scale. The ladder panel lists
 every level of the horizon - its result (`win f76`, `no win by f75`,
 `not run`) and marked-set size - with the current pass's level tagged
 FWD / BWD; tap a level to jump to the start of its forward.
@@ -83,21 +83,12 @@ The view opens on the answer: the optimal horizon's ladder at its last
 step in the Height map look - the exact route, brightest, over every
 band the search narrowed through. Play from there sweeps from the top.
 
-**Wins** are drawn in every look as a reticle (a white ring with four
-ticks over a dark halo) around the cell a winning state left the room
-from; the cell itself stays uncovered. A forward shows the wins found so
-far, a backward (and a whole pass, and a finished grid panel) every win
-by H - capped at H, since level 0's frames file is shared by every
-horizon and holds wins past the earlier ones. The readout names each
-(`win: 2 at (28, -2) from f76`), and probing the cell adds `won from
-here`. The export places a won state where its player LEFT the room
-(`ui_export.rs`, `read_level_frames`, 2026-09-16); an export made before
-that put it at the next room's spawn, one room over - room (0,0)'s data
-still does, at (136, 128) and (136, 124). No in-room state can have x >=
-128 (the cart moves the player back inside at `x > 121`), so those cells
-are neither painted nor marked, and the readout says how many won states
-it left out: `N won states recorded in the next room by an old export:
-exit cell unknown, not drawn`. Re-exporting the run fixes it.
+Wins are not marked on the room. The heat layers never paint a cell
+with x >= 128: no in-room state can be there (the cart moves the player
+back inside at `x > 121`), and an export made before the exit-placement
+fix (`ui_export.rs`, `read_level_frames`, 2026-09-16) recorded won states
+at the next room's spawn, one room over - room (0,0)'s data still does,
+at (136, 128) and (136, 124).
 
 Playback speed is three presets (slow / normal / fast: 15, 60, 250
 steps per second; Passes runs one, two, four passes per second), and

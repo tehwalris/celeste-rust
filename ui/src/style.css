@@ -623,13 +623,6 @@ details summary:focus-visible {
   touch-action: none;
   cursor: crosshair;
 }
-.room-overlay {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-}
 .room-loading {
   position: absolute;
   right: 8px;
@@ -649,7 +642,7 @@ details summary:focus-visible {
   display: none;
 }
 
-/* The readout under the stage: the probed cell, the scale, the wins. */
+/* The readout under the stage: the probed cell and the scale. */
 .stage-foot {
   display: flex;
   flex-wrap: wrap;
@@ -687,24 +680,6 @@ details summary:focus-visible {
   height: 8px;
   border-radius: 2px;
 }
-.win-key {
-  display: inline-flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 2px 8px;
-  min-width: 0;
-}
-.win-key:empty {
-  display: none;
-}
-.win-icon {
-  flex: 0 0 auto;
-  display: block;
-}
-.win-key .warn {
-  color: #e8b36a;
-  flex-basis: 100%;
-}
 
 .grid-panels {
   display: grid;
@@ -722,15 +697,15 @@ details summary:focus-visible {
   display: block;
   image-rendering: pixelated;
 }
-.grid-panels .panel canvas:not(.room-overlay) {
+.grid-panels .panel canvas {
   border-radius: 6px;
   background: #000;
   box-shadow: 0 0 0 1px var(--line);
 }
-.grid-panels .panel.not-run canvas:not(.room-overlay) {
+.grid-panels .panel.not-run canvas {
   opacity: 0.35;
 }
-.grid-panels .panel.animating canvas:not(.room-overlay) {
+.grid-panels .panel.animating canvas {
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.7);
 }
 .grid-panels .panel .state {

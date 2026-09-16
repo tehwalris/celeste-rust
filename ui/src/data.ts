@@ -115,23 +115,17 @@ export class FramesBin {
     this.words = new Uint32Array(buf);
     this.nframes = this.words[1];
   }
-  private record(f: number, which: 0 | 2): Sparse {
+  /** The states per cell first reached at frame `f`. (Each entry's win
+   *  record is not read: the UI does not mark wins.) */
+  cells(f: number): Sparse {
     if (f < 0 || f >= this.nframes) return { idx: new Uint32Array(0), count: new Uint32Array(0) };
     const e = 2 + f * 4;
-    const off = this.words[e + which] >>> 2;
-    const n = this.words[e + which + 1];
+    const off = this.words[e] >>> 2;
+    const n = this.words[e + 1];
     return {
       idx: this.words.subarray(off, off + n),
       count: this.words.subarray(off + n, off + 2 * n),
     };
-  }
-  /** The states per cell first reached at frame `f`. */
-  cells(f: number): Sparse {
-    return this.record(f, 0);
-  }
-  /** The win states per cell at frame `f`. */
-  wins(f: number): Sparse {
-    return this.record(f, 2);
   }
 }
 
