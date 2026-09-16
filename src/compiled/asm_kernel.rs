@@ -735,6 +735,49 @@ impl AsmKernel {
                         None => break,
                     }
                 }
+                // The FAILING premise: follow a false conjunct through the
+                // strict merges (`And(Known(c), Sel(c, ok_a, ok_b))`) - an
+                // And into its false children, a decided Sel into its taken
+                // arm, an Or into every child - to the leaves that are
+                // decided false, which name the premise the lane fails.
+                let mut stack = vec![n];
+                let mut walked = std::collections::HashSet::new();
+                let mut leaves = 0;
+                while let Some(x) = stack.pop() {
+                    if !walked.insert(x) || leaves >= 8 {
+                        continue;
+                    }
+                    let nd = self.fused.get(x);
+                    match nd.op {
+                        Op::And | Op::Or => stack.extend(nd.args.iter().copied().filter(|&a| vals[a as usize] == Val::Bool(Some(false)))),
+                        Op::Sel => match vals[nd.args[0] as usize] {
+                            Val::Bool(Some(true)) => stack.push(nd.args[1]),
+                            Val::Bool(Some(false)) => stack.push(nd.args[2]),
+                            _ => {}
+                        },
+                        _ => {
+                            leaves += 1;
+                            let args: Vec<String> = nd.args.iter().map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize])).collect();
+                            eprintln!("[kernel]     failing premise {} {:?} = {:?}; args {}", x, nd.op, vals[x as usize], args.join(", "));
+                            // A `Known` premise fails on an undecided
+                            // condition: its undecided operands, down to the
+                            // comparisons the lane cannot decide.
+                            if matches!(nd.op, Op::Known) {
+                                let mut todo = vec![(nd.args[0], 0usize)];
+                                let mut shown = std::collections::HashSet::new();
+                                while let Some((y, depth)) = todo.pop() {
+                                    if depth > 6 || !shown.insert(y) || vals[y as usize] != Val::Bool(None) {
+                                        continue;
+                                    }
+                                    let yn = self.fused.get(y);
+                                    let yargs: Vec<String> = yn.args.iter().map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize])).collect();
+                                    eprintln!("[kernel]       undecided {}{} {:?}; args {}", "  ".repeat(depth), y, yn.op, yargs.join(", "));
+                                    todo.extend(yn.args.iter().map(|&a| (a, depth + 1)));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

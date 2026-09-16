@@ -220,6 +220,17 @@ pub fn merge<D: Domain>(
     }
 
     let mut heap = t.heap.clone();
+    // Did any join leave a select the kernel reads by `cond`'s value bit?
+    let mut selects = false;
+    let mut join = |d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>| -> Result<Value<D>> {
+        let j = join(d, cond, a, b)?;
+        selects |= match &j {
+            Value::Num(n) => d.is_select_num(n),
+            Value::Bool(x) => d.is_select_bool(x),
+            _ => false,
+        };
+        Ok(j)
+    };
     for (rt, rf) in t_order.iter().zip(f_order.iter()) {
         match (rt, rf) {
             (Root::Table(a), Root::Table(b)) => {
@@ -289,10 +300,23 @@ pub fn merge<D: Domain>(
         // the condition is decided at trace time (every exact-speed set),
         // and elsewhere makes an undecided merge what it has to be: a
         // fatal decline naming the lane, like an exceeded fork arity.
+        //
+        // ONLY WHERE A SELECT SURVIVES (2026-09-16). A merge whose joins all
+        // folded (equal arms, or booleans into Kleene algebra - the `and`
+        // chain of an overlap test) reads no value bit, and the kernel's
+        // And/Or/Not are exact on (value, known) masks. Room (2,0)'s fruit
+        // bobs over a widened band (`widen_fruit`), so the player-fruit
+        // overlap test is undecided near it; the unconditional premise
+        // refused those lanes (exact speed, f49), where the undecided `hit`
+        // should instead emit both outcomes (an unknown `live` emits).
         ok: {
             let per_case = d.sel_bool(cond, &t.ok, &f.ok);
-            let decided = d.known(cond);
-            d.and(&per_case, &decided)
+            if selects || d.is_select_bool(&per_case) {
+                let decided = d.known(cond);
+                d.and(&per_case, &decided)
+            } else {
+                per_case
+            }
         },
         path,
         key_override: t.key_override,

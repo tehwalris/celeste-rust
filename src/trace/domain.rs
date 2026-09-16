@@ -171,6 +171,21 @@ pub trait Domain {
         self.boolean(true)
     }
 
+    /// Is a merged value a SELECT the kernel reads by its condition's value
+    /// bit (`Op::Sel`), rather than a value the merge folded away (equal
+    /// arms, a decided condition) or into Kleene boolean algebra, which the
+    /// kernel evaluates exactly on (value, known) masks? Only the former
+    /// needs the merge's condition decided (`state::merge`). A concrete
+    /// merge never selects.
+    fn is_select_num(&self, _v: &Self::Num) -> bool {
+        false
+    }
+
+    /// `is_select_num` for a boolean.
+    fn is_select_bool(&self, _b: &Self::Bool) -> bool {
+        false
+    }
+
     /// Fork at `flr`: the value restricted to a fresh fork choice, and
     /// which lanes fall in the chosen fragment.
     ///
@@ -689,6 +704,14 @@ impl Domain for Symbolic {
 
     fn known(&mut self, b: &NodeId) -> NodeId {
         self.graph.fold(Op::Known, vec![*b])
+    }
+
+    fn is_select_num(&self, v: &NodeId) -> bool {
+        matches!(self.graph.get(*v).op, Op::Sel)
+    }
+
+    fn is_select_bool(&self, b: &NodeId) -> bool {
+        matches!(self.graph.get(*b).op, Op::Sel)
     }
 
     fn move_ways(&self) -> u8 {
