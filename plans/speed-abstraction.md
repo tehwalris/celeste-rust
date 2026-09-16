@@ -67,6 +67,40 @@ the exact count, against a ceiling of 1.6x, and hull growth re-emits 42% more
 rows by f50. Running: realized forwards at `s20` / `s18` / `s16` with the
 hull-growth counter.
 
+### Realized per table (room (1,0), level 0, f0-f50, release, 32 threads, after both fixes below)
+
+| f50 | exact | `s20` thresholds | `s18` + 4 px | `s16` + 1 px |
+|---|---|---|---|---|
+| distinct states | 1.19M | 1.08M (1.11x) | 1.08M (1.11x) | 1.21M (0.98x) |
+| rows kept (per state) | 1.19M (1.00) | 1.63M (1.51) | 1.62M (1.51) | 1.73M (1.42) |
+| hull growths | - | 1.15M | 1.15M | 1.18M |
+| raw rows through the kernels | 5.5M | 52.4M | 53.9M | 44.8M |
+| f50 frame | 0.67 s | 24.0 s | 24.5 s | 19.7 s |
+| forward f0-f50 | 6 s | 3:26 | 3:27 | 3:07 |
+| key fixpoint | - | 344 nodes, 42 s | 348 nodes, 43 s | 593 nodes, 67 s |
+| post-hoc ceiling (states) | - | 1.81x | 1.80x | 1.61x |
+
+**Room (1,0): a bucketed level 0 is a loss at every table.** The best merge
+realized is 1.11x in states (the ceiling promises 1.8x), and hull growth
+re-emits half as many rows again, so the frontier is LARGER than exact
+speed's. The kernels also run ~9x more raw rows, and a frame costs 30-36x.
+The grid only changes the key count: `s20` and `s18` produce identical
+states.
+
+Where the cost goes, per input lane (f40-f50):
+
+| | successor rows per lane (raw / in) | kept / raw | kernel ms per M lanes |
+|---|---|---|---|
+| exact | 4.5-5.2 | 22-29% | 620-760 |
+| `s20` | 26-32 | 3-6% | 14,800-15,500 |
+| `s16` | 22-27 | 4-5% | 9,900-11,800 |
+
+A lane holding a speed HULL enumerates the successors of every speed in it:
+the move fork's floors across the hull and the table fork's buckets across
+the output. So it emits ~6x the rows, and nearly all of them are revisits
+the door drops, or re-emissions when they widen a hull. The merge does not
+pay for that on room (1,0).
+
 ### Two bugs the coarse tables exposed (2026-09-16)
 
 - **The dash-constant reader** split on every undecided select in the dash
