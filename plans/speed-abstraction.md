@@ -256,6 +256,36 @@ and the extra positions compound over frames. And even an exact realization
 of the x-only table merges at most 1.3x by f55: the large merges need y
 bucketed too and no singleton thresholds.
 
+**The benchmark: a bucketed tree against its ideal** (`rewrite bucket-diff
+--exact-dir E --bucketed-dir B --from 0 --to F --w W --x-only`). Project
+every state of both trees onto its named cells, with the speed as its
+bucket. The projection of the exact states of frames <= F is the ideal a
+sound bucketed forward reaches. It must be cumulative, because the door
+dedupes across frames and a coarser key is reached at a different frame
+than its members. "Lost" (ideal, not realized) is a soundness bug;
+"over-widened" (realized, not ideal) is what the abstraction added.
+
+| through frame | ideal | `s20x` realized | ratio | `s16x` ratio |
+|---|---|---|---|---|
+| f28 | 894 | 894 | 1.000 | 1.000 |
+| f29 | 2,816 | 2,850 | 1.012 | |
+| f32 | 28,160 | 31,182 | 1.107 | 1.072 |
+| f36 | 173,067 | 201,745 | 1.166 | 1.117 |
+| f40 | 771,006 | 987,855 | 1.281 | 1.114 |
+| f44 | 3,045,585 | 4,260,867 | 1.399 | 1.159 |
+
+Nothing is lost at any frame, in either tree. The first over-widened states
+(f29, player (8, 95), mid-jump) show the mechanism. Exact has spd.x 0.8,
+0.99998 and 1 there, in separate states; the bucketed row holds their hull
+[0.8, 1] (bucket (0.75, 1]). Air deceleration by 0.4 maps the hull onto
+[0.4, 0.6], and the output key fork emits every bucket that reaches: the
+interior bucket (0.4, 0.6), which no member produces, and 0.600006 (1 - 0.4),
+which this state's members do not have. So a bucket's members do not stay
+together under the dynamics. A table that keeps them together needs the
+thresholds' preimages under every `appr` shift and the spring's multiply;
+closed to a fixpoint those shifts have no common step and the table becomes
+exact speed, so only a bounded number of preimage steps is finite.
+
 ### The next rooms (2026-09-16, night)
 
 | room | objects | ceiling (TAS replayed, then followed in our game) | result |

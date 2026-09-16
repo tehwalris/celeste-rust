@@ -298,6 +298,33 @@ enum Command {
         #[arg(long)]
         x_only: bool,
     },
+    /// DIAGNOSTIC: a speed-bucketed tree against its IDEAL, frame by frame.
+    /// Both trees' states are projected onto their named cells with the
+    /// speed as its bucket (the edge table at width `w`; spd.x only with
+    /// `--x-only`). The exact tree's projection is what a sound, ideal
+    /// bucketed forward reaches: a LOST state (ideal, not realized) is a
+    /// soundness bug, an OVER-WIDENED one (realized, not ideal) is what the
+    /// abstraction added. Prints examples of the latter.
+    BucketDiff {
+        #[arg(long)]
+        exact_dir: String,
+        #[arg(long)]
+        bucketed_dir: String,
+        #[arg(long)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        #[arg(long, default_value_t = 20)]
+        w: u8,
+        #[arg(long)]
+        x_only: bool,
+        /// Over-widened states to describe per frame.
+        #[arg(long, default_value_t = 3)]
+        examples: usize,
+        /// Also print every state at player position `x,y`, both trees.
+        #[arg(long)]
+        at: Option<String>,
+    },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed file by
     /// file and row range by row range (the whole-frame `census` loads the
     /// frame). Per shape: rows, then every varying column's distinct value
@@ -383,6 +410,225 @@ enum Command {
         #[arg(long, default_value = "1,0")]
         room: String,
     },
+}
+
+/// One frame of a checkpoint tree projected for `bucket-diff`: per state, a
+/// hash over its named value cells (`cell_names`) with the player's speed
+/// replaced by its bucket in the edge table at width `w` (spd.x only with
+/// `x_only`). A hull (a bucketed tree's speed cell) buckets by its low end;
+/// `straddles` counts hulls spanning more than one bucket.
+struct Projection {
+    rows: u64,
+    states: rustc_hash::FxHashSet<u64>,
+    /// The states not in `against`, and a few of them described by their
+    /// varying cells.
+    only: rustc_hash::FxHashSet<u64>,
+    examples: Vec<String>,
+    straddles: u64,
+    /// The states at the `--at` player position, described.
+    at_rows: Vec<String>,
+}
+
+fn project_frame(
+    dir: &std::path::Path,
+    frame: u32,
+    w: u8,
+    x_only: bool,
+    against: Option<&rustc_hash::FxHashSet<u64>>,
+    max_examples: usize,
+    at: Option<(i32, i32)>,
+) -> Result<Projection> {
+    use celeste_engine::runtime2::{mix64, Cell2, Col, AV};
+    use celeste_rust::search::checkpoint::FrameFile;
+    let ids = celeste_rust::compiled::ids();
+    let fdir = dir.join("frames").join(format!("f{frame:03}"));
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")))
+        .collect();
+    files.sort();
+    let name_hash = |s: &str| -> u64 { s.bytes().fold(0x9e37_79b9_7f4a_7c15u64, |h, b| mix64(h ^ b as u64)) };
+    // A value's code. Pointers are structure, which the names already
+    // describe, and the two trees may number their cells differently. A
+    // point interval is its number: a bucketed tree types a cell as an
+    // interval where the exact tree holds the same value as a number
+    // (spd.y on an x-only level).
+    let code = |v: AV| -> u64 {
+        let (tag, a, b) = match v {
+            AV::Num(n) => (0u64, n.as_raw_u32() as u64, 0u64),
+            AV::Ival(a, b) if a.as_raw_u32() == b.as_raw_u32() => (0, a.as_raw_u32() as u64, 0),
+            AV::Ival(a, b) => (1, a.as_raw_u32() as u64, b.as_raw_u32() as u64),
+            AV::Bool(x) => (2, x as u64, 0),
+            AV::UBool => (3, 0, 0),
+            AV::Str(s) => (4, s as u64, 0),
+            AV::Nil => (5, 0, 0),
+            AV::Ptr(_) => (6, 0, 0),
+            AV::NilPtr => (7, 0, 0),
+        };
+        mix64(mix64(tag) ^ (a << 32 | b))
+    };
+    let show = |v: AV| -> String {
+        match v {
+            AV::Num(n) => format!("{}", n.as_raw_u32() as i32 as f64 / 65536.0),
+            AV::Ival(a, b) => format!("[{}, {}]", a.as_raw_u32() as i32 as f64 / 65536.0, b.as_raw_u32() as i32 as f64 / 65536.0),
+            other => format!("{other:?}"),
+        }
+    };
+    let mut p = Projection { rows: 0, states: Default::default(), only: Default::default(), examples: Vec::new(), straddles: 0, at_rows: Vec::new() };
+    for path in &files {
+        let ff = FrameFile::open(path)?;
+        let width = ff.width();
+        let mut lo = 0u32;
+        while lo < width {
+            let hi = (lo + (1 << 20)).min(width);
+            let Some(rt2) = ff.load_rows(&[lo..hi])? else { break };
+            p.rows += rt2.width as u64;
+            let names = cell_names(&rt2, ids);
+            // Per value cell: its name's hash, the cell, the speed axis it
+            // is, and the name (a cell no name reaches goes by its index).
+            let mut cells: Vec<(u64, usize, Option<usize>, String)> = Vec::new();
+            for c in 0..rt2.cols.len() {
+                if !matches!(rt2.structure[c], Cell2::Val) {
+                    continue;
+                }
+                let nm = names.get(&c).cloned().unwrap_or_else(|| format!("cell{c}"));
+                let axis = match nm.as_str() {
+                    "spd.x" => Some(0),
+                    "spd.y" if !x_only => Some(1),
+                    _ => None,
+                };
+                cells.push((name_hash(&nm), c, axis, nm));
+            }
+            // The chunk's uniform cells once; the rest per row.
+            let mut base = 0u64;
+            let mut varying: Vec<usize> = Vec::new();
+            for (i, (h, c, axis, _)) in cells.iter().enumerate() {
+                match (&rt2.cols[*c], axis) {
+                    (Col::U(v), None) => base = base.wrapping_add(mix64(h ^ code(*v))),
+                    _ => varying.push(i),
+                }
+            }
+            let pos_cells: Option<(usize, usize)> = at.and_then(|_| {
+                let find = |n: &str| cells.iter().find(|c| c.3 == n).map(|c| c.1);
+                Some((find("player.x")?, find("player.y")?))
+            });
+            for r in 0..rt2.width {
+                let mut acc = base;
+                for &i in &varying {
+                    let (h, c, axis, _) = &cells[i];
+                    let cv = match (axis, rt2.cols[*c].at(r)) {
+                        (Some(ax), AV::Num(n)) => mix64(8 ^ (celeste_core::spd_buckets::index(n.as_raw_u32() as i32, w, *ax) as u64) << 8),
+                        (Some(ax), AV::Ival(a, b)) => {
+                            let ia = celeste_core::spd_buckets::index(a.as_raw_u32() as i32, w, *ax);
+                            if ia != celeste_core::spd_buckets::index(b.as_raw_u32() as i32, w, *ax) {
+                                p.straddles += 1;
+                            }
+                            mix64(8 ^ (ia as u64) << 8)
+                        }
+                        (_, v) => code(v),
+                    };
+                    acc = acc.wrapping_add(mix64(h ^ cv));
+                }
+                p.states.insert(acc);
+                // A state described by its chunk's varying cells and the
+                // player's, so both trees print comparable fields.
+                let describe = || -> String {
+                    cells
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, c)| varying.contains(i) || c.3.starts_with("player") || c.3.starts_with("spd.") || c.3.starts_with("rem."))
+                        .map(|(_, (_, c, _, nm))| format!("{nm}={}", show(rt2.cols[*c].at(r))))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                if let Some(e) = against {
+                    if !e.contains(&acc) && p.only.insert(acc) && p.examples.len() < max_examples {
+                        p.examples.push(describe());
+                    }
+                }
+                if let (Some((px, py)), Some((cx, cy))) = (at, pos_cells) {
+                    let whole = |v: AV| match v {
+                        AV::Num(n) => Some(n.as_raw_u32() as i32 >> 16),
+                        _ => None,
+                    };
+                    if whole(rt2.cols[cx].at(r)) == Some(px) && whole(rt2.cols[cy].at(r)) == Some(py) && p.at_rows.len() < 64 {
+                        p.at_rows.push(describe());
+                    }
+                }
+            }
+            lo = hi;
+        }
+    }
+    Ok(p)
+}
+
+/// A frame's value cells by NAME, for the diagnostics that read or compare
+/// frames across shapes and levels: the player's position, speed and
+/// remainder (`player.x`, `spd.x`, `rem.y`, `dash_effect_time`), and every
+/// object's fields as `type[i].field` (and `type[i].field.sub` one table
+/// deeper). A cell no name reaches (a global's) is left out.
+fn cell_names(rt2: &celeste_engine::runtime2::Rt2, ids: &celeste_engine::runtime2::BoundaryIds) -> std::collections::HashMap<usize, String> {
+    use celeste_engine::runtime2::{Cell2, Col, AV};
+    let mut names = std::collections::HashMap::new();
+    if let Some(obj) = celeste_rust::search::pos_graph::player_object(rt2) {
+        for (nm, f) in [("player.x", ids.f_x), ("player.y", ids.f_y), ("dash_effect_time", ids.f_dash_effect_time)] {
+            if let Some(c) = rt2.obj_field_cell(obj, f) {
+                names.insert(c as usize, nm.to_string());
+            }
+        }
+        for (nm, f) in [("spd", ids.f_spd), ("rem", ids.f_rem)] {
+            if let Some(pc) = rt2.obj_field_cell(obj, f) {
+                if let Col::U(AV::Ptr(sub)) = rt2.cols[pc as usize] {
+                    for (ax, g) in [("x", ids.f_x), ("y", ids.f_y)] {
+                        if let Some(c) = rt2.obj_field_cell(sub, g) {
+                            names.insert(c as usize, format!("{nm}.{ax}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Every other object's fields, named `type[i].field` (and
+    // `type[i].field.sub` one table deeper): the column that multiplies a
+    // frontier is as often a platform's or a fall floor's as the player's.
+    if let Some(arr) = rt2.global_target(ids.g_objects) {
+        if let Cell2::Arr(items) = &rt2.structure[arr as usize] {
+            let type_name = |t: u32| -> String {
+                (0..celeste_names::GLOBAL_NAMES.len() as u32)
+                    .find(|&g| rt2.global_target(g) == Some(t))
+                    .map(|g| celeste_names::GLOBAL_NAMES[g as usize].to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            };
+            let field_name = |f: u32| celeste_names::FIELD_NAMES.get(f as usize).copied().unwrap_or("?");
+            for (i, item) in items.iter().enumerate() {
+                let Col::U(AV::Ptr(obj)) = rt2.cols[*item as usize] else { continue };
+                let Cell2::Obj(fields) = &rt2.structure[obj as usize] else { continue };
+                let ty = rt2
+                    .obj_field_cell(obj, ids.f_type)
+                    .and_then(|c| match rt2.cols[c as usize] {
+                        Col::U(AV::Ptr(t)) => Some(type_name(t)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "?".to_string());
+                for &(f, c) in fields {
+                    match (&rt2.structure[c as usize], &rt2.cols[c as usize]) {
+                        (Cell2::Val, Col::U(AV::Ptr(sub))) => {
+                            if let Cell2::Obj(subs) = &rt2.structure[*sub as usize] {
+                                for &(g, c2) in subs {
+                                    names.entry(c2 as usize).or_insert_with(|| format!("{ty}[{i}].{}.{}", field_name(f), field_name(g)));
+                                }
+                            }
+                        }
+                        (Cell2::Val, _) => {
+                            names.entry(c as usize).or_insert_with(|| format!("{ty}[{i}].{}", field_name(f)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    names
 }
 
 fn main() -> Result<()> {
@@ -1899,6 +2145,56 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::BucketDiff { exact_dir, bucketed_dir, from, to, w, x_only, examples, at } => {
+            let at: Option<(i32, i32)> = at
+                .map(|s| -> Result<(i32, i32)> {
+                    let (a, b) = s.split_once(',').ok_or_else(|| anyhow::anyhow!("--at x,y"))?;
+                    Ok((a.trim().parse()?, b.trim().parse()?))
+                })
+                .transpose()?;
+            // CUMULATIVE. The door dedupes across frames, so a frame's rows
+            // are only the states NEW at it, and the bucketed forward does not
+            // re-admit a key it reached earlier where exact first reaches a
+            // member of it (or the other way round). The ideal of frames <= F
+            // is the projection of every exact state of frames <= F; run from
+            // frame 0.
+            let (mut ideal, mut realized): (rustc_hash::FxHashSet<u64>, rustc_hash::FxHashSet<u64>) = Default::default();
+            for frame in from..=to {
+                let exact = project_frame(std::path::Path::new(&exact_dir), frame, w, x_only, None, 0, at)?;
+                ideal.extend(exact.states.iter().copied());
+                let bucketed = project_frame(std::path::Path::new(&bucketed_dir), frame, w, x_only, Some(&ideal), examples, at)?;
+                realized.extend(bucketed.states.iter().copied());
+                let over = realized.iter().filter(|h| !ideal.contains(*h)).count();
+                let lost = ideal.iter().filter(|h| !realized.contains(*h)).count();
+                println!(
+                    "f{frame:03} (frames {from}..={frame}): ideal {} states; realized {} states, {:.3}x the ideal; {} over-widened, {} lost (this frame: {} exact rows, {} bucketed rows, {} bucketed states not in the ideal so far){}",
+                    ideal.len(),
+                    realized.len(),
+                    realized.len() as f64 / ideal.len().max(1) as f64,
+                    over,
+                    lost,
+                    exact.rows,
+                    bucketed.rows,
+                    bucketed.only.len(),
+                    if bucketed.straddles > 0 { format!("; {} hulls span more than one bucket", bucketed.straddles) } else { String::new() }
+                );
+                for ex in &bucketed.examples {
+                    println!("  over-widened: {ex}");
+                }
+                if lost > 0 && examples > 0 {
+                    // This frame's exact states no realized state so far matches.
+                    for ex in project_frame(std::path::Path::new(&exact_dir), frame, w, x_only, Some(&realized), examples, None)?.examples {
+                        println!("  lost: {ex}");
+                    }
+                }
+                for d in &exact.at_rows {
+                    println!("  exact at: {d}");
+                }
+                for d in &bucketed.at_rows {
+                    println!("  realized at: {d}");
+                }
+            }
+        }
         Command::ColCensus { level_dir, frame, cap } => {
             use celeste_engine::runtime2::{Cell2, Col, AV};
             use celeste_rust::search::checkpoint::FrameFile;
@@ -1942,66 +2238,7 @@ fn main() -> Result<()> {
                     let hi = (lo + (1 << 20)).min(width);
                     let Some(rt2) = ff.load_rows(&[lo..hi])? else { break };
                     let st = by_shape.entry(ff.shape_hash()).or_insert_with(|| {
-                        let mut names = std::collections::HashMap::new();
-                        if let Some(obj) = celeste_rust::search::pos_graph::player_object(&rt2) {
-                            for (nm, f) in [("player.x", ids.f_x), ("player.y", ids.f_y), ("dash_effect_time", ids.f_dash_effect_time)] {
-                                if let Some(c) = rt2.obj_field_cell(obj, f) {
-                                    names.insert(c as usize, nm.to_string());
-                                }
-                            }
-                            for (nm, f) in [("spd", ids.f_spd), ("rem", ids.f_rem)] {
-                                if let Some(pc) = rt2.obj_field_cell(obj, f) {
-                                    if let Col::U(AV::Ptr(sub)) = rt2.cols[pc as usize] {
-                                        for (ax, g) in [("x", ids.f_x), ("y", ids.f_y)] {
-                                            if let Some(c) = rt2.obj_field_cell(sub, g) {
-                                                names.insert(c as usize, format!("{nm}.{ax}"));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Every other object's fields, named `type[i].field`
-                        // (and `type[i].field.sub` one table deeper): the
-                        // column that multiplies a frontier is as often a
-                        // platform's or a fall floor's as the player's.
-                        if let Some(arr) = rt2.global_target(ids.g_objects) {
-                            if let Cell2::Arr(items) = &rt2.structure[arr as usize] {
-                                let type_name = |t: u32| -> String {
-                                    (0..celeste_names::GLOBAL_NAMES.len() as u32)
-                                        .find(|&g| rt2.global_target(g) == Some(t))
-                                        .map(|g| celeste_names::GLOBAL_NAMES[g as usize].to_string())
-                                        .unwrap_or_else(|| "?".to_string())
-                                };
-                                let field_name = |f: u32| celeste_names::FIELD_NAMES.get(f as usize).copied().unwrap_or("?");
-                                for (i, item) in items.iter().enumerate() {
-                                    let Col::U(AV::Ptr(obj)) = rt2.cols[*item as usize] else { continue };
-                                    let Cell2::Obj(fields) = &rt2.structure[obj as usize] else { continue };
-                                    let ty = rt2
-                                        .obj_field_cell(obj, ids.f_type)
-                                        .and_then(|c| match rt2.cols[c as usize] {
-                                            Col::U(AV::Ptr(t)) => Some(type_name(t)),
-                                            _ => None,
-                                        })
-                                        .unwrap_or_else(|| "?".to_string());
-                                    for &(f, c) in fields {
-                                        match (&rt2.structure[c as usize], &rt2.cols[c as usize]) {
-                                            (Cell2::Val, Col::U(AV::Ptr(sub))) => {
-                                                if let Cell2::Obj(subs) = &rt2.structure[*sub as usize] {
-                                                    for &(g, c2) in subs {
-                                                        names.entry(c2 as usize).or_insert_with(|| format!("{ty}[{i}].{}.{}", field_name(f), field_name(g)));
-                                                    }
-                                                }
-                                            }
-                                            (Cell2::Val, _) => {
-                                                names.entry(c as usize).or_insert_with(|| format!("{ty}[{i}].{}", field_name(f)));
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        let names = cell_names(&rt2, ids);
                         S { rows: 0, cols: vec![Default::default(); rt2.cols.len()], varying: vec![false; rt2.cols.len()], names, spd: Default::default(), ivals: vec![0; rt2.cols.len()], ubools: vec![0; rt2.cols.len()] }
                     });
                     st.rows += rt2.width as u64;
