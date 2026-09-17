@@ -198,3 +198,28 @@ configurations 6-10x although the two arms exclude each other.
 - **As a ladder level** it is the same object: `f + d <= H` is its marked set,
   and it feeds level 0 exactly like `MarkFilter`. There is no forward at level
   -1, only the table.
+
+## Room (1,0) (2026-09-17, against a current tree)
+
+A fresh held-ladder search (`r0sxh..r15sxh,rxsx`, `--ceiling 99`, census
+`394ae0b`): OPTIMAL 99 in 1:39.7 wall, 5.76 GB peak. (`/var/tmp/celeste-room10h`
+predates the `rnd` global, so none of its shapes matched: every state was
+"other shape". The fresh tree matches every shape.)
+
+The probe at S=5, ceiling 99: 5 passes, 24 s, 1.0 GB, 17,904 nodes (15,662 reach
+an exit), the start's d = 44, max finite d = 30; 0 violations against 383,247
+in-room recorded pairs and 114 crossings; 0 marked states too late at every
+frame f50-f99 (`h099/level00.marks.bin`).
+
+| frame | states | too late (f + d > 99) | band (99, 8) |
+|---|---|---|---|
+| f050-f072 | | 0% | 0% |
+| f075 | 1,373,019 | 1.2% | 0% |
+| f080 | 1,102,103 | 7.7% | 0% |
+| f083 | 961,138 | 33.9% | 0% |
+| f085 | 1,021,640 | 50.0% | 0% |
+| f090 | 1,290,067 | 78.2% | 19.9% |
+| f095 | 1,643,893 | 93.3% | 79.1% |
+
+As a filter it would drop 18,919,491 of the 55,577,462 level-0 rows f0-f99
+(34.0%; the band 21.0%), all from f73 on.
