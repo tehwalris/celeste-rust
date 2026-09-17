@@ -83,3 +83,18 @@ floors' collision tests.
   between rounds, would cut both the re-traces and the wall time; not built.
   With the report's bind + lower of every frame: 6:17 wall, 968 MB peak,
   25,034 bodies over the 114 kernels.
+- **Kernels against the reference engine** (`rewrite forward --reference`,
+  `ckhash` of both trees), room (3,0) to f32:
+  - exact level `rxsx`: IDENTICAL through f32 (4,818 states at f32, posgraph
+    f032 identical). The region kernels and the absent-as-zero `delay` compute
+    what the interpreter does.
+  - level 0 `r0sx` (rem Bits(0)): identical through f28, then the kernels keep
+    MORE states (f32: 7,364 against the reference's 2,778 and the exact level's
+    4,818). Room (1,0) at the same level does the same (f33: the kernels'
+    26,507, the pinned gate's own count, against the reference's 7,202; they
+    part at f25): at Bits(0) the kernels over-approximate where the reference
+    engine splits the interval, so ckhash equality is a test only at an exact
+    level. Not a room (3,0) problem.
+- **Level-0 forward** (`r0sxh`, release): 114 kernels in 315 s; states from f29
+  (the player's first input), 22,656 at f35, 176,925 at f40 (x1.5 per frame),
+  f40 in 426 ms, 0.95 GB.
