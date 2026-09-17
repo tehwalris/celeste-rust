@@ -707,15 +707,21 @@ struct Built {
     start_d: u32,
 }
 
-/// A LOWER BOUND on the frames from each node to an exit, all of whose premises
-/// are the table's own - what a filter may refuse a row on. A multi-source
-/// shortest path backward over the edges, seeded where the graph stops
-/// modelling: an exit edge (1); a successor clipped to `WINDOW` (1: what lies
-/// past it is not modelled, so it may be an exit); a death successor (1 + the
-/// start state's d, `chain_frames` + d of the chain's end: the room restarts
-/// and replays the spawn chain, however long its countdown). The death seed
-/// reads the end's d, which it cannot lower (a path through a death is longer
-/// than the start's d), so the second run is the answer.
+/// A LOWER BOUND on the frames from each node to an exit - what a filter may
+/// refuse a row on. A multi-source shortest path backward over the edges,
+/// seeded where the graph stops modelling: an exit edge (1); a death successor
+/// (1 + the start state's d, `chain_frames` + d of the chain's end: the room
+/// restarts and replays the spawn chain, however long its countdown). The death
+/// seed reads the end's d, which it cannot lower (a path through a death is
+/// longer than the start's d), so the second run is the answer.
+///
+/// A successor part CLIPPED to `WINDOW` is not a seed: no real player is there
+/// at a frame boundary (the draw clamp keeps x in [-1, 121], skipped on a freeze
+/// frame by at most one move; below y = 128 the update kills; above y = -4 the
+/// room changes), so a clipped part is the evaluator's imprecision. Seeding it
+/// as a possible exit (tried first) put every node near a clamped edge within a
+/// frame or two of an exit and cut nothing in room (2,0). The claim is checked
+/// on every row the filter sees (`CostToGo::too_late`), never assumed.
 fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32) -> Vec<u32> {
     use std::cmp::Reverse;
     let n = g.nodes.len();
@@ -723,7 +729,7 @@ fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32) -> Ve
         let mut dist = vec![u32::MAX; n];
         let mut heap = std::collections::BinaryHeap::new();
         for i in 0..n {
-            let mut s = if g.exits[i] || g.clipped[i] { 1 } else { u32::MAX };
+            let mut s = if g.exits[i] { 1 } else { u32::MAX };
             if let (true, Some(w)) = (g.deaths[i], death) {
                 s = s.min(w.saturating_add(1));
             }
@@ -769,12 +775,19 @@ impl CostToGo {
     /// Is a row of `shape` at `cell` at `frame` provably unable to exit by
     /// `horizon`? Only a table node is ever refused: a row without a player,
     /// one that has left the room, a shape or a cell the table never reached
-    /// is kept.
+    /// is kept. A row in the room OUTSIDE `WINDOW` breaks the premise the table
+    /// dropped its clipped successors on (`sound_d`): it panics rather than
+    /// filter on a table that does not cover it.
     pub fn too_late(&self, shape: u64, cell: u32, frame: u32, horizon: u32) -> bool {
         let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
         if x >= 128 {
             return false;
         }
+        let (x64, y64) = (x as i64, y as i64);
+        assert!(
+            x64 >= WINDOW.0 && y64 >= WINDOW.0 && y64 <= WINDOW.1,
+            "level -1 filter: a row of shape {shape:#x} at ({x}, {y}), frame {frame}, lies outside the window {WINDOW:?} the table assumes a player never leaves"
+        );
         match self.d.get(&(shape, x as i16, y as i16)) {
             None => false,
             Some(&d) => d == u32::MAX || frame.saturating_add(d) > horizon,
@@ -1134,7 +1147,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
     let start_d = sound[end_node as usize].saturating_add(chain.len() as u32 - 1);
     say!(
         rep,
-        "sound d (a clipped successor may exit, a death costs a respawn): {} of {n} nodes finite; the start state's d = {start_d}; {} clipped and {} death nodes",
+        "sound d (a death costs a respawn; clipped parts dropped, the window checked on every filtered row): {} of {n} nodes finite; the start state's d = {start_d}; {} clipped and {} death nodes",
         sound.iter().filter(|d| **d != u32::MAX).count(),
         g1.clipped.iter().filter(|c| **c).count(),
         g1.deaths.iter().filter(|c| **c).count()

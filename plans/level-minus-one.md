@@ -231,23 +231,35 @@ As a filter it would drop 18,919,491 of the 55,577,462 level-0 rows f0-f99
 when `CostToGo::too_late`. What makes it sound where the probe only counted:
 
 - **`sound_d`**: a multi-source shortest path backward over the edges, seeded
-  where the graph stops modelling. An exit edge is 1; a successor CLIPPED to
-  the window is 1 (what lies past it may be an exit); a DEATH successor is 1 +
+  where the graph stops modelling. An exit edge is 1; a DEATH successor is 1 +
   the start state's d (the room restarts and replays the spawn chain, however
   long the countdown). The death seed reads the end's d, which it cannot lower,
   so a second run is the fixpoint.
+- **a clipped successor part is dropped, and the window is CHECKED**: no real
+  player is outside it at a frame boundary (the draw clamp keeps x in [-1,
+  121], a freeze frame skips it by at most one move; below y = 128 the update
+  kills; above y = -4 the room changes). `CostToGo::too_late` panics on any row
+  in the room outside it, so the premise is checked on every row the filter
+  sees rather than assumed.
 - **only table nodes are refused**: a row without a player cell, one that has
   left the room (x >= 128), a shape or a cell the table never reached, is kept.
 - **H is the largest horizon the run tests**: level 0 persists across
   horizons, so this is for a `--ceiling` search with H = the ceiling.
 
-Room (1,0), S=5, H=99 (release, held ladder, `--ceiling 99`):
+First tried: a clipped successor seeded as a possible exit (d = 1). Sound, and
+useless in room (2,0): its six player shapes each clip 755,646 successors
+(imprecise joins at the clamped edges), 25,224 of 154,408 nodes had one, every
+node near them got a d of a frame or two, and level 0 at f80 kept 62,810,806
+states - what it keeps with no filter at all. Stopped at f80.
 
-- the sound d: the start state's d = 29 (the plain probe's 44): 3,025 nodes
-  with a clipped successor, 12,199 with a death successor;
-- the probe with the sound d: too late 0% through f077, 10.4% at f082, 32.2%
-  at f085, 69.2% at f090, 91.9% at f095; MARKED TOO LATE 0 at every frame;
-- the search: **OPTIMAL 99** (h99 confirmed, h98 refuted at level 6), 1:46.6
-  wall with the table's 20.6 s build, 4.44 GB peak; without the filter 1:39.7
-  and 5.76 GB. Room (1,0)'s late frames are small, so it pays in memory, not
-  time. The room it is for is (2,0), whose level 0 is ~60 M states at f80.
+Room (1,0), S=5, H=99 (release, held ladder, `--ceiling 99`), as committed:
+
+- the sound d: the start state's d = 44, the plain probe's (12,199 nodes with a
+  death successor lower nothing that reaches an exit);
+- the probe with the sound d: too late 0.3% at f074, 7.4% at f079, 44.7% at
+  f084, 69.9% at f089, 90.2% at f094; MARKED TOO LATE 0 at every frame;
+- the search: **OPTIMAL 99** (h99 confirmed, h98 refuted at level 6), no row
+  outside the window, 1:44.5 wall with the table's 19.9 s build, 4.25 GB peak;
+  without the filter 1:39.7 and 5.76 GB. Room (1,0)'s late frames are small,
+  so it pays in memory, not time. The room it is for is (2,0), whose level 0
+  is ~60 M states at f80.
