@@ -83,6 +83,15 @@ floors' collision tests.
   between rounds, would cut both the re-traces and the wall time; not built.
   With the report's bind + lower of every frame: 6:17 wall, 968 MB peak,
   25,034 bodies over the 114 kernels.
+- **The walk in parallel rounds** (`room_constant_lattice`, 2026-09-17): each
+  round traces its frontier on one tracer copy per worker against the round's
+  lattice snapshot, the results applied in node order between rounds;
+  representatives cross arenas through `shapes::rebase`, frames are bound in
+  their worker's arena. Room (3,0): the same 9 shapes, 114 nodes and 25,034
+  bodies, 473 traces in 13 rounds, 20.8 s for the walk (32 workers) against
+  ~5.5 min serial; `transpile --room-consts` 46 s wall against 6:17, 1.7 GB.
+  The rounds did not cut the traces (473 against 471); the gain is the
+  parallelism. Room (1,0) gates reproduce (ckhash, posgraph, marks).
 - **Kernels against the reference engine** (`rewrite forward --reference`,
   `ckhash` of both trees), room (3,0) to f32:
   - exact level `rxsx`: IDENTICAL through f32 (4,818 states at f32, posgraph
@@ -178,6 +187,18 @@ like rooms (1,0) and (2,0). The explosion is multiplicative on top of it:
    flying);
 2. the player's exact speed (x3.3);
 3. the fall floors' state and timers (x3.1 at f55, growing).
+
+## Latent hazard found by the parallel walk (2026-09-17)
+
+A walk's representative state keeps closure scopes, and a scope created in a
+frame can hold a SYMBOLIC value: the `y` that `init_object(player, this.x,
+this.y)` captured is the spawn's position, a node of that frame. The serial
+walk carried the node into the next trace, where its `Cell(k)` leaf is
+hash-consed with the new frame's slot k, so a read of it would silently read
+another slot. Nothing in this cart reads it again (the methods read `obj`),
+and room (3,0) matches the reference engine exactly at `rxsx`, but nothing
+checks it either. `shapes::rebase` now blanks such values (and refuses a table
+scalar that is neither a state path nor a constant).
 
 ## 4. What it would take (proposal, not built)
 

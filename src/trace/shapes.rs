@@ -160,6 +160,112 @@ pub fn blank(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     Ok(())
 }
 
+/// Every number and boolean in the heap - its tables' and its closure scopes'
+/// - that is a constant, by node: what `rebase` re-makes in another arena.
+pub fn heap_constants(st: &State<Symbolic>, d: &Symbolic) -> std::collections::HashMap<u32, iface::Conc> {
+    use super::domain::Domain;
+    let mut out = std::collections::HashMap::new();
+    let mut note = |v: &Value<Symbolic>| match v {
+        Value::Num(n) => {
+            if let Some(c) = d.as_const(n) {
+                out.insert(*n, iface::Conc::Num(c));
+            }
+        }
+        Value::Bool(b) => {
+            if let Some(c) = d.decide(b) {
+                out.insert(*b, iface::Conc::Bool(c));
+            }
+        }
+        _ => {}
+    };
+    for tab in st.heap.tables.values() {
+        for v in tab.hash.values().chain(tab.arr.iter()).chain(tab.ints.values()) {
+            note(v);
+        }
+    }
+    for sc in st.heap.scopes.values() {
+        for v in sc.vars.values() {
+            note(v);
+        }
+    }
+    out
+}
+
+/// Move a walk's representative state into another tracer's arena
+/// (`kernel::room_constant_lattice`'s rounds): every number and boolean names
+/// a node of the arena it was produced in. The slots `blank` rewrites are
+/// blanked; every OTHER scalar - a frozen table's, a closure scope's (the
+/// `x`/`y` an object's methods captured at `init_object`) - is re-made from
+/// `constants` (`heap_constants` of the state, in the arena it came from); a
+/// table scalar that is neither refuses, a closure scope's is blanked (below).
+/// The path's decisions and the key overrides go with `guard` and `ok`.
+pub fn rebase(st: &mut State<Symbolic>, d: &mut Symbolic, constants: &std::collections::HashMap<u32, iface::Conc>) -> Result<()> {
+    // Where `blank` writes: each state path's (table, last step).
+    let mut blanked: std::collections::BTreeSet<(u32, Step)> = Default::default();
+    for p in state_paths(st)? {
+        let Some((last, parent)) = p.split_last() else { continue };
+        if let Some(Value::Table(t)) = iface::get(st, &parent.to_vec()) {
+            blanked.insert((t, last.clone()));
+        }
+    }
+    let remake = |d: &mut Symbolic, at: &dyn Fn() -> String, v: &mut Value<Symbolic>| -> Result<()> {
+        let (n, is_num) = match v {
+            Value::Num(n) => (*n, true),
+            Value::Bool(b) => (*b, false),
+            _ => return Ok(()),
+        };
+        *v = match (constants.get(&n), is_num) {
+            (Some(iface::Conc::Num(c)), true) => Value::Num(d.num(*c)),
+            (Some(iface::Conc::Bool(c)), false) => Value::Bool(d.boolean(*c)),
+            _ => anyhow::bail!("rebasing a walk state: {} holds node {n}, neither a constant nor a slot `blank` rewrites", at()),
+        };
+        Ok(())
+    };
+    for (t, tab) in st.heap.tables.iter_mut() {
+        for (k, v) in tab.hash.iter_mut() {
+            if !blanked.contains(&(*t, Step::Key(k.clone()))) {
+                remake(d, &|| format!("table {t} [{k:?}]"), v)?;
+            }
+        }
+        for (i, v) in tab.arr.iter_mut().enumerate() {
+            if !blanked.contains(&(*t, Step::Idx(i))) {
+                remake(d, &|| format!("table {t} [{i}]"), v)?;
+            }
+        }
+        for (i, v) in tab.ints.iter_mut() {
+            if !blanked.contains(&(*t, Step::Int(*i))) {
+                remake(d, &|| format!("table {t} [int {i}]"), v)?;
+            }
+        }
+    }
+    // A closure scope can also hold a value no constant describes: the `y`
+    // `init_object(player, this.x, this.y)` captured is the spawn's symbolic
+    // position, a node of the previous frame. Nothing reads it again (the
+    // methods read `obj`), and a trace that did would read garbage either way:
+    // in the serial walk the node is the previous frame's `Cell(k)`, which is
+    // hash-consed with THIS frame's slot k. So it is blanked like `guard` and
+    // `ok`, which is what carrying it amounted to.
+    for sc in st.heap.scopes.values_mut() {
+        for v in sc.vars.values_mut() {
+            let (n, is_num) = match v {
+                Value::Num(n) => (*n, true),
+                Value::Bool(b) => (*b, false),
+                _ => continue,
+            };
+            *v = match (constants.get(&n), is_num) {
+                (Some(iface::Conc::Num(c)), true) => Value::Num(d.num(*c)),
+                (Some(iface::Conc::Bool(c)), false) => Value::Bool(d.boolean(*c)),
+                (_, true) => Value::Num(d.num(celeste_core::pico8_num::Pico8Num::from_i16(0))),
+                (_, false) => Value::Bool(d.boolean(false)),
+            };
+        }
+    }
+    blank(st, d)?;
+    st.path.clear();
+    st.key_override.clear();
+    Ok(())
+}
+
 /// Which room a state is in. Concrete: `room` is frozen as an input and
 /// `load_room` only ever writes it a constant.
 pub fn room_of(st: &State<Symbolic>, d: &Symbolic) -> (i16, i16) {

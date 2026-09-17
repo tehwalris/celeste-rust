@@ -99,7 +99,14 @@ pub(crate) fn lattice_kernel_refs(
     // arenas; an exact-speed set's frames are bound against the walk's.
     let frames: Vec<(KernelKey, super::verify::Frame, Bounds, Option<Bound>)> = match opts.spd.width_log2() {
         Some(w) => key_fixpoint(&lw, w)?.into_iter().map(|n| (KernelKey { speed: n.key, region: None }, n.frame, n.bounds, Some(n.bound))).collect(),
-        None => std::mem::take(&mut lw.frames).into_iter().map(|((_, region), (f, b))| (KernelKey { speed: None, region }, f, b, None)).collect(),
+        // Bound by the walk, each in the worker arena it was traced in.
+        None => std::mem::take(&mut lw.frames)
+            .into_iter()
+            .map(|((shape, region), wf)| -> Result<_> {
+                let bound = wf.bound.map_err(|e| anyhow::anyhow!("the walk's frame of shape {shape} region {region:?} did not bind: {e}"))?;
+                Ok((KernelKey { speed: None, region }, wf.frame, wf.bounds, Some(bound)))
+            })
+            .collect::<Result<Vec<_>>>()?,
     };
     // Bind + lower (specialize + decide, the expensive half of a kernel
     // build) per frame, frames in parallel.
@@ -1124,12 +1131,13 @@ pub fn key_probe(root: &std::path::Path, dump: &std::path::Path, sel: &[usize], 
         let (shape, key, range) = parse_node_line(line)?;
         if exact_done.insert(shape) {
             let skey = lwx.by_hash.get(&shape).ok_or_else(|| anyhow::anyhow!("the exact-speed lattice has no shape {shape:#x}"))?;
-            let f = &lwx.frames[&(skey.clone(), None)].0;
-            let bound = super::emit::bind(f, &lwx.tracer.it.d.graph, lwx.opts.widen)?;
+            let wf = &lwx.frames[&(skey.clone(), None)];
+            let f = &wf.frame;
+            let bound = wf.bound.as_ref().map_err(|e| anyhow::anyhow!("the walk's frame of shape {shape:#x} did not bind: {e}"))?;
             let t = std::time::Instant::now();
-            let lowered = super::emit::lower_frame(&bound, Some(room.clone()), Default::default())?;
+            let lowered = super::emit::lower_frame(bound, Some(room.clone()), Default::default())?;
             writeln!(out, "=== exact-speed kernel of shape {shape:#x}: lower {:.2} s", t.elapsed().as_secs_f64())?;
-            out.push_str(&body_breakdown(f, &bound, &lowered.spec));
+            out.push_str(&body_breakdown(f, bound, &lowered.spec));
             out.push_str(&census_of(&lowered.spec));
         }
         writeln!(out, "=== node {i}: {key:?}, range x [{:.4}, {:.4}] y [{:.4}, {:.4}]", range[0].0 as f64 / 65536.0, range[0].1 as f64 / 65536.0, range[1].0 as f64 / 65536.0, range[1].1 as f64 / 65536.0)?;
@@ -1290,7 +1298,7 @@ pub fn key_fixpoint(lw: &LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
     anyhow::ensure!(region_grid().is_none(), "the speed-key fixpoint is not built with the region key (CELESTE_REGION)");
     let t = std::time::Instant::now();
     let (mut t_trace, mut t_succ) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-    let start_shape = lw.frames[&(lw.start_key.clone(), None)].0.in_rt2.shape_hash_of();
+    let start_shape = lw.frames[&(lw.start_key.clone(), None)].frame.in_rt2.shape_hash_of();
     let buckets_y = lw.opts.spd.buckets_y();
     let (start_key, start_range) = concrete_key(&lw.reps[&lw.start_key], &lw.tracer.it.d, w, buckets_y)?;
     // A key's whole buckets, per bucketed axis; an unbucketed y keeps what
@@ -1534,7 +1542,7 @@ mod tests {
         let lw = super::room_constant_lattice(std::path::Path::new("."), opts).expect("lattice");
         let mut tr = lw.tracer.clone();
         let skey = lw.reps.iter().find(|(_, st)| crate::trace::shapes::player_path(st).is_some()).map(|(k, _)| k.clone()).expect("a shape with a player");
-        let shape = lw.frames[&(skey.clone(), None)].0.in_rt2.shape_hash_of();
+        let shape = lw.frames[&(skey.clone(), None)].frame.in_rt2.shape_hash_of();
         let rest = super::SpeedKey {
             bx: celeste_core::spd_buckets::index(0, 16, 0),
             by: celeste_core::spd_buckets::index(0, 16, 1),
@@ -2236,8 +2244,7 @@ pub fn room_constant_lattice(
 ) -> Result<LatticeWalk> {
     use super::domain::Symbolic;
     use super::interp::Interp;
-    use super::verify::{run_one, trace_frame};
-    use super::domain::Domain;
+    use super::verify::run_one;
     use super::{cart, shapes};
     use anyhow::{anyhow, bail};
     type Cmap = std::collections::BTreeMap<super::iface::Path, super::iface::Conc>;
@@ -2274,7 +2281,7 @@ pub fn room_constant_lattice(
     let mut lattice: std::collections::BTreeMap<String, Cmap> = Default::default();
     let mut reps: std::collections::BTreeMap<String, super::state::State<Symbolic>> = Default::default();
     let mut forks: std::collections::BTreeMap<String, usize> = Default::default();
-    let mut frames: std::collections::BTreeMap<WalkNode, (super::verify::Frame, Bounds)> = Default::default();
+    let mut frames: std::collections::BTreeMap<WalkNode, WalkFrame> = Default::default();
     let mut forkops: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let mut refused: std::collections::BTreeMap<WalkNode, String> = Default::default();
     let mut ival_extra: std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>> = Default::default();
@@ -2294,164 +2301,186 @@ pub fn room_constant_lattice(
     let start_regions = successor_regions(&start, &mut it.d, grid)?;
     let mut regions: std::collections::BTreeMap<String, std::collections::BTreeSet<Option<Region>>> = Default::default();
     regions.insert(sk.clone(), start_regions.iter().copied().collect());
-    let mut work: Vec<WalkNode> = start_regions.into_iter().map(|r| (sk.clone(), r)).collect();
     let room0 = shapes::room_of(&start, &it.d);
-    let mut guard = 0usize;
+    let lattice_trace = std::env::var_os("CELESTE_LATTICE_TRACE").is_some();
 
-    while let Some((k, region)) = work.pop() {
-        guard += 1;
-        if guard > 20000 { bail!("constant-lattice fixpoint did not converge"); }
-        let st = reps[&k].clone();
-        let roots = shapes::state_paths(&st)?;
-        let ival = if opts.ival { with_extra(shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival()), ival_extra.get(&k)) } else { Vec::new() };
-        // Pin the shape's known constants (only those that are real scalar
-        // inputs here), everything else abstract.
-        let pin: Vec<(super::iface::Path, super::iface::Conc)> = lattice[&k]
+    // THE ROUNDS IN PARALLEL (2026-09-17, plans/room30.md): each round traces
+    // its whole frontier, one copy of the tracer per worker, against the
+    // round's snapshot of the lattice, and the results are applied in node
+    // order between rounds. A narrowed lattice re-traces a node once per
+    // round, not once per narrowing (room (3,0): 471 serial traces for 114
+    // nodes, 315 s). A new shape's representative crosses from a worker's
+    // arena into the walk's through `shapes::rebase` (checked); each frame is
+    // bound in the arena it was traced in (`WalkFrame::bound`).
+    let mut rep_constants: std::collections::BTreeMap<String, std::collections::HashMap<u32, super::iface::Conc>> = Default::default();
+    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let mut tracers: Vec<Tracer> = (0..n_workers).map(|_| Tracer { it: it.clone(), reset, fr }).collect();
+    let mut frontier: Vec<WalkNode> = start_regions.into_iter().map(|r| (sk.clone(), r)).collect();
+    let (mut traces, mut round) = (0usize, 0usize);
+    let t_walk = std::time::Instant::now();
+    while !frontier.is_empty() {
+        round += 1;
+        traces += frontier.len();
+        if traces > 20000 {
+            bail!("constant-lattice fixpoint did not converge");
+        }
+        let t_round = std::time::Instant::now();
+        let jobs: Vec<WalkJob> = frontier
             .iter()
-            .filter(|(p, _)| roots.iter().any(|r| r == *p))
-            .map(|(p, c)| (p.clone(), *c))
-            .collect();
-        let bounds: Bounds = match (grid, region, shapes::player_path(&st)) {
-            (Some(g), Some(r), Some(pl)) => g.bounds(&pl, r).into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect(),
-            (None, None, _) | (Some(_), None, None) => Vec::new(),
-            (g, r, pl) => bail!("walk node {r:?} of a shape {} a player under grid {g:?}", if pl.is_some() { "with" } else { "without" }),
-        };
-        let f = match trace_frame(&mut it, reset, fr, st, &roots, &pin, &ival, opts.widen_mode(), &bounds) {
-            Ok(f) => f,
-            Err(e) => {
-                // Remember the refusal instead of silently skipping: a
-                // shape that never traces is a MISSING KERNEL, and the
-                // post-fixpoint check below turns that into a hard
-                // error. (A refusal on an early pass that a later
-                // re-trace of the same shape survives is fine - the
-                // successful frame lands in `frames`.)
-                //
-                // And the shape's EARLIER frame goes: it was traced under
-                // pins the lattice has since dropped, so a kernel built from
-                // it bakes constants the shape no longer has. Keeping it
-                // turned a refused re-trace into a runtime premise failure
-                // (room (4,0): the spawn's `state`/`delay` baked at 0, a
-                // KERNEL COVERAGE GAP at f8, 2026-09-16).
-                refused.insert((k.clone(), region), format!("{:#}", e));
-                frames.remove(&(k.clone(), region));
-                continue;
-            }
-        };
-        refused.remove(&(k.clone(), region));
-        // Live forks of THIS (converged-so-far) trace of shape k.
-        {
-            use crate::transpile::graph::Op;
-            let mut rn: Vec<crate::transpile::graph::NodeId> = Vec::new();
-            for o in &f.outs { for (_, nd, _) in &o.fields { rn.push(*nd); } rn.push(o.guard); rn.push(o.ok); }
-            let reach = crate::transpile::bdd::reachable(&it.d.graph, &rn);
-            let mut fs = std::collections::BTreeSet::new();
-            for id in 0..it.d.graph.len() { if reach[id] { if let Op::Split(d) = it.d.graph.get(id as u32).op { fs.insert(d); } } }
-            forks.insert(k.clone(), fs.len());
-            if fs.len() > 2 {
-                let mut ops = Vec::new();
-                for id in 0..it.d.graph.len() {
-                    if reach[id] { if let Op::Split(_) = it.d.graph.get(id as u32).op {
-                        let operand = it.d.graph.get(id as u32).args[0];
-                        ops.push(super::emit::show_tree(&it.d.graph, operand, 5));
-                    } }
+            .map(|(k, region)| -> Result<WalkJob> {
+                let st = reps[k].clone();
+                let roots = shapes::state_paths(&st)?;
+                let ival = if opts.ival { with_extra(shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival()), ival_extra.get(k)) } else { Vec::new() };
+                // Pin the shape's known constants (only those that are real
+                // scalar inputs here), everything else abstract.
+                let pin: Vec<(super::iface::Path, super::iface::Conc)> =
+                    lattice[k].iter().filter(|(p, _)| roots.iter().any(|r| r == *p)).map(|(p, c)| (p.clone(), *c)).collect();
+                let bounds: Bounds = match (grid, *region, shapes::player_path(&st)) {
+                    (Some(g), Some(r), Some(pl)) => g.bounds(&pl, r).into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect(),
+                    (None, None, _) | (Some(_), None, None) => Vec::new(),
+                    (g, r, pl) => bail!("walk node {r:?} of a shape {} a player under grid {g:?}", if pl.is_some() { "with" } else { "without" }),
+                };
+                let rebase = if *k == start_key { None } else { Some(rep_constants[k].clone()) };
+                Ok(WalkJob { node: (k.clone(), *region), st, roots, pin, ival, bounds, rebase })
+            })
+            .collect::<Result<_>>()?;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (jobs_ref, next_ref) = (&jobs, &next);
+        let results: Vec<Result<Vec<(usize, WalkTraced)>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = tracers
+                .iter_mut()
+                .map(|tr| {
+                    std::thread::Builder::new()
+                        .stack_size(128 * 1024 * 1024)
+                        .spawn_scoped(scope, move || -> Result<Vec<(usize, WalkTraced)>> {
+                            let mut done = Vec::new();
+                            loop {
+                                let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some(job) = jobs_ref.get(i) else { break };
+                                done.push((i, walk_trace(tr, job, opts, grid, room0)?));
+                            }
+                            Ok(done)
+                        })
+                        .expect("spawn walk worker")
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("walk worker panicked")).collect()
+        });
+        let mut traced: Vec<(usize, WalkTraced)> = Vec::new();
+        for r in results {
+            traced.extend(r?);
+        }
+        traced.sort_by_key(|(i, _)| *i);
+        let mut next_frontier: std::collections::BTreeSet<WalkNode> = Default::default();
+        for (i, t) in traced {
+            let job = &jobs[i];
+            let (k, region) = (&job.node.0, job.node.1);
+            match t {
+                WalkTraced::Refused(e) => {
+                    // Remember the refusal instead of silently skipping: a
+                    // shape that never traces is a MISSING KERNEL, and the
+                    // post-fixpoint check below turns that into a hard
+                    // error. (A refusal on an early pass that a later
+                    // re-trace of the same shape survives is fine - the
+                    // successful frame lands in `frames`.)
+                    //
+                    // And the shape's EARLIER frame goes: it was traced under
+                    // pins the lattice has since dropped, so a kernel built from
+                    // it bakes constants the shape no longer has. Keeping it
+                    // turned a refused re-trace into a runtime premise failure
+                    // (room (4,0): the spawn's `state`/`delay` baked at 0, a
+                    // KERNEL COVERAGE GAP at f8, 2026-09-16).
+                    refused.insert(job.node.clone(), e);
+                    frames.remove(&job.node);
                 }
-                forkops.insert(k.clone(), ops);
-            }
-        }
-        // Keep the converged frame for generation (last trace wins).
-        let lattice_trace = std::env::var_os("CELESTE_LATTICE_TRACE").is_some();
-        if lattice_trace {
-            eprintln!(
-                "[lattice] trace shape #{} region {:?} ({} pinned): {} outcomes, {} nodes added ({} in the arena)",
-                lattice.keys().position(|x| *x == k).unwrap_or(usize::MAX),
-                region,
-                pin.len(),
-                f.outs.len(),
-                it.d.node_count().saturating_sub(it.trace_start_nodes),
-                it.d.node_count()
-            );
-        }
-        for o in &f.outs {
-            if it.d.decide(&o.ok) == Some(false) {
-                if lattice_trace { eprintln!("[lattice]   outcome skipped: ok folds false"); }
-                continue;
-            }
-            if shapes::room_of(&o.st, &it.d) != room0 {
-                if lattice_trace { eprintln!("[lattice]   outcome skipped: another room"); }
-                continue;
-            }
-            let tk = key(&o.st)?;
-            let fc = shapes::field_constants(&o.st, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held)?;
-            // The slots this outcome wrote an interval to, outside the
-            // boundary's own widenings: the next frame reads them as
-            // interval inputs.
-            let widened = shapes::ival_paths(&o.st, opts.spd_ival(), opts.pos_ival());
-            let mut new_ival = false;
-            if opts.ival {
-                for p in shapes::state_paths(&o.st)? {
-                    if widened.contains(&p) {
-                        continue;
+                WalkTraced::Traced { frame, bound, forks: live_forks, forkops: ops, nodes_added, arena, outs, skipped } => {
+                    refused.remove(&job.node);
+                    forks.insert(k.clone(), live_forks);
+                    if live_forks > 2 {
+                        forkops.insert(k.clone(), ops);
                     }
-                    if let Some(super::heap::Value::Num(n)) = super::iface::get(&o.st, &p) {
-                        if it.d.is_interval(&n) {
-                            new_ival |= ival_extra.entry(tk.clone()).or_default().insert(p);
+                    if lattice_trace {
+                        eprintln!(
+                            "[lattice] trace shape #{} region {:?} ({} pinned): {} outcomes, {} nodes added ({} in the worker's arena)",
+                            lattice.keys().position(|x| x == k).unwrap_or(usize::MAX),
+                            region,
+                            job.pin.len(),
+                            frame.outs.len(),
+                            nodes_added,
+                            arena
+                        );
+                        for s in &skipped {
+                            eprintln!("[lattice]   outcome skipped: {s}");
                         }
                     }
-                }
-            }
-            if lattice_trace {
-                let known = lattice.get(&tk).map(|m| m.iter().filter(|(p, v)| fc.get(*p) != Some(*v)).map(|(p, _)| super::iface::show(p)).collect::<Vec<_>>());
-                match known {
-                    None => {
-                        // What separates the new shape from the one whose
-                        // frame produced it.
-                        let d = shape_key_diff(&k, &tk, 40);
-                        eprintln!(
-                            "[lattice]   outcome: NEW shape, {} constants; from shape #{}: after `{}`, `{}` ({} tokens) became `{}` ({} tokens)",
-                            fc.len(),
-                            lattice.keys().position(|x| *x == k).unwrap_or(usize::MAX),
-                            d.before,
-                            d.a,
-                            d.a_len,
-                            d.b,
-                            d.b_len
-                        )
+                    for o in outs {
+                        let tk = o.key;
+                        // The slots this outcome wrote an interval to, outside
+                        // the boundary's own widenings: the next frame reads
+                        // them as interval inputs.
+                        let mut new_ival = false;
+                        for p in o.ival {
+                            new_ival |= ival_extra.entry(tk.clone()).or_default().insert(p);
+                        }
+                        if lattice_trace {
+                            let known = lattice.get(&tk).map(|m| m.iter().filter(|(p, v)| o.constants.get(*p) != Some(*v)).map(|(p, _)| super::iface::show(p)).collect::<Vec<_>>());
+                            match known {
+                                None => {
+                                    // What separates the new shape from the one
+                                    // whose frame produced it.
+                                    let d = shape_key_diff(k, &tk, 40);
+                                    eprintln!(
+                                        "[lattice]   outcome: NEW shape, {} constants; from shape #{}: after `{}`, `{}` ({} tokens) became `{}` ({} tokens)",
+                                        o.constants.len(),
+                                        lattice.keys().position(|x| x == k).unwrap_or(usize::MAX),
+                                        d.before,
+                                        d.a,
+                                        d.a_len,
+                                        d.b,
+                                        d.b_len
+                                    )
+                                }
+                                Some(gone) => eprintln!("[lattice]   outcome: shape #{}, constants removed: {:?}", lattice.keys().position(|x| *x == tk).unwrap_or(usize::MAX), gone),
+                            }
+                        }
+                        let changed = match lattice.get_mut(&tk) {
+                            None => {
+                                lattice.insert(tk.clone(), o.constants);
+                                let mut rep = o.st;
+                                shapes::rebase(&mut rep, &mut it.d, &o.heap_constants)?;
+                                rep_constants.insert(tk.clone(), shapes::heap_constants(&rep, &it.d));
+                                reps.insert(tk.clone(), rep);
+                                true
+                            }
+                            Some(m) => {
+                                let before = m.len();
+                                m.retain(|p, v| o.constants.get(p) == Some(v));
+                                m.len() != before
+                            }
+                        };
+                        // The outcome's regions: the new ones are traced, and a
+                        // narrowed lattice re-traces every region the shape has
+                        // reached.
+                        let reached = regions.entry(tk.clone()).or_default();
+                        let mut push: Vec<Option<Region>> = if changed || new_ival { reached.iter().copied().collect() } else { Vec::new() };
+                        for r in o.regions {
+                            if reached.insert(r) {
+                                push.push(r);
+                            }
+                        }
+                        for r in push {
+                            next_frontier.insert((tk.clone(), r));
+                        }
                     }
-                    Some(gone) => eprintln!("[lattice]   outcome: shape #{}, constants removed: {:?}", lattice.keys().position(|x| *x == tk).unwrap_or(usize::MAX), gone),
-                }
-            }
-            let changed = match lattice.get_mut(&tk) {
-                None => {
-                    lattice.insert(tk.clone(), fc);
-                    let mut rep = o.st.clone();
-                    shapes::blank(&mut rep, &mut it.d)?;
-                    reps.insert(tk.clone(), rep);
-                    true
-                }
-                Some(m) => {
-                    let before = m.len();
-                    m.retain(|p, v| fc.get(p) == Some(v));
-                    m.len() != before
-                }
-            };
-            // The outcome's regions: the new ones are traced, and a narrowed
-            // lattice re-traces every region the shape has reached.
-            let succ = successor_regions(&o.st, &mut it.d, grid)?;
-            let reached = regions.entry(tk.clone()).or_default();
-            let mut push: Vec<Option<Region>> = if changed || new_ival { reached.iter().copied().collect() } else { Vec::new() };
-            for r in succ {
-                if reached.insert(r) {
-                    push.push(r);
-                }
-            }
-            for r in push {
-                let node = (tk.clone(), r);
-                if !work.contains(&node) {
-                    work.push(node);
+                    // Keep the converged frame for generation (last trace wins).
+                    frames.insert(job.node.clone(), WalkFrame { frame, bounds: job.bounds.clone(), bound });
                 }
             }
         }
-        frames.insert((k.clone(), region), (f, bounds));
+        if lattice_trace {
+            eprintln!("[walk] round {round}: {} traced, {} next, {:.1} s", jobs.len(), next_frontier.len(), t_round.elapsed().as_secs_f64());
+        }
+        frontier = next_frontier.into_iter().collect();
     }
     // Every reachable shape must have a frame. A shape whose every
     // trace refused would otherwise just be MISSING from the generated
@@ -2471,13 +2500,16 @@ pub fn room_constant_lattice(
             missing.join("\n")
         );
     }
-    if grid.is_some() {
-        eprintln!("[region] the walk reached {} shapes in {} (shape, region) nodes ({guard} traces)", lattice.len(), nodes.len());
-    }
+    eprintln!(
+        "[walk] reached {} shapes in {} (shape, region) nodes: {traces} traces in {round} rounds, {:.1} s ({n_workers} workers)",
+        lattice.len(),
+        nodes.len(),
+        t_walk.elapsed().as_secs_f64()
+    );
     let graph = it.d.graph.clone();
     let mut by_hash = std::collections::HashMap::new();
-    for ((k, _), (f, _)) in &frames {
-        by_hash.insert(f.in_rt2.shape_hash_of(), k.clone());
+    for ((k, _), wf) in &frames {
+        by_hash.insert(wf.frame.in_rt2.shape_hash_of(), k.clone());
     }
     Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops, tracer: Tracer { it, reset, fr }, by_hash, opts, start_key, ival_extra })
 }
@@ -2491,6 +2523,138 @@ fn with_extra(mut ival: Vec<super::iface::Path>, extra: Option<&std::collections
         }
     }
     ival
+}
+
+/// What one walk node is traced under, from its round's snapshot of the
+/// lattice.
+struct WalkJob {
+    node: WalkNode,
+    st: super::state::State<super::domain::Symbolic>,
+    roots: Vec<super::iface::Path>,
+    pin: Vec<(super::iface::Path, super::iface::Conc)>,
+    ival: Vec<super::iface::Path>,
+    bounds: Bounds,
+    /// `Some` where the representative is a rebased outcome, not the walk's
+    /// start state: its heap's constants in the walk's arena, to rebase it
+    /// into the worker's (`shapes::rebase`).
+    rebase: Option<std::collections::HashMap<u32, super::iface::Conc>>,
+}
+
+/// A live outcome of a traced walk node, as the walk reads it: its shape
+/// key, its constants, the slots it wrote an interval to beyond the
+/// boundary's own widenings, its regions, and the state (a new shape's
+/// representative).
+struct WalkOutcome {
+    key: String,
+    constants: std::collections::BTreeMap<super::iface::Path, super::iface::Conc>,
+    ival: Vec<super::iface::Path>,
+    regions: Vec<Option<Region>>,
+    st: super::state::State<super::domain::Symbolic>,
+    /// `shapes::heap_constants` of `st`, in the worker's arena.
+    heap_constants: std::collections::HashMap<u32, super::iface::Conc>,
+}
+
+/// One traced walk node, or why its trace refused.
+enum WalkTraced {
+    Refused(String),
+    Traced {
+        frame: super::verify::Frame,
+        bound: std::result::Result<Bound, String>,
+        forks: usize,
+        forkops: Vec<String>,
+        nodes_added: usize,
+        arena: usize,
+        outs: Vec<WalkOutcome>,
+        skipped: Vec<&'static str>,
+    },
+}
+
+/// A walk node's converged frame, the bounds it was traced under (its
+/// region's; none without a region key), and the frame bound in the arena it
+/// was traced in (a worker's, gone once the walk returns), or why it did not
+/// bind.
+pub struct WalkFrame {
+    pub frame: super::verify::Frame,
+    pub bounds: Bounds,
+    pub bound: std::result::Result<Bound, String>,
+}
+
+/// Trace one walk node on a worker's tracer and read what the walk needs off
+/// it, all in that worker's arena.
+fn walk_trace(
+    tr: &mut Tracer,
+    job: &WalkJob,
+    opts: super::shapes::WalkOpts,
+    grid: Option<RegionGrid>,
+    room0: (i16, i16),
+) -> Result<WalkTraced> {
+    use super::domain::Domain;
+    use super::{shapes, verify};
+    use crate::transpile::graph::Op;
+    let mut st = job.st.clone();
+    if let Some(constants) = &job.rebase {
+        shapes::rebase(&mut st, &mut tr.it.d, constants)?;
+    }
+    let f = match verify::trace_frame(&mut tr.it, tr.reset, tr.fr, st, &job.roots, &job.pin, &job.ival, opts.widen_mode(), &job.bounds) {
+        Ok(f) => f,
+        Err(e) => return Ok(WalkTraced::Refused(format!("{:#}", e))),
+    };
+    let nodes_added = tr.it.d.node_count().saturating_sub(tr.it.trace_start_nodes);
+    // Live forks of THIS trace.
+    let (live_forks, forkops) = {
+        let g = &tr.it.d.graph;
+        let mut rn: Vec<crate::transpile::graph::NodeId> = Vec::new();
+        for o in &f.outs {
+            for (_, nd, _) in &o.fields {
+                rn.push(*nd);
+            }
+            rn.push(o.guard);
+            rn.push(o.ok);
+        }
+        let reach = crate::transpile::bdd::reachable(g, &rn);
+        let splits: Vec<u32> = (0..g.len()).filter(|&id| reach[id] && matches!(g.get(id as u32).op, Op::Split(_))).map(|id| id as u32).collect();
+        let mut live = std::collections::BTreeSet::new();
+        for &id in &splits {
+            if let Op::Split(d) = g.get(id).op {
+                live.insert(d);
+            }
+        }
+        let ops: Vec<String> = if live.len() > 2 { splits.iter().map(|&id| super::emit::show_tree(g, g.get(id).args[0], 5)).collect() } else { Vec::new() };
+        (live.len(), ops)
+    };
+    let mut outs = Vec::new();
+    let mut skipped = Vec::new();
+    for o in &f.outs {
+        if tr.it.d.decide(&o.ok) == Some(false) {
+            skipped.push("ok folds false");
+            continue;
+        }
+        if shapes::room_of(&o.st, &tr.it.d) != room0 {
+            skipped.push("another room");
+            continue;
+        }
+        let key = format!("{:?}", o.st.shape()?);
+        let constants = shapes::field_constants(&o.st, &tr.it.d, opts.spd_ival(), opts.pos_ival(), opts.held)?;
+        let mut ival = Vec::new();
+        if opts.ival {
+            let widened = shapes::ival_paths(&o.st, opts.spd_ival(), opts.pos_ival());
+            for p in shapes::state_paths(&o.st)? {
+                if widened.contains(&p) {
+                    continue;
+                }
+                if let Some(super::heap::Value::Num(n)) = super::iface::get(&o.st, &p) {
+                    if tr.it.d.is_interval(&n) {
+                        ival.push(p);
+                    }
+                }
+            }
+        }
+        let regions = successor_regions(&o.st, &mut tr.it.d, grid)?;
+        let heap_constants = shapes::heap_constants(&o.st, &tr.it.d);
+        outs.push(WalkOutcome { key, constants, ival, regions, st: o.st.clone(), heap_constants });
+    }
+    let bound = super::emit::bind(&f, &tr.it.d.graph, opts.widen).map_err(|e| format!("{:#}", e));
+    Ok(WalkTraced::Traced { frame: f, bound, forks: live_forks, forkops, nodes_added, arena: tr.it.d.node_count(), outs, skipped })
 }
 
 /// The tracer a walk ran in, kept so a shape can be re-traced later in
@@ -2536,9 +2700,8 @@ pub struct LatticeWalk {
     pub lattice: std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,
     pub reps: std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic>>,
     pub forks: std::collections::BTreeMap<String, usize>,
-    /// Per (shape, region), its converged frame and the bounds it was traced
-    /// under (the region's; none without a region key).
-    pub frames: std::collections::BTreeMap<WalkNode, (super::verify::Frame, Bounds)>,
+    /// Per (shape, region), its converged frame, bounds and binding.
+    pub frames: std::collections::BTreeMap<WalkNode, WalkFrame>,
     pub graph: crate::transpile::graph::Graph,
     pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
@@ -2553,14 +2716,14 @@ pub struct LatticeWalk {
 
 /// Report the constant lattice for `transpile --room-consts`.
 pub fn room_constants(root: &std::path::Path) -> Result<String> {
-    let LatticeWalk { lattice, forks, mut frames, graph, cart, cache, forkops, .. } =
+    let LatticeWalk { lattice, forks, frames, cart, cache, forkops, .. } =
         room_constant_lattice(root, super::shapes::WalkOpts::LEVEL0)?;
     let room = crate::transpile::graph::Room { cart: cart.clone(), cache: cache.clone() };
-    // Bind+lower each converged frame to get the emitted size.
+    // Lower each converged frame (bound by the walk) to get the emitted size.
     let mut bodies_by_shape: std::collections::BTreeMap<String, usize> = Default::default();
-    for ((k, _), (f, bounds)) in frames.iter_mut() {
-        if let Ok(bound) = super::emit::bind(f, &graph, true) {
-            if let Ok(low) = super::emit::lower_frame(&bound, Some(room.clone()), engine_ranges(f, bounds)) {
+    for ((k, _), wf) in &frames {
+        if let Ok(bound) = &wf.bound {
+            if let Ok(low) = super::emit::lower_frame(bound, Some(room.clone()), engine_ranges(&wf.frame, &wf.bounds)) {
                 *bodies_by_shape.entry(k.clone()).or_default() += low.bodies;
             }
         }
