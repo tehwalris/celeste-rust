@@ -73,12 +73,26 @@ f50 20.8 s. Its RSS, 13-16 GB, held 17 prebuilt kernel sets; this run peaks at
 4.9 GB at f50 and 14.7 GB at f55 for level 0 alone, so they don't compare.)
 55,125,381 states visited through f55.
 
-**Kernel build time regressed:** the walk takes 414 s (493 traces in 13
-rounds) against 20.8 s at `r0sxh`; the 115 kernels then assemble in 2.2 s. Not
-the atom walk (`reads_unknown_atom` memoized post-order: the same 414 s, and
-identical kept/visited counts f1-f36). Unverified suspect: `collapse` re-trying,
-at every statement, pairs of states it keeps as two successors, with a full
-heap join before each refusal.
+**Kernel build time regressed, then fixed:** the walk took 414 s (493 traces in
+13 rounds) against 20.8 s at `r0sxh`. Profiled: three quarters in
+`BTreeMap::clone`, `gc` and the allocator. `collapse` copied and collected both
+states for every merge ATTEMPT and re-tried every pair after each successful
+merge; before the atom rule almost every pair merged at once or differed in
+shape, and now same-shape successors near the fruit are kept apart, so the
+refused attempts multiplied. Fixed (`state::merge_canon`, `Interp`'s `Pairing`):
+a merge reads both sides and copies only once it happens, a pair whose shapes
+differ is not tried, a refused pair is not re-tried within one collapse, and each
+outcome's shape and canonical order are computed once per collapse. Same 493
+traces and 89,901 bodies, identical kept counts f1-f40, the room (1,0) gates
+(ckhash, posgraph, marks) unchanged.
+
+| walk (room (3,0), `CELESTE_REGION=32,6`) | before | copy-free merge | + shapes once per collapse |
+|---|---|---|---|
+| `r0sxhf` | 414.7 s | 43.0 s | 29.3 s |
+| `r0sxh` | 20.8 s | 15.2 s | 10.6 s |
+
+The whole kernel build at `r0sxhf` is 58 s (walk plus specialization: 89,901
+bodies against 25,034 at `r0sxh`, the fly/collect outcomes), 15 s at `r0sxh`.
 
 So the widening pays and the factor grows (1.3x at f40, 3.6x at f50), but level 0
 still does not saturate: growth is x1.37 at f50 and rising to x1.51 at f55. That
@@ -87,10 +101,14 @@ Against the no-fruit EXPERIMENT (f050 797,366; f055 5,788,531) this is still
 about 3x more. Not measured which part: the fruit gone (collected, or flown
 away), the refilled `djump` rows, or the two-successor merges.
 
-Found on the way, not fixed: `Interp::collapse_values` joins an expression's
-two values with a select and no `Known` premise (the premise is only added for
-heap selects), so `x = c and a or b` on an undecided per-lane `c` blends by the
-condition's value bit.
+Found on the way, FIXED (2026-09-17, `Interp::premise_for_value`): `collapse`
+and `collapse_values` joined a call's or an expression's two values with a
+select and no `Known` premise (the premise was only added for heap selects), so
+a value like `c and a or b`, or a function returning a different number per
+branch over a heap both branches left alike, took one arm by the condition's
+value bit on a lane where `c` is undecided. Test:
+`a_returned_select_carries_the_decided_premise` (fails without the fix). Room
+(3,0) `r0sxhf` f1-f40 and the room (1,0) gates are unchanged by it.
 
 ## Why
 

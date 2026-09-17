@@ -24,7 +24,7 @@ use crate::pico8_num::Pico8Num as P8;
 
 use super::domain::{refuse_unknown, Arith, Cmp, Domain, Fun1, Fun2};
 use super::heap::{BodyId, TableId, Value};
-use super::state::{merge, split, State};
+use super::state::{merge_canon, split, Canon, State};
 
 pub enum Flow<D: Domain> {
     Normal,
@@ -606,6 +606,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// the frontier stays at the number of genuinely different futures
     /// rather than the product of every branch taken to get there.
     pub fn collapse(&mut self, mut outs: Outcome<D>) -> Result<Outcome<D>> {
+        let mut pairing = Pairing::new(outs.iter().map(|o| &o.0))?;
         'again: loop {
             // Siblings first (longest shared decision prefix), so that a
             // merge selects on the decision that separates its two sides
@@ -613,24 +614,31 @@ impl<'a, D: Domain> Interp<'a, D> {
             // `State::path` and `merge_order`.
             let states: Vec<&State<D>> = outs.iter().map(|o| &o.0).collect();
             let pairs = super::state::merge_order(&states, |i, j| {
-                self.can_join(&outs[i].1, &outs[j].1)
+                pairing.may_merge(i, j) && self.can_join(&outs[i].1, &outs[j].1)
             });
             for (i, j) in pairs {
-                let (a, b) = (outs[i].0.clone(), outs[j].0.clone());
-                let Some(m) = merge(&mut self.d, a, b)? else {
+                let (t, f) = (pairing.side(i, &outs[i].0), pairing.side(j, &outs[j].0));
+                let Some(m) = merge_canon(&mut self.d, t, f)? else {
+                    pairing.refuse(i, j);
                     continue;
                 };
                 if let (Flow::Return(x), Flow::Return(y)) = (&outs[i].1, &outs[j].1) {
                     if !self.joins_independent(&m.cond, x, y) {
+                        pairing.refuse(i, j);
                         continue;
                     }
                 }
                 self.merge_fallbacks += m.fell_back as usize;
                 let fl = self.join_flow(&m.cond, &outs[i].1, &outs[j].1);
+                let state = match &fl {
+                    Flow::Return(v) => self.premise_for_value(m, v),
+                    _ => m.state,
+                };
                 // j > i, so drop the later index first.
                 outs.remove(j);
                 outs.remove(i);
-                outs.push((m.state, fl));
+                pairing.replace(i, j, &state)?;
+                outs.push((state, fl));
                 continue 'again;
             }
             break;
@@ -644,27 +652,56 @@ impl<'a, D: Domain> Interp<'a, D> {
         &mut self,
         mut outs: Multi<D, Value<D>>,
     ) -> Result<Multi<D, Value<D>>> {
+        let mut pairing = Pairing::new(outs.iter().map(|o| &o.0))?;
         'again: loop {
             let states: Vec<&State<D>> = outs.iter().map(|o| &o.0).collect();
-            let pairs = super::state::merge_order(&states, |i, j| joinable(&outs[i].1, &outs[j].1));
+            let pairs = super::state::merge_order(&states, |i, j| {
+                pairing.may_merge(i, j) && joinable(&outs[i].1, &outs[j].1)
+            });
             for (i, j) in pairs {
-                let (a, b) = (outs[i].0.clone(), outs[j].0.clone());
-                let Some(m) = merge(&mut self.d, a, b)? else {
+                let (t, f) = (pairing.side(i, &outs[i].0), pairing.side(j, &outs[j].0));
+                let Some(m) = merge_canon(&mut self.d, t, f)? else {
+                    pairing.refuse(i, j);
                     continue;
                 };
                 if !self.joins_independent(&m.cond, &outs[i].1, &outs[j].1) {
+                    pairing.refuse(i, j);
                     continue;
                 }
                 self.merge_fallbacks += m.fell_back as usize;
                 let v = self.join_value(&m.cond, &outs[i].1.clone(), &outs[j].1.clone());
+                let state = self.premise_for_value(m, &v);
                 outs.remove(j);
                 outs.remove(i);
-                outs.push((m.state, v));
+                pairing.replace(i, j, &state)?;
+                outs.push((state, v));
                 continue 'again;
             }
             break;
         }
         Ok(outs)
+    }
+
+    /// The merged state, with the premise its VALUE needs. `state::merge`
+    /// conjoins `Known(cond)` where a select survives in the heap or in `ok`,
+    /// but an expression's or a call's value is joined here, after it: a
+    /// value that is a select reads `cond`'s value bit just the same, and on a
+    /// lane where `cond` is undecided the kernel's select silently takes one
+    /// arm (`c and 1 or 2`, or a function returning a different number per
+    /// branch, over a heap both branches left alike). Booleans fold into
+    /// Kleene algebra and are exact without it, as in `merge`.
+    fn premise_for_value(&mut self, m: super::state::Merged<D>, v: &Value<D>) -> State<D> {
+        let mut state = m.state;
+        let selects = match v {
+            Value::Num(n) => self.d.is_select_num(n),
+            Value::Bool(b) => self.d.is_select_bool(b),
+            _ => false,
+        };
+        if selects && !m.selects {
+            let decided = self.d.known(&m.cond);
+            state.ok = self.d.and(&state.ok, &decided);
+        }
+        state
     }
 
     /// Can these two flows be joined - WITHOUT building any nodes? Asked
@@ -1622,7 +1659,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             let mut acc = states.next().expect("a split has a fragment");
             for (s, v) in states {
                 let cond = self.d.undecided_atom()?;
-                let m = super::state::merge_on(&mut self.d, acc.0, s, cond.clone())?
+                let m = super::state::merge_on(&mut self.d, &acc.0, &s, cond.clone())?
                     .ok_or_else(|| anyhow!("literal split {id}: its fragments end in different shapes"))?;
                 anyhow::ensure!(
                     !m.selects,
@@ -1985,6 +2022,71 @@ fn ident(t: &full_moon::tokenizer::TokenReference) -> Result<String> {
     }
 }
 
+/// Which pairs of a `collapse` frontier are worth trying to merge.
+///
+/// Every outcome has an id, increasing with its position (so a pair's ids are
+/// in the order of its indices), and its shape's hash: two different shapes
+/// never merge. A pair that refused stays refused - `merge` is a function of
+/// the two states, and nothing here changes a state, it only replaces a merged
+/// pair - so it is tried once per collapse rather than again after every
+/// merge. A frontier that keeps successors apart used to re-try all of its
+/// pairs after each merge (room (3,0) at a fruit-unknown set, 2026-09-17).
+struct Pairing {
+    /// Per outcome: its id, and - when there is more than one outcome - its
+    /// shape's hash and its `Canon`, computed once rather than per attempt.
+    keys: Vec<(usize, u64, Option<Canon>)>,
+    next: usize,
+    refused: std::collections::HashSet<(usize, usize)>,
+}
+
+impl Pairing {
+    fn new<'s, D: Domain + 's>(states: impl Iterator<Item = &'s State<D>>) -> Result<Self> {
+        let states: Vec<&State<D>> = states.collect();
+        // A lone outcome is never paired: nothing to compute.
+        let lone = states.len() < 2;
+        let keys = states
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Pairing::key(i, s, lone))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Pairing { next: keys.len(), keys, refused: Default::default() })
+    }
+
+    fn key<D: Domain>(id: usize, s: &State<D>, lone: bool) -> Result<(usize, u64, Option<Canon>)> {
+        if lone {
+            return Ok((id, 0, None));
+        }
+        use std::hash::{Hash, Hasher};
+        let canon = Canon::of(s)?;
+        let mut h = rustc_hash::FxHasher::default();
+        canon.shape().hash(&mut h);
+        Ok((id, h.finish(), Some(canon)))
+    }
+
+    fn may_merge(&self, i: usize, j: usize) -> bool {
+        self.keys[i].1 == self.keys[j].1 && !self.refused.contains(&(self.keys[i].0, self.keys[j].0))
+    }
+
+    /// Outcome `i`'s state with its `Canon`, for `merge_canon`.
+    fn side<'s, D: Domain>(&'s self, i: usize, s: &'s State<D>) -> (&'s State<D>, &'s Canon) {
+        (s, self.keys[i].2.as_ref().expect("a paired outcome has its canon"))
+    }
+
+    fn refuse(&mut self, i: usize, j: usize) {
+        self.refused.insert((self.keys[i].0, self.keys[j].0));
+    }
+
+    /// Outcomes `i < j` merged into `merged`, which goes last.
+    fn replace<D: Domain>(&mut self, i: usize, j: usize, merged: &State<D>) -> Result<()> {
+        self.keys.remove(j);
+        self.keys.remove(i);
+        let key = Pairing::key(self.next, merged, self.keys.is_empty())?;
+        self.keys.push(key);
+        self.next += 1;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2095,6 +2197,41 @@ mod tests {
         // Two constants under one condition - the `if` became data.
         assert_eq!(it.d.graph.get(node.args[1]).op, Op::Const(10 << 16, 10 << 16));
         assert_eq!(it.d.graph.get(node.args[2]).op, Op::Const(20 << 16, 20 << 16));
+    }
+
+    /// A call whose branches leave the heap alike but RETURN different
+    /// numbers: the value is a select, so the state needs the same
+    /// `Known(cond)` premise a heap select gets. Without it a lane where the
+    /// condition is undecided took one arm silently (`premise_for_value`).
+    #[test]
+    fn a_returned_select_carries_the_decided_premise() {
+        let ast = parse(
+            r#"
+            function f()
+              if input > 0 then
+                return 10
+              else
+                return 20
+              end
+            end
+            result = f()
+            "#,
+        );
+        let mut d = Symbolic::default();
+        let sym = d.graph.leaf(Op::Cell(1));
+        let mut it = Interp::new(d);
+        let mut st = fresh::<Symbolic>(&mut it.d);
+        let g = st.globals;
+        st.heap.tables.get_mut(&g).unwrap().hash.insert("input".into(), Value::Num(sym));
+
+        let out = it.exec_block(ast.nodes(), st).expect("exec");
+        assert_eq!(out.len(), 1, "the returns merged");
+        let s = &out[0].0;
+        let Value::Num(r) = s.heap.tables[&s.globals].hash["result"].clone() else {
+            panic!("expected a number")
+        };
+        assert_eq!(it.d.graph.get(r).op, Op::Sel, "the returned value is a select");
+        assert_eq!(it.d.graph.get(s.ok).op, Op::Known, "and the state carries its premise");
     }
 }
 

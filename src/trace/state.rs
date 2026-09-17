@@ -13,12 +13,10 @@
 //! the player produces two output shapes without anyone having to write a
 //! specialization set to express it.
 
-use std::collections::BTreeMap;
-
 use anyhow::{bail, Result};
 
 use super::domain::Domain;
-use super::heap::{push_value, Heap, Root, ScopeId, Shape, TableId, Value};
+use super::heap::{Heap, Root, ScopeId, Shape, TableId, Value};
 
 pub struct State<D: Domain> {
     pub heap: Heap<D>,
@@ -191,21 +189,56 @@ impl<D: Domain> State<D> {
 /// happens when EITHER side would have, and picks t's value exactly where
 /// t applies. This needs the two guards to be disjoint; see the invariant
 /// on `State::guard`.
-pub fn merge<D: Domain>(d: &mut D, t: State<D>, f: State<D>) -> Result<Option<Merged<D>>> {
-    merge_inner(d, t, f, None)
+pub fn merge<D: Domain>(d: &mut D, t: &State<D>, f: &State<D>) -> Result<Option<Merged<D>>> {
+    merge_inner(d, (t, &Canon::of(t)?), (f, &Canon::of(f)?), None)
 }
 
 /// `merge` on a GIVEN condition instead of the separating decision: what a
 /// literal split's fragments rejoin on (`Interp::rejoin_fragments`), whose
 /// paths do not diverge at a decision.
-pub fn merge_on<D: Domain>(d: &mut D, t: State<D>, f: State<D>, cond: D::Bool) -> Result<Option<Merged<D>>> {
-    merge_inner(d, t, f, Some(cond))
+pub fn merge_on<D: Domain>(d: &mut D, t: &State<D>, f: &State<D>, cond: D::Bool) -> Result<Option<Merged<D>>> {
+    merge_inner(d, (t, &Canon::of(t)?), (f, &Canon::of(f)?), Some(cond))
 }
 
+/// `merge` with both sides' `Canon` already computed: `Interp::collapse`
+/// tries many pairs of the same outcomes, and computing the shapes and orders
+/// per attempt was most of a trace after the copies went (room (3,0),
+/// 2026-09-17).
+pub fn merge_canon<D: Domain>(d: &mut D, t: (&State<D>, &Canon), f: (&State<D>, &Canon)) -> Result<Option<Merged<D>>> {
+    merge_inner(d, t, f, None)
+}
+
+/// What a merge compares and pairs a state by: its shape, and the canonical
+/// BFS order of its reachable objects (two heaps built by different
+/// allocation histories number the same objects the same). Both walk only
+/// what the roots reach.
+pub struct Canon {
+    shape: Shape,
+    order: Vec<Root>,
+}
+
+impl Canon {
+    pub fn of<D: Domain>(s: &State<D>) -> Result<Canon> {
+        let (shape, order) = s.heap.shape_and_order(&s.roots())?;
+        Ok(Canon { shape, order })
+    }
+
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+}
+
+/// Both sides are READ: nothing is copied or collected until the merge is
+/// known to happen. `collapse` tries every pair and most of them refuse, and
+/// copying and collecting both heaps per attempt was three quarters of a
+/// trace once a fruit-unknown set kept successors apart (room (3,0),
+/// 2026-09-17: the walk went from 21 s to 415 s, in `BTreeMap::clone`, `gc`
+/// and the allocator). A `Canon` walks only what the roots reach, so garbage
+/// cannot make two states look different.
 fn merge_inner<D: Domain>(
     d: &mut D,
-    mut t: State<D>,
-    mut f: State<D>,
+    (t, ct): (&State<D>, &Canon),
+    (f, cf): (&State<D>, &Canon),
     over: Option<D::Bool>,
 ) -> Result<Option<Merged<D>>> {
     // Two fragments of one literal split are different successors until the
@@ -213,9 +246,7 @@ fn merge_inner<D: Domain>(
     if t.frag != f.frag {
         return Ok(None);
     }
-    t.gc();
-    f.gc();
-    if t.shape()? != f.shape()? {
+    if ct.shape != cf.shape {
         return Ok(None);
     }
 
@@ -244,78 +275,46 @@ fn merge_inner<D: Domain>(
     // Canonical order is still what PAIRS the two sides, so allocation
     // history cannot make equal states look different. It just is not
     // what the result is numbered by.
-    let t_order = canonical_order(&t);
-    let f_order = canonical_order(&f);
+    let (t_order, f_order) = (&ct.order, &cf.order);
     if t_order.len() != f_order.len() {
         // Equal shapes should guarantee this; if it ever fires, the shape
         // is not describing what merging actually depends on.
         bail!("merge: canonical orders disagree after equal shapes");
     }
 
-    let mut heap = t.heap.clone();
-    // Did any join leave a select the kernel reads by `cond`'s value bit?
-    let mut selects = false;
-    let mut first_select: Option<String> = None;
-    // A rejoin on a given condition (`merge_on`) counts only the selects IT
-    // made: a slot both fragments hold alike keeps whatever select an earlier
-    // merge left there, which reads its own condition, not this one. (The
-    // ordinary merge keeps counting those too, as it always has.)
-    let mut join = |d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>, at: &dyn Fn() -> String| -> Result<Value<D>> {
-        let j = join(d, cond, a, b)?;
-        let sel = !(rejoin && a == b)
-            && match &j {
-                Value::Num(n) => d.is_select_num(n),
-                Value::Bool(x) => d.is_select_bool(x),
-                _ => false,
-            };
-        if sel && first_select.is_none() {
-            let show = |d: &D, v: &Value<D>| match v {
-                Value::Num(n) => d.describe(n),
-                other => format!("{other:?}"),
-            };
-            first_select = Some(format!("{} = {} against {}", at(), show(d, a), show(d, b)));
-        }
-        selects |= sel;
-        Ok(j)
-    };
+    // A condition that reads an unknown atom cannot be selected on: the lanes
+    // it depends on the atom in would decline its `Known` premise. Two such
+    // states are two successors (plans/fly-fruit.md), refused at the first
+    // select; only a rejoin (`merge_on`) reports it instead.
+    let refuse_selects = !rejoin && d.reads_unknown_atom(cond);
+    let mut joined = Joined { writes: Vec::new(), selects: false, first_select: None };
     for (rt, rf) in t_order.iter().zip(f_order.iter()) {
         match (rt, rf) {
             (Root::Table(a), Root::Table(b)) => {
-                let tb = &f.heap.tables[b];
-                let keys: Vec<String> = heap.tables[a].hash.keys().cloned().collect();
-                for k in keys {
-                    let va = heap.tables[a].hash[&k].clone();
-                    let vb = tb.hash.get(&k).ok_or_else(|| {
+                let (ta, tb) = (&t.heap.tables[a], &f.heap.tables[b]);
+                for (k, va) in &ta.hash {
+                    let vb = tb.hash.get(k).ok_or_else(|| {
                         anyhow::anyhow!("merge: key {:?} missing after equal shapes", k)
                     })?;
-                    let j = join(d, cond, &va, vb, &|| format!("table {a} [{k:?}]"))?;
-                    heap.tables.get_mut(a).unwrap().hash.insert(k, j);
+                    joined.slot(d, cond, rejoin, *rt, || SlotKey::Hash(k.clone()), va, vb)?;
                 }
-                for i in 0..heap.tables[a].arr.len() {
-                    let va = heap.tables[a].arr[i].clone();
-                    let j = join(d, cond, &va, &tb.arr[i], &|| format!("table {a} [{i}]"))?;
-                    heap.tables.get_mut(a).unwrap().arr[i] = j;
+                for (i, va) in ta.arr.iter().enumerate() {
+                    joined.slot(d, cond, rejoin, *rt, || SlotKey::Arr(i), va, &tb.arr[i])?;
                 }
-                let ikeys: Vec<i16> = heap.tables[a].ints.keys().copied().collect();
-                for k in ikeys {
-                    let va = heap.tables[a].ints[&k].clone();
-                    let vb = tb.ints.get(&k).ok_or_else(|| {
+                for (k, va) in &ta.ints {
+                    let vb = tb.ints.get(k).ok_or_else(|| {
                         anyhow::anyhow!("merge: index {} missing after equal shapes", k)
                     })?;
-                    let j = join(d, cond, &va, vb, &|| format!("table {a} [int {k}]"))?;
-                    heap.tables.get_mut(a).unwrap().ints.insert(k, j);
+                    joined.slot(d, cond, rejoin, *rt, || SlotKey::Int(*k), va, vb)?;
                 }
             }
             (Root::Scope(a), Root::Scope(b)) => {
                 let sb = &f.heap.scopes[b];
-                let keys: Vec<String> = heap.scopes[a].vars.keys().cloned().collect();
-                for k in keys {
-                    let va = heap.scopes[a].vars[&k].clone();
-                    let vb = sb.vars.get(&k).ok_or_else(|| {
+                for (k, va) in &t.heap.scopes[a].vars {
+                    let vb = sb.vars.get(k).ok_or_else(|| {
                         anyhow::anyhow!("merge: local {:?} missing after equal shapes", k)
                     })?;
-                    let j = join(d, cond, &va, vb, &|| format!("local {k:?}"))?;
-                    heap.scopes.get_mut(a).unwrap().vars.insert(k, j);
+                    joined.slot(d, cond, rejoin, *rt, || SlotKey::Var(k.clone()), va, vb)?;
                 }
             }
             // A closure has no mutable content - which body it is and
@@ -325,20 +324,38 @@ fn merge_inner<D: Domain>(
             (Root::Closure(_), Root::Closure(_)) => {}
             _ => bail!("merge: canonical orders disagree in kind after equal shapes"),
         }
+        if refuse_selects && joined.selects {
+            return Ok(None);
+        }
     }
 
     let per_case = d.sel_bool(cond, &t.ok, &f.ok);
     let ok_selects = !(rejoin && t.ok == f.ok) && d.is_select_bool(&per_case);
+    let Joined { writes, selects, mut first_select } = joined;
     if first_select.is_none() && ok_selects {
         first_select = Some("ok".to_string());
     }
     let selects = selects || ok_selects;
-    // A condition that reads an unknown atom cannot be selected on: the lanes
-    // it depends on the atom in would decline its `Known` premise. Two such
-    // states are two successors (plans/fly-fruit.md); only a rejoin
-    // (`merge_on`) reports it instead.
-    if selects && !rejoin && d.reads_unknown_atom(cond) {
+    if selects && refuse_selects {
         return Ok(None);
+    }
+    // The merge happens: t's heap, collected, with the joined slots written.
+    let mut heap = t.heap.clone();
+    heap.gc(&t.roots());
+    for (root, key, v) in writes {
+        match (root, key) {
+            (Root::Table(a), SlotKey::Hash(k)) => {
+                heap.tables.get_mut(&a).unwrap().hash.insert(k, v);
+            }
+            (Root::Table(a), SlotKey::Arr(i)) => heap.tables.get_mut(&a).unwrap().arr[i] = v,
+            (Root::Table(a), SlotKey::Int(k)) => {
+                heap.tables.get_mut(&a).unwrap().ints.insert(k, v);
+            }
+            (Root::Scope(a), SlotKey::Var(k)) => {
+                heap.scopes.get_mut(&a).unwrap().vars.insert(k, v);
+            }
+            (root, key) => bail!("merge: slot {} written into {root:?}", key.at(root)),
+        }
     }
     let state = State {
         heap,
@@ -378,10 +395,86 @@ fn merge_inner<D: Domain>(
             }
         },
         path,
-        key_override: t.key_override,
-        frag: t.frag,
+        key_override: t.key_override.clone(),
+        frag: t.frag.clone(),
     };
     Ok(Some(Merged { state, cond: cond.clone(), fell_back, selects, first_select }))
+}
+
+/// A slot of a merge, in `t`'s numbering.
+enum SlotKey {
+    Hash(String),
+    Arr(usize),
+    Int(i16),
+    Var(String),
+}
+
+impl SlotKey {
+    fn at(&self, root: Root) -> String {
+        let id = match root {
+            Root::Table(a) => a as u64,
+            Root::Scope(a) => a as u64,
+            Root::Closure(a) => a as u64,
+        };
+        match self {
+            SlotKey::Hash(k) => format!("table {id} [{k:?}]"),
+            SlotKey::Arr(i) => format!("table {id} [{i}]"),
+            SlotKey::Int(k) => format!("table {id} [int {k}]"),
+            SlotKey::Var(k) => format!("local {k:?}"),
+        }
+    }
+}
+
+/// A merge's joined slots before the heap is copied: the ones whose join
+/// differs from `t`'s value, and whether a select survived.
+struct Joined<D: Domain> {
+    writes: Vec<(Root, SlotKey, Value<D>)>,
+    selects: bool,
+    /// The first slot whose join left a select, with its two values.
+    first_select: Option<String>,
+}
+
+impl<D: Domain> Joined<D> {
+    #[allow(clippy::too_many_arguments)]
+    fn slot(
+        &mut self,
+        d: &mut D,
+        cond: &D::Bool,
+        rejoin: bool,
+        root: Root,
+        key: impl FnOnce() -> SlotKey,
+        a: &Value<D>,
+        b: &Value<D>,
+    ) -> Result<()> {
+        let j = join(d, cond, a, b)?;
+        // A rejoin on a given condition (`merge_on`) counts only the selects
+        // IT made: a slot both fragments hold alike keeps whatever select an
+        // earlier merge left there, which reads its own condition, not this
+        // one. (The ordinary merge keeps counting those too, as it always has.)
+        let sel = !(rejoin && a == b)
+            && match &j {
+                Value::Num(n) => d.is_select_num(n),
+                Value::Bool(x) => d.is_select_bool(x),
+                _ => false,
+            };
+        let first = sel && self.first_select.is_none();
+        let changed = j != *a;
+        if first || changed {
+            let key = key();
+            if first {
+                let show = |d: &D, v: &Value<D>| match v {
+                    Value::Num(n) => d.describe(n),
+                    other => format!("{other:?}"),
+                };
+                self.first_select = Some(format!("{} = {} against {}", key.at(root), show(d, a), show(d, b)));
+            }
+            if changed {
+                self.writes.push((root, key, j));
+            }
+        }
+        self.selects |= sel;
+        Ok(())
+    }
 }
 
 /// Merge one slot. Only numbers and booleans can actually differ - the
@@ -406,51 +499,6 @@ fn join<D: Domain>(d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Res
             | Value::Builtin(_)) => x.clone(),
         (x, y) => bail!("merge: {:?} and {:?} after equal shapes", x, y),
     })
-}
-
-/// Canonical BFS order of the reachable objects. `roots()` seeds it with
-/// the globals table and the current scope, so two heaps built by
-/// different allocation histories still number the same objects the same.
-fn canonical_order<D: Domain>(s: &State<D>) -> Vec<Root> {
-
-    let mut queue: Vec<Root> = s.roots();
-    let mut seen: BTreeMap<Root, u32> = BTreeMap::new();
-    let mut order: Vec<Root> = Vec::new();
-    let mut i = 0;
-    while i < queue.len() {
-        let r = queue[i];
-        i += 1;
-        if seen.contains_key(&r) {
-            continue;
-        }
-        seen.insert(r, order.len() as u32);
-        order.push(r);
-        match r {
-            Root::Table(t) => {
-                if let Some(tab) = s.heap.tables.get(&t) {
-                    for v in tab.values() {
-                        push_value(v, &mut queue);
-                    }
-                }
-            }
-            Root::Scope(sc) => {
-                if let Some(scope) = s.heap.scopes.get(&sc) {
-                    for v in scope.vars.values() {
-                        push_value(v, &mut queue);
-                    }
-                    if let Some(p) = scope.parent {
-                        queue.push(Root::Scope(p));
-                    }
-                }
-            }
-            Root::Closure(c) => {
-                if let Some(cl) = s.heap.closures.get(&c) {
-                    queue.push(Root::Scope(cl.env));
-                }
-            }
-        }
-    }
-    order
 }
 
 #[cfg(test)]
@@ -501,7 +549,7 @@ mod tests {
         s.guard = cond.clone();
         f.guard = d.not(&cond);
 
-        let m = merge(&mut d, s, f).unwrap().expect("same shape merges").state;
+        let m = merge(&mut d, &s, &f).unwrap().expect("same shape merges").state;
         let player_m = match m.heap.tables[&m.globals].hash["p"] {
             Value::Table(t) => t,
             ref v => panic!("expected a table, got {:?}", v),
@@ -545,7 +593,7 @@ mod tests {
         t.heap.tables.get_mut(&t.globals).unwrap().hash.insert("x".into(), Value::Num(b));
         let (tg, fg) = (t.guard, f.guard);
 
-        let m = merge(&mut d, t, f).unwrap().expect("same shape merges");
+        let m = merge(&mut d, &t, &f).unwrap().expect("same shape merges");
         assert!(!m.fell_back, "siblings share a split, so no fallback");
         assert_eq!(m.cond, c, "the select condition is the branch condition");
         let x = match m.state.heap.tables[&m.state.globals].hash["x"] {
@@ -564,7 +612,7 @@ mod tests {
         let mut q = p.clone();
         q.guard = c;
         q.path = vec![(c, false)];
-        let m = merge(&mut d, p, q).unwrap().expect("same shape merges");
+        let m = merge(&mut d, &p, &q).unwrap().expect("same shape merges");
         assert!(m.fell_back);
         assert_eq!(m.cond, g);
     }
@@ -589,7 +637,7 @@ mod tests {
         let cond = d.compare(Cmp::Gt, &sym, &zero).unwrap();
         s.guard = cond.clone();
         f.guard = d.not(&cond);
-        assert!(merge(&mut d, s, f).unwrap().is_none());
+        assert!(merge(&mut d, &s, &f).unwrap().is_none());
     }
 
     /// GC before comparing: two states that reached the same place by
@@ -611,7 +659,7 @@ mod tests {
         let cond = d.compare(Cmp::Gt, &sym, &zero).unwrap();
         s.guard = cond.clone();
         f.guard = d.not(&cond);
-        assert!(merge(&mut d, s, f).unwrap().is_some());
+        assert!(merge(&mut d, &s, &f).unwrap().is_some());
     }
 }
 

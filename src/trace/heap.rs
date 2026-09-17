@@ -166,7 +166,7 @@ pub struct Table<D: Domain> {
 
 impl<D: Domain> Table<D> {
     /// Every value the table holds. The ONE place that knows a table has
-    /// three parts: `gc`, `shape` and `canonical_order` all went through
+    /// three parts: `gc`, `shape` and the merge's canonical order went through
     /// their own hand-written `hash.values().chain(arr.iter())`, so
     /// adding the integer part meant finding all three, and a fourth
     /// would mean finding them again.
@@ -465,9 +465,9 @@ pub enum Root {
 }
 
 /// The objects a value refers to. The ONE place that knows which value
-/// kinds are references, so `gc`, `shape` and `canonical_order` cannot
-/// disagree about it - they each had their own copy, and adding closures
-/// to the heap meant finding all three.
+/// kinds are references, so `gc` and `shape_and_order` cannot disagree about
+/// it - they each had their own copy (with the merge's canonical order, a
+/// third), and adding closures to the heap meant finding all three.
 pub fn push_value<D: Domain>(v: &Value<D>, stack: &mut Vec<Root>) {
     match v {
         Value::Table(t) => stack.push(Root::Table(*t)),
@@ -485,7 +485,7 @@ pub fn push_value<D: Domain>(v: &Value<D>, stack: &mut Vec<Root>) {
 /// different shapes are different successors and both survive - which is
 /// how a frame that kills the player naturally produces two output shapes
 /// rather than needing a specialization set to express it.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Slot {
     Nil,
     Num,
@@ -499,7 +499,7 @@ pub enum Slot {
     Builtin(&'static str),
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Shape {
     /// Canonical (BFS-numbered) tables: their keys and their slot kinds,
     /// for all THREE parts - string, array, integer. The integer part is
@@ -516,6 +516,12 @@ impl<D: Domain> Heap<D> {
     /// Canonicalize from `roots` in BFS order, so two heaps that allocated
     /// the same structure in a different ORDER compare equal.
     pub fn shape(&self, roots: &[Root]) -> Result<Shape> {
+        Ok(self.shape_and_order(roots)?.0)
+    }
+
+    /// `shape`, and the canonical BFS order of the reachable objects it was
+    /// numbered by - the order a merge pairs the two sides' objects in.
+    pub fn shape_and_order(&self, roots: &[Root]) -> Result<(Shape, Vec<Root>)> {
         let mut t_num: BTreeMap<TableId, u32> = BTreeMap::new();
         let mut s_num: BTreeMap<ScopeId, u32> = BTreeMap::new();
         let mut c_num: BTreeMap<ClosureId, u32> = BTreeMap::new();
@@ -600,6 +606,6 @@ impl<D: Domain> Heap<D> {
                 }
             }
         }
-        Ok(shape)
+        Ok((shape, order))
     }
 }

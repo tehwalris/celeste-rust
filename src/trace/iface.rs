@@ -114,8 +114,9 @@ pub fn set<D: Domain>(st: &mut State<D>, p: &[Step], v: Value<D>) -> Result<()> 
 ///
 /// Deterministic because the hash part is a `BTreeMap` and the array part
 /// is a `Vec`, so the order is a property of the CONTENT and not of the
-/// allocation history - which is the same reason `state::canonical_order`
-/// exists, and the same thing that makes two runs comparable.
+/// allocation history - which is the same reason `Heap::shape_and_order`
+/// numbers objects canonically, and the same thing that makes two runs
+/// comparable.
 ///
 /// A slot gets the FIRST path that reaches it, and the heap is a graph:
 /// `spring.tile` is named `objects[2].type.tile` in a room that contains
