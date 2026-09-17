@@ -1,3 +1,29 @@
+# Rooms (1,0), (2,0), (3,0), 2026-09-17 (release, 32 threads)
+
+Held ladder `CELESTE_LADDER="r0sxh,r1sxh,...,r15sxh,rxsx"` throughout.
+
+| run | outcome | wall | peak RSS |
+|---|---|---|---|
+| room (1,0) `--ceiling 99` (`394ae0b`) | OPTIMAL 99 (h99 confirmed, h98 refuted at level 6) | 1:39.7 | 5.76 GB |
+| room (1,0) `--ceiling 99`, `CELESTE_LEVEL_MINUS_ONE="99,5"` (`c75f856`) | OPTIMAL 99 | 1:44.5 (table 19.9 s) | 4.25 GB |
+| room (2,0) `--ceiling 95`, `CELESTE_BAND="95,8"` (2026-09-16) | OPTIMAL 95, resting on the band | 41:57 | |
+| room (2,0) `--ceiling 95`, `CELESTE_LEVEL_MINUS_ONE="95,5"`, no band (`c75f856`) | OPTIMAL 95 (h94 refuted at level 9) | 27:27.6 (table 472.1 s) | 28.0 GB |
+
+- The level -1 filter drops 34.0% of room (1,0)'s level-0 rows f0-f99
+  (18,919,491 of 55,577,462), all from f73 on: it pays in memory, not time. In
+  room (2,0) level 0 at f080 keeps 23,997,253 states against 62,810,806
+  unfiltered, 49 s against 131 s; f090 1,029,159, f095 1.
+- Room (2,0)'s 17 kernel sets prebuild in 16.6 s with the parallel walk.
+- Room (3,0) (`CELESTE_REGION=32,6`, level-0 set, quick profile): the walk,
+  serial, 471 traces in ~5.5 min, `transpile --room-consts` 6:17 at 968 MB;
+  in parallel rounds (`394ae0b`) 473 traces in 13 rounds, 20.8 s, 46 s at
+  1.7 GB. With the serial walk the 17-level prebuild took 546.7 s.
+- Room (3,0) level 0 (`r0sxh`, before the parallel walk) grows x1.5 per frame
+  and does not saturate: f040 176,925, f044 825,170, f048 3,886,471, f050
+  8,993,524 (20.8 s per frame, 16.5 GB with the kernel sets); stopped at f52.
+  Why: plans/room30.md (the fly fruit, the player's exact speed, the fall
+  floors' timers).
+
 # Room (4,0) end to end: OPTIMAL 76 (2026-09-16, release, 32 threads)
 
 `rewrite search --room 4,0 --ceiling 76`: the ceiling is the community TAS5
