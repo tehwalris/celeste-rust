@@ -75,7 +75,23 @@ pub fn apply_start_room(game_lua: &str) -> Result<String> {
         ));
     }
     let (x, y) = start_room();
-    Ok(game_lua.replacen(PAT, &format!("load_room({}, {})", x, y), 1))
+    let out = game_lua.replacen(PAT, &format!("load_room({}, {})", x, y), 1);
+    // EXPERIMENT (room (3,0), 2026-09-17, plans/room30.md): with
+    // `CELESTE_EXPERIMENT_NO_FLY_FRUIT` set, the cart never registers the fly
+    // fruit type, so no fly fruit spawns. A DIFFERENT GAME: it measures how
+    // level 0 grows without the fly fruit's time-dependent fields, and no
+    // horizon it reports is an answer for the real cart.
+    if std::env::var_os("CELESTE_EXPERIMENT_NO_FLY_FRUIT").is_some() {
+        const TYPE: &str = "add(types,fly_fruit)";
+        let n = out.matches(TYPE).count();
+        if n != 1 {
+            return Err(anyhow!("CELESTE_EXPERIMENT_NO_FLY_FRUIT: expected exactly one {:?} in the game lua, found {}", TYPE, n));
+        }
+        static BANNER: std::sync::Once = std::sync::Once::new();
+        BANNER.call_once(|| eprintln!("[experiment] NO FLY FRUIT: the cart's fly fruit type is removed; this is not the real game"));
+        return Ok(out.replacen(TYPE, "-- (experiment) no fly fruit", 1));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

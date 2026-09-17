@@ -98,3 +98,59 @@ floors' collision tests.
 - **Level-0 forward** (`r0sxh`, release): 114 kernels in 315 s; states from f29
   (the player's first input), 22,656 at f35, 176,925 at f40 (x1.5 per frame),
   f40 in 426 ms, 0.95 GB.
+
+## 3. Level 0 does not saturate: the fly fruit (2026-09-17, search stopped at f52)
+
+The held-ladder search (`CELESTE_REGION=32,6`, `r0sxh..r15sxh,rxsx`, `--from 1
+--to 250`) prebuilt its 17 kernel sets in 547 s (13 GB resident) and extended
+level 0 at x1.5 states per frame with no sign of saturating:
+
+| frame | states | frame time | RSS |
+|---|---|---|---|
+| f40 | 176,925 | 0.4 s | 13.1 GB |
+| f44 | 825,170 | 1.6 s | 13.3 GB |
+| f48 | 3,886,471 | 7.9 s | 14.5 GB |
+| f50 | 8,993,524 | 20.8 s | 16.5 GB |
+
+Every visited cell still had 20%+ new states at f47 (`rewrite cell-growth`).
+It was stopped at f52; the partial run is in the UI as `room30`.
+
+What multiplies (`rewrite coarse-census`, f47, 2,591,387 states):
+
+| erased | states | fewer |
+|---|---|---|
+| all 12 fall floors' `delay` | 2,511,159 | 1.03x |
+| everything on the fall floors | 2,465,319 | 1.05x |
+| the player's `spd.` / `rem.` | 1,131,202 | 2.29x |
+| the fly fruit | 1,127,623 | 2.30x |
+| the fly fruit and the player's speed | 278,578 | 9.3x |
+
+The fruit's fields vary TOGETHER: erasing only `step` (1.00x), only `y`/`rem`/
+`spd` (1.01x) or only `fly` (1.00x) merges almost nothing, while `step`, `y`,
+`rem` and `spd` jointly give 2.17x. So a lossless `step := 0` while flying (it
+is never read again) would not merge the dash cohorts on its own; the position
+has to be abstracted with it.
+
+So the floor timers are not the problem; the FLY FRUIT is, twice over:
+
+- while it waits, `step += 0.05` every frame and its `y`/`rem.y`/`spd.y` bob
+  with `sin(step)`: every state of frame f carries a fruit no earlier frame
+  had, so the door's cross-frame dedupe never fires. With the fruit erased the
+  set is MONOTONE (the cumulative count through f47 equals f47's own count:
+  idle inputs keep every earlier state), and the new states per frame at f47
+  would be ~294k instead of 2.59 M (x8.8), growing x1.37 per frame.
+- once the player dashes it flies (`spd.y` toward -3.5, frozen `step`), so
+  rows split by the frame of the dash.
+
+Room (2,0)'s `fruit` has a band widening (`widen_fruit`, `Rt2` 3b, the
+interpreter's `make_state_abstract_rem`) and a lossless `off mod 40`. Neither
+transfers directly: that fruit ASSIGNS `y = start + sin(off/40)*2.5`, so its
+band is inductive; the fly fruit INTEGRATES `spd.y` through `move`, so an
+interval band moved by up to a pixel is not contained in itself (the
+containment premise would fail at the edge), and its waiting bob is not
+exactly periodic (0.05 is not exact in 16.16), so `step mod 1` alone does not
+make rows repeat. A sound fly-fruit abstraction needs a design of its own.
+
+`CELESTE_EXPERIMENT_NO_FLY_FRUIT=1` (`game_runner::apply_start_room`) removes
+the fly fruit type from the cart to measure the rest of the room without it.
+A different game; nothing it reports is an answer for the real cart.
