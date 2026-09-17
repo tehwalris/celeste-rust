@@ -1060,6 +1060,11 @@ impl<'a> ForwardSink<'a> {
                 Some((h, px)) if cell_too_late(slot.cell, self.frame, h, px) => Some(vec![false; n]),
                 _ => allow,
             };
+            // The level -1 filter: the queue's cell provably cannot exit by H.
+            let allow = match level_minus_one() {
+                Some((h, table)) if table.too_late(slot.shape, slot.cell, self.frame, h) => Some(vec![false; n]),
+                _ => allow,
+            };
             self.sort_buf.clear();
             self.sort_buf.extend(
                 slot.keys
@@ -1274,6 +1279,43 @@ fn band() -> Option<(u32, i32)> {
         eprintln!("[band] EXPERIMENT: dropping cells that cannot climb to the exit by f{} at {} px per frame", band.0, band.1);
         Some(band)
     })
+}
+
+/// THE LEVEL -1 FILTER (`CELESTE_LEVEL_MINUS_ONE="H,S"`, plans/level-minus-one.md):
+/// drop a queue (one player cell) when the level -1 table proves its rows
+/// cannot exit by horizon H (`trace::level_minus_one::CostToGo::too_late`).
+/// Unlike the band it is derived from the traced frames: the table's ranges
+/// are inductive, a clipped successor counts as a possible exit and a death as
+/// a respawn. H must be the LARGEST horizon the run tests - level 0 persists
+/// across horizons - so this is for a `--ceiling` search with H = the ceiling.
+/// Built once, at the first flush, on a thread with the tracer's stack.
+fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::CostToGo)> {
+    static TABLE: std::sync::OnceLock<Option<(u32, crate::trace::level_minus_one::CostToGo)>> = std::sync::OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            let s = std::env::var("CELESTE_LEVEL_MINUS_ONE").ok()?;
+            let (h, sp) = s.split_once(',').expect("CELESTE_LEVEL_MINUS_ONE=\"H,S\"");
+            let h: u32 = h.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE horizon");
+            let sp: i32 = sp.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE speed bound (px per frame)");
+            let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            let t = std::time::Instant::now();
+            let table = std::thread::Builder::new()
+                .stack_size(256 * 1024 * 1024)
+                .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new(&root), sp, threads))
+                .expect("spawn the level -1 builder")
+                .join()
+                .expect("the level -1 builder panicked")
+                .unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"));
+            eprintln!(
+                "[level -1] table built in {:.1} s (S = {sp}): the start state's d = {}; dropping cells that cannot exit by f{h}",
+                t.elapsed().as_secs_f64(),
+                table.start_d
+            );
+            Some((h, table))
+        })
+        .as_ref()
+        .map(|(h, t)| (*h, t))
 }
 
 /// Can a player at `cell` at frame `frame` not reach the exit (y < -4) by

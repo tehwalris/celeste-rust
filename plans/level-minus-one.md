@@ -223,3 +223,31 @@ frame f50-f99 (`h099/level00.marks.bin`).
 
 As a filter it would drop 18,919,491 of the 55,577,462 level-0 rows f0-f99
 (34.0%; the band 21.0%), all from f73 on.
+
+## As a filter (2026-09-17): `CELESTE_LEVEL_MINUS_ONE="H,S"`
+
+`trace::level_minus_one::cost_to_go` builds the table (the probe's passes,
+`build`) and `frame::level_minus_one` drops a flush queue (one player cell)
+when `CostToGo::too_late`. What makes it sound where the probe only counted:
+
+- **`sound_d`**: a multi-source shortest path backward over the edges, seeded
+  where the graph stops modelling. An exit edge is 1; a successor CLIPPED to
+  the window is 1 (what lies past it may be an exit); a DEATH successor is 1 +
+  the start state's d (the room restarts and replays the spawn chain, however
+  long the countdown). The death seed reads the end's d, which it cannot lower,
+  so a second run is the fixpoint.
+- **only table nodes are refused**: a row without a player cell, one that has
+  left the room (x >= 128), a shape or a cell the table never reached, is kept.
+- **H is the largest horizon the run tests**: level 0 persists across
+  horizons, so this is for a `--ceiling` search with H = the ceiling.
+
+Room (1,0), S=5, H=99 (release, held ladder, `--ceiling 99`):
+
+- the sound d: the start state's d = 29 (the plain probe's 44): 3,025 nodes
+  with a clipped successor, 12,199 with a death successor;
+- the probe with the sound d: too late 0% through f077, 10.4% at f082, 32.2%
+  at f085, 69.2% at f090, 91.9% at f095; MARKED TOO LATE 0 at every frame;
+- the search: **OPTIMAL 99** (h99 confirmed, h98 refuted at level 6), 1:46.6
+  wall with the table's 20.6 s build, 4.44 GB peak; without the filter 1:39.7
+  and 5.76 GB. Room (1,0)'s late frames are small, so it pays in memory, not
+  time. The room it is for is (2,0), whose level 0 is ~60 M states at f80.

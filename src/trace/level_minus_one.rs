@@ -266,6 +266,8 @@ struct Shape {
 struct NodeOut {
     /// `(target shape, box)`; `usize::MAX` is the exit.
     succ: Vec<(usize, Option<(i16, i16, i16, i16)>)>,
+    /// A successor box was clipped to `WINDOW`.
+    clipped: bool,
 }
 
 /// A worker's accumulated observations and violations.
@@ -635,6 +637,7 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
                             let ((cxl, cxh), (cyl, cyh)) = (clip((xl, xh)), clip((yl, yh)));
                             if (cxl, cxh, cyl, cyh) != (xl, xh, yl, yh) {
                                 acc.clipped[tid] += 1;
+                                out.clipped = true;
                             }
                             if cxl > cxh || cyl > cyh {
                                 continue;
@@ -688,10 +691,116 @@ struct Graph1 {
     index: HashMap<(usize, i16, i16), u32>,
     edges: Vec<Vec<u32>>,
     exits: Vec<bool>,
+    /// A successor without a located object (a death).
+    deaths: Vec<bool>,
+    /// A successor clipped to `WINDOW`.
+    clipped: Vec<bool>,
 }
 
-pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
+/// What `build` hands on: per block shape hash its table shape, the converged
+/// graph, the sound d per node (`sound_d`), and the spawn chain.
+struct Built {
+    by_hash: HashMap<u64, usize>,
+    g1: Graph1,
+    sound: Vec<u32>,
+    chain: Vec<(usize, (i16, i16))>,
+    start_d: u32,
+}
+
+/// A LOWER BOUND on the frames from each node to an exit, all of whose premises
+/// are the table's own - what a filter may refuse a row on. A multi-source
+/// shortest path backward over the edges, seeded where the graph stops
+/// modelling: an exit edge (1); a successor clipped to `WINDOW` (1: what lies
+/// past it is not modelled, so it may be an exit); a death successor (1 + the
+/// start state's d, `chain_frames` + d of the chain's end: the room restarts
+/// and replays the spawn chain, however long its countdown). The death seed
+/// reads the end's d, which it cannot lower (a path through a death is longer
+/// than the start's d), so the second run is the answer.
+fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32) -> Vec<u32> {
+    use std::cmp::Reverse;
+    let n = g.nodes.len();
+    let run = |death: Option<u32>| -> Vec<u32> {
+        let mut dist = vec![u32::MAX; n];
+        let mut heap = std::collections::BinaryHeap::new();
+        for i in 0..n {
+            let mut s = if g.exits[i] || g.clipped[i] { 1 } else { u32::MAX };
+            if let (true, Some(w)) = (g.deaths[i], death) {
+                s = s.min(w.saturating_add(1));
+            }
+            if s != u32::MAX {
+                dist[i] = s;
+                heap.push(Reverse((s, i as u32)));
+            }
+        }
+        while let Some(Reverse((dn, i))) = heap.pop() {
+            if dn != dist[i as usize] {
+                continue;
+            }
+            for &p in &rev[i as usize] {
+                if dn + 1 < dist[p as usize] {
+                    dist[p as usize] = dn + 1;
+                    heap.push(Reverse((dn + 1, p)));
+                }
+            }
+        }
+        dist
+    };
+    let mut death = None;
+    loop {
+        let dist = run(death);
+        let start = dist[end_node as usize];
+        let w = (start != u32::MAX).then(|| start.saturating_add(chain_frames));
+        if w == death {
+            return dist;
+        }
+        death = w;
+    }
+}
+
+/// THE LEVEL -1 FILTER's table (`frame::level_minus_one`): per (block shape
+/// hash, player cell), a lower bound on the frames to an exit (`sound_d`).
+pub struct CostToGo {
+    d: HashMap<(u64, i16, i16), u32>,
+    /// The start state's d: no exit is sooner than this.
+    pub start_d: u32,
+}
+
+impl CostToGo {
+    /// Is a row of `shape` at `cell` at `frame` provably unable to exit by
+    /// `horizon`? Only a table node is ever refused: a row without a player,
+    /// one that has left the room, a shape or a cell the table never reached
+    /// is kept.
+    pub fn too_late(&self, shape: u64, cell: u32, frame: u32, horizon: u32) -> bool {
+        let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
+        if x >= 128 {
+            return false;
+        }
+        match self.d.get(&(shape, x as i16, y as i16)) {
+            None => false,
+            Some(&d) => d == u32::MAX || frame.saturating_add(d) > horizon,
+        }
+    }
+}
+
+/// Build the level -1 table of the configured start room at player speed bound
+/// `spd_px` (its report goes to stderr as it is built).
+pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo> {
     let mut rep = String::new();
+    let b = build(root, spd_px, threads, &mut rep)?;
+    let mut d = HashMap::new();
+    for (&h, &id) in &b.by_hash {
+        for (i, &(sid, x, y)) in b.g1.nodes.iter().enumerate() {
+            if sid == id {
+                d.insert((h, x, y), b.sound[i]);
+            }
+        }
+    }
+    Ok(CostToGo { d, start_d: b.start_d })
+}
+
+/// The table: the lattice walk, the spawn chain, the passes to inductive ranges,
+/// and d.
+fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result<Built> {
     let t_all = std::time::Instant::now();
     let room0 = celeste_interp::game_runner::start_room();
     let lw = super::kernel::room_constant_lattice(root, super::shapes::WalkOpts::LEVEL0.with_held(true))?;
@@ -701,7 +810,7 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
         lw: &lw,
         room: Room { cart: lw.cart.clone(), cache: lw.cache.clone() },
         room0,
-        spd_px: opts.spd_px,
+        spd_px,
         shapes: Vec::new(),
         by_key: HashMap::new(),
         obs_keys: Vec::new(),
@@ -757,7 +866,7 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
         chain.push((tid, (xl, yl)));
         if let Some(pl) = super::shapes::player_path(&lw.reps[&table.shapes[tid].key]) {
             // The player's speed range joins the successor's own speed.
-            let sp = (opts.spd_px as i64) << 16;
+            let sp = (spd_px as i64) << 16;
             for ax in ["x", "y"] {
                 let q = with(&pl, &["spd", ax]);
                 let r = ranges.get(&q).copied().unwrap_or((0, 0));
@@ -779,7 +888,7 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
         ensure!(pass <= 16, "the level -1 ranges did not converge in 16 passes");
         let t_pass = std::time::Instant::now();
         let mut t_trace = std::time::Duration::ZERO;
-        let mut g = Graph1 { nodes: Vec::new(), index: HashMap::new(), edges: Vec::new(), exits: Vec::new() };
+        let mut g = Graph1 { nodes: Vec::new(), index: HashMap::new(), edges: Vec::new(), exits: Vec::new(), deaths: Vec::new(), clipped: Vec::new() };
         let mut obs: Vec<Option<Obs>> = Vec::new();
         let mut violations: Vec<String> = Vec::new();
         let mut n_violations = 0usize;
@@ -793,6 +902,8 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
             g.index.insert(k, i);
             g.edges.push(Vec::new());
             g.exits.push(false);
+            g.deaths.push(false);
+            g.clipped.push(false);
             (i, true)
         };
         let mut frontier: Vec<u32> = vec![add(&mut g, (end_id, end_xy.0, end_xy.1)).0];
@@ -816,7 +927,7 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let (sref, rref, fref, gref) = (&table.shapes, &table.room, &frontier, &g);
             let results: Vec<Result<(Vec<(u32, NodeOut)>, Acc)>> = std::thread::scope(|scope| {
-                let hs: Vec<_> = (0..opts.threads)
+                let hs: Vec<_> = (0..threads)
                     .map(|_| {
                         let next = &next;
                         scope.spawn(move || -> Result<(Vec<(u32, NodeOut)>, Acc)> {
@@ -852,15 +963,20 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
                 violations.extend(acc.violations);
                 for (n, out) in done {
                     let mut es: BTreeSet<u32> = BTreeSet::new();
+                    if out.clipped {
+                        g.clipped[n as usize] = true;
+                    }
                     for (tid, bx) in out.succ {
                         if tid == usize::MAX {
                             g.exits[n as usize] = true;
                             continue;
                         }
                         // An outcome without a located object is a death:
-                        // a dead end (plans/level-minus-one.md).
+                        // no edge (plans/level-minus-one.md); `sound_d` seeds
+                        // it with the respawn.
                         let Some((xl, xh, yl, yh)) = bx else {
                             n_deaths += 1;
+                            g.deaths[n as usize] = true;
                             continue;
                         };
                         for (x, y) in (xl..=xh).flat_map(|x| (yl..=yh).map(move |y| (x, y))) {
@@ -967,7 +1083,7 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
     for (id, sh) in table.shapes.iter().enumerate() {
         let Some(t) = &sh.traced else { continue };
         let n = g1.nodes.iter().filter(|k| k.0 == id).count();
-        say!(rep, "shape {id} ({:#x}): {n} nodes; {}", lw.frames.get(&sh.key).map(|f| f.in_rt2.shape_hash_of()).unwrap_or(0), t.stats)?;
+        say!(rep, "shape {id} ({:#x}): {n} nodes; {}", lw.frames.iter().find(|((k, _), _)| *k == sh.key).map(|(_, wf)| wf.frame.in_rt2.shape_hash_of()).unwrap_or(0), t.stats)?;
         let rs: Vec<String> = sh
             .ranges
             .iter()
@@ -1014,6 +1130,28 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
         dist[end_node as usize].saturating_add(chain.len() as u32 - 1),
         dist.iter().filter(|d| **d != u32::MAX).max().copied().unwrap_or(0)
     )?;
+    let sound = sound_d(&g1, &rev, chain.len() as u32 - 1, end_node);
+    let start_d = sound[end_node as usize].saturating_add(chain.len() as u32 - 1);
+    say!(
+        rep,
+        "sound d (a clipped successor may exit, a death costs a respawn): {} of {n} nodes finite; the start state's d = {start_d}; {} clipped and {} death nodes",
+        sound.iter().filter(|d| **d != u32::MAX).count(),
+        g1.clipped.iter().filter(|c| **c).count(),
+        g1.deaths.iter().filter(|c| **c).count()
+    )?;
+    let mut by_hash = HashMap::new();
+    for (h, k) in &lw.by_hash {
+        if let Some(&id) = table.by_key.get(k) {
+            by_hash.insert(*h, id);
+        }
+    }
+    Ok(Built { by_hash, g1, sound, chain, start_d })
+}
+
+pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
+    let mut rep = String::new();
+    let t_all = std::time::Instant::now();
+    let Built { by_hash, g1, sound, chain, .. } = build(root, opts.spd_px, opts.threads, &mut rep)?;
 
     // The soundness check against the recorded transitions.
     use crate::search::pos_graph::{cell_xy, PosGraph, CELL_COUNT, NO_CELL};
@@ -1088,7 +1226,7 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
                 continue;
             }
             let ff = FrameFile::open(&p)?;
-            let id = lw.by_hash.get(&ff.shape_hash()).and_then(|k| table.by_key.get(k)).copied();
+            let id = by_hash.get(&ff.shape_hash()).copied();
             let mut late_cells: rustc_hash::FxHashSet<u32> = Default::default();
             for (cell, rows) in ff.cell_counts() {
                 let rows = rows as u64;
@@ -1121,7 +1259,8 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
                         }
                     }
                     Some(&i) => {
-                        let d = dist[i as usize];
+                        // The filter's d (`sound_d`), what it would drop.
+                        let d = sound[i as usize];
                         if d == u32::MAX {
                             nopath += rows;
                             late += rows;
