@@ -75,6 +75,11 @@ enum Command {
         /// Start room "x,y".
         #[arg(long, default_value = "1,0")]
         room: String,
+        /// Run the REFERENCE engine (the interpreter, one lane per fork leaf)
+        /// instead of the kernels: `ckhash` of the two trees must agree. Slow;
+        /// for a new room's first frames. Not at held-unknown levels.
+        #[arg(long)]
+        reference: bool,
     },
     /// Fingerprint a forward checkpoint tree: per frame, the lane count and an
     /// order-independent hash of its (row key, cell) set. Two runs that agree
@@ -774,8 +779,9 @@ fn main() -> Result<()> {
             k,
             checkpoint_dir,
             room,
+            reference,
         } => {
-            use celeste_rust::frame::{forward_run, Block};
+            use celeste_rust::frame::{forward_run, Block, FrameStep};
             use celeste_rust::interpreter::abstraction::{current_level, set_level, set_rem_precision, Level, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
             match &level {
@@ -783,14 +789,18 @@ fn main() -> Result<()> {
                 None => set_rem_precision(if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) }),
             }
             let t = std::time::Instant::now();
-            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
-            eprintln!("[fwd] engine up in {:.2} s ({:?})", t.elapsed().as_secs_f64(), current_level());
+            let engine: Box<dyn FrameStep> = if reference {
+                Box::new(std::sync::Mutex::new(celeste_rust::trace::refengine::RefEngine::new()?))
+            } else {
+                Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)
+            };
+            eprintln!("[fwd] engine up in {:.2} s ({:?}{})", t.elapsed().as_secs_f64(), current_level(), if reference { ", REFERENCE engine" } else { "" });
             let initial = vec![Block::from_state(
                 &celeste_rust::trace::refengine::RefEngine::new()?.initial_state()?,
             )?];
             let dir = std::path::Path::new(&checkpoint_dir);
             let t = std::time::Instant::now();
-            let fwd = forward_run(&engine, initial, dir, to, true, None)?;
+            let fwd = forward_run(engine.as_ref(), initial, dir, to, true, None)?;
             let wall = t.elapsed().as_secs_f64();
             match fwd.win_frame {
                 Some(h) => println!("win at f{h} ({wall:.2} s)"),
