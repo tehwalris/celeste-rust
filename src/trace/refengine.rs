@@ -51,6 +51,7 @@ impl RefEngine {
     pub fn new() -> Result<Self> {
         let src = crate::trace::cart::sources()?;
         let top: &'static ast::Ast = Box::leak(Box::new(full_moon::parse(&src)?));
+        crate::trace::cart::check_absent_fields(top)?;
         let init: &'static ast::Ast = Box::leak(Box::new(full_moon::parse("_init()")?));
         let body: &'static ast::Ast = Box::leak(Box::new(full_moon::parse(
             "__reset_button_states()\n_update()\n_draw()",

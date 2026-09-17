@@ -283,6 +283,9 @@ pub fn trace_frame<'a>(
         }
         let mut s = s;
         s.gc();
+        // The absent-as-zero fields (`widen::ABSENT_AS_ZERO`), at every
+        // level: part of the shape, not of the precision.
+        super::widen::materialize_absent_fields(&mut s, &mut it.d)?;
         // THE WIDENINGS, here rather than at the boundary a moment
         // later, so the graph knows about them and the value a row is
         // hashed on is the value it stores (`trace::widen`). Before

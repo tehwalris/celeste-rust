@@ -1371,15 +1371,19 @@ pub(crate) struct Registry {
     /// level every key the key fixpoint reached (`trace::kernel::
     /// key_fixpoint`) has its kernel here, built up front, and a row with
     /// a key that is not here is a coverage gap.
-    kernels: HashMap<(u64, Option<SpeedKey>), AsmKernel>,
+    /// With a region key (`trace::kernel::RegionGrid`), one per reached
+    /// (shape, region) too.
+    kernels: HashMap<(u64, KernelKey), AsmKernel>,
     /// The rung-agnostic / exact sets go through `boundary_exact`; the
     /// level-0 set through `boundary`.
     exact_boundary: bool,
     /// The grid width `2^w` of a bucketed level's edge tables.
     w: Option<u8>,
+    /// The region grid the set was built on.
+    grid: Option<crate::trace::kernel::RegionGrid>,
 }
 
-use crate::trace::kernel::SpeedKey;
+use crate::trace::kernel::{KernelKey, SpeedKey};
 
 /// The speed key of row `lane` of `rt2` at the current level: `None` at an
 /// exact-speed level or without a player (the reference path's rows).
@@ -1441,7 +1445,8 @@ impl Registry {
     /// Run `chunk` on the matching kernel; `false` if no kernel binds (a
     /// miss) or the chunk declined. At a bucketed level the rows of a
     /// block come in RUNS of one speed key (the queues are keyed by it),
-    /// and each run goes to its key's kernel as a contiguous range.
+    /// and each run goes to its key's kernel as a contiguous range; with a
+    /// region key the rows come in cell order, so in runs of one region.
     pub fn run_chunk(
         &self,
         chunk: &Rt2,
@@ -1449,11 +1454,13 @@ impl Registry {
         lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
     ) -> bool {
-        let Some(w) = self.w else {
-            return self.run_key(chunk, None, cell_in, lanes, sink);
+        if self.w.is_none() && self.grid.is_none() {
+            return self.run_key(chunk, KernelKey { speed: None, region: None }, cell_in, lanes, sink);
+        }
+        let keys = self.w.and_then(|w| speed_keys(chunk, w));
+        let key_of = |lane: usize| -> KernelKey {
+            KernelKey { speed: keys.as_ref().map(|k| k[lane]), region: self.grid.and_then(|g| g.of_cell(cell_in[lane])) }
         };
-        let keys = speed_keys(chunk, w);
-        let key_of = |lane: usize| -> Option<SpeedKey> { keys.as_ref().map(|k| k[lane]) };
         let mut lo = lanes.start;
         while lo < lanes.end {
             let k = key_of(lo);
@@ -1472,7 +1479,7 @@ impl Registry {
     fn run_key(
         &self,
         chunk: &Rt2,
-        key: Option<SpeedKey>,
+        key: KernelKey,
         cell_in: &[u32],
         lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
@@ -1482,7 +1489,7 @@ impl Registry {
             None => {
                 // Diagnose a coverage gap: which (shape, key) has no
                 // assembled kernel. Printed once per distinct one.
-                static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u64, Option<SpeedKey>)>>> =
+                static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u64, KernelKey)>>> =
                     std::sync::OnceLock::new();
                 let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
                 if seen.lock().unwrap().insert((chunk.shape_hash, key)) {
@@ -1529,7 +1536,7 @@ impl Registry {
             .min(refs.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let refs_ref = &refs;
-        let mut built: Vec<(usize, Result<(u64, Option<SpeedKey>, AsmKernel)>)> = std::thread::scope(|scope| {
+        let mut built: Vec<(usize, Result<(u64, KernelKey, AsmKernel)>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..n_workers)
                 .map(|_| {
                     let next = &next;
@@ -1544,7 +1551,7 @@ impl Registry {
                                     break;
                                 }
                                 let (key, r) = &refs_ref[si];
-                                out.push((si, build_one_shape(r, si, &format!("_{si}"), *key, w, buckets_y)));
+                                out.push((si, build_one_shape(r, si, &format!("_{si}"), key.speed, w, buckets_y).map(|(shape, _, kernel)| (shape, *key, kernel))));
                             }
                             out
                         })
@@ -1570,7 +1577,7 @@ impl Registry {
             n_workers,
         );
         eprintln!("[asm build]   phases, summed over workers and concurrent builds: {}", crate::transpile::lower::build_profile());
-        Ok(Registry { kernels, exact_boundary, w })
+        Ok(Registry { kernels, exact_boundary, w, grid: crate::trace::kernel::region_grid() })
     }
 }
 
@@ -1608,7 +1615,7 @@ fn typed(kind: Kind) -> Col {
 /// columns (`BodyCols`). The reference engine's rule (every numeric and
 /// boolean cell typed) is the same idea without the registry to narrow
 /// it.
-fn unify(by_shape: &mut HashMap<(u64, Option<SpeedKey>), AsmKernel>) -> Result<()> {
+fn unify(by_shape: &mut HashMap<(u64, KernelKey), AsmKernel>) -> Result<()> {
     let mut unions: HashMap<u64, Rt2> = HashMap::new();
     for kernel in by_shape.values() {
         for t in &kernel.acc_templates {

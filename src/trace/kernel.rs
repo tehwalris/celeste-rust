@@ -89,17 +89,17 @@ fn name_cells(f: &super::verify::Frame, e: anyhow::Error) -> anyhow::Error {
 pub(crate) fn lattice_kernel_refs(
     root: &std::path::Path,
     opts: super::shapes::WalkOpts,
-) -> Result<Vec<(Option<SpeedKey>, Reference)>> {
+) -> Result<Vec<(KernelKey, Reference)>> {
     let mut lw = room_constant_lattice(root, opts)?;
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
-    // The frames to lower: per shape for an exact-speed set; per
+    // The frames to lower: per (shape, region) for an exact-speed set; per
     // (shape, speed key) - the key fixpoint - for a bucketed one, whose
     // kernels are specialized on the key (`key_frame`).
     // A bucketed set's frames come bound out of the key fixpoint workers'
     // arenas; an exact-speed set's frames are bound against the walk's.
-    let frames: Vec<(Option<SpeedKey>, super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>, Option<Bound>)> = match opts.spd.width_log2() {
-        Some(w) => key_fixpoint(&lw, w)?.into_iter().map(|n| (n.key, n.frame, n.bounds, Some(n.bound))).collect(),
-        None => std::mem::take(&mut lw.frames).into_values().map(|f| (None, f, Vec::new(), None)).collect(),
+    let frames: Vec<(KernelKey, super::verify::Frame, Bounds, Option<Bound>)> = match opts.spd.width_log2() {
+        Some(w) => key_fixpoint(&lw, w)?.into_iter().map(|n| (KernelKey { speed: n.key, region: None }, n.frame, n.bounds, Some(n.bound))).collect(),
+        None => std::mem::take(&mut lw.frames).into_iter().map(|((_, region), (f, b))| (KernelKey { speed: None, region }, f, b, None)).collect(),
     };
     // Bind + lower (specialize + decide, the expensive half of a kernel
     // build) per frame, frames in parallel.
@@ -110,10 +110,10 @@ pub(crate) fn lattice_kernel_refs(
     let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(frames.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
     // Each frame is taken by exactly one worker (a `Frame` is not cloned).
-    let slots: Vec<std::sync::Mutex<Option<(Option<SpeedKey>, super::verify::Frame, Vec<(super::iface::Path, (i32, i32))>, Option<Bound>)>>> =
+    let slots: Vec<std::sync::Mutex<Option<(KernelKey, super::verify::Frame, Bounds, Option<Bound>)>>> =
         frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
     let slots = &slots;
-    let mut built: Vec<(usize, Result<(Option<SpeedKey>, Reference)>)> = std::thread::scope(|scope| {
+    let mut built: Vec<(usize, Result<(KernelKey, Reference)>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..n_workers)
             .map(|_| {
                 let (cart, cache, next) = (cart.clone(), cache.clone(), &next);
@@ -124,7 +124,7 @@ pub(crate) fn lattice_kernel_refs(
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some((key, f, bounds, pre)) = slots.get(i).and_then(|m| m.lock().unwrap().take()) else { break };
-                            let r = (|| -> Result<(Option<SpeedKey>, Reference)> {
+                            let r = (|| -> Result<(KernelKey, Reference)> {
                                 let t_phase = std::time::Instant::now();
                                 let bound = match pre {
                                     Some(b) => b,
@@ -162,6 +162,122 @@ pub struct SpeedKey {
     pub dashing: bool,
     /// `[target.x, target.y, accel.x, accel.y]`, all 0 when not mid-dash.
     pub dash: [i32; 4],
+}
+
+/// THE REGION KEY (room (3,0), 2026-09-17, plans/room30.md): a kernel is
+/// specialized on the player's whole-pixel position lying in one square of
+/// a `px`-pixel grid and its speed in `[-speed, speed]` px per frame, both
+/// guarded in `ok` (a lane outside declines loudly). Room (3,0)'s frame
+/// checks its 12 fall floors in every collision loop of every move step;
+/// with the position unknown the trace ran for minutes, with it bounded to a
+/// square the range analysis folds the far floors away (15.6 s for the spawn
+/// square's whole walk). Rows dispatch on the region of their input cell.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Region {
+    pub ix: i16,
+    pub iy: i16,
+}
+
+/// The grid a region key is taken on (`CELESTE_REGION="px,S"`; unset: no
+/// region key, one kernel per shape as before).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RegionGrid {
+    pub px: i32,
+    pub speed: i32,
+}
+
+/// The process's region grid, read once. `S` is at most 7: the move loop
+/// is unrolled for `abs(amount) <= 8` (`Interp::unroll_bound`), and
+/// `amount` is `flr(rem + spd + 0.5)`.
+pub fn region_grid() -> Option<RegionGrid> {
+    static GRID: std::sync::OnceLock<Option<RegionGrid>> = std::sync::OnceLock::new();
+    *GRID.get_or_init(|| {
+        let s = std::env::var("CELESTE_REGION").ok()?;
+        let v: Vec<i32> = s.split(',').map(|t| t.trim().parse().expect("CELESTE_REGION=\"px,S\"")).collect();
+        assert!(v.len() == 2 && v[0] >= 8 && (1..=7).contains(&v[1]), "CELESTE_REGION=\"px,S\" with px >= 8 and 1 <= S <= 7, not {s:?}");
+        let g = RegionGrid { px: v[0], speed: v[1] };
+        eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed);
+        Some(g)
+    })
+}
+
+impl RegionGrid {
+    /// The region of a whole-pixel position.
+    pub fn of(&self, x: i32, y: i32) -> Region {
+        Region { ix: x.div_euclid(self.px) as i16, iy: y.div_euclid(self.px) as i16 }
+    }
+
+    /// The region of a row's input cell; `None` for a row without a player.
+    pub fn of_cell(&self, cell: u32) -> Option<Region> {
+        crate::search::pos_graph::cell_xy(cell).map(|(x, y)| self.of(x, y))
+    }
+
+    /// The bounds a region's kernel is traced under, by path under `pl`.
+    fn bounds(&self, pl: &super::iface::Path, r: Region) -> Bounds {
+        const ONE: i32 = 1 << 16;
+        let field = |fs: &[&str]| -> super::iface::Path {
+            let mut q = pl.clone();
+            for f in fs {
+                q.push(super::iface::key(f));
+            }
+            q
+        };
+        let (x0, y0) = (r.ix as i32 * self.px, r.iy as i32 * self.px);
+        vec![
+            (field(&["x"]), (x0 * ONE, (x0 + self.px - 1) * ONE)),
+            (field(&["y"]), (y0 * ONE, (y0 + self.px - 1) * ONE)),
+            (field(&["spd", "x"]), (-self.speed * ONE, self.speed * ONE)),
+            (field(&["spd", "y"]), (-self.speed * ONE, self.speed * ONE)),
+        ]
+    }
+}
+
+/// What one kernel of a shape is specialized on: the speed key (bucketed
+/// levels) and the region (`CELESTE_REGION`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct KernelKey {
+    pub speed: Option<SpeedKey>,
+    pub region: Option<Region>,
+}
+
+/// The input bounds a frame is traced under (`verify::trace_frame`).
+pub type Bounds = Vec<(super::iface::Path, (i32, i32))>;
+
+/// A node of the constant-lattice walk: a shape key and a region.
+pub type WalkNode = (String, Option<Region>);
+
+/// The regions a state's rows can be in: `None` without a grid or without a
+/// player; otherwise every region the hull of the player's whole-pixel `x`
+/// and `y` touches (`Symbolic::range_of` over the frame's seeded bounds),
+/// clamped to the screen and one region beyond it on each side. An axis with
+/// no static range (the player the spawn creates at its own, unbounded,
+/// position) takes that whole window. Both only ever ADD kernels: a row
+/// outside the window has no kernel and stops the run (`[asm] MISS`).
+fn successor_regions(
+    st: &super::state::State<super::domain::Symbolic>,
+    d: &mut super::domain::Symbolic,
+    grid: Option<RegionGrid>,
+) -> Result<Vec<Option<Region>>> {
+    use super::{iface, shapes};
+    let (Some(g), Some(pl)) = (grid, shapes::player_path(st)) else { return Ok(vec![None]) };
+    let window = (-(g.px as i64), 128 + g.px as i64 - 1);
+    let mut hull = [(0i64, 0i64); 2];
+    for (axis, name) in ["x", "y"].into_iter().enumerate() {
+        let mut p = pl.clone();
+        p.push(iface::key(name));
+        let Some(super::heap::Value::Num(n)) = iface::get(st, &p) else { anyhow::bail!("{}: not a number", iface::show(&p)) };
+        hull[axis] = match d.range_of(n) {
+            Some(pieces) if !pieces.is_empty() => {
+                let lo = pieces.iter().map(|q| q.0).min().unwrap_or(0).div_euclid(1 << 16);
+                let hi = pieces.iter().map(|q| q.1).max().unwrap_or(0).div_euclid(1 << 16);
+                (lo.max(window.0), hi.min(window.1))
+            }
+            _ => window,
+        };
+        anyhow::ensure!(hull[axis].0 <= hull[axis].1, "{}: its range lies outside the screen window {window:?}", iface::show(&p));
+    }
+    let (a, b) = (g.of(hull[0].0 as i32, hull[1].0 as i32), g.of(hull[0].1 as i32, hull[1].1 as i32));
+    Ok((a.iy..=b.iy).flat_map(|iy| (a.ix..=b.ix).map(move |ix| Some(Region { ix, iy }))).collect())
 }
 
 /// The bounds `dash_time` is traced under per class: `> 0` folds either
@@ -1008,7 +1124,7 @@ pub fn key_probe(root: &std::path::Path, dump: &std::path::Path, sel: &[usize], 
         let (shape, key, range) = parse_node_line(line)?;
         if exact_done.insert(shape) {
             let skey = lwx.by_hash.get(&shape).ok_or_else(|| anyhow::anyhow!("the exact-speed lattice has no shape {shape:#x}"))?;
-            let f = &lwx.frames[skey];
+            let f = &lwx.frames[&(skey.clone(), None)].0;
             let bound = super::emit::bind(f, &lwx.tracer.it.d.graph, lwx.opts.widen)?;
             let t = std::time::Instant::now();
             let lowered = super::emit::lower_frame(&bound, Some(room.clone()), Default::default())?;
@@ -1062,6 +1178,33 @@ pub fn shape_diff(root: &std::path::Path, spd: crate::interpreter::abstraction::
             anyhow::anyhow!("no shape {h:#018x} in the walk; shapes: {}", known.join(" "))
         })
     };
+    let d = shape_key_diff(key(a)?, key(b)?, SHOW);
+    let mut out = String::new();
+    writeln!(out, "{a:#018x}: {} tokens; {b:#018x}: {} tokens; {} in common before the difference, {} after", d.a_tokens, d.b_tokens, d.prefix, d.suffix)?;
+    writeln!(out, "before: {}", d.before)?;
+    writeln!(out, "{a:#018x} ({} tokens): {}", d.a_len, d.a)?;
+    writeln!(out, "{b:#018x} ({} tokens): {}", d.b_len, d.b)?;
+    writeln!(out, "after: {}", d.after)?;
+    Ok(out)
+}
+
+/// Where two shape keys (`State::shape`'s Debug text) differ, tokenized at
+/// punctuation: the tokens between their common prefix and common suffix
+/// (at most `show` each side) and some context around them.
+struct ShapeKeyDiff {
+    a_tokens: usize,
+    b_tokens: usize,
+    prefix: usize,
+    suffix: usize,
+    before: String,
+    a: String,
+    a_len: usize,
+    b: String,
+    b_len: usize,
+    after: String,
+}
+
+fn shape_key_diff(a: &str, b: &str, show: usize) -> ShapeKeyDiff {
     let tokens = |s: &str| -> Vec<String> {
         let mut out = Vec::new();
         let mut cur = String::new();
@@ -1076,17 +1219,23 @@ pub fn shape_diff(root: &std::path::Path, spd: crate::interpreter::abstraction::
         }
         out
     };
-    let (ta, tb) = (tokens(key(a)?), tokens(key(b)?));
+    let (ta, tb) = (tokens(a), tokens(b));
     let pre = ta.iter().zip(&tb).take_while(|(x, y)| x == y).count();
     let suf = ta[pre..].iter().rev().zip(tb[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
     let (da, db) = (&ta[pre..ta.len() - suf], &tb[pre..tb.len() - suf]);
-    let mut out = String::new();
-    writeln!(out, "{a:#018x}: {} tokens; {b:#018x}: {} tokens; {pre} in common before the difference, {suf} after", ta.len(), tb.len())?;
-    writeln!(out, "before: {}", ta[pre.saturating_sub(SHOW / 4)..pre].join(" "))?;
-    writeln!(out, "{a:#018x} ({} tokens): {}", da.len(), da.iter().take(SHOW).cloned().collect::<Vec<_>>().join(" "))?;
-    writeln!(out, "{b:#018x} ({} tokens): {}", db.len(), db.iter().take(SHOW).cloned().collect::<Vec<_>>().join(" "))?;
-    writeln!(out, "after: {}", ta[ta.len() - suf..].iter().take(SHOW / 4).cloned().collect::<Vec<_>>().join(" "))?;
-    Ok(out)
+    let join = |t: &[String]| t.iter().take(show).cloned().collect::<Vec<_>>().join(" ");
+    ShapeKeyDiff {
+        a_tokens: ta.len(),
+        b_tokens: tb.len(),
+        prefix: pre,
+        suffix: suf,
+        before: ta[pre.saturating_sub(show / 4)..pre].join(" "),
+        a: join(da),
+        a_len: da.len(),
+        b: join(db),
+        b_len: db.len(),
+        after: ta[ta.len() - suf..].iter().take(show / 4).cloned().collect::<Vec<_>>().join(" "),
+    }
 }
 
 /// `transpile --key-census [N [FILE]]`: the key fixpoint of the start
@@ -1138,9 +1287,10 @@ pub fn key_census(root: &std::path::Path, lower: usize, dump: Option<&std::path:
 /// (`room_constant_lattice`) supplies the shapes, their representative
 /// states and their constant pins.
 pub fn key_fixpoint(lw: &LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
+    anyhow::ensure!(region_grid().is_none(), "the speed-key fixpoint is not built with the region key (CELESTE_REGION)");
     let t = std::time::Instant::now();
     let (mut t_trace, mut t_succ) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-    let start_shape = lw.frames[&lw.start_key].in_rt2.shape_hash_of();
+    let start_shape = lw.frames[&(lw.start_key.clone(), None)].0.in_rt2.shape_hash_of();
     let buckets_y = lw.opts.spd.buckets_y();
     let (start_key, start_range) = concrete_key(&lw.reps[&lw.start_key], &lw.tracer.it.d, w, buckets_y)?;
     // A key's whole buckets, per bucketed axis; an unbucketed y keeps what
@@ -1384,7 +1534,7 @@ mod tests {
         let lw = super::room_constant_lattice(std::path::Path::new("."), opts).expect("lattice");
         let mut tr = lw.tracer.clone();
         let skey = lw.reps.iter().find(|(_, st)| crate::trace::shapes::player_path(st).is_some()).map(|(k, _)| k.clone()).expect("a shape with a player");
-        let shape = lw.frames[&skey].in_rt2.shape_hash_of();
+        let shape = lw.frames[&(skey.clone(), None)].0.in_rt2.shape_hash_of();
         let rest = super::SpeedKey {
             bx: celeste_core::spd_buckets::index(0, 16, 0),
             by: celeste_core::spd_buckets::index(0, 16, 1),
@@ -2098,6 +2248,7 @@ pub fn room_constant_lattice(
     // dispatch), and `Interp` borrows what it ran.
     let leak = |a: full_moon::ast::Ast| -> &'static full_moon::ast::Ast { Box::leak(Box::new(a)) };
     let top = leak(full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?);
+    cart::check_absent_fields(top)?;
     let init = leak(full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?);
     let reset = leak(full_moon::parse("__reset_button_states()").map_err(|e| anyhow!("reset: {:?}", e))?);
     let fr = leak(full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("frame: {:?}", e))?);
@@ -2123,20 +2274,31 @@ pub fn room_constant_lattice(
     let mut lattice: std::collections::BTreeMap<String, Cmap> = Default::default();
     let mut reps: std::collections::BTreeMap<String, super::state::State<Symbolic>> = Default::default();
     let mut forks: std::collections::BTreeMap<String, usize> = Default::default();
-    let mut frames: std::collections::BTreeMap<String, super::verify::Frame> = Default::default();
+    let mut frames: std::collections::BTreeMap<WalkNode, (super::verify::Frame, Bounds)> = Default::default();
     let mut forkops: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-    let mut refused: std::collections::BTreeMap<String, String> = Default::default();
+    let mut refused: std::collections::BTreeMap<WalkNode, String> = Default::default();
     let mut ival_extra: std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>> = Default::default();
 
     let sk = key(&start)?;
     let start_key = sk.clone();
     lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held)?);
     reps.insert(sk.clone(), start.clone());
-    let mut work: Vec<String> = vec![sk];
+    // THE REGION KEY (`RegionGrid`): a node is (shape, region), the lattice
+    // stays per shape, and a narrowed lattice re-traces every region its
+    // shape has reached.
+    let grid = region_grid();
+    anyhow::ensure!(
+        grid.is_none() || (opts.spd == crate::interpreter::abstraction::SpdPrecision::Exact && opts.pos == crate::interpreter::abstraction::PosPrecision::EXACT),
+        "the region key (CELESTE_REGION) is built only for exact-speed, exact-position levels, not {opts:?}"
+    );
+    let start_regions = successor_regions(&start, &mut it.d, grid)?;
+    let mut regions: std::collections::BTreeMap<String, std::collections::BTreeSet<Option<Region>>> = Default::default();
+    regions.insert(sk.clone(), start_regions.iter().copied().collect());
+    let mut work: Vec<WalkNode> = start_regions.into_iter().map(|r| (sk.clone(), r)).collect();
     let room0 = shapes::room_of(&start, &it.d);
     let mut guard = 0usize;
 
-    while let Some(k) = work.pop() {
+    while let Some((k, region)) = work.pop() {
         guard += 1;
         if guard > 20000 { bail!("constant-lattice fixpoint did not converge"); }
         let st = reps[&k].clone();
@@ -2149,7 +2311,12 @@ pub fn room_constant_lattice(
             .filter(|(p, _)| roots.iter().any(|r| r == *p))
             .map(|(p, c)| (p.clone(), *c))
             .collect();
-        let f = match trace_frame(&mut it, reset, fr, st, &roots, &pin, &ival, opts.widen_mode(), &[]) {
+        let bounds: Bounds = match (grid, region, shapes::player_path(&st)) {
+            (Some(g), Some(r), Some(pl)) => g.bounds(&pl, r).into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect(),
+            (None, None, _) | (Some(_), None, None) => Vec::new(),
+            (g, r, pl) => bail!("walk node {r:?} of a shape {} a player under grid {g:?}", if pl.is_some() { "with" } else { "without" }),
+        };
+        let f = match trace_frame(&mut it, reset, fr, st, &roots, &pin, &ival, opts.widen_mode(), &bounds) {
             Ok(f) => f,
             Err(e) => {
                 // Remember the refusal instead of silently skipping: a
@@ -2165,12 +2332,12 @@ pub fn room_constant_lattice(
                 // turned a refused re-trace into a runtime premise failure
                 // (room (4,0): the spawn's `state`/`delay` baked at 0, a
                 // KERNEL COVERAGE GAP at f8, 2026-09-16).
-                refused.insert(k.clone(), format!("{:#}", e));
-                frames.remove(&k);
+                refused.insert((k.clone(), region), format!("{:#}", e));
+                frames.remove(&(k.clone(), region));
                 continue;
             }
         };
-        refused.remove(&k);
+        refused.remove(&(k.clone(), region));
         // Live forks of THIS (converged-so-far) trace of shape k.
         {
             use crate::transpile::graph::Op;
@@ -2195,8 +2362,9 @@ pub fn room_constant_lattice(
         let lattice_trace = std::env::var_os("CELESTE_LATTICE_TRACE").is_some();
         if lattice_trace {
             eprintln!(
-                "[lattice] trace shape #{} ({} pinned): {} outcomes, {} nodes added ({} in the arena)",
+                "[lattice] trace shape #{} region {:?} ({} pinned): {} outcomes, {} nodes added ({} in the arena)",
                 lattice.keys().position(|x| *x == k).unwrap_or(usize::MAX),
+                region,
                 pin.len(),
                 f.outs.len(),
                 it.d.node_count().saturating_sub(it.trace_start_nodes),
@@ -2234,7 +2402,21 @@ pub fn room_constant_lattice(
             if lattice_trace {
                 let known = lattice.get(&tk).map(|m| m.iter().filter(|(p, v)| fc.get(*p) != Some(*v)).map(|(p, _)| super::iface::show(p)).collect::<Vec<_>>());
                 match known {
-                    None => eprintln!("[lattice]   outcome: NEW shape, {} constants", fc.len()),
+                    None => {
+                        // What separates the new shape from the one whose
+                        // frame produced it.
+                        let d = shape_key_diff(&k, &tk, 40);
+                        eprintln!(
+                            "[lattice]   outcome: NEW shape, {} constants; from shape #{}: after `{}`, `{}` ({} tokens) became `{}` ({} tokens)",
+                            fc.len(),
+                            lattice.keys().position(|x| *x == k).unwrap_or(usize::MAX),
+                            d.before,
+                            d.a,
+                            d.a_len,
+                            d.b,
+                            d.b_len
+                        )
+                    }
                     Some(gone) => eprintln!("[lattice]   outcome: shape #{}, constants removed: {:?}", lattice.keys().position(|x| *x == tk).unwrap_or(usize::MAX), gone),
                 }
             }
@@ -2252,36 +2434,49 @@ pub fn room_constant_lattice(
                     m.len() != before
                 }
             };
-            if (changed || new_ival) && !work.contains(&tk) { work.push(tk); }
+            // The outcome's regions: the new ones are traced, and a narrowed
+            // lattice re-traces every region the shape has reached.
+            let succ = successor_regions(&o.st, &mut it.d, grid)?;
+            let reached = regions.entry(tk.clone()).or_default();
+            let mut push: Vec<Option<Region>> = if changed || new_ival { reached.iter().copied().collect() } else { Vec::new() };
+            for r in succ {
+                if reached.insert(r) {
+                    push.push(r);
+                }
+            }
+            for r in push {
+                let node = (tk.clone(), r);
+                if !work.contains(&node) {
+                    work.push(node);
+                }
+            }
         }
-        frames.insert(k.clone(), f);
+        frames.insert((k.clone(), region), (f, bounds));
     }
     // Every reachable shape must have a frame. A shape whose every
     // trace refused would otherwise just be MISSING from the generated
     // set - a silent runtime coverage gap, fatal under strict mode and
     // invisible until then.
-    let missing: Vec<String> = lattice
-        .keys()
-        .filter(|k| !frames.contains_key(*k))
-        .map(|k| {
-            format!(
-                "shape {}: {}",
-                k,
-                refused.get(k).map(String::as_str).unwrap_or("never traced")
-            )
-        })
+    let nodes: Vec<WalkNode> = regions.iter().flat_map(|(k, rs)| rs.iter().map(move |r| (k.clone(), *r))).collect();
+    let missing: Vec<String> = nodes
+        .iter()
+        .filter(|node| !frames.contains_key(*node))
+        .map(|node| format!("shape {} region {:?}: {}", node.0, node.1, refused.get(node).map(String::as_str).unwrap_or("never traced")))
         .collect();
     if !missing.is_empty() {
         bail!(
-            "the constant-lattice fixpoint could not trace {} of {} shapes:\n{}",
+            "the constant-lattice fixpoint could not trace {} of {} (shape, region) nodes:\n{}",
             missing.len(),
-            lattice.len(),
+            nodes.len(),
             missing.join("\n")
         );
     }
+    if grid.is_some() {
+        eprintln!("[region] the walk reached {} shapes in {} (shape, region) nodes ({guard} traces)", lattice.len(), nodes.len());
+    }
     let graph = it.d.graph.clone();
     let mut by_hash = std::collections::HashMap::new();
-    for (k, f) in &frames {
+    for ((k, _), (f, _)) in &frames {
         by_hash.insert(f.in_rt2.shape_hash_of(), k.clone());
     }
     Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops, tracer: Tracer { it, reset, fr }, by_hash, opts, start_key, ival_extra })
@@ -2341,7 +2536,9 @@ pub struct LatticeWalk {
     pub lattice: std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,
     pub reps: std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic>>,
     pub forks: std::collections::BTreeMap<String, usize>,
-    pub frames: std::collections::BTreeMap<String, super::verify::Frame>,
+    /// Per (shape, region), its converged frame and the bounds it was traced
+    /// under (the region's; none without a region key).
+    pub frames: std::collections::BTreeMap<WalkNode, (super::verify::Frame, Bounds)>,
     pub graph: crate::transpile::graph::Graph,
     pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
@@ -2361,10 +2558,10 @@ pub fn room_constants(root: &std::path::Path) -> Result<String> {
     let room = crate::transpile::graph::Room { cart: cart.clone(), cache: cache.clone() };
     // Bind+lower each converged frame to get the emitted size.
     let mut bodies_by_shape: std::collections::BTreeMap<String, usize> = Default::default();
-    for (k, f) in frames.iter_mut() {
+    for ((k, _), (f, bounds)) in frames.iter_mut() {
         if let Ok(bound) = super::emit::bind(f, &graph, true) {
-            if let Ok(low) = super::emit::lower_frame(&bound, Some(room.clone()), Default::default()) {
-                bodies_by_shape.insert(k.clone(), low.bodies);
+            if let Ok(low) = super::emit::lower_frame(&bound, Some(room.clone()), engine_ranges(f, bounds)) {
+                *bodies_by_shape.entry(k.clone()).or_default() += low.bodies;
             }
         }
     }

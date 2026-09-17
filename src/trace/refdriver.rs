@@ -68,7 +68,9 @@ pub fn run_frame_all<'a>(
         it.prints.clear();
         let mut st = input.clone();
         crate::trace::widen::fork_pos_inputs(&mut st, &mut it.d, pos)?;
-        let out = run_one(it, body, st)?;
+        let mut out = run_one(it, body, st)?;
+        // The absent-as-zero fields, as the tracer's `trace_frame` writes them.
+        crate::trace::widen::materialize_absent_fields(&mut out, &mut it.d)?;
         outputs.push(out);
         paths += 1;
         if paths > 1_000_000 {

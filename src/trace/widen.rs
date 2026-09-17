@@ -41,6 +41,41 @@ use super::iface::{self, Path, Step};
 use super::state::State;
 use crate::transpile::graph::Op;
 
+/// THE ABSENT NUMBER FIELDS (room (3,0), 2026-09-17, plans/room30.md):
+/// `(type global, field)`, a field the object's `init` does not set and a
+/// later update adds as a number. A fall floor gets `delay` the first time
+/// it breaks and keeps it, so "which floors have ever broken" was 12 bits of
+/// the HEAP SHAPE (up to 4,096 shapes; the walk found 128 in 150 s).
+///
+/// Every frame's outcomes (the tracer's `trace_frame`, the reference
+/// engine's `run_frame_all`) write the missing field as the number 0, at
+/// every level: it is part of the shape, not of the precision. Sound because
+/// the cart cannot tell nil from 0 through what it does with the field:
+/// `cart::check_absent_fields` refuses a cart in which any read of it is not
+/// a direct operand of arithmetic or an ordering comparison - on nil those
+/// are runtime errors that halt PICO-8, so a path that reads the missing
+/// value is one the real game never continues - and `Interp::index_key`
+/// refuses a computed `t[k]` that names it.
+pub const ABSENT_AS_ZERO: &[(&str, &str)] = &[("fall_floor", "delay")];
+
+/// Write every `ABSENT_AS_ZERO` field an object lacks as the number 0.
+pub fn materialize_absent_fields<D: Domain>(st: &mut State<D>, d: &mut D) -> Result<()> {
+    for (ty, f) in ABSENT_AS_ZERO {
+        for obj in objects_of_type(st, ty) {
+            let Some(Value::Table(t)) = iface::get(st, &obj) else { bail!("{}: not a table", iface::show(&obj)) };
+            match st.heap.tables[&t].hash.get(*f) {
+                None | Some(Value::Nil) => {
+                    let zero = Value::Num(d.num(P8::from_raw(0)));
+                    st.heap.tables.get_mut(&t).unwrap().hash.insert(f.to_string(), zero);
+                }
+                Some(Value::Num(_)) => {}
+                Some(other) => bail!("{}.{f} holds {other:?}, not a number", iface::show(&obj)),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Objects whose `type` is the global `name` - the rule `mark_walk` uses
 /// to find the player, rather than a position in the object list, since
 /// which object is the player changes within a room.

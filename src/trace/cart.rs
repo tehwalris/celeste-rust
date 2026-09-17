@@ -105,6 +105,85 @@ pub fn sources_in(root: &std::path::Path) -> Result<String> {
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
 }
 
+/// Refuse a program that could tell an `ABSENT_AS_ZERO` field's missing
+/// value (nil) from the 0 every frame writes there
+/// (`widen::materialize_absent_fields`). Every `.field` in the program must
+/// be an assignment target or a DIRECT operand of arithmetic (`+ - * / % ^`)
+/// or of an ordering comparison (`< <= > >=`) - on nil each of those is a
+/// runtime error, so a path reading the missing value halts the real game.
+/// Anything else (`==`, `and`/`or`, `not`, a call argument, a local,
+/// parentheses, a further index) refuses. Counted rather than walked with
+/// parents: all `.field` indexes must equal the targets plus such operands.
+/// A bracketed `t["field"]` is refused at trace time (`Interp::index_key`).
+pub fn check_absent_fields(ast: &full_moon::ast::Ast) -> Result<()> {
+    use full_moon::ast;
+    use full_moon::visitors::Visitor;
+    fn names_field(e: &ast::VarExpression, field: &str) -> bool {
+        matches!(e.suffixes().last(), Some(ast::Suffix::Index(ast::Index::Dot { name, .. })) if name.token().to_string().trim() == field)
+    }
+    struct Count {
+        field: &'static str,
+        all: usize,
+        safe: usize,
+    }
+    impl Visitor for Count {
+        fn visit_index(&mut self, node: &ast::Index) {
+            if let ast::Index::Dot { name, .. } = node {
+                if name.token().to_string().trim() == self.field {
+                    self.all += 1;
+                }
+            }
+        }
+        fn visit_expression(&mut self, node: &ast::Expression) {
+            if let ast::Expression::BinaryOperator { lhs, binop, rhs } = node {
+                use ast::BinOp;
+                let crashes_on_nil = matches!(
+                    binop,
+                    BinOp::Plus(_)
+                        | BinOp::Minus(_)
+                        | BinOp::Star(_)
+                        | BinOp::Slash(_)
+                        | BinOp::Percent(_)
+                        | BinOp::Caret(_)
+                        | BinOp::LessThan(_)
+                        | BinOp::LessThanEqual(_)
+                        | BinOp::GreaterThan(_)
+                        | BinOp::GreaterThanEqual(_)
+                );
+                if crashes_on_nil {
+                    for side in [lhs, rhs] {
+                        if let ast::Expression::Var(ast::Var::Expression(ve)) = &**side {
+                            if names_field(ve, self.field) {
+                                self.safe += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fn visit_assignment(&mut self, node: &ast::Assignment) {
+            for v in node.variables().iter() {
+                if let ast::Var::Expression(ve) = v {
+                    if names_field(ve, self.field) {
+                        self.safe += 1;
+                    }
+                }
+            }
+        }
+    }
+    for (_, field) in super::widen::ABSENT_AS_ZERO {
+        let mut c = Count { field, all: 0, safe: 0 };
+        c.visit_ast(ast);
+        anyhow::ensure!(
+            c.all == c.safe,
+            "`.{field}` is absent-as-zero (widen::ABSENT_AS_ZERO), but {} of its {} uses could tell nil from 0 (not an assignment target, arithmetic or an ordering comparison)",
+            c.all - c.safe,
+            c.all
+        );
+    }
+    Ok(())
+}
+
 pub fn fresh_state<D: Domain>(d: &mut D) -> State<D> {
     let mut heap: Heap<D> = Heap::default();
     let globals = heap.new_table();

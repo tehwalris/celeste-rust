@@ -1294,7 +1294,14 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// point rather than a limitation.
     fn index_key(&mut self, v: &Value<D>) -> Result<Key> {
         Ok(match v {
-            Value::Str(s) => Key::Field(s.to_string()),
+            Value::Str(s) => {
+                // `cart::check_absent_fields` sees only `.field`: a bracketed
+                // or computed key naming an absent-as-zero field escapes it.
+                if let Some((_, f)) = crate::trace::widen::ABSENT_AS_ZERO.iter().find(|(_, f)| s.to_string() == **f) {
+                    bail!("`[\"{f}\"]` indexes an absent-as-zero field (widen::ABSENT_AS_ZERO) outside what cart::check_absent_fields checks");
+                }
+                Key::Field(s.to_string())
+            }
             Value::Num(n) => {
                 let c = self
                     .d
