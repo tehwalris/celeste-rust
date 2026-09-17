@@ -552,7 +552,28 @@ export function spaceView(run: Run, onState: () => void): View {
       else onState();
     },
   );
-  const bar = el("div", { class: "transport-bar" }, [transport, scrub.root]);
+  // The pass scrubber: the same full width, over the current pass only (a
+  // level's forward or backward), so a finger can pick one frame of a pass
+  // that is a few pixels wide on the ladder's scrubber. Both are views of
+  // `st.step`; each follows the other through render().
+  let passShown: Pass | null = null;
+  const passScrub = scrubber(
+    (v) => {
+      if (!passShown) return;
+      st.step = passShown.start + v;
+      stop();
+      render();
+    },
+    (g) => {
+      if (g) stop();
+      else onState();
+    },
+    "position in the current pass",
+  );
+  const passWhat = el("span", { class: "what" });
+  const passWhere = el("span", { class: "where" });
+  const passBox = el("div", { class: "pass-scrub" }, [el("div", { class: "pass-scrub-label", "aria-hidden": true }, [passWhat, passWhere]), passScrub.root]);
+  const bar = el("div", { class: "transport-bar" }, [transport, el("div", { class: "scrubs" }, [scrub.root, passBox])]);
 
   function goHorizon(i: number) {
     st.h = i;
@@ -873,6 +894,8 @@ export function spaceView(run: Run, onState: () => void): View {
     show(view3dWrap, is3d);
     show(lookChips.root, !is3d);
     show(mode3Chips.root, is3d);
+    // Stepping by pass has no frames inside a step to scrub.
+    show(passBox, !byPass());
     stage.dataset.grain = st.grain;
     syncLegend();
     buildLadder();
@@ -907,6 +930,45 @@ export function spaceView(run: Run, onState: () => void): View {
         if (bw > 22) {
           ctx.fillStyle = p.phase === "fwd" ? "rgba(0,0,0,0.8)" : "rgba(255,255,255,0.75)";
           ctx.fillText(label, x0 + 4, h / 2 + 0.5);
+        }
+      }
+    });
+  }
+
+  /** Move the pass scrubber to frame slot `i` of `pass`; a new pass (or
+   *  horizon: the passes are per horizon) repaints its backdrop. */
+  function syncPassScrub(hr: HorizonRun, pass: Pass, i: number) {
+    const n = pass.frames.length;
+    const f = pass.frames[i];
+    const fwd = pass.phase === "fwd";
+    const lv = levelName(pass.lr) === "exact" ? "exact" : `level ${pass.lr.level}`;
+    passWhat.replaceChildren(el("i", { style: `background:${levelCss(pass.lr.level)}` }), `h${hr.h} · ${lv} · ${fwd ? "forward" : "backward"}`);
+    passWhere.textContent = fwd ? `f${f} / f${pass.frames[n - 1]}` : `back to f${f} · f${pass.frames[0]} → f${pass.frames[n - 1]}`;
+    passScrub.set(i, n - 1, fwd ? `f${f}` : `← f${f}`);
+    if (passShown === pass) return;
+    passShown = pass;
+    passScrub.backdrop((ctx, w, h) => {
+      ctx.fillStyle = rgbCss(levelColor(pass.lr.level), fwd ? 0.45 : 0.22);
+      ctx.fillRect(0, 0, w, h);
+      if (!fwd) {
+        ctx.fillStyle = "rgba(255,245,225,0.55)";
+        ctx.fillRect(0, 0, w, 2);
+      }
+      // A tick per frame at the knob's slot centres (when they are far
+      // enough apart to read), a longer one and the number every 10 frames.
+      const slot = w / n;
+      ctx.font = "600 10px " + getComputedStyle(document.body).fontFamily;
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "left";
+      for (let k = 0; k < n; k++) {
+        const x = Math.round((k + 0.5) * slot) - 0.5;
+        const major = pass.frames[k] % 10 === 0;
+        if (!major && slot < 3) continue;
+        ctx.fillStyle = major ? "rgba(255,255,255,0.6)" : "rgba(255,255,255,0.22)";
+        ctx.fillRect(x, h - (major ? 10 : 5), 1, major ? 10 : 5);
+        if (major && slot * 10 >= 24) {
+          ctx.fillStyle = "rgba(255,255,255,0.8)";
+          ctx.fillText(String(pass.frames[k]), x + 3, h / 2 - 3);
         }
       }
     });
@@ -959,6 +1021,7 @@ export function spaceView(run: Run, onState: () => void): View {
     st.step = Math.max(0, Math.min(total - 1, st.step));
     const { pass, i } = locate(tl, st.step);
     scrub.set(st.step, total - 1, `${pass.phase === "fwd" ? "f" : "← f"}${pass.frames[i]} · L${pass.lr.level}`);
+    syncPassScrub(hr, pass, i);
     if (st.grain === "room") {
       const built = roomScene(hr, pass, i);
       shown(built);
@@ -1250,6 +1313,7 @@ export function spaceView(run: Run, onState: () => void): View {
     st.step = Math.max(0, Math.min(total - 1, st.step));
     const { pass, i } = locate(tl, st.step);
     scrub.set(st.step, total - 1, `${pass.phase === "fwd" ? "f" : "← f"}${pass.frames[i]} · L${pass.lr.level}`);
+    syncPassScrub(hr, pass, i);
     const off = columnsScene(hr, pass, i);
     v.setDynamic(inst3.data, inst3.count);
     v.setDimBelow(-1e9, 1);
@@ -1387,6 +1451,9 @@ export function spaceView(run: Run, onState: () => void): View {
     if (!root.isConnected || ev.metaKey || ev.ctrlKey || ev.altKey) return;
     const tag = (ev.target as HTMLElement).tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    // A focused scrubber moves itself on the arrows / home / end (the pass
+    // scrubber's home is the pass's start, not the horizon's).
+    if ((ev.target as HTMLElement).closest?.(".scrubber") && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(ev.key)) return;
     switch (ev.key) {
       case " ":
         ev.preventDefault();

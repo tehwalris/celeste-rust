@@ -176,11 +176,11 @@ export interface Scrubber {
  *  slots, the knob sits in the middle of the current one, a press picks
  *  the slot under the finger. A backdrop drawn with the same slot
  *  mapping (`slotX`) lines up with the knob. */
-export function scrubber(onScrub: (value: number) => void, onGrab?: (grabbing: boolean) => void): Scrubber {
+export function scrubber(onScrub: (value: number) => void, onGrab?: (grabbing: boolean) => void, ariaLabel = "position in the ladder"): Scrubber {
   const canvas = el("canvas", { class: "scrub-track" });
   const knob = el("div", { class: "scrub-knob" });
   const bubble = el("div", { class: "scrub-bubble" });
-  const root = el("div", { class: "scrubber", role: "slider", tabindex: 0, "aria-valuemin": 0, "aria-label": "position in the ladder" }, [canvas, knob, bubble]);
+  const root = el("div", { class: "scrubber", role: "slider", tabindex: 0, "aria-valuemin": 0, "aria-label": ariaLabel }, [canvas, knob, bubble]);
   let value = 0;
   let max = 1;
   let label = "";
