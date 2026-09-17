@@ -56,6 +56,9 @@ use crate::transpile::graph::Op;
 /// are runtime errors that halt PICO-8, so a path that reads the missing
 /// value is one the real game never continues - and `Interp::index_key`
 /// refuses a computed `t[k]` that names it.
+// TODO(Philippe, 2026-09-17): writing the missing field as 0 is a hack, good
+// enough for now; revisit (a proper nil-or-number, or a derived rule instead
+// of this list).
 pub const ABSENT_AS_ZERO: &[(&str, &str)] = &[("fall_floor", "delay")];
 
 /// Write every `ABSENT_AS_ZERO` field an object lacks as the number 0.
