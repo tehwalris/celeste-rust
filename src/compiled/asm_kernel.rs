@@ -183,6 +183,9 @@ struct AsmKernel {
     fused: crate::transpile::graph::Graph,
     flat_roots: Vec<crate::transpile::graph::NodeId>,
     room: Room,
+    /// Per input cell (parallel to `compiled.input_cells`), the traced
+    /// frame's path for it: what a packing failure names.
+    input_names: Vec<String>,
 }
 
 impl AsmKernel {
@@ -853,7 +856,11 @@ impl AsmKernel {
             .input_cells
             .iter()
             .zip(&self.compiled.input_reprs)
-            .map(|(&cell, repr)| InputView::of(&chunk.cols[cell as usize], *repr))
+            .zip(&self.input_names)
+            .map(|((&cell, repr), name)| {
+                InputView::of(&chunk.cols[cell as usize], *repr)
+                    .unwrap_or_else(|e| panic!("{e}: input cell {cell} = {name} of shape {:#x}", chunk.shape_hash))
+            })
             .collect()
     }
 
@@ -1172,8 +1179,8 @@ enum InputView<'c> {
 }
 
 impl<'c> InputView<'c> {
-    fn of(col: &'c Col, repr: CellRepr) -> Self {
-        match (repr, col) {
+    fn of(col: &'c Col, repr: CellRepr) -> Result<Self, String> {
+        Ok(match (repr, col) {
             (CellRepr::Num, Col::N(v)) => InputView::Num(v),
             (CellRepr::Num, Col::U(AV::Num(n))) => InputView::NumU(n.as_raw_u32()),
             (CellRepr::Ival, Col::I(v)) => InputView::Ival(v),
@@ -1186,11 +1193,11 @@ impl<'c> InputView<'c> {
                 // A kernel reads this cell, and a bool input is DECIDED
                 // (`CellRepr::Bool`): packing an unknown as false would
                 // silently drop the true arm.
-                other => panic!("ASM bool input column holds {other:?}: a kernel reads a boolean the block does not decide"),
+                other => return Err(format!("ASM bool input column holds {other:?}: a kernel reads a boolean the block does not decide")),
             },
-            (CellRepr::Bool, other) => panic!("ASM bool input column is {:?}", other),
+            (CellRepr::Bool, other) => return Err(format!("ASM bool input column is {other:?}")),
             (repr, other) => InputView::Any(other, repr),
-        }
+        })
     }
 }
 
@@ -1458,8 +1465,12 @@ impl Registry {
             return self.run_key(chunk, KernelKey { speed: None, region: None }, cell_in, lanes, sink);
         }
         let keys = self.w.and_then(|w| speed_keys(chunk, w));
+        // A region only where the shape has a PLAYER (`shapes::player_path`,
+        // the walk's rule): a row's cell also locates a `player_spawn`, whose
+        // shape's kernel has no region (room (3,0) f1: the spawn at y=128).
+        let grid = self.grid.filter(|_| !chunk.player_objects(crate::compiled::ids()).is_empty());
         let key_of = |lane: usize| -> KernelKey {
-            KernelKey { speed: keys.as_ref().map(|k| k[lane]), region: self.grid.and_then(|g| g.of_cell(cell_in[lane])) }
+            KernelKey { speed: keys.as_ref().map(|k| k[lane]), region: grid.and_then(|g| g.of_cell(cell_in[lane])) }
         };
         let mut lo = lanes.start;
         while lo < lanes.end {
@@ -1874,6 +1885,18 @@ fn build_one_shape(
         b.pos = pos_sources(&acc_templates[b.outcome].build(), &b.fields)?;
     }
 
+    let input_names = compiled
+        .input_cells
+        .iter()
+        .map(|c| {
+            r.frame
+                .in_cells
+                .iter()
+                .position(|x| x == c)
+                .map(|i| crate::trace::iface::show(&r.frame.iface.slots[i]))
+                .unwrap_or_else(|| format!("cell {c}, not an input slot"))
+        })
+        .collect();
     Ok((
         shape,
         key,
@@ -1887,6 +1910,7 @@ fn build_one_shape(
             fused,
             flat_roots,
             room,
+            input_names,
         },
     ))
 }

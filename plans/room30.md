@@ -32,6 +32,14 @@ apart by this cart:
   comparison (`==`, `and`/`or`, a call argument, a local: refused), and
   `Interp::index_key` refuses a bracketed or computed `t["delay"]`.
 
+A consequence: the post-`_init` start state (no `delay` yet) is a shape no
+frame ever returns to, so no outcome narrows its constant lattice, and it kept
+`__button_states[0..5] = false` pinned. The block holds the buttons unknown
+(their canonical form: dead at the boundary, reset before every read), so the
+start kernel's pin guard read an undecided boolean at f1. In rooms (1,0) and
+(2,0) the spawn's own successor narrowed the pin away. `field_constants` now
+never makes a button a constant.
+
 Rooms (1,0) and (2,0) have no fall floors: the three pinned gates reproduce
 (ckhash f0-f44 empty diff, posgraph f044 identical, marks identical).
 
@@ -55,7 +63,10 @@ floors' collision tests.
   kernels: a row outside has no kernel and stops the run (`[asm] MISS`).
 - The registry is keyed by (shape hash, `KernelKey { speed, region }`); a
   chunk's lanes arrive in cell order, so `run_chunk` runs each run of one
-  region on its kernel.
+  region on its kernel. A chunk takes a region only if its shape has a
+  `player` object (the walk's `player_path` rule): a row's CELL also locates
+  a `player_spawn`, and the first forward stopped at f1 on the spawn at
+  y = 128 asking for region (0, 4) of a shape whose kernel has none.
 - `S <= 7`: the move loop is unrolled for `abs(amount) <= 8`. The game's
   largest speed is the dash's 5.
 - Only exact-speed, exact-position levels (the held ladder `r*sxh`, `rxsx`);
@@ -63,4 +74,12 @@ floors' collision tests.
 
 ## Measurements
 
-(filled in below as they land)
+- **The level-0 walk with `CELESTE_REGION=32,6`** (`transpile --room-consts`,
+  quick profile) converges at 9 shapes in 114 (shape, region) nodes, from
+  471 traces in about 5.5 min, 713 MB resident. Two thirds of the traces are
+  re-traces: a shape's lattice narrows a few pins at a time (shape 7: 245 ->
+  215 pinned over 12 narrowings), and each narrowing re-traces all ~30
+  regions the shape has reached. Parallel rounds, with narrowings applied
+  between rounds, would cut both the re-traces and the wall time; not built.
+  With the report's bind + lower of every frame: 6:17 wall, 968 MB peak,
+  25,034 bodies over the 114 kernels.

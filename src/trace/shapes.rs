@@ -247,9 +247,16 @@ pub fn field_constants(
     use super::domain::Domain;
     use super::iface::Conc;
     let widened = boundary_widened_paths(st, spd_ival, pos_ival, held);
+    // The buttons are dead at the boundary: blocks hold them unknown (the
+    // canonical form, `refbridge`) and every frame resets them before it
+    // reads them. A concrete `false` in the post-`_init` start state is not a
+    // constant of the shape: pinned, the start shape's kernel guarded on them
+    // and read an unknown (room (3,0), whose start shape no frame returns to
+    // once `delay` is materialized, so nothing narrowed the pin away).
+    let buttons = iface::key("__button_states");
     let mut out = std::collections::BTreeMap::new();
     for p in state_paths(st)? {
-        if widened.contains(&p) { continue; }
+        if widened.contains(&p) || p.first() == Some(&buttons) { continue; }
         match iface::get(st, &p) {
             Some(Value::Num(n)) => {
                 if let Some(v) = d.as_const(&n) {
