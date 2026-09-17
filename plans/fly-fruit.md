@@ -26,13 +26,18 @@ loudly), the finer-level dead `step`, gates and ladder runs.
   button or fork) and the arms are literals: the hull (or the unknown number;
   booleans that differ join to an atom). This is the "sound join" rejected for
   lane data (plans/bucket-dispatch.md); here no lane can take an arm, so the
-  select + `Known` premise would decline every lane. Lane-dependent arms keep
-  the select.
+  select + `Known` premise would decline every lane. Where the arms differ by
+  lane data (collected or not once the fruit has flown away: the player's
+  `djump`), the two states are NOT merged: they stay two successors, like two
+  shapes (`Domain::independent_undecided`; the same for a `return` value in
+  `collapse`/`collapse_values`).
 - **The local fork (option chosen: a fork scoped to the call).** `__split_by_flr`
   of a literal interval runs each grid fragment as its own TRACE state (tagged
   `State::frag`, never merged by `collapse`), and they rejoin when the enclosing
   Lua call returns (`Interp::rejoin_fragments`): merged on an undecided atom, every
-  difference must join to a literal, else the trace is refused. For the fruit's
+  difference must join to a literal, else the trace is refused. (A slot both
+  fragments hold alike may already hold an older select, e.g. a fall floor's
+  `delay`; the rejoin counts only the selects it makes.) For the fruit's
   `move` the 6 fragments of `rem.y + spd.y + 0.5` in [-3.5, 1.5) rejoin as `rem.y`
   = [-0.5, 0.5) exactly and `y` unknown, so the frame gains no configuration.
   Why not the others: a graph fork multiplies every body's configurations (6
@@ -43,7 +48,44 @@ loudly), the finer-level dead `step`, gates and ladder runs.
   [-0.5, 0.5) as literals; `fly` an atom, stored `AV::UBool`. At the output the
   frame's computed `spd.y` / `rem.y` must be literals inside their ranges (checked
   at trace time, so for every row at once) or the trace is refused. The lattice
-  never pins these fields.
+  never pins these fields. The post-`_init` start block (`Block::from_state`) is
+  keyed with the fruit exact: storing the decided fruit is exact, the kernel
+  replaces it at the frame's start, and no frame returns to that shape.
+
+### Measured: room (3,0) level 0, `r0sxhf` against `r0sxh` (2026-09-17)
+
+`CELESTE_REGION=32,6 rewrite forward --level r0sxhf --to 55 --room 3,0`,
+release, 32 threads, fresh checkpoint dir. The walk reaches 10 shapes in 115
+(shape, region) nodes (9 in 114 at `r0sxh`: the fruit collected after it
+flew away is a shape of its own). No decline, no coverage gap, to f55.
+
+| frame | `r0sxh` states | `r0sxhf` states | fewer | `r0sxhf` frame | growth |
+|---|---|---|---|---|---|
+| f40 | 176,925 | 133,228 | 1.33x | 0.88 s | x1.36 |
+| f44 | 825,170 | 376,427 | 2.19x | 1.9 s | x1.31 |
+| f48 | 3,886,471 | 1,334,635 | 2.91x | 3.9 s | x1.40 |
+| f50 | 8,993,524 | 2,523,979 | 3.56x | 6.7 s | x1.37 |
+| f52 | - | 5,289,522 | | 13.8 s | x1.47 |
+| f55 | - | 17,556,119 | | 56.1 s | x1.51 |
+
+(`r0sxh` frame times, from the stopped search: f40 0.4 s, f44 1.6 s, f48 7.9 s,
+f50 20.8 s. Its RSS, 13-16 GB, held 17 prebuilt kernel sets; this run peaks at
+4.9 GB at f50 and 14.7 GB at f55 for level 0 alone, so they don't compare.)
+55,125,381 states visited through f55.
+
+**Kernel build time regressed:** the walk takes 414 s (493 traces in 13
+rounds) against 20.8 s at `r0sxh`; the 115 kernels then assemble in 2.2 s. Not
+the atom walk (`reads_unknown_atom` memoized post-order: the same 414 s, and
+identical kept/visited counts f1-f36). Unverified suspect: `collapse` re-trying,
+at every statement, pairs of states it keeps as two successors, with a full
+heap join before each refusal.
+
+So the widening pays and the factor grows (1.3x at f40, 3.6x at f50), but level 0
+still does not saturate: growth is x1.37 at f50 and rising to x1.51 at f55. That
+matches room30.md: the fall floors and the player's exact speed remain.
+Against the no-fruit EXPERIMENT (f050 797,366; f055 5,788,531) this is still
+about 3x more. Not measured which part: the fruit gone (collected, or flown
+away), the refilled `djump` rows, or the two-successor merges.
 
 Found on the way, not fixed: `Interp::collapse_values` joins an expression's
 two values with a select and no `Known` premise (the premise is only added for

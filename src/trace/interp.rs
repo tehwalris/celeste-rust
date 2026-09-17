@@ -620,6 +620,11 @@ impl<'a, D: Domain> Interp<'a, D> {
                 let Some(m) = merge(&mut self.d, a, b)? else {
                     continue;
                 };
+                if let (Flow::Return(x), Flow::Return(y)) = (&outs[i].1, &outs[j].1) {
+                    if !self.joins_independent(&m.cond, x, y) {
+                        continue;
+                    }
+                }
                 self.merge_fallbacks += m.fell_back as usize;
                 let fl = self.join_flow(&m.cond, &outs[i].1, &outs[j].1);
                 // j > i, so drop the later index first.
@@ -647,6 +652,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                 let Some(m) = merge(&mut self.d, a, b)? else {
                     continue;
                 };
+                if !self.joins_independent(&m.cond, &outs[i].1, &outs[j].1) {
+                    continue;
+                }
                 self.merge_fallbacks += m.fell_back as usize;
                 let v = self.join_value(&m.cond, &outs[i].1.clone(), &outs[j].1.clone());
                 outs.remove(j);
@@ -668,6 +676,20 @@ impl<'a, D: Domain> Interp<'a, D> {
             (Flow::Return(x), Flow::Return(y)) => joinable(x, y),
             (Flow::Break, Flow::Break) | (Flow::Normal, Flow::Normal) => true,
             _ => false,
+        }
+    }
+
+    /// Can two values be joined on `cond` without a select some lane cannot
+    /// take? On a condition that reads an unknown atom, only an independent
+    /// join (`Domain::join_num_independent`) can; otherwise the states stay two
+    /// successors, as `state::merge` keeps their heaps.
+    fn joins_independent(&mut self, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> bool {
+        if a == b || !self.d.reads_unknown_atom(cond) {
+            return true;
+        }
+        match (a, b) {
+            (Value::Num(x), Value::Num(y)) => self.d.join_num_independent(cond, x, y).is_some(),
+            _ => true,
         }
     }
 
@@ -1602,7 +1624,11 @@ impl<'a, D: Domain> Interp<'a, D> {
                 let cond = self.d.undecided_atom()?;
                 let m = super::state::merge_on(&mut self.d, acc.0, s, cond.clone())?
                     .ok_or_else(|| anyhow!("literal split {id}: its fragments end in different shapes"))?;
-                anyhow::ensure!(!m.selects, "literal split {id}: its fragments did not rejoin (a value differs by more than a literal)");
+                anyhow::ensure!(
+                    !m.selects,
+                    "literal split {id}: its fragments did not rejoin, {} differs by more than a literal",
+                    m.first_select.as_deref().unwrap_or("a value")
+                );
                 let v = match (&acc.1, &v) {
                     (a, b) if a == b => a.clone(),
                     (Value::Num(x), Value::Num(y)) => Value::Num(

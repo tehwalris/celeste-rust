@@ -89,7 +89,16 @@ impl Block {
         // The key is the level's WIDENED row (the speed hull: a row stores
         // its tight speed and is keyed on the bucket), the same rule the
         // kernels' key layer applies (`asm_kernel`: the key node override).
-        let (_, keys, _) = widened_keys_rt2(&rt2, crate::interpreter::abstraction::current_level())?;
+        // A fruit-unknown level keys the state's fly fruit as it is: storing
+        // the decided fruit is exact, the kernel replaces it at the frame's
+        // start (`widen::fork_fruit_inputs`), and the post-`_init` state is a
+        // shape no frame returns to, so no key has to agree with it
+        // (plans/fly-fruit.md).
+        let level = crate::interpreter::abstraction::Level {
+            fruit: crate::interpreter::abstraction::FruitPrecision::Exact,
+            ..crate::interpreter::abstraction::current_level()
+        };
+        let (_, keys, _) = widened_keys_rt2(&rt2, level)?;
         rt2.row_keys_canonical();
         rt2.row_keys = keys;
         Ok(Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() })

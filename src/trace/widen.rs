@@ -235,19 +235,33 @@ pub fn fork_fruit_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<(
 /// The fly fruit's OUTPUT side at a fruit-unknown level: `step` and `y` the
 /// unknown number (stored `AV::UNum`, `emit::bind`), `fly` unknown (stored
 /// `AV::UBool`), `spd.y` and `rem.y` their ranges - after checking that the
-/// frame computed a literal inside each (rule 1: a range only replaces what it
-/// visibly contains). Literal, so the check holds for every row at once, and
-/// the range is a fixed point of the frame itself, not an argument about the
-/// game.
+/// frame computed literals inside each (rule 1: a range only replaces what it
+/// visibly contains): a literal, or a select whose arms all are (a lane holds
+/// one of them). Literal, so the check holds for every row at once, and the
+/// range is a fixed point of the frame itself, not an argument about the game.
 fn widen_fly_fruit(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     if !d.fruit_unknown {
         return Ok(());
     }
+    // Every value a lane can hold: a literal, or a select over such values
+    // (whichever arm a lane takes, it holds one of them).
+    fn literal_arms(g: &crate::transpile::graph::Graph, n: crate::transpile::graph::NodeId, out: &mut Vec<(i32, i32)>) -> bool {
+        let node = g.get(n);
+        match node.op {
+            Op::Const(a, b) => {
+                out.push((a, b));
+                true
+            }
+            Op::Sel => literal_arms(g, node.args[1], out) && literal_arms(g, node.args[2], out),
+            _ => false,
+        }
+    }
     let fp = fly_fruit_paths(st);
     for (p, (lo, hi)) in &fp.ranges {
         let Some(Value::Num(v)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
-        match d.graph.get(v).op {
-            Op::Const(a, b) if *lo <= a && b <= *hi => {}
+        let mut arms = Vec::new();
+        match literal_arms(&d.graph, v, &mut arms) {
+            true if arms.iter().all(|(a, b)| *lo <= *a && *b <= *hi) => {}
             _ => bail!(
                 "{}: the fly fruit's range [{}, {}] does not visibly contain what the frame computed, {}",
                 iface::show(p),

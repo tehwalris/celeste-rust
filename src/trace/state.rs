@@ -145,6 +145,9 @@ pub struct Merged<D: Domain> {
     /// A select survived the merge - in a value or in `ok` - so the kernel
     /// reads `cond`'s value bit on this state's lanes.
     pub selects: bool,
+    /// The first slot whose join left a select, with its two values (or
+    /// "ok"): what a refused rejoin names (`Interp::rejoin_fragments`).
+    pub first_select: Option<String>,
 }
 
 impl<D: Domain> Clone for State<D> {
@@ -218,7 +221,8 @@ fn merge_inner<D: Domain>(
 
     // The decision that separates the two sides - see `State::path`.
     let l = common_prefix(&t, &f);
-    let (cond, fell_back) = match (over, t.path.get(l), f.path.get(l)) {
+    let rejoin = over.is_some();
+    let (cond, fell_back) = match (over,t.path.get(l), f.path.get(l)) {
         (Some(c), _, _) => (c, false),
         (None, Some((ct, pt)), Some((cf, pf))) if ct == cf && pt != pf => {
             (if *pt { ct.clone() } else { d.not(ct) }, false)
@@ -251,13 +255,27 @@ fn merge_inner<D: Domain>(
     let mut heap = t.heap.clone();
     // Did any join leave a select the kernel reads by `cond`'s value bit?
     let mut selects = false;
-    let mut join = |d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>| -> Result<Value<D>> {
+    let mut first_select: Option<String> = None;
+    // A rejoin on a given condition (`merge_on`) counts only the selects IT
+    // made: a slot both fragments hold alike keeps whatever select an earlier
+    // merge left there, which reads its own condition, not this one. (The
+    // ordinary merge keeps counting those too, as it always has.)
+    let mut join = |d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>, at: &dyn Fn() -> String| -> Result<Value<D>> {
         let j = join(d, cond, a, b)?;
-        selects |= match &j {
-            Value::Num(n) => d.is_select_num(n),
-            Value::Bool(x) => d.is_select_bool(x),
-            _ => false,
-        };
+        let sel = !(rejoin && a == b)
+            && match &j {
+                Value::Num(n) => d.is_select_num(n),
+                Value::Bool(x) => d.is_select_bool(x),
+                _ => false,
+            };
+        if sel && first_select.is_none() {
+            let show = |d: &D, v: &Value<D>| match v {
+                Value::Num(n) => d.describe(n),
+                other => format!("{other:?}"),
+            };
+            first_select = Some(format!("{} = {} against {}", at(), show(d, a), show(d, b)));
+        }
+        selects |= sel;
         Ok(j)
     };
     for (rt, rf) in t_order.iter().zip(f_order.iter()) {
@@ -270,12 +288,12 @@ fn merge_inner<D: Domain>(
                     let vb = tb.hash.get(&k).ok_or_else(|| {
                         anyhow::anyhow!("merge: key {:?} missing after equal shapes", k)
                     })?;
-                    let j = join(d, cond, &va, vb)?;
+                    let j = join(d, cond, &va, vb, &|| format!("table {a} [{k:?}]"))?;
                     heap.tables.get_mut(a).unwrap().hash.insert(k, j);
                 }
                 for i in 0..heap.tables[a].arr.len() {
                     let va = heap.tables[a].arr[i].clone();
-                    let j = join(d, cond, &va, &tb.arr[i])?;
+                    let j = join(d, cond, &va, &tb.arr[i], &|| format!("table {a} [{i}]"))?;
                     heap.tables.get_mut(a).unwrap().arr[i] = j;
                 }
                 let ikeys: Vec<i16> = heap.tables[a].ints.keys().copied().collect();
@@ -284,7 +302,7 @@ fn merge_inner<D: Domain>(
                     let vb = tb.ints.get(&k).ok_or_else(|| {
                         anyhow::anyhow!("merge: index {} missing after equal shapes", k)
                     })?;
-                    let j = join(d, cond, &va, vb)?;
+                    let j = join(d, cond, &va, vb, &|| format!("table {a} [int {k}]"))?;
                     heap.tables.get_mut(a).unwrap().ints.insert(k, j);
                 }
             }
@@ -296,7 +314,7 @@ fn merge_inner<D: Domain>(
                     let vb = sb.vars.get(&k).ok_or_else(|| {
                         anyhow::anyhow!("merge: local {:?} missing after equal shapes", k)
                     })?;
-                    let j = join(d, cond, &va, vb)?;
+                    let j = join(d, cond, &va, vb, &|| format!("local {k:?}"))?;
                     heap.scopes.get_mut(a).unwrap().vars.insert(k, j);
                 }
             }
@@ -310,7 +328,18 @@ fn merge_inner<D: Domain>(
     }
 
     let per_case = d.sel_bool(cond, &t.ok, &f.ok);
-    let selects = selects || d.is_select_bool(&per_case);
+    let ok_selects = !(rejoin && t.ok == f.ok) && d.is_select_bool(&per_case);
+    if first_select.is_none() && ok_selects {
+        first_select = Some("ok".to_string());
+    }
+    let selects = selects || ok_selects;
+    // A condition that reads an unknown atom cannot be selected on: the lanes
+    // it depends on the atom in would decline its `Known` premise. Two such
+    // states are two successors (plans/fly-fruit.md); only a rejoin
+    // (`merge_on`) reports it instead.
+    if selects && !rejoin && d.reads_unknown_atom(cond) {
+        return Ok(None);
+    }
     let state = State {
         heap,
         globals: t.globals,
@@ -352,7 +381,7 @@ fn merge_inner<D: Domain>(
         key_override: t.key_override,
         frag: t.frag,
     };
-    Ok(Some(Merged { state, cond: cond.clone(), fell_back, selects }))
+    Ok(Some(Merged { state, cond: cond.clone(), fell_back, selects, first_select }))
 }
 
 /// Merge one slot. Only numbers and booleans can actually differ - the

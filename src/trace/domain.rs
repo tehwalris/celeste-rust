@@ -265,6 +265,15 @@ pub trait Domain {
         None
     }
 
+    /// Does the undecided condition `c` read an unknown atom (`Op::UnknownBool`)?
+    /// No lane ever decides an atom, so wherever `c` depends on one it stays
+    /// undecided: a merge on `c` that would leave a select is not a merge but two
+    /// successors, since those lanes would decline the select's `Known(c)`
+    /// premise (`state::merge`).
+    fn reads_unknown_atom(&mut self, _c: &Self::Bool) -> bool {
+        false
+    }
+
     /// `__split_by_flr` of a value every lane holds alike (a literal interval):
     /// its fragments on the fork grid, as literals, for the interpreter to run
     /// as separate trace states and rejoin when the enclosing call returns
@@ -400,6 +409,8 @@ pub struct Symbolic {
     /// `lane_independent`'s memo. Structural (a node's op and operands never
     /// change), so it outlives a frame.
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
+    /// `reads_unknown_atom`'s memo: structural, like `lane_memo`.
+    atom_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// Fork choices already handed out THIS FRAME, by the value forked.
     ///
     /// Two call sites that floor the same value do not need two choice
@@ -907,6 +918,35 @@ impl Domain for Symbolic {
             (Op::Const(a0, a1), Op::Const(b0, b1)) => Some(self.graph.leaf(Op::Const(a0.min(b0), a1.max(b1)))),
             _ => None,
         }
+    }
+
+    fn reads_unknown_atom(&mut self, c: &NodeId) -> bool {
+        if !self.fruit_unknown || self.decide(c).is_some() {
+            return false;
+        }
+        // Post-order, every node walked memoized (`lane_independent`'s walk):
+        // the conditions a frame merges on share most of their cones.
+        let mut stack: Vec<(NodeId, bool)> = vec![(*c, false)];
+        while let Some((x, expanded)) = stack.pop() {
+            if self.atom_memo.contains_key(&x) {
+                continue;
+            }
+            let node = self.graph.get(x);
+            if matches!(node.op, Op::UnknownBool(_)) || node.args.is_empty() {
+                let atom = matches!(node.op, Op::UnknownBool(_));
+                self.atom_memo.insert(x, atom);
+                continue;
+            }
+            let args = node.args.clone();
+            if expanded {
+                let r = args.iter().any(|a| self.atom_memo[a]);
+                self.atom_memo.insert(x, r);
+            } else {
+                stack.push((x, true));
+                stack.extend(args.iter().filter(|a| !self.atom_memo.contains_key(a)).map(|a| (*a, false)));
+            }
+        }
+        self.atom_memo[c]
     }
 
     fn join_bool_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
