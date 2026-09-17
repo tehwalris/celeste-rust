@@ -242,6 +242,12 @@ Measured:
   bound: a spring snaps the player up to 8 px (`hit.y=this.y-4` from the deepest
   overlap) and the player then moves with `spd.y=-3` in the same frame, 11 px.
   95 itself is the replayed TAS, confirmed through Exact.
+  **CLOSED 2026-09-17**: rerun with no band under the level -1 filter
+  (`CELESTE_LEVEL_MINUS_ONE="95,5"`, `c75f856`, plans/level-minus-one.md), a
+  bound derived from the traced frames whose window premise is checked on every
+  row: h95 confirmed through Exact, h94 refuted at level 9, **OPTIMAL 95**, in
+  27m27.6s (table 472 s included) at 28.0 GB peak. h95's level-0 marks are the
+  band run's exactly (19,245,834): the filter dropped nothing the backward used.
 
 ## Later
 

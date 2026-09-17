@@ -1,8 +1,10 @@
 # Level -1: a position-only cost-to-go table from the traced frames (2026-09-17)
 
-A PROBE, not wired into the search. The goal was to replace the experimental
-time band (`CELESTE_BAND="H,px"`, `frame::band`), whose 8 px/frame is a
-measurement, with a bound derived from the game code.
+Built first as a probe, then wired into the search as a filter
+(`CELESTE_LEVEL_MINUS_ONE="H,S"`, "As a filter" below) that replaced the
+experimental time band (`CELESTE_BAND="H,px"`, `frame::band`), whose 8 px/frame
+is a measurement, with a bound derived from the game code. Room (2,0) reports
+OPTIMAL 95 with it and no band ("Room (2,0): OPTIMAL 95 without the band").
 
 ```bash
 CELESTE_START_ROOM=2,0 CELESTE_THREADS=16 ./safe-run.sh -- ./target/quick/transpile \
@@ -263,3 +265,21 @@ Room (1,0), S=5, H=99 (release, held ladder, `--ceiling 99`), as committed:
   without the filter 1:39.7 and 5.76 GB. Room (1,0)'s late frames are small,
   so it pays in memory, not time. The room it is for is (2,0), whose level 0
   is ~60 M states at f80.
+
+## Room (2,0): OPTIMAL 95 without the band (2026-09-17)
+
+`CELESTE_LEVEL_MINUS_ONE="95,5"`, held ladder (`r0sxh..r15sxh,rxsx`), `--ceiling
+95`, no `CELESTE_BAND`, release, census `c75f856`:
+
+- the table: 472.1 s (16 threads), 154,408 nodes, the start state's d = 45;
+- level 0 (the same counts as with no filter through f070): f080 23,997,253
+  states (no filter: 62,810,806; x2.6), f085 3,315,620, f090 1,029,159, f095 1;
+  f080 in 49 s against 131 s, 17.8 GB resident against 25.6 GB;
+- h95 level 0 marked 19,245,834 states - exactly the band run's h95 level-0
+  marks: the filter dropped no state on a path to a win by f95;
+- h95 confirmed at every level through Exact (first win f95 from level 9 on),
+  h94 refuted at level 9 (as with the band): **OPTIMAL 95**;
+- 27:27.6 wall including the table, 28.0 GB peak, 114 GB of checkpoints; no
+  row outside the window.
+
+So room (2,0)'s 95 no longer rests on the 8 px band.
