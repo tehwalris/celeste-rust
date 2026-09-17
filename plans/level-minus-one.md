@@ -283,3 +283,58 @@ Room (1,0), S=5, H=99 (release, held ladder, `--ceiling 99`), as committed:
   row outside the window.
 
 So room (2,0)'s 95 no longer rests on the 8 px band.
+
+## DEFERRED: the off-screen lane (2026-09-17)
+
+The filter is sound and acceptable as it is; this is precision, parked while the
+fly fruit and the fall floors come first (Philippe: "probably C").
+
+**What the table gets wrong.** Room (2,0)'s left pocket (x 0-31, y 32-63) was
+still in level 0's frontier at f079, 16 frames before f95, although the real
+route out (down, right past the diagonal wall band, up the right side, ~230 px)
+is over 45 frames even at 5 px per frame. `CELESTE_L1_PATH="16,48"` (the probe's
+fastest-path trace) shows why: d = 11 along
+
+    (16,48) (10,47) (4,45) (-2,41) (-8,37) (-14,31) (-16,25) ... (-16,1) EXIT
+
+- left out of the room and up outside it. The `d` map has d = 1-5 in the two
+columns left of x = 0 from the top down to y 24, and the cut near the top is a
+horizontal line: the table lets the player fly at up to 5 px per frame in any
+direction.
+
+**Why.** Nothing kills the player on the left: the player's `draw` clamps x to
+[-1, 121] and zeroes `spd.x`. The gate is the global `freeze`: `_update` returns
+early while `freeze > 0` (nothing moves), `_draw` returns early too (no clamp),
+and a dash sets `freeze = 2` inside the update, after that frame's move - the one
+move that may end past the clamp. At level -1 `freeze` and `djump` are one range
+per shape and widen to the full 16.16 range (no condition refinement), so
+`freeze > 0` is undecided at every node, and the evaluator joins each undecided
+select on its own: "moved" from `_update` with "clamp skipped" from `_draw`,
+every frame, and with `djump` unbounded, a dash every frame. Off-screen, once the
+hitbox is left of x = 0, the tile loop checks no tiles, so nothing is solid.
+
+**Options.**
+- **A. Split one frame's evaluation on `freeze > 0`** and union. Makes `_update`
+  and `_draw` agree within a frame, ~2x the evaluation. Does not close the lane:
+  the node after a dash frame does not remember the dash, and `djump` unbounded
+  dashes again.
+- **B. Condition refinement in the evaluator** (`freeze - 1` only where
+  `freeze > 0`): ranges converge to `freeze` in [0, 2], `djump` in [0, 1], but
+  still undecided per node. The lane stays.
+- **C. Small counters exact per node** (CHOSEN, deferred): a node is (shape, cell,
+  `freeze`, `djump`) instead of (shape, cell). Their outputs are exact per fork
+  configuration, so a dash needs `djump > 0`, off-screen there is no ground to
+  refill it, and after one unclamped move and two frozen frames the clamp is
+  back: the lane closes. Up to 6x the nodes (154k -> ~900k worst case) and pass
+  time (~8 min per pass for room (2,0), ~50 min for the table; room (1,0) ~3
+  min). Which counters: naming `freeze`/`djump` is game knowledge; the generic
+  rule is "player integer fields whose observed values stay in a small set become
+  node coordinates", but `dash_time` (0-4) and `grace` (0-6) would join (x210),
+  so it needs a cap or a measurement. The filter would look up d as the minimum
+  over a cell's counters, so the flush hook stays per queue.
+- **D. Speed per node** (coarse buckets instead of [-5, 5] everywhere): what would
+  bend the top's straight line along gravity and the walls. Much bigger.
+
+After C: the pocket cut along the walls, the top still a straight line (that is
+D). Check with `CELESTE_L1_PATH="16,48"` (the path goes round the wall), f079's
+too-late share, then room (2,0) again.
