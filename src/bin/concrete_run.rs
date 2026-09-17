@@ -26,6 +26,32 @@ struct Cli {
     /// Number of frames to run (default: length of inputs)
     #[arg(short, long)]
     frames: Option<u32>,
+
+    /// Also print the first object of this type's number fields each frame
+    /// (e.g. `fly_fruit`: its `step`, `y`, `spd`, `rem`).
+    #[arg(long)]
+    object: Option<String>,
+}
+
+/// One object's number fields for `--object`: what a design experiment reads
+/// off it per frame (room (3,0)'s waiting fly fruit, plans/room30.md).
+fn print_object(state: &State, type_name: &str) {
+    let helper = StateHelper::new(state);
+    let Some(id) = find_object(state, type_name) else {
+        return println!("  {type_name}: none");
+    };
+    let mut parts = Vec::new();
+    for f in ["x", "y", "step", "start", "off", "state", "delay"] {
+        if let Some(n) = object_number_field(&helper, id, f) {
+            parts.push(format!("{f}={}", format_num(n)));
+        }
+    }
+    for f in ["spd", "rem"] {
+        if let Some((x, y)) = object_xy_field(&helper, id, f) {
+            parts.push(format!("{f}=({}, {})", format_num(x), format_num(y)));
+        }
+    }
+    println!("  {type_name}: {}", parts.join(" "));
 }
 
 /// Read a scalar-number field of an object behind `player_id`.
@@ -203,6 +229,9 @@ fn main() -> Result<()> {
         };
         state = ce.step_frame(state, input_byte)?;
         print_frame(&state, frame_num, input_byte);
+        if let Some(t) = &cli.object {
+            print_object(&state, t);
+        }
     }
 
     Ok(())

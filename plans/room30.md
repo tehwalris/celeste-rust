@@ -188,6 +188,20 @@ like rooms (1,0) and (2,0). The explosion is multiplicative on top of it:
 2. the player's exact speed (x3.3);
 3. the fall floors' state and timers (x3.1 at f55, growing).
 
+### The waiting fly fruit, concretely (`concrete_run --object fly_fruit`, 400 idle frames)
+
+- Its `y` NEVER moves while it waits (32 = `start`): `rem.y` stays within about
+  +-0.46, so `move` always rounds to 0.
+- `step` grows by raw 3276 (0x0ccc, the literal 0.05) per frame; 20 steps are
+  65,520, 16 short of a turn, so `sin(step)`, `spd.y` and `rem.y` drift and
+  never repeat exactly. No lossless canonicalization exists.
+- While waiting, the only thing the player can observe (the hitbox at `y`) is
+  constant; `step`/`spd.y`/`rem.y` only matter once it flies. A coarse
+  abstraction could keep `y` exact through an invariant checked by simulation
+  (the waiting fruit reads no input) and widen the phase fields; the flight
+  needs its own treatment. Not built: without the fruit the floors and the
+  player's speed still explode (above).
+
 ## Latent hazard found by the parallel walk (2026-09-17)
 
 A walk's representative state keeps closure scopes, and a scope created in a
