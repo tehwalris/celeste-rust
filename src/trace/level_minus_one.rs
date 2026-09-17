@@ -1166,6 +1166,51 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
     let t_all = std::time::Instant::now();
     let Built { by_hash, g1, sound, chain, .. } = build(root, opts.spd_px, opts.threads, &mut rep)?;
 
+    // The d map: per 8 px tile, the smallest sound d of any table node in it
+    // (0-9, then a-z for 10-35, '+' above, '*' no exit path, '.' no node).
+    say!(rep, "\nsound d per 8 px tile, the smallest over the table's shapes:")?;
+    let mut best: HashMap<(i16, i16), u32> = HashMap::new();
+    for (i, &(_, x, y)) in g1.nodes.iter().enumerate() {
+        let e = best.entry((x.div_euclid(8), y.div_euclid(8))).or_insert(u32::MAX);
+        *e = (*e).min(sound[i]);
+    }
+    for ty in -2i16..=17 {
+        let line: String = (-2i16..=17)
+            .map(|tx| match best.get(&(tx, ty)) {
+                None => '.',
+                Some(&u32::MAX) => '*',
+                Some(&d) if d < 10 => (b'0' + d as u8) as char,
+                Some(&d) if d < 36 => (b'a' + (d - 10) as u8) as char,
+                Some(_) => '+',
+            })
+            .collect();
+        say!(rep, "{:4} {line}", ty as i32 * 8)?;
+    }
+    // `CELESTE_L1_PATH="x,y"`: the table's fastest path from that cell, one
+    // successor of d - 1 per step, to see HOW it gets to the exit.
+    if let Ok(s) = std::env::var("CELESTE_L1_PATH") {
+        let (x, y) = s
+            .split_once(',')
+            .and_then(|(a, b)| Some((a.trim().parse::<i16>().ok()?, b.trim().parse::<i16>().ok()?)))
+            .ok_or_else(|| anyhow!("CELESTE_L1_PATH=\"x,y\", not {s:?}"))?;
+        let show = |i: usize| format!("({}, {}) shape {} d {}", g1.nodes[i].1, g1.nodes[i].2, g1.nodes[i].0, sound[i]);
+        match g1.nodes.iter().enumerate().filter(|(_, n)| n.1 == x && n.2 == y).min_by_key(|(i, _)| sound[*i]).map(|(i, _)| i) {
+            None => say!(rep, "\npath from ({x}, {y}): not a table node")?,
+            Some(mut i) => {
+                let mut steps = vec![show(i)];
+                while sound[i] > 1 && sound[i] != u32::MAX && steps.len() < 64 {
+                    let Some(&next) = g1.edges[i].iter().find(|&&e| sound[e as usize] == sound[i] - 1) else {
+                        steps.push("(no successor of d - 1: a death seed)".to_string());
+                        break;
+                    };
+                    i = next as usize;
+                    steps.push(show(i));
+                }
+                say!(rep, "\npath from ({x}, {y}), the table's fastest:\n  {}{}", steps.join("\n  "), if g1.exits[i] { "\n  EXIT" } else { "" })?;
+            }
+        }
+    }
+
     // The soundness check against the recorded transitions.
     use crate::search::pos_graph::{cell_xy, PosGraph, CELL_COUNT, NO_CELL};
     let pg = PosGraph::load(&crate::frame::pos_graph_path(&opts.level_dir))?;
