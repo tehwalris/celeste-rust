@@ -97,6 +97,8 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                 Conc::Num(P8::from_raw(lo))
             }
             Op::ConstBool(b) => Conc::Bool(b),
+            // Concrete: an unknown has no single value to return.
+            Op::UnknownNum | Op::UnknownBool(_) => bail!("node {} is an unknown, not a value", id),
             // This evaluator is CONCRETE - one number per node - so a
             // span is a value only when it is degenerate, exactly as an
             // interval literal is. Same refusal, for the same reason:

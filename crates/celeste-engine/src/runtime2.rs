@@ -36,6 +36,7 @@ pub fn av_code(v: AV) -> u64 {
         AV::Ival(a, b) => 2u64 << 56 | (a.to_bits() as u64) << 24 ^ mix64((b.to_bits() as u64) << 1),
         AV::Bool(b) => 3u64 << 56 | b as u64,
         AV::UBool => 4u64 << 56,
+        AV::UNum => 9u64 << 56,
         AV::Str(x) => 5u64 << 56 | x as u64,
         AV::Nil => 6u64 << 56,
         AV::Ptr(p) => 7u64 << 56 | p as u64,
@@ -67,6 +68,10 @@ pub enum AV {
     Ival(P8, P8),
     Bool(bool),
     UBool,
+    /// An UNKNOWN number (plans/fly-fruit.md): what a level that widens a
+    /// number to nothing stores, uniform; no kernel reads it
+    /// (`graph::Op::UnknownNum`).
+    UNum,
     Str(u32),
     Nil,
     Ptr(u32),

@@ -535,6 +535,7 @@ fn project_frame(
             AV::Nil => (5, 0, 0),
             AV::Ptr(_) => (6, 0, 0),
             AV::NilPtr => (7, 0, 0),
+            AV::UNum => (8, 0, 0),
         };
         mix64(mix64(tag) ^ (a << 32 | b))
     };
@@ -1124,6 +1125,7 @@ fn main() -> Result<()> {
                                     AV::Nil => (5, 0, 0),
                                     AV::Ptr(p) => (6, p as u64, 0),
                                     AV::NilPtr => (7, 0, 0),
+                                    AV::UNum => (8, 0, 0),
                                 };
                                 mix(acc ^ mix((c as u64) << 56 | k << 48 | a << 16 ^ b))
                             };
@@ -1193,6 +1195,7 @@ fn main() -> Result<()> {
                     AV::Nil => (5, 0, 0),
                     AV::Ptr(p) => (6, p, 0),
                     AV::NilPtr => (7, 0, 0),
+                    AV::UNum => (8, 0, 0),
                 }
             };
             let mut names: Vec<String> = Vec::new();
@@ -1974,6 +1977,7 @@ fn main() -> Result<()> {
                             AV::Nil => (5, 0, 0),
                             AV::Ptr(p) => (6, p as u64, 0),
                             AV::NilPtr => (7, 0, 0),
+                            AV::UNum => (8, 0, 0),
                         };
                         mix64(acc ^ mix64((c as u64) << 56 | k << 48 | a << 16 ^ bb))
                     };
@@ -2161,6 +2165,7 @@ fn main() -> Result<()> {
                             AV::Nil => (5, 0, 0),
                             AV::Ptr(p) => (6, p as u64, 0),
                             AV::NilPtr => (7, 0, 0),
+                            AV::UNum => (8, 0, 0),
                         };
                         mix64(acc ^ mix64((c as u64) << 56 | k << 48 | a << 16 ^ bb))
                     };
@@ -2486,6 +2491,7 @@ fn main() -> Result<()> {
                     AV::Nil => 5 << 40,
                     AV::Ptr(p) => 6 << 40 | p as u64,
                     AV::NilPtr => 7 << 40,
+                    AV::UNum => 8 << 40,
                 }
             };
             // shape -> (rows, per-column sets, player field names, spd pairs)

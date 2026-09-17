@@ -2120,8 +2120,10 @@ fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'stati
     const POS_SLOTS: usize = 4;
     // Held buttons exact or unknown.
     const HELD_SLOTS: usize = 2;
-    static REGS: [std::sync::OnceLock<Option<Registry>>; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS] =
-        [const { std::sync::OnceLock::new() }; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS];
+    // The fly fruit exact or unknown.
+    const FRUIT_SLOTS: usize = 2;
+    static REGS: [std::sync::OnceLock<Option<Registry>>; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS] =
+        [const { std::sync::OnceLock::new() }; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS];
     let rem_slot = match level.rem {
         RemPrecision::Exact => 16,
         RemPrecision::Bits(b) => (b as usize).min(16),
@@ -2133,7 +2135,8 @@ fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'stati
     };
     let pos_slot = (level.pos.x.clamp(1, 2) as usize - 1) + 2 * (level.pos.y.clamp(1, 2) as usize - 1);
     let held_slot = level.held.is_unknown() as usize;
-    REGS[((rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot) * HELD_SLOTS + held_slot].get_or_init(|| build_registry_for_rung(level)).as_ref()
+    let fruit_slot = level.fruit.is_unknown() as usize;
+    REGS[(((rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot) * HELD_SLOTS + held_slot) * FRUIT_SLOTS + fruit_slot].get_or_init(|| build_registry_for_rung(level)).as_ref()
 }
 
 /// Build every rung's kernel set now, all rungs at once (one builder
@@ -2159,7 +2162,7 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
     let mode = super::dispatch::traced_mode_for(rem);
     let (opts, exact) = match mode {
-        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos).with_held(level.held.is_unknown()), false),
+        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos).with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()), false),
         super::dispatch::TracedMode::Level0Agnostic => {
             // Phase 1: the opt-in rung-specific variant bakes the rem
             // widening into the graph (`ladder_widen`), still through

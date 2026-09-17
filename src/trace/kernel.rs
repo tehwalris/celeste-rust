@@ -2269,6 +2269,8 @@ pub fn room_constant_lattice(
     // Every frame this walk traces (and its key traces, through copies of
     // this tracer) forks the held-button trails (`widen::fork_held_inputs`).
     it.d.held_unknown = opts.held;
+    // ... and replaces the fly fruit's widened fields (`widen::fork_fruit_inputs`).
+    it.d.fruit_unknown = opts.fruit;
 
     let st = cart::fresh_state::<Symbolic>(&mut it.d);
     let st = run_one(&mut it, top, st)?;
@@ -2288,7 +2290,7 @@ pub fn room_constant_lattice(
 
     let sk = key(&start)?;
     let start_key = sk.clone();
-    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held)?);
+    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit)?);
     reps.insert(sk.clone(), start.clone());
     // THE REGION KEY (`RegionGrid`): a node is (shape, region), the lattice
     // stays per shape, and a narrowed lattice re-traces every region its
@@ -2634,12 +2636,13 @@ fn walk_trace(
             continue;
         }
         let key = format!("{:?}", o.st.shape()?);
-        let constants = shapes::field_constants(&o.st, &tr.it.d, opts.spd_ival(), opts.pos_ival(), opts.held)?;
+        let constants = shapes::field_constants(&o.st, &tr.it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit)?;
         let mut ival = Vec::new();
         if opts.ival {
             let widened = shapes::ival_paths(&o.st, opts.spd_ival(), opts.pos_ival());
+            let fruit: Vec<super::iface::Path> = if opts.fruit { super::widen::fly_fruit_paths(&o.st).all().cloned().collect() } else { Vec::new() };
             for p in shapes::state_paths(&o.st)? {
-                if widened.contains(&p) {
+                if widened.contains(&p) || fruit.contains(&p) {
                     continue;
                 }
                 if let Some(super::heap::Value::Num(n)) = super::iface::get(&o.st, &p) {

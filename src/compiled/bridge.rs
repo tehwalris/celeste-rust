@@ -136,6 +136,9 @@ fn export_col(rt2: &Rt2, col: &Col, ids: &[HeapId], cell: usize) -> Value {
             // for it) and nothing reads it, so a placeholder is honest
             // about what survived rather than inventing a name.
             AV::NilPtr => Value::NilPointer(String::new()),
+            // The interpreter has no unknown number, and the reference engine
+            // refuses fruit-unknown levels (`refdriver::run_frame_all`).
+            AV::UNum => panic!("cell {cell}: an unknown number has no interpreter value (plans/fly-fruit.md)"),
         }
     };
     use std::sync::Arc;

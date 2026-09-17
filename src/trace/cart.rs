@@ -198,6 +198,7 @@ pub fn fresh_state<D: Domain>(d: &mut D) -> State<D> {
         ok: t,
         path: Vec::new(),
         key_override: Vec::new(),
+        frag: Vec::new(),
     };
     for name in NATIVE {
         st.heap

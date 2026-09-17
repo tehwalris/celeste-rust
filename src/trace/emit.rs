@@ -125,7 +125,7 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
         roots.push(o.ok);
         roots.extend(o.keys.iter().map(|(_, nd)| *nd));
     }
-    let (mut graph, roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
+    let (mut graph, mut roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
         .map_err(|e| anyhow::anyhow!("{:#}\nwhere the roots are\n{}", e, root_legend(f)))?;
     // The frame's own fork arities and tables (`Frame::fork_ways`).
     graph.reset_forks();
@@ -152,6 +152,26 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
     // Dropping it costs no check. What a kernel must agree with a block
     // about is its SHAPE, and that is the dispatcher's hash, not this
     // list.
+    // THE UNKNOWN NUMBER never reaches a kernel (plans/fly-fruit.md): a field
+    // holding it is stored as the uniform `AV::UNum` (below), so the root the
+    // kernel would compute for it is unread and gets a literal placeholder,
+    // and any other root that reads one is refused (the walk below).
+    let placeholder = graph.leaf(crate::transpile::graph::Op::Const(0, 0));
+    let mut unknown_fields: Vec<Vec<bool>> = Vec::with_capacity(f.outs.len());
+    {
+        let mut at = 0usize;
+        for o in &f.outs {
+            let n = o.fields.len();
+            let mine: Vec<bool> = (0..n).map(|i| matches!(graph.get(roots[at + i]).op, crate::transpile::graph::Op::UnknownNum)).collect();
+            for (i, u) in mine.iter().enumerate() {
+                if *u {
+                    roots[at + i] = placeholder;
+                }
+            }
+            unknown_fields.push(mine);
+            at += n + 2 + o.keys.len();
+        }
+    }
     let mut used = vec![false; graph.len()];
     let mut stack: Vec<NodeId> = roots.clone();
     let mut reads: std::collections::BTreeSet<u32> = Default::default();
@@ -160,8 +180,12 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
             continue;
         }
         used[n as usize] = true;
-        if let crate::transpile::graph::Op::Cell(c) = graph.get(n).op {
-            reads.insert(c);
+        match graph.get(n).op {
+            crate::transpile::graph::Op::Cell(c) => {
+                reads.insert(c);
+            }
+            crate::transpile::graph::Op::UnknownNum => anyhow::bail!("an unknown number reaches the kernel: node {n} is read by a root"),
+            _ => {}
         }
         stack.extend(graph.get(n).args.iter().copied());
     }
@@ -203,7 +227,7 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
     let zero = celeste_core::pico8_num::Pico8Num::from_i16(0);
     let mut at = 0usize;
     let mut outcomes = Vec::new();
-    for o in &f.outs {
+    for (oi, o) in f.outs.iter().enumerate() {
         let n = o.fields.len();
         let outputs = o
             .fields
@@ -237,6 +261,20 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
                     let c = o.rt2.obj_field_cell(obj, fid).ok_or_else(|| anyhow::anyhow!("held buttons unknown: the player has no p_jump / p_dash field"))?;
                     widen.push((c, AV::UBool));
                 }
+            }
+        }
+        // The unknown numbers, uniform, off the per-lane key fold.
+        for (i, u) in unknown_fields[oi].iter().enumerate() {
+            if *u {
+                widen.push((o.cells[i], AV::UNum));
+            }
+        }
+        // The fly fruit unknown: its `fly` written unknown, uniform
+        // (`widen::widen_fly_fruit`).
+        if f.fruit_unknown {
+            for p in crate::trace::widen::fly_fruit_paths(&o.st).fly {
+                let i = o.fields.iter().position(|(q, _, _)| *q == p).ok_or_else(|| anyhow::anyhow!("{}: the fly fruit's `fly` is not an output field", crate::trace::iface::show(&p)))?;
+                widen.push((o.cells[i], AV::UBool));
             }
         }
         let keys: Vec<(usize, NodeId)> =

@@ -63,6 +63,10 @@ pub fn run_frame_all<'a>(
     if crate::interpreter::abstraction::current_level().held.is_unknown() {
         anyhow::bail!("the reference engine does not run held-unknown levels (plans/held-buttons.md)");
     }
+    // Nor the fly fruit unknown: it has no unknown number.
+    if crate::interpreter::abstraction::current_level().fruit.is_unknown() {
+        anyhow::bail!("the reference engine does not run fruit-unknown levels (plans/fly-fruit.md)");
+    }
     loop {
         it.d.cursor.reset();
         it.prints.clear();

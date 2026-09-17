@@ -128,6 +128,8 @@ pub struct Interp<'a, D: Domain> {
     /// A count, because whether `collapse`'s pairing ever produces this
     /// case is a number and not an argument.
     pub merge_fallbacks: usize,
+    /// Literal splits handed out: the ids in `State::frag`.
+    next_split: usize,
 }
 
 impl<'a, D: Domain> Interp<'a, D> {
@@ -153,6 +155,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             for_iterations: 0,
             room_flags: std::collections::HashMap::new(),
             merge_fallbacks: 0,
+            next_split: 0,
         }
     }
 
@@ -682,8 +685,16 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// established that this pair is one of those or is equal outright.
     fn join_value(&mut self, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Value<D> {
         match (a, b) {
-            (Value::Num(x), Value::Num(y)) => Value::Num(self.d.sel_num(cond, x, y)),
-            (Value::Bool(x), Value::Bool(y)) => Value::Bool(self.d.sel_bool(cond, x, y)),
+            // As a heap slot's join (`state::join`): a condition no lane
+            // decides over values every lane holds alike joins, not selects.
+            (Value::Num(x), Value::Num(y)) => Value::Num(match self.d.join_num_independent(cond, x, y) {
+                Some(j) => j,
+                None => self.d.sel_num(cond, x, y),
+            }),
+            (Value::Bool(x), Value::Bool(y)) => Value::Bool(match self.d.join_bool_independent(cond, x, y) {
+                Some(j) => j,
+                None => self.d.sel_bool(cond, x, y),
+            }),
             (x, _) => x.clone(),
         }
     }
@@ -1548,11 +1559,65 @@ impl<'a, D: Domain> Interp<'a, D> {
                         Flow::Break => bail!("break outside a loop"),
                     });
                 }
+                // The literal splits made inside this call rejoin as it
+                // returns (`rejoin_fragments`).
+                if out.iter().any(|(s, _)| s.frag.last().is_some_and(|f| f.0 > s.stack.len())) {
+                    out = self.rejoin_fragments(out)?;
+                }
                 Ok(out)
             }
             Value::Builtin(name) => self.call_builtin(name, args, st),
             other => bail!("calling a non-function: {:?}", other),
         }
+    }
+
+    /// Rejoin the fragments of the literal splits made inside a call that has
+    /// just returned (`State::frag`, plans/fly-fruit.md). The states of one
+    /// split, alike in every other fragment tag, merge on an undecided atom:
+    /// no lane picks a fragment (the split value is the same in every lane),
+    /// so everything they differ in must JOIN - a literal hull or the unknown
+    /// number (`Domain::join_num_independent`). A select that survives, a
+    /// return value that does not join, or two shapes refuse the trace: the
+    /// fragments did not rejoin.
+    fn rejoin_fragments(&mut self, out: Multi<D, Value<D>>) -> Result<Multi<D, Value<D>>> {
+        let mut rest: Multi<D, Value<D>> = Vec::new();
+        type Tags = Vec<(usize, usize, u16)>;
+        let mut groups: Vec<(Tags, usize, Multi<D, Value<D>>)> = Vec::new();
+        for (mut s, v) in out {
+            match s.frag.last().copied() {
+                Some((depth, id, _)) if depth > s.stack.len() => {
+                    s.frag.pop();
+                    match groups.iter_mut().find(|g| g.0 == s.frag && g.1 == id) {
+                        Some(g) => g.2.push((s, v)),
+                        None => groups.push((s.frag.clone(), id, vec![(s, v)])),
+                    }
+                }
+                _ => rest.push((s, v)),
+            }
+        }
+        for (_, id, group) in groups {
+            let mut states = group.into_iter();
+            let mut acc = states.next().expect("a split has a fragment");
+            for (s, v) in states {
+                let cond = self.d.undecided_atom()?;
+                let m = super::state::merge_on(&mut self.d, acc.0, s, cond.clone())?
+                    .ok_or_else(|| anyhow!("literal split {id}: its fragments end in different shapes"))?;
+                anyhow::ensure!(!m.selects, "literal split {id}: its fragments did not rejoin (a value differs by more than a literal)");
+                let v = match (&acc.1, &v) {
+                    (a, b) if a == b => a.clone(),
+                    (Value::Num(x), Value::Num(y)) => Value::Num(
+                        self.d.join_num_independent(&cond, x, y).ok_or_else(|| anyhow!("literal split {id}: the call's return value did not rejoin"))?,
+                    ),
+                    (Value::Bool(x), Value::Bool(y)) => Value::Bool(
+                        self.d.join_bool_independent(&cond, x, y).ok_or_else(|| anyhow!("literal split {id}: the call's return value did not rejoin"))?,
+                    ),
+                    _ => bail!("literal split {id}: its fragments return different kinds"),
+                };
+                acc = (m.state, v);
+            }
+            rest.push(acc);
+        }
+        Ok(rest)
     }
 
     fn call_builtin(
@@ -1744,6 +1809,27 @@ impl<'a, D: Domain> Interp<'a, D> {
             // cannot run it.
             "__split_by_flr" | "__split_at" => {
                 let x = num(0)?;
+                // A value every lane holds alike (a literal interval at a
+                // fruit-unknown set, plans/fly-fruit.md): each fragment runs as
+                // its own trace state and they rejoin when the enclosing call
+                // returns (`rejoin_fragments`), so the split multiplies no
+                // configuration of the frame.
+                if let Some(frags) = self.d.literal_fragments(&x) {
+                    if frags.len() == 1 {
+                        return Ok(vec![(st, Value::Num(frags[0].clone()))]);
+                    }
+                    let (id, depth) = (self.next_split, st.stack.len());
+                    self.next_split += 1;
+                    return Ok(frags
+                        .into_iter()
+                        .enumerate()
+                        .map(|(c, v)| {
+                            let mut s = st.clone();
+                            s.frag.push((depth, id, c as u16));
+                            (s, Value::Num(v))
+                        })
+                        .collect());
+                }
                 if !self.d.is_interval(&x) {
                     (st, args[0].clone())
                 } else {
@@ -1889,7 +1975,7 @@ mod tests {
         let globals = heap.new_table();
         let scope = heap.new_scope(None);
         let t = d.boolean(true);
-        State { heap, globals, scope, stack: Vec::new(), guard: t.clone(), ok: t, path: Vec::new(), key_override: Vec::new() }
+        State { heap, globals, scope, stack: Vec::new(), guard: t.clone(), ok: t, path: Vec::new(), key_override: Vec::new(), frag: Vec::new() }
     }
 
     /// Run `src` and read back the global `result`.

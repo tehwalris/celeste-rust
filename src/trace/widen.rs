@@ -167,6 +167,107 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
     widen_dash(st, d)?;
     widen_fruit(st, d)?;
     widen_timers(st, d)?;
+    widen_fly_fruit(st, d)?;
+    Ok(())
+}
+
+/// The fly fruit's `spd.y` range: waiting, `sin(step) * 0.5` in [-0.5, 0.5];
+/// flying, `appr(spd.y, -3.5, 0.25)` from inside stays inside.
+const FRUIT_SPD_Y: (i32, i32) = (-0x3_8000, 0x8000);
+/// The fly fruit's `rem.y` range, [-0.5, 0.5): `move`'s own arithmetic.
+const FRUIT_REM_Y: (i32, i32) = (-0x8000, 0x7fff);
+
+/// The fields a fruit-unknown level widens, per live fly fruit
+/// (plans/fly-fruit.md).
+pub struct FlyFruitPaths {
+    /// `step` and `y`: the unknown number.
+    pub unknown: Vec<Path>,
+    /// `spd.y` and `rem.y`, with their ranges (raw 16.16, inclusive).
+    pub ranges: Vec<(Path, (i32, i32))>,
+    /// `fly`: an unknown boolean.
+    pub fly: Vec<Path>,
+}
+
+impl FlyFruitPaths {
+    pub fn all(&self) -> impl Iterator<Item = &Path> {
+        self.unknown.iter().chain(self.ranges.iter().map(|(p, _)| p)).chain(self.fly.iter())
+    }
+}
+
+pub fn fly_fruit_paths<D: Domain>(st: &State<D>) -> FlyFruitPaths {
+    let mut out = FlyFruitPaths { unknown: Vec::new(), ranges: Vec::new(), fly: Vec::new() };
+    for obj in objects_of_type(st, "fly_fruit") {
+        out.unknown.push(field(&obj, &["step"]));
+        out.unknown.push(field(&obj, &["y"]));
+        out.ranges.push((field(&obj, &["spd", "y"]), FRUIT_SPD_Y));
+        out.ranges.push((field(&obj, &["rem", "y"]), FRUIT_REM_Y));
+        out.fly.push(field(&obj, &["fly"]));
+    }
+    out
+}
+
+/// The fly fruit's INPUT side at a fruit-unknown level (plans/fly-fruit.md):
+/// `step` and `y` are the unknown number, `spd.y` and `rem.y` their whole
+/// ranges as literals, `fly` an undecided atom - every lane alike, and no
+/// input cell read. Every block at such a level holds them so (the output
+/// side, `widen_fly_fruit`); a decided input (the post-`_init` start state)
+/// lies inside and only over-approximates, so there is no premise.
+pub fn fork_fruit_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    let fp = fly_fruit_paths(st);
+    for p in &fp.unknown {
+        let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
+        let u = d.unknown_num();
+        iface::set(st, p, Value::Num(u))?;
+    }
+    for (p, (lo, hi)) in &fp.ranges {
+        let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
+        let r = d.graph.leaf(Op::Const(*lo, *hi));
+        iface::set(st, p, Value::Num(r))?;
+    }
+    for p in &fp.fly {
+        let Some(Value::Bool(_)) = iface::get(st, p) else { bail!("{}: not a boolean", iface::show(p)) };
+        let b = d.unknown_bool_atom();
+        iface::set(st, p, Value::Bool(b))?;
+    }
+    Ok(())
+}
+
+/// The fly fruit's OUTPUT side at a fruit-unknown level: `step` and `y` the
+/// unknown number (stored `AV::UNum`, `emit::bind`), `fly` unknown (stored
+/// `AV::UBool`), `spd.y` and `rem.y` their ranges - after checking that the
+/// frame computed a literal inside each (rule 1: a range only replaces what it
+/// visibly contains). Literal, so the check holds for every row at once, and
+/// the range is a fixed point of the frame itself, not an argument about the
+/// game.
+fn widen_fly_fruit(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    if !d.fruit_unknown {
+        return Ok(());
+    }
+    let fp = fly_fruit_paths(st);
+    for (p, (lo, hi)) in &fp.ranges {
+        let Some(Value::Num(v)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
+        match d.graph.get(v).op {
+            Op::Const(a, b) if *lo <= a && b <= *hi => {}
+            _ => bail!(
+                "{}: the fly fruit's range [{}, {}] does not visibly contain what the frame computed, {}",
+                iface::show(p),
+                *lo as f64 / 65536.0,
+                *hi as f64 / 65536.0,
+                d.describe(&v)
+            ),
+        }
+        let r = d.graph.leaf(Op::Const(*lo, *hi));
+        iface::set(st, p, Value::Num(r))?;
+    }
+    for p in &fp.unknown {
+        let u = d.unknown_num();
+        iface::set(st, p, Value::Num(u))?;
+    }
+    for p in &fp.fly {
+        let Some(Value::Bool(_)) = iface::get(st, p) else { bail!("{}: not a boolean", iface::show(p)) };
+        let b = d.unknown_bool_atom();
+        iface::set(st, p, Value::Bool(b))?;
+    }
     Ok(())
 }
 

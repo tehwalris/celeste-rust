@@ -249,6 +249,35 @@ pub trait Domain {
     fn move_ways(&self) -> u8 {
         2
     }
+
+    /// The join of a merge on a condition NO LANE can decide, where the arms
+    /// are values every lane holds alike (plans/fly-fruit.md): the hull of
+    /// two literal intervals, or the unknown number. `None` keeps the
+    /// ordinary select (and its `Known` premise). Only a fruit-unknown set
+    /// has such conditions; the concrete domain never merges.
+    fn join_num_independent(&mut self, _c: &Self::Bool, _t: &Self::Num, _f: &Self::Num) -> Option<Self::Num> {
+        None
+    }
+
+    /// `join_num_independent` for booleans: two different arms join to an
+    /// undecided atom.
+    fn join_bool_independent(&mut self, _c: &Self::Bool, _t: &Self::Bool, _f: &Self::Bool) -> Option<Self::Bool> {
+        None
+    }
+
+    /// `__split_by_flr` of a value every lane holds alike (a literal interval):
+    /// its fragments on the fork grid, as literals, for the interpreter to run
+    /// as separate trace states and rejoin when the enclosing call returns
+    /// (`Interp::rejoin_fragments`). `None`: an ordinary per-lane fork.
+    fn literal_fragments(&mut self, _v: &Self::Num) -> Option<Vec<Self::Num>> {
+        None
+    }
+
+    /// A fresh undecided boolean every lane holds alike: what a literal split's
+    /// fragments are merged on when they rejoin.
+    fn undecided_atom(&mut self) -> Result<Self::Bool> {
+        bail!("this domain has no undecided booleans")
+    }
 }
 
 // ---------------------------------------------------------------- concrete
@@ -360,6 +389,17 @@ pub struct Symbolic {
     /// (`abstraction::HeldPrecision`): `trace_frame` forks the player's
     /// `p_jump` / `p_dash` (`widen::fork_held_inputs`). Set by the walk.
     pub held_unknown: bool,
+    /// The fly fruit unknown for the set being traced
+    /// (`abstraction::FruitPrecision`, plans/fly-fruit.md): `trace_frame`
+    /// replaces the fruit's inputs (`widen::fork_fruit_inputs`), arithmetic on
+    /// literal intervals folds to literals, and a merge on a condition no lane
+    /// decides joins its literal arms (`join_num_independent`). Set by the walk.
+    pub fruit_unknown: bool,
+    /// How many `Op::UnknownBool` atoms this frame handed out.
+    pub unknown_atoms: u32,
+    /// `lane_independent`'s memo. Structural (a node's op and operands never
+    /// change), so it outlives a frame.
+    lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// Fork choices already handed out THIS FRAME, by the value forked.
     ///
     /// Two call sites that floor the same value do not need two choice
@@ -412,6 +452,86 @@ impl Symbolic {
         crate::transpile::graph::pieces_of(&self.graph, &self.ranges, &mut self.range_memo, n)
     }
 
+    /// The unknown number (`Op::UnknownNum`).
+    pub fn unknown_num(&mut self) -> NodeId {
+        self.graph.leaf(Op::UnknownNum)
+    }
+
+    fn is_unknown_num(&self, n: NodeId) -> bool {
+        matches!(self.graph.get(n).op, Op::UnknownNum)
+    }
+
+    /// A fresh undecided atom (`Op::UnknownBool`), distinct from every other
+    /// this frame.
+    pub fn unknown_bool_atom(&mut self) -> NodeId {
+        let k = self.unknown_atoms;
+        self.unknown_atoms += 1;
+        self.graph.leaf(Op::UnknownBool(k))
+    }
+
+    /// Does no lane's data reach `n` - no input cell, button or fork?
+    pub fn lane_independent(&mut self, n: NodeId) -> bool {
+        let mut stack: Vec<(NodeId, bool)> = vec![(n, false)];
+        while let Some((x, expanded)) = stack.pop() {
+            if self.lane_memo.contains_key(&x) {
+                continue;
+            }
+            let node = self.graph.get(x);
+            let dependent = matches!(
+                node.op,
+                Op::Cell(_) | Op::Free(_) | Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_)
+            );
+            if dependent || node.args.is_empty() {
+                self.lane_memo.insert(x, !dependent);
+                continue;
+            }
+            let args = node.args.clone();
+            if expanded {
+                let r = args.iter().all(|a| self.lane_memo[a]);
+                self.lane_memo.insert(x, r);
+            } else {
+                stack.push((x, true));
+                stack.extend(args.iter().filter(|a| !self.lane_memo.contains_key(a)).map(|a| (*a, false)));
+            }
+        }
+        self.lane_memo[&n]
+    }
+
+    /// `op` over LITERAL operands, at least one an interval, in the graph's
+    /// own interval semantics (`Graph::eval` on the literals: one definition,
+    /// not a second): the value, or `None` where eval does not model it (a
+    /// wrap at the 16.16 extremes, a non-positive scale). A fruit-unknown set
+    /// only.
+    fn eval_literal(&self, op: &Op, args: &[NodeId]) -> Option<crate::transpile::graph::Val> {
+        if !self.fruit_unknown {
+            return None;
+        }
+        let lits: Vec<(i32, i32)> = args
+            .iter()
+            .map(|a| match self.graph.get(*a).op {
+                Op::Const(lo, hi) => Some((lo, hi)),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        if lits.iter().all(|(lo, hi)| lo == hi) {
+            return None;
+        }
+        let mut g = Graph::new();
+        let leaves: Vec<NodeId> = lits.iter().map(|(lo, hi)| g.leaf(Op::Const(*lo, *hi))).collect();
+        let n = g.add(op.clone(), leaves);
+        g.eval(&std::collections::HashMap::new()).ok().map(|v| v[n as usize])
+    }
+
+    /// `eval_literal`'s number as a literal node.
+    fn literal_num(&mut self, op: Op, args: &[NodeId]) -> Option<NodeId> {
+        match self.eval_literal(&op, args)? {
+            crate::transpile::graph::Val::Num(iv) => {
+                Some(self.graph.leaf(Op::Const(iv.low.as_raw_u32() as i32, iv.high.as_raw_u32() as i32)))
+            }
+            crate::transpile::graph::Val::Bool(_) => None,
+        }
+    }
+
     fn konst(&mut self, v: P8) -> NodeId {
         let raw = v.as_raw_u32() as i32;
         self.graph.leaf(Op::Const(raw, raw))
@@ -443,6 +563,9 @@ impl Domain for Symbolic {
             let mut c = Concrete;
             return Ok(self.konst(c.arith(op, &x, &y)?));
         }
+        if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
+            return Ok(self.unknown_num());
+        }
         let g = match op {
             Arith::Add => Op::Add,
             Arith::Sub => Op::Sub,
@@ -450,12 +573,23 @@ impl Domain for Symbolic {
             Arith::Div => Op::Div,
             Arith::Rem => Op::Rem,
         };
+        if let Some(n) = self.literal_num(g.clone(), &[*a, *b]) {
+            return Ok(n);
+        }
         Ok(self.graph.fold(g, vec![*a, *b]))
     }
     fn fun1(&mut self, f: Fun1, a: &NodeId) -> Result<NodeId> {
         if let Some(x) = self.as_p8(*a) {
             let mut c = Concrete;
             return Ok(self.konst(c.fun1(f, &x)?));
+        }
+        // `sin` of anything is in [-1, 1]; every other builtin of an unknown
+        // number is unknown.
+        if self.is_unknown_num(*a) {
+            return Ok(match f {
+                Fun1::Sin => self.graph.leaf(Op::Const(-0x1_0000, 0x1_0000)),
+                _ => self.unknown_num(),
+            });
         }
         // `sin` of an interval is its full range [-1, 1], matching the
         // interpreter's `builtin_sin` (game_runner.rs) exactly. Emit the
@@ -473,6 +607,9 @@ impl Domain for Symbolic {
             Fun1::Flr => Op::Flr,
             Fun1::Sin => Op::Sin,
         };
+        if let Some(n) = self.literal_num(g.clone(), &[*a]) {
+            return Ok(n);
+        }
         Ok(self.graph.fold(g, vec![*a]))
     }
     fn fun2(&mut self, f: Fun2, a: &NodeId, b: &NodeId) -> Result<NodeId> {
@@ -480,10 +617,16 @@ impl Domain for Symbolic {
             let mut c = Concrete;
             return Ok(self.konst(c.fun2(f, &x, &y)?));
         }
+        if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
+            return Ok(self.unknown_num());
+        }
         let g = match f {
             Fun2::Min => Op::Min,
             Fun2::Max => Op::Max,
         };
+        if let Some(n) = self.literal_num(g.clone(), &[*a, *b]) {
+            return Ok(n);
+        }
         Ok(self.graph.fold(g, vec![*a, *b]))
     }
     fn compare(&mut self, op: Cmp, a: &NodeId, b: &NodeId) -> Result<NodeId> {
@@ -491,6 +634,24 @@ impl Domain for Symbolic {
             let mut c = Concrete;
             let r = c.compare(op, &x, &y)?;
             return Ok(self.graph.leaf(Op::ConstBool(r)));
+        }
+        // With an unknown number nothing is decided.
+        if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
+            return Ok(self.unknown_bool_atom());
+        }
+        // Two literals: decided by their intervals, or an undecided atom of
+        // its own (the same in every lane, and never one atom with another).
+        let lit = match op {
+            Cmp::Lt => Op::Lt,
+            Cmp::Le => Op::Le,
+            Cmp::Gt => Op::Gt,
+            Cmp::Ge => Op::Ge,
+            Cmp::Eq => Op::Eq,
+        };
+        match self.eval_literal(&lit, &[*a, *b]) {
+            Some(crate::transpile::graph::Val::Bool(Some(r))) => return Ok(self.graph.leaf(Op::ConstBool(r))),
+            Some(crate::transpile::graph::Val::Bool(None)) => return Ok(self.unknown_bool_atom()),
+            _ => {}
         }
         // Decided by the static ranges (the bucket dispatch): a branch
         // the specialized body never takes is never traced. Decided iff
@@ -730,6 +891,60 @@ impl Domain for Symbolic {
 
     fn move_ways(&self) -> u8 {
         self.move_ways.max(2)
+    }
+
+    fn join_num_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
+        if !self.fruit_unknown || self.decide(c).is_some() || !self.lane_independent(*c) {
+            return None;
+        }
+        if t == f {
+            return Some(*t);
+        }
+        if self.is_unknown_num(*t) || self.is_unknown_num(*f) {
+            return Some(self.unknown_num());
+        }
+        match (self.graph.get(*t).op.clone(), self.graph.get(*f).op.clone()) {
+            (Op::Const(a0, a1), Op::Const(b0, b1)) => Some(self.graph.leaf(Op::Const(a0.min(b0), a1.max(b1)))),
+            _ => None,
+        }
+    }
+
+    fn join_bool_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
+        if !self.fruit_unknown || self.decide(c).is_some() || !self.lane_independent(*c) {
+            return None;
+        }
+        if t == f {
+            return Some(*t);
+        }
+        Some(self.unknown_bool_atom())
+    }
+
+    fn literal_fragments(&mut self, v: &NodeId) -> Option<Vec<NodeId>> {
+        if !self.fruit_unknown {
+            return None;
+        }
+        let Op::Const(lo, hi) = self.graph.get(*v).op else { return None };
+        if lo == hi {
+            return None;
+        }
+        let step = 1i64 << (16 - self.graph.fork_bits() as i64);
+        let (lo, hi) = (lo as i64, hi as i64);
+        let (fl, fh) = (lo.div_euclid(step) * step, hi.div_euclid(step) * step);
+        if (fh - fl) / step + 1 > crate::transpile::graph::MAX_WAYS as i64 {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut base = fl;
+        while base <= fh {
+            let (a, b) = (lo.max(base), hi.min(base + step - 1));
+            out.push(self.graph.leaf(Op::Const(a as i32, b as i32)));
+            base += step;
+        }
+        Some(out)
+    }
+
+    fn undecided_atom(&mut self) -> Result<NodeId> {
+        Ok(self.unknown_bool_atom())
     }
 
     fn as_const(&self, v: &NodeId) -> Option<P8> {

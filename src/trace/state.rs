@@ -92,6 +92,13 @@ pub struct State<D: Domain> {
     /// and matching by node gave the key to the wrong field (the row key
     /// check, 2026-09-15).
     pub key_override: Vec<(super::iface::Path, D::Num)>,
+    /// The LITERAL SPLITS this state is a fragment of (plans/fly-fruit.md):
+    /// `(call depth, split id, fragment)`, innermost last. A `__split_by_flr`
+    /// of a value every lane holds alike runs each fragment as its own state
+    /// (`Domain::literal_fragments`); states of different fragments never
+    /// merge in `collapse`, and rejoin when the call that split them returns
+    /// (`Interp::rejoin_fragments`).
+    pub frag: Vec<(usize, usize, u16)>,
 }
 
 /// How many leading decisions two states share.
@@ -135,6 +142,9 @@ pub struct Merged<D: Domain> {
     /// so `cond` is `t.guard`, the always-correct choice the merge used
     /// to make unconditionally. Counted so its frequency is a number.
     pub fell_back: bool,
+    /// A select survived the merge - in a value or in `ok` - so the kernel
+    /// reads `cond`'s value bit on this state's lanes.
+    pub selects: bool,
 }
 
 impl<D: Domain> Clone for State<D> {
@@ -148,6 +158,7 @@ impl<D: Domain> Clone for State<D> {
             ok: self.ok.clone(),
             path: self.path.clone(),
             key_override: self.key_override.clone(),
+            frag: self.frag.clone(),
         }
     }
 }
@@ -177,11 +188,28 @@ impl<D: Domain> State<D> {
 /// happens when EITHER side would have, and picks t's value exactly where
 /// t applies. This needs the two guards to be disjoint; see the invariant
 /// on `State::guard`.
-pub fn merge<D: Domain>(
+pub fn merge<D: Domain>(d: &mut D, t: State<D>, f: State<D>) -> Result<Option<Merged<D>>> {
+    merge_inner(d, t, f, None)
+}
+
+/// `merge` on a GIVEN condition instead of the separating decision: what a
+/// literal split's fragments rejoin on (`Interp::rejoin_fragments`), whose
+/// paths do not diverge at a decision.
+pub fn merge_on<D: Domain>(d: &mut D, t: State<D>, f: State<D>, cond: D::Bool) -> Result<Option<Merged<D>>> {
+    merge_inner(d, t, f, Some(cond))
+}
+
+fn merge_inner<D: Domain>(
     d: &mut D,
     mut t: State<D>,
     mut f: State<D>,
+    over: Option<D::Bool>,
 ) -> Result<Option<Merged<D>>> {
+    // Two fragments of one literal split are different successors until the
+    // call that split them returns.
+    if t.frag != f.frag {
+        return Ok(None);
+    }
     t.gc();
     f.gc();
     if t.shape()? != f.shape()? {
@@ -190,8 +218,9 @@ pub fn merge<D: Domain>(
 
     // The decision that separates the two sides - see `State::path`.
     let l = common_prefix(&t, &f);
-    let (cond, fell_back) = match (t.path.get(l), f.path.get(l)) {
-        (Some((ct, pt)), Some((cf, pf))) if ct == cf && pt != pf => {
+    let (cond, fell_back) = match (over, t.path.get(l), f.path.get(l)) {
+        (Some(c), _, _) => (c, false),
+        (None, Some((ct, pt)), Some((cf, pf))) if ct == cf && pt != pf => {
             (if *pt { ct.clone() } else { d.not(ct) }, false)
         }
         _ => (t.guard.clone(), true),
@@ -280,6 +309,8 @@ pub fn merge<D: Domain>(
         }
     }
 
+    let per_case = d.sel_bool(cond, &t.ok, &f.ok);
+    let selects = selects || d.is_select_bool(&per_case);
     let state = State {
         heap,
         globals: t.globals,
@@ -310,8 +341,7 @@ pub fn merge<D: Domain>(
         // refused those lanes (exact speed, f49), where the undecided `hit`
         // should instead emit both outcomes (an unknown `live` emits).
         ok: {
-            let per_case = d.sel_bool(cond, &t.ok, &f.ok);
-            if selects || d.is_select_bool(&per_case) {
+            if selects {
                 let decided = d.known(cond);
                 d.and(&per_case, &decided)
             } else {
@@ -320,8 +350,9 @@ pub fn merge<D: Domain>(
         },
         path,
         key_override: t.key_override,
+        frag: t.frag,
     };
-    Ok(Some(Merged { state, cond: cond.clone(), fell_back }))
+    Ok(Some(Merged { state, cond: cond.clone(), fell_back, selects }))
 }
 
 /// Merge one slot. Only numbers and booleans can actually differ - the
@@ -330,8 +361,16 @@ pub fn merge<D: Domain>(
 /// which is the overwhelming majority.
 fn join<D: Domain>(d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Result<Value<D>> {
     Ok(match (a, b) {
-        (Value::Num(x), Value::Num(y)) => Value::Num(d.sel_num(cond, x, y)),
-        (Value::Bool(x), Value::Bool(y)) => Value::Bool(d.sel_bool(cond, x, y)),
+        // A condition no lane decides, over values every lane holds alike: the
+        // join, not a select no lane can take (`Domain::join_num_independent`).
+        (Value::Num(x), Value::Num(y)) => Value::Num(match d.join_num_independent(cond, x, y) {
+            Some(j) => j,
+            None => d.sel_num(cond, x, y),
+        }),
+        (Value::Bool(x), Value::Bool(y)) => Value::Bool(match d.join_bool_independent(cond, x, y) {
+            Some(j) => j,
+            None => d.sel_bool(cond, x, y),
+        }),
         // The shapes agreed about everything else, and the result keeps
         // the t side's structure, so t's own value is already right.
         (x, Value::Table(_) | Value::Func(_) | Value::Nil | Value::Str(_)
@@ -406,6 +445,7 @@ mod tests {
             ok: d.boolean(true),
             path: Vec::new(),
             key_override: Vec::new(),
+            frag: Vec::new(),
         };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
@@ -458,7 +498,7 @@ mod tests {
     #[test]
     fn a_merge_selects_on_the_separating_decision_not_the_guard() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let a = d.num(P8::from_i16(1));
@@ -489,7 +529,7 @@ mod tests {
 
         // Two states whose paths do not diverge at one shared decision
         // fall back to the full guard, which is always correct.
-        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ok: d.boolean(true), path: vec![(g, true)], key_override: Vec::new() };
+        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ok: d.boolean(true), path: vec![(g, true)], key_override: Vec::new(), frag: Vec::new() };
         p.globals = p.heap.new_table();
         p.scope = p.heap.new_scope(None);
         let mut q = p.clone();
@@ -504,7 +544,7 @@ mod tests {
     #[test]
     fn differing_shapes_do_not_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let obj = s.heap.new_table();
@@ -529,7 +569,7 @@ mod tests {
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let mut f = s.clone();

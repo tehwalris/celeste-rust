@@ -981,6 +981,10 @@ impl<'a> Lower<'a> {
                 Value::Num(NumVal::Reg(self.flr(lo)))
             }
             Op::ConstBool(b) => Value::Bool([MaskVal::Const(*b), MaskVal::Const(true)]),
+            // Undecided in every lane: the known plane is all zeros.
+            Op::UnknownBool(_) => Value::Bool([MaskVal::Const(false), MaskVal::Const(false)]),
+            // `emit::bind` keeps it out of every root's cone.
+            Op::UnknownNum => bail!("node {}: an unknown number reached the kernel", id),
             op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
                 if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
                     // Interval comparison -> tri-state ZB (zi_cmp).

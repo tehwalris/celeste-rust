@@ -217,6 +217,15 @@ pub enum Op {
     /// comparisons, so nothing here has to decide anything at trace
     /// time.
     Span,
+    /// THE UNKNOWN NUMBER (plans/fly-fruit.md): a number about which nothing
+    /// is known - the fly fruit's `step` and `y` at a fruit-unknown level. NOT
+    /// the full-range interval: interval arithmetic at the 16.16 extremes
+    /// raises, and this stays unknown under every operation instead
+    /// (`Symbolic::arith`, `fun1`, `fun2`), and a comparison with it is an
+    /// undecided atom (`UnknownBool`). It never reaches a kernel: its only
+    /// stored form is the uniform `AV::UNum` (`emit::bind`), and `bind`
+    /// refuses a root that reads it.
+    UnknownNum,
 
     // ---- number -> bool ----
     Lt,
@@ -239,6 +248,12 @@ pub enum Op {
     /// of a traced frame, `Not` was the single most common op in the
     /// emitted body.
     Or,
+    /// An UNDECIDED boolean, the same in every lane (plans/fly-fruit.md): a
+    /// comparison with an unknown number, or a comparison of literal
+    /// intervals nothing decides. The index separates the sites, so boolean
+    /// simplification never treats two independent unknowns as one atom
+    /// (`c and not c` of two different atoms is not false).
+    UnknownBool(u32),
 
     /// `Sel(cond, then, else)` - the former `if`, in every width.
     Sel,
@@ -1121,6 +1136,11 @@ impl Graph {
                     Pico8Num::from_raw(*hi),
                 )),
                 Op::ConstBool(b) => Val::Bool(Some(*b)),
+                // Nothing is known, in every lane.
+                Op::UnknownBool(_) => Val::Bool(None),
+                // No interval holds an unknown number without raising at the
+                // extremes: unmodelled (TOP under the lenient evaluators).
+                Op::UnknownNum => bail!("node {}: an unknown number has no interval", i),
                 // The hull, and the definition `fold`'s two-constant
                 // rule below is checked against.
                 // Tolerant of `lo > hi`: a table-fork fragment the lane
@@ -1434,6 +1454,7 @@ impl Graph {
             | Op::And
             | Op::Or
             | Op::Known
+            | Op::UnknownBool(_)
             | Op::TileFlagAt => Val::Bool(None),
             Op::Sel => match args.get(1).map(|x| out[*x as usize]) {
                 Some(Val::Bool(_)) => Val::Bool(None),

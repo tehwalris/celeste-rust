@@ -90,6 +90,7 @@ fn encode_av(v: AV, out: &mut [u8]) {
         AV::Nil => (5, 0, 0),
         AV::Ptr(p) => (6, p, 0),
         AV::NilPtr => (7, 0, 0),
+        AV::UNum => (8, 0, 0),
     };
     out[0..4].copy_from_slice(&tag.to_le_bytes());
     out[4..8].copy_from_slice(&a.to_le_bytes());
@@ -109,6 +110,7 @@ fn decode_av(bytes: &[u8]) -> Result<AV> {
         5 => AV::Nil,
         6 => AV::Ptr(a),
         7 => AV::NilPtr,
+        8 => AV::UNum,
         t => return Err(anyhow!("checkpoint: unknown AV tag {t}")),
     })
 }

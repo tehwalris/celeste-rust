@@ -1,8 +1,54 @@
-# The fly fruit: unknown at level 0, exact above (PLAN, 2026-09-17, not started)
+# The fly fruit: unknown at level 0, exact above (PLAN, 2026-09-17; level 0 built)
 
 Room (3,0)'s fly fruit is the largest single reason its level 0 does not
 saturate (plans/room30.md "Level 0 does not saturate"). This is the plan for
-widening it, agreed with Philippe; nothing here is built yet.
+widening it, agreed with Philippe.
+
+## Built (2026-09-17, level 0 only, the minimum to measure)
+
+Opt-in through the level flag `f` (`r0sxhf`; `FruitPrecision`, rem Bits(0) and
+exact position only, a registry slot of its own). Not built: the block-model
+side (`Rt2::widen_to`, the mark filter refuses a fruit-unknown coarser level
+loudly), the finer-level dead `step`, gates and ladder runs.
+
+- **The unknown number** is a graph leaf, `Op::UnknownNum`: arithmetic, `min`/
+  `max`, `abs`/`flr` of it are it, `sin` of it is [-1, 1], a comparison with it
+  is an undecided atom `Op::UnknownBool(k)` (one per site, so boolean
+  simplification never cancels two independent unknowns). It never reaches a
+  kernel: a field holding it is stored as the uniform `AV::UNum` (checkpoint
+  tag 8), its root gets a literal placeholder, and `emit::bind` refuses any
+  other root that reads it.
+- **Literals stay literals.** At a fruit-unknown set, arithmetic and comparisons
+  whose operands are all literal intervals are evaluated at trace time with
+  `Graph::eval` (the one definition); an undecided literal comparison is an
+  atom. So the fruit's whole numeric computation is lane-independent literals.
+- **The merge joins** where NO LANE decides the condition (its cone has no cell,
+  button or fork) and the arms are literals: the hull (or the unknown number;
+  booleans that differ join to an atom). This is the "sound join" rejected for
+  lane data (plans/bucket-dispatch.md); here no lane can take an arm, so the
+  select + `Known` premise would decline every lane. Lane-dependent arms keep
+  the select.
+- **The local fork (option chosen: a fork scoped to the call).** `__split_by_flr`
+  of a literal interval runs each grid fragment as its own TRACE state (tagged
+  `State::frag`, never merged by `collapse`), and they rejoin when the enclosing
+  Lua call returns (`Interp::rejoin_fragments`): merged on an undecided atom, every
+  difference must join to a literal, else the trace is refused. For the fruit's
+  `move` the 6 fragments of `rem.y + spd.y + 0.5` in [-3.5, 1.5) rejoin as `rem.y`
+  = [-0.5, 0.5) exactly and `y` unknown, so the frame gains no configuration.
+  Why not the others: a graph fork multiplies every body's configurations (6
+  times, then collapsed again only after specialization), and a no-split `flr`
+  would need to see `solids` at the split site, which the value does not carry.
+- **The widening** (`widen::fork_fruit_inputs` at frame start, `widen_fly_fruit`
+  at the outputs): `step`, `y` unknown; `spd.y` = [-3.5, 0.5] and `rem.y` =
+  [-0.5, 0.5) as literals; `fly` an atom, stored `AV::UBool`. At the output the
+  frame's computed `spd.y` / `rem.y` must be literals inside their ranges (checked
+  at trace time, so for every row at once) or the trace is refused. The lattice
+  never pins these fields.
+
+Found on the way, not fixed: `Interp::collapse_values` joins an expression's
+two values with a select and no `Known` premise (the premise is only added for
+heap selects), so `x = c and a or b` on an undecided per-lane `c` blends by the
+condition's value bit.
 
 ## Why
 
