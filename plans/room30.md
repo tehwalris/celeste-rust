@@ -154,3 +154,46 @@ make rows repeat. A sound fly-fruit abstraction needs a design of its own.
 `CELESTE_EXPERIMENT_NO_FLY_FRUIT=1` (`game_runner::apply_start_room`) removes
 the fly fruit type from the cart to measure the rest of the room without it.
 A different game; nothing it reports is an answer for the real cart.
+
+### Without the fly fruit (the experiment, level 0 `r0sxh`, to f56)
+
+39 kernels (built in 73 s, against 114 in 315 s). States: f040 41,770, f045
+155,455, f050 797,366, f055 5,788,531 (7.6 s per frame, 2.2 GB): still x1.49
+per frame at f55, so the fruit is the largest factor but not the only one.
+
+| erased (no fruit) | f050 | f055 | through f055 |
+|---|---|---|---|
+| nothing | 797,366 | 5,788,531 | 15,745,151 |
+| player `spd.`/`rem.` | 3.17x fewer | 3.33x fewer | 4,339,519 |
+| the fall floors | 1.46x fewer | 3.13x fewer | 4,050,571 |
+| both | 7.36x fewer | 21.1x fewer | 405,975 |
+
+The fall floors DO matter once the player reaches them (1.05x at f47 with the
+fruit, 3.13x at f55 and rising): their exact `state`/`delay` split rows as they
+break. With the player's speed and the floors erased, the new states per frame
+stay at 30k-54k (f46..f55) and the set through f55 is 406k: THE CORE SATURATES
+like rooms (1,0) and (2,0). The explosion is multiplicative on top of it:
+
+1. the fly fruit (x2.3 at f47: time-dependent while waiting, dash cohorts while
+   flying);
+2. the player's exact speed (x3.3);
+3. the fall floors' state and timers (x3.1 at f55, growing).
+
+## 4. What it would take (proposal, not built)
+
+A level 0 that abstracts all three, refined back by the finer levels:
+
+- **Fall floor timers** (Philippe, 2026-09-17): at non-exact levels `delay`
+  unknown (a bounded interval), with the undecided `delay <= 0` taken as a
+  ROW SPLIT (both "moves on" and "does not", each with exact `state` and
+  `collideable`, like the held buttons' `SplitInt` fork), not a merged hull.
+- **Fly fruit**: a design of its own, since its position integrates `spd.y`
+  (the room (2,0) band is not inductive here). Candidates: an invariant band
+  derived by running the waiting fruit concretely (it is deterministic and
+  reads no input until the player dashes), so the widened `y` needs no
+  per-frame containment premise; `step := 0` while flying (dead, lossless).
+- **Player speed**: the speed-bucket levels (`s16`) exist but with the region
+  key the key fixpoint refuses; a region x speed-key fixpoint is the join of
+  the two, and buckets were a precision loss in rooms (1,0)/(2,0).
+
+The measured target: the core's ~406k states through f55 against 15.7 M.
