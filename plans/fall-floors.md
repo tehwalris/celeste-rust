@@ -66,3 +66,25 @@ filtered by its marks.
 2. The local fork-and-rejoin (or the premise change), shared with the fruit.
 3. The floors' widening on top; `collideable` forked where read.
 4. Measure room (3,0) level 0 with floors and fruit unknown.
+
+## Removing the `delay` hack (`widen::ABSENT_AS_ZERO`)
+
+Today every frame writes a missing `delay` as the number 0, at every level
+(de24a0e; `cart::check_absent_fields` refuses a cart where the field is read
+other than by arithmetic or an ordering comparison, both runtime errors on nil).
+It exists because a floor gains `delay` only when it first breaks, which made
+"which floors have ever broken" 12 bits of the heap shape. Philippe: a hack,
+TODO to remove.
+
+- **Coarse levels**: once the floors' `delay` is unknown, a missing `delay` can
+  be written as that unknown instead of 0 - within the rule "only replace a
+  value by something containing it" only if the unknown value covers nil too
+  ("any value", not just any number). The unknown number type
+  (plans/fly-fruit.md) should be built with that property in mind.
+- **Exact levels**: `delay` stays exact, so a never-broken floor still has no
+  field; without the hack the exact levels are back to 2^12 shape variants, each
+  with its kernels. Replacement: a real nil-or-number field (a per-row tag for
+  "present"), which the kernels read with a premise where the cart does
+  arithmetic on it.
+
+Then `ABSENT_AS_ZERO`, `materialize_absent_fields` and `check_absent_fields` go.
