@@ -1283,7 +1283,7 @@ fn band() -> Option<(u32, i32)> {
 /// the right (`pos_graph`), so x >= 128 is a row that has LEFT the room - a
 /// win, which a band reading its new-room y dropped (room (1,0) refuted 99 at
 /// level 0, room (2,0) 95 at level 1, 2026-09-16).
-fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
+pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
     let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
     if x >= 128 {
         return false;

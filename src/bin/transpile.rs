@@ -2,6 +2,7 @@
 //!
 //!   transpile --room-consts            the reachable constant lattice report
 //!   transpile --spec-probe SHAPE       specialization collapse for one shape
+//!   transpile --level-minus-one ...    the position-only cost-to-go table
 //!
 //! The kernel emitter is gone: the kernels are assembled at runtime from the
 //! fused graph (`compiled::asm_kernel`), so there is nothing to generate.
@@ -89,6 +90,33 @@ fn main() -> Result<()> {
                     .parse()
                     .context("--bucket-probe SHAPE index")?;
                 let report = celeste_rust::trace::kernel::bucket_probe(std::path::Path::new("."), idx)?;
+                print!("{}", report);
+                return Ok(());
+            }
+            // --level-minus-one S LEVEL_DIR CEILING FROM TO [MARKS]: the
+            // position-only cost-to-go table for the start room
+            // (plans/level-minus-one.md), with the player's speed in [-S, S]
+            // px/frame, checked against LEVEL_DIR's recorded transitions and
+            // compared with its frames FROM..=TO under CEILING (and against the
+            // backward's MARKS file at that horizon). CELESTE_THREADS workers
+            // (default 8).
+            "--level-minus-one" => {
+                let mut next = |what: &str| args.next().ok_or_else(|| anyhow!("--level-minus-one S LEVEL_DIR CEILING FROM TO: missing {what}"));
+                let spd_px: i32 = next("S")?.parse().context("--level-minus-one S")?;
+                let level_dir = std::path::PathBuf::from(next("LEVEL_DIR")?);
+                let ceiling: u32 = next("CEILING")?.parse().context("--level-minus-one CEILING")?;
+                let from: u32 = next("FROM")?.parse().context("--level-minus-one FROM")?;
+                let to: u32 = next("TO")?.parse().context("--level-minus-one TO")?;
+                let marks = args.next().map(std::path::PathBuf::from);
+                let threads = std::env::var("CELESTE_THREADS").ok().map(|s| s.parse().context("CELESTE_THREADS")).transpose()?.unwrap_or(8);
+                let opts = celeste_rust::trace::level_minus_one::Opts { spd_px, level_dir, ceiling, from, to, marks, threads };
+                // The tracer recurses through the cart's AST: a big stack.
+                let report = std::thread::Builder::new()
+                    .stack_size(256 * 1024 * 1024)
+                    .spawn(move || celeste_rust::trace::level_minus_one::probe(std::path::Path::new("."), &opts))
+                    .context("spawn the level -1 probe")?
+                    .join()
+                    .map_err(|_| anyhow!("the level -1 probe panicked"))??;
                 print!("{}", report);
                 return Ok(());
             }
