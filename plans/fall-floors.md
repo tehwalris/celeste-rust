@@ -144,6 +144,23 @@ eval check and a decline's explanation), and with 18 levels prebuilt the room
 `CELESTE_ASM_EVAL_CHECK` / `CELESTE_KERNEL_EXPLAIN`, 1.64 GB (this morning's
 commit: 1.96 GB).
 
+**The held-only levels' walk** (`r1sxh`..`r15sxh`, fruit and floors exact)
+took 1,910 traces for 306 nodes: every fall floor's `state`/`delay`/
+`collideable` starts pinned, each floor's pins drop in the round the walk first
+reaches it, and each drop re-traced every region its shape had reached - the
+whole room once per floor. Built alone such a level is 30 s (walk 22 s); the
+prebuild's 498 s for 18 levels is those builds sharing 32 cores. The walk now
+DEFERS the re-trace until no new region is left (`dirty` in
+`room_constant_lattice`): 1,910 -> 928 traces, the same 42,674 bodies. Level 0
+goes 444 -> 743 traces (its stale traces find successors later), kernels
+identical. The fused node counts were NOT reproducible run to run, old code
+included (3,786,450 and 3,786,571 for two runs of one binary, 30 of 306
+kernels apart): each walk worker traced all its jobs into one arena, and
+`bind::renumber_cells` re-folds a frame in arena-id order, so a commutative
+op's operand order - and what folds after it - depended on which worker had
+traced what before. Every job now traces in a fresh copy of the walk's
+starting arena: two runs, 0 kernels apart (3,795,002 fused nodes each).
+
 What is left of the walk is the tracer itself: ~0.7 CPU-s per trace, heap
 clones at splits and merges 31%, dropping states 17%, canons of `if` merges
 16%. Copy-on-write tables would be the next step.

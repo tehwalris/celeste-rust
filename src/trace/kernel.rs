@@ -2377,6 +2377,8 @@ pub fn room_constant_lattice(
     let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let mut tracers: Vec<Tracer> = (0..n_workers).map(|_| Tracer { it: it.clone(), reset, fr }).collect();
     let mut frontier: Vec<WalkNode> = start_regions.into_iter().map(|r| (sk.clone(), r)).collect();
+    // Shapes whose reached regions wait for a re-trace (the deferred re-trace).
+    let mut dirty: std::collections::BTreeSet<String> = Default::default();
     let (mut traces, mut round) = (0usize, 0usize);
     let t_walk = std::time::Instant::now();
     while !frontier.is_empty() {
@@ -2410,6 +2412,8 @@ pub fn room_constant_lattice(
         let next = std::sync::atomic::AtomicUsize::new(0);
         let (jobs_ref, next_ref) = (&jobs, &next);
         let results: Vec<Result<Vec<(usize, WalkTraced)>>> = std::thread::scope(|scope| {
+            // Each worker OWNS its pristine copy (a `Tracer` is `Send`, not
+            // `Sync`) and only ever clones from it.
             let handles: Vec<_> = tracers
                 .iter_mut()
                 .map(|tr| {
@@ -2420,7 +2424,17 @@ pub fn room_constant_lattice(
                             loop {
                                 let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let Some(job) = jobs_ref.get(i) else { break };
-                                done.push((i, walk_trace(tr, job, opts, grid, room0)?));
+                                // Every job in a FRESH copy of the walk's
+                                // starting arena: a frame's graph is then a
+                                // function of the job, not of which worker
+                                // traced what before it. In one arena per
+                                // worker, re-folding a frame out of it
+                                // (`bind::renumber_cells`) ordered commutative
+                                // operands by arena ids and the kernels' node
+                                // counts moved run to run (room (3,0) `r1sxh`:
+                                // 30 of 306 kernels, 2026-09-18).
+                                let mut fresh = Tracer { it: tr.it.clone(), reset: tr.reset, fr: tr.fr };
+                                done.push((i, walk_trace(&mut fresh, job, opts, grid, room0)?));
                             }
                             Ok(done)
                         })
@@ -2524,22 +2538,39 @@ pub fn room_constant_lattice(
                                 m.len() != before
                             }
                         };
-                        // The outcome's regions: the new ones are traced, and a
+                        // The outcome's regions: the new ones are traced now. A
                         // narrowed lattice re-traces every region the shape has
-                        // reached.
+                        // reached - but only once the new regions run out
+                        // (`dirty`, below).
                         let reached = regions.entry(tk.clone()).or_default();
-                        let mut push: Vec<Option<Region>> = if changed || new_ival { reached.iter().copied().collect() } else { Vec::new() };
+                        if changed || new_ival {
+                            dirty.insert(tk.clone());
+                        }
                         for r in o.regions {
                             if reached.insert(r) {
-                                push.push(r);
+                                next_frontier.insert((tk.clone(), r));
                             }
-                        }
-                        for r in push {
-                            next_frontier.insert((tk.clone(), r));
                         }
                     }
                     // Keep the converged frame for generation (last trace wins).
                     frames.insert(job.node.clone(), WalkFrame { frame, bounds: job.bounds.clone(), bound });
+                }
+            }
+        }
+        // THE DEFERRED RE-TRACE (2026-09-18). A shape whose lattice narrowed
+        // (or that gained an interval slot) is re-traced in every region it
+        // reached - once the walk finds no new region, not at each narrowing.
+        // At a floors-exact level each fall floor's pins drop in the round the
+        // walk first reaches it, and re-tracing everything per floor was 1,910
+        // traces for 306 nodes (room (3,0), `r1sxh`). Deferring is sound:
+        // pins only drop, so a trace under older pins sees a subset of the
+        // states the final ones admit - it cannot drop a constant the fixpoint
+        // keeps - and the re-trace under the final lattice finds the rest,
+        // repeating until nothing changes.
+        if next_frontier.is_empty() {
+            for k in std::mem::take(&mut dirty) {
+                for r in regions.get(&k).into_iter().flatten() {
+                    next_frontier.insert((k.clone(), *r));
                 }
             }
         }
