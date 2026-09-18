@@ -57,9 +57,10 @@ struct AsmBody {
     fields: Vec<AsmField>,
     ok_root: usize,
     live_root: usize,
-    /// The two row-key word roots: `Σ cell_mix` over the body's varying
-    /// fields, per half, computed in the kernel (`Op::CellMix`/`AddW`).
-    key_roots: (usize, usize),
+    /// The fields the row key folds (`key_words`): the body's varying ones -
+    /// a per-row column the boundary does not widen to uniform - and every
+    /// keyed one.
+    key_fields: Vec<KeyField>,
     /// Where an emitted row's player x, player y, room x, room y come from
     /// (`search::pos_graph::block_cells`' inputs), so the append step can
     /// compute the row's position cell straight off the output buffer.
@@ -87,7 +88,40 @@ struct DKey {
     edges: [&'static [i32]; 2],
 }
 
+/// One field of a body's row key: its cell, the output slot it is read from,
+/// and whether it is hashed as an INTERVAL. A field keyed on another node
+/// (the speed under a bucket: stored tight, keyed on its bucket) is hashed
+/// per row even where its stored value is constant (`acc_template` leaves it
+/// out of `part`), and as an interval: the boundary keys it on `widen_to`'s
+/// `AV::Ival` bucket, and `av_code` tells a number from a point interval - a
+/// singleton bucket the fold pinned to `Const(t, t)` reads as a number (25 of
+/// 262 exact marks lost, 2026-09-15).
+struct KeyField {
+    cell: u64,
+    root: usize,
+    kind: RootKind,
+    span: bool,
+}
+
 impl AsmBody {
+    /// Row `i`'s `(h1, h2)`: `Σ cell_mix` over the key fields, per half.
+    /// `mix64(part + h)` is the boundary's key exactly (`acc_template`
+    /// computes `part`; `check_against_boundary` gates it).
+    #[inline]
+    fn key_words(&self, buf: &[u8], i: usize) -> (u64, u64) {
+        use celeste_engine::runtime2::cell_mix;
+        let (mut h1, mut h2) = (0u64, 0u64);
+        for f in &self.key_fields {
+            let av = match (read_root_av(f.root, f.kind, buf, i), f.span) {
+                (AV::Num(n), true) => AV::Ival(n, n),
+                (av, _) => av,
+            };
+            h1 = h1.wrapping_add(cell_mix(f.cell, av, KEY_SEED1));
+            h2 = h2.wrapping_add(cell_mix(f.cell, av, KEY_SEED2));
+        }
+        (h1, h2)
+    }
+
     /// Row `i`'s speed key: its buckets and dash class read off the row,
     /// the dash constants only where it is dashing.
     #[inline]
@@ -454,8 +488,7 @@ impl AsmKernel {
                     while take != 0 {
                         let i = take.trailing_zeros() as usize;
                         take &= take - 1;
-                        let h1 = read_word(outbuf, body.key_roots.0, i);
-                        let h2 = read_word(outbuf, body.key_roots.1, i);
+                        let (h1, h2) = body.key_words(outbuf, i);
                         let key = (
                             runtime2::mix64(template.part.0.wrapping_add(h1)),
                             runtime2::mix64(template.part.1.wrapping_add(h2)),
@@ -473,9 +506,8 @@ impl AsmKernel {
                     let i = take.trailing_zeros() as usize;
                     take &= take - 1;
                     // The row's (h1,h2) fold over the varying, non-widened
-                    // cells, computed by the kernel (the body's key roots).
-                    let h1 = read_word(outbuf, body.key_roots.0, i);
-                    let h2 = read_word(outbuf, body.key_roots.1, i);
+                    // cells.
+                    let (h1, h2) = body.key_words(outbuf, i);
                     let part = template.part;
                     let key = (
                         runtime2::mix64(part.0.wrapping_add(h1)),
@@ -1382,18 +1414,16 @@ fn read_zb_holds(buf: &[u8], root: usize) -> u16 {
 /// append folds the same cell_mix so its dedup key equals the boundary's.
 use celeste_engine::runtime2::{KEY_SEED1, KEY_SEED2};
 
-/// Lane `i` of a word root: lanes 0-7 in the slot's first 64 bytes, 8-15
-/// in the second.
-#[inline]
-fn read_word(buf: &[u8], root: usize, i: usize) -> u64 {
-    let base = root * 128 + (i / 8) * 64 + (i % 8) * 8;
-    u64::from_le_bytes(buf[base..base + 8].try_into().unwrap())
-}
-
 /// The `AV` a field root holds for lane `i` (for the dedup fold).
 fn read_field_av(f: &AsmField, buf: &[u8], i: usize) -> AV {
-    let base = f.root * 128;
-    match f.kind {
+    read_root_av(f.root, f.kind, buf, i)
+}
+
+/// The `AV` output slot `root` of kind `kind` holds for lane `i`.
+#[inline]
+fn read_root_av(root: usize, kind: RootKind, buf: &[u8], i: usize) -> AV {
+    let base = root * 128;
+    match kind {
         RootKind::Num => {
             AV::Num(P8::from_raw(i32::from_le_bytes(
                 buf[base + i * 4..base + i * 4 + 4].try_into().unwrap(),
@@ -1414,7 +1444,6 @@ fn read_field_av(f: &AsmField, buf: &[u8], i: usize) -> AV {
                 i32::from_le_bytes(buf[base + 64 + i * 4..base + 64 + i * 4 + 4].try_into().unwrap());
             AV::Ival(P8::from_raw(lo), P8::from_raw(hi))
         }
-        RootKind::Word => unreachable!("an output field is never a word root"),
     }
 }
 
@@ -1724,19 +1753,21 @@ fn unify(by_shape: &mut HashMap<(u64, KernelKey), AsmKernel>) -> Result<()> {
     // Per kernel, largest first: bodies, the traced forks, the forks its bodies
     // ENUMERATE (a split that differs between two of its bodies), fused nodes,
     // the spill frame, the region.
-    let mut per_shape: Vec<(usize, u8, usize, usize, String, String)> = by_shape
+    let mut per_shape: Vec<(usize, u8, usize, usize, String, String, String)> = by_shape
         .iter()
         .map(|((_, key), k)| {
             let first = k.bodies.first().map(|b| b.splits.clone()).unwrap_or_default();
             let enumerated = (0..k.forks as usize).filter(|&d| k.bodies.iter().any(|b| b.splits.get(d) != first.get(d))).count();
             let region = key.region.map_or("-".to_string(), |r| format!("({},{})", r.ix, r.iy));
-            (k.bodies.len(), k.forks, enumerated, k.fused_nodes, format!("{:.1} MB", k.compiled.frame_bytes as f64 / 1048576.0), region)
+            (k.bodies.len(), k.forks, enumerated, k.fused_nodes, format!("{:.1} MB", k.compiled.frame_bytes as f64 / 1048576.0), region, k.compiled.sym.clone())
         })
         .collect();
     per_shape.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.5.cmp(&b.5)));
     if std::env::var_os("CELESTE_KERNEL_REPORT").is_some() {
+        // The symbol names the kernel's .so in `target/asm-scratch` (what a
+        // profile of a live run attributes samples to).
         for s in &per_shape {
-            eprintln!("[asm kernel] region {} bodies {} forks {} enumerated {} fused nodes {} frame {}", s.5, s.0, s.1, s.2, s.3, s.4);
+            eprintln!("[asm kernel] region {} bodies {} forks {} enumerated {} fused nodes {} frame {} {}", s.5, s.0, s.1, s.2, s.3, s.4, s.6);
         }
     }
     per_shape.truncate(12);
@@ -2127,53 +2158,15 @@ fn build_one_shape(
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
     let t_fuse = std::time::Instant::now();
-    let (mut fused, bodies, mut flat_roots, reprs) =
+    let (fused, bodies, flat_roots, reprs) =
         crate::trace::emit::asm_fused_from(&r.bound, &r.lowered.spec)
             .with_context(|| format!("fusing shape {si} (hash {shape:#x})"))?;
-    // THE ROW KEY, AS GRAPH ROOTS. Per body, the per-lane sum of
-    // `cell_mix` over its varying fields (a per-row column that the
-    // boundary does not widen to uniform), one node chain per half,
-    // appended AFTER every body's own roots so the field/ok/live slots
-    // keep their layout. `mix64(part + this)` is the exact boundary key
-    // (`acc_template` computes `part`; `check_against_boundary` gates it).
-    let mut key_roots: Vec<(usize, usize)> = Vec::with_capacity(bodies.len());
-    for b in &bodies {
-        use crate::transpile::graph::Op;
-        let okeys = &r.bound.outcomes[b.outcome].keys;
-        let nfields = b.roots.len() - 2 - okeys.len();
-        let outputs = &r.bound.outcomes[b.outcome].outputs;
-        let out_fields = &r.lowered.outs[b.outcome].fields;
-        let (mut h1, mut h2) = (fused.leaf(Op::Word(0)), fused.leaf(Op::Word(0)));
-        for j in 0..nfields {
-            let keyed = okeys.iter().position(|(fi, _)| *fi == j);
-            // A field keyed on another node (the speed under a bucket:
-            // stored tight, keyed on its bucket) is hashed HERE, per lane,
-            // even where its stored value is constant (`acc_template` leaves
-            // it out of `part`), and as an INTERVAL: the boundary keys it on
-            // `widen_to`'s `AV::Ival` bucket, and `av_code` tells a number
-            // from a point interval - a singleton bucket the fold pinned to
-            // `Const(t, t)` lowers as a number (25 of 262 exact marks lost,
-            // 2026-09-15). `add`, not `fold`: nothing collapses the span.
-            if keyed.is_none() && (out_fields[j].konst_av.is_some() || out_fields[j].widen_uniform.is_some()) {
-                continue;
-            }
-            let cell = outputs[j].0;
-            let key_root = match keyed {
-                Some(k) => {
-                    let n = b.roots[nfields + 2 + k];
-                    fused.add(Op::Span, vec![n, n])
-                }
-                None => b.roots[j],
-            };
-            let m1 = fused.add(Op::CellMix(cell, 0), vec![key_root]);
-            let m2 = fused.add(Op::CellMix(cell, 1), vec![key_root]);
-            h1 = fused.add(Op::AddW, vec![h1, m1]);
-            h2 = fused.add(Op::AddW, vec![h2, m2]);
-        }
-        key_roots.push((flat_roots.len(), flat_roots.len() + 1));
-        flat_roots.push(h1);
-        flat_roots.push(h2);
-    }
+    // THE ROW KEY is folded per EMITTED row, in the append step
+    // (`AsmBody::key_words`, over `key_fields`), not in the kernel. In the
+    // kernel every body hashed every lane, and a big kernel's bodies are
+    // mostly not taken on a lane: room (3,0)'s square (6,5), 13,812 bodies,
+    // ~22 rows per lane - the key chains were 40% of its 9.7M instructions and
+    // most of its 9.3 MB spill frame (2026-09-18).
     // One output SLOT per DISTINCT root node. Bodies share most of their
     // roots (a fork configuration changes a handful of fields), and the
     // kernel writes every slot per slice: room (2,0)'s level-0 bucket set
@@ -2277,13 +2270,28 @@ fn build_one_shape(
             }
             _ => None,
         };
+        let okeys = &r.bound.outcomes[b.outcome].keys;
+        let out_fields = &r.lowered.outs[b.outcome].fields;
+        let key_fields = (0..nfields)
+            .filter_map(|j| {
+                let keyed = okeys.iter().position(|(fi, _)| *fi == j);
+                if keyed.is_none() && (out_fields[j].konst_av.is_some() || out_fields[j].widen_uniform.is_some()) {
+                    return None;
+                }
+                let root = match keyed {
+                    Some(k) => slot_of[off + nfields + 2 + k],
+                    None => slot_of[off + j],
+                };
+                Some(KeyField { cell: outputs[j].0 as u64, root, kind: compiled.root_kinds[root], span: keyed.is_some() })
+            })
+            .collect();
         asm_bodies.push(AsmBody {
             outcome: b.outcome,
             splits: b.splits.clone(),
             fields,
             ok_root: slot_of[off + nfields],
             live_root: slot_of[off + nfields + 1],
-            key_roots: (slot_of[key_roots[bi].0], slot_of[key_roots[bi].1]),
+            key_fields,
             pos: None,
             dkey,
         });

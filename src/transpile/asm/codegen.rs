@@ -71,14 +71,6 @@ enum MaskVal {
     Const(bool),
 }
 
-/// One half of a word (row-key) value: 8 u64 lanes per zmm, so 16 rows
-/// are two of these.
-#[derive(Clone, Copy)]
-enum WordHalf {
-    Reg(Vreg),
-    ConstU64(u64),
-}
-
 #[derive(Clone, Copy)]
 enum Value {
     Num(NumVal),
@@ -86,8 +78,6 @@ enum Value {
     Bool([MaskVal; 2]),
     /// `[lo, hi]` interval planes.
     Ival([NumVal; 2]),
-    /// The row-key word layer: lanes 0-7 and 8-15.
-    Word([WordHalf; 2]),
 }
 
 /// A source operand for an emitted instruction.
@@ -95,16 +85,6 @@ enum Value {
 enum Src {
     Reg(Vreg),
     BI32(i32),
-    BU64(u64),
-}
-
-/// 64-bit lane binary ops (the row-key word layer).
-#[derive(Clone, Copy)]
-enum QOp {
-    AddQ,
-    XorQ,
-    OrQ,
-    MullQ,
 }
 
 #[derive(Clone, Copy)]
@@ -125,14 +105,12 @@ enum ROp {
 enum SrcKey {
     Reg(Vreg),
     I32(i32),
-    U64(u64),
 }
 impl Src {
     fn key(self) -> SrcKey {
         match self {
             Src::Reg(v) => SrcKey::Reg(v),
             Src::BI32(c) => SrcKey::I32(c),
-            Src::BU64(c) => SrcKey::U64(c),
         }
     }
 }
@@ -153,10 +131,6 @@ enum Key {
     Muldq(Vreg, Vreg),
     Sraq(Vreg, u8),
     Sllq(Vreg, u8),
-    Srlq(Vreg, u8),
-    QBin(u8, Vreg, SrcKey),
-    ExtLo(Vreg),
-    ExtHi(Vreg),
     BlendImm(u16, Vreg, Vreg),
     Cmp(u8, Vreg, SrcKey),
     Ternlog(Vreg, Vreg, Vreg, u8),
@@ -181,14 +155,6 @@ enum Inst {
     Sraq { dst: Vreg, a: Vreg, imm: u8 },
     /// Logical 64-bit left shift by an immediate (`vpsllq`).
     Sllq { dst: Vreg, a: Vreg, imm: u8 },
-    /// Logical 64-bit right shift by an immediate (`vpsrlq`).
-    Srlq { dst: Vreg, a: Vreg, imm: u8 },
-    /// 64-bit lane binary op; `b` may be a broadcast u64 constant.
-    QBin { dst: Vreg, op: QOp, a: Vreg, b: Src },
-    /// Zero-extend the low / high eight i32 lanes of `src` to u64 lanes
-    /// (`vpmovzxdq`; the high half via `vextracti64x4 $1`).
-    ExtLo { dst: Vreg, src: Vreg },
-    ExtHi { dst: Vreg, src: Vreg },
     /// Blend `a`/`b` per 32-bit lane by a COMPILE-TIME mask: lane takes `b`
     /// where the mask bit is set, else `a` (`kmov` imm -> k1; `vpblendmd`).
     BlendImm { dst: Vreg, mask: u16, a: Vreg, b: Vreg },
@@ -207,15 +173,13 @@ enum Inst {
 }
 
 /// The type of a root value, so a caller knows how to read its 128-byte
-/// output slot: `Num` = one ZN at +0; `Word`/`Ival` = two 64-byte planes at
+/// output slot: `Num` = one ZN at +0; `Ival` = two 64-byte planes at
 /// +0/+64; `Bool` = two u16 masks (val at +0, known at +2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RootKind {
     Num,
     Bool,
     Ival,
-    /// A row-key word: 16 u64 lanes, lanes 0-7 at +0 and 8-15 at +64.
-    Word,
 }
 
 /// How an `Op::Cell` INPUT column is packed in the input buffer, so the
@@ -280,17 +244,9 @@ pub struct Compiled {
 
 #[derive(Default)]
 struct Pool {
-    q: Vec<u64>,
     d: Vec<i32>,
 }
 impl Pool {
-    fn q(&mut self, v: u64) -> String {
-        let i = self.q.iter().position(|x| *x == v).unwrap_or_else(|| {
-            self.q.push(v);
-            self.q.len() - 1
-        });
-        format!(".LCq{i}")
-    }
     fn d(&mut self, v: i32) -> String {
         let i = self.d.iter().position(|x| *x == v).unwrap_or_else(|| {
             self.d.push(v);
@@ -356,59 +312,6 @@ impl<'a> Lower<'a> {
     }
     fn sraq(&mut self, a: Vreg, imm: u8) -> Vreg {
         self.pure(Key::Sraq(a, imm), move |d| Inst::Sraq { dst: d, a, imm })
-    }
-    fn srlq(&mut self, a: Vreg, imm: u8) -> Vreg {
-        self.pure(Key::Srlq(a, imm), move |d| Inst::Srlq { dst: d, a, imm })
-    }
-
-    /// `a op b` on u64 lanes, GVN'd; the commutative ops canonicalize their
-    /// register operands so `a+b` and `b+a` share.
-    fn qbin(&mut self, op: QOp, a: Vreg, b: Src) -> Vreg {
-        let tag = match op {
-            QOp::AddQ => 0,
-            QOp::XorQ => 1,
-            QOp::OrQ => 2,
-            QOp::MullQ => 3,
-        };
-        let (a, b) = match (op, b) {
-            (QOp::AddQ | QOp::XorQ | QOp::OrQ | QOp::MullQ, Src::Reg(r)) if r < a => (r, Src::Reg(a)),
-            _ => (a, b),
-        };
-        self.pure(Key::QBin(tag, a, b.key()), move |d| Inst::QBin { dst: d, op, a, b })
-    }
-
-    /// Zero-extend 16 i32 lanes to two registers of 8 u64 lanes.
-    fn ext(&mut self, v: Vreg) -> [Vreg; 2] {
-        let lo = self.pure(Key::ExtLo(v), move |d| Inst::ExtLo { dst: d, src: v });
-        let hi = self.pure(Key::ExtHi(v), move |d| Inst::ExtHi { dst: d, src: v });
-        [lo, hi]
-    }
-
-    /// `runtime2::mix64` on 8 u64 lanes.
-    fn mix64(&mut self, x: Vreg) -> Vreg {
-        use celeste_engine::runtime2::{MIX_C1, MIX_C2};
-        let t = self.srlq(x, 30);
-        let x = self.qbin(QOp::XorQ, x, Src::Reg(t));
-        let x = self.qbin(QOp::MullQ, x, Src::BU64(MIX_C1));
-        let t = self.srlq(x, 27);
-        let x = self.qbin(QOp::XorQ, x, Src::Reg(t));
-        let x = self.qbin(QOp::MullQ, x, Src::BU64(MIX_C2));
-        let t = self.srlq(x, 31);
-        self.qbin(QOp::XorQ, x, Src::Reg(t))
-    }
-
-    fn word_src(&self, w: WordHalf) -> Src {
-        match w {
-            WordHalf::Reg(v) => Src::Reg(v),
-            WordHalf::ConstU64(c) => Src::BU64(c),
-        }
-    }
-
-    fn as_word(&self, id: NodeId) -> Result<[WordHalf; 2]> {
-        match self.vals[id as usize] {
-            Some(Value::Word(w)) => Ok(w),
-            _ => bail!("node {} is not a word value where one was needed", id),
-        }
     }
 
     fn sllq(&mut self, a: Vreg, imm: u8) -> Vreg {
@@ -729,7 +632,6 @@ impl<'a> Lower<'a> {
             Some(Value::Num(_)) => 0,
             Some(Value::Bool(_)) => 1,
             Some(Value::Ival(_)) => 2,
-            Some(Value::Word(_)) => 3,
             None => 0,
         }
     }
@@ -744,88 +646,6 @@ impl<'a> Lower<'a> {
                 } else {
                     Value::Ival([NumVal::ConstI32(*lo), NumVal::ConstI32(*hi)])
                 }
-            }
-            Op::Word(w) => Value::Word([WordHalf::ConstU64(*w), WordHalf::ConstU64(*w)]),
-            Op::AddW => {
-                let (x, y) = (self.as_word(a[0])?, self.as_word(a[1])?);
-                let mut out = [WordHalf::ConstU64(0); 2];
-                for h in 0..2 {
-                    out[h] = match (x[h], y[h]) {
-                        (WordHalf::ConstU64(p), WordHalf::ConstU64(q)) => {
-                            WordHalf::ConstU64(p.wrapping_add(q))
-                        }
-                        (WordHalf::Reg(r), WordHalf::ConstU64(q))
-                        | (WordHalf::ConstU64(q), WordHalf::Reg(r)) => {
-                            if q == 0 {
-                                WordHalf::Reg(r)
-                            } else {
-                                WordHalf::Reg(self.qbin(QOp::AddQ, r, Src::BU64(q)))
-                            }
-                        }
-                        (WordHalf::Reg(r), WordHalf::Reg(s)) => {
-                            WordHalf::Reg(self.qbin(QOp::AddQ, r, Src::Reg(s)))
-                        }
-                    };
-                }
-                Value::Word(out)
-            }
-            Op::CellMix(c, half) => {
-                // `runtime2::cell_mix(c, v, seed)` = `mix64(seed ^ c*K ^
-                // av_code(v))`, with `av_code` per the argument's domain
-                // (`runtime2::av_code`, zero-extending the 32-bit patterns
-                // as `to_bits() as u64` does).
-                use celeste_engine::runtime2::{CELL_K, KEY_SEED1, KEY_SEED2};
-                let seed = if *half == 0 { KEY_SEED1 } else { KEY_SEED2 };
-                let cconst = seed ^ (*c as u64).wrapping_mul(CELL_K);
-                let mut out = [WordHalf::ConstU64(0); 2];
-                match self.dom(a[0]) {
-                    0 => {
-                        // Num: code = 1<<56 | bits.
-                        let n = self.as_num(a[0])?;
-                        let r = self.num_reg(n);
-                        let e = self.ext(r);
-                        for h in 0..2 {
-                            let code = self.qbin(QOp::OrQ, e[h], Src::BU64(1u64 << 56));
-                            let x = self.qbin(QOp::XorQ, code, Src::BU64(cconst));
-                            out[h] = WordHalf::Reg(self.mix64(x));
-                        }
-                    }
-                    2 => {
-                        // Ival: code = 2<<56 | ((lo << 24) ^ mix64(hi << 1)).
-                        let iv = self.as_ival(a[0])?;
-                        let [lo, hi] = self.ival_regs(iv);
-                        let (elo, ehi) = (self.ext(lo), self.ext(hi));
-                        for h in 0..2 {
-                            let sl = self.sllq(elo[h], 24);
-                            let sh = self.sllq(ehi[h], 1);
-                            let mh = self.mix64(sh);
-                            let x = self.qbin(QOp::XorQ, sl, Src::Reg(mh));
-                            let code = self.qbin(QOp::OrQ, x, Src::BU64(2u64 << 56));
-                            let x = self.qbin(QOp::XorQ, code, Src::BU64(cconst));
-                            out[h] = WordHalf::Reg(self.mix64(x));
-                        }
-                    }
-                    1 => {
-                        // Bool: code = known ? 3<<56 | val : 4<<56, i.e.
-                        // ((3 + (known ^ 1)) << 56) | (val & known).
-                        let b = self.as_bool(a[0])?;
-                        let (v, k) = (self.mask_reg(b[0]), self.mask_reg(b[1]));
-                        let vk = self.dbin(ROp::AndD, v, k);
-                        let vb = self.dbin_c(ROp::AndD, vk, 1);
-                        let kb = self.dbin_c(ROp::AndD, k, 1);
-                        let (ev, ek) = (self.ext(vb), self.ext(kb));
-                        for h in 0..2 {
-                            let t = self.qbin(QOp::XorQ, ek[h], Src::BU64(1));
-                            let t = self.qbin(QOp::AddQ, t, Src::BU64(3));
-                            let t = self.sllq(t, 56);
-                            let code = self.qbin(QOp::OrQ, t, Src::Reg(ev[h]));
-                            let x = self.qbin(QOp::XorQ, code, Src::BU64(cconst));
-                            out[h] = WordHalf::Reg(self.mix64(x));
-                        }
-                    }
-                    d => bail!("node {}: CellMix over a domain-{d} value", id),
-                }
-                Value::Word(out)
             }
             Op::Cell(c) => {
                 let off = *self
@@ -1355,13 +1175,6 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
             push_src(b, out);
         }
         Inst::Neg { a, .. } | Inst::Abs { a, .. } => out.push(*a),
-        Inst::Srlq { a, .. } | Inst::ExtLo { src: a, .. } | Inst::ExtHi { src: a, .. } => {
-            out.push(*a)
-        }
-        Inst::QBin { a, b, .. } => {
-            out.push(*a);
-            push_src(b, out);
-        }
         Inst::Muldq { a, b, .. } | Inst::BlendImm { a, b, .. } => {
             out.push(*a);
             out.push(*b);
@@ -1543,10 +1356,6 @@ fn inst_def(inst: &Inst) -> Option<Vreg> {
         | Inst::RBin { dst, .. }
         | Inst::Neg { dst, .. }
         | Inst::Abs { dst, .. }
-        | Inst::Srlq { dst, .. }
-        | Inst::QBin { dst, .. }
-        | Inst::ExtLo { dst, .. }
-        | Inst::ExtHi { dst, .. }
         | Inst::Muldq { dst, .. }
         | Inst::Sraq { dst, .. }
         | Inst::Sllq { dst, .. }
@@ -1763,10 +1572,6 @@ impl<'a> Emitter<'a> {
                 let l = self.pool.d(c);
                 format!("{l}(%rip){{1to16}}")
             }
-            Src::BU64(c) => {
-                let l = self.pool.q(c);
-                format!("{l}(%rip){{1to8}}")
-            }
         }
     }
 
@@ -1845,38 +1650,6 @@ impl<'a> Emitter<'a> {
                 let ra = self.use_reg(*a, OPA);
                 let d = self.def_reg(*dst);
                 writeln!(self.out, "    vpsllq ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::Srlq { dst, a, imm } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpsrlq ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::QBin { dst, op, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
-                let mn = match op {
-                    QOp::AddQ => "vpaddq",
-                    QOp::XorQ => "vpxorq",
-                    QOp::OrQ => "vporq",
-                    QOp::MullQ => "vpmullq",
-                };
-                writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::ExtLo { dst, src } => {
-                let rs = self.use_reg(*src, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpmovzxdq %ymm{}, %zmm{}", rs, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::ExtHi { dst, src } => {
-                let rs = self.use_reg(*src, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vextracti64x4 $1, %zmm{}, %ymm{}", rs, OPB).unwrap();
-                writeln!(self.out, "    vpmovzxdq %ymm{}, %zmm{}", OPB, d).unwrap();
                 self.store_def(*dst, d);
             }
             Inst::BlendImm { dst, mask, a, b } => {
@@ -2007,11 +1780,6 @@ impl<'a> Emitter<'a> {
                         writeln!(self.out, "    vpbroadcastd {}(%rip), %zmm{}", l, OPA).unwrap();
                         OPA
                     }
-                    Src::BU64(c) => {
-                        let l = self.pool.q(*c);
-                        writeln!(self.out, "    vpbroadcastq {}(%rip), %zmm{}", l, OPA).unwrap();
-                        OPA
-                    }
                 };
                 writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%r14)", r, off).unwrap();
             }
@@ -2079,8 +1847,28 @@ pub fn compile(
         .unwrap_or(4);
     let t_lower = std::time::Instant::now();
     let order = schedule(g, &live, roots, batch);
+    // `CELESTE_ASM_STATS`: which graph op each vreg and instruction came from.
+    let stats = std::env::var_os("CELESTE_ASM_STATS").is_some();
+    let mut kinds: Vec<String> = Vec::new();
+    let mut kind_ix: HashMap<String, u16> = HashMap::new();
+    let mut vreg_kind: Vec<u16> = Vec::new();
+    let mut insts_by_kind: Vec<usize> = Vec::new();
     for id in order {
+        let (v0, i0) = (lo.next_vreg, lo.insts.len());
         lo.lower_node(id)?;
+        if stats {
+            let name = format!("{:?}", g.get(id).op).split('(').next().unwrap_or("").to_string();
+            let k = *kind_ix.entry(name.clone()).or_insert_with(|| {
+                kinds.push(name);
+                insts_by_kind.push(0);
+                (kinds.len() - 1) as u16
+            });
+            insts_by_kind[k as usize] += lo.insts.len() - i0;
+            vreg_kind.resize(lo.next_vreg as usize, u16::MAX);
+            for v in v0..lo.next_vreg {
+                vreg_kind[v as usize] = k;
+            }
+        }
     }
     let t_lower = t_lower.elapsed();
 
@@ -2107,13 +1895,6 @@ pub fn compile(
                 lo.insts.push(Inst::StoreMask { off: base, src: val });
                 lo.insts.push(Inst::StoreMask { off: base + 2, src: known });
                 RootKind::Bool
-            }
-            Some(Value::Word(w)) => {
-                for (half, wh) in w.iter().enumerate() {
-                    let src = lo.word_src(*wh);
-                    lo.insts.push(Inst::Store { off: base + half as u32 * 64, src });
-                }
-                RootKind::Word
             }
             None => bail!("root {} was never lowered", r),
         };
@@ -2148,6 +1929,35 @@ pub fn compile(
     let (home, spill_slots) = allocate(&lo.insts, lo.next_vreg, &remat);
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         eprintln!("[build]   {sym}: allocate {:.1}s ({spill_slots} spill slots)", t_alloc.elapsed().as_secs_f64());
+    }
+    if stats {
+        // Per graph op: the instructions it lowered to, how many of its
+        // values live in a spill slot, and how often they are reloaded.
+        vreg_kind.resize(lo.next_vreg as usize, u16::MAX);
+        let (mut spilled, mut reloads) = (vec![0usize; kinds.len()], vec![0usize; kinds.len()]);
+        for v in 0..lo.next_vreg as usize {
+            if matches!(home[v], Loc::Spill(_)) && !remat[v] && vreg_kind[v] != u16::MAX {
+                spilled[vreg_kind[v] as usize] += 1;
+            }
+        }
+        let mut buf = Vec::new();
+        for inst in &lo.insts {
+            buf.clear();
+            inst_uses(inst, &mut buf);
+            for &v in &buf {
+                if matches!(home[v as usize], Loc::Spill(_)) && !remat[v as usize] && vreg_kind[v as usize] != u16::MAX {
+                    reloads[vreg_kind[v as usize] as usize] += 1;
+                }
+            }
+        }
+        let mut rows: Vec<usize> = (0..kinds.len()).collect();
+        rows.sort_by_key(|&k| std::cmp::Reverse(reloads[k]));
+        let line: Vec<String> = rows
+            .iter()
+            .take(14)
+            .map(|&k| format!("{} {}i/{}s/{}r", kinds[k], insts_by_kind[k], spilled[k], reloads[k]))
+            .collect();
+        eprintln!("[asm stats] {sym} by op (instructions/spilled values/reloads): {}", line.join(", "));
     }
 
     // Any call-outs? They need a 32-zmm save area and arg buffers above the
@@ -2209,9 +2019,6 @@ pub fn compile(
     // Constant pool.
     writeln!(asm, ".section .rodata").unwrap();
     writeln!(asm, ".align 64").unwrap();
-    for (i, v) in em.pool.q.iter().enumerate() {
-        writeln!(asm, ".LCq{i}: .quad {}", v).unwrap();
-    }
     for (i, v) in em.pool.d.iter().enumerate() {
         writeln!(asm, ".LCd{i}: .long {}", *v as u32).unwrap();
     }

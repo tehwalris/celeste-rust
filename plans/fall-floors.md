@@ -161,6 +161,31 @@ op's operand order - and what folds after it - depended on which worker had
 traced what before. Every job now traces in a fresh copy of the walk's
 starting arena: two runs, 0 kernels apart (3,795,002 fused nodes each).
 
+**Where a level-0 frame goes** (a 20 s `perf record` of the live search at
+f65, 2026-09-18): 80% in the kernels, 161 of level 0's 307; the square (6,5)
+- the middle of the floor cluster - alone ~25%: its player kernel 13,812
+bodies, 801k fused nodes, 88 MB of code, a 9.1 MB spill frame. The process ran
+at 0.12 instructions per cycle, ~1 L1d miss per 10 instructions: the kernels'
+straight-line code is 57% stack traffic (42% reloads, 15% spills) into frames
+far beyond L2. `CELESTE_ASM_STATS` prints per kernel the instructions, reloads,
+spills and frame, and per graph op the instructions, spilled values and reloads
+it accounts for. The (6,5) player kernel by op: `And` 1.26M instructions / 1.37M
+reloads, `CellMix` 1.36M / 1.11M, `Or` 0.62M / 0.69M, `AddW` 0.31M / 0.19M -
+the boolean layer, and the ROW KEY: every body hashed every lane, though a lane
+takes ~22 of the 13,812 bodies (55M rows from 2.5M lanes at f50).
+
+The row key is now folded per EMITTED row in the append step
+(`AsmBody::key_words`: `Σ cell_mix` over the body's key fields read off the
+output slots), and `Op::Word`/`CellMix`/`AddW` with their codegen (the u64
+lane ops) are gone. The (6,5) player kernel: 9.9M -> 5.8M instructions, frame
+9.1 -> 3.9 MB. `bench-frame` on the live tree's f50 (2.5M lanes, 16 threads,
+the search running beside it), per rep: 80 s -> 50 s, cycles 5.4T -> 3.8T,
+L1d misses 42G -> 27G, the same 5,771,927 rows kept. (Instructions went UP,
+0.49T -> 1.58T: the scalar fold per raw row. At 0.42 instructions per cycle
+it is still the cheap half; a 16-lane fold over the slots is the next step.)
+The batch/pressure knobs of the scheduler (`CELESTE_ASM_BATCH=1`) moved the
+big kernel by nothing.
+
 What is left of the walk is the tracer itself: ~0.7 CPU-s per trace, heap
 clones at splits and merges 31%, dropping states 17%, canons of `if` merges
 16%. Copy-on-write tables would be the next step.

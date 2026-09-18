@@ -55,6 +55,34 @@ pub fn compile_and_load_reprs(
             t_asm.as_secs_f64()
         );
     }
+    // `CELESTE_ASM_STATS`: per kernel, the instructions and how many of them
+    // are stack traffic - the measure codegen changes are judged by (a big
+    // kernel's reloads miss the caches: room (3,0), 0.12 instructions per
+    // cycle, 2026-09-18).
+    if std::env::var_os("CELESTE_ASM_STATS").is_some() {
+        let (mut insts, mut reloads, mut spills) = (0usize, 0usize, 0usize);
+        for line in compiled.asm.lines() {
+            let Some(body) = line.strip_prefix("    ") else { continue };
+            if body.starts_with('.') {
+                continue;
+            }
+            insts += 1;
+            if let Some(ops) = body.strip_prefix("vmovdqu64 ") {
+                if ops.contains("(%rsp), %zmm") {
+                    reloads += 1;
+                } else if ops.starts_with("%zmm") && ops.ends_with("(%rsp)") {
+                    spills += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[asm stats] {sym}: {insts} instructions, {reloads} reloads ({:.0}%), {spills} spills ({:.0}%), {} spill slots, frame {:.1} MB",
+            100.0 * reloads as f64 / insts.max(1) as f64,
+            100.0 * spills as f64 / insts.max(1) as f64,
+            compiled.spill_slots,
+            compiled.frame_bytes as f64 / 1048576.0
+        );
+    }
     // The assembly TEXT is only the assembler's input: dropped once the
     // .so is loaded (room (2,0)'s 17 kernel sets held ~8 GB after their
     // prebuild, 2026-09-14). `CELESTE_KEEP_ASM` keeps it for a dump.
