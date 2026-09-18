@@ -227,8 +227,14 @@ pub struct Compiled {
     pub input_reprs: Vec<CellRepr>,
     /// Total bytes the input buffer must be.
     pub input_bytes: u32,
-    /// Number of roots. Root `i` occupies a 128-byte slot at `i*128`.
+    /// Number of roots.
     pub n_roots: usize,
+    /// Root `i`'s byte offset in the output buffer: bools packed first (4
+    /// bytes: `val` u16 at +0, `known` at +2), then numbers (64 bytes) and
+    /// intervals (128: `lo` at +0, `hi` at +64), 64-aligned.
+    pub root_offsets: Vec<u32>,
+    /// Bytes the output buffer must be.
+    pub out_bytes: u32,
     /// Each root's type (how to read its slot).
     pub root_kinds: Vec<RootKind>,
     pub sym: String,
@@ -1933,10 +1939,46 @@ pub fn compile(
     }
     let t_lower = t_lower.elapsed();
 
-    // Roots -> typed stores, each into its own 128-byte slot.
+    // Roots -> typed stores into a PACKED output buffer (`root_offsets`): the
+    // booleans first, 4 bytes each (`val`, `known`), then the numbers (64
+    // bytes) and the intervals (128), 64-aligned. One 128-byte slot per root
+    // left a big kernel's 12,755 bool roots a cache line each: 44,141 lines,
+    // 5.4 MB per slice, for room (3,0)'s square (6,5) (2026-09-18).
+    let kind_of = |v: &Option<Value>| -> Result<RootKind> {
+        Ok(match v {
+            Some(Value::Num(_)) => RootKind::Num,
+            Some(Value::Ival(_)) => RootKind::Ival,
+            Some(Value::Bool(_)) => RootKind::Bool,
+            None => bail!("a root was never lowered"),
+        })
+    };
+    let kinds_first: Vec<RootKind> = roots.iter().map(|r| kind_of(&lo.vals[*r as usize])).collect::<Result<_>>()?;
+    let mut root_offsets: Vec<u32> = vec![0; roots.len()];
+    let mut next = 0u32;
+    for (ri, k) in kinds_first.iter().enumerate() {
+        if *k == RootKind::Bool {
+            root_offsets[ri] = next;
+            next += 4;
+        }
+    }
+    next = next.div_ceil(64) * 64;
+    for (ri, k) in kinds_first.iter().enumerate() {
+        match k {
+            RootKind::Num => {
+                root_offsets[ri] = next;
+                next += 64;
+            }
+            RootKind::Ival => {
+                root_offsets[ri] = next;
+                next += 128;
+            }
+            RootKind::Bool => {}
+        }
+    }
+    let out_bytes = next.max(64);
     let mut root_kinds: Vec<RootKind> = Vec::with_capacity(roots.len());
     for (ri, r) in roots.iter().enumerate() {
-        let base = ri as u32 * 128;
+        let base = root_offsets[ri];
         let kind = match lo.vals[*r as usize] {
             Some(Value::Num(n)) => {
                 let src = lo.num_src(n);
@@ -2092,6 +2134,8 @@ pub fn compile(
         input_reprs,
         input_bytes,
         n_roots: roots.len(),
+        root_offsets,
+        out_bytes,
         root_kinds,
         sym: sym.to_string(),
         spill_slots,

@@ -76,13 +76,20 @@ pub fn compile_and_load_reprs(
             }
         }
         eprintln!(
-            "[asm stats] {sym}: {insts} instructions, {reloads} reloads ({:.0}%), {spills} spills ({:.0}%), {} spill slots, frame {:.1} MB, {} output slots ({:.1} MB per slice)",
+            "[asm stats] {sym}: {insts} instructions, {reloads} reloads ({:.0}%), {spills} spills ({:.0}%), {} spill slots, frame {:.1} MB, {} output roots ({:.1} MB per slice)",
             100.0 * reloads as f64 / insts.max(1) as f64,
             100.0 * spills as f64 / insts.max(1) as f64,
             compiled.spill_slots,
             compiled.frame_bytes as f64 / 1048576.0,
             compiled.n_roots,
-            compiled.n_roots as f64 * 128.0 / 1048576.0
+            compiled.out_bytes as f64 / 1048576.0
+        );
+        let count = |k: RootKind| compiled.root_kinds.iter().filter(|r| **r == k).count();
+        eprintln!(
+            "[asm stats] {sym}: output slots by kind: {} num, {} interval, {} bool",
+            count(RootKind::Num),
+            count(RootKind::Ival),
+            count(RootKind::Bool)
         );
     }
     // The assembly TEXT is only the assembler's input: dropped once the

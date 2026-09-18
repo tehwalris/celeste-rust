@@ -195,6 +195,12 @@ share the machine with the live search):
 | keys folded per emitted row | ~50 s | 3.79T | 1.58T |
 | + the fold specialized per field (no `AV` per row) | 42-48 s | 3.37T | 0.96T |
 | + redundant reloads dropped | ~33 s | 2.89T | 0.95T |
+| + the output buffer packed (bools 4 bytes, not a 128-byte slot) | ~34 s | 2.56T | 0.95T |
+
+The packed layout (`Compiled::root_offsets`): the (6,5) player kernel's
+44,141 output roots are 31,384 numbers, 2 intervals and 12,755 bools, and a
+bool took a cache line of its own - 5.4 MB per 16-lane slice, now 2.0 MB; the
+append step's `ok`/`live` scan over every body reads one dense run.
 
 The last is a peephole over the emitted body (`drop_redundant_reloads`): a
 spilled value is reloaded at every use, often straight back into the scratch

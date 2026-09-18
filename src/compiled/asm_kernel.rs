@@ -43,7 +43,10 @@ use crate::transpile::graph::Room;
 /// `Col::U` cells).
 struct AsmField {
     cell: usize,
+    /// The root's slot (diagnostics) and its byte offset in the output
+    /// buffer (`Compiled::root_offsets`).
     root: usize,
+    off: usize,
     kind: RootKind,
 }
 
@@ -57,6 +60,10 @@ struct AsmBody {
     fields: Vec<AsmField>,
     ok_root: usize,
     live_root: usize,
+    /// `ok`/`live`'s byte offsets in the output buffer (`Compiled::
+    /// root_offsets`); `ok_root`/`live_root` are their slots.
+    ok_off: usize,
+    live_off: usize,
     /// The fields the row key folds (`key_words`): the body's varying ones -
     /// a per-row column the boundary does not widen to uniform - and every
     /// keyed one.
@@ -78,7 +85,8 @@ struct AsmBody {
 #[derive(Clone, Copy)]
 struct DKey {
     dash: [i32; 4],
-    /// The output slot of spd.x's key root (low end first).
+    /// The byte offset of spd.x's key root in the output buffer (low end
+    /// first); `bucket_y` and `dash_time_slot` likewise.
     bucket_x: usize,
     /// spd.y's, where the level buckets y (`SpdPrecision::buckets_y`); an
     /// x-only level has no y key root and every row's `by` is 0.
@@ -88,7 +96,7 @@ struct DKey {
     edges: [&'static [i32]; 2],
 }
 
-/// One field of a body's row key: its cell, the output slot it is read from,
+/// One field of a body's row key: its cell, the byte offset it is read from,
 /// and whether it is hashed as an INTERVAL. A field keyed on another node
 /// (the speed under a bucket: stored tight, keyed on its bucket) is hashed
 /// per row even where its stored value is constant (`acc_template` leaves it
@@ -134,7 +142,7 @@ impl KeyField {
     #[inline]
     fn code(&self, buf: &[u8], i: usize) -> u64 {
         use celeste_engine::runtime2::mix64;
-        let base = self.root * 128;
+        let base = self.root;
         let word = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) as u64;
         let ival = |lo: u64, hi: u64| 2u64 << 56 | lo << 24 ^ mix64(hi << 1);
         match self.read {
@@ -178,7 +186,7 @@ impl AsmBody {
     #[inline]
     fn dkey_of(&self, buf: &[u8], i: usize) -> Option<SpeedKey> {
         let k = self.dkey?;
-        let word = |slot: usize| u32::from_le_bytes(buf[slot * 128 + i * 4..slot * 128 + i * 4 + 4].try_into().unwrap()) as i32;
+        let word = |off: usize| u32::from_le_bytes(buf[off + i * 4..off + i * 4 + 4].try_into().unwrap()) as i32;
         let dashing = word(k.dash_time_slot) > 0;
         let bucket = |axis: usize, slot: usize| k.edges[axis].partition_point(|&e| e <= word(slot)) as u16;
         let by = k.bucket_y.map_or(0, |s| bucket(1, s));
@@ -438,8 +446,8 @@ impl AsmKernel {
                 // declined is DROPPED as not-live - the graph considers it dead.
                 let (mut kept, mut declined, mut any_live) = (0u16, 0u16, 0u16);
                 for body in &self.bodies {
-                    let ok = read_zb_holds(outbuf, body.ok_root);
-                    let live = read_zb_live(outbuf, body.live_root);
+                    let ok = read_zb_holds(outbuf, body.ok_off);
+                    let live = read_zb_live(outbuf, body.live_off);
                     kept |= live & ok & valid;
                     declined |= live & !ok & valid;
                     any_live |= live & valid;
@@ -470,8 +478,8 @@ impl AsmKernel {
                 // `val` bit instead of declining. A lane whose `ok` is unknown
                 // must fall to the reference, so the trace's failure to
                 // fork/decide it surfaces instead of producing a coarse row.
-                let ok = read_zb_holds(outbuf, body.ok_root);
-                let live = read_zb_live(outbuf, body.live_root);
+                let ok = read_zb_holds(outbuf, body.ok_off);
+                let live = read_zb_live(outbuf, body.live_off);
                 if live & !ok & valid != 0 {
                     // Declined: a live lane the kernel could not keep (or
                     // could not DECIDE). A coverage gap for the whole call -
@@ -701,8 +709,8 @@ impl AsmKernel {
         }
         let mut n_live_eval = 0;
         for (bi, body) in self.bodies.iter().enumerate() {
-            let live_asm = read_zb_live(outbuf, body.live_root) & (1 << i) != 0;
-            let ok_asm = read_zb_holds(outbuf, body.ok_root) & (1 << i) != 0;
+            let live_asm = read_zb_live(outbuf, body.live_off) & (1 << i) != 0;
+            let ok_asm = read_zb_holds(outbuf, body.ok_off) & (1 << i) != 0;
             let live_ev = vals[self.flat_roots[body.live_root] as usize];
             let ok_ev = vals[self.flat_roots[body.ok_root] as usize];
             if live_ev != Val::Bool(Some(false)) || live_asm {
@@ -1131,7 +1139,7 @@ impl Scratch {
                 None => Scratch {
                     kernel: id,
                     inbuf: vec![0u8; k.compiled.input_bytes as usize],
-                    outbuf: vec![0u8; k.compiled.n_roots * 128],
+                    outbuf: vec![0u8; k.compiled.out_bytes as usize],
                 },
             }
         })
@@ -1179,10 +1187,10 @@ impl BodyCols {
             };
             written[ci] = true;
             match (f.kind, &proto.cols[ci].1) {
-                (RootKind::Num, TCol::Num(_)) => num.push((ci, f.root)),
-                (RootKind::Ival, TCol::Ival(_)) => ival.push((ci, f.root)),
-                (RootKind::Num, TCol::Ival(_)) => num_as_ival.push((ci, f.root)),
-                (RootKind::Bool, TCol::Bool(_)) => bool_.push((ci, f.root)),
+                (RootKind::Num, TCol::Num(_)) => num.push((ci, f.off)),
+                (RootKind::Ival, TCol::Ival(_)) => ival.push((ci, f.off)),
+                (RootKind::Num, TCol::Ival(_)) => num_as_ival.push((ci, f.off)),
+                (RootKind::Bool, TCol::Bool(_)) => bool_.push((ci, f.off)),
                 (k, _) => anyhow::bail!("body field cell {} kind {:?} disagrees with the shape's column", f.cell, k),
             }
         }
@@ -1224,11 +1232,11 @@ impl BodyCols {
         let s = self.spd?;
         let word = |base: usize| u32::from_le_bytes(buf[base..base + 4].try_into().unwrap()) as i32;
         let range = |(_, root, is_num): (usize, usize, bool)| -> (i32, i32) {
-            let lo = word(root * 128 + i * 4);
+            let lo = word(root + i * 4);
             if is_num {
                 (lo, lo)
             } else {
-                (lo, word(root * 128 + 64 + i * 4))
+                (lo, word(root + 64 + i * 4))
             }
         };
         let (x, y) = (range(s[0]), range(s[1]));
@@ -1242,24 +1250,24 @@ impl BodyCols {
         let word = |base: usize| u32::from_le_bytes(buf[base..base + 4].try_into().unwrap());
         for &(ci, root) in &self.num {
             if let TCol::Num(v) = &mut slot.cols[ci].1 {
-                v.push(word(root * 128 + i * 4));
+                v.push(word(root + i * 4));
             }
         }
         for &(ci, root) in &self.ival {
             if let TCol::Ival(v) = &mut slot.cols[ci].1 {
-                v.push((word(root * 128 + i * 4), word(root * 128 + 64 + i * 4)));
+                v.push((word(root + i * 4), word(root + 64 + i * 4)));
             }
         }
         for &(ci, root) in &self.num_as_ival {
             if let TCol::Ival(v) = &mut slot.cols[ci].1 {
-                let n = word(root * 128 + i * 4);
+                let n = word(root + i * 4);
                 v.push((n, n));
             }
         }
         for &(ci, root) in &self.bool_ {
             if let TCol::Bool(v) = &mut slot.cols[ci].1 {
-                let val = u16::from_le_bytes([buf[root * 128], buf[root * 128 + 1]]);
-                let known = u16::from_le_bytes([buf[root * 128 + 2], buf[root * 128 + 3]]);
+                let val = u16::from_le_bytes([buf[root], buf[root + 1]]);
+                let known = u16::from_le_bytes([buf[root + 2], buf[root + 3]]);
                 // FATAL, not a `2`: an undecided boolean here means a branch
                 // on an unknown reached the output without its `Known`
                 // premise declining the lane - and a stored one would be
@@ -1447,15 +1455,13 @@ fn ival_raw(av: AV) -> (i32, i32) {
 /// room (2,0) under `CELESTE_SPD_LADDER=level0` silently dropped lanes
 /// in 813 slices of its first 32 frames (2026-09-14). `ok` keeps the
 /// strict reading: an undecided OBLIGATION is a decline.
-fn read_zb_live(buf: &[u8], root: usize) -> u16 {
-    let off = root * 128;
+fn read_zb_live(buf: &[u8], off: usize) -> u16 {
     let val = u16::from_le_bytes([buf[off], buf[off + 1]]);
     let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
     val | !known
 }
 
-fn read_zb_holds(buf: &[u8], root: usize) -> u16 {
-    let off = root * 128;
+fn read_zb_holds(buf: &[u8], off: usize) -> u16 {
     let val = u16::from_le_bytes([buf[off], buf[off + 1]]);
     let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
     val & known
@@ -1467,13 +1473,13 @@ use celeste_engine::runtime2::{KEY_SEED1, KEY_SEED2};
 
 /// The `AV` a field root holds for lane `i` (for the dedup fold).
 fn read_field_av(f: &AsmField, buf: &[u8], i: usize) -> AV {
-    read_root_av(f.root, f.kind, buf, i)
+    read_root_av(f.off, f.kind, buf, i)
 }
 
-/// The `AV` output slot `root` of kind `kind` holds for lane `i`.
+/// The `AV` the output root at byte offset `base`, of kind `kind`, holds for
+/// lane `i`.
 #[inline]
-fn read_root_av(root: usize, kind: RootKind, buf: &[u8], i: usize) -> AV {
-    let base = root * 128;
+fn read_root_av(base: usize, kind: RootKind, buf: &[u8], i: usize) -> AV {
     match kind {
         RootKind::Num => {
             AV::Num(P8::from_raw(i32::from_le_bytes(
@@ -2275,6 +2281,7 @@ fn build_one_shape(
             .map(|j| AsmField {
                 cell: outputs[j].0 as usize,
                 root: slot_of[off + j],
+                off: compiled.root_offsets[slot_of[off + j]] as usize,
                 kind: compiled.root_kinds[slot_of[off + j]],
             })
             .collect();
@@ -2300,7 +2307,7 @@ fn build_one_shape(
                 // a mid-dash body's `dash_time - 1` ends the dash on some
                 // lanes and not others. The dash constants are per body,
                 // read only where the row is still dashing.
-                let dash_time_slot = slot_of[off + field_index(&paths[2])?];
+                let dash_time_slot = compiled.root_offsets[slot_of[off + field_index(&paths[2])?]] as usize;
                 let mut dash = [0i32; 4];
                 for (i, p) in paths[3..].iter().enumerate() {
                     let root = b.roots[field_index(p)?];
@@ -2313,8 +2320,8 @@ fn build_one_shape(
                 }
                 Some(DKey {
                     dash,
-                    bucket_x: bucket_slot(0)?,
-                    bucket_y: if buckets_y { Some(bucket_slot(1)?) } else { None },
+                    bucket_x: compiled.root_offsets[bucket_slot(0)?] as usize,
+                    bucket_y: if buckets_y { Some(compiled.root_offsets[bucket_slot(1)?] as usize) } else { None },
                     dash_time_slot,
                     edges: [celeste_core::spd_buckets::edges(w, 0), celeste_core::spd_buckets::edges(w, 1)],
                 })
@@ -2333,7 +2340,7 @@ fn build_one_shape(
                     Some(k) => slot_of[off + nfields + 2 + k],
                     None => slot_of[off + j],
                 };
-                Some(KeyField::new(outputs[j].0 as u64, root, compiled.root_kinds[root], keyed.is_some()))
+                Some(KeyField::new(outputs[j].0 as u64, compiled.root_offsets[root] as usize, compiled.root_kinds[root], keyed.is_some()))
             })
             .collect();
         asm_bodies.push(AsmBody {
@@ -2342,6 +2349,8 @@ fn build_one_shape(
             fields,
             ok_root: slot_of[off + nfields],
             live_root: slot_of[off + nfields + 1],
+            ok_off: compiled.root_offsets[slot_of[off + nfields]] as usize,
+            live_off: compiled.root_offsets[slot_of[off + nfields + 1]] as usize,
             key_fields,
             pos: None,
             dkey,
@@ -2410,7 +2419,7 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]
             // number's; its cell is the bucket's low corner
             // (`pos_graph::whole_i16_col`).
             return Ok(match f.kind {
-                RootKind::Num | RootKind::Ival => Some(PosSrc::Root(f.root * 128)),
+                RootKind::Num | RootKind::Ival => Some(PosSrc::Root(f.off)),
                 _ => None,
             });
         }

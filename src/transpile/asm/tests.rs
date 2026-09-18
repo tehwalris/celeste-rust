@@ -206,14 +206,14 @@ fn eval_nodes(
 
 use crate::transpile::asm::RootKind;
 
-/// Read raw output bytes for `n_roots` 128-byte slots.
+/// Read the raw output buffer, `out_bytes` long (`Compiled::out_bytes`).
 fn run_asm_raw(
     loaded: &crate::transpile::asm::Loaded,
     input: &[u8],
-    n_roots: usize,
+    out_bytes: u32,
     ctx: *const std::os::raw::c_void,
 ) -> Vec<u8> {
-    let mut out = vec![0u8; n_roots * 128];
+    let mut out = vec![0u8; out_bytes as usize];
     unsafe { (loaded.func)(input.as_ptr(), out.as_mut_ptr(), ctx) };
     out
 }
@@ -233,10 +233,10 @@ fn check_typed(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
     for _ in 0..8 {
         let cols = random_columns(&compiled.input_cells, rng);
         let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.n_roots, std::ptr::null());
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,std::ptr::null());
         let vals = eval_nodes(g, &cols, None);
         for (ri, r) in roots.iter().enumerate() {
-            let base = ri * 128;
+            let base = compiled.root_offsets[ri] as usize;
             match (compiled.root_kinds[ri], vals[*r as usize]) {
                 (RootKind::Num, V::N(z)) => {
                     assert_eq!(&out[base..base + 64], &zn_bytes(z), "{tag}: num root {ri}");
@@ -304,10 +304,10 @@ fn check_typed_small(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
     for _ in 0..8 {
         let cols = random_small_columns(&compiled.input_cells, rng);
         let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.n_roots, std::ptr::null());
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,std::ptr::null());
         let vals = eval_nodes(g, &cols, None);
         for (ri, r) in roots.iter().enumerate() {
-            let base = ri * 128;
+            let base = compiled.root_offsets[ri] as usize;
             match (compiled.root_kinds[ri], vals[*r as usize]) {
                 (RootKind::Num, V::N(z)) => {
                     assert_eq!(&out[base..base + 64], &zn_bytes(z), "{tag}: num root {ri}");
@@ -424,10 +424,10 @@ fn check_typed_ctx(
     for _ in 0..8 {
         let cols = random_small_columns(&compiled.input_cells, rng);
         let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.n_roots, ctxp);
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,ctxp);
         let vals = eval_nodes(g, &cols, None);
         for (ri, r) in roots.iter().enumerate() {
-            let base = ri * 128;
+            let base = compiled.root_offsets[ri] as usize;
             match (compiled.root_kinds[ri], vals[*r as usize]) {
                 (RootKind::Num, V::N(z)) => {
                     assert_eq!(&out[base..base + 64], &zn_bytes(z), "{tag}: num root {ri}");
@@ -512,10 +512,10 @@ fn asm_callout_collision_matches_primitives() {
     for _ in 0..8 {
         let cols = random_columns(&compiled.input_cells, &mut rng);
         let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.n_roots, ctxp);
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,ctxp);
         let vals = eval_nodes(&g, &cols, Some((&cart, &cache)));
         for (ri, r) in roots.iter().enumerate() {
-            let base = ri * 128;
+            let base = compiled.root_offsets[ri] as usize;
             match (compiled.root_kinds[ri], vals[*r as usize]) {
                 (RootKind::Num, V::N(z)) => {
                     assert_eq!(&out[base..base + 64], &zn_bytes(z), "collision num root {ri}");
@@ -584,7 +584,7 @@ fn asm_bool_input_matches_primitives() {
         for (l, v) in num2.iter().enumerate() {
             input[128 + l * 4..128 + l * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
-        let out = run_asm_raw(&loaded, &input, compiled.n_roots, std::ptr::null());
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,std::ptr::null());
 
         let zb = ZB { val: mask, known: ALL };
         let zn0 = ZN::from_array(std::array::from_fn(|i| P8::from_raw(num0[i])));
@@ -593,25 +593,26 @@ fn asm_bool_input_matches_primitives() {
         let e_seln = zsel_n(zb_not(zb), zn2, zn0);
         let e_not = zb_not(zb);
 
-        assert_eq!(&out[0..64], &zn_bytes(e_sel), "trial {trial}: sel");
-        assert_eq!(&out[128..192], &zn_bytes(e_seln), "trial {trial}: seln");
+        let o = |ri: usize| compiled.root_offsets[ri] as usize;
+        assert_eq!(&out[o(0)..o(0) + 64], &zn_bytes(e_sel), "trial {trial}: sel");
+        assert_eq!(&out[o(1)..o(1) + 64], &zn_bytes(e_seln), "trial {trial}: seln");
         assert_eq!(
-            u16::from_le_bytes([out[256], out[257]]),
+            u16::from_le_bytes([out[o(2)], out[o(2) + 1]]),
             e_not.val,
             "trial {trial}: not val"
         );
         assert_eq!(
-            u16::from_le_bytes([out[258], out[259]]),
+            u16::from_le_bytes([out[o(2) + 2], out[o(2) + 3]]),
             e_not.known,
             "trial {trial}: not known"
         );
         assert_eq!(
-            u16::from_le_bytes([out[384], out[385]]),
+            u16::from_le_bytes([out[o(3)], out[o(3) + 1]]),
             mask,
             "trial {trial}: passthrough val"
         );
         assert_eq!(
-            u16::from_le_bytes([out[386], out[387]]),
+            u16::from_le_bytes([out[o(3) + 2], out[o(3) + 3]]),
             ALL,
             "trial {trial}: passthrough known"
         );
@@ -662,7 +663,7 @@ fn asm_ival_input_matches_primitives() {
         for (l, v) in num.iter().enumerate() {
             input[128 + l * 4..128 + l * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
-        let out = run_asm_raw(&loaded, &input, compiled.n_roots, std::ptr::null());
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,std::ptr::null());
 
         let ziv = ZI {
             lo: ZN::from_array(std::array::from_fn(|i| P8::from_raw(lo[i]))),
@@ -672,11 +673,12 @@ fn asm_ival_input_matches_primitives() {
         let e_sum = zi_add(ziv, ZI { lo: znum, hi: znum });
         let e_fl = zi_flr(e_sum);
 
-        assert_eq!(&out[0..64], &zn_bytes(e_sum.lo), "trial {trial}: sum lo");
-        assert_eq!(&out[64..128], &zn_bytes(e_sum.hi), "trial {trial}: sum hi");
-        assert_eq!(&out[128..192], &zn_bytes(e_fl), "trial {trial}: flr");
-        assert_eq!(&out[256..320], &zn_bytes(ziv.lo), "trial {trial}: passthrough lo");
-        assert_eq!(&out[320..384], &zn_bytes(ziv.hi), "trial {trial}: passthrough hi");
+        let o = |ri: usize| compiled.root_offsets[ri] as usize;
+        assert_eq!(&out[o(0)..o(0) + 64], &zn_bytes(e_sum.lo), "trial {trial}: sum lo");
+        assert_eq!(&out[o(0) + 64..o(0) + 128], &zn_bytes(e_sum.hi), "trial {trial}: sum hi");
+        assert_eq!(&out[o(1)..o(1) + 64], &zn_bytes(e_fl), "trial {trial}: flr");
+        assert_eq!(&out[o(2)..o(2) + 64], &zn_bytes(ziv.lo), "trial {trial}: passthrough lo");
+        assert_eq!(&out[o(2) + 64..o(2) + 128], &zn_bytes(ziv.hi), "trial {trial}: passthrough hi");
     }
 }
 
