@@ -306,6 +306,11 @@ pub struct Slot {
     skeleton: Rt2,
     /// `(cell, column)` per varying cell, in the kernel's order.
     pub cols: Vec<(usize, TCol)>,
+    /// `speed_typed_cols`, computed once: the skeleton and the column layout
+    /// never change after `new`, and the flush asked for it per queue flush,
+    /// walking the object list each time (4% of a room (3,0) frame,
+    /// 2026-09-18).
+    speed_cols: Option<(usize, usize)>,
     pub keys: Vec<(u64, u64)>,
     pub cells: Vec<u32>,
     /// The row's predecessors in the slice that emitted it: the slice's
@@ -326,6 +331,21 @@ pub struct Slot {
     pub gen: u16,
 }
 
+/// The typed-column indices of the player's `spd.x` / `spd.y` in a slot over
+/// `skeleton` with columns `cols`, when they are interval columns
+/// (`Slot::speed_typed_cols`).
+fn speed_cols_of(skeleton: &Rt2, cols: &[(usize, TCol)]) -> Option<(usize, usize)> {
+    let ids = crate::compiled::ids();
+    let obj = crate::search::pos_graph::player_object(skeleton)?;
+    let pc = skeleton.obj_field_cell(obj, ids.f_spd)?;
+    let Col::U(AV::Ptr(sub)) = skeleton.cols[pc as usize] else { return None };
+    let cx = skeleton.obj_field_cell(sub, ids.f_x)?;
+    let cy = skeleton.obj_field_cell(sub, ids.f_y)?;
+    let tx = cols.iter().position(|(c, t)| *c == cx as usize && matches!(t, TCol::Ival(_)))?;
+    let ty = cols.iter().position(|(c, t)| *c == cy as usize && matches!(t, TCol::Ival(_)))?;
+    Some((tx, ty))
+}
+
 impl Slot {
     /// A slot over `skeleton`: a width-0 block whose varying cells hold
     /// EMPTY typed columns (`Col::N`/`Col::I` for numbers / intervals,
@@ -341,7 +361,8 @@ impl Slot {
                 Col::V(_) => Some((cell, TCol::Bool(Vec::new()))),
                 Col::U(_) => None,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let speed_cols = speed_cols_of(&skeleton, &cols);
         Slot {
             shape: skeleton.shape_hash,
             outcome: 0,
@@ -351,6 +372,7 @@ impl Slot {
             touched: false,
             skeleton,
             cols,
+            speed_cols,
             keys: Vec::new(),
             cells: Vec::new(),
             pred_base: Vec::new(),
@@ -383,15 +405,7 @@ impl Slot {
     /// `spd.y` when the level buckets the speed - they are interval
     /// columns then. `None` at exact speed (numbers) or without a player.
     pub fn speed_typed_cols(&self) -> Option<(usize, usize)> {
-        let ids = crate::compiled::ids();
-        let obj = crate::search::pos_graph::player_object(&self.skeleton)?;
-        let pc = self.skeleton.obj_field_cell(obj, ids.f_spd)?;
-        let Col::U(AV::Ptr(sub)) = self.skeleton.cols[pc as usize] else { return None };
-        let cx = self.skeleton.obj_field_cell(sub, ids.f_x)?;
-        let cy = self.skeleton.obj_field_cell(sub, ids.f_y)?;
-        let tx = self.cols.iter().position(|(c, t)| *c == cx as usize && matches!(t, TCol::Ival(_)))?;
-        let ty = self.cols.iter().position(|(c, t)| *c == cy as usize && matches!(t, TCol::Ival(_)))?;
-        Some((tx, ty))
+        self.speed_cols
     }
 
     /// Row `r`'s speed hull from the typed columns `speed_typed_cols` found.
@@ -1446,11 +1460,28 @@ pub trait FrameStep: Sync {
     fn run(&self, block: &Block, cell_in: &[u32], lanes: Range<usize>, sink: &mut ForwardSink) -> Result<()>;
 }
 
-/// The emit phase's unit: one kernel call covers at most this many lanes
-/// of one block. A worker pulls a GRAB of consecutive units at a time and
-/// runs the contiguous ones as one call, so the step's within-call dedup
-/// (`seen`) spans the grab; the grab, not the unit, sets the dedup window.
-const UNIT_LANES: usize = 16384;
+/// The emit phase's unit: one kernel call covers at most this many lanes of
+/// one block, and a worker pulls one unit at a time, so the step's within-call
+/// dedup (`seen`) spans a unit. `CELESTE_UNIT_LANES` overrides it for a
+/// measurement (a multiple of 64: slices and predecessor groups start at
+/// multiples of 64).
+///
+/// 1024: room (3,0) f44 at `r0sxhfb` (2026-09-18, `bench-frame`, 16 threads)
+/// took 2.23 s with 45% of the workers' time idle at 16384 lanes (a few units
+/// of the heavy kernels outlasted the rest), 1.81 s / 28% at 4096, 1.47 s / 9%
+/// at 1024, 1.53 s / 4% at 256, where the smaller dedup window let more
+/// duplicates through (6.10M raw rows against 6.02M). Same kept set at all.
+fn unit_lanes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("CELESTE_UNIT_LANES") {
+        Ok(v) => {
+            let n: usize = v.parse().unwrap_or_else(|_| panic!("CELESTE_UNIT_LANES={v:?} is not a number"));
+            assert!(n >= 64 && n % 64 == 0, "CELESTE_UNIT_LANES={n}: must be a positive multiple of 64");
+            n
+        }
+        Err(_) => 1024,
+    })
+}
 
 /// Stack per frame worker: the ASM kernels keep their spill frames on the
 /// stack (~0.5 MB at level 0, more at the finer rungs, 83 MB for room (3,0)'s
@@ -1474,7 +1505,7 @@ fn units_of(lanes: impl Iterator<Item = usize>, unit: usize) -> Vec<(usize, usiz
     units
 }
 
-/// One forward frame, one pass (plans/waves.md): units of `UNIT_LANES`
+/// One forward frame, one pass (plans/waves.md): units of `unit_lanes()`
 /// lanes of the frontier's chunks, in CELL order, pulled by `threads()`
 /// workers. Each worker runs the frame step on its units into its own
 /// `ForwardSink`, whose queues flush as they fill: filter, door
@@ -1504,7 +1535,7 @@ pub fn forward_frame(
     let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
     // Units in WAVE order: by first cell across the (cell-sorted) pieces,
     // so consecutive units are neighbours in the room.
-    let mut units = units_of(frontier.iter().map(Block::lanes), UNIT_LANES);
+    let mut units = units_of(frontier.iter().map(Block::lanes), unit_lanes());
     // A unit of nothing but skipped lanes (won rows: checkpointed, never
     // expanded - their shape has no kernel) is not run.
     units.retain(|&(bi, lo, hi)| {

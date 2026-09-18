@@ -8,7 +8,7 @@
 //! same arena. (The Rust-source renderer that used to live here went with
 //! the generated kernel crates; nothing rendered text any more, 2026-09-08.)
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use super::graph::{Graph, NodeId, Op};
 use super::kernel::{Emit, OutFields};
@@ -361,21 +361,56 @@ pub(crate) fn specialize_frame(
             sp.len()
         );
     }
-    // --- 4. identical roots are the same body; a body live nowhere
-    // (its guard decided false: a table-fork fragment the specialized
-    // input range never reaches) is no body ---
+    // --- 4. candidates that write the same row are ONE body; a body live
+    // nowhere (its guard decided false: a table-fork fragment the
+    // specialized input range never reaches) is no body ---
+    //
+    // Candidates of one outcome with the same fields and keys write the
+    // same row wherever they are live, so they fuse: `live` the OR of
+    // theirs, `ok` the conjunction of `live_i -> ok_i`. A lane then
+    // declines exactly where some candidate declined (`L & !O` is
+    // `OR_i (L_i & !O_i)`, in the kernels' three-valued masks too: an
+    // unknown `live` reads as live, an unknown `ok` does not hold), and is
+    // kept where some candidate kept it; the door keeps one copy of the
+    // row either way. Before, a per-configuration `ok` or `live` node kept
+    // them apart: room (3,0) with the fall floors unknown, 336 bodies over
+    // 14 distinct rows per outcome (2026-09-18).
     let bodies: Vec<SpecializedBody> = {
-        let mut seen: BTreeSet<(usize, Vec<NodeId>)> = BTreeSet::new();
-        cands
-            .into_iter()
-            .filter(|c| {
-                let nfields = outs[c.0].0.len();
-                !matches!(sp.get(c.3[nfields + 1]).op, Op::ConstBool(false))
-            })
-            .filter(|c| seen.insert((c.0, c.3.clone())))
-            .collect()
+        let mut groups: Vec<(SpecializedBody, usize)> = Vec::new();
+        let mut index: BTreeMap<(usize, Vec<NodeId>), usize> = BTreeMap::new();
+        for c in cands {
+            let nfields = outs[c.0].0.len();
+            let (ok, live) = (c.3[nfields], c.3[nfields + 1]);
+            if matches!(sp.get(live).op, Op::ConstBool(false)) {
+                continue;
+            }
+            let row: Vec<NodeId> = c.3[..nfields].iter().chain(&c.3[nfields + 2..]).copied().collect();
+            match index.get(&(c.0, row.clone())) {
+                Some(&gi) => {
+                    let (g, members) = &mut groups[gi];
+                    let (g_ok, g_live) = (g.3[nfields], g.3[nfields + 1]);
+                    // The first member's `ok` joins guarded by its own `live`.
+                    let g_ok = if *members == 1 { guarded_ok(&mut sp, g_live, g_ok) } else { g_ok };
+                    let mine = guarded_ok(&mut sp, live, ok);
+                    g.3[nfields] = sp.fold(Op::And, vec![g_ok, mine]);
+                    g.3[nfields + 1] = sp.fold(Op::Or, vec![g_live, live]);
+                    *members += 1;
+                }
+                None => {
+                    index.insert((c.0, row), groups.len());
+                    groups.push((c, 1));
+                }
+            }
+        }
+        groups.into_iter().map(|(b, _)| b).collect()
     };
     (sp, bodies)
+}
+
+/// `live -> ok`: what a fused body's `ok` conjoins per member (`specialize_frame`).
+fn guarded_ok(sp: &mut Graph, live: NodeId, ok: NodeId) -> NodeId {
+    let dead = sp.fold(Op::Not, vec![live]);
+    sp.fold(Op::Or, vec![dead, ok])
 }
 
 /// The fused bodies' constant-output analysis. For each outcome field,

@@ -1596,7 +1596,7 @@ impl Registry {
                                     break;
                                 }
                                 let (key, r) = &refs_ref[si];
-                                out.push((si, build_one_shape(r, si, &format!("_{si}"), key.speed, w, buckets_y).map(|(shape, _, kernel)| (shape, *key, kernel))));
+                                out.push((si, build_one_shape(r, si, &format!("_{si}"), key.speed, key.region, w, buckets_y).map(|(shape, _, kernel)| (shape, *key, kernel))));
                             }
                             out
                         })
@@ -1706,12 +1706,27 @@ fn unify(by_shape: &mut HashMap<(u64, KernelKey), AsmKernel>) -> Result<()> {
     let templates: usize = by_shape.values().map(|k| k.acc_templates.len()).sum();
     let bodies: usize = by_shape.values().map(|k| k.bodies.len()).sum();
     let fused: usize = by_shape.values().map(|k| k.fused.len()).sum();
-    let mut per_shape: Vec<(usize, u8, usize, u8)> =
-        by_shape.values().map(|k| (k.bodies.len(), k.forks, k.fused.len(), k.fused.fork_bits())).collect();
+    // Per kernel, largest first: bodies, the traced forks, the forks its bodies
+    // ENUMERATE (a split that differs between two of its bodies), fused nodes,
+    // the spill frame, the region.
+    let mut per_shape: Vec<(usize, u8, usize, usize, String, String)> = by_shape
+        .iter()
+        .map(|((_, key), k)| {
+            let first = k.bodies.first().map(|b| b.splits.clone()).unwrap_or_default();
+            let enumerated = (0..k.forks as usize).filter(|&d| k.bodies.iter().any(|b| b.splits.get(d) != first.get(d))).count();
+            let region = key.region.map_or("-".to_string(), |r| format!("({},{})", r.ix, r.iy));
+            (k.bodies.len(), k.forks, enumerated, k.fused.len(), format!("{:.1} MB", k.compiled.frame_bytes as f64 / 1048576.0), region)
+        })
+        .collect();
+    per_shape.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.5.cmp(&b.5)));
+    if std::env::var_os("CELESTE_KERNEL_REPORT").is_some() {
+        for s in &per_shape {
+            eprintln!("[asm kernel] region {} bodies {} forks {} enumerated {} fused nodes {} frame {}", s.5, s.0, s.1, s.2, s.3, s.4);
+        }
+    }
     per_shape.truncate(12);
-    per_shape.sort_unstable_by_key(|s| std::cmp::Reverse(s.0));
     eprintln!(
-        "[asm build] {} output shapes over {templates} outcome templates; {widened} template cells widened uniform -> typed by the union ({:.2} per template); {bodies} bodies, {fused} fused nodes over {} input shapes; per input shape (bodies, forks, fused nodes, fork grid bits): {:?}",
+        "[asm build] {} output shapes over {templates} outcome templates; {widened} template cells widened uniform -> typed by the union ({:.2} per template); {bodies} bodies, {fused} fused nodes over {} input shapes; largest kernels (bodies, forks, forks enumerated, fused nodes, frame, region): {:?}",
         unions.len(),
         widened as f64 / templates.max(1) as f64,
         by_shape.len(),
@@ -1739,6 +1754,173 @@ fn apply_union(kernel: &mut AsmKernel, unions: &HashMap<u64, std::sync::Arc<Rt2>
     Ok(())
 }
 
+/// What one kernel is made of (`CELESTE_KERNEL_DUMP=<substring of its symbol>`):
+/// its region, its traced forks and what each splits, per outcome the forks its
+/// bodies enumerate, the fused graph's ops, and the codegen's frame. A
+/// diagnostic for why a kernel is as big as it is.
+fn dump_kernel(
+    r: &crate::trace::kernel::Reference,
+    sym: &str,
+    region: Option<crate::trace::kernel::Region>,
+    fused: &crate::transpile::graph::Graph,
+    bodies: &[crate::trace::emit::AsmBody],
+    slots: usize,
+    compiled: &crate::transpile::asm::Compiled,
+) {
+    use crate::transpile::graph::Op;
+    let op_name = |op: &Op| -> String { format!("{op:?}").split('(').next().unwrap_or("").to_string() };
+    let region = region.map_or("-".to_string(), |g| format!("({},{})", g.ix, g.iy));
+    eprintln!(
+        "[kernel dump] {sym} region {region}: {} outcomes, {} bodies, {} traced forks, {} fused nodes, {slots} root slots, {} spill slots, frame {:.1} MB, {} asm lines",
+        r.bound.outcomes.len(),
+        bodies.len(),
+        r.frame.forks,
+        fused.len(),
+        compiled.spill_slots,
+        compiled.frame_bytes as f64 / 1048576.0,
+        compiled.asm.lines().count()
+    );
+    // Each fork: its arity and what it splits (the operand's op, one level).
+    let g = &r.bound.graph;
+    for d in 0..r.frame.forks {
+        let site = (0..g.len() as crate::transpile::graph::NodeId).find(|&n| {
+            matches!(g.get(n).op, Op::Split(x) | Op::SplitInt(x) | Op::SplitTab(x) if x == d)
+        });
+        let what = match site {
+            Some(n) => {
+                let node = g.get(n);
+                let arg = g.get(node.args[0]);
+                let args: Vec<String> = arg.args.iter().map(|a| op_name(&g.get(*a).op)).collect();
+                format!("{} of {}({})", op_name(&node.op), op_name(&arg.op), args.join(", "))
+            }
+            None => "not in the bound graph".to_string(),
+        };
+        let origin = r.frame.fork_origins.iter().find(|(x, _)| *x == d).map_or("-", |(_, o)| o.as_str());
+        eprintln!("[kernel dump]   fork {d}: {} ways, {what}, made for {origin}", r.frame.fork_ways[d as usize]);
+    }
+    // Per outcome: its bodies and the forks they enumerate.
+    for oi in 0..r.bound.outcomes.len() {
+        let mine: Vec<&crate::trace::emit::AsmBody> = bodies.iter().filter(|b| b.outcome == oi).collect();
+        let Some(first) = mine.first() else { continue };
+        let enumerated: Vec<usize> = (0..first.splits.len()).filter(|&d| mine.iter().any(|b| b.splits[d] != first.splits[d])).collect();
+        let reps: std::collections::BTreeSet<u8> = mine.iter().map(|b| b.frees).collect();
+        eprintln!(
+            "[kernel dump]   outcome {oi}: {} bodies over {} button reps, forks enumerated {:?}, {} fields",
+            mine.len(),
+            reps.len(),
+            enumerated,
+            r.bound.outcomes[oi].outputs.len()
+        );
+        // What keeps bodies apart: the distinct root tuples when a body is
+        // compared by its fields only, then with `live`, with `ok`, and whole.
+        // Roots are `[fields.., ok, live, keys..]`.
+        let nf = r.bound.outcomes[oi].outputs.len();
+        let distinct = |f: &dyn Fn(&[crate::transpile::graph::NodeId]) -> Vec<crate::transpile::graph::NodeId>| -> usize {
+            mine.iter().map(|b| f(&b.roots)).collect::<std::collections::BTreeSet<_>>().len()
+        };
+        eprintln!(
+            "[kernel dump]     distinct roots: fields {}, fields+live {}, fields+ok {}, all {}; distinct live {}, distinct ok {}",
+            distinct(&|x| x[..nf].to_vec()),
+            distinct(&|x| x[..nf].iter().chain(std::iter::once(&x[nf + 1])).copied().collect()),
+            distinct(&|x| x[..nf + 1].to_vec()),
+            distinct(&|x| x.to_vec()),
+            distinct(&|x| vec![x[nf + 1]]),
+            distinct(&|x| vec![x[nf]]),
+        );
+        // Which fields keep bodies apart: per field, its distinct nodes.
+        let mut varying: Vec<(usize, usize)> = (0..nf)
+            .map(|j| (mine.iter().map(|b| b.roots[j]).collect::<std::collections::BTreeSet<_>>().len(), j))
+            .filter(|(n, _)| *n > 1)
+            .collect();
+        varying.sort_by(|a, b| b.0.cmp(&a.0));
+        let names: Vec<String> = varying
+            .iter()
+            .take(10)
+            .map(|(n, j)| {
+                let path = r.frame.outs.get(oi).and_then(|o| o.fields.get(*j)).map(|f| crate::trace::iface::show(&f.0)).unwrap_or_else(|| format!("field {j}"));
+                format!("{path} {n}")
+            })
+            .collect();
+        eprintln!("[kernel dump]     varying fields ({} of {nf}): {}", varying.len(), names.join(", "));
+        // Two bodies with the same fields and different `ok`: the conjuncts in
+        // one `ok` and not the other.
+        let conjuncts = |n: crate::transpile::graph::NodeId| -> std::collections::BTreeSet<crate::transpile::graph::NodeId> {
+            let (mut out, mut stack) = (std::collections::BTreeSet::new(), vec![n]);
+            while let Some(x) = stack.pop() {
+                let node = fused.get(x);
+                if node.op == Op::And {
+                    stack.extend(node.args.iter().copied());
+                } else {
+                    out.insert(x);
+                }
+            }
+            out
+        };
+        let mut ok_by_fields: std::collections::BTreeMap<Vec<crate::transpile::graph::NodeId>, crate::transpile::graph::NodeId> = Default::default();
+        for b in &mine {
+            let ok = b.roots[nf];
+            match ok_by_fields.get(&b.roots[..nf].to_vec()) {
+                Some(&other) if other != ok => {
+                    let (a, c) = (conjuncts(other), conjuncts(ok));
+                    let only = |x: &std::collections::BTreeSet<crate::transpile::graph::NodeId>, y: &std::collections::BTreeSet<crate::transpile::graph::NodeId>| -> Vec<String> {
+                        x.difference(y)
+                            .take(4)
+                            .map(|n| {
+                                let node = fused.get(*n);
+                                let args: Vec<String> = node.args.iter().map(|q| op_name(&fused.get(*q).op)).collect();
+                                format!("{}({})", op_name(&node.op), args.join(", "))
+                            })
+                            .collect()
+                    };
+                    eprintln!(
+                        "[kernel dump]     same fields, different ok: {} and {} conjuncts, {} shared; only in the first: {:?}; only in the second: {:?}",
+                        a.len(),
+                        c.len(),
+                        a.intersection(&c).count(),
+                        only(&a, &c),
+                        only(&c, &a)
+                    );
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    ok_by_fields.insert(b.roots[..nf].to_vec(), ok);
+                }
+            }
+        }
+        // The first two bodies whose fields agree but whose `live` differs:
+        // what the two `live` roots are.
+        let mut by_fields: std::collections::BTreeMap<Vec<crate::transpile::graph::NodeId>, crate::transpile::graph::NodeId> = Default::default();
+        for b in &mine {
+            let live = b.roots[nf + 1];
+            match by_fields.get(&b.roots[..nf].to_vec()) {
+                Some(&other) if other != live => {
+                    let show = |n: crate::transpile::graph::NodeId| {
+                        let node = fused.get(n);
+                        let args: Vec<String> = node.args.iter().map(|a| op_name(&fused.get(*a).op)).collect();
+                        format!("{}({})", op_name(&node.op), args.join(", "))
+                    };
+                    eprintln!("[kernel dump]     same fields, different live: {} against {}", show(other), show(live));
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    by_fields.insert(b.roots[..nf].to_vec(), live);
+                }
+            }
+        }
+    }
+    // The fused graph's ops, most common first.
+    let mut hist: std::collections::BTreeMap<String, usize> = Default::default();
+    for n in 0..fused.len() as crate::transpile::graph::NodeId {
+        *hist.entry(op_name(&fused.get(n).op)).or_default() += 1;
+    }
+    let mut hist: Vec<(String, usize)> = hist.into_iter().collect();
+    hist.sort_by(|a, b| b.1.cmp(&a.1));
+    let top: Vec<String> = hist.iter().take(20).map(|(o, c)| format!("{o} {c}")).collect();
+    eprintln!("[kernel dump]   ops: {}", top.join(", "));
+}
+
 /// Assemble ONE start-room shape: fuse its graph, gcc + dlopen it, and map
 /// its bodies' roots onto flat slots. Independent per shape, so
 /// `build_for_start_room` runs these in parallel. `tag` distinguishes the
@@ -1748,6 +1930,8 @@ fn build_one_shape(
     si: usize,
     tag: &str,
     key: Option<SpeedKey>,
+    // For the report only (`CELESTE_KERNEL_DUMP`).
+    region: Option<crate::trace::kernel::Region>,
     w: Option<u8>,
     // Does the level bucket spd.y (`SpdPrecision::buckets_y`): only then does
     // a body have a y key root to dispatch on.
@@ -1834,6 +2018,13 @@ fn build_one_shape(
     )
     .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
     crate::transpile::lower::build_add(8, t_asm);
+    if let Some(want) = std::env::var_os("CELESTE_KERNEL_DUMP") {
+        let (sym, want) = (format!("k{shape:016x}{tag}"), want.to_string_lossy().to_string());
+        let at = region.map(|g| format!("({},{})", g.ix, g.iy));
+        if sym.contains(&want) || at.as_deref() == Some(want.as_str()) {
+            dump_kernel(r, &sym, region, &fused, &bodies, flat_roots.len(), &compiled);
+        }
+    }
 
     // Map each fused body's roots onto their SLOTS: the bodies' roots
     // concatenated in order, through `slot_of`.

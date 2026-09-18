@@ -1648,23 +1648,31 @@ impl<'a, D: Domain> Interp<'a, D> {
         super::heap::push_value(&v, &mut roots);
         let (tables, scopes, _) = s.heap.reachable(&roots);
         let d = &mut self.d;
-        let mut swap = |x: &mut Value<D>| {
+        let mut swap = |x: &mut Value<D>, origin: &str| {
             if let Value::Bool(b) = x {
-                if let Some(f) = d.escaped_atom(b, since) {
+                if let Some(f) = d.escaped_atom(b, since, origin) {
                     *b = f;
                 }
             }
         };
         for (_, t) in s.heap.tables.iter_mut().filter(|(id, _)| tables.contains(id)) {
-            t.hash.values_mut().for_each(&mut swap);
-            t.arr.iter_mut().for_each(&mut swap);
-            t.ints.values_mut().for_each(&mut swap);
+            for (k, x) in t.hash.iter_mut() {
+                swap(x, k);
+            }
+            for x in t.arr.iter_mut() {
+                swap(x, "[array]");
+            }
+            for x in t.ints.values_mut() {
+                swap(x, "[int]");
+            }
         }
         for (_, sc) in s.heap.scopes.iter_mut().filter(|(id, _)| scopes.contains(id)) {
-            sc.vars.values_mut().for_each(&mut swap);
+            for (k, x) in sc.vars.iter_mut() {
+                swap(x, k);
+            }
         }
         let mut v = v;
-        swap(&mut v);
+        swap(&mut v, "[returned]");
         (s, v)
     }
 

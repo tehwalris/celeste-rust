@@ -301,7 +301,7 @@ pub trait Domain {
     /// by the player's collisions) decides per configuration instead of leaving
     /// every such decision undecided and its arms apart. Fresh, so nothing read
     /// it before; both values contain the atom's. `None` for anything else.
-    fn escaped_atom(&mut self, _b: &Self::Bool, _since: u32) -> Option<Self::Bool> {
+    fn escaped_atom(&mut self, _b: &Self::Bool, _since: u32, _origin: &str) -> Option<Self::Bool> {
         None
     }
 }
@@ -431,6 +431,9 @@ pub struct Symbolic {
     /// `escaped_atom`'s memo: the fork each escaped atom became, this frame.
     /// Cleared with `unknown_atoms` (atom ids restart per frame).
     pub escaped: rustc_hash::FxHashMap<NodeId, NodeId>,
+    /// What each fork `both_values` made was made for (a held trail, an
+    /// escaped atom's slot), for the kernel dump. Cleared with `escaped`.
+    pub fork_origins: Vec<(u8, String)>,
     /// `lane_independent`'s memo. Structural (a node's op and operands never
     /// change), so it outlives a frame.
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
@@ -509,10 +512,11 @@ impl Symbolic {
     /// A boolean every lane holds in BOTH values: a 2-way fork with no
     /// validity (every configuration applies to every lane), `choice > 0` over
     /// the whole grid - the held buttons' fork (`widen::fork_held_inputs`).
-    pub fn both_values(&mut self) -> NodeId {
+    pub fn both_values(&mut self, origin: &str) -> NodeId {
         let fork = self.forks;
         self.forks += 1;
         self.graph.set_fork_ways(fork, 2);
+        self.fork_origins.push((fork, origin.to_string()));
         let choices = self.graph.leaf(Op::Const(0, 1 << 16));
         let choice = self.graph.fold(Op::SplitInt(fork), vec![choices]);
         let zero = self.graph.leaf(Op::Const(0, 0));
@@ -1008,13 +1012,13 @@ impl Domain for Symbolic {
         self.unknown_atoms
     }
 
-    fn escaped_atom(&mut self, b: &NodeId, since: u32) -> Option<NodeId> {
+    fn escaped_atom(&mut self, b: &NodeId, since: u32, origin: &str) -> Option<NodeId> {
         match self.graph.get(*b).op {
             Op::UnknownBool(k) if k >= since => {
                 if let Some(f) = self.escaped.get(b) {
                     return Some(*f);
                 }
-                let f = self.both_values();
+                let f = self.both_values(origin);
                 self.escaped.insert(*b, f);
                 Some(f)
             }

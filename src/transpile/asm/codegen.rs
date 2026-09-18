@@ -1590,18 +1590,37 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
     // active: indices into `ivs`, kept sorted by end ascending.
     let mut active: Vec<usize> = Vec::new();
     let mut n_slots: u32 = 0;
+    // Spill SLOTS are reused like registers: a slot whose interval has ended
+    // goes back to `free_slots` with that end, and is handed only to an
+    // interval that starts after it. (A spilled interval can start before the
+    // current point: `steal` spills an active one.) Before this every spilled
+    // vreg had its own slot for the whole kernel: room (3,0)'s largest kernel
+    // had 1.36M slots, an 83 MB frame, for 173k fused nodes (2026-09-18).
+    let mut free_slots: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> = Default::default();
+    // Spilled intervals holding a slot: (end, slot).
+    let mut spilled: Vec<(u32, u32)> = Vec::new();
     // A spilled vreg's location. A rematerializable value (a load, or bits
     // of a load) costs no stack slot: it is recomputed from input memory at
     // each use instead of stored/reloaded. That is what keeps the 48 shared
     // `Bits` off the stack under the interleaved schedule.
-    let spill_loc = |vreg: Vreg, n_slots: &mut u32| -> Loc {
+    let spill_loc = |(vreg, start, end): (Vreg, u32, u32), n_slots: &mut u32, free_slots: &mut std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>, spilled: &mut Vec<(u32, u32)>| -> Loc {
         if remat[vreg as usize] {
-            Loc::Spill(u32::MAX)
-        } else {
-            let s = *n_slots;
-            *n_slots += 1;
-            Loc::Spill(s)
+            return Loc::Spill(u32::MAX);
         }
+        let s = match free_slots.peek() {
+            Some(std::cmp::Reverse((freed_at, s))) if *freed_at < start => {
+                let s = *s;
+                free_slots.pop();
+                s
+            }
+            _ => {
+                let s = *n_slots;
+                *n_slots += 1;
+                s
+            }
+        };
+        spilled.push((end, s));
+        Loc::Spill(s)
     };
 
     for cur in 0..ivs.len() {
@@ -1612,6 +1631,14 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
                 if let Loc::Reg(r) = home[ivs[ai].0 as usize] {
                     free.push(r);
                 }
+                false
+            } else {
+                true
+            }
+        });
+        spilled.retain(|&(end, s)| {
+            if end < start {
+                free_slots.push(std::cmp::Reverse((end, s)));
                 false
             } else {
                 true
@@ -1631,12 +1658,12 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
                     _ => unreachable!(),
                 };
                 home[vreg as usize] = Loc::Reg(stolen);
-                home[ivs[spill_ai].0 as usize] = spill_loc(ivs[spill_ai].0, &mut n_slots);
+                home[ivs[spill_ai].0 as usize] = spill_loc(ivs[spill_ai], &mut n_slots, &mut free_slots, &mut spilled);
                 active.pop();
                 active.push(cur);
                 active.sort_by_key(|&ai| ivs[ai].2);
             } else {
-                home[vreg as usize] = spill_loc(vreg, &mut n_slots);
+                home[vreg as usize] = spill_loc(ivs[cur], &mut n_slots, &mut free_slots, &mut spilled);
             }
         }
     }

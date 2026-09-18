@@ -1,16 +1,16 @@
-[ladder] h29 level 0 (Bits(0)): first win f29, marked 48 states (fingerprint bdea25e3aac13bfc), 51 edges read
+[ladder] h29 level 0 (Bits(0)): first win f29, marked 48 states (fingerprint bdea25e3aac13bfc), 47 edges read
 [ladder] h29 level 1 (Bits(1)): first win f29, marked 40 states (fingerprint f736b969bfa204bc), 39 edges read
 [ladder] h29 level 2 (Exact): NO WIN -> Refuted
-[ladder] h30 level 0 (Bits(0)): first win f29, marked 124 states (fingerprint 286dbcad7cf5155e), 154 edges read
+[ladder] h30 level 0 (Bits(0)): first win f29, marked 124 states (fingerprint 286dbcad7cf5155e), 146 edges read
 [ladder] h30 level 1 (Bits(1)): first win f29, marked 88 states (fingerprint 7b889c417b142941), 94 edges read
 [ladder] h30 level 2 (Exact): NO WIN -> Refuted
-[ladder] h31 level 0 (Bits(0)): first win f29, marked 297 states (fingerprint 255ae2a5b5c14b8a), 455 edges read
+[ladder] h31 level 0 (Bits(0)): first win f29, marked 297 states (fingerprint 255ae2a5b5c14b8a), 441 edges read
 [ladder] h31 level 1 (Bits(1)): first win f29, marked 181 states (fingerprint 0800bc6f27c630f0), 206 edges read
 [ladder] h31 level 2 (Exact): NO WIN -> Refuted
-[ladder] h32 level 0 (Bits(0)): first win f29, marked 961 states (fingerprint 5f49083b6dec5212), 1916 edges read
+[ladder] h32 level 0 (Bits(0)): first win f29, marked 961 states (fingerprint 5f49083b6dec5212), 1878 edges read
 [ladder] h32 level 1 (Bits(1)): first win f29, marked 543 states (fingerprint 8ffc01ba97e625c1), 677 edges read
 [ladder] h32 level 2 (Exact): NO WIN -> Refuted
-[ladder] h33 level 0 (Bits(0)): first win f29, marked 2853 states (fingerprint 01cff49816697096), 7923 edges read
-[ladder] h33 level 1 (Bits(1)): first win f29, marked 2418 states (fingerprint 0aba4819f2255b93), 4387 edges read
-[ladder] h33 level 2 (Exact): first win f33, marked 262 states (fingerprint 8ff4eba61f2ef2be), 277 edges read
+[ladder] h33 level 0 (Bits(0)): first win f29, marked 2853 states (fingerprint 01cff49816697096), 7837 edges read
+[ladder] h33 level 1 (Bits(1)): first win f29, marked 2418 states (fingerprint 0aba4819f2255b93), 4351 edges read
+[ladder] h33 level 2 (Exact): first win f33, marked 262 states (fingerprint 8ff4eba61f2ef2be), 297 edges read
 OPTIMAL win frame: 33

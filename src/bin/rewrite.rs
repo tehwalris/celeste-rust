@@ -148,6 +148,9 @@ enum Command {
         filter: Option<String>,
         #[arg(long, default_value_t = 0)]
         coarser: u8,
+        /// A level spec (`Level::parse`, e.g. `r0sxhfb`) instead of `--precision`.
+        #[arg(long)]
+        level: Option<String>,
         /// Record the frame's edges (into `<level dir>/bench-edges`, compacted
         /// and deleted per rep, both timed) - the search's forward path.
         #[arg(long, default_value_t = false)]
@@ -388,6 +391,17 @@ enum Command {
         frame: u32,
         #[arg(long, default_value_t = 1 << 24)]
         cap: usize,
+    },
+    /// Per player lane of one checkpointed frame: the set of fall floors its
+    /// player can touch within the frame (the hitbox swept by the lane's speed
+    /// hull, rounded out a pixel, plus `is_solid`'s probes: 3 px sideways for a
+    /// wall jump, 1 px up and down). How many distinct sets there are, and
+    /// which dominate: what a kernel dispatch keyed on it would need.
+    FloorReach {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        frame: u32,
     },
     /// Export a finished run for the web UI (`ui/`): per (horizon, level,
     /// frame) the states per player-position cell and the win cells, per
@@ -967,6 +981,7 @@ fn main() -> Result<()> {
             precision,
             filter,
             coarser,
+            level,
             edges,
         } => {
             use celeste_rust::frame::{forward_frame, load_frame, threads, Block, MarkFilter, Visited};
@@ -974,7 +989,10 @@ fn main() -> Result<()> {
             use celeste_rust::interpreter::abstraction::{set_level, Level, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
             let rung = |k: u8| Level::for_rem(if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) });
-            set_level(rung(precision));
+            match &level {
+                Some(spec) => set_level(Level::parse(spec).map_err(|e| anyhow::anyhow!(e))?),
+                None => set_level(rung(precision)),
+            }
             let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
             let dir = match &level_dir {
                 Some(d) => std::path::PathBuf::from(d),
@@ -2473,6 +2491,66 @@ fn main() -> Result<()> {
                 for d in &bucketed.at_rows {
                     println!("  realized at: {d}");
                 }
+            }
+        }
+        Command::FloorReach { level_dir, frame } => {
+            use celeste_rust::search::checkpoint::FrameFile;
+            use celeste_rust::search::pos_graph::{player_object, whole_range_col};
+            let ids = celeste_rust::compiled::ids();
+            let fdir = std::path::Path::new(&level_dir).join("frames").join(format!("f{frame:03}"));
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")))
+                .collect();
+            files.sort();
+            let (mut masks, mut floors, mut lanes) = (std::collections::BTreeMap::<u32, u64>::new(), Vec::<(i16, i16)>::new(), 0u64);
+            // A speed bound (raw 16.16) to whole pixels, rounded OUT one pixel.
+            let (lo_px, hi_px) = (|raw: i32| raw.div_euclid(1 << 16) - 1, |raw: i32| (raw as i64 + 0xffff).div_euclid(1 << 16) as i32 + 1);
+            for p in &files {
+                let ff = FrameFile::open(p)?;
+                let width = ff.width();
+                let mut lo = 0u32;
+                while lo < width {
+                    let hi = (lo + (1 << 20)).min(width);
+                    let Some(rt2) = ff.load_rows(&[lo..hi])? else { break };
+                    lo = hi;
+                    let Some(obj) = player_object(&rt2) else { continue };
+                    let axis = |o: u32, f: u32| rt2.obj_field_cell(o, f).and_then(|c| whole_range_col(&rt2, c));
+                    let (Some(xs), Some(ys)) = (axis(obj, ids.f_x), axis(obj, ids.f_y)) else { continue };
+                    let hulls = rt2.speed_hulls(ids);
+                    let here: Vec<(i16, i16)> = rt2
+                        .objects_of_type(ids, ids.g_fall_floor)
+                        .into_iter()
+                        .filter_map(|f| Some((axis(f, ids.f_x)?[0].0, axis(f, ids.f_y)?[0].0)))
+                        .collect();
+                    if floors.is_empty() {
+                        floors = here.clone();
+                    }
+                    for l in 0..rt2.width {
+                        let (sxa, sxb, sya, syb) = match hulls.as_ref().map(|h| h[l]) {
+                            Some([xa, xb, ya, yb]) => (lo_px(xa), hi_px(xb), lo_px(ya), hi_px(yb)),
+                            None => (-7, 7, -7, 7),
+                        };
+                        let (x0, x1) = (xs[l].0 as i32 + 1 + sxa.min(0) - 3, xs[l].1 as i32 + 7 + sxb.max(0) + 3);
+                        let (y0, y1) = (ys[l].0 as i32 + 3 + sya.min(0) - 1, ys[l].1 as i32 + 8 + syb.max(0) + 1);
+                        let mut mask = 0u32;
+                        for (k, &(fx, fy)) in here.iter().enumerate() {
+                            let (fx, fy) = (fx as i32, fy as i32);
+                            if x0 < fx + 8 && fx < x1 && y0 < fy + 8 && fy < y1 {
+                                mask |= 1 << k;
+                            }
+                        }
+                        *masks.entry(mask).or_default() += 1;
+                        lanes += 1;
+                    }
+                }
+            }
+            println!("[floor-reach] f{frame}: {lanes} player lanes, {} distinct floor sets; floors {floors:?}", masks.len());
+            let mut by_count: Vec<(u32, u64)> = masks.into_iter().collect();
+            by_count.sort_by(|a, b| b.1.cmp(&a.1));
+            for (mask, n) in by_count.iter().take(16) {
+                let set: Vec<(i16, i16)> = (0..floors.len()).filter(|k| mask & (1 << k) != 0).map(|k| floors[k]).collect();
+                println!("[floor-reach]   {n:>9} lanes ({:.1}%): {} floors {set:?}", *n as f64 * 100.0 / lanes.max(1) as f64, set.len());
             }
         }
         Command::ColCensus { level_dir, frame, cap } => {

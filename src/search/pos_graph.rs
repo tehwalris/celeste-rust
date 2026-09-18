@@ -115,7 +115,7 @@ pub(crate) fn whole_i16_col(rt2: &Rt2, cell: u32) -> Option<Vec<i16>> {
 /// the bucket's corners for an interval (the position rung); `None` if any
 /// lane is neither. The win tests use this: a bucket wins where the
 /// target lies inside it.
-pub(crate) fn whole_range_col(rt2: &Rt2, cell: u32) -> Option<Vec<(i16, i16)>> {
+pub fn whole_range_col(rt2: &Rt2, cell: u32) -> Option<Vec<(i16, i16)>> {
     let one = |v: AV| -> Option<(i16, i16)> {
         match v {
             AV::Num(n) => Some((n.whole_part_as_i16(), n.whole_part_as_i16())),

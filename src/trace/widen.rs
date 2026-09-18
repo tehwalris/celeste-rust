@@ -740,7 +740,7 @@ pub fn fork_held_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()
             let Some(Value::Bool(_)) = iface::get(st, &p) else {
                 bail!("{}: not a boolean", iface::show(&p));
             };
-            let held = d.both_values();
+            let held = d.both_values(f);
             iface::set(st, &p, Value::Bool(held))?;
         }
     }
