@@ -28,6 +28,8 @@ celeste-interp = { path = "crates/celeste-interp" }
 celeste-engine = { path = "crates/celeste-engine" }
 celeste-names = { path = "crates/celeste-names" }
 mimalloc = { version = "0.1", default-features = false }
+# `mi_option_set`: the kernel build's purge delay (`compiled::asm_kernel`).
+libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 anyhow = "1.0.62"
 im = { version = "15.1.0", features = ["serde"] }
 lazy_static = "1.4.0"

@@ -278,6 +278,26 @@ impl<D: Domain> Clone for Scope<D> {
     }
 }
 
+impl<D: Domain> PartialEq for Table<D> {
+    fn eq(&self, o: &Self) -> bool {
+        self.hash == o.hash && self.arr == o.arr && self.ints == o.ints
+    }
+}
+
+impl<D: Domain> PartialEq for Scope<D> {
+    fn eq(&self, o: &Self) -> bool {
+        self.parent == o.parent && self.vars == o.vars
+    }
+}
+
+impl<D: Domain> Heap<D> {
+    /// Every object alike BY ID: two heaps of one fork that neither side has
+    /// written to since (`state::same_heap`).
+    pub fn same_as(&self, o: &Self) -> bool {
+        self.tables == o.tables && self.scopes == o.scopes && self.closures == o.closures
+    }
+}
+
 /// A closure object: which function body, and the scope it captured.
 /// Both are immutable, so unlike a table there is nothing here to merge -
 /// it is in the heap for its IDENTITY.

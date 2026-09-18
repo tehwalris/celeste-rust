@@ -1622,7 +1622,7 @@ impl Registry {
             n_workers,
         );
         eprintln!("[asm build]   phases, summed over workers and concurrent builds: {}", crate::transpile::lower::build_profile());
-        Ok(Registry { kernels, exact_boundary, w, grid: crate::trace::kernel::region_grid() })
+        Ok(Registry { kernels, exact_boundary, w, grid: crate::trace::kernel::region_grid_for(opts)? })
     }
 }
 
@@ -1910,61 +1910,173 @@ fn dump_kernel(
             }
         }
     }
+    // CELESTE_KERNEL_SPLIT=1: per outcome and per fork its bodies enumerate, up
+    // to 20 body pairs that differ ONLY in that fork (same button rep), how many
+    // fields differ, and how many of those are `Sel(c, x, y)` with one arm the
+    // other body's value - what splitting the body on `c` and fusing would take
+    // away.
+    if std::env::var_os("CELESTE_KERNEL_SPLIT").is_some() {
+        for oi in 0..r.bound.outcomes.len() {
+            let mine: Vec<&crate::trace::emit::AsmBody> = bodies.iter().filter(|b| b.outcome == oi).collect();
+            let Some(first) = mine.first() else { continue };
+            let nf = r.bound.outcomes[oi].outputs.len();
+            for d in (0..first.splits.len()).filter(|&d| mine.iter().any(|b| b.splits[d] != first.splits[d])) {
+                let (mut pairs, mut differing, mut sel_else_other) = (0usize, 0usize, 0usize);
+                'pairs: for (i, a) in mine.iter().enumerate() {
+                    for b in &mine[i + 1..] {
+                        let one_fork = a.frees == b.frees && a.splits.iter().zip(&b.splits).enumerate().all(|(x, (p, q))| (x == d) != (p == q));
+                        if !one_fork {
+                            continue;
+                        }
+                        pairs += 1;
+                        for j in 0..nf {
+                            let (x, y) = (a.roots[j], b.roots[j]);
+                            if x == y {
+                                continue;
+                            }
+                            differing += 1;
+                            let arm_is = |n: crate::transpile::graph::NodeId, other: crate::transpile::graph::NodeId| {
+                                let node = fused.get(n);
+                                node.op == Op::Sel && (node.args[1] == other || node.args[2] == other)
+                            };
+                            if arm_is(x, y) || arm_is(y, x) {
+                                sel_else_other += 1;
+                            }
+                        }
+                        if pairs >= 20 {
+                            break 'pairs;
+                        }
+                    }
+                }
+                if pairs == 0 {
+                    continue;
+                }
+                let origin = r.frame.fork_origins.iter().find(|(x, _)| *x as usize == d).map_or("move/table", |(_, o)| o.as_str());
+                eprintln!(
+                    "[kernel split] outcome {oi} ({} bodies): fork {d} ({origin}): {pairs} pairs, {:.1} fields differ per pair, {:.0}% of them Sel with the other body's value as an arm",
+                    mine.len(),
+                    differing as f64 / pairs as f64,
+                    sel_else_other as f64 * 100.0 / differing.max(1) as f64
+                );
+            }
+        }
+    }
     // CELESTE_KERNEL_DIFF=<outcome>: two of its bodies with the same button rep
     // whose fork configurations differ in ONE fork, and where their fields
     // differ, walked down to the nodes that actually diverge.
-    if let Some(want) = std::env::var("CELESTE_KERNEL_DIFF").ok().and_then(|v| v.parse::<usize>().ok()) {
+    // `<outcome>`: the two bodies differ in one fork; `<outcome>:<bit>`: in that
+    // button alone, forks equal (bits 0..5 = left, right, up, down, jump, dash).
+    if let Some(spec) = std::env::var("CELESTE_KERNEL_DIFF").ok() {
+        // `<outcome>@<fork>`: one fork apart, in that fork.
+        let (spec, only_fork) = match spec.split_once('@') {
+            Some((s, f)) => (s.to_string(), f.parse::<usize>().ok()),
+            None => (spec.clone(), None),
+        };
+        let (want, button) = match spec.split_once(':') {
+            Some((o, b)) => (o.parse::<usize>().ok(), b.parse::<u8>().ok()),
+            None => (spec.parse::<usize>().ok(), None),
+        };
+        let want = want.unwrap_or(usize::MAX);
         let mine: Vec<&crate::trace::emit::AsmBody> = bodies.iter().filter(|b| b.outcome == want).collect();
         let pair = mine.iter().enumerate().find_map(|(i, a)| {
-            mine[i + 1..].iter().find(|b| b.frees == a.frees && a.splits.iter().zip(&b.splits).filter(|(x, y)| x != y).count() == 1).map(|b| (*a, *b))
+            mine[i + 1..]
+                .iter()
+                .find(|b| match button {
+                    Some(bit) => a.splits == b.splits && a.frees ^ b.frees == 1 << bit,
+                    None => {
+                        let apart: Vec<usize> = a.splits.iter().zip(&b.splits).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| i).collect();
+                        a.frees == b.frees && apart.len() == 1 && only_fork.is_none_or(|f| apart[0] == f)
+                    }
+                })
+                .map(|b| (*a, *b))
         });
         match pair {
-            None => eprintln!("[kernel diff] outcome {want}: no two bodies differ in exactly one fork"),
+            None => eprintln!("[kernel diff] outcome {want}: no two bodies differ in exactly {}", if button.is_some() { "that button" } else { "one fork" }),
             Some((a, b)) => {
-                let d = a.splits.iter().zip(&b.splits).position(|(x, y)| x != y).unwrap_or(0);
-                let origin = r.frame.fork_origins.iter().find(|(x, _)| *x as usize == d).map_or("-", |(_, o)| o.as_str());
+                let what = match button {
+                    Some(bit) => format!("button bit {bit}, reps {:#08b} against {:#08b}", a.frees, b.frees),
+                    None => {
+                        let d = a.splits.iter().zip(&b.splits).position(|(x, y)| x != y).unwrap_or(0);
+                        let origin = r.frame.fork_origins.iter().find(|(x, _)| *x as usize == d).map_or("-", |(_, o)| o.as_str());
+                        format!("button rep {}: fork {d} ({origin}) = {} against {}", a.frees, a.splits[d], b.splits[d])
+                    }
+                };
                 let nf = r.bound.outcomes[want].outputs.len();
                 let differing: Vec<usize> = (0..nf).filter(|&j| a.roots[j] != b.roots[j]).collect();
                 eprintln!(
-                    "[kernel diff] outcome {want}, button rep {}: fork {d} ({origin}) = {} against {}; {} of {nf} fields differ, live {}, ok {}",
-                    a.frees,
-                    a.splits[d],
-                    b.splits[d],
+                    "[kernel diff] outcome {want}, {what}; {} of {nf} fields differ, live {}, ok {}",
                     differing.len(),
                     if a.roots[nf + 1] == b.roots[nf + 1] { "same" } else { "differs" },
                     if a.roots[nf] == b.roots[nf] { "same" } else { "differs" },
                 );
-                // A node as an expression, `depth` levels deep.
-                fn show(g: &crate::transpile::graph::Graph, n: crate::transpile::graph::NodeId, depth: usize) -> String {
+                type Memo = std::collections::HashMap<crate::transpile::graph::NodeId, Option<crate::transpile::graph::Pieces>>;
+                type Seeds = std::collections::HashMap<crate::transpile::graph::NodeId, (i64, i64)>;
+                // The region's seeded cells, by node of the fused graph: what the
+                // range analysis starts from.
+                let seeds: Seeds = (0..fused.len() as crate::transpile::graph::NodeId)
+                    .filter_map(|n| match fused.get(n).op {
+                        Op::Cell(c) => r.lowered.ranges.get(&c).map(|(lo, hi)| (n, (*lo as i64, *hi as i64))),
+                        _ => None,
+                    })
+                    .collect();
+                let mut memo: Memo = Default::default();
+                // A node as an expression, `depth` levels deep; a number with its
+                // static range's hull in pixels, `{lo..hi}`, where it has one.
+                fn show(g: &crate::transpile::graph::Graph, seeds: &Seeds, memo: &mut Memo, n: crate::transpile::graph::NodeId, depth: usize) -> String {
                     let node = g.get(n);
-                    let op = format!("{:?}", node.op);
+                    let mut op = format!("{:?}", node.op);
+                    if !matches!(node.op, Op::Const(..)) {
+                        if let Some(p) = crate::transpile::graph::pieces_of(g, seeds, memo, n) {
+                            if let (Some(lo), Some(hi)) = (p.first(), p.last()) {
+                                op = format!("{op}{{{}..{}}}", lo.0 as f64 / 65536.0, hi.1 as f64 / 65536.0);
+                            }
+                        }
+                    }
                     if node.args.is_empty() || depth == 0 {
                         return if node.args.is_empty() { op } else { format!("{op}(..)") };
                     }
-                    let args: Vec<String> = node.args.iter().map(|x| show(g, *x, depth - 1)).collect();
+                    let args: Vec<String> = node.args.iter().map(|x| show(g, seeds, memo, *x, depth - 1)).collect();
                     format!("{op}({})", args.join(", "))
                 }
                 // Down both expressions while they agree on the op, to where they diverge.
-                fn diverge(g: &crate::transpile::graph::Graph, x: crate::transpile::graph::NodeId, y: crate::transpile::graph::NodeId, depth: usize, out: &mut Vec<String>) {
+                fn diverge(g: &crate::transpile::graph::Graph, seeds: &Seeds, memo: &mut Memo, x: crate::transpile::graph::NodeId, y: crate::transpile::graph::NodeId, depth: usize, out: &mut Vec<String>) {
                     if x == y || out.len() >= 6 {
                         return;
                     }
                     let (nx, ny) = (g.get(x), g.get(y));
                     if nx.op != ny.op || nx.args.len() != ny.args.len() || depth == 0 {
-                        out.push(format!("{}  AGAINST  {}", show(g, x, 3), show(g, y, 3)));
+                        let deep = std::env::var("CELESTE_KERNEL_DIFF_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+                        out.push(format!("{}  AGAINST  {}", show(g, seeds, memo, x, deep), show(g, seeds, memo, y, deep)));
                         return;
                     }
                     for (p, q) in nx.args.iter().zip(&ny.args) {
-                        diverge(g, *p, *q, depth - 1, out);
+                        diverge(g, seeds, memo, *p, *q, depth - 1, out);
                     }
                 }
+                // `CELESTE_KERNEL_CONE=N`: the second body's field as a DAG, its
+                // first N nodes breadth-first, each once with its range.
+                let cone = std::env::var("CELESTE_KERNEL_CONE").ok().and_then(|v| v.parse::<usize>().ok());
                 for &j in differing.iter().take(4) {
                     let path = r.frame.outs.get(want).and_then(|o| o.fields.get(j)).map(|f| crate::trace::iface::show(&f.0)).unwrap_or_else(|| format!("field {j}"));
                     let mut out = Vec::new();
-                    diverge(fused, a.roots[j], b.roots[j], 12, &mut out);
+                    diverge(fused, &seeds, &mut memo, a.roots[j], b.roots[j], 12, &mut out);
                     eprintln!("[kernel diff]   {path}:");
                     for line in out {
                         eprintln!("[kernel diff]     {line}");
+                    }
+                    if let Some(max) = cone {
+                        // `CELESTE_KERNEL_CONE_ROOT=<node>`: from that node instead.
+                        let root = std::env::var("CELESTE_KERNEL_CONE_ROOT").ok().and_then(|v| v.parse().ok()).unwrap_or(b.roots[j]);
+                        let (mut queue, mut seen) = (std::collections::VecDeque::from([root]), std::collections::HashSet::new());
+                        while let Some(n) = queue.pop_front() {
+                            if seen.len() >= max || !seen.insert(n) {
+                                continue;
+                            }
+                            let node = fused.get(n);
+                            let args: Vec<String> = node.args.iter().map(|x| format!("#{x}")).collect();
+                            eprintln!("[kernel cone]     #{n} = {}({})", show(fused, &seeds, &mut memo, n, 0).trim_end_matches("(..)"), args.join(", "));
+                            queue.extend(node.args.iter().copied());
+                        }
                     }
                 }
             }
@@ -2444,9 +2556,55 @@ pub fn prebuild(levels: &[crate::interpreter::abstraction::Level]) {
     eprintln!("[asm build] {} levels prebuilt in {:.1} s", levels.len(), t.elapsed().as_secs_f64());
 }
 
+/// THE KERNEL BUILD'S PURGE DELAY (2026-09-18). `safe-run.sh` has mimalloc
+/// return freed pages at once (`MIMALLOC_PURGE_DELAY=0`, for the search's
+/// resident memory), and under the build's tracer threads those purges were a
+/// third of the room walk, in TLB shootdowns (room (3,0) on an 8 px grid: the
+/// walk 26.0 s, 16.5 s with a 1 s delay). While any kernel set builds, purges
+/// wait a second; the process's own setting is back when the last build ends.
+struct BuildPurgeDelay;
+
+/// Builds in progress, and the purge delay they found.
+static BUILDS: std::sync::Mutex<(usize, std::os::raw::c_long)> = std::sync::Mutex::new((0, 0));
+
+/// `mi_option_purge_delay` in mimalloc.h's `mi_option_t`, right after
+/// `mi_option_eager_commit_delay` (14); libmimalloc-sys 0.1.44 binds no
+/// constant for it. Checked against the environment's value in `start`.
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+impl BuildPurgeDelay {
+    fn start() -> BuildPurgeDelay {
+        let mut b = BUILDS.lock().unwrap();
+        if b.0 == 0 {
+            // SAFETY: plain option reads and writes, mimalloc's documented API.
+            let before = unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) };
+            if let Some(env) = std::env::var("MIMALLOC_PURGE_DELAY").ok().and_then(|v| v.parse::<std::os::raw::c_long>().ok()) {
+                assert_eq!(before, env, "mimalloc option {MI_OPTION_PURGE_DELAY} is not the purge delay MIMALLOC_PURGE_DELAY set");
+            }
+            b.1 = before;
+            if (0..1000).contains(&before) {
+                unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 1000) };
+            }
+        }
+        b.0 += 1;
+        BuildPurgeDelay
+    }
+}
+
+impl Drop for BuildPurgeDelay {
+    fn drop(&mut self) {
+        let mut b = BUILDS.lock().unwrap();
+        b.0 -= 1;
+        if b.0 == 0 {
+            unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, b.1) };
+        }
+    }
+}
+
 fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Option<Registry> {
     use crate::interpreter::abstraction::RemPrecision;
     use crate::trace::shapes::WalkOpts;
+    let _purge = BuildPurgeDelay::start();
     let rem = level.rem;
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
     let mode = super::dispatch::traced_mode_for(rem);
@@ -2474,6 +2632,10 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
     match built {
         Ok(reg) => {
             eprintln!("ASM kernels ENABLED ({mode:?}, {level}): {} start-room shapes assembled", reg.len());
+            if let Some(only) = crate::trace::kernel::kernel_only() {
+                eprintln!("[kernel only] built the kernels of {only:?}; exiting (CELESTE_KERNEL_ONLY)");
+                std::process::exit(0);
+            }
             Some(reg)
         }
         Err(e) => panic!("building ASM kernels for {rem:?}: {e:#}"),

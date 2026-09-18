@@ -24,22 +24,40 @@ impl CartData {
         // player spawn standing on it - the smallest room with a player, for
         // counting what its kernels should be. A DIFFERENT GAME: nothing it
         // reports is an answer for the real cart.
+        // `"x,y;tx:ty,..."` also places a fall floor (`fall_floor.tile`) at
+        // each tile (tx, ty) of that room.
         if let Ok(spec) = std::env::var("CELESTE_EXPERIMENT_FLAT_ROOM") {
             const SOLID: u8 = 32; // flag bit 0
             const SPAWN: u8 = 1; // `player_spawn.tile`
-            let (rx, ry) = spec
+            const FALL_FLOOR: u8 = 23;
+            let (room, floors) = spec.split_once(';').unwrap_or((spec.as_str(), ""));
+            let floors: Vec<(usize, usize)> = floors
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.split_once(':').and_then(|(a, b)| Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?))).filter(|&(x, y)| x < 16 && y < 16))
+                .collect::<Option<_>>()
+                .ok_or_else(|| anyhow!("CELESTE_EXPERIMENT_FLAT_ROOM={spec:?}: floors are \"tx:ty\" tiles with tx, ty < 16"))?;
+            let (rx, ry) = room
                 .split_once(',')
                 .and_then(|(a, b)| Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?)))
                 .filter(|&(x, y)| x < 8 && y < 4)
                 .ok_or_else(|| anyhow!("CELESTE_EXPERIMENT_FLAT_ROOM={spec:?}: expected a room \"x,y\" with x < 8, y < 4"))?;
             for ty in 0..16 {
                 for tx in 0..16 {
-                    let tile = if ty == 15 { SOLID } else if (tx, ty) == (4, 14) { SPAWN } else { 0 };
+                    let tile = if ty == 15 {
+                        SOLID
+                    } else if (tx, ty) == (4, 14) {
+                        SPAWN
+                    } else if floors.contains(&(tx, ty)) {
+                        FALL_FLOOR
+                    } else {
+                        0
+                    };
                     cart.map_data[(ry * 16 + ty) * 128 + rx * 16 + tx] = tile;
                 }
             }
             static BANNER: std::sync::Once = std::sync::Once::new();
-            BANNER.call_once(|| eprintln!("[experiment] FLAT ROOM ({rx},{ry}): an empty room, a solid floor and the spawn; this is not the real game"));
+            BANNER.call_once(|| eprintln!("[experiment] FLAT ROOM ({rx},{ry}): an empty room, a solid floor, the spawn and fall floors at tiles {floors:?}; this is not the real game"));
         }
         Ok(cart)
     }

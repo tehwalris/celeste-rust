@@ -301,8 +301,13 @@ pub trait Domain {
     /// by the player's collisions) decides per configuration instead of leaving
     /// every such decision undecided and its arms apart. Fresh, so nothing read
     /// it before; both values contain the atom's. `None` for anything else.
-    fn escaped_atom(&mut self, _b: &Self::Bool, _since: u32, _origin: &str) -> Option<Self::Bool> {
+    fn escaped_atom(&mut self, _b: &Self::Bool, _since: u32, _origin: &dyn Fn(&Self) -> String) -> Option<Self::Bool> {
         None
+    }
+
+    /// A number for a diagnostic (a fork's origin): its value if known.
+    fn describe_num(&self, n: &Self::Num) -> String {
+        format!("{n:?}")
     }
 }
 
@@ -932,10 +937,16 @@ impl Domain for Symbolic {
         if self.ranges.is_empty() {
             return self.move_ways();
         }
+        // At most `move_ways`: the static range is over ALL lanes, and one
+        // lane's interval spans at most that many floors. A region kernel's
+        // speed range [-S, S] is 2S + 1 floors wide while each lane's speed is
+        // exact, and taking the range's width made the move forks 13-way
+        // (room (3,0) square (5,13) on an 8 px grid: 1,236 bodies -> 35,502,
+        // 2026-09-18). Too small an arity declines loudly (`SplitOk`).
         match self.range_of(*v) {
             Some(ps) => {
                 let sh = 16 - self.graph.fork_bits() as u32;
-                ps.iter().map(|p| (p.1 >> sh) - (p.0 >> sh) + 1).max().unwrap_or(1).clamp(1, crate::transpile::graph::MAX_WAYS as i64) as u8
+                ps.iter().map(|p| (p.1 >> sh) - (p.0 >> sh) + 1).max().unwrap_or(1).clamp(1, self.move_ways() as i64) as u8
             }
             None => self.move_ways(),
         }
@@ -1026,13 +1037,22 @@ impl Domain for Symbolic {
         self.unknown_atoms
     }
 
-    fn escaped_atom(&mut self, b: &NodeId, since: u32, origin: &str) -> Option<NodeId> {
+    fn describe_num(&self, n: &NodeId) -> String {
+        match self.graph.get(*n).op {
+            Op::Const(lo, hi) if lo == hi => format!("{}", lo as f64 / 65536.0),
+            Op::Const(lo, hi) => format!("{}..{}", lo as f64 / 65536.0, hi as f64 / 65536.0),
+            _ => "?".to_string(),
+        }
+    }
+
+    fn escaped_atom(&mut self, b: &NodeId, since: u32, origin: &dyn Fn(&Self) -> String) -> Option<NodeId> {
         match self.graph.get(*b).op {
             Op::UnknownBool(k) if k >= since => {
                 if let Some(f) = self.escaped.get(b) {
                     return Some(*f);
                 }
-                let f = self.both_values(origin);
+                let name = origin(self);
+                let f = self.both_values(&name);
                 self.escaped.insert(*b, f);
                 Some(f)
             }

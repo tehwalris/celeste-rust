@@ -1597,13 +1597,15 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
     // vreg had its own slot for the whole kernel: room (3,0)'s largest kernel
     // had 1.36M slots, an 83 MB frame, for 173k fused nodes (2026-09-18).
     let mut free_slots: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> = Default::default();
-    // Spilled intervals holding a slot: (end, slot).
-    let mut spilled: Vec<(u32, u32)> = Vec::new();
+    // Spilled intervals holding a slot: (end, slot), earliest end first. A
+    // heap, not a list scanned per interval: the scan was quadratic, over a
+    // minute of one core for room (3,0)'s spawn kernel (2026-09-18).
+    let mut spilled: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> = Default::default();
     // A spilled vreg's location. A rematerializable value (a load, or bits
     // of a load) costs no stack slot: it is recomputed from input memory at
     // each use instead of stored/reloaded. That is what keeps the 48 shared
     // `Bits` off the stack under the interleaved schedule.
-    let spill_loc = |(vreg, start, end): (Vreg, u32, u32), n_slots: &mut u32, free_slots: &mut std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>, spilled: &mut Vec<(u32, u32)>| -> Loc {
+    let spill_loc = |(vreg, start, end): (Vreg, u32, u32), n_slots: &mut u32, free_slots: &mut std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>, spilled: &mut std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>| -> Loc {
         if remat[vreg as usize] {
             return Loc::Spill(u32::MAX);
         }
@@ -1619,7 +1621,7 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
                 s
             }
         };
-        spilled.push((end, s));
+        spilled.push(std::cmp::Reverse((end, s)));
         Loc::Spill(s)
     };
 
@@ -1636,14 +1638,13 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
                 true
             }
         });
-        spilled.retain(|&(end, s)| {
-            if end < start {
-                free_slots.push(std::cmp::Reverse((end, s)));
-                false
-            } else {
-                true
+        while let Some(&std::cmp::Reverse((end, s))) = spilled.peek() {
+            if end >= start {
+                break;
             }
-        });
+            spilled.pop();
+            free_slots.push(std::cmp::Reverse((end, s)));
+        }
         if let Some(r) = free.pop() {
             home[vreg as usize] = Loc::Reg(r);
             active.push(cur);

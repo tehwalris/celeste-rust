@@ -190,22 +190,45 @@ impl<D: Domain> State<D> {
 /// t applies. This needs the two guards to be disjoint; see the invariant
 /// on `State::guard`.
 pub fn merge<D: Domain>(d: &mut D, t: &State<D>, f: &State<D>) -> Result<Option<Merged<D>>> {
-    merge_inner(d, (t, &Canon::of(t)?), (f, &Canon::of(f)?), None)
+    if same_heap(t, f) {
+        return merge_inner(d, t, f, Sides::Same, None);
+    }
+    merge_inner(d, t, f, Sides::Canon(&Canon::of(t)?, &Canon::of(f)?), None)
 }
 
 /// `merge` on a GIVEN condition instead of the separating decision: what a
 /// literal split's fragments rejoin on (`Interp::rejoin_fragments`), whose
 /// paths do not diverge at a decision.
 pub fn merge_on<D: Domain>(d: &mut D, t: &State<D>, f: &State<D>, cond: D::Bool) -> Result<Option<Merged<D>>> {
-    merge_inner(d, (t, &Canon::of(t)?), (f, &Canon::of(f)?), Some(cond))
+    if same_heap(t, f) {
+        return merge_inner(d, t, f, Sides::Same, Some(cond));
+    }
+    merge_inner(d, t, f, Sides::Canon(&Canon::of(t)?, &Canon::of(f)?), Some(cond))
 }
 
-/// `merge` with both sides' `Canon` already computed: `Interp::collapse`
-/// tries many pairs of the same outcomes, and computing the shapes and orders
-/// per attempt was most of a trace after the copies went (room (3,0),
-/// 2026-09-17).
-pub fn merge_canon<D: Domain>(d: &mut D, t: (&State<D>, &Canon), f: (&State<D>, &Canon)) -> Result<Option<Merged<D>>> {
-    merge_inner(d, t, f, None)
+/// `merge` with the sides already paired: `Interp::collapse` tries many pairs
+/// of the same outcomes, and computing the shapes and orders per attempt was
+/// most of a trace after the copies went (room (3,0), 2026-09-17).
+pub fn merge_canon<D: Domain>(d: &mut D, t: &State<D>, f: &State<D>, sides: Sides<'_>) -> Result<Option<Merged<D>>> {
+    merge_inner(d, t, f, sides, None)
+}
+
+/// How a merge pairs its two sides' objects: by their `Canon`s, or - where
+/// both hold the same heap by id (`same_heap`) - each object with itself.
+#[derive(Clone, Copy)]
+pub enum Sides<'c> {
+    Same,
+    Canon(&'c Canon, &'c Canon),
+}
+
+/// The two states hold the same heap, object by object BY ID, with the same
+/// roots: they forked and neither wrote since - the arms of `a and b` where
+/// `b` only reads. Every slot then pairs with an equal one, so the merge has
+/// no shape to compare and nothing to join, and computing both `Canon`s was
+/// a third of the room walk (room (3,0), 2026-09-18). Anything else
+/// (a temporary allocated, a different numbering) pairs by `Canon`.
+pub fn same_heap<D: Domain>(t: &State<D>, f: &State<D>) -> bool {
+    t.globals == f.globals && t.scope == f.scope && t.stack == f.stack && t.frag == f.frag && t.heap.same_as(&f.heap)
 }
 
 /// What a merge compares and pairs a state by: its shape, and the canonical
@@ -237,8 +260,9 @@ impl Canon {
 /// cannot make two states look different.
 fn merge_inner<D: Domain>(
     d: &mut D,
-    (t, ct): (&State<D>, &Canon),
-    (f, cf): (&State<D>, &Canon),
+    t: &State<D>,
+    f: &State<D>,
+    sides: Sides<'_>,
     over: Option<D::Bool>,
 ) -> Result<Option<Merged<D>>> {
     // Two fragments of one literal split are different successors until the
@@ -246,7 +270,7 @@ fn merge_inner<D: Domain>(
     if t.frag != f.frag {
         return Ok(None);
     }
-    if ct.shape != cf.shape {
+    if matches!(sides, Sides::Canon(ct, cf) if ct.shape != cf.shape) {
         return Ok(None);
     }
 
@@ -275,7 +299,11 @@ fn merge_inner<D: Domain>(
     // Canonical order is still what PAIRS the two sides, so allocation
     // history cannot make equal states look different. It just is not
     // what the result is numbered by.
-    let (t_order, f_order) = (&ct.order, &cf.order);
+    // Same heap: every slot pairs with an equal one, nothing to walk.
+    let (t_order, f_order): (&[Root], &[Root]) = match sides {
+        Sides::Same => (&[], &[]),
+        Sides::Canon(ct, cf) => (&ct.order, &cf.order),
+    };
     if t_order.len() != f_order.len() {
         // Equal shapes should guarantee this; if it ever fires, the shape
         // is not describing what merging actually depends on.

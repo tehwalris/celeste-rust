@@ -433,8 +433,13 @@ same run's `posgraph` line must equal `gates/posgraph_room10_f044.txt`, and
 `rewrite search --from 29 --to 35 --maxk 1 --win-at 9,101` must reproduce
 `gates/marks_room10_win9-101_h29-33.txt` (the backward's marked sets per
 horizon and level, ending in `OPTIMAL win frame: 33`; the same
-fingerprints under `CELESTE_BACKWARD=kernel`, whose lines end in
-"re-runs" instead of "edges read").
+fingerprints under `CELESTE_BACKWARD=kernel`). Compare with the work count
+stripped - `grep -E '^\[ladder\] h[0-9]+ level|^OPTIMAL' log | sed -E
+'s/, [0-9]+ (edges read|re-runs)$//' | diff - gates/marks_...` - because
+"edges read" counts RECORDS, and how lanes group into records depends on
+thread scheduling: two runs of one binary read 1850 and 1878 at h32
+(2026-09-18). The edge-count "re-pins" of `ffe939e` and `9921c0d` were that
+noise.
 
 Re-pinned 2026-09-16 (`4e2d2e9`) when `rnd` became a builtin global. That
 added one global to every state, so row keys, and with them the ckhash and

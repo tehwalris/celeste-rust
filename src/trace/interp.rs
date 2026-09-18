@@ -24,7 +24,7 @@ use crate::pico8_num::Pico8Num as P8;
 
 use super::domain::{refuse_unknown, Arith, Cmp, Domain, Fun1, Fun2};
 use super::heap::{BodyId, TableId, Value};
-use super::state::{merge_canon, split, Canon, State};
+use super::state::{merge_canon, split, Canon, Sides, State};
 
 pub enum Flow<D: Domain> {
     Normal,
@@ -606,19 +606,19 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// the frontier stays at the number of genuinely different futures
     /// rather than the product of every branch taken to get there.
     pub fn collapse(&mut self, mut outs: Outcome<D>) -> Result<Outcome<D>> {
-        let mut pairing = Pairing::new(outs.iter().map(|o| &o.0))?;
+        let mut pairing = Pairing::new(outs.len());
         'again: loop {
             // Siblings first (longest shared decision prefix), so that a
             // merge selects on the decision that separates its two sides
             // rather than falling back to the full guard - see
             // `State::path` and `merge_order`.
             let states: Vec<&State<D>> = outs.iter().map(|o| &o.0).collect();
+            pairing.prepare(&states)?;
             let pairs = super::state::merge_order(&states, |i, j| {
                 pairing.may_merge(i, j) && self.can_join(&outs[i].1, &outs[j].1)
             });
             for (i, j) in pairs {
-                let (t, f) = (pairing.side(i, &outs[i].0), pairing.side(j, &outs[j].0));
-                let Some(m) = merge_canon(&mut self.d, t, f)? else {
+                let Some(m) = merge_canon(&mut self.d, &outs[i].0, &outs[j].0, pairing.sides(i, j))? else {
                     pairing.refuse(i, j);
                     continue;
                 };
@@ -637,7 +637,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 // j > i, so drop the later index first.
                 outs.remove(j);
                 outs.remove(i);
-                pairing.replace(i, j, &state)?;
+                pairing.replace(i, j);
                 outs.push((state, fl));
                 continue 'again;
             }
@@ -652,15 +652,15 @@ impl<'a, D: Domain> Interp<'a, D> {
         &mut self,
         mut outs: Multi<D, Value<D>>,
     ) -> Result<Multi<D, Value<D>>> {
-        let mut pairing = Pairing::new(outs.iter().map(|o| &o.0))?;
+        let mut pairing = Pairing::new(outs.len());
         'again: loop {
             let states: Vec<&State<D>> = outs.iter().map(|o| &o.0).collect();
+            pairing.prepare(&states)?;
             let pairs = super::state::merge_order(&states, |i, j| {
                 pairing.may_merge(i, j) && joinable(&outs[i].1, &outs[j].1)
             });
             for (i, j) in pairs {
-                let (t, f) = (pairing.side(i, &outs[i].0), pairing.side(j, &outs[j].0));
-                let Some(m) = merge_canon(&mut self.d, t, f)? else {
+                let Some(m) = merge_canon(&mut self.d, &outs[i].0, &outs[j].0, pairing.sides(i, j))? else {
                     pairing.refuse(i, j);
                     continue;
                 };
@@ -673,7 +673,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 let state = self.premise_for_value(m, &v);
                 outs.remove(j);
                 outs.remove(i);
-                pairing.replace(i, j, &state)?;
+                pairing.replace(i, j);
                 outs.push((state, v));
                 continue 'again;
             }
@@ -1648,7 +1648,9 @@ impl<'a, D: Domain> Interp<'a, D> {
         super::heap::push_value(&v, &mut roots);
         let (tables, scopes, _) = s.heap.reachable(&roots);
         let d = &mut self.d;
-        let mut swap = |x: &mut Value<D>, origin: &str| {
+        // The origin is named only when a fork is minted: a table's key, with
+        // the table's `x`, `y` where it has them (which fall floor).
+        let swap = |d: &mut D, x: &mut Value<D>, origin: &dyn Fn(&D) -> String| {
             if let Value::Bool(b) = x {
                 if let Some(f) = d.escaped_atom(b, since, origin) {
                     *b = f;
@@ -1656,23 +1658,31 @@ impl<'a, D: Domain> Interp<'a, D> {
             }
         };
         for (_, t) in s.heap.tables.iter_mut().filter(|(id, _)| tables.contains(id)) {
+            let num = |k: &str| match t.hash.get(k) {
+                Some(Value::Num(n)) => Some(n.clone()),
+                _ => None,
+            };
+            let at = (num("x"), num("y"));
             for (k, x) in t.hash.iter_mut() {
-                swap(x, k);
+                swap(&mut *d, x, &|d: &D| match &at {
+                    (Some(px), Some(py)) => format!("{k} at x {} y {}", d.describe_num(px), d.describe_num(py)),
+                    _ => k.clone(),
+                });
             }
             for x in t.arr.iter_mut() {
-                swap(x, "[array]");
+                swap(&mut *d, x, &|_: &D| "[array]".to_string());
             }
             for x in t.ints.values_mut() {
-                swap(x, "[int]");
+                swap(&mut *d, x, &|_: &D| "[int]".to_string());
             }
         }
         for (_, sc) in s.heap.scopes.iter_mut().filter(|(id, _)| scopes.contains(id)) {
             for (k, x) in sc.vars.iter_mut() {
-                swap(x, k);
+                swap(&mut *d, x, &|_: &D| k.to_string());
             }
         }
         let mut v = v;
-        swap(&mut v, "[returned]");
+        swap(&mut *d, &mut v, &|_: &D| "[returned]".to_string());
         (s, v)
     }
 
@@ -2078,44 +2088,55 @@ fn ident(t: &full_moon::tokenizer::TokenReference) -> Result<String> {
 /// merge. A frontier that keeps successors apart used to re-try all of its
 /// pairs after each merge (room (3,0) at a fruit-unknown set, 2026-09-17).
 struct Pairing {
-    /// Per outcome: its id, and - when there is more than one outcome - its
-    /// shape's hash and its `Canon`, computed once rather than per attempt.
-    keys: Vec<(usize, u64, Option<Canon>)>,
+    /// Per outcome: its id, and its shape's hash and `Canon` once `prepare`
+    /// computed them - once per outcome rather than per attempt.
+    keys: Vec<(usize, Option<(u64, Canon)>)>,
+    /// Every outcome holds the first one's heap (`state::same_heap`): they
+    /// pair object by object and need no `Canon`.
+    same: bool,
+    /// Whether `same` can still hold: once the heaps differ, canons it is.
+    same_possible: bool,
     next: usize,
     refused: std::collections::HashSet<(usize, usize)>,
 }
 
 impl Pairing {
-    fn new<'s, D: Domain + 's>(states: impl Iterator<Item = &'s State<D>>) -> Result<Self> {
-        let states: Vec<&State<D>> = states.collect();
-        // A lone outcome is never paired: nothing to compute.
-        let lone = states.len() < 2;
-        let keys = states
-            .iter()
-            .enumerate()
-            .map(|(i, s)| Pairing::key(i, s, lone))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Pairing { next: keys.len(), keys, refused: Default::default() })
+    fn new(n: usize) -> Self {
+        Pairing { keys: (0..n).map(|i| (i, None)).collect(), same: false, same_possible: true, next: n, refused: Default::default() }
     }
 
-    fn key<D: Domain>(id: usize, s: &State<D>, lone: bool) -> Result<(usize, u64, Option<Canon>)> {
-        if lone {
-            return Ok((id, 0, None));
-        }
+    /// Before pairing `states` (in `keys`' order): decide how they pair, and
+    /// compute the canons that needs. A lone outcome is never paired.
+    fn prepare<D: Domain>(&mut self, states: &[&State<D>]) -> Result<()> {
         use std::hash::{Hash, Hasher};
-        let canon = Canon::of(s)?;
-        let mut h = rustc_hash::FxHasher::default();
-        canon.shape().hash(&mut h);
-        Ok((id, h.finish(), Some(canon)))
+        self.same = self.same_possible && states.iter().skip(1).all(|s| super::state::same_heap(states[0], s));
+        self.same_possible = self.same;
+        if self.same || states.len() < 2 {
+            return Ok(());
+        }
+        for (k, s) in self.keys.iter_mut().zip(states) {
+            if k.1.is_none() {
+                let canon = Canon::of(s)?;
+                let mut h = rustc_hash::FxHasher::default();
+                canon.shape().hash(&mut h);
+                k.1 = Some((h.finish(), canon));
+            }
+        }
+        Ok(())
     }
 
     fn may_merge(&self, i: usize, j: usize) -> bool {
-        self.keys[i].1 == self.keys[j].1 && !self.refused.contains(&(self.keys[i].0, self.keys[j].0))
+        let alike = self.same || matches!((&self.keys[i].1, &self.keys[j].1), (Some((a, _)), Some((b, _))) if a == b);
+        alike && !self.refused.contains(&(self.keys[i].0, self.keys[j].0))
     }
 
-    /// Outcome `i`'s state with its `Canon`, for `merge_canon`.
-    fn side<'s, D: Domain>(&'s self, i: usize, s: &'s State<D>) -> (&'s State<D>, &'s Canon) {
-        (s, self.keys[i].2.as_ref().expect("a paired outcome has its canon"))
+    /// How outcomes `i` and `j` pair, for `merge_canon`.
+    fn sides(&self, i: usize, j: usize) -> Sides<'_> {
+        match (&self.keys[i].1, &self.keys[j].1) {
+            _ if self.same => Sides::Same,
+            (Some((_, a)), Some((_, b))) => Sides::Canon(a, b),
+            _ => unreachable!("`prepare` computed every canon of a differing frontier"),
+        }
     }
 
     fn refuse(&mut self, i: usize, j: usize) {
@@ -2123,13 +2144,13 @@ impl Pairing {
     }
 
     /// Outcomes `i < j` merged into `merged`, which goes last.
-    fn replace<D: Domain>(&mut self, i: usize, j: usize, merged: &State<D>) -> Result<()> {
+    fn replace(&mut self, i: usize, j: usize) {
         self.keys.remove(j);
         self.keys.remove(i);
-        let key = Pairing::key(self.next, merged, self.keys.is_empty())?;
-        self.keys.push(key);
+        self.keys.push((self.next, None));
         self.next += 1;
-        Ok(())
+        // The merged heap is collected, the others are not: recheck.
+        self.same_possible = true;
     }
 }
 

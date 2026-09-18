@@ -108,6 +108,7 @@ pub(crate) fn lattice_kernel_refs(
             })
             .collect::<Result<Vec<_>>>()?,
     };
+    let frames: Vec<_> = frames.into_iter().filter(|(key, ..)| kernel_only_keeps(key.region)).collect();
     // Bind + lower (specialize + decide, the expensive half of a kernel
     // build) per frame, frames in parallel.
     let (graph, cart, cache) = (&lw.tracer.it.d.graph, lw.cart.clone(), lw.cache.clone());
@@ -185,27 +186,46 @@ pub struct Region {
     pub iy: i16,
 }
 
-/// The grid a region key is taken on (`CELESTE_REGION="px,S"`; unset: no
-/// region key, one kernel per shape as before).
+/// The grid a region key is taken on (`region_grid_for`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RegionGrid {
     pub px: i32,
     pub speed: i32,
 }
 
-/// The process's region grid, read once. `S` is at most 7: the move loop
-/// is unrolled for `abs(amount) <= 8` (`Interp::unroll_bound`), and
+/// The region grid of a kernel set at `opts`. `CELESTE_REGION="px,S"` sets
+/// it, `off` leaves every kernel set unkeyed (one kernel per shape); unset it
+/// is 16 px with speeds within 6 px (Philippe, 2026-09-18). The key is built
+/// only for exact-speed, exact-position levels: the DEFAULT leaves any other
+/// level unkeyed, an explicit grid on one is an error. `S` is at most 7: the
+/// move loop is unrolled for `abs(amount) <= 8` (`Interp::unroll_bound`), and
 /// `amount` is `flr(rem + spd + 0.5)`.
-pub fn region_grid() -> Option<RegionGrid> {
-    static GRID: std::sync::OnceLock<Option<RegionGrid>> = std::sync::OnceLock::new();
-    *GRID.get_or_init(|| {
-        let s = std::env::var("CELESTE_REGION").ok()?;
-        let v: Vec<i32> = s.split(',').map(|t| t.trim().parse().expect("CELESTE_REGION=\"px,S\"")).collect();
-        assert!(v.len() == 2 && v[0] >= 8 && (1..=7).contains(&v[1]), "CELESTE_REGION=\"px,S\" with px >= 8 and 1 <= S <= 7, not {s:?}");
-        let g = RegionGrid { px: v[0], speed: v[1] };
-        eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed);
-        Some(g)
-    })
+pub fn region_grid_for(opts: super::shapes::WalkOpts) -> Result<Option<RegionGrid>> {
+    // The grid, and whether the environment named it.
+    static GRID: std::sync::OnceLock<Option<(RegionGrid, bool)>> = std::sync::OnceLock::new();
+    let named = *GRID.get_or_init(|| {
+        let g = match std::env::var("CELESTE_REGION").ok().as_deref() {
+            Some("off") => None,
+            Some(s) => {
+                let v: Vec<i32> = s.split(',').map(|t| t.trim().parse().expect("CELESTE_REGION=\"px,S\" or off")).collect();
+                assert!(v.len() == 2 && v[0] >= 8 && (1..=7).contains(&v[1]), "CELESTE_REGION=\"px,S\" with px >= 8 and 1 <= S <= 7, not {s:?}");
+                Some((RegionGrid { px: v[0], speed: v[1] }, true))
+            }
+            None => Some((RegionGrid { px: 16, speed: 6 }, false)),
+        };
+        match g {
+            Some((g, _)) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
+            None => eprintln!("[region] no region key (CELESTE_REGION=off)"),
+        }
+        g
+    });
+    let Some((grid, explicit)) = named else { return Ok(None) };
+    let keyable = opts.spd == crate::interpreter::abstraction::SpdPrecision::Exact && opts.pos == crate::interpreter::abstraction::PosPrecision::EXACT;
+    match (keyable, explicit) {
+        (true, _) => Ok(Some(grid)),
+        (false, false) => Ok(None),
+        (false, true) => anyhow::bail!("the region key (CELESTE_REGION) is built only for exact-speed, exact-position levels, not {opts:?}"),
+    }
 }
 
 impl RegionGrid {
@@ -235,8 +255,49 @@ impl RegionGrid {
             (field(&["y"]), (y0 * ONE, (y0 + self.px - 1) * ONE)),
             (field(&["spd", "x"]), (-self.speed * ONE, self.speed * ONE)),
             (field(&["spd", "y"]), (-self.speed * ONE, self.speed * ONE)),
+            // `move` leaves `rem` in `[-0.5, 0.5)`. Unbounded, the move amount
+            // had no range, every step of the unrolled loop stayed, and the
+            // collisions reached 8 px each way instead of 7: one fall floor
+            // too many in room (3,0)'s spawn square (2026-09-18).
+            (field(&["rem", "x"]), (-0x8000, 0x7fff)),
+            (field(&["rem", "y"]), (-0x8000, 0x7fff)),
         ]
     }
+}
+
+/// EXPERIMENT (not a search mode): `CELESTE_EXPERIMENT_BOUND="djump=0..0"`
+/// traces every region kernel with those player fields (whole units) bounded,
+/// to count the bodies a dispatch key on them would leave. Lanes outside the
+/// bound decline, so only the kernel build is meaningful.
+fn experiment_bounds(pl: &super::iface::Path) -> Bounds {
+    let Ok(spec) = std::env::var("CELESTE_EXPERIMENT_BOUND") else { return Vec::new() };
+    spec.split(',')
+        .map(|item| {
+            let (name, range) = item.split_once('=').expect("CELESTE_EXPERIMENT_BOUND=\"field=lo..hi,...\"");
+            let (lo, hi) = range.split_once("..").expect("CELESTE_EXPERIMENT_BOUND=\"field=lo..hi,...\"");
+            let mut p = pl.clone();
+            for f in name.split('.') {
+                p.push(super::iface::key(f));
+            }
+            let whole = |s: &str| s.trim().parse::<i32>().expect("a whole number") << 16;
+            (p, (whole(lo), whole(hi)))
+        })
+        .collect()
+}
+
+/// THE KERNEL DEV LOOP: `CELESTE_KERNEL_ONLY="(5,13) (4,13)"` lowers and
+/// assembles only those regions' kernels (the walk still runs whole: it is
+/// what finds the shapes), and the process exits once they are built - for
+/// `CELESTE_KERNEL_DUMP` / `CELESTE_KERNEL_REPORT` without the rest of a
+/// room's kernels or a forward.
+pub fn kernel_only() -> Option<&'static [String]> {
+    static ONLY: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    ONLY.get_or_init(|| std::env::var("CELESTE_KERNEL_ONLY").ok().map(|v| v.split_whitespace().map(str::to_string).collect())).as_deref()
+}
+
+fn kernel_only_keeps(region: Option<Region>) -> bool {
+    let name = region.map_or("-".to_string(), |r| format!("({},{})", r.ix, r.iy));
+    kernel_only().is_none_or(|only| only.contains(&name))
 }
 
 /// What one kernel of a shape is specialized on: the speed key (bucketed
@@ -1295,7 +1356,7 @@ pub fn key_census(root: &std::path::Path, lower: usize, dump: Option<&std::path:
 /// (`room_constant_lattice`) supplies the shapes, their representative
 /// states and their constant pins.
 pub fn key_fixpoint(lw: &LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
-    anyhow::ensure!(region_grid().is_none(), "the speed-key fixpoint is not built with the region key (CELESTE_REGION)");
+    anyhow::ensure!(region_grid_for(lw.opts)?.is_none(), "the speed-key fixpoint is not built with the region key (CELESTE_REGION)");
     let t = std::time::Instant::now();
     let (mut t_trace, mut t_succ) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     let start_shape = lw.frames[&(lw.start_key.clone(), None)].frame.in_rt2.shape_hash_of();
@@ -2297,11 +2358,7 @@ pub fn room_constant_lattice(
     // THE REGION KEY (`RegionGrid`): a node is (shape, region), the lattice
     // stays per shape, and a narrowed lattice re-traces every region its
     // shape has reached.
-    let grid = region_grid();
-    anyhow::ensure!(
-        grid.is_none() || (opts.spd == crate::interpreter::abstraction::SpdPrecision::Exact && opts.pos == crate::interpreter::abstraction::PosPrecision::EXACT),
-        "the region key (CELESTE_REGION) is built only for exact-speed, exact-position levels, not {opts:?}"
-    );
+    let grid = region_grid_for(opts)?;
     let start_regions = successor_regions(&start, &mut it.d, grid)?;
     let mut regions: std::collections::BTreeMap<String, std::collections::BTreeSet<Option<Region>>> = Default::default();
     regions.insert(sk.clone(), start_regions.iter().copied().collect());
@@ -2340,7 +2397,9 @@ pub fn room_constant_lattice(
                 let pin: Vec<(super::iface::Path, super::iface::Conc)> =
                     lattice[k].iter().filter(|(p, _)| roots.iter().any(|r| r == *p)).map(|(p, c)| (p.clone(), *c)).collect();
                 let bounds: Bounds = match (grid, *region, shapes::player_path(&st)) {
-                    (Some(g), Some(r), Some(pl)) => g.bounds(&pl, r).into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect(),
+                    (Some(g), Some(r), Some(pl)) => {
+                        g.bounds(&pl, r).into_iter().chain(experiment_bounds(&pl)).filter(|(p, _)| roots.iter().any(|q| q == p)).collect()
+                    }
                     (None, None, _) | (Some(_), None, None) => Vec::new(),
                     (g, r, pl) => bail!("walk node {r:?} of a shape {} a player under grid {g:?}", if pl.is_some() { "with" } else { "without" }),
                 };
@@ -2424,6 +2483,9 @@ pub fn room_constant_lattice(
                         // them as interval inputs.
                         let mut new_ival = false;
                         for p in o.ival {
+                            if lattice_trace && !ival_extra.get(&tk).is_some_and(|s| s.contains(&p)) {
+                                eprintln!("[lattice]   outcome: new interval slot {} (shape #{})", super::iface::show(&p), lattice.keys().position(|x| *x == tk).unwrap_or(usize::MAX));
+                            }
                             new_ival |= ival_extra.entry(tk.clone()).or_default().insert(p);
                         }
                         if lattice_trace {

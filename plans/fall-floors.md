@@ -89,6 +89,58 @@ $87047808, %rsp`), the forward workers' stack was 64 MB. Workers now get 512 MB
 asserts its frame fits (`Compiled::frame_bytes` + 1 MB): a loud refusal instead
 of a touch past the stack.
 
+### One floor too many, and the kernel dev loop (2026-09-18, afternoon)
+
+Philippe's hand count of the floors an 8 px square can reach disagreed with the
+kernels: square (5,13) forked on the floor at (64,112), 17 px to the right. The
+fork origins now name the floor (`collideable at x 64 y 112`, from the table's
+`x`/`y` at the call return), and `CELESTE_KERNEL_DIFF=<outcome>@<fork>` with
+`CELESTE_KERNEL_CONE=N` prints the two bodies' difference as a DAG with each
+node's static range. The reader was the wall-jump test `is_solid(3,0)` after
+the move, with the moved `x` in [32, 55] for a square [40, 47]: 8 px each
+way. `rem` had no seeded range, so the move amount `flr(rem + spd + 0.5)` had
+none, the unrolled `for i=0,abs(amount)` kept every one of its 8 iterations,
+and every later collision box grew by a pixel. Fixes:
+
+- the region key also bounds `rem.x`/`rem.y` to [-0.5, 0.5) (`RegionGrid::
+  bounds`, guarded in `ok` like the rest: a lane outside declines);
+- `Symbolic::flr_ways` is capped at `move_ways`: with any range seeded it
+  took the arity from the static range's width, which for a region's speed
+  range [-6, 6] is 13 floors (35,502 bodies in (5,13)); one lane's interval
+  spans at most `move_ways` floors, and too small an arity declines (`SplitOk`).
+
+Square (5,13): 1,236 -> 852 bodies, forks only on its two floors. The 16 px
+spawn square (2,6), the main player shape: 1,254 -> 870 bodies, its big
+outcomes 384 = 24 button reps x 2 floors x 2 move forks, the static count
+the abstraction predicts. Level-0 kept counts f1-f40 at 32 px are identical
+before and after. 16 px is the default grid now (`region_grid_for`;
+`CELESTE_REGION=off` for none): 307 kernels, 158,848 bodies (330,549 at 32 px
+this morning).
+
+The dev loop (`CELESTE_KERNEL_ONLY="(5,13)"`: lower and assemble only those
+regions, then exit; `none` stops after the walk) went from 100+ s to 18 s:
+
+| | before | after |
+|---|---|---|
+| walk, 8 px grid (979 nodes, 1,266 traces) | 38.9 s | 16.5 s |
+| lower + assemble (5,13)'s 3 kernels | 80 s + a codegen over 60 s | 1.8 s |
+
+- **Merges of an unchanged heap** (`state::same_heap`, `Sides::Same`): the arms
+  of `a and b` where `b` only reads hold the same heap by id, so the merge pairs
+  every slot with itself and needs no `Canon` - computing both was a third of
+  the walk. Equal values join to themselves and a select of equal arms folds, so
+  the result is the one the canon path made. 38.9 s -> 26.0 s.
+- **The build's purge delay** (`asm_kernel::BuildPurgeDelay`): `safe-run.sh`
+  purges freed pages at once, and under the tracer threads that was a third of
+  the walk in TLB shootdowns. While a kernel set builds, purges wait a second.
+  26.0 s -> 16.5 s.
+- **The spill-slot expiry** was a list scanned per interval, quadratic in the
+  largest kernels; a heap now.
+
+What is left of the walk is the tracer itself: ~0.7 CPU-s per trace, heap
+clones at splits and merges 31%, dropping states 17%, canons of `if` merges
+16%. Copy-on-write tables would be the next step.
+
 Room (3,0) has 12 fall floors. Without the fly fruit, level 0 still grew x1.49
 per frame at f55, and erasing the floors merged 3.13x there (plans/room30.md).
 This records the field-by-field analysis and where the discussion landed; the

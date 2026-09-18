@@ -38,6 +38,9 @@ pub struct Lowered {
     /// specialize + decide were half a kernel build, and used to run
     /// twice per shape (2026-09-14).
     pub(crate) spec: (Graph, Vec<crate::transpile::lower::SpecializedBody>),
+    /// The input cells' static ranges the frame was lowered under (raw), for
+    /// the kernel dump's range annotations.
+    pub(crate) ranges: std::collections::HashMap<u32, (i32, i32)>,
 }
 
 /// A node's subtree, to a bounded depth, as text. For DIAGNOSTICS: the
@@ -421,5 +424,5 @@ pub fn lower_frame(
         .collect();
     let spec = crate::transpile::lower::lower_outcomes(&e, &mut outs);
     let bodies = spec.1.len();
-    Ok(Lowered { outs: outs.into_iter().map(|o| o.of).collect(), bodies, spec })
+    Ok(Lowered { outs: outs.into_iter().map(|o| o.of).collect(), bodies, spec, ranges: e.ranges })
 }
