@@ -9,9 +9,15 @@ OPTIMAL 95 with it and no band ("Room (2,0): OPTIMAL 95 without the band").
 ```bash
 CELESTE_START_ROOM=2,0 CELESTE_THREADS=16 ./safe-run.sh -- ./target/quick/transpile \
     --level-minus-one S LEVEL_DIR CEILING FROM TO [MARKS]
-# e.g. 5 /var/tmp/celeste-search20-held/level00 95 60 95 \
-#      /var/tmp/celeste-search20-held/h095/level00.marks.bin
+# e.g. 5 /var/tmp/celeste-room20-l1/level00 95 60 95 \
+#      /var/tmp/celeste-room20-l1/h095/level00.marks.bin
 ```
+
+The example tree (room (2,0), `--ceiling 95`, OPTIMAL 95) is archived at
+`/var/tmp/celeste-archive/celeste-room20-l1.tar.zst` since 2026-09-18; unpack
+it first (`tar -I zstd -xf /var/tmp/celeste-archive/celeste-room20-l1.tar.zst
+-C /var/tmp`, ~116 GB). The tree this example originally named,
+`celeste-search20-held` (the held-band run), is deleted.
 
 Code: `src/trace/level_minus_one.rs` (`probe`).
 

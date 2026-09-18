@@ -203,10 +203,15 @@ struct AsmKernel {
     /// the room, so `run` can re-evaluate the SAME fused graph with the pure
     /// interval evaluator (`eval_narrow_top_in`) per lane and diff it against the
     /// assembled kernel's output. Separates an ASM-codegen bug (asm != eval)
-    /// from a fused-graph bug (asm == eval, both != interpreter).
+    /// from a fused-graph bug (asm == eval, both != interpreter). Also what a
+    /// decline's explanation evaluates (`explain_ok`). KEPT ONLY under
+    /// `kernel_graph_kept()`: otherwise empty, since every kernel set holding
+    /// its graphs was gigabytes for nothing (2026-09-18).
     fused: crate::transpile::graph::Graph,
     flat_roots: Vec<crate::transpile::graph::NodeId>,
     room: Room,
+    /// The fused graph's node count, for the build report.
+    fused_nodes: usize,
     /// Per input cell (parallel to `compiled.input_cells`), the traced
     /// frame's path for it: what a packing failure names.
     input_names: Vec<String>,
@@ -417,7 +422,10 @@ impl AsmKernel {
                         "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} ok {:#06x}):\n{rows}",
                         chunk.shape_hash, body.outcome, declined, live, ok
                     );
-                    self.explain_ok(chunk, lanes[declined.trailing_zeros() as usize], self.flat_roots[body.ok_root]);
+                    match self.flat_roots.get(body.ok_root) {
+                        Some(&ok_node) => self.explain_ok(chunk, lanes[declined.trailing_zeros() as usize], ok_node),
+                        None => eprintln!("[kernel] rerun with CELESTE_KERNEL_EXPLAIN=1 for the premise the lane failed"),
+                    }
                     sc.put_back();
                     return false;
                 }
@@ -1320,6 +1328,13 @@ fn eval_check_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("CELESTE_ASM_EVAL_CHECK").is_some())
 }
 
+/// Whether kernels keep their fused graphs after assembly: for the eval check,
+/// and for `CELESTE_KERNEL_EXPLAIN` (a decline names the premise it failed).
+fn kernel_graph_kept() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| eval_check_on() || std::env::var_os("CELESTE_KERNEL_EXPLAIN").is_some())
+}
+
 fn num_raw(av: AV) -> i32 {
     match av {
         AV::Num(p) => p.as_raw_u32() as i32,
@@ -1705,7 +1720,7 @@ fn unify(by_shape: &mut HashMap<(u64, KernelKey), AsmKernel>) -> Result<()> {
     }
     let templates: usize = by_shape.values().map(|k| k.acc_templates.len()).sum();
     let bodies: usize = by_shape.values().map(|k| k.bodies.len()).sum();
-    let fused: usize = by_shape.values().map(|k| k.fused.len()).sum();
+    let fused: usize = by_shape.values().map(|k| k.fused_nodes).sum();
     // Per kernel, largest first: bodies, the traced forks, the forks its bodies
     // ENUMERATE (a split that differs between two of its bodies), fused nodes,
     // the spill frame, the region.
@@ -1715,7 +1730,7 @@ fn unify(by_shape: &mut HashMap<(u64, KernelKey), AsmKernel>) -> Result<()> {
             let first = k.bodies.first().map(|b| b.splits.clone()).unwrap_or_default();
             let enumerated = (0..k.forks as usize).filter(|&d| k.bodies.iter().any(|b| b.splits.get(d) != first.get(d))).count();
             let region = key.region.map_or("-".to_string(), |r| format!("({},{})", r.ix, r.iy));
-            (k.bodies.len(), k.forks, enumerated, k.fused.len(), format!("{:.1} MB", k.compiled.frame_bytes as f64 / 1048576.0), region)
+            (k.bodies.len(), k.forks, enumerated, k.fused_nodes, format!("{:.1} MB", k.compiled.frame_bytes as f64 / 1048576.0), region)
         })
         .collect();
     per_shape.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.5.cmp(&b.5)));
@@ -2304,8 +2319,9 @@ fn build_one_shape(
             acc_templates,
             forks: r.bound.forks,
             body_cols: Vec::new(),
-            fused,
-            flat_roots,
+            fused_nodes: fused.len(),
+            fused: if kernel_graph_kept() { fused } else { crate::transpile::graph::Graph::new() },
+            flat_roots: if kernel_graph_kept() { flat_roots } else { Vec::new() },
             room,
             input_names,
         },
@@ -2597,6 +2613,11 @@ impl Drop for BuildPurgeDelay {
         b.0 -= 1;
         if b.0 == 0 {
             unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, b.1) };
+            // And purge what the build freed under the delay: the builder
+            // threads have exited, so nothing else runs their delayed purges.
+            // (Not what made a built set big: that was every kernel keeping
+            // its fused graph, `kernel_graph_kept`.)
+            unsafe { libmimalloc_sys::mi_collect(true) };
         }
     }
 }

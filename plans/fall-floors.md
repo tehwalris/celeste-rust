@@ -137,6 +137,13 @@ regions, then exit; `none` stops after the walk) went from 100+ s to 18 s:
 - **The spill-slot expiry** was a list scanned per interval, quadratic in the
   largest kernels; a heap now.
 
+**Memory of a built kernel set.** Every kernel kept its fused graph (for the
+eval check and a decline's explanation), and with 18 levels prebuilt the room
+(3,0) search held ~30 GB before its frontier. A one-level set at 32 px left
+7.3 GB resident after its build; with the graphs kept only under
+`CELESTE_ASM_EVAL_CHECK` / `CELESTE_KERNEL_EXPLAIN`, 1.64 GB (this morning's
+commit: 1.96 GB).
+
 What is left of the walk is the tracer itself: ~0.7 CPU-s per trace, heap
 clones at splits and merges 31%, dropping states 17%, canons of `if` merges
 16%. Copy-on-write tables would be the next step.
