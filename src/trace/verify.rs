@@ -153,6 +153,15 @@ fn out_fields(
             ubool.push(p);
             continue;
         }
+        // The canonical output unknown (`Symbolic::unknown_bool_output`: held
+        // trails, the fly fruit's `fly`, the fall floors' `collideable`): the
+        // same uniform `AV::UBool` whatever the body, so no root.
+        if let Some(Value::Bool(b)) = iface::get(st, &p) {
+            if d.is_unknown_output(b) {
+                ubool.push(p);
+                continue;
+            }
+        }
         // The engine TYPE of the column this slot becomes. Asked of the
         // graph rather than of the tracer's `Value`, because an interval
         // is a `Value::Num` too: `player.rem` comes in widened and leaves

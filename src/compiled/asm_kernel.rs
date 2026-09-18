@@ -1910,6 +1910,66 @@ fn dump_kernel(
             }
         }
     }
+    // CELESTE_KERNEL_DIFF=<outcome>: two of its bodies with the same button rep
+    // whose fork configurations differ in ONE fork, and where their fields
+    // differ, walked down to the nodes that actually diverge.
+    if let Some(want) = std::env::var("CELESTE_KERNEL_DIFF").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let mine: Vec<&crate::trace::emit::AsmBody> = bodies.iter().filter(|b| b.outcome == want).collect();
+        let pair = mine.iter().enumerate().find_map(|(i, a)| {
+            mine[i + 1..].iter().find(|b| b.frees == a.frees && a.splits.iter().zip(&b.splits).filter(|(x, y)| x != y).count() == 1).map(|b| (*a, *b))
+        });
+        match pair {
+            None => eprintln!("[kernel diff] outcome {want}: no two bodies differ in exactly one fork"),
+            Some((a, b)) => {
+                let d = a.splits.iter().zip(&b.splits).position(|(x, y)| x != y).unwrap_or(0);
+                let origin = r.frame.fork_origins.iter().find(|(x, _)| *x as usize == d).map_or("-", |(_, o)| o.as_str());
+                let nf = r.bound.outcomes[want].outputs.len();
+                let differing: Vec<usize> = (0..nf).filter(|&j| a.roots[j] != b.roots[j]).collect();
+                eprintln!(
+                    "[kernel diff] outcome {want}, button rep {}: fork {d} ({origin}) = {} against {}; {} of {nf} fields differ, live {}, ok {}",
+                    a.frees,
+                    a.splits[d],
+                    b.splits[d],
+                    differing.len(),
+                    if a.roots[nf + 1] == b.roots[nf + 1] { "same" } else { "differs" },
+                    if a.roots[nf] == b.roots[nf] { "same" } else { "differs" },
+                );
+                // A node as an expression, `depth` levels deep.
+                fn show(g: &crate::transpile::graph::Graph, n: crate::transpile::graph::NodeId, depth: usize) -> String {
+                    let node = g.get(n);
+                    let op = format!("{:?}", node.op);
+                    if node.args.is_empty() || depth == 0 {
+                        return if node.args.is_empty() { op } else { format!("{op}(..)") };
+                    }
+                    let args: Vec<String> = node.args.iter().map(|x| show(g, *x, depth - 1)).collect();
+                    format!("{op}({})", args.join(", "))
+                }
+                // Down both expressions while they agree on the op, to where they diverge.
+                fn diverge(g: &crate::transpile::graph::Graph, x: crate::transpile::graph::NodeId, y: crate::transpile::graph::NodeId, depth: usize, out: &mut Vec<String>) {
+                    if x == y || out.len() >= 6 {
+                        return;
+                    }
+                    let (nx, ny) = (g.get(x), g.get(y));
+                    if nx.op != ny.op || nx.args.len() != ny.args.len() || depth == 0 {
+                        out.push(format!("{}  AGAINST  {}", show(g, x, 3), show(g, y, 3)));
+                        return;
+                    }
+                    for (p, q) in nx.args.iter().zip(&ny.args) {
+                        diverge(g, *p, *q, depth - 1, out);
+                    }
+                }
+                for &j in differing.iter().take(4) {
+                    let path = r.frame.outs.get(want).and_then(|o| o.fields.get(j)).map(|f| crate::trace::iface::show(&f.0)).unwrap_or_else(|| format!("field {j}"));
+                    let mut out = Vec::new();
+                    diverge(fused, a.roots[j], b.roots[j], 12, &mut out);
+                    eprintln!("[kernel diff]   {path}:");
+                    for line in out {
+                        eprintln!("[kernel diff]     {line}");
+                    }
+                }
+            }
+        }
+    }
     // The fused graph's ops, most common first.
     let mut hist: std::collections::BTreeMap<String, usize> = Default::default();
     for n in 0..fused.len() as crate::transpile::graph::NodeId {
@@ -2239,8 +2299,9 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
         let cell = f.cell as usize;
         // A boundary-widened-to-uniform cell holds its widened value, whatever
         // the body computes for it: rem and the timers are constants in the
-        // graph too, the held-button trails are decided per body and written
-        // unknown (`emit::bind`) - the value its key folds into `part`.
+        // graph too, the unknown numbers are written `AV::UNum` (`emit::bind`)
+        // - the value its key folds into `part`. The unknown booleans an output
+        // widening writes are no fields (`ubool_cells` below).
         if let Some(av) = f.widen_uniform.or(f.konst_av) {
             inits.push((cell, ColInit::Uniform(av)));
         } else {

@@ -252,37 +252,12 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
                 }
             }
         }
-        // Held buttons unknown (plans/held-buttons.md): the player's trails
-        // are written unknown, uniform, off the per-lane key fold - the same
-        // route as rem above, and what `Rt2::widen_to(.., held)` writes.
-        if f.held_unknown {
-            for obj in o.rt2.player_objects(&ids) {
-                for fid in [ids.f_p_jump, ids.f_p_dash] {
-                    let c = o.rt2.obj_field_cell(obj, fid).ok_or_else(|| anyhow::anyhow!("held buttons unknown: the player has no p_jump / p_dash field"))?;
-                    widen.push((c, AV::UBool));
-                }
-            }
-        }
-        // The unknown numbers, uniform, off the per-lane key fold.
+        // The unknown numbers, uniform, off the per-lane key fold. (The unknown
+        // BOOLEANS an output widening writes - held trails, `fly`, `collideable`
+        // - are no fields at all: `verify::out_fields` stores them uniform.)
         for (i, u) in unknown_fields[oi].iter().enumerate() {
             if *u {
                 widen.push((o.cells[i], AV::UNum));
-            }
-        }
-        // The fly fruit unknown: its `fly` written unknown, uniform
-        // (`widen::widen_fly_fruit`).
-        if f.fruit_unknown {
-            for p in crate::trace::widen::fly_fruit_paths(&o.st).fly {
-                let i = o.fields.iter().position(|(q, _, _)| *q == p).ok_or_else(|| anyhow::anyhow!("{}: the fly fruit's `fly` is not an output field", crate::trace::iface::show(&p)))?;
-                widen.push((o.cells[i], AV::UBool));
-            }
-        }
-        // The fall floors unknown: their `collideable` written unknown, uniform
-        // (`widen::widen_fall_floors`).
-        if f.floors_unknown {
-            for p in crate::trace::widen::fall_floor_paths(&o.st).collideable {
-                let i = o.fields.iter().position(|(q, _, _)| *q == p).ok_or_else(|| anyhow::anyhow!("{}: the fall floor's `collideable` is not an output field", crate::trace::iface::show(&p)))?;
-                widen.push((o.cells[i], AV::UBool));
             }
         }
         let keys: Vec<(usize, NodeId)> =

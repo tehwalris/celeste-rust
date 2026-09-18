@@ -169,6 +169,26 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
     widen_timers(st, d)?;
     widen_fly_fruit(st, d)?;
     widen_fall_floors(st, d)?;
+    widen_held(st, d)?;
+    Ok(())
+}
+
+/// Held buttons unknown (plans/held-buttons.md): the player's trails leave the
+/// frame unknown - the canonical output unknown (`Symbolic::unknown_bool_output`),
+/// stored uniform (`verify::out_fields`), whatever each fork configuration
+/// computed.
+fn widen_held(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    if !d.held_unknown {
+        return Ok(());
+    }
+    for obj in objects_of_type(st, "player") {
+        for f in ["p_jump", "p_dash"] {
+            let p = field(&obj, &[f]);
+            let Some(Value::Bool(_)) = iface::get(st, &p) else { bail!("{}: not a boolean", iface::show(&p)) };
+            let b = d.unknown_bool_output();
+            iface::set(st, &p, Value::Bool(b))?;
+        }
+    }
     Ok(())
 }
 
@@ -213,21 +233,23 @@ pub fn fall_floor_paths<D: Domain>(st: &State<D>) -> FallFloorPaths {
 /// floor (a `ChoiceSet` holds 58).
 pub fn fork_floor_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     materialize_absent_fields(st, d)?;
-    replace_fall_floors(st, d)
+    replace_fall_floors(st, d, false)
 }
 
 /// The fall floors' OUTPUT side at a floors-unknown level: `state` and `delay`
-/// the unknown number (stored `AV::UNum`, `emit::bind`), `collideable` unknown
-/// (stored `AV::UBool`). The unknown contains whatever the frame computed, so
-/// there is nothing to check.
+/// the unknown number (stored `AV::UNum`, `emit::bind`), `collideable` the
+/// canonical output unknown (stored `AV::UBool`, `verify::out_fields`). The
+/// unknown contains whatever the frame computed, so there is nothing to check.
 fn widen_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     if !d.floors_unknown {
         return Ok(());
     }
-    replace_fall_floors(st, d)
+    replace_fall_floors(st, d, true)
 }
 
-fn replace_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+/// `output`: the canonical output unknown for `collideable` (never read in
+/// the frame), else a fresh atom (read by collisions: independent per floor).
+fn replace_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic, output: bool) -> Result<()> {
     let fp = fall_floor_paths(st);
     for p in &fp.unknown {
         let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
@@ -236,7 +258,7 @@ fn replace_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()>
     }
     for p in &fp.collideable {
         let Some(Value::Bool(_)) = iface::get(st, p) else { bail!("{}: not a boolean", iface::show(p)) };
-        let b = d.unknown_bool_atom();
+        let b = if output { d.unknown_bool_output() } else { d.unknown_bool_atom() };
         iface::set(st, p, Value::Bool(b))?;
     }
     Ok(())
@@ -348,7 +370,7 @@ fn widen_fly_fruit(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     }
     for p in &fp.fly {
         let Some(Value::Bool(_)) = iface::get(st, p) else { bail!("{}: not a boolean", iface::show(p)) };
-        let b = d.unknown_bool_atom();
+        let b = d.unknown_bool_output();
         iface::set(st, p, Value::Bool(b))?;
     }
     Ok(())

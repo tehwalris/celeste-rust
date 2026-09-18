@@ -523,6 +523,20 @@ impl Symbolic {
         self.graph.fold(Op::Gt, vec![choice, zero])
     }
 
+    /// THE unknown boolean an output widening writes (held trails, the fly
+    /// fruit's `fly`, the fall floors' `collideable`): one hash-consed node, so
+    /// every body writing it writes the same thing, and `verify::out_fields`
+    /// stores it as the uniform `AV::UBool` rather than as a root. Nothing in
+    /// the frame reads an output, so sharing it between fields correlates
+    /// nothing; inputs and comparisons take fresh atoms (`unknown_bool_atom`).
+    pub fn unknown_bool_output(&mut self) -> NodeId {
+        self.graph.leaf(Op::UnknownBool(u32::MAX))
+    }
+
+    pub fn is_unknown_output(&self, b: NodeId) -> bool {
+        matches!(self.graph.get(b).op, Op::UnknownBool(u32::MAX))
+    }
+
     pub fn unknown_bool_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;

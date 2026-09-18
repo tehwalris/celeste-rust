@@ -15,10 +15,33 @@ impl CartData {
         P: AsRef<Path>,
     {
         let base_path = base_path.as_ref();
-        Ok(CartData {
+        let mut cart = CartData {
             map_data: Self::load_vec(&base_path.join("map-data.txt"), 8192)?,
             flag_data: Self::load_vec(&base_path.join("flag-data.txt"), 256)?,
-        })
+        };
+        // EXPERIMENT (2026-09-18): with `CELESTE_EXPERIMENT_FLAT_ROOM="x,y"` the
+        // room at (x, y) is an empty room with a solid bottom row and the
+        // player spawn standing on it - the smallest room with a player, for
+        // counting what its kernels should be. A DIFFERENT GAME: nothing it
+        // reports is an answer for the real cart.
+        if let Ok(spec) = std::env::var("CELESTE_EXPERIMENT_FLAT_ROOM") {
+            const SOLID: u8 = 32; // flag bit 0
+            const SPAWN: u8 = 1; // `player_spawn.tile`
+            let (rx, ry) = spec
+                .split_once(',')
+                .and_then(|(a, b)| Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?)))
+                .filter(|&(x, y)| x < 8 && y < 4)
+                .ok_or_else(|| anyhow!("CELESTE_EXPERIMENT_FLAT_ROOM={spec:?}: expected a room \"x,y\" with x < 8, y < 4"))?;
+            for ty in 0..16 {
+                for tx in 0..16 {
+                    let tile = if ty == 15 { SOLID } else if (tx, ty) == (4, 14) { SPAWN } else { 0 };
+                    cart.map_data[(ry * 16 + ty) * 128 + rx * 16 + tx] = tile;
+                }
+            }
+            static BANNER: std::sync::Once = std::sync::Once::new();
+            BANNER.call_once(|| eprintln!("[experiment] FLAT ROOM ({rx},{ry}): an empty room, a solid floor and the spawn; this is not the real game"));
+        }
+        Ok(cart)
     }
 
     fn load_vec(path: &Path, expected_len: usize) -> Result<Vec<u8>> {
