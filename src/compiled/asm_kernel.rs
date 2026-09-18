@@ -96,11 +96,65 @@ struct DKey {
 /// `AV::Ival` bucket, and `av_code` tells a number from a point interval - a
 /// singleton bucket the fold pinned to `Const(t, t)` reads as a number (25 of
 /// 262 exact marks lost, 2026-09-15).
+///
+/// Specialized at build time: `c` is `seed ^ cell * CELL_K` per half, and
+/// `read` reads the slot straight into `runtime2::av_code`'s code - no `AV`
+/// is built per row (the fold was ~16% of a big frame's cycles through
+/// `read_root_av` and `av_code`, 2026-09-18).
 struct KeyField {
-    cell: u64,
+    c: [u64; 2],
     root: usize,
-    kind: RootKind,
-    span: bool,
+    read: KeyRead,
+}
+
+/// How a key field's slot becomes its `av_code`.
+#[derive(Clone, Copy)]
+enum KeyRead {
+    Num,
+    /// A number keyed as the point interval `[v, v]` (`KeyField`'s doc).
+    NumAsIval,
+    Ival,
+    Bool,
+}
+
+impl KeyField {
+    fn new(cell: u64, root: usize, kind: RootKind, span: bool) -> KeyField {
+        use celeste_engine::runtime2::CELL_K;
+        let ck = cell.wrapping_mul(CELL_K);
+        let read = match (kind, span) {
+            (RootKind::Num, false) => KeyRead::Num,
+            (RootKind::Num, true) => KeyRead::NumAsIval,
+            (RootKind::Ival, _) => KeyRead::Ival,
+            (RootKind::Bool, _) => KeyRead::Bool,
+        };
+        KeyField { c: [KEY_SEED1 ^ ck, KEY_SEED2 ^ ck], root, read }
+    }
+
+    /// `runtime2::av_code` of lane `i`'s value, off the output slot.
+    #[inline]
+    fn code(&self, buf: &[u8], i: usize) -> u64 {
+        use celeste_engine::runtime2::mix64;
+        let base = self.root * 128;
+        let word = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) as u64;
+        let ival = |lo: u64, hi: u64| 2u64 << 56 | lo << 24 ^ mix64(hi << 1);
+        match self.read {
+            KeyRead::Num => 1u64 << 56 | word(base + i * 4),
+            KeyRead::NumAsIval => {
+                let v = word(base + i * 4);
+                ival(v, v)
+            }
+            KeyRead::Ival => ival(word(base + i * 4), word(base + 64 + i * 4)),
+            KeyRead::Bool => {
+                let val = u16::from_le_bytes([buf[base], buf[base + 1]]);
+                let known = u16::from_le_bytes([buf[base + 2], buf[base + 3]]);
+                if known & (1 << i) != 0 {
+                    3u64 << 56 | (val >> i & 1) as u64
+                } else {
+                    4u64 << 56
+                }
+            }
+        }
+    }
 }
 
 impl AsmBody {
@@ -109,15 +163,12 @@ impl AsmBody {
     /// computes `part`; `check_against_boundary` gates it).
     #[inline]
     fn key_words(&self, buf: &[u8], i: usize) -> (u64, u64) {
-        use celeste_engine::runtime2::cell_mix;
+        use celeste_engine::runtime2::mix64;
         let (mut h1, mut h2) = (0u64, 0u64);
         for f in &self.key_fields {
-            let av = match (read_root_av(f.root, f.kind, buf, i), f.span) {
-                (AV::Num(n), true) => AV::Ival(n, n),
-                (av, _) => av,
-            };
-            h1 = h1.wrapping_add(cell_mix(f.cell, av, KEY_SEED1));
-            h2 = h2.wrapping_add(cell_mix(f.cell, av, KEY_SEED2));
+            let code = f.code(buf, i);
+            h1 = h1.wrapping_add(mix64(f.c[0] ^ code));
+            h2 = h2.wrapping_add(mix64(f.c[1] ^ code));
         }
         (h1, h2)
     }
@@ -2282,7 +2333,7 @@ fn build_one_shape(
                     Some(k) => slot_of[off + nfields + 2 + k],
                     None => slot_of[off + j],
                 };
-                Some(KeyField { cell: outputs[j].0 as u64, root, kind: compiled.root_kinds[root], span: keyed.is_some() })
+                Some(KeyField::new(outputs[j].0 as u64, root, compiled.root_kinds[root], keyed.is_some()))
             })
             .collect();
         asm_bodies.push(AsmBody {
