@@ -7,9 +7,13 @@ widening it, agreed with Philippe.
 ## Built (2026-09-17, level 0 only, the minimum to measure)
 
 Opt-in through the level flag `f` (`r0sxhf`; `FruitPrecision`, rem Bits(0) and
-exact position only, a registry slot of its own). Not built: the block-model
-side (`Rt2::widen_to`, the mark filter refuses a fruit-unknown coarser level
-loudly), the finer-level dead `step`, gates and ladder runs.
+exact position only, a registry slot of its own). The block-model side since
+2026-09-18: `Rt2::widen_to(.., fruit)` projects an exact row onto the level as
+its kernels write it (`step`/`y` `AV::UNum`, `fly` `AV::UBool`, `spd.y`/`rem.y`
+the ranges, each asserted per lane to contain the value it replaces; the ranges
+are ONE definition, `runtime2::FLY_FRUIT_SPD_Y`/`FLY_FRUIT_REM_Y`), so the mark
+filter links `r0sxhf` to the finer levels. Not built: the finer-level dead
+`step`.
 
 - **The unknown number** is a graph leaf, `Op::UnknownNum`: arithmetic, `min`/
   `max`, `abs`/`flr` of it are it, `sin` of it is [-1, 1], a comparison with it
@@ -109,6 +113,35 @@ branch over a heap both branches left alike, took one arm by the condition's
 value bit on a lane where `c` is undecided. Test:
 `a_returned_select_carries_the_decided_premise` (fails without the fix). Room
 (3,0) `r0sxhf` f1-f40 and the room (1,0) gates are unchanged by it.
+
+### The mark filter, and a real search (2026-09-18)
+
+Validated on a synthetic win (room (3,0), `--win-at 10,77`, `--from 30`):
+`r0sxhf,r0sxh,rxsx` and the control `r0sxh,rxsx` both report OPTIMAL 35, and
+`r0sxh` marks the same 338 states (fingerprint `8544ef59a244b38b`) behind the
+fruit filter as without it; the exact level the same 137. The projection agrees
+with what the kernels write. Room (1,0) marks gate unchanged.
+
+The search, `CELESTE_REGION=32,6`, `r0sxhf,r0sxh..r15sxh,rxsx`, `--from 1 --to
+250`, against the held ladder's run (plans/room30.md, stopped at f52). Killed
+by the 60 GB cap after f58, no level-0 win:
+
+| | `r0sxh..` (2026-09-17) | `r0sxhf,r0sxh..` (2026-09-18) |
+|---|---|---|
+| kernel prebuild | 17 levels, 546.7 s | 18 levels, 407.2 s |
+| f40 | 176,925 states, 0.40 s | 133,228, 0.90 s |
+| f44 | 825,170, 1.6 s | 376,427, 2.0 s |
+| f48 | 3,886,471, 7.9 s | 1,334,635, 3.6 s |
+| f50 | 8,993,524, 20.8 s | 2,523,979, 6.4 s |
+| f52 | 21,500,008, 72.4 s, 27.7 GB peak | 5,289,522, 13.3 s, 20.7 GB |
+| f55 | - | 17,556,119, 52.6 s, 27.9 GB |
+| f58 | - | 60,781,081, 291.7 s, 52.8 GB |
+
+The prebuild is faster despite a level more (the copy-free merges). The early
+frames are slower with fewer states: the `r0sxhf` kernels have 89,901 bodies
+against 25,034 (collected / not and flying / waiting stay separate outcomes).
+From ~f48 the fruit level is ahead, 5.5x at f52. It does not saturate (x1.5
+states per frame from f55): the fall floors' timers and the player's speed.
 
 ## Why
 

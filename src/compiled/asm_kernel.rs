@@ -1219,7 +1219,7 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     } else {
         // The key hashes the speed BUCKET (the row stores the hull).
         if let Some(w) = crate::interpreter::abstraction::spd_precision().width_log2() {
-            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1), false);
+            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1), false, false);
         }
         b.boundary(&super::boundary_ids());
     }

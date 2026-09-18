@@ -158,7 +158,21 @@ pub struct BoundaryIds {
     /// The player's held-button trails (`abstraction::HeldPrecision`).
     pub f_p_jump: u32,
     pub f_p_dash: u32,
+    /// The fly fruit at a fruit-unknown level (`abstraction::FruitPrecision`):
+    /// its type global and the `step` / `fly` fields (`y`, `spd`, `rem` above).
+    pub g_fly_fruit: u32,
+    pub f_step: u32,
+    pub f_fly: u32,
 }
+
+/// The fly fruit's `spd.y` range at a fruit-unknown level (raw 16.16,
+/// inclusive): waiting, `sin(step) * 0.5` in [-0.5, 0.5]; flying,
+/// `appr(spd.y, -3.5, 0.25)` from inside stays inside. What the level's kernels
+/// write (`trace::widen::widen_fly_fruit`, which checks the frame computed
+/// values inside it) and what `Rt2::widen_to` projects exact rows onto.
+pub const FLY_FRUIT_SPD_Y: (i32, i32) = (-0x3_8000, 0x8000);
+/// The fly fruit's `rem.y` range, [-0.5, 0.5): `move`'s own arithmetic.
+pub const FLY_FRUIT_REM_Y: (i32, i32) = (-0x8000, 0x7fff);
 
 pub struct Rt2 {
     pub width: usize,
@@ -760,7 +774,7 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, 0, None, (1, 1), false);
+        self.widen_to(ids, 0, None, (1, 1), false, false);
     }
 
     /// The boundary widenings of the `Bits(rem_bits)` level on this block's
@@ -779,7 +793,7 @@ impl Rt2 {
     /// players' `spd.x`/`spd.y` to, `None` for exact speed - the level's
     /// `abstraction::spd_precision_for`, which the caller passes because
     /// the switch lives above this crate.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool, fruit: bool) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 0. position widening (the rung below level 0): the player's
@@ -1038,6 +1052,44 @@ impl Rt2 {
                 for f in [ids.f_p_jump, ids.f_p_dash] {
                     let c = self.obj_field_cell(obj, f).unwrap_or_else(|| panic!("held widening: the player has no p_jump / p_dash field"));
                     self.cols[c as usize] = Col::U(AV::UBool);
+                }
+            }
+        }
+
+        // 7. The fly fruit at a fruit-unknown level (plans/fly-fruit.md), as
+        // that level's kernels write it (`widen::widen_fly_fruit`): `step` and
+        // `y` the unknown number, `fly` unknown, `spd.y` and `rem.y` their
+        // ranges. Each is asserted per lane to contain the value it replaces:
+        // a widening only ever replaces a value by something containing it.
+        if fruit {
+            for obj in self.objects_of_type(ids, ids.g_fly_fruit) {
+                let field = |rt: &Self, name: &str, f: u32| {
+                    rt.obj_field_cell(obj, f).unwrap_or_else(|| panic!("fly fruit widening: the fly fruit has no `{name}` field"))
+                };
+                let check = |rt: &Self, c: u32, name: &str, ok: &dyn Fn(AV) -> bool| {
+                    for lane in 0..rt.width {
+                        let v = rt.cols[c as usize].at(lane);
+                        assert!(ok(v), "fly fruit widening: lane {lane} of `{name}` is {v:?}, which the widening does not contain");
+                    }
+                };
+                for (name, f) in [("step", ids.f_step), ("y", ids.f_y)] {
+                    let c = field(self, name, f);
+                    check(self, c, name, &|v| matches!(v, AV::Num(_) | AV::Ival(..) | AV::UNum));
+                    self.cols[c as usize] = Col::U(AV::UNum);
+                }
+                let fly = field(self, "fly", ids.f_fly);
+                check(self, fly, "fly", &|v| matches!(v, AV::Bool(_) | AV::UBool));
+                self.cols[fly as usize] = Col::U(AV::UBool);
+                for (name, f, (lo, hi)) in [("spd.y", ids.f_spd, FLY_FRUIT_SPD_Y), ("rem.y", ids.f_rem, FLY_FRUIT_REM_Y)] {
+                    let cells = self.xy_cells_of(obj, f, ids);
+                    let [_, c] = cells[..] else { panic!("fly fruit widening: the fly fruit has no `{name}`") };
+                    let (lo, hi) = (P8::from_raw(lo), P8::from_raw(hi));
+                    check(self, c, name, &|v| match v {
+                        AV::Num(n) => lo <= n && n <= hi,
+                        AV::Ival(a, b) => lo <= a && b <= hi,
+                        _ => false,
+                    });
+                    self.cols[c as usize] = Col::U(AV::Ival(lo, hi));
                 }
             }
         }

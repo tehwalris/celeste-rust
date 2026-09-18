@@ -171,11 +171,9 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
     Ok(())
 }
 
-/// The fly fruit's `spd.y` range: waiting, `sin(step) * 0.5` in [-0.5, 0.5];
-/// flying, `appr(spd.y, -3.5, 0.25)` from inside stays inside.
-const FRUIT_SPD_Y: (i32, i32) = (-0x3_8000, 0x8000);
-/// The fly fruit's `rem.y` range, [-0.5, 0.5): `move`'s own arithmetic.
-const FRUIT_REM_Y: (i32, i32) = (-0x8000, 0x7fff);
+/// The fly fruit's `spd.y` and `rem.y` ranges: ONE definition, shared with the
+/// block model's projection (`Rt2::widen_to`), or the mark filter misses.
+use celeste_engine::runtime2::{FLY_FRUIT_REM_Y as FRUIT_REM_Y, FLY_FRUIT_SPD_Y as FRUIT_SPD_Y};
 
 /// The fields a fruit-unknown level widens, per live fly fruit
 /// (plans/fly-fruit.md).

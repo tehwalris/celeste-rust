@@ -1414,12 +1414,9 @@ pub fn widened_keys_rt2(
     coarser: crate::interpreter::abstraction::Level,
 ) -> Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
     use crate::interpreter::abstraction::RemPrecision;
-    // Projecting a row onto a fruit-unknown level (`widen_fly_fruit`'s fields)
-    // is not built: refuse rather than miss every mark (plans/fly-fruit.md).
-    anyhow::ensure!(!coarser.fruit.is_unknown(), "the mark filter does not project rows onto a fruit-unknown level {coarser} (plans/fly-fruit.md)");
     let mut w = rt2.clone_block();
     if let RemPrecision::Bits(b) = coarser.rem {
-        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y), coarser.held.is_unknown());
+        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y), coarser.held.is_unknown(), coarser.fruit.is_unknown());
     }
     let keys = w.row_keys_canonical();
     let cells = crate::search::pos_graph::block_cells(&w)?;
