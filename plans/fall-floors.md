@@ -186,6 +186,23 @@ it is still the cheap half; a 16-lane fold over the slots is the next step.)
 The batch/pressure knobs of the scheduler (`CELESTE_ASM_BATCH=1`) moved the
 big kernel by nothing.
 
+Then two more, the same bench (instructions and cycles per rep; the timings
+share the machine with the live search):
+
+| | wall | cycles | instructions |
+|---|---|---|---|
+| keys in the kernels (before) | ~80 s | 5.42T | 0.49T |
+| keys folded per emitted row | ~50 s | 3.79T | 1.58T |
+| + the fold specialized per field (no `AV` per row) | 42-48 s | 3.37T | 0.96T |
+| + redundant reloads dropped | ~33 s | 2.89T | 0.95T |
+
+The last is a peephole over the emitted body (`drop_redundant_reloads`): a
+spilled value is reloaded at every use, often straight back into the scratch
+register an earlier use left it in. 21% of the big kernel's reloads were that
+(another 4% could come from another register holding the slot: not taken); in
+the current code, the (6,5) player kernel 5.83M -> 5.52M instructions, its
+reloads 2.66M -> 2.36M.
+
 What is left of the walk is the tracer itself: ~0.7 CPU-s per trace, heap
 clones at splits and merges 31%, dropping states 17%, canons of `if` merges
 16%. Copy-on-write tables would be the next step.

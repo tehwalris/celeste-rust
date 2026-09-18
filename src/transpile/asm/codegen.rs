@@ -1788,6 +1788,67 @@ impl<'a> Emitter<'a> {
 }
 
 /// Compile `roots` (each a word-domain node) of `g` into AVX-512 assembly.
+/// Drop every stack reload into a register that already holds that slot: a
+/// spilled value is reloaded at each use, often straight back into the
+/// scratch register an earlier use left it in (room (3,0)'s biggest kernel:
+/// 856k of its 4.16M reloads, 2026-09-18). A register holds a slot from a
+/// reload of it or a spill of it until anything writes the register (the last
+/// operand, AT&T); a spill to the slot makes every other holder stale; any
+/// other access to the stack, a label, jump, call, return or `vzeroupper`
+/// forgets everything - so only a straight-line run of our own emitted
+/// reload/spill forms is ever optimized.
+fn drop_redundant_reloads(body: &str) -> String {
+    let reg = |s: &str| -> Option<usize> {
+        let s = s.strip_prefix("%zmm").or_else(|| s.strip_prefix("%ymm")).or_else(|| s.strip_prefix("%xmm"))?;
+        let n: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        n.parse().ok()
+    };
+    fn slot(s: &str) -> Option<&str> {
+        s.strip_suffix("(%rsp)")
+    }
+    let mut holds: [Option<String>; 32] = Default::default();
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let t = line.trim();
+        let (mn, ops) = t.split_once(' ').unwrap_or((t, ""));
+        let (a, b) = ops.rsplit_once(", ").unwrap_or(("", ops));
+        let forget = |holds: &mut [Option<String>; 32]| *holds = Default::default();
+        if mn == "vmovdqu64" && slot(a).is_some() && b.starts_with("%zmm") {
+            // A reload: `vmovdqu64 OFF(%rsp), %zmmR`.
+            let (s, r) = (slot(a).unwrap().to_string(), reg(b).unwrap_or(usize::MAX));
+            if r < 32 && holds[r].as_deref() == Some(s.as_str()) {
+                continue;
+            }
+            if r < 32 {
+                holds[r] = Some(s);
+            } else {
+                forget(&mut holds);
+            }
+        } else if mn == "vmovdqu64" && a.starts_with("%zmm") && slot(b).is_some() {
+            // A spill: `vmovdqu64 %zmmR, OFF(%rsp)`.
+            let s = slot(b).unwrap();
+            for h in holds.iter_mut() {
+                if h.as_deref() == Some(s) {
+                    *h = None;
+                }
+            }
+            match reg(a) {
+                Some(r) if r < 32 => holds[r] = Some(s.to_string()),
+                _ => forget(&mut holds),
+            }
+        } else if t.contains("(%rsp)") || t.ends_with(':') || mn.starts_with('j') || mn == "call" || mn == "ret" || mn == "vzeroupper" || t.starts_with('.') {
+            forget(&mut holds);
+        } else if let Some(r) = reg(b) {
+            if r < 32 {
+                holds[r] = None;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 pub fn compile(
     g: &Graph,
     roots: &[NodeId],
@@ -1984,6 +2045,7 @@ pub fn compile(
         em.emit_inst(inst);
     }
     std::mem::swap(&mut em.out, &mut body); // em.out empty again, body holds the code
+    let body = drop_redundant_reloads(&body);
 
     // Frame: spill slots, then (if any call-outs) the zmm save area and the
     // call-out arg buffers. r13/r14/r15 are callee-saved and hold the input,
