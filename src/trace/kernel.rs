@@ -2271,6 +2271,8 @@ pub fn room_constant_lattice(
     it.d.held_unknown = opts.held;
     // ... and replaces the fly fruit's widened fields (`widen::fork_fruit_inputs`).
     it.d.fruit_unknown = opts.fruit;
+    // ... and the fall floors' (`widen::fork_floor_inputs`).
+    it.d.floors_unknown = opts.floors;
 
     let st = cart::fresh_state::<Symbolic>(&mut it.d);
     let st = run_one(&mut it, top, st)?;
@@ -2290,7 +2292,7 @@ pub fn room_constant_lattice(
 
     let sk = key(&start)?;
     let start_key = sk.clone();
-    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit)?);
+    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors)?);
     reps.insert(sk.clone(), start.clone());
     // THE REGION KEY (`RegionGrid`): a node is (shape, region), the lattice
     // stays per shape, and a narrowed lattice re-traces every region its
@@ -2636,11 +2638,14 @@ fn walk_trace(
             continue;
         }
         let key = format!("{:?}", o.st.shape()?);
-        let constants = shapes::field_constants(&o.st, &tr.it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit)?;
+        let constants = shapes::field_constants(&o.st, &tr.it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors)?;
         let mut ival = Vec::new();
         if opts.ival {
             let widened = shapes::ival_paths(&o.st, opts.spd_ival(), opts.pos_ival());
-            let fruit: Vec<super::iface::Path> = if opts.fruit { super::widen::fly_fruit_paths(&o.st).all().cloned().collect() } else { Vec::new() };
+            let mut fruit: Vec<super::iface::Path> = if opts.fruit { super::widen::fly_fruit_paths(&o.st).all().cloned().collect() } else { Vec::new() };
+            if opts.floors {
+                fruit.extend(super::widen::fall_floor_paths(&o.st).all().cloned());
+            }
             for p in shapes::state_paths(&o.st)? {
                 if widened.contains(&p) || fruit.contains(&p) {
                     continue;

@@ -296,16 +296,16 @@ fn merge_inner<D: Domain>(
                     let vb = tb.hash.get(k).ok_or_else(|| {
                         anyhow::anyhow!("merge: key {:?} missing after equal shapes", k)
                     })?;
-                    joined.slot(d, cond, rejoin, *rt, || SlotKey::Hash(k.clone()), va, vb)?;
+                    joined.slot(d, cond,*rt, || SlotKey::Hash(k.clone()), va, vb)?;
                 }
                 for (i, va) in ta.arr.iter().enumerate() {
-                    joined.slot(d, cond, rejoin, *rt, || SlotKey::Arr(i), va, &tb.arr[i])?;
+                    joined.slot(d, cond,*rt, || SlotKey::Arr(i), va, &tb.arr[i])?;
                 }
                 for (k, va) in &ta.ints {
                     let vb = tb.ints.get(k).ok_or_else(|| {
                         anyhow::anyhow!("merge: index {} missing after equal shapes", k)
                     })?;
-                    joined.slot(d, cond, rejoin, *rt, || SlotKey::Int(*k), va, vb)?;
+                    joined.slot(d, cond,*rt, || SlotKey::Int(*k), va, vb)?;
                 }
             }
             (Root::Scope(a), Root::Scope(b)) => {
@@ -314,7 +314,7 @@ fn merge_inner<D: Domain>(
                     let vb = sb.vars.get(k).ok_or_else(|| {
                         anyhow::anyhow!("merge: local {:?} missing after equal shapes", k)
                     })?;
-                    joined.slot(d, cond, rejoin, *rt, || SlotKey::Var(k.clone()), va, vb)?;
+                    joined.slot(d, cond,*rt, || SlotKey::Var(k.clone()), va, vb)?;
                 }
             }
             // A closure has no mutable content - which body it is and
@@ -330,7 +330,8 @@ fn merge_inner<D: Domain>(
     }
 
     let per_case = d.sel_bool(cond, &t.ok, &f.ok);
-    let ok_selects = !(rejoin && t.ok == f.ok) && d.is_select_bool(&per_case);
+    // Likewise `ok`: an `ok` both sides hold alike is no select on `cond`.
+    let ok_selects = t.ok != f.ok && d.is_select_bool(&per_case);
     let Joined { writes, selects, mut first_select } = joined;
     if first_select.is_none() && ok_selects {
         first_select = Some("ok".to_string());
@@ -440,18 +441,18 @@ impl<D: Domain> Joined<D> {
         &mut self,
         d: &mut D,
         cond: &D::Bool,
-        rejoin: bool,
         root: Root,
         key: impl FnOnce() -> SlotKey,
         a: &Value<D>,
         b: &Value<D>,
     ) -> Result<()> {
         let j = join(d, cond, a, b)?;
-        // A rejoin on a given condition (`merge_on`) counts only the selects
-        // IT made: a slot both fragments hold alike keeps whatever select an
-        // earlier merge left there, which reads its own condition, not this
-        // one. (The ordinary merge keeps counting those too, as it always has.)
-        let sel = !(rejoin && a == b)
+        // Only the selects THIS merge made read `cond`'s value bit: a slot both
+        // sides hold alike keeps whatever select an earlier merge left there,
+        // which reads its own condition and carries its own premise. (Counting
+        // those too made every merge on an undecided atom refuse over the
+        // spawn's `delay`, room (3,0) with the floors unknown, 2026-09-18.)
+        let sel = a != b
             && match &j {
                 Value::Num(n) => d.is_select_num(n),
                 Value::Bool(x) => d.is_select_bool(x),

@@ -168,6 +168,77 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
     widen_fruit(st, d)?;
     widen_timers(st, d)?;
     widen_fly_fruit(st, d)?;
+    widen_fall_floors(st, d)?;
+    Ok(())
+}
+
+/// The fields a floors-unknown level widens, per fall floor
+/// (plans/fall-floors.md).
+pub struct FallFloorPaths {
+    /// `state` and `delay`: the unknown number.
+    pub unknown: Vec<Path>,
+    /// `collideable`: an unknown boolean.
+    pub collideable: Vec<Path>,
+}
+
+impl FallFloorPaths {
+    pub fn all(&self) -> impl Iterator<Item = &Path> {
+        self.unknown.iter().chain(self.collideable.iter())
+    }
+}
+
+pub fn fall_floor_paths<D: Domain>(st: &State<D>) -> FallFloorPaths {
+    let mut out = FallFloorPaths { unknown: Vec::new(), collideable: Vec::new() };
+    for obj in objects_of_type(st, "fall_floor") {
+        out.unknown.push(field(&obj, &["state"]));
+        out.unknown.push(field(&obj, &["delay"]));
+        out.collideable.push(field(&obj, &["collideable"]));
+    }
+    out
+}
+
+/// The fall floors' INPUT side at a floors-unknown level (plans/fall-floors.md):
+/// `state` and `delay` the unknown number, `collideable` an undecided atom -
+/// every lane alike, no input cell read. A floor that never broke has no
+/// `delay` in the post-`_init` start state; it is materialized first
+/// (`ABSENT_AS_ZERO`, as every frame's output does), then replaced. A decided
+/// input lies inside and only over-approximates, so there is no premise.
+///
+/// `collideable` is read by other objects' collisions (the player's
+/// `is_solid`), whose decisions are the player's data, and an atom there leaves
+/// them undecided and their arms apart. But the floor's own update joins its
+/// `collideable` writes into a fresh atom, and that one becomes a fork of both
+/// values at the update's return (`Domain::escaped_atom`): what the player,
+/// updating after the floors, reads. A fork here would be dead, one fork id per
+/// floor (a `ChoiceSet` holds 58).
+pub fn fork_floor_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    materialize_absent_fields(st, d)?;
+    replace_fall_floors(st, d)
+}
+
+/// The fall floors' OUTPUT side at a floors-unknown level: `state` and `delay`
+/// the unknown number (stored `AV::UNum`, `emit::bind`), `collideable` unknown
+/// (stored `AV::UBool`). The unknown contains whatever the frame computed, so
+/// there is nothing to check.
+fn widen_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    if !d.floors_unknown {
+        return Ok(());
+    }
+    replace_fall_floors(st, d)
+}
+
+fn replace_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    let fp = fall_floor_paths(st);
+    for p in &fp.unknown {
+        let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
+        let u = d.unknown_num();
+        iface::set(st, p, Value::Num(u))?;
+    }
+    for p in &fp.collideable {
+        let Some(Value::Bool(_)) = iface::get(st, p) else { bail!("{}: not a boolean", iface::show(p)) };
+        let b = d.unknown_bool_atom();
+        iface::set(st, p, Value::Bool(b))?;
+    }
     Ok(())
 }
 
@@ -663,20 +734,13 @@ pub fn fork_pos_inputs<D: Domain>(
 /// configuration `jump` / `dash` are decided and the two arms are two bodies.
 /// One fork per trail, never memoized: the two trails are independent.
 pub fn fork_held_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    use crate::transpile::graph::Op;
     for obj in objects_of_type(st, "player") {
         for f in ["p_jump", "p_dash"] {
             let p = field(&obj, &[f]);
             let Some(Value::Bool(_)) = iface::get(st, &p) else {
                 bail!("{}: not a boolean", iface::show(&p));
             };
-            let fork = d.forks;
-            d.forks += 1;
-            d.graph.set_fork_ways(fork, 2);
-            let choices = d.graph.leaf(Op::Const(0, 1 << 16));
-            let choice = d.graph.fold(Op::SplitInt(fork), vec![choices]);
-            let zero = d.graph.leaf(Op::Const(0, 0));
-            let held = d.graph.fold(Op::Gt, vec![choice, zero]);
+            let held = d.both_values();
             iface::set(st, &p, Value::Bool(held))?;
         }
     }

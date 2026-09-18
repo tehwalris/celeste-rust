@@ -270,6 +270,10 @@ pub struct Compiled {
     pub sym: String,
     /// How many spill slots the allocator used (0 = everything fit).
     pub spill_slots: usize,
+    /// The kernel's stack frame in bytes (spill slots, save area, call-out
+    /// buffers): what the calling thread's stack must hold below the call
+    /// (`asm_kernel`'s stack check).
+    pub frame_bytes: u32,
 }
 
 // ---- constant pool ----
@@ -2194,5 +2198,6 @@ pub fn compile(
         root_kinds,
         sym: sym.to_string(),
         spill_slots,
+        frame_bytes: frame,
     })
 }

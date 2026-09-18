@@ -1608,6 +1608,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 // scope, not the caller's.
                 st.stack.push(outer);
                 st.scope = frame;
+                let atoms_before = self.d.atoms_minted();
                 let mut out = Vec::new();
                 for (mut s, flow) in self.exec_block(b.block(), st)? {
                     s.stack.pop();
@@ -1623,11 +1624,48 @@ impl<'a, D: Domain> Interp<'a, D> {
                 if out.iter().any(|(s, _)| s.frag.last().is_some_and(|f| f.0 > s.stack.len())) {
                     out = self.rejoin_fragments(out)?;
                 }
+                // The atoms made inside this call do not escape it
+                // (`Domain::escaped_atom`).
+                if self.d.atoms_minted() > atoms_before {
+                    out = out.into_iter().map(|(s, v)| self.fork_escaped_atoms(s, v, atoms_before)).collect();
+                }
                 Ok(out)
             }
             Value::Builtin(name) => self.call_builtin(name, args, st),
             other => bail!("calling a non-function: {:?}", other),
         }
+    }
+
+    /// Every heap boolean and the returned value that hold an atom made at or
+    /// after `since` become that atom's fork of both values
+    /// (`Domain::escaped_atom`).
+    fn fork_escaped_atoms(&mut self, mut s: State<D>, v: Value<D>, since: u32) -> (State<D>, Value<D>) {
+        // Only what the caller can still reach: the callee's frame is garbage,
+        // and a fork for an atom in it spends a fork id on nothing (room (3,0)
+        // with the fruit and the floors unknown: 63 forks, a `ChoiceSet` holds
+        // 58).
+        let mut roots = s.roots();
+        super::heap::push_value(&v, &mut roots);
+        let (tables, scopes, _) = s.heap.reachable(&roots);
+        let d = &mut self.d;
+        let mut swap = |x: &mut Value<D>| {
+            if let Value::Bool(b) = x {
+                if let Some(f) = d.escaped_atom(b, since) {
+                    *b = f;
+                }
+            }
+        };
+        for (_, t) in s.heap.tables.iter_mut().filter(|(id, _)| tables.contains(id)) {
+            t.hash.values_mut().for_each(&mut swap);
+            t.arr.iter_mut().for_each(&mut swap);
+            t.ints.values_mut().for_each(&mut swap);
+        }
+        for (_, sc) in s.heap.scopes.iter_mut().filter(|(id, _)| scopes.contains(id)) {
+            sc.vars.values_mut().for_each(&mut swap);
+        }
+        let mut v = v;
+        swap(&mut v);
+        (s, v)
     }
 
     /// Rejoin the fragments of the literal splits made inside a call that has

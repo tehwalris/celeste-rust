@@ -412,6 +412,14 @@ impl<D: Domain> Heap<D> {
     /// different garbage behind, so collecting is what makes them
     /// comparable rather than merely tidy.
     pub fn gc(&mut self, roots: &[Root]) {
+        let (live_t, live_s, live_c) = self.reachable(roots);
+        self.tables.retain(|k, _| live_t.contains(k));
+        self.scopes.retain(|k, _| live_s.contains(k));
+        self.closures.retain(|k, _| live_c.contains(k));
+    }
+
+    /// The tables, scopes and closures reachable from `roots`.
+    pub fn reachable(&self, roots: &[Root]) -> (BTreeSet<TableId>, BTreeSet<ScopeId>, BTreeSet<ClosureId>) {
         let mut live_t: BTreeSet<TableId> = BTreeSet::new();
         let mut live_s: BTreeSet<ScopeId> = BTreeSet::new();
         let mut live_c: BTreeSet<ClosureId> = BTreeSet::new();
@@ -451,9 +459,7 @@ impl<D: Domain> Heap<D> {
                 }
             }
         }
-        self.tables.retain(|k, _| live_t.contains(k));
-        self.scopes.retain(|k, _| live_s.contains(k));
-        self.closures.retain(|k, _| live_c.contains(k));
+        (live_t, live_s, live_c)
     }
 }
 

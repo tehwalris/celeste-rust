@@ -67,6 +67,10 @@ pub fn run_frame_all<'a>(
     if crate::interpreter::abstraction::current_level().fruit.is_unknown() {
         anyhow::bail!("the reference engine does not run fruit-unknown levels (plans/fly-fruit.md)");
     }
+    // Nor the fall floors unknown, for the same reason.
+    if crate::interpreter::abstraction::current_level().floors.is_unknown() {
+        anyhow::bail!("the reference engine does not run floors-unknown levels (plans/fall-floors.md)");
+    }
     loop {
         it.d.cursor.reset();
         it.prints.clear();

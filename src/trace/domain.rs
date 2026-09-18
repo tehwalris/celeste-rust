@@ -287,6 +287,23 @@ pub trait Domain {
     fn undecided_atom(&mut self) -> Result<Self::Bool> {
         bail!("this domain has no undecided booleans")
     }
+
+    /// How many undecided atoms this frame has handed out: `Interp` marks it
+    /// where a call begins (`Interp::fork_escaped_atoms`).
+    fn atoms_minted(&self) -> u32 {
+        0
+    }
+
+    /// An atom handed out at or after `since` that ESCAPES the call that made
+    /// it (held in the heap, or returned) becomes a fork of both values, one per
+    /// atom. Inside the call it stays an atom; after it, a read by lane data (a
+    /// fall floor's `collideable`, joined under undecided `state` branches, read
+    /// by the player's collisions) decides per configuration instead of leaving
+    /// every such decision undecided and its arms apart. Fresh, so nothing read
+    /// it before; both values contain the atom's. `None` for anything else.
+    fn escaped_atom(&mut self, _b: &Self::Bool, _since: u32) -> Option<Self::Bool> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------- concrete
@@ -404,8 +421,16 @@ pub struct Symbolic {
     /// literal intervals folds to literals, and a merge on a condition no lane
     /// decides joins its literal arms (`join_num_independent`). Set by the walk.
     pub fruit_unknown: bool,
+    /// The fall floors unknown (`abstraction::FloorsPrecision`,
+    /// plans/fall-floors.md): `trace_frame` replaces every fall floor's
+    /// `state`, `delay` and `collideable` (`widen::fork_floor_inputs`), with the
+    /// same literal and atom machinery as the fruit (`unknowns`). Set by the walk.
+    pub floors_unknown: bool,
     /// How many `Op::UnknownBool` atoms this frame handed out.
     pub unknown_atoms: u32,
+    /// `escaped_atom`'s memo: the fork each escaped atom became, this frame.
+    /// Cleared with `unknown_atoms` (atom ids restart per frame).
+    pub escaped: rustc_hash::FxHashMap<NodeId, NodeId>,
     /// `lane_independent`'s memo. Structural (a node's op and operands never
     /// change), so it outlives a frame.
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
@@ -474,6 +499,26 @@ impl Symbolic {
 
     /// A fresh undecided atom (`Op::UnknownBool`), distinct from every other
     /// this frame.
+    /// Is anything unknown in the set being traced (the fly fruit, the fall
+    /// floors)? The literal folding, the independent joins and the literal
+    /// splits switch on with it.
+    pub fn unknowns(&self) -> bool {
+        self.fruit_unknown || self.floors_unknown
+    }
+
+    /// A boolean every lane holds in BOTH values: a 2-way fork with no
+    /// validity (every configuration applies to every lane), `choice > 0` over
+    /// the whole grid - the held buttons' fork (`widen::fork_held_inputs`).
+    pub fn both_values(&mut self) -> NodeId {
+        let fork = self.forks;
+        self.forks += 1;
+        self.graph.set_fork_ways(fork, 2);
+        let choices = self.graph.leaf(Op::Const(0, 1 << 16));
+        let choice = self.graph.fold(Op::SplitInt(fork), vec![choices]);
+        let zero = self.graph.leaf(Op::Const(0, 0));
+        self.graph.fold(Op::Gt, vec![choice, zero])
+    }
+
     pub fn unknown_bool_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;
@@ -514,7 +559,7 @@ impl Symbolic {
     /// wrap at the 16.16 extremes, a non-positive scale). A fruit-unknown set
     /// only.
     fn eval_literal(&self, op: &Op, args: &[NodeId]) -> Option<crate::transpile::graph::Val> {
-        if !self.fruit_unknown {
+        if !self.unknowns() {
             return None;
         }
         let lits: Vec<(i32, i32)> = args
@@ -905,7 +950,7 @@ impl Domain for Symbolic {
     }
 
     fn join_num_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
-        if !self.fruit_unknown || self.decide(c).is_some() || !self.lane_independent(*c) {
+        if !self.unknowns() || self.decide(c).is_some() || !self.lane_independent(*c) {
             return None;
         }
         if t == f {
@@ -921,7 +966,7 @@ impl Domain for Symbolic {
     }
 
     fn reads_unknown_atom(&mut self, c: &NodeId) -> bool {
-        if !self.fruit_unknown || self.decide(c).is_some() {
+        if !self.unknowns() || self.decide(c).is_some() {
             return false;
         }
         // Post-order, every node walked memoized (`lane_independent`'s walk):
@@ -950,7 +995,7 @@ impl Domain for Symbolic {
     }
 
     fn join_bool_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
-        if !self.fruit_unknown || self.decide(c).is_some() || !self.lane_independent(*c) {
+        if !self.unknowns() || self.decide(c).is_some() || !self.lane_independent(*c) {
             return None;
         }
         if t == f {
@@ -959,8 +1004,26 @@ impl Domain for Symbolic {
         Some(self.unknown_bool_atom())
     }
 
+    fn atoms_minted(&self) -> u32 {
+        self.unknown_atoms
+    }
+
+    fn escaped_atom(&mut self, b: &NodeId, since: u32) -> Option<NodeId> {
+        match self.graph.get(*b).op {
+            Op::UnknownBool(k) if k >= since => {
+                if let Some(f) = self.escaped.get(b) {
+                    return Some(*f);
+                }
+                let f = self.both_values();
+                self.escaped.insert(*b, f);
+                Some(f)
+            }
+            _ => None,
+        }
+    }
+
     fn literal_fragments(&mut self, v: &NodeId) -> Option<Vec<NodeId>> {
-        if !self.fruit_unknown {
+        if !self.unknowns() {
             return None;
         }
         let Op::Const(lo, hi) = self.graph.get(*v).op else { return None };

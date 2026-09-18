@@ -1008,10 +1008,43 @@ impl Graph {
                     (None, Some(_)) => return args[0],
                     _ => {}
                 }
+                // `(g and c) or (g and not c)` is `g`, exactly, for every
+                // concrete `c`. A split's two guards merge into this, and
+                // left unfolded the merged guard - an outcome's `live` - reads
+                // the split's condition, so every fork it split on enters the
+                // configuration product (room (3,0), 2026-09-18: each fall
+                // floor's forked `collideable` in `collide`'s `and`, 2^12).
+                let and_args = |g: &Graph, n: NodeId| -> Option<[NodeId; 2]> {
+                    let node = &g.nodes[n as usize];
+                    (node.op == Op::And).then(|| [node.args[0], node.args[1]])
+                };
+                if let (Some(a), Some(b)) = (and_args(self, args[0]), and_args(self, args[1])) {
+                    for i in 0..2 {
+                        for j in 0..2 {
+                            if a[i] == b[j] && self.complements(a[1 - i], b[1 - j]) {
+                                return a[i];
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
         self.add(op, args)
+    }
+
+    /// Is `y` the negation of `x`: `Not(x)`, or the opposite comparison over
+    /// the same operands (`fold(Not)` turns `not (a < b)` into `a >= b`)?
+    fn complements(&self, x: NodeId, y: NodeId) -> bool {
+        let (nx, ny) = (&self.nodes[x as usize], &self.nodes[y as usize]);
+        if (nx.op == Op::Not && nx.args[0] == y) || (ny.op == Op::Not && ny.args[0] == x) {
+            return true;
+        }
+        let opposite = matches!(
+            (&nx.op, &ny.op),
+            (Op::Lt, Op::Ge) | (Op::Ge, Op::Lt) | (Op::Le, Op::Gt) | (Op::Gt, Op::Le)
+        );
+        opposite && nx.args == ny.args
     }
 
     /// Resolve an emitted operand spelling to a node: a name the emitter
@@ -1880,6 +1913,31 @@ mod tests {
         let nc = g.fold(Op::Not, vec![c]);
         assert_eq!(g.fold(Op::Sel, vec![c, ff, x]), g.fold(Op::And, vec![nc, x]));
         assert_eq!(g.fold(Op::Sel, vec![c, x, tt]), g.fold(Op::Or, vec![nc, x]));
+    }
+
+    #[test]
+    fn a_split_guard_merged_back_is_the_guard() {
+        // `split` guards the two arms `g and c` / `g and not c`, and `merge`
+        // ORs them: the result is `g` for every concrete `c`, and must not
+        // read `c` (or its fork) any more.
+        let mut g = Graph::new();
+        let guard = g.leaf(Op::Cell(1));
+        let c = g.leaf(Op::Cell(2));
+        let nc = g.fold(Op::Not, vec![c]);
+        let t = g.fold(Op::And, vec![guard, c]);
+        let f = g.fold(Op::And, vec![nc, guard]);
+        assert_eq!(g.fold(Op::Or, vec![t, f]), guard);
+        // The negation of a comparison folds into the opposite comparison.
+        let (a, b) = (g.leaf(Op::Cell(3)), g.leaf(Op::Cell(4)));
+        let gt = g.fold(Op::Gt, vec![a, b]);
+        let le = g.fold(Op::Not, vec![gt]);
+        let t = g.fold(Op::And, vec![guard, gt]);
+        let f = g.fold(Op::And, vec![guard, le]);
+        assert_eq!(g.fold(Op::Or, vec![t, f]), guard);
+        // Two different conditions are not complements.
+        let d = g.leaf(Op::Cell(5));
+        let f = g.fold(Op::And, vec![guard, d]);
+        assert_ne!(g.fold(Op::Or, vec![t, f]), guard);
     }
 
     #[test]

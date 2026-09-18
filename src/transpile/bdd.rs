@@ -975,26 +975,31 @@ mod tests {
         let l1 = {
             let l = g.fold(Op::And, vec![a, p]);
             let r = g.fold(Op::And, vec![a, np]);
-            g.fold(Op::Or, vec![l, r])
+            // `add`, not `fold`: `Graph::fold` folds a remerge over one
+            // condition itself now, and this pass is what is under test.
+            g.add(Op::Or, vec![l, r])
         };
         let gt = g.fold(Op::Gt, vec![x, y]);
         let le = g.fold(Op::Le, vec![x, y]);
         let l2 = {
             let l = g.fold(Op::And, vec![l1, gt]);
             let r = g.fold(Op::And, vec![l1, le]);
-            g.fold(Op::Or, vec![l, r])
+            g.add(Op::Or, vec![l, r])
         };
         let q = g.leaf(Op::Cell(3));
         let nq = g.fold(Op::Not, vec![q]);
         let l3 = {
             let l = g.fold(Op::And, vec![l2, q]);
             let r = g.fold(Op::And, vec![l2, nq]);
-            g.fold(Op::Or, vec![l, r])
+            g.add(Op::Or, vec![l, r])
         };
         let (out, map, st) = local(&g, &[l3]);
         assert_eq!(map[l3 as usize], map[a as usize], "the whole chain is A");
         assert_eq!(out.get(map[l3 as usize]).op, Op::And);
-        assert_eq!(st.merged, 3, "one merge per level: {:?}", st);
+        // The pass rebuilds through `Graph::fold`, which folds each level's
+        // remerge itself now (`Graph::complements`), so nothing is left to count
+        // as a BDD merge: what remains is A's three nodes, in one pass.
+        assert_eq!(st.after, 3, "the chain is A's three nodes: {:?}", st);
     }
 
     /// What `simplify_until_stable` needed a second pass for, the local pass

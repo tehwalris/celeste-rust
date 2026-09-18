@@ -277,6 +277,14 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
                 widen.push((o.cells[i], AV::UBool));
             }
         }
+        // The fall floors unknown: their `collideable` written unknown, uniform
+        // (`widen::widen_fall_floors`).
+        if f.floors_unknown {
+            for p in crate::trace::widen::fall_floor_paths(&o.st).collideable {
+                let i = o.fields.iter().position(|(q, _, _)| *q == p).ok_or_else(|| anyhow::anyhow!("{}: the fall floor's `collideable` is not an output field", crate::trace::iface::show(&p)))?;
+                widen.push((o.cells[i], AV::UBool));
+            }
+        }
         let keys: Vec<(usize, NodeId)> =
             o.keys.iter().enumerate().map(|(k, (fi, _))| (*fi, roots[at + n + 2 + k])).collect();
         outcomes.push(FrameOutcome {

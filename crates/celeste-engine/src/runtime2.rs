@@ -163,6 +163,11 @@ pub struct BoundaryIds {
     pub g_fly_fruit: u32,
     pub f_step: u32,
     pub f_fly: u32,
+    /// The fall floors at a floors-unknown level (`abstraction::FloorsPrecision`).
+    pub g_fall_floor: u32,
+    pub f_state: u32,
+    pub f_delay: u32,
+    pub f_collideable: u32,
 }
 
 /// The fly fruit's `spd.y` range at a fruit-unknown level (raw 16.16,
@@ -774,7 +779,7 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, 0, None, (1, 1), false, false);
+        self.widen_to(ids, 0, None, (1, 1), false, false, false);
     }
 
     /// The boundary widenings of the `Bits(rem_bits)` level on this block's
@@ -793,7 +798,7 @@ impl Rt2 {
     /// players' `spd.x`/`spd.y` to, `None` for exact speed - the level's
     /// `abstraction::spd_precision_for`, which the caller passes because
     /// the switch lives above this crate.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool, fruit: bool) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool, fruit: bool, floors: bool) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 0. position widening (the rung below level 0): the player's
@@ -1061,16 +1066,16 @@ impl Rt2 {
         // `y` the unknown number, `fly` unknown, `spd.y` and `rem.y` their
         // ranges. Each is asserted per lane to contain the value it replaces:
         // a widening only ever replaces a value by something containing it.
+        let check = |rt: &Self, c: u32, name: &str, ok: &dyn Fn(AV) -> bool| {
+            for lane in 0..rt.width {
+                let v = rt.cols[c as usize].at(lane);
+                assert!(ok(v), "object widening: lane {lane} of `{name}` is {v:?}, which the widening does not contain");
+            }
+        };
         if fruit {
             for obj in self.objects_of_type(ids, ids.g_fly_fruit) {
                 let field = |rt: &Self, name: &str, f: u32| {
                     rt.obj_field_cell(obj, f).unwrap_or_else(|| panic!("fly fruit widening: the fly fruit has no `{name}` field"))
-                };
-                let check = |rt: &Self, c: u32, name: &str, ok: &dyn Fn(AV) -> bool| {
-                    for lane in 0..rt.width {
-                        let v = rt.cols[c as usize].at(lane);
-                        assert!(ok(v), "fly fruit widening: lane {lane} of `{name}` is {v:?}, which the widening does not contain");
-                    }
                 };
                 for (name, f) in [("step", ids.f_step), ("y", ids.f_y)] {
                     let c = field(self, name, f);
@@ -1091,6 +1096,28 @@ impl Rt2 {
                     });
                     self.cols[c as usize] = Col::U(AV::Ival(lo, hi));
                 }
+            }
+        }
+
+        // 8. The fall floors at a floors-unknown level (plans/fall-floors.md),
+        // as that level's kernels write them (`widen::widen_fall_floors`):
+        // `state` and `delay` the unknown number, `collideable` unknown. A
+        // floor with no `delay` (a block built from the post-`_init` state,
+        // which the level keys exact, `frame::Block::from_state`) has nothing
+        // there to widen.
+        if floors {
+            for obj in self.objects_of_type(ids, ids.g_fall_floor) {
+                for (name, f) in [("state", ids.f_state), ("delay", ids.f_delay)] {
+                    let Some(c) = self.obj_field_cell(obj, f) else {
+                        assert!(f == ids.f_delay, "fall floor widening: the fall floor has no `{name}` field");
+                        continue;
+                    };
+                    check(self, c, name, &|v| matches!(v, AV::Num(_) | AV::Ival(..) | AV::UNum));
+                    self.cols[c as usize] = Col::U(AV::UNum);
+                }
+                let c = self.obj_field_cell(obj, ids.f_collideable).unwrap_or_else(|| panic!("fall floor widening: the fall floor has no `collideable` field"));
+                check(self, c, "collideable", &|v| matches!(v, AV::Bool(_) | AV::UBool));
+                self.cols[c as usize] = Col::U(AV::UBool);
             }
         }
     }

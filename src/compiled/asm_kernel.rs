@@ -162,6 +162,30 @@ impl AccTemplate {
     }
 }
 
+/// Rust's default stack for a spawned thread: what a thread that never called
+/// `set_thread_stack` is assumed to have.
+const DEFAULT_THREAD_STACK: usize = 2 << 20;
+/// Room a kernel call leaves for its callers' frames and its call-outs.
+const KERNEL_STACK_MARGIN: usize = 1 << 20;
+
+thread_local! {
+    static THREAD_STACK: std::cell::Cell<usize> = const { std::cell::Cell::new(DEFAULT_THREAD_STACK) };
+}
+
+/// Record this thread's stack size. Every kernel call checks that its spill
+/// frame fits (`Compiled::frame_bytes`): a kernel whose frame outgrew the
+/// forward workers' stack touched past it and segfaulted (room (3,0) with the
+/// fruit and the floors unknown, an 83 MB frame on a 64 MB stack, 2026-09-18).
+/// Call it first thing in a thread spawned with `stack_size(bytes)` that runs
+/// kernels.
+pub fn set_thread_stack(bytes: usize) {
+    THREAD_STACK.with(|s| s.set(bytes));
+}
+
+fn thread_stack() -> usize {
+    THREAD_STACK.with(|s| s.get())
+}
+
 /// One shape's assembled kernel: the loaded function, its input/output
 /// layout, and the per-body/per-outcome metadata the append needs.
 struct AsmKernel {
@@ -292,6 +316,16 @@ impl AsmKernel {
                 None => 0,
             };
             self.pack_input(&views, lanes, inbuf);
+            // The kernel's spill frame lives on THIS thread's stack: refuse
+            // loudly rather than touch past its end (`set_thread_stack`).
+            let (frame, stack) = (self.compiled.frame_bytes as usize, thread_stack());
+            assert!(
+                frame + KERNEL_STACK_MARGIN <= stack,
+                "kernel {}: its {:.1} MB stack frame does not fit this thread's {:.1} MB stack (a kernel thread needs `set_thread_stack` and a larger `stack_size`)",
+                self.compiled.sym,
+                frame as f64 / 1048576.0,
+                stack as f64 / 1048576.0
+            );
             unsafe {
                 (self.loaded.func)(
                     inbuf.as_ptr(),
@@ -1219,7 +1253,7 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     } else {
         // The key hashes the speed BUCKET (the row stores the hull).
         if let Some(w) = crate::interpreter::abstraction::spd_precision().width_log2() {
-            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1), false, false);
+            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1), false, false, false);
         }
         b.boundary(&super::boundary_ids());
     }
@@ -2120,10 +2154,11 @@ fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'stati
     const POS_SLOTS: usize = 4;
     // Held buttons exact or unknown.
     const HELD_SLOTS: usize = 2;
-    // The fly fruit exact or unknown.
+    // The fly fruit exact or unknown, the fall floors exact or unknown.
     const FRUIT_SLOTS: usize = 2;
-    static REGS: [std::sync::OnceLock<Option<Registry>>; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS] =
-        [const { std::sync::OnceLock::new() }; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS];
+    const FLOORS_SLOTS: usize = 2;
+    static REGS: [std::sync::OnceLock<Option<Registry>>; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS] =
+        [const { std::sync::OnceLock::new() }; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS];
     let rem_slot = match level.rem {
         RemPrecision::Exact => 16,
         RemPrecision::Bits(b) => (b as usize).min(16),
@@ -2136,7 +2171,9 @@ fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'stati
     let pos_slot = (level.pos.x.clamp(1, 2) as usize - 1) + 2 * (level.pos.y.clamp(1, 2) as usize - 1);
     let held_slot = level.held.is_unknown() as usize;
     let fruit_slot = level.fruit.is_unknown() as usize;
-    REGS[(((rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot) * HELD_SLOTS + held_slot) * FRUIT_SLOTS + fruit_slot].get_or_init(|| build_registry_for_rung(level)).as_ref()
+    let floors_slot = level.floors.is_unknown() as usize;
+    let slot = ((((rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot) * HELD_SLOTS + held_slot) * FRUIT_SLOTS + fruit_slot) * FLOORS_SLOTS + floors_slot;
+    REGS[slot].get_or_init(|| build_registry_for_rung(level)).as_ref()
 }
 
 /// Build every rung's kernel set now, all rungs at once (one builder
@@ -2162,7 +2199,7 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
     let mode = super::dispatch::traced_mode_for(rem);
     let (opts, exact) = match mode {
-        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos).with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()), false),
+        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos).with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()), false),
         super::dispatch::TracedMode::Level0Agnostic => {
             // Phase 1: the opt-in rung-specific variant bakes the rem
             // widening into the graph (`ladder_widen`), still through

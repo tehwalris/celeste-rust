@@ -96,6 +96,8 @@ impl Block {
         // (plans/fly-fruit.md).
         let level = crate::interpreter::abstraction::Level {
             fruit: crate::interpreter::abstraction::FruitPrecision::Exact,
+            // Likewise the fall floors (`widen::fork_floor_inputs`).
+            floors: crate::interpreter::abstraction::FloorsPrecision::Exact,
             ..crate::interpreter::abstraction::current_level()
         };
         let (_, keys, _) = widened_keys_rt2(&rt2, level)?;
@@ -1416,7 +1418,7 @@ pub fn widened_keys_rt2(
     use crate::interpreter::abstraction::RemPrecision;
     let mut w = rt2.clone_block();
     if let RemPrecision::Bits(b) = coarser.rem {
-        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y), coarser.held.is_unknown(), coarser.fruit.is_unknown());
+        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y), coarser.held.is_unknown(), coarser.fruit.is_unknown(), coarser.floors.is_unknown());
     }
     let keys = w.row_keys_canonical();
     let cells = crate::search::pos_graph::block_cells(&w)?;
@@ -1451,8 +1453,12 @@ pub trait FrameStep: Sync {
 const UNIT_LANES: usize = 16384;
 
 /// Stack per frame worker: the ASM kernels keep their spill frames on the
-/// stack (~0.5 MB at level 0, more at the finer rungs).
-const WORKER_STACK: usize = 64 << 20;
+/// stack (~0.5 MB at level 0, more at the finer rungs, 83 MB for room (3,0)'s
+/// largest kernel with the fruit and the floors unknown, which overflowed the
+/// 64 MB this was: a segfault at f59, 2026-09-18). Virtual: only the pages a
+/// kernel touches are resident. Every call checks its frame fits
+/// (`asm_kernel::set_thread_stack`).
+const WORKER_STACK: usize = 512 << 20;
 
 /// Cut `blocks` (by lane count) into `(block, lo, hi)` units.
 fn units_of(lanes: impl Iterator<Item = usize>, unit: usize) -> Vec<(usize, usize, usize)> {
@@ -1532,6 +1538,7 @@ pub fn forward_frame(
                 // the default 2 MB thread stack overflowed on room (0,0)'s
                 // level 1 (2026-09-13).
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
+                    crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     let t = Instant::now();
                     let mut sink = ForwardSink::forward(door, filter, pos.is_some(), frame, w as u32, edges_dir);
                     loop {
@@ -1808,6 +1815,7 @@ fn backward_walk(
                 .map(|_| {
                     let (cells, next_cell, targets, marked) = (&cells, &next_cell, &targets, &marked);
                     std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<(Vec<UnitOut>, std::time::Duration)> {
+                        crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                         let t_busy = std::time::Instant::now();
                         let mut out = Vec::new();
                         loop {

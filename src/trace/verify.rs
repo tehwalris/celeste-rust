@@ -93,6 +93,9 @@ pub struct Frame {
     /// Traced with the fly fruit unknown (`Symbolic::fruit_unknown`): every
     /// outcome writes its `fly` unknown (`emit::bind`).
     pub fruit_unknown: bool,
+    /// Traced with the fall floors unknown (`Symbolic::floors_unknown`): every
+    /// outcome writes their `collideable` unknown (`emit::bind`).
+    pub floors_unknown: bool,
     /// How many FORK choices this frame made (`__split_by_flr` on a
     /// widened value). The emitter needs it: a node whose cone contains
     /// a split lives at fork level 1 or deeper, and a body emitted at
@@ -235,6 +238,7 @@ pub fn trace_frame<'a>(
     // otherwise run out of buttons on the seventh.
     it.d.frees = 0;
     it.d.unknown_atoms = 0;
+    it.d.escaped.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
     // Built BEFORE the frame runs, so it names the input cells rather
     // than whatever the frame did to those slots.
@@ -283,6 +287,10 @@ pub fn trace_frame<'a>(
     // them (plans/fly-fruit.md).
     if it.d.fruit_unknown {
         super::widen::fork_fruit_inputs(&mut st, &mut it.d)?;
+    }
+    // The fall floors unknown: likewise (plans/fall-floors.md).
+    if it.d.floors_unknown {
+        super::widen::fork_floor_inputs(&mut st, &mut it.d)?;
     }
     let st = run_one(it, reset, st)?;
     let mut outs = Vec::new();
@@ -354,7 +362,7 @@ pub fn trace_frame<'a>(
     }
     let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
     let fork_tables: Vec<Vec<(i32, i32)>> = (0..it.d.forks).map(|d| it.d.graph.fork_table(d).to_vec()).collect();
-    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, forks: it.d.forks, fork_ways, fork_tables, outs, in_cells, in_rt2 })
+    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, floors_unknown: it.d.floors_unknown, forks: it.d.forks, fork_ways, fork_tables, outs, in_cells, in_rt2 })
 }
 
 /// The player is the object with a `djump` field. Naming it by
