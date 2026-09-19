@@ -69,12 +69,29 @@ state that widens onto it.
    coarse level over-approximates: a fine state that wins from t widens to
    a coarse one that does) and it prunes only states with no winning
    descendant, so every level's marked set, win frame and outcome are
-   unchanged - the marks gate is its check. Marks loaded from disk and the
+   unchanged - the marks gate is its check (identical, while its level 1
+   keeps 99,960 states over all frames against 110,675: -10%; `4413c85`).
+   Marks loaded from disk and the
    kernel re-run backward carry no deadline (`u16::MAX`): the old test.
    Unit test: `a_marks_deadline_is_the_last_frame_it_still_wins_from`.
 6. **Level 0 dropped from memory while the finer levels run** (count-down
    only, `Ladder::drop_level0`): ~10 GB idle at f89, resumed from disk in
    42 s when the next horizon needs it.
+   **Result (h89 level 1, r1sxhb):** level 1 started at 5.6 GB RSS (19.2
+   with level 0 held, 32.5 with every kernel set), peaked at 15.7M states at
+   f54 and then SHRANK - 3.2M at f60, 2.8M at f63 - where every earlier run
+   was still growing (39M at f61 before the OOM). Peak anonymous RSS
+   12.8 GB; the slowest frame 60 s.
+
+   | frame | old r0sxh | membership only | + deadline |
+   |---|---|---|---|
+   | f45 | 1.09M | 2.11M | 1.81M |
+   | f50 | 6.06M | 11.0M | 7.18M |
+   | f54-55 | 25.8M | (24.4M at f53) | 15.7M (peak) |
+   | f60 | 32.1M | - | 3.17M |
+
+   With this much headroom the kernel-set cap could go up (each rebuild is
+   ~35 s, 17 per horizon); left at 2 - not the bottleneck.
 7. **The crashed attempt's finer-level trees deleted** (`h089/`, `level01/`,
    63 GB): built under the old ladder. `level00/` (153 GB) is kept and reused -
    the new ladder's level 0 is the same `r0sxhfb`. Nothing on disk records a
