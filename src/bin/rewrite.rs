@@ -877,7 +877,7 @@ fn main() -> Result<()> {
                     if !marked.iter().any(|&m| m) {
                         continue;
                     }
-                    let allow = filter.allowed(block.rt2())?;
+                    let allow = filter.allowed(block.rt2(), f)?;
                     for (i, &m) in marked.iter().enumerate() {
                         if m {
                             self_total += 1;

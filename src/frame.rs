@@ -1072,7 +1072,7 @@ impl<'a> ForwardSink<'a> {
             let allow = match self.filter {
                 Some(f) => {
                     let t_f = std::time::Instant::now();
-                    let a = f.allowed(&slot.to_rt2())?;
+                    let a = f.allowed(&slot.to_rt2(), self.frame)?;
                     self.t_filter += t_f.elapsed();
                     Some(a)
                 }
@@ -1380,7 +1380,14 @@ impl<'a> MarkFilter<'a> {
         Self { marked, coarser }
     }
 
-    /// Per-lane: keep lane `i` iff its widened-to-coarser form was marked.
+    /// Per-lane: keep lane `i` of a block at `frame` iff its widened-to-coarser
+    /// form was marked with a deadline of `frame` or later. The time bound is
+    /// sound because the coarse level over-approximates: a fine state that
+    /// still wins by the horizon from `frame` widens to a coarse state that
+    /// does too - whose deadline is then >= `frame`. The membership test
+    /// alone admitted a fine state at f60 onto a coarse state marked from an
+    /// earlier frame with no time left (room (3,0) level 1: 14.6M kept at
+    /// f51 onto 456k layer-51 marks, 2026-09-19).
     /// Rem widening never moves the integer cell and (coarsening) never splits
     /// a lane, so the widened block is lane-aligned with the input.
     ///
@@ -1388,12 +1395,12 @@ impl<'a> MarkFilter<'a> {
     /// live there (`abstraction.rs`) and this is the one place the loop
     /// still needs them. Paid only at levels >= 1, whose frontiers the
     /// filter itself keeps small.
-    pub fn allowed(&self, rt2: &Rt2) -> Result<Vec<bool>> {
+    pub fn allowed(&self, rt2: &Rt2, frame: u32) -> Result<Vec<bool>> {
         let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser)?;
         Ok(keys
             .iter()
             .zip(&cells)
-            .map(|(k, &c)| self.marked.contains(shape, *k, c))
+            .map(|(k, &c)| self.marked.deadline(shape, *k, c).is_some_and(|d| u32::from(d) >= frame))
             .collect())
     }
 }
@@ -2461,7 +2468,13 @@ pub struct Visited {
     /// different cell), so the sharding is a free refinement: small sets,
     /// per-cell locality, and a run of rows at one cell is one outer
     /// lookup.
-    shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashSet<(u64, u64)>>,
+    ///
+    /// Each key maps to its DEADLINE: the last frame a marked state still
+    /// reaches a win by the horizon from (`edges::Marks`), what `MarkFilter`
+    /// bounds time with. `u16::MAX` where there is none - a door, a loaded
+    /// marks file (the file stores the set only), the kernel re-run backward:
+    /// the membership test alone, as before deadlines existed.
+    shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashMap<(u64, u64), u16>>,
 }
 
 impl Visited {
@@ -2475,20 +2488,38 @@ impl Visited {
         use celeste_engine::runtime2::mix64;
         let mut acc = 0u64;
         for ((_shape, cell), keys) in &self.shards {
-            for &(k0, k1) in keys {
+            for &(k0, k1) in keys.keys() {
                 acc = acc.wrapping_add(mix64(k0 ^ mix64(k1 ^ (*cell as u64) << 1)));
             }
         }
         (self.len(), acc)
     }
     /// True if `key` (at `shape`, `cell`) was NOT already present - this
-    /// lane is new, keep it.
+    /// lane is new, keep it. No deadline.
     pub fn insert(&mut self, shape: u64, key: (u64, u64), cell: u32) -> bool {
-        self.shards.entry((shape, cell)).or_default().insert(key)
+        self.insert_until(shape, key, cell, u16::MAX)
     }
-    /// The key set of one `(shape, cell)` shard, created if absent.
+    /// `insert` with a deadline; a key inserted twice keeps the later one.
+    pub fn insert_until(&mut self, shape: u64, key: (u64, u64), cell: u32, deadline: u16) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.shards.entry((shape, cell)).or_default().entry(key) {
+            Entry::Occupied(mut e) => {
+                let d = e.get_mut();
+                *d = (*d).max(deadline);
+                false
+            }
+            Entry::Vacant(e) => {
+                e.insert(deadline);
+                true
+            }
+        }
+    }
     pub fn contains(&self, shape: u64, key: (u64, u64), cell: u32) -> bool {
-        self.shards.get(&(shape, cell)).is_some_and(|s| s.contains(&key))
+        self.shards.get(&(shape, cell)).is_some_and(|s| s.contains_key(&key))
+    }
+    /// The key's deadline, `None` if absent.
+    pub fn deadline(&self, shape: u64, key: (u64, u64), cell: u32) -> Option<u16> {
+        self.shards.get(&(shape, cell)).and_then(|s| s.get(&key)).copied()
     }
     pub fn len(&self) -> usize {
         self.shards.values().map(|s| s.len()).sum()
@@ -2499,7 +2530,7 @@ impl Visited {
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         let mut v: Vec<(u64, u32, u64, u64)> = Vec::with_capacity(self.len());
         for ((shape, cell), keys) in &self.shards {
-            v.extend(keys.iter().map(|&(k0, k1)| (*shape, *cell, k0, k1)));
+            v.extend(keys.keys().map(|&(k0, k1)| (*shape, *cell, k0, k1)));
         }
         crate::search::checkpoint::save_value_to(path, &v)
     }
@@ -2520,7 +2551,7 @@ impl Visited {
         let mut v: Vec<(u64, u32, (u64, u64))> = self
             .shards
             .iter()
-            .flat_map(|((s, c), keys)| keys.iter().map(move |&k| (*s, *c, k)))
+            .flat_map(|((s, c), keys)| keys.keys().map(move |&k| (*s, *c, k)))
             .collect();
         v.sort_unstable();
         v
@@ -2589,6 +2620,12 @@ where
     base_dir: &'a std::path::Path,
     precisions: &'a [crate::interpreter::abstraction::Level],
     level0: Option<(Box<dyn FrameStep>, ForwardState)>,
+    /// Drop level 0's in-memory state (door, frontier, engine) once its
+    /// backward at a horizon is done, and resume it from disk when a later
+    /// horizon needs it. Counting down from a ceiling it never extends again,
+    /// and at room (3,0) f89 it held ~10 GB idle under every finer level;
+    /// the resume is 42 s (a 550M-entry door, 2026-09-19).
+    drop_level0: bool,
 }
 
 impl<'a, E, I> Ladder<'a, E, I>
@@ -2602,7 +2639,7 @@ where
         base_dir: &'a std::path::Path,
         precisions: &'a [crate::interpreter::abstraction::Level],
     ) -> Self {
-        Ladder { make_engine, make_initial, base_dir, precisions, level0: None }
+        Ladder { make_engine, make_initial, base_dir, precisions, level0: None, drop_level0: false }
     }
 
     fn level_dir(&self, horizon: u32, level: usize) -> std::path::PathBuf {
@@ -2705,6 +2742,9 @@ where
                  (fingerprint {fp:016x}), {work}"
             );
             prev = Some((marked, precision));
+            if level == 0 && self.drop_level0 {
+                self.level0 = None;
+            }
         }
         Ok(HorizonOutcome::Confirmed)
     }
@@ -2791,6 +2831,8 @@ pub fn find_optimum_from_ceiling(
     precisions: &[crate::interpreter::abstraction::Level],
 ) -> Result<u32> {
     let mut ladder = Ladder::new(make_engine, make_initial, base_dir, precisions);
+    // Horizons only go down from here: level 0 is complete at the ceiling.
+    ladder.drop_level0 = true;
     anyhow::ensure!(ceiling >= 1, "a ceiling of 0 frames");
     match ladder.at_horizon(ceiling)? {
         HorizonOutcome::Confirmed => eprintln!("[search] ceiling: horizon {ceiling} confirmed"),

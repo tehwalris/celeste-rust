@@ -56,7 +56,26 @@ state that widens onto it.
    the per-set footprint because it is certain; where the 1.7 GB goes is still
    unmeasured (the asm text is already dropped; the templates' `Rt2`s are
    the suspect).
-5. **The crashed attempt's finer-level trees deleted** (`h089/`, `level01/`,
+5. **Level 1 still blew up; the mark filter gets a time bound.** The first
+   run with this ladder (kernel sets capped at 2: level 1 started at 19.2 GB
+   instead of 32.5) grew level 1 at ~2x the old one - 339k at f40, 14.6M at
+   f51, 24.4M at f53 - and was stopped before its OOM. Level 0 marked only
+   456k states at layer 51: the filter admitted fine states onto coarse
+   states marked from EARLIER frames, with no time left to win. The BFS
+   already knew better: iteration i marks exactly the states that win by H
+   from frame i but not i+1, so i is the state's DEADLINE. It is now kept
+   (`Marks` -> `Visited`'s per-key value) and `MarkFilter` admits a fine
+   state at frame t only onto a coarse one with deadline >= t. Sound (the
+   coarse level over-approximates: a fine state that wins from t widens to
+   a coarse one that does) and it prunes only states with no winning
+   descendant, so every level's marked set, win frame and outcome are
+   unchanged - the marks gate is its check. Marks loaded from disk and the
+   kernel re-run backward carry no deadline (`u16::MAX`): the old test.
+   Unit test: `a_marks_deadline_is_the_last_frame_it_still_wins_from`.
+6. **Level 0 dropped from memory while the finer levels run** (count-down
+   only, `Ladder::drop_level0`): ~10 GB idle at f89, resumed from disk in
+   42 s when the next horizon needs it.
+7. **The crashed attempt's finer-level trees deleted** (`h089/`, `level01/`,
    63 GB): built under the old ladder. `level00/` (153 GB) is kept and reused -
    the new ladder's level 0 is the same `r0sxhfb`. Nothing on disk records a
    level's spec, so the resume would not notice a mismatch; the reuse rests on

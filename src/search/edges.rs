@@ -909,12 +909,16 @@ impl EdgeGraph {
 #[derive(Default)]
 pub struct Marks {
     bits: rustc_hash::FxHashMap<(u32, u32), Vec<u64>>,
+    /// Each marked id's DEADLINE: the last frame from which it still reaches
+    /// a win by the horizon - the BFS iteration that marked it (a seed's is
+    /// the horizon). What the next level's filter bounds time with.
+    deadlines: Vec<(u64, u16)>,
     pub count: usize,
 }
 
 impl Marks {
-    /// True if newly marked.
-    fn insert(&mut self, id: u64) -> bool {
+    /// True if newly marked; the first marking's `deadline` is the id's.
+    fn insert(&mut self, id: u64, deadline: u32) -> bool {
         let (layer, seq, row) = (id_layer(id), crate::frame::id_seq(id), crate::frame::id_row(id));
         let v = self.bits.entry((layer, seq)).or_default();
         let (w, b) = ((row / 64) as usize, row % 64);
@@ -926,6 +930,7 @@ impl Marks {
         }
         v[w] |= 1 << b;
         self.count += 1;
+        self.deadlines.push((id, u16::try_from(deadline).expect("a deadline past u16")));
         true
     }
 
@@ -937,22 +942,11 @@ impl Marks {
             .is_some_and(|w| w & (1 << (row % 64)) != 0)
     }
 
-    /// Every marked id, by (layer, seq, row).
-    pub fn ids(&self) -> Vec<u64> {
-        let mut keys: Vec<&(u32, u32)> = self.bits.keys().collect();
-        keys.sort();
-        let mut out = Vec::with_capacity(self.count);
-        for k in keys {
-            for (w, &word) in self.bits[k].iter().enumerate() {
-                let mut m = word;
-                while m != 0 {
-                    let b = m.trailing_zeros();
-                    out.push(pack_id(k.0, k.1, (w as u32) * 64 + b));
-                    m &= m - 1;
-                }
-            }
-        }
-        out
+    /// Every marked id with its deadline, by (layer, seq, row).
+    pub fn with_deadlines(&self) -> Vec<(u64, u16)> {
+        let mut v = self.deadlines.clone();
+        v.sort_unstable();
+        v
     }
 }
 
@@ -968,12 +962,15 @@ pub struct BfsStats {
 /// (i = horizon-1 down to 1) marks a predecessor of an i+1-frontier state
 /// iff the predecessor's layer is <= i. A state's edges are consulted
 /// once, when it enters the frontier: its runs of frames layer..=i+1.
+/// So iteration i marks exactly the states that reach a win by the horizon
+/// from frame i but not from i+1: i is the state's DEADLINE (`Marks`),
+/// horizon - its distance to a win, for any state first reached by then.
 pub fn bfs(graph: &EdgeGraph, horizon: u32, seeds: impl IntoIterator<Item = u64>) -> (Marks, BfsStats) {
     let t = std::time::Instant::now();
     let mut marks = Marks::default();
     let mut frontier: Vec<u64> = Vec::new();
     for s in seeds {
-        if id_layer(s) <= horizon && marks.insert(s) {
+        if id_layer(s) <= horizon && marks.insert(s, horizon) {
             frontier.push(s);
         }
     }
@@ -1030,7 +1027,7 @@ pub fn bfs(graph: &EdgeGraph, horizon: u32, seeds: impl IntoIterator<Item = u64>
             lookups += lk;
             edges_read += ed;
             for p in out {
-                if marks.insert(p) {
+                if marks.insert(p, i) {
                     next.push(p);
                 }
             }
@@ -1085,23 +1082,23 @@ pub fn backward(dir: &Path, horizon: u32) -> Result<BackwardResult> {
     // The marked ids as the ladder's (shape, key, cell) set.
     let t = std::time::Instant::now();
     let mut marked = Visited::new();
-    let ids = marks.ids();
+    let ids = marks.with_deadlines();
     let mut i = 0usize;
     for (layer, seq, file) in &files {
-        let lo = ids.partition_point(|&id| (id_layer(id), crate::frame::id_seq(id)) < (*layer, *seq));
-        let hi = ids.partition_point(|&id| (id_layer(id), crate::frame::id_seq(id)) <= (*layer, *seq));
+        let lo = ids.partition_point(|&(id, _)| (id_layer(id), crate::frame::id_seq(id)) < (*layer, *seq));
+        let hi = ids.partition_point(|&(id, _)| (id_layer(id), crate::frame::id_seq(id)) <= (*layer, *seq));
         if lo == hi {
             continue;
         }
         let cells = file.row_cells();
-        for &id in &ids[lo..hi] {
+        for &(id, deadline) in &ids[lo..hi] {
             let row = crate::frame::id_row(id);
             ensure!(
                 row < file.width(),
                 "edges: marked id l{layer} s{seq} r{row} is past its file's {} rows",
                 file.width()
             );
-            marked.insert(file.shape_hash(), file.key_at(row), cells[row as usize]);
+            marked.insert_until(file.shape_hash(), file.key_at(row), cells[row as usize], deadline);
             i += 1;
         }
     }
@@ -1130,6 +1127,40 @@ mod tests {
             encode_record(&mut buf, e.target, e.base, e.mask);
         }
         std::fs::write(raw_path(dir, frame, layer, worker), buf).unwrap();
+    }
+
+    /// A mark's deadline is the last frame it still reaches a win by the
+    /// horizon from, through revisits of earlier-layer states too.
+    #[test]
+    fn a_marks_deadline_is_the_last_frame_it_still_wins_from() {
+        let dir = std::env::temp_dir().join(format!("celeste-edges-deadline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (a, b, c, e, w, f, g) =
+            (pack_id(0, 0, 0), pack_id(1, 0, 0), pack_id(2, 0, 0), pack_id(2, 0, 1), pack_id(3, 0, 0), pack_id(3, 0, 1), pack_id(3, 0, 2));
+        let edge = |from: u64, to: u64| Edge { target: to, base: from, mask: 1 };
+        // a -> b -> c -> w (the win, layer 3); b -> e -> f; and two REVISITS
+        // at frame 4: g -> w (in time: a win at 4) and f -> c (too late: c at
+        // 4 wins at 5).
+        let frames: [Vec<Edge>; 4] =
+            [vec![edge(a, b)], vec![edge(b, c), edge(b, e)], vec![edge(c, w), edge(e, f)], vec![edge(f, c), edge(g, w)]];
+        // A frame's records are filed by their TARGET's layer (`l{layer}`):
+        // frame 4's revisits land in layers 2 and 3.
+        for (i, es) in frames.iter().enumerate() {
+            let frame = i as u32 + 1;
+            for layer in 0..=frame {
+                let part: Vec<Edge> = es.iter().filter(|e| id_layer(e.target) == layer).copied().collect();
+                if !part.is_empty() {
+                    write_worker(&dir, frame, layer, 0, &part);
+                }
+            }
+            compact_frame(&dir, frame).unwrap();
+        }
+        let g4 = EdgeGraph::open(&dir, 4).unwrap();
+        let (marks, _) = bfs(&g4, 4, [w]);
+        let mut want = vec![(a, 1u16), (b, 2), (c, 3), (w, 4), (g, 3)];
+        want.sort_unstable();
+        assert_eq!(marks.with_deadlines(), want, "e and f reach a win only after frame 4");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A target whose records straddle an index block boundary (and one
