@@ -99,6 +99,20 @@ state that widens onto it.
    | 1 r1sxhb | f74 | 3.59M |
    | 2 r2sxhb | f83 | 1.68M |
    | 3 r3sxhb | f87 | 0.72M |
+   | 4 r4sxhb | f88 | 748k |
+   | 5 r5sxhb | f88 | 696k |
+   | 6 r6sxhb | f89 | 813k |
+   | 7-13 r7..r13sxhb | f89 | 492k-730k |
+   | 14 r14sxhb | f89 | 352k |
+   | 15 r15sxhb | f89 | 80,271 |
+   | 16 r15sxh (floors exact) | f89 | 80,271 (same count, new keys) |
+   | 17 rxsx (exact) | f89 | 59,268 |
+
+   **h89 CONFIRMED at every level** (levels 1-17 in ~35 min, done 02:54).
+   A trial `export-ui` of h89 alone (log cut at the confirmation, into a
+   scratch dir) read the custom ladder's 18 levels fine: 6.8 MB in 63 s. Floors going exact at
+   level 16 changed no count: on every winning route the fall floors behave
+   as "unknown" does. The first win reached the ceiling at level 6.
 
    With this much headroom the kernel-set cap could go up (each rebuild is
    ~35 s, 17 per horizon); left at 2 - not the bottleneck.

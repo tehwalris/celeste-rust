@@ -400,7 +400,7 @@ impl<'a> ToInterp<'a> {
         let has_hash = !table.hash.is_empty();
         let has_arr = !table.arr.is_empty();
         if !table.ints.is_empty() {
-            bail!("to_interp_state: table #{} has a non-empty integer part - unsupported", t);
+            return Err(BridgeGap(format!("to_interp_state: table #{t} has a non-empty integer part - unsupported")).into());
         }
         if has_hash && has_arr {
             bail!("to_interp_state: table #{} has both string and array parts", t);
@@ -478,6 +478,22 @@ fn name_is_buttons(name: &str) -> bool {
 
 /// Turn a single-lane trace state into a one-lane old-interpreter boundary
 /// state - the inverse of `to_trace_state`.
+/// A traced state the interpreter's `State` cannot hold: a table with a
+/// sparse integer part - `got_fruit[1 + level_index()]` once room (3,0)'s
+/// fruit is taken (`HeapValue` has dense arrays only). Typed so a caller that
+/// can do without that one state (the witness's DFS, `rewrite witness`) can
+/// tell it from a real failure.
+#[derive(Debug)]
+pub struct BridgeGap(pub String);
+
+impl std::fmt::Display for BridgeGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BridgeGap {}
+
 pub fn to_interp_state(ts: &TState<RefDomain>) -> Result<OState> {
     let mut cx = ToInterp {
         ts,
