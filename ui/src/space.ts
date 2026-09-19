@@ -25,7 +25,7 @@
 // and the ladder, options and legend sit in a scrolling side column.
 
 import type { FramesBin, HorizonRun, LevelRun, Run } from "./data";
-import { defaultHorizon, fmtCompact, fmtInt, horizonOrder, horizonVerdict, levelName, loadFrames, loadLayers, type VerdictKind } from "./data";
+import { defaultHorizon, fmtCompact, fmtInt, horizonOrder, horizonVerdict, ladderPrecisions, levelName, loadFrames, loadLayers, precisionName, type VerdictKind } from "./data";
 import { levelCss, levelRamp, marksRamp, heightBand, bandColor, bandHalo, movingColor, HEIGHT_BANDS, rgbCss, levelColor, LEVELS, type RGB } from "./color";
 import { addSparse, RoomRenderer, sparseMax, type HeatLayer, type Scene } from "./room";
 import { button, chips, clear, el, icon, scrubber, select, show } from "./ui";
@@ -97,6 +97,11 @@ const GROUP: Record<VerdictKind, string> = {
 };
 
 export function spaceView(run: Run, onState: () => void): View {
+  // The run's own ladder: its level count and names come from the log, not
+  // from the default 17 (room (3,0) ran 18, Bits(15) at index 16).
+  const ladder = ladderPrecisions(run);
+  const nLevels = Math.max(LEVELS, ladder.length);
+  const nameAt = (level: number) => (ladder[level] ? precisionName(ladder[level]) : `${level} bit${level === 1 ? "" : "s"}`);
   const renderer = new RoomRenderer(run.cell_box, run.tiles);
   const ncell = run.cell_box.w * run.cell_box.h;
   /** The horizon the view opens on: the optimal one (data.ts). */
@@ -674,7 +679,7 @@ export function spaceView(run: Run, onState: () => void): View {
   ]);
   const legendSweep = el("div", { class: "legend" }, [key(rgbCss(levelRamp(0, "bright")[55]), "the frontier at this frame"), key(rgbCss(marksRamp("bright")[55]), "marked at this iteration")]);
   const levelStrip = el("div", { class: "level-strip" });
-  for (let i = 0; i < LEVELS; i++) levelStrip.append(el("i", { style: `background:${levelCss(i)}`, title: i === 16 ? "exact" : `level ${i}: ${i} bit${i === 1 ? "" : "s"}` }));
+  for (let i = 0; i < nLevels; i++) levelStrip.append(el("i", { style: `background:${levelCss(i)}`, title: ladder[i] === "Exact" ? "exact" : `level ${i}: ${nameAt(i)}` }));
   const levelBlock = el("div", {}, [
     el("div", { class: "legend-title", text: "hue = the ladder level" }),
     levelStrip,
@@ -733,9 +738,9 @@ export function spaceView(run: Run, onState: () => void): View {
     hPicker.root.dataset.kind = v.kind;
     ladderList.replaceChildren();
     ladderRows.clear();
-    for (let level = 0; level < LEVELS; level++) {
+    for (let level = 0; level < nLevels; level++) {
       const lr = hr.levels.find((l) => l.level === level);
-      const name = level === 16 ? "exact" : `${level} bit${level === 1 ? "" : "s"}`;
+      const name = nameAt(level);
       const result = !lr ? "not run" : lr.refuted ? `no win by f${hr.h}` : lr.first_win != null ? `win f${lr.first_win}` : "–";
       const ph = el("span", { class: "ph" });
       const row = el(
@@ -795,10 +800,10 @@ export function spaceView(run: Run, onState: () => void): View {
     panelsFor = st.h;
     clear(gridBox);
     panels = [];
-    for (let level = 0; level < LEVELS; level++) {
+    for (let level = 0; level < nLevels; level++) {
       const lr = hr.levels.find((l) => l.level === level) ?? null;
       const c = el("canvas", { "aria-label": `level ${level}` });
-      const name = level === 16 ? "exact" : `${level} bit${level === 1 ? "" : "s"}`;
+      const name = nameAt(level);
       // The panel's state (playing / done / not yet) sits in its own
       // corner so the label does not wrap on a phone.
       const state = el("div", { class: "state" });
@@ -852,8 +857,8 @@ export function spaceView(run: Run, onState: () => void): View {
     const gap = 8;
     let best = 0;
     let cols = 4;
-    for (let c = 1; c <= LEVELS; c++) {
-      const r = Math.ceil(LEVELS / c);
+    for (let c = 1; c <= nLevels; c++) {
+      const r = Math.ceil(nLevels / c);
       const w = Math.min((W - gap * (c - 1)) / c, ((H - gap * (r - 1)) / r) * aspect);
       if (w > best) {
         best = w;
@@ -926,7 +931,7 @@ export function spaceView(run: Run, onState: () => void): View {
           ctx.fillStyle = "rgba(255,245,225,0.55)";
           ctx.fillRect(x0, 0, bw, 2);
         }
-        const label = p.lr.level === 16 ? "ex" : `L${p.lr.level}`;
+        const label = p.lr.precision === "Exact" ? "ex" : `L${p.lr.level}`;
         if (bw > 22) {
           ctx.fillStyle = p.phase === "fwd" ? "rgba(0,0,0,0.8)" : "rgba(255,255,255,0.75)";
           ctx.fillText(label, x0 + 4, h / 2 + 0.5);

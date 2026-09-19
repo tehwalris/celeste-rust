@@ -69,7 +69,7 @@ export function timelineView(run: Run, chs: Chapter[]): View {
     });
   }
   for (const [hIndex, r] of byH) blocks.push({ row: 0, t0: r.t0, t1: r.t1, label: `h${run.horizons[hIndex].h}`, color: "#2f2f2d", hIndex });
-  for (const [, r] of byHL) blocks.push({ row: 1, t0: r.t0, t1: r.t1, label: r.c.level === 16 ? "exact" : `L${r.c.level}`, color: levelCss(r.c.level, 0.85), hIndex: r.c.hIndex, level: r.c.level, chapter: r.c });
+  for (const [, r] of byHL) blocks.push({ row: 1, t0: r.t0, t1: r.t1, label: r.c.levelRun.precision === "Exact" ? "exact" : `L${r.c.level}`, color: levelCss(r.c.level, 0.85), hIndex: r.c.hIndex, level: r.c.level, chapter: r.c });
 
   // ---- view state ------------------------------------------------------------
   let v0 = 0;

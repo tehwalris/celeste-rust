@@ -6,7 +6,7 @@
 // screen the charts sit two to a row.
 
 import type { Run, LevelRun } from "./data";
-import { defaultHorizon, fmtCompact, fmtDuration, fmtInt, fmtMs, horizonOrder, horizonVerdict, levelName } from "./data";
+import { defaultHorizon, fmtCompact, fmtDuration, fmtInt, fmtMs, horizonOrder, horizonVerdict, ladderPrecisions, levelName } from "./data";
 import { levelCss, slots } from "./color";
 import { lineChart, legendFor, type Series } from "./chart";
 import { chips, el, clear, select } from "./ui";
@@ -86,7 +86,8 @@ export function sizesView(run: Run, onState: () => void): View {
   root.append(charts);
 
   const seriesOf = (lr: LevelRun, points: [number, number][]): Series => ({ name: `L${lr.level} (${levelName(lr)})`, color: levelCss(lr.level), points });
-  const levelLabel = (x: number) => (x === 16 ? "exact" : `L${x}`);
+  const ladder = ladderPrecisions(run);
+  const levelLabel = (x: number) => (ladder[x] === "Exact" ? "exact" : `L${x}`);
 
   function build() {
     clear(charts);

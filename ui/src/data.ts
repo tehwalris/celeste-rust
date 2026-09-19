@@ -257,8 +257,27 @@ export function locate(chs: Chapter[], globalStep: number): { chapter: Chapter; 
   return { chapter: c, step: Math.max(0, Math.min(c.frames.length - 1, globalStep - c.startStep)) };
 }
 
-export const levelName = (lr: LevelRun) =>
-  lr.precision === "Exact" ? "exact" : `${lr.level} bit${lr.level === 1 ? "" : "s"}`;
+/** A level's name from the precision its log line gave it, not from its
+ *  index: `Exact` -> "exact", `Bits(k)` -> "k bits", the rest of a custom
+ *  ladder's spec kept (`Bits(1)/H/B` -> "1 bit/H/B": held, fruit, floors
+ *  unknown). Room (3,0)'s 18-level ladder has Bits(15) at index 16. */
+export function precisionName(p: string): string {
+  if (p === "Exact") return "exact";
+  const m = /^Bits\((\d+)\)(.*)$/.exec(p);
+  if (!m) return p;
+  const k = Number(m[1]);
+  return `${k} bit${k === 1 ? "" : "s"}${m[2]}`;
+}
+
+export const levelName = (lr: LevelRun) => precisionName(lr.precision);
+
+/** Every ladder level's precision by index, from whichever horizon ran it
+ *  (the ladder is the same at every horizon; "" for an index none ran). */
+export function ladderPrecisions(run: Run): string[] {
+  const out: string[] = [];
+  for (const hr of run.horizons) for (const lr of hr.levels) out[lr.level] ??= lr.precision;
+  return Array.from(out, (p) => p ?? "");
+}
 
 // ---------------------------------------------------------------------------
 // Rooms, in game order, with the altitude the game shows on entering them.
