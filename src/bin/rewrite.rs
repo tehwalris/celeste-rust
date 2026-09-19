@@ -2826,7 +2826,6 @@ fn main() -> Result<()> {
                 dead: &mut rustc_hash::FxHashSet<(u64, u64, u32)>,
                 path: &mut Vec<u8>,
                 steps: &mut u64,
-                skipped: &mut u64,
                 dir: &std::path::Path,
             ) -> Result<bool> {
                 if f >= horizon {
@@ -2835,18 +2834,7 @@ fn main() -> Result<()> {
                 for byte in 0u8..64 {
                     let mut s = state.clone();
                     celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
-                    let mut succ = match eng.run_frame_concrete(&s) {
-                        Ok(succ) => succ,
-                        // A successor the interpreter's State cannot hold (the
-                        // fruit taken) is not evaluated: a witness found without
-                        // it is still a witness; only NO WITNESS becomes
-                        // inconclusive, and says so below.
-                        Err(e) if e.downcast_ref::<celeste_rust::trace::refbridge::BridgeGap>().is_some() => {
-                            *skipped += 1;
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    };
+                    let mut succ = eng.run_frame_concrete(&s)?;
                     celeste_rust::concrete::restore_buttons(initial, &mut succ)?;
                     *steps += 1;
                     let block = Block::from_state(&succ)?;
@@ -2920,7 +2908,7 @@ fn main() -> Result<()> {
                         continue;
                     }
                     path.push(byte);
-                    if dfs(eng, initial, &succ, f + 1, horizon, precision, marks, layer_of, dead, path, steps, skipped, dir)? {
+                    if dfs(eng, initial, &succ, f + 1, horizon, precision, marks, layer_of, dead, path, steps, dir)? {
                         return Ok(true);
                     }
                     path.pop();
@@ -2928,21 +2916,13 @@ fn main() -> Result<()> {
                 }
                 Ok(false)
             }
-            let mut skipped: u64 = 0;
             let found = dfs(
                 &mut eng, &initial, &initial, 0, horizon, precision, &marks, &layer_of, &mut dead, &mut path,
-                &mut steps, &mut skipped, &dir,
+                &mut steps, &dir,
             )?;
-            eprintln!(
-                "[witness] {} concrete steps, {} dead ends, {} successors skipped (the interpreter State cannot hold them)",
-                steps,
-                dead.len(),
-                skipped
-            );
+            eprintln!("[witness] {} concrete steps, {} dead ends", steps, dead.len());
             if found {
                 println!("win at f{}: {}", path.len(), path.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
-            } else if skipped > 0 {
-                println!("NO WITNESS among the evaluable successors by f{horizon} - INCONCLUSIVE: {skipped} successors skipped");
             } else {
                 println!("NO WITNESS: no marked chain has a concrete continuation to a win by f{horizon}");
             }

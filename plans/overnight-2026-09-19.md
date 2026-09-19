@@ -41,11 +41,18 @@ The UI took level index 16 as "exact" and showed 17 levels; it now names
 every level from its logged precision (L16 "15 bits/H", L17 "exact") and
 takes the count from the run. Checked in the browser.
 
-The concrete witness (`rewrite witness --horizon 89 --level 17`) was
-still running at 03:12 (single-threaded DFS through the reference engine,
-13 min CPU so far, 38 MB); its output goes to /var/tmp/witness-r30-h89.txt.
-Once it prints a path: `pico8_diff/replay.py --room 3,0 --inputs <bytes>`
-must show the room change at f89.
+The concrete witness (`rewrite witness --horizon 89 --level 17`, the
+reference engine's DFS through level 17's marks) is **INCONCLUSIVE**: 3.5M
+concrete steps, 55k dead ends, 23,168 successors skipped because they take
+the fruit (`got_fruit[3]`, which the old interpreter's `State` cannot hold),
+and no path among the rest. So every marked winning route seems to take the
+fruit - exactly the part the reference path cannot follow. The optimum does
+not rest on it: level 17 is exact in every field (its win at f89 is a
+concrete win of the compiled kernels) and the community TAS is 89. What is
+missing is the independent cross-check against the interpreter and a
+PICO-8 replay; both need the bridge to hold a sparse integer part (or a
+witness that never leaves the tracer's state). Output:
+/var/tmp/witness-r30-h89.txt.
 
 ## For the morning
 

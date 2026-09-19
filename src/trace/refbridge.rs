@@ -397,11 +397,32 @@ impl<'a> ToInterp<'a> {
         // -> ArrayTable. The two are disjoint in this program (the IR chose
         // one at each allocation site); a table carrying both parts is a
         // modelling surprise worth surfacing.
+        // Integer keys past the array part (`got_fruit[1 + level_index()]`
+        // on an empty table, room (3,0)'s fruit): the interpreter keeps the
+        // table dense with the gap as explicit nils - exactly as `bind`
+        // flattens it for the engine, so the exported state keys like the
+        // forward's rows.
+        let arr: Vec<TValue<RefDomain>> = if table.ints.is_empty() {
+            table.arr.to_vec()
+        } else {
+            if !table.hash.is_empty() {
+                bail!("to_interp_state: table #{} has integer keys AND named fields", t);
+            }
+            let (Some(&lo), Some(&top)) = (table.ints.keys().next(), table.ints.keys().next_back()) else {
+                unreachable!("checked non-empty")
+            };
+            if lo < 1 {
+                bail!("to_interp_state: table #{} has a non-positive integer key", t);
+            }
+            let mut arr = table.arr.to_vec();
+            arr.resize(top as usize, TValue::Nil);
+            for (k, v) in &table.ints {
+                arr[*k as usize - 1] = v.clone();
+            }
+            arr
+        };
         let has_hash = !table.hash.is_empty();
-        let has_arr = !table.arr.is_empty();
-        if !table.ints.is_empty() {
-            return Err(BridgeGap(format!("to_interp_state: table #{t} has a non-empty integer part - unsupported")).into());
-        }
+        let has_arr = !arr.is_empty();
         if has_hash && has_arr {
             bail!("to_interp_state: table #{} has both string and array parts", t);
         }
@@ -424,9 +445,8 @@ impl<'a> ToInterp<'a> {
             }
             HeapValue::ObjectTable(fields)
         } else {
-            let items: Vec<TValue<RefDomain>> = table.arr.to_vec();
-            let mut out = Vec::with_capacity(items.len());
-            for v in items {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
                 out.push(self.box_slot(&v, ubool)?);
             }
             HeapValue::ArrayTable(out)
@@ -478,22 +498,6 @@ fn name_is_buttons(name: &str) -> bool {
 
 /// Turn a single-lane trace state into a one-lane old-interpreter boundary
 /// state - the inverse of `to_trace_state`.
-/// A traced state the interpreter's `State` cannot hold: a table with a
-/// sparse integer part - `got_fruit[1 + level_index()]` once room (3,0)'s
-/// fruit is taken (`HeapValue` has dense arrays only). Typed so a caller that
-/// can do without that one state (the witness's DFS, `rewrite witness`) can
-/// tell it from a real failure.
-#[derive(Debug)]
-pub struct BridgeGap(pub String);
-
-impl std::fmt::Display for BridgeGap {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for BridgeGap {}
-
 pub fn to_interp_state(ts: &TState<RefDomain>) -> Result<OState> {
     let mut cx = ToInterp {
         ts,
