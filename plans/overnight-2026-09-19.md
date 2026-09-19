@@ -90,6 +90,16 @@ state that widens onto it.
    | f54-55 | 25.8M | (24.4M at f53) | 15.7M (peak) |
    | f60 | 32.1M | - | 3.17M |
 
+   The ladder then tightens fast (h89; each level ~2 min plus a ~30 s
+   kernel-set rebuild under the cap):
+
+   | level | first win | marked |
+   |---|---|---|
+   | 0 r0sxhfb | f64 | 26.7M |
+   | 1 r1sxhb | f74 | 3.59M |
+   | 2 r2sxhb | f83 | 1.68M |
+   | 3 r3sxhb | f87 | 0.72M |
+
    With this much headroom the kernel-set cap could go up (each rebuild is
    ~35 s, 17 per horizon); left at 2 - not the bottleneck.
 7. **The crashed attempt's finer-level trees deleted** (`h089/`, `level01/`,
