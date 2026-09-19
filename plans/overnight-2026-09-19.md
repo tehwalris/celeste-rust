@@ -37,6 +37,16 @@ What made it fit, in order of effect: the deadline-bounded mark filter
 kernel-set cap (4). Floors unknown up the rem ramp (1, 3) cost nothing and
 changed no count where they were made exact.
 
+The UI took level index 16 as "exact" and showed 17 levels; it now names
+every level from its logged precision (L16 "15 bits/H", L17 "exact") and
+takes the count from the run. Checked in the browser.
+
+The concrete witness (`rewrite witness --horizon 89 --level 17`) was
+still running at 03:12 (single-threaded DFS through the reference engine,
+13 min CPU so far, 38 MB); its output goes to /var/tmp/witness-r30-h89.txt.
+Once it prints a path: `pico8_diff/replay.py --room 3,0 --inputs <bytes>`
+must show the room change at f89.
+
 ## For the morning
 
 - The fly fruit stays unknown only at level 0: unknown it multiplied states
