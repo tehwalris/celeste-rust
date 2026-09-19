@@ -41,18 +41,18 @@ The UI took level index 16 as "exact" and showed 17 levels; it now names
 every level from its logged precision (L16 "15 bits/H", L17 "exact") and
 takes the count from the run. Checked in the browser.
 
-The concrete witness (`rewrite witness --horizon 89 --level 17`, the
-reference engine's DFS through level 17's marks) is **INCONCLUSIVE**: 3.5M
-concrete steps, 55k dead ends, 23,168 successors skipped because they take
-the fruit (`got_fruit[3]`, which the old interpreter's `State` cannot hold),
-and no path among the rest. So every marked winning route seems to take the
-fruit - exactly the part the reference path cannot follow. The optimum does
-not rest on it: level 17 is exact in every field (its win at f89 is a
-concrete win of the compiled kernels) and the community TAS is 89. What is
-missing is the independent cross-check against the interpreter and a
-PICO-8 replay; both need the bridge to hold a sparse integer part (or a
-witness that never leaves the tracer's state). Output:
-/var/tmp/witness-r30-h89.txt.
+**Verified on a real PICO-8.** The concrete witness (`rewrite witness
+--horizon 89 --level 17`, the reference engine's DFS through level 17's
+marks) first died on the fruit: `to_interp_state` refused `got_fruit[3]`
+(a sparse integer part), and with those successors skipped it found no
+path (3.5M steps, 23,168 skipped) - every marked route takes the fruit.
+The interpreter keeps such a table dense with explicit nils and `bind`
+flattens it the same way, so `to_interp_state` now does too (`c9e9224`).
+Then: **win at f89 in 279 concrete steps, 0 dead ends**, and
+`pico8_diff/replay.py --room 3,0` shows the room change to (4,0) at f89
+(f88: player at 48,-4). The inputs are `tas/room_3_0_exit_frame_89.txt`:
+34 idle spawn frames, right with one jump at f42, a jump at f52, then
+dash up-right (38) at f62 and f76 with jumps between.
 
 ## For the morning
 
@@ -62,10 +62,9 @@ witness that never leaves the tracer's state). Output:
 - The deadline filter changes nothing in any marked set (the gate), but it
   is a new pruning rule in the ladder's soundness argument - worth reading
   `MarkFilter::allowed` and `edges::bfs`'s doc together.
-- `rewrite witness` skips successors the old interpreter's `State` cannot
-  hold (the fruit taken: `got_fruit[3]`), counted and reported. The real fix
-  is a sparse integer part in `HeapValue`, or a witness that never leaves
-  the tracer's state.
+- `refbridge::to_interp_state` now flattens a sparse integer part into a
+  dense nil-padded array (as the interpreter and `bind` do). Worth a second
+  look that no other table in the cart relies on the sparse form.
 - `CELESTE_KERNEL_SETS` is opt-in; with level 0 dropped, room (3,0) peaked at
   12.8 GB, so a default cap is a question of rebuild time vs memory.
 
