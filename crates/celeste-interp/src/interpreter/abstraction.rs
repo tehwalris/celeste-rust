@@ -476,10 +476,12 @@ impl Level {
         if self.held.is_unknown() && !matches!(self.rem, RemPrecision::Bits(_)) {
             return false;
         }
-        // The fly fruit and the fall floors unknown only at level 0 (rem
-        // Bits(0), exact position): only the level-0 widening implements them
-        // (plans/fly-fruit.md, plans/fall-floors.md).
-        if (self.fruit.is_unknown() || self.floors.is_unknown()) && (self.rem != RemPrecision::Bits(0) || !self.pos.is_exact()) {
+        // The fly fruit and the fall floors unknown at a rem rung with an exact
+        // position, like the held buttons: their input forks and output
+        // widenings are keyed on the domain's flags, not on the trace mode, so
+        // the ladder rungs above level 0 take them too (plans/fly-fruit.md,
+        // plans/fall-floors.md; the rungs since 2026-09-19).
+        if (self.fruit.is_unknown() || self.floors.is_unknown()) && (!matches!(self.rem, RemPrecision::Bits(_)) || !self.pos.is_exact()) {
             return false;
         }
         // A position bucket forks on the integer grid: rem Bits(0) only.
@@ -1656,19 +1658,23 @@ mod tests {
         // Held buttons unknown: `h`, at rem rungs only, coarser than exact.
         let h = Level::parse("r0sxh").unwrap();
         assert_eq!(h, Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(0), spd: SpdPrecision::Exact, held: HeldPrecision::Unknown, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact });
-        // The fly fruit unknown: `f` after `h`, at level 0 only.
+        // The fly fruit unknown: `f` after `h`, at rem rungs, exact position.
         let hf = Level::parse("r0sxhf").unwrap();
         assert!(hf.fruit.is_unknown() && hf.held.is_unknown() && hf.grid_consistent());
         assert_eq!(format!("{hf}"), "Bits(0)/H/F");
-        assert!(!Level::parse("r1sxhf").unwrap().grid_consistent());
+        assert!(Level::parse("r1sxhf").unwrap().grid_consistent());
+        assert!(!Level::parse("y2r0sxhf").unwrap().grid_consistent());
         assert!(Level::parse_ladder("r0sxhf,r0sxh,r1sxh,rxsx").is_ok());
         assert!(Level::parse_ladder("r0sxh,r0sxhf,rxsx").is_err());
-        // The fall floors unknown: `b` after `f`, at level 0 only.
+        // The fall floors unknown: `b` after `f`, at rem rungs, exact position.
         let hfb = Level::parse("r0sxhfb").unwrap();
         assert!(hfb.floors.is_unknown() && hfb.fruit.is_unknown() && hfb.grid_consistent());
         assert_eq!(format!("{hfb}"), "Bits(0)/H/F/B");
-        assert!(!Level::parse("r1sxhb").unwrap().grid_consistent());
+        assert!(Level::parse("r1sxhb").unwrap().grid_consistent());
         assert!(Level::parse_ladder("r0sxhfb,r0sxhf,r0sxh,rxsx").is_ok());
+        // Unknown through the rem ramp, made exact near its top.
+        assert!(Level::parse_ladder("r0sxhfb,r4sxhfb,r15sxhfb,r15sxhb,r15sxh,rxsx").is_ok());
+        assert!(Level::parse_ladder("r0sxhfb,r4sxh,r8sxhfb,rxsx").is_err());
         assert!(Level::parse_ladder("r0sxhf,r0sxhfb,rxsx").is_err());
         assert_eq!(Level::parse("r1s20xh").unwrap().spd, SpdPrecision::WidthLog2X(20));
         assert!(!Level::parse("rxsxh").unwrap().grid_consistent());

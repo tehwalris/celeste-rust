@@ -353,13 +353,18 @@ fn widen_fly_fruit(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
         let mut arms = Vec::new();
         match literal_arms(&d.graph, v, &mut arms) {
             true if arms.iter().all(|(a, b)| *lo <= *a && *b <= *hi) => {}
-            _ => bail!(
-                "{}: the fly fruit's range [{}, {}] does not visibly contain what the frame computed, {}",
-                iface::show(p),
-                *lo as f64 / 65536.0,
-                *hi as f64 / 65536.0,
-                d.describe(&v)
-            ),
+            // Not visibly inside: a rung above level 0, where the fruit's rem
+            // is exact and `rem.y - 0.5 - amount` no literal. The containment
+            // becomes a runtime premise in `ok` (like the region bounds): a
+            // lane outside the range declines loudly, none is widened wrongly.
+            _ => {
+                let (klo, khi) = (d.graph.leaf(Op::Const(*lo, *lo)), d.graph.leaf(Op::Const(*hi, *hi)));
+                let (vlo, vhi) = (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v]));
+                let above = d.graph.fold(Op::Ge, vec![vlo, klo]);
+                let below = d.graph.fold(Op::Le, vec![vhi, khi]);
+                let inside = d.graph.fold(Op::And, vec![above, below]);
+                st.ok = d.graph.fold(Op::And, vec![st.ok, inside]);
+            }
         }
         let r = d.graph.leaf(Op::Const(*lo, *hi));
         iface::set(st, p, Value::Num(r))?;

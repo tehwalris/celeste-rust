@@ -2560,21 +2560,6 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
     Ok(t)
 }
 
-/// The kernel set for the CURRENT rung, built once per rung on a big stack
-/// (the retrace's init interpret recurses deeper than a worker thread's
-/// default). The root is `CELESTE_ROOT` or the CWD.
-///
-/// PER-RUNG cache (not a single process-wide set): with the widening in the
-/// graph the ladder kernels specialize to the active rem precision, so an
-/// IN-PROCESS ladder that walks rungs (`rewrite ladder`) needs a distinct
-/// set per rung - a single `OnceLock` would freeze it at level 0's set and
-/// serve the wrong kernels to every rung above. Indexed by rem precision
-/// (Bits(0..15) -> 0..15, Exact/Bits(>=16) -> 16); each slot is its own
-/// lock-free `OnceLock`, so per-chunk dispatch pays one atomic load once the
-/// rung is built. `traced_mode()` (which the build respects) is a function
-/// of the precision plus the process-constant `CELESTE_TRACED_SET` override,
-/// so precision alone keys the set within a process. `ladder.sh`'s
-/// per-process rungs no longer buy anything the in-process cache does not.
 /// Kernel call shape: [0] calls, [1] rows offered, [2] slice-lanes executed
 /// (16 per slice, so `[2] - [1]` is the padding). The per-call fixed cost
 /// (accumulators, buffers, seen sets, boundary) is paid once per [0].
@@ -2586,27 +2571,126 @@ pub(crate) fn take_call_stats() -> [u64; 7] {
     std::array::from_fn(|i| CALL_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
-/// The kernel set of the process-global rem precision (built on first use).
-pub(crate) fn registry() -> Option<&'static Registry> {
+/// The kernel set of the process-global level (built on first use).
+pub(crate) fn registry() -> Option<std::sync::Arc<Registry>> {
     registry_for(crate::interpreter::abstraction::current_level())
 }
 
-/// One kernel set per LEVEL (rem rung x spd precision), each built once,
-/// on first use or by `prebuild` - the level is an explicit input of the
-/// build, not read from the process-global precision, so the sets can
-/// be built in parallel.
-fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'static Registry> {
+// Widths 1..=20 both axes, 1..=20 x-only, and exact.
+const SPD_SLOTS: usize = 41;
+const POS_SLOTS: usize = 4;
+// Held buttons exact or unknown.
+const HELD_SLOTS: usize = 2;
+// The fly fruit exact or unknown, the fall floors exact or unknown.
+const FRUIT_SLOTS: usize = 2;
+const FLOORS_SLOTS: usize = 2;
+const LEVEL_SLOTS: usize = 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS;
+
+/// The kernel set for one LEVEL, built on a big stack (the retrace's init
+/// interpret recurses deeper than a worker thread's default). The root is
+/// `CELESTE_ROOT` or the CWD.
+///
+/// One set per level (rem rung x spd x pos x held x fruit x floors): the
+/// ladder kernels specialize to the level, so a ladder that walks levels in
+/// one process needs a distinct set for each - one process-wide set would
+/// freeze at level 0's and serve the wrong kernels to every level above. The
+/// level is an explicit input of the build, not read from the process-global
+/// level, so the sets build in parallel (`prebuild`); one build per level at a
+/// time (`BUILDING`), a second caller waits for it.
+///
+/// RESIDENT SETS ARE CAPPED (2026-09-19). A set is ~1.7 GB resident (room
+/// (3,0): 306 kernels), and all 18 of a ladder's were 31 GB before the search
+/// started - room (3,0)'s level 1 was OOM-killed at the 60 GB cap with half of
+/// it kernels it was not running. `CELESTE_KERNEL_SETS=N` keeps at most N
+/// built sets; building one more evicts the least recently used, rebuilt if
+/// its level runs again (the next horizon). Unset: no cap, every set stays.
+/// A caller holds its set by `Arc` for the call, so an evicted set lives on
+/// until its last chunk ends.
+fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<std::sync::Arc<Registry>> {
+    static BUILDING: [std::sync::Mutex<()>; LEVEL_SLOTS] = [const { std::sync::Mutex::new(()) }; LEVEL_SLOTS];
+    let slot = level_slot(level);
+    if let Some(r) = SETS.lock().unwrap().get(slot) {
+        return r;
+    }
+    let _building = BUILDING[slot].lock().unwrap();
+    if let Some(r) = SETS.lock().unwrap().get(slot) {
+        return r;
+    }
+    let built = build_registry_for_rung(level).map(std::sync::Arc::new);
+    let evicted = SETS.lock().unwrap().insert(slot, level, built.clone());
+    // Unloaded outside the lock: every other chunk's lookup waits on it.
+    drop(evicted);
+    built
+}
+
+/// The built kernel sets, most recently used last.
+static SETS: std::sync::Mutex<Sets> = std::sync::Mutex::new(Sets { resident: Vec::new(), tick: 0 });
+
+struct Sets {
+    resident: Vec<ResidentSet>,
+    tick: u64,
+}
+
+struct ResidentSet {
+    slot: usize,
+    level: crate::interpreter::abstraction::Level,
+    /// `None`: the level has no kernel set (cached too; costs nothing).
+    set: Option<std::sync::Arc<Registry>>,
+    used: u64,
+}
+
+impl Sets {
+    fn get(&mut self, slot: usize) -> Option<Option<std::sync::Arc<Registry>>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.resident.iter_mut().find(|r| r.slot == slot).map(|r| {
+            r.used = tick;
+            r.set.clone()
+        })
+    }
+
+    /// Add a built set; returns the sets the cap evicts, for the caller to
+    /// drop outside the lock.
+    fn insert(
+        &mut self,
+        slot: usize,
+        level: crate::interpreter::abstraction::Level,
+        set: Option<std::sync::Arc<Registry>>,
+    ) -> Vec<ResidentSet> {
+        self.tick += 1;
+        self.resident.push(ResidentSet { slot, level, set, used: self.tick });
+        let mut evicted = Vec::new();
+        let Some(cap) = kernel_set_cap() else { return evicted };
+        while self.resident.iter().filter(|r| r.set.is_some()).count() > cap {
+            let (i, _) = self
+                .resident
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.set.is_some())
+                .min_by_key(|(_, r)| r.used)
+                .expect("over the cap, so one is built");
+            let r = self.resident.remove(i);
+            eprintln!("[asm build] evicted the {} kernel set (CELESTE_KERNEL_SETS={cap})", r.level);
+            evicted.push(r);
+        }
+        evicted
+    }
+}
+
+/// `CELESTE_KERNEL_SETS`: the most built kernel sets kept at once (>= 1).
+fn kernel_set_cap() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("CELESTE_KERNEL_SETS").ok().map(|v| {
+            let n: usize = v.parse().unwrap_or_else(|_| panic!("CELESTE_KERNEL_SETS={v}: not a count"));
+            assert!(n >= 1, "CELESTE_KERNEL_SETS=0: the running level needs its set");
+            n
+        })
+    })
+}
+
+fn level_slot(level: crate::interpreter::abstraction::Level) -> usize {
     use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
-    // Widths 1..=20 both axes, 1..=20 x-only, and exact.
-    const SPD_SLOTS: usize = 41;
-    const POS_SLOTS: usize = 4;
-    // Held buttons exact or unknown.
-    const HELD_SLOTS: usize = 2;
-    // The fly fruit exact or unknown, the fall floors exact or unknown.
-    const FRUIT_SLOTS: usize = 2;
-    const FLOORS_SLOTS: usize = 2;
-    static REGS: [std::sync::OnceLock<Option<Registry>>; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS] =
-        [const { std::sync::OnceLock::new() }; 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS];
     let rem_slot = match level.rem {
         RemPrecision::Exact => 16,
         RemPrecision::Bits(b) => (b as usize).min(16),
@@ -2620,15 +2704,17 @@ fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<&'stati
     let held_slot = level.held.is_unknown() as usize;
     let fruit_slot = level.fruit.is_unknown() as usize;
     let floors_slot = level.floors.is_unknown() as usize;
-    let slot = ((((rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot) * HELD_SLOTS + held_slot) * FRUIT_SLOTS + fruit_slot) * FLOORS_SLOTS + floors_slot;
-    REGS[slot].get_or_init(|| build_registry_for_rung(level)).as_ref()
+    ((((rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot) * HELD_SLOTS + held_slot) * FRUIT_SLOTS + fruit_slot) * FLOORS_SLOTS + floors_slot
 }
 
 /// Build every rung's kernel set now, all rungs at once (one builder
 /// thread per rung, each assembling its shapes in parallel). The ladder
 /// calls this up front: lazily, the 17 builds landed one at a time inside
 /// the first frame of each level - 82 s of a 524 s room (1,0) run.
+/// Under `CELESTE_KERNEL_SETS=N` only the first N (the ladder runs them in
+/// order): building more would only evict them again.
 pub fn prebuild(levels: &[crate::interpreter::abstraction::Level]) {
+    let levels = &levels[..kernel_set_cap().map_or(levels.len(), |n| n.min(levels.len()))];
     let t = std::time::Instant::now();
     std::thread::scope(|scope| {
         for &l in levels {
@@ -2708,7 +2794,7 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
                 (true, RemPrecision::Bits(b)) => WalkOpts::ladder_widen(b, level.spd),
                 _ => WalkOpts::LADDER,
             };
-            (opts.with_held(level.held.is_unknown()), true)
+            (opts.with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()), true)
         }
         super::dispatch::TracedMode::ExactRem => (WalkOpts::EXACT, true),
     };
