@@ -13,6 +13,45 @@ f61, 62 GB peak - and was OOM-killed at the 60 GB cap. The mark filter barely
 bounds it: a level-0 mark (floors unknown) admits every exact floor/fruit
 state that widens onto it.
 
+## Result
+
+**Room (3,0): optimal 89 frames** (`OPTIMAL win frame: 89`, 03:06). h89
+confirmed at all 18 levels; h88 refuted at level 6 (r6sxhb: no win by f88).
+It equals the community TAS (TAS4: 62 inputs + 27 spawn frames). The search
+itself, with level 0 resumed from last night's tree: 34 min wall (02:32 -
+03:06), peak anonymous RSS 12.8 GB (level 1 of h89), 210 GB of checkpoints.
+In the UI as `room30opt`, the default run: http://127.0.0.1:3011/celeste/
+
+| h88 level | first win | marked |
+|---|---|---|
+| 0 | f64 | 21.3M |
+| 1 | f74 | 2.34M |
+| 2 | f83 | 1.10M |
+| 3 | f87 | 356k |
+| 4 | f88 | 327k |
+| 5 | f88 | 243k |
+| 6 | NO WIN | refuted |
+
+What made it fit, in order of effect: the deadline-bounded mark filter
+(decision 5), level 0 dropped from memory during the finer levels (6), the
+kernel-set cap (4). Floors unknown up the rem ramp (1, 3) cost nothing and
+changed no count where they were made exact.
+
+## For the morning
+
+- The fly fruit stays unknown only at level 0: unknown it multiplied states
+  above level 0 and overflowed the 58-fork `ChoiceSet` from r8 up. Worth a
+  look whether the fruit's undecided `collide` could merge instead.
+- The deadline filter changes nothing in any marked set (the gate), but it
+  is a new pruning rule in the ladder's soundness argument - worth reading
+  `MarkFilter::allowed` and `edges::bfs`'s doc together.
+- `rewrite witness` skips successors the old interpreter's `State` cannot
+  hold (the fruit taken: `got_fruit[3]`), counted and reported. The real fix
+  is a sparse integer part in `HeapValue`, or a witness that never leaves
+  the tracer's state.
+- `CELESTE_KERNEL_SETS` is opt-in; with level 0 dropped, room (3,0) peaked at
+  12.8 GB, so a default cap is a question of rebuild time vs memory.
+
 ## Decisions
 
 1. **Fruit and floors unknown up the rem ramp** (Philippe's suggestion), made
