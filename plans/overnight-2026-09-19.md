@@ -70,6 +70,35 @@ fruit-taking successors searched level 17's marked states exhaustively and
 found no win by f89. Taking it also refills the dash (`hit.djump =
 max_djump` in `fly_fruit.update`), a plausible reason - not established.
 
+**TAS4's positions against our search (2026-09-20).** At every frame
+f28-f88 its position (original cart) is inside every h89 level's allowed
+cells, the exact level included (a marked state at that cell with time
+left to win by 89). The one miss - level 1, f78, (18,22) not first reached
+at f78 - is the cross-frame dedup: that cell was reached earlier. And
+`rewrite trajectory` follows TAS4's positions frame by frame in OUR game
+and wins at f89: the route is physically ours; only its raw inputs do not
+transfer to the minimal cart.
+
+**Room (5,0) (600 m), started 2026-09-20.** TAS6 is 48 inputs; the player
+is controllable from f30 on both carts, so ceiling 29 + 48 = 77 (the same
+rule gives room (4,0)'s proven 76). But TAS6 only exits under favourable
+random numbers: one original-cart replay left the room at f77, four others
+(a one-frame-different cart) fell at (82,84). The room uses `rnd` (balloon
+`offset=rnd(1)`, and a `rnd(3)`). Our model draws `rnd` as an interval
+(`4e2d2e9`), so the search's optimum is the BEST CASE over random outcomes
+- as a TAS that manipulates RNG. Worth deciding whether that is the
+question we want answered.
+
+Decided with Philippe (2026-09-20): `rnd` stays an interval at EVERY
+level, so the ladder's "exact" level is exact except for the random draws.
+Run the ladder to exact and see; then, at the exact level, try concrete
+RNG seeds one after another until one reaches the win (or all are covered).
+The first search died in the room walk: room (5,0) is loaded by `_init`,
+so the balloon's `offset = rnd(1)` is an interval in the START state, which
+the walk's write discovery never typed as an interval input ("objects[1].
+offset was already symbolic"). The walk now types the start state's own
+intervals as interval inputs too (`room_constant_lattice`).
+
 ## For the morning
 
 - `concrete_run --object fly_fruit` prints "none" on every frame of a route

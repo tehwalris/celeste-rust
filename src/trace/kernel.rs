@@ -2355,6 +2355,31 @@ pub fn room_constant_lattice(
     let start_key = sk.clone();
     lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors)?);
     reps.insert(sk.clone(), start.clone());
+    // The START state's own intervals are interval inputs too. Room (5,0) is
+    // loaded by `_init`, whose balloon draws `offset = rnd(1)` there: an
+    // interval no traced frame wrote, so the write discovery below never
+    // typed it and `symbolize` refused the start node ("objects[1].offset
+    // was already symbolic", 2026-09-20). `rnd` stays an interval at every
+    // level, the exact one included. Typed as an interval input, the slot's
+    // representative holds a POINT, as every other shape's blanked slot does
+    // (`shapes::blank`'s 0) - `Iface::init` records a point for an interval
+    // slot and `ival` makes it one. Only the representative: the lattice
+    // above was read from `start`, where the slot is no constant, and a 0
+    // there would have pinned the balloon's phase.
+    if opts.ival {
+        use super::domain::Domain as _;
+        for r in shapes::state_paths(&start)? {
+            for p in super::iface::scalars(&start, &r)? {
+                let Some(super::heap::Value::Num(n)) = super::iface::get(&start, &p) else { continue };
+                if it.d.as_const(&n).is_some() {
+                    continue;
+                }
+                let zero = it.d.num(celeste_core::pico8_num::Pico8Num::from_i16(0));
+                super::iface::set(reps.get_mut(&sk).expect("inserted above"), &p, super::heap::Value::Num(zero))?;
+                ival_extra.entry(sk.clone()).or_default().insert(p);
+            }
+        }
+    }
     // THE REGION KEY (`RegionGrid`): a node is (shape, region), the lattice
     // stays per shape, and a narrowed lattice re-traces every region its
     // shape has reached.
