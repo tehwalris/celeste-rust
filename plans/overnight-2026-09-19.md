@@ -202,6 +202,15 @@ frame (44 s -> 185 s), peak 11.4 -> 25.1 GB (x1.09-1.15 per frame). To f77:
 the 60 GB cap - tight. Then the backward (~900M visited: minutes), the 16
 filtered levels (40-90 min), h76 (20-40 min): done ~01:30-02:30.
 
+At 23:47 (f74) the memory grows faster than that: anonymous memory mid-wave
+23.8 / 27.4 / 31.8 / 36.7 GB at f71-f74 (x1.15 per frame; the door 9.8 ->
+15.6 GB), file-backed ~0.05 GB. Projected f77: ~56 GB mid-wave, ~59 GB
+peak against the 60 GB cap - about even odds. DECISION: let it run (a
+failure costs ~35 min; restarting now would redo all of level 0, over an
+hour, even where it fits). If it is OOM-killed at f77, restart with a
+coarser level 0, `y2r0sxh` (2 px y buckets, ~half the states; the position
+rung is sound - the finer levels narrow it back). The cap is not raised.
+
 ## For the morning
 
 - `concrete_run --object fly_fruit` prints "none" on every frame of a route
