@@ -169,9 +169,42 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
     widen_timers(st, d)?;
     widen_fly_fruit(st, d)?;
     widen_fall_floors(st, d)?;
+    canon_balloon_offset(st, d)?;
     widen_held(st, d)?;
     Ok(())
 }
+
+/// The balloon's phase `offset` (2026-09-21, room (5,0)): a `rnd` draw, an
+/// interval `[a, a + 1)` a full period wide at every level, which advances
+/// 0.01 a frame only while the balloon shows - so each pop at a different
+/// frame shifts it by another 0.01: a different key for the same future
+/// (14 values at room (5,0) f60). Its one reader is `sin(offset)`, and `sin`
+/// of any interval a full period wide is `[-1, 1]` (`Symbolic::fun1`), so all
+/// of them behave alike and the row stores the canonical `[0, 1)` - EXACT, at
+/// every level, and what lets the floors-unknown balloon `timer`
+/// (`fall_floor_paths`) actually merge pop histories. The premise that the
+/// interval is a full period rides on `ok`: a narrower phase (a concrete draw)
+/// declines loudly, never widened. The block model projects the same way
+/// (`Rt2::widen_to`), for the mark filter.
+fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    for obj in objects_of_type(st, "balloon") {
+        let p = field(&obj, &["offset"]);
+        let Some(Value::Num(v)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
+        if !d.is_interval(&v) {
+            continue;
+        }
+        let (lo, hi) = (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v]));
+        let width = d.graph.fold(Op::Sub, vec![hi, lo]);
+        let period = d.graph.leaf(Op::Const(BALLOON_PERIOD_RAW, BALLOON_PERIOD_RAW));
+        let full = d.graph.fold(Op::Ge, vec![width, period]);
+        st.ok = d.graph.fold(Op::And, vec![st.ok, full]);
+        let canon = d.graph.leaf(Op::Const(0, BALLOON_PERIOD_RAW));
+        iface::set(st, &p, Value::Num(canon))?;
+    }
+    Ok(())
+}
+
+use celeste_engine::runtime2::BALLOON_PERIOD_RAW;
 
 /// Held buttons unknown (plans/held-buttons.md): the player's trails leave the
 /// frame unknown - the canonical output unknown (`Symbolic::unknown_bool_output`),
@@ -213,6 +246,16 @@ pub fn fall_floor_paths<D: Domain>(st: &State<D>) -> FallFloorPaths {
         out.unknown.push(field(&obj, &["state"]));
         out.unknown.push(field(&obj, &["delay"]));
         out.collideable.push(field(&obj, &["collideable"]));
+    }
+    // The balloon's respawn `timer` (2026-09-21, room (5,0)): under the same
+    // flag, the unknown number. While the balloon shows, the timer is dead (a
+    // pop sets it to 60), so the merge is exact; while it is popped, an
+    // unknown timer lets it respawn on any frame - the over-approximation the
+    // exact-floors levels narrow back. Every pop at a different frame carried
+    // its own countdown next to the same player state (room (5,0) level 0: a
+    // balloon multiplier of 2.25x at f70).
+    for obj in objects_of_type(st, "balloon") {
+        out.unknown.push(field(&obj, &["timer"]));
     }
     out
 }

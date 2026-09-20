@@ -117,6 +117,9 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
         f_state: f("state"),
         f_delay: f("delay"),
         f_collideable: f("collideable"),
+        g_balloon: g("balloon"),
+        f_timer: f("timer"),
+        f_offset: f("offset"),
     }
 }
 

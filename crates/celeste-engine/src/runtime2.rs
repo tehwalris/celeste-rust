@@ -168,7 +168,20 @@ pub struct BoundaryIds {
     pub f_state: u32,
     pub f_delay: u32,
     pub f_collideable: u32,
+    /// The balloon, whose respawn `timer` the same floors-unknown level
+    /// widens (`widen::fall_floor_paths`).
+    pub g_balloon: u32,
+    pub f_timer: u32,
+    /// Its phase, stored canonical at every level (`widen::canon_balloon_offset`).
+    pub f_offset: u32,
 }
+
+/// A full period of `sin` as an inclusive raw 16.16 interval's width: `[a, a +
+/// 1)` is `[a, a + 0xffff]`, what `rnd(1)` draws. The balloon's canonical
+/// phase is `[0, BALLOON_PERIOD_RAW]`. ONE definition, shared with the
+/// tracer's output widening (`widen::canon_balloon_offset`), or the mark
+/// filter misses.
+pub const BALLOON_PERIOD_RAW: i32 = 0xffff;
 
 /// The fly fruit's `spd.y` range at a fruit-unknown level (raw 16.16,
 /// inclusive): waiting, `sin(step) * 0.5` in [-0.5, 0.5]; flying,
@@ -1119,6 +1132,27 @@ impl Rt2 {
                 check(self, c, "collideable", &|v| matches!(v, AV::Bool(_) | AV::UBool));
                 self.cols[c as usize] = Col::U(AV::UBool);
             }
+            // The balloon's respawn `timer`, under the same flag.
+            for obj in self.objects_of_type(ids, ids.g_balloon) {
+                let c = self.obj_field_cell(obj, ids.f_timer).unwrap_or_else(|| panic!("balloon widening: the balloon has no `timer` field"));
+                check(self, c, "timer", &|v| matches!(v, AV::Num(_) | AV::Ival(..) | AV::UNum));
+                self.cols[c as usize] = Col::U(AV::UNum);
+            }
+        }
+
+        // 9. The balloon's phase, at EVERY level, as the kernels store it
+        // (`widen::canon_balloon_offset`): an interval a full period wide is
+        // the canonical [0, 1) - exact, `sin` of any such is [-1, 1]. A
+        // concrete phase stays as it is; an interval narrower than a period is
+        // no row a kernel writes, and asserts.
+        for obj in self.objects_of_type(ids, ids.g_balloon) {
+            let Some(c) = self.obj_field_cell(obj, ids.f_offset) else { continue };
+            if (0..self.width).all(|lane| matches!(self.cols[c as usize].at(lane), AV::Num(_))) {
+                continue;
+            }
+            let full = |v: AV| matches!(v, AV::Ival(lo, hi) if hi.as_raw_u32() as i32 - lo.as_raw_u32() as i32 >= BALLOON_PERIOD_RAW);
+            check(self, c, "offset", &full);
+            self.cols[c as usize] = Col::U(AV::Ival(P8::from_raw(0), P8::from_raw(BALLOON_PERIOD_RAW)));
         }
     }
 

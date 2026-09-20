@@ -223,6 +223,25 @@ over f60-f70, room (3,0)'s level 0 peaked at 22.7M) and a balloon-history
 multiplier that is growing (every frame more states pop it at a different
 moment: their own respawn timer and phase shift, and a refilled dash).
 
+**The real cause, and the fix (00:15, after Philippe asked to widen the
+popped balloon's timer).** Widening the timer alone (to the unknown number,
+under the floors-unknown flag `b`, `widen::fall_floor_paths`) cut level 0
+only 4% at f60 (10.17M against 10.58M): the phase `offset` records the same
+pop history. And it records more: `offset` advanced 0.01 EVERY frame the
+balloon showed, in every state - so no room (5,0) state ever equalled one
+from an earlier frame and the door's cross-frame dedup never fired. That,
+not the balloon variants alone, is why room (5,0) outgrew every other room.
+`offset` is only read through `sin`, and `sin` of any interval a full period
+wide is [-1, 1], so it is now stored as the canonical [0, 1) at every level
+(`widen::canon_balloon_offset`, with a full-period premise in `ok`; the block
+model's projection does the same, `Rt2::widen_to` step 9). EXACT: through
+f50 both trees reach exactly the same 1,374,280 distinct balloon-free states
+(`coarse-census --erase balloon --from 1 --to 50`), the new one in 296k rows
+at f50 against 1.42M (f40 23.8k against 76.4k, f60 1.08M against 10.58M).
+The old search (f76: 122M states, 53 GB peak, projected ~62 GB at f77 against
+the 60 GB cap) was stopped at 00:15 and room (5,0) restarted on this model,
+ladder `r0sxhb .. r15sxhb, r15sxh, rxsx` (timer exact at the top two).
+
 ## For the morning
 
 - `concrete_run --object fly_fruit` prints "none" on every frame of a route
