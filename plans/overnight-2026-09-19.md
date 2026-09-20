@@ -195,6 +195,13 @@ backward (minutes), 16 filtered levels (~2 min each in room (3,0): 40-80
 min), and h76 (a refutation mid-ladder: 20-30 min). About 1.5-2.5 h in all,
 if level 0 fits. An alert fires above 45 GB.
 
+Revised at 23:30 (level 0 f71): the growth STOPPED easing - 1.154 .. 1.160
+per frame f65-f71 (24.0M -> 57.4M; visited 395M), frame time x1.27 per
+frame (44 s -> 185 s), peak 11.4 -> 25.1 GB (x1.09-1.15 per frame). To f77:
+~138M states, ~45-50 min more of level 0 (to ~00:20), peak ~50 GB against
+the 60 GB cap - tight. Then the backward (~900M visited: minutes), the 16
+filtered levels (40-90 min), h76 (20-40 min): done ~01:30-02:30.
+
 ## For the morning
 
 - `concrete_run --object fly_fruit` prints "none" on every frame of a route
