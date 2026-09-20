@@ -287,6 +287,7 @@ pub fn symbolize(
         .filter(|(_, b)| **b)
         .map(|(i, _)| i as u32)
         .collect();
+    d.forget_intervals();
     Ok(Iface { slots, init, pins, ival })
 }
 

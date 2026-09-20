@@ -172,6 +172,19 @@ pub trait Domain {
         false
     }
 
+    /// SPLIT A COMPARISON at a runtime point (2026-09-20, room (5,0)'s
+    /// balloon): `a op b` with one side an INTERVAL and the other a number is
+    /// undecided, and its two outcomes need not merge (the balloon's hit test
+    /// against the player). `__split_by_flr` cuts an interval at a fixed grid;
+    /// this cuts it at the other operand, a number on every lane: a 2-way
+    /// choice is the comparison's value, and the validity - the half of the
+    /// interval that answer leaves is non-empty - goes in the guard. Returns
+    /// `(value, validity)`, or `None` for anything else (and in every exact
+    /// domain, where nothing is undecided).
+    fn split_compare(&mut self, _op: Cmp, _a: &Self::Num, _b: &Self::Num) -> Option<(Self::Bool, Self::Bool)> {
+        None
+    }
+
     /// The premise that `b` is DECIDED on this lane (`Op::Known`). A
     /// concrete boolean always is.
     fn known(&mut self, _b: &Self::Bool) -> Self::Bool {
@@ -469,6 +482,14 @@ pub struct Symbolic {
     /// a graph node names. `is_interval` is a cone query against this
     /// set: a value is an interval exactly when it was computed from one.
     pub ival_cells: std::collections::BTreeSet<u32>,
+    /// `is_interval`'s memo, valid for the current `ival_cells` (nodes never
+    /// change): `split_compare` asks it of every undecided comparison, and a
+    /// graph-sized memo per call was fine only while forks were the one
+    /// caller. Dropped with `forget_intervals` wherever `ival_cells` changes.
+    ival_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
+    /// `split_compare`'s forks this frame, by (operator, interval, point): a
+    /// comparison asked twice is one choice. Cleared beside `fork_memo`.
+    pub cmp_memo: std::collections::HashMap<(u8, NodeId, NodeId), (NodeId, NodeId)>,
     /// STATIC RANGES (2026-09-15, the bucket dispatch): input cells whose
     /// value is known to lie in a range - a body specialized on the
     /// player's speed BUCKET - and the memo of the range analysis over
@@ -489,6 +510,11 @@ impl Symbolic {
         self.ranges.clear();
         self.range_memo.clear();
         self.range_folds = 0;
+    }
+
+    /// `ival_cells` changed: `is_interval`'s memo no longer holds.
+    pub fn forget_intervals(&mut self) {
+        self.ival_memo.get_mut().clear();
     }
 
     /// The static range of `n` (`graph::pieces_of` over the seeded cells).
@@ -775,6 +801,48 @@ impl Domain for Symbolic {
         };
         Ok(self.graph.fold(g, vec![*a, *b]))
     }
+    fn split_compare(&mut self, op: Cmp, a: &NodeId, b: &NodeId) -> Option<(NodeId, NodeId)> {
+        // The interval `x` on the left, the point `t` on the right: `t < x`
+        // is `x > t`. Only one side an interval; `==` never splits.
+        let (x, t, op) = match (self.is_interval(a), self.is_interval(b)) {
+            (true, false) => (*a, *b, op),
+            (false, true) => {
+                let mirrored = match op {
+                    Cmp::Lt => Cmp::Gt,
+                    Cmp::Le => Cmp::Ge,
+                    Cmp::Gt => Cmp::Lt,
+                    Cmp::Ge => Cmp::Le,
+                    Cmp::Eq => return None,
+                };
+                (*b, *a, mirrored)
+            }
+            _ => return None,
+        };
+        if op == Cmp::Eq {
+            return None;
+        }
+        let key = (op as u8, x, t);
+        if let Some(hit) = self.cmp_memo.get(&key) {
+            return Some(*hit);
+        }
+        // Which answer a lane can take: the half of `x` it leaves on each
+        // side of the lane's `t`. `x < t` cuts at [lo, t) | [t, hi]; `x > t`
+        // at [lo, t] | (t, hi] - the point goes with the answer it gives.
+        let (lo, hi) = (self.graph.fold(Op::Lo, vec![x]), self.graph.fold(Op::Hi, vec![x]));
+        let (may_true, may_false) = match op {
+            Cmp::Lt => (self.compare(Cmp::Lt, &lo, &t).ok()?, self.compare(Cmp::Ge, &hi, &t).ok()?),
+            Cmp::Le => (self.compare(Cmp::Le, &lo, &t).ok()?, self.compare(Cmp::Gt, &hi, &t).ok()?),
+            Cmp::Gt => (self.compare(Cmp::Gt, &hi, &t).ok()?, self.compare(Cmp::Le, &lo, &t).ok()?),
+            Cmp::Ge => (self.compare(Cmp::Ge, &hi, &t).ok()?, self.compare(Cmp::Lt, &lo, &t).ok()?),
+            Cmp::Eq => return None,
+        };
+        let c = self.both_values(&format!("{op:?} split at a point"));
+        let nc = self.not(&c);
+        let (yes, no) = (self.and(&c, &may_true), self.and(&nc, &may_false));
+        let valid = self.or(&yes, &no);
+        self.cmp_memo.insert(key, (c, valid));
+        Some((c, valid))
+    }
     fn not(&mut self, a: &NodeId) -> NodeId {
         self.graph.fold(Op::Not, vec![*a])
     }
@@ -840,13 +908,13 @@ impl Domain for Symbolic {
     /// other by construction: disagree, and lowering fails with "output
     /// cell wants a ZN but the graph computes a ZI".
     fn is_interval(&self, v: &NodeId) -> bool {
-        fn go(g: &Graph, ival: &std::collections::BTreeSet<u32>, memo: &mut Vec<Option<bool>>, n: NodeId) -> bool {
-            if let Some(b) = memo[n as usize] {
-                return b;
+        fn go(g: &Graph, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
+            if let Some(b) = memo.get(&n) {
+                return *b;
             }
             let node = g.get(n);
             let a = &node.args;
-            let any = |memo: &mut Vec<Option<bool>>, xs: &[NodeId]| {
+            let any = |memo: &mut rustc_hash::FxHashMap<NodeId, bool>, xs: &[NodeId]| {
                 xs.iter().any(|x| go(g, ival, memo, *x))
             };
             let r = match node.op {
@@ -876,7 +944,7 @@ impl Domain for Symbolic {
                 Op::Sin => any(memo, a),
                 _ => false,
             };
-            memo[n as usize] = Some(r);
+            memo.insert(n, r);
             r
         }
         // NO early-out on an empty `ival_cells`. A value can be an
@@ -885,8 +953,7 @@ impl Domain for Symbolic {
         // interval. Returning false for those typed a widened `rem` as
         // a `ZN` and the lowering refused it - "output cell 278 wants a
         // ZN but the graph computes a (P8, P8)".
-        let mut memo = vec![None; self.graph.len()];
-        go(&self.graph, &self.ival_cells, &mut memo, *v)
+        go(&self.graph, &self.ival_cells, &mut self.ival_memo.borrow_mut(), *v)
     }
 
     fn fork_flr(&mut self, v: &NodeId, ways: u8) -> (NodeId, NodeId) {

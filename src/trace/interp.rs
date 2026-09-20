@@ -1199,7 +1199,12 @@ impl<'a, D: Domain> Interp<'a, D> {
         let mut out = Vec::new();
         for (st, a) in self.eval(lhs, st)? {
             for (mut st, b) in self.eval(rhs, st)? {
-                let (v, illegal) = self.binop_values(binop, &a, &b)?;
+                let (v, illegal, split) = self.binop_values(binop, &a, &b)?;
+                // A comparison split at a point (`Domain::split_compare`):
+                // the lane takes this answer only where it can.
+                if let Some(valid) = split {
+                    st.guard = self.d.and(&st.guard, &valid);
+                }
                 if let Some(why) = illegal {
                     // The source text, built only when it is needed: a
                     // type error is useless without knowing which
@@ -1243,13 +1248,15 @@ impl<'a, D: Domain> Interp<'a, D> {
 
     /// The value, and - if Lua itself would have raised - why this path
     /// is not a legal run. The caller poisons, because it is the caller
-    /// that knows which expression this was.
+    /// that knows which expression this was. Third: the validity of a
+    /// comparison split at a point (`Domain::split_compare`), for the caller
+    /// to put in the path's guard.
     fn binop_values(
         &mut self,
         binop: &ast::BinOp,
         a: &Value<D>,
         b: &Value<D>,
-    ) -> Result<(Value<D>, Option<String>)> {
+    ) -> Result<(Value<D>, Option<String>, Option<D::Bool>)> {
         let (num_op, cmp_op) = match binop {
             ast::BinOp::Plus(_) => (Some(Arith::Add), None),
             ast::BinOp::Minus(_) => (Some(Arith::Sub), None),
@@ -1269,13 +1276,28 @@ impl<'a, D: Domain> Interp<'a, D> {
                 // Lua raises here, so this path is not a legal run.
                 let zero = Value::Num(self.d.num(P8::from_i16(0)));
                 let why = format!("arithmetic on {} and {}", kind_of(a), kind_of(b));
-                return Ok((zero, Some(why)));
+                return Ok((zero, Some(why), None));
             };
-            return Ok((Value::Num(self.d.arith(op, x, y)?), None));
+            return Ok((Value::Num(self.d.arith(op, x, y)?), None, None));
         }
         let op = cmp_op.unwrap();
+        let mut split = None;
         let r = match (a, b) {
-            (Value::Num(x), Value::Num(y)) => self.d.compare(op, x, y)?,
+            // Undecided with one side an interval: split it at the other
+            // side's point, so each answer is decided (room (5,0)'s balloon).
+            (Value::Num(x), Value::Num(y)) => {
+                let r = self.d.compare(op, x, y)?;
+                match self.d.decide(&r) {
+                    None => match self.d.split_compare(op, x, y) {
+                        Some((c, valid)) => {
+                            split = Some(valid);
+                            c
+                        }
+                        None => r,
+                    },
+                    Some(_) => r,
+                }
+            }
             // Two booleans compare by VALUE in Lua, so this is
             // answerable exactly rather than by comparing node ids -
             // which is what the fallthrough below would do, making two
@@ -1317,7 +1339,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             // so this path is not a legal run either.
             _ => {
                 let why = format!("comparison of {} and {}", kind_of(a), kind_of(b));
-                return Ok((Value::Bool(self.d.boolean(false)), Some(why)));
+                return Ok((Value::Bool(self.d.boolean(false)), Some(why), None));
             }
         };
         let v = Value::Bool(if matches!(binop, ast::BinOp::TildeEqual(_)) {
@@ -1325,7 +1347,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         } else {
             r
         });
-        Ok((v, None))
+        Ok((v, None, split))
     }
 
 

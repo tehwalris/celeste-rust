@@ -97,7 +97,58 @@ The first search died in the room walk: room (5,0) is loaded by `_init`,
 so the balloon's `offset = rnd(1)` is an interval in the START state, which
 the walk's write discovery never typed as an interval input ("objects[1].
 offset was already symbolic"). The walk now types the start state's own
-intervals as interval inputs too (`room_constant_lattice`).
+intervals as interval inputs too (`room_constant_lattice`, `c6d11e9`).
+
+Plan, refined with Philippe: `rnd` is an interval at every level EXCEPT
+exact; at exact, enumerate the concrete draws until one wins. Issues noted:
+`rnd(1)` has 65,536 values (16 fraction bits) and the balloon draws once, in
+`_init`, so exact is "the start state with offset = k/65536" per k -
+confirming a horizon stops at the first k that wins, refuting one at exact
+needs all 65,536 (rooms 3 and 4 refuted far below exact, at levels 6 and 9);
+running them all at once is out (the coarser marks cannot tell k apart, so
+the exact frontier would carry up to 65,536x), so in batches. Treating
+each draw as free is the best case over VALUES, not over PICO-8 seeds.
+
+**Superseded (2026-09-20, with Philippe):** the "refuse the merge" fix below
+(the `rnd` taint, `reads_rnd`, the refusal diagnostic, `max_states` 1024)
+was REVERTED uncommitted: with the cap raised the room (5,0) walk ran 21 min
+(41 CPU-min) without finishing. Replaced by a SPLIT AT A POINT - the
+balloon's interval `y` is cut at the player's per-lane position, exactly as
+`__split_by_flr` cuts at a fixed grid, except the cut is a runtime value:
+`Domain::split_compare`, called from `binop_values` when a comparison with
+one interval side and one number side is undecided. A 2-way fork
+(`both_values`) is the comparison's value; its validity (the half of the
+interval that answer leaves is non-empty: `x < t` true iff `lo(x) < t`,
+false iff `hi(x) >= t`; `x > t` true iff `hi(x) > t`, false iff
+`lo(x) <= t`; mirrored when the interval is on the right) goes in the
+path's guard. No new graph op, no cart edit, no marking.
+
+The second blocker, at level 0 (f51, 4.6M states): the player-balloon hit
+compares against the balloon's interval y (`74 < [71, 75]`), and the two
+arms cannot merge (the pop refills the dash), so the merge added its
+`Known(cond)` premise and the kernel declined the lanes - a coverage gap.
+Fix (2026-09-20): a condition that reads a `rnd` draw refuses the merge like
+one reading an unknown atom (`Domain::reads_rnd`, beside
+`reads_unknown_atom` in `state::merge` and `joins_independent`), so the
+two sides stay two successors and an undecided lane emits both. The draws
+are a per-frame TAINT carried FORWARD by `Graph::fold` (seeded by each
+`range_num` leaf and the cells of the walk's `ival_extra` slots; a point or
+boolean constant is never tainted). The first version walked the
+condition's cone backward and missed the balloon: `sin` of an interval is a
+literal span [-1, 1], so `y = start + sin(offset) * 2` kept no link to the
+draw (f50 unchanged at 4,581,199, same gap at f51). With no draw, `fold`
+takes its old path and nothing changes.
+
+With the taint, six room (5,0) walk nodes then hit the tracer's frontier
+cap (288 and 312 states, limit 256). `CELESTE_TRACE_REFUSALS=1` (new: names
+each refused merge's condition and first differing slot) showed the refused
+merges are balloon-hit families being paired across: the hit splits every
+later outcome of the frame in two (popped + dash refilled, or not), and
+`merge_inner` already selects on the SEPARATING decision (`State::path`),
+so within a family nothing is refused. 288 = 2 x 144 and 312 = 2 x 156:
+the legitimate doubling of those regions' player frontiers. The cap
+(`Interp::max_states`) is now 1024 - a limit no other room reaches, so their
+kernels are unchanged; it still stops a real runaway before `collapse`.
 
 ## For the morning
 
