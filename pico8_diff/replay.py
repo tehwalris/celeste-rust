@@ -75,6 +75,14 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None):
         "..' rem '..tostr(o.rem.x, true)..','..tostr(o.rem.y, true)",
         "    elseif o.type == player_spawn then",
         "      line = line..' player_spawn '..o.x..','..o.y",
+        # The room's fruit, and the lifeup a taken one leaves (a
+        # removed fruit with no lifeup flew away instead).
+        "    elseif fly_fruit and o.type == fly_fruit then",
+        "      line = line..' fly_fruit '..o.x..','..o.y",
+        "    elseif fruit and o.type == fruit then",
+        "      line = line..' fruit '..o.x..','..o.y",
+        "    elseif lifeup and o.type == lifeup then",
+        "      line = line..' lifeup '..o.x..','..o.y",
         "    end",
         "  end",
         "  printh('@P8@ '..line)",

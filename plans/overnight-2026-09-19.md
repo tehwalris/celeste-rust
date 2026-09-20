@@ -54,7 +54,26 @@ Then: **win at f89 in 279 concrete steps, 0 dead ends**, and
 34 idle spawn frames, right with one jump at f42, a jump at f52, then
 dash up-right (38) at f62 and f76 with jumps between.
 
+**Against the community TAS (classic/any/TAS4.tas, 62 inputs).** With the
+27 spawn frames first it exits at f89 on the ORIGINAL cart (PICO-8, f88
+player at 47,-3), equal to ours. On celeste-minimal the same inputs do not
+exit (f89: player at 23,75, falling) - the minimal cart diverges, as for
+room (2,0). Both routes are controllable from f28; TAS4 runs right at once,
+ours stands until f35 and is 14 px behind at f36, yet both are at (21,59)
+at f60 and within 2 px from there to the exit - the first stretch has
+slack. **Both take the fly fruit at f77**: the dash at f62 sets it flying,
+it rises to (16,23), and at f77 it is gone - TAS4 leaves a `lifeup` at
+(14,17), ours (the minimal cart has no lifeup) removes it with the player
+at (22,24). (`pico8_diff/replay.py` now prints fly_fruit/fruit/lifeup.)
+The fruit looks NECESSARY for 89: the witness run that skipped exactly the
+fruit-taking successors searched level 17's marked states exhaustively and
+found no win by f89. Taking it also refills the dash (`hit.djump =
+max_djump` in `fly_fruit.update`), a plausible reason - not established.
+
 ## For the morning
+
+- `concrete_run --object fly_fruit` prints "none" on every frame of a route
+  where PICO-8 shows the fly fruit throughout: its `find_object` misses it.
 
 - The fly fruit stays unknown only at level 0: unknown it multiplied states
   above level 0 and overflowed the 58-fork `ChoiceSet` from r8 up. Worth a
