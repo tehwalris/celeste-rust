@@ -255,6 +255,20 @@ the exact one included (empty in a room without `rnd`, so its exact kernels
 are unchanged). The search resumes from its checkpoint (level 0 reloads,
 h77's finer levels recompute - seconds each).
 
+**Room (5,0): OPTIMAL 77 (00:22).** h77 confirmed at all 18 levels (first
+win f73, f74, f75, f76, f76, then f77 from level 5 through the exact level;
+the exact level marked 921 states); h76 refuted at level 5 (r5sxhb: no win
+by f76). Equal to the community TAS (29 spawn frames + TAS6's 48 inputs).
+The REFUTATION of 76 is sound for every draw: level 5 holds `rnd` as the
+whole interval and the respawn timer unknown, an over-approximation of every
+phase and timing. The CONFIRMATION of 77 is for a favourable draw: even the
+exact level keeps `rnd` an interval (assumption 4), so it says "some phase
+allows 77" - consistent with TAS6 leaving the room at f77 on the original cart
+in one replay and falling short in others. A concrete witness and a PICO-8
+replay need the seed enumeration (the reference engine refuses `rnd`).
+Wall time on the balloon model: ~10 min for the whole search. In the UI as
+`room50`.
+
 ## For the morning
 
 - `concrete_run --object fly_fruit` prints "none" on every frame of a route
