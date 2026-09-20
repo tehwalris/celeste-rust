@@ -403,7 +403,7 @@ pub fn key_frame(
     let st = lw.reps[&skey].clone();
     let opts = lw.opts;
     let roots = shapes::state_paths(&st)?;
-    let ival = if opts.ival { with_extra(shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival()), lw.ival_extra.get(&skey)) } else { Vec::new() };
+    let ival = with_extra(boundary_ival(&st, opts), lw.ival_extra.get(&skey));
     let mut pin: Vec<(iface::Path, Conc)> = lw.lattice[&skey]
         .iter()
         .filter(|(p, _)| roots.iter().any(|r| r == *p))
@@ -2365,8 +2365,9 @@ pub fn room_constant_lattice(
     // (`shapes::blank`'s 0) - `Iface::init` records a point for an interval
     // slot and `ival` makes it one. Only the representative: the lattice
     // above was read from `start`, where the slot is no constant, and a 0
-    // there would have pinned the balloon's phase.
-    if opts.ival {
+    // there would have pinned the balloon's phase. At every level, the exact
+    // one included (`boundary_ival`).
+    {
         use super::domain::Domain as _;
         for r in shapes::state_paths(&start)? {
             for p in super::iface::scalars(&start, &r)? {
@@ -2418,7 +2419,7 @@ pub fn room_constant_lattice(
             .map(|(k, region)| -> Result<WalkJob> {
                 let st = reps[k].clone();
                 let roots = shapes::state_paths(&st)?;
-                let ival = if opts.ival { with_extra(shapes::ival_paths(&st, opts.spd_ival(), opts.pos_ival()), ival_extra.get(k)) } else { Vec::new() };
+                let ival = with_extra(boundary_ival(&st, opts), ival_extra.get(k));
                 // Pin the shape's known constants (only those that are real
                 // scalar inputs here), everything else abstract.
                 let pin: Vec<(super::iface::Path, super::iface::Conc)> =
@@ -2638,6 +2639,19 @@ pub fn room_constant_lattice(
 
 /// `ival_paths` plus a shape's discovered interval slots (`LatticeWalk::
 /// ival_extra`), each once.
+/// The interval inputs the BOUNDARY widens (the player's `rem`, a speed or
+/// position bucket): only where the set types intervals at all (`opts.ival`;
+/// not the exact set). The `rnd`-derived ones (`ival_extra`) come on top at
+/// EVERY level, the exact one included: `rnd` is an interval there too, and
+/// room (5,0)'s balloon phase is one from `_init` on (2026-09-21).
+fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: super::shapes::WalkOpts) -> Vec<super::iface::Path> {
+    if opts.ival {
+        super::shapes::ival_paths(st, opts.spd_ival(), opts.pos_ival())
+    } else {
+        Vec::new()
+    }
+}
+
 fn with_extra(mut ival: Vec<super::iface::Path>, extra: Option<&std::collections::BTreeSet<super::iface::Path>>) -> Vec<super::iface::Path> {
     for p in extra.into_iter().flatten() {
         if !ival.contains(p) {
@@ -2757,9 +2771,11 @@ fn walk_trace(
         }
         let key = format!("{:?}", o.st.shape()?);
         let constants = shapes::field_constants(&o.st, &tr.it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors)?;
+        // Every level, the exact one included: an interval an outcome holds
+        // beyond the boundary's own widenings came from `rnd` (`boundary_ival`).
         let mut ival = Vec::new();
-        if opts.ival {
-            let widened = shapes::ival_paths(&o.st, opts.spd_ival(), opts.pos_ival());
+        {
+            let widened = boundary_ival(&o.st, opts);
             let mut fruit: Vec<super::iface::Path> = if opts.fruit { super::widen::fly_fruit_paths(&o.st).all().cloned().collect() } else { Vec::new() };
             if opts.floors {
                 fruit.extend(super::widen::fall_floor_paths(&o.st).all().cloned());

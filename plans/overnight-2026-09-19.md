@@ -242,6 +242,19 @@ The old search (f76: 122M states, 53 GB peak, projected ~62 GB at f77 against
 the 60 GB cap) was stopped at 00:15 and room (5,0) restarted on this model,
 ladder `r0sxhb .. r15sxhb, r15sxh, rxsx` (timer exact at the top two).
 
+**First run on it (00:17-00:31):** level 0 to f77 in minutes (2.5M kept at
+f70 against 49.5M; first win f73, 172k marked). h77 first wins by level:
+f73, f74, f75, f76, f76, f77 (levels 5-16); level 15 marked 617, level 16
+(timer exact) 354. Then level 17 (Exact) failed in its kernel build:
+"objects[1].offset was already symbolic" - the exact set runs with
+`opts.ival` off, and that switch gated the `rnd` interval inputs too (the
+start-state seeding, the walk's discovery of interval writes, `key_frame`).
+Fix: the boundary's own interval paths stay behind `opts.ival`
+(`boundary_ival`), the `rnd`-derived `ival_extra` ones apply at EVERY level,
+the exact one included (empty in a room without `rnd`, so its exact kernels
+are unchanged). The search resumes from its checkpoint (level 0 reloads,
+h77's finer levels recompute - seconds each).
+
 ## For the morning
 
 - `concrete_run --object fly_fruit` prints "none" on every frame of a route
