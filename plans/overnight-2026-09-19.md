@@ -211,6 +211,18 @@ hour, even where it fits). If it is OOM-killed at f77, restart with a
 coarser level 0, `y2r0sxh` (2 px y buckets, ~half the states; the position
 rung is sound - the finer levels narrow it back). The cap is not raised.
 
+**Where room (5,0)'s memory goes (23:58, asked by Philippe).** Not per state:
+~100 B per frontier row (rooms (0,0) 126, (1,0) 127, (3,0) 152) and the same
+24.7 B per door entry. It is the COUNT: 105M kept at f75 against ~23M at the
+peak in rooms (0,0) and (3,0) and 7.1M in room (1,0). `col-census` at f60:
+the same varying fields as room (3,0) plus the balloon's `offset` (14
+values), `timer` (11) and `spr` (2). `coarse-census --erase balloon`: f60
+10.58M rows -> 8.09M states without the balloon (1.31x), f70 49.5M -> 22.0M
+(2.25x). So two factors: the player's own reachable states (8.1M -> 22.0M
+over f60-f70, room (3,0)'s level 0 peaked at 22.7M) and a balloon-history
+multiplier that is growing (every frame more states pop it at a different
+moment: their own respawn timer and phase shift, and a refilled dash).
+
 ## For the morning
 
 - `concrete_run --object fly_fruit` prints "none" on every frame of a route
