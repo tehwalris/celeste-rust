@@ -150,6 +150,51 @@ the legitimate doubling of those regions' player frontiers. The cap
 (`Interp::max_states`) is now 1024 - a limit no other room reaches, so their
 kernels are unchanged; it still stops a real runaway before `collapse`.
 
+**Room (5,0) assumptions (2026-09-20, decided while Philippe was busy):**
+
+1. The split cuts only an UNDECIDED ordered comparison (`<`, `<=`, `>`,
+   `>=`) with exactly ONE interval side; `==`, two intervals, and anything
+   the static ranges already decide are left as before.
+2. The interval is NOT narrowed in the heap: each comparison is its own
+   2-way fork (shared only for the same operator, interval node and point
+   node in one frame). The balloon's two hitbox tests fork independently, so
+   a combination no single `y` allows can survive - sound, looser than a
+   narrowed split.
+3. "Interval" is `is_interval`'s answer: a literal interval constant, a span,
+   or anything computed from an interval input cell. So the split also fires
+   for the fly fruit at fruit-unknown levels and for speed buckets; neither is
+   covered by a gate (room (2,0)'s / room (3,0)'s kernels at those levels
+   change; the default ladder's do not - the room (1,0) gates are identical).
+4. `rnd` stays an interval at EVERY level, the exact one included, for now:
+   the exact-level enumeration of concrete draws is NOT built. So the ladder's
+   "exact" level is exact except for the balloon's phase, and a confirmed
+   horizon means "wins for some phase trajectory the interval allows" - the
+   best case, possibly spurious. To be settled by the seed enumeration (or a
+   witness + PICO-8 replay) before calling 77 the optimum.
+5. The ceiling is 77 = 29 spawn frames + TAS6's 48 inputs; TAS6 left the room
+   at f77 on the original cart in one replay and fell short in four others
+   (the rnd draw), so the ceiling is a real solution only under a lucky draw.
+6. The ladder is room (3,0)'s without fruit/floors: `r0sxh, r1sxh .. r15sxh,
+   rxsx` (held buttons unknown up to the top): a level-0 forward with held
+   exact reached 38.4M states at f60 (65 s/frame, 18 GB peak) and was still
+   growing x2.6 per 5 frames. Kernel sets capped at 2; level 0 dropped while
+   the finer levels run (count-down).
+7. The ChoiceSet holds 58 forks a frame; each undecided interval comparison is
+   one more. Room (5,0)'s walk fit; a room with many such comparisons would
+   panic loudly ("fork N but a ChoiceSet holds only 58"), not go wrong.
+
+**Room (5,0) projection (2026-09-20 23:17, search at level 0 f61):** held
+unknown cut level 0 ~3x (1.42M at f50 against 4.58M held exact; 10.6M at
+f60 against 38.4M). Growth per frame 1.27 (f51) -> 1.21 (f56) -> 1.19
+(f61), ~1.3 us per state per frame, ~0.37 GB resident per million states
+(4.7 GB at f61, 6.8 GB peak). If the ratio keeps easing to ~1.11, f77 is
+~120M states: ~20 more minutes of level 0, but ~45 GB plus transients
+against the 60 GB cap - a real OOM risk around f72-f77, unless level 0
+peaks before the ceiling as room (3,0)'s did (22.7M at f74). Then the
+backward (minutes), 16 filtered levels (~2 min each in room (3,0): 40-80
+min), and h76 (a refutation mid-ladder: 20-30 min). About 1.5-2.5 h in all,
+if level 0 fits. An alert fires above 45 GB.
+
 ## For the morning
 
 - `concrete_run --object fly_fruit` prints "none" on every frame of a route
