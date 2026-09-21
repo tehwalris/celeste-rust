@@ -113,6 +113,8 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
         g_fly_fruit: g("fly_fruit"),
         f_step: f("step"),
         f_fly: f("fly"),
+        g_platform: g("platform"),
+        f_last: f("last"),
         g_fall_floor: g("fall_floor"),
         f_state: f("state"),
         f_delay: f("delay"),

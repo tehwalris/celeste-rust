@@ -163,6 +163,11 @@ pub struct BoundaryIds {
     pub g_fly_fruit: u32,
     pub f_step: u32,
     pub f_fly: u32,
+    /// The moving platforms at a platforms-unknown level
+    /// (`abstraction::PlatformsPrecision`): the type global and `last` (`x`,
+    /// `rem` above).
+    pub g_platform: u32,
+    pub f_last: u32,
     /// The fall floors at a floors-unknown level (`abstraction::FloorsPrecision`).
     pub g_fall_floor: u32,
     pub f_state: u32,
@@ -182,6 +187,16 @@ pub struct BoundaryIds {
 /// tracer's output widening (`widen::canon_balloon_offset`), or the mark
 /// filter misses.
 pub const BALLOON_PERIOD_RAW: i32 = 0xffff;
+
+/// A moving platform's whole path, whole pixels: it moves 0.65 px a frame and
+/// wraps from past 128 to -16 (and from past -16 to 128), so its `x` - and
+/// `last`, which equals it at every frame boundary - is always in here. ONE
+/// definition, shared with the tracer (`widen::widen_platforms`).
+pub const PLATFORM_PATH: (i16, i16) = (-16, 128);
+
+/// A platform's `rem.x` at a platforms-unknown level: the whole remainder
+/// `[-0.5, 0.5)`, raw.
+pub const PLATFORM_REM: (i32, i32) = (-0x8000, 0x7fff);
 
 /// The fly fruit's `spd.y` range at a fruit-unknown level (raw 16.16,
 /// inclusive): waiting, `sin(step) * 0.5` in [-0.5, 0.5]; flying,
@@ -792,7 +807,7 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, 0, None, (1, 1), false, false, false);
+        self.widen_to(ids, 0, None, (1, 1), false, false, false, false);
     }
 
     /// The boundary widenings of the `Bits(rem_bits)` level on this block's
@@ -811,7 +826,7 @@ impl Rt2 {
     /// players' `spd.x`/`spd.y` to, `None` for exact speed - the level's
     /// `abstraction::spd_precision_for`, which the caller passes because
     /// the switch lives above this crate.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool, fruit: bool, floors: bool) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool, fruit: bool, floors: bool, platforms: bool) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 0. position widening (the rung below level 0): the player's
@@ -1137,6 +1152,41 @@ impl Rt2 {
                 let c = self.obj_field_cell(obj, ids.f_timer).unwrap_or_else(|| panic!("balloon widening: the balloon has no `timer` field"));
                 check(self, c, "timer", &|v| matches!(v, AV::Num(_) | AV::Ival(..) | AV::UNum));
                 self.cols[c as usize] = Col::U(AV::UNum);
+            }
+        }
+
+        // 8b. The moving platforms at a platforms-unknown level
+        // (plans/platforms-unknown.md), as that level's kernels write them
+        // (`widen::widen_platforms`): `x` and `last` the interval of the whole
+        // path, `rem.x` the whole remainder. `last == x` holds in every row a
+        // frame ends in (the update ends with `last = x`; `init` sets it): the
+        // kernels read `last` as `x`, so a row where it does not hold asserts.
+        if platforms {
+            let (plo, phi) = (P8::from_i16(PLATFORM_PATH.0), P8::from_i16(PLATFORM_PATH.1));
+            let (rlo, rhi) = (P8::from_raw(PLATFORM_REM.0), P8::from_raw(PLATFORM_REM.1));
+            for obj in self.objects_of_type(ids, ids.g_platform) {
+                let x = self.obj_field_cell(obj, ids.f_x).unwrap_or_else(|| panic!("platform widening: a platform has no `x`"));
+                let last = self.obj_field_cell(obj, ids.f_last).unwrap_or_else(|| panic!("platform widening: a platform has no `last`"));
+                assert!(
+                    (0..self.width).all(|lane| self.cols[x as usize].at(lane) == self.cols[last as usize].at(lane)),
+                    "platform widening: a row with `last != x`"
+                );
+                for (name, c) in [("x", x), ("last", last)] {
+                    check(self, c, name, &|v| match v {
+                        AV::Num(n) => plo <= n && n <= phi,
+                        AV::Ival(a, b) => plo <= a && b <= phi,
+                        _ => false,
+                    });
+                    self.cols[c as usize] = Col::U(AV::Ival(plo, phi));
+                }
+                let cells = self.xy_cells_of(obj, ids.f_rem, ids);
+                let [c, _] = cells[..] else { panic!("platform widening: a platform has no `rem`") };
+                check(self, c, "rem.x", &|v| match v {
+                    AV::Num(n) => rlo <= n && n <= rhi,
+                    AV::Ival(a, b) => rlo <= a && b <= rhi,
+                    _ => false,
+                });
+                self.cols[c as usize] = Col::U(AV::Ival(rlo, rhi));
             }
         }
 

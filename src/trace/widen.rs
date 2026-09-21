@@ -169,6 +169,7 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
     widen_timers(st, d)?;
     widen_fly_fruit(st, d)?;
     widen_fall_floors(st, d)?;
+    widen_platforms(st, d)?;
     canon_balloon_offset(st, d)?;
     widen_held(st, d)?;
     Ok(())
@@ -204,7 +205,7 @@ fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()
     Ok(())
 }
 
-use celeste_engine::runtime2::BALLOON_PERIOD_RAW;
+use celeste_engine::runtime2::{BALLOON_PERIOD_RAW, PLATFORM_PATH, PLATFORM_REM};
 
 /// Held buttons unknown (plans/held-buttons.md): the player's trails leave the
 /// frame unknown - the canonical output unknown (`Symbolic::unknown_bool_output`),
@@ -305,6 +306,165 @@ fn replace_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic, output: bool)
         iface::set(st, p, Value::Bool(b))?;
     }
     Ok(())
+}
+
+/// The fields a platforms-unknown level widens, per moving platform
+/// (plans/platforms-unknown.md).
+pub struct PlatformPaths {
+    pub x: Vec<Path>,
+    pub last: Vec<Path>,
+    pub rem_x: Vec<Path>,
+}
+
+impl PlatformPaths {
+    pub fn all(&self) -> impl Iterator<Item = &Path> {
+        self.x.iter().chain(self.last.iter()).chain(self.rem_x.iter())
+    }
+}
+
+pub fn platform_paths<D: Domain>(st: &State<D>) -> PlatformPaths {
+    let mut out = PlatformPaths { x: Vec::new(), last: Vec::new(), rem_x: Vec::new() };
+    for obj in objects_of_type(st, "platform") {
+        out.x.push(field(&obj, &["x"]));
+        out.last.push(field(&obj, &["last"]));
+        out.rem_x.push(field(&obj, &["rem", "x"]));
+    }
+    out
+}
+
+/// The platforms' INPUT side at a platforms-unknown level
+/// (plans/platforms-unknown.md): `x` stays the interval input cell - per-lane
+/// data, so a comparison with it is a point split and it keeps its identity -
+/// and `last` is bound to that SAME value: `last == x` at every frame
+/// boundary, proved by every traced outcome (`widen_platforms`) and the start
+/// state. `rem.x` is the whole remainder as a literal, so the move's
+/// `__split_by_flr` runs as literal fragments.
+pub fn fork_platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    let pp = platform_paths(st);
+    for (x, last) in pp.x.iter().zip(&pp.last) {
+        let Some(Value::Num(xv)) = iface::get(st, x) else { bail!("{}: not a number", iface::show(x)) };
+        let Some(Value::Num(_)) = iface::get(st, last) else { bail!("{}: not a number", iface::show(last)) };
+        iface::set(st, last, Value::Num(xv))?;
+        d.platform_inputs.push(xv);
+    }
+    for p in &pp.rem_x {
+        let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
+        let r = d.graph.leaf(Op::Const(PLATFORM_REM.0, PLATFORM_REM.1));
+        iface::set(st, p, Value::Num(r))?;
+    }
+    Ok(())
+}
+
+/// The platforms' OUTPUT side at a platforms-unknown level: `x` and `last` the
+/// interval of the whole path, `rem.x` the whole remainder (`Rt2::widen_to`
+/// step 8b projects the same way). Checked, never assumed: the output `last`
+/// must BE the output `x` (the update ends with `last = x`) - with the start
+/// state, what makes the input alias sound by induction - and each widened
+/// field must provably lie in its range (`within`, through the wrap's point
+/// splits), else a runtime premise in `ok` declines the lane loudly.
+fn widen_platforms(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    if !d.platforms_unknown {
+        return Ok(());
+    }
+    let pp = platform_paths(st);
+    let path = ((PLATFORM_PATH.0 as i64) << 16, (PLATFORM_PATH.1 as i64) << 16);
+    for (x, last) in pp.x.iter().zip(&pp.last) {
+        let Some(Value::Num(xv)) = iface::get(st, x) else { bail!("{}: not a number", iface::show(x)) };
+        let Some(Value::Num(lv)) = iface::get(st, last) else { bail!("{}: not a number", iface::show(last)) };
+        anyhow::ensure!(xv == lv, "{}: a platform's `last` is not its `x` at the frame's end", iface::show(last));
+        contain(st, d, xv, path);
+        let hull = d.graph.leaf(Op::Const(path.0 as i32, path.1 as i32));
+        iface::set(st, x, Value::Num(hull))?;
+        iface::set(st, last, Value::Num(hull))?;
+    }
+    let rem = (PLATFORM_REM.0 as i64, PLATFORM_REM.1 as i64);
+    for p in &pp.rem_x {
+        let Some(Value::Num(v)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
+        contain(st, d, v, rem);
+        let r = d.graph.leaf(Op::Const(PLATFORM_REM.0, PLATFORM_REM.1));
+        iface::set(st, p, Value::Num(r))?;
+    }
+    Ok(())
+}
+
+/// `v` in `[lo, hi]` (raw): proved statically (`within`), else a premise in
+/// `ok` (like the fly fruit's containment, `widen_fly_fruit`).
+fn contain(st: &mut State<Symbolic>, d: &mut Symbolic, v: crate::transpile::graph::NodeId, (lo, hi): (i64, i64)) {
+    if within(d, v, (lo, hi), &mut Vec::new()) {
+        return;
+    }
+    let (klo, khi) = (d.graph.leaf(Op::Const(lo as i32, lo as i32)), d.graph.leaf(Op::Const(hi as i32, hi as i32)));
+    let (vlo, vhi) = (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v]));
+    let above = d.graph.fold(Op::Ge, vec![vlo, klo]);
+    let below = d.graph.fold(Op::Le, vec![vhi, khi]);
+    let inside = d.graph.fold(Op::And, vec![above, below]);
+    st.ok = d.graph.fold(Op::And, vec![st.ok, inside]);
+}
+
+/// Does `v` provably lie in `[lo, hi]` (raw)? Through the arms of a select,
+/// and under a point split's branch with what its answer says about the
+/// compared value (`Symbolic::point_cmp`): the wrap `x < -16 ? 128 : (x > 128
+/// ? -16 : x)` is on the path whatever `x` was. Static; `false` where it
+/// cannot tell.
+fn within(d: &Symbolic, v: crate::transpile::graph::NodeId, (lo, hi): (i64, i64), facts: &mut Vec<(crate::transpile::graph::NodeId, i64, i64)>) -> bool {
+    use super::domain::Cmp;
+    let node = d.graph.get(v);
+    if let Op::Sel = node.op {
+        let (c, t, f) = (node.args[0], node.args[1], node.args[2]);
+        if let Some(&(op, x, k)) = d.point_cmp.get(&c) {
+            if let Op::Const(kl, kh) = d.graph.get(k).op {
+                if kl == kh {
+                    let k = kl as i64;
+                    // What each answer says about `x`, as a raw range.
+                    let (yes, no) = match op {
+                        Cmp::Lt => ((i64::MIN, k - 1), (k, i64::MAX)),
+                        Cmp::Le => ((i64::MIN, k), (k + 1, i64::MAX)),
+                        Cmp::Gt => ((k + 1, i64::MAX), (i64::MIN, k)),
+                        Cmp::Ge => ((k, i64::MAX), (i64::MIN, k - 1)),
+                        Cmp::Eq => return within(d, t, (lo, hi), facts) && within(d, f, (lo, hi), facts),
+                    };
+                    facts.push((x, yes.0, yes.1));
+                    let a = within(d, t, (lo, hi), facts);
+                    facts.pop();
+                    facts.push((x, no.0, no.1));
+                    let b = within(d, f, (lo, hi), facts);
+                    facts.pop();
+                    return a && b;
+                }
+            }
+        }
+        return within(d, t, (lo, hi), facts) && within(d, f, (lo, hi), facts);
+    }
+    match bounds(d, v, facts) {
+        Some((a, b)) => lo <= a && b <= hi,
+        None => false,
+    }
+}
+
+/// A static raw range of `n`: literals, a platform's input `x` (its path),
+/// sums and differences - narrowed by what the enclosing branches know about
+/// `n`. `None` for anything else.
+fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::transpile::graph::NodeId, i64, i64)]) -> Option<(i64, i64)> {
+    let node = d.graph.get(n);
+    let mut r = match node.op {
+        Op::Const(a, b) => (a as i64, b as i64),
+        _ if d.platform_inputs.contains(&n) => ((PLATFORM_PATH.0 as i64) << 16, (PLATFORM_PATH.1 as i64) << 16),
+        Op::Add => {
+            let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
+            (a.0 + b.0, a.1 + b.1)
+        }
+        Op::Sub => {
+            let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
+            (a.0 - b.1, a.1 - b.0)
+        }
+        _ => return None,
+    };
+    for &(m, flo, fhi) in facts {
+        if m == n {
+            r = (r.0.max(flo), r.1.min(fhi));
+        }
+    }
+    Some(r)
 }
 
 /// The fly fruit's `spd.y` and `rem.y` ranges: ONE definition, shared with the

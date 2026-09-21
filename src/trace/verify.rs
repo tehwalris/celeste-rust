@@ -257,6 +257,8 @@ pub fn trace_frame<'a>(
     it.d.escaped.clear();
     it.d.fork_origins.clear();
     it.d.point_splits.clear();
+    it.d.point_cmp.clear();
+    it.d.platform_inputs.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
     // Built BEFORE the frame runs, so it names the input cells rather
     // than whatever the frame did to those slots.
@@ -309,6 +311,11 @@ pub fn trace_frame<'a>(
     // The fall floors unknown: likewise (plans/fall-floors.md).
     if it.d.floors_unknown {
         super::widen::fork_floor_inputs(&mut st, &mut it.d)?;
+    }
+    // The moving platforms unknown: `last` read as `x`, `rem.x` the literal
+    // (plans/platforms-unknown.md).
+    if it.d.platforms_unknown {
+        super::widen::fork_platform_inputs(&mut st, &mut it.d)?;
     }
     let st = run_one(it, reset, st)?;
     let mut outs = Vec::new();
@@ -377,6 +384,42 @@ pub fn trace_frame<'a>(
     }
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         eprintln!("[build] trace_frame {widen:?}: {} forks at the end, {} outcomes, {} pins", it.d.forks, outs.len(), pin.len());
+    }
+    // DIAGNOSTIC (CELESTE_BUILD_TRACE): how many forks this frame minted, by
+    // origin - what a `ChoiceSet` overflow ("fork 58 but a ChoiceSet holds
+    // only 58") is made of.
+    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+        let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
+        for (_, o) in &it.d.fork_origins {
+            *by.entry(o.as_str()).or_default() += 1;
+        }
+        // And how many of them any outcome can still see (its fields, guard,
+        // `ok`): the forks a kernel would really have to enumerate.
+        use crate::transpile::graph::Op;
+        let mut roots: Vec<NodeId> = Vec::new();
+        for o in &outs {
+            roots.extend(o.fields.iter().map(|(_, n, _)| *n));
+            roots.push(o.guard);
+            roots.push(o.ok);
+        }
+        let reach = crate::transpile::bdd::reachable(&it.d.graph, &roots);
+        let point: std::collections::BTreeSet<u8> = it.d.point_splits.iter().map(|p| p.0).collect();
+        let mut live: std::collections::BTreeSet<u8> = Default::default();
+        for (i, r) in reach.iter().enumerate() {
+            if !*r {
+                continue;
+            }
+            if let Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) | Op::SplitKeyTab(d) | Op::SplitOkTab(d) = it.d.graph.get(i as NodeId).op {
+                live.insert(d);
+            }
+        }
+        eprintln!(
+            "[build] trace_frame: {} forks, {} with an origin: {by:?}; live {} ({} of them point splits)",
+            it.d.forks,
+            it.d.fork_origins.len(),
+            live.len(),
+            live.iter().filter(|d| point.contains(d)).count()
+        );
     }
     let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
     let fork_tables: Vec<Vec<(i32, i32)>> = (0..it.d.forks).map(|d| it.d.graph.fork_table(d).to_vec()).collect();

@@ -1351,7 +1351,7 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     } else {
         // The key hashes the speed BUCKET (the row stores the hull).
         if let Some(w) = crate::interpreter::abstraction::spd_precision().width_log2() {
-            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1), false, false, false);
+            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1), false, false, false, false);
         }
         b.boundary(&super::boundary_ids());
     }
@@ -2581,7 +2581,8 @@ const HELD_SLOTS: usize = 2;
 // The fly fruit exact or unknown, the fall floors exact or unknown.
 const FRUIT_SLOTS: usize = 2;
 const FLOORS_SLOTS: usize = 2;
-const LEVEL_SLOTS: usize = 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS;
+const PLATFORMS_SLOTS: usize = 2;
+const LEVEL_SLOTS: usize = 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS * PLATFORMS_SLOTS;
 
 /// The kernel set for one LEVEL, built on a big stack (the retrace's init
 /// interpret recurses deeper than a worker thread's default). The root is
@@ -2701,7 +2702,8 @@ fn level_slot(level: crate::interpreter::abstraction::Level) -> usize {
     let held_slot = level.held.is_unknown() as usize;
     let fruit_slot = level.fruit.is_unknown() as usize;
     let floors_slot = level.floors.is_unknown() as usize;
-    ((((rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot) * HELD_SLOTS + held_slot) * FRUIT_SLOTS + fruit_slot) * FLOORS_SLOTS + floors_slot
+    let platforms_slot = level.platforms.is_unknown() as usize;
+    (((((rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot) * HELD_SLOTS + held_slot) * FRUIT_SLOTS + fruit_slot) * FLOORS_SLOTS + floors_slot) * PLATFORMS_SLOTS + platforms_slot
 }
 
 /// Build every rung's kernel set now, all rungs at once (one builder
@@ -2781,7 +2783,7 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
     let mode = super::dispatch::traced_mode_for(rem);
     let (opts, exact) = match mode {
-        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos).with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()), false),
+        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos).with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()).with_platforms(level.platforms.is_unknown()), false),
         super::dispatch::TracedMode::Level0Agnostic => {
             // Phase 1: the opt-in rung-specific variant bakes the rem
             // widening into the graph (`ladder_widen`), still through
@@ -2791,7 +2793,7 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
                 (true, RemPrecision::Bits(b)) => WalkOpts::ladder_widen(b, level.spd),
                 _ => WalkOpts::LADDER,
             };
-            (opts.with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()), true)
+            (opts.with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()).with_platforms(level.platforms.is_unknown()), true)
         }
         super::dispatch::TracedMode::ExactRem => (WalkOpts::EXACT, true),
     };

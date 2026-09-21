@@ -2334,6 +2334,8 @@ pub fn room_constant_lattice(
     it.d.fruit_unknown = opts.fruit;
     // ... and the fall floors' (`widen::fork_floor_inputs`).
     it.d.floors_unknown = opts.floors;
+    // ... and the moving platforms' (`widen::fork_platform_inputs`).
+    it.d.platforms_unknown = opts.platforms;
 
     let st = cart::fresh_state::<Symbolic>(&mut it.d);
     let st = run_one(&mut it, top, st)?;
@@ -2353,7 +2355,7 @@ pub fn room_constant_lattice(
 
     let sk = key(&start)?;
     let start_key = sk.clone();
-    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors)?);
+    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?);
     reps.insert(sk.clone(), start.clone());
     // The START state's own intervals are interval inputs too. Room (5,0) is
     // loaded by `_init`, whose balloon draws `offset = rnd(1)` there: an
@@ -2646,7 +2648,14 @@ pub fn room_constant_lattice(
 /// room (5,0)'s balloon phase is one from `_init` on (2026-09-21).
 fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: super::shapes::WalkOpts) -> Vec<super::iface::Path> {
     if opts.ival {
-        super::shapes::ival_paths(st, opts.spd_ival(), opts.pos_ival())
+        let mut ival = super::shapes::ival_paths(st, opts.spd_ival(), opts.pos_ival());
+        // The moving platforms' `x` and `last` at a platforms-unknown level:
+        // interval inputs, their whole path (plans/platforms-unknown.md).
+        if opts.platforms {
+            let pp = super::widen::platform_paths(st);
+            ival.extend(pp.x.iter().chain(pp.last.iter()).cloned());
+        }
+        ival
     } else {
         Vec::new()
     }
@@ -2770,7 +2779,7 @@ fn walk_trace(
             continue;
         }
         let key = format!("{:?}", o.st.shape()?);
-        let constants = shapes::field_constants(&o.st, &tr.it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors)?;
+        let constants = shapes::field_constants(&o.st, &tr.it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?;
         // Every level, the exact one included: an interval an outcome holds
         // beyond the boundary's own widenings came from `rnd` (`boundary_ival`).
         let mut ival = Vec::new();
@@ -2779,6 +2788,9 @@ fn walk_trace(
             let mut fruit: Vec<super::iface::Path> = if opts.fruit { super::widen::fly_fruit_paths(&o.st).all().cloned().collect() } else { Vec::new() };
             if opts.floors {
                 fruit.extend(super::widen::fall_floor_paths(&o.st).all().cloned());
+            }
+            if opts.platforms {
+                fruit.extend(super::widen::platform_paths(&o.st).all().cloned());
             }
             for p in shapes::state_paths(&o.st)? {
                 if widened.contains(&p) || fruit.contains(&p) {

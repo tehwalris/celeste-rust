@@ -422,6 +422,27 @@ impl FloorsPrecision {
     }
 }
 
+/// The moving PLATFORMS (plans/platforms-unknown.md): `Unknown` at the coarse
+/// rungs, where every platform's `x` and `last` are the interval of its whole
+/// path and its `rem.x` the whole remainder - its phase forgotten, so states
+/// from different frames merge. The exact rungs keep the real positions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlatformsPrecision {
+    Unknown,
+    Exact,
+}
+
+impl PlatformsPrecision {
+    pub fn is_unknown(self) -> bool {
+        self == PlatformsPrecision::Unknown
+    }
+
+    /// Unknown covers exact.
+    pub fn coarser_or_equal(self, finer: PlatformsPrecision) -> bool {
+        self == PlatformsPrecision::Unknown || finer == PlatformsPrecision::Exact
+    }
+}
+
 /// ONE LEVEL of the ladder: its position, rem and spd precisions. The
 /// search's levels are a list of these (`parse_ladder`); the
 /// process-global precisions (`set_level`) name the level whose kernels
@@ -434,13 +455,14 @@ pub struct Level {
     pub held: HeldPrecision,
     pub fruit: FruitPrecision,
     pub floors: FloorsPrecision,
+    pub platforms: PlatformsPrecision,
 }
 
 impl Level {
     /// The level at rem rung `rem` under the spd preset, exact position and
     /// held buttons.
     pub fn for_rem(rem: RemPrecision) -> Level {
-        Level { pos: PosPrecision::EXACT, rem, spd: spd_precision_for(rem), held: HeldPrecision::Exact, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact }
+        Level { pos: PosPrecision::EXACT, rem, spd: spd_precision_for(rem), held: HeldPrecision::Exact, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact, platforms: PlatformsPrecision::Exact }
     }
 
     /// Exact in every coordinate: the top of every ladder.
@@ -451,6 +473,7 @@ impl Level {
         held: HeldPrecision::Exact,
         fruit: FruitPrecision::Exact,
         floors: FloorsPrecision::Exact,
+        platforms: PlatformsPrecision::Exact,
     };
 
     /// Every fork in a rung's graph cuts on ONE grid (2^-k for rem
@@ -481,7 +504,7 @@ impl Level {
         // widenings are keyed on the domain's flags, not on the trace mode, so
         // the ladder rungs above level 0 take them too (plans/fly-fruit.md,
         // plans/fall-floors.md; the rungs since 2026-09-19).
-        if (self.fruit.is_unknown() || self.floors.is_unknown()) && (!matches!(self.rem, RemPrecision::Bits(_)) || !self.pos.is_exact()) {
+        if (self.fruit.is_unknown() || self.floors.is_unknown() || self.platforms.is_unknown()) && (!matches!(self.rem, RemPrecision::Bits(_)) || !self.pos.is_exact()) {
             return false;
         }
         // A position bucket forks on the integer grid: rem Bits(0) only.
@@ -503,6 +526,7 @@ impl Level {
             && self.held.coarser_or_equal(finer.held)
             && self.fruit.coarser_or_equal(finer.fruit)
             && self.floors.coarser_or_equal(finer.floors)
+            && self.platforms.coarser_or_equal(finer.platforms)
     }
 
     /// One level from `[x<w>][y<w>]r<k|x>s<w|x>[h][f][b]`: an optional position
@@ -541,6 +565,11 @@ impl Level {
                 return Err(format!("level {spec:?}: rem rung {k} > 15 (use x for exact)"));
             }
         }
+        // `p`: the moving platforms unknown. No speed token ends in `p`.
+        let (sp, platforms) = match sp.strip_suffix('p') {
+            Some(t) => (t, PlatformsPrecision::Unknown),
+            None => (sp, PlatformsPrecision::Exact),
+        };
         // `b`: the fall floors unknown. No speed token ends in `b`.
         let (sp, floors) = match sp.strip_suffix('b') {
             Some(t) => (t, FloorsPrecision::Unknown),
@@ -575,7 +604,7 @@ impl Level {
                 }
             }
         };
-        Ok(Level { pos, rem, spd, held, fruit, floors })
+        Ok(Level { pos, rem, spd, held, fruit, floors, platforms })
     }
 
     /// A ladder from a comma-separated list of levels, coarsest first,
@@ -634,6 +663,9 @@ impl std::fmt::Display for Level {
         }
         if self.floors.is_unknown() {
             write!(f, "/B")?;
+        }
+        if self.platforms.is_unknown() {
+            write!(f, "/M")?;
         }
         Ok(())
     }
@@ -730,6 +762,21 @@ pub fn set_floors_precision(p: FloorsPrecision) {
     FLOORS_UNKNOWN.store(p.is_unknown(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The process-global platform precision (`set_level`); unset reads as exact.
+static PLATFORMS_UNKNOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn platforms_precision() -> PlatformsPrecision {
+    if PLATFORMS_UNKNOWN.load(std::sync::atomic::Ordering::Relaxed) {
+        PlatformsPrecision::Unknown
+    } else {
+        PlatformsPrecision::Exact
+    }
+}
+
+pub fn set_platforms_precision(p: PlatformsPrecision) {
+    PLATFORMS_UNKNOWN.store(p.is_unknown(), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The level whose kernels the engine dispatches to, from here on.
 pub fn set_level(l: Level) {
     set_pos_precision(l.pos);
@@ -738,6 +785,7 @@ pub fn set_level(l: Level) {
     set_held_precision(l.held);
     set_fruit_precision(l.fruit);
     set_floors_precision(l.floors);
+    set_platforms_precision(l.platforms);
 }
 
 pub fn current_level() -> Level {
@@ -748,6 +796,7 @@ pub fn current_level() -> Level {
         held: held_precision(),
         fruit: fruit_precision(),
         floors: floors_precision(),
+        platforms: platforms_precision(),
     }
 }
 
@@ -1653,11 +1702,11 @@ mod tests {
         // The ladder spec.
         let l = Level::parse_ladder("r0s16,r1s15,r2sx,rxsx").unwrap();
         assert_eq!(l.len(), 4);
-        assert_eq!(l[0], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(0), spd: SpdPrecision::WidthLog2(16), held: HeldPrecision::Exact, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact });
-        assert_eq!(l[2], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(2), spd: SpdPrecision::Exact, held: HeldPrecision::Exact, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact });
+        assert_eq!(l[0], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(0), spd: SpdPrecision::WidthLog2(16), held: HeldPrecision::Exact, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact, platforms: PlatformsPrecision::Exact });
+        assert_eq!(l[2], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(2), spd: SpdPrecision::Exact, held: HeldPrecision::Exact, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact, platforms: PlatformsPrecision::Exact });
         // Held buttons unknown: `h`, at rem rungs only, coarser than exact.
         let h = Level::parse("r0sxh").unwrap();
-        assert_eq!(h, Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(0), spd: SpdPrecision::Exact, held: HeldPrecision::Unknown, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact });
+        assert_eq!(h, Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(0), spd: SpdPrecision::Exact, held: HeldPrecision::Unknown, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact, platforms: PlatformsPrecision::Exact });
         // The fly fruit unknown: `f` after `h`, at rem rungs, exact position.
         let hf = Level::parse("r0sxhf").unwrap();
         assert!(hf.fruit.is_unknown() && hf.held.is_unknown() && hf.grid_consistent());

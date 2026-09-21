@@ -448,6 +448,10 @@ pub struct Symbolic {
     /// `state`, `delay` and `collideable` (`widen::fork_floor_inputs`), with the
     /// same literal and atom machinery as the fruit (`unknowns`). Set by the walk.
     pub floors_unknown: bool,
+    /// The moving platforms unknown (`abstraction::PlatformsPrecision`,
+    /// plans/platforms-unknown.md): `trace_frame` widens their inputs
+    /// (`widen::fork_platform_inputs`), every outcome their outputs.
+    pub platforms_unknown: bool,
     /// How many `Op::UnknownBool` atoms this frame handed out.
     pub unknown_atoms: u32,
     /// `escaped_atom`'s memo: the fork each escaped atom became, this frame.
@@ -461,6 +465,15 @@ pub struct Symbolic {
     /// the comparison itself over its ranges instead of enumerating it
     /// (`level_minus_one`). Cleared with `fork_origins`.
     pub point_splits: Vec<(u8, NodeId, NodeId)>,
+    /// Each point split's comparison, by its choice node: `(op, x, t)` for
+    /// `x op t` - what a branch on the choice KNOWS about `x`
+    /// (`widen::widen_platforms`' containment proof). Cleared with
+    /// `point_splits`.
+    pub point_cmp: rustc_hash::FxHashMap<NodeId, (Cmp, NodeId, NodeId)>,
+    /// The moving platforms' `x` input values at a platforms-unknown level
+    /// (`widen::fork_platform_inputs`): each on its path. Cleared with
+    /// `point_splits`.
+    pub platform_inputs: Vec<NodeId>,
     /// `lane_independent`'s memo. Structural (a node's op and operands never
     /// change), so it outlives a frame.
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
@@ -546,7 +559,58 @@ impl Symbolic {
     /// floors)? The literal folding, the independent joins and the literal
     /// splits switch on with it.
     pub fn unknowns(&self) -> bool {
-        self.fruit_unknown || self.floors_unknown
+        self.fruit_unknown || self.floors_unknown || self.platforms_unknown
+    }
+
+    /// `n` as `base + literal`: an `Add` with a literal operand (either side),
+    /// else `n + 0`.
+    fn base_plus_literal(&self, n: NodeId) -> (NodeId, (i32, i32)) {
+        let node = self.graph.get(n);
+        if let Op::Add = node.op {
+            for (b, k) in [(node.args[0], node.args[1]), (node.args[1], node.args[0])] {
+                if let Op::Const(lo, hi) = self.graph.get(k).op {
+                    return (b, (lo, hi));
+                }
+            }
+        }
+        (n, (0, 0))
+    }
+
+    /// `a - r` where `a` is `r + c` (either operand order): `c`, EXACTLY - the
+    /// identity holds in 16.16 wrapping arithmetic - and `r - r` is 0. Also
+    /// under the arms of a select `a`, where an arm cancels (a platform's carry
+    /// `x - last`, with `last` its own input `x` and the wrap's select between,
+    /// plans/platforms-unknown.md). In the tracer's arithmetic, not
+    /// `Graph::fold`: over ranges `(r + c) - r` evaluates wider than `c`, and
+    /// `fold` must agree with the evaluator exactly. `None` where nothing
+    /// cancels.
+    fn cancel_sub(&mut self, a: NodeId, r: NodeId) -> Result<Option<NodeId>> {
+        if a == r {
+            return Ok(Some(self.konst(P8::from_raw(0))));
+        }
+        let op = self.graph.get(a).op.clone();
+        let args = self.graph.get(a).args.clone();
+        match op {
+            Op::Add if args[0] == r => Ok(Some(args[1])),
+            Op::Add if args[1] == r => Ok(Some(args[0])),
+            Op::Sel => {
+                let (c, t, f) = (args[0], args[1], args[2]);
+                let (tc, fc) = (self.cancel_sub(t, r)?, self.cancel_sub(f, r)?);
+                if tc.is_none() && fc.is_none() {
+                    return Ok(None);
+                }
+                let t2 = match tc {
+                    Some(n) => n,
+                    None => self.arith(Arith::Sub, &t, &r)?,
+                };
+                let f2 = match fc {
+                    Some(n) => n,
+                    None => self.arith(Arith::Sub, &f, &r)?,
+                };
+                Ok(Some(self.graph.fold(Op::Sel, vec![c, t2, f2])))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// A boolean every lane holds in BOTH values: a 2-way fork with no
@@ -679,6 +743,11 @@ impl Domain for Symbolic {
         }
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
             return Ok(self.unknown_num());
+        }
+        if let Arith::Sub = op {
+            if let Some(n) = self.cancel_sub(*a, *b)? {
+                return Ok(n);
+            }
         }
         let g = match op {
             Arith::Add => Op::Add,
@@ -847,6 +916,7 @@ impl Domain for Symbolic {
         };
         let c = self.both_values(&format!("{op:?} split at a point"));
         self.point_splits.push((self.forks - 1, may_true, may_false));
+        self.point_cmp.insert(c, (op, x, t));
         let nc = self.not(&c);
         let (yes, no) = (self.and(&c, &may_true), self.and(&nc, &may_false));
         let valid = self.or(&yes, &no);
@@ -1070,7 +1140,20 @@ impl Domain for Symbolic {
         }
         match (self.graph.get(*t).op.clone(), self.graph.get(*f).op.clone()) {
             (Op::Const(a0, a1), Op::Const(b0, b1)) => Some(self.graph.leaf(Op::Const(a0.min(b0), a1.max(b1)))),
-            _ => None,
+            // The SAME value plus a literal on each side (a platform's `x0` and
+            // `x0 + 1` from its move's two fragments, plans/platforms-unknown.md):
+            // that value plus the literals' hull. A lane holds one of the two,
+            // both lie in it, and the value stays itself - so what reads it
+            // later still knows it (`x - last` cancels, `Symbolic::cancel_sub`).
+            _ => {
+                let (tb, tk) = self.base_plus_literal(*t);
+                let (fb, fk) = self.base_plus_literal(*f);
+                if tb != fb || matches!(self.graph.get(tb).op, Op::Const(..)) {
+                    return None;
+                }
+                let k = self.graph.leaf(Op::Const(tk.0.min(fk.0), tk.1.max(fk.1)));
+                Some(self.graph.fold(Op::Add, vec![tb, k]))
+            }
         }
     }
 
