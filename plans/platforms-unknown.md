@@ -121,7 +121,25 @@ outcome's `live` reads every comparison of the frame, whether or not the
 answer changes any of its values. Widening the mask would trade the panic for
 2^70 bodies per outcome. Needs a decision (below, "Options").
 
-## Options (for Philippe)
+## Decided: fork AFTER the frame (Philippe, 2026-09-21)
+
+The eager point split (`split_compare`, forking each interval comparison as
+it is evaluated and putting its validity in the path's guard) is gone. A
+comparison is traced as an ordinary condition: branches merge into selects
+with `Known(cond)`, everything folds, and only then does
+`verify::fork_known_premises` turn each SURVIVING `Known(cond)` whose `cond`
+reads an interval comparison into a fork - `cond` -> the fork in every
+outcome, `Known(cond)` -> true, the validity (`Symbolic::may_answers`) only
+in the guards of outcomes that read it. Level -1 opts out
+(`Symbolic::no_known_forks`): its evaluator joins undecided selects.
+
+Room (5,0), the balloon the point split was built for, level 0 `r0sxhb` to
+f60: kept counts IDENTICAL to the point-split run (f40 23,772, f45 89,797,
+f50 296,257, f51 363,568, f55 646,053, f60 1,078,261) - no coverage gap at
+f51. Room (6,0) at `r0sxhp`: still too many forks (worst traces 131-144 live,
+nearly all from the pass) - under investigation.
+
+## Options considered before (for the record)
 
 1. A fork whose answers agree is no fork: where two configurations give an
    outcome the same values and `ok`, merge them and OR their `live` - the two

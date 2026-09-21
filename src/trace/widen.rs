@@ -407,31 +407,19 @@ fn contain(st: &mut State<Symbolic>, d: &mut Symbolic, v: crate::transpile::grap
 /// ? -16 : x)` is on the path whatever `x` was. Static; `false` where it
 /// cannot tell.
 fn within(d: &Symbolic, v: crate::transpile::graph::NodeId, (lo, hi): (i64, i64), facts: &mut Vec<(crate::transpile::graph::NodeId, i64, i64)>) -> bool {
-    use super::domain::Cmp;
     let node = d.graph.get(v);
     if let Op::Sel = node.op {
         let (c, t, f) = (node.args[0], node.args[1], node.args[2]);
-        if let Some(&(op, x, k)) = d.point_cmp.get(&c) {
-            if let Op::Const(kl, kh) = d.graph.get(k).op {
-                if kl == kh {
-                    let k = kl as i64;
-                    // What each answer says about `x`, as a raw range.
-                    let (yes, no) = match op {
-                        Cmp::Lt => ((i64::MIN, k - 1), (k, i64::MAX)),
-                        Cmp::Le => ((i64::MIN, k), (k + 1, i64::MAX)),
-                        Cmp::Gt => ((k + 1, i64::MAX), (i64::MIN, k)),
-                        Cmp::Ge => ((k, i64::MAX), (i64::MIN, k - 1)),
-                        Cmp::Eq => return within(d, t, (lo, hi), facts) && within(d, f, (lo, hi), facts),
-                    };
-                    facts.push((x, yes.0, yes.1));
-                    let a = within(d, t, (lo, hi), facts);
-                    facts.pop();
-                    facts.push((x, no.0, no.1));
-                    let b = within(d, f, (lo, hi), facts);
-                    facts.pop();
-                    return a && b;
-                }
-            }
+        // A select on `x op k` (`k` a literal point): each arm with what its
+        // answer says about `x`.
+        if let Some((x, yes, no)) = comparison_facts(d, c) {
+            facts.push((x, yes.0, yes.1));
+            let a = within(d, t, (lo, hi), facts);
+            facts.pop();
+            facts.push((x, no.0, no.1));
+            let b = within(d, f, (lo, hi), facts);
+            facts.pop();
+            return a && b;
         }
         return within(d, t, (lo, hi), facts) && within(d, f, (lo, hi), facts);
     }
@@ -439,6 +427,41 @@ fn within(d: &Symbolic, v: crate::transpile::graph::NodeId, (lo, hi): (i64, i64)
         Some((a, b)) => lo <= a && b <= hi,
         None => false,
     }
+}
+
+/// `c` as `x op k` with `k` a literal point (either side): `x`, and the raw
+/// range each answer puts it in - `(when true, when false)`.
+fn comparison_facts(d: &Symbolic, c: crate::transpile::graph::NodeId) -> Option<(crate::transpile::graph::NodeId, (i64, i64), (i64, i64))> {
+    let node = d.graph.get(c);
+    let point = |n: crate::transpile::graph::NodeId| match d.graph.get(n).op {
+        Op::Const(a, b) if a == b => Some(a as i64),
+        _ => None,
+    };
+    if !matches!(node.op, Op::Lt | Op::Le | Op::Gt | Op::Ge) {
+        return None;
+    }
+    // `k op x` is `x op' k` with the operator mirrored.
+    let (x, k, op) = match (point(node.args[0]), point(node.args[1])) {
+        (None, Some(k)) => (node.args[0], k, node.op.clone()),
+        (Some(k), None) => (
+            node.args[1],
+            k,
+            match node.op {
+                Op::Lt => Op::Gt,
+                Op::Le => Op::Ge,
+                Op::Gt => Op::Lt,
+                _ => Op::Le,
+            },
+        ),
+        _ => return None,
+    };
+    let (yes, no) = match op {
+        Op::Lt => ((i64::MIN, k - 1), (k, i64::MAX)),
+        Op::Le => ((i64::MIN, k), (k + 1, i64::MAX)),
+        Op::Gt => ((k + 1, i64::MAX), (i64::MIN, k)),
+        _ => ((k, i64::MAX), (i64::MIN, k - 1)),
+    };
+    Some((x, yes, no))
 }
 
 /// A static raw range of `n`: literals, a platform's input `x` (its path),

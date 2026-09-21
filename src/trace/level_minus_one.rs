@@ -378,6 +378,9 @@ impl<'a> Table<'a> {
         // The move forks' arity from the ranges' full width (`flr_ways`): the
         // speed is [-S, S] at one node, 2S + 1 floors. Restored below.
         tr.it.d.uncapped_ways = true;
+        // And its undecided selects stay selects: this evaluator joins their
+        // arms (module doc), a fork would only multiply configurations.
+        tr.it.d.no_known_forks = true;
         let f = super::verify::trace_frame(
             &mut tr.it,
             tr.reset,
@@ -391,6 +394,7 @@ impl<'a> Table<'a> {
         )
         .map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"));
         tr.it.d.uncapped_ways = false;
+        tr.it.d.no_known_forks = false;
         let f = f?;
         let t_trace = t0.elapsed();
         let n_slots = f.iface.slots.len();
@@ -473,13 +477,6 @@ impl<'a> Table<'a> {
             ensure!(f.fork_tables.get(k as usize).is_none_or(|t| t.is_empty()), "shape {id}: table fork {k} (not at exact speed)");
             cone.set_fork_ways(k, f.fork_ways[k as usize]);
         }
-        // A POINT split (`split_compare`: a comparison with one interval side,
-        // forked on its answer) is read as the comparison itself over the
-        // ranges instead of enumerated: true where only `may_true` can hold,
-        // false where only `may_false` can, both ([0, 1]) where both can - an
-        // undecided select joins its arms. Enumerated, room (1,0)'s 17 forks
-        // were past `MAX_CONFIGS` and its table no longer built (2026-09-21).
-        let point: HashMap<u8, (NodeId, NodeId)> = f.point_splits.iter().map(|(k, t, fl)| (*k, (*t, *fl))).collect();
         let mut cmap: Vec<NodeId> = vec![NodeId::MAX; arena.len()];
         let mut forks: BTreeMap<u8, NodeId> = BTreeMap::new();
         for i in 0..arena.len() {
@@ -491,21 +488,6 @@ impl<'a> Table<'a> {
                 Op::Free(b) => cone.leaf(Op::Cell(n_slots as u32 + b as u32)),
                 Op::Known | Op::SplitOk(_) => cone.leaf(Op::ConstBool(true)),
                 Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_) => bail!("shape {id}: a table fork"),
-                // The choice is `> 0` for true (`Symbolic::both_values`); a
-                // condition outside the cone leaves it unknown.
-                Op::SplitInt(k) if point.contains_key(&k) => {
-                    let (t, fl) = point[&k];
-                    let both = cone.leaf(Op::Const(0, 1 << 16));
-                    match (cmap[t as usize], cmap[fl as usize]) {
-                        (mt, mf) if mt != NodeId::MAX && mf != NodeId::MAX => {
-                            let yes = cone.leaf(Op::Const(1 << 16, 1 << 16));
-                            let no = cone.leaf(Op::Const(0, 0));
-                            let if_true = cone.fold(Op::Sel, vec![mf, both, yes]);
-                            cone.fold(Op::Sel, vec![mt, if_true, no])
-                        }
-                        _ => both,
-                    }
-                }
                 _ => {
                     let args: Vec<NodeId> = nd.args.iter().map(|a| cmap[*a as usize]).collect();
                     if let Op::Split(k) | Op::SplitInt(k) = nd.op {

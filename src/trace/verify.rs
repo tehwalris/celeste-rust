@@ -99,9 +99,6 @@ pub struct Frame {
     /// What each fork minted as both values was minted for
     /// (`Symbolic::fork_origins`), for the kernel dump.
     pub fork_origins: Vec<(u8, String)>,
-    /// `Symbolic::point_splits`: each point split's fork and its may-true /
-    /// may-false conditions, arena ids (level -1 reads them).
-    pub point_splits: Vec<(u8, NodeId, NodeId)>,
     /// How many FORK choices this frame made (`__split_by_flr` on a
     /// widened value). The emitter needs it: a node whose cone contains
     /// a split lives at fork level 1 or deeper, and a body emitted at
@@ -229,7 +226,6 @@ pub fn trace_frame<'a>(
     it.d.clear_ranges();
     it.d.fork_memo.clear();
     it.d.fork_memo_int.clear();
-    it.d.cmp_memo.clear();
     // The fork grid is the rung's rem bucket width: `move` forks at the
     // bucket edges (which include the integers), so one fork per axis
     // settles the integer move AND the output bucket, and the boundary
@@ -256,8 +252,6 @@ pub fn trace_frame<'a>(
     it.d.unknown_atoms = 0;
     it.d.escaped.clear();
     it.d.fork_origins.clear();
-    it.d.point_splits.clear();
-    it.d.point_cmp.clear();
     it.d.platform_inputs.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
     // Built BEFORE the frame runs, so it names the input cells rather
@@ -382,6 +376,10 @@ pub fn trace_frame<'a>(
             st: s,
         });
     }
+    // The selects left on a condition a lane can hold undecided become forks.
+    if !it.d.no_known_forks {
+        fork_known_premises(&mut it.d, &mut outs)?;
+    }
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         eprintln!("[build] trace_frame {widen:?}: {} forks at the end, {} outcomes, {} pins", it.d.forks, outs.len(), pin.len());
     }
@@ -403,7 +401,7 @@ pub fn trace_frame<'a>(
             roots.push(o.ok);
         }
         let reach = crate::transpile::bdd::reachable(&it.d.graph, &roots);
-        let point: std::collections::BTreeSet<u8> = it.d.point_splits.iter().map(|p| p.0).collect();
+        let point: std::collections::BTreeSet<u8> = it.d.fork_origins.iter().filter(|(_, o)| o == UNDECIDED_SELECT).map(|(k, _)| *k).collect();
         let mut live: std::collections::BTreeSet<u8> = Default::default();
         for (i, r) in reach.iter().enumerate() {
             if !*r {
@@ -414,7 +412,7 @@ pub fn trace_frame<'a>(
             }
         }
         eprintln!(
-            "[build] trace_frame: {} forks, {} with an origin: {by:?}; live {} ({} of them point splits)",
+            "[build] trace_frame: {} forks, {} with an origin: {by:?}; live {} ({} of them undecided selects)",
             it.d.forks,
             it.d.fork_origins.len(),
             live.len(),
@@ -423,7 +421,152 @@ pub fn trace_frame<'a>(
     }
     let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
     let fork_tables: Vec<Vec<(i32, i32)>> = (0..it.d.forks).map(|d| it.d.graph.fork_table(d).to_vec()).collect();
-    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, floors_unknown: it.d.floors_unknown, fork_origins: it.d.fork_origins.clone(), point_splits: it.d.point_splits.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, in_cells, in_rt2 })
+    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, floors_unknown: it.d.floors_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, in_cells, in_rt2 })
+}
+
+/// The fork origin of an undecided select's condition (`fork_known_premises`).
+const UNDECIDED_SELECT: &str = "an undecided select's condition";
+
+/// THE UNDECIDED SELECTS BECOME FORKS, once the frame is traced
+/// (plans/platforms-unknown.md, 2026-09-21). A select on a condition the
+/// kernel reads per lane carries the premise `Known(c)` in `ok`
+/// (`state::merge`, `Interp::premise_for_value`); where `c` reads a
+/// comparison with an interval operand, a lane can hold it undecided - it
+/// stands for concrete states answering EACH way - and the select could take
+/// only one arm, so the premise would decline it. Such a `c` becomes a 2-way
+/// fork `k`: `c` -> `k` in every outcome's fields, keys, `ok` and guard,
+/// `Known(c)` -> true, and every outcome that reads `k` takes the validity
+/// `(k and may_true(c)) or (not k and may_false(c))` into its guard - a lane
+/// takes an answer only where some state it stands for gives it
+/// (`Symbolic::may_answers`). Exact: each lane takes every answer one of its
+/// states gives, and no other.
+///
+/// AFTER the frame, not at the comparison (`split_compare` did that until
+/// today): by now every select whose arms came out equal has folded away,
+/// with its premise, so a comparison whose answer changed nothing - a
+/// platform's x-overlap test in another row, where the y test fails either
+/// way - leaves no fork at all. Forking it as it was evaluated put its
+/// validity in every later guard: room (6,0) at `r0sxhp`, 70-86 live forks
+/// a frame against a `ChoiceSet`'s 58.
+fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
+    use crate::transpile::graph::Op;
+    let roots_of = |outs: &[FrameOut]| -> Vec<NodeId> {
+        let mut r = Vec::new();
+        for o in outs {
+            r.extend(o.fields.iter().map(|(_, n, _)| *n));
+            r.extend(o.keys.iter().map(|(_, n)| *n));
+            r.push(o.guard);
+            r.push(o.ok);
+        }
+        r
+    };
+    // Every `Known(c)` the outcomes reach whose `c` a lane can hold undecided.
+    let reach = crate::transpile::bdd::reachable(&d.graph, &roots_of(outs));
+    let mut memo: std::collections::HashMap<NodeId, bool> = Default::default();
+    let mut knowns: Vec<(NodeId, NodeId)> = Vec::new();
+    let mut conds: Vec<NodeId> = Vec::new();
+    for (i, r) in reach.iter().enumerate() {
+        if !*r {
+            continue;
+        }
+        let node = d.graph.get(i as NodeId);
+        if let Op::Known = node.op {
+            let c = node.args[0];
+            if d.reads_interval_cmp(c, &mut memo) {
+                knowns.push((i as NodeId, c));
+                if !conds.contains(&c) {
+                    conds.push(c);
+                }
+            }
+        }
+    }
+    if conds.is_empty() {
+        return Ok(());
+    }
+    // DIAGNOSTIC (CELESTE_BUILD_TRACE): which conditions fork - by the
+    // condition's root op, and for a comparison which operands are intervals.
+    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+        let mut by: std::collections::BTreeMap<String, usize> = Default::default();
+        for &c in &conds {
+            let node = d.graph.get(c);
+            let k = match node.op {
+                Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => {
+                    let iv: Vec<bool> = node.args.iter().map(|a| d.is_interval(a)).collect();
+                    format!("{:?} interval sides {:?}", node.op, iv)
+                }
+                ref op => format!("{op:?}"),
+            };
+            *by.entry(k).or_default() += 1;
+        }
+        eprintln!("[build] fork_known_premises: {} conditions, {} premises: {by:?}", conds.len(), knowns.len());
+        for &c in conds.iter().take(4) {
+            eprintln!("[build]   condition: {}", super::emit::show_tree(&d.graph, c, 4));
+        }
+    }
+    // One fork per condition, with its answers' validity.
+    let mut subst: std::collections::HashMap<NodeId, NodeId> = Default::default();
+    let mut forks: Vec<(NodeId, NodeId)> = Vec::new();
+    for &c in &conds {
+        let (may_true, may_false) = d.may_answers(c, &mut memo);
+        let k = d.both_values(UNDECIDED_SELECT);
+        let nk = d.not(&k);
+        let (yes, no) = (d.and(&k, &may_true), d.and(&nk, &may_false));
+        let valid = d.or(&yes, &no);
+        subst.insert(c, k);
+        forks.push((k, valid));
+    }
+    let t = d.graph.leaf(Op::ConstBool(true));
+    for (known, _) in &knowns {
+        subst.insert(*known, t);
+    }
+    // Rebuild what the outcomes and the validities read, through `subst`
+    // (operands precede their node, so one ascending pass).
+    let mut want = roots_of(outs);
+    want.extend(forks.iter().map(|f| f.1));
+    let need = crate::transpile::bdd::reachable(&d.graph, &want);
+    let mut map: Vec<NodeId> = (0..need.len() as NodeId).collect();
+    for i in 0..need.len() {
+        if !need[i] {
+            continue;
+        }
+        if let Some(&s) = subst.get(&(i as NodeId)) {
+            map[i] = s;
+            continue;
+        }
+        let (op, args) = {
+            let node = d.graph.get(i as NodeId);
+            (node.op.clone(), node.args.clone())
+        };
+        let mapped: Vec<NodeId> = args.iter().map(|a| map[*a as usize]).collect();
+        if mapped != args {
+            map[i] = d.graph.fold(op, mapped);
+        }
+    }
+    let m = |n: NodeId| map[n as usize];
+    for o in outs.iter_mut() {
+        for f in &mut o.fields {
+            f.1 = m(f.1);
+        }
+        for k in &mut o.keys {
+            k.1 = m(k.1);
+        }
+        o.ok = m(o.ok);
+        let mut guard = m(o.guard);
+        // The validity of each fork this outcome reads, and only of those.
+        let mut r: Vec<NodeId> = o.fields.iter().map(|(_, n, _)| *n).collect();
+        r.extend(o.keys.iter().map(|(_, n)| *n));
+        r.push(o.ok);
+        r.push(guard);
+        let seen = crate::transpile::bdd::reachable(&d.graph, &r);
+        for (k, valid) in &forks {
+            if seen.get(*k as usize).copied().unwrap_or(false) {
+                let v = m(*valid);
+                guard = d.and(&guard, &v);
+            }
+        }
+        o.guard = guard;
+    }
+    Ok(())
 }
 
 /// The player is the object with a `djump` field. Naming it by

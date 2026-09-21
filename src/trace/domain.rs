@@ -172,19 +172,6 @@ pub trait Domain {
         false
     }
 
-    /// SPLIT A COMPARISON at a runtime point (2026-09-20, room (5,0)'s
-    /// balloon): `a op b` with one side an INTERVAL and the other a number is
-    /// undecided, and its two outcomes need not merge (the balloon's hit test
-    /// against the player). `__split_by_flr` cuts an interval at a fixed grid;
-    /// this cuts it at the other operand, a number on every lane: a 2-way
-    /// choice is the comparison's value, and the validity - the half of the
-    /// interval that answer leaves is non-empty - goes in the guard. Returns
-    /// `(value, validity)`, or `None` for anything else (and in every exact
-    /// domain, where nothing is undecided).
-    fn split_compare(&mut self, _op: Cmp, _a: &Self::Num, _b: &Self::Num) -> Option<(Self::Bool, Self::Bool)> {
-        None
-    }
-
     /// The premise that `b` is DECIDED on this lane (`Op::Known`). A
     /// concrete boolean always is.
     fn known(&mut self, _b: &Self::Bool) -> Self::Bool {
@@ -460,19 +447,13 @@ pub struct Symbolic {
     /// What each fork `both_values` made was made for (a held trail, an
     /// escaped atom's slot), for the kernel dump. Cleared with `escaped`.
     pub fork_origins: Vec<(u8, String)>,
-    /// Each point split's fork (`split_compare`) with the conditions under
-    /// which a lane may answer true and false: level -1 reads the split as
-    /// the comparison itself over its ranges instead of enumerating it
-    /// (`level_minus_one`). Cleared with `fork_origins`.
-    pub point_splits: Vec<(u8, NodeId, NodeId)>,
-    /// Each point split's comparison, by its choice node: `(op, x, t)` for
-    /// `x op t` - what a branch on the choice KNOWS about `x`
-    /// (`widen::widen_platforms`' containment proof). Cleared with
-    /// `point_splits`.
-    pub point_cmp: rustc_hash::FxHashMap<NodeId, (Cmp, NodeId, NodeId)>,
+    /// Keep a traced frame's undecided selects as selects: level -1, whose
+    /// evaluator joins an undecided select's arms, sets it around its trace.
+    /// Off, the frame's surviving selects on a condition a lane can hold
+    /// undecided become forks (`verify::fork_known_premises`).
+    pub no_known_forks: bool,
     /// The moving platforms' `x` input values at a platforms-unknown level
-    /// (`widen::fork_platform_inputs`): each on its path. Cleared with
-    /// `point_splits`.
+    /// (`widen::fork_platform_inputs`): each on its path. Cleared per frame.
     pub platform_inputs: Vec<NodeId>,
     /// `lane_independent`'s memo. Structural (a node's op and operands never
     /// change), so it outlives a frame.
@@ -505,13 +486,11 @@ pub struct Symbolic {
     /// set: a value is an interval exactly when it was computed from one.
     pub ival_cells: std::collections::BTreeSet<u32>,
     /// `is_interval`'s memo, valid for the current `ival_cells` (nodes never
-    /// change): `split_compare` asks it of every undecided comparison, and a
-    /// graph-sized memo per call was fine only while forks were the one
-    /// caller. Dropped with `forget_intervals` wherever `ival_cells` changes.
+    /// change): asked of every select's condition at the end of a frame
+    /// (`verify::fork_known_premises`), and a graph-sized memo per call was
+    /// fine only while forks were the one caller. Dropped with
+    /// `forget_intervals` wherever `ival_cells` changes.
     ival_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
-    /// `split_compare`'s forks this frame, by (operator, interval, point): a
-    /// comparison asked twice is one choice. Cleared beside `fork_memo`.
-    pub cmp_memo: std::collections::HashMap<(u8, NodeId, NodeId), (NodeId, NodeId)>,
     /// STATIC RANGES (2026-09-15, the bucket dispatch): input cells whose
     /// value is known to lie in a range - a body specialized on the
     /// player's speed BUCKET - and the memo of the range analysis over
@@ -574,6 +553,69 @@ impl Symbolic {
             }
         }
         (n, (0, 0))
+    }
+
+    /// Does boolean `n` read a comparison with an INTERVAL operand - a
+    /// condition a lane can hold undecided, its states answering both ways
+    /// (`verify::fork_known_premises`)?
+    pub fn reads_interval_cmp(&self, n: NodeId, memo: &mut std::collections::HashMap<NodeId, bool>) -> bool {
+        if let Some(b) = memo.get(&n) {
+            return *b;
+        }
+        let node = self.graph.get(n);
+        let r = match node.op {
+            Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => node.args.iter().any(|a| self.is_interval(a)),
+            Op::Not | Op::And | Op::Or | Op::Sel => {
+                let args = node.args.clone();
+                args.iter().any(|a| self.reads_interval_cmp(*a, memo))
+            }
+            _ => false,
+        };
+        memo.insert(n, r);
+        r
+    }
+
+    /// For a boolean `n`: where a lane CAN answer true, and where false, over
+    /// the concrete states it stands for - a cover, both may hold. A
+    /// comparison reads its operands' ends (`a < b` can hold iff `lo(a) <
+    /// hi(b)` and fail iff `hi(a) >= lo(b)`; a number is its own ends); a node
+    /// no interval reaches is decided per lane, `(n, not n)`; connectives
+    /// combine; anything else may answer either way.
+    pub fn may_answers(&mut self, n: NodeId, memo: &mut std::collections::HashMap<NodeId, bool>) -> (NodeId, NodeId) {
+        if !self.reads_interval_cmp(n, memo) {
+            let nn = self.graph.fold(Op::Not, vec![n]);
+            return (n, nn);
+        }
+        let (op, args) = {
+            let node = self.graph.get(n);
+            (node.op.clone(), node.args.clone())
+        };
+        let yes = self.graph.leaf(Op::ConstBool(true));
+        match op {
+            Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+                let (alo, ahi) = (self.graph.fold(Op::Lo, vec![args[0]]), self.graph.fold(Op::Hi, vec![args[0]]));
+                let (blo, bhi) = (self.graph.fold(Op::Lo, vec![args[1]]), self.graph.fold(Op::Hi, vec![args[1]]));
+                let ((t, ta, tb), (f, fa, fb)) = match op {
+                    Op::Lt => ((Op::Lt, alo, bhi), (Op::Ge, ahi, blo)),
+                    Op::Le => ((Op::Le, alo, bhi), (Op::Gt, ahi, blo)),
+                    Op::Gt => ((Op::Gt, ahi, blo), (Op::Le, alo, bhi)),
+                    _ => ((Op::Ge, ahi, blo), (Op::Lt, alo, bhi)),
+                };
+                (self.graph.fold(t, vec![ta, tb]), self.graph.fold(f, vec![fa, fb]))
+            }
+            Op::Not => {
+                let (t, f) = self.may_answers(args[0], memo);
+                (f, t)
+            }
+            Op::And | Op::Or => {
+                let parts: Vec<(NodeId, NodeId)> = args.iter().map(|a| self.may_answers(*a, memo)).collect();
+                let (join_t, join_f) = if op == Op::And { (Op::And, Op::Or) } else { (Op::Or, Op::And) };
+                let t = self.graph.fold(join_t, parts.iter().map(|p| p.0).collect());
+                let f = self.graph.fold(join_f, parts.iter().map(|p| p.1).collect());
+                (t, f)
+            }
+            _ => (yes, yes),
+        }
     }
 
     /// `a - r` where `a` is `r + c` (either operand order): `c`, EXACTLY - the
@@ -878,50 +920,6 @@ impl Domain for Symbolic {
             Cmp::Eq => Op::Eq,
         };
         Ok(self.graph.fold(g, vec![*a, *b]))
-    }
-    fn split_compare(&mut self, op: Cmp, a: &NodeId, b: &NodeId) -> Option<(NodeId, NodeId)> {
-        // The interval `x` on the left, the point `t` on the right: `t < x`
-        // is `x > t`. Only one side an interval; `==` never splits.
-        let (x, t, op) = match (self.is_interval(a), self.is_interval(b)) {
-            (true, false) => (*a, *b, op),
-            (false, true) => {
-                let mirrored = match op {
-                    Cmp::Lt => Cmp::Gt,
-                    Cmp::Le => Cmp::Ge,
-                    Cmp::Gt => Cmp::Lt,
-                    Cmp::Ge => Cmp::Le,
-                    Cmp::Eq => return None,
-                };
-                (*b, *a, mirrored)
-            }
-            _ => return None,
-        };
-        if op == Cmp::Eq {
-            return None;
-        }
-        let key = (op as u8, x, t);
-        if let Some(hit) = self.cmp_memo.get(&key) {
-            return Some(*hit);
-        }
-        // Which answer a lane can take: the half of `x` it leaves on each
-        // side of the lane's `t`. `x < t` cuts at [lo, t) | [t, hi]; `x > t`
-        // at [lo, t] | (t, hi] - the point goes with the answer it gives.
-        let (lo, hi) = (self.graph.fold(Op::Lo, vec![x]), self.graph.fold(Op::Hi, vec![x]));
-        let (may_true, may_false) = match op {
-            Cmp::Lt => (self.compare(Cmp::Lt, &lo, &t).ok()?, self.compare(Cmp::Ge, &hi, &t).ok()?),
-            Cmp::Le => (self.compare(Cmp::Le, &lo, &t).ok()?, self.compare(Cmp::Gt, &hi, &t).ok()?),
-            Cmp::Gt => (self.compare(Cmp::Gt, &hi, &t).ok()?, self.compare(Cmp::Le, &lo, &t).ok()?),
-            Cmp::Ge => (self.compare(Cmp::Ge, &hi, &t).ok()?, self.compare(Cmp::Lt, &lo, &t).ok()?),
-            Cmp::Eq => return None,
-        };
-        let c = self.both_values(&format!("{op:?} split at a point"));
-        self.point_splits.push((self.forks - 1, may_true, may_false));
-        self.point_cmp.insert(c, (op, x, t));
-        let nc = self.not(&c);
-        let (yes, no) = (self.and(&c, &may_true), self.and(&nc, &may_false));
-        let valid = self.or(&yes, &no);
-        self.cmp_memo.insert(key, (c, valid));
-        Some((c, valid))
     }
     fn not(&mut self, a: &NodeId) -> NodeId {
         self.graph.fold(Op::Not, vec![*a])
