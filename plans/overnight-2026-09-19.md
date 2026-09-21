@@ -294,6 +294,19 @@ recorded below.
   moving platforms. Fix: the fly fruit exact at EVERY level (ladder `r0sxhb,
   r1sxhb .. r15sxhb, r15sxh, rxsx`) - sound, more precise, and fruit-unknown
   was only an optimization. For all remaining rooms.
+- **Stop 3, room (6,0) (01:35): level 0 explodes.** x1.3-1.5 per frame: 81.0M
+  kept at f50 (47 GB mid-wave) with 20 frames to the ceiling; stopped before
+  the OOM. `coarse-census` at f45 (17.9M rows): erasing the platforms changes
+  nothing (their positions are the same in every state of a frame), erasing
+  the fly fruit gives 7.55M (2.37x: its flight starts at the first dash). The
+  real cost is the platforms making every frame's states unique - no
+  cross-frame dedup, as with the balloon phase - but unlike the phase they
+  cannot be canonicalized (their positions decide where the player stands) and
+  their cycle is far longer than the room. Fix: the level -1 cost-to-go filter
+  (`CELESTE_LEVEL_MINUS_ONE="H,5"`, plans/level-minus-one.md: sound, the basis
+  of room (2,0)'s 95), which drops every state that cannot reach the exit by H
+  - exactly the late frames the missing dedup inflates. For all remaining
+  rooms (H = the ceiling; the count-up fallback uses its own top horizon).
 
 ## For the morning
 
