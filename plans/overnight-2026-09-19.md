@@ -283,6 +283,18 @@ On success the room is exported to the UI (`runs.json`, newest first). The
 driver stops at the first failure; each stop, its cause and its fix are
 recorded below.
 
+- **Stop 1, room (6,0) (01:09): the spawn pattern.** The driver looked for
+  `freeze N player`; there the fly fruit prints before the player. Fixed (any
+  ` player <n>` on the frame's line). Spawn 23, ceiling 70 (TAS7: 47 inputs).
+- **Stop 2, room (6,0) (01:10): fruit unknown fans out.** The level-0 kernel
+  build (`r0sxhfb`) fails: the start shape's `foreach` over objects grows to
+  331 states (cap 256). `r0sxh` and `r1sxhb` build fine, and the pre-split
+  binary fails worse (49 of 296 nodes, up to 448 states) - so not the point
+  split: the fruit-unknown abstraction multiplies across this room's 10
+  moving platforms. Fix: the fly fruit exact at EVERY level (ladder `r0sxhb,
+  r1sxhb .. r15sxhb, r15sxh, rxsx`) - sound, more precise, and fruit-unknown
+  was only an optimization. For all remaining rooms.
+
 ## For the morning
 
 - `concrete_run --object fly_fruit` prints "none" on every frame of a route
