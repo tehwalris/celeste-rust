@@ -393,6 +393,70 @@ recorded below.
   search never takes it silently. Position and box violations (the table's
   own premises) stay fatal. The price is precision near those nodes; the
   pass report prints how many and where.
+  Room (6,0) with both (`706f287`): 0 violations in every pass; 114, then
+  171 unmodelled nodes, ALL at x < -1 or x > 121 (the unclamped post-dash
+  cells), none inside the room. The passes are slow - ~5.3 min each (the
+  per-snapshot fallback, 71 evaluations per fallback node) and 12 of them
+  (each shape's countdowns creep one step a pass before the jump, and the fly
+  fruit's `step`/`y`/`spd.y` - its forks are range-read, so its rem is a
+  range - joined late) - so this run IS room (6,0)'s search rather than a
+  test: the quick binary at `706f287`, `CELESTE_LEVEL_MINUS_ONE="70,5"`, the
+  driver's ladder, `--ceiling 70`, log `/var/tmp/l1test60.log`, tree
+  `/var/tmp/l1test60` (its 2 h `timeout` wrapper killed so it can finish).
+  Exported to the UI by hand; the driver resumes at room (7,0).
+  The table: converged at pass 12 (76,800 nodes, 14.3M edges, 0 violations,
+  171 unmodelled nodes all outside x in [-1, 121]), built in 3,569 s; the
+  start state's d = 31 (the spawn ends at f24, so no exit before ~f55; the TAS
+  exits at f70, 47 frames after the spawn - a lower bound, as it must be).
+- **Stop 5, room (6,0) (03:56): the filter does not bite.** f45 kept 17.9M,
+  f50 81.0M - IDENTICAL to the unfiltered run - at 49.8 GB; killed before the
+  f51/f52 OOM. The table is sound but, like every level -1 table, weak: d = 31
+  against the real 46 is the usual ratio (room (1,0): 44 against 75), because
+  level -1 lets the player move at [-S, S] = 5 px/frame at every node. In the
+  other rooms that is enough, since cross-frame dedup keeps each frame's
+  frontier to the NEW states; here every frame's states are new (the
+  platforms moved), the frontier is the whole set reachable at that exact
+  frame (x1.4 a frame), and no state is provably too late until ~f55. f60 would
+  be hours per wave whatever the memory. Level -1 cannot carry this room.
+  The fundamental fix is to give the dedup back where the states are, on the
+  ladder: the PLATFORMS PHASE-UNKNOWN at the coarse levels (like the fall
+  floors), exact at the top, the coarse marks filtering the exact levels. What
+  that needs in the kernels, and why each piece is sound:
+  1. platforms' x / last / rem.x widened to their whole path at coarse levels
+     (`Rt2::widen_to` step, a level flag, the paths as interval inputs);
+  2. their own `move` fork range-read, not enumerated (platforms have
+     `solids=false`: `x += amount`, no loop - an interval amount is fine; ten
+     enumerated 2-way forks would be 1024 configurations per kernel);
+  3. `last` ALIASED to `x` at trace time - the update ends with `last = x` and
+     init sets it, so it holds at every boundary; checked structurally on
+     every traced outcome (the output `last` is the output `x`'s node);
+  4. a fold `Sub(Add(a, b), a) -> b` (exact in 16.16 wrapping arithmetic), so
+     the carry `x_new - last` is the platform's move amount [0, 1] instead of a
+     144 px hull; the wrap arm's platform sits at the constant -16 / 128, so
+     its collide with the player's exact x is decided per lane.
+  Several hours. Meanwhile the driver runs the LATER rooms from (7,0) on the
+  release binary at `706f287` (room (6,0) postponed, not skipped: nothing of
+  it is lost - the phases, the unmodelled rule and the table stay).
+  Working it through against the kernel model, the phase-unknown design is
+  blocked at the WRAP, not the carry:
+  - the move fork is fine: a literal interval `rem` (every lane alike, as the
+    fall floors' inputs) goes through `literal_fragments` - fragments as
+    separate trace states, rejoined at the call's return, no per-lane fork;
+  - but with x spanning the whole path, `if x < -16 then x = 128 ...` is
+    undecided in EVERY lane: an ordinary select needs `Known(c)` (declines);
+    two successors per platform compound to 2^10 trace states (the tracer's
+    frontier cap is 256); a per-lane interval CELL for x instead makes every
+    comparison a point split (a per-lane fork, `split_compare`) - 2^20;
+  - wrap-free phase buckets avoid all that but reset the dedup at every wrap,
+    and a late wrap brings back the whole frontier at that frame.
+  So "platforms unknown" needs a kernel-level answer to an undecided,
+  every-lane-alike condition over non-literal arms (a hull select without the
+  `Known` premise) - a change to the kernel semantics, not a widening. Not
+  forced tonight. The cheaper question first: does a COARSER level 0 (speed
+  buckets `s16`, position buckets `x2y2`) bound the growth? With no
+  cross-frame dedup the frontier is bounded by the abstract state space, and
+  that may be small enough. Measured with `rewrite forward --level` to f45
+  against `r0sxhb` (2.5M at f40, 17.9M at f45).
 
 ## For the morning
 
