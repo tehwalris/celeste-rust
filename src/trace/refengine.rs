@@ -97,7 +97,8 @@ impl RefEngine {
         let mut bridged = to_trace_state(input, 0, &mut d)?;
         patch_closures_for(&mut bridged, &self.fn_info)?;
         add_missing_builtins(&mut bridged, &self.base);
-        let leaves = run_frame_all(&mut self.it, self.body_concrete, &bridged)?;
+        // Concrete: exact, whatever level the search has set.
+        let leaves = run_frame_all(&mut self.it, self.body_concrete, &bridged, crate::interpreter::abstraction::Level::EXACT)?;
         if leaves.len() != 1 {
             bail!("concrete frame produced {} leaves (expected exactly 1)", leaves.len());
         }
@@ -119,7 +120,7 @@ impl RefEngine {
         let mut bridged = to_trace_state(input, 0, &mut d)?;
         patch_closures_for(&mut bridged, &self.fn_info)?;
         add_missing_builtins(&mut bridged, &self.base);
-        run_frame_all(&mut self.it, self.body_concrete, &bridged)?
+        run_frame_all(&mut self.it, self.body_concrete, &bridged, crate::interpreter::abstraction::Level::EXACT)?
             .iter()
             .map(to_interp_state)
             .collect()
@@ -131,7 +132,8 @@ impl RefEngine {
         let mut bridged = to_trace_state(input, lane, &mut d)?;
         patch_closures_for(&mut bridged, &self.fn_info)?;
         add_missing_builtins(&mut bridged, &self.base);
-        run_frame_all(&mut self.it, self.body, &bridged)?
+        // The engine as a `FrameStep`: the level the search runs.
+        run_frame_all(&mut self.it, self.body, &bridged, crate::interpreter::abstraction::current_level())?
             .iter()
             .map(to_interp_state)
             .collect()

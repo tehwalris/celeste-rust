@@ -299,18 +299,8 @@ fn phases(lw: &LatticeWalk, max_frame: u32) -> Result<Option<Phases>> {
         fields.push(kr);
         p0.push(raw(v));
     }
-    // The reference engine runs at the process-global level, and the search
-    // has set level 0 (held unknown, rem widened): a concrete run needs the
-    // exact one. Restored on every exit; the table is built before any wave
-    // runs (`frame::level_minus_one`), so no kernel dispatch sees it.
-    struct Restore(crate::interpreter::abstraction::Level);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            crate::interpreter::abstraction::set_level(self.0);
-        }
-    }
-    let _restore = Restore(crate::interpreter::abstraction::current_level());
-    crate::interpreter::abstraction::set_level(crate::interpreter::abstraction::Level::EXACT);
+    // A concrete run: exact whatever level the search holds
+    // (`RefEngine::run_frame_concrete`).
     let mut ce = crate::concrete::ConcreteEngine::new()?;
     let mut cs = ce.initial_state()?;
     let mut snaps: Vec<Vec<i64>> = Vec::new();

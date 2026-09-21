@@ -367,13 +367,14 @@ recorded below.
   only platform slots and `freeze` (a point split counts as what its
   conditions read), else the build fails. Rooms without platforms are
   untouched (`phases: None`).
-  The reference engine runs at the PROCESS-GLOBAL level (atomics set by
-  `abstraction::set_level`), and the first attempt died on "the reference
-  engine does not run held-unknown levels": the table was built lazily at
-  the first flush, inside level 0's wave. The snapshot run now sets
-  `Level::EXACT` and restores the saved level on every exit, and the table is
-  built EAGERLY at the start of `find_optimum` / `find_optimum_from_ceiling`,
-  before any wave, so no kernel dispatch can see the switch.
+  The reference engine read the PROCESS-GLOBAL level (`refdriver::
+  run_frame_all`), so the first attempt died on "the reference engine does
+  not run held-unknown levels" (the table is built inside level 0's wave).
+  A night-time workaround flipped the global to exact and back; replaced
+  (morning, Philippe: "fix it properly") by passing the level in:
+  `run_frame_all` takes it, the concrete runs (`run_frame_concrete{,_all}`)
+  pass `Level::EXACT`, the engine as a `FrameStep` (`run_lane`) passes the
+  search's level. No global is touched and the table is built lazily again.
   With the phases (120 platform fields, 71 distinct snapshots for u <= 70;
   the concrete run's checks all held), pass 1 still had 13,986 violations,
   two kinds: `9 > abs(x_after - last)` definitely FALSE at cell (-2, 80) - a

@@ -46,29 +46,35 @@ pub fn fresh_interp<'a>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Inte
 /// cannot satisfy) is a real coverage answer, not a crash - but for now it
 /// propagates so the gate sees it; the driver will classify refusals once the
 /// row-key extraction lands.
+///
+/// `level` is the precision the frame runs at, passed in rather than read from
+/// the process-global level: a concrete run (`RefEngine::run_frame_concrete`)
+/// is exact whatever level the search has set (2026-09-21: level -1's platform
+/// snapshots, taken while the search held level 0).
 pub fn run_frame_all<'a>(
     it: &mut Interp<'a, RefDomain>,
     body: &'a ast::Ast,
     input: &State<RefDomain>,
+    level: crate::interpreter::abstraction::Level,
 ) -> Result<Vec<State<RefDomain>>> {
     it.d.cursor = Cursor::new();
     let mut outputs = Vec::new();
     let mut paths = 0usize;
     // A position bucket in the input (the rung below level 0) is one exact
     // position per fork leaf, exactly as the kernels' `IntFrag`.
-    let pos = crate::interpreter::abstraction::current_level().pos;
+    let pos = level.pos;
     // The reference engine has no held-button fork (`widen::fork_held_inputs`):
     // its bridge reads an unknown trail as false, which would silently drop
     // the held twin. Refuse rather than compare against it.
-    if crate::interpreter::abstraction::current_level().held.is_unknown() {
+    if level.held.is_unknown() {
         anyhow::bail!("the reference engine does not run held-unknown levels (plans/held-buttons.md)");
     }
     // Nor the fly fruit unknown: it has no unknown number.
-    if crate::interpreter::abstraction::current_level().fruit.is_unknown() {
+    if level.fruit.is_unknown() {
         anyhow::bail!("the reference engine does not run fruit-unknown levels (plans/fly-fruit.md)");
     }
     // Nor the fall floors unknown, for the same reason.
-    if crate::interpreter::abstraction::current_level().floors.is_unknown() {
+    if level.floors.is_unknown() {
         anyhow::bail!("the reference engine does not run floors-unknown levels (plans/fall-floors.md)");
     }
     loop {
@@ -127,12 +133,12 @@ mod tests {
             if find_player(&st).is_some() {
                 break;
             }
-            let outs = run_frame_all(&mut it, &body, &st).expect("warmup frame");
+            let outs = run_frame_all(&mut it, &body, &st, crate::interpreter::abstraction::Level::EXACT).expect("warmup frame");
             st = outs.into_iter().next().expect("at least one successor");
         }
         assert!(find_player(&st).is_some(), "player never appeared in warm-up");
 
-        let outs = run_frame_all(&mut it, &body, &st).expect("frame");
+        let outs = run_frame_all(&mut it, &body, &st, crate::interpreter::abstraction::Level::EXACT).expect("frame");
         assert!(!outs.is_empty(), "a frame produced no successors");
         eprintln!("[refdriver] one frame -> {} successor states", outs.len());
     }
