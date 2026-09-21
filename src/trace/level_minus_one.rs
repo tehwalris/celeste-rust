@@ -7,9 +7,12 @@
 //! unknown (booleans), one per shape and the same for every cell of it: the
 //! objects' `rem` its whole [-0.5, 0.5), the player's speed [-S, S], the rest
 //! discovered below. One frame from a node is the shape's traced frame with
-//! every `move` fork RESOLVED per configuration (`specialize_subset_into`: in
-//! a configuration the move amount is one number, so the pixel steps and
-//! their collisions are exact at an exact position) and evaluated over the
+//! every fork of the LOCATED object RESOLVED per configuration
+//! (`specialize_subset_into`: in a configuration the move amount is one
+//! number, so the pixel steps and their collisions are exact at an exact
+//! position) - any other object's fork is read over its operand's whole range
+//! instead, its validity unknown (2026-09-21, room (6,0)'s ten platforms) -
+//! and evaluated over the
 //! ranges with `Graph::eval_narrow_top_in`: a select whose condition the
 //! ranges leave undecided JOINS its arms, the six buttons are unknown cells.
 //! Every outcome whose `live` is not definitely false is a successor, at the
@@ -180,6 +183,14 @@ fn with(base: &Path, names: &[&str]) -> Path {
     p
 }
 
+/// The index of the object `p` is under (`objects[i]...`).
+fn object_index(p: &Path) -> Option<usize> {
+    match (p.first(), p.get(1)) {
+        (Some(s), Some(Step::Idx(i))) if *s == iface::key("objects") => Some(*i),
+        _ => None,
+    }
+}
+
 /// Is `p` an object's `rem.x/y`?
 fn is_rem(p: &Path) -> bool {
     p.len() == 4 && p[0] == iface::key("objects") && p[2] == iface::key("rem")
@@ -248,6 +259,9 @@ struct Traced {
     /// The bounds it was traced under (the static ranges the arity came from).
     bounds: BTreeMap<Path, Range>,
     pins: BTreeMap<Path, Conc>,
+    /// Objects whose forks are read over ranges: their `rem` is an ordinary
+    /// range, not held to [-0.5, 0.5).
+    ranged_objects: BTreeSet<usize>,
     stats: String,
 }
 
@@ -375,6 +389,9 @@ impl<'a> Table<'a> {
         // The held trails are unknown booleans read from their cells, not a
         // fork (the walk forks them for the kernels).
         tr.it.d.held_unknown = false;
+        // The move forks' arity from the ranges' full width (`flr_ways`):
+        // [-S, S] speed is 2S + 1 floors at one node. Restored below.
+        tr.it.d.uncapped_ways = true;
         let f = super::verify::trace_frame(
             &mut tr.it,
             tr.reset,
@@ -386,7 +403,9 @@ impl<'a> Table<'a> {
             Some(super::widen::WidenMode::Level0(SpdPrecision::Exact, PosPrecision::EXACT)),
             &bound_list,
         )
-        .map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"))?;
+        .map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"));
+        tr.it.d.uncapped_ways = false;
+        let f = f?;
         let t_trace = t0.elapsed();
         let n_slots = f.iface.slots.len();
         let seeds: Vec<Seed> = f
@@ -468,8 +487,57 @@ impl<'a> Table<'a> {
             ensure!(f.fork_tables.get(k as usize).is_none_or(|t| t.is_empty()), "shape {id}: table fork {k} (not at exact speed)");
             cone.set_fork_ways(k, f.fork_ways[k as usize]);
         }
+        // A fork whose operand reads ANOTHER object's slots and none of the
+        // located object's is that object's own (room (6,0): ten platforms'
+        // `move`, 2^43 configurations): it is evaluated over its operand's
+        // whole range - `Split` as its operand (the hull of its fragments),
+        // `SplitValid` unknown - which joins every fragment's outcome and is
+        // sound; those objects' positions are ranges anyway. Every other fork
+        // is enumerated: it can decide the located object's pixel steps, so
+        // its successor cell is exact per configuration. (Enumerating only
+        // the forks that read the located object's slots lost exactness in
+        // room (1,0)'s spawn chain: a fork there reads neither.)
+        let object_of = object_index;
+        let located_idx = located.as_ref().and_then(object_of);
+        // Per node: (reads the located object, reads another object).
+        let slot_owner: Vec<(bool, bool)> = f
+            .iface
+            .slots
+            .iter()
+            .map(|p| match object_of(p) {
+                Some(i) if Some(i) == located_idx => (true, false),
+                Some(_) => (false, true),
+                None => (false, false),
+            })
+            .collect();
+        let mut reads: Vec<(bool, bool)> = vec![(false, false); arena.len()];
+        let mut fork_operand: BTreeMap<u8, NodeId> = BTreeMap::new();
+        for i in 0..arena.len() {
+            if !need[i] {
+                continue;
+            }
+            let nd = arena.get(i as NodeId);
+            reads[i] = match nd.op {
+                Op::Cell(c) => slot_owner.get(c as usize).copied().unwrap_or((false, false)),
+                _ => nd.args.iter().fold((false, false), |(l, o), a| (l || reads[*a as usize].0, o || reads[*a as usize].1)),
+            };
+            if let Op::Split(k) | Op::SplitInt(k) | Op::SplitValid(k) = nd.op {
+                fork_operand.entry(k).or_insert(nd.args[0]);
+            }
+        }
+        // A POINT split (`split_compare`: a comparison whose one side is an
+        // interval, forked on its answer) is read as the comparison itself
+        // over the ranges: true where only `may_true` can hold, false where
+        // only `may_false` can, both where both can (an undecided select
+        // joins its arms). Exact wherever the ranges decide it, and never
+        // enumerated - room (6,0)'s player-against-platform comparisons
+        // alone were 32 forks.
+        let point: BTreeMap<u8, (NodeId, NodeId)> = f.point_splits.iter().map(|(k, t, fl)| (*k, (*t, *fl))).collect();
+        let enumerated = |k: u8| {
+            let (l, o) = reads[fork_operand[&k] as usize];
+            !point.contains_key(&k) && (l || !o)
+        };
         let mut cmap: Vec<NodeId> = vec![NodeId::MAX; arena.len()];
-        let mut forks: BTreeMap<u8, NodeId> = BTreeMap::new();
         for i in 0..arena.len() {
             if !need[i] {
                 continue;
@@ -479,26 +547,60 @@ impl<'a> Table<'a> {
                 Op::Free(b) => cone.leaf(Op::Cell(n_slots as u32 + b as u32)),
                 Op::Known | Op::SplitOk(_) => cone.leaf(Op::ConstBool(true)),
                 Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_) => bail!("shape {id}: a table fork"),
+                // The choice is `> 0` for true (`Symbolic::both_values`); a
+                // condition outside the cone leaves it unknown.
+                Op::SplitInt(k) if point.contains_key(&k) => {
+                    let (t, fl) = point[&k];
+                    let both = cone.leaf(Op::Const(0, 1 << 16));
+                    match (cmap[t as usize], cmap[fl as usize]) {
+                        (mt, mf) if mt != NodeId::MAX && mf != NodeId::MAX => {
+                            let yes = cone.leaf(Op::Const(1 << 16, 1 << 16));
+                            let no = cone.leaf(Op::Const(0, 0));
+                            let if_true = cone.fold(Op::Sel, vec![mf, both, yes]);
+                            cone.fold(Op::Sel, vec![mt, if_true, no])
+                        }
+                        _ => both,
+                    }
+                }
+                Op::Split(k) | Op::SplitInt(k) if !enumerated(k) => cmap[nd.args[0] as usize],
+                // One unknown per fork, never shared: two forks' validities
+                // are independent.
+                Op::SplitValid(k) if !enumerated(k) => cone.leaf(Op::UnknownBool(u32::MAX - 1 - k as u32)),
                 _ => {
                     let args: Vec<NodeId> = nd.args.iter().map(|a| cmap[*a as usize]).collect();
-                    if let Op::Split(k) | Op::SplitInt(k) = nd.op {
-                        forks.entry(k).or_insert(args[0]);
-                    }
                     cone.fold(nd.op.clone(), args)
                 }
             };
         }
-        // `SplitValid` without its `Split` in the cone still names a fork.
-        for i in 0..arena.len() {
-            if need[i] {
-                if let Op::SplitValid(k) = arena.get(i as NodeId).op {
-                    forks.entry(k).or_insert(cmap[arena.get(i as NodeId).args[0] as usize]);
+        // The objects a range-read fork belongs to: their `rem` leaves
+        // [-0.5, 0.5) under the hull (`rem - flr(rem + 0.5)` over an
+        // interval loses the correlation), so it is a range like any other,
+        // widened when it grows - not the finding it is for a located object.
+        let mut ranged_objects: BTreeSet<usize> = BTreeSet::new();
+        for (k, op) in &fork_operand {
+            if enumerated(*k) || point.contains_key(k) {
+                continue;
+            }
+            let cone_of = crate::transpile::bdd::reachable(arena, &[*op]);
+            for (i, &r) in cone_of.iter().enumerate() {
+                if let (true, Op::Cell(c)) = (r, &arena.get(i as NodeId).op) {
+                    if let Some(o) = f.iface.slots.get(*c as usize).and_then(object_index) {
+                        ranged_objects.insert(o);
+                    }
                 }
             }
         }
-        let arities: Vec<(u8, u8)> = forks.keys().map(|k| (*k, f.fork_ways[*k as usize])).collect();
+        // The enumerated forks' operands are checked against their arity per
+        // node (`eval_node`); a range-read fork chooses no fragment, so its
+        // arity is moot.
+        let forks: BTreeMap<u8, NodeId> = fork_operand.iter().map(|(k, op)| (*k, cmap[*op as usize])).collect();
+        let arities: Vec<(u8, u8)> = forks.keys().filter(|k| enumerated(**k)).map(|k| (*k, f.fork_ways[*k as usize])).collect();
         let n_configs: usize = arities.iter().map(|(_, w)| *w as usize).product();
-        ensure!(n_configs <= MAX_CONFIGS, "shape {id}: {n_configs} fork configurations ({arities:?})");
+        ensure!(
+            n_configs <= MAX_CONFIGS,
+            "shape {id}: {n_configs} fork configurations ({arities:?}), operands:{}",
+            arities.iter().map(|(k, _)| format!("\n  fork {k}: {}", super::emit::show_tree(arena, fork_operand[k], 3))).collect::<String>()
+        );
         let mut shared = cone.like();
         let mut configs: Vec<Config> = Vec::new();
         let mut seen: HashSet<Vec<NodeId>> = HashSet::new();
@@ -515,7 +617,7 @@ impl<'a> Table<'a> {
                 .iter()
                 .map(|r| Roots { live: m(r.live), ok: m(r.ok), xy: r.xy.map(|(x, y)| (m(x), m(y))), fields: r.fields.iter().map(|n| m(*n)).collect() })
                 .collect();
-            let operands: Vec<(u8, NodeId)> = forks.iter().map(|(k, op)| (f.fork_ways[*k as usize], map[*op as usize])).collect();
+            let operands: Vec<(u8, NodeId)> = forks.iter().filter(|(k, _)| enumerated(**k)).map(|(k, op)| (f.fork_ways[*k as usize], map[*op as usize])).collect();
             let mut sig: Vec<NodeId> = Vec::new();
             for r in &outs_c {
                 sig.extend([r.live, r.ok]);
@@ -531,12 +633,13 @@ impl<'a> Table<'a> {
         }
         let operands: Vec<String> = forks.iter().map(|(k, op)| format!("fork {k}: {}", super::emit::show_tree(&cone, *op, 3))).collect();
         let stats = format!(
-            "{} slots ({} pinned, {} interval), {} outcomes, forks {:?}, {} configurations ({} distinct), cone {} nodes, specialized {} nodes, trace {:.1} s, specialize {:.1} s",
+            "{} slots ({} pinned, {} interval), {} outcomes, forks {:?} (+{} over ranges), {} configurations ({} distinct), cone {} nodes, specialized {} nodes, trace {:.1} s, specialize {:.1} s",
             n_slots,
             pins.len(),
             ival.len(),
             outs.len(),
             arities.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
+            forks.len() - arities.len(),
             n_configs,
             configs.len(),
             cone.len(),
@@ -544,7 +647,7 @@ impl<'a> Table<'a> {
             t_trace.as_secs_f64(),
             (t0.elapsed() - t_trace).as_secs_f64()
         ) + &operands.iter().map(|o| format!("\n      {o}")).collect::<String>();
-        self.shapes[id].traced = Some(Traced { seeds, graph: shared, outs, configs, bounds, pins, stats });
+        self.shapes[id].traced = Some(Traced { seeds, graph: shared, outs, configs, bounds, pins, ranged_objects, stats });
         Ok(())
     }
 
@@ -596,7 +699,8 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
             if let Val::Num(i) = vals[n as usize] {
                 let floors = (raw(i.high) >> 16) - (raw(i.low) >> 16) + 1;
                 if floors > ways as i64 {
-                    violation(acc, format!("shape {id} cell {xy:?} configuration {ci}: a fork operand spans {floors} floors, arity {ways}"));
+                    let what = if acc.violations.len() < 12 { super::emit::show_tree(&t.graph, n, 3) } else { String::new() };
+                    violation(acc, format!("shape {id} cell {xy:?} configuration {ci}: a fork operand spans {floors} floors, arity {ways}: {what}"));
                 }
             }
         }
@@ -605,7 +709,7 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
                 continue;
             }
             if vals[r.ok as usize] != Val::Bool(Some(true)) {
-                let why = if acc.violations.len() < 12 { culprit(&t.graph, &vals, r.ok) } else { String::new() };
+                let why = if acc.violations.len() < 12 { culprit(&t.graph, &vals, r.ok, &t.seeds) } else { String::new() };
                 violation(acc, format!("shape {id} cell {xy:?} configuration {ci} outcome {oi}: a live outcome's ok is {:?}: {why}", vals[r.ok as usize]));
             }
             for (slot, n) in spec.fields.iter().zip(&r.fields) {
@@ -654,15 +758,47 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
     Ok(out)
 }
 
+/// The slot behind every `Cell(n)` in `n`'s cone, with its value, as `
+/// [Cell(n) = path: value, ...]`: a violation should say WHAT it read.
+fn cell_names(seeds: &[Seed], g: &Graph, vals: &[Val], n: NodeId) -> String {
+    let cone = crate::transpile::bdd::reachable(g, &[n]);
+    let named: BTreeSet<(usize, NodeId)> = (0..g.len())
+        .filter(|i| cone[*i])
+        .filter_map(|i| match g.get(i as NodeId).op {
+            Op::Cell(c) => Some((c as usize, i as NodeId)),
+            _ => None,
+        })
+        .collect();
+    let name = |n: usize| match seeds.get(n) {
+        Some(Seed::Range(p)) => iface::show(p),
+        Some(Seed::X) => "located x".into(),
+        Some(Seed::Y) => "located y".into(),
+        Some(Seed::Pin(c)) => format!("pinned {c:?}"),
+        Some(Seed::Unknown) => "an unknown boolean".into(),
+        None => format!("button {}", n - seeds.len()),
+    };
+    if named.is_empty() {
+        return String::new();
+    }
+    format!(" [{}]", named.iter().map(|(c, i)| format!("Cell({c}) = {}: {:?}", name(*c), vals[*i as usize])).collect::<Vec<_>>().join(", "))
+}
+
 /// Which conjunct keeps `n` from being true: down the `And`s and decided
 /// selects to the first node that is not, with its operands' values.
-fn culprit(g: &Graph, vals: &[Val], mut n: NodeId) -> String {
+fn culprit(g: &Graph, vals: &[Val], mut n: NodeId, seeds: &[Seed]) -> String {
     loop {
         let nd = g.get(n);
         let not_true = |a: &NodeId| vals[*a as usize] != Val::Bool(Some(true));
         match nd.op {
             Op::And => {
                 if let Some(a) = nd.args.iter().find(|a| not_true(a)) {
+                    n = *a;
+                    continue;
+                }
+            }
+            // An undecided disjunction: down its undecided disjunct.
+            Op::Or => {
+                if let Some(a) = nd.args.iter().find(|a| vals[**a as usize] == Val::Bool(None)) {
                     n = *a;
                     continue;
                 }
@@ -681,7 +817,8 @@ fn culprit(g: &Graph, vals: &[Val], mut n: NodeId) -> String {
             },
             _ => {}
         }
-        return format!("{} = {:?}, operands {:?}", super::emit::show_tree(g, n, 4), vals[n as usize], nd.args.iter().map(|a| vals[*a as usize]).collect::<Vec<_>>());
+        return format!("{} = {:?}, operands {:?}", super::emit::show_tree(g, n, 4), vals[n as usize], nd.args.iter().map(|a| vals[*a as usize]).collect::<Vec<_>>())
+            + &cell_names(seeds, g, vals, n);
     }
 }
 
@@ -1065,12 +1202,15 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
                 }
                 if lo < r.0 || hi > r.1 {
                     // A rem stays in [-0.5, 0.5) by `move`'s own arithmetic:
-                    // one outside is a finding, not a range to widen.
-                    ensure!(!is_rem(p) || (lo >= REM.0 && hi <= REM.1), "shape {id}: {} = [{}, {}] leaves rem's [-0.5, 0.5)", iface::show(p), px(lo), px(hi));
+                    // one outside is a finding, not a range to widen - unless
+                    // its object's forks are read over ranges (`Traced::
+                    // ranged_objects`), where the hull loses that arithmetic.
+                    let held = is_rem(p) && !object_index(p).is_some_and(|o| t.ranged_objects.contains(&o));
+                    ensure!(!held || (lo >= REM.0 && hi <= REM.1), "shape {id}: {} = [{}, {}] leaves rem's [-0.5, 0.5)", iface::show(p), px(lo), px(hi));
                     let n = grown.entry((*id, p.clone())).or_insert(0);
                     *n += 1;
                     let w = widen(r, (lo, hi), *n > 2);
-                    let w = if is_rem(p) { (w.0.max(REM.0), w.1.min(REM.1)) } else { w };
+                    let w = if held { (w.0.max(REM.0), w.1.min(REM.1)) } else { w };
                     changes.push(format!("shape {id}: {} [{}, {}] observed [{}, {}]: widened to [{}, {}]", iface::show(p), px(r.0), px(r.1), px(lo), px(hi), px(w.0), px(w.1)));
                     sh.ranges.insert(p.clone(), w);
                     if t.bounds.contains_key(p) {

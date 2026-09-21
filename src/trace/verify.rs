@@ -99,6 +99,9 @@ pub struct Frame {
     /// What each fork minted as both values was minted for
     /// (`Symbolic::fork_origins`), for the kernel dump.
     pub fork_origins: Vec<(u8, String)>,
+    /// `Symbolic::point_splits`: each point split's fork and its may-true /
+    /// may-false conditions, arena ids (level -1 reads them).
+    pub point_splits: Vec<(u8, NodeId, NodeId)>,
     /// How many FORK choices this frame made (`__split_by_flr` on a
     /// widened value). The emitter needs it: a node whose cone contains
     /// a split lives at fork level 1 or deeper, and a body emitted at
@@ -253,6 +256,7 @@ pub fn trace_frame<'a>(
     it.d.unknown_atoms = 0;
     it.d.escaped.clear();
     it.d.fork_origins.clear();
+    it.d.point_splits.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
     // Built BEFORE the frame runs, so it names the input cells rather
     // than whatever the frame did to those slots.
@@ -376,7 +380,7 @@ pub fn trace_frame<'a>(
     }
     let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
     let fork_tables: Vec<Vec<(i32, i32)>> = (0..it.d.forks).map(|d| it.d.graph.fork_table(d).to_vec()).collect();
-    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, floors_unknown: it.d.floors_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, in_cells, in_rt2 })
+    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, floors_unknown: it.d.floors_unknown, fork_origins: it.d.fork_origins.clone(), point_splits: it.d.point_splits.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, in_cells, in_rt2 })
 }
 
 /// The player is the object with a `djump` field. Naming it by

@@ -429,6 +429,10 @@ pub struct Symbolic {
     /// `Domain::move_ways`); `trace_frame` sets it from the widen mode.
     /// 0 (the default) reads as 2.
     pub move_ways: u8,
+    /// `flr_ways` takes a static range's FULL width, not capped at
+    /// `move_ways`: level -1, whose speed is a range at every node rather
+    /// than exact per lane (`level_minus_one`). Off everywhere else.
+    pub uncapped_ways: bool,
     /// Held buttons unknown for the set being traced
     /// (`abstraction::HeldPrecision`): `trace_frame` forks the player's
     /// `p_jump` / `p_dash` (`widen::fork_held_inputs`). Set by the walk.
@@ -452,6 +456,11 @@ pub struct Symbolic {
     /// What each fork `both_values` made was made for (a held trail, an
     /// escaped atom's slot), for the kernel dump. Cleared with `escaped`.
     pub fork_origins: Vec<(u8, String)>,
+    /// Each point split's fork (`split_compare`) with the conditions under
+    /// which a lane may answer true and false: level -1 reads the split as
+    /// the comparison itself over its ranges instead of enumerating it
+    /// (`level_minus_one`). Cleared with `fork_origins`.
+    pub point_splits: Vec<(u8, NodeId, NodeId)>,
     /// `lane_independent`'s memo. Structural (a node's op and operands never
     /// change), so it outlives a frame.
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
@@ -837,6 +846,7 @@ impl Domain for Symbolic {
             Cmp::Eq => return None,
         };
         let c = self.both_values(&format!("{op:?} split at a point"));
+        self.point_splits.push((self.forks - 1, may_true, may_false));
         let nc = self.not(&c);
         let (yes, no) = (self.and(&c, &may_true), self.and(&nc, &may_false));
         let valid = self.or(&yes, &no);
@@ -1010,10 +1020,13 @@ impl Domain for Symbolic {
         // exact, and taking the range's width made the move forks 13-way
         // (room (3,0) square (5,13) on an 8 px grid: 1,236 bodies -> 35,502,
         // 2026-09-18). Too small an arity declines loudly (`SplitOk`).
+        // Level -1 (`uncapped_ways`) needs the full width: its lanes ARE
+        // ranges.
         match self.range_of(*v) {
             Some(ps) => {
                 let sh = 16 - self.graph.fork_bits() as u32;
-                ps.iter().map(|p| (p.1 >> sh) - (p.0 >> sh) + 1).max().unwrap_or(1).clamp(1, self.move_ways() as i64) as u8
+                let cap = if self.uncapped_ways { i64::from(u8::MAX) } else { self.move_ways() as i64 };
+                ps.iter().map(|p| (p.1 >> sh) - (p.0 >> sh) + 1).max().unwrap_or(1).clamp(1, cap) as u8
             }
             None => self.move_ways(),
         }

@@ -307,6 +307,44 @@ recorded below.
   of room (2,0)'s 95), which drops every state that cannot reach the exit by H
   - exactly the late frames the missing dedup inflates. For all remaining
   rooms (H = the ceiling; the count-up fallback uses its own top horizon).
+- **Stop 4, room (6,0) (01:40): the level -1 table cannot be built.** "shape
+  1: 8796093022208 fork configurations": the builder enumerated EVERY fork's
+  fragments (cap 2^14), and each of the ten platforms' `move` forks twice (its
+  `rem` is seeded with the whole [-0.5, 0.5)) - 2^43. Only the located
+  object's forks need enumerating: they fix the player's pixel steps, so its
+  successor cell is exact per configuration. Two kinds of fork are no longer
+  enumerated (`level_minus_one.rs`):
+  - another object's own fork (its operand reads that object's slots and none
+    of the located object's): read over its operand's whole range (`Split` ->
+    the operand, the hull of its fragments; `SplitValid` -> an unknown boolean
+    of its own), which joins every fragment's outcome - sound, and costs
+    nothing where the objects' positions are ranges anyway (the platforms' are
+    [-16, 128]);
+  - a POINT split (`split_compare`, 2026-09-20): a free choice of a
+    comparison's answer, `Const(0, 1)` as its operand, so it reads no slot and
+    the first rule enumerated it - 17 forks in room (1,0), 32 in room (6,0)
+    (player against platforms), and room (1,0)'s own table (d = 44, the basis of
+    its 99) no longer built either: the point split had silently broken level
+    -1 everywhere, unnoticed because room (5,0) ran without it. Level -1 reads
+    it as the comparison itself over the ranges (`Symbolic::point_splits`
+    keeps each split's may-true / may-false conditions): true where only
+    may-true holds, false where only may-false, unknown where both - exact
+    where the ranges decide it, a join otherwise.
+  Every other fork is enumerated as before. (Enumerating ONLY the forks that
+  read the located object's slots lost exactness in room (1,0)'s spawn chain.)
+  The arity check runs on every enumerated fork's operand; a range-read fork
+  chooses no fragment, so its arity is moot.
+  Two more things this uncovered, both also breaking room (1,0)'s table:
+  - `7dce5b4` (2026-09-18) capped `flr_ways` at `move_ways` (2) for the region
+    kernels, whose lanes' speeds are exact. Level -1's speed is [-S, S] at
+    one node - `0.5 + rem + spd` spans 11 floors - so every node violated
+    "a fork operand spans 11 floors, arity 2". A `Symbolic::uncapped_ways`
+    flag, set only around level -1's trace, restores the full width.
+  - A range-read object's `rem` leaves [-0.5, 0.5) under the hull (`rem -
+    flr(rem + 0.5)` over an interval loses the correlation): room (6,0)'s
+    platform `objects[0].rem.x` went to [-0.6, 0.75]. For such an object
+    (`Traced::ranged_objects`) the rem is an ordinary range, widened as it
+    grows; the player's rem is still held to [-0.5, 0.5), a finding if not.
 
 ## For the morning
 
