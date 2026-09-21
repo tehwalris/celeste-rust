@@ -310,6 +310,24 @@ pub fn trace_frame<'a>(
     // (plans/platforms-unknown.md).
     if it.d.platforms_unknown {
         super::widen::fork_platform_inputs(&mut st, &mut it.d)?;
+        // Each input `x` lies in the path (the boundary wrote exactly that
+        // interval), so a comparison the path decides - the wrap test a
+        // platform's direction cannot reach - folds instead of forking.
+        // Guarded like a bound: both ends of the lane's value, in `ok`.
+        use crate::transpile::graph::Op;
+        let (lo, hi) = (
+            (celeste_engine::runtime2::PLATFORM_PATH.0 as i32) << 16,
+            (celeste_engine::runtime2::PLATFORM_PATH.1 as i32) << 16,
+        );
+        for x in it.d.platform_inputs.clone() {
+            it.d.ranges.insert(x, (lo as i64, hi as i64));
+            let (klo, khi) = (it.d.graph.leaf(Op::Const(lo, lo)), it.d.graph.leaf(Op::Const(hi, hi)));
+            let (vlo, vhi) = (it.d.graph.fold(Op::Lo, vec![x]), it.d.graph.fold(Op::Hi, vec![x]));
+            let a = it.d.graph.fold(Op::Ge, vec![vlo, klo]);
+            let b = it.d.graph.fold(Op::Le, vec![vhi, khi]);
+            let both = it.d.graph.fold(Op::And, vec![a, b]);
+            pin_ok = it.d.graph.fold(Op::And, vec![pin_ok, both]);
+        }
     }
     let st = run_one(it, reset, st)?;
     let mut outs = Vec::new();
@@ -460,10 +478,37 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
         }
         r
     };
-    // Every `Known(c)` the outcomes reach whose `c` a lane can hold undecided.
+    // What a select still reads: the condition of every select the outcomes
+    // reach - not through a premise, which protects a select rather than
+    // being one - and everything those conditions read. A `Known(c)` exists
+    // for a select on `c`; where none reads `c` any more (its value was
+    // overwritten - a platform's `x` by the output widening, after its
+    // wrap's `if` made a select on it - or folded away), it is VACUOUS.
+    // Conservative: a select on `And(c, d)` keeps `Known(c)`.
     let reach = crate::transpile::bdd::reachable(&d.graph, &roots_of(outs));
+    let mut read_by_select: Vec<NodeId> = Vec::new();
+    {
+        let mut seen = vec![false; reach.len()];
+        let mut stack: Vec<NodeId> = roots_of(outs);
+        while let Some(n) = stack.pop() {
+            if std::mem::replace(&mut seen[n as usize], true) {
+                continue;
+            }
+            let node = d.graph.get(n);
+            match node.op {
+                Op::Known => continue,
+                Op::Sel => read_by_select.push(node.args[0]),
+                _ => {}
+            }
+            stack.extend(node.args.iter().copied());
+        }
+    }
+    let selected = crate::transpile::bdd::reachable(&d.graph, &read_by_select);
+    // Every `Known(c)` the outcomes reach: vacuous, or - if `c` is read by a
+    // select and a lane can hold it undecided - to fork.
     let mut memo: std::collections::HashMap<NodeId, bool> = Default::default();
     let mut knowns: Vec<(NodeId, NodeId)> = Vec::new();
+    let mut vacuous: Vec<NodeId> = Vec::new();
     let mut conds: Vec<NodeId> = Vec::new();
     for (i, r) in reach.iter().enumerate() {
         if !*r {
@@ -472,7 +517,9 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
         let node = d.graph.get(i as NodeId);
         if let Op::Known = node.op {
             let c = node.args[0];
-            if d.reads_interval_cmp(c, &mut memo) {
+            if !selected.get(c as usize).copied().unwrap_or(false) {
+                vacuous.push(i as NodeId);
+            } else if d.reads_interval_cmp(c, &mut memo) {
                 knowns.push((i as NodeId, c));
                 if !conds.contains(&c) {
                     conds.push(c);
@@ -480,7 +527,7 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
             }
         }
     }
-    if conds.is_empty() {
+    if conds.is_empty() && vacuous.is_empty() {
         return Ok(());
     }
     // DIAGNOSTIC (CELESTE_BUILD_TRACE): which conditions fork - by the
@@ -498,7 +545,12 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
             };
             *by.entry(k).or_default() += 1;
         }
-        eprintln!("[build] fork_known_premises: {} conditions, {} premises: {by:?}", conds.len(), knowns.len());
+        eprintln!(
+            "[build] fork_known_premises: {} conditions, {} premises, {} vacuous: {by:?}",
+            conds.len(),
+            knowns.len(),
+            vacuous.len()
+        );
         for &c in conds.iter().take(4) {
             eprintln!("[build]   condition: {}", super::emit::show_tree(&d.graph, c, 4));
         }
@@ -516,8 +568,8 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
         forks.push((k, valid));
     }
     let t = d.graph.leaf(Op::ConstBool(true));
-    for (known, _) in &knowns {
-        subst.insert(*known, t);
+    for known in knowns.iter().map(|k| k.0).chain(vacuous.iter().copied()) {
+        subst.insert(known, t);
     }
     // Rebuild what the outcomes and the validities read, through `subst`
     // (operands precede their node, so one ascending pass).

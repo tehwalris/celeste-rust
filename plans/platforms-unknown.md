@@ -139,6 +139,40 @@ f50 296,257, f51 363,568, f55 646,053, f60 1,078,261) - no coverage gap at
 f51. Room (6,0) at `r0sxhp`: still too many forks (worst traces 131-144 live,
 nearly all from the pass) - under investigation.
 
+## Measured (2026-09-22): where room (6,0)'s forks come from
+
+Two sound fixes went in first:
+
+- A `Known(c)` whose `c` no select reads any more is dropped (vacuous: e.g. a
+  platform `x` overwritten by the output widening).
+- Each platform input `x` is seeded into the static ranges as the path
+  `[-16, 128]`, guarded in `ok` like a bound. That folds the wrap test a
+  platform's direction cannot reach (`x0 + [0,1] < -16`).
+
+After both, 278 of 914 traces have no platform condition left. The rest
+split in two classes (`CELESTE_BUILD_TRACE`, per trace):
+
+1. **The wrap arm's carry** (player regions in a platform row; 33-109
+   conditions). In the arm where the platform wraps, `x - last` is
+   `128 - x0` / `-16 - x0`, up to 144 px. It feeds the player's `move_x`:
+   sign tests, the 8-step loop tests `k > abs(amount)`, and the solid checks
+   per step, one fork each. The concrete game never carries there: a hit
+   needs the player on the platform, and a wrapped platform (at 128 / -16) is
+   out of a clamped player's reach. But the tracer loses the correlation
+   "hit => no wrap": the carry is computed under `if hit` from the
+   already-merged `Sel(wrap, 128, x1)`.
+2. **Landing, one fork per COMPARISON** (8-31 conditions, each reading the 2-3
+   platforms of the row). The player's `is_solid` checks each platform of the
+   row per `move_y` step, and each compound result is its own condition.
+   Forking the interval comparisons (atoms) inside instead of the compounds
+   takes these to 10.
+
+`specialize_frame` enumerates the full product of the forks in an outcome's
+cone (no pruning by validity), so 10 forks are 1,024 configurations per
+outcome per button rep, against 224 over 14 reps for a level-0 kernel today.
+The plan's "a fork per platform the region can reach (2-3)" was off by an
+order of magnitude.
+
 ## Options considered before (for the record)
 
 1. A fork whose answers agree is no fork: where two configurations give an
