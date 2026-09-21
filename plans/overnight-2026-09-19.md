@@ -269,6 +269,20 @@ replay need the seed enumeration (the reference engine refuses `rnd`).
 Wall time on the balloon model: ~10 min for the whole search. In the UI as
 `room50`.
 
+## The rest of the rooms (started 2026-09-21 ~00:30, Philippe asleep to ~10:00)
+
+Every remaining room in order, level index 6 (room (6,0), 700 m) to 30 (the
+summit), none skipped, by `/var/tmp/run-rooms.sh` (progress in
+`/var/tmp/rooms-progress.txt`, logs `/var/tmp/celeste-ui/room<xy>.log`). Per
+room: spawn = the first controllable frame of a zero-input replay (minimal
+cart) - 1; ceiling = spawn + the inputs of `classic/any/TAS<level+1>.tas`;
+ladder `r0sxhfb, r1sxhb .. r15sxhb, r15sxh, rxsx` (the flags are no-ops where
+a room has no fly fruit / fall floors / balloon); kernel sets capped at 2; a
+refuted ceiling (the model cannot reproduce the TAS) counts up from ceiling+1.
+On success the room is exported to the UI (`runs.json`, newest first). The
+driver stops at the first failure; each stop, its cause and its fix are
+recorded below.
+
 ## For the morning
 
 - `concrete_run --object fly_fruit` prints "none" on every frame of a route
