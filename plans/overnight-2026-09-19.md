@@ -510,6 +510,22 @@ recorded below.
   (`/var/tmp/rewrite-phases`), with the whole remaining list. Room (7,0)'s
   `r0sxhb` probe timed out at 10 min (8 refusals, no other error), so it runs
   floors exact at every level; its walk is clean (6 shapes, 204 nodes, 5.9 s).
+- **Stop 3, room (7,0) (04:54): level -1 and the balloon's phase.** The table
+  build failed at the spawn chain's first frame: a live outcome's `ok` was
+  false on `Hi(offset + 0.01) - Lo(offset + 0.01) >= period` - the balloon's
+  full-period premise (`widen::canon_balloon_offset`, room (5,0)): the kernels
+  store the phase canonically as [0, BALLOON_PERIOD_RAW] at every level, but
+  level -1 seeded the slot with the start representative's point. Room (5,0)
+  never ran with level -1, so it did not show; it would have stopped every
+  balloon room left ((0,1), (2,1), (4,1), (6,1), (7,1)). First fix (seed the
+  canonical period as an interval input) moved the failure, not the cause:
+  the premise went from false to UNDECIDED, because over a node's range a
+  lane's `Lo`/`Hi` is anywhere in the hull. The fix: at level -1 the phase is a
+  plain NUMBER per lane, never an interval input - so the trace makes no
+  canonicalization and no premise - with its range the whole period
+  [0, BALLOON_PERIOD_RAW] (`objects_of_type_in`): every real state holds some
+  concrete phase in it, and the evaluator reads the bob's `sin` over all of
+  them. Tested on rooms (7,0) and (5,0) before the restart.
 
 ## For the morning
 

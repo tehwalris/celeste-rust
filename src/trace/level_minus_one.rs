@@ -262,7 +262,13 @@ struct Phases {
 /// The phase objects of `st`, in `objects` order: the `k`-th is ordinal `k`
 /// (objects are created and deleted around them, so an index is not stable).
 fn phase_objects(st: &State<Symbolic>) -> Vec<usize> {
-    let Some(Value::Table(want)) = iface::get(st, &[iface::key(PHASE_TYPE)]) else { return Vec::new() };
+    objects_of_type_in(st, PHASE_TYPE)
+}
+
+/// The indices of `st`'s objects of type `ty` (the global of that name), in
+/// `objects` order.
+fn objects_of_type_in(st: &State<Symbolic>, ty: &str) -> Vec<usize> {
+    let Some(Value::Table(want)) = iface::get(st, &[iface::key(ty)]) else { return Vec::new() };
     let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else { return Vec::new() };
     (0..st.heap.tables[&objects].arr.len())
         .filter(|&i| iface::get(st, &[iface::key("objects"), Step::Idx(i), iface::key("type")]) == Some(Value::Table(want)))
@@ -520,9 +526,23 @@ impl<'a> Table<'a> {
             Some(o) => (Some(with(o, &["x"])), Some(with(o, &["y"]))),
             None => (None, None),
         };
+        // A balloon's phase: the kernels store it canonically as the interval
+        // [0, BALLOON_PERIOD_RAW] (`Rt2::widen_to` step 9), and a trace that
+        // sees it as an INTERVAL input carries the full-period premise
+        // `Hi(off) - Lo(off) >= period` in `ok` (`widen::canon_balloon_offset`).
+        // Level -1 cannot decide that premise: over a node's range a lane's
+        // `Lo`/`Hi` is anywhere in the hull. Seeded as the representative's
+        // point it was FALSE at room (7,0)'s first spawn frame (2026-09-21).
+        // So at level -1 the phase is a plain NUMBER per lane (never an
+        // interval input: no canonicalization, no premise) whose range is the
+        // whole period - every real state holds some concrete phase in it,
+        // and the evaluator reads everything derived (the bob's `sin`) over
+        // all of them.
+        let balloon_offsets: BTreeSet<Path> = objects_of_type_in(&st, "balloon").into_iter().map(|i| vec![iface::key("objects"), Step::Idx(i), iface::key("offset")]).collect();
         // Seed every numeric slot not pinned: a range kept from an earlier
-        // pass, else the player's rem half and speed [-S, S], or the value the
-        // representative holds (the start state's own, a blanked shape's 0).
+        // pass, else the player's rem half and speed [-S, S], a balloon's
+        // canonical phase, or the value the representative holds (the start
+        // state's own, a blanked shape's 0).
         for p in &roots {
             if pins.contains_key(p) || self.shapes[id].ranges.contains_key(p) || Some(p) == xp.as_ref() || Some(p) == yp.as_ref() {
                 continue;
@@ -533,6 +553,8 @@ impl<'a> Table<'a> {
                 REM
             } else if is_player("spd") {
                 (-(self.spd_px as i64) << 16, (self.spd_px as i64) << 16)
+            } else if balloon_offsets.contains(p) {
+                (0, celeste_engine::runtime2::BALLOON_PERIOD_RAW as i64)
             } else {
                 let v = tr.it.d.as_const(&n).ok_or_else(|| anyhow!("{key}: {} is not a constant in the representative", iface::show(p)))?;
                 if key != self.lw.start_key {
@@ -555,7 +577,7 @@ impl<'a> Table<'a> {
             ival.push(p);
         }
         for p in super::shapes::ival_paths(&st, false, (false, false)).into_iter().chain(self.lw.ival_extra.get(&key).into_iter().flatten().cloned()) {
-            if !pins.contains_key(&p) && !ival.contains(&p) {
+            if !pins.contains_key(&p) && !ival.contains(&p) && !balloon_offsets.contains(&p) {
                 ival.push(p);
             }
         }
