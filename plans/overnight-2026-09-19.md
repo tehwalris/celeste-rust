@@ -528,6 +528,30 @@ recorded below.
   concrete phase in it, and the evaluator reads the bob's `sin` over all of
   them. Tested on rooms (7,0) and (5,0) before the restart.
 
+## Morning: the level -1 table off again, its overnight additions removed
+
+Philippe: turning the table on for every room was not asked for (it had been
+used deliberately, for rooms (1,0) and (2,0)), and it did not rescue room
+(6,0) anyway. So:
+
+- the driver no longer sets `CELESTE_LEVEL_MINUS_ONE`;
+- `level_minus_one.rs` is back to its pre-night state (`3f0ef8d`): gone are
+  the platform phases (snapshots, per-snapshot fallback, the phase premise),
+  the unmodelled-node rule, range-reading other objects' forks and their
+  unheld `rem`, the balloon-phase seeding, and the violation diagnostics;
+- KEPT, re-applied on it: the two repairs without which room (1,0)'s own table
+  no longer built - a point split read as its comparison
+  (`Symbolic::point_splits`), and the full-width move arity at level -1
+  (`Symbolic::uncapped_ways`, undoing `7dce5b4`'s cap there only);
+- kept, unrelated to the table: the room-wrap fix (`c91ed59`) and the
+  reference engine's explicit level (`dade490`).
+
+The "glitch" behind the unmodelled rule is not in the game: `_draw` returns
+early while `freeze > 0`, so the player's x clamp runs on the frame freeze
+reaches 0, before the next unfrozen `_update`; every unfrozen update starts
+with x in [-1, 121], and no clamped player overlaps a wrapped platform. It
+existed only because the table treats x and `freeze` as independent.
+
 ## For the morning
 
 - `concrete_run --object fly_fruit` prints "none" on every frame of a route

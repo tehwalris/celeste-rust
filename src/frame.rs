@@ -1334,7 +1334,7 @@ fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::Cos
             let t = std::time::Instant::now();
             let table = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
-                .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new(&root), sp, threads, h))
+                .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new(&root), sp, threads))
                 .expect("spawn the level -1 builder")
                 .join()
                 .expect("the level -1 builder panicked")
