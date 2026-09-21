@@ -457,6 +457,18 @@ recorded below.
   cross-frame dedup the frontier is bounded by the abstract state space, and
   that may be small enough. Measured with `rewrite forward --level` to f45
   against `r0sxhb` (2.5M at f40, 17.9M at f45).
+  Result: it cannot even be BUILT. `r0s16hb` (1 px speed buckets) was
+  OOM-killed in the kernel build, past 60 GB, after a 2,579-node key fixpoint
+  - before its first frame; `x2y2r0s16hb` was at 54 GB and still building
+  after 14 min when I killed it (it was starving room (7,0)). So a coarser
+  level 0 through speed buckets is out for this room.
+  Where room (6,0) stands, for the morning: the table machinery is in and
+  sound (`706f287`), but the room needs the platforms phase-unknown on the
+  coarse rungs, and that needs a KERNEL SEMANTICS change: a select on an
+  undecided, every-lane-alike condition that takes the hull of its arms
+  instead of requiring `Known(c)` (the wrap), together with keeping each
+  platform's `x` a single value per lane so `x - last` cancels. That is a
+  design decision about the kernels, so it waits for you.
 
 ## For the morning
 
