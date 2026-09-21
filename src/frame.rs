@@ -249,19 +249,24 @@ pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
             _ => vec![false; lanes],
         });
     }
-    let want = crate::pico8_num::Pico8Num::from_i16(crate::game_runner::win_room_x());
+    // The room `next_room` loads (`game_runner::win_room`): both coordinates,
+    // since the exit from a row's last room wraps to the next row.
+    let (wx, wy) = crate::game_runner::win_room();
     let room = rt2
         .global_target(ids.g_room)
         .ok_or_else(|| anyhow::anyhow!("wins: no `room` global"))?;
-    let x = rt2
-        .obj_field_cell(room, ids.f_x)
-        .ok_or_else(|| anyhow::anyhow!("wins: room table has no x field"))?;
-    Ok(match &rt2.cols[x as usize] {
-        Col::U(AV::Num(n)) => vec![*n == want; lanes],
-        Col::N(vs) => vs.iter().map(|n| *n == want).collect(),
-        Col::V(vs) => vs.iter().map(|v| *v == AV::Num(want)).collect(),
-        other => anyhow::bail!("wins: room.x is not a number column: {:?}", other),
-    })
+    let is = |f: u32, name: &str, want: i16| -> Result<Vec<bool>> {
+        let want = crate::pico8_num::Pico8Num::from_i16(want);
+        let c = rt2.obj_field_cell(room, f).ok_or_else(|| anyhow::anyhow!("wins: room table has no {name} field"))?;
+        Ok(match &rt2.cols[c as usize] {
+            Col::U(AV::Num(n)) => vec![*n == want; lanes],
+            Col::N(vs) => vs.iter().map(|n| *n == want).collect(),
+            Col::V(vs) => vs.iter().map(|v| *v == AV::Num(want)).collect(),
+            other => anyhow::bail!("wins: room.{name} is not a number column: {:?}", other),
+        })
+    };
+    let (xs, ys) = (is(ids.f_x, "x", wx)?, is(ids.f_y, "y", wy)?);
+    Ok(xs.iter().zip(&ys).map(|(a, b)| *a && *b).collect())
 }
 
 /// Worker (and owner) count: `CELESTE_THREADS`, else half the logical
@@ -586,11 +591,13 @@ impl Slot {
                 xl <= tx && tx <= xh && yl <= ty && ty <= yh
             }));
         }
-        let want = P8::from_i16(crate::game_runner::win_room_x());
+        let (wx, wy) = crate::game_runner::win_room();
+        let (wx, wy) = (P8::from_i16(wx), P8::from_i16(wy));
         let room = sk.global_target(ids.g_room).ok_or_else(|| anyhow::anyhow!("any_win: no `room` global"))?;
         let x = sk.obj_field_cell(room, ids.f_x).ok_or_else(|| anyhow::anyhow!("any_win: room has no x"))?;
-        let xs = num_at(x)?;
-        Ok(rows.iter().any(|&r| xs.at(r) == want))
+        let y = sk.obj_field_cell(room, ids.f_y).ok_or_else(|| anyhow::anyhow!("any_win: room has no y"))?;
+        let (xs, ys) = (num_at(x)?, num_at(y)?);
+        Ok(rows.iter().any(|&r| xs.at(r) == wx && ys.at(r) == wy))
     }
 
     /// Push one materialized row (the reference engine's path): its

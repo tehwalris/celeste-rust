@@ -405,8 +405,8 @@ fn read_level_frames(dir: &Path) -> Result<LevelData> {
             }
         }
         // A won state has left the room: its cell is the NEXT room's spawn,
-        // one room over (`pos_graph::block_cells` adds `room.x - start.x`
-        // rooms), so drawn as-is the winning states sit in the box's far
+        // one room over (`pos_graph::room_offset` puts the room it exits to
+        // one room to the right), so drawn as-is the winning states sit in the box's far
         // corner and the animation never shows the player reach the exit
         // (room (4,0) f76 at (136,128), room (1,0) f99 at (136,124),
         // 2026-09-16). Draw each win cell where its player LEFT from instead:

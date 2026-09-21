@@ -32,19 +32,19 @@ pub fn start_room() -> (i16, i16) {
     })
 }
 
-/// The `room.x` value that means "won" for the configured start room: the
-/// room the player lands in after exiting. Progression in this cart is
-/// `room.x + 1` along a map row (`next_room` only wraps at x == 7, which no
-/// supported start room reaches - asserted). Comparing `room.x` alone is
-/// enough because a same-row exit never changes `room.y`.
-pub fn win_room_x() -> i16 {
-    let (x, _y) = start_room();
-    assert!(
-        x < 7,
-        "win_room_x: start room x={} would wrap to the next map row",
-        x
-    );
-    x + 1
+/// The room that means "won" for the configured start room: the room the
+/// player lands in after exiting, as the cart's `next_room` loads it -
+/// `(x + 1, y)` along a map row, and `(0, y + 1)` from a row's last room
+/// (x == 7: rooms (7,0), (7,1), (7,2); until 2026-09-21 this asserted x < 7,
+/// which room (7,0) hit). Compare BOTH coordinates: the wrapped exit changes
+/// `room.y`.
+pub fn win_room() -> (i16, i16) {
+    let (x, y) = start_room();
+    if x == 7 {
+        (0, y + 1)
+    } else {
+        (x + 1, y)
+    }
 }
 
 /// Directory-name stem for per-room checkpoint trees under a base dir:
@@ -103,7 +103,7 @@ mod tests {
     // the room-(0,0) pipeline runs.
     #[test]
     fn win_and_dir_stem_for_default_room() {
-        assert_eq!(super::win_room_x(), 2);
+        assert_eq!(super::win_room(), (2, 0));
         assert_eq!(super::room_dir_stem(), "room1");
     }
 

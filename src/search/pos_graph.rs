@@ -148,7 +148,6 @@ pub fn player_object(rt2: &Rt2) -> Option<u32> {
 /// a player whose `x`/`y` is not a plain number, is at `NO_CELL`.
 pub fn block_cells(rt2: &Rt2) -> Result<Vec<u32>> {
     let ids = crate::compiled::ids();
-    let start = crate::game_runner::start_room();
     let lanes = rt2.width;
     let axis = |obj: u32, f: u32| rt2.obj_field_cell(obj, f).and_then(|c| whole_i16_col(rt2, c));
     let room = rt2
@@ -165,12 +164,27 @@ pub fn block_cells(rt2: &Rt2) -> Result<Vec<u32>> {
     };
     (0..lanes)
         .map(|i| {
-            cell_of(
-                px[i] as i32 + (rx[i] - start.0) as i32 * ROOM_PX,
-                py[i] as i32 + (ry[i] - start.1) as i32 * ROOM_PX,
-            )
+            let (ox, oy) = room_offset(rx[i], ry[i])?;
+            cell_of(px[i] as i32 + ox, py[i] as i32 + oy)
         })
         .collect()
+}
+
+/// The labelling offset of a row in room `(rx, ry)`: the start room at 0, the
+/// room `next_room` loads (`game_runner::win_room`) one ROOM_PX to the right -
+/// whichever edge it was left by, including the wrap from a row's last room to
+/// the next row's first (room (7,y) -> (0,y+1), 2026-09-21; `rx - start` put it
+/// 7 rooms LEFT and one down, off the grid). No other room is ever in a block:
+/// a death reloads the start room.
+pub fn room_offset(rx: i16, ry: i16) -> Result<(i32, i32)> {
+    let start = crate::game_runner::start_room();
+    if (rx, ry) == start {
+        Ok((0, 0))
+    } else if (rx, ry) == crate::game_runner::win_room() {
+        Ok((ROOM_PX, 0))
+    } else {
+        Err(anyhow!("a row in room ({rx},{ry}): neither the start room {start:?} nor the one it exits to {:?}", crate::game_runner::win_room()))
+    }
 }
 
 /// The finished table: for each destination cell, the cells a predecessor

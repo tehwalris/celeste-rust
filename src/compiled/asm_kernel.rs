@@ -371,7 +371,6 @@ impl AsmKernel {
         let n = lanes.len();
         debug_assert!((1..=16).contains(&n));
         assert!(lanes.iter().all(|&l| l & !63 == lanes[0] & !63), "a slice within one id group: lanes {lanes:?}");
-        let start = crate::game_runner::start_room();
         // Consecutive emissions mostly repeat one (input cell, output cell)
         // pair; skip the set insert for those.
         let mut last_edge = (u32::MAX, u32::MAX);
@@ -553,7 +552,7 @@ impl AsmKernel {
                             runtime2::mix64(template.part.1.wrapping_add(h2)),
                         );
                         n_unique += 1;
-                        let cout = cell_out(body, outbuf, i, start);
+                        let cout = cell_out(body, outbuf, i);
                         if targets.contains(key, cout) {
                             sink.hit(lanes[i]);
                             hit_lanes |= 1 << i;
@@ -590,7 +589,7 @@ impl AsmKernel {
                         // mask, or straight to a record if the row was
                         // flushed (its id is in the cache then).
                         if sink.edges_on && first_cin != cin {
-                            sink.edges.insert((cin, cell_out(body, outbuf, i, start)));
+                            sink.edges.insert((cin, cell_out(body, outbuf, i)));
                         }
                         // THE SPEED HULL: the same key with another speed
                         // fragment is not the same row. Still queued: its
@@ -621,7 +620,7 @@ impl AsmKernel {
                     }
                     sink.emitted += 1;
                     n_unique += 1;
-                    let cout = cell_out(body, outbuf, i, start);
+                    let cout = cell_out(body, outbuf, i);
                     if sink.edges_on && last_edge != (cin, cout) {
                         last_edge = (cin, cout);
                         sink.edges.insert((cin, cout));
@@ -2450,8 +2449,8 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]
 /// The position cell of lane `i` of a body's output, read straight off the
 /// output buffer. `Pico8Num::whole_part_as_i16` is `raw >> 16`.
 #[inline]
-fn cell_out(body: &AsmBody, buf: &[u8], i: usize, start: (i16, i16)) -> u32 {
-    use crate::search::pos_graph::{cell_of, NO_CELL};
+fn cell_out(body: &AsmBody, buf: &[u8], i: usize) -> u32 {
+    use crate::search::pos_graph::{cell_of, room_offset, NO_CELL};
     let Some(srcs) = &body.pos else {
         return NO_CELL;
     };
@@ -2465,11 +2464,9 @@ fn cell_out(body: &AsmBody, buf: &[u8], i: usize, start: (i16, i16)) -> u32 {
         }
     };
     let (px, py, rx, ry) = (read(srcs[0]), read(srcs[1]), read(srcs[2]), read(srcs[3]));
-    cell_of(
-        px as i32 + (rx - start.0) as i32 * 128,
-        py as i32 + (ry - start.1) as i32 * 128,
-    )
-    .unwrap_or_else(|e| panic!("emitted row: {e}"))
+    // The same labelling as `pos_graph::block_cells` (`room_offset`).
+    let (ox, oy) = room_offset(rx, ry).unwrap_or_else(|e| panic!("emitted row: {e:#}"));
+    cell_of(px as i32 + ox, py as i32 + oy).unwrap_or_else(|e| panic!("emitted row: {e}"))
 }
 
 /// The accumulator recipe for one outcome: the outcome's structural

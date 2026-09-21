@@ -469,6 +469,41 @@ recorded below.
   instead of requiring `Known(c)` (the wrap), together with keeping each
   platform's `x` a single value per lane so `x - last` cancels. That is a
   design decision about the kernels, so it waits for you.
+- **Stop 1, room (7,0) (04:37): the walk fans out.** Room (7,0) (balloon, six
+  fall floors, spring; ceiling 84 = 23 + TAS8's 61) spent 33 min in the
+  lattice walk without finishing: its log is 32 `[trace] frontier by flow`
+  lines - each printed just before a trace BAILS with "frontier grew to N
+  states (limit 256) - something is fanning out without merging back" (N =
+  5,236 and 592). The walk records each refusal and, if a shape never traces,
+  ends with a hard error listing them (`kernel.rs`, the post-fixpoint check),
+  so it was headed for a failure, slowly (each refused trace first grows to
+  thousands of states). Killed. Suspect: a multiplicative fan-out across the
+  six floors' updates at the floors-unknown level (2^6 x balloon x spring =
+  256 is exactly the cap; room (3,0)'s floors walked in 17.6 s). Diagnosis:
+  walk-only runs (`CELESTE_KERNEL_ONLY=none`, `CELESTE_LATTICE_TRACE=1`) at
+  `r0sxhb` (floors unknown) and `r0sxh` (floors exact).
+- **Stop 2, room (7,0) (04:45): the exit wraps.** Both diagnostics panicked at
+  once: `win_room_x: start room x=7 would wrap to the next map row`. The cart's
+  `next_room` loads (0, y+1) from a row's last room, and three places assumed
+  (x+1, y): the win test (`frame.rs`, both the block and the row-set variant,
+  compared `room.x` alone), and the position labelling - `pos_graph::
+  block_cells` and the kernels' `cell_out` put a row at `x + (room.x -
+  start.x) * 128`, which for the wrapped exit is 7 rooms LEFT and one down, off
+  the 512 px grid (and the level -1 filter's window assert). Fixed for rooms
+  (7,0), (7,1), (7,2): `game_runner::win_room()` returns the exit room (both
+  coordinates); both win tests compare both; `pos_graph::room_offset` labels
+  the start room 0 and the exit room one ROOM_PX right whichever edge it was
+  left by (the documented labelling), and errors on any other room; the
+  kernels' `cell_out` uses it.
+  With it the diagnostics run: floors EXACT (`r0sxh`) walks cleanly - 6
+  shapes, 204 (shape, region) nodes, 621 traces in 4.9 s, 0 refusals - so the
+  fan-out is the floors-unknown flag `b`. Floors exact is sound (more precise;
+  the flag is only an optimization - the same call as the fly fruit for room
+  (6,0)). Several rooms left have fall floors ((1,1), (2,1), (5,1), (6,1),
+  (7,1)), so the driver now PROBES each room's floors-unknown walk (walk only,
+  10 min; room (3,0)'s took 17.6 s) and falls back to floors exact at every
+  level (`r0sxh, r1sxh .. r15sxh, rxsx`) if it does not finish cleanly,
+  logging which ladder it chose.
 
 ## For the morning
 
