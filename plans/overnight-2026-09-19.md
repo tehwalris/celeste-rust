@@ -503,7 +503,13 @@ recorded below.
   (7,1)), so the driver now PROBES each room's floors-unknown walk (walk only,
   10 min; room (3,0)'s took 17.6 s) and falls back to floors exact at every
   level (`r0sxh, r1sxh .. r15sxh, rxsx`) if it does not finish cleanly,
-  logging which ladder it chose.
+  logging which ladder it chose. (It probes both ends of the ramp, `r0sxhb`
+  and `r15sxhb`: the search prebuilds and later runs every floors-unknown
+  rung, so a fan-out above rung 0 must not slip through.)
+  Driver restarted 04:44 from room (7,0) on the release binary at `c91ed59`
+  (`/var/tmp/rewrite-phases`), with the whole remaining list. Room (7,0)'s
+  `r0sxhb` probe timed out at 10 min (8 refusals, no other error), so it runs
+  floors exact at every level; its walk is clean (6 shapes, 204 nodes, 5.9 s).
 
 ## For the morning
 
