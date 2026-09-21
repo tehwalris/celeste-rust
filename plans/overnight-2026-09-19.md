@@ -345,6 +345,54 @@ recorded below.
     platform `objects[0].rem.x` went to [-0.6, 0.75]. For such an object
     (`Traced::ranged_objects`) the rem is an ordinary range, widened as it
     grows; the player's rem is still held to [-0.5, 0.5), a finding if not.
+  Committed as `78f78a4` (room (1,0): d = 44, OPTIMAL 99; suite and the
+  three pinned oracles green). Room (6,0) still did not converge: from pass 2
+  on, live outcomes' `ok` undecided - named, `1 > abs(x_after - last)`, the
+  platform CARRY loop (`hit.move_x(this.x - this.last, 1)`) traced as zero
+  iterations, with `x` and `last` independent ranges ([0, 0] and [-1, 125]).
+  In the game `last == x` at every frame boundary (the update ends with
+  `last = x`), so the carry is at most 1 px - a relation no interval keeps.
+  Tracing the whole loop (up to 144 px) is sound but lets the table teleport
+  the player along every platform row; relational folding fails at the wrap.
+- **The fix: the platforms' phases** (`level_minus_one::Phases`). A platform's
+  update reads only its own fields and `freeze`, and `load_room` re-creates
+  it, so in any row at frame t the platforms hold P(u), the state after
+  u <= t unfrozen updates. The table now reads each platform slot from
+  snapshots P(0..=H) of a zero-input CONCRETE run (the reference
+  interpreter), checked to start at the traced start state and to neither
+  freeze nor lose its player. A node is evaluated over the snapshots' HULL
+  first; only where that breaks a premise is it evaluated once per snapshot,
+  exactly (the carry is then exact), joining the successors. The premise is
+  CHECKED on every traced outcome: each platform output field's cone reads
+  only platform slots and `freeze` (a point split counts as what its
+  conditions read), else the build fails. Rooms without platforms are
+  untouched (`phases: None`).
+  The reference engine runs at the PROCESS-GLOBAL level (atomics set by
+  `abstraction::set_level`), and the first attempt died on "the reference
+  engine does not run held-unknown levels": the table was built lazily at
+  the first flush, inside level 0's wave. The snapshot run now sets
+  `Level::EXACT` and restores the saved level on every exit, and the table is
+  built EAGERLY at the start of `find_optimum` / `find_optimum_from_ceiling`,
+  before any wave, so no kernel dispatch can see the switch.
+  With the phases (120 platform fields, 71 distinct snapshots for u <= 70;
+  the concrete run's checks all held), pass 1 still had 13,986 violations,
+  two kinds: `9 > abs(x_after - last)` definitely FALSE at cell (-2, 80) - a
+  right-moving platform wrapping from 128 to -16 under a player at x = -2
+  carries it -144 px, past `move_x`'s unrolled 8 (`interp::unroll_bound`,
+  the same in every kernel) - and an `ok` of `freeze > 0 or ...`. x = -2 at a
+  frame boundary is real: the x clamp is in the player's DRAW, skipped on the
+  frame a dash sets `freeze`. So the glitch is a real configuration the
+  traced frame does not model, at any level.
+- **Unmodelled nodes get d = 1.** A node where a live outcome's `ok` (or an
+  enumerated fork's arity, the kernels' `SplitOk`) is not provably true is no
+  longer a build failure: it is UNMODELLED and seeded d = 1, the weakest
+  bound. Sound: its own bound is trivially valid; a real transition that
+  satisfies `ok` is still covered by the (over-approximating) outcomes, so the
+  ranges stay inductive; and a real transition that breaks `ok` breaks the
+  same premise in the kernels, which decline it as a FATAL coverage gap - the
+  search never takes it silently. Position and box violations (the table's
+  own premises) stay fatal. The price is precision near those nodes; the
+  pass report prints how many and where.
 
 ## For the morning
 

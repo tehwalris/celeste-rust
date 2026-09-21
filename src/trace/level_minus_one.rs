@@ -35,7 +35,16 @@
 //!   fork operand spans at most `n` floors: checked directly on every
 //!   configuration's operands instead. What is left - pin guards, the static
 //!   range premises, the symbolic loops' "finished" obligation, the rem
-//!   containment - must evaluate to TRUE, or the node is reported.
+//!   containment - must evaluate to TRUE, or the node is UNMODELLED and
+//!   seeded d = 1, the weakest bound (2026-09-21, room (6,0): a platform
+//!   wrapping under a player left of x = -1 carries it 144 px, past the move
+//!   loop's unrolled 8). Sound: the node's own bound is trivially valid; a
+//!   real transition that satisfies `ok` is still covered by the outcomes
+//!   (they over-approximate it, so the ranges stay inductive); and one that
+//!   breaks it breaks the same premise in the kernels, which decline it as a
+//!   fatal coverage gap - it is never taken silently. An enumerated fork
+//!   whose operand spans more floors than its arity (the kernels' `SplitOk`)
+//!   is unmodelled the same way.
 //! * Every position hull has whole endpoints (a cell is a whole pixel).
 //!
 //! And three things it does NOT model, each counted in the report:
@@ -223,6 +232,134 @@ enum Seed {
     /// A numeric range, by path into the shape's `ranges`.
     Range(Path),
     Unknown,
+    /// A platform's field, from the snapshots (`Phases`), by field id.
+    Phase(usize),
+}
+
+/// The object type whose state is a function of time alone (`Phases`).
+const PHASE_TYPE: &str = "platform";
+
+/// THE PLATFORMS' PHASES (2026-09-21, room (6,0)). A platform's update reads
+/// only its own fields and `freeze` (checked on every traced outcome, `trace`),
+/// and `load_room` re-creates it, so in any row at frame t the platforms hold
+/// P(u), the state after u <= t unfrozen updates from the room's start. Level
+/// -1 evaluates a node over the platforms' HULL first and, where that breaks a
+/// premise (the carry `x - last` over independent ranges: `last == x` at every
+/// frame boundary is a relation no interval keeps), once per snapshot P(u),
+/// u <= H, exactly, joining the successors. The snapshots come from a
+/// zero-input concrete run, checked to start at the traced start state and to
+/// neither freeze nor reload.
+struct Phases {
+    /// Per field id: (platform ordinal among the phase objects, path below it).
+    fields: Vec<(usize, Path)>,
+    index: BTreeMap<(usize, Path), usize>,
+    /// The distinct P(u), u = 0..=H: per field id, the raw value.
+    snaps: Vec<Vec<i64>>,
+    /// Per field id, the hull over the snapshots.
+    hull: Vec<Range>,
+}
+
+/// The phase objects of `st`, in `objects` order: the `k`-th is ordinal `k`
+/// (objects are created and deleted around them, so an index is not stable).
+fn phase_objects(st: &State<Symbolic>) -> Vec<usize> {
+    let Some(Value::Table(want)) = iface::get(st, &[iface::key(PHASE_TYPE)]) else { return Vec::new() };
+    let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else { return Vec::new() };
+    (0..st.heap.tables[&objects].arr.len())
+        .filter(|&i| iface::get(st, &[iface::key("objects"), Step::Idx(i), iface::key("type")]) == Some(Value::Table(want)))
+        .collect()
+}
+
+/// `p` as (phase ordinal, path below the object), if it is under one of `objs`.
+fn phase_field(objs: &[usize], p: &Path) -> Option<(usize, Path)> {
+    let i = object_index(p)?;
+    let k = objs.iter().position(|&o| o == i)?;
+    Some((k, p[2..].to_vec()))
+}
+
+/// The snapshots P(0..=max_frame) of the start room's platforms, or `None`
+/// for a room without any.
+fn phases(lw: &LatticeWalk, max_frame: u32) -> Result<Option<Phases>> {
+    let st = &lw.reps[&lw.start_key];
+    let objs = phase_objects(st);
+    if objs.is_empty() {
+        return Ok(None);
+    }
+    let mut fields = Vec::new();
+    let mut p0 = Vec::new();
+    for p in super::shapes::state_paths(st)? {
+        let Some(kr) = phase_field(&objs, &p) else { continue };
+        let Some(Value::Num(n)) = iface::get(st, &p) else { continue };
+        let v = lw.tracer.it.d.as_const(&n).ok_or_else(|| anyhow!("the start state's {} is not a constant", iface::show(&p)))?;
+        fields.push(kr);
+        p0.push(raw(v));
+    }
+    // The reference engine runs at the process-global level, and the search
+    // has set level 0 (held unknown, rem widened): a concrete run needs the
+    // exact one. Restored on every exit; the table is built before any wave
+    // runs (`frame::level_minus_one`), so no kernel dispatch sees it.
+    struct Restore(crate::interpreter::abstraction::Level);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::interpreter::abstraction::set_level(self.0);
+        }
+    }
+    let _restore = Restore(crate::interpreter::abstraction::current_level());
+    crate::interpreter::abstraction::set_level(crate::interpreter::abstraction::Level::EXACT);
+    let mut ce = crate::concrete::ConcreteEngine::new()?;
+    let mut cs = ce.initial_state()?;
+    let mut snaps: Vec<Vec<i64>> = Vec::new();
+    for u in 0..=max_frame {
+        let (vals, freeze, alive) = concrete_phase(&cs, &fields)?;
+        ensure!(u > 0 || vals == p0, "the concrete start state's platforms {vals:?} are not the traced start state's {p0:?}");
+        ensure!(alive, "the zero-input run lost its player at frame {u}: the room reloads, so its frames are not the phases");
+        ensure!(freeze == 0, "the zero-input run is frozen at frame {u}: its frames are not the phases");
+        snaps.push(vals);
+        if u < max_frame {
+            cs = ce.step_frame(cs, 0)?;
+        }
+    }
+    let hull = (0..fields.len()).map(|i| (snaps.iter().map(|s| s[i]).min().unwrap_or(0), snaps.iter().map(|s| s[i]).max().unwrap_or(0))).collect();
+    snaps.sort_unstable();
+    snaps.dedup();
+    let index = fields.iter().cloned().enumerate().map(|(i, kr)| (kr, i)).collect();
+    Ok(Some(Phases { fields, index, snaps, hull }))
+}
+
+/// A CONCRETE state's (the reference interpreter's) platform fields, per
+/// field of `fields`, its `freeze`, and whether it still has a player or its
+/// spawn.
+fn concrete_phase(cs: &crate::interpreter::state::State, fields: &[(usize, Path)]) -> Result<(Vec<i64>, i64, bool)> {
+    use crate::interpreter::inspect::StateHelper;
+    use crate::interpreter::value::{HeapValue, MaybeVector, Value as Cv};
+    let h = StateHelper::new(cs);
+    let num = |id| match h.load(id) {
+        HeapValue::Value(Cv::Number(MaybeVector::Scalar(n))) => Some(raw(*n)),
+        _ => None,
+    };
+    let objects = h.find_global("objects").ok_or_else(|| anyhow!("concrete: no `objects`"))?;
+    let HeapValue::Value(Cv::Pointer(arr)) = h.load(objects) else { bail!("concrete: `objects` is not a table") };
+    let of_type = |t: &str| h.find_objects_by_type(*arr, t).map_err(|e| anyhow!("concrete: {e:?}"));
+    let objs = of_type(PHASE_TYPE)?;
+    let alive = !of_type("player")?.is_empty() || !of_type("player_spawn")?.is_empty();
+    let mut out = Vec::with_capacity(fields.len());
+    for (k, rest) in fields {
+        let mut cur = *objs.get(*k).ok_or_else(|| anyhow!("concrete: {} platforms, no ordinal {k}", objs.len()))?;
+        let mut v = None;
+        for (j, s) in rest.iter().enumerate() {
+            let Step::Key(name) = s else { bail!("concrete: a platform field path {} with a non-key step", iface::show(rest)) };
+            let HeapValue::ObjectTable(t) = h.load(cur) else { bail!("concrete: platform {k}'s {} is not a table", iface::show(rest)) };
+            let slot = *t.get(name.as_str()).ok_or_else(|| anyhow!("concrete: platform {k} has no {}", iface::show(rest)))?;
+            if j + 1 == rest.len() {
+                v = num(slot);
+            } else {
+                let HeapValue::Value(Cv::Pointer(next)) = h.load(slot) else { bail!("concrete: platform {k}'s {} is not a table", iface::show(rest)) };
+                cur = *next;
+            }
+        }
+        out.push(v.ok_or_else(|| anyhow!("concrete: platform {k}'s {} is not a number", iface::show(rest)))?);
+    }
+    let freeze = h.find_global("freeze").and_then(num).ok_or_else(|| anyhow!("concrete: no numeric `freeze`"))?;
+    Ok((out, freeze, alive))
 }
 
 enum Target {
@@ -282,6 +419,9 @@ struct NodeOut {
     succ: Vec<(usize, Option<(i16, i16, i16, i16)>)>,
     /// A successor box was clipped to `WINDOW`.
     clipped: bool,
+    /// A live outcome's `ok`, or an enumerated fork's arity, is not provably
+    /// true here: the node is UNMODELLED (`sound_d` seeds it d = 1).
+    unmodelled: bool,
 }
 
 /// A worker's accumulated observations and violations.
@@ -291,6 +431,24 @@ struct Acc {
     clipped: Vec<u64>,
     violations: Vec<String>,
     n_violations: usize,
+    /// The first unmodelled (configuration, outcome)s and how many.
+    unmodelled: Vec<String>,
+    n_unmodelled: usize,
+}
+
+impl Acc {
+    fn new(n_obs: usize, n_shapes: usize) -> Acc {
+        Acc { obs: vec![None; n_obs], clipped: vec![0; n_shapes], violations: Vec::new(), n_violations: 0, unmodelled: Vec::new(), n_unmodelled: 0 }
+    }
+
+    /// An unmodelled (configuration, outcome), with its message if among the
+    /// first twelve.
+    fn unmodel(&mut self, msg: impl FnOnce() -> String) {
+        self.n_unmodelled += 1;
+        if self.unmodelled.len() < 12 {
+            self.unmodelled.push(msg());
+        }
+    }
 }
 
 struct Table<'a> {
@@ -302,6 +460,8 @@ struct Table<'a> {
     by_key: HashMap<String, usize>,
     obs_keys: Vec<(usize, Path)>,
     obs_index: BTreeMap<(usize, Path), usize>,
+    /// Set after the spawn chain (`Phases`); `None` in a room without platforms.
+    phases: Option<Phases>,
 }
 
 impl<'a> Table<'a> {
@@ -334,6 +494,21 @@ impl<'a> Table<'a> {
         let key = self.shapes[id].key.clone();
         let st = self.lw.reps[&key].clone();
         let roots = super::shapes::state_paths(&st)?;
+        // The platforms' slots (`Phases`): read from the snapshots, bounded by
+        // their hull.
+        let pobjs = if self.phases.is_some() { phase_objects(&st) } else { Vec::new() };
+        let mut phase_of: BTreeMap<Path, usize> = BTreeMap::new();
+        let mut phase_hull: BTreeMap<Path, Range> = BTreeMap::new();
+        if let Some(ph) = &self.phases {
+            for p in &roots {
+                if let Some(kr) = phase_field(&pobjs, p) {
+                    if let Some(&i) = ph.index.get(&kr) {
+                        phase_of.insert(p.clone(), i);
+                        phase_hull.insert(p.clone(), ph.hull[i]);
+                    }
+                }
+            }
+        }
         let pins: BTreeMap<Path, Conc> = self.lw.lattice[&key]
             .iter()
             .filter(|(p, _)| roots.iter().any(|r| r == *p) && !self.shapes[id].demoted.contains(*p))
@@ -376,7 +551,7 @@ impl<'a> Table<'a> {
             if pins.contains_key(&p) {
                 continue;
             }
-            bounds.insert(p.clone(), self.shapes[id].ranges[&p]);
+            bounds.insert(p.clone(), phase_hull.get(&p).copied().unwrap_or(self.shapes[id].ranges[&p]));
             ival.push(p);
         }
         for p in super::shapes::ival_paths(&st, false, (false, false)).into_iter().chain(self.lw.ival_extra.get(&key).into_iter().flatten().cloned()) {
@@ -414,7 +589,7 @@ impl<'a> Table<'a> {
             .iter()
             .zip(&f.iface.init)
             .map(|(p, c)| {
-                if Some(p) == xp.as_ref() {
+                Ok(if Some(p) == xp.as_ref() {
                     Seed::X
                 } else if Some(p) == yp.as_ref() {
                     Seed::Y
@@ -422,12 +597,18 @@ impl<'a> Table<'a> {
                     Seed::Pin(*c)
                 } else {
                     match c {
-                        Conc::Num(_) => Seed::Range(p.clone()),
+                        Conc::Num(_) => match phase_of.get(p) {
+                            Some(&k) => Seed::Phase(k),
+                            None => {
+                                ensure!(phase_field(&pobjs, p).is_none(), "shape {id}: platform slot {} is not in the snapshots", iface::show(p));
+                                Seed::Range(p.clone())
+                            }
+                        },
                         Conc::Bool(_) => Seed::Unknown,
                     }
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         ensure!(located.is_none() || seeds.iter().filter(|s| matches!(s, Seed::X | Seed::Y)).count() == 2, "shape {id}: the located object's x/y are not input slots");
 
         // The outcomes and every root read from them.
@@ -481,6 +662,43 @@ impl<'a> Table<'a> {
             rs.extend(&r.fields);
         }
         let need = crate::transpile::bdd::reachable(arena, &rs);
+        // THE PHASE PREMISE (`Phases`): every outcome's platform fields read
+        // only the platforms' own slots and `freeze` - no player, button,
+        // other object or unknown - so a platform's state is a function of
+        // its unfrozen updates. A point split counts as what its conditions
+        // read.
+        if self.phases.is_some() {
+            let freeze: Path = vec![iface::key("freeze")];
+            let point: HashMap<u8, (NodeId, NodeId)> = f.point_splits.iter().map(|(k, t, fl)| (*k, (*t, *fl))).collect();
+            let mut safe = vec![false; arena.len()];
+            for i in 0..arena.len() {
+                if !need[i] {
+                    continue;
+                }
+                let nd = arena.get(i as NodeId);
+                safe[i] = match nd.op {
+                    Op::Cell(c) => f.iface.slots.get(c as usize).is_some_and(|p| *p == freeze || phase_field(&pobjs, p).is_some()),
+                    Op::Free(_) | Op::UnknownBool(_) | Op::UnknownNum => false,
+                    Op::SplitInt(k) if point.contains_key(&k) => {
+                        let (t, fl) = point[&k];
+                        safe[t as usize] && safe[fl as usize]
+                    }
+                    _ => nd.args.iter().all(|a| safe[*a as usize]),
+                };
+            }
+            for o in &f.outs {
+                if d.decide(&o.ok) == Some(false) || super::shapes::room_of(&o.st, d) != self.room0 {
+                    continue;
+                }
+                let tobjs = phase_objects(&o.st);
+                ensure!(tobjs.len() == pobjs.len(), "shape {id}: an outcome has {} platforms, the shape {}", tobjs.len(), pobjs.len());
+                for (p, n, _) in &o.fields {
+                    if phase_field(&tobjs, p).is_some() {
+                        ensure!(safe[*n as usize], "shape {id}: an outcome's {} reads more than the platforms and freeze: the phase premise fails", iface::show(p));
+                    }
+                }
+            }
+        }
         let mut cone = arena.like();
         cone.reset_forks();
         for k in 0..f.forks {
@@ -655,7 +873,49 @@ impl<'a> Table<'a> {
 
 /// One node's frame: evaluate every configuration over the shape's ranges at
 /// cell `xy`. Free of the `Table`, whose tracer is not `Sync`.
-fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut Acc) -> Result<NodeOut> {
+fn eval_node(shapes: &[Shape], room: &Room, phases: Option<&Phases>, id: usize, xy: (i16, i16), acc: &mut Acc) -> Result<NodeOut> {
+    let t = shapes[id].traced.as_ref().expect("a node's shape is traced before its layer");
+    let Some(ph) = phases.filter(|_| t.seeds.iter().any(|s| matches!(s, Seed::Phase(_)))) else {
+        return eval_at(shapes, room, id, xy, PhaseVals::None, acc);
+    };
+    // The platforms' hull first; where it breaks a premise, every snapshot.
+    let mut trial = Acc::new(acc.obs.len(), acc.clipped.len());
+    let out = eval_at(shapes, room, id, xy, PhaseVals::Hull(&ph.hull), &mut trial)?;
+    if trial.n_violations == 0 && !out.unmodelled {
+        for (slot, o) in trial.obs.into_iter().enumerate() {
+            if let Some(o) = o {
+                acc.obs[slot] = Some(match acc.obs[slot] {
+                    Some(p) => p.join(o)?,
+                    None => o,
+                });
+            }
+        }
+        for (c, k) in acc.clipped.iter_mut().zip(&trial.clipped) {
+            *c += k;
+        }
+        return Ok(out);
+    }
+    let mut all = NodeOut::default();
+    for s in &ph.snaps {
+        let o = eval_at(shapes, room, id, xy, PhaseVals::Snap(s), acc)?;
+        all.succ.extend(o.succ);
+        all.clipped |= o.clipped;
+        all.unmodelled |= o.unmodelled;
+    }
+    all.succ.sort_unstable();
+    all.succ.dedup();
+    Ok(all)
+}
+
+/// What a `Seed::Phase` evaluates to.
+#[derive(Clone, Copy)]
+enum PhaseVals<'a> {
+    None,
+    Hull(&'a [Range]),
+    Snap(&'a [i64]),
+}
+
+fn eval_at(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), pv: PhaseVals, acc: &mut Acc) -> Result<NodeOut> {
     let sh = &shapes[id];
     let t = sh.traced.as_ref().expect("a node's shape is traced before its layer");
     let exact = |v: i64| Val::Num(Pico8NumInterval::new(P8::from_raw(v as i32), P8::from_raw(v as i32)));
@@ -671,6 +931,11 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
                 Val::Num(Pico8NumInterval::new(P8::from_raw(r.0 as i32), P8::from_raw(r.1 as i32)))
             }
             Seed::Unknown => Val::Bool(None),
+            Seed::Phase(k) => match pv {
+                PhaseVals::Hull(h) => Val::Num(Pico8NumInterval::new(P8::from_raw(h[*k].0 as i32), P8::from_raw(h[*k].1 as i32))),
+                PhaseVals::Snap(s) => exact(s[*k]),
+                PhaseVals::None => bail!("shape {id}: a platform slot without the snapshots"),
+            },
         };
         cells.insert(i as u32, v);
     }
@@ -699,8 +964,8 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
             if let Val::Num(i) = vals[n as usize] {
                 let floors = (raw(i.high) >> 16) - (raw(i.low) >> 16) + 1;
                 if floors > ways as i64 {
-                    let what = if acc.violations.len() < 12 { super::emit::show_tree(&t.graph, n, 3) } else { String::new() };
-                    violation(acc, format!("shape {id} cell {xy:?} configuration {ci}: a fork operand spans {floors} floors, arity {ways}: {what}"));
+                    out.unmodelled = true;
+                    acc.unmodel(|| format!("shape {id} cell {xy:?} configuration {ci}: a fork operand spans {floors} floors, arity {ways}: {}", super::emit::show_tree(&t.graph, n, 3)));
                 }
             }
         }
@@ -709,8 +974,8 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
                 continue;
             }
             if vals[r.ok as usize] != Val::Bool(Some(true)) {
-                let why = if acc.violations.len() < 12 { culprit(&t.graph, &vals, r.ok, &t.seeds) } else { String::new() };
-                violation(acc, format!("shape {id} cell {xy:?} configuration {ci} outcome {oi}: a live outcome's ok is {:?}: {why}", vals[r.ok as usize]));
+                out.unmodelled = true;
+                acc.unmodel(|| format!("shape {id} cell {xy:?} configuration {ci} outcome {oi}: a live outcome's ok is {:?}: {}", vals[r.ok as usize], culprit(&t.graph, &vals, r.ok, &t.seeds)));
             }
             for (slot, n) in spec.fields.iter().zip(&r.fields) {
                 let o = Obs::of(vals[*n as usize]);
@@ -775,6 +1040,7 @@ fn cell_names(seeds: &[Seed], g: &Graph, vals: &[Val], n: NodeId) -> String {
         Some(Seed::Y) => "located y".into(),
         Some(Seed::Pin(c)) => format!("pinned {c:?}"),
         Some(Seed::Unknown) => "an unknown boolean".into(),
+        Some(Seed::Phase(k)) => format!("platform field {k} (the snapshots)"),
         None => format!("button {}", n - seeds.len()),
     };
     if named.is_empty() {
@@ -796,9 +1062,10 @@ fn culprit(g: &Graph, vals: &[Val], mut n: NodeId, seeds: &[Seed]) -> String {
                     continue;
                 }
             }
-            // An undecided disjunction: down its undecided disjunct.
+            // A disjunction that is not true: down its LAST disjunct that is
+            // not (the first is often an escape like `freeze > 0`).
             Op::Or => {
-                if let Some(a) = nd.args.iter().find(|a| vals[**a as usize] == Val::Bool(None)) {
+                if let Some(a) = nd.args.iter().rev().find(|a| not_true(a)) {
                     n = *a;
                     continue;
                 }
@@ -832,6 +1099,8 @@ struct Graph1 {
     deaths: Vec<bool>,
     /// A successor clipped to `WINDOW`.
     clipped: Vec<bool>,
+    /// Not provably modelled (`NodeOut::unmodelled`).
+    unmodelled: Vec<bool>,
 }
 
 /// What `build` hands on: per block shape hash its table shape, the converged
@@ -866,7 +1135,8 @@ fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32) -> Ve
         let mut dist = vec![u32::MAX; n];
         let mut heap = std::collections::BinaryHeap::new();
         for i in 0..n {
-            let mut s = if g.exits[i] { 1 } else { u32::MAX };
+            // An unmodelled node gets the weakest bound: one frame.
+            let mut s = if g.exits[i] || g.unmodelled[i] { 1 } else { u32::MAX };
             if let (true, Some(w)) = (g.deaths[i], death) {
                 s = s.min(w.saturating_add(1));
             }
@@ -934,9 +1204,9 @@ impl CostToGo {
 
 /// Build the level -1 table of the configured start room at player speed bound
 /// `spd_px` (its report goes to stderr as it is built).
-pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo> {
+pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize, max_frame: u32) -> Result<CostToGo> {
     let mut rep = String::new();
-    let b = build(root, spd_px, threads, &mut rep)?;
+    let b = build(root, spd_px, threads, max_frame, &mut rep)?;
     let mut d = HashMap::new();
     for (&h, &id) in &b.by_hash {
         for (i, &(sid, x, y)) in b.g1.nodes.iter().enumerate() {
@@ -950,7 +1220,9 @@ pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo
 
 /// The table: the lattice walk, the spawn chain, the passes to inductive ranges,
 /// and d.
-fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result<Built> {
+/// `max_frame` is the latest frame a row the table judges can be at (the
+/// search's largest horizon): the platforms' snapshots run to it.
+fn build(root: &FsPath, spd_px: i32, threads: usize, max_frame: u32, rep: &mut String) -> Result<Built> {
     let t_all = std::time::Instant::now();
     let room0 = celeste_interp::game_runner::start_room();
     let lw = super::kernel::room_constant_lattice(root, super::shapes::WalkOpts::LEVEL0.with_held(true))?;
@@ -965,6 +1237,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         by_key: HashMap::new(),
         obs_keys: Vec::new(),
         obs_index: BTreeMap::new(),
+        phases: None,
     };
     let start_id = table.shape_id(&lw.start_key)?;
     let start_xy = {
@@ -994,10 +1267,17 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         ensure!(chain.len() <= 256, "the spawn prefix did not reach a player in 256 frames");
         table.shapes[id].traced = None;
         table.trace(&mut tr, id)?;
-        let mut acc = Acc { obs: vec![None; table.obs_keys.len()], clipped: vec![0; table.shapes.len()], violations: Vec::new(), n_violations: 0 };
-        let out = eval_node(&table.shapes, &table.room, id, xy, &mut acc)?;
+        let mut acc = Acc::new(table.obs_keys.len(), table.shapes.len());
+        let out = eval_node(&table.shapes, &table.room, None, id, xy, &mut acc)?;
         let f = chain.len() - 1;
-        ensure!(acc.n_violations == 0 && acc.clipped.iter().all(|c| *c == 0), "the spawn prefix at frame {f} {xy:?}: {:?} (clipped {:?})", acc.violations, acc.clipped);
+        // The chain is exact: nothing in it may be unmodelled.
+        ensure!(
+            acc.n_violations == 0 && !out.unmodelled && acc.clipped.iter().all(|c| *c == 0),
+            "the spawn prefix at frame {f} {xy:?}: {:?} {:?} (clipped {:?})",
+            acc.violations,
+            acc.unmodelled,
+            acc.clipped
+        );
         let succ: BTreeSet<(usize, Option<(i16, i16, i16, i16)>)> = out.succ.into_iter().collect();
         ensure!(succ.len() == 1, "the spawn prefix at frame {f} {xy:?}: {} successors {succ:?}, not one", succ.len());
         let (tid, bx) = succ.into_iter().next().expect("one successor");
@@ -1029,6 +1309,14 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         table.shapes[tid].ranges = ranges;
     };
     say!(rep, "spawn prefix: {} frames, {:?} -> shape {end_id} at {end_xy:?}, {:.1} s", chain.len() - 1, chain.iter().map(|c| c.1).collect::<Vec<_>>(), t_chain.elapsed().as_secs_f64())?;
+    // The platforms' snapshots (`Phases`), for every shape traced from here.
+    table.phases = phases(&lw, max_frame)?;
+    if let Some(ph) = &table.phases {
+        say!(rep, "phases: {} platform fields, {} distinct snapshots P(u), u <= {max_frame}", ph.fields.len(), ph.snaps.len())?;
+        for s in &mut table.shapes {
+            s.traced = None;
+        }
+    }
 
     let mut pass = 0usize;
     // How often each range has grown (`widen`).
@@ -1038,10 +1326,12 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         ensure!(pass <= 16, "the level -1 ranges did not converge in 16 passes");
         let t_pass = std::time::Instant::now();
         let mut t_trace = std::time::Duration::ZERO;
-        let mut g = Graph1 { nodes: Vec::new(), index: HashMap::new(), edges: Vec::new(), exits: Vec::new(), deaths: Vec::new(), clipped: Vec::new() };
+        let mut g = Graph1 { nodes: Vec::new(), index: HashMap::new(), edges: Vec::new(), exits: Vec::new(), deaths: Vec::new(), clipped: Vec::new(), unmodelled: Vec::new() };
         let mut obs: Vec<Option<Obs>> = Vec::new();
         let mut violations: Vec<String> = Vec::new();
         let mut n_violations = 0usize;
+        let mut unmodelled: Vec<String> = Vec::new();
+        let mut n_unmodelled = 0usize;
         let mut clipped: Vec<u64> = Vec::new();
         let add = |g: &mut Graph1, k: (usize, i16, i16)| -> (u32, bool) {
             if let Some(&i) = g.index.get(&k) {
@@ -1054,6 +1344,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
             g.exits.push(false);
             g.deaths.push(false);
             g.clipped.push(false);
+            g.unmodelled.push(false);
             (i, true)
         };
         let mut frontier: Vec<u32> = vec![add(&mut g, (end_id, end_xy.0, end_xy.1)).0];
@@ -1075,19 +1366,19 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
             clipped.resize(n_shapes, 0);
             obs.resize(n_obs, None);
             let next = std::sync::atomic::AtomicUsize::new(0);
-            let (sref, rref, fref, gref) = (&table.shapes, &table.room, &frontier, &g);
+            let (sref, rref, fref, gref, pref) = (&table.shapes, &table.room, &frontier, &g, table.phases.as_ref());
             let results: Vec<Result<(Vec<(u32, NodeOut)>, Acc)>> = std::thread::scope(|scope| {
                 let hs: Vec<_> = (0..threads)
                     .map(|_| {
                         let next = &next;
                         scope.spawn(move || -> Result<(Vec<(u32, NodeOut)>, Acc)> {
-                            let mut acc = Acc { obs: vec![None; n_obs], clipped: vec![0; n_shapes], violations: Vec::new(), n_violations: 0 };
+                            let mut acc = Acc::new(n_obs, n_shapes);
                             let mut done = Vec::new();
                             loop {
                                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let Some(&n) = fref.get(i) else { break };
                                 let (id, x, y) = gref.nodes[n as usize];
-                                done.push((n, eval_node(sref, rref, id, (x, y), &mut acc)?));
+                                done.push((n, eval_node(sref, rref, pref, id, (x, y), &mut acc)?));
                             }
                             Ok((done, acc))
                         })
@@ -1111,10 +1402,15 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
                     *c += k;
                 }
                 violations.extend(acc.violations);
+                n_unmodelled += acc.n_unmodelled;
+                unmodelled.extend(acc.unmodelled);
                 for (n, out) in done {
                     let mut es: BTreeSet<u32> = BTreeSet::new();
                     if out.clipped {
                         g.clipped[n as usize] = true;
+                    }
+                    if out.unmodelled {
+                        g.unmodelled[n as usize] = true;
                     }
                     for (tid, bx) in out.succ {
                         if tid == usize::MAX {
@@ -1157,6 +1453,23 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         }
         for v in violations.iter().take(12) {
             say!(rep, "  VIOLATION {v}")?;
+        }
+        let um: Vec<(usize, i16, i16)> = g.nodes.iter().zip(&g.unmodelled).filter(|(_, u)| **u).map(|(n, _)| *n).collect();
+        if !um.is_empty() {
+            let (xs, ys): (Vec<i16>, Vec<i16>) = um.iter().map(|n| (n.1, n.2)).unzip();
+            say!(
+                rep,
+                "  {} unmodelled nodes (d = 1; {n_unmodelled} outcomes), x in [{}, {}], y in [{}, {}], {} of them at x < -1 or x > 121",
+                um.len(),
+                xs.iter().min().unwrap_or(&0),
+                xs.iter().max().unwrap_or(&0),
+                ys.iter().min().unwrap_or(&0),
+                ys.iter().max().unwrap_or(&0),
+                xs.iter().filter(|x| **x < -1 || **x > 121).count()
+            )?;
+            for v in unmodelled.iter().take(6) {
+                say!(rep, "  UNMODELLED {v}")?;
+            }
         }
 
         // The inductive check.
@@ -1304,7 +1617,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
 pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
     let mut rep = String::new();
     let t_all = std::time::Instant::now();
-    let Built { by_hash, g1, sound, chain, .. } = build(root, opts.spd_px, opts.threads, &mut rep)?;
+    let Built { by_hash, g1, sound, chain, .. } = build(root, opts.spd_px, opts.threads, opts.to.max(opts.ceiling), &mut rep)?;
 
     // The d map: per 8 px tile, the smallest sound d of any table node in it
     // (0-9, then a-z for 10-35, '+' above, '*' no exit path, '.' no node).

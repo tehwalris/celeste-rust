@@ -1313,7 +1313,11 @@ fn band() -> Option<(u32, i32)> {
 /// are inductive, a clipped successor counts as a possible exit and a death as
 /// a respawn. H must be the LARGEST horizon the run tests - level 0 persists
 /// across horizons - so this is for a `--ceiling` search with H = the ceiling.
-/// Built once, at the first flush, on a thread with the tracer's stack.
+/// Built once, on a thread with the tracer's stack, EAGERLY at the start of
+/// `find_optimum` / `find_optimum_from_ceiling`, before any wave: a room
+/// with platforms runs the reference engine for their snapshots, which sets
+/// the process-global level for the duration (`level_minus_one::phases`),
+/// and no kernel dispatch may see that.
 fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::CostToGo)> {
     static TABLE: std::sync::OnceLock<Option<(u32, crate::trace::level_minus_one::CostToGo)>> = std::sync::OnceLock::new();
     TABLE
@@ -1327,7 +1331,7 @@ fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::Cos
             let t = std::time::Instant::now();
             let table = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
-                .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new(&root), sp, threads))
+                .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new(&root), sp, threads, h))
                 .expect("spawn the level -1 builder")
                 .join()
                 .expect("the level -1 builder panicked")
@@ -2793,6 +2797,8 @@ pub fn find_optimum(
     max_horizon: u32,
     precisions: &[crate::interpreter::abstraction::Level],
 ) -> Result<Option<u32>> {
+    // The level -1 table before any wave (`level_minus_one`).
+    let _ = level_minus_one();
     let mut ladder = Ladder::new(make_engine, make_initial, base_dir, precisions);
     let mut horizon = first_win.max(1);
     // Level 0 first: extend until it wins, one frame at a time past
@@ -2830,6 +2836,8 @@ pub fn find_optimum_from_ceiling(
     ceiling: u32,
     precisions: &[crate::interpreter::abstraction::Level],
 ) -> Result<u32> {
+    // The level -1 table before any wave (`level_minus_one`).
+    let _ = level_minus_one();
     let mut ladder = Ladder::new(make_engine, make_initial, base_dir, precisions);
     // Horizons only go down from here: level 0 is complete at the ceiling.
     ladder.drop_level0 = true;
