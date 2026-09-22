@@ -173,6 +173,51 @@ outcome per button rep, against 224 over 14 reps for a level-0 kernel today.
 The plan's "a fork per platform the region can reach (2-3)" was off by an
 order of magnitude.
 
+## Measured (2026-09-22, evening): the bodies are mostly duplicates
+
+A body is one answer per fork; the kernel builder enumerated the full
+product of the forks an outcome reads, then fused the candidates that write
+the same row (`specialize_frame` step 4: `live` the OR, `ok` guarded). A
+probe (`CELESTE_DEAD_PROBE`, uncommitted) counted, per outcome of room (6,0)
+at `r0sxhp`, what a TREE build needs against that product:
+
+- Dead combinations exist (wrapped AND the player on the platform) and fold
+  away once the ranges are used, but they are not the bulk.
+- The bulk is forks whose answer does not change the ROW: read only by
+  `ok`, the guard or another fork's validity, or read by the row but not
+  changing it once other forks are fixed. Per outcome the product ran to
+  2^8..2^50 while the DISTINCT rows were 1-16.
+- Splitting only on forks the row reads: 52 forks -> 2 bodies, 8 -> 32 (10
+  rows), 9 -> 128 (14 rows); the carry kernels (the row reads 32-44 forks)
+  stay large (480+ leaves for 16 rows).
+
+## Built (2026-09-22): the bodies as a tree over the forks
+
+`specialize_frame` builds each (outcome, button rep)'s bodies as a tree
+(`lower::tree`): the forks fixed so far in `cfg`, the rest `graph::OPEN`; a
+node whose `live` folds false has no body; otherwise it splits on the highest
+open fork the row still reads (the product's order when every fork is read,
+so rooms without open forks build the same arena); where the row reads no
+open fork, the configurations below are ONE body, with the forks `ok`/`live`
+read quantified out by the fusion rule (`lower::quantify`, one fork at a time
+through `Graph::resolve_fork`). Exact: the same rows, `live` and `ok` as the
+product fused. The 64-bit fork masks (`ChoiceSet`, the 58-fork limit) are
+gone: an outcome's forks are its reachable `Split*` nodes, a fork id is a
+`u8` below `OPEN`.
+
+Gates (ckhash, posgraph, marks) identical, room (5,0) `r0sxhb` kept counts
+f40-f51 identical, suite 126/126.
+
+Room (6,0) at `r0sxhp`: the walk takes 65 s, then kernels build but slowly -
+up to 3,528 bodies per outcome (of 196,608 configurations), 37 s to
+specialize one kernel; 82 outcomes in 20 minutes, not finished. The tree
+prunes only where `live` folds false WITHOUT the static ranges, so the
+combinations the ranges kill (a wrapped platform the player cannot reach)
+survive, and splitting the highest fork first reaches the carry's forks
+before the wrap that makes them dead. Next: range-aware pruning with forced
+answers (a fork whose other answer is dead is fixed, not split) - what the
+probe did.
+
 ## Options considered before (for the record)
 
 1. A fork whose answers agree is no fork: where two configurations give an

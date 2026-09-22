@@ -75,80 +75,14 @@ impl Val {
 
 pub type NodeId = u32;
 
-/// A SPECIALIZATION POINT: something the program could not keep symbolic,
-/// so the whole downstream graph is rebuilt once per possible outcome.
-///
-/// The two kinds are one MECHANISM and two SEMANTICS, and the difference
-/// is exactly why `Split` carries a validity mask and `Free` does not:
-///
-/// * `Free` - a symbolic boolean input, one of the six buttons. Every
-///   outcome is live for every lane; the search enumerates them, and the
-///   frame genuinely has 2^6 successors.
-/// * `Split` - a value the abstract domain could not represent, so the
-///   program enumerates the cases. The outcomes PARTITION the lanes, and
-///   one can be empty.
-///
-/// Both are eliminated by `specialize_into`, and neither survives into
-/// emitted code as a value: a `Free` becomes a constant, a `Split`
-/// becomes a concrete narrowing.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Choice {
-    Free(u8),
-    Split(u8),
-}
+/// A fork left unresolved in a partial configuration (`specialize_subset_into`).
+pub const OPEN: u8 = u8::MAX;
 
-/// A set of choices, as a bitmask. Frees occupy the low 6 bits (one per
-/// button), splits the rest.
-///
-/// `u64`, not `u16`. Room (1,0) forks at most a handful of times and 10
-/// split bits looked like plenty; room (2,0) has a fruit and two
-/// springs and forks SIXTEEN times, and `1u16 << (6 + 15)` does not
-///error - Rust masks the shift amount in release, so
-/// `Split(15).bit()` came back as bit 5, which is a BUTTON. The cones
-/// were then silently wrong and the emitter placed fork-dependent nodes
-/// in the shared prologue, where they referred to loop variables that
-/// did not exist yet. 48 undefined names in a million lines of
-/// generated Rust, and nothing upstream complained.
-///
-/// 58 splits is not obviously enough either, which is what `bit`'s
-/// assertion below is for: the next room that needs more gets a panic
-/// naming the limit rather than a corrupt mask.
-pub type ChoiceSet = u64;
-pub const N_FREE: u8 = 6;
-/// Split choices representable in a `ChoiceSet`.
-pub const N_SPLIT: u8 = (ChoiceSet::BITS as u8) - N_FREE;
-
-impl Choice {
-    pub fn bit(self) -> ChoiceSet {
-        let i = match self {
-            Choice::Free(b) => {
-                assert!(b < N_FREE, "free choice {} but only {} buttons", b, N_FREE);
-                b
-            }
-            Choice::Split(d) => {
-                // The one that actually fired. See the type's note.
-                assert!(
-                    d < N_SPLIT,
-                    "fork {} but a ChoiceSet holds only {} - widen ChoiceSet",
-                    d,
-                    N_SPLIT
-                );
-                N_FREE + d
-            }
-        };
-        1 << i
-    }
-    pub fn all_in(set: ChoiceSet) -> Vec<Choice> {
-        (0..ChoiceSet::BITS as u8)
-            .filter(|i| set & (1 << i) != 0)
-            .map(|i| {
-                if i < N_FREE {
-                    Choice::Free(i)
-                } else {
-                    Choice::Split(i - N_FREE)
-                }
-            })
-            .collect()
+/// The fork a `Split*` op belongs to.
+pub fn fork_of(op: &Op) -> Option<u8> {
+    match *op {
+        Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) | Op::SplitKeyTab(d) | Op::SplitOkTab(d) => Some(d),
+        _ => None,
     }
 }
 
@@ -533,52 +467,6 @@ impl Graph {
         self.nodes.is_empty()
     }
 
-    /// For every node, which CHOICES can influence it - one bitmask,
-    /// computed bottom-up in one pass (operands always precede their
-    /// node). This used to be two functions over two vocabularies; it is
-    /// one reachability question, and answering it once is what lets
-    /// placement stop distinguishing "the button suffix" from "the fork
-    /// loop nest".
-    ///
-    /// A choice that reaches no OUTPUT cannot affect any lane's result, so
-    /// its outcomes collapse - a plain reachability fact, decided once for
-    /// the whole kernel rather than per lane.
-    pub fn choice_cones(&self) -> Vec<ChoiceSet> {
-        let mut mask = vec![0 as ChoiceSet; self.nodes.len()];
-        for (i, node) in self.nodes.iter().enumerate() {
-            let mut m = match node.op {
-                Op::Free(b) => Choice::Free(b).bit(),
-                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) | Op::SplitKeyTab(d) | Op::SplitOkTab(d) => {
-                    Choice::Split(d).bit()
-                }
-                _ => 0,
-            };
-            for a in &node.args {
-                m |= mask[*a as usize];
-            }
-            mask[i] = m;
-        }
-        mask
-    }
-
-    /// The cone restricted to FREE choices - the buttons, which every lane
-    /// enumerates. Splits are excluded because their outcomes partition
-    /// lanes rather than multiplying them, so the two answer different
-    /// questions at an emit site even though one pass computes both.
-    pub fn free_cones(&self) -> Vec<u8> {
-        self.choice_cones().iter().map(|m| (*m & 0x3f) as u8).collect()
-    }
-
-    /// The cone restricted to SPLIT choices.
-    ///
-    /// As wide as `ChoiceSet`, not `u8`. This used to truncate, which
-    /// was a second copy of the same bug the type's note describes:
-    /// even with a wide enough mask, `as u8` threw away every fork past
-    /// the eighth.
-    pub fn split_cones(&self) -> Vec<ChoiceSet> {
-        self.choice_cones().iter().map(|m| *m >> N_FREE).collect()
-    }
-
     /// Rebuild this graph into `out` with the button bits replaced by
     /// constants, folding as it goes. Returns the mapping old -> new.
     ///
@@ -660,82 +548,89 @@ impl Graph {
                 }
             }
             let arg = |map: &Vec<NodeId>, k: usize| map[node.args[k] as usize];
-            let id = match (node.op.clone(), splits) {
-                (Op::Free(b), _) => out.leaf(Op::ConstBool(frees & (1 << b) != 0)),
-                // `d` indexes a fork, and `splits` is TWO bits per fork
-                // (the fragment index, arity up to 4). It is a `u64`
-                // rather than a `u8` because room (2,0) forks 14 times
-                // and `(s >> 13) & 1` on a `u8` is always 0 - which
-                // would have silently measured 16,384 configurations
-                // as 256 distinct ones and reported the collapse as
-                // sharing. Fourth member of the shift-overflow family;
-                // see `ChoiceSet`.
-                (Op::Split(d), Some(s)) => out.fold(Op::Frag(s[d as usize]), vec![arg(&map, 0)]),
-                (Op::SplitValid(d), Some(s)) => out.fold(Op::FragOk(s[d as usize]), vec![arg(&map, 0)]),
-                (Op::SplitInt(d), Some(s)) => out.fold(Op::IntFrag(s[d as usize]), vec![arg(&map, 0)]),
-                // The relative table fork (see `Op::SplitTab`): per-lane
-                // select chains on `Lo(v)` over the entries.
-                (Op::SplitTab(d), Some(s)) | (Op::SplitValidTab(d), Some(s)) | (Op::SplitKeyTab(d), Some(s)) | (Op::SplitOkTab(d), Some(s)) => {
-                    let c = s[d as usize] as usize;
-                    let (arity, table) = match tabs.and_then(|t| t.get(d as usize)).filter(|t| !t.1.is_empty()) {
-                        Some((k, t)) => (*k as usize, t.as_slice()),
-                        None => (self.fork_ways(d) as usize, self.fork_table(d)),
-                    };
-                    assert!(!table.is_empty() && c < arity, "table fork {d}: configuration {c} of arity {arity} over {} entries", table.len());
-                    let v = arg(&map, 0);
-                    let vlo = out.fold(Op::Lo, vec![v]);
-                    let vhi = out.fold(Op::Hi, vec![v]);
-                    let lo_of = |out: &mut Graph, c: usize| table_chain(out, table, vlo, |j| rel_entry(table, j, c).map_or(i32::MAX, |e| e.0), i32::MAX);
-                    let hi_of = |out: &mut Graph, c: usize| table_chain(out, table, vlo, |j| rel_entry(table, j, c).map_or(i32::MIN, |e| e.1), i32::MIN);
-                    match node.op {
-                        Op::SplitTab(_) => {
-                            let (l, h) = (lo_of(out, c), hi_of(out, c));
-                            let a = out.fold(Op::Max, vec![vlo, l]);
-                            let b = out.fold(Op::Min, vec![vhi, h]);
-                            out.fold(Op::Span, vec![a, b])
-                        }
-                        Op::SplitKeyTab(_) => {
-                            let (l, h) = (lo_of(out, c), hi_of(out, c));
-                            out.fold(Op::Span, vec![l, h])
-                        }
-                        // Fragment 0 holds the low end iff its entry does (a
-                        // low end in a gap has none); fragment c > 0 is reached
-                        // iff the high end is at or past its entry.
-                        Op::SplitValidTab(_) if c == 0 => {
-                            let h = hi_of(out, 0);
-                            out.fold(Op::Le, vec![vlo, h])
-                        }
-                        Op::SplitValidTab(_) => {
-                            let l = lo_of(out, c);
-                            out.fold(Op::Ge, vec![vhi, l])
-                        }
-                        // The lane is covered: its low end in an entry, its
-                        // high end within the contiguous run of `arity`
-                        // entries from there.
-                        _ => {
-                            let h0 = hi_of(out, 0);
-                            let reach = table_chain(
-                                out,
-                                table,
-                                vlo,
-                                |j| (0..arity).rev().find_map(|m| rel_entry(table, j, m)).map_or(i32::MIN, |e| e.1),
-                                i32::MIN,
-                            );
-                            let a = out.fold(Op::Le, vec![vlo, h0]);
-                            let b = out.fold(Op::Le, vec![vhi, reach]);
-                            out.fold(Op::And, vec![a, b])
-                        }
+            let id = match node.op {
+                Op::Free(b) => out.leaf(Op::ConstBool(frees & (1 << b) != 0)),
+                // A fork resolved to its fragment (`resolve_fork`); an
+                // `OPEN` one is left standing.
+                ref op => match (fork_of(op), splits) {
+                    (Some(d), Some(s)) if s[d as usize] != OPEN => out.resolve_fork(op, arg(&map, 0), s[d as usize], tabs),
+                    _ => {
+                        let args: Vec<NodeId> = node.args.iter().map(|a| map[*a as usize]).collect();
+                        out.fold(node.op.clone(), args)
                     }
-                }
-                _ => {
-                    let args: Vec<NodeId> =
-                        node.args.iter().map(|a| map[*a as usize]).collect();
-                    out.fold(node.op.clone(), args)
-                }
+                },
             };
             map.push(id);
         }
         map
+    }
+
+    /// Fork node `op` (a `Split*` op, its operand already `v` in `self`)
+    /// resolved to fragment `c`: `Frag`/`FragOk`/`IntFrag` ordinary unary
+    /// ops, a table fork's per-lane select chains. `tabs`, per fork,
+    /// overrides a table fork's arity and entries (an empty list keeps the
+    /// fork's). What `specialize_subset_into` does per fork node, and what
+    /// resolving one OPEN fork inside an arena needs (`lower::quantify`).
+    pub(crate) fn resolve_fork(&mut self, op: &Op, v: NodeId, c: u8, tabs: Option<&[(u8, Vec<(i32, i32)>)]>) -> NodeId {
+        match *op {
+            Op::Split(_) => self.fold(Op::Frag(c), vec![v]),
+            Op::SplitValid(_) => self.fold(Op::FragOk(c), vec![v]),
+            Op::SplitInt(_) => self.fold(Op::IntFrag(c), vec![v]),
+            Op::SplitTab(d) | Op::SplitValidTab(d) | Op::SplitKeyTab(d) | Op::SplitOkTab(d) => {
+                let c = c as usize;
+                let (arity, table): (usize, Vec<(i32, i32)>) = match tabs.and_then(|t| t.get(d as usize)).filter(|t| !t.1.is_empty()) {
+                    Some((k, t)) => (*k as usize, t.clone()),
+                    None => (self.fork_ways(d) as usize, self.fork_table(d).to_vec()),
+                };
+                let table = table.as_slice();
+                let out = self;
+                assert!(!table.is_empty() && c < arity, "table fork {d}: configuration {c} of arity {arity} over {} entries", table.len());
+                let vlo = out.fold(Op::Lo, vec![v]);
+                let vhi = out.fold(Op::Hi, vec![v]);
+                let lo_of = |out: &mut Graph, c: usize| table_chain(out, table, vlo, |j| rel_entry(table, j, c).map_or(i32::MAX, |e| e.0), i32::MAX);
+                let hi_of = |out: &mut Graph, c: usize| table_chain(out, table, vlo, |j| rel_entry(table, j, c).map_or(i32::MIN, |e| e.1), i32::MIN);
+                match *op {
+                    Op::SplitTab(_) => {
+                        let (l, h) = (lo_of(out, c), hi_of(out, c));
+                        let a = out.fold(Op::Max, vec![vlo, l]);
+                        let b = out.fold(Op::Min, vec![vhi, h]);
+                        out.fold(Op::Span, vec![a, b])
+                    }
+                    Op::SplitKeyTab(_) => {
+                        let (l, h) = (lo_of(out, c), hi_of(out, c));
+                        out.fold(Op::Span, vec![l, h])
+                    }
+                    // Fragment 0 holds the low end iff its entry does (a
+                    // low end in a gap has none); fragment c > 0 is reached
+                    // iff the high end is at or past its entry.
+                    Op::SplitValidTab(_) if c == 0 => {
+                        let h = hi_of(out, 0);
+                        out.fold(Op::Le, vec![vlo, h])
+                    }
+                    Op::SplitValidTab(_) => {
+                        let l = lo_of(out, c);
+                        out.fold(Op::Ge, vec![vhi, l])
+                    }
+                    // The lane is covered: its low end in an entry, its
+                    // high end within the contiguous run of `arity`
+                    // entries from there.
+                    _ => {
+                        let h0 = hi_of(out, 0);
+                        let reach = table_chain(
+                            out,
+                            table,
+                            vlo,
+                            |j| (0..arity).rev().find_map(|m| rel_entry(table, j, m)).map_or(i32::MIN, |e| e.1),
+                            i32::MIN,
+                        );
+                        let a = out.fold(Op::Le, vec![vlo, h0]);
+                        let b = out.fold(Op::Le, vec![vhi, reach]);
+                        out.fold(Op::And, vec![a, b])
+                    }
+                }
+            }
+            _ => unreachable!("resolve_fork of {op:?}, not a fork"),
+        }
     }
 
     /// Is operand order meaningless for this op? Structural interning is
@@ -1959,29 +1854,6 @@ mod tests {
         // And a decided condition still picks its arm.
         let t = g.leaf(Op::ConstBool(true));
         assert_eq!(g.fold(Op::Sel, vec![t, x, y]), x);
-    }
-
-    #[test]
-    fn one_cone_pass_answers_for_both_kinds_of_choice() {
-        // Free choices and splits used to need two reachability passes over
-        // two vocabularies. They are one question - "which specialization
-        // points reach this node" - and the answer must stay separable,
-        // because the two are emitted differently: frees multiply the
-        // variants, splits partition the lanes.
-        let mut g = Graph::new();
-        let c = g.leaf(Op::Cell(1));
-        let kb = g.leaf(Op::Free(3));
-        let iv = g.add(Op::Split(1), vec![c]);
-        let both = g.add(Op::Sel, vec![kb, iv, c]);
-        let cones = g.choice_cones();
-        assert_eq!(
-            Choice::all_in(cones[both as usize]),
-            vec![Choice::Free(3), Choice::Split(1)]
-        );
-        assert_eq!(g.free_cones()[both as usize], 1 << 3);
-        assert_eq!(g.split_cones()[both as usize], 1 << 1);
-        // A node under neither is under neither.
-        assert_eq!(cones[c as usize], 0);
     }
 
     #[test]

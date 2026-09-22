@@ -1644,8 +1644,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     fn fork_escaped_atoms(&mut self, mut s: State<D>, v: Value<D>, since: u32) -> (State<D>, Value<D>) {
         // Only what the caller can still reach: the callee's frame is garbage,
         // and a fork for an atom in it spends a fork id on nothing (room (3,0)
-        // with the fruit and the floors unknown: 63 forks, a `ChoiceSet` holds
-        // 58).
+        // with the fruit and the floors unknown: 63 forks).
         let mut roots = s.roots();
         super::heap::push_value(&v, &mut roots);
         let (tables, scopes, _) = s.heap.reachable(&roots);

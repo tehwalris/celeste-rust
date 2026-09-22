@@ -105,16 +105,6 @@ pub(crate) fn specialize_frame(
 ) -> (Graph, Vec<SpecializedBody>) {
     let trace = std::env::var_os("CELESTE_BUILD_TRACE").is_some();
     let t0 = std::time::Instant::now();
-    // --- 1. which forks each outcome actually depends on ---
-    let cones = graph.split_cones();
-    let bits_of = |fields: &[NodeId], ok: NodeId, live: NodeId, keys: &[NodeId]| -> Vec<u8> {
-        let mut m = cones[ok as usize] | cones[live as usize];
-        for &f in fields.iter().chain(keys) {
-            m |= cones[f as usize];
-        }
-        (0..forks).filter(|d| m & (1u64 << d) != 0).collect()
-    };
-
     // --- 2. specialize, per outcome, over (button, its own forks) ---
     let mut sp = graph.like();
     // (outcome, button, fork configuration, roots) where roots is the
@@ -141,7 +131,25 @@ pub(crate) fn specialize_frame(
         // whole arena once per (button, configuration) is most of the
         // work and none of the answer.
         let need = reachable(graph, &want);
-        let bits = bits_of(fields, *ok, *live, keys);
+        // --- 1. which forks this outcome actually depends on ---
+        let bits: Vec<u8> = {
+            let mut s = std::collections::BTreeSet::new();
+            for (i, n) in need.iter().enumerate() {
+                if *n {
+                    if let Some(d) = crate::transpile::graph::fork_of(&graph.get(i as NodeId).op) {
+                        s.insert(d);
+                    }
+                }
+            }
+            s.into_iter().collect()
+        };
+        // The row (fields and keys) and `live`: what the tree's internal
+        // nodes specialize to decide which open forks to split on.
+        let nf = fields.len();
+        let mut probe_roots: Vec<NodeId> = fields.clone();
+        probe_roots.extend(keys.iter().copied());
+        probe_roots.push(*live);
+        let need_probe = reachable(graph, &probe_roots);
         // Buttons first, with the forks left standing. If two
         // assignments agree before the forks are resolved they agree
         // after - resolving is substitution, and substitution preserves
@@ -160,6 +168,7 @@ pub(crate) fn specialize_frame(
             v
         };
         let mut total_cfgs = 0u64;
+        let mut product_cfgs = 0f64;
         // The most fragments one rep enumerates per fork (for the trace).
         let mut ways_max = vec![0u8; bits.len()];
         for m in reps.iter().copied() {
@@ -218,32 +227,31 @@ pub(crate) fn specialize_frame(
             // Move forks keep their traced arity (`Domain::flr_ways`: from
             // the same ranges, and button-independent - `move` runs before
             // `update`), which their `SplitOk` premise checks.
-            let valid: Vec<u8> = bits
-                .iter()
-                .map(|&d| if graph.fork_table(d).is_empty() { graph.fork_ways(d) } else { tabs[d as usize].0 })
+            let ways: Vec<u8> = (0..forks)
+                .map(|d| if graph.fork_table(d).is_empty() { graph.fork_ways(d) } else { tabs[d as usize].0 })
                 .collect();
-            let total: u64 = valid.iter().map(|&n| n as u64).product();
-            total_cfgs += total;
-            for (i, n) in valid.iter().enumerate() {
-                ways_max[i] = ways_max[i].max(*n);
+            product_cfgs += bits.iter().map(|&d| ways[d as usize] as f64).product::<f64>();
+            for (i, d) in bits.iter().enumerate() {
+                ways_max[i] = ways_max[i].max(ways[*d as usize]);
             }
-            for k in 0..total {
-                let mut cfg = vec![0u8; forks as usize];
-                let mut r = k;
-                for (i, d) in bits.iter().enumerate() {
-                    let n = valid[i] as u64;
-                    cfg[*d as usize] = (r % n) as u8;
-                    r /= n;
-                }
-                let map = graph.specialize_subset_into(m, Some(&cfg), Some(&tabs), Some(&need), &mut sp);
-                let roots: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
+            // --- the TREE: a fork is split only where the row reads it ---
+            let mut cfg = vec![0u8; forks as usize];
+            for &d in &bits {
+                cfg[d as usize] = crate::transpile::graph::OPEN;
+            }
+            let ctx = Tree { graph, m, tabs: &tabs, need: &need, need_probe: &need_probe, want: &want, probe_roots: &probe_roots, nf, bits: &bits, ways: &ways };
+            let mut probe = graph.like();
+            let mut leaves = Vec::new();
+            tree(&ctx, &mut cfg, &mut probe, &mut sp, &mut leaves);
+            total_cfgs += leaves.len() as u64;
+            for (cfg, roots) in leaves {
                 cands.push((oi, m, cfg, roots));
             }
         }
         if trace {
             let ways: Vec<u8> = bits.iter().map(|&d| graph.fork_ways(d)).collect();
             eprintln!(
-                "[build]   outcome {oi}: forks {bits:?} traced ways {ways:?}, at most {ways_max:?} in one rep -> {total_cfgs} configurations over {} button reps",
+                "[build]   outcome {oi}: forks {bits:?} traced ways {ways:?}, at most {ways_max:?} in one rep -> {total_cfgs} bodies of {product_cfgs:.0} configurations over {} button reps",
                 reps.len()
             );
         }
@@ -411,6 +419,147 @@ pub(crate) fn specialize_frame(
 fn guarded_ok(sp: &mut Graph, live: NodeId, ok: NodeId) -> NodeId {
     let dead = sp.fold(Op::Not, vec![live]);
     sp.fold(Op::Or, vec![dead, ok])
+}
+
+/// One (outcome, button rep)'s fork tree (`tree`).
+struct Tree<'a> {
+    graph: &'a Graph,
+    m: u8,
+    tabs: &'a [(u8, Vec<(i32, i32)>)],
+    /// What the outcome's roots reach, and what the row and `live` reach.
+    need: &'a [bool],
+    need_probe: &'a [bool],
+    /// The outcome's roots: fields, `ok`, `live`, keys.
+    want: &'a [NodeId],
+    /// Fields, keys, then `live`.
+    probe_roots: &'a [NodeId],
+    nf: usize,
+    /// The outcome's forks, and every fork's arity in this rep.
+    bits: &'a [u8],
+    ways: &'a [u8],
+}
+
+/// The bodies of one (outcome, button rep), as a TREE over its forks
+/// rather than their full product (plans/platforms-unknown.md, 2026-09-22).
+///
+/// At each node, `cfg` holds the forks fixed so far and the rest `OPEN`.
+/// The row (fields and keys) and `live` are specialized under it: a node
+/// whose `live` folds false has no body under it; otherwise it splits on
+/// the highest open fork the ROW still reads (the order the product
+/// enumerated in, when every fork is read). Where the row reads no open
+/// fork, the configurations below write one row, so they are one body:
+/// the forks only `ok` or `live` read are quantified out of those by the
+/// fusion rule (`quantify`) - what step 4 does to candidates with the same
+/// row, without enumerating them. Exact: the same rows, `live` and `ok`
+/// as the product fused.
+fn tree(t: &Tree, cfg: &mut Vec<u8>, probe: &mut Graph, sp: &mut Graph, out: &mut Vec<(Vec<u8>, Vec<NodeId>)>) {
+    use crate::transpile::graph::OPEN;
+    let open: Vec<u8> = t.bits.iter().copied().filter(|d| cfg[*d as usize] == OPEN).collect();
+    if !open.is_empty() {
+        let map = t.graph.specialize_subset_into(t.m, Some(cfg), Some(t.tabs), Some(t.need_probe), probe);
+        let live = map[t.probe_roots[t.probe_roots.len() - 1] as usize];
+        if matches!(probe.get(live).op, Op::ConstBool(false)) {
+            return;
+        }
+        let row: Vec<NodeId> = t.probe_roots[..t.probe_roots.len() - 1].iter().map(|r| map[*r as usize]).collect();
+        if let Some(&d) = forks_read(probe, &row, &open).iter().next_back() {
+            for v in 0..t.ways[d as usize] {
+                cfg[d as usize] = v;
+                tree(t, cfg, probe, sp, out);
+            }
+            cfg[d as usize] = OPEN;
+            return;
+        }
+    }
+    let map = t.graph.specialize_subset_into(t.m, Some(cfg), Some(t.tabs), Some(t.need), sp);
+    let mut roots: Vec<NodeId> = t.want.iter().map(|r| map[*r as usize]).collect();
+    if !open.is_empty() {
+        let (ok, live) = quantify(sp, roots[t.nf], roots[t.nf + 1], &open, t.ways, t.tabs);
+        roots[t.nf] = ok;
+        roots[t.nf + 1] = live;
+    }
+    out.push((cfg.clone(), roots));
+}
+
+/// The forks of `among` whose nodes `roots` reach in `g`.
+fn forks_read(g: &Graph, roots: &[NodeId], among: &[u8]) -> std::collections::BTreeSet<u8> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = roots.to_vec();
+    while let Some(n) = stack.pop() {
+        if !seen.insert(n) {
+            continue;
+        }
+        let node = g.get(n);
+        if let Some(d) = crate::transpile::graph::fork_of(&node.op) {
+            if among.contains(&d) {
+                found.insert(d);
+                if found.len() == among.len() {
+                    break;
+                }
+            }
+        }
+        stack.extend(node.args.iter().copied());
+    }
+    found
+}
+
+/// `ok` and `live` with the forks of `open` they read quantified out, one
+/// at a time: `live` the OR over the fork's fragments, `ok` the AND of
+/// `live_c -> ok_c` - the fusion rule of `specialize_frame`'s step 4, over
+/// the configurations that write this row.
+fn quantify(sp: &mut Graph, ok: NodeId, live: NodeId, open: &[u8], ways: &[u8], tabs: &[(u8, Vec<(i32, i32)>)]) -> (NodeId, NodeId) {
+    let (mut ok, mut live) = (ok, live);
+    for d in forks_read(sp, &[ok, live], open) {
+        let (mut l_all, mut o_all): (Option<NodeId>, Option<NodeId>) = (None, None);
+        for c in 0..ways[d as usize] {
+            let r = resolve(sp, &[live, ok], d, c, tabs);
+            let g = guarded_ok(sp, r[0], r[1]);
+            l_all = Some(match l_all {
+                None => r[0],
+                Some(x) => sp.fold(Op::Or, vec![x, r[0]]),
+            });
+            o_all = Some(match o_all {
+                None => g,
+                Some(x) => sp.fold(Op::And, vec![x, g]),
+            });
+        }
+        live = l_all.expect("a fork has a fragment");
+        ok = o_all.expect("a fork has a fragment");
+    }
+    (ok, live)
+}
+
+/// `roots` rebuilt in `sp` with fork `d` resolved to fragment `c` (operands
+/// precede their node, so the cone in ascending order is one pass).
+fn resolve(sp: &mut Graph, roots: &[NodeId], d: u8, c: u8, tabs: &[(u8, Vec<(i32, i32)>)]) -> Vec<NodeId> {
+    let mut cone = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = roots.to_vec();
+    while let Some(n) = stack.pop() {
+        if seen.insert(n) {
+            cone.push(n);
+            stack.extend(sp.get(n).args.iter().copied());
+        }
+    }
+    cone.sort_unstable();
+    let mut map: std::collections::HashMap<NodeId, NodeId> = std::collections::HashMap::new();
+    for n in cone {
+        let (op, args) = {
+            let x = sp.get(n);
+            (x.op.clone(), x.args.clone())
+        };
+        let a: Vec<NodeId> = args.iter().map(|y| map[y]).collect();
+        let out = if crate::transpile::graph::fork_of(&op) == Some(d) {
+            sp.resolve_fork(&op, a[0], c, Some(tabs))
+        } else if a != args {
+            sp.fold(op, a)
+        } else {
+            n
+        };
+        map.insert(n, out);
+    }
+    roots.iter().map(|r| map[r]).collect()
 }
 
 /// The fused bodies' constant-output analysis. For each outcome field,

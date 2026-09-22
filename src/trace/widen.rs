@@ -274,7 +274,7 @@ pub fn fall_floor_paths<D: Domain>(st: &State<D>) -> FallFloorPaths {
 /// `collideable` writes into a fresh atom, and that one becomes a fork of both
 /// values at the update's return (`Domain::escaped_atom`): what the player,
 /// updating after the floors, reads. A fork here would be dead, one fork id per
-/// floor (a `ChoiceSet` holds 58).
+/// floor.
 pub fn fork_floor_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     materialize_absent_fields(st, d)?;
     replace_fall_floors(st, d, false)

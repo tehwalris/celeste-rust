@@ -200,7 +200,7 @@ pub trait Domain {
     /// whose floors differ - so the cart marks the place with
     /// `__split_by_flr` and the program enumerates the cases. This
     /// returns ONE node, not two states: the fragment is a choice, like
-    /// a button, and specialization enumerates it (`Choice::Split`).
+    /// a button, and specialization enumerates it (`lower::specialize_frame`).
     ///
     /// `ways` is the fork's arity - how many floors the fragments cover.
     ///
@@ -409,8 +409,8 @@ pub struct Symbolic {
     /// asks for six, in slot order, which is what makes these line up with
     /// the kb0..kb5 the kernels already speak.
     pub frees: u8,
-    /// How many FORK choices have been handed out this frame. The other
-    /// half of `ChoiceSet`, above the six buttons.
+    /// How many FORK choices have been handed out this frame. A fork id is
+    /// a `u8` below `graph::OPEN`.
     pub forks: u8,
     /// The arity of the `move` fork for the set being traced (see
     /// `Domain::move_ways`); `trace_frame` sets it from the widen mode.
@@ -660,7 +660,7 @@ impl Symbolic {
     /// the whole grid - the held buttons' fork (`widen::fork_held_inputs`).
     pub fn both_values(&mut self, origin: &str) -> NodeId {
         let fork = self.forks;
-        self.forks += 1;
+        self.forks = self.forks.checked_add(1).filter(|f| *f <= crate::transpile::graph::OPEN).expect("a fork id is a u8 below graph::OPEN");
         self.graph.set_fork_ways(fork, 2);
         self.fork_origins.push((fork, origin.to_string()));
         let choices = self.graph.leaf(Op::Const(0, 1 << 16));
@@ -1045,7 +1045,7 @@ impl Domain for Symbolic {
             return out;
         }
         let d = self.forks;
-        self.forks += 1;
+        self.forks = self.forks.checked_add(1).filter(|f| *f <= crate::transpile::graph::OPEN).expect("a fork id is a u8 below graph::OPEN");
         self.graph.set_fork_ways(d, ways);
         let out = (
             self.graph.fold(Op::Split(d), vec![*v]),
@@ -1062,7 +1062,7 @@ impl Domain for Symbolic {
             return out;
         }
         let d = self.forks;
-        self.forks += 1;
+        self.forks = self.forks.checked_add(1).filter(|f| *f <= crate::transpile::graph::OPEN).expect("a fork id is a u8 below graph::OPEN");
         self.graph.set_fork_ways(d, ways);
         let out = (
             self.graph.fold(Op::SplitInt(d), vec![*v]),
@@ -1102,7 +1102,7 @@ impl Domain for Symbolic {
 
     fn fork_table(&mut self, v: &NodeId, ranges: &[(i32, i32)], arity: u8) -> (NodeId, NodeId) {
         let d = self.forks;
-        self.forks += 1;
+        self.forks = self.forks.checked_add(1).filter(|f| *f <= crate::transpile::graph::OPEN).expect("a fork id is a u8 below graph::OPEN");
         self.graph.set_fork_table(d, ranges.to_vec(), arity);
         (
             self.graph.fold(Op::SplitTab(d), vec![*v]),
