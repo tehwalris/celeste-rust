@@ -66,30 +66,72 @@ So: walk back from the offending branch to an unknown source, and partition
 THAT, at the thresholds the branch compares against. Recurse if one split does
 not make the branch decidable.
 
-## 4. Error is a property of values
+## 4. Error is DERIVED from the operators, never carried
 
-Each node carries an error condition: a boolean saying this computation was
-invalid on this lane. Sources are genuine value facts - a fork's coverage
-claim, the `flr`-span assertion, range bounds, a division by zero.
+Error is a property of a value, and two rules leave it no freedom:
 
-It propagates along the same edges as the computation:
+* if any input of an operator has error, its output has error;
+* an operator may ADD error of its own, as a function of its inputs, even
+  where none of them has any.
 
-    error(n) = own_error(n) or OR over args of error(arg)
+So
 
-and A ROW'S ERROR IS THE OR OF THE ERRORS OF THE VALUES IT STORES. This is a
-second relation over the same nodes - a different edge set with its own roots,
-not a separate graph.
+    error(n) = own_error(n, args) or OR over args of error(arg)
 
-Two properties fall out, and both are things we currently lack:
+is a bottom-up function of the graph. Nothing in it depends on execution order
+or on the path taken, which means IT NEED NOT BE EXPLICIT IN THE GRAPH AT ALL.
+It is derivable whenever wanted, and there is exactly one moment worth deriving
+it: very late, when the kernel is materialised. Then a row's error is the OR of
+the errors of the values it stores.
 
-* **Demand-driven.** A premise about a value nothing stores is in no row's
-  error. Obligations cannot outlive the values they are about.
-* **One polarity.** Fusing bodies is OR of `live` and OR of `error`. No AND
-  of implications anywhere, which is what makes fusion cheap (see 6).
+Every obligation we actually have is an operator's own error:
 
-`error`, not `ok`. The complement is not cosmetic: it is what matches the two
-masks' polarity so they share structure in a hash-consed graph, where an `And`
-tree and an `Or` tree share nothing.
+| operator | `own_error` |
+|---|---|
+| `Div(a, b)` | `b = 0` |
+| `Flr(x)` | `not (flr(lo x) = flr(hi x))` - the span claim |
+| a fork | the lane's set is not covered by the parts enumerated |
+| an unrolled loop | its condition still holds after the bound |
+| an input with an assumed range | the lane's value is outside it |
+
+`Flr` is the instructive one. As a premise (`Known(Flr(x))`) it looks circular -
+`Flr` is exact BECAUSE of it, so propagation cannot discharge it without
+assuming it - and encoding it that way is what made me fold it away unsoundly
+on 2026-09-26. As an operator's own error there is no circularity at all:
+`Flr` is simply PARTIAL, a singleton on pain of error.
+
+Trace-time refusals (a symbolic table index, an unsupported construct) are not
+error conditions. They are failures to compile, and stay so.
+
+One obligation is NOT any value's error and needs its own home: a fork's
+COVERAGE - that the lane's set really is contained in the union of the parts
+enumerated. It cannot be a value's error, because "the lane is outside part c"
+is just `live = false` for that body, and "outside every part" is a property of
+the body SET rather than of any value. Left implicit it is the one failure mode
+we cannot tolerate: no body's `live` holds, the lane emits nothing, and a state
+is lost SILENTLY instead of declining loudly. So coverage belongs with the
+input preconditions - beside "this cell lies in the range this body was
+specialised for" - which is what `SplitOk` already is today.
+
+Consequences:
+
+* **No `ok` in the tracer.** `State::ok` is not state. Carrying it treats a
+  DATA property as a PATH property, which is the actual bug behind obligations
+  outliving their values: in room (6,0), 0 of 10-14 merge premises protect a
+  select that reaches any row.
+* **Demand-driven by construction.** A value nothing stores contributes to no
+  row's error, because error was never materialised for it.
+* **Fusion never touches error.** Bodies fuse only when their row VALUES are
+  equal, and equal values are literally the same nodes - so their error is the
+  same expression, not two to be combined. Rows are fused before error exists;
+  error is materialised once afterwards. Only `live` needs combining.
+* **One polarity, because there is one materialisation.** No `ok`-versus-
+  `error` sharing question in the hash-consed graph.
+
+One subtlety, at the kernel boundary only: `own_error`'s condition can itself
+be undecidable (`b = 0` where `b` is an interval containing zero), so error is
+`{true, false}`. The kernel reads may-error AS error - strict, declines
+loudly - which is the semantics `ok` has today.
 
 ## 5. The kernel
 
@@ -111,13 +153,16 @@ nothing. That is `lower::quantify`, and it inflated one room (6,0) body's
 ok/live cone from 1,974 nodes to 96,540 (48.9x), which was 97-98% of the
 kernel's arena.
 
-Under this model the same fusion is
+Under this model there is nothing to fuse. Error is not carried, so fusion
+concerns only the rows and `live`:
 
-    live  = the lane's value lies in the UNION of the parts   (one test)
-    error = OR over c of error_c                             (error cone only)
+    live = the lane's value lies in the UNION of the parts   (one test)
 
-No AND-of-implications, no per-fragment copy of `live`, and the live side
-collapses to a single membership test. `quantify` disappears.
+and error is materialised ONCE, after fusion, from the fused body - bodies fuse
+only on equal row values, so the members' errors are the same expression
+anyway. No AND-of-implications, no per-fragment copy of either formula, no
+incremental fold. `quantify` does not merely get cheaper - it has no mechanism
+left by which to arise.
 
 ## 7. `Known` is an assertion, never a type fact
 
@@ -131,13 +176,13 @@ collapses to a single membership test. `quantify` disappears.
   to the fork pass, encoded as a graph node that then sits in `ok` and
   inflates everything downstream of it.
 * **A genuine value assertion** - `Known(Flr(x))` claims the lane's interval
-  spans a single integer. Unknowable statically (and circular to discharge by
-  propagation: `Flr` is exact BECAUSE of this premise). This is legitimate and
-  belongs in `error`, under a name that says what it asserts.
+  spans a single integer.
 
-Only the second survives. In the target model the first cannot arise, because
-stage 2 forks a branch it cannot decide rather than merging it and leaving a
-marker - there is no merge, so there is nothing to mark.
+NEITHER survives. The first cannot arise: stage 2 forks a branch it cannot
+decide rather than merging it and leaving a marker, so there is no merge and
+nothing to mark. The second is not an assertion the graph carries either - it
+is `Flr`'s own error condition (section 4), which is what dissolves its
+apparent circularity. `Known` disappears as a concept.
 
 ## Where the code diverges
 
@@ -172,8 +217,11 @@ this size is safe.
    (numbers) and `Symbolic::runtime_unknown` (booleans, added 2026-09-26).
 2. Delete `Known`-as-decidedness, using that pass. Keep the assertion, renamed.
 3. Unify the fork operations into one `fork(node, partition)`.
-4. `ok` -> per-value `error`, OR-composed into rows. The invasive step; do it
-   in two halves with the gates green between them.
+4. DELETE `ok`. It goes from `State`, from `state::merge`, from the nine
+   conjunction sites and from `Domain::require`/`known`; error is derived
+   instead when the kernel is materialised. A deletion, not a re-plumbing -
+   but still the invasive step, so do it in halves with the gates green
+   between them.
 5. Domain-first fork choice, partitioned at the thresholds the branch uses.
 6. Delete `quantify`.
 
