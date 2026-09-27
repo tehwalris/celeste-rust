@@ -499,6 +499,125 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
             *by.entry(k).or_default() += 1;
         }
         eprintln!("[build] fork_known_premises: {} conditions, {} premises: {by:?}", conds.len(), knowns.len());
+        // STEP 1 CHECK (plans/graph-model.md): what the type-propagation pass
+        // would fork, against what the `Known` premises fork today. Step 2
+        // replaces the premises with this query, so the two counts have to be
+        // reconciled BEFORE the substitution - the pass is deliberately
+        // stricter in two ways (it counts a `Sel`'s condition, and it covers
+        // `TileFlagAt`/`Mget` over abstract coordinates, where
+        // `reads_interval_cmp` has a `_ => false` arm), and any difference
+        // beyond those two is a difference I do not yet understand.
+        {
+            let mut sel_abstract: std::collections::BTreeSet<NodeId> = Default::default();
+            let mut by_op: std::collections::BTreeMap<String, usize> = Default::default();
+            for (i, r) in reach.iter().enumerate() {
+                if !*r {
+                    continue;
+                }
+                let node = d.graph.get(i as NodeId);
+                if !matches!(node.op, Op::Sel) {
+                    continue;
+                }
+                let c = node.args[0];
+                if d.abstractness(c) {
+                    sel_abstract.insert(c);
+                    let name = format!("{:?}", d.graph.get(c).op);
+                    *by_op.entry(name.split('(').next().unwrap_or("").to_string()).or_default() += 1;
+                }
+            }
+            let old: std::collections::BTreeSet<NodeId> = conds.iter().copied().collect();
+            let extra: Vec<NodeId> = sel_abstract.difference(&old).copied().collect();
+            let missing: Vec<NodeId> = old.difference(&sel_abstract).copied().collect();
+            // IS `missing` UNSOUNDNESS OR ARE THEY PHANTOM FORKS? A condition
+            // lands in my set only if some reachable `Sel` still branches on
+            // it. So a premise-forked condition that is missing means: the
+            // type pass agrees it is abstract, but NOTHING SELECTS ON IT any
+            // more - the arms came out equal, or a later widening overwrote
+            // the field. Those are the phantom forks, and step 2 deletes them
+            // by construction. Checked rather than assumed: for each, whether
+            // the pass calls it abstract, and whether any reachable select
+            // reads it.
+            {
+                let (mut phantom, mut real_gap) = (0usize, Vec::new());
+                for &c in &missing {
+                    let selected = reach.iter().enumerate().any(|(i, r)| {
+                        *r && matches!(d.graph.get(i as NodeId).op, Op::Sel) && d.graph.get(i as NodeId).args[0] == c
+                    });
+                    if d.abstractness(c) && !selected {
+                        phantom += 1;
+                    } else {
+                        real_gap.push(c);
+                    }
+                }
+                eprintln!(
+                    "[step1]   of {} missing: {phantom} are phantom (abstract, but no select reads them), {} are a REAL gap",
+                    missing.len(),
+                    real_gap.len()
+                );
+                for c in real_gap.iter().take(2) {
+                    eprintln!(
+                        "[step1]   REAL GAP, abstract={}: {}",
+                        d.abstractness(*c),
+                        super::emit::show_tree(&d.graph, *c, 5)
+                    );
+                }
+            }
+            eprintln!(
+                "[step1] reachable selects with an abstract condition: {} distinct ({} not in today's {} conditions, {} of today's not found); their ops {by_op:?}",
+                sel_abstract.len(),
+                extra.len(),
+                old.len(),
+                missing.len()
+            );
+            // WHY does the pass fork these and the premises not? Attributed to
+            // the three deliberate differences rather than inferred from
+            // examples: the old `reads_interval_cmp` has a `_ => false` arm
+            // (so `TileFlagAt`/`Mget` over abstract coordinates read as
+            // decidable), it calls `Flr` exact "by guard" (assuming the very
+            // obligation), and it ignores a `Sel`'s condition.
+            {
+                let mut why: std::collections::BTreeMap<&str, usize> = Default::default();
+                for &c in &extra {
+                    let cone = crate::transpile::bdd::reachable(&d.graph, &[c]);
+                    let has = |f: &dyn Fn(&Op) -> bool| {
+                        (0..cone.len()).any(|i| cone[i] && f(&d.graph.get(i as NodeId).op))
+                    };
+                    let tile = has(&|op: &Op| matches!(op, Op::TileFlagAt | Op::Mget));
+                    let flr = has(&|op: &Op| matches!(op, Op::Flr));
+                    let key = match (tile, flr) {
+                        (true, _) => "reads TileFlagAt/Mget",
+                        (false, true) => "reads Flr of an abstract value",
+                        (false, false) => "other",
+                    };
+                    *why.entry(key).or_default() += 1;
+                }
+                eprintln!("[step1]   the {} extra, by cause: {why:?}", extra.len());
+            }
+            for c in extra.iter().take(2) {
+                eprintln!("[step1]   only the pass forks: {}", super::emit::show_tree(&d.graph, *c, 5));
+            }
+            for c in missing.iter().take(2) {
+                // Which cells does it read, and are they declared INTERVAL?
+                // A wrap test on a platform's `x` must be abstract, so if the
+                // pass calls it decided the cause is either that the cell is
+                // not in `ival_cells` or that the memo answered from before
+                // `ival_cells` was set - the second would be a bug in the
+                // pass, and it is the one that silently drops states.
+                let cone = crate::transpile::bdd::reachable(&d.graph, &[*c]);
+                let cells: Vec<(u32, bool)> = (0..cone.len())
+                    .filter(|i| cone[*i])
+                    .filter_map(|i| match d.graph.get(i as NodeId).op {
+                        Op::Cell(k) => Some((k, d.ival_cells.contains(&k))),
+                        _ => None,
+                    })
+                    .collect();
+                eprintln!(
+                    "[step1]   only the premise forks: {} | its cells (id, declared interval): {cells:?} | ival_cells {:?}",
+                    super::emit::show_tree(&d.graph, *c, 5),
+                    d.ival_cells
+                );
+            }
+        }
         for &c in conds.iter().take(4) {
             eprintln!("[build]   condition: {}", super::emit::show_tree(&d.graph, c, 4));
         }

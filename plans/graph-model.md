@@ -35,9 +35,35 @@ A concrete value is atomic. An abstract value is a set of concrete values. The
 input shape plus the level fix each input field's type; one static pass
 (TYPE PROPAGATION) labels every node with whether its set is a singleton.
 
-Type propagation is the whole of what decidedness means. It runs at compile
-time, costs nothing at runtime, and decides two things: which branch-like
-nodes need forking, and which assertions are discharged statically.
+Type propagation runs at compile time, costs nothing at runtime, and says which
+values denote sets.
+
+BUT IT IS NOT THE FORK TRIGGER, and conflating the two is a mistake I made and
+measured on 2026-09-27. A LANE IS ITSELF A SET OF STATES, and the kernel
+computes on interval representations, so a value can denote a set and still be
+ONE computed quantity per lane that the kernel can branch on:
+
+* `TileFlagAt` (and `Mget`) lower to a single instruction taking the
+  coordinates as number registers, so a lane gets one answer however abstract
+  its coordinates are. Lane-decidable, no fork.
+* `Flr` of an interval is lane-decidable too - but only BECAUSE an assertion
+  guarantees the span is one integer (`zi_flr_ok`). Different justification:
+  not a type fact, an `own_error` (section 4).
+
+What forces a fork is narrower: the condition's value differs ACROSS THE
+CONCRETE STATES ONE LANE STANDS FOR. That is what `reads_interval_cmp`
+approximates by asking whether a comparison has an interval operand, and why it
+excludes the two families above - not sloppiness, as I first read it.
+
+So stage 2 needs two predicates, and they must stay apart:
+
+* ABSTRACTNESS - does this value denote a set? (`Symbolic::abstractness`.)
+  Used for typing, and for discharging assertions statically.
+* LANE-UNDECIDABILITY - can one lane hold both answers? The fork trigger.
+
+Measured on room (6,0): using abstractness as the trigger would mint 50-90
+EXTRA forks a frame, all of them `TileFlagAt`/`Mget` (41-76) or `Flr` (8-16)
+conditions the kernel decides per lane anyway.
 
 ## 3. Forking is one operation
 

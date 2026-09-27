@@ -491,6 +491,11 @@ pub struct Symbolic {
     /// fine only while forks were the one caller. Dropped with
     /// `forget_intervals` wherever `ival_cells` changes.
     ival_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
+    /// `abstractness`'s memo - the TYPE PROPAGATION pass, which asks whether a
+    /// node's value is a SET rather than a single value. Valid for the current
+    /// `ival_cells` exactly as `ival_memo` is, and dropped beside it in
+    /// `forget_intervals`.
+    abstract_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// STATIC RANGES (2026-09-15, the bucket dispatch): input cells whose
     /// value is known to lie in a range - a body specialized on the
     /// player's speed BUCKET - and the memo of the range analysis over
@@ -516,6 +521,80 @@ impl Symbolic {
     /// `ival_cells` changed: `is_interval`'s memo no longer holds.
     pub fn forget_intervals(&mut self) {
         self.ival_memo.get_mut().clear();
+        self.abstract_memo.get_mut().clear();
+    }
+
+    /// TYPE PROPAGATION (plans/graph-model.md section 2): does this node's
+    /// value denote a SET of concrete values rather than a single one?
+    ///
+    /// This is the whole of what decidedness means, and it is static. A node
+    /// whose value is a singleton is one every lane decides; a node whose
+    /// value is a set is one no lane need decide, so a branch on it is what
+    /// stage 2 has to fork.
+    ///
+    /// NOT `is_interval`, which answers a different question and must keep
+    /// doing so: whether a NUMBER is an interval, for the lowering's ZI/ZN
+    /// typing and for the widenings. Two differences are load-bearing:
+    ///
+    /// * a `Sel` counts its CONDITION, because an undecided condition is
+    ///   precisely what makes the select unevaluable, where for interval-ness
+    ///   only the arms matter;
+    /// * `Flr` FOLLOWS ITS OPERAND. `is_interval` calls it exact "by guard -
+    ///   the lane survives only where the floor is unique, which is a
+    ///   conjunct of `ok`", i.e. it assumes the very obligation. Here `Flr`
+    ///   is a PARTIAL operator: a singleton only on pain of error, and that
+    ///   error is the operator's own (`own_error`), not a type fact. Reading
+    ///   the shortcut into this pass is what made me fold `Known(Flr(..))`
+    ///   away unsoundly on 2026-09-26.
+    ///
+    /// Every `Op` is listed on purpose - no catch-all. `reads_interval_cmp`
+    /// has a `_ => false` arm, which silently calls `TileFlagAt` over
+    /// interval coordinates decidable; harmless for a diagnostic, unsound
+    /// the moment it decides whether to fork.
+    pub fn abstractness(&self, n: NodeId) -> bool {
+        fn go(g: &Graph, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
+            if let Some(b) = memo.get(&n) {
+                return *b;
+            }
+            let node = g.get(n);
+            let any = |memo: &mut rustc_hash::FxHashMap<NodeId, bool>, xs: &[NodeId]| xs.iter().any(|x| go(g, ival, memo, *x));
+            let args = node.args.clone();
+            let r = match node.op {
+                // Singletons by construction.
+                Op::ConstBool(_) => false,
+                Op::Const(lo, hi) => lo != hi,
+                Op::Cell(c) => ival.contains(&c),
+                // Resolved to a constant per body, so decided.
+                Op::Free(_) => false,
+                // The genuinely unknown atoms.
+                Op::UnknownNum | Op::UnknownBool(_) => true,
+                // A span exists because its bounds are different nodes.
+                Op::Span => true,
+                // A fragment of an interval is a narrower interval; a
+                // fragment of the integer grid is one exact number. The
+                // validity and coverage masks are per-lane comparisons on
+                // the operand, so they follow it.
+                Op::Split(_) | Op::SplitTab(_) | Op::SplitKeyTab(_) | Op::Frag(_) => true,
+                Op::SplitInt(_) | Op::IntFrag(_) => false,
+                Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_) => any(memo, &args),
+                // The ends of an interval are exact numbers.
+                Op::Lo | Op::Hi => false,
+                // A premise is a mask query: every lane decides it.
+                Op::Known => false,
+                // PARTIAL: a singleton only on pain of error. See above.
+                Op::Flr => any(memo, &args),
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min | Op::Max | Op::Sin => any(memo, &args),
+                Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => any(memo, &args),
+                Op::Not | Op::And | Op::Or => any(memo, &args),
+                // The condition counts: that is what cannot be evaluated.
+                Op::Sel => any(memo, &args),
+                // Data, addressed by coordinates that may be sets.
+                Op::Mget | Op::TileFlagAt => any(memo, &args),
+            };
+            memo.insert(n, r);
+            r
+        }
+        go(&self.graph, &self.ival_cells, &mut self.abstract_memo.borrow_mut(), n)
     }
 
     /// The static range of `n` (`graph::pieces_of` over the seeded cells).
