@@ -227,17 +227,56 @@ pub(crate) fn specialize_frame(
                 .iter()
                 .map(|&d| if graph.fork_table(d).is_empty() { graph.fork_ways(d) } else { tabs[d as usize].0 })
                 .collect();
-            let total: u64 = valid.iter().map(|&n| n as u64).product();
-            total_cfgs += total;
             for (i, n) in valid.iter().enumerate() {
                 ways_max[i] = ways_max[i].max(*n);
             }
+            // PER FORK, ITS VALUES THAT AGREE: each value resolved with every
+            // other fork left standing (`graph::OPEN`), and one kept of those
+            // whose roots come out the same - they agree whatever the other
+            // forks take, resolving being substitution, as the button reps
+            // above. The platform worlds' fork (`widen::fork_platform_inputs`,
+            // ~128 ways) is what needs it: from one region most worlds look
+            // alike, and enumerating all of them against every other fork's
+            // configurations ran room (6,0)'s kernel build out of memory
+            // (2026-09-27).
+            let values: Vec<Vec<u8>> = bits
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| {
+                    if valid[i] <= 2 {
+                        return (0..valid[i]).collect();
+                    }
+                    // Compared DECIDED, when the body is (`decide`): a test of
+                    // the player against one world's platform folds only
+                    // with the region's ranges, and before that every world
+                    // is a different node.
+                    let mut probe = graph.like();
+                    let mut decided = graph.like();
+                    let mut seen: BTreeMap<Vec<NodeId>, u8> = BTreeMap::new();
+                    for v in 0..valid[i] {
+                        let mut cfg = vec![crate::transpile::graph::OPEN; forks as usize];
+                        cfg[d as usize] = v;
+                        let map = graph.specialize_subset_into(m, Some(&cfg), Some(&tabs), Some(&need), &mut probe);
+                        let mut sig: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
+                        if decide {
+                            let (dm, _) = crate::transpile::ival::fold_with_into(&probe, &sig, room, ranges, &mut decided).expect("interval fold");
+                            sig = sig.iter().map(|r| dm[*r as usize]).collect();
+                        }
+                        seen.entry(sig).or_insert(v);
+                    }
+                    let mut v: Vec<u8> = seen.into_values().collect();
+                    v.sort_unstable();
+                    v
+                })
+                .collect();
+            let total: u64 = values.iter().map(|v| v.len() as u64).product();
+            total_cfgs += total;
             for k in 0..total {
                 let mut cfg = vec![0u8; forks as usize];
                 let mut r = k;
                 for (i, d) in bits.iter().enumerate() {
-                    let n = valid[i] as u64;
-                    cfg[*d as usize] = (r % n) as u8;
+                    let n = values[i].len() as u64;
+                    cfg[*d as usize] = values[i][(r % n) as usize];
                     r /= n;
                 }
                 let map = graph.specialize_subset_into(m, Some(&cfg), Some(&tabs), Some(&need), &mut sp);

@@ -608,6 +608,19 @@ this size is safe.
      Measured, room (6,0) at `r0sxhp`: the walk 8.9 s, every region at most
      6-8 outcomes (mean ~3) - the same as with the platforms exact, plus the
      world fork.
+     BUT THE KERNELS: enumerating ~128 worlds at compile time makes them huge
+     - region (2,2) 29,492 bodies / 966k fused nodes / 28 s, against 404 /
+     18,848 / 8.9 s with the platforms exact per lane (`r0sxh`). Grouping a
+     fork's values whose DECIDED roots agree (`lower::specialize_frame`,
+     `graph::OPEN`, `ival::fold_with_into`) only takes 128 to 74: every world
+     with a platform near the region is its own body, because the rows are
+     computed against that world's exact platform position.
+     So the open choice is WHERE the worlds are enumerated: at compile time
+     (small traces, huge kernels), or at run time as data - each input lane
+     expanded to one lane per world, the exact-platform kernel run on them,
+     the outputs widened and deduped at the door (small kernels, ~128x the
+     lane work, which collapses if the worlds are first grouped per lane by
+     the nearest platform's relative position).
 6. Delete `quantify` - never on this branch (it came with `ac307ce`). What
    step 6 stood for here is the other limit that commit removed: the per-node
    `ChoiceSet` fork mask, which capped a frame at 58 forks and is what stops

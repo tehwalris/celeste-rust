@@ -75,6 +75,10 @@ impl Val {
 
 pub type NodeId = u32;
 
+/// In a `splits` vector (`Graph::specialize_subset_into`): leave this fork
+/// standing.
+pub const OPEN: u8 = u8::MAX;
+
 /// The map, for the evaluator. `CollisionCache` already carries which
 /// room it is for, so this is just the pair the cart queries need.
 #[derive(Clone)]
@@ -513,6 +517,9 @@ impl Graph {
     /// Entries for unbuilt nodes are `UNBUILT`, which is not a valid id
     /// - reading one is a bug, and it should look like one.
     ///
+    /// A `splits` entry of `OPEN` leaves that fork standing (what
+    /// `lower::specialize_frame` groups one fork's values by).
+    ///
     /// `tabs`, per fork, overrides a table fork's arity and entries with a
     /// button rep's own (`lower::specialize_frame`: what that rep's lanes
     /// can reach); an empty entry list keeps the fork's.
@@ -546,12 +553,12 @@ impl Graph {
                 // would have silently measured 16,384 configurations
                 // as 256 distinct ones and reported the collapse as
                 // sharing. Fourth member of the shift-overflow family.
-                (Op::Split(d), Some(s)) => out.fold(Op::Frag(s[d as usize]), vec![arg(&map, 0)]),
-                (Op::SplitValid(d), Some(s)) => out.fold(Op::FragOk(s[d as usize]), vec![arg(&map, 0)]),
-                (Op::SplitInt(d), Some(s)) => out.fold(Op::IntFrag(s[d as usize]), vec![arg(&map, 0)]),
+                (Op::Split(d), Some(s)) if s[d as usize] != OPEN => out.fold(Op::Frag(s[d as usize]), vec![arg(&map, 0)]),
+                (Op::SplitValid(d), Some(s)) if s[d as usize] != OPEN => out.fold(Op::FragOk(s[d as usize]), vec![arg(&map, 0)]),
+                (Op::SplitInt(d), Some(s)) if s[d as usize] != OPEN => out.fold(Op::IntFrag(s[d as usize]), vec![arg(&map, 0)]),
                 // The relative table fork (see `Op::SplitTab`): per-lane
                 // select chains on `Lo(v)` over the entries.
-                (Op::SplitTab(d), Some(s)) | (Op::SplitValidTab(d), Some(s)) | (Op::SplitKeyTab(d), Some(s)) | (Op::SplitOkTab(d), Some(s)) => {
+                (Op::SplitTab(d), Some(s)) | (Op::SplitValidTab(d), Some(s)) | (Op::SplitKeyTab(d), Some(s)) | (Op::SplitOkTab(d), Some(s)) if s[d as usize] != OPEN => {
                     let c = s[d as usize] as usize;
                     let (arity, table) = match tabs.and_then(|t| t.get(d as usize)).filter(|t| !t.1.is_empty()) {
                         Some((k, t)) => (*k as usize, t.as_slice()),

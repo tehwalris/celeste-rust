@@ -95,14 +95,27 @@ pub fn fold_with(
     room: Option<&Room>,
     ranges: &HashMap<u32, (i32, i32)>,
 ) -> Result<(Graph, Vec<NodeId>, Stats)> {
+    let mut out = g.like();
+    let (map, st) = fold_with_into(g, roots, room, ranges, &mut out)?;
+    Ok((out, map, st))
+}
+
+/// `fold_with`, writing into `out` - so what several graphs fold to lands
+/// in one hash-consed arena, and equal results are the same node
+/// (`lower::specialize_frame` groups a fork's values by it).
+pub fn fold_with_into(
+    g: &Graph,
+    roots: &[NodeId],
+    room: Option<&Room>,
+    ranges: &HashMap<u32, (i32, i32)>,
+    out: &mut Graph,
+) -> Result<(Vec<NodeId>, Stats)> {
     let need = super::bdd::reachable(g, roots);
     let cells = seed_cells(g, ranges);
     let vals = match room {
         Some(r) => g.eval_lenient_in(&cells, r)?,
         None => g.eval_lenient(&cells)?,
     };
-
-    let mut out = g.like();
     let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
     let mut st = Stats {
         before: need.iter().filter(|x| **x).count(),
@@ -131,7 +144,7 @@ pub fn fold_with(
         map[id] = new;
     }
     st.after = out.len();
-    Ok((out, map, st))
+    Ok((map, st))
 }
 
 #[cfg(test)]
