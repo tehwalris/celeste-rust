@@ -359,6 +359,19 @@ pub fn platform_paths<D: Domain>(st: &State<D>) -> PlatformPaths {
 /// admitted the player carried by every platform at once (room (6,0),
 /// 2026-09-27). Configurations that come out alike fuse.
 pub fn fork_platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    if std::env::var_os("XNOWORLD").is_some() {
+        // EXPERIMENT: the interval model - `x` the input cell, `last` the
+        // same value, `rem.x` the literal.
+        for obj in objects_of_type(st, "platform") {
+            let (x, last, rem) = (field(&obj, &["x"]), field(&obj, &["last"]), field(&obj, &["rem", "x"]));
+            let Some(Value::Num(xv)) = iface::get(st, &x) else { bail!("{}: not a number", iface::show(&x)) };
+            d.ranges.insert(xv, ((PLATFORM_PATH.0 as i64) << 16, (PLATFORM_PATH.1 as i64) << 16));
+            iface::set(st, &last, Value::Num(xv))?;
+            let r = d.graph.leaf(Op::Const(PLATFORM_REM.0, PLATFORM_REM.1));
+            iface::set(st, &rem, Value::Num(r))?;
+        }
+        return Ok(());
+    }
     let worlds = d.worlds.clone().ok_or_else(|| anyhow::anyhow!("the platforms are unknown but there is no world table"))?;
     let platforms = objects_of_type(st, "platform");
     anyhow::ensure!(worlds.iter().all(|w| w.len() == platforms.len()), "a platform world has a different number of platforms than the state ({})", platforms.len());
@@ -522,6 +535,7 @@ fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::tra
             let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
             (a.0 - b.1, a.1 - b.0)
         }
+        Op::Cell(_) if d.ranges.contains_key(&n) => d.ranges[&n],
         // Known only from the branches around it.
         _ if facts.iter().any(|f| f.0 == n) => (i64::MIN, i64::MAX),
         _ => return None,

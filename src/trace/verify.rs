@@ -498,24 +498,32 @@ pub fn trace_frame<'a>(
 /// MAKING THE FRAME EXECUTABLE UNDER ABSTRACT INPUTS (plans/graph-model.md
 /// section 1, stage 2). The traced graph computes a row for concrete inputs;
 /// a SELECT whose condition a lane can hold both ways cannot be evaluated -
-/// it stands for concrete states answering each way. So, one at a time: find
-/// such a select in an outcome, take the most upstream one (the lowest node:
-/// its condition was computed first), and split the outcome in two - the
-/// condition true in one, false in the other, everything that reads it
-/// refolded, each side's guard narrowed to the lanes where some state they
-/// stand for gives that answer (`Symbolic::may_answers`). Then look again,
-/// ON THE SPLIT OUTCOMES: a condition that was undecidable only through the
-/// other answer (a carry amount that is an interval only when the platform
-/// wrapped) is decided now, and is never split. Stop when no outcome has an
-/// abstract value driving a select, and fuse the outcomes that came out
-/// equal.
+/// it stands for concrete states answering each way.
 ///
-/// It replaces minting a fork per condition up front, judged on the unforked
-/// graph (2026-09-21 - 2026-09-27): that split conditions independently,
-/// including ones every configuration that reads them decides, and
-/// `specialize_frame` enumerates every fork an outcome reads - room (6,0),
-/// 14 forks a platform for its touch test, where the real cases are "not
-/// touching", "carried a step" and "wrapped, so not touching".
+/// WHERE IT MATTERS, AND WHERE IT DOES NOT (Philippe, 2026-09-27). A select
+/// the row STORES (a field, a key) must be resolved: the row is one value.
+/// So must one the ERROR reads, which is strict. But a select in the GUARD
+/// is only a question of whether the lane is live, and that is three-valued
+/// already - an undecided `live` reads as live (`asm_kernel::read_zb_may`).
+/// So the guard is rewritten, not split (`three_valued`): a boolean select
+/// becomes `(c and a) or (not c and b)`, exact in Kleene logic, and a number
+/// selected on an undecided `c` is pushed through whatever reads it into
+/// the select's arms. Splitting the guard's selects too made the player's
+/// every collision test after a move split again on the platforms the move
+/// had already asked about - room (6,0), 50,000 splits for 112 outcomes in
+/// one trace.
+///
+/// Then, one at a time: find a select the row or the error reads whose
+/// condition a lane can hold both ways, take the FIRST in program order
+/// (the lowest node: its condition was computed first), and split the
+/// outcome in two - the condition true in one, false in the other,
+/// everything that reads it refolded, each side's guard narrowed to the
+/// lanes where some state they stand for gives that answer
+/// (`Symbolic::may_answers`). Then look again on the split outcomes: a
+/// condition that was undecidable only through the other answer is decided
+/// now, and never split - a loop that stops at the first blocked pixel
+/// comes out as one outcome per stop point. Stop when no stored value or
+/// error has an undecided select, and fuse the outcomes that came out equal.
 ///
 /// Comparisons are refolded with the static ranges (`Symbolic::compare`), so
 /// a branch the kernel's region never takes folds away, and what it read
@@ -523,43 +531,36 @@ pub fn trace_frame<'a>(
 fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<FrameOut>> {
     use crate::transpile::graph::Op;
     const MAX_OUTCOMES: usize = 4096;
-    let roots_of = |o: &FrameOut| -> Vec<NodeId> {
+    let stored = |o: &FrameOut| -> Vec<NodeId> {
         let mut r: Vec<NodeId> = o.fields.iter().map(|(_, n, _)| *n).collect();
         r.extend(o.keys.iter().map(|(_, n)| *n));
-        r.push(o.guard);
         r.push(o.error);
         r
     };
+    if std::env::var_os("XSUM").is_some() {
+        eprintln!("[xsum] enter: {} outcomes, guard cones {:?}", outs.len(), outs.iter().map(|o| cone(&d.graph, &[o.guard]).len()).collect::<Vec<_>>());
+    }
     let mut work: Vec<FrameOut> = outs;
+    let t0 = std::time::Instant::now();
+    for o in work.iter_mut() {
+        o.guard = three_valued(d, o.guard);
+    }
+    if std::env::var_os("XSUM").is_some() {
+        eprintln!("[xsum] three_valued {} outcomes {:.2}s, guard cones {:?}", work.len(), t0.elapsed().as_secs_f64(), work.iter().map(|o| cone(&d.graph, &[o.guard]).len()).collect::<Vec<_>>());
+    }
+    let mut n_splits = 0usize;
     let mut done: Vec<FrameOut> = Vec::new();
     while let Some(o) = work.pop() {
         anyhow::ensure!(work.len() + done.len() < MAX_OUTCOMES, "more than {MAX_OUTCOMES} outcomes splitting undecided selects");
-        // The outcome's cone, in node order - its own, not the arena's: each
-        // split adds nodes, and a walk of the whole arena per split made the
-        // splitting quadratic.
-        let reach = cone(&d.graph, &roots_of(&o));
-        // The first such select in program order: nodes are built as the
-        // frame runs, so the lowest select is the earliest join - one
-        // object's branches are resolved (and can dedupe) before the next
-        // object's are touched.
-        let sel_cond: Option<NodeId> = reach
+        // The cone of what must be resolved, in node order - the outcome's
+        // own, not the arena's: each split adds nodes, and a walk of the
+        // whole arena per split made the splitting quadratic.
+        let reach = cone(&d.graph, &stored(&o));
+        let first: Option<NodeId> = reach
             .iter()
             .filter(|n| d.graph.get(**n).op == Op::Sel)
             .map(|n| d.graph.get(*n).args[0])
             .find(|c| d.lane_undecidable(*c));
-        // And within it, the finest-grained undecidable part: the lowest
-        // comparison (or unknown) a lane can hold both ways. A condition is
-        // usually a conjunction of something each lane decides (the
-        // player's row) and something it cannot (a platform's x overlap);
-        // split on the whole of it and every later test sharing the part is
-        // split again - the player's move tests the same overlap at every
-        // pixel. Split on the part, and those fold.
-        let first = sel_cond.map(|c| {
-            cone(&d.graph, &[c])
-                .into_iter()
-                .find(|n| matches!(d.graph.get(*n).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::UnknownBool(_)) && d.lane_undecidable(*n))
-                .unwrap_or(c)
-        });
         let Some(c) = first else {
             let same = |p: &FrameOut| p.shape == o.shape && p.keys == o.keys && p.fields.iter().map(|f| f.1).eq(o.fields.iter().map(|f| f.1));
             match done.iter_mut().find(|p| same(p)) {
@@ -568,7 +569,14 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<
             }
             continue;
         };
+        n_splits += 1;
+        if std::env::var_os("XSUM").is_some() && n_splits % 2000 == 0 {
+            eprintln!("[xprog] {n_splits} splits, work {} done {}; cond {}", work.len(), done.len(), super::emit::show_tree(&d.graph, c, 4));
+        }
         let (may_true, may_false) = d.may_answers(c);
+        let mut all = stored(&o);
+        all.push(o.guard);
+        let reach = cone(&d.graph, &all);
         for (answer, may) in [(true, may_true), (false, may_false)] {
             let to = d.graph.leaf(Op::ConstBool(answer));
             let map = rebuild(d, &reach, c, to);
@@ -598,7 +606,76 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<
             work.push(side);
         }
     }
+    if std::env::var_os("XSUM").is_some() {
+        eprintln!("[xsum] {n_splits} splits, {} out", done.len());
+    }
     Ok(done)
+}
+
+/// `root` - a guard - with no select on an undecided condition left for the
+/// kernel to read by a garbage bit (`split_undecided_selects`). A boolean
+/// select becomes `(c and a) or (not c and b)`, exact in Kleene logic. A
+/// NUMBER selected on an undecided `c` becomes the hull of its arms where
+/// the lane does not decide `c`, and the select where it does:
+/// `Sel(Known(c), Sel(c, x, y), [min, max])` - a comparison on the hull that
+/// straddles reads as "may be live", which is what `live` over-approximates
+/// with anyway. (Pushing the readers into the arms instead is exact and
+/// exponential: the player's position after a move is a tree of such
+/// selects, and every sum of two of them multiplies.)
+fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
+    use crate::transpile::graph::Op;
+    let nodes = cone(&d.graph, &[root]);
+    let undecided = |d: &mut Symbolic, n: NodeId| d.graph.get(n).op == Op::Sel && d.lane_undecidable(d.graph.get(n).args[0]);
+    if !nodes.iter().any(|n| undecided(d, *n)) {
+        return root;
+    }
+    // Which selects a boolean reads (and the root): those are booleans.
+    let mut boolean: rustc_hash::FxHashSet<NodeId> = Default::default();
+    boolean.insert(root);
+    for &n in &nodes {
+        let node = d.graph.get(n);
+        if matches!(node.op, Op::And | Op::Or | Op::Not | Op::Known) {
+            boolean.extend(node.args.iter().copied());
+        }
+        if node.op == Op::Sel && boolean.contains(&n) {
+            boolean.extend(node.args[1..].iter().copied());
+        }
+    }
+    let mut map: std::collections::HashMap<NodeId, NodeId> = Default::default();
+    for &n in &nodes {
+        let (op, args) = {
+            let node = d.graph.get(n);
+            (node.op.clone(), node.args.clone())
+        };
+        let a: Vec<NodeId> = args.iter().map(|x| *map.get(x).unwrap_or(x)).collect();
+        let new = if op == Op::Sel && d.lane_undecidable(args[0]) {
+            let (c, x, y) = (a[0], a[1], a[2]);
+            if boolean.contains(&n) {
+                let nc = d.graph.fold(Op::Not, vec![c]);
+                let tx = d.graph.fold(Op::And, vec![c, x]);
+                let fy = d.graph.fold(Op::And, vec![nc, y]);
+                d.graph.fold(Op::Or, vec![tx, fy])
+            } else {
+                let decided = d.graph.fold(Op::Known, vec![c]);
+                let picked = d.graph.fold(Op::Sel, vec![c, x, y]);
+                // Evaluated only where the lane decides `c` - its own error
+                // holds nowhere else (`trace::error`).
+                d.evaluated_at(&picked, &decided);
+                let (xl, yl) = (d.graph.fold(Op::Lo, vec![x]), d.graph.fold(Op::Lo, vec![y]));
+                let (xh, yh) = (d.graph.fold(Op::Hi, vec![x]), d.graph.fold(Op::Hi, vec![y]));
+                let lo = d.graph.fold(Op::Min, vec![xl, yl]);
+                let hi = d.graph.fold(Op::Max, vec![xh, yh]);
+                let hull = d.graph.fold(Op::Span, vec![lo, hi]);
+                d.graph.fold(Op::Sel, vec![decided, picked, hull])
+            }
+        } else if a == args {
+            n
+        } else {
+            d.graph.fold(op, a)
+        };
+        map.insert(n, new);
+    }
+    map[&root]
 }
 
 /// One outcome absorbing another with the same row: live wherever either
