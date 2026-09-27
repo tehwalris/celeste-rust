@@ -587,6 +587,27 @@ this size is safe.
      comparison of a one-pixel part with an integer exact per lane is
      decided; (c) at the coarse levels, one decision per platform per move
      rather than per pixel. Open.
+   * PLATFORM WORLDS (Philippe, 2026-09-27) - what replaced (a)-(c). The
+     player never moves a platform, so all ten are a function of ONE number,
+     how many frames they have updated since the room loaded: within a
+     search's horizon there are about as many arrangements as frames (98
+     distinct states of one platform in 150 idle frames). So the platforms'
+     fields leave the abstraction: `concrete::platform_worlds` runs the room
+     and records every arrangement (a WORLD) up to `PLATFORM_WORLD_FRAMES`,
+     and a platforms-unknown frame takes ONE fork over the worlds
+     (`widen::fork_platform_inputs`, `Symbolic::world_choice`), every
+     platform field read off the configuration's world. Inside a
+     configuration the platforms are concrete and consistent - a row keeps
+     its spacing, at most one platform is near the player - so no test of the
+     player against a platform forks at all; across configurations the cases
+     ADD (one world per case) where independent intervals multiplied.
+     Nothing is carried across frames: every frame's end widens the platforms
+     to "any world" exactly as before, so the row format, the boundary and
+     the mark filter are unchanged. A frame past the worlds' horizon is
+     refused (`frame::forward_frame`).
+     Measured, room (6,0) at `r0sxhp`: the walk 8.9 s, every region at most
+     6-8 outcomes (mean ~3) - the same as with the platforms exact, plus the
+     world fork.
 6. Delete `quantify` - never on this branch (it came with `ac307ce`). What
    step 6 stood for here is the other limit that commit removed: the per-node
    `ChoiceSet` fork mask, which capped a frame at 58 forks and is what stops

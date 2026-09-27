@@ -1541,6 +1541,16 @@ pub fn forward_frame(
     edges_dir: Option<&std::path::Path>,
 ) -> Result<(Vec<Block>, bool, FrameStats)> {
     use std::time::Instant;
+    // A platforms-unknown level reads its platforms from the worlds a
+    // platform time up to `PLATFORM_WORLD_FRAMES` can reach
+    // (`concrete::platform_worlds`); a frame past that could hold one it
+    // does not have.
+    let level = crate::interpreter::abstraction::current_level();
+    anyhow::ensure!(
+        !level.platforms.is_unknown() || frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
+        "frame {frame} at {level}: the platform worlds cover {} frames",
+        crate::trace::kernel::PLATFORM_WORLD_FRAMES
+    );
     let mut st = FrameStats::default();
     let workers = threads();
     st.blocks_in = frontier.len();

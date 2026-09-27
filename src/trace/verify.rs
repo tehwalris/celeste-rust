@@ -290,7 +290,6 @@ pub fn trace_frame<'a>(
     it.d.escaped.clear();
     it.d.fork_origins.clear();
     it.d.evaluated.clear();
-    it.d.platform_inputs.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
     // THE KERNEL'S ADMISSIBLE INPUTS: the pins it was specialised on and the
     // ranges its region seeded. Built BEFORE the frame runs, so it names the
@@ -462,7 +461,6 @@ pub fn trace_frame<'a>(
             roots.push(o.error);
         }
         let reach = crate::transpile::bdd::reachable(&it.d.graph, &roots);
-        let point: std::collections::BTreeSet<u8> = it.d.fork_origins.iter().filter(|(_, o)| o == UNDECIDED_SELECT).map(|(k, _)| *k).collect();
         let mut live: std::collections::BTreeSet<u8> = Default::default();
         for (i, r) in reach.iter().enumerate() {
             if !*r {
@@ -473,11 +471,10 @@ pub fn trace_frame<'a>(
             }
         }
         eprintln!(
-            "[build] trace_frame: {} forks, {} with an origin: {by:?}; live {} ({} of them undecided selects)",
+            "[build] trace_frame: {} forks, {} with an origin: {by:?}; live {}",
             it.d.forks,
             it.d.fork_origins.len(),
-            live.len(),
-            live.iter().filter(|d| point.contains(d)).count()
+            live.len()
         );
     }
     let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
@@ -497,9 +494,6 @@ pub fn trace_frame<'a>(
     };
     Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, floors_unknown: it.d.floors_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, raise, in_cells, in_rt2 })
 }
-
-/// The fork origin of an undecided select's condition (`fork_undecided_selects`).
-const UNDECIDED_SELECT: &str = "an undecided select's condition";
 
 /// MAKING THE FRAME EXECUTABLE UNDER ABSTRACT INPUTS (plans/graph-model.md
 /// section 1, stage 2). The traced graph computes a row for concrete inputs;
@@ -566,7 +560,6 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<
                 .find(|n| matches!(d.graph.get(*n).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::UnknownBool(_)) && d.lane_undecidable(*n))
                 .unwrap_or(c)
         });
-        let first = if std::env::var_os("XFAST").is_some() && work.len() + done.len() > 200 { None } else { first };
         let Some(c) = first else {
             let same = |p: &FrameOut| p.shape == o.shape && p.keys == o.keys && p.fields.iter().map(|f| f.1).eq(o.fields.iter().map(|f| f.1));
             match done.iter_mut().find(|p| same(p)) {
@@ -575,13 +568,6 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<
             }
             continue;
         };
-        if std::env::var_os("XSPLIT").is_some() {
-            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 60 || n % 500 == 0 {
-                eprintln!("[xsplit] #{n} work {} done {} cond {}", work.len(), done.len(), super::emit::show_tree(&d.graph, c, 3));
-            }
-        }
         let (may_true, may_false) = d.may_answers(c);
         for (answer, may) in [(true, may_true), (false, may_false)] {
             let to = d.graph.leaf(Op::ConstBool(answer));
@@ -611,21 +597,6 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<
             side.keys = keys;
             work.push(side);
         }
-    }
-    if std::env::var_os("XDIFF").is_some() && done.len() > 20 {
-        let mut shapes: std::collections::BTreeSet<String> = Default::default();
-        let errs: std::collections::BTreeSet<NodeId> = done.iter().map(|o| o.error).collect();
-        for o in &done { shapes.insert(format!("{:?}", o.shape).chars().take(40).collect()); }
-        let mut per: Vec<(usize, String)> = Vec::new();
-        if let Some(first) = done.first() {
-            for (i, (p, _, _)) in first.fields.iter().enumerate() {
-                let vals: std::collections::BTreeSet<NodeId> = done.iter().filter(|o| o.shape == first.shape).filter_map(|o| o.fields.get(i).map(|f| f.1)).collect();
-                if vals.len() > 1 { per.push((vals.len(), super::iface::show(p))); }
-            }
-        }
-        per.sort_by(|a, b| b.0.cmp(&a.0));
-        per.truncate(12);
-        eprintln!("[xdiff] {} outcomes, {} shapes, {} distinct errors; varying fields (same shape as the first): {:?}", done.len(), shapes.len(), errs.len(), per);
     }
     Ok(done)
 }

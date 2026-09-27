@@ -311,6 +311,12 @@ pub struct KernelKey {
 /// The input bounds a frame is traced under (`verify::trace_frame`).
 pub type Bounds = Vec<(super::iface::Path, (i32, i32))>;
 
+/// How many frames of platform motion the platform worlds cover
+/// (`concrete::platform_worlds`): a platforms-unknown level is sound only for
+/// a search no longer than this, and refuses a longer one
+/// (`frame::forward_frame`).
+pub const PLATFORM_WORLD_FRAMES: usize = 127;
+
 /// A node of the constant-lattice walk: a shape key and a region.
 pub type WalkNode = (String, Option<Region>);
 
@@ -378,6 +384,12 @@ fn no_player_ranges(
     // the walk does with its lattice.
     let mut consts = shapes::field_constants(start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?;
     // The spawn takes ~20 frames; the cap only stops a phase that never ends.
+    // Only a phase run to its end - the player appears, or the shape
+    // changes - bounds anything: a hull of part of it could miss a later
+    // frame, and a phase that cannot be run concretely (a field already
+    // symbolic: room (5,0)'s balloon `offset`, an `rnd` draw) is not
+    // deterministic at all.
+    let mut ended = false;
     for _ in 0..240 {
         for (p, c) in &consts {
             if let Conc::Num(v) = c {
@@ -388,9 +400,10 @@ fn no_player_ranges(
         }
         let roots = shapes::state_paths(&st)?;
         let pin: Vec<(super::iface::Path, Conc)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
-        let f = super::verify::trace_frame(it, reset, fr, st.clone(), &roots, &pin, &[], opts.widen_mode(), &[])?;
+        let Ok(f) = super::verify::trace_frame(it, reset, fr, st.clone(), &roots, &pin, &[], opts.widen_mode(), &[]) else { break };
         let [o] = f.outs.as_slice() else { break };
         if o.shape != shape || shapes::player_path(&o.st).is_some() {
+            ended = true;
             break;
         }
         consts = shapes::field_constants(&o.st, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?;
@@ -398,6 +411,9 @@ fn no_player_ranges(
         let mut next = o.st.clone();
         shapes::rebase(&mut next, &mut it.d, &heap)?;
         st = next;
+    }
+    if !ended {
+        return Ok(Vec::new());
     }
     Ok(hull.into_iter().filter(|(_, (lo, hi))| lo < hi).collect())
 }
@@ -2390,6 +2406,10 @@ pub fn room_constant_lattice(
     it.d.floors_unknown = opts.floors;
     // ... and the moving platforms' (`widen::fork_platform_inputs`).
     it.d.platforms_unknown = opts.platforms;
+    // ... from the start room's platform worlds (`concrete::platform_worlds`).
+    if opts.platforms {
+        it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds(PLATFORM_WORLD_FRAMES)?));
+    }
 
     let st = cart::fresh_state::<Symbolic>(&mut it.d);
     let st = run_one(&mut it, top, st)?;
@@ -2419,7 +2439,7 @@ pub fn room_constant_lattice(
         Some(_) => no_player_ranges(&mut it, reset, fr, &start, opts)?,
         None => Vec::new(),
     };
-    if std::env::var_os("CELESTE_LATTICE_TRACE").is_some() || std::env::var_os("XREG").is_some() {
+    if std::env::var_os("CELESTE_LATTICE_TRACE").is_some() {
         eprintln!("[walk] no-player ranges: {:?}", no_player.iter().map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>());
     }
     lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?);
@@ -2876,9 +2896,6 @@ fn walk_trace(
         Err(e) => return Ok(WalkTraced::Refused(format!("{:#}", e), std::mem::take(&mut tr.it.illegal))),
     };
     let nodes_added = tr.it.d.node_count().saturating_sub(tr.it.trace_start_nodes);
-    if std::env::var_os("XREG").is_some() {
-        eprintln!("[xreg] region {:?} player {} outcomes {} forks {}", job.node.1, shapes::player_path(&job.st).is_some(), f.outs.len(), tr.it.d.forks);
-    }
     // Live forks of THIS trace.
     let (live_forks, forkops) = {
         let g = &tr.it.d.graph;

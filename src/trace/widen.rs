@@ -343,25 +343,40 @@ pub fn platform_paths<D: Domain>(st: &State<D>) -> PlatformPaths {
     out
 }
 
-/// The platforms' INPUT side at a platforms-unknown level
-/// (plans/platforms-unknown.md): `x` stays the interval input cell - per-lane
-/// data, so a comparison with it is a point split and it keeps its identity -
-/// and `last` is bound to that SAME value: `last == x` at every frame
-/// boundary, proved by every traced outcome (`widen_platforms`) and the start
-/// state. `rem.x` is the whole remainder as a literal, so the move's
-/// `__split_by_flr` runs as literal fragments.
+/// The platforms' INPUT side at a platforms-unknown level: ONE fork over the
+/// start room's PLATFORM WORLDS (`Symbolic::worlds`, `concrete::platform_worlds`)
+/// - every arrangement of the moving platforms a search can meet - and every
+/// platform field read off the world the configuration takes.
+///
+/// The row stores none of it: a platforms-unknown level widens the platforms
+/// at every frame's end (`widen_platforms`), so a lane never knows which
+/// world it is in, and every configuration applies to every lane - the fork
+/// has no validity. What it buys is that within a configuration the
+/// platforms are CONCRETE and consistent with each other: the platforms of a
+/// row keep their spacing, a wrap happens where it does, and every test of
+/// the player against a platform is one the kernel decides - where ten
+/// independent interval inputs made each a fork, and their product
+/// admitted the player carried by every platform at once (room (6,0),
+/// 2026-09-27). Configurations that come out alike fuse.
 pub fn fork_platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    let pp = platform_paths(st);
-    for (x, last) in pp.x.iter().zip(&pp.last) {
-        let Some(Value::Num(xv)) = iface::get(st, x) else { bail!("{}: not a number", iface::show(x)) };
-        let Some(Value::Num(_)) = iface::get(st, last) else { bail!("{}: not a number", iface::show(last)) };
-        iface::set(st, last, Value::Num(xv))?;
-        d.platform_inputs.push(xv);
-    }
-    for p in &pp.rem_x {
-        let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
-        let r = d.graph.leaf(Op::Const(PLATFORM_REM.0, PLATFORM_REM.1));
-        iface::set(st, p, Value::Num(r))?;
+    let worlds = d.worlds.clone().ok_or_else(|| anyhow::anyhow!("the platforms are unknown but there is no world table"))?;
+    let platforms = objects_of_type(st, "platform");
+    anyhow::ensure!(worlds.iter().all(|w| w.len() == platforms.len()), "a platform world has a different number of platforms than the state ({})", platforms.len());
+    let world = d.world_choice(worlds.len())?;
+    for (i, obj) in platforms.iter().enumerate() {
+        let paths = [field(obj, &["x"]), field(obj, &["last"]), field(obj, &["rem", "x"]), field(obj, &["spd", "x"])];
+        for (f, p) in paths.iter().enumerate() {
+            let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
+            let lit = |d: &mut Symbolic, v: i32| d.graph.leaf(Op::Const(v, v));
+            let mut v = lit(d, worlds[worlds.len() - 1][i][f]);
+            for j in (0..worlds.len() - 1).rev() {
+                let here = lit(d, (j as i32) << 16);
+                let is = d.graph.fold(Op::Eq, vec![world, here]);
+                let w = lit(d, worlds[j][i][f]);
+                v = d.graph.fold(Op::Sel, vec![is, w, v]);
+            }
+            iface::set(st, p, Value::Num(v))?;
+        }
     }
     Ok(())
 }
@@ -487,7 +502,18 @@ fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::tra
     let node = d.graph.get(n);
     let mut r = match node.op {
         Op::Const(a, b) => (a as i64, b as i64),
-        _ if d.platform_inputs.contains(&n) => ((PLATFORM_PATH.0 as i64) << 16, (PLATFORM_PATH.1 as i64) << 16),
+        // One of its arms: a platform world's field is a select over the
+        // worlds' literals (`fork_platform_inputs`).
+        Op::Sel => {
+            let (a, b) = (bounds(d, node.args[1], facts)?, bounds(d, node.args[2], facts)?);
+            (a.0.min(b.0), a.1.max(b.1))
+        }
+        Op::Flr => {
+            let a = bounds(d, node.args[0], facts)?;
+            (a.0.div_euclid(1 << 16) << 16, a.1.div_euclid(1 << 16) << 16)
+        }
+        // A fork's fragment lies inside its operand.
+        Op::Split(_) => bounds(d, node.args[0], facts)?,
         Op::Add => {
             let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
             (a.0 + b.0, a.1 + b.1)
@@ -496,6 +522,8 @@ fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::tra
             let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
             (a.0 - b.1, a.1 - b.0)
         }
+        // Known only from the branches around it.
+        _ if facts.iter().any(|f| f.0 == n) => (i64::MIN, i64::MAX),
         _ => return None,
     };
     for &(m, flo, fhi) in facts {

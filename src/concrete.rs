@@ -135,3 +135,62 @@ pub fn restore_buttons(
     Ok(())
 }
 // DFS with memoized dead ends per (key, cell).
+
+/// The moving platforms' fields a world fixes (`platform_worlds`): `x`,
+/// `last`, `rem.x`, `spd.x`, in that order, raw 16.16.
+pub const WORLD_FIELDS: usize = 4;
+
+/// THE PLATFORM WORLDS of the start room (plans/graph-model.md step 5): every
+/// arrangement of its moving platforms in the first `frames` frames, each
+/// platform's `(x, last, rem.x, spd.x)` in the order the platforms stand in
+/// `objects`, deduplicated.
+///
+/// A platform moves by `dir * 0.65` a frame and nothing the player does
+/// moves it, so the arrangement is a function of one number - how many
+/// frames the platforms have updated since the room loaded - and running
+/// the room with no input visits every arrangement a search of up to
+/// `frames` frames can meet (a freeze or a restart only makes that number
+/// smaller). What a search further than `frames` would need is not here,
+/// and the caller must refuse such a search.
+pub fn platform_worlds(frames: usize) -> Result<Vec<Vec<[i32; WORLD_FIELDS]>>> {
+    use crate::interpreter::inspect::StateHelper;
+    let mut ce = ConcreteEngine::new()?;
+    let mut state = ce.initial_state()?;
+    let mut seen: std::collections::BTreeSet<Vec<[i32; WORLD_FIELDS]>> = Default::default();
+    let mut worlds = Vec::new();
+    for _ in 0..=frames {
+        let helper = StateHelper::new(&state);
+        let objects = helper.find_global("objects").ok_or_else(|| anyhow!("no `objects`"))?;
+        let HeapValue::Value(Value::Pointer(array)) = helper.load(objects) else { return Err(anyhow!("`objects` is not a table")) };
+        let number = |id: crate::interpreter::heap::HeapId, field: &str| -> Option<i32> {
+            let HeapValue::ObjectTable(obj) = helper.load(id) else { return None };
+            match helper.load(*obj.get(field)?) {
+                HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => Some(n.as_raw_u32() as i32),
+                _ => None,
+            }
+        };
+        let sub = |id: crate::interpreter::heap::HeapId, field: &str| -> Option<crate::interpreter::heap::HeapId> {
+            let HeapValue::ObjectTable(obj) = helper.load(id) else { return None };
+            match helper.load(*obj.get(field)?) {
+                HeapValue::Value(Value::Pointer(p)) => Some(*p),
+                _ => None,
+            }
+        };
+        let mut world = Vec::new();
+        for p in helper.find_objects_by_type(*array, "platform").map_err(|e| anyhow!("{e:?}"))? {
+            let field = |v: Option<i32>, name: &str| v.ok_or_else(|| anyhow!("a platform without a numeric `{name}`"));
+            world.push([
+                field(number(p, "x"), "x")?,
+                field(number(p, "last"), "last")?,
+                field(sub(p, "rem").and_then(|r| number(r, "x")), "rem.x")?,
+                field(sub(p, "spd").and_then(|s| number(s, "x")), "spd.x")?,
+            ]);
+        }
+        drop(helper);
+        if seen.insert(world.clone()) {
+            worlds.push(world);
+        }
+        state = ce.step_frame(state, 0)?;
+    }
+    Ok(worlds)
+}
