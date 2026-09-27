@@ -2351,6 +2351,9 @@ pub fn room_constant_lattice(
     let mut frames: std::collections::BTreeMap<WalkNode, WalkFrame> = Default::default();
     let mut forkops: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let mut refused: std::collections::BTreeMap<WalkNode, String> = Default::default();
+    // Poisoned paths over the WHOLE walk, by reason: summed from the per-job
+    // drains of `Interp::illegal`, reported at the end (see `WalkTraced`).
+    let mut illegal: std::collections::BTreeMap<String, usize> = Default::default();
     let mut ival_extra: std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>> = Default::default();
 
     let sk = key(&start)?;
@@ -2481,7 +2484,10 @@ pub fn room_constant_lattice(
             let job = &jobs[i];
             let (k, region) = (&job.node.0, job.node.1);
             match t {
-                WalkTraced::Refused(e) => {
+                WalkTraced::Refused(e, poisoned) => {
+                    for (why, n) in poisoned {
+                        *illegal.entry(why).or_default() += n;
+                    }
                     // Remember the refusal instead of silently skipping: a
                     // shape that never traces is a MISSING KERNEL, and the
                     // post-fixpoint check below turns that into a hard
@@ -2498,7 +2504,10 @@ pub fn room_constant_lattice(
                     refused.insert(job.node.clone(), e);
                     frames.remove(&job.node);
                 }
-                WalkTraced::Traced { frame, bound, forks: live_forks, forkops: ops, nodes_added, arena, outs, skipped } => {
+                WalkTraced::Traced { frame, bound, forks: live_forks, forkops: ops, nodes_added, arena, outs, skipped, illegal: poisoned } => {
+                    for (why, n) in poisoned {
+                        *illegal.entry(why).or_default() += n;
+                    }
                     refused.remove(&job.node);
                     forks.insert(k.clone(), live_forks);
                     if live_forks > 2 {
@@ -2631,6 +2640,17 @@ pub fn room_constant_lattice(
         nodes.len(),
         t_walk.elapsed().as_secs_f64()
     );
+    // POISONED PATHS, unconditionally: a Lua type error the tracer could not
+    // prove unreachable is a modelling gap, and it is worth exactly as much
+    // attention as a refusal. Silent until 2026-09-27, and measured at zero in
+    // rooms (0,0) through (6,0) - so a non-empty line here is news.
+    if !illegal.is_empty() {
+        let total: usize = illegal.values().sum();
+        eprintln!("[walk] {total} POISONED paths (a Lua raise the tracer could not rule out), by reason:");
+        for (why, n) in &illegal {
+            eprintln!("[walk]   {n} x {why}");
+        }
+    }
     let graph = it.d.graph.clone();
     let mut by_hash = std::collections::HashMap::new();
     for ((k, _), wf) in &frames {
@@ -2701,7 +2721,8 @@ struct WalkOutcome {
 
 /// One traced walk node, or why its trace refused.
 enum WalkTraced {
-    Refused(String),
+    /// Why the trace did not compile, and what it poisoned before refusing.
+    Refused(String, std::collections::BTreeMap<String, usize>),
     Traced {
         frame: super::verify::Frame,
         bound: std::result::Result<Bound, String>,
@@ -2711,6 +2732,17 @@ enum WalkTraced {
         arena: usize,
         outs: Vec<WalkOutcome>,
         skipped: Vec<&'static str>,
+        /// Paths this trace POISONED, by reason (`Interp::illegal`, drained
+        /// per job so the walk can sum them).
+        ///
+        /// Carried out of the worker because it is the one number that says
+        /// the tracer lost an invariant the game holds, and it used to reach
+        /// nobody: `Interp::illegal` is read only by an `#[ignore]`d test, and
+        /// a poisoned OUTCOME shows up in production only as `[lattice]
+        /// outcome skipped: ok folds false` under `CELESTE_LATTICE_TRACE`. A
+        /// modelling gap should not depend on remembering an environment
+        /// variable (plans/graph-model.md section 4).
+        illegal: std::collections::BTreeMap<String, usize>,
     },
 }
 
@@ -2736,13 +2768,30 @@ fn walk_trace(
     use super::domain::Domain;
     use super::{shapes, verify};
     use crate::transpile::graph::Op;
+    // `Interp::illegal` is never cleared, and a worker runs many jobs, so
+    // every exit from here has to account for what THIS trace poisoned or the
+    // reasons land on some later job instead. Emptied on the way in - the
+    // previous job took its own - so whatever is in the map at an exit is
+    // this trace's.
+    //
+    // The two exits that RETURN a `WalkTraced` both drain (`Traced` below,
+    // `Refused` just after this). The `?` exits do not, and do not need to:
+    // an `Err` from here propagates through the worker to
+    // `room_constant_lattice`'s `traced.extend(r?)`, which fails the whole
+    // walk, so there is no later job on this worker to mis-attribute to. The
+    // assert is what would say so if that ever stopped being true.
+    debug_assert!(tr.it.illegal.is_empty(), "a previous job left {} poison reasons behind", tr.it.illegal.len());
+    tr.it.illegal.clear();
     let mut st = job.st.clone();
     if let Some(constants) = &job.rebase {
         shapes::rebase(&mut st, &mut tr.it.d, constants)?;
     }
     let f = match verify::trace_frame(&mut tr.it, tr.reset, tr.fr, st, &job.roots, &job.pin, &job.ival, opts.widen_mode(), &job.bounds) {
         Ok(f) => f,
-        Err(e) => return Ok(WalkTraced::Refused(format!("{:#}", e))),
+        // A REFUSED trace can have poisoned paths before it refused, and they
+        // count: the refusal says this (shape, region) did not compile, the
+        // poison says the model admitted a Lua raise on the way there.
+        Err(e) => return Ok(WalkTraced::Refused(format!("{:#}", e), std::mem::take(&mut tr.it.illegal))),
     };
     let nodes_added = tr.it.d.node_count().saturating_sub(tr.it.trace_start_nodes);
     // Live forks of THIS trace.
@@ -2808,7 +2857,11 @@ fn walk_trace(
         outs.push(WalkOutcome { key, constants, ival, regions, st: o.st.clone(), heap_constants });
     }
     let bound = super::emit::bind(&f, &tr.it.d.graph, opts.widen).map_err(|e| format!("{:#}", e));
-    Ok(WalkTraced::Traced { frame: f, bound, forks: live_forks, forkops, nodes_added, arena: tr.it.d.node_count(), outs, skipped })
+    // DRAINED, not copied: `Interp::illegal` is never cleared, so a worker's
+    // map would otherwise accumulate across every job it runs and the walk
+    // would count the same poisoned path once per later trace.
+    let illegal = std::mem::take(&mut tr.it.illegal);
+    Ok(WalkTraced::Traced { frame: f, bound, forks: live_forks, forkops, nodes_added, arena: tr.it.d.node_count(), outs, skipped, illegal })
 }
 
 /// The tracer a walk ran in, kept so a shape can be re-traced later in
