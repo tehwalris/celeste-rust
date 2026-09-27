@@ -407,9 +407,11 @@ this size is safe.
 
    * `widen.rs` 123 (the `require` helper - a free function there, NOT a
      `Domain` method), 201, 401, 592, 667, 865, 884, 887, 973; `interp.rs:1962`
-     (a `move` fork's span premise); `verify.rs:340` (the pin guard) - all
-     preconditions, i.e. unary operators on an input that error on an invalid
-     one.
+     (a `move` fork's span premise) - all preconditions, i.e. unary operators
+     on an input that error on an invalid one. TEN, not eleven:
+     `verify.rs:340` is not a write at all, it builds a LOCAL `ok` from `s.ok`
+     and `pin_ok` for the outcome's root, so the pin guard belongs with the
+     reads below.
    * `interp.rs:702` (`Known(cond)` where a merged VALUE is a select) and
      `interp.rs:890` (the unrolled loop's bound).
 

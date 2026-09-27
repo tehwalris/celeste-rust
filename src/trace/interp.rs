@@ -698,8 +698,10 @@ impl<'a, D: Domain> Interp<'a, D> {
             _ => false,
         };
         if selects && !m.selects {
+            // `Sel`'s own error: the arms differ, so an undecided condition
+            // leaves this value undefined on that lane.
             let decided = self.d.known(&m.cond);
-            state.ok = self.d.and(&state.ok, &decided);
+            state.own_error(&mut self.d, &decided);
         }
         state
     }
@@ -887,7 +889,9 @@ impl<'a, D: Domain> Interp<'a, D> {
         let over = self.d.compare(Cmp::Le, &iv, &limit)?;
         let finished = self.d.not(&over);
         for (s, _) in running.iter_mut() {
-            s.ok = self.d.and(&s.ok, &finished);
+            // The unrolled loop's own error: its condition still holds after
+            // the bound ran out.
+            s.own_error(&mut self.d, &finished);
         }
         done.extend(running);
         self.collapse(done)
@@ -1959,7 +1963,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                     let premise = self.d.span_ok(&x, ways);
                     let mut st = st;
                     st.guard = self.d.and(&st.guard, &valid);
-                    st.ok = self.d.and(&st.ok, &premise);
+                    st.precondition(&mut self.d, &premise);
                     (st, Value::Num(v))
                 }
             }

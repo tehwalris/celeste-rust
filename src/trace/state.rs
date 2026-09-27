@@ -177,6 +177,30 @@ impl<D: Domain> State<D> {
     pub fn shape(&self) -> Result<Shape> {
         self.heap.shape(&self.roots())
     }
+
+    /// A PRECONDITION on this kernel's inputs: `c` must hold, or these inputs
+    /// should not have been run through this body at all (a widened field
+    /// outside the band it was widened to, a fork whose parts do not cover the
+    /// lane, a pin that does not match).
+    ///
+    /// One error concept, so this and `own_error` below have the SAME body -
+    /// the names are the classification, which is what step 4 needs in order
+    /// to derive error per value instead of carrying one boolean per state
+    /// (plans/graph-model.md section 4). Naming them costs nothing: the node
+    /// is `fold(And, ..)` either way, and `fold` sorts `And`'s operands by id,
+    /// so neither the spelling nor the order changes what is interned.
+    pub fn precondition(&mut self, d: &mut D, c: &D::Bool) {
+        self.ok = d.and(&self.ok, c);
+    }
+
+    /// An OPERATOR'S OWN ERROR: this expression is partial, and `c` is the
+    /// condition under which it has a value at all - `Known(cond)` where a
+    /// merged value is a select, or an unrolled loop's bound having run out.
+    /// Unlike a precondition this is a property of a VALUE, so once error is
+    /// derived these become `own_error(n, args)` on the node itself.
+    pub fn own_error(&mut self, d: &mut D, c: &D::Bool) {
+        self.ok = d.and(&self.ok, c);
+    }
 }
 
 /// Merge `t` (condition true) and `f` (condition false) if their shapes

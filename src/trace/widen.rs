@@ -117,10 +117,10 @@ fn ival(d: &mut Symbolic, lo: P8, hi: P8) -> <Symbolic as Domain>::Num {
     d.graph.leaf(Op::Const(lo.as_raw_u32() as i32, hi.as_raw_u32() as i32))
 }
 
-/// Conjoin `c` into the state's obligation.
+/// Conjoin `c` into the state's obligation: a PRECONDITION on the widened
+/// input (`State::precondition`).
 fn require(st: &mut State<Symbolic>, d: &mut Symbolic, c: <Symbolic as Domain>::Bool) {
-    let ok = st.ok;
-    st.ok = d.and(&ok, &c);
+    st.precondition(d, &c);
 }
 
 /// Which boundary widenings a traced frame bakes into its graph.
@@ -198,7 +198,7 @@ fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()
         let width = d.graph.fold(Op::Sub, vec![hi, lo]);
         let period = d.graph.leaf(Op::Const(BALLOON_PERIOD_RAW, BALLOON_PERIOD_RAW));
         let full = d.graph.fold(Op::Ge, vec![width, period]);
-        st.ok = d.graph.fold(Op::And, vec![st.ok, full]);
+        st.precondition(d, &full);
         let canon = d.graph.leaf(Op::Const(0, BALLOON_PERIOD_RAW));
         iface::set(st, &p, Value::Num(canon))?;
     }
@@ -398,7 +398,7 @@ fn contain(st: &mut State<Symbolic>, d: &mut Symbolic, v: crate::transpile::grap
     let above = d.graph.fold(Op::Ge, vec![vlo, klo]);
     let below = d.graph.fold(Op::Le, vec![vhi, khi]);
     let inside = d.graph.fold(Op::And, vec![above, below]);
-    st.ok = d.graph.fold(Op::And, vec![st.ok, inside]);
+    st.precondition(d, &inside);
 }
 
 /// Does `v` provably lie in `[lo, hi]` (raw)? Through the arms of a select,
@@ -589,7 +589,7 @@ fn widen_fly_fruit(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
                 let above = d.graph.fold(Op::Ge, vec![vlo, klo]);
                 let below = d.graph.fold(Op::Le, vec![vhi, khi]);
                 let inside = d.graph.fold(Op::And, vec![above, below]);
-                st.ok = d.graph.fold(Op::And, vec![st.ok, inside]);
+                st.precondition(d, &inside);
             }
         }
         let r = d.graph.leaf(Op::Const(*lo, *hi));
@@ -663,8 +663,7 @@ fn widen_rem(
             }
 
             let rb = rem_bucket_node(d, old, bits)?;
-            let ok = st.ok;
-            st.ok = d.and(&ok, &rb.premise);
+            st.precondition(d, &rb.premise);
             iface::set(st, &p, Value::Num(rb.value))?;
         }
     }
@@ -861,8 +860,7 @@ fn widen_spd(
                 let sb = spd_table_node(d, old, celeste_core::spd_buckets::edges(w, ax), &range)?;
                 if let Some((valid, premise)) = sb.fork {
                     st.guard = d.and(&st.guard, &valid);
-                    let ok = st.ok;
-                    st.ok = d.and(&ok, &premise);
+                    st.precondition(d, &premise);
                 }
                 iface::set(st, &p, Value::Num(sb.tight))?;
                 st.key_override.push((p.clone(), sb.value));
@@ -880,11 +878,9 @@ fn widen_spd(
             let sb = spd_bucket_node(d, old, w)?;
             if let Some((valid, premise)) = sb.fork {
                 st.guard = d.and(&st.guard, &valid);
-                let ok = st.ok;
-                st.ok = d.and(&ok, &premise);
+                st.precondition(d, &premise);
             }
-            let ok = st.ok;
-            st.ok = d.and(&ok, &sb.premise);
+            st.precondition(d, &sb.premise);
             // THE SPEED HULL (2026-09-15): the row stores the tight
             // fragment and is keyed on the bucket, so states that differ
             // only within a bucket are one state whose interval is only as
@@ -970,7 +966,7 @@ pub fn fork_pos_inputs<D: Domain>(
             let (v, valid) = d.fork_int(&old, w);
             let premise = d.span_ok(&old, w);
             st.guard = d.and(&st.guard, &valid);
-            st.ok = d.and(&st.ok, &premise);
+            st.precondition(d, &premise);
             iface::set(st, &p, Value::Num(v))?;
         }
     }
