@@ -528,6 +528,74 @@ pub fn trace_frame<'a>(
 /// Comparisons are refolded with the static ranges (`Symbolic::compare`), so
 /// a branch the kernel's region never takes folds away, and what it read
 /// with it.
+/// `o` with every comparison its facts decide replaced by the answer - an
+/// unknown against a lane value plus a constant that the facts settle;
+/// implied, so it needs no validity - and the facts renamed to match.
+/// Before the side is keyed, so two sides equal under what they know merge.
+fn settle(d: &mut Symbolic, o: &mut FrameOut, facts: Facts) -> Facts {
+    let mut roots: Vec<NodeId> = o.fields.iter().map(|f| f.1).collect();
+    roots.extend(o.keys.iter().map(|k| k.1));
+    roots.extend([o.error, o.guard]);
+    let reach = cone(&d.graph, &roots);
+    let decided = facts.decide(d, &reach);
+    if decided.is_empty() {
+        return facts;
+    }
+    let map = rebuild_all(d, &reach, &decided);
+    let m = |n: NodeId| map.get(&n).copied().unwrap_or(n);
+    o.guard = m(o.guard);
+    o.error = m(o.error);
+    for f in &mut o.fields {
+        f.1 = m(f.1);
+    }
+    for k in &mut o.keys {
+        k.1 = m(k.1);
+    }
+    facts.rename(&map)
+}
+
+/// `split_undecided_selects`' queue: the outcomes still to split, popped
+/// largest cone first, and deduped as they arrive - a side equal to an
+/// outcome still waiting is that outcome, live wherever either is, knowing
+/// what both know (`merge_into`, `Facts::join`).
+#[derive(Default)]
+struct Waiting {
+    slots: Vec<Option<(FrameOut, Facts)>>,
+    index: rustc_hash::FxHashMap<(super::heap::Shape, Vec<(usize, NodeId)>, Vec<NodeId>), usize>,
+    heap: std::collections::BinaryHeap<(usize, std::cmp::Reverse<usize>)>,
+}
+
+impl Waiting {
+    fn key(o: &FrameOut) -> (super::heap::Shape, Vec<(usize, NodeId)>, Vec<NodeId>) {
+        (o.shape.clone(), o.keys.clone(), o.fields.iter().map(|f| f.1).collect())
+    }
+
+    fn push(&mut self, d: &mut Symbolic, o: FrameOut, facts: Facts, size: usize) {
+        let key = Self::key(&o);
+        if let Some(&i) = self.index.get(&key) {
+            let (p, pf) = self.slots[i].as_mut().expect("an indexed outcome is waiting");
+            merge_into(d, p, o.guard, o.error);
+            *pf = pf.join(&facts);
+            return;
+        }
+        let i = self.slots.len();
+        self.slots.push(Some((o, facts)));
+        self.index.insert(key, i);
+        self.heap.push((size, std::cmp::Reverse(i)));
+    }
+
+    fn pop(&mut self) -> Option<(FrameOut, Facts)> {
+        let (_, std::cmp::Reverse(i)) = self.heap.pop()?;
+        let out = self.slots[i].take().expect("a queued outcome is waiting");
+        self.index.remove(&Self::key(&out.0));
+        Some(out)
+    }
+
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+}
+
 fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<FrameOut>> {
     use crate::transpile::graph::Op;
     const MAX_OUTCOMES: usize = 4096;
@@ -537,28 +605,51 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<
         r.push(o.error);
         r
     };
-    if std::env::var_os("XSUM").is_some() {
-        eprintln!("[xsum] enter: {} outcomes, guard cones {:?}", outs.len(), outs.iter().map(|o| cone(&d.graph, &[o.guard]).len()).collect::<Vec<_>>());
-    }
-    let mut work: Vec<FrameOut> = outs;
-    let t0 = std::time::Instant::now();
-    for o in work.iter_mut() {
+    let every = |o: &FrameOut| -> Vec<NodeId> {
+        let mut r = stored(o);
+        r.push(o.guard);
+        r
+    };
+    let n_in = outs.len();
+    // The outcomes waiting, LARGEST CONE FIRST. A split only shrinks an
+    // outcome's cone, so every path into a state has arrived - and merged
+    // with it - before the state is split: popped in any other order, a
+    // state reached by several paths was split again for each (room (6,0):
+    // 20k splits churning ~20 outcomes, the same three platforms tested
+    // from scratch each time).
+    let mut work = Waiting::default();
+    for mut o in outs {
         o.guard = three_valued(d, o.guard);
-    }
-    if std::env::var_os("XSUM").is_some() {
-        eprintln!("[xsum] three_valued {} outcomes {:.2}s, guard cones {:?}", work.len(), t0.elapsed().as_secs_f64(), work.iter().map(|o| cone(&d.graph, &[o.guard]).len()).collect::<Vec<_>>());
+        let size = cone(&d.graph, &stored(&o)).len();
+        work.push(d, o, Facts::default(), size);
     }
     let mut n_splits = 0usize;
     let mut done: Vec<FrameOut> = Vec::new();
-    while let Some(o) = work.pop() {
+    while let Some((o, facts)) = work.pop() {
         anyhow::ensure!(work.len() + done.len() < MAX_OUTCOMES, "more than {MAX_OUTCOMES} outcomes splitting undecided selects");
         // The cone of what must be resolved, in node order - the outcome's
         // own, not the arena's: each split adds nodes, and a walk of the
         // whole arena per split made the splitting quadratic.
         let reach = cone(&d.graph, &stored(&o));
+        // A select `three_valued` guarded - `Sel(Known(c), Sel(c, x, y), ..)`,
+        // evaluated only where the lane decides `c` - needs no split: the
+        // kernel reads it as it stands. A merge's error reads the guards
+        // (`merge_into`), and would otherwise split their selects again.
+        let guarded: rustc_hash::FxHashSet<NodeId> = reach
+            .iter()
+            .filter_map(|n| {
+                let node = d.graph.get(*n);
+                if node.op != Op::Sel {
+                    return None;
+                }
+                let k = d.graph.get(node.args[0]);
+                let inner = d.graph.get(node.args[1]);
+                (k.op == Op::Known && inner.op == Op::Sel && inner.args[0] == k.args[0]).then_some(node.args[1])
+            })
+            .collect();
         let first: Option<NodeId> = reach
             .iter()
-            .filter(|n| d.graph.get(**n).op == Op::Sel)
+            .filter(|n| d.graph.get(**n).op == Op::Sel && !guarded.contains(*n))
             .map(|n| d.graph.get(*n).args[0])
             .find(|c| d.lane_undecidable(*c));
         let Some(c) = first else {
@@ -569,17 +660,32 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<
             }
             continue;
         };
+        // Split on the finest undecidable part of it - the lowest comparison
+        // a lane can hold both ways - so that what the answer says about the
+        // unknown it reads can be KEPT (`Facts`): the player's every later
+        // test of the same platform is then decided, not split again.
+        let atom = cone(&d.graph, &[c])
+            .into_iter()
+            .find(|n| matches!(d.graph.get(*n).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::UnknownBool(_)) && d.lane_undecidable(*n))
+            .unwrap_or(c);
         n_splits += 1;
-        if std::env::var_os("XSUM").is_some() && n_splits % 2000 == 0 {
-            eprintln!("[xprog] {n_splits} splits, work {} done {}; cond {}", work.len(), done.len(), super::emit::show_tree(&d.graph, c, 4));
+        if n_splits % 2000 == 0 && std::env::var_os("XSUM").is_some() {
+            eprintln!("[xprog] {n_splits} splits, work {} done {}, facts {}, cone {}, graph {}; atom {}", work.len(), done.len(), facts.0.len(), reach.len(), d.graph.len(), super::emit::show_tree(&d.graph, atom, 6));
+            eprintln!("[xrel] {:?}", relation(d, atom).map(|(r, op, t)| (facts.0.get(&r).copied(), r, op, t)));
         }
-        let (may_true, may_false) = d.may_answers(c);
-        let mut all = stored(&o);
-        all.push(o.guard);
-        let reach = cone(&d.graph, &all);
+        let (may_true, may_false) = d.may_answers(atom);
+        let reach = cone(&d.graph, &every(&o));
+        let rel = relation(d, atom);
         for (answer, may) in [(true, may_true), (false, may_false)] {
+            let mut learnt = facts.clone();
+            if let Some((r, op, t)) = &rel {
+                if !learnt.narrow(r.clone(), op, *t, answer) {
+                    continue;
+                }
+            }
             let to = d.graph.leaf(Op::ConstBool(answer));
-            let map = rebuild(d, &reach, c, to);
+            let map = rebuild_all(d, &reach, &rustc_hash::FxHashMap::from_iter([(atom, to)]));
+            let learnt = learnt.rename(&map);
             let m = |n: NodeId| map.get(&n).copied().unwrap_or(n);
             let guard = m(o.guard);
             let guard = d.and(&guard, &may);
@@ -589,13 +695,6 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<
             let error = m(o.error);
             let fields: Vec<NodeId> = o.fields.iter().map(|f| m(f.1)).collect();
             let keys: Vec<(usize, NodeId)> = o.keys.iter().map(|(i, k)| (*i, m(*k))).collect();
-            // Deduped as it goes: a side equal to an outcome still waiting is
-            // that outcome, live wherever either is.
-            let same = |p: &FrameOut| p.shape == o.shape && p.keys == keys && p.fields.iter().map(|f| f.1).eq(fields.iter().copied());
-            if let Some(p) = work.iter_mut().find(|p| same(p)) {
-                merge_into(d, p, guard, error);
-                continue;
-            }
             let mut side = o.clone();
             side.guard = guard;
             side.error = error;
@@ -603,13 +702,184 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<
                 f.1 = n;
             }
             side.keys = keys;
-            work.push(side);
+            let learnt = settle(d, &mut side, learnt);
+            let size = cone(&d.graph, &stored(&side)).len();
+            work.push(d, side, learnt, size);
         }
     }
-    if std::env::var_os("XSUM").is_some() {
-        eprintln!("[xsum] {n_splits} splits, {} out", done.len());
+    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+        eprintln!("[build] split_undecided_selects: {n_in} outcomes, {n_splits} splits, {} out", done.len());
     }
     Ok(done)
+}
+
+/// An unknown relative to a lane value: `u - anchor`, `u` the one term a lane
+/// holds a set of (a platform's `x`), `anchor` a sum of terms each lane holds
+/// one value of (the player's `x`, a move's step), as `(negated, term)`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Rel {
+    u: NodeId,
+    anchor: Vec<(bool, NodeId)>,
+}
+
+/// What a side of `split_undecided_selects` has learnt from the comparisons
+/// it split: the range of each `u - anchor` (raw, inclusive). A comparison
+/// of the same difference against another threshold is then decided, as far
+/// as the range settles it - the relation intervals alone cannot hold
+/// ("platform 2 is more than 10 px right of the player") that made every
+/// check after a move split again on the same platform (room (6,0),
+/// 2026-09-27).
+///
+/// Sound as a case split over CONCRETE states: each state goes down the
+/// side of its own answer, so what the answer says of its `u - anchor` holds
+/// for every state the side stands for (the lanes a side over-covers are
+/// accounted for on the other side).
+#[derive(Clone, Default)]
+struct Facts(std::collections::BTreeMap<Rel, (i64, i64)>);
+
+/// `u - anchor op t`, `t` some value in `[t.0, t.1]`: an interval constant
+/// in the comparison (the sub-pixel remainder) is one value per concrete
+/// state, not known here.
+type Threshold = (i64, i64);
+
+impl Facts {
+    /// Keep that `rel op t` came out `answer`. `false` where that
+    /// contradicts what is known: the side is empty.
+    fn narrow(&mut self, rel: Rel, op: &crate::transpile::graph::Op, t: Threshold, answer: bool) -> bool {
+        use crate::transpile::graph::Op;
+        let r = self.0.entry(rel).or_insert((i64::MIN, i64::MAX));
+        let (tlo, thi) = t;
+        let (lo, hi) = match (op, answer) {
+            (Op::Lt, true) | (Op::Ge, false) => (r.0, r.1.min(thi - 1)),
+            (Op::Lt, false) | (Op::Ge, true) => (r.0.max(tlo), r.1),
+            (Op::Le, true) | (Op::Gt, false) => (r.0, r.1.min(thi)),
+            (Op::Le, false) | (Op::Gt, true) => (r.0.max(tlo + 1), r.1),
+            (Op::Eq, true) => (r.0.max(tlo), r.1.min(thi)),
+            _ => *r,
+        };
+        *r = (lo, hi);
+        lo <= hi
+    }
+
+    /// The comparisons in `nodes` these facts settle, each to its constant.
+    fn decide(&self, d: &mut Symbolic, nodes: &[NodeId]) -> rustc_hash::FxHashMap<NodeId, NodeId> {
+        use crate::transpile::graph::Op;
+        let mut out: rustc_hash::FxHashMap<NodeId, NodeId> = Default::default();
+        if self.0.is_empty() {
+            return out;
+        }
+        for &n in nodes {
+            if !matches!(d.graph.get(n).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq) {
+                continue;
+            }
+            let Some((rel, op, (tlo, thi))) = relation(d, n) else { continue };
+            let Some(&(lo, hi)) = self.0.get(&rel) else { continue };
+            let answer = match op {
+                Op::Lt => (hi < tlo).then_some(true).or((lo >= thi).then_some(false)),
+                Op::Le => (hi <= tlo).then_some(true).or((lo > thi).then_some(false)),
+                Op::Gt => (lo > thi).then_some(true).or((hi <= tlo).then_some(false)),
+                Op::Ge => (lo >= thi).then_some(true).or((hi < tlo).then_some(false)),
+                _ => (lo == hi && tlo == thi && lo == tlo).then_some(true).or((hi < tlo || lo > thi).then_some(false)),
+            };
+            if let Some(a) = answer {
+                out.insert(n, d.graph.leaf(Op::ConstBool(a)));
+            }
+        }
+        out
+    }
+
+    /// The facts renamed through a rebuild: on the side that made it, a
+    /// rebuilt node equals its original on every state, so what was known
+    /// of the one is known of the other.
+    fn rename(&self, map: &rustc_hash::FxHashMap<NodeId, NodeId>) -> Facts {
+        let m = |n: NodeId| map.get(&n).copied().unwrap_or(n);
+        let mut out = Facts::default();
+        for (rel, &(lo, hi)) in &self.0 {
+            let mut anchor: Vec<(bool, NodeId)> = rel.anchor.iter().map(|(neg, t)| (*neg, m(*t))).collect();
+            anchor.sort();
+            let r = out.0.entry(Rel { u: m(rel.u), anchor }).or_insert((i64::MIN, i64::MAX));
+            *r = (r.0.max(lo), r.1.min(hi));
+        }
+        out
+    }
+
+    /// What two merged sides both know: each common difference's hull.
+    fn join(&self, other: &Facts) -> Facts {
+        Facts(self.0.iter().filter_map(|(k, a)| other.0.get(k).map(|b| (k.clone(), (a.0.min(b.0), a.1.max(b.1))))).collect())
+    }
+}
+
+/// `c` as `u - anchor op t` (`Rel`, `Threshold`): a comparison whose two
+/// sides differ by ONE term a lane holds a set of, with coefficient 1 after
+/// normalising, terms each lane holds one value of, and constants (interval
+/// constants included, as the threshold's range).
+fn relation(d: &mut Symbolic, c: NodeId) -> Option<(Rel, crate::transpile::graph::Op, Threshold)> {
+    use crate::transpile::graph::Op;
+    fn linear(d: &Symbolic, n: NodeId, neg: bool, terms: &mut Vec<(bool, NodeId)>, k: &mut (i64, i64)) -> bool {
+        let node = d.graph.get(n);
+        match node.op {
+            Op::Add => linear(d, node.args[0], neg, terms, k) && linear(d, node.args[1], neg, terms, k),
+            Op::Sub => linear(d, node.args[0], neg, terms, k) && linear(d, node.args[1], !neg, terms, k),
+            Op::Neg => linear(d, node.args[0], !neg, terms, k),
+            Op::Const(lo, hi) => {
+                let (lo, hi) = (lo as i64, hi as i64);
+                if neg {
+                    *k = (k.0 - hi, k.1 - lo);
+                } else {
+                    *k = (k.0 + lo, k.1 + hi);
+                }
+                true
+            }
+            _ => {
+                // A term and its negation cancel.
+                match terms.iter().position(|t| t.1 == n && t.0 != neg) {
+                    Some(i) => {
+                        terms.remove(i);
+                    }
+                    None => terms.push((neg, n)),
+                }
+                true
+            }
+        }
+    }
+    let node = d.graph.get(c);
+    let op = node.op.clone();
+    if !matches!(op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq) {
+        return None;
+    }
+    let (l, r) = (node.args[0], node.args[1]);
+    // Integer reasoning holds only where the 16.16 sums cannot wrap: both
+    // sides must have a static range (`pieces_of` refuses an overflow). A
+    // decided comparison is never evaluated, so the kernel's own overflow
+    // check on it would go with it.
+    if d.range_of(l).is_none() || d.range_of(r).is_none() {
+        return None;
+    }
+    let (mut terms, mut k) = (Vec::new(), (0i64, 0i64));
+    if !linear(d, l, false, &mut terms, &mut k) || !linear(d, r, true, &mut terms, &mut k) {
+        return None;
+    }
+    // `sum(terms) + k op 0`, exactly one of them a set.
+    let sets: Vec<usize> = (0..terms.len()).filter(|&i| d.abstract_beneath_lane_ops(terms[i].1)).collect();
+    let [i] = sets.as_slice() else { return None };
+    let (u_neg, u) = terms.remove(*i);
+    // Make `u`'s coefficient +1: negate everything, and mirror the operator.
+    let (op, k, terms) = if u_neg {
+        let mirror = match op {
+            Op::Lt => Op::Gt,
+            Op::Le => Op::Ge,
+            Op::Gt => Op::Lt,
+            Op::Ge => Op::Le,
+            o => o,
+        };
+        (mirror, (-k.1, -k.0), terms.into_iter().map(|(n, t)| (!n, t)).collect::<Vec<_>>())
+    } else {
+        (op, k, terms)
+    };
+    // `u + sum(terms) + k op 0` is `u - anchor op -k`, `anchor = -sum(terms)`.
+    let mut anchor: Vec<(bool, NodeId)> = terms.into_iter().map(|(n, t)| (!n, t)).collect();
+    anchor.sort();
+    Some((Rel { u, anchor }, op, (-k.1, -k.0)))
 }
 
 /// `root` - a guard - with no select on an undecided condition left for the
@@ -641,7 +911,7 @@ fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
             boolean.extend(node.args[1..].iter().copied());
         }
     }
-    let mut map: std::collections::HashMap<NodeId, NodeId> = Default::default();
+    let mut map: rustc_hash::FxHashMap<NodeId, NodeId> = Default::default();
     for &n in &nodes {
         let (op, args) = {
             let node = d.graph.get(n);
@@ -704,15 +974,16 @@ fn cone(g: &crate::transpile::graph::Graph, roots: &[NodeId]) -> Vec<NodeId> {
     out
 }
 
-/// Every node of `cone` rebuilt with `from` replaced by `to`, in node order;
-/// comparisons refolded against the static ranges (`Symbolic::compare`),
-/// the rest by `Graph::fold`. Only the nodes that changed are in the map.
-fn rebuild(d: &mut Symbolic, cone: &[NodeId], from: NodeId, to: NodeId) -> std::collections::HashMap<NodeId, NodeId> {
+/// Every node of `cone` rebuilt with the nodes of `subst` replaced, in node
+/// order; comparisons refolded against the static ranges
+/// (`Symbolic::compare`), the rest by `Graph::fold`. Only the nodes that
+/// changed are in the map.
+fn rebuild_all(d: &mut Symbolic, cone: &[NodeId], subst: &rustc_hash::FxHashMap<NodeId, NodeId>) -> rustc_hash::FxHashMap<NodeId, NodeId> {
     use super::domain::Cmp;
     use crate::transpile::graph::Op;
-    let mut map: std::collections::HashMap<NodeId, NodeId> = std::collections::HashMap::from([(from, to)]);
+    let mut map: rustc_hash::FxHashMap<NodeId, NodeId> = subst.clone();
     for &i in cone {
-        if i == from {
+        if subst.contains_key(&i) {
             continue;
         }
         let (op, args) = {

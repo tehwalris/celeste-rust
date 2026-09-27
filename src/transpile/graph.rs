@@ -271,7 +271,10 @@ pub struct Node {
 #[derive(Default, Clone)]
 pub struct Graph {
     nodes: Vec<Node>,
-    intern: rustc_hash::FxHashMap<Node, NodeId>,
+    /// Hashed with rustc-hash 2: with 1.1's Fx, lookups here were 86% of a
+    /// room (6,0) trace, nearly all of it probing (2026-09-27). Never
+    /// iterated, so the hasher changes no order.
+    intern: rustc_hash2::FxHashMap<Node, NodeId>,
     /// The fork grid: `Split`/`Frag`/`FragOk`/`SplitOk` cut an interval at
     /// the multiples of `2^-fork_bits` (0 = the integers, the historic
     /// meaning). One value per graph, because it is one value per traced
