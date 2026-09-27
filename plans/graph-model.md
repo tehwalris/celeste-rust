@@ -154,17 +154,14 @@ on 2026-09-26. As an operator's own error there is no circularity at all:
 Trace-time refusals (a symbolic table index, an unsupported construct) are not
 error conditions. They are failures to compile, and stay so.
 
-`Interp::poison` is one of these, and it must survive step 4 unchanged. It
-fires where `binop_values` found arithmetic on a non-number - Lua itself would
-have raised, so no legal run takes that path - and it substitutes a dummy `0`
-and records the reason in `illegal`. Making it a value's error would be wrong
-twice: the abort is not a property of the substituted `0` (nothing downstream
-"uses a bad number"; the run does not continue at all), and a derived error
-that no stored value depends on would VANISH, which is precisely the silent
-loss the `ok`-not-`guard` choice exists to prevent. Its own doc makes the
-argument: clearing `guard` would say "no lane takes this path" and a successor
-could disappear unnoticed, while clearing `ok` says "the kernel declines these
-lanes", which fails loudly.
+A LUA RAISE is not one of them either, and it is not an error. `Interp::poison`
+fires where `binop_values` found an operand of the wrong kind - Lua itself would
+have raised, so no legal run takes that path - and it substitutes a dummy value
+and records the reason in `illegal`. Making the raise a value's error would be
+wrong twice over: the abort is not a property of the substituted dummy (nothing
+downstream "uses a bad number"; the run does not continue at all), and a derived
+error that no stored value depended on would VANISH, losing the path silently.
+What a raise gets instead is its own row - next.
 
 A RAISE IS ITS OWN ROW (Philippe, 2026-09-27). Not "the lane stops and there is
 nothing to hand on" - that was my mistake. There is a RAISE ROW, it has its own
@@ -204,12 +201,38 @@ WHICH raise happened is diagnostics, not semantics: the sites merge into one
 row, and the per-reason breakdown stays where it is today, in `Interp::illegal`
 at trace time.
 
-MEASURED FIRST (2026-09-27): `poison` never fires. Rooms (6,0), (5,0) and
-(1,0) skip 200 / 289 / 45 outcomes between them and every one is "another
-room" - not a single "ok folds false" - and the start room's shape fixpoint
-reports an empty `illegal`. So raise needs no runtime mask in any room we can
-test: build-time refusal plus the loud assertion is enough, and if it ever does
-fire we hear about it.
+TWO THINGS THAT LOOK ALIKE ARE HANDLED DIFFERENTLY, and the distinction is
+what "do we ever raise at runtime?" turns on:
+
+* A RAISE ON A PATH - `poison`, reached from exactly two conditions, both in
+  `binop_values`: arithmetic on a non-number, and an ORDERED comparison on a
+  non-number. Each substitutes a dummy (`0`, `false`) and records a reason.
+  This is the one that could in principle reach runtime.
+* A TRACE-TIME REFUSAL - indexing a non-table, assigning through one, calling a
+  non-function, `#` of a non-table. Every one is a `bail!`: the trace of that
+  (shape, region) fails outright. Lua would raise on all of them too, but they
+  never become a row, a mask, or a lane - they stop the build. And they stop it
+  LOUDLY at the right granularity: the lattice fixpoint's completeness check is
+  keyed on the `(shape, region)` pair, so a refusal in one region still bails
+  even where another region of the same shape traced fine.
+
+MEASURED (2026-09-27): `poison` never fires, in any room testable. Rooms
+(6,0), (5,0), (1,0), (2,0), (0,0), (3,0) skip 200 / 289 / 45 / 492 / 167 / 200
+outcomes and every single one is "another room" - not one "ok folds false" -
+with no refusal reasons either, and the start room's shape fixpoint reports an
+empty `illegal`. Room (2,0) is the one that matters: the spring's unset `delay`
+is the worked example in `poison`'s own doc, and it is clean.
+
+So TODAY THE RAISE ROW IS IMPLICIT AND THROWN AWAY - `poison` makes the outcome
+statically dead and the build drops it - and that is fine, because a row nobody
+reads need not be materialised. But throwing it away is only sound if it is
+EMPTY, which means computing its liveness is exactly what licenses discarding
+it. Hence the cheap version of the design, which costs nothing at runtime:
+fold the raise row's liveness at BUILD time; where it folds to false, emit
+nothing; where it does NOT, that is a loud build-time event - we have learned
+the model admits a raise - and we choose then between over-approximating and
+fixing the model. What happens today in that case instead is that the
+obligation quietly becomes a runtime `ok` term.
 
 Both counters that would have told us this were invisible: `Interp::illegal` is
 read only by an `#[ignore]`d test, and `shapes::Walk::unreachable` is
