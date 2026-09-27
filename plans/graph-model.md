@@ -55,6 +55,13 @@ CONCRETE STATES ONE LANE STANDS FOR. That is what `reads_interval_cmp`
 approximates by asking whether a comparison has an interval operand, and why it
 excludes the two families above - not sloppiness, as I first read it.
 
+A `Sel` is where the two predicates must disagree, and the asymmetry is easy to
+"tidy" away by mistake. For a NUMERIC operand the condition is irrelevant -
+`Sel(c, 5, 7)` is one of two exact numbers whatever `c` is - so judging whether
+a comparison straddles must skip it. For a BOOLEAN select it is the opposite: a
+select straddles exactly when its condition does. Counting the condition in the
+numeric case over-triggers on 31-33 conditions a frame in room (6,0).
+
 So stage 2 needs two predicates, and they must stay apart:
 
 * ABSTRACTNESS - does this value denote a set? (`Symbolic::abstractness`.)

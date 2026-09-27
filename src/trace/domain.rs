@@ -496,6 +496,12 @@ pub struct Symbolic {
     /// `ival_cells` exactly as `ival_memo` is, and dropped beside it in
     /// `forget_intervals`.
     abstract_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
+    /// `lane_undecidable`'s memo - THE FORK TRIGGER. Derived from
+    /// `abstractness`, so it depends on `ival_cells` too and is dropped with
+    /// the other two.
+    undecidable_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
+    /// `abstract_beneath_lane_ops`'s memo, dropped with the rest.
+    beneath_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// STATIC RANGES (2026-09-15, the bucket dispatch): input cells whose
     /// value is known to lie in a range - a body specialized on the
     /// player's speed BUCKET - and the memo of the range analysis over
@@ -522,6 +528,116 @@ impl Symbolic {
     pub fn forget_intervals(&mut self) {
         self.ival_memo.get_mut().clear();
         self.abstract_memo.get_mut().clear();
+        self.undecidable_memo.get_mut().clear();
+    }
+
+    /// THE FORK TRIGGER (plans/graph-model.md section 2): can ONE LANE hold
+    /// this condition both ways?
+    ///
+    /// Not `abstractness`, and the difference is the whole point. A lane is
+    /// itself a set of states and the kernel computes on interval
+    /// representations, so a value can denote a set and still be one computed
+    /// quantity per lane that the kernel can branch on. What forces a fork is
+    /// narrower: the condition's value differs ACROSS THE CONCRETE STATES ONE
+    /// LANE STANDS FOR.
+    ///
+    /// Exhaustive over every `Op`, because the two exclusions below are the
+    /// load-bearing part and a catch-all hides them (`reads_interval_cmp`'s
+    /// `_ => false` gets them right by accident and would get the next
+    /// genuinely undecidable op wrong):
+    ///
+    /// * `TileFlagAt` and `Mget` are LANE-DECIDABLE BY INSTRUCTION. They lower
+    ///   to one call over number registers, so a lane gets a single answer
+    ///   however abstract its coordinates are.
+    /// * `Flr` is LANE-DECIDABLE BY ASSERTION - `zi_flr_ok` reads decidedness
+    ///   off the interval - and that assertion is the operator's own error
+    ///   (section 4), not a type fact. This is the one place the two
+    ///   justifications differ, and conflating them is what made me fold
+    ///   `Known(Flr(..))` away unsoundly.
+    ///
+    /// Measured on room (6,0): triggering on `abstractness` instead would mint
+    /// 50-90 extra forks a frame, all of them these two families.
+    pub fn lane_undecidable(&self, b: NodeId) -> bool {
+        fn go(d: &Symbolic, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
+            if let Some(x) = memo.get(&n) {
+                return *x;
+            }
+            let node = d.graph.get(n);
+            let args = node.args.clone();
+            let any = |memo: &mut rustc_hash::FxHashMap<NodeId, bool>, xs: &[NodeId]| xs.iter().any(|x| go(d, memo, *x));
+            let r = match node.op {
+                // THE source: a lane's states answer a comparison both ways
+                // exactly when an operand spans values - but "spans values"
+                // here must IGNORE the lane-decidable operators, or the
+                // exclusions below never bite. `Gt(Flr(Split(..)), 0)` has an
+                // abstract operand by `abstractness`, yet the kernel decides
+                // it per lane because the span assertion makes the floor
+                // unique. Same for a coordinate that feeds `TileFlagAt`.
+                Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => args.iter().any(|a| d.abstract_beneath_lane_ops(*a)),
+                Op::UnknownBool(_) => true,
+                Op::Not | Op::And | Op::Or | Op::Sel => any(memo, &args),
+                // Lane-decidable by instruction.
+                Op::TileFlagAt | Op::Mget => false,
+                // Lane-decidable by assertion (`own_error`, not a type fact).
+                Op::Flr => false,
+                // A mask query; every lane decides it.
+                Op::Known => false,
+                // The validity and coverage masks are per-lane comparisons the
+                // kernel evaluates, not conditions a lane straddles.
+                Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_) => false,
+                Op::ConstBool(_) => false,
+                // Not boolean-valued, so not a condition.
+                _ => false,
+            };
+            memo.insert(n, r);
+            r
+        }
+        go(self, &mut self.undecidable_memo.borrow_mut(), b)
+    }
+
+    /// `abstractness`, but STOPPING at the operators a lane decides for
+    /// itself: `Flr` (unique by its span assertion) and `TileFlagAt`/`Mget`
+    /// (one instruction, one answer per lane).
+    ///
+    /// This is what a comparison's operands must be judged by. Asking plain
+    /// `abstractness` there makes `Gt(Flr(Split(..)), 0)` a fork trigger, and
+    /// measured on room (6,0) that is 38-50 spurious forks a frame - the
+    /// difference between this predicate and the `Known` premises it replaces.
+    pub fn abstract_beneath_lane_ops(&self, n: NodeId) -> bool {
+        fn go(d: &Symbolic, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
+            if let Some(x) = memo.get(&n) {
+                return *x;
+            }
+            let node = d.graph.get(n);
+            let args = node.args.clone();
+            let r = match node.op {
+                // A lane decides these whatever their operands, so nothing
+                // beneath them can make a comparison straddle.
+                Op::Flr | Op::TileFlagAt | Op::Mget => false,
+                Op::Cell(c) => d.ival_cells.contains(&c),
+                Op::Const(lo, hi) => lo != hi,
+                Op::Span => true,
+                Op::UnknownNum | Op::UnknownBool(_) => true,
+                Op::Split(_) | Op::SplitTab(_) | Op::SplitKeyTab(_) | Op::Frag(_) => true,
+                Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi => false,
+                Op::ConstBool(_) | Op::Free(_) | Op::Known => false,
+                // THE CONDITION DOES NOT MAKE THE RESULT A SET. `Sel(c, 5, 7)`
+                // is one of two exact numbers whatever `c` is; that a lane may
+                // take either arm is a BRANCHING question, answered by forking
+                // `c` itself, not by calling this operand's value a range.
+                // Counting the condition here (my first version did, via the
+                // catch-all) over-triggered on 31-33 conditions a frame in room
+                // (6,0). `is_interval` has always had this rule; note that
+                // `lane_undecidable` deliberately does the OPPOSITE for
+                // booleans, where a select genuinely straddles when its
+                // condition does.
+                Op::Sel => args[1..].iter().any(|a| go(d, memo, *a)),
+                _ => args.iter().any(|a| go(d, memo, *a)),
+            };
+            memo.insert(n, r);
+            r
+        }
+        go(self, &mut self.beneath_memo.borrow_mut(), n)
     }
 
     /// TYPE PROPAGATION (plans/graph-model.md section 2): does this node's
@@ -660,8 +776,16 @@ impl Symbolic {
     /// hi(b)` and fail iff `hi(a) >= lo(b)`; a number is its own ends); a node
     /// no interval reaches is decided per lane, `(n, not n)`; connectives
     /// combine; anything else may answer either way.
-    pub fn may_answers(&mut self, n: NodeId, memo: &mut std::collections::HashMap<NodeId, bool>) -> (NodeId, NodeId) {
-        if !self.reads_interval_cmp(n, memo) {
+    /// Judged by `lane_undecidable`, THE SAME PREDICATE THAT DECIDES WHAT TO
+    /// FORK. It has to be: this computes a fork's validity, so if the two
+    /// disagreed about which conditions a lane can hold both ways, a fork's
+    /// answers would be described by a rule other than the one that created
+    /// it. The old `reads_interval_cmp` says `Gt(Flr(interval), 0)` is
+    /// undecidable, where a lane decides it (`zi_flr_ok`) - so it would build
+    /// endpoint comparisons for a condition whose answers are exactly `n` and
+    /// `not n`.
+    pub fn may_answers(&mut self, n: NodeId) -> (NodeId, NodeId) {
+        if !self.lane_undecidable(n) {
             let nn = self.graph.fold(Op::Not, vec![n]);
             return (n, nn);
         }
@@ -683,11 +807,11 @@ impl Symbolic {
                 (self.graph.fold(t, vec![ta, tb]), self.graph.fold(f, vec![fa, fb]))
             }
             Op::Not => {
-                let (t, f) = self.may_answers(args[0], memo);
+                let (t, f) = self.may_answers(args[0]);
                 (f, t)
             }
             Op::And | Op::Or => {
-                let parts: Vec<(NodeId, NodeId)> = args.iter().map(|a| self.may_answers(*a, memo)).collect();
+                let parts: Vec<(NodeId, NodeId)> = args.iter().map(|a| self.may_answers(*a)).collect();
                 let (join_t, join_f) = if op == Op::And { (Op::And, Op::Or) } else { (Op::Or, Op::And) };
                 let t = self.graph.fold(join_t, parts.iter().map(|p| p.0).collect());
                 let f = self.graph.fold(join_f, parts.iter().map(|p| p.1).collect());
@@ -1365,6 +1489,85 @@ mod tests {
 
     fn p(v: i16) -> P8 {
         P8::from_i16(v)
+    }
+
+    /// The FORK TRIGGER's contract, pinned on hand-built graphs.
+    ///
+    /// `lane_undecidable` currently agrees with the `Known` premises it is
+    /// about to replace - measured on room (5,0) exactly, and on room (6,0) up
+    /// to the phantom forks it deliberately drops. That agreement is what
+    /// licenses the substitution, and once `Known` is gone NOTHING ELSE PINS
+    /// IT. So the four rules that took four attempts to get right are asserted
+    /// here rather than left to a diagnostic that will be deleted.
+    #[test]
+    fn the_fork_trigger_excludes_what_a_lane_decides_for_itself() {
+        let mut d = Symbolic::default();
+        let ival = d.graph.leaf(Op::Cell(0));
+        let exact = d.graph.leaf(Op::Cell(1));
+        d.ival_cells.insert(0);
+        d.forget_intervals();
+        let zero = d.graph.leaf(Op::Const(0, 0));
+
+        // A comparison on an interval operand IS the source of forking.
+        let cmp = d.graph.fold(Op::Gt, vec![ival, zero]);
+        assert!(d.lane_undecidable(cmp), "a comparison on an interval must fork");
+        // On an exact operand it is not.
+        let exact_cmp = d.graph.fold(Op::Gt, vec![exact, zero]);
+        assert!(!d.lane_undecidable(exact_cmp));
+
+        // `Flr` is lane-decidable BY ASSERTION (`zi_flr_ok`), so a comparison
+        // on the floor of an interval does not fork - the span claim is an
+        // `own_error`, not a fork trigger. Reading this the other way is what
+        // made me fold `Known(Flr(..))` away unsoundly.
+        let flr = d.graph.fold(Op::Flr, vec![ival]);
+        let flr_cmp = d.graph.fold(Op::Gt, vec![flr, zero]);
+        assert!(!d.lane_undecidable(flr_cmp), "Flr is decided per lane by its assertion");
+
+        // `TileFlagAt` is lane-decidable BY INSTRUCTION: one call over number
+        // registers, one answer per lane, however abstract the coordinates.
+        let w = d.graph.leaf(Op::Const(8 << 16, 8 << 16));
+        let tile = d.graph.fold(Op::TileFlagAt, vec![ival, ival, w, w, zero]);
+        assert!(!d.lane_undecidable(tile), "TileFlagAt is decided per lane");
+        // And a boolean tree over it stays decidable.
+        let not_tile = d.graph.fold(Op::Not, vec![tile]);
+        assert!(!d.lane_undecidable(not_tile));
+
+        // THE `Sel` ASYMMETRY, which is easy to "tidy" away wrongly. For a
+        // NUMERIC operand the condition is irrelevant: `Sel(c, 5, 7)` is one of
+        // two exact numbers whatever `c` is, so a comparison on it does not
+        // fork. Counting the condition here over-triggered on 31-33 conditions
+        // a frame in room (6,0).
+        let five = d.graph.leaf(Op::Const(5 << 16, 5 << 16));
+        let seven = d.graph.leaf(Op::Const(7 << 16, 7 << 16));
+        let num_sel = d.graph.fold(Op::Sel, vec![cmp, five, seven]);
+        let sel_cmp = d.graph.fold(Op::Gt, vec![num_sel, zero]);
+        assert!(
+            !d.lane_undecidable(sel_cmp),
+            "a select's condition does not make its numeric result span values"
+        );
+        // For a BOOLEAN select it is the opposite: it straddles exactly when
+        // its condition does.
+        let t = d.graph.leaf(Op::ConstBool(true));
+        let f = d.graph.leaf(Op::ConstBool(false));
+        let bool_sel = d.graph.fold(Op::Sel, vec![cmp, t, f]);
+        assert!(d.lane_undecidable(bool_sel), "a boolean select straddles with its condition");
+    }
+
+    /// `abstractness` and `lane_undecidable` answer DIFFERENT questions, and
+    /// conflating them cost a day. A value can denote a set and still be one
+    /// computed quantity per lane.
+    #[test]
+    fn abstractness_is_not_the_fork_trigger() {
+        let mut d = Symbolic::default();
+        let ival = d.graph.leaf(Op::Cell(0));
+        d.ival_cells.insert(0);
+        d.forget_intervals();
+        let flr = d.graph.fold(Op::Flr, vec![ival]);
+        assert!(d.abstractness(flr), "Flr of an interval denotes a set (partial: singleton on pain of error)");
+        let zero = d.graph.leaf(Op::Const(0, 0));
+        let cmp = d.graph.fold(Op::Gt, vec![flr, zero]);
+        assert!(d.abstractness(cmp), "so a comparison on it is abstract too");
+        assert!(!d.lane_undecidable(cmp), "yet a lane decides it, so it must not fork");
     }
 
     #[test]

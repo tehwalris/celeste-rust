@@ -460,9 +460,23 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
         }
         r
     };
-    // Every `Known(c)` the outcomes reach whose `c` a lane can hold undecided.
+    // WHAT NEEDS FORKING IS A SELECT, NOT A PREMISE (step 2,
+    // plans/graph-model.md). Every `Sel` the outcomes reach whose condition a
+    // LANE can hold both ways: that select is what cannot be evaluated, and
+    // forking its condition is what makes the graph executable again.
+    //
+    // Previously the trigger was a `Known(c)` premise - a marker the merge left
+    // behind saying "a lane must decide this" - which made obligations the
+    // driver of forking and let them outlive the selects they were about.
+    // Asking the selects directly removes that whole class by construction: a
+    // select whose arms folded equal, or whose field a later widening
+    // overwrote, is not reachable and so mints nothing. Measured on room
+    // (6,0), that is 4-11 PHANTOM forks a frame gone, with zero conditions
+    // that the premises forked and this does not (`[step1]`, 2026-09-27).
+    //
+    // `Known` nodes are still collected, but only to substitute them away
+    // below; they no longer decide anything.
     let reach = crate::transpile::bdd::reachable(&d.graph, &roots_of(outs));
-    let mut memo: std::collections::HashMap<NodeId, bool> = Default::default();
     let mut knowns: Vec<(NodeId, NodeId)> = Vec::new();
     let mut conds: Vec<NodeId> = Vec::new();
     for (i, r) in reach.iter().enumerate() {
@@ -470,13 +484,37 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
             continue;
         }
         let node = d.graph.get(i as NodeId);
-        if let Op::Known = node.op {
-            let c = node.args[0];
-            if d.reads_interval_cmp(c, &mut memo) {
-                knowns.push((i as NodeId, c));
-                if !conds.contains(&c) {
+        match node.op {
+            Op::Sel => {
+                let c = node.args[0];
+                if d.lane_undecidable(c) && !conds.contains(&c) {
                     conds.push(c);
                 }
+            }
+            _ => {}
+        }
+    }
+    // The `Known` markers to substitute away: ONLY those whose condition we
+    // actually fork. A `Known` about anything else is a genuine assertion and
+    // must survive - `widen::rem_bucket_node` builds `Known(Flr(old / width))`
+    // directly with `Op::Known`, and that is the claim that a lane's rem lies
+    // within ONE bucket, which is what makes the floor single-valued. Erasing
+    // it is yesterday's unsoundness in a different hat, so this is filtered
+    // rather than blanket.
+    //
+    // `Flr` can never be in `conds` (`lane_undecidable(Flr) == false`, pinned
+    // by `the_fork_trigger_excludes_what_a_lane_decides_for_itself`), so the
+    // span premises are left alone by construction rather than by a special
+    // case here.
+    for (i, r) in reach.iter().enumerate() {
+        if !*r {
+            continue;
+        }
+        let node = d.graph.get(i as NodeId);
+        if let Op::Known = node.op {
+            let c = node.args[0];
+            if conds.contains(&c) {
+                knowns.push((i as NodeId, c));
             }
         }
     }
@@ -499,125 +537,6 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
             *by.entry(k).or_default() += 1;
         }
         eprintln!("[build] fork_known_premises: {} conditions, {} premises: {by:?}", conds.len(), knowns.len());
-        // STEP 1 CHECK (plans/graph-model.md): what the type-propagation pass
-        // would fork, against what the `Known` premises fork today. Step 2
-        // replaces the premises with this query, so the two counts have to be
-        // reconciled BEFORE the substitution - the pass is deliberately
-        // stricter in two ways (it counts a `Sel`'s condition, and it covers
-        // `TileFlagAt`/`Mget` over abstract coordinates, where
-        // `reads_interval_cmp` has a `_ => false` arm), and any difference
-        // beyond those two is a difference I do not yet understand.
-        {
-            let mut sel_abstract: std::collections::BTreeSet<NodeId> = Default::default();
-            let mut by_op: std::collections::BTreeMap<String, usize> = Default::default();
-            for (i, r) in reach.iter().enumerate() {
-                if !*r {
-                    continue;
-                }
-                let node = d.graph.get(i as NodeId);
-                if !matches!(node.op, Op::Sel) {
-                    continue;
-                }
-                let c = node.args[0];
-                if d.abstractness(c) {
-                    sel_abstract.insert(c);
-                    let name = format!("{:?}", d.graph.get(c).op);
-                    *by_op.entry(name.split('(').next().unwrap_or("").to_string()).or_default() += 1;
-                }
-            }
-            let old: std::collections::BTreeSet<NodeId> = conds.iter().copied().collect();
-            let extra: Vec<NodeId> = sel_abstract.difference(&old).copied().collect();
-            let missing: Vec<NodeId> = old.difference(&sel_abstract).copied().collect();
-            // IS `missing` UNSOUNDNESS OR ARE THEY PHANTOM FORKS? A condition
-            // lands in my set only if some reachable `Sel` still branches on
-            // it. So a premise-forked condition that is missing means: the
-            // type pass agrees it is abstract, but NOTHING SELECTS ON IT any
-            // more - the arms came out equal, or a later widening overwrote
-            // the field. Those are the phantom forks, and step 2 deletes them
-            // by construction. Checked rather than assumed: for each, whether
-            // the pass calls it abstract, and whether any reachable select
-            // reads it.
-            {
-                let (mut phantom, mut real_gap) = (0usize, Vec::new());
-                for &c in &missing {
-                    let selected = reach.iter().enumerate().any(|(i, r)| {
-                        *r && matches!(d.graph.get(i as NodeId).op, Op::Sel) && d.graph.get(i as NodeId).args[0] == c
-                    });
-                    if d.abstractness(c) && !selected {
-                        phantom += 1;
-                    } else {
-                        real_gap.push(c);
-                    }
-                }
-                eprintln!(
-                    "[step1]   of {} missing: {phantom} are phantom (abstract, but no select reads them), {} are a REAL gap",
-                    missing.len(),
-                    real_gap.len()
-                );
-                for c in real_gap.iter().take(2) {
-                    eprintln!(
-                        "[step1]   REAL GAP, abstract={}: {}",
-                        d.abstractness(*c),
-                        super::emit::show_tree(&d.graph, *c, 5)
-                    );
-                }
-            }
-            eprintln!(
-                "[step1] reachable selects with an abstract condition: {} distinct ({} not in today's {} conditions, {} of today's not found); their ops {by_op:?}",
-                sel_abstract.len(),
-                extra.len(),
-                old.len(),
-                missing.len()
-            );
-            // WHY does the pass fork these and the premises not? Attributed to
-            // the three deliberate differences rather than inferred from
-            // examples: the old `reads_interval_cmp` has a `_ => false` arm
-            // (so `TileFlagAt`/`Mget` over abstract coordinates read as
-            // decidable), it calls `Flr` exact "by guard" (assuming the very
-            // obligation), and it ignores a `Sel`'s condition.
-            {
-                let mut why: std::collections::BTreeMap<&str, usize> = Default::default();
-                for &c in &extra {
-                    let cone = crate::transpile::bdd::reachable(&d.graph, &[c]);
-                    let has = |f: &dyn Fn(&Op) -> bool| {
-                        (0..cone.len()).any(|i| cone[i] && f(&d.graph.get(i as NodeId).op))
-                    };
-                    let tile = has(&|op: &Op| matches!(op, Op::TileFlagAt | Op::Mget));
-                    let flr = has(&|op: &Op| matches!(op, Op::Flr));
-                    let key = match (tile, flr) {
-                        (true, _) => "reads TileFlagAt/Mget",
-                        (false, true) => "reads Flr of an abstract value",
-                        (false, false) => "other",
-                    };
-                    *why.entry(key).or_default() += 1;
-                }
-                eprintln!("[step1]   the {} extra, by cause: {why:?}", extra.len());
-            }
-            for c in extra.iter().take(2) {
-                eprintln!("[step1]   only the pass forks: {}", super::emit::show_tree(&d.graph, *c, 5));
-            }
-            for c in missing.iter().take(2) {
-                // Which cells does it read, and are they declared INTERVAL?
-                // A wrap test on a platform's `x` must be abstract, so if the
-                // pass calls it decided the cause is either that the cell is
-                // not in `ival_cells` or that the memo answered from before
-                // `ival_cells` was set - the second would be a bug in the
-                // pass, and it is the one that silently drops states.
-                let cone = crate::transpile::bdd::reachable(&d.graph, &[*c]);
-                let cells: Vec<(u32, bool)> = (0..cone.len())
-                    .filter(|i| cone[*i])
-                    .filter_map(|i| match d.graph.get(i as NodeId).op {
-                        Op::Cell(k) => Some((k, d.ival_cells.contains(&k))),
-                        _ => None,
-                    })
-                    .collect();
-                eprintln!(
-                    "[step1]   only the premise forks: {} | its cells (id, declared interval): {cells:?} | ival_cells {:?}",
-                    super::emit::show_tree(&d.graph, *c, 5),
-                    d.ival_cells
-                );
-            }
-        }
         for &c in conds.iter().take(4) {
             eprintln!("[build]   condition: {}", super::emit::show_tree(&d.graph, c, 4));
         }
@@ -626,7 +545,7 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
     let mut subst: std::collections::HashMap<NodeId, NodeId> = Default::default();
     let mut forks: Vec<(NodeId, NodeId)> = Vec::new();
     for &c in &conds {
-        let (may_true, may_false) = d.may_answers(c, &mut memo);
+        let (may_true, may_false) = d.may_answers(c);
         let k = d.both_values(UNDECIDED_SELECT);
         let nk = d.not(&k);
         let (yes, no) = (d.and(&k, &may_true), d.and(&nk, &may_false));
