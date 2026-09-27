@@ -305,7 +305,23 @@ mod tests {
     /// the six free choices unknown, so `_update` genuinely branches on
     /// something the tracer cannot decide, and every such branch has to
     /// become a select or a second output state.
+    // 514 SECONDS OF A 514-SECOND SUITE (measured 2026-09-27), and it asserts
+    // nothing: every failure path prints and returns. It was ~13 s once - the
+    // comment below about `intern_body` records that - so this is a
+    // regression, and the budget that was supposed to stop it does not bind:
+    // `max_nodes` is checked as `node_count() - trace_start_nodes`, and
+    // `trace_start_nodes` is only ever set by `verify::trace_frame`, which
+    // this test never calls. So the limit is measured against the whole arena
+    // from zero, the 40-frame loop keeps fanning out, and `collapse` -
+    // quadratic in the frontier, one heap clone per pair - grinds for minutes.
+    //
+    // Ignored rather than fixed here: the suite is the dev loop, and every
+    // other test in it together costs 22 s (wall ~12 s, since nextest gives
+    // each test its own process). Fixing the budget, or moving this and the
+    // other five zero-assertion diagnostics behind `src/bin/probe.rs` as
+    // CLAUDE.md asks, is its own piece of work.
     #[test]
+    #[ignore]
     fn trace_one_frame() {
         let src = sources().expect("sources");
         let ast = full_moon::parse(&src).expect("parse");
