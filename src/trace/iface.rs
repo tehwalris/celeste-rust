@@ -294,11 +294,11 @@ pub fn symbolize(
 /// The obligation a pinned body carries: every pinned cell holds the
 /// value the body was compiled for.
 ///
-/// Conjoin this into `ok`, not into `guard`. A lane whose key disagrees
-/// is a REAL lane that this body cannot run - the interpreter has to
-/// take it - and that is what `ok` means. Putting it in `guard` would
-/// silently drop the lane from every outcome, which is the missing-
-/// successor failure the whole boolean split exists to prevent.
+/// Its negation is an ERROR of the whole frame, not a `guard`. A lane whose
+/// key disagrees is a REAL lane that this body cannot run, and a declined
+/// lane is what says so loudly. Putting it in `guard` would silently drop
+/// the lane from every outcome, which is the missing-successor failure the
+/// whole boolean split exists to prevent.
 ///
 /// Returns `ConstBool(true)` when nothing is pinned, which folds away.
 pub fn pin_guard(d: &mut Symbolic, iface: &Iface) -> NodeId {

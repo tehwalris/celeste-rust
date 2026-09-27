@@ -101,7 +101,7 @@ pub struct Interp<'a, D: Domain> {
     /// `illegal` counts by reason and so cannot build that - a string is not a
     /// condition. Kept beside it rather than replacing it, because the count
     /// is the build-time diagnostic and this is the value the kernel needs.
-    /// Drained per job like `illegal` (`kernel::walk_trace`).
+    /// Per trace: `verify::trace_frame` resets it and takes it.
     pub raised: Vec<(D::Bool, String)>,
     /// The cart and the room's collision cache, for `mget`/`fget` and
     /// `tile_flag_at`. Optional so the unit tests can run programs that
@@ -362,15 +362,11 @@ impl<'a, D: Domain> Interp<'a, D> {
                     next.push((s, f));
                     continue;
                 }
-                // A POISONED path executes no further. `ok` is already
-                // false, so every lane on it deopts and nothing it goes
-                // on to compute can be read - but it would still intern
-                // nodes, and on the shape walk that was most of a
-                // two-million-node graph. Carried rather than dropped:
-                // dropping is `guard`'s direction, and a successor that
-                // vanishes is the one failure nothing downstream sees.
-                if self.d.decide(&s.ok) == Some(false) {
-                    next.push((s, f));
+                // A RAISED path executes no further: its lanes are in the
+                // raise row (`poison`), so it is live nowhere, and running
+                // on would intern nodes nothing reads - on the shape walk
+                // that was most of a two-million-node graph.
+                if self.d.decide(&s.guard) == Some(false) {
                     continue;
                 }
                 next.extend(self.exec_stmt(stmt, s)?);
@@ -616,6 +612,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// the frontier stays at the number of genuinely different futures
     /// rather than the product of every branch taken to get there.
     pub fn collapse(&mut self, mut outs: Outcome<D>) -> Result<Outcome<D>> {
+        self.drop_raised(&mut outs);
         let mut pairing = Pairing::new(outs.len());
         'again: loop {
             // Siblings first (longest shared decision prefix), so that a
@@ -640,10 +637,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
                 self.merge_fallbacks += m.fell_back as usize;
                 let fl = self.join_flow(&m.cond, &outs[i].1, &outs[j].1);
-                let state = match &fl {
-                    Flow::Return(v) => self.premise_for_value(m, v),
-                    _ => m.state,
-                };
+                let state = m.state;
                 // j > i, so drop the later index first.
                 outs.remove(j);
                 outs.remove(i);
@@ -662,6 +656,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         &mut self,
         mut outs: Multi<D, Value<D>>,
     ) -> Result<Multi<D, Value<D>>> {
+        self.drop_raised(&mut outs);
         let mut pairing = Pairing::new(outs.len());
         'again: loop {
             let states: Vec<&State<D>> = outs.iter().map(|o| &o.0).collect();
@@ -680,7 +675,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
                 self.merge_fallbacks += m.fell_back as usize;
                 let v = self.join_value(&m.cond, &outs[i].1.clone(), &outs[j].1.clone());
-                let state = self.premise_for_value(m, &v);
+                let state = m.state;
                 outs.remove(j);
                 outs.remove(i);
                 pairing.replace(i, j);
@@ -692,28 +687,12 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(outs)
     }
 
-    /// The merged state, with the premise its VALUE needs. `state::merge`
-    /// conjoins `Known(cond)` where a select survives in the heap or in `ok`,
-    /// but an expression's or a call's value is joined here, after it: a
-    /// value that is a select reads `cond`'s value bit just the same, and on a
-    /// lane where `cond` is undecided the kernel's select silently takes one
-    /// arm (`c and 1 or 2`, or a function returning a different number per
-    /// branch, over a heap both branches left alike). Booleans fold into
-    /// Kleene algebra and are exact without it, as in `merge`.
-    fn premise_for_value(&mut self, m: super::state::Merged<D>, v: &Value<D>) -> State<D> {
-        let mut state = m.state;
-        let selects = match v {
-            Value::Num(n) => self.d.is_select_num(n),
-            Value::Bool(b) => self.d.is_select_bool(b),
-            _ => false,
-        };
-        if selects && !m.selects {
-            // `Sel`'s own error: the arms differ, so an undecided condition
-            // leaves this value undefined on that lane.
-            let decided = self.d.known(&m.cond);
-            state.own_error(&mut self.d, &decided);
-        }
-        state
+    /// Drop the states live nowhere before merging: a raise cleared their
+    /// guard (`poison`) and its lanes are in the raise row. Merged instead,
+    /// such a state would put a select on the separating decision into
+    /// every slot it disagrees in, for lanes that cannot take it.
+    fn drop_raised<T>(&mut self, outs: &mut Vec<(State<D>, T)>) {
+        outs.retain(|(s, _)| self.d.decide(&s.guard) != Some(false));
     }
 
     /// Can these two flows be joined - WITHOUT building any nodes? Asked
@@ -890,18 +869,16 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
             }
         }
-        // The obligation, and it belongs ONLY to the states that never
-        // left: by the time the bound ran out, the loop must be over.
-        // Applying it to a state that broke or returned would deopt a
-        // lane for a bound it never depended on.
+        // Where the model ENDS: a state still running when the bound ran
+        // out goes on as if the loop were over, and the lanes on which it
+        // was not are unmodelled from here (`State::ended`). Only the states
+        // that never left: one that broke or returned never depended on the
+        // bound.
         let off = self.d.num(P8::from_i16(bound as i16));
         let iv = self.d.arith(Arith::Add, &start, &off)?;
         let over = self.d.compare(Cmp::Le, &iv, &limit)?;
-        let finished = self.d.not(&over);
         for (s, _) in running.iter_mut() {
-            // The unrolled loop's own error: its condition still holds after
-            // the bound ran out.
-            s.own_error(&mut self.d, &finished);
+            s.ended = self.d.or(&s.ended, &over);
         }
         done.extend(running);
         self.collapse(done)
@@ -1228,35 +1205,32 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(out)
     }
 
-    /// Mark this path as one no legal run takes, and keep going.
+    /// A LUA RAISE on this path: route its lanes to the frame's raise row.
     ///
-    /// PICO-8 raises on `nil > 0`, so a path that does it is not a game
-    /// execution at all - it is a path the tracer reached only because
-    /// it over-approximated a branch. The real game holds an invariant
-    /// the tracer cannot see; `spring.init` never sets `delay`, and
-    /// `spring.update` reads it only in a branch that a prior branch
-    /// assigns it in first.
+    /// PICO-8 raises on `nil > 0`, and a raise ends the game: the lanes that
+    /// get here have NO successor, which is what clearing `guard` says. It is
+    /// not a silent drop, because nothing is thrown away - the guard at the
+    /// raise goes to `raised`, whose OR is the raise row's liveness
+    /// (`verify::Frame::raise`, plans/graph-model.md section 4), so every
+    /// lane still ends in exactly one row. The lanes that raise are a set the
+    /// build can name and the walk reports when it is not empty
+    /// (`kernel::room_constant_lattice`).
     ///
-    /// `ok`, NOT `guard`. Those mean different things and only one is
-    /// safe here. Clearing `guard` would say "no lane takes this
-    /// path", and if that were ever wrong the successor would silently
-    /// vanish. Clearing `ok` says "the kernel declines these lanes",
-    /// which is the direction that fails loudly - and under the
-    /// never-deopt doctrine a lane that really got here stops the run
-    /// and names itself, so a wrong invariant is reported rather than
-    /// assumed.
+    /// Where it fires, the real game cannot reach it: in rooms (7,0), (6,1)
+    /// and (7,1) a spring standing on a breakable floor reaches `this.delay
+    /// > 0` with `delay` unset only through a merge that lost the
+    /// correlation between `spr` and `hide_for` (plans/graph-model.md, "The
+    /// raise is NOT reachable concretely"). Routing those lanes away is exact
+    /// either way: a state that raises has no successor, and one that does
+    /// not takes the other arm, whose guard is emitted.
     ///
-    /// Counted in `illegal` rather than swallowed. Turning an error into
-    /// a deopt hides modelling gaps at BUILD time - the shape walk would
-    /// happily include shapes only reachable through impossible paths -
-    /// so the count is what keeps that visible.
+    /// Counted in `illegal` by reason as well, the build-time diagnostic.
     fn poison(&mut self, st: &mut State<D>, why: String) {
-        // WHEN this raise happens: the path guard, before `ok` is cleared.
-        // This is what the raise row's liveness is built from; `ok = false`
-        // below is still what declines the lanes today, and moving that over
-        // is a separate step.
+        // The lanes are ROUTED, not declined: they leave this state for the
+        // raise row, whose liveness is the OR of the guards recorded here, so
+        // every lane still ends in exactly one outcome.
         self.raised.push((st.guard.clone(), why.clone()));
-        st.ok = self.d.boolean(false);
+        st.guard = self.d.boolean(false);
         *self.illegal.entry(why).or_default() += 1;
     }
 
@@ -1264,7 +1238,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// is not a legal run. The caller poisons, because it is the caller
     /// that knows which expression this was. An undecided comparison is its
     /// plain node: a select on it becomes a fork only if one survives the
-    /// traced frame (`verify::fork_known_premises`).
+    /// traced frame (`verify::fork_undecided_selects`).
     fn binop_values(
         &mut self,
         binop: &ast::BinOp,
@@ -1663,8 +1637,8 @@ impl<'a, D: Domain> Interp<'a, D> {
     fn fork_escaped_atoms(&mut self, mut s: State<D>, v: Value<D>, since: u32) -> (State<D>, Value<D>) {
         // Only what the caller can still reach: the callee's frame is garbage,
         // and a fork for an atom in it spends a fork id on nothing (room (3,0)
-        // with the fruit and the floors unknown: 63 forks, a `ChoiceSet` holds
-        // 58).
+        // with the fruit and the floors unknown: 63 forks, when a fork mask
+        // held 58).
         let mut roots = s.roots();
         super::heap::push_value(&v, &mut roots);
         let (tables, scopes, _) = s.heap.reachable(&roots);
@@ -1789,7 +1763,10 @@ impl<'a, D: Domain> Interp<'a, D> {
                     _ => Fun1::Sin,
                 };
                 let a = num(0)?;
-                (st, Value::Num(self.d.fun1(f, &a)?))
+                let v = self.d.fun1(f, &a)?;
+                let at = st.decided(&mut self.d);
+                self.d.evaluated_at(&v, &at);
+                (st, Value::Num(v))
             }
             // The map is DATA, not code, and it is concrete - so a lookup
             // with concrete coordinates folds to a constant here exactly
@@ -1944,9 +1921,9 @@ impl<'a, D: Domain> Interp<'a, D> {
             // enumerates exactly as it does the six buttons. Its
             // validity goes in the GUARD, because the fragments
             // partition the lane and a lane in neither is not a lane at
-            // all; its premise goes in `ok`, because a lane spanning
-            // more floors than there are fragments is REAL and this body
-            // cannot run it.
+            // all; its coverage is the fork's own error, because a lane
+            // spanning more floors than there are fragments is REAL and
+            // this body cannot run it.
             "__split_by_flr" | "__split_at" => {
                 let x = num(0)?;
                 // A value every lane holds alike (a literal interval at a
@@ -1973,12 +1950,14 @@ impl<'a, D: Domain> Interp<'a, D> {
                 if !self.d.is_interval(&x) {
                     (st, args[0].clone())
                 } else {
+                    // The fork's coverage is its own error, derived from the
+                    // fork node where it was evaluated (`trace::error`).
                     let ways = self.d.flr_ways(&x);
                     let (v, valid) = self.d.fork_flr(&x, ways);
-                    let premise = self.d.span_ok(&x, ways);
+                    let at = st.decided(&mut self.d);
+                    self.d.evaluated_at(&v, &at);
                     let mut st = st;
                     st.guard = self.d.and(&st.guard, &valid);
-                    st.precondition(&mut self.d, &premise);
                     (st, Value::Num(v))
                 }
             }
@@ -2191,7 +2170,8 @@ mod tests {
         let globals = heap.new_table();
         let scope = heap.new_scope(None);
         let t = d.boolean(true);
-        State { heap, globals, scope, stack: Vec::new(), guard: t.clone(), ok: t, path: Vec::new(), key_override: Vec::new(), frag: Vec::new() }
+        let f = d.boolean(false);
+        State { heap, globals, scope, stack: Vec::new(), guard: t, ended: f, path: Vec::new(), key_override: Vec::new(), frag: Vec::new() }
     }
 
     /// Run `src` and read back the global `result`.
@@ -2288,11 +2268,12 @@ mod tests {
     }
 
     /// A call whose branches leave the heap alike but RETURN different
-    /// numbers: the value is a select, so the state needs the same
-    /// `Known(cond)` premise a heap select gets. Without it a lane where the
-    /// condition is undecided took one arm silently (`premise_for_value`).
+    /// numbers: the value is a select, and its own error is its condition
+    /// being undecided - derived from the value (`trace::error`), where it
+    /// used to be conjoined into the state by the merge. Without it a lane
+    /// where the condition is undecided took one arm silently.
     #[test]
-    fn a_returned_select_carries_the_decided_premise() {
+    fn a_returned_select_owns_its_condition_being_decided() {
         let ast = parse(
             r#"
             function f()
@@ -2306,6 +2287,9 @@ mod tests {
             "#,
         );
         let mut d = Symbolic::default();
+        // An interval input: a lane can hold `input > 0` both ways.
+        d.ival_cells.insert(1);
+        d.forget_intervals();
         let sym = d.graph.leaf(Op::Cell(1));
         let mut it = Interp::new(d);
         let mut st = fresh::<Symbolic>(&mut it.d);
@@ -2319,7 +2303,10 @@ mod tests {
             panic!("expected a number")
         };
         assert_eq!(it.d.graph.get(r).op, Op::Sel, "the returned value is a select");
-        assert_eq!(it.d.graph.get(s.ok).op, Op::Known, "and the state carries its premise");
+        let cond = it.d.graph.get(r).args[0];
+        let e = super::super::error::of(&mut it.d, &[r]);
+        let known = it.d.graph.fold(Op::Known, vec![cond]);
+        assert_eq!(e, it.d.graph.fold(Op::Not, vec![known]), "and its error is the condition undecided");
     }
 }
 

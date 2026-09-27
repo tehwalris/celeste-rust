@@ -2,8 +2,8 @@
 //!
 //! This is the first thing in `trace` that treats a trace as a FUNCTION
 //! rather than as a walk: input cells in, output cells out, plus the two
-//! booleans every outcome carries (`guard` - when does this outcome
-//! apply; `ok` - did the tracer compute it correctly).
+//! booleans every outcome has (`guard` - when does this outcome apply;
+//! `error` - where its row is undefined, derived from its values).
 //!
 //! The check is the point. Run the frame twice from the same state:
 //!
@@ -33,7 +33,9 @@ use super::state::State;
 /// One traced outcome of a frame.
 pub struct FrameOut {
     pub guard: NodeId,
-    pub ok: NodeId,
+    /// Where this outcome's row has no defined value (`trace::error`): the
+    /// lanes live here on which it holds decline. Derived, never carried.
+    pub error: NodeId,
     /// Every scalar reachable from the globals table, by path, with the
     /// KIND the tracer knows it to be. Carrying the kind rather than
     /// re-deriving it from the node's op matters: `Op::Cell` and `Op::Sel`
@@ -224,7 +226,7 @@ pub fn trace_frame<'a>(
     widen: Option<super::widen::WidenMode>,
     // Input slots known to lie in a RANGE (raw 16.16, inclusive): the
     // body is specialized on them (`Symbolic::ranges`, the bucket
-    // dispatch), and guarded on them in `ok` like a pin.
+    // dispatch), and outside them the frame is in error, like a pin.
     bounds: &[(Path, (i32, i32))],
 ) -> Result<Frame> {
     it.trace_start_nodes = it.d.node_count();
@@ -263,13 +265,20 @@ pub fn trace_frame<'a>(
     // otherwise run out of buttons on the seventh.
     it.d.frees = 0;
     it.d.unknown_atoms = 0;
+    // What the previous trace left if it failed part-way (a success takes
+    // both below).
+    it.raised.clear();
     it.d.escaped.clear();
     it.d.fork_origins.clear();
+    it.d.evaluated.clear();
     it.d.platform_inputs.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
-    // Built BEFORE the frame runs, so it names the input cells rather
-    // than whatever the frame did to those slots.
-    let mut pin_ok = iface::pin_guard(&mut it.d, &iface);
+    // THE KERNEL'S ADMISSIBLE INPUTS: the pins it was specialised on and the
+    // ranges its region seeded. Built BEFORE the frame runs, so it names the
+    // input cells rather than whatever the frame did to those slots. A lane
+    // outside it should not have been run through this kernel at all, which
+    // is an error of the whole frame rather than of any value it computes.
+    let mut admissible = iface::pin_guard(&mut it.d, &iface);
     for (p, (lo, hi)) in bounds {
         let i = iface.slots.iter().position(|q| q == p).ok_or_else(|| anyhow!("bounded {} is not an input slot", iface::show(p)))?;
         let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(i as u32));
@@ -283,7 +292,7 @@ pub fn trace_frame<'a>(
         let a = it.d.graph.fold(Op::Ge, vec![vlo, klo]);
         let b = it.d.graph.fold(Op::Le, vec![vhi, khi]);
         let both = it.d.graph.fold(Op::And, vec![a, b]);
-        pin_ok = it.d.graph.fold(Op::And, vec![pin_ok, both]);
+        admissible = it.d.graph.fold(Op::And, vec![admissible, both]);
     }
     // The engine's numbering for the INPUT shape. Here rather than in a
     // later pass because this is the last moment the input state exists;
@@ -325,8 +334,15 @@ pub fn trace_frame<'a>(
         super::widen::fork_platform_inputs(&mut st, &mut it.d)?;
     }
     let st = run_one(it, reset, st)?;
+    let finished = it.exec_block(frame.nodes(), st)?;
+    // The error of the whole frame, OR-ed into every outcome's: inputs this
+    // kernel was not built for.
+    let global = {
+        use super::domain::Domain;
+        it.d.not(&admissible)
+    };
     let mut outs = Vec::new();
-    for (s, f) in it.exec_block(frame.nodes(), st)? {
+    for (s, f) in finished {
         if let Flow::Break = f {
             bail!("break at frame toplevel");
         }
@@ -342,17 +358,19 @@ pub fn trace_frame<'a>(
         //
         // After `gc`, because it walks the object list to find the
         // player and the fruit, and a dead object is not one.
-        if let Some(mode) = widen {
-            super::widen::widen(&mut s, &mut it.d, mode)?;
-        }
-        // The specialization's obligation rides on `ok`: a lane whose
-        // key disagrees with what this body was compiled for deopts to
-        // the interpreter. Folds to `s.ok` when nothing is pinned.
-        //
-        // `widen` conjoins its own containment checks into `s.ok` above,
-        // which is why this reads `s.ok` after it rather than before.
-        let ok = it.d.graph.fold(crate::transpile::graph::Op::And, vec![s.ok, pin_ok]);
+        let owed = match widen {
+            Some(mode) => super::widen::widen(&mut s, &mut it.d, mode)?,
+            None => Vec::new(),
+        };
         let (fields, ubool) = out_fields(&s, &it.d)?;
+        // What this outcome owes beyond its operators: the frame's, where its
+        // path's model ended (`State::ended`), and the widenings' of the
+        // slots it STORES - a widened slot no field holds (its object died)
+        // is no part of the row.
+        let error = owed
+            .iter()
+            .filter(|(p, _)| fields.iter().any(|(q, _, _)| q == p))
+            .fold(it.d.graph.fold(crate::transpile::graph::Op::Or, vec![global, s.ended]), |e, (_, w)| it.d.graph.fold(crate::transpile::graph::Op::Or, vec![e, *w]));
         // A widened slot no output holds (the outcome destroyed its
         // object: a death) has no key to override. Matched by PATH: two
         // fields holding the same (hash-consed) node are still two fields.
@@ -378,7 +396,7 @@ pub fn trace_frame<'a>(
         let (guard, shape) = (s.guard.clone(), s.shape()?);
         outs.push(FrameOut {
             guard,
-            ok,
+            error,
             fields,
             keys,
             ubool,
@@ -391,27 +409,37 @@ pub fn trace_frame<'a>(
     }
     // The selects left on a condition a lane can hold undecided become forks.
     if !it.d.no_known_forks {
-        fork_known_premises(&mut it.d, &mut outs)?;
+        fork_undecided_selects(&mut it.d, &mut outs)?;
+    }
+    // ERROR, DERIVED - once, now that the graph each outcome reads is final:
+    // from what the row stores (fields, keys), from where it is live (an
+    // error in the guard is the whole lane's), and from the conditions it
+    // already owes (`trace::error`).
+    let roots: Vec<Vec<NodeId>> = outs
+        .iter()
+        .map(|o| o.fields.iter().map(|(_, n, _)| *n).chain(o.keys.iter().map(|(_, n)| *n)).chain([o.guard, o.error]).collect())
+        .collect();
+    for (o, e) in outs.iter_mut().zip(super::error::for_outcomes(&mut it.d, &roots)) {
+        o.error = it.d.graph.fold(crate::transpile::graph::Op::Or, vec![o.error, e]);
     }
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         eprintln!("[build] trace_frame {widen:?}: {} forks at the end, {} outcomes, {} pins", it.d.forks, outs.len(), pin.len());
     }
     // DIAGNOSTIC (CELESTE_BUILD_TRACE): how many forks this frame minted, by
-    // origin - what a `ChoiceSet` overflow ("fork 58 but a ChoiceSet holds
-    // only 58") is made of.
+    // origin, and how many an outcome can still see.
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
         for (_, o) in &it.d.fork_origins {
             *by.entry(o.as_str()).or_default() += 1;
         }
         // And how many of them any outcome can still see (its fields, guard,
-        // `ok`): the forks a kernel would really have to enumerate.
+        // error): the forks a kernel would really have to enumerate.
         use crate::transpile::graph::Op;
         let mut roots: Vec<NodeId> = Vec::new();
         for o in &outs {
             roots.extend(o.fields.iter().map(|(_, n, _)| *n));
             roots.push(o.guard);
-            roots.push(o.ok);
+            roots.push(o.error);
         }
         let reach = crate::transpile::bdd::reachable(&it.d.graph, &roots);
         let point: std::collections::BTreeSet<u8> = it.d.fork_origins.iter().filter(|(_, o)| o == UNDECIDED_SELECT).map(|(k, _)| *k).collect();
@@ -450,31 +478,33 @@ pub fn trace_frame<'a>(
     Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, floors_unknown: it.d.floors_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, raise, in_cells, in_rt2 })
 }
 
-/// The fork origin of an undecided select's condition (`fork_known_premises`).
+/// The fork origin of an undecided select's condition (`fork_undecided_selects`).
 const UNDECIDED_SELECT: &str = "an undecided select's condition";
 
 /// THE UNDECIDED SELECTS BECOME FORKS, once the frame is traced
-/// (plans/platforms-unknown.md, 2026-09-21). A select on a condition the
-/// kernel reads per lane carries the premise `Known(c)` in `ok`
-/// (`state::merge`, `Interp::premise_for_value`); where `c` reads a
-/// comparison with an interval operand, a lane can hold it undecided - it
+/// (plans/platforms-unknown.md, 2026-09-21; plans/graph-model.md step 2). A
+/// select is read by its condition's value bit, and where `c` reads a
+/// comparison with an interval operand a lane can hold it undecided - it
 /// stands for concrete states answering EACH way - and the select could take
-/// only one arm, so the premise would decline it. Such a `c` becomes a 2-way
-/// fork `k`: `c` -> `k` in every outcome's fields, keys, `ok` and guard,
-/// `Known(c)` -> true, and every outcome that reads `k` takes the validity
+/// only one arm: its own error (`trace::error`) would decline the lane. Such
+/// a `c` becomes a 2-way fork `k`: `c` -> `k` in every outcome's fields,
+/// keys, error and guard, and every outcome that reads `k` takes the validity
 /// `(k and may_true(c)) or (not k and may_false(c))` into its guard - a lane
 /// takes an answer only where some state it stands for gives it
 /// (`Symbolic::may_answers`). Exact: each lane takes every answer one of its
 /// states gives, and no other.
 ///
 /// AFTER the frame, not at the comparison (`split_compare` did that until
-/// today): by now every select whose arms came out equal has folded away,
-/// with its premise, so a comparison whose answer changed nothing - a
-/// platform's x-overlap test in another row, where the y test fails either
-/// way - leaves no fork at all. Forking it as it was evaluated put its
-/// validity in every later guard: room (6,0) at `r0sxhp`, 70-86 live forks
-/// a frame against a `ChoiceSet`'s 58.
-fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
+/// 2026-09-21): by now every select whose arms came out equal has folded
+/// away, so a comparison whose answer changed nothing - a platform's
+/// x-overlap test in another row, where the y test fails either way - leaves
+/// no fork at all. Forking it as it was evaluated put its validity in every
+/// later guard: room (6,0) at `r0sxhp`, 70-86 live forks a frame.
+///
+/// And BEFORE error is derived: a select forked here is resolved, so it owns
+/// no error, and what is derived afterwards is only what the kernel really
+/// has to check.
+fn fork_undecided_selects(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
     use crate::transpile::graph::Op;
     let roots_of = |outs: &[FrameOut]| -> Vec<NodeId> {
         let mut r = Vec::new();
@@ -482,77 +512,32 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
             r.extend(o.fields.iter().map(|(_, n, _)| *n));
             r.extend(o.keys.iter().map(|(_, n)| *n));
             r.push(o.guard);
-            r.push(o.ok);
+            r.push(o.error);
         }
         r
     };
-    // WHAT NEEDS FORKING IS A SELECT, NOT A PREMISE (step 2,
-    // plans/graph-model.md). Every `Sel` the outcomes reach whose condition a
-    // LANE can hold both ways: that select is what cannot be evaluated, and
-    // forking its condition is what makes the graph executable again.
+    // Every `Sel` the outcomes reach whose condition a LANE can hold both
+    // ways: that select is what cannot be evaluated, and forking its
+    // condition is what makes the graph executable again. A select whose
+    // arms folded equal, or whose field a later widening overwrote, is not
+    // reachable and so mints nothing - measured on room (6,0), 4-11 PHANTOM
+    // forks a frame fewer than forking the merges' premises did (`[step1]`,
+    // 2026-09-27).
     //
-    // Previously the trigger was a `Known(c)` premise - a marker the merge left
-    // behind saying "a lane must decide this" - which made obligations the
-    // driver of forking and let them outlive the selects they were about.
-    // Asking the selects directly removes that whole class by construction: a
-    // select whose arms folded equal, or whose field a later widening
-    // overwrote, is not reachable and so mints nothing. Measured on room
-    // (6,0), that is 4-11 PHANTOM forks a frame gone, with zero conditions
-    // that the premises forked and this does not (`[step1]`, 2026-09-27).
-    //
-    // `Known` nodes are still collected, but only to substitute them away
-    // below; they no longer decide anything.
+    // ONE pass over the reachable set: two, plus `lane_undecidable` per
+    // reachable `Sel`, doubled room (6,0)'s lattice walk from 65 s to 120 s.
+    // The predicate is memoised per node, so the cost was the traversals.
     let reach = crate::transpile::bdd::reachable(&d.graph, &roots_of(outs));
-    let mut knowns: Vec<(NodeId, NodeId)> = Vec::new();
-    let mut conds: Vec<NodeId> = Vec::new();
-    // ONE pass, and the `Known` collection below only runs if anything forked.
-    // Two passes over every reachable node - plus `lane_undecidable` per
-    // reachable `Sel`, where selects vastly outnumber `Known` nodes - doubled
-    // room (6,0)'s lattice walk from 65 s to 120 s when this replaced the
-    // premise scan. The predicate is memoised per node, so the cost was the
-    // traversals rather than the predicate.
     let mut sels: Vec<NodeId> = Vec::new();
     for (i, r) in reach.iter().enumerate() {
-        if !*r {
-            continue;
-        }
-        let node = d.graph.get(i as NodeId);
-        match node.op {
-            Op::Sel => sels.push(node.args[0]),
-            Op::Known => knowns.push((i as NodeId, node.args[0])),
-            _ => {}
+        if *r && d.graph.get(i as NodeId).op == Op::Sel {
+            sels.push(d.graph.get(i as NodeId).args[0]);
         }
     }
+    let mut conds: Vec<NodeId> = Vec::new();
     for c in sels {
         if d.lane_undecidable(c) && !conds.contains(&c) {
             conds.push(c);
-        }
-    }
-    // Only the markers whose condition we fork are substituted away; the rest
-    // are genuine assertions (see below).
-    knowns.retain(|(_, c)| conds.contains(c));
-    // The `Known` markers to substitute away: ONLY those whose condition we
-    // actually fork. A `Known` about anything else is a genuine assertion and
-    // must survive - `widen::rem_bucket_node` builds `Known(Flr(old / width))`
-    // directly with `Op::Known`, and that is the claim that a lane's rem lies
-    // within ONE bucket, which is what makes the floor single-valued. Erasing
-    // it is yesterday's unsoundness in a different hat, so this is filtered
-    // rather than blanket.
-    //
-    // `Flr` can never be in `conds` (`lane_undecidable(Flr) == false`, pinned
-    // by `the_fork_trigger_excludes_what_a_lane_decides_for_itself`), so the
-    // span premises are left alone by construction rather than by a special
-    // case here.
-    for (i, r) in reach.iter().enumerate() {
-        if !*r {
-            continue;
-        }
-        let node = d.graph.get(i as NodeId);
-        if let Op::Known = node.op {
-            let c = node.args[0];
-            if conds.contains(&c) {
-                knowns.push((i as NodeId, c));
-            }
         }
     }
     if conds.is_empty() {
@@ -573,7 +558,7 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
             };
             *by.entry(k).or_default() += 1;
         }
-        eprintln!("[build] fork_known_premises: {} conditions, {} premises: {by:?}", conds.len(), knowns.len());
+        eprintln!("[build] fork_undecided_selects: {} conditions: {by:?}", conds.len());
         for &c in conds.iter().take(4) {
             eprintln!("[build]   condition: {}", super::emit::show_tree(&d.graph, c, 4));
         }
@@ -589,10 +574,6 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
         let valid = d.or(&yes, &no);
         subst.insert(c, k);
         forks.push((k, valid));
-    }
-    let t = d.graph.leaf(Op::ConstBool(true));
-    for (known, _) in &knowns {
-        subst.insert(*known, t);
     }
     // Rebuild what the outcomes and the validities read, through `subst`
     // (operands precede their node, so one ascending pass).
@@ -625,12 +606,12 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
         for k in &mut o.keys {
             k.1 = m(k.1);
         }
-        o.ok = m(o.ok);
+        o.error = m(o.error);
         let mut guard = m(o.guard);
         // The validity of each fork this outcome reads, and only of those.
         let mut r: Vec<NodeId> = o.fields.iter().map(|(_, n, _)| *n).collect();
         r.extend(o.keys.iter().map(|(_, n)| *n));
-        r.push(o.ok);
+        r.push(o.error);
         r.push(guard);
         let seen = crate::transpile::bdd::reachable(&d.graph, &r);
         for (k, valid) in &forks {
@@ -668,8 +649,8 @@ pub fn find_player<D: Domain>(st: &State<D>) -> Option<Path> {
 ///
 /// This list is the CONTRACT between the two sides. A body compiled for
 /// a key is dispatchable only to blocks the engine has partitioned on
-/// exactly these cells; drop one here and the guard on `ok` still
-/// catches the mismatch, but every such block deopts instead of running.
+/// exactly these cells; drop one here and the pin's error still catches
+/// the mismatch, but every such block declines instead of running.
 pub fn pm1_paths(player: &Path) -> Vec<Path> {
     let mut v: Vec<Path> = vec![vec![iface::key("has_dashed")], vec![iface::key("freeze")]];
     for f in ["dash_time", "djump", "p_dash", "p_jump"] {
@@ -763,8 +744,8 @@ pub fn check_at(
         bail!("{:?}: {} outcomes claim this assignment, not 1", bits, live.len());
     }
     let o = &f.outs[live[0]];
-    if super::eval::eval(g, o.ok, &env)? != Conc::Bool(true) {
-        bail!("{:?}: the trace declined this assignment (ok is false)", bits);
+    if super::eval::eval(g, o.error, &env)? != Conc::Bool(false) {
+        bail!("{:?}: the trace declined this assignment (its error holds)", bits);
     }
     let mut n = 0;
     for (p, want) in oracle {
@@ -922,7 +903,6 @@ mod tests {
         queue.push(k0);
 
         let (mut frames, mut refused, mut dropped) = (0usize, 0usize, 0usize);
-        let mut poisoned_outcomes = 0usize;
         let mut kept_arena = 0usize;
         let mut left_room = 0usize;
         let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
@@ -943,14 +923,10 @@ mod tests {
                     continue;
                 }
             };
+            // A path that raised left no outcome (its lanes are in the raise
+            // row, `Interp::poison`), so every shape here is one some kernel
+            // needs; the raises are counted in `illegal`, reported below.
             for o in f.outs {
-                // An outcome whose `ok` is statically false is reached
-                // only along poisoned paths - no legal run gets there,
-                // so its shape is not one any kernel needs.
-                if it.d.decide(&o.ok) == Some(false) {
-                    poisoned_outcomes += 1;
-                    continue;
-                }
                 // A ROOM TRANSITION is a terminal, not a step.
                 //
                 // This is what made the walk diverge. With the player's
@@ -996,7 +972,7 @@ mod tests {
 
         eprintln!(
             "[fix] {} shapes from {} traced frames in {:.1}s ({} refused, {} dropped at the cap of {}), \
-             {} graph nodes, {} outcomes dropped as unreachable, {} left the room, {} frames could not release the arena",
+             {} graph nodes, {} left the room, {} frames could not release the arena",
             seen.len(),
             frames,
             started.elapsed().as_secs_f64(),
@@ -1004,7 +980,6 @@ mod tests {
             dropped,
             CAP,
             it.d.graph.len(),
-            poisoned_outcomes,
             left_room,
             kept_arena
         );
@@ -1142,8 +1117,8 @@ mod tests {
     /// that is the heap's topology, which this does not touch.
     fn rebase(states: Vec<&mut State<Symbolic>>, d: &mut Symbolic) -> bool {
         // Every scalar in the WHOLE heap, not the ones a path reaches.
-        // Walking from the globals misses the state's own `guard` and
-        // `ok`, and it misses scope variables - and one stale id
+        // Walking from the globals misses the state's own `guard`, and
+        // it misses scope variables - and one stale id
         // anywhere is an out-of-bounds index into the new arena, which
         // is how the first two attempts at this failed.
         let read = |d: &Symbolic, v: &Value<Symbolic>| -> Option<Conc> {
@@ -1181,7 +1156,7 @@ mod tests {
             // simply true. They live on the state rather than in the
             // heap, which is what makes them easy to forget.
             st.guard = d.boolean(true);
-            st.ok = d.boolean(true);
+            st.ended = d.boolean(false);
             let mut it = snap.into_iter();
             let mut put = |d: &mut Symbolic, v: &mut Value<Symbolic>| {
                 let c = it.next().expect("snapshot and heap disagree about size");
@@ -1248,8 +1223,8 @@ mod tests {
     /// The pin folds the key's values into the body, so nothing in it
     /// reads those cells any more - which is exactly how a specialization
     /// silently runs the wrong physics if the obligation is left implicit.
-    /// `pin_guard` puts it on `ok`, and this is the test that it bites:
-    /// perturb one pinned cell and the frame declines the lane.
+    /// `pin_guard`'s negation is the frame's error, and this is the test that
+    /// it bites: perturb one pinned cell and the frame declines the lane.
     #[test]
     fn a_body_pinned_to_a_pm1_key_refuses_any_other_key() {
         let src = cart::sources().expect("sources");
@@ -1287,7 +1262,7 @@ mod tests {
         let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[], None, &[]).expect("trace");
         assert_eq!(f.iface.pins.len(), 6, "all six pinned");
 
-        // `ok` of whichever outcome claims this assignment.
+        // No error in whichever outcome claims this assignment.
         let bits = [false; 6];
         let ok_at = |cells: &[Conc]| -> bool {
             let env = super::super::eval::Env {
@@ -1303,7 +1278,7 @@ mod tests {
                 .filter(|o| super::super::eval::eval(g, o.guard, &env).expect("guard") == Conc::Bool(true))
                 .collect();
             assert_eq!(live.len(), 1, "exactly one outcome claims a lane");
-            super::super::eval::eval(g, live[0].ok, &env).expect("ok") == Conc::Bool(true)
+            super::super::eval::eval(g, live[0].error, &env).expect("error") == Conc::Bool(false)
         };
 
         assert!(ok_at(&f.iface.init), "the key it was compiled for is accepted");
@@ -1635,9 +1610,10 @@ end
             panic!("f did not return a number")
         };
         // 100 is well past the unroll bound of 8 on purpose: once a
-        // `break` is reached the bound stops mattering, so `ok` has to be
-        // true there too. Before the fix the loop ran on and the "it
+        // `break` is reached the bound stops mattering, so the frame must be
+        // modelled there too. Before the fix the loop ran on and the "it
         // finished" obligation made this lane deopt.
+
         for a in [0i16, 1, 2, 3, 5, 8, 100] {
             let cells = [Conc::Num(crate::pico8_num::Pico8Num::from_i16(a))];
             let env = super::super::eval::Env {
@@ -1654,8 +1630,8 @@ end
                 "amount = {}",
                 a
             );
-            let ok = super::super::eval::eval(&it.d.graph, st.ok, &env).expect("eval ok");
-            assert_eq!(ok, Conc::Bool(true), "amount = {}: the trace declined", a);
+            let beyond = super::super::eval::eval(&it.d.graph, st.ended, &env).expect("eval ended");
+            assert_eq!(beyond, Conc::Bool(false), "amount = {}: the trace declined", a);
         }
     }
 

@@ -75,83 +75,6 @@ impl Val {
 
 pub type NodeId = u32;
 
-/// A SPECIALIZATION POINT: something the program could not keep symbolic,
-/// so the whole downstream graph is rebuilt once per possible outcome.
-///
-/// The two kinds are one MECHANISM and two SEMANTICS, and the difference
-/// is exactly why `Split` carries a validity mask and `Free` does not:
-///
-/// * `Free` - a symbolic boolean input, one of the six buttons. Every
-///   outcome is live for every lane; the search enumerates them, and the
-///   frame genuinely has 2^6 successors.
-/// * `Split` - a value the abstract domain could not represent, so the
-///   program enumerates the cases. The outcomes PARTITION the lanes, and
-///   one can be empty.
-///
-/// Both are eliminated by `specialize_into`, and neither survives into
-/// emitted code as a value: a `Free` becomes a constant, a `Split`
-/// becomes a concrete narrowing.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Choice {
-    Free(u8),
-    Split(u8),
-}
-
-/// A set of choices, as a bitmask. Frees occupy the low 6 bits (one per
-/// button), splits the rest.
-///
-/// `u64`, not `u16`. Room (1,0) forks at most a handful of times and 10
-/// split bits looked like plenty; room (2,0) has a fruit and two
-/// springs and forks SIXTEEN times, and `1u16 << (6 + 15)` does not
-///error - Rust masks the shift amount in release, so
-/// `Split(15).bit()` came back as bit 5, which is a BUTTON. The cones
-/// were then silently wrong and the emitter placed fork-dependent nodes
-/// in the shared prologue, where they referred to loop variables that
-/// did not exist yet. 48 undefined names in a million lines of
-/// generated Rust, and nothing upstream complained.
-///
-/// 58 splits is not obviously enough either, which is what `bit`'s
-/// assertion below is for: the next room that needs more gets a panic
-/// naming the limit rather than a corrupt mask.
-pub type ChoiceSet = u64;
-pub const N_FREE: u8 = 6;
-/// Split choices representable in a `ChoiceSet`.
-pub const N_SPLIT: u8 = (ChoiceSet::BITS as u8) - N_FREE;
-
-impl Choice {
-    pub fn bit(self) -> ChoiceSet {
-        let i = match self {
-            Choice::Free(b) => {
-                assert!(b < N_FREE, "free choice {} but only {} buttons", b, N_FREE);
-                b
-            }
-            Choice::Split(d) => {
-                // The one that actually fired. See the type's note.
-                assert!(
-                    d < N_SPLIT,
-                    "fork {} but a ChoiceSet holds only {} - widen ChoiceSet",
-                    d,
-                    N_SPLIT
-                );
-                N_FREE + d
-            }
-        };
-        1 << i
-    }
-    pub fn all_in(set: ChoiceSet) -> Vec<Choice> {
-        (0..ChoiceSet::BITS as u8)
-            .filter(|i| set & (1 << i) != 0)
-            .map(|i| {
-                if i < N_FREE {
-                    Choice::Free(i)
-                } else {
-                    Choice::Split(i - N_FREE)
-                }
-            })
-            .collect()
-    }
-}
-
 /// The map, for the evaluator. `CollisionCache` already carries which
 /// room it is for, so this is just the pair the cart queries need.
 #[derive(Clone)]
@@ -212,10 +135,10 @@ pub enum Op {
     ///
     /// Sound because it is exactly the hull: whatever concrete values
     /// the operands take, the result contains the band around them.
-    /// The premise that the widened field was INSIDE the band is a
-    /// separate conjunct of `ok`, built by the caller from ordinary
-    /// comparisons, so nothing here has to decide anything at trace
-    /// time.
+    /// That the widened field was INSIDE the band is the widening's own
+    /// error, built by the caller from ordinary comparisons
+    /// (`widen::SlotErrors`), so nothing here has to decide anything at
+    /// trace time.
     Span,
     /// THE UNKNOWN NUMBER (plans/fly-fruit.md): a number about which nothing
     /// is known - the fly fruit's `step` and `y` at a fruit-unknown level. NOT
@@ -533,52 +456,6 @@ impl Graph {
         self.nodes.is_empty()
     }
 
-    /// For every node, which CHOICES can influence it - one bitmask,
-    /// computed bottom-up in one pass (operands always precede their
-    /// node). This used to be two functions over two vocabularies; it is
-    /// one reachability question, and answering it once is what lets
-    /// placement stop distinguishing "the button suffix" from "the fork
-    /// loop nest".
-    ///
-    /// A choice that reaches no OUTPUT cannot affect any lane's result, so
-    /// its outcomes collapse - a plain reachability fact, decided once for
-    /// the whole kernel rather than per lane.
-    pub fn choice_cones(&self) -> Vec<ChoiceSet> {
-        let mut mask = vec![0 as ChoiceSet; self.nodes.len()];
-        for (i, node) in self.nodes.iter().enumerate() {
-            let mut m = match node.op {
-                Op::Free(b) => Choice::Free(b).bit(),
-                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) | Op::SplitKeyTab(d) | Op::SplitOkTab(d) => {
-                    Choice::Split(d).bit()
-                }
-                _ => 0,
-            };
-            for a in &node.args {
-                m |= mask[*a as usize];
-            }
-            mask[i] = m;
-        }
-        mask
-    }
-
-    /// The cone restricted to FREE choices - the buttons, which every lane
-    /// enumerates. Splits are excluded because their outcomes partition
-    /// lanes rather than multiplying them, so the two answer different
-    /// questions at an emit site even though one pass computes both.
-    pub fn free_cones(&self) -> Vec<u8> {
-        self.choice_cones().iter().map(|m| (*m & 0x3f) as u8).collect()
-    }
-
-    /// The cone restricted to SPLIT choices.
-    ///
-    /// As wide as `ChoiceSet`, not `u8`. This used to truncate, which
-    /// was a second copy of the same bug the type's note describes:
-    /// even with a wide enough mask, `as u8` threw away every fork past
-    /// the eighth.
-    pub fn split_cones(&self) -> Vec<ChoiceSet> {
-        self.choice_cones().iter().map(|m| *m >> N_FREE).collect()
-    }
-
     /// Rebuild this graph into `out` with the button bits replaced by
     /// constants, folding as it goes. Returns the mapping old -> new.
     ///
@@ -668,8 +545,7 @@ impl Graph {
                 // and `(s >> 13) & 1` on a `u8` is always 0 - which
                 // would have silently measured 16,384 configurations
                 // as 256 distinct ones and reported the collapse as
-                // sharing. Fourth member of the shift-overflow family;
-                // see `ChoiceSet`.
+                // sharing. Fourth member of the shift-overflow family.
                 (Op::Split(d), Some(s)) => out.fold(Op::Frag(s[d as usize]), vec![arg(&map, 0)]),
                 (Op::SplitValid(d), Some(s)) => out.fold(Op::FragOk(s[d as usize]), vec![arg(&map, 0)]),
                 (Op::SplitInt(d), Some(s)) => out.fold(Op::IntFrag(s[d as usize]), vec![arg(&map, 0)]),
@@ -756,7 +632,7 @@ impl Graph {
     /// returns evaluates to the same abstract value as the unfolded node
     /// would have, for every assignment of the leaves. Not "sound" -
     /// exact. A rule that merely refined the result would still be
-    /// correct in isolation but would change which lanes survive `ok`,
+    /// correct in isolation but would change which lanes are in error,
     /// and `folding_is_exact` enumerates the tri-state assignments to
     /// keep that honest. Rules that WOULD refine (`x and not x` is false
     /// concretely but unknown in Kleene) are therefore left out.
@@ -790,6 +666,20 @@ impl Graph {
             // `Some(true)` for every operand, and the two are checked
             // against each other by `folding_is_exact`.
             Op::FragOk(0) => return self.leaf(Op::ConstBool(true)),
+            // The span premise over a LITERAL interval is decided: the same
+            // test `zi_span_ok` makes per lane (the high end's grid cell
+            // within `n - 1` steps of the low end's), made once. A fork of a
+            // constant (`Symbolic::both_values`' two answers) derives its
+            // coverage through here, and it always fits.
+            Op::SplitOk(n) => {
+                if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
+                    // In the kernel's own i32 arithmetic, wrap included.
+                    let step = 1i32 << (16 - self.fork_bits as i32);
+                    let (fl, fh) = (lo & !(step - 1), hi & !(step - 1));
+                    let top = fl.wrapping_add(step.wrapping_mul(n as i32 - 1));
+                    return self.leaf(Op::ConstBool(fh <= top));
+                }
+            }
             // `IntFrag(c)` of a literal interval is a constant, by `eval`'s
             // definition: the grid floor of the low end plus `c` steps, at
             // least the low end. EXACT. The held-button fork
@@ -1725,13 +1615,37 @@ mod tests {
         assert_eq!(g.eval(&cells).unwrap()[and as usize], Val::Bool(Some(false)));
     }
 
+    /// `SplitOk(n)` over a literal folds to what the kernel computes for it
+    /// (`zi_span_ok`, the definition), at every grid and arity - `eval`
+    /// cannot model it, so `folding_is_exact_not_merely_sound` cannot.
+    #[test]
+    fn split_ok_of_a_literal_is_what_zi_span_ok_says() {
+        use celeste_engine::kernel::{zi_span_ok, zn_splat, ALL, ZI};
+        let raws = [i32::MIN, -0x2_8000, -0x1_0000, -1, 0, 1, 0x8000, 0xffff, 0x1_0000, 0x1_0001, 0x2_0000, 0x3_7fff, i32::MAX - 0x1_0000, i32::MAX];
+        for bits in [0u8, 1, 4, 16] {
+            let mut g = Graph::new();
+            g.set_fork_bits(bits);
+            for &lo in &raws {
+                for &hi in raws.iter().filter(|h| **h >= lo) {
+                    let c = g.leaf(Op::Const(lo, hi));
+                    for ways in 1..=4u8 {
+                        let got = g.fold(Op::SplitOk(ways), vec![c]);
+                        let iv = ZI { lo: zn_splat(Pico8Num::from_raw(lo)), hi: zn_splat(Pico8Num::from_raw(hi)) };
+                        let want = zi_span_ok(iv, bits, ways).val == ALL;
+                        assert_eq!(g.get(got).op, Op::ConstBool(want), "bits {bits} ways {ways} [{lo:#x}, {hi:#x}]");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn folding_is_exact_not_merely_sound() {
         // Every rule in `fold` has to be EXACT: `fold(op, args)` and
         // `add(op, args)` must evaluate to the SAME abstract value at
         // every assignment of the leaves. A rule that merely refined the
         // answer would be correct in isolation and would still change
-        // which lanes survive `ok` and which rows dedup together, so "it
+        // which lanes are in error and which rows dedup together, so "it
         // can only help" is not a defence. This enumerates rather than
         // arguing - it is the reason `x and not x -> false` is absent,
         // since Kleene says unknown there and `false` would be a
@@ -1959,29 +1873,6 @@ mod tests {
         // And a decided condition still picks its arm.
         let t = g.leaf(Op::ConstBool(true));
         assert_eq!(g.fold(Op::Sel, vec![t, x, y]), x);
-    }
-
-    #[test]
-    fn one_cone_pass_answers_for_both_kinds_of_choice() {
-        // Free choices and splits used to need two reachability passes over
-        // two vocabularies. They are one question - "which specialization
-        // points reach this node" - and the answer must stay separable,
-        // because the two are emitted differently: frees multiply the
-        // variants, splits partition the lanes.
-        let mut g = Graph::new();
-        let c = g.leaf(Op::Cell(1));
-        let kb = g.leaf(Op::Free(3));
-        let iv = g.add(Op::Split(1), vec![c]);
-        let both = g.add(Op::Sel, vec![kb, iv, c]);
-        let cones = g.choice_cones();
-        assert_eq!(
-            Choice::all_in(cones[both as usize]),
-            vec![Choice::Free(3), Choice::Split(1)]
-        );
-        assert_eq!(g.free_cones()[both as usize], 1 << 3);
-        assert_eq!(g.split_cones()[both as usize], 1 << 1);
-        // A node under neither is under neither.
-        assert_eq!(cones[c as usize], 0);
     }
 
     #[test]

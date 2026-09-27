@@ -60,7 +60,20 @@ pub struct State<D: Domain> {
     /// merged guard holds, exactly one side's guard holds, and the
     /// separating decision is KNOWN there, so the select picks that side.
     pub guard: D::Bool,
-    pub ok: D::Bool,
+    /// Where this path's MODEL ENDED: the lanes on which an unrolled loop's
+    /// bound ran out while the path still looped, and it went on as if the
+    /// loop were over (`Interp`'s numeric `for`). An error of the path, not
+    /// of any value - the loop changed nothing a row stores by running too
+    /// few times - so it is carried the one place a path's properties live,
+    /// and merged per case (the lanes a merged state takes from `t` ended
+    /// where `t`'s did). OR-ed into the outcome's error at the frame's end.
+    ///
+    /// The one thing `ok` carried that is not derivable from values
+    /// (plans/graph-model.md step 4). Made frame-global instead - OR-ed into
+    /// every outcome - each outcome's error read every path's loops, their
+    /// forks with them: room (3,0)'s largest kernel specialised 3.3M
+    /// configurations where it had 78k (2026-09-27).
+    pub ended: D::Bool,
     /// The branch decisions this state took since the frame started, in
     /// order: `(condition, which way)`. `split` pushes one; `merge` keeps
     /// the common prefix of the two sides.
@@ -140,11 +153,11 @@ pub struct Merged<D: Domain> {
     /// so `cond` is `t.guard`, the always-correct choice the merge used
     /// to make unconditionally. Counted so its frequency is a number.
     pub fell_back: bool,
-    /// A select survived the merge - in a value or in `ok` - so the kernel
-    /// reads `cond`'s value bit on this state's lanes.
+    /// A select survived the merge in a heap value, so the kernel reads
+    /// `cond`'s value bit on this state's lanes.
     pub selects: bool,
-    /// The first slot whose join left a select, with its two values (or
-    /// "ok"): what a refused rejoin names (`Interp::rejoin_fragments`).
+    /// The first slot whose join left a select, with its two values: what a
+    /// refused rejoin names (`Interp::rejoin_fragments`).
     pub first_select: Option<String>,
 }
 
@@ -156,7 +169,7 @@ impl<D: Domain> Clone for State<D> {
             scope: self.scope,
             stack: self.stack.clone(),
             guard: self.guard.clone(),
-            ok: self.ok.clone(),
+            ended: self.ended.clone(),
             path: self.path.clone(),
             key_override: self.key_override.clone(),
             frag: self.frag.clone(),
@@ -178,28 +191,21 @@ impl<D: Domain> State<D> {
         self.heap.shape(&self.roots())
     }
 
-    /// A PRECONDITION on this kernel's inputs: `c` must hold, or these inputs
-    /// should not have been run through this body at all (a widened field
-    /// outside the band it was widened to, a fork whose parts do not cover the
-    /// lane, a pin that does not match).
-    ///
-    /// One error concept, so this and `own_error` below have the SAME body -
-    /// the names are the classification, which is what step 4 needs in order
-    /// to derive error per value instead of carrying one boolean per state
-    /// (plans/graph-model.md section 4). Naming them costs nothing: the node
-    /// is `fold(And, ..)` either way, and `fold` sorts `And`'s operands by id,
-    /// so neither the spelling nor the order changes what is interned.
-    pub fn precondition(&mut self, d: &mut D, c: &D::Bool) {
-        self.ok = d.and(&self.ok, c);
-    }
-
-    /// An OPERATOR'S OWN ERROR: this expression is partial, and `c` is the
-    /// condition under which it has a value at all - `Known(cond)` where a
-    /// merged value is a select, or an unrolled loop's bound having run out.
-    /// Unlike a precondition this is a property of a VALUE, so once error is
-    /// derived these become `own_error(n, args)` on the node itself.
-    pub fn own_error(&mut self, d: &mut D, c: &D::Bool) {
-        self.ok = d.and(&self.ok, c);
+    /// The DECISIONS this state's path took, as one condition: where an
+    /// operator evaluated on it means anything (`Domain::evaluated_at`,
+    /// `trace::error`). A superset of the lanes `guard` names - a fork's
+    /// validity narrows the guard and not the path, and a merge keeps the
+    /// common prefix - so an own error scoped to it errs on no fewer lanes
+    /// than it should. Scoped to `guard` itself it was exact and far bigger:
+    /// every fork site's intermediate guard became a root of the kernel
+    /// (room (3,0)'s largest, 456k nodes -> 1.41M, 2026-09-27).
+    pub fn decided(&self, d: &mut D) -> D::Bool {
+        let mut at = d.boolean(true);
+        for (c, way) in &self.path {
+            let lit = if *way { c.clone() } else { d.not(c) };
+            at = d.and(&at, &lit);
+        }
+        at
     }
 }
 
@@ -381,14 +387,7 @@ fn merge_inner<D: Domain>(
         }
     }
 
-    let per_case = d.sel_bool(cond, &t.ok, &f.ok);
-    // Likewise `ok`: an `ok` both sides hold alike is no select on `cond`.
-    let ok_selects = t.ok != f.ok && d.is_select_bool(&per_case);
-    let Joined { writes, selects, mut first_select } = joined;
-    if first_select.is_none() && ok_selects {
-        first_select = Some("ok".to_string());
-    }
-    let selects = selects || ok_selects;
+    let Joined { writes, selects, first_select } = joined;
     if selects && refuse_selects {
         return Ok(None);
     }
@@ -416,37 +415,7 @@ fn merge_inner<D: Domain>(
         scope: t.scope,
         stack: t.stack.clone(),
         guard: d.or(&t.guard, &f.guard),
-        // Obligations are per-CASE: a lane only has to satisfy what the
-        // arm it actually took required, so this selects rather than
-        // conjoining. Conjoining would be sound but would deopt lanes for
-        // an obligation incurred on a path they did not take.
-        //
-        // AND THE DECISION MUST BE DECIDED (2026-09-15). Every value below
-        // is `Sel(cond, t, f)`, and the kernel's select takes an arm by
-        // the condition's value bit: on a lane where `cond` is undecided
-        // (a comparison on an interval speed) that silently picked the
-        // false arm and dropped the other arm's successors - and `ok`
-        // itself was such a select. `Known(cond)` folds to true wherever
-        // the condition is decided at trace time (every exact-speed set),
-        // and elsewhere makes an undecided merge what it has to be: a
-        // fatal decline naming the lane, like an exceeded fork arity.
-        //
-        // ONLY WHERE A SELECT SURVIVES (2026-09-16). A merge whose joins all
-        // folded (equal arms, or booleans into Kleene algebra - the `and`
-        // chain of an overlap test) reads no value bit, and the kernel's
-        // And/Or/Not are exact on (value, known) masks. Room (2,0)'s fruit
-        // bobs over a widened band (`widen_fruit`), so the player-fruit
-        // overlap test is undecided near it; the unconditional premise
-        // refused those lanes (exact speed, f49), where the undecided `hit`
-        // should instead emit both outcomes (an unknown `live` emits).
-        ok: {
-            if selects {
-                let decided = d.known(cond);
-                d.and(&per_case, &decided)
-            } else {
-                per_case
-            }
-        },
+        ended: d.sel_bool(cond, &t.ended, &f.ended),
         path,
         key_override: t.key_override.clone(),
         frag: t.frag.clone(),
@@ -501,7 +470,7 @@ impl<D: Domain> Joined<D> {
         let j = join(d, cond, a, b)?;
         // Only the selects THIS merge made read `cond`'s value bit: a slot both
         // sides hold alike keeps whatever select an earlier merge left there,
-        // which reads its own condition and carries its own premise. (Counting
+        // which reads its own condition and owns its own error. (Counting
         // those too made every merge on an undecided atom refuse over the
         // spawn's `delay`, room (3,0) with the floors unknown, 2026-09-18.)
         let sel = a != b
@@ -563,6 +532,29 @@ mod tests {
 
     /// Two states that differ in one field merge into one state with one
     /// select, and everything they agree on stays a single node.
+    /// Where a path's model ended is merged PER CASE: the lanes the merged
+    /// state takes from one side ended where that side's did, and no more.
+    #[test]
+    fn where_a_path_ended_merges_per_case() {
+        let mut d = Symbolic::default();
+        let mut t: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        t.globals = t.heap.new_table();
+        t.scope = t.heap.new_scope(None);
+        let mut f = t.clone();
+        let sym = d.graph.leaf(Op::Cell(1));
+        let zero = d.num(P8::from_i16(0));
+        let cond = d.compare(Cmp::Gt, &sym, &zero).unwrap();
+        t.guard = cond;
+        f.guard = d.not(&cond);
+        t.path.push((cond, true));
+        f.path.push((cond, false));
+        // Only `t`'s loop ran out, where some other condition holds.
+        let over = d.graph.leaf(Op::Cell(2));
+        t.ended = over;
+        let m = merge(&mut d, &t, &f).unwrap().expect("same shape merges").state;
+        assert_eq!(m.ended, d.graph.fold(Op::And, vec![cond, over]), "ended only on t's lanes");
+    }
+
     #[test]
     fn merging_costs_a_select_only_where_the_arms_disagree() {
         let mut d = Symbolic::default();
@@ -572,7 +564,7 @@ mod tests {
             scope: 0,
             stack: Vec::new(),
             guard: d.boolean(true),
-            ok: d.boolean(true),
+            ended: d.boolean(false),
             path: Vec::new(),
             key_override: Vec::new(),
             frag: Vec::new(),
@@ -628,7 +620,7 @@ mod tests {
     #[test]
     fn a_merge_selects_on_the_separating_decision_not_the_guard() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let a = d.num(P8::from_i16(1));
@@ -659,7 +651,7 @@ mod tests {
 
         // Two states whose paths do not diverge at one shared decision
         // fall back to the full guard, which is always correct.
-        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ok: d.boolean(true), path: vec![(g, true)], key_override: Vec::new(), frag: Vec::new() };
+        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ended: d.boolean(false), path: vec![(g, true)], key_override: Vec::new(), frag: Vec::new() };
         p.globals = p.heap.new_table();
         p.scope = p.heap.new_scope(None);
         let mut q = p.clone();
@@ -674,7 +666,7 @@ mod tests {
     #[test]
     fn differing_shapes_do_not_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let obj = s.heap.new_table();
@@ -699,7 +691,7 @@ mod tests {
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let mut f = s.clone();

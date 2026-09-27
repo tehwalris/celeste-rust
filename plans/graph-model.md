@@ -311,31 +311,19 @@ what "do we ever raise at runtime?" turns on:
   keyed on the `(shape, region)` pair, so a refusal in one region still bails
   even where another region of the same shape traced fine.
 
-MEASURED (2026-09-27): `poison` never fires, in any room testable. Rooms
-(6,0), (5,0), (1,0), (2,0), (0,0), (3,0) skip 200 / 289 / 45 / 492 / 167 / 200
-outcomes and every single one is "another room" - not one "ok folds false" -
-with no refusal reasons either, and the start room's shape fixpoint reports an
-empty `illegal`. Room (2,0) is the one that matters: the spring's unset `delay`
-is the worked example in `poison`'s own doc, and it is clean.
+HOW IT IS BUILT (step 4, 2026-09-27). `poison` clears the state's guard and
+records the guard it had in `Interp::raised`; the collapse drops a state live
+nowhere, and `verify::trace_frame` folds the recorded guards into
+`Frame::raise`. The lattice walk reports every (shape, region) whose raise row
+does not fold to false - (7,0) 101 of 204, (6,1) 404 of 811, (7,1) 303 of 406,
+and none anywhere else - so a raise is a build-time fact with a name, not a
+runtime `ok` term. The row is not materialised in the kernel: it has no field
+and no successor, so a lane in it produces nothing, which is the semantics of
+a Lua raise; what a kernel mask would add is a runtime COUNT of such lanes.
 
-So TODAY THE RAISE ROW IS IMPLICIT AND THROWN AWAY - `poison` makes the outcome
-statically dead and the build drops it - and that is fine, because a row nobody
-reads need not be materialised. But throwing it away is only sound if it is
-EMPTY, which means computing its liveness is exactly what licenses discarding
-it. Hence the cheap version of the design, which costs nothing at runtime:
-fold the raise row's liveness at BUILD time; where it folds to false, emit
-nothing; where it does NOT, that is a loud build-time event - we have learned
-the model admits a raise - and we choose then between over-approximating and
-fixing the model. What happens today in that case instead is that the
-obligation quietly becomes a runtime `ok` term.
-
-Both counters that would have told us this were invisible: `Interp::illegal` is
-read only by an `#[ignore]`d test, and `shapes::Walk::unreachable` is
-incremented and never printed. The production path reports a poisoned outcome
-only as `[lattice]   outcome skipped: ok folds false` under
-`CELESTE_LATTICE_TRACE`, which is how the numbers above were taken. A growing
-poison count is the tracer losing an invariant the game holds, so it should not
-depend on remembering to set an environment variable.
+(An earlier paragraph here said `poison` never fires. It was measured with a
+counter that could not see a poisoned state merging into a live one, which is
+exactly how it does fire.)
 
 THERE IS ONE ERROR CONCEPT, AND PRECONDITIONS ARE IN IT (Philippe,
 2026-09-27). An earlier draft of this section gave a fork's COVERAGE its own
@@ -391,6 +379,14 @@ erroring operand? No, on two independent grounds.
 So: assert that every `live` cone is error-free - statically where the
 propagation can show it, and otherwise as a root checked loudly, which is the
 shape `level_minus_one` already uses to check `ok`.
+
+CORRECTED BY STEP 4 (2026-09-27): the first reason is true of the trace and
+false of the kernel. The kernel evaluates every node on every lane, and off
+the path a node was traced on its operands are garbage - strict propagation
+declined room (1,0) at f25. An operator's own error therefore holds where the
+operator was EVALUATED (`at`, the path's decisions at its site), which is
+the masking by control flow that the tracer does, stated on the node rather
+than carried on the state. See step 4 under "Order of work".
 
 Consequences:
 
@@ -450,7 +446,7 @@ left by which to arise.
 * **Decidedness** - "this lane decides `c`". That is type propagation's answer,
   known at compile time. As a runtime premise it is worse than useless: at a
   platforms-unknown level the condition is undecided for EVERY lane, so the
-  check would refuse everything, and in practice `fork_known_premises` finds
+  check would refuse everything, and in practice `fork_undecided_selects` finds
   it later and converts it into a fork. It is a to-do marker from the tracer
   to the fork pass, encoded as a graph node that then sits in `ok` and
   inflates everything downstream of it.
@@ -463,6 +459,11 @@ nothing to mark. The second is not an assertion the graph carries either - it
 is `Flr`'s own error condition (section 4), which is what dissolves its
 apparent circularity. `Known` disappears as a concept.
 
+AS BUILT (step 4): the tracer creates no `Known` node at all. `Op::Known`
+survives only as the kernel's test that a value is decided on a lane, and only
+inside a derived error (`trace::error`: a floor's, a select's, and whether an
+operand of `And`/`Or` decides it).
+
 ## Where the code diverges
 
 * **The tracer is an interpreter, so the two stages are collapsed.** At an
@@ -472,19 +473,19 @@ apparent circularity. `Known` disappears as a concept.
   which depends on the level - so the lattice walk re-traces per (shape,
   region, level): room (6,0) does 914 traces in a 65 s walk before a single
   kernel is built. Under the separation that is one trace per shape.
-* **`Sel` and `Known` are artifacts of merging, not of the program.**
+* **`Sel` is an artifact of merging, not of the program.** (`Known` no longer
+  is: step 4.)
 * **Two fork mechanisms where there should be one.** `fork_flr` / `fork_int` /
-  `fork_table` split a value; `both_values` + `verify::fork_known_premises`
-  split a condition. The second is what room (6,0) uses, and it is the source
+  `fork_table` split a value; `both_values` + `verify::fork_undecided_selects`
+  split a condition. (Step 3 made them one OPERATION; they are still two
+  choices of WHAT to split, which is step 5.) The second is what room (6,0) uses, and it is the source
   of its 57-79 forks over 10 unknowns, of the validity algebra, of the
   impossible combinations, and of the 10-13 forks per frame that change no
   stored field at all (the platform wrap: whether it wrapped cannot matter,
   because the output widening overwrites `x` with the whole path either way).
-* **`ok` is one boolean per state, accumulated by AND**, rather than per-value
-  errors OR-ed into the rows that store them. Hence obligations outliving
-  their values: in room (6,0), 0 of 10-14 merge premises protect a select that
-  reaches any row.
-* **`quantify` exists at all.**
+* ~~`ok` is one boolean per state, accumulated by AND~~ - gone in step 4 (below).
+* **`quantify` exists at all** - on the abandoned `ac307ce` line only; this
+  branch never had it (step 6).
 
 ## Order of work
 
@@ -496,38 +497,84 @@ this size is safe.
    (numbers) and `Symbolic::runtime_unknown` (booleans, added 2026-09-26).
 2. Delete `Known`-as-decidedness, using that pass. Keep the assertion, renamed.
 3. Unify the fork operations into one `fork(node, partition)`.
-4. DELETE `ok`. Surveyed 2026-09-27: 16 sites write it. THIRTEEN of them are
-   obligations and all thirteen become derived error - there is one error
-   concept, so there is nothing to classify between them:
+4. DELETE `ok`. DONE 2026-09-27 (`trace::error`). There is no `State::ok`;
+   a traced outcome's `error` is derived once, after
+   `fork_undecided_selects`, from its fields, keys and guard, and OR-ed with
+   what no operator carries. What each former `ok` writer became:
 
-   * `widen.rs` 123 (the `require` helper - a free function there, NOT a
-     `Domain` method), 201, 401, 592, 667, 865, 884, 887, 973; `interp.rs:1962`
-     (a `move` fork's span premise) - all preconditions, i.e. unary operators
-     on an input that error on an invalid one. TEN, not eleven:
-     `verify.rs:340` is not a write at all, it builds a LOCAL `ok` from `s.ok`
-     and `pin_ok` for the outcome's root, so the pin guard belongs with the
-     reads below.
-   * `interp.rs:702` (`Known(cond)` where a merged VALUE is a select) and
-     `interp.rs:890` (the unrolled loop's bound).
+   * OPERATORS' OWN ERROR, derived per node: `Flr` of a set not within one
+     integer (`not Known(Flr)`), a `Sel` on a lane-undecidable condition
+     (`not Known(c)`), a fork FRAGMENT's coverage (`not SplitOk(ways)`, `not
+     SplitOkTab`) - the move fork's span premise, the snaps' one-bucket
+     claims, the position fork's, and the merge's `Known(cond)`
+     (`premise_for_value`, deleted). A fork's validity owns nothing; coverage
+     uses the fork's FINAL arity (the old per-site premise with a smaller
+     arity was stricter than the fragments enumerated). Lua `flr(x)` of an
+     interval used to have no premise at all while the kernel floors the low
+     end; it has its own error now.
+   * A WIDENING'S OWN ERROR, on the slot it writes (`widen::SlotErrors`),
+     counted only where the outcome stores that slot.
+   * THE FRAME'S: inputs outside the kernel's admissible set (pins, region
+     bounds).
+   * THE PATH'S: `State::ended`, where an unrolled loop's bound ran out -
+     the one thing `ok` carried that no value derives, merged per case.
+   * A RAISE: its own row (section 4, "How it is built").
 
-   The fourteenth is `interp.rs:1240` (`poison`), a Lua RAISE, which is not an
-   error and gets the treatment in section 4: it kills liveness downstream and
-   is exported as an obligation provably false wherever live.
+   THE FINDING that shaped it: section 4's argument that `And`/`Or` never
+   need to mask error ("no node exists on a path Lua would not have
+   evaluated") is true of the TRACE and false of the KERNEL, which evaluates
+   every node on every lane - off its path a node's operands are whatever the
+   lane's own path left there. Strict propagation declined room (1,0) at f25;
+   exact (Kleene-lazy `And`/`Or`) propagation was a copy of the DAG above
+   every source, +23% frame time. So AN OWN ERROR HOLDS WHERE ITS OPERATOR WAS
+   EVALUATED: `own and at`, `at` the decisions of the path at its site
+   (`State::decided`, `Domain::evaluated_at`) - and the path's guard would not
+   do: specialised per fork configuration it is a different large node in
+   each, and bodies whose errors differ fuse at a node per body. Likewise the
+   loop's bound, which made frame-global read every path's forks (room
+   (3,0)'s largest kernel: 78k configurations -> 3.3M).
 
-   The last writes are plumbing that dissolves with the field: `shapes.rs:159`
-   and `verify.rs:1157` initialise it to true, `state.rs:360` merges it (and
-   can REFUSE a merge when the merged `ok` is a select - the fusion cost this
-   step removes), `verify.rs:601` remaps it.
+   Downstream the root is `error`, read with the SAME polarity as `live` - where
+   it MAY hold (`asm_kernel::read_zb_may`); fused bodies keep a shared error
+   node unchanged, and members whose errors differ OR `live_i and error_i`.
 
-   Reading `ok` is the wider surface: ~35 sites over seven files, including two
-   that are not plumbing - `level_minus_one.rs:530` hashes it into a DEDUP
-   SIGNATURE, and `interp.rs:2303` asserts its representation is `Op::Known`.
-   Five sites prune an outcome whose `ok` folds statically false and all five
-   mean the same thing, so they can share one predicate.
+   Gates (ckhash, posgraph, marks) and room (5,0)'s kept counts unchanged.
+   Fused kernel nodes against the old `ok`: room (1,0) 483k -> 305k, (2,0)
+   4.22M -> 2.61M, (5,0) 1.06M -> 406k, (3,0) 6.24M -> 3.25M (its largest
+   kernel 456k -> 229k); room (1,0) f0-f44 frame time 2.79 s -> 2.72 s.
 
-   Still the invasive step, so do it in halves with the gates green between.
 5. Domain-first fork choice, partitioned at the thresholds the branch uses.
-6. Delete `quantify`.
+   IN PROGRESS (2026-09-27). Measured on room (6,0) at `r0sxhp`, the worst
+   trace forks 134 conditions, and they group by the input they read: each
+   platform's `x` alone is read by 12-14 of them - its two wrap tests
+   (`x1 < -16`, `x1 > 128`, `x1 = x + step`) and the carry's (`d < 0`,
+   `d > 0`, `|d| < 1..8`, the `move_x` unroll bounds), where `d` is `step`
+   away from the wrap. Forked one by one that is 2^12-2^14 configurations per
+   platform, nearly all impossible; the unknown has three meaningful parts.
+   The rest are chains over several platforms (the player carried by one,
+   then another).
+
+   Built: `verify::partition_unknowns` - group the conditions that read one
+   unknown and nothing else unknown, bisect its range until every lane
+   decides every condition on every part, make ONE table fork of the unknown
+   at those parts, and rebuild each condition on the fork's fragment.
+   It finds the groups and partitions NONE of them, and the reason is the
+   finding: the thresholds are not constants. `step` is
+   `flr(__split_by_flr(rem + spd + 0.5))` and the platform's `spd.x` is an
+   input (0 on the spawn frame, `dir * 0.65` after), so the wrap happens at
+   `x < -16 - step`, a different threshold on each lane. A partition at
+   constant ranges cannot decide it; what can is either a fork whose parts
+   are cut at per-lane thresholds (a new op family: `SplitAt(v, t1..tn)`,
+   fragments `clip(v, [t_c, t_c+1))`), or a sharper per-lane decidability
+   argument (a comparison of `u + e` against `K`, `e` integer-valued per
+   lane, is decided on any part of `u` with no integer inside it). Open:
+   which.
+6. Delete `quantify` - never on this branch (it came with `ac307ce`). What
+   step 6 stood for here is the other limit that commit removed: the per-node
+   `ChoiceSet` fork mask, which capped a frame at 58 forks and is what stops
+   room (6,0)'s kernel build (traces fork up to 138). DONE 2026-09-27:
+   `lower::specialize_frame` reads each outcome's forks off the cone it
+   already computes, and `Choice`/`ChoiceSet`/`choice_cones` are gone.
 
 Steps 1-2 are small and land immediately. Steps 3-6 are load-bearing.
 

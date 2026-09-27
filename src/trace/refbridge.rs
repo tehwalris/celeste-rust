@@ -221,7 +221,7 @@ pub fn to_trace_state(
         scope,
         stack: Vec::new(),
         guard: true,
-        ok: true,
+        ended: false,
         path: Vec::new(),
         key_override: Vec::new(),
         frag: Vec::new(),

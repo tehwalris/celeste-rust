@@ -39,7 +39,7 @@ pub struct Reference {
 /// No pm1 pin: a kernel covers every key of its shape (the pin is worth
 /// -6.3% (T13) and costs a kernel per key). The LATTICE pins are a
 /// different thing: fields constant across the room's reachable states,
-/// guarded by `pin_guard` in `ok`.
+/// whose mismatch (`pin_guard`) is the frame's error.
 ///
 /// REFUSES rather than returns a partial set. A shape the fixpoint could
 /// not trace is a kernel that will not exist, and under the never-deopt
@@ -175,7 +175,7 @@ pub struct SpeedKey {
 /// THE REGION KEY (room (3,0), 2026-09-17, plans/room30.md): a kernel is
 /// specialized on the player's whole-pixel position lying in one square of
 /// a `px`-pixel grid and its speed in `[-speed, speed]` px per frame, both
-/// guarded in `ok` (a lane outside declines loudly). Room (3,0)'s frame
+/// outside which the frame is in error (a lane outside declines loudly). Room (3,0)'s frame
 /// checks its 12 fall floors in every collision loop of every move step;
 /// with the position unknown the trace ran for minutes, with it bounded to a
 /// square the range analysis folds the far floors away (15.6 s for the spawn
@@ -387,8 +387,8 @@ fn key_paths(pl: &super::iface::Path) -> [super::iface::Path; 7] {
 /// (`Symbolic::ranges`: every comparison on them folds, and the boundary
 /// snap forks at exactly the edges the output can cross,
 /// `widen::spd_table_node`); `dash_time` and, mid-dash, the dash target
-/// and accel are pinned. Both are guarded in `ok`: a lane outside declines
-/// loudly. Returns the frame and the bounds it was traced under.
+/// and accel are pinned. Outside either the frame is in error: a lane
+/// outside declines loudly. Returns the frame and the bounds it was traced under.
 pub fn key_frame(
     t: &mut Tracer,
     lw: &WalkView<'_>,
@@ -1050,7 +1050,7 @@ fn census_report(nodes: &[KeyNode], w: u8) -> String {
 
 /// What a lowered kernel's bodies ARE, for finding why there are many:
 /// root slots against distinct root nodes and constants; per outcome the
-/// button reps, bodies per rep, bodies whose `ok` folded false, the forks
+/// button reps, bodies per rep, bodies whose `error` folded true, the forks
 /// whose fragments separate bodies (and the most fragments within one
 /// rep), which roots differ between the bodies of one rep, and the
 /// configurations of the largest rep.
@@ -1092,7 +1092,7 @@ fn body_breakdown(
             if j < nf {
                 names[j].clone()
             } else if j == nf {
-                "ok".into()
+                "error".into()
             } else if j == nf + 1 {
                 "live".into()
             } else {
@@ -1105,10 +1105,10 @@ fn body_breakdown(
         }
         let mut sizes: Vec<usize> = by_rep.values().map(|v| v.len()).collect();
         sizes.sort_unstable();
-        let ok_false = mine.iter().filter(|b| matches!(sp.get(b.3[nf]).op, Op::ConstBool(false))).count();
+        let err_true = mine.iter().filter(|b| matches!(sp.get(b.3[nf]).op, Op::ConstBool(true))).count();
         let _ = writeln!(
             out,
-            "  outcome {oi}: {} bodies over {} button reps (per rep min {} median {} max {}); {ok_false} with ok folded false; {} roots per body",
+            "  outcome {oi}: {} bodies over {} button reps (per rep min {} median {} max {}); {err_true} with error folded true; {} roots per body",
             mine.len(),
             by_rep.len(),
             sizes[0],
@@ -1456,8 +1456,8 @@ pub fn key_fixpoint(lw: &LatticeWalk, w: u8) -> Result<Vec<KeyNode>> {
                         eprintln!("[keysucc] {:#x} {:?} -> {s_shape:#x} {s_key:?}{}", node.shape, node.key, if known { "" } else { " (not in the walk)" });
                     }
                     // An outcome shape the shape lattice has no frame for is
-                    // one it excluded on purpose (left the room, or `ok` folds
-                    // false): there is no kernel for it in any set.
+                    // one it excluded on purpose (it left the room): there is
+                    // no kernel for it in any set.
                     if !known {
                         continue;
                     }
@@ -1718,19 +1718,19 @@ fn probe_trace<'a>(
             return Stat { nodes: 0, forks: vec![], bodies: 0, fused: 0, asm_lines: 0, slots: 0, iters: it.for_iterations - it0, folds: it.d.range_folds, premises: 0, err: Some(format!("{e:#}")) }
         }
     };
-    // Nodes reachable from every outcome's roots, and the merge premises
-    // (`Known` of a non-constant) among them.
+    // Nodes reachable from every outcome's roots, and the selects' own
+    // errors (`Known` of a non-constant) among them.
     let g = &it.d.graph;
     let mut seen = vec![false; g.len()];
     let mut stack: Vec<u32> = Vec::new();
     for o in &f.outs {
         stack.extend(o.fields.iter().map(|(_, n, _)| *n));
-        stack.push(o.ok);
+        stack.push(o.error);
         stack.push(o.guard);
         stack.extend(o.keys.iter().map(|(_, n)| *n));
     }
-    // A merge premise (`Known(cond)`) that can FAIL at runtime is one
-    // whose condition reads an interval: a comparison with an interval
+    // A select's own error (`not Known(cond)`) that can HOLD at runtime is
+    // one whose condition reads an interval: a comparison with an interval
     // operand, or a connective / select over one.
     fn reads_interval(d: &super::domain::Symbolic, n: u32, depth: usize) -> bool {
         use super::domain::Domain;
@@ -2167,7 +2167,7 @@ pub fn specialize_probe(
         for o in &f.outs {
             for (_, nd, _) in &o.fields { roots_n.push(*nd); }
             roots_n.push(o.guard);
-            roots_n.push(o.ok);
+            roots_n.push(o.error);
         }
         let reach = crate::transpile::bdd::reachable(g, &roots_n);
         let nodes = reach.iter().filter(|b| **b).count();
@@ -2224,7 +2224,7 @@ pub fn specialize_probe(
         use crate::transpile::graph::Op;
         let g = &it.d.graph;
         let mut roots_n: Vec<crate::transpile::graph::NodeId> = Vec::new();
-        for o in &f.outs { for (_, nd, _) in &o.fields { roots_n.push(*nd); } roots_n.push(o.guard); roots_n.push(o.ok); }
+        for o in &f.outs { for (_, nd, _) in &o.fields { roots_n.push(*nd); } roots_n.push(o.guard); roots_n.push(o.error); }
         let reach = crate::transpile::bdd::reachable(g, &roots_n);
         let mut seen = std::collections::BTreeSet::new();
         for id in 0..g.len() {
@@ -2244,7 +2244,7 @@ pub fn specialize_probe(
         use crate::transpile::graph::Op;
         let g = &it.d.graph;
         let mut roots_n: Vec<crate::transpile::graph::NodeId> = Vec::new();
-        for o in &f.outs { for (_, nd, _) in &o.fields { roots_n.push(*nd); } roots_n.push(o.guard); roots_n.push(o.ok); }
+        for o in &f.outs { for (_, nd, _) in &o.fields { roots_n.push(*nd); } roots_n.push(o.guard); roots_n.push(o.error); }
         let mut hist: std::collections::BTreeMap<usize, usize> = Default::default();
         for m in 0u8..64 {
             let mut sp = g.like();
@@ -2264,7 +2264,7 @@ pub fn specialize_probe(
         use crate::transpile::graph::Op;
         let g = &it.d.graph;
         let mut roots_n: Vec<crate::transpile::graph::NodeId> = Vec::new();
-        for o in &f.outs { for (_, nd, _) in &o.fields { roots_n.push(*nd); } roots_n.push(o.guard); roots_n.push(o.ok); }
+        for o in &f.outs { for (_, nd, _) in &o.fields { roots_n.push(*nd); } roots_n.push(o.guard); roots_n.push(o.error); }
         let reach = crate::transpile::bdd::reachable(g, &roots_n);
         for id in 0..g.len() {
             if reach[id] {
@@ -2755,9 +2755,7 @@ enum WalkTraced {
         ///
         /// Carried out of the worker because it is the one number that says
         /// the tracer lost an invariant the game holds, and it used to reach
-        /// nobody: `Interp::illegal` is read only by an `#[ignore]`d test, and
-        /// a poisoned OUTCOME shows up in production only as `[lattice]
-        /// outcome skipped: ok folds false` under `CELESTE_LATTICE_TRACE`. A
+        /// nobody: `Interp::illegal` was read only by an `#[ignore]`d test. A
         /// modelling gap should not depend on remembering an environment
         /// variable (plans/graph-model.md section 4).
         illegal: std::collections::BTreeMap<String, usize>,
@@ -2803,9 +2801,7 @@ fn walk_trace(
     // walk, so there is no later job on this worker to mis-attribute to. The
     // assert is what would say so if that ever stopped being true.
     debug_assert!(tr.it.illegal.is_empty(), "a previous job left {} poison reasons behind", tr.it.illegal.len());
-    debug_assert!(tr.it.raised.is_empty(), "a previous job left {} raise conditions behind", tr.it.raised.len());
     tr.it.illegal.clear();
-    tr.it.raised.clear();
     let mut st = job.st.clone();
     if let Some(constants) = &job.rebase {
         shapes::rebase(&mut st, &mut tr.it.d, constants)?;
@@ -2815,10 +2811,7 @@ fn walk_trace(
         // A REFUSED trace can have poisoned paths before it refused, and they
         // count: the refusal says this (shape, region) did not compile, the
         // poison says the model admitted a Lua raise on the way there.
-        Err(e) => {
-            tr.it.raised.clear();
-            return Ok(WalkTraced::Refused(format!("{:#}", e), std::mem::take(&mut tr.it.illegal)));
-        }
+        Err(e) => return Ok(WalkTraced::Refused(format!("{:#}", e), std::mem::take(&mut tr.it.illegal))),
     };
     let nodes_added = tr.it.d.node_count().saturating_sub(tr.it.trace_start_nodes);
     // Live forks of THIS trace.
@@ -2830,7 +2823,7 @@ fn walk_trace(
                 rn.push(*nd);
             }
             rn.push(o.guard);
-            rn.push(o.ok);
+            rn.push(o.error);
         }
         let reach = crate::transpile::bdd::reachable(g, &rn);
         let splits: Vec<u32> = (0..g.len()).filter(|&id| reach[id] && matches!(g.get(id as u32).op, Op::Split(_))).map(|id| id as u32).collect();
@@ -2846,10 +2839,6 @@ fn walk_trace(
     let mut outs = Vec::new();
     let mut skipped = Vec::new();
     for o in &f.outs {
-        if tr.it.d.decide(&o.ok) == Some(false) {
-            skipped.push("ok folds false");
-            continue;
-        }
         if shapes::room_of(&o.st, &tr.it.d) != room0 {
             skipped.push("another room");
             continue;
@@ -2888,10 +2877,6 @@ fn walk_trace(
     // map would otherwise accumulate across every job it runs and the walk
     // would count the same poisoned path once per later trace.
     let illegal = std::mem::take(&mut tr.it.illegal);
-    // `raised` needs no drain here: `verify::trace_frame` takes it when it
-    // folds `Frame::raise`, so it is already empty on this path. The entry
-    // assert is what says so.
-    debug_assert!(tr.it.raised.is_empty(), "trace_frame left {} raise conditions behind", tr.it.raised.len());
     // CAN THIS FRAME RAISE? Decided HERE, in the worker whose arena `f.raise`
     // names - the walk's own graph is a different arena, so asking there would
     // read the wrong node. A bool travels safely; a NodeId would not.

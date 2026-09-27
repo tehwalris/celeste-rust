@@ -242,18 +242,12 @@ pub trait Domain {
         false
     }
 
-    /// The premise that `b` is DECIDED on this lane (`Op::Known`). A
-    /// concrete boolean always is.
-    fn known(&mut self, _b: &Self::Bool) -> Self::Bool {
-        self.boolean(true)
-    }
-
     /// Is a merged value a SELECT the kernel reads by its condition's value
     /// bit (`Op::Sel`), rather than a value the merge folded away (equal
     /// arms, a decided condition) or into Kleene boolean algebra, which the
     /// kernel evaluates exactly on (value, known) masks? Only the former
-    /// needs the merge's condition decided (`state::merge`). A concrete
-    /// merge never selects.
+    /// reads the merge's condition, so only it can make the merge refuse
+    /// (`state::merge`). A concrete merge never selects.
     fn is_select_num(&self, _v: &Self::Num) -> bool {
         false
     }
@@ -287,20 +281,19 @@ pub trait Domain {
         (v.clone(), self.boolean(true))
     }
 
+    /// `n` was computed where `at` holds - a fork's fragment, a floor: the
+    /// operators with an own error (`trace::error`), which holds only on the
+    /// lanes that evaluate them. Off its path a node's operands are whatever
+    /// the lane's own path left there. Nothing to record for a domain that
+    /// has no graph.
+    fn evaluated_at(&mut self, _n: &Self::Num, _at: &Self::Bool) {}
+
     /// The arity of the fork `__split_by_flr` takes on `v`: `move_ways`,
     /// or where the trace knows `v`'s static range (a kernel specialized
     /// on its speed key) the most grid cells one piece of it crosses -
     /// a lane's interval lies within one piece, and `SplitOk` checks it.
     fn flr_ways(&mut self, _v: &Self::Num) -> u8 {
         self.move_ways()
-    }
-
-    /// The premise a fork is taken under: this lane's interval spans at
-    /// most `ways` floors, as many as there are fragments. An
-    /// obligation, not a guard - a lane that fails it is REAL and this
-    /// body cannot run it.
-    fn span_ok(&mut self, _v: &Self::Num, _ways: u8) -> Self::Bool {
-        self.boolean(true)
     }
 
     /// The arity of the `move` fork (`__split_by_flr`): 2 unless the
@@ -471,8 +464,8 @@ pub struct Symbolic {
     /// asks for six, in slot order, which is what makes these line up with
     /// the kb0..kb5 the kernels already speak.
     pub frees: u8,
-    /// How many FORK choices have been handed out this frame. The other
-    /// half of `ChoiceSet`, above the six buttons.
+    /// How many FORK choices have been handed out this frame: the fork ids,
+    /// beside the six buttons.
     pub forks: u8,
     /// The arity of the `move` fork for the set being traced (see
     /// `Domain::move_ways`); `trace_frame` sets it from the widen mode.
@@ -509,10 +502,15 @@ pub struct Symbolic {
     /// What each fork `both_values` made was made for (a held trail, an
     /// escaped atom's slot), for the kernel dump. Cleared with `escaped`.
     pub fork_origins: Vec<(u8, String)>,
+    /// WHERE each node with an own error was evaluated: the OR of the path
+    /// guards the tracer built it under (`Domain::evaluated_at`), because
+    /// its error holds only there (`trace::error`). Per trace, like the
+    /// fork numbering.
+    pub evaluated: rustc_hash::FxHashMap<NodeId, NodeId>,
     /// Keep a traced frame's undecided selects as selects: level -1, whose
     /// evaluator joins an undecided select's arms, sets it around its trace.
     /// Off, the frame's surviving selects on a condition a lane can hold
-    /// undecided become forks (`verify::fork_known_premises`).
+    /// undecided become forks (`verify::fork_undecided_selects`).
     pub no_known_forks: bool,
     /// The moving platforms' `x` input values at a platforms-unknown level
     /// (`widen::fork_platform_inputs`): each on its path. Cleared per frame.
@@ -552,7 +550,7 @@ pub struct Symbolic {
     pub ival_cells: std::collections::BTreeSet<u32>,
     /// `is_interval`'s memo, valid for the current `ival_cells` (nodes never
     /// change): asked of every select's condition at the end of a frame
-    /// (`verify::fork_known_premises`), and a graph-sized memo per call was
+    /// (`verify::fork_undecided_selects`), and a graph-sized memo per call was
     /// fine only while forks were the one caller. Dropped with
     /// `forget_intervals` wherever `ival_cells` changes.
     ival_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
@@ -726,11 +724,11 @@ impl Symbolic {
     /// * a `Sel` counts its CONDITION, because an undecided condition is
     ///   precisely what makes the select unevaluable, where for interval-ness
     ///   only the arms matter;
-    /// * `Flr` FOLLOWS ITS OPERAND. `is_interval` calls it exact "by guard -
-    ///   the lane survives only where the floor is unique, which is a
-    ///   conjunct of `ok`", i.e. it assumes the very obligation. Here `Flr`
-    ///   is a PARTIAL operator: a singleton only on pain of error, and that
-    ///   error is the operator's own (`own_error`), not a type fact. Reading
+    /// * `Flr` FOLLOWS ITS OPERAND. `is_interval` calls it exact because
+    ///   the lane survives only where the floor is unique, i.e. it assumes
+    ///   the very obligation. Here `Flr` is a PARTIAL operator: a singleton
+    ///   only on pain of error, and that error is the operator's own
+    ///   (`trace::error`), not a type fact. Reading
     ///   the shortcut into this pass is what made me fold `Known(Flr(..))`
     ///   away unsoundly on 2026-09-26.
     ///
@@ -823,7 +821,7 @@ impl Symbolic {
 
     /// Does boolean `n` read a comparison with an INTERVAL operand - a
     /// condition a lane can hold undecided, its states answering both ways
-    /// (`verify::fork_known_premises`)?
+    /// (`verify::fork_undecided_selects`)?
     pub fn reads_interval_cmp(&self, n: NodeId, memo: &mut std::collections::HashMap<NodeId, bool>) -> bool {
         if let Some(b) = memo.get(&n) {
             return *b;
@@ -858,7 +856,7 @@ impl Symbolic {
     pub fn may_answers(&mut self, n: NodeId) -> (NodeId, NodeId) {
         // MEMOISED, like every other pass here, because it is a pure function
         // of the graph - and because without it this was 99.96% of
-        // `fork_known_premises` and half of room (6,0)'s lattice walk.
+        // `fork_undecided_selects` and half of room (6,0)'s lattice walk.
         //
         // The recursion below descends `And`/`Or`/`Not`, and the graph is a
         // DAG, so an unmemoised walk recomputes every shared subtree once per
@@ -1386,8 +1384,8 @@ impl Domain for Symbolic {
                 | Op::Min | Op::Max => any(memo, a),
                 // The CONDITION does not make the result an interval.
                 Op::Sel => any(memo, &a[1..]),
-                // Exact by guard - the lane survives only where the floor
-                // is unique, which is a conjunct of `ok`.
+                // Exact where the lane survives: a floor that is not unique
+                // is the operator's own error (`trace::error`).
                 Op::Flr => false,
                 // The walk replaces `sin` of an inexact input with its
                 // RANGE as a constant, so this follows its operand.
@@ -1416,10 +1414,6 @@ impl Domain for Symbolic {
         (f.value, f.valid)
     }
 
-    fn span_ok(&mut self, v: &NodeId, ways: u8) -> NodeId {
-        self.graph.fold(Op::SplitOk(ways), vec![*v])
-    }
-
     fn flr_ways(&mut self, v: &NodeId) -> u8 {
         // Only a trace with seeded ranges knows a static range: an
         // unspecialized trace keeps the fixed arity (and its gates).
@@ -1444,16 +1438,20 @@ impl Domain for Symbolic {
         }
     }
 
-    fn known(&mut self, b: &NodeId) -> NodeId {
-        self.graph.fold(Op::Known, vec![*b])
-    }
-
     fn is_select_num(&self, v: &NodeId) -> bool {
         matches!(self.graph.get(*v).op, Op::Sel)
     }
 
     fn is_select_bool(&self, b: &NodeId) -> bool {
         matches!(self.graph.get(*b).op, Op::Sel)
+    }
+
+    fn evaluated_at(&mut self, n: &NodeId, at: &NodeId) {
+        let at = match self.evaluated.get(n) {
+            Some(before) => self.graph.fold(Op::Or, vec![*before, *at]),
+            None => *at,
+        };
+        self.evaluated.insert(*n, at);
     }
 
     fn move_ways(&self) -> u8 {

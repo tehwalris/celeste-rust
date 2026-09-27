@@ -296,11 +296,6 @@ impl Domain for RefDomain {
         let p = P8::from_i16(base);
         (Iv::new(p, p), true)
     }
-
-    fn span_ok(&mut self, _v: &Iv, _ways: u8) -> bool {
-        // We fork on the ACTUAL floor span, so the premise holds by construction.
-        true
-    }
 }
 
 #[cfg(test)]

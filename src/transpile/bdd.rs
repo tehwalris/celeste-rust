@@ -306,7 +306,8 @@ fn syntactic_complements(g: &Graph, x: NodeId, y: NodeId) -> bool {
 // ONE table shared by the whole graph. On a fused kernel of the bucket
 // dispatch (~700 atoms, guard chains across hundreds of configurations) a few
 // early formulas filled its 2^22-node cap, and every node after them - 5,500
-// to 8,300 `And`/`Or`/`Not` per kernel, the `ok`/`live` region included - was
+// to 8,300 `And`/`Or`/`Not` per kernel, the `ok`/`live` region included (`ok`
+// is `error` since 2026-09-27) - was
 // left unanalysed; four passes of that were ~all of the level-0 bucketed
 // set's build CPU (7,292 CPU-seconds of the build's ~7,200 user seconds).
 // What it found was almost entirely the common-factor collapse, and a

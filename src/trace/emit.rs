@@ -61,14 +61,14 @@ pub fn show_tree(g: &Graph, root: NodeId, depth: usize) -> String {
 }
 
 /// One output shape of a traced frame: the cells it writes, and the two
-/// booleans that say which lanes reach it and which it may keep.
+/// booleans that say which lanes reach it and on which its row is undefined.
 pub struct FrameOutcome {
     pub outputs: Vec<(u32, NodeId, &'static str)>,
     /// Outputs keyed on another node than they store: `(index into
     /// outputs, key node)` - the speed under a bucket (`State::key_override`).
     pub keys: Vec<(usize, NodeId)>,
     pub live: NodeId,
-    pub ok: NodeId,
+    pub error: NodeId,
     /// Cells `Rt2::boundary` widens to a UNIFORM value at level 0 (rem x/y ->
     /// the [-0.5, 0.5) interval; timer globals -> 0), with that value. The key
     /// emitter mirrors the boundary: these contribute the widened value from
@@ -89,7 +89,7 @@ pub struct Bound {
 
 
 /// What each root index passed to `renumber_cells` is: the roots are
-/// every outcome's fields then its `live` and `ok`, flattened, and a
+/// every outcome's fields then its `live` and `error`, flattened, and a
 /// failure that says "root #58" means nothing without that key.
 fn root_legend(f: &crate::trace::verify::Frame) -> String {
     let mut out = Vec::new();
@@ -100,7 +100,7 @@ fn root_legend(f: &crate::trace::verify::Frame) -> String {
             k += 1;
         }
         out.push(format!("  #{} outcome {} live", k, i));
-        out.push(format!("  #{} outcome {} ok", k + 1, i));
+        out.push(format!("  #{} outcome {} error", k + 1, i));
         k += 2;
     }
     out.join("\n")
@@ -125,7 +125,7 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
     for o in &f.outs {
         roots.extend(o.fields.iter().map(|(_, nd, _)| *nd));
         roots.push(o.guard);
-        roots.push(o.ok);
+        roots.push(o.error);
         roots.extend(o.keys.iter().map(|(_, nd)| *nd));
     }
     let (mut graph, mut roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
@@ -269,7 +269,7 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
             outputs,
             keys,
             live: roots[at + n],
-            ok: roots[at + n + 1],
+            error: roots[at + n + 1],
             widen,
         });
         at += n + 2 + o.keys.len();
@@ -299,12 +299,12 @@ pub fn asm_input_reprs(
 
 /// One fused (specialized) body: which outcome it belongs to, the choices
 /// it resolved, and its roots in the FUSED graph - the outcome's output
-/// field nodes in order, then `ok`, then `live`.
+/// field nodes in order, then `error`, then `live`.
 pub struct AsmBody {
     pub outcome: usize,
     pub frees: u8,
     pub splits: Vec<u8>,
-    /// `outputs.len() + 2 + keys` nodes: fields..., ok, live, key nodes...
+    /// `outputs.len() + 2 + keys` nodes: fields..., error, live, key nodes...
     pub roots: Vec<NodeId>,
 }
 
@@ -332,7 +332,7 @@ pub fn asm_fused(
     let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = bound
         .outcomes
         .iter()
-        .map(|o| (o.outputs.iter().map(|(_, nd, _)| *nd).collect(), o.ok, o.live, o.keys.iter().map(|(_, nd)| *nd).collect()))
+        .map(|o| (o.outputs.iter().map(|(_, nd, _)| *nd).collect(), o.error, o.live, o.keys.iter().map(|(_, nd)| *nd).collect()))
         .collect();
     let (fused, raw_bodies) = crate::transpile::lower::specialize_frame(
         &bound.graph,
@@ -417,7 +417,7 @@ pub fn lower_frame(
                     })
                     .collect(),
             },
-            ok: o.ok,
+            error: o.error,
             live: o.live,
             keys: o.keys.clone(),
         })

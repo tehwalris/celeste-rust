@@ -150,13 +150,8 @@ pub fn blank(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     // slots)" and a select with a numeric arm and a boolean arm both
     // arrived: neither is a mixed VALUE, both are one frame's expression
     // read in another frame's numbering.
-    //
-    // Dropping `ok` is not dropping the obligation. A lane only reaches
-    // this state by satisfying the previous kernel's `ok`, which that
-    // kernel checks. Re-checking it here would deopt a lane twice for
-    // one obligation, and it would need cells this frame does not have.
     st.guard = d.boolean(true);
-    st.ok = d.boolean(true);
+    st.ended = d.boolean(false);
     Ok(())
 }
 
@@ -198,7 +193,7 @@ pub fn heap_constants(st: &State<Symbolic>, d: &Symbolic) -> std::collections::H
 /// `x`/`y` an object's methods captured at `init_object`) - is re-made from
 /// `constants` (`heap_constants` of the state, in the arena it came from); a
 /// table scalar that is neither refuses, a closure scope's is blanked (below).
-/// The path's decisions and the key overrides go with `guard` and `ok`.
+/// The path's decisions and the key overrides go with `guard`.
 pub fn rebase(st: &mut State<Symbolic>, d: &mut Symbolic, constants: &std::collections::HashMap<u32, iface::Conc>) -> Result<()> {
     // Where `blank` writes: each state path's (table, last step).
     let mut blanked: std::collections::BTreeSet<(u32, Step)> = Default::default();
@@ -243,8 +238,8 @@ pub fn rebase(st: &mut State<Symbolic>, d: &mut Symbolic, constants: &std::colle
     // position, a node of the previous frame. Nothing reads it again (the
     // methods read `obj`), and a trace that did would read garbage either way:
     // in the serial walk the node is the previous frame's `Cell(k)`, which is
-    // hash-consed with THIS frame's slot k. So it is blanked like `guard` and
-    // `ok`, which is what carrying it amounted to.
+    // hash-consed with THIS frame's slot k. So it is blanked like `guard`,
+    // which is what carrying it amounted to.
     for sc in st.heap.scopes.values_mut() {
         for v in sc.vars.values_mut() {
             let (n, is_num) = match v {
@@ -294,9 +289,6 @@ pub struct Walk {
     /// Outcomes that left the room - real successors, belonging to
     /// another room's kernel set.
     pub left_room: usize,
-    /// Outcomes reached only along poisoned paths, which no legal run
-    /// takes (`Interp::poison`).
-    pub unreachable: usize,
     /// Outcomes discarded because the walk hit `cap`. NOT zero means the
     /// shape set is incomplete and a kernel is missing.
     pub dropped: usize,
@@ -525,7 +517,6 @@ pub fn walk<'a>(
     let mut out = Walk {
         shapes: Vec::new(),
         left_room: 0,
-        unreachable: 0,
         dropped: 0,
         refused: Default::default(),
     };
@@ -541,10 +532,6 @@ pub fn walk<'a>(
             }
         };
         for o in &f.outs {
-            if it.d.decide(&o.ok) == Some(false) {
-                out.unreachable += 1;
-                continue;
-            }
             if room_of(&o.st, &it.d) != room0 {
                 out.left_room += 1;
                 continue;

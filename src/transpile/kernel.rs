@@ -7,7 +7,8 @@
 //! `trace::emit::asm_fused` and reads `OutFields` for its accumulators.
 //!
 //! Abstract-domain limits (straddling splits, unknown compares, masked
-//! guard failures) are PER-LANE facts in the graph (`ok`), never errors.
+//! guard failures) are PER-LANE facts in the graph (a body's `error` mask,
+//! `trace::error`), never Rust errors.
 
 
 use super::graph::{Graph, NodeId};

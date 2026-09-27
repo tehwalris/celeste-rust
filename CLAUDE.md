@@ -527,10 +527,12 @@ pinned gates.
 
 An interval speed also leaves branch conditions on it UNDECIDED per
 lane, and where the arms cannot merge the body's `live` is unknown. The
-kernel reads an unknown `live` as live (`read_zb_live`: the row's hull
+kernel reads an unknown `live` as live (`read_zb_may`: the row's hull
 covers both sides, emitting over-approximates and the exact-speed levels
 refute); reading it as not-live silently dropped lanes, which is what
-every speed-bucket run before 2026-09-14 did. `ok` stays strict. The
+every speed-bucket run before 2026-09-14 did. An unknown `error` reads as
+error: strict (the per-state `ok` is gone since 2026-09-27; a body's
+error is derived, `trace::error`). The
 result of all this is in BENCHMARK_DATA.md: the bucket is sound and a
 loss on room (2,0) (the hulls at every speed condition over-approximate
 past the census's 19x), so `exact` remains the default.

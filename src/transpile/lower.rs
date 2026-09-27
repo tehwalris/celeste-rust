@@ -66,14 +66,14 @@ fn reachable(g: &Graph, roots: &[NodeId]) -> Vec<bool> {
 }
 
 /// One output shape: the cells it writes, and the two booleans that say
-/// which lanes reach it (`live`) and which of those the kernel may keep
-/// (`ok`).
+/// which lanes reach it (`live`) and on which of those its row is undefined
+/// (`error`, `trace::error`).
 pub(crate) struct Outcome {
     pub(crate) of: OutFields,
-    pub(crate) ok: NodeId,
+    pub(crate) error: NodeId,
     pub(crate) live: NodeId,
     /// Fields keyed on another node than they store: `(field index, key
-    /// node)`. The key nodes are roots too, after `ok` and `live`.
+    /// node)`. The key nodes are roots too, after `error` and `live`.
     pub(crate) keys: Vec<(usize, NodeId)>,
 }
 
@@ -85,7 +85,7 @@ pub(crate) struct Outcome {
 /// share nodes ("duplicate, then fuse again"). Steps 1-4 of the frame
 /// lowering. Returns the fused graph and one body per DISTINCT (outcome,
 /// roots): `(outcome, frees, splits, roots)`, where `roots` is that
-/// outcome's fields in order, then `ok`, then `live`, then its key
+/// outcome's fields in order, then `error`, then `live`, then its key
 /// nodes (`Outcome::keys`), as node ids in the fused graph.
 ///
 /// This is the SINGLE source of the specialized compute: the AVX-512
@@ -105,20 +105,25 @@ pub(crate) fn specialize_frame(
 ) -> (Graph, Vec<SpecializedBody>) {
     let trace = std::env::var_os("CELESTE_BUILD_TRACE").is_some();
     let t0 = std::time::Instant::now();
-    // --- 1. which forks each outcome actually depends on ---
-    let cones = graph.split_cones();
-    let bits_of = |fields: &[NodeId], ok: NodeId, live: NodeId, keys: &[NodeId]| -> Vec<u8> {
-        let mut m = cones[ok as usize] | cones[live as usize];
-        for &f in fields.iter().chain(keys) {
-            m |= cones[f as usize];
+    // --- 1. which forks each outcome actually depends on: the forks in its
+    // cone, read off the reachable set it needs anyway (no per-node mask, so
+    // no limit on how many forks a frame has) ---
+    let bits_of = |need: &[bool]| -> Vec<u8> {
+        let mut forks: std::collections::BTreeSet<u8> = Default::default();
+        for (i, n) in need.iter().enumerate() {
+            if *n {
+                if let Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) | Op::SplitKeyTab(d) | Op::SplitOkTab(d) = graph.get(i as NodeId).op {
+                    forks.insert(d);
+                }
+            }
         }
-        (0..forks).filter(|d| m & (1u64 << d) != 0).collect()
+        forks.into_iter().collect()
     };
 
     // --- 2. specialize, per outcome, over (button, its own forks) ---
     let mut sp = graph.like();
     // (outcome, button, fork configuration, roots) where roots is the
-    // outcome's fields in order, then `ok`, then `live`.
+    // outcome's fields in order, then `error`, then `live`.
     let mut cands: Vec<SpecializedBody> = Vec::new();
     // The table forks' operands, per fork: how many fragments a button
     // rep's lanes can need, and which entries they can reach, is decided
@@ -132,16 +137,16 @@ pub(crate) fn specialize_frame(
                 .collect()
         })
         .collect();
-    for (oi, (fields, ok, live, keys)) in outs.iter().enumerate() {
+    for (oi, (fields, error, live, keys)) in outs.iter().enumerate() {
         let mut want: Vec<NodeId> = fields.clone();
-        want.push(*ok);
+        want.push(*error);
         want.push(*live);
         want.extend(keys.iter().copied());
         // An outcome reaches a fraction of the graph, and mapping the
         // whole arena once per (button, configuration) is most of the
         // work and none of the answer.
         let need = reachable(graph, &want);
-        let bits = bits_of(fields, *ok, *live, keys);
+        let bits = bits_of(&need);
         // Buttons first, with the forks left standing. If two
         // assignments agree before the forks are resolved they agree
         // after - resolving is substitution, and substitution preserves
@@ -250,6 +255,7 @@ pub(crate) fn specialize_frame(
     }
 
     let t_spec = t0.elapsed();
+
     build_add_duration(3, t_spec);
     let n_cands = cands.len();
     let t1 = std::time::Instant::now();
@@ -261,10 +267,10 @@ pub(crate) fn specialize_frame(
             crate::transpile::ival::fold_with(&sp, &all, room, ranges).expect("interval fold");
         build_add(4, t_phase);
         let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
-        // DIAGNOSTIC (CELESTE_BUILD_TRACE): a body whose `ok` folded to
-        // false while it is live somewhere declines every lane it takes.
-        // Say which conjunct: the leaves of the unfolded `ok`'s And-tree
-        // the interval evaluator decided false.
+        // DIAGNOSTIC (CELESTE_BUILD_TRACE): a body whose `error` folded to
+        // true while it is live somewhere declines every lane it takes.
+        // Say which disjunct: the leaves of the unfolded `error`'s Or-tree
+        // the interval evaluator decided true.
         if trace {
             let cells = crate::transpile::ival::seed_cells(&sp, ranges);
             let vals = match room {
@@ -275,20 +281,20 @@ pub(crate) fn specialize_frame(
             let mut shown = 0;
             for c in &cands {
                 let nfields = outs[c.0].0.len();
-                let (ok, live) = (c.3[nfields], c.3[nfields + 1]);
-                let ok_false = matches!(g1.get(m1[ok as usize]).op, Op::ConstBool(false));
+                let (error, live) = (c.3[nfields], c.3[nfields + 1]);
+                let error_true = matches!(g1.get(m1[error as usize]).op, Op::ConstBool(true));
                 let live_false = matches!(g1.get(m1[live as usize]).op, Op::ConstBool(false));
-                if !ok_false || live_false || shown >= 3 {
+                if !error_true || live_false || shown >= 3 {
                     continue;
                 }
                 shown += 1;
-                let mut stack = vec![ok];
+                let mut stack = vec![error];
                 let mut leaves = Vec::new();
                 while let Some(n) = stack.pop() {
                     let nd = sp.get(n);
-                    if matches!(nd.op, Op::And) {
+                    if matches!(nd.op, Op::Or) {
                         stack.extend(nd.args.iter().copied());
-                    } else if matches!(vals[n as usize], crate::transpile::graph::Val::Bool(Some(false))) {
+                    } else if matches!(vals[n as usize], crate::transpile::graph::Val::Bool(Some(true))) {
                         leaves.push(format!("{n}={:?}({})", nd.op, nd.args.iter().map(|a| format!("{a}={:?}={:?}", sp.get(*a).op, vals[*a as usize])).collect::<Vec<_>>().join(", ")));
                         // Where an unbounded value came from: down the
                         // first full-range operand to the node that made it.
@@ -313,7 +319,7 @@ pub(crate) fn specialize_frame(
                         }
                     }
                 }
-                eprintln!("[build]   outcome {} rep {} cfg {:?}: ok folds FALSE while live; false conjuncts: {}", c.0, c.1, c.2, leaves.join(" | "));
+                eprintln!("[build]   outcome {} rep {} cfg {:?}: error folds TRUE while live; true disjuncts: {}", c.0, c.1, c.2, leaves.join(" | "));
             }
         }
         // The boolean layer, simplified locally (`bdd::simplify_local`: one
@@ -351,6 +357,7 @@ pub(crate) fn specialize_frame(
     }
 
     let t_decide = t1.elapsed();
+
     if trace {
         eprintln!(
             "[build] specialize {} candidates, {} nodes: {:.1}s; decide: {:.1}s ({} nodes after)",
@@ -367,50 +374,57 @@ pub(crate) fn specialize_frame(
     //
     // Candidates of one outcome with the same fields and keys write the
     // same row wherever they are live, so they fuse: `live` the OR of
-    // theirs, `ok` the conjunction of `live_i -> ok_i`. A lane then
-    // declines exactly where some candidate declined (`L & !O` is
-    // `OR_i (L_i & !O_i)`, in the kernels' three-valued masks too: an
-    // unknown `live` reads as live, an unknown `ok` does not hold), and is
-    // kept where some candidate kept it; the door keeps one copy of the
-    // row either way. Before, a per-configuration `ok` or `live` node kept
-    // them apart: room (3,0) with the fall floors unknown, 336 bodies over
-    // 14 distinct rows per outcome (2026-09-18).
+    // theirs, and `error` - where the members' errors are one node, as they
+    // are when error comes only from the row's own values - that node
+    // unchanged (plans/graph-model.md section 4: fusion never touches
+    // error), else `OR_i (live_i & error_i)`. Either way a lane declines
+    // exactly where some candidate declined (`L & E` is `OR_i (L_i & E_i)`
+    // when every `E_i` is `E`, and by definition otherwise; in the kernels'
+    // three-valued masks too, both read where they MAY hold), and is kept
+    // where some candidate kept it; the door keeps one copy of the row
+    // either way. Before, a per-configuration `ok` or `live` node kept them
+    // apart: room (3,0) with the fall floors unknown, 336 bodies over 14
+    // distinct rows per outcome (2026-09-18).
     let bodies: Vec<SpecializedBody> = {
-        let mut groups: Vec<(SpecializedBody, usize)> = Vec::new();
+        let mut groups: Vec<Vec<SpecializedBody>> = Vec::new();
         let mut index: BTreeMap<(usize, Vec<NodeId>), usize> = BTreeMap::new();
         for c in cands {
             let nfields = outs[c.0].0.len();
-            let (ok, live) = (c.3[nfields], c.3[nfields + 1]);
-            if matches!(sp.get(live).op, Op::ConstBool(false)) {
+            if matches!(sp.get(c.3[nfields + 1]).op, Op::ConstBool(false)) {
                 continue;
             }
             let row: Vec<NodeId> = c.3[..nfields].iter().chain(&c.3[nfields + 2..]).copied().collect();
             match index.get(&(c.0, row.clone())) {
-                Some(&gi) => {
-                    let (g, members) = &mut groups[gi];
-                    let (g_ok, g_live) = (g.3[nfields], g.3[nfields + 1]);
-                    // The first member's `ok` joins guarded by its own `live`.
-                    let g_ok = if *members == 1 { guarded_ok(&mut sp, g_live, g_ok) } else { g_ok };
-                    let mine = guarded_ok(&mut sp, live, ok);
-                    g.3[nfields] = sp.fold(Op::And, vec![g_ok, mine]);
-                    g.3[nfields + 1] = sp.fold(Op::Or, vec![g_live, live]);
-                    *members += 1;
-                }
+                Some(&gi) => groups[gi].push(c),
                 None => {
                     index.insert((c.0, row), groups.len());
-                    groups.push((c, 1));
+                    groups.push(vec![c]);
                 }
             }
         }
-        groups.into_iter().map(|(b, _)| b).collect()
+        groups
+            .into_iter()
+            .map(|members| {
+                let nfields = outs[members[0].0].0.len();
+                let shared = members.iter().all(|m| m.3[nfields] == members[0].3[nfields]);
+                let fused_error = if shared {
+                    members[0].3[nfields]
+                } else {
+                    members.iter().fold(sp.leaf(Op::ConstBool(false)), |e, m| {
+                        let here = sp.fold(Op::And, vec![m.3[nfields + 1], m.3[nfields]]);
+                        sp.fold(Op::Or, vec![e, here])
+                    })
+                };
+                let fused_live = members.iter().skip(1).fold(members[0].3[nfields + 1], |l, m| sp.fold(Op::Or, vec![l, m.3[nfields + 1]]));
+                let mut b = members.into_iter().next().expect("a group has a member");
+                b.3[nfields] = fused_error;
+                b.3[nfields + 1] = fused_live;
+                b
+            })
+            .collect()
     };
-    (sp, bodies)
-}
 
-/// `live -> ok`: what a fused body's `ok` conjoins per member (`specialize_frame`).
-fn guarded_ok(sp: &mut Graph, live: NodeId, ok: NodeId) -> NodeId {
-    let dead = sp.fold(Op::Not, vec![live]);
-    sp.fold(Op::Or, vec![dead, ok])
+    (sp, bodies)
 }
 
 /// The fused bodies' constant-output analysis. For each outcome field,
@@ -423,7 +437,7 @@ fn guarded_ok(sp: &mut Graph, live: NodeId, ok: NodeId) -> NodeId {
 pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> (Graph, Vec<SpecializedBody>) {
     let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = outs
         .iter()
-        .map(|o| (o.of.fields.iter().map(|f| f.node).collect(), o.ok, o.live, o.keys.iter().map(|(_, n)| *n).collect()))
+        .map(|o| (o.of.fields.iter().map(|f| f.node).collect(), o.error, o.live, o.keys.iter().map(|(_, n)| *n).collect()))
         .collect();
     let (sp, bodies) =
         specialize_frame(&e.graph, &outs_spec, e.fork_depth as u8, e.decide, e.room.as_ref(), &e.ranges);

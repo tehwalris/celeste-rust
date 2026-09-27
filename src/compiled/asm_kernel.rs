@@ -15,7 +15,7 @@
 //! The compute is the SAME fused graph the Rust kernel is emitted from; the
 //! append here is the generic runtime equivalent of the generated
 //! `acc{i}`/`append{i}`: clone the per-outcome template block, push each
-//! `live & ok` lane's ASM-computed field values into it, and let
+//! `live & !error` lane's ASM-computed field values into it, and let
 //! `Rt2::boundary` recompute the row keys (its `boundary_finish` folds the
 //! cell contents into the exact same key the generated kernel precomputed)
 //! and dedup. See plans/asm-and-posgraph-execution.md.
@@ -51,18 +51,18 @@ struct AsmField {
 }
 
 /// One fused body (a distinct (outcome, choices) with distinct outputs):
-/// its output fields plus the `ok`/`live` mask roots. A lane is materialized
-/// into outcome `outcome`'s block iff `live & ok`.
+/// its output fields plus the `error`/`live` mask roots. A lane is
+/// materialized into outcome `outcome`'s block iff `live & !error`.
 struct AsmBody {
     outcome: usize,
     /// The fork configuration (two bits per fork), for diagnostics.
     splits: Vec<u8>,
     fields: Vec<AsmField>,
-    ok_root: usize,
+    error_root: usize,
     live_root: usize,
-    /// `ok`/`live`'s byte offsets in the output buffer (`Compiled::
-    /// root_offsets`); `ok_root`/`live_root` are their slots.
-    ok_off: usize,
+    /// `error`/`live`'s byte offsets in the output buffer (`Compiled::
+    /// root_offsets`); `error_root`/`live_root` are their slots.
+    error_off: usize,
     live_off: usize,
     /// The fields the row key folds (`key_words`): the body's varying ones -
     /// a per-row column the boundary does not widen to uniform - and every
@@ -297,7 +297,7 @@ struct AsmKernel {
     /// interval evaluator (`eval_narrow_top_in`) per lane and diff it against the
     /// assembled kernel's output. Separates an ASM-codegen bug (asm != eval)
     /// from a fused-graph bug (asm == eval, both != interpreter). Also what a
-    /// decline's explanation evaluates (`explain_ok`). KEPT ONLY under
+    /// decline's explanation evaluates (`explain_error`). KEPT ONLY under
     /// `kernel_graph_kept()`: otherwise empty, since every kernel set holding
     /// its graphs was gigabytes for nothing (2026-09-18).
     fused: crate::transpile::graph::Graph,
@@ -312,11 +312,11 @@ struct AsmKernel {
 
 impl AsmKernel {
     /// Run lanes `lanes` of one block. Per 16-lane slice: pack inputs, call
-    /// the assembly, and for each body push its `live & ok` lanes into the
-    /// sink's slot for (owner, outcome shape) - keyed, at the boundary, with
-    /// the pos-graph edge recorded - or, in backward mode, mark the input
-    /// rows whose outputs hit a target. A nonzero `live & !ok` (declined)
-    /// fails the whole call (a coverage gap).
+    /// the assembly, and for each body push its `live & !error` lanes into
+    /// the sink's slot for (owner, outcome shape) - keyed, at the boundary,
+    /// with the pos-graph edge recorded - or, in backward mode, mark the
+    /// input rows whose outputs hit a target. A nonzero `live & error`
+    /// (declined) fails the whole call (a coverage gap).
     fn run(
         &self,
         chunk: &Rt2,
@@ -439,16 +439,16 @@ impl AsmKernel {
             }
             let valid = (((1u32 << n) - 1) as u16) & only;
             if liveok_on() {
-                // Per-lane coverage census: OR of live&ok over all bodies
-                // (lane kept by SOME outcome), and OR of live&!ok (lane
+                // Per-lane coverage census: OR of live&!error over all bodies
+                // (lane kept by SOME outcome), and OR of live&error (lane
                 // DECLINED by some outcome). A lane that is neither kept nor
                 // declined is DROPPED as not-live - the graph considers it dead.
                 let (mut kept, mut declined, mut any_live) = (0u16, 0u16, 0u16);
                 for body in &self.bodies {
-                    let ok = read_zb_holds(outbuf, body.ok_off);
-                    let live = read_zb_live(outbuf, body.live_off);
-                    kept |= live & ok & valid;
-                    declined |= live & !ok & valid;
+                    let error = read_zb_may(outbuf, body.error_off);
+                    let live = read_zb_may(outbuf, body.live_off);
+                    kept |= live & !error & valid;
+                    declined |= live & error & valid;
                     any_live |= live & valid;
                 }
                 let dropped = valid & !kept & !declined;
@@ -468,24 +468,22 @@ impl AsmKernel {
             // to learn from them.
             let mut hit_lanes: u16 = 0;
             for (bi, (body, cols)) in self.bodies.iter().zip(body_cols).enumerate() {
-                // `ok`/`live` are tri-state ZB masks; the kernel keeps a lane
-                // only where they are KNOWN-TRUE (val & known - `zb_holds`,
-                // exactly what the generated `frame` applied). Reading `val`
-                // alone dropped the decidedness check: an UNKNOWN condition
-                // (a comparison landing inside an interval, e.g. a rem-derived
-                // guard at a fine rem rung) would silently use the garbage
-                // `val` bit instead of declining. A lane whose `ok` is unknown
-                // must fall to the reference, so the trace's failure to
-                // fork/decide it surfaces instead of producing a coarse row.
-                let ok = read_zb_holds(outbuf, body.ok_off);
-                let live = read_zb_live(outbuf, body.live_off);
-                if live & !ok & valid != 0 {
+                // `error`/`live` are tri-state ZB masks, read with ONE
+                // polarity (plans/graph-model.md section 5): each where it
+                // MAY hold. An unknown `live` reads as live (the row's hull
+                // over-approximates, a finer level refutes); an unknown
+                // `error` reads as error, so a lane the trace failed to
+                // fork or decide declines loudly instead of producing a row
+                // from the garbage `val` bit.
+                let error = read_zb_may(outbuf, body.error_off);
+                let live = read_zb_may(outbuf, body.live_off);
+                if live & error & valid != 0 {
                     // Declined: a live lane the kernel could not keep (or
                     // could not DECIDE). A coverage gap for the whole call -
                     // fatal in the caller, so say what was declined: the
                     // body's outcome and the lanes' player rem / spd (the
                     // interval slots the rungs fork on).
-                    let declined = live & !ok & valid;
+                    let declined = live & error & valid;
                     let ids = crate::compiled::ids();
                     let mut rows = String::new();
                     let mut m = declined;
@@ -511,17 +509,17 @@ impl AsmKernel {
                         rows.push('\n');
                     }
                     eprintln!(
-                        "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} ok {:#06x}):\n{rows}",
-                        chunk.shape_hash, body.outcome, declined, live, ok
+                        "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} error {:#06x}):\n{rows}",
+                        chunk.shape_hash, body.outcome, declined, live, error
                     );
-                    match self.flat_roots.get(body.ok_root) {
-                        Some(&ok_node) => self.explain_ok(chunk, lanes[declined.trailing_zeros() as usize], ok_node),
-                        None => eprintln!("[kernel] rerun with CELESTE_KERNEL_EXPLAIN=1 for the premise the lane failed"),
+                    match self.flat_roots.get(body.error_root) {
+                        Some(&error_node) => self.explain_error(chunk, lanes[declined.trailing_zeros() as usize], error_node),
+                        None => eprintln!("[kernel] rerun with CELESTE_KERNEL_EXPLAIN=1 for the error the lane holds"),
                     }
                     sc.put_back();
                     return false;
                 }
-                let mut take = live & ok & valid & !skip;
+                let mut take = live & !error & valid & !skip;
                 n_bodies += 1;
                 if take == 0 {
                     continue;
@@ -656,7 +654,7 @@ impl AsmKernel {
 
     /// from the interpreter. Prints at most a few mismatches per chunk.
     /// A lane no body is live for: evaluate the fused graph for it and
-    /// print every fork node's value and each body's (live, ok) under
+    /// print every fork node's value and each body's (live, error) under
     /// the evaluator against the kernel's. Diagnostic for the liveok
     /// census (`CELESTE_ASM_LIVEOK`), first such lane per call.
     fn explain_dropped(&self, chunk: &Rt2, lane: usize, i: usize, outbuf: &[u8]) {
@@ -708,14 +706,14 @@ impl AsmKernel {
         }
         let mut n_live_eval = 0;
         for (bi, body) in self.bodies.iter().enumerate() {
-            let live_asm = read_zb_live(outbuf, body.live_off) & (1 << i) != 0;
-            let ok_asm = read_zb_holds(outbuf, body.ok_off) & (1 << i) != 0;
+            let live_asm = read_zb_may(outbuf, body.live_off) & (1 << i) != 0;
+            let error_asm = read_zb_may(outbuf, body.error_off) & (1 << i) != 0;
             let live_ev = vals[self.flat_roots[body.live_root] as usize];
-            let ok_ev = vals[self.flat_roots[body.ok_root] as usize];
+            let error_ev = vals[self.flat_roots[body.error_root] as usize];
             if live_ev != Val::Bool(Some(false)) || live_asm {
                 n_live_eval += 1;
                 if n_live_eval <= 6 {
-                    eprintln!("[dropped]   body {bi} outcome {} splits {:?}: live eval {:?} asm {live_asm}; ok eval {:?} asm {ok_asm}", body.outcome, body.splits, live_ev, ok_ev);
+                    eprintln!("[dropped]   body {bi} outcome {} splits {:?}: live eval {:?} asm {live_asm}; error eval {:?} asm {error_asm}", body.outcome, body.splits, live_ev, error_ev);
                     eprintln!("[dropped]   the live leaves the evaluator cannot decide:");
                     self.explain_bool(chunk, lane, self.flat_roots[body.live_root]);
                 }
@@ -769,9 +767,9 @@ impl AsmKernel {
     }
 
     /// On a decline: evaluate the fused graph for `lane` and print the
-    /// conjuncts of the body's `ok` (its And-tree's leaves) that are not
-    /// decided true - the premise the lane fails.
-    fn explain_ok(&self, chunk: &Rt2, lane: usize, ok_node: crate::transpile::graph::NodeId) {
+    /// disjuncts of the body's `error` (its Or-tree's leaves) that are not
+    /// decided false - the error the lane holds.
+    fn explain_error(&self, chunk: &Rt2, lane: usize, error_node: crate::transpile::graph::NodeId) {
         use crate::transpile::graph::{Op, Val};
         let mut cells: std::collections::HashMap<u32, Val> = Default::default();
         for &cell in &self.compiled.input_cells {
@@ -791,7 +789,7 @@ impl AsmKernel {
                 return;
             }
         };
-        let mut stack = vec![ok_node];
+        let mut stack = vec![error_node];
         let mut seen = std::collections::HashSet::new();
         let mut shown = 0;
         while let Some(n) = stack.pop() {
@@ -799,18 +797,18 @@ impl AsmKernel {
                 continue;
             }
             let node = self.fused.get(n);
-            if matches!(node.op, Op::And) {
+            if matches!(node.op, Op::Or) {
                 stack.extend(node.args.iter().copied());
                 continue;
             }
-            if vals[n as usize] != Val::Bool(Some(true)) && shown < 6 {
+            if vals[n as usize] != Val::Bool(Some(false)) && shown < 6 {
                 shown += 1;
                 let args: Vec<String> = node
                     .args
                     .iter()
                     .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
                     .collect();
-                eprintln!("[kernel]   ok conjunct {} {:?} = {:?}; args {}", n, node.op, vals[n as usize], args.join(", "));
+                eprintln!("[kernel]   error disjunct {} {:?} = {:?}; args {}", n, node.op, vals[n as usize], args.join(", "));
                 // The whole sub-DAG under it (bounded), when asked: what
                 // `CELESTE_EXPLAIN_DEPTH=N` prints is every node within N
                 // steps of the conjunct, once, with its value.
@@ -1440,30 +1438,27 @@ fn ival_raw(av: AV) -> (i32, i32) {
     }
 }
 
-/// `zb_holds` of a Bool root: the lanes where it is KNOWN-TRUE (val & known).
-/// `val` at +0, `known` at +2 of the 128-byte slot.
-/// A body's `live` per lane: KNOWN-TRUE or UNKNOWN. An unknown guard is
-/// a branch condition on a value the lane holds an INTERVAL of (a
-/// bucketed speed: `spd.x ~= 0` on `[0, 1)`), which the tracer could not
-/// merge away - the two arms have different shapes, or the merged guard
-/// `Or(g & c, g & !c)` is itself unknown where `c` is. The lane stands
-/// for points on both sides, so the body's hull covers some of them:
-/// emitting the row over-approximates (a finer level, where the speed is
-/// exact and `c` decided, refutes the spurious half), while NOT emitting
-/// it loses real successors. Before this read unknown as not-live, and
-/// room (2,0) under `CELESTE_SPD_LADDER=level0` silently dropped lanes
-/// in 813 slices of its first 32 frames (2026-09-14). `ok` keeps the
-/// strict reading: an undecided OBLIGATION is a decline.
-fn read_zb_live(buf: &[u8], off: usize) -> u16 {
+/// A tri-state mask read where it MAY hold - `val`, or not known - which
+/// is the one polarity for both of a body's masks (plans/graph-model.md
+/// section 5). `val` at +0, `known` at +2 of the 128-byte slot.
+///
+/// For `live` it means an UNKNOWN guard reads as live. An unknown guard is
+/// a branch condition on a value the lane holds an INTERVAL of (a bucketed
+/// speed: `spd.x ~= 0` on `[0, 1)`), which the tracer could not merge away -
+/// the two arms have different shapes, or the merged guard `Or(g & c, g &
+/// !c)` is itself unknown where `c` is. The lane stands for points on both
+/// sides, so the body's hull covers some of them: emitting the row
+/// over-approximates (a finer level, where the speed is exact and `c`
+/// decided, refutes the spurious half), while NOT emitting it loses real
+/// successors. Before, this read unknown as not-live, and room (2,0) under
+/// `CELESTE_SPD_LADDER=level0` silently dropped lanes in 813 slices of its
+/// first 32 frames (2026-09-14).
+///
+/// For `error` it means an undecided error is a decline: strict.
+fn read_zb_may(buf: &[u8], off: usize) -> u16 {
     let val = u16::from_le_bytes([buf[off], buf[off + 1]]);
     let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
     val | !known
-}
-
-fn read_zb_holds(buf: &[u8], off: usize) -> u16 {
-    let val = u16::from_le_bytes([buf[off], buf[off + 1]]);
-    let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
-    val & known
 }
 
 /// The boundary's row-key mix seeds (see `runtime2::boundary_finish`); the
@@ -1914,14 +1909,14 @@ fn dump_kernel(
             r.bound.outcomes[oi].outputs.len()
         );
         // What keeps bodies apart: the distinct root tuples when a body is
-        // compared by its fields only, then with `live`, with `ok`, and whole.
-        // Roots are `[fields.., ok, live, keys..]`.
+        // compared by its fields only, then with `live`, with `error`, and
+        // whole. Roots are `[fields.., error, live, keys..]`.
         let nf = r.bound.outcomes[oi].outputs.len();
         let distinct = |f: &dyn Fn(&[crate::transpile::graph::NodeId]) -> Vec<crate::transpile::graph::NodeId>| -> usize {
             mine.iter().map(|b| f(&b.roots)).collect::<std::collections::BTreeSet<_>>().len()
         };
         eprintln!(
-            "[kernel dump]     distinct roots: fields {}, fields+live {}, fields+ok {}, all {}; distinct live {}, distinct ok {}",
+            "[kernel dump]     distinct roots: fields {}, fields+live {}, fields+error {}, all {}; distinct live {}, distinct error {}",
             distinct(&|x| x[..nf].to_vec()),
             distinct(&|x| x[..nf].iter().chain(std::iter::once(&x[nf + 1])).copied().collect()),
             distinct(&|x| x[..nf + 1].to_vec()),
@@ -1944,13 +1939,13 @@ fn dump_kernel(
             })
             .collect();
         eprintln!("[kernel dump]     varying fields ({} of {nf}): {}", varying.len(), names.join(", "));
-        // Two bodies with the same fields and different `ok`: the conjuncts in
-        // one `ok` and not the other.
-        let conjuncts = |n: crate::transpile::graph::NodeId| -> std::collections::BTreeSet<crate::transpile::graph::NodeId> {
+        // Two bodies with the same fields and different `error`: the
+        // disjuncts in one `error` and not the other.
+        let disjuncts = |n: crate::transpile::graph::NodeId| -> std::collections::BTreeSet<crate::transpile::graph::NodeId> {
             let (mut out, mut stack) = (std::collections::BTreeSet::new(), vec![n]);
             while let Some(x) = stack.pop() {
                 let node = fused.get(x);
-                if node.op == Op::And {
+                if node.op == Op::Or {
                     stack.extend(node.args.iter().copied());
                 } else {
                     out.insert(x);
@@ -1958,12 +1953,12 @@ fn dump_kernel(
             }
             out
         };
-        let mut ok_by_fields: std::collections::BTreeMap<Vec<crate::transpile::graph::NodeId>, crate::transpile::graph::NodeId> = Default::default();
+        let mut error_by_fields: std::collections::BTreeMap<Vec<crate::transpile::graph::NodeId>, crate::transpile::graph::NodeId> = Default::default();
         for b in &mine {
-            let ok = b.roots[nf];
-            match ok_by_fields.get(&b.roots[..nf].to_vec()) {
-                Some(&other) if other != ok => {
-                    let (a, c) = (conjuncts(other), conjuncts(ok));
+            let error = b.roots[nf];
+            match error_by_fields.get(&b.roots[..nf].to_vec()) {
+                Some(&other) if other != error => {
+                    let (a, c) = (disjuncts(other), disjuncts(error));
                     let only = |x: &std::collections::BTreeSet<crate::transpile::graph::NodeId>, y: &std::collections::BTreeSet<crate::transpile::graph::NodeId>| -> Vec<String> {
                         x.difference(y)
                             .take(4)
@@ -1975,7 +1970,7 @@ fn dump_kernel(
                             .collect()
                     };
                     eprintln!(
-                        "[kernel dump]     same fields, different ok: {} and {} conjuncts, {} shared; only in the first: {:?}; only in the second: {:?}",
+                        "[kernel dump]     same fields, different error: {} and {} disjuncts, {} shared; only in the first: {:?}; only in the second: {:?}",
                         a.len(),
                         c.len(),
                         a.intersection(&c).count(),
@@ -1986,7 +1981,7 @@ fn dump_kernel(
                 }
                 Some(_) => {}
                 None => {
-                    ok_by_fields.insert(b.roots[..nf].to_vec(), ok);
+                    error_by_fields.insert(b.roots[..nf].to_vec(), error);
                 }
             }
         }
@@ -2106,7 +2101,7 @@ fn dump_kernel(
                 let nf = r.bound.outcomes[want].outputs.len();
                 let differing: Vec<usize> = (0..nf).filter(|&j| a.roots[j] != b.roots[j]).collect();
                 eprintln!(
-                    "[kernel diff] outcome {want}, {what}; {} of {nf} fields differ, live {}, ok {}",
+                    "[kernel diff] outcome {want}, {what}; {} of {nf} fields differ, live {}, error {}",
                     differing.len(),
                     if a.roots[nf + 1] == b.roots[nf + 1] { "same" } else { "differs" },
                     if a.roots[nf] == b.roots[nf] { "same" } else { "differs" },
@@ -2267,7 +2262,7 @@ fn build_one_shape(
     let mut off = 0usize;
     let mut asm_bodies = Vec::with_capacity(bodies.len());
     for (bi, b) in bodies.iter().enumerate() {
-        let nfields = b.roots.len() - 2 - r.bound.outcomes[b.outcome].keys.len(); // roots = [fields.., ok, live, keys..]
+        let nfields = b.roots.len() - 2 - r.bound.outcomes[b.outcome].keys.len(); // roots = [fields.., error, live, keys..]
         let outputs = &r.bound.outcomes[b.outcome].outputs;
         anyhow::ensure!(
             outputs.len() == nfields,
@@ -2346,9 +2341,9 @@ fn build_one_shape(
             outcome: b.outcome,
             splits: b.splits.clone(),
             fields,
-            ok_root: slot_of[off + nfields],
+            error_root: slot_of[off + nfields],
             live_root: slot_of[off + nfields + 1],
-            ok_off: compiled.root_offsets[slot_of[off + nfields]] as usize,
+            error_off: compiled.root_offsets[slot_of[off + nfields]] as usize,
             live_off: compiled.root_offsets[slot_of[off + nfields + 1]] as usize,
             key_fields,
             pos: None,

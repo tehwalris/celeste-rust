@@ -25,14 +25,15 @@
 //!   flows into it widens (`widen`), a pin that does not hold is
 //!   dropped (the shape re-traced without it), and the pass is redone. A pass
 //!   that changes nothing is the answer.
-//! * `ok` on every live outcome, read with `Known(..)` and `SplitOk(..)` as
-//!   true. `Known(c)` is the kernels' premise that a select reads a DECIDED
-//!   condition (`state::merge`, the boundary snaps): this evaluator joins an
-//!   undecided select instead, which is sound. `SplitOk(n)` is that a lane's
-//!   fork operand spans at most `n` floors: checked directly on every
-//!   configuration's operands instead. What is left - pin guards, the static
-//!   range premises, the symbolic loops' "finished" obligation, the rem
-//!   containment - must evaluate to TRUE, or the node is reported.
+//! * NO `error` on any live outcome (`trace::error`), read with `Known(..)`
+//!   and `SplitOk(..)` as true. `Known(c)` is how a select's own error says
+//!   the kernel reads a DECIDED condition (and a floor's, a single one): this
+//!   evaluator joins an undecided select instead, which is sound.
+//!   `SplitOk(n)` is that a lane's fork operand spans at most `n` floors:
+//!   checked directly on every configuration's operands instead. What is
+//!   left - pin guards, the static range claims, an unrolled loop that had
+//!   not finished, the widenings' containment - must evaluate to FALSE, or
+//!   the node is reported.
 //! * Every position hull has whole endpoints (a cell is a whole pixel).
 //!
 //! And three things it does NOT model, each counted in the report:
@@ -227,7 +228,7 @@ struct OutSpec {
 
 struct Roots {
     live: NodeId,
-    ok: NodeId,
+    error: NodeId,
     xy: Option<(NodeId, NodeId)>,
     fields: Vec<NodeId>,
 }
@@ -425,14 +426,11 @@ impl<'a> Table<'a> {
         let mut outs: Vec<OutSpec> = Vec::new();
         let mut roots_old: Vec<Roots> = Vec::new();
         for o in &f.outs {
-            if d.decide(&o.ok) == Some(false) {
-                continue;
-            }
             let room = super::shapes::room_of(&o.st, d);
             ensure!(room.0 >= 0 && room.1 >= 0, "shape {id}: an outcome whose room is not a constant");
             if room != self.room0 {
                 outs.push(OutSpec { target: Target::Exit, fields: Vec::new() });
-                roots_old.push(Roots { live: o.guard, ok: o.ok, xy: None, fields: Vec::new() });
+                roots_old.push(Roots { live: o.guard, error: o.error, xy: None, fields: Vec::new() });
                 continue;
             }
             let tkey = format!("{:?}", o.st.shape()?);
@@ -453,7 +451,7 @@ impl<'a> Table<'a> {
                 fnodes.push(*n);
             }
             outs.push(OutSpec { target: Target::Shape { id: tid, located: tloc.is_some() }, fields });
-            roots_old.push(Roots { live: o.guard, ok: o.ok, xy, fields: fnodes });
+            roots_old.push(Roots { live: o.guard, error: o.error, xy, fields: fnodes });
         }
 
         // The cone, copied out of the arena with the buttons as unknown cells
@@ -463,7 +461,7 @@ impl<'a> Table<'a> {
         let mut rs: Vec<NodeId> = Vec::new();
         for r in &roots_old {
             rs.push(r.live);
-            rs.push(r.ok);
+            rs.push(r.error);
             if let Some((x, y)) = r.xy {
                 rs.push(x);
                 rs.push(y);
@@ -522,12 +520,12 @@ impl<'a> Table<'a> {
             let m = |n: NodeId| map[cmap[n as usize] as usize];
             let outs_c: Vec<Roots> = roots_old
                 .iter()
-                .map(|r| Roots { live: m(r.live), ok: m(r.ok), xy: r.xy.map(|(x, y)| (m(x), m(y))), fields: r.fields.iter().map(|n| m(*n)).collect() })
+                .map(|r| Roots { live: m(r.live), error: m(r.error), xy: r.xy.map(|(x, y)| (m(x), m(y))), fields: r.fields.iter().map(|n| m(*n)).collect() })
                 .collect();
             let operands: Vec<(u8, NodeId)> = forks.iter().map(|(k, op)| (f.fork_ways[*k as usize], map[*op as usize])).collect();
             let mut sig: Vec<NodeId> = Vec::new();
             for r in &outs_c {
-                sig.extend([r.live, r.ok]);
+                sig.extend([r.live, r.error]);
                 if let Some((x, y)) = r.xy {
                     sig.extend([x, y]);
                 }
@@ -613,9 +611,9 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
             if vals[r.live as usize] == Val::Bool(Some(false)) {
                 continue;
             }
-            if vals[r.ok as usize] != Val::Bool(Some(true)) {
-                let why = if acc.violations.len() < 12 { culprit(&t.graph, &vals, r.ok) } else { String::new() };
-                violation(acc, format!("shape {id} cell {xy:?} configuration {ci} outcome {oi}: a live outcome's ok is {:?}: {why}", vals[r.ok as usize]));
+            if vals[r.error as usize] != Val::Bool(Some(false)) {
+                let why = if acc.violations.len() < 12 { culprit(&t.graph, &vals, r.error) } else { String::new() };
+                violation(acc, format!("shape {id} cell {xy:?} configuration {ci} outcome {oi}: a live outcome's error is {:?}: {why}", vals[r.error as usize]));
             }
             for (slot, n) in spec.fields.iter().zip(&r.fields) {
                 let o = Obs::of(vals[*n as usize]);
@@ -663,15 +661,15 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
     Ok(out)
 }
 
-/// Which conjunct keeps `n` from being true: down the `And`s and decided
+/// Which disjunct keeps `n` from being false: down the `Or`s and decided
 /// selects to the first node that is not, with its operands' values.
 fn culprit(g: &Graph, vals: &[Val], mut n: NodeId) -> String {
     loop {
         let nd = g.get(n);
-        let not_true = |a: &NodeId| vals[*a as usize] != Val::Bool(Some(true));
+        let not_false = |a: &NodeId| vals[*a as usize] != Val::Bool(Some(false));
         match nd.op {
-            Op::And => {
-                if let Some(a) = nd.args.iter().find(|a| not_true(a)) {
+            Op::Or => {
+                if let Some(a) = nd.args.iter().find(|a| not_false(a)) {
                     n = *a;
                     continue;
                 }
@@ -682,7 +680,7 @@ fn culprit(g: &Graph, vals: &[Val], mut n: NodeId) -> String {
                     continue;
                 }
                 _ => {
-                    if let Some(a) = nd.args[1..].iter().find(|a| not_true(a)) {
+                    if let Some(a) = nd.args[1..].iter().find(|a| not_false(a)) {
                         n = *a;
                         continue;
                     }

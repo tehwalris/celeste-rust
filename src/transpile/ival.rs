@@ -168,8 +168,8 @@ mod tests {
     /// the player could be anywhere, so "is there a wall here" really
     /// can go either way. Those nodes are constant AROUND ONE STATE, not
     /// constant. Deciding them needs BOUNDS on the position inputs -
-    /// which is a specialization, and would need the same `ok` guard a
-    /// pin gets.
+    /// which is a specialization, and would need the same error a pin
+    /// gets.
     #[test]
     fn a_collision_test_is_decided_at_a_known_position_and_not_at_an_unknown_one() {
         let cart = std::sync::Arc::new(
