@@ -479,21 +479,32 @@ fn fork_known_premises(d: &mut Symbolic, outs: &mut [FrameOut]) -> Result<()> {
     let reach = crate::transpile::bdd::reachable(&d.graph, &roots_of(outs));
     let mut knowns: Vec<(NodeId, NodeId)> = Vec::new();
     let mut conds: Vec<NodeId> = Vec::new();
+    // ONE pass, and the `Known` collection below only runs if anything forked.
+    // Two passes over every reachable node - plus `lane_undecidable` per
+    // reachable `Sel`, where selects vastly outnumber `Known` nodes - doubled
+    // room (6,0)'s lattice walk from 65 s to 120 s when this replaced the
+    // premise scan. The predicate is memoised per node, so the cost was the
+    // traversals rather than the predicate.
+    let mut sels: Vec<NodeId> = Vec::new();
     for (i, r) in reach.iter().enumerate() {
         if !*r {
             continue;
         }
         let node = d.graph.get(i as NodeId);
         match node.op {
-            Op::Sel => {
-                let c = node.args[0];
-                if d.lane_undecidable(c) && !conds.contains(&c) {
-                    conds.push(c);
-                }
-            }
+            Op::Sel => sels.push(node.args[0]),
+            Op::Known => knowns.push((i as NodeId, node.args[0])),
             _ => {}
         }
     }
+    for c in sels {
+        if d.lane_undecidable(c) && !conds.contains(&c) {
+            conds.push(c);
+        }
+    }
+    // Only the markers whose condition we fork are substituted away; the rest
+    // are genuine assertions (see below).
+    knowns.retain(|(_, c)| conds.contains(c));
     // The `Known` markers to substitute away: ONLY those whose condition we
     // actually fork. A `Known` about anything else is a genuine assertion and
     // must survive - `widen::rem_bucket_node` builds `Known(Flr(old / width))`
