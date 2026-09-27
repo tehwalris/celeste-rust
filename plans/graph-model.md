@@ -137,13 +137,31 @@ values, and which one the lane takes is a question about this expression rather
 than about the kernel's admissible inputs.
 
 `Div` is vacuous in THIS program and the table keeps it only because the model
-should be stated for the operator rather than for the cart. Every division in
-the Lua divides by a numeric literal - `8` eleven times, `5` seven times, then
-`30`, `1.5`, `64`, `60`, `40`, `4`, `32`, `3`, and no non-numeric divisor
-anywhere (checked 2026-09-27 with comments stripped; an earlier scan "found"
-`/big`, which is the text `platforms/big chest` in a comment). So there is no
-`Div` obligation in the code, and that is correct rather than a gap: `b` is
-never a value a lane could make zero.
+should be stated for the operator rather than for the cart. The traced program
+has TEN divisions and every divisor is a numeric literal - `8` eight times,
+then `40` and `30` - with no non-numeric divisor anywhere. So there is no `Div`
+obligation in the code, and that is correct rather than a gap: `b` is never a
+value a lane could make zero.
+
+MEASURE THE TRACED SOURCE, NOT THE REFERENCE CART. `cart::sources_in` reads
+`lua/builtin_level_3.lua` + `lua/builtin_level_4.lua` +
+`lua/celeste-minimal.lua`, and that concatenation is the program the tracer
+parses. `~/src/github.com/tehwalris/celeste_ocaml/celeste.lua` is the OCaml
+implementation's reference cart - useful for semantics, wrong for counting
+anything. Twice on 2026-09-27 I quoted it as if it were the input: a divisor
+census that came out `8` x11 / `5` x7 / `1.5` / `64` / `32` / ... (none of
+which the tracer sees, and one of which, `/big`, was the text
+`platforms/big chest` in a COMMENT), and a `.delay` census that attributed uses
+to a `room_title` type `celeste-minimal` does not even contain.
+
+The real `.delay` picture, for `ABSENT_AS_ZERO`: 18 uses over three types -
+`player_spawn` 7, `spring` 5, `fall_floor` 6 - of which only
+`fall_floor.delay` is the absent-as-zero one, and all 18 are an assignment
+target, an operand of `-`, or an ordering comparison, which is what
+`check_absent_fields` requires. (The minimal cart has `-=` desugared to
+`this.delay = this.delay - (1)`, so the operand test sees plain arithmetic.)
+`spr` is `function spr() end` in `builtin_level_4.lua`, so `_draw()` runs
+harmlessly - it is a Lua no-op, not an unreached branch.
 
 `Flr` is the instructive one. As a premise (`Known(Flr(x))`) it looks circular -
 `Flr` is exact BECAUSE of it, so propagation cannot discharge it without
