@@ -164,17 +164,115 @@ that no stored value depends on would VANISH, which is precisely the silent
 loss the `ok`-not-`guard` choice exists to prevent. Its own doc makes the
 argument: clearing `guard` would say "no lane takes this path" and a successor
 could disappear unnoticed, while clearing `ok` says "the kernel declines these
-lanes", which fails loudly. So `poison` keeps a precondition-shaped home.
+lanes", which fails loudly.
 
-One obligation is NOT any value's error and needs its own home: a fork's
-COVERAGE - that the lane's set really is contained in the union of the parts
-enumerated. It cannot be a value's error, because "the lane is outside part c"
-is just `live = false` for that body, and "outside every part" is a property of
-the body SET rather than of any value. Left implicit it is the one failure mode
-we cannot tolerate: no body's `live` holds, the lane emits nothing, and a state
-is lost SILENTLY instead of declining loudly. So coverage belongs with the
-input preconditions - beside "this cell lies in the range this body was
-specialised for" - which is what `SplitOk` already is today.
+A RAISE IS ITS OWN ROW (Philippe, 2026-09-27). Not "the lane stops and there is
+nothing to hand on" - that was my mistake. There is a RAISE ROW, it has its own
+liveness, and every raise site in the frame ORs into it:
+
+    raise.live = OR over raise sites of (the guard where the raise happens)
+
+A raise is special in only one way - the row has no field values at the end -
+and it is NOT special in the way that matters for the analysis: we want to know
+WHEN IT IS REACHABLE, exactly as we do for any other row. So the frame's
+outcome set gains one outcome with an empty field list, and the question "can
+this program raise?" becomes the ordinary question "is this row live?", answered
+precisely except where we CHOOSE to over-approximate.
+
+Three things follow, and the first is why this beats conjoining an obligation
+into `ok` or clearing `guard`:
+
+* LIVENESS IS CONSERVED BY CONSTRUCTION. A raising lane is not dropped, it is
+  ROUTED: it leaves the normal outcomes and lands in the raise row. Every lane
+  still ends in exactly one outcome, which is the invariant
+  `verify::check_at` already checks ("exactly one outcome claims this lane").
+  Clearing `guard` would have needed a separate proof that nothing vanished;
+  routing needs none, because nothing is thrown away.
+* DOWNSTREAM IS DEAD FOR FREE. The lanes that raise are no longer in the
+  surviving state's guard, so the rest of the path simply does not apply to
+  them - no `not raise` conjunction threaded through everything, and no
+  interning of nodes on a path that cannot run (which `interp.rs` today
+  suppresses by testing `decide(ok) == Some(false)`, worth most of a
+  two-million-node graph on the shape walk).
+* IT STOPS BLOCKING FUSION. Today `poison` sets `ok = false`, so merging that
+  state with a healthy sibling builds `Sel(cond, false, true)` - a select,
+  which can REFUSE the merge outright (`state::merge` names it
+  `first_select = "ok"`). A raise row takes those lanes out of the merge
+  entirely, so no select is created and nothing is refused.
+
+WHICH raise happened is diagnostics, not semantics: the sites merge into one
+row, and the per-reason breakdown stays where it is today, in `Interp::illegal`
+at trace time.
+
+MEASURED FIRST (2026-09-27): `poison` never fires. Rooms (6,0), (5,0) and
+(1,0) skip 200 / 289 / 45 outcomes between them and every one is "another
+room" - not a single "ok folds false" - and the start room's shape fixpoint
+reports an empty `illegal`. So raise needs no runtime mask in any room we can
+test: build-time refusal plus the loud assertion is enough, and if it ever does
+fire we hear about it.
+
+Both counters that would have told us this were invisible: `Interp::illegal` is
+read only by an `#[ignore]`d test, and `shapes::Walk::unreachable` is
+incremented and never printed. The production path reports a poisoned outcome
+only as `[lattice]   outcome skipped: ok folds false` under
+`CELESTE_LATTICE_TRACE`, which is how the numbers above were taken. A growing
+poison count is the tracer losing an invariant the game holds, so it should not
+depend on remembering to set an environment variable.
+
+THERE IS ONE ERROR CONCEPT, AND PRECONDITIONS ARE IN IT (Philippe,
+2026-09-27). An earlier draft of this section gave a fork's COVERAGE its own
+home, on the grounds that "outside every part" is a property of the body SET
+rather than of any value. That was a distinction without a difference. A
+precondition is a unary operator applied just after the input, which errors on
+an invalid one; whether the kernel was handed an input it was not built for, or
+made an assumption that does not hold, it is the same statement - THESE INPUTS
+SHOULD NOT HAVE BEEN RUN THROUGH THIS KERNEL - and the ordinary error concept
+says it. (We may still want to know WHICH obligation failed, but that is
+diagnostics, not semantics.)
+
+Coverage in particular is the forked operand's own error: "this lane's value at
+node `v` spans at most `n` parts" is `SplitOk(n)` applied to `v`, which is
+exactly the shape above. Attaching it there is also what makes the fused fork
+cheap. Fusing the configurations a row does not read currently needs
+
+    live = OR over c of live_c
+    ok   = AND over c of (live_c -> ok_c)
+
+so every fragment carries a copy of both trees and the two share nothing; that
+is `lower::quantify`, and it took one room (6,0) body's ok/live cone from 1,974
+nodes to 96,540. With the obligation on the shared operand there is ONE term
+however many fragments fuse. So the unification removes `quantify`'s reason to
+exist, which is step 6.
+
+### Error in a `live` mask is GLOBAL (Philippe, 2026-09-27)
+
+A row's error is the OR over the values it stores - but the `live` mask is not
+one of those values, and an error inside it belongs to nobody in particular.
+The right reading is that it is a global failure: the nodes a `live` mask is
+computed from must have no error at all, and if one does, the kernel was built
+wrong or run on inputs it was not built for.
+
+The code already behaves this way. A lane with `live & !ok` is DECLINED, and a
+declined lane is fatal for the whole call rather than a property of some row
+(`asm_kernel`: "a coverage gap for the whole call - fatal in the caller").
+
+This also settles a question worth asking: should error be masked by AND
+ORDERING, the way Lua's `and` short-circuits, so a guard can protect an
+erroring operand? No, on two independent grounds.
+
+* It is unnecessary. The tracer already short-circuits by CONTROL FLOW: it
+  decides the left operand's truthiness, evaluates the right only when it must,
+  and where the left is undecided it SPLITS the state and evaluates the right
+  only on the taken branch (`interp.rs`, the `BinOp::And`/`Or` arm). No node
+  ever exists on a path Lua would not have evaluated.
+* It is impossible anyway. `Graph::fold` treats `And`/`Or` as commutative and
+  sorts the operands by node id, and that symmetry is what lets `a or b` and
+  `b or a` intern together. A graph that cannot tell which operand was written
+  first cannot let the first protect the second.
+
+So: assert that every `live` cone is error-free - statically where the
+propagation can show it, and otherwise as a root checked loudly, which is the
+shape `level_minus_one` already uses to check `ok`.
 
 Consequences:
 
@@ -280,25 +378,32 @@ this size is safe.
    (numbers) and `Symbolic::runtime_unknown` (booleans, added 2026-09-26).
 2. Delete `Known`-as-decidedness, using that pass. Keep the assertion, renamed.
 3. Unify the fork operations into one `fork(node, partition)`.
-4. DELETE `ok`. Surveyed 2026-09-27: 16 sites write it, and they are three
-   different things, so the step is CLASSIFY FIRST, then delete.
+4. DELETE `ok`. Surveyed 2026-09-27: 16 sites write it. THIRTEEN of them are
+   obligations and all thirteen become derived error - there is one error
+   concept, so there is nothing to classify between them:
 
-   * PRECONDITIONS, 11 sites - obligations on the kernel's admissible inputs,
-     which the kernel declines loudly on (`live & !ok`): `widen.rs` 123 (the
-     `require` helper - a free function there, NOT a `Domain` method), 201,
-     401, 592, 667, 865, 884, 887, 973, `interp.rs:1962` (a `move` fork's
-     span premise), `verify.rs:340` (the pin guard). These move to input
-     preconditions, beside what `SplitOk` already is.
-   * `own_error`, 2 sites - `interp.rs:702` (`Known(cond)` for a surviving
-     select) and `interp.rs:890` (the unrolled loop's bound). These become
-     derived error.
-   * A TRACE-TIME REFUSAL, 1 site - `interp.rs:1240` (`poison`), which stays
-     as it is (see section 4).
+   * `widen.rs` 123 (the `require` helper - a free function there, NOT a
+     `Domain` method), 201, 401, 592, 667, 865, 884, 887, 973; `interp.rs:1962`
+     (a `move` fork's span premise); `verify.rs:340` (the pin guard) - all
+     preconditions, i.e. unary operators on an input that error on an invalid
+     one.
+   * `interp.rs:702` (`Known(cond)` where a merged VALUE is a select) and
+     `interp.rs:890` (the unrolled loop's bound).
 
-   The remaining writes are plumbing that dissolves with the field:
-   `shapes.rs:159` and `verify.rs:1157` initialise it to true, `state.rs:360`
-   merges it (and can REFUSE a merge when the merged `ok` is a select, which
-   is the fusion cost this step removes), `verify.rs:601` remaps it.
+   The fourteenth is `interp.rs:1240` (`poison`), a Lua RAISE, which is not an
+   error and gets the treatment in section 4: it kills liveness downstream and
+   is exported as an obligation provably false wherever live.
+
+   The last writes are plumbing that dissolves with the field: `shapes.rs:159`
+   and `verify.rs:1157` initialise it to true, `state.rs:360` merges it (and
+   can REFUSE a merge when the merged `ok` is a select - the fusion cost this
+   step removes), `verify.rs:601` remaps it.
+
+   Reading `ok` is the wider surface: ~35 sites over seven files, including two
+   that are not plumbing - `level_minus_one.rs:530` hashes it into a DEDUP
+   SIGNATURE, and `interp.rs:2303` asserts its representation is `Op::Known`.
+   Five sites prune an outcome whose `ok` folds statically false and all five
+   mean the same thing, so they can share one predicate.
 
    Still the invasive step, so do it in halves with the gates green between.
 5. Domain-first fork choice, partitioned at the thresholds the branch uses.
