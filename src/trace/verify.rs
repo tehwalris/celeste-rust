@@ -224,8 +224,7 @@ pub fn trace_frame<'a>(
     it.d.forks = 0;
     it.d.graph.reset_forks();
     it.d.clear_ranges();
-    it.d.fork_memo.clear();
-    it.d.fork_memo_int.clear();
+    it.d.clear_fork_memo();
     // The fork grid is the rung's rem bucket width: `move` forks at the
     // bucket edges (which include the integers), so one fork per axis
     // settles the integer move AND the output bucket, and the boundary

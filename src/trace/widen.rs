@@ -1101,8 +1101,8 @@ fn spd_table_node(
         .map(|p| crossed.iter().filter(|(lo, hi)| (*lo as i64) <= p.1 && (*hi as i64) >= p.0).count())
         .max()
         .unwrap_or(1);
-    let (frag, valid) = d.fork_table(&old, &crossed, arity as u8);
-    let fork = d.forks - 1;
+    let f = d.fork_table_at(&old, &crossed, arity as u8);
+    let (frag, valid, fork) = (f.value, f.valid, f.id);
     // The row's bucket, per lane, and the premise that the fragments
     // cover the lane.
     let value = d.graph.fold(Op::SplitKeyTab(fork), vec![old]);

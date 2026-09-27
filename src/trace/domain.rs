@@ -66,6 +66,76 @@ pub enum Fun2 {
     Max,
 }
 
+/// Which op family carries a fork, and so the memo's second key: `Floors` and
+/// `Ints` over one value resolve to different fragments and may not share a
+/// choice dimension.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ForkKind {
+    Floors,
+    Ints,
+    Table,
+}
+
+/// HOW a fork partitions its value's set - the one thing that differs between
+/// the forks a trace takes (plans/graph-model.md section 3). A configuration
+/// index becomes a value by this rule.
+pub enum Partition {
+    /// Cut an interval at the fork grid's cell edges: fragment `c` is the
+    /// `c`-th cell (`Op::Split` -> `Frag`), which is what `flr` of an
+    /// interval needs, since `flr` is not a function on a set whose points
+    /// have different floors.
+    Floors { ways: u8 },
+    /// Cut an interval of WHOLE numbers into the numbers themselves, each
+    /// EXACT (`Op::SplitInt` -> `IntFrag`): a position under a pixel bucket.
+    ///
+    /// `memo` is false where two forks over the SAME node must stay
+    /// independent: the held trails `p_jump` / `p_dash` both fork the constant
+    /// `[0, 1<<16]`, and sharing one choice would tie them together, so the
+    /// pair could never take opposite values.
+    Ints { ways: u8, memo: bool },
+    /// Cut at a TABLE of ranges, RELATIVE to the entry the low end lies in:
+    /// fragment `c` is the value clipped to the `c`-th entry from there
+    /// (`Op::SplitTab` -> a select chain). Never memoised: the ranges are part
+    /// of the partition, so two sites forking one value at different tables
+    /// are different forks, and `set_fork_table` would overwrite the first.
+    Table { ranges: Vec<(i32, i32)>, arity: u8 },
+}
+
+impl Partition {
+    fn kind(&self) -> ForkKind {
+        match self {
+            Partition::Floors { .. } => ForkKind::Floors,
+            Partition::Ints { .. } => ForkKind::Ints,
+            Partition::Table { .. } => ForkKind::Table,
+        }
+    }
+
+    /// The fork's arity: how many fragments a configuration chooses between.
+    fn ways(&self) -> u8 {
+        match self {
+            Partition::Floors { ways } | Partition::Ints { ways, .. } => *ways,
+            Partition::Table { arity, .. } => *arity,
+        }
+    }
+
+    fn memoized(&self) -> bool {
+        match self {
+            Partition::Floors { .. } => true,
+            Partition::Ints { memo, .. } => *memo,
+            Partition::Table { .. } => false,
+        }
+    }
+}
+
+/// What a fork hands back: the fragment this configuration takes, which lanes
+/// fall in it, and the choice dimension it minted (which the caller needs to
+/// name the fork's other ops - a table fork's key and coverage).
+pub struct Fork {
+    pub value: NodeId,
+    pub valid: NodeId,
+    pub id: u8,
+}
+
 pub trait Domain {
     type Num: Clone + Debug + PartialEq;
     type Bool: Clone + Debug + PartialEq;
@@ -214,14 +284,6 @@ pub trait Domain {
     /// numbers themselves, each EXACT (`Op::SplitInt`): the player's
     /// position under a bucket. Same validity and premise as `fork_flr`.
     fn fork_int(&mut self, v: &Self::Num, _ways: u8) -> (Self::Num, Self::Bool) {
-        (v.clone(), self.boolean(true))
-    }
-
-    /// A RELATIVE fork at a TABLE of ranges (`Op::SplitTab`) with `arity`
-    /// fragments: fragment `c` is the value clipped to the `c`-th entry
-    /// from the one its low end lies in, valid where the value reaches it.
-    /// The default is the identity (an exact value is in one range).
-    fn fork_table(&mut self, v: &Self::Num, _ranges: &[(i32, i32)], _arity: u8) -> (Self::Num, Self::Bool) {
         (v.clone(), self.boolean(true))
     }
 
@@ -475,9 +537,12 @@ pub struct Symbolic {
     /// configurations instead of 16,384.
     ///
     /// Per frame, like `forks` itself - cleared beside it.
-    pub fork_memo: std::collections::HashMap<NodeId, (u8, (NodeId, NodeId))>,
-    /// `fork_memo` for `fork_int` (a different op over the same value).
-    pub fork_memo_int: std::collections::HashMap<NodeId, (u8, (NodeId, NodeId))>,
+    ///
+    /// Keyed by `(value, kind)`, NOT by value: `Floors` and `Ints` over one
+    /// value are different ops (`Split` against `SplitInt`) resolving to
+    /// different fragments, so they are different forks and may not share a
+    /// choice. `Table` is absent from this map by design - see `Partition`.
+    fork_memo: std::collections::HashMap<(NodeId, ForkKind), (u8, (NodeId, NodeId))>,
     /// Input cells that hold an INTERVAL rather than a number - the
     /// player's `rem.x`/`rem.y`, which the boundary widens.
     ///
@@ -886,15 +951,94 @@ impl Symbolic {
     /// A boolean every lane holds in BOTH values: a 2-way fork with no
     /// validity (every configuration applies to every lane), `choice > 0` over
     /// the whole grid - the held buttons' fork (`widen::fork_held_inputs`).
+    ///
+    /// An `Ints` fork over a CONSTANT, so it goes through `fork` like the
+    /// rest; `Partition::Ints { memo: false }` because the two held trails are
+    /// independent and must not share one choice even though the operand node
+    /// is the same for both (see `Partition`). The validity is dropped rather
+    /// than ignored: every configuration applies to every lane.
     pub fn both_values(&mut self, origin: &str) -> NodeId {
-        let fork = self.forks;
-        self.forks += 1;
-        self.graph.set_fork_ways(fork, 2);
-        self.fork_origins.push((fork, origin.to_string()));
         let choices = self.graph.leaf(Op::Const(0, 1 << 16));
-        let choice = self.graph.fold(Op::SplitInt(fork), vec![choices]);
+        let f = self.fork(&choices, Partition::Ints { ways: 2, memo: false }, origin);
         let zero = self.graph.leaf(Op::Const(0, 0));
-        self.graph.fold(Op::Gt, vec![choice, zero])
+        self.graph.fold(Op::Gt, vec![f.value, zero])
+    }
+
+    /// Forget this frame's fork choices: a new frame's forks start at 0.
+    /// Called beside `forks = 0` and `Graph::reset_forks`.
+    pub fn clear_fork_memo(&mut self) {
+        self.fork_memo.clear();
+    }
+
+    /// A table fork (`Partition::Table`), the one partition only `Symbolic`
+    /// can take: the row's bucket and the coverage premise are further ops
+    /// naming the fork (`SplitKeyTab` / `SplitOkTab` in
+    /// `widen::spd_table_node`), so the caller needs its id.
+    ///
+    /// Not on `Domain`: a fork id is a graph notion, and the reference domain
+    /// forks by walking one fragment at a time through its cursor instead.
+    pub fn fork_table_at(&mut self, v: &NodeId, ranges: &[(i32, i32)], arity: u8) -> Fork {
+        self.fork(v, Partition::Table { ranges: ranges.to_vec(), arity }, "a speed bucket table")
+    }
+
+    /// THE fork: partition `v`'s set, mint a choice dimension for the pieces,
+    /// and hand back the piece this configuration takes plus which lanes fall
+    /// in it (plans/graph-model.md section 3 - "forking is one operation").
+    ///
+    /// Every fork in a trace comes through here, so the bookkeeping that used
+    /// to be copied into four functions is stated once: the fork id, its
+    /// arity, its origin (for the kernel dump), and whether the choice is
+    /// shared with an earlier fork of the same value.
+    ///
+    /// What differs between partitions is only how a configuration index
+    /// becomes a value, which is the `Partition` - and on the graph, which op
+    /// family carries it. Those ops must stay distinct: `Graph::specialize`
+    /// resolves `Split` to `Frag`, `SplitInt` to `IntFrag` and the `SplitTab`
+    /// family to per-lane select chains, so they are three different
+    /// computations, not three spellings of one.
+    fn fork(&mut self, v: &NodeId, p: Partition, origin: &str) -> Fork {
+        let kind = p.kind();
+        // Already forked this exact value this frame? Reuse the choice.
+        //
+        // Hash-consing is what makes this sound and also what makes it FIRE:
+        // two `move` calls on values that are structurally the same
+        // expression are the same node id. Forking one value twice yields the
+        // same fragments, so the second choice is determined by the first and
+        // every configuration where they disagree is empty.
+        if p.memoized() {
+            if let Some(hit) = self.fork_memo.get(&(*v, kind)) {
+                let (d, out) = *hit;
+                // RAISED, not set: each site's own `SplitOk` premise is what
+                // bounds the lanes it admits, so the wider request wins.
+                self.graph.set_fork_ways(d, p.ways());
+                return Fork { value: out.0, valid: out.1, id: d };
+            }
+        }
+        let d = self.forks;
+        self.forks += 1;
+        self.fork_origins.push((d, origin.to_string()));
+        let (value, valid) = match &p {
+            Partition::Floors { ways } => {
+                self.graph.set_fork_ways(d, *ways);
+                (self.graph.fold(Op::Split(d), vec![*v]), self.graph.fold(Op::SplitValid(d), vec![*v]))
+            }
+            Partition::Ints { ways, .. } => {
+                self.graph.set_fork_ways(d, *ways);
+                (self.graph.fold(Op::SplitInt(d), vec![*v]), self.graph.fold(Op::SplitValid(d), vec![*v]))
+            }
+            Partition::Table { ranges, arity } => {
+                // SET, not raised, and it registers the table too: a table
+                // fork's arity is its entry count, and the arena outlives a
+                // trace, so fork `d` of the previous one may have had a
+                // bigger table.
+                self.graph.set_fork_table(d, ranges.to_vec(), *arity);
+                (self.graph.fold(Op::SplitTab(d), vec![*v]), self.graph.fold(Op::SplitValidTab(d), vec![*v]))
+            }
+        };
+        if p.memoized() {
+            self.fork_memo.insert((*v, kind), (d, (value, valid)));
+        }
+        Fork { value, valid, id: d }
     }
 
     /// THE unknown boolean an output widening writes (held trails, the fly
@@ -1263,41 +1407,13 @@ impl Domain for Symbolic {
     }
 
     fn fork_flr(&mut self, v: &NodeId, ways: u8) -> (NodeId, NodeId) {
-        // Already forked this exact value this frame? Reuse the choice.
-        // See `fork_memo`. Hash-consing is what makes this sound and
-        // also what makes it FIRE: two `move` calls on values that are
-        // structurally the same expression are the same node id.
-        if let Some(hit) = self.fork_memo.get(v) {
-            let (d, out) = *hit;
-            self.graph.set_fork_ways(d, ways);
-            return out;
-        }
-        let d = self.forks;
-        self.forks += 1;
-        self.graph.set_fork_ways(d, ways);
-        let out = (
-            self.graph.fold(Op::Split(d), vec![*v]),
-            self.graph.fold(Op::SplitValid(d), vec![*v]),
-        );
-        self.fork_memo.insert(*v, (d, out));
-        out
+        let f = self.fork(v, Partition::Floors { ways }, "a floor fork (`move`)");
+        (f.value, f.valid)
     }
 
     fn fork_int(&mut self, v: &NodeId, ways: u8) -> (NodeId, NodeId) {
-        if let Some(hit) = self.fork_memo_int.get(v) {
-            let (d, out) = *hit;
-            self.graph.set_fork_ways(d, ways);
-            return out;
-        }
-        let d = self.forks;
-        self.forks += 1;
-        self.graph.set_fork_ways(d, ways);
-        let out = (
-            self.graph.fold(Op::SplitInt(d), vec![*v]),
-            self.graph.fold(Op::SplitValid(d), vec![*v]),
-        );
-        self.fork_memo_int.insert(*v, (d, out));
-        out
+        let f = self.fork(v, Partition::Ints { ways, memo: true }, "a bucketed position");
+        (f.value, f.valid)
     }
 
     fn span_ok(&mut self, v: &NodeId, ways: u8) -> NodeId {
@@ -1326,16 +1442,6 @@ impl Domain for Symbolic {
             }
             None => self.move_ways(),
         }
-    }
-
-    fn fork_table(&mut self, v: &NodeId, ranges: &[(i32, i32)], arity: u8) -> (NodeId, NodeId) {
-        let d = self.forks;
-        self.forks += 1;
-        self.graph.set_fork_table(d, ranges.to_vec(), arity);
-        (
-            self.graph.fold(Op::SplitTab(d), vec![*v]),
-            self.graph.fold(Op::SplitValidTab(d), vec![*v]),
-        )
     }
 
     fn known(&mut self, b: &NodeId) -> NodeId {
