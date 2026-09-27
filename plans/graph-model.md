@@ -544,31 +544,49 @@ this size is safe.
    kernel 456k -> 229k); room (1,0) f0-f44 frame time 2.79 s -> 2.72 s.
 
 5. Domain-first fork choice, partitioned at the thresholds the branch uses.
-   IN PROGRESS (2026-09-27). Measured on room (6,0) at `r0sxhp`, the worst
-   trace forks 134 conditions, and they group by the input they read: each
-   platform's `x` alone is read by 12-14 of them - its two wrap tests
-   (`x1 < -16`, `x1 > 128`, `x1 = x + step`) and the carry's (`d < 0`,
-   `d > 0`, `|d| < 1..8`, the `move_x` unroll bounds), where `d` is `step`
-   away from the wrap. Forked one by one that is 2^12-2^14 configurations per
-   platform, nearly all impossible; the unknown has three meaningful parts.
-   The rest are chains over several platforms (the player carried by one,
-   then another).
+   IN PROGRESS on branch `step5-split` (2026-09-27, with Philippe). What we
+   learned, in order:
 
-   Built: `verify::partition_unknowns` - group the conditions that read one
-   unknown and nothing else unknown, bisect its range until every lane
-   decides every condition on every part, make ONE table fork of the unknown
-   at those parts, and rebuild each condition on the fork's fragment.
-   It finds the groups and partitions NONE of them, and the reason is the
-   finding: the thresholds are not constants. `step` is
-   `flr(__split_by_flr(rem + spd + 0.5))` and the platform's `spd.x` is an
-   input (0 on the spawn frame, `dir * 0.65` after), so the wrap happens at
-   `x < -16 - step`, a different threshold on each lane. A partition at
-   constant ranges cannot decide it; what can is either a fork whose parts
-   are cut at per-lane thresholds (a new op family: `SplitAt(v, t1..tn)`,
-   fragments `clip(v, [t_c, t_c+1))`), or a sharper per-lane decidability
-   argument (a comparison of `u + e` against `K`, `e` integer-valued per
-   lane, is decided on any part of `u` with no integer inside it). Open:
-   which.
+   * THE WASTE WAS REAL, AND IT WAS NOT FUSION. Room (6,0): an outcome whose
+     row reads 0-1 forks had a guard reading ~138, and `specialize_frame`
+     enumerates every fork an outcome reads. Per platform ~14 forks: 2 wrap
+     tests, carry sign, the 8 unrolled `move_x` bounds, 2 touch tests - and
+     ~24 more downstream in the player's own move. All but the touch tests
+     cascade from ONE fact: judged on the unforked graph the carry amount is
+     `128 - x` or `step` (an interval, because of the wrap), so every test on
+     it forks; in every configuration that actually reads it, it is `step`.
+   * SO: TYPES ON THE GRAPH AS FORKED (Philippe's formulation). After tracing
+     the graph is executable for concrete inputs; loop: find a select driven
+     by something abstract, split the outcome at the most upstream place,
+     refold (with the static ranges), dedupe, recompute types, repeat until
+     no abstract value drives a select. Built as
+     `verify::split_undecided_selects`: program order (the lowest select),
+     cone-local rebuild, outcomes with equal rows merged as they appear
+     (errors combined per lane: `(g1 and e1) or (g2 and e2)` - without that,
+     202 outcomes of one row had 201 distinct errors and never merged).
+   * THE SPAWN FRAMES had no region (no player at the frame's start) and one
+     trace for all of them, so the player created on landing was anywhere:
+     1024 platform-touch combinations. Fixed generically
+     (`kernel::no_player_ranges`): the no-player phase is deterministic, so
+     run it pinned and bound each field to the hull of what it took - the
+     spawn's y [106, 128], and each platform's speed [-0.65, 0] / [0, 0.65]
+     (the speed bound, derived rather than asserted by hand). Spawn traces
+     now take no time.
+   * WHAT REMAINS: near a platform row the split count is still exponential
+     (tens of thousands of splits for ~100 outcomes). The player's move tests
+     "does platform j overlap me" at every pixel, the player's x a pixel
+     further (or stopped by a tile - a per-lane select) each step: each test
+     a separate comparison against the same unknown platform x, split
+     independently, though for any real platform the overlapping steps are
+     one contiguous run. This is section 3's "split the unknown, not the
+     predicate", with thresholds that are per-lane values. Candidates:
+     (a) fork the RELATIVE position (platform x - player x at the move's
+     start) at constant cuts - but a tile can stop the player mid-move, so
+     step k's x is not start + k, and deciding the parts still needs (b);
+     (b) a per-lane decidability test sharper than interval types: a
+     comparison of a one-pixel part with an integer exact per lane is
+     decided; (c) at the coarse levels, one decision per platform per move
+     rather than per pixel. Open.
 6. Delete `quantify` - never on this branch (it came with `ac307ce`). What
    step 6 stood for here is the other limit that commit removed: the per-node
    `ChoiceSet` fork mask, which capped a frame at 58 forks and is what stops
