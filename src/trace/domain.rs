@@ -502,6 +502,10 @@ pub struct Symbolic {
     undecidable_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// `abstract_beneath_lane_ops`'s memo, dropped with the rest.
     beneath_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
+    /// `may_answers`'s memo: a condition's `(may_true, may_false)` pair.
+    /// Depends on `lane_undecidable` and so on `ival_cells`, so it is dropped
+    /// with the other three in `forget_intervals`.
+    may_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, (NodeId, NodeId)>>,
     /// STATIC RANGES (2026-09-15, the bucket dispatch): input cells whose
     /// value is known to lie in a range - a body specialized on the
     /// player's speed BUCKET - and the memo of the range analysis over
@@ -529,6 +533,8 @@ impl Symbolic {
         self.ival_memo.get_mut().clear();
         self.abstract_memo.get_mut().clear();
         self.undecidable_memo.get_mut().clear();
+        self.beneath_memo.get_mut().clear();
+        self.may_memo.get_mut().clear();
     }
 
     /// THE FORK TRIGGER (plans/graph-model.md section 2): can ONE LANE hold
@@ -785,6 +791,25 @@ impl Symbolic {
     /// endpoint comparisons for a condition whose answers are exactly `n` and
     /// `not n`.
     pub fn may_answers(&mut self, n: NodeId) -> (NodeId, NodeId) {
+        // MEMOISED, like every other pass here, because it is a pure function
+        // of the graph - and because without it this was 99.96% of
+        // `fork_known_premises` and half of room (6,0)'s lattice walk.
+        //
+        // The recursion below descends `And`/`Or`/`Not`, and the graph is a
+        // DAG, so an unmemoised walk recomputes every shared subtree once per
+        // path that reaches it - and each recomputation re-runs
+        // `lane_undecidable`, which walks cones of its own. Measured before
+        // this: 14.7 s in one trace for 91 conditions, ~160 ms each, against
+        // 0.6 s for the whole ascending rebuild beside it.
+        if let Some(hit) = self.may_memo.borrow().get(&n) {
+            return *hit;
+        }
+        let out = self.may_answers_uncached(n);
+        self.may_memo.borrow_mut().insert(n, out);
+        out
+    }
+
+    fn may_answers_uncached(&mut self, n: NodeId) -> (NodeId, NodeId) {
         if !self.lane_undecidable(n) {
             let nn = self.graph.fold(Op::Not, vec![n]);
             return (n, nn);
