@@ -112,6 +112,20 @@ pub struct Frame {
     pub fork_ways: Vec<u8>,
     pub fork_tables: Vec<Vec<(i32, i32)>>,
     pub outs: Vec<FrameOut>,
+    /// THE RAISE ROW's liveness: when this frame would have hit a Lua raise,
+    /// as the OR of the path guards at every `Interp::poison` site
+    /// (plans/graph-model.md section 4, "a raise is its own row").
+    ///
+    /// `ConstBool(false)` for a frame that cannot raise, which is every frame
+    /// of every room but the three where a spring stands on a breakable floor
+    /// (rooms (7,0), (6,1), (7,1)) - so it folds away and costs nothing where
+    /// nothing raises.
+    ///
+    /// NOT an element of `outs`: a raise has no field values, while every
+    /// `outs` consumer indexes positionally and assumes `fields` / `rt2` /
+    /// `shape` / `st` are there (`emit::bind`'s roots, `kernel`'s
+    /// `outs.len() == bound.outcomes.len()` pairing, the level -1 walk).
+    pub raise: NodeId,
     /// The canonical cell each `Iface` slot names in the state the frame
     /// STARTS in - the engine's numbering for `Op::Cell(i)`.
     pub in_cells: Vec<u32>,
@@ -420,7 +434,20 @@ pub fn trace_frame<'a>(
     }
     let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
     let fork_tables: Vec<Vec<(i32, i32)>> = (0..it.d.forks).map(|d| it.d.graph.fork_table(d).to_vec()).collect();
-    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, floors_unknown: it.d.floors_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, in_cells, in_rt2 })
+    // The raise row's liveness: the OR over the guards at the raises this
+    // trace hit. Folded from `false`, so a frame that cannot raise gets
+    // `ConstBool(false)` and a frame with one raise gets that guard exactly
+    // (`false OR g` folds to `g`).
+    let raise = {
+        use super::domain::Domain;
+        let raised = std::mem::take(&mut it.raised);
+        let mut r = it.d.boolean(false);
+        for (g, _) in &raised {
+            r = it.d.or(&r, g);
+        }
+        r
+    };
+    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, floors_unknown: it.d.floors_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, raise, in_cells, in_rt2 })
 }
 
 /// The fork origin of an undecided select's condition (`fork_known_premises`).

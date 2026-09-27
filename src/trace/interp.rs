@@ -94,6 +94,15 @@ pub struct Interp<'a, D: Domain> {
     /// trace. Counted by reason, because turning an error into a deopt
     /// would otherwise hide a modelling gap at build time.
     pub illegal: std::collections::BTreeMap<String, usize>,
+    /// WHERE each poisoned path was, as the path guard at the raise, with the
+    /// reason: the raise row's liveness is the OR of these
+    /// (plans/graph-model.md section 4, "a raise is its own row").
+    ///
+    /// `illegal` counts by reason and so cannot build that - a string is not a
+    /// condition. Kept beside it rather than replacing it, because the count
+    /// is the build-time diagnostic and this is the value the kernel needs.
+    /// Drained per job like `illegal` (`kernel::walk_trace`).
+    pub raised: Vec<(D::Bool, String)>,
     /// The cart and the room's collision cache, for `mget`/`fget` and
     /// `tile_flag_at`. Optional so the unit tests can run programs that
     /// never touch the map.
@@ -140,6 +149,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             body_ids: std::collections::HashMap::new(),
             hint: Vec::new(),
             illegal: Default::default(),
+            raised: Vec::new(),
             cart: None,
             cache: None,
             max_states: 256,
@@ -1241,6 +1251,11 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// happily include shapes only reachable through impossible paths -
     /// so the count is what keeps that visible.
     fn poison(&mut self, st: &mut State<D>, why: String) {
+        // WHEN this raise happens: the path guard, before `ok` is cleared.
+        // This is what the raise row's liveness is built from; `ok = false`
+        // below is still what declines the lanes today, and moving that over
+        // is a separate step.
+        self.raised.push((st.guard.clone(), why.clone()));
         st.ok = self.d.boolean(false);
         *self.illegal.entry(why).or_default() += 1;
     }

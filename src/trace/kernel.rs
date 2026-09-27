@@ -2354,6 +2354,9 @@ pub fn room_constant_lattice(
     // Poisoned paths over the WHOLE walk, by reason: summed from the per-job
     // drains of `Interp::illegal`, reported at the end (see `WalkTraced`).
     let mut illegal: std::collections::BTreeMap<String, usize> = Default::default();
+    // The (shape, region) nodes whose RAISE ROW is live - `Frame::raise` did
+    // not fold to false, so the model admits a Lua raise there.
+    let mut raising: std::collections::BTreeSet<WalkNode> = Default::default();
     let mut ival_extra: std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>> = Default::default();
 
     let sk = key(&start)?;
@@ -2504,9 +2507,12 @@ pub fn room_constant_lattice(
                     refused.insert(job.node.clone(), e);
                     frames.remove(&job.node);
                 }
-                WalkTraced::Traced { frame, bound, forks: live_forks, forkops: ops, nodes_added, arena, outs, skipped, illegal: poisoned } => {
+                WalkTraced::Traced { frame, bound, forks: live_forks, forkops: ops, nodes_added, arena, outs, skipped, illegal: poisoned, can_raise } => {
                     for (why, n) in poisoned {
                         *illegal.entry(why).or_default() += n;
+                    }
+                    if can_raise {
+                        raising.insert(job.node.clone());
                     }
                     refused.remove(&job.node);
                     forks.insert(k.clone(), live_forks);
@@ -2651,6 +2657,18 @@ pub fn room_constant_lattice(
             eprintln!("[walk]   {n} x {why}");
         }
     }
+    // THE RAISE ROW, per (shape, region): a live one means this frame's model
+    // admits a Lua raise, so the row would emit lanes. Reported next to the
+    // poison count because they answer different questions - the count is how
+    // often the tracer HIT the site, this is whether the resulting condition
+    // survived folding.
+    if !raising.is_empty() {
+        eprintln!(
+            "[walk] {} of {} (shape, region) nodes have a LIVE raise row (`Frame::raise` did not fold to false)",
+            raising.len(),
+            nodes.len()
+        );
+    }
     let graph = it.d.graph.clone();
     let mut by_hash = std::collections::HashMap::new();
     for ((k, _), wf) in &frames {
@@ -2743,6 +2761,10 @@ enum WalkTraced {
         /// modelling gap should not depend on remembering an environment
         /// variable (plans/graph-model.md section 4).
         illegal: std::collections::BTreeMap<String, usize>,
+        /// Is this frame's RAISE ROW live - i.e. did `Frame::raise` fail to
+        /// fold to `false`? Decided in the worker, because the node lives in
+        /// the worker's arena (see `walk_trace`).
+        can_raise: bool,
     },
 }
 
@@ -2781,7 +2803,9 @@ fn walk_trace(
     // walk, so there is no later job on this worker to mis-attribute to. The
     // assert is what would say so if that ever stopped being true.
     debug_assert!(tr.it.illegal.is_empty(), "a previous job left {} poison reasons behind", tr.it.illegal.len());
+    debug_assert!(tr.it.raised.is_empty(), "a previous job left {} raise conditions behind", tr.it.raised.len());
     tr.it.illegal.clear();
+    tr.it.raised.clear();
     let mut st = job.st.clone();
     if let Some(constants) = &job.rebase {
         shapes::rebase(&mut st, &mut tr.it.d, constants)?;
@@ -2791,7 +2815,10 @@ fn walk_trace(
         // A REFUSED trace can have poisoned paths before it refused, and they
         // count: the refusal says this (shape, region) did not compile, the
         // poison says the model admitted a Lua raise on the way there.
-        Err(e) => return Ok(WalkTraced::Refused(format!("{:#}", e), std::mem::take(&mut tr.it.illegal))),
+        Err(e) => {
+            tr.it.raised.clear();
+            return Ok(WalkTraced::Refused(format!("{:#}", e), std::mem::take(&mut tr.it.illegal)));
+        }
     };
     let nodes_added = tr.it.d.node_count().saturating_sub(tr.it.trace_start_nodes);
     // Live forks of THIS trace.
@@ -2861,7 +2888,15 @@ fn walk_trace(
     // map would otherwise accumulate across every job it runs and the walk
     // would count the same poisoned path once per later trace.
     let illegal = std::mem::take(&mut tr.it.illegal);
-    Ok(WalkTraced::Traced { frame: f, bound, forks: live_forks, forkops, nodes_added, arena: tr.it.d.node_count(), outs, skipped, illegal })
+    // `raised` needs no drain here: `verify::trace_frame` takes it when it
+    // folds `Frame::raise`, so it is already empty on this path. The entry
+    // assert is what says so.
+    debug_assert!(tr.it.raised.is_empty(), "trace_frame left {} raise conditions behind", tr.it.raised.len());
+    // CAN THIS FRAME RAISE? Decided HERE, in the worker whose arena `f.raise`
+    // names - the walk's own graph is a different arena, so asking there would
+    // read the wrong node. A bool travels safely; a NodeId would not.
+    let can_raise = tr.it.d.decide(&f.raise) != Some(false);
+    Ok(WalkTraced::Traced { frame: f, bound, forks: live_forks, forkops, nodes_added, arena: tr.it.d.node_count(), outs, skipped, illegal, can_raise })
 }
 
 /// The tracer a walk ran in, kept so a shape can be re-traced later in
