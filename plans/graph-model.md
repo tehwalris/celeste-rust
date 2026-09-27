@@ -219,6 +219,83 @@ WHICH raise happened is diagnostics, not semantics: the sites merge into one
 row, and the per-reason breakdown stays where it is today, in `Interp::illegal`
 at trace time.
 
+WE DO RAISE, AND IT DOES NOT FOLD (measured 2026-09-27, correcting the
+paragraph below). A spring sitting directly on a breakable floor reaches the
+Lua raise, and the obligation survives to runtime:
+
+* Rooms (7,0) 221, (6,1) 1058, (7,1) 1321 poisoned paths, all from ONE site -
+  `` `this.delay>0`: comparison of nil and number `` - identical at `r0sxh`
+  and `r0sxhp`. These are TRACES that hit the site, summed over the walk, not
+  a count of declining lanes.
+* They do NOT fold to a dead outcome: zero "ok folds false" skips (every skip
+  is "another room"), so they merge into live rows and become runtime `ok`
+  terms. Which is why the raise row is worth MATERIALISING rather than folding
+  at build time: the condition is being computed anyway, so the row costs one
+  extra mask, and routing those lanes is what keeps them accounted for.
+
+THE MECHANISM, and the predictor is ADJACENCY rather than either object:
+`break_fall_floor` does `obj.collide(spring, 0, -1)` - probing one pixel UP, so
+it finds a spring standing ON the floor that is breaking - and calls
+`break_spring`, which sets `hide_in=15`. Fifteen frames later `hide_in<=0` sets
+`hide_for=60` and `spr=0`. Now the spring's update chain (`hide_for>0` /
+`elseif spr==18` / `elseif this.delay>0`) can reach its THIRD arm with `delay`
+never assigned - `init` sets only `hide_in`/`hide_for`, and the two assignments
+to `delay` live in the first two arms. `init_object` sets `spr = type.tile`, so
+in the real game `spr` is 18 until the collide branch sets both `spr=19` and
+`delay=10`; the tracer poisons once `spr` stops being a known constant.
+
+Controlled, by tile census over `cart/map-data.txt`:
+
+| room | springs | floors | spring ON floor | poisons |
+|---|---|---|---|---|
+| (7,0) | 1 | 6 | 1 | 221 |
+| (6,1) | 1 | 6 | 1 | 1058 |
+| (7,1) | 2 | 4 | 2 | 1321 |
+| (5,1) | 1 | 2 | 0 | 0 |
+| (1,1) | 0 | 4 | 0 | 0 |
+| (2,1) | 0 | 4 | 0 | 0 |
+| (2,0) | 2 | 0 | 0 | 0 |
+| (3,0) | 0 | 12 | 0 | 0 |
+
+So it is neither a room quirk nor "springs raise": it is the spring-on-a-
+breakable-floor pair. The tile census finds EXACTLY THREE such rooms in the
+cart - (7,0) at local (12,12), (6,1) at (14,9), (7,1) at (7,4) and (5,14) - and
+all three poison while every control is silent, including a room with a spring
+AND floors but no adjacency (5,1). Three for three, five controls clean. Per
+trace: 0.36 / 0.43 / 1.07, the largest being the room with TWO pairs.
+
+### The raise is NOT reachable concretely: it is a lost correlation
+
+Worth knowing, because it says what would make the raise row fold. The
+spring's `spr` takes three values and two of them are assigned TOGETHER WITH
+something that blocks the third arm:
+
+* `spr=19` (arm 2, the bounce) sets `delay=10` in the same frame;
+* `spr=0` (the hiding tail) sets `hide_for=60` in the same frame;
+* `spr=18` is the initial value, and what arms 1 and 3 restore.
+
+Arm 3 needs `hide_for<=0` AND `spr!=18`. With `delay` unset, `spr!=18` forces
+`spr=0`, which forces `hide_for=60>0`, which takes ARM 1 instead. So no
+concrete execution reads a nil `delay`, and the real game cannot crash here.
+
+What the tracer loses is the correlation. Two concrete states share one SHAPE
+(neither has a `delay` field): the fresh spring `(spr=18, hide_for=0)` and the
+hidden spring `(spr=0, hide_for=60)`. Same shape, so they merge - and the merge
+keeps `spr` and `hide_for` as two INDEPENDENT symbolic values, whose product
+contains `(spr=0, hide_for=0)`, a state no concrete run ever holds. That
+impossible corner is exactly where arm 3 is reached with `delay` absent.
+
+This is section 3's argument arriving from a new direction: two quantities
+that are perfectly correlated in every concrete state get split
+independently, and their product admits what no concrete value could produce.
+So the raise row will be provably empty in reality while the model cannot see
+it, and what makes it fold is keeping the correlation - step 5's "partition the
+unknown, not the predicate". Note also that `r0sxh` has floors EXACT
+(`widen_fall_floors` returns early unless `floors_unknown`), so the
+undecidedness comes from the player's position, not from a widened
+`collideable` - the raise is live at the levels that carry the ladder's
+optimality claim.
+
 TWO THINGS THAT LOOK ALIKE ARE HANDLED DIFFERENTLY, and the distinction is
 what "do we ever raise at runtime?" turns on:
 
