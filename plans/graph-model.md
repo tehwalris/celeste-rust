@@ -123,9 +123,27 @@ Every obligation we actually have is an operator's own error:
 |---|---|
 | `Div(a, b)` | `b = 0` |
 | `Flr(x)` | `not (flr(lo x) = flr(hi x))` - the span claim |
+| `Sel(c, t, f)` | `not Known(c)` - the arms differ, so an undecided `c` leaves the value undefined on that lane |
 | a fork | the lane's set is not covered by the parts enumerated |
 | an unrolled loop | its condition still holds after the bound |
 | an input with an assumed range | the lane's value is outside it |
+
+`Sel` is the one the first draft of this table omitted, and it is one of only
+two error-side obligations the code actually has (`interp::premise_for_value`
+conjoins `Known(cond)` where a merged VALUE is a select; the other is the
+unrolled loop's bound, `interp.rs` "the obligation belongs only to the states
+that never left"). It is an `own_error` and not a precondition: the arms are
+values, and which one the lane takes is a question about this expression rather
+than about the kernel's admissible inputs.
+
+`Div` is vacuous in THIS program and the table keeps it only because the model
+should be stated for the operator rather than for the cart. Every division in
+the Lua divides by a numeric literal - `8` eleven times, `5` seven times, then
+`30`, `1.5`, `64`, `60`, `40`, `4`, `32`, `3`, and no non-numeric divisor
+anywhere (checked 2026-09-27 with comments stripped; an earlier scan "found"
+`/big`, which is the text `platforms/big chest` in a comment). So there is no
+`Div` obligation in the code, and that is correct rather than a gap: `b` is
+never a value a lane could make zero.
 
 `Flr` is the instructive one. As a premise (`Known(Flr(x))`) it looks circular -
 `Flr` is exact BECAUSE of it, so propagation cannot discharge it without
@@ -135,6 +153,18 @@ on 2026-09-26. As an operator's own error there is no circularity at all:
 
 Trace-time refusals (a symbolic table index, an unsupported construct) are not
 error conditions. They are failures to compile, and stay so.
+
+`Interp::poison` is one of these, and it must survive step 4 unchanged. It
+fires where `binop_values` found arithmetic on a non-number - Lua itself would
+have raised, so no legal run takes that path - and it substitutes a dummy `0`
+and records the reason in `illegal`. Making it a value's error would be wrong
+twice: the abort is not a property of the substituted `0` (nothing downstream
+"uses a bad number"; the run does not continue at all), and a derived error
+that no stored value depends on would VANISH, which is precisely the silent
+loss the `ok`-not-`guard` choice exists to prevent. Its own doc makes the
+argument: clearing `guard` would say "no lane takes this path" and a successor
+could disappear unnoticed, while clearing `ok` says "the kernel declines these
+lanes", which fails loudly. So `poison` keeps a precondition-shaped home.
 
 One obligation is NOT any value's error and needs its own home: a fork's
 COVERAGE - that the lane's set really is contained in the union of the parts
@@ -250,11 +280,27 @@ this size is safe.
    (numbers) and `Symbolic::runtime_unknown` (booleans, added 2026-09-26).
 2. Delete `Known`-as-decidedness, using that pass. Keep the assertion, renamed.
 3. Unify the fork operations into one `fork(node, partition)`.
-4. DELETE `ok`. It goes from `State`, from `state::merge`, from the nine
-   conjunction sites and from `Domain::require`/`known`; error is derived
-   instead when the kernel is materialised. A deletion, not a re-plumbing -
-   but still the invasive step, so do it in halves with the gates green
-   between them.
+4. DELETE `ok`. Surveyed 2026-09-27: 16 sites write it, and they are three
+   different things, so the step is CLASSIFY FIRST, then delete.
+
+   * PRECONDITIONS, 11 sites - obligations on the kernel's admissible inputs,
+     which the kernel declines loudly on (`live & !ok`): `widen.rs` 123 (the
+     `require` helper - a free function there, NOT a `Domain` method), 201,
+     401, 592, 667, 865, 884, 887, 973, `interp.rs:1962` (a `move` fork's
+     span premise), `verify.rs:340` (the pin guard). These move to input
+     preconditions, beside what `SplitOk` already is.
+   * `own_error`, 2 sites - `interp.rs:702` (`Known(cond)` for a surviving
+     select) and `interp.rs:890` (the unrolled loop's bound). These become
+     derived error.
+   * A TRACE-TIME REFUSAL, 1 site - `interp.rs:1240` (`poison`), which stays
+     as it is (see section 4).
+
+   The remaining writes are plumbing that dissolves with the field:
+   `shapes.rs:159` and `verify.rs:1157` initialise it to true, `state.rs:360`
+   merges it (and can REFUSE a merge when the merged `ok` is a select, which
+   is the fusion cost this step removes), `verify.rs:601` remaps it.
+
+   Still the invasive step, so do it in halves with the gates green between.
 5. Domain-first fork choice, partitioned at the thresholds the branch uses.
 6. Delete `quantify`.
 
