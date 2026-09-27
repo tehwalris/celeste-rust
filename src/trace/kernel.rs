@@ -348,6 +348,60 @@ fn successor_regions(
     Ok((a.iy..=b.iy).flat_map(|iy| (a.ix..=b.ix).map(move |ix| Some(Region { ix, iy }))).collect())
 }
 
+/// THE NO-PLAYER PHASE'S RANGES (region-keyed rooms). With no player there
+/// is no region, and one trace covers every frame of the spawn, so a field
+/// that differs between those frames - the spawn's `y`, flying up from 128
+/// and falling back to its target - is an input with no range, and the
+/// player it creates on landing could be anywhere: in room (6,0), next to
+/// every platform row. But no input matters before the player exists, so the
+/// phase is DETERMINISTIC: run it, frame by frame, fully pinned, while the
+/// shape stays the no-player shape and every field stays a constant, and
+/// bound each numeric field to the hull of what it took. Asserted like a
+/// region's bounds (`verify::trace_frame`): a lane outside declines.
+fn no_player_ranges(
+    it: &mut super::interp::Interp<'static, super::domain::Symbolic>,
+    reset: &'static full_moon::ast::Ast,
+    fr: &'static full_moon::ast::Ast,
+    start: &super::state::State<super::domain::Symbolic>,
+    opts: super::shapes::WalkOpts,
+) -> Result<Bounds> {
+    use super::iface::Conc;
+    use super::shapes;
+    if shapes::player_path(start).is_some() {
+        return Ok(Vec::new());
+    }
+    let shape = start.shape()?;
+    let mut hull: std::collections::BTreeMap<super::iface::Path, (i32, i32)> = Default::default();
+    let mut st = start.clone();
+    // The state's values, read off it before it is rebased (which blanks
+    // them) and pinned back onto the rebased state by the next trace - as
+    // the walk does with its lattice.
+    let mut consts = shapes::field_constants(start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?;
+    // The spawn takes ~20 frames; the cap only stops a phase that never ends.
+    for _ in 0..240 {
+        for (p, c) in &consts {
+            if let Conc::Num(v) = c {
+                let r = v.as_raw_u32() as i32;
+                let e = hull.entry(p.clone()).or_insert((r, r));
+                *e = (e.0.min(r), e.1.max(r));
+            }
+        }
+        let roots = shapes::state_paths(&st)?;
+        let pin: Vec<(super::iface::Path, Conc)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
+        let f = super::verify::trace_frame(it, reset, fr, st.clone(), &roots, &pin, &[], opts.widen_mode(), &[])?;
+        let [o] = f.outs.as_slice() else { break };
+        if o.shape != shape || shapes::player_path(&o.st).is_some() {
+            break;
+        }
+        consts = shapes::field_constants(&o.st, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?;
+        let heap = shapes::heap_constants(&o.st, &it.d);
+        let mut next = o.st.clone();
+        shapes::rebase(&mut next, &mut it.d, &heap)?;
+        st = next;
+    }
+    Ok(hull.into_iter().filter(|(_, (lo, hi))| lo < hi).collect())
+}
+
 /// The bounds `dash_time` is traced under per class: `> 0` folds either
 /// way. Half the 16.16 range on each side (Philippe): a value in it can
 /// neither wrap the decrement nor fall outside every kernel, and one
@@ -2361,6 +2415,13 @@ pub fn room_constant_lattice(
 
     let sk = key(&start)?;
     let start_key = sk.clone();
+    let no_player = match region_grid_for(opts)? {
+        Some(_) => no_player_ranges(&mut it, reset, fr, &start, opts)?,
+        None => Vec::new(),
+    };
+    if std::env::var_os("CELESTE_LATTICE_TRACE").is_some() || std::env::var_os("XREG").is_some() {
+        eprintln!("[walk] no-player ranges: {:?}", no_player.iter().map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>());
+    }
     lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?);
     reps.insert(sk.clone(), start.clone());
     // The START state's own intervals are interval inputs too. Room (5,0) is
@@ -2436,7 +2497,8 @@ pub fn room_constant_lattice(
                     (Some(g), Some(r), Some(pl)) => {
                         g.bounds(&pl, r).into_iter().chain(experiment_bounds(&pl)).filter(|(p, _)| roots.iter().any(|q| q == p)).collect()
                     }
-                    (None, None, _) | (Some(_), None, None) => Vec::new(),
+                    (None, None, _) => Vec::new(),
+                    (Some(_), None, None) => no_player.iter().filter(|(p, _)| roots.iter().any(|q| q == p)).cloned().collect(),
                     (g, r, pl) => bail!("walk node {r:?} of a shape {} a player under grid {g:?}", if pl.is_some() { "with" } else { "without" }),
                 };
                 let rebase = if *k == start_key { None } else { Some(rep_constants[k].clone()) };
@@ -2814,6 +2876,9 @@ fn walk_trace(
         Err(e) => return Ok(WalkTraced::Refused(format!("{:#}", e), std::mem::take(&mut tr.it.illegal))),
     };
     let nodes_added = tr.it.d.node_count().saturating_sub(tr.it.trace_start_nodes);
+    if std::env::var_os("XREG").is_some() {
+        eprintln!("[xreg] region {:?} player {} outcomes {} forks {}", job.node.1, shapes::player_path(&job.st).is_some(), f.outs.len(), tr.it.d.forks);
+    }
     // Live forks of THIS trace.
     let (live_forks, forkops) = {
         let g = &tr.it.d.graph;
