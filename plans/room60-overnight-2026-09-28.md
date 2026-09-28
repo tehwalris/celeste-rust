@@ -211,3 +211,13 @@ One-pixel probes (`CELESTE_REGION=1,6`, `CELESTE_WALK_REGIONS`):
 Philippe: buttons should be forks (unknown booleans through the generic
 fork mechanism), not a separate body dimension - delegated to a background
 agent on a worktree.
+- DONE (branch `buttons-as-forks`): `Domain::unknown_bool` is
+  `Symbolic::both_values` (a 2-way `Ints` fork over the literal `[0, one
+  grid step]`, no validity); `Op::Free`, the `frees` threading and the 64-way
+  rep pass are gone. `specialize_frame` sorts an outcome's forks by what a
+  configuration means: those every lane takes both ways (buttons, held
+  trails, escaped atoms) are resolved one at a time with root dedup into
+  CLASSES (the old 64 -> 24 collapse, now also over the held trails); those
+  that partition lanes (validity read, tables) are enumerated per class as
+  before, their dead-ness decided once per outcome. Same bodies everywhere,
+  fused nodes equal or fewer, gates identical.

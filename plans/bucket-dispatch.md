@@ -102,8 +102,9 @@ state of the work. The measurements behind it are in
    - the boundary snap is a relative TABLE fork (`Op::SplitTab`,
      `SplitValidTab`, `SplitKeyTab` = the lane's bucket, `SplitOkTab` =
      the fragments cover the lane) over the buckets the output range
-     crosses; per button rep the lowering takes the entries and arity
-     that rep's pieces reach (`specialize_frame`'s `tabs`) and resolves
+     crosses; per button rep (since 2026-09-28: per class of the forks
+     every lane takes both ways, the buttons among them) the lowering takes
+     the entries and arity that rep's pieces reach (`specialize_frame`'s `tabs`) and resolves
      the fork into select chains on `Lo(v)` built with exactly those, so
      the premise checks what the configurations enumerate and a lane the
      analysis got wrong declines rather than vanishing

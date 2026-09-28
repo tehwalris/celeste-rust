@@ -413,7 +413,10 @@ The kernels are assembled at startup: `compiled::asm_kernel::registry`
 retraces the configured start room (`trace::kernel::room_kernels_in`),
 fuses each shape's graph (`trace::emit::asm_fused` ->
 `lower::specialize_frame` - every fork resolved at compile time, one
-hash-consed arena), and `transpile::asm` assembles it with gcc + dlopen,
+hash-consed arena; the six buttons are forks like any other, 2-way forks
+every lane takes both ways (`Symbolic::both_values`), and a body is one
+(outcome, fork configuration) - there is no separate button dimension
+since 2026-09-28), and `transpile::asm` assembles it with gcc + dlopen,
 one .so per shape, in milliseconds where rustc+LLVM took minutes over
 ~900k generated lines. There is no regen step, no staleness gate, and
 no diff to read: what runs is always what the tracer produces from the

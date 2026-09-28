@@ -484,6 +484,11 @@ operand of `And`/`Or` decides it).
   stored field at all (the platform wrap: whether it wrapped cannot matter,
   because the output widening overwrites `x` with the whole path either way).
 * ~~`ok` is one boolean per state, accumulated by AND~~ - gone in step 4 (below).
+* ~~The buttons are a separate body dimension~~ (`Op::Free`, 64 assignments
+  grouped into "button reps", bodies = reps x configurations) - gone
+  2026-09-28: a button is a `both_values` fork, and `specialize_frame`
+  dedups the configurations of every fork each lane takes both ways the
+  same way.
 * **`quantify` exists at all** - on the abandoned `ac307ce` line only; this
   branch never had it (step 6).
 
