@@ -22,7 +22,7 @@
 use anyhow::{anyhow, bail, Result};
 use full_moon::ast;
 
-use crate::transpile::graph::NodeId;
+use crate::transpile::graph::{Graph, NodeId};
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
@@ -255,7 +255,7 @@ pub fn trace_frame<'a>(
     // overrides, whose key nodes name ITS forks - inherited, the kernel
     // hashed a stale key (2026-09-15).
     st.key_override.clear();
-    // Fork choices are per FRAME, like the six buttons above.
+    // Fork choices are per FRAME; the six buttons are among them.
     it.d.forks = 0;
     it.d.graph.reset_forks();
     it.d.clear_ranges();
@@ -278,11 +278,6 @@ pub fn trace_frame<'a>(
         }
         _ => 2,
     };
-    // One frame has exactly six free choices, `Free(0..5)`. The counter
-    // is on the domain rather than the frame, so tracing a SECOND frame
-    // through one interpreter - which compiling per pm1 key does - would
-    // otherwise run out of buttons on the seventh.
-    it.d.frees = 0;
     it.d.unknown_atoms = 0;
     // What the previous trace left if it failed part-way (a success takes
     // both below).
@@ -1374,7 +1369,7 @@ fn is_bool_op(op: &crate::transpile::graph::Op) -> bool {
     matches!(
         op,
         Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Not | Op::And | Op::Or | Op::Known | Op::ConstBool(_) | Op::UnknownBool(_) | Op::TileFlagAt
-            | Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_) | Op::Free(_)
+            | Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_)
     )
 }
 
@@ -1617,28 +1612,50 @@ pub fn cells_with(iface: &Iface, over: &[(Path, Conc)]) -> Result<Vec<Conc>> {
     Ok(v)
 }
 
+/// A traced frame's graph with its six buttons RESOLVED to one input
+/// (`bits`, in `__button_states` order), for the concrete evaluator, which
+/// has no value for a fork: the cone of the frame's outcomes specialized
+/// into a fresh graph, and the map to it. The buttons are the forks
+/// `Symbolic::unknown_bool` minted, in the order `__reset_button_states`
+/// asked for them; every other fork is left standing.
+pub fn at_buttons(g: &Graph, f: &Frame, bits: &[bool; 6]) -> Result<(Graph, Vec<NodeId>)> {
+    let buttons: Vec<u8> = f.fork_origins.iter().filter(|(_, o)| o == super::domain::UNKNOWN_BOOL_ORIGIN).map(|(d, _)| *d).collect();
+    if buttons.len() != 6 {
+        bail!("the frame minted {} unknown booleans, not the six buttons", buttons.len());
+    }
+    let mut cfg = vec![crate::transpile::graph::OPEN; 256];
+    for (d, b) in buttons.iter().zip(bits) {
+        cfg[*d as usize] = *b as u8;
+    }
+    let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.fields.iter().map(|(_, n, _)| *n).chain([o.guard, o.error])).collect();
+    let need = crate::transpile::bdd::reachable(g, &roots);
+    let mut out = g.like();
+    let map = g.specialize_subset_into(&cfg, None, Some(&need), &mut out);
+    Ok((out, map))
+}
+
 /// Check one traced frame against the oracle at one (inputs, buttons)
-/// point. Returns `(which outcome claimed it, fields compared)` - the
+/// point, `at` being the frame at those buttons (`at_buttons`). Returns `(which outcome claimed it, fields compared)` - the
 /// outcome index so a caller can tell whether the guards ever
 /// discriminate, and the count so it can tell "agreed about everything"
 /// from "agreed about nothing, because the paths did not line up".
 pub fn check_at(
     it: &Interp<'_, Symbolic>,
     f: &Frame,
+    at: &(Graph, Vec<NodeId>),
     cells: &[Conc],
     bits: &[bool; 6],
     oracle: &[(Path, Conc)],
 ) -> Result<(usize, usize)> {
     let env = super::eval::Env {
         cells,
-        frees: bits,
         cart: it.cart.clone(),
         cache: it.cache.clone(),
     };
-    let g = &it.d.graph;
+    let (g, map) = (&at.0, &at.1);
     let mut live: Vec<usize> = Vec::new();
     for (i, o) in f.outs.iter().enumerate() {
-        if super::eval::eval(g, o.guard, &env)? == Conc::Bool(true) {
+        if super::eval::eval(g, map[o.guard as usize], &env)? == Conc::Bool(true) {
             live.push(i);
         }
     }
@@ -1649,7 +1666,7 @@ pub fn check_at(
         bail!("{:?}: {} outcomes claim this assignment, not 1", bits, live.len());
     }
     let o = &f.outs[live[0]];
-    if super::eval::eval(g, o.error, &env)? != Conc::Bool(false) {
+    if super::eval::eval(g, map[o.error as usize], &env)? != Conc::Bool(false) {
         bail!("{:?}: the trace declined this assignment (its error holds)", bits);
     }
     let mut n = 0;
@@ -1672,7 +1689,7 @@ pub fn check_at(
             .iter()
             .find(|(q, _, _)| q == p)
             .ok_or_else(|| anyhow!("{:?}: traced state has no {}", bits, iface::show(p)))?;
-        let got = super::eval::eval(g, got.1, &env)?;
+        let got = super::eval::eval(g, map[got.1 as usize], &env)?;
         if got != *want {
             bail!("{:?}: {} is {:?}, oracle says {:?}", bits, iface::show(p), got, want);
         }
@@ -2168,22 +2185,20 @@ mod tests {
         assert_eq!(f.iface.pins.len(), 6, "all six pinned");
 
         // No error in whichever outcome claims this assignment.
-        let bits = [false; 6];
+        let (g, map) = at_buttons(&it.d.graph, &f, &[false; 6]).expect("the six buttons");
         let ok_at = |cells: &[Conc]| -> bool {
             let env = super::super::eval::Env {
                 cells,
-                frees: &bits,
                 cart: it.cart.clone(),
                 cache: it.cache.clone(),
             };
-            let g = &it.d.graph;
             let live: Vec<&FrameOut> = f
                 .outs
                 .iter()
-                .filter(|o| super::super::eval::eval(g, o.guard, &env).expect("guard") == Conc::Bool(true))
+                .filter(|o| super::super::eval::eval(&g, map[o.guard as usize], &env).expect("guard") == Conc::Bool(true))
                 .collect();
             assert_eq!(live.len(), 1, "exactly one outcome claims a lane");
-            super::super::eval::eval(g, live[0].error, &env).expect("error") == Conc::Bool(false)
+            super::super::eval::eval(&g, map[live[0].error as usize], &env).expect("error") == Conc::Bool(false)
         };
 
         assert!(ok_at(&f.iface.init), "the key it was compiled for is accepted");
@@ -2309,12 +2324,12 @@ mod tests {
                 ];
                 let env = super::super::eval::Env {
                     cells: &f.iface.init,
-                    frees: &bits,
                     cart: it.cart.clone(),
                     cache: it.cache.clone(),
                 };
+                let (g, map) = at_buttons(&it.d.graph, &f, &bits).expect("the six buttons");
                 for o in &f.outs {
-                    if super::super::eval::eval(&it.d.graph, o.guard, &env).ok()
+                    if super::super::eval::eval(&g, map[o.guard as usize], &env).ok()
                         != Some(Conc::Bool(true))
                     {
                         continue;
@@ -2323,7 +2338,7 @@ mod tests {
                     for p in &paths {
                         match o.fields.iter().find(|(q, _, _)| q == p) {
                             Some((_, nd, _)) => {
-                                match super::super::eval::eval(&it.d.graph, *nd, &env) {
+                                match super::super::eval::eval(&g, map[*nd as usize], &env) {
                                     Ok(c) => next.push(c),
                                     Err(_) => break,
                                 }
@@ -2523,7 +2538,6 @@ end
             let cells = [Conc::Num(crate::pico8_num::Pico8Num::from_i16(a))];
             let env = super::super::eval::Env {
                 cells: &cells,
-                frees: &[false; 6],
                 cart: None,
                 cache: None,
             };
@@ -2781,6 +2795,9 @@ end
         let mut declined = 0usize;
         let mut declined_at: std::collections::BTreeMap<String, usize> = Default::default();
         let mut used: std::collections::BTreeSet<usize> = Default::default();
+        let at: Vec<(crate::transpile::graph::Graph, Vec<NodeId>)> = (0u8..64)
+            .map(|m| at_buttons(&it.d.graph, &f, &std::array::from_fn(|i| m & (1 << i) != 0)).expect("the six buttons"))
+            .collect();
         for (label, over) in &perts {
             let label = label.as_str();
             let cells = cells_with(&f.iface, over).expect("overrides name input cells");
@@ -2812,7 +2829,7 @@ end
                         return eprintln!("[verify] oracle {} {:?} not concrete: {:#}", label, bits, e)
                     }
                 };
-                match check_at(&it, &f, &cells, &bits, &want) {
+                match check_at(&it, &f, &at[mask as usize], &cells, &bits, &want) {
                     Ok((which, n)) => {
                         checked += 1;
                         compared += n;

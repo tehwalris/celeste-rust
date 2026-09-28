@@ -584,7 +584,7 @@ fn concrete_key(st: &super::state::State<super::domain::Symbolic>, d: &super::do
 
 /// The successor keys of one traced frame: per outcome, the outcome's
 /// shape and - if it has a player - every speed key its rows can carry,
-/// read per BUTTON CONFIGURATION (the buttons substituted, a graph
+/// read per BUTTON CONFIGURATION (the buttons' forks resolved, a graph
 /// rewrite, so the dash fields' values are the constants of that
 /// configuration rather than a product of per-field sets) from the
 /// pieces of the dispatch fields' output nodes: the buckets the speed's
@@ -622,7 +622,8 @@ fn successor_keys(
             let Some(super::heap::Value::Num(n)) = iface::get(&o.st, p) else { anyhow::bail!("{}: not a number at the boundary", iface::show(p)) };
             nodes[i] = n;
         }
-        // The cone of the seven, per button configuration.
+        // The cone of the seven, per configuration of its forks over a
+        // literal (the buttons).
         let mut need = vec![false; d.graph.len()];
         let mut stack: Vec<NodeId> = nodes.to_vec();
         while let Some(n) = stack.pop() {
@@ -632,7 +633,7 @@ fn successor_keys(
             need[n as usize] = true;
             stack.extend(d.graph.get(n).args.iter().copied());
         }
-        // Copy the cone ONCE: the 64 per-button passes below then walk it,
+        // Copy the cone ONCE: the per-configuration passes below then walk it,
         // not the shared arena every trace grows (reading successors went
         // from 19 to 45 ms per node over room (1,0)'s fixpoint, the arena
         // from 42k to 253k nodes, 2026-09-15).
@@ -650,8 +651,8 @@ fn successor_keys(
         let seeds_by_node: Vec<(NodeId, (i64, i64))> =
             d.ranges.iter().filter(|(n, _)| need[**n as usize]).map(|(n, r)| (cmap[*n as usize], *r)).collect();
         let mut seen: std::collections::BTreeSet<[NodeId; 7]> = Default::default();
-        // Per button configuration, and within it per assignment of the
-        // conditions the fields select on (`djump > 0` decides both
+        // Per configuration of the buttons, and within it per assignment of
+        // the conditions the fields select on (`djump > 0` decides both
         // `dash_time` and the target: read jointly, or the target's set
         // would include the unbounded old value under `dash_time = 4`).
         let mut cases: Vec<(crate::transpile::graph::Graph, [NodeId; 7], std::collections::HashMap<NodeId, (i64, i64)>)> = Vec::new();
@@ -664,8 +665,37 @@ fn successor_keys(
         // configuration's was ever read (room (2,0) f37: a down-left dash
         // start with no kernel, 2026-09-16).
         let mut shared = cone.like();
-        for m in 0u8..64 {
-            let map = cone.specialize_subset_into(m, None, None, None, &mut shared);
+        // The configurations: every fork over a literal - one every lane
+        // takes both ways, a configuration of which is a set of inputs -
+        // resolved one at a time with the rest standing, kept only where the
+        // seven differ (as `lower::specialize_frame`: two that agree with the
+        // rest standing agree in every completion). The forks that partition
+        // lanes stay standing.
+        let literal: std::collections::BTreeSet<u8> = (0..cone.len() as NodeId)
+            .filter(|&n| cone.is_literal_fork(n))
+            .filter_map(|n| match cone.get(n).op {
+                Op::Split(k) | Op::SplitInt(k) => Some(k),
+                _ => None,
+            })
+            .collect();
+        let mut cfgs: Vec<Vec<u8>> = vec![vec![crate::transpile::graph::OPEN; 256]];
+        for &k in &literal {
+            let mut next = Vec::new();
+            let mut step: std::collections::HashSet<[NodeId; 7]> = Default::default();
+            for c in cfgs {
+                for v in 0..cone.fork_ways(k) {
+                    let mut c = c.clone();
+                    c[k as usize] = v;
+                    let map = cone.specialize_subset_into(&c, None, None, &mut shared);
+                    if step.insert(std::array::from_fn(|i| map[cnodes[i] as usize])) {
+                        next.push(c);
+                    }
+                }
+            }
+            cfgs = next;
+        }
+        for cfg in cfgs {
+            let map = cone.specialize_subset_into(&cfg, None, None, &mut shared);
             let ssig: [NodeId; 7] = std::array::from_fn(|i| map[cnodes[i] as usize]);
             if !seen.insert(ssig) {
                 continue;
@@ -710,7 +740,7 @@ fn successor_keys(
             // collision test in their cones ran to 65,536 cases
             // (2026-09-15).
             type Case = (crate::transpile::graph::Graph, [NodeId; 7], std::collections::HashMap<NodeId, (i64, i64)>);
-            const MAX_CASES_PER_REP: usize = 4096;
+            const MAX_CASES_PER_CONFIGURATION: usize = 4096;
             let cone_of = |g: &crate::transpile::graph::Graph, roots: &[NodeId]| -> Vec<bool> {
                 let mut v = vec![false; g.len()];
                 let mut stack: Vec<NodeId> = roots.to_vec();
@@ -826,7 +856,7 @@ fn successor_keys(
             // `spd.x`, then `spd.y` - splitting on the conditions of the
             // selects the field is built from, each condition opaque
             // (splitting INSIDE a condition, through `on_ground`'s
-            // collision tests, ran to thousands of cases per rep). Once
+            // collision tests, ran to thousands of cases per configuration). Once
             // the speeds are fixed the dash target and accel, which are
             // computed from them, fold to constants.
             let mut done: Vec<Case> = Vec::new();
@@ -850,7 +880,7 @@ fn successor_keys(
                             }
                         },
                     }
-                    anyhow::ensure!(done.len() + todo.len() <= MAX_CASES_PER_REP, "outcome {shape:#x}: over {MAX_CASES_PER_REP} select cases for the dispatch fields in one button configuration (phase {phase})");
+                    anyhow::ensure!(done.len() + todo.len() <= MAX_CASES_PER_CONFIGURATION, "outcome {shape:#x}: over {MAX_CASES_PER_CONFIGURATION} select cases for the dispatch fields in one button configuration (phase {phase})");
                 }
             }
             // Mid-dash, the dash target and accel are read JOINTLY, as one
@@ -890,7 +920,7 @@ fn successor_keys(
                         }
                     }
                 }
-                if done.len() + todo.len() > MAX_CASES_PER_REP {
+                if done.len() + todo.len() > MAX_CASES_PER_CONFIGURATION {
                     let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
                     for s in &dash_conds {
                         *counts.entry(s.as_str()).or_default() += 1;
@@ -898,7 +928,7 @@ fn successor_keys(
                     let mut top: Vec<(&str, usize)> = counts.into_iter().collect();
                     top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
                     anyhow::bail!(
-                        "outcome {shape:#x}: over {MAX_CASES_PER_REP} select cases for the dash constants in one button configuration; split on: {}",
+                        "outcome {shape:#x}: over {MAX_CASES_PER_CONFIGURATION} select cases for the dash constants in one button configuration; split on: {}",
                         top.iter().take(12).map(|(s, n)| format!("{s} x{n}")).collect::<Vec<_>>().join("; ")
                     );
                 }
@@ -1147,25 +1177,24 @@ fn census_report(nodes: &[KeyNode], w: u8) -> String {
 }
 
 /// What a lowered kernel's bodies ARE, for finding why there are many:
-/// root slots against distinct root nodes and constants; per outcome the
-/// button reps, bodies per rep, bodies whose `error` folded true, the forks
-/// whose fragments separate bodies (and the most fragments within one
-/// rep), which roots differ between the bodies of one rep, and the
-/// configurations of the largest rep.
+/// root slots against distinct root nodes and constants; per outcome its
+/// bodies, those whose `error` folded true, the forks whose fragments
+/// separate bodies (the buttons among them), which roots differ between its
+/// bodies, and its configurations.
 fn body_breakdown(
     f: &super::verify::Frame,
     bound: &Bound,
     spec: &(crate::transpile::graph::Graph, Vec<crate::transpile::lower::SpecializedBody>),
 ) -> String {
     use crate::transpile::graph::Op;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::fmt::Write as _;
     let (sp, bodies) = spec;
     let mut out = String::new();
-    let slots: usize = bodies.iter().map(|b| b.3.len()).sum();
-    let distinct: BTreeSet<u32> = bodies.iter().flat_map(|b| b.3.iter().copied()).collect();
+    let slots: usize = bodies.iter().map(|b| b.2.len()).sum();
+    let distinct: BTreeSet<u32> = bodies.iter().flat_map(|b| b.2.iter().copied()).collect();
     let konst = |r: u32| matches!(sp.get(r).op, Op::Const(..) | Op::ConstBool(_));
-    let const_slots = bodies.iter().flat_map(|b| b.3.iter()).filter(|r| konst(**r)).count();
+    let const_slots = bodies.iter().flat_map(|b| b.2.iter()).filter(|r| konst(**r)).count();
     let _ = writeln!(
         out,
         "  {} bodies, {} fused nodes; {slots} root slots, {} distinct root nodes, {const_slots} slots hold constants",
@@ -1197,74 +1226,48 @@ fn body_breakdown(
                 format!("key of {}", names.get(o.keys[j - nf - 2].0).cloned().unwrap_or_default())
             }
         };
-        let mut by_rep: BTreeMap<u8, Vec<&crate::transpile::lower::SpecializedBody>> = BTreeMap::new();
-        for b in &mine {
-            by_rep.entry(b.1).or_default().push(b);
-        }
-        let mut sizes: Vec<usize> = by_rep.values().map(|v| v.len()).collect();
-        sizes.sort_unstable();
-        let err_true = mine.iter().filter(|b| matches!(sp.get(b.3[nf]).op, Op::ConstBool(true))).count();
-        let _ = writeln!(
-            out,
-            "  outcome {oi}: {} bodies over {} button reps (per rep min {} median {} max {}); {err_true} with error folded true; {} roots per body",
-            mine.len(),
-            by_rep.len(),
-            sizes[0],
-            sizes[sizes.len() / 2],
-            sizes[sizes.len() - 1],
-            mine[0].3.len()
-        );
+        let err_true = mine.iter().filter(|b| matches!(sp.get(b.2[nf]).op, Op::ConstBool(true))).count();
+        let _ = writeln!(out, "  outcome {oi}: {} bodies; {err_true} with error folded true; {} roots per body", mine.len(), mine[0].2.len());
+        let mut used: Vec<u8> = Vec::new();
         for d in 0..bound.forks {
-            let vals: BTreeSet<u8> = mine.iter().map(|b| b.2[d as usize]).collect();
+            let vals: BTreeSet<u8> = mine.iter().map(|b| b.1[d as usize]).collect();
             if vals.len() <= 1 {
                 continue;
             }
-            let in_rep = by_rep.values().map(|v| v.iter().map(|b| b.2[d as usize]).collect::<BTreeSet<_>>().len()).max().unwrap_or(0);
+            used.push(d);
             let table = bound.graph.fork_table(d);
             let kind = if table.is_empty() {
-                format!("move, {} ways", bound.graph.fork_ways(d))
+                let origin = f.fork_origins.iter().find(|(x, _)| *x == d).map_or("move", |(_, o)| o.as_str());
+                format!("{origin}, {} ways", bound.graph.fork_ways(d))
             } else {
                 format!(
                     "table {}",
                     table.iter().map(|(a, b)| format!("[{:.4},{:.4}]", *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>().join(" ")
                 )
             };
-            let _ = writeln!(out, "    fork {d} ({kind}): fragments {vals:?} used, at most {in_rep} within one rep");
+            let _ = writeln!(out, "    fork {d} ({kind}): fragments {vals:?} used");
         }
-        let nroots = mine[0].3.len();
-        let mut differ = vec![0usize; nroots];
-        let mut groups = 0usize;
-        for v in by_rep.values() {
-            if v.len() < 2 {
-                continue;
-            }
-            groups += 1;
-            for (j, dj) in differ.iter_mut().enumerate() {
-                if v.iter().any(|b| b.3[j] != v[0].3[j]) {
-                    *dj += 1;
-                }
-            }
-        }
-        let mut ranked: Vec<(usize, usize)> = differ.iter().copied().enumerate().filter(|(_, c)| *c > 0).collect();
+        let nroots = mine[0].2.len();
+        let mut ranked: Vec<(usize, usize)> = (0..nroots)
+            .map(|j| (j, mine.iter().map(|b| b.2[j]).collect::<BTreeSet<_>>().len()))
+            .filter(|(_, c)| *c > 1)
+            .collect();
         ranked.sort_by_key(|(j, c)| (std::cmp::Reverse(*c), *j));
         let _ = writeln!(
             out,
-            "    roots differing between the bodies of one rep ({} of {nroots}, over {groups} reps with 2+ bodies): {}",
+            "    roots differing between its bodies ({} of {nroots}, by distinct values): {}",
             ranked.len(),
             ranked.iter().take(30).map(|(j, c)| format!("{} ({c})", root_name(*j))).collect::<Vec<_>>().join(", ")
         );
-        if let Some((m, v)) = by_rep.iter().max_by_key(|(_, v)| v.len()) {
-            let used: Vec<u8> = (0..bound.forks).filter(|d| v.iter().map(|b| b.2[*d as usize]).collect::<BTreeSet<_>>().len() > 1).collect();
-            let cfgs: Vec<String> = v.iter().take(40).map(|b| format!("{:?}", used.iter().map(|d| b.2[*d as usize]).collect::<Vec<_>>())).collect();
-            let _ = writeln!(out, "    largest rep {m}: {} bodies; configurations over forks {used:?}: {}", v.len(), cfgs.join(" "));
-        }
+        let cfgs: Vec<String> = mine.iter().take(40).map(|b| format!("{:?}", used.iter().map(|d| b.1[*d as usize]).collect::<Vec<_>>())).collect();
+        let _ = writeln!(out, "    configurations over forks {used:?}: {}", cfgs.join(" "));
     }
     out
 }
 
 /// `bdd::census` of a lowered kernel's fused graph over all its bodies' roots.
 fn census_of(spec: &(crate::transpile::graph::Graph, Vec<crate::transpile::lower::SpecializedBody>)) -> String {
-    let roots: Vec<u32> = spec.1.iter().flat_map(|b| b.3.iter().copied()).collect();
+    let roots: Vec<u32> = spec.1.iter().flat_map(|b| b.2.iter().copied()).collect();
     crate::transpile::bdd::census(&spec.0, &roots)
 }
 
@@ -2300,8 +2303,8 @@ pub fn specialize_probe(
             eprintln!("  slot {} = {}", i, iface::show(sp));
         }
     }
-    // The assembled kernel's shape: bind + fuse (every fork and button
-    // configuration resolved), then count the fused graph's nodes and
+    // The assembled kernel's shape: bind + fuse (every fork, the buttons
+    // among them, resolved), then count the fused graph's nodes and
     // its BODIES - one body is one distinct output row an input row can
     // produce, so the body count bounds the fan-out per input row.
     let fused_of = |fr: &super::verify::Frame| -> Result<(usize, usize)> {
@@ -2333,29 +2336,6 @@ pub fn specialize_probe(
                 }
             }
         }
-    }
-    // CELESTE_SPEC_BTNFORKS: for each of the 64 button assignments,
-    // resolve the buttons (specialize_config_into) and count how many
-    // forks remain LIVE. If per-button the count is ~2 (rem x,y), the
-    // emitter's 2^fork_depth enumeration is over-counting per config.
-    if std::env::var("CELESTE_SPEC_BTNFORKS").is_ok() {
-        use crate::transpile::graph::Op;
-        let g = &it.d.graph;
-        let mut roots_n: Vec<crate::transpile::graph::NodeId> = Vec::new();
-        for o in &f.outs { for (_, nd, _) in &o.fields { roots_n.push(*nd); } roots_n.push(o.guard); roots_n.push(o.error); }
-        let mut hist: std::collections::BTreeMap<usize, usize> = Default::default();
-        for m in 0u8..64 {
-            let mut sp = g.like();
-            let mapped = g.specialize_config_into(m, None, &mut sp);
-            let sroots: Vec<_> = roots_n.iter().map(|r| mapped[*r as usize]).collect();
-            let reach = crate::transpile::bdd::reachable(&sp, &sroots);
-            let mut forks = std::collections::BTreeSet::new();
-            for id in 0..sp.len() {
-                if reach[id] { if let Op::Split(d) = sp.get(id as u32).op { forks.insert(d); } }
-            }
-            *hist.entry(forks.len()).or_default() += 1;
-        }
-        out.push_str(&format!("  live forks per button assignment (fork_depth {}): {:?}\n", f.forks, hist));
     }
     // What each LIVE fork forks on.
     {

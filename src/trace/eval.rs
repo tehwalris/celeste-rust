@@ -36,8 +36,6 @@ use super::iface::Conc;
 pub struct Env<'a> {
     /// `Op::Cell(i)` - the frame's input slots, in `Iface` order.
     pub cells: &'a [Conc],
-    /// `Op::Free(b)` - the six button choices.
-    pub frees: &'a [bool; 6],
     pub cart: Option<Arc<CartData>>,
     pub cache: Option<Arc<CollisionCache>>,
 }
@@ -114,11 +112,6 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                 .cells
                 .get(i as usize)
                 .ok_or_else(|| anyhow!("no value for cell {}", i))?,
-            Op::Free(b) => Conc::Bool(
-                *env.frees
-                    .get(b as usize)
-                    .ok_or_else(|| anyhow!("no value for free choice {}", b))?,
-            ),
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
                 let op = match node.op {
                     Op::Add => Arith::Add,
@@ -195,12 +188,13 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                 };
                 Conc::Bool(r)
             }
-            // The specialization ops. The tracer never builds one - a
-            // split is a branch to it, not a node - so reaching here
-            // means the graph came from somewhere else.
+            // A fork has no one value, and what resolving one leaves over an
+            // interval is not concrete either. Resolve the configuration
+            // first (`Graph::specialize_subset_into`): the buttons are forks
+            // over a literal, and resolve to constants.
             Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::IntFrag(_) | Op::SplitOk(_) | Op::Frag(_) | Op::FragOk(_)
             | Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_) | Op::Lo | Op::Hi => {
-                bail!("node {} is {:?}, which the tracer does not build", id, node.op)
+                bail!("node {} is {:?}: resolve the fork configuration before evaluating", id, node.op)
             }
         };
         Ok(v)
@@ -233,7 +227,7 @@ mod tests {
         let out = d.sel_num(&gt, &sum, &x);
 
         let cells = [Conc::Num(three), Conc::Num(four)];
-        let env = Env { cells: &cells, frees: &[false; 6], cart: None, cache: None };
+        let env = Env { cells: &cells, cart: None, cache: None };
         assert_eq!(eval(&d.graph, out, &env).unwrap(), Conc::Num(P8::from_i16(7)));
 
         let (a, b) = (d.num(three), d.num(four));
@@ -242,16 +236,17 @@ mod tests {
     }
 
     #[test]
-    fn a_free_choice_is_a_leaf_like_any_other() {
+    fn a_button_is_a_fork_evaluated_per_configuration() {
         let mut d = super::super::domain::Symbolic::default();
         let f = d.unknown_bool().unwrap();
         let (t, e) = (d.num(P8::from_i16(1)), d.num(P8::from_i16(0)));
         let out = d.sel_num(&f, &t, &e);
-        for (bit, want) in [(true, 1i16), (false, 0)] {
-            let mut frees = [false; 6];
-            frees[0] = bit;
-            let env = Env { cells: &[], frees: &frees, cart: None, cache: None };
-            assert_eq!(eval(&d.graph, out, &env).unwrap(), Conc::Num(P8::from_i16(want)));
+        let env = Env { cells: &[], cart: None, cache: None };
+        assert!(eval(&d.graph, out, &env).is_err(), "an unresolved fork has no one value");
+        for (c, want) in [(1u8, 1i16), (0, 0)] {
+            let mut g = d.graph.like();
+            let map = d.graph.specialize_subset_into(&[c], None, None, &mut g);
+            assert_eq!(eval(&g, map[out as usize], &env).unwrap(), Conc::Num(P8::from_i16(want)));
         }
     }
 }

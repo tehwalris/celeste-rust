@@ -76,6 +76,12 @@ pub enum ForkKind {
     Table,
 }
 
+/// The origin (`Symbolic::fork_origins`) of the forks `Domain::unknown_bool`
+/// mints: the cart's `__new_unknown_boolean`, i.e. the six buttons, in the
+/// order `__reset_button_states` asks for them - which is how an oracle that
+/// sets the buttons concretely finds them (`verify::at_buttons`).
+pub const UNKNOWN_BOOL_ORIGIN: &str = "__new_unknown_boolean";
+
 /// HOW a fork partitions its value's set - the one thing that differs between
 /// the forks a trace takes (plans/graph-model.md section 3). A configuration
 /// index becomes a value by this rule.
@@ -460,12 +466,8 @@ impl Domain for Concrete {
 #[derive(Default, Clone)]
 pub struct Symbolic {
     pub graph: Graph,
-    /// How many free choices have been handed out. `__reset_button_states`
-    /// asks for six, in slot order, which is what makes these line up with
-    /// the kb0..kb5 the kernels already speak.
-    pub frees: u8,
-    /// How many FORK choices have been handed out this frame: the fork ids,
-    /// beside the six buttons.
+    /// How many FORK choices have been handed out this frame: the fork ids.
+    /// The six buttons are among them (`unknown_bool`).
     pub forks: u8,
     /// The arity of the `move` fork for the set being traced (see
     /// `Domain::move_ways`); `trace_frame` sets it from the widen mode.
@@ -694,7 +696,7 @@ impl Symbolic {
                 Op::UnknownNum | Op::UnknownBool(_) => true,
                 Op::Split(_) | Op::SplitTab(_) | Op::SplitKeyTab(_) | Op::Frag(_) => true,
                 Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi => false,
-                Op::ConstBool(_) | Op::Free(_) | Op::Known => false,
+                Op::ConstBool(_) | Op::Known => false,
                 // THE CONDITION DOES NOT MAKE THE RESULT A SET. `Sel(c, 5, 7)`
                 // is one of two exact numbers whatever `c` is; that a lane may
                 // take either arm is a BRANCHING question, answered by forking
@@ -754,8 +756,6 @@ impl Symbolic {
                 Op::ConstBool(_) => false,
                 Op::Const(lo, hi) => lo != hi,
                 Op::Cell(c) => ival.contains(&c),
-                // Resolved to a constant per body, so decided.
-                Op::Free(_) => false,
                 // The genuinely unknown atoms.
                 Op::UnknownNum | Op::UnknownBool(_) => true,
                 // A span exists because its bounds are different nodes.
@@ -952,16 +952,24 @@ impl Symbolic {
     }
 
     /// A boolean every lane holds in BOTH values: a 2-way fork with no
-    /// validity (every configuration applies to every lane), `choice > 0` over
-    /// the whole grid - the held buttons' fork (`widen::fork_held_inputs`).
+    /// validity (every configuration applies to every lane), `choice > 0` -
+    /// the buttons (`unknown_bool`), the held trails
+    /// (`widen::fork_held_inputs`) and the escaped atoms (`escaped_atom`).
     ///
     /// An `Ints` fork over a CONSTANT, so it goes through `fork` like the
-    /// rest; `Partition::Ints { memo: false }` because the two held trails are
+    /// rest; `Partition::Ints { memo: false }` because two such booleans are
     /// independent and must not share one choice even though the operand node
     /// is the same for both (see `Partition`). The validity is dropped rather
     /// than ignored: every configuration applies to every lane.
+    ///
+    /// The constant is `[0, one grid step]`: exactly TWO points of the fork
+    /// grid at every rung (`Graph::fork_bits`), so the derived coverage
+    /// premise `SplitOk(2)` folds true and the fragments to `0` and the step.
+    /// Over `[0, 1]` that held at rem Bits(0) only: on a finer grid the
+    /// literal spans more cells than two ways cover, and every lane declined.
     pub fn both_values(&mut self, origin: &str) -> NodeId {
-        let choices = self.graph.leaf(Op::Const(0, 1 << 16));
+        let step = 1i32 << (16 - self.graph.fork_bits() as i32);
+        let choices = self.graph.leaf(Op::Const(0, step));
         let f = self.fork(&choices, Partition::Ints { ways: 2, memo: false }, origin);
         let zero = self.graph.leaf(Op::Const(0, 0));
         self.graph.fold(Op::Gt, vec![f.value, zero])
@@ -1064,7 +1072,7 @@ impl Symbolic {
         self.graph.leaf(Op::UnknownBool(k))
     }
 
-    /// Does no lane's data reach `n` - no input cell, button or fork?
+    /// Does no lane's data reach `n` - no input cell or fork?
     pub fn lane_independent(&mut self, n: NodeId) -> bool {
         let mut stack: Vec<(NodeId, bool)> = vec![(n, false)];
         while let Some((x, expanded)) = stack.pop() {
@@ -1074,7 +1082,7 @@ impl Symbolic {
             let node = self.graph.get(x);
             let dependent = matches!(
                 node.op,
-                Op::Cell(_) | Op::Free(_) | Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_)
+                Op::Cell(_) | Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_)
             );
             if dependent || node.args.is_empty() {
                 self.lane_memo.insert(x, !dependent);
@@ -1333,13 +1341,10 @@ impl Domain for Symbolic {
     fn range_num(&mut self, lo: P8, hi: P8) -> Result<NodeId> {
         Ok(self.graph.leaf(Op::Const(lo.as_raw_u32() as i32, hi.as_raw_u32() as i32)))
     }
+    /// A button (`__reset_button_states` asks for six): a fork like any
+    /// other, whose two configurations every lane takes (`both_values`).
     fn unknown_bool(&mut self) -> Result<NodeId> {
-        if self.frees >= 6 {
-            bail!("more than six free choices - the kernels only model six buttons");
-        }
-        let b = self.frees;
-        self.frees += 1;
-        Ok(self.graph.leaf(Op::Free(b)))
+        Ok(self.both_values(UNKNOWN_BOOL_ORIGIN))
     }
     fn node_count(&self) -> usize {
         self.graph.len()

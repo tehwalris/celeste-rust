@@ -1230,7 +1230,7 @@ fn spd_table_node(
     }
     // The RELATIVE fork: its arity is the most buckets one lane can cross
     // (a lane lies within one piece), not every bucket the range reaches;
-    // a button rep's own pieces refine it (`lower::specialize_frame`).
+    // a configuration's own pieces refine it (`lower::specialize_frame`).
     let arity = pieces
         .iter()
         .map(|p| crossed.iter().filter(|(lo, hi)| (*lo as i64) <= p.1 && (*hi as i64) >= p.0).count())

@@ -1900,11 +1900,9 @@ fn dump_kernel(
         let mine: Vec<&crate::trace::emit::AsmBody> = bodies.iter().filter(|b| b.outcome == oi).collect();
         let Some(first) = mine.first() else { continue };
         let enumerated: Vec<usize> = (0..first.splits.len()).filter(|&d| mine.iter().any(|b| b.splits[d] != first.splits[d])).collect();
-        let reps: std::collections::BTreeSet<u8> = mine.iter().map(|b| b.frees).collect();
         eprintln!(
-            "[kernel dump]   outcome {oi}: {} bodies over {} button reps, forks enumerated {:?}, {} fields",
+            "[kernel dump]   outcome {oi}: {} bodies, forks enumerated {:?}, {} fields",
             mine.len(),
-            reps.len(),
             enumerated,
             r.bound.outcomes[oi].outputs.len()
         );
@@ -2008,7 +2006,7 @@ fn dump_kernel(
         }
     }
     // CELESTE_KERNEL_SPLIT=1: per outcome and per fork its bodies enumerate, up
-    // to 20 body pairs that differ ONLY in that fork (same button rep), how many
+    // to 20 body pairs that differ ONLY in that fork, how many
     // fields differ, and how many of those are `Sel(c, x, y)` with one arm the
     // other body's value - what splitting the body on `c` and fusing would take
     // away.
@@ -2021,7 +2019,7 @@ fn dump_kernel(
                 let (mut pairs, mut differing, mut sel_else_other) = (0usize, 0usize, 0usize);
                 'pairs: for (i, a) in mine.iter().enumerate() {
                     for b in &mine[i + 1..] {
-                        let one_fork = a.frees == b.frees && a.splits.iter().zip(&b.splits).enumerate().all(|(x, (p, q))| (x == d) != (p == q));
+                        let one_fork = a.splits.iter().zip(&b.splits).enumerate().all(|(x, (p, q))| (x == d) != (p == q));
                         if !one_fork {
                             continue;
                         }
@@ -2058,19 +2056,13 @@ fn dump_kernel(
             }
         }
     }
-    // CELESTE_KERNEL_DIFF=<outcome>: two of its bodies with the same button rep
-    // whose fork configurations differ in ONE fork, and where their fields
-    // differ, walked down to the nodes that actually diverge.
-    // `<outcome>`: the two bodies differ in one fork; `<outcome>:<bit>`: in that
-    // button alone, forks equal (bits 0..5 = left, right, up, down, jump, dash).
+    // CELESTE_KERNEL_DIFF=<outcome>: two of its bodies whose fork
+    // configurations differ in ONE fork (a button is a fork), and where their
+    // fields differ, walked down to the nodes that actually diverge.
+    // `<outcome>@<fork>`: one fork apart, in that fork.
     if let Some(spec) = std::env::var("CELESTE_KERNEL_DIFF").ok() {
-        // `<outcome>@<fork>`: one fork apart, in that fork.
-        let (spec, only_fork) = match spec.split_once('@') {
-            Some((s, f)) => (s.to_string(), f.parse::<usize>().ok()),
-            None => (spec.clone(), None),
-        };
-        let (want, button) = match spec.split_once(':') {
-            Some((o, b)) => (o.parse::<usize>().ok(), b.parse::<u8>().ok()),
+        let (want, only_fork) = match spec.split_once('@') {
+            Some((s, f)) => (s.parse::<usize>().ok(), f.parse::<usize>().ok()),
             None => (spec.parse::<usize>().ok(), None),
         };
         let want = want.unwrap_or(usize::MAX);
@@ -2078,25 +2070,19 @@ fn dump_kernel(
         let pair = mine.iter().enumerate().find_map(|(i, a)| {
             mine[i + 1..]
                 .iter()
-                .find(|b| match button {
-                    Some(bit) => a.splits == b.splits && a.frees ^ b.frees == 1 << bit,
-                    None => {
-                        let apart: Vec<usize> = a.splits.iter().zip(&b.splits).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| i).collect();
-                        a.frees == b.frees && apart.len() == 1 && only_fork.is_none_or(|f| apart[0] == f)
-                    }
+                .find(|b| {
+                    let apart: Vec<usize> = a.splits.iter().zip(&b.splits).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| i).collect();
+                    apart.len() == 1 && only_fork.is_none_or(|f| apart[0] == f)
                 })
                 .map(|b| (*a, *b))
         });
         match pair {
-            None => eprintln!("[kernel diff] outcome {want}: no two bodies differ in exactly {}", if button.is_some() { "that button" } else { "one fork" }),
+            None => eprintln!("[kernel diff] outcome {want}: no two bodies differ in exactly one fork"),
             Some((a, b)) => {
-                let what = match button {
-                    Some(bit) => format!("button bit {bit}, reps {:#08b} against {:#08b}", a.frees, b.frees),
-                    None => {
-                        let d = a.splits.iter().zip(&b.splits).position(|(x, y)| x != y).unwrap_or(0);
-                        let origin = r.frame.fork_origins.iter().find(|(x, _)| *x as usize == d).map_or("-", |(_, o)| o.as_str());
-                        format!("button rep {}: fork {d} ({origin}) = {} against {}", a.frees, a.splits[d], b.splits[d])
-                    }
+                let what = {
+                    let d = a.splits.iter().zip(&b.splits).position(|(x, y)| x != y).unwrap_or(0);
+                    let origin = r.frame.fork_origins.iter().find(|(x, _)| *x as usize == d).map_or("-", |(_, o)| o.as_str());
+                    format!("fork {d} ({origin}) = {} against {}", a.splits[d], b.splits[d])
                 };
                 let nf = r.bound.outcomes[want].outputs.len();
                 let differing: Vec<usize> = (0..nf).filter(|&j| a.roots[j] != b.roots[j]).collect();

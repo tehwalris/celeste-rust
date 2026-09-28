@@ -37,7 +37,10 @@ One frame from a node:
    ranges: 11-way at S=5, 13-way at S=6.
 2. **Copy the cone** of every outcome's `live`, `ok`, position and fields out
    of the arena, with three substitutions:
-   - `Free(b)` becomes an extra input cell, seeded unknown.
+   - A fork over a literal (a button, `Symbolic::both_values`) stands for
+     its whole literal: its `choice > 0` is unknown. (Before 2026-09-28 the
+     buttons were `Free(b)` leaves, copied as extra input cells seeded
+     unknown.)
    - `Known(..)` becomes true: it is the kernels' premise that a select reads
      a decided condition, and this evaluator JOINS undecided selects instead,
      which is sound.

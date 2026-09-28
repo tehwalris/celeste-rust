@@ -27,7 +27,7 @@
 //! ## What counts as an atom
 //!
 //! Everything that is not `And`, `Or`, `Not`, `ConstBool` or a `Sel`
-//! between booleans: comparisons, `TileFlagAt`, `Known`, `Free`, boolean
+//! between booleans: comparisons, `TileFlagAt`, `Known`, boolean
 //! input cells. Atoms are treated as INDEPENDENT free variables, which is
 //! the source of this analysis's incompleteness and also of its
 //! soundness:
@@ -212,7 +212,6 @@ fn inherently_bool(op: &Op) -> bool {
             | Op::Known
             | Op::SplitValid(_)
             | Op::SplitOk(_)
-            | Op::Free(_)
             | Op::Lt
             | Op::Le
             | Op::Gt

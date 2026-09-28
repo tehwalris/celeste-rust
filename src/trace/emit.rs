@@ -297,12 +297,11 @@ pub fn asm_input_reprs(
     Ok(reprs)
 }
 
-/// One fused (specialized) body: which outcome it belongs to, the choices
-/// it resolved, and its roots in the FUSED graph - the outcome's output
+/// One fused (specialized) body: which outcome it belongs to, the fork
+/// configuration it resolved (the buttons among the forks), and its roots in the FUSED graph - the outcome's output
 /// field nodes in order, then `error`, then `live`.
 pub struct AsmBody {
     pub outcome: usize,
-    pub frees: u8,
     pub splits: Vec<u8>,
     /// `outputs.len() + 2 + keys` nodes: fields..., error, live, key nodes...
     pub roots: Vec<NodeId>,
@@ -311,9 +310,9 @@ pub struct AsmBody {
 /// The FUSED ASM graph, its bodies, the flat root list, and the input
 /// reprs for a bound frame.
 ///
-/// `lower::specialize_frame` resolves every (button, fork) configuration
-/// into ONE shared, hash-consed graph - `Free` -> constant, `Split` ->
-/// `Frag` - so the result holds only ordinary ops the codegen lowers. The
+/// `lower::specialize_frame` resolves every fork configuration into ONE
+/// shared, hash-consed graph - `Split` -> `Frag`, a button's fork -> a
+/// constant - so the result holds only ordinary ops the codegen lowers. The
 /// row key is not in the graph: the ASM path computes it in Rust from the
 /// output cells (`Rt2::boundary`, the one definition of the key).
 ///
@@ -370,9 +369,9 @@ fn asm_fused_of(
 )> {
     let mut flat_roots = Vec::new();
     let mut bodies = Vec::with_capacity(raw_bodies.len());
-    for (outcome, frees, splits, roots) in raw_bodies {
+    for (outcome, splits, roots) in raw_bodies {
         flat_roots.extend(roots.iter().copied());
-        bodies.push(AsmBody { outcome, frees, splits, roots });
+        bodies.push(AsmBody { outcome, splits, roots });
     }
     let reprs = asm_input_reprs(bound)?;
     Ok((fused, bodies, flat_roots, reprs))

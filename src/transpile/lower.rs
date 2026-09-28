@@ -1,7 +1,7 @@
 //! Graph -> the fused, fork-free frame (`plans/multi-output-fusion.md`).
 //!
 //! The tracer's walk records what each value MEANS as a node in
-//! `transpile::graph`; `specialize_frame` resolves every (button, fork)
+//! `transpile::graph`; `specialize_frame` resolves every fork
 //! configuration of that graph into ONE hash-consed arena, and
 //! `lower_outcomes` reads the per-outcome constants the kernel needs off
 //! the result. The ASM backend (`trace::emit::asm_fused`) assembles the
@@ -79,21 +79,57 @@ pub(crate) struct Outcome {
 
 /// Specialize a traced frame's graph into ONE fused, hash-consed arena.
 ///
-/// Every (button, fork configuration) is resolved: `Free` becomes a
-/// constant and `Split`/`SplitValid` become `Frag`/`FragOk` (ordinary
-/// unary ops), so NO fork node survives and configurations that agree
-/// share nodes ("duplicate, then fuse again"). Steps 1-4 of the frame
-/// lowering. Returns the fused graph and one body per DISTINCT (outcome,
-/// roots): `(outcome, frees, splits, roots)`, where `roots` is that
-/// outcome's fields in order, then `error`, then `live`, then its key
-/// nodes (`Outcome::keys`), as node ids in the fused graph.
+/// Every fork configuration is resolved: `Split`/`SplitValid`/`SplitInt`
+/// and the table forks become `Frag`/`FragOk`/`IntFrag` and select chains
+/// (ordinary ops), so NO fork node survives and configurations that agree
+/// share nodes ("duplicate, then fuse again"). The six buttons are forks
+/// like any other (`Symbolic::both_values`): a configuration of theirs is a
+/// set of inputs, and it folds them to constants. Returns the fused graph
+/// and one body per DISTINCT (outcome, row): `(outcome, splits, roots)`,
+/// where `roots` is that outcome's fields in order, then `error`, then
+/// `live`, then its key nodes (`Outcome::keys`), as node ids in the fused
+/// graph.
 ///
 /// This is the SINGLE source of the specialized compute: the AVX-512
 /// backend assembles it (`trace::emit::asm_fused`) and `lower_outcomes`
 /// reads the per-outcome constants off it, so both see byte-for-byte the
 /// same thing - there is no parallel specialization.
-/// One specialized body: `(outcome, frees, splits, roots)`.
-pub(crate) type SpecializedBody = (usize, u8, Vec<u8>, Vec<NodeId>);
+/// One specialized body: `(outcome, splits, roots)` - `splits` the fragment
+/// per fork (`graph::ANY_VALID` for a dead one; 0 for a fork outside the
+/// outcome's cone).
+pub(crate) type SpecializedBody = (usize, Vec<u8>, Vec<NodeId>);
+
+/// Per fork, a table fork's arity and the entries a configuration's lanes
+/// can reach (`Graph::specialize_subset_into`'s `tabs`).
+type Tabs = Vec<(u8, Vec<(i32, i32)>)>;
+
+/// `want`'s images under the configuration `cfg`, specialized into `out`.
+fn roots_under(graph: &Graph, cfg: &[u8], tabs: &Tabs, need: &[bool], want: &[NodeId], out: &mut Graph) -> Vec<NodeId> {
+    let map = graph.specialize_subset_into(cfg, Some(tabs), Some(need), out);
+    want.iter().map(|r| map[*r as usize]).collect()
+}
+
+/// The roots of each configuration of `cfgs` DECIDED (the interval fold with
+/// the region's ranges and the map), in one fresh arena so equal results are
+/// one node: a test of the player against one world's platform folds only
+/// with the ranges, and before that every world is a different node.
+fn decided_roots(
+    graph: &Graph,
+    cfgs: &[Vec<u8>],
+    (tabs, need, want): (&Tabs, &[bool], &[NodeId]),
+    room: Option<&crate::transpile::graph::Room>,
+    ranges: &std::collections::HashMap<u32, (i32, i32)>,
+) -> Vec<Vec<NodeId>> {
+    let mut probe = graph.like();
+    let mut decided = graph.like();
+    cfgs.iter()
+        .map(|c| {
+            let sig = roots_under(graph, c, tabs, need, want, &mut probe);
+            let (dm, _) = crate::transpile::ival::fold_with_into(&probe, &sig, room, ranges, &mut decided).expect("interval fold");
+            sig.iter().map(|r| dm[*r as usize]).collect()
+        })
+        .collect()
+}
 
 pub(crate) fn specialize_frame(
     graph: &Graph,
@@ -120,15 +156,23 @@ pub(crate) fn specialize_frame(
         forks.into_iter().collect()
     };
 
-    // --- 2. specialize, per outcome, over (button, its own forks) ---
+    // --- 2. per outcome, its configurations ---
+    //
+    // The forks in the outcome's cone are resolved ONE AT A TIME, in fork
+    // order, with the later ones left standing (`graph::OPEN`), and a
+    // configuration is kept only where its roots differ from every one kept
+    // before it at that step. Resolving is substitution, and substitution
+    // preserves equality, so two configurations that agree with the rest
+    // standing agree in every completion, and one of them is all the kernel
+    // needs. This is what folds the buttons' 64 assignments to the ones
+    // that differ (left and right together being neither, a jump nothing
+    // can take being no jump), and it does the same for every other fork.
     let mut sp = graph.like();
-    // (outcome, button, fork configuration, roots) where roots is the
-    // outcome's fields in order, then `error`, then `live`.
     let mut cands: Vec<SpecializedBody> = Vec::new();
-    // The table forks' operands, per fork: how many fragments a button
-    // rep's lanes can need, and which entries they can reach, is decided
-    // from the operand's range under that rep (`ranges`: the bucket
-    // dispatch's specialization).
+    // The table forks' operands, per fork: how many fragments a
+    // configuration's lanes can need, and which entries they can reach, is
+    // decided from the operand's range under the forks resolved before it
+    // (`ranges`: the bucket dispatch's specialization).
     let fork_operands: Vec<Vec<NodeId>> = (0..forks)
         .map(|d| {
             (0..graph.len() as NodeId)
@@ -143,178 +187,157 @@ pub(crate) fn specialize_frame(
         want.push(*live);
         want.extend(keys.iter().copied());
         // An outcome reaches a fraction of the graph, and mapping the
-        // whole arena once per (button, configuration) is most of the
-        // work and none of the answer.
+        // whole arena once per configuration is most of the work and none
+        // of the answer.
         let need = reachable(graph, &want);
         let bits = bits_of(&need);
-        // Buttons first, with the forks left standing. If two
-        // assignments agree before the forks are resolved they agree
-        // after - resolving is substitution, and substitution preserves
-        // equality - so this prunes the product soundly, and cheaply
-        // enough to be worth a separate pass.
-        let reps: Vec<u8> = {
-            let mut probe = graph.like();
-            let mut seen: BTreeMap<Vec<NodeId>, u8> = BTreeMap::new();
-            for m in 0u8..64 {
-                let map = graph.specialize_subset_into(m, None, None, Some(&need), &mut probe);
-                let sig: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
-                seen.entry(sig).or_insert(m);
-            }
-            let mut v: Vec<u8> = seen.into_values().collect();
-            v.sort_unstable();
-            v
-        };
-        let mut total_cfgs = 0u64;
-        // The most fragments one rep enumerates per fork (for the trace).
+        // The forks whose validity the outcome reads.
+        let validity_read: std::collections::BTreeSet<u8> = (0..graph.len())
+            .filter(|&n| need[n])
+            .filter_map(|n| match graph.get(n as NodeId).op {
+                Op::SplitValid(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        // Every configuration's roots land in ONE arena, so a comparison of
+        // roots is a comparison of node ids. The forks outside the cone are
+        // unread: 0.
+        let mut probe = graph.like();
+        let mut root_cfg = vec![0u8; forks as usize];
+        for &d in &bits {
+            root_cfg[d as usize] = crate::transpile::graph::OPEN;
+        }
+        let root_tabs: Tabs = vec![(0, Vec::new()); forks as usize];
+        let map0 = graph.specialize_subset_into(&root_cfg, Some(&root_tabs), Some(&need), &mut probe);
+        // The seeded cells, by node in `probe` (a cell is the same node under
+        // every configuration).
+        let seeds: std::collections::HashMap<NodeId, (i64, i64)> = (0..graph.len() as NodeId)
+            .filter(|&n| need[n as usize])
+            .filter_map(|n| match graph.get(n).op {
+                Op::Cell(c) => ranges.get(&c).map(|(lo, hi)| (map0[n as usize], (*lo as i64, *hi as i64))),
+                _ => None,
+            })
+            .collect();
+        let mut memo = std::collections::HashMap::new();
+        let mut classes: Vec<(Vec<u8>, Tabs)> = vec![(root_cfg, root_tabs)];
+        // The most fragments one configuration enumerates per fork (for the
+        // trace).
         let mut ways_max = vec![0u8; bits.len()];
-        for m in reps.iter().copied() {
-            let mut probe = graph.like();
-            let map = graph.specialize_subset_into(m, None, None, Some(&need), &mut probe);
-            // The seeded cells, by node, in the rep's graph.
-            let seeds: std::collections::HashMap<NodeId, (i64, i64)> = (0..probe.len() as NodeId)
-                .filter_map(|n| match probe.get(n).op {
-                    Op::Cell(c) => ranges.get(&c).map(|(lo, hi)| (n, (*lo as i64, *hi as i64))),
-                    _ => None,
-                })
-                .collect();
-            let mut memo = std::collections::HashMap::new();
-            // Per table fork, what THIS rep's lanes can need: the entries its
-            // operand's pieces reach, and the most entries one piece crosses
-            // - the arity (a lane's interval lies within one piece). The
-            // fork is resolved with exactly these, so `SplitOkTab` checks
-            // the arity the configurations enumerate: a lane the analysis
-            // got wrong declines, it is never dropped.
-            let mut tabs: Vec<(u8, Vec<(i32, i32)>)> = vec![(0, Vec::new()); forks as usize];
-            for &d in &bits {
-                let table = graph.fork_table(d);
-                if table.is_empty() {
-                    continue;
-                }
-                let mut reach = vec![false; table.len()];
-                let mut arity = 0usize;
-                let mut known = true;
-                for &operand in &fork_operands[d as usize] {
-                    let mapped = map[operand as usize];
-                    if mapped == NodeId::MAX || !need[operand as usize] {
-                        continue;
-                    }
-                    match crate::transpile::graph::pieces_of(&probe, &seeds, &mut memo, mapped) {
-                        None => known = false,
-                        Some(ps) => {
-                            for p in &ps {
-                                let mut n = 0usize;
-                                for (c, (tlo, thi)) in table.iter().enumerate() {
-                                    if (*tlo as i64) <= p.1 && (*thi as i64) >= p.0 {
-                                        reach[c] = true;
-                                        n += 1;
+        for (i, &d) in bits.iter().enumerate() {
+            let table = graph.fork_table(d);
+            let mut next: Vec<(Vec<u8>, Tabs)> = Vec::new();
+            let mut seen: std::collections::HashSet<Vec<NodeId>> = Default::default();
+            for (cfg, mut tabs) in classes {
+                // A table fork: what THIS configuration's lanes can need -
+                // the entries its operand's pieces reach, and the most
+                // entries one piece crosses, the arity (a lane's interval
+                // lies within one piece). The fork is resolved with exactly
+                // these, so `SplitOkTab` checks the arity the configurations
+                // enumerate: a lane the analysis got wrong declines, it is
+                // never dropped.
+                if !table.is_empty() {
+                    let map = graph.specialize_subset_into(&cfg, Some(&tabs), Some(&need), &mut probe);
+                    let mut reach = vec![false; table.len()];
+                    let mut arity = 0usize;
+                    let mut known = true;
+                    for &operand in &fork_operands[d as usize] {
+                        if !need[operand as usize] {
+                            continue;
+                        }
+                        match crate::transpile::graph::pieces_of(&probe, &seeds, &mut memo, map[operand as usize]) {
+                            None => known = false,
+                            Some(ps) => {
+                                for p in &ps {
+                                    let mut n = 0usize;
+                                    for (c, (tlo, thi)) in table.iter().enumerate() {
+                                        if (*tlo as i64) <= p.1 && (*thi as i64) >= p.0 {
+                                            reach[c] = true;
+                                            n += 1;
+                                        }
                                     }
+                                    arity = arity.max(n);
                                 }
-                                arity = arity.max(n);
                             }
                         }
                     }
+                    tabs[d as usize] = if known && arity > 0 {
+                        (arity as u8, table.iter().zip(&reach).filter(|(_, r)| **r).map(|(e, _)| *e).collect())
+                    } else {
+                        (graph.fork_ways(d), table.to_vec())
+                    };
                 }
-                tabs[d as usize] = if known && arity > 0 {
-                    (arity as u8, table.iter().zip(&reach).filter(|(_, r)| **r).map(|(e, _)| *e).collect())
-                } else {
-                    (graph.fork_ways(d), table.to_vec())
+                // Move and button forks keep their traced arity
+                // (`Domain::flr_ways`, `Symbolic::both_values`), which their
+                // `SplitOk` premise checks.
+                let ways = if table.is_empty() { graph.fork_ways(d) } else { tabs[d as usize].0 };
+                ways_max[i] = ways_max[i].max(ways);
+                let with = |v: u8| {
+                    let mut c = cfg.clone();
+                    c[d as usize] = v;
+                    c
                 };
-            }
-            // Move forks keep their traced arity (`Domain::flr_ways`: from
-            // the same ranges, and button-independent - `move` runs before
-            // `update`), which their `SplitOk` premise checks.
-            let valid: Vec<u8> = bits
-                .iter()
-                .map(|&d| if graph.fork_table(d).is_empty() { graph.fork_ways(d) } else { tabs[d as usize].0 })
-                .collect();
-            for (i, n) in valid.iter().enumerate() {
-                ways_max[i] = ways_max[i].max(*n);
-            }
-            // PER FORK, ITS VALUES THAT AGREE: each value resolved with every
-            // other fork left standing (`graph::OPEN`), and one kept of those
-            // whose roots come out the same - they agree whatever the other
-            // forks take, resolving being substitution, as the button reps
-            // above. Built for a 128-way fork over the platform worlds (since
-            // replaced by deciding per world at compile time,
-            // `verify::Points`), which from one region mostly looked alike.
-            let values: Vec<Vec<u8>> = bits
-                .iter()
-                .enumerate()
-                .map(|(i, &d)| {
-                    // A DEAD fork: every fragment gives the same fields,
-                    // keys and error, and the same `live` once the fork's own
-                    // validity is set aside - it is taken once, validity true
-                    // (`graph::ANY_VALID`): the OR of its fragments'
-                    // validities is the lane covered. Room (6,0)'s no-player
-                    // frames move all ten platforms through a floor fork each
-                    // and then widen where they stand: 1024 configurations of
-                    // one row per outcome (2026-09-28). Grid forks only.
-                    if graph.fork_table(d).is_empty() && valid[i] >= 2 {
-                        let mut probe = graph.like();
-                        let mut decided = graph.like();
-                        let mut sigs: std::collections::BTreeSet<Vec<NodeId>> = Default::default();
-                        for v in 0..valid[i] {
-                            let mut cfg = vec![crate::transpile::graph::OPEN; forks as usize];
-                            cfg[d as usize] = v | crate::transpile::graph::ANY_VALID;
-                            let map = graph.specialize_subset_into(m, Some(&cfg), Some(&tabs), Some(&need), &mut probe);
-                            let mut sig: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
-                            if decide {
-                                let (dm, _) = crate::transpile::ival::fold_with_into(&probe, &sig, room, ranges, &mut decided).expect("interval fold");
-                                sig = sig.iter().map(|r| dm[*r as usize]).collect();
-                            }
-                            sigs.insert(sig);
-                        }
-                        if sigs.len() == 1 {
-                            return vec![crate::transpile::graph::ANY_VALID];
-                        }
+                let this = (&tabs, need.as_slice(), want.as_slice());
+                // The children, each with its roots.
+                let mut kids: Vec<(Vec<u8>, Vec<NodeId>)> = Vec::new();
+                let plain: Vec<Vec<u8>> = (0..ways).map(with).collect();
+                let mut raw: Option<Vec<Vec<NodeId>>> = None;
+                // A DEAD fork: every fragment gives the same fields, keys and
+                // error, and the same `live` once the fork's own validity is
+                // set aside - it is taken once, validity true
+                // (`graph::ANY_VALID`): the OR of its fragments' validities
+                // is the lane covered. Room (6,0)'s no-player frames move all
+                // ten platforms through a floor fork each and then widen
+                // where they stand: 1024 configurations of one row per
+                // outcome (2026-09-28). Grid forks only. A fork whose
+                // validity the outcome does not read (a button has none) has
+                // nothing to set aside: its plain values are the probe.
+                if table.is_empty() && ways >= 2 {
+                    let any: Vec<Vec<u8>> = (0..ways).map(|v| with(v | crate::transpile::graph::ANY_VALID)).collect();
+                    let reads_validity = validity_read.contains(&d);
+                    let probed: Vec<Vec<NodeId>> =
+                        (if reads_validity { &any } else { &plain }).iter().map(|c| roots_under(graph, c, &tabs, &need, &want, &mut probe)).collect();
+                    let dead = probed.iter().all(|r| *r == probed[0])
+                        || (decide && {
+                            let dec = decided_roots(graph, if reads_validity { &any } else { &plain }, this, room, ranges);
+                            dec.iter().all(|r| *r == dec[0])
+                        });
+                    if dead {
+                        kids.push((any[0].clone(), probed[0].clone()));
+                    } else if !reads_validity {
+                        raw = Some(probed);
                     }
-                    if valid[i] <= 2 {
-                        return (0..valid[i]).collect();
-                    }
-                    // Compared DECIDED, when the body is (`decide`): a test of
-                    // the player against one world's platform folds only
-                    // with the region's ranges, and before that every world
-                    // is a different node.
-                    let mut probe = graph.like();
-                    let mut decided = graph.like();
-                    let mut seen: BTreeMap<Vec<NodeId>, u8> = BTreeMap::new();
-                    for v in 0..valid[i] {
-                        let mut cfg = vec![crate::transpile::graph::OPEN; forks as usize];
-                        cfg[d as usize] = v;
-                        let map = graph.specialize_subset_into(m, Some(&cfg), Some(&tabs), Some(&need), &mut probe);
-                        let mut sig: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
-                        if decide {
-                            let (dm, _) = crate::transpile::ival::fold_with_into(&probe, &sig, room, ranges, &mut decided).expect("interval fold");
-                            sig = sig.iter().map(|r| dm[*r as usize]).collect();
-                        }
-                        seen.entry(sig).or_insert(v);
-                    }
-                    let mut v: Vec<u8> = seen.into_values().collect();
-                    v.sort_unstable();
-                    v
-                })
-                .collect();
-            let total: u64 = values.iter().map(|v| v.len() as u64).product();
-            total_cfgs += total;
-            for k in 0..total {
-                let mut cfg = vec![0u8; forks as usize];
-                let mut r = k;
-                for (i, d) in bits.iter().enumerate() {
-                    let n = values[i].len() as u64;
-                    cfg[*d as usize] = values[i][(r % n) as usize];
-                    r /= n;
                 }
-                let map = graph.specialize_subset_into(m, Some(&cfg), Some(&tabs), Some(&need), &mut sp);
-                let roots: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
-                cands.push((oi, m, cfg, roots));
+                if kids.is_empty() {
+                    let raw: Vec<Vec<NodeId>> =
+                        raw.unwrap_or_else(|| plain.iter().map(|c| roots_under(graph, c, &tabs, &need, &want, &mut probe)).collect());
+                    // PER FORK, ITS VALUES THAT AGREE, compared DECIDED when
+                    // the body is (`decide`). Built for a 128-way fork over
+                    // the platform worlds (since replaced by deciding per
+                    // world at compile time, `verify::Points`), which from
+                    // one region mostly looked alike. Two values of a 2-way
+                    // fork that agreed would have made it dead.
+                    let dec = (decide && ways > 2).then(|| decided_roots(graph, &plain, this, room, ranges));
+                    for (v, (c, r)) in plain.into_iter().zip(raw).enumerate() {
+                        if !dec.as_ref().is_some_and(|dec| dec[..v].contains(&dec[v])) {
+                            kids.push((c, r));
+                        }
+                    }
+                }
+                for (c, r) in kids {
+                    if seen.insert(r) {
+                        next.push((c, tabs.clone()));
+                    }
+                }
             }
+            classes = next;
         }
         if trace {
             let ways: Vec<u8> = bits.iter().map(|&d| graph.fork_ways(d)).collect();
-            eprintln!(
-                "[build]   outcome {oi}: forks {bits:?} traced ways {ways:?}, at most {ways_max:?} in one rep -> {total_cfgs} configurations over {} button reps",
-                reps.len()
-            );
+            eprintln!("[build]   outcome {oi}: forks {bits:?} traced ways {ways:?}, at most {ways_max:?} -> {} configurations", classes.len());
+        }
+        for (cfg, tabs) in classes {
+            let roots = roots_under(graph, &cfg, &tabs, &need, &want, &mut sp);
+            cands.push((oi, cfg, roots));
         }
     }
 
@@ -325,7 +348,7 @@ pub(crate) fn specialize_frame(
     let t1 = std::time::Instant::now();
     // --- 3. decide the boolean layer, on the RESOLVED graph ---
     if decide {
-        let all: Vec<NodeId> = cands.iter().flat_map(|c| c.3.iter().copied()).collect();
+        let all: Vec<NodeId> = cands.iter().flat_map(|c| c.2.iter().copied()).collect();
         let t_phase = std::time::Instant::now();
         let (g1, m1, _) =
             crate::transpile::ival::fold_with(&sp, &all, room, ranges).expect("interval fold");
@@ -345,7 +368,7 @@ pub(crate) fn specialize_frame(
             let mut shown = 0;
             for c in &cands {
                 let nfields = outs[c.0].0.len();
-                let (error, live) = (c.3[nfields], c.3[nfields + 1]);
+                let (error, live) = (c.2[nfields], c.2[nfields + 1]);
                 let error_true = matches!(g1.get(m1[error as usize]).op, Op::ConstBool(true));
                 let live_false = matches!(g1.get(m1[live as usize]).op, Op::ConstBool(false));
                 if !error_true || live_false || shown >= 3 {
@@ -383,7 +406,7 @@ pub(crate) fn specialize_frame(
                         }
                     }
                 }
-                eprintln!("[build]   outcome {} rep {} cfg {:?}: error folds TRUE while live; true disjuncts: {}", c.0, c.1, c.2, leaves.join(" | "));
+                eprintln!("[build]   outcome {} cfg {:?}: error folds TRUE while live; true disjuncts: {}", c.0, c.1, leaves.join(" | "));
             }
         }
         // The boolean layer, simplified locally (`bdd::simplify_local`: one
@@ -413,7 +436,7 @@ pub(crate) fn specialize_frame(
         build_add(6, t_phase);
         let mut it = r2.iter().map(|x| m3[*x as usize]);
         for c in cands.iter_mut() {
-            for r in c.3.iter_mut() {
+            for r in c.2.iter_mut() {
                 *r = it.next().expect("one decided root per root");
             }
         }
@@ -454,10 +477,10 @@ pub(crate) fn specialize_frame(
         let mut index: BTreeMap<(usize, Vec<NodeId>), usize> = BTreeMap::new();
         for c in cands {
             let nfields = outs[c.0].0.len();
-            if matches!(sp.get(c.3[nfields + 1]).op, Op::ConstBool(false)) {
+            if matches!(sp.get(c.2[nfields + 1]).op, Op::ConstBool(false)) {
                 continue;
             }
-            let row: Vec<NodeId> = c.3[..nfields].iter().chain(&c.3[nfields + 2..]).copied().collect();
+            let row: Vec<NodeId> = c.2[..nfields].iter().chain(&c.2[nfields + 2..]).copied().collect();
             match index.get(&(c.0, row.clone())) {
                 Some(&gi) => groups[gi].push(c),
                 None => {
@@ -470,19 +493,19 @@ pub(crate) fn specialize_frame(
             .into_iter()
             .map(|members| {
                 let nfields = outs[members[0].0].0.len();
-                let shared = members.iter().all(|m| m.3[nfields] == members[0].3[nfields]);
+                let shared = members.iter().all(|m| m.2[nfields] == members[0].2[nfields]);
                 let fused_error = if shared {
-                    members[0].3[nfields]
+                    members[0].2[nfields]
                 } else {
                     members.iter().fold(sp.leaf(Op::ConstBool(false)), |e, m| {
-                        let here = sp.fold(Op::And, vec![m.3[nfields + 1], m.3[nfields]]);
+                        let here = sp.fold(Op::And, vec![m.2[nfields + 1], m.2[nfields]]);
                         sp.fold(Op::Or, vec![e, here])
                     })
                 };
-                let fused_live = members.iter().skip(1).fold(members[0].3[nfields + 1], |l, m| sp.fold(Op::Or, vec![l, m.3[nfields + 1]]));
+                let fused_live = members.iter().skip(1).fold(members[0].2[nfields + 1], |l, m| sp.fold(Op::Or, vec![l, m.2[nfields + 1]]));
                 let mut b = members.into_iter().next().expect("a group has a member");
-                b.3[nfields] = fused_error;
-                b.3[nfields + 1] = fused_live;
+                b.2[nfields] = fused_error;
+                b.2[nfields + 1] = fused_live;
                 b
             })
             .collect()
@@ -493,8 +516,8 @@ pub(crate) fn specialize_frame(
 
 /// The fused bodies' constant-output analysis. For each outcome field,
 /// `konst_av` is the `AV` it holds in EVERY row: set when every body of
-/// that outcome computes the same node for it (button- and
-/// fork-independent) and that node is a compile-time constant. The ASM
+/// that outcome computes the same node for it (configuration-
+/// independent) and that node is a compile-time constant. The ASM
 /// accumulator writes such a column ONCE as `Col::U` instead of pushing
 /// it per row, and the within-chunk dedup fold skips it. Returns the
 /// number of distinct bodies (a size measure for the probes).
@@ -506,7 +529,7 @@ pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> (Graph, Vec<Spec
     let (sp, bodies) =
         specialize_frame(&e.graph, &outs_spec, e.fork_depth as u8, e.decide, e.room.as_ref(), &e.ranges);
     for (oi, o) in outs.iter_mut().enumerate() {
-        let mine: Vec<&Vec<NodeId>> = bodies.iter().filter(|b| b.0 == oi).map(|b| &b.3).collect();
+        let mine: Vec<&Vec<NodeId>> = bodies.iter().filter(|b| b.0 == oi).map(|b| &b.2).collect();
         let Some(first) = mine.first() else {
             continue;
         };

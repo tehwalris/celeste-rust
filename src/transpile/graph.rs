@@ -110,13 +110,9 @@ pub enum Op {
     /// An input cell. NOT split into uniform/per-lane: that is a derived
     /// property, computed after the graph exists.
     Cell(u32),
-    /// `Free(b)`: the outcome of free choice b - one of the six button
-    /// bits. A leaf, because nothing computes it: the search does.
-    Free(u8),
     /// `Split(d)` over one operand: that value RESTRICTED to the outcome
-    /// of split choice d. Unlike a free choice this is not a constant -
-    /// the narrowing is a real operation on the operand - but it is
-    /// eliminated by the same specialization step.
+    /// of split choice d - a real operation on the operand, eliminated by
+    /// specialization (`Graph::specialize_subset_into`).
     Split(u8),
 
     // ---- number -> number ----
@@ -198,9 +194,10 @@ pub enum Op {
     /// instead of a side channel.
     Known,
     /// `SplitValid(d)` over the same operand as `Split(d)`: which lanes
-    /// fall in the chosen outcome. This is what a free choice has no
-    /// analogue of - the outcomes of a split PARTITION the lanes, so the
-    /// primitive returns a (value, validity) pair and it is two nodes.
+    /// fall in the chosen outcome - the outcomes of a split PARTITION the
+    /// lanes, so the primitive returns a (value, validity) pair and it is
+    /// two nodes. (A fork every lane takes both ways, `Symbolic::both_values`,
+    /// drops it.)
     SplitValid(u8),
     /// `Split(d)` after specialization: fragment `c` of an interval,
     /// `c` being a CONCRETE fork configuration rather than a runtime
@@ -215,7 +212,7 @@ pub enum Op {
     /// Ordinary unary ops, which is the whole point: they intern and
     /// fold like anything else, so the configurations SHARE every node
     /// they agree on instead of the emitter running the tail of the
-    /// frame once per configuration. See `specialize_into`.
+    /// frame once per configuration. See `specialize_subset_into`.
     Frag(u8),
     FragOk(u8),
     /// A fork like `Split(d)` over an interval of WHOLE numbers whose
@@ -225,7 +222,9 @@ pub enum Op {
     /// position per configuration). Validity is `SplitValid(d)` /
     /// `FragOk(c)` and the premise `SplitOk(n)`, shared with `Split`, on
     /// the same operand - so the fork grid must be the integers (rem
-    /// Bits(0), `Level::grid_consistent`).
+    /// Bits(0), `Level::grid_consistent`). A fork over a literal
+    /// (`Symbolic::both_values`) forks one of two grid points instead, at
+    /// any grid.
     SplitInt(u8),
     IntFrag(u8),
     /// `SplitOk(n)` over the same operand: does this lane's interval span
@@ -250,7 +249,7 @@ pub enum Op {
     /// that fragments `0..arity` cover the lane. Which entry is a
     /// per-lane select chain on `Lo(v)` - data, not control flow - so
     /// the arity is what ONE lane can cross, not every entry any lane
-    /// reaches: enumerating absolute entries multiplied a button rep's
+    /// reaches: enumerating absolute entries multiplied one button input's
     /// ground, air, ice and dash images into 10 x 8 configurations of
     /// the same compute (2026-09-15, the bucket dispatch). Resolved by
     /// specialization into the ordinary ops above.
@@ -469,73 +468,50 @@ impl Graph {
         self.nodes.is_empty()
     }
 
-    /// Rebuild this graph into `out` with the button bits replaced by
-    /// constants, folding as it goes. Returns the mapping old -> new.
-    ///
-    /// This is the "duplicate, then fuse again" step: `out` is SHARED
-    /// across all 2^6 specializations and hash-consed, so two button
-    /// combinations that compute the same thing land on the SAME node ids,
-    /// and comparing their output tuples decides whether they are the same
-    /// successor state for every lane. E.g. `input` is
-    /// `Sel(right, 1, Sel(left, -1, 0))`, so with right = true the whole
-    /// thing folds to 1 whatever left is: {left,right} and {right} collapse.
-    pub fn specialize_into(&self, frees: u8, out: &mut Graph) -> Vec<NodeId> {
-        self.specialize_config_into(frees, None, out)
+    /// Is `n` a fork over a LITERAL - one every lane takes both ways
+    /// (`Symbolic::both_values`: the buttons, the held trails, the escaped
+    /// atoms), so that every configuration of it applies to every lane?
+    pub fn is_literal_fork(&self, n: NodeId) -> bool {
+        let node = self.get(n);
+        matches!(node.op, Op::Split(_) | Op::SplitInt(_)) && matches!(self.get(node.args[0]).op, Op::Const(lo, hi) if lo != hi)
     }
 
-    /// As `specialize_into`, and ALSO resolve the splits.
+    /// Rebuild this graph into `out` with the forks RESOLVED per `splits`,
+    /// over a SUBSET of the nodes, folding as it goes. Returns the mapping
+    /// old -> new.
     ///
-    /// `splits` is one bit per fork level, or `None` to leave
-    /// `Op::Split`/`Op::SplitValid` standing - which is what the walk's
-    /// kernels do, because they emit a fork as a runtime loop and their
-    /// generated form is checked in byte-for-byte.
+    /// This is the "duplicate, then fuse again" step: `out` is SHARED across
+    /// configurations and hash-consed, so two configurations that compute
+    /// the same thing land on the SAME node ids, and comparing their output
+    /// tuples decides whether they are the same successor state for every
+    /// lane. E.g. `input` is `Sel(right, 1, Sel(left, -1, 0))`, so with
+    /// right pressed the whole thing folds to 1 whatever left is: those two
+    /// configurations of the buttons' forks collapse.
     ///
-    /// Resolving a split here rather than at runtime is the same trade
-    /// as resolving a button. A `Free` becomes a CONSTANT, which is why
-    /// button assignments collapse so well; a `Split` cannot - it is a
-    /// narrowing of a runtime value, not a constant - but it does not
-    /// need to be. It needs to be ORDINARY ARITHMETIC, and `Frag` /
-    /// `FragOk` are. They intern, they fold, and every node the
-    /// configurations agree on is therefore ONE node, where the runtime
-    /// loop re-executed the whole tail of the frame per configuration.
+    /// A resolved split becomes ORDINARY ARITHMETIC (`Frag` / `FragOk` /
+    /// `IntFrag`, the table forks' select chains): it interns and folds, so
+    /// every node the configurations agree on is ONE node, and a fork over a
+    /// literal (`Symbolic::both_values`: the buttons) folds to a constant.
+    /// The cost is the nodes that genuinely differ: those are emitted once
+    /// per configuration.
     ///
-    /// The cost is the nodes that genuinely differ: those are emitted
-    /// once per configuration, so a fork early in a frame duplicates
-    /// whatever downstream of it actually depends on the fragment.
-    /// That is the trade, and it is a measurement rather than an
-    /// argument - see `plans/tracing.md`.
-    pub fn specialize_config_into(
-        &self,
-        frees: u8,
-        splits: Option<&[u8]>,
-        out: &mut Graph,
-    ) -> Vec<NodeId> {
-        self.specialize_subset_into(frees, splits, None, None, out)
-    }
-
-    /// As `specialize_config_into`, over a SUBSET of the nodes.
+    /// `splits` is the fragment per fork; an entry of `OPEN` leaves that fork
+    /// standing (what `lower::specialize_frame` groups configurations by).
     ///
     /// `need[i]` false means node `i`'s image is never read, so it is
-    /// not built. The flat fork path specializes once per (button, fork
-    /// configuration) PER OUTCOME, and an outcome reaches a fraction of
-    /// the graph - so mapping the whole arena every time is most of the
-    /// work and none of the answer. Ids only ever refer downward
-    /// (`add` appends), so a needed node's arguments are needed too and
-    /// one forward pass is enough.
+    /// not built: an outcome reaches a fraction of the graph, and mapping
+    /// the whole arena per configuration is most of the work and none of
+    /// the answer. Ids only ever refer downward (`add` appends), so a needed
+    /// node's arguments are needed too and one forward pass is enough.
+    /// Entries for unbuilt nodes are `UNBUILT`, which is not a valid id -
+    /// reading one is a bug, and it should look like one.
     ///
-    /// Entries for unbuilt nodes are `UNBUILT`, which is not a valid id
-    /// - reading one is a bug, and it should look like one.
-    ///
-    /// A `splits` entry of `OPEN` leaves that fork standing (what
-    /// `lower::specialize_frame` groups one fork's values by).
-    ///
-    /// `tabs`, per fork, overrides a table fork's arity and entries with a
-    /// button rep's own (`lower::specialize_frame`: what that rep's lanes
-    /// can reach); an empty entry list keeps the fork's.
+    /// `tabs`, per fork, overrides a table fork's arity and entries with what
+    /// the configuration's lanes can reach (`lower::specialize_frame`); an
+    /// empty entry list keeps the fork's.
     pub fn specialize_subset_into(
         &self,
-        frees: u8,
-        splits: Option<&[u8]>,
+        splits: &[u8],
         tabs: Option<&[(u8, Vec<(i32, i32)>)]>,
         need: Option<&[bool]>,
         out: &mut Graph,
@@ -553,22 +529,15 @@ impl Graph {
                 }
             }
             let arg = |map: &Vec<NodeId>, k: usize| map[node.args[k] as usize];
-            let id = match (node.op.clone(), splits) {
-                (Op::Free(b), _) => out.leaf(Op::ConstBool(frees & (1 << b) != 0)),
-                // `d` indexes a fork, and `splits` is TWO bits per fork
-                // (the fragment index, arity up to 4). It is a `u64`
-                // rather than a `u8` because room (2,0) forks 14 times
-                // and `(s >> 13) & 1` on a `u8` is always 0 - which
-                // would have silently measured 16,384 configurations
-                // as 256 distinct ones and reported the collapse as
-                // sharing. Fourth member of the shift-overflow family.
-                (Op::Split(d), Some(s)) if s[d as usize] != OPEN => out.fold(Op::Frag(s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
-                (Op::SplitValid(d), Some(s)) if s[d as usize] != OPEN && s[d as usize] & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
-                (Op::SplitValid(d), Some(s)) if s[d as usize] != OPEN => out.fold(Op::FragOk(s[d as usize]), vec![arg(&map, 0)]),
-                (Op::SplitInt(d), Some(s)) if s[d as usize] != OPEN => out.fold(Op::IntFrag(s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
+            let s = splits;
+            let id = match node.op.clone() {
+                Op::Split(d) if s[d as usize] != OPEN => out.fold(Op::Frag(s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
+                Op::SplitValid(d) if s[d as usize] != OPEN && s[d as usize] & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
+                Op::SplitValid(d) if s[d as usize] != OPEN => out.fold(Op::FragOk(s[d as usize]), vec![arg(&map, 0)]),
+                Op::SplitInt(d) if s[d as usize] != OPEN => out.fold(Op::IntFrag(s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
                 // The relative table fork (see `Op::SplitTab`): per-lane
                 // select chains on `Lo(v)` over the entries.
-                (Op::SplitTab(d), Some(s)) | (Op::SplitValidTab(d), Some(s)) | (Op::SplitKeyTab(d), Some(s)) | (Op::SplitOkTab(d), Some(s)) if s[d as usize] != OPEN => {
+                Op::SplitTab(d) | Op::SplitValidTab(d) | Op::SplitKeyTab(d) | Op::SplitOkTab(d) if s[d as usize] != OPEN => {
                     let c = s[d as usize] as usize;
                     let (arity, table) = match tabs.and_then(|t| t.get(d as usize)).filter(|t| !t.1.is_empty()) {
                         Some((k, t)) => (*k as usize, t.as_slice()),
@@ -699,10 +668,10 @@ impl Graph {
             }
             // `IntFrag(c)` of a literal interval is a constant, by `eval`'s
             // definition: the grid floor of the low end plus `c` steps, at
-            // least the low end. EXACT. The held-button fork
-            // (`widen::fork_held_inputs`) forks the literal `[0, 1]`, and
-            // folding it is what makes a body's trail, and so its `jump` /
-            // `dash`, a constant.
+            // least the low end. EXACT. A fork every lane takes both ways
+            // (`Symbolic::both_values`: the buttons, the held trails) forks
+            // a literal, and folding it is what makes a body's buttons, and
+            // so its `jump` / `dash`, constants.
             Op::IntFrag(c) if matches!(self.nodes[args[0] as usize].op, Op::Const(..)) => {
                 let Op::Const(lo, _) = self.nodes[args[0] as usize].op else { unreachable!("guarded above") };
                 let (step, mask) = self.grid();
@@ -936,54 +905,6 @@ impl Graph {
         opposite && nx.args == ny.args
     }
 
-    /// Resolve an emitted operand spelling to a node: a name the emitter
-    /// already bound, a witness field access (`u.cN` / `rin.cN`), or a
-    /// literal. Anything else is an error - silently inventing a node here
-    /// would make the graph disagree with the program it claims to model.
-    pub fn operand(&mut self, s: &str, named: &HashMap<String, NodeId>) -> Result<NodeId> {
-        if let Some(id) = named.get(s) {
-            return Ok(*id);
-        }
-        // Uniform cells read from the witness binding, per-lane columns read
-        // from the row struct, and the `let r_cN = ...` loads the emitter
-        // hoists for them. All three are the same thing to the graph: an
-        // input cell. Which of them is uniform is a DERIVED property.
-        for p in ["u.c", "rin.c", "r_c"] {
-            if let Some(rest) = s.strip_prefix(p) {
-                if let Ok(cell) = rest.parse::<u32>() {
-                    return Ok(self.leaf(Op::Cell(cell)));
-                }
-            }
-        }
-        // kb0..kb5: the free choices the suffix is specialized on.
-        if let Some(rest) = s.strip_prefix("kb") {
-            if let Ok(bit) = rest.parse::<u8>() {
-                return Ok(self.leaf(Op::Free(bit)));
-            }
-        }
-        if let Some(rest) = s.strip_prefix("P8::from_raw(") {
-            if let Some(num) = rest.strip_suffix("i32)") {
-                if let Ok(raw) = num.parse::<i32>() {
-                    return Ok(self.leaf(Op::Const(raw, raw)));
-                }
-            }
-        }
-        if let Some(rest) = s.strip_prefix("P8::from_i16(") {
-            if let Some(num) = rest.strip_suffix(')') {
-                if let Ok(v) = num.parse::<i16>() {
-                    let raw = (v as i32) << 16;
-                    return Ok(self.leaf(Op::Const(raw, raw)));
-                }
-            }
-        }
-        match s {
-            "true" => return Ok(self.leaf(Op::ConstBool(true))),
-            "false" => return Ok(self.leaf(Op::ConstBool(false))),
-            _ => {}
-        }
-        bail!("operand {:?} is not a bound name, a witness cell or a literal", s)
-    }
-
     /// Evaluate `roots` given the input cells, in one pass over the arena.
     /// Nodes are appended after their operands, so a forward sweep is a
     /// valid evaluation order.
@@ -1072,7 +993,6 @@ impl Graph {
                     let (lo, hi) = (a(0).as_num("Span")?.low, a(1).as_num("Span")?.high);
                     Val::Num(Pico8NumInterval::new(lo.min(hi), lo.max(hi)))
                 }
-                Op::Free(b) => bail!("node {}: free choice {} has no value outside a variant", i, b),
                 // A split RESTRICTS its operand, so under `lenient` the
                 // operand's own range still contains the result - which
                 // is strictly better than top and costs nothing.
@@ -1366,7 +1286,6 @@ impl Graph {
     fn top_of(op: &Op, args: &[NodeId], out: &[Val], full: Val) -> Val {
         match op {
             Op::ConstBool(_)
-            | Op::Free(_)
             | Op::SplitValid(_)
             | Op::SplitValidTab(_)
             | Op::SplitOkTab(_)
@@ -1905,28 +1824,49 @@ mod tests {
     }
 
     #[test]
-    fn specializing_a_free_choice_collapses_the_variants_that_agree() {
-        // `input` is Sel(right, 1, Sel(left, -1, 0)): with right = true the
-        // whole thing is 1 whatever left is, so {left,right} and {right}
-        // land on the same node and their successor states are the same.
-        let mut g = Graph::new();
-        let right = g.leaf(Op::Free(1));
-        let left = g.leaf(Op::Free(0));
-        let one = g.leaf(Op::Const(n(1).as_raw_u32() as i32, n(1).as_raw_u32() as i32));
-        let neg = g.leaf(Op::Const(n(-1).as_raw_u32() as i32, n(-1).as_raw_u32() as i32));
-        let zero = g.leaf(Op::Const(0, 0));
-        let inner = g.add(Op::Sel, vec![left, neg, zero]);
-        let input = g.add(Op::Sel, vec![right, one, inner]);
+    fn specializing_the_button_forks_collapses_the_configurations_that_agree() {
+        // `input` is Sel(right, 1, Sel(left, -1, 0)) over two buttons, each a
+        // fork every lane takes both ways (`Symbolic::both_values`): with
+        // right = true the whole thing is 1 whatever left is, so {left,right}
+        // and {right} land on the same node and their successor states are
+        // the same. At every fork grid: the buttons are the same forks at
+        // every rung.
+        for bits in [0u8, 1, 15] {
+            let mut d = crate::trace::domain::Symbolic::default();
+            d.graph.set_fork_bits(bits);
+            let left = d.both_values("left");
+            let right = d.both_values("right");
+            // Its coverage premise (`trace::error`) holds on every lane.
+            let fork = d.graph.get(left).args[0];
+            assert!(d.graph.is_literal_fork(fork), "a button is a fork over a literal");
+            let literal = d.graph.get(fork).args[0];
+            let covered = d.graph.fold(Op::SplitOk(2), vec![literal]);
+            assert_eq!(d.graph.get(covered).op, Op::ConstBool(true), "fork bits {bits}: the literal fits two ways");
+            let g = &mut d.graph;
+            let one = g.leaf(Op::Const(n(1).as_raw_u32() as i32, n(1).as_raw_u32() as i32));
+            let neg = g.leaf(Op::Const(n(-1).as_raw_u32() as i32, n(-1).as_raw_u32() as i32));
+            let zero = g.leaf(Op::Const(0, 0));
+            let inner = g.add(Op::Sel, vec![left, neg, zero]);
+            let input = g.add(Op::Sel, vec![right, one, inner]);
 
-        let mut shared = Graph::new();
-        let sig = |m: u8, shared: &mut Graph| g.specialize_into(m, shared)[input as usize];
-        let r_only = sig(0b10, &mut shared);
-        let both = sig(0b11, &mut shared);
-        assert_eq!(r_only, both, "right dominates left; these are one variant");
-        let l_only = sig(0b01, &mut shared);
-        let none = sig(0b00, &mut shared);
-        assert_ne!(l_only, none);
-        assert_ne!(l_only, both);
+            let mut shared = Graph::new();
+            let sig = |l: u8, r: u8, shared: &mut Graph| {
+                let map = d.graph.specialize_subset_into(&[l, r], None, None, shared);
+                (map[input as usize], map[left as usize], map[right as usize])
+            };
+            let r_only = sig(0, 1, &mut shared);
+            let both = sig(1, 1, &mut shared);
+            assert_eq!(r_only.0, both.0, "right dominates left; these are one configuration");
+            let l_only = sig(1, 0, &mut shared);
+            let none = sig(0, 0, &mut shared);
+            assert_ne!(l_only.0, none.0);
+            assert_ne!(l_only.0, both.0);
+            // Each configuration resolves a button to a constant.
+            for (cfg, want) in [(none, (false, false)), (l_only, (true, false)), (both, (true, true))] {
+                assert_eq!(shared.get(cfg.1).op, Op::ConstBool(want.0), "fork bits {bits}: left");
+                assert_eq!(shared.get(cfg.2).op, Op::ConstBool(want.1), "fork bits {bits}: right");
+            }
+        }
     }
 
     #[test]
@@ -1994,7 +1934,7 @@ mod tests {
             let resolved: Vec<(Graph, Vec<NodeId>)> = (0..arity)
                 .map(|c| {
                     let mut out = g.like();
-                    let map = g.specialize_subset_into(0, Some(&[c]), Some(&tabs), None, &mut out);
+                    let map = g.specialize_subset_into(&[c], Some(&tabs), None, &mut out);
                     (out, map)
                 })
                 .collect();

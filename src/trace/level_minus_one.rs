@@ -11,7 +11,8 @@
 //! a configuration the move amount is one number, so the pixel steps and
 //! their collisions are exact at an exact position) and evaluated over the
 //! ranges with `Graph::eval_narrow_top_in`: a select whose condition the
-//! ranges leave undecided JOINS its arms, the six buttons are unknown cells.
+//! ranges leave undecided JOINS its arms, the six buttons (forks over a
+//! literal, left standing as that literal) unknown.
 //! Every outcome whose `live` is not definitely false is a successor, at the
 //! cells its position hull covers; an outcome in another room is the EXIT.
 //! `d(node)` is the fewest frames from the node to an exit over that graph.
@@ -454,9 +455,9 @@ impl<'a> Table<'a> {
             roots_old.push(Roots { live: o.guard, error: o.error, xy, fields: fnodes });
         }
 
-        // The cone, copied out of the arena with the buttons as unknown cells
-        // past the interface and the kernels' premises read as true (module
-        // doc).
+        // The cone, copied out of the arena with every fork over a literal
+        // (the buttons) standing for its whole literal - unknown - and the
+        // kernels' premises read as true (module doc).
         let arena = &d.graph;
         let mut rs: Vec<NodeId> = Vec::new();
         for r in &roots_old {
@@ -483,7 +484,7 @@ impl<'a> Table<'a> {
             }
             let nd = arena.get(i as NodeId);
             cmap[i] = match nd.op {
-                Op::Free(b) => cone.leaf(Op::Cell(n_slots as u32 + b as u32)),
+                _ if arena.is_literal_fork(i as NodeId) => cmap[nd.args[0] as usize],
                 Op::Known | Op::SplitOk(_) => cone.leaf(Op::ConstBool(true)),
                 Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_) => bail!("shape {id}: a table fork"),
                 _ => {
@@ -516,7 +517,7 @@ impl<'a> Table<'a> {
                 splits[*k as usize] = (rest % *w as usize) as u8;
                 rest /= *w as usize;
             }
-            let map = cone.specialize_subset_into(0, Some(&splits), None, None, &mut shared);
+            let map = cone.specialize_subset_into(&splits, None, None, &mut shared);
             let m = |n: NodeId| map[cmap[n as usize] as usize];
             let outs_c: Vec<Roots> = roots_old
                 .iter()
@@ -563,7 +564,7 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
     let sh = &shapes[id];
     let t = sh.traced.as_ref().expect("a node's shape is traced before its layer");
     let exact = |v: i64| Val::Num(Pico8NumInterval::new(P8::from_raw(v as i32), P8::from_raw(v as i32)));
-    let mut cells: HashMap<u32, Val> = HashMap::with_capacity(t.seeds.len() + 6);
+    let mut cells: HashMap<u32, Val> = HashMap::with_capacity(t.seeds.len());
     for (i, s) in t.seeds.iter().enumerate() {
         let v = match s {
             Seed::Pin(Conc::Num(n)) => Val::exact_num(*n),
@@ -577,9 +578,6 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
             Seed::Unknown => Val::Bool(None),
         };
         cells.insert(i as u32, v);
-    }
-    for b in 0..6u32 {
-        cells.insert(t.seeds.len() as u32 + b, Val::Bool(None));
     }
     let vals = t.graph.eval_narrow_top_in(&cells, room)?;
     let mut out = NodeOut::default();
