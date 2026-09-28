@@ -97,7 +97,7 @@ impl Block {
         let level = crate::interpreter::abstraction::Level {
             fruit: crate::interpreter::abstraction::FruitPrecision::Exact,
             // Likewise the fall floors (`widen::fork_floor_inputs`) and the
-            // moving platforms (`widen::fork_platform_inputs`).
+            // moving platforms (`widen::platform_inputs`).
             floors: crate::interpreter::abstraction::FloorsPrecision::Exact,
             platforms: crate::interpreter::abstraction::PlatformsPrecision::Exact,
             ..crate::interpreter::abstraction::current_level()

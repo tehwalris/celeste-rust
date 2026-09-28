@@ -492,7 +492,7 @@ pub struct Symbolic {
     pub floors_unknown: bool,
     /// The moving platforms unknown (`abstraction::PlatformsPrecision`,
     /// plans/platforms-unknown.md): `trace_frame` widens their inputs
-    /// (`widen::fork_platform_inputs`), every outcome their outputs.
+    /// (`widen::platform_inputs`), every outcome their outputs.
     pub platforms_unknown: bool,
     /// How many `Op::UnknownBool` atoms this frame handed out.
     pub unknown_atoms: u32,
@@ -512,12 +512,14 @@ pub struct Symbolic {
     /// Off, the frame's surviving selects on a condition a lane can hold
     /// undecided become forks (`verify::fork_undecided_selects`).
     pub no_known_forks: bool,
-    /// The moving platforms' `x` input values at a platforms-unknown level
     /// THE PLATFORM WORLDS (`concrete::platform_worlds`): every arrangement
     /// of the start room's moving platforms a search can meet, each
-    /// platform's `(x, last, rem.x, spd.x)`. What a platforms-unknown frame
-    /// reads its platforms from (`widen::fork_platform_inputs`).
+    /// platform's `(x, last, rem.x, spd.x)`. The split pass decides a
+    /// comparison per world (`verify::Points`); no lane ever holds one.
     pub worlds: Option<std::sync::Arc<Vec<Vec<[i32; crate::concrete::WORLD_FIELDS]>>>>,
+    /// This frame's platforms' `x` input cells, in the WORLDS' order (matched
+    /// by `y` and `dir`, `widen::platform_inputs`): what a world pins.
+    pub platform_cells: Vec<NodeId>,
     /// `lane_independent`'s memo. Structural (a node's op and operands never
     /// change), so it outlives a frame.
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
@@ -953,16 +955,6 @@ impl Symbolic {
     /// validity (every configuration applies to every lane), `choice > 0` over
     /// the whole grid - the held buttons' fork (`widen::fork_held_inputs`).
     ///
-    /// The fork over the platform worlds (`widen::fork_platform_inputs`):
-    /// `n` ways over the literal `[0, n - 1]`, the configuration's world
-    /// index as a whole number. Every configuration applies to every lane,
-    /// so there is no validity.
-    pub fn world_choice(&mut self, n: usize) -> Result<NodeId> {
-        anyhow::ensure!((1..=crate::transpile::graph::MAX_WAYS).contains(&n), "{n} platform worlds, more than a fork holds ({})", crate::transpile::graph::MAX_WAYS);
-        let choices = self.graph.leaf(Op::Const(0, ((n - 1) as i32) << 16));
-        Ok(self.fork(&choices, Partition::Ints { ways: n as u8, memo: false }, "the platform world").value)
-    }
-
     /// An `Ints` fork over a CONSTANT, so it goes through `fork` like the
     /// rest; `Partition::Ints { memo: false }` because the two held trails are
     /// independent and must not share one choice even though the operand node

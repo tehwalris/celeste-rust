@@ -234,15 +234,40 @@ pub(crate) fn specialize_frame(
             // other fork left standing (`graph::OPEN`), and one kept of those
             // whose roots come out the same - they agree whatever the other
             // forks take, resolving being substitution, as the button reps
-            // above. The platform worlds' fork (`widen::fork_platform_inputs`,
-            // ~128 ways) is what needs it: from one region most worlds look
-            // alike, and enumerating all of them against every other fork's
-            // configurations ran room (6,0)'s kernel build out of memory
-            // (2026-09-27).
+            // above. Built for a 128-way fork over the platform worlds (since
+            // replaced by deciding per world at compile time,
+            // `verify::Points`), which from one region mostly looked alike.
             let values: Vec<Vec<u8>> = bits
                 .iter()
                 .enumerate()
                 .map(|(i, &d)| {
+                    // A DEAD fork: every fragment gives the same fields,
+                    // keys and error, and the same `live` once the fork's own
+                    // validity is set aside - it is taken once, validity true
+                    // (`graph::ANY_VALID`): the OR of its fragments'
+                    // validities is the lane covered. Room (6,0)'s no-player
+                    // frames move all ten platforms through a floor fork each
+                    // and then widen where they stand: 1024 configurations of
+                    // one row per outcome (2026-09-28). Grid forks only.
+                    if graph.fork_table(d).is_empty() && valid[i] >= 2 {
+                        let mut probe = graph.like();
+                        let mut decided = graph.like();
+                        let mut sigs: std::collections::BTreeSet<Vec<NodeId>> = Default::default();
+                        for v in 0..valid[i] {
+                            let mut cfg = vec![crate::transpile::graph::OPEN; forks as usize];
+                            cfg[d as usize] = v | crate::transpile::graph::ANY_VALID;
+                            let map = graph.specialize_subset_into(m, Some(&cfg), Some(&tabs), Some(&need), &mut probe);
+                            let mut sig: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
+                            if decide {
+                                let (dm, _) = crate::transpile::ival::fold_with_into(&probe, &sig, room, ranges, &mut decided).expect("interval fold");
+                                sig = sig.iter().map(|r| dm[*r as usize]).collect();
+                            }
+                            sigs.insert(sig);
+                        }
+                        if sigs.len() == 1 {
+                            return vec![crate::transpile::graph::ANY_VALID];
+                        }
+                    }
                     if valid[i] <= 2 {
                         return (0..valid[i]).collect();
                     }

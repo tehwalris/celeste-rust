@@ -343,55 +343,84 @@ pub fn platform_paths<D: Domain>(st: &State<D>) -> PlatformPaths {
     out
 }
 
-/// The platforms' INPUT side at a platforms-unknown level: ONE fork over the
-/// start room's PLATFORM WORLDS (`Symbolic::worlds`, `concrete::platform_worlds`)
-/// - every arrangement of the moving platforms a search can meet - and every
-/// platform field read off the world the configuration takes.
+/// The platforms' INPUT side at a platforms-unknown level: each platform's
+/// `x` its input cell over the whole path, `last` read as `x` (the update
+/// ends with `last = x`, `widen_platforms` checks it), `rem.x` the literal
+/// whole remainder. The `x` cells are recorded (`Symbolic::platform_cells`)
+/// for the split pass, which decides a comparison of the player against a
+/// platform per PLATFORM WORLD (`verify::Points`): every arrangement the
+/// search can meet, pinned onto these cells. So the ten platforms stay
+/// consistent with each other inside a frame - a path whose answers no one
+/// world gives is dropped at compile time - where ten independent
+/// intervals admitted the player carried by every platform at once (room
+/// (6,0), 2026-09-27), and no lane ever holds a world.
 ///
-/// The row stores none of it: a platforms-unknown level widens the platforms
-/// at every frame's end (`widen_platforms`), so a lane never knows which
-/// world it is in, and every configuration applies to every lane - the fork
-/// has no validity. What it buys is that within a configuration the
-/// platforms are CONCRETE and consistent with each other: the platforms of a
-/// row keep their spacing, a wrap happens where it does, and every test of
-/// the player against a platform is one the kernel decides - where ten
-/// independent interval inputs made each a fork, and their product
-/// admitted the player carried by every platform at once (room (6,0),
-/// 2026-09-27). Configurations that come out alike fuse.
-pub fn fork_platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    if std::env::var_os("XNOWORLD").is_some() {
-        // EXPERIMENT: the interval model - `x` the input cell, `last` the
-        // same value, `rem.x` the literal.
-        for obj in objects_of_type(st, "platform") {
-            let (x, last, rem) = (field(&obj, &["x"]), field(&obj, &["last"]), field(&obj, &["rem", "x"]));
-            let Some(Value::Num(xv)) = iface::get(st, &x) else { bail!("{}: not a number", iface::show(&x)) };
-            d.ranges.insert(xv, ((PLATFORM_PATH.0 as i64) << 16, (PLATFORM_PATH.1 as i64) << 16));
-            iface::set(st, &last, Value::Num(xv))?;
-            let r = d.graph.leaf(Op::Const(PLATFORM_REM.0, PLATFORM_REM.1));
-            iface::set(st, &rem, Value::Num(r))?;
-        }
-        return Ok(());
-    }
+/// `rem.x` stays a literal, NOT pinned (decision 2026-09-28, plans/
+/// graph-model.md): the platform's own move floors it, and a literal's
+/// floor runs as rejoined fragments (`Interp::rejoin_fragments`, no fork)
+/// where an interval input cell forks the frame once per platform. The
+/// price is a pixel of slack in where a platform stands after its move, at
+/// this coarse rung only - the exact-platform levels above it are exact.
+///
+/// Each platform's `spd.x`, where it is an input cell (not pinned), gets the
+/// range of its speeds over the worlds (0 at the load, `dir * 0.65` after):
+/// without it a platform's move had no bound, and its containment in the path
+/// was left to the lane - which holds the whole path, so it failed (room
+/// (6,0)'s first frame, 2026-09-28). Returned as obligations for the frame's
+/// admissible inputs, so it is checked per lane, never assumed.
+pub fn platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<crate::transpile::graph::NodeId>> {
     let worlds = d.worlds.clone().ok_or_else(|| anyhow::anyhow!("the platforms are unknown but there is no world table"))?;
     let platforms = objects_of_type(st, "platform");
-    anyhow::ensure!(worlds.iter().all(|w| w.len() == platforms.len()), "a platform world has a different number of platforms than the state ({})", platforms.len());
-    let world = d.world_choice(worlds.len())?;
-    for (i, obj) in platforms.iter().enumerate() {
-        let paths = [field(obj, &["x"]), field(obj, &["last"]), field(obj, &["rem", "x"]), field(obj, &["spd", "x"])];
-        for (f, p) in paths.iter().enumerate() {
-            let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
-            let lit = |d: &mut Symbolic, v: i32| d.graph.leaf(Op::Const(v, v));
-            let mut v = lit(d, worlds[worlds.len() - 1][i][f]);
-            for j in (0..worlds.len() - 1).rev() {
-                let here = lit(d, (j as i32) << 16);
-                let is = d.graph.fold(Op::Eq, vec![world, here]);
-                let w = lit(d, worlds[j][i][f]);
-                v = d.graph.fold(Op::Sel, vec![is, w, v]);
-            }
-            iface::set(st, p, Value::Num(v))?;
+    let first = worlds.first().ok_or_else(|| anyhow::anyhow!("no platform world"))?;
+    anyhow::ensure!(first.len() == platforms.len(), "a platform world has {} platforms, the state {}", first.len(), platforms.len());
+    // WHICH world platform each of this state's is: by `y` and `dir`, which
+    // never change. The state's order is its row's canonical one, not the
+    // load's the worlds were recorded in (room (6,0): a pin on one platform's
+    // speed read against another's range, 2026-09-28). Platforms alike in
+    // both are alike in everything a row keeps (their `x` is the whole
+    // path), so any matching among them is the same.
+    fn konst(st: &State<Symbolic>, d: &Symbolic, p: &Path) -> Result<i32> {
+        match iface::get(st, p) {
+            Some(Value::Num(n)) => match d.graph.get(n).op {
+                Op::Const(a, b) if a == b => Ok(a),
+                ref o => bail!("{}: a platform's {} is not a known constant ({o:?})", iface::show(p), iface::show(p)),
+            },
+            _ => bail!("{}: not a number", iface::show(p)),
         }
     }
-    Ok(())
+    let mut taken = vec![false; platforms.len()];
+    let mut cells: Vec<Option<crate::transpile::graph::NodeId>> = vec![None; platforms.len()];
+    let mut obligations = Vec::new();
+    for obj in &platforms {
+        let (y, dir) = (konst(st, d, &field(obj, &["y"]))?, konst(st, d, &field(obj, &["dir"]))?);
+        let j = (0..first.len())
+            .find(|&j| !taken[j] && first[j][4] == y && first[j][5] == dir)
+            .ok_or_else(|| anyhow::anyhow!("no platform world entry at y {y:#x} dir {dir:#x} left for {}", iface::show(obj)))?;
+        taken[j] = true;
+        let spd = field(obj, &["spd", "x"]);
+        if let Some(Value::Num(sv)) = iface::get(st, &spd) {
+            if matches!(d.graph.get(sv).op, Op::Cell(_)) {
+                let lo = worlds.iter().map(|w| w[j][3]).min().expect("a world");
+                let hi = worlds.iter().map(|w| w[j][3]).max().expect("a world");
+                d.ranges.insert(sv, (lo as i64, hi as i64));
+                let (klo, khi) = (d.graph.leaf(Op::Const(lo, lo)), d.graph.leaf(Op::Const(hi, hi)));
+                let (vlo, vhi) = (d.graph.fold(Op::Lo, vec![sv]), d.graph.fold(Op::Hi, vec![sv]));
+                let a = d.graph.fold(Op::Ge, vec![vlo, klo]);
+                let b = d.graph.fold(Op::Le, vec![vhi, khi]);
+                obligations.push(d.graph.fold(Op::And, vec![a, b]));
+            }
+        }
+        let (x, last, rem) = (field(obj, &["x"]), field(obj, &["last"]), field(obj, &["rem", "x"]));
+        let Some(Value::Num(xv)) = iface::get(st, &x) else { bail!("{}: not a number", iface::show(&x)) };
+        anyhow::ensure!(matches!(d.graph.get(xv).op, Op::Cell(_)), "a platform's `x` must be an input cell");
+        d.ranges.insert(xv, ((PLATFORM_PATH.0 as i64) << 16, (PLATFORM_PATH.1 as i64) << 16));
+        iface::set(st, &last, Value::Num(xv))?;
+        let r = d.graph.leaf(Op::Const(PLATFORM_REM.0, PLATFORM_REM.1));
+        iface::set(st, &rem, Value::Num(r))?;
+        cells[j] = Some(xv);
+    }
+    d.platform_cells = cells.into_iter().map(|c| c.expect("every world platform matched")).collect();
+    Ok(obligations)
 }
 
 /// The platforms' OUTPUT side at a platforms-unknown level: `x` and `last` the
@@ -451,6 +480,15 @@ fn contain(d: &mut Symbolic, v: crate::transpile::graph::NodeId, (lo, hi): (i64,
 /// ? -16 : x)` is on the path whatever `x` was. Static; `false` where it
 /// cannot tell.
 fn within(d: &Symbolic, v: crate::transpile::graph::NodeId, (lo, hi): (i64, i64), facts: &mut Vec<(crate::transpile::graph::NodeId, i64, i64)>) -> bool {
+    // Its own bounds first, with what the branches know about IT: a select
+    // the enclosing branch bounds (the wrap's `not (x < -16)` on `x`, itself
+    // a select on whether the platform moved) is bounded as a whole, where
+    // its arms alone are not (room (6,0), 2026-09-28).
+    if let Some((a, b)) = bounds(d, v, facts) {
+        if lo <= a && b <= hi {
+            return true;
+        }
+    }
     let node = d.graph.get(v);
     if let Op::Sel = node.op {
         let (c, t, f) = (node.args[0], node.args[1], node.args[2]);
@@ -513,32 +551,40 @@ fn comparison_facts(d: &Symbolic, c: crate::transpile::graph::NodeId) -> Option<
 /// `n`. `None` for anything else.
 fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::transpile::graph::NodeId, i64, i64)]) -> Option<(i64, i64)> {
     let node = d.graph.get(n);
-    let mut r = match node.op {
-        Op::Const(a, b) => (a as i64, b as i64),
-        // One of its arms: a platform world's field is a select over the
-        // worlds' literals (`fork_platform_inputs`).
-        Op::Sel => {
-            let (a, b) = (bounds(d, node.args[1], facts)?, bounds(d, node.args[2], facts)?);
-            (a.0.min(b.0), a.1.max(b.1))
-        }
-        Op::Flr => {
-            let a = bounds(d, node.args[0], facts)?;
-            (a.0.div_euclid(1 << 16) << 16, a.1.div_euclid(1 << 16) << 16)
-        }
-        // A fork's fragment lies inside its operand.
-        Op::Split(_) => bounds(d, node.args[0], facts)?,
-        Op::Add => {
-            let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
-            (a.0 + b.0, a.1 + b.1)
-        }
-        Op::Sub => {
-            let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
-            (a.0 - b.1, a.1 - b.0)
-        }
-        Op::Cell(_) if d.ranges.contains_key(&n) => d.ranges[&n],
-        // Known only from the branches around it.
-        _ if facts.iter().any(|f| f.0 == n) => (i64::MIN, i64::MAX),
-        _ => return None,
+    let structural = || -> Option<(i64, i64)> {
+        Some(match node.op {
+            Op::Const(a, b) => (a as i64, b as i64),
+            // One of its arms.
+            Op::Sel => {
+                let (a, b) = (bounds(d, node.args[1], facts)?, bounds(d, node.args[2], facts)?);
+                (a.0.min(b.0), a.1.max(b.1))
+            }
+            Op::Flr => {
+                let a = bounds(d, node.args[0], facts)?;
+                (a.0.div_euclid(1 << 16) << 16, a.1.div_euclid(1 << 16) << 16)
+            }
+            // A fork's fragment lies inside its operand.
+            Op::Split(_) | Op::Frag(_) | Op::IntFrag(_) => bounds(d, node.args[0], facts)?,
+            Op::Add => {
+                let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
+                (a.0 + b.0, a.1 + b.1)
+            }
+            Op::Sub => {
+                let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
+                (a.0 - b.1, a.1 - b.0)
+            }
+            Op::Cell(_) if d.ranges.contains_key(&n) => d.ranges[&n],
+            _ => return None,
+        })
+    };
+    // Known from its structure, else only from the branches around it - also
+    // where its structure is known but an operand's is not (a platform's
+    // move through a fork's fragment: room (6,0)'s first frame, where the
+    // wrap's own branch is what bounds it, 2026-09-28).
+    let mut r = match structural() {
+        Some(r) => r,
+        None if facts.iter().any(|f| f.0 == n) => (i64::MIN, i64::MAX),
+        None => return None,
     };
     for &(m, flo, fhi) in facts {
         if m == n {

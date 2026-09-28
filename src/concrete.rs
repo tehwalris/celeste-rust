@@ -137,13 +137,16 @@ pub fn restore_buttons(
 // DFS with memoized dead ends per (key, cell).
 
 /// The moving platforms' fields a world fixes (`platform_worlds`): `x`,
-/// `last`, `rem.x`, `spd.x`, in that order, raw 16.16.
-pub const WORLD_FIELDS: usize = 4;
+/// `last`, `rem.x`, `spd.x`, then `y` and `dir` - constant, what a traced
+/// state's platform is matched to a world's by (`widen::platform_inputs`) -
+/// in that order, raw 16.16.
+pub const WORLD_FIELDS: usize = 6;
 
 /// THE PLATFORM WORLDS of the start room (plans/graph-model.md step 5): every
 /// arrangement of its moving platforms in the first `frames` frames, each
-/// platform's `(x, last, rem.x, spd.x)` in the order the platforms stand in
-/// `objects`, deduplicated.
+/// platform's `(x, last, rem.x, spd.x, y, dir)` in the order the platforms
+/// stand in `objects` at the load - NOT necessarily a traced state's order
+/// (a row's canonical structure reorders objects), deduplicated.
 ///
 /// A platform moves by `dir * 0.65` a frame and nothing the player does
 /// moves it, so the arrangement is a function of one number - how many
@@ -184,6 +187,8 @@ pub fn platform_worlds(frames: usize) -> Result<Vec<Vec<[i32; WORLD_FIELDS]>>> {
                 field(number(p, "last"), "last")?,
                 field(sub(p, "rem").and_then(|r| number(r, "x")), "rem.x")?,
                 field(sub(p, "spd").and_then(|s| number(s, "x")), "spd.x")?,
+                field(number(p, "y"), "y")?,
+                field(number(p, "dir"), "dir")?,
             ]);
         }
         drop(helper);

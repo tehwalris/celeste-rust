@@ -2404,7 +2404,7 @@ pub fn room_constant_lattice(
     it.d.fruit_unknown = opts.fruit;
     // ... and the fall floors' (`widen::fork_floor_inputs`).
     it.d.floors_unknown = opts.floors;
-    // ... and the moving platforms' (`widen::fork_platform_inputs`).
+    // ... and the moving platforms' (`widen::platform_inputs`).
     it.d.platforms_unknown = opts.platforms;
     // ... from the start room's platform worlds (`concrete::platform_worlds`).
     if opts.platforms {
@@ -2435,6 +2435,7 @@ pub fn room_constant_lattice(
 
     let sk = key(&start)?;
     let start_key = sk.clone();
+    let no_player_shape = start.shape()?;
     let no_player = match region_grid_for(opts)? {
         Some(_) => no_player_ranges(&mut it, reset, fr, &start, opts)?,
         None => Vec::new(),
@@ -2489,7 +2490,10 @@ pub fn room_constant_lattice(
     // arena into the walk's through `shapes::rebase` (checked); each frame is
     // bound in the arena it was traced in (`WalkFrame::bound`).
     let mut rep_constants: std::collections::BTreeMap<String, std::collections::HashMap<u32, super::iface::Conc>> = Default::default();
-    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    // `CELESTE_WALK_THREADS` caps the walk's workers: each holds its own arena,
+    // and room (6,0)'s heaviest traces (the platforms' points, the split pass)
+    // reached 45 GB at 32 at once (2026-09-28).
+    let n_workers = std::env::var("CELESTE_WALK_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
     let mut tracers: Vec<Tracer> = (0..n_workers).map(|_| Tracer { it: it.clone(), reset, fr }).collect();
     let mut frontier: Vec<WalkNode> = start_regions.into_iter().map(|r| (sk.clone(), r)).collect();
     // Shapes whose reached regions wait for a re-trace (the deferred re-trace).
@@ -2518,7 +2522,15 @@ pub fn room_constant_lattice(
                         g.bounds(&pl, r).into_iter().chain(experiment_bounds(&pl)).filter(|(p, _)| roots.iter().any(|q| q == p)).collect()
                     }
                     (None, None, _) => Vec::new(),
-                    (Some(_), None, None) => no_player.iter().filter(|(p, _)| roots.iter().any(|q| q == p)).cloned().collect(),
+                    // The spawn chain's hull, on ITS shape only: bounds are
+                    // by path, and another no-player shape's `objects[k]` is
+                    // another object (room (6,0): a platform's speed pinned
+                    // to -0.65 read against another's [0, 0.65], every body
+                    // of the shape in error from f25, 2026-09-28).
+                    (Some(_), None, None) if st.shape()? == no_player_shape => {
+                        no_player.iter().filter(|(p, _)| roots.iter().any(|q| q == p)).cloned().collect()
+                    }
+                    (Some(_), None, None) => Vec::new(),
                     (g, r, pl) => bail!("walk node {r:?} of a shape {} a player under grid {g:?}", if pl.is_some() { "with" } else { "without" }),
                 };
                 let rebase = if *k == start_key { None } else { Some(rep_constants[k].clone()) };

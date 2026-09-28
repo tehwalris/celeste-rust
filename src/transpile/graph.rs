@@ -79,6 +79,12 @@ pub type NodeId = u32;
 /// standing.
 pub const OPEN: u8 = u8::MAX;
 
+/// In a `splits` vector, OR-ed into a fragment index: that fragment, with the
+/// fork's validity TRUE - a DEAD fork (`lower::specialize_frame`), whose
+/// fragments all give the outcome the same row, taken once for all of them:
+/// the OR of its fragments' validities is the lane covered.
+pub const ANY_VALID: u8 = 0x80;
+
 /// The map, for the evaluator. `CollisionCache` already carries which
 /// room it is for, so this is just the pair the cart queries need.
 #[derive(Clone)]
@@ -556,9 +562,10 @@ impl Graph {
                 // would have silently measured 16,384 configurations
                 // as 256 distinct ones and reported the collapse as
                 // sharing. Fourth member of the shift-overflow family.
-                (Op::Split(d), Some(s)) if s[d as usize] != OPEN => out.fold(Op::Frag(s[d as usize]), vec![arg(&map, 0)]),
+                (Op::Split(d), Some(s)) if s[d as usize] != OPEN => out.fold(Op::Frag(s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
+                (Op::SplitValid(d), Some(s)) if s[d as usize] != OPEN && s[d as usize] & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
                 (Op::SplitValid(d), Some(s)) if s[d as usize] != OPEN => out.fold(Op::FragOk(s[d as usize]), vec![arg(&map, 0)]),
-                (Op::SplitInt(d), Some(s)) if s[d as usize] != OPEN => out.fold(Op::IntFrag(s[d as usize]), vec![arg(&map, 0)]),
+                (Op::SplitInt(d), Some(s)) if s[d as usize] != OPEN => out.fold(Op::IntFrag(s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
                 // The relative table fork (see `Op::SplitTab`): per-lane
                 // select chains on `Lo(v)` over the entries.
                 (Op::SplitTab(d), Some(s)) | (Op::SplitValidTab(d), Some(s)) | (Op::SplitKeyTab(d), Some(s)) | (Op::SplitOkTab(d), Some(s)) if s[d as usize] != OPEN => {
@@ -1126,12 +1133,24 @@ impl Graph {
                     }
                 }
                 // The span premise: whether the interval fits in the
-                // fork's fragment count. Unmodellable here (the resolved
-                // form is `zi_span_ok`, runtime-only), so it becomes TOP
-                // under narrow-top eval - like `Mget`/`TileFlagAt`
-                // without a room - and only errors under strict eval.
-                Op::SplitOk(_) if !strict_err => Val::Bool(None),
-                Op::SplitOk(_) => bail!("node {}: SplitOk needs the interval's floor span", i),
+                // fork's fragment count (`zi_span_ok`: the floor of its high
+                // end at most `ways - 1` grid cells above its low end's).
+                // A value here is the hull over the lanes: fitting, every
+                // lane fits; not fitting, a lane still may - unknown. So
+                // the kernel's explanation reads what the kernel computed
+                // rather than top (room (6,0), 2026-09-28).
+                Op::SplitOk(ways) => {
+                    let iv = a(0).as_num("SplitOk")?;
+                    let step = 1i64 << (16 - self.fork_bits as i64);
+                    let floor = |v: Pico8Num| (v.as_raw_u32() as i32 as i64).div_euclid(step) * step;
+                    if floor(iv.high) <= floor(iv.low) + (*ways as i64 - 1) * step {
+                        Val::Bool(Some(true))
+                    } else if !strict_err {
+                        Val::Bool(None)
+                    } else {
+                        bail!("node {}: SplitOk of an interval that may not fit", i)
+                    }
+                }
                 // The RESOLVED fork: `zi_fork_flr`, on one interval
                 // instead of sixteen lanes. Exact, and it is the
                 // definition `fold`'s `FragOk(0)` rule is checked

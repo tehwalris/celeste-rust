@@ -297,10 +297,21 @@ pub fn trace_frame<'a>(
     // outside it should not have been run through this kernel at all, which
     // is an error of the whole frame rather than of any value it computes.
     let mut admissible = iface::pin_guard(&mut it.d, &iface);
+    // The player's input position and its region, for the points
+    // (`Points`): the bounds on its `x` and `y`.
+    let player = super::shapes::player_path(&st);
+    let mut position: [Option<(NodeId, (i32, i32))>; 2] = [None, None];
     for (p, (lo, hi)) in bounds {
         let i = iface.slots.iter().position(|q| q == p).ok_or_else(|| anyhow!("bounded {} is not an input slot", iface::show(p)))?;
         let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(i as u32));
         it.d.ranges.insert(cell, (*lo as i64, *hi as i64));
+        if let Some(pl) = &player {
+            for (k, f) in ["x", "y"].iter().enumerate() {
+                if p.len() == pl.len() + 1 && p.starts_with(pl) && p[pl.len()] == iface::key(f) {
+                    position[k] = Some((cell, (*lo, *hi)));
+                }
+            }
+        }
         // The obligation, built on the graph directly so the range
         // analysis it seeds cannot fold it away: the lane's value (an
         // interval: both ends) lies in the range.
@@ -346,10 +357,13 @@ pub fn trace_frame<'a>(
     if it.d.floors_unknown {
         super::widen::fork_floor_inputs(&mut st, &mut it.d)?;
     }
-    // The moving platforms unknown: `last` read as `x`, `rem.x` the literal
-    // (plans/platforms-unknown.md).
+    // The moving platforms unknown: their input cells, decided per world by
+    // the split pass (`widen::platform_inputs`, `Points`).
+    it.d.platform_cells.clear();
     if it.d.platforms_unknown {
-        super::widen::fork_platform_inputs(&mut st, &mut it.d)?;
+        for ob in super::widen::platform_inputs(&mut st, &mut it.d)? {
+            admissible = it.d.graph.fold(crate::transpile::graph::Op::And, vec![admissible, ob]);
+        }
     }
     let st = run_one(it, reset, st)?;
     let finished = it.exec_block(frame.nodes(), st)?;
@@ -428,7 +442,18 @@ pub fn trace_frame<'a>(
     // The selects left on a condition a lane can hold undecided are split,
     // until none is (`split_undecided_selects`).
     if !it.d.no_known_forks {
-        outs = split_undecided_selects(&mut it.d, outs)?;
+        let points = if it.d.platforms_unknown { Some(Points::new(&it.d, position)?) } else { None };
+        let room = crate::transpile::graph::Room { cart: cart.clone(), cache: cache.clone() };
+        outs = split_undecided_selects(&mut it.d, outs, points, Some(&room))?;
+        // The conditions an operator was EVALUATED under (`Symbolic::evaluated`)
+        // are read by the error's derivation too (`trace::error`), and they
+        // are the tracer's path guards: a select on a condition the lane
+        // cannot decide left in one reads a garbage bit, and its own error
+        // `not Known(c)` held on every lane that straddles `c` (room (6,0)
+        // f24: 750k such selects under the outcomes' fields, 2026-09-28).
+        // Read three-valued like the guards (`three_valued`): an unknown
+        // condition makes `own and at` unknown, which reads as error.
+        three_valued_evaluated(&mut it.d, &outs);
     }
     // ERROR, DERIVED - once, now that the graph each outcome reads is final:
     // from what the row stores (fields, keys), from where it is live (an
@@ -495,6 +520,488 @@ pub fn trace_frame<'a>(
     Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, floors_unknown: it.d.floors_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, raise, in_cells, in_rt2 })
 }
 
+/// `split_undecided_selects`' queue: the outcomes still to split, popped
+/// largest cone first, and deduped as they arrive - a side equal to an
+/// outcome still waiting is that outcome, live wherever either is, at the
+/// points either is (`Lite::merge`, `PointSet::union`).
+#[derive(Default)]
+struct Waiting {
+    slots: Vec<Option<(Lite, Option<PointSet>)>>,
+    index: rustc_hash::FxHashMap<(usize, Vec<(usize, NodeId)>, Vec<NodeId>), usize>,
+    heap: std::collections::BinaryHeap<(usize, std::cmp::Reverse<usize>)>,
+}
+
+/// One outcome of `split_undecided_selects` in flight: what a split changes,
+/// over the outcome it came from (`t`, whose shape, state and structure it
+/// keeps). Cloning the whole `FrameOut` per side held a state and a block
+/// per waiting outcome.
+#[derive(Clone)]
+struct Lite {
+    t: usize,
+    guard: NodeId,
+    error: NodeId,
+    fields: Vec<NodeId>,
+    keys: Vec<(usize, NodeId)>,
+}
+
+impl Lite {
+    /// What the row stores: the fields and the keys.
+    fn row(&self) -> Vec<NodeId> {
+        let mut r = self.fields.clone();
+        r.extend(self.keys.iter().map(|(_, n)| *n));
+        r
+    }
+
+    fn every(&self) -> Vec<NodeId> {
+        let mut r = self.row();
+        r.extend([self.error, self.guard]);
+        r
+    }
+
+    /// Absorb another with the same row: live wherever either is, and in
+    /// error where the one live there is - each error only counts on its own
+    /// lanes, so the merged error is `(g1 and e1) or (g2 and e2)`, and where
+    /// the two errors are one node, that node.
+    fn merge(&mut self, d: &mut Symbolic, guard: NodeId, error: NodeId) {
+        if self.error != error {
+            let (a, b) = (d.and(&self.guard, &self.error), d.and(&guard, &error));
+            self.error = d.or(&a, &b);
+        }
+        self.guard = d.or(&self.guard, &guard);
+    }
+}
+
+impl Waiting {
+    /// Outcomes of one shape with the same row are one: the template's
+    /// SHAPE class (`class`) rather than the template itself.
+    fn key(class: &[usize], o: &Lite) -> (usize, Vec<(usize, NodeId)>, Vec<NodeId>) {
+        (class[o.t], o.keys.clone(), o.fields.clone())
+    }
+
+    fn push(&mut self, d: &mut Symbolic, class: &[usize], o: Lite, pts: Option<PointSet>, size: usize) {
+        let key = Self::key(class, &o);
+        if let Some(&i) = self.index.get(&key) {
+            let (p, pp) = self.slots[i].as_mut().expect("an indexed outcome is waiting");
+            p.merge(d, o.guard, o.error);
+            if let (Some(a), Some(b)) = (pp.as_mut(), pts.as_ref()) {
+                a.union(b);
+            }
+            return;
+        }
+        let i = self.slots.len();
+        self.slots.push(Some((o, pts)));
+        self.index.insert(key, i);
+        self.heap.push((size, std::cmp::Reverse(i)));
+    }
+
+    fn pop(&mut self, class: &[usize]) -> Option<(Lite, Option<PointSet>)> {
+        let (_, std::cmp::Reverse(i)) = self.heap.pop()?;
+        let out = self.slots[i].take().expect("a queued outcome is waiting");
+        self.index.remove(&Self::key(class, &out.0));
+        Some(out)
+    }
+
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+}
+
+/// An outcome's error once its row is resolved: WHERE A LANE MAY ERR, with no
+/// select on an undecided condition left (`MayErr`) - by case analysis on
+/// the error alone, never on the outcome: splitting the outcome on the
+/// error's selects gave two sides with one row that merged back as
+/// `(g1 and e1) or (g2 and e2)`, the guards copied in, doubling each round
+/// (room (6,0): a 41-node row under a 5M-node error). Nor three-valued: a
+/// hull loses what a select's condition says about its value - the
+/// platform wrap `x < -16 ? 128 : (x > 128 ? -16 : x)` hulled to
+/// `[-16, 129]` failed its own containment, and the lane declined.
+fn settle_error(d: &mut Symbolic, points: Option<&mut Points>, pts: Option<&PointSet>, room: Option<&crate::transpile::graph::Room>, mut o: Lite) -> Lite {
+    let mut m = MayErr { points, room, memo: Default::default(), cases: 0 };
+    let here = pts.cloned();
+    o.error = m.may(d, o.error, here.as_ref()).0;
+    o
+}
+
+/// `MayErr::may`'s bound on the cases it opens under one error.
+const MAY_CASES: usize = 4096;
+
+/// A boolean's `(may be true, may be false)` over the states a lane stands
+/// for, with no undecided select left: an `Or` or `And` or `Not` through its
+/// operands (`or` exact; `and` over-approximates, which for an error is
+/// the safe side), a node that reads an undecided select split on its
+/// lowest undecidable comparison - each case under that answer's `may`
+/// guard (`Symbolic::may_answers`), narrowed to the points that give it,
+/// and a case no point gives dropped - and a node that reads none as it is
+/// (the kernel reads an unknown as both). Past `MAY_CASES` cases, the
+/// three-valued reading (`three_valued`).
+struct MayErr<'a, 'r> {
+    points: Option<&'a mut Points>,
+    room: Option<&'r crate::transpile::graph::Room>,
+    memo: rustc_hash::FxHashMap<(NodeId, Option<Vec<u64>>), (NodeId, NodeId)>,
+    cases: usize,
+}
+
+impl MayErr<'_, '_> {
+    fn may(&mut self, d: &mut Symbolic, n: NodeId, pts: Option<&PointSet>) -> (NodeId, NodeId) {
+        use crate::transpile::graph::Op;
+        let key = (n, pts.map(|p| p.0.clone()));
+        if let Some(hit) = self.memo.get(&key) {
+            return *hit;
+        }
+        let (op, args) = {
+            let node = d.graph.get(n);
+            (node.op.clone(), node.args.clone())
+        };
+        let reads_undecided = |d: &mut Symbolic, n: NodeId| cone(&d.graph, &[n]).into_iter().find(|m| d.graph.get(*m).op == Op::Sel && d.lane_undecidable(d.graph.get(*m).args[0]));
+        let out = match op {
+            Op::Or | Op::And => {
+                let parts: Vec<(NodeId, NodeId)> = args.iter().map(|a| self.may(d, *a, pts)).collect();
+                let (t, f): (Vec<NodeId>, Vec<NodeId>) = parts.into_iter().unzip();
+                if op == Op::Or {
+                    (d.graph.fold(Op::Or, t), d.graph.fold(Op::And, f))
+                } else {
+                    (d.graph.fold(Op::And, t), d.graph.fold(Op::Or, f))
+                }
+            }
+            Op::Not => {
+                let (t, f) = self.may(d, args[0], pts);
+                (f, t)
+            }
+            _ => match reads_undecided(d, n) {
+                None => {
+                    let nn = d.graph.fold(Op::Not, vec![n]);
+                    (n, nn)
+                }
+                Some(sel) if self.cases < MAY_CASES => {
+                    self.cases += 1;
+                    let c = d.graph.get(sel).args[0];
+                    let atom = cone(&d.graph, &[c])
+                        .into_iter()
+                        .find(|m| matches!(d.graph.get(*m).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::UnknownBool(_)) && d.lane_undecidable(*m))
+                        .unwrap_or(c);
+                    let sides: Vec<(bool, Option<PointSet>)> = match (self.points.as_deref_mut(), pts) {
+                        (Some(p), Some(here)) => {
+                            let (yes, no) = p.answers(d, self.room, atom);
+                            [(true, yes.and(here)), (false, no.and(here))].into_iter().filter(|(_, s)| !s.is_empty()).map(|(a, s)| (a, Some(s))).collect()
+                        }
+                        _ => vec![(true, None), (false, None)],
+                    };
+                    let decided = sides.len() == 1;
+                    let (may_true, may_false) = d.may_answers(atom);
+                    let reach = cone(&d.graph, &[n]);
+                    let (mut t, mut f) = (d.graph.leaf(Op::ConstBool(false)), d.graph.leaf(Op::ConstBool(false)));
+                    for (answer, side) in sides {
+                        let to = d.graph.leaf(Op::ConstBool(answer));
+                        let map = rebuild_all(d, &reach, &rustc_hash::FxHashMap::from_iter([(atom, to)]));
+                        let m = map.get(&n).copied().unwrap_or(n);
+                        let (ct, cf) = self.may(d, m, side.as_ref());
+                        let (ct, cf) = if decided {
+                            (ct, cf)
+                        } else {
+                            let g = if answer { may_true } else { may_false };
+                            (d.graph.fold(Op::And, vec![g, ct]), d.graph.fold(Op::And, vec![g, cf]))
+                        };
+                        t = d.graph.fold(Op::Or, vec![t, ct]);
+                        f = d.graph.fold(Op::Or, vec![f, cf]);
+                    }
+                    (t, f)
+                }
+                Some(_) => {
+                    let e = three_valued(d, n);
+                    let ne = d.graph.fold(Op::Not, vec![e]);
+                    (e, ne)
+                }
+            },
+        };
+        self.memo.insert(key, out);
+        out
+    }
+}
+
+/// `Symbolic::evaluated`'s conditions, for every node the outcomes reach
+/// (through the conditions themselves too), rewritten by `three_valued`.
+fn three_valued_evaluated(d: &mut Symbolic, outs: &[FrameOut]) {
+    let mut roots: Vec<NodeId> = Vec::new();
+    for o in outs {
+        roots.extend(o.fields.iter().map(|f| f.1));
+        roots.extend(o.keys.iter().map(|k| k.1));
+        roots.extend([o.guard, o.error]);
+    }
+    let mut done: rustc_hash::FxHashSet<NodeId> = Default::default();
+    let mut todo = cone(&d.graph, &roots);
+    while !todo.is_empty() {
+        let mut next: Vec<NodeId> = Vec::new();
+        for n in todo {
+            if !done.insert(n) {
+                continue;
+            }
+            if let Some(at) = d.evaluated.get(&n).copied() {
+                let at2 = three_valued(d, at);
+                if at2 != at {
+                    d.evaluated.insert(n, at2);
+                }
+                next.push(at2);
+            }
+        }
+        todo = cone(&d.graph, &next).into_iter().filter(|n| !done.contains(n)).collect();
+    }
+}
+
+/// A set of `Points`' points, one bit each.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct PointSet(Vec<u64>);
+
+impl PointSet {
+    fn empty(n: usize) -> Self {
+        PointSet(vec![0; n.div_ceil(64)])
+    }
+    fn full(n: usize) -> Self {
+        let mut s = Self::empty(n);
+        for i in 0..n {
+            s.insert(i);
+        }
+        s
+    }
+    fn insert(&mut self, i: usize) {
+        self.0[i / 64] |= 1 << (i % 64);
+    }
+    fn contains(&self, i: usize) -> bool {
+        self.0[i / 64] >> (i % 64) & 1 == 1
+    }
+    fn union(&mut self, o: &PointSet) {
+        for (a, b) in self.0.iter_mut().zip(&o.0) {
+            *a |= b;
+        }
+    }
+    fn and(&self, o: &PointSet) -> PointSet {
+        PointSet(self.0.iter().zip(&o.0).map(|(a, b)| a & b).collect())
+    }
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|w| *w == 0)
+    }
+}
+
+/// THE POINTS a platforms-unknown frame's comparisons are decided over
+/// (plans/graph-model.md step 5, Philippe 2026-09-28): every PLATFORM WORLD
+/// (`concrete::platform_worlds`) at every whole pixel of the player's region.
+/// A path through the frame carries the points still consistent with its
+/// answers: a comparison narrows them to where it can come out as the path
+/// takes it, a comparison that comes out one way at all of them is decided,
+/// and a path left with none is dropped - the answers of one path must all
+/// come from ONE arrangement of the platforms, which ten independent
+/// intervals could not say. Compile time only: a lane never holds a world;
+/// what reaches the kernel is each outcome's pixels (`position_guard`).
+///
+/// A comparison is decided at a point by the interval evaluator over its
+/// cone with the platforms' cells pinned to the world and the player's to
+/// the pixel (`Graph::eval_lenient_in`, the map included); what else it
+/// reads keeps its range, and a point it leaves undecided goes both ways.
+pub struct Points {
+    /// Per world, the value of each platform cell: `(cell, raw)`.
+    worlds: Vec<Vec<(u32, i32)>>,
+    platform: rustc_hash::FxHashSet<u32>,
+    /// The player's input `x` and `y`: the cell, its node, the first whole
+    /// pixel of the region and how many. `None` without a player.
+    pos: [Option<(u32, NodeId, i32, usize)>; 2],
+    memo: rustc_hash::FxHashMap<NodeId, (PointSet, PointSet)>,
+}
+
+impl Points {
+    fn new(d: &Symbolic, pos: [Option<(NodeId, (i32, i32))>; 2]) -> Result<Points> {
+        use crate::transpile::graph::Op;
+        let table = d.worlds.clone().ok_or_else(|| anyhow!("the platforms are unknown but there is no world table"))?;
+        let cell = |n: NodeId| match d.graph.get(n).op {
+            Op::Cell(c) => Ok(c),
+            ref o => Err(anyhow!("a pinned input is {o:?}, not a cell")),
+        };
+        let mut worlds = Vec::with_capacity(table.len());
+        for w in table.iter() {
+            anyhow::ensure!(w.len() == d.platform_cells.len(), "a world has {} platforms, the frame {}", w.len(), d.platform_cells.len());
+            let mut pins = Vec::new();
+            for (p, x) in w.iter().zip(&d.platform_cells) {
+                pins.push((cell(*x)?, p[0]));
+            }
+            worlds.push(pins);
+        }
+        let platform = worlds.first().map(|w| w.iter().map(|(c, _)| *c).collect()).unwrap_or_default();
+        let mut out = [None, None];
+        for (k, p) in pos.iter().enumerate() {
+            if let Some((n, (lo, hi))) = p {
+                const ONE: i32 = 1 << 16;
+                anyhow::ensure!(lo % ONE == 0 && hi % ONE == 0, "the player's position range is not whole pixels");
+                let (a, b) = (lo.div_euclid(ONE), hi.div_euclid(ONE));
+                out[k] = Some((cell(*n)?, *n, a, (b - a + 1) as usize));
+            }
+        }
+        Ok(Points { worlds, platform, pos: out, memo: Default::default() })
+    }
+
+    fn per_world(&self) -> usize {
+        self.pos.iter().map(|p| p.map_or(1, |p| p.3)).product()
+    }
+
+    fn len(&self) -> usize {
+        self.worlds.len() * self.per_world()
+    }
+
+    /// The point of world `w` at pixel offsets `(i, j)` into the region.
+    fn index(&self, w: usize, i: usize, j: usize) -> usize {
+        let ny = self.pos[1].map_or(1, |p| p.3);
+        (w * self.per_world()) + i * ny + j
+    }
+
+    /// Where `c` can come out true, and where false.
+    fn answers(&mut self, d: &Symbolic, room: Option<&crate::transpile::graph::Room>, c: NodeId) -> (PointSet, PointSet) {
+        use crate::transpile::graph::{Op, Val};
+        use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
+        if let Some(hit) = self.memo.get(&c) {
+            return hit.clone();
+        }
+        // The cone as a graph of its own, so an evaluation costs the cone.
+        let nodes = cone(&d.graph, &[c]);
+        let mut g = d.graph.like();
+        let mut map: rustc_hash::FxHashMap<NodeId, NodeId> = Default::default();
+        let mut ranges: std::collections::HashMap<u32, (i32, i32)> = Default::default();
+        for &n in &nodes {
+            let node = d.graph.get(n);
+            let args = node.args.iter().map(|a| map[a]).collect();
+            map.insert(n, g.add(node.op.clone(), args));
+            if let (Op::Cell(k), Some(r)) = (&node.op, d.ranges.get(&n)) {
+                ranges.insert(*k, (r.0 as i32, r.1 as i32));
+            }
+        }
+        let root = map[&c] as usize;
+        let base = crate::transpile::ival::seed_cells(&g, &ranges);
+        let exact = |v: i32| Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(v), Pico8Num::from_raw(v)));
+        let eval = |cells: &std::collections::HashMap<u32, Val>| -> Option<bool> {
+            let v = match room {
+                Some(r) => g.eval_lenient_in(cells, r),
+                None => g.eval_lenient(cells),
+            };
+            match v.ok()?.get(root) {
+                Some(Val::Bool(b)) => *b,
+                _ => None,
+            }
+        };
+        let reads_platform = base.keys().any(|k| self.platform.contains(k));
+        let reads = |k: usize| self.pos[k].filter(|p| base.contains_key(&p.0));
+        let (px, py) = (reads(0), reads(1));
+        let n = self.len();
+        let (mut yes, mut no) = (PointSet::empty(n), PointSet::empty(n));
+        let (nx, ny) = (self.pos[0].map_or(1, |p| p.3), self.pos[1].map_or(1, |p| p.3));
+        // Mark worlds `ws` at pixels `is` x `js` with answer `r`.
+        let mut mark = |ws: &[usize], is: &[usize], js: &[usize], r: Option<bool>| {
+            for &w in ws {
+                for &i in is {
+                    for &j in js {
+                        let at = self.index(w, i, j);
+                        if r != Some(false) {
+                            yes.insert(at);
+                        }
+                        if r != Some(true) {
+                            no.insert(at);
+                        }
+                    }
+                }
+            }
+        };
+        let all_i: Vec<usize> = (0..nx).collect();
+        let all_j: Vec<usize> = (0..ny).collect();
+        let all_w: Vec<usize> = (0..self.worlds.len()).collect();
+        let groups: Vec<Vec<usize>> = if reads_platform { all_w.iter().map(|w| vec![*w]).collect() } else { vec![all_w.clone()] };
+        for ws in &groups {
+            let mut cells = base.clone();
+            if reads_platform {
+                for (k, v) in &self.worlds[ws[0]] {
+                    if cells.contains_key(k) {
+                        cells.insert(*k, exact(*v));
+                    }
+                }
+            }
+            let r = eval(&cells);
+            if r.is_some() || (px.is_none() && py.is_none()) {
+                mark(ws, &all_i, &all_j, r);
+                continue;
+            }
+            // Per pixel, along the axes the comparison reads.
+            let is: Vec<Option<usize>> = if px.is_some() { (0..nx).map(Some).collect() } else { vec![None] };
+            let js: Vec<Option<usize>> = if py.is_some() { (0..ny).map(Some).collect() } else { vec![None] };
+            for i in &is {
+                for j in &js {
+                    let mut at = cells.clone();
+                    if let (Some(i), Some(p)) = (i, px) {
+                        at.insert(p.0, exact((p.2 + *i as i32) << 16));
+                    }
+                    if let (Some(j), Some(p)) = (j, py) {
+                        at.insert(p.0, exact((p.2 + *j as i32) << 16));
+                    }
+                    let r = eval(&at);
+                    let ii = i.map_or(all_i.clone(), |i| vec![i]);
+                    let jj = j.map_or(all_j.clone(), |j| vec![j]);
+                    mark(ws, &ii, &jj, r);
+                }
+            }
+        }
+        self.memo.insert(c, (yes.clone(), no.clone()));
+        (yes, no)
+    }
+
+    /// The lanes an outcome at `pts` is live on: the player's pixels some
+    /// world of `pts` has - `true` when that is every pixel.
+    fn position_guard(&self, d: &mut Symbolic, pts: &PointSet) -> NodeId {
+        use crate::transpile::graph::Op;
+        let (nx, ny) = (self.pos[0].map_or(1, |p| p.3), self.pos[1].map_or(1, |p| p.3));
+        let at = |i: usize, j: usize| (0..self.worlds.len()).any(|w| pts.contains(self.index(w, i, j)));
+        let yes = d.graph.leaf(Op::ConstBool(true));
+        if (0..nx).all(|i| (0..ny).all(|j| at(i, j))) {
+            return yes;
+        }
+        // `lo <= cell <= hi` over whole pixels of one axis.
+        let within = |d: &mut Symbolic, axis: usize, lo: usize, hi: usize| -> NodeId {
+            let Some((_, n, first, _)) = self.pos[axis] else { return d.graph.leaf(Op::ConstBool(true)) };
+            let (a, b) = ((first + lo as i32) << 16, (first + hi as i32) << 16);
+            let (ka, kb) = (d.graph.leaf(Op::Const(a, a)), d.graph.leaf(Op::Const(b, b)));
+            let ge = d.graph.fold(Op::Ge, vec![n, ka]);
+            let le = d.graph.fold(Op::Le, vec![n, kb]);
+            d.graph.fold(Op::And, vec![ge, le])
+        };
+        // Runs of `j` per column, and runs of columns with the same runs.
+        let runs = |i: usize| -> Vec<(usize, usize)> {
+            let mut out: Vec<(usize, usize)> = Vec::new();
+            for j in 0..ny {
+                if at(i, j) {
+                    match out.last_mut() {
+                        Some(r) if r.1 + 1 == j => r.1 = j,
+                        _ => out.push((j, j)),
+                    }
+                }
+            }
+            out
+        };
+        let mut guard = d.graph.leaf(Op::ConstBool(false));
+        let mut i = 0;
+        while i < nx {
+            let r = runs(i);
+            let mut k = i;
+            while k + 1 < nx && runs(k + 1) == r {
+                k += 1;
+            }
+            if !r.is_empty() {
+                let mut col = d.graph.leaf(Op::ConstBool(false));
+                for (a, b) in &r {
+                    let w = within(d, 1, *a, *b);
+                    col = d.graph.fold(Op::Or, vec![col, w]);
+                }
+                let x = within(d, 0, i, k);
+                let both = d.graph.fold(Op::And, vec![x, col]);
+                guard = d.graph.fold(Op::Or, vec![guard, both]);
+            }
+            i = k + 1;
+        }
+        guard
+    }
+}
+
 /// MAKING THE FRAME EXECUTABLE UNDER ABSTRACT INPUTS (plans/graph-model.md
 /// section 1, stage 2). The traced graph computes a row for concrete inputs;
 /// a SELECT whose condition a lane can hold both ways cannot be evaluated -
@@ -502,7 +1009,9 @@ pub fn trace_frame<'a>(
 ///
 /// WHERE IT MATTERS, AND WHERE IT DOES NOT (Philippe, 2026-09-27). A select
 /// the row STORES (a field, a key) must be resolved: the row is one value.
-/// So must one the ERROR reads, which is strict. But a select in the GUARD
+/// The ERROR is strict, but once the row is resolved it is finished rather
+/// than split (`settle_error`): its splits all came back to one row, merged
+/// as the three-valued reading with the guards copied in. A select in the GUARD
 /// is only a question of whether the lane is live, and that is three-valued
 /// already - an undecided `live` reads as live (`asm_kernel::read_zb_may`).
 /// So the guard is rewritten, not split (`three_valued`): a boolean select
@@ -513,7 +1022,7 @@ pub fn trace_frame<'a>(
 /// had already asked about - room (6,0), 50,000 splits for 112 outcomes in
 /// one trace.
 ///
-/// Then, one at a time: find a select the row or the error reads whose
+/// Then, one at a time: find a select the row reads whose
 /// condition a lane can hold both ways, take the FIRST in program order
 /// (the lowest node: its condition was computed first), and split the
 /// outcome in two - the condition true in one, false in the other,
@@ -522,367 +1031,153 @@ pub fn trace_frame<'a>(
 /// (`Symbolic::may_answers`). Then look again on the split outcomes: a
 /// condition that was undecidable only through the other answer is decided
 /// now, and never split - a loop that stops at the first blocked pixel
-/// comes out as one outcome per stop point. Stop when no stored value or
-/// error has an undecided select, and fuse the outcomes that came out equal.
+/// comes out as one outcome per stop point. Stop when no stored value has
+/// an undecided select, and fuse the outcomes that came out equal.
 ///
 /// Comparisons are refolded with the static ranges (`Symbolic::compare`), so
 /// a branch the kernel's region never takes folds away, and what it read
 /// with it.
-/// `o` with every comparison its facts decide replaced by the answer - an
-/// unknown against a lane value plus a constant that the facts settle;
-/// implied, so it needs no validity - and the facts renamed to match.
-/// Before the side is keyed, so two sides equal under what they know merge.
-fn settle(d: &mut Symbolic, o: &mut FrameOut, facts: Facts) -> Facts {
-    let mut roots: Vec<NodeId> = o.fields.iter().map(|f| f.1).collect();
-    roots.extend(o.keys.iter().map(|k| k.1));
-    roots.extend([o.error, o.guard]);
-    let reach = cone(&d.graph, &roots);
-    let decided = facts.decide(d, &reach);
-    if decided.is_empty() {
-        return facts;
-    }
-    let map = rebuild_all(d, &reach, &decided);
-    let m = |n: NodeId| map.get(&n).copied().unwrap_or(n);
-    o.guard = m(o.guard);
-    o.error = m(o.error);
-    for f in &mut o.fields {
-        f.1 = m(f.1);
-    }
-    for k in &mut o.keys {
-        k.1 = m(k.1);
-    }
-    facts.rename(&map)
-}
-
-/// `split_undecided_selects`' queue: the outcomes still to split, popped
-/// largest cone first, and deduped as they arrive - a side equal to an
-/// outcome still waiting is that outcome, live wherever either is, knowing
-/// what both know (`merge_into`, `Facts::join`).
-#[derive(Default)]
-struct Waiting {
-    slots: Vec<Option<(FrameOut, Facts)>>,
-    index: rustc_hash::FxHashMap<(super::heap::Shape, Vec<(usize, NodeId)>, Vec<NodeId>), usize>,
-    heap: std::collections::BinaryHeap<(usize, std::cmp::Reverse<usize>)>,
-}
-
-impl Waiting {
-    fn key(o: &FrameOut) -> (super::heap::Shape, Vec<(usize, NodeId)>, Vec<NodeId>) {
-        (o.shape.clone(), o.keys.clone(), o.fields.iter().map(|f| f.1).collect())
-    }
-
-    fn push(&mut self, d: &mut Symbolic, o: FrameOut, facts: Facts, size: usize) {
-        let key = Self::key(&o);
-        if let Some(&i) = self.index.get(&key) {
-            let (p, pf) = self.slots[i].as_mut().expect("an indexed outcome is waiting");
-            merge_into(d, p, o.guard, o.error);
-            *pf = pf.join(&facts);
-            return;
-        }
-        let i = self.slots.len();
-        self.slots.push(Some((o, facts)));
-        self.index.insert(key, i);
-        self.heap.push((size, std::cmp::Reverse(i)));
-    }
-
-    fn pop(&mut self) -> Option<(FrameOut, Facts)> {
-        let (_, std::cmp::Reverse(i)) = self.heap.pop()?;
-        let out = self.slots[i].take().expect("a queued outcome is waiting");
-        self.index.remove(&Self::key(&out.0));
-        Some(out)
-    }
-
-    fn len(&self) -> usize {
-        self.index.len()
-    }
-}
-
-fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>) -> Result<Vec<FrameOut>> {
+///
+/// At a platforms-unknown level each path also carries its POINTS (`Points`):
+/// the worlds and pixels its answers are consistent with. A comparison only
+/// one answer comes out of at them is decided without a split, and each
+/// outcome ends live only on its pixels.
+fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Option<Points>, room: Option<&crate::transpile::graph::Room>) -> Result<Vec<FrameOut>> {
     use crate::transpile::graph::Op;
     const MAX_OUTCOMES: usize = 4096;
-    let stored = |o: &FrameOut| -> Vec<NodeId> {
-        let mut r: Vec<NodeId> = o.fields.iter().map(|(_, n, _)| *n).collect();
-        r.extend(o.keys.iter().map(|(_, n)| *n));
-        r.push(o.error);
-        r
-    };
-    let every = |o: &FrameOut| -> Vec<NodeId> {
-        let mut r = stored(o);
-        r.push(o.guard);
-        r
-    };
     let n_in = outs.len();
+    // Templates of one shape share a class: their outcomes dedupe together.
+    let class: Vec<usize> = (0..outs.len()).map(|i| (0..=i).find(|&j| outs[j].shape == outs[i].shape).expect("itself")).collect();
     // The outcomes waiting, LARGEST CONE FIRST. A split only shrinks an
     // outcome's cone, so every path into a state has arrived - and merged
     // with it - before the state is split: popped in any other order, a
     // state reached by several paths was split again for each (room (6,0):
-    // 20k splits churning ~20 outcomes, the same three platforms tested
-    // from scratch each time).
+    // 20k splits churning ~20 outcomes).
     let mut work = Waiting::default();
-    for mut o in outs {
-        o.guard = three_valued(d, o.guard);
-        let size = cone(&d.graph, &stored(&o)).len();
-        work.push(d, o, Facts::default(), size);
+    let everywhere = points.as_ref().map(|p| PointSet::full(p.len()));
+    for (t, o) in outs.iter().enumerate() {
+        let lite = Lite {
+            t,
+            guard: o.guard,
+            error: o.error,
+            fields: o.fields.iter().map(|f| f.1).collect(),
+            keys: o.keys.clone(),
+        };
+        let size = cone(&d.graph, &lite.row()).len();
+        work.push(d, &class, lite, everywhere.clone(), size);
     }
-    let mut n_splits = 0usize;
-    let mut done: Vec<FrameOut> = Vec::new();
-    while let Some((o, facts)) = work.pop() {
+    let (mut n_splits, mut n_decided) = (0usize, 0usize);
+    let mut done: Vec<(Lite, Option<PointSet>)> = Vec::new();
+    while let Some((o, pts)) = work.pop(&class) {
         anyhow::ensure!(work.len() + done.len() < MAX_OUTCOMES, "more than {MAX_OUTCOMES} outcomes splitting undecided selects");
         // The cone of what must be resolved, in node order - the outcome's
         // own, not the arena's: each split adds nodes, and a walk of the
         // whole arena per split made the splitting quadratic.
-        let reach = cone(&d.graph, &stored(&o));
-        // A select `three_valued` guarded - `Sel(Known(c), Sel(c, x, y), ..)`,
-        // evaluated only where the lane decides `c` - needs no split: the
-        // kernel reads it as it stands. A merge's error reads the guards
-        // (`merge_into`), and would otherwise split their selects again.
-        let guarded: rustc_hash::FxHashSet<NodeId> = reach
-            .iter()
-            .filter_map(|n| {
-                let node = d.graph.get(*n);
-                if node.op != Op::Sel {
-                    return None;
-                }
-                let k = d.graph.get(node.args[0]);
-                let inner = d.graph.get(node.args[1]);
-                (k.op == Op::Known && inner.op == Op::Sel && inner.args[0] == k.args[0]).then_some(node.args[1])
-            })
-            .collect();
+        let reach = cone(&d.graph, &o.row());
         let first: Option<NodeId> = reach
             .iter()
-            .filter(|n| d.graph.get(**n).op == Op::Sel && !guarded.contains(*n))
+            .filter(|n| d.graph.get(**n).op == Op::Sel)
             .map(|n| d.graph.get(*n).args[0])
             .find(|c| d.lane_undecidable(*c));
         let Some(c) = first else {
-            let same = |p: &FrameOut| p.shape == o.shape && p.keys == o.keys && p.fields.iter().map(|f| f.1).eq(o.fields.iter().map(|f| f.1));
-            match done.iter_mut().find(|p| same(p)) {
-                Some(p) => merge_into(d, p, o.guard, o.error),
-                None => done.push(o),
+            // The row is resolved; the error is finished rather than split
+            // (`settle_error`). Splitting it gave two sides with one row,
+            // merged straight back as `(g1 and e1) or (g2 and e2)` - the
+            // three-valued reading with the guards copied in, doubling each
+            // round (room (6,0): a 41-node row under a 5M-node error).
+            let o = settle_error(d, points.as_mut(), pts.as_ref(), room, o);
+            let same = |p: &Lite| class[p.t] == class[o.t] && p.keys == o.keys && p.fields == o.fields;
+            match done.iter_mut().find(|(p, _)| same(p)) {
+                Some((p, pp)) => {
+                    p.merge(d, o.guard, o.error);
+                    if let (Some(a), Some(b)) = (pp.as_mut(), pts.as_ref()) {
+                        a.union(b);
+                    }
+                }
+                None => done.push((o, pts)),
             }
             continue;
         };
         // Split on the finest undecidable part of it - the lowest comparison
-        // a lane can hold both ways - so that what the answer says about the
-        // unknown it reads can be KEPT (`Facts`): the player's every later
-        // test of the same platform is then decided, not split again.
+        // a lane can hold both ways - so the points it is decided over are
+        // the answer's own, not a condition's built of several.
         let atom = cone(&d.graph, &[c])
             .into_iter()
             .find(|n| matches!(d.graph.get(*n).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::UnknownBool(_)) && d.lane_undecidable(*n))
             .unwrap_or(c);
-        n_splits += 1;
-        if n_splits % 2000 == 0 && std::env::var_os("XSUM").is_some() {
-            eprintln!("[xprog] {n_splits} splits, work {} done {}, facts {}, cone {}, graph {}; atom {}", work.len(), done.len(), facts.0.len(), reach.len(), d.graph.len(), super::emit::show_tree(&d.graph, atom, 6));
-            eprintln!("[xrel] {:?}", relation(d, atom).map(|(r, op, t)| (facts.0.get(&r).copied(), r, op, t)));
+        // Where each answer can come from, among this path's points: an
+        // answer no point gives is no side at all, and when only one is
+        // left the comparison is DECIDED here - the same answer at every
+        // point, so every state this path stands for gives it, and no
+        // lane's guard needs narrowing.
+        let sides: Vec<(bool, Option<PointSet>)> = match (points.as_mut(), &pts) {
+            (Some(p), Some(here)) => {
+                let (yes, no) = p.answers(d, room, atom);
+                [(true, yes.and(here)), (false, no.and(here))].into_iter().filter(|(_, s)| !s.is_empty()).map(|(a, s)| (a, Some(s))).collect()
+            }
+            _ => vec![(true, None), (false, None)],
+        };
+        let decided = sides.len() == 1;
+        if decided {
+            n_decided += 1;
+        } else {
+            n_splits += 1;
         }
         let (may_true, may_false) = d.may_answers(atom);
-        let reach = cone(&d.graph, &every(&o));
-        let rel = relation(d, atom);
-        for (answer, may) in [(true, may_true), (false, may_false)] {
-            let mut learnt = facts.clone();
-            if let Some((r, op, t)) = &rel {
-                if !learnt.narrow(r.clone(), op, *t, answer) {
-                    continue;
-                }
-            }
+        let reach = cone(&d.graph, &o.every());
+        for (answer, side_pts) in sides {
             let to = d.graph.leaf(Op::ConstBool(answer));
             let map = rebuild_all(d, &reach, &rustc_hash::FxHashMap::from_iter([(atom, to)]));
-            let learnt = learnt.rename(&map);
             let m = |n: NodeId| map.get(&n).copied().unwrap_or(n);
-            let guard = m(o.guard);
-            let guard = d.and(&guard, &may);
+            let mut guard = m(o.guard);
+            if !decided {
+                let may = if answer { may_true } else { may_false };
+                guard = d.and(&guard, &may);
+            }
             if d.decide(&guard) == Some(false) {
                 continue;
             }
-            let error = m(o.error);
-            let fields: Vec<NodeId> = o.fields.iter().map(|f| m(f.1)).collect();
-            let keys: Vec<(usize, NodeId)> = o.keys.iter().map(|(i, k)| (*i, m(*k))).collect();
-            let mut side = o.clone();
-            side.guard = guard;
-            side.error = error;
-            for (f, n) in side.fields.iter_mut().zip(fields) {
-                f.1 = n;
-            }
-            side.keys = keys;
-            let learnt = settle(d, &mut side, learnt);
-            let size = cone(&d.graph, &stored(&side)).len();
-            work.push(d, side, learnt, size);
+            let side = Lite {
+                t: o.t,
+                guard,
+                error: m(o.error),
+                fields: o.fields.iter().map(|f| m(*f)).collect(),
+                keys: o.keys.iter().map(|(i, k)| (*i, m(*k))).collect(),
+            };
+            let size = cone(&d.graph, &side.row()).len();
+            work.push(d, &class, side, side_pts, size);
         }
     }
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
-        eprintln!("[build] split_undecided_selects: {n_in} outcomes, {n_splits} splits, {} out", done.len());
+        eprintln!("[build] split_undecided_selects: {n_in} outcomes, {n_splits} splits, {n_decided} decided by the points, {} out", done.len());
     }
-    Ok(done)
+    // Each outcome whole again, over its template; what reaches the kernel
+    // of the points is its pixels.
+    Ok(done
+        .into_iter()
+        .map(|(lite, pts)| {
+            let mut o = outs[lite.t].clone();
+            o.guard = lite.guard;
+            o.error = lite.error;
+            for (f, n) in o.fields.iter_mut().zip(lite.fields) {
+                f.1 = n;
+            }
+            o.keys = lite.keys;
+            // The guard read three-valued now, with what the row's splits
+            // decided already substituted (`three_valued`).
+            o.guard = three_valued(d, o.guard);
+            // And the error: merged outcomes copied their guards into it.
+            o.error = three_valued(d, o.error);
+            if let (Some(p), Some(pts)) = (points.as_ref(), pts.as_ref()) {
+                let g = p.position_guard(d, pts);
+                o.guard = d.and(&o.guard, &g);
+            }
+            o
+        })
+        .collect())
 }
 
-/// An unknown relative to a lane value: `u - anchor`, `u` the one term a lane
-/// holds a set of (a platform's `x`), `anchor` a sum of terms each lane holds
-/// one value of (the player's `x`, a move's step), as `(negated, term)`.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct Rel {
-    u: NodeId,
-    anchor: Vec<(bool, NodeId)>,
-}
-
-/// What a side of `split_undecided_selects` has learnt from the comparisons
-/// it split: the range of each `u - anchor` (raw, inclusive). A comparison
-/// of the same difference against another threshold is then decided, as far
-/// as the range settles it - the relation intervals alone cannot hold
-/// ("platform 2 is more than 10 px right of the player") that made every
-/// check after a move split again on the same platform (room (6,0),
-/// 2026-09-27).
-///
-/// Sound as a case split over CONCRETE states: each state goes down the
-/// side of its own answer, so what the answer says of its `u - anchor` holds
-/// for every state the side stands for (the lanes a side over-covers are
-/// accounted for on the other side).
-#[derive(Clone, Default)]
-struct Facts(std::collections::BTreeMap<Rel, (i64, i64)>);
-
-/// `u - anchor op t`, `t` some value in `[t.0, t.1]`: an interval constant
-/// in the comparison (the sub-pixel remainder) is one value per concrete
-/// state, not known here.
-type Threshold = (i64, i64);
-
-impl Facts {
-    /// Keep that `rel op t` came out `answer`. `false` where that
-    /// contradicts what is known: the side is empty.
-    fn narrow(&mut self, rel: Rel, op: &crate::transpile::graph::Op, t: Threshold, answer: bool) -> bool {
-        use crate::transpile::graph::Op;
-        let r = self.0.entry(rel).or_insert((i64::MIN, i64::MAX));
-        let (tlo, thi) = t;
-        let (lo, hi) = match (op, answer) {
-            (Op::Lt, true) | (Op::Ge, false) => (r.0, r.1.min(thi - 1)),
-            (Op::Lt, false) | (Op::Ge, true) => (r.0.max(tlo), r.1),
-            (Op::Le, true) | (Op::Gt, false) => (r.0, r.1.min(thi)),
-            (Op::Le, false) | (Op::Gt, true) => (r.0.max(tlo + 1), r.1),
-            (Op::Eq, true) => (r.0.max(tlo), r.1.min(thi)),
-            _ => *r,
-        };
-        *r = (lo, hi);
-        lo <= hi
-    }
-
-    /// The comparisons in `nodes` these facts settle, each to its constant.
-    fn decide(&self, d: &mut Symbolic, nodes: &[NodeId]) -> rustc_hash::FxHashMap<NodeId, NodeId> {
-        use crate::transpile::graph::Op;
-        let mut out: rustc_hash::FxHashMap<NodeId, NodeId> = Default::default();
-        if self.0.is_empty() {
-            return out;
-        }
-        for &n in nodes {
-            if !matches!(d.graph.get(n).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq) {
-                continue;
-            }
-            let Some((rel, op, (tlo, thi))) = relation(d, n) else { continue };
-            let Some(&(lo, hi)) = self.0.get(&rel) else { continue };
-            let answer = match op {
-                Op::Lt => (hi < tlo).then_some(true).or((lo >= thi).then_some(false)),
-                Op::Le => (hi <= tlo).then_some(true).or((lo > thi).then_some(false)),
-                Op::Gt => (lo > thi).then_some(true).or((hi <= tlo).then_some(false)),
-                Op::Ge => (lo >= thi).then_some(true).or((hi < tlo).then_some(false)),
-                _ => (lo == hi && tlo == thi && lo == tlo).then_some(true).or((hi < tlo || lo > thi).then_some(false)),
-            };
-            if let Some(a) = answer {
-                out.insert(n, d.graph.leaf(Op::ConstBool(a)));
-            }
-        }
-        out
-    }
-
-    /// The facts renamed through a rebuild: on the side that made it, a
-    /// rebuilt node equals its original on every state, so what was known
-    /// of the one is known of the other.
-    fn rename(&self, map: &rustc_hash::FxHashMap<NodeId, NodeId>) -> Facts {
-        let m = |n: NodeId| map.get(&n).copied().unwrap_or(n);
-        let mut out = Facts::default();
-        for (rel, &(lo, hi)) in &self.0 {
-            let mut anchor: Vec<(bool, NodeId)> = rel.anchor.iter().map(|(neg, t)| (*neg, m(*t))).collect();
-            anchor.sort();
-            let r = out.0.entry(Rel { u: m(rel.u), anchor }).or_insert((i64::MIN, i64::MAX));
-            *r = (r.0.max(lo), r.1.min(hi));
-        }
-        out
-    }
-
-    /// What two merged sides both know: each common difference's hull.
-    fn join(&self, other: &Facts) -> Facts {
-        Facts(self.0.iter().filter_map(|(k, a)| other.0.get(k).map(|b| (k.clone(), (a.0.min(b.0), a.1.max(b.1))))).collect())
-    }
-}
-
-/// `c` as `u - anchor op t` (`Rel`, `Threshold`): a comparison whose two
-/// sides differ by ONE term a lane holds a set of, with coefficient 1 after
-/// normalising, terms each lane holds one value of, and constants (interval
-/// constants included, as the threshold's range).
-fn relation(d: &mut Symbolic, c: NodeId) -> Option<(Rel, crate::transpile::graph::Op, Threshold)> {
-    use crate::transpile::graph::Op;
-    fn linear(d: &Symbolic, n: NodeId, neg: bool, terms: &mut Vec<(bool, NodeId)>, k: &mut (i64, i64)) -> bool {
-        let node = d.graph.get(n);
-        match node.op {
-            Op::Add => linear(d, node.args[0], neg, terms, k) && linear(d, node.args[1], neg, terms, k),
-            Op::Sub => linear(d, node.args[0], neg, terms, k) && linear(d, node.args[1], !neg, terms, k),
-            Op::Neg => linear(d, node.args[0], !neg, terms, k),
-            Op::Const(lo, hi) => {
-                let (lo, hi) = (lo as i64, hi as i64);
-                if neg {
-                    *k = (k.0 - hi, k.1 - lo);
-                } else {
-                    *k = (k.0 + lo, k.1 + hi);
-                }
-                true
-            }
-            _ => {
-                // A term and its negation cancel.
-                match terms.iter().position(|t| t.1 == n && t.0 != neg) {
-                    Some(i) => {
-                        terms.remove(i);
-                    }
-                    None => terms.push((neg, n)),
-                }
-                true
-            }
-        }
-    }
-    let node = d.graph.get(c);
-    let op = node.op.clone();
-    if !matches!(op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq) {
-        return None;
-    }
-    let (l, r) = (node.args[0], node.args[1]);
-    // Integer reasoning holds only where the 16.16 sums cannot wrap: both
-    // sides must have a static range (`pieces_of` refuses an overflow). A
-    // decided comparison is never evaluated, so the kernel's own overflow
-    // check on it would go with it.
-    if d.range_of(l).is_none() || d.range_of(r).is_none() {
-        return None;
-    }
-    let (mut terms, mut k) = (Vec::new(), (0i64, 0i64));
-    if !linear(d, l, false, &mut terms, &mut k) || !linear(d, r, true, &mut terms, &mut k) {
-        return None;
-    }
-    // `sum(terms) + k op 0`, exactly one of them a set.
-    let sets: Vec<usize> = (0..terms.len()).filter(|&i| d.abstract_beneath_lane_ops(terms[i].1)).collect();
-    let [i] = sets.as_slice() else { return None };
-    let (u_neg, u) = terms.remove(*i);
-    // Make `u`'s coefficient +1: negate everything, and mirror the operator.
-    let (op, k, terms) = if u_neg {
-        let mirror = match op {
-            Op::Lt => Op::Gt,
-            Op::Le => Op::Ge,
-            Op::Gt => Op::Lt,
-            Op::Ge => Op::Le,
-            o => o,
-        };
-        (mirror, (-k.1, -k.0), terms.into_iter().map(|(n, t)| (!n, t)).collect::<Vec<_>>())
-    } else {
-        (op, k, terms)
-    };
-    // `u + sum(terms) + k op 0` is `u - anchor op -k`, `anchor = -sum(terms)`.
-    let mut anchor: Vec<(bool, NodeId)> = terms.into_iter().map(|(n, t)| (!n, t)).collect();
-    anchor.sort();
-    Some((Rel { u, anchor }, op, (-k.1, -k.0)))
-}
-
-/// `root` - a guard - with no select on an undecided condition left for the
+/// `root` - a guard or an error - with no select on an undecided condition left for the
 /// kernel to read by a garbage bit (`split_undecided_selects`). A boolean
 /// select becomes `(c and a) or (not c and b)`, exact in Kleene logic. A
 /// NUMBER selected on an undecided `c` becomes the hull of its arms where
@@ -891,34 +1186,70 @@ fn relation(d: &mut Symbolic, c: NodeId) -> Option<(Rel, crate::transpile::graph
 /// straddles reads as "may be live", which is what `live` over-approximates
 /// with anyway. (Pushing the readers into the arms instead is exact and
 /// exponential: the player's position after a move is a tree of such
-/// selects, and every sum of two of them multiplies.)
+/// selects, and every sum of two of them multiplies.) Except for the ops the
+/// kernel computes on exact operands only (`exact_only`: a tile lookup at a
+/// hulled position cannot be assembled): those are pushed into the arms,
+/// up to `ARMS` combinations (`arms`).
+///
+/// Also the error's, once the row is resolved (`settle_error`).
 fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
     use crate::transpile::graph::Op;
     let nodes = cone(&d.graph, &[root]);
-    let undecided = |d: &mut Symbolic, n: NodeId| d.graph.get(n).op == Op::Sel && d.lane_undecidable(d.graph.get(n).args[0]);
+    // The select a wrapper this built already guards (`Sel(Known(c), Sel(c,
+    // ..), hull)`) stays as it is: rewriting it again moved it off the
+    // registration that bounds its error - so this is idempotent.
+    let wrapped: rustc_hash::FxHashSet<NodeId> = nodes
+        .iter()
+        .filter_map(|n| {
+            let node = d.graph.get(*n);
+            if node.op != Op::Sel {
+                return None;
+            }
+            let (k, inner) = (d.graph.get(node.args[0]), d.graph.get(node.args[1]));
+            (k.op == Op::Known && inner.op == Op::Sel && inner.args[0] == k.args[0]).then_some(node.args[1])
+        })
+        .collect();
+    let undecided = |d: &mut Symbolic, n: NodeId| !wrapped.contains(&n) && d.graph.get(n).op == Op::Sel && d.lane_undecidable(d.graph.get(n).args[0]);
     if !nodes.iter().any(|n| undecided(d, *n)) {
         return root;
     }
-    // Which selects a boolean reads (and the root): those are booleans.
+    // The booleans, typed bottom-up from what each node IS (a boolean op, a
+    // boolean cell, a select of booleans) - not from who reads it: a select
+    // of booleans read as another select's condition, or by `Eq`, was taken
+    // for a number and hulled (room (6,0), 2026-09-28).
     let mut boolean: rustc_hash::FxHashSet<NodeId> = Default::default();
-    boolean.insert(root);
     for &n in &nodes {
         let node = d.graph.get(n);
-        if matches!(node.op, Op::And | Op::Or | Op::Not | Op::Known) {
-            boolean.extend(node.args.iter().copied());
-        }
-        if node.op == Op::Sel && boolean.contains(&n) {
-            boolean.extend(node.args[1..].iter().copied());
+        let b = match node.op {
+            Op::Sel => boolean.contains(&node.args[1]) || boolean.contains(&node.args[2]),
+            Op::Cell(c) => d.graph.cell_kind(c) == crate::transpile::graph::CellKind::Bool,
+            ref o => is_bool_op(o),
+        };
+        if b {
+            boolean.insert(n);
         }
     }
     let mut map: rustc_hash::FxHashMap<NodeId, NodeId> = Default::default();
+    // What an undecided select reaches (its readers, transitively), and the
+    // exact values of those numbers per arm (`arms`).
+    let mut affected: rustc_hash::FxHashSet<NodeId> = Default::default();
+    let mut arms_memo: rustc_hash::FxHashMap<NodeId, Option<Vec<(NodeId, NodeId)>>> = Default::default();
+    let yes = d.graph.leaf(Op::ConstBool(true));
     for &n in &nodes {
         let (op, args) = {
             let node = d.graph.get(n);
             (node.op.clone(), node.args.clone())
         };
+        if wrapped.contains(&n) {
+            map.insert(n, n);
+            continue;
+        }
         let a: Vec<NodeId> = args.iter().map(|x| *map.get(x).unwrap_or(x)).collect();
-        let new = if op == Op::Sel && d.lane_undecidable(args[0]) {
+        let sel_undecided = op == Op::Sel && (d.lane_undecidable(args[0]) || d.lane_undecidable(a[0]));
+        // Undecided as REWRITTEN: a condition that became undecidable here (a
+        // tile test past `ARMS`, an unknown now) makes a select that was
+        // decided before an undecided one.
+        let new = if sel_undecided {
             let (c, x, y) = (a[0], a[1], a[2]);
             if boolean.contains(&n) {
                 let nc = d.graph.fold(Op::Not, vec![c]);
@@ -929,8 +1260,13 @@ fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
                 let decided = d.graph.fold(Op::Known, vec![c]);
                 let picked = d.graph.fold(Op::Sel, vec![c, x, y]);
                 // Evaluated only where the lane decides `c` - its own error
-                // holds nowhere else (`trace::error`).
-                d.evaluated_at(&picked, &decided);
+                // holds nowhere else (`trace::error`). SET, not added to:
+                // `picked` is the original select itself (hash-consed), and
+                // what the tracer registered for it (an unguarded `true`)
+                // made its `not Known(c)` hold on every lane (room (6,0) f24,
+                // 2026-09-28). This wrapper is the only place a select on an
+                // undecided condition survives the split pass.
+                d.evaluated.insert(picked, decided);
                 let (xl, yl) = (d.graph.fold(Op::Lo, vec![x]), d.graph.fold(Op::Lo, vec![y]));
                 let (xh, yh) = (d.graph.fold(Op::Hi, vec![x]), d.graph.fold(Op::Hi, vec![y]));
                 let lo = d.graph.fold(Op::Min, vec![xl, yl]);
@@ -938,26 +1274,183 @@ fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
                 let hull = d.graph.fold(Op::Span, vec![lo, hi]);
                 d.graph.fold(Op::Sel, vec![decided, picked, hull])
             }
+        } else if exact_only(d, &op, &args) && args.iter().any(|x| affected.contains(x) && !boolean.contains(x) && !is_bool_op(&d.graph.get(*x).op)) {
+            // An op the kernel only computes on exact operands (a tile
+            // lookup, `mget`, ...), reading a hull: distributed into the
+            // arms instead, one per combination of the undecided selects
+            // it reads - a boolean joined Kleene-wise over them, a number
+            // the hull of the arms' values. Past `ARMS` combinations, the
+            // weakest value (unknown, or the whole range): sound, and it
+            // has not been seen.
+            let mut combos: Option<Vec<(NodeId, Vec<NodeId>)>> = Some(vec![(yes, Vec::new())]);
+            for (k, x) in args.iter().enumerate() {
+                let alts = if affected.contains(x) && !boolean.contains(x) && !is_bool_op(&d.graph.get(*x).op) {
+                    arms(d, *x, &map, &affected, &boolean, &mut arms_memo)
+                } else {
+                    Some(vec![(yes, a[k])])
+                };
+                combos = match (combos, alts) {
+                    (Some(cs), Some(alts)) if cs.len() * alts.len() <= ARMS => Some(
+                        cs.iter()
+                            .flat_map(|(c, vs)| {
+                                alts.iter().map(move |(ac, v)| {
+                                    let mut vs = vs.clone();
+                                    vs.push(*v);
+                                    ((*c, *ac), vs)
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .map(|((c, ac), vs)| (d.graph.fold(Op::And, vec![c, ac]), vs))
+                            .collect(),
+                    ),
+                    _ => None,
+                };
+            }
+            let boolean_op = is_bool_op(&op);
+            match combos {
+                Some(cs) if boolean_op => {
+                    let mut out = d.graph.leaf(Op::ConstBool(false));
+                    for (c, vs) in cs {
+                        let v = d.graph.fold(op.clone(), vs);
+                        let both = d.graph.fold(Op::And, vec![c, v]);
+                        out = d.graph.fold(Op::Or, vec![out, both]);
+                    }
+                    out
+                }
+                Some(cs) => {
+                    let vals: Vec<NodeId> = cs.into_iter().map(|(_, vs)| d.graph.fold(op.clone(), vs)).collect();
+                    hull_of(d, &vals)
+                }
+                None if boolean_op => {
+                    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+                        eprintln!("[build] three_valued: {op:?} past {ARMS} arms, unknown");
+                    }
+                    d.unknown_bool_atom()
+                }
+                None => {
+                    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+                        eprintln!("[build] three_valued: {op:?} past {ARMS} arms, the whole range");
+                    }
+                    d.graph.leaf(Op::Const(i32::MIN, i32::MAX))
+                }
+            }
         } else if a == args {
             n
         } else {
-            d.graph.fold(op, a)
+            d.graph.fold(op.clone(), a)
         };
+        if args.iter().any(|x| affected.contains(x)) || sel_undecided {
+            affected.insert(n);
+        }
         map.insert(n, new);
     }
     map[&root]
 }
 
-/// One outcome absorbing another with the same row: live wherever either
-/// is, and in error where the one live there is - each error only counts
-/// on its own lanes, so the merged error is `(g1 and e1) or (g2 and e2)`,
-/// and where the two errors are one node, that node.
-fn merge_into(d: &mut Symbolic, p: &mut FrameOut, guard: NodeId, error: NodeId) {
-    if p.error != error {
-        let (a, b) = (d.and(&p.guard, &p.error), d.and(&guard, &error));
-        p.error = d.or(&a, &b);
+/// `three_valued`'s bound on the arms an exact-only op is distributed over.
+const ARMS: usize = 64;
+
+/// Ops the kernel computes on exact operands only (`asm::codegen`'s
+/// `as_num`): an interval must not reach them. `Mul`/`Div` take an interval
+/// scaled by a positive literal (`pos_const_scalar`), and only that.
+fn exact_only(d: &Symbolic, op: &crate::transpile::graph::Op, args: &[NodeId]) -> bool {
+    use crate::transpile::graph::Op;
+    let pos = |n: NodeId| matches!(d.graph.get(n).op, Op::Const(lo, hi) if lo == hi && lo > 0);
+    match op {
+        Op::TileFlagAt | Op::Mget | Op::Rem | Op::Sin => true,
+        Op::Mul => !(pos(args[0]) || pos(args[1])),
+        Op::Div => !pos(args[1]),
+        _ => false,
     }
-    p.guard = d.or(&p.guard, &guard);
+}
+
+/// Ops whose value is a boolean.
+fn is_bool_op(op: &crate::transpile::graph::Op) -> bool {
+    use crate::transpile::graph::Op;
+    matches!(
+        op,
+        Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Not | Op::And | Op::Or | Op::Known | Op::ConstBool(_) | Op::UnknownBool(_) | Op::TileFlagAt
+            | Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_) | Op::Free(_)
+    )
+}
+
+/// The hull `[min lo, max hi]` of numbers.
+fn hull_of(d: &mut Symbolic, vals: &[NodeId]) -> NodeId {
+    use crate::transpile::graph::Op;
+    let (mut lo, mut hi) = (d.graph.fold(Op::Lo, vec![vals[0]]), d.graph.fold(Op::Hi, vec![vals[0]]));
+    for v in &vals[1..] {
+        let (l, h) = (d.graph.fold(Op::Lo, vec![*v]), d.graph.fold(Op::Hi, vec![*v]));
+        lo = d.graph.fold(Op::Min, vec![lo, l]);
+        hi = d.graph.fold(Op::Max, vec![hi, h]);
+    }
+    d.graph.fold(Op::Span, vec![lo, hi])
+}
+
+/// A number `three_valued` hulled, as the exact values it takes and where:
+/// `(condition, value)` over the undecided selects under it, the conditions
+/// Kleene (`map`'s). `None` past `ARMS`.
+fn arms(
+    d: &mut Symbolic,
+    n: NodeId,
+    map: &rustc_hash::FxHashMap<NodeId, NodeId>,
+    affected: &rustc_hash::FxHashSet<NodeId>,
+    boolean: &rustc_hash::FxHashSet<NodeId>,
+    memo: &mut rustc_hash::FxHashMap<NodeId, Option<Vec<(NodeId, NodeId)>>>,
+) -> Option<Vec<(NodeId, NodeId)>> {
+    use crate::transpile::graph::Op;
+    if let Some(hit) = memo.get(&n) {
+        return hit.clone();
+    }
+    let yes = d.graph.leaf(Op::ConstBool(true));
+    let (op, args) = {
+        let node = d.graph.get(n);
+        (node.op.clone(), node.args.clone())
+    };
+    let numeric = |d: &Symbolic, x: NodeId| affected.contains(&x) && !boolean.contains(&x) && !is_bool_op(&d.graph.get(x).op);
+    let out = if !affected.contains(&n) {
+        Some(vec![(yes, *map.get(&n).unwrap_or(&n))])
+    } else if op == Op::Sel && (d.lane_undecidable(args[0]) || d.lane_undecidable(*map.get(&args[0]).unwrap_or(&args[0]))) {
+        // Undecided as rewritten too (`three_valued`'s `sel_undecided`): an
+        // arm per answer, never a select left on it.
+        let c = *map.get(&args[0]).unwrap_or(&args[0]);
+        let nc = d.graph.fold(Op::Not, vec![c]);
+        match (arms(d, args[1], map, affected, boolean, memo), arms(d, args[2], map, affected, boolean, memo)) {
+            (Some(t), Some(f)) if t.len() + f.len() <= ARMS => {
+                let mut v = Vec::with_capacity(t.len() + f.len());
+                for (k, x) in t {
+                    v.push((d.graph.fold(Op::And, vec![k, c]), x));
+                }
+                for (k, x) in f {
+                    v.push((d.graph.fold(Op::And, vec![k, nc]), x));
+                }
+                Some(v)
+            }
+            _ => None,
+        }
+    } else {
+        let mut combos: Option<Vec<(NodeId, Vec<NodeId>)>> = Some(vec![(yes, Vec::new())]);
+        for x in &args {
+            let alts = if numeric(d, *x) { arms(d, *x, map, affected, boolean, memo) } else { Some(vec![(yes, *map.get(x).unwrap_or(x))]) };
+            combos = match (combos, alts) {
+                (Some(cs), Some(alts)) if cs.len() * alts.len() <= ARMS => {
+                    let mut next = Vec::with_capacity(cs.len() * alts.len());
+                    for (c, vs) in &cs {
+                        for (ac, v) in &alts {
+                            let mut vs = vs.clone();
+                            vs.push(*v);
+                            next.push((d.graph.fold(Op::And, vec![*c, *ac]), vs));
+                        }
+                    }
+                    Some(next)
+                }
+                _ => None,
+            };
+        }
+        combos.map(|cs| cs.into_iter().map(|(c, vs)| (c, d.graph.fold(op.clone(), vs))).collect())
+    };
+    memo.insert(n, out.clone());
+    out
 }
 
 /// The nodes `roots` reach, ascending (operands precede their node).
@@ -978,9 +1471,27 @@ fn cone(g: &crate::transpile::graph::Graph, roots: &[NodeId]) -> Vec<NodeId> {
 /// order; comparisons refolded against the static ranges
 /// (`Symbolic::compare`), the rest by `Graph::fold`. Only the nodes that
 /// changed are in the map.
+///
+/// Where a node was EVALUATED (`Symbolic::evaluated`, what bounds its own
+/// error, `trace::error`) goes with it: its rebuild is registered at the
+/// rebuilt condition, so the cone is widened to those conditions first.
+/// Dropped, the rebuild's own error held everywhere - a three-valued guard's
+/// `Sel(Known(c), Sel(c, ..), ..)` rebuilt by a split erred as `not Known(c)`
+/// on every lane (room (6,0) f24, 2026-09-28).
 fn rebuild_all(d: &mut Symbolic, cone: &[NodeId], subst: &rustc_hash::FxHashMap<NodeId, NodeId>) -> rustc_hash::FxHashMap<NodeId, NodeId> {
-    use super::domain::Cmp;
+    use super::domain::{Cmp, Domain};
     use crate::transpile::graph::Op;
+    let mut all: Vec<NodeId> = cone.to_vec();
+    loop {
+        let have: rustc_hash::FxHashSet<NodeId> = all.iter().copied().collect();
+        let more: Vec<NodeId> = all.iter().filter_map(|n| d.evaluated.get(n).copied()).filter(|a| !have.contains(a)).collect();
+        if more.is_empty() {
+            break;
+        }
+        all.extend(more);
+        all = self::cone(&d.graph, &all);
+    }
+    let cone = &all[..];
     let mut map: rustc_hash::FxHashMap<NodeId, NodeId> = subst.clone();
     for &i in cone {
         if subst.contains_key(&i) {
@@ -1007,6 +1518,11 @@ fn rebuild_all(d: &mut Symbolic, cone: &[NodeId], subst: &rustc_hash::FxHashMap<
             None => d.graph.fold(op, mapped),
         };
         map.insert(i, n);
+    }
+    let moved: Vec<(NodeId, NodeId)> = cone.iter().filter_map(|i| Some((*map.get(i)?, *d.evaluated.get(i)?))).collect();
+    for (n, at) in moved {
+        let at = *map.get(&at).unwrap_or(&at);
+        d.evaluated_at(&n, &at);
     }
     map
 }
