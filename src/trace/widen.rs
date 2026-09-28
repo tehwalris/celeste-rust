@@ -398,7 +398,30 @@ pub fn platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec
             .ok_or_else(|| anyhow::anyhow!("no platform world entry at y {y:#x} dir {dir:#x} left for {}", iface::show(obj)))?;
         taken[j] = true;
         let spd = field(obj, &["spd", "x"]);
-        if let Some(Value::Num(sv)) = iface::get(st, &spd) {
+        let moving: Vec<i32> = {
+            let mut v: Vec<i32> = worlds.iter().map(|w| w[j][3]).filter(|s| *s != 0).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        if let (Some(Value::Num(sv)), None, [v]) = (iface::get(st, &spd), super::shapes::player_path(st), moving.as_slice()) {
+            // NO PLAYER: a platform's move is unobservable - its `x`, `last`
+            // and `rem.x` are widened at the frame's end and `update` sets
+            // `spd.x` to `dir * 0.65` whatever it was - and the worlds say an
+            // unpinned `spd.x` is 0 (the load) or that one speed. So the move
+            // reads the speed as the literal, and the floor of the literal
+            // remainder plus it rejoins as fragments (`literal_fragments`)
+            // where an input cell forked it, once per platform - with the
+            // fruit unknown, 2048 configurations per outcome of the room
+            // (6,0) spawn shape (decision 2026-09-28). Asserted: the lane's
+            // speed is 0 or that one.
+            if matches!(d.graph.get(sv).op, Op::Cell(_)) {
+                let (k0, kv) = (d.graph.leaf(Op::Const(0, 0)), d.graph.leaf(Op::Const(*v, *v)));
+                let (a, b) = (d.graph.fold(Op::Eq, vec![sv, k0]), d.graph.fold(Op::Eq, vec![sv, kv]));
+                obligations.push(d.graph.fold(Op::Or, vec![a, b]));
+                iface::set(st, &spd, Value::Num(kv))?;
+            }
+        } else if let Some(Value::Num(sv)) = iface::get(st, &spd) {
             if matches!(d.graph.get(sv).op, Op::Cell(_)) {
                 let lo = worlds.iter().map(|w| w[j][3]).min().expect("a world");
                 let hi = worlds.iter().map(|w| w[j][3]).max().expect("a world");

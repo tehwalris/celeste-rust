@@ -1153,28 +1153,30 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
     }
     // Each outcome whole again, over its template; what reaches the kernel
     // of the points is its pixels.
-    Ok(done
-        .into_iter()
-        .map(|(lite, pts)| {
-            let mut o = outs[lite.t].clone();
-            o.guard = lite.guard;
-            o.error = lite.error;
-            for (f, n) in o.fields.iter_mut().zip(lite.fields) {
-                f.1 = n;
-            }
-            o.keys = lite.keys;
-            // The guard read three-valued now, with what the row's splits
-            // decided already substituted (`three_valued`).
-            o.guard = three_valued(d, o.guard);
-            // And the error: merged outcomes copied their guards into it.
-            o.error = three_valued(d, o.error);
-            if let (Some(p), Some(pts)) = (points.as_ref(), pts.as_ref()) {
-                let g = p.position_guard(d, pts);
-                o.guard = d.and(&o.guard, &g);
-            }
-            o
-        })
-        .collect())
+    let mut whole = Vec::with_capacity(done.len());
+    for (lite, pts) in done {
+        // The error settled again: merged outcomes copied their guards into
+        // it, and what a guard's selects read (a tile test at a position a
+        // split left open) is only exact case by case - three-valued, a tile
+        // test past `ARMS` was an unknown in the error and declined the
+        // lanes of the other path (room (6,0) f26, 2026-09-28).
+        let lite = settle_error(d, points.as_mut(), pts.as_ref(), room, lite);
+        let mut o = outs[lite.t].clone();
+        // The guard read three-valued now, with what the row's splits
+        // decided already substituted (`three_valued`).
+        o.guard = three_valued(d, lite.guard);
+        o.error = lite.error;
+        for (f, n) in o.fields.iter_mut().zip(lite.fields) {
+            f.1 = n;
+        }
+        o.keys = lite.keys;
+        if let (Some(p), Some(pts)) = (points.as_ref(), pts.as_ref()) {
+            let g = p.position_guard(d, pts);
+            o.guard = d.and(&o.guard, &g);
+        }
+        whole.push(o);
+    }
+    Ok(whole)
 }
 
 /// `root` - a guard or an error - with no select on an undecided condition left for the
@@ -1323,10 +1325,11 @@ fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
                     hull_of(d, &vals)
                 }
                 None if boolean_op => {
+                    let u = d.unknown_bool_atom();
                     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
-                        eprintln!("[build] three_valued: {op:?} past {ARMS} arms, unknown");
+                        eprintln!("[build] three_valued: {op:?} past {ARMS} arms, unknown {:?}", d.graph.get(u).op);
                     }
-                    d.unknown_bool_atom()
+                    u
                 }
                 None => {
                     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {

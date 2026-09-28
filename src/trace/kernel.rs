@@ -115,7 +115,14 @@ pub(crate) fn lattice_kernel_refs(
     let room = &room;
     // A pool of one worker per core pulling frames off an atomic index
     // (a thread per frame lowered 600 at once and hit the memory cap).
-    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(frames.len().max(1));
+    // `CELESTE_BUILD_THREADS` caps the kernels lowered and assembled at once:
+    // room (6,0)'s largest take several GB each, and 32 at once ran out of
+    // memory (2026-09-28).
+    let n_workers = std::env::var("CELESTE_BUILD_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+        .min(frames.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
     // Each frame is taken by exactly one worker (a `Frame` is not cloned).
     let slots: Vec<std::sync::Mutex<Option<(KernelKey, super::verify::Frame, Bounds, Option<Bound>)>>> =
@@ -208,7 +215,7 @@ pub fn region_grid_for(opts: super::shapes::WalkOpts) -> Result<Option<RegionGri
             Some("off") => None,
             Some(s) => {
                 let v: Vec<i32> = s.split(',').map(|t| t.trim().parse().expect("CELESTE_REGION=\"px,S\" or off")).collect();
-                assert!(v.len() == 2 && v[0] >= 8 && (1..=7).contains(&v[1]), "CELESTE_REGION=\"px,S\" with px >= 8 and 1 <= S <= 7, not {s:?}");
+                assert!(v.len() == 2 && v[0] >= 1 && (1..=7).contains(&v[1]), "CELESTE_REGION=\"px,S\" with px >= 1 and 1 <= S <= 7, not {s:?}");
                 Some((RegionGrid { px: v[0], speed: v[1] }, true))
             }
             None => Some((RegionGrid { px: 16, speed: 6 }, false)),
@@ -351,6 +358,27 @@ fn successor_regions(
         anyhow::ensure!(hull[axis].0 <= hull[axis].1, "{}: its range lies outside the screen window {window:?}", iface::show(&p));
     }
     let (a, b) = (g.of(hull[0].0 as i32, hull[1].0 as i32), g.of(hull[0].1 as i32, hull[1].1 as i32));
+    // THE WALK PROBE: `CELESTE_WALK_REGIONS="(ix,iy) .."` traces only those
+    // regions - what one region's kernel is made of, without the thousands
+    // of a fine grid (`CELESTE_REGION=1,6`: one pixel). Not a search mode:
+    // every other row has no kernel.
+    static ONLY: std::sync::OnceLock<Option<Vec<(i16, i16)>>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("CELESTE_WALK_REGIONS").ok().map(|v| {
+            v.split_whitespace()
+                .map(|t| {
+                    let t = t.trim_matches(|c| c == '(' || c == ')');
+                    let (x, y) = t.split_once(',').expect("CELESTE_WALK_REGIONS=\"(ix,iy) ..\"");
+                    (x.parse().expect("ix"), y.parse().expect("iy"))
+                })
+                .collect()
+        })
+    });
+    if let Some(o) = only {
+        // Straight to them, reachable or not: the probe asks what their
+        // kernels are, not whether a search gets there.
+        return Ok(o.iter().map(|&(ix, iy)| Some(Region { ix, iy })).collect());
+    }
     Ok((a.iy..=b.iy).flat_map(|iy| (a.ix..=b.ix).map(move |ix| Some(Region { ix, iy }))).collect())
 }
 

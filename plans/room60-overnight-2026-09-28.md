@@ -165,3 +165,49 @@ unknown too; `plans/fly-fruit.md`, refined by the exact rungs above).
   with the fork's own validity set true -> one configuration with validity
   TRUE, `graph::ANY_VALID`: the OR of the fragments' validities is the lane
   covered). Every room's lowering sees this; gates re-run.
+- The dead-fork rule did not fire on the spawn shape: the fragments'
+  errors differed only in OR-tree nesting, but their `live` genuinely read
+  the platforms' moved `x` (the fly fruit's collision checks). Instead:
+  **in a no-player trace, a platform's unpinned `spd.x` is read as the
+  literal `dir * 0.65`** (asserted: the lane's is 0 or that one). With no
+  player the move is unobservable - `x`, `last`, `rem.x` are widened at the
+  frame's end and `update` sets `spd.x` anyway - so the row is the same, and
+  the floor of literal plus literal rejoins as fragments (no fork). The
+  region-less kernels: one 22M-node graph (OOM at 50 GB) -> 12.6k bodies,
+  164k fused nodes. (The dead-fork rule stays: sound, and gates pass.)
+- `r0sxhfp` then OOMed in ASSEMBLY (kernels of ~4M instructions, 32 at a
+  time). **`CELESTE_BUILD_THREADS`** caps the lowering/assembly pool (runs
+  use 8; the walk uses 16).
+- ...and again at 61 GB with 8 build threads, 299 of 306 kernels
+  assembled. **Decision: this build runs under `safe-run --memory 85G`**
+  (107 GB available, /tmp 3.8 GB) with 6 build threads. Revisit: the
+  resident kernel set is the cost (the largest kernels are 150-260 MB of
+  assembly each).
+- `r0sxhfp` BUILT (85G): 2.7M bodies, 26.7M fused nodes over 306 shapes
+  (`r0sxhp`: 1.13M / 15.9M). Ran f1-f25 (f25: 270 states), then a gap at
+  f26: every one of the 133 rows of the fresh player shape missed. Explain
+  run under way.
+- f26: the error held fresh unknown atoms - `three_valued`'s fallback for a
+  tile test past 64 arms - which reached it through MERGED outcomes'
+  `(g1 and e1) or (g2 and e2)`: a lane on path 2 declined for path 1's
+  unknown guard. **The merged error is now settled at the end by `MayErr`**
+  (exact case analysis with the points; three-valued only past 4096 cases)
+  instead of read three-valued.
+
+## Morning (2026-09-28) - node count
+
+Philippe: 15-27M fused nodes will not finish the room; aim ~10k per kernel.
+One-pixel probes (`CELESTE_REGION=1,6`, `CELESTE_WALK_REGIONS`):
+- (72,88): 12 outcomes, 597-2388 bodies, 10.8-22k fused nodes per kernel.
+- (96,80), above the y=88 platform row: 24 / 49 outcomes (49 = 7 x 7:
+  the x and y move loops' stop pixels), 1194 / 2390 bodies, 12k / 25k nodes.
+- Per outcome ~50 bodies = 24 button reps x 2-4 fork configurations; the
+  outcomes differ by rebuilt dash/jump conditions reading the post-move
+  state, not by buttons.
+- 16 px region (4,5): 120 outcomes, 6024 bodies, 78k nodes (one shape).
+- Separate: the spawn-landing trace of the second no-player shape has no
+  bounds since its ranges were restricted to the chain's shape: 234
+  outcomes. Needs its own chain's ranges.
+Philippe: buttons should be forks (unknown booleans through the generic
+fork mechanism), not a separate body dimension - delegated to a background
+agent on a worktree.
