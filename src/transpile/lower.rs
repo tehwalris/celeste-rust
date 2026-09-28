@@ -158,21 +158,32 @@ pub(crate) fn specialize_frame(
 
     // --- 2. per outcome, its configurations ---
     //
-    // The forks in the outcome's cone are resolved ONE AT A TIME, in fork
-    // order, with the later ones left standing (`graph::OPEN`), and a
-    // configuration is kept only where its roots differ from every one kept
-    // before it at that step. Resolving is substitution, and substitution
-    // preserves equality, so two configurations that agree with the rest
-    // standing agree in every completion, and one of them is all the kernel
-    // needs. This is what folds the buttons' 64 assignments to the ones
-    // that differ (left and right together being neither, a jump nothing
-    // can take being no jump), and it does the same for every other fork.
+    // Two kinds of fork, by what a configuration of it MEANS:
+    //
+    // * A fork every lane takes both ways (`Symbolic::both_values`: the
+    //   buttons, the held trails, the escaped atoms - the outcome reads no
+    //   validity of it). A configuration of these is a set of INPUTS, and
+    //   two that give the same roots are one: resolved ONE AT A TIME with
+    //   the rest standing (`graph::OPEN`), a configuration is kept only
+    //   where its roots differ from every one kept before it at that step.
+    //   Resolving is substitution, and substitution preserves equality, so
+    //   two that agree with the rest standing agree in every completion. This
+    //   folds the buttons' 64 assignments to the ones that differ (left and
+    //   right together being neither, a jump nothing can take being no jump).
+    // * A fork that PARTITIONS the lanes (its validity read, or a table
+    //   fork). Its fragments' `live` differ by that validity, so two of them
+    //   agree only where the fork is dead; per fork, with every other fork
+    //   standing, its dead-ness and its values that agree are decided (per
+    //   outcome and per class of the first kind), and the configurations are
+    //   the product. A fork whose validity the outcome does not read (a move
+    //   whose fragment does not decide `live`) is of the first kind: every
+    //   lane takes both of its fragments' rows.
     let mut sp = graph.like();
     let mut cands: Vec<SpecializedBody> = Vec::new();
-    // The table forks' operands, per fork: how many fragments a
-    // configuration's lanes can need, and which entries they can reach, is
-    // decided from the operand's range under the forks resolved before it
-    // (`ranges`: the bucket dispatch's specialization).
+    // The table forks' operands, per fork: how many fragments a class's
+    // lanes can need, and which entries they can reach, is decided from the
+    // operand's range under the class (`ranges`: the bucket dispatch's
+    // specialization).
     let fork_operands: Vec<Vec<NodeId>> = (0..forks)
         .map(|d| {
             (0..graph.len() as NodeId)
@@ -191,7 +202,6 @@ pub(crate) fn specialize_frame(
         // of the answer.
         let need = reachable(graph, &want);
         let bits = bits_of(&need);
-        // The forks whose validity the outcome reads.
         let validity_read: std::collections::BTreeSet<u8> = (0..graph.len())
             .filter(|&n| need[n])
             .filter_map(|n| match graph.get(n as NodeId).op {
@@ -199,145 +209,196 @@ pub(crate) fn specialize_frame(
                 _ => None,
             })
             .collect();
+        let (parts, takes_both): (Vec<u8>, Vec<u8>) = bits.iter().partition(|&&d| !graph.fork_table(d).is_empty() || validity_read.contains(&d));
         // Every configuration's roots land in ONE arena, so a comparison of
         // roots is a comparison of node ids. The forks outside the cone are
         // unread: 0.
-        let mut probe = graph.like();
-        let mut root_cfg = vec![0u8; forks as usize];
+        let mut open = vec![0u8; forks as usize];
         for &d in &bits {
-            root_cfg[d as usize] = crate::transpile::graph::OPEN;
+            open[d as usize] = crate::transpile::graph::OPEN;
         }
-        let root_tabs: Tabs = vec![(0, Vec::new()); forks as usize];
-        let map0 = graph.specialize_subset_into(&root_cfg, Some(&root_tabs), Some(&need), &mut probe);
-        // The seeded cells, by node in `probe` (a cell is the same node under
-        // every configuration).
-        let seeds: std::collections::HashMap<NodeId, (i64, i64)> = (0..graph.len() as NodeId)
-            .filter(|&n| need[n as usize])
-            .filter_map(|n| match graph.get(n).op {
-                Op::Cell(c) => ranges.get(&c).map(|(lo, hi)| (map0[n as usize], (*lo as i64, *hi as i64))),
-                _ => None,
-            })
-            .collect();
-        let mut memo = std::collections::HashMap::new();
-        let mut classes: Vec<(Vec<u8>, Tabs)> = vec![(root_cfg, root_tabs)];
-        // The most fragments one configuration enumerates per fork (for the
-        // trace).
-        let mut ways_max = vec![0u8; bits.len()];
-        for (i, &d) in bits.iter().enumerate() {
-            let table = graph.fork_table(d);
-            let mut next: Vec<(Vec<u8>, Tabs)> = Vec::new();
+        let no_tabs: Tabs = vec![(0, Vec::new()); forks as usize];
+        // The classes of the forks every lane takes both ways.
+        let mut classes: Vec<Vec<u8>> = vec![open.clone()];
+        let mut probe = graph.like();
+        for &d in &takes_both {
+            let mut next = Vec::new();
             let mut seen: std::collections::HashSet<Vec<NodeId>> = Default::default();
-            for (cfg, mut tabs) in classes {
-                // A table fork: what THIS configuration's lanes can need -
-                // the entries its operand's pieces reach, and the most
-                // entries one piece crosses, the arity (a lane's interval
-                // lies within one piece). The fork is resolved with exactly
-                // these, so `SplitOkTab` checks the arity the configurations
-                // enumerate: a lane the analysis got wrong declines, it is
-                // never dropped.
-                if !table.is_empty() {
-                    let map = graph.specialize_subset_into(&cfg, Some(&tabs), Some(&need), &mut probe);
-                    let mut reach = vec![false; table.len()];
-                    let mut arity = 0usize;
-                    let mut known = true;
-                    for &operand in &fork_operands[d as usize] {
-                        if !need[operand as usize] {
-                            continue;
-                        }
-                        match crate::transpile::graph::pieces_of(&probe, &seeds, &mut memo, map[operand as usize]) {
-                            None => known = false,
-                            Some(ps) => {
-                                for p in &ps {
-                                    let mut n = 0usize;
-                                    for (c, (tlo, thi)) in table.iter().enumerate() {
-                                        if (*tlo as i64) <= p.1 && (*thi as i64) >= p.0 {
-                                            reach[c] = true;
-                                            n += 1;
-                                        }
-                                    }
-                                    arity = arity.max(n);
-                                }
-                            }
-                        }
-                    }
-                    tabs[d as usize] = if known && arity > 0 {
-                        (arity as u8, table.iter().zip(&reach).filter(|(_, r)| **r).map(|(e, _)| *e).collect())
-                    } else {
-                        (graph.fork_ways(d), table.to_vec())
-                    };
-                }
-                // Move and button forks keep their traced arity
-                // (`Domain::flr_ways`, `Symbolic::both_values`), which their
-                // `SplitOk` premise checks.
-                let ways = if table.is_empty() { graph.fork_ways(d) } else { tabs[d as usize].0 };
-                ways_max[i] = ways_max[i].max(ways);
-                let with = |v: u8| {
+            for cfg in classes {
+                for v in 0..graph.fork_ways(d) {
                     let mut c = cfg.clone();
                     c[d as usize] = v;
-                    c
-                };
-                let this = (&tabs, need.as_slice(), want.as_slice());
-                // The children, each with its roots.
-                let mut kids: Vec<(Vec<u8>, Vec<NodeId>)> = Vec::new();
-                let plain: Vec<Vec<u8>> = (0..ways).map(with).collect();
-                let mut raw: Option<Vec<Vec<NodeId>>> = None;
-                // A DEAD fork: every fragment gives the same fields, keys and
-                // error, and the same `live` once the fork's own validity is
-                // set aside - it is taken once, validity true
-                // (`graph::ANY_VALID`): the OR of its fragments' validities
-                // is the lane covered. Room (6,0)'s no-player frames move all
-                // ten platforms through a floor fork each and then widen
-                // where they stand: 1024 configurations of one row per
-                // outcome (2026-09-28). Grid forks only. A fork whose
-                // validity the outcome does not read (a button has none) has
-                // nothing to set aside: its plain values are the probe.
-                if table.is_empty() && ways >= 2 {
-                    let any: Vec<Vec<u8>> = (0..ways).map(|v| with(v | crate::transpile::graph::ANY_VALID)).collect();
-                    let reads_validity = validity_read.contains(&d);
-                    let probed: Vec<Vec<NodeId>> =
-                        (if reads_validity { &any } else { &plain }).iter().map(|c| roots_under(graph, c, &tabs, &need, &want, &mut probe)).collect();
-                    let dead = probed.iter().all(|r| *r == probed[0])
-                        || (decide && {
-                            let dec = decided_roots(graph, if reads_validity { &any } else { &plain }, this, room, ranges);
-                            dec.iter().all(|r| *r == dec[0])
-                        });
-                    if dead {
-                        kids.push((any[0].clone(), probed[0].clone()));
-                    } else if !reads_validity {
-                        raw = Some(probed);
-                    }
-                }
-                if kids.is_empty() {
-                    let raw: Vec<Vec<NodeId>> =
-                        raw.unwrap_or_else(|| plain.iter().map(|c| roots_under(graph, c, &tabs, &need, &want, &mut probe)).collect());
-                    // PER FORK, ITS VALUES THAT AGREE, compared DECIDED when
-                    // the body is (`decide`). Built for a 128-way fork over
-                    // the platform worlds (since replaced by deciding per
-                    // world at compile time, `verify::Points`), which from
-                    // one region mostly looked alike. Two values of a 2-way
-                    // fork that agreed would have made it dead.
-                    let dec = (decide && ways > 2).then(|| decided_roots(graph, &plain, this, room, ranges));
-                    for (v, (c, r)) in plain.into_iter().zip(raw).enumerate() {
-                        if !dec.as_ref().is_some_and(|dec| dec[..v].contains(&dec[v])) {
-                            kids.push((c, r));
-                        }
-                    }
-                }
-                for (c, r) in kids {
-                    if seen.insert(r) {
-                        next.push((c, tabs.clone()));
+                    if seen.insert(roots_under(graph, &c, &no_tabs, &need, &want, &mut probe)) {
+                        next.push(c);
                     }
                 }
             }
             classes = next;
         }
-        if trace {
-            let ways: Vec<u8> = bits.iter().map(|&d| graph.fork_ways(d)).collect();
-            eprintln!("[build]   outcome {oi}: forks {bits:?} traced ways {ways:?}, at most {ways_max:?} -> {} configurations", classes.len());
+        let n_classes = classes.len();
+        // A DEAD fork: every fragment gives the same fields, keys and error,
+        // and the same `live` once the fork's own validity is set aside - it
+        // is taken once, validity true (`graph::ANY_VALID`): the OR of its
+        // fragments' validities is the lane covered. Room (6,0)'s no-player
+        // frames move all ten platforms through a floor fork each and then
+        // widen where they stand: 1024 configurations of one row per outcome
+        // (2026-09-28). Grid forks only. Decided here once, with every other
+        // fork standing and compared DECIDED where the body is: dead so, it is
+        // dead in every class (resolving is substitution). A fork this misses
+        // is checked per class below; one both miss is enumerated, which
+        // costs candidates and never a row.
+        let dead_everywhere: std::collections::BTreeSet<u8> = parts
+            .iter()
+            .copied()
+            .filter(|&d| graph.fork_table(d).is_empty() && graph.fork_ways(d) >= 2)
+            .filter(|&d| {
+                let any: Vec<Vec<u8>> = (0..graph.fork_ways(d))
+                    .map(|v| {
+                        let mut c = open.clone();
+                        c[d as usize] = v | crate::transpile::graph::ANY_VALID;
+                        c
+                    })
+                    .collect();
+                let raw: Vec<Vec<NodeId>> = any.iter().map(|c| roots_under(graph, c, &no_tabs, &need, &want, &mut probe)).collect();
+                raw.iter().all(|r| *r == raw[0])
+                    || (decide && {
+                        let dec = decided_roots(graph, &any, (&no_tabs, &need, &want), room, ranges);
+                        dec.iter().all(|r| *r == dec[0])
+                    })
+            })
+            .collect();
+        let mut total_cfgs = 0u64;
+        // The most fragments one class enumerates per partitioning fork (for
+        // the trace).
+        let mut ways_max = vec![0u8; parts.len()];
+        // The input cells the outcome reads that the region seeds.
+        let cells: Vec<(NodeId, (i64, i64))> = (0..graph.len() as NodeId)
+            .filter(|&n| need[n as usize])
+            .filter_map(|n| match graph.get(n).op {
+                Op::Cell(c) => ranges.get(&c).map(|(lo, hi)| (n, (*lo as i64, *hi as i64))),
+                _ => None,
+            })
+            .collect();
+        for m in classes {
+            // A class's own arena: what it builds is its own, and one shared
+            // across the classes grew with each.
+            let mut probe = graph.like();
+            let map = graph.specialize_subset_into(&m, Some(&no_tabs), Some(&need), &mut probe);
+            // The seeded cells, by node, in the class's graph.
+            let seeds: std::collections::HashMap<NodeId, (i64, i64)> = cells.iter().map(|(n, r)| (map[*n as usize], *r)).collect();
+            let mut memo = std::collections::HashMap::new();
+            // Per table fork, what THIS class's lanes can need: the entries
+            // its operand's pieces reach, and the most entries one piece
+            // crosses - the arity (a lane's interval lies within one piece).
+            // The fork is resolved with exactly these, so `SplitOkTab` checks
+            // the arity the configurations enumerate: a lane the analysis got
+            // wrong declines, it is never dropped.
+            let mut tabs: Tabs = no_tabs.clone();
+            for &d in &parts {
+                let table = graph.fork_table(d);
+                if table.is_empty() {
+                    continue;
+                }
+                let mut reach = vec![false; table.len()];
+                let mut arity = 0usize;
+                let mut known = true;
+                for &operand in &fork_operands[d as usize] {
+                    let mapped = map[operand as usize];
+                    if mapped == NodeId::MAX || !need[operand as usize] {
+                        continue;
+                    }
+                    match crate::transpile::graph::pieces_of(&probe, &seeds, &mut memo, mapped) {
+                        None => known = false,
+                        Some(ps) => {
+                            for p in &ps {
+                                let mut n = 0usize;
+                                for (c, (tlo, thi)) in table.iter().enumerate() {
+                                    if (*tlo as i64) <= p.1 && (*thi as i64) >= p.0 {
+                                        reach[c] = true;
+                                        n += 1;
+                                    }
+                                }
+                                arity = arity.max(n);
+                            }
+                        }
+                    }
+                }
+                tabs[d as usize] = if known && arity > 0 {
+                    (arity as u8, table.iter().zip(&reach).filter(|(_, r)| **r).map(|(e, _)| *e).collect())
+                } else {
+                    (graph.fork_ways(d), table.to_vec())
+                };
+            }
+            // Move forks keep their traced arity (`Domain::flr_ways`: from
+            // the same ranges), which their `SplitOk` premise checks.
+            let valid: Vec<u8> = parts
+                .iter()
+                .map(|&d| if graph.fork_table(d).is_empty() { graph.fork_ways(d) } else { tabs[d as usize].0 })
+                .collect();
+            for (i, n) in valid.iter().enumerate() {
+                ways_max[i] = ways_max[i].max(*n);
+            }
+            let this = (&tabs, need.as_slice(), want.as_slice());
+            let values: Vec<Vec<u8>> = parts
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| {
+                    let with = |v: u8| {
+                        let mut c = m.clone();
+                        c[d as usize] = v;
+                        c
+                    };
+                    // Dead for the whole outcome (above), or for this class:
+                    // compared as built here, since dead-ness only a decided
+                    // comparison shows is read once, with every fork standing.
+                    if dead_everywhere.contains(&d) {
+                        return vec![crate::transpile::graph::ANY_VALID];
+                    }
+                    if graph.fork_table(d).is_empty() && valid[i] >= 2 {
+                        let raw: Vec<Vec<NodeId>> = (0..valid[i]).map(|v| roots_under(graph, &with(v | crate::transpile::graph::ANY_VALID), &tabs, &need, &want, &mut probe)).collect();
+                        if raw.iter().all(|r| *r == raw[0]) {
+                            return vec![crate::transpile::graph::ANY_VALID];
+                        }
+                    }
+                    if valid[i] <= 2 {
+                        return (0..valid[i]).collect();
+                    }
+                    // PER FORK, ITS VALUES THAT AGREE, compared DECIDED when
+                    // the body is: a test of the player against one world's
+                    // platform folds only with the region's ranges, and before
+                    // that every world is a different node. Built for a
+                    // 128-way fork over the platform worlds (since replaced by
+                    // deciding per world at compile time, `verify::Points`),
+                    // which from one region mostly looked alike.
+                    let plain: Vec<Vec<u8>> = (0..valid[i]).map(with).collect();
+                    let sigs = if decide {
+                        decided_roots(graph, &plain, this, room, ranges)
+                    } else {
+                        plain.iter().map(|c| roots_under(graph, c, &tabs, &need, &want, &mut probe)).collect()
+                    };
+                    (0..valid[i]).filter(|&v| !sigs[..v as usize].contains(&sigs[v as usize])).collect()
+                })
+                .collect();
+            let total: u64 = values.iter().map(|v| v.len() as u64).product();
+            total_cfgs += total;
+            for k in 0..total {
+                let mut cfg = m.clone();
+                let mut r = k;
+                for (i, d) in parts.iter().enumerate() {
+                    let n = values[i].len() as u64;
+                    cfg[*d as usize] = values[i][(r % n) as usize];
+                    r /= n;
+                }
+                let roots = roots_under(graph, &cfg, &tabs, &need, &want, &mut sp);
+                cands.push((oi, cfg, roots));
+            }
         }
-        for (cfg, tabs) in classes {
-            let roots = roots_under(graph, &cfg, &tabs, &need, &want, &mut sp);
-            cands.push((oi, cfg, roots));
+        if trace {
+            let ways: Vec<u8> = parts.iter().map(|&d| graph.fork_ways(d)).collect();
+            eprintln!(
+                "[build]   outcome {oi}: {} forks taken both ways -> {n_classes} classes; partitioning forks {parts:?} traced ways {ways:?}, at most {ways_max:?} in one class -> {total_cfgs} configurations",
+                takes_both.len()
+            );
         }
     }
 
