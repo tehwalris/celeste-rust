@@ -10,6 +10,7 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use anyhow::{bail, Result};
 
@@ -28,25 +29,50 @@ pub type KernelFn = unsafe extern "C" fn(*const u8, *mut u8, *const std::os::raw
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A scratch directory for the `.s` / `.so` pair. Inside `target/` so it
-/// is ignored and cleaned by `cargo clean`.
-fn scratch_dir() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("target");
-    p.push("asm-scratch");
-    let _ = std::fs::create_dir_all(&p);
-    p
+/// This process's scratch directory for the `.s` / `.so` pairs,
+/// `target/asm-scratch/<pid>/`. Inside `target/` so it is ignored and
+/// cleaned by `cargo clean`.
+///
+/// A loaded `.so` stays on disk while the process runs (a profile of a
+/// live run attributes samples to its path), and the kernel registry lives
+/// until exit, so nothing unlinks them on exit, a kill or an OOM. As flat
+/// files, one pair per kernel per run, they reached 641 GB in 240k files
+/// (2026-09-29). So the first call sweeps: the directory of every pid that
+/// is no longer running is removed, and this pid's own directory (left by
+/// a dead process with the same pid) is emptied.
+fn scratch_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        root.push("target");
+        root.push("asm-scratch");
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for e in entries.flatten() {
+                let pid = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok());
+                if let Some(pid) = pid {
+                    if !Path::new("/proc").join(pid.to_string()).exists() {
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
+                }
+            }
+        }
+        let dir = root.join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
 }
 
 fn unique_stem(tag: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    format!("k_{}_{}_{}", tag, pid, n)
+    format!("k_{}_{}", tag, n)
 }
 
 /// Write `asm` to a `.s` file and assemble it into a shared object with
 /// `gcc -shared -fPIC`. Returns the `.so` path. Timed separately from
-/// emission by the benchmarks.
+/// emission by the benchmarks. The `.s` is removed once it has assembled
+/// (kept on failure, for the error to name): it is the bulk of the
+/// scratch, MBs of text for a big kernel against a `.so` of tens of KB.
 pub fn assemble(asm: &str, tag: &str) -> Result<PathBuf> {
     let dir = scratch_dir();
     let stem = unique_stem(tag);
@@ -67,6 +93,7 @@ pub fn assemble(asm: &str, tag: &str) -> Result<PathBuf> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    let _ = std::fs::remove_file(&src);
     Ok(obj)
 }
 
@@ -115,8 +142,5 @@ impl Drop for Loaded {
             dlclose(self.handle);
         }
         let _ = std::fs::remove_file(&self.path);
-        let mut s = self.path.clone();
-        s.set_extension("s");
-        let _ = std::fs::remove_file(&s);
     }
 }

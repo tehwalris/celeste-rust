@@ -1823,7 +1823,7 @@ fn unify(by_shape: &mut HashMap<(u64, KernelKey), AsmKernel>) -> Result<()> {
         .collect();
     per_shape.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.5.cmp(&b.5)));
     if std::env::var_os("CELESTE_KERNEL_REPORT").is_some() {
-        // The symbol names the kernel's .so in `target/asm-scratch` (what a
+        // The symbol names the kernel's .so in `target/asm-scratch/<pid>` (what a
         // profile of a live run attributes samples to).
         for s in &per_shape {
             eprintln!("[asm kernel] region {} bodies {} forks {} enumerated {} fused nodes {} frame {} {}", s.5, s.0, s.1, s.2, s.3, s.4, s.6);
