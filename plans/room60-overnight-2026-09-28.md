@@ -221,3 +221,20 @@ agent on a worktree.
   that partition lanes (validity read, tables) are enumerated per class as
   before, their dead-ness decided once per outcome. Same bodies everywhere,
   fused nodes equal or fewer, gates identical.
+
+## The split frame (prototype, 2026-09-29)
+
+`CELESTE_SPLIT_FRAME=1` loads `lua/celeste-minimal-split.lua`: `_update` as two
+steps around the player's `_hint_normalize` - part a (timers, freeze,
+restart, every object up to and including the player's MOVE), part b (the
+player's update - the buttons - the objects after it, the tail, `_draw`).
+The globals `__phase` / `__frozen` mark a state between the parts; they
+hold TABLES (a global is a fixed slot of the block model: a number there is
+a value, not a shape, and the parts shared kernels). The rest of the
+machinery is unchanged: a frame is two steps.
+- (96,80) one-pixel probe: 4778 bodies / 49.5k fused nodes -> 342 / 14.5k;
+  the largest kernel 49 bodies (part a: the 7 x 7 stops) / 2.7k nodes.
+- Whole room `r0sxhp`: 1,129,941 bodies / 15.9M nodes -> 46,052 / 3.1M.
+- Level 0: frame 40 (step 80) 6,154,595 states vs 6,154,596 unsplit - the
+  widening at the cut costs nothing measurable - in 6.5 s (steps 79+80)
+  against 177 s.

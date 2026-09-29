@@ -100,8 +100,10 @@ pub fn sources_in(root: &std::path::Path) -> Result<String> {
     let read = |p: &str| std::fs::read_to_string(root.join(p));
     let b3 = read("lua/builtin_level_3.lua")?;
     let b4 = read("lua/builtin_level_4.lua")?;
-    let game =
-        celeste_interp::game_runner::apply_start_room(&read("lua/celeste-minimal.lua")?)?;
+    // `CELESTE_SPLIT_FRAME`: the split-frame prototype, one frame as two steps
+    // (lua/celeste-minimal-split.lua, plans/room60-overnight-2026-09-28.md).
+    let lua = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
+    let game = celeste_interp::game_runner::apply_start_room(&read(lua)?)?;
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
 }
 
