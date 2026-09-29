@@ -777,7 +777,12 @@ fn main() -> Result<()> {
                 )?])
             };
             let dir = std::path::Path::new(&checkpoint_dir);
-            celeste_rust::compiled::prebuild_kernels(&precisions);
+            // `CELESTE_NO_PREBUILD`: each level's kernels built when it first
+            // runs instead - so a level-0 backward on a finished tree runs
+            // before any finer level compiles (and holds its memory).
+            if std::env::var_os("CELESTE_NO_PREBUILD").is_none() {
+                celeste_rust::compiled::prebuild_kernels(&precisions);
+            }
             let found = if let Some(c) = ceiling {
                 Some(celeste_rust::frame::find_optimum_from_ceiling(make_engine, make_initial, dir, c, &precisions)?)
             } else {
@@ -2393,7 +2398,9 @@ fn main() -> Result<()> {
                     chosen.push(c);
                 }
             }
-            let shown = n_frames.min(12);
+            // `CELESTE_CELL_GROWTH_ALL`: every frame of the window, for fitting a
+            // cell's growth against its age.
+            let shown = if std::env::var_os("CELESTE_CELL_GROWTH_ALL").is_some() { n_frames } else { n_frames.min(12) };
             println!("cell: visited through f{to:03} | new per frame, f{:03}..f{to:03}", to - shown as u32 + 1);
             for c in &chosen {
                 let where_ = cell_xy(*c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string());

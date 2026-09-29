@@ -1546,8 +1546,10 @@ pub fn forward_frame(
     // (`concrete::platform_worlds`); a frame past that could hold one it
     // does not have.
     let level = crate::interpreter::abstraction::current_level();
+    // Under the split-frame prototype a game frame is two steps.
+    let game_frame = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { frame.div_ceil(2) } else { frame };
     anyhow::ensure!(
-        !level.platforms.is_unknown() || frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
+        !level.platforms.is_unknown() || game_frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
         "frame {frame} at {level}: the platform worlds cover {} frames",
         crate::trace::kernel::PLATFORM_WORLD_FRAMES
     );
@@ -2298,7 +2300,11 @@ pub fn forward_run(
     record: bool,
     filter: Option<&MarkFilter>,
 ) -> Result<ForwardResult> {
-    let mut st = ForwardState::start(initial, dir, record)?;
+    // Resumes a tree already there, as the search does (`ForwardState::resume`).
+    let mut st = match ForwardState::resume(dir, record)? {
+        Some(st) => st,
+        None => ForwardState::start(initial, dir, record)?,
+    };
     st.extend(engine, dir, max_frames, filter)?;
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
@@ -2679,6 +2685,13 @@ where
         crate::interpreter::abstraction::set_level(self.precisions[0]);
         let dir = self.level_dir(horizon, 0);
         if self.level0.is_none() {
+            // A tree on disk that already reaches the horizon needs no
+            // resume: the backward reads its edges, and its first win is in
+            // its frame files. Resuming would rebuild the door - for room
+            // (6,0)'s 1.7G states a 67 GB peak - to extend nothing.
+            if let Some(win) = tree_first_win_through(&dir, horizon)? {
+                return Ok(win.filter(|&h| h <= horizon));
+            }
             let engine = (self.make_engine)(self.precisions[0])?;
             // A tree left by an earlier run resumes; the ladder's finer
             // levels are recomputed per horizon (their outcome is on disk,
@@ -2767,6 +2780,26 @@ where
         }
         Ok(HorizonOutcome::Confirmed)
     }
+}
+
+/// A level tree on disk complete through `horizon` (its frames there and
+/// their edge runs done): its first win, from the frame files' win lists.
+/// `None` when the tree does not reach the horizon.
+fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
+    let done = crate::search::edges::done_frame(&dir.join("edges"));
+    if done.is_none_or(|d| d < horizon) || !dir.join("frames").join(format!("f{horizon:03}")).is_dir() {
+        return Ok(None);
+    }
+    for f in 0..=horizon {
+        for e in std::fs::read_dir(dir.join("frames").join(format!("f{f:03}")))? {
+            let p = e?.path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name.starts_with('s') && name.ends_with(".bin") && !crate::search::checkpoint::FrameFile::open(&p)?.wins().is_empty() {
+                return Ok(Some(Some(f)));
+            }
+        }
+    }
+    Ok(Some(None))
 }
 
 /// The backward is the BFS over the recorded edges (`search::edges`);
@@ -2859,15 +2892,19 @@ pub fn find_optimum_from_ceiling(
             "ceiling {ceiling} REFUTED at level {level}: a known concrete solution the model cannot reproduce"
         ),
     }
+    // Under the split-frame prototype a win is only seen at the end of a
+    // frame (the exit test is in the player's update, the second step), so an
+    // odd horizon asks what the even one below it does: count down by two.
+    let step = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { 2 } else { 1 };
     let mut best = ceiling;
-    while best > 1 {
-        match ladder.at_horizon(best - 1)? {
+    while best > step {
+        match ladder.at_horizon(best - step)? {
             HorizonOutcome::Confirmed => {
-                eprintln!("[search] horizon {} confirmed, counting down", best - 1);
-                best -= 1;
+                eprintln!("[search] horizon {} confirmed, counting down", best - step);
+                best -= step;
             }
             HorizonOutcome::Refuted { level } => {
-                eprintln!("[search] horizon {} refuted at level {level}", best - 1);
+                eprintln!("[search] horizon {} refuted at level {level}", best - step);
                 break;
             }
         }
