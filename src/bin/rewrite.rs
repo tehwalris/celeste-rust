@@ -777,12 +777,9 @@ fn main() -> Result<()> {
                 )?])
             };
             let dir = std::path::Path::new(&checkpoint_dir);
-            // `CELESTE_NO_PREBUILD`: each level's kernels built when it first
-            // runs instead - so a level-0 backward on a finished tree runs
-            // before any finer level compiles (and holds its memory).
-            if std::env::var_os("CELESTE_NO_PREBUILD").is_none() {
-                celeste_rust::compiled::prebuild_kernels(&precisions);
-            }
+            // Level 0's kernels are built when it first runs; the finer levels'
+            // all at once after its first backward (`Ladder::at_horizon`), past
+            // the memory peak.
             let found = if let Some(c) = ceiling {
                 Some(celeste_rust::frame::find_optimum_from_ceiling(make_engine, make_initial, dir, c, &precisions)?)
             } else {

@@ -2651,6 +2651,9 @@ where
     /// and at room (3,0) f89 it held ~10 GB idle under every finer level;
     /// the resume is 42 s (a 550M-entry door, 2026-09-19).
     drop_level0: bool,
+    /// The finer levels' kernels built (`prebuild_kernels`): after level 0's
+    /// first backward, the search's memory peak, all at once in parallel.
+    finer_built: bool,
 }
 
 impl<'a, E, I> Ladder<'a, E, I>
@@ -2664,7 +2667,7 @@ where
         base_dir: &'a std::path::Path,
         precisions: &'a [crate::interpreter::abstraction::Level],
     ) -> Self {
-        Ladder { make_engine, make_initial, base_dir, precisions, level0: None, drop_level0: false }
+        Ladder { make_engine, make_initial, base_dir, precisions, level0: None, drop_level0: false, finer_built: false }
     }
 
     fn level_dir(&self, horizon: u32, level: usize) -> std::path::PathBuf {
@@ -2730,13 +2733,35 @@ where
         for level in 0..self.precisions.len() {
             let precision = self.precisions[level];
             let dir = self.level_dir(horizon, level);
+            // A level an interrupted run finished: its marks and, written
+            // after them, its first win are on disk - so a restart loses only
+            // the level in progress (room (6,0): minutes a level).
+            let marks_file = marks_path(self.base_dir, horizon, level);
+            let win_file = marks_file.with_extension("win");
+            if let Ok(w) = std::fs::read_to_string(&win_file) {
+                let h: u32 = w.trim().parse().with_context(|| format!("{}", win_file.display()))?;
+                let marked = Visited::load(&marks_file)?;
+                let (n, fp) = marked.fingerprint();
+                eprintln!("[ladder] h{horizon} level {level} ({precision}): first win f{h}, marked {n} states (fingerprint {fp:016x}), from an earlier run");
+                prev = Some((marked, precision));
+                if level == 0 && !self.finer_built {
+                    crate::compiled::prebuild_kernels(&self.precisions[1..]);
+                    self.finer_built = true;
+                }
+                continue;
+            }
             // The level's forward to `horizon`: level 0 extended in place,
             // a finer level fresh, under the previous level's marks.
             let mut fresh: Option<Box<dyn FrameStep>> = None;
             let (win, graph) = if level == 0 {
                 let win = self.extend_level0(horizon)?;
-                let state = &self.level0.as_ref().expect("started by extend_level0").1;
-                (win, state.pos_graph().expect("level 0 records"))
+                // Not resumed when its tree already reached the horizon
+                // (`extend_level0`): its pos graph is on disk with it.
+                let graph = match self.level0.as_ref() {
+                    Some((_, state)) => state.pos_graph().expect("level 0 records"),
+                    None => crate::search::pos_graph::PosGraph::load(&pos_graph_path(&dir))?,
+                };
+                (win, graph)
             } else {
                 crate::interpreter::abstraction::set_level(precision);
                 let engine = (self.make_engine)(precision)?;
@@ -2756,18 +2781,27 @@ where
                 eprintln!("[ladder] h{horizon} level {level} ({precision}): NO WIN -> Refuted");
                 return Ok(HorizonOutcome::Refuted { level });
             };
-            let engine: &dyn FrameStep = match fresh.as_ref() {
-                Some(e) => e.as_ref(),
-                None => self.level0.as_ref().expect("level 0").0.as_ref(),
-            };
             let (marked, work) = if bfs_backward() {
                 let bwd = crate::search::edges::backward(&dir, horizon)?;
                 (bwd.marked, format!("{} edges read", bwd.stats.edges_read))
             } else {
+                // The kernel re-run needs the level's engine: level 0's, or
+                // one made here when level 0 was not resumed (`extend_level0`).
+                if fresh.is_none() && self.level0.is_none() {
+                    fresh = Some((self.make_engine)(precision)?);
+                }
+                let engine: &dyn FrameStep = match fresh.as_ref() {
+                    Some(e) => e.as_ref(),
+                    None => self.level0.as_ref().expect("level 0").0.as_ref(),
+                };
                 let bwd = backward_run(engine, &dir, horizon, &graph)?;
                 (bwd.marked, format!("{} re-runs", bwd.reruns))
             };
-            marked.save(&marks_path(self.base_dir, horizon, level))?;
+            marked.save(&marks_file)?;
+            // Last, and atomically: its presence says the marks are whole.
+            let tmp = win_file.with_extension("win.tmp");
+            std::fs::write(&tmp, format!("{h}\n"))?;
+            std::fs::rename(&tmp, &win_file)?;
             let (n, fp) = marked.fingerprint();
             eprintln!(
                 "[ladder] h{horizon} level {level} ({precision}): first win f{h}, marked {n} states \
@@ -2776,6 +2810,10 @@ where
             prev = Some((marked, precision));
             if level == 0 && self.drop_level0 {
                 self.level0 = None;
+            }
+            if level == 0 && !self.finer_built {
+                crate::compiled::prebuild_kernels(&self.precisions[1..]);
+                self.finer_built = true;
             }
         }
         Ok(HorizonOutcome::Confirmed)
@@ -2858,7 +2896,9 @@ pub fn find_optimum(
             HorizonOutcome::Confirmed => return Ok(Some(horizon)),
             HorizonOutcome::Refuted { level } => {
                 eprintln!("[search] horizon {horizon} refuted at level {level}");
-                horizon += 1;
+                // Under the split-frame prototype a win is only seen at the end of a
+                // frame (the second step): count up by two.
+                horizon += if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { 2 } else { 1 };
             }
         }
     }
