@@ -239,7 +239,7 @@ machinery is unchanged: a frame is two steps.
   widening at the cut costs nothing measurable - in 6.5 s (steps 79+80)
   against 177 s.
 
-## RESULT (2026-09-30): room (6,0) optimal exit at FRAME 70
+## RESULT (2026-09-30): room (6,0) exit at FRAME 70 - TIES the community TAS7
 
 - Level 0 (r0sxhfp, split frame) to step 150: 1.68G states visited; first
   win step 128 (frame 64).
@@ -251,4 +251,12 @@ machinery is unchanged: a frame is two steps.
   5.9M exact). `OPTIMAL win frame: 140`.
 - Witness: 335 concrete steps, 0 dead ends; tas/room_6_0_exit_frame_70.txt.
   concrete_run and a real PICO-8 both leave the room on frame 70 (f69 player
-  at 52,-2; f70 room 7,0). Two frames better than the known 72.
+  at 52,-2; f70 room 7,0).
+- CORRECTION: this is NOT two frames better than TAS7. The "72" came from
+  replaying TAS7 at prologue offsets 24-31; at offset 23 (its input 0 on
+  frame 24, the first frame the player exists, which is the TAS tool's
+  convention and matches room (1,0): 23 + TAS2's 76 = 99) TAS7 leaves during
+  frame 70 in the original cart too. The search agrees with TAS7's length
+  (bounded below at 70 by the ladder), it does not improve on it. And the
+  wording: "improved"/"optimal" are both off the table here - it is a tie,
+  and optimality is not claimed until the pipeline has been reviewed.

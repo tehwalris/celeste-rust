@@ -1,4 +1,4 @@
-# Room (6,0) "700 m" OPTIMAL exit for celeste-minimal: frame 70 (derived 2026-09-30).
+# Room (6,0) "700 m" exit for celeste-minimal: frame 70 (derived 2026-09-30).
 #
 # Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 6,0, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
@@ -12,12 +12,18 @@
 #   (rem Bits(5)) had its first win at step 140, so no path wins before
 #   frame 70 (level 0 alone: frame 64).
 # - Horizon step 140 (frame 70) confirmed at every level including Exact:
-#   OPTIMAL win frame 140 (steps) = frame 70.
+#   `OPTIMAL win frame: 140` (steps) = frame 70 (the search's word; not
+#   claimed optimal until the whole pipeline has been reviewed).
 # - `rewrite witness --horizon 140 --level 18` (split frame): 335 concrete
 #   steps, 0 dead ends; its per-step bytes folded to per-frame (step 2k is
 #   frame k's input; the part-a steps read no buttons).
 # - concrete_run (the unsplit game): player at (52,-2) on frame 69, the next
 #   room's spawn on frame 70. On a REAL PICO-8 (pico8_diff/replay.py --room
-#   6,0): f69 player 52,-2, f70 room 7,0. Two frames faster than
-#   room_6_0_exit_frame_72.txt (the community TAS7 route).
+#   6,0): f69 player 52,-2, f70 room 7,0.
+# - This TIES the community TAS7 (47 inputs), it does not beat it. TAS7's
+#   input 0 goes on frame 24, the first frame the player exists (prologue
+#   offset 23): replayed that way in the original cart it also leaves on
+#   frame 70 (f69 player 54,-3; f70 room 7,0). The same convention gives
+#   room (1,0): 23 + TAS2's 76 = 99. room_6_0_exit_frame_72.txt tried
+#   offsets 24-31 only and so started TAS7 a frame late.
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,0,0,38,0,0,0,0,0,0,0,16,0,0,0,0,0,0,16,0,1,1,1,36,0,0,0,0,0,0,0,2,0,16,0,0,0,36,0,0,0,0,0,0,16,0,0
