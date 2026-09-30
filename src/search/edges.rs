@@ -1033,7 +1033,8 @@ pub fn bfs(graph: &EdgeGraph, horizon: u32, seeds: impl IntoIterator<Item = u64>
             }
         }
         eprintln!(
-            "[bfs] f{i:03} targets {} marked {} | {:.0} ms",
+            "[bfs] {} targets {} marked {} | {:.0} ms",
+            crate::frame::Stages::current().show(i),
             frontier.len(),
             next.len(),
             t_it.elapsed().as_secs_f64() * 1e3
@@ -1104,7 +1105,8 @@ pub fn backward(dir: &Path, horizon: u32) -> Result<BackwardResult> {
     }
     ensure!(i == ids.len(), "edges: {} marked ids, {} resolved through the checkpoint files", ids.len(), i);
     eprintln!(
-        "[bfs] h{horizon}: {} runs-bytes {:.2} GB, open {:.0} ms, bfs {:.0} ms ({} lookups, {} edges), resolve {:.0} ms",
+        "[bfs] to {}: {} runs-bytes {:.2} GB, open {:.0} ms, bfs {:.0} ms ({} lookups, {} edges), resolve {:.0} ms",
+        crate::frame::Stages::current().show(horizon),
         graph.records,
         graph.bytes as f64 / 1e9,
         stats.t_open.as_secs_f64() * 1e3,

@@ -303,10 +303,15 @@ impl Block {
 /// Per lane: does it sit on the room's win target? The room-exit test
 /// (`room.x` past the start room) or, under `CELESTE_WIN_AT_XY`, the
 /// synthetic player-position target. Pure position; no peeking inside.
+/// Only at the end of a frame: a state between two of its stages
+/// (`Rt2::cont`) has not finished it.
 pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Col, AV};
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
+    if rt2.cont != 0 {
+        return Ok(vec![false; lanes]);
+    }
     if let Some(target) = crate::interpreter::abstraction::synthetic_win_xy() {
         let Some(obj) = crate::search::pos_graph::player_object(rt2) else {
             return Ok(vec![false; lanes]);
@@ -616,6 +621,9 @@ impl Slot {
     pub fn any_win(&self, rows: &[u32]) -> Result<bool> {
         let ids = crate::compiled::ids();
         let sk = &self.skeleton;
+        if sk.cont != 0 {
+            return Ok(false);
+        }
         let num_at = |cell: u32| -> Result<NumView<'_>> {
             match &sk.cols[cell as usize] {
                 Col::U(AV::Num(n)) => Ok(NumView::Uniform(*n)),
@@ -1743,10 +1751,6 @@ pub fn forward_frame(
     st.rss_file = crate::metrics::current_file_rss_gb();
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
-    // The exit test runs in the player's update, which no cut splits from
-    // the frame's end: a row that won inside a frame is a cut this search
-    // has no model for (its next stage's kernels are the next room's).
-    anyhow::ensure!(!won || stages.frame(step).is_some(), "a win inside a frame, at {}", stages.show(step));
     Ok((next, won, st))
 }
 
@@ -2011,8 +2015,9 @@ fn backward_walk(
         reruns += frame_reruns;
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
         eprintln!(
-            "[bwd] f{i:03} targets {} cand-cells {} loaded {} rerun {} marked {} | \
+            "[bwd] {} targets {} cand-cells {} loaded {} rerun {} marked {} | \
              load {:.0} (thread-ms) par {:.0} (idle {:.0}%) total {:.0} ms",
+            Stages::current().show(i),
             frontier.len(),
             cells.len(),
             loaded,

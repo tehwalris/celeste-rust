@@ -253,10 +253,35 @@ fn parse_fwd(line: &str) -> Result<(FwdLine, bool)> {
     }, stage))
 }
 
-fn parse_bwd(line: &str) -> Result<BwdLine> {
+impl BwdLine {
+    /// A frame's backward line from its stages' (`f012.1`, one stage into
+    /// frame 13, is walked just before `f012`): the targets the walk came in
+    /// with (`earlier`'s), what the frame boundary marked (`self`'s), the work
+    /// of both.
+    fn after(self, earlier: BwdLine) -> BwdLine {
+        BwdLine {
+            targets: earlier.targets,
+            cand_cells: earlier.cand_cells + self.cand_cells,
+            loaded: earlier.loaded + self.loaded,
+            rerun: earlier.rerun + self.rerun,
+            load_thread_ms: earlier.load_thread_ms + self.load_thread_ms,
+            par_ms: earlier.par_ms + self.par_ms,
+            par_idle: earlier.par_idle.max(self.par_idle),
+            total_ms: earlier.total_ms + self.total_ms,
+            ..self
+        }
+    }
+}
+
+/// A `[bwd]` line, and whether it is a stage inside a frame (`f012.1`).
+fn parse_bwd(line: &str) -> Result<(BwdLine, bool)> {
     let t: Vec<&str> = line.split_whitespace().collect();
-    Ok(BwdLine {
-        f: num(t[1])?,
+    let (frame, stage) = match t[1].split_once('.') {
+        Some((f, _)) => (f, true),
+        None => (t[1], false),
+    };
+    Ok((BwdLine {
+        f: num(frame)?,
         targets: num(after(&t, "targets", 0)?)?,
         cand_cells: num(after(&t, "cand-cells", 0)?)?,
         loaded: num(after(&t, "loaded", 0)?)?,
@@ -266,7 +291,7 @@ fn parse_bwd(line: &str) -> Result<BwdLine> {
         par_ms: num(after(&t, "par", 0)?)?,
         par_idle: num(after(&t, "(idle", 0)?)?,
         total_ms: num(after(&t, "total", 0)?)?,
-    })
+    }, stage))
 }
 
 /// Parse the run log into horizons in execution order. A `[ladder] hH
@@ -283,6 +308,7 @@ pub fn parse_log(text: &str, forward_only: bool) -> Result<(Vec<HorizonRun>, Opt
     let mut first_win: Option<u32> = None;
     // The stages of the frame in progress (a multi-stage search).
     let mut stages: Option<FwdLine> = None;
+    let mut bwd_stages: Option<BwdLine> = None;
     let (mut wall, mut prebuild, mut optimal) = (None, None, None);
     for (ln, line) in text.lines().enumerate() {
         let ctx = || format!("log line {}: {line}", ln + 1);
@@ -300,8 +326,23 @@ pub fn parse_log(text: &str, forward_only: bool) -> Result<(Vec<HorizonRun>, Opt
                 fwd.push(l);
             }
         } else if line.starts_with("[bwd] f") {
-            bwd.push(parse_bwd(line).with_context(ctx)?);
+            let (l, inside) = parse_bwd(line).with_context(ctx)?;
+            let l = match bwd_stages.take() {
+                Some(earlier) => l.after(earlier),
+                None => l,
+            };
+            if inside {
+                bwd_stages = Some(l);
+            } else {
+                bwd.push(l);
+            }
         } else if line.starts_with("[ladder] h") {
+            // A forward that emptied inside a frame ends on a stage's line:
+            // it is its frame's.
+            if let Some(mut l) = stages.take() {
+                l.f += 1;
+                fwd.push(l);
+            }
             let t: Vec<&str> = line.split_whitespace().collect();
             let h: u32 = num(t[1]).with_context(ctx)?;
             let level: usize = num(t[3]).with_context(ctx)?;
@@ -715,16 +756,19 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize, stages: crate:
     } else {
         None
     };
+    // The frames: the tree's steps at frame boundaries. A forward stops
+    // only at its horizon (a boundary) or on an empty frontier, so a tree
+    // whose last step is inside a frame emptied there: its frame is empty.
+    let n = if nframes == 0 { 0 } else { (nframes - 1).div_ceil(stages.per_frame) as usize + 1 };
+    let step_of = |f: usize| stages.step(f as u32);
     // The latest frames are the largest: pulled first, so the tail of the
     // parallel pass is the small ones.
-    let n = nframes as usize;
-    let mut counts = par_map(n, |i| frame_counts(dir, (n - 1 - i) as u32, marks, nsets))?;
+    let mut counts = par_map(n, |i| frame_counts(dir, step_of(n - 1 - i), marks, nsets))?;
     counts.reverse();
     let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(n);
     let mut layers: Vec<Vec<Sparse>> = vec![Vec::with_capacity(n); nsets];
-    // The previous step's states per cell (a frame's, or a stage's).
     let mut prev: Option<Sparse> = None;
-    for (step, FrameCounts { mut cells, mut wins, marked }) in counts.into_iter().enumerate() {
+    for FrameCounts { mut cells, mut wins, marked } in counts {
         // A won state has left the room: its cell is the NEXT room's spawn,
         // one room over (`pos_graph::room_offset` puts the room it exits to
         // one room to the right), so drawn as-is the winning states sit in the box's far
@@ -736,8 +780,18 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize, stages: crate:
         // moves whole, in both the states and the wins record, so totals are
         // unchanged; with no graph or no occupied source the cell stays.
         if let (Some(g), Some(prev)) = (graph.as_ref(), prev.as_ref()) {
+            // A frame is `per_frame` steps of the graph.
+            let sources = |win: u32| -> Vec<u32> {
+                let mut at = vec![win];
+                for _ in 0..stages.per_frame {
+                    at = at.iter().flat_map(|&c| g.sources(c).iter().copied()).collect();
+                    at.sort_unstable();
+                    at.dedup();
+                }
+                at
+            };
             let busiest = |win: u32| -> Option<u32> {
-                g.sources(win)
+                sources(win)
                     .iter()
                     .filter_map(|&s| prev.binary_search_by_key(&s, |&(c, _)| c).ok().map(|i| prev[i]))
                     .max_by_key(|&(c, n)| (n, std::cmp::Reverse(c)))
@@ -754,11 +808,9 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize, stages: crate:
             }
         }
         let cells = sparse(cells);
-        if stages.frame(step as u32).is_some() {
-            frames.push((cells.clone(), sparse(wins)));
-            for (k, m) in marked.into_iter().enumerate() {
-                layers[k].push(sparse(m));
-            }
+        frames.push((cells.clone(), sparse(wins)));
+        for (k, m) in marked.into_iter().enumerate() {
+            layers[k].push(sparse(m));
         }
         prev = Some(cells);
     }
@@ -1158,5 +1210,22 @@ OPTIMAL win frame: 3
         assert_eq!(wall, Some(433.31));
         assert_eq!(prebuild, Some(8.8));
         assert_eq!(optimal, Some(3));
+        // A multi-stage search: a frame's stage lines fold into its line.
+        let staged = "\
+[fwd] f000.1 in 1/10 raw 30 kept 20 out 2/20 visited 30 | wave 5 (idle 10%) door 1 edges 0 ckpt 2 pos 1 total 9 ms | flushes 1 (1 rows avg) | in 0.00 queues 0.00 door 0.00 GB rss start 1.00 wave 1.00 end 1.50 peak 2.00 GB
+[fwd] f001 in 2/20 raw 40 kept 15 out 3/15 visited 45 | wave 7 (idle 20%) door 2 edges 0 ckpt 3 pos 1 total 13 ms | flushes 1 (1 rows avg) | in 0.00 queues 0.00 door 0.00 GB rss start 1.00 wave 1.00 end 1.20 peak 2.00 GB
+[bwd] f001 targets 4 cand-cells 2 loaded 5 rerun 5 marked 3 | load 1 (thread-ms) par 2 (idle 5%) total 3 ms
+[bwd] f000.1 targets 3 cand-cells 1 loaded 4 rerun 4 marked 2 | load 1 (thread-ms) par 2 (idle 9%) total 4 ms
+[bwd] f000 targets 2 cand-cells 1 loaded 2 rerun 2 marked 1 | load 1 (thread-ms) par 1 (idle 1%) total 2 ms
+[ladder] h1 level 0 (Bits(0)): first win f1, marked 6 states (fingerprint cda9202a7cbb2234), 11 re-runs
+";
+        let l = &parse_log(staged, false).unwrap().0[0].levels[0];
+        assert_eq!(l.fwd.len(), 1);
+        let f = &l.fwd[0];
+        assert_eq!((f.f, f.in_lanes, f.raw, f.kept, f.out_lanes, f.emit_ms, f.emit_idle, f.total_ms), (1, 10, 70, 15, 15, 12, 20, 22));
+        assert_eq!(f.rss_gb, 1.5);
+        assert_eq!(l.bwd.len(), 2);
+        let b = &l.bwd[1];
+        assert_eq!((b.f, b.targets, b.rerun, b.marked, b.par_idle, b.total_ms), (0, 3, 6, 1, 9, 6));
     }
 }
