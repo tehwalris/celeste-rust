@@ -3110,6 +3110,38 @@ mod tests {
     use crate::trace::refengine::RefEngine;
     use std::sync::Mutex;
 
+    /// The cart run in two STAGES a frame (`--cut player`, `trace::stage`)
+    /// reaches the pinned frame sets of the unsplit run at every frame
+    /// boundary (`gates/ckhash_room10_f000-044.txt`, the `rewrite ckhash`
+    /// fingerprint), through the player's spawn and its first 12 frames.
+    #[test]
+    fn a_frame_in_stages_reaches_the_pinned_frame_sets() {
+        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        crate::trace::stage::set_cuts(vec!["player".to_string()]).expect("cuts");
+        crate::interpreter::abstraction::set_level(crate::interpreter::abstraction::Level::for_rem(crate::interpreter::abstraction::RemPrecision::Bits(0)));
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-stages-test");
+        let _ = std::fs::remove_dir_all(dir);
+        let engine = crate::compiled::FrameEngine::new_for_start_room().expect("engine");
+        let init = vec![Block::from_state(&RefEngine::new().expect("ref").initial_state().expect("init")).expect("block")];
+        let stages = Stages::current();
+        assert_eq!(stages.per_frame, 2);
+        let to = 36;
+        let fwd = forward_run(&engine, init, dir, stages.step(to), true, None).expect("forward");
+        assert_eq!(fwd.steps, stages.step(to));
+        let gate = std::fs::read_to_string("gates/ckhash_room10_f000-044.txt").expect("the pinned gate");
+        for (f, line) in gate.lines().take(to as usize + 1).enumerate() {
+            let (mut n, mut acc) = (0usize, 0u64);
+            for b in load_frame(dir, stages.step(f as u32)).expect("load") {
+                for (k, &c) in b.keys().iter().zip(&b.positions().expect("cells")) {
+                    acc = acc.wrapping_add(celeste_engine::runtime2::mix64(k.0 ^ celeste_engine::runtime2::mix64(k.1 ^ (c as u64) << 1)));
+                    n += 1;
+                }
+            }
+            assert_eq!(format!("f{f:03} {n} {acc:016x}"), line, "frame {f} (step {})", stages.step(f as u32));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// End-to-end proof that the rebuilt outer loop runs: drive `forward_run`
     /// over the trusted reference engine for a few frames from the initial
     /// block, checkpointing each frontier, and prove the checkpoint round-trips
