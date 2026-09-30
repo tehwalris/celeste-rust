@@ -798,7 +798,7 @@ fn main() -> Result<()> {
             room,
             reference,
         } => {
-            use celeste_rust::frame::{forward_run, Block, FrameStep};
+            use celeste_rust::frame::{Block, FrameStep};
             use celeste_rust::interpreter::abstraction::{current_level, set_level, set_rem_precision, Level, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
             match &level {
@@ -817,7 +817,7 @@ fn main() -> Result<()> {
             )?];
             let dir = std::path::Path::new(&checkpoint_dir);
             let t = std::time::Instant::now();
-            let fwd = forward_run(engine.as_ref(), initial, dir, to, true, None)?;
+            let fwd = celeste_rust::frame::forward_resume_or_run(engine.as_ref(), initial, dir, to)?;
             let wall = t.elapsed().as_secs_f64();
             match fwd.win_frame {
                 Some(h) => println!("win at f{h} ({wall:.2} s)"),

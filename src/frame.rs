@@ -2292,6 +2292,22 @@ pub fn pos_graph_path(dir: &std::path::Path) -> std::path::PathBuf {
 
 /// A whole forward run in one call: frame 0 from `initial`, then frames
 /// `1..=max_frames`.
+/// `forward_run`, but resuming a tree already in `dir` (`ForwardState::resume`),
+/// as the search does - what `rewrite forward` runs.
+pub fn forward_resume_or_run(
+    engine: &dyn FrameStep,
+    initial: Vec<Block>,
+    dir: &std::path::Path,
+    max_frames: u32,
+) -> Result<ForwardResult> {
+    let mut st = match ForwardState::resume(dir, true)? {
+        Some(st) => st,
+        None => ForwardState::start(initial, dir, true)?,
+    };
+    st.extend(engine, dir, max_frames, None)?;
+    Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
+}
+
 pub fn forward_run(
     engine: &dyn FrameStep,
     initial: Vec<Block>,
@@ -2300,11 +2316,7 @@ pub fn forward_run(
     record: bool,
     filter: Option<&MarkFilter>,
 ) -> Result<ForwardResult> {
-    // Resumes a tree already there, as the search does (`ForwardState::resume`).
-    let mut st = match ForwardState::resume(dir, record)? {
-        Some(st) => st,
-        None => ForwardState::start(initial, dir, record)?,
-    };
+    let mut st = ForwardState::start(initial, dir, record)?;
     st.extend(engine, dir, max_frames, filter)?;
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
