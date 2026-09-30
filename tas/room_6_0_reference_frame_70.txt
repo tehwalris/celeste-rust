@@ -1,0 +1,22 @@
+# Room (6,0) "700 m" reference exit for celeste-minimal: frame 70, the
+# community TAS7 route (derived 2026-09-30; replaces the wrong
+# room_6_0_exit_frame_72.txt).
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 6,0, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# ~/src/github.com/CelesteClassic/tasdatabase/classic/any/TAS7.tas (47
+# inputs, unchanged upstream at bf184fa) replayed on a real PICO-8 in the
+# ORIGINAL cart (`replay.py --lua celeste_ocaml/celeste.lua --begin-game
+# --room 6,0`) at prologue offset 23: its input 0 on frame 24, the first
+# frame the player exists (the TAS tool's convention; room (1,0): 23 +
+# TAS2's 76 = 99). Exits during frame 70 (f69 player 54,-3). The earlier
+# derivation tried offsets 24-31 only and got 72.
+# Its per-frame positions (frames 1-70, `-` while there is no player) went
+# through `rewrite trajectory --room 6,0`, which followed them exactly in
+# OUR game (4 states on f69). Replayed on a real PICO-8 in celeste-minimal:
+# f69 player 54,-3 with the same spd and rem as the original cart, f70 room
+# 7,0. So TAS7 is valid for celeste-minimal, and the search's frame-70 result
+# (room_6_0_exit_frame_70.txt, a different route) ties it.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,38,0,0,0,0,0,0,0,16,0,0,36,0,0,0,0,0,0,16,0,2,36,0,0,0,0,0,0,2,2,2,2,16,0,1,1,36,0,0,0,0,0,0,16,0,0,0

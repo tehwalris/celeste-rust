@@ -24,6 +24,7 @@
 #   input 0 goes on frame 24, the first frame the player exists (prologue
 #   offset 23): replayed that way in the original cart it also leaves on
 #   frame 70 (f69 player 54,-3; f70 room 7,0). The same convention gives
-#   room (1,0): 23 + TAS2's 76 = 99. room_6_0_exit_frame_72.txt tried
-#   offsets 24-31 only and so started TAS7 a frame late.
+#   room (1,0): 23 + TAS2's 76 = 99. the old room_6_0_exit_frame_72.txt tried
+#   offsets 24-31 only and so started TAS7 a frame late
+#   (now room_6_0_reference_frame_70.txt: TAS7 fitted to celeste-minimal).
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,0,0,38,0,0,0,0,0,0,0,16,0,0,0,0,0,0,16,0,1,1,1,36,0,0,0,0,0,0,0,2,0,16,0,0,0,36,0,0,0,0,0,0,16,0,0
