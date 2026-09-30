@@ -13,7 +13,7 @@
 #   frame 70 (level 0 alone: frame 64).
 # - Horizon step 140 (frame 70) confirmed at every level including Exact:
 #   OPTIMAL win frame 140 (steps) = frame 70.
-# -  (split frame): 335 concrete
+# - `rewrite witness --horizon 140 --level 18` (split frame): 335 concrete
 #   steps, 0 dead ends; its per-step bytes folded to per-frame (step 2k is
 #   frame k's input; the part-a steps read no buttons).
 # - concrete_run (the unsplit game): player at (52,-2) on frame 69, the next
