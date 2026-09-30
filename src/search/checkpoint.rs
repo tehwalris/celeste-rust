@@ -315,6 +315,13 @@ impl FrameFile {
         self.header.index.iter().flat_map(move |&(cell, start, len)| (start..start + len).map(move |r| (r, (cell, self.key(r)))))
     }
 
+    /// The cell index itself: the runs `(cell, start, len)`, sorted by
+    /// `(cell, start)` - for a reader that decides per run whether to read
+    /// its keys (`key_at`) at all.
+    pub fn runs(&self) -> &[(u32, u32, u32)] {
+        &self.header.index
+    }
+
     /// The row ranges holding `cell`, ascending (empty if the file has none).
     pub fn rows_of_cell(&self, cell: u32) -> Vec<std::ops::Range<u32>> {
         let idx = &self.header.index;
@@ -448,7 +455,6 @@ pub fn save_value_to<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-/// Load a value saved by `save_value_to`.
 /// `rewrite partition-census`: per frame of a level's tree, how its rows
 /// split under the layout of plans/architecture.md follow-up 6 - one file
 /// per (shape, cell), one block per dispatch key inside - next to today's
@@ -544,8 +550,16 @@ pub fn partition_census(level_dir: &Path, w: Option<u8>) -> Result<String> {
     Ok(out)
 }
 
+/// Load a value saved by `save_value_to`.
 pub fn load_value_from<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = std::fs::read(path)?;
+    bincode::deserialize(value_payload(&bytes, path)?).with_context(|| format!("deserializing {}", path.display()))
+}
+
+/// The bincode payload of a `save_value_to` file's bytes (`path` names it in
+/// errors), its header checked - for a reader that walks a large value in
+/// place (the UI export's marks, mapped) instead of deserializing it.
+pub fn value_payload<'a>(bytes: &'a [u8], path: &Path) -> Result<&'a [u8]> {
     ensure!(bytes.len() >= 16 && &bytes[0..4] == MAGIC, "{}: bad magic", path.display());
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     ensure!(
@@ -557,7 +571,7 @@ pub fn load_value_from<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T>
     );
     let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
     ensure!(bytes.len() == 16 + len, "{}: length mismatch", path.display());
-    bincode::deserialize(&bytes[16..]).with_context(|| format!("deserializing {}", path.display()))
+    Ok(&bytes[16..])
 }
 
 #[cfg(test)]

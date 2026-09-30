@@ -8,7 +8,20 @@
 //! frame file gives the per-cell state count as consecutive index
 //! differences, the win list gives the win cells - and in the marks files
 //! (`(shape, cell, key, dist)` rows). No row is decoded and no engine is
-//! built, so the export is a walk over headers: ~120k files in seconds.
+//! built: the export is a walk over headers plus, for the marks by layer,
+//! the key column of the runs at marked cells.
+//!
+//! How it reads (2026-09-30; room (6,0) h144 levels 0-5, a 1.7G-row level
+//! 0 and 70-100M marks per level: 556 s and 48 GB before, ~25 s and 13 GB
+//! after, on a machine a search was running on). One checkpoint tree at a
+//! time, each read by one worker per core frame by frame, the latest (the
+//! largest) first. A tree's marked sets are read in place off the mapped
+//! marks files (never deserialized as a whole) into hash shards by
+//! (shape, cell), and a frame file's rows are probed against them - a run
+//! at a cell with no marks is skipped without touching its keys. The marks
+//! used to be one hash map built by one thread per tree and probed by that
+//! thread with every row of the tree, which for level 0 was the whole
+//! export.
 //!
 //! Output layout (`--out DIR`):
 //!
@@ -367,8 +380,259 @@ struct LevelData {
     frames: Vec<(Sparse, Sparse)>,
 }
 
-/// Read one level directory's frames, headers only.
-fn read_level_frames(dir: &Path) -> Result<LevelData> {
+/// `f(i)` for every `i < n`, on one worker per core pulling indices in
+/// order; the results by index. The first error stops the pulling.
+fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8).min(n.max(1));
+    let parts = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(|| -> Result<Vec<(usize, T)>> {
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            return Ok(mine);
+                        }
+                        match f(i) {
+                            Ok(v) => mine.push((i, v)),
+                            Err(e) => {
+                                next.store(n, Ordering::Relaxed);
+                                return Err(e);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("export worker panicked")).collect::<Result<Vec<_>>>()
+    })?;
+    let mut all: Vec<(usize, T)> = parts.into_iter().flatten().collect();
+    all.sort_unstable_by_key(|p| p.0);
+    Ok(all.into_iter().map(|p| p.1).collect())
+}
+
+/// A marks file, mapped. `Visited::save` writes `(shape, cell, k0, k1)`
+/// rows (28 bytes each); trees from when the marks carried their distance
+/// hold `(shape, cell, k0, k1, dist)` rows (32 bytes). The bincode `Vec`
+/// length prefix says which:
+/// the payload is `n x 32` or `n x 28`, never both. Rows are read in
+/// place, never deserialized as a whole: a level's marks run to 100M rows
+/// (room (6,0) h144: 1.5-2.8 GB per file).
+struct MarksMap {
+    map: memmap2::Mmap,
+    rows: usize,
+    stride: usize,
+}
+
+/// Bytes before the first row: the checkpoint value header (16) and the
+/// bincode `Vec` length (8).
+const MARKS_ROWS_AT: usize = 24;
+
+impl MarksMap {
+    fn open(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: a marks file is written once (renamed into place) and
+        // never modified afterwards.
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        let payload = crate::search::checkpoint::value_payload(&map, path)?;
+        anyhow::ensure!(payload.len() >= 8, "{}: too short for a marks file", path.display());
+        let n = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let body = payload.len() as u64 - 8;
+        let stride = if n.checked_mul(32) == Some(body) {
+            32
+        } else if n.checked_mul(28) == Some(body) {
+            28
+        } else {
+            bail!("{}: {n} rows do not fit {body} payload bytes as 32- or 28-byte rows", path.display())
+        };
+        Ok(MarksMap { map, rows: n as usize, stride })
+    }
+
+    fn have_dist(&self) -> bool {
+        self.stride == 32
+    }
+
+    /// Row `i` as `((shape, cell, key), dist)`; dist 0 without distances.
+    fn row(&self, i: usize) -> ((u64, u32, (u64, u64)), u32) {
+        let b = &self.map[MARKS_ROWS_AT + i * self.stride..MARKS_ROWS_AT + (i + 1) * self.stride];
+        let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let dist = if self.stride == 32 { u32_at(28) } else { 0 };
+        ((u64_at(0), u32_at(8), (u64_at(12), u64_at(20))), dist)
+    }
+}
+
+/// Shards of the marked states, by (shape, cell): enough to build them in
+/// parallel, and a frame file's run looks up one shard.
+const MARK_SHARDS: usize = 256;
+
+fn mark_shard(shape: u64, cell: u32) -> usize {
+    use celeste_engine::runtime2::mix64;
+    (mix64(shape ^ mix64(cell as u64)) % MARK_SHARDS as u64) as usize
+}
+
+/// One marked state: `(shape, cell, key)`, as the frame rows are keyed.
+type MarkId = (u64, u32, (u64, u64));
+
+/// Every marked state of up to 64 sets over one tree, with the bitmask of
+/// the sets that hold it, and the (shape, cell)s that hold any - so a
+/// frame file's run at a cell with none is skipped unread, and a row of
+/// one that has some is one probe.
+///
+/// A hash probe per row, not a merge against sorted marks: a run is a few
+/// rows (one flush's survivors at one cell) while a cell's marks span every
+/// layer, so a sorted lookup started cold per run and paid a binary search
+/// of cache misses per row (2026-09-30: 70% of the export's CPU at room
+/// (6,0)). A probe that misses - most rows are unmarked - is one cache miss.
+struct MarkTable {
+    shards: Vec<FxHashMap<MarkId, u64>>,
+    cells: rustc_hash::FxHashSet<(u64, u32)>,
+}
+
+/// Rows of the marks files per chunk of the parallel read.
+const MARKS_CHUNK: usize = 1 << 20;
+
+/// The sets' table, and per set its `(cell, dist, count)` sorted by (dist,
+/// cell) (dist 0 throughout when the file has none).
+fn mark_table(sets: &[MarksMap]) -> Result<(MarkTable, Vec<Vec<(u32, u32, u32)>>)> {
+    anyhow::ensure!(sets.len() <= 64, "at most 64 marked sets per tree");
+    // The chunks: every set's rows, read in parallel into per-shard lists
+    // and a per-(dist, cell) count.
+    let chunks: Vec<(usize, usize)> =
+        sets.iter().enumerate().flat_map(|(k, m)| (0..m.rows.div_ceil(MARKS_CHUNK)).map(move |c| (k, c))).collect();
+    let read = par_map(chunks.len(), |i| {
+        let (k, c) = chunks[i];
+        let m = &sets[k];
+        let mut shards: Vec<Vec<MarkId>> = vec![Vec::new(); MARK_SHARDS];
+        let mut hist: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+        for r in c * MARKS_CHUNK..((c + 1) * MARKS_CHUNK).min(m.rows) {
+            let (id, dist) = m.row(r);
+            shards[mark_shard(id.0, id.1)].push(id);
+            *hist.entry((dist, id.1)).or_default() += 1;
+        }
+        Ok((k, shards, hist))
+    })?;
+    let mut hists: Vec<FxHashMap<(u32, u32), u32>> = vec![FxHashMap::default(); sets.len()];
+    let per_shard: Vec<std::sync::Mutex<Vec<(u64, Vec<MarkId>)>>> =
+        (0..MARK_SHARDS).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    for (k, shards, hist) in read {
+        for (dc, n) in hist {
+            *hists[k].entry(dc).or_default() += n;
+        }
+        for (s, rows) in shards.into_iter().enumerate() {
+            if !rows.is_empty() {
+                per_shard[s].lock().unwrap().push((1u64 << k, rows));
+            }
+        }
+    }
+    // Per shard: one entry per state with its sets' bits OR-ed, and the
+    // shard's (shape, cell)s.
+    let built = par_map(MARK_SHARDS, |s| {
+        let lists = std::mem::take(&mut *per_shard[s].lock().unwrap());
+        let mut map: FxHashMap<MarkId, u64> = FxHashMap::default();
+        map.reserve(lists.iter().map(|l| l.1.len()).sum());
+        let mut cells = rustc_hash::FxHashSet::default();
+        for (bit, list) in lists {
+            for id in list {
+                *map.entry(id).or_default() |= bit;
+                cells.insert((id.0, id.1));
+            }
+        }
+        Ok((map, cells))
+    })?;
+    let mut table = MarkTable { shards: Vec::with_capacity(MARK_SHARDS), cells: rustc_hash::FxHashSet::default() };
+    for (map, cells) in built {
+        table.shards.push(map);
+        table.cells.extend(cells);
+    }
+    let by_cell_dist = hists
+        .into_iter()
+        .map(|h| {
+            let mut v: Vec<(u32, u32, u32)> = h.into_iter().map(|((d, c), n)| (c, d, n)).collect();
+            v.sort_unstable_by_key(|&(c, d, _)| (d, c));
+            v
+        })
+        .collect();
+    Ok((table, by_cell_dist))
+}
+
+/// One frame of a tree: the states per cell, the wins per cell, and per
+/// marked set the marked states per cell.
+struct FrameCounts {
+    cells: FxHashMap<u32, u32>,
+    wins: FxHashMap<u32, u32>,
+    marked: Vec<FxHashMap<u32, u32>>,
+}
+
+fn frame_counts(dir: &Path, f: u32, marks: Option<&MarkTable>, nsets: usize) -> Result<FrameCounts> {
+    let mut out = FrameCounts { cells: FxHashMap::default(), wins: FxHashMap::default(), marked: vec![FxHashMap::default(); nsets] };
+    let files = match crate::frame::frame_files(dir, f) {
+        Ok(v) => v,
+        Err(_) if !dir.join("frames").join(format!("f{f:03}")).exists() => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("{} frame {f}", dir.display())),
+    };
+    let mut per_set = vec![0u32; nsets];
+    for file in files {
+        for (cell, n) in file.cell_counts() {
+            *out.cells.entry(cell).or_default() += n;
+        }
+        for &(_, cell) in file.win_rows() {
+            *out.wins.entry(cell).or_default() += 1;
+        }
+        let Some(t) = marks else { continue };
+        let shape = file.shape_hash();
+        // A run is a few rows (one flush's survivors at one cell: ~4 at
+        // room (6,0) level 0, 564M runs over the tree), and a cell's runs
+        // are adjacent: the cell is looked up once, and a run at a cell
+        // without marks is skipped without reading its keys.
+        let mut last: Option<(u32, bool)> = None;
+        for &(cell, start, len) in file.runs() {
+            let marked = match last {
+                Some((c, m)) if c == cell => m,
+                _ => {
+                    let m = t.cells.contains(&(shape, cell));
+                    last = Some((cell, m));
+                    m
+                }
+            };
+            if !marked {
+                continue;
+            }
+            let shard = &t.shards[mark_shard(shape, cell)];
+            per_set.fill(0);
+            for r in start..start + len {
+                if let Some(&m) = shard.get(&(shape, cell, file.key_at(r))) {
+                    let mut bits = m;
+                    while bits != 0 {
+                        per_set[bits.trailing_zeros() as usize] += 1;
+                        bits &= bits - 1;
+                    }
+                }
+            }
+            for (s, &n) in per_set.iter().enumerate() {
+                if n > 0 {
+                    *out.marked[s].entry(cell).or_default() += n;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn sparse(m: FxHashMap<u32, u32>) -> Sparse {
+    let mut v: Sparse = m.into_iter().collect();
+    v.sort_unstable();
+    v
+}
+
+/// Read one level directory: its frames from the headers, and - in the
+/// same pass over the files - the marked sets of `marks` split by layer
+/// (result `[k]` is, per frame, the marked states of set `k` per cell: the
+/// tree's `(cell, key)` rows intersected with the set). Frames in parallel.
+fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
     let fdir = dir.join("frames");
     let mut nframes = 0u32;
     for e in std::fs::read_dir(&fdir).with_context(|| format!("listing {}", fdir.display()))? {
@@ -378,7 +642,6 @@ fn read_level_frames(dir: &Path) -> Result<LevelData> {
             nframes = nframes.max(n + 1);
         }
     }
-    let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(nframes as usize);
     // The level's position graph, to draw a won state where its player left
     // from (below). A tree without one draws wins at their own cells; one
     // that exists and does not load is an error, not a silent skip.
@@ -388,22 +651,14 @@ fn read_level_frames(dir: &Path) -> Result<LevelData> {
     } else {
         None
     };
-    for f in 0..nframes {
-        let mut cells: FxHashMap<u32, u32> = FxHashMap::default();
-        let mut wins: FxHashMap<u32, u32> = FxHashMap::default();
-        let files = match crate::frame::frame_files(dir, f) {
-            Ok(v) => v,
-            Err(_) if !fdir.join(format!("f{f:03}")).exists() => Vec::new(),
-            Err(e) => return Err(e).with_context(|| format!("{} frame {f}", dir.display())),
-        };
-        for file in files {
-            for (cell, n) in file.cell_counts() {
-                *cells.entry(cell).or_default() += n;
-            }
-            for (_, _, cell) in file.wins() {
-                *wins.entry(cell).or_default() += 1;
-            }
-        }
+    // The latest frames are the largest: pulled first, so the tail of the
+    // parallel pass is the small ones.
+    let n = nframes as usize;
+    let mut counts = par_map(n, |i| frame_counts(dir, (n - 1 - i) as u32, marks, nsets))?;
+    counts.reverse();
+    let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(n);
+    let mut layers: Vec<Vec<Sparse>> = vec![Vec::with_capacity(n); nsets];
+    for FrameCounts { mut cells, mut wins, marked } in counts {
         // A won state has left the room: its cell is the NEXT room's spawn,
         // one room over (`pos_graph::room_offset` puts the room it exits to
         // one room to the right), so drawn as-is the winning states sit in the box's far
@@ -433,108 +688,12 @@ fn read_level_frames(dir: &Path) -> Result<LevelData> {
                 }
             }
         }
-        let mut cells: Sparse = cells.into_iter().collect();
-        cells.sort_unstable();
-        let mut wins: Sparse = wins.into_iter().collect();
-        wins.sort_unstable();
-        frames.push((cells, wins));
-    }
-    Ok(LevelData { frames })
-}
-
-/// One marked state: `(shape, cell, key)`, as the frame rows are keyed.
-type MarkId = (u64, u32, u64, u64);
-
-/// A marks file: the states, and their distances if the file has them.
-struct MarksFile {
-    ids: Vec<MarkId>,
-    dist: Option<Vec<u32>>,
-}
-
-/// Read a marks file in either layout. `Marks::save` writes `(shape,
-/// cell, k0, k1, dist)` rows (32 bytes each); trees written before the
-/// distance was stored hold `(shape, cell, k0, k1)` rows (28 bytes). The
-/// bincode `Vec` length prefix says which: the payload is `n x 32` or
-/// `n x 28`, never both.
-fn read_marks_file(path: &Path) -> Result<MarksFile> {
-    let len = std::fs::metadata(path)?.len();
-    let bytes = std::fs::read(path)?;
-    anyhow::ensure!(bytes.len() >= 24, "{}: too short for a marks file", path.display());
-    let n = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let payload = len - 24;
-    if payload == n * 32 {
-        let rows: Vec<(u64, u32, u64, u64, u32)> = crate::search::checkpoint::load_value_from(path)?;
-        let dist = rows.iter().map(|r| r.4).collect();
-        Ok(MarksFile { ids: rows.into_iter().map(|(s, c, a, b, _)| (s, c, a, b)).collect(), dist: Some(dist) })
-    } else if payload == n * 28 {
-        let rows: Vec<(u64, u32, u64, u64)> = crate::search::checkpoint::load_value_from(path)?;
-        Ok(MarksFile { ids: rows, dist: None })
-    } else {
-        bail!("{}: {n} rows do not fit {payload} payload bytes as 32- or 28-byte rows", path.display())
-    }
-}
-
-/// `(cell, dist, count)` sorted by (dist, cell); dist 0 throughout when
-/// the file has none.
-fn marks_by_cell_dist(m: &MarksFile) -> Vec<(u32, u32, u32)> {
-    let mut agg: FxHashMap<(u32, u32), u32> = FxHashMap::default();
-    for (i, id) in m.ids.iter().enumerate() {
-        let d = m.dist.as_ref().map(|v| v[i]).unwrap_or(0);
-        *agg.entry((d, id.1)).or_default() += 1;
-    }
-    let mut v: Vec<(u32, u32, u32)> = agg.into_iter().map(|((d, c), n)| (c, d, n)).collect();
-    v.sort_unstable_by_key(|&(c, d, _)| (d, c));
-    v
-}
-
-/// Split several marked sets over ONE frames tree by layer: result `[k]`
-/// is, per frame, the marked states of set `k` per cell. One pass over the
-/// tree's `(cell, key)` rows against a state -> set-bitmask map, so level
-/// 0's 150M rows are read once for all its horizons.
-fn marks_by_layer(dir: &Path, sets: &[&MarksFile]) -> Result<Vec<Vec<Sparse>>> {
-    anyhow::ensure!(sets.len() <= 64, "at most 64 marked sets per tree");
-    let mut mask: FxHashMap<MarkId, u64> = FxHashMap::default();
-    for (k, set) in sets.iter().enumerate() {
-        for id in &set.ids {
-            *mask.entry(*id).or_default() |= 1 << k;
+        frames.push((sparse(cells), sparse(wins)));
+        for (k, m) in marked.into_iter().enumerate() {
+            layers[k].push(sparse(m));
         }
     }
-    let fdir = dir.join("frames");
-    let mut nframes = 0u32;
-    for e in std::fs::read_dir(&fdir)? {
-        let name = e?.file_name();
-        if let Some(n) = name.to_string_lossy().strip_prefix('f').and_then(|s| s.parse::<u32>().ok()) {
-            nframes = nframes.max(n + 1);
-        }
-    }
-    let mut out: Vec<Vec<Sparse>> = vec![Vec::with_capacity(nframes as usize); sets.len()];
-    for f in 0..nframes {
-        let mut per_set: Vec<FxHashMap<u32, u32>> = vec![FxHashMap::default(); sets.len()];
-        let files = match crate::frame::frame_files(dir, f) {
-            Ok(v) => v,
-            Err(_) if !fdir.join(format!("f{f:03}")).exists() => Vec::new(),
-            Err(e) => return Err(e).with_context(|| format!("{} frame {f}", dir.display())),
-        };
-        for file in files {
-            let shape = file.shape_hash();
-            for (cell, key) in file.cell_keys() {
-                if let Some(&m) = mask.get(&(shape, cell, key.0, key.1)) {
-                    let mut bits = m;
-                    while bits != 0 {
-                        let k = bits.trailing_zeros() as usize;
-                        bits &= bits - 1;
-                        *per_set[k].entry(cell).or_default() += 1;
-                    }
-                }
-            }
-        }
-        for (k, agg) in per_set.into_iter().enumerate() {
-            let mut v: Sparse = agg.into_iter().collect();
-            v.sort_unstable();
-            out[k].push(v);
-        }
-    }
-    Ok(out)
+    Ok((LevelData { frames }, layers))
 }
 
 /// A level's directory under a search's checkpoint base; a forward's
@@ -665,36 +824,32 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
     );
     std::fs::create_dir_all(out)?;
 
-    // Work items: level 0's frames once, every finer level's frames, and
-    // per frames tree the marked sets over it (level 0: one per horizon).
-    enum Job {
-        Frames { h: u32, level: usize },
-        Marks { level: usize, hs: Vec<u32> },
+    // One pass per checkpoint tree: level 0's once, every finer level's,
+    // each with the marked sets over it (level 0: one per horizon), its
+    // frames and its marks split by layer read together. The trees go one
+    // at a time, each read in parallel inside, so the memory is one tree's
+    // marked sets at a time.
+    struct Tree {
+        h: u32,
+        level: usize,
+        marks_hs: Vec<u32>,
     }
-    let mut jobs: Vec<Job> = Vec::new();
-    let mut l0_hs: Vec<u32> = Vec::new();
-    let mut have_l0 = false;
+    let mut trees: Vec<Tree> = Vec::new();
     for hr in &horizons {
         for lr in &hr.levels {
+            // A forward on its own has no backward, so no marks.
+            let marked = !lr.refuted && !forward_only;
             if lr.level == 0 {
-                if !have_l0 {
-                    jobs.push(Job::Frames { h: hr.h, level: 0 });
-                    have_l0 = true;
+                if !trees.iter().any(|t| t.level == 0) {
+                    trees.push(Tree { h: hr.h, level: 0, marks_hs: Vec::new() });
                 }
-                // A forward on its own has no backward, so no marks.
-                if !lr.refuted && !forward_only {
-                    l0_hs.push(hr.h);
+                if marked {
+                    trees.iter_mut().find(|t| t.level == 0).expect("level 0's tree").marks_hs.push(hr.h);
                 }
             } else {
-                jobs.push(Job::Frames { h: hr.h, level: lr.level });
-                if !lr.refuted {
-                    jobs.push(Job::Marks { level: lr.level, hs: vec![hr.h] });
-                }
+                trees.push(Tree { h: hr.h, level: lr.level, marks_hs: if marked { vec![hr.h] } else { Vec::new() } });
             }
         }
-    }
-    if !l0_hs.is_empty() {
-        jobs.push(Job::Marks { level: 0, hs: l0_hs });
     }
     struct MarksOut {
         h: u32,
@@ -707,63 +862,49 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
         Frames { h: u32, level: usize, data: LevelData },
         Marks(Vec<MarksOut>),
     }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let results = std::sync::Mutex::new(Vec::new());
+    let mut results: Vec<Done> = Vec::new();
     let t = std::time::Instant::now();
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(16);
-    std::thread::scope(|s| -> Result<()> {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                s.spawn(|| -> Result<()> {
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(job) = jobs.get(i) else { return Ok(()) };
-                        let done = match *job {
-                            Job::Frames { h, level } => {
-                                let dir = level_dir(checkpoint_dir, h, level, forward_only);
-                                let data = read_level_frames(&dir)
-                                    .with_context(|| format!("frames of {}", dir.display()))?;
-                                Done::Frames { h, level, data }
-                            }
-                            Job::Marks { level, ref hs } => {
-                                let files = hs
-                                    .iter()
-                                    .map(|&h| {
-                                        let path = crate::frame::marks_path(checkpoint_dir, h, level);
-                                        read_marks_file(&path).with_context(|| format!("marks {}", path.display()))
-                                    })
-                                    .collect::<Result<Vec<_>>>()?;
-                                let refs: Vec<&MarksFile> = files.iter().collect();
-                                let dir = level_dir(checkpoint_dir, hs[0], level, forward_only);
-                                let layers = marks_by_layer(&dir, &refs)
-                                    .with_context(|| format!("marks by layer over {}", dir.display()))?;
-                                let outs = hs
-                                    .iter()
-                                    .zip(files.iter())
-                                    .zip(layers)
-                                    .map(|((&h, m), by_layer)| MarksOut {
-                                        h,
-                                        level,
-                                        have_dist: m.dist.is_some(),
-                                        by_cell_dist: marks_by_cell_dist(m),
-                                        by_layer,
-                                    })
-                                    .collect();
-                                Done::Marks(outs)
-                            }
-                        };
-                        results.lock().unwrap().push(done);
-                    }
-                })
+    for tree in &trees {
+        let tt = std::time::Instant::now();
+        let dir = level_dir(checkpoint_dir, tree.h, tree.level, forward_only);
+        let sets = tree
+            .marks_hs
+            .iter()
+            .map(|&h| {
+                let path = crate::frame::marks_path(checkpoint_dir, h, tree.level);
+                MarksMap::open(&path).with_context(|| format!("marks {}", path.display()))
             })
-            .collect();
-        for h in handles {
-            h.join().expect("export worker panicked")?;
+            .collect::<Result<Vec<_>>>()?;
+        let (table, by_cell_dist) = if sets.is_empty() {
+            (None, Vec::new())
+        } else {
+            let (table, by_cell_dist) = mark_table(&sets).with_context(|| format!("marks of {}", dir.display()))?;
+            (Some(table), by_cell_dist)
+        };
+        let t_marks = tt.elapsed();
+        let (data, layers) = read_tree(&dir, table.as_ref(), sets.len()).with_context(|| format!("frames of {}", dir.display()))?;
+        eprintln!(
+            "[export-ui] {}: {} frames, {} marked sets ({} states) in {:.1} s ({:.1} s marks)",
+            dir.display(),
+            data.frames.len(),
+            sets.len(),
+            sets.iter().map(|m| m.rows).sum::<usize>(),
+            tt.elapsed().as_secs_f64(),
+            t_marks.as_secs_f64()
+        );
+        results.push(Done::Frames { h: tree.h, level: tree.level, data });
+        if !sets.is_empty() {
+            let outs = tree
+                .marks_hs
+                .iter()
+                .zip(&sets)
+                .zip(by_cell_dist.into_iter().zip(layers))
+                .map(|((&h, m), (by_cell_dist, by_layer))| MarksOut { h, level: tree.level, have_dist: m.have_dist(), by_cell_dist, by_layer })
+                .collect();
+            results.push(Done::Marks(outs));
         }
-        Ok(())
-    })?;
-    let results = results.into_inner().unwrap();
-    eprintln!("[export-ui] read {} jobs in {:.1} s", results.len(), t.elapsed().as_secs_f64());
+    }
+    eprintln!("[export-ui] read {} trees in {:.1} s", trees.len(), t.elapsed().as_secs_f64());
 
     // The cell box: everything seen, and at least the start room.
     let (mut x0, mut y0, mut x1, mut y1) = (0i32, 0i32, 127i32, 127i32);
@@ -866,6 +1007,36 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both marks layouts read in place, and a state in two sets is one
+    /// entry holding both sets' bits (what level 0's horizons share).
+    #[test]
+    fn marks_files_read_in_place_into_one_table() {
+        let dir = std::env::temp_dir().join(format!("celeste-ui-marks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.bin"), dir.join("b.bin"));
+        // Set 0 without distances (`Visited::save`'s 28-byte rows), set 1
+        // with them (32-byte rows); they share the state (7, 3, (1, 2)).
+        let rows_a: Vec<(u64, u32, u64, u64)> = vec![(7, 3, 1, 2), (7, 3, 5, 6), (8, 4, 1, 2)];
+        let rows_b: Vec<(u64, u32, u64, u64, u32)> = vec![(7, 3, 1, 2, 2), (9, 3, 0, 0, 1)];
+        crate::search::checkpoint::save_value_to(&a, &rows_a).unwrap();
+        crate::search::checkpoint::save_value_to(&b, &rows_b).unwrap();
+        let sets = [MarksMap::open(&a).unwrap(), MarksMap::open(&b).unwrap()];
+        assert!(!sets[0].have_dist() && sets[1].have_dist());
+        assert_eq!((sets[0].rows, sets[1].rows), (3, 2));
+        assert_eq!(sets[1].row(0), ((7, 3, (1, 2)), 2));
+        let (t, by_cell_dist) = mark_table(&sets).unwrap();
+        let get = |s: u64, c: u32, k: (u64, u64)| t.shards[mark_shard(s, c)].get(&(s, c, k)).copied();
+        assert_eq!(get(7, 3, (1, 2)), Some(0b11), "the shared state holds both sets");
+        assert_eq!(get(7, 3, (5, 6)), Some(0b01));
+        assert_eq!(get(9, 3, (0, 0)), Some(0b10));
+        assert_eq!(get(7, 4, (1, 2)), None, "a key is looked up at its own cell");
+        assert_eq!(t.shards.iter().map(|s| s.len()).sum::<usize>(), 4);
+        assert!(t.cells.contains(&(8, 4)) && !t.cells.contains(&(8, 3)));
+        assert_eq!(by_cell_dist[0], vec![(3, 0, 2), (4, 0, 1)], "no distances: dist 0");
+        assert_eq!(by_cell_dist[1], vec![(3, 1, 1), (3, 2, 1)], "sorted by (dist, cell)");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn the_log_lines_parse_and_close_into_horizons() {

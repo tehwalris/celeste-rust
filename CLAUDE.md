@@ -602,7 +602,8 @@ A phone-first web view of one finished search: the room as a heatmap
 per (horizon, level, pass, frame) with the ladder's bands, set sizes,
 and the timing waterfall. Static: `rewrite export-ui` turns a finished
 checkpoint tree + its run log into ~9 MB of `run.json` + per-level
-binaries (headers and marks only, no row decoded, ~6 s); a Vite build
+binaries (headers, marks, and the key column at marked cells; no row
+decoded; room (6,0) h144 levels 0-5, a 1.7G-row level 0, in ~20 s); a Vite build
 plus `ui/serve.mjs` serve it under `/celeste/` on port 3011
 (UI-HOSTING.md). The control model and the data layout are in
 `ui/README.md` and at the top of `src/search/ui_export.rs`.
