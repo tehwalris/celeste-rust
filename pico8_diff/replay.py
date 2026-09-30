@@ -33,8 +33,17 @@ def hexbytes(path, n):
     return bytes.fromhex(h)
 
 
-def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None):
+def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, balloon_seeds=None):
     lua = open(lua_path or os.path.join(ROOT, "lua", "celeste-minimal.lua")).read()
+    if balloon_seeds is not None:
+        # A balloon's phase is `offset=rnd(1)` at load, which PICO-8 seeds
+        # itself, so a route past a balloon replays only under some draws.
+        # The TAS tool (gonengazit/UniversalClassicTas) fixes each balloon's
+        # offset instead - the `[s1,s2,]` header of a tasdatabase file, in
+        # object creation order - and so does this.
+        pat = "this.offset=rnd(1)"
+        assert lua.count(pat) == 1, f"expected exactly one {pat!r} in the Lua"
+        lua = lua.replace(pat, "this.offset=__balloon_seed()")
     if room is not None:
         # The minimal cart's _init loads room (1,0); the search patches the
         # same call (celeste-interp game_runner) to start elsewhere. The
@@ -51,6 +60,8 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None):
         # concrete value) and the state-normalization hint (a no-op).
         "function __split_by_flr(x) return x end",
         "function _hint_normalize() end",
+        "__balloon_seeds = {" + ",".join(str(v) for v in (balloon_seeds or [])) + "}",
+        "function __balloon_seed() return deli(__balloon_seeds, 1) or 0 end",
         "__inputs = {" + ",".join(str(b) for b in inputs) + "}",
         "__frame = 0",
         "function btn(i)",
@@ -116,6 +127,7 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the generated cart")
     ap.add_argument("--lua", help="the game's Lua (default lua/celeste-minimal.lua)")
     ap.add_argument("--begin-game", action="store_true", help="call begin_game() after _init() (the original cart)")
+    ap.add_argument("--balloon-seeds", help="comma-separated balloon offsets in creation order (the tasdatabase header), instead of rnd(1); missing ones are 0")
     ap.add_argument("--room", help="start room \"x,y\" (minimal cart: replaces _init's load_room(1, 0); with --begin-game: begin_game's load_room(0,0))")
     args = ap.parse_args()
     if args.inputs:
@@ -129,7 +141,8 @@ def main():
     work = tempfile.mkdtemp(prefix="celeste-replay-")
     cart = os.path.join(work, "replay.p8")
     room = tuple(int(v) for v in args.room.split(",")) if args.room else None
-    build_cart(inputs, frames, cart, args.lua, args.begin_game, room)
+    seeds = [float(v) for v in args.balloon_seeds.split(",") if v] if args.balloon_seeds is not None else None
+    build_cart(inputs, frames, cart, args.lua, args.begin_game, room, seeds)
     print(f"[replay] {len(inputs)} inputs, {frames} frames, cart {cart}", file=sys.stderr)
     proc = subprocess.run([pico8, "-x", cart], capture_output=True, text=True, timeout=120)
     lines = [l[len("@P8@ "):] for l in proc.stdout.splitlines() if l.startswith("@P8@ ")]

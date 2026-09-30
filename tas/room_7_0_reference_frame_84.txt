@@ -1,0 +1,21 @@
+# Room (7,0) "800 m" reference exit for celeste-minimal: frame 84, the
+# community TAS8 route (derived 2026-09-30). BALLOON SEED 0: replay with
+#   pico8_diff/replay.py --room 7,0 --balloon-seeds 0 tas/room_7_0_reference_frame_84.txt
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 7,0, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# ~/src/github.com/CelesteClassic/tasdatabase/classic/any/TAS8.tas: header
+# [0,] (the balloon's offset, which the TAS tool sets instead of rnd(1)) and
+# 61 inputs. In the ORIGINAL cart at prologue offset 23 (input 0 on frame 24,
+# the first frame the player exists) with the balloon offset 0 it exits
+# during frame 84 (f83 player 31,-4), on every replay; with PICO-8's own
+# rnd(1) it exits in some replays and not others.
+# Its per-frame positions (frames 1-84) went through
+# `rewrite trajectory --room 7,0` (our model's balloon phase is the whole
+# period, so the fit is phase-free); the fitted inputs below, replayed on a
+# real PICO-8 in celeste-minimal with --balloon-seeds 0, give f83 player
+# 31,-4 and f84 room 0,1, on every replay. Without the seed, 1 of 4 replays
+# stayed in the room.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,17,1,1,1,1,0,2,2,2,0,36,0,0,0,0,0,0,0,2,0,0,2,2,16,0,0,16,0,0,0,0,0,0,0,2,0,0,37,0,0,0,0,0,0,0,0,0,0,0,0,16,0,0,0,0,0,0,0,0,16,0
