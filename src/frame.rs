@@ -1448,7 +1448,7 @@ pub fn widened_keys_rt2(
     use crate::interpreter::abstraction::RemPrecision;
     let mut w = rt2.clone_block();
     if let RemPrecision::Bits(b) = coarser.rem {
-        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y), coarser.held.is_unknown(), coarser.fruit.is_unknown(), coarser.floors.is_unknown(), coarser.platforms.is_unknown());
+        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y), coarser.held.is_unknown(), coarser.fruit.is_unknown(), coarser.floors.is_unknown(), coarser.floors.is_timers(), coarser.platforms.is_unknown());
     }
     let keys = w.row_keys_canonical();
     let cells = crate::search::pos_graph::block_cells(&w)?;

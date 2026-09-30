@@ -180,6 +180,7 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
     widen_timers(st, d)?;
     widen_fly_fruit(st, d, &mut errs)?;
     widen_fall_floors(st, d)?;
+    widen_floor_timers(st, d)?;
     widen_platforms(st, d, &mut errs)?;
     canon_balloon_offset(st, d, &mut errs)?;
     widen_held(st, d)?;
@@ -216,7 +217,7 @@ fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut S
     Ok(())
 }
 
-use celeste_engine::runtime2::{BALLOON_PERIOD_RAW, PLATFORM_PATH, PLATFORM_REM};
+use celeste_engine::runtime2::{floor_holds_spring, BALLOON_PERIOD_RAW, FLOOR_TIMER_RANGE, PLATFORM_PATH, PLATFORM_REM};
 
 /// Held buttons unknown (plans/held-buttons.md): the player's trails leave the
 /// frame unknown - the canonical output unknown (`Symbolic::unknown_bool_output`),
@@ -252,9 +253,26 @@ impl FallFloorPaths {
     }
 }
 
-pub fn fall_floor_paths<D: Domain>(st: &State<D>) -> FallFloorPaths {
+pub fn fall_floor_paths<D: Domain>(st: &State<D>, d: &D) -> Result<FallFloorPaths> {
     let mut out = FallFloorPaths { unknown: Vec::new(), collideable: Vec::new() };
+    // An object's `(x, y)`: constants, floors and springs never move.
+    let at = |obj: &Path| -> Result<(P8, P8)> {
+        let get = |f: &str| -> Result<P8> {
+            let p = field(obj, &[f]);
+            match iface::get(st, &p) {
+                Some(Value::Num(v)) => d.as_const(&v).ok_or_else(|| anyhow::anyhow!("{}: not a constant", iface::show(&p))),
+                _ => bail!("{}: not a number", iface::show(&p)),
+            }
+        };
+        Ok((get("x")?, get("y")?))
+    };
+    let springs: Vec<(P8, P8)> = objects_of_type(st, "spring").iter().map(at).collect::<Result<_>>()?;
     for obj in objects_of_type(st, "fall_floor") {
+        // A floor holding up a spring stays exact: its unknown `state` would
+        // leak into the spring through `break_spring`.
+        if floor_holds_spring(at(&obj)?, &springs) {
+            continue;
+        }
         out.unknown.push(field(&obj, &["state"]));
         out.unknown.push(field(&obj, &["delay"]));
         out.collideable.push(field(&obj, &["collideable"]));
@@ -269,7 +287,46 @@ pub fn fall_floor_paths<D: Domain>(st: &State<D>) -> FallFloorPaths {
     for obj in objects_of_type(st, "balloon") {
         out.unknown.push(field(&obj, &["timer"]));
     }
+    Ok(out)
+}
+
+/// The countdowns a timers level widens (`abstraction::FloorsPrecision::Timers`):
+/// every fall floor's `delay` and the balloon's respawn `timer`.
+pub fn floor_timer_paths<D: Domain>(st: &State<D>) -> Vec<Path> {
+    let mut out = Vec::new();
+    for obj in objects_of_type(st, "fall_floor") {
+        let p = field(&obj, &["delay"]);
+        if iface::get(st, &p).is_some() {
+            out.push(p);
+        }
+    }
+    for obj in objects_of_type(st, "balloon") {
+        out.push(field(&obj, &["timer"]));
+    }
     out
+}
+
+/// The OUTPUT side of a timers level (2026-09-30, room (7,0)): each countdown
+/// stored as the whole range (`FLOOR_TIMER_RANGE`: the cart only compares
+/// them with 0, so no tighter range would be more precise). A floor's `state` and `collideable` stay exact, so
+/// an idle floor - which never reads its `delay` (a break sets it) - is
+/// unchanged, and a broken one keeps its phase and only forgets how far into
+/// it it is: next frame its `delay <= 0` is undecided and the interval split
+/// (`Domain::split_compare`) forks it into "still counting" and "done", each
+/// with an exact `state`. Every value is in the range, so there is no
+/// premise. Room (7,0)
+/// level 0 at f54: erasing the delays merged 3.1x, all floor fields 4.6x.
+fn widen_floor_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    if !d.floor_timers {
+        return Ok(());
+    }
+    let (lo, hi) = FLOOR_TIMER_RANGE;
+    for p in floor_timer_paths(st) {
+        let Some(Value::Num(_)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
+        let r = d.graph.leaf(Op::Const(lo, hi));
+        iface::set(st, &p, Value::Num(r))?;
+    }
+    Ok(())
 }
 
 /// The fall floors' INPUT side at a floors-unknown level (plans/fall-floors.md):
@@ -305,7 +362,7 @@ fn widen_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
 /// `output`: the canonical output unknown for `collideable` (never read in
 /// the frame), else a fresh atom (read by collisions: independent per floor).
 fn replace_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic, output: bool) -> Result<()> {
-    let fp = fall_floor_paths(st);
+    let fp = fall_floor_paths(st, d)?;
     for p in &fp.unknown {
         let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
         let u = d.unknown_num();

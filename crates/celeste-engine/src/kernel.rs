@@ -542,22 +542,18 @@ pub fn zi_fork_flr(a: ZI, c: usize, bits: u8) -> (ZI, u16) {
 
 // ---- cart / collision builtins (per-lane; x/y vary, w/h/flag uniform) ----
 
-/// mget, per lane, against the raw grid. Semantics identical to
-/// `CartData::mget(..).expect(..)`: fractional or out-of-range
-/// coordinates panic (the certified trace never produces them).
+/// mget, per lane. Semantics identical to `CartData::mget(..).expect(..)`:
+/// 0 outside the map (PICO-8's; a branch-free kernel reads there on a lane
+/// that does not take the iteration), and a fractional coordinate panics
+/// (the traced cart never makes one).
 #[inline(always)]
 pub fn zn_mget(cart: &CartData, x: ZN, y: ZN) -> ZN {
-    let map = cart.map_grid();
     let (x, y) = (x.to_array(), y.to_array());
     let mut o = [P8::from_i16(0); W];
     for i in 0..W {
         let xi = x[i].as_i16().expect("mget: x is not an integer");
         let yi = y[i].as_i16().expect("mget: y is not an integer");
-        assert!(
-            (0..128).contains(&xi) && (0..64).contains(&yi),
-            "mget out of range"
-        );
-        o[i] = P8::from_i16(map[xi as usize + yi as usize * 128] as i16);
+        o[i] = P8::from_i16(cart.mget_whole(xi, yi) as i16);
     }
     ZN::from_array(o)
 }

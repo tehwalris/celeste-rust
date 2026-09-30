@@ -122,6 +122,7 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
         g_balloon: g("balloon"),
         f_timer: f("timer"),
         f_offset: f("offset"),
+        g_spring: g("spring"),
     }
 }
 

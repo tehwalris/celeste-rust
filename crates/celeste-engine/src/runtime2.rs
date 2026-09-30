@@ -179,6 +179,9 @@ pub struct BoundaryIds {
     pub f_timer: u32,
     /// Its phase, stored canonical at every level (`widen::canon_balloon_offset`).
     pub f_offset: u32,
+    /// The spring, whose floor stays exact at a floors-unknown level
+    /// (`floor_holds_spring`).
+    pub g_spring: u32,
 }
 
 /// A full period of `sin` as an inclusive raw 16.16 interval's width: `[a, a +
@@ -187,6 +190,33 @@ pub struct BoundaryIds {
 /// tracer's output widening (`widen::canon_balloon_offset`), or the mark
 /// filter misses.
 pub const BALLOON_PERIOD_RAW: i32 = 0xffff;
+
+/// A countdown at a timers level (`abstraction::FloorsPrecision::Timers`): a
+/// fall floor's `delay`, the balloon's respawn `timer`. The cart only ever
+/// compares them with 0 (`delay <= 0`, `timer > 0`) and decrements them, so
+/// the whole 16.16 range is as precise as any tighter one - and, unlike a
+/// tighter one, closed under the decrement (a split does not narrow the stored
+/// interval, so `[-1024, 60] - 1` would leave `[-1024, 60]`). Raw 16.16.
+/// ONE definition, shared with the tracer (`widen::widen_floor_timers`), or
+/// the mark filter misses.
+pub const FLOOR_TIMER_RANGE: (i32, i32) = (i32::MIN, i32::MAX);
+
+/// Does the fall floor at `floor` hold up one of the springs at `springs`
+/// (each an object's `(x, y)`)? The cart's `break_fall_floor` breaks the
+/// spring standing on it (`collide(spring, 0, -1)`, both 8x8 boxes at offset
+/// 0, neither ever moves), so an unknown `state` for that floor would make
+/// the spring's `hide_in` - and through it `spr`, the bounce - unknown too.
+/// Such a floor stays EXACT at a floors-unknown level (room (7,0): the
+/// floor at (96, 104) under the spring at (96, 96)). ONE definition, shared
+/// with the tracer (`widen::fall_floor_paths`), or the mark filter misses.
+pub fn floor_holds_spring(floor: (P8, P8), springs: &[(P8, P8)]) -> bool {
+    let (fx, fy) = (floor.0.as_raw_u32() as i32 as i64, floor.1.as_raw_u32() as i32 as i64);
+    let px = 1i64 << 16;
+    springs.iter().any(|&(sx, sy)| {
+        let (sx, sy) = (sx.as_raw_u32() as i32 as i64, sy.as_raw_u32() as i32 as i64);
+        sx + 8 * px > fx && sy + 8 * px > fy - px && sx < fx + 8 * px && sy < fy + 7 * px
+    })
+}
 
 /// A moving platform's whole path, whole pixels: it moves 0.65 px a frame and
 /// wraps from past 128 to -16 (and from past -16 to 128), so its `x` - and
@@ -807,7 +837,7 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, 0, None, (1, 1), false, false, false, false);
+        self.widen_to(ids, 0, None, (1, 1), false, false, false, false, false);
     }
 
     /// The boundary widenings of the `Bits(rem_bits)` level on this block's
@@ -826,7 +856,7 @@ impl Rt2 {
     /// players' `spd.x`/`spd.y` to, `None` for exact speed - the level's
     /// `abstraction::spd_precision_for`, which the caller passes because
     /// the switch lives above this crate.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool, fruit: bool, floors: bool, platforms: bool) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool, fruit: bool, floors: bool, floor_timers: bool, platforms: bool) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 0. position widening (the rung below level 0): the player's
@@ -1129,12 +1159,25 @@ impl Rt2 {
 
         // 8. The fall floors at a floors-unknown level (plans/fall-floors.md),
         // as that level's kernels write them (`widen::widen_fall_floors`):
-        // `state` and `delay` the unknown number, `collideable` unknown. A
+        // `state` and `delay` the unknown number, `collideable` unknown -
+        // except a floor holding up a spring (`floor_holds_spring`). A
         // floor with no `delay` (a block built from the post-`_init` state,
         // which the level keys exact, `frame::Block::from_state`) has nothing
         // there to widen.
         if floors {
+            // An object's `(x, y)`, the same in every lane: floors and springs never move.
+            let at = |rt: &Self, obj: u32, what: &str| -> (P8, P8) {
+                let get = |f: u32| match rt.obj_field_cell(obj, f).map(|c| &rt.cols[c as usize]) {
+                    Some(Col::U(AV::Num(n))) => *n,
+                    other => panic!("fall floor widening: a {what}'s position is {other:?}, not one number"),
+                };
+                (get(ids.f_x), get(ids.f_y))
+            };
+            let springs: Vec<(P8, P8)> = self.objects_of_type(ids, ids.g_spring).into_iter().map(|o| at(self, o, "spring")).collect();
             for obj in self.objects_of_type(ids, ids.g_fall_floor) {
+                if floor_holds_spring(at(self, obj, "fall floor"), &springs) {
+                    continue;
+                }
                 for (name, f) in [("state", ids.f_state), ("delay", ids.f_delay)] {
                     let Some(c) = self.obj_field_cell(obj, f) else {
                         assert!(f == ids.f_delay, "fall floor widening: the fall floor has no `{name}` field");
@@ -1152,6 +1195,26 @@ impl Rt2 {
                 let c = self.obj_field_cell(obj, ids.f_timer).unwrap_or_else(|| panic!("balloon widening: the balloon has no `timer` field"));
                 check(self, c, "timer", &|v| matches!(v, AV::Num(_) | AV::Ival(..) | AV::UNum));
                 self.cols[c as usize] = Col::U(AV::UNum);
+            }
+        }
+
+        // 8a. Only the floors' timers (`abstraction::FloorsPrecision::Timers`),
+        // as that level's kernels write them (`widen::widen_floor_timers`):
+        // every fall floor's `delay` and the balloon's `timer` the whole
+        // range (`FLOOR_TIMER_RANGE`), `state` and `collideable` exact. A floor with no `delay` (the
+        // post-`_init` block, keyed exact) has nothing there to widen.
+        if floor_timers {
+            let (lo, hi) = (P8::from_raw(FLOOR_TIMER_RANGE.0), P8::from_raw(FLOOR_TIMER_RANGE.1));
+            for (ty, f, name) in [(ids.g_fall_floor, ids.f_delay, "delay"), (ids.g_balloon, ids.f_timer, "timer")] {
+                for obj in self.objects_of_type(ids, ty) {
+                    let Some(c) = self.obj_field_cell(obj, f) else { continue };
+                    check(self, c, name, &|v| match v {
+                        AV::Num(n) => lo <= n && n <= hi,
+                        AV::Ival(a, b) => lo <= a && b <= hi,
+                        _ => false,
+                    });
+                    self.cols[c as usize] = Col::U(AV::Ival(lo, hi));
+                }
             }
         }
 

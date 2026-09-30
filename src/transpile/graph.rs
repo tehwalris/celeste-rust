@@ -1246,8 +1246,8 @@ impl Graph {
                     Self::tile_flag_over(room.unwrap(), a(0), a(1), a(2), a(3), a(4))?
                 }
                 // `mget` on EXACT coordinates, the only form the kernels
-                // take (`zn_mget` panics on a fractional or out-of-range
-                // one); an interval coordinate is TOP.
+                // take (`zn_mget` panics on a fractional one, reads 0
+                // outside the map); an interval coordinate is refused.
                 Op::Mget if room.is_some() => {
                     let (x, y) = (a(0).as_num("Mget")?, a(1).as_num("Mget")?);
                     if x.low != x.high || y.low != y.high {

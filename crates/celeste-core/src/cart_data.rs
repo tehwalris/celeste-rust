@@ -84,10 +84,26 @@ impl CartData {
         &self.map_data
     }
 
+    /// PICO-8's `mget`: the tile at a whole-number map coordinate, and 0
+    /// outside the 128x64 map (as PICO-8 returns). The cart's own reads stay
+    /// inside (`tile_flag_at` / `spikes_at` clamp to the room), but a
+    /// branch-free kernel evaluates an unrolled loop iteration a lane does not
+    /// take too - `spikes_at`'s second column for a player at x >= 119 reads
+    /// tile column 16 of the room, x = 128 (room (7,0), 2026-09-30). A
+    /// fractional coordinate is refused: the traced cart never makes one.
     pub fn mget(&self, x: Pico8Num, y: Pico8Num) -> Result<u8> {
-        let x = Self::as_usize_below(x, "x", 128)?;
-        let y = Self::as_usize_below(y, "y", 64)?;
-        Ok(self.map_data[x + (y * 128)])
+        let x = x.as_i16().ok_or_else(|| anyhow!("mget: x is not an integer"))?;
+        let y = y.as_i16().ok_or_else(|| anyhow!("mget: y is not an integer"))?;
+        Ok(self.mget_whole(x, y))
+    }
+
+    /// `mget` on whole numbers: 0 outside the map.
+    pub fn mget_whole(&self, x: i16, y: i16) -> u8 {
+        if (0..128).contains(&x) && (0..64).contains(&y) {
+            self.map_data[x as usize + y as usize * 128]
+        } else {
+            0
+        }
     }
 
     pub fn fget(&self, i: Pico8Num, b: Pico8Num) -> Result<bool> {

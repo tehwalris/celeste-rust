@@ -492,6 +492,11 @@ pub struct Symbolic {
     /// `state`, `delay` and `collideable` (`widen::fork_floor_inputs`), with the
     /// same literal and atom machinery as the fruit (`unknowns`). Set by the walk.
     pub floors_unknown: bool,
+    /// Only the fall floors' TIMERS widened (`abstraction::FloorsPrecision::
+    /// Timers`): every outcome stores each floor's `delay` and the balloon's
+    /// `timer` as their whole ranges (`widen::widen_floor_timers`), which the
+    /// next frame reads as interval inputs. Set by the walk.
+    pub floor_timers: bool,
     /// The moving platforms unknown (`abstraction::PlatformsPrecision`,
     /// plans/platforms-unknown.md): `trace_frame` widens their inputs
     /// (`widen::platform_inputs`), every outcome their outputs.

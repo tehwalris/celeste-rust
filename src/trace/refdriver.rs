@@ -73,8 +73,9 @@ pub fn run_frame_all<'a>(
     if level.fruit.is_unknown() {
         anyhow::bail!("the reference engine does not run fruit-unknown levels (plans/fly-fruit.md)");
     }
-    // Nor the fall floors unknown, for the same reason.
-    if level.floors.is_unknown() {
+    // Nor the fall floors unknown or only their timers widened (a range the
+    // reference engine does not store).
+    if level.floors != crate::interpreter::abstraction::FloorsPrecision::Exact {
         anyhow::bail!("the reference engine does not run floors-unknown levels (plans/fall-floors.md)");
     }
     loop {

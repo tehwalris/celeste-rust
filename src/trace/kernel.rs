@@ -410,7 +410,7 @@ fn no_player_ranges(
     // The state's values, read off it before it is rebased (which blanks
     // them) and pinned back onto the rebased state by the next trace - as
     // the walk does with its lattice.
-    let mut consts = shapes::field_constants(start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?;
+    let mut consts = shapes::field_constants(start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.floor_timers, opts.platforms)?;
     // The spawn takes ~20 frames; the cap only stops a phase that never ends.
     // Only a phase run to its end - the player appears, or the shape
     // changes - bounds anything: a hull of part of it could miss a later
@@ -434,7 +434,7 @@ fn no_player_ranges(
             ended = true;
             break;
         }
-        consts = shapes::field_constants(&o.st, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?;
+        consts = shapes::field_constants(&o.st, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.floor_timers, opts.platforms)?;
         let heap = shapes::heap_constants(&o.st, &it.d);
         let mut next = o.st.clone();
         shapes::rebase(&mut next, &mut it.d, &heap)?;
@@ -2412,6 +2412,8 @@ pub fn room_constant_lattice(
     it.d.fruit_unknown = opts.fruit;
     // ... and the fall floors' (`widen::fork_floor_inputs`).
     it.d.floors_unknown = opts.floors;
+    // ... and stores the floors' timers as their ranges (`widen::widen_floor_timers`).
+    it.d.floor_timers = opts.floor_timers;
     // ... and the moving platforms' (`widen::platform_inputs`).
     it.d.platforms_unknown = opts.platforms;
     // ... from the start room's platform worlds (`concrete::platform_worlds`).
@@ -2451,7 +2453,7 @@ pub fn room_constant_lattice(
     if std::env::var_os("CELESTE_LATTICE_TRACE").is_some() {
         eprintln!("[walk] no-player ranges: {:?}", no_player.iter().map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>());
     }
-    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?);
+    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.floor_timers, opts.platforms)?);
     reps.insert(sk.clone(), start.clone());
     // The START state's own intervals are interval inputs too. Room (5,0) is
     // loaded by `_init`, whose balloon draws `offset = rnd(1)` there: an
@@ -2795,6 +2797,11 @@ fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: super:
             let pp = super::widen::platform_paths(st);
             ival.extend(pp.x.iter().chain(pp.last.iter()).cloned());
         }
+        // The floors' timers at a timers level: interval inputs, their whole
+        // range (`widen::widen_floor_timers`).
+        if opts.floor_timers {
+            ival.extend(super::widen::floor_timer_paths(st));
+        }
         ival
     } else {
         Vec::new()
@@ -2946,7 +2953,7 @@ fn walk_trace(
             continue;
         }
         let key = format!("{:?}", o.st.shape()?);
-        let constants = shapes::field_constants(&o.st, &tr.it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.platforms)?;
+        let constants = shapes::field_constants(&o.st, &tr.it.d, opts.spd_ival(), opts.pos_ival(), opts.held, opts.fruit, opts.floors, opts.floor_timers, opts.platforms)?;
         // Every level, the exact one included: an interval an outcome holds
         // beyond the boundary's own widenings came from `rnd` (`boundary_ival`).
         let mut ival = Vec::new();
@@ -2954,7 +2961,10 @@ fn walk_trace(
             let widened = boundary_ival(&o.st, opts);
             let mut fruit: Vec<super::iface::Path> = if opts.fruit { super::widen::fly_fruit_paths(&o.st).all().cloned().collect() } else { Vec::new() };
             if opts.floors {
-                fruit.extend(super::widen::fall_floor_paths(&o.st).all().cloned());
+                fruit.extend(super::widen::fall_floor_paths(&o.st, &tr.it.d)?.all().cloned());
+            }
+            if opts.floor_timers {
+                fruit.extend(super::widen::floor_timer_paths(&o.st));
             }
             if opts.platforms {
                 fruit.extend(super::widen::platform_paths(&o.st).all().cloned());
