@@ -238,3 +238,17 @@ machinery is unchanged: a frame is two steps.
 - Level 0: frame 40 (step 80) 6,154,595 states vs 6,154,596 unsplit - the
   widening at the cut costs nothing measurable - in 6.5 s (steps 79+80)
   against 177 s.
+
+## RESULT (2026-09-30): room (6,0) optimal exit at FRAME 70
+
+- Level 0 (r0sxhfp, split frame) to step 150: 1.68G states visited; first
+  win step 128 (frame 64).
+- h144 (frame 72) ladder: every level through 5 bits won; level 7's first
+  win at step 140 bounds the optimum below at frame 70. Marks there GREW
+  with rem precision (54M -> 357M) - slack: many near-optimal routes.
+- Count-up from step 140 (frame 70): confirmed at all 19 levels (marks 42M
+  at level 0, 3.9M at 2 bits, a bump to 114M at 9 bits, 3.0M at 15 bits,
+  5.9M exact). `OPTIMAL win frame: 140`.
+- Witness: 335 concrete steps, 0 dead ends; tas/room_6_0_exit_frame_70.txt.
+  concrete_run and a real PICO-8 both leave the room on frame 70 (f69 player
+  at 52,-2; f70 room 7,0). Two frames better than the known 72.
