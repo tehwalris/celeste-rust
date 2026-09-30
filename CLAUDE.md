@@ -540,6 +540,57 @@ result of all this is in BENCHMARK_DATA.md: the bucket is sound and a
 loss on room (2,0) (the hulls at every speed condition over-approximate
 past the census's 19x), so `exact` remains the default.
 
+## A frame in stages (`--cut`, 2026-09-30)
+
+`rewrite search|forward --cut player` splits every frame into STAGES
+(`trace::stage`), one search step each, deduped at the door between them:
+the forks of the player's `move` then no longer multiply every fork after
+it (the buttons, the platforms, the fruit). A cut is one of the cart's own
+`_hint_normalize()` statements - nothing is added to the Lua - at which the
+local `obj` is an instance of the named type: `player` stops the stage after
+the player's move, before its update. The tracer suspends there
+(`Flow::Suspend`), each level it unwinds through records where it was
+(statement, `if` arm, numeric `for`'s next index, the function of a call
+statement) with its scope, and the next stage resumes that stack
+(`Interp::resume`). The continuation's KEY - the place and the locals, which
+must be constants or references (`stage::key` refuses anything else) - is
+part of the shape (`heap::Shape::cont`, `Rt2::cont`, checkpoint format 10),
+so states at different places in a frame never share a kernel or dedupe. A
+state that reaches no cut (a frozen frame, a dead player) finishes its frame
+and WAITS out the remaining stages, so a frame is always `per_frame` steps.
+
+`frame::Stages` is the one mapping: the forward, its trees (`frames/fNNN`
+is a STEP), the edges and the backward count steps and know nothing of
+stages; horizons, wins (only at a frame's end: `wins_of` of a row with a
+continuation is false), the ladder, `--from/--to/--ceiling`, ckhash, witness,
+bench-backward and export-ui count FRAMES. A tree records its cuts
+(`stages.txt`; `Stages::of_tree`, `Stages::adopt` for tools that rebuild its
+kernels); logs label a step inside a frame `f012.1` (one stage into frame
+13); the tree diagnostics refuse a multi-stage tree. The reference engine
+steps whole frames and refuses a run with cuts; the witness steps it frame by
+frame against a split tree's frame boundaries.
+
+Gates, with cuts: the per-frame state sets at frame boundaries equal the
+unsplit ones (room (1,0) f0-f70: `ckhash` minus the `.` lines is the pinned
+gate; the `--win-at 9,101` search's marked sets at frame boundaries equal
+the pinned marks at every horizon and level, OPTIMAL 33;
+`CELESTE_BACKWARD=kernel` and `bench-backward --diff` agree with the BFS).
+The one known difference is room (6,0)'s level 0 (`r0sxhp`): TWO fewer
+states from f24 on, spurious deaths of the new player in its first frame
+that the unsplit kernel admits because it traces that frame from the spawn's
+shape, which has no player position to decide the platforms' collisions by
+(no `Points`); the split's second stage starts from a shape with the player
+and decides them. Every input at f24 of the concrete game leaves the player
+alive.
+
+When to cut is measured, not assumed: room (6,0) level 0 `r0sxhp` - kernels
+1.06M bodies / 15.7M fused nodes -> 33k / 2.0M, frame 40 209 s -> 8.3 s, f0-f40
+10:30 -> 0:41 wall, peak 28.8 -> 5.1 GB. Rooms (1,0) and (2,0), whose
+kernels are small already, gain nothing: the same states in
+1.45x / ~1.05x the time (every row is deduped and checkpointed twice a frame,
+and the stage between holds as many states as a frame boundary). So it is a
+per-run choice, not the default.
+
 ## Useful entry points
 
 ```bash

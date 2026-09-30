@@ -238,6 +238,23 @@ machinery is unchanged: a frame is two steps.
 - Level 0: frame 40 (step 80) 6,154,595 states vs 6,154,596 unsplit - the
   widening at the cut costs nothing measurable - in 6.5 s (steps 79+80)
   against 177 s.
+- REPLACED 2026-09-30 (branch `multistage`) by the real thing, `trace::stage`
+  (CLAUDE.md "A frame in stages"): no second Lua, no marker globals - the
+  cut is the cart's own `_hint_normalize()` where the local `obj` is the
+  player (`--cut player`), the tracer suspends and resumes its own stack,
+  and the continuation is part of the shape. `r0sxhp`: 33,148 bodies / 2.0M
+  fused nodes (unsplit 1,059,109 / 15.7M); frame 40 6,154,595 states, the
+  prototype's number.
+- The one-state difference, explained: from f24 on the unsplit level 0 has
+  exactly TWO more states (one at f40), every one a dead player
+  (`will_restart`) descending from a death in the new player's first frame;
+  the split tree is a subset of the unsplit one at every frame compared
+  (f24-f40). The concrete game cannot die there (all 64 inputs at f24 leave
+  the player alive at (16,112)). The unsplit kernel traces that frame from
+  the SPAWN's shape, which has no player position for the platforms' points
+  to decide collisions by; the split's second stage starts from a shape with
+  the player in it and decides them. An over-approximation of the unsplit
+  frame, not a state the split lost.
 
 ## RESULT (2026-09-30): room (6,0) exit at FRAME 70 - TIES the community TAS7
 

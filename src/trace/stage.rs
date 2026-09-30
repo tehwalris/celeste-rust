@@ -6,8 +6,9 @@
 //! player's update, the platforms and the fruit after that - is enumerated
 //! once per move configuration. Most of those configurations end in the
 //! same few states. Ending the kernel at the player's move and deduping
-//! there lets them merge BEFORE the second half runs (room (6,0), level 0:
-//! 1.13M kernel bodies -> 46k, the same frame-40 state set; plans/stages.md).
+//! there lets them merge BEFORE the second half runs (room (6,0) level 0
+//! `r0sxhp`: 1.06M kernel bodies -> 33k, frame 40 in 8 s instead of 209;
+//! CLAUDE.md "A frame in stages", plans/room60-overnight-2026-09-28.md).
 //!
 //! A CUT is where a stage ends: a `_hint_normalize()` statement (the cart's
 //! own merge hints, nothing added to the Lua) at which the local `obj` is an
