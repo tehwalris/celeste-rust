@@ -2802,6 +2802,13 @@ where
         // since level 0 last did: say which level is running before it runs.
         crate::interpreter::abstraction::set_level(self.precisions[0]);
         let dir = self.level_dir(horizon, 0);
+        anyhow::ensure!(
+            !dir.join("frames").is_dir() || Stages::of_tree(&dir)? == self.stages,
+            "{}: a tree of {:?}, and this search has {:?}",
+            dir.display(),
+            Stages::of_tree(&dir)?,
+            self.stages
+        );
         if self.level0.is_none() {
             // A tree on disk that already reaches the horizon needs no
             // resume: the backward reads its edges, and its first win is in

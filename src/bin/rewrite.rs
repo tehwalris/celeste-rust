@@ -506,7 +506,8 @@ enum Command {
         checkpoint_dir: String,
         #[arg(long)]
         horizon: u32,
-        /// Ladder level (0..=15 = Bits(k), 16 = Exact).
+        /// Ladder level: its index in `CELESTE_LADDER` (the search's own
+        /// list) when that is set, else 0..=15 = Bits(k), 16 = Exact.
         #[arg(long, default_value_t = 16)]
         level: usize,
         #[arg(long, default_value = "1,0")]
@@ -2841,7 +2842,13 @@ fn main() -> Result<()> {
             use celeste_rust::interpreter::abstraction::{set_level, Level, RemPrecision};
             use rustc_hash::FxHashMap;
             std::env::set_var("CELESTE_START_ROOM", &room);
-            let precision = Level::for_rem(if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level as u8) });
+            let precision = match std::env::var("CELESTE_LADDER") {
+                Ok(spec) => *Level::parse_ladder(&spec)
+                    .map_err(|e| anyhow::anyhow!("CELESTE_LADDER: {e}"))?
+                    .get(level)
+                    .ok_or_else(|| anyhow::anyhow!("CELESTE_LADDER has no level {level}"))?,
+                Err(_) => Level::for_rem(if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level as u8) }),
+            };
             set_level(precision);
             let base = std::path::Path::new(&checkpoint_dir);
             let dir = if level == 0 {
