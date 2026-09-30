@@ -619,6 +619,35 @@ fn asm_bool_input_matches_primitives() {
     }
 }
 
+/// A maybe-unknown bool INPUT cell (`CellRepr::UBool`, a near level's floor
+/// `collideable`): `val` at +0 and `known` at +2 of its slot, both loaded, so
+/// `Known` reads the lanes' own known mask and the cell passes through to a
+/// bool root with it.
+#[test]
+fn asm_ubool_input_carries_its_known_mask() {
+    use crate::transpile::asm::{compile_and_load_reprs, CellRepr, RootKind};
+    let mut g = Graph::new();
+    let cb = g.leaf(Op::Cell(0));
+    let known = g.add(Op::Known, vec![cb]);
+    let roots = vec![known, cb];
+    let mut reprs = HashMap::new();
+    reprs.insert(0u32, CellRepr::UBool);
+    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "uboolin", &reprs).expect("compile+load");
+    assert_eq!(compiled.root_kinds, vec![RootKind::Bool, RootKind::Bool]);
+    let mut rng = Lcg(0x0b00_1ea4);
+    for trial in 0..8 {
+        let (val, kn) = ((rng.next_u64() & 0xFFFF) as u16, (rng.next_u64() & 0xFFFF) as u16);
+        let mut input = vec![0u8; 64];
+        input[0..2].copy_from_slice(&val.to_le_bytes());
+        input[2..4].copy_from_slice(&kn.to_le_bytes());
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes, std::ptr::null());
+        let o = |ri: usize| compiled.root_offsets[ri] as usize;
+        let word = |at: usize| u16::from_le_bytes([out[at], out[at + 1]]);
+        assert_eq!((word(o(0)), word(o(0) + 2)), (kn, ALL), "trial {trial}: Known");
+        assert_eq!((word(o(1)) & kn, word(o(1) + 2)), (val & kn, kn), "trial {trial}: passthrough");
+    }
+}
+
 /// An interval (`ZI`) INPUT cell (`CellRepr::Ival`): two `ZN` planes (lo at
 /// +0, hi at +64 of a 128-byte slot), the codegen loads both, and the
 /// interval flows through `Add`/`Flr` to Ival and Num roots. Real room

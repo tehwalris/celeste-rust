@@ -181,6 +181,7 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
     widen_fly_fruit(st, d, &mut errs)?;
     widen_fall_floors(st, d)?;
     widen_floor_timers(st, d)?;
+    widen_near_floors(st, d, &mut errs)?;
     widen_platforms(st, d, &mut errs)?;
     canon_balloon_offset(st, d, &mut errs)?;
     widen_held(st, d)?;
@@ -217,7 +218,7 @@ fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut S
     Ok(())
 }
 
-use celeste_engine::runtime2::{floor_holds_spring, BALLOON_PERIOD_RAW, FLOOR_TIMER_RANGE, PLATFORM_PATH, PLATFORM_REM};
+use celeste_engine::runtime2::{floor_holds_spring, floor_player_window, BALLOON_PERIOD_RAW, FLOOR_HITBOX, FLOOR_STATE_RANGE, FLOOR_TIMER_RANGE, PLATFORM_PATH, PLATFORM_REM, PLAYER_HITBOX};
 
 /// Held buttons unknown (plans/held-buttons.md): the player's trails leave the
 /// frame unknown - the canonical output unknown (`Symbolic::unknown_bool_output`),
@@ -253,24 +254,29 @@ impl FallFloorPaths {
     }
 }
 
+/// An object's `(x, y)`: constants, floors and springs never move.
+fn position<D: Domain>(st: &State<D>, d: &D, obj: &Path) -> Result<(P8, P8)> {
+    let get = |f: &str| -> Result<P8> {
+        let p = field(obj, &[f]);
+        match iface::get(st, &p) {
+            Some(Value::Num(v)) => d.as_const(&v).ok_or_else(|| anyhow::anyhow!("{}: not a constant", iface::show(&p))),
+            _ => bail!("{}: not a number", iface::show(&p)),
+        }
+    };
+    Ok((get("x")?, get("y")?))
+}
+
+fn spring_positions<D: Domain>(st: &State<D>, d: &D) -> Result<Vec<(P8, P8)>> {
+    objects_of_type(st, "spring").iter().map(|o| position(st, d, o)).collect()
+}
+
 pub fn fall_floor_paths<D: Domain>(st: &State<D>, d: &D) -> Result<FallFloorPaths> {
     let mut out = FallFloorPaths { unknown: Vec::new(), collideable: Vec::new() };
-    // An object's `(x, y)`: constants, floors and springs never move.
-    let at = |obj: &Path| -> Result<(P8, P8)> {
-        let get = |f: &str| -> Result<P8> {
-            let p = field(obj, &[f]);
-            match iface::get(st, &p) {
-                Some(Value::Num(v)) => d.as_const(&v).ok_or_else(|| anyhow::anyhow!("{}: not a constant", iface::show(&p))),
-                _ => bail!("{}: not a number", iface::show(&p)),
-            }
-        };
-        Ok((get("x")?, get("y")?))
-    };
-    let springs: Vec<(P8, P8)> = objects_of_type(st, "spring").iter().map(at).collect::<Result<_>>()?;
+    let springs = spring_positions(st, d)?;
     for obj in objects_of_type(st, "fall_floor") {
         // A floor holding up a spring stays exact: its unknown `state` would
         // leak into the spring through `break_spring`.
-        if floor_holds_spring(at(&obj)?, &springs) {
+        if floor_holds_spring(position(st, d, &obj)?, &springs) {
             continue;
         }
         out.unknown.push(field(&obj, &["state"]));
@@ -325,6 +331,165 @@ fn widen_floor_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> 
         let Some(Value::Num(_)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
         let r = d.graph.leaf(Op::Const(lo, hi));
         iface::set(st, &p, Value::Num(r))?;
+    }
+    Ok(())
+}
+
+/// Which fall floors hold up a spring (`floor_holds_spring`), as ordinals
+/// among the fall floors in object order - which is stable: a floor is made
+/// by `load_room` and never destroyed, and `del` keeps the order of what it
+/// leaves. Read off a state whose positions are constants (the walk's start
+/// state); the walk's representatives hold theirs blanked (`shapes::blank`),
+/// so a near level names the spring's floor by this (`near_floor_paths`),
+/// and `widen_near_floors` checks it against the positions it has.
+pub fn spring_floor_ordinals<D: Domain>(st: &State<D>, d: &D) -> Result<Vec<usize>> {
+    let springs = spring_positions(st, d)?;
+    let mut out = Vec::new();
+    for (k, obj) in objects_of_type(st, "fall_floor").iter().enumerate() {
+        if floor_holds_spring(position(st, d, obj)?, &springs) {
+            out.push(k);
+        }
+    }
+    Ok(out)
+}
+
+/// The fields a near level widens but where the player overlaps the floor
+/// (`abstraction::FloorsPrecision::Near`), per fall floor but a spring's
+/// (`Symbolic::spring_floors`); its countdowns are `floor_timer_paths`.
+pub struct NearFloorPaths {
+    pub floors: Vec<Path>,
+    /// `state`: the interval `FLOOR_STATE_RANGE`, or exact.
+    pub state: Vec<Path>,
+    /// `collideable`: unknown, or exact.
+    pub collideable: Vec<Path>,
+}
+
+impl NearFloorPaths {
+    pub fn all(&self) -> impl Iterator<Item = &Path> {
+        self.state.iter().chain(self.collideable.iter())
+    }
+}
+
+pub fn near_floor_paths(st: &State<Symbolic>, d: &Symbolic) -> Result<NearFloorPaths> {
+    let skip = d.spring_floors.as_ref().ok_or_else(|| anyhow::anyhow!("a near level's tracer does not know the springs' floors (`spring_floor_ordinals`)"))?;
+    let mut out = NearFloorPaths { floors: Vec::new(), state: Vec::new(), collideable: Vec::new() };
+    for (k, obj) in objects_of_type(st, "fall_floor").into_iter().enumerate() {
+        if skip.contains(&k) {
+            continue;
+        }
+        out.state.push(field(&obj, &["state"]));
+        out.collideable.push(field(&obj, &["collideable"]));
+        out.floors.push(obj);
+    }
+    Ok(out)
+}
+
+/// A near level's INPUT side (`abstraction::FloorsPrecision::Near`): a floor's
+/// `state` arrives as an interval input (`FLOOR_STATE_RANGE`, or `[n, n]`) and
+/// is read as it is - its update's `state == k` is undecided on a widened lane
+/// and split (`verify::split_undecided_selects`, the equal side narrowed to
+/// `k`); its `collideable` arrives as a boolean a lane may hold unknown, which
+/// no kernel may read as a bit, so it is forked here
+/// (`Symbolic::fork_maybe_unknown`): per configuration a decided boolean,
+/// valid on the lanes that may hold it. The player, which reads it in every
+/// collision, and the floor's own update then see a decided value.
+pub fn fork_near_floor_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    let fp = near_floor_paths(st, d)?;
+    for (obj, p) in fp.floors.iter().zip(&fp.collideable) {
+        let Some(Value::Bool(c)) = iface::get(st, p) else { bail!("{}: not a boolean", iface::show(p)) };
+        let origin = match position(st, d, obj) {
+            Ok((x, y)) => format!("collideable at x {} y {}", x.whole_part_as_i16(), y.whole_part_as_i16()),
+            Err(_) => iface::show(p),
+        };
+        let (b, v, valid) = d.fork_maybe_unknown(c, &origin);
+        let at = st.decided(d);
+        d.evaluated_at(&v, &at);
+        st.guard = d.and(&st.guard, &valid);
+        iface::set(st, p, Value::Bool(b))?;
+    }
+    Ok(())
+}
+
+/// A near level's OUTPUT side (`abstraction::FloorsPrecision::Near`,
+/// 2026-09-30, room (7,0)): every fall floor but a spring's stores its `state`
+/// as the interval `FLOOR_STATE_RANGE` and its `collideable` unknown - EXCEPT
+/// where a player overlaps it (the cart's `floor.collide(player, 0, 0)`,
+/// `runtime2::floor_player_window`, on this outcome's positions), where both
+/// stay what the frame computed. The countdowns are `widen_floor_timers`'s,
+/// overlap or not: the player cannot enter a floor it collides with, so an
+/// overlapped floor is hidden and comes back only `if delay <= 0 and not
+/// check(player, 0, 0)` - its `delay` is not read while the player is inside
+/// (and an exact one could not be kept anyway: a floor the player enters was
+/// widened a frame before, and the mark filter keys a row by its projection,
+/// `Rt2::widen_to`, which has no history). Per lane: `Sel(overlap, computed,
+/// widened)`, the `state` always an interval column. The widened `state`
+/// contains the computed one, or the widening's own error says where not.
+fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
+    use super::domain::Cmp;
+    if !d.floors_near {
+        return Ok(());
+    }
+    // The hitboxes `floor_player_window` assumes, checked on the state.
+    let hitbox = |st: &State<Symbolic>, d: &Symbolic, obj: &Path, want: [i16; 4]| -> Result<()> {
+        for (f, w) in ["x", "y", "w", "h"].iter().zip(want) {
+            let p = field(obj, &["hitbox", f]);
+            let got = match iface::get(st, &p) {
+                Some(Value::Num(v)) => d.as_const(&v),
+                _ => None,
+            };
+            anyhow::ensure!(got == Some(P8::from_i16(w)), "{}: {got:?}, the near widening assumes {w}", iface::show(&p));
+        }
+        Ok(())
+    };
+    let mut players = Vec::new();
+    for obj in objects_of_type(st, "player") {
+        hitbox(st, d, &obj, PLAYER_HITBOX)?;
+        let coord = |f: &str| -> Result<crate::transpile::graph::NodeId> {
+            let p = field(&obj, &[f]);
+            match iface::get(st, &p) {
+                Some(Value::Num(v)) => Ok(v),
+                _ => bail!("{}: not a number", iface::show(&p)),
+            }
+        };
+        players.push((coord("x")?, coord("y")?));
+    }
+    let springs = spring_positions(st, d)?;
+    let fp = near_floor_paths(st, d)?;
+    let (slo, shi) = FLOOR_STATE_RANGE;
+    for ((obj, ps), pc) in fp.floors.iter().zip(&fp.state).zip(&fp.collideable) {
+        hitbox(st, d, obj, FLOOR_HITBOX)?;
+        let at = position(st, d, obj)?;
+        anyhow::ensure!(!floor_holds_spring(at, &springs), "{}: holds up a spring, but is not one of the springs' floors the walk recorded", iface::show(obj));
+        let [(xlo, xhi), (ylo, yhi)] = floor_player_window(at);
+        // `lo < v < hi` for every value `v` a lane may hold: an interval by
+        // its ends, so a bucket straddling an edge is no overlap (widened,
+        // the safe side) - as `runtime2::player_overlaps_floor`.
+        let inside = |d: &mut Symbolic, v: crate::transpile::graph::NodeId, lo: P8, hi: P8| -> Result<crate::transpile::graph::NodeId> {
+            let (a, b) = if d.is_interval(&v) { (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v])) } else { (v, v) };
+            let (klo, khi) = (d.num(lo), d.num(hi));
+            let above = d.compare(Cmp::Gt, &a, &klo)?;
+            let below = d.compare(Cmp::Lt, &b, &khi)?;
+            Ok(d.and(&above, &below))
+        };
+        let mut overlap = d.boolean(false);
+        for &(px, py) in &players {
+            let x = inside(d, px, xlo, xhi)?;
+            let y = inside(d, py, ylo, yhi)?;
+            let both = d.and(&x, &y);
+            overlap = d.or(&overlap, &both);
+        }
+        let Some(Value::Num(state)) = iface::get(st, ps) else { bail!("{}: not a number", iface::show(ps)) };
+        if let Some(holds) = contain(d, state, (slo as i64, shi as i64)) {
+            let held = d.or(&overlap, &holds);
+            owe(errs, d, ps, held);
+        }
+        let range = d.graph.leaf(Op::Const(slo, shi));
+        let state = d.sel_num(&overlap, &state, &range);
+        iface::set(st, ps, Value::Num(state))?;
+        let Some(Value::Bool(coll)) = iface::get(st, pc) else { bail!("{}: not a boolean", iface::show(pc)) };
+        let unknown = d.unknown_bool_output();
+        let coll = d.sel_bool(&overlap, &coll, &unknown);
+        iface::set(st, pc, Value::Bool(coll))?;
     }
     Ok(())
 }

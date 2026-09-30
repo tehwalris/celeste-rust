@@ -192,6 +192,9 @@ pub enum RootKind {
 ///   e.g. `has_dashed`).
 /// * `Ival` - a `ZI` (128 bytes): the `lo` plane (`ZN`) at +0, the `hi`
 ///   plane at +64. A per-lane interval, e.g. `player.rem`.
+/// * `UBool` - a bool a lane may hold UNKNOWN (a near level's floor
+///   `collideable`): the 16-bit `val` mask at +0 and the `known` mask at +2
+///   of a 64-byte slot.
 ///
 /// A cell absent from the repr map defaults to `Num`. Input cells are laid
 /// out in `input_cells` order, each at `Compiled::input_offsets[i]`, sized
@@ -200,6 +203,7 @@ pub enum RootKind {
 pub enum CellRepr {
     Num,
     Bool,
+    UBool,
     Ival,
 }
 
@@ -207,7 +211,7 @@ impl CellRepr {
     /// Bytes this input cell occupies in the input buffer.
     fn size(self) -> u32 {
         match self {
-            CellRepr::Num | CellRepr::Bool => 64,
+            CellRepr::Num | CellRepr::Bool | CellRepr::UBool => 64,
             CellRepr::Ival => 128,
         }
     }
@@ -670,6 +674,12 @@ impl<'a> Lower<'a> {
                         let dst =
                             self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off });
                         Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
+                    }
+                    CellRepr::UBool => {
+                        let known_off = off + 2;
+                        let val = self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off });
+                        let known = self.pure(Key::LoadMask(known_off), move |d| Inst::LoadMask { dst: d, off: known_off });
+                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
                     }
                     CellRepr::Ival => {
                         // Two ZN planes: lo at +0, hi at +64.

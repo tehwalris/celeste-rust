@@ -1439,6 +1439,18 @@ pub fn spd_width_log2(spd: crate::interpreter::abstraction::SpdPrecision) -> Opt
     }
 }
 
+/// The fall-floor projection a level's rows are keyed on (`Rt2::widen_to`).
+pub fn floors_widening(floors: crate::interpreter::abstraction::FloorsPrecision) -> celeste_engine::runtime2::FloorsWidening {
+    use crate::interpreter::abstraction::FloorsPrecision as P;
+    use celeste_engine::runtime2::FloorsWidening as W;
+    match floors {
+        P::Exact => W::Exact,
+        P::Unknown => W::Unknown,
+        P::Timers => W::Timers,
+        P::Near => W::Near,
+    }
+}
+
 /// `(shape, keys, cells)` of the widened rows - the shape is the widened
 /// block's, which is what the coarser level's marks are sharded by.
 pub fn widened_keys_rt2(
@@ -1448,7 +1460,7 @@ pub fn widened_keys_rt2(
     use crate::interpreter::abstraction::RemPrecision;
     let mut w = rt2.clone_block();
     if let RemPrecision::Bits(b) = coarser.rem {
-        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y), coarser.held.is_unknown(), coarser.fruit.is_unknown(), coarser.floors.is_unknown(), coarser.floors.is_timers(), coarser.platforms.is_unknown());
+        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y), coarser.held.is_unknown(), coarser.fruit.is_unknown(), floors_widening(coarser.floors), coarser.platforms.is_unknown());
     }
     let keys = w.row_keys_canonical();
     let cells = crate::search::pos_graph::block_cells(&w)?;

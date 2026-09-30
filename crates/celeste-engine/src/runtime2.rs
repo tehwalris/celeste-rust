@@ -201,6 +201,58 @@ pub const BALLOON_PERIOD_RAW: i32 = 0xffff;
 /// the mark filter misses.
 pub const FLOOR_TIMER_RANGE: (i32, i32) = (i32::MIN, i32::MAX);
 
+/// Which fall-floor widening a level applies (`abstraction::FloorsPrecision`,
+/// which lives above this crate): what `Rt2::widen_to` projects a row onto.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FloorsWidening {
+    Exact,
+    /// Every floor unknown but a spring's (`floor_holds_spring`).
+    Unknown,
+    /// Only the countdowns, their whole ranges (`FLOOR_TIMER_RANGE`).
+    Timers,
+    /// The countdowns as `Timers`, and every floor's `state` and
+    /// `collideable` but a spring's floor widened (`FLOOR_STATE_RANGE`,
+    /// unknown) except in the lanes where the player overlaps it
+    /// (`floor_player_window`).
+    Near,
+}
+
+/// A fall floor's `state` where a near level widens it
+/// (`abstraction::FloorsPrecision::Near`): 0 idle, 1 shaking, 2 hidden, the
+/// only values the cart gives it. An interval, not the unknown number: a lane
+/// may hold it or an exact state (an interval column holds a number as
+/// `[n, n]`). Raw 16.16. ONE definition, shared with the tracer
+/// (`widen::widen_near_floors`), or the mark filter misses.
+pub const FLOOR_STATE_RANGE: (i32, i32) = (0, 2 << 16);
+
+/// The player's hitbox (`player.init`) and every other object's
+/// (`init_object`), `(x, y, w, h)`, as `floor_player_window` reads them. The
+/// tracer checks the state it traces holds these (`widen::widen_near_floors`).
+pub const PLAYER_HITBOX: [i16; 4] = [1, 3, 6, 5];
+pub const FLOOR_HITBOX: [i16; 4] = [0, 0, 8, 8];
+
+/// Where the player overlaps the fall floor at `floor`: the cart's
+/// `floor.collide(player, 0, 0)` solved for the player's position, as OPEN
+/// windows `(lo, hi)` for its `x` and its `y` - it overlaps iff `lo < x < hi`
+/// on both axes. With the hitboxes above, `x` in `(fx - 7, fx + 7)` and `y` in
+/// `(fy - 8, fy + 5)`. ONE definition, shared with the tracer
+/// (`widen::widen_near_floors`), or the mark filter misses.
+pub fn floor_player_window(floor: (P8, P8)) -> [(P8, P8); 2] {
+    let [px, py, pw, ph] = PLAYER_HITBOX;
+    let [fx, fy, fw, fh] = FLOOR_HITBOX;
+    let at = |base: P8, d: i16| base + P8::from_i16(d);
+    [(at(floor.0, fx - px - pw), at(floor.0, fx + fw - px)), (at(floor.1, fy - py - ph), at(floor.1, fy + fh - py))]
+}
+
+/// Does a player whose `x` and `y` lie in `x` and `y` (inclusive, a number is
+/// `(n, n)`) CERTAINLY overlap the window's floor (`floor_player_window`)? A
+/// position bucket that straddles the window's edge does not: the floor is
+/// widened there, the safe side. ONE definition with the tracer's.
+pub fn player_overlaps_floor(window: [(P8, P8); 2], x: (P8, P8), y: (P8, P8)) -> bool {
+    let [(xlo, xhi), (ylo, yhi)] = window;
+    x.0 > xlo && x.1 < xhi && y.0 > ylo && y.1 < yhi
+}
+
 /// Does the fall floor at `floor` hold up one of the springs at `springs`
 /// (each an object's `(x, y)`)? The cart's `break_fall_floor` breaks the
 /// spring standing on it (`collide(spring, 0, -1)`, both 8x8 boxes at offset
@@ -837,7 +889,7 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, 0, None, (1, 1), false, false, false, false, false);
+        self.widen_to(ids, 0, None, (1, 1), false, false, FloorsWidening::Exact, false);
     }
 
     /// The boundary widenings of the `Bits(rem_bits)` level on this block's
@@ -856,7 +908,7 @@ impl Rt2 {
     /// players' `spd.x`/`spd.y` to, `None` for exact speed - the level's
     /// `abstraction::spd_precision_for`, which the caller passes because
     /// the switch lives above this crate.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool, fruit: bool, floors: bool, floor_timers: bool, platforms: bool) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool, fruit: bool, floors: FloorsWidening, platforms: bool) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 0. position widening (the rung below level 0): the player's
@@ -1164,16 +1216,20 @@ impl Rt2 {
         // floor with no `delay` (a block built from the post-`_init` state,
         // which the level keys exact, `frame::Block::from_state`) has nothing
         // there to widen.
-        if floors {
-            // An object's `(x, y)`, the same in every lane: floors and springs never move.
-            let at = |rt: &Self, obj: u32, what: &str| -> (P8, P8) {
-                let get = |f: u32| match rt.obj_field_cell(obj, f).map(|c| &rt.cols[c as usize]) {
-                    Some(Col::U(AV::Num(n))) => *n,
-                    other => panic!("fall floor widening: a {what}'s position is {other:?}, not one number"),
-                };
-                (get(ids.f_x), get(ids.f_y))
+        // An object's `(x, y)`, the same in every lane: floors and springs never move.
+        let at = |rt: &Self, obj: u32, what: &str| -> (P8, P8) {
+            let get = |f: u32| match rt.obj_field_cell(obj, f).map(|c| &rt.cols[c as usize]) {
+                Some(Col::U(AV::Num(n))) => *n,
+                other => panic!("fall floor widening: a {what}'s position is {other:?}, not one number"),
             };
-            let springs: Vec<(P8, P8)> = self.objects_of_type(ids, ids.g_spring).into_iter().map(|o| at(self, o, "spring")).collect();
+            (get(ids.f_x), get(ids.f_y))
+        };
+        let springs: Vec<(P8, P8)> = if matches!(floors, FloorsWidening::Unknown | FloorsWidening::Near) {
+            self.objects_of_type(ids, ids.g_spring).into_iter().map(|o| at(self, o, "spring")).collect()
+        } else {
+            Vec::new()
+        };
+        if floors == FloorsWidening::Unknown {
             for obj in self.objects_of_type(ids, ids.g_fall_floor) {
                 if floor_holds_spring(at(self, obj, "fall floor"), &springs) {
                     continue;
@@ -1203,7 +1259,7 @@ impl Rt2 {
         // every fall floor's `delay` and the balloon's `timer` the whole
         // range (`FLOOR_TIMER_RANGE`), `state` and `collideable` exact. A floor with no `delay` (the
         // post-`_init` block, keyed exact) has nothing there to widen.
-        if floor_timers {
+        if matches!(floors, FloorsWidening::Timers | FloorsWidening::Near) {
             let (lo, hi) = (P8::from_raw(FLOOR_TIMER_RANGE.0), P8::from_raw(FLOOR_TIMER_RANGE.1));
             for (ty, f, name) in [(ids.g_fall_floor, ids.f_delay, "delay"), (ids.g_balloon, ids.f_timer, "timer")] {
                 for obj in self.objects_of_type(ids, ty) {
@@ -1218,7 +1274,72 @@ impl Rt2 {
             }
         }
 
-        // 8b. The moving platforms at a platforms-unknown level
+        // 8b. Near (`abstraction::FloorsPrecision::Near`), as that level's
+        // kernels write them (`widen::widen_near_floors`): per lane, every
+        // fall floor's `state` the interval `FLOOR_STATE_RANGE` and its
+        // `collideable` unknown - but a spring's floor, and but in the lanes
+        // where a player overlaps it at the end of the frame
+        // (`player_overlaps_floor`, on the positions step 0 left), which keep
+        // both as they are. `state` is an interval column in every lane (an
+        // exact one `[n, n]`), as the kernels store it.
+        if floors == FloorsWidening::Near {
+            let (slo, shi) = (P8::from_raw(FLOOR_STATE_RANGE.0), P8::from_raw(FLOOR_STATE_RANGE.1));
+            let span = |v: AV, what: &str| match v {
+                AV::Num(n) => (n, n),
+                AV::Ival(a, b) => (a, b),
+                other => panic!("near floor widening: {what} is {other:?}"),
+            };
+            let players: Vec<(u32, u32)> = self
+                .player_objects(ids)
+                .into_iter()
+                .map(|o| {
+                    let cell = |f: u32, what: &str| self.obj_field_cell(o, f).unwrap_or_else(|| panic!("near floor widening: the player has no `{what}`"));
+                    (cell(ids.f_x, "x"), cell(ids.f_y, "y"))
+                })
+                .collect();
+            for obj in self.objects_of_type(ids, ids.g_fall_floor) {
+                let floor = at(self, obj, "fall floor");
+                if floor_holds_spring(floor, &springs) {
+                    continue;
+                }
+                let window = floor_player_window(floor);
+                let overlap: Vec<bool> = (0..self.width)
+                    .map(|lane| {
+                        players.iter().any(|&(cx, cy)| {
+                            player_overlaps_floor(window, span(self.cols[cx as usize].at(lane), "the player's x"), span(self.cols[cy as usize].at(lane), "the player's y"))
+                        })
+                    })
+                    .collect();
+                let field = |f: u32, name: &str| self.obj_field_cell(obj, f).unwrap_or_else(|| panic!("near floor widening: the fall floor has no `{name}` field"));
+                let (cs, cc) = (field(ids.f_state, "state"), field(ids.f_collideable, "collideable"));
+                let state: Vec<(P8, P8)> = (0..self.width)
+                    .map(|lane| {
+                        let (a, b) = span(self.cols[cs as usize].at(lane), "a fall floor's `state`");
+                        if overlap[lane] {
+                            (a, b)
+                        } else {
+                            assert!(slo <= a && b <= shi, "near floor widening: lane {lane} of `state` is [{a:?}, {b:?}], which the widening does not contain");
+                            (slo, shi)
+                        }
+                    })
+                    .collect();
+                let coll: Vec<AV> = (0..self.width)
+                    .map(|lane| {
+                        let v = self.cols[cc as usize].at(lane);
+                        assert!(matches!(v, AV::Bool(_) | AV::UBool), "near floor widening: lane {lane} of `collideable` is {v:?}");
+                        if overlap[lane] {
+                            v
+                        } else {
+                            AV::UBool
+                        }
+                    })
+                    .collect();
+                self.cols[cs as usize] = collapse_uniform(Col::I(state));
+                self.cols[cc as usize] = collapse_uniform(Col::V(coll));
+            }
+        }
+
+        // 8c. The moving platforms at a platforms-unknown level
         // (plans/platforms-unknown.md), as that level's kernels write them
         // (`widen::widen_platforms`): `x` and `last` the interval of the whole
         // path, `rem.x` the whole remainder. `last == x` holds in every row a
@@ -1497,5 +1618,31 @@ impl Rt2 {
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `floor_player_window` is the cart's `floor.collide(player, 0, 0)` - its
+    /// four hitbox inequalities, spelled out here as the cart writes them -
+    /// at every whole-pixel player position around a floor.
+    #[test]
+    fn the_overlap_window_is_the_carts_collide() {
+        let (fx, fy) = (48i16, 112i16);
+        let window = floor_player_window((P8::from_i16(fx), P8::from_i16(fy)));
+        let [px_, py_, pw, ph] = PLAYER_HITBOX;
+        let [fx_, fy_, fw, fh] = FLOOR_HITBOX;
+        for x in fx - 20..fx + 20 {
+            for y in fy - 20..fy + 20 {
+                let collide = x + px_ + pw > fx + fx_ && y + py_ + ph > fy + fy_ && x + px_ < fx + fx_ + fw && y + py_ < fy + fy_ + fh;
+                let (px, py) = (P8::from_i16(x), P8::from_i16(y));
+                assert_eq!(player_overlaps_floor(window, (px, px), (py, py)), collide, "player at ({x}, {y})");
+            }
+        }
+        // A bucket straddling the window's edge is no overlap.
+        let (a, b) = (P8::from_i16(fx - 7), P8::from_i16(fx - 6));
+        assert!(!player_overlaps_floor(window, (a, b), (P8::from_i16(fy), P8::from_i16(fy))));
+    }
 }
 

@@ -109,6 +109,28 @@ enum Command {
         #[arg(long, default_value = "1,0")]
         room: String,
     },
+    /// DIAGNOSTIC: is a coarser level closed over a finer one's rows, as the
+    /// mark filter needs? Every row of the FINE forward tree at frames
+    /// `from..=to`, projected onto `level` (`frame::widened_keys`, the key
+    /// the filter looks up), must be a row of the COARSE forward tree at that
+    /// frame or before (the door keeps a state at the first frame it is
+    /// reached). Per frame: the fine rows and the projections the coarse tree
+    /// has not reached, then the first misses' cells.
+    DiagProject {
+        #[arg(long)]
+        fine_dir: String,
+        #[arg(long)]
+        coarse_dir: String,
+        /// The coarse level's spec (`Level::parse`).
+        #[arg(long)]
+        level: String,
+        #[arg(long, default_value_t = 1)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+    },
     Ckhash {
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
@@ -965,6 +987,46 @@ fn main() -> Result<()> {
                 Some(m) => println!("FIRST MISS: {m}"),
                 None => println!("no miss: every fine winning state's widening is coarse-marked"),
             }
+        }
+        Command::DiagProject { fine_dir, coarse_dir, level, from, to, room } => {
+            use celeste_rust::frame::{load_frame, widened_keys, Visited};
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            let level = celeste_rust::interpreter::abstraction::Level::parse(&level).map_err(|e| anyhow::anyhow!(e))?;
+            let (fine, coarse) = (std::path::Path::new(&fine_dir), std::path::Path::new(&coarse_dir));
+            let mut reached = Visited::new();
+            let (mut total, mut missed) = (0usize, 0usize);
+            let mut misses: Vec<String> = Vec::new();
+            for f in 0..=to {
+                for b in load_frame(coarse, f)? {
+                    let cells = b.positions()?;
+                    for (k, &c) in b.keys().iter().zip(&cells) {
+                        reached.insert(b.shard_shape(), *k, c);
+                    }
+                }
+                if f < from {
+                    continue;
+                }
+                let (mut n, mut miss) = (0usize, 0usize);
+                for block in load_frame(fine, f)? {
+                    let (ws, wk, wc) = widened_keys(&block, level)?;
+                    for i in 0..block.lanes() {
+                        n += 1;
+                        if !reached.contains(ws, wk[i], wc[i]) {
+                            miss += 1;
+                            if misses.len() < 8 {
+                                misses.push(format!("f{f:03}: a fine row at {:?} projects to key {:016x}{:016x}, which the coarse tree has not reached", celeste_rust::search::pos_graph::cell_xy(wc[i]), wk[i].0, wk[i].1));
+                            }
+                        }
+                    }
+                }
+                println!("f{f:03}: fine rows {n}, projections not reached {miss}");
+                total += n;
+                missed += miss;
+            }
+            for m in &misses {
+                println!("MISS {m}");
+            }
+            println!("{missed} of {total} fine rows' projections not reached by the coarse tree");
         }
         Command::Ckhash {
             checkpoint_dir,
@@ -3003,7 +3065,7 @@ fn main() -> Result<()> {
                         // successor against every layer-1 row.
                         let mut mine = block.into_rt2();
                         if let RemPrecision::Bits(b) = precision.rem {
-                            mine.widen_to(celeste_rust::compiled::ids(), b, celeste_rust::frame::spd_width_log2(precision.spd), (precision.pos.x, precision.pos.y), precision.held.is_unknown(), precision.fruit.is_unknown(), precision.floors.is_unknown(), precision.floors.is_timers(), precision.platforms.is_unknown());
+                            mine.widen_to(celeste_rust::compiled::ids(), b, celeste_rust::frame::spd_width_log2(precision.spd), (precision.pos.x, precision.pos.y), precision.held.is_unknown(), precision.fruit.is_unknown(), celeste_rust::frame::floors_widening(precision.floors), precision.platforms.is_unknown());
                         }
                         for file in frame_files(dir, 1)? {
                             let Some(theirs) = file.load_all()? else { continue };

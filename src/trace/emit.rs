@@ -202,6 +202,8 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
             // What makes it an interval is `Iface::ival`, and the
             // emitter needs to know: an `ival` input is a `ZI` lane and
             // a `num` one is a `ZN`.
+            // A boolean slot flagged `ival` is one a lane may hold unknown.
+            crate::trace::iface::Conc::Bool(_) if f.iface.ival[i] => "ubool",
             _ if f.iface.ival[i] => "ival",
             crate::trace::iface::Conc::Num(_) => "num",
             crate::trace::iface::Conc::Bool(_) => "bool",
@@ -288,6 +290,7 @@ pub fn asm_input_reprs(
     for (cell, kind) in bound.inputs.iter().chain(bound.uni.iter()) {
         let repr = match *kind {
             "bool" => CellRepr::Bool,
+            "ubool" => CellRepr::UBool,
             "num" => CellRepr::Num,
             "ival" => CellRepr::Ival,
             other => anyhow::bail!("cell {} has unexpected input kind {:?}", cell, other),

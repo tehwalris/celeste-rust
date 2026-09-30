@@ -183,6 +183,11 @@ fn out_fields(
 ) -> Result<(Vec<(Path, NodeId, &'static str)>, Vec<Path>)> {
     let mut out = Vec::new();
     let mut ubool = Vec::new();
+    // A near level's floor `state`s are an interval column in every outcome
+    // (`widen::widen_near_floors`), an exact state `[n, n]` included: a shape's
+    // column keys a point as an interval, and so does the mark filter's
+    // projection (`Rt2::widen_to`).
+    let ival_always: Vec<Path> = if d.floors_near { super::widen::near_floor_paths(st, d)?.state } else { Vec::new() };
     for p in iface::scalars(st, &[])? {
         if p.first() == Some(&iface::key("__button_states")) {
             ubool.push(p);
@@ -205,7 +210,7 @@ fn out_fields(
         // as a number would be a narrowing nobody checked.
         let (n, ty) = match iface::get(st, &p).unwrap() {
             Value::Num(n) => {
-                let ty = if d.is_interval(&n) { "ZI" } else { "ZN" };
+                let ty = if d.is_interval(&n) || ival_always.contains(&p) { "ZI" } else { "ZN" };
                 (n, ty)
             }
             Value::Bool(n) => (n, "ZB"),
@@ -351,6 +356,10 @@ pub fn trace_frame<'a>(
     // The fall floors unknown: likewise (plans/fall-floors.md).
     if it.d.floors_unknown {
         super::widen::fork_floor_inputs(&mut st, &mut it.d)?;
+    }
+    // A near level's floors: each `collideable` a lane may hold unknown, forked.
+    if it.d.floors_near {
+        super::widen::fork_near_floor_inputs(&mut st, &mut it.d)?;
     }
     // The moving platforms unknown: their input cells, decided per world by
     // the split pass (`widen::platform_inputs`, `Points`).
@@ -1119,10 +1128,31 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             n_splits += 1;
         }
         let (may_true, may_false) = d.may_answers(atom);
+        // The equal side of `x == k` (`k` a literal point, `x` a set a lane
+        // holds) knows `x`: it IS `k` on every state the side stands for, so
+        // the side reads `k` wherever it read `x`. Exact, and what a near
+        // level needs: a floor's `state` on `[0, 2]` splits on its update's
+        // `state == 0 / 1 / 2`, and an outcome that keeps the floor exact (the
+        // player overlaps it) must store the state it narrowed to, as the
+        // mark filter's projection does (`Rt2::widen_to`). The other side
+        // learns nothing an interval can hold.
+        let narrowed = {
+            let node = d.graph.get(atom);
+            let point = |n: NodeId| matches!(d.graph.get(n).op, Op::Const(lo, hi) if lo == hi);
+            match (node.op == Op::Eq, node.args.first().copied(), node.args.get(1).copied()) {
+                (true, Some(a), Some(b)) if point(b) && d.abstract_beneath_lane_ops(a) => Some((a, b)),
+                (true, Some(a), Some(b)) if point(a) && d.abstract_beneath_lane_ops(b) => Some((b, a)),
+                _ => None,
+            }
+        };
         let reach = cone(&d.graph, &o.every());
         for (answer, side_pts) in sides {
             let to = d.graph.leaf(Op::ConstBool(answer));
-            let map = rebuild_all(d, &reach, &rustc_hash::FxHashMap::from_iter([(atom, to)]));
+            let mut subst = rustc_hash::FxHashMap::from_iter([(atom, to)]);
+            if let (true, Some((x, k))) = (answer, narrowed) {
+                subst.insert(x, k);
+            }
+            let map = rebuild_all(d, &reach, &subst);
             let m = |n: NodeId| map.get(&n).copied().unwrap_or(n);
             let mut guard = m(o.guard);
             if !decided {
