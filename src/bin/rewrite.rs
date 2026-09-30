@@ -364,6 +364,13 @@ enum Command {
         top: usize,
         #[arg(long)]
         at: Option<String>,
+        /// Also the growth by AGE: for every age `a` (frames since a cell's
+        /// first state, a multiple of this step), over the cells reached at
+        /// least `a` frames before `to`, the median, 90th percentile and mean
+        /// of the states a cell had visited by that age - comparable across
+        /// rooms, where the per-frame totals are not.
+        #[arg(long)]
+        by_age: Option<usize>,
     },
     /// DIAGNOSTIC: how much speed variety a frame has. Per axis: the distinct
     /// player speed values, how few of them hold 50/90/99% of the states,
@@ -384,6 +391,24 @@ enum Command {
     /// frame). Per shape: rows, then every varying column's distinct value
     /// count (capped), every object's fields named (`type[i].field`), and the distinct
     /// (spd.x, spd.y) pairs.
+    /// DIAGNOSTIC: where one cell's states come from. Samples `samples` states
+    /// first reached at `frame` in the player cell `x,y`, prints each in full
+    /// (every value cell named, `type[i].field`), then follows the recorded
+    /// edges back `depth` steps through one predecessor each, printing the
+    /// predecessor's cell and every field that differs from its successor:
+    /// the history a single state carries, to be checked against the game.
+    Ancestry {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        frame: u32,
+        #[arg(long)]
+        cell: String,
+        #[arg(long, default_value_t = 4)]
+        samples: usize,
+        #[arg(long, default_value_t = 16)]
+        depth: u32,
+    },
     ColCensus {
         #[arg(long)]
         level_dir: String,
@@ -391,6 +416,10 @@ enum Command {
         frame: u32,
         #[arg(long, default_value_t = 1 << 24)]
         cap: usize,
+        /// Only the rows of the player cell `x,y`: what varies among the
+        /// states of one position.
+        #[arg(long)]
+        cell: Option<String>,
     },
     /// Per player lane of one checkpointed frame: the set of fall floors its
     /// player can touch within the frame (the hitbox swept by the lane's speed
@@ -2364,7 +2393,7 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Command::CellGrowth { level_dir, from, to, top, at } => {
+        Command::CellGrowth { level_dir, from, to, top, at, by_age } => {
             use celeste_rust::search::checkpoint::FrameFile;
             use celeste_rust::search::pos_graph::{cell_of, cell_xy};
             let dir = std::path::Path::new(&level_dir);
@@ -2385,6 +2414,29 @@ fn main() -> Result<()> {
                 }
             }
             let visited = |v: &[u64]| v.iter().sum::<u64>();
+            if let Some(stepw) = by_age {
+                // Per cell: its states visited by each age since its first.
+                let series: Vec<Vec<u64>> = per
+                    .values()
+                    .filter_map(|v| {
+                        let first = v.iter().position(|&n| n > 0)?;
+                        Some(v[first..].iter().scan(0u64, |acc, &n| {
+                            *acc += n;
+                            Some(*acc)
+                        }).collect())
+                    })
+                    .collect();
+                println!("age | cells | median p90 mean (states visited by that age)");
+                for a in (0..n_frames).step_by(stepw.max(1)) {
+                    let mut at_a: Vec<u64> = series.iter().filter(|s| s.len() > a).map(|s| s[a]).collect();
+                    if at_a.is_empty() {
+                        break;
+                    }
+                    at_a.sort_unstable();
+                    let mean = at_a.iter().sum::<u64>() as f64 / at_a.len() as f64;
+                    println!("{a:>3} | {:>6} | {} {} {:.0}", at_a.len(), at_a[at_a.len() / 2], at_a[at_a.len() * 9 / 10], mean);
+                }
+            }
             let mut by_visited: Vec<(u32, u64)> = per.iter().map(|(c, v)| (*c, visited(v))).collect();
             by_visited.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c));
             let mut chosen: Vec<u32> = by_visited.iter().take(top).map(|&(c, _)| c).collect();
@@ -2557,8 +2609,87 @@ fn main() -> Result<()> {
                 println!("[floor-reach]   {n:>9} lanes ({:.1}%): {} floors {set:?}", *n as f64 * 100.0 / lanes.max(1) as f64, set.len());
             }
         }
-        Command::ColCensus { level_dir, frame, cap } => {
+        Command::Ancestry { level_dir, frame, cell, samples, depth } => {
+            use celeste_engine::runtime2::{Cell2, Rt2, AV};
+            use celeste_rust::frame::{frame_files_seq, id_layer, id_row, id_seq, pack_id};
+            use celeste_rust::search::pos_graph::{cell_of, cell_xy};
+            let dir = std::path::Path::new(&level_dir);
+            let ids = celeste_rust::compiled::ids();
+            let (a, b) = cell.split_once(',').ok_or_else(|| anyhow::anyhow!("--cell x,y"))?;
+            let want = cell_of(a.trim().parse()?, b.trim().parse()?)?;
+            let edges = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), frame)?;
+            // One row by id: the row, its shape, its cell.
+            let load = |id: u64| -> Result<(Rt2, u64, u32)> {
+                let files = frame_files_seq(dir, id_layer(id))?;
+                let (_, f) = files.iter().find(|(s, _)| *s == id_seq(id)).ok_or_else(|| anyhow::anyhow!("no file for id {id:#x}"))?;
+                let r = id_row(id);
+                let rt2 = f.load_rows(&[r..r + 1])?.ok_or_else(|| anyhow::anyhow!("no row for id {id:#x}"))?;
+                Ok((rt2, f.shape_hash(), f.row_cells()[r as usize]))
+            };
+            let show = |v: AV| -> String {
+                match v {
+                    AV::Num(n) => format!("{}", n.as_raw_u32() as i32 as f64 / 65536.0),
+                    AV::Ival(a, b) => format!("[{}, {}]", a.as_raw_u32() as i32 as f64 / 65536.0, b.as_raw_u32() as i32 as f64 / 65536.0),
+                    other => format!("{other:?}"),
+                }
+            };
+            let fields = |rt2: &Rt2| -> std::collections::BTreeMap<String, String> {
+                cell_names(rt2, ids).into_iter().filter(|(c, _)| matches!(rt2.structure[*c], Cell2::Val)).map(|(c, n)| (n, show(rt2.cols[c].at(0)))).collect()
+            };
+            let where_ = |c: u32| cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string());
+            let mut here: Vec<u64> = Vec::new();
+            for (seq, f) in frame_files_seq(dir, frame)? {
+                for range in f.rows_of_cell(want) {
+                    here.extend(range.map(|r| pack_id(frame, seq, r)));
+                }
+            }
+            println!("[ancestry] {} states first reached at f{frame:03} in {}", here.len(), where_(want));
+            let n = samples.min(here.len());
+            for k in 0..n {
+                let id0 = here[k * here.len() / n];
+                let (rt2, shape, c) = load(id0)?;
+                let mut prev = fields(&rt2);
+                println!("\n[ancestry] sample {k}: l{} s{} r{} shape {shape:016x} {}", id_layer(id0), id_seq(id0), id_row(id0), where_(c));
+                for (name, v) in &prev {
+                    println!("    {name} = {v}");
+                }
+                let mut id = id0;
+                for _ in 0..depth {
+                    let layer = id_layer(id);
+                    if layer == 0 {
+                        break;
+                    }
+                    let mut buf = Vec::new();
+                    edges.preds_at(id, layer, &mut buf);
+                    let preds: Vec<u64> = buf.iter().flat_map(|e| (0..64u64).filter(move |i| e.mask >> i & 1 == 1).map(move |i| e.base + i)).collect();
+                    let Some(&p) = preds.first() else {
+                        println!("  <- no recorded predecessor at f{layer:03}");
+                        break;
+                    };
+                    let (rt2, shape, c) = load(p)?;
+                    let cur = fields(&rt2);
+                    // Pointers renumber between shapes: structure, not state.
+                    let changed: Vec<String> = cur
+                        .iter()
+                        .filter(|(nm, v)| prev.get(*nm) != Some(*v) && !v.starts_with("Ptr("))
+                        .map(|(nm, v)| format!("{nm}={v}"))
+                        .chain(prev.keys().filter(|nm| !cur.contains_key(*nm)).map(|nm| format!("{nm} absent")))
+                        .collect();
+                    println!("  <- f{:03} {} shape {shape:016x} ({} preds): {}", id_layer(p), where_(c), preds.len(), changed.join(" "));
+                    prev = cur;
+                    id = p;
+                }
+            }
+        }
+        Command::ColCensus { level_dir, frame, cap, cell } => {
             use celeste_engine::runtime2::{Cell2, Col, AV};
+            let only_cell = match &cell {
+                Some(s) => {
+                    let (a, b) = s.split_once(',').ok_or_else(|| anyhow::anyhow!("--cell x,y"))?;
+                    Some(celeste_rust::search::pos_graph::cell_of(a.trim().parse()?, b.trim().parse()?)?)
+                }
+                None => None,
+            };
             use celeste_rust::search::checkpoint::FrameFile;
             let dir = std::path::Path::new(&level_dir);
             let ids = celeste_rust::compiled::ids();
@@ -2596,10 +2727,14 @@ fn main() -> Result<()> {
             for p in &files {
                 let ff = FrameFile::open(p)?;
                 let width = ff.width();
-                let mut lo = 0u32;
-                while lo < width {
-                    let hi = (lo + (1 << 20)).min(width);
-                    let Some(rt2) = ff.load_rows(&[lo..hi])? else { break };
+                // The row ranges to read: the whole file in 1M-row pieces, or
+                // one cell's rows.
+                let pieces: Vec<std::ops::Range<u32>> = match only_cell {
+                    Some(c) => ff.rows_of_cell(c),
+                    None => (0..width).step_by(1 << 20).map(|lo| lo..(lo + (1 << 20)).min(width)).collect(),
+                };
+                for piece in pieces {
+                    let Some(rt2) = ff.load_rows(&[piece])? else { break };
                     let st = by_shape.entry(ff.shape_hash()).or_insert_with(|| {
                         let names = cell_names(&rt2, ids);
                         S { rows: 0, cols: vec![Default::default(); rt2.cols.len()], varying: vec![false; rt2.cols.len()], names, spd: Default::default(), ivals: vec![0; rt2.cols.len()], ubools: vec![0; rt2.cols.len()] }
@@ -2648,7 +2783,6 @@ fn main() -> Result<()> {
                             st.spd.insert(code(rt2.cols[sx].at(r)) << 32 ^ code(rt2.cols[sy].at(r)));
                         }
                     }
-                    lo = hi;
                 }
             }
             for (shape, st) in &by_shape {
@@ -2658,6 +2792,15 @@ fn main() -> Result<()> {
                 println!("shape {shape:#x}: {} rows, {} varying columns, cardinality product {:.2e}, spd pairs {}", st.rows, cards.len(), product, st.spd.len());
                 for &(n, c) in cards.iter().take(24) {
                     println!("  c{c:<4} {n:>10} {:<18} intervals {:>10} unknown-bools {:>10}", st.names.get(&c).map(|s| s.as_str()).unwrap_or(""), st.ivals[c], st.ubools[c]);
+                    // One cell's census lists the numbers themselves (a
+                    // number's code is its raw 16.16 value).
+                    if only_cell.is_some() && n <= 64 {
+                        let mut vals: Vec<f64> = st.cols[c].iter().filter(|&&v| v >> 32 == 0).map(|&v| v as u32 as i32 as f64 / 65536.0).collect();
+                        vals.sort_by(|a, b| a.total_cmp(b));
+                        if !vals.is_empty() {
+                            println!("        {}", vals.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(" "));
+                        }
+                    }
                 }
             }
         }
