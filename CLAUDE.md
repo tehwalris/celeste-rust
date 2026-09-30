@@ -583,13 +583,17 @@ shape, which has no player position to decide the platforms' collisions by
 and decides them. Every input at f24 of the concrete game leaves the player
 alive.
 
-When to cut is measured, not assumed: room (6,0) level 0 `r0sxhp` - kernels
-1.06M bodies / 15.7M fused nodes -> 33k / 2.0M, frame 40 209 s -> 8.3 s, f0-f40
-10:30 -> 0:41 wall, peak 28.8 -> 5.1 GB. Rooms (1,0) and (2,0), whose
-kernels are small already, gain nothing: the same states in
-1.45x / ~1.05x the time (every row is deduped and checkpointed twice a frame,
-and the stage between holds as many states as a frame boundary). So it is a
-per-run choice, not the default.
+When to cut is measured, not assumed (2026-09-30, release, all times on a
+machine shared with another search - contended): room (6,0) level 0
+`r0sxhp` - kernels 1.06M bodies / 15.7M fused nodes -> 33k / 2.0M, frame 40
+209 s -> 8.3 s, f0-f40 10:30 -> 0:41 wall, peak 28.8 -> 5.1 GB. Rooms (1,0)
+and (2,0), whose kernels are small already (10k / 342k nodes -> 3.5k / 126k;
+87k / 2.9M -> 29k / 1.5M), gain nothing: the same states, room (1,0) f0-f70
+0:59 -> 1:38, its whole `--ceiling 99` search 6:09 -> 6:43 and 18.1 -> 29.7 GB
+peak, room (2,0) frame 50 3.4 s -> 3.6 s. Every row is deduped, keyed and
+checkpointed twice a frame, and the stage between holds about as many states
+as a frame boundary (the door holds both). So it is a per-run choice, not
+the default.
 
 ## Useful entry points
 
@@ -608,6 +612,10 @@ per-run choice, not the default.
 # the count-up 4:51). Marks are monotone downward too (plans/... the
 # cheap narrowing of the finer levels' trees is not built).
 ./safe-run.sh -- ./target/release/rewrite search --room 2,0 --ceiling 95
+# A room whose kernels explode (room (6,0)): two stages a frame, cut after the
+# player's move ("A frame in stages" above). Horizons stay in frames.
+CELESTE_LADDER="r0sxhfp,r0sxhf,r0sxh,r1sxh,...,r15sxh,rxsx" ./safe-run.sh -- \
+    ./target/release/rewrite search --room 6,0 --ceiling 70 --cut player
 
 # One forward pass at one precision with the per-frame timing line
 # (emit / own / checkpoint ms, lanes in/raw/kept, RSS; CELESTE_THREADS=N)
