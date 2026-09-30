@@ -18,6 +18,81 @@ use crate::interpreter::state::State;
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
+/// Search STEPS per game FRAME (`trace::stage`): a frame is `per_frame`
+/// consecutive steps, one per stage, and step `f * per_frame` is the boundary
+/// after frame `f`. The forward, its trees (`frames/fNNN` is a step), the
+/// edges and the backward count STEPS and know nothing of stages; the ladder's
+/// horizons and wins, and everything reported to a user, count FRAMES, through
+/// this. Only a frame boundary can win.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stages {
+    pub per_frame: u32,
+}
+
+impl Stages {
+    /// The run's (`trace::stage::per_frame`).
+    pub fn current() -> Self {
+        Stages { per_frame: crate::trace::stage::per_frame() }
+    }
+
+    /// The step at the end of frame `frame`.
+    pub fn step(self, frame: u32) -> u32 {
+        frame * self.per_frame
+    }
+
+    /// The frame `step` ends; `None` for a step inside a frame.
+    pub fn frame(self, step: u32) -> Option<u32> {
+        (step % self.per_frame == 0).then_some(step / self.per_frame)
+    }
+
+    /// The frames complete by `step`: the game frame a bound on the time
+    /// left counts from (a row inside frame `f + 1` has had `f`).
+    pub fn frames_done(self, step: u32) -> u32 {
+        step / self.per_frame
+    }
+
+    /// A step as what it has run: `f012` at a frame boundary, `f012.1` one
+    /// stage into frame 13.
+    pub fn show(self, step: u32) -> String {
+        match step % self.per_frame {
+            0 => format!("f{:03}", step / self.per_frame),
+            r => format!("f{:03}.{r}", step / self.per_frame),
+        }
+    }
+
+    /// The stages a tree was grown with (`record`, beside its frames); a tree
+    /// without the marker is single-stage.
+    pub fn of_tree(dir: &std::path::Path) -> Result<Self> {
+        let path = dir.join("stages.txt");
+        let Ok(text) = std::fs::read_to_string(&path) else { return Ok(Stages { per_frame: 1 }) };
+        let per_frame: u32 = text
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .with_context(|| format!("{}: unreadable {text:?}", path.display()))?;
+        anyhow::ensure!(per_frame >= 1, "{}: {per_frame} stages per frame", path.display());
+        Ok(Stages { per_frame })
+    }
+
+    /// Run with the cuts a tree was grown with (`record`): for a tool that
+    /// rebuilds the kernels of an existing tree. Before any kernel is built.
+    pub fn adopt(dir: &std::path::Path) -> Result<Self> {
+        let text = std::fs::read_to_string(dir.join("stages.txt")).unwrap_or_default();
+        let cuts = text.split_whitespace().nth(1).map(crate::trace::stage::parse_cuts).unwrap_or_default();
+        crate::trace::stage::set_cuts(cuts)?;
+        let s = Self::of_tree(dir)?;
+        anyhow::ensure!(s == Self::current(), "{}: {} stages per frame, but its cuts {:?} make {}", dir.display(), s.per_frame, crate::trace::stage::cuts(), Self::current().per_frame);
+        Ok(s)
+    }
+
+    /// Mark a tree as grown with the run's stages and cuts (`of_tree`).
+    fn record(self, dir: &std::path::Path) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("stages.txt"), format!("{} {}\n", self.per_frame, crate::trace::stage::cuts().join(",")))?;
+        Ok(())
+    }
+}
+
 /// The data currency (interface #2). A columnar batch of lanes - the engine's
 /// own block (`Rt2`: one shape, one column per value cell, the key column the
 /// boundary computed), carried as-is. Two columns are EXPOSED - the per-lane
@@ -780,9 +855,9 @@ pub struct ForwardSink<'a> {
     /// This worker's next-frame rows, one piece per shape: the block, its
     /// file seq in the layer (`worker * 256 + k`), and its rows' ids.
     pieces: rustc_hash::FxHashMap<u64, (Rt2, u32, Vec<u64>)>,
-    /// The frame being computed (the layer the new rows belong to) and
+    /// The step being computed (the layer the new rows belong to) and
     /// this worker's index: what a new row's id is made of.
-    frame: u32,
+    step: u32,
     worker: u32,
     pub won: bool,
     pub kept: usize,
@@ -840,7 +915,7 @@ impl<'a> ForwardSink<'a> {
             t_edges: std::time::Duration::ZERO,
             t_filter: std::time::Duration::ZERO,
             pieces: Default::default(),
-            frame: 0,
+            step: 0,
             worker: 0,
             won: false,
             kept: 0,
@@ -864,20 +939,20 @@ impl<'a> ForwardSink<'a> {
         }
     }
 
-    /// Worker `worker`'s sink for `frame`: flushes through `door` (and
-    /// `filter`); its pieces' rows get ids in layer `frame`.
+    /// Worker `worker`'s sink for `step`: flushes through `door` (and
+    /// `filter`); its pieces' rows get ids in layer `step`.
     pub fn forward(
         door: &'a crate::search::door::Door,
         filter: Option<&'a MarkFilter<'a>>,
         edges_on: bool,
-        frame: u32,
+        step: u32,
         worker: u32,
         edges_dir: Option<&std::path::Path>,
     ) -> Self {
         let mut s = Self::empty(edges_on);
         s.door = Some(door);
         s.filter = filter;
-        s.frame = frame;
+        s.step = step;
         s.worker = worker;
         s.edges_dir = edges_dir.map(|p| p.to_path_buf());
         s
@@ -888,7 +963,7 @@ impl<'a> ForwardSink<'a> {
     #[inline]
     fn record(&mut self, target: u64, base: u64, mask: u64) -> Result<()> {
         let dir = self.edges_dir.as_deref().expect("recording without an edges dir");
-        append_record(&mut self.edge_bufs, &mut self.edge_records, dir, self.frame, self.worker, target, base, mask)
+        append_record(&mut self.edge_bufs, &mut self.edge_records, dir, self.step, self.worker, target, base, mask)
     }
 
     /// Lane `lane` of the slice based at `base` produced the (already
@@ -1081,7 +1156,7 @@ impl<'a> ForwardSink<'a> {
             let allow = match self.filter {
                 Some(f) => {
                     let t_f = std::time::Instant::now();
-                    let a = f.allowed(&slot.to_rt2(), self.frame)?;
+                    let a = f.allowed(&slot.to_rt2(), self.step)?;
                     self.t_filter += t_f.elapsed();
                     Some(a)
                 }
@@ -1091,12 +1166,12 @@ impl<'a> ForwardSink<'a> {
             // A queue is one player cell; drop it when even the fastest recorded
             // climb cannot reach the exit by the horizon.
             let allow = match band() {
-                Some((h, px)) if cell_too_late(slot.cell, self.frame, h, px) => Some(vec![false; n]),
+                Some((h, px)) if cell_too_late(slot.cell, Stages::current().frames_done(self.step), h, px) => Some(vec![false; n]),
                 _ => allow,
             };
             // The level -1 filter: the queue's cell provably cannot exit by H.
             let allow = match level_minus_one() {
-                Some((h, table)) if table.too_late(slot.shape, slot.cell, self.frame, h) => Some(vec![false; n]),
+                Some((h, table)) if table.too_late(slot.shape, slot.cell, Stages::current().frames_done(self.step), h) => Some(vec![false; n]),
                 _ => allow,
             };
             self.sort_buf.clear();
@@ -1144,7 +1219,7 @@ impl<'a> ForwardSink<'a> {
             // gets: the door hands the k-th new key `first_new + k`, and the
             // rows are appended in that same order.
             let n_pieces = self.pieces.len() as u32;
-            let (frame, worker) = (self.frame, self.worker);
+            let (frame, worker) = (self.step, self.worker);
             let (piece, seq, ids) = self
                 .pieces
                 .entry(slot.shape)
@@ -1167,7 +1242,7 @@ impl<'a> ForwardSink<'a> {
             if let Some(edges_dir) = self.edges_dir.as_deref().filter(|_| slot.pred_base.len() == n) {
                 let t_e = std::time::Instant::now();
                 let (row_uniq, ids_buf) = (&self.row_uniq, &self.ids_buf);
-                let (edge_bufs, edge_records, frame, worker) = (&mut self.edge_bufs, &mut self.edge_records, self.frame, self.worker);
+                let (edge_bufs, edge_records, frame, worker) = (&mut self.edge_bufs, &mut self.edge_records, self.step, self.worker);
                 let rows = slot.pred_base.iter().zip(&slot.pred_mask).enumerate().map(|(r, (&b, &m))| (r as u32, b, m));
                 for (r, b, m) in rows.chain(slot.extra.iter().copied()) {
                     let u = row_uniq[r as usize];
@@ -1236,7 +1311,7 @@ impl<'a> ForwardSink<'a> {
         if let Some(dir) = self.edges_dir.clone() {
             for (layer, buf) in self.edge_bufs.iter_mut().enumerate() {
                 if !buf.is_empty() {
-                    write_edges(&dir, self.frame, layer, self.worker, buf)?;
+                    write_edges(&dir, self.step, layer, self.worker, buf)?;
                 }
             }
         }
@@ -1537,7 +1612,7 @@ pub fn forward_frame(
     door: &crate::search::door::Door,
     pos: Option<&crate::search::pos_graph::PosObserver>,
     filter: Option<&MarkFilter>,
-    frame: u32,
+    step: u32,
     edges_dir: Option<&std::path::Path>,
 ) -> Result<(Vec<Block>, bool, FrameStats)> {
     use std::time::Instant;
@@ -1546,11 +1621,11 @@ pub fn forward_frame(
     // (`concrete::platform_worlds`); a frame past that could hold one it
     // does not have.
     let level = crate::interpreter::abstraction::current_level();
-    // Under the split-frame prototype a game frame is two steps.
-    let game_frame = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { frame.div_ceil(2) } else { frame };
+    let stages = Stages::current();
     anyhow::ensure!(
-        !level.platforms.is_unknown() || game_frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
-        "frame {frame} at {level}: the platform worlds cover {} frames",
+        !level.platforms.is_unknown() || step.div_ceil(stages.per_frame) as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
+        "{} at {level}: the platform worlds cover {} frames",
+        stages.show(step),
         crate::trace::kernel::PLATFORM_WORLD_FRAMES
     );
     let mut st = FrameStats::default();
@@ -1599,7 +1674,7 @@ pub fn forward_frame(
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     let t = Instant::now();
-                    let mut sink = ForwardSink::forward(door, filter, pos.is_some(), frame, w as u32, edges_dir);
+                    let mut sink = ForwardSink::forward(door, filter, pos.is_some(), step, w as u32, edges_dir);
                     loop {
                         let u = next_unit.fetch_add(1, Ordering::Relaxed);
                         let Some(&(bi, lo, hi)) = units.get(u) else { break };
@@ -1668,6 +1743,10 @@ pub fn forward_frame(
     st.rss_file = crate::metrics::current_file_rss_gb();
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
+    // The exit test runs in the player's update, which no cut splits from
+    // the frame's end: a row that won inside a frame is a cut this search
+    // has no model for (its next stage's kernels are the next room's).
+    anyhow::ensure!(!won || stages.frame(step).is_some(), "a win inside a frame, at {}", stages.show(step));
     Ok((next, won, st))
 }
 
@@ -1960,21 +2039,22 @@ pub struct ForwardState {
     /// The door: every (shape, cell, key) reached so far (`search::door`).
     door: crate::search::door::Door,
     observer: Option<crate::search::pos_graph::PosObserver>,
-    /// The last frame computed (and checkpointed).
-    pub frames: u32,
-    /// The first frame a lane won, if any so far.
-    pub win_frame: Option<u32>,
+    /// The last step computed (and checkpointed): a frame per stage
+    /// (`Stages`).
+    pub steps: u32,
+    /// The first step a lane won at, if any so far.
+    pub win_step: Option<u32>,
     /// The compaction of the last frame's edge records, running behind
     /// the next frame's wave (`join_compaction`).
     compaction: Option<(u32, std::thread::JoinHandle<Result<crate::search::edges::CompactStats>>)>,
 }
 
-/// What a forward run reports.
+/// What a forward run reports, in steps (`Stages`).
 pub struct ForwardResult {
-    /// The frame a lane first won, if any.
-    pub win_frame: Option<u32>,
-    /// The number of frames actually run (the last checkpointed frame).
-    pub frames: u32,
+    /// The step a lane first won at, if any.
+    pub win_step: Option<u32>,
+    /// The number of steps actually run (the last checkpointed step).
+    pub steps: u32,
     /// The position graph, when recording was on - backward's input.
     pub pos_graph: Option<crate::search::pos_graph::PosGraph>,
 }
@@ -1983,6 +2063,7 @@ impl ForwardState {
     /// Frame 0: seed the visited set from `initial`, checkpoint it, start
     /// recording the position graph if `record`.
     pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool) -> Result<Self> {
+        Stages::current().record(dir)?;
         // The checkpoint assigns the initial rows their ids (layer 0); the
         // door then takes each row under that id.
         checkpoint_frontier(dir, 0, &mut initial)?;
@@ -2009,8 +2090,8 @@ impl ForwardState {
             frontier: initial,
             door,
             observer,
-            frames: 0,
-            win_frame: None,
+            steps: 0,
+            win_step: None,
             compaction: None,
         })
     }
@@ -2028,6 +2109,13 @@ impl ForwardState {
             last = Some(last.map_or(0, |f| f + 1));
         }
         let Some(mut last) = last else { return Ok(None) };
+        anyhow::ensure!(
+            Stages::of_tree(dir)? == Stages::current(),
+            "resuming {}: a tree of {:?}, and this run has {:?}",
+            dir.display(),
+            Stages::of_tree(dir)?,
+            Stages::current()
+        );
         let t = std::time::Instant::now();
         // The frames a resume can trust are those whose edge runs are
         // complete (`edges/done.txt`, written when a frame's compaction
@@ -2101,12 +2189,12 @@ impl ForwardState {
                 handles.into_iter().map(|h| h.join().expect("resume loader panicked")).collect::<Result<Vec<_>>>()
             })?;
         let mut shards: rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>> = Default::default();
-        let mut win_frame: Option<u32> = None;
+        let mut win_step: Option<u32> = None;
         for (m, w) in partial {
             for (k, mut v) in m {
                 shards.entry(k).or_default().append(&mut v);
             }
-            win_frame = match (win_frame, w) {
+            win_step = match (win_step, w) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
@@ -2142,10 +2230,10 @@ impl ForwardState {
             frontier.iter().map(Block::lanes).sum::<usize>(),
             door.len(),
             files.len(),
-            win_frame,
+            win_step,
             t.elapsed().as_secs_f64()
         );
-        Ok(Some(ForwardState { frontier, door, observer, frames: last, win_frame, compaction: None }))
+        Ok(Some(ForwardState { frontier, door, observer, steps: last, win_step, compaction: None }))
     }
 
     /// Compute and checkpoint frames `frames+1 ..= to`. A win does NOT stop
@@ -2182,8 +2270,8 @@ impl ForwardState {
         to: u32,
         filter: Option<&MarkFilter>,
     ) -> Result<()> {
-        while self.frames < to && !self.frontier.is_empty() {
-            let frame = self.frames + 1;
+        while self.steps < to && !self.frontier.is_empty() {
+            let frame = self.steps + 1;
             let t_frame = std::time::Instant::now();
             let frontier = std::mem::take(&mut self.frontier);
             let edges_dir = dir.join("edges");
@@ -2213,10 +2301,10 @@ impl ForwardState {
             }
             let t_pos = t.elapsed();
             log_frame(frame, &st, t_edges, compact_records, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
-            self.frames = frame;
-            if won && self.win_frame.is_none() {
-                self.win_frame = Some(frame);
-                eprintln!("[fwd] first win at f{frame}");
+            self.steps = frame;
+            if won && self.win_step.is_none() {
+                self.win_step = Some(frame);
+                eprintln!("[fwd] first win at {}", Stages::current().show(frame));
             }
             // A won row is checkpointed (it is a backward seed) but never
             // expanded: its successors have left the room, and the search
@@ -2249,7 +2337,7 @@ impl ForwardState {
         // The level's graph so far, beside its frames: a backward can then
         // run on the tree alone (`rewrite bench-backward`).
         if let Some(o) = self.observer.as_ref() {
-            save_pos_graph(dir, &o.snapshot(), self.frames)?;
+            save_pos_graph(dir, &o.snapshot(), self.steps)?;
         }
         Ok(())
     }
@@ -2298,27 +2386,27 @@ pub fn forward_resume_or_run(
     engine: &dyn FrameStep,
     initial: Vec<Block>,
     dir: &std::path::Path,
-    max_frames: u32,
+    max_steps: u32,
 ) -> Result<ForwardResult> {
     let mut st = match ForwardState::resume(dir, true)? {
         Some(st) => st,
         None => ForwardState::start(initial, dir, true)?,
     };
-    st.extend(engine, dir, max_frames, None)?;
-    Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
+    st.extend(engine, dir, max_steps, None)?;
+    Ok(ForwardResult { win_step: st.win_step, steps: st.steps, pos_graph: st.pos_graph() })
 }
 
 pub fn forward_run(
     engine: &dyn FrameStep,
     initial: Vec<Block>,
     dir: &std::path::Path,
-    max_frames: u32,
+    max_steps: u32,
     record: bool,
     filter: Option<&MarkFilter>,
 ) -> Result<ForwardResult> {
     let mut st = ForwardState::start(initial, dir, record)?;
-    st.extend(engine, dir, max_frames, filter)?;
-    Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
+    st.extend(engine, dir, max_steps, filter)?;
+    Ok(ForwardResult { win_step: st.win_step, steps: st.steps, pos_graph: st.pos_graph() })
 }
 
 /// One line per forward frame on stderr, plus the phase totals under
@@ -2336,10 +2424,11 @@ fn log_frame(
 ) {
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
-        "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
+        "[fwd] {} in {}/{} raw {} kept {} out {}/{} visited {} | \
          wave {:.0} (idle {:.0}%) door {:.0} edges {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
          flushes {} ({:.0} rows avg) edges {} hull growths {} | \
          in {:.2} queues {:.2} door {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2})",
+        Stages::current().show(frame),
         st.blocks_in,
         st.lanes_in,
         st.lanes_raw,
@@ -2666,6 +2755,9 @@ where
     /// The finer levels' kernels built (`prebuild_kernels`): after level 0's
     /// first backward, the search's memory peak, all at once in parallel.
     finer_built: bool,
+    /// Steps per frame: the ladder's horizons and wins are frames, its
+    /// forwards and backwards run steps.
+    stages: Stages,
 }
 
 impl<'a, E, I> Ladder<'a, E, I>
@@ -2679,7 +2771,7 @@ where
         base_dir: &'a std::path::Path,
         precisions: &'a [crate::interpreter::abstraction::Level],
     ) -> Self {
-        Ladder { make_engine, make_initial, base_dir, precisions, level0: None, drop_level0: false, finer_built: false }
+        Ladder { make_engine, make_initial, base_dir, precisions, level0: None, drop_level0: false, finer_built: false, stages: Stages::current() }
     }
 
     fn level_dir(&self, horizon: u32, level: usize) -> std::path::PathBuf {
@@ -2688,6 +2780,12 @@ where
         } else {
             self.base_dir.join(format!("h{:03}", horizon)).join(format!("level{:02}", level))
         }
+    }
+
+    /// The frame a forward's first win ends (`Stages`: only a frame
+    /// boundary wins).
+    fn win_frame(&self, step: Option<u32>) -> Result<Option<u32>> {
+        step.map(|s| self.stages.frame(s).with_context(|| format!("a win inside a frame, at {}", self.stages.show(s)))).transpose()
     }
 
     /// Extend level 0 to `horizon` (starting it if needed) and report its
@@ -2704,8 +2802,8 @@ where
             // resume: the backward reads its edges, and its first win is in
             // its frame files. Resuming would rebuild the door - for room
             // (6,0)'s 1.7G states a 67 GB peak - to extend nothing.
-            if let Some(win) = tree_first_win_through(&dir, horizon)? {
-                return Ok(win.filter(|&h| h <= horizon));
+            if let Some(win) = tree_first_win_through(&dir, self.stages.step(horizon))? {
+                return Ok(self.win_frame(win)?.filter(|&h| h <= horizon));
             }
             let engine = (self.make_engine)(self.precisions[0])?;
             // A tree left by an earlier run resumes; the ladder's finer
@@ -2718,8 +2816,9 @@ where
             self.level0 = Some((engine, state));
         }
         let (engine, state) = self.level0.as_mut().expect("just started");
-        state.extend(engine.as_ref(), &dir, horizon, None)?;
-        Ok(state.win_frame.filter(|&h| h <= horizon))
+        state.extend(engine.as_ref(), &dir, self.stages.step(horizon), None)?;
+        let win = state.win_step;
+        Ok(self.win_frame(win)?.filter(|&h| h <= horizon))
     }
 
     pub fn at_horizon(&mut self, horizon: u32) -> Result<HorizonOutcome> {
@@ -2782,19 +2881,19 @@ where
                     engine.as_ref(),
                     (self.make_initial)()?,
                     &dir,
-                    horizon,
+                    self.stages.step(horizon),
                     true,
                     filter.as_ref(),
                 )?;
                 fresh = Some(engine);
-                (fwd.win_frame, fwd.pos_graph.expect("record mode always builds the pos graph"))
+                (self.win_frame(fwd.win_step)?, fwd.pos_graph.expect("record mode always builds the pos graph"))
             };
             let Some(h) = win else {
                 eprintln!("[ladder] h{horizon} level {level} ({precision}): NO WIN -> Refuted");
                 return Ok(HorizonOutcome::Refuted { level });
             };
             let (marked, work) = if bfs_backward() {
-                let bwd = crate::search::edges::backward(&dir, horizon)?;
+                let bwd = crate::search::edges::backward(&dir, self.stages.step(horizon))?;
                 (bwd.marked, format!("{} edges read", bwd.stats.edges_read))
             } else {
                 // The kernel re-run needs the level's engine: level 0's, or
@@ -2806,7 +2905,7 @@ where
                     Some(e) => e.as_ref(),
                     None => self.level0.as_ref().expect("level 0").0.as_ref(),
                 };
-                let bwd = backward_run(engine, &dir, horizon, &graph)?;
+                let bwd = backward_run(engine, &dir, self.stages.step(horizon), &graph)?;
                 (bwd.marked, format!("{} re-runs", bwd.reruns))
             };
             marked.save(&marks_file)?;
@@ -2832,9 +2931,9 @@ where
     }
 }
 
-/// A level tree on disk complete through `horizon` (its frames there and
-/// their edge runs done): its first win, from the frame files' win lists.
-/// `None` when the tree does not reach the horizon.
+/// A level tree on disk complete through step `horizon` (its steps there and
+/// their edge runs done): the step of its first win, from the frame files'
+/// win lists. `None` when the tree does not reach the horizon.
 fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
     let done = crate::search::edges::done_frame(&dir.join("edges"));
     if done.is_none_or(|d| d < horizon) || !dir.join("frames").join(format!("f{horizon:03}")).is_dir() {
@@ -2908,9 +3007,7 @@ pub fn find_optimum(
             HorizonOutcome::Confirmed => return Ok(Some(horizon)),
             HorizonOutcome::Refuted { level } => {
                 eprintln!("[search] horizon {horizon} refuted at level {level}");
-                // Under the split-frame prototype a win is only seen at the end of a
-                // frame (the second step): count up by two.
-                horizon += if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { 2 } else { 1 };
+                horizon += 1;
             }
         }
     }
@@ -2944,19 +3041,15 @@ pub fn find_optimum_from_ceiling(
             "ceiling {ceiling} REFUTED at level {level}: a known concrete solution the model cannot reproduce"
         ),
     }
-    // Under the split-frame prototype a win is only seen at the end of a
-    // frame (the exit test is in the player's update, the second step), so an
-    // odd horizon asks what the even one below it does: count down by two.
-    let step = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { 2 } else { 1 };
     let mut best = ceiling;
-    while best > step {
-        match ladder.at_horizon(best - step)? {
+    while best > 1 {
+        match ladder.at_horizon(best - 1)? {
             HorizonOutcome::Confirmed => {
-                eprintln!("[search] horizon {} confirmed, counting down", best - step);
-                best -= step;
+                eprintln!("[search] horizon {} confirmed, counting down", best - 1);
+                best -= 1;
             }
             HorizonOutcome::Refuted { level } => {
-                eprintln!("[search] horizon {} refuted at level {level}", best - step);
+                eprintln!("[search] horizon {} refuted at level {level}", best - 1);
                 break;
             }
         }
@@ -3022,8 +3115,8 @@ mod tests {
 
         let result = forward_run(&Mutex::new(engine), init, dir, 4, true, None).expect("forward_run");
         // No win in the 4-frame intro; the run reaches the horizon.
-        assert_eq!(result.win_frame, None, "unexpected early win in the intro");
-        assert_eq!(result.frames, 4, "expected 4 frames run");
+        assert_eq!(result.win_step, None, "unexpected early win in the intro");
+        assert_eq!(result.steps, 4, "expected 4 frames run");
         // Recording was on: a position graph was built.
         let pg = result.pos_graph.expect("pos graph built in record mode");
         eprintln!("[forward_run] pos-graph: {} live cells", pg.live_cells());
@@ -3340,7 +3433,7 @@ mod tests {
             assert_eq!(pos_graph_frame(dir), Some(0), "start must leave a graph beside f0");
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
-                assert_eq!(st.frames, to);
+                assert_eq!(st.steps, to);
                 // Every frame boundary leaves a graph covering the frame: a
                 // crash here resumes (the graph was saved only when a
                 // forward ended, so a crash lost it, 2026-09-16).
@@ -3365,7 +3458,7 @@ mod tests {
         {
             let e = Mutex::new(RefEngine::new().expect("engine"));
             let mut st = ForwardState::resume(dir, true).expect("resume").expect("a tree to resume");
-            assert_eq!(st.frames, 4);
+            assert_eq!(st.steps, 4);
             let door_before = st.visited_len();
             st.extend(&e, dir, 6, None).expect("extend resumed");
             assert!(st.visited_len() >= door_before);

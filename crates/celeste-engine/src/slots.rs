@@ -160,6 +160,7 @@ pub fn reshape(src: &Rt2, width: usize) -> Rt2 {
     );
     b.globals = src.globals.clone();
     b.structure = src.structure.clone();
+    b.cont = src.cont;
     b.cols = src
         .cols
         .iter()

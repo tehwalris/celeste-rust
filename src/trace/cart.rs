@@ -100,10 +100,8 @@ pub fn sources_in(root: &std::path::Path) -> Result<String> {
     let read = |p: &str| std::fs::read_to_string(root.join(p));
     let b3 = read("lua/builtin_level_3.lua")?;
     let b4 = read("lua/builtin_level_4.lua")?;
-    // `CELESTE_SPLIT_FRAME`: the split-frame prototype, one frame as two steps
-    // (lua/celeste-minimal-split.lua, plans/room60-overnight-2026-09-28.md).
-    let lua = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
-    let game = celeste_interp::game_runner::apply_start_room(&read(lua)?)?;
+    let game =
+        celeste_interp::game_runner::apply_start_room(&read("lua/celeste-minimal.lua")?)?;
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
 }
 
@@ -201,6 +199,7 @@ pub fn fresh_state<D: Domain>(d: &mut D) -> State<D> {
         path: Vec::new(),
         key_override: Vec::new(),
         frag: Vec::new(),
+        cont: None,
     };
     for name in NATIVE {
         st.heap
@@ -219,6 +218,7 @@ pub fn run_chunk<'a, D: Domain>(
     ast: &'a full_moon::ast::Ast,
     st: State<D>,
 ) -> Result<State<D>> {
+    it.intern_all(ast);
     let out = it.exec_block(ast.nodes(), st)?;
     if out.len() != 1 {
         return Err(anyhow!("chunk ended in {} states", out.len()));
@@ -226,7 +226,7 @@ pub fn run_chunk<'a, D: Domain>(
     let (s, f) = out.into_iter().next().unwrap();
     match f {
         Flow::Normal | Flow::Return(_) => Ok(s),
-        Flow::Break => Err(anyhow!("break at chunk toplevel")),
+        Flow::Break | Flow::Suspend => Err(anyhow!("break or a stage cut at chunk toplevel")),
     }
 }
 

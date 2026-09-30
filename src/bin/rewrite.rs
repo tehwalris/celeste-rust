@@ -15,6 +15,20 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// per-block version of it once exhausted /tmp's inodes, 2026-09-07).
 const DEFAULT_CHECKPOINT_DIR: &str = "/var/tmp/celeste-checkpoints";
 
+/// A diagnostic that counts a tree's layers as frames refuses a multi-stage
+/// tree (`--cut`), whose layers are steps (`frame::Stages`).
+fn single_stage(dir: &std::path::Path) -> Result<()> {
+    let s = celeste_rust::frame::Stages::of_tree(dir)?;
+    anyhow::ensure!(s.per_frame == 1, "{}: a tree of {} stages per frame, whose layers this diagnostic would read as frames", dir.display(), s.per_frame);
+    Ok(())
+}
+
+/// Split the run's frames at `--cut` (`trace::stage`), before any kernel is
+/// built.
+fn set_cuts(cut: &Option<String>) -> Result<()> {
+    celeste_rust::trace::stage::set_cuts(cut.as_deref().map(celeste_rust::trace::stage::parse_cuts).unwrap_or_default())
+}
+
 #[derive(Parser)]
 #[command(about = "The abstract TAS search")]
 struct Cli {
@@ -54,6 +68,13 @@ enum Command {
         /// ceiling is optimal. `--from`/`--to` are ignored.
         #[arg(long)]
         ceiling: Option<u32>,
+        /// Split every frame into STAGES at these cuts (`trace::stage`):
+        /// object types, comma-separated. `player` ends a stage after the
+        /// player's move, so the states dedupe before its update (the
+        /// buttons). A frame is then one search step per stage; horizons,
+        /// wins and the reported frames stay game frames.
+        #[arg(long)]
+        cut: Option<String>,
     },
     /// ONE forward pass at ONE precision level, exactly as the ladder runs it
     /// (record mode, position partition, sharded checkpoints), with the
@@ -80,6 +101,13 @@ enum Command {
         /// for a new room's first frames. Not at held-unknown levels.
         #[arg(long)]
         reference: bool,
+        /// Split every frame into STAGES at these cuts (`trace::stage`):
+        /// object types, comma-separated. `player` ends a stage after the
+        /// player's move, so the states dedupe before its update (the
+        /// buttons). A frame is then one search step per stage; horizons,
+        /// wins and the reported frames stay game frames.
+        #[arg(long)]
+        cut: Option<String>,
     },
     /// Fingerprint a forward checkpoint tree: per frame, the lane count and an
     /// order-independent hash of its (row key, cell) set. Two runs that agree
@@ -130,8 +158,13 @@ enum Command {
     BenchFrame {
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
+        /// The frame whose successors to compute: its boundary's rows in.
         #[arg(long, default_value_t = 70)]
         frame: u32,
+        /// In a multi-stage tree (`--cut`), the stage of the next frame to
+        /// run instead: its input is the rows `stage` steps past the boundary.
+        #[arg(long, default_value_t = 0)]
+        stage: u32,
         #[arg(long, default_value_t = 3)]
         reps: usize,
         #[arg(long, default_value = "1,0")]
@@ -734,10 +767,12 @@ fn main() -> Result<()> {
             room,
             win_at,
             ceiling,
+            cut,
         } => {
             use celeste_rust::frame::{find_optimum, Block, FrameStep};
             use celeste_rust::interpreter::abstraction::{set_level, Level, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
+            set_cuts(&cut)?;
             if let Some(xy) = &win_at {
                 std::env::set_var("CELESTE_WIN_AT_XY", xy);
             }
@@ -797,10 +832,13 @@ fn main() -> Result<()> {
             checkpoint_dir,
             room,
             reference,
+            cut,
         } => {
-            use celeste_rust::frame::{Block, FrameStep};
+            use celeste_rust::frame::{Block, FrameStep, Stages};
             use celeste_rust::interpreter::abstraction::{current_level, set_level, set_rem_precision, Level, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
+            set_cuts(&cut)?;
+            let stages = Stages::current();
             match &level {
                 Some(spec) => set_level(Level::parse(spec).map_err(|e| anyhow::anyhow!(e))?),
                 None => set_rem_precision(if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) }),
@@ -817,15 +855,15 @@ fn main() -> Result<()> {
             )?];
             let dir = std::path::Path::new(&checkpoint_dir);
             let t = std::time::Instant::now();
-            let fwd = celeste_rust::frame::forward_resume_or_run(engine.as_ref(), initial, dir, to)?;
+            let fwd = celeste_rust::frame::forward_resume_or_run(engine.as_ref(), initial, dir, stages.step(to))?;
             let wall = t.elapsed().as_secs_f64();
-            match fwd.win_frame {
-                Some(h) => println!("win at f{h} ({wall:.2} s)"),
-                None => println!("no win by f{} ({wall:.2} s)", fwd.frames),
+            match fwd.win_step {
+                Some(h) => println!("win at {} ({wall:.2} s)", stages.show(h)),
+                None => println!("no win by {} ({wall:.2} s)", stages.show(fwd.steps)),
             }
             if let Some(pg) = &fwd.pos_graph {
                 let (pairs, fp) = pg.fingerprint();
-                println!("posgraph f{:03} {pairs} {fp:016x}", fwd.frames);
+                println!("posgraph {} {pairs} {fp:016x}", stages.show(fwd.steps));
             }
             celeste_rust::metrics::dump("forward", Some(dir), &[("k", k.to_string())]);
         }
@@ -851,6 +889,8 @@ fn main() -> Result<()> {
             };
             let fine_dir = level_dir(fine_h, fine_level);
             let coarse_dir = level_dir(coarse_h, coarse_level);
+            single_stage(&fine_dir)?;
+            single_stage(&coarse_dir)?;
             let fine_marks =
                 Visited::load(&celeste_rust::frame::marks_path(base, fine_h, fine_level))?;
             let coarse_marks =
@@ -945,6 +985,10 @@ fn main() -> Result<()> {
         } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
             let dir = std::path::Path::new(&checkpoint_dir);
+            // Every step of a multi-stage tree, each labelled by what it has
+            // run (`Stages::show`): a frame boundary as a single-stage tree's.
+            let stages = celeste_rust::frame::Stages::of_tree(dir)?;
+            let to = stages.step(to);
             let mut by_cell: rustc_hash::FxHashMap<u32, usize> = Default::default();
             for frame in 0..=to {
                 let mut n = 0usize;
@@ -961,7 +1005,7 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                println!("f{frame:03} {n} {acc:016x}");
+                println!("{} {n} {acc:016x}", stages.show(frame));
             }
             if let Some(top) = top_cells {
                 let mut v: Vec<(u32, usize)> = by_cell.into_iter().collect();
@@ -977,6 +1021,7 @@ fn main() -> Result<()> {
         Command::BenchFrame {
             checkpoint_dir,
             frame,
+            stage,
             reps,
             room,
             level_dir,
@@ -995,11 +1040,15 @@ fn main() -> Result<()> {
                 Some(spec) => set_level(Level::parse(spec).map_err(|e| anyhow::anyhow!(e))?),
                 None => set_level(rung(precision)),
             }
-            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
             let dir = match &level_dir {
                 Some(d) => std::path::PathBuf::from(d),
                 None => std::path::Path::new(&checkpoint_dir).join("level00"),
             };
+            let stages = celeste_rust::frame::Stages::adopt(&dir)?;
+            anyhow::ensure!(stage < stages.per_frame, "stage {stage} of a tree with {} per frame", stages.per_frame);
+            // The input layer (a step).
+            let frame = stages.step(frame) + stage;
+            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
             let marks: Option<Visited> = match &filter {
                 Some(p) => Some(Visited::load(std::path::Path::new(p))?),
                 None => None,
@@ -1010,7 +1059,8 @@ fn main() -> Result<()> {
             let frontier = load_frame(&dir, frame)?;
             let lanes: usize = frontier.iter().map(Block::lanes).sum();
             eprintln!(
-                "[bench] f{frame}: {} blocks, {lanes} lanes loaded in {:.2} s; {} threads",
+                "[bench] {}: {} blocks, {lanes} lanes loaded in {:.2} s; {} threads",
+                stages.show(frame),
                 frontier.len(),
                 t.elapsed().as_secs_f64(),
                 threads()
@@ -1099,6 +1149,7 @@ fn main() -> Result<()> {
             use rustc_hash::FxHashMap;
             std::env::set_var("CELESTE_START_ROOM", &room);
             let dir = std::path::Path::new(&level_dir);
+            single_stage(dir)?;
             let ids = celeste_rust::compiled::ids();
             if let Some(to) = to {
                 let mix = celeste_engine::runtime2::mix64;
@@ -1419,21 +1470,23 @@ fn main() -> Result<()> {
             use celeste_rust::interpreter::abstraction::{set_level, Level, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
             set_level(Level::for_rem(RemPrecision::Bits(0)));
-            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
             let dir = std::path::Path::new(&level_dir);
+            // The horizon is a frame; the walks run the tree's steps.
+            let steps = celeste_rust::frame::Stages::adopt(dir)?.step(horizon);
+            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
             let graph = celeste_rust::search::pos_graph::PosGraph::load(&pos_graph_path(dir))?;
             eprintln!("[bench] level-0 tree {}, pos-graph {} pairs; {} threads", dir.display(), graph.pairs(), threads());
             let t = std::time::Instant::now();
             if diff {
-                let kern = backward_run(&engine, dir, horizon, &graph)?;
-                let bfs = celeste_rust::search::edges::backward(dir, horizon)?;
+                let kern = backward_run(&engine, dir, steps, &graph)?;
+                let bfs = celeste_rust::search::edges::backward(dir, steps)?;
                 let a = kern.marked.entries();
                 let b = bfs.marked.entries();
                 let sa: std::collections::BTreeSet<_> = a.iter().copied().collect();
                 let sb: std::collections::BTreeSet<_> = b.iter().copied().collect();
                 // Where a state lives: its (layer, seq, row) through the tree.
                 let mut where_is: rustc_hash::FxHashMap<(u64, u32, (u64, u64)), Vec<u64>> = Default::default();
-                for layer in 0..=horizon {
+                for layer in 0..=steps {
                     for (seq, file) in celeste_rust::frame::frame_files_seq(dir, layer)? {
                         let cells = file.row_cells();
                         for row in 0..file.width() {
@@ -1445,7 +1498,7 @@ fn main() -> Result<()> {
                     }
                 }
                 println!("[diff] kernel {} states, bfs {} states", a.len(), b.len());
-                let edges = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
+                let edges = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), steps)?;
                 let only_kernel: Vec<_> = sa.difference(&sb).copied().collect();
                 let only_bfs: Vec<_> = sb.difference(&sa).copied().collect();
                 println!("[diff] only kernel: {} states; only bfs: {} states", only_kernel.len(), only_bfs.len());
@@ -1547,7 +1600,7 @@ fn main() -> Result<()> {
                                 }
                                 // Where is this successor in the tree?
                                 let mut found: Vec<u64> = Vec::new();
-                                for l2 in 0..=horizon {
+                                for l2 in 0..=steps {
                                     for (s2, f2) in celeste_rust::frame::frame_files_seq(dir, l2)? {
                                         if f2.shape_hash() != shape {
                                             continue;
@@ -1582,7 +1635,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             if celeste_rust::frame::bfs_backward() {
-                let bwd = celeste_rust::search::edges::backward(dir, horizon)?;
+                let bwd = celeste_rust::search::edges::backward(dir, steps)?;
                 let (n, fp) = bwd.marked.fingerprint();
                 println!(
                     "[bench] BFS backward h{horizon}: {:.2} s, marked {n} (fingerprint {fp:016x}), {} edges read",
@@ -1591,7 +1644,7 @@ fn main() -> Result<()> {
                 );
                 return Ok(());
             }
-            let bwd = backward_run(&engine, dir, horizon, &graph)?;
+            let bwd = backward_run(&engine, dir, steps, &graph)?;
             let (n, fp) = bwd.marked.fingerprint();
             println!(
                 "[bench] backward h{horizon}: {:.2} s, marked {n} (fingerprint {fp:016x}), {} re-runs",
@@ -1602,6 +1655,7 @@ fn main() -> Result<()> {
             celeste_rust::metrics::dump("bench-backward", None, &[]);
         }
         Command::PartitionProbe { level_dir, frame, to, square } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             use celeste_rust::search::checkpoint::FrameFile;
             use celeste_rust::search::edges::{EdgeGraph, GroupMasks};
             use celeste_rust::search::pos_graph::cell_xy;
@@ -1705,6 +1759,7 @@ fn main() -> Result<()> {
             }
         }
         Command::PruneProbe { level_dir, ceiling, from, to } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             use celeste_rust::search::checkpoint::FrameFile;
             use celeste_rust::search::pos_graph::{cell_xy, PosGraph, CELL_COUNT};
             let dir = std::path::Path::new(&level_dir);
@@ -1793,6 +1848,7 @@ fn main() -> Result<()> {
             }
         }
         Command::FullnessProbe { level_dir, to, cells, auto } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             use celeste_engine::runtime2::{Col, AV};
             use celeste_rust::search::checkpoint::FrameFile;
             use celeste_rust::search::pos_graph::{cell_of, cell_xy, player_object, NO_CELL};
@@ -1966,6 +2022,7 @@ fn main() -> Result<()> {
             }
         }
         Command::PosCensus { level_dir, frames } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             use celeste_engine::runtime2::{mix64, Cell2, Col, AV};
             use celeste_rust::frame::load_frame;
             let dir = std::path::Path::new(&level_dir);
@@ -2043,6 +2100,7 @@ fn main() -> Result<()> {
             }
         }
         Command::EdgeAge { level_dir, frames } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             use celeste_rust::search::edges::EdgeGraph;
             let dir = std::path::Path::new(&level_dir);
             for f in frames.split(',') {
@@ -2066,6 +2124,8 @@ fn main() -> Result<()> {
             let coarse_level = Level::parse(&coarse).map_err(|e| anyhow::anyhow!(e))?;
             set_level(coarse_level);
             let (a, b) = (std::path::Path::new(&a), std::path::Path::new(&b));
+            single_stage(&a.join("level00"))?;
+            single_stage(&b.join("level00"))?;
             let ma = Visited::load(&marks_path(a, horizon, level))?;
             let mb = Visited::load(&marks_path(b, horizon, level))?;
             let missing: Vec<(u64, u32, (u64, u64))> =
@@ -2141,9 +2201,11 @@ fn main() -> Result<()> {
             println!("of the {} missing: coarse state absent from b's level-0 tree {absent} (forward loss), present but unmarked {unmarked} (backward loss)", missing.len());
         }
         Command::PartitionCensus { level_dir, spd_w } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             print!("{}", celeste_rust::search::checkpoint::partition_census(std::path::Path::new(&level_dir), spd_w)?);
         }
         Command::SpdCensus { level_dir, frame, widths, edge_table, erase, x_only } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             use celeste_engine::runtime2::{mix64, Cell2, Col, AV};
             use celeste_rust::search::checkpoint::FrameFile;
             let dir = std::path::Path::new(&level_dir);
@@ -2264,6 +2326,7 @@ fn main() -> Result<()> {
             }
         }
         Command::SpdHist { level_dir, frame, top } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             use celeste_engine::runtime2::AV;
             use celeste_rust::search::checkpoint::FrameFile;
             let ids = celeste_rust::compiled::ids();
@@ -2365,6 +2428,7 @@ fn main() -> Result<()> {
             }
         }
         Command::CellGrowth { level_dir, from, to, top, at } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             use celeste_rust::search::checkpoint::FrameFile;
             use celeste_rust::search::pos_graph::{cell_of, cell_xy};
             let dir = std::path::Path::new(&level_dir);
@@ -2433,6 +2497,7 @@ fn main() -> Result<()> {
             );
         }
         Command::CoarseCensus { level_dir, from, to, erase } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             let prefixes: Vec<&str> = erase.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
             let mut through: rustc_hash::FxHashSet<u64> = Default::default();
             for frame in from..=to {
@@ -2448,6 +2513,8 @@ fn main() -> Result<()> {
             }
         }
         Command::BucketDiff { exact_dir, bucketed_dir, from, to, w, x_only, examples, at } => {
+            single_stage(std::path::Path::new(&exact_dir))?;
+            single_stage(std::path::Path::new(&bucketed_dir))?;
             let at: Option<(i32, i32)> = at
                 .map(|s| -> Result<(i32, i32)> {
                     let (a, b) = s.split_once(',').ok_or_else(|| anyhow::anyhow!("--at x,y"))?;
@@ -2498,6 +2565,7 @@ fn main() -> Result<()> {
             }
         }
         Command::FloorReach { level_dir, frame } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             use celeste_rust::search::checkpoint::FrameFile;
             use celeste_rust::search::pos_graph::{player_object, whole_range_col};
             let ids = celeste_rust::compiled::ids();
@@ -2558,6 +2626,7 @@ fn main() -> Result<()> {
             }
         }
         Command::ColCensus { level_dir, frame, cap } => {
+            single_stage(std::path::Path::new(&level_dir))?;
             use celeste_engine::runtime2::{Cell2, Col, AV};
             use celeste_rust::search::checkpoint::FrameFile;
             let dir = std::path::Path::new(&level_dir);
@@ -2781,9 +2850,13 @@ fn main() -> Result<()> {
                 base.join(format!("h{:03}", horizon)).join(format!("level{:02}", level))
             };
             let marks = Visited::load(&marks_path(base, horizon, level))?;
+            // A multi-stage tree's layers are steps; the walk below steps
+            // whole frames (the reference engine runs a frame at a time), so
+            // it meets the tree at frame boundaries only.
+            let stages = celeste_rust::frame::Stages::of_tree(&dir)?;
             // (key, cell) -> the layer it was first reached at.
             let mut layer_of: FxHashMap<(u64, u64, u32), u32> = FxHashMap::default();
-            for f in 0..=horizon {
+            for f in 0..=stages.step(horizon) {
                 for file in frame_files(&dir, f)? {
                     if let Some(rt2) = file.load_all()? {
                         let b = Block::from_rt2(rt2);
@@ -2831,6 +2904,7 @@ fn main() -> Result<()> {
                 path: &mut Vec<u8>,
                 steps: &mut u64,
                 dir: &std::path::Path,
+                stages: celeste_rust::frame::Stages,
             ) -> Result<bool> {
                 if f >= horizon {
                     return Ok(false);
@@ -2849,7 +2923,7 @@ fn main() -> Result<()> {
                     }
                     let (shape, keys, cells) = widened_keys(&block, precision)?;
                     let id = (keys[0].0, keys[0].1, cells[0]);
-                    if f == 0 && byte == 0 && layer_of.get(&id) != Some(&1) {
+                    if f == 0 && byte == 0 && layer_of.get(&id) != Some(&stages.step(1)) {
                         eprintln!(
                             "[witness] f1 successor: cell {} layer {:?} marked {} - diffing against layer 1",
                             cells[0],
@@ -2862,7 +2936,7 @@ fn main() -> Result<()> {
                         if let RemPrecision::Bits(b) = precision.rem {
                             mine.widen_to(celeste_rust::compiled::ids(), b, celeste_rust::frame::spd_width_log2(precision.spd), (precision.pos.x, precision.pos.y), precision.held.is_unknown(), precision.fruit.is_unknown(), precision.floors.is_unknown(), precision.floors.is_timers(), precision.platforms.is_unknown());
                         }
-                        for file in frame_files(dir, 1)? {
+                        for file in frame_files(dir, stages.step(1))? {
                             let Some(theirs) = file.load_all()? else { continue };
                             eprintln!(
                                 "[witness]   layer-1 file shape {:#x} width {} (mine shape {:#x}); structures {}",
@@ -2908,11 +2982,11 @@ fn main() -> Result<()> {
                     if dead.contains(&id) || !marks.contains(shape, keys[0], cells[0]) {
                         continue;
                     }
-                    if layer_of.get(&id) != Some(&(f + 1)) {
+                    if layer_of.get(&id) != Some(&stages.step(f + 1)) {
                         continue;
                     }
                     path.push(byte);
-                    if dfs(eng, initial, &succ, f + 1, horizon, precision, marks, layer_of, dead, path, steps, dir)? {
+                    if dfs(eng, initial, &succ, f + 1, horizon, precision, marks, layer_of, dead, path, steps, dir, stages)? {
                         return Ok(true);
                     }
                     path.pop();
@@ -2922,7 +2996,7 @@ fn main() -> Result<()> {
             }
             let found = dfs(
                 &mut eng, &initial, &initial, 0, horizon, precision, &marks, &layer_of, &mut dead, &mut path,
-                &mut steps, &dir,
+                &mut steps, &dir, stages,
             )?;
             eprintln!("[witness] {} concrete steps, {} dead ends", steps, dead.len());
             if found {

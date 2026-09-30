@@ -55,6 +55,11 @@
 //!
 //! Everything is little-endian u32 at 4-byte alignment, so the UI reads
 //! it as `Uint32Array` views without a parser.
+//!
+//! A tree searched in STAGES (`frame::Stages`, `--cut`) exports its frame
+//! boundaries: frame f is the tree's step `f * per_frame`, a marked state
+//! inside a frame is left out of the marks, a distance is in frames, and the
+//! log's per-stage `[fwd]` lines are summed into their frame's.
 
 use anyhow::{bail, Context, Result};
 use rustc_hash::FxHashMap;
@@ -190,12 +195,39 @@ fn after<'a>(toks: &[&'a str], key: &str, nth: usize) -> Result<&'a str> {
     bail!("no token {key:?} (#{nth}) in line")
 }
 
-fn parse_fwd(line: &str) -> Result<FwdLine> {
+impl FwdLine {
+    /// A frame's line from its stages' (`f012.1` is one stage into frame 13):
+    /// the input the frame's first stage took (`earlier`), the output its last
+    /// one left (`self`), the work of both.
+    fn after(self, earlier: FwdLine) -> FwdLine {
+        FwdLine {
+            in_blocks: earlier.in_blocks,
+            in_lanes: earlier.in_lanes,
+            raw: earlier.raw + self.raw,
+            emit_ms: earlier.emit_ms + self.emit_ms,
+            emit_idle: earlier.emit_idle.max(self.emit_idle),
+            own_ms: earlier.own_ms + self.own_ms,
+            own_idle: earlier.own_idle.max(self.own_idle),
+            ckpt_ms: earlier.ckpt_ms + self.ckpt_ms,
+            pos_ms: earlier.pos_ms + self.pos_ms,
+            total_ms: earlier.total_ms + self.total_ms,
+            rss_gb: earlier.rss_gb.max(self.rss_gb),
+            ..self
+        }
+    }
+}
+
+/// A `[fwd]` line, and whether it is a stage inside a frame (`f012.1`).
+fn parse_fwd(line: &str) -> Result<(FwdLine, bool)> {
     let t: Vec<&str> = line.split_whitespace().collect();
     let (ib, il) = after(&t, "in", 0)?.split_once('/').context("in b/l")?;
     let (ob, ol) = after(&t, "out", 0)?.split_once('/').context("out b/l")?;
-    Ok(FwdLine {
-        f: num(t[1])?,
+    let (frame, stage) = match t[1].split_once('.') {
+        Some((f, _)) => (f, true),
+        None => (t[1], false),
+    };
+    Ok((FwdLine {
+        f: num(frame)?,
         in_blocks: num(ib)?,
         in_lanes: num(il)?,
         raw: num(after(&t, "raw", 0)?)?,
@@ -218,7 +250,7 @@ fn parse_fwd(line: &str) -> Result<FwdLine> {
             "start" => num(after(&t, "end", 0)?)?,
             v => num(v)?,
         },
-    })
+    }, stage))
 }
 
 fn parse_bwd(line: &str) -> Result<BwdLine> {
@@ -249,13 +281,24 @@ pub fn parse_log(text: &str, forward_only: bool) -> Result<(Vec<HorizonRun>, Opt
     let mut fwd: Vec<FwdLine> = Vec::new();
     let mut bwd: Vec<BwdLine> = Vec::new();
     let mut first_win: Option<u32> = None;
+    // The stages of the frame in progress (a multi-stage search).
+    let mut stages: Option<FwdLine> = None;
     let (mut wall, mut prebuild, mut optimal) = (None, None, None);
     for (ln, line) in text.lines().enumerate() {
         let ctx = || format!("log line {}: {line}", ln + 1);
         if line.starts_with("[fwd] first win at f") {
             first_win = Some(num(line.rsplit(' ').next().unwrap_or("")).with_context(ctx)?);
         } else if line.starts_with("[fwd] f") {
-            fwd.push(parse_fwd(line).with_context(ctx)?);
+            let (l, inside) = parse_fwd(line).with_context(ctx)?;
+            let l = match stages.take() {
+                Some(earlier) => l.after(earlier),
+                None => l,
+            };
+            if inside {
+                stages = Some(l);
+            } else {
+                fwd.push(l);
+            }
         } else if line.starts_with("[bwd] f") {
             bwd.push(parse_bwd(line).with_context(ctx)?);
         } else if line.starts_with("[ladder] h") {
@@ -496,8 +539,10 @@ struct MarkTable {
 const MARKS_CHUNK: usize = 1 << 20;
 
 /// The sets' table, and per set its `(cell, dist, count)` sorted by (dist,
-/// cell) (dist 0 throughout when the file has none).
-fn mark_table(sets: &[MarksMap]) -> Result<(MarkTable, Vec<Vec<(u32, u32, u32)>>)> {
+/// cell) (dist 0 throughout when the file has none). The states of the
+/// `inside` shapes (a multi-stage tree's, between two stages of a frame) are
+/// left out, and a distance is counted in frames.
+fn mark_table(sets: &[MarksMap], stages: crate::frame::Stages, inside: &rustc_hash::FxHashSet<u64>) -> Result<(MarkTable, Vec<Vec<(u32, u32, u32)>>)> {
     anyhow::ensure!(sets.len() <= 64, "at most 64 marked sets per tree");
     // The chunks: every set's rows, read in parallel into per-shard lists
     // and a per-(dist, cell) count.
@@ -510,8 +555,11 @@ fn mark_table(sets: &[MarksMap]) -> Result<(MarkTable, Vec<Vec<(u32, u32, u32)>>
         let mut hist: FxHashMap<(u32, u32), u32> = FxHashMap::default();
         for r in c * MARKS_CHUNK..((c + 1) * MARKS_CHUNK).min(m.rows) {
             let (id, dist) = m.row(r);
+            if inside.contains(&id.0) {
+                continue;
+            }
             shards[mark_shard(id.0, id.1)].push(id);
-            *hist.entry((dist, id.1)).or_default() += 1;
+            *hist.entry((dist / stages.per_frame, id.1)).or_default() += 1;
         }
         Ok((k, shards, hist))
     })?;
@@ -628,11 +676,27 @@ fn sparse(m: FxHashMap<u32, u32>) -> Sparse {
     v
 }
 
+/// The shapes of a multi-stage tree's states between two stages of a frame:
+/// every shape of its steps inside a frame (a continuation is part of the
+/// shape, so none of them is ever a frame boundary's).
+fn inside_shapes(dir: &Path, stages: crate::frame::Stages) -> Result<rustc_hash::FxHashSet<u64>> {
+    let mut out = rustc_hash::FxHashSet::default();
+    let mut step = 0;
+    while stages.per_frame > 1 && dir.join("frames").join(format!("f{step:03}")).exists() {
+        if stages.frame(step).is_none() {
+            out.extend(crate::frame::frame_files(dir, step)?.iter().map(|f| f.shape_hash()));
+        }
+        step += 1;
+    }
+    Ok(out)
+}
+
 /// Read one level directory: its frames from the headers, and - in the
 /// same pass over the files - the marked sets of `marks` split by layer
 /// (result `[k]` is, per frame, the marked states of set `k` per cell: the
-/// tree's `(cell, key)` rows intersected with the set). Frames in parallel.
-fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
+/// tree's `(cell, key)` rows intersected with the set). Frames in parallel;
+/// of a multi-stage tree, its frame boundaries.
+fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize, stages: crate::frame::Stages) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
     let fdir = dir.join("frames");
     let mut nframes = 0u32;
     for e in std::fs::read_dir(&fdir).with_context(|| format!("listing {}", fdir.display()))? {
@@ -658,7 +722,9 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(Lev
     counts.reverse();
     let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(n);
     let mut layers: Vec<Vec<Sparse>> = vec![Vec::with_capacity(n); nsets];
-    for FrameCounts { mut cells, mut wins, marked } in counts {
+    // The previous step's states per cell (a frame's, or a stage's).
+    let mut prev: Option<Sparse> = None;
+    for (step, FrameCounts { mut cells, mut wins, marked }) in counts.into_iter().enumerate() {
         // A won state has left the room: its cell is the NEXT room's spawn,
         // one room over (`pos_graph::room_offset` puts the room it exits to
         // one room to the right), so drawn as-is the winning states sit in the box's far
@@ -669,8 +735,7 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(Lev
         // the one holding the most states at the previous frame. The count
         // moves whole, in both the states and the wins record, so totals are
         // unchanged; with no graph or no occupied source the cell stays.
-        if let (Some(g), Some((prev, _))) = (graph.as_ref(), frames.last()) {
-            let prev: &Sparse = prev;
+        if let (Some(g), Some(prev)) = (graph.as_ref(), prev.as_ref()) {
             let busiest = |win: u32| -> Option<u32> {
                 g.sources(win)
                     .iter()
@@ -688,10 +753,14 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(Lev
                 }
             }
         }
-        frames.push((sparse(cells), sparse(wins)));
-        for (k, m) in marked.into_iter().enumerate() {
-            layers[k].push(sparse(m));
+        let cells = sparse(cells);
+        if stages.frame(step as u32).is_some() {
+            frames.push((cells.clone(), sparse(wins)));
+            for (k, m) in marked.into_iter().enumerate() {
+                layers[k].push(sparse(m));
+            }
         }
+        prev = Some(cells);
     }
     Ok((LevelData { frames }, layers))
 }
@@ -875,14 +944,16 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
                 MarksMap::open(&path).with_context(|| format!("marks {}", path.display()))
             })
             .collect::<Result<Vec<_>>>()?;
+        let stages = crate::frame::Stages::of_tree(&dir)?;
+        let inside = inside_shapes(&dir, stages)?;
         let (table, by_cell_dist) = if sets.is_empty() {
             (None, Vec::new())
         } else {
-            let (table, by_cell_dist) = mark_table(&sets).with_context(|| format!("marks of {}", dir.display()))?;
+            let (table, by_cell_dist) = mark_table(&sets, stages, &inside).with_context(|| format!("marks of {}", dir.display()))?;
             (Some(table), by_cell_dist)
         };
         let t_marks = tt.elapsed();
-        let (data, layers) = read_tree(&dir, table.as_ref(), sets.len()).with_context(|| format!("frames of {}", dir.display()))?;
+        let (data, layers) = read_tree(&dir, table.as_ref(), sets.len(), stages).with_context(|| format!("frames of {}", dir.display()))?;
         eprintln!(
             "[export-ui] {}: {} frames, {} marked sets ({} states) in {:.1} s ({:.1} s marks)",
             dir.display(),
@@ -1025,7 +1096,7 @@ mod tests {
         assert!(!sets[0].have_dist() && sets[1].have_dist());
         assert_eq!((sets[0].rows, sets[1].rows), (3, 2));
         assert_eq!(sets[1].row(0), ((7, 3, (1, 2)), 2));
-        let (t, by_cell_dist) = mark_table(&sets).unwrap();
+        let (t, by_cell_dist) = mark_table(&sets, crate::frame::Stages { per_frame: 1 }, &Default::default()).unwrap();
         let get = |s: u64, c: u32, k: (u64, u64)| t.shards[mark_shard(s, c)].get(&(s, c, k)).copied();
         assert_eq!(get(7, 3, (1, 2)), Some(0b11), "the shared state holds both sets");
         assert_eq!(get(7, 3, (5, 6)), Some(0b01));

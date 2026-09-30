@@ -1702,19 +1702,11 @@ impl Registry {
         });
         built.sort_by_key(|(si, _)| *si);
         let mut kernels = HashMap::new();
-        let mut first: HashMap<(u64, crate::trace::kernel::KernelKey), usize> = HashMap::new();
-        for (si, res) in built {
+        for (_si, res) in built {
             let (shape, key, kernel) = res?;
             if kernels.insert((shape, key), kernel).is_some() {
-                let slots = |i: usize| refs[i].1.frame.iface.slots.iter().map(crate::trace::iface::show).filter(|p| p.starts_with("__")).collect::<Vec<_>>();
-                anyhow::bail!(
-                    "two start-room frames hash to {shape:#x} with key {key:?} (frames {} and {si}: underscore slots {:?} / {:?})",
-                    first[&(shape, key)],
-                    slots(first[&(shape, key)]),
-                    slots(si)
-                );
+                anyhow::bail!("two start-room frames hash to {shape:#x} with key {key:?}");
             }
-            first.insert((shape, key), si);
         }
         unify(&mut kernels)?;
         eprintln!(

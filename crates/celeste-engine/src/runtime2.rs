@@ -248,6 +248,12 @@ pub struct Rt2 {
     pub cart: Arc<CartData>,
     pub cache: Arc<CollisionCache>,
     pub prints: Vec<String>,
+    /// Where in its frame every row of this block stands: 0 at a frame
+    /// boundary, else the hash of its CONTINUATION (the tracer's
+    /// `trace::stage::Cont`) - a state between two stages of a frame, whose
+    /// rest the next stage's kernel runs. Part of the shape (`shape_hash_of`):
+    /// rows at different places in a frame never share a kernel or dedupe.
+    pub cont: u64,
     /// Set by `boundary`: the canonical structure hash (the shape key).
     pub shape_hash: u64,
     /// Set by `boundary`: per-lane 128-bit canonical row keys.
@@ -416,6 +422,7 @@ impl Rt2 {
             cart,
             cache,
             prints: Vec::new(),
+            cont: 0,
             shape_hash: 0,
             row_keys: Vec::new(),
         }
@@ -606,6 +613,10 @@ impl Rt2 {
         }
         for g in self.globals.iter() {
             h.write_u32(*g);
+        }
+        // A frame boundary hashes as it always has.
+        if self.cont != 0 {
+            h.write_u64(self.cont);
         }
         h.finish()
     }
@@ -1476,6 +1487,7 @@ impl Rt2 {
             cart: self.cart.clone(),
             cache: self.cache.clone(),
             prints: self.prints.clone(),
+            cont: self.cont,
             shape_hash: self.shape_hash,
             row_keys: Vec::new(),
         }
@@ -1492,6 +1504,7 @@ impl Rt2 {
             cart: self.cart.clone(),
             cache: self.cache.clone(),
             prints: self.prints.clone(),
+            cont: self.cont,
             shape_hash: self.shape_hash,
             row_keys: self.row_keys.clone(),
         }

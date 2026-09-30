@@ -16,20 +16,25 @@
 //! shape divergence happens in statement position (`del(objects, obj)`),
 //! and a loud refusal is the right way to find out if that is ever wrong.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use full_moon::ast;
 use full_moon::tokenizer::{Symbol, TokenType};
 
 use crate::pico8_num::Pico8Num as P8;
 
 use super::domain::{refuse_unknown, Arith, Cmp, Domain, Fun1, Fun2};
-use super::heap::{BodyId, TableId, Value};
+use super::heap::{BodyId, ScopeId, TableId, Value};
+use super::stage::At;
 use super::state::{merge_canon, split, Canon, Sides, State};
 
 pub enum Flow<D: Domain> {
     Normal,
     Break,
     Return(Value<D>),
+    /// The stage ended at a cut (`trace::stage`): the state carries where
+    /// (`State::cont`), and every enclosing level passes it up, adding
+    /// where it was, instead of running on.
+    Suspend,
 }
 
 impl<D: Domain> Clone for Flow<D> {
@@ -38,6 +43,7 @@ impl<D: Domain> Clone for Flow<D> {
             Flow::Normal => Flow::Normal,
             Flow::Break => Flow::Break,
             Flow::Return(v) => Flow::Return(v.clone()),
+            Flow::Suspend => Flow::Suspend,
         }
     }
 }
@@ -139,6 +145,10 @@ pub struct Interp<'a, D: Domain> {
     pub merge_fallbacks: usize,
     /// Literal splits handed out: the ids in `State::frag`.
     next_split: usize,
+    /// The STAGE being traced (`trace::stage`): which cuts end it. `None`
+    /// outside a multi-stage kernel trace, where a `_hint_normalize()` is
+    /// never a cut.
+    pub stage: Option<super::stage::StageCtx<D>>,
 }
 
 impl<'a, D: Domain> Interp<'a, D> {
@@ -166,6 +176,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             room_flags: std::collections::HashMap::new(),
             merge_fallbacks: 0,
             next_split: 0,
+            stage: None,
         }
     }
 
@@ -304,6 +315,28 @@ impl<'a, D: Domain> Interp<'a, D> {
             .collect()
     }
 
+    /// Intern every function body of a program chunk, in syntactic order,
+    /// before it runs: a body's id is then a function of the source, not of
+    /// which tracer evaluated which `function` first. A continuation names
+    /// bodies by id (`stage::At::Call`, a closure in a local), and a stage is
+    /// resumed in a copy of another tracer (`kernel::room_constant_lattice`).
+    pub fn intern_all(&mut self, chunk: &'a ast::Ast) {
+        use full_moon::visitors::Visitor;
+        #[derive(Default)]
+        struct Bodies(Vec<*const ast::FunctionBody>);
+        impl Visitor for Bodies {
+            fn visit_function_body(&mut self, b: &ast::FunctionBody) {
+                self.0.push(b as *const ast::FunctionBody);
+            }
+        }
+        let mut v = Bodies::default();
+        v.visit_ast(chunk);
+        for b in v.0 {
+            // SAFETY: `b` points into `chunk`, which lives for `'a`.
+            self.intern_body(unsafe { &*b });
+        }
+    }
+
     fn intern_body(&mut self, b: &'a ast::FunctionBody) -> BodyId {
         // By POINTER: the AST outlives the interpreter and never moves,
         // so the address is a stable name for the syntax. Two closures
@@ -354,8 +387,17 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     fn exec_block_flat(&mut self, block: &'a ast::Block, st: State<D>) -> Result<Outcome<D>> {
-        let mut live: Outcome<D> = vec![(st, Flow::Normal)];
-        for stmt in block.stmts() {
+        self.exec_stmts(block, 0, vec![(st, Flow::Normal)])
+    }
+
+    /// Run `block`'s statements from `from` on, then its last statement, on
+    /// the states of `live` that are still running: a block from the top,
+    /// or the rest of one a stage resumes in (`resume_block`).
+    fn exec_stmts(&mut self, block: &'a ast::Block, from: usize, mut live: Outcome<D>) -> Result<Outcome<D>> {
+        for (index, stmt) in block.stmts().enumerate().skip(from) {
+            if live.iter().all(|(_, f)| !f.is_normal()) {
+                break;
+            }
             let mut next: Outcome<D> = Vec::new();
             for (s, f) in live {
                 if !f.is_normal() {
@@ -369,7 +411,8 @@ impl<'a, D: Domain> Interp<'a, D> {
                 if self.d.decide(&s.guard) == Some(false) {
                     continue;
                 }
-                next.extend(self.exec_stmt(stmt, s)?);
+                let out = self.exec_stmt(stmt, s)?;
+                next.extend(Self::suspended_at(out, |s| super::stage::At::Stmt { index: index as u32, scope: s.scope }));
             }
             live = self.collapse(next)?;
             if live.len() > self.max_states {
@@ -379,6 +422,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                         Flow::Normal => "normal",
                         Flow::Break => "break",
                         Flow::Return(_) => "return",
+                        Flow::Suspend => "suspend",
                     };
                     let _ = st;
                     *hist.entry(k).or_default() += 1;
@@ -399,9 +443,6 @@ impl<'a, D: Domain> Interp<'a, D> {
                     self.d.node_count()
                 );
             }
-            if live.iter().all(|(_, f)| !f.is_normal()) {
-                break;
-            }
         }
         if let Some(last) = block.last_stmt() {
             let mut next: Outcome<D> = Vec::new();
@@ -415,6 +456,21 @@ impl<'a, D: Domain> Interp<'a, D> {
             live = next;
         }
         Ok(live)
+    }
+
+    /// Each outcome a level passes SUSPENDED gets that level pushed onto its
+    /// continuation (`trace::stage::At`, innermost first): where it was, for
+    /// the resume.
+    fn suspended_at(out: Outcome<D>, at: impl Fn(&State<D>) -> super::stage::At) -> Outcome<D> {
+        out.into_iter()
+            .map(|(mut s, f)| {
+                if let Flow::Suspend = f {
+                    let a = at(&s);
+                    s.cont.as_mut().expect("a suspended state carries its continuation").frames.push(a);
+                }
+                (s, f)
+            })
+            .collect()
     }
 
     fn exec_last(&mut self, last: &'a ast::LastStmt, st: State<D>) -> Result<Outcome<D>> {
@@ -502,11 +558,22 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
                 Ok(out.into_iter().map(|s| (s, Flow::Normal)).collect())
             }
-            ast::Stmt::FunctionCall(call) => Ok(self
-                .eval_call(call, st)?
-                .into_iter()
-                .map(|(s, _)| (s, Flow::Normal))
-                .collect()),
+            ast::Stmt::FunctionCall(call) => {
+                if let Some(cut) = self.cut_at(call, &st) {
+                    return Ok(vec![(self.suspend(st, cut)?, Flow::Suspend)]);
+                }
+                // A call statement is the one place a stage may stop inside
+                // a call: its value is dropped, so the rest of the caller is
+                // all a resume has to run (`walk_suffixes` refuses the rest).
+                Ok(self
+                    .walk_suffixes(call.prefix(), &call.suffixes().collect::<Vec<_>>(), st, true)?
+                    .into_iter()
+                    .map(|(s, _)| {
+                        let f = if s.cont.is_some() { Flow::Suspend } else { Flow::Normal };
+                        (s, f)
+                    })
+                    .collect())
+            }
             ast::Stmt::FunctionDeclaration(f) => {
                 let body = self.intern_body(f.body());
                 let mut s = st;
@@ -529,6 +596,129 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
     }
 
+    /// The cut this call statement is, if the stage being traced stops there:
+    /// a bare `_hint_normalize()` at a cut's object (`stage::cut_at`).
+    fn cut_at(&self, call: &ast::FunctionCall, st: &State<D>) -> Option<u32> {
+        let ctx = self.stage.as_ref()?;
+        let ast::Prefix::Name(t) = call.prefix() else { return None };
+        if ident(t).ok()? != "_hint_normalize" {
+            return None;
+        }
+        let mut suffixes = call.suffixes();
+        match (suffixes.next(), suffixes.next()) {
+            (Some(ast::Suffix::Call(ast::Call::AnonymousCall(ast::FunctionArgs::Parentheses { arguments, .. }))), None)
+                if arguments.is_empty() => {}
+            _ => return None,
+        }
+        super::stage::cut_at(st, ctx.cuts)
+    }
+
+    /// End the stage at cut `cut`: the state leaves with a continuation that
+    /// every level it unwinds through adds itself to (`Flow::Suspend`).
+    ///
+    /// The row it becomes has no column for the buttons: every stage starts
+    /// with the reset, as every frame does (`verify::trace_frame`), so a
+    /// button this stage READ would be read again, independently, by the next
+    /// - two choices for one frame's input. Refused rather than assumed: the
+    /// buttons must be exactly what the reset left.
+    fn suspend(&mut self, st: State<D>, cut: u32) -> Result<State<D>> {
+        let ctx = self.stage.as_ref().expect("a cut is only found while tracing a stage");
+        ensure!(
+            cut > ctx.stage,
+            "cut {cut} reached in stage {} of its frame: a frame passes each cut once, in order",
+            ctx.stage
+        );
+        ensure!(st.frag.is_empty(), "a stage cut inside a literal split");
+        let buttons = match st.heap.tables[&st.globals].hash.get("__button_states") {
+            Some(Value::Table(b)) => st.heap.tables[b].arr.clone(),
+            _ => Vec::new(),
+        };
+        ensure!(buttons == ctx.buttons, "a stage cut after a button was read: the next stage would choose it again");
+        let mut st = st;
+        st.cont = Some(super::stage::Cont { stage: 0, cut: Some(cut), frames: Vec::new(), key: String::new() });
+        Ok(st)
+    }
+
+    /// Run the rest of the frame a stage stopped at a cut (`trace::stage`):
+    /// `top` is the frame chunk, `frames` the continuation (innermost first).
+    /// Each level carries on where it was, then as if it had never stopped.
+    pub fn resume(&mut self, top: &'a ast::Block, frames: &[At], st: State<D>) -> Result<Outcome<D>> {
+        let outer = st.scope;
+        let path: Vec<At> = frames.iter().rev().cloned().collect();
+        self.resume_block(top, &path, st, outer)
+    }
+
+    /// Resume in `block` at the statement `path` starts with, then run the
+    /// statements after it; the block's outcomes leave in scope `outer`.
+    fn resume_block(&mut self, block: &'a ast::Block, path: &[At], mut st: State<D>, outer: ScopeId) -> Result<Outcome<D>> {
+        let Some((At::Stmt { index, scope }, rest)) = path.split_first() else {
+            bail!("a continuation level {:?} where a statement was expected", path.first());
+        };
+        let index = *index as usize;
+        let stmt = block
+            .stmts()
+            .nth(index)
+            .ok_or_else(|| anyhow!("a continuation at statement {index} of a block of {}", block.stmts().count()))?;
+        st.scope = *scope;
+        let inner = self.resume_stmt(stmt, rest, st)?;
+        let inner = Self::suspended_at(inner, |s| At::Stmt { index: index as u32, scope: s.scope });
+        let inner = self.collapse(inner)?;
+        let mut out = self.exec_stmts(block, index + 1, inner)?;
+        for (s, _) in out.iter_mut() {
+            s.scope = outer;
+        }
+        Ok(out)
+    }
+
+    /// Resume inside `stmt` along `path`; an empty path is the cut itself,
+    /// which has run.
+    fn resume_stmt(&mut self, stmt: &'a ast::Stmt, path: &[At], mut st: State<D>) -> Result<Outcome<D>> {
+        let Some((at, rest)) = path.split_first() else {
+            return Ok(vec![(st, Flow::Normal)]);
+        };
+        match (stmt, at) {
+            (ast::Stmt::If(iff), At::Arm(a)) => {
+                let elseifs: Vec<&'a ast::ElseIf> = iff.else_if().map(|e| e.iter().collect()).unwrap_or_default();
+                let blk = match *a as usize {
+                    0 => iff.block(),
+                    k if k <= elseifs.len() => elseifs[k - 1].block(),
+                    k if k == elseifs.len() + 1 => iff.else_block().ok_or_else(|| anyhow!("a continuation in the else of an if without one"))?,
+                    k => bail!("a continuation in arm {k} of an if with {} arms", elseifs.len() + 1),
+                };
+                let outer = st.scope;
+                let out = self.resume_block(blk, rest, st, outer)?;
+                Ok(Self::suspended_at(out, |_| At::Arm(*a)))
+            }
+            (ast::Stmt::NumericFor(f), At::Loop { next, to }) => {
+                let name = ident(f.index_variable())?;
+                let (next, to) = (P8::from_raw(*next), P8::from_raw(*to));
+                let outer = st.scope;
+                let (mut done, mut again) = (Vec::new(), Vec::new());
+                for (s, fl) in self.resume_block(f.block(), rest, st, outer)? {
+                    Self::after_body(s, fl, next, to, &mut done, &mut again);
+                }
+                done.extend(self.run_for(f, &name, next, to, again)?);
+                Ok(done)
+            }
+            (ast::Stmt::FunctionCall(_), At::Call(body)) => {
+                let b = *self.bodies.get(*body as usize).ok_or_else(|| anyhow!("a continuation in function body {body}, which this tracer does not have"))?;
+                let outer = st.scope;
+                st.stack.push(outer);
+                let atoms_before = self.d.atoms_minted();
+                let flows = self.resume_block(b.block(), rest, st, outer)?;
+                Ok(self
+                    .return_from(*body, outer, flows, atoms_before)?
+                    .into_iter()
+                    .map(|(s, _)| {
+                        let f = if s.cont.is_some() { Flow::Suspend } else { Flow::Normal };
+                        (s, f)
+                    })
+                    .collect())
+            }
+            (stmt, at) => bail!("a continuation level {at:?} at a statement it does not fit: {}", stmt.to_string().trim()),
+        }
+    }
+
     /// `if` is where the tracer stops being an interpreter. A condition the
     /// domain can decide just takes its arm - most of them, because the
     /// heap is concrete. One it cannot runs BOTH arms from a copy of the
@@ -543,18 +733,21 @@ impl<'a, D: Domain> Interp<'a, D> {
                 arms.push((ei.condition(), ei.block()));
             }
         }
-        self.exec_arms(&arms, iff.else_block(), st)
+        self.exec_arms(&arms, iff.else_block(), st, 0)
     }
 
+    /// The arms from `arms[0]`, which is arm number `arm` of its `if` (the
+    /// `else` is the last number): what a suspended stage records.
     fn exec_arms(
         &mut self,
         arms: &[(&'a ast::Expression, &'a ast::Block)],
         els: Option<&'a ast::Block>,
         st: State<D>,
+        arm: u32,
     ) -> Result<Outcome<D>> {
         let Some(((cond_e, blk), rest)) = arms.split_first() else {
             return Ok(match els {
-                Some(b) => self.exec_block(b, st)?,
+                Some(b) => self.exec_arm(b, arm, st)?,
                 None => vec![(st, Flow::Normal)],
             });
         };
@@ -562,8 +755,8 @@ impl<'a, D: Domain> Interp<'a, D> {
         for (s, cv) in self.eval(cond_e, st)? {
             let cond = self.truthy(&cv);
             out.extend(match self.decide(&cond) {
-                Some(true) => self.exec_block(blk, s)?,
-                Some(false) => self.exec_arms(rest, els, s)?,
+                Some(true) => self.exec_arm(blk, arm, s)?,
+                Some(false) => self.exec_arms(rest, els, s, arm + 1)?,
                 None => {
                     // Each arm only happens under its own condition, so
                     // record that before running it. A merge puts the
@@ -571,11 +764,11 @@ impl<'a, D: Domain> Interp<'a, D> {
                     // original condition.
                     let (ts, fs) = split(&mut self.d, s, &cond);
                     let t = match ts {
-                        Some(x) => self.exec_block(blk, x)?,
+                        Some(x) => self.exec_arm(blk, arm, x)?,
                         None => Vec::new(),
                     };
                     let f = match fs {
-                        Some(x) => self.exec_arms(rest, els, x)?,
+                        Some(x) => self.exec_arms(rest, els, x, arm + 1)?,
                         None => Vec::new(),
                     };
                     // One side dead means no branch really happened.
@@ -594,6 +787,10 @@ impl<'a, D: Domain> Interp<'a, D> {
             });
         }
         Ok(out)
+    }
+
+    fn exec_arm(&mut self, blk: &'a ast::Block, arm: u32, st: State<D>) -> Result<Outcome<D>> {
+        Ok(Self::suspended_at(self.exec_block(blk, st)?, |_| super::stage::At::Arm(arm)))
     }
 
     /// Merge every pair of outcomes that can be merged, to a fixpoint.
@@ -702,7 +899,9 @@ impl<'a, D: Domain> Interp<'a, D> {
     fn can_join(&self, a: &Flow<D>, b: &Flow<D>) -> bool {
         match (a, b) {
             (Flow::Return(x), Flow::Return(y)) => joinable(x, y),
-            (Flow::Break, Flow::Break) | (Flow::Normal, Flow::Normal) => true,
+            // Two suspended states merge where they stopped at the same place
+            // (`state::merge` compares the continuations).
+            (Flow::Break, Flow::Break) | (Flow::Normal, Flow::Normal) | (Flow::Suspend, Flow::Suspend) => true,
             _ => false,
         }
     }
@@ -727,6 +926,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 Flow::Return(self.join_value(cond, &x.clone(), &y.clone()))
             }
             (Flow::Break, _) => Flow::Break,
+            (Flow::Suspend, _) => Flow::Suspend,
             _ => Flow::Normal,
         }
     }
@@ -781,7 +981,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
         for (s, b) in bounds {
             all.extend(match b {
-                Bound::Concrete(from, to) => self.run_for(f, &name, from, to, s)?,
+                Bound::Concrete(from, to) => self.run_for(f, &name, from, to, vec![(s, Flow::Normal)])?,
                 Bound::Symbolic(start, limit) => {
                     let limit_src = f.end().to_string().trim().to_string();
                     let n = unroll_bound(&limit_src).ok_or_else(|| {
@@ -866,6 +1066,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                     Flow::Break => done.push((s, Flow::Normal)),
                     Flow::Return(v) => done.push((s, Flow::Return(v))),
                     Flow::Normal => running.push((s, Flow::Normal)),
+                    // Its next index is symbolic, which a continuation (a
+                    // shape) cannot hold.
+                    Flow::Suspend => bail!("a stage cut inside a loop with a symbolic bound"),
                 }
             }
         }
@@ -908,20 +1111,22 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(out)
     }
 
+    /// A numeric `for` with concrete bounds, from index `from`, on the
+    /// states of `running`: a loop from its start, or the rest of one a stage
+    /// resumes in.
     fn run_for(
         &mut self,
         f: &'a ast::NumericFor,
         name: &str,
         from: P8,
         to: P8,
-        s: State<D>,
+        mut running: Outcome<D>,
     ) -> Result<Outcome<D>> {
 
         // A `break` ends the LOOP for that state, not the state: it moves
         // to `done` and carries on after the loop. Getting this wrong the
         // first time made `break` a no-op, so `foreach`'s bounded walk ran
         // its full 32767 iterations instead of stopping.
-        let mut running: Outcome<D> = vec![(s, Flow::Normal)];
         let mut done: Outcome<D> = Vec::new();
         let one = P8::from_i16(1);
         let mut i = from;
@@ -939,11 +1144,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 cur.scope = body_scope;
                 for (mut s2, f2) in self.exec_block(f.block(), cur)? {
                     s2.scope = outer;
-                    match f2 {
-                        Flow::Break => done.push((s2, Flow::Normal)),
-                        Flow::Return(v) => done.push((s2, Flow::Return(v))),
-                        Flow::Normal => next.push((s2, Flow::Normal)),
-                    }
+                    Self::after_body(s2, f2, i + one, to, &mut done, &mut next);
                 }
             }
             running = next;
@@ -952,6 +1153,21 @@ impl<'a, D: Domain> Interp<'a, D> {
         // Whatever was still going when the bound ran out just continues.
         done.extend(running.into_iter().map(|(s, _)| (s, Flow::Normal)));
         Ok(done)
+    }
+
+    /// Where one outcome of a loop body goes: out of the loop (a `break`, a
+    /// `return`, a suspended stage - which records that the loop goes on at
+    /// `next`) or round again.
+    fn after_body(s: State<D>, f: Flow<D>, next: P8, to: P8, done: &mut Outcome<D>, again: &mut Outcome<D>) {
+        match f {
+            Flow::Break => done.push((s, Flow::Normal)),
+            Flow::Return(v) => done.push((s, Flow::Return(v))),
+            Flow::Normal => again.push((s, Flow::Normal)),
+            Flow::Suspend => done.extend(Self::suspended_at(vec![(s, Flow::Suspend)], |_| super::stage::At::Loop {
+                next: next.as_raw_u32() as i32,
+                to: to.as_raw_u32() as i32,
+            })),
+        }
     }
 
     // ------------------------------------------------------- expressions
@@ -1067,7 +1283,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
                 ast::Var::Expression(ve) => {
                     let suffixes: Vec<_> = ve.suffixes().collect();
-                    self.walk_suffixes(ve.prefix(), &suffixes, st)
+                    self.walk_suffixes(ve.prefix(), &suffixes, st, false)
                 }
                 other => bail!("unsupported var {:?}", other),
             },
@@ -1405,11 +1621,17 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     /// Walk a prefix and its suffixes as an rvalue.
+    ///
+    /// `stmt`: this is a call STATEMENT, whose last call may suspend the
+    /// stage (`trace::stage`); a suspension anywhere else - inside an
+    /// expression, where the resume would have to finish evaluating it -
+    /// refuses the trace.
     fn walk_suffixes(
         &mut self,
         p: &'a ast::Prefix,
         suffixes: &[&'a ast::Suffix],
         st: State<D>,
+        stmt: bool,
     ) -> Result<Multi<D, Value<D>>> {
         // A readable path, so "calling a non-function: nil" says WHICH
         // nil. Costs a string per suffix at trace time and nothing at run
@@ -1424,7 +1646,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             .into_iter()
             .map(|(s, v)| (s, (v, base.clone())))
             .collect();
-        for suffix in suffixes {
+        for (k, suffix) in suffixes.iter().enumerate() {
             let mut next: Multi<D, (Value<D>, String)> = Vec::new();
             for (st, (val, path)) in cur {
                 match suffix {
@@ -1462,6 +1684,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                             let got = self
                                 .call_value(val.clone(), args, st)
                                 .map_err(|e| anyhow!("calling {}: {:#}", path, e))?;
+                            if got.iter().any(|(s, _)| s.cont.is_some()) && !(stmt && k + 1 == suffixes.len()) {
+                                bail!("calling {path}: a stage cut inside an expression (only a call statement may stop a stage)");
+                            }
                             next.extend(
                                 got.into_iter().map(|(s, v)| (s, (v, format!("{}()", path)))),
                             );
@@ -1493,7 +1718,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                     bail!("assignment target with no suffixes")
                 };
                 let mut out = Vec::new();
-                for (st, target) in self.walk_suffixes(e.prefix(), init, st)? {
+                for (st, target) in self.walk_suffixes(e.prefix(), init, st, false)? {
                     match last {
                         ast::Suffix::Index(ast::Index::Dot { name, .. }) => {
                             out.push((st, Target::Field(target, Key::Field(ident(name)?))));
@@ -1567,7 +1792,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         st: State<D>,
     ) -> Result<Multi<D, Value<D>>> {
         let suffixes: Vec<_> = call.suffixes().collect();
-        self.walk_suffixes(call.prefix(), &suffixes, st)
+        self.walk_suffixes(call.prefix(), &suffixes, st, false)
     }
 
     /// A call is RECURSION - hand the callee the state, get it back. There
@@ -1604,31 +1829,40 @@ impl<'a, D: Domain> Interp<'a, D> {
                 st.stack.push(outer);
                 st.scope = frame;
                 let atoms_before = self.d.atoms_minted();
-                let mut out = Vec::new();
-                for (mut s, flow) in self.exec_block(b.block(), st)? {
-                    s.stack.pop();
-                    s.scope = outer;
-                    out.push(match flow {
-                        Flow::Return(v) => (s, v),
-                        Flow::Normal => (s, Value::Nil),
-                        Flow::Break => bail!("break outside a loop"),
-                    });
-                }
-                // The literal splits made inside this call rejoin as it
-                // returns (`rejoin_fragments`).
-                if out.iter().any(|(s, _)| s.frag.last().is_some_and(|f| f.0 > s.stack.len())) {
-                    out = self.rejoin_fragments(out)?;
-                }
-                // The atoms made inside this call do not escape it
-                // (`Domain::escaped_atom`).
-                if self.d.atoms_minted() > atoms_before {
-                    out = out.into_iter().map(|(s, v)| self.fork_escaped_atoms(s, v, atoms_before)).collect();
-                }
-                Ok(out)
+                let flows = self.exec_block(b.block(), st)?;
+                self.return_from(body, outer, flows, atoms_before)
             }
             Value::Builtin(name) => self.call_builtin(name, args, st),
             other => bail!("calling a non-function: {:?}", other),
         }
+    }
+
+    /// A function body's outcomes as its call's: back in the caller's scope
+    /// `outer`, with the value returned. A suspended one (`trace::stage`) keeps
+    /// its state marked by its continuation, which records the function it
+    /// stopped in; the caller's call statement passes it on.
+    fn return_from(&mut self, body: BodyId, outer: super::heap::ScopeId, flows: Outcome<D>, atoms_before: u32) -> Result<Multi<D, Value<D>>> {
+        let mut out = Vec::new();
+        for (mut s, flow) in Self::suspended_at(flows, |_| super::stage::At::Call(body)) {
+            s.stack.pop();
+            s.scope = outer;
+            out.push(match flow {
+                Flow::Return(v) => (s, v),
+                Flow::Normal | Flow::Suspend => (s, Value::Nil),
+                Flow::Break => bail!("break outside a loop"),
+            });
+        }
+        // The literal splits made inside this call rejoin as it
+        // returns (`rejoin_fragments`).
+        if out.iter().any(|(s, _)| s.frag.last().is_some_and(|f| f.0 > s.stack.len())) {
+            out = self.rejoin_fragments(out)?;
+        }
+        // The atoms made inside this call do not escape it
+        // (`Domain::escaped_atom`).
+        if self.d.atoms_minted() > atoms_before {
+            out = out.into_iter().map(|(s, v)| self.fork_escaped_atoms(s, v, atoms_before)).collect();
+        }
+        Ok(out)
     }
 
     /// Every heap boolean and the returned value that hold an atom made at or
@@ -2171,7 +2405,7 @@ mod tests {
         let scope = heap.new_scope(None);
         let t = d.boolean(true);
         let f = d.boolean(false);
-        State { heap, globals, scope, stack: Vec::new(), guard: t, ended: f, path: Vec::new(), key_override: Vec::new(), frag: Vec::new() }
+        State { heap, globals, scope, stack: Vec::new(), guard: t, ended: f, path: Vec::new(), key_override: Vec::new(), frag: Vec::new(), cont: None }
     }
 
     /// Run `src` and read back the global `result`.

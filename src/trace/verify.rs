@@ -163,13 +163,14 @@ pub fn run_one<'a, D: Domain>(
     ast: &'a ast::Ast,
     st: State<D>,
 ) -> Result<State<D>> {
+    it.intern_all(ast);
     let out = it.exec_block(ast.nodes(), st)?;
     if out.len() != 1 {
         bail!("expected one state, got {}", out.len());
     }
     let (s, f) = out.into_iter().next().unwrap();
-    if let Flow::Break = f {
-        bail!("break at chunk toplevel");
+    if let Flow::Break | Flow::Suspend = f {
+        bail!("break or a stage cut at chunk toplevel");
     }
     Ok(s)
 }
@@ -360,8 +361,32 @@ pub fn trace_frame<'a>(
             admissible = it.d.graph.fold(crate::transpile::graph::Op::And, vec![admissible, ob]);
         }
     }
-    let st = run_one(it, reset, st)?;
-    let finished = it.exec_block(frame.nodes(), st)?;
+    // THE STAGE (`trace::stage`): the frame from its start, the rest of one
+    // this state stopped at a cut, or - its frame over early, or its cut a
+    // later stage's - nothing: it waits.
+    let per_frame = super::stage::per_frame();
+    let mut st = st;
+    let cont = st.cont.take();
+    let mut st = run_one(it, reset, st)?;
+    let stage = cont.as_ref().map_or(0, |c| c.stage);
+    it.stage = (per_frame > 1).then(|| super::stage::StageCtx {
+        stage,
+        cuts: super::stage::cuts(),
+        buttons: match iface::get(&st, &[iface::key("__button_states")]) {
+            Some(Value::Table(b)) => st.heap.tables[&b].arr.clone(),
+            _ => Vec::new(),
+        },
+    });
+    let finished = match cont {
+        None => it.exec_block(frame.nodes(), st),
+        Some(c) if c.cut == Some(stage) => it.resume(frame.nodes(), &c.frames, st),
+        Some(c) => {
+            st.cont = Some(c);
+            Ok(vec![(st, Flow::Normal)])
+        }
+    };
+    it.stage = None;
+    let finished = finished?;
     // The error of the whole frame, OR-ed into every outcome's: inputs this
     // kernel was not built for.
     let global = {
@@ -370,11 +395,26 @@ pub fn trace_frame<'a>(
     };
     let mut outs = Vec::new();
     for (s, f) in finished {
-        if let Flow::Break = f {
-            bail!("break at frame toplevel");
-        }
         let mut s = s;
+        // Where the outcome stands after this stage: at a cut (the stage
+        // that runs next resumes it), its frame over with stages left (it
+        // waits), or at the frame's end.
+        s.cont = match f {
+            Flow::Break => bail!("break at frame toplevel"),
+            Flow::Suspend | Flow::Normal | Flow::Return(_) => match s.cont.take() {
+                Some(mut c) => {
+                    c.stage = stage + 1;
+                    (c.stage < per_frame || c.cut.is_some()).then_some(c)
+                }
+                None => (stage + 1 < per_frame).then(|| super::stage::Cont { stage: stage + 1, cut: None, frames: Vec::new(), key: String::new() }),
+            },
+        };
         s.gc();
+        if let Some(mut c) = s.cont.take() {
+            anyhow::ensure!(c.stage < per_frame, "a state past the frame's last stage ({c:?})");
+            c.key = super::stage::key(&s, &it.d, &c)?;
+            s.cont = Some(c);
+        }
         // The absent-as-zero fields (`widen::ABSENT_AS_ZERO`), at every
         // level: part of the shape, not of the precision.
         super::widen::materialize_absent_fields(&mut s, &mut it.d)?;

@@ -225,6 +225,7 @@ pub fn to_trace_state(
         path: Vec::new(),
         key_override: Vec::new(),
         frag: Vec::new(),
+        cont: None,
     })
 }
 

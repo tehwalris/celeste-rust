@@ -536,6 +536,9 @@ pub struct Shape {
     /// Canonical (BFS-numbered) closures: their body, and the canonical
     /// number of the scope they captured.
     pub closures: Vec<(BodyId, u32)>,
+    /// Between two stages of a frame, the continuation's key
+    /// (`trace::stage::key`); set by `State::shape`.
+    pub cont: Option<String>,
 }
 
 impl<D: Domain> Heap<D> {

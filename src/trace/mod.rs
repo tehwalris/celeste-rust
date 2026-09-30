@@ -65,6 +65,7 @@ pub mod kernel;
 pub mod interp;
 pub mod level_minus_one;
 pub mod shapes;
+pub mod stage;
 pub mod probe;
 pub mod state;
 pub mod verify;

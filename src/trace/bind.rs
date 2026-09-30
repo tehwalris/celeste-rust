@@ -138,6 +138,12 @@ pub fn structure_of(
         }
     }
     rt2.globals = globals;
+    // Between two stages of a frame: where (`trace::stage`), as part of the
+    // shape. Only a finished stage's continuation has its key.
+    if let Some(c) = &st.cont {
+        anyhow::ensure!(!c.key.is_empty(), "the structure of a state whose stage is still unwinding");
+        rt2.cont = c.hash();
+    }
 
     let mut c = 0usize;
     while c < rt2.structure.len() {

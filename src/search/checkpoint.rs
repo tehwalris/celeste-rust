@@ -40,7 +40,10 @@ const MAGIC: &[u8; 4] = b"C8TB";
 /// its stable id `(layer, file seq, row)` from the moment it is admitted;
 /// the cell index lists RUNS `(cell, start, len)` instead of one range per
 /// cell; win rows carry their cell. A v8 tree is refused.
-pub const FORMAT_VERSION: u32 = 9;
+/// 9 -> 10: the header carries the block's continuation (`Rt2::cont`, a
+/// state between two stages of a frame), which its shape hash includes. A
+/// v9 tree is refused.
+pub const FORMAT_VERSION: u32 = 10;
 
 /// Where one column lives: uniform (in the header) or raw in the data
 /// region at a byte offset, `width` entries of the kind's fixed width.
@@ -67,6 +70,7 @@ struct Header {
     globals: Vec<u32>,
     strings: Vec<String>,
     prints: Vec<String>,
+    cont: u64,
     shape_hash: u64,
     cols: Vec<ColMeta>,
     /// Data offset of the key column, 16 bytes per row.
@@ -173,6 +177,7 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
         globals: rt2.globals.clone(),
         strings: rt2.strings.clone(),
         prints: rt2.prints.clone(),
+        cont: rt2.cont,
         shape_hash: rt2.shape_hash,
         cols,
         keys: keys_off,
@@ -373,6 +378,7 @@ impl FrameFile {
         let mut rt2 = Rt2::empty(total, h.globals.len(), &[], cart, cache);
         rt2.structure = h.structure.clone();
         rt2.globals = h.globals.clone();
+        rt2.cont = h.cont;
         rt2.strings = h.strings.clone();
         rt2.prints = h.prints.clone();
         rt2.shape_hash = h.shape_hash;

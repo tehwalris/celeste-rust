@@ -153,6 +153,13 @@ impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
         lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
     ) -> Result<()> {
+        // It runs whole frames, on the interpreter's `State`, which has no
+        // continuation: a search step is a frame only without cuts.
+        anyhow::ensure!(
+            crate::trace::stage::per_frame() == 1,
+            "the reference engine steps whole frames; this run splits them at {:?}",
+            crate::trace::stage::cuts()
+        );
         let mut engine = self.lock().expect("reference engine lock");
         // The reference runs on interpreter `State`s: cross the bridge both
         // ways. `Block::from_state` keys each leaf by the one canonical rule,

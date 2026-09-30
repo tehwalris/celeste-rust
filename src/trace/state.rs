@@ -110,6 +110,12 @@ pub struct State<D: Domain> {
     /// merge in `collapse`, and rejoin when the call that split them returns
     /// (`Interp::rejoin_fragments`).
     pub frag: Vec<(usize, usize, u16)>,
+    /// Where this state stands between two STAGES of its frame
+    /// (`trace::stage`): `None` at a frame boundary (and while a stage runs).
+    /// A stage that stops at a cut unwinds with it set, each level pushing
+    /// where it was; its scopes are GC roots, and two states merge only at
+    /// the same place (`Cont::same_place`).
+    pub cont: Option<super::stage::Cont>,
 }
 
 /// How many leading decisions two states share.
@@ -173,6 +179,7 @@ impl<D: Domain> Clone for State<D> {
             path: self.path.clone(),
             key_override: self.key_override.clone(),
             frag: self.frag.clone(),
+            cont: self.cont.clone(),
         }
     }
 }
@@ -181,14 +188,20 @@ impl<D: Domain> State<D> {
     pub fn roots(&self) -> Vec<Root> {
         let mut r = vec![Root::Table(self.globals), Root::Scope(self.scope)];
         r.extend(self.stack.iter().map(|s| Root::Scope(*s)));
+        if let Some(c) = &self.cont {
+            r.extend(c.scopes().map(Root::Scope));
+        }
         r
     }
     pub fn gc(&mut self) {
         let r = self.roots();
         self.heap.gc(&r);
     }
+    /// The heap's shape and, between stages, the continuation's key.
     pub fn shape(&self) -> Result<Shape> {
-        self.heap.shape(&self.roots())
+        let mut s = self.heap.shape(&self.roots())?;
+        s.cont = self.cont.as_ref().map(|c| c.key.clone());
+        Ok(s)
     }
 
     /// The DECISIONS this state's path took, as one condition: where an
@@ -258,7 +271,7 @@ pub enum Sides<'c> {
 /// a third of the room walk (room (3,0), 2026-09-18). Anything else
 /// (a temporary allocated, a different numbering) pairs by `Canon`.
 pub fn same_heap<D: Domain>(t: &State<D>, f: &State<D>) -> bool {
-    t.globals == f.globals && t.scope == f.scope && t.stack == f.stack && t.frag == f.frag && t.heap.same_as(&f.heap)
+    t.globals == f.globals && t.scope == f.scope && t.stack == f.stack && t.frag == f.frag && t.cont == f.cont && t.heap.same_as(&f.heap)
 }
 
 /// What a merge compares and pairs a state by: its shape, and the canonical
@@ -299,6 +312,13 @@ fn merge_inner<D: Domain>(
     // call that split them returns.
     if t.frag != f.frag {
         return Ok(None);
+    }
+    // Two states stopped at different places in their frame are different
+    // successors.
+    match (&t.cont, &f.cont) {
+        (None, None) => {}
+        (Some(a), Some(b)) if a.same_place(b) => {}
+        _ => return Ok(None),
     }
     if matches!(sides, Sides::Canon(ct, cf) if ct.shape != cf.shape) {
         return Ok(None);
@@ -419,6 +439,7 @@ fn merge_inner<D: Domain>(
         path,
         key_override: t.key_override.clone(),
         frag: t.frag.clone(),
+        cont: t.cont.clone(),
     };
     Ok(Some(Merged { state, cond: cond.clone(), fell_back, selects, first_select }))
 }
@@ -537,7 +558,7 @@ mod tests {
     #[test]
     fn where_a_path_ended_merges_per_case() {
         let mut d = Symbolic::default();
-        let mut t: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        let mut t: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new(), cont: None };
         t.globals = t.heap.new_table();
         t.scope = t.heap.new_scope(None);
         let mut f = t.clone();
@@ -568,6 +589,7 @@ mod tests {
             path: Vec::new(),
             key_override: Vec::new(),
             frag: Vec::new(),
+            cont: None,
         };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
@@ -620,7 +642,7 @@ mod tests {
     #[test]
     fn a_merge_selects_on_the_separating_decision_not_the_guard() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new(), cont: None };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let a = d.num(P8::from_i16(1));
@@ -651,7 +673,7 @@ mod tests {
 
         // Two states whose paths do not diverge at one shared decision
         // fall back to the full guard, which is always correct.
-        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ended: d.boolean(false), path: vec![(g, true)], key_override: Vec::new(), frag: Vec::new() };
+        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ended: d.boolean(false), path: vec![(g, true)], key_override: Vec::new(), frag: Vec::new(), cont: None };
         p.globals = p.heap.new_table();
         p.scope = p.heap.new_scope(None);
         let mut q = p.clone();
@@ -666,7 +688,7 @@ mod tests {
     #[test]
     fn differing_shapes_do_not_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new(), cont: None };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let obj = s.heap.new_table();
@@ -691,7 +713,7 @@ mod tests {
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new(), cont: None };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let mut f = s.clone();
