@@ -1,0 +1,19 @@
+# Room (0,1) "900 m": exit at frame 100 for celeste-minimal, found by the
+# search (2026-10-01). Balloon seeds [0, 0.8905] (TAS9's), [0, 0] and PICO-8's
+# own rnd all exit; [0.5, 0.5] does not:
+#   pico8_diff/replay.py --room 0,1 --balloon-seeds 0,0.8905 tas/room_0_1_exit_frame_100.txt
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 0,1, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search: no split frame, ladder r0sxhn, r1sxhn, r1sxh, r2sxh .. r15sxh, rxsx
+# at horizon 100: the objects (springs' and balloons' phases, balloons'
+# respawn timers) widened at rem Bits(0) AND Bits(1), exact from there. First
+# wins: 66, 94, 94, 96, 98, 99 x5, then 100 from rem Bits(9) up to Exact -
+# no exit before frame 100 for any balloon seed (the phase is an interval at
+# every level). `OPTIMAL win frame: 100`. Witness: `rewrite witness
+# --horizon 100 --level 17`, 344 concrete steps, 0 dead ends; on a real
+# PICO-8 (celeste-minimal) f99 player 31,-2, f100 room 1,1. TIES the community
+# TAS9 (100, tas/room_0_1_reference_frame_100.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,16,0,0,34,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,2,0,0,0,1,1,1,0,1,1,1,1,1,1,36,0,0,0,0,0,0,1,1,1,1,1,37,0,0,0,0,0,0,0,0,16,0,0,0,0,0,16,0,0,0
