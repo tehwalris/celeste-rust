@@ -1,0 +1,20 @@
+# Room (2,1) "1100 m": exit at frame 82 for celeste-minimal, found by the
+# search (2026-10-01). Balloon seeds [0, 0.8905] (TAS11's), [0], [0.5] and
+# PICO-8's own rnd all exit:
+#   pico8_diff/replay.py --room 2,1 --balloon-seeds 0,0.8905 tas/room_2_1_exit_frame_82.txt
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 2,1, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search: no split frame, ladder r0sxhnp, r0sxhn, r1sxhn .. r8sxhn, r8sxh ..
+# r15sxh, rxsx at horizon 82: level 0 with every object abstract (the four
+# fall floors, the balloon's phases and bob, the platform's position), the
+# platform exact from level 1, the floors and balloon through rem Bits(8).
+# First wins: 72, 74, 77, 78, 79, 81 x3, then 82 from rem Bits(7) up to
+# Exact - no exit before frame 82 for any balloon seed. `OPTIMAL win frame:
+# 82`. Witness: `rewrite witness --horizon 82 --level 18`, 322 concrete
+# steps, 0 dead ends; on a real PICO-8 (celeste-minimal) f81 player (95,-2),
+# f82 room (3,1). TIES the community TAS11 (82,
+# tas/room_2_1_reference_frame_82.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,2,2,2,2,2,2,2,18,2,2,2,2,2,38,0,0,0,0,0,0,16,0,0,16,0,0,0,0,0,0,16,0,0,0,2,16,0,0,36,0,0,0,0,0,0,2,2,0,16,0,0,0,0,16,0
