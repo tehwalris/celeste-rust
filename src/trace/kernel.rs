@@ -1726,6 +1726,35 @@ mod tests {
         assert!(checked > 0, "no outcome with a player");
     }
 
+    /// A near level (`r0sxhn`) over room (6,1)'s five fall floors side by
+    /// side: an overlapped floor stores the cart's invariant (hidden), not
+    /// what its update computed (`widen::widen_near_floors`), so the split
+    /// pass resolves only what the player's collisions read - each floor
+    /// solid or not. Storing the computed value split every floor's whole
+    /// update over every floor a region's player might overlap: region (3,6)
+    /// 3,638 outcomes in one frame, region (4,6) past the 4,096 cap, the
+    /// room's kernels unbuildable (2026-10-01).
+    #[test]
+    fn near_floors_side_by_side_split_only_what_collisions_read() {
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
+            return;
+        }
+        std::env::set_var("CELESTE_START_ROOM", "6,1");
+        std::env::set_var("CELESTE_WALK_REGIONS", "(3,6) (4,6)");
+        let opts = crate::trace::shapes::WalkOpts::level0(crate::interpreter::abstraction::SpdPrecision::Exact, crate::interpreter::abstraction::PosPrecision::EXACT)
+            .with_held(true)
+            .with_floor_timers(true)
+            .with_floors_near(true);
+        let lw = super::room_constant_lattice(std::path::Path::new("."), opts).unwrap_or_else(|e| panic!("{e:#}"));
+        let mut traced = 0;
+        for ((shape, region), f) in &lw.frames {
+            let Some(r) = region else { continue };
+            assert!(f.frame.outs.len() <= 256, "shape {shape} region ({},{}): {} outcomes", r.ix, r.iy, f.frame.outs.len());
+            traced += 1;
+        }
+        assert!(traced >= 2, "{traced} (shape, region) nodes traced");
+    }
+
     /// A player that is not dashing starts a dash in every direction or in
     /// none: the direction is the buttons alone. The successor reader once
     /// deduplicated button configurations by node ids across separately

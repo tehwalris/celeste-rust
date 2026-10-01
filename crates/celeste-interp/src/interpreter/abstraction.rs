@@ -413,7 +413,8 @@ impl FruitPrecision {
 /// `state` and `collideable` widened as `Unknown` widens them - `state` the
 /// interval [0, 2], `collideable` unknown - EXCEPT where the player overlaps
 /// the floor at the end of the frame (`runtime2::floor_player_window`), where
-/// they stay exact (`widen::widen_near_floors`): at `Unknown`, a player that
+/// they stay exact - hidden, the cart's invariant there, owed by the
+/// widening (`widen::widen_near_floors`): at `Unknown`, a player that
 /// entered a hidden floor was refused every move once the floor read "maybe
 /// back", and sat inside it for good. The finer levels keep them exact.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -451,9 +451,28 @@ pub fn fork_near_floor_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Res
 /// check(player, 0, 0)` - its `delay` is not read while the player is inside
 /// (and an exact one could not be kept anyway: a floor the player enters was
 /// widened a frame before, and the mark filter keys a row by its projection,
-/// `Rt2::widen_to`, which has no history). Per lane: `Sel(overlap, computed,
-/// widened)`, the `state` always an interval column. The widened `state`
-/// contains the computed one, or the widening's own error says where not.
+/// `Rt2::widen_to`, which has no history). The widened `state` contains the
+/// computed one, or the widening's own error says where not.
+///
+/// What an overlapped floor stores is the CART'S INVARIANT, not the computed
+/// value: hidden, `state` 2 and `collideable` false - the player cannot step
+/// into a collideable floor, and a hidden one comes back only where the
+/// player does not overlap it - with the computed value checked against it
+/// as the widening's own error (strict: a lane where it may differ declines).
+/// Per lane: `Sel(overlap, 2, [0, 2])` and `Sel(overlap, false, unknown)`.
+/// Storing the computed value instead made every floor the region's player
+/// MIGHT overlap a stored field on every outcome, so the split pass
+/// (`verify::split_undecided_selects`) resolved each such floor's whole
+/// update - `state == 0 / 1 / 2` times `delay <= 0`, ~5 outcomes a floor -
+/// and multiplied them over the floors, though on any one lane all but the
+/// (at most two) floors the player overlaps store the widened value whatever
+/// they computed. Room (6,1), five floors side by side under its spawn: one
+/// region's player half split 4,614 times into 3,638 outcomes (344k bodies),
+/// four regions past the 4,096 cap; with the invariant stored, 108 outcomes
+/// (5,454 bodies): only what the player's collisions read - each floor solid
+/// or not - is still split. Exactly what the mark filter's projection of a
+/// concrete row holds there (`Rt2::widen_to` keeps an overlapped floor as it
+/// is, and in the game it is hidden).
 fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
     use super::domain::Cmp;
     if !d.floors_near {
@@ -512,12 +531,21 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
             let held = d.or(&overlap, &holds);
             owe(errs, d, ps, held);
         }
+        // Overlapped: hidden, as the cart keeps it - owed, not assumed.
+        let apart = d.not(&overlap);
+        let two = d.num(P8::from_i16(2));
+        let hidden = d.compare(Cmp::Eq, &state, &two)?;
+        let held = d.or(&apart, &hidden);
+        owe(errs, d, ps, held);
         let range = d.graph.leaf(Op::Const(slo, shi));
-        let state = d.sel_num(&overlap, &state, &range);
+        let state = d.sel_num(&overlap, &two, &range);
         iface::set(st, ps, Value::Num(state))?;
         let Some(Value::Bool(coll)) = iface::get(st, pc) else { bail!("{}: not a boolean", iface::show(pc)) };
-        let unknown = d.unknown_bool_output();
-        let coll = d.sel_bool(&overlap, &coll, &unknown);
+        let passable = d.not(&coll);
+        let held = d.or(&apart, &passable);
+        owe(errs, d, pc, held);
+        let (unknown, absent) = (d.unknown_bool_output(), d.boolean(false));
+        let coll = d.sel_bool(&overlap, &absent, &unknown);
         iface::set(st, pc, Value::Bool(coll))?;
     }
     Ok(())
