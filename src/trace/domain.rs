@@ -336,11 +336,11 @@ pub trait Domain {
     }
 
     /// `__split_by_flr` of a value every lane holds alike (a literal interval):
-    /// its fragments on the fork grid, as literals, for the interpreter to run
+    /// its fragments on the integers, as literals, for the interpreter to run
     /// as separate trace states and rejoin when the enclosing call returns
     /// (`Interp::rejoin_fragments`). `None`: an ordinary per-lane fork.
-    fn literal_fragments(&mut self, _v: &Self::Num) -> Option<Vec<Self::Num>> {
-        None
+    fn literal_fragments(&mut self, _v: &Self::Num) -> Result<Option<Vec<Self::Num>>> {
+        Ok(None)
     }
 
     /// A fresh undecided boolean every lane holds alike: what a literal split's
@@ -1667,20 +1667,38 @@ impl Domain for Symbolic {
         Some(out)
     }
 
-    fn literal_fragments(&mut self, v: &NodeId) -> Option<Vec<NodeId>> {
+    fn literal_fragments(&mut self, v: &NodeId) -> Result<Option<Vec<NodeId>>> {
         if !self.unknowns() {
-            return None;
+            return Ok(None);
         }
-        let Op::Const(lo, hi) = self.graph.get(*v).op else { return None };
+        let Op::Const(lo, hi) = self.graph.get(*v).op else { return Ok(None) };
         if lo == hi {
-            return None;
+            return Ok(None);
         }
-        let step = 1i64 << (16 - self.graph.fork_bits() as i64);
+        // On the INTEGERS, not the fork grid (`Graph::fork_bits`, the rem
+        // bucket at rung k): a fragment only has to make `flr` exact, and the
+        // fragments rejoin into ONE literal hull (`rejoin_fragments`), so a
+        // finer cut buys no precision - within one integer `move` reads the
+        // fragment only through its exact floor and a linear `rem - 0.5 -
+        // amount`. On the bucket grid the fruit's `rem.y + spd.y + 0.5` in
+        // [-3.5, 1.5) was 5 * 2^k fragments: 160 trace states at rem Bits(5),
+        // and past `MAX_WAYS` at Bits(6), where this fell through to a 2-way
+        // per-lane fork of a literal that no lane is covered by - its error
+        // held wherever the fruit moved and the start state declined (room
+        // (3,1) `r6sxhf`, 2026-10-01).
+        let step = 1i64 << 16;
         let (lo, hi) = (lo as i64, hi as i64);
         let (fl, fh) = (lo.div_euclid(step) * step, hi.div_euclid(step) * step);
-        if (fh - fl) / step + 1 > crate::transpile::graph::MAX_WAYS as i64 {
-            return None;
-        }
+        // Too many to enumerate is refused HERE, at trace time: an ordinary
+        // fork of a literal would be a body whose error holds on every lane.
+        anyhow::ensure!(
+            (fh - fl) / step < crate::transpile::graph::MAX_WAYS as i64,
+            "__split_by_flr of the literal [{}, {}] spans {} integers, more than {} fragments",
+            lo as f64 / 65536.0,
+            hi as f64 / 65536.0,
+            (fh - fl) / step + 1,
+            crate::transpile::graph::MAX_WAYS
+        );
         let mut out = Vec::new();
         let mut base = fl;
         while base <= fh {
@@ -1688,7 +1706,7 @@ impl Domain for Symbolic {
             out.push(self.graph.leaf(Op::Const(a as i32, b as i32)));
             base += step;
         }
-        Some(out)
+        Ok(Some(out))
     }
 
     fn undecided_atom(&mut self) -> Result<NodeId> {

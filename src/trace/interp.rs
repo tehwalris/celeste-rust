@@ -1918,7 +1918,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 // its own trace state and they rejoin when the enclosing call
                 // returns (`rejoin_fragments`), so the split multiplies no
                 // configuration of the frame.
-                if let Some(frags) = self.d.literal_fragments(&x) {
+                if let Some(frags) = self.d.literal_fragments(&x)? {
                     if frags.len() == 1 {
                         return Ok(vec![(st, Value::Num(frags[0].clone()))]);
                     }
@@ -2294,6 +2294,73 @@ mod tests {
         let e = super::super::error::of(&mut it.d, &[r]);
         let known = it.d.graph.fold(Op::Known, vec![cond]);
         assert_eq!(e, it.d.graph.fold(Op::Not, vec![known]), "and its error is the condition undecided");
+    }
+
+    /// The fly fruit's `move` at a fruit-unknown level on a FINE rem rung:
+    /// `__split_by_flr` of a literal (every lane holds it alike) splits on the
+    /// integers and rejoins into one literal with no error, whatever the
+    /// rung's fork grid. On the bucket grid `rem.y + spd.y + 0.5` in
+    /// [-3.5, 1.5) was 5 * 64 fragments at rem Bits(6), past `MAX_WAYS`, and it
+    /// fell through to a 2-way per-lane fork of the literal: an error on every
+    /// lane where the fruit moved (room (3,1) `r6sxhf` declined its start
+    /// state, 2026-10-01).
+    #[test]
+    fn a_literal_split_rejoins_without_error_on_a_fine_rem_grid() {
+        let ast = parse(
+            r#"
+            function mv(r)
+              r = __split_by_flr(r + 0.5)
+              local amount = flr(r)
+              return r - 0.5 - amount
+            end
+            result = mv(input)
+            "#,
+        );
+        for bits in [0u8, 5, 6, 16] {
+            let mut d = Symbolic::default();
+            d.fruit_unknown = true;
+            d.graph.set_fork_bits(bits);
+            // The literal [-4, 1): the fruit's `rem.y + spd.y`.
+            let input = d.graph.leaf(Op::Const(-4 << 16, (1 << 16) - 1));
+            let mut it = Interp::new(d);
+            let mut st = fresh::<Symbolic>(&mut it.d);
+            let g = st.globals;
+            let globals = &mut st.heap.tables.get_mut(&g).unwrap().hash;
+            globals.insert("input".into(), Value::Num(input));
+            for b in ["__split_by_flr", "flr"] {
+                globals.insert(b.into(), Value::Builtin(b));
+            }
+            let out = it.exec_block(ast.nodes(), st).expect("exec");
+            assert_eq!(out.len(), 1, "Bits({bits}): the fragments rejoined");
+            let s = &out[0].0;
+            let Value::Num(r) = s.heap.tables[&s.globals].hash["result"].clone() else {
+                panic!("expected a number")
+            };
+            // + 0.5 is [-3.5, 1.5): six integers, each fragment's
+            // remainder in [-0.5, 0.5), hulled back into one literal.
+            assert_eq!(it.d.graph.get(r).op, Op::Const(-0x8000, 0x7fff), "Bits({bits}): the remainder is the literal [-0.5, 0.5)");
+            let e = super::super::error::of(&mut it.d, &[r]);
+            assert_eq!(it.d.graph.get(e).op, Op::ConstBool(false), "Bits({bits}): no lane errs");
+            assert_eq!(it.d.forks, 0, "Bits({bits}): no per-lane fork");
+        }
+    }
+
+    /// A literal spanning more integers than a split can enumerate is refused
+    /// while tracing, not left as a fork every lane would decline.
+    #[test]
+    fn a_literal_split_past_max_ways_is_refused() {
+        let ast = parse("result = __split_by_flr(input)");
+        let mut d = Symbolic::default();
+        d.fruit_unknown = true;
+        let input = d.graph.leaf(Op::Const(0, (300 << 16) - 1));
+        let mut it = Interp::new(d);
+        let mut st = fresh::<Symbolic>(&mut it.d);
+        let g = st.globals;
+        let globals = &mut st.heap.tables.get_mut(&g).unwrap().hash;
+        globals.insert("input".into(), Value::Num(input));
+        globals.insert("__split_by_flr".into(), Value::Builtin("__split_by_flr"));
+        let err = it.exec_block(ast.nodes(), st).err().expect("refused");
+        assert!(format!("{err:#}").contains("more than 255 fragments"), "{err:#}");
     }
 }
 
