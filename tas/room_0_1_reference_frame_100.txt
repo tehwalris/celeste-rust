@@ -1,0 +1,16 @@
+# Room (0,1) "900 m" reference exit for celeste-minimal: frame 100, the
+# community TAS9 route (derived 2026-10-01). Balloon seeds [0, 0.8905] (the
+# TAS header); the route also exits under PICO-8's own rnd:
+#   pico8_diff/replay.py --room 0,1 --balloon-seeds 0,0.8905 tas/room_0_1_reference_frame_100.txt
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 0,1, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# ~/src/github.com/CelesteClassic/tasdatabase/classic/any/TAS9.tas: 73 inputs.
+# In the ORIGINAL cart at prologue offset 27 (input 0 on frame 28, the first
+# frame the player exists - the spawn rises to y 96 here) it exits during
+# frame 100 (f99 player 29,-2). Its per-frame positions went through
+# `rewrite trajectory --room 0,1`; the fitted inputs below, replayed on a
+# real PICO-8 in celeste-minimal, give f99 player 29,-2 and f100 room 1,1.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,16,0,0,0,34,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,0,0,1,1,1,1,1,1,1,1,1,1,0,0,36,0,0,0,0,0,0,1,1,1,1,1,37,0,0,0,0,0,0,0,0,16,0,0,0,0,0,16,0,0,0
