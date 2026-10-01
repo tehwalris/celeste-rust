@@ -1,0 +1,18 @@
+# Room (4,1) "1300 m" reference for celeste-minimal, derived 2026-10-01.
+# Needs TAS13's balloon seeds (other seeds kill the player):
+#   pico8_diff/replay.py --room 4,1 --balloon-seeds 0.32205,0.20335,0.3813 tas/room_4_1_reference_frame_95.txt
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 4,1, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Derived from ~/src/github.com/CelesteClassic/tasdatabase/classic/any/TAS13.tas
+# (70 inputs, header [0.32205,0.20335,0.3813,0,]), replayed on a real PICO-8
+# in the ORIGINAL cart with those seeds at prologue offsets 20-32: the
+# earliest exit is during frame 95, at offset 25 (= 25 + 70; the player first
+# exists on frame 26). Its per-frame player positions (frames 1-94, `-`
+# during the spawn, frame 95 open) went through `rewrite trajectory --room
+# 4,1`, which found the inputs below for OUR game. Replayed on a real PICO-8
+# in celeste-minimal with the same seeds, the room changes to (5,1) during
+# frame 95. So the search's ceiling is 95.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,18,2,2,2,2,0,0,36,0,0,0,0,0,0,0,2,2,2,2,36,0,0,0,0,0,0,1,1,0,0,2,2,16,0,0,0,0,0,0,0,2,34,0,0,0,0,0,0,0,0,0,0,0,0,0,2,38,0,0,0,0,0,0,0,0,0,16,0,0,0
