@@ -241,6 +241,66 @@ mod tests {
         assert_eq!(out.get(map[t as usize]).op, Op::TileFlagAt, "unknown stays unknown");
     }
 
+    /// A collision test with ONE coordinate at TOP is decided false only
+    /// where no position along that axis is solid, in every level room.
+    ///
+    /// The fold used to cap the derived rectangle's corner and size apart:
+    /// at TOP that is the rectangle [-4096, 0), tile row (column) 0 only,
+    /// so the test read "nothing solid" wherever row 0 was open at that
+    /// column. Room (0,2)'s spawn frame traces the new player at a TOP
+    /// `y` (the spawn's), and its `is_solid(0, 1)` at x = 16 folded to
+    /// false over tile (2, 0): the kernels put the player in the air on
+    /// the ground and the room's witness was lost (2026-10-01).
+    #[test]
+    fn a_collision_test_at_a_top_coordinate_folds_only_to_what_every_position_gives() {
+        let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let raw = |v: i16| Pico8Num::from_i16(v).as_raw_u32() as i32;
+        let (mut checked, mut decided) = (0usize, 0usize);
+        for ry in 0..4i16 {
+            for rx in 0..8i16 {
+                if (rx, ry) == (7, 3) {
+                    continue; // the summit: no level room
+                }
+                let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).expect("cache"));
+                let room = Room { cart: cart.clone(), cache: cache.clone() };
+                // The player's hitbox (6x5) and a whole tile.
+                for (w, h) in [(6i16, 5i16), (8, 8)] {
+                    for at in -8..136i16 {
+                        for top_is_y in [true, false] {
+                            let mut g = Graph::new();
+                            let exact = g.leaf(Op::Const(raw(at), raw(at)));
+                            let top = g.leaf(Op::Cell(0));
+                            let (px, py) = if top_is_y { (exact, top) } else { (top, exact) };
+                            let (gw, gh, f) = (g.leaf(Op::Const(raw(w), raw(w))), g.leaf(Op::Const(raw(h), raw(h))), g.leaf(Op::Const(0, 0)));
+                            let t = g.fold(Op::TileFlagAt, vec![px, py, gw, gh, f]);
+                            let (out, map, _) = fold(&g, &[t], Some(&room)).expect("folds");
+                            let got = match out.get(map[t as usize]).op {
+                                Op::ConstBool(b) => Some(b),
+                                _ => None,
+                            };
+                            // What the concrete test gives along the TOP axis
+                            // (beyond [-16, 144] every rectangle misses the room).
+                            let any_solid = (-16..=144i16).any(|v| {
+                                let (x, y) = if top_is_y { (at, v) } else { (v, at) };
+                                cache.solid_at(&cart, x, y, w, h).expect("solid_at")
+                            });
+                            checked += 1;
+                            decided += got.is_some() as usize;
+                            assert!(got != Some(true), "room ({rx},{ry}) {w}x{h} at {at} ({}) folded to true", if top_is_y { "x; y TOP" } else { "y; x TOP" });
+                            assert!(
+                                got != Some(false) || !any_solid,
+                                "room ({rx},{ry}) {w}x{h} at {} = {at}, the other axis TOP: folded to false, but a position along it is solid",
+                                if top_is_y { "x" } else { "y" }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Open columns ARE decided false: the test is not vacuous.
+        assert!(decided > 0 && decided < checked, "{decided} of {checked} decided");
+    }
+
     /// A node it CANNOT model must not be decided, and must not poison
     /// the nodes that do not depend on it.
     #[test]

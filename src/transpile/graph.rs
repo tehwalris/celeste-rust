@@ -1352,10 +1352,24 @@ impl Graph {
         // A room is 16 tiles across and `solid_at` clamps to it, so any
         // span past the room edge is the whole room. Clamping also keeps
         // the derived rectangle inside i16 when an input is at TOP.
-        let cap = |n: i32| -> i16 { n.clamp(-4096, 4096) as i16 };
+        //
+        // Clamp the rectangle's EDGES, never its corner and its size
+        // apart: with a coordinate at TOP the corner is -32768 and the
+        // size 65536+, and capping each on its own left the rectangle
+        // [-4096, 0) - tile row (or column) 0 only, so a TOP position
+        // read "nothing solid anywhere" wherever that row is open and
+        // the frame folded the collision to false. Room (0,2)'s spawn
+        // frame: the new player's `is_solid(0, 1)` at y = TOP, tile
+        // (2, 0) open, the player in the air on the ground (2026-10-01).
+        let edges = |lo: i32, size: i32| -> (i16, i16) {
+            let hi = lo + size - 1;
+            let (lo, hi) = (lo.clamp(-4096, 4096), hi.clamp(-4096, 4096));
+            (lo as i16, (hi - lo + 1) as i16)
+        };
         let (dx, dy) = (xhi - xlo, yhi - ylo);
         let solid = |px: i32, py: i32, pw: i32, ph: i32| -> Result<bool> {
-            room.cache.flag_at(&room.cart, cap(px), cap(py), cap(pw), cap(ph), flag)
+            let ((px, pw), (py, ph)) = (edges(px, pw), edges(py, ph));
+            room.cache.flag_at(&room.cart, px, py, pw, ph, flag)
         };
         if !solid(xlo, ylo, w + dx, h + dy)? {
             return Ok(Val::Bool(Some(false)));

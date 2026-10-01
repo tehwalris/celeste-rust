@@ -3523,4 +3523,40 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// THE SPAWN FRAME, kernels against the reference: room (0,2)'s frame
+    /// where `player_spawn` lands and becomes the player at (16, 104), on
+    /// the ground. The kernels' trace has the new player at the spawn's
+    /// TOP `y`, and its `is_solid(0, 1)` folded to false (tile (2, 0) is
+    /// open; `Graph::tile_flag_over` read only row 0 at TOP): every
+    /// successor had the player in the air (grace 0, air acceleration,
+    /// gravity) where the reference and a real PICO-8 have it standing
+    /// (grace 6, a jump), and the exact levels' f80 had no witness
+    /// (2026-10-01). Both engines must make the same successor set.
+    #[test]
+    fn room_02_spawn_frame_kernels_make_the_reference_successors() {
+        use crate::interpreter::abstraction::{set_level, Level};
+        std::env::set_var("CELESTE_START_ROOM", "0,2");
+        set_level(Level::parse("rxsx").expect("level"));
+        let kernels = crate::compiled::FrameEngine::new_for_start_room().expect("kernels");
+        let reference = Mutex::new(RefEngine::new().expect("ref engine"));
+        // 25 frames of no input: the spawn's last frame is the 26th.
+        let mut concrete = crate::concrete::ConcreteEngine::new().expect("concrete");
+        let init = concrete.initial_state().expect("initial state");
+        let mut st = init.clone();
+        for _ in 0..25 {
+            st = concrete.step_frame(st, 0).expect("frame");
+            crate::concrete::restore_buttons(&init, &mut st).expect("buttons");
+        }
+        let successors = |engine: &dyn FrameStep| -> std::collections::BTreeSet<((u64, u64), u32)> {
+            let door = crate::search::door::Door::for_current_level();
+            let (next, _, _) = forward_frame(engine, vec![Block::from_state(&st).expect("block")], &door, None, None, 26, None).expect("frame");
+            next.iter().flat_map(|b| b.keys().iter().copied().zip(b.positions().expect("cells"))).collect()
+        };
+        let (k, r) = (successors(&kernels), successors(&reference));
+        let at: std::collections::BTreeSet<_> = r.iter().map(|(_, c)| crate::search::pos_graph::cell_xy(*c)).collect();
+        assert_eq!(at, [Some((16, 104))].into_iter().collect(), "the player stands at its spawn");
+        assert!(r.len() > 1, "the buttons make more than one successor");
+        assert_eq!(k.difference(&r).count() + r.difference(&k).count(), 0, "kernels {} successors, reference {}: {} only in the reference", k.len(), r.len(), r.difference(&k).count());
+    }
 }
