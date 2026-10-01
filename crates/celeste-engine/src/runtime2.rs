@@ -1259,10 +1259,15 @@ impl Rt2 {
                     // Its `y` (`widen::phase_paths`): the bob band around its
                     // constant `start`.
                     let sc = self.obj_field_cell(o, ids.f_start).unwrap_or_else(|| panic!("phase widening: the balloon has no `start` field"));
-                    let start = match &self.cols[sc as usize] {
-                        Col::U(AV::Num(s)) => s.to_bits() as i32,
-                        other => panic!("phase widening: the balloon's `start` is not one number: {:?}", other),
+                    // Its `start` is the constant tile row it was placed at: one
+                    // number in every lane, however the column stores it.
+                    let col = &self.cols[sc as usize];
+                    let start = match col.at(0) {
+                        AV::Num(s) => s,
+                        other => panic!("phase widening: the balloon's `start` is not a number: {:?}", other),
                     };
+                    assert!((0..self.width).all(|lane| col.at(lane) == AV::Num(start)), "phase widening: the balloon's `start` differs between lanes: {:?}", col);
+                    let start = start.to_bits() as i32;
                     [(o, "spr", ids.f_spr, BALLOON_SPR_RANGE), (o, "y", ids.f_y, (start - BALLOON_BOB_RAW, start + BALLOON_BOB_RAW))]
                 }))
                 .collect::<Vec<_>>();
