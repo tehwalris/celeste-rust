@@ -104,6 +104,14 @@ impl Col {
             Col::I(v) => AV::Ival(v[lane].0, v[lane].1),
         }
     }
+
+    /// The one number every lane of a `width`-lane column holds, however the
+    /// column stores it (a uniform `U`, or an `N`/`V` whose lanes agree);
+    /// `None` if a lane holds anything else or the lanes differ.
+    pub fn uniform_num(&self, width: usize) -> Option<P8> {
+        let AV::Num(n) = self.at(0) else { return None };
+        (0..width).all(|lane| self.at(lane) == AV::Num(n)).then_some(n)
+    }
 }
 
 /// Shared heap structure. Value cells' per-lane contents live in
@@ -1217,9 +1225,12 @@ impl Rt2 {
         // there to widen.
         // An object's `(x, y)`, the same in every lane: floors and springs never move.
         let at = |rt: &Self, obj: u32, what: &str| -> (P8, P8) {
-            let get = |f: u32| match rt.obj_field_cell(obj, f).map(|c| &rt.cols[c as usize]) {
-                Some(Col::U(AV::Num(n))) => *n,
-                other => panic!("fall floor widening: a {what}'s position is {other:?}, not one number"),
+            let get = |f: u32| {
+                let col = rt.obj_field_cell(obj, f).map(|c| &rt.cols[c as usize]);
+                match col.and_then(|c| c.uniform_num(rt.width)) {
+                    Some(n) => n,
+                    None => panic!("fall floor widening: a {what}'s position is {col:?}, not one number"),
+                }
             };
             (get(ids.f_x), get(ids.f_y))
         };
@@ -1262,11 +1273,7 @@ impl Rt2 {
                     // Its `start` is the constant tile row it was placed at: one
                     // number in every lane, however the column stores it.
                     let col = &self.cols[sc as usize];
-                    let start = match col.at(0) {
-                        AV::Num(s) => s,
-                        other => panic!("phase widening: the balloon's `start` is not a number: {:?}", other),
-                    };
-                    assert!((0..self.width).all(|lane| col.at(lane) == AV::Num(start)), "phase widening: the balloon's `start` differs between lanes: {:?}", col);
+                    let start = col.uniform_num(self.width).unwrap_or_else(|| panic!("phase widening: the balloon's `start` is not one number: {:?}", col));
                     let start = start.to_bits() as i32;
                     [(o, "spr", ids.f_spr, BALLOON_SPR_RANGE), (o, "y", ids.f_y, (start - BALLOON_BOB_RAW, start + BALLOON_BOB_RAW))]
                 }))
