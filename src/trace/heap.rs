@@ -219,6 +219,32 @@ impl<D: Domain> Table<D> {
         Some(last)
     }
 
+    /// `name = v` for a GLOBAL, Lua's way: assigning nil removes the key.
+    /// A global held as an explicit `Nil` is a structural slot to the
+    /// boundary (`bind::structure_of` gives every present global a cell,
+    /// and the canonical numbering counts it), so a state that once
+    /// assigned a global and then cleared it was a different SHAPE from one
+    /// that never assigned it - equal game states that never dedupe. The
+    /// split frame (lua/celeste-minimal-split.lua) clears `__phase` every
+    /// frame and `__frozen` after a freeze, which made every state that had
+    /// sat in a dash freeze a second copy (room (2,1): 2.8-3.8x the unsplit
+    /// states, plans/room21-2026-10-01.md).
+    ///
+    /// Globals only. An object FIELD assigned nil keeps its slot: the cart
+    /// does that in `init_object` (`obj.spr = type.tile`, nil for the
+    /// player's type), to every object of the type alike, and removing the
+    /// slot renumbers every state with a player in every room - room (1,0)
+    /// f0-f44 moved every fingerprint from f24 with every count, the pos
+    /// graph and the marks unchanged - which invalidates the pinned gates
+    /// and every checkpoint tree on disk for no merge.
+    pub fn set_global(&mut self, name: String, v: Value<D>) {
+        if matches!(v, Value::Nil) {
+            self.hash.remove(&name);
+        } else {
+            self.hash.insert(name, v);
+        }
+    }
+
     pub fn get_index(&self, i: i16) -> Option<&Value<D>> {
         if i >= 1 && (i as usize) <= self.arr.len() {
             Some(&self.arr[i as usize - 1])

@@ -358,7 +358,11 @@ pub fn trace_frame<'a>(
         super::widen::fork_floor_inputs(&mut st, &mut it.d)?;
     }
     // A near level's floors: each `collideable` a lane may hold unknown, forked.
-    if it.d.floors_near {
+    // Not in the middle of a split frame: there the row stores the
+    // `collideable` the frame's first step computed wherever the second may
+    // read it (`widen::widen_near_floors`), and deriving it from the widened
+    // `state` would throw that away.
+    if it.d.floors_near && !super::widen::mid_frame(&st) {
         super::widen::fork_near_floor_inputs(&mut st, &mut it.d)?;
     }
     // The moving platforms unknown: their input cells, decided per world by

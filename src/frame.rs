@@ -1368,6 +1368,14 @@ pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
     frame + (frames.max(1) - 1) as u32 > h
 }
 
+/// Is `rt2` a block of states BETWEEN the two steps of a split frame
+/// (`CELESTE_SPLIT_FRAME`): its `__phase` global is set (`widen::mid_frame`,
+/// the tracer's side).
+pub fn mid_frame_rt2(rt2: &Rt2) -> bool {
+    let phase = celeste_names::gen::global_id("__phase").expect("`__phase` is a global name") as usize;
+    rt2.globals.get(phase).is_some_and(|&g| g != celeste_engine::runtime2::NONE)
+}
+
 /// The ladder's forward discard-filter. A state generated at precision r+1 is
 /// KEPT only if its widened-to-precision-r form was marked by the previous
 /// level's backward pass - "immediately, during the forward, the whole time".
@@ -1404,7 +1412,16 @@ impl<'a> MarkFilter<'a> {
     /// live there (`abstraction.rs`) and this is the one place the loop
     /// still needs them. Paid only at levels >= 1, whose frontiers the
     /// filter itself keeps small.
+    ///
+    /// A row in the MIDDLE of a split frame passes unfiltered: there the
+    /// kernels keep what the frame's second step reads unwidened
+    /// (`widen::widen_near_floors`), so the coarser level's row is no
+    /// projection of the finer one's. Sound - the filter only discards - and
+    /// the step after it is a frame boundary, filtered again.
     pub fn allowed(&self, rt2: &Rt2, frame: u32) -> Result<Vec<bool>> {
+        if mid_frame_rt2(rt2) {
+            return Ok(vec![true; rt2.width]);
+        }
         let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser)?;
         Ok(keys
             .iter()
@@ -3558,5 +3575,39 @@ mod tests {
         assert_eq!(at, [Some((16, 104))].into_iter().collect(), "the player stands at its spawn");
         assert!(r.len() > 1, "the buttons make more than one successor");
         assert_eq!(k.difference(&r).count() + r.difference(&k).count(), 0, "kernels {} successors, reference {}: {} only in the reference", k.len(), r.len(), r.difference(&k).count());
+    }
+
+    /// THE SPLIT FRAME (`CELESTE_SPLIT_FRAME`) at a near level reaches the
+    /// unsplit frame's states at every frame boundary: room (2,1) `r0sxhn`,
+    /// where the player spawns onto two fall floors and can dash (a freeze)
+    /// from frame 24. The counts are the UNSPLIT forward's (`rewrite forward
+    /// --level r0sxhn --room 2,1`, 2026-10-01; its (key, cell) sets equal the
+    /// split one's at every even step through f34, `rewrite ckhash`). Two bugs
+    /// made the split frame reach MORE: a global cleared to nil left a slot
+    /// behind (`heap::Table::set_global`), so every state that had sat in a
+    /// freeze was a second shape (f26: 2,742 against 1,810 at `r0sxhnp`); and
+    /// the middle of the frame widened the floors the player's update then
+    /// read (`widen::widen_near_floors`, f25: 318 against 308). The kernels
+    /// are built per process for one level, so the unsplit side is pinned.
+    #[test]
+    fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
+        use crate::interpreter::abstraction::{set_level, Level};
+        std::env::set_var("CELESTE_START_ROOM", "2,1");
+        std::env::set_var("CELESTE_SPLIT_FRAME", "1");
+        set_level(Level::parse("r0sxhn").expect("level"));
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-split-near-test");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("checkpoint dir");
+        let engine = crate::compiled::FrameEngine::new_for_start_room().expect("engine");
+        let init = vec![Block::from_state(&RefEngine::new().expect("ref").initial_state().expect("init")).expect("block")];
+        // Unsplit, frame by frame: 1 state a frame through the spawn, then these.
+        let unsplit: Vec<(u32, usize)> = (0..24).map(|f| (f, 1)).chain([(24, 27), (25, 308), (26, 1576), (27, 5559), (28, 15348)]).collect();
+        let last = unsplit.last().unwrap().0;
+        forward_run(&engine, init, dir, 2 * last, false, None).expect("split forward");
+        for (f, want) in unsplit {
+            let got: usize = load_frame(dir, 2 * f).expect("load").iter().map(Block::lanes).sum();
+            assert_eq!(got, want, "frame {f} (step {}): the split frame reached {got} states, the unsplit {want}", 2 * f);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

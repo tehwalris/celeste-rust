@@ -199,3 +199,59 @@ pub fn platform_worlds(frames: usize) -> Result<Vec<Vec<[i32; WORLD_FIELDS]>>> {
     }
     Ok(worlds)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// THE SPLIT FRAME (`CELESTE_SPLIT_FRAME`, lua/celeste-minimal-split.lua)
+    /// must run exactly the original frame: after its two steps a state is
+    /// the unsplit frame's, down to the SHAPE - equal game states in two
+    /// shapes never dedupe. Room (1,0)'s witness dashes on frame 24, so
+    /// frames 25-26 take the freeze path, whose part a sets `__frozen` and
+    /// whose part b clears it. The cleared global used to stay behind as an
+    /// explicit nil slot, so every state that had sat in a freeze was its
+    /// own shape (room (2,1): 2.8-3.8x the unsplit states,
+    /// plans/room21-2026-10-01.md); the tracer now removes the key, as Lua
+    /// does (`Table::set_global`). It failed at frame 1 before: `__phase`,
+    /// cleared every frame, was a slot every unsplit state lacks.
+    #[test]
+    fn split_frame_lands_on_the_unsplit_states_through_a_dash_freeze() {
+        use crate::frame::Block;
+        let tas = std::fs::read_to_string("tas/room_1_0_exit_frame_99.txt").expect("tas");
+        let bytes: Vec<u8> = tas
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .flat_map(|l| l.split(','))
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().parse().expect("input byte"))
+            .collect();
+        assert_eq!(bytes.len(), 99);
+        let fingerprint = |st: &State| {
+            let b = Block::from_state(st).expect("block");
+            (b.rt2().shape_hash_of(), b.keys().to_vec())
+        };
+        // The cart is read when an engine is built; nextest runs this test
+        // in its own process.
+        std::env::remove_var("CELESTE_SPLIT_FRAME");
+        let mut whole = ConcreteEngine::new().expect("engine");
+        std::env::set_var("CELESTE_SPLIT_FRAME", "1");
+        let mut split = ConcreteEngine::new().expect("split engine");
+        std::env::remove_var("CELESTE_SPLIT_FRAME");
+
+        let mut a = whole.initial_state().expect("init");
+        let mut b = split.initial_state().expect("split init");
+        assert_eq!(fingerprint(&a), fingerprint(&b), "the initial states differ");
+        for (f, &byte) in bytes.iter().enumerate() {
+            a = whole.step_frame(a, byte).expect("frame");
+            b = split.step_frame(b, byte).expect("part a");
+            b = split.step_frame(b, byte).expect("part b");
+            assert_eq!(
+                fingerprint(&a),
+                fingerprint(&b),
+                "frame {}: after the split frame's two steps the state is not the unsplit frame's",
+                f + 1
+            );
+        }
+    }
+}

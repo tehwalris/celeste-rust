@@ -154,6 +154,14 @@ pub enum WidenMode {
     RemRung(crate::interpreter::abstraction::RemPrecision, crate::interpreter::abstraction::SpdPrecision),
 }
 
+/// A state BETWEEN the two steps of a split frame (`CELESTE_SPLIT_FRAME`,
+/// lua/celeste-minimal-split.lua): `__phase` holds a table there, and at every
+/// frame boundary it is absent (`heap::Table::set_global`). The unsplit cart
+/// never assigns it.
+pub fn mid_frame<D: Domain>(st: &State<D>) -> bool {
+    st.heap.tables[&st.globals].hash.contains_key("__phase")
+}
+
 /// Apply the boundary widenings selected by `mode` to `st`.
 ///
 /// Every widening `make_state_abstract` applies, in the graph, so a
@@ -181,7 +189,7 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
     widen_fly_fruit(st, d, &mut errs)?;
     widen_fall_floors(st, d)?;
     widen_floor_timers(st, d)?;
-    widen_near_floors(st, d, &mut errs)?;
+    widen_near_floors(st, d, &mut errs, mid_frame(st))?;
     widen_platforms(st, d, &mut errs)?;
     canon_balloon_offset(st, d, &mut errs)?;
     widen_held(st, d)?;
@@ -440,6 +448,14 @@ pub fn fork_near_floor_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Res
     Ok(())
 }
 
+/// How far the player's own update reaches for a fall floor, as offsets to
+/// the overlap window `floor_player_window` (`(x lo, x hi), (y lo, y hi)`,
+/// added to the OPEN window's ends): `is_solid(ox, oy)` checks the floors at
+/// `ox` in -3..=3 and `oy` in 0..=1 (lua/celeste-minimal.lua, `player.update`:
+/// `is_solid(0,1)`, `is_solid(input,0)`, `is_solid(-3,0)`/`is_solid(3,0)`), and
+/// `check` at `(ox, oy)` overlaps where the player at `(x + ox, y + oy)` would.
+pub const PLAYER_PROBE: [(i16, i16); 2] = [(-3, 3), (-1, 0)];
+
 /// A near level's OUTPUT side (`abstraction::FloorsPrecision::Near`,
 /// 2026-09-30, room (7,0)): every fall floor stores its `state`
 /// as the interval `FLOOR_STATE_RANGE` and its `collideable` unknown - EXCEPT
@@ -473,7 +489,21 @@ pub fn fork_near_floor_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Res
 /// or not - is still split. Exactly what the mark filter's projection of a
 /// concrete row holds there (`Rt2::widen_to` keeps an overlapped floor as it
 /// is, and in the game it is hidden).
-fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
+///
+/// AT THE MIDDLE OF A SPLIT FRAME (`mid`) one more floor stays as computed:
+/// its `collideable`, wherever the player's own update - the second step, the
+/// buttons - may read it. That update reads the floors only through
+/// `is_solid` (`check(fall_floor, ox, oy)` for `ox` in -3..=3, `oy` in 0..=1:
+/// the ground below, a step sideways, the wall jump's 3 px), and the floors
+/// update in the FIRST step (they stand before the player in `objects`). So
+/// widened there, the second step read a floor the first step had just
+/// decided as solid-or-not as both, and the split frame reached states the
+/// frame does not (room (2,1) `r0sxhn` f34: 496k states against 387k). The
+/// window is `PLAYER_PROBE` around the overlap window; `state` is widened as
+/// at the frame's end (the second step does not read it, and the frame's end
+/// widens it, the player not having moved), and the next step reads the
+/// stored `collideable` rather than deriving it (`fork_near_floor_inputs`).
+fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors, mid: bool) -> Result<()> {
     use super::domain::Cmp;
     if !d.floors_near {
         return Ok(());
@@ -520,11 +550,20 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
             Ok(d.and(&above, &below))
         };
         let mut overlap = d.boolean(false);
+        // Where the player's update may read the floor (mid-frame only).
+        let mut probe = d.boolean(false);
         for &(px, py) in &players {
             let x = inside(d, px, xlo, xhi)?;
             let y = inside(d, py, ylo, yhi)?;
             let both = d.and(&x, &y);
             overlap = d.or(&overlap, &both);
+            if mid {
+                let [(dxlo, dxhi), (dylo, dyhi)] = PLAYER_PROBE;
+                let x = inside(d, px, xlo + P8::from_i16(dxlo), xhi + P8::from_i16(dxhi))?;
+                let y = inside(d, py, ylo + P8::from_i16(dylo), yhi + P8::from_i16(dyhi))?;
+                let both = d.and(&x, &y);
+                probe = d.or(&probe, &both);
+            }
         }
         let Some(Value::Num(state)) = iface::get(st, ps) else { bail!("{}: not a number", iface::show(ps)) };
         if let Some(holds) = contain(d, state, (slo as i64, shi as i64)) {
@@ -545,7 +584,9 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
         let held = d.or(&apart, &passable);
         owe(errs, d, pc, held);
         let (unknown, absent) = (d.unknown_bool_output(), d.boolean(false));
-        let coll = d.sel_bool(&overlap, &absent, &unknown);
+        // Mid-frame, in the probe window: the computed `collideable`, kept.
+        let unread = if mid { d.sel_bool(&probe, &coll, &unknown) } else { unknown };
+        let coll = d.sel_bool(&overlap, &absent, &unread);
         iface::set(st, pc, Value::Bool(coll))?;
     }
     Ok(())

@@ -1553,7 +1553,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             Target::Name(name) => {
                 if !st.heap.assign(st.scope, name, v.clone()) {
                     let g = st.globals;
-                    st.heap.tables.get_mut(&g).unwrap().hash.insert(name.clone(), v);
+                    st.heap.tables.get_mut(&g).unwrap().set_global(name.clone(), v);
                 }
             }
             Target::Field(tab, k) => self.set_key(tab, k.clone(), v, st)?,
