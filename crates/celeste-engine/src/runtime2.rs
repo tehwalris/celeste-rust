@@ -236,6 +236,11 @@ pub const SPRING_SPR_RANGE: (i32, i32) = (0, 19 << 16);
 /// Raw 16.16. ONE definition, shared with the tracer (`widen::phase_paths`).
 pub const BALLOON_SPR_RANGE: (i32, i32) = (0, 22 << 16);
 
+/// A balloon's bob radius where a near level widens its `y`: `start +
+/// sin(offset) * 2`, so `y` is in `start +- 2`. Raw 16.16. ONE definition,
+/// shared with the tracer (`widen::phase_paths`).
+pub const BALLOON_BOB_RAW: i32 = 2 << 16;
+
 /// The player's hitbox (`player.init`) and every other object's
 /// (`init_object`), `(x, y, w, h)`, as `floor_player_window` reads them. The
 /// tracer checks the state it traces holds these (`widen::widen_near_floors`).
@@ -1250,7 +1255,16 @@ impl Rt2 {
                 .objects_of_type(ids, ids.g_spring)
                 .into_iter()
                 .flat_map(|o| [(o, "spr", ids.f_spr, SPRING_SPR_RANGE), (o, "delay", ids.f_delay, FLOOR_TIMER_RANGE), (o, "hide_in", ids.f_hide_in, FLOOR_TIMER_RANGE), (o, "hide_for", ids.f_hide_for, FLOOR_TIMER_RANGE)])
-                .chain(self.objects_of_type(ids, ids.g_balloon).into_iter().map(|o| (o, "spr", ids.f_spr, BALLOON_SPR_RANGE)))
+                .chain(self.objects_of_type(ids, ids.g_balloon).into_iter().flat_map(|o| {
+                    // Its `y` (`widen::phase_paths`): the bob band around its
+                    // constant `start`.
+                    let sc = self.obj_field_cell(o, ids.f_start).unwrap_or_else(|| panic!("phase widening: the balloon has no `start` field"));
+                    let start = match &self.cols[sc as usize] {
+                        Col::U(AV::Num(s)) => s.to_bits() as i32,
+                        other => panic!("phase widening: the balloon's `start` is not one number: {:?}", other),
+                    };
+                    [(o, "spr", ids.f_spr, BALLOON_SPR_RANGE), (o, "y", ids.f_y, (start - BALLOON_BOB_RAW, start + BALLOON_BOB_RAW))]
+                }))
                 .collect::<Vec<_>>();
             {
                 for (obj, name, f, range) in phases {

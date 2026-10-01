@@ -218,7 +218,7 @@ fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut S
     Ok(())
 }
 
-use celeste_engine::runtime2::{floor_player_window, BALLOON_PERIOD_RAW, FLOOR_HITBOX, FLOOR_STATE_RANGE, FLOOR_TIMER_RANGE, SPRING_SPR_RANGE, BALLOON_SPR_RANGE, PLATFORM_PATH, PLATFORM_REM, PLAYER_HITBOX};
+use celeste_engine::runtime2::{floor_player_window, BALLOON_PERIOD_RAW, FLOOR_HITBOX, FLOOR_STATE_RANGE, FLOOR_TIMER_RANGE, SPRING_SPR_RANGE, BALLOON_SPR_RANGE, BALLOON_BOB_RAW, PLATFORM_PATH, PLATFORM_REM, PLAYER_HITBOX};
 
 /// Held buttons unknown (plans/held-buttons.md): the player's trails leave the
 /// frame unknown - the canonical output unknown (`Symbolic::unknown_bool_output`),
@@ -296,18 +296,32 @@ pub fn fall_floor_paths<D: Domain>(st: &State<D>) -> FallFloorPaths {
 /// player", the balloon's "maybe refill the dash where the player overlaps
 /// its bob", and nothing else; the floor under a spring is widened like any
 /// other. (The balloon's respawn `timer` is a countdown with the floors'.)
-pub fn phase_paths<D: Domain>(st: &State<D>) -> Vec<(Path, (i32, i32))> {
+///
+/// The balloon's `y` too (2026-10-01, room (2,1)): its bob `start +
+/// sin(offset) * 2` runs only on the `spr == 22` arm, so with `spr` widened a
+/// stored `y = start` (the other arm) had two successors, `start` and the
+/// bob band, and every state existed twice. Its range is the band itself,
+/// `start +- BALLOON_BOB_RAW` (`PhaseRange::AroundStart`).
+pub fn phase_paths<D: Domain>(st: &State<D>) -> Vec<(Path, PhaseRange)> {
     let mut out = Vec::new();
     for obj in objects_of_type(st, "spring") {
-        out.push((field(&obj, &["spr"]), SPRING_SPR_RANGE));
+        out.push((field(&obj, &["spr"]), PhaseRange::Fixed(SPRING_SPR_RANGE)));
         for f in ["delay", "hide_in", "hide_for"] {
-            out.push((field(&obj, &[f]), FLOOR_TIMER_RANGE));
+            out.push((field(&obj, &[f]), PhaseRange::Fixed(FLOOR_TIMER_RANGE)));
         }
     }
     for obj in objects_of_type(st, "balloon") {
-        out.push((field(&obj, &["spr"]), BALLOON_SPR_RANGE));
+        out.push((field(&obj, &["spr"]), PhaseRange::Fixed(BALLOON_SPR_RANGE)));
+        out.push((field(&obj, &["y"]), PhaseRange::AroundStart(field(&obj, &["start"]), BALLOON_BOB_RAW)));
     }
     out
+}
+
+/// Where a near level stores a phase (`phase_paths`): a fixed range, or the
+/// object's constant `start` plus or minus a radius (raw 16.16).
+pub enum PhaseRange {
+    Fixed((i32, i32)),
+    AroundStart(Path, i32),
 }
 
 /// The countdowns a timers level widens (`abstraction::FloorsPrecision::Timers`):
@@ -381,7 +395,15 @@ pub fn near_floor_paths(st: &State<Symbolic>) -> NearFloorPaths {
 /// == k`. The output side; the next frame reads the stored intervals as
 /// interval inputs.
 fn widen_near_phases(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
-    for (p, (lo, hi)) in phase_paths(st) {
+    for (p, range) in phase_paths(st) {
+        let (lo, hi) = match range {
+            PhaseRange::Fixed(r) => r,
+            PhaseRange::AroundStart(sp, radius) => {
+                let Some(Value::Num(s)) = iface::get(st, &sp) else { bail!("{}: not a number", iface::show(&sp)) };
+                let Some(s) = d.as_const(&s) else { bail!("{}: not a constant", iface::show(&sp)) };
+                (s.to_bits() as i32 - radius, s.to_bits() as i32 + radius)
+            }
+        };
         let Some(Value::Num(v)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
         if let Some(holds) = contain(d, v, (lo as i64, hi as i64)) {
             owe(errs, d, &p, holds);

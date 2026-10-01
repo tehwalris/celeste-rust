@@ -1,0 +1,19 @@
+# Room (2,1) "1100 m" reference for celeste-minimal, derived 2026-10-01.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 2,1, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Derived from ~/src/github.com/CelesteClassic/tasdatabase/classic/any/TAS11.tas
+# (58 inputs, header [0,0.8905,]), replayed on a real PICO-8 in the ORIGINAL
+# cart (celeste_ocaml/celeste.lua, `replay.py --lua ... --begin-game --room
+# 2,1`) at prologue offsets 22-29: only 24 (exit during frame 82 = 24 + 58)
+# and 27 (85) exit; the player first exists on frame 24. Its per-frame player
+# positions (frames 1-81, `-` during the spawn, and frame 82 open) went
+# through `rewrite trajectory --room 2,1`, which found the inputs below for
+# OUR game following that trajectory exactly and winning at frame 82 (the
+# positions alone, without frame 82, admit a last dash that does not exit).
+# Replayed on a real PICO-8 in celeste-minimal, the player is at (95,-2) on
+# frame 81 and the room changes to (3,1) during frame 82, for balloon seeds
+# [0, 0.8905], [0], [0.5] and PICO-8's rnd. So the search's ceiling is 82.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,2,2,18,2,2,2,2,2,2,2,2,2,2,38,0,0,0,0,0,0,16,0,0,16,0,0,0,0,0,16,0,0,0,0,2,16,0,0,36,0,0,0,0,0,0,2,2,0,16,0,0,0,0,16,0
