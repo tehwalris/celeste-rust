@@ -101,7 +101,15 @@ pub struct CollisionCache {
 
     /// tile_flag_at cache for flag 0 (solid), w=8, h=8 (full tile)
     solid_8x8: BoolMap,
+
+    /// tile_flag_at cache for flag 4 (ice, `ICE_FLAG`), the player hitbox:
+    /// `is_ice` asks it every frame (`on_ice`, the wall jump). Indexed like
+    /// `solid_player_hitbox`.
+    ice_player_hitbox: BoolMap,
 }
+
+/// The ice flag: `ice_at(x, y, w, h)` is `tile_flag_at(x, y, w, h, 4)`.
+pub const ICE_FLAG: i16 = 4;
 
 impl CollisionCache {
     /// Create a new collision cache for the given room
@@ -117,6 +125,7 @@ impl CollisionCache {
         let mut solid_player_hitbox = BoolMap::new(range.clone());
         let mut solid_1x1 = BoolMap::new(range.clone());
         let mut solid_8x8 = BoolMap::new(range.clone());
+        let mut ice_player_hitbox = BoolMap::new(range.clone());
 
         // Precompute tile_flag_at for different hitbox sizes
         solid_player_hitbox.fill(|x, y| {
@@ -135,12 +144,18 @@ impl CollisionCache {
                 .unwrap_or(false)
         });
 
+        ice_player_hitbox.fill(|x, y| {
+            Self::tile_flag_at_impl(cart_data, room_x, room_y, x + 1, y + 3, 6, 5, ICE_FLAG)
+                .unwrap_or(false)
+        });
+
         Ok(Self {
             room_x,
             room_y,
             solid_player_hitbox,
             solid_1x1,
             solid_8x8,
+            ice_player_hitbox,
         })
     }
 
@@ -172,6 +187,32 @@ impl CollisionCache {
             (8, 8) => Some((&self.solid_8x8, 0, 0)),
             _ => None,
         }
+    }
+
+    /// The precomputed map answering `tile_flag_at(x, y, w, h, flag)`, as
+    /// `solid_map` for flag 0; the ice map for the player hitbox; else none
+    /// (the caller computes, `flag_at`).
+    #[inline]
+    pub fn flag_map(&self, w: i16, h: i16, flag: i16) -> Option<(&BoolMap, i16, i16)> {
+        match (flag, w, h) {
+            (0, _, _) => self.solid_map(w, h),
+            (ICE_FLAG, 6, 5) => Some((&self.ice_player_hitbox, -1, -3)),
+            _ => None,
+        }
+    }
+
+    /// `tile_flag_at(x, y, w, h, flag)` for any flag: the cached maps where
+    /// they cover the query, else the tile scan.
+    pub fn flag_at(&self, cart_data: &CartData, x: i16, y: i16, w: i16, h: i16, flag: i16) -> Result<bool> {
+        if flag == 0 {
+            return self.solid_at(cart_data, x, y, w, h);
+        }
+        if let Some((map, dx, dy)) = self.flag_map(w, h, flag) {
+            if let Some(v) = map.get(x + dx, y + dy) {
+                return Ok(v);
+            }
+        }
+        Self::tile_flag_at_impl(cart_data, self.room_x, self.room_y, x, y, w, h, flag)
     }
 
     /// Generic solid_at lookup - falls back to computation if not cached

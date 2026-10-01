@@ -2453,71 +2453,73 @@ mod tests {
         );
     }
 
-    /// `ice_at` is `tile_flag_at(.., 4)`, and only flag 0 is modelled.
-    /// Answering `false` for every other flag is right exactly where the
-    /// room has no such tile - so this checks BOTH halves: that it
-    /// answers in a room without ice, and that it RAISES in one with.
-    ///
-    /// The second half is the point. A guard that never fires is
-    /// indistinguishable from no guard, and this one was wrong in the
-    /// interpreter too, so no differential test between the two could
-    /// have found it.
+    /// `ice_at` is `tile_flag_at(.., 4)` (2026-10-01: modelled, room (3,1)).
+    /// In every room of the map, with that room's collision cache, the
+    /// tracer's answer for a concrete rectangle is the tile scan's - true
+    /// on some rectangle in the rooms with ice (so the check is not
+    /// vacuous), false everywhere in the others (the trace-time fold).
     #[test]
-    fn ice_answers_without_ice_and_raises_with_it() {
+    fn ice_at_answers_the_tile_scan_in_every_room() {
         let src = cart::sources().expect("sources");
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
-        let probe = full_moon::parse("ice_probe = ice_at(0,0,8,8)").expect("parse probe");
-        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd =
             std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
-        let (rx, ry) = celeste_interp::game_runner::start_room();
+        // Parsed before the interpreter, which borrows the ASTs it runs.
+        let rects: Vec<(i16, i16, i16, i16)> = (0..16i16)
+            .flat_map(|i| (0..16i16).map(move |j| (i * 8, j * 8)))
+            .flat_map(|(x, y)| [(x, y, 8, 8), (x + 1, y + 3, 6, 5)])
+            .collect();
+        let probes: Vec<_> = rects
+            .iter()
+            .map(|(x, y, w, h)| full_moon::parse(&format!("ice_probe = ice_at({x},{y},{w},{h})")).expect("parse probe"))
+            .collect();
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let (rx0, ry0) = celeste_interp::game_runner::start_room();
         it.cache = Some(std::sync::Arc::new(
-            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
+            celeste_core::collision_cache::CollisionCache::new(&cd, rx0, ry0).expect("cache"),
         ));
-        it.cart = Some(cd);
+        it.cart = Some(cd.clone());
         let st = cart::fresh_state::<Symbolic>(&mut it.d);
         let mut st = run_one(&mut it, &top, st).expect("toplevel");
         cart::inject_tile_flag_at(&mut st);
         let st = run_one(&mut it, &init, st).expect("_init");
-
-        // The start room has no ice, so the answer is false and exact.
-        let s = run_one(&mut it, &probe, st.clone()).expect("start room should answer");
-        let Some(Value::Bool(b)) = iface::get(&s, &[iface::key("ice_probe")]) else {
-            panic!("ice_at did not return a boolean")
+        let scan = |rx: i16, ry: i16, x: i16, y: i16, w: i16, h: i16| -> bool {
+            let p = |v: i16| crate::pico8_num::Pico8Num::from_i16(v);
+            (y.max(0) / 8..=((y + h - 1) / 8).min(15)).any(|ty| {
+                (x.max(0) / 8..=((x + w - 1) / 8).min(15)).any(|tx| {
+                    let t = cd.mget(p(rx * 16 + tx), p(ry * 16 + ty)).expect("mget");
+                    cd.fget(p(t as i16), p(4)).expect("fget")
+                })
+            })
         };
-        assert_eq!(it.d.decide(&b), Some(false), "the start room has no ice");
-
-        // Somewhere on the map there IS ice, and there it must raise
-        // rather than quietly answer false. Searched rather than
-        // hard-coded, so the test cannot pass by looking in the wrong
-        // place.
-        let mut refused = 0;
-        let mut answered = 0;
+        let (mut icy, mut dry) = (0, 0);
         for rx in 0..8i16 {
             for ry in 0..4i16 {
+                it.cache = Some(std::sync::Arc::new(
+                    celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
+                ));
                 let mut o = st.clone();
                 for (k, v) in [("x", rx), ("y", ry)] {
                     let n = it.d.num(crate::pico8_num::Pico8Num::from_i16(v));
                     iface::set(&mut o, &[iface::key("room"), iface::key(k)], Value::Num(n))
                         .expect("set room");
                 }
-                match run_one(&mut it, &probe, o) {
-                    Ok(_) => answered += 1,
-                    Err(e) => {
-                        assert!(
-                            format!("{:#}", e).contains("CONTAINS that flag"),
-                            "refused for the wrong reason: {:#}",
-                            e
-                        );
-                        refused += 1;
-                    }
+                let mut any = false;
+                for (&(x, y, w, h), probe) in rects.iter().zip(&probes) {
+                    let s = run_one(&mut it, probe, o.clone()).expect("ice_at answers");
+                    let Some(Value::Bool(b)) = iface::get(&s, &[iface::key("ice_probe")]) else {
+                        panic!("ice_at did not return a boolean")
+                    };
+                    let want = scan(rx, ry, x, y, w, h);
+                    assert_eq!(it.d.decide(&b), Some(want), "room ({rx},{ry}) ice_at({x},{y},{w},{h})");
+                    any |= want;
                 }
+                if any { icy += 1 } else { dry += 1 }
             }
         }
-        eprintln!("[ice] {} rooms answer false, {} raise", answered, refused);
-        assert!(refused > 0, "no room on the map has ice - then this guard is untested");
-        assert!(answered > 0, "every room raised - the guard is too coarse");
+        eprintln!("[ice] {icy} rooms with ice, {dry} without");
+        assert!(icy > 0 && dry > 0, "the map has rooms with and without ice");
     }
 
     /// `break` in a loop whose bound the tracer CANNOT know.

@@ -170,22 +170,16 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                     .clone()
                     .ok_or_else(|| anyhow!("tile_flag_at: no collision cache"))?;
                 let gi = |v: P8| v.as_i16().ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
-                // Only flag 0 (solid) reaches the graph. A non-zero
-                // flag is decided at TRACE time - it folds to false when
-                // the room provably has no such tile, and raises when it
-                // does - so a node carrying one means something upstream
-                // stopped doing that.
-                let r = if gi(num(a(4)?)?)? != 0 {
-                    bail!("tile_flag_at node with a non-zero flag: only flag 0 is modelled")
-                } else {
-                    cache.solid_at(
-                        &cart,
-                        gi(num(a(0)?)?)?,
-                        gi(num(a(1)?)?)?,
-                        gi(num(a(2)?)?)?,
-                        gi(num(a(3)?)?)?,
-                    )?
-                };
+                // Any flag: solid (0), ice (4). A flag no tile of the room
+                // carries folds to false at trace time and never gets here.
+                let r = cache.flag_at(
+                    &cart,
+                    gi(num(a(0)?)?)?,
+                    gi(num(a(1)?)?)?,
+                    gi(num(a(2)?)?)?,
+                    gi(num(a(3)?)?)?,
+                    gi(num(a(4)?)?)?,
+                )?;
                 Conc::Bool(r)
             }
             // A fork has no one value, and what resolving one leaves over an

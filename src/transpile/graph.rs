@@ -1329,8 +1329,7 @@ impl Graph {
     /// so this costs two map queries and introduces no new machinery.
     fn tile_flag_over(room: &Room, x: Val, y: Val, w: Val, h: Val, flag: Val) -> Result<Val> {
         // The size and flag must be exact. A symbolic hitbox is a
-        // different question, and only flag 0 (solid) ever reaches the
-        // graph - `trace::eval` raises on anything else.
+        // different question.
         let ex = |v: Val, what: &str| -> Result<i32> {
             v.as_exact()
                 .and_then(|n| n.as_i16())
@@ -1338,9 +1337,7 @@ impl Graph {
                 .ok_or_else(|| anyhow!("tile_flag_at: {} is not an exact integer", what))
         };
         let (w, h) = (ex(w, "w")?, ex(h, "h")?);
-        if ex(flag, "flag")? != 0 {
-            bail!("tile_flag_at: only flag 0 (solid) is modelled");
-        }
+        let flag = ex(flag, "flag")? as i16;
         // An interval covers every integer from floor(low) to
         // floor(high). Non-integer coordinates fail concretely, so
         // covering them here is conservative rather than wrong.
@@ -1358,7 +1355,7 @@ impl Graph {
         let cap = |n: i32| -> i16 { n.clamp(-4096, 4096) as i16 };
         let (dx, dy) = (xhi - xlo, yhi - ylo);
         let solid = |px: i32, py: i32, pw: i32, ph: i32| -> Result<bool> {
-            room.cache.solid_at(&room.cart, cap(px), cap(py), cap(pw), cap(ph))
+            room.cache.flag_at(&room.cart, cap(px), cap(py), cap(pw), cap(ph), flag)
         };
         if !solid(xlo, ylo, w + dx, h + dy)? {
             return Ok(Val::Bool(Some(false)));

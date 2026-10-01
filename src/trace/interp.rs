@@ -1799,36 +1799,23 @@ impl<'a, D: Domain> Interp<'a, D> {
             "tile_flag_at" => {
                 let (x, y, w, h, fl) = (num(0)?, num(1)?, num(2)?, num(3)?, num(4)?);
                 let gi = |v: P8| v.as_i16().ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
-                // THE FLAG DECIDES FIRST, before the coordinates.
-                //
-                // A non-zero flag is ice, and only flag 0 (solid) is
-                // modelled. Returning `false` for every other flag - which
-                // is what this did, and what the interpreter still does
-                // (`game_runner.rs`, with a "not ideal but allows testing"
-                // comment) - is right only where the room contains no such
-                // tile. 16 tiles carry flag 4 across map rows 2 and 3, and
-                // `ice_at` gates acceleration and the wall-slide every
-                // frame, so the first search in one of those rooms gets
-                // silently wrong physics. In BOTH engines at once, which
-                // is why the differential gate cannot see it.
+                // THE FLAG DECIDES FIRST, before the coordinates: a flag no
+                // tile of the loaded room carries (ice, outside the ice
+                // rooms) is false for every rectangle in the room - exact,
+                // and it keeps the node out of the graph. A flag the room
+                // does carry is answered like solid, by the cache
+                // (`CollisionCache::flag_at`) or a graph node. (Until
+                // 2026-10-01 a room with ice raised here: only flag 0 was
+                // modelled, and both engines had answered `false`
+                // everywhere before that guard.)
                 //
                 // Checking the flag before the coordinates matters: with a
                 // symbolic player position `ice_at` has unknown x and y,
-                // so an earlier version of this guard sat in the
-                // all-known branch and the call went straight past it into
-                // a graph node. Whether a room contains a flag does not
-                // depend on where in the room you look.
+                // so the room check must not sit in the all-known branch.
                 let Some(fi) = self.d.as_const(&fl).map(gi).transpose()? else {
                     bail!("tile_flag_at with an unknown flag");
                 };
-                if fi != 0 {
-                    if self.room_has_flag(&st, fi)? {
-                        bail!(
-                            "tile_flag_at with flag {} in a room that CONTAINS that flag: \
-                             only flag 0 (solid) is modelled",
-                            fi
-                        );
-                    }
+                if fi != 0 && !self.room_has_flag(&st, fi)? {
                     // No tile in this room carries it, so the answer is
                     // false for every rectangle in the room. Exact, and
                     // it keeps the node out of the graph entirely.
@@ -1850,7 +1837,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                                 .cart
                                 .clone()
                                 .ok_or_else(|| anyhow!("tile_flag_at: no cart"))?;
-                            let r = cache.solid_at(&cart, gi(x)?, gi(y)?, gi(w)?, gi(h)?)?;
+                            let r = cache.flag_at(&cart, gi(x)?, gi(y)?, gi(w)?, gi(h)?, fi)?;
                             (st, Value::Bool(self.d.boolean(r)))
                         }
                         _ => {

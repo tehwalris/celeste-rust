@@ -558,9 +558,8 @@ pub fn zn_mget(cart: &CartData, x: ZN, y: ZN) -> ZN {
     ZN::from_array(o)
 }
 
-/// tile_flag_at with uniform w/h/flag (runtime.rs bi_tile_flag_at):
-/// flag != 0 is constant-false; flag 0 goes through the precomputed solid
-/// map with the computed fallback.
+/// tile_flag_at with uniform w/h/flag: the precomputed map for the flag and
+/// box where there is one (`CollisionCache::flag_map`), else the scan.
 #[inline(always)]
 pub fn zn_tile_flag_at(
     cache: &CollisionCache,
@@ -572,23 +571,20 @@ pub fn zn_tile_flag_at(
     flag: P8,
 ) -> ZB {
     let f = flag.as_i16().expect("tile_flag_at: flag must be integer");
-    if f != 0 {
-        return zb_splat(false);
-    }
     let wi = w.as_i16().expect("tile_flag_at: w");
     let hi = h.as_i16().expect("tile_flag_at: h");
     let mut val = 0u16;
-    let solid = cache.solid_map(wi, hi);
+    let map = cache.flag_map(wi, hi, f);
     let (x, y) = (x.to_array(), y.to_array());
     for i in 0..W {
         let xi = x[i].as_i16().expect("tile_flag_at: x must be an integer");
         let yi = y[i].as_i16().expect("tile_flag_at: y must be an integer");
-        let b = match &solid {
+        let b = match &map {
             Some((map, dx, dy)) => match map.get(xi + dx, yi + dy) {
                 Some(v) => v,
-                None => cache.solid_at(cart, xi, yi, wi, hi).unwrap_or(false),
+                None => cache.flag_at(cart, xi, yi, wi, hi, f).expect("tile_flag_at"),
             },
-            None => cache.solid_at(cart, xi, yi, wi, hi).unwrap_or(false),
+            None => cache.flag_at(cart, xi, yi, wi, hi, f).expect("tile_flag_at"),
         };
         if b {
             val |= 1 << i;
@@ -624,9 +620,6 @@ pub fn zn_tile_flag_at_lanes(
     flag: P8,
 ) -> ZB {
     let f = flag.as_i16().expect("tile_flag_at: flag must be integer");
-    if f != 0 {
-        return zb_splat(false);
-    }
     let mut val = 0u16;
     let (x, y, w, h) = (x.to_array(), y.to_array(), w.to_array(), h.to_array());
     for i in 0..W {
@@ -634,7 +627,7 @@ pub fn zn_tile_flag_at_lanes(
         let yi = y[i].as_i16().expect("tile_flag_at: y must be an integer");
         let wi = w[i].as_i16().expect("tile_flag_at: w must be an integer");
         let hi = h[i].as_i16().expect("tile_flag_at: h must be an integer");
-        if cache.solid_at(cart, xi, yi, wi, hi).unwrap_or(false) {
+        if cache.flag_at(cart, xi, yi, wi, hi, f).expect("tile_flag_at") {
             val |= 1 << i;
         }
     }
