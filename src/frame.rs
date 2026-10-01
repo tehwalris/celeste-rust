@@ -2001,6 +2001,18 @@ impl ForwardState {
     /// Frame 0: seed the visited set from `initial`, checkpoint it, start
     /// recording the position graph if `record`.
     pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool) -> Result<Self> {
+        // A fresh tree: nothing a killed run left in `dir` may survive. Each
+        // frame's checkpoint replaces its own directory, but an edge run is
+        // one file per (layer, frame), so a stale run for a pair the new
+        // forward never writes would be read by the backward against the
+        // new rows (room (1,1) h94, a level killed and rerun at another
+        // precision: "marked id ... is past its file's rows").
+        for sub in ["frames", "edges"] {
+            let p = dir.join(sub);
+            if p.exists() {
+                std::fs::remove_dir_all(&p).with_context(|| p.display().to_string())?;
+            }
+        }
         // The checkpoint assigns the initial rows their ids (layer 0); the
         // door then takes each row under that id.
         checkpoint_frontier(dir, 0, &mut initial)?;
@@ -3028,6 +3040,29 @@ mod tests {
     /// block, checkpointing each frontier, and prove the checkpoint round-trips
     /// (reload a frame's states and match the count). Uses the interpreter (the
     /// oracle), so it is slow and needs the cart on disk; run explicitly.
+    /// A fresh forward in a directory a killed run left files in must not
+    /// keep any of them: a stale edge run for a (layer, frame) the new
+    /// forward never writes was read by the backward against the new rows
+    /// (room (1,1) h94, 2026-10-01).
+    #[test]
+    fn a_fresh_forward_clears_what_a_killed_run_left() {
+        let engine = RefEngine::new().expect("ref engine");
+        let init = vec![Block::from_state(&engine.initial_state().expect("initial state")).expect("block")];
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-fresh-start-test");
+        let _ = std::fs::remove_dir_all(dir);
+        let stale = [dir.join("edges/l9/f009.bin"), dir.join("edges/raw/f009/w0.bin"), dir.join("frames/f009/b0_s0.bin")];
+        for f in &stale {
+            std::fs::create_dir_all(f.parent().unwrap()).expect("mkdir");
+            std::fs::write(f, b"stale").expect("write");
+        }
+        ForwardState::start(init, dir, true).expect("start");
+        for f in &stale {
+            assert!(!f.exists(), "{} survived a fresh start", f.display());
+        }
+        assert!(dir.join("frames/f000").is_dir(), "frame 0 checkpointed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     #[ignore]
     fn forward_run_drives_the_reference_engine() {
