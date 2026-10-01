@@ -1538,7 +1538,23 @@ impl Domain for Symbolic {
         if t == f {
             return Some(*t);
         }
-        Some(self.unknown_bool_atom())
+        // Arms every lane holds alike (literals, other atoms - a fall floor's
+        // `collideable` writes under its undecided `state`): a fresh atom,
+        // which escapes the call as a fork (`escaped_atom`).
+        if self.lane_independent(*t) && self.lane_independent(*f) {
+            return Some(self.unknown_bool_atom());
+        }
+        // An arm that reads lane data - `collide`'s `other.collideable and
+        // <overlap>` joined on the floor's atom - is joined EXACTLY, in
+        // three-valued logic the kernels evaluate per lane (`zb_and`,
+        // `zb_or`): `(c and t) or (not c and f)`. A fresh atom here threw the
+        // lane's own overlap away, so every collision with an undecided floor
+        // read "maybe" wherever the floor was not folded out of the region -
+        // on the ground, or a wall, with nothing there (room (7,0), 2026-10-01).
+        let ct = self.and(c, t);
+        let nc = self.not(c);
+        let cf = self.and(&nc, f);
+        Some(self.or(&ct, &cf))
     }
 
     fn atoms_minted(&self) -> u32 {

@@ -397,6 +397,62 @@ enum Command {
     /// edges back `depth` steps through one predecessor each, printing the
     /// predecessor's cell and every field that differs from its successor:
     /// the history a single state carries, to be checked against the game.
+    /// DIAGNOSTIC: which of a COARSE level's states are SPURIOUS, measured
+    /// against a finer REAL tree, and where they first went wrong. Both
+    /// trees' rows are projected onto every named value cell except the
+    /// `--erase` prefixes (the fields the coarse level widens). In player
+    /// cell `x,y` at step `step`, the coarse tree's new states whose
+    /// projection the real tree never reached there by `step` are spurious;
+    /// their per-field value distributions are printed against the real ones'.
+    /// For `samples` of them, the recorded edges are walked back to the first
+    /// predecessor whose projection the real tree did reach (by its step):
+    /// the first spurious transition, printed as what changed across it.
+    /// DIAGNOSTIC: does one position SATURATE? Over steps 0..=`to`, the player
+    /// cell `x,y`'s cumulative distinct states (projected without the `--erase`
+    /// prefixes), distinct (spd.x, spd.y) pairs, and distinct "inner" states
+    /// (the projection without speed), every `every` steps.
+    CellSaturation {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        cell: String,
+        #[arg(long)]
+        to: u32,
+        #[arg(long, default_value = "")]
+        erase: String,
+        #[arg(long, default_value_t = 4)]
+        every: u32,
+    },
+    /// DIAGNOSTIC: re-run ONE stored state through the kernels of `--level`
+    /// and print every successor (projected without `--erase`), next to the
+    /// state itself: what the kernel makes of a single row. `--row L:S:R` is
+    /// the row's (layer, seq, row) in the tree's frame files.
+    RerunRow {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        row: String,
+        #[arg(long)]
+        level: String,
+        #[arg(long, default_value = "fall_floor")]
+        erase: String,
+    },
+    Spurious {
+        #[arg(long)]
+        real: String,
+        #[arg(long)]
+        coarse: String,
+        #[arg(long)]
+        step: u32,
+        #[arg(long)]
+        cell: String,
+        #[arg(long, default_value = "fall_floor")]
+        erase: String,
+        #[arg(long, default_value_t = 8)]
+        samples: usize,
+        #[arg(long, default_value_t = 40)]
+        depth: u32,
+    },
     Ancestry {
         #[arg(long)]
         level_dir: String,
@@ -687,6 +743,37 @@ fn project_frame(
 /// remainder (`player.x`, `spd.x`, `rem.y`, `dash_effect_time`), and every
 /// object's fields as `type[i].field` (and `type[i].field.sub` one table
 /// deeper). A cell no name reaches (a global's) is left out.
+/// A value cell for a diagnostic: numbers as decimals, intervals as ranges.
+fn av_show(v: celeste_engine::runtime2::AV) -> String {
+    use celeste_engine::runtime2::AV;
+    match v {
+        AV::Num(n) => format!("{}", n.as_raw_u32() as i32 as f64 / 65536.0),
+        AV::Ival(a, b) => format!("[{}, {}]", a.as_raw_u32() as i32 as f64 / 65536.0, b.as_raw_u32() as i32 as f64 / 65536.0),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Row `r`'s projection for a diagnostic: every named value cell
+/// (`cell_names`) but those whose name starts with an `erase` prefix, and no
+/// pointers (structure, renumbered between shapes).
+fn project_row(rt2: &celeste_engine::runtime2::Rt2, names: &std::collections::HashMap<usize, String>, r: u32, erase: &[String]) -> std::collections::BTreeMap<String, String> {
+    use celeste_engine::runtime2::Cell2;
+    names
+        .iter()
+        .filter(|(c, n)| matches!(rt2.structure[**c], Cell2::Val) && !erase.iter().any(|e| n.starts_with(e.as_str())))
+        .map(|(c, n)| (n.clone(), av_show(rt2.cols[*c].at(r as usize))))
+        .filter(|(_, v)| !v.starts_with("Ptr("))
+        .collect()
+}
+
+/// A projection's hash, for set membership.
+fn projection_key(p: &std::collections::BTreeMap<String, String>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    p.hash(&mut h);
+    h.finish()
+}
+
 fn cell_names(rt2: &celeste_engine::runtime2::Rt2, ids: &celeste_engine::runtime2::BoundaryIds) -> std::collections::HashMap<usize, String> {
     use celeste_engine::runtime2::{Cell2, Col, AV};
     let mut names = std::collections::HashMap::new();
@@ -2609,8 +2696,234 @@ fn main() -> Result<()> {
                 println!("[floor-reach]   {n:>9} lanes ({:.1}%): {} floors {set:?}", *n as f64 * 100.0 / lanes.max(1) as f64, set.len());
             }
         }
+        Command::CellSaturation { level_dir, cell, to, erase, every } => {
+            use celeste_rust::frame::frame_files_seq;
+            use celeste_rust::search::pos_graph::cell_of;
+            let ids = celeste_rust::compiled::ids();
+            let dir = std::path::Path::new(&level_dir);
+            let erase: Vec<String> = erase.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let (a, b) = cell.split_once(',').ok_or_else(|| anyhow::anyhow!("--cell x,y"))?;
+            let want = cell_of(a.trim().parse()?, b.trim().parse()?)?;
+            let (mut all, mut spd, mut inner) = (rustc_hash::FxHashSet::<u64>::default(), rustc_hash::FxHashSet::<u64>::default(), rustc_hash::FxHashSet::<u64>::default());
+            let mut first: Option<u32> = None;
+            println!("step | new | distinct states | speed pairs | inner (no speed)");
+            for s in 0..=to {
+                let mut new = 0u64;
+                for (_, f) in frame_files_seq(dir, s)? {
+                    for range in f.rows_of_cell(want) {
+                        let Some(rt2) = f.load_rows(&[range])? else { continue };
+                        let names = cell_names(&rt2, ids);
+                        for r in 0..rt2.width {
+                            let mut p = project_row(&rt2, &names, r as u32, &erase);
+                            new += 1;
+                            all.insert(projection_key(&p));
+                            let sp: Vec<String> = ["spd.x", "spd.y"].iter().map(|k| p.remove(*k).unwrap_or_default()).collect();
+                            spd.insert(projection_key(&sp.iter().enumerate().map(|(i, v)| (i.to_string(), v.clone())).collect()));
+                            inner.insert(projection_key(&p));
+                        }
+                    }
+                }
+                if new > 0 && first.is_none() {
+                    first = Some(s);
+                }
+                if first.is_some() && (s % every == 0 || s == to) {
+                    println!("{s:>4} | {new:>8} | {:>10} | {:>6} | {:>8}", all.len(), spd.len(), inner.len());
+                }
+            }
+        }
+        Command::RerunRow { level_dir, row, level, erase } => {
+            use celeste_rust::frame::{frame_files_seq, pack_id, Block};
+            use celeste_rust::interpreter::abstraction::{set_level, Level};
+            use celeste_rust::search::pos_graph::{block_cells, cell_xy};
+            let ids = celeste_rust::compiled::ids();
+            let dir = std::path::Path::new(&level_dir);
+            let erase: Vec<String> = erase.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let parts: Vec<u32> = row.split(':').map(|s| s.trim().parse()).collect::<Result<_, _>>()?;
+            let [layer, seq, r] = parts[..] else { anyhow::bail!("--row L:S:R") };
+            set_level(Level::parse(&level).map_err(|e| anyhow::anyhow!(e))?);
+            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+            let files = frame_files_seq(dir, layer)?;
+            let (_, f) = files.iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
+            let rt2 = f.load_rows(&[r..r + 1])?.ok_or_else(|| anyhow::anyhow!("no row"))?;
+            let names = cell_names(&rt2, ids);
+            let me = project_row(&rt2, &names, 0, &erase);
+            let at = |c: u32| cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string());
+            println!("[rerun] l{layer} s{seq} r{r} at {}:", at(f.row_cells()[r as usize]));
+            for (n, v) in &me {
+                println!("    {n} = {v}");
+            }
+            let block = Block::with_ids(rt2, vec![pack_id(layer, seq, r)], seq);
+            let tmp = std::env::temp_dir().join(format!("rerun-row-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            let door = celeste_rust::search::door::Door::for_current_level();
+            let (next, won, _) = celeste_rust::frame::forward_frame(&engine, vec![block], &door, None, None, layer + 1, Some(&tmp))?;
+            let _ = std::fs::remove_dir_all(&tmp);
+            let mut n = 0;
+            for b in &next {
+                let cells = block_cells(b.rt2())?;
+                let names = cell_names(b.rt2(), ids);
+                for i in 0..b.rt2().width {
+                    let p = project_row(b.rt2(), &names, i as u32, &erase);
+                    let changed: Vec<String> = p.iter().filter(|(k, v)| me.get(*k) != Some(*v)).map(|(k, v)| format!("{k}={v}")).collect();
+                    println!("  -> {} {}", at(cells[i]), changed.join(" "));
+                    n += 1;
+                }
+            }
+            println!("[rerun] {n} successors, win {won}");
+        }
+        Command::Spurious { real, coarse, step, cell, erase, samples, depth } => {
+            use celeste_engine::runtime2::Rt2;
+            use celeste_rust::frame::{frame_files_seq, id_layer, id_row, id_seq, pack_id};
+            use celeste_rust::search::pos_graph::{cell_of, cell_xy};
+            let ids = celeste_rust::compiled::ids();
+            let (real, coarse) = (std::path::Path::new(&real), std::path::Path::new(&coarse));
+            let erase: Vec<String> = erase.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let (a, b) = cell.split_once(',').ok_or_else(|| anyhow::anyhow!("--cell x,y"))?;
+            let want = cell_of(a.trim().parse()?, b.trim().parse()?)?;
+            let project = |rt2: &Rt2, names: &std::collections::HashMap<usize, String>, r: u32| project_row(rt2, names, r, &erase);
+            let key = projection_key;
+            // The real tree's projections in one cell, each with the first
+            // step it was reached at, through `step`.
+            let mut real_cells: std::collections::HashMap<u32, std::collections::HashMap<u64, u32>> = Default::default();
+            let mut real_vals: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> = Default::default();
+            type Dist = std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>;
+            let mut real_of = |c: u32, mut vals: Option<&mut Dist>| -> Result<std::collections::HashMap<u64, u32>> {
+                if let Some(m) = real_cells.get(&c) {
+                    return Ok(m.clone());
+                }
+                let mut m: std::collections::HashMap<u64, u32> = Default::default();
+                for s in 0..=step {
+                    for (_, f) in frame_files_seq(real, s)? {
+                        for range in f.rows_of_cell(c) {
+                            let Some(rt2) = f.load_rows(&[range])? else { continue };
+                            let names = cell_names(&rt2, ids);
+                            for r in 0..rt2.width {
+                                let p = project(&rt2, &names, r as u32);
+                                if let (Some(vals), true) = (vals.as_deref_mut(), s == step) {
+                                    for (n, v) in &p {
+                                        *vals.entry(n.clone()).or_default().entry(v.clone()).or_default() += 1;
+                                    }
+                                }
+                                m.entry(key(&p)).or_insert(s);
+                            }
+                        }
+                    }
+                }
+                real_cells.insert(c, m.clone());
+                Ok(m)
+            };
+            let here_real = real_of(want, Some(&mut real_vals))?;
+            let where_ = |c: u32| cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string());
+            // The coarse tree's new states in the cell at `step`.
+            let mut spurious: Vec<u64> = Vec::new();
+            let (mut total, mut sp_vals) = (0u64, std::collections::BTreeMap::<String, std::collections::BTreeMap<String, u64>>::new());
+            let mut co_vals: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> = Default::default();
+            for (seq, f) in frame_files_seq(coarse, step)? {
+                for range in f.rows_of_cell(want) {
+                    let lo = range.start;
+                    let Some(rt2) = f.load_rows(&[range])? else { continue };
+                    let names = cell_names(&rt2, ids);
+                    for r in 0..rt2.width {
+                        total += 1;
+                        let p = project(&rt2, &names, r as u32);
+                        let is_real = here_real.get(&key(&p)).is_some_and(|&s| s <= step);
+                        let into = if is_real { &mut co_vals } else { &mut sp_vals };
+                        for (n, v) in &p {
+                            *into.entry(n.clone()).or_default().entry(v.clone()).or_default() += 1;
+                        }
+                        if !is_real {
+                            spurious.push(pack_id(step, seq, lo + r as u32));
+                        }
+                    }
+                }
+            }
+            println!("[spurious] {}: step {step}: coarse {total} new states, {} spurious (projection never reached by the real tree), real tree {} distinct projections by then", where_(want), spurious.len(), here_real.len());
+            // Per-field distributions: real tree at this step, coarse real-looking, coarse spurious.
+            let fmt_dist = |m: Option<&std::collections::BTreeMap<String, u64>>| -> String {
+                let Some(m) = m else { return "-".into() };
+                let mut v: Vec<(&String, &u64)> = m.iter().collect();
+                v.sort_by(|a, b| b.1.cmp(a.1));
+                let n = v.len();
+                let top: Vec<String> = v.iter().take(8).map(|(k, c)| format!("{k}:{c}")).collect();
+                format!("{n} values; {}", top.join(" "))
+            };
+            let mut fields: Vec<&String> = sp_vals.keys().chain(real_vals.keys()).collect();
+            fields.sort();
+            fields.dedup();
+            for nm in fields {
+                let distinct = |m: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>| m.get(nm).map_or(0, |x| x.len());
+                if distinct(&sp_vals).max(distinct(&real_vals)).max(distinct(&co_vals)) <= 1 {
+                    continue;
+                }
+                println!("  {nm}\n    real     {}\n    coarse-ok {}\n    spurious {}", fmt_dist(real_vals.get(nm)), fmt_dist(co_vals.get(nm)), fmt_dist(sp_vals.get(nm)));
+            }
+            // Walk samples back to their first spurious transition.
+            let edges = celeste_rust::search::edges::EdgeGraph::open(&coarse.join("edges"), step)?;
+            let load = |id: u64| -> Result<(Rt2, u32)> {
+                let files = frame_files_seq(coarse, id_layer(id))?;
+                let (_, f) = files.iter().find(|(s, _)| *s == id_seq(id)).ok_or_else(|| anyhow::anyhow!("no file for id {id:#x}"))?;
+                let r = id_row(id);
+                let rt2 = f.load_rows(&[r..r + 1])?.ok_or_else(|| anyhow::anyhow!("no row"))?;
+                Ok((rt2, f.row_cells()[r as usize]))
+            };
+            let n = samples.min(spurious.len());
+            for k in 0..n {
+                let mut id = spurious[k * spurious.len() / n];
+                let (rt2, c) = load(id)?;
+                let names = cell_names(&rt2, ids);
+                let mut cur = project(&rt2, &names, 0);
+                let mut cur_cell = c;
+                println!("\n[spurious] sample {k}: l{} {}", id_layer(id), where_(c));
+                let mut found = false;
+                for _ in 0..depth {
+                    let layer = id_layer(id);
+                    if layer == 0 {
+                        break;
+                    }
+                    let mut buf = Vec::new();
+                    edges.preds_at(id, layer, &mut buf);
+                    let preds: Vec<u64> = buf.iter().flat_map(|e| (0..64u64).filter(move |i| e.mask >> i & 1 == 1).map(move |i| e.base + i)).collect();
+                    // Prefer a REAL predecessor: then this step is the first spurious one.
+                    let mut chosen: Option<(u64, std::collections::BTreeMap<String, String>, u32, bool)> = None;
+                    for &p in &preds {
+                        let (rt, pc) = load(p)?;
+                        let nm = cell_names(&rt, ids);
+                        let pp = project(&rt, &nm, 0);
+                        let is_real = real_of(pc, None)?.get(&key(&pp)).is_some_and(|&s| s <= id_layer(p));
+                        if is_real || chosen.is_none() {
+                            chosen = Some((p, pp, pc, is_real));
+                        }
+                        if is_real {
+                            break;
+                        }
+                    }
+                    let Some((p, pp, pc, is_real)) = chosen else {
+                        println!("  no recorded predecessor at l{layer}");
+                        break;
+                    };
+                    if is_real {
+                        let changed: Vec<String> = cur.iter().filter(|(nm, v)| pp.get(*nm) != Some(*v)).map(|(nm, v)| format!("{nm}: {} -> {v}", pp.get(nm).map(|s| s.as_str()).unwrap_or("absent"))).collect();
+                        println!("  FIRST SPURIOUS STEP l{} s{} r{} -> l{}: {} -> {} ({} preds): {}", id_layer(p), id_seq(p), id_row(p), layer, where_(pc), where_(cur_cell), preds.len(), changed.join(", "));
+                        // The whole real predecessor, unprojected: the floors too.
+                        let (rt, _) = load(p)?;
+                        let nm = cell_names(&rt, ids);
+                        let full = project_row(&rt, &nm, 0, &[]);
+                        println!("    predecessor (full): {}", full.iter().filter(|(n, _)| !n.contains("hitbox") && !n.contains(".type.") && !n.ends_with(".solids") && !n.contains(".flip.y") && !n.ends_with(".spr") || n.starts_with("spring") || n.starts_with("balloon")).map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(" "));
+                        found = true;
+                        break;
+                    }
+                    println!("  <- l{} {} still spurious", id_layer(p), where_(pc));
+                    id = p;
+                    cur = pp;
+                    cur_cell = pc;
+                }
+                if !found {
+                    println!("  (no real predecessor within {depth} steps)");
+                }
+            }
+        }
         Command::Ancestry { level_dir, frame, cell, samples, depth } => {
-            use celeste_engine::runtime2::{Cell2, Rt2, AV};
+            use celeste_engine::runtime2::{Cell2, Rt2};
             use celeste_rust::frame::{frame_files_seq, id_layer, id_row, id_seq, pack_id};
             use celeste_rust::search::pos_graph::{cell_of, cell_xy};
             let dir = std::path::Path::new(&level_dir);
@@ -2626,15 +2939,8 @@ fn main() -> Result<()> {
                 let rt2 = f.load_rows(&[r..r + 1])?.ok_or_else(|| anyhow::anyhow!("no row for id {id:#x}"))?;
                 Ok((rt2, f.shape_hash(), f.row_cells()[r as usize]))
             };
-            let show = |v: AV| -> String {
-                match v {
-                    AV::Num(n) => format!("{}", n.as_raw_u32() as i32 as f64 / 65536.0),
-                    AV::Ival(a, b) => format!("[{}, {}]", a.as_raw_u32() as i32 as f64 / 65536.0, b.as_raw_u32() as i32 as f64 / 65536.0),
-                    other => format!("{other:?}"),
-                }
-            };
             let fields = |rt2: &Rt2| -> std::collections::BTreeMap<String, String> {
-                cell_names(rt2, ids).into_iter().filter(|(c, _)| matches!(rt2.structure[*c], Cell2::Val)).map(|(c, n)| (n, show(rt2.cols[c].at(0)))).collect()
+                cell_names(rt2, ids).into_iter().filter(|(c, _)| matches!(rt2.structure[*c], Cell2::Val)).map(|(c, n)| (n, av_show(rt2.cols[c].at(0)))).collect()
             };
             let where_ = |c: u32| cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string());
             let mut here: Vec<u64> = Vec::new();
