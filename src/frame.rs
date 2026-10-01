@@ -1439,12 +1439,24 @@ pub fn spd_width_log2(spd: crate::interpreter::abstraction::SpdPrecision) -> Opt
     }
 }
 
+/// The fall-floor projection a level's rows are keyed on (`Rt2::widen_to`).
+pub fn floors_widening(floors: crate::interpreter::abstraction::FloorsPrecision) -> celeste_engine::runtime2::FloorsWidening {
+    use crate::interpreter::abstraction::FloorsPrecision as P;
+    use celeste_engine::runtime2::FloorsWidening as W;
+    match floors {
+        P::Exact => W::Exact,
+        P::Unknown => W::Unknown,
+        P::Timers => W::Timers,
+        P::Near => W::Near,
+    }
+}
+
 /// `rt2` projected IN PLACE onto `level` (`Rt2::widen_to`): the row the
 /// level's kernels would store for it. The exact level projects nothing.
 pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::interpreter::abstraction::Level) {
     use crate::interpreter::abstraction::RemPrecision;
     if let RemPrecision::Bits(b) = level.rem {
-        rt2.widen_to(crate::compiled::ids(), b, spd_width_log2(level.spd), (level.pos.x, level.pos.y), level.held.is_unknown(), level.fruit.is_unknown(), level.floors.is_unknown(), level.floors.is_timers(), level.platforms.is_unknown());
+        rt2.widen_to(crate::compiled::ids(), b, spd_width_log2(level.spd), (level.pos.x, level.pos.y), level.held.is_unknown(), level.fruit.is_unknown(), floors_widening(level.floors), level.platforms.is_unknown());
     }
 }
 

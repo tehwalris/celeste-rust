@@ -187,6 +187,10 @@ pub struct Iface {
     /// from something and every other consumer wants one. What makes the
     /// slot an interval is this flag, which the emitter turns into an
     /// `ival` input and the tracer into a value it will fork on.
+    ///
+    /// On a BOOLEAN slot the flag says a lane may hold it unknown (a near
+    /// level's floor `collideable`, `widen::fork_near_floor_inputs`): the
+    /// emitter makes it a `ubool` input, whose known mask the kernel reads.
     pub ival: Vec<bool>,
 }
 
@@ -272,19 +276,22 @@ pub fn symbolize(
         d.graph.set_cell_kind(
             i as u32,
             match (&c, ival.contains(p)) {
+                (Conc::Bool(_), _) => crate::transpile::graph::CellKind::Bool,
                 (_, true) => crate::transpile::graph::CellKind::Ival,
                 (Conc::Num(_), _) => crate::transpile::graph::CellKind::Num,
-                (Conc::Bool(_), _) => crate::transpile::graph::CellKind::Bool,
             },
         );
         init.push(c);
         set(st, p, new)?;
     }
     let ival: Vec<bool> = slots.iter().map(|p| ival.contains(p)).collect();
+    // A NUMBER slot in `ival` is an interval; a boolean one a boolean a lane
+    // may hold unknown (`Iface::ival`), which is no interval cell.
     d.ival_cells = ival
         .iter()
+        .zip(&init)
         .enumerate()
-        .filter(|(_, b)| **b)
+        .filter(|(_, (b, c))| **b && matches!(c, Conc::Num(_)))
         .map(|(i, _)| i as u32)
         .collect();
     d.forget_intervals();

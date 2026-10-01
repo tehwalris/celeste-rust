@@ -605,6 +605,10 @@ pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> (Graph, Vec<Spec
                 use celeste_core::pico8_num::Pico8Num;
                 use celeste_engine::runtime2::AV;
                 match sp.get(node).op {
+                    // A point in an INTERVAL field is the interval `[v, v]`:
+                    // the field's column is an interval column, which keys a
+                    // point as one (`asm_kernel::KeyRead::NumAsIval`).
+                    Op::Const(lo, hi) if lo == hi && f.ty == "ZI" => Some(AV::Ival(Pico8Num::from_raw(lo), Pico8Num::from_raw(lo))),
                     Op::Const(lo, hi) if lo == hi => Some(AV::Num(Pico8Num::from_raw(lo))),
                     Op::Const(lo, hi) => {
                         Some(AV::Ival(Pico8Num::from_raw(lo), Pico8Num::from_raw(hi)))

@@ -85,6 +85,9 @@ pub fn run_frame_all<'a>(
             let b = it.d.cursor.choose(2) == 1;
             st.heap.tables.get_mut(t).expect("an unknown field's table").hash.insert(k.clone(), crate::trace::heap::Value::Bool(b));
         }
+        if level.floors == crate::interpreter::abstraction::FloorsPrecision::Near {
+            concretize_near_floors(&mut st, &mut it.d)?;
+        }
         crate::trace::widen::fork_pos_inputs(&mut st, &mut it.d, pos)?;
         let mut out = run_one(it, body, st)?;
         // The absent-as-zero fields, as the tracer's `trace_frame` writes them.
@@ -99,6 +102,27 @@ pub fn run_frame_all<'a>(
         }
     }
     Ok(outputs)
+}
+
+/// A near level's floors, concretized per path as the kernels read them
+/// (`widen::fork_near_floor_inputs`): a widened `state` (an interval) is each
+/// whole number in it, by the cursor, and `collideable` is `state ~= 2` - the
+/// cart keeps the two in step, so a stored unknown `collideable` is not a
+/// separate choice.
+fn concretize_near_floors(st: &mut State<RefDomain>, d: &mut RefDomain) -> Result<()> {
+    use crate::pico8_num::{Pico8Num as P8, Pico8NumInterval as Iv};
+    use crate::trace::heap::Value;
+    use crate::trace::iface;
+    use crate::trace::widen::{field, objects_of_type};
+    for obj in objects_of_type(st, "fall_floor") {
+        let (ps, pc) = (field(&obj, &["state"]), field(&obj, &["collideable"]));
+        let Some(Value::Num(v)) = iface::get(st, &ps) else { bail!("{}: not a number", iface::show(&ps)) };
+        let (lo, hi) = (v.low.as_i16_or_err()?, v.high.as_i16_or_err()?);
+        let k = lo + d.cursor.choose((hi - lo + 1) as u32) as i16;
+        iface::set(st, &ps, Value::Num(Iv::from_number(P8::from_i16(k))))?;
+        iface::set(st, &pc, Value::Bool(k != 2))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

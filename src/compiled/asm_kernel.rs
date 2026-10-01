@@ -48,6 +48,11 @@ struct AsmField {
     root: usize,
     off: usize,
     kind: RootKind,
+    /// A boolean root an output widening may write UNKNOWN in some lanes (it
+    /// reads the canonical output unknown, `Symbolic::unknown_bool_output`: a
+    /// near level's floor `collideable`). Any other undecided boolean is a
+    /// branch on an unknown that no premise declined, and fatal (`push_row`).
+    may_unknown: bool,
 }
 
 /// One fused body (a distinct (outcome, choices) with distinct outputs):
@@ -1051,6 +1056,25 @@ impl AsmKernel {
                     }
                     buf[off..off + 2].copy_from_slice(&mask.to_le_bytes());
                 }
+                InputView::UBool(col) => {
+                    let (mut val, mut known) = (0u16, 0u16);
+                    for l in 0..16 {
+                        match col[lane(l)] {
+                            AV::Bool(b) => {
+                                known |= 1 << l;
+                                val |= (b as u16) << l;
+                            }
+                            AV::UBool => {}
+                            other => panic!("ASM maybe-unknown bool input lane holds {other:?}"),
+                        }
+                    }
+                    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
+                    buf[off + 2..off + 4].copy_from_slice(&known.to_le_bytes());
+                }
+                InputView::UBoolU(val, known) => {
+                    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
+                    buf[off + 2..off + 4].copy_from_slice(&known.to_le_bytes());
+                }
                 InputView::Any(col, repr) => {
                     // The general case (a materialized `AV` column feeding a
                     // numeric input): per value, as before.
@@ -1067,7 +1091,7 @@ impl AsmKernel {
                                 buf[off + 64 + l * 4..off + 64 + l * 4 + 4]
                                     .copy_from_slice(&b.to_le_bytes());
                             }
-                            CellRepr::Bool => unreachable!("bool inputs are Bool/BoolU views"),
+                            CellRepr::Bool | CellRepr::UBool => unreachable!("bool inputs are Bool/BoolU/UBool/UBoolU views"),
                         }
                     }
                 }
@@ -1159,7 +1183,8 @@ struct BodyCols {
     /// outcome that sets it exactly (`spd.x = 0` on a wall, the spring's
     /// `spd.y = -3`) computes a number for it (the speed hull, 2026-09-15).
     num_as_ival: Vec<(usize, usize)>,
-    bool_: Vec<(usize, usize)>,
+    /// `(column, root, may the root be unknown)` (`AsmField::may_unknown`).
+    bool_: Vec<(usize, usize, bool)>,
     /// The speed hull's columns when the level buckets the speed: the
     /// queue column and output root of `spd.x` and `spd.y`, each root a
     /// number (`is_num`) or an interval. `None` at exact speed.
@@ -1187,7 +1212,7 @@ impl BodyCols {
                 (RootKind::Num, TCol::Num(_)) => num.push((ci, f.off)),
                 (RootKind::Ival, TCol::Ival(_)) => ival.push((ci, f.off)),
                 (RootKind::Num, TCol::Ival(_)) => num_as_ival.push((ci, f.off)),
-                (RootKind::Bool, TCol::Bool(_)) => bool_.push((ci, f.off)),
+                (RootKind::Bool, TCol::Bool(_)) => bool_.push((ci, f.off, f.may_unknown)),
                 (k, _) => anyhow::bail!("body field cell {} kind {:?} disagrees with the shape's column", f.cell, k),
             }
         }
@@ -1204,12 +1229,11 @@ impl BodyCols {
                 (TCol::Ival(_), AV::Ival(a, b)) => uniform_ival.push((ci, (a.as_raw_u32(), b.as_raw_u32()))),
                 (TCol::Ival(_), AV::Num(n)) => uniform_ival.push((ci, (n.as_raw_u32(), n.as_raw_u32()))),
                 (TCol::Bool(_), AV::Bool(x)) => uniform_bool.push((ci, *x as u8)),
-                // A per-row column never stores an undecided boolean: bool
-                // inputs are decided (`InputView::of` refuses an unknown), a
-                // branch on an unknown declines through its `Known` premise,
-                // and the one widened-to-unknown boolean (the held-button
-                // trails) is a uniform output column, not a root.
-                (TCol::Bool(_), AV::UBool) => anyhow::bail!("union column at cell {cell} is a uniform undecided boolean"),
+                // The canonical output unknown an output widening writes
+                // (`TCol::Bool`'s 2): a near level's floor `collideable` is
+                // unknown in the outcomes where the player is statically far
+                // from the floor, and per lane in the others.
+                (TCol::Bool(_), AV::UBool) => uniform_bool.push((ci, 2)),
                 (_, v) => anyhow::bail!("union column at cell {cell}: the outcome's uniform {v:?} does not fit its kind"),
             }
         }
@@ -1261,19 +1285,20 @@ impl BodyCols {
                 v.push((n, n));
             }
         }
-        for &(ci, root) in &self.bool_ {
+        for &(ci, root, may_unknown) in &self.bool_ {
             if let TCol::Bool(v) = &mut slot.cols[ci].1 {
                 let val = u16::from_le_bytes([buf[root], buf[root + 1]]);
                 let known = u16::from_le_bytes([buf[root + 2], buf[root + 3]]);
-                // FATAL, not a `2`: an undecided boolean here means a branch
-                // on an unknown reached the output without its `Known`
-                // premise declining the lane - and a stored one would be
-                // refused as an input next frame (`InputView::of`).
-                assert!(
-                    known >> i & 1 != 0,
-                    "emitted row holds an undecided boolean (column {ci}, root {root}): no premise declined it"
-                );
-                v.push((val >> i & 1) as u8);
+                if known >> i & 1 == 0 {
+                    // FATAL, not a `2`, unless an output widening wrote it
+                    // (`AsmField::may_unknown`): an undecided boolean here
+                    // means a branch on an unknown reached the output without
+                    // its `Known` premise declining the lane.
+                    assert!(may_unknown, "emitted row holds an undecided boolean (column {ci}, root {root}): no premise declined it");
+                    v.push(2);
+                } else {
+                    v.push((val >> i & 1) as u8);
+                }
             }
         }
         for &(ci, n) in &self.uniform_num {
@@ -1305,6 +1330,10 @@ enum InputView<'c> {
     IvalU(u32, u32),
     Bool(&'c [AV]),
     BoolU(u16),
+    /// A bool a lane may hold unknown (`CellRepr::UBool`): per lane, or
+    /// uniform `(val, known)`.
+    UBool(&'c [AV]),
+    UBoolU(u16, u16),
     Any(&'c Col, CellRepr),
 }
 
@@ -1326,6 +1355,10 @@ impl<'c> InputView<'c> {
                 other => return Err(format!("ASM bool input column holds {other:?}: a kernel reads a boolean the block does not decide")),
             },
             (CellRepr::Bool, other) => return Err(format!("ASM bool input column is {other:?}")),
+            (CellRepr::UBool, Col::V(v)) => InputView::UBool(v),
+            (CellRepr::UBool, Col::U(AV::Bool(b))) => InputView::UBoolU(if *b { 0xffff } else { 0 }, 0xffff),
+            (CellRepr::UBool, Col::U(AV::UBool)) => InputView::UBoolU(0, 0),
+            (CellRepr::UBool, other) => return Err(format!("ASM maybe-unknown bool input column is {other:?}")),
             (repr, other) => InputView::Any(other, repr),
         })
     }
@@ -1349,7 +1382,7 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     } else {
         // The key hashes the speed BUCKET (the row stores the hull).
         if let Some(w) = crate::interpreter::abstraction::spd_precision().width_log2() {
-            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1), false, false, false, false, false);
+            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1), false, false, celeste_engine::runtime2::FloorsWidening::Exact, false);
         }
         b.boundary(&super::boundary_ids());
     }
@@ -2251,6 +2284,16 @@ fn build_one_shape(
         }
     }
 
+    // Which fused nodes read the canonical output unknown
+    // (`AsmField::may_unknown`): one pass in node order, operands first.
+    let reads_unknown_output: Vec<bool> = {
+        let mut out = vec![false; fused.len()];
+        for n in 0..fused.len() {
+            let node = fused.get(n as crate::transpile::graph::NodeId);
+            out[n] = node.op == crate::transpile::graph::Op::UnknownBool(u32::MAX) || node.args.iter().any(|a| out[*a as usize]);
+        }
+        out
+    };
     // Map each fused body's roots onto their SLOTS: the bodies' roots
     // concatenated in order, through `slot_of`.
     let mut off = 0usize;
@@ -2271,6 +2314,7 @@ fn build_one_shape(
                 root: slot_of[off + j],
                 off: compiled.root_offsets[slot_of[off + j]] as usize,
                 kind: compiled.root_kinds[slot_of[off + j]],
+                may_unknown: reads_unknown_output[b.roots[j] as usize],
             })
             .collect();
         // The body's rows' speed key (the queue they land in): the bucket
@@ -2328,7 +2372,10 @@ fn build_one_shape(
                     Some(k) => slot_of[off + nfields + 2 + k],
                     None => slot_of[off + j],
                 };
-                Some(KeyField::new(outputs[j].0 as u64, compiled.root_offsets[root] as usize, compiled.root_kinds[root], keyed.is_some()))
+                // A number root of an INTERVAL field is stored `[v, v]`
+                // (`BodyCols::num_as_ival`) and keyed as that interval.
+                let span = keyed.is_some() || out_fields[j].ty == "ZI";
+                Some(KeyField::new(outputs[j].0 as u64, compiled.root_offsets[root] as usize, compiled.root_kinds[root], span))
             })
             .collect();
         asm_bodies.push(AsmBody {
@@ -2569,7 +2616,7 @@ const POS_SLOTS: usize = 4;
 const HELD_SLOTS: usize = 2;
 // The fly fruit exact or unknown, the fall floors exact or unknown.
 const FRUIT_SLOTS: usize = 2;
-const FLOORS_SLOTS: usize = 3;
+const FLOORS_SLOTS: usize = 4;
 const PLATFORMS_SLOTS: usize = 2;
 const LEVEL_SLOTS: usize = 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS * PLATFORMS_SLOTS;
 
@@ -2694,6 +2741,7 @@ fn level_slot(level: crate::interpreter::abstraction::Level) -> usize {
         crate::interpreter::abstraction::FloorsPrecision::Exact => 0,
         crate::interpreter::abstraction::FloorsPrecision::Unknown => 1,
         crate::interpreter::abstraction::FloorsPrecision::Timers => 2,
+        crate::interpreter::abstraction::FloorsPrecision::Near => 3,
     };
     let platforms_slot = level.platforms.is_unknown() as usize;
     (((((rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot) * HELD_SLOTS + held_slot) * FRUIT_SLOTS + fruit_slot) * FLOORS_SLOTS + floors_slot) * PLATFORMS_SLOTS + platforms_slot
@@ -2776,7 +2824,7 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
     let mode = super::dispatch::traced_mode_for(rem);
     let (opts, exact) = match mode {
-        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos).with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()).with_floor_timers(level.floors.is_timers()).with_platforms(level.platforms.is_unknown()), false),
+        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos).with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()).with_floor_timers(level.floors.widens_timers()).with_floors_near(level.floors.is_near()).with_platforms(level.platforms.is_unknown()), false),
         super::dispatch::TracedMode::Level0Agnostic => {
             // Phase 1: the opt-in rung-specific variant bakes the rem
             // widening into the graph (`ladder_widen`), still through
@@ -2786,7 +2834,7 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
                 (true, RemPrecision::Bits(b)) => WalkOpts::ladder_widen(b, level.spd),
                 _ => WalkOpts::LADDER,
             };
-            (opts.with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()).with_floor_timers(level.floors.is_timers()).with_platforms(level.platforms.is_unknown()), true)
+            (opts.with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()).with_floor_timers(level.floors.widens_timers()).with_floors_near(level.floors.is_near()).with_platforms(level.platforms.is_unknown()), true)
         }
         super::dispatch::TracedMode::ExactRem => (WalkOpts::EXACT, true),
     };

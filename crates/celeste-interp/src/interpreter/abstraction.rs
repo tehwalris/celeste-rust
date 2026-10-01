@@ -409,10 +409,17 @@ impl FruitPrecision {
 /// and the balloon's respawn `timer` - as their whole ranges
 /// (`widen::widen_floor_timers`): an idle floor never reads its `delay`, so
 /// an untouched floor stays exact, and a broken one may fall or come back on
-/// any frame. The finer levels keep them exact.
+/// any frame. `Near` (2026-09-30, room (7,0)) is `Timers` plus each floor's
+/// `state` and `collideable` widened as `Unknown` widens them - `state` the
+/// interval [0, 2], `collideable` unknown - EXCEPT where the player overlaps
+/// the floor at the end of the frame (`runtime2::floor_player_window`), where
+/// they stay exact (`widen::widen_near_floors`): at `Unknown`, a player that
+/// entered a hidden floor was refused every move once the floor read "maybe
+/// back", and sat inside it for good. The finer levels keep them exact.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FloorsPrecision {
     Unknown,
+    Near,
     Timers,
     Exact,
 }
@@ -427,15 +434,27 @@ impl FloorsPrecision {
         self == FloorsPrecision::Timers
     }
 
+    /// Widened except where the player overlaps the floor (`Near`).
+    pub fn is_near(self) -> bool {
+        self == FloorsPrecision::Near
+    }
+
+    /// Are the countdowns stored as their whole ranges (`Timers`, and `Near`,
+    /// which is `Timers` plus the overlap-conditional widening)?
+    pub fn widens_timers(self) -> bool {
+        matches!(self, FloorsPrecision::Timers | FloorsPrecision::Near)
+    }
+
     fn rank(self) -> u8 {
         match self {
-            FloorsPrecision::Unknown => 2,
+            FloorsPrecision::Unknown => 3,
+            FloorsPrecision::Near => 2,
             FloorsPrecision::Timers => 1,
             FloorsPrecision::Exact => 0,
         }
     }
 
-    /// Unknown covers timers, which covers exact.
+    /// Unknown covers near, which covers timers, which covers exact.
     pub fn coarser_or_equal(self, finer: FloorsPrecision) -> bool {
         self.rank() >= finer.rank()
     }
@@ -548,12 +567,13 @@ impl Level {
             && self.platforms.coarser_or_equal(finer.platforms)
     }
 
-    /// One level from `[x<w>][y<w>]r<k|x>s<w|x>[h][f][b|t]`: an optional position
+    /// One level from `[x<w>][y<w>]r<k|x>s<w|x>[h][f][b|n|t]`: an optional position
     /// bucket width per axis in pixels (2; absent = exact), rem rung k
     /// (0..=15) or exact, spd bucket width 2^w raw units or exact, and `h`
     /// for held buttons unknown (absent = exact), then `f` for the fly fruit
-    /// unknown, then `b` for the fall floors unknown or `t` for only their
-    /// timers (absent = exact).
+    /// unknown, then `b` for the fall floors unknown, `n` for them widened
+    /// except where the player overlaps one, or `t` for only their timers
+    /// (absent = exact).
     pub fn parse(spec: &str) -> Result<Level, String> {
         let mut s = spec.trim();
         let mut pos = PosPrecision::EXACT;
@@ -590,12 +610,16 @@ impl Level {
             Some(t) => (t, PlatformsPrecision::Unknown),
             None => (sp, PlatformsPrecision::Exact),
         };
-        // `b`: the fall floors unknown, `t`: only their timers. No speed
-        // token ends in either.
-        let (sp, floors) = match (sp.strip_suffix('b'), sp.strip_suffix('t')) {
-            (Some(t), _) => (t, FloorsPrecision::Unknown),
-            (None, Some(t)) => (t, FloorsPrecision::Timers),
-            (None, None) => (sp, FloorsPrecision::Exact),
+        // `b`: the fall floors unknown, `n`: unknown but where the player
+        // overlaps one, `t`: only their timers. No speed token ends in any.
+        let (sp, floors) = if let Some(t) = sp.strip_suffix('b') {
+            (t, FloorsPrecision::Unknown)
+        } else if let Some(t) = sp.strip_suffix('n') {
+            (t, FloorsPrecision::Near)
+        } else if let Some(t) = sp.strip_suffix('t') {
+            (t, FloorsPrecision::Timers)
+        } else {
+            (sp, FloorsPrecision::Exact)
         };
         // `f`: the fly fruit unknown. No speed token ends in `f`.
         let (sp, fruit) = match sp.strip_suffix('f') {
@@ -685,6 +709,7 @@ impl std::fmt::Display for Level {
         }
         match self.floors {
             FloorsPrecision::Unknown => write!(f, "/B")?,
+            FloorsPrecision::Near => write!(f, "/N")?,
             FloorsPrecision::Timers => write!(f, "/T")?,
             FloorsPrecision::Exact => {}
         }
@@ -777,7 +802,8 @@ static FLOORS_PRECISION: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomic
 
 pub fn floors_precision() -> FloorsPrecision {
     match FLOORS_PRECISION.load(std::sync::atomic::Ordering::Relaxed) {
-        2 => FloorsPrecision::Unknown,
+        3 => FloorsPrecision::Unknown,
+        2 => FloorsPrecision::Near,
         1 => FloorsPrecision::Timers,
         _ => FloorsPrecision::Exact,
     }
@@ -1756,6 +1782,14 @@ mod tests {
         assert!(Level::parse_ladder("r0sxhb,r0sxht,r0sxh,rxsx").is_ok());
         assert!(Level::parse_ladder("r0sxh,r0sxht,rxsx").is_err());
         assert!(Level::parse_ladder("r0sxht,r0sxhb,rxsx").is_err());
+        // Widened except where the player overlaps: between unknown and timers.
+        let hn = Level::parse("r0sxhn").unwrap();
+        assert!(hn.floors.is_near() && hn.floors.widens_timers() && hn.grid_consistent());
+        assert_eq!(format!("{hn}"), "Bits(0)/H/N");
+        assert!(Level::parse_ladder("r0sxhb,r0sxhn,r0sxht,r0sxh,rxsx").is_ok());
+        assert!(Level::parse_ladder("r0sxhn,r0sxh,r1sxh,rxsx").is_ok());
+        assert!(Level::parse_ladder("r0sxht,r0sxhn,rxsx").is_err());
+        assert!(Level::parse_ladder("r0sxhn,r0sxhb,rxsx").is_err());
         assert!(Level::parse_ladder("r0sxhf,r0sxhfb,rxsx").is_err());
         assert_eq!(Level::parse("r1s20xh").unwrap().spd, SpdPrecision::WidthLog2X(20));
         assert!(!Level::parse("rxsxh").unwrap().grid_consistent());

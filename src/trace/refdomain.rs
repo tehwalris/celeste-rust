@@ -101,6 +101,15 @@ impl RefDomain {
     }
 }
 
+/// The unknown number: the whole 16.16 range.
+fn unknown() -> Iv {
+    Iv::new(P8::from_raw(i32::MIN), P8::from_raw(i32::MAX))
+}
+
+fn is_unknown(v: &Iv) -> bool {
+    v.low == P8::from_raw(i32::MIN) && v.high == P8::from_raw(i32::MAX)
+}
+
 /// Interval floor helper: how many distinct integer floors `v` spans, and the
 /// sub-interval clipped to the `k`-th one (`k in 0..count`).
 fn floor_span(v: &Iv) -> u32 {
@@ -137,6 +146,12 @@ impl Domain for RefDomain {
     }
 
     fn arith(&mut self, op: Arith, a: &Iv, b: &Iv) -> Result<Iv> {
+        // An unknown number (the whole 16.16 range: the bridge's form of
+        // `AV::UNum`) stays unknown through any arithmetic: in wrapping 16.16
+        // every result is possible, as the kernels' `UnknownNum` folds.
+        if is_unknown(a) || is_unknown(b) {
+            return Ok(unknown());
+        }
         Ok(match op {
             Arith::Add => a.checked_add(*b).ok_or_else(|| anyhow::anyhow!("interval add overflow"))?,
             Arith::Sub => a.checked_sub(*b).ok_or_else(|| anyhow::anyhow!("interval sub overflow"))?,

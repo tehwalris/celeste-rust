@@ -503,6 +503,13 @@ pub struct Symbolic {
     /// `timer` as their whole ranges (`widen::widen_floor_timers`), which the
     /// next frame reads as interval inputs. Set by the walk.
     pub floor_timers: bool,
+    /// The fall floors widened but where the player overlaps one
+    /// (`abstraction::FloorsPrecision::Near`, with `floor_timers`):
+    /// `trace_frame` forks each floor's `collideable` input
+    /// (`widen::fork_near_floor_inputs`), every outcome stores `state` and
+    /// `collideable` per lane widened or exact (`widen::widen_near_floors`).
+    /// Set by the walk.
+    pub floors_near: bool,
     /// The moving platforms unknown (`abstraction::PlatformsPrecision`,
     /// plans/platforms-unknown.md): `trace_frame` widens their inputs
     /// (`widen::platform_inputs`), every outcome their outputs.
@@ -909,6 +916,20 @@ impl Symbolic {
                     _ => ((Op::Ge, ahi, blo), (Op::Lt, alo, bhi)),
                 };
                 (self.graph.fold(t, vec![ta, tb]), self.graph.fold(f, vec![fa, fb]))
+            }
+            // `a == b` can hold iff the two ranges meet, and fail iff they are
+            // not the same single number: `lo(a) < hi(b)` or `hi(a) > lo(b)`
+            // picks two different values (else `lo(a) >= hi(b) >= lo(b) >=
+            // hi(a) >= lo(a)`, all equal). A near level's floor `state == k`
+            // on `[0, 2]` goes both ways, on an exact state one. Only where no
+            // unknown atom exists (`unknowns`): then an operand a lane can hold
+            // both ways is an interval NUMBER, and `Lo`/`Hi` are its ends.
+            Op::Eq if !self.unknowns() => {
+                let (alo, ahi) = (self.graph.fold(Op::Lo, vec![args[0]]), self.graph.fold(Op::Hi, vec![args[0]]));
+                let (blo, bhi) = (self.graph.fold(Op::Lo, vec![args[1]]), self.graph.fold(Op::Hi, vec![args[1]]));
+                let (meet_a, meet_b) = (self.graph.fold(Op::Le, vec![alo, bhi]), self.graph.fold(Op::Le, vec![blo, ahi]));
+                let (below, above) = (self.graph.fold(Op::Lt, vec![alo, bhi]), self.graph.fold(Op::Gt, vec![ahi, blo]));
+                (self.graph.fold(Op::And, vec![meet_a, meet_b]), self.graph.fold(Op::Or, vec![below, above]))
             }
             Op::Not => {
                 let (t, f) = self.may_answers(args[0]);
@@ -1830,5 +1851,33 @@ mod tests {
         let t = d.num(p(1));
         assert_eq!(d.sel_num(&gt, &t, &t), t);
         assert_ne!(d.sel_num(&gt, &t, &k), t);
+    }
+
+    /// `x == k` on an interval `x` (a near level's floor `state` on `[0, 2]`,
+    /// `widen::widen_near_floors`) can come out true on a lane exactly where
+    /// `k` is in `x`, and false where `x` is not the single number `k`: the
+    /// split's guards (`verify::split_undecided_selects`). One lane's value
+    /// as a literal (the evaluator reads a cell as the hull over lanes):
+    /// `[0, 2]`, `[1, 1]` and `[0, 0]` against `k = 1`.
+    #[test]
+    fn an_equality_on_an_interval_may_answer_as_its_ends_allow() {
+        use crate::transpile::graph::Val;
+        let one = 1 << 16;
+        let answers = |lo: i32, hi: i32| {
+            let mut d = Symbolic::default();
+            let x = d.graph.leaf(Op::Const(lo, hi));
+            let k = d.graph.leaf(Op::Const(one, one));
+            let eq = d.graph.fold(Op::Eq, vec![x, k]);
+            let (t, f) = d.may_answers(eq);
+            let v = d.graph.eval(&Default::default()).unwrap();
+            let b = |n: NodeId| match v[n as usize] {
+                Val::Bool(b) => b,
+                Val::Num(_) => panic!("a number"),
+            };
+            (b(t), b(f))
+        };
+        assert_eq!(answers(0, 2 * one), (Some(true), Some(true)), "[0, 2] both ways");
+        assert_eq!(answers(one, one), (Some(true), Some(false)), "[1, 1] only equal");
+        assert_eq!(answers(0, 0), (Some(false), Some(true)), "[0, 0] only unequal");
     }
 }
