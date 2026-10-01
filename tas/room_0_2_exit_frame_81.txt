@@ -1,0 +1,17 @@
+# Room (0,2) "1700 m": exit at frame 81 for celeste-minimal, found by the
+# search (2026-10-01). Exits on a real PICO-8 (pico8_diff/replay.py --room
+# 0,2: the player at (45,-3) on frame 80, room (1,2) during frame 81). Ties
+# the community TAS17 (81).
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 0,2, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search: CELESTE_LEVEL_MINUS_ONE="81,5", ladder r0sxhn .. r4sxhn, r4sxh ..
+# r15sxh, rxsx, --ceiling 81: horizon 81 confirmed through the exact level
+# (first win f81 from rem Bits(10) up), horizon 80 refuted at rem Bits(10).
+# The earlier f80 at every exact level was the spawn-frame fold bug
+# (`Graph::tile_flag_over`, cfc41d3): the kernels had the new player in the
+# air, and that run's f80 had no witness. `rewrite witness --horizon 81
+# --level 17`: 278 concrete steps, 0 dead ends.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,17,0,40,0,0,0,0,0,0,16,0,0,0,0,36,0,0,0,0,0,0,0,0,2,2,0,2,0,18,0,2,0,2,2,2,2,38,0,0,0,0,0,0,0,0,0,0,16,0,0,0,0,0,0,0,0
