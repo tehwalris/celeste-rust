@@ -1,0 +1,16 @@
+# Room (7,1) "1600 m": exit at frame 86 for celeste-minimal, found by the
+# search (2026-10-01). Exits on a real PICO-8 with balloon seeds 0, 0.5 and
+# PICO-8's rnd.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 7,1, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search: no split frame, ladder r0sxhn .. r4sxhn, r4sxh .. r15sxh, rxsx at
+# horizon 86 (two springs on fall floors, two more floors, a balloon:
+# abstract through rem Bits(4)). First wins: 73, 78, 80, 81, 83, 83 (the
+# first exact-object level), 84, 85, then 86 from rem Bits(7) up to Exact.
+# `OPTIMAL win frame: 86`. Witness: `rewrite witness --horizon 86 --level
+# 17`, 332 concrete steps, 0 dead ends; f85 player (32,-2), f86 room (0,2).
+# TIES the community TAS16 (86, tas/room_7_1_reference_frame_86.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,42,0,0,0,0,0,0,0,0,2,2,16,0,16,0,0,0,2,2,0,1,16,0,1,0,1,0,1,16,0,0,36,0,0,0,0,0,0,2,2,2,2,2,2,18,2,2,2,2,2,36,0,0,0,0,0,0,16,0
