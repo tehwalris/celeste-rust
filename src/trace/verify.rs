@@ -546,6 +546,11 @@ struct Lite {
     error: NodeId,
     fields: Vec<NodeId>,
     keys: Vec<(usize, NodeId)>,
+    /// Conditions every lane DECIDES that a case split of this outcome may
+    /// merge into outcomes already made (`absorbed`): what a split's atom
+    /// guarded in the select's condition, carried through every later
+    /// substitution.
+    rests: Vec<NodeId>,
 }
 
 impl Lite {
@@ -566,7 +571,12 @@ impl Lite {
     /// error where the one live there is - each error only counts on its own
     /// lanes, so the merged error is `(g1 and e1) or (g2 and e2)`, and where
     /// the two errors are one node, that node.
-    fn merge(&mut self, d: &mut Symbolic, guard: NodeId, error: NodeId) {
+    fn merge(&mut self, d: &mut Symbolic, guard: NodeId, error: NodeId, rests: &[NodeId]) {
+        for r in rests {
+            if !self.rests.contains(r) && self.rests.len() < MAX_RESTS {
+                self.rests.push(*r);
+            }
+        }
         if self.error != error {
             let (a, b) = (d.and(&self.guard, &self.error), d.and(&guard, &error));
             self.error = d.or(&a, &b);
@@ -586,7 +596,7 @@ impl Waiting {
         let key = Self::key(class, &o);
         if let Some(&i) = self.index.get(&key) {
             let (p, pp) = self.slots[i].as_mut().expect("an indexed outcome is waiting");
-            p.merge(d, o.guard, o.error);
+            p.merge(d, o.guard, o.error, &o.rests);
             if let (Some(a), Some(b)) = (pp.as_mut(), pts.as_ref()) {
                 a.union(b);
             }
@@ -1066,11 +1076,12 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             error: o.error,
             fields: o.fields.iter().map(|f| f.1).collect(),
             keys: o.keys.clone(),
+            rests: Vec::new(),
         };
         let size = cone(&d.graph, &lite.row()).len();
         work.push(d, &class, lite, everywhere.clone(), size);
     }
-    let (mut n_splits, mut n_decided) = (0usize, 0usize);
+    let (mut n_splits, mut n_decided, mut n_rest) = (0usize, 0usize, 0usize);
     let mut done: Vec<(Lite, Option<PointSet>)> = Vec::new();
     while let Some((o, pts)) = work.pop(&class) {
         anyhow::ensure!(work.len() + done.len() < MAX_OUTCOMES, "more than {MAX_OUTCOMES} outcomes splitting undecided selects");
@@ -1093,7 +1104,7 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             let same = |p: &Lite| class[p.t] == class[o.t] && p.keys == o.keys && p.fields == o.fields;
             match done.iter_mut().find(|(p, _)| same(p)) {
                 Some((p, pp)) => {
-                    p.merge(d, o.guard, o.error);
+                    p.merge(d, o.guard, o.error, &o.rests);
                     if let (Some(a), Some(b)) = (pp.as_mut(), pts.as_ref()) {
                         a.union(b);
                     }
@@ -1145,7 +1156,29 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
                 _ => None,
             }
         };
+        // The atom's SIBLINGS in the select's condition: the other operands
+        // of a conjunction or disjunction the atom (or its negation) is an
+        // operand of - `not check(player, 0, 0)` beside `delay <= 0`. What
+        // the atom guarded, and what a side may be case split on to merge
+        // (`absorbed`), with the condition itself.
+        let sibs: Vec<NodeId> = {
+            let not_atom = d.graph.fold(Op::Not, vec![atom]);
+            let is_atom = |n: NodeId| n == atom || n == not_atom;
+            let mut out: Vec<NodeId> = Vec::new();
+            for n in cone(&d.graph, &[c]) {
+                let node = d.graph.get(n);
+                if matches!(node.op, Op::And | Op::Or) && node.args.iter().any(|a| is_atom(*a)) {
+                    for a in node.args.iter().copied().filter(|a| !is_atom(*a)) {
+                        if !out.contains(&a) {
+                            out.push(a);
+                        }
+                    }
+                }
+            }
+            out
+        };
         let reach = cone(&d.graph, &o.every());
+        let mut made: Vec<(Lite, Option<PointSet>, Vec<NodeId>)> = Vec::new();
         for (answer, side_pts) in sides {
             let to = d.graph.leaf(Op::ConstBool(answer));
             let mut subst = rustc_hash::FxHashMap::from_iter([(atom, to)]);
@@ -1162,19 +1195,83 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             if d.decide(&guard) == Some(false) {
                 continue;
             }
-            let side = Lite {
+            let mut side = Lite {
                 t: o.t,
                 guard,
                 error: m(o.error),
                 fields: o.fields.iter().map(|f| m(*f)).collect(),
                 keys: o.keys.iter().map(|(i, k)| (*i, m(*k))).collect(),
+                rests: Vec::new(),
             };
-            let size = cone(&d.graph, &side.row()).len();
-            work.push(d, &class, side, side_pts, size);
+            // This split's candidates first; the inherited ones are tried
+            // again once every outcome is made (below).
+            let mut fresh: Vec<NodeId> = Vec::new();
+            for r in std::iter::once(c).chain(sibs.iter().copied()).map(m) {
+                if !fresh.contains(&r) {
+                    fresh.push(r);
+                }
+            }
+            for r in fresh.iter().copied().chain(o.rests.iter().map(|r| m(*r))) {
+                if !side.rests.contains(&r) && side.rests.len() < MAX_RESTS {
+                    side.rests.push(r);
+                }
+            }
+            made.push((side, side_pts, fresh));
+        }
+        // A side that is two outcomes already made, case split on a
+        // condition every lane decides, is them (`absorbed`).
+        let rows: Vec<(usize, Vec<(usize, NodeId)>, Vec<NodeId>)> = made.iter().map(|(l, _, _)| Waiting::key(&class, l)).collect();
+        for (si, (side, side_pts, fresh)) in made.into_iter().enumerate() {
+            let made_elsewhere = |k: &(usize, Vec<(usize, NodeId)>, Vec<NodeId>)| {
+                rows.iter().enumerate().any(|(j, r)| j != si && r == k) || work.index.contains_key(k) || done.iter().any(|(p, _)| Waiting::key(&class, p) == *k)
+            };
+            match absorbed(d, &class, &side, &fresh, made_elsewhere) {
+                Some(halves) => {
+                    n_rest += 1;
+                    for h in halves {
+                        let size = cone(&d.graph, &h.row()).len();
+                        work.push(d, &class, h, side_pts.clone(), size);
+                    }
+                }
+                None => {
+                    let size = cone(&d.graph, &side.row()).len();
+                    work.push(d, &class, side, side_pts, size);
+                }
+            }
         }
     }
+    // The same once every outcome is made, on every candidate an outcome
+    // carries: one whose halves were made only after it was split is
+    // absorbed now. Absorbing makes no row, so an outcome that cannot be
+    // absorbed can become so only by gaining candidates (a merge) - it is
+    // tried again then, until none is. (A merge changes no row either, so
+    // the rows are kept beside `done`.)
+    let mut keys: Vec<_> = done.iter().map(|(p, _)| Waiting::key(&class, p)).collect();
+    let mut dirty = vec![true; done.len()];
+    while let Some(i) = dirty.iter().position(|x| *x) {
+        dirty[i] = false;
+        let rests = done[i].0.rests.clone();
+        let Some(halves) = absorbed(d, &class, &done[i].0, &rests, |k| *k != keys[i] && keys.contains(k)) else {
+            continue;
+        };
+        let (_, pts) = done.remove(i);
+        keys.remove(i);
+        dirty.remove(i);
+        for h in halves {
+            let key = Waiting::key(&class, &h);
+            let at = keys.iter().position(|k| *k == key).expect("an absorbing half's row is an outcome");
+            let (p, pp) = &mut done[at];
+            let had = p.rests.len();
+            p.merge(d, h.guard, h.error, &h.rests);
+            dirty[at] |= p.rests.len() > had;
+            if let (Some(a), Some(b)) = (pp.as_mut(), pts.as_ref()) {
+                a.union(b);
+            }
+        }
+        n_rest += 1;
+    }
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
-        eprintln!("[build] split_undecided_selects: {n_in} outcomes, {n_splits} splits, {n_decided} decided by the points, {} out", done.len());
+        eprintln!("[build] split_undecided_selects: {n_in} outcomes, {n_splits} splits, {n_decided} decided by the points, {n_rest} absorbed by a case split, {} out", done.len());
     }
     // Each outcome whole again, over its template; what reaches the kernel
     // of the points is its pixels.
@@ -1493,6 +1590,84 @@ pub(crate) fn cone(g: &crate::transpile::graph::Graph, roots: &[NodeId]) -> Vec<
     let mut out: Vec<NodeId> = seen.into_iter().collect();
     out.sort_unstable();
     out
+}
+
+/// How many case-split candidates an outcome carries (`Lite::rests`).
+const MAX_RESTS: usize = 32;
+
+/// `o` CASE-SPLIT on one of `cands`, a condition every lane decides, where
+/// both halves are outcomes already made (`made`): its halves, to merge into
+/// them, or `None`.
+///
+/// The atom a split takes is the finest undecidable part of a select's
+/// condition, and with it substituted the rest of the condition may be one
+/// every lane DECIDES: a fall floor's `delay <= 0 and not check(player, 0,
+/// 0)` on its `delay <= 0` side - the floor comes back where the player is
+/// not inside it. That select then stays in the row, a third variant of the
+/// floor's solidity beside "solid" and "hidden": on every lane it IS one of
+/// the two, but as a row it is neither, so each floor a region's player
+/// reaches multiplied the outcomes by 3 instead of 2 (room (6,1), five floors
+/// side by side under its spawn: 2 x 3^4 outcomes in one region, 21k bodies
+/// in one kernel, 2026-10-01). Split on the decided rest, the
+/// halves are the "solid" and the "hidden" rows, which are outcomes of their
+/// own; the outcome is then theirs, live where they are or where it was.
+///
+/// EXACT: a lane decides `cv`, so it takes exactly the half its own answer
+/// gives (no `may`), and that half's row, error and guard are the outcome's
+/// on that lane. Taken only where BOTH halves merge, so it never adds an
+/// outcome: a case split that merges with nothing only adds a body.
+///
+/// Measured: the room's level-0 kernels 287,705 -> 140,323 bodies but 11.6M
+/// -> 10.7M fused nodes, f35-f40 7-21% faster. A kernel's cost is its fused
+/// nodes, and ~80% of those are the outcomes' `live`/`error` cones (the
+/// three-valued guards over the floors' `state`/`delay` intervals, copied
+/// into the errors by `Lite::merge`), not their rows (region (4,6)'s
+/// largest player kernel: 450k nodes, 34k under a field).
+fn absorbed(
+    d: &mut Symbolic,
+    class: &[usize],
+    o: &Lite,
+    cands: &[NodeId],
+    made: impl Fn(&(usize, Vec<(usize, NodeId)>, Vec<NodeId>)) -> bool,
+) -> Option<Vec<Lite>> {
+    use crate::transpile::graph::Op;
+    // Only the ROW is rebuilt: the guard and the error read `cv` as the lane
+    // decides it, so on the lanes of a half (`guard and cv`, `guard and not
+    // cv`) they are the outcome's own unchanged - and an error's cone can be
+    // millions of nodes under a row of tens.
+    let mut reach: Option<Vec<NodeId>> = None;
+    for &cv in cands {
+        if d.lane_undecidable(cv) || d.decide(&cv).is_some() {
+            continue;
+        }
+        let reach = reach.get_or_insert_with(|| cone(&d.graph, &o.row()));
+        if reach.binary_search(&cv).is_err() {
+            continue;
+        }
+        let mut halves = Vec::new();
+        for half in [true, false] {
+            let to = d.graph.leaf(Op::ConstBool(half));
+            let map = rebuild_all(d, reach, &rustc_hash::FxHashMap::from_iter([(cv, to)]));
+            let m = |n: NodeId| map.get(&n).copied().unwrap_or(n);
+            let at = if half { cv } else { d.not(&cv) };
+            let guard = d.and(&o.guard, &at);
+            if d.decide(&guard) == Some(false) {
+                continue;
+            }
+            halves.push(Lite {
+                t: o.t,
+                guard,
+                error: o.error,
+                fields: o.fields.iter().map(|f| m(*f)).collect(),
+                keys: o.keys.iter().map(|(i, k)| (*i, m(*k))).collect(),
+                rests: o.rests.iter().map(|r| m(*r)).filter(|r| *r != cv).collect(),
+            });
+        }
+        if !halves.is_empty() && halves.iter().all(|h| made(&Waiting::key(class, h))) {
+            return Some(halves);
+        }
+    }
+    None
 }
 
 /// Every node of `cone` rebuilt with the nodes of `subst` replaced, in node

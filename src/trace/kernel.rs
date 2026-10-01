@@ -1734,6 +1734,15 @@ mod tests {
     /// update over every floor a region's player might overlap: region (3,6)
     /// 3,638 outcomes in one frame, region (4,6) past the 4,096 cap, the
     /// room's kernels unbuildable (2026-10-01).
+    ///
+    /// And a floor that comes back (`delay <= 0 and not check(player, 0,
+    /// 0)`) is, on every lane, solid or hidden - the rows of two outcomes
+    /// already made - so the split pass absorbs it into them
+    /// (`verify::absorbed`) instead of keeping it as a third variant of the
+    /// floor: 3 outcomes a reachable floor became 2. Without it these regions
+    /// trace 99 / 108 / 162 outcomes a frame (2 x 3^4 for region (4,6)'s
+    /// four floors), with it 67 / 32 / 48, and the room's level-0 kernels
+    /// hold half the bodies (287,705 -> 140,323), with identical sets.
     #[test]
     fn near_floors_side_by_side_split_only_what_collisions_read() {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
@@ -1749,7 +1758,7 @@ mod tests {
         let mut traced = 0;
         for ((shape, region), f) in &lw.frames {
             let Some(r) = region else { continue };
-            assert!(f.frame.outs.len() <= 256, "shape {shape} region ({},{}): {} outcomes", r.ix, r.iy, f.frame.outs.len());
+            assert!(f.frame.outs.len() <= 72, "shape {shape} region ({},{}): {} outcomes", r.ix, r.iy, f.frame.outs.len());
             traced += 1;
         }
         assert!(traced >= 2, "{traced} (shape, region) nodes traced");
