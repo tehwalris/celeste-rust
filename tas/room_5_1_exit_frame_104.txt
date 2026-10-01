@@ -1,0 +1,16 @@
+# Room (5,1) "1400 m": exit at frame 104 for celeste-minimal, found by the
+# search (2026-10-01). No balloons.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 5,1, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search: no split frame, ladder r0sxhn .. r4sxhn, r4sxh .. r15sxh, rxsx at
+# horizon 104 (the spring's phases and the two fall floors abstract through
+# rem Bits(4)), level 0 from f89 under the level -1 filter
+# (CELESTE_LEVEL_MINUS_ONE="104,5"). First wins: 87, 91, 93, 95, 96, then 104
+# from the first exact-object level up to Exact. `OPTIMAL win frame: 104`.
+# Witness: `rewrite witness --horizon 104 --level 17`, 412 concrete steps, 0
+# dead ends; on a real PICO-8 (celeste-minimal) f103 player (83,-3), f104 room
+# (6,1). TIES the community TAS14 (104, tas/room_5_1_reference_frame_104.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,42,0,0,0,0,0,0,0,16,0,34,0,0,0,0,0,0,0,16,0,0,0,0,0,2,2,2,2,2,2,2,2,2,2,38,0,0,0,0,0,0,0,0,0,0,0,16,0,0,0,0,0,36,0,0,0,0,0,0,1,1,1,0,17,0,1,0,16,37,0,0,0,0,0,0,16,0,0,0
