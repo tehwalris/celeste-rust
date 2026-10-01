@@ -122,3 +122,32 @@ impl CartData {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every level room (31 of them: (0,0)..(7,3) but the summit's (7,3)) has
+    /// exactly ONE player spawn tile. Map rows 32-63 share memory with the
+    /// lower sprite sheet and are written in a cart's `__gfx__` with each
+    /// byte's nibbles swapped; `map-data.txt` held them unswapped until
+    /// 2026-10-01, which gave the rooms of rows 2 and 3 two to seven spawns
+    /// each (and garbage everywhere else in them) - found when the community
+    /// TAS for room (0,2) never exited.
+    #[test]
+    fn every_level_room_has_one_player_spawn() {
+        let cart = CartData::load(concat!(env!("CARGO_MANIFEST_DIR"), "/../../cart")).expect("cart");
+        for ry in 0..4i16 {
+            for rx in 0..8i16 {
+                if (rx, ry) == (7, 3) {
+                    continue;
+                }
+                let n = (0..16i16)
+                    .flat_map(|ty| (0..16i16).map(move |tx| (tx, ty)))
+                    .filter(|&(tx, ty)| cart.mget_whole(rx * 16 + tx, ry * 16 + ty) == 1)
+                    .count();
+                assert_eq!(n, 1, "room ({rx},{ry}) has {n} player spawn tiles");
+            }
+        }
+    }
+}

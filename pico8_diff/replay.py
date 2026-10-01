@@ -101,13 +101,17 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
         "_init = nil _update = nil _draw = nil",
     ]
     # __map__: rows 0..31 as 32 lines of 128 bytes. Rows 32..63 live in the
-    # sprite sheet's lower half (__gfx__ lines 64..127), one hex char per
-    # PIXEL with the low nibble first.
+    # sprite sheet's lower half (__gfx__ lines 64..127): a sprite-sheet line
+    # is 64 bytes (128 pixels, one hex char each, low nibble first), so each
+    # map row is TWO of them. (Until 2026-10-01 one 256-char line per row,
+    # which PICO-8 truncated: rooms of map rows 2 and 3 were garbage here.)
     map_lines = [map_data[r * 128:(r + 1) * 128].hex() for r in range(32)]
     gfx_lines = ["0" * 128 for _ in range(64)]
     for r in range(32, 64):
-        row = map_data[r * 128:(r + 1) * 128]
-        gfx_lines.append("".join(f"{b & 15:x}{b >> 4:x}" for b in row))
+        for half in range(2):
+            part = map_data[r * 128 + half * 64:r * 128 + (half + 1) * 64]
+            gfx_lines.append("".join(f"{b & 15:x}{b >> 4:x}" for b in part))
+    assert len(gfx_lines) == 128 and all(len(l) == 128 for l in gfx_lines)
     gff_lines = [flags[:128].hex(), flags[128:].hex()]
     with open(out, "w") as f:
         f.write("pico-8 cartridge // http://www.pico-8.com\nversion 42\n__lua__\n")
