@@ -1,0 +1,15 @@
+# Room (3,1) "1200 m": exit at frame 71 for celeste-minimal, found by the
+# search (2026-10-01). No balloons.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 3,1, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search (ice modelled, 4f1ed71): no split frame, ladder r0sxhf .. r5sxhf,
+# r5sxh .. r15sxh, rxsx at horizon 71: the fly fruit unknown through rem
+# Bits(5), exact from there. First wins: 65, 68, 69, 69, then 71 from rem
+# Bits(4) up to Exact. `OPTIMAL win frame: 71`. Witness: `rewrite witness
+# --horizon 71 --level 17`, 257 concrete steps, 0 dead ends; on a real PICO-8
+# (celeste-minimal) f70 player (37,-2), f71 room (4,1). TIES the community
+# TAS12 (71, tas/room_3_1_reference_frame_71.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,2,2,2,0,2,16,38,0,0,0,0,0,0,0,0,2,2,0,16,0,0,0,0,2,2,16,0,0,0,0,0,36,0,0,0,0,0,0,16,0,0,16,0,0,0
