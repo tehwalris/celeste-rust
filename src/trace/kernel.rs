@@ -2499,6 +2499,7 @@ pub fn room_constant_lattice(
     // above was read from `start`, where the slot is no constant, and a 0
     // there would have pinned the balloon's phase. At every level, the exact
     // one included (`boundary_ival`).
+    let mut start_ivals: std::collections::BTreeMap<super::iface::Path, (i32, i32)> = Default::default();
     {
         use super::domain::Domain as _;
         for r in shapes::state_paths(&start)? {
@@ -2506,6 +2507,9 @@ pub fn room_constant_lattice(
                 let Some(super::heap::Value::Num(n)) = super::iface::get(&start, &p) else { continue };
                 if it.d.as_const(&n).is_some() {
                     continue;
+                }
+                if let crate::transpile::graph::Op::Const(lo, hi) = it.d.graph.get(n).op {
+                    start_ivals.insert(p.clone(), (lo, hi));
                 }
                 let zero = it.d.num(celeste_core::pico8_num::Pico8Num::from_i16(0));
                 super::iface::set(reps.get_mut(&sk).expect("inserted above"), &p, super::heap::Value::Num(zero))?;
@@ -2810,7 +2814,7 @@ pub fn room_constant_lattice(
     for ((k, _), wf) in &frames {
         by_hash.insert(wf.frame.in_rt2.shape_hash_of(), k.clone());
     }
-    Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops, tracer: Tracer { it, reset, fr }, by_hash, opts, start_key, ival_extra })
+    Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops, tracer: Tracer { it, reset, fr }, by_hash, opts, start_key, ival_extra, start_ivals })
 }
 
 /// `ival_paths` plus a shape's discovered interval slots (`LatticeWalk::
@@ -3081,6 +3085,11 @@ pub struct LatticeWalk {
     /// inputs, since a number input reading an interval panicked (room
     /// (4,0) f62, the chest's `x`). Monotone like the constants.
     pub ival_extra: std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>>,
+    /// The START state's own intervals (a literal range, `rnd`'s draw: room
+    /// (5,0)'s balloon `offset`), by path: the representative holds a blanked
+    /// POINT there (above), so a reader that seeds values from the
+    /// representative - level -1's ranges - takes the real range from here.
+    pub start_ivals: std::collections::BTreeMap<super::iface::Path, (i32, i32)>,
 }
 
 /// Report the constant lattice for `transpile --room-consts`.

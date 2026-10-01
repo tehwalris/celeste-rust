@@ -1494,12 +1494,23 @@ impl Domain for Symbolic {
         // (room (3,0) square (5,13) on an 8 px grid: 1,236 bodies -> 35,502,
         // 2026-09-18). Too small an arity declines loudly (`SplitOk`).
         // Level -1 (`uncapped_ways`) needs the full width: its lanes ARE
-        // ranges.
+        // ranges. And the width of the HULL of the pieces, not of the widest
+        // piece: its evaluator joins a select it cannot decide, so the
+        // operand it sees spans every piece at once. The fake wall's
+        // `hit.spd.x = -sign(hit.spd.x)*1.5` is three pieces two floors wide
+        // each and a hull five wide (room (0,2), 2026-10-01: a 2-way fork,
+        // and every evaluation of it a violation).
         match self.range_of(*v) {
             Some(ps) => {
                 let sh = 16 - self.graph.fork_bits() as u32;
-                let cap = if self.uncapped_ways { i64::from(u8::MAX) } else { self.move_ways() as i64 };
-                ps.iter().map(|p| (p.1 >> sh) - (p.0 >> sh) + 1).max().unwrap_or(1).clamp(1, cap) as u8
+                let w = if self.uncapped_ways {
+                    let lo = ps.iter().map(|p| p.0 >> sh).min().unwrap_or(0);
+                    let hi = ps.iter().map(|p| p.1 >> sh).max().unwrap_or(0);
+                    (hi - lo + 1).min(i64::from(u8::MAX))
+                } else {
+                    ps.iter().map(|p| (p.1 >> sh) - (p.0 >> sh) + 1).max().unwrap_or(1).min(self.move_ways() as i64)
+                };
+                w.max(1) as u8
             }
             None => self.move_ways(),
         }
@@ -1750,6 +1761,33 @@ mod tests {
 
     fn p(v: i16) -> P8 {
         P8::from_i16(v)
+    }
+
+    /// The fake wall's `hit.spd.x = -sign(hit.spd.x)*1.5` before the player's
+    /// `move`: `rem + sel(.., -1.5, sel(.., 1.5, 0)) + 0.5`, three pieces two
+    /// floors wide each. A kernel lane holds one piece (2-way); level -1's
+    /// evaluator joins the select, so its fork spans the HULL, five floors
+    /// (room (0,2), 2026-10-01: built 2-way, every evaluation a violation).
+    #[test]
+    fn level_minus_one_sizes_a_move_fork_by_the_hull_of_its_pieces() {
+        let mut d = Symbolic::default();
+        let rem = d.graph.leaf(Op::Cell(0));
+        let spd = d.graph.leaf(Op::Cell(1));
+        d.ranges.insert(rem, (-0x8000, 0x7fff));
+        d.ranges.insert(spd, (-5 << 16, 5 << 16));
+        let zero = d.graph.leaf(Op::Const(0, 0));
+        let k = |d: &mut Symbolic, v: i32| d.graph.leaf(Op::Const(v, v));
+        let (neg, pos, half) = (k(&mut d, -0x18000), k(&mut d, 0x18000), k(&mut d, 0x8000));
+        let gt = d.graph.fold(Op::Gt, vec![spd, zero]);
+        let lt = d.graph.fold(Op::Lt, vec![spd, zero]);
+        let inner = d.graph.fold(Op::Sel, vec![lt, pos, zero]);
+        let wall = d.graph.fold(Op::Sel, vec![gt, neg, inner]);
+        let moved = d.graph.fold(Op::Add, vec![rem, wall]);
+        let operand = d.graph.fold(Op::Add, vec![half, moved]);
+        assert_eq!(d.flr_ways(&operand), 2, "a kernel lane takes one piece");
+        d.uncapped_ways = true;
+        d.range_memo.clear();
+        assert_eq!(d.flr_ways(&operand), 5, "level -1 joins the pieces: floors -2..=2");
     }
 
     /// The FORK TRIGGER's contract, pinned on hand-built graphs.

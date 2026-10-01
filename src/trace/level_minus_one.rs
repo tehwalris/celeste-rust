@@ -37,6 +37,17 @@
 //!   the node is reported.
 //! * Every position hull has whole endpoints (a cell is a whole pixel).
 //!
+//! A range is a HULL of the node's values; two refinements keep what the hull
+//! forgets, both exact per state, so the premises above stay checked as they
+//! are (2026-10-01, rooms (6,1), (7,1), (0,2)):
+//!
+//! * a slot every state holds as the same literal interval (the balloon's
+//!   `rnd` phase, `Shape::lits`) is read as that literal, so its own ends
+//!   (`Lo`/`Hi`) are exact;
+//! * selects are lifted out of the ops above them (`lift`): `Lo`/`Hi`/`Sub`
+//!   in every frame, every value op in the precise frame a node falls back to
+//!   when its plain evaluation is in violation (`eval_node`).
+//!
 //! And three things it does NOT model, each counted in the report:
 //!
 //! * THE SPAWN is run as a chain from the start state (`probe`): as a
@@ -117,6 +128,10 @@ pub struct Opts {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Obs {
     Num(i64, i64),
+    /// A LITERAL interval (`Op::Const(lo, hi)`, `lo < hi`): every lane holds
+    /// exactly this interval - the balloon's canonical phase `[0, 1)`, an
+    /// `rnd` draw. `Num` is a hull of lanes' values instead.
+    Lit(i64, i64),
     Bool { f: bool, t: bool, u: bool },
 }
 
@@ -129,9 +144,17 @@ impl Obs {
             Val::Bool(None) => Obs::Bool { f: false, t: false, u: true },
         }
     }
+    /// What flowed in as a hull of the lanes' values: a literal is one.
+    fn hull(self) -> Obs {
+        match self {
+            Obs::Lit(a, b) => Obs::Num(a, b),
+            o => o,
+        }
+    }
     fn join(self, o: Obs) -> Result<Obs> {
         Ok(match (self, o) {
-            (Obs::Num(a, b), Obs::Num(c, d)) => Obs::Num(a.min(c), b.max(d)),
+            (Obs::Lit(a, b), Obs::Lit(c, d)) if (a, b) == (c, d) => Obs::Lit(a, b),
+            (Obs::Num(a, b) | Obs::Lit(a, b), Obs::Num(c, d) | Obs::Lit(c, d)) => Obs::Num(a.min(c), b.max(d)),
             (Obs::Bool { f, t, u }, Obs::Bool { f: g, t: s, u: v }) => Obs::Bool { f: f || g, t: t || s, u: u || v },
             _ => bail!("a slot observed as both a number and a boolean"),
         })
@@ -241,12 +264,34 @@ struct Config {
     operands: Vec<(u8, NodeId)>,
 }
 
+/// Every fork configuration of a cone, specialized into one shared graph.
+struct Spec {
+    graph: Graph,
+    configs: Vec<Config>,
+}
+
+/// What a shape's frame is before specialization: the cone with its roots
+/// and forks (in the cone's ids), from which `Spec`s are built.
+struct Cone {
+    graph: Graph,
+    roots: Vec<Roots>,
+    forks: BTreeMap<u8, NodeId>,
+    /// `(fork, arity)` of every fork in `forks`.
+    arities: Vec<(u8, u8)>,
+    n_forks: u8,
+}
+
 /// A shape traced for level -1.
 struct Traced {
     seeds: Vec<Seed>,
-    graph: Graph,
     outs: Vec<OutSpec>,
-    configs: Vec<Config>,
+    /// The frame specialized as traced: what every node is evaluated with.
+    plain: Spec,
+    /// The same frame with its selects LIFTED (`lift`), more precise and
+    /// ~25x larger: built the first time a node's plain evaluation is in
+    /// violation, and then that node's answer (`eval_node`).
+    precise: std::sync::OnceLock<Spec>,
+    cone: Cone,
     /// The bounds it was traced under (the static ranges the arity came from).
     bounds: BTreeMap<Path, Range>,
     pins: BTreeMap<Path, Conc>,
@@ -256,6 +301,12 @@ struct Traced {
 struct Shape {
     key: String,
     ranges: BTreeMap<Path, Range>,
+    /// The `ranges` that are a LITERAL interval every lane holds (`Obs::Lit`):
+    /// the cone reads the slot as that literal (`Op::Const`), so a lane's own
+    /// ends (`Lo`/`Hi`) are exact - the balloon's full-period premise
+    /// (`widen::canon_balloon_offset`) is decided, where over a hull of the
+    /// lanes' values it is not. Only an `rnd`-derived slot (`ival_extra`).
+    lits: BTreeSet<Path>,
     /// Ranges not yet observed: taken from a blanked representative (0), so
     /// the first observation REPLACES them rather than joining the 0 in.
     unseeded: BTreeSet<Path>,
@@ -279,6 +330,8 @@ struct Acc {
     clipped: Vec<u64>,
     violations: Vec<String>,
     n_violations: usize,
+    /// Nodes answered by the precise frame (`Traced::precise`).
+    precise: usize,
 }
 
 struct Table<'a> {
@@ -299,9 +352,17 @@ impl<'a> Table<'a> {
         }
         ensure!(self.lw.reps.contains_key(key), "an outcome shape the lattice walk never reached: {key}");
         let i = self.shapes.len();
-        self.shapes.push(Shape { key: key.to_string(), ranges: BTreeMap::new(), unseeded: BTreeSet::new(), demoted: BTreeSet::new(), traced: None });
+        self.shapes.push(Shape { key: key.to_string(), ranges: BTreeMap::new(), lits: BTreeSet::new(), unseeded: BTreeSet::new(), demoted: BTreeSet::new(), traced: None });
         self.by_key.insert(key.to_string(), i);
         Ok(i)
+    }
+
+    /// May slot `p` of shape `key` be a literal (`Shape::lits`)? An
+    /// `rnd`-derived slot only, never a motion slot: a range there stands for
+    /// every concrete value, which is what the table bounds.
+    fn lit_slot(&self, key: &str, p: &Path) -> bool {
+        let motion = p.len() == 4 && p[0] == iface::key("objects") && (p[2] == iface::key("rem") || p[2] == iface::key("spd"));
+        !motion && self.lw.ival_extra.get(key).is_some_and(|s| s.contains(p))
     }
 
     fn obs_slot(&mut self, shape: usize, p: &Path) -> usize {
@@ -342,7 +403,19 @@ impl<'a> Table<'a> {
             }
             let Some(Value::Num(n)) = iface::get(&st, p) else { continue };
             let is_player = |f: &str| player.as_ref().is_some_and(|pl| *p == with(pl, &[f, "x"]) || *p == with(pl, &[f, "y"]));
-            let r = if is_player("rem") {
+            let start_ival = key == self.lw.start_key && self.lw.ival_extra.get(&key).is_some_and(|s| s.contains(p));
+            let r = if start_ival {
+                // The start state's own interval (the balloon's `offset =
+                // rnd(1)`): its representative holds a blanked point, and
+                // seeded with that point the balloon's phase was no full
+                // period, so `canon_balloon_offset`'s premise failed on the
+                // spawn's first frame (rooms (6,1) and (7,1), 2026-10-01).
+                // A literal: the one start state holds exactly it.
+                let (lo, hi) = *self.lw.start_ivals.get(p).ok_or_else(|| anyhow!("{key}: the start state's interval {} is not a literal range", iface::show(p)))?;
+                ensure!(self.lit_slot(&key, p), "{key}: the start state's interval {} is not an `rnd` slot", iface::show(p));
+                self.shapes[id].lits.insert(p.clone());
+                (lo as i64, hi as i64)
+            } else if is_player("rem") {
                 REM
             } else if is_player("spd") {
                 (-(self.spd_px as i64) << 16, (self.spd_px as i64) << 16)
@@ -478,21 +551,38 @@ impl<'a> Table<'a> {
         }
         let mut cmap: Vec<NodeId> = vec![NodeId::MAX; arena.len()];
         let mut forks: BTreeMap<u8, NodeId> = BTreeMap::new();
+        // The literal slots' cells (`Shape::lits`), read as their literal.
+        let lit_cells: HashMap<u32, (i32, i32)> = f
+            .iface
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| self.shapes[id].lits.contains(*p))
+            .map(|(i, p)| {
+                let r = self.shapes[id].ranges[p];
+                (i as u32, (r.0 as i32, r.1 as i32))
+            })
+            .collect();
+        let mut lifted: HashMap<(Op, Vec<NodeId>), NodeId> = HashMap::new();
         for i in 0..arena.len() {
             if !need[i] {
                 continue;
             }
             let nd = arena.get(i as NodeId);
+            let args: Vec<NodeId> = nd.args.iter().map(|a| cmap[*a as usize]).collect();
             cmap[i] = match nd.op {
                 _ if arena.is_literal_fork(i as NodeId) => cmap[nd.args[0] as usize],
+                Op::Cell(c) if lit_cells.contains_key(&c) => {
+                    let (lo, hi) = lit_cells[&c];
+                    cone.leaf(Op::Const(lo, hi))
+                }
                 Op::Known | Op::SplitOk(_) => cone.leaf(Op::ConstBool(true)),
                 Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_) => bail!("shape {id}: a table fork"),
                 _ => {
-                    let args: Vec<NodeId> = nd.args.iter().map(|a| cmap[*a as usize]).collect();
                     if let Op::Split(k) | Op::SplitInt(k) = nd.op {
                         forks.entry(k).or_insert(args[0]);
                     }
-                    cone.fold(nd.op.clone(), args)
+                    lift(&mut cone, nd.op.clone(), args, Lift::Ends, &mut lifted)
                 }
             };
         }
@@ -507,23 +597,54 @@ impl<'a> Table<'a> {
         let arities: Vec<(u8, u8)> = forks.keys().map(|k| (*k, f.fork_ways[*k as usize])).collect();
         let n_configs: usize = arities.iter().map(|(_, w)| *w as usize).product();
         ensure!(n_configs <= MAX_CONFIGS, "shape {id}: {n_configs} fork configurations ({arities:?})");
-        let mut shared = cone.like();
+        let m = |n: &NodeId| cmap[*n as usize];
+        let roots: Vec<Roots> = roots_old.iter().map(|r| Roots { live: m(&r.live), error: m(&r.error), xy: r.xy.map(|(x, y)| (m(&x), m(&y))), fields: r.fields.iter().map(m).collect() }).collect();
+        let cone = Cone { graph: cone, roots, forks, arities, n_forks: f.forks };
+        let plain = cone.specialize();
+        let operands: Vec<String> = cone.forks.iter().map(|(k, op)| format!("fork {k}: {}", super::emit::show_tree(&cone.graph, *op, 3))).collect();
+        let stats = format!(
+            "{} slots ({} pinned, {} interval), {} outcomes, forks {:?}, {} configurations ({} distinct), cone {} nodes, specialized {} nodes, trace {:.1} s, specialize {:.1} s",
+            n_slots,
+            pins.len(),
+            ival.len(),
+            outs.len(),
+            cone.arities.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
+            n_configs,
+            plain.configs.len(),
+            cone.graph.len(),
+            plain.graph.len(),
+            t_trace.as_secs_f64(),
+            (t0.elapsed() - t_trace).as_secs_f64()
+        ) + &operands.iter().map(|o| format!("\n      {o}")).collect::<String>();
+        self.shapes[id].traced = Some(Traced { seeds, outs, plain, precise: std::sync::OnceLock::new(), cone, bounds, pins, stats });
+        Ok(())
+    }
+
+}
+
+impl Cone {
+    /// Every fork configuration, specialized into one shared graph; the
+    /// configurations that come out identical kept once.
+    fn specialize(&self) -> Spec {
+        let n_configs: usize = self.arities.iter().map(|(_, w)| *w as usize).product();
+        let mut shared = self.graph.like();
         let mut configs: Vec<Config> = Vec::new();
         let mut seen: HashSet<Vec<NodeId>> = HashSet::new();
         for c in 0..n_configs {
-            let mut splits = vec![0u8; f.forks as usize];
+            let mut splits = vec![0u8; self.n_forks as usize];
             let mut rest = c;
-            for (k, w) in &arities {
+            for (k, w) in &self.arities {
                 splits[*k as usize] = (rest % *w as usize) as u8;
                 rest /= *w as usize;
             }
-            let map = cone.specialize_subset_into(&splits, None, None, &mut shared);
-            let m = |n: NodeId| map[cmap[n as usize] as usize];
-            let outs_c: Vec<Roots> = roots_old
+            let map = self.graph.specialize_subset_into(&splits, None, None, &mut shared);
+            let m = |n: NodeId| map[n as usize];
+            let outs_c: Vec<Roots> = self
+                .roots
                 .iter()
                 .map(|r| Roots { live: m(r.live), error: m(r.error), xy: r.xy.map(|(x, y)| (m(x), m(y))), fields: r.fields.iter().map(|n| m(*n)).collect() })
                 .collect();
-            let operands: Vec<(u8, NodeId)> = forks.iter().map(|(k, op)| (f.fork_ways[*k as usize], map[*op as usize])).collect();
+            let operands: Vec<(u8, NodeId)> = self.forks.iter().map(|(k, op)| (self.graph.fork_ways(*k), map[*op as usize])).collect();
             let mut sig: Vec<NodeId> = Vec::new();
             for r in &outs_c {
                 sig.extend([r.live, r.error]);
@@ -537,25 +658,115 @@ impl<'a> Table<'a> {
                 configs.push(Config { outs: outs_c, operands });
             }
         }
-        let operands: Vec<String> = forks.iter().map(|(k, op)| format!("fork {k}: {}", super::emit::show_tree(&cone, *op, 3))).collect();
-        let stats = format!(
-            "{} slots ({} pinned, {} interval), {} outcomes, forks {:?}, {} configurations ({} distinct), cone {} nodes, specialized {} nodes, trace {:.1} s, specialize {:.1} s",
-            n_slots,
-            pins.len(),
-            ival.len(),
-            outs.len(),
-            arities.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
-            n_configs,
-            configs.len(),
-            cone.len(),
-            shared.len(),
-            t_trace.as_secs_f64(),
-            (t0.elapsed() - t_trace).as_secs_f64()
-        ) + &operands.iter().map(|o| format!("\n      {o}")).collect::<String>();
-        self.shapes[id].traced = Some(Traced { seeds, graph: shared, outs, configs, bounds, pins, stats });
-        Ok(())
+        Spec { graph: shared, configs }
     }
 
+    /// The cone with its selects lifted (`lift`), specialized.
+    fn precise(&self) -> Spec {
+        let g = &self.graph;
+        let mut out = g.like();
+        let mut memo: HashMap<(Op, Vec<NodeId>), NodeId> = HashMap::new();
+        let mut map: Vec<NodeId> = Vec::with_capacity(g.len());
+        for i in 0..g.len() {
+            let nd = g.get(i as NodeId);
+            let args: Vec<NodeId> = nd.args.iter().map(|a| map[*a as usize]).collect();
+            map.push(if args.is_empty() { out.leaf(nd.op.clone()) } else { lift(&mut out, nd.op.clone(), args, Lift::All, &mut memo) });
+        }
+        let m = |n: NodeId| map[n as usize];
+        let lifted = Cone {
+            graph: out,
+            roots: self.roots.iter().map(|r| Roots { live: m(r.live), error: m(r.error), xy: r.xy.map(|(x, y)| (m(x), m(y))), fields: r.fields.iter().map(|n| m(*n)).collect() }).collect(),
+            forks: self.forks.iter().map(|(k, n)| (*k, m(*n))).collect(),
+            arities: self.arities.clone(),
+            n_forks: self.n_forks,
+        };
+        lifted.specialize()
+    }
+}
+
+/// `a + b` / `a - b` of a literal interval and a point, as the literal every
+/// lane then holds; `None` for anything else or past the 16.16 range.
+fn lit_shift(g: &Graph, op: &Op, args: &[NodeId]) -> Option<(i32, i32)> {
+    let c = |n: NodeId| match g.get(n).op {
+        Op::Const(lo, hi) => Some((lo as i64, hi as i64)),
+        _ => None,
+    };
+    let (a, b) = (c(*args.first()?)?, c(*args.get(1)?)?);
+    let (lo, hi) = match op {
+        Op::Add if a.0 < a.1 && b.0 == b.1 => (a.0 + b.0, a.1 + b.0),
+        Op::Add if b.0 < b.1 && a.0 == a.1 => (b.0 + a.0, b.1 + a.0),
+        Op::Sub if a.0 < a.1 && b.0 == b.1 => (a.0 - b.0, a.1 - b.0),
+        _ => return None,
+    };
+    (lo >= i32::MIN as i64 && hi <= i32::MAX as i64).then_some((lo as i32, hi as i32))
+}
+
+/// Which ops `lift` lifts selects out of.
+#[derive(Clone, Copy)]
+enum Lift {
+    /// A lane's ends and their difference (`Lo`, `Hi`, `Sub`): cheap, and what
+    /// the balloon's full-period width needs at every node of a balloon room.
+    /// The frame every node is evaluated with (`Traced::plain`).
+    Ends,
+    /// Every pure value op: ~25x the graph (room (7,1): 92k -> 2.4M nodes
+    /// specialized), so only where `Ends` is in violation (`Traced::precise`).
+    All,
+}
+
+/// `op(args)` with every select among the args LIFTED out where they all
+/// select on one condition: `op(.., sel(c, a, b), ..)` is `sel(c, op(.., a,
+/// ..), op(.., b, ..))`, exact per lane - a lane takes one arm of `c` in every
+/// operand at once. This evaluator joins a select it cannot decide, and an
+/// expression of a joined value forgets that its operands moved together:
+///
+/// * the balloon's full-period width `Hi(v) - Lo(v)`, `v` a select between two
+///   literal phases (shown or popped), is any difference of the two ends'
+///   hulls, and its premise (`widen::canon_balloon_offset`) is undecided;
+/// * a tile loop's "finished" obligation `start + k <= end`, both ends of the
+///   player's `x` after a `move` the evaluator cannot decide was taken (its
+///   speed range holds 0), puts a loop over 2 tiles at 3 (room (7,1)).
+///
+/// Lifted, each arm is decided on its own. Selects on DIFFERENT conditions
+/// are left joined: lifting those multiplies arms. Never across a fork op (a
+/// fork's operand stays one node) or a select's own condition. And a literal
+/// shifted by a point is the shifted literal (`lit_shift`), which `Graph::fold`
+/// leaves: it is exact with respect to `eval`'s hulls, not per lane.
+fn lift(g: &mut Graph, op: Op, args: Vec<NodeId>, what: Lift, memo: &mut HashMap<(Op, Vec<NodeId>), NodeId>) -> NodeId {
+    let liftable = match what {
+        Lift::Ends => matches!(op, Op::Sub | Op::Lo | Op::Hi),
+        Lift::All => matches!(
+            op,
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Flr | Op::Sin | Op::Min | Op::Max
+                | Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Not | Op::And | Op::Or | Op::Lo | Op::Hi | Op::TileFlagAt
+        ),
+    };
+    if let Some((lo, hi)) = lit_shift(g, &op, &args) {
+        return g.leaf(Op::Const(lo, hi));
+    }
+    if !liftable {
+        return g.fold(op, args);
+    }
+    let cond = |g: &Graph, a: NodeId| match g.get(a).op {
+        Op::Sel => Some(g.get(a).args[0]),
+        _ => None,
+    };
+    let conds: Vec<NodeId> = args.iter().filter_map(|a| cond(g, *a)).collect();
+    let Some(&c) = conds.first() else {
+        return g.fold(op, args);
+    };
+    if conds.iter().any(|d| *d != c) {
+        return g.fold(op, args);
+    }
+    if let Some(&r) = memo.get(&(op.clone(), args.clone())) {
+        return r;
+    }
+    let arm = |g: &Graph, k: usize| -> Vec<NodeId> { args.iter().map(|a| if cond(g, *a).is_some() { g.get(*a).args[k] } else { *a }).collect() };
+    let (ta, fa) = (arm(g, 1), arm(g, 2));
+    let t = lift(g, op.clone(), ta, what, memo);
+    let f = lift(g, op.clone(), fa, what, memo);
+    let r = g.fold(Op::Sel, vec![c, t, f]);
+    memo.insert((op, args), r);
+    r
 }
 
 /// One node's frame: evaluate every configuration over the shape's ranges at
@@ -579,7 +790,16 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
         };
         cells.insert(i as u32, v);
     }
-    let vals = t.graph.eval_narrow_top_in(&cells, room)?;
+    // The plain frame first; where it is in violation, the precise one (both
+    // over-approximate the node's frame, so either answer is sound).
+    let vals = t.plain.graph.eval_narrow_top_in(&cells, room)?;
+    let (sp, vals) = if in_violation(&t.plain, &vals) {
+        let precise = t.precise.get_or_init(|| t.cone.precise());
+        acc.precise += 1;
+        (precise, precise.graph.eval_narrow_top_in(&cells, room)?)
+    } else {
+        (&t.plain, vals)
+    };
     let mut out = NodeOut::default();
     let violation = |acc: &mut Acc, msg: String| {
         acc.n_violations += 1;
@@ -596,7 +816,7 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
         }
         Ok((lo >> 16, hi >> 16))
     };
-    for (ci, cfg) in t.configs.iter().enumerate() {
+    for (ci, cfg) in sp.configs.iter().enumerate() {
         for &(ways, n) in &cfg.operands {
             if let Val::Num(i) = vals[n as usize] {
                 let floors = (raw(i.high) >> 16) - (raw(i.low) >> 16) + 1;
@@ -610,11 +830,14 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
                 continue;
             }
             if vals[r.error as usize] != Val::Bool(Some(false)) {
-                let why = if acc.violations.len() < 12 { culprit(&t.graph, &vals, r.error) } else { String::new() };
+                let why = if acc.violations.len() < 12 { culprit(&sp.graph, &vals, r.error) } else { String::new() };
                 violation(acc, format!("shape {id} cell {xy:?} configuration {ci} outcome {oi}: a live outcome's error is {:?}: {why}", vals[r.error as usize]));
             }
             for (slot, n) in spec.fields.iter().zip(&r.fields) {
-                let o = Obs::of(vals[*n as usize]);
+                let o = match sp.graph.get(*n).op {
+                    Op::Const(lo, hi) if lo < hi => Obs::Lit(lo as i64, hi as i64),
+                    _ => Obs::of(vals[*n as usize]),
+                };
                 acc.obs[*slot] = Some(match acc.obs[*slot] {
                     Some(p) => p.join(o)?,
                     None => o,
@@ -657,6 +880,25 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
         }
     }
     Ok(out)
+}
+
+/// Would `eval_node` report a violation of this evaluation: a fork operand
+/// wider than its arity, a live outcome's error not false, a successor
+/// position not whole pixels or too large a box?
+fn in_violation(spec: &Spec, vals: &[Val]) -> bool {
+    let whole = |v: Val| matches!(v, Val::Num(i) if raw(i.low) & 0xffff == 0 && raw(i.high) & 0xffff == 0);
+    let cells = |i: Pico8NumInterval| (raw(i.high) >> 16) - (raw(i.low) >> 16) + 1;
+    spec.configs.iter().any(|cfg| {
+        cfg.operands.iter().any(|&(ways, n)| matches!(vals[n as usize], Val::Num(i) if cells(i) > ways as i64))
+            || cfg.outs.iter().any(|r| {
+                vals[r.live as usize] != Val::Bool(Some(false))
+                    && (vals[r.error as usize] != Val::Bool(Some(false))
+                        || r.xy.is_some_and(|(x, y)| match (vals[x as usize], vals[y as usize]) {
+                            (Val::Num(a), Val::Num(b)) if whole(vals[x as usize]) && whole(vals[y as usize]) => cells(a) * cells(b) > MAX_BOX,
+                            _ => true,
+                        }))
+            })
+    })
 }
 
 /// Which disjunct keeps `n` from being false: down the `Or`s and decided
@@ -862,7 +1104,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         ensure!(chain.len() <= 256, "the spawn prefix did not reach a player in 256 frames");
         table.shapes[id].traced = None;
         table.trace(&mut tr, id)?;
-        let mut acc = Acc { obs: vec![None; table.obs_keys.len()], clipped: vec![0; table.shapes.len()], violations: Vec::new(), n_violations: 0 };
+        let mut acc = Acc { obs: vec![None; table.obs_keys.len()], clipped: vec![0; table.shapes.len()], violations: Vec::new(), n_violations: 0, precise: 0 };
         let out = eval_node(&table.shapes, &table.room, id, xy, &mut acc)?;
         let f = chain.len() - 1;
         ensure!(acc.n_violations == 0 && acc.clipped.iter().all(|c| *c == 0), "the spawn prefix at frame {f} {xy:?}: {:?} (clipped {:?})", acc.violations, acc.clipped);
@@ -874,13 +1116,25 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         };
         // The successor's values are its seeds.
         let mut ranges: BTreeMap<Path, Range> = BTreeMap::new();
+        let mut lits: BTreeSet<Path> = BTreeSet::new();
+        let tkey = table.shapes[tid].key.clone();
         for (slot, o) in acc.obs.iter().enumerate() {
-            if let (Some(Obs::Num(lo, hi)), (sid, p)) = (o, &table.obs_keys[slot]) {
-                if *sid == tid {
+            let (sid, p) = &table.obs_keys[slot];
+            if *sid != tid {
+                continue;
+            }
+            match o {
+                Some(Obs::Lit(lo, hi)) if table.lit_slot(&tkey, p) => {
+                    ranges.insert(p.clone(), (*lo, *hi));
+                    lits.insert(p.clone());
+                }
+                Some(Obs::Num(lo, hi) | Obs::Lit(lo, hi)) => {
                     ranges.insert(p.clone(), (*lo, *hi));
                 }
+                _ => {}
             }
         }
+        table.shapes[tid].lits = lits;
         chain.push((tid, (xl, yl)));
         if let Some(pl) = super::shapes::player_path(&lw.reps[&table.shapes[tid].key]) {
             // The player's speed range joins the successor's own speed.
@@ -910,6 +1164,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         let mut obs: Vec<Option<Obs>> = Vec::new();
         let mut violations: Vec<String> = Vec::new();
         let mut n_violations = 0usize;
+        let mut n_precise = 0usize;
         let mut clipped: Vec<u64> = Vec::new();
         let add = |g: &mut Graph1, k: (usize, i16, i16)| -> (u32, bool) {
             if let Some(&i) = g.index.get(&k) {
@@ -949,7 +1204,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
                     .map(|_| {
                         let next = &next;
                         scope.spawn(move || -> Result<(Vec<(u32, NodeOut)>, Acc)> {
-                            let mut acc = Acc { obs: vec![None; n_obs], clipped: vec![0; n_shapes], violations: Vec::new(), n_violations: 0 };
+                            let mut acc = Acc { obs: vec![None; n_obs], clipped: vec![0; n_shapes], violations: Vec::new(), n_violations: 0, precise: 0 };
                             let mut done = Vec::new();
                             loop {
                                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -975,6 +1230,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
                     }
                 }
                 n_violations += acc.n_violations;
+                n_precise += acc.precise;
                 for (c, k) in clipped.iter_mut().zip(&acc.clipped) {
                     *c += k;
                 }
@@ -1013,7 +1269,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         let n_edges: usize = g.edges.iter().map(|e| e.len()).sum();
         say!(
             rep,
-            "pass {pass}: {} nodes, {} edges, {} exit nodes, {n_deaths} death successors, {layers} layers; {:.1} s ({:.1} s tracing); {n_violations} violations",
+            "pass {pass}: {} nodes, {} edges, {} exit nodes, {n_deaths} death successors, {layers} layers; {:.1} s ({:.1} s tracing); {n_precise} nodes evaluated precisely; {n_violations} violations",
             g.nodes.len(),
             n_edges,
             g.exits.iter().filter(|e| **e).count(),
@@ -1031,6 +1287,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         let mut changes: Vec<String> = Vec::new();
         for (slot, (id, p)) in table.obs_keys.clone().iter().enumerate() {
             let Some(o) = obs[slot] else { continue };
+            let eligible = table.lit_slot(&table.shapes[*id].key, p);
             let sh = &mut table.shapes[*id];
             let Some(t) = sh.traced.as_ref() else {
                 // Observed flowing into a shape no node of reached: nothing to
@@ -1038,6 +1295,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
                 continue;
             };
             if let Some(c) = t.pins.get(p) {
+                let o = o.hull();
                 let holds = match (c, o) {
                     (Conc::Num(v), Obs::Num(lo, hi)) => lo == raw(*v) && hi == raw(*v),
                     (Conc::Bool(b), Obs::Bool { f, t, u }) => !u && (if *b { !f } else { !t }),
@@ -1057,7 +1315,29 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
             if !t.seeds.iter().any(|s| matches!(s, Seed::Range(q) if q == p)) {
                 continue;
             }
-            if let (Some(r), Obs::Num(lo, hi)) = (sh.ranges.get(p).copied(), o) {
+            // A literal holds while exactly it flows in; anything else and the
+            // slot is a hull of the lanes' values from now on.
+            if sh.lits.contains(p) {
+                let r = sh.ranges[p];
+                if o != Obs::Lit(r.0, r.1) {
+                    let Obs::Num(lo, hi) = o.hull() else { bail!("shape {id}: {} observed {o:?}", iface::show(p)) };
+                    let w = (r.0.min(lo), r.1.max(hi));
+                    changes.push(format!("shape {id}: the literal {} = [{}, {}] observed {o:?}: the range [{}, {}]", iface::show(p), px(r.0), px(r.1), px(w.0), px(w.1)));
+                    sh.lits.remove(p);
+                    sh.ranges.insert(p.clone(), w);
+                    sh.traced = None;
+                }
+                continue;
+            }
+            if let (true, Obs::Lit(lo, hi), true) = (eligible, o, sh.unseeded.contains(p)) {
+                sh.unseeded.remove(p);
+                changes.push(format!("shape {id}: {} first observed the literal [{}, {}]", iface::show(p), px(lo), px(hi)));
+                sh.ranges.insert(p.clone(), (lo, hi));
+                sh.lits.insert(p.clone());
+                sh.traced = None;
+                continue;
+            }
+            if let (Some(r), Obs::Num(lo, hi)) = (sh.ranges.get(p).copied(), o.hull()) {
                 if sh.unseeded.remove(p) {
                     if (lo, hi) != r {
                         changes.push(format!("shape {id}: {} first observed [{}, {}]", iface::show(p), px(lo), px(hi)));
@@ -1106,7 +1386,15 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
             .ranges
             .iter()
             .filter(|(p, _)| t.seeds.iter().any(|s| matches!(s, Seed::Range(q) if q == *p)))
-            .map(|(p, r)| if r.0 == r.1 { format!("{}={}", iface::show(p), px(r.0)) } else { format!("{}=[{},{}]", iface::show(p), px(r.0), px(r.1)) })
+            .map(|(p, r)| {
+                if r.0 == r.1 {
+                    format!("{}={}", iface::show(p), px(r.0))
+                } else if sh.lits.contains(p) {
+                    format!("{}=literal[{},{}]", iface::show(p), px(r.0), px(r.1))
+                } else {
+                    format!("{}=[{},{}]", iface::show(p), px(r.0), px(r.1))
+                }
+            })
             .collect();
         say!(rep, "    {}", rs.join(" "))?;
         if !sh.demoted.is_empty() {
@@ -1361,4 +1649,114 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
     }
     say!(rep, "\ntotal {:.1} s", t_all.elapsed().as_secs_f64())?;
     Ok(rep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn num(lo: i32, hi: i32) -> Val {
+        Val::Num(Pico8NumInterval::new(P8::from_raw(lo), P8::from_raw(hi)))
+    }
+
+    /// The balloon's full-period premise `Hi(v) - Lo(v) >= 1` (the width of its
+    /// phase, `widen::canon_balloon_offset`), with `v` a select on a condition
+    /// the evaluator leaves undecided between the phase `[0, 1)` and the phase
+    /// advanced by 0.01. Over the joined select the two ends are independent
+    /// and the premise is undecided - every node of rooms (6,1) and (7,1) in
+    /// violation; lifted (`lift`, `Lift::Ends`) each arm is a literal shifted
+    /// by a point (`lit_shift`), and the premise holds.
+    #[test]
+    fn a_select_of_literal_phases_keeps_its_full_period_width() {
+        let period = 0xffff;
+        let build = |what: Option<Lift>| -> (Graph, NodeId) {
+            let mut g = Graph::default();
+            let mut memo = HashMap::new();
+            let mut mk = |g: &mut Graph, op: Op, args: Vec<NodeId>| match what {
+                Some(w) => lift(g, op, args, w, &mut memo),
+                None => g.fold(op, args),
+            };
+            let shown = g.leaf(Op::Cell(0));
+            let zero = g.leaf(Op::Const(0, 0));
+            let c = mk(&mut g, Op::Gt, vec![shown, zero]);
+            let phase = g.leaf(Op::Const(0, period));
+            let step = g.leaf(Op::Const(655, 655));
+            let advanced = mk(&mut g, Op::Add, vec![phase, step]);
+            let v = mk(&mut g, Op::Sel, vec![c, advanced, phase]);
+            let hi = mk(&mut g, Op::Hi, vec![v]);
+            let lo = mk(&mut g, Op::Lo, vec![v]);
+            let width = mk(&mut g, Op::Sub, vec![hi, lo]);
+            let p = g.leaf(Op::Const(period, period));
+            let full = mk(&mut g, Op::Ge, vec![width, p]);
+            (g, full)
+        };
+        let cells: HashMap<u32, Val> = [(0, num(-0x10000, 0x10000))].into_iter().collect();
+        let (g, full) = build(None);
+        assert_eq!(g.eval_narrow_top(&cells).unwrap()[full as usize], Val::Bool(None), "joined, the width is undecided");
+        for w in [Lift::Ends, Lift::All] {
+            let (g, full) = build(Some(w));
+            assert_eq!(g.eval_narrow_top(&cells).unwrap()[full as usize], Val::Bool(Some(true)), "lifted, each arm is a full period");
+        }
+    }
+
+    /// A tile loop's "another iteration" test `start + 2 <= end` over the
+    /// player's `x` after a `move` the evaluator cannot decide was taken (x 44
+    /// or 52, room (7,1) at (52, 35)): both ends of the loop read the same `x`,
+    /// so per lane the loop is two tiles, but over the joined `x` it may be
+    /// three - the unrolled loop's "finished" obligation undecided. Lifting
+    /// every value op (`Lift::All`, the precise frame) decides it; `Lift::Ends`
+    /// does not touch it.
+    #[test]
+    fn lifting_keeps_a_tile_loop_over_one_x_two_tiles_wide() {
+        let build = |what: Lift| -> (Graph, NodeId) {
+            let mut g = Graph::default();
+            let mut memo = HashMap::new();
+            let mut mk = |g: &mut Graph, op: Op, args: Vec<NodeId>| lift(g, op, args, what, &mut memo);
+            let moved = g.leaf(Op::Cell(0));
+            let zero = g.leaf(Op::Const(0, 0));
+            let c = mk(&mut g, Op::Gt, vec![moved, zero]);
+            let (a, b) = (g.leaf(Op::Const(44 << 16, 44 << 16)), g.leaf(Op::Const(52 << 16, 52 << 16)));
+            let x = mk(&mut g, Op::Sel, vec![c, a, b]);
+            let k = |g: &mut Graph, v: i32| g.leaf(Op::Const(v << 16, v << 16));
+            let (one, five, eight, two) = (k(&mut g, 1), k(&mut g, 5), k(&mut g, 8), k(&mut g, 2));
+            let x1 = mk(&mut g, Op::Add, vec![x, one]);
+            let sd = mk(&mut g, Op::Div, vec![x1, eight]);
+            let start = mk(&mut g, Op::Flr, vec![sd]);
+            let xe = mk(&mut g, Op::Add, vec![x1, five]);
+            let ed = mk(&mut g, Op::Div, vec![xe, eight]);
+            let end = mk(&mut g, Op::Flr, vec![ed]);
+            let third = mk(&mut g, Op::Add, vec![start, two]);
+            let more = mk(&mut g, Op::Le, vec![third, end]);
+            (g, more)
+        };
+        let cells: HashMap<u32, Val> = [(0, num(-0x10000, 0x10000))].into_iter().collect();
+        let (g, more) = build(Lift::Ends);
+        assert_eq!(g.eval_narrow_top(&cells).unwrap()[more as usize], Val::Bool(None));
+        let (g, more) = build(Lift::All);
+        assert_eq!(g.eval_narrow_top(&cells).unwrap()[more as usize], Val::Bool(Some(false)), "per lane, no third tile");
+    }
+}
+
+#[cfg(test)]
+mod room_tests {
+    /// Room (7,1)'s table builds and is sound by its own checks (rooms (6,1)
+    /// and (7,1) failed at the spawn's first frame on the balloon's phase,
+    /// then on a tile loop over a joined `x`, 2026-10-01): the start state is
+    /// at least 45 frames from the exit (the known optimum is 86).
+    #[test]
+    #[ignore = "~30 s with 8 threads: a lattice walk and five passes"]
+    fn room_71_table_builds_with_its_balloon() {
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
+            return;
+        }
+        std::env::set_var("CELESTE_START_ROOM", "7,1");
+        let t = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| super::cost_to_go(std::path::Path::new("."), 5, 8))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(t.start_d, 45);
+    }
 }

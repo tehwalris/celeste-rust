@@ -293,6 +293,71 @@ Room (1,0), S=5, H=99 (release, held ladder, `--ceiling 99`), as committed:
 
 So room (2,0)'s 95 no longer rests on the 8 px band.
 
+## Rooms (6,1), (7,1), (0,2): three tables that did not build (2026-10-01)
+
+Three causes, each a premise the table CHECKS that the evaluator could not
+decide. None of the checks was weakened.
+
+**The balloon's phase (rooms (6,1), (7,1)).** The balloon draws `offset =
+rnd(1)` in `_init`: every state holds the literal interval `[0, 1)`, and every
+outcome stores the canonical `[0, 1)` with the premise that it IS a full period
+(`widen::canon_balloon_offset`: `Hi(v) - Lo(v) >= 1`). Two things broke it:
+
+- The start state's representative holds a BLANKED 0 there (`kernel.rs`: the
+  walk types the slot as an interval input), and the table seeded its ranges
+  from the representative: phase `[0, 0]`, width 0, "error is true" on the
+  spawn's first frame. The walk now records the start state's own intervals
+  (`LatticeWalk::start_ivals`).
+- A range is a HULL of the node's values, so `Lo`/`Hi` of it are anywhere in
+  it and the width is undecided. A slot every state holds as one literal
+  (`Obs::Lit`, only `rnd`-derived `ival_extra` slots, never `rem`/`spd`) is now
+  read as that literal (`Shape::lits`, the cone's cell replaced by the
+  `Const`), a literal plus a point folds to the shifted literal (`lit_shift`),
+  and `Lo`/`Hi`/`Sub` lift selects out (`lift`, `Lift::Ends`), since the phase
+  is `sel(shown, offset + 0.01, offset)` on a condition the ranges leave open.
+  A literal that ever observes anything else drops back to a range.
+
+**A tile loop over a joined `x` (room (7,1), then (0,2) and (6,1)).** At (52,
+35) the player's `x` after `move` is `sel(spd ~= 0, x moved, x)`: the speed
+range holds 0, so it is undecided, and over the joined `x` a collision loop's
+two ends (`flr((x+1)/8)`, `flr((x+6)/8)`) are independent - three tiles where
+each state has two, the unrolled loop's "finished" obligation undecided.
+Lifting every value op through selects on one condition (`Lift::All`) decides
+it, but makes the graph ~25x larger (room (7,1): 92k -> 2.4M specialized nodes,
+a pass 9 s -> 390 s). So it is the FALLBACK: a node is evaluated with the plain
+frame, and only if that is in violation (`in_violation`) with the precise one,
+built once per shape (`Traced::precise`). Both are sound; 26-104 nodes per pass
+take it.
+
+**The fake wall's speed (room (0,2)).** `hit.spd.x = -sign(hit.spd.x)*1.5`
+before the player's `move` makes the move operand three pieces 2 floors wide
+each. `flr_ways` sizes a fork by the widest PIECE (a kernel lane is in one),
+so the fork was 2-way; the table's evaluator joins the select and sees the
+hull, 5 floors - 10,997,504 violations. Under `uncapped_ways` (level -1 only)
+the arity is now the hull's width: shape 2 forks `[5, 2, 11, 11]`, 1,210
+configurations. Kernels are untouched (`uncapped_ways` is off there).
+
+| room | build (quick, 8 threads, probe wall) | nodes | start's d | known optimum |
+|---|---|---|---|---|
+| (7,1) | 32 s | 21,250 | 45 | 86 |
+| (0,2) | 3:52 | 61,208 | 45 | 81 |
+| (6,1) | 6:43 (2 passes with shapes 4 and 7 not yet literal: 14k and 33k precise nodes) | 78,544 | 49 | 89 |
+| (2,0) | 58 s | 38,852 | 45 (identical d map to `09505c7`) | 95 |
+| (5,1) | 66 s | 40,080 | 45 (identical d map to `09505c7`) | 104 |
+
+Room (0,2), the table against a level-0 tree without the filter
+(`r0sxhn`, f0-f61): 288,366 recorded in-room transitions, 0 not in the table.
+The filter at H = 81 (`search --from 81 --to 81`, level 0):
+
+| frame | no filter | filter |
+|---|---|---|
+| f055 | 3,089,194 | 3,089,194 |
+| f060 | 6,194,037 | 5,987,224 |
+| f061 | 6,957,393 | 6,284,993 |
+| f065 | | 3,288,338 |
+| f070 | | 1,310,981 |
+| f075 | 65,768,836 (an earlier run, killed at 30 GB) | |
+
 ## DEFERRED: the off-screen lane (2026-09-17)
 
 The filter is sound and acceptable as it is; this is precision, parked while the
