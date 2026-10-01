@@ -229,8 +229,12 @@ pub const FLOOR_STATE_RANGE: (i32, i32) = (0, 2 << 16);
 
 /// A spring's `spr` where a near level widens it: 0 hidden, 18 ready, 19
 /// compressed, the only values the cart gives it. Raw 16.16. ONE definition,
-/// shared with the tracer (`widen::widen_near_springs`).
+/// shared with the tracer (`widen::phase_paths`).
 pub const SPRING_SPR_RANGE: (i32, i32) = (0, 19 << 16);
+
+/// A balloon's `spr` where a near level widens it: 0 popped, 22 present.
+/// Raw 16.16. ONE definition, shared with the tracer (`widen::phase_paths`).
+pub const BALLOON_SPR_RANGE: (i32, i32) = (0, 22 << 16);
 
 /// The player's hitbox (`player.init`) and every other object's
 /// (`init_object`), `(x, y, w, h)`, as `floor_player_window` reads them. The
@@ -1235,21 +1239,27 @@ impl Rt2 {
                 self.cols[c as usize] = Col::U(AV::UNum);
             }
         }
-        // The spring's whole phase at both floors-unknown levels
-        // (`widen::spring_paths`). A spring that never bounced has no `delay`
-        // (the post-`_init` block, keyed exact): nothing there to widen.
-        // Unknown: the unknown number. Near: intervals (`SPRING_SPR_RANGE`,
-        // `FLOOR_TIMER_RANGE`), as `widen::widen_near_springs` writes them.
+        // The objects' phases at both floors-unknown levels
+        // (`widen::phase_paths`): the springs' and the balloons'. Unknown: the
+        // unknown number. Near: their intervals, as `widen::widen_near_phases`
+        // writes them. A spring that never bounced has no `delay` (the
+        // post-`_init` block, keyed exact): nothing there to widen.
         if matches!(floors, FloorsWidening::Unknown | FloorsWidening::Near) {
             let near = floors == FloorsWidening::Near;
-            for obj in self.objects_of_type(ids, ids.g_spring) {
-                for (name, f) in [("spr", ids.f_spr), ("delay", ids.f_delay), ("hide_in", ids.f_hide_in), ("hide_for", ids.f_hide_for)] {
+            let phases = self
+                .objects_of_type(ids, ids.g_spring)
+                .into_iter()
+                .flat_map(|o| [(o, "spr", ids.f_spr, SPRING_SPR_RANGE), (o, "delay", ids.f_delay, FLOOR_TIMER_RANGE), (o, "hide_in", ids.f_hide_in, FLOOR_TIMER_RANGE), (o, "hide_for", ids.f_hide_for, FLOOR_TIMER_RANGE)])
+                .chain(self.objects_of_type(ids, ids.g_balloon).into_iter().map(|o| (o, "spr", ids.f_spr, BALLOON_SPR_RANGE)))
+                .collect::<Vec<_>>();
+            {
+                for (obj, name, f, range) in phases {
                     let Some(c) = self.obj_field_cell(obj, f) else {
-                        assert!(f == ids.f_delay, "spring widening: the spring has no `{name}` field");
+                        assert!(f == ids.f_delay, "phase widening: no `{name}` field");
                         continue;
                     };
                     if near {
-                        let (lo, hi) = if f == ids.f_spr { SPRING_SPR_RANGE } else { FLOOR_TIMER_RANGE };
+                        let (lo, hi) = range;
                         let (lo, hi) = (P8::from_raw(lo), P8::from_raw(hi));
                         check(self, c, name, &|v| match v {
                             AV::Num(n) => lo <= n && n <= hi,

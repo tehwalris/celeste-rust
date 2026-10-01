@@ -2810,7 +2810,7 @@ fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: super:
         // two apart by the slot's value; `widen::widen_near_floors`).
         if opts.floors_near {
             ival.extend(super::widen::near_floor_paths(st).all().cloned());
-            ival.extend(super::widen::spring_paths(st));
+            ival.extend(super::widen::phase_paths(st).into_iter().map(|(p, _)| p));
         }
         ival
     } else {

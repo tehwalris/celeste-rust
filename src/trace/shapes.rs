@@ -357,7 +357,7 @@ pub fn level_widened_paths(st: &State<Symbolic>, opts: &WalkOpts) -> Vec<Path> {
     }
     if opts.floors_near {
         out.extend(super::widen::near_floor_paths(st).all().cloned());
-        out.extend(super::widen::spring_paths(st));
+        out.extend(super::widen::phase_paths(st).into_iter().map(|(p, _)| p));
     }
     out
 }

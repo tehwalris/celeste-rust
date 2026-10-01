@@ -218,7 +218,7 @@ fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut S
     Ok(())
 }
 
-use celeste_engine::runtime2::{floor_player_window, BALLOON_PERIOD_RAW, FLOOR_HITBOX, FLOOR_STATE_RANGE, FLOOR_TIMER_RANGE, SPRING_SPR_RANGE, PLATFORM_PATH, PLATFORM_REM, PLAYER_HITBOX};
+use celeste_engine::runtime2::{floor_player_window, BALLOON_PERIOD_RAW, FLOOR_HITBOX, FLOOR_STATE_RANGE, FLOOR_TIMER_RANGE, SPRING_SPR_RANGE, BALLOON_SPR_RANGE, PLATFORM_PATH, PLATFORM_REM, PLAYER_HITBOX};
 
 /// Held buttons unknown (plans/held-buttons.md): the player's trails leave the
 /// frame unknown - the canonical output unknown (`Symbolic::unknown_bool_output`),
@@ -283,23 +283,29 @@ pub fn fall_floor_paths<D: Domain>(st: &State<D>) -> FallFloorPaths {
     for obj in objects_of_type(st, "balloon") {
         out.unknown.push(field(&obj, &["timer"]));
     }
-    // The spring's whole phase (`spring_paths`).
-    out.unknown.extend(spring_paths(st));
+    // The objects' phases (`phase_paths`).
+    out.unknown.extend(phase_paths(st).into_iter().map(|(p, _)| p));
     out
 }
 
-/// The spring's whole phase, which both floors-unknown levels widen to the
-/// unknown number (2026-10-01, room (7,0)): `spr` (ready, compressed,
-/// hidden), the compressed countdown `delay`, and the hide countdowns
-/// `hide_in`/`hide_for`. Its update is then "maybe bounce the player" and
-/// nothing else, so the floor under it (whose break starts `hide_in`) is
-/// widened like any other.
-pub fn spring_paths<D: Domain>(st: &State<D>) -> Vec<Path> {
+/// The object PHASES both floors-unknown levels widen (2026-10-01, rooms
+/// (7,0)/(0,1)), each with the range a near level stores it as: the spring's
+/// `spr` (0 hidden, 18 ready, 19 compressed), its compressed countdown `delay`
+/// and hide countdowns `hide_in`/`hide_for`, and the balloon's `spr` (0
+/// popped, 22 present). The spring's update is then "maybe bounce the
+/// player", the balloon's "maybe refill the dash where the player overlaps
+/// its bob", and nothing else; the floor under a spring is widened like any
+/// other. (The balloon's respawn `timer` is a countdown with the floors'.)
+pub fn phase_paths<D: Domain>(st: &State<D>) -> Vec<(Path, (i32, i32))> {
     let mut out = Vec::new();
     for obj in objects_of_type(st, "spring") {
-        for f in ["spr", "delay", "hide_in", "hide_for"] {
-            out.push(field(&obj, &[f]));
+        out.push((field(&obj, &["spr"]), SPRING_SPR_RANGE));
+        for f in ["delay", "hide_in", "hide_for"] {
+            out.push((field(&obj, &[f]), FLOOR_TIMER_RANGE));
         }
+    }
+    for obj in objects_of_type(st, "balloon") {
+        out.push((field(&obj, &["spr"]), BALLOON_SPR_RANGE));
     }
     out
 }
@@ -345,7 +351,7 @@ fn widen_floor_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> 
 
 /// The fields a near level widens but where the player overlaps the floor
 /// (`abstraction::FloorsPrecision::Near`), per fall floor; its countdowns are
-/// `floor_timer_paths`, the spring's phase `spring_paths`.
+/// `floor_timer_paths`, the objects' phases `phase_paths`.
 pub struct NearFloorPaths {
     pub floors: Vec<Path>,
     /// `state`: the interval `FLOOR_STATE_RANGE`, or exact.
@@ -370,16 +376,13 @@ pub fn near_floor_paths(st: &State<Symbolic>) -> NearFloorPaths {
     out
 }
 
-/// The spring's phase at a near level, as INTERVALS - the level has no
-/// unknown numbers, so `spr == 18` splits like a floor's `state == k`:
-/// `spr` the range of its values (`SPRING_SPR_RANGE`: 0 hidden, 18 ready, 19
-/// compressed), the countdowns `delay`, `hide_in`, `hide_for` the whole range
-/// (`FLOOR_TIMER_RANGE`: compared with 0 and decremented only). The output
-/// side; the next frame reads the stored intervals as interval inputs.
-fn widen_near_springs(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
-    for p in spring_paths(st) {
+/// The objects' phases at a near level (`phase_paths`), as INTERVALS - the
+/// level has no unknown numbers, so `spr == 18` splits like a floor's `state
+/// == k`. The output side; the next frame reads the stored intervals as
+/// interval inputs.
+fn widen_near_phases(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
+    for (p, (lo, hi)) in phase_paths(st) {
         let Some(Value::Num(v)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
-        let (lo, hi) = if p.last() == Some(&iface::key("spr")) { SPRING_SPR_RANGE } else { FLOOR_TIMER_RANGE };
         if let Some(holds) = contain(d, v, (lo as i64, hi as i64)) {
             owe(errs, d, &p, holds);
         }
@@ -458,7 +461,7 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
         };
         players.push((coord("x")?, coord("y")?));
     }
-    widen_near_springs(st, d, errs)?;
+    widen_near_phases(st, d, errs)?;
     let fp = near_floor_paths(st);
     let (slo, shi) = FLOOR_STATE_RANGE;
     for ((obj, ps), pc) in fp.floors.iter().zip(&fp.state).zip(&fp.collideable) {
