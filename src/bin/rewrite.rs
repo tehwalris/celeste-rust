@@ -3459,85 +3459,90 @@ fn main() -> Result<()> {
                 for byte in 0u8..64 {
                     let mut s = state.clone();
                     celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
-                    let mut succ = eng.run_frame_concrete(&s)?;
-                    celeste_rust::concrete::restore_buttons(initial, &mut succ)?;
-                    *steps += 1;
-                    let block = Block::from_state(&succ)?;
-                    if wins_of(block.rt2())?.iter().any(|&w| w) {
-                        path.push(byte);
-                        eprintln!("[witness] WIN at f{} via input {}", f + 1, byte);
-                        return Ok(true);
-                    }
-                    let (shape, keys, cells) = widened_keys(&block, precision)?;
-                    let id = (keys[0].0, keys[0].1, cells[0]);
-                    if f == 0 && byte == 0 && layer_of.get(&id) != Some(&1) {
-                        eprintln!(
-                            "[witness] f1 successor: cell {} layer {:?} marked {} - diffing against layer 1",
-                            cells[0],
-                            layer_of.get(&id),
-                            marks.contains(shape, keys[0], cells[0])
-                        );
-                        // Column-by-column diff of the widened concrete
-                        // successor against every layer-1 row.
-                        let mut mine = block.into_rt2();
-                        if let RemPrecision::Bits(b) = precision.rem {
-                            mine.widen_to(celeste_rust::compiled::ids(), b, celeste_rust::frame::spd_width_log2(precision.spd), (precision.pos.x, precision.pos.y), precision.held.is_unknown(), precision.fruit.is_unknown(), celeste_rust::frame::floors_widening(precision.floors), precision.platforms.is_unknown());
+                    // Every leaf: a frame forks where the cart reads a value no
+                    // input decides (`rnd`: room (7,0)'s balloon phase), and a
+                    // leaf on a marked chain is as good a witness as the frame
+                    // has. The real-PICO-8 replay, with a seed, settles it.
+                    for mut succ in eng.run_frame_concrete_all(&s)? {
+                        celeste_rust::concrete::restore_buttons(initial, &mut succ)?;
+                        *steps += 1;
+                        let block = Block::from_state(&succ)?;
+                        if wins_of(block.rt2())?.iter().any(|&w| w) {
+                            path.push(byte);
+                            eprintln!("[witness] WIN at f{} via input {}", f + 1, byte);
+                            return Ok(true);
                         }
-                        for file in frame_files(dir, 1)? {
-                            let Some(theirs) = file.load_all()? else { continue };
+                        let (shape, keys, cells) = widened_keys(&block, precision)?;
+                        let id = (keys[0].0, keys[0].1, cells[0]);
+                        if f == 0 && byte == 0 && layer_of.get(&id) != Some(&1) {
                             eprintln!(
-                                "[witness]   layer-1 file shape {:#x} width {} (mine shape {:#x}); structures {}",
-                                theirs.shape_hash,
-                                theirs.width,
-                                mine.shape_hash,
-                                if theirs.structure == mine.structure { "EQUAL" } else { "DIFFER" }
+                                "[witness] f1 successor: cell {} layer {:?} marked {} - diffing against layer 1",
+                                cells[0],
+                                layer_of.get(&id),
+                                marks.contains(shape, keys[0], cells[0])
                             );
-                            let name_of = |cell: usize| -> String {
-                                for (g, &c) in mine.globals.iter().enumerate() {
-                                    if c as usize == cell {
-                                        return format!("global {}", celeste_names::GLOBAL_NAMES[g]);
+                            // Column-by-column diff of the widened concrete
+                            // successor against every layer-1 row.
+                            let mut mine = block.into_rt2();
+                            if let RemPrecision::Bits(b) = precision.rem {
+                                mine.widen_to(celeste_rust::compiled::ids(), b, celeste_rust::frame::spd_width_log2(precision.spd), (precision.pos.x, precision.pos.y), precision.held.is_unknown(), precision.fruit.is_unknown(), celeste_rust::frame::floors_widening(precision.floors), precision.platforms.is_unknown());
+                            }
+                            for file in frame_files(dir, 1)? {
+                                let Some(theirs) = file.load_all()? else { continue };
+                                eprintln!(
+                                    "[witness]   layer-1 file shape {:#x} width {} (mine shape {:#x}); structures {}",
+                                    theirs.shape_hash,
+                                    theirs.width,
+                                    mine.shape_hash,
+                                    if theirs.structure == mine.structure { "EQUAL" } else { "DIFFER" }
+                                );
+                                let name_of = |cell: usize| -> String {
+                                    for (g, &c) in mine.globals.iter().enumerate() {
+                                        if c as usize == cell {
+                                            return format!("global {}", celeste_names::GLOBAL_NAMES[g]);
+                                        }
                                     }
-                                }
-                                for (obj, node) in mine.structure.iter().enumerate() {
-                                    if let celeste_engine::runtime2::Cell2::Obj(fields) = node {
-                                        for &(fid, c) in fields {
-                                            if c as usize == cell {
-                                                return format!("obj#{obj}.{}", celeste_names::FIELD_NAMES[fid as usize]);
+                                    for (obj, node) in mine.structure.iter().enumerate() {
+                                        if let celeste_engine::runtime2::Cell2::Obj(fields) = node {
+                                            for &(fid, c) in fields {
+                                                if c as usize == cell {
+                                                    return format!("obj#{obj}.{}", celeste_names::FIELD_NAMES[fid as usize]);
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                String::from("?")
-                            };
-                            let n = mine.cols.len().min(theirs.cols.len());
-                            let mut shown = 0;
-                            for c in 0..n {
-                                if !matches!(mine.structure[c], celeste_engine::runtime2::Cell2::Val) {
-                                    continue;
-                                }
-                                for lane in 0..theirs.width {
-                                    let (a, b) = (mine.cols[c].at(0), theirs.cols[c].at(lane));
-                                    if a != b && shown < 40 {
-                                        eprintln!("[witness]   cell {c} ({}): mine {:?} vs theirs[{lane}] {:?}", name_of(c), a, b);
-                                        shown += 1;
+                                    String::from("?")
+                                };
+                                let n = mine.cols.len().min(theirs.cols.len());
+                                let mut shown = 0;
+                                for c in 0..n {
+                                    if !matches!(mine.structure[c], celeste_engine::runtime2::Cell2::Val) {
+                                        continue;
+                                    }
+                                    for lane in 0..theirs.width {
+                                        let (a, b) = (mine.cols[c].at(0), theirs.cols[c].at(lane));
+                                        if a != b && shown < 40 {
+                                            eprintln!("[witness]   cell {c} ({}): mine {:?} vs theirs[{lane}] {:?}", name_of(c), a, b);
+                                            shown += 1;
+                                        }
                                     }
                                 }
                             }
+                            anyhow::bail!("stopping after the diff");
                         }
-                        anyhow::bail!("stopping after the diff");
+                        if dead.contains(&id) || !marks.contains(shape, keys[0], cells[0]) {
+                            continue;
+                        }
+                        if layer_of.get(&id) != Some(&(f + 1)) {
+                            continue;
+                        }
+                        path.push(byte);
+                        if dfs(eng, initial, &succ, f + 1, horizon, precision, marks, layer_of, dead, path, steps, dir)? {
+                            return Ok(true);
+                        }
+                        path.pop();
+                        dead.insert(id);
                     }
-                    if dead.contains(&id) || !marks.contains(shape, keys[0], cells[0]) {
-                        continue;
-                    }
-                    if layer_of.get(&id) != Some(&(f + 1)) {
-                        continue;
-                    }
-                    path.push(byte);
-                    if dfs(eng, initial, &succ, f + 1, horizon, precision, marks, layer_of, dead, path, steps, dir)? {
-                        return Ok(true);
-                    }
-                    path.pop();
-                    dead.insert(id);
                 }
                 Ok(false)
             }
