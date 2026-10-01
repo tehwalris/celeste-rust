@@ -52,7 +52,7 @@ impl Cursor {
 
     /// A fork with `n` options. `n <= 1` is not a choice (identity fork), so it
     /// is not recorded. Returns the choice index in `0..n`.
-    fn choose(&mut self, n: u32) -> u32 {
+    pub fn choose(&mut self, n: u32) -> u32 {
         if n <= 1 {
             return 0;
         }

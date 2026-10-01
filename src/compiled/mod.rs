@@ -123,6 +123,8 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
         f_timer: f("timer"),
         f_offset: f("offset"),
         g_spring: g("spring"),
+        f_hide_in: f("hide_in"),
+        f_hide_for: f("hide_for"),
     }
 }
 

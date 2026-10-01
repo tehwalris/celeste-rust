@@ -423,6 +423,30 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         every: u32,
     },
+    /// THE KERNELS AGAINST THE REFERENCE ENGINE, row by row: `samples` stored
+    /// rows first reached at step `frame` (in player cell `--cell x,y` if
+    /// given) each run one step through the compiled kernels of `--level` and
+    /// through the reference engine (`RefEngine`, the interpreter enumerating
+    /// every fork path, unknown inputs forked per path), both sides projected
+    /// onto the level (`frame::widen_rt2_to`) and compared by named fields.
+    /// A reference successor the kernels miss is a SOUNDNESS gap; a kernel
+    /// successor the reference never makes is a PRECISION gap (room (7,0)'s
+    /// floor-collision join, `7f6b96e`).
+    RefCheck {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        frame: u32,
+        #[arg(long)]
+        level: String,
+        #[arg(long, default_value_t = 20)]
+        samples: usize,
+        #[arg(long)]
+        cell: Option<String>,
+        /// Show up to this many differing successors per row and side.
+        #[arg(long, default_value_t = 3)]
+        show: usize,
+    },
     /// DIAGNOSTIC: re-run ONE stored state through the kernels of `--level`
     /// and print every successor (projected without `--erase`), next to the
     /// state itself: what the kernel makes of a single row. `--row L:S:R` is
@@ -2730,6 +2754,92 @@ fn main() -> Result<()> {
                     println!("{s:>4} | {new:>8} | {:>10} | {:>6} | {:>8}", all.len(), spd.len(), inner.len());
                 }
             }
+        }
+        Command::RefCheck { level_dir, frame, level, samples, cell, show } => {
+            use celeste_rust::frame::{frame_files_seq, pack_id, widen_rt2_to, Block};
+            use celeste_rust::interpreter::abstraction::{set_level, Level};
+            use celeste_rust::search::pos_graph::{cell_of, cell_xy};
+            type Proj = std::collections::BTreeMap<String, String>;
+            let ids = celeste_rust::compiled::ids();
+            let dir = std::path::Path::new(&level_dir);
+            let lvl = Level::parse(&level).map_err(|e| anyhow::anyhow!(e))?;
+            set_level(lvl);
+            let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+            let mut reference = celeste_rust::trace::refengine::RefEngine::new()?;
+            let only = match &cell {
+                Some(s) => {
+                    let (a, b) = s.split_once(',').ok_or_else(|| anyhow::anyhow!("--cell x,y"))?;
+                    Some(cell_of(a.trim().parse()?, b.trim().parse()?)?)
+                }
+                None => None,
+            };
+            // Every candidate row (seq, row), then `samples` evenly spaced.
+            let files = frame_files_seq(dir, frame)?;
+            let mut all: Vec<(usize, u32)> = Vec::new();
+            for (fi, (_, f)) in files.iter().enumerate() {
+                match only {
+                    Some(c) => all.extend(f.rows_of_cell(c).into_iter().flatten().map(|r| (fi, r))),
+                    None => all.extend((0..f.width()).map(|r| (fi, r))),
+                }
+            }
+            anyhow::ensure!(!all.is_empty(), "no rows at step {frame}");
+            // A block's rows, projected onto the level, by named fields.
+            let projected = |rt2: &mut celeste_engine::runtime2::Rt2| -> Vec<Proj> {
+                widen_rt2_to(rt2, lvl);
+                let names = cell_names(rt2, ids);
+                (0..rt2.width).map(|r| project_row(rt2, &names, r as u32, &[])).collect()
+            };
+            // What a successor is, for reading: the player's fields.
+            let brief = |p: &Proj| -> String {
+                p.iter()
+                    .filter(|(n, _)| (n.starts_with("player") || n.starts_with("spd") || n.starts_with("rem") || n.starts_with("dash_effect")) && !n.contains("hitbox") && !n.contains(".type.") && !n.ends_with(".solids") && !n.ends_with(".collideable") && !n.contains(".flip.y"))
+                    .map(|(n, v)| format!("{n}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let n = samples.min(all.len());
+            let (mut sound_gaps, mut precision_gaps, mut rows_bad) = (0usize, 0usize, 0usize);
+            for k in 0..n {
+                let (fi, r) = all[k * all.len() / n];
+                let (seq, f) = &files[fi];
+                let rt2 = f.load_rows(&[r..r + 1])?.ok_or_else(|| anyhow::anyhow!("no row"))?;
+                let at = cell_xy(f.row_cells()[r as usize]).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".into());
+                // The kernels' successors.
+                let block = Block::with_ids(rt2.clone_block(), vec![pack_id(frame, *seq, r)], *seq);
+                let tmp = std::env::temp_dir().join(format!("ref-check-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&tmp);
+                let door = celeste_rust::search::door::Door::for_current_level();
+                let (next, _, _) = celeste_rust::frame::forward_frame(&kernels, vec![block], &door, None, None, frame + 1, Some(&tmp))?;
+                let _ = std::fs::remove_dir_all(&tmp);
+                let mut kset: std::collections::BTreeSet<Proj> = Default::default();
+                for b in next {
+                    let mut w = b.into_rt2();
+                    kset.extend(projected(&mut w));
+                }
+                // The reference engine's, from the same row projected onto the
+                // level (the input the kernels' own widening reads).
+                let mut input = rt2.clone_block();
+                widen_rt2_to(&mut input, lvl);
+                let state = Block::from_rt2(input).to_state();
+                let mut rset: std::collections::BTreeSet<Proj> = Default::default();
+                for leaf in reference.run_lane(&state, 0)? {
+                    let mut w = Block::from_state(&leaf)?.into_rt2();
+                    rset.extend(projected(&mut w));
+                }
+                let missing: Vec<&Proj> = rset.difference(&kset).collect();
+                let extra: Vec<&Proj> = kset.difference(&rset).collect();
+                sound_gaps += missing.len();
+                precision_gaps += extra.len();
+                let verdict = if missing.is_empty() && extra.is_empty() { "ok" } else { rows_bad += 1; "DIFFERS" };
+                println!("[ref-check] row s{seq} r{r} at {at}: kernels {} successors, reference {}: {verdict} ({} only in the reference, {} only in the kernels)", kset.len(), rset.len(), missing.len(), extra.len());
+                for p in missing.iter().take(show) {
+                    println!("    only in the REFERENCE (soundness gap): {}", brief(p));
+                }
+                for p in extra.iter().take(show) {
+                    println!("    only in the KERNELS (precision gap): {}", brief(p));
+                }
+            }
+            println!("[ref-check] {n} rows: {rows_bad} differ; {sound_gaps} successors only in the reference, {precision_gaps} only in the kernels");
         }
         Command::RerunRow { level_dir, row, level, erase } => {
             use celeste_rust::frame::{frame_files_seq, pack_id, Block};

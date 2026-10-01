@@ -355,13 +355,14 @@ pub trait Domain {
         0
     }
 
-    /// An atom handed out at or after `since` that ESCAPES the call that made
-    /// it (held in the heap, or returned) becomes a fork of both values, one per
-    /// atom. Inside the call it stays an atom; after it, a read by lane data (a
-    /// fall floor's `collideable`, joined under undecided `state` branches, read
-    /// by the player's collisions) decides per configuration instead of leaving
-    /// every such decision undecided and its arms apart. Fresh, so nothing read
-    /// it before; both values contain the atom's. `None` for anything else.
+    /// A boolean that reads an atom handed out at or after `since` and ESCAPES
+    /// the call that made it (held in the heap, or returned) becomes a fork:
+    /// of both values for a bare atom, else restricted per lane to the values
+    /// it can take (`Symbolic::escaped_atom`). Inside the call it stays as it
+    /// is; after it, a read by lane data (a fall floor's `collideable`, joined
+    /// under undecided `state` branches, read by the player's collisions)
+    /// decides per configuration, consistently across reads. `None` for a
+    /// value that reads no such atom.
     fn escaped_atom(&mut self, _b: &Self::Bool, _since: u32, _origin: &dyn Fn(&Self) -> String) -> Option<Self::Bool> {
         None
     }
@@ -371,6 +372,11 @@ pub trait Domain {
         format!("{n:?}")
     }
 }
+
+/// How many atoms an escaping value may read before its fork is left
+/// unrestricted (`Symbolic::escaped_atom`): the restriction substitutes every
+/// assignment of them.
+const ESCAPE_ATOMS: usize = 6;
 
 // ---------------------------------------------------------------- concrete
 
@@ -1071,6 +1077,31 @@ impl Symbolic {
         matches!(self.graph.get(b).op, Op::UnknownBool(u32::MAX))
     }
 
+    /// `root` with the nodes of `subst` replaced, every node above them
+    /// re-folded (`Graph::fold`); untouched nodes are shared.
+    pub fn substitute(&mut self, root: NodeId, subst: &rustc_hash::FxHashMap<NodeId, NodeId>) -> NodeId {
+        let mut done: rustc_hash::FxHashMap<NodeId, NodeId> = subst.clone();
+        let mut stack: Vec<(NodeId, bool)> = vec![(root, false)];
+        while let Some((n, expanded)) = stack.pop() {
+            if done.contains_key(&n) {
+                continue;
+            }
+            let (op, args) = {
+                let node = self.graph.get(n);
+                (node.op.clone(), node.args.clone())
+            };
+            if !expanded {
+                stack.push((n, true));
+                stack.extend(args.iter().filter(|a| !done.contains_key(a)).map(|a| (*a, false)));
+                continue;
+            }
+            let new_args: Vec<NodeId> = args.iter().map(|a| done[a]).collect();
+            let out = if new_args == args { n } else { self.graph.fold(op, new_args) };
+            done.insert(n, out);
+        }
+        done[&root]
+    }
+
     pub fn unknown_bool_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;
@@ -1570,18 +1601,49 @@ impl Domain for Symbolic {
     }
 
     fn escaped_atom(&mut self, b: &NodeId, since: u32, origin: &dyn Fn(&Self) -> String) -> Option<NodeId> {
-        match self.graph.get(*b).op {
-            Op::UnknownBool(k) if k >= since => {
-                if let Some(f) = self.escaped.get(b) {
-                    return Some(*f);
-                }
-                let name = origin(self);
-                let f = self.both_values(&name);
-                self.escaped.insert(*b, f);
-                Some(f)
-            }
-            _ => None,
+        if let Some(f) = self.escaped.get(b) {
+            return Some(*f);
         }
+        // The atoms of this call that `b` reads.
+        let atoms: Vec<NodeId> = crate::trace::verify::cone(&self.graph, &[*b])
+            .into_iter()
+            .filter(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(k) if k >= since && k != u32::MAX))
+            .collect();
+        if atoms.is_empty() {
+            return None;
+        }
+        let name = origin(self);
+        let g = self.both_values(&name);
+        // A bare atom is both values everywhere. Anything else - an atom
+        // joined with lane data (a floor's `collideable` under its unknown
+        // `state`, with the comeback's `not check(player,0,0)`) - is the fork
+        // RESTRICTED per lane to the values `b` can take: may-true and
+        // may-false by substituting every assignment of its atoms. A lane
+        // whose value is decided keeps it; every later read sees one value
+        // per configuration, which three-valued reads of the atom did not
+        // (room (7,0): "solid" for one test and "absent" for the next).
+        let out = if atoms.len() == 1 && atoms[0] == *b {
+            g
+        } else if atoms.len() > ESCAPE_ATOMS {
+            g
+        } else {
+            let (mut may_t, mut may_f) = (self.graph.leaf(Op::ConstBool(false)), self.graph.leaf(Op::ConstBool(false)));
+            for bits in 0u32..(1 << atoms.len()) {
+                let subst: rustc_hash::FxHashMap<NodeId, NodeId> =
+                    atoms.iter().enumerate().map(|(i, a)| (*a, self.graph.leaf(Op::ConstBool(bits >> i & 1 == 1)))).collect();
+                let v = self.substitute(*b, &subst);
+                let nv = self.graph.fold(Op::Not, vec![v]);
+                may_t = self.graph.fold(Op::Or, vec![may_t, v]);
+                may_f = self.graph.fold(Op::Or, vec![may_f, nv]);
+            }
+            let not_f = self.graph.fold(Op::Not, vec![may_f]);
+            let only_t = self.graph.fold(Op::And, vec![may_t, not_f]);
+            let both = self.graph.fold(Op::And, vec![may_t, may_f]);
+            let either = self.graph.fold(Op::And, vec![both, g]);
+            self.graph.fold(Op::Or, vec![only_t, either])
+        };
+        self.escaped.insert(*b, out);
+        Some(out)
     }
 
     fn literal_fragments(&mut self, v: &NodeId) -> Option<Vec<NodeId>> {

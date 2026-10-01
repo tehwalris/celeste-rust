@@ -308,7 +308,7 @@ pub struct Walk {
 /// player's `rem` (ival_paths) and every live fruit's `off`/`y`
 /// (widen.rs). The lattice must not bake these, or a mid-game block whose
 /// `off` is an interval will not bind a kernel that expects a number.
-pub fn boundary_widened_paths(st: &State<Symbolic>, d: &Symbolic, spd_ival: bool, pos_ival: (bool, bool), held: bool, fruit: bool, floors: bool, floor_timers: bool, platforms: bool) -> Result<std::collections::BTreeSet<Path>> {
+pub fn boundary_widened_paths(st: &State<Symbolic>, spd_ival: bool, pos_ival: (bool, bool), held: bool, fruit: bool, floors: bool, floor_timers: bool, platforms: bool) -> std::collections::BTreeSet<Path> {
     let mut out: std::collections::BTreeSet<Path> = ival_paths(st, spd_ival, pos_ival).into_iter().collect();
     // The moving platforms unknown: the boundary writes their widened fields.
     if platforms {
@@ -320,7 +320,7 @@ pub fn boundary_widened_paths(st: &State<Symbolic>, d: &Symbolic, spd_ival: bool
     }
     // The fall floors unknown: likewise.
     if floors {
-        out.extend(super::widen::fall_floor_paths(st, d)?.all().cloned());
+        out.extend(super::widen::fall_floor_paths(st).all().cloned());
     }
     // Only the floors' timers: likewise.
     if floor_timers {
@@ -336,8 +336,8 @@ pub fn boundary_widened_paths(st: &State<Symbolic>, d: &Symbolic, spd_ival: bool
             }
         }
     }
-    let Some(Value::Table(fruit)) = iface::get(st, &[iface::key("fruit")]) else { return Ok(out) };
-    let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else { return Ok(out) };
+    let Some(Value::Table(fruit)) = iface::get(st, &[iface::key("fruit")]) else { return out };
+    let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else { return out };
     let n = st.heap.tables[&objects].arr.len();
     for i in 0..n {
         let base = vec![iface::key("objects"), Step::Idx(i)];
@@ -348,7 +348,7 @@ pub fn boundary_widened_paths(st: &State<Symbolic>, d: &Symbolic, spd_ival: bool
             if iface::get(st, &p).is_some() { out.insert(p); }
         }
     }
-    Ok(out)
+    out
 }
 
 pub fn field_constants(
@@ -364,7 +364,7 @@ pub fn field_constants(
 ) -> Result<std::collections::BTreeMap<Path, super::iface::Conc>> {
     use super::domain::Domain;
     use super::iface::Conc;
-    let widened = boundary_widened_paths(st, d, spd_ival, pos_ival, held, fruit, floors, floor_timers, platforms)?;
+    let widened = boundary_widened_paths(st, spd_ival, pos_ival, held, fruit, floors, floor_timers, platforms);
     // The buttons are dead at the boundary: blocks hold them unknown (the
     // canonical form, `refbridge`) and every frame resets them before it
     // reads them. A concrete `false` in the post-`_init` start state is not a

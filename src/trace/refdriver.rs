@@ -51,10 +51,16 @@ pub fn fresh_interp<'a>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Inte
 /// the process-global level: a concrete run (`RefEngine::run_frame_concrete`)
 /// is exact whatever level the search has set (2026-09-21: level -1's platform
 /// snapshots, taken while the search held level 0).
+///
+/// `unknown` names the input's fields that hold an unknown boolean
+/// (`refbridge::to_trace_state_unknowns`): each is a cursor choice of both
+/// values per path, made before the frame runs - as the kernels fork a held
+/// trail, and read a fall floor's unknown `collideable`.
 pub fn run_frame_all<'a>(
     it: &mut Interp<'a, RefDomain>,
     body: &'a ast::Ast,
     input: &State<RefDomain>,
+    unknown: &[(crate::trace::heap::TableId, String)],
     level: crate::interpreter::abstraction::Level,
 ) -> Result<Vec<State<RefDomain>>> {
     it.d.cursor = Cursor::new();
@@ -63,25 +69,22 @@ pub fn run_frame_all<'a>(
     // A position bucket in the input (the rung below level 0) is one exact
     // position per fork leaf, exactly as the kernels' `IntFrag`.
     let pos = level.pos;
-    // The reference engine has no held-button fork (`widen::fork_held_inputs`):
-    // its bridge reads an unknown trail as false, which would silently drop
-    // the held twin. Refuse rather than compare against it.
-    if level.held.is_unknown() {
-        anyhow::bail!("the reference engine does not run held-unknown levels (plans/held-buttons.md)");
-    }
-    // Nor the fly fruit unknown: it has no unknown number.
+    // Nor the fly fruit and the moving platforms unknown: their ranges and
+    // worlds have no reference form yet.
     if level.fruit.is_unknown() {
         anyhow::bail!("the reference engine does not run fruit-unknown levels (plans/fly-fruit.md)");
     }
-    // Nor the fall floors unknown or only their timers widened (a range the
-    // reference engine does not store).
-    if level.floors != crate::interpreter::abstraction::FloorsPrecision::Exact {
-        anyhow::bail!("the reference engine does not run floors-unknown levels (plans/fall-floors.md)");
+    if level.platforms.is_unknown() {
+        anyhow::bail!("the reference engine does not run platforms-unknown levels (plans/platforms-unknown.md)");
     }
     loop {
         it.d.cursor.reset();
         it.prints.clear();
         let mut st = input.clone();
+        for (t, k) in unknown {
+            let b = it.d.cursor.choose(2) == 1;
+            st.heap.tables.get_mut(t).expect("an unknown field's table").hash.insert(k.clone(), crate::trace::heap::Value::Bool(b));
+        }
         crate::trace::widen::fork_pos_inputs(&mut st, &mut it.d, pos)?;
         let mut out = run_one(it, body, st)?;
         // The absent-as-zero fields, as the tracer's `trace_frame` writes them.
@@ -134,12 +137,12 @@ mod tests {
             if find_player(&st).is_some() {
                 break;
             }
-            let outs = run_frame_all(&mut it, &body, &st, crate::interpreter::abstraction::Level::EXACT).expect("warmup frame");
+            let outs = run_frame_all(&mut it, &body, &st, &[], crate::interpreter::abstraction::Level::EXACT).expect("warmup frame");
             st = outs.into_iter().next().expect("at least one successor");
         }
         assert!(find_player(&st).is_some(), "player never appeared in warm-up");
 
-        let outs = run_frame_all(&mut it, &body, &st, crate::interpreter::abstraction::Level::EXACT).expect("frame");
+        let outs = run_frame_all(&mut it, &body, &st, &[], crate::interpreter::abstraction::Level::EXACT).expect("frame");
         assert!(!outs.is_empty(), "a frame produced no successors");
         eprintln!("[refdriver] one frame -> {} successor states", outs.len());
     }

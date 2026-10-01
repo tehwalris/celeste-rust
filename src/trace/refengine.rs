@@ -19,7 +19,7 @@ use full_moon::ast;
 use crate::interpreter::state::State as OState;
 use crate::trace::interp::Interp;
 use crate::trace::refbridge::{
-    add_missing_builtins, fn_info_of, patch_closures_for, to_interp_state, to_trace_state, FnInfo,
+    add_missing_builtins, fn_info_of, patch_closures_for, to_interp_state, to_trace_state, to_trace_state_unknowns, FnInfo,
 };
 use crate::trace::refdomain::RefDomain;
 use crate::trace::refdriver::{fresh_interp, run_frame_all};
@@ -98,7 +98,7 @@ impl RefEngine {
         patch_closures_for(&mut bridged, &self.fn_info)?;
         add_missing_builtins(&mut bridged, &self.base);
         // Concrete: exact, whatever level the search has set.
-        let leaves = run_frame_all(&mut self.it, self.body_concrete, &bridged, crate::interpreter::abstraction::Level::EXACT)?;
+        let leaves = run_frame_all(&mut self.it, self.body_concrete, &bridged, &[], crate::interpreter::abstraction::Level::EXACT)?;
         if leaves.len() != 1 {
             bail!("concrete frame produced {} leaves (expected exactly 1)", leaves.len());
         }
@@ -120,20 +120,22 @@ impl RefEngine {
         let mut bridged = to_trace_state(input, 0, &mut d)?;
         patch_closures_for(&mut bridged, &self.fn_info)?;
         add_missing_builtins(&mut bridged, &self.base);
-        run_frame_all(&mut self.it, self.body_concrete, &bridged, crate::interpreter::abstraction::Level::EXACT)?
+        run_frame_all(&mut self.it, self.body_concrete, &bridged, &[], crate::interpreter::abstraction::Level::EXACT)?
             .iter()
             .map(to_interp_state)
             .collect()
     }
 
     /// One frame of ONE lane of `input`: every fork leaf as a state.
+    /// An unknown field of the input (a held trail, a fall floor's unknown
+    /// `collideable`) is forked per path; an unknown number is the whole range.
     pub fn run_lane(&mut self, input: &OState, lane: usize) -> Result<Vec<OState>> {
         let mut d = RefDomain::new();
-        let mut bridged = to_trace_state(input, lane, &mut d)?;
+        let (mut bridged, unknown) = to_trace_state_unknowns(input, lane, &mut d)?;
         patch_closures_for(&mut bridged, &self.fn_info)?;
         add_missing_builtins(&mut bridged, &self.base);
         // The engine as a `FrameStep`: the level the search runs.
-        run_frame_all(&mut self.it, self.body, &bridged, crate::interpreter::abstraction::current_level())?
+        run_frame_all(&mut self.it, self.body, &bridged, &unknown, crate::interpreter::abstraction::current_level())?
             .iter()
             .map(to_interp_state)
             .collect()

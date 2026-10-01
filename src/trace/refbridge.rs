@@ -92,6 +92,9 @@ struct ToTrace<'a> {
     heap: THeap<RefDomain>,
     /// old target cell (table/closure/builtin) -> trace value naming it.
     memo: HashMap<HeapId, TValue<RefDomain>>,
+    /// The table fields whose old value was `UnknownBool`: the driver forks
+    /// each per path (`refdriver::run_frame_all`).
+    unknown: Vec<(TableId, String)>,
 }
 
 impl<'a> ToTrace<'a> {
@@ -105,6 +108,11 @@ impl<'a> ToTrace<'a> {
         }
     }
 
+    /// Does the slot hold an `UnknownBool`?
+    fn is_unknown_bool(&self, box_id: HeapId) -> bool {
+        matches!(self.old.heap.get(box_id), HeapValue::Value(OValue::UnknownBool))
+    }
+
     fn conv_value(&mut self, v: &OValue) -> Result<TValue<RefDomain>> {
         Ok(match v {
             OValue::Number(mv) => TValue::Num(Iv::from_number(lane_of(mv, self.lane))),
@@ -113,8 +121,10 @@ impl<'a> ToTrace<'a> {
                 TValue::Num(Iv::new(iv.low, iv.high))
             }
             OValue::Bool(mv) => TValue::Bool(lane_of(mv, self.lane)),
-            // Overwritten by `__reset_button_states` before any read; a
-            // definite placeholder keeps RefDomain's `Bool = bool` total.
+            // A placeholder keeping RefDomain's `Bool = bool` total: the
+            // buttons are overwritten by `__reset_button_states` before any
+            // read, and every other unknown field is forked per path by the
+            // driver (`ToTrace::unknown`).
             OValue::UnknownBool => TValue::Bool(false),
             OValue::String(s) => TValue::Str(Arc::from(s.as_str())),
             OValue::Nil(_) => TValue::Nil,
@@ -137,6 +147,9 @@ impl<'a> ToTrace<'a> {
                 let mut names: Vec<(&String, &HeapId)> = fields.iter().collect();
                 names.sort();
                 for (name, fid) in names {
+                    if self.is_unknown_bool(*fid) {
+                        self.unknown.push((t, name.clone()));
+                    }
                     let cv = self.conv_slot(*fid)?;
                     self.heap.tables.get_mut(&t).unwrap().hash.insert(name.clone(), cv);
                 }
@@ -200,22 +213,41 @@ impl<'a> ToTrace<'a> {
 pub fn to_trace_state(
     old: &OState,
     lane: usize,
-    _d: &mut RefDomain,
+    d: &mut RefDomain,
 ) -> Result<TState<RefDomain>> {
+    Ok(to_trace_state_unknowns(old, lane, d)?.0)
+}
+
+/// `to_trace_state`, and the fields that held an unknown boolean (the
+/// buttons excepted, which every frame resets before reading): the
+/// reference engine forks each of them per path.
+pub fn to_trace_state_unknowns(
+    old: &OState,
+    lane: usize,
+    _d: &mut RefDomain,
+) -> Result<(TState<RefDomain>, Vec<(TableId, String)>)> {
     if lane >= old.vector_size {
         bail!("lane {} out of range (vector_size {})", lane, old.vector_size);
     }
-    let mut cx = ToTrace { old, lane, heap: THeap::default(), memo: HashMap::new() };
+    let mut cx = ToTrace { old, lane, heap: THeap::default(), memo: HashMap::new(), unknown: Vec::new() };
     let globals = cx.heap.new_table();
     let scope = cx.heap.new_scope(None);
     // Globals in sorted order (OrdMap is already sorted).
     let names: Vec<(String, HeapId)> =
         old.global_env.iter().map(|(k, v)| (k.clone(), *v)).collect();
     for (name, box_id) in names {
+        if cx.is_unknown_bool(box_id) {
+            cx.unknown.push((globals, name.clone()));
+        }
         let v = cx.conv_slot(box_id)?;
         cx.heap.tables.get_mut(&globals).unwrap().hash.insert(name, v);
     }
-    Ok(TState {
+    let buttons = match cx.heap.tables[&globals].hash.get(BUTTON_GLOBAL) {
+        Some(TValue::Table(t)) => Some(*t),
+        _ => None,
+    };
+    let unknown: Vec<(TableId, String)> = cx.unknown.into_iter().filter(|(t, _)| Some(*t) != buttons).collect();
+    let st = TState {
         heap: cx.heap,
         globals,
         scope,
@@ -225,7 +257,8 @@ pub fn to_trace_state(
         path: Vec::new(),
         key_override: Vec::new(),
         frag: Vec::new(),
-    })
+    };
+    Ok((st, unknown))
 }
 
 /// What a function's closures look like in a state that the interp itself

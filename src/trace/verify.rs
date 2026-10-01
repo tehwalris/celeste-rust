@@ -1452,7 +1452,7 @@ fn arms(
 }
 
 /// The nodes `roots` reach, ascending (operands precede their node).
-fn cone(g: &crate::transpile::graph::Graph, roots: &[NodeId]) -> Vec<NodeId> {
+pub(crate) fn cone(g: &crate::transpile::graph::Graph, roots: &[NodeId]) -> Vec<NodeId> {
     let mut seen: rustc_hash::FxHashSet<NodeId> = Default::default();
     let mut stack: Vec<NodeId> = roots.to_vec();
     while let Some(n) = stack.pop() {
@@ -2817,12 +2817,15 @@ end
                 if let Err(e) = set_buttons(&mut it.d, &mut o, &bits) {
                     return eprintln!("[verify] {} {:?}: {:#}", label, bits, e);
                 }
-                let o = match run_one(&mut it, &frame, o) {
+                let mut o = match run_one(&mut it, &frame, o) {
                     Ok(s) => s,
                     Err(e) => {
                         return eprintln!("[verify] oracle {} {:?} stopped at: {:#}", label, bits, e)
                     }
                 };
+                // The absent-as-zero fields, as every frame's outcomes write
+                // them (`trace_frame`, `refdriver::run_frame_all`).
+                crate::trace::widen::materialize_absent_fields(&mut o, &mut it.d).expect("materialize the absent fields");
                 let want = match iface::read_concrete(&it.d, &o, &[]) {
                     Ok(w) => w,
                     Err(e) => {

@@ -2961,7 +2961,7 @@ fn walk_trace(
             let widened = boundary_ival(&o.st, opts);
             let mut fruit: Vec<super::iface::Path> = if opts.fruit { super::widen::fly_fruit_paths(&o.st).all().cloned().collect() } else { Vec::new() };
             if opts.floors {
-                fruit.extend(super::widen::fall_floor_paths(&o.st, &tr.it.d)?.all().cloned());
+                fruit.extend(super::widen::fall_floor_paths(&o.st).all().cloned());
             }
             if opts.floor_timers {
                 fruit.extend(super::widen::floor_timer_paths(&o.st));

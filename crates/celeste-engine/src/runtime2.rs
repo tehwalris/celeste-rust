@@ -179,9 +179,11 @@ pub struct BoundaryIds {
     pub f_timer: u32,
     /// Its phase, stored canonical at every level (`widen::canon_balloon_offset`).
     pub f_offset: u32,
-    /// The spring, whose floor stays exact at a floors-unknown level
-    /// (`floor_holds_spring`).
+    /// The spring, whose phase a floors-unknown level widens
+    /// (`widen::fall_floor_paths`).
     pub g_spring: u32,
+    pub f_hide_in: u32,
+    pub f_hide_for: u32,
 }
 
 /// A full period of `sin` as an inclusive raw 16.16 interval's width: `[a, a +
@@ -201,22 +203,6 @@ pub const BALLOON_PERIOD_RAW: i32 = 0xffff;
 /// the mark filter misses.
 pub const FLOOR_TIMER_RANGE: (i32, i32) = (i32::MIN, i32::MAX);
 
-/// Does the fall floor at `floor` hold up one of the springs at `springs`
-/// (each an object's `(x, y)`)? The cart's `break_fall_floor` breaks the
-/// spring standing on it (`collide(spring, 0, -1)`, both 8x8 boxes at offset
-/// 0, neither ever moves), so an unknown `state` for that floor would make
-/// the spring's `hide_in` - and through it `spr`, the bounce - unknown too.
-/// Such a floor stays EXACT at a floors-unknown level (room (7,0): the
-/// floor at (96, 104) under the spring at (96, 96)). ONE definition, shared
-/// with the tracer (`widen::fall_floor_paths`), or the mark filter misses.
-pub fn floor_holds_spring(floor: (P8, P8), springs: &[(P8, P8)]) -> bool {
-    let (fx, fy) = (floor.0.as_raw_u32() as i32 as i64, floor.1.as_raw_u32() as i32 as i64);
-    let px = 1i64 << 16;
-    springs.iter().any(|&(sx, sy)| {
-        let (sx, sy) = (sx.as_raw_u32() as i32 as i64, sy.as_raw_u32() as i32 as i64);
-        sx + 8 * px > fx && sy + 8 * px > fy - px && sx < fx + 8 * px && sy < fy + 7 * px
-    })
-}
 
 /// A moving platform's whole path, whole pixels: it moves 0.65 px a frame and
 /// wraps from past 128 to -16 (and from past -16 to 128), so its `x` - and
@@ -1159,25 +1145,12 @@ impl Rt2 {
 
         // 8. The fall floors at a floors-unknown level (plans/fall-floors.md),
         // as that level's kernels write them (`widen::widen_fall_floors`):
-        // `state` and `delay` the unknown number, `collideable` unknown -
-        // except a floor holding up a spring (`floor_holds_spring`). A
+        // `state` and `delay` the unknown number, `collideable` unknown. A
         // floor with no `delay` (a block built from the post-`_init` state,
         // which the level keys exact, `frame::Block::from_state`) has nothing
         // there to widen.
         if floors {
-            // An object's `(x, y)`, the same in every lane: floors and springs never move.
-            let at = |rt: &Self, obj: u32, what: &str| -> (P8, P8) {
-                let get = |f: u32| match rt.obj_field_cell(obj, f).map(|c| &rt.cols[c as usize]) {
-                    Some(Col::U(AV::Num(n))) => *n,
-                    other => panic!("fall floor widening: a {what}'s position is {other:?}, not one number"),
-                };
-                (get(ids.f_x), get(ids.f_y))
-            };
-            let springs: Vec<(P8, P8)> = self.objects_of_type(ids, ids.g_spring).into_iter().map(|o| at(self, o, "spring")).collect();
             for obj in self.objects_of_type(ids, ids.g_fall_floor) {
-                if floor_holds_spring(at(self, obj, "fall floor"), &springs) {
-                    continue;
-                }
                 for (name, f) in [("state", ids.f_state), ("delay", ids.f_delay)] {
                     let Some(c) = self.obj_field_cell(obj, f) else {
                         assert!(f == ids.f_delay, "fall floor widening: the fall floor has no `{name}` field");
@@ -1195,6 +1168,19 @@ impl Rt2 {
                 let c = self.obj_field_cell(obj, ids.f_timer).unwrap_or_else(|| panic!("balloon widening: the balloon has no `timer` field"));
                 check(self, c, "timer", &|v| matches!(v, AV::Num(_) | AV::Ival(..) | AV::UNum));
                 self.cols[c as usize] = Col::U(AV::UNum);
+            }
+            // The spring's whole phase (`widen::fall_floor_paths`). A spring
+            // that never bounced has no `delay` (the post-`_init` block, keyed
+            // exact): nothing there to widen.
+            for obj in self.objects_of_type(ids, ids.g_spring) {
+                for (name, f) in [("spr", ids.f_spr), ("delay", ids.f_delay), ("hide_in", ids.f_hide_in), ("hide_for", ids.f_hide_for)] {
+                    let Some(c) = self.obj_field_cell(obj, f) else {
+                        assert!(f == ids.f_delay, "spring widening: the spring has no `{name}` field");
+                        continue;
+                    };
+                    check(self, c, name, &|v| matches!(v, AV::Num(_) | AV::Ival(..) | AV::UNum));
+                    self.cols[c as usize] = Col::U(AV::UNum);
+                }
             }
         }
 

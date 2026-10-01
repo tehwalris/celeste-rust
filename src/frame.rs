@@ -1439,17 +1439,23 @@ pub fn spd_width_log2(spd: crate::interpreter::abstraction::SpdPrecision) -> Opt
     }
 }
 
+/// `rt2` projected IN PLACE onto `level` (`Rt2::widen_to`): the row the
+/// level's kernels would store for it. The exact level projects nothing.
+pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::interpreter::abstraction::Level) {
+    use crate::interpreter::abstraction::RemPrecision;
+    if let RemPrecision::Bits(b) = level.rem {
+        rt2.widen_to(crate::compiled::ids(), b, spd_width_log2(level.spd), (level.pos.x, level.pos.y), level.held.is_unknown(), level.fruit.is_unknown(), level.floors.is_unknown(), level.floors.is_timers(), level.platforms.is_unknown());
+    }
+}
+
 /// `(shape, keys, cells)` of the widened rows - the shape is the widened
 /// block's, which is what the coarser level's marks are sharded by.
 pub fn widened_keys_rt2(
     rt2: &Rt2,
     coarser: crate::interpreter::abstraction::Level,
 ) -> Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
-    use crate::interpreter::abstraction::RemPrecision;
     let mut w = rt2.clone_block();
-    if let RemPrecision::Bits(b) = coarser.rem {
-        w.widen_to(crate::compiled::ids(), b, spd_width_log2(coarser.spd), (coarser.pos.x, coarser.pos.y), coarser.held.is_unknown(), coarser.fruit.is_unknown(), coarser.floors.is_unknown(), coarser.floors.is_timers(), coarser.platforms.is_unknown());
-    }
+    widen_rt2_to(&mut w, coarser);
     let keys = w.row_keys_canonical();
     let cells = crate::search::pos_graph::block_cells(&w)?;
     anyhow::ensure!(

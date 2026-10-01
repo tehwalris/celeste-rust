@@ -60,7 +60,7 @@ use crate::transpile::graph::Op;
 // TODO(Philippe, 2026-09-17): writing the missing field as 0 is a hack, good
 // enough for now; revisit (a proper nil-or-number, or a derived rule instead
 // of this list).
-pub const ABSENT_AS_ZERO: &[(&str, &str)] = &[("fall_floor", "delay")];
+pub const ABSENT_AS_ZERO: &[(&str, &str)] = &[("fall_floor", "delay"), ("spring", "delay")];
 
 /// Write every `ABSENT_AS_ZERO` field an object lacks as the number 0.
 pub fn materialize_absent_fields<D: Domain>(st: &mut State<D>, d: &mut D) -> Result<()> {
@@ -217,7 +217,7 @@ fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut S
     Ok(())
 }
 
-use celeste_engine::runtime2::{floor_holds_spring, BALLOON_PERIOD_RAW, FLOOR_TIMER_RANGE, PLATFORM_PATH, PLATFORM_REM};
+use celeste_engine::runtime2::{BALLOON_PERIOD_RAW, FLOOR_TIMER_RANGE, PLATFORM_PATH, PLATFORM_REM};
 
 /// Held buttons unknown (plans/held-buttons.md): the player's trails leave the
 /// frame unknown - the canonical output unknown (`Symbolic::unknown_bool_output`),
@@ -253,26 +253,9 @@ impl FallFloorPaths {
     }
 }
 
-pub fn fall_floor_paths<D: Domain>(st: &State<D>, d: &D) -> Result<FallFloorPaths> {
+pub fn fall_floor_paths<D: Domain>(st: &State<D>) -> FallFloorPaths {
     let mut out = FallFloorPaths { unknown: Vec::new(), collideable: Vec::new() };
-    // An object's `(x, y)`: constants, floors and springs never move.
-    let at = |obj: &Path| -> Result<(P8, P8)> {
-        let get = |f: &str| -> Result<P8> {
-            let p = field(obj, &[f]);
-            match iface::get(st, &p) {
-                Some(Value::Num(v)) => d.as_const(&v).ok_or_else(|| anyhow::anyhow!("{}: not a constant", iface::show(&p))),
-                _ => bail!("{}: not a number", iface::show(&p)),
-            }
-        };
-        Ok((get("x")?, get("y")?))
-    };
-    let springs: Vec<(P8, P8)> = objects_of_type(st, "spring").iter().map(at).collect::<Result<_>>()?;
     for obj in objects_of_type(st, "fall_floor") {
-        // A floor holding up a spring stays exact: its unknown `state` would
-        // leak into the spring through `break_spring`.
-        if floor_holds_spring(at(&obj)?, &springs) {
-            continue;
-        }
         out.unknown.push(field(&obj, &["state"]));
         out.unknown.push(field(&obj, &["delay"]));
         out.collideable.push(field(&obj, &["collideable"]));
@@ -287,7 +270,17 @@ pub fn fall_floor_paths<D: Domain>(st: &State<D>, d: &D) -> Result<FallFloorPath
     for obj in objects_of_type(st, "balloon") {
         out.unknown.push(field(&obj, &["timer"]));
     }
-    Ok(out)
+    // The spring (2026-10-01, room (7,0)): its whole phase - `spr` (ready,
+    // compressed, hidden), the compressed countdown `delay`, and the
+    // hide countdowns `hide_in`/`hide_for` - the unknown number. Its update is
+    // then "maybe bounce the player" and nothing else, and the floor under it
+    // (whose break starts `hide_in`) is widened like any other.
+    for obj in objects_of_type(st, "spring") {
+        for f in ["spr", "delay", "hide_in", "hide_for"] {
+            out.unknown.push(field(&obj, &[f]));
+        }
+    }
+    out
 }
 
 /// The countdowns a timers level widens (`abstraction::FloorsPrecision::Timers`):
@@ -330,19 +323,19 @@ fn widen_floor_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> 
 }
 
 /// The fall floors' INPUT side at a floors-unknown level (plans/fall-floors.md):
-/// `state` and `delay` the unknown number, `collideable` an undecided atom -
-/// every lane alike, no input cell read. A floor that never broke has no
-/// `delay` in the post-`_init` start state; it is materialized first
-/// (`ABSENT_AS_ZERO`, as every frame's output does), then replaced. A decided
-/// input lies inside and only over-approximates, so there is no premise.
+/// `state` and `delay` (and the spring's phase, the balloon's timer) the
+/// unknown number, `collideable` a FORK of both values - every lane alike, no
+/// input cell read. A floor that never broke has no `delay` in the
+/// post-`_init` start state; it is materialized first (`ABSENT_AS_ZERO`, as
+/// every frame's output does), then replaced. A decided input lies inside and
+/// only over-approximates, so there is no premise.
 ///
-/// `collideable` is read by other objects' collisions (the player's
-/// `is_solid`), whose decisions are the player's data, and an atom there leaves
-/// them undecided and their arms apart. But the floor's own update joins its
-/// `collideable` writes into a fresh atom, and that one becomes a fork of both
-/// values at the update's return (`Domain::escaped_atom`): what the player,
-/// updating after the floors, reads. A fork here would be dead: one fork id per
-/// floor, for nothing.
+/// `collideable` is a fork, not an atom, because it is read by other objects'
+/// collisions (the player's `is_solid`) and every read in a stage must agree:
+/// three-valued reads of one atom do not. Where the floor's own update runs
+/// first, it joins its `collideable` writes under the unknown `state`, and the
+/// joined value becomes a fork restricted to what each lane can take when the
+/// update returns (`Domain::escaped_atom`).
 pub fn fork_floor_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     materialize_absent_fields(st, d)?;
     replace_fall_floors(st, d, false)
@@ -362,7 +355,7 @@ fn widen_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
 /// `output`: the canonical output unknown for `collideable` (never read in
 /// the frame), else a fresh atom (read by collisions: independent per floor).
 fn replace_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic, output: bool) -> Result<()> {
-    let fp = fall_floor_paths(st, d)?;
+    let fp = fall_floor_paths(st);
     for p in &fp.unknown {
         let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
         let u = d.unknown_num();
@@ -370,7 +363,12 @@ fn replace_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic, output: bool)
     }
     for p in &fp.collideable {
         let Some(Value::Bool(_)) = iface::get(st, p) else { bail!("{}: not a boolean", iface::show(p)) };
-        let b = if output { d.unknown_bool_output() } else { d.unknown_bool_atom() };
+        // The input: a FORK of both values, so every read of it in the stage
+        // agrees with every other. Under the split frame the player's half
+        // reads it directly - the floors update in the other half - and an
+        // atom read twice gave "solid" for one test and "absent" for the next
+        // (room (7,0), 2026-10-01, `rewrite ref-check`).
+        let b = if output { d.unknown_bool_output() } else { d.both_values(&format!("{} input", iface::show(p))) };
         iface::set(st, p, Value::Bool(b))?;
     }
     Ok(())
