@@ -540,6 +540,42 @@ result of all this is in BENCHMARK_DATA.md: the bucket is sound and a
 loss on room (2,0) (the hulls at every speed condition over-approximate
 past the census's 19x), so `exact` remains the default.
 
+### Rooms with objects: everything abstract at level 0, two rem rungs (2026-10-01)
+
+What made rooms (7,0) and (0,1) tractable (plans/room70-2026-09-30.md,
+plans/room01-2026-10-01.md); the ladder to start an object room with:
+
+```
+CELESTE_LADDER="r0sxhn,r1sxhn,r1sxh,r2sxh,...,r15sxh,rxsx"
+```
+
+- **Every object abstract at level 0** (`n`, `FloorsPrecision::Near`):
+  every fall floor's `state` the range [0, 2] with `collideable` DERIVED as
+  `state ~= 2` (the cart keeps them in step), exact only where the player
+  overlaps the floor at the frame's end; the countdowns (floor `delay`,
+  balloon `timer`) the whole range; the objects' phases (`widen::phase_paths`:
+  spring `spr`/`delay`/`hide_in`/`hide_for`, balloon `spr`) their ranges. A
+  widened object's update is then "maybe X" (maybe bounce, maybe refill the
+  dash) and nothing else. Room (0,1) level 0 at f100: 14.8M states, 14 GB,
+  against 40.0M / 30 GB with the balloon's `spr` exact.
+- **Keep them abstract one rem rung longer** (`r1sxhn` before `r1sxh`): the
+  switch to exact objects then happens on narrow marks. Room (0,1): the
+  first exact-objects level peaked at 88k states a frame, against 26.5M when
+  it came straight after level 0 (`r0sxh`, from 57M marks).
+- **When a level grows, look at the states before reasoning about counts**:
+  `rewrite cell-growth --by-age` (states per cell by age, comparable across
+  rooms), `col-census --cell x,y` (what varies at one position),
+  `cell-saturation`, `spurious --real T --coarse C` (a coarse level's states a
+  finer tree never reaches, traced back to the first spurious step), and
+  `rerun-row` (one stored row through a level's kernels). That chain found
+  the floor-collision join bug (`7f6b96e`): 99.8% of room (7,0)'s
+  fully-unknown states at one cell were impossible. `ref-check` (kernels
+  against the reference engine, row by row) catches that class of bug; the
+  reference's design is still open (it runs out of memory at `n`).
+- **Balloon rooms**: `rnd` stays an interval at every level, so a confirmed
+  frame bounds every seed from below; the witness needs a seed
+  (`pico8_diff/replay.py --balloon-seeds`, the tasdatabase header).
+
 ## Useful entry points
 
 ```bash
