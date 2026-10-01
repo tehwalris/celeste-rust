@@ -238,6 +238,16 @@ machinery is unchanged: a frame is two steps.
 - Level 0: frame 40 (step 80) 6,154,595 states vs 6,154,596 unsplit - the
   widening at the cut costs nothing measurable - in 6.5 s (steps 79+80)
   against 177 s.
+- 2026-10-01, after the two fidelity fixes (a global cleared to nil left a
+  slot: a second shape after every freeze; the cut widened the near floors
+  the player's update reads - plans/room21-2026-10-01.md): room (6,1)
+  `r0sxhn` (five fall floors under the spawn), 8 threads, f0-f45 against
+  steps 0-90. States IDENTICAL at every frame (ckhash sets equal; 1,255,157
+  at f45). Kernels 287,705 bodies / 11.6M fused nodes (largest 21,276 /
+  825k) -> 23,166 / 3.4M (largest 865 / 185k); build walk 87 s + trace
+  328 s + assemble 37 s -> 34 + 48 + 7 s; frames 2-45 955 s -> 152 s (f40
+  47 s -> 27 s, f45 164 s -> 11 s; the unsplit run shared the machine with
+  builds for part of f36-f45); peak RSS 24.2 -> 6.9 GB; wall 22:07 -> 3:31.
 
 ## RESULT (2026-09-30): room (6,0) exit at FRAME 70 - TIES the community TAS7
 
