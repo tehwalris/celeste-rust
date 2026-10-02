@@ -449,7 +449,11 @@ added one global to every state, so row keys, and with them the ckhash and
 marks FINGERPRINTS, moved. The sets did not: posgraph f044 is identical,
 every per-frame kept count f0-f44 is identical, every marked count, first
 win and the `OPTIMAL` line are identical. Re-pin only on evidence like that,
-and say so in the commit.
+and say so in the commit. Re-pinned again 2026-10-02 on the same evidence
+(and the marks equal under `CELESTE_BACKWARD=kernel`): `18208c6` appended
+the split frame's `__phase` / `__frozen` to the global names, two more
+globals in every state, so the fingerprints had drifted since 2026-09-29
+(found by bisecting f000's fingerprint).
 
 `crates/celeste-names/src/gen.rs` is FROZEN, not generated. Its generator
 (`transpile::names`) walked the rewritten IR and was deleted with the walk
