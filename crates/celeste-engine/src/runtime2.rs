@@ -139,6 +139,9 @@ pub struct BoundaryIds {
     /// The `room` table (`x`/`y` fields via `f_x`/`f_y`): the position
     /// column is start-room-relative, and the win test is `room.x`.
     pub g_room: u32,
+    /// `max_djump`: 2 once the orb (room (5,2)'s big chest) is taken - the
+    /// orb room's win needs it (`frame::wins_of`).
+    pub g_max_djump: u32,
     pub g_timers: Vec<u32>, // frames, seconds, minutes, deaths
     pub f_type: u32,
     pub f_rem: u32,

@@ -268,7 +268,26 @@ pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
         })
     };
     let (xs, ys) = (is(ids.f_x, "x", wx)?, is(ids.f_y, "y", wy)?);
-    Ok(xs.iter().zip(&ys).map(|(a, b)| *a && *b).collect())
+    let orb = orb_required();
+    let has_orb: Vec<bool> = if orb {
+        let c = rt2.globals[ids.g_max_djump as usize];
+        anyhow::ensure!(c != celeste_engine::runtime2::NONE, "wins: no `max_djump` global");
+        let two = crate::pico8_num::Pico8Num::from_i16(2);
+        (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(two)).collect()
+    } else {
+        vec![true; lanes]
+    };
+    Ok(xs.iter().zip(&ys).zip(&has_orb).map(|((a, b), o)| *a && *b && *o).collect())
+}
+
+/// The orb room (room (5,2), `game_runner::ORB_LEVEL`): its big chest holds
+/// the orb that gives every later level the second dash, so leaving the room
+/// WITHOUT it is not the level's exit as the game is played (and as TAS22
+/// plays it): a win there also needs `max_djump == 2` (2026-10-02; the bare
+/// room exit is reachable at frame 68 by skipping the chest).
+pub fn orb_required() -> bool {
+    let (x, y) = crate::game_runner::start_room();
+    crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL
 }
 
 /// Worker (and owner) count: `CELESTE_THREADS`, else half the logical
@@ -599,6 +618,13 @@ impl Slot {
         let x = sk.obj_field_cell(room, ids.f_x).ok_or_else(|| anyhow::anyhow!("any_win: room has no x"))?;
         let y = sk.obj_field_cell(room, ids.f_y).ok_or_else(|| anyhow::anyhow!("any_win: room has no y"))?;
         let (xs, ys) = (num_at(x)?, num_at(y)?);
+        if orb_required() {
+            let c = sk.globals[ids.g_max_djump as usize];
+            anyhow::ensure!(c != celeste_engine::runtime2::NONE, "any_win: no `max_djump` global");
+            let md = num_at(c)?;
+            let two = P8::from_i16(2);
+            return Ok(rows.iter().any(|&r| xs.at(r) == wx && ys.at(r) == wy && md.at(r) == two));
+        }
         Ok(rows.iter().any(|&r| xs.at(r) == wx && ys.at(r) == wy))
     }
 
