@@ -1,0 +1,15 @@
+# Room (5,2) reference for celeste-minimal, derived 2026-10-02.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 5,2, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Derived from ~/src/github.com/CelesteClassic/tasdatabase/classic/any/TAS22.tas
+# (125 inputs), replayed on a real PICO-8 in the ORIGINAL cart: the earliest
+# exit is during frame 150, at prologue offset 25 (= 25 + 125; the player
+# first exists on frame 26). Its per-frame player positions (`-` during the
+# spawn, frame 150 open) went through `rewrite trajectory --room 5,2`, which
+# found the inputs below for OUR game; replayed on a real PICO-8 in
+# celeste-minimal, the player is at (86,-2) on frame 149 and the room changes
+# to (6,2) during frame 150. So the search's ceiling is 150.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,38,0,0,0,0,0,0,0,0,0,0,2,2,34,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,18,2,2,36,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,36,0,0,0,0,0,0,38,0,0,0,0,0,0,16,0,0,0,0,16,0,0,0,0
