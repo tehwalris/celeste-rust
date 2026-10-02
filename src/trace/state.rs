@@ -243,6 +243,25 @@ pub fn merge_canon<D: Domain>(d: &mut D, t: &State<D>, f: &State<D>, sides: Side
     merge_inner(d, t, f, sides, None)
 }
 
+/// Do both states hold the same `room`? It is a PROGRAM CONSTANT
+/// (`shapes::frozen_tables`): `load_room` only ever writes it constants, and
+/// everything downstream reads a state's room as one - the walk
+/// (`shapes::room_of`, -1 for anything else), level -1 (which refuses
+/// otherwise). Merged on a lane-dependent condition, `room.x` became a select
+/// and the walk skipped the merged outcome as "another room", losing its
+/// in-room arm with it: room (6,2), the respawned `player_spawn` and
+/// `next_room`'s fresh one in (7,2) have one shape, so the spawn's `spd.y` was
+/// never seen to leave -4 and a row at -3.5 declined (2026-10-02).
+fn same_room<D: Domain>(t: &State<D>, f: &State<D>) -> bool {
+    fn room<D: Domain>(s: &State<D>) -> Option<&std::collections::BTreeMap<String, Value<D>>> {
+        match s.heap.tables.get(&s.globals)?.hash.get("room")? {
+            Value::Table(r) => s.heap.tables.get(r).map(|tab| &tab.hash),
+            _ => None,
+        }
+    }
+    room(t) == room(f)
+}
+
 /// How a merge pairs its two sides' objects: by their `Canon`s, or - where
 /// both hold the same heap by id (`same_heap`) - each object with itself.
 #[derive(Clone, Copy)]
@@ -301,6 +320,10 @@ fn merge_inner<D: Domain>(
         return Ok(None);
     }
     if matches!(sides, Sides::Canon(ct, cf) if ct.shape != cf.shape) {
+        return Ok(None);
+    }
+    // Two rooms are two successors, whatever their shapes.
+    if !same_room(t, f) {
         return Ok(None);
     }
 

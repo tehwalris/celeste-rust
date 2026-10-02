@@ -2296,6 +2296,50 @@ mod tests {
         assert_eq!(e, it.d.graph.fold(Op::Not, vec![known]), "and its error is the condition undecided");
     }
 
+    /// `room` is a program constant (`shapes::frozen_tables`): two states of
+    /// one shape in DIFFERENT rooms stay two successors. Merged, `room.x`
+    /// became a select, the walk read the merged outcome's room as "another
+    /// room" (`shapes::room_of` is -1 for a non-constant) and skipped it - and
+    /// with it the in-room arm. Room (6,2) `r0sxhf`: the respawn's
+    /// `player_spawn` staying a spawn merged with `next_room`'s fresh
+    /// `player_spawn` of room (7,2), the spawn's `spd.y` stayed pinned at -4,
+    /// and the row at -3.5 declined (KERNEL COVERAGE GAP at f72, 2026-10-02).
+    #[test]
+    fn states_in_different_rooms_stay_apart() {
+        let ast = parse(
+            r#"
+            room = {x = 6, y = 2}
+            o = {y = 0}
+            if input > 0 then
+              room.x = 7
+              o.y = 1
+            else
+              o.y = 2
+            end
+            "#,
+        );
+        let mut d = Symbolic::default();
+        let sym = d.graph.leaf(Op::Cell(1));
+        let mut it = Interp::new(d);
+        let mut st = fresh::<Symbolic>(&mut it.d);
+        let g = st.globals;
+        st.heap.tables.get_mut(&g).unwrap().hash.insert("input".into(), Value::Num(sym));
+
+        let out = it.exec_block(ast.nodes(), st).expect("exec");
+        assert_eq!(out.len(), 2, "one successor per room");
+        let mut rooms: Vec<i16> = out
+            .iter()
+            .map(|(s, _)| {
+                let Some(Value::Num(x)) = crate::trace::iface::get(s, &[crate::trace::iface::key("room"), crate::trace::iface::key("x")]) else {
+                    panic!("room.x is not a number")
+                };
+                it.d.as_const(&x).expect("room.x is a constant in every outcome").as_i16_or_err().expect("a whole room")
+            })
+            .collect();
+        rooms.sort();
+        assert_eq!(rooms, vec![6, 7]);
+    }
+
     /// The fly fruit's `move` at a fruit-unknown level on a FINE rem rung:
     /// `__split_by_flr` of a literal (every lane holds it alike) splits on the
     /// integers and rejoins into one literal with no error, whatever the

@@ -3000,7 +3000,12 @@ fn walk_trace(
     let mut outs = Vec::new();
     let mut skipped = Vec::new();
     for o in &f.outs {
-        if shapes::room_of(&o.st, &tr.it.d) != room0 {
+        // A room that is not a constant (-1) is NOT another room: it may hold
+        // this one's states too, and skipping it lost them (`state::same_room`,
+        // which keeps two rooms apart, so this cannot happen).
+        let room = shapes::room_of(&o.st, &tr.it.d);
+        anyhow::ensure!(room.0 >= 0 && room.1 >= 0, "an outcome whose room is not a constant: {room:?}");
+        if room != room0 {
             skipped.push("another room");
             continue;
         }
