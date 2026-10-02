@@ -1,0 +1,15 @@
+# Room (4,3) "2900 m": exit at frame 85 for celeste-minimal, found by the
+# search (2026-10-02). Starts with the second dash (past the orb, 26a0e54).
+# Exits on a real PICO-8 with balloon seeds 0 and 0.5.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 4,3, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search: no split frame, ladder r0sxhn .. r4sxhn, r4sxh .. r15sxh, rxsx
+# (three balloons, a spring, a fruit), level -1 filter (85,5), --ceiling 85.
+# h85: first wins 79, 81, 82, 84, then 85 from rem Bits(4) to Exact; h84
+# refuted at level 4. `OPTIMAL win frame: 85`. Witness 363 concrete steps, 0
+# dead ends; f84 player (108,-2), f85 room (5,3). TIES the community TAS29 (85,
+# tas/room_4_3_reference_frame_85.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,42,0,0,0,0,0,0,16,0,0,0,0,0,16,0,0,38,0,0,0,0,0,0,0,0,0,38,0,0,0,0,0,0,0,0,0,0,38,0,0,0,0,0,0,0,36,0,0,0,0,0,0,16,0,0
