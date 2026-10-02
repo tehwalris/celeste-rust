@@ -1,0 +1,17 @@
+# Room (1,2) "1800 m": exit at frame 103 for celeste-minimal, found by the
+# search (2026-10-02). Exits on a real PICO-8 with TAS18's balloon seed, seed 0
+# and PICO-8's rnd; seed 0.5 does not:
+#   pico8_diff/replay.py --room 1,2 --balloon-seeds 0.93967494187012 tas/room_1_2_exit_frame_103.txt
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 1,2, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search: no split frame, ladder r0sxhnp, r0sxhn, r1sxhn .. r4sxhn, r4sxh ..
+# r15sxh, rxsx (five balloons, a moving platform), --ceiling 103, no level -1
+# filter (its table refused a balloon's interval y in the start state). h103
+# confirmed through Exact (first win 103 from rem Bits(6)); h102 refuted at
+# level 8 (Bits(6)). `OPTIMAL win frame: 103`. Witness 382 concrete steps, 0
+# dead ends; f102 player (21,-4), f103 room (2,2). TIES the community TAS18
+# (103, tas/room_1_2_reference_frame_103.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,42,0,0,0,0,0,0,16,0,0,0,0,0,0,2,2,2,2,2,2,2,2,2,2,0,0,0,38,0,0,0,0,0,0,0,0,0,0,37,0,0,0,0,0,0,16,0,0,0,0,0,0,1,37,0,0,0,0,0,0,0,0,0,0,0,0,0,36,0,0,0,0,0,0,0,0
