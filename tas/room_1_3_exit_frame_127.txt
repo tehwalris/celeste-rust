@@ -1,0 +1,15 @@
+# Room (1,3) "2600 m": exit at frame 127 for celeste-minimal, found by the
+# search (2026-10-02). Starts with the second dash (past the orb, 26a0e54).
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 1,3, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search (with 592c72f: a number and its point interval key alike - before
+# it, h127 was refuted at level 1, the mark filter dropping every exit row):
+# ladder r0sxh .. r15sxh, rxsx (a key and a chest), --ceiling 127. h127: first
+# wins 114, 119, 122, 124, 125, 126 x3, then 127 from rem Bits(8) to Exact;
+# h126 refuted at level 8. `OPTIMAL win frame: 127`. Witness 500 concrete
+# steps, 0 dead ends; f126 player (113,-3), f127 room (2,3). TIES the community
+# TAS26 (127, tas/room_1_3_reference_frame_127.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,16,0,34,0,0,0,0,0,0,0,0,0,0,36,0,0,0,0,0,0,0,1,1,33,0,0,0,0,0,0,0,16,0,0,0,0,0,0,36,0,0,0,0,0,0,0,1,1,1,1,38,0,0,0,0,0,0,0,0,0,16,0,42,0,0,0,0,0,0,0,38,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,2,18,2,0,0,0,0
