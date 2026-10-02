@@ -143,6 +143,12 @@ impl Block {
         wins_of(&self.rt2)
     }
 
+    /// Per lane: has it left the start room (`exits_of`)? A superset of the
+    /// wins: in the orb room an exit without the orb is not a win.
+    pub fn exits(&self) -> Result<Vec<bool>> {
+        exits_of(&self.rt2)
+    }
+
     /// Keep only the lanes whose mask entry is true, as a new block; `None` if
     /// none survive. The one splitting primitive the loop needs (dedup at the
     /// door repacks with this).
@@ -225,10 +231,10 @@ impl Block {
     }
 }
 
-/// Per lane: does it sit on the room's win target? The room-exit test
-/// (`room.x` past the start room) or, under `CELESTE_WIN_AT_XY`, the
-/// synthetic player-position target. Pure position; no peeking inside.
-pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
+/// Per lane: has it left the start room? The room-exit test (`room.x` past
+/// the start room) or, under `CELESTE_WIN_AT_XY`, the synthetic
+/// player-position target. Pure position; no peeking inside.
+pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Col, AV};
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
@@ -268,16 +274,25 @@ pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
         })
     };
     let (xs, ys) = (is(ids.f_x, "x", wx)?, is(ids.f_y, "y", wy)?);
-    let orb = orb_required();
-    let has_orb: Vec<bool> = if orb {
+    Ok(xs.iter().zip(&ys).map(|(a, b)| *a && *b).collect())
+}
+
+/// Per lane: does it sit on the room's win target? The room exit
+/// (`exits_of`), and in the orb room the orb taken too (`orb_required`).
+pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
+    use celeste_engine::runtime2::AV;
+    let exits = exits_of(rt2)?;
+    if crate::interpreter::abstraction::synthetic_win_xy().is_some() || !orb_required() {
+        return Ok(exits);
+    }
+    let (ids, lanes) = (crate::compiled::ids(), rt2.width);
+    let has_orb: Vec<bool> = {
         let c = rt2.globals[ids.g_max_djump as usize];
         anyhow::ensure!(c != celeste_engine::runtime2::NONE, "wins: no `max_djump` global");
         let two = crate::pico8_num::Pico8Num::from_i16(2);
         (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(two)).collect()
-    } else {
-        vec![true; lanes]
     };
-    Ok(xs.iter().zip(&ys).zip(&has_orb).map(|((a, b), o)| *a && *b && *o).collect())
+    Ok(exits.iter().zip(&has_orb).map(|(e, o)| *e && *o).collect())
 }
 
 /// The orb room (room (5,2), `game_runner::ORB_LEVEL`): its big chest holds
@@ -2296,13 +2311,15 @@ impl ForwardState {
             // is about reaching the exit, not what lies past it (and the
             // start room's kernel set does not cover the next room's
             // shapes).
-            self.frontier = if won {
+            // In the orb room a row can leave without the orb: not a win,
+            // but past the room all the same - never expanded either.
+            self.frontier = if won || orb_required() {
                 std::thread::scope(|scope| {
                     let handles: Vec<_> = next
                         .into_iter()
                         .map(|mut b| {
                             scope.spawn(move || -> Result<Block> {
-                                let wins = b.wins()?;
+                                let wins = b.exits()?;
                                 b.set_skip(wins);
                                 Ok(b)
                             })
