@@ -51,7 +51,10 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
         # same way, so a community TAS of any level replays from its room.
         pat = "load_room(0,0)" if begin_game else "load_room(1, 0)"
         assert lua.count(pat) == 1, f"expected exactly one {pat!r} in the Lua"
-        lua = lua.replace(pat, f"load_room({room[0]}, {room[1]})")
+        # Past the orb (room (5,2)'s big chest, level 21) a play-through has
+        # the second dash: max_djump=2 (celeste-interp game_runner, the same).
+        orb = "max_djump=2 " if room[0] % 8 + room[1] * 8 > 21 else ""
+        lua = lua.replace(pat, f"{orb}load_room({room[0]}, {room[1]})")
     map_data = hexbytes(os.path.join(ROOT, "cart", "map-data.txt"), 8192)
     flags = hexbytes(os.path.join(ROOT, "cart", "flag-data.txt"), 256)
     prelude = [

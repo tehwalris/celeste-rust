@@ -64,6 +64,14 @@ pub fn room_dir_stem() -> String {
 /// Point the game's `_init` at the configured start room. Strict: the
 /// checked-in lua must contain the default call exactly once, so a source
 /// edit can never silently disable the substitution.
+/// The cart's `level_index()` of room (x, y).
+pub fn level_index(x: i16, y: i16) -> i16 {
+    x % 8 + y * 8
+}
+
+/// The level whose big chest holds the orb (`max_djump=2`): room (5,2).
+pub const ORB_LEVEL: i16 = 21;
+
 pub fn apply_start_room(game_lua: &str) -> Result<String> {
     const PAT: &str = "load_room(1, 0)";
     let count = game_lua.matches(PAT).count();
@@ -75,7 +83,13 @@ pub fn apply_start_room(game_lua: &str) -> Result<String> {
         ));
     }
     let (x, y) = start_room();
-    let out = game_lua.replacen(PAT, &format!("load_room({}, {})", x, y), 1);
+    // The orb in room (5,2)'s big chest (level index 21) sets `max_djump=2`
+    // for the rest of the game, and every later level is designed (and
+    // TASed) with the second dash. Starting a later room directly must start
+    // as a play-through reaches it: with the orb taken (2026-10-02, room
+    // (6,2): TAS23 never exited with one dash).
+    let orb = if level_index(x, y) > ORB_LEVEL { "max_djump=2 " } else { "" };
+    let out = game_lua.replacen(PAT, &format!("{}load_room({}, {})", orb, x, y), 1);
     // EXPERIMENT (room (3,0), 2026-09-17, plans/room30.md): with
     // `CELESTE_EXPERIMENT_NO_FLY_FRUIT` set, the cart never registers the fly
     // fruit type, so no fly fruit spawns. A DIFFERENT GAME: it measures how
@@ -113,6 +127,15 @@ mod tests {
     fn apply_start_room_is_identity_for_default_room() {
         let src = "function _init()\n\tload_room(1, 0)\nend\n";
         assert_eq!(apply_start_room(src).unwrap(), src);
+    }
+
+    /// A room past the orb's starts with the second dash; the orb's room and
+    /// earlier ones do not.
+    #[test]
+    fn rooms_past_the_orb_start_with_two_dashes() {
+        use super::{level_index, ORB_LEVEL};
+        assert_eq!(level_index(5, 2), ORB_LEVEL);
+        assert!(level_index(6, 2) > ORB_LEVEL && level_index(1, 0) < ORB_LEVEL);
     }
 
     #[test]
