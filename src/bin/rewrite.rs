@@ -610,6 +610,38 @@ enum Command {
         #[arg(long, default_value = "1,0")]
         room: String,
     },
+    /// DIAGNOSTIC: follow a CONCRETE input sequence (the reference engine's
+    /// concrete step) through one level's tree: per frame, whether the
+    /// concrete state projected onto `--level` is a row of the tree, and
+    /// where. At the first frame it is not, or at the win (never stored), the
+    /// parent row goes through the level's kernels and the concrete
+    /// successor's projection is printed next to the closest kernel
+    /// successors: a concrete successor no kernel successor equals is a
+    /// SOUNDNESS gap; one that is a kernel successor was filtered (the marks
+    /// of a coarser level, `--marks`). Found room (1,3)'s win rows keyed
+    /// apart from their columns (2026-10-02, `runtime2::av_code`).
+    Follow {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        level: String,
+        /// The input bytes: a file in the `tas/` format, or a comma list.
+        #[arg(long)]
+        inputs: String,
+        #[arg(long, default_value_t = 5)]
+        show: usize,
+        /// A coarser level's marks (`hNNN/levelNN.marks.bin`) and that level
+        /// (`--coarser`): also report, per frame, whether the concrete state
+        /// and the kernels' successors pass the ladder's mark filter.
+        #[arg(long)]
+        marks: Option<String>,
+        #[arg(long)]
+        coarser: Option<String>,
+        /// The coarser level's tree: at a win, the kernels' win rows
+        /// projected onto `--coarser` are compared with its rows at their cell.
+        #[arg(long)]
+        coarse_dir: Option<String>,
+    },
 }
 
 /// The player's `spd.x` and `spd.y` cells of a block, when it has a player
@@ -3382,6 +3414,213 @@ fn main() -> Result<()> {
             }
             println!("[trajectory] followed to the end: {} states; one input sequence:", layer.len());
             println!("{}", layer[0].1.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
+        }
+        Command::Follow { level_dir, level, inputs, show, marks, coarser, coarse_dir } => {
+            use celeste_rust::frame::{frame_files_seq, pack_id, widen_rt2_to, Block};
+            use celeste_rust::interpreter::abstraction::{set_level, Level};
+            type Proj = std::collections::BTreeMap<String, String>;
+            let ids = celeste_rust::compiled::ids();
+            let dir = std::path::Path::new(&level_dir);
+            let lvl = Level::parse(&level).map_err(|e| anyhow::anyhow!(e))?;
+            set_level(lvl);
+            let text = std::fs::read_to_string(&inputs).unwrap_or_else(|_| inputs.clone());
+            let bytes: Vec<u8> = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .flat_map(|l| l.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect::<Vec<_>>())
+                .map(|t| t.parse::<u8>())
+                .collect::<std::result::Result<_, _>>()?;
+            // (key, cell) -> (layer, seq, row): where the tree first has it.
+            let mut at: rustc_hash::FxHashMap<(u64, u64, u32), (u32, u32, u32)> = Default::default();
+            let mut layers = 0u32;
+            while dir.join("frames").join(format!("f{:03}", layers)).exists() {
+                for (seq, file) in frame_files_seq(dir, layers)? {
+                    if let Some(rt2) = file.load_all()? {
+                        let b = Block::from_rt2(rt2);
+                        let cells = b.positions()?;
+                        for (r, (k, &c)) in b.keys().iter().zip(&cells).enumerate() {
+                            at.entry((k.0, k.1, c)).or_insert((layers, seq, r as u32));
+                        }
+                    }
+                }
+                layers += 1;
+            }
+            eprintln!("[follow] {} rows in {layers} layers, {} inputs", at.len(), bytes.len());
+            let projected = |rt2: &mut celeste_engine::runtime2::Rt2| -> Vec<Proj> {
+                widen_rt2_to(rt2, lvl);
+                let names = cell_names(rt2, ids);
+                (0..rt2.width).map(|r| project_row(rt2, &names, r as u32, &[])).collect()
+            };
+            let brief = |p: &Proj| -> String {
+                p.iter()
+                    .filter(|(n, _)| (n.starts_with("player") || n.starts_with("spd") || n.starts_with("rem") || n.starts_with("dash")) && !n.contains("hitbox") && !n.contains(".type.") && !n.ends_with(".solids") && !n.ends_with(".collideable") && !n.contains(".flip.y"))
+                    .map(|(n, v)| format!("{n}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let filter = match (&marks, &coarser) {
+                (Some(m), Some(c)) => Some((celeste_rust::frame::Visited::load(std::path::Path::new(m))?, Level::parse(c).map_err(|e| anyhow::anyhow!(e))?)),
+                (None, None) => None,
+                _ => anyhow::bail!("--marks and --coarser go together"),
+            };
+            // Per lane of `rt2`: is its widened-to-coarser form marked?
+            let marked = |rt2: &celeste_engine::runtime2::Rt2| -> Result<Vec<bool>> {
+                let Some((m, c)) = &filter else { return Ok(vec![true; rt2.width]) };
+                let (shape, keys, cells) = celeste_rust::frame::widened_keys_rt2(rt2, *c)?;
+                Ok(keys.iter().zip(&cells).map(|(k, &cell)| m.contains(shape, *k, cell)).collect())
+            };
+            let mut eng = celeste_rust::trace::refengine::RefEngine::new()?;
+            let initial = eng.initial_state()?;
+            let mut states = vec![initial.clone()];
+            let mut parent: Option<(u32, u32, u32)> = None;
+            for (f, &byte) in bytes.iter().enumerate() {
+                let f = f as u32 + 1;
+                let mut next = Vec::new();
+                for s0 in &states {
+                    let mut s = s0.clone();
+                    celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
+                    for mut succ in eng.run_frame_concrete_all(&s)? {
+                        celeste_rust::concrete::restore_buttons(&initial, &mut succ)?;
+                        next.push(succ);
+                    }
+                }
+                // Where the tree has one of the concrete leaves (an `rnd` fork
+                // makes several).
+                let mut found = None;
+                let mut won = false;
+                for succ in &next {
+                    let block = Block::from_state(succ)?;
+                    if celeste_rust::frame::wins_of(block.rt2())?.iter().any(|&w| w) {
+                        won = true;
+                    }
+                    let (_, keys, cells) = celeste_rust::frame::widened_keys(&block, lvl)?;
+                    if let Some(&loc) = at.get(&(keys[0].0, keys[0].1, cells[0])) {
+                        found = Some(loc);
+                    }
+                }
+                // A win is not stored in the tree: check the kernels make it.
+                let Some(loc) = found.filter(|_| !won) else {
+                    println!("[follow] f{f} input {byte}: {} ({} concrete leaves)", if won { "WIN" } else { "NOT IN THE TREE" }, next.len());
+                    let (layer, seq, r) = parent.ok_or_else(|| anyhow::anyhow!("the first step is already missing"))?;
+                    let file = frame_files_seq(dir, layer)?
+                        .into_iter()
+                        .find(|(s, _)| *s == seq)
+                        .map(|(_, f)| f)
+                        .ok_or_else(|| anyhow::anyhow!("no file s{seq} at layer {layer}"))?;
+                    let rt2 = file.load_rows(&[r..r + 1])?.ok_or_else(|| anyhow::anyhow!("no row"))?;
+                    println!("    parent row (layer {layer} s{seq} r{r}): {}", brief(&projected(&mut rt2.clone_block())[0]));
+                    for s in &states {
+                        println!("    concrete parent: {}", brief(&project_row(&Block::from_state(s)?.into_rt2(), &cell_names(&Block::from_state(s)?.into_rt2(), ids), 0, &[])));
+                    }
+                    let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+                    let block = Block::with_ids(rt2.clone_block(), vec![pack_id(layer, seq, r)], seq);
+                    let tmp = std::env::temp_dir().join(format!("follow-{}", std::process::id()));
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    let door = celeste_rust::search::door::Door::for_current_level();
+                    let (out, _, _) = celeste_rust::frame::forward_frame(&kernels, vec![block], &door, None, None, layer + 1, Some(&tmp))?;
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    let mut kset: std::collections::BTreeSet<Proj> = Default::default();
+                    let (mut kwins, mut kwins_marked) = (0, 0);
+                    for b in out {
+                        let mut w = b.into_rt2();
+                        let (wins, m) = (celeste_rust::frame::wins_of(&w)?, marked(&w)?);
+                        if let (Some(cd), Some((_, c))) = (&coarse_dir, &filter) {
+                            // The win rows as the coarser level keys them,
+                            // against that tree's rows at the same cell.
+                            let mut cw = w.clone_block();
+                            widen_rt2_to(&mut cw, *c);
+                            let names = cell_names(&cw, ids);
+                            let cells = celeste_rust::search::pos_graph::block_cells(&cw)?;
+                            for lane in (0..cw.width).filter(|&l| wins[l]) {
+                                let mine = project_row(&cw, &names, lane as u32, &[]);
+                                println!("    kernel win row as {c:?} keys it: shape {:#x} cell {}", cw.shape_hash, cells[lane]);
+                                let want: rustc_hash::FxHashSet<u32> = [cells[lane]].into_iter().collect();
+                                // The coarse tree's stored rows at the cell: header
+                                // win, stored key, marked.
+                                let mk = cw.clone_block().row_keys_canonical()[lane];
+                                for lf in 0..layers {
+                                    for (seq, file) in frame_files_seq(std::path::Path::new(cd), lf)? {
+                                        let wins: std::collections::HashSet<u32> = file.win_rows().iter().map(|w| w.0).collect();
+                                        for (row, &c) in file.row_cells().iter().enumerate() {
+                                            if c == cells[lane] {
+                                                let k = file.key_at(row as u32);
+                                                let m = filter.as_ref().is_some_and(|(m, _)| m.contains(file.shape_hash(), k, c));
+                                                println!("      coarse file l{lf} s{seq} shape {:#x} row {row}: header win {}, stored key == fine {}, marked {m}", file.shape_hash(), wins.contains(&(row as u32)), k == mk);
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut shown = 0;
+                                for lf in 0..layers {
+                                    for blk in celeste_rust::frame::load_frame_cells(std::path::Path::new(cd), lf, &want)? {
+                                        let mut t = blk.into_rt2();
+                                        let tn = cell_names(&t, ids);
+                                        for r in 0..t.width {
+                                            if shown >= show {
+                                                break;
+                                            }
+                                            shown += 1;
+                                            let theirs = project_row(&t, &tn, r as u32, &[]);
+                                            let mut diff: Vec<String> = mine
+                                                .iter()
+                                                .filter(|(n, v)| theirs.get(*n) != Some(*v))
+                                                .map(|(n, v)| format!("{n}: fine {v}, coarse {}", theirs.get(n).map(String::as_str).unwrap_or("-")))
+                                                .chain(theirs.keys().filter(|n| !mine.contains_key(*n)).map(|n| format!("{n}: only coarse")))
+                                                .collect();
+                                            // Every value cell, named or not, when the structures agree.
+                                            if t.structure == cw.structure {
+                                                for c in 0..t.cols.len() {
+                                                    if matches!(t.structure[c], celeste_engine::runtime2::Cell2::Val) && !names.contains_key(&c) {
+                                                        let (a, b) = (cw.cols[c].at(lane), t.cols[c].at(r));
+                                                        if a != b {
+                                                            diff.push(format!("cell {c}: fine {a:?}, coarse {b:?}"));
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                diff.push("structures differ".into());
+                                            }
+                                            let tk = t.row_keys_canonical()[r];
+                                            let mk = cw.row_keys_canonical()[lane];
+                                            let tm = filter.as_ref().is_some_and(|(m, _)| m.contains(t.shape_hash, tk, cells[lane]));
+                                            println!("      coarse row at layer {lf} (shape {:#x}, key {}, marked {tm}): {}", t.shape_hash, if tk == mk { "EQUAL" } else { "differs" }, if diff.is_empty() { "EQUAL".to_string() } else { diff.join("; ") });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        kwins += wins.iter().filter(|&&x| x).count();
+                        kwins_marked += wins.iter().zip(&m).filter(|(&x, &y)| x && y).count();
+                        kset.extend(projected(&mut w));
+                    }
+                    println!("    {} kernel successors, {kwins} of them wins, {kwins_marked} of those pass the mark filter", kset.len());
+                    for succ in &next {
+                        let p = projected(&mut Block::from_state(succ)?.into_rt2()).remove(0);
+                        let verdict = if kset.contains(&p) { "a kernel successor (filtered)" } else { "NOT a kernel successor" };
+                        println!("    concrete successor, {verdict}: {}", brief(&p));
+                        let dist = |k: &Proj| k.iter().filter(|(n, v)| p.get(*n) != Some(*v)).count() + p.keys().filter(|n| !k.contains_key(*n)).count();
+                        let mut near: Vec<&Proj> = kset.iter().collect();
+                        near.sort_by_key(|k| dist(k));
+                        for k in near.iter().take(show) {
+                            let diff: Vec<String> = k
+                                .iter()
+                                .filter(|(n, v)| p.get(*n) != Some(*v))
+                                .map(|(n, v)| format!("{n}: kernel {v}, concrete {}", p.get(n).map(String::as_str).unwrap_or("-")))
+                                .collect();
+                            println!("      kernel successor at distance {}: {}", dist(k), diff.join("; "));
+                        }
+                    }
+                    return Ok(());
+                };
+                let mut pass = false;
+                for succ in &next {
+                    pass |= marked(Block::from_state(succ)?.rt2())?[0];
+                }
+                println!("[follow] f{f} input {byte}: in the tree at layer {} (s{} r{}){}", loc.0, loc.1, loc.2, if pass { "" } else { ", NOT MARKED at the coarser level" });
+                parent = Some(loc);
+                states = next;
+            }
+            println!("[follow] every frame is in the tree");
         }
         Command::Witness {
             checkpoint_dir,

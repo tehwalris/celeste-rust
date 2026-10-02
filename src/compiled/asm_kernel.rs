@@ -102,13 +102,12 @@ struct DKey {
 }
 
 /// One field of a body's row key: its cell, the byte offset it is read from,
-/// and whether it is hashed as an INTERVAL. A field keyed on another node
-/// (the speed under a bucket: stored tight, keyed on its bucket) is hashed
-/// per row even where its stored value is constant (`acc_template` leaves it
-/// out of `part`), and as an interval: the boundary keys it on `widen_to`'s
-/// `AV::Ival` bucket, and `av_code` tells a number from a point interval - a
-/// singleton bucket the fold pinned to `Const(t, t)` reads as a number (25 of
-/// 262 exact marks lost, 2026-09-15).
+/// and how its slot is read. A field keyed on another node (the speed under
+/// a bucket: stored tight, keyed on its bucket) is hashed per row even where
+/// its stored value is constant (`acc_template` leaves it out of `part`).
+/// A number and the point interval `[v, v]` key alike (`runtime2::av_code`),
+/// so a number root keys the same whether its column stores it as a number
+/// or, typed by the shape's union, as `[v, v]`.
 ///
 /// Specialized at build time: `c` is `seed ^ cell * CELL_K` per half, and
 /// `read` reads the slot straight into `runtime2::av_code`'s code - no `AV`
@@ -124,21 +123,18 @@ struct KeyField {
 #[derive(Clone, Copy)]
 enum KeyRead {
     Num,
-    /// A number keyed as the point interval `[v, v]` (`KeyField`'s doc).
-    NumAsIval,
     Ival,
     Bool,
 }
 
 impl KeyField {
-    fn new(cell: u64, root: usize, kind: RootKind, span: bool) -> KeyField {
+    fn new(cell: u64, root: usize, kind: RootKind) -> KeyField {
         use celeste_engine::runtime2::CELL_K;
         let ck = cell.wrapping_mul(CELL_K);
-        let read = match (kind, span) {
-            (RootKind::Num, false) => KeyRead::Num,
-            (RootKind::Num, true) => KeyRead::NumAsIval,
-            (RootKind::Ival, _) => KeyRead::Ival,
-            (RootKind::Bool, _) => KeyRead::Bool,
+        let read = match kind {
+            RootKind::Num => KeyRead::Num,
+            RootKind::Ival => KeyRead::Ival,
+            RootKind::Bool => KeyRead::Bool,
         };
         KeyField { c: [KEY_SEED1 ^ ck, KEY_SEED2 ^ ck], root, read }
     }
@@ -146,17 +142,11 @@ impl KeyField {
     /// `runtime2::av_code` of lane `i`'s value, off the output slot.
     #[inline]
     fn code(&self, buf: &[u8], i: usize) -> u64 {
-        use celeste_engine::runtime2::mix64;
         let base = self.root;
-        let word = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) as u64;
-        let ival = |lo: u64, hi: u64| 2u64 << 56 | lo << 24 ^ mix64(hi << 1);
+        let word = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
         match self.read {
-            KeyRead::Num => 1u64 << 56 | word(base + i * 4),
-            KeyRead::NumAsIval => {
-                let v = word(base + i * 4);
-                ival(v, v)
-            }
-            KeyRead::Ival => ival(word(base + i * 4), word(base + 64 + i * 4)),
+            KeyRead::Num => celeste_engine::runtime2::num_code(word(base + i * 4)),
+            KeyRead::Ival => celeste_engine::runtime2::ival_code(word(base + i * 4), word(base + 64 + i * 4)),
             KeyRead::Bool => {
                 let val = u16::from_le_bytes([buf[base], buf[base + 1]]);
                 let known = u16::from_le_bytes([buf[base + 2], buf[base + 3]]);
@@ -2372,10 +2362,9 @@ fn build_one_shape(
                     Some(k) => slot_of[off + nfields + 2 + k],
                     None => slot_of[off + j],
                 };
-                // A number root of an INTERVAL field is stored `[v, v]`
-                // (`BodyCols::num_as_ival`) and keyed as that interval.
-                let span = keyed.is_some() || out_fields[j].ty == "ZI";
-                Some(KeyField::new(outputs[j].0 as u64, compiled.root_offsets[root] as usize, compiled.root_kinds[root], span))
+                // A number root of an INTERVAL column is stored `[v, v]`
+                // (`BodyCols::num_as_ival`), which keys as the number.
+                Some(KeyField::new(outputs[j].0 as u64, compiled.root_offsets[root] as usize, compiled.root_kinds[root]))
             })
             .collect();
         asm_bodies.push(AsmBody {

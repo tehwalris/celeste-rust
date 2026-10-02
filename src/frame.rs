@@ -3663,6 +3663,64 @@ mod tests {
         assert_eq!(k.difference(&r).count() + r.difference(&k).count(), 0, "kernels {} successors, reference {}: {} only in the reference", k.len(), r.len(), r.difference(&k).count());
     }
 
+    /// THE EXIT FRAME of room (1,3)'s known 127-frame solution
+    /// (`tas/room_1_3_reference_frame_127.txt`, verified on a real PICO-8):
+    /// from the state before it, projected onto `r1sxh`, the kernels must
+    /// make the concrete exit's state - the KEY the mark filter looks up
+    /// included - and every row they emit must carry the key its columns
+    /// have. The exit loads room (2,3), whose balloon's `y` is a number in
+    /// the outcome the kernel keyed (the key folded it as a number) and
+    /// `[64, 64]` in the shape's union column (the boundary read it as an
+    /// interval): two keys for one state, so the next level's mark filter
+    /// never found level 0's win rows and the ladder refuted the solution
+    /// at level 1 (2026-10-02, `runtime2::av_code`).
+    #[test]
+    fn room_13_exit_frame_keys_the_concrete_exit() {
+        use crate::interpreter::abstraction::{set_level, Level};
+        std::env::set_var("CELESTE_START_ROOM", "1,3");
+        let level = Level::parse("r1sxh").expect("level");
+        set_level(level);
+        let kernels = crate::compiled::FrameEngine::new_for_start_room().expect("kernels");
+        let text = std::fs::read_to_string("tas/room_1_3_reference_frame_127.txt").expect("the reference solution");
+        let inputs: Vec<u8> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .flat_map(|l| l.split(',').filter(|t| !t.trim().is_empty()).map(|t| t.trim().parse::<u8>().expect("an input byte")).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(inputs.len(), 127);
+        let mut reference = RefEngine::new().expect("ref engine");
+        let init = reference.initial_state().expect("initial state");
+        let step = |reference: &mut RefEngine, st: &crate::interpreter::state::State, byte: u8| {
+            let mut s = st.clone();
+            crate::concrete::set_concrete_buttons(&mut s, byte).expect("buttons");
+            let mut out = reference.run_frame_concrete_all(&s).expect("frame");
+            assert_eq!(out.len(), 1, "one concrete successor");
+            let mut next = out.pop().unwrap();
+            crate::concrete::restore_buttons(&init, &mut next).expect("buttons");
+            next
+        };
+        let mut st = init.clone();
+        for &b in &inputs[..126] {
+            st = step(&mut reference, &st, b);
+        }
+        let exit = Block::from_state(&step(&mut reference, &st, inputs[126])).expect("block");
+        assert!(wins_of(exit.rt2()).expect("wins")[0], "the reference solution exits at frame 127");
+        let mut parent = Block::from_state(&st).expect("block").into_rt2();
+        widen_rt2_to(&mut parent, level);
+        let door = crate::search::door::Door::for_current_level();
+        let (next, _, _) = forward_frame(&kernels, vec![Block::from_rt2(parent)], &door, None, None, 127, None).expect("frame");
+        let mut made: std::collections::BTreeSet<(u64, (u64, u64), u32)> = Default::default();
+        for b in &next {
+            let stored = b.keys().to_vec();
+            let canonical = b.rt2().clone_block().row_keys_canonical();
+            assert_eq!(stored, canonical, "an emitted row's key is not its columns' key (shape {:#x})", b.rt2().shape_hash);
+            let (shape, keys, cells) = widened_keys(b, level).expect("keys");
+            made.extend(keys.into_iter().zip(cells).map(|(k, c)| (shape, k, c)));
+        }
+        let (shape, keys, cells) = widened_keys(&exit, level).expect("keys");
+        assert!(made.contains(&(shape, keys[0], cells[0])), "the kernels do not make the concrete exit's state ({} successors)", made.len());
+    }
+
     /// THE SPLIT FRAME (`CELESTE_SPLIT_FRAME`) at a near level reaches the
     /// unsplit frame's states at every frame boundary: room (2,1) `r0sxhn`,
     /// where the player spawns onto two fall floors and can dash (a freeze)

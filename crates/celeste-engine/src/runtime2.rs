@@ -29,11 +29,23 @@ pub fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// A value's contribution to the row key. A number and the point interval
+/// `[n, n]` are the same set of concrete values and code ALIKE: which of the
+/// two a row stores depends on how its column is typed (a shape's union
+/// types a cell as an interval column if any of its outcomes writes an
+/// interval there, and a number lands in it as `[n, n]`,
+/// `asm_kernel::BodyCols`), and the kernels, the boundary, `widen_to` and the
+/// bridge from a `State` do not all type a cell alike. Coded apart, one state
+/// had two keys: room (1,3)'s exit rows carry the next room's balloon `y`,
+/// a number in the outcome the kernel keyed but `[64, 64]` in the column, so
+/// the mark filter (canonical keys of the widened finer rows) never found
+/// the coarser level's win rows (their kernel keys) and refuted the known
+/// 127-frame solution at level 1 (2026-10-02).
 #[inline]
 pub fn av_code(v: AV) -> u64 {
     match v {
-        AV::Num(n) => 1u64 << 56 | n.to_bits() as u64,
-        AV::Ival(a, b) => 2u64 << 56 | (a.to_bits() as u64) << 24 ^ mix64((b.to_bits() as u64) << 1),
+        AV::Num(n) => num_code(n.to_bits()),
+        AV::Ival(a, b) => ival_code(a.to_bits(), b.to_bits()),
         AV::Bool(b) => 3u64 << 56 | b as u64,
         AV::UBool => 4u64 << 56,
         AV::UNum => 9u64 << 56,
@@ -41,6 +53,23 @@ pub fn av_code(v: AV) -> u64 {
         AV::Nil => 6u64 << 56,
         AV::Ptr(p) => 7u64 << 56 | p as u64,
         AV::NilPtr => 8u64 << 56,
+    }
+}
+
+/// `av_code` of the number with raw bits `n`.
+#[inline]
+pub fn num_code(n: u32) -> u64 {
+    1u64 << 56 | n as u64
+}
+
+/// `av_code` of the interval with raw bits `[lo, hi]`: a point interval
+/// codes as its number.
+#[inline]
+pub fn ival_code(lo: u32, hi: u32) -> u64 {
+    if lo == hi {
+        num_code(lo)
+    } else {
+        2u64 << 56 | (lo as u64) << 24 ^ mix64((hi as u64) << 1)
     }
 }
 
@@ -1486,7 +1515,7 @@ impl Rt2 {
                     let c1 = KEY_SEED1 ^ ci.wrapping_mul(CELL_K);
                     let c2 = KEY_SEED2 ^ ci.wrapping_mul(CELL_K);
                     for i in 0..w {
-                        let code = 1u64 << 56 | vs[i].to_bits() as u64;
+                        let code = num_code(vs[i].to_bits());
                         h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
                         h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
                     }
@@ -1672,6 +1701,23 @@ impl Rt2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A number and the point interval of it are one value to the row key
+    /// (`av_code`): a column typed as an interval stores a number as `[n, n]`.
+    #[test]
+    fn a_point_interval_keys_as_its_number() {
+        for raw in [0i32, 1, -1, 64 << 16, -(5 << 15), i32::MAX, i32::MIN] {
+            let n = P8::from_raw(raw);
+            assert_eq!(av_code(AV::Ival(n, n)), av_code(AV::Num(n)), "raw {raw:#x}");
+            assert_eq!(cell_mix(7, AV::Ival(n, n), KEY_SEED1), cell_mix(7, AV::Num(n), KEY_SEED1));
+            assert_eq!(ival_code(n.to_bits(), n.to_bits()), num_code(n.to_bits()));
+        }
+        // A wider interval is not its low end, nor its high end.
+        let (a, b) = (P8::from_raw(0), P8::from_raw(1));
+        assert_ne!(av_code(AV::Ival(a, b)), av_code(AV::Num(a)));
+        assert_ne!(av_code(AV::Ival(a, b)), av_code(AV::Num(b)));
+        assert_ne!(av_code(AV::Ival(a, b)), av_code(AV::Ival(b, b)));
+    }
 
     /// `floor_player_window` is the cart's `floor.collide(player, 0, 0)` - its
     /// four hitbox inequalities, spelled out here as the cart writes them -
