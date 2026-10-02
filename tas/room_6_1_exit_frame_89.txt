@@ -1,0 +1,18 @@
+# Room (6,1) "1500 m": exit at frame 89 for celeste-minimal, found by the
+# search (2026-10-02). Exits on a real PICO-8 with balloon seeds 0, 0.5 and
+# PICO-8's rnd.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 6,1, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search: SPLIT frame (two steps a frame, e4e0f1a), ladder r0sxhn .. r4sxhn,
+# r4sxh .. r15sxh, rxsx, level -1 filter (178,5), --ceiling 178 (steps).
+# First wins (steps): 160, 168, 172, 176, 176, then 178 from the first
+# exact-object level up to Exact; h176 refuted at level 5. `OPTIMAL win
+# frame: 178` = frame 89. Witness: `rewrite witness --horizon 178 --level 17`
+# (split frame), 394 concrete steps, 0 dead ends; its per-step bytes folded to
+# per-frame (step 2k is frame k's input; every odd step's is 0). On a real
+# PICO-8 (celeste-minimal) f88 player (51,-3), f89 room (7,1). TIES the
+# community TAS15 (89, tas/room_6_1_reference_frame_89.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,0,0,16,0,0,38,0,0,0,0,0,0,0,0,0,0,0,2,2,0,0,0,1,1,1,0,1,1,33,0,0,0,0,0,0,0,0,0,16,0,0,0,36,0,0,0,0,0,0,2,16,0,16,0,0,0
