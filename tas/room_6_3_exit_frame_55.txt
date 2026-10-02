@@ -1,0 +1,18 @@
+# Room (6,3) "summit": the flag touched at frame 55 for celeste-minimal, found
+# by the search (2026-10-02). Starts with the second dash (past the orb).
+# The summit has no exit; the finish is touching the flag (the original cart's
+# flag.draw check(player,0,0)): the player at x 55..67, y 41..52
+# (frame::win_rect). On a real PICO-8 the player is at (55,44) at f55, and
+# outside the rect at every earlier frame.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 6,3, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search: no split frame, the default ladder (rem Bits(0..=15), then exact;
+# the room has no objects but the flag), --ceiling 55, no level -1 filter
+# (its table measures the room exit). h55: first wins 50, 52, 53, 53, 54, 54,
+# then 55 from rem Bits(6) to Exact; h54 refuted at level 6. `OPTIMAL win
+# frame: 55`. Witness 187 concrete steps, 0 dead ends. TIES the community
+# TAS31 (55, tas/room_6_3_reference_frame_55.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,18,0,36,0,0,0,0,0,0,38,0,0,0,0,0,0,0,0,0,0,0,38,0,0,0,0,0,0,0,0,0
