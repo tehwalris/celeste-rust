@@ -1,0 +1,15 @@
+# Room (0,3) "2500 m": exit at frame 98 for celeste-minimal, found by the
+# search (2026-10-02). Starts with the second dash (past the orb, 26a0e54).
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 0,3, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search: no split frame, ladder r0sxhn .. r4sxhn, r4sxh .. r15sxh, rxsx
+# (three springs, two fall floors, key, chest: abstract through rem Bits(4)),
+# level -1 filter (98,5), --ceiling 98. h98: first wins 90, 94, 95, 96, then
+# 97 from level 4 to rem Bits(11), 98 from rem Bits(12) to Exact; h97 refuted
+# at level 13 (Bits(12)). `OPTIMAL win frame: 98`. Witness 348 concrete steps,
+# 0 dead ends; f97 player (61,0), f98 room (1,3). TIES the community TAS25 (98,
+# tas/room_0_3_reference_frame_98.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,0,0,0,0,0,37,0,0,0,0,0,0,0,0,37,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,36,0,0,0,0,0,0,0,36,0,0,0
