@@ -231,19 +231,60 @@ impl Block {
     }
 }
 
+/// The summit (level 30, room (6,3)) has no exit: `player.update` calls
+/// `next_room` only below level 30. Its finish is the FLAG (the original
+/// cart's `flag`, absent from celeste-minimal since it changes nothing else):
+/// `flag.init` moves it 5 px right of its tile (118), and `flag.draw` - the
+/// same frame's draw, after every update - takes the run as finished when
+/// `this.check(player,0,0)` holds. With the player's hitbox (1, 3, 6, 5) and
+/// the flag's default (0, 0, 8, 8) at (fx, fy) the overlap is, in the
+/// player's whole-pixel x/y: fx-6 <= x <= fx+6 and fy-7 <= y <= fy+4.
+pub const SUMMIT_LEVEL: i16 = 30;
+
+/// The player positions that win, as an inclusive rect (x_lo, x_hi, y_lo,
+/// y_hi) on the player's whole-pixel x/y - a lane wins where its position
+/// (a bucket under the position rung) MEETS the rect: `CELESTE_WIN_AT_XY`'s
+/// point, or the summit's flag (`SUMMIT_LEVEL`). None: the win is the room
+/// exit.
+pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
+    static RECT: std::sync::OnceLock<Option<(i16, i16, i16, i16)>> = std::sync::OnceLock::new();
+    *RECT.get_or_init(|| {
+        if let Some((x, y)) = crate::interpreter::abstraction::synthetic_win_xy() {
+            return Some((x, x, y, y));
+        }
+        let (rx, ry) = crate::game_runner::start_room();
+        if crate::game_runner::level_index(rx, ry) != SUMMIT_LEVEL {
+            return None;
+        }
+        let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
+        let cart = celeste_core::cart_data::CartData::load(std::path::Path::new(&root).join("cart"))
+            .expect("summit win: load the cart");
+        let flags: Vec<(i16, i16)> = (0..16i16)
+            .flat_map(|ty| (0..16i16).map(move |tx| (tx, ty)))
+            .filter(|&(tx, ty)| cart.mget_whole(rx * 16 + tx, ry * 16 + ty) == 118)
+            .collect();
+        let [(tx, ty)] = flags[..] else { panic!("summit win: want one flag tile (118) in room ({rx},{ry}), found {flags:?}") };
+        let (fx, fy) = (tx * 8 + 5, ty * 8);
+        let rect = (fx - 6, fx + 6, fy - 7, fy + 4);
+        eprintln!("[win] summit: the flag at ({fx}, {fy}); the player wins at x {}..={}, y {}..={}", rect.0, rect.1, rect.2, rect.3);
+        Some(rect)
+    })
+}
+
 /// Per lane: has it left the start room? The room-exit test (`room.x` past
-/// the start room) or, under `CELESTE_WIN_AT_XY`, the synthetic
-/// player-position target. Pure position; no peeking inside.
+/// the start room) or, where there is a `win_rect` (`CELESTE_WIN_AT_XY`, the
+/// summit's flag), the player's position meeting it. Pure position; no
+/// peeking inside.
 pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Col, AV};
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
-    if let Some(target) = crate::interpreter::abstraction::synthetic_win_xy() {
+    if let Some((txl, txh, tyl, tyh)) = win_rect() {
         let Some(obj) = crate::search::pos_graph::player_object(rt2) else {
             return Ok(vec![false; lanes]);
         };
-        // A position bucket (the position rung) wins where the target
-        // lies inside it - the same rule as the queue's `any_win`.
+        // A position bucket (the position rung) wins where it meets the
+        // target - the same rule as the queue's `any_win`.
         let axis = |f: u32| {
             rt2.obj_field_cell(obj, f)
                 .and_then(|c| crate::search::pos_graph::whole_range_col(rt2, c))
@@ -252,7 +293,7 @@ pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
             (Some(xs), Some(ys)) => xs
                 .iter()
                 .zip(&ys)
-                .map(|(&(xl, xh), &(yl, yh))| xl <= target.0 && target.0 <= xh && yl <= target.1 && target.1 <= yh)
+                .map(|(&(xl, xh), &(yl, yh))| xl <= txh && txl <= xh && yl <= tyh && tyl <= yh)
                 .collect(),
             _ => vec![false; lanes],
         });
@@ -282,7 +323,7 @@ pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
 pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::AV;
     let exits = exits_of(rt2)?;
-    if crate::interpreter::abstraction::synthetic_win_xy().is_some() || !orb_required() {
+    if win_rect().is_some() || !orb_required() {
         return Ok(exits);
     }
     let (ids, lanes) = (crate::compiled::ids(), rt2.width);
@@ -619,7 +660,7 @@ impl Slot {
                 other => anyhow::bail!("any_win: cell {cell} is not a number: {:?}", other),
             }
         };
-        if let Some((tx, ty)) = crate::interpreter::abstraction::synthetic_win_xy() {
+        if let Some((txl, txh, tyl, tyh)) = win_rect() {
             let Some(obj) = crate::search::pos_graph::player_object(sk) else {
                 return Ok(false);
             };
@@ -627,7 +668,7 @@ impl Slot {
                 return Ok(false);
             };
             // A position is a number, or a BUCKET under the position rung
-            // (`PosPrecision`): the lane wins if the target lies in it -
+            // (`PosPrecision`): the lane wins if it meets the target -
             // the over-approximation a coarser level is entitled to, and
             // what the finer levels refute.
             let range_at = |cell: u32| -> Result<Box<dyn Fn(u32) -> (i16, i16) + '_>> {
@@ -658,7 +699,7 @@ impl Slot {
             return Ok(rows.iter().any(|&r| {
                 let (xl, xh) = xs(r);
                 let (yl, yh) = ys(r);
-                xl <= tx && tx <= xh && yl <= ty && ty <= yh
+                xl <= txh && txl <= xh && yl <= tyh && tyl <= yh
             }));
         }
         let (wx, wy) = crate::game_runner::win_room();
@@ -1383,6 +1424,7 @@ fn band() -> Option<(u32, i32)> {
     static BAND: std::sync::OnceLock<Option<(u32, i32)>> = std::sync::OnceLock::new();
     *BAND.get_or_init(|| {
         let s = std::env::var("CELESTE_BAND").ok()?;
+        assert!(win_rect().is_none(), "CELESTE_BAND measures the climb to the room exit; this room's win is a position");
         let (h, px) = s.split_once(',').expect("CELESTE_BAND=\"H,px\"");
         let band = (h.trim().parse().expect("CELESTE_BAND horizon"), px.trim().parse().expect("CELESTE_BAND px per frame"));
         eprintln!("[band] EXPERIMENT: dropping cells that cannot climb to the exit by f{} at {} px per frame", band.0, band.1);
@@ -1403,6 +1445,9 @@ fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::Cos
     TABLE
         .get_or_init(|| {
             let s = std::env::var("CELESTE_LEVEL_MINUS_ONE").ok()?;
+            // The table's distances are to the room EXIT; a position win
+            // (the summit's flag) is nearer, and pruning by them is unsound.
+            assert!(win_rect().is_none(), "CELESTE_LEVEL_MINUS_ONE: the table measures the room exit; this room's win is a position");
             let (h, sp) = s.split_once(',').expect("CELESTE_LEVEL_MINUS_ONE=\"H,S\"");
             let h: u32 = h.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE horizon");
             let sp: i32 = sp.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE speed bound (px per frame)");
@@ -3719,6 +3764,35 @@ mod tests {
         }
         let (shape, keys, cells) = widened_keys(&exit, level).expect("keys");
         assert!(made.contains(&(shape, keys[0], cells[0])), "the kernels do not make the concrete exit's state ({} successors)", made.len());
+    }
+
+    /// The summit's win is touching the flag (`win_rect`), not a room exit:
+    /// the TAS31 reference (fitted to the original cart's flag touch at frame
+    /// 55) wins at its last frame and at no frame before it.
+    #[test]
+    fn the_summit_reference_wins_at_the_flag() {
+        std::env::set_var("CELESTE_START_ROOM", "6,3");
+        assert_eq!(win_rect(), Some((55, 67, 41, 52)), "the flag at (61, 48)");
+        let text = std::fs::read_to_string("tas/room_6_3_reference_frame_55.txt").expect("the reference");
+        let inputs: Vec<u8> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .flat_map(|l| l.split(',').filter(|t| !t.trim().is_empty()).map(|t| t.trim().parse::<u8>().expect("an input byte")).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(inputs.len(), 55);
+        let mut reference = RefEngine::new().expect("ref engine");
+        let init = reference.initial_state().expect("initial state");
+        let mut st = init.clone();
+        for (i, &b) in inputs.iter().enumerate() {
+            let mut s = st.clone();
+            crate::concrete::set_concrete_buttons(&mut s, b).expect("buttons");
+            let mut out = reference.run_frame_concrete_all(&s).expect("frame");
+            assert_eq!(out.len(), 1, "one concrete successor");
+            st = out.pop().unwrap();
+            crate::concrete::restore_buttons(&init, &mut st).expect("buttons");
+            let won = wins_of(Block::from_state(&st).expect("block").rt2()).expect("wins")[0];
+            assert_eq!(won, i + 1 == 55, "frame {}: won {won}", i + 1);
+        }
     }
 
     /// THE SPLIT FRAME (`CELESTE_SPLIT_FRAME`) at a near level reaches the

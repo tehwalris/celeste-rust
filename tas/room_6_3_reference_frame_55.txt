@@ -1,0 +1,19 @@
+# Room (6,3) "summit" reference for celeste-minimal, derived 2026-10-02.
+#   pico8_diff/replay.py --room 6,3 tas/room_6_3_reference_frame_55.txt
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 6,3, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# The summit has no exit: the finish is touching the flag (the original
+# cart's flag.draw: check(player,0,0), the flag 5 px right of tile 118 at
+# (56,48)), i.e. the player at x 55..67, y 41..52 after a frame's update
+# (frame::win_rect).
+#
+# Derived from ~/src/github.com/CelesteClassic/tasdatabase/classic/any/TAS31.tas
+# (34 inputs, no seeds), replayed on a real PICO-8 in the ORIGINAL cart: the
+# earliest flag touch is at frame 55, at prologue offset 23 (the player at
+# (57,44)). Its per-frame player positions went through `rewrite trajectory`
+# (the WIN at f55), and this replays in celeste-minimal to the same (57,44)
+# at f55.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,18,2,2,0,2,16,38,0,0,0,0,0,0,0,0,0,0,16,0,38,0,0,0,0,0,0,0,0,0,0,0,0
