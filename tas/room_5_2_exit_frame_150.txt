@@ -1,0 +1,18 @@
+# Room (5,2) "2200 m": exit WITH THE ORB at frame 150 for celeste-minimal,
+# found by the search (2026-10-02). No balloons.
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 5,2, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# The orb room: a win is the room exit with max_djump == 2 (2dc116d; the bare
+# exit, skipping the chest, is reachable at frame 68 and is not the level as
+# the game is played). Search: no split frame, ladder r0sxh .. r15sxh, rxsx,
+# level -1 filter (150,5) and the chest deadline (a still-closed chest at
+# frame f is not expanded once f + 71 > 150: the pause, the orb and its
+# freeze take at least 79 frames, 3a.. see plans/room52). h150 confirmed
+# through Exact (150 from rem Bits(4)); h149 refuted at level 4.
+# `OPTIMAL win frame: 150`. Witness 390 concrete steps, 0 dead ends; f149
+# player (89,-2), f150 room (6,2). TIES the community TAS22 (150,
+# tas/room_5_2_reference_frame_150.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,38,0,0,0,0,0,0,0,0,0,0,2,2,34,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,18,0,2,2,36,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,38,0,0,0,0,0,0,36,0,0,0,0,0,0,16,0,0,0,0,16,0,0,0

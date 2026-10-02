@@ -295,6 +295,40 @@ pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
     Ok(exits.iter().zip(&has_orb).map(|(e, o)| *e && *o).collect())
 }
 
+/// The fewest frames from the orb room's big chest opening (the frame the
+/// player stands on it: `state=1`, `timer=60`, `pause_player`) to a win, as a
+/// SOUND LOWER BOUND read off the cart (lua/celeste-minimal.lua `big_chest`,
+/// `orb`, `player.update`, `_update`): the paused player does not update
+/// until the timer runs out and the orb appears (61 frames); the orb is
+/// collectable only once its `spd.y` has come from -4 to 0 in steps of 0.5 (8
+/// more draws); collecting it sets `freeze=10`, ten frames in which nothing
+/// updates; and the win is a room exit after that: at least 79 frames. Taken
+/// as 70, a margin of 9.
+pub const ORB_MIN_FRAMES_AFTER_CHEST: u32 = 70;
+
+/// Per lane, in the orb room: is it a row whose big chest is still CLOSED at
+/// `frame`, too late to open it and still win by `horizon`
+/// (`ORB_MIN_FRAMES_AFTER_CHEST`)? Such a row cannot win - its chest opens
+/// at `frame + 1` at the earliest - so it is not expanded (the same skip as a
+/// won row). `horizon` is the run's ceiling (the level -1 filter's H: level 0
+/// persists across the count-down's horizons). (2026-10-02: room (5,2)'s
+/// level 0 grew x1.06 a frame to f150 with the players who never open the
+/// chest.)
+pub fn orb_deadline_skip(rt2: &Rt2, frame: u32, horizon: u32) -> Vec<bool> {
+    use celeste_engine::runtime2::AV;
+    let lanes = rt2.width;
+    if frame + 1 + ORB_MIN_FRAMES_AFTER_CHEST <= horizon {
+        return vec![false; lanes];
+    }
+    let ids = crate::compiled::ids();
+    let Some(&chest) = rt2.objects_of_type(ids, ids.g_big_chest).first() else {
+        return vec![false; lanes];
+    };
+    let Some(c) = rt2.obj_field_cell(chest, ids.f_state) else { return vec![false; lanes] };
+    let zero = crate::pico8_num::Pico8Num::from_i16(0);
+    (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(zero)).collect()
+}
+
 /// The orb room (room (5,2), `game_runner::ORB_LEVEL`): its big chest holds
 /// the orb that gives every later level the second dash, so leaving the room
 /// WITHOUT it is not the level's exit as the game is played (and as TAS22
@@ -2312,14 +2346,23 @@ impl ForwardState {
             // start room's kernel set does not cover the next room's
             // shapes).
             // In the orb room a row can leave without the orb: not a win,
-            // but past the room all the same - never expanded either.
-            self.frontier = if won || orb_required() {
+            // but past the room all the same - never expanded either; nor a
+            // row whose chest is still closed too late to win
+            // (`orb_deadline_skip`).
+            let orb = orb_required();
+            let ceiling = level_minus_one().map(|(h, _)| h);
+            self.frontier = if won || orb {
                 std::thread::scope(|scope| {
                     let handles: Vec<_> = next
                         .into_iter()
                         .map(|mut b| {
                             scope.spawn(move || -> Result<Block> {
-                                let wins = b.exits()?;
+                                let mut wins = b.exits()?;
+                                if let (true, Some(h)) = (orb, ceiling) {
+                                    for (w, late) in wins.iter_mut().zip(orb_deadline_skip(b.rt2(), frame, h)) {
+                                        *w |= late;
+                                    }
+                                }
                                 b.set_skip(wins);
                                 Ok(b)
                             })

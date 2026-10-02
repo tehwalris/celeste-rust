@@ -181,6 +181,8 @@ pub struct BoundaryIds {
     pub f_last: u32,
     /// The fall floors at a floors-unknown level (`abstraction::FloorsPrecision`).
     pub g_fall_floor: u32,
+    /// The orb room's big chest (`frame::orb_deadline_skip`).
+    pub g_big_chest: u32,
     pub f_state: u32,
     pub f_delay: u32,
     pub f_collideable: u32,
