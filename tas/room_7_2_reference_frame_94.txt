@@ -1,0 +1,15 @@
+# Room (7,2) reference for celeste-minimal, derived 2026-10-02 (rooms past the
+# orb start with max_djump=2, 26a0e54).
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 7,2, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Derived from ~/src/github.com/CelesteClassic/tasdatabase/classic/any/TAS24.tas
+# (70 inputs), replayed on a real PICO-8 in the
+# ORIGINAL cart: the earliest exit is during frame 94, at prologue offset 23.
+# Its per-frame player positions (`-` during the spawn, frame 94 open) went
+# through `rewrite trajectory --room 7,2`, which found the inputs below for
+# OUR game; replayed on a real PICO-8 in celeste-minimal, the
+# room changes to (0,3) during frame 94. So the search's ceiling is 94.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,16,0,0,0,0,0,0,0,2,36,0,0,0,0,0,0,0,16,0,0,0,0,38,0,0,0,0,0,0,0,0,0,16,0,0,0,0,0,0,0,1,33,0,0,0,0,0,0,0,0,37,0,0,0,0,0,0,16,0,0,0,0,16,0
