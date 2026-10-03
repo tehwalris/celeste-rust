@@ -1565,3 +1565,36 @@ table.ladder td.muted {
     padding-right: 2px;
   }
 }
+
+/* The Rem tab (debug pages, rem.ts). */
+.rem-canvas {
+  display: block;
+  width: 100%;
+  height: 300px;
+  margin: 10px 0 4px;
+}
+.rem .chips {
+  margin-top: 8px;
+}
+.rem-scroll {
+  overflow-x: auto;
+  margin: 8px 0;
+}
+.rem-table {
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.rem-table th,
+.rem-table td {
+  padding: 4px 8px;
+  text-align: right;
+  border-bottom: 1px solid var(--line);
+}
+.rem-table th:first-child {
+  text-align: left;
+}
+.rem-table small {
+  color: var(--muted);
+}

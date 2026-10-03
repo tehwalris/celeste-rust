@@ -21,12 +21,14 @@ import { el, clear, button, select, type Select } from "./ui";
 import { spaceView } from "./space";
 import { sizesView } from "./sizes";
 import { timelineView } from "./timeline";
+import { remView } from "./rem";
 
-type Tab = "space" | "sizes" | "time";
+type Tab = "space" | "sizes" | "time" | "rem";
 const TABS: { id: Tab; label: string; hint: string }[] = [
   { id: "space", label: "Space", hint: "the room, frame by frame" },
   { id: "sizes", label: "Sizes", hint: "how big the sets were" },
   { id: "time", label: "Time", hint: "where the time went" },
+  { id: "rem", label: "Rem", hint: "debug: the sub-pixel remainder (room (3,3), any run)" },
 ];
 
 /** A view: its element, and optionally its state for the URL. */
@@ -153,7 +155,8 @@ async function main() {
     const c = current!;
     const have = c.views.get(t);
     if (have) return have;
-    const v: View = t === "space" ? spaceView(c.run, writeHash) : t === "sizes" ? sizesView(c.run, writeHash) : timelineView(c.run, c.chs);
+    const v: View =
+      t === "space" ? spaceView(c.run, writeHash) : t === "sizes" ? sizesView(c.run, writeHash) : t === "rem" ? remView() : timelineView(c.run, c.chs);
     c.views.set(t, v);
     return v;
   };
