@@ -252,6 +252,19 @@ pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
         if let Some((x, y)) = crate::interpreter::abstraction::synthetic_win_xy() {
             return Some((x, x, y, y));
         }
+        // EXPERIMENT (like `CELESTE_WIN_AT_XY`, a different search whose trees
+        // are comparable to no real campaign's): `CELESTE_WIN_RECT="x0,x1,y0,y1"`,
+        // an artificial finish line part-way through a room, to study the
+        // ladder on the room's first half.
+        if let Ok(raw) = std::env::var("CELESTE_WIN_RECT") {
+            let v: Vec<i16> = raw
+                .split(',')
+                .map(|t| t.trim().parse().unwrap_or_else(|e| panic!("CELESTE_WIN_RECT {raw:?}: {e}")))
+                .collect();
+            let [x0, x1, y0, y1] = v[..] else { panic!("CELESTE_WIN_RECT must be \"x0,x1,y0,y1\", got {raw:?}") };
+            eprintln!("[win] EXPERIMENT: the player wins at x {x0}..={x1}, y {y0}..={y1} (CELESTE_WIN_RECT)");
+            return Some((x0, x1, y0, y1));
+        }
         let (rx, ry) = crate::game_runner::start_room();
         if crate::game_runner::level_index(rx, ry) != SUMMIT_LEVEL {
             return None;
@@ -2155,11 +2168,15 @@ impl ForwardState {
         checkpoint_frontier(dir, 0, &mut initial)?;
         crate::search::edges::set_done_frame(&dir.join("edges"), 0)?;
         let door = crate::search::door::Door::for_current_level();
+        // Hulls only into a door that keeps them (a level that buckets the
+        // speed, as `resume` decides): a start state with a player - not a
+        // room's spawn, `rewrite search --start-after` - has a speed.
+        let hulled = crate::interpreter::abstraction::spd_precision().width_log2().is_some();
         for b in &initial {
             let cells = b.positions()?;
             let shape = b.shard_shape();
             let (mut new, mut ids) = (Vec::new(), Vec::new());
-            let hulls = b.rt2().speed_hulls(crate::compiled::ids());
+            let hulls = if hulled { b.rt2().speed_hulls(crate::compiled::ids()) } else { None };
             for (r, ((&cell, &key), &id)) in cells.iter().zip(b.keys()).zip(b.ids()).enumerate() {
                 let h = hulls.as_ref().map(|h| vec![h[r]]);
                 door.admit(shape, cell, &[key], id, &mut ids, &mut new, h.as_deref(), &mut Vec::new());
