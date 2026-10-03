@@ -406,7 +406,7 @@ impl FruitPrecision {
 /// `widen::widen_fall_floors`): nothing about a floor's timing is part of a
 /// row. `Timers` (2026-09-30, room (7,0)) keeps every `state` and
 /// `collideable` exact and stores only the countdowns - each floor's `delay`
-/// and the balloon's respawn `timer` - as their whole ranges
+/// and the balloon's respawn `timer` - as the unknown number
 /// (`widen::widen_floor_timers`): an idle floor never reads its `delay`, so
 /// an untouched floor stays exact, and a broken one may fall or come back on
 /// any frame. `Near` (2026-09-30, room (7,0)) is `Timers` plus each floor's
@@ -440,7 +440,7 @@ impl FloorsPrecision {
         self == FloorsPrecision::Near
     }
 
-    /// Are the countdowns stored as their whole ranges (`Timers`, and `Near`,
+    /// Are the countdowns stored as the unknown number (`Timers`, and `Near`,
     /// which is `Timers` plus the overlap-conditional widening)?
     pub fn widens_timers(self) -> bool {
         matches!(self, FloorsPrecision::Timers | FloorsPrecision::Near)

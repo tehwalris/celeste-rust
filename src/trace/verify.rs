@@ -369,6 +369,10 @@ pub fn trace_frame<'a>(
             super::widen::fork_near_floor_inputs(&mut st, &mut it.d)?;
         }
     }
+    // The countdowns of a timers or near level: the unknown number, as stored
+    // (`widen::widen_floor_timers`). After the near floors' inputs, which
+    // materialize the absent fields.
+    super::widen::forget_countdown_inputs(&mut st, &mut it.d)?;
     // The moving platforms unknown: their input cells, decided per world by
     // the split pass (`widen::platform_inputs`, `Points`).
     it.d.platform_cells.clear();
@@ -1504,7 +1508,7 @@ fn is_bool_op(op: &crate::transpile::graph::Op) -> bool {
     matches!(
         op,
         Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Not | Op::And | Op::Or | Op::Known | Op::ConstBool(_) | Op::UnknownBool(_) | Op::TileFlagAt
-            | Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_)
+            | Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_) | Op::NoWrap
     )
 }
 

@@ -6,8 +6,8 @@ use std::collections::HashMap;
 const ONE_FIXED2: i32 = 0x0002_0000; // +2.0 in 16.16
 
 use celeste_engine::kernel::{
-    zb_and, zb_eq, zb_not, zb_or, zi_abs, zi_add, zi_cmp, zi_eq, zi_flr, zi_fork_flr, zi_max, zi_min,
-    zi_neg, zi_span_ok, zi_sub, zn_abs, zn_add, zn_eq, zn_flr, zn_ge, zn_gt, zn_le, zn_lt, zn_max,
+    zb_and, zb_eq, zb_not, zb_or, zi_abs, zi_add, zi_add_wraps, zi_cmp, zi_eq, zi_flr, zi_fork_flr, zi_max, zi_min,
+    zi_neg, zi_neg_wraps, zi_span_ok, zi_sub, zi_sub_wraps, zn_abs, zn_add, zn_eq, zn_flr, zn_ge, zn_gt, zn_le, zn_lt, zn_max,
     zn_min, zn_mul, zn_neg, zn_sub, zsel_b, zsel_i, zsel_n,
     zn_div, zn_mget, zn_rem, zn_sin, zn_tile_flag_at, Cmp, ZB, ZI,
     ZN, ALL,
@@ -184,6 +184,22 @@ fn eval_nodes(
                 V::B(ZB { val: ok, known: ALL })
             }
             Op::SplitOk(ways) => V::B(zi_span_ok(iv(0), g.fork_bits(), *ways)),
+            // Read off the operation's operands, as the codegen does.
+            Op::NoWrap => {
+                let x = g.get(node.args[0]);
+                let ivx = |k: usize| match vals[x.args[k] as usize] {
+                    V::I(z) => z,
+                    V::N(z) => ZI { lo: z, hi: z },
+                    _ => panic!("node {id}: NoWrap of a boolean"),
+                };
+                let wraps = match (&x.op, vals[node.args[0] as usize]) {
+                    (Op::Add, V::I(_)) => zi_add_wraps(ivx(0), ivx(1)),
+                    (Op::Sub, V::I(_)) => zi_sub_wraps(ivx(0), ivx(1)),
+                    (Op::Neg, V::I(_)) => zi_neg_wraps(ivx(0)),
+                    _ => 0,
+                };
+                V::B(ZB { val: !wraps, known: ALL })
+            }
             Op::Mget => {
                 let (cart, _) = room.expect("Mget needs a room");
                 V::N(zn_mget(cart, n(0), n(1)))
@@ -346,9 +362,15 @@ fn build_interval_graph(cells: &[u32], fork_bits: u8) -> (Graph, Vec<NodeId>) {
         let ivl = g.add(Op::Span, vec![base, hi]); // [base, base+2]
         let shifted = g.add(Op::Add, vec![ivl, band]); // interval + interval
         let neg = g.add(Op::Neg, vec![shifted]);
+        // their no-wrap premises, which hold on these bounded inputs
+        // (`asm_interval_overflow_declines` covers the lanes that wrap)
+        let nw_add = g.add(Op::NoWrap, vec![shifted]);
+        let nw_neg = g.add(Op::NoWrap, vec![neg]);
         let ab = g.add(Op::Abs, vec![neg]);
         let mn = g.add(Op::Min, vec![ab, ivl]);
         let mx = g.add(Op::Max, vec![mn, shifted]);
+        let diff = g.add(Op::Sub, vec![mx, ivl]);
+        let nw_sub = g.add(Op::NoWrap, vec![diff]);
         // floor + its premise
         let fl = g.add(Op::Flr, vec![mx]);
         let flok = g.add(Op::Known, vec![fl]);
@@ -392,6 +414,10 @@ fn build_interval_graph(cells: &[u32], fork_bits: u8) -> (Graph, Vec<NodeId>) {
         roots.push(ifrag0);
         roots.push(ifrag1);
         roots.push(seli);
+        roots.push(diff);
+        roots.push(nw_add);
+        roots.push(nw_sub);
+        roots.push(nw_neg);
     }
     (g, roots)
 }
@@ -745,13 +771,17 @@ fn asm_ival_input_matches_primitives() {
 }
 
 /// Interval `+`, `-` and negation whose endpoints OVERFLOW the 16.16 range
-/// give the whole range in that lane - the hull of PICO-8's wrapped concrete
-/// results - in the assembled kernel and in the primitives alike. The
-/// assembled ops used to wrap each endpoint, which inverted the interval: a
-/// timers level's floor `delay` (the whole range) minus 1 decided `<= 0` as
-/// "no", and a shaking floor never fell (room (3,3), 2026-10-03).
+/// are an ERROR in that lane, never a value: the assembled kernel's
+/// `NoWrap` premise is false exactly where the primitives' wrap guard
+/// (`zi_add_wraps`, `zi_sub_wraps`, `zi_neg_wraps` - the lanes `zi_add`,
+/// `zi_sub`, `zi_neg` panic on) fires, and a body whose result reads such
+/// an operation declines there (`trace::error`). Every other lane is
+/// bit-exact with the primitives. Until 2026-10-03 the assembled ops wrapped
+/// each endpoint silently, which inverted the interval: a timers level's
+/// floor `delay` (the whole range) minus 1 decided `<= 0` as "no", and a
+/// shaking floor never fell (room (3,3)).
 #[test]
-fn asm_interval_overflow_is_the_whole_range() {
+fn asm_interval_overflow_declines() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr};
     let mut g = Graph::new();
     let civ = g.leaf(Op::Cell(0)); // ival
@@ -759,14 +789,15 @@ fn asm_interval_overflow_is_the_whole_range() {
     let add = g.add(Op::Add, vec![civ, cnum]);
     let sub = g.add(Op::Sub, vec![civ, cnum]);
     let neg = g.add(Op::Neg, vec![civ]);
-    let roots = vec![add, sub, neg];
+    let ok: Vec<NodeId> = [add, sub, neg].iter().map(|&x| g.add(Op::NoWrap, vec![x])).collect();
+    let roots = vec![add, sub, neg, ok[0], ok[1], ok[2]];
     let mut reprs = HashMap::new();
     reprs.insert(0u32, CellRepr::Ival);
     let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "ivalovf", &reprs).expect("compile+load");
     let one = 0x1_0000;
-    // Per lane (lo, hi, num): the whole range minus/plus one, a top end
+    // Per lane (lo, hi, num): the whole range plus/minus one, a top end
     // that overflows on +1, a bottom end on -1, MIN negated, and lanes that
-    // do not overflow.
+    // come right up to the ends without overflowing.
     let lanes: [(i32, i32, i32); 16] = [
         (i32::MIN, i32::MAX, one),
         (i32::MIN, i32::MAX, -one),
@@ -797,28 +828,36 @@ fn asm_interval_overflow_is_the_whole_range() {
         hi: ZN::from_array(std::array::from_fn(|i| P8::from_raw(lanes[i].1))),
     };
     let znum = ZN::from_array(std::array::from_fn(|i| P8::from_raw(lanes[i].2)));
-    let expect = [zi_add(ziv, ZI { lo: znum, hi: znum }), zi_sub(ziv, ZI { lo: znum, hi: znum }), zi_neg(ziv)];
+    let zb = ZI { lo: znum, hi: znum };
+    let wraps = [zi_add_wraps(ziv, zb), zi_sub_wraps(ziv, zb), zi_neg_wraps(ziv)];
+    // What the test is about: exactly these lanes overflow.
+    assert_eq!(wraps[0], 0x0c07, "add: the whole range +- 1, a top end past MAX, MAX + eps, MIN - eps");
+    assert_eq!(wraps[1], 0x000b, "sub: the whole range -+ 1, a bottom end past MIN");
+    assert_eq!(wraps[2], 0x081b, "neg: every lane with an endpoint at MIN");
+    let word = |o: usize| u16::from_le_bytes([out[o], out[o + 1]]);
     let plane = |ri: usize, off: usize| -> [i32; 16] {
         let o = compiled.root_offsets[ri] as usize + off;
         std::array::from_fn(|l| i32::from_le_bytes(out[o + l * 4..o + l * 4 + 4].try_into().unwrap()))
     };
-    for (ri, (e, name)) in expect.iter().zip(["add", "sub", "neg"]).enumerate() {
-        let (lo, hi) = (plane(ri, 0), plane(ri, 64));
-        for l in 0..16 {
-            let want = (e.lo.to_array()[l].as_raw_u32() as i32, e.hi.to_array()[l].as_raw_u32() as i32);
+    for (k, name) in ["add", "sub", "neg"].into_iter().enumerate() {
+        let o = compiled.root_offsets[3 + k] as usize;
+        assert_eq!(word(o + 2), 0xffff, "{name}: the premise is decided on every lane");
+        assert_eq!(word(o), !wraps[k], "{name}: NoWrap false exactly where the primitives' guard fires");
+        // The other lanes are bit-exact with the primitives, run on those
+        // lanes alone (they panic on the rest).
+        let (lo, hi) = (plane(k, 0), plane(k, 64));
+        for l in (0..16).filter(|l| wraps[k] >> l & 1 == 0) {
+            let pick = |z: ZN| ZN::from_array([z.to_array()[l]; 16]);
+            let (a, b) = (ZI { lo: pick(ziv.lo), hi: pick(ziv.hi) }, ZI { lo: pick(znum), hi: pick(znum) });
+            let e = match k {
+                0 => zi_add(a, b),
+                1 => zi_sub(a, b),
+                _ => zi_neg(a),
+            };
+            let want = (e.lo.to_array()[0].as_raw_u32() as i32, e.hi.to_array()[0].as_raw_u32() as i32);
             assert_eq!((lo[l], hi[l]), want, "{name} lane {l} {:?}: assembled vs primitive", lanes[l]);
-            assert!(lo[l] <= hi[l], "{name} lane {l}: an inverted interval");
         }
     }
-    let whole = (i32::MIN, i32::MAX);
-    let lane = |ri: usize, l: usize| (plane(ri, 0)[l], plane(ri, 64)[l]);
-    assert_eq!(lane(1, 0), whole, "the whole range minus 1 is the whole range");
-    assert_eq!(lane(0, 0), whole, "the whole range plus 1");
-    assert_eq!(lane(0, 2), whole, "a top end past MAX");
-    assert_eq!(lane(1, 3), whole, "a bottom end past MIN");
-    assert_eq!(lane(2, 4), whole, "-[MIN, 0]");
-    assert_eq!(lane(1, 5), (-2 * one, 0), "no overflow: exact");
-    assert_eq!(lane(1, 7), (i32::MIN, i32::MAX - 2 * one), "the bottom end lands on MIN exactly");
 }
 
 // ---------------------------------------------------------------------------

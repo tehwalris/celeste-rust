@@ -235,6 +235,18 @@ pub enum Op {
     /// fork shares the one node. It exists so the validity chain
     /// accounts for every lane `zi_fork_flr` gives up on.
     SplitOk(u8),
+    /// `NoWrap(x)`, `x` an interval `+`, `-` or negation: did no endpoint of
+    /// `x` OVERFLOW the 16.16 range on this lane? The kernel computes each
+    /// endpoint in wrapping i32 arithmetic, so where one overflowed the
+    /// lane's interval is not the result (its ends wrapped apart, or the
+    /// interval inverted) - and that is the operation's OWN ERROR
+    /// (`trace::error`): the lane declines, loudly, rather than carry an
+    /// interval that says something false. (Until 2026-10-03 the kernels
+    /// wrapped silently: a timers level's countdown, the whole range,
+    /// minus 1 decided `<= 0` as "no" and a shaking floor never fell.) Of
+    /// anything else - an exact operation, which wraps as PICO-8 does, or a
+    /// node a rewrite made of `x` - it is true.
+    NoWrap,
     /// An interval's endpoints as plain numbers (`Lo(v)` = its low end,
     /// `Hi(v)` its high end; of a number, the number). What lets a fork
     /// at a TABLE of cuts be ordinary arithmetic after specialization.
@@ -679,6 +691,12 @@ impl Graph {
                 let v = (lo as i64).max(base).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                 return self.leaf(Op::Const(v, v));
             }
+            // The no-wrap premise of anything but an interval `+`, `-` or
+            // negation holds (`eval`'s definition): a rebuild that folded
+            // the operation to a constant evaluated it without a wrap.
+            Op::NoWrap if !matches!(self.nodes[args[0] as usize].op, Op::Add | Op::Sub | Op::Neg) => {
+                return self.leaf(Op::ConstBool(true));
+            }
             // Arithmetic on literal POINTS is a constant, in PICO-8's
             // arithmetic (the concrete domain's). The tracer folds these
             // before they reach the graph; a rebuild that substitutes the
@@ -1071,6 +1089,22 @@ impl Graph {
                         bail!("node {}: SplitOk of an interval that may not fit", i)
                     }
                 }
+                // The no-wrap premise: the operation's operands, in i64.
+                // Under `lenient` they are hulls over the lanes - no wrap on
+                // the hull, none on any lane; a wrap on the hull, a lane may
+                // still fit: unknown. On one lane's interval, decided.
+                Op::NoWrap => {
+                    let x = &self.nodes[node.args[0] as usize];
+                    let fits = match x.op {
+                        Op::Add | Op::Sub => {
+                            let (p, q) = (out[x.args[0] as usize].as_num("NoWrap")?, out[x.args[1] as usize].as_num("NoWrap")?);
+                            if matches!(x.op, Op::Add) { p.checked_add(q) } else { p.checked_sub(q) }.is_some()
+                        }
+                        Op::Neg => out[x.args[0] as usize].as_num("NoWrap")?.checked_neg().is_some(),
+                        _ => true,
+                    };
+                    Val::Bool(if fits || !lenient { Some(fits) } else { None })
+                }
                 // The RESOLVED fork: `zi_fork_flr`, on one interval
                 // instead of sixteen lanes. Exact, and it is the
                 // definition `fold`'s `FragOk(0)` rule is checked
@@ -1290,6 +1324,7 @@ impl Graph {
             | Op::SplitValidTab(_)
             | Op::SplitOkTab(_)
             | Op::SplitOk(_)
+            | Op::NoWrap
             | Op::FragOk(_)
             | Op::Lt
             | Op::Le

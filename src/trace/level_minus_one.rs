@@ -576,7 +576,7 @@ impl<'a> Table<'a> {
                     let (lo, hi) = lit_cells[&c];
                     cone.leaf(Op::Const(lo, hi))
                 }
-                Op::Known | Op::SplitOk(_) => cone.leaf(Op::ConstBool(true)),
+                Op::Known | Op::SplitOk(_) | Op::NoWrap => cone.leaf(Op::ConstBool(true)),
                 Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_) => bail!("shape {id}: a table fork"),
                 _ => {
                     if let Op::Split(k) | Op::SplitInt(k) = nd.op {

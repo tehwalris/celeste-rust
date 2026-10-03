@@ -187,7 +187,12 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
             crate::transpile::graph::Op::Cell(c) => {
                 reads.insert(c);
             }
-            crate::transpile::graph::Op::UnknownNum => anyhow::bail!("an unknown number reaches the kernel: node {n} is read by a root"),
+            crate::transpile::graph::Op::UnknownNum => {
+                // Name the roots that read it: the field, the guard or the error.
+                let reaches = |r: NodeId| crate::trace::verify::cone(&graph, &[r]).contains(&n);
+                let which: Vec<String> = roots.iter().enumerate().filter(|(_, r)| reaches(**r)).map(|(i, r)| format!("#{i} {}", show_tree(&graph, *r, 4))).collect();
+                anyhow::bail!("an unknown number reaches the kernel: node {n} is read by root(s)\n{}\nwhere the roots are\n{}", which.join("\n"), root_legend(f))
+            }
             _ => {}
         }
         stack.extend(graph.get(n).args.iter().copied());

@@ -500,8 +500,9 @@ pub struct Symbolic {
     pub floors_unknown: bool,
     /// Only the fall floors' TIMERS widened (`abstraction::FloorsPrecision::
     /// Timers`): every outcome stores each floor's `delay` and the balloon's
-    /// `timer` as their whole ranges (`widen::widen_floor_timers`), which the
-    /// next frame reads as interval inputs. Set by the walk.
+    /// `timer` as the unknown number (`widen::widen_floor_timers`), which the
+    /// next frame reads as unknown (`widen::forget_countdown_inputs`). Set by
+    /// the walk.
     pub floor_timers: bool,
     /// The fall floors widened but where the player overlaps one
     /// (`abstraction::FloorsPrecision::Near`, with `floor_timers`):
@@ -678,7 +679,7 @@ impl Symbolic {
                 Op::Known => false,
                 // The validity and coverage masks are per-lane comparisons the
                 // kernel evaluates, not conditions a lane straddles.
-                Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_) => false,
+                Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_) | Op::NoWrap => false,
                 Op::ConstBool(_) => false,
                 // Not boolean-valued, so not a condition.
                 _ => false,
@@ -714,7 +715,7 @@ impl Symbolic {
                 Op::UnknownNum | Op::UnknownBool(_) => true,
                 Op::Split(_) | Op::SplitTab(_) | Op::SplitKeyTab(_) | Op::Frag(_) => true,
                 Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi => false,
-                Op::ConstBool(_) | Op::Known => false,
+                Op::ConstBool(_) | Op::Known | Op::NoWrap => false,
                 // THE CONDITION DOES NOT MAKE THE RESULT A SET. `Sel(c, 5, 7)`
                 // is one of two exact numbers whatever `c` is; that a lane may
                 // take either arm is a BRANCHING question, answered by forking
@@ -788,7 +789,7 @@ impl Symbolic {
                 // The ends of an interval are exact numbers.
                 Op::Lo | Op::Hi => false,
                 // A premise is a mask query: every lane decides it.
-                Op::Known => false,
+                Op::Known | Op::NoWrap => false,
                 // PARTIAL: a singleton only on pain of error. See above.
                 Op::Flr => any(memo, &args),
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min | Op::Max | Op::Sin => any(memo, &args),
@@ -817,6 +818,28 @@ impl Symbolic {
 
     fn is_unknown_num(&self, n: NodeId) -> bool {
         matches!(self.graph.get(n).op, Op::UnknownNum)
+    }
+
+    /// `n` as `Sel(c, t, f)` where an arm HOLDS the unknown number - is it, or
+    /// is such a select (a countdown a branch set on some lanes and left
+    /// unknown on the others: `if delay <= 0 then delay = 60 end`). An
+    /// operation on one is distributed over its arms (`arith`, `fun1`, `fun2`,
+    /// `compare`), so the unknown stays unknown per arm and never becomes an
+    /// operand of graph arithmetic - which no kernel can compute
+    /// (`Op::UnknownNum`). EXACT: `op(Sel(c, t, f))` and `Sel(c, op(t),
+    /// op(f))` agree for every value of `c`, and where a lane holds `c`
+    /// undecided both selects own the same error (`trace::error`).
+    fn unknown_select(&self, n: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
+        fn holds(g: &Graph, n: NodeId) -> bool {
+            let node = g.get(n);
+            match node.op {
+                Op::UnknownNum => true,
+                Op::Sel => holds(g, node.args[1]) || holds(g, node.args[2]),
+                _ => false,
+            }
+        }
+        let node = self.graph.get(n);
+        (node.op == Op::Sel && holds(&self.graph, n)).then(|| (node.args[0], node.args[1], node.args[2]))
     }
 
     /// A fresh undecided atom (`Op::UnknownBool`), distinct from every other
@@ -1226,6 +1249,14 @@ impl Domain for Symbolic {
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
             return Ok(self.unknown_num());
         }
+        if let Some((c, t, f)) = self.unknown_select(*a) {
+            let (x, y) = (self.arith(op, &t, b)?, self.arith(op, &f, b)?);
+            return Ok(self.sel_num(&c, &x, &y));
+        }
+        if let Some((c, t, f)) = self.unknown_select(*b) {
+            let (x, y) = (self.arith(op, a, &t)?, self.arith(op, a, &f)?);
+            return Ok(self.sel_num(&c, &x, &y));
+        }
         if let Arith::Sub = op {
             if let Some(n) = self.cancel_sub(*a, *b)? {
                 return Ok(n);
@@ -1256,6 +1287,10 @@ impl Domain for Symbolic {
                 _ => self.unknown_num(),
             });
         }
+        if let Some((c, t, e)) = self.unknown_select(*a) {
+            let (x, y) = (self.fun1(f, &t)?, self.fun1(f, &e)?);
+            return Ok(self.sel_num(&c, &x, &y));
+        }
         // `sin` of an interval is its full range [-1, 1], matching the
         // interpreter's `builtin_sin` (game_runner.rs) exactly. Emit the
         // constant range so the emitter never has to lower a `Sin` over a
@@ -1285,6 +1320,14 @@ impl Domain for Symbolic {
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
             return Ok(self.unknown_num());
         }
+        if let Some((c, t, e)) = self.unknown_select(*a) {
+            let (x, y) = (self.fun2(f, &t, b)?, self.fun2(f, &e, b)?);
+            return Ok(self.sel_num(&c, &x, &y));
+        }
+        if let Some((c, t, e)) = self.unknown_select(*b) {
+            let (x, y) = (self.fun2(f, a, &t)?, self.fun2(f, a, &e)?);
+            return Ok(self.sel_num(&c, &x, &y));
+        }
         let g = match f {
             Fun2::Min => Op::Min,
             Fun2::Max => Op::Max,
@@ -1303,6 +1346,14 @@ impl Domain for Symbolic {
         // With an unknown number nothing is decided.
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
             return Ok(self.unknown_bool_atom());
+        }
+        if let Some((c, t, f)) = self.unknown_select(*a) {
+            let (x, y) = (self.compare(op, &t, b)?, self.compare(op, &f, b)?);
+            return Ok(self.sel_bool(&c, &x, &y));
+        }
+        if let Some((c, t, f)) = self.unknown_select(*b) {
+            let (x, y) = (self.compare(op, a, &t)?, self.compare(op, a, &f)?);
+            return Ok(self.sel_bool(&c, &x, &y));
         }
         // Two literals: decided by their intervals, or an undecided atom of
         // its own (the same in every lane, and never one atom with another).
@@ -1633,6 +1684,18 @@ impl Domain for Symbolic {
     }
 
     fn escaped_atom(&mut self, b: &NodeId, since: u32, origin: &dyn Fn(&Self) -> String) -> Option<NodeId> {
+        // Only where the set has unknowns (`unknowns`: the floors, the fruit,
+        // the platforms unknown). A timers or near level's atoms are its
+        // countdowns' `delay <= 0` (`widen::widen_floor_timers`): there a
+        // boolean holding one stays three-valued, decided per lane where it
+        // is read - as the interval countdown's comparison was before
+        // 2026-10-03 - and is not a fork. Forked, every shaking floor's
+        // `collideable` was a configuration dimension whether anything read
+        // it or not: room (1,1) `r0sxhn` 10 forks a kernel became 14, the
+        // bodies 12k -> 29k, 1.7x the forward's time, for the same states.
+        if !self.unknowns() {
+            return None;
+        }
         if let Some(f) = self.escaped.get(b) {
             return Some(*f);
         }
@@ -1855,6 +1918,27 @@ mod tests {
     /// `abstractness` and `lane_undecidable` answer DIFFERENT questions, and
     /// conflating them cost a day. A value can denote a set and still be one
     /// computed quantity per lane.
+    /// A countdown set on some lanes and unknown on the others (`if delay <= 0
+    /// then delay = 60 end`): `delay - 1` and `delay - 1 <= 0` are distributed
+    /// over the select, so the unknown number never becomes an operand of
+    /// graph arithmetic (which no kernel computes) and the set lanes stay
+    /// exact.
+    #[test]
+    fn an_operation_on_a_select_of_the_unknown_number_is_distributed() {
+        let mut d = Symbolic::default();
+        let c = d.graph.leaf(Op::Cell(0));
+        let (sixty, one, zero) = (d.num(p(60)), d.num(p(1)), d.num(p(0)));
+        let u = d.unknown_num();
+        let delay = d.sel_num(&c, &sixty, &u);
+        let less = d.arith(Arith::Sub, &delay, &one).unwrap();
+        let fifty_nine = d.num(p(59));
+        assert_eq!(less, d.sel_num(&c, &fifty_nine, &u));
+        let done = d.compare(Cmp::Le, &less, &zero).unwrap();
+        let node = d.graph.get(done).clone();
+        assert!(crate::trace::verify::cone(&d.graph, &[done]).iter().all(|n| d.graph.get(*n).op != Op::UnknownNum), "{node:?}");
+        assert!(crate::trace::verify::cone(&d.graph, &[done]).iter().any(|n| matches!(d.graph.get(*n).op, Op::UnknownBool(_))), "the unknown lanes: an atom");
+    }
+
     #[test]
     fn abstractness_is_not_the_fork_trigger() {
         let mut d = Symbolic::default();
