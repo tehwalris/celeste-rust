@@ -235,16 +235,6 @@ pub struct BoundaryIds {
 /// filter misses.
 pub const BALLOON_PERIOD_RAW: i32 = 0xffff;
 
-/// A countdown at a timers level (`abstraction::FloorsPrecision::Timers`): a
-/// fall floor's `delay`, the balloon's respawn `timer`. The cart only ever
-/// compares them with 0 (`delay <= 0`, `timer > 0`) and decrements them, so
-/// the whole 16.16 range is as precise as any tighter one - and, unlike a
-/// tighter one, closed under the decrement (a split does not narrow the stored
-/// interval, so `[-1024, 60] - 1` would leave `[-1024, 60]`). Raw 16.16.
-/// ONE definition, shared with the tracer (`widen::widen_floor_timers`), or
-/// the mark filter misses.
-pub const FLOOR_TIMER_RANGE: (i32, i32) = (i32::MIN, i32::MAX);
-
 /// Which fall-floor widening a level applies (`abstraction::FloorsPrecision`,
 /// which lives above this crate): what `Rt2::widen_to` projects a row onto.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -252,7 +242,8 @@ pub enum FloorsWidening {
     Exact,
     /// Every floor unknown, and the spring's phase.
     Unknown,
-    /// Only the countdowns, their whole ranges (`FLOOR_TIMER_RANGE`).
+    /// Only the countdowns - each fall floor's `delay`, the balloon's respawn
+    /// `timer` - the unknown number (`AV::UNum`).
     Timers,
     /// The countdowns as `Timers`, the spring's phase as `Unknown`, and every
     /// floor's `state` and `collideable` widened (`FLOOR_STATE_RANGE`,
@@ -1299,7 +1290,7 @@ impl Rt2 {
             let phases = self
                 .objects_of_type(ids, ids.g_spring)
                 .into_iter()
-                .flat_map(|o| [(o, "spr", ids.f_spr, SPRING_SPR_RANGE), (o, "delay", ids.f_delay, FLOOR_TIMER_RANGE), (o, "hide_in", ids.f_hide_in, FLOOR_TIMER_RANGE), (o, "hide_for", ids.f_hide_for, FLOOR_TIMER_RANGE)])
+                .flat_map(|o| [(o, "spr", ids.f_spr, Some(SPRING_SPR_RANGE)), (o, "delay", ids.f_delay, None), (o, "hide_in", ids.f_hide_in, None), (o, "hide_for", ids.f_hide_for, None)])
                 .chain(self.objects_of_type(ids, ids.g_balloon).into_iter().flat_map(|o| {
                     // Its `y` (`widen::phase_paths`): the bob band around its
                     // constant `start`.
@@ -1309,7 +1300,7 @@ impl Rt2 {
                     let col = &self.cols[sc as usize];
                     let start = col.uniform_num(self.width).unwrap_or_else(|| panic!("phase widening: the balloon's `start` is not one number: {:?}", col));
                     let start = start.to_bits() as i32;
-                    [(o, "spr", ids.f_spr, BALLOON_SPR_RANGE), (o, "y", ids.f_y, (start - BALLOON_BOB_RAW, start + BALLOON_BOB_RAW))]
+                    [(o, "spr", ids.f_spr, Some(BALLOON_SPR_RANGE)), (o, "y", ids.f_y, Some((start - BALLOON_BOB_RAW, start + BALLOON_BOB_RAW)))]
                 }))
                 .collect::<Vec<_>>();
             {
@@ -1318,8 +1309,10 @@ impl Rt2 {
                         assert!(f == ids.f_delay, "phase widening: no `{name}` field");
                         continue;
                     };
-                    if near {
-                        let (lo, hi) = range;
+                    // A near level's phases are their ranges, but the
+                    // spring's countdowns (`None`) the unknown number, as the
+                    // floors' (8a).
+                    if let (true, Some((lo, hi))) = (near, range) {
                         let (lo, hi) = (P8::from_raw(lo), P8::from_raw(hi));
                         check(self, c, name, &|v| match v {
                             AV::Num(n) => lo <= n && n <= hi,
@@ -1337,20 +1330,15 @@ impl Rt2 {
 
         // 8a. Only the floors' timers (`abstraction::FloorsPrecision::Timers`),
         // as that level's kernels write them (`widen::widen_floor_timers`):
-        // every fall floor's `delay` and the balloon's `timer` the whole
-        // range (`FLOOR_TIMER_RANGE`), `state` and `collideable` exact. A floor with no `delay` (the
+        // every fall floor's `delay` and the balloon's `timer` the unknown
+        // number, `state` and `collideable` exact. A floor with no `delay` (the
         // post-`_init` block, keyed exact) has nothing there to widen.
         if matches!(floors, FloorsWidening::Timers | FloorsWidening::Near) {
-            let (lo, hi) = (P8::from_raw(FLOOR_TIMER_RANGE.0), P8::from_raw(FLOOR_TIMER_RANGE.1));
             for (ty, f, name) in [(ids.g_fall_floor, ids.f_delay, "delay"), (ids.g_balloon, ids.f_timer, "timer")] {
                 for obj in self.objects_of_type(ids, ty) {
                     let Some(c) = self.obj_field_cell(obj, f) else { continue };
-                    check(self, c, name, &|v| match v {
-                        AV::Num(n) => lo <= n && n <= hi,
-                        AV::Ival(a, b) => lo <= a && b <= hi,
-                        _ => false,
-                    });
-                    self.cols[c as usize] = Col::U(AV::Ival(lo, hi));
+                    check(self, c, name, &|v| matches!(v, AV::Num(_) | AV::Ival(..) | AV::UNum));
+                    self.cols[c as usize] = Col::U(AV::UNum);
                 }
             }
         }

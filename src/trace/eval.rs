@@ -158,6 +158,9 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
             // Every leaf was substituted with a value, so everything
             // reachable IS determined - which is what `Known` asks.
             Op::Known => Conc::Bool(true),
+            // Concrete arithmetic wraps as PICO-8 does: one number, never an
+            // interval whose ends wrapped apart.
+            Op::NoWrap => Conc::Bool(true),
             Op::Mget => {
                 let cart = env.cart.clone().ok_or_else(|| anyhow!("mget: no cart"))?;
                 let t = cart.mget(num(a(0)?)?, num(a(1)?)?)?;

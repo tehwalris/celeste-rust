@@ -226,7 +226,7 @@ fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut S
     Ok(())
 }
 
-use celeste_engine::runtime2::{floor_player_window, BALLOON_PERIOD_RAW, FLOOR_HITBOX, FLOOR_STATE_RANGE, FLOOR_TIMER_RANGE, SPRING_SPR_RANGE, BALLOON_SPR_RANGE, BALLOON_BOB_RAW, PLATFORM_PATH, PLATFORM_REM, PLAYER_HITBOX};
+use celeste_engine::runtime2::{floor_player_window, BALLOON_PERIOD_RAW, FLOOR_HITBOX, FLOOR_STATE_RANGE, SPRING_SPR_RANGE, BALLOON_SPR_RANGE, BALLOON_BOB_RAW, PLATFORM_PATH, PLATFORM_REM, PLAYER_HITBOX};
 
 /// Held buttons unknown (plans/held-buttons.md): the player's trails leave the
 /// frame unknown - the canonical output unknown (`Symbolic::unknown_bool_output`),
@@ -310,12 +310,15 @@ pub fn fall_floor_paths<D: Domain>(st: &State<D>) -> FallFloorPaths {
 /// stored `y = start` (the other arm) had two successors, `start` and the
 /// bob band, and every state existed twice. Its range is the band itself,
 /// `start +- BALLOON_BOB_RAW` (`PhaseRange::AroundStart`).
+///
+/// The spring's three COUNTDOWNS are the unknown number at a near level too
+/// (`PhaseRange::Countdown`), as the floors' are (`widen_floor_timers`).
 pub fn phase_paths<D: Domain>(st: &State<D>) -> Vec<(Path, PhaseRange)> {
     let mut out = Vec::new();
     for obj in objects_of_type(st, "spring") {
         out.push((field(&obj, &["spr"]), PhaseRange::Fixed(SPRING_SPR_RANGE)));
         for f in ["delay", "hide_in", "hide_for"] {
-            out.push((field(&obj, &[f]), PhaseRange::Fixed(FLOOR_TIMER_RANGE)));
+            out.push((field(&obj, &[f]), PhaseRange::Countdown));
         }
     }
     for obj in objects_of_type(st, "balloon") {
@@ -325,11 +328,13 @@ pub fn phase_paths<D: Domain>(st: &State<D>) -> Vec<(Path, PhaseRange)> {
     out
 }
 
-/// Where a near level stores a phase (`phase_paths`): a fixed range, or the
-/// object's constant `start` plus or minus a radius (raw 16.16).
+/// Where a near level stores a phase (`phase_paths`): a fixed range, the
+/// object's constant `start` plus or minus a radius (raw 16.16), or - a
+/// countdown - the unknown number.
 pub enum PhaseRange {
     Fixed((i32, i32)),
     AroundStart(Path, i32),
+    Countdown,
 }
 
 /// The countdowns a timers level widens (`abstraction::FloorsPrecision::Timers`):
@@ -349,24 +354,63 @@ pub fn floor_timer_paths<D: Domain>(st: &State<D>) -> Vec<Path> {
 }
 
 /// The OUTPUT side of a timers level (2026-09-30, room (7,0)): each countdown
-/// stored as the whole range (`FLOOR_TIMER_RANGE`: the cart only compares
-/// them with 0, so no tighter range would be more precise). A floor's `state` and `collideable` stay exact, so
-/// an idle floor - which never reads its `delay` (a break sets it) - is
-/// unchanged, and a broken one keeps its phase and only forgets how far into
-/// it it is: next frame its `delay <= 0` is undecided and the interval split
-/// (`Domain::split_compare`) forks it into "still counting" and "done", each
-/// with an exact `state`. Every value is in the range, so there is no
-/// premise. Room (7,0)
-/// level 0 at f54: erasing the delays merged 3.1x, all floor fields 4.6x.
+/// stored as THE UNKNOWN NUMBER (`Symbolic::unknown_num`, stored `AV::UNum`,
+/// `emit::bind`) - the cart only decrements them and compares them with 0, so
+/// no range would be more precise. A floor's `state` and `collideable` stay
+/// exact, so an idle floor - which never reads its `delay` (a break sets it)
+/// - is unchanged, and a broken one keeps its phase and only forgets how far
+/// into it it is: next frame its `delay <= 0` is an undecided atom, "still
+/// counting" or "done". The unknown contains whatever the frame computed, so
+/// there is no premise. Room (7,0) level 0 at f54: erasing the delays merged
+/// 3.1x, all floor fields 4.6x.
+///
+/// NOT the interval [MIN, MAX] (what it was until 2026-10-03): the cart's
+/// `delay - 1` of the whole range overflows, the assembled kernels wrapped the
+/// low end to +32767.99, and `delay <= 0` decided "no" - a shaking floor
+/// never fell. Interval arithmetic that overflows is now a lane's error
+/// (`Op::NoWrap`), so a countdown of the whole range would decline every
+/// lane; the unknown number stays unknown under every operation instead.
 fn widen_floor_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     if !d.floor_timers {
         return Ok(());
     }
-    let (lo, hi) = FLOOR_TIMER_RANGE;
     for p in floor_timer_paths(st) {
         let Some(Value::Num(_)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
-        let r = d.graph.leaf(Op::Const(lo, hi));
-        iface::set(st, &p, Value::Num(r))?;
+        let u = d.unknown_num();
+        iface::set(st, &p, Value::Num(u))?;
+    }
+    Ok(())
+}
+
+/// The countdowns a level stores as the unknown number
+/// (`widen_floor_timers`, and a near level's `PhaseRange::Countdown` phases):
+/// what the next frame reads them as.
+pub fn countdown_paths(st: &State<Symbolic>, d: &Symbolic) -> Vec<Path> {
+    let mut out = Vec::new();
+    if d.floor_timers {
+        out.extend(floor_timer_paths(st));
+    }
+    if d.floors_near {
+        out.extend(phase_paths(st).into_iter().filter(|(_, r)| matches!(r, PhaseRange::Countdown)).map(|(p, _)| p));
+    }
+    out
+}
+
+/// The INPUT side of the countdowns (`countdown_paths`): the unknown number
+/// in place of whatever the slot holds, before anything reads it - as a
+/// floors-unknown level replaces its floors (`fork_floor_inputs`). A slot
+/// the state does not have (a spring that never bounced: no `delay`) stays
+/// absent.
+pub fn forget_countdown_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    for p in countdown_paths(st, d) {
+        match iface::get(st, &p) {
+            None => {}
+            Some(Value::Num(_)) => {
+                let u = d.unknown_num();
+                iface::set(st, &p, Value::Num(u))?;
+            }
+            Some(_) => bail!("{}: not a number", iface::show(&p)),
+        }
     }
     Ok(())
 }
@@ -398,13 +442,21 @@ pub fn near_floor_paths(st: &State<Symbolic>) -> NearFloorPaths {
     out
 }
 
-/// The objects' phases at a near level (`phase_paths`), as INTERVALS - the
-/// level has no unknown numbers, so `spr == 18` splits like a floor's `state
-/// == k`. The output side; the next frame reads the stored intervals as
-/// interval inputs.
+/// The objects' phases at a near level (`phase_paths`), as INTERVALS, so
+/// `spr == 18` splits like a floor's `state == k` - but the countdowns, which
+/// the cart only decrements and compares with 0, as the unknown number
+/// (`PhaseRange::Countdown`, `widen_floor_timers`). The output side; the next
+/// frame reads the stored intervals as interval inputs and the countdowns as
+/// unknown (`forget_countdown_inputs`).
 fn widen_near_phases(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
     for (p, range) in phase_paths(st) {
         let (lo, hi) = match range {
+            PhaseRange::Countdown => {
+                let Some(Value::Num(_)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
+                let u = d.unknown_num();
+                iface::set(st, &p, Value::Num(u))?;
+                continue;
+            }
             PhaseRange::Fixed(r) => r,
             PhaseRange::AroundStart(sp, radius) => {
                 let Some(Value::Num(s)) = iface::get(st, &sp) else { bail!("{}: not a number", iface::show(&sp)) };

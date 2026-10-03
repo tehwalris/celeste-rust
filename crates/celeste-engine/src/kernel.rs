@@ -271,31 +271,51 @@ fn zi_scalar(a: ZI, b: ZI, f: impl Fn(IV, IV) -> IV) -> ZI {
     ZI { lo: ZN::from_array(lo), hi: ZN::from_array(hi) }
 }
 
+/// The lanes where an interval `+` OVERFLOWS an endpoint: the assembled
+/// kernel's own error for it (`Op::NoWrap`), and the guard `zi_add`
+/// panics on.
 #[inline(always)]
-pub fn zi_add(a: ZI, b: ZI) -> ZI {
+pub fn zi_add_wraps(a: ZI, b: ZI) -> u16 {
     unsafe {
         let lo = _mm512_add_epi32(a.lo.0, b.lo.0);
         let hi = _mm512_add_epi32(a.hi.0, b.hi.0);
-        if add_overflows(a.lo.0, b.lo.0, lo) | add_overflows(a.hi.0, b.hi.0, hi) != 0 {
-            // A wrapped endpoint: that lane is the whole range (the concrete
-            // results straddle PICO-8's wrap), as the assembled kernel does.
-            return zi_scalar(a, b, |x, y| x.checked_add(y).unwrap_or_else(IV::full));
-        }
-        ZI { lo: ZN(lo), hi: ZN(hi) }
+        add_overflows(a.lo.0, b.lo.0, lo) | add_overflows(a.hi.0, b.hi.0, hi)
     }
+}
+/// `zi_add_wraps` for `-` (`[a.lo - b.hi, a.hi - b.lo]`).
+#[inline(always)]
+pub fn zi_sub_wraps(a: ZI, b: ZI) -> u16 {
+    unsafe {
+        let lo = _mm512_sub_epi32(a.lo.0, b.hi.0);
+        let hi = _mm512_sub_epi32(a.hi.0, b.lo.0);
+        sub_overflows(a.lo.0, b.hi.0, lo) | sub_overflows(a.hi.0, b.lo.0, hi)
+    }
+}
+/// `zi_add_wraps` for negation: an endpoint at `MIN`.
+#[inline(always)]
+pub fn zi_neg_wraps(a: ZI) -> u16 {
+    unsafe {
+        let min = _mm512_set1_epi32(i32::MIN);
+        _mm512_cmpeq_epi32_mask(a.lo.0, min) | _mm512_cmpeq_epi32_mask(a.hi.0, min)
+    }
+}
+
+#[inline(always)]
+pub fn zi_add(a: ZI, b: ZI) -> ZI {
+    if zi_add_wraps(a, b) != 0 {
+        // The scalar `+` panics on the wrap: never silently.
+        return zi_scalar(a, b, |x, y| x + y);
+    }
+    unsafe { ZI { lo: ZN(_mm512_add_epi32(a.lo.0, b.lo.0)), hi: ZN(_mm512_add_epi32(a.hi.0, b.hi.0)) } }
 }
 #[inline(always)]
 pub fn zi_sub(a: ZI, b: ZI) -> ZI {
     // `[a.low - b.high, a.high - b.low]` - the endpoints CROSS, which is
     // the whole content of interval subtraction.
-    unsafe {
-        let lo = _mm512_sub_epi32(a.lo.0, b.hi.0);
-        let hi = _mm512_sub_epi32(a.hi.0, b.lo.0);
-        if sub_overflows(a.lo.0, b.hi.0, lo) | sub_overflows(a.hi.0, b.lo.0, hi) != 0 {
-            return zi_scalar(a, b, |x, y| x.checked_sub(y).unwrap_or_else(IV::full));
-        }
-        ZI { lo: ZN(lo), hi: ZN(hi) }
+    if zi_sub_wraps(a, b) != 0 {
+        return zi_scalar(a, b, |x, y| x - y);
     }
+    unsafe { ZI { lo: ZN(_mm512_sub_epi32(a.lo.0, b.hi.0)), hi: ZN(_mm512_sub_epi32(a.hi.0, b.lo.0)) } }
 }
 #[inline(always)]
 pub fn zi_min(a: ZI, b: ZI) -> ZI {
@@ -308,19 +328,11 @@ pub fn zi_max(a: ZI, b: ZI) -> ZI {
 
 #[inline(always)]
 pub fn zi_neg(a: ZI) -> ZI {
-    // `-MIN` wraps to `MIN`: a lane with an endpoint at MIN is the whole
-    // range (as `zi_add` on overflow, and the assembled kernel).
-    let (lo, hi) = (a.lo.to_array(), a.hi.to_array());
-    if lo.iter().chain(hi.iter()).any(|v| v.as_raw_u32() as i32 == i32::MIN) {
-        let mut out_lo = [P8::from_i16(0); W];
-        let mut out_hi = [P8::from_i16(0); W];
-        for i in 0..W {
-            let wraps = lo[i].as_raw_u32() as i32 == i32::MIN || hi[i].as_raw_u32() as i32 == i32::MIN;
-            let r = if wraps { IV::full() } else { IV::new(-hi[i], -lo[i]) };
-            out_lo[i] = r.low;
-            out_hi[i] = r.high;
-        }
-        return ZI { lo: ZN::from_array(out_lo), hi: ZN::from_array(out_hi) };
+    // `-MIN` wraps to `MIN`: PANIC on it, as `zi_add` / `zi_sub` do on
+    // theirs. The assembled kernel declines such a lane instead (its own
+    // error, `Op::NoWrap`); neither ever wraps silently.
+    if zi_neg_wraps(a) != 0 {
+        return zi_scalar(a, a, |x, _| x.checked_neg().unwrap_or_else(|| panic!("interval negation wraps: -[{:?}, {:?}]", x.low, x.high)));
     }
     ZI { lo: zn_neg(a.hi), hi: zn_neg(a.lo) }
 }
@@ -952,22 +964,35 @@ mod tests {
         }
     }
 
-    /// `zi_add` and `zi_sub` must not wrap silently: a lane whose endpoint
-    /// overflows is the whole range (the hull of PICO-8's wrapped results),
-    /// as the assembled kernel computes it
-    /// (`asm_interval_overflow_is_the_whole_range`). Until 2026-10-03 the
-    /// primitives panicked here while the assembled ops wrapped - the
-    /// difference that made a timers level's floors never fall.
+    /// `zi_add` and `zi_sub` must PANIC on a wrap, not wrap silently.
+    /// The vector arms compute the overflow predicate and hand the whole
+    /// column to the scalar implementation when any lane trips it - so
+    /// this checks the guard still bites, which a `vpaddd` alone would
+    /// have removed.
     #[test]
-    fn an_interval_add_that_wraps_is_the_whole_range() {
+    #[should_panic]
+    fn an_interval_add_that_wraps_still_panics() {
         let big = zn_splat(P8::from_raw(i32::MAX));
         let a = ZI { lo: big, hi: big };
-        let whole = |z: ZI| (0..W).all(|i| z.lo.to_array()[i].as_raw_u32() as i32 == i32::MIN && z.hi.to_array()[i].as_raw_u32() as i32 == i32::MAX);
-        assert!(whole(zi_add(a, a)), "MAX + MAX");
-        let min = zn_splat(P8::from_raw(i32::MIN));
+        let _ = zi_add(a, a);
+    }
+
+    /// `zi_sub` too: the whole range minus 1 (a timers level's countdown,
+    /// before it became the unknown number, 2026-10-03).
+    #[test]
+    #[should_panic]
+    fn an_interval_sub_that_wraps_still_panics() {
+        let (min, max) = (zn_splat(P8::from_raw(i32::MIN)), zn_splat(P8::from_raw(i32::MAX)));
         let one = zn_splat(P8::from_i16(1));
-        assert!(whole(zi_sub(ZI { lo: min, hi: big }, ZI { lo: one, hi: one })), "the whole range - 1");
-        assert!(whole(zi_neg(ZI { lo: min, hi: big })), "-[MIN, MAX]");
+        let _ = zi_sub(ZI { lo: min, hi: max }, ZI { lo: one, hi: one });
+    }
+
+    /// And negation, which wraps on exactly one endpoint value: `MIN`.
+    #[test]
+    #[should_panic]
+    fn an_interval_negation_that_wraps_still_panics() {
+        let (min, zero) = (zn_splat(P8::from_raw(i32::MIN)), zn_splat(P8::from_i16(0)));
+        let _ = zi_neg(ZI { lo: min, hi: zero });
     }
 
     /// Round-tripping a column through an array must be the identity,

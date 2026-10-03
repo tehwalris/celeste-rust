@@ -2842,17 +2842,15 @@ fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: super:
             let pp = super::widen::platform_paths(st);
             ival.extend(pp.x.iter().chain(pp.last.iter()).cloned());
         }
-        // The floors' timers at a timers level: interval inputs, their whole
-        // range (`widen::widen_floor_timers`).
-        if opts.floor_timers {
-            ival.extend(super::widen::floor_timer_paths(st));
-        }
+        // (The floors' countdowns at a timers or near level are not interval
+        // inputs: they are the unknown number, `widen::forget_countdown_inputs`.)
         // A near level's floors: `state` an interval input, `collideable` a
         // boolean input a lane may hold unknown (`iface::symbolize` tells the
-        // two apart by the slot's value; `widen::widen_near_floors`).
+        // two apart by the slot's value; `widen::widen_near_floors`), and the
+        // objects' phases but their countdowns.
         if opts.floors_near {
             ival.extend(super::widen::near_floor_paths(st).all().cloned());
-            ival.extend(super::widen::phase_paths(st).into_iter().map(|(p, _)| p));
+            ival.extend(super::widen::phase_paths(st).into_iter().filter(|(_, r)| !matches!(r, super::widen::PhaseRange::Countdown)).map(|(p, _)| p));
         }
         ival
     } else {

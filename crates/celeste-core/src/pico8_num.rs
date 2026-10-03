@@ -394,12 +394,6 @@ impl Pico8NumInterval {
         }
     }
 
-    /// The whole 16.16 range: the sound result of an interval operation
-    /// whose concrete results straddle PICO-8's wrap.
-    pub fn full() -> Self {
-        Self::new(Pico8Num(i32::MIN), Pico8Num(i32::MAX))
-    }
-
     /// `+` and `-` that report a wrap instead of panicking on it.
     pub fn checked_add(self, rhs: Self) -> Option<Self> {
         Self::try_from_i64_endpoints(

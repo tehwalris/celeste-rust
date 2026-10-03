@@ -15,6 +15,7 @@
 //! | `Flr(x)`, `x` a set not within one integer | `not Known(Flr(x))` | the kernel floors the low end (`zi_flr_ok` is the test) |
 //! | a fork's fragment (`Split`, `SplitInt`, `SplitTab`, `SplitKeyTab`) of a set | not covered: `not SplitOk(ways)` / `not SplitOkTab` | a lane spanning more parts than are enumerated has none to go to |
 //! | `Sel(c, t, f)`, `c` lane-undecidable | `not Known(c)` | the kernel picks an arm by `c`'s value bit |
+//! | `Add`, `Sub`, `Neg` of an interval, not bounded inside the 16.16 range by the static ranges | `not NoWrap(op)` | the kernel computes each endpoint in wrapping i32: an overflow wraps it apart from the other |
 //!
 //! A fork's VALIDITY (`SplitValid*`) owns nothing: whether this
 //! configuration's part is non-empty is defined on every lane. What an
@@ -44,7 +45,7 @@
 
 use crate::transpile::graph::{NodeId, Op};
 
-use super::domain::Symbolic;
+use super::domain::{Domain, Symbolic};
 
 /// The error of the values `roots` (`for_outcomes`, one outcome).
 pub fn of(d: &mut Symbolic, roots: &[NodeId]) -> NodeId {
@@ -177,6 +178,15 @@ fn own_error(d: &mut Symbolic, n: NodeId) -> Option<NodeId> {
         // `fork_undecided_selects` such a select survives only where the
         // level keeps it, level -1).
         Op::Sel if d.lane_undecidable(a?) => undecided(d, a?),
+        // Overflow is an ASSERTION (2026-10-03): an interval whose endpoint
+        // wrapped is not the result, so the lane declines - never wraps
+        // silently, never widens silently. Only where the result is an
+        // interval in the kernel (an exact operation wraps as PICO-8 does)
+        // and the static ranges do not already bound it inside the range.
+        Op::Add | Op::Sub | Op::Neg if d.is_interval(&n) && !bounded(d, n) => {
+            let fits = d.graph.fold(Op::NoWrap, vec![n]);
+            d.graph.fold(Op::Not, vec![fits])
+        }
         _ => return None,
     };
     (d.graph.get(own).op != Op::ConstBool(false)).then_some(own)
@@ -196,6 +206,13 @@ fn within_one_integer(d: &Symbolic, n: NodeId) -> bool {
         Op::Sel => within_one_integer(d, node.args[1]) && within_one_integer(d, node.args[2]),
         _ => !d.abstract_beneath_lane_ops(n),
     }
+}
+
+/// Do the static ranges (`Symbolic::range_of`, the bucket dispatch's
+/// runtime-guarded seeds) put every value of `n` inside the 16.16 range? In
+/// i64, so a bound past it is seen rather than wrapped.
+fn bounded(d: &mut Symbolic, n: NodeId) -> bool {
+    d.range_of(n).is_some_and(|pieces| pieces.iter().all(|&(lo, hi)| lo >= i32::MIN as i64 && hi <= i32::MAX as i64))
 }
 
 /// `not Known(b)`: the lane holds `b` undecided.
@@ -324,6 +341,45 @@ mod tests {
         // `flr((x + flr(frag)) / 8)`: one number per lane wherever the
         // fragment is covered, so only the fork's coverage.
         assert_eq!(of(&mut d, &[f]), of(&mut d, &[frag]));
+    }
+
+    #[test]
+    fn interval_arithmetic_owns_its_no_wrap_and_exact_arithmetic_does_not() {
+        let mut d = Symbolic::default();
+        let x = cell(&mut d, 0, true);
+        let y = cell(&mut d, 1, false);
+        for op in [Op::Add, Op::Sub] {
+            let r = d.graph.fold(op, vec![x, y]);
+            let e = of(&mut d, &[r]);
+            let fits = d.graph.fold(Op::NoWrap, vec![r]);
+            assert_eq!(e, d.graph.fold(Op::Not, vec![fits]));
+        }
+        let n = d.graph.fold(Op::Neg, vec![x]);
+        let e = of(&mut d, &[n]);
+        let fits = d.graph.fold(Op::NoWrap, vec![n]);
+        assert_eq!(e, d.graph.fold(Op::Not, vec![fits]));
+        // Exact: PICO-8's own wrap, one number.
+        let z = cell(&mut d, 2, false);
+        let s = d.graph.fold(Op::Add, vec![y, z]);
+        let e = of(&mut d, &[s]);
+        assert_eq!(d.graph.get(e).op, Op::ConstBool(false));
+    }
+
+    #[test]
+    fn interval_arithmetic_the_static_ranges_bound_owns_nothing() {
+        let mut d = Symbolic::default();
+        let x = cell(&mut d, 0, true);
+        d.ranges.insert(x, (-(4 << 16), 4 << 16));
+        let one = d.graph.leaf(Op::Const(1 << 16, 1 << 16));
+        let s = d.graph.fold(Op::Add, vec![x, one]);
+        let e = of(&mut d, &[s]);
+        assert_eq!(d.graph.get(e).op, Op::ConstBool(false));
+        // A range that reaches past the 16.16 range is still checked.
+        let y = cell(&mut d, 1, true);
+        d.ranges.insert(y, (0, i32::MAX as i64));
+        let t = d.graph.fold(Op::Add, vec![y, one]);
+        let fits = d.graph.fold(Op::NoWrap, vec![t]);
+        assert_eq!(of(&mut d, &[t]), d.graph.fold(Op::Not, vec![fits]));
     }
 
     #[test]
