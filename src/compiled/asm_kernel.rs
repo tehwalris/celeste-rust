@@ -1284,7 +1284,7 @@ impl BodyCols {
                     // (`AsmField::may_unknown`): an undecided boolean here
                     // means a branch on an unknown reached the output without
                     // its `Known` premise declining the lane.
-                    assert!(may_unknown, "emitted row holds an undecided boolean (column {ci}, root {root}): no premise declined it");
+                    assert!(may_unknown, "emitted row holds an undecided boolean (column {ci}, cell {}, root {root}): no premise declined it", slot.cols[ci].0);
                     v.push(2);
                 } else {
                     v.push((val >> i & 1) as u8);

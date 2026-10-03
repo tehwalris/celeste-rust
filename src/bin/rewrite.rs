@@ -366,6 +366,28 @@ enum Command {
     /// states of a tree with the named cells (`cell_names`) whose names
     /// start with any `--erase` prefix left out (comma-separated, e.g.
     /// `spd.,rem.,player[3].dash`), and cumulatively through that frame.
+    /// DIAGNOSTIC: the sub-pixel remainders of an EXACT tree, for weighing
+    /// two rem abstractions. Per frame, the rows are grouped by every named
+    /// field but `rem.x`/`rem.y` (the combination the rem would hang off),
+    /// and for each group the exact remainders it holds: (A) one rem
+    /// RECTANGLE per group - its row count is the group count, its precision
+    /// the hull's width per axis; (B) the Bits(k) buckets kept but each
+    /// carrying the hull of what it holds - its row count is today's, its
+    /// precision the hull's width as a fraction of the bucket's.
+    RemCensus {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        /// Also the IDEAL of a level (`r4sxh`): the exact states projected
+        /// through its own widening (`frame::widened_keys`), cumulative - what
+        /// a sound forward at that level would visit with no
+        /// over-approximation beyond the projection itself.
+        #[arg(long)]
+        level: Option<String>,
+    },
     CoarseCensus {
         #[arg(long)]
         level_dir: String,
@@ -2824,6 +2846,140 @@ fn main() -> Result<()> {
                 cells_in[3],
                 states_in[3]
             );
+        }
+        Command::RemCensus { level_dir, from, to, level } => {
+            let level = match &level {
+                Some(sp) => Some(celeste_rust::interpreter::abstraction::Level::parse(sp).map_err(|e| anyhow::anyhow!(e))?),
+                None => None,
+            };
+            let mut ideal: rustc_hash::FxHashSet<(u64, (u64, u64), u32)> = Default::default();
+            use celeste_engine::runtime2::{mix64, Cell2, AV};
+            use celeste_rust::search::checkpoint::FrameFile;
+            let ids = celeste_rust::compiled::ids();
+            let name_hash = |s: &str| -> u64 { s.bytes().fold(0x9e37_79b9_7f4a_7c15u64, |h, b| mix64(h ^ b as u64)) };
+            let code = |v: AV| -> u64 {
+                let (tag, a, b) = match v {
+                    AV::Num(n) => (0u64, n.as_raw_u32() as u64, 0u64),
+                    AV::Ival(a, b) => (1, a.as_raw_u32() as u64, b.as_raw_u32() as u64),
+                    AV::Bool(x) => (2, x as u64, 0),
+                    AV::UBool => (3, 0, 0),
+                    AV::Str(s) => (4, s as u64, 0),
+                    AV::Nil => (5, 0, 0),
+                    AV::Ptr(_) => (6, 0, 0),
+                    AV::NilPtr => (7, 0, 0),
+                    AV::UNum => (8, 0, 0),
+                };
+                mix64(mix64(tag) ^ (a << 32 | b))
+            };
+            let q = |v: &mut Vec<f64>, f: f64| -> f64 {
+                if v.is_empty() {
+                    return 0.0;
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[((v.len() - 1) as f64 * f) as usize]
+            };
+            println!("frame | N exact | G (A rows) | Bits(k) rows k=0..8 | A hull px x: med/p90/max, y: med/p90/max | B hull/bucket x,y at k=2,4,6,8 (mean) | cumulative Bits(k) k=0..8");
+            // Every (group, bucket) of every frame so far, per k: the IDEAL a
+            // Bits(k) forward reaches (its `visited`), the exact states projected.
+            let mut seen: Vec<rustc_hash::FxHashSet<(u64, i32, i32)>> = (0..=8).map(|_| Default::default()).collect();
+            for frame in from..=to {
+                let fdir = std::path::Path::new(&level_dir).join("frames").join(format!("f{frame:03}"));
+                let Ok(rd) = std::fs::read_dir(&fdir) else { continue };
+                let mut files: Vec<std::path::PathBuf> = rd
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")))
+                    .collect();
+                files.sort();
+                // (group, rem.x raw, rem.y raw)
+                let mut rows: Vec<(u64, i32, i32)> = Vec::new();
+                for path in &files {
+                    let ff = FrameFile::open(path)?;
+                    let width = ff.width();
+                    let mut lo = 0u32;
+                    while lo < width {
+                        let hi = (lo + (1 << 20)).min(width);
+                        let Some(rt2) = ff.load_rows(&[lo..hi])? else { break };
+                        if let Some(l) = level {
+                            let (shape, keys, cells) = celeste_rust::frame::widened_keys_rt2(&rt2, l)?;
+                            ideal.extend(keys.into_iter().zip(cells).map(|(k, c)| (shape, k, c)));
+                        }
+                        let names = cell_names(&rt2, ids);
+                        let (mut rx, mut ry, mut rest) = (None, None, Vec::new());
+                        for c in 0..rt2.cols.len() {
+                            if !matches!(rt2.structure[c], Cell2::Val) {
+                                continue;
+                            }
+                            match names.get(&c).map(|s| s.as_str()) {
+                                Some("rem.x") => rx = Some(c),
+                                Some("rem.y") => ry = Some(c),
+                                other => rest.push((name_hash(other.unwrap_or("?")) ^ c as u64 * u64::from(other.is_none()), c)),
+                            }
+                        }
+                        let (Some(rx), Some(ry)) = (rx, ry) else {
+                            lo = hi;
+                            continue; // no player
+                        };
+                        let raw = |v: AV| -> Result<i32> {
+                            match v {
+                                AV::Num(n) => Ok(n.as_raw_u32() as i32),
+                                AV::Ival(a, b) if a == b => Ok(a.as_raw_u32() as i32),
+                                other => anyhow::bail!("rem-census needs an EXACT tree: a remainder is {other:?}"),
+                            }
+                        };
+                        for l in 0..rt2.width {
+                            let mut g = 0u64;
+                            for &(nh, c) in &rest {
+                                g = mix64(g ^ nh ^ code(rt2.cols[c].at(l)));
+                            }
+                            rows.push((g, raw(rt2.cols[rx].at(l))?, raw(rt2.cols[ry].at(l))?));
+                        }
+                        lo = hi;
+                    }
+                }
+                if rows.is_empty() {
+                    continue;
+                }
+                let n = rows.len();
+                // A: the hull per group.
+                let mut hull: rustc_hash::FxHashMap<u64, (i32, i32, i32, i32)> = Default::default();
+                for &(g, x, y) in &rows {
+                    let e = hull.entry(g).or_insert((x, x, y, y));
+                    *e = (e.0.min(x), e.1.max(x), e.2.min(y), e.3.max(y));
+                }
+                let (mut wx, mut wy): (Vec<f64>, Vec<f64>) = hull.values().map(|h| ((h.1 - h.0) as f64 / 65536.0, (h.3 - h.2) as f64 / 65536.0)).unzip();
+                // Bits(k) rows, and B's hull per (group, bucket).
+                let bucket = |r: i32, k: u32| -> i32 { (r + 32768) >> (16 - k) };
+                let mut counts = Vec::new();
+                let mut b_frac = Vec::new();
+                for k in 0..=8u32 {
+                    let mut cells: rustc_hash::FxHashMap<(u64, i32, i32), (i32, i32, i32, i32)> = Default::default();
+                    for &(g, x, y) in &rows {
+                        let e = cells.entry((g, bucket(x, k), bucket(y, k))).or_insert((x, x, y, y));
+                        *e = (e.0.min(x), e.1.max(x), e.2.min(y), e.3.max(y));
+                    }
+                    counts.push(cells.len());
+                    seen[k as usize].extend(cells.keys().copied());
+                    if [2, 4, 6, 8].contains(&k) {
+                        let bw = (1i64 << (16 - k)) as f64;
+                        let m = cells.len() as f64;
+                        let fx = cells.values().map(|h| (h.1 - h.0 + 1) as f64 / bw).sum::<f64>() / m;
+                        let fy = cells.values().map(|h| (h.3 - h.2 + 1) as f64 / bw).sum::<f64>() / m;
+                        b_frac.push(format!("{fx:.3},{fy:.3}"));
+                    }
+                }
+                println!(
+                    "f{frame:03} | {n} | {} | {} | x {:.3}/{:.3}/{:.3} y {:.3}/{:.3}/{:.3} | {} | {}",
+                    hull.len(),
+                    counts.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" "),
+                    q(&mut wx, 0.5), q(&mut wx, 0.9), q(&mut wx, 1.0),
+                    q(&mut wy, 0.5), q(&mut wy, 0.9), q(&mut wy, 1.0),
+                    b_frac.join(" "),
+                    seen.iter().map(|c| c.len().to_string()).collect::<Vec<_>>().join(" ")
+                );
+                if level.is_some() {
+                    println!("f{frame:03} ideal of the level, cumulative: {}", ideal.len());
+                }
+            }
         }
         Command::CoarseCensus { level_dir, from, to, erase } => {
             let prefixes: Vec<&str> = erase.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
