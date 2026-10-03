@@ -448,6 +448,27 @@ pub fn fork_near_floor_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Res
     Ok(())
 }
 
+/// A near level's floors IN THE MIDDLE OF A SPLIT FRAME: each `collideable`
+/// is the value the frame's first step stored (`widen_near_floors`) - computed
+/// where the player's half may read it, unknown elsewhere - so a lane may hold
+/// it unknown (`AV::UBool`), and the tracer binds a boolean slot as a plain,
+/// per-lane decided cell (`iface::symbolize`). Read as it is, an unknown lane
+/// took its value bit - false: the floor under the player read as absent, and
+/// room (6,1)'s player never stood on its spawn floors once the first step
+/// stored them unknown (2026-10-03; before, a split the near owes happened to
+/// cause decided them). So: the cell where the lane knows it, else a fork of
+/// both values (`Symbolic::both_values`, one read agreeing with every other).
+pub fn fork_unknown_near_collideables(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    for pc in near_floor_paths(st).collideable {
+        let Some(Value::Bool(c)) = iface::get(st, &pc) else { bail!("{}: not a boolean", iface::show(&pc)) };
+        let known = d.graph.fold(Op::Known, vec![c]);
+        let both = d.both_values(&format!("{} unknown", iface::show(&pc)));
+        let v = d.sel_bool(&known, &c, &both);
+        iface::set(st, &pc, Value::Bool(v))?;
+    }
+    Ok(())
+}
+
 /// How far the player's own update reaches for a fall floor, as offsets to
 /// the overlap window `floor_player_window` (`(x lo, x hi), (y lo, y hi)`,
 /// added to the OPEN window's ends): `is_solid(ox, oy)` checks the floors at
@@ -570,19 +591,37 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
             let held = d.or(&overlap, &holds);
             owe(errs, d, ps, held);
         }
-        // Overlapped: hidden, as the cart keeps it - owed, not assumed.
+        // Overlapped: hidden, as the cart keeps it - owed, not assumed, as
+        // `collideable` false below. That one owe carries `state` 2 too: the
+        // input `collideable` is DERIVED as `state ~= 2`
+        // (`fork_near_floor_inputs`) and the cart's only writes keep the two
+        // in step (1 -> 2 with false, 2 -> 0 with true), so at the frame's end
+        // "not collideable" IS "state 2". Owing `state == 2` as well declined
+        // lanes once the countdowns stopped wrapping (2026-10-03,
+        // `asm_interval_overflow_is_the_whole_range`): a shaking floor's
+        // `state` is then `sel(delay - 1 <= 0, 2, 1)`, which the player's
+        // collision split never reads, so the error's own case analysis took
+        // "not done" - a solid floor the player is inside, which the row's
+        // collision outcome had already ruled out - and the lane erred.
         let apart = d.not(&overlap);
         let two = d.num(P8::from_i16(2));
-        let hidden = d.compare(Cmp::Eq, &state, &two)?;
-        let held = d.or(&apart, &hidden);
-        owe(errs, d, ps, held);
         let range = d.graph.leaf(Op::Const(slo, shi));
         let state = d.sel_num(&overlap, &two, &range);
         iface::set(st, ps, Value::Num(state))?;
         let Some(Value::Bool(coll)) = iface::get(st, pc) else { bail!("{}: not a boolean", iface::show(pc)) };
-        let passable = d.not(&coll);
-        let held = d.or(&apart, &passable);
-        owe(errs, d, pc, held);
+        // Owed at the FRAME'S END only. In the middle of a split frame the
+        // player has not moved, so nothing has split a shaking floor's
+        // `delay - 1 <= 0`, and the error's case analysis keeps "not done":
+        // a solid floor the player is inside, which the cart rules out (a
+        // floor the player is inside comes back only `if delay <= 0 and not
+        // check(player, 0, 0)`) and which the end step's collision split
+        // decides. Owed mid-frame as well, it declined room (2,1)'s lanes at
+        // step 48 once the countdowns stopped wrapping (2026-10-03).
+        if !mid {
+            let passable = d.not(&coll);
+            let held = d.or(&apart, &passable);
+            owe(errs, d, pc, held);
+        }
         let (unknown, absent) = (d.unknown_bool_output(), d.boolean(false));
         // Mid-frame, in the probe window: the computed `collideable`, kept.
         let unread = if mid { d.sel_bool(&probe, &coll, &unknown) } else { unknown };

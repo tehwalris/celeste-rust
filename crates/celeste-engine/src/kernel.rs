@@ -277,7 +277,9 @@ pub fn zi_add(a: ZI, b: ZI) -> ZI {
         let lo = _mm512_add_epi32(a.lo.0, b.lo.0);
         let hi = _mm512_add_epi32(a.hi.0, b.hi.0);
         if add_overflows(a.lo.0, b.lo.0, lo) | add_overflows(a.hi.0, b.hi.0, hi) != 0 {
-            return zi_scalar(a, b, |x, y| x + y);
+            // A wrapped endpoint: that lane is the whole range (the concrete
+            // results straddle PICO-8's wrap), as the assembled kernel does.
+            return zi_scalar(a, b, |x, y| x.checked_add(y).unwrap_or_else(IV::full));
         }
         ZI { lo: ZN(lo), hi: ZN(hi) }
     }
@@ -290,7 +292,7 @@ pub fn zi_sub(a: ZI, b: ZI) -> ZI {
         let lo = _mm512_sub_epi32(a.lo.0, b.hi.0);
         let hi = _mm512_sub_epi32(a.hi.0, b.lo.0);
         if sub_overflows(a.lo.0, b.hi.0, lo) | sub_overflows(a.hi.0, b.lo.0, hi) != 0 {
-            return zi_scalar(a, b, |x, y| x - y);
+            return zi_scalar(a, b, |x, y| x.checked_sub(y).unwrap_or_else(IV::full));
         }
         ZI { lo: ZN(lo), hi: ZN(hi) }
     }
@@ -306,6 +308,20 @@ pub fn zi_max(a: ZI, b: ZI) -> ZI {
 
 #[inline(always)]
 pub fn zi_neg(a: ZI) -> ZI {
+    // `-MIN` wraps to `MIN`: a lane with an endpoint at MIN is the whole
+    // range (as `zi_add` on overflow, and the assembled kernel).
+    let (lo, hi) = (a.lo.to_array(), a.hi.to_array());
+    if lo.iter().chain(hi.iter()).any(|v| v.as_raw_u32() as i32 == i32::MIN) {
+        let mut out_lo = [P8::from_i16(0); W];
+        let mut out_hi = [P8::from_i16(0); W];
+        for i in 0..W {
+            let wraps = lo[i].as_raw_u32() as i32 == i32::MIN || hi[i].as_raw_u32() as i32 == i32::MIN;
+            let r = if wraps { IV::full() } else { IV::new(-hi[i], -lo[i]) };
+            out_lo[i] = r.low;
+            out_hi[i] = r.high;
+        }
+        return ZI { lo: ZN::from_array(out_lo), hi: ZN::from_array(out_hi) };
+    }
     ZI { lo: zn_neg(a.hi), hi: zn_neg(a.lo) }
 }
 
@@ -936,17 +952,22 @@ mod tests {
         }
     }
 
-    /// `zi_add` and `zi_sub` must PANIC on a wrap, not wrap silently.
-    /// The vector arms compute the overflow predicate and hand the whole
-    /// column to the scalar implementation when any lane trips it - so
-    /// this checks the guard still bites, which a `vpaddd` alone would
-    /// have removed.
+    /// `zi_add` and `zi_sub` must not wrap silently: a lane whose endpoint
+    /// overflows is the whole range (the hull of PICO-8's wrapped results),
+    /// as the assembled kernel computes it
+    /// (`asm_interval_overflow_is_the_whole_range`). Until 2026-10-03 the
+    /// primitives panicked here while the assembled ops wrapped - the
+    /// difference that made a timers level's floors never fall.
     #[test]
-    #[should_panic]
-    fn an_interval_add_that_wraps_still_panics() {
+    fn an_interval_add_that_wraps_is_the_whole_range() {
         let big = zn_splat(P8::from_raw(i32::MAX));
         let a = ZI { lo: big, hi: big };
-        let _ = zi_add(a, a);
+        let whole = |z: ZI| (0..W).all(|i| z.lo.to_array()[i].as_raw_u32() as i32 == i32::MIN && z.hi.to_array()[i].as_raw_u32() as i32 == i32::MAX);
+        assert!(whole(zi_add(a, a)), "MAX + MAX");
+        let min = zn_splat(P8::from_raw(i32::MIN));
+        let one = zn_splat(P8::from_i16(1));
+        assert!(whole(zi_sub(ZI { lo: min, hi: big }, ZI { lo: one, hi: one })), "the whole range - 1");
+        assert!(whole(zi_neg(ZI { lo: min, hi: big })), "-[MIN, MAX]");
     }
 
     /// Round-tripping a column through an array must be the identity,

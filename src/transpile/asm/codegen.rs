@@ -454,12 +454,40 @@ impl<'a> Lower<'a> {
         self.cmp(0, a, Src::Reg(b))
     }
 
+    /// Interval `+`. An endpoint that OVERFLOWS the 16.16 range makes the
+    /// lane's result the whole range: PICO-8's arithmetic wraps, so the
+    /// concrete results straddle the wrap and the whole range is their
+    /// hull. Wrapping the endpoints instead (plain `vpaddd`) inverted the
+    /// interval: a timers level's floor `delay` (the whole range) minus 1
+    /// became [32767.99, 32766.99], `delay <= 0` decided "no", and a shaking
+    /// floor never fell - an UNSOUND successor set (room (3,3), 2026-10-03).
     fn zi_add(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
-        [self.dbin(ROp::AddD, a[0], b[0]), self.dbin(ROp::AddD, a[1], b[1])]
+        let lo = self.dbin(ROp::AddD, a[0], b[0]);
+        let hi = self.dbin(ROp::AddD, a[1], b[1]);
+        // r = x + y overflowed iff (x ^ r) & (y ^ r) is negative.
+        let ol = self.ternlog(a[0], b[0], lo, 0x42);
+        let oh = self.ternlog(a[1], b[1], hi, 0x42);
+        self.whole_where_negative(ol, oh, lo, hi)
     }
+    /// Interval `-` (endpoints cross: [a.lo - b.hi, a.hi - b.lo]), the
+    /// whole range on overflow as `zi_add`.
     fn zi_sub(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
-        // Endpoints cross: [a.lo - b.hi, a.hi - b.lo].
-        [self.dbin(ROp::SubD, a[0], b[1]), self.dbin(ROp::SubD, a[1], b[0])]
+        let lo = self.dbin(ROp::SubD, a[0], b[1]);
+        let hi = self.dbin(ROp::SubD, a[1], b[0]);
+        // r = x - y overflowed iff (x ^ y) & (x ^ r) is negative.
+        let ol = self.ternlog(a[0], b[1], lo, 0x18);
+        let oh = self.ternlog(a[1], b[0], hi, 0x18);
+        self.whole_where_negative(ol, oh, lo, hi)
+    }
+    /// `[lo, hi]`, but `[MIN, MAX]` in each lane where `ol` or `oh` is
+    /// negative (an endpoint's overflow flag in its sign bit).
+    fn whole_where_negative(&mut self, ol: Vreg, oh: Vreg, lo: Vreg, hi: Vreg) -> [Vreg; 2] {
+        let any = self.dbin(ROp::OrD, ol, oh);
+        let zero = self.num_reg(NumVal::ConstI32(0));
+        let m = self.cmp(1, any, Src::Reg(zero)); // any < 0  (LT)
+        let min = self.num_reg(NumVal::ConstI32(i32::MIN));
+        let max = self.num_reg(NumVal::ConstI32(i32::MAX));
+        [self.vsel(m, min, lo), self.vsel(m, max, hi)]
     }
     fn zi_min(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
         [self.dbin(ROp::MinSD, a[0], b[0]), self.dbin(ROp::MinSD, a[1], b[1])]
@@ -467,10 +495,16 @@ impl<'a> Lower<'a> {
     fn zi_max(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
         [self.dbin(ROp::MaxSD, a[0], b[0]), self.dbin(ROp::MaxSD, a[1], b[1])]
     }
+    /// Interval negation; `-MIN` wraps to `MIN`, so a lane with an endpoint
+    /// at `MIN` is the whole range (as `zi_add`).
     fn zi_neg(&mut self, a: [Vreg; 2]) -> [Vreg; 2] {
         let lo = self.neg(a[1]);
         let hi = self.neg(a[0]);
-        [lo, hi]
+        let min = self.num_reg(NumVal::ConstI32(i32::MIN));
+        let el = self.cmp(0, a[0], Src::Reg(min)); // lo == MIN  (EQ)
+        let eh = self.cmp(0, a[1], Src::Reg(min)); // hi == MIN
+        // The masks are all-ones (negative) where set.
+        self.whole_where_negative(el, eh, lo, hi)
     }
     /// `zi_abs`: the three-case blend (non-negative / non-positive / straddle).
     fn zi_abs(&mut self, a: [Vreg; 2]) -> [Vreg; 2] {

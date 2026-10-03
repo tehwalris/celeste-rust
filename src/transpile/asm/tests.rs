@@ -744,6 +744,83 @@ fn asm_ival_input_matches_primitives() {
     }
 }
 
+/// Interval `+`, `-` and negation whose endpoints OVERFLOW the 16.16 range
+/// give the whole range in that lane - the hull of PICO-8's wrapped concrete
+/// results - in the assembled kernel and in the primitives alike. The
+/// assembled ops used to wrap each endpoint, which inverted the interval: a
+/// timers level's floor `delay` (the whole range) minus 1 decided `<= 0` as
+/// "no", and a shaking floor never fell (room (3,3), 2026-10-03).
+#[test]
+fn asm_interval_overflow_is_the_whole_range() {
+    use crate::transpile::asm::{compile_and_load_reprs, CellRepr};
+    let mut g = Graph::new();
+    let civ = g.leaf(Op::Cell(0)); // ival
+    let cnum = g.leaf(Op::Cell(1)); // num
+    let add = g.add(Op::Add, vec![civ, cnum]);
+    let sub = g.add(Op::Sub, vec![civ, cnum]);
+    let neg = g.add(Op::Neg, vec![civ]);
+    let roots = vec![add, sub, neg];
+    let mut reprs = HashMap::new();
+    reprs.insert(0u32, CellRepr::Ival);
+    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "ivalovf", &reprs).expect("compile+load");
+    let one = 0x1_0000;
+    // Per lane (lo, hi, num): the whole range minus/plus one, a top end
+    // that overflows on +1, a bottom end on -1, MIN negated, and lanes that
+    // do not overflow.
+    let lanes: [(i32, i32, i32); 16] = [
+        (i32::MIN, i32::MAX, one),
+        (i32::MIN, i32::MAX, -one),
+        (i32::MAX - 5, i32::MAX, one),
+        (i32::MIN, i32::MIN + 5, one),
+        (i32::MIN, 0, 0),
+        (-one, one, one),
+        (0, 3 * one, -one),
+        (i32::MIN + one, i32::MAX - one, one),
+        (i32::MIN + one, i32::MAX - one, -one),
+        (5, 9, 2),
+        (i32::MAX, i32::MAX, 1),
+        (i32::MIN, i32::MIN, -1),
+        (-7 * one, -6 * one, 4 * one),
+        (100, 200, 300),
+        (i32::MIN + 1, i32::MIN + 1, 0),
+        (0, 0, 0),
+    ];
+    let mut input = vec![0u8; compiled.input_bytes as usize];
+    for (l, &(lo, hi, num)) in lanes.iter().enumerate() {
+        input[l * 4..l * 4 + 4].copy_from_slice(&lo.to_le_bytes());
+        input[64 + l * 4..64 + l * 4 + 4].copy_from_slice(&hi.to_le_bytes());
+        input[128 + l * 4..128 + l * 4 + 4].copy_from_slice(&num.to_le_bytes());
+    }
+    let out = run_asm_raw(&loaded, &input, compiled.out_bytes, std::ptr::null());
+    let ziv = ZI {
+        lo: ZN::from_array(std::array::from_fn(|i| P8::from_raw(lanes[i].0))),
+        hi: ZN::from_array(std::array::from_fn(|i| P8::from_raw(lanes[i].1))),
+    };
+    let znum = ZN::from_array(std::array::from_fn(|i| P8::from_raw(lanes[i].2)));
+    let expect = [zi_add(ziv, ZI { lo: znum, hi: znum }), zi_sub(ziv, ZI { lo: znum, hi: znum }), zi_neg(ziv)];
+    let plane = |ri: usize, off: usize| -> [i32; 16] {
+        let o = compiled.root_offsets[ri] as usize + off;
+        std::array::from_fn(|l| i32::from_le_bytes(out[o + l * 4..o + l * 4 + 4].try_into().unwrap()))
+    };
+    for (ri, (e, name)) in expect.iter().zip(["add", "sub", "neg"]).enumerate() {
+        let (lo, hi) = (plane(ri, 0), plane(ri, 64));
+        for l in 0..16 {
+            let want = (e.lo.to_array()[l].as_raw_u32() as i32, e.hi.to_array()[l].as_raw_u32() as i32);
+            assert_eq!((lo[l], hi[l]), want, "{name} lane {l} {:?}: assembled vs primitive", lanes[l]);
+            assert!(lo[l] <= hi[l], "{name} lane {l}: an inverted interval");
+        }
+    }
+    let whole = (i32::MIN, i32::MAX);
+    let lane = |ri: usize, l: usize| (plane(ri, 0)[l], plane(ri, 64)[l]);
+    assert_eq!(lane(1, 0), whole, "the whole range minus 1 is the whole range");
+    assert_eq!(lane(0, 0), whole, "the whole range plus 1");
+    assert_eq!(lane(0, 2), whole, "a top end past MAX");
+    assert_eq!(lane(1, 3), whole, "a bottom end past MIN");
+    assert_eq!(lane(2, 4), whole, "-[MIN, 0]");
+    assert_eq!(lane(1, 5), (-2 * one, 0), "no overflow: exact");
+    assert_eq!(lane(1, 7), (i32::MIN, i32::MAX - 2 * one), "the bottom end lands on MIN exactly");
+}
+
 // ---------------------------------------------------------------------------
 // Benchmark: asserts BOTH the asm backend and a self-contained rustc build
 // of the identical graph match the primitives, then prints compile-time and
