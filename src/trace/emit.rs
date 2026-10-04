@@ -61,9 +61,6 @@ pub fn show_tree(g: &Graph, root: NodeId, depth: usize) -> String {
 /// booleans that say which lanes reach it and on which its row is undefined.
 pub struct FrameOutcome {
     pub outputs: Vec<(u32, NodeId, &'static str)>,
-    /// Outputs keyed on another node than they store: `(index into
-    /// outputs, key node)` - the speed under a bucket (`State::key_override`).
-    pub keys: Vec<(usize, NodeId)>,
     pub live: NodeId,
     pub error: NodeId,
     /// Cells `Rt2::boundary` widens to a UNIFORM value at level 0 (rem x/y ->
@@ -72,7 +69,7 @@ pub struct FrameOutcome {
     /// `KPART`, off the per-lane fold. See `OutField::widen_uniform`.
     pub widen: Vec<(u32, celeste_engine::runtime2::AV)>,
     /// The transfer roots (`verify::FrameOut::arc`; empty unless arc mode),
-    /// after the keys in a body's roots, and whether the outcome has a player
+    /// after `live` in a body's roots, and whether the outcome has a player
     /// at its end.
     pub arc: Vec<NodeId>,
     pub arc_fin: bool,
@@ -128,18 +125,14 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
         roots.extend(o.fields.iter().map(|(_, nd, _)| *nd));
         roots.push(o.guard);
         roots.push(o.error);
-        roots.extend(o.keys.iter().map(|(_, nd)| *nd));
         roots.extend(o.arc.iter().copied());
     }
     let (mut graph, mut roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
         .map_err(|e| anyhow::anyhow!("{:#}\nwhere the roots are\n{}", e, root_legend(f)))?;
-    // The frame's own fork arities and tables (`Frame::fork_ways`).
+    // The frame's own fork arities (`Frame::fork_ways`).
     graph.reset_forks();
     for d in 0..f.forks {
-        if let Some(t) = f.fork_tables.get(d as usize).filter(|t| !t.is_empty()) {
-            let arity = f.fork_ways.get(d as usize).copied().ok_or_else(|| anyhow::anyhow!("table fork {d} has no recorded arity"))?;
-            graph.set_fork_table(d, t.clone(), arity);
-        } else if let Some(&w) = f.fork_ways.get(d as usize) {
+        if let Some(&w) = f.fork_ways.get(d as usize) {
             graph.set_fork_ways(d, w);
         }
     }
@@ -175,7 +168,7 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
                 }
             }
             unknown_fields.push(mine);
-            at += n + 2 + o.keys.len() + o.arc.len();
+            at += n + 2 + o.arc.len();
         }
     }
     let mut used = vec![false; graph.len()];
@@ -273,12 +266,9 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
                 widen.push((o.cells[i], AV::UNum));
             }
         }
-        let keys: Vec<(usize, NodeId)> =
-            o.keys.iter().enumerate().map(|(k, (fi, _))| (*fi, roots[at + n + 2 + k])).collect();
-        let arc_at = at + n + 2 + o.keys.len();
+        let arc_at = at + n + 2;
         outcomes.push(FrameOutcome {
             outputs,
-            keys,
             live: roots[at + n],
             error: roots[at + n + 1],
             widen,
@@ -313,13 +303,13 @@ pub fn asm_input_reprs(
 
 /// One fused (specialized) body: which outcome it belongs to, the fork
 /// configuration it resolved (the buttons among the forks), and its roots in the FUSED graph - the outcome's output
-/// field nodes in order, then `error`, then `live`, then its key nodes, then
-/// its transfer roots (`FrameOutcome::arc`).
+/// field nodes in order, then `error`, then `live`, then its transfer roots
+/// (`FrameOutcome::arc`).
 pub struct AsmBody {
     pub outcome: usize,
     pub splits: Vec<u8>,
-    /// `outputs.len() + 2 + keys + arc` nodes: fields..., error, live, key
-    /// nodes..., transfer roots...
+    /// `outputs.len() + 2 + arc` nodes: fields..., error, live, transfer
+    /// roots...
     pub roots: Vec<NodeId>,
 }
 
@@ -347,7 +337,7 @@ pub fn asm_fused(
     let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = bound
         .outcomes
         .iter()
-        .map(|o| (o.outputs.iter().map(|(_, nd, _)| *nd).collect(), o.error, o.live, o.keys.iter().map(|(_, nd)| *nd).chain(o.arc.iter().copied()).collect()))
+        .map(|o| (o.outputs.iter().map(|(_, nd, _)| *nd).collect(), o.error, o.live, o.arc.clone()))
         .collect();
     let (fused, raw_bodies) = crate::transpile::lower::specialize_frame(
         &bound.graph,
@@ -434,7 +424,6 @@ pub fn lower_frame(
             },
             error: o.error,
             live: o.live,
-            keys: o.keys.clone(),
             arc: o.arc.clone(),
         })
         .collect();

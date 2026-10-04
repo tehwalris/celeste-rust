@@ -73,7 +73,6 @@ pub enum Fun2 {
 pub enum ForkKind {
     Floors,
     Ints,
-    Table,
 }
 
 /// The origin (`Symbolic::fork_origins`) of the forks `Domain::unknown_bool`
@@ -99,12 +98,6 @@ pub enum Partition {
     /// `[0, 1<<16]`, and sharing one choice would tie them together, so the
     /// pair could never take opposite values.
     Ints { ways: u8, memo: bool },
-    /// Cut at a TABLE of ranges, RELATIVE to the entry the low end lies in:
-    /// fragment `c` is the value clipped to the `c`-th entry from there
-    /// (`Op::SplitTab` -> a select chain). Never memoised: the ranges are part
-    /// of the partition, so two sites forking one value at different tables
-    /// are different forks, and `set_fork_table` would overwrite the first.
-    Table { ranges: Vec<(i32, i32)>, arity: u8 },
 }
 
 impl Partition {
@@ -112,7 +105,6 @@ impl Partition {
         match self {
             Partition::Floors { .. } => ForkKind::Floors,
             Partition::Ints { .. } => ForkKind::Ints,
-            Partition::Table { .. } => ForkKind::Table,
         }
     }
 
@@ -120,7 +112,6 @@ impl Partition {
     fn ways(&self) -> u8 {
         match self {
             Partition::Floors { ways } | Partition::Ints { ways, .. } => *ways,
-            Partition::Table { arity, .. } => *arity,
         }
     }
 
@@ -128,7 +119,6 @@ impl Partition {
         match self {
             Partition::Floors { .. } => true,
             Partition::Ints { memo, .. } => *memo,
-            Partition::Table { .. } => false,
         }
     }
 }
@@ -277,13 +267,6 @@ pub trait Domain {
     /// The default is the identity, which is what an exact value needs:
     /// one fragment, always valid.
     fn fork_flr(&mut self, v: &Self::Num, _ways: u8) -> (Self::Num, Self::Bool) {
-        (v.clone(), self.boolean(true))
-    }
-
-    /// A fork over an interval of WHOLE numbers whose fragments are the
-    /// numbers themselves, each EXACT (`Op::SplitInt`): the player's
-    /// position under a bucket. Same validity and premise as `fork_flr`.
-    fn fork_int(&mut self, v: &Self::Num, _ways: u8) -> (Self::Num, Self::Bool) {
         (v.clone(), self.boolean(true))
     }
 
@@ -664,7 +647,7 @@ impl Symbolic {
                 Op::Known => false,
                 // The validity and coverage masks are per-lane comparisons the
                 // kernel evaluates, not conditions a lane straddles.
-                Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_) | Op::NoWrap => false,
+                Op::SplitValid(_) | Op::SplitOk(_) | Op::FragOk(_) | Op::NoWrap => false,
                 Op::ConstBool(_) => false,
                 // Not boolean-valued, so not a condition.
                 _ => false,
@@ -698,7 +681,7 @@ impl Symbolic {
                 Op::Const(lo, hi) => lo != hi,
                 Op::Span => true,
                 Op::UnknownNum | Op::UnknownBool(_) => true,
-                Op::Split(_) | Op::SplitTab(_) | Op::SplitKeyTab(_) | Op::Frag(_) => true,
+                Op::Split(_) | Op::Frag(_) => true,
                 Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi => false,
                 Op::ConstBool(_) | Op::Known | Op::NoWrap => false,
                 // THE CONDITION DOES NOT MAKE THE RESULT A SET. `Sel(c, 5, 7)`
@@ -768,9 +751,9 @@ impl Symbolic {
                 // fragment of the integer grid is one exact number. The
                 // validity and coverage masks are per-lane comparisons on
                 // the operand, so they follow it.
-                Op::Split(_) | Op::SplitTab(_) | Op::SplitKeyTab(_) | Op::Frag(_) => true,
+                Op::Split(_) | Op::Frag(_) => true,
                 Op::SplitInt(_) | Op::IntFrag(_) => false,
-                Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_) => any(memo, &args),
+                Op::SplitValid(_) | Op::SplitOk(_) | Op::FragOk(_) => any(memo, &args),
                 // The ends of an interval are exact numbers.
                 Op::Lo | Op::Hi => false,
                 // A premise is a mask query: every lane decides it.
@@ -1033,9 +1016,8 @@ impl Symbolic {
     /// What differs between partitions is only how a configuration index
     /// becomes a value, which is the `Partition` - and on the graph, which op
     /// family carries it. Those ops must stay distinct: `Graph::specialize`
-    /// resolves `Split` to `Frag`, `SplitInt` to `IntFrag` and the `SplitTab`
-    /// family to per-lane select chains, so they are three different
-    /// computations, not three spellings of one.
+    /// resolves `Split` to `Frag` and `SplitInt` to `IntFrag`, so they are two
+    /// different computations, not two spellings of one.
     fn fork(&mut self, v: &NodeId, p: Partition, origin: &str) -> Fork {
         let kind = p.kind();
         // Already forked this exact value this frame? Reuse the choice.
@@ -1065,14 +1047,6 @@ impl Symbolic {
             Partition::Ints { ways, .. } => {
                 self.graph.set_fork_ways(d, *ways);
                 (self.graph.fold(Op::SplitInt(d), vec![*v]), self.graph.fold(Op::SplitValid(d), vec![*v]))
-            }
-            Partition::Table { ranges, arity } => {
-                // SET, not raised, and it registers the table too: a table
-                // fork's arity is its entry count, and the arena outlives a
-                // trace, so fork `d` of the previous one may have had a
-                // bigger table.
-                self.graph.set_fork_table(d, ranges.to_vec(), *arity);
-                (self.graph.fold(Op::SplitTab(d), vec![*v]), self.graph.fold(Op::SplitValidTab(d), vec![*v]))
             }
         };
         if p.memoized() {
@@ -1136,7 +1110,7 @@ impl Symbolic {
             let node = self.graph.get(x);
             let dependent = matches!(
                 node.op,
-                Op::Cell(_) | Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_)
+                Op::Cell(_) | Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_)
             );
             if dependent || node.args.is_empty() {
                 self.lane_memo.insert(x, !dependent);
@@ -1460,7 +1434,7 @@ impl Domain for Symbolic {
             let r = match node.op {
                 Op::Cell(c) => ival.contains(&c),
                 Op::Const(lo, hi) => lo != hi,
-                Op::Split(_) | Op::SplitTab(_) | Op::SplitKeyTab(_) => true,
+                Op::Split(_) => true,
                 // An exact whole number per configuration.
                 Op::SplitInt(_) | Op::Lo | Op::Hi => false,
                 // Unconditionally, like a non-degenerate `Const`: a
@@ -1498,11 +1472,6 @@ impl Domain for Symbolic {
 
     fn fork_flr(&mut self, v: &NodeId, ways: u8) -> (NodeId, NodeId) {
         let f = self.fork(v, Partition::Floors { ways }, "a floor fork (`move`)");
-        (f.value, f.valid)
-    }
-
-    fn fork_int(&mut self, v: &NodeId, ways: u8) -> (NodeId, NodeId) {
-        let f = self.fork(v, Partition::Ints { ways, memo: true }, "a bucketed position");
         (f.value, f.valid)
     }
 

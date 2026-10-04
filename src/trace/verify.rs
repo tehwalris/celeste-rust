@@ -45,9 +45,6 @@ pub struct FrameOut {
     /// re-deriving it from the node's op matters: `Op::Cell` and `Op::Sel`
     /// are both, and a guess there is a guess about the boundary.
     pub fields: Vec<(Path, NodeId, &'static str)>,
-    /// Fields keyed on another node than they store (`State::key_override`):
-    /// `(index into fields, key node)`.
-    pub keys: Vec<(usize, NodeId)>,
     /// Slots that are DEAD at the frame boundary: the six button cells.
     ///
     /// `btn(i)` writes as well as reads - it resolves the unknown to a
@@ -110,7 +107,6 @@ impl Clone for FrameOut {
             guard: self.guard,
             error: self.error,
             fields: self.fields.clone(),
-            keys: self.keys.clone(),
             ubool: self.ubool.clone(),
             shape: self.shape.clone(),
             rt2: self.rt2.clone_block(),
@@ -139,13 +135,11 @@ pub struct Frame {
     /// a split lives at fork level 1 or deeper, and a body emitted at
     /// depth 0 silently drops every one of them.
     pub forks: u8,
-    /// The forks' arities and table-fork ranges AS TRACED (`Graph::
-    /// fork_ways` / `fork_table` at the end of this frame). The arena
-    /// outlives the frame and a later frame's forks overwrite them, so a
-    /// frame carries its own and `emit::bind` installs them in the bound
-    /// graph.
+    /// The forks' arities AS TRACED (`Graph::fork_ways` at the end of this
+    /// frame). The arena outlives the frame and a later frame's forks
+    /// overwrite them, so a frame carries its own and `emit::bind` installs
+    /// them in the bound graph.
     pub fork_ways: Vec<u8>,
-    pub fork_tables: Vec<Vec<(i32, i32)>>,
     pub outs: Vec<FrameOut>,
     /// THE RAISE ROW's liveness: when this frame would have hit a Lua raise,
     /// as the OR of the path guards at every `Interp::poison` site
@@ -273,7 +267,6 @@ pub fn trace_frame<'a>(
     // OUTPUT state of an earlier trace and still carries that trace's
     // overrides, whose key nodes name ITS forks - inherited, the kernel
     // hashed a stale key (2026-09-15).
-    st.key_override.clear();
     // Fork choices are per FRAME; the six buttons are among them.
     it.d.forks = 0;
     it.d.graph.reset_forks();
@@ -440,19 +433,6 @@ pub fn trace_frame<'a>(
             .iter()
             .filter(|(p, _)| fields.iter().any(|(q, _, _)| q == p))
             .fold(it.d.graph.fold(crate::transpile::graph::Op::Or, vec![global, s.ended]), |e, (_, w)| it.d.graph.fold(crate::transpile::graph::Op::Or, vec![e, *w]));
-        // A widened slot no output holds (the outcome destroyed its
-        // object: a death) has no key to override. Matched by PATH: two
-        // fields holding the same (hash-consed) node are still two fields.
-        let keys: Vec<(usize, NodeId)> = s
-            .key_override
-            .iter()
-            .filter_map(|(held, key)| fields.iter().position(|(p, _, _)| p == held).map(|i| (i, *key)))
-            .collect();
-        anyhow::ensure!(
-            keys.iter().enumerate().all(|(k, (i, _))| keys[..k].iter().all(|(j, _)| j != i)),
-            "field {} has more than one key override",
-            keys.iter().find(|(i, _)| keys.iter().filter(|(j, _)| j == i).count() > 1).map(|(i, _)| super::iface::show(&fields[*i].0)).unwrap_or_default()
-        );
         // The engine's numbering for THIS outcome's shape. Fields and
         // dead cells are resolved together: they share one cell space,
         // so a collision between the two halves is exactly as wrong as
@@ -467,7 +447,6 @@ pub fn trace_frame<'a>(
             guard,
             error,
             fields,
-            keys,
             ubool,
             shape,
             rt2,
@@ -495,12 +474,12 @@ pub fn trace_frame<'a>(
         three_valued_evaluated(&mut it.d, &outs);
     }
     // ERROR, DERIVED - once, now that the graph each outcome reads is final:
-    // from what the row stores (fields, keys), from where it is live (an
+    // from what the row stores (its fields), from where it is live (an
     // error in the guard is the whole lane's), and from the conditions it
     // already owes (`trace::error`).
     let roots: Vec<Vec<NodeId>> = outs
         .iter()
-        .map(|o| o.fields.iter().map(|(_, n, _)| *n).chain(o.keys.iter().map(|(_, n)| *n)).chain([o.guard, o.error]).collect())
+        .map(|o| o.fields.iter().map(|(_, n, _)| *n).chain([o.guard, o.error]).collect())
         .collect();
     for (o, e) in outs.iter_mut().zip(super::error::for_outcomes(&mut it.d, &roots)) {
         o.error = it.d.graph.fold(crate::transpile::graph::Op::Or, vec![o.error, e]);
@@ -530,7 +509,7 @@ pub fn trace_frame<'a>(
             if !*r {
                 continue;
             }
-            if let Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::SplitTab(d) | Op::SplitValidTab(d) | Op::SplitKeyTab(d) | Op::SplitOkTab(d) = it.d.graph.get(i as NodeId).op {
+            if let Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) = it.d.graph.get(i as NodeId).op {
                 live.insert(d);
             }
         }
@@ -542,7 +521,6 @@ pub fn trace_frame<'a>(
         );
     }
     let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
-    let fork_tables: Vec<Vec<(i32, i32)>> = (0..it.d.forks).map(|d| it.d.graph.fork_table(d).to_vec()).collect();
     // The raise row's liveness: the OR over the guards at the raises this
     // trace hit. Folded from `false`, so a frame that cannot raise gets
     // `ConstBool(false)` and a frame with one raise gets that guard exactly
@@ -556,8 +534,11 @@ pub fn trace_frame<'a>(
         }
         r
     };
-    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, raise, in_cells, in_rt2 })
+    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, outs, raise, in_cells, in_rt2 })
 }
+
+/// An outcome's row as `Waiting` indexes it: its shape class and its fields.
+type RowKey = (usize, Vec<NodeId>);
 
 /// `split_undecided_selects`' queue: the outcomes still to split, popped
 /// largest cone first, and deduped as they arrive - a side equal to an
@@ -566,7 +547,7 @@ pub fn trace_frame<'a>(
 #[derive(Default)]
 struct Waiting {
     slots: Vec<Option<(Lite, Option<PointSet>)>>,
-    index: rustc_hash::FxHashMap<(usize, Vec<(usize, NodeId)>, Vec<NodeId>), usize>,
+    index: rustc_hash::FxHashMap<RowKey, usize>,
     heap: std::collections::BinaryHeap<(usize, std::cmp::Reverse<usize>)>,
 }
 
@@ -580,7 +561,6 @@ struct Lite {
     guard: NodeId,
     error: NodeId,
     fields: Vec<NodeId>,
-    keys: Vec<(usize, NodeId)>,
     /// Conditions every lane DECIDES that a case split of this outcome may
     /// merge into outcomes already made (`absorbed`): what a split's atom
     /// guarded in the select's condition, carried through every later
@@ -589,11 +569,9 @@ struct Lite {
 }
 
 impl Lite {
-    /// What the row stores: the fields and the keys.
+    /// What the row stores: the fields.
     fn row(&self) -> Vec<NodeId> {
-        let mut r = self.fields.clone();
-        r.extend(self.keys.iter().map(|(_, n)| *n));
-        r
+        self.fields.clone()
     }
 
     fn every(&self) -> Vec<NodeId> {
@@ -623,8 +601,8 @@ impl Lite {
 impl Waiting {
     /// Outcomes of one shape with the same row are one: the template's
     /// SHAPE class (`class`) rather than the template itself.
-    fn key(class: &[usize], o: &Lite) -> (usize, Vec<(usize, NodeId)>, Vec<NodeId>) {
-        (class[o.t], o.keys.clone(), o.fields.clone())
+    fn key(class: &[usize], o: &Lite) -> RowKey {
+        (class[o.t], o.fields.clone())
     }
 
     fn push(&mut self, d: &mut Symbolic, class: &[usize], o: Lite, pts: Option<PointSet>, size: usize) {
@@ -773,7 +751,6 @@ fn three_valued_evaluated(d: &mut Symbolic, outs: &[FrameOut]) {
     let mut roots: Vec<NodeId> = Vec::new();
     for o in outs {
         roots.extend(o.fields.iter().map(|f| f.1));
-        roots.extend(o.keys.iter().map(|k| k.1));
         roots.extend([o.guard, o.error]);
     }
     let mut done: rustc_hash::FxHashSet<NodeId> = Default::default();
@@ -1113,7 +1090,6 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             // same substitutions, and two outcomes are one only where they
             // agree in them too.
             fields: o.fields.iter().map(|f| f.1).chain(o.arc.iter().copied()).collect(),
-            keys: o.keys.clone(),
             rests: Vec::new(),
         };
         let size = cone(&d.graph, &lite.row()).len();
@@ -1139,7 +1115,7 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             // three-valued reading with the guards copied in, doubling each
             // round (room (6,0): a 41-node row under a 5M-node error).
             let o = settle_error(d, points.as_mut(), pts.as_ref(), room, o);
-            let same = |p: &Lite| class[p.t] == class[o.t] && p.keys == o.keys && p.fields == o.fields;
+            let same = |p: &Lite| class[p.t] == class[o.t] && p.fields == o.fields;
             match done.iter_mut().find(|(p, _)| same(p)) {
                 Some((p, pp)) => {
                     p.merge(d, o.guard, o.error, &o.rests);
@@ -1238,7 +1214,6 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
                 guard,
                 error: m(o.error),
                 fields: o.fields.iter().map(|f| m(*f)).collect(),
-                keys: o.keys.iter().map(|(i, k)| (*i, m(*k))).collect(),
                 rests: Vec::new(),
             };
             // This split's candidates first; the inherited ones are tried
@@ -1258,9 +1233,9 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
         }
         // A side that is two outcomes already made, case split on a
         // condition every lane decides, is them (`absorbed`).
-        let rows: Vec<(usize, Vec<(usize, NodeId)>, Vec<NodeId>)> = made.iter().map(|(l, _, _)| Waiting::key(&class, l)).collect();
+        let rows: Vec<RowKey> = made.iter().map(|(l, _, _)| Waiting::key(&class, l)).collect();
         for (si, (side, side_pts, fresh)) in made.into_iter().enumerate() {
-            let made_elsewhere = |k: &(usize, Vec<(usize, NodeId)>, Vec<NodeId>)| {
+            let made_elsewhere = |k: &RowKey| {
                 rows.iter().enumerate().any(|(j, r)| j != si && r == k) || work.index.contains_key(k) || done.iter().any(|(p, _)| Waiting::key(&class, p) == *k)
             };
             match absorbed(d, &class, &side, &fresh, made_elsewhere) {
@@ -1331,7 +1306,6 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             f.1 = *n;
         }
         o.arc = lite.fields[nf..].to_vec();
-        o.keys = lite.keys;
         if let (Some(p), Some(pts)) = (points.as_ref(), pts.as_ref()) {
             let g = p.position_guard(d, pts);
             o.guard = d.and(&o.guard, &g);
@@ -1536,7 +1510,7 @@ fn is_bool_op(op: &crate::transpile::graph::Op) -> bool {
     matches!(
         op,
         Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Not | Op::And | Op::Or | Op::Known | Op::ConstBool(_) | Op::UnknownBool(_) | Op::TileFlagAt
-            | Op::SplitValid(_) | Op::SplitValidTab(_) | Op::SplitOk(_) | Op::SplitOkTab(_) | Op::FragOk(_) | Op::NoWrap
+            | Op::SplitValid(_) | Op::SplitOk(_) | Op::FragOk(_) | Op::NoWrap
     )
 }
 
@@ -1668,7 +1642,7 @@ fn absorbed(
     class: &[usize],
     o: &Lite,
     cands: &[NodeId],
-    made: impl Fn(&(usize, Vec<(usize, NodeId)>, Vec<NodeId>)) -> bool,
+    made: impl Fn(&RowKey) -> bool,
 ) -> Option<Vec<Lite>> {
     use crate::transpile::graph::Op;
     // Only the ROW is rebuilt: the guard and the error read `cv` as the lane
@@ -1699,7 +1673,6 @@ fn absorbed(
                 guard,
                 error: o.error,
                 fields: o.fields.iter().map(|f| m(*f)).collect(),
-                keys: o.keys.iter().map(|(i, k)| (*i, m(*k))).collect(),
                 rests: o.rests.iter().map(|r| m(*r)).filter(|r| *r != cv).collect(),
             });
         }
@@ -1881,7 +1854,7 @@ pub fn at_buttons(g: &Graph, f: &Frame, bits: &[bool; 6]) -> Result<(Graph, Vec<
     let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.fields.iter().map(|(_, n, _)| *n).chain([o.guard, o.error])).collect();
     let need = crate::transpile::bdd::reachable(g, &roots);
     let mut out = g.like();
-    let map = g.specialize_subset_into(&cfg, None, Some(&need), &mut out);
+    let map = g.specialize_subset_into(&cfg, Some(&need), &mut out);
     Ok((out, map))
 }
 

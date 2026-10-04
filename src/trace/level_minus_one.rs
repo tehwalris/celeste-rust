@@ -547,7 +547,6 @@ impl<'a> Table<'a> {
         let mut cone = arena.like();
         cone.reset_forks();
         for k in 0..f.forks {
-            ensure!(f.fork_tables.get(k as usize).is_none_or(|t| t.is_empty()), "shape {id}: table fork {k} (not at exact speed)");
             cone.set_fork_ways(k, f.fork_ways[k as usize]);
         }
         let mut cmap: Vec<NodeId> = vec![NodeId::MAX; arena.len()];
@@ -578,7 +577,6 @@ impl<'a> Table<'a> {
                     cone.leaf(Op::Const(lo, hi))
                 }
                 Op::Known | Op::SplitOk(_) | Op::NoWrap => cone.leaf(Op::ConstBool(true)),
-                Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_) => bail!("shape {id}: a table fork"),
                 _ => {
                     if let Op::Split(k) | Op::SplitInt(k) = nd.op {
                         forks.entry(k).or_insert(args[0]);
@@ -638,7 +636,7 @@ impl Cone {
                 splits[*k as usize] = (rest % *w as usize) as u8;
                 rest /= *w as usize;
             }
-            let map = self.graph.specialize_subset_into(&splits, None, None, &mut shared);
+            let map = self.graph.specialize_subset_into(&splits, None, &mut shared);
             let m = |n: NodeId| map[n as usize];
             let outs_c: Vec<Roots> = self
                 .roots

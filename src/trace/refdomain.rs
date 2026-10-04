@@ -303,14 +303,6 @@ impl Domain for RefDomain {
         let k = self.cursor.choose(n);
         (floor_fragment(v, k), true)
     }
-
-    fn fork_int(&mut self, v: &Iv, _ways: u8) -> (Iv, bool) {
-        let n = floor_span(v);
-        let k = self.cursor.choose(n);
-        let base = v.low.flr().as_i16_or_err().unwrap_or(0) + k as i16;
-        let p = P8::from_i16(base);
-        (Iv::new(p, p), true)
-    }
 }
 
 #[cfg(test)]

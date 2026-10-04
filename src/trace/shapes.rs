@@ -257,7 +257,6 @@ pub fn rebase(st: &mut State<Symbolic>, d: &mut Symbolic, constants: &std::colle
     }
     blank(st, d)?;
     st.path.clear();
-    st.key_override.clear();
     Ok(())
 }
 

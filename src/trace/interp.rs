@@ -2243,7 +2243,7 @@ mod tests {
         let scope = heap.new_scope(None);
         let t = d.boolean(true);
         let f = d.boolean(false);
-        State { heap, globals, scope, stack: Vec::new(), guard: t, ended: f, path: Vec::new(), key_override: Vec::new(), frag: Vec::new(), arc: None }
+        State { heap, globals, scope, stack: Vec::new(), guard: t, ended: f, path: Vec::new(), frag: Vec::new(), arc: None }
     }
 
     /// Run `src` and read back the global `result`.

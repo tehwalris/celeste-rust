@@ -199,7 +199,6 @@ pub fn fresh_state<D: Domain>(d: &mut D) -> State<D> {
         guard: t,
         ended: d.boolean(false),
         path: Vec::new(),
-        key_override: Vec::new(),
         frag: Vec::new(),
         arc: None,
     };

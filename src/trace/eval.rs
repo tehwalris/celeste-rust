@@ -190,7 +190,7 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
             // first (`Graph::specialize_subset_into`): the buttons are forks
             // over a literal, and resolve to constants.
             Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::IntFrag(_) | Op::SplitOk(_) | Op::Frag(_) | Op::FragOk(_)
-            | Op::SplitTab(_) | Op::SplitValidTab(_) | Op::SplitKeyTab(_) | Op::SplitOkTab(_) | Op::Lo | Op::Hi => {
+            | Op::Lo | Op::Hi => {
                 bail!("node {} is {:?}: resolve the fork configuration before evaluating", id, node.op)
             }
         };
@@ -242,7 +242,7 @@ mod tests {
         assert!(eval(&d.graph, out, &env).is_err(), "an unresolved fork has no one value");
         for (c, want) in [(1u8, 1i16), (0, 0)] {
             let mut g = d.graph.like();
-            let map = d.graph.specialize_subset_into(&[c], None, None, &mut g);
+            let map = d.graph.specialize_subset_into(&[c], None, &mut g);
             assert_eq!(eval(&g, map[out as usize], &env).unwrap(), Conc::Num(P8::from_i16(want)));
         }
     }

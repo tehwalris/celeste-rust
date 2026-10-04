@@ -68,8 +68,7 @@ struct AsmBody {
     error_off: usize,
     live_off: usize,
     /// The fields the row key folds (`key_words`): the body's varying ones -
-    /// a per-row column the boundary does not widen to uniform - and every
-    /// keyed one.
+    /// a per-row column the boundary does not widen to uniform.
     key_fields: Vec<KeyField>,
     /// Where an emitted row's player x, player y, room x, room y come from
     /// (`search::pos_graph::block_cells`' inputs), so the append step can
@@ -1531,8 +1530,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
     let mut asm_bodies = Vec::with_capacity(bodies.len());
     for b in &bodies {
         let narc = r.bound.outcomes[b.outcome].arc.len();
-        let nkeys = r.bound.outcomes[b.outcome].keys.len();
-        let nfields = b.roots.len() - 2 - nkeys - narc; // roots = [fields.., error, live, keys.., arc..]
+        let nfields = b.roots.len() - 2 - narc; // roots = [fields.., error, live, arc..]
         let outputs = &r.bound.outcomes[b.outcome].outputs;
         anyhow::ensure!(
             outputs.len() == nfields,
@@ -1549,18 +1547,13 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
                 may_unknown: reads_unknown_output[b.roots[j] as usize],
             })
             .collect();
-        let okeys = &r.bound.outcomes[b.outcome].keys;
         let out_fields = &r.lowered.outs[b.outcome].fields;
         let key_fields = (0..nfields)
             .filter_map(|j| {
-                let keyed = okeys.iter().position(|(fi, _)| *fi == j);
-                if keyed.is_none() && (out_fields[j].konst_av.is_some() || out_fields[j].widen_uniform.is_some()) {
+                if out_fields[j].konst_av.is_some() || out_fields[j].widen_uniform.is_some() {
                     return None;
                 }
-                let root = match keyed {
-                    Some(k) => slot_of[off + nfields + 2 + k],
-                    None => slot_of[off + j],
-                };
+                let root = slot_of[off + j];
                 // A number root of an INTERVAL column is stored `[v, v]`
                 // (`BodyCols::num_as_ival`), which keys as the number.
                 Some(KeyField::new(outputs[j].0 as u64, compiled.root_offsets[root] as usize, compiled.root_kinds[root]))
@@ -1570,7 +1563,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
             None
         } else {
             anyhow::ensure!(narc == 2 * crate::trace::verify::ARC_AXIS_ROOTS, "shape {si} outcome {}: {narc} transfer roots", b.outcome);
-            let at = off + nfields + 2 + nkeys;
+            let at = off + nfields + 2;
             let roots = std::array::from_fn(|k| (compiled.root_offsets[slot_of[at + k]] as usize, compiled.root_kinds[slot_of[at + k]]));
             Some(ArcSlots { roots, fin: r.bound.outcomes[b.outcome].arc_fin })
         };
@@ -1760,15 +1753,11 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
     // timers) are pushed per row but the boundary replaces them with the
     // widened uniform value, so they fold in at that value.
     let widen = &r.bound.outcomes[oi].widen;
-    // The cells keyed on another node (the speed's bucket) are hashed per
-    // lane by the kernel whatever their stored value (`build_one_shape`),
-    // never folded in here at that value.
-    let keyed: Vec<usize> = r.bound.outcomes[oi].keys.iter().map(|(fi, _)| r.bound.outcomes[oi].outputs[*fi].0 as usize).collect();
     let empty = t.build();
     let mut part1: u64 = shape_hash;
     let mut part2: u64 = 0xa076_1d64_78bd_642f ^ shape_hash;
     for (c, cell) in empty.structure.iter().enumerate() {
-        if !matches!(cell, celeste_engine::runtime2::Cell2::Val) || keyed.contains(&c) {
+        if !matches!(cell, celeste_engine::runtime2::Cell2::Val) {
             continue;
         }
         let uniform = match widen.iter().find(|(wc, _)| *wc as usize == c) {

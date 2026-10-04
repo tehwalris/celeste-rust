@@ -13,7 +13,7 @@
 //! | operator | own error | why the kernel needs it |
 //! |---|---|---|
 //! | `Flr(x)`, `x` a set not within one integer | `not Known(Flr(x))` | the kernel floors the low end (`zi_flr_ok` is the test) |
-//! | a fork's fragment (`Split`, `SplitInt`, `SplitTab`, `SplitKeyTab`) of a set | not covered: `not SplitOk(ways)` / `not SplitOkTab` | a lane spanning more parts than are enumerated has none to go to |
+//! | a fork's fragment (`Split`, `SplitInt`) of a set | not covered: `not SplitOk(ways)` | a lane spanning more parts than are enumerated has none to go to |
 //! | `Sel(c, t, f)`, `c` lane-undecidable | `not Known(c)` | the kernel picks an arm by `c`'s value bit |
 //! | `Add`, `Sub`, `Neg` of an interval, not bounded inside the 16.16 range by the static ranges | `not NoWrap(op)` | the kernel computes each endpoint in wrapping i32: an overflow wraps it apart from the other |
 //!
@@ -165,10 +165,6 @@ fn own_error(d: &mut Symbolic, n: NodeId) -> Option<NodeId> {
         Op::Split(k) | Op::SplitInt(k) if d.abstract_beneath_lane_ops(a?) => {
             let ways = d.graph.fork_ways(k);
             let covered = d.graph.fold(Op::SplitOk(ways), vec![a?]);
-            d.graph.fold(Op::Not, vec![covered])
-        }
-        Op::SplitTab(k) | Op::SplitKeyTab(k) => {
-            let covered = d.graph.fold(Op::SplitOkTab(k), vec![a?]);
             d.graph.fold(Op::Not, vec![covered])
         }
         // Only where a LANE can hold `c` both ways: a condition the kernel
