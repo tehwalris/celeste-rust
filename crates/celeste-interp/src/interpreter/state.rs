@@ -15,19 +15,6 @@ type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
 // This eliminates the need to sort in shape_of_state.
 type ImOrdMap<K, V> = im::OrdMap<K, V>;
 
-/// Why a `filter_by_mask` happened. Used as the trace span name so the three
-/// very different causes can be told apart in a profile.
-pub type FilterReason = &'static str;
-
-/// A conditional branch whose condition differs across lanes: the state is
-/// split so each edge sees only its own lanes. Pure overhead - this is what
-/// making the program branch-free is meant to eliminate.
-pub const FILTER_BRANCH: FilterReason = "filter_branch";
-
-/// `__split_by_flr` refining an interval into integer-floor classes.
-/// Semantically necessary; this is the search fanning out, not overhead.
-pub const FILTER_SPLIT_FLR: FilterReason = "filter_split_flr";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub heap: Heap,
@@ -51,41 +38,6 @@ impl State {
             prints: Vec::new(),
             vector_size: 1,
         }
-    }
-
-    fn filter_by_mask_in_place(&mut self, mask: &[bool], reason: FilterReason) {
-        // The mask is scanned once here; every vector below gathers the
-        // kept lanes directly, O(kept) per vector instead of O(mask), and
-        // range-at-a-time (see `KeptLanes`).
-        let kept = super::value::KeptLanes::from_mask(mask);
-        self.filter_by_kept_in_place(&kept, Some(mask.len()), reason);
-    }
-
-    /// The one filter body. `lanes_before` is only needed by the branch
-    /// census, which is charged per *input* lane; callers that came from a
-    /// run list (the frontier subtract, lane chunking) pass `None` because
-    /// they are never `FILTER_BRANCH`.
-    fn filter_by_kept_in_place(
-        &mut self,
-        kept: &super::value::KeptLanes,
-        lanes_before: Option<usize>,
-        reason: FilterReason,
-    ) {
-
-        self.heap.filter_vectors_in_place(kept);
-        self.vector_size = kept.len();
-
-        if reason == FILTER_BRANCH {
-            let _before = lanes_before.expect("a branch filter always comes from a mask");
-        }
-    }
-
-    /// Filters all vector values in the state by a mask, cloning first.
-    /// The resulting state's vector_size will be the number of true values in the mask.
-    pub fn filter_by_mask_clone(&self, mask: &[bool], reason: FilterReason) -> Self {
-        let mut new_state = self.clone();
-        new_state.filter_by_mask_in_place(mask, reason);
-        new_state
     }
 
     /// Garbage collect the heap and renumber HeapIds deterministically.
@@ -159,7 +111,6 @@ impl State {
                 | Value::NumberInterval(_)
                 | Value::Bool(_)
                 | Value::UnknownBool
-                | Value::MaybeBool(_)
                 | Value::String(_)
                 | Value::Nil(_)
                 | Value::NilPointer(_)) => v,

@@ -43,9 +43,7 @@ use crate::transpile::graph::Room;
 /// `Col::U` cells).
 struct AsmField {
     cell: usize,
-    /// The root's slot (diagnostics) and its byte offset in the output
-    /// buffer (`Compiled::root_offsets`).
-    root: usize,
+    /// The root's byte offset in the output buffer (`Compiled::root_offsets`).
     off: usize,
     kind: RootKind,
     /// A boolean root an output widening may write UNKNOWN in some lanes (it
@@ -63,10 +61,10 @@ struct AsmBody {
     /// The fork configuration (two bits per fork), for diagnostics.
     splits: Vec<u8>,
     fields: Vec<AsmField>,
+    /// `error`'s slot (`CELESTE_KERNEL_EXPLAIN`).
     error_root: usize,
-    live_root: usize,
     /// `error`/`live`'s byte offsets in the output buffer (`Compiled::
-    /// root_offsets`); `error_root`/`live_root` are their slots.
+    /// root_offsets`).
     error_off: usize,
     live_off: usize,
     /// The fields the row key folds (`key_words`): the body's varying ones -
@@ -79,9 +77,6 @@ struct AsmBody {
     /// `None`: this outcome has no player object, or its `x`/`y` is not a
     /// plain number (every row is `NO_CELL`, as `block_cells` says).
     pos: Option<[PosSrc; 4]>,
-    /// Where this body's rows' speed key comes from (the bucket dispatch,
-    /// `dkey_of`). `None` at an exact-speed level or without a player.
-    dkey: Option<DKey>,
     /// The transfer roots (`search::arc_edges`): `None` unless the set was
     /// traced in arc mode.
     arc: Option<ArcSlots>,
@@ -124,28 +119,8 @@ impl ArcSlots {
     }
 }
 
-/// A body's rows' speed key: the dash constants per body; the buckets and
-/// the dash class per ROW - the speed's key roots (`SplitKeyTab`: which
-/// bucket a lane lands in is data, not a configuration) and `dash_time`.
-#[derive(Clone, Copy)]
-struct DKey {
-    dash: [i32; 4],
-    /// The byte offset of spd.x's key root in the output buffer (low end
-    /// first); `bucket_y` and `dash_time_slot` likewise.
-    bucket_x: usize,
-    /// spd.y's, where the level buckets y (`SpdPrecision::buckets_y`); an
-    /// x-only level has no y key root and every row's `by` is 0.
-    bucket_y: Option<usize>,
-    dash_time_slot: usize,
-    /// The edge tables, looked up once (`spd_buckets::edges` locks).
-    edges: [&'static [i32]; 2],
-}
-
 /// One field of a body's row key: its cell, the byte offset it is read from,
-/// and how its slot is read. A field keyed on another node (the speed under
-/// a bucket: stored tight, keyed on its bucket) is hashed per row even where
-/// its stored value is constant (`acc_template` leaves it out of `part`).
-/// A number and the point interval `[v, v]` key alike (`runtime2::av_code`),
+/// and how its slot is read. A number and the point interval `[v, v]` key alike (`runtime2::av_code`),
 /// so a number root keys the same whether its column stores it as a number
 /// or, typed by the shape's union, as `[v, v]`.
 ///
@@ -214,18 +189,6 @@ impl AsmBody {
             h2 = h2.wrapping_add(mix64(f.c[1] ^ code));
         }
         (h1, h2)
-    }
-
-    /// Row `i`'s speed key: its buckets and dash class read off the row,
-    /// the dash constants only where it is dashing.
-    #[inline]
-    fn dkey_of(&self, buf: &[u8], i: usize) -> Option<SpeedKey> {
-        let k = self.dkey?;
-        let word = |off: usize| u32::from_le_bytes(buf[off + i * 4..off + i * 4 + 4].try_into().unwrap()) as i32;
-        let dashing = word(k.dash_time_slot) > 0;
-        let bucket = |axis: usize, slot: usize| k.edges[axis].partition_point(|&e| e <= word(slot)) as u16;
-        let by = k.bucket_y.map_or(0, |s| bucket(1, s));
-        Some(SpeedKey { bx: bucket(0, k.bucket_x), by, dashing, dash: if dashing { k.dash } else { [0; 4] } })
     }
 }
 
@@ -327,12 +290,8 @@ struct AsmKernel {
     /// Per body: where its output roots (and its outcome's uniform cells)
     /// go in the shape's union columns. Built by `Registry::unify`.
     body_cols: Vec<BodyCols>,
-    /// DEBUG (CELESTE_ASM_EVAL_CHECK): the fused graph + its flat roots +
-    /// the room, so `run` can re-evaluate the SAME fused graph with the pure
-    /// interval evaluator (`eval_narrow_top_in`) per lane and diff it against the
-    /// assembled kernel's output. Separates an ASM-codegen bug (asm != eval)
-    /// from a fused-graph bug (asm == eval, both != interpreter). Also what a
-    /// decline's explanation evaluates (`explain_error`). KEPT ONLY under
+    /// The fused graph + its flat roots + the room, what a decline's
+    /// explanation evaluates (`explain_error`). KEPT ONLY under
     /// `kernel_graph_kept()`: otherwise empty, since every kernel set holding
     /// its graphs was gigabytes for nothing (2026-09-18).
     fused: crate::transpile::graph::Graph,
@@ -419,14 +378,6 @@ impl AsmKernel {
         let mut sc = Scratch::take(self);
         let Scratch { inbuf, outbuf, .. } = &mut sc;
         let body_cols = &self.body_cols;
-        // Pure-kernel throughput floor (CELESTE_KERNEL_DRYRUN=1): pack the
-        // inputs and call the kernel, then discard - no dedup, no
-        // materialize. Produces no rows, so it is a MEASUREMENT MODE ONLY
-        // (the frame comes out empty).
-        let dryrun = {
-            static DR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *DR.get_or_init(|| std::env::var_os("CELESTE_KERNEL_DRYRUN").is_some())
-        };
 
         CALL_STATS[1].fetch_add(only.count_ones().min(n as u32) as u64, std::sync::atomic::Ordering::Relaxed);
         CALL_STATS[2].fetch_add(16, std::sync::atomic::Ordering::Relaxed);
@@ -465,44 +416,11 @@ impl AsmKernel {
                     &ctx as *const AsmCtx as *const c_void,
                 );
             }
-            if dryrun {
-                sc.put_back();
-                return true;
-            }
-            if eval_check_on() {
-                self.eval_check(chunk, lanes, outbuf);
-            }
             let valid = (((1u32 << n) - 1) as u16) & only;
-            if liveok_on() {
-                // Per-lane coverage census: OR of live&!error over all bodies
-                // (lane kept by SOME outcome), and OR of live&error (lane
-                // DECLINED by some outcome). A lane that is neither kept nor
-                // declined is DROPPED as not-live - the graph considers it dead.
-                let (mut kept, mut declined, mut any_live) = (0u16, 0u16, 0u16);
-                for body in &self.bodies {
-                    let error = read_zb_may(outbuf, body.error_off);
-                    let live = read_zb_may(outbuf, body.live_off);
-                    kept |= live & !error & valid;
-                    declined |= live & error & valid;
-                    any_live |= live & valid;
-                }
-                let dropped = valid & !kept & !declined;
-                eprintln!(
-                    "[liveok] slice lanes={n} valid={valid:04x} kept={kept:04x} \
-                     declined={declined:04x} dropped(not-live)={dropped:04x} any_live={any_live:04x}"
-                );
-                if dropped != 0 {
-                    self.explain_dropped(chunk, lanes[dropped.trailing_zeros() as usize], dropped.trailing_zeros() as usize, outbuf);
-                }
-            }
-            // DIAGNOSTIC (CELESTE_BODYSETS=1): which bodies take each lane -
-            // the per-lane body SET, whose distinct count over a frame is
-            // how many kernels a dispatch keyed on it would need.
-            let mut lane_sets: Option<Vec<Vec<u64>>> = bodysets_on().then(|| vec![vec![0u64; self.bodies.len().div_ceil(64)]; n]);
             // BACKWARD: lanes already known to reach a target; nothing more
             // to learn from them.
             let mut hit_lanes: u16 = 0;
-            for (bi, (body, cols)) in self.bodies.iter().zip(body_cols).enumerate() {
+            for (body, cols) in self.bodies.iter().zip(body_cols) {
                 // `error`/`live` are tri-state ZB masks, read with ONE
                 // polarity (plans/graph-model.md section 5): each where it
                 // MAY hold. An unknown `live` reads as live (the row's hull
@@ -558,14 +476,6 @@ impl AsmKernel {
                 n_bodies += 1;
                 if take == 0 {
                     continue;
-                }
-                if let Some(ls) = lane_sets.as_mut() {
-                    let mut t = take;
-                    while t != 0 {
-                        let i = t.trailing_zeros() as usize;
-                        t &= t - 1;
-                        ls[i][bi / 64] |= 1 << (bi % 64);
-                    }
                 }
                 n_bodies_taken += 1;
                 n_lanes += take.count_ones() as u64;
@@ -630,22 +540,14 @@ impl AsmKernel {
                         if sink.edges_on && first_cin != cin {
                             sink.edges.insert((cin, cell_out(body, outbuf, i)));
                         }
-                        // THE SPEED HULL: the same key with another speed
-                        // fragment is not the same row. Still queued: its
-                        // hull widens in place. Already flushed (an id in
-                        // the cache): pushed again, and the flush's door
-                        // decides - inside the hull, the old id; outside, a
-                        // grown row.
-                        let hull = cols.lane_hull(outbuf, i);
                         match slice_base {
-                            Some(b) if r & RowCache::ID_FLAG != 0 && hull.is_none() => {
+                            Some(b) if r & RowCache::ID_FLAG != 0 => {
                                 sink.direct_edge(r & !RowCache::ID_FLAG, b, glane(i));
                                 if let Some(t) = arc {
                                     sink.arc_direct(r & !RowCache::ID_FLAG, b, glane(i), t);
                                 }
                                 continue;
                             }
-                            Some(_) if r & RowCache::ID_FLAG != 0 => {}
                             Some(_) if r & RowCache::DROP_FLAG != 0 => continue,
                             // The row was flushed (a stale ref, only if
                             // the cache lost the flush's write-back): push
@@ -654,9 +556,6 @@ impl AsmKernel {
                             Some(b) => {
                                 if let Some(t) = arc {
                                     sink.arc_at_ref(r, b, glane(i), t);
-                                }
-                                if let (Some(h), Some(s)) = (hull, cols.spd) {
-                                    sink.hull_union_at(r, s[0].0, s[1].0, h);
                                 }
                                 continue;
                             }
@@ -673,7 +572,7 @@ impl AsmKernel {
                     // The queue for (shape, cell), over the shape's union
                     // skeleton: the run cache makes this one compare for a
                     // run of rows at one cell.
-                    let q = sink.queue(template.shape_hash, cout, body.dkey_of(outbuf, i), || (*template.union).clone_block());
+                    let q = sink.queue(template.shape_hash, cout, || (*template.union).clone_block());
                     cols.push_row(&mut sink.slots[q], outbuf, i, key, cout);
                     if let Some(b) = slice_base {
                         sink.slots[q].pred_base.push(b);
@@ -687,133 +586,12 @@ impl AsmKernel {
                     sink.pushed(q).expect("flushing a full queue");
                 }
             }
-            if let Some(ls) = lane_sets {
-                let mut m = BODYSETS.lock().expect("bodysets");
-                let e = m.entry(chunk.shape_hash).or_default();
-                for s in ls {
-                    *e.entry(s).or_default() += 1;
-                }
-            }
         }
         sc.put_back();
         for (i, n) in [n_bodies, n_bodies_taken, n_lanes, n_unique].into_iter().enumerate() {
             CALL_STATS[3 + i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         }
         true
-    }
-
-    /// from the interpreter. Prints at most a few mismatches per chunk.
-    /// A lane no body is live for: evaluate the fused graph for it and
-    /// print every fork node's value and each body's (live, error) under
-    /// the evaluator against the kernel's. Diagnostic for the liveok
-    /// census (`CELESTE_ASM_LIVEOK`), first such lane per call.
-    fn explain_dropped(&self, chunk: &Rt2, lane: usize, i: usize, outbuf: &[u8]) {
-        use crate::transpile::graph::{Op, Val};
-        static SHOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2 {
-            return;
-        }
-        let ids = crate::compiled::ids();
-        let mut desc = String::new();
-        for obj in chunk.player_objects(ids) {
-            for (name, f) in [("rem", ids.f_rem), ("spd", ids.f_spd)] {
-                if let Some(pc) = chunk.obj_field_cell(obj, f) {
-                    if let Col::U(AV::Ptr(sub)) = chunk.cols[pc as usize] {
-                        for (axis, g) in [("x", ids.f_x), ("y", ids.f_y)] {
-                            if let Some(c) = chunk.obj_field_cell(sub, g) {
-                                desc.push_str(&format!(" {name}.{axis}={:?}", chunk.cols[c as usize].at(lane)));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        eprintln!("[dropped] shape {:#x} lane {lane}:{desc}", chunk.shape_hash);
-        let mut cells: std::collections::HashMap<u32, Val> = Default::default();
-        for &cell in &self.compiled.input_cells {
-            let v = match chunk.cols[cell as usize].at(lane) {
-                AV::Num(p) => Val::Num(crate::pico8_num::Pico8NumInterval::new(p, p)),
-                AV::Ival(a, b) => Val::Num(crate::pico8_num::Pico8NumInterval::new(a, b)),
-                AV::Bool(b) => Val::Bool(Some(b)),
-                AV::UBool => Val::Bool(None),
-                _ => continue,
-            };
-            cells.insert(cell, v);
-        }
-        let vals = match self.fused.eval_narrow_top_in(&cells, &self.room) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[dropped]   graph evaluation failed: {e:#}");
-                return;
-            }
-        };
-        for id in 0..self.fused.len() as crate::transpile::graph::NodeId {
-            let node = self.fused.get(id);
-            if matches!(node.op, Op::SplitOk(_) | Op::FragOk(_) | Op::Frag(_)) {
-                let x = node.args[0];
-                eprintln!("[dropped]   {id} {:?} = {:?}; operand {x} {:?} = {:?}", node.op, vals[id as usize], self.fused.get(x).op, vals[x as usize]);
-            }
-        }
-        let mut n_live_eval = 0;
-        for (bi, body) in self.bodies.iter().enumerate() {
-            let live_asm = read_zb_may(outbuf, body.live_off) & (1 << i) != 0;
-            let error_asm = read_zb_may(outbuf, body.error_off) & (1 << i) != 0;
-            let live_ev = vals[self.flat_roots[body.live_root] as usize];
-            let error_ev = vals[self.flat_roots[body.error_root] as usize];
-            if live_ev != Val::Bool(Some(false)) || live_asm {
-                n_live_eval += 1;
-                if n_live_eval <= 6 {
-                    eprintln!("[dropped]   body {bi} outcome {} splits {:?}: live eval {:?} asm {live_asm}; error eval {:?} asm {error_asm}", body.outcome, body.splits, live_ev, error_ev);
-                    eprintln!("[dropped]   the live leaves the evaluator cannot decide:");
-                    self.explain_bool(chunk, lane, self.flat_roots[body.live_root]);
-                }
-            }
-        }
-        eprintln!("[dropped]   {n_live_eval} bodies live under the evaluator or the kernel");
-    }
-
-    /// Descend a boolean DAG from `root` through And/Or/Not along the
-    /// undecided operands and print the undecided LEAVES (comparisons,
-    /// forks, cart lookups) with their operands' values.
-    fn explain_bool(&self, chunk: &Rt2, lane: usize, root: crate::transpile::graph::NodeId) {
-        use crate::transpile::graph::{Op, Val};
-        let mut cells: std::collections::HashMap<u32, Val> = Default::default();
-        for &cell in &self.compiled.input_cells {
-            let v = match chunk.cols[cell as usize].at(lane) {
-                AV::Num(p) => Val::Num(crate::pico8_num::Pico8NumInterval::new(p, p)),
-                AV::Ival(a, b) => Val::Num(crate::pico8_num::Pico8NumInterval::new(a, b)),
-                AV::Bool(b) => Val::Bool(Some(b)),
-                AV::UBool => Val::Bool(None),
-                _ => continue,
-            };
-            cells.insert(cell, v);
-        }
-        let Ok(vals) = self.fused.eval_narrow_top_in(&cells, &self.room) else { return };
-        let mut stack = vec![root];
-        let mut seen = std::collections::HashSet::new();
-        let mut shown = 0;
-        while let Some(n) = stack.pop() {
-            if !seen.insert(n) || shown >= 10 {
-                continue;
-            }
-            let node = self.fused.get(n);
-            let v = vals[n as usize];
-            match node.op {
-                Op::And => stack.extend(node.args.iter().copied().filter(|&a| vals[a as usize] != Val::Bool(Some(true)))),
-                Op::Or => stack.extend(node.args.iter().copied().filter(|&a| vals[a as usize] != Val::Bool(Some(false)))),
-                Op::Not => stack.push(node.args[0]),
-                Op::Sel => stack.extend(node.args.iter().copied()),
-                _ => {
-                    shown += 1;
-                    let args: Vec<String> = node
-                        .args
-                        .iter()
-                        .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
-                        .collect();
-                    eprintln!("[kernel]   leaf {} {:?} = {:?}; args {}", n, node.op, v, args.join(", "));
-                }
-            }
-        }
     }
 
     /// On a decline: evaluate the fused graph for `lane` and print the
@@ -859,29 +637,6 @@ impl AsmKernel {
                     .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
                     .collect();
                 eprintln!("[kernel]   error disjunct {} {:?} = {:?}; args {}", n, node.op, vals[n as usize], args.join(", "));
-                // The whole sub-DAG under it (bounded), when asked: what
-                // `CELESTE_EXPLAIN_DEPTH=N` prints is every node within N
-                // steps of the conjunct, once, with its value.
-                if let Some(depth) = std::env::var("CELESTE_EXPLAIN_DEPTH").ok().and_then(|v| v.parse::<usize>().ok()) {
-                    let mut frontier = vec![n];
-                    let mut printed = std::collections::HashSet::new();
-                    for _ in 0..depth {
-                        let mut next = Vec::new();
-                        for id in frontier {
-                            if !printed.insert(id) {
-                                continue;
-                            }
-                            let nd = self.fused.get(id);
-                            if matches!(nd.op, Op::Const(..) | Op::ConstBool(_)) {
-                                continue;
-                            }
-                            let args: Vec<String> = nd.args.iter().map(|&a| format!("{a}")).collect();
-                            eprintln!("[kernel]     {} {:?} = {:?}; args {}", id, nd.op, vals[id as usize], args.join(","));
-                            next.extend(nd.args.iter().copied());
-                        }
-                        frontier = next;
-                    }
-                }
                 // The undecided CONDITION behind it: follow Sels through
                 // their known conditions (and a comparison's Sel operands)
                 // to the first condition the lane cannot decide.
@@ -963,65 +718,6 @@ impl AsmKernel {
                                 }
                             }
                         }
-                    }
-                }
-            }
-        }
-    }
-
-    fn eval_check(&self, chunk: &Rt2, lanes: &[usize], outbuf: &[u8]) {
-        let n = lanes.len();
-        use crate::transpile::graph::Val;
-        static PRINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        for i in 0..n {
-            // Build the per-lane input cells from the block columns.
-            let mut cells: std::collections::HashMap<u32, Val> = Default::default();
-            for &cell in &self.compiled.input_cells {
-                let v = match chunk.cols[cell as usize].at(lanes[i]) {
-                    AV::Num(p) => Val::Num(crate::pico8_num::Pico8NumInterval::new(p, p)),
-                    AV::Ival(a, b) => Val::Num(crate::pico8_num::Pico8NumInterval::new(a, b)),
-                    AV::Bool(b) => Val::Bool(Some(b)),
-                    AV::UBool => Val::Bool(None),
-                    _ => continue,
-                };
-                cells.insert(cell, v);
-            }
-            let vals = match self.fused.eval_narrow_top_in(&cells, &self.room) {
-                Ok(v) => v,
-                Err(e) => {
-                    if PRINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-                        eprintln!("[eval-check] lane {} eval err: {e:#}", lanes[i]);
-                    }
-                    return;
-                }
-            };
-            for body in &self.bodies {
-                for f in &body.fields {
-                    let asm = read_field_av(f, outbuf, i);
-                    let node = self.flat_roots[f.root];
-                    let ev = vals[node as usize];
-                    let agree = match (asm, ev) {
-                        (AV::Num(p), Val::Num(iv)) => {
-                            p.as_raw_u32() == iv.low.as_raw_u32()
-                                && iv.low.as_raw_u32() == iv.high.as_raw_u32()
-                        }
-                        (AV::Ival(a, b), Val::Num(iv)) => {
-                            a.as_raw_u32() == iv.low.as_raw_u32()
-                                && b.as_raw_u32() == iv.high.as_raw_u32()
-                        }
-                        (AV::Bool(x), Val::Bool(Some(y))) => x == y,
-                        (AV::UBool, Val::Bool(None)) => true,
-                        _ => false,
-                    };
-                    if !agree && PRINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
-                        eprintln!(
-                            "[eval-check] lane {} cell {} root {}: ASM {:x?} vs EVAL {:x?}",
-                            lanes[i],
-                            f.cell,
-                            f.root,
-                            asm,
-                            ev,
-                        );
                     }
                 }
             }
@@ -1146,43 +842,8 @@ impl AsmKernel {
 }
 
 /// A thread's reusable scratch for one kernel: the packed input and the
-/// output buffer and the dedup cache. Kept per (thread, kernel) across
-/// calls so no unit allocates them afresh.
-fn bodysets_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CELESTE_BODYSETS").is_some())
-}
-
-/// DIAGNOSTIC: per input shape, the distinct per-lane body sets and how
-/// many lanes had each (`CELESTE_BODYSETS=1`, printed by `print_bodysets`).
-static BODYSETS: std::sync::Mutex<std::collections::BTreeMap<u64, std::collections::HashMap<Vec<u64>, u64>>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-pub fn print_bodysets() {
-    let m = BODYSETS.lock().expect("bodysets");
-    if m.is_empty() {
-        return;
-    }
-    for (shape, sets) in m.iter() {
-        let lanes: u64 = sets.values().sum();
-        let mut counts: Vec<u64> = sets.values().copied().collect();
-        counts.sort_unstable_by(|a, b| b.cmp(a));
-        let top: u64 = counts.iter().take(16).sum();
-        let top64: u64 = counts.iter().take(64).sum();
-        let sizes: Vec<u32> = sets.keys().map(|s| s.iter().map(|w| w.count_ones()).sum()).collect();
-        let avg_size = sizes.iter().map(|&x| x as f64).sum::<f64>() / sizes.len().max(1) as f64;
-        eprintln!(
-            "[bodysets] shape {:016x}: {} lanes, {} distinct body sets (avg {:.1} bodies per set); top 16 sets cover {:.1}% of lanes, top 64 {:.1}%",
-            shape,
-            lanes,
-            sets.len(),
-            avg_size,
-            100.0 * top as f64 / lanes.max(1) as f64,
-            100.0 * top64 as f64 / lanes.max(1) as f64
-        );
-    }
-}
-
+/// output buffer. Kept per (thread, kernel) across calls so no unit
+/// allocates them afresh.
 struct Scratch {
     kernel: usize,
     inbuf: Vec<u8>,
@@ -1223,17 +884,11 @@ impl Scratch {
 struct BodyCols {
     num: Vec<(usize, usize)>,
     ival: Vec<(usize, usize)>,
-    /// A NUMBER root into an interval column, stored as `[v, v]`: the
-    /// speed under a bucket is an interval column of the shape, and an
-    /// outcome that sets it exactly (`spd.x = 0` on a wall, the spring's
-    /// `spd.y = -3`) computes a number for it (the speed hull, 2026-09-15).
+    /// A NUMBER root into an interval column (the shape's union types a
+    /// cell `Ival` where another outcome holds an interval), stored `[v, v]`.
     num_as_ival: Vec<(usize, usize)>,
     /// `(column, root, may the root be unknown)` (`AsmField::may_unknown`).
     bool_: Vec<(usize, usize, bool)>,
-    /// The speed hull's columns when the level buckets the speed: the
-    /// queue column and output root of `spd.x` and `spd.y`, each root a
-    /// number (`is_num`) or an interval. `None` at exact speed.
-    spd: Option<[(usize, usize, bool); 2]>,
     uniform_num: Vec<(usize, u32)>,
     uniform_ival: Vec<(usize, (u32, u32))>,
     uniform_bool: Vec<(usize, u8)>,
@@ -1282,31 +937,7 @@ impl BodyCols {
                 (_, v) => anyhow::bail!("union column at cell {cell}: the outcome's uniform {v:?} does not fit its kind"),
             }
         }
-        let spd = proto.speed_typed_cols().and_then(|(tx, ty)| {
-            let find = |ci: usize| -> Option<(usize, usize, bool)> {
-                ival.iter().find(|(c, _)| *c == ci).map(|&(c, r)| (c, r, false))
-                    .or_else(|| num_as_ival.iter().find(|(c, _)| *c == ci).map(|&(c, r)| (c, r, true)))
-            };
-            Some([find(tx)?, find(ty)?])
-        });
-        Ok(BodyCols { num, ival, num_as_ival, bool_, spd, uniform_num, uniform_ival, uniform_bool })
-    }
-
-    /// Lane `i`'s speed hull off the output buffer (`spd` columns).
-    #[inline]
-    fn lane_hull(&self, buf: &[u8], i: usize) -> Option<crate::search::door::Hull> {
-        let s = self.spd?;
-        let word = |base: usize| u32::from_le_bytes(buf[base..base + 4].try_into().unwrap()) as i32;
-        let range = |(_, root, is_num): (usize, usize, bool)| -> (i32, i32) {
-            let lo = word(root + i * 4);
-            if is_num {
-                (lo, lo)
-            } else {
-                (lo, word(root + 64 + i * 4))
-            }
-        };
-        let (x, y) = (range(s[0]), range(s[1]));
-        Some([x.0, x.1, y.0, y.1])
+        Ok(BodyCols { num, ival, num_as_ival, bool_, uniform_num, uniform_ival, uniform_bool })
     }
 
     /// Append lane `i` of the output buffer to `slot` as one row.
@@ -1425,14 +1056,10 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     if exact {
         b.boundary_exact();
     } else {
-        // The key hashes the speed BUCKET (the row stores the hull).
-        if let Some(w) = crate::interpreter::abstraction::spd_precision().width_log2() {
-            b.widen_to(&super::boundary_ids(), 0, Some((w, crate::interpreter::abstraction::spd_precision().buckets_y())), (1, 1), false, false, celeste_engine::runtime2::FloorsWidening::Exact, false);
-        }
         b.boundary(&super::boundary_ids());
     }
     // A queue holds rows from SEVERAL kernel calls (the call's dedup cache
-    // is per call; a bucketed chunk is one call per speed key), and the
+    // is per call), and the
     // flush collapses equal keys - so the append step's DISTINCT keys must
     // be the boundary's, duplicates allowed. Demanding no duplicates fired
     // on the exact-speed forward that reproduces every pinned gate
@@ -1476,12 +1103,6 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     );
 }
 
-/// DEBUG gate for the per-lane fused-graph re-evaluation (`eval_check`).
-fn liveok_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CELESTE_ASM_LIVEOK").is_some())
-}
-
 /// `CELESTE_KERNEL_KEY_CHECK=1`: verify every finished acc against
 /// `Rt2::boundary` (see `check_against_boundary`).
 fn key_check_on() -> bool {
@@ -1489,16 +1110,11 @@ fn key_check_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_KEY_CHECK").is_some())
 }
 
-fn eval_check_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CELESTE_ASM_EVAL_CHECK").is_some())
-}
-
-/// Whether kernels keep their fused graphs after assembly: for the eval check,
-/// and for `CELESTE_KERNEL_EXPLAIN` (a decline names the premise it failed).
+/// Whether kernels keep their fused graphs after assembly
+/// (`CELESTE_KERNEL_EXPLAIN`): a decline then names the premise it failed.
 fn kernel_graph_kept() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| eval_check_on() || std::env::var_os("CELESTE_KERNEL_EXPLAIN").is_some())
+    *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_EXPLAIN").is_some())
 }
 
 fn num_raw(av: AV) -> i32 {
@@ -1521,16 +1137,13 @@ fn ival_raw(av: AV) -> (i32, i32) {
 /// section 5). `val` at +0, `known` at +2 of the 128-byte slot.
 ///
 /// For `live` it means an UNKNOWN guard reads as live. An unknown guard is
-/// a branch condition on a value the lane holds an INTERVAL of (a bucketed
-/// speed: `spd.x ~= 0` on `[0, 1)`), which the tracer could not merge away -
-/// the two arms have different shapes, or the merged guard `Or(g & c, g &
-/// !c)` is itself unknown where `c` is. The lane stands for points on both
-/// sides, so the body's hull covers some of them: emitting the row
-/// over-approximates (a finer level, where the speed is exact and `c`
-/// decided, refutes the spurious half), while NOT emitting it loses real
-/// successors. Before, this read unknown as not-live, and room (2,0) under
-/// `CELESTE_SPD_LADDER=level0` silently dropped lanes in 813 slices of its
-/// first 32 frames (2026-09-14).
+/// a branch condition on a value the lane holds an INTERVAL of, which the
+/// tracer could not merge away - the two arms have different shapes, or the
+/// merged guard `Or(g & c, g & !c)` is itself unknown where `c` is. The lane
+/// stands for points on both sides, so the body's hull covers some of them:
+/// emitting the row over-approximates (a finer level refutes the spurious
+/// half), while NOT emitting it loses real successors (room (2,0)'s speed
+/// buckets silently dropped lanes in 813 slices that way, 2026-09-14).
 ///
 /// For `error` it means an undecided error is a decline: strict.
 fn read_zb_may(buf: &[u8], off: usize) -> u16 {
@@ -1542,11 +1155,6 @@ fn read_zb_may(buf: &[u8], off: usize) -> u16 {
 /// The boundary's row-key mix seeds (see `runtime2::boundary_finish`); the
 /// append folds the same cell_mix so its dedup key equals the boundary's.
 use celeste_engine::runtime2::{KEY_SEED1, KEY_SEED2};
-
-/// The `AV` a field root holds for lane `i` (for the dedup fold).
-fn read_field_av(f: &AsmField, buf: &[u8], i: usize) -> AV {
-    read_root_av(f.off, f.kind, buf, i)
-}
 
 /// The `AV` the output root at byte offset `base`, of kind `kind`, holds for
 /// lane `i`.
@@ -1580,76 +1188,18 @@ fn read_root_av(base: usize, kind: RootKind, buf: &[u8], i: usize) -> AV {
 /// The start room's assembled kernels, keyed by input shape hash, for one
 /// rem-precision mode.
 pub(crate) struct Registry {
-    /// One kernel per (input shape, speed key): the key is `None` at an
-    /// exact-speed level and for a shape without a player; at a bucketed
-    /// level every key the key fixpoint reached (`trace::kernel::
-    /// key_fixpoint`) has its kernel here, built up front, and a row with
-    /// a key that is not here is a coverage gap.
-    /// With a region key (`trace::kernel::RegionGrid`), one per reached
-    /// (shape, region) too.
-    kernels: HashMap<(u64, KernelKey), AsmKernel>,
+    /// One kernel per input shape - with a region key
+    /// (`trace::kernel::RegionGrid`), per reached (shape, region) - and a row
+    /// with a key that is not here is a coverage gap.
+    kernels: HashMap<(u64, Option<Region>), AsmKernel>,
     /// The rung-agnostic / exact sets go through `boundary_exact`; the
     /// level-0 set through `boundary`.
     exact_boundary: bool,
-    /// The grid width `2^w` of a bucketed level's edge tables.
-    w: Option<u8>,
     /// The region grid the set was built on.
     grid: Option<crate::trace::kernel::RegionGrid>,
 }
 
-use crate::trace::kernel::{KernelKey, SpeedKey};
-
-/// The speed key of row `lane` of `rt2` at the current level: `None` at an
-/// exact-speed level or without a player (the reference path's rows).
-pub fn speed_key_of_row(rt2: &Rt2, lane: usize) -> Option<SpeedKey> {
-    let w = crate::interpreter::abstraction::spd_precision().width_log2()?;
-    speed_keys(rt2, w).map(|k| k[lane])
-}
-
-/// Per lane of `chunk`, what its kernel is specialized on; `None` for a
-/// shape without a player.
-pub(crate) fn speed_keys(chunk: &Rt2, w: u8) -> Option<Vec<SpeedKey>> {
-    // `WidthLog2X`: spd.y is exact and not part of the key.
-    let buckets_y = crate::interpreter::abstraction::spd_precision().buckets_y();
-    let ids = crate::compiled::ids();
-    let hulls = chunk.speed_hulls(ids)?;
-    let obj = *chunk.player_objects(ids).first()?;
-    let num_col = |f: u32| -> Option<u32> { chunk.obj_field_cell(obj, f) };
-    let xy = |f: u32| -> Option<(u32, u32)> {
-        let pc = chunk.obj_field_cell(obj, f)?;
-        let Col::U(AV::Ptr(sub)) = chunk.cols[pc as usize] else { return None };
-        Some((chunk.obj_field_cell(sub, ids.f_x)?, chunk.obj_field_cell(sub, ids.f_y)?))
-    };
-    let dt = num_col(ids.f_dash_time);
-    let (target, accel) = (xy(ids.f_dash_target), xy(ids.f_dash_accel));
-    let raw = |c: Option<u32>, lane: usize| -> i32 {
-        match c.map(|c| chunk.cols[c as usize].at(lane)) {
-            Some(AV::Num(n)) => n.as_raw_u32() as i32,
-            Some(other) => panic!("dispatch key cell holds {other:?}, not a number"),
-            None => 0,
-        }
-    };
-    Some(
-        (0..chunk.width)
-            .map(|lane| {
-                let h = hulls[lane];
-                let bx = celeste_core::spd_buckets::index(h[0], w, 0);
-                let by = if buckets_y { celeste_core::spd_buckets::index(h[2], w, 1) } else { 0 };
-                debug_assert!(
-                    celeste_core::spd_buckets::index(h[1], w, 0) == bx && (!buckets_y || celeste_core::spd_buckets::index(h[3], w, 1) == by),
-                    "lane {lane}: speed hull {h:?} straddles a bucket edge"
-                );
-                let dashing = raw(dt, lane) > 0;
-                let dash = if dashing {
-                    [raw(target.map(|t| t.0), lane), raw(target.map(|t| t.1), lane), raw(accel.map(|t| t.0), lane), raw(accel.map(|t| t.1), lane)]
-                } else {
-                    [0; 4]
-                };
-                SpeedKey { bx, by, dashing, dash }
-            })
-            .collect(),
-    )
-}
+use crate::trace::kernel::Region;
 
 impl Registry {
     pub fn len(&self) -> usize {
@@ -1657,10 +1207,9 @@ impl Registry {
     }
 
     /// Run `chunk` on the matching kernel; `false` if no kernel binds (a
-    /// miss) or the chunk declined. At a bucketed level the rows of a
-    /// block come in RUNS of one speed key (the queues are keyed by it),
-    /// and each run goes to its key's kernel as a contiguous range; with a
-    /// region key the rows come in cell order, so in runs of one region.
+    /// miss) or the chunk declined. With a region key the rows come in cell
+    /// order, so in runs of one region, and each run goes to its region's
+    /// kernel as a contiguous range.
     pub fn run_chunk(
         &self,
         chunk: &Rt2,
@@ -1668,17 +1217,14 @@ impl Registry {
         lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
     ) -> bool {
-        if self.w.is_none() && self.grid.is_none() {
-            return self.run_key(chunk, KernelKey { speed: None, region: None }, cell_in, lanes, sink);
+        if self.grid.is_none() {
+            return self.run_key(chunk, None, cell_in, lanes, sink);
         }
-        let keys = self.w.and_then(|w| speed_keys(chunk, w));
         // A region only where the shape has a PLAYER (`shapes::player_path`,
         // the walk's rule): a row's cell also locates a `player_spawn`, whose
         // shape's kernel has no region (room (3,0) f1: the spawn at y=128).
         let grid = self.grid.filter(|_| !chunk.player_objects(crate::compiled::ids()).is_empty());
-        let key_of = |lane: usize| -> KernelKey {
-            KernelKey { speed: keys.as_ref().map(|k| k[lane]), region: grid.and_then(|g| g.of_cell(cell_in[lane])) }
-        };
+        let key_of = |lane: usize| -> Option<Region> { grid.and_then(|g| g.of_cell(cell_in[lane])) };
         let mut lo = lanes.start;
         while lo < lanes.end {
             let k = key_of(lo);
@@ -1697,7 +1243,7 @@ impl Registry {
     fn run_key(
         &self,
         chunk: &Rt2,
-        key: KernelKey,
+        key: Option<Region>,
         cell_in: &[u32],
         lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
@@ -1707,7 +1253,7 @@ impl Registry {
             None => {
                 // Diagnose a coverage gap: which (shape, key) has no
                 // assembled kernel. Printed once per distinct one.
-                static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u64, KernelKey)>>> =
+                static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u64, Option<Region>)>>> =
                     std::sync::OnceLock::new();
                 let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
                 if seen.lock().unwrap().insert((chunk.shape_hash, key)) {
@@ -1725,15 +1271,9 @@ impl Registry {
     }
 
     /// Retrace the start room and assemble every shape for one lattice set
-    /// (`opts`). `root` is the repo root (Lua sources + cart). `decide =
-    /// true` matches the Rust kernel so the assembled compute is the same
-    /// fused graph. `exact_boundary` selects `boundary_exact` for the
-    /// rung-agnostic / exact sets.
-    /// How many kernels the set has.
-    pub fn kernel_count(&self) -> usize {
-        self.kernels.len()
-    }
-
+    /// (`opts`). `root` is the repo root (Lua sources + cart).
+    /// `exact_boundary` selects `boundary_exact` for the ladder and exact
+    /// sets.
     pub fn build_for_start_room(
         root: &Path,
         opts: crate::trace::shapes::WalkOpts,
@@ -1742,10 +1282,6 @@ impl Registry {
         let t_trace = std::time::Instant::now();
         let refs = crate::trace::kernel::lattice_kernel_refs(root, opts)
             .context("retracing the start room for ASM kernels")?;
-        let w = opts.spd.width_log2();
-        // Of the level being built, not the process-global one: the sets of
-        // several levels build in parallel.
-        let buckets_y = opts.spd.buckets_y();
         let trace_s = t_trace.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
         let n_workers = std::thread::available_parallelism()
@@ -1754,7 +1290,7 @@ impl Registry {
             .min(refs.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let refs_ref = &refs;
-        let mut built: Vec<(usize, Result<(u64, KernelKey, AsmKernel)>)> = std::thread::scope(|scope| {
+        let mut built: Vec<(usize, Result<(u64, Option<Region>, AsmKernel)>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..n_workers)
                 .map(|_| {
                     let next = &next;
@@ -1769,7 +1305,7 @@ impl Registry {
                                     break;
                                 }
                                 let (key, r) = &refs_ref[si];
-                                out.push((si, build_one_shape(r, si, &format!("_{si}"), key.speed, key.region, w, buckets_y).map(|(shape, _, kernel)| (shape, *key, kernel))));
+                                out.push((si, build_one_shape(r, si, &format!("_{si}")).map(|(shape, kernel)| (shape, *key, kernel))));
                             }
                             out
                         })
@@ -1780,7 +1316,7 @@ impl Registry {
         });
         built.sort_by_key(|(si, _)| *si);
         let mut kernels = HashMap::new();
-        let mut first: HashMap<(u64, crate::trace::kernel::KernelKey), usize> = HashMap::new();
+        let mut first: HashMap<(u64, Option<Region>), usize> = HashMap::new();
         for (si, res) in built {
             let (shape, key, kernel) = res?;
             if kernels.insert((shape, key), kernel).is_some() {
@@ -1803,7 +1339,7 @@ impl Registry {
             n_workers,
         );
         eprintln!("[asm build]   phases, summed over workers and concurrent builds: {}", crate::transpile::lower::build_profile());
-        Ok(Registry { kernels, exact_boundary, w, grid: crate::trace::kernel::region_grid_for(opts)? })
+        Ok(Registry { kernels, exact_boundary, grid: crate::trace::kernel::region_grid() })
     }
 }
 
@@ -1841,7 +1377,7 @@ fn typed(kind: Kind) -> Col {
 /// columns (`BodyCols`). The reference engine's rule (every numeric and
 /// boolean cell typed) is the same idea without the registry to narrow
 /// it.
-fn unify(by_shape: &mut HashMap<(u64, KernelKey), AsmKernel>) -> Result<()> {
+fn unify(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel>) -> Result<()> {
     let mut unions: HashMap<u64, Rt2> = HashMap::new();
     for kernel in by_shape.values() {
         for t in &kernel.acc_templates {
@@ -1895,18 +1431,11 @@ fn unify(by_shape: &mut HashMap<(u64, KernelKey), AsmKernel>) -> Result<()> {
         .map(|((_, key), k)| {
             let first = k.bodies.first().map(|b| b.splits.clone()).unwrap_or_default();
             let enumerated = (0..k.forks as usize).filter(|&d| k.bodies.iter().any(|b| b.splits.get(d) != first.get(d))).count();
-            let region = key.region.map_or("-".to_string(), |r| format!("({},{})", r.ix, r.iy));
+            let region = key.map_or("-".to_string(), |r| format!("({},{})", r.ix, r.iy));
             (k.bodies.len(), k.forks, enumerated, k.fused_nodes, format!("{:.1} MB", k.compiled.frame_bytes as f64 / 1048576.0), region, k.compiled.sym.clone())
         })
         .collect();
     per_shape.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.5.cmp(&b.5)));
-    if std::env::var_os("CELESTE_KERNEL_REPORT").is_some() {
-        // The symbol names the kernel's .so in `target/asm-scratch/<pid>` (what a
-        // profile of a live run attributes samples to).
-        for s in &per_shape {
-            eprintln!("[asm kernel] region {} bodies {} forks {} enumerated {} fused nodes {} frame {} {}", s.5, s.0, s.1, s.2, s.3, s.4, s.6);
-        }
-    }
     per_shape.truncate(12);
     eprintln!(
         "[asm build] {} output shapes over {templates} outcome templates; {widened} template cells widened uniform -> typed by the union ({:.2} per template); {bodies} bodies, {fused} fused nodes over {} input shapes; largest kernels (bodies, forks, forks enumerated, fused nodes, frame, region): {:?}",
@@ -1937,347 +1466,11 @@ fn apply_union(kernel: &mut AsmKernel, unions: &HashMap<u64, std::sync::Arc<Rt2>
     Ok(())
 }
 
-/// What one kernel is made of (`CELESTE_KERNEL_DUMP=<substring of its symbol>`):
-/// its region, its traced forks and what each splits, per outcome the forks its
-/// bodies enumerate, the fused graph's ops, and the codegen's frame. A
-/// diagnostic for why a kernel is as big as it is.
-fn dump_kernel(
-    r: &crate::trace::kernel::Reference,
-    sym: &str,
-    region: Option<crate::trace::kernel::Region>,
-    fused: &crate::transpile::graph::Graph,
-    bodies: &[crate::trace::emit::AsmBody],
-    slots: usize,
-    compiled: &crate::transpile::asm::Compiled,
-) {
-    use crate::transpile::graph::Op;
-    let op_name = |op: &Op| -> String { format!("{op:?}").split('(').next().unwrap_or("").to_string() };
-    let region = region.map_or("-".to_string(), |g| format!("({},{})", g.ix, g.iy));
-    eprintln!(
-        "[kernel dump] {sym} region {region}: {} outcomes, {} bodies, {} traced forks, {} fused nodes, {slots} root slots, {} spill slots, frame {:.1} MB, {} asm lines",
-        r.bound.outcomes.len(),
-        bodies.len(),
-        r.frame.forks,
-        fused.len(),
-        compiled.spill_slots,
-        compiled.frame_bytes as f64 / 1048576.0,
-        compiled.asm.lines().count()
-    );
-    // Each fork: its arity and what it splits (the operand's op, one level).
-    let g = &r.bound.graph;
-    for d in 0..r.frame.forks {
-        let site = (0..g.len() as crate::transpile::graph::NodeId).find(|&n| {
-            matches!(g.get(n).op, Op::Split(x) | Op::SplitInt(x) | Op::SplitTab(x) if x == d)
-        });
-        let what = match site {
-            Some(n) => {
-                let node = g.get(n);
-                let arg = g.get(node.args[0]);
-                let args: Vec<String> = arg.args.iter().map(|a| op_name(&g.get(*a).op)).collect();
-                format!("{} of {}({})", op_name(&node.op), op_name(&arg.op), args.join(", "))
-            }
-            None => "not in the bound graph".to_string(),
-        };
-        let origin = r.frame.fork_origins.iter().find(|(x, _)| *x == d).map_or("-", |(_, o)| o.as_str());
-        eprintln!("[kernel dump]   fork {d}: {} ways, {what}, made for {origin}", r.frame.fork_ways[d as usize]);
-    }
-    // Per outcome: its bodies and the forks they enumerate.
-    for oi in 0..r.bound.outcomes.len() {
-        let mine: Vec<&crate::trace::emit::AsmBody> = bodies.iter().filter(|b| b.outcome == oi).collect();
-        let Some(first) = mine.first() else { continue };
-        let enumerated: Vec<usize> = (0..first.splits.len()).filter(|&d| mine.iter().any(|b| b.splits[d] != first.splits[d])).collect();
-        eprintln!(
-            "[kernel dump]   outcome {oi}: {} bodies, forks enumerated {:?}, {} fields",
-            mine.len(),
-            enumerated,
-            r.bound.outcomes[oi].outputs.len()
-        );
-        // What keeps bodies apart: the distinct root tuples when a body is
-        // compared by its fields only, then with `live`, with `error`, and
-        // whole. Roots are `[fields.., error, live, keys..]`.
-        let nf = r.bound.outcomes[oi].outputs.len();
-        let distinct = |f: &dyn Fn(&[crate::transpile::graph::NodeId]) -> Vec<crate::transpile::graph::NodeId>| -> usize {
-            mine.iter().map(|b| f(&b.roots)).collect::<std::collections::BTreeSet<_>>().len()
-        };
-        eprintln!(
-            "[kernel dump]     distinct roots: fields {}, fields+live {}, fields+error {}, all {}; distinct live {}, distinct error {}",
-            distinct(&|x| x[..nf].to_vec()),
-            distinct(&|x| x[..nf].iter().chain(std::iter::once(&x[nf + 1])).copied().collect()),
-            distinct(&|x| x[..nf + 1].to_vec()),
-            distinct(&|x| x.to_vec()),
-            distinct(&|x| vec![x[nf + 1]]),
-            distinct(&|x| vec![x[nf]]),
-        );
-        // Which fields keep bodies apart: per field, its distinct nodes.
-        let mut varying: Vec<(usize, usize)> = (0..nf)
-            .map(|j| (mine.iter().map(|b| b.roots[j]).collect::<std::collections::BTreeSet<_>>().len(), j))
-            .filter(|(n, _)| *n > 1)
-            .collect();
-        varying.sort_by(|a, b| b.0.cmp(&a.0));
-        let names: Vec<String> = varying
-            .iter()
-            .take(10)
-            .map(|(n, j)| {
-                let path = r.frame.outs.get(oi).and_then(|o| o.fields.get(*j)).map(|f| crate::trace::iface::show(&f.0)).unwrap_or_else(|| format!("field {j}"));
-                format!("{path} {n}")
-            })
-            .collect();
-        eprintln!("[kernel dump]     varying fields ({} of {nf}): {}", varying.len(), names.join(", "));
-        // Two bodies with the same fields and different `error`: the
-        // disjuncts in one `error` and not the other.
-        let disjuncts = |n: crate::transpile::graph::NodeId| -> std::collections::BTreeSet<crate::transpile::graph::NodeId> {
-            let (mut out, mut stack) = (std::collections::BTreeSet::new(), vec![n]);
-            while let Some(x) = stack.pop() {
-                let node = fused.get(x);
-                if node.op == Op::Or {
-                    stack.extend(node.args.iter().copied());
-                } else {
-                    out.insert(x);
-                }
-            }
-            out
-        };
-        let mut error_by_fields: std::collections::BTreeMap<Vec<crate::transpile::graph::NodeId>, crate::transpile::graph::NodeId> = Default::default();
-        for b in &mine {
-            let error = b.roots[nf];
-            match error_by_fields.get(&b.roots[..nf].to_vec()) {
-                Some(&other) if other != error => {
-                    let (a, c) = (disjuncts(other), disjuncts(error));
-                    let only = |x: &std::collections::BTreeSet<crate::transpile::graph::NodeId>, y: &std::collections::BTreeSet<crate::transpile::graph::NodeId>| -> Vec<String> {
-                        x.difference(y)
-                            .take(4)
-                            .map(|n| {
-                                let node = fused.get(*n);
-                                let args: Vec<String> = node.args.iter().map(|q| op_name(&fused.get(*q).op)).collect();
-                                format!("{}({})", op_name(&node.op), args.join(", "))
-                            })
-                            .collect()
-                    };
-                    eprintln!(
-                        "[kernel dump]     same fields, different error: {} and {} disjuncts, {} shared; only in the first: {:?}; only in the second: {:?}",
-                        a.len(),
-                        c.len(),
-                        a.intersection(&c).count(),
-                        only(&a, &c),
-                        only(&c, &a)
-                    );
-                    break;
-                }
-                Some(_) => {}
-                None => {
-                    error_by_fields.insert(b.roots[..nf].to_vec(), error);
-                }
-            }
-        }
-        // The first two bodies whose fields agree but whose `live` differs:
-        // what the two `live` roots are.
-        let mut by_fields: std::collections::BTreeMap<Vec<crate::transpile::graph::NodeId>, crate::transpile::graph::NodeId> = Default::default();
-        for b in &mine {
-            let live = b.roots[nf + 1];
-            match by_fields.get(&b.roots[..nf].to_vec()) {
-                Some(&other) if other != live => {
-                    let show = |n: crate::transpile::graph::NodeId| {
-                        let node = fused.get(n);
-                        let args: Vec<String> = node.args.iter().map(|a| op_name(&fused.get(*a).op)).collect();
-                        format!("{}({})", op_name(&node.op), args.join(", "))
-                    };
-                    eprintln!("[kernel dump]     same fields, different live: {} against {}", show(other), show(live));
-                    break;
-                }
-                Some(_) => {}
-                None => {
-                    by_fields.insert(b.roots[..nf].to_vec(), live);
-                }
-            }
-        }
-    }
-    // CELESTE_KERNEL_SPLIT=1: per outcome and per fork its bodies enumerate, up
-    // to 20 body pairs that differ ONLY in that fork, how many
-    // fields differ, and how many of those are `Sel(c, x, y)` with one arm the
-    // other body's value - what splitting the body on `c` and fusing would take
-    // away.
-    if std::env::var_os("CELESTE_KERNEL_SPLIT").is_some() {
-        for oi in 0..r.bound.outcomes.len() {
-            let mine: Vec<&crate::trace::emit::AsmBody> = bodies.iter().filter(|b| b.outcome == oi).collect();
-            let Some(first) = mine.first() else { continue };
-            let nf = r.bound.outcomes[oi].outputs.len();
-            for d in (0..first.splits.len()).filter(|&d| mine.iter().any(|b| b.splits[d] != first.splits[d])) {
-                let (mut pairs, mut differing, mut sel_else_other) = (0usize, 0usize, 0usize);
-                'pairs: for (i, a) in mine.iter().enumerate() {
-                    for b in &mine[i + 1..] {
-                        let one_fork = a.splits.iter().zip(&b.splits).enumerate().all(|(x, (p, q))| (x == d) != (p == q));
-                        if !one_fork {
-                            continue;
-                        }
-                        pairs += 1;
-                        for j in 0..nf {
-                            let (x, y) = (a.roots[j], b.roots[j]);
-                            if x == y {
-                                continue;
-                            }
-                            differing += 1;
-                            let arm_is = |n: crate::transpile::graph::NodeId, other: crate::transpile::graph::NodeId| {
-                                let node = fused.get(n);
-                                node.op == Op::Sel && (node.args[1] == other || node.args[2] == other)
-                            };
-                            if arm_is(x, y) || arm_is(y, x) {
-                                sel_else_other += 1;
-                            }
-                        }
-                        if pairs >= 20 {
-                            break 'pairs;
-                        }
-                    }
-                }
-                if pairs == 0 {
-                    continue;
-                }
-                let origin = r.frame.fork_origins.iter().find(|(x, _)| *x as usize == d).map_or("move/table", |(_, o)| o.as_str());
-                eprintln!(
-                    "[kernel split] outcome {oi} ({} bodies): fork {d} ({origin}): {pairs} pairs, {:.1} fields differ per pair, {:.0}% of them Sel with the other body's value as an arm",
-                    mine.len(),
-                    differing as f64 / pairs as f64,
-                    sel_else_other as f64 * 100.0 / differing.max(1) as f64
-                );
-            }
-        }
-    }
-    // CELESTE_KERNEL_DIFF=<outcome>: two of its bodies whose fork
-    // configurations differ in ONE fork (a button is a fork), and where their
-    // fields differ, walked down to the nodes that actually diverge.
-    // `<outcome>@<fork>`: one fork apart, in that fork.
-    if let Some(spec) = std::env::var("CELESTE_KERNEL_DIFF").ok() {
-        let (want, only_fork) = match spec.split_once('@') {
-            Some((s, f)) => (s.parse::<usize>().ok(), f.parse::<usize>().ok()),
-            None => (spec.parse::<usize>().ok(), None),
-        };
-        let want = want.unwrap_or(usize::MAX);
-        let mine: Vec<&crate::trace::emit::AsmBody> = bodies.iter().filter(|b| b.outcome == want).collect();
-        let pair = mine.iter().enumerate().find_map(|(i, a)| {
-            mine[i + 1..]
-                .iter()
-                .find(|b| {
-                    let apart: Vec<usize> = a.splits.iter().zip(&b.splits).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| i).collect();
-                    apart.len() == 1 && only_fork.is_none_or(|f| apart[0] == f)
-                })
-                .map(|b| (*a, *b))
-        });
-        match pair {
-            None => eprintln!("[kernel diff] outcome {want}: no two bodies differ in exactly one fork"),
-            Some((a, b)) => {
-                let what = {
-                    let d = a.splits.iter().zip(&b.splits).position(|(x, y)| x != y).unwrap_or(0);
-                    let origin = r.frame.fork_origins.iter().find(|(x, _)| *x as usize == d).map_or("-", |(_, o)| o.as_str());
-                    format!("fork {d} ({origin}) = {} against {}", a.splits[d], b.splits[d])
-                };
-                let nf = r.bound.outcomes[want].outputs.len();
-                let differing: Vec<usize> = (0..nf).filter(|&j| a.roots[j] != b.roots[j]).collect();
-                eprintln!(
-                    "[kernel diff] outcome {want}, {what}; {} of {nf} fields differ, live {}, error {}",
-                    differing.len(),
-                    if a.roots[nf + 1] == b.roots[nf + 1] { "same" } else { "differs" },
-                    if a.roots[nf] == b.roots[nf] { "same" } else { "differs" },
-                );
-                type Memo = std::collections::HashMap<crate::transpile::graph::NodeId, Option<crate::transpile::graph::Pieces>>;
-                type Seeds = std::collections::HashMap<crate::transpile::graph::NodeId, (i64, i64)>;
-                // The region's seeded cells, by node of the fused graph: what the
-                // range analysis starts from.
-                let seeds: Seeds = (0..fused.len() as crate::transpile::graph::NodeId)
-                    .filter_map(|n| match fused.get(n).op {
-                        Op::Cell(c) => r.lowered.ranges.get(&c).map(|(lo, hi)| (n, (*lo as i64, *hi as i64))),
-                        _ => None,
-                    })
-                    .collect();
-                let mut memo: Memo = Default::default();
-                // A node as an expression, `depth` levels deep; a number with its
-                // static range's hull in pixels, `{lo..hi}`, where it has one.
-                fn show(g: &crate::transpile::graph::Graph, seeds: &Seeds, memo: &mut Memo, n: crate::transpile::graph::NodeId, depth: usize) -> String {
-                    let node = g.get(n);
-                    let mut op = format!("{:?}", node.op);
-                    if !matches!(node.op, Op::Const(..)) {
-                        if let Some(p) = crate::transpile::graph::pieces_of(g, seeds, memo, n) {
-                            if let (Some(lo), Some(hi)) = (p.first(), p.last()) {
-                                op = format!("{op}{{{}..{}}}", lo.0 as f64 / 65536.0, hi.1 as f64 / 65536.0);
-                            }
-                        }
-                    }
-                    if node.args.is_empty() || depth == 0 {
-                        return if node.args.is_empty() { op } else { format!("{op}(..)") };
-                    }
-                    let args: Vec<String> = node.args.iter().map(|x| show(g, seeds, memo, *x, depth - 1)).collect();
-                    format!("{op}({})", args.join(", "))
-                }
-                // Down both expressions while they agree on the op, to where they diverge.
-                fn diverge(g: &crate::transpile::graph::Graph, seeds: &Seeds, memo: &mut Memo, x: crate::transpile::graph::NodeId, y: crate::transpile::graph::NodeId, depth: usize, out: &mut Vec<String>) {
-                    if x == y || out.len() >= 6 {
-                        return;
-                    }
-                    let (nx, ny) = (g.get(x), g.get(y));
-                    if nx.op != ny.op || nx.args.len() != ny.args.len() || depth == 0 {
-                        let deep = std::env::var("CELESTE_KERNEL_DIFF_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-                        out.push(format!("{}  AGAINST  {}", show(g, seeds, memo, x, deep), show(g, seeds, memo, y, deep)));
-                        return;
-                    }
-                    for (p, q) in nx.args.iter().zip(&ny.args) {
-                        diverge(g, seeds, memo, *p, *q, depth - 1, out);
-                    }
-                }
-                // `CELESTE_KERNEL_CONE=N`: the second body's field as a DAG, its
-                // first N nodes breadth-first, each once with its range.
-                let cone = std::env::var("CELESTE_KERNEL_CONE").ok().and_then(|v| v.parse::<usize>().ok());
-                for &j in differing.iter().take(4) {
-                    let path = r.frame.outs.get(want).and_then(|o| o.fields.get(j)).map(|f| crate::trace::iface::show(&f.0)).unwrap_or_else(|| format!("field {j}"));
-                    let mut out = Vec::new();
-                    diverge(fused, &seeds, &mut memo, a.roots[j], b.roots[j], 12, &mut out);
-                    eprintln!("[kernel diff]   {path}:");
-                    for line in out {
-                        eprintln!("[kernel diff]     {line}");
-                    }
-                    if let Some(max) = cone {
-                        // `CELESTE_KERNEL_CONE_ROOT=<node>`: from that node instead.
-                        let root = std::env::var("CELESTE_KERNEL_CONE_ROOT").ok().and_then(|v| v.parse().ok()).unwrap_or(b.roots[j]);
-                        let (mut queue, mut seen) = (std::collections::VecDeque::from([root]), std::collections::HashSet::new());
-                        while let Some(n) = queue.pop_front() {
-                            if seen.len() >= max || !seen.insert(n) {
-                                continue;
-                            }
-                            let node = fused.get(n);
-                            let args: Vec<String> = node.args.iter().map(|x| format!("#{x}")).collect();
-                            eprintln!("[kernel cone]     #{n} = {}({})", show(fused, &seeds, &mut memo, n, 0).trim_end_matches("(..)"), args.join(", "));
-                            queue.extend(node.args.iter().copied());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // The fused graph's ops, most common first.
-    let mut hist: std::collections::BTreeMap<String, usize> = Default::default();
-    for n in 0..fused.len() as crate::transpile::graph::NodeId {
-        *hist.entry(op_name(&fused.get(n).op)).or_default() += 1;
-    }
-    let mut hist: Vec<(String, usize)> = hist.into_iter().collect();
-    hist.sort_by(|a, b| b.1.cmp(&a.1));
-    let top: Vec<String> = hist.iter().take(20).map(|(o, c)| format!("{o} {c}")).collect();
-    eprintln!("[kernel dump]   ops: {}", top.join(", "));
-}
-
 /// Assemble ONE start-room shape: fuse its graph, gcc + dlopen it, and map
 /// its bodies' roots onto flat slots. Independent per shape, so
 /// `build_for_start_room` runs these in parallel. `tag` distinguishes the
-/// bucket-specialized kernels of one shape.
-fn build_one_shape(
-    r: &crate::trace::kernel::Reference,
-    si: usize,
-    tag: &str,
-    key: Option<SpeedKey>,
-    // For the report only (`CELESTE_KERNEL_DUMP`).
-    region: Option<crate::trace::kernel::Region>,
-    w: Option<u8>,
-    // Does the level bucket spd.y (`SpdPrecision::buckets_y`): only then does
-    // a body have a y key root to dispatch on.
-    buckets_y: bool,
-) -> Result<(u64, Option<SpeedKey>, AsmKernel)> {
+/// region-keyed kernels of one shape.
+fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) -> Result<(u64, AsmKernel)> {
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
     let t_fuse = std::time::Instant::now();
@@ -2321,13 +1514,6 @@ fn build_one_shape(
     )
     .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
     crate::transpile::lower::build_add(8, t_asm);
-    if let Some(want) = std::env::var_os("CELESTE_KERNEL_DUMP") {
-        let (sym, want) = (format!("k{shape:016x}{tag}"), want.to_string_lossy().to_string());
-        let at = region.map(|g| format!("({},{})", g.ix, g.iy));
-        if sym.contains(&want) || at.as_deref() == Some(want.as_str()) {
-            dump_kernel(r, &sym, region, &fused, &bodies, flat_roots.len(), &compiled);
-        }
-    }
 
     // Which fused nodes read the canonical output unknown
     // (`AsmField::may_unknown`): one pass in node order, operands first.
@@ -2343,7 +1529,7 @@ fn build_one_shape(
     // concatenated in order, through `slot_of`.
     let mut off = 0usize;
     let mut asm_bodies = Vec::with_capacity(bodies.len());
-    for (bi, b) in bodies.iter().enumerate() {
+    for b in &bodies {
         let narc = r.bound.outcomes[b.outcome].arc.len();
         let nkeys = r.bound.outcomes[b.outcome].keys.len();
         let nfields = b.roots.len() - 2 - nkeys - narc; // roots = [fields.., error, live, keys.., arc..]
@@ -2358,55 +1544,11 @@ fn build_one_shape(
         let fields = (0..nfields)
             .map(|j| AsmField {
                 cell: outputs[j].0 as usize,
-                root: slot_of[off + j],
                 off: compiled.root_offsets[slot_of[off + j]] as usize,
                 kind: compiled.root_kinds[slot_of[off + j]],
                 may_unknown: reads_unknown_output[b.roots[j] as usize],
             })
             .collect();
-        // The body's rows' speed key (the queue they land in): the bucket
-        // its speed KEY roots name (a constant per body: the table fork's
-        // fragment, or the one bucket) and its constant dash outputs.
-        let dkey = match (w, crate::trace::shapes::player_path(&r.frame.outs[b.outcome].st)) {
-            (Some(w), Some(pl)) => {
-                let paths = crate::trace::kernel::key_paths_of(&pl);
-                let out_fields = &r.frame.outs[b.outcome].fields;
-                let field_index = |p: &crate::trace::iface::Path| -> Result<usize> {
-                    out_fields.iter().position(|(q, _, _)| q == p).ok_or_else(|| anyhow::anyhow!("shape {si}: no output field {}", crate::trace::iface::show(p)))
-                };
-                let okeys = &r.bound.outcomes[b.outcome].keys;
-                // The speed's key root: the bucket, per lane (its low end at
-                // the slot's base, a number or an interval alike).
-                let bucket_slot = |axis: usize| -> Result<usize> {
-                    let fi = field_index(&paths[axis])?;
-                    let k = okeys.iter().position(|(j, _)| *j == fi).ok_or_else(|| anyhow::anyhow!("shape {si} body {bi}: spd axis {axis} has no key node"))?;
-                    Ok(slot_of[off + nfields + 2 + k])
-                };
-                // `dash_time` is read per ROW at append time (`dash_time_slot`):
-                // a mid-dash body's `dash_time - 1` ends the dash on some
-                // lanes and not others. The dash constants are per body,
-                // read only where the row is still dashing.
-                let dash_time_slot = compiled.root_offsets[slot_of[off + field_index(&paths[2])?]] as usize;
-                let mut dash = [0i32; 4];
-                for (i, p) in paths[3..].iter().enumerate() {
-                    let root = b.roots[field_index(p)?];
-                    // Unchanged from the (unbounded) input on a lane that is
-                    // not dashing: only a constant where it is read.
-                    dash[i] = match fused.get(root).op {
-                        crate::transpile::graph::Op::Const(lo, _) => lo,
-                        _ => 0,
-                    };
-                }
-                Some(DKey {
-                    dash,
-                    bucket_x: compiled.root_offsets[bucket_slot(0)?] as usize,
-                    bucket_y: if buckets_y { Some(compiled.root_offsets[bucket_slot(1)?] as usize) } else { None },
-                    dash_time_slot,
-                    edges: [celeste_core::spd_buckets::edges(w, 0), celeste_core::spd_buckets::edges(w, 1)],
-                })
-            }
-            _ => None,
-        };
         let okeys = &r.bound.outcomes[b.outcome].keys;
         let out_fields = &r.lowered.outs[b.outcome].fields;
         let key_fields = (0..nfields)
@@ -2437,12 +1579,10 @@ fn build_one_shape(
             splits: b.splits.clone(),
             fields,
             error_root: slot_of[off + nfields],
-            live_root: slot_of[off + nfields + 1],
             error_off: compiled.root_offsets[slot_of[off + nfields]] as usize,
             live_off: compiled.root_offsets[slot_of[off + nfields + 1]] as usize,
             key_fields,
             pos: None,
-            dkey,
             arc,
         });
         off += b.roots.len();
@@ -2469,7 +1609,6 @@ fn build_one_shape(
         .collect();
     Ok((
         shape,
-        key,
         AsmKernel {
             loaded,
             compiled,
@@ -2664,22 +1803,18 @@ pub(crate) fn registry() -> Option<std::sync::Arc<Registry>> {
     registry_for(crate::interpreter::abstraction::current_level())
 }
 
-// Widths 1..=20 both axes, 1..=20 x-only, and exact.
-const SPD_SLOTS: usize = 41;
-const POS_SLOTS: usize = 4;
-// Held buttons exact or unknown.
+// Held buttons, the fly fruit, the floors and the platforms widened or exact.
 const HELD_SLOTS: usize = 2;
-// The fly fruit exact or unknown, the fall floors exact or unknown.
 const FRUIT_SLOTS: usize = 2;
-const FLOORS_SLOTS: usize = 4;
+const FLOORS_SLOTS: usize = 2;
 const PLATFORMS_SLOTS: usize = 2;
-const LEVEL_SLOTS: usize = 17 * SPD_SLOTS * POS_SLOTS * HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS * PLATFORMS_SLOTS;
+const LEVEL_SLOTS: usize = 17 * HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS * PLATFORMS_SLOTS;
 
 /// The kernel set for one LEVEL, built on a big stack (the retrace's init
 /// interpret recurses deeper than a worker thread's default). The root is
 /// `CELESTE_ROOT` or the CWD.
 ///
-/// One set per level (rem rung x spd x pos x held x fruit x floors): the
+/// One set per level (rem rung x held x fruit x floors x platforms): the
 /// ladder kernels specialize to the level, so a ladder that walks levels in
 /// one process needs a distinct set for each - one process-wide set would
 /// freeze at level 0's and serve the wrong kernels to every level above. The
@@ -2779,27 +1914,16 @@ fn kernel_set_cap() -> Option<usize> {
 }
 
 fn level_slot(level: crate::interpreter::abstraction::Level) -> usize {
-    use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
+    use crate::interpreter::abstraction::RemPrecision;
     let rem_slot = match level.rem {
         RemPrecision::Exact => 16,
         RemPrecision::Bits(b) => (b as usize).min(16),
     };
-    let spd_slot = match level.spd {
-        SpdPrecision::Exact => 40,
-        SpdPrecision::WidthLog2(w) => (w as usize).clamp(1, 20) - 1,
-        SpdPrecision::WidthLog2X(w) => 20 + (w as usize).clamp(1, 20) - 1,
-    };
-    let pos_slot = (level.pos.x.clamp(1, 2) as usize - 1) + 2 * (level.pos.y.clamp(1, 2) as usize - 1);
     let held_slot = level.held.is_unknown() as usize;
     let fruit_slot = level.fruit.is_unknown() as usize;
-    let floors_slot = match level.floors {
-        crate::interpreter::abstraction::FloorsPrecision::Exact => 0,
-        crate::interpreter::abstraction::FloorsPrecision::Unknown => 1,
-        crate::interpreter::abstraction::FloorsPrecision::Timers => 2,
-        crate::interpreter::abstraction::FloorsPrecision::Near => 3,
-    };
+    let floors_slot = level.floors.is_near() as usize;
     let platforms_slot = level.platforms.is_unknown() as usize;
-    (((((rem_slot * SPD_SLOTS + spd_slot) * POS_SLOTS + pos_slot) * HELD_SLOTS + held_slot) * FRUIT_SLOTS + fruit_slot) * FLOORS_SLOTS + floors_slot) * PLATFORMS_SLOTS + platforms_slot
+    (((rem_slot * HELD_SLOTS + held_slot) * FRUIT_SLOTS + fruit_slot) * FLOORS_SLOTS + floors_slot) * PLATFORMS_SLOTS + platforms_slot
 }
 
 /// Build every rung's kernel set now, all rungs at once (one builder
@@ -2878,20 +2002,15 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
     let rem = level.rem;
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
     let mode = super::dispatch::traced_mode_for(rem);
-    let (opts, exact) = match mode {
-        super::dispatch::TracedMode::Level0 => (WalkOpts::level0(level.spd, level.pos).with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()).with_floor_timers(level.floors.widens_timers()).with_floors_near(level.floors.is_near()).with_platforms(level.platforms.is_unknown()), false),
-        super::dispatch::TracedMode::Level0Agnostic => {
-            // Phase 1: the opt-in rung-specific variant bakes the rem
-            // widening into the graph (`ladder_widen`), still through
-            // `boundary_exact` (it emits the widened rem and keys the
-            // emitted field). Default `LADDER` is unchanged.
-            let opts = match (super::dispatch::widen_in_graph(), rem) {
-                (true, RemPrecision::Bits(b)) => WalkOpts::ladder_widen(b, level.spd),
-                _ => WalkOpts::LADDER,
-            };
-            (opts.with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors(level.floors.is_unknown()).with_floor_timers(level.floors.widens_timers()).with_floors_near(level.floors.is_near()).with_platforms(level.platforms.is_unknown()), true)
-        }
-        super::dispatch::TracedMode::ExactRem => (WalkOpts::EXACT, true),
+    let objects = |o: WalkOpts| o.with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors_near(level.floors.is_near()).with_platforms(level.platforms.is_unknown());
+    let (opts, exact) = match (mode, rem) {
+        (super::dispatch::TracedMode::Level0, _) => (objects(WalkOpts::LEVEL0), false),
+        // The rung's rem widening baked into the graph (`ladder_widen`),
+        // rows through `boundary_exact` (it emits the widened rem and keys
+        // the emitted field).
+        (super::dispatch::TracedMode::Level0Agnostic, RemPrecision::Bits(b)) => (objects(WalkOpts::ladder_widen(b)), true),
+        (super::dispatch::TracedMode::Level0Agnostic, RemPrecision::Exact) => unreachable!("an exact rem is the exact set"),
+        (super::dispatch::TracedMode::ExactRem, _) => (WalkOpts::EXACT, true),
     };
     let built = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
@@ -2902,10 +2021,6 @@ fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Opt
     match built {
         Ok(reg) => {
             eprintln!("ASM kernels ENABLED ({mode:?}, {level}): {} start-room shapes assembled", reg.len());
-            if let Some(only) = crate::trace::kernel::kernel_only() {
-                eprintln!("[kernel only] built the kernels of {only:?}; exiting (CELESTE_KERNEL_ONLY)");
-                std::process::exit(0);
-            }
             Some(reg)
         }
         Err(e) => panic!("building ASM kernels for {rem:?}: {e:#}"),

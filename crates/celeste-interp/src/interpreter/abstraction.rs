@@ -1,122 +1,13 @@
-//! The abstraction layer: how a concrete frame-boundary state becomes an
-//! abstract one, and how abstract states are probed.
+//! The LEVELS of the precision ladder: what each rung widens, as a value
+//! (`Level`) and as the process-global level the engine dispatches to
+//! (`set_level` / `current_level`).
 //!
-//! PROOF-CRITICAL. Everything in this module shapes the reachable set the
-//! search explores and therefore the optimality proofs:
-//!
-//! * `RemPrecision` / `make_state_abstract_rem` - the rem widening ladder
-//!   (floor-aligned buckets of width 2^-k, each level nesting inside the
-//!   previous), plus the fruit `off` widening at interval levels.
-//! * `split_rem_straddles` - the per-bucket canonicalization that keeps a
-//!   state's rem interval inside one bucket (a straddling interval would
-//!   make equal rows hash differently).
-//! * `apply_conservative_widenings` - the boundary pins (gameplay-dead
-//!   timers, dash_effect_time clamp) certified by `rewrite widencheck`.
-//! * The lane probes (`player_xy_per_lane`, `room_xy_per_lane`) that the
-//!   position column and the tools read.
-//!
-//! Every widening here must be an OVER-approximation: it may only grow the
-//! reachable set, never drop a state a concrete run could visit. If a
-//! widening cannot be justified, do not add it - insert a runtime guard
-//! and let the run fail loudly instead.
+//! The widenings themselves are in the traced graph (`trace::widen`, the
+//! kernels' boundary) and in the block model (`Rt2::widen_to`, the mark
+//! filter's projection); this module only names them. Every widening must be
+//! an OVER-approximation, and every one must be narrowed back by a finer
+//! level: the ladder ends exact in every coordinate (`Level::parse_ladder`).
 
-use std::collections::{HashMap, HashSet};
-
-use super::{
-    heap::HeapId,
-    inspect::StateHelper,
-    state::State,
-    value::{HeapValue, MaybeVector, Value},
-};
-use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
-
-
-/// Marks to apply when making state abstract
-pub struct HeapMarks {
-    /// Map from mark name to set of heap IDs that should get that mark
-    pub marks: HashMap<String, HashSet<HeapId>>,
-}
-
-impl HeapMarks {
-    pub fn new() -> Self {
-        Self {
-            marks: HashMap::new(),
-        }
-    }
-
-    pub fn add_mark(&mut self, mark_name: &str, heap_id: HeapId) {
-        self.marks
-            .entry(mark_name.to_string())
-            .or_insert_with(HashSet::new)
-            .insert(heap_id);
-    }
-}
-
-/// Mark heap locations that should be made abstract.
-/// Currently marks player.rem.x and player.rem.y as "player_rem_xy".
-pub fn mark_heap(state: &State) -> HeapMarks {
-    let mut marks = HeapMarks::new();
-    let helper = StateHelper::new(state);
-
-    // Find player objects
-    if let Some(objects_array_id) = helper.get_objects_array_id() {
-        let players = helper
-            .find_objects_by_type(objects_array_id, "player")
-            .expect("get_objects_array_id returned non-ArrayTable");
-        for player_heap_id in players {
-            if let HeapValue::ObjectTable(player) = helper.load(player_heap_id) {
-                // Get player.rem
-                if let Some(rem_ptr) = player.get("rem") {
-                    if let Some(rem_heap_id) = helper.unwrap_pointer(helper.load(*rem_ptr)) {
-                        if let HeapValue::ObjectTable(rem) = helper.load(rem_heap_id) {
-                            // Mark rem.x and rem.y
-                            for key in ["x", "y"] {
-                                if let Some(coord_ptr) = rem.get(key) {
-                                    marks.add_mark("player_rem_xy", *coord_ptr);
-                                }
-                            }
-                        }
-                    }
-                }
-                // Get player.spd - the spd-rung widening's target
-                // (plans/spd-rung.md). Marked unconditionally; whether
-                // anything happens to it is SpdPrecision's decision.
-                if let Some(spd_ptr) = player.get("spd") {
-                    if let Some(spd_heap_id) = helper.unwrap_pointer(helper.load(*spd_ptr)) {
-                        if let HeapValue::ObjectTable(spd) = helper.load(spd_heap_id) {
-                            for key in ["x", "y"] {
-                                if let Some(coord_ptr) = spd.get(key) {
-                                    marks.add_mark("player_spd_xy", *coord_ptr);
-                                }
-                            }
-                        }
-                    }
-                }
-                // The player's own `x`/`y`: the position widening's target
-                // (`make_state_abstract_pos`, `split_pos_points`).
-                for key in ["x", "y"] {
-                    if let Some(ptr) = player.get(key) {
-                        marks.add_mark(if key == "x" { "player_x" } else { "player_y" }, *ptr);
-                    }
-                }
-                // Mark dash_effect_time for the boundary clamp (see
-                // make_state_abstract): it decrements unconditionally every
-                // frame, so without a clamp it drifts negative forever and
-                // makes otherwise-identical states at different frames
-                // distinct, defeating cross-frame visited dedup.
-                if let Some(ptr) = player.get("dash_effect_time") {
-                    marks.add_mark("player_dash_effect_time", *ptr);
-                }
-            }
-        }
-    }
-
-    marks
-}
-
-/// Make marked heap values abstract by replacing concrete numbers with intervals.
-/// This is the key function for abstract interpretation - it widens concrete values
-/// to represent uncertainty (e.g., player's sub-pixel position can be anywhere in [-0.5, 0.5)).
 /// The rem precision ladder (plans/refinement-plan.md).
 ///
 /// * `Bits(0)` - the historic widening: rem -> the full interval [-0.5, 0.5).
@@ -143,215 +34,6 @@ impl RemPrecision {
             (RemPrecision::Bits(_), RemPrecision::Exact) => true,
             (RemPrecision::Bits(a), RemPrecision::Bits(b)) => a <= b,
         }
-    }
-
-    /// Every rem level this build can be configured for, coarsest first.
-    /// `Bits(16)` and above are read as `Exact` by the env parser, so 0..16
-    /// is the whole `Bits` range.
-    pub fn all() -> impl Iterator<Item = RemPrecision> {
-        (0..16u8)
-            .map(RemPrecision::Bits)
-            .chain(std::iter::once(RemPrecision::Exact))
-    }
-}
-
-/// The session rem precision, as ONE settable process global.
-///
-/// The environment (CELESTE_REM_BITS / CELESTE_EXACT_REM) is the DEFAULT
-/// source, read the first time the precision is needed; `set_rem_precision`
-/// then overrides it for the rest of the process. This is what lets a single
-/// process run several levels (the in-process `ladder`: level 0, then k=1,
-/// then k=2) - the old read-once OnceLock could only express one.
-///
-/// Encoding: 0..=15 = `Bits(n)`, `EXACT` = `Exact`, `UNSET` = not yet read
-/// from the env.
-static REM_PRECISION: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(REM_UNSET);
-const REM_UNSET: u8 = 0xFF;
-const REM_EXACT: u8 = 0xFE;
-
-fn encode_rem(p: RemPrecision) -> u8 {
-    match p {
-        RemPrecision::Exact => REM_EXACT,
-        RemPrecision::Bits(b) if b >= 16 => REM_EXACT,
-        RemPrecision::Bits(b) => b,
-    }
-}
-
-/// Set the session rem precision for the rest of the process (overriding the
-/// env default). Last write wins.
-pub fn set_rem_precision(p: RemPrecision) {
-    REM_PRECISION.store(encode_rem(p), std::sync::atomic::Ordering::Relaxed);
-}
-
-fn rem_precision_from_env_default() -> RemPrecision {
-    if std::env::var_os("CELESTE_EXACT_REM").is_some() {
-        return RemPrecision::Exact;
-    }
-    match std::env::var("CELESTE_REM_BITS") {
-        Ok(v) => {
-            let bits: u8 = v
-                .parse()
-                .unwrap_or_else(|_| panic!("CELESTE_REM_BITS={:?} is not a number", v));
-            if bits >= 16 {
-                RemPrecision::Exact
-            } else {
-                RemPrecision::Bits(bits)
-            }
-        }
-        Err(_) => RemPrecision::Bits(0),
-    }
-}
-
-/// The session's rem precision: the `set_rem_precision` value if one was set,
-/// else the env default (CELESTE_REM_BITS=k; 16 or CELESTE_EXACT_REM mean
-/// exact; unset means the historic Bits(0)), latched on first read.
-pub fn rem_precision_from_env() -> RemPrecision {
-    use std::sync::atomic::Ordering::Relaxed;
-    match REM_PRECISION.load(Relaxed) {
-        REM_UNSET => {
-            let p = rem_precision_from_env_default();
-            // Racing readers compute the same env default; either store wins.
-            REM_PRECISION.store(encode_rem(p), Relaxed);
-            p
-        }
-        REM_EXACT => RemPrecision::Exact,
-        b => RemPrecision::Bits(b),
-    }
-}
-
-/// The spd precision ladder (plans/spd-rung.md) - the rung BELOW level 0
-/// that unblocks room (2,0).
-///
-/// * `WidthLog2(w)` - widen player.spd.x/y to floor-aligned buckets of
-///   width 2^w in raw 16.16 units. w=16 is 1 px/frame. Buckets are
-///   STATIC and data-independent (floor-alignment on the raw i32), so
-///   the scheme covers the entire speed range by construction - no
-///   assumption about which speeds occur. Power-of-two floor-aligned
-///   buckets NEST, so a coarser level over-approximates a finer one and
-///   band coarsening can never straddle.
-/// * `WidthLog2X(w)` - bucket `player.spd.x` the same way and keep
-///   `spd.y` EXACT (2026-09-16, Philippe). Room (2,0)'s dense speeds come
-///   from the spring's `spd.x *= 0.2` on x alone; bucketing y too only
-///   multiplied the kernel keys (3,202 against 430 with whole buckets).
-///   Spec `s<w>x`.
-/// * `Exact` - no spd widening (today's semantics; the env default).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SpdPrecision {
-    WidthLog2(u8),
-    WidthLog2X(u8),
-    Exact,
-}
-
-impl SpdPrecision {
-    /// Does `self` widen spd AT LEAST as much as `finer`? Buckets are
-    /// floor-aligned at width 2^w on the raw 16.16 value, so they nest for
-    /// w >= w', and `Exact` nests inside every bucketed precision. An exact
-    /// y is finer than a bucketed one, so `WidthLog2X` is never coarser than
-    /// `WidthLog2`.
-    pub fn coarser_or_equal(self, finer: SpdPrecision) -> bool {
-        match (self, finer) {
-            (SpdPrecision::Exact, _) => finer == SpdPrecision::Exact,
-            (SpdPrecision::WidthLog2(_) | SpdPrecision::WidthLog2X(_), SpdPrecision::Exact) => true,
-            (SpdPrecision::WidthLog2(a), SpdPrecision::WidthLog2(b) | SpdPrecision::WidthLog2X(b)) => a >= b,
-            (SpdPrecision::WidthLog2X(a), SpdPrecision::WidthLog2X(b)) => a >= b,
-            (SpdPrecision::WidthLog2X(_), SpdPrecision::WidthLog2(_)) => false,
-        }
-    }
-
-    /// The speed table's grid width, if the level buckets speed at all.
-    pub fn width_log2(self) -> Option<u8> {
-        match self {
-            SpdPrecision::WidthLog2(w) | SpdPrecision::WidthLog2X(w) => Some(w),
-            SpdPrecision::Exact => None,
-        }
-    }
-
-    /// Does the level bucket `spd.y` as well as `spd.x`?
-    pub fn buckets_y(self) -> bool {
-        matches!(self, SpdPrecision::WidthLog2(_))
-    }
-
-    /// Every spd level this build can be configured for, coarsest first.
-    pub fn all() -> impl Iterator<Item = SpdPrecision> {
-        (1..=20u8)
-            .rev()
-            .flat_map(|w| [SpdPrecision::WidthLog2(w), SpdPrecision::WidthLog2X(w)])
-            .chain(std::iter::once(SpdPrecision::Exact))
-    }
-}
-
-/// THE LADDER'S SPD PRECISION AT A REM PRECISION (2026-09-14): the same
-/// bucket width. `Bits(k)` buckets rem at 2^-k px; spd at `WidthLog2(16-k)`
-/// is 2^(16-k) raw units = 2^-k px; both are exact at `Exact`. So one
-/// ladder refines both, and both reach full precision on the same rung.
-/// Level 0 widens spd to whole pixels per frame - the spring's
-/// `spd.x *= 0.2` minted thousands of distinct fractional speeds in room
-/// (2,0) (3,200 spd.x values against 60 in rooms (0,0)/(1,0)), and
-/// bucketing them to 1 px collapsed its frontier 19x (BENCHMARK_DATA.md).
-/// `CELESTE_SPD_WIDTH_LOG2=w` overrides the rule for experiments.
-/// The finest speed bucket the bucket node can compute without
-/// overflowing 16.16 (`Level::grid_consistent`): 2^6 raw = 1/1024 px.
-pub const SPD_MIN_WIDTH_LOG2: u8 = 6;
-
-pub fn spd_precision_for(rem: RemPrecision) -> SpdPrecision {
-    if let Some(w) = spd_width_override() {
-        return SpdPrecision::WidthLog2(w);
-    }
-    match (spd_ladder_preset(), rem) {
-        (SpdLadder::Exact, _) => SpdPrecision::Exact,
-        (SpdLadder::Bucket, RemPrecision::Bits(k)) if k < 16 && 16 - k >= SPD_MIN_WIDTH_LOG2 => SpdPrecision::WidthLog2(16 - k),
-        (SpdLadder::Level0Only, RemPrecision::Bits(0)) => SpdPrecision::WidthLog2(16),
-        _ => SpdPrecision::Exact,
-    }
-}
-
-/// The speed ladder PRESETS (`CELESTE_SPD_LADDER`), for the commands that
-/// take a rem rung and derive the level: `exact` (the default, the ladder
-/// the pinned gates were taken with), `bucket` (the same bucket width as
-/// rem's at every rung), `level0` (1 px at level 0 only, exact above).
-/// The search itself takes a full ladder spec (`Level::parse_ladder`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SpdLadder {
-    Exact,
-    Bucket,
-    Level0Only,
-}
-
-pub fn spd_ladder_preset() -> SpdLadder {
-    static P: std::sync::OnceLock<SpdLadder> = std::sync::OnceLock::new();
-    *P.get_or_init(|| match std::env::var("CELESTE_SPD_LADDER").as_deref() {
-        Ok("bucket") => SpdLadder::Bucket,
-        Ok("level0") => SpdLadder::Level0Only,
-        Ok("exact") | Err(_) => SpdLadder::Exact,
-        Ok(other) => panic!("CELESTE_SPD_LADDER={other:?}: expected exact, bucket or level0"),
-    })
-}
-
-/// The player's POSITION precision: the bucket width in whole pixels per
-/// axis, 1 = exact. `rem` is the sub-pixel position, so a 2 px bucket is
-/// the same ladder one rung below level 0 (which knows the position to a
-/// pixel). Only 1 or 2 today: the frame runs an EXACT integer position
-/// per fork configuration (`IntFrag`), so a bucket of width w is a w-way
-/// fork per axis, and the bucket's fork must be on the integer grid, i.e.
-/// rem Bits(0) (`Level::grid_consistent`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PosPrecision {
-    pub x: u8,
-    pub y: u8,
-}
-
-impl PosPrecision {
-    pub const EXACT: PosPrecision = PosPrecision { x: 1, y: 1 };
-    pub const MAX_WIDTH: u8 = 2;
-
-    pub fn is_exact(self) -> bool {
-        self == Self::EXACT
-    }
-
-    /// Wider-or-equal on both axes.
-    pub fn coarser_or_equal(self, finer: PosPrecision) -> bool {
-        self.x >= finer.x && self.y >= finer.y
     }
 }
 
@@ -400,64 +82,30 @@ impl FruitPrecision {
     }
 }
 
-/// The FALL FLOORS (plans/fall-floors.md): `Unknown` at level 0 only, where
-/// every fall floor's `state` and `delay` are unknown numbers and its
-/// `collideable` an unknown boolean (`widen::fork_floor_inputs`,
-/// `widen::widen_fall_floors`): nothing about a floor's timing is part of a
-/// row. `Timers` (2026-09-30, room (7,0)) keeps every `state` and
-/// `collideable` exact and stores only the countdowns - each floor's `delay`
-/// and the balloon's respawn `timer` - as the unknown number
-/// (`widen::widen_floor_timers`): an idle floor never reads its `delay`, so
-/// an untouched floor stays exact, and a broken one may fall or come back on
-/// any frame. `Near` (2026-09-30, room (7,0)) is `Timers` plus each floor's
-/// `state` and `collideable` widened as `Unknown` widens them - `state` the
-/// interval [0, 2], `collideable` unknown - EXCEPT where the player overlaps
-/// the floor at the end of the frame (`runtime2::floor_player_window`), where
-/// they stay exact - hidden, the cart's invariant there, owed by the
-/// widening (`widen::widen_near_floors`): at `Unknown`, a player that
-/// entered a hidden floor was refused every move once the floor read "maybe
-/// back", and sat inside it for good. The finer levels keep them exact.
+/// The FALL FLOORS and the objects' phases (plans/fall-floors.md). `Near`
+/// (2026-09-30, room (7,0)) stores the countdowns - each floor's `delay`, the
+/// balloon's respawn `timer`, the spring's - as the unknown number
+/// (`widen::widen_floor_timers`), each floor's `state` as the interval [0, 2]
+/// and its `collideable` unknown - EXCEPT where the player overlaps the floor
+/// at the end of the frame (`runtime2::floor_player_window`), where they stay
+/// exact - hidden, the cart's invariant there, owed by the widening
+/// (`widen::widen_near_floors`) - and the objects' phases as their ranges
+/// (`widen::phase_paths`). The finer levels keep them exact.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FloorsPrecision {
-    Unknown,
     Near,
-    Timers,
     Exact,
 }
 
 impl FloorsPrecision {
-    pub fn is_unknown(self) -> bool {
-        self == FloorsPrecision::Unknown
-    }
-
-    /// Only the countdowns widened (`Timers`).
-    pub fn is_timers(self) -> bool {
-        self == FloorsPrecision::Timers
-    }
-
     /// Widened except where the player overlaps the floor (`Near`).
     pub fn is_near(self) -> bool {
         self == FloorsPrecision::Near
     }
 
-    /// Are the countdowns stored as the unknown number (`Timers`, and `Near`,
-    /// which is `Timers` plus the overlap-conditional widening)?
-    pub fn widens_timers(self) -> bool {
-        matches!(self, FloorsPrecision::Timers | FloorsPrecision::Near)
-    }
-
-    fn rank(self) -> u8 {
-        match self {
-            FloorsPrecision::Unknown => 3,
-            FloorsPrecision::Near => 2,
-            FloorsPrecision::Timers => 1,
-            FloorsPrecision::Exact => 0,
-        }
-    }
-
-    /// Unknown covers near, which covers timers, which covers exact.
+    /// Near covers exact.
     pub fn coarser_or_equal(self, finer: FloorsPrecision) -> bool {
-        self.rank() >= finer.rank()
+        self == FloorsPrecision::Near || finer == FloorsPrecision::Exact
     }
 }
 
@@ -482,15 +130,13 @@ impl PlatformsPrecision {
     }
 }
 
-/// ONE LEVEL of the ladder: its position, rem and spd precisions. The
-/// search's levels are a list of these (`parse_ladder`); the
-/// process-global precisions (`set_level`) name the level whose kernels
-/// the engine dispatches to.
+/// ONE LEVEL of the ladder. The search's levels are a list of these
+/// (`parse_ladder`); the process-global level (`set_level`) names the level
+/// whose kernels the engine dispatches to. The player's speed and position
+/// are exact at every level.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Level {
-    pub pos: PosPrecision,
     pub rem: RemPrecision,
-    pub spd: SpdPrecision,
     pub held: HeldPrecision,
     pub fruit: FruitPrecision,
     pub floors: FloorsPrecision,
@@ -498,105 +144,50 @@ pub struct Level {
 }
 
 impl Level {
-    /// The level at rem rung `rem` under the spd preset, exact position and
-    /// held buttons.
+    /// The level at rem rung `rem`, every object exact.
     pub fn for_rem(rem: RemPrecision) -> Level {
-        Level { pos: PosPrecision::EXACT, rem, spd: spd_precision_for(rem), held: HeldPrecision::Exact, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact, platforms: PlatformsPrecision::Exact }
+        Level { rem, ..Level::EXACT }
     }
 
     /// Exact in every coordinate: the top of every ladder.
     pub const EXACT: Level = Level {
-        pos: PosPrecision::EXACT,
         rem: RemPrecision::Exact,
-        spd: SpdPrecision::Exact,
         held: HeldPrecision::Exact,
         fruit: FruitPrecision::Exact,
         floors: FloorsPrecision::Exact,
         platforms: PlatformsPrecision::Exact,
     };
 
-    /// Every fork in a rung's graph cuts on ONE grid (2^-k for rem
-    /// `Bits(k)`), and the unspecialized trace forks the speed on it and
-    /// snaps each fragment to its bucket, so a level's spd bucket is either
-    /// exact or at least one grid cell (`WidthLog2(w)`, `w >= 16 - k`: a
-    /// fragment then lies within one bucket). A coarser bucket is the
-    /// speed table's thresholds with a coarser grid (`spd_buckets`), and
-    /// its move fork's arity comes from the specialized ranges
-    /// (`Domain::flr_ways`). (Before the bucket dispatch it had to be
-    /// exactly the grid, 2026-09-14; relaxed 2026-09-16 for `r0s20`.)
-    /// And the bucket node computes `spd / width` in 16.16: with |spd| up
-    /// to 16 px that is 16 * 2^(16-w), which fits the integer part only
-    /// for w >= `SPD_MIN_WIDTH_LOG2` (w = 1 overflowed: the kernel's
-    /// buckets disagreed with the interpreter's, the filter dropped the
-    /// real states and level 15 refuted a horizon the concrete game wins,
-    /// 2026-09-14). Finer speed buckets than 1/1024 px never paid anyway
-    /// (interval arithmetic at full price for < 4x collapse).
+    /// The held buttons and the objects are widened only at a rem rung: the
+    /// exact rung is what narrows them back (plans/held-buttons.md), the mark
+    /// filter widens a finer row to a coarser key only at a rem rung, and
+    /// their input forks and output widenings are keyed on the domain's
+    /// flags, not on the trace mode (plans/fly-fruit.md, plans/fall-floors.md).
     pub fn grid_consistent(self) -> bool {
-        // Held buttons unknown only at a rem rung: the exact rung is what
-        // narrows them back (plans/held-buttons.md), and the mark filter
-        // widens a finer row to a coarser key only at a rem rung.
-        if self.held.is_unknown() && !matches!(self.rem, RemPrecision::Bits(_)) {
-            return false;
-        }
-        // The fly fruit and the fall floors unknown at a rem rung with an exact
-        // position, like the held buttons: their input forks and output
-        // widenings are keyed on the domain's flags, not on the trace mode, so
-        // the ladder rungs above level 0 take them too (plans/fly-fruit.md,
-        // plans/fall-floors.md; the rungs since 2026-09-19).
-        if (self.fruit.is_unknown() || self.floors != FloorsPrecision::Exact || self.platforms.is_unknown()) && (!matches!(self.rem, RemPrecision::Bits(_)) || !self.pos.is_exact()) {
-            return false;
-        }
-        // A position bucket forks on the integer grid: rem Bits(0) only.
-        if !self.pos.is_exact() && self.rem != RemPrecision::Bits(0) {
-            return false;
-        }
-        match (self.rem, self.spd) {
-            (_, SpdPrecision::Exact) => true,
-            (RemPrecision::Bits(k), SpdPrecision::WidthLog2(w) | SpdPrecision::WidthLog2X(w)) => k < 16 && w >= 16 - k && w >= SPD_MIN_WIDTH_LOG2,
-            (RemPrecision::Exact, SpdPrecision::WidthLog2(_) | SpdPrecision::WidthLog2X(_)) => false,
-        }
+        let widens_objects = self.held.is_unknown() || self.fruit.is_unknown() || self.floors != FloorsPrecision::Exact || self.platforms.is_unknown();
+        !widens_objects || matches!(self.rem, RemPrecision::Bits(_))
     }
 
     /// Does `self` widen at least as much as `finer` in EVERY coordinate?
     pub fn coarser_or_equal(self, finer: Level) -> bool {
-        self.pos.coarser_or_equal(finer.pos)
-            && self.rem.coarser_or_equal(finer.rem)
-            && self.spd.coarser_or_equal(finer.spd)
+        self.rem.coarser_or_equal(finer.rem)
             && self.held.coarser_or_equal(finer.held)
             && self.fruit.coarser_or_equal(finer.fruit)
             && self.floors.coarser_or_equal(finer.floors)
             && self.platforms.coarser_or_equal(finer.platforms)
     }
 
-    /// One level from `[x<w>][y<w>]r<k|x>s<w|x>[h][f][b|n|t]`: an optional position
-    /// bucket width per axis in pixels (2; absent = exact), rem rung k
-    /// (0..=15) or exact, spd bucket width 2^w raw units or exact, and `h`
-    /// for held buttons unknown (absent = exact), then `f` for the fly fruit
-    /// unknown, then `b` for the fall floors unknown, `n` for them widened
-    /// except where the player overlaps one, or `t` for only their timers
-    /// (absent = exact).
+    /// One level from `r<k|x>sx[h][f][n][p]`: rem rung k (0..=15) or exact,
+    /// the speed exact (`sx`, the only speed there is), then `h` for held
+    /// buttons unknown, `f` for the fly fruit unknown, `n` for the fall floors
+    /// and the objects' phases widened except where the player overlaps a
+    /// floor, and `p` for the moving platforms unknown (each absent = exact).
     pub fn parse(spec: &str) -> Result<Level, String> {
-        let mut s = spec.trim();
-        let mut pos = PosPrecision::EXACT;
-        for axis in ['x', 'y'] {
-            if let Some(rest) = s.strip_prefix(axis) {
-                let n = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-                let w: u8 = rest[..n].parse().map_err(|e| format!("level {spec:?}: {axis} bucket: {e}"))?;
-                if !(1..=PosPrecision::MAX_WIDTH).contains(&w) {
-                    return Err(format!("level {spec:?}: {axis} bucket {w} px outside 1..={}", PosPrecision::MAX_WIDTH));
-                }
-                if axis == 'x' {
-                    pos.x = w;
-                } else {
-                    pos.y = w;
-                }
-                s = &rest[n..];
-            }
-        }
-        let (r, sp) = s
+        let s = spec.trim();
+        let (r, mut rest) = s
             .strip_prefix('r')
             .and_then(|t| t.split_once('s'))
-            .ok_or_else(|| format!("level {spec:?}: expected r<k|x>s<w|x>"))?;
+            .ok_or_else(|| format!("level {spec:?}: expected r<k|x>sx..."))?;
         let rem = match r {
             "x" => RemPrecision::Exact,
             k => RemPrecision::Bits(k.parse::<u8>().map_err(|e| format!("level {spec:?}: rem rung: {e}"))?),
@@ -606,57 +197,31 @@ impl Level {
                 return Err(format!("level {spec:?}: rem rung {k} > 15 (use x for exact)"));
             }
         }
-        // `p`: the moving platforms unknown. No speed token ends in `p`.
-        let (sp, platforms) = match sp.strip_suffix('p') {
-            Some(t) => (t, PlatformsPrecision::Unknown),
-            None => (sp, PlatformsPrecision::Exact),
-        };
-        // `b`: the fall floors unknown, `n`: unknown but where the player
-        // overlaps one, `t`: only their timers. No speed token ends in any.
-        let (sp, floors) = if let Some(t) = sp.strip_suffix('b') {
-            (t, FloorsPrecision::Unknown)
-        } else if let Some(t) = sp.strip_suffix('n') {
-            (t, FloorsPrecision::Near)
-        } else if let Some(t) = sp.strip_suffix('t') {
-            (t, FloorsPrecision::Timers)
-        } else {
-            (sp, FloorsPrecision::Exact)
-        };
-        // `f`: the fly fruit unknown. No speed token ends in `f`.
-        let (sp, fruit) = match sp.strip_suffix('f') {
-            Some(t) => (t, FruitPrecision::Unknown),
-            None => (sp, FruitPrecision::Exact),
-        };
-        // `h`: held buttons unknown. No speed token ends in `h`.
-        let (sp, held) = match sp.strip_suffix('h') {
-            Some(t) => (t, HeldPrecision::Unknown),
-            None => (sp, HeldPrecision::Exact),
-        };
-        let spd = match sp {
-            "x" => SpdPrecision::Exact,
-            w => {
-                // `s<w>x`: only spd.x bucketed, spd.y exact.
-                let (digits, x_only) = match w.strip_suffix('x') {
-                    Some(d) => (d, true),
-                    None => (w, false),
-                };
-                let w: u8 = digits.parse().map_err(|e| format!("level {spec:?}: spd width: {e}"))?;
-                if !(SPD_MIN_WIDTH_LOG2..=20).contains(&w) {
-                    return Err(format!("level {spec:?}: spd width log2 {w} outside {SPD_MIN_WIDTH_LOG2}..=20 (finer overflows the bucket node)"));
+        rest = rest
+            .strip_prefix('x')
+            .ok_or_else(|| format!("level {spec:?}: the speed is exact at every level (`sx`)"))?;
+        let mut flag = |c: char| -> bool {
+            match rest.strip_prefix(c) {
+                Some(t) => {
+                    rest = t;
+                    true
                 }
-                if x_only {
-                    SpdPrecision::WidthLog2X(w)
-                } else {
-                    SpdPrecision::WidthLog2(w)
-                }
+                None => false,
             }
         };
-        Ok(Level { pos, rem, spd, held, fruit, floors, platforms })
+        let held = if flag('h') { HeldPrecision::Unknown } else { HeldPrecision::Exact };
+        let fruit = if flag('f') { FruitPrecision::Unknown } else { FruitPrecision::Exact };
+        let floors = if flag('n') { FloorsPrecision::Near } else { FloorsPrecision::Exact };
+        let platforms = if flag('p') { PlatformsPrecision::Unknown } else { PlatformsPrecision::Exact };
+        if !rest.is_empty() {
+            return Err(format!("level {spec:?}: unexpected {rest:?} (flags are h, f, n, p in that order)"));
+        }
+        Ok(Level { rem, held, fruit, floors, platforms })
     }
 
     /// A ladder from a comma-separated list of levels, coarsest first,
-    /// each level coarser-or-equal to the next in both coordinates and the
-    /// last exact in both (the ladder's soundness argument).
+    /// each level coarser-or-equal to the next in every coordinate and the
+    /// last exact in every one (the ladder's soundness argument).
     pub fn parse_ladder(spec: &str) -> Result<Vec<Level>, String> {
         let levels: Vec<Level> = spec.split(',').map(Level::parse).collect::<Result<_, _>>()?;
         if levels.is_empty() {
@@ -664,10 +229,7 @@ impl Level {
         }
         for l in &levels {
             if !l.grid_consistent() {
-                return Err(format!(
-                    "ladder: {l} - with the single-grid fork a level's spd bucket must be the rem grid \
-                     (r<k>s<16-k>) or exact, and a position bucket needs rem Bits(0)"
-                ));
+                return Err(format!("ladder: {l} - held buttons and objects are widened only at a rem rung"));
             }
         }
         for w in levels.windows(2) {
@@ -676,12 +238,12 @@ impl Level {
             }
         }
         if *levels.last().unwrap() != Level::EXACT {
-            return Err("ladder: the last level must be rxsx (exact in both)".into());
+            return Err("ladder: the last level must be rxsx (exact in every coordinate)".into());
         }
         Ok(levels)
     }
 
-    /// The default ladder: rem Bits(0..=15) then exact, spd by the preset.
+    /// The default ladder: rem Bits(0..=maxk) then exact.
     pub fn default_ladder(maxk: u8) -> Vec<Level> {
         (0u8..=maxk.min(15))
             .map(|k| Level::for_rem(RemPrecision::Bits(k)))
@@ -691,28 +253,18 @@ impl Level {
 }
 
 impl std::fmt::Display for Level {
-    /// `Bits(k)` / `Exact` with exact speed (the form the pinned marks
-    /// gate was taken with), `Bits(k)/W<w>` with a speed bucket.
+    /// `Bits(k)` / `Exact` (the form the pinned marks gate was taken with),
+    /// then a flag per widened object.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.spd {
-            SpdPrecision::Exact => write!(f, "{:?}", self.rem)?,
-            SpdPrecision::WidthLog2(w) => write!(f, "{:?}/W{w}", self.rem)?,
-            SpdPrecision::WidthLog2X(w) => write!(f, "{:?}/W{w}x", self.rem)?,
-        }
-        if !self.pos.is_exact() {
-            write!(f, "/P{}x{}", self.pos.x, self.pos.y)?;
-        }
+        write!(f, "{:?}", self.rem)?;
         if self.held.is_unknown() {
             write!(f, "/H")?;
         }
         if self.fruit.is_unknown() {
             write!(f, "/F")?;
         }
-        match self.floors {
-            FloorsPrecision::Unknown => write!(f, "/B")?,
-            FloorsPrecision::Near => write!(f, "/N")?,
-            FloorsPrecision::Timers => write!(f, "/T")?,
-            FloorsPrecision::Exact => {}
+        if self.floors.is_near() {
+            write!(f, "/N")?;
         }
         if self.platforms.is_unknown() {
             write!(f, "/M")?;
@@ -721,931 +273,33 @@ impl std::fmt::Display for Level {
     }
 }
 
-/// The process-global position precision (`set_level`): `x | y << 4`,
-/// bucket widths in pixels; 0 (unset) reads as exact.
-static POS_PRECISION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-pub fn pos_precision() -> PosPrecision {
-    match POS_PRECISION.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => PosPrecision::EXACT,
-        v => PosPrecision { x: v & 0xf, y: v >> 4 },
-    }
-}
-
-pub fn set_pos_precision(p: PosPrecision) {
-    POS_PRECISION.store(p.x | (p.y << 4), std::sync::atomic::Ordering::Relaxed);
-}
-
-static SPD_PRECISION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SPD_UNSET);
-const SPD_UNSET: u8 = 0xFF;
-const SPD_EXACT: u8 = 0xFE;
-
-/// `WidthLog2X(w)` stores `w | SPD_X_ONLY` (w <= 20, so the bit is free).
-const SPD_X_ONLY: u8 = 0x40;
-
-fn encode_spd(p: SpdPrecision) -> u8 {
-    match p {
-        SpdPrecision::Exact => SPD_EXACT,
-        SpdPrecision::WidthLog2(w) => w,
-        SpdPrecision::WidthLog2X(w) => w | SPD_X_ONLY,
-    }
-}
-
-/// The process-global spd precision: the level the engine dispatches to
-/// (`set_level`). Unset: derived from the rem precision by the preset.
-pub fn spd_precision() -> SpdPrecision {
-    match SPD_PRECISION.load(std::sync::atomic::Ordering::Relaxed) {
-        SPD_UNSET => spd_precision_for(rem_precision_from_env()),
-        SPD_EXACT => SpdPrecision::Exact,
-        w if w & SPD_X_ONLY != 0 => SpdPrecision::WidthLog2X(w & !SPD_X_ONLY),
-        w => SpdPrecision::WidthLog2(w),
-    }
-}
-
-pub fn set_spd_precision(p: SpdPrecision) {
-    SPD_PRECISION.store(encode_spd(p), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The process-global held-button precision (`set_level`); unset reads as
-/// exact.
-static HELD_UNKNOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn held_precision() -> HeldPrecision {
-    if HELD_UNKNOWN.load(std::sync::atomic::Ordering::Relaxed) {
-        HeldPrecision::Unknown
-    } else {
-        HeldPrecision::Exact
-    }
-}
-
-pub fn set_held_precision(p: HeldPrecision) {
-    HELD_UNKNOWN.store(p.is_unknown(), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The process-global fly-fruit precision (`set_level`); unset reads as exact.
-static FRUIT_UNKNOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn fruit_precision() -> FruitPrecision {
-    if FRUIT_UNKNOWN.load(std::sync::atomic::Ordering::Relaxed) {
-        FruitPrecision::Unknown
-    } else {
-        FruitPrecision::Exact
-    }
-}
-
-pub fn set_fruit_precision(p: FruitPrecision) {
-    FRUIT_UNKNOWN.store(p.is_unknown(), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The process-global fall-floor precision (`set_level`): `FloorsPrecision::rank`;
-/// unset (0) reads as exact.
-static FLOORS_PRECISION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-pub fn floors_precision() -> FloorsPrecision {
-    match FLOORS_PRECISION.load(std::sync::atomic::Ordering::Relaxed) {
-        3 => FloorsPrecision::Unknown,
-        2 => FloorsPrecision::Near,
-        1 => FloorsPrecision::Timers,
-        _ => FloorsPrecision::Exact,
-    }
-}
-
-pub fn set_floors_precision(p: FloorsPrecision) {
-    FLOORS_PRECISION.store(p.rank(), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The process-global platform precision (`set_level`); unset reads as exact.
-static PLATFORMS_UNKNOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn platforms_precision() -> PlatformsPrecision {
-    if PLATFORMS_UNKNOWN.load(std::sync::atomic::Ordering::Relaxed) {
-        PlatformsPrecision::Unknown
-    } else {
-        PlatformsPrecision::Exact
-    }
-}
-
-pub fn set_platforms_precision(p: PlatformsPrecision) {
-    PLATFORMS_UNKNOWN.store(p.is_unknown(), std::sync::atomic::Ordering::Relaxed);
-}
+/// The process-global level (`set_level`): what the engine dispatches to.
+/// Unset, it is level 0 (rem Bits(0), every object exact).
+static LEVEL: std::sync::Mutex<Option<Level>> = std::sync::Mutex::new(None);
 
 /// The level whose kernels the engine dispatches to, from here on.
 pub fn set_level(l: Level) {
-    set_pos_precision(l.pos);
-    set_rem_precision(l.rem);
-    set_spd_precision(l.spd);
-    set_held_precision(l.held);
-    set_fruit_precision(l.fruit);
-    set_floors_precision(l.floors);
-    set_platforms_precision(l.platforms);
+    *LEVEL.lock().unwrap() = Some(l);
+}
+
+/// Set only the rem precision of the process-global level.
+pub fn set_rem_precision(p: RemPrecision) {
+    let mut l = LEVEL.lock().unwrap();
+    *l = Some(Level { rem: p, ..l.unwrap_or(Level::for_rem(RemPrecision::Bits(0))) });
 }
 
 pub fn current_level() -> Level {
-    Level {
-        pos: pos_precision(),
-        rem: rem_precision_from_env(),
-        spd: spd_precision(),
-        held: held_precision(),
-        fruit: fruit_precision(),
-        floors: floors_precision(),
-        platforms: platforms_precision(),
-    }
-}
-
-fn spd_width_override() -> Option<u8> {
-    static W: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
-    *W.get_or_init(|| match std::env::var("CELESTE_SPD_WIDTH_LOG2") {
-        Ok(v) => {
-            let w: u8 = v
-                .parse()
-                .unwrap_or_else(|_| panic!("CELESTE_SPD_WIDTH_LOG2={:?} is not a number", v));
-            assert!(
-                (SPD_MIN_WIDTH_LOG2..=20).contains(&w),
-                "CELESTE_SPD_WIDTH_LOG2={} outside the range {}..=20 \
-                 (16 = 1 px/frame buckets; finer overflows the bucket node)",
-                w,
-                SPD_MIN_WIDTH_LOG2
-            );
-            Some(w)
-        }
-        Err(_) => None,
-    })
-}
-
-pub fn make_state_abstract(state: State) -> State {
-    erase_provenance_hints(apply_conservative_widenings(make_state_abstract_pos(
-        make_state_abstract_spd(make_state_abstract_rem(state, rem_precision_from_env()), spd_precision()),
-        pos_precision(),
-    )))
-}
-
-/// The position widening at `precision`: the player's `x`/`y` (whole
-/// pixels) snapped to their floor-aligned bucket of `precision.x`/`.y`
-/// pixels as a closed interval `[low, low + w - 1]`. Exact is a no-op.
-pub fn make_state_abstract_pos(mut state: State, precision: PosPrecision) -> State {
-    if precision.is_exact() {
-        return state;
-    }
-    let marks = mark_heap(&state);
-    for (axis, w) in [("player_x", precision.x), ("player_y", precision.y)] {
-        if w <= 1 {
-            continue;
-        }
-        let Some(heap_ids) = marks.marks.get(axis) else { continue };
-        let width = w as i32;
-        let bucket = |n: Pico8Num| -> Pico8NumInterval {
-            let whole = n.as_i16().unwrap_or_else(|| panic!("player {axis} {n:?} is not a whole pixel")) as i32;
-            let low = whole.div_euclid(width) * width;
-            Pico8NumInterval::new(Pico8Num::from_i16(low as i16), Pico8Num::from_i16((low + width - 1) as i16))
-        };
-        let widen_interval = |iv: &Pico8NumInterval| -> Pico8NumInterval {
-            Pico8NumInterval::new(bucket(iv.low).low, bucket(iv.high).high)
-        };
-        for &heap_id in heap_ids {
-            if let HeapValue::Value(value) = state.heap.get(heap_id) {
-                let new_value = match value {
-                    Value::Number(MaybeVector::Scalar(n)) => Value::NumberInterval(MaybeVector::Scalar(bucket(*n))),
-                    Value::Number(MaybeVector::Vector(nums)) => {
-                        Value::NumberInterval(MaybeVector::vector(nums.iter().map(|n| bucket(*n)).collect()))
-                    }
-                    Value::NumberInterval(MaybeVector::Scalar(iv)) => {
-                        Value::NumberInterval(MaybeVector::Scalar(widen_interval(iv)))
-                    }
-                    Value::NumberInterval(MaybeVector::Vector(ivs)) => {
-                        Value::NumberInterval(MaybeVector::vector(ivs.iter().map(widen_interval).collect()))
-                    }
-                    other => panic!("Unexpected value type for {axis} at {:?}: {:?}", heap_id, other),
-                };
-                state.heap.set(heap_id, HeapValue::Value(new_value));
-            }
-        }
-    }
-    state
-}
-
-/// The reference's INPUT side of the position widening: a state whose
-/// player `x`/`y` is a bucket interval becomes one state per whole-pixel
-/// point in it (the kernels run the same points as fork configurations,
-/// `IntFrag`). Scalar (single-lane) states only - the reference engine
-/// runs one lane at a time.
-pub fn split_pos_points(state: State) -> Vec<State> {
-    let marks = mark_heap(&state);
-    let mut work = vec![state];
-    for axis in ["player_x", "player_y"] {
-        let Some(cells) = marks.marks.get(axis).cloned() else { continue };
-        for cell in cells {
-            let mut next = Vec::new();
-            for st in work {
-                let Some(HeapValue::Value(Value::NumberInterval(MaybeVector::Scalar(iv)))) = st.heap.get_opt(cell) else {
-                    next.push(st);
-                    continue;
-                };
-                let lo = iv.low.as_i16().unwrap_or_else(|| panic!("{axis} bucket {iv:?} is not whole pixels"));
-                let hi = iv.high.as_i16().unwrap_or_else(|| panic!("{axis} bucket {iv:?} is not whole pixels"));
-                for p in lo..=hi {
-                    let mut s = st.clone();
-                    s.heap.set(cell, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(p)))));
-                    next.push(s);
-                }
-            }
-            work = next;
-        }
-    }
-    work
-}
-
-/// Canonicalize provenance strings at the frame boundary: `Nil(Some(hint))`
-/// becomes `Nil(None)` and `NilPointer(name)` becomes `NilPointer("")`.
-///
-/// The strings are diagnostic-only: a hint is BORN loading through a
-/// `NilPointer` (core_interpreter's Load arm) and CONSUMED only in error
-/// messages, and a `NilPointer`'s name likewise reaches nothing but
-/// messages and the hint it mints. Game semantics never read either. But
-/// both sit in the SHAPE HASH (`ValueShape::Nil(hint)` /
-/// `ValueShape::NilPointer(name)`), so two states identical in every
-/// gameplay coordinate were explored as two distinct search rows if they
-/// reached the same nil along different paths.
-///
-/// This is a canonicalization, NOT a widening: the states it merges have
-/// bit-identical concrete semantics, so there is nothing a refinement rung
-/// would need to narrow back.
-///
-/// It is also what makes the compiled engine's exports and the
-/// interpreter's states ONE key space. `compiled::bridge` cannot round-trip
-/// the strings (`AV::Nil` and `AV::NilPtr` carry no payload), so its
-/// exports were hint-less while the interpreter's states were not - the
-/// two searches diverged at the first hinted nil (room (1,0) f25: every
-/// row re-keyed, +24 rows against history; see BENCHMARK_DATA.md
-/// "The 24-row divergence"). Erasing at the boundary makes the erased form
-/// canonical on both paths.
-///
-/// Trajectory-changing: row keys differ from the first hinted nil onward,
-/// which is why FORMAT_VERSION moved to 5.
-pub fn erase_provenance_hints(mut state: State) -> State {
-    // Boundary states carry no local envs (asserted by the bridge and true
-    // at every call site); the heap is the whole story.
-    for i in 0..state.heap.len() {
-        let id = HeapId::from_raw(i);
-        let erased = match state.heap.get_opt(id) {
-            Some(HeapValue::Value(Value::Nil(Some(_)))) => Some(HeapValue::Value(Value::Nil(None))),
-            Some(HeapValue::Value(Value::NilPointer(s))) if !s.is_empty() => {
-                Some(HeapValue::Value(Value::NilPointer(String::new())))
-            }
-            Some(HeapValue::Closure(gid, caps))
-                if caps.iter().any(|c| {
-                    matches!(c, Value::Nil(Some(_)))
-                        || matches!(c, Value::NilPointer(s) if !s.is_empty())
-                }) =>
-            {
-                let caps = caps
-                    .iter()
-                    .map(|c| match c {
-                        Value::Nil(Some(_)) => Value::Nil(None),
-                        Value::NilPointer(s) if !s.is_empty() => Value::NilPointer(String::new()),
-                        other => other.clone(),
-                    })
-                    .collect();
-                Some(HeapValue::Closure(gid.clone(), caps))
-            }
-            _ => None,
-        };
-        if let Some(v) = erased {
-            state.heap.set(id, v);
-        }
-    }
-    state
-}
-
-/// Split lanes whose boundary rem interval straddles a bucket boundary of
-/// the session precision into one lane per bucket, clipping the interval.
-///
-/// Why: the boundary widening maps each lane's rem to the bucket(s) covering
-/// it. A straddling interval (e.g. [-0.463, 0.037) at 1 bit, after a dash's
-/// rounding) would widen to the SPAN of two buckets - sound, but the row is
-/// then a different value than the single bucket the same underlying state
-/// gets when reached along another path, so row identity fragments and
-/// band/witness probes miss legitimate rows. Splitting first makes every
-/// boundary row's rem exactly one bucket - canonical identity per level.
-///
-/// Boundary intervals inherit single-bucket width (they enter the frame as
-/// one bucket and the move only shifts and renormalizes them), so a
-/// straddle spans at most two adjacent buckets; this is asserted.
-pub fn split_rem_straddles(state: State) -> Vec<State> {
-    let RemPrecision::Bits(bits) = rem_precision_from_env() else {
-        return vec![state];
-    };
-    if bits == 0 {
-        return vec![state];
-    }
-    // rem boundary intervals are single-bucket-width by construction
-    // (they enter the frame as one bucket and the move only shifts and
-    // renormalizes them), so a straddle spans at most TWO buckets.
-    split_marked_straddles(state, "player_rem_xy", 0x1_0000 >> bits, 2)
-}
-
-/// `split_rem_straddles` for the spd rung: one lane per occupied spd
-/// bucket (plans/spd-rung.md). spd boundary intervals are one bucket
-/// wide plus at most a frame's worth of accel drift, so the span cap is
-/// generous rather than tight; hitting it means the physics moved spd
-/// intervals in a way the design did not price, and that should FAIL,
-/// not widen silently.
-pub fn split_spd_straddles(state: State) -> Vec<State> {
-    // A number lies in one bucket, so an exact y (`WidthLog2X`) never splits.
-    let Some(w) = spd_precision().width_log2() else {
-        return vec![state];
-    };
-    split_marked_straddles(state, "player_spd_xy", 1i32 << w, 8)
-}
-
-/// Both boundary straddle splits, composed - the one the boundary
-/// pipeline calls.
-pub fn split_precision_straddles(state: State) -> Vec<State> {
-    split_rem_straddles(state)
-        .into_iter()
-        .flat_map(split_spd_straddles)
-        .collect()
-}
-
-/// Split lanes whose interval on any `mark`-ed cell straddles a
-/// floor-aligned bucket of `width` into one lane per covered bucket,
-/// clipping each to its bucket. Generalizes the historic two-bucket rem
-/// split: the first emitted state is EVERY lane clipped to its first
-/// bucket, then one state per further bucket depth holding only the
-/// lanes that reach it - for a two-bucket straddle this is bit for bit
-/// the old (low, high) pair, in the same order, which the room (1,0)
-/// f30 byte-identity gate checks.
-fn split_marked_straddles(state: State, mark: &str, width: i32, max_span: i32) -> Vec<State> {
-    let bucket_low = |n: Pico8Num| (n.as_raw_u32() as i32).div_euclid(width) * width;
-    let from_raw = |r: i32| Pico8Num::from_parts((r >> 16) as i16, r as u16);
-
-    let marks = mark_heap(&state);
-    let Some(cells) = marks.marks.get(mark).cloned() else {
-        return vec![state];
-    };
-
-    let mut work = vec![state];
-    for cell in cells {
-        let mut next = Vec::with_capacity(work.len());
-        for state in work {
-            let Some(HeapValue::Value(Value::NumberInterval(mv))) = state.heap.get_opt(cell) else {
-                // Numbers (and anything else) lie in a single bucket.
-                next.push(state);
-                continue;
-            };
-            let intervals: Vec<Pico8NumInterval> = match mv {
-                MaybeVector::Scalar(iv) => vec![*iv; state.vector_size.max(1)],
-                MaybeVector::Vector(ivs) => ivs.iter().copied().collect(),
-            };
-            // Buckets covered per lane, 1-based.
-            let spans: Vec<i32> = intervals
-                .iter()
-                .map(|iv| {
-                    let span = (bucket_low(iv.high) - bucket_low(iv.low)) / width + 1;
-                    assert!(
-                        span <= max_span,
-                        "{} interval {:?} spans {} buckets of width {:#x} (cap {})",
-                        mark,
-                        iv,
-                        span,
-                        width,
-                        max_span
-                    );
-                    span
-                })
-                .collect();
-            let deepest = spans.iter().copied().max().unwrap_or(1);
-            if deepest == 1 {
-                next.push(state);
-                continue;
-            }
-            // Depth 1: every lane, clipped to its FIRST bucket.
-            let clipped_first: Vec<Pico8NumInterval> = intervals
-                .iter()
-                .zip(&spans)
-                .map(|(iv, span)| {
-                    if *span > 1 {
-                        Pico8NumInterval::new(iv.low, from_raw(bucket_low(iv.low) + width - 1))
-                    } else {
-                        *iv
-                    }
-                })
-                .collect();
-            let mut first_state = state.clone();
-            first_state.heap.set(
-                cell,
-                HeapValue::Value(Value::NumberInterval(MaybeVector::vector(clipped_first))),
-            );
-            next.push(first_state);
-            // Depth k >= 2: only the lanes whose interval reaches bucket k,
-            // clipped to it.
-            for depth in 2..=deepest {
-                let reaches: Vec<bool> = spans.iter().map(|s| *s >= depth).collect();
-                let depth_state = state
-                    .filter_by_mask_clone(&reaches, crate::interpreter::state::FILTER_SPLIT_FLR);
-                let clipped: Vec<Pico8NumInterval> = intervals
-                    .iter()
-                    .zip(&spans)
-                    .filter(|(_, s)| **s >= depth)
-                    .map(|(iv, span)| {
-                        let start = bucket_low(iv.low) + (depth - 1) * width;
-                        let low = if depth == 1 { iv.low } else { from_raw(start) };
-                        let high = if depth == *span {
-                            iv.high
-                        } else {
-                            from_raw(start + width - 1)
-                        };
-                        Pico8NumInterval::new(low, high)
-                    })
-                    .collect();
-                let mut depth_state = depth_state;
-                depth_state.heap.set(
-                    cell,
-                    HeapValue::Value(Value::NumberInterval(MaybeVector::vector(clipped))),
-                );
-                next.push(depth_state);
-            }
-        }
-        work = next;
-    }
-    work
-}
-
-/// Widen player.spd.x/y to floor-aligned buckets of width 2^w raw
-/// (plans/spd-rung.md). Exact is a no-op. The sanity bound is NOT
-/// load-bearing - floor-aligned buckets cover every representable value
-/// - it exists to catch a heap-shape bug loudly rather than bucket
-/// garbage.
-/// THE SPEED HULL (2026-09-15): a row stores its speed TIGHT and is keyed
-/// on its bucket (`Block::from_state`: the widened key; the kernels: the
-/// key node override). The straddle split (`split_spd_straddles`) clips a
-/// speed interval to its bucket; nothing widens it to the bucket any more,
-/// so this is the identity - kept as the boundary's named step, and as
-/// the place the sanity range check lives.
-pub fn make_state_abstract_spd(state: State, precision: SpdPrecision) -> State {
-    let _ = precision;
-    state
-}
-
-/// The floor-aligned width-2^-bits bucket containing `n` (bits in 1..=15).
-fn rem_bucket(n: Pico8Num, bits: u8) -> Pico8NumInterval {
-    let width: i32 = 0x1_0000 >> bits;
-    let raw = n.as_raw_u32() as i32;
-    let low = raw.div_euclid(width) * width;
-    let from_raw = |r: i32| Pico8Num::from_parts((r >> 16) as i16, r as u16);
-    Pico8NumInterval::new(from_raw(low), from_raw(low + width - 1))
-}
-
-/// Widen player.rem.x/y at `precision` (see `RemPrecision`). Bits(0) is the
-/// historic full-interval widening, bit for bit; Exact leaves rem untouched.
-pub fn make_state_abstract_rem(mut state: State, precision: RemPrecision) -> State {
-    if precision == RemPrecision::Exact {
-        return state;
-    }
-    let marks = mark_heap(&state);
-
-    // The player_rem_xy range: [-0.5, 0.5). 0.5 is 0x8000 fractional.
-    let half = Pico8Num::from_parts(0, 0x8000);
-    let neg_half = -half;
-    let half_below = half.next_smallest(); // 0.5 - epsilon
-    let wide_interval = Pico8NumInterval::new(neg_half, half_below);
-
-    // Bucket of a single value at this precision.
-    let widen_number = |n: Pico8Num| -> Pico8NumInterval {
-        assert!(
-            wide_interval.contains_number(n),
-            "player_rem value {:?} not in expected interval",
-            n
-        );
-        match precision {
-            RemPrecision::Bits(0) => wide_interval,
-            RemPrecision::Bits(bits) => rem_bucket(n, bits),
-            RemPrecision::Exact => unreachable!(),
-        }
-    };
-    // An interval (mid-frame refinement residue) spans its endpoint buckets.
-    let widen_interval = |iv: &Pico8NumInterval| -> Pico8NumInterval {
-        assert!(
-            wide_interval.contains_interval(iv),
-            "player_rem interval {:?} not in expected interval",
-            iv
-        );
-        match precision {
-            RemPrecision::Bits(0) => wide_interval,
-            RemPrecision::Bits(bits) => {
-                Pico8NumInterval::new(rem_bucket(iv.low, bits).low, rem_bucket(iv.high, bits).high)
-            }
-            RemPrecision::Exact => unreachable!(),
-        }
-    };
-
-    if let Some(heap_ids) = marks.marks.get("player_rem_xy") {
-        for &heap_id in heap_ids {
-            let heap_value = state.heap.get(heap_id);
-            if let HeapValue::Value(value) = heap_value {
-                let new_value = match value {
-                    Value::Number(MaybeVector::Scalar(n)) => {
-                        Value::NumberInterval(MaybeVector::Scalar(widen_number(*n)))
-                    }
-                    Value::Number(MaybeVector::Vector(nums)) => Value::NumberInterval(
-                        MaybeVector::vector(nums.iter().map(|n| widen_number(*n)).collect()),
-                    ),
-                    Value::NumberInterval(MaybeVector::Scalar(interval)) => {
-                        Value::NumberInterval(MaybeVector::Scalar(widen_interval(interval)))
-                    }
-                    Value::NumberInterval(MaybeVector::Vector(intervals)) => {
-                        Value::NumberInterval(MaybeVector::vector(
-                            intervals.iter().map(|iv| widen_interval(iv)).collect(),
-                        ))
-                    }
-                    other => {
-                        panic!("Unexpected value type for player_rem: {:?}", other);
-                    }
-                };
-                state.heap.set(heap_id, HeapValue::Value(new_value));
-            }
-        }
-    }
-
-    // Widen each live fruit's bob counter to unknown-within-period: off :=
-    // the FULL interval [0, 39] at every non-exact level (this function
-    // returns early for Exact, where `off` stays concrete mod 40 - the
-    // conservative pin). This joins the refinement ladder exactly like rem:
-    // coarse levels over-approximate the bob (sin over the interval covers
-    // [-1, 1], so the fruit's y is the whole band and collisions split on
-    // UnknownBool), refutations stay sound, and the exact level resolves
-    // the phase through the k15 band. Rationale (Philippe, 2026-08-07): the
-    // berry is extremely unlikely to be on the optimal path; if it IS, the
-    // exact level still decides correctly - a wrong result cannot slip
-    // through, only a loose band. The win: all break cohorts collapse into
-    // one row family (33.5% of the room-(0,0) frontier at f79 was
-    // per-cohort fruit rows).
-    //
-    // The bob POSITION goes with it. `off` is read in exactly one place -
-    // fruit.update's `this.y = this.start + sin(this.off/40)*2.5` (the read
-    // census in `apply_conservative_widenings`) - so `y` is the one field
-    // derived from it, and widening one without the other does not produce
-    // a state the coarse level can have. That asymmetry is not academic:
-    // the exact level's `y` is one of the 40 concrete bob positions, so its
-    // coarsened row (concrete y, widened off) matches no row of the coarse
-    // level (interval y, widened off), and the band filter drops the lane
-    // as an "unknown coarse row". Room (2,0) has a fruit alive from room
-    // load in EVERY lane, and before this the k16 level came out empty at
-    // frame 2 and refuted every horizon. `sin` is in [-1, 1] by definition,
-    // so the band is start +/- 2.5 - which is also, bit for bit, what the
-    // coarse levels' own interval arithmetic puts there.
-    {
-        let helper = StateHelper::new(&state);
-        let mut off_cells: Vec<HeapId> = Vec::new();
-        let mut bob_cells: Vec<(HeapId, HeapId)> = Vec::new();
-        if let Some(arr_id) = helper
-            .find_global("objects")
-            .and_then(|id| helper.unwrap_pointer(helper.load(id)))
-        {
-            let fruits = helper
-                .find_objects_by_type(arr_id, "fruit")
-                .unwrap_or_else(|e| panic!("fruit-off widening: {}", e));
-            for obj_id in fruits {
-                let HeapValue::ObjectTable(obj) = helper.load(obj_id) else {
-                    panic!("fruit-off widening: fruit is not an ObjectTable");
-                };
-                off_cells.push(
-                    *obj.get("off")
-                        .unwrap_or_else(|| panic!("fruit-off widening: fruit has no `off` field")),
-                );
-                let field = |name: &str| {
-                    *obj.get(name).unwrap_or_else(|| {
-                        panic!("fruit-off widening: fruit has no `{}` field", name)
-                    })
-                };
-                bob_cells.push((field("y"), field("start")));
-            }
-        }
-        let full_period = Pico8NumInterval::new(Pico8Num::from_i16(0), Pico8Num::from_i16(39));
-        for cell in off_cells {
-            match state.heap.get(cell) {
-                HeapValue::Value(Value::Number(_) | Value::NumberInterval(_)) => {
-                    state.heap.set(
-                        cell,
-                        HeapValue::Value(Value::NumberInterval(MaybeVector::Scalar(full_period))),
-                    );
-                }
-                other => panic!("fruit-off widening: off is not numeric: {:?}", other),
-            }
-        }
-        // sin(off/40) * 2.5, for an unknown phase: the whole bob band.
-        let amplitude = Pico8Num::from_parts(2, 0x8000);
-        let band_of =
-            |start: &Pico8Num| Pico8NumInterval::new(*start - amplitude, *start + amplitude);
-        for (y_cell, start_cell) in bob_cells {
-            let bands: MaybeVector<Pico8NumInterval> = match state.heap.get(start_cell) {
-                HeapValue::Value(Value::Number(MaybeVector::Scalar(start))) => {
-                    MaybeVector::Scalar(band_of(start))
-                }
-                HeapValue::Value(Value::Number(MaybeVector::Vector(starts))) => {
-                    MaybeVector::vector(starts.iter().map(band_of).collect())
-                }
-                other => panic!("fruit-off widening: start is not a number: {:?}", other),
-            };
-            // The widening must only ever grow the value it replaces.
-            let old_y = match state.heap.get(y_cell) {
-                HeapValue::Value(value) => value.clone(),
-                other => panic!("fruit-off widening: y is not a value: {:?}", other),
-            };
-            let band_of_lane = |i: usize| match &bands {
-                MaybeVector::Scalar(band) => *band,
-                MaybeVector::Vector(bands) => bands[i],
-            };
-            for i in 0..state.vector_size {
-                let contained = match &old_y {
-                    Value::Number(MaybeVector::Scalar(n)) => band_of_lane(i).contains_number(*n),
-                    Value::Number(MaybeVector::Vector(ns)) => {
-                        band_of_lane(i).contains_number(ns[i])
-                    }
-                    Value::NumberInterval(MaybeVector::Scalar(iv)) => {
-                        band_of_lane(i).contains_interval(iv)
-                    }
-                    Value::NumberInterval(MaybeVector::Vector(ivs)) => {
-                        band_of_lane(i).contains_interval(&ivs[i])
-                    }
-                    other => panic!("fruit-off widening: y is not numeric: {:?}", other),
-                };
-                assert!(
-                    contained,
-                    "fruit-off widening: lane {} of y {:?} is outside the bob band {:?}",
-                    i,
-                    old_y,
-                    band_of_lane(i)
-                );
-            }
-            state
-                .heap
-                .set(y_cell, HeapValue::Value(Value::NumberInterval(bands)));
-        }
-    }
-
-    state
-}
-
-/// The newer boundary widenings, all justified as behavior-preserving by read
-/// censuses (and certifiable dynamically via `rewrite widencheck`): the
-/// dash_effect_time clamp, and the gameplay-dead timer-global pins. Applied
-/// as part of `make_state_abstract`, and applied post hoc by the widen-check.
-pub fn apply_conservative_widenings(mut state: State) -> State {
-    let marks = mark_heap(&state);
-
-    // Clamp player.dash_effect_time at 0 from below. The field decrements
-    // unconditionally every frame (celeste-minimal.lua:124) and its ONLY read
-    // anywhere is `hit.dash_effect_time > 0` (line 471), so every value <= 0
-    // is behaviorally identical - the clamp is a no-op in every room, not
-    // just this one. Without it the field drifts negative forever and two
-    // otherwise-identical states at different frames never compare equal,
-    // defeating cross-frame visited dedup.
-    if let Some(heap_ids) = marks.marks.get("player_dash_effect_time") {
-        let zero = Pico8Num::from_i16(0);
-        for &heap_id in heap_ids {
-            match state.heap.get(heap_id) {
-                HeapValue::Value(Value::Number(mv)) => {
-                    let clamped = match mv {
-                        MaybeVector::Scalar(n) => {
-                            MaybeVector::Scalar(if *n < zero { zero } else { *n })
-                        }
-                        MaybeVector::Vector(ns) => MaybeVector::vector(
-                            ns.iter()
-                                .map(|n| if *n < zero { zero } else { *n })
-                                .collect(),
-                        ),
-                    };
-                    state
-                        .heap
-                        .set(heap_id, HeapValue::Value(Value::Number(clamped)));
-                }
-                other => panic!("player dash_effect_time is not a number: {:?}", other),
-            }
-        }
-    }
-
-    // NOTE on p_jump/p_dash (2026-08-06): widening the held-button trails to
-    // unknown at the boundary at EVERY level was considered (it would merge
-    // the dominated held variants with their released twins) and REJECTED by
-    // Philippe: it is an over-approximation - it admits e.g. ground-jump at n
-    // followed by wall-jump at n+1, which the concrete game forbids (the
-    // press at n forces p_jump=true at n+1) - and nothing narrowed it back.
-    // Since 2026-09-16 a level can hold them unknown (`HeldPrecision`, spec
-    // `h`) only at a rem rung, with the exact rung keeping them exact, which
-    // refutes such spurious wins (plans/held-buttons.md). This function (the
-    // reference widenings) never widens them: the reference engine refuses
-    // held-unknown levels (`refdriver::run_frame_all`).
-
-    // Reduce each live fruit's bob counter modulo its period 40.
-    //
-    // Read census: `off` is written at fruit.init (this.off=0) and
-    // fruit.update (this.off += 1), and READ exactly once - fruit.update's
-    // `sin(this.off/40)` (celeste-minimal.lua ~line 425). For nonnegative
-    // integers, fixed-point division splits exactly ((off+40)/40 ==
-    // off/40 + 1), and `pico8_sin` reduces its argument mod one turn in
-    // fixed point, so sin(off/40) == sin((off mod 40)/40) bit-for-bit -
-    // pinned exhaustively by test_pico8_sin_period_40_bit_exact. Without
-    // this pin, `off` is an embedded frame counter: every fruit-alive row
-    // differs across frames and break cohorts, defeating cross-frame
-    // visited dedup (measured at 33.5% of the room-(0,0) frontier at f79).
-    // No fruit ever exists in room (1,0), so this is a no-op there and the
-    // standing (1,0) row hashes are untouched.
-    {
-        let helper = StateHelper::new(&state);
-        let mut off_updates: Vec<(HeapId, Value)> = Vec::new();
-        if let Some(arr_id) = helper
-            .find_global("objects")
-            .and_then(|id| helper.unwrap_pointer(helper.load(id)))
-        {
-            let fruits = helper
-                .find_objects_by_type(arr_id, "fruit")
-                .unwrap_or_else(|e| panic!("fruit-off pin: {}", e));
-            for obj_id in fruits {
-                let HeapValue::ObjectTable(obj) = helper.load(obj_id) else {
-                    panic!("fruit-off pin: fruit is not an ObjectTable");
-                };
-                let off_cell = *obj
-                    .get("off")
-                    .unwrap_or_else(|| panic!("fruit-off pin: fruit has no `off` field"));
-                let reduce = |n: &Pico8Num| -> Pico8Num {
-                    let i = n
-                        .as_i16()
-                        .unwrap_or_else(|| panic!("fruit-off pin: off {:?} is not an integer", n));
-                    assert!(i >= 0, "fruit-off pin: off {} is negative", i);
-                    Pico8Num::from_i16(i % 40)
-                };
-                match helper.load(off_cell) {
-                    HeapValue::Value(Value::Number(mv)) => {
-                        let reduced = match mv {
-                            MaybeVector::Scalar(n) => MaybeVector::Scalar(reduce(n)),
-                            MaybeVector::Vector(ns) => {
-                                MaybeVector::vector(ns.iter().map(reduce).collect())
-                            }
-                        };
-                        off_updates.push((off_cell, Value::Number(reduced)));
-                    }
-                    // Already widened to unknown-within-period by
-                    // make_state_abstract_rem (which runs before this at
-                    // non-exact levels; mid-frame the interval drifts to at
-                    // most [1, 40]). Validate the bound and leave it - the
-                    // next boundary's widening resets it to [0, 39].
-                    HeapValue::Value(Value::NumberInterval(mv)) => {
-                        let ok = |iv: &Pico8NumInterval| {
-                            iv.low >= Pico8Num::from_i16(0) && iv.high <= Pico8Num::from_i16(40)
-                        };
-                        let all_ok = match mv {
-                            MaybeVector::Scalar(iv) => ok(iv),
-                            MaybeVector::Vector(ivs) => ivs.iter().all(ok),
-                        };
-                        assert!(
-                            all_ok,
-                            "fruit-off pin: widened off outside [0, 40]: {:?}",
-                            mv
-                        );
-                    }
-                    other => panic!("fruit-off pin: off is not a number: {:?}", other),
-                }
-            }
-        }
-        for (cell, value) in off_updates {
-            state.heap.set(cell, HeapValue::Value(value));
-        }
-    }
-
-    // Pin the gameplay-dead timer globals to 0.
-    //
-    // `frames`, `seconds`, `minutes` and `deaths` form a closed subsystem in
-    // celeste-minimal: they only ever feed each other (the timer cascade and
-    // the death counter), never gameplay. The one other read is the key's
-    // sprite wobble: `key.update` writes `spr = 9 + (sin(frames/30) + 0.5)`
-    // and toggles `flip.x` when `flr(spr)` reaches 10, and nothing but the
-    // key's update and its drawing reads either - so those two are pinned
-    // below WITH the timers (spr to the key tile 8, flip.x to false).
-    // Pinning `frames` alone left them varying on exact rows and constant on
-    // pinned ones: in room (4,0), the first key room, no exact state had a
-    // widened counterpart and the exact level refuted a real solution
-    // (2026-09-16). Erasing them at the
-    // frame boundary makes the state representation world-still, which is
-    // what allows cross-frame visited-set dedup (a state reached at frame n
-    // never needs re-expansion later). It also merges died-and-respawned
-    // lanes with never-died ones (`deaths` is lane-varying after a death).
-    for name in ["frames", "seconds", "minutes", "deaths"] {
-        let cell = state.global_env.get(name).copied().unwrap_or_else(|| {
-            panic!(
-                "timer global {} missing - pinning would silently not apply",
-                name
-            )
-        });
-        match state.heap.get(cell) {
-            HeapValue::Value(Value::Number(_)) => {
-                state.heap.set(
-                    cell,
-                    HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(0)))),
-                );
-            }
-            other => panic!("timer global {} is not a number: {:?}", name, other),
-        }
-    }
-    {
-        let helper = StateHelper::new(&state);
-        let mut key_updates: Vec<(HeapId, Value)> = Vec::new();
-        if let Some(arr_id) = helper
-            .find_global("objects")
-            .and_then(|id| helper.unwrap_pointer(helper.load(id)))
-        {
-            let keys = helper
-                .find_objects_by_type(arr_id, "key")
-                .unwrap_or_else(|e| panic!("key pin: {}", e));
-            for obj_id in keys {
-                let HeapValue::ObjectTable(obj) = helper.load(obj_id) else {
-                    panic!("key pin: key is not an ObjectTable");
-                };
-                let spr = *obj.get("spr").unwrap_or_else(|| panic!("key pin: key has no `spr` field"));
-                key_updates.push((spr, Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(8)))));
-                let flip = *obj.get("flip").unwrap_or_else(|| panic!("key pin: key has no `flip` field"));
-                let flip_table = helper
-                    .unwrap_pointer(helper.load(flip))
-                    .unwrap_or_else(|| panic!("key pin: key `flip` is not a table"));
-                let HeapValue::ObjectTable(ft) = helper.load(flip_table) else {
-                    panic!("key pin: key `flip` is not an ObjectTable");
-                };
-                let fx = *ft.get("x").unwrap_or_else(|| panic!("key pin: key `flip` has no `x`"));
-                key_updates.push((fx, Value::Bool(MaybeVector::Scalar(false))));
-            }
-        }
-        for (cell, value) in key_updates {
-            state.heap.set(cell, HeapValue::Value(value));
-        }
-    }
-
-    // NOTE on `has_dashed` (2026-08-15): it is gameplay-dead in any room
-    // without a `fly_fruit` (its only read is fly_fruit.update's
-    // `if has_dashed`), and pinning it looked like a free way to merge the
-    // dashed and never-dashed copies of every state. MEASURED on room
-    // (2,0): the pin changes the frame-50 frontier from 5,507,770 lanes to
-    // 5,507,769 - one lane. By the time the frontier is large, every state
-    // in it has dashed. Not worth a per-room soundness argument.
-
-    state
+    LEVEL.lock().unwrap().unwrap_or(Level::for_rem(RemPrecision::Bits(0)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_pico8_interval_half() {
-        let half = Pico8Num::from_parts(0, 0x8000);
-        let neg_half = -half;
-        assert_eq!(half + neg_half, Pico8Num::from_i16(0));
-
-        let interval = Pico8NumInterval::new(neg_half, half.next_smallest());
-        assert!(interval.contains_number(Pico8Num::from_i16(0)));
-        assert!(interval.contains_number(Pico8Num::from_parts(0, 0x4000))); // 0.25
-        assert!(interval.contains_number(neg_half));
-        assert!(!interval.contains_number(half)); // 0.5 is not included (we use < 0.5)
-    }
-
-    /// The spd buckets (plans/spd-rung.md): static floor-aligned coverage
-    /// including negatives, power-of-two NESTING (finer bucket inside
-    /// exactly one coarser bucket - what makes band coarsening
-    /// straddle-free and coarse levels over-approximations), and the
-    /// 1 px width at w=16.
-    #[test]
-    fn spd_buckets_are_static_nested_and_cover_negatives() {
-        let bucket = |raw: i32, w: u8| -> (i32, i32) {
-            let width = 1i32 << w;
-            let low = raw.div_euclid(width) * width;
-            (low, low + width - 1)
-        };
-        // 1 px buckets at w=16: -0.3 px/f lands in [-1 px, -epsilon].
-        let neg = -(0x0000_4CCC_i32); // ~ -0.3 in 16.16
-        let (lo, hi) = bucket(neg, 16);
-        assert_eq!(lo, -0x1_0000, "negative speeds floor-align DOWN");
-        assert_eq!(hi, -1);
-        // Zero sits at the bottom of [0, 1px).
-        assert_eq!(bucket(0, 16), (0, 0xFFFF));
-        // Nesting: every w=16 bucket lies inside exactly one w=17 bucket.
-        for raw in [-0x2_8000i32, -0x1_0000, -1, 0, 0x7FFF, 0x1_2345, 0x5_0000] {
-            let (lo16, hi16) = bucket(raw, 16);
-            let (lo17, hi17) = bucket(raw, 17);
-            assert!(
-                lo17 <= lo16 && hi16 <= hi17,
-                "w=16 bucket of {:#x} not nested",
-                raw
-            );
-            // And the coarse bucket of the fine bucket's endpoints agrees.
-            assert_eq!(bucket(lo16, 17), (lo17, hi17));
-            assert_eq!(bucket(hi16, 17), (lo17, hi17));
-        }
-    }
-
     /// `coarser_or_equal` is the guard on every artifact one ladder level
-    /// shares with another (the position graph today), so it must mean
-    /// BUCKET CONTAINMENT and not just "a smaller number". Checked against
-    /// the actual widening arithmetic: both ladders are floor-aligned
-    /// power-of-two buckets, rem at raw width 2^(16-k) and spd at 2^w, so
-    /// containment is nesting in the same sense the test above checks.
+    /// shares with another, so it must mean BUCKET CONTAINMENT and not just
+    /// "a smaller number": rem's floor-aligned buckets at raw width
+    /// 2^(16-k) nest exactly when the rung is coarser.
     #[test]
     fn coarser_or_equal_means_the_buckets_nest() {
         let bucket = |raw: i32, w: u8| -> (i32, i32) {
@@ -1653,25 +307,14 @@ mod tests {
             let low = raw.div_euclid(width) * width;
             (low, low + width - 1)
         };
-        let probes = [
-            -0x2_8000i32,
-            -0x1_0000,
-            -0x4CCC,
-            -1,
-            0,
-            0x1234,
-            0x7FFF,
-            0x1_2345,
-        ];
-        for a in RemPrecision::all() {
-            for b in RemPrecision::all() {
+        let probes = [-0x2_8000i32, -0x1_0000, -0x4CCC, -1, 0, 0x1234, 0x7FFF, 0x1_2345];
+        let all = || (0..16u8).map(RemPrecision::Bits).chain(std::iter::once(RemPrecision::Exact));
+        for a in all() {
+            for b in all() {
                 let (RemPrecision::Bits(ka), RemPrecision::Bits(kb)) = (a, b) else {
                     // Exact is a point, so it nests in everything and
                     // contains only itself.
-                    assert_eq!(
-                        a.coarser_or_equal(b),
-                        b == RemPrecision::Exact || a != RemPrecision::Exact
-                    );
+                    assert_eq!(a.coarser_or_equal(b), b == RemPrecision::Exact || a != RemPrecision::Exact);
                     continue;
                 };
                 let nests = probes.iter().all(|&r| {
@@ -1682,141 +325,49 @@ mod tests {
                 assert_eq!(a.coarser_or_equal(b), nests, "rem {:?} vs {:?}", a, b);
             }
         }
-        for a in SpdPrecision::all() {
-            for b in SpdPrecision::all() {
-                let (SpdPrecision::WidthLog2(wa), SpdPrecision::WidthLog2(wb)) = (a, b) else {
-                    continue;
-                };
-                let nests = probes.iter().all(|&r| {
-                    let (loa, hia) = bucket(r, wa);
-                    let (lob, hib) = bucket(r, wb);
-                    loa <= lob && hib <= hia
-                });
-                assert_eq!(a.coarser_or_equal(b), nests, "spd {:?} vs {:?}", a, b);
-            }
-        }
-    }
-
-    /// `SpdPrecision::Exact` must leave any state bit-identical (it is the
-    /// default; existing campaigns and gates depend on this being a no-op).
-    /// The position rung: `y2r0sx` is level 0 with 2 px y-buckets, coarser
-    /// than level 0 and finer than nothing narrower; a bucket needs rem
-    /// Bits(0) (the fork grid is the integers); widths above 2 are refused.
-    #[test]
-    fn position_levels_parse_and_order() {
-        let y2 = Level::parse("y2r0sx").unwrap();
-        assert_eq!(y2.pos, PosPrecision { x: 1, y: 2 });
-        assert_eq!(y2.rem, RemPrecision::Bits(0));
-        assert_eq!(y2.to_string(), "Bits(0)/P1x2");
-        let xy = Level::parse("x2y2r0sx").unwrap();
-        assert_eq!(xy.pos, PosPrecision { x: 2, y: 2 });
-        assert!(xy.coarser_or_equal(y2) && !y2.coarser_or_equal(xy));
-        assert!(y2.coarser_or_equal(Level::for_rem(RemPrecision::Bits(0))));
-        assert!(!Level::for_rem(RemPrecision::Bits(0)).coarser_or_equal(y2));
-        assert!(Level::parse("y2r1sx").unwrap().grid_consistent() == false);
-        // A speed bucket is at least one grid cell: thresholds-only at level
-        // 0, and speed refined as its own rung before rem.
-        assert!(Level::parse("r0s20").unwrap().grid_consistent());
-        assert!(!Level::parse("r1s14").unwrap().grid_consistent(), "a bucket finer than the rem grid");
-        assert_eq!(Level::parse_ladder("r0s20,r0s16,r0sx,r1sx,rxsx").unwrap().len(), 5);
-        assert!(Level::parse("y3r0sx").is_err());
-        assert_eq!(Level::parse("r0sx").unwrap().pos, PosPrecision::EXACT);
-        let ladder = Level::parse_ladder("x2y2r0sx,y2r0sx,r0sx,r1sx,rxsx").unwrap();
-        assert_eq!(ladder.len(), 5);
-        assert!(Level::parse_ladder("y2r0sx,x2r0sx,rxsx").is_err(), "x2 is not finer than y2");
-        // The reference widening and its input split round-trip a point.
-        let l = Level::parse("x2y2r0sx").unwrap();
-        assert_eq!(l.pos.x, 2);
     }
 
     #[test]
-    fn spd_exact_is_a_no_op_and_split_passthrough() {
-        // Cheap structural check without building a game state: the
-        // widen function returns the input untouched for Exact...
-        let state = State::new();
-        let out = make_state_abstract_spd(state.clone(), SpdPrecision::Exact);
-        assert_eq!(out.vector_size, state.vector_size);
-        // ...and the ladder rule: the same bucket width as rem's rung,
-        // exact with exact rem.
-        assert_eq!(spd_precision_for(RemPrecision::Exact), SpdPrecision::Exact);
-        match spd_ladder_preset() {
-            SpdLadder::Bucket => {
-                assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::WidthLog2(16));
-                assert_eq!(spd_precision_for(RemPrecision::Bits(10)), SpdPrecision::WidthLog2(6));
-                assert_eq!(spd_precision_for(RemPrecision::Bits(11)), SpdPrecision::Exact, "finer would overflow");
-            }
-            SpdLadder::Level0Only => {
-                assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::WidthLog2(16));
-                assert_eq!(spd_precision_for(RemPrecision::Bits(1)), SpdPrecision::Exact);
-            }
-            SpdLadder::Exact => assert_eq!(spd_precision_for(RemPrecision::Bits(0)), SpdPrecision::Exact),
-        }
-        // The ladder spec.
-        let l = Level::parse_ladder("r0s16,r1s15,r2sx,rxsx").unwrap();
+    fn levels_parse_and_order() {
+        let l = Level::parse_ladder("r0sx,r1sx,r2sx,rxsx").unwrap();
         assert_eq!(l.len(), 4);
-        assert_eq!(l[0], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(0), spd: SpdPrecision::WidthLog2(16), held: HeldPrecision::Exact, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact, platforms: PlatformsPrecision::Exact });
-        assert_eq!(l[2], Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(2), spd: SpdPrecision::Exact, held: HeldPrecision::Exact, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact, platforms: PlatformsPrecision::Exact });
+        assert_eq!(l[2], Level::for_rem(RemPrecision::Bits(2)));
+        assert_eq!(Level::parse("r0sx").unwrap(), Level::for_rem(RemPrecision::Bits(0)));
+        // Speed buckets and position buckets are gone.
+        assert!(Level::parse("r0s16").is_err());
+        assert!(Level::parse("y2r0sx").is_err());
         // Held buttons unknown: `h`, at rem rungs only, coarser than exact.
         let h = Level::parse("r0sxh").unwrap();
-        assert_eq!(h, Level { pos: PosPrecision::EXACT, rem: RemPrecision::Bits(0), spd: SpdPrecision::Exact, held: HeldPrecision::Unknown, fruit: FruitPrecision::Exact, floors: FloorsPrecision::Exact, platforms: PlatformsPrecision::Exact });
-        // The fly fruit unknown: `f` after `h`, at rem rungs, exact position.
-        let hf = Level::parse("r0sxhf").unwrap();
-        assert!(hf.fruit.is_unknown() && hf.held.is_unknown() && hf.grid_consistent());
-        assert_eq!(format!("{hf}"), "Bits(0)/H/F");
-        assert!(Level::parse("r1sxhf").unwrap().grid_consistent());
-        assert!(!Level::parse("y2r0sxhf").unwrap().grid_consistent());
-        assert!(Level::parse_ladder("r0sxhf,r0sxh,r1sxh,rxsx").is_ok());
-        assert!(Level::parse_ladder("r0sxh,r0sxhf,rxsx").is_err());
-        // The fall floors unknown: `b` after `f`, at rem rungs, exact position.
-        let hfb = Level::parse("r0sxhfb").unwrap();
-        assert!(hfb.floors.is_unknown() && hfb.fruit.is_unknown() && hfb.grid_consistent());
-        assert_eq!(format!("{hfb}"), "Bits(0)/H/F/B");
-        assert!(Level::parse("r1sxhb").unwrap().grid_consistent());
-        assert!(Level::parse_ladder("r0sxhfb,r0sxhf,r0sxh,rxsx").is_ok());
-        // Unknown through the rem ramp, made exact near its top.
-        assert!(Level::parse_ladder("r0sxhfb,r4sxhfb,r15sxhfb,r15sxhb,r15sxh,rxsx").is_ok());
-        assert!(Level::parse_ladder("r0sxhfb,r4sxh,r8sxhfb,rxsx").is_err());
-        // Only the floors' timers: between unknown and exact.
-        let ht = Level::parse("r0sxht").unwrap();
-        assert!(ht.floors.is_timers() && ht.grid_consistent());
-        assert_eq!(format!("{ht}"), "Bits(0)/H/T");
-        assert!(Level::parse_ladder("r0sxhb,r0sxht,r0sxh,rxsx").is_ok());
-        assert!(Level::parse_ladder("r0sxh,r0sxht,rxsx").is_err());
-        assert!(Level::parse_ladder("r0sxht,r0sxhb,rxsx").is_err());
-        // Widened except where the player overlaps: between unknown and timers.
-        let hn = Level::parse("r0sxhn").unwrap();
-        assert!(hn.floors.is_near() && hn.floors.widens_timers() && hn.grid_consistent());
-        assert_eq!(format!("{hn}"), "Bits(0)/H/N");
-        assert!(Level::parse_ladder("r0sxhb,r0sxhn,r0sxht,r0sxh,rxsx").is_ok());
-        assert!(Level::parse_ladder("r0sxhn,r0sxh,r1sxh,rxsx").is_ok());
-        assert!(Level::parse_ladder("r0sxht,r0sxhn,rxsx").is_err());
-        assert!(Level::parse_ladder("r0sxhn,r0sxhb,rxsx").is_err());
-        assert!(Level::parse_ladder("r0sxhf,r0sxhfb,rxsx").is_err());
-        assert_eq!(Level::parse("r1s20xh").unwrap().spd, SpdPrecision::WidthLog2X(20));
+        assert_eq!(h, Level { held: HeldPrecision::Unknown, ..Level::for_rem(RemPrecision::Bits(0)) });
+        assert_eq!(format!("{h}"), "Bits(0)/H");
         assert!(!Level::parse("rxsxh").unwrap().grid_consistent());
         assert!(Level::parse_ladder("r0sxh,r1sxh,rxsx").is_ok());
         assert!(Level::parse_ladder("r0sx,r1sxh,rxsx").is_err());
-        assert_eq!(format!("{h}"), "Bits(0)/H");
-        assert!(Level::parse_ladder("r0sx,r0s16,rxsx").is_err(), "spd may not get coarser");
-        assert!(Level::parse_ladder("r0s16,r1s15").is_err(), "must end exact");
-        assert!(Level::parse_ladder("r0s16,r1s16,rxsx").is_ok(), "a spd bucket of several rem grid cells");
-        // x-only buckets: `s<w>x`, never coarser than both axes bucketed.
-        let xo = Level::parse("r0s20x").unwrap();
-        assert_eq!(xo.spd, SpdPrecision::WidthLog2X(20));
-        assert_eq!(xo.to_string(), "Bits(0)/W20x");
-        assert!(xo.spd.coarser_or_equal(SpdPrecision::WidthLog2X(16)));
-        assert!(SpdPrecision::WidthLog2(20).coarser_or_equal(xo.spd));
-        assert!(!xo.spd.coarser_or_equal(SpdPrecision::WidthLog2(20)), "an exact y is finer than a bucketed one");
-        assert_eq!((xo.spd.width_log2(), xo.spd.buckets_y()), (Some(20), false));
-        assert!(Level::parse_ladder("r0s20x,r0sx,r1sx,rxsx").is_ok());
-        assert!(Level::parse_ladder("r0s20x,r0s20,rxsx").is_err(), "both axes bucketed is coarser, not finer");
-        crate::interpreter::abstraction::set_spd_precision(SpdPrecision::WidthLog2X(20));
-        assert_eq!(spd_precision(), SpdPrecision::WidthLog2X(20), "the process-global encoding round-trips");
-        assert!(Level::parse_ladder("r0s16,r1s14,rxsx").is_err(), "spd bucket finer than the rem grid");
-        assert!(Level::parse_ladder("r0s16,r0s15,rxsx").is_err(), "speed cannot refine on its own");
-        assert!(Level::parse_ladder("r0s16,r15s1,rxsx").is_err(), "W1 overflows the bucket node");
-        set_level(Level::EXACT);
-        assert_eq!(split_spd_straddles(State::new()).len(), 1);
+        // The fly fruit unknown: `f` after `h`.
+        let hf = Level::parse("r0sxhf").unwrap();
+        assert!(hf.fruit.is_unknown() && hf.held.is_unknown() && hf.grid_consistent());
+        assert_eq!(format!("{hf}"), "Bits(0)/H/F");
+        assert!(Level::parse_ladder("r0sxhf,r0sxh,r1sxh,rxsx").is_ok());
+        assert!(Level::parse_ladder("r0sxh,r0sxhf,rxsx").is_err());
+        // The floors: near covers exact.
+        let hn = Level::parse("r0sxhn").unwrap();
+        assert!(hn.floors.is_near() && hn.grid_consistent());
+        assert_eq!(format!("{hn}"), "Bits(0)/H/N");
+        assert!(Level::parse_ladder("r0sxhn,r1sxhn,r1sxh,rxsx").is_ok());
+        assert!(Level::parse_ladder("r0sxh,r0sxhn,rxsx").is_err());
+        assert!(Level::parse("r0sxhb").is_err(), "floors unknown `b` is gone");
+        assert!(Level::parse("r0sxht").is_err(), "timers only `t` is gone");
+        // The platforms: `p`, last.
+        let p = Level::parse("r0sxhnp").unwrap();
+        assert!(p.platforms.is_unknown() && p.floors.is_near());
+        assert_eq!(format!("{p}"), "Bits(0)/H/N/M");
+        assert!(Level::parse("r0sxph").is_err(), "flags in order");
+        assert!(Level::parse_ladder("r0sx,r1sx").is_err(), "must end exact");
+        // The process-global level round-trips.
+        set_level(hn);
+        assert_eq!(current_level(), hn);
+        set_rem_precision(RemPrecision::Exact);
+        assert_eq!(current_level(), Level { rem: RemPrecision::Exact, ..hn });
     }
 }
 
@@ -1855,4 +406,3 @@ pub fn synthetic_win_xy() -> Option<(i16, i16)> {
         Some(target)
     })
 }
-

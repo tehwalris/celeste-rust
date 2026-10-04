@@ -240,12 +240,9 @@ pub const BALLOON_PERIOD_RAW: i32 = 0xffff;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FloorsWidening {
     Exact,
-    /// Every floor unknown, and the spring's phase.
-    Unknown,
-    /// Only the countdowns - each fall floor's `delay`, the balloon's respawn
-    /// `timer` - the unknown number (`AV::UNum`).
-    Timers,
-    /// The countdowns as `Timers`, the spring's phase as `Unknown`, and every
+    /// The countdowns - each fall floor's `delay`, the balloon's respawn
+    /// `timer` - the unknown number (`AV::UNum`), the objects' phases their
+    /// ranges, and every
     /// floor's `state` and `collideable` widened (`FLOOR_STATE_RANGE`,
     /// unknown) except in the lanes where the player overlaps it
     /// (`floor_player_window`).
@@ -340,39 +337,6 @@ pub struct Rt2 {
 }
 
 pub const NONE: u32 = u32::MAX;
-
-/// Push one value onto a column of `width` lanes, materializing a uniform
-/// column only when the value differs from it, and keeping the raw
-/// `N`/`I` forms while the kinds allow.
-/// Overwrite lane `lane` of a column at block width `width` with `v`,
-/// promoting a uniform column that disagrees to a per-lane one.
-pub fn col_set(col: &mut Col, width: usize, lane: usize, v: AV) {
-    match col {
-        Col::U(u) if *u == v => {}
-        Col::U(u) => {
-            let mut vs = vec![*u; width];
-            vs[lane] = v;
-            *col = Col::V(vs);
-        }
-        Col::V(vs) => vs[lane] = v,
-        Col::N(vs) => match v {
-            AV::Num(n) => vs[lane] = n,
-            other => {
-                let mut all: Vec<AV> = vs.iter().map(|n| AV::Num(*n)).collect();
-                all[lane] = other;
-                *col = Col::V(all);
-            }
-        },
-        Col::I(vs) => match v {
-            AV::Ival(a, b) => vs[lane] = (a, b),
-            other => {
-                let mut all: Vec<AV> = vs.iter().map(|(a, b)| AV::Ival(*a, *b)).collect();
-                all[lane] = other;
-                *col = Col::V(all);
-            }
-        },
-    }
-}
 
 pub fn col_push(col: &mut Col, width: usize, v: AV) {
     match col {
@@ -615,36 +579,6 @@ impl Rt2 {
             [x, y] => Some((x as usize, y as usize)),
             _ => None,
         }
-    }
-
-    /// Per lane, the player's speed hull `[x_lo, x_hi, y_lo, y_hi]` (raw),
-    /// `None` when the block has no player with a numeric or interval
-    /// speed on both axes.
-    pub fn speed_hulls(&self, ids: &BoundaryIds) -> Option<Vec<[i32; 4]>> {
-        let obj = *self.player_objects(ids).first()?;
-        let cells = self.xy_cells_of(obj, ids.f_spd, ids);
-        if cells.len() != 2 {
-            return None;
-        }
-        let range = |c: u32, lane: usize| -> Option<(i32, i32)> {
-            match self.cols[c as usize].at(lane) {
-                AV::Num(n) => Some((n.as_raw_u32() as i32, n.as_raw_u32() as i32)),
-                AV::Ival(a, b) => Some((a.as_raw_u32() as i32, b.as_raw_u32() as i32)),
-                _ => None,
-            }
-        };
-        (0..self.width)
-            .map(|l| {
-                let (xa, xb) = range(cells[0], l)?;
-                let (ya, yb) = range(cells[1], l)?;
-                Some([xa, xb, ya, yb])
-            })
-            .collect()
-    }
-
-    /// The players' `spd.x`/`spd.y` cells.
-    pub fn spd_cells(&self, ids: &BoundaryIds) -> Vec<u32> {
-        self.player_objects(ids).into_iter().flat_map(|obj| self.xy_cells_of(obj, ids.f_spd, ids)).collect()
     }
 
     /// Boundary abstraction + canonical row dedup + compaction. Returns
@@ -932,7 +866,7 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, 0, None, (1, 1), false, false, FloorsWidening::Exact, false);
+        self.widen_to(ids, 0, false, false, FloorsWidening::Exact, false);
     }
 
     /// The boundary widenings of the `Bits(rem_bits)` level on this block's
@@ -947,51 +881,8 @@ impl Rt2 {
     ///   3. dash_effect_time clamped at 0 from below.
     ///   3b. fruit: off := [0, 39] and y := its bob band, together.
     ///   4. timer globals pinned to 0.
-    /// `spd_width_log2`: the speed bucket (2^w raw units) to widen the
-    /// players' `spd.x`/`spd.y` to, `None` for exact speed - the level's
-    /// `abstraction::spd_precision_for`, which the caller passes because
-    /// the switch lives above this crate.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, spd_width_log2: Option<(u8, bool)>, pos: (u8, u8), held: bool, fruit: bool, floors: FloorsWidening, platforms: bool) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, held: bool, fruit: bool, floors: FloorsWidening, platforms: bool) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
-
-        // 0. position widening (the rung below level 0): the player's
-        // whole-pixel x/y to their floor-aligned bucket of `pos.0`/`pos.1`
-        // pixels (`abstraction::make_state_abstract_pos`).
-        for obj in self.player_objects(ids) {
-            for (f, w) in [(ids.f_x, pos.0), (ids.f_y, pos.1)] {
-                if w <= 1 {
-                    continue;
-                }
-                let Some(c) = self.obj_field_cell(obj, f) else { continue };
-                let width = w as i32;
-                let pbucket = |n: P8| -> (P8, P8) {
-                    let whole = n.whole_part_as_i16() as i32;
-                    let low = whole.div_euclid(width) * width;
-                    (P8::from_i16(low as i16), P8::from_i16((low + width - 1) as i16))
-                };
-                let widen = |v: AV| -> AV {
-                    match v {
-                        AV::Num(n) => {
-                            let (lo, hi) = pbucket(n);
-                            AV::Ival(lo, hi)
-                        }
-                        AV::Ival(a, b) => AV::Ival(pbucket(a).0, pbucket(b).1),
-                        other => panic!("Unexpected value type for player position: {:?}", other),
-                    }
-                };
-                self.cols[c as usize] = match &self.cols[c as usize] {
-                    Col::U(v) => Col::U(widen(*v)),
-                    Col::V(vs) => Col::V(vs.iter().map(|v| widen(*v)).collect()),
-                    Col::N(vs) => Col::V(vs.iter().map(|n| widen(AV::Num(*n))).collect()),
-                    Col::I(vs) => Col::V(vs.iter().map(|(a, b)| widen(AV::Ival(*a, *b))).collect()),
-                };
-                let col = std::mem::replace(&mut self.cols[c as usize], Col::U(AV::Nil));
-                self.cols[c as usize] = collapse_uniform(match col {
-                    Col::V(vs) => compress_num_v(vs),
-                    other => other,
-                });
-            }
-        }
 
         // 1. rem widening.
         let half = P8::from_parts(0, 0x8000);
@@ -1054,44 +945,6 @@ impl Rt2 {
                         other => other,
                     });
                 }
-            }
-        }
-
-        // 2. spd widening (the spd ladder, `abstraction::spd_precision_for`):
-        // floor-aligned buckets of 2^w raw units (`make_state_abstract_spd`).
-        if let Some((w, buckets_y)) = spd_width_log2 {
-            // The bucket is the edge table's (`celeste_core::spd_buckets`),
-            // per axis: the cells come as [x, y]. An x-only level
-            // (`buckets_y` false) leaves spd.y exact.
-            for (axis, c) in self.spd_cells(ids).into_iter().enumerate() {
-                if axis == 1 && !buckets_y {
-                    continue;
-                }
-                let sbucket = |n: P8| -> (P8, P8) {
-                    let (lo, hi) = celeste_core::spd_buckets::bucket(n.to_bits().cast_signed(), w, axis);
-                    (P8::from_raw(lo), P8::from_raw(hi))
-                };
-                let widen = |v: AV| -> AV {
-                    match v {
-                        AV::Num(n) => {
-                            let (lo, hi) = sbucket(n);
-                            AV::Ival(lo, hi)
-                        }
-                        AV::Ival(a, b) => AV::Ival(sbucket(a).0, sbucket(b).1),
-                        other => panic!("Unexpected value type for player spd: {:?}", other),
-                    }
-                };
-                self.cols[c as usize] = match &self.cols[c as usize] {
-                    Col::U(v) => Col::U(widen(*v)),
-                    Col::V(vs) => Col::V(vs.iter().map(|v| widen(*v)).collect()),
-                    Col::N(vs) => Col::V(vs.iter().map(|n| widen(AV::Num(*n))).collect()),
-                    Col::I(vs) => Col::V(vs.iter().map(|(a, b)| widen(AV::Ival(*a, *b))).collect()),
-                };
-                let col = std::mem::replace(&mut self.cols[c as usize], Col::U(AV::Nil));
-                self.cols[c as usize] = collapse_uniform(match col {
-                    Col::V(vs) => compress_num_v(vs),
-                    other => other,
-                });
             }
         }
 
@@ -1252,12 +1105,6 @@ impl Rt2 {
             }
         }
 
-        // 8. The fall floors at a floors-unknown level (plans/fall-floors.md),
-        // as that level's kernels write them (`widen::widen_fall_floors`):
-        // `state` and `delay` the unknown number, `collideable` unknown. A
-        // floor with no `delay` (a block built from the post-`_init` state,
-        // which the level keys exact, `frame::Block::from_state`) has nothing
-        // there to widen.
         // An object's `(x, y)`, the same in every lane: floors and springs never move.
         let at = |rt: &Self, obj: u32, what: &str| -> (P8, P8) {
             let get = |f: u32| {
@@ -1269,34 +1116,12 @@ impl Rt2 {
             };
             (get(ids.f_x), get(ids.f_y))
         };
-        if floors == FloorsWidening::Unknown {
-            for obj in self.objects_of_type(ids, ids.g_fall_floor) {
-                for (name, f) in [("state", ids.f_state), ("delay", ids.f_delay)] {
-                    let Some(c) = self.obj_field_cell(obj, f) else {
-                        assert!(f == ids.f_delay, "fall floor widening: the fall floor has no `{name}` field");
-                        continue;
-                    };
-                    check(self, c, name, &|v| matches!(v, AV::Num(_) | AV::Ival(..) | AV::UNum));
-                    self.cols[c as usize] = Col::U(AV::UNum);
-                }
-                let c = self.obj_field_cell(obj, ids.f_collideable).unwrap_or_else(|| panic!("fall floor widening: the fall floor has no `collideable` field"));
-                check(self, c, "collideable", &|v| matches!(v, AV::Bool(_) | AV::UBool));
-                self.cols[c as usize] = Col::U(AV::UBool);
-            }
-            // The balloon's respawn `timer`, under the same flag.
-            for obj in self.objects_of_type(ids, ids.g_balloon) {
-                let c = self.obj_field_cell(obj, ids.f_timer).unwrap_or_else(|| panic!("balloon widening: the balloon has no `timer` field"));
-                check(self, c, "timer", &|v| matches!(v, AV::Num(_) | AV::Ival(..) | AV::UNum));
-                self.cols[c as usize] = Col::U(AV::UNum);
-            }
-        }
-        // The objects' phases at both floors-unknown levels
-        // (`widen::phase_paths`): the springs' and the balloons'. Unknown: the
-        // unknown number. Near: their intervals, as `widen::widen_near_phases`
-        // writes them. A spring that never bounced has no `delay` (the
-        // post-`_init` block, keyed exact): nothing there to widen.
-        if matches!(floors, FloorsWidening::Unknown | FloorsWidening::Near) {
-            let near = floors == FloorsWidening::Near;
+        // 8. The objects' phases at a near level (`widen::phase_paths`): the
+        // springs' and the balloons', their intervals as
+        // `widen::widen_near_phases` writes them. A spring that never bounced
+        // has no `delay` (the post-`_init` block, keyed exact): nothing there
+        // to widen.
+        if floors == FloorsWidening::Near {
             let phases = self
                 .objects_of_type(ids, ids.g_spring)
                 .into_iter()
@@ -1319,10 +1144,10 @@ impl Rt2 {
                         assert!(f == ids.f_delay, "phase widening: no `{name}` field");
                         continue;
                     };
-                    // A near level's phases are their ranges, but the
-                    // spring's countdowns (`None`) the unknown number, as the
-                    // floors' (8a).
-                    if let (true, Some((lo, hi))) = (near, range) {
+                    // The phases are their ranges, but the spring's
+                    // countdowns (`None`) the unknown number, as the floors'
+                    // (8a).
+                    if let Some((lo, hi)) = range {
                         let (lo, hi) = (P8::from_raw(lo), P8::from_raw(hi));
                         check(self, c, name, &|v| match v {
                             AV::Num(n) => lo <= n && n <= hi,
@@ -1338,12 +1163,11 @@ impl Rt2 {
             }
         }
 
-        // 8a. Only the floors' timers (`abstraction::FloorsPrecision::Timers`),
-        // as that level's kernels write them (`widen::widen_floor_timers`):
-        // every fall floor's `delay` and the balloon's `timer` the unknown
-        // number, `state` and `collideable` exact. A floor with no `delay` (the
+        // 8a. The countdowns, as a near level's kernels write them
+        // (`widen::widen_floor_timers`): every fall floor's `delay` and the
+        // balloon's `timer` the unknown number. A floor with no `delay` (the
         // post-`_init` block, keyed exact) has nothing there to widen.
-        if matches!(floors, FloorsWidening::Timers | FloorsWidening::Near) {
+        if floors == FloorsWidening::Near {
             for (ty, f, name) in [(ids.g_fall_floor, ids.f_delay, "delay"), (ids.g_balloon, ids.f_timer, "timer")] {
                 for obj in self.objects_of_type(ids, ty) {
                     let Some(c) = self.obj_field_cell(obj, f) else { continue };

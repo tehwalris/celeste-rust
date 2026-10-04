@@ -609,7 +609,7 @@ fn rerun(engine: &dyn FrameStep, rt2: Rt2, id: u64, scratch: &str) -> Result<(Ve
     let block = Block::with_ids(rt2, vec![id], id_seq(id));
     let tmp = std::env::temp_dir().join(format!("{scratch}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
-    let door = celeste_rust::search::door::Door::for_current_level();
+    let door = celeste_rust::search::door::Door::new();
     let (next, won, _) = forward_frame(engine, vec![block], &door, None, None, id_layer(id) + 1, Some(&tmp))?;
     let _ = std::fs::remove_dir_all(&tmp);
     Ok((next, won))
@@ -847,7 +847,7 @@ fn main() -> Result<()> {
                 let n = b.lanes();
                 let mask: Vec<bool> = (0..n).map(|i| i < 64).collect();
                 let small = vec![b.keep(&mask).expect("a non-empty block")];
-                forward_frame(&engine, small, &Door::for_current_level(), None, mark_filter, frame + 1, None)?;
+                forward_frame(&engine, small, &Door::new(), None, mark_filter, frame + 1, None)?;
             }
             let edges_dir = dir.join("bench-edges");
             // With edges, the tree's own door: every re-emitted old state
@@ -868,7 +868,7 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|b| Block::with_ids(b.rt2().clone_block(), b.ids().to_vec(), b.seq()))
                     .collect();
-                let fresh = Door::for_current_level();
+                let fresh = Door::new();
                 let door: &Door = tree_door.as_ref().map_or(&fresh, |s| s.door());
                 let _ = std::fs::remove_dir_all(&edges_dir);
                 let t = std::time::Instant::now();

@@ -295,18 +295,16 @@ pub trait Domain {
     fn evaluated_at(&mut self, _n: &Self::Num, _at: &Self::Bool) {}
 
     /// The arity of the fork `__split_by_flr` takes on `v`: `move_ways`,
-    /// or where the trace knows `v`'s static range (a kernel specialized
-    /// on its speed key) the most grid cells one piece of it crosses -
-    /// a lane's interval lies within one piece, and `SplitOk` checks it.
+    /// or where the trace knows `v`'s static range (a region kernel, level
+    /// -1) the most grid cells one piece of it crosses - a lane's interval
+    /// lies within one piece, and `SplitOk` checks it.
     fn flr_ways(&mut self, _v: &Self::Num) -> u8 {
         self.move_ways()
     }
 
-    /// The arity of the `move` fork (`__split_by_flr`): 2 unless the
-    /// traced set buckets the player's speed, where an object updating
-    /// before the player (the spring: `hit.spd.x *= 0.2`) can hand
-    /// `move` a bucket no longer aligned to the grid, and `rem + spd +
-    /// 0.5` then spans THREE floors (room (2,0) f36, 2026-09-14).
+    /// The arity of the `move` fork (`__split_by_flr`): `rem + spd + 0.5`
+    /// with an exact speed and a rem within one grid cell spans at most two
+    /// floors.
     fn move_ways(&self) -> u8 {
         2
     }
@@ -475,10 +473,6 @@ pub struct Symbolic {
     /// How many FORK choices have been handed out this frame: the fork ids.
     /// The six buttons are among them (`unknown_bool`).
     pub forks: u8,
-    /// The arity of the `move` fork for the set being traced (see
-    /// `Domain::move_ways`); `trace_frame` sets it from the widen mode.
-    /// 0 (the default) reads as 2.
-    pub move_ways: u8,
     /// `flr_ways` takes a static range's FULL width, not capped at
     /// `move_ways`: level -1, whose speed is a range at every node rather
     /// than exact per lane (`level_minus_one`). Off everywhere else.
@@ -493,23 +487,14 @@ pub struct Symbolic {
     /// literal intervals folds to literals, and a merge on a condition no lane
     /// decides joins its literal arms (`join_num_independent`). Set by the walk.
     pub fruit_unknown: bool,
-    /// The fall floors unknown (`abstraction::FloorsPrecision`,
-    /// plans/fall-floors.md): `trace_frame` replaces every fall floor's
-    /// `state`, `delay` and `collideable` (`widen::fork_floor_inputs`), with the
-    /// same literal and atom machinery as the fruit (`unknowns`). Set by the walk.
-    pub floors_unknown: bool,
-    /// Only the fall floors' TIMERS widened (`abstraction::FloorsPrecision::
-    /// Timers`): every outcome stores each floor's `delay` and the balloon's
-    /// `timer` as the unknown number (`widen::widen_floor_timers`), which the
-    /// next frame reads as unknown (`widen::forget_countdown_inputs`). Set by
-    /// the walk.
-    pub floor_timers: bool,
     /// The fall floors widened but where the player overlaps one
-    /// (`abstraction::FloorsPrecision::Near`, with `floor_timers`):
-    /// `trace_frame` forks each floor's `collideable` input
-    /// (`widen::fork_near_floor_inputs`), every outcome stores `state` and
-    /// `collideable` per lane widened or exact (`widen::widen_near_floors`).
-    /// Set by the walk.
+    /// (`abstraction::FloorsPrecision::Near`): `trace_frame` forks each
+    /// floor's `collideable` input (`widen::fork_near_floor_inputs`), every
+    /// outcome stores `state` and `collideable` per lane widened or exact
+    /// (`widen::widen_near_floors`), and each floor's `delay` and the
+    /// balloon's `timer` as the unknown number (`widen::widen_floor_timers`),
+    /// which the next frame reads as unknown
+    /// (`widen::forget_countdown_inputs`). Set by the walk.
     pub floors_near: bool,
     /// The moving platforms unknown (`abstraction::PlatformsPrecision`,
     /// plans/platforms-unknown.md): `trace_frame` widens their inputs
@@ -844,11 +829,11 @@ impl Symbolic {
 
     /// A fresh undecided atom (`Op::UnknownBool`), distinct from every other
     /// this frame.
-    /// Is anything unknown in the set being traced (the fly fruit, the fall
-    /// floors)? The literal folding, the independent joins and the literal
+    /// Is anything unknown in the set being traced (the fly fruit, the
+    /// platforms)? The literal folding, the independent joins and the literal
     /// splits switch on with it.
     pub fn unknowns(&self) -> bool {
-        self.fruit_unknown || self.floors_unknown || self.platforms_unknown
+        self.fruit_unknown || self.platforms_unknown
     }
 
     /// `n` as `base + literal`: an `Add` with a literal operand (either side),
@@ -1034,17 +1019,6 @@ impl Symbolic {
     /// Called beside `forks = 0` and `Graph::reset_forks`.
     pub fn clear_fork_memo(&mut self) {
         self.fork_memo.clear();
-    }
-
-    /// A table fork (`Partition::Table`), the one partition only `Symbolic`
-    /// can take: the row's bucket and the coverage premise are further ops
-    /// naming the fork (`SplitKeyTab` / `SplitOkTab` in
-    /// `widen::spd_table_node`), so the caller needs its id.
-    ///
-    /// Not on `Domain`: a fork id is a graph notion, and the reference domain
-    /// forks by walking one fragment at a time through its cursor instead.
-    pub fn fork_table_at(&mut self, v: &NodeId, ranges: &[(i32, i32)], arity: u8) -> Fork {
-        self.fork(v, Partition::Table { ranges: ranges.to_vec(), arity }, "a speed bucket table")
     }
 
     /// THE fork: partition `v`'s set, mint a choice dimension for the pieces,
@@ -1581,10 +1555,6 @@ impl Domain for Symbolic {
             None => *at,
         };
         self.evaluated.insert(*n, at);
-    }
-
-    fn move_ways(&self) -> u8 {
-        self.move_ways.max(2)
     }
 
     fn join_num_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {

@@ -127,9 +127,6 @@ pub struct Frame {
     /// Traced with the fly fruit unknown (`Symbolic::fruit_unknown`): every
     /// outcome writes its `fly` unknown (`emit::bind`).
     pub fruit_unknown: bool,
-    /// Traced with the fall floors unknown (`Symbolic::floors_unknown`): every
-    /// outcome writes their `collideable` unknown (`emit::bind`).
-    pub floors_unknown: bool,
     /// What each fork minted as both values was minted for
     /// (`Symbolic::fork_origins`), for the kernel dump.
     pub fork_origins: Vec<(u8, String)>,
@@ -283,22 +280,12 @@ pub fn trace_frame<'a>(
     // settles the integer move AND the output bucket, and the boundary
     // snap below never has to fork again.
     it.d.graph.set_fork_bits(match widen {
-        Some(super::widen::WidenMode::RemRung(crate::interpreter::abstraction::RemPrecision::Bits(k), _)) => k,
+        Some(super::widen::WidenMode::RemRung(crate::interpreter::abstraction::RemPrecision::Bits(k))) => k,
         _ => 0,
     });
-    // The `move` fork's arity: three under a bucketed speed (see
-    // `Domain::move_ways`), two otherwise.
-    it.d.move_ways = match widen {
-        Some(super::widen::WidenMode::Level0(spd, _)) | Some(super::widen::WidenMode::RemRung(_, spd))
-            if spd.width_log2().is_some() =>
-        {
-            3
-        }
-        _ => 2,
-    };
     it.d.unknown_atoms = 0;
     // The arc capture (`search::arc_edges`): a level-0 trace in arc mode.
-    it.arc_capture = crate::search::arc_edges::enabled() && matches!(widen, Some(super::widen::WidenMode::Level0(..)));
+    it.arc_capture = crate::search::arc_edges::enabled() && matches!(widen, Some(super::widen::WidenMode::Level0));
     // What the previous trace left if it failed part-way (a success takes
     // both below).
     it.raised.clear();
@@ -348,16 +335,7 @@ pub fn trace_frame<'a>(
     };
     let in_rt2 = super::bind::structure_of(&st, cart.clone(), cache.clone())?;
     let in_cells = super::bind::bind_inputs(&in_rt2, &iface)?;
-    // A position bucket in the input runs as one exact position per fork
-    // configuration. After the input shape is taken (the block carries
-    // the bucket), before anything reads the position.
     let mut st = st;
-    if let Some(super::widen::WidenMode::Level0(_, pos)) = widen {
-        super::widen::fork_pos_inputs(&mut st, &mut it.d, pos)?;
-        if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
-            eprintln!("[build] trace_frame {widen:?}: {} forks after fork_pos_inputs, {} ival slots", it.d.forks, iface.ival.iter().filter(|b| **b).count());
-        }
-    }
     // Held buttons unknown: both trails run as a fork of both values, after
     // the input shape is taken, before anything reads them.
     if it.d.held_unknown {
@@ -367,10 +345,6 @@ pub fn trace_frame<'a>(
     // them (plans/fly-fruit.md).
     if it.d.fruit_unknown {
         super::widen::fork_fruit_inputs(&mut st, &mut it.d)?;
-    }
-    // The fall floors unknown: likewise (plans/fall-floors.md).
-    if it.d.floors_unknown {
-        super::widen::fork_floor_inputs(&mut st, &mut it.d)?;
     }
     // A near level's floors: each `collideable` derived from `state`. Not in
     // the middle of a split frame: there the row stores the `collideable` the
@@ -578,7 +552,7 @@ pub fn trace_frame<'a>(
         }
         r
     };
-    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, floors_unknown: it.d.floors_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, raise, in_cells, in_rt2 })
+    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, fork_tables, outs, raise, in_cells, in_rt2 })
 }
 
 /// `split_undecided_selects`' queue: the outcomes still to split, popped

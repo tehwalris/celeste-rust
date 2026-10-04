@@ -66,9 +66,6 @@ pub fn run_frame_all<'a>(
     it.d.cursor = Cursor::new();
     let mut outputs = Vec::new();
     let mut paths = 0usize;
-    // A position bucket in the input (the rung below level 0) is one exact
-    // position per fork leaf, exactly as the kernels' `IntFrag`.
-    let pos = level.pos;
     // Nor the fly fruit and the moving platforms unknown: their ranges and
     // worlds have no reference form yet.
     if level.fruit.is_unknown() {
@@ -88,7 +85,6 @@ pub fn run_frame_all<'a>(
         if level.floors == crate::interpreter::abstraction::FloorsPrecision::Near {
             concretize_near_floors(&mut st, &mut it.d)?;
         }
-        crate::trace::widen::fork_pos_inputs(&mut st, &mut it.d, pos)?;
         let mut out = run_one(it, body, st)?;
         // The absent-as-zero fields, as the tracer's `trace_frame` writes them.
         crate::trace::widen::materialize_absent_fields(&mut out, &mut it.d)?;

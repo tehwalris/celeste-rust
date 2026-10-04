@@ -20,70 +20,6 @@ pub(crate) mod asm_kernel;
 pub mod bridge;
 pub mod dispatch;
 
-/// The assert-noop guard body (`dispatch::widen_noop_check`): a
-/// widen-in-graph kernel's output state must be a FIXED POINT of the
-/// campaign's `split_precision_straddles` + `make_state_abstract`. Keys
-/// both the state as-is and its re-abstraction with the SAME
-/// `engine_row_keys` (so it is a pure "did the boundary move anything"
-/// test, no cross-keyer question), and panics on the first difference -
-/// naming itself, under the never-deopt doctrine.
-fn assert_widen_is_noop(state: &crate::interpreter::state::State) {
-    use std::collections::HashSet;
-    if state.vector_size == 0 {
-        return;
-    }
-    let keys = |s: &crate::interpreter::state::State| -> HashSet<(u64, u64)> {
-        engine_row_keys(s)
-            .expect("widen-noop: row_keys")
-            .into_iter()
-            .collect()
-    };
-    let before = keys(state);
-    let mut after: HashSet<(u64, u64)> = HashSet::new();
-    for st in crate::interpreter::abstraction::split_precision_straddles(state.clone()) {
-        let w = crate::interpreter::abstraction::make_state_abstract(st);
-        after.extend(keys(&w));
-    }
-    if before != after {
-        // Robust cell-by-cell diff: make_state_abstract does not change the
-        // heap LENGTH (widening rewrites values in place; erase rewrites
-        // nils in place), so compare each cell's Debug form directly and
-        // name every one the boundary moved.
-        let w = crate::interpreter::abstraction::make_state_abstract(state.clone());
-        let n = state.heap.len().min(w.heap.len());
-        let mut shown = 0;
-        for i in 0..n {
-            let id = crate::interpreter::heap::HeapId::from_raw(i);
-            let (a, b) = (state.heap.get_opt(id), w.heap.get_opt(id));
-            if format!("{:?}", a) != format!("{:?}", b) {
-                eprintln!("[widen-noop diff] cell {}: kernel={:?} boundary={:?}", i, a, b);
-                shown += 1;
-                if shown >= 12 {
-                    eprintln!("[widen-noop diff] ... (more)");
-                    break;
-                }
-            }
-        }
-        if state.heap.len() != w.heap.len() {
-            eprintln!(
-                "[widen-noop diff] heap LENGTH changed: kernel {} boundary {}",
-                state.heap.len(),
-                w.heap.len()
-            );
-        }
-    }
-    assert_eq!(
-        before, after,
-        "KERNEL WIDEN-NOOP VIOLATION: re-abstracting a widen-in-graph kernel output \
-         changed its row keys ({} before, {} after; {} boundary-only, {} kernel-only). \
-         The graph UNDER-widened a field the campaign boundary still moves.",
-        before.len(),
-        after.len(),
-        after.difference(&before).count(),
-        before.difference(&after).count(),
-    );
-}
-
 pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
     let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));
     let f = |name: &str| gen::field_id(name).unwrap_or_else(|| panic!("no field {}", name));
@@ -160,24 +96,6 @@ pub fn room_context() -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
     Ok(CTX.get().expect("just set").clone())
 }
 
-/// The canonical (kernel/engine) row keys of a state, per lane in lane
-/// order - the ONE row key of the search.
-///
-/// Backed by a process-wide `FrameEngine` for the start room, so the
-/// ids/cart/cache match every forward's and the keys are byte-identical to
-/// what a forward stored: there is exactly one key space.
-static KEY_ENGINE: std::sync::OnceLock<FrameEngine> = std::sync::OnceLock::new();
-
-pub fn engine_row_keys(
-    state: &crate::interpreter::state::State,
-) -> Result<Vec<(u64, u64)>> {
-    if KEY_ENGINE.get().is_none() {
-        // Racing initializers build identical engines; keep whichever wins.
-        let _ = KEY_ENGINE.set(FrameEngine::new_for_start_room()?);
-    }
-    Ok(KEY_ENGINE.get().expect("just set").row_keys_lane_order(state))
-}
-
 pub struct FrameEngine {
     ids: runtime2::BoundaryIds,
     cart: Arc<CartData>,
@@ -241,28 +159,6 @@ impl FrameEngine {
                 dispatch::miss_report(),
             );
         }
-        if dispatch::widen_noop_check() {
-            for slot in &sink.slots {
-                assert_widen_is_noop(&bridge::export_block(&slot.to_rt2()));
-            }
-        }
-    }
-
-    /// The kernel/engine row keys of one state, per lane in LANE ORDER (no
-    /// dedup, no widening) - the canonical row key of the whole search.
-    /// Free-function `engine_row_keys` is the usual entry point; this is the
-    /// method when a `FrameEngine` is already in hand.
-    ///
-    /// Reproduces exactly what a compiled forward's boundary stored for the
-    /// same already-abstracted content, so the backward sweep and the band
-    /// filter can recompute a saved state's keys and find them in the row
-    /// table. `import_block` + `Rt2::row_keys_canonical`.
-    pub fn row_keys_lane_order(
-        &self,
-        state: &crate::interpreter::state::State,
-    ) -> Vec<(u64, u64)> {
-        let mut b = bridge::import_block(state, self.cart.clone(), self.cache.clone());
-        b.row_keys_canonical()
     }
 }
 

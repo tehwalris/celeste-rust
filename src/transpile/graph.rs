@@ -207,7 +207,7 @@ pub enum Op {
     /// interval reaches it - together they are exactly
     /// `zi_fork_flr(x, c)`. How many fragments a fork HAS is the fork's
     /// arity (`Graph::fork_ways`): 2 for every fork but the player's
-    /// `move` under a bucketed speed, which is 3 (`Symbolic::move_ways`).
+    /// `move` under a range wider than one grid cell (`Domain::flr_ways`).
     ///
     /// Ordinary unary ops, which is the whole point: they intern and
     /// fold like anything else, so the configurations SHARE every node

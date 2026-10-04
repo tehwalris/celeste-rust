@@ -44,26 +44,9 @@ impl<'a> StateHelper<'a> {
         self.state.global_env.get(name).copied()
     }
 
-    /// Get the objects array HeapId (dereferencing the global pointer)
-    pub fn get_objects_array_id(&self) -> Option<HeapId> {
-        let global_id = self.find_global("objects")?;
-        match self.load(global_id) {
-            HeapValue::Value(Value::Pointer(arr_id)) => Some(*arr_id),
-            _ => None,
-        }
-    }
-
     /// Load a heap value
     pub fn load(&self, id: HeapId) -> &HeapValue {
         self.state.heap.get(id)
-    }
-
-    /// Get a pointer from a heap value (unwrap Value::Pointer)
-    pub fn unwrap_pointer(&self, value: &HeapValue) -> Option<HeapId> {
-        match value {
-            HeapValue::Value(Value::Pointer(id)) => Some(*id),
-            _ => None,
-        }
     }
 
     /// Find objects in an array table that have a specific type.

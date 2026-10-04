@@ -86,18 +86,16 @@ impl Block {
     pub fn from_state(state: &State) -> Result<Self> {
         let (cart, cache) = crate::compiled::room_context()?;
         let mut rt2 = crate::compiled::bridge::import_block(state, cart, cache);
-        // The key is the level's WIDENED row (the speed hull: a row stores
-        // its tight speed and is keyed on the bucket), the same rule the
-        // kernels' key layer applies (`asm_kernel`: the key node override).
-        // A fruit-unknown level keys the state's fly fruit as it is: storing
+        // The key is the level's WIDENED row, the rule the kernels' boundary
+        // applies. A fruit-unknown level keys the state's fly fruit as it is: storing
         // the decided fruit is exact, the kernel replaces it at the frame's
         // start (`widen::fork_fruit_inputs`), and the post-`_init` state is a
         // shape no frame returns to, so no key has to agree with it
         // (plans/fly-fruit.md).
         let level = crate::interpreter::abstraction::Level {
             fruit: crate::interpreter::abstraction::FruitPrecision::Exact,
-            // Likewise the fall floors (`widen::fork_floor_inputs`) and the
-            // moving platforms (`widen::platform_inputs`).
+            // Likewise the fall floors (`widen::fork_near_floor_inputs`) and
+            // the moving platforms (`widen::platform_inputs`).
             floors: crate::interpreter::abstraction::FloorsPrecision::Exact,
             platforms: crate::interpreter::abstraction::PlatformsPrecision::Exact,
             ..crate::interpreter::abstraction::current_level()
@@ -418,19 +416,11 @@ pub struct Slot {
     /// The queue's key while live (`ForwardSink::queue`).
     pub outcome: u64,
     pub cell: u32,
-    /// The rows' speed key (the bucket dispatch): a queue holds rows of
-    /// one key, so a piece is runs of one key.
-    pub dkey: Option<crate::trace::kernel::SpeedKey>,
     pub live: bool,
     pub touched: bool,
     skeleton: Rt2,
     /// `(cell, column)` per varying cell, in the kernel's order.
     pub cols: Vec<(usize, TCol)>,
-    /// `speed_typed_cols`, computed once: the skeleton and the column layout
-    /// never change after `new`, and the flush asked for it per queue flush,
-    /// walking the object list each time (4% of a room (3,0) frame,
-    /// 2026-09-18).
-    speed_cols: Option<(usize, usize)>,
     pub keys: Vec<(u64, u64)>,
     pub cells: Vec<u32>,
     /// The row's predecessors in the slice that emitted it: the slice's
@@ -455,21 +445,6 @@ pub struct Slot {
     pub gen: u16,
 }
 
-/// The typed-column indices of the player's `spd.x` / `spd.y` in a slot over
-/// `skeleton` with columns `cols`, when they are interval columns
-/// (`Slot::speed_typed_cols`).
-fn speed_cols_of(skeleton: &Rt2, cols: &[(usize, TCol)]) -> Option<(usize, usize)> {
-    let ids = crate::compiled::ids();
-    let obj = crate::search::pos_graph::player_object(skeleton)?;
-    let pc = skeleton.obj_field_cell(obj, ids.f_spd)?;
-    let Col::U(AV::Ptr(sub)) = skeleton.cols[pc as usize] else { return None };
-    let cx = skeleton.obj_field_cell(sub, ids.f_x)?;
-    let cy = skeleton.obj_field_cell(sub, ids.f_y)?;
-    let tx = cols.iter().position(|(c, t)| *c == cx as usize && matches!(t, TCol::Ival(_)))?;
-    let ty = cols.iter().position(|(c, t)| *c == cy as usize && matches!(t, TCol::Ival(_)))?;
-    Some((tx, ty))
-}
-
 impl Slot {
     /// A slot over `skeleton`: a width-0 block whose varying cells hold
     /// EMPTY typed columns (`Col::N`/`Col::I` for numbers / intervals,
@@ -486,17 +461,14 @@ impl Slot {
                 Col::U(_) => None,
             })
             .collect::<Vec<_>>();
-        let speed_cols = speed_cols_of(&skeleton, &cols);
         Slot {
             shape: skeleton.shape_hash,
             outcome: 0,
             cell: 0,
-            dkey: None,
             live: false,
             touched: false,
             skeleton,
             cols,
-            speed_cols,
             keys: Vec::new(),
             cells: Vec::new(),
             pred_base: Vec::new(),
@@ -524,19 +496,6 @@ impl Slot {
             .sum::<usize>()
             + self.keys.capacity() * 16
             + self.cells.capacity() * 4
-    }
-
-    /// The typed-column indices (into `cols`) of the player's `spd.x` and
-    /// `spd.y` when the level buckets the speed - they are interval
-    /// columns then. `None` at exact speed (numbers) or without a player.
-    pub fn speed_typed_cols(&self) -> Option<(usize, usize)> {
-        self.speed_cols
-    }
-
-    /// Row `r`'s speed hull from the typed columns `speed_typed_cols` found.
-    pub fn speed_hull(&self, tx: usize, ty: usize, r: usize) -> crate::search::door::Hull {
-        let (TCol::Ival(x), TCol::Ival(y)) = (&self.cols[tx].1, &self.cols[ty].1) else { unreachable!("speed columns are intervals") };
-        [x[r].0 as i32, x[r].1 as i32, y[r].0 as i32, y[r].1 as i32]
     }
 
     /// Drop the rows, keeping the skeleton and the columns' capacity.
@@ -871,13 +830,13 @@ pub struct ForwardSink<'a> {
     pub slots: Vec<Slot>,
     /// (outcome id, cell) -> live queue. The outcome id is the emitter's:
     /// a kernel's template address, the reference engine's shape hash.
-    index: rustc_hash::FxHashMap<(u64, u32, Option<crate::trace::kernel::SpeedKey>), u32>,
+    index: rustc_hash::FxHashMap<(u64, u32), u32>,
     /// Flushed, empty queues per outcome id, keeping their columns.
     spare: rustc_hash::FxHashMap<u64, Vec<u32>>,
     /// The second-chance hand over `slots`.
     clock: usize,
     /// The run cache: rows arrive in runs of one (outcome, cell).
-    last: ((u64, u32, Option<crate::trace::kernel::SpeedKey>), u32),
+    last: ((u64, u32), u32),
     door: Option<&'a crate::search::door::Door>,
     filter: Option<&'a MarkFilter<'a>>,
     /// The ids of the block being run, per lane (set by the worker before
@@ -925,10 +884,6 @@ pub struct ForwardSink<'a> {
     pub flushed_rows: u64,
     sort_buf: Vec<((u64, u64), u32)>,
     keys_buf: Vec<(u64, u64)>,
-    /// Per distinct key of a flush, its rows' speed hull; and per new key,
-    /// the hull the emitted row carries (`door::Admit::admit`).
-    hull_buf: Vec<crate::search::door::Hull>,
-    new_hulls: Vec<crate::search::door::Hull>,
     uniq_buf: Vec<u32>,
     row_uniq: Vec<u32>,
     new_buf: Vec<u32>,
@@ -953,7 +908,7 @@ pub struct ForwardSink<'a> {
     hit_base: usize,
 }
 
-const NO_QUEUE: ((u64, u32, Option<crate::trace::kernel::SpeedKey>), u32) = ((u64::MAX, u32::MAX, None), u32::MAX);
+const NO_QUEUE: ((u64, u32), u32) = ((u64::MAX, u32::MAX), u32::MAX);
 
 impl<'a> ForwardSink<'a> {
     fn empty(edges_on: bool) -> Self {
@@ -988,8 +943,6 @@ impl<'a> ForwardSink<'a> {
             flushed_rows: 0,
             sort_buf: Vec::with_capacity(QUEUE_ROWS),
             keys_buf: Vec::with_capacity(QUEUE_ROWS),
-            hull_buf: Vec::with_capacity(QUEUE_ROWS),
-            new_hulls: Vec::with_capacity(QUEUE_ROWS),
             uniq_buf: Vec::with_capacity(QUEUE_ROWS),
             row_uniq: Vec::with_capacity(QUEUE_ROWS),
             new_buf: Vec::with_capacity(QUEUE_ROWS),
@@ -1156,25 +1109,6 @@ impl<'a> ForwardSink<'a> {
         true
     }
 
-    /// THE SPEED HULL at the call's dedup cache: a lane re-emitting a
-    /// queued row's key with another speed fragment widens that row's
-    /// hull in place (columns `tx`/`ty`, `Slot::speed_typed_cols`). False
-    /// if the queue was flushed since (the ref is stale).
-    pub fn hull_union_at(&mut self, row_ref: u64, tx: usize, ty: usize, h: crate::search::door::Hull) -> bool {
-        let (gen, q, r) = ((row_ref >> 32) as u16, ((row_ref >> 8) & 0xff_ffff) as usize, (row_ref & 0xff) as usize);
-        let s = &mut self.slots[q];
-        if !s.live || s.gen != gen || r >= s.pred_mask.len() {
-            return false;
-        }
-        if let TCol::Ival(x) = &mut s.cols[tx].1 {
-            x[r] = ((x[r].0 as i32).min(h[0]) as u32, (x[r].1 as i32).max(h[1]) as u32);
-        }
-        if let TCol::Ival(y) = &mut s.cols[ty].1 {
-            y[r] = ((y[r].0 as i32).min(h[2]) as u32, (y[r].1 as i32).max(h[3]) as u32);
-        }
-        true
-    }
-
     /// The backward's sink for the candidate rows `lanes` of a block.
     pub fn backward(targets: &'a TargetSet, lanes: Range<usize>) -> Self {
         let mut s = Self::empty(false);
@@ -1197,11 +1131,11 @@ impl<'a> ForwardSink<'a> {
     /// The live queue for `(outcome, cell)`, created over the skeleton
     /// `init` returns (or a spare of the outcome) on first use, evicting
     /// the least recently touched queue when the pool is full.
-    pub fn queue(&mut self, outcome: u64, cell: u32, dkey: Option<crate::trace::kernel::SpeedKey>, init: impl FnOnce() -> Rt2) -> usize {
-        if self.last.0 == (outcome, cell, dkey) {
+    pub fn queue(&mut self, outcome: u64, cell: u32, init: impl FnOnce() -> Rt2) -> usize {
+        if self.last.0 == (outcome, cell) {
             return self.last.1 as usize;
         }
-        let q = match self.index.get(&(outcome, cell, dkey)) {
+        let q = match self.index.get(&(outcome, cell)) {
             Some(&q) => q,
             None => {
                 if self.index.len() >= POOL_QUEUES {
@@ -1217,14 +1151,13 @@ impl<'a> ForwardSink<'a> {
                 let s = &mut self.slots[q as usize];
                 s.outcome = outcome;
                 s.cell = cell;
-                s.dkey = dkey;
                 s.live = true;
                 s.touched = false;
-                self.index.insert((outcome, cell, dkey), q);
+                self.index.insert((outcome, cell), q);
                 q
             }
         };
-        self.last = ((outcome, cell, dkey), q);
+        self.last = ((outcome, cell), q);
         q as usize
     }
 
@@ -1280,13 +1213,6 @@ impl<'a> ForwardSink<'a> {
                 }
                 None => None,
             };
-            // EXPERIMENT (not a default, not sound as a proof): the time band.
-            // A queue is one player cell; drop it when even the fastest recorded
-            // climb cannot reach the exit by the horizon.
-            let allow = match band() {
-                Some((h, px)) if cell_too_late(slot.cell, self.frame, h, px) => Some(vec![false; n]),
-                _ => allow,
-            };
             // The level -1 filter: the queue's cell provably cannot exit by H.
             let allow = match level_minus_one() {
                 Some((h, table)) if table.too_late(slot.shape, slot.cell, self.frame, h) => Some(vec![false; n]),
@@ -1320,19 +1246,6 @@ impl<'a> ForwardSink<'a> {
             }
             self.new_buf.clear();
             self.ids_buf.clear();
-            self.new_hulls.clear();
-            // THE SPEED HULL: per distinct key, the union of its rows'
-            // speed intervals (`door::Hull`), when the level buckets the
-            // speed (the slot's speed columns are intervals).
-            let spd_cols = slot.speed_typed_cols();
-            self.hull_buf.clear();
-            if let Some((cx, cy)) = spd_cols {
-                self.hull_buf.resize(self.keys_buf.len(), crate::search::door::NO_HULL);
-                for (e, &u) in self.sort_buf.iter().zip(&self.uniq_buf) {
-                    let h = slot.speed_hull(cx, cy, e.1 as usize);
-                    self.hull_buf[u as usize] = crate::search::door::hull_union(&self.hull_buf[u as usize], &h);
-                }
-            }
             // The piece the new rows land in, and the id the first of them
             // gets: the door hands the k-th new key `first_new + k`, and the
             // rows are appended in that same order.
@@ -1343,16 +1256,7 @@ impl<'a> ForwardSink<'a> {
                 .entry(slot.shape)
                 .or_insert_with(|| (slot.empty_piece(), worker * 256 + n_pieces, Vec::new()));
             let first_new = pack_id(frame, *seq, piece.width as u32);
-            door.admit(
-                slot.shape,
-                slot.cell,
-                &self.keys_buf,
-                first_new,
-                &mut self.ids_buf,
-                &mut self.new_buf,
-                spd_cols.map(|_| &self.hull_buf[..]),
-                &mut self.new_hulls,
-            );
+            door.admit(slot.shape, slot.cell, &self.keys_buf, first_new, &mut self.ids_buf, &mut self.new_buf);
             // The edges: every row (each a predecessor mask) to its state,
             // plus the extra masks. Rows without ids (a step run on
             // id-less blocks, e.g. the tests' reference engine) have no
@@ -1401,17 +1305,7 @@ impl<'a> ForwardSink<'a> {
                 }));
                 self.kept += self.rows_buf.len();
                 self.won |= slot.any_win(&self.rows_buf)?;
-                let w0 = piece.width;
                 slot.gather_into(piece, &self.rows_buf);
-                // An emitted row carries the hull the door handed back:
-                // its own for a new key, the union for a grown one.
-                if let Some((cx, cy)) = spd_cols {
-                    let (cx, cy) = (slot.cols[cx].0, slot.cols[cy].0);
-                    for (k, h) in self.new_hulls.iter().enumerate() {
-                        celeste_engine::runtime2::col_set(&mut piece.cols[cx], piece.width, w0 + k, AV::Ival(P8::from_raw(h[0]), P8::from_raw(h[1])));
-                        celeste_engine::runtime2::col_set(&mut piece.cols[cy], piece.width, w0 + k, AV::Ival(P8::from_raw(h[2]), P8::from_raw(h[3])));
-                    }
-                }
                 ids.extend((0..self.rows_buf.len() as u32).map(|k| first_new + k as u64));
                 debug_assert_eq!(ids.len(), piece.width);
             }
@@ -1419,7 +1313,7 @@ impl<'a> ForwardSink<'a> {
         }
         slot.live = false;
         slot.touched = false;
-        self.index.remove(&(slot.outcome, slot.cell, slot.dkey));
+        self.index.remove(&(slot.outcome, slot.cell));
         self.spare.entry(slot.outcome).or_default().push(q as u32);
         if self.last.1 == q as u32 {
             self.last = NO_QUEUE;
@@ -1485,8 +1379,7 @@ impl<'a> ForwardSink<'a> {
         // The reference engine computes no transfer: its edges would have no
         // arc records (`search::arc_edges`).
         anyhow::ensure!(!self.arc_on, "arc edges (CELESTE_ARC_EDGES=1) are recorded by the kernels only, not the reference engine");
-        let dkey = crate::compiled::asm_kernel::speed_key_of_row(row, 0);
-        let q = self.queue(row.shape_hash, cell, dkey, || {
+        let q = self.queue(row.shape_hash, cell, || {
             // The skeleton from the row itself: numeric and boolean cells
             // vary (typed, empty), the rest is uniform - which every row
             // of a shape agrees on, the shape hash being the structure.
@@ -1511,25 +1404,10 @@ impl<'a> ForwardSink<'a> {
 }
 
 
-/// EXPERIMENT: `CELESTE_BAND="H,px"`, the time band. `px` is the largest upward
-/// movement per frame (8 on room (2,0)'s recorded transitions: a measurement,
-/// not a proven bound), `H` the horizon. Unset: no band.
-fn band() -> Option<(u32, i32)> {
-    static BAND: std::sync::OnceLock<Option<(u32, i32)>> = std::sync::OnceLock::new();
-    *BAND.get_or_init(|| {
-        let s = std::env::var("CELESTE_BAND").ok()?;
-        assert!(win_rect().is_none(), "CELESTE_BAND measures the climb to the room exit; this room's win is a position");
-        let (h, px) = s.split_once(',').expect("CELESTE_BAND=\"H,px\"");
-        let band = (h.trim().parse().expect("CELESTE_BAND horizon"), px.trim().parse().expect("CELESTE_BAND px per frame"));
-        eprintln!("[band] EXPERIMENT: dropping cells that cannot climb to the exit by f{} at {} px per frame", band.0, band.1);
-        Some(band)
-    })
-}
-
 /// THE LEVEL -1 FILTER (`CELESTE_LEVEL_MINUS_ONE="H,S"`, plans/level-minus-one.md):
 /// drop a queue (one player cell) when the level -1 table proves its rows
 /// cannot exit by horizon H (`trace::level_minus_one::CostToGo::too_late`).
-/// Unlike the band it is derived from the traced frames: the table's ranges
+/// It is derived from the traced frames: the table's ranges
 /// are inductive, a clipped successor counts as a possible exit and a death as
 /// a respawn. H must be the LARGEST horizon the run tests - level 0 persists
 /// across horizons - so this is for a `--ceiling` search with H = the ceiling.
@@ -1566,8 +1444,9 @@ fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::Cos
         .map(|(h, t)| (*h, t))
 }
 
-/// Can a player at `cell` at frame `frame` not reach the exit (y < -4) by
-/// horizon `h`, at `px` pixels per frame up? One frame of slack for when the
+/// THE TIME BAND (an estimate, not a bound; the level -1 probe compares its
+/// table against it): can a player at `cell` at frame `frame` not reach the
+/// exit (y < -4) by horizon `h`, at `px` pixels per frame up? One frame of slack for when the
 /// exit test runs. A cell with no player (a death) is kept, and so is a cell
 /// past the start room: the position grid places the next room one room to
 /// the right (`pos_graph`), so x >= 128 is a row that has LEFT the room - a
@@ -1660,24 +1539,12 @@ pub fn widened_keys(
     widened_keys_rt2(&block.rt2, coarser)
 }
 
-/// The speed bucket (log2 raw units) a level widens to, `None` for exact.
-/// The speed table width a level buckets at, and whether it buckets y as
-/// well as x (`Rt2::widen_to`'s speed step).
-pub fn spd_width_log2(spd: crate::interpreter::abstraction::SpdPrecision) -> Option<(u8, bool)> {
-    match spd.width_log2() {
-        Some(w) => Some((w, spd.buckets_y())),
-        None => None,
-    }
-}
-
 /// The fall-floor projection a level's rows are keyed on (`Rt2::widen_to`).
 pub fn floors_widening(floors: crate::interpreter::abstraction::FloorsPrecision) -> celeste_engine::runtime2::FloorsWidening {
     use crate::interpreter::abstraction::FloorsPrecision as P;
     use celeste_engine::runtime2::FloorsWidening as W;
     match floors {
         P::Exact => W::Exact,
-        P::Unknown => W::Unknown,
-        P::Timers => W::Timers,
         P::Near => W::Near,
     }
 }
@@ -1687,7 +1554,7 @@ pub fn floors_widening(floors: crate::interpreter::abstraction::FloorsPrecision)
 pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::interpreter::abstraction::Level) {
     use crate::interpreter::abstraction::RemPrecision;
     if let RemPrecision::Bits(b) = level.rem {
-        rt2.widen_to(crate::compiled::ids(), b, spd_width_log2(level.spd), (level.pos.x, level.pos.y), level.held.is_unknown(), level.fruit.is_unknown(), floors_widening(level.floors), level.platforms.is_unknown());
+        rt2.widen_to(crate::compiled::ids(), b, level.held.is_unknown(), level.fruit.is_unknown(), floors_widening(level.floors), level.platforms.is_unknown());
     }
 }
 
@@ -1888,7 +1755,6 @@ pub fn forward_frame(
     let t = Instant::now();
     door.end_frame(workers);
     st.t_door = t.elapsed();
-    st.hull_grown = crate::search::door::take_hull_growths();
     st.door_bytes = door.alloc_bytes();
 
     let mut won = false;
@@ -1951,9 +1817,6 @@ pub struct FrameStats {
     pub t_door: std::time::Duration,
     pub flushes: u64,
     pub flushed_rows: u64,
-    /// Admissions whose speed hull grew: existing states re-emitted as new
-    /// rows (a bucketed level; `door::take_hull_growths`).
-    pub hull_grown: u64,
     /// Edge records written (`EDGE_RECORD_BYTES` each), and the workers'
     /// summed time encoding and writing them (thread-time).
     pub edge_records: u64,
@@ -2248,19 +2111,13 @@ impl ForwardState {
         // door then takes each row under that id.
         checkpoint_frontier(dir, 0, &mut initial)?;
         crate::search::edges::set_done_frame(&dir.join("edges"), 0)?;
-        let door = crate::search::door::Door::for_current_level();
-        // Hulls only into a door that keeps them (a level that buckets the
-        // speed, as `resume` decides): a start state with a player - not a
-        // room's spawn, `rewrite search --start-after` - has a speed.
-        let hulled = crate::interpreter::abstraction::spd_precision().width_log2().is_some();
+        let door = crate::search::door::Door::new();
         for b in &initial {
             let cells = b.positions()?;
             let shape = b.shard_shape();
             let (mut new, mut ids) = (Vec::new(), Vec::new());
-            let hulls = if hulled { b.rt2().speed_hulls(crate::compiled::ids()) } else { None };
-            for (r, ((&cell, &key), &id)) in cells.iter().zip(b.keys()).zip(b.ids()).enumerate() {
-                let h = hulls.as_ref().map(|h| vec![h[r]]);
-                door.admit(shape, cell, &[key], id, &mut ids, &mut new, h.as_deref(), &mut Vec::new());
+            for ((&cell, &key), &id) in cells.iter().zip(b.keys()).zip(b.ids()) {
+                door.admit(shape, cell, &[key], id, &mut ids, &mut new);
             }
         }
         door.end_frame(1);
@@ -2310,51 +2167,26 @@ impl ForwardState {
         crate::search::edges::discard_after(&edges_dir, last)?;
         crate::search::arc_edges::discard_after(&edges_dir, last)?;
         // Every layer's keys into the door, one file per unit of work.
-        let seq_of = |p: &std::path::Path| -> u32 {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .and_then(|n| n.trim_end_matches(".bin").rsplit('_').next())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0)
-        };
-        let files: Vec<(u32, std::path::PathBuf)> = (0..=last)
-            .flat_map(|f| {
-                let fdir = dir.join("frames").join(format!("f{:03}", f));
-                std::fs::read_dir(&fdir)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.starts_with('s') && n.ends_with(".bin")))
-                    .map(move |p| (f, p))
-            })
-            .collect();
+        let mut files: Vec<(u32, u32, std::path::PathBuf)> = Vec::new();
+        for f in 0..=last {
+            files.extend(frame_paths(dir, f)?.into_iter().map(|(seq, p)| (f, seq, p)));
+        }
         let next = AtomicUsize::new(0);
-        let hulled = crate::interpreter::abstraction::spd_precision().width_log2().is_some();
         let partial: Vec<(rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>>, Option<u32>)> =
             std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..threads())
                     .map(|_| {
-                        let (files, next, seq_of, hulled) = (&files, &next, &seq_of, hulled);
+                        let (files, next) = (&files, &next);
                         scope.spawn(move || -> Result<_> {
                             let mut m: rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>> = Default::default();
                             let mut win: Option<u32> = None;
                             loop {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
-                                let Some((f, path)) = files.get(i) else { break };
+                                let Some((f, seq, path)) = files.get(i) else { break };
                                 let file = crate::search::checkpoint::FrameFile::open(path)?;
                                 let shape = file.shape_hash();
-                                let seq = seq_of(path);
-                                // The door's speed hulls come back from the
-                                // rows (a bucketed level; decoding every layer,
-                                // which a resume can afford).
-                                let hulls: Option<Vec<crate::search::door::Hull>> = if hulled {
-                                    file.load_all()?.and_then(|rt2| rt2.speed_hulls(crate::compiled::ids()))
-                                } else {
-                                    None
-                                };
                                 for (row, (cell, key)) in file.cell_keys_rows() {
-                                    let h = hulls.as_ref().map_or(crate::search::door::NO_HULL, |h| h[row as usize]);
-                                    m.entry((shape, cell)).or_default().push((key, pack_id(*f, seq, row), h));
+                                    m.entry((shape, cell)).or_default().push((key, pack_id(*f, *seq, row)));
                                 }
                                 if !file.wins().is_empty() {
                                     win = Some(win.map_or(*f, |w| w.min(*f)));
@@ -2377,7 +2209,7 @@ impl ForwardState {
                 (a, b) => a.or(b),
             };
         }
-        let door = crate::search::door::Door::from_shards(shards, hulled);
+        let door = crate::search::door::Door::from_shards(shards);
         // The frontier: the last layer minus its won rows.
         let mut frontier: Vec<Block> = load_frame(dir, last)?;
         for b in &mut frontier {
@@ -2618,7 +2450,7 @@ fn log_frame(
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
          wave {:.0} (idle {:.0}%) door {:.0} edges {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
-         flushes {} ({:.0} rows avg) edges {} hull growths {} | \
+         flushes {} ({:.0} rows avg) edges {} | \
          in {:.2} queues {:.2} door {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2})",
         st.blocks_in,
         st.lanes_in,
@@ -2637,7 +2469,6 @@ fn log_frame(
         st.flushes,
         st.flushed_rows as f64 / st.flushes.max(1) as f64,
         edge_records,
-        st.hull_grown,
         st.bytes_in as f64 / 1e9,
         st.queue_bytes as f64 / 1e9,
         st.door_bytes as f64 / 1e9,
@@ -3417,13 +3248,8 @@ mod tests {
 
         // The real ladder maps k>=16 to Exact (rewrite.rs: `if prev_bits >= 16
         // { Exact }`), so the distinct precisions are Bits(0..=15) then Exact.
-        // CELESTE_LADDER_MAXBITS bisects: Bits(0..=maxbits) then Exact.
-        let maxbits: u8 = std::env::var("CELESTE_LADDER_MAXBITS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(15);
         let precisions: Vec<crate::interpreter::abstraction::Level> =
-            crate::interpreter::abstraction::Level::default_ladder(maxbits);
+            crate::interpreter::abstraction::Level::default_ladder(15);
 
         let make_engine = |precision: crate::interpreter::abstraction::Level| {
             crate::interpreter::abstraction::set_level(precision);
@@ -3793,7 +3619,7 @@ mod tests {
             crate::concrete::restore_buttons(&init, &mut st).expect("buttons");
         }
         let successors = |engine: &dyn FrameStep| -> std::collections::BTreeSet<((u64, u64), u32)> {
-            let door = crate::search::door::Door::for_current_level();
+            let door = crate::search::door::Door::new();
             let (next, _, _) = forward_frame(engine, vec![Block::from_state(&st).expect("block")], &door, None, None, 26, None).expect("frame");
             next.iter().flat_map(|b| b.keys().iter().copied().zip(b.positions().expect("cells"))).collect()
         };
@@ -3848,7 +3674,7 @@ mod tests {
         assert!(wins_of(exit.rt2()).expect("wins")[0], "the reference solution exits at frame 127");
         let mut parent = Block::from_state(&st).expect("block").into_rt2();
         widen_rt2_to(&mut parent, level);
-        let door = crate::search::door::Door::for_current_level();
+        let door = crate::search::door::Door::new();
         let (next, _, _) = forward_frame(&kernels, vec![Block::from_rt2(parent)], &door, None, None, 127, None).expect("frame");
         let mut made: std::collections::BTreeSet<(u64, (u64, u64), u32)> = Default::default();
         for b in &next {

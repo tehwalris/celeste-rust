@@ -378,7 +378,6 @@ impl<'a> Table<'a> {
     /// Trace shape `id` under its current ranges and pins, and specialize its
     /// frame on every fork configuration into one shared graph.
     fn trace(&mut self, tr: &mut Tracer, id: usize) -> Result<()> {
-        use crate::interpreter::abstraction::{PosPrecision, SpdPrecision};
         let t0 = std::time::Instant::now();
         let key = self.shapes[id].key.clone();
         let st = self.lw.reps[&key].clone();
@@ -440,7 +439,7 @@ impl<'a> Table<'a> {
             bounds.insert(p.clone(), self.shapes[id].ranges[&p]);
             ival.push(p);
         }
-        for p in super::shapes::ival_paths(&st, false, (false, false)).into_iter().chain(self.lw.ival_extra.get(&key).into_iter().flatten().cloned()) {
+        for p in super::shapes::ival_paths(&st).into_iter().chain(self.lw.ival_extra.get(&key).into_iter().flatten().cloned()) {
             if !pins.contains_key(&p) && !ival.contains(&p) {
                 ival.push(p);
             }
@@ -464,7 +463,7 @@ impl<'a> Table<'a> {
             &roots,
             &pin_list,
             &ival,
-            Some(super::widen::WidenMode::Level0(SpdPrecision::Exact, PosPrecision::EXACT)),
+            Some(super::widen::WidenMode::Level0),
             &bound_list,
         )
         .map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"));

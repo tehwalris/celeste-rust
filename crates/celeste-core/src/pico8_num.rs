@@ -340,14 +340,6 @@ impl Pico8NumInterval {
         }
     }
 
-    pub fn contains_number(&self, n: Pico8Num) -> bool {
-        n >= self.low && n <= self.high
-    }
-
-    pub fn contains_interval(&self, other: &Self) -> bool {
-        other.low >= self.low && other.high <= self.high
-    }
-
     pub fn union(&self, other: &Self) -> Self {
         Self {
             low: std::cmp::min(self.low, other.low),

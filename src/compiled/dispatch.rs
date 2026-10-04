@@ -28,64 +28,15 @@ pub(crate) enum TracedMode {
     ExactRem,
 }
 
-/// The mode, re-evaluated per call (the in-process ladder changes the rem
-/// rung between levels, via `set_rem_precision`, and the kernel set must
-/// follow it - a OnceLock here froze the mode at level 0's Bits(0) and made
-/// every rung refuse its own set): `CELESTE_TRACED_SET=traced|ladder|exact`
-/// overrides; otherwise the rem rung picks (Bits(0) -> the level-0 set,
-/// Bits(1..15) -> the rung-agnostic set, Exact -> the exact set).
+/// The mode of a rem rung: Bits(0) -> the level-0 set, Bits(1..15) -> the
+/// rung-specific ladder set, Exact -> the exact set.
 pub(crate) fn traced_mode_for(rem: crate::interpreter::abstraction::RemPrecision) -> TracedMode {
     use crate::interpreter::abstraction::RemPrecision;
-    match std::env::var("CELESTE_TRACED_SET").as_deref() {
-        Ok("traced") => TracedMode::Level0,
-        Ok("ladder") => TracedMode::Level0Agnostic,
-        Ok("exact") => TracedMode::ExactRem,
-        Ok(other) => {
-            panic!("CELESTE_TRACED_SET={:?}: expected traced, ladder or exact", other)
-        }
-        Err(_) => match rem {
-            RemPrecision::Bits(0) => TracedMode::Level0,
-            RemPrecision::Bits(_) => TracedMode::Level0Agnostic,
-            RemPrecision::Exact => TracedMode::ExactRem,
-        },
+    match rem {
+        RemPrecision::Bits(0) => TracedMode::Level0,
+        RemPrecision::Bits(_) => TracedMode::Level0Agnostic,
+        RemPrecision::Exact => TracedMode::ExactRem,
     }
-}
-
-/// Whether the ladder (`Level0Agnostic`) kernel set bakes the rem rung
-/// widening into the graph (`WalkOpts::LADDER_WIDEN`, `WidenMode::RemRung`)
-/// instead of emitting exact rows and leaving the rung widening to the
-/// campaign boundary (plans/keying-widening-flow.md).
-///
-/// DEFAULT ON (2026-08-29): the exact-ladder-then-wrapper-widen path was
-/// the source of the Bits(2) keying artifact - the kernel's own
-/// `chunk_skip` acted on the pre-widening key while the frontier stored
-/// the widened key - and moving the widening into the graph fixes it AND
-/// is FASTER per frame (the within-frame dedup collapses rows on the
-/// widened key before they reach the boundary; measured -34% on room
-/// (1,0) f31 at Bits(2)). `CELESTE_WIDEN_IN_GRAPH=0` is the kill-switch
-/// for debugging / A-B. Rung-SPECIFIC, so a process must not change rem
-/// precision after the registry is built (the OnceLock caches one rung's
-/// kernels); the production ladder runs one rung PER PROCESS
-/// (`ladder.sh`), so this holds. Level 0 already widens in the graph
-/// (`WidenMode::Level0`) and the exact-rem set has no rem intervals, so
-/// this only governs the Bits(1..15) ladder set.
-pub(crate) fn widen_in_graph() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CELESTE_WIDEN_IN_GRAPH").map_or(true, |v| v != "0"))
-}
-
-/// The assert-noop guard (plans/keying-widening-flow.md, Phase 1 point 1):
-/// when the kernels widen in the graph, re-applying the campaign's
-/// `make_state_abstract` to their output must be a no-op on the row keys.
-/// A failure means the graph UNDER-widened some field the boundary would
-/// still move - the exact class the fruit `off`/`y` bug was in. OFF by
-/// default (a per-frame re-abstraction + double keying); opt-in via
-/// `CELESTE_KERNEL_WIDEN_NOOP=1`. Only meaningful with
-/// `CELESTE_WIDEN_IN_GRAPH=1` (an exact-rem kernel is not a fixed point of
-/// the rung widening by construction).
-pub(crate) fn widen_noop_check() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CELESTE_KERNEL_WIDEN_NOOP").map_or(false, |v| v != "0"))
 }
 
 /// A one-line miss summary for the strict-mode abort: how many lanes the
@@ -160,9 +111,4 @@ pub fn print_kernel_hits() {
             100.0 * unique as f64 / lane_emits.max(1) as f64
         );
     }
-}
-
-/// The per-lane body-set census (`CELESTE_BODYSETS=1`).
-pub fn print_bodysets() {
-    super::asm_kernel::print_bodysets();
 }

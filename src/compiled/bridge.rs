@@ -333,6 +333,5 @@ fn import_scalar_value(rt2: &mut Rt2, v: &Value, state: &State) -> Col {
         Value::Nil(_) => Col::U(AV::Nil),
         Value::Pointer(_) => unreachable!("handled by conv_value"),
         Value::NilPointer(_) => Col::U(AV::NilPtr),
-        Value::MaybeBool(_) => panic!("MaybeBool must never be stored (value.rs contract)"),
     }
 }

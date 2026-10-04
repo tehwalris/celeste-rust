@@ -139,19 +139,17 @@ pub enum WidenMode {
     /// The full Bits(0) boundary widenings (rem -> [-0.5, 0.5), the
     /// timer globals -> 0, `dash_effect_time` -> max(0, .), a live
     /// fruit's `off`/`y` -> its bob band), all in the graph. The
-    /// production level-0 set. Carries the level's spd and position
-    /// precisions (the position rung below level 0 is a Level0 set with
-    /// a position bucket: `Level::grid_consistent`).
-    Level0(crate::interpreter::abstraction::SpdPrecision, crate::interpreter::abstraction::PosPrecision),
+    /// production level-0 set.
+    Level0,
     /// ONLY the rem widening, at the configured Bits(k) rung, via a
     /// bucket fork + snap. Phase 1 of moving the ladder widening into
     /// the graph (plans/keying-widening-flow.md): the rung-agnostic
     /// ladder kernel emits EXACT rem and leaves the rung widening to the
     /// campaign boundary; this makes a rung-SPECIFIC variant that emits
     /// the widened rem so the row is keyed on the value it stores.
-    /// Everything else (spd, fruit, timers, conservative widenings) is
-    /// still left to the boundary in this phase.
-    RemRung(crate::interpreter::abstraction::RemPrecision, crate::interpreter::abstraction::SpdPrecision),
+    /// The fruit, timer and object widenings are rung-independent and
+    /// applied as at level 0.
+    RemRung(crate::interpreter::abstraction::RemPrecision),
 }
 
 /// A state BETWEEN the two steps of a split frame (`CELESTE_SPLIT_FRAME`,
@@ -164,30 +162,23 @@ pub fn mid_frame<D: Domain>(st: &State<D>) -> bool {
 
 /// Apply the boundary widenings selected by `mode` to `st`.
 ///
-/// Every widening `make_state_abstract` applies, in the graph, so a
-/// widen-in-graph kernel emits a FIXED POINT of it: the campaign boundary
-/// re-abstracting the output changes nothing (the assert-noop property).
-/// The fruit / dash / timer widenings are rung-INDEPENDENT
-/// (`make_state_abstract_rem` widens the fruit at every non-exact rung,
-/// `apply_conservative_widenings` clamps dash and pins timers regardless),
-/// so both modes apply them; only rem and spd differ by rung.
+/// The fruit / dash / timer widenings are rung-INDEPENDENT (the fruit is
+/// widened at every non-exact rung, dash clamped and timers pinned
+/// regardless), so both modes apply them; only rem differs by rung.
 pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Result<SlotErrors> {
     use crate::interpreter::abstraction::RemPrecision;
-    // The level's rem and spd precisions (`abstraction::Level`), explicit
-    // so every level's set can be traced at once.
-    let (rem, spd, pos) = match mode {
-        WidenMode::Level0(spd, pos) => (RemPrecision::Bits(0), spd, pos),
-        WidenMode::RemRung(rem, spd) => (rem, spd, crate::interpreter::abstraction::PosPrecision::EXACT),
+    // The level's rem precision (`abstraction::Level`), explicit so every
+    // level's set can be traced at once.
+    let rem = match mode {
+        WidenMode::Level0 => RemPrecision::Bits(0),
+        WidenMode::RemRung(rem) => rem,
     };
     let mut errs = SlotErrors::new();
     widen_rem(st, d, rem, &mut errs)?;
-    widen_spd(st, d, spd, &mut errs)?;
-    widen_pos(st, d, pos)?;
     widen_dash(st, d)?;
     widen_fruit(st, d, &mut errs)?;
     widen_timers(st, d)?;
     widen_fly_fruit(st, d, &mut errs)?;
-    widen_fall_floors(st, d)?;
     widen_floor_timers(st, d)?;
     widen_near_floors(st, d, &mut errs, mid_frame(st))?;
     widen_platforms(st, d, &mut errs)?;
@@ -247,21 +238,6 @@ fn widen_held(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     Ok(())
 }
 
-/// The fields a floors-unknown level widens, per fall floor
-/// (plans/fall-floors.md).
-pub struct FallFloorPaths {
-    /// `state` and `delay`: the unknown number.
-    pub unknown: Vec<Path>,
-    /// `collideable`: an unknown boolean.
-    pub collideable: Vec<Path>,
-}
-
-impl FallFloorPaths {
-    pub fn all(&self) -> impl Iterator<Item = &Path> {
-        self.unknown.iter().chain(self.collideable.iter())
-    }
-}
-
 /// An object's `(x, y)`: constants, floors and springs never move.
 fn position<D: Domain>(st: &State<D>, d: &D, obj: &Path) -> Result<(P8, P8)> {
     let get = |f: &str| -> Result<P8> {
@@ -274,30 +250,8 @@ fn position<D: Domain>(st: &State<D>, d: &D, obj: &Path) -> Result<(P8, P8)> {
     Ok((get("x")?, get("y")?))
 }
 
-pub fn fall_floor_paths<D: Domain>(st: &State<D>) -> FallFloorPaths {
-    let mut out = FallFloorPaths { unknown: Vec::new(), collideable: Vec::new() };
-    for obj in objects_of_type(st, "fall_floor") {
-        out.unknown.push(field(&obj, &["state"]));
-        out.unknown.push(field(&obj, &["delay"]));
-        out.collideable.push(field(&obj, &["collideable"]));
-    }
-    // The balloon's respawn `timer` (2026-09-21, room (5,0)): under the same
-    // flag, the unknown number. While the balloon shows, the timer is dead (a
-    // pop sets it to 60), so the merge is exact; while it is popped, an
-    // unknown timer lets it respawn on any frame - the over-approximation the
-    // exact-floors levels narrow back. Every pop at a different frame carried
-    // its own countdown next to the same player state (room (5,0) level 0: a
-    // balloon multiplier of 2.25x at f70).
-    for obj in objects_of_type(st, "balloon") {
-        out.unknown.push(field(&obj, &["timer"]));
-    }
-    // The objects' phases (`phase_paths`).
-    out.unknown.extend(phase_paths(st).into_iter().map(|(p, _)| p));
-    out
-}
-
-/// The object PHASES both floors-unknown levels widen (2026-10-01, rooms
-/// (7,0)/(0,1)), each with the range a near level stores it as: the spring's
+/// The object PHASES a near level widens (2026-10-01, rooms (7,0)/(0,1)),
+/// each with the range it stores it as: the spring's
 /// `spr` (0 hidden, 18 ready, 19 compressed), its compressed countdown `delay`
 /// and hide countdowns `hide_in`/`hide_for`, and the balloon's `spr` (0
 /// popped, 22 present). The spring's update is then "maybe bounce the
@@ -337,8 +291,8 @@ pub enum PhaseRange {
     Countdown,
 }
 
-/// The countdowns a timers level widens (`abstraction::FloorsPrecision::Timers`):
-/// every fall floor's `delay` and the balloon's respawn `timer`.
+/// The countdowns a near level widens: every fall floor's `delay` and the
+/// balloon's respawn `timer`.
 pub fn floor_timer_paths<D: Domain>(st: &State<D>) -> Vec<Path> {
     let mut out = Vec::new();
     for obj in objects_of_type(st, "fall_floor") {
@@ -353,13 +307,11 @@ pub fn floor_timer_paths<D: Domain>(st: &State<D>) -> Vec<Path> {
     out
 }
 
-/// The OUTPUT side of a timers level (2026-09-30, room (7,0)): each countdown
+/// The countdowns' OUTPUT side at a near level (2026-09-30, room (7,0)): each
 /// stored as THE UNKNOWN NUMBER (`Symbolic::unknown_num`, stored `AV::UNum`,
 /// `emit::bind`) - the cart only decrements them and compares them with 0, so
-/// no range would be more precise. A floor's `state` and `collideable` stay
-/// exact, so an idle floor - which never reads its `delay` (a break sets it)
-/// - is unchanged, and a broken one keeps its phase and only forgets how far
-/// into it it is: next frame its `delay <= 0` is an undecided atom, "still
+/// no range would be more precise. A broken floor only forgets how far into
+/// its phase it is: next frame its `delay <= 0` is an undecided atom, "still
 /// counting" or "done". The unknown contains whatever the frame computed, so
 /// there is no premise. Room (7,0) level 0 at f54: erasing the delays merged
 /// 3.1x, all floor fields 4.6x.
@@ -371,7 +323,7 @@ pub fn floor_timer_paths<D: Domain>(st: &State<D>) -> Vec<Path> {
 /// (`Op::NoWrap`), so a countdown of the whole range would decline every
 /// lane; the unknown number stays unknown under every operation instead.
 fn widen_floor_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    if !d.floor_timers {
+    if !d.floors_near {
         return Ok(());
     }
     for p in floor_timer_paths(st) {
@@ -387,10 +339,8 @@ fn widen_floor_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> 
 /// what the next frame reads them as.
 pub fn countdown_paths(st: &State<Symbolic>, d: &Symbolic) -> Vec<Path> {
     let mut out = Vec::new();
-    if d.floor_timers {
-        out.extend(floor_timer_paths(st));
-    }
     if d.floors_near {
+        out.extend(floor_timer_paths(st));
         out.extend(phase_paths(st).into_iter().filter(|(_, r)| matches!(r, PhaseRange::Countdown)).map(|(p, _)| p));
     }
     out
@@ -679,58 +629,6 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
         let unread = if mid { d.sel_bool(&probe, &coll, &unknown) } else { unknown };
         let coll = d.sel_bool(&overlap, &absent, &unread);
         iface::set(st, pc, Value::Bool(coll))?;
-    }
-    Ok(())
-}
-
-/// The fall floors' INPUT side at a floors-unknown level (plans/fall-floors.md):
-/// `state` and `delay` (and the spring's phase, the balloon's timer) the
-/// unknown number, `collideable` a FORK of both values - every lane alike, no
-/// input cell read. A floor that never broke has no `delay` in the
-/// post-`_init` start state; it is materialized first (`ABSENT_AS_ZERO`, as
-/// every frame's output does), then replaced. A decided input lies inside and
-/// only over-approximates, so there is no premise.
-///
-/// `collideable` is a fork, not an atom, because it is read by other objects'
-/// collisions (the player's `is_solid`) and every read in a stage must agree:
-/// three-valued reads of one atom do not. Where the floor's own update runs
-/// first, it joins its `collideable` writes under the unknown `state`, and the
-/// joined value becomes a fork restricted to what each lane can take when the
-/// update returns (`Domain::escaped_atom`).
-pub fn fork_floor_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    materialize_absent_fields(st, d)?;
-    replace_fall_floors(st, d, false)
-}
-
-/// The fall floors' OUTPUT side at a floors-unknown level: `state` and `delay`
-/// the unknown number (stored `AV::UNum`, `emit::bind`), `collideable` the
-/// canonical output unknown (stored `AV::UBool`, `verify::out_fields`). The
-/// unknown contains whatever the frame computed, so there is nothing to check.
-fn widen_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    if !d.floors_unknown {
-        return Ok(());
-    }
-    replace_fall_floors(st, d, true)
-}
-
-/// `output`: the canonical output unknown for `collideable` (never read in
-/// the frame), else a fresh atom (read by collisions: independent per floor).
-fn replace_fall_floors(st: &mut State<Symbolic>, d: &mut Symbolic, output: bool) -> Result<()> {
-    let fp = fall_floor_paths(st);
-    for p in &fp.unknown {
-        let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
-        let u = d.unknown_num();
-        iface::set(st, p, Value::Num(u))?;
-    }
-    for p in &fp.collideable {
-        let Some(Value::Bool(_)) = iface::get(st, p) else { bail!("{}: not a boolean", iface::show(p)) };
-        // The input: a FORK of both values, so every read of it in the stage
-        // agrees with every other. Under the split frame the player's half
-        // reads it directly - the floors update in the other half - and an
-        // atom read twice gave "solid" for one test and "absent" for the next
-        // (room (7,0), 2026-10-01, `rewrite ref-check`).
-        let b = if output { d.unknown_bool_output() } else { d.both_values(&format!("{} input", iface::show(p))) };
-        iface::set(st, p, Value::Bool(b))?;
     }
     Ok(())
 }
@@ -1209,49 +1107,25 @@ fn widen_rem(
 
             let at = st.decided(d);
             let rb = rem_bucket_node(d, old, bits, at)?;
-            iface::set(st, &p, Value::Num(rb.value))?;
+            iface::set(st, &p, Value::Num(rb))?;
         }
     }
     Ok(())
 }
 
-/// The widened rem (or speed) for one value.
-///
-/// That `old` lay within ONE bucket is not stated here: the bucket is
-/// computed through `Flr(old / width)`, and that floor's own error is exactly
-/// the claim (`trace::error`). A lane whose value straddles a bucket edge is
-/// REAL and this body cannot represent it, so it declines, never widened past
-/// its bucket. For rem it never fires: `move` forked at the bucket grid
-/// (`Graph::fork_bits`), so every fragment's new rem is one bucket shifted by
-/// a multiple of the bucket width.
-pub(crate) struct RemBucket {
-    /// The widened rem: `Span(bucket_low, bucket_high)`, the
-    /// floor-aligned Bits(k) bucket `rem_bucket(., bits)`.
-    pub value: <Symbolic as Domain>::Num,
-    /// The TIGHT value: the fork's fragment (the input clipped to its
-    /// bucket), or the input itself when it needed no fork. The speed
-    /// stores this and is keyed on `value` (the speed hull).
-    pub tight: <Symbolic as Domain>::Num,
-    /// The validity of the fork's fragment, when the value forked here
-    /// (`spd_bucket_node`: spd has no earlier split to fold into); `None`
-    /// for rem.
-    pub fork: Option<<Symbolic as Domain>::Bool>,
-    /// What the snap ASSUMED of `old` beyond what an operator carries: the
-    /// static range a bucket table was cut for (`spd_table_node`). The
-    /// widening's own error where it fails.
-    pub within: Option<<Symbolic as Domain>::Bool>,
-}
-
 /// Snap `old` (assumed in [-0.5, 0.5)) to its floor-aligned Bits(`bits`)
-/// bucket - WITHOUT forking. The straddle split happened once already,
-/// at `move`'s `__split_by_flr`, on the bucket grid; here a straddling
-/// value is a violated premise, not a case. `bits` in 1..=16.
+/// bucket `Span(bucket_low, bucket_high)` - WITHOUT forking. The straddle
+/// split happened once already, at `move`'s `__split_by_flr`, on the bucket
+/// grid; here a straddling value is a violated premise, not a case: the
+/// bucket is computed through `Flr(old / width)`, and that floor's own error
+/// is exactly the claim (`trace::error`), so such a lane declines. `bits` in
+/// 1..=16.
 pub(crate) fn rem_bucket_node(
     d: &mut Symbolic,
     old: <Symbolic as Domain>::Num,
     bits: u8,
     at: <Symbolic as Domain>::Bool,
-) -> Result<RemBucket> {
+) -> Result<<Symbolic as Domain>::Num> {
     debug_assert!((1..=16).contains(&bits), "rem_bucket_node bits {} out of 1..=16", bits);
     // width = 2^-k in real units; raw bits = 2^(16-k), always
     // representable for k in 1..=16.
@@ -1272,8 +1146,7 @@ pub(crate) fn rem_bucket_node(
     let low = d.arith(super::domain::Arith::Mul, &idx, &width)?;
     let span_minus_one = d.num(P8::from_raw(width_raw - 1));
     let high = d.arith(super::domain::Arith::Add, &low, &span_minus_one)?;
-    let value = d.graph.fold(Op::Span, vec![low, high]);
-    Ok(RemBucket { value, fork: None, within: None, tight: value })
+    Ok(d.graph.fold(Op::Span, vec![low, high]))
 }
 
 /// Apply every level-0 boundary widening to `st`, in the boundary's order.
@@ -1376,156 +1249,6 @@ fn widen_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     Ok(())
 }
 
-/// The spd widening at `precision`, baked into the graph - the analogue
-/// of `split_spd_straddles` + `make_state_abstract_spd`. `Exact` is a
-/// no-op (today's default and level 0). `WidthLog2(w)`: fork
-/// `spd / 2^w_raw` at its integer floors and snap each fragment to its
-/// floor-aligned width-`2^w` bucket, exactly the rem shape at a raw-unit
-/// width. `player.spd.x/y` is not range-premised the way rem is (its
-/// buckets tile the whole `+/-16 px/frame` range by construction), so
-/// there is no containment conjunct.
-fn widen_spd(
-    st: &mut State<Symbolic>,
-    d: &mut Symbolic,
-    precision: crate::interpreter::abstraction::SpdPrecision,
-    errs: &mut SlotErrors,
-) -> Result<()> {
-    let Some(w) = precision.width_log2() else {
-        return Ok(());
-    };
-    // `WidthLog2X`: only spd.x is bucketed; spd.y stays exact.
-    let axes: &[&str] = if precision.buckets_y() { &["x", "y"] } else { &["x"] };
-    for obj in objects_of_type(st, "player") {
-        for &f in axes {
-            let p = field(&obj, &["spd", f]);
-            let Some(Value::Num(old)) = iface::get(st, &p) else {
-                bail!("{}: spd is not a number", iface::show(&p));
-            };
-            // THE BUCKET DISPATCH (2026-09-15, probe): a body specialized on
-            // its input speed bucket knows the static range of its output
-            // speed, so the snap forks at exactly the bucket edges that
-            // range crosses (`fork_table`), the row stores the fragment and
-            // is keyed on its bucket - a per-configuration constant.
-            if let Some(range) = d.range_of(old) {
-                let ax = if f == "x" { 0 } else { 1 };
-                let at = st.decided(d);
-                let sb = spd_table_node(d, old, celeste_core::spd_buckets::edges(w, ax), &range, at)?;
-                if let Some(valid) = sb.fork {
-                    st.guard = d.and(&st.guard, &valid);
-                }
-                if let Some(within) = sb.within {
-                    owe(errs, d, &p, within);
-                }
-                iface::set(st, &p, Value::Num(sb.tight))?;
-                st.key_override.push((p.clone(), sb.value));
-                continue;
-            }
-            // A trace specialized on its input bucket must know its output
-            // range - a grid snap here would key on a grid bucket, not the
-            // table's. Only the unspecialized base trace (the union
-            // templates) snaps to the grid.
-            anyhow::ensure!(
-                d.ranges.is_empty(),
-                "{}: no static range for the output speed of a bucket-specialized trace",
-                iface::show(&p)
-            );
-            let at = st.decided(d);
-            let sb = spd_bucket_node(d, old, w, at)?;
-            if let Some(valid) = sb.fork {
-                st.guard = d.and(&st.guard, &valid);
-            }
-            // THE SPEED HULL (2026-09-15): the row stores the tight
-            // fragment and is keyed on the bucket, so states that differ
-            // only within a bucket are one state whose interval is only as
-            // wide as the speeds actually merged into it (the door keeps
-            // the union, `door::Hull`), instead of the full bucket - which
-            // fanned out at every threshold the bucket straddled.
-            iface::set(st, &p, Value::Num(sb.tight))?;
-            st.key_override.push((p.clone(), sb.value));
-        }
-    }
-    Ok(())
-}
-
-/// The position widening at `pos` (the OUTPUT side): the player's whole
-/// pixel `x`/`y` snapped to its floor-aligned bucket of `w` pixels,
-/// `Span(low, low + w - 1)` with `low = w * flr(x / w)`. The analogue of
-/// `make_state_abstract_pos`. No fork and no premise: the frame ran an
-/// exact integer position (`fork_pos_inputs`), so `x` is a number.
-fn widen_pos(
-    st: &mut State<Symbolic>,
-    d: &mut Symbolic,
-    pos: crate::interpreter::abstraction::PosPrecision,
-) -> Result<()> {
-    if pos.is_exact() {
-        return Ok(());
-    }
-    for obj in objects_of_type(st, "player") {
-        for (f, w) in [("x", pos.x), ("y", pos.y)] {
-            if w <= 1 {
-                continue;
-            }
-            let p = field(&obj, &[f]);
-            let Some(Value::Num(old)) = iface::get(st, &p) else {
-                bail!("{}: position is not a number", iface::show(&p));
-            };
-            anyhow::ensure!(!d.is_interval(&old), "{}: position is an interval at the output", iface::show(&p));
-            let width = d.num(P8::from_i16(w as i16));
-            let scaled = d.arith(super::domain::Arith::Div, &old, &width)?;
-            let idx = d.fun1(super::domain::Fun1::Flr, &scaled)?;
-            let low = d.arith(super::domain::Arith::Mul, &idx, &width)?;
-            let span_minus_one = d.num(P8::from_i16(w as i16 - 1));
-            let high = d.arith(super::domain::Arith::Add, &low, &span_minus_one)?;
-            let value = d.graph.fold(Op::Span, vec![low, high]);
-            iface::set(st, &p, Value::Num(value))?;
-        }
-    }
-    Ok(())
-}
-
-/// The position widening's INPUT side: a player `x`/`y` that arrives as a
-/// bucket interval is forked into its whole-pixel points (`fork_int`:
-/// `Op::SplitInt`, one exact position per configuration), with the fork's
-/// validity in the guard; its coverage (at most `w` pixels) is the fork's own
-/// error (`trace::error`). Generic over the domain: the reference engine forks the same way
-/// through its cursor (`refdriver::run_frame_all`). A position that is
-/// already a number is left alone.
-pub fn fork_pos_inputs<D: Domain>(
-    st: &mut State<D>,
-    d: &mut D,
-    pos: crate::interpreter::abstraction::PosPrecision,
-) -> Result<()> {
-    if pos.is_exact() {
-        return Ok(());
-    }
-    for obj in objects_of_type(st, "player") {
-        for (f, w) in [("x", pos.x), ("y", pos.y)] {
-            if w <= 1 {
-                continue;
-            }
-            let p = field(&obj, &[f]);
-            let Some(Value::Num(old)) = iface::get(st, &p) else {
-                bail!("{}: position is not a number", iface::show(&p));
-            };
-            if !d.is_interval(&old) {
-                if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
-                    eprintln!("[build] fork_pos_inputs: {} is not an interval, no fork", iface::show(&p));
-                }
-                continue;
-            }
-            if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
-                eprintln!("[build] fork_pos_inputs: forking {} {w}-way", iface::show(&p));
-            }
-            let (v, valid) = d.fork_int(&old, w);
-            let at = st.decided(d);
-            d.evaluated_at(&v, &at);
-            st.guard = d.and(&st.guard, &valid);
-            iface::set(st, &p, Value::Num(v))?;
-        }
-    }
-    Ok(())
-}
-
 /// The held-button trails' INPUT side at a held-unknown level
 /// (plans/held-buttons.md): a block holds the player's `p_jump` / `p_dash`
 /// unknown, so each is replaced by a 2-way fork (`Op::SplitInt` over the
@@ -1547,119 +1270,6 @@ pub fn fork_held_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()
         }
     }
     Ok(())
-}
-
-/// Snap `old` (a raw 16.16 speed) to its floor-aligned width-`2^w` bucket,
-/// forking at bucket edges. `w` in 8..=20 (the `SpdPrecision` range), so
-/// `width = 2^w` raw is a representable P8 (2^20 = 16.0 < 32768) and the
-/// scale is a DIVISION by it. Same construction as `rem_bucket_node`, only
-/// the bucket width lives in raw units rather than a fraction.
-pub(crate) fn spd_bucket_node(
-    d: &mut Symbolic,
-    old: <Symbolic as Domain>::Num,
-    w: u8,
-    at: <Symbolic as Domain>::Bool,
-) -> Result<RemBucket> {
-    anyhow::ensure!(
-        (crate::interpreter::abstraction::SPD_MIN_WIDTH_LOG2..=20).contains(&w),
-        "spd_bucket_node w {w}: spd / 2^w raw overflows 16.16 below w = {}",
-        crate::interpreter::abstraction::SPD_MIN_WIDTH_LOG2
-    );
-    let width_raw: i32 = 1i32 << w;
-    let width = d.num(P8::from_raw(width_raw));
-    // The fork is on the RAW value: every fork in the graph cuts at the
-    // grid (`Graph::fork_bits`, 2^-k), and the spd bucket at rung k is at
-    // least one grid cell (`Level::grid_consistent`: width 2^w raw, w >=
-    // 16-k), so a fragment lies within one bucket. (Forking the SCALED value cut it
-    // on a 2^-k grid in bucket units - three cells for a one-bucket span
-    // - and every rung > 0 declined its lanes, 2026-09-14.)
-    let fb = d.graph.fork_bits();
-    anyhow::ensure!(
-        fb == 0 || w as u32 == 16 - fb as u32,
-        "spd bucket width 2^{w} raw does not match the fork grid 2^-{fb}"
-    );
-    let (frag, fork) = if d.is_interval(&old) {
-        // Two-way: the boundary snap sees the frame's OUTPUT speed, at
-        // most one grid cell wide plus the frame's shifts (`appr`'s
-        // 0.6, gravity's 0.21) - two cells.
-        let (frag, valid) = d.fork_flr(&old, 2);
-        d.evaluated_at(&frag, &at);
-        (frag, Some(valid))
-    } else {
-        (old, None)
-    };
-    let scaled = d.arith(super::domain::Arith::Div, &frag, &width)?;
-    let idx = d.fun1(super::domain::Fun1::Flr, &scaled)?;
-    d.evaluated_at(&idx, &at);
-    let low = d.arith(super::domain::Arith::Mul, &idx, &width)?;
-    let span_minus_one = d.num(P8::from_raw(width_raw - 1));
-    let high = d.arith(super::domain::Arith::Add, &low, &span_minus_one)?;
-    let value = d.graph.fold(Op::Span, vec![low, high]);
-    Ok(RemBucket { value, fork, within: None, tight: frag })
-}
-
-/// The snap of `old`, statically within `range`, to the buckets of
-/// `edges` (sorted raw edges; bucket `j` is `[edges[j], edges[j+1] - 1]`,
-/// the ends open): the buckets the range crosses become a table fork
-/// (`Op::SplitTab`), one bucket is no fork at all. `value` is the bucket
-/// (the key), `tight` the fragment, `within` the runtime check that the
-/// range held.
-fn spd_table_node(
-    d: &mut Symbolic,
-    old: <Symbolic as Domain>::Num,
-    edges: &[i32],
-    pieces: &[(i64, i64)],
-    at: <Symbolic as Domain>::Bool,
-) -> Result<RemBucket> {
-    let range = (pieces[0].0, pieces[pieces.len() - 1].1);
-    use crate::transpile::graph::Op;
-    let bucket = |j: usize| -> (i32, i32) {
-        let lo = if j == 0 { i32::MIN } else { edges[j - 1] };
-        let hi = if j == edges.len() { i32::MAX } else { edges[j] - 1 };
-        (lo, hi)
-    };
-    let crossed: Vec<(i32, i32)> = (0..=edges.len())
-        .map(bucket)
-        .filter(|(lo, hi)| pieces.iter().any(|p| (*lo as i64) <= p.1 && (*hi as i64) >= p.0))
-        .collect();
-    anyhow::ensure!(!crossed.is_empty(), "speed range {range:?} crosses no bucket");
-    anyhow::ensure!(
-        crossed.len() <= crate::transpile::graph::MAX_WAYS,
-        "speed range [{}, {}] crosses {} buckets, more than a fork holds ({})",
-        range.0 as f64 / 65536.0, range.1 as f64 / 65536.0, crossed.len(), crate::transpile::graph::MAX_WAYS
-    );
-    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
-        eprintln!("[build]   spd_table_node: range [{:.4}, {:.4}] in {} pieces crosses {} buckets: {:?}", range.0 as f64 / 65536.0, range.1 as f64 / 65536.0, pieces.len(), crossed.len(),
-            pieces.iter().map(|(a, b)| format!("[{:.3},{:.3}]", *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>());
-    }
-    // The claim: the static range holds. On the graph directly, so the
-    // range analysis cannot fold its own obligation away.
-    let (rlo, rhi) = (d.graph.leaf(Op::Const(range.0 as i32, range.0 as i32)), d.graph.leaf(Op::Const(range.1 as i32, range.1 as i32)));
-    let (vlo, vhi) = (d.graph.fold(Op::Lo, vec![old]), d.graph.fold(Op::Hi, vec![old]));
-    let a = d.graph.fold(Op::Ge, vec![vlo, rlo]);
-    let b = d.graph.fold(Op::Le, vec![vhi, rhi]);
-    let within = Some(d.graph.fold(Op::And, vec![a, b]));
-    if crossed.len() == 1 {
-        let (lo, hi) = crossed[0];
-        let value = d.graph.leaf(Op::Const(lo, hi));
-        return Ok(RemBucket { value, fork: None, within, tight: old });
-    }
-    // The RELATIVE fork: its arity is the most buckets one lane can cross
-    // (a lane lies within one piece), not every bucket the range reaches;
-    // a configuration's own pieces refine it (`lower::specialize_frame`).
-    let arity = pieces
-        .iter()
-        .map(|p| crossed.iter().filter(|(lo, hi)| (*lo as i64) <= p.1 && (*hi as i64) >= p.0).count())
-        .max()
-        .unwrap_or(1);
-    let f = d.fork_table_at(&old, &crossed, arity as u8);
-    let (frag, valid, fork) = (f.value, f.valid, f.id);
-    // The row's bucket, per lane. That the fragments cover the lane is the
-    // fork's own error (`SplitOkTab`, derived from the fork nodes).
-    let value = d.graph.fold(Op::SplitKeyTab(fork), vec![old]);
-    d.evaluated_at(&frag, &at);
-    d.evaluated_at(&value, &at);
-    Ok(RemBucket { value, fork: Some(valid), within, tight: frag })
 }
 
 #[cfg(test)]
@@ -1693,14 +1303,13 @@ mod tests {
             // No ival mark: an exact input, so no fork.
             let at = d.boolean(true);
             let rb = rem_bucket_node(&mut d, old, bits, at).expect("rem_bucket_node");
-            assert!(rb.fork.is_none(), "exact input must not fork (bits {})", bits);
             // Sweep the whole rem range; step is coprime-ish to bucket
             // widths so every bucket and both signs are hit.
             for v_raw in (-32768..32768).step_by(97) {
                 let v = P8::from_raw(v_raw);
                 let cells = HashMap::from([(0u32, Val::exact_num(v))]);
                 let out = d.graph.eval(&cells).expect("eval");
-                let got = match out[rb.value as usize] {
+                let got = match out[rb as usize] {
                     Val::Num(iv) => iv,
                     other => panic!("rem is not a number: {:?}", other),
                 };
@@ -1733,44 +1342,12 @@ mod tests {
                 for edge in [lo, hi] {
                     let cells = HashMap::from([(0u32, Val::exact_num(P8::from_raw(edge)))]);
                     let out = d.graph.eval(&cells).expect("eval");
-                    let got = match out[rb.value as usize] {
+                    let got = match out[rb as usize] {
                         Val::Num(iv) => iv,
                         other => panic!("rem is not a number: {:?}", other),
                     };
                     assert_eq!(raw(&got), (lo, hi), "bits {} edge {}", bits, edge);
                 }
-            }
-        }
-    }
-
-    /// `spd_bucket_node`, on an EXACT spd value (no fork), snaps to the
-    /// floor-aligned width-`2^w` bucket - `make_state_abstract_spd`'s
-    /// bucket, in raw units. Swept across a wide speed range at every
-    /// rung width.
-    #[test]
-    fn spd_bucket_node_matches_make_state_abstract_spd() {
-        // Reference: floor-aligned width-2^w bucket on the raw value.
-        let ref_bucket = |v_raw: i32, w: u8| -> (i32, i32) {
-            let width = 1i32 << w;
-            let low = v_raw.div_euclid(width) * width;
-            (low, low + width - 1)
-        };
-        for w in 8..=20u8 {
-            let mut d = Symbolic::default();
-            let old = d.graph.leaf(Op::Cell(0));
-            let at = d.boolean(true);
-            let sb = spd_bucket_node(&mut d, old, w, at).expect("spd_bucket_node");
-            assert!(sb.fork.is_none(), "exact spd must not fork (w {})", w);
-            // +/-16 px/frame is +/-2^20 raw; sweep it.
-            for v_raw in (-(1 << 20)..(1 << 20)).step_by(9973) {
-                let v = P8::from_raw(v_raw);
-                let cells = HashMap::from([(0u32, Val::exact_num(v))]);
-                let out = d.graph.eval(&cells).expect("eval");
-                let got = match out[sb.value as usize] {
-                    Val::Num(iv) => iv,
-                    other => panic!("spd is not a number: {:?}", other),
-                };
-                assert_eq!(raw(&got), ref_bucket(v_raw, w), "w {} value raw {}", w, v_raw);
             }
         }
     }
@@ -1788,14 +1365,13 @@ mod tests {
         let old = d.graph.leaf(Op::Cell(0));
         let at = d.boolean(true);
         let rb = rem_bucket_node(&mut d, old, bits, at).expect("rem_bucket_node");
-        assert!(rb.fork.is_none(), "the boundary snap must not fork");
         assert_eq!(d.forks, 0, "no fork registered");
 
         // Inside the bucket [0, 0x3fff]: snaps to it.
         let inside = celeste_core::pico8_num::Pico8NumInterval::new(P8::from_raw(100), P8::from_raw(0x3000));
         let cells = HashMap::from([(0u32, Val::Num(inside))]);
         let vals = d.graph.eval_narrow_top(&cells).expect("eval");
-        let got = match vals[rb.value as usize] {
+        let got = match vals[rb as usize] {
             Val::Num(iv) => iv,
             other => panic!("rem is not a number: {:?}", other),
         };

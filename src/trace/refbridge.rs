@@ -130,7 +130,6 @@ impl<'a> ToTrace<'a> {
             OValue::Nil(_) => TValue::Nil,
             OValue::NilPointer(_) => TValue::Nil,
             OValue::Pointer(id) => self.conv_target(*id)?,
-            OValue::MaybeBool(_) => bail!("MaybeBool must never be stored (value.rs contract)"),
         })
     }
 

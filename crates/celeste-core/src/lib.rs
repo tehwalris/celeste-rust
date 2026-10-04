@@ -18,5 +18,4 @@ pub mod builtins;
 pub mod cart_data;
 pub mod collision_cache;
 pub mod ids;
-pub mod spd_buckets;
 pub mod pico8_num;
