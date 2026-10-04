@@ -11,9 +11,12 @@
 //!                       predecessor filter (`plans/strategy.md`)
 //!   * `ui_export`     - `rewrite export-ui`: a finished run's tree + log
 //!                       -> the static data the web UI (`ui/`) renders
+//!   * `arcs`          - sets of remainders as arcs of the circle (a frame
+//!                       rotates them), for the rotation graph
 //!
 //! The forward driver itself is `frame::forward_run` (src/frame.rs), on a
 //! `compiled::FrameEngine`.
+pub mod arcs;
 pub mod checkpoint;
 pub mod door;
 pub mod edges;

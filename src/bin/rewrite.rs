@@ -366,6 +366,39 @@ enum Command {
     /// states of a tree with the named cells (`cell_names`) whose names
     /// start with any `--erase` prefix left out (comma-separated, e.g.
     /// `spd.,rem.,player[3].dash`), and cumulatively through that frame.
+    /// PROTOTYPE (branch arc-sets): the ROTATION GRAPH. Nodes are the
+    /// game's states with the remainders erased, time-expanded from the room's
+    /// start to `--horizon`; an edge is (input, the piece of each axis's
+    /// circle a frame's speed cuts, outcome), carrying its GUARD (that
+    /// rectangle of remainders) and per axis its ACTION (a rotation by the
+    /// speed, or a collision's constant), found by stepping the reference
+    /// engine at a remainder inside the piece (and, `--verify`, at its ends).
+    /// Then the winning sets W(node) - every remainder pair from which the win
+    /// is reachable by the horizon, as a union of rectangles - backward, and
+    /// the start's remainder tested against W(start); and the exact forward
+    /// from the start's remainder, for the earliest win.
+    ArcProto {
+        #[arg(long, default_value = "1,0")]
+        room: String,
+        #[arg(long)]
+        horizon: u32,
+        /// A synthetic win "x,y" (CELESTE_WIN_AT_XY).
+        #[arg(long)]
+        win_at: Option<String>,
+        #[arg(long)]
+        verify: bool,
+        /// Stop (with an error) past this many nodes.
+        #[arg(long, default_value_t = 2_000_000)]
+        max_nodes: usize,
+        /// A rem-free level's marks for this horizon (`hNNN/level00.marks.bin`
+        /// of a search with the same win): a successor whose projection onto
+        /// `--marks-level` is not marked cannot win by the horizon with any
+        /// remainder, so its W is empty - it is not expanded.
+        #[arg(long)]
+        marks: Option<String>,
+        #[arg(long, default_value = "r0sx")]
+        marks_level: String,
+    },
     /// DIAGNOSTIC: the sub-pixel remainders of an EXACT tree, for weighing
     /// two rem abstractions. Per frame, the rows are grouped by every named
     /// field but `rem.x`/`rem.y` (the combination the rem would hang off),
@@ -2847,6 +2880,273 @@ fn main() -> Result<()> {
                 states_in[3]
             );
         }
+        Command::ArcProto { room, horizon, win_at, verify, max_nodes, marks, marks_level } => {
+            use celeste_rust::frame::{wins_of, Block};
+            use celeste_rust::interpreter::state::State;
+            use celeste_rust::search::arcs::{pieces, point, Action, Rect, Rects, Set};
+            use celeste_engine::runtime2::{Col, AV};
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            if let Some(xy) = &win_at {
+                std::env::set_var("CELESTE_WIN_AT_XY", xy);
+            }
+            let ids = celeste_rust::compiled::ids();
+            let t0 = std::time::Instant::now();
+            let mut eng = celeste_rust::trace::refengine::RefEngine::new()?;
+            let initial = eng.initial_state()?;
+            // The PLAYER's (x, y) cells of a table field (`rem`, `spd`) - the
+            // player instance only: `pos_graph::player_object` falls back to
+            // `player_spawn`, whose remainder is real state (the level-0 key
+            // keeps it), not the player's.
+            let vec_cells = |rt2: &celeste_engine::runtime2::Rt2, f: u32| -> Option<(usize, usize)> {
+                let obj = *rt2.player_objects(ids).first()?;
+                let c = rt2.obj_field_cell(obj, f)?;
+                let Col::U(AV::Ptr(sub)) = rt2.cols[c as usize] else { return None };
+                Some((rt2.obj_field_cell(sub, ids.f_x)? as usize, rt2.obj_field_cell(sub, ids.f_y)? as usize))
+            };
+            let raw_of = |rt2: &celeste_engine::runtime2::Rt2, c: usize| -> Result<i32> {
+                match rt2.cols[c].at(0) {
+                    AV::Num(n) => Ok(n.as_raw_u32() as i32),
+                    other => anyhow::bail!("arc-proto: a concrete number expected, got {other:?}"),
+                }
+            };
+            let rem_of = |st: &State| -> Result<Option<(i32, i32)>> {
+                let b = Block::from_state(st)?;
+                let Some((cx, cy)) = vec_cells(b.rt2(), ids.f_rem) else { return Ok(None) };
+                Ok(Some((raw_of(b.rt2(), cx)?, raw_of(b.rt2(), cy)?)))
+            };
+            let with_rem = |st: &State, rx: i32, ry: i32| -> Result<State> {
+                let b = Block::from_state(st)?;
+                let Some((cx, cy)) = vec_cells(b.rt2(), ids.f_rem) else { return Ok(st.clone()) };
+                let mut rt2 = b.into_rt2();
+                rt2.cols[cx] = Col::U(AV::Num(celeste_rust::pico8_num::Pico8Num::from_raw(rx)));
+                rt2.cols[cy] = Col::U(AV::Num(celeste_rust::pico8_num::Pico8Num::from_raw(ry)));
+                Ok(Block::from_rt2(rt2).to_state())
+            };
+            let key_of = |st: &State| -> Result<(u64, u64, u32)> {
+                let b = Block::from_state(st)?;
+                Ok((b.keys()[0].0, b.keys()[0].1, b.positions()?[0]))
+            };
+            #[derive(Clone)]
+            enum To {
+                Node(usize),
+                Win,
+            }
+            #[derive(Clone)]
+            struct E {
+                gx: Set,
+                gy: Set,
+                ax: Action,
+                ay: Action,
+                to: To,
+            }
+            struct Node {
+                state: State,
+                edges: Vec<E>,
+            }
+            let marks = match &marks {
+                Some(p) => Some((celeste_rust::frame::Visited::load(std::path::Path::new(p))?, celeste_rust::interpreter::abstraction::Level::parse(&marks_level).map_err(|e| anyhow::anyhow!(e))?)),
+                None => None,
+            };
+            let marked = |st: &State| -> Result<bool> {
+                let Some((m, l)) = &marks else { return Ok(true) };
+                let (shape, keys, cells) = celeste_rust::frame::widened_keys(&Block::from_state(st)?, *l)?;
+                Ok(m.contains(shape, keys[0], cells[0]))
+            };
+            let mut pruned = 0u64;
+            let start_rem = rem_of(&initial)?.unwrap_or((0, 0));
+            let mut nodes: Vec<Node> = vec![Node { state: with_rem(&initial, 0, 0)?, edges: Vec::new() }];
+            let mut layer_nodes: Vec<Vec<usize>> = vec![vec![0]];
+            let mut steps = 0u64;
+            let wrap = |r: i32| -> i32 { (r + 32768).rem_euclid(65536) - 32768 };
+            for t in 0..horizon {
+                let mut next: rustc_hash::FxHashMap<(u64, u64, u32), usize> = Default::default();
+                let mut next_list = Vec::new();
+                for &ni in &layer_nodes[t as usize].clone() {
+                    let st = nodes[ni].state.clone();
+                    let has_player = rem_of(&st)?.is_some();
+                    let inputs: Vec<u8> = if has_player { (0..64).collect() } else { vec![0] };
+                    let mut edges: Vec<E> = Vec::new();
+                    let mut seen: rustc_hash::FxHashSet<(Vec<u32>, String, usize)> = Default::default();
+                    for &b in &inputs {
+                        // The shift the frame APPLIES (not the stored speed: a freeze
+                        // applies none, an object may set the speed before the move):
+                        // three probes vote per axis on q - r.
+                        let (vx, vy) = if has_player {
+                            let mut votes: [rustc_hash::FxHashMap<i32, u32>; 2] = Default::default();
+                            for r in [-16384, 0, 16384] {
+                                let mut s0 = with_rem(&st, r, r)?;
+                                celeste_rust::concrete::set_concrete_buttons(&mut s0, b)?;
+                                for mut succ in eng.run_frame_concrete_all(&s0)? {
+                                    celeste_rust::concrete::restore_buttons(&initial, &mut succ)?;
+                                    steps += 1;
+                                    if let Some((qx, qy)) = rem_of(&succ)? {
+                                        *votes[0].entry(wrap(qx - r)).or_default() += 1;
+                                        *votes[1].entry(wrap(qy - r)).or_default() += 1;
+                                    }
+                                }
+                            }
+                            let pick = |m: &rustc_hash::FxHashMap<i32, u32>| m.iter().max_by_key(|(d, n)| (**n, -(d.abs()))).map(|(d, _)| *d).unwrap_or(0);
+                            (pick(&votes[0]), pick(&votes[1]))
+                        } else {
+                            (0, 0)
+                        };
+                        let (px, py) = if has_player { (pieces(vx), pieces(vy)) } else { (vec![Set::full()], vec![Set::full()]) };
+                        for gx in &px {
+                            for gy in &py {
+                                // The piece's two opposite corners classify it (an end alone
+                                // cannot: a constant 0 and a rotation by 0 agree at 0); with
+                                // --verify the middle and the other corners must agree.
+                                let ends = |g: &Set| -> [i32; 2] { [g.0[0].lo as i32 - 32768, g.0[0].hi as i32 - 1 - 32768] };
+                                let mid = |g: &Set| -> i32 { ((g.0[0].lo + g.0[0].hi) / 2) as i32 - 32768 };
+                                let (ex, ey) = (ends(gx), ends(gy));
+                                let mut probes: Vec<(i32, i32)> = vec![(ex[0], ey[0]), (ex[1], ey[1])];
+                                if verify {
+                                    probes.extend([(mid(gx), mid(gy)), (ex[0], ey[1]), (ex[1], ey[0])]);
+                                }
+                                // Per probe: target (None = win) -> (rem after, the zeroed state).
+                                type Leaves = std::collections::BTreeMap<Option<(u64, u64, u32)>, ((i32, i32), State)>;
+                                let mut outcomes: Vec<Leaves> = Vec::new();
+                                for &(rx, ry) in &probes {
+                                    let mut s0 = with_rem(&st, rx, ry)?;
+                                    celeste_rust::concrete::set_concrete_buttons(&mut s0, b)?;
+                                    let mut leaves = Leaves::new();
+                                    for mut succ in eng.run_frame_concrete_all(&s0)? {
+                                        celeste_rust::concrete::restore_buttons(&initial, &mut succ)?;
+                                        steps += 1;
+                                        let win = wins_of(Block::from_state(&succ)?.rt2())?[0];
+                                        let q = rem_of(&succ)?.unwrap_or((0, 0));
+                                        let zeroed = with_rem(&succ, 0, 0)?;
+                                        let key = if win { None } else { Some(key_of(&zeroed)?) };
+                                        leaves.insert(key, (q, zeroed));
+                                    }
+                                    outcomes.push(leaves);
+                                }
+                                // Every probe must reach the same targets (the piece acts as one).
+                                for (i, o) in outcomes.iter().enumerate().skip(1) {
+                                    if !o.keys().eq(outcomes[0].keys()) {
+                                        let pos = |st: &State| -> String {
+                                            let b = Block::from_state(st).ok();
+                                            b.map(|b| player_summary(b.rt2())).unwrap_or_default()
+                                        };
+                                        eprintln!("[arc] DEBUG node state: {}", pos(&st));
+                                        eprintln!("[arc] DEBUG applied shift ({vx}, {vy})");
+                                        for (j, (pr, oo)) in probes.iter().zip(&outcomes).enumerate() {
+                                            for (k, ((qx, qy), z)) in oo {
+                                                eprintln!("[arc] DEBUG probe {j} {pr:?}: target {:?} rem out ({qx}, {qy}) | {}", k.map(|k| k.2), pos(z));
+                                            }
+                                        }
+                                    }
+                                    anyhow::ensure!(
+                                        o.keys().eq(outcomes[0].keys()),
+                                        "arc-proto: node {ni} (layer {t}) input {b}: piece x {:?} y {:?} reaches other states at probe {:?} than at {:?}",
+                                        gx, gy, probes[i], probes[0]
+                                    );
+                                }
+                                // Per axis: a rotation by the speed if every probe rotates, else
+                                // a constant if every probe lands on one value.
+                                let classify = |axis: usize, v: i32, key: &Option<(u64, u64, u32)>| -> Result<Action> {
+                                    let qs: Vec<(i32, i32)> = probes.iter().zip(&outcomes).map(|(p, o)| {
+                                        let r = if axis == 0 { p.0 } else { p.1 };
+                                        let q = o[key].0;
+                                        (r, if axis == 0 { q.0 } else { q.1 })
+                                    }).collect();
+                                    if has_player && qs.iter().all(|&(r, q)| q == wrap(r + v)) {
+                                        Ok(Action::Rotate(v))
+                                    } else if qs.iter().all(|&(_, q)| q == qs[0].1) {
+                                        Ok(Action::Const(point(qs[0].1)))
+                                    } else {
+                                        anyhow::bail!("arc-proto: node {ni} (layer {t}) input {b} axis {axis}: neither a rotation by {v} nor a constant: {qs:?}")
+                                    }
+                                };
+                                let mut classified = Vec::new();
+                                for (key, (_, zeroed)) in &outcomes[0] {
+                                    classified.push((*key, classify(0, vx, key)?, classify(1, vy, key)?, zeroed.clone()));
+                                }
+                                for (key, ax, ay, zeroed) in classified {
+                                    if key.is_some() && !marked(&zeroed)? {
+                                        pruned += 1;
+                                        continue;
+                                    }
+                                    let to = match key {
+                                        None => To::Win,
+                                        Some(k) => {
+                                            let idx = *next.entry(k).or_insert_with(|| {
+                                                nodes.push(Node { state: zeroed.clone(), edges: Vec::new() });
+                                                next_list.push(nodes.len() - 1);
+                                                nodes.len() - 1
+                                            });
+                                            To::Node(idx)
+                                        }
+                                    };
+                                    let tag = (
+                                        vec![gx.0[0].lo, gy.0[0].lo],
+                                        format!("{ax:?}{ay:?}"),
+                                        match to { To::Win => usize::MAX, To::Node(i) => i },
+                                    );
+                                    if seen.insert(tag) {
+                                        edges.push(E { gx: gx.clone(), gy: gy.clone(), ax, ay, to });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    nodes[ni].edges = edges;
+                    anyhow::ensure!(nodes.len() <= max_nodes, "arc-proto: past --max-nodes {max_nodes} at layer {t}");
+                }
+                eprintln!("[arc] layer {:3}: {} nodes -> {} next, {} edges, {} successors pruned by the marks; {} steps, {:.1} s", t, layer_nodes[t as usize].len(), next_list.len(), layer_nodes[t as usize].iter().map(|&i| nodes[i].edges.len()).sum::<usize>(), pruned, steps, t0.elapsed().as_secs_f64());
+                layer_nodes.push(next_list);
+            }
+            // BACKWARD: W(node) = union over edges of guard ∩ preimage(W(target)); a win edge contributes its guard.
+            let mut w: Vec<Rects> = (0..nodes.len()).map(|_| Rects::empty()).collect();
+            for t in (0..horizon as usize).rev() {
+                for &ni in &layer_nodes[t] {
+                    let mut acc = Rects::empty();
+                    for e in &nodes[ni].edges {
+                        match e.to {
+                            To::Win => acc.add(Rect { x: e.gx.clone(), y: e.gy.clone() }),
+                            To::Node(j) => {
+                                for r in &w[j].0 {
+                                    acc.add(Rect { x: e.ax.preimage(&r.x).intersect(&e.gx), y: e.ay.preimage(&r.y).intersect(&e.gy) });
+                                }
+                            }
+                        }
+                    }
+                    w[ni] = acc;
+                }
+                let mut sizes: Vec<f64> = layer_nodes[t].iter().map(|&i| w[i].0.len() as f64).filter(|n| *n > 0.0).collect();
+                sizes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let q = |f: f64| if sizes.is_empty() { 0.0 } else { sizes[((sizes.len() - 1) as f64 * f) as usize] };
+                eprintln!("[arc] W layer {t:3}: {} of {} nodes can win; rectangles per winning node med {} p90 {} max {}", sizes.len(), layer_nodes[t].len(), q(0.5), q(0.9), q(1.0));
+            }
+            let (sx, sy) = (point(start_rem.0), point(start_rem.1));
+            println!("start remainder ({}, {}): in W(start) = {}", start_rem.0, start_rem.1, w[0].contains(sx, sy));
+            // FORWARD, exact, from the start's remainder: the earliest win.
+            let mut f: Vec<Rects> = (0..nodes.len()).map(|_| Rects::empty()).collect();
+            f[0].add(Rect { x: Set::point(sx), y: Set::point(sy) });
+            let mut earliest: Option<u32> = None;
+            for t in 0..horizon as usize {
+                for &ni in &layer_nodes[t] {
+                    let src = f[ni].clone();
+                    for e in &nodes[ni].edges {
+                        for r in &src.0 {
+                            let (x, y) = (r.x.intersect(&e.gx), r.y.intersect(&e.gy));
+                            if x.is_empty() || y.is_empty() {
+                                continue;
+                            }
+                            match e.to {
+                                To::Win => {
+                                    if earliest.is_none() {
+                                        earliest = Some(t as u32 + 1);
+                                    }
+                                }
+                                To::Node(j) => f[j].add(Rect { x: e.ax.image(&x), y: e.ay.image(&y) }),
+                            }
+                        }
+                    }
+                }
+            }
+            println!("exact forward from the start's remainder: earliest win {:?}; {} nodes, {} ref steps, {:.1} s", earliest, nodes.len(), steps, t0.elapsed().as_secs_f64());
+        }
         Command::RemCensus { level_dir, from, to, level } => {
             let level = match &level {
                 Some(sp) => Some(celeste_rust::interpreter::abstraction::Level::parse(sp).map_err(|e| anyhow::anyhow!(e))?),
@@ -2947,6 +3247,27 @@ fn main() -> Result<()> {
                     *e = (e.0.min(x), e.1.max(x), e.2.min(y), e.3.max(y));
                 }
                 let (mut wx, mut wy): (Vec<f64>, Vec<f64>) = hull.values().map(|h| ((h.1 - h.0) as f64 / 65536.0, (h.3 - h.2) as f64 / 65536.0)).unzip();
+                // The same per group on the CIRCLE: the remainder is taken
+                // mod 1 (a frame rotates it), so a group's remainders are
+                // covered by the shortest ARC - one minus the largest gap
+                // between neighbours, the gap across the wrap included.
+                let mut per: rustc_hash::FxHashMap<u64, (Vec<i32>, Vec<i32>)> = Default::default();
+                for &(g, x, y) in &rows {
+                    let e = per.entry(g).or_default();
+                    e.0.push(x);
+                    e.1.push(y);
+                }
+                let arc = |v: &mut Vec<i32>| -> f64 {
+                    v.sort_unstable();
+                    v.dedup();
+                    let mut gap = (v[0] as i64 + 65536 - *v.last().unwrap() as i64) as f64;
+                    for w in v.windows(2) {
+                        gap = gap.max((w[1] - w[0]) as f64);
+                    }
+                    (65536.0 - gap) / 65536.0
+                };
+                let (mut cx, mut cy): (Vec<f64>, Vec<f64>) = per.values_mut().map(|(xs, ys)| (arc(xs), arc(ys))).unzip();
+
                 // Bits(k) rows, and B's hull per (group, bucket).
                 let bucket = |r: i32, k: u32| -> i32 { (r + 32768) >> (16 - k) };
                 let mut counts = Vec::new();
@@ -2979,6 +3300,26 @@ fn main() -> Result<()> {
                 if level.is_some() {
                     println!("f{frame:03} ideal of the level, cumulative: {}", ideal.len());
                 }
+                // How many DISTINCT remainders there are: overall, and per
+                // group - a lattice small enough to carry as a set?
+                let mut all_x: rustc_hash::FxHashSet<i32> = Default::default();
+                let mut all_y: rustc_hash::FxHashSet<i32> = Default::default();
+                for &(_, x, y) in &rows {
+                    all_x.insert(x);
+                    all_y.insert(y);
+                }
+                let (mut nx, mut ny): (Vec<f64>, Vec<f64>) = per.values().map(|(xs, ys)| (xs.len() as f64, ys.len() as f64)).unzip();
+                println!(
+                    "f{frame:03} distinct remainders: x {} y {} over the frame; per group x {:.0}/{:.0}/{:.0} y {:.0}/{:.0}/{:.0} (med/p90/max)",
+                    all_x.len(), all_y.len(),
+                    q(&mut nx, 0.5), q(&mut nx, 0.9), q(&mut nx, 1.0),
+                    q(&mut ny, 0.5), q(&mut ny, 0.9), q(&mut ny, 1.0)
+                );
+                println!(
+                    "f{frame:03} A on the circle (shortest arc) px x: {:.3}/{:.3}/{:.3} y: {:.3}/{:.3}/{:.3}",
+                    q(&mut cx, 0.5), q(&mut cx, 0.9), q(&mut cx, 1.0),
+                    q(&mut cy, 0.5), q(&mut cy, 0.9), q(&mut cy, 1.0)
+                );
             }
         }
         Command::CoarseCensus { level_dir, from, to, erase } => {
