@@ -18,18 +18,29 @@
 //! it is occupied), so one recorded expansion per node serves every frame;
 //! a node is occupied no earlier than the layer it was first reached.
 
-use super::arcs::{Action, Rect, Rects, Set};
-use rustc_hash::FxHashMap;
+use super::arcs::{Action, Rect, Rects, Seg, Set};
+use rustc_hash::{FxHashMap, FxHashSet};
 
-/// One axis of an edge: the remainders that take it and what it does to them.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// One axis of an edge: the remainders that take it (one piece of the
+/// circle: a guard never wraps - the pieces are cut at the wrap) and what it
+/// does to them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Transfer {
-    pub guard: Set,
+    pub guard: Seg,
     pub action: Action,
 }
 
+impl Transfer {
+    pub fn guard_set(&self) -> Set {
+        Set::seg(self.guard.lo, self.guard.hi)
+    }
+    pub fn takes(&self, p: u32) -> bool {
+        self.guard.lo <= p && p < self.guard.hi
+    }
+}
+
 /// An edge of the graph: `src` -> `dst`, its x and y transfers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Edge {
     pub src: u64,
     pub dst: u64,
@@ -37,25 +48,62 @@ pub struct Edge {
     pub y: Transfer,
 }
 
-/// The graph, indexed both ways, with each node's first layer.
+/// The graph: its edges in two sorted orders, each node's first layer, the
+/// wins, and optionally each node's DEADLINE (the last frame it can still
+/// win from - the remainder-free backward's; past it W is empty).
 pub struct Graph {
-    pub by_dst: FxHashMap<u64, Vec<usize>>,
-    pub by_src: FxHashMap<u64, Vec<usize>>,
     pub edges: Vec<Edge>,
-    /// The frame a node is first reached: it cannot be occupied earlier.
-    pub layer: FxHashMap<u64, u32>,
-    /// Nodes that win as soon as they are occupied.
-    pub wins: Vec<u64>,
+    by_dst: Vec<u32>,
+    dst_at: FxHashMap<u64, (u32, u32)>,
+    by_src: Vec<u32>,
+    src_at: FxHashMap<u64, (u32, u32)>,
+    layer: Box<dyn Fn(u64) -> u32 + Sync>,
+    pub wins: FxHashSet<u64>,
+    deadline: Option<FxHashMap<u64, u16>>,
+}
+
+fn ranges(order: &[u32], key: impl Fn(u32) -> u64) -> FxHashMap<u64, (u32, u32)> {
+    let mut m: FxHashMap<u64, (u32, u32)> = FxHashMap::default();
+    let mut i = 0usize;
+    while i < order.len() {
+        let k = key(order[i]);
+        let mut j = i;
+        while j < order.len() && key(order[j]) == k {
+            j += 1;
+        }
+        m.insert(k, (i as u32, j as u32));
+        i = j;
+    }
+    m
 }
 
 impl Graph {
-    pub fn new(edges: Vec<Edge>, layer: FxHashMap<u64, u32>, wins: Vec<u64>) -> Self {
-        let (mut by_dst, mut by_src): (FxHashMap<u64, Vec<usize>>, FxHashMap<u64, Vec<usize>>) = Default::default();
-        for (i, e) in edges.iter().enumerate() {
-            by_dst.entry(e.dst).or_default().push(i);
-            by_src.entry(e.src).or_default().push(i);
-        }
-        Graph { by_dst, by_src, edges, layer, wins }
+    pub fn new(edges: Vec<Edge>, layer: Box<dyn Fn(u64) -> u32 + Sync>, wins: impl IntoIterator<Item = u64>, deadline: Option<FxHashMap<u64, u16>>) -> Self {
+        let mut by_dst: Vec<u32> = (0..edges.len() as u32).collect();
+        by_dst.sort_unstable_by_key(|&i| edges[i as usize].dst);
+        let mut by_src: Vec<u32> = (0..edges.len() as u32).collect();
+        by_src.sort_unstable_by_key(|&i| edges[i as usize].src);
+        let dst_at = ranges(&by_dst, |i| edges[i as usize].dst);
+        let src_at = ranges(&by_src, |i| edges[i as usize].src);
+        Graph { edges, by_dst, dst_at, by_src, src_at, layer, wins: wins.into_iter().collect(), deadline }
+    }
+    fn into(&self, n: u64) -> impl Iterator<Item = &Edge> {
+        let (a, b) = self.dst_at.get(&n).copied().unwrap_or((0, 0));
+        self.by_dst[a as usize..b as usize].iter().map(move |&i| &self.edges[i as usize])
+    }
+    fn out_of(&self, n: u64) -> impl Iterator<Item = &Edge> {
+        let (a, b) = self.src_at.get(&n).copied().unwrap_or((0, 0));
+        self.by_src[a as usize..b as usize].iter().map(move |&i| &self.edges[i as usize])
+    }
+    /// Can `n` be occupied at `t`, and still win from there?
+    fn live(&self, n: u64, t: u32) -> bool {
+        (self.layer)(n) <= t && self.deadline.as_ref().is_none_or(|d| d.get(&n).is_some_and(|&dl| t <= dl as u32))
+    }
+    pub fn layer_of(&self, n: u64) -> u32 {
+        (self.layer)(n)
+    }
+    pub fn sources(&self) -> impl Iterator<Item = u64> + '_ {
+        self.src_at.keys().copied()
     }
 }
 
@@ -79,13 +127,12 @@ impl Winning {
 /// BACKWARD: `W_t` for `t = horizon` down to 0. At `horizon` only the win
 /// nodes (occupied then, they win by it); below, a win node is the whole
 /// torus again and every other node collects its out-edges' contributions.
-/// Only a node occupiable at `t` (`layer <= t`) is given a set.
+/// Only a node live at `t` (occupiable, within its deadline) gets a set.
 pub fn backward(g: &Graph, horizon: u32) -> Winning {
-    let occupiable = |n: u64, t: u32| g.layer.get(&n).is_some_and(|&l| l <= t);
     let mut w: Vec<FxHashMap<u64, Rects>> = (0..=horizon).map(|_| FxHashMap::default()).collect();
     let seed = |m: &mut FxHashMap<u64, Rects>, t: u32| {
         for &n in &g.wins {
-            if occupiable(n, t) {
+            if (g.layer)(n) <= t {
                 let mut r = Rects::empty();
                 r.add(whole());
                 m.insert(n, r);
@@ -97,20 +144,15 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
         let (lo, hi) = w.split_at_mut(t as usize + 1);
         let (cur, next) = (&mut lo[t as usize], &hi[0]);
         seed(cur, t);
-        // Every node with a non-empty set at t + 1 pulls its in-edges' sources.
         for (&dst, set) in next.iter() {
-            let Some(ins) = g.by_dst.get(&dst) else { continue };
-            for &i in ins {
-                let e = &g.edges[i];
-                if !occupiable(e.src, t) || g.wins.contains(&e.src) {
+            for e in g.into(dst) {
+                if g.wins.contains(&e.src) || !g.live(e.src, t) {
                     continue;
                 }
+                let (gx, gy) = (e.x.guard_set(), e.y.guard_set());
                 let acc = cur.entry(e.src).or_default();
                 for r in &set.0 {
-                    acc.add(Rect {
-                        x: e.x.action.preimage(&r.x).intersect(&e.x.guard),
-                        y: e.y.action.preimage(&r.y).intersect(&e.y.guard),
-                    });
+                    acc.add(Rect { x: e.x.action.preimage(&r.x).intersect(&gx), y: e.y.action.preimage(&r.y).intersect(&gy) });
                 }
             }
         }
@@ -128,28 +170,24 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
 /// (shifted), a collision's constant carries none. Two axes are partitioned
 /// separately (the product partition).
 pub fn partition(g: &Graph, horizon: u32) -> Vec<FxHashMap<u64, (Vec<u32>, Vec<u32>)>> {
-    let occupiable = |n: u64, t: u32| g.layer.get(&n).is_some_and(|&l| l <= t);
     let mut out: Vec<FxHashMap<u64, (Vec<u32>, Vec<u32>)>> = (0..=horizon).map(|_| FxHashMap::default()).collect();
     for t in (0..horizon).rev() {
         let (lo, hi) = out.split_at_mut(t as usize + 1);
         let (cur, next) = (&mut lo[t as usize], &hi[0]);
-        for (&src, outs) in &g.by_src {
-            if !occupiable(src, t) {
+        for src in g.sources().collect::<Vec<_>>() {
+            if g.layer_of(src) > t {
                 continue;
             }
             let (mut xs, mut ys): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
-            for &i in outs {
-                let e = &g.edges[i];
+            for e in g.out_of(src) {
                 let cuts = |tr: &Transfer, succ: &[u32], acc: &mut Vec<u32>| {
-                    for seg in &tr.guard.0 {
-                        if seg.lo != 0 {
-                            acc.push(seg.lo);
-                        }
+                    if tr.guard.lo != 0 {
+                        acc.push(tr.guard.lo);
                     }
                     if let Action::Rotate(v) = tr.action {
                         for &c in succ {
                             let back = apply(Action::Rotate(-v), c);
-                            if tr.guard.contains(back) {
+                            if tr.takes(back) {
                                 acc.push(back);
                             }
                         }
@@ -206,10 +244,8 @@ pub fn forward(g: &Graph, w: &Winning, start: u64, point: (u32, u32), horizon: u
         }
         let mut next = Points::default();
         for &(n, p) in frames[t as usize].keys() {
-            let Some(outs) = g.by_src.get(&n) else { continue };
-            for &i in outs {
-                let e = &g.edges[i];
-                if !(e.x.guard.contains(p.0) && e.y.guard.contains(p.1)) {
+            for e in g.out_of(n) {
+                if !(e.x.takes(p.0) && e.y.takes(p.1)) {
                     continue;
                 }
                 let q = (apply(e.x.action, p.0), apply(e.y.action, p.1));
@@ -254,14 +290,13 @@ mod tests {
     fn corridor() -> Graph {
         let v = 39322; // 0.6 px
         let p = pieces(v);
-        let both = |g: &Set| Transfer { guard: g.clone(), action: Action::Rotate(v) };
-        let still = Transfer { guard: Set::full(), action: Action::Rotate(0) };
+        let both = |g: &Set| Transfer { guard: g.0[0], action: Action::Rotate(v) };
+        let still = Transfer { guard: Seg { lo: 0, hi: 1 << 16 }, action: Action::Rotate(0) };
         let edges = vec![
-            Edge { src: 0, dst: 0, x: both(&p[0]), y: still.clone() },
+            Edge { src: 0, dst: 0, x: both(&p[0]), y: still },
             Edge { src: 0, dst: 1, x: both(&p[1]), y: still },
         ];
-        let layer: FxHashMap<u64, u32> = [(0, 0), (1, 1)].into_iter().collect();
-        Graph::new(edges, layer, vec![1])
+        Graph::new(edges, Box::new(|n| n as u32), [1], None)
     }
 
     #[test]

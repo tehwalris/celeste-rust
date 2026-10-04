@@ -385,6 +385,11 @@ enum Command {
         /// Also the goal-free partition (cut points per node and frame).
         #[arg(long)]
         partition: bool,
+        /// Load only the edges between nodes the remainder-free backward
+        /// marks (and give a node a set only up to its deadline): every other
+        /// node cannot win by the horizon with any remainder.
+        #[arg(long)]
+        marked_only: bool,
     },
     /// PROTOTYPE (branch arc-sets): the ROTATION GRAPH. Nodes are the
     /// game's states with the remainders erased, time-expanded from the room's
@@ -3120,8 +3125,8 @@ fn main() -> Result<()> {
                 states_in[3]
             );
         }
-        Command::ArcSearch { level_dir, horizon, room, win_at, partition } => {
-            use celeste_rust::frame::{frame_files_seq, pack_id, wins_of};
+        Command::ArcSearch { level_dir, horizon, room, win_at, partition, marked_only } => {
+            use celeste_rust::frame::{frame_files_seq, pack_id};
             use celeste_rust::search::{arc_dp, arc_edges, arcs};
             std::env::set_var("CELESTE_START_ROOM", &room);
             if let Some(xy) = &win_at {
@@ -3129,45 +3134,55 @@ fn main() -> Result<()> {
             }
             let dir = std::path::Path::new(&level_dir);
             let t0 = std::time::Instant::now();
-            // Nodes: every stored row of frames 0..=horizon; the wins among them.
-            let mut layer: rustc_hash::FxHashMap<u64, u32> = Default::default();
+            // The wins (the checkpoint headers' win rows) and the start.
             let mut wins: Vec<u64> = Vec::new();
             let mut start: Option<u64> = None;
             for f in 0..=horizon {
                 for (seq, file) in frame_files_seq(dir, f)? {
-                    let Some(rt2) = file.load_all()? else { continue };
-                    let w = wins_of(&rt2)?;
-                    for (r, won) in w.into_iter().enumerate() {
-                        let id = pack_id(f, seq, r as u32);
-                        layer.insert(id, f);
-                        if won {
-                            wins.push(id);
-                        }
-                        if f == 0 {
-                            start = Some(id);
-                        }
+                    if f == 0 {
+                        start = Some(pack_id(0, seq, 0));
+                    } else {
+                        wins.extend(file.win_rows().iter().map(|&(row, _)| pack_id(f, seq, row)));
                     }
                 }
             }
             let start = start.ok_or_else(|| anyhow::anyhow!("no frame-0 row"))?;
+            // The remainder-free backward's marks and deadlines (`--marked-only`).
+            let deadline: Option<rustc_hash::FxHashMap<u64, u16>> = if marked_only {
+                let eg = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
+                let (marks, _) = celeste_rust::search::edges::bfs(&eg, horizon, wins.iter().copied());
+                Some(marks.with_deadlines().into_iter().collect())
+            } else {
+                None
+            };
+            let keep = |id: u64| deadline.as_ref().is_none_or(|d| d.contains_key(&id) || wins.contains(&id));
             // Edges: the arc records of frames 1..=horizon, one per predecessor bit.
-            let conv = |t: &arc_edges::Transfer| arc_dp::Transfer { guard: t.guard.clone(), action: t.action };
+            let conv = |t: &arc_edges::Transfer| -> Result<arc_dp::Transfer> {
+                anyhow::ensure!(t.guard.0.len() == 1, "a guard of {} segments", t.guard.0.len());
+                Ok(arc_dp::Transfer { guard: t.guard.0[0], action: t.action })
+            };
             let mut edges = Vec::new();
             let edges_dir = dir.join("edges");
             for f in 1..=horizon {
                 for e in arc_edges::read_frame(&edges_dir, f)? {
+                    if !keep(e.target) {
+                        continue;
+                    }
+                    let (x, y) = (conv(&e.x)?, conv(&e.y)?);
                     let mut m = e.mask;
                     while m != 0 {
                         let i = m.trailing_zeros() as u64;
                         m &= m - 1;
-                        edges.push(arc_dp::Edge { src: e.base + i, dst: e.target, x: conv(&e.x), y: conv(&e.y) });
+                        if keep(e.base + i) {
+                            edges.push(arc_dp::Edge { src: e.base + i, dst: e.target, x, y });
+                        }
                     }
                 }
             }
-            let n_nodes = layer.len();
             let n_edges = edges.len();
-            let g = arc_dp::Graph::new(edges, layer, wins.clone());
-            eprintln!("[arc] {} nodes, {} edges, {} win rows; loaded in {:.1} s", n_nodes, n_edges, wins.len(), t0.elapsed().as_secs_f64());
+            let n_marked = deadline.as_ref().map(|d| d.len());
+            let g = arc_dp::Graph::new(edges, Box::new(celeste_rust::frame::id_layer), wins.iter().copied(), deadline);
+            eprintln!("[arc] {} edges, {} win rows, marked nodes {:?}; loaded in {:.1} s", n_edges, wins.len(), n_marked, t0.elapsed().as_secs_f64());
             let tb = std::time::Instant::now();
             let w = arc_dp::backward(&g, horizon);
             let tb = tb.elapsed().as_secs_f64();
@@ -3308,18 +3323,22 @@ fn main() -> Result<()> {
                 }
             }
             layer.insert(WIN, 0);
+            let seg = |s: &celeste_rust::search::arcs::Set| -> Result<celeste_rust::search::arcs::Seg> {
+                anyhow::ensure!(s.0.len() == 1, "a guard of {} segments", s.0.len());
+                Ok(s.0[0])
+            };
             let mut edges = Vec::new();
             for (ni, node) in nodes.iter().enumerate() {
                 for (e, to) in &node.edges {
                     edges.push(arc_dp::Edge {
                         src: ni as u64,
                         dst: match to { To::Win => WIN, To::Node(j) => *j as u64 },
-                        x: arc_dp::Transfer { guard: e.gx.clone(), action: e.ax },
-                        y: arc_dp::Transfer { guard: e.gy.clone(), action: e.ay },
+                        x: arc_dp::Transfer { guard: seg(&e.gx)?, action: e.ax },
+                        y: arc_dp::Transfer { guard: seg(&e.gy)?, action: e.ay },
                     });
                 }
             }
-            let g = arc_dp::Graph::new(edges, layer, vec![WIN]);
+            let g = arc_dp::Graph::new(edges, Box::new(move |n| layer.get(&n).copied().unwrap_or(u32::MAX)), [WIN], None);
             let tw = std::time::Instant::now();
             let w = arc_dp::backward(&g, horizon);
             for t in (0..horizon).rev() {
