@@ -1081,8 +1081,21 @@ impl CostToGo {
 }
 
 /// Build the level -1 table of the configured start room at player speed bound
-/// `spd_px` (its report goes to stderr as it is built).
+/// `spd_px` (its report goes to stderr as it is built), or read it from the
+/// table cache (`cache_file`) when this binary built it before for the same
+/// inputs.
 pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo> {
+    let cache = cache_file(root, spd_px)?;
+    if let Some((path, _)) = &cache {
+        match CostToGo::load(path) {
+            Ok(Some(t)) => {
+                eprintln!("[level -1] table read from {} ({} entries)", path.display(), t.d.len());
+                return Ok(t);
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("[level -1] the cached table {} is unreadable ({e:#}): building it", path.display()),
+        }
+    }
     let mut rep = String::new();
     let b = build(root, spd_px, threads, &mut rep)?;
     let mut d = HashMap::new();
@@ -1093,7 +1106,124 @@ pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo
             }
         }
     }
-    Ok(CostToGo { d, start_d: b.start_d })
+    let t = CostToGo { d, start_d: b.start_d };
+    if let Some((path, key)) = &cache {
+        match t.save(path, key) {
+            Ok(()) => eprintln!("[level -1] table cached at {}", path.display()),
+            Err(e) => eprintln!("[level -1] could not cache the table at {} ({e:#})", path.display()),
+        }
+    }
+    Ok(t)
+}
+
+/// The table cache's format; bump it when what a file holds changes.
+const CACHE_FORMAT: u32 = 1;
+
+/// Where the table for these inputs is cached, and the key's description:
+/// `CELESTE_L1_CACHE` (a directory, default `/var/tmp/celeste-l1-cache`; `off`
+/// to always build). The table is a function of the code (this binary's own
+/// bytes), the cart (the traced Lua as `trace::cart::sources_in` assembles it,
+/// start room and `CELESTE_SPLIT_FRAME` included, and the map/flag data), the
+/// speed bound, and the knobs the tracer reads - every `CELESTE_*` variable
+/// but the ones that cannot change it, so an unknown knob costs a rebuild,
+/// never a wrong table.
+fn cache_file(root: &FsPath, spd_px: i32) -> Result<Option<(PathBuf, String)>> {
+    use std::hash::{Hash, Hasher};
+    let dir = match std::env::var("CELESTE_L1_CACHE") {
+        Ok(s) if s == "off" => return Ok(None),
+        Ok(s) => PathBuf::from(s),
+        Err(_) => PathBuf::from("/var/tmp/celeste-l1-cache"),
+    };
+    let exe = std::env::current_exe()?;
+    let exe_bytes = std::fs::read(&exe).map_err(|e| anyhow!("reading this binary {}: {e}", exe.display()))?;
+    let lua = super::cart::sources_in(root)?;
+    let mut cart: Vec<(String, Vec<u8>)> = Vec::new();
+    for e in std::fs::read_dir(root.join("cart"))? {
+        let e = e?;
+        if e.file_type()?.is_file() {
+            cart.push((e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path())?));
+        }
+    }
+    cart.sort();
+    const IRRELEVANT: [&str; 3] = ["CELESTE_THREADS", "CELESTE_LEVEL_MINUS_ONE", "CELESTE_L1_CACHE"];
+    let mut env: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k.starts_with("CELESTE_") && !IRRELEVANT.contains(&k.as_str())).collect();
+    env.sort();
+    let room = celeste_interp::game_runner::start_room();
+    // Two 64-bit SipHashes under different prefixes: a 128-bit name.
+    let half = |salt: u8| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (salt, CACHE_FORMAT, &exe_bytes, &lua, &cart, &env, room, spd_px).hash(&mut h);
+        h.finish()
+    };
+    let name = format!("{:016x}{:016x}", half(1), half(2));
+    let key = format!(
+        "level -1 table cache, format {CACHE_FORMAT}\nroom {room:?}, S = {spd_px}\nbinary {} ({} bytes)\nenv {env:?}\ncart files {:?}\n",
+        exe.display(),
+        exe_bytes.len(),
+        cart.iter().map(|c| &c.0).collect::<Vec<_>>()
+    );
+    Ok(Some((dir.join(format!("room{}_{}_s{spd_px}_{name}.bin", room.0, room.1)), key)))
+}
+
+impl CostToGo {
+    /// The cached table at `path`, `None` when there is none.
+    fn load(path: &FsPath) -> Result<Option<CostToGo>> {
+        let b = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Result<&[u8]> {
+            let s = b.get(at..at + n).ok_or_else(|| anyhow!("truncated"))?;
+            at += n;
+            Ok(s)
+        };
+        ensure!(take(4)? == b"CL1T", "not a level -1 table");
+        let u32_of = |s: &[u8]| u32::from_le_bytes(s.try_into().unwrap());
+        let u64_of = |s: &[u8]| u64::from_le_bytes(s.try_into().unwrap());
+        ensure!(u32_of(take(4)?) == CACHE_FORMAT, "another format");
+        let start_d = u32_of(take(4)?);
+        let n = u64_of(take(8)?) as usize;
+        let mut d = HashMap::with_capacity(n);
+        for _ in 0..n {
+            let e = take(16)?;
+            let (h, x, y, v) = (u64_of(&e[0..8]), i16::from_le_bytes([e[8], e[9]]), i16::from_le_bytes([e[10], e[11]]), u32_of(&e[12..16]));
+            d.insert((h, x, y), v);
+        }
+        let fp = u64_of(take(8)?);
+        ensure!(at == b.len(), "trailing bytes");
+        let t = CostToGo { d, start_d };
+        ensure!(t.fingerprint() == fp, "the fingerprint does not match the entries");
+        Ok(Some(t))
+    }
+
+    /// Write the table to `path` (atomically: a reader sees all of it or
+    /// none), with `key` beside it as text.
+    fn save(&self, path: &FsPath, key: &str) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut es: Vec<(&(u64, i16, i16), &u32)> = self.d.iter().collect();
+        es.sort_unstable();
+        let mut b: Vec<u8> = Vec::with_capacity(28 + 16 * es.len());
+        b.extend(b"CL1T");
+        b.extend(CACHE_FORMAT.to_le_bytes());
+        b.extend(self.start_d.to_le_bytes());
+        b.extend((es.len() as u64).to_le_bytes());
+        for ((h, x, y), v) in es {
+            b.extend(h.to_le_bytes());
+            b.extend(x.to_le_bytes());
+            b.extend(y.to_le_bytes());
+            b.extend(v.to_le_bytes());
+        }
+        b.extend(self.fingerprint().to_le_bytes());
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, &b)?;
+        std::fs::rename(&tmp, path)?;
+        std::fs::write(path.with_extension("txt"), key)?;
+        Ok(())
+    }
 }
 
 /// A node `(shape, x, y)` as one word: the key of every map the passes keep.
