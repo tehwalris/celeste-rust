@@ -1,0 +1,22 @@
+# Room (5,0) "600 m": exit at frame 77 for celeste-minimal, found by the
+# search (2026-10-04). Exits on a real PICO-8 with TAS6's balloon seed
+# 0.636 (and every seed 0.6 .. 0.9 of a 0.05 grid); NOT with 0 .. 0.55,
+# 0.95, or PICO-8's own rnd: the second dash (f56) needs the balloon's
+# refill, and the balloon is in reach only at those phases (seed 0: no
+# refill, the dash press at f56 does nothing).
+#   pico8_diff/replay.py --room 5,0 --balloon-seeds 0.636 tas/room_5_0_exit_frame_77.txt
+#
+# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 5,0, one
+# per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
+# bit4=jump bit5=dash.
+#
+# Search (binary with the interval-overflow fixes 549ecf5 / b47b118): ladder
+# r0sxhn .. r4sxhn, r4sxh .. r15sxh, rxsx (balloon abstract through rem
+# Bits(4)), no level -1 filter (its table refused the balloon's interval y),
+# `rewrite search --room 5,0 --ceiling 77`. h77: first wins 73, 74, 75, 76,
+# 76, 76, then 77 from level 6 to Exact; h76 refuted at level 6 (r5sxh).
+# `OPTIMAL win frame: 77`, 4:37 wall, 10.9 GB peak. Witness: `rewrite witness
+# --horizon 77 --level 17 --spec rxsx`, 921 Exact marks, 270 concrete steps,
+# 0 dead ends. TIES the community TAS6 (29 + 48 = 77,
+# tas/room_5_0_reference_frame_77.txt).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,34,0,0,0,0,0,0,16,0,0,0,0,0,0,38,0,0,0,0,0,0,0,0,0,0,38,0,0,0,0,0,0,0,0,16,0,0,0,0,16,0,0,16,0,0,16,0

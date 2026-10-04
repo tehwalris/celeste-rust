@@ -1,3 +1,5 @@
+> STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
+
 # Rooms (1,0), (2,0), (3,0), 2026-09-17 (release, 32 threads)
 
 Held ladder `CELESTE_LADDER="r0sxh,r1sxh,...,r15sxh,rxsx"` throughout.
@@ -4979,6 +4981,10 @@ result (and the old witness at 100, positions/spd/rem identical to ours).
 `tas/room_1_0_exit_frame_99.txt`. The frame comes from a dash pressed on
 frame 24, the frame the player object is created and - under PICO-8's
 `all()` - first updated; the 2022 model started inputs on frame 25.
+(Corrected 2026-10-04: this is NOT a better route. The 2022 searcher's win
+at 0-based control frame 75 is 76 player updates, as is our 99 (23 + 76)
+and TAS2; the "100" file is the same route with an idle update on frame 24,
+plans/results.md. A tie, from a prologue-count difference.)
 
 Found on the way: the Exact kernel set widens nothing (`WalkOpts::EXACT`),
 so its rows carry live timers and `widened_keys(_, Exact)` must not pin

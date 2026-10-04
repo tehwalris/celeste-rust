@@ -179,7 +179,7 @@ cp /tmp/room00_search.log /var/tmp/celeste-ui/room00.log
 A forward on its own exports with `--forward-only` (one partial horizon,
 no backward). With `--arc DIR` it becomes a two-level run: `DIR` is what
 `rewrite arc-search --marked-only --save-marks DIR [--witness]` wrote over
-the same tree (plans/arcs.md) - level 0 gets the remainder-free backward's
+the same tree (plans/architecture.md "Arcs") - level 0 gets the remainder-free backward's
 marks, and level 1 is the remainder-exact ARC backward over level 0's
 forward (`forward_of: 0` in `run.json`: no forward pass of its own; a node
 is marked when its winning set W_t is non-empty at some frame t, drawn at
