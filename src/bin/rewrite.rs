@@ -76,8 +76,7 @@ enum Command {
         /// Last frame to compute.
         #[arg(long)]
         to: u32,
-        /// A full level spec (`Level::parse`, e.g. `r0s18`: rem rung 0,
-        /// speed buckets of the edge table at a 4 px grid), instead of `k`.
+        /// A full level spec (`Level::parse`, e.g. `r0sxn`), instead of `k`.
         #[arg(long, value_parser = Level::parse)]
         level: Option<Level>,
         /// Rem precision: bits 0..=15, or >=16 for Exact.

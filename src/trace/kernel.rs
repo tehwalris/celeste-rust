@@ -523,8 +523,7 @@ pub fn room_constant_lattice(
 
     let src = cart::sources_in(root)?;
     // The ASTs outlive the walk: the tracer is kept (`LatticeWalk::tracer`)
-    // to re-trace a shape under a speed bucket on demand (the bucket
-    // dispatch), and `Interp` borrows what it ran.
+    // to re-trace a shape on demand, and `Interp` borrows what it ran.
     let leak = |a: full_moon::ast::Ast| -> &'static full_moon::ast::Ast { Box::leak(Box::new(a)) };
     let top = leak(full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?);
     cart::check_absent_fields(top)?;
@@ -909,8 +908,7 @@ pub fn room_constant_lattice(
 
 /// `ival_paths` plus a shape's discovered interval slots (`LatticeWalk::
 /// ival_extra`), each once.
-/// The interval inputs the BOUNDARY widens (the player's `rem`, a speed or
-/// position bucket): only where the set types intervals at all (`opts.ival`;
+/// The interval inputs the BOUNDARY widens (the player's `rem`): only where the set types intervals at all (`opts.ival`;
 /// not the exact set). The `rnd`-derived ones (`ival_extra`) come on top at
 /// EVERY level, the exact one included: `rnd` is an interval there too, and
 /// room (5,0)'s balloon phase is one from `_init` on (2026-09-21).
@@ -1135,25 +1133,8 @@ pub struct Tracer {
 // The raw pointers inside (`Interp::body_ids`' function-body keys and the
 // AST references) all point into the `'static` ASTs `room_constant_lattice`
 // leaks - immutable and never freed - so a copy of the tracer can move to a
-// key fixpoint worker (the same argument as `RefEngine`'s).
+// lattice walk worker (the same argument as `RefEngine`'s).
 unsafe impl Send for Tracer {}
-
-/// The parts of a lattice walk a key trace reads (`key_frame`), shared
-/// read-only by the key fixpoint's workers, each tracing in its own copy of
-/// the walk's `Tracer`.
-pub struct WalkView<'a> {
-    pub by_hash: &'a std::collections::HashMap<u64, String>,
-    pub reps: &'a std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic>>,
-    pub lattice: &'a std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,
-    pub ival_extra: &'a std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>>,
-    pub opts: super::shapes::WalkOpts,
-}
-
-impl LatticeWalk {
-    pub fn view(&self) -> WalkView<'_> {
-        WalkView { by_hash: &self.by_hash, reps: &self.reps, lattice: &self.lattice, ival_extra: &self.ival_extra, opts: self.opts }
-    }
-}
 
 /// The output of `room_constant_lattice`.
 pub struct LatticeWalk {

@@ -1150,8 +1150,7 @@ pub(crate) fn rem_bucket_node(
 }
 
 /// Apply every level-0 boundary widening to `st`, in the boundary's order.
-/// `player.dash_effect_time` := max(0, it) - `apply_conservative_widenings`'
-/// clamp (the field decrements forever and is only read `> 0`, so every
+/// `player.dash_effect_time` := max(0, it) - a clamp (the field decrements forever and is only read `> 0`, so every
 /// value <= 0 is behaviorally identical). Rung-independent.
 fn widen_dash(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     let zero = P8::from_i16(0);
@@ -1169,8 +1168,7 @@ fn widen_dash(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
 
 /// A live fruit's `off` := [0, 39] and `y` := start +- 2.5, TOGETHER -
 /// one without the other is a row no interpreter level has.
-/// `make_state_abstract_rem` applies this at EVERY non-exact rung, so it
-/// is rung-independent.
+/// Applied at EVERY non-exact rung, so it is rung-independent.
 fn widen_fruit(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
     let amplitude = P8::from_parts(2, 0x8000);
     for obj in objects_of_type(st, "fruit") {
@@ -1216,7 +1214,7 @@ fn widen_fruit(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors
 }
 
 /// The timer globals (`frames`/`seconds`/`minutes`/`deaths`) pinned to
-/// zero - `apply_conservative_widenings`' gameplay-dead pins - and with
+/// zero - gameplay-dead pins - and with
 /// them each key's `frames`-derived `spr` (to its tile, 8) and `flip.x` (to
 /// false): the key's update derives both from `frames` and nothing but its
 /// own update and drawing reads them, so pinning `frames` alone left exact
@@ -1294,7 +1292,7 @@ mod tests {
     /// `rem_bucket_node`, on an EXACT rem value (no fork), snaps every
     /// representable rem in [-0.5, 0.5) to exactly `rem_bucket`, at every
     /// rung. This is the "widened the same" half of the A-vs-B gate at
-    /// the value level: the graph's snap == `make_state_abstract_rem`'s.
+    /// the value level: the graph's snap == the boundary's (`Rt2::widen_to`).
     #[test]
     fn rem_bucket_node_matches_rem_bucket_exact() {
         for bits in 1..=15u8 {
@@ -1325,7 +1323,7 @@ mod tests {
     }
 
     /// The snap is a FIXED POINT: re-snapping a value already at a bucket
-    /// edge (the low end, which is what `make_state_abstract_rem` would
+    /// edge (the low end, which is what the next frame's boundary would
     /// re-read) lands on the same bucket. The assert-noop property at the
     /// value level - catches UNDER-widening (a bucket that a second
     /// widening would move).

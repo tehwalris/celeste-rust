@@ -17,7 +17,7 @@ pub(crate) enum TracedMode {
     /// the graph, accumulators go through `Rt2::boundary`. Valid ONLY at
     /// rem Bits(0).
     Level0,
-    /// The ladder set (`WalkOpts::LADDER_WIDEN`): the rem rung's widening
+    /// The ladder set (`WalkOpts::ladder_widen`): the rem rung's widening
     /// in the graph, rows through `Rt2::boundary_exact`. Serves rem
     /// Bits(1..=15).
     Level0Agnostic,

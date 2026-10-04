@@ -86,7 +86,7 @@ pub(crate) fn seed_cells(g: &Graph, ranges: &HashMap<u32, (i32, i32)>) -> HashMa
 }
 
 /// `fold` with input cells `ranges` known to lie in a range (raw,
-/// inclusive) - a body specialized on its speed bucket (2026-09-15). The
+/// inclusive) - a region kernel's input ranges (`CELESTE_REGION`). The
 /// evaluator sees the range instead of top, so a comparison or a table
 /// fork's validity the range decides folds to a constant.
 pub fn fold_with(

@@ -89,10 +89,9 @@ pub fn cell_xy(cell: u32) -> Option<(i32, i32)> {
 }
 
 /// A numeric column's whole parts, one per lane, or `None` if any lane is
-/// not a number or an interval (a pointer, nil). An INTERVAL is a position
-/// bucket (the rung below level 0, `abstraction::PosPrecision`) and its
-/// cell is the bucket's low corner - the one rule every reader of a
-/// position shares (`block_cells`, the kernel's `pos_sources`).
+/// not a number or an interval (a pointer, nil). An INTERVAL's cell is its
+/// low corner - the one rule every reader of a position shares
+/// (`block_cells`, the kernel's `pos_sources`).
 pub(crate) fn whole_i16_col(rt2: &Rt2, cell: u32) -> Option<Vec<i16>> {
     match &rt2.cols[cell as usize] {
         Col::U(AV::Num(n)) => Some(vec![n.whole_part_as_i16(); rt2.width]),
@@ -112,9 +111,8 @@ pub(crate) fn whole_i16_col(rt2: &Rt2, cell: u32) -> Option<Vec<i16>> {
 }
 
 /// A position column's whole-pixel RANGE per lane: `(w, w)` for a number,
-/// the bucket's corners for an interval (the position rung); `None` if any
-/// lane is neither. The win tests use this: a bucket wins where the
-/// target lies inside it.
+/// the corners for an interval; `None` if any lane is neither. The win
+/// tests use this: an interval wins where the target lies inside it.
 pub fn whole_range_col(rt2: &Rt2, cell: u32) -> Option<Vec<(i16, i16)>> {
     let one = |v: AV| -> Option<(i16, i16)> {
         match v {

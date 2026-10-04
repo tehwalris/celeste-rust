@@ -178,13 +178,7 @@ pub struct BoundaryIds {
     pub f_x: u32,
     pub f_y: u32,
     pub f_dash_effect_time: u32,
-    /// The bucket dispatch's keys (`compiled::asm_kernel`): a kernel is
-    /// specialized on `dash_time` and, mid-dash, on the dash's target and
-    /// accel.
-    pub f_dash_time: u32,
-    pub f_dash_target: u32,
-    pub f_dash_accel: u32,
-    /// Fruit-off widening ids (abstraction.rs:720): the `fruit` type
+    /// Fruit-off widening ids (`widen::widen_fruit`): the `fruit` type
     /// global plus the `off`/`start` fields. `f_y` above doubles as the
     /// bob-band target.
     pub g_fruit: u32,
@@ -292,8 +286,8 @@ pub fn floor_player_window(floor: (P8, P8)) -> [(P8, P8); 2] {
 
 /// Does a player whose `x` and `y` lie in `x` and `y` (inclusive, a number is
 /// `(n, n)`) CERTAINLY overlap the window's floor (`floor_player_window`)? A
-/// position bucket that straddles the window's edge does not: the floor is
-/// widened there, the safe side. ONE definition with the tracer's.
+/// range that straddles the window's edge does not: the floor is widened
+/// there, the safe side. ONE definition with the tracer's.
 pub fn player_overlaps_floor(window: [(P8, P8); 2], x: (P8, P8), y: (P8, P8)) -> bool {
     let [(xlo, xhi), (ylo, yhi)] = window;
     x.0 > xlo && x.1 < xhi && y.0 > ylo && y.1 < yhi
@@ -584,15 +578,14 @@ impl Rt2 {
     /// Boundary abstraction + canonical row dedup + compaction. Returns
     /// the surviving lane count (= next frame's width).
     ///
-    /// Ports, in order (make_state_abstract, abstraction.rs:286):
-    ///   1. rem widening at Bits(0): full closed interval [-0.5, 0.5-eps]
-    ///      (abstraction.rs:521; other precisions are follow-up work).
-    ///   2. spd: Exact (the default) - nothing.
-    ///   3. dash_effect_time clamp at 0 from below (abstraction.rs:713).
-    ///   3b. fruit off/y widening (abstraction.rs:720): off := [0, 39],
+    /// In order (the graph-side twins are in `trace::widen`):
+    ///   1. rem widening at Bits(0): full closed interval [-0.5, 0.5-eps].
+    ///   2. spd: exact - nothing.
+    ///   3. dash_effect_time clamp at 0 from below (`widen_dash`).
+    ///   3b. fruit off/y widening (`widen_fruit`): off := [0, 39],
     ///       y := start +/- 2.5, together, growth asserted per lane. A
     ///       no-op on fruit-free shapes (rooms without a live fruit).
-    ///   4. timer globals pinned to 0 (abstraction.rs:837).
+    ///   4. timer globals pinned to 0 (`widen_timers`).
     /// Then: reachability BFS from globals over the shared structure (the
     /// per-frame GC + canonical cell order), per-lane 128-bit row hash
     /// over live value cells, dedup, compact columns to survivors.
@@ -965,7 +958,7 @@ impl Rt2 {
             };
         }
 
-        // 3b. Fruit off/y widening (abstraction.rs:720): each live fruit's
+        // 3b. Fruit off/y widening (`widen::widen_fruit`): each live fruit's
         // bob counter becomes the full period [0, 39] and its y the whole
         // bob band start +/- 2.5 (sin is in [-1, 1]) - bit for bit the
         // interpreter's behavior at every Bits level. `off` and `y` widen
@@ -1038,7 +1031,7 @@ impl Rt2 {
         }
 
         // 5. The key's `frames`-derived fields, pinned WITH the timers
-        // (`abstraction::apply_conservative_widenings`, `widen::widen_timers`):
+        // (`widen::widen_timers`):
         // `key.update` writes `spr = 9 + (sin(frames/30) + 0.5)` and toggles
         // `flip.x` when `flr(spr)` reaches 10, and nothing but the key's own
         // update and its drawing reads either. Pinning `frames` alone left

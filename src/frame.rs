@@ -232,7 +232,7 @@ pub const SUMMIT_LEVEL: i16 = 30;
 
 /// The player positions that win, as an inclusive rect (x_lo, x_hi, y_lo,
 /// y_hi) on the player's whole-pixel x/y - a lane wins where its position
-/// (a bucket under the position rung) MEETS the rect: `CELESTE_WIN_AT_XY`'s
+/// MEETS the rect: `CELESTE_WIN_AT_XY`'s
 /// point, or the summit's flag (`SUMMIT_LEVEL`). None: the win is the room
 /// exit.
 pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
@@ -285,8 +285,8 @@ pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
         let Some(obj) = crate::search::pos_graph::player_object(rt2) else {
             return Ok(vec![false; lanes]);
         };
-        // A position bucket (the position rung) wins where it meets the
-        // target - the same rule as the queue's `any_win`.
+        // An interval position wins where it meets the target - the same
+        // rule as the queue's `any_win`.
         let axis = |f: u32| {
             rt2.obj_field_cell(obj, f)
                 .and_then(|c| crate::search::pos_graph::whole_range_col(rt2, c))
@@ -636,10 +636,9 @@ impl Slot {
             let (Some(cx), Some(cy)) = (sk.obj_field_cell(obj, ids.f_x), sk.obj_field_cell(obj, ids.f_y)) else {
                 return Ok(false);
             };
-            // A position is a number, or a BUCKET under the position rung
-            // (`PosPrecision`): the lane wins if it meets the target -
-            // the over-approximation a coarser level is entitled to, and
-            // what the finer levels refute.
+            // A position is a number, or an interval: the lane wins if it
+            // meets the target - the over-approximation a coarser level is
+            // entitled to, and what the finer levels refute.
             let range_at = |cell: u32| -> Result<Box<dyn Fn(u32) -> (i16, i16) + '_>> {
                 Ok(match &sk.cols[cell as usize] {
                     Col::U(AV::Num(n)) => {

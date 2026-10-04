@@ -217,9 +217,7 @@ pub enum Op {
     FragOk(u8),
     /// A fork like `Split(d)` over an interval of WHOLE numbers whose
     /// fragments are the numbers themselves, EXACT: `SplitInt(d)` resolves
-    /// to `IntFrag(c)`, the low end of fragment `c` as a plain number (the
-    /// player's position under a bucket: the frame runs an exact integer
-    /// position per configuration). Validity is `SplitValid(d)` /
+    /// to `IntFrag(c)`, the low end of fragment `c` as a plain number. Validity is `SplitValid(d)` /
     /// `FragOk(c)` and the premise `SplitOk(n)`, shared with `Split`, on
     /// the same operand - so the fork grid must be the integers (rem
     /// Bits(0), `Level::grid_consistent`). A fork over a literal
@@ -422,7 +420,7 @@ impl Graph {
     /// configurations of the buttons' forks collapse.
     ///
     /// A resolved split becomes ORDINARY ARITHMETIC (`Frag` / `FragOk` /
-    /// `IntFrag`, the table forks' select chains): it interns and folds, so
+    /// `IntFrag`): it interns and folds, so
     /// every node the configurations agree on is ONE node, and a fork over a
     /// literal (`Symbolic::both_values`: the buttons) folds to a constant.
     /// The cost is the nodes that genuinely differ: those are emitted once
@@ -1846,7 +1844,7 @@ pub fn normalize_pieces(mut v: Pieces) -> Option<Pieces> {
 
 /// The static range of `n` in raw 16.16 units, if the analysis has one:
 /// from the seeded nodes (input cells known to lie in a range - a body
-/// specialized on the player's speed bucket) through the arithmetic the
+/// specialized on a region's ranges) through the arithmetic the
 /// graph does on them, as PIECES. A select whose condition is not
 /// constant is the union of its arms, not their hull: the dash writes ±5
 /// next to a run speed under 1, and the hull would cross every bucket in

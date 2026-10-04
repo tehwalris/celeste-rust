@@ -190,8 +190,8 @@ impl Pico8Num {
     /// modelling here.
     ///
     /// Periodicity mod one turn is exact by construction, which the
-    /// fruit-off boundary widening in
-    /// `abstraction::apply_conservative_widenings` depends on.
+    /// fruit-off boundary widening (`widen::widen_fruit`, `Rt2::boundary`)
+    /// depends on.
     pub fn pico8_sin(self) -> Self {
         // Two's-complement masking IS floored mod 1.0: -0.25 -> 0.75.
         let frac = (self.0 & 0xffff) as u32;
@@ -560,7 +560,7 @@ mod tests {
     }
 
     /// Pins the invariance the fruit-off boundary widening relies on
-    /// (`abstraction::apply_conservative_widenings`): for every nonnegative
+    /// (`widen::widen_fruit`): for every nonnegative
     /// integer `off`, `sin(off/40) == sin((off mod 40)/40)` BIT-EXACTLY in
     /// this implementation. The fixed-point division makes the arguments
     /// differ by exactly 1.0 per period ((off+40)/40 == off/40 + 1 for

@@ -91,7 +91,7 @@ pub enum Partition {
     /// have different floors.
     Floors { ways: u8 },
     /// Cut an interval of WHOLE numbers into the numbers themselves, each
-    /// EXACT (`Op::SplitInt` -> `IntFrag`): a position under a pixel bucket.
+    /// EXACT (`Op::SplitInt` -> `IntFrag`): the held trails' unknown booleans.
     ///
     /// `memo` is false where two forks over the SAME node must stay
     /// independent: the held trails `p_jump` / `p_dash` both fork the constant
@@ -125,7 +125,7 @@ impl Partition {
 
 /// What a fork hands back: the fragment this configuration takes, which lanes
 /// fall in it, and the choice dimension it minted (which the caller needs to
-/// name the fork's other ops - a table fork's key and coverage).
+/// name the fork's other ops).
 pub struct Fork {
     pub value: NodeId,
     pub valid: NodeId,

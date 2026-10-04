@@ -533,9 +533,8 @@ pub fn zsel_b(c: ZB, t: ZB, f: ZB) -> ZB {
 
 /// __split_by_flr as an n-way FORK (plans/kernel-plan.md K2): a
 /// boundary-widened rem has width < 1 and an exact speed, so `rem +
-/// spd + 0.5` spans at most two floors and the fork has two fragments;
-/// under a BUCKETED speed the player's `move` fork has three (the
-/// spring's `spd.x *= 0.2` misaligns the bucket, 2026-09-14). Fragment
+/// spd + 0.5` spans at most two floors and the fork has two fragments
+/// (a wider operand, e.g. a region's ranges, may take more). Fragment
 /// `c` is the `c`-th floor from the low end's, clipped to the lane;
 /// fragment 0 is always non-empty. Returns (fragment `c` per lane,
 /// valid mask); a lane with an empty fragment simply produces no row in

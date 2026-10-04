@@ -381,9 +381,7 @@ fn build_interval_graph(cells: &[u32], fork_bits: u8) -> (Graph, Vec<NodeId>) {
         // (the spd ladder compares widened speeds with constants)
         let eqi = g.add(Op::Eq, vec![ivl, shifted]);
         let eqn = g.add(Op::Eq, vec![mx, base]);
-        // fork, at arity 2 and 3 (the player's `move` under a bucketed
-        // speed forks three ways: a 1 px speed bucket scaled by the
-        // spring's 0.2 spans three floors once rem is added, 2026-09-14)
+        // fork, at arity 2 and 3
         let spanok = g.add(Op::SplitOk(2), vec![mx]);
         let spanok3 = g.add(Op::SplitOk(3), vec![mx]);
         let frag0 = g.add(Op::Frag(0), vec![mx]);
@@ -392,7 +390,7 @@ fn build_interval_graph(cells: &[u32], fork_bits: u8) -> (Graph, Vec<NodeId>) {
         let ok1 = g.add(Op::FragOk(1), vec![mx]);
         let frag2 = g.add(Op::Frag(2), vec![mx]);
         let ok2 = g.add(Op::FragOk(2), vec![mx]);
-        // the exact-number fragments of a position bucket
+        // the exact-number fragments of an interval of whole numbers
         let ifrag0 = g.add(Op::IntFrag(0), vec![mx]);
         let ifrag1 = g.add(Op::IntFrag(1), vec![mx]);
         // select an interval on a decided bool

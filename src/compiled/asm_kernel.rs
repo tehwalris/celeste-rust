@@ -350,9 +350,7 @@ impl AsmKernel {
     }
 
     /// Run ONE slice: the up-to-16 lanes `lanes` of `chunk` (all within one
-    /// 64-lane id group, in any order - the bucket dispatch sorts a group's
-    /// lanes by speed bucket), keeping only the lanes of `only`. What the
-    /// contiguous `run` above and the bucket dispatch share.
+    /// 64-lane id group, in any order), keeping only the lanes of `only`.
     fn run_slice(
         &self,
         chunk: &Rt2,
@@ -1636,9 +1634,8 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]
     // `None` = not a plain number in every row.
     let src_of = |cell: u32| -> Result<Option<PosSrc>> {
         if let Some(f) = fields.iter().find(|f| f.cell == cell as usize) {
-            // A position bucket (`Span`, the rung below level 0) is an
-            // interval root whose low lanes sit at the same offset as a
-            // number's; its cell is the bucket's low corner
+            // An interval root's low lanes sit at the same offset as a
+            // number's; its cell is the low corner
             // (`pos_graph::whole_i16_col`).
             return Ok(match f.kind {
                 RootKind::Num | RootKind::Ival => Some(PosSrc::Root(f.off)),
