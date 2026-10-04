@@ -1237,6 +1237,15 @@ fn main() -> Result<()> {
                                 if f > horizon {
                                     return Ok(out);
                                 }
+                                // A frame the forward kept nothing of and
+                                // recorded no edge for (the level -1 filter at
+                                // the horizon) has no record directory; any
+                                // other frame without one is an error.
+                                if !arc_edges::frame_dir(&edges_dir, f).is_dir() {
+                                    let rows: u32 = celeste_rust::frame::frame_files(dir, f)?.iter().map(|(_, file)| file.cell_counts().map(|(_, n)| n).sum::<u32>()).sum();
+                                    anyhow::ensure!(rows == 0, "no arc records for f{f}, which kept {rows} rows: was CELESTE_ARC_EDGES set?");
+                                    continue;
+                                }
                                 arc_edges::for_each_rec(&edges_dir, f, |(target, base, x, y, mask)| {
                                     let Some(&dst) = index.get(&target) else { return };
                                     let (x, y) = (x.transfer(), y.transfer());
