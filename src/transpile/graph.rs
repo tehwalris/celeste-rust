@@ -843,7 +843,11 @@ impl Graph {
         ));
         let mut out: Vec<Val> = Vec::with_capacity(self.nodes.len());
         for (i, node) in self.nodes.iter().enumerate() {
-            let a = |k: usize| -> Val { out[node.args[k] as usize] };
+            macro_rules! a {
+                ($k:expr) => {
+                    out[node.args[$k] as usize]
+                };
+            }
             let computed = (|| -> Result<Val> {
                 Ok(match &node.op {
                 Op::Const(lo, hi) => Val::Num(Pico8NumInterval::new(
@@ -859,7 +863,7 @@ impl Graph {
                 // The hull, and the definition `fold`'s two-constant
                 // rule below is checked against. Tolerant of `lo > hi`.
                 Op::Span => {
-                    let (lo, hi) = (a(0).as_num("Span")?.low, a(1).as_num("Span")?.high);
+                    let (lo, hi) = (a!(0).as_num("Span")?.low, a!(1).as_num("Span")?.high);
                     Val::Num(Pico8NumInterval::new(lo.min(hi), lo.max(hi)))
                 }
                 // A split RESTRICTS its operand, so under `lenient` the
@@ -867,9 +871,9 @@ impl Graph {
                 // is strictly better than top and costs nothing.
                 Op::Split(d) if lenient => {
                     let _ = d;
-                    a(0)
+                    a!(0)
                 }
-                Op::SplitInt(_) if lenient => a(0),
+                Op::SplitInt(_) if lenient => a!(0),
                 Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) => {
                     bail!("node {}: split {} has no value outside an outcome", i, d)
                 }
@@ -890,13 +894,13 @@ impl Graph {
                             let v = Pico8Num::from_raw(if low { l } else { h });
                             Val::Num(Pico8NumInterval::new(v, v))
                         }
-                        _ => Val::Num(a(0).as_num("Lo/Hi")?),
+                        _ => Val::Num(a!(0).as_num("Lo/Hi")?),
                     }
                 }
                 // The low end of fragment `c`, exact; under `lenient` the
                 // hull of that over the lanes: `[fl + c, fh + c]` cells.
                 Op::IntFrag(c) => {
-                    let iv = a(0).as_num("IntFrag")?;
+                    let iv = a!(0).as_num("IntFrag")?;
                     let (step, mask) = self.grid();
                     let gflr = |p: Pico8Num| p.as_raw_u32() as i32 as i64 & mask as i64;
                     let (fl, fh) = (gflr(iv.low), gflr(iv.high));
@@ -920,7 +924,7 @@ impl Graph {
                 // the kernel's explanation reads what the kernel computed
                 // rather than top (room (6,0), 2026-09-28).
                 Op::SplitOk(ways) => {
-                    let iv = a(0).as_num("SplitOk")?;
+                    let iv = a!(0).as_num("SplitOk")?;
                     let step = 1i64 << (16 - self.fork_bits as i64);
                     let floor = |v: Pico8Num| (v.as_raw_u32() as i32 as i64).div_euclid(step) * step;
                     if floor(iv.high) <= floor(iv.low) + (*ways as i64 - 1) * step {
@@ -952,7 +956,7 @@ impl Graph {
                 // definition `fold`'s `FragOk(0)` rule is checked
                 // against.
                 Op::Frag(c) | Op::FragOk(c) => {
-                    let iv = a(0).as_num("Frag")?;
+                    let iv = a!(0).as_num("Frag")?;
                     let (step, mask) = self.grid();
                     let gflr = |p: Pico8Num| Pico8Num::from_raw(p.as_raw_u32() as i32 & mask);
                     let (fl, fh) = (gflr(iv.low), gflr(iv.high));
@@ -978,7 +982,7 @@ impl Graph {
                     // "exactly two floors" split below would exclude.
                     if lenient {
                         return Ok(match (&node.op, c) {
-                            (Op::Frag(_), _) => a(0),
+                            (Op::Frag(_), _) => a!(0),
                             (_, 0) => Val::Bool(Some(true)),
                             // A hull spanning fewer cells than fragment
                             // `c` needs contains no lane that reaches it.
@@ -999,7 +1003,7 @@ impl Graph {
                             let hi = (iv.high.as_raw_u32() as i32 as i64).min(base + step as i64 - 1);
                             Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(lo as i32), Pico8Num::from_raw(hi as i32)))
                         }
-                        Op::Frag(_) => a(0),
+                        Op::Frag(_) => a!(0),
                         _ => Val::Bool(Some(valid)),
                     }
                 }
@@ -1013,26 +1017,26 @@ impl Graph {
                 // panics on its own intended input is not usable as a
                 // transformation.
                 Op::Add => Val::Num(
-                    a(0)
+                    a!(0)
                         .as_num("Add")?
-                        .checked_add(a(1).as_num("Add")?)
+                        .checked_add(a!(1).as_num("Add")?)
                         .ok_or_else(|| anyhow!("node {}: Add wrapped", i))?,
                 ),
                 Op::Sub => Val::Num(
-                    a(0)
+                    a!(0)
                         .as_num("Sub")?
-                        .checked_sub(a(1).as_num("Sub")?)
+                        .checked_sub(a!(1).as_num("Sub")?)
                         .ok_or_else(|| anyhow!("node {}: Sub wrapped", i))?,
                 ),
                 Op::Neg => Val::Num(
-                    a(0)
+                    a!(0)
                         .as_num("Neg")?
                         .checked_neg()
                         .ok_or_else(|| anyhow!("node {}: Neg wrapped", i))?,
                 ),
-                Op::Mul | Op::Div | Op::Rem => Self::arith(&node.op, a(0), a(1))?,
+                Op::Mul | Op::Div | Op::Rem => Self::arith(&node.op, a!(0), a!(1))?,
                 Op::Abs => {
-                    let x = a(0).as_num("Abs")?;
+                    let x = a!(0).as_num("Abs")?;
                     let zero = Pico8Num::from_i16(0);
                     if x.low >= zero {
                         Val::Num(x)
@@ -1046,16 +1050,16 @@ impl Graph {
                 }
                 // flr is monotone, so endpoints suffice.
                 Op::Flr => {
-                    let x = a(0).as_num("Flr")?;
+                    let x = a!(0).as_num("Flr")?;
                     Val::Num(Pico8NumInterval::new(x.low.flr(), x.high.flr()))
                 }
                 // sin is NOT monotone; only exact inputs are sound here.
-                Op::Sin => match a(0).as_exact() {
+                Op::Sin => match a!(0).as_exact() {
                     Some(n) => Val::exact_num(n.pico8_sin()),
                     None => bail!("Sin over a non-exact interval is not modelled"),
                 },
                 Op::Min | Op::Max => {
-                    let (x, y) = (a(0).as_num("MinMax")?, a(1).as_num("MinMax")?);
+                    let (x, y) = (a!(0).as_num("MinMax")?, a!(1).as_num("MinMax")?);
                     let pick = |p: Pico8Num, q: Pico8Num| {
                         if matches!(node.op, Op::Min) {
                             if p < q { p } else { q }
@@ -1068,11 +1072,11 @@ impl Graph {
                     Val::Num(Pico8NumInterval::new(pick(x.low, y.low), pick(x.high, y.high)))
                 }
                 Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => {
-                    Self::compare(&node.op, a(0), a(1))?
+                    Self::compare(&node.op, a!(0), a!(1))?
                 }
-                Op::Not => Val::Bool(a(0).as_bool("Not")?.map(|b| !b)),
+                Op::Not => Val::Bool(a!(0).as_bool("Not")?.map(|b| !b)),
                 Op::And => {
-                    let (x, y) = (a(0).as_bool("And")?, a(1).as_bool("And")?);
+                    let (x, y) = (a!(0).as_bool("And")?, a!(1).as_bool("And")?);
                     // Short-circuit on a decided false, so `false AND
                     // unknown` is false rather than unknown.
                     Val::Bool(match (x, y) {
@@ -1082,7 +1086,7 @@ impl Graph {
                     })
                 }
                 Op::Or => {
-                    let (x, y) = (a(0).as_bool("Or")?, a(1).as_bool("Or")?);
+                    let (x, y) = (a!(0).as_bool("Or")?, a!(1).as_bool("Or")?);
                     // Short-circuit on a decided true, mirroring And.
                     Val::Bool(match (x, y) {
                         (Some(p), Some(q)) => Some(p || q),
@@ -1090,13 +1094,13 @@ impl Graph {
                         (Some(_), None) | (None, Some(_)) | (None, None) => None,
                     })
                 }
-                Op::Sel => match a(0).as_bool("Sel")? {
-                    Some(true) => a(1),
-                    Some(false) => a(2),
+                Op::Sel => match a!(0).as_bool("Sel")? {
+                    Some(true) => a!(1),
+                    Some(false) => a!(2),
                     // Undecided: the lane is invalid (its `valid` node
                     // carries `Known(cond)`), so any SOUND value serves.
                     // The join is the sound one.
-                    None => Self::join(a(1), a(2))?,
+                    None => Self::join(a!(1), a!(2))?,
                 },
                 // Decidedness is a per-LANE fact. Under `lenient` the
                 // operand is a HULL over many lanes: a decided hull means
@@ -1106,7 +1110,7 @@ impl Graph {
                 // one-bucket premise `Known(Flr(rem/w))` to a constant and
                 // refused every lane of every finer rung (2026-09-13).
                 Op::Known => {
-                    let decided = match a(0) {
+                    let decided = match a!(0) {
                         Val::Bool(b) => b.is_some(),
                         Val::Num(i) => i.to_number().is_some(),
                     };
@@ -1119,13 +1123,13 @@ impl Graph {
                     }
                 }
                 Op::TileFlagAt if room.is_some() => {
-                    Self::tile_flag_over(room.unwrap(), a(0), a(1), a(2), a(3), a(4))?
+                    Self::tile_flag_over(room.unwrap(), a!(0), a!(1), a!(2), a!(3), a!(4))?
                 }
                 // `mget` on EXACT coordinates, the only form the kernels
                 // take (`zn_mget` panics on a fractional one, reads 0
                 // outside the map); an interval coordinate is refused.
                 Op::Mget if room.is_some() => {
-                    let (x, y) = (a(0).as_num("Mget")?, a(1).as_num("Mget")?);
+                    let (x, y) = (a!(0).as_num("Mget")?, a!(1).as_num("Mget")?);
                     if x.low != x.high || y.low != y.high {
                         bail!("node {}: mget over an interval coordinate", i);
                     }
