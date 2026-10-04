@@ -4,7 +4,7 @@
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #
-# Found by the search (plans/room60-overnight-2026-09-28.md), not derived
+# Found by the search (plans/results.md), not derived
 # from a community TAS: the split-frame prototype (CELESTE_SPLIT_FRAME, two
 # steps per frame), level 0 r0sxhfp (platforms, fly fruit, held buttons
 # unknown), ladder r0sxhfp, r0sxhf, r0sxh, r1sxh..r15sxh, rxsx.

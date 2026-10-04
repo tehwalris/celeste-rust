@@ -7,7 +7,7 @@
 # bit4=jump bit5=dash.
 #
 # Search: split frame (two steps a frame), ladder r0sxhn, r0sxh, r1sxh ..
-# r15sxh, rxsx at horizon step 168 (plans/room70-2026-09-30.md). Level 0 is
+# r15sxh, rxsx at horizon step 168 (plans/results.md). Level 0 is
 # the floors widened but where the player overlaps one, with the spring's
 # phase widened and a floor's collideable derived from its state. First wins
 # by level (steps): 134, 134, 142, 152, 156, 160, 162, 164, 164, 164, then

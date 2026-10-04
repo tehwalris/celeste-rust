@@ -1,3 +1,5 @@
+> STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
+
 # Rooms (1,0), (2,0), (3,0), 2026-09-17 (release, 32 threads)
 
 Held ladder `CELESTE_LADDER="r0sxh,r1sxh,...,r15sxh,rxsx"` throughout.

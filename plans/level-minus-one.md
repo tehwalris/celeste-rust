@@ -1,414 +1,144 @@
-# Level -1: a position-only cost-to-go table from the traced frames (2026-09-17)
+# Level -1: a position-only cost-to-go table from the traced frames
 
-Built first as a probe, then wired into the search as a filter
-(`CELESTE_LEVEL_MINUS_ONE="H,S"`, "As a filter" below) that replaced the
-experimental time band (`CELESTE_BAND="H,px"`, `frame::band`), whose 8 px/frame
-is a measurement, with a bound derived from the game code. Room (2,0) reports
-OPTIMAL 95 with it and no band ("Room (2,0): OPTIMAL 95 without the band").
+A sound lower bound on the frames to the exit from every (shape, player cell),
+built from the same traced frames the kernels come from, used as a FILTER on
+level 0 under a known ceiling. It replaced the experimental time band
+(`CELESTE_BAND="H,px"`, `frame::band`, 8 px/frame), which was a measurement,
+not a bound: a spring snaps the player up to 8 px and `spd.y = -3` moves it
+3 more in the same frame. Code: `src/trace/level_minus_one.rs`.
 
 ```bash
-CELESTE_START_ROOM=2,0 CELESTE_THREADS=16 ./safe-run.sh -- ./target/quick/transpile \
+# as a filter inside a search (H = the ceiling, S = the speed bound in px/frame)
+CELESTE_LEVEL_MINUS_ONE="95,5" ./safe-run.sh -- ./target/release/rewrite search --room 2,0 --ceiling 95
+# as a probe: the table against a level-0 tree, with the too-late share per frame
+CELESTE_START_ROOM=2,0 ./safe-run.sh -- ./target/quick/transpile \
     --level-minus-one S LEVEL_DIR CEILING FROM TO [MARKS]
-# e.g. 5 /var/tmp/celeste-room20-l1/level00 95 60 95 \
-#      /var/tmp/celeste-room20-l1/h095/level00.marks.bin
 ```
-
-The example tree (room (2,0), `--ceiling 95`, OPTIMAL 95) is archived at
-`/var/tmp/celeste-archive/celeste-room20-l1.tar.zst` since 2026-09-18; unpack
-it first (`tar -I zstd -xf /var/tmp/celeste-archive/celeste-room20-l1.tar.zst
--C /var/tmp`, ~116 GB). The tree this example originally named,
-`celeste-search20-held` (the held-band run), is deleted.
-
-Code: `src/trace/level_minus_one.rs` (`probe`).
 
 ## What it computes
 
-A node is `(heap shape, cell of the player)`. Every other input of the shape's
-frame is one RANGE for the whole shape (numbers) or unknown (booleans): the
-player's `rem` is its whole [-0.5, 0.5), its speed is [-S, S], and the other
-fields are discovered (below). The heap shape stays concrete, and the lattice
-pins stay pinned for as long as they hold.
+A node is `(heap shape, cell of the player)`. Every other input is one RANGE
+per shape (numbers) or unknown (booleans): the player's `rem` the whole
+[-0.5, 0.5), its speed [-S, S], the other fields discovered inductively. The
+heap shape stays concrete; the lattice pins stay pinned while they hold.
 
 One frame from a node:
 
 1. **Trace** the shape (`verify::trace_frame`, level-0 widenings) with every
-   object's unpinned `rem`/`spd` as interval inputs, and with `bounds` on them.
-   The bounds let `Domain::flr_ways` size the `move` forks from the static
-   ranges: 11-way at S=5, 13-way at S=6.
-2. **Copy the cone** of every outcome's `live`, `ok`, position and fields out
-   of the arena, with three substitutions:
-   - A fork over a literal (a button, `Symbolic::both_values`) stands for
-     its whole literal: its `choice > 0` is unknown. (Before 2026-09-28 the
-     buttons were `Free(b)` leaves, copied as extra input cells seeded
-     unknown.)
-   - `Known(..)` becomes true: it is the kernels' premise that a select reads
-     a decided condition, and this evaluator JOINS undecided selects instead,
-     which is sound.
-   - `SplitOk(..)` becomes true. It is checked directly instead: every fork
-     operand spans at most the fork's arity.
-3. **Specialize** on every fork configuration into one shared graph
-   (`specialize_subset_into`). In a configuration the move amount is one
-   number, so the pixel steps and their collisions are exact at an exact
-   position.
-4. **Evaluate** with `Graph::eval_narrow_top_in` over the ranges.
-   - Outcomes whose `live` is not definitely false are successors, at the
-     cells their position hull covers.
-   - An outcome in another room is the EXIT.
-   - `ok` must be TRUE on every live outcome. What is left in it: pin guards,
-     the static range premises, the symbolic loops' "finished" obligation, rem
-     containment.
+   object's unpinned `rem`/`spd` as interval inputs, bounded, so
+   `Domain::flr_ways` sizes the `move` forks from the static ranges (11-way at
+   S=5; `Symbolic::uncapped_ways` gives the hull's width, level -1 only).
+2. **Copy the cone** of every outcome's `live`, error, position and fields,
+   with substitutions: a fork over a literal (a button) stands for its whole
+   literal; `Known(..)` is true (this evaluator JOINS undecided selects, which
+   is sound - `Symbolic::no_known_forks`); `SplitOk(..)` is checked directly
+   (every fork operand spans at most its arity).
+3. **Specialize** on every fork configuration into one shared graph: per
+   configuration the move amount is one number, so the pixel steps and their
+   collisions are exact at an exact position.
+4. **Evaluate** over the ranges (`Graph::eval_narrow_top_in`): an outcome
+   whose `live` is not definitely false is a successor at the cells its
+   position hull covers; an outcome in another room is the EXIT; the error
+   must be false on every live outcome.
 
-Passes: a BFS over the reachable nodes, then an **inductive check**. Every
-value flowing into a shape must lie in its ranges and agree with its pins. If
-one doesn't, the range widens or the pin is dropped (and the shape
-re-traced), and the pass is redone. The widening is the hull for a slot's
-first two growths, then that end goes straight to the 16.16 extreme. The
-hull comes first because a threshold overshot `widen_fruit`'s band premise.
-`d(node)` is the fewest frames to an exit, backward from the exit edges.
+Passes: a BFS over the reachable nodes, then an INDUCTIVE check - every value
+flowing into a shape must lie in its ranges and agree with its pins, else the
+range widens (the hull for its first two growths, then that end straight to
+the 16.16 extreme) or the pin drops, and the pass is redone.
 
-### What it does not model (counted in the report)
+`d(node)` is `sound_d`: a multi-source shortest path backward, an exit edge 1,
+a DEATH successor 1 + the start state's d (the room restarts and replays the
+spawn; a second run is the fixpoint). The spawn runs as a CHAIN from the start
+state (as a position-only node it never converges: `solids=false` and one
+speed range per shape let it rise forever).
 
-- **The spawn** runs as a CHAIN from the start state (26 frames to the player
-  at (8, 104)). As a position-only node it never converges: `solids=false`,
-  and `state`, `delay` and the speed are one range per shape, so it can rise
-  forever. Tried first, the spawn's `spd.y`/`delay` ranges doubled every pass
-  to the fork arity limit (255).
-- **Deaths** are dead ends. The comparison keeps `NO_CELL` rows.
-- **Successor cells outside x, y in [-16, 143]** are clipped. Real player
-  positions lie inside: the draw clamp to [-1, 121] is skipped on a dash frame
-  (`freeze=2`), which leaves at most one move (<= 6 px) past it. The
-  imprecision pushes hulls further.
+## As a filter (`frame::level_minus_one`, `CostToGo::too_late`)
 
-## Final inductive ranges (room (2,0), both S converge after 6 passes)
+A flush queue (one player cell) is dropped when `f + d(shape, cell) > H`. What
+makes it sound where the probe only counted:
 
-The eight player shapes share one pattern (S=5; S=6 identical except the speed):
-
-| field | range |
-|---|---|
-| `spd.x`, `spd.y` | [-S, S] (inductive for S=5 and S=6; the dash writes exactly 5) |
-| `rem.x`, `rem.y` | [-0.5, 0.5) |
-| `dash_target.x/y` | [-2, 2] |
-| `dash_accel.x/y` | [0, 1.5] |
-| `dash_effect_time` | [0, 10] (level-0 clamp) |
-| `dash_time`, `djump`, `grace`, `freeze`, springs' `delay` | FULL 16.16 range |
-| springs' `spr` | [0, 19] |
-| fruit `off` / `y` | [0, 39] / [45.5, 50.5] |
-| `delay_restart` | 0 |
-
-No lattice pin was dropped. The full ranges are the evaluator having no
-condition refinement: `if freeze>0 then freeze=freeze-1` computes the arm over
-the whole range, so each pass steps one lower. That is sound, and it hardly
-matters for positions, but it is why djump cannot limit dashes here.
-
-## Soundness checks
-
-- **Recorded transitions** (`level00/posgraph.bin` of the held-unknown room
-  (2,0) tree): 464,896 pairs, 463,567 in-room pairs and 162 exit crossings
-  checked, **0 violations** at S=5 and at S=6. 1,167 death/respawn pairs are
-  not modelled.
-- **The backward's marks at h95** (`h095/level00.marks.bin`, 19,245,834
-  states, 10,673,512 of them in f060-f095): **0 marked states are too late**
-  (`f + d > 95`) at S=5 and at S=6.
-- No violation in the converged pass: every live `ok` is true, every fork
-  operand fits its arity, and every position hull is whole pixels.
-- The 11 rows of shape `0x38ca639158d2ee7b` at f073-f083 are a respawned spawn
-  (after a death), a shape the table never reaches: kept.
-
-## Comparison: share of states with `f + d > 95`
-
-This is the tree the search ran WITH the band (94, 8), so the band's own rule
-at ceiling 95 cuts 0 of it (measured). The band's effect as recorded in
-plans/held-buttons.md: 60.3M against 62.8M states at f80, about 4%, with the
-peak at f82-f83. prune-probe's goal is "y <= top + 8" rather than the exit,
-so it is not strictly tighter than level -1. From f083 on, S=5 cuts more than
-it.
-
-| frame | states | level -1, S=5 | level -1, S=6 | prune-probe |
-|---|---|---|---|---|
-| f070 | 16,510,619 | 0.0% | 0.0% | 0.7% |
-| f072 | 21,159,387 | 0.0% | 0.0% | 7.2% |
-| f073 | 24,300,879 | 0.1% | 0.0% | 12.5% |
-| f074 | 27,917,006 | 1.5% | 0.0% | 21.2% |
-| f075 | 31,654,306 | 4.1% | 0.0% | 34.2% |
-| f076 | 36,405,697 | 8.1% | 0.0% | 45.8% |
-| f077 | 41,178,330 | 14.7% | 2.0% | 56.0% |
-| f078 | 47,806,190 | 21.2% | 4.9% | 66.2% |
-| f079 | 54,245,424 | 40.3% | 9.8% | 73.7% |
-| f080 | 61,979,189 | 61.3% | 15.9% | 79.8% |
-| f081 | 68,871,941 | 78.2% | 25.7% | 84.7% |
-| f082 | 76,200,926 | 87.9% | 51.3% | 89.7% |
-| f083 | 77,296,459 | 92.7% | 73.5% | 92.6% |
-| f084 | 79,428,398 | 95.2% | 86.4% | 94.2% |
-| f085 | 63,878,612 | 94.8% | 91.1% | 93.8% |
-| f086 | 36,791,191 | 91.8% | 89.1% | 90.3% |
-| f087 | 13,993,095 | 81.7% | 75.2% | 76.7% |
-| f088 | 5,179,603 | 60.7% | 42.6% | 42.6% |
-| f090 | 3,191,586 | 67.8% | 50.5% | 42.3% |
-| f092 | 1,439,154 | 75.9% | 65.3% | 41.5% |
-| f094 | 325,639 | 84.5% | 80.7% | 29.1% |
-
-(f060-f069: 0.0% for both S. f095: 100% for both, since a state at the
-horizon has d >= 1.)
-
-d itself: the start state's d is 45 at S=5 (26 spawn frames + 19) and 42 at
-S=6, against the known optimum of 95. The largest finite d is 25 / 22. 16,320
-of 154,408 nodes (S=5) have no path to the exit.
-
-## Size and cost (quick profile, 16 threads)
-
-| | S=5 | S=6 |
-|---|---|---|
-| nodes / edges | 154,408 / 22,741,336 | 157,076 / 28,789,432 |
-| exit nodes | 10,928 | 11,584 |
-| fork configurations per shape | 726 (3x2x11x11) or 121 | 1690 (5x2x13x13) or 169 |
-| specialized graph per shape | 171k-300k nodes | 243k-432k nodes |
-| one pass | 84-89 s | 177-200 s |
-| whole probe (6 passes) | 500.7 s | 1015.2 s alone |
-| peak RSS | 1.10 GB (2.79 GB with the marks set) | 1.39 GB (3.05 GB) |
-
-(The S=5 pass times ran concurrently with the S=6 run.) Lattice walk 8.7 s,
-spawn chain 2.9 s, tracing and specializing 0.3-1.3 s per shape.
-
-The first two forks (arity 3x2 / 5x2) are the player's move after a spring
-has rewritten its speed (`hit.spd.x *= 0.2`, `spd.y = -3`) in the same frame.
-They are a different operand, so a separate fork, and they multiply the
-configurations 6-10x although the two arms exclude each other.
-
-## Blockers and doubts
-
-- `unroll_bound("abs(amount)") = 8` (src/trace/interp.rs:1853) caps S at 7.
-  Beyond that the loop's "finished" premise fails. It would be reported, not
-  absorbed.
-- The spawn is not position-only (above). The chain works because the spawn
-  reads no button.
-- Deaths and respawns are dead ends, and the window is a claim from the code.
-  Both were checked only against recorded transitions, never proven.
-- Condition refinement is missing in the evaluator, so the counters go to the
-  full range.
-- The table relies on the lattice pins, which are checked inductively here.
-  It also relies on the tracer's merge semantics: the evaluator joins where
-  the kernels required `Known`.
-
-## What it would take to use it
-
-- **As a filter** (the band's place): drop a flush queue (one player cell)
-  when `f + d(shape, cell) > H`. That is one table lookup per queue, and the
-  table is horizon-independent, so one per room. It needs a death rule: model
-  the no-player shapes and the respawn chain, or prove that a death is too
-  late (a respawn costs 26 frames plus d(end) = 19 at S=5). It also needs the
-  window premise handled (enlarge the window, or bound positions from the
-  clamp).
-- **Cost**: about 8 minutes for room (2,0) at S=5. Most of it is re-running
-  the passes while counters walk down one step per pass. Seeding the ranges
-  from the cart's own setters, or a faster widening, would cut that to 2-3
-  passes.
-- **Precision**: condition refinement in `eval_narrow_top_in` for comparisons
-  on an input cell; splitting small integer ranges (`freeze` 0 vs 1-2); a node
-  that carries dashes left (`djump`); per-node rather than per-shape speed
-  ranges. Each costs nodes or evaluations.
-- **As a ladder level** it is the same object: `f + d <= H` is its marked set,
-  and it feeds level 0 exactly like `MarkFilter`. There is no forward at level
-  -1, only the table.
-
-## Room (1,0) (2026-09-17, against a current tree)
-
-A fresh held-ladder search (`r0sxh..r15sxh,rxsx`, `--ceiling 99`, census
-`394ae0b`): OPTIMAL 99 in 1:39.7 wall, 5.76 GB peak. (`/var/tmp/celeste-room10h`
-predates the `rnd` global, so none of its shapes matched: every state was
-"other shape". The fresh tree matches every shape.)
-
-The probe at S=5, ceiling 99: 5 passes, 24 s, 1.0 GB, 17,904 nodes (15,662 reach
-an exit), the start's d = 44, max finite d = 30; 0 violations against 383,247
-in-room recorded pairs and 114 crossings; 0 marked states too late at every
-frame f50-f99 (`h099/level00.marks.bin`).
-
-| frame | states | too late (f + d > 99) | band (99, 8) |
-|---|---|---|---|
-| f050-f072 | | 0% | 0% |
-| f075 | 1,373,019 | 1.2% | 0% |
-| f080 | 1,102,103 | 7.7% | 0% |
-| f083 | 961,138 | 33.9% | 0% |
-| f085 | 1,021,640 | 50.0% | 0% |
-| f090 | 1,290,067 | 78.2% | 19.9% |
-| f095 | 1,643,893 | 93.3% | 79.1% |
-
-As a filter it would drop 18,919,491 of the 55,577,462 level-0 rows f0-f99
-(34.0%; the band 21.0%), all from f73 on.
-
-## As a filter (2026-09-17): `CELESTE_LEVEL_MINUS_ONE="H,S"`
-
-`trace::level_minus_one::cost_to_go` builds the table (the probe's passes,
-`build`) and `frame::level_minus_one` drops a flush queue (one player cell)
-when `CostToGo::too_late`. What makes it sound where the probe only counted:
-
-- **`sound_d`**: a multi-source shortest path backward over the edges, seeded
-  where the graph stops modelling. An exit edge is 1; a DEATH successor is 1 +
-  the start state's d (the room restarts and replays the spawn chain, however
-  long the countdown). The death seed reads the end's d, which it cannot lower,
-  so a second run is the fixpoint.
-- **a clipped successor part is dropped, and the window is CHECKED**: no real
-  player is outside it at a frame boundary (the draw clamp keeps x in [-1,
-  121], a freeze frame skips it by at most one move; below y = 128 the update
-  kills; above y = -4 the room changes). `CostToGo::too_late` panics on any row
-  in the room outside it, so the premise is checked on every row the filter
-  sees rather than assumed.
-- **only table nodes are refused**: a row without a player cell, one that has
-  left the room (x >= 128), a shape or a cell the table never reached, is kept.
+- **the window is CHECKED, not assumed**: no real player is outside x in
+  [-1, 121] plus one move (the draw clamp, skipped on a dash's freeze frame),
+  below y = 128 (the update kills) or above y = -4 (the room changes);
+  `too_late` panics on any in-room row outside it. A clipped successor part
+  is dropped (seeding it as a possible exit, d = 1, was sound and useless:
+  room (2,0) f80 kept exactly the unfiltered 62.8M);
+- **only table nodes are refused**: a row without a player cell, outside the
+  room, or of a shape or cell the table never reached is kept;
 - **H is the largest horizon the run tests**: level 0 persists across
   horizons, so this is for a `--ceiling` search with H = the ceiling.
 
-First tried: a clipped successor seeded as a possible exit (d = 1). Sound, and
-useless in room (2,0): its six player shapes each clip 755,646 successors
-(imprecise joins at the clamped edges), 25,224 of 154,408 nodes had one, every
-node near them got a d of a frame or two, and level 0 at f80 kept 62,810,806
-states - what it keeps with no filter at all. Stopped at f80.
+The table is horizon-independent: one per room.
 
-Room (1,0), S=5, H=99 (release, held ladder, `--ceiling 99`), as committed:
+## Soundness checks done
 
-- the sound d: the start state's d = 44, the plain probe's (12,199 nodes with a
-  death successor lower nothing that reaches an exit);
-- the probe with the sound d: too late 0.3% at f074, 7.4% at f079, 44.7% at
-  f084, 69.9% at f089, 90.2% at f094; MARKED TOO LATE 0 at every frame;
-- the search: **OPTIMAL 99** (h99 confirmed, h98 refuted at level 6), no row
-  outside the window, 1:44.5 wall with the table's 19.9 s build, 4.25 GB peak;
-  without the filter 1:39.7 and 5.76 GB. Room (1,0)'s late frames are small,
-  so it pays in memory, not time. The room it is for is (2,0), whose level 0
-  is ~60 M states at f80.
+- Room (2,0), against the recorded `posgraph.bin` of a level-0 tree: 463,567
+  in-room pairs and 162 exit crossings, 0 violations at S=5 and S=6.
+- The backward's marks at h95 (19,245,834 states): 0 marked states too late.
+  With the filter on, h95's level-0 marks are EXACTLY the band run's: the
+  filter dropped no state on a path to a win.
+- Room (1,0) at S=5, ceiling 99: 0 violations against 383,247 recorded pairs,
+  0 marked states too late at every frame f50-f99.
+- Room (0,2): 288,366 recorded in-room transitions of an unfiltered `r0sxhn`
+  tree, 0 not in the table.
 
-## Room (2,0): OPTIMAL 95 without the band (2026-09-17)
+## Measurements that matter
 
-`CELESTE_LEVEL_MINUS_ONE="95,5"`, held ladder (`r0sxh..r15sxh,rxsx`), `--ceiling
-95`, no `CELESTE_BAND`, release, census `c75f856`:
+| room | table build | nodes | start's d | known optimum | effect |
+|---|---|---|---|---|---|
+| (1,0) | 19.9 s | 17,904 | 44 | 99 | drops 34% of level 0's rows f0-f99, all from f73; pays in memory (4.25 vs 5.76 GB), not time |
+| (2,0) | 472 s (S=5, 16 threads) | 154,408 | 45 | 95 | f80 24.0M states against 62.8M (49 s vs 131 s a frame), f90 1.0M, f95 1; OPTIMAL 95 in 27:28 at 28 GB with no band |
+| (5,1) | 39 s | | 45 | 104 | resumed at f88: f90 7.0M kept (unfiltered f89 37.7M) -> 1.1M at f95 |
+| (0,2) | 3:52 | 61,208 | 45 | 81 | f61 6.28M vs 6.96M, f70 1.3M (unfiltered f75 65.8M, killed at 30 GB) |
+| (6,1) | 6:43 | 78,544 | 49 | 89 | |
+| (7,1) | 32 s | 21,250 | 45 | 86 | |
 
-- the table: 472.1 s (16 threads), 154,408 nodes, the start state's d = 45;
-- level 0 (the same counts as with no filter through f070): f080 23,997,253
-  states (no filter: 62,810,806; x2.6), f085 3,315,620, f090 1,029,159, f095 1;
-  f080 in 49 s against 131 s, 17.8 GB resident against 25.6 GB;
-- h95 level 0 marked 19,245,834 states - exactly the band run's h95 level-0
-  marks: the filter dropped no state on a path to a win by f95;
-- h95 confirmed at every level through Exact (first win f95 from level 9 on),
-  h94 refuted at level 9 (as with the band): **OPTIMAL 95**;
-- 27:27.6 wall including the table, 28.0 GB peak, 114 GB of checkpoints; no
-  row outside the window.
+d is weak by design: the start's d is ~45 against optima of 80-130 (the
+player may move at S px/frame in any direction at every node). It bites only
+in the last ~20 frames - which is exactly where a room's level 0 explodes
+when its frames do not dedupe (springs, ice). It does NOT rescue a room
+whose every frame is new: room (6,0) with platforms exact kept the
+unfiltered counts at f50 (d = 31 against the real 46); that needed `p`.
 
-So room (2,0)'s 95 no longer rests on the 8 px band.
+## Build failures and their fixes (each a premise the table CHECKS that the evaluator could not decide; none weakened)
 
-## Rooms (6,1), (7,1), (0,2): three tables that did not build (2026-10-01)
+- **The balloon's phase** (rooms (6,1), (7,1)): the start representative
+  holds a blanked 0 where every state holds the literal [0, 1); the walk now
+  records the start's own intervals (`LatticeWalk::start_ivals`), a slot every
+  state holds as one literal is read as that literal (`Shape::lits`), and
+  `Lo`/`Hi`/`Sub` lift selects out (`Lift::Ends`).
+- **A tile loop over a joined `x`** (rooms (7,1), (0,2), (6,1)): over
+  `sel(spd ~= 0, x moved, x)` the loop's two ends are independent; lifting
+  every op through the select decides it but grows the graph ~25x, so it is
+  the FALLBACK per node in violation (`Traced::precise`).
+- **The fake wall's speed** (room (0,2)): a 3-piece move operand; the arity is
+  now the hull's width at level -1 (1,210 configurations).
+- **The point split** (2026-09-20) and the move arity cap (`7dce5b4`) had
+  silently broken level -1 everywhere, room (1,0) included, unnoticed because
+  the room being run did not use it. Repaired in `4b31c1b`.
+- **Still refused** (rooms run unfiltered): a balloon's bob `y` widened at `n`
+  in the start state (rooms (1,2), (2,3): "not a literal range"); the unknown
+  fly fruit's `rem.y` (room (6,2)); the summit (it measures the room exit).
+- **Reverted** (`4b31c1b`, Philippe: the table was not asked for every room
+  and did not rescue room (6,0)): platform phases from concrete snapshots, an
+  "unmodelled node gets d = 1" rule, range-reading other objects' forks.
 
-Three causes, each a premise the table CHECKS that the evaluator could not
-decide. None of the checks was weakened.
+## Deferred: the off-screen lane (precision)
 
-**The balloon's phase (rooms (6,1), (7,1)).** The balloon draws `offset =
-rnd(1)` in `_init`: every state holds the literal interval `[0, 1)`, and every
-outcome stores the canonical `[0, 1)` with the premise that it IS a full period
-(`widen::canon_balloon_offset`: `Hi(v) - Lo(v) >= 1`). Two things broke it:
+Room (2,0)'s left pocket stays in the frontier 16 frames too long: the table's
+fastest path leaves the room on the left and flies up outside it at 5
+px/frame. `freeze` and `djump` are one full range per shape (no condition
+refinement), so `_update`'s "moved" and `_draw`'s "clamp skipped" join every
+frame, with a dash every frame. Chosen fix (C, not built): small counters
+exact per node - a node is (shape, cell, `freeze`, `djump`) - up to 6x the
+nodes; the filter would take the minimum d over a cell's counters. Check with
+`CELESTE_L1_PATH="16,48"`. Bigger: speed per node instead of [-S, S]
+everywhere (would bend the top's straight cut along gravity and walls).
 
-- The start state's representative holds a BLANKED 0 there (`kernel.rs`: the
-  walk types the slot as an interval input), and the table seeded its ranges
-  from the representative: phase `[0, 0]`, width 0, "error is true" on the
-  spawn's first frame. The walk now records the start state's own intervals
-  (`LatticeWalk::start_ivals`).
-- A range is a HULL of the node's values, so `Lo`/`Hi` of it are anywhere in
-  it and the width is undecided. A slot every state holds as one literal
-  (`Obs::Lit`, only `rnd`-derived `ival_extra` slots, never `rem`/`spd`) is now
-  read as that literal (`Shape::lits`, the cone's cell replaced by the
-  `Const`), a literal plus a point folds to the shifted literal (`lit_shift`),
-  and `Lo`/`Hi`/`Sub` lift selects out (`lift`, `Lift::Ends`), since the phase
-  is `sel(shown, offset + 0.01, offset)` on a condition the ranges leave open.
-  A literal that ever observes anything else drops back to a range.
+## Limits
 
-**A tile loop over a joined `x` (room (7,1), then (0,2) and (6,1)).** At (52,
-35) the player's `x` after `move` is `sel(spd ~= 0, x moved, x)`: the speed
-range holds 0, so it is undecided, and over the joined `x` a collision loop's
-two ends (`flr((x+1)/8)`, `flr((x+6)/8)`) are independent - three tiles where
-each state has two, the unrolled loop's "finished" obligation undecided.
-Lifting every value op through selects on one condition (`Lift::All`) decides
-it, but makes the graph ~25x larger (room (7,1): 92k -> 2.4M specialized nodes,
-a pass 9 s -> 390 s). So it is the FALLBACK: a node is evaluated with the plain
-frame, and only if that is in violation (`in_violation`) with the precise one,
-built once per shape (`Traced::precise`). Both are sound; 26-104 nodes per pass
-take it.
-
-**The fake wall's speed (room (0,2)).** `hit.spd.x = -sign(hit.spd.x)*1.5`
-before the player's `move` makes the move operand three pieces 2 floors wide
-each. `flr_ways` sizes a fork by the widest PIECE (a kernel lane is in one),
-so the fork was 2-way; the table's evaluator joins the select and sees the
-hull, 5 floors - 10,997,504 violations. Under `uncapped_ways` (level -1 only)
-the arity is now the hull's width: shape 2 forks `[5, 2, 11, 11]`, 1,210
-configurations. Kernels are untouched (`uncapped_ways` is off there).
-
-| room | build (quick, 8 threads, probe wall) | nodes | start's d | known optimum |
-|---|---|---|---|---|
-| (7,1) | 32 s | 21,250 | 45 | 86 |
-| (0,2) | 3:52 | 61,208 | 45 | 81 |
-| (6,1) | 6:43 (2 passes with shapes 4 and 7 not yet literal: 14k and 33k precise nodes) | 78,544 | 49 | 89 |
-| (2,0) | 58 s | 38,852 | 45 (identical d map to `09505c7`) | 95 |
-| (5,1) | 66 s | 40,080 | 45 (identical d map to `09505c7`) | 104 |
-
-Room (0,2), the table against a level-0 tree without the filter
-(`r0sxhn`, f0-f61): 288,366 recorded in-room transitions, 0 not in the table.
-The filter at H = 81 (`search --from 81 --to 81`, level 0):
-
-| frame | no filter | filter |
-|---|---|---|
-| f055 | 3,089,194 | 3,089,194 |
-| f060 | 6,194,037 | 5,987,224 |
-| f061 | 6,957,393 | 6,284,993 |
-| f065 | | 3,288,338 |
-| f070 | | 1,310,981 |
-| f075 | 65,768,836 (an earlier run, killed at 30 GB) | |
-
-## DEFERRED: the off-screen lane (2026-09-17)
-
-The filter is sound and acceptable as it is; this is precision, parked while the
-fly fruit and the fall floors come first (Philippe: "probably C").
-
-**What the table gets wrong.** Room (2,0)'s left pocket (x 0-31, y 32-63) was
-still in level 0's frontier at f079, 16 frames before f95, although the real
-route out (down, right past the diagonal wall band, up the right side, ~230 px)
-is over 45 frames even at 5 px per frame. `CELESTE_L1_PATH="16,48"` (the probe's
-fastest-path trace) shows why: d = 11 along
-
-    (16,48) (10,47) (4,45) (-2,41) (-8,37) (-14,31) (-16,25) ... (-16,1) EXIT
-
-- left out of the room and up outside it. The `d` map has d = 1-5 in the two
-columns left of x = 0 from the top down to y 24, and the cut near the top is a
-horizontal line: the table lets the player fly at up to 5 px per frame in any
-direction.
-
-**Why.** Nothing kills the player on the left: the player's `draw` clamps x to
-[-1, 121] and zeroes `spd.x`. The gate is the global `freeze`: `_update` returns
-early while `freeze > 0` (nothing moves), `_draw` returns early too (no clamp),
-and a dash sets `freeze = 2` inside the update, after that frame's move - the one
-move that may end past the clamp. At level -1 `freeze` and `djump` are one range
-per shape and widen to the full 16.16 range (no condition refinement), so
-`freeze > 0` is undecided at every node, and the evaluator joins each undecided
-select on its own: "moved" from `_update` with "clamp skipped" from `_draw`,
-every frame, and with `djump` unbounded, a dash every frame. Off-screen, once the
-hitbox is left of x = 0, the tile loop checks no tiles, so nothing is solid.
-
-**Options.**
-- **A. Split one frame's evaluation on `freeze > 0`** and union. Makes `_update`
-  and `_draw` agree within a frame, ~2x the evaluation. Does not close the lane:
-  the node after a dash frame does not remember the dash, and `djump` unbounded
-  dashes again.
-- **B. Condition refinement in the evaluator** (`freeze - 1` only where
-  `freeze > 0`): ranges converge to `freeze` in [0, 2], `djump` in [0, 1], but
-  still undecided per node. The lane stays.
-- **C. Small counters exact per node** (CHOSEN, deferred): a node is (shape, cell,
-  `freeze`, `djump`) instead of (shape, cell). Their outputs are exact per fork
-  configuration, so a dash needs `djump > 0`, off-screen there is no ground to
-  refill it, and after one unclamped move and two frozen frames the clamp is
-  back: the lane closes. Up to 6x the nodes (154k -> ~900k worst case) and pass
-  time (~8 min per pass for room (2,0), ~50 min for the table; room (1,0) ~3
-  min). Which counters: naming `freeze`/`djump` is game knowledge; the generic
-  rule is "player integer fields whose observed values stay in a small set become
-  node coordinates", but `dash_time` (0-4) and `grace` (0-6) would join (x210),
-  so it needs a cap or a measurement. The filter would look up d as the minimum
-  over a cell's counters, so the flush hook stays per queue.
-- **D. Speed per node** (coarse buckets instead of [-5, 5] everywhere): what would
-  bend the top's straight line along gravity and the walls. Much bigger.
-
-After C: the pocket cut along the walls, the top still a straight line (that is
-D). Check with `CELESTE_L1_PATH="16,48"` (the path goes round the wall), f079's
-too-late share, then room (2,0) again.
+- `unroll_bound("abs(amount)") = 8` caps S at 7.
+- Deaths are modelled only through the respawn's d; the window is a claim
+  from the code checked on every row the filter sees.
+- No condition refinement in the evaluator: counters (`freeze`, `djump`,
+  `dash_time`, `grace`, springs' `delay`) go to the full range.

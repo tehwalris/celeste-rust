@@ -1,5 +1,5 @@
 # Room (3,3): the concrete witness of the remainder-exact arc search at h172
-# (2026-10-04; plans/arcs.md). The arc search refutes 171 and wins at 172;
+# (2026-10-04; plans/architecture.md "Arcs"). The arc search refutes 171 and wins at 172;
 # this DFS (reference engine, concrete objects, every successor inside the
 # winning sets) found it in 608 steps. Replayed on a real PICO-8:
 #   pico8_diff/replay.py --room 3,3 --balloon-seeds 0,0.15341642642793 tas/room_3_3_arc_witness_frame_172.txt
