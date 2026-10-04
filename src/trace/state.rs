@@ -98,10 +98,10 @@ pub struct State<D: Domain> {
     /// merge in `collapse`, and rejoin when the call that split them returns
     /// (`Interp::rejoin_fragments`).
     pub frag: Vec<(usize, usize, u16)>,
-    /// THE ARC CAPTURE (`search::arc_edges`, `CELESTE_ARC_EDGES=1`): per
+    /// THE ARC CAPTURE (`search::arc_edges`): per
     /// axis (x, y), what this path's split of the PLAYER's own remainder did
     /// (`Interp::capture_player_split`). `None` when the trace does not
-    /// capture - every trace but a level-0 one in arc mode. Not in the heap,
+    /// capture - every trace but a level-0 one. Not in the heap,
     /// so no shape, key or fingerprint sees it; merged per case like `ended`.
     pub arc: Option<Box<[ArcAxis<D>; 2]>>,
 }

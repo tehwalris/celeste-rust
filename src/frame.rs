@@ -427,18 +427,18 @@ pub struct Slot {
     /// first input id and a bit per lane (`ForwardSink::ids_in`).
     pub pred_base: Vec<u64>,
     pub pred_mask: Vec<u64>,
-    /// Predecessors from OTHER slices of the same kernel call (the call
-    /// dedups its emissions, so a row is pushed once per call and its
-    /// later producers land here): `(row, slice base, lane mask)`.
-    pub extra: Vec<(u32, u64, u64)>,
+    /// The remainder transfer of the lanes in `pred_mask`
+    /// (`ForwardSink::xfer_id`): lanes with another transfer go to `extra`.
+    pub pred_xfer: Vec<u32>,
+    /// Predecessors from OTHER slices of the same kernel call, or with
+    /// another transfer (the call dedups its emissions, so a row is pushed
+    /// once per call and its later producers land here): `(row, slice base,
+    /// transfer, lane mask)`.
+    pub extra: Vec<(u32, u64, u32, u64)>,
     /// Per row, the index of its latest `extra` entry (`u32::MAX`: none).
     /// The kernel emits slice by slice, so a row's producers from the
     /// current slice always merge into that entry.
     pub last_extra: Vec<u32>,
-    /// THE ARC EDGES (`search::arc_edges`): per producer of a queued row,
-    /// `(row, slice base, x, y, lane mask)` - the transfer is per producer,
-    /// not per row, so these are kept beside the masks, not in them.
-    pub arc: Vec<(u32, u64, crate::search::arc_edges::AxisXfer, crate::search::arc_edges::AxisXfer, u64)>,
     /// Bumped at every flush; a row ref (`ForwardSink::row_ref`) carries
     /// the generation it was made under, so a ref into a flushed queue is
     /// recognised as stale rather than reaching another cell's rows.
@@ -473,9 +473,9 @@ impl Slot {
             cells: Vec::new(),
             pred_base: Vec::new(),
             pred_mask: Vec::new(),
+            pred_xfer: Vec::new(),
             extra: Vec::new(),
             last_extra: Vec::new(),
-            arc: Vec::new(),
             gen: 0,
         }
     }
@@ -511,9 +511,9 @@ impl Slot {
         self.cells.clear();
         self.pred_base.clear();
         self.pred_mask.clear();
+        self.pred_xfer.clear();
         self.extra.clear();
         self.last_extra.clear();
-        self.arc.clear();
         self.gen = self.gen.wrapping_add(1);
     }
 
@@ -722,6 +722,7 @@ fn append_record(
     worker: u32,
     target: u64,
     base: u64,
+    xfer: u32,
     mask: u64,
 ) -> Result<()> {
     let layer = id_layer(target) as usize;
@@ -729,7 +730,7 @@ fn append_record(
         edge_bufs.resize_with(layer + 1, Vec::new);
     }
     let buf = &mut edge_bufs[layer];
-    crate::search::edges::encode_record(buf, target, base, mask);
+    crate::search::edges::encode_record(buf, target, base, xfer, mask);
     *edge_records += 1;
     if buf.len() >= EDGE_BUF_BYTES {
         write_edges(dir, frame, layer, worker, buf)?;
@@ -844,27 +845,23 @@ pub struct ForwardSink<'a> {
     pub ids_in: Option<&'a [u64]>,
     /// Lanes of the block being run that must not be expanded.
     pub skip_in: Option<&'a [bool]>,
-    /// Where the edges go: `<dir>/l{target layer}/w{worker}.bin`, records
-    /// of `(target id u64, slice base id u64, lane mask u16)`, appended as
-    /// the per-layer buffers fill. `None`: no recording.
+    /// Where the edges go: `<dir>/raw/f{frame}/l{target layer}_w{worker}.bin`
+    /// (`search::edges::encode_record`), appended as the per-layer buffers
+    /// fill. `None`: no recording.
     edges_dir: Option<std::path::PathBuf>,
     edge_bufs: Vec<Vec<u8>>,
     pub edge_records: u64,
     /// The within-call dedup cache (`RowCache`), written back by the flush.
     pub seen: celeste_engine::kernel::RowCache,
     /// Direct-mapped merge of the edges to already-flushed states:
-    /// `(target, base, mask)` per slot, an entry evicted or drained at the
-    /// call's end becomes a record.
-    direct: Vec<(u64, u64, u64)>,
-    /// THE ARC-EDGE STREAM (`search::arc_edges`): recorded when edges are
-    /// (`edges_dir`) and `CELESTE_ARC_EDGES=1`. The records of producers of
-    /// rows already flushed (their ids known), merged at the call's end;
-    /// the encoded records waiting to be appended to this worker's file.
-    pub arc_on: bool,
-    arc_direct: Vec<crate::search::arc_edges::Rec>,
-    arc_recs: Vec<crate::search::arc_edges::Rec>,
-    arc_buf: Vec<u8>,
-    pub arc_records: u64,
+    /// `(target, base, transfer, mask)` per slot, an entry evicted or
+    /// drained at the call's end becomes a record.
+    direct: Vec<(u64, u64, u32, u64)>,
+    /// THE TRANSFERS (`search::arc_edges`): this worker's interned (x, y)
+    /// pairs, an edge record carrying the index; the table is written beside
+    /// the frame's raw records (`edges::raw_xfer_path`).
+    xfer_ids: rustc_hash::FxHashMap<crate::search::arc_edges::Pair, u32>,
+    xfer_tab: Vec<crate::search::arc_edges::Pair>,
     /// Time spent encoding and writing edge records (this worker).
     pub t_edges: std::time::Duration,
     /// Time spent in the ladder filter (this worker).
@@ -926,11 +923,8 @@ impl<'a> ForwardSink<'a> {
             edge_records: 0,
             seen: celeste_engine::kernel::RowCache::new(),
             direct: Vec::new(),
-            arc_on: false,
-            arc_direct: Vec::new(),
-            arc_recs: Vec::new(),
-            arc_buf: Vec::new(),
-            arc_records: 0,
+            xfer_ids: Default::default(),
+            xfer_tab: Vec::new(),
             t_edges: std::time::Duration::ZERO,
             t_filter: std::time::Duration::ZERO,
             pieces: Default::default(),
@@ -972,87 +966,51 @@ impl<'a> ForwardSink<'a> {
         s.frame = frame;
         s.worker = worker;
         s.edges_dir = edges_dir.map(|p| p.to_path_buf());
-        s.arc_on = s.edges_dir.is_some() && crate::search::arc_edges::enabled();
         s
     }
 
-    /// Arc edges: lane `lane` of the slice based at `base` produced the row
-    /// just pushed into queue `q`, with the transfer `t`.
+    /// The transfer pair `t` as this worker's id (interned on first use).
     #[inline]
-    pub fn arc_queued(&mut self, q: usize, base: u64, lane: usize, t: [crate::search::arc_edges::AxisXfer; 2]) {
-        let s = &mut self.slots[q];
-        let r = s.rows() as u32 - 1;
-        s.arc.push((r, base, t[0], t[1], 1u64 << lane));
-    }
-
-    /// Arc edges: lane `lane` of the slice based at `base` also produced the
-    /// queued row `row_ref` points at (`mark_pred` just accepted it).
-    #[inline]
-    pub fn arc_at_ref(&mut self, row_ref: u64, base: u64, lane: usize, t: [crate::search::arc_edges::AxisXfer; 2]) {
-        let (gen, q, r) = ((row_ref >> 32) as u16, ((row_ref >> 8) & 0xff_ffff) as usize, (row_ref & 0xff) as u32);
-        let s = &mut self.slots[q];
-        assert!(s.live && s.gen == gen && (r as usize) < s.pred_mask.len(), "arc edges: a row ref mark_pred accepted is stale");
-        match s.arc.last_mut() {
-            Some(e) if (e.0, e.1, e.2, e.3) == (r, base, t[0], t[1]) => e.4 |= 1u64 << lane,
-            _ => s.arc.push((r, base, t[0], t[1], 1u64 << lane)),
+    pub fn xfer_id(&mut self, t: crate::search::arc_edges::Pair) -> u32 {
+        if let Some(&id) = self.xfer_ids.get(&t) {
+            return id;
         }
-    }
-
-    /// Arc edges: lane `lane` of the slice based at `base` produced the
-    /// already flushed state `target` (`direct_edge`'s twin).
-    #[inline]
-    pub fn arc_direct(&mut self, target: u64, base: u64, lane: usize, t: [crate::search::arc_edges::AxisXfer; 2]) {
-        self.arc_direct.push((target, base, t[0], t[1], 1u64 << lane));
-    }
-
-    /// Merge `arc_recs` and encode them into the buffer, appending it to the
-    /// worker's file of this frame when full.
-    fn arc_write(&mut self) -> Result<()> {
-        if self.arc_recs.is_empty() {
-            return Ok(());
-        }
-        crate::search::arc_edges::merge(&mut self.arc_recs);
-        for r in &self.arc_recs {
-            crate::search::arc_edges::encode(&mut self.arc_buf, r);
-        }
-        self.arc_records += self.arc_recs.len() as u64;
-        self.arc_recs.clear();
-        if self.arc_buf.len() >= EDGE_BUF_BYTES {
-            let dir = self.edges_dir.as_deref().expect("arc edges without an edges dir");
-            crate::search::arc_edges::append(dir, self.frame, self.worker, &mut self.arc_buf)?;
-        }
-        Ok(())
+        let id = u32::try_from(self.xfer_tab.len()).ok().filter(|&id| id != crate::search::edges::NO_XFER).expect("transfer table past u32");
+        self.xfer_tab.push(t);
+        self.xfer_ids.insert(t, id);
+        id
     }
 
     /// One edge record: `target` (a state id) has the lanes of `mask` in
-    /// the slice based at `base` as predecessors.
+    /// the slice based at `base` as predecessors, with the transfer `xfer`.
     #[inline]
-    fn record(&mut self, target: u64, base: u64, mask: u64) -> Result<()> {
+    fn record(&mut self, target: u64, base: u64, xfer: u32, mask: u64) -> Result<()> {
         let dir = self.edges_dir.as_deref().expect("recording without an edges dir");
-        append_record(&mut self.edge_bufs, &mut self.edge_records, dir, self.frame, self.worker, target, base, mask)
+        append_record(&mut self.edge_bufs, &mut self.edge_records, dir, self.frame, self.worker, target, base, xfer, mask)
     }
 
     /// Lane `lane` of the slice based at `base` produced the (already
-    /// flushed) state `target`: merged with the slice's other lanes in
-    /// the direct-mapped cache, recorded on eviction.
+    /// flushed) state `target` with the transfer `xfer`: merged with the
+    /// slice's other lanes of that transfer in the direct-mapped cache,
+    /// recorded on eviction.
     #[inline]
-    pub fn direct_edge(&mut self, target: u64, base: u64, lane: usize) {
+    pub fn direct_edge(&mut self, target: u64, base: u64, xfer: u32, lane: usize) {
         if self.edges_dir.is_none() {
             return;
         }
         if self.direct.is_empty() {
-            self.direct = vec![(u64::MAX, 0, 0); DIRECT_SLOTS];
+            self.direct = vec![(u64::MAX, 0, 0, 0); DIRECT_SLOTS];
         }
-        let i = (celeste_engine::runtime2::mix64(target ^ base.rotate_left(17)) as usize) & (DIRECT_SLOTS - 1);
+        let i = (celeste_engine::runtime2::mix64(target ^ base.rotate_left(17) ^ (xfer as u64).rotate_left(41)) as usize) & (DIRECT_SLOTS - 1);
         let e = self.direct[i];
-        if e.0 == target && e.1 == base {
-            self.direct[i].2 |= 1u64 << lane;
+        if e.0 == target && e.1 == base && e.2 == xfer {
+            self.direct[i].3 |= 1u64 << lane;
             return;
         }
         if e.0 != u64::MAX {
-            self.record(e.0, e.1, e.2).expect("recording an edge");
+            self.record(e.0, e.1, e.2, e.3).expect("recording an edge");
         }
-        self.direct[i] = (target, base, 1u64 << lane);
+        self.direct[i] = (target, base, xfer, 1u64 << lane);
     }
 
     /// The step's end of a kernel call: the merge cache drains.
@@ -1060,14 +1018,10 @@ impl<'a> ForwardSink<'a> {
         for i in 0..self.direct.len() {
             let e = self.direct[i];
             if e.0 != u64::MAX {
-                self.record(e.0, e.1, e.2).expect("recording an edge");
-                self.direct[i] = (u64::MAX, 0, 0);
+                self.record(e.0, e.1, e.2, e.3).expect("recording an edge");
+                self.direct[i] = (u64::MAX, 0, 0, 0);
             }
         }
-        // The flushes' records (`arc_recs`, written here rather than in the
-        // flush, which holds its queue) and the direct ones.
-        self.arc_recs.append(&mut self.arc_direct);
-        self.arc_write().expect("recording arc edges");
     }
 
     /// The step's handle on the row it just pushed into queue `q` (its
@@ -1085,25 +1039,25 @@ impl<'a> ForwardSink<'a> {
     }
 
     /// Lane `lane` of the slice based at `base` also produced the row
-    /// `row_ref` points at. False if that queue was flushed since (the row
-    /// is gone; the caller pushes the row again).
+    /// `row_ref` points at, with the transfer `xfer`. False if that queue
+    /// was flushed since (the row is gone; the caller pushes the row again).
     #[inline]
-    pub fn mark_pred(&mut self, row_ref: u64, base: u64, lane: usize) -> bool {
+    pub fn mark_pred(&mut self, row_ref: u64, base: u64, xfer: u32, lane: usize) -> bool {
         let (gen, q, r) = ((row_ref >> 32) as u16, ((row_ref >> 8) & 0xff_ffff) as usize, (row_ref & 0xff) as usize);
         let s = &mut self.slots[q];
         if !s.live || s.gen != gen || r >= s.pred_mask.len() {
             return false;
         }
-        if s.pred_base[r] == base {
+        if s.pred_base[r] == base && s.pred_xfer[r] == xfer {
             s.pred_mask[r] |= 1u64 << lane;
             return true;
         }
         let last = s.last_extra[r];
-        if last != u32::MAX && s.extra[last as usize].1 == base {
-            s.extra[last as usize].2 |= 1u64 << lane;
+        if last != u32::MAX && s.extra[last as usize].1 == base && s.extra[last as usize].2 == xfer {
+            s.extra[last as usize].3 |= 1u64 << lane;
         } else {
             s.last_extra[r] = s.extra.len() as u32;
-            s.extra.push((r as u32, base, 1u64 << lane));
+            s.extra.push((r as u32, base, xfer, 1u64 << lane));
         }
         true
     }
@@ -1264,21 +1218,11 @@ impl<'a> ForwardSink<'a> {
                 let t_e = std::time::Instant::now();
                 let (row_uniq, ids_buf) = (&self.row_uniq, &self.ids_buf);
                 let (edge_bufs, edge_records, frame, worker) = (&mut self.edge_bufs, &mut self.edge_records, self.frame, self.worker);
-                let rows = slot.pred_base.iter().zip(&slot.pred_mask).enumerate().map(|(r, (&b, &m))| (r as u32, b, m));
-                for (r, b, m) in rows.chain(slot.extra.iter().copied()) {
+                let rows = slot.pred_base.iter().zip(&slot.pred_xfer).zip(&slot.pred_mask).enumerate().map(|(r, ((&b, &x), &m))| (r as u32, b, x, m));
+                for (r, b, x, m) in rows.chain(slot.extra.iter().copied()) {
                     let u = row_uniq[r as usize];
                     if u != u32::MAX {
-                        append_record(edge_bufs, edge_records, edges_dir, frame, worker, ids_buf[u as usize], b, m)?;
-                    }
-                }
-                // The arc records: each producer of a row, with its transfer,
-                // to the row's state.
-                if self.arc_on {
-                    for &(r, b, x, y, m) in &slot.arc {
-                        let u = row_uniq[r as usize];
-                        if u != u32::MAX {
-                            self.arc_recs.push((ids_buf[u as usize], b, x, y, m));
-                        }
+                        append_record(edge_bufs, edge_records, edges_dir, frame, worker, ids_buf[u as usize], b, x, m)?;
                     }
                 }
                 // Write each row's fate back into the dedup cache: a later
@@ -1335,9 +1279,14 @@ impl<'a> ForwardSink<'a> {
                     write_edges(&dir, self.frame, layer, self.worker, buf)?;
                 }
             }
-            self.arc_write()?;
-            if !self.arc_buf.is_empty() {
-                crate::search::arc_edges::append(&dir, self.frame, self.worker, &mut self.arc_buf)?;
+            if !self.xfer_tab.is_empty() {
+                let mut buf = Vec::with_capacity(self.xfer_tab.len() * crate::search::arc_edges::PAIR_BYTES);
+                for p in &self.xfer_tab {
+                    crate::search::arc_edges::encode_pair(&mut buf, p);
+                }
+                let path = crate::search::edges::raw_xfer_path(&dir, self.frame, self.worker);
+                std::fs::create_dir_all(path.parent().expect("a raw dir"))?;
+                std::fs::write(path, buf)?;
             }
         }
         let mut out = Vec::new();
@@ -1375,9 +1324,6 @@ impl<'a> ForwardSink<'a> {
     pub fn emit_row(&mut self, row: &Rt2, cell: u32) -> Result<()> {
         debug_assert_eq!(row.width, 1);
         debug_assert_eq!(row.row_keys.len(), 1, "an emitted row carries its key");
-        // The reference engine computes no transfer: its edges would have no
-        // arc records (`search::arc_edges`).
-        anyhow::ensure!(!self.arc_on, "arc edges (CELESTE_ARC_EDGES=1) are recorded by the kernels only, not the reference engine");
         let q = self.queue(row.shape_hash, cell, || {
             // The skeleton from the row itself: numeric and boolean cells
             // vary (typed, empty), the rest is uniform - which every row
@@ -2162,7 +2108,6 @@ impl ForwardState {
             last = done;
         }
         crate::search::edges::discard_after(&edges_dir, last)?;
-        crate::search::arc_edges::discard_after(&edges_dir, last)?;
         // Every layer's keys into the door, one file per unit of work.
         let mut files: Vec<(u32, u32, std::path::PathBuf)> = Vec::new();
         for f in 0..=last {
@@ -2282,9 +2227,6 @@ impl ForwardState {
             let t_frame = std::time::Instant::now();
             let frontier = std::mem::take(&mut self.frontier);
             let edges_dir = dir.join("edges");
-            // Its arc records are appended to: what an earlier run left of
-            // this frame's goes first.
-            crate::search::arc_edges::reset_frame(&edges_dir, frame)?;
             let (mut next, won, st) =
                 forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filter, frame, Some(&edges_dir))?;
             // The PREVIOUS frame's compaction ran behind this wave; it is
@@ -3112,22 +3054,28 @@ mod tests {
             s.cells.push(0);
             s.pred_base.push(1000 + q as u64 * 16);
             s.pred_mask.push(1);
+            s.pred_xfer.push(7);
             s.last_extra.push(u32::MAX);
         }
         let r = sink.row_ref(299);
         assert!(r & celeste_engine::kernel::RowCache::ID_FLAG == 0);
-        assert!(sink.mark_pred(r, 1000 + 299 * 16, 3));
+        assert!(sink.mark_pred(r, 1000 + 299 * 16, 7, 3));
         assert_eq!(sink.slots[299].pred_mask[0], 0b1001);
         assert_eq!(sink.slots[43].pred_mask[0], 1, "no other queue's row was touched");
         // Another slice of the same call: an extra entry on the same row.
-        assert!(sink.mark_pred(r, 5000, 2));
-        assert_eq!(sink.slots[299].extra, vec![(0, 5000, 0b100u64)]);
+        assert!(sink.mark_pred(r, 5000, 7, 2));
+        assert_eq!(sink.slots[299].extra, vec![(0, 5000, 7, 0b100u64)]);
         // Lanes up to 63 (a 64-lane group).
-        assert!(sink.mark_pred(r, 1000 + 299 * 16, 63));
+        assert!(sink.mark_pred(r, 1000 + 299 * 16, 7, 63));
         assert_eq!(sink.slots[299].pred_mask[0], 0b1001 | (1 << 63));
+        // The same slice with another transfer: its own entry, not the mask.
+        assert!(sink.mark_pred(r, 1000 + 299 * 16, 8, 5));
+        assert!(sink.mark_pred(r, 1000 + 299 * 16, 8, 6));
+        assert_eq!(sink.slots[299].pred_mask[0], 0b1001 | (1 << 63));
+        assert_eq!(sink.slots[299].extra[1], (0, 1000 + 299 * 16, 8, 0b110_0000u64));
         // A flushed queue's ref is stale.
         sink.slots[299].clear();
-        assert!(!sink.mark_pred(r, 1000 + 299 * 16, 0));
+        assert!(!sink.mark_pred(r, 1000 + 299 * 16, 7, 0));
     }
     use super::*;
     use crate::trace::refengine::RefEngine;

@@ -1,17 +1,17 @@
-//! THE ARC-EDGE STREAM (plans/arcs.md, design step 1): per recorded edge of
-//! a level-0 forward, what the frame did to the player's sub-pixel remainder
-//! on each axis, as a GUARD (the piece of the circle the edge is taken from)
-//! and an ACTION (a rotation, or a collision's constant).
+//! THE TRANSFERS (plans/architecture.md, "Arcs"): per recorded edge of a
+//! forward, what the frame did to the player's sub-pixel remainder on each
+//! axis, as a GUARD (the piece of the circle the edge is taken from) and an
+//! ACTION (a rotation, or a collision's constant).
 //!
-//! `CELESTE_ARC_EDGES=1` turns it on. Off, nothing changes anywhere: the
-//! tracer captures nothing, the kernels have no extra roots, the forward
-//! writes no extra file. On, every traced frame at rem Bits(0)
-//! (`widen::WidenMode::Level0`) captures, per body, the transfer roots
-//! (`trace::verify::FrameOut::arc`), the kernel computes them beside the row
-//! without storing them in it (no key, column, dedupe or checkpoint sees
-//! them), and the forward writes one record per (target, predecessor slice,
-//! transfer) to `<level>/edges/arc/f{frame}/w{worker}.bin`, beside today's
-//! edge records (which are unchanged). Levels with a finer rem record no arcs.
+//! Always on: every traced frame at rem Bits(0) (`widen::WidenMode::Level0`)
+//! captures, per body, the transfer roots (`trace::verify::FrameOut::arc`);
+//! the kernel computes them beside the row without storing them in it (no
+//! key, column, dedupe or checkpoint sees them) and decodes each producer's
+//! transfer here; the forward interns the (x, y) pair per worker
+//! (`ForwardSink::xfer_id`) and the edge record carries its id. The
+//! compaction turns the workers' ids into one table per frame
+//! (`search::edges`, `xfer/f{frame}.bin`), so a run's records are keyed by
+//! (target, base, transfer) and a mask is OR-ed only across equal transfers.
 //!
 //! ## What the kernel computes per axis (`RawAxis`)
 //!
@@ -61,25 +61,10 @@
 //!     the whole circle or nothing and any action into it is exact);
 //!     `fin` anything else (an interval that is not the image): REFUSED.
 //!
-//! A refusal is FATAL in the forward (`ForwardSink`): the record would be a
-//! claim about the remainder that nothing checked.
-
-use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result};
+//! A refusal is FATAL in the forward (the kernel's append step): the record
+//! would be a claim about the remainder that nothing checked.
 
 use super::arcs::{self, Action, Seg, Set, Transfer, CIRCLE};
-
-/// `CELESTE_ARC_EDGES=1`: record the arc-edge stream (read once).
-pub fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("CELESTE_ARC_EDGES") {
-        Ok(v) if v == "1" => true,
-        Ok(v) if v.is_empty() || v == "0" => false,
-        Ok(v) => panic!("CELESTE_ARC_EDGES={v}: expected 1 or 0"),
-        Err(_) => false,
-    })
-}
 
 const HALF: i64 = 32768;
 const ONE: i64 = 65536;
@@ -130,15 +115,25 @@ impl AxisXfer {
     }
 }
 
-/// One arc-edge record: the predecessors `mask` (bits over the 64 ids from
-/// `base`) reach `target` (`frame::pack_id`) with the transfer `x`, `y`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ArcEdge {
-    pub target: u64,
-    pub base: u64,
-    pub mask: u64,
-    pub x: Transfer,
-    pub y: Transfer,
+/// A transfer pair (x, y) as one edge record's id refers to it.
+pub type Pair = (AxisXfer, AxisXfer);
+
+/// Bytes per encoded pair: per axis `lo`, `hi` (u32), `tag` (u8), `val` (i32).
+pub const PAIR_BYTES: usize = 2 * 13;
+
+pub fn encode_pair(out: &mut Vec<u8>, p: &Pair) {
+    for a in [p.0, p.1] {
+        out.extend_from_slice(&a.lo.to_le_bytes());
+        out.extend_from_slice(&a.hi.to_le_bytes());
+        out.push(a.tag);
+        out.extend_from_slice(&a.val.to_le_bytes());
+    }
+}
+
+pub fn decode_pair(b: &[u8]) -> Pair {
+    let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let axis = |o: usize| AxisXfer { lo: u32_at(o), hi: u32_at(o + 4), tag: b[o + 8], val: u32_at(o + 9) as i32 };
+    (axis(0), axis(13))
 }
 
 /// Decode one axis (the module doc's rules). `Err` is a refusal.
@@ -191,127 +186,6 @@ pub fn decode_axis(r: &RawAxis) -> std::result::Result<AxisXfer, String> {
         Some((a, b)) if a == b => AxisXfer::konst(lo, hi, a),
         Some(fin) => Err(format!("the final remainder {fin:?} is neither the image {image:?} nor a point")),
     }
-}
-
-/// A record before it is written: `(target, base, x, y, mask)`.
-pub type Rec = (u64, u64, AxisXfer, AxisXfer, u64);
-
-/// Sort `recs` and OR the masks of records alike in everything else.
-pub fn merge(recs: &mut Vec<Rec>) {
-    recs.sort_unstable_by_key(|r| (r.0, r.1, r.2, r.3));
-    recs.dedup_by(|b, a| {
-        if (a.0, a.1, a.2, a.3) == (b.0, b.1, b.2, b.3) {
-            a.4 |= b.4;
-            true
-        } else {
-            false
-        }
-    });
-}
-
-/// Bytes per record: target, base, mask (u64 each), then per axis `lo`,
-/// `hi` (u32), `tag` (u8), `val` (i32).
-pub const RECORD_BYTES: usize = 24 + 2 * 13;
-
-pub fn encode(out: &mut Vec<u8>, r: &Rec) {
-    out.extend_from_slice(&r.0.to_le_bytes());
-    out.extend_from_slice(&r.1.to_le_bytes());
-    out.extend_from_slice(&r.4.to_le_bytes());
-    for a in [r.2, r.3] {
-        out.extend_from_slice(&a.lo.to_le_bytes());
-        out.extend_from_slice(&a.hi.to_le_bytes());
-        out.push(a.tag);
-        out.extend_from_slice(&a.val.to_le_bytes());
-    }
-}
-
-fn decode_rec(b: &[u8]) -> Rec {
-    let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-    let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-    let axis = |o: usize| AxisXfer { lo: u32_at(o), hi: u32_at(o + 4), tag: b[o + 8], val: u32_at(o + 9) as i32 };
-    (u64_at(0), u64_at(8), axis(24), axis(37), u64_at(16))
-}
-
-/// The directory of frame `frame`'s records under an edges dir.
-pub fn frame_dir(edges_dir: &Path, frame: u32) -> PathBuf {
-    edges_dir.join("arc").join(format!("f{frame:03}"))
-}
-
-/// Worker `worker`'s record file of frame `frame`.
-pub fn path(edges_dir: &Path, frame: u32, worker: u32) -> PathBuf {
-    frame_dir(edges_dir, frame).join(format!("w{worker:03}.bin"))
-}
-
-/// Append `buf` to worker `worker`'s file of frame `frame`, and clear it.
-pub fn append(edges_dir: &Path, frame: u32, worker: u32, buf: &mut Vec<u8>) -> Result<()> {
-    use std::io::Write;
-    let p = path(edges_dir, frame, worker);
-    std::fs::create_dir_all(frame_dir(edges_dir, frame))?;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p).with_context(|| format!("opening {}", p.display()))?;
-    f.write_all(buf)?;
-    buf.clear();
-    Ok(())
-}
-
-/// Frame `frame` is about to be computed: whatever an earlier run left of
-/// its records goes (the files are appended to).
-pub fn reset_frame(edges_dir: &Path, frame: u32) -> Result<()> {
-    let d = frame_dir(edges_dir, frame);
-    if d.is_dir() {
-        std::fs::remove_dir_all(&d)?;
-    }
-    Ok(())
-}
-
-/// A resume trusts frames up to `last`: every later frame's records go.
-pub fn discard_after(edges_dir: &Path, last: u32) -> Result<()> {
-    let root = edges_dir.join("arc");
-    for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
-        let name = e.file_name();
-        let f: Option<u32> = name.to_str().and_then(|n| n.strip_prefix('f')).and_then(|n| n.parse().ok());
-        if f.is_some_and(|f| f > last) {
-            std::fs::remove_dir_all(e.path())?;
-        }
-    }
-    Ok(())
-}
-
-/// Every record of frame `frame` (its targets are in any layer up to
-/// `frame`, its predecessors in layer `frame - 1`), streamed in file order
-/// without holding the frame: a late frame of a big room is gigabytes.
-pub fn for_each_rec(edges_dir: &Path, frame: u32, mut f: impl FnMut(Rec)) -> Result<()> {
-    use std::io::Read;
-    let mut files: Vec<PathBuf> = std::fs::read_dir(frame_dir(edges_dir, frame))
-        .with_context(|| format!("no arc records for f{frame} under {}", edges_dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "bin"))
-        .collect();
-    files.sort();
-    let mut buf = vec![0u8; RECORD_BYTES * (1 << 16)];
-    for p in files {
-        let mut file = std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
-        let mut have = 0;
-        loop {
-            let n = file.read(&mut buf[have..])?;
-            if n == 0 {
-                anyhow::ensure!(have == 0, "{}: a partial record at the end", p.display());
-                break;
-            }
-            have += n;
-            let whole = have - have % RECORD_BYTES;
-            buf[..whole].chunks_exact(RECORD_BYTES).for_each(|b| f(decode_rec(b)));
-            buf.copy_within(whole..have, 0);
-            have -= whole;
-        }
-    }
-    Ok(())
-}
-
-/// Every record of frame `frame`, decoded.
-pub fn read_frame(edges_dir: &Path, frame: u32) -> Result<Vec<ArcEdge>> {
-    let mut out = Vec::new();
-    for_each_rec(edges_dir, frame, |r| out.push(ArcEdge { target: r.0, base: r.1, mask: r.4, x: r.2.transfer(), y: r.3.transfer() }))?;
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -394,18 +268,14 @@ mod tests {
     }
 
     #[test]
-    fn records_round_trip_and_merge() {
+    fn pairs_round_trip() {
         let a = AxisXfer { lo: 3, hi: 9, tag: 0, val: 12 };
         let b = AxisXfer { lo: 0, hi: CIRCLE, tag: 1, val: 32768 };
-        let mut v = vec![(5, 64, a, b, 1), (5, 64, a, b, 4), (5, 64, b, a, 2), (1, 0, a, a, 8)];
-        merge(&mut v);
-        assert_eq!(v, vec![(1, 0, a, a, 8), (5, 64, b, a, 2), (5, 64, a, b, 5)]);
         let mut buf = Vec::new();
-        for r in &v {
-            encode(&mut buf, r);
-        }
-        assert_eq!(buf.len(), 3 * RECORD_BYTES);
-        let back: Vec<Rec> = buf.chunks_exact(RECORD_BYTES).map(decode_rec).collect();
-        assert_eq!(back, v);
+        encode_pair(&mut buf, &(a, b));
+        encode_pair(&mut buf, &(b, a));
+        assert_eq!(buf.len(), 2 * PAIR_BYTES);
+        assert_eq!(decode_pair(&buf[..PAIR_BYTES]), (a, b));
+        assert_eq!(decode_pair(&buf[PAIR_BYTES..]), (b, a));
     }
 }

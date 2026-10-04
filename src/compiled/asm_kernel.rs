@@ -76,8 +76,8 @@ struct AsmBody {
     /// `None`: this outcome has no player object, or its `x`/`y` is not a
     /// plain number (every row is `NO_CELL`, as `block_cells` says).
     pos: Option<[PosSrc; 4]>,
-    /// The transfer roots (`search::arc_edges`): `None` unless the set was
-    /// traced in arc mode.
+    /// The transfer roots (`search::arc_edges`): `None` unless the set is
+    /// a level-0 one.
     arc: Option<ArcSlots>,
 }
 
@@ -94,7 +94,7 @@ impl ArcSlots {
     /// Lane `i`'s transfer, decoded (`arc_edges::decode_axis`). A refusal,
     /// or a `took` the lane does not decide, is FATAL: the record would be
     /// a claim about the remainder nothing checked.
-    fn transfer(&self, buf: &[u8], i: usize, chunk: &Rt2, lane: usize, outcome: usize) -> [crate::search::arc_edges::AxisXfer; 2] {
+    fn transfer(&self, buf: &[u8], i: usize, chunk: &Rt2, lane: usize, outcome: usize) -> crate::search::arc_edges::Pair {
         use crate::search::arc_edges::{decode_axis, RawAxis};
         let ival = |k: usize| -> (i32, i32) {
             let (off, kind) = self.roots[k];
@@ -114,7 +114,7 @@ impl ArcSlots {
             let raw = RawAxis { took, pre: ival(base + 1), frag: ival(base + 2), ox: ival(base + 3), fin: self.fin.then(|| ival(base + 4)) };
             decode_axis(&raw).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}: {e} (raw {raw:?})", chunk.shape_hash))
         };
-        [axis(0), axis(1)]
+        (axis(0), axis(1))
     }
 }
 
@@ -512,11 +512,11 @@ impl AsmKernel {
                         runtime2::mix64(part.1.wrapping_add(h2)),
                     );
                     let cin = cell_in[lanes[i]];
-                    // THE ARC EDGE's transfer (`search::arc_edges`): per
-                    // producer, beside the edge, never in the row.
-                    let arc = match (&body.arc, sink.arc_on && slice_base.is_some()) {
-                        (Some(a), true) => Some(a.transfer(outbuf, i, chunk, lanes[i], body.outcome)),
-                        _ => None,
+                    // THE TRANSFER (`search::arc_edges`): per producer,
+                    // carried by the edge, never in the row.
+                    let xfer = match (&body.arc, slice_base) {
+                        (Some(a), Some(_)) => sink.xfer_id(a.transfer(outbuf, i, chunk, lanes[i], body.outcome)),
+                        _ => crate::search::edges::NO_XFER,
                     };
                     // EMISSION-TIME PROVENANCE (plans/buckets.md). The
                     // source of this row is lane `i` of this slice, and
@@ -539,23 +539,15 @@ impl AsmKernel {
                         }
                         match slice_base {
                             Some(b) if r & RowCache::ID_FLAG != 0 => {
-                                sink.direct_edge(r & !RowCache::ID_FLAG, b, glane(i));
-                                if let Some(t) = arc {
-                                    sink.arc_direct(r & !RowCache::ID_FLAG, b, glane(i), t);
-                                }
+                                sink.direct_edge(r & !RowCache::ID_FLAG, b, xfer, glane(i));
                                 continue;
                             }
                             Some(_) if r & RowCache::DROP_FLAG != 0 => continue,
                             // The row was flushed (a stale ref, only if
                             // the cache lost the flush's write-back): push
                             // it again; the flush merges duplicates by key.
-                            Some(b) if !sink.mark_pred(r, b, glane(i)) => {}
-                            Some(b) => {
-                                if let Some(t) = arc {
-                                    sink.arc_at_ref(r, b, glane(i), t);
-                                }
-                                continue;
-                            }
+                            Some(b) if !sink.mark_pred(r, b, xfer, glane(i)) => {}
+                            Some(_) => continue,
                             None => continue,
                         }
                     }
@@ -574,10 +566,8 @@ impl AsmKernel {
                     if let Some(b) = slice_base {
                         sink.slots[q].pred_base.push(b);
                         sink.slots[q].pred_mask.push(1u64 << (glane(i)));
+                        sink.slots[q].pred_xfer.push(xfer);
                         sink.slots[q].last_extra.push(u32::MAX);
-                        if let Some(t) = arc {
-                            sink.arc_queued(q, b, glane(i), t);
-                        }
                         sink.seen.set_ref(key, sink.row_ref(q));
                     }
                     sink.pushed(q).expect("flushing a full queue");

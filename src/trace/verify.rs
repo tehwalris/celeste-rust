@@ -86,7 +86,7 @@ pub struct FrameOut {
     /// heap shape only appears by actually advancing a frame, and the
     /// state an outcome ends in is the only thing that has that shape.
     pub st: State<Symbolic>,
-    /// THE TRANSFER ROOTS (`search::arc_edges`, a level-0 trace in arc mode;
+    /// THE TRANSFER ROOTS (`search::arc_edges`, a level-0 trace;
     /// empty otherwise): per axis x then y, `took`, `pre`, `frag`, `ox` (the
     /// player's split, `State::arc`) and `fin` (the player's remainder
     /// before the boundary widening; a placeholder 0 without a player at the
@@ -281,8 +281,8 @@ pub fn trace_frame<'a>(
         _ => 0,
     });
     it.d.unknown_atoms = 0;
-    // The arc capture (`search::arc_edges`): a level-0 trace in arc mode.
-    it.arc_capture = crate::search::arc_edges::enabled() && matches!(widen, Some(super::widen::WidenMode::Level0));
+    // The arc capture (`search::arc_edges`): every level-0 trace.
+    it.arc_capture = matches!(widen, Some(super::widen::WidenMode::Level0));
     // What the previous trace left if it failed part-way (a success takes
     // both below).
     it.raised.clear();

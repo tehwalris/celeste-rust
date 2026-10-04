@@ -68,7 +68,7 @@ pub struct FrameOutcome {
     /// emitter mirrors the boundary: these contribute the widened value from
     /// `KPART`, off the per-lane fold. See `OutField::widen_uniform`.
     pub widen: Vec<(u32, celeste_engine::runtime2::AV)>,
-    /// The transfer roots (`verify::FrameOut::arc`; empty unless arc mode),
+    /// The transfer roots (`verify::FrameOut::arc`; empty but at level 0),
     /// after `live` in a body's roots, and whether the outcome has a player
     /// at its end.
     pub arc: Vec<NodeId>,

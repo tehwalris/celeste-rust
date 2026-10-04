@@ -17,7 +17,7 @@
 //!                       exact forward (plans/arcs.md)
 //!   * `inspect`       - a row read by its named fields, for the diagnostics
 //!   * `arc_edges`     - per recorded edge, what the frame did to the
-//!                       player's remainder (`CELESTE_ARC_EDGES=1`)
+//!                       player's remainder (the transfer)
 //!
 //! The forward driver itself is `frame::forward_run` (src/frame.rs), on a
 //! `compiled::FrameEngine`.

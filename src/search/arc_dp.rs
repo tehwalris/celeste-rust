@@ -162,6 +162,122 @@ impl Graph {
     }
 }
 
+/// A level's rotation graph up to a horizon, loaded (`load`).
+pub struct Loaded {
+    pub graph: Graph,
+    /// The start's node index (layer 0, its frame file's row 0).
+    pub start: u32,
+    /// The remainder-free backward's marks: every id that wins by the
+    /// horizon with SOME remainder, with its deadline, by id (the start
+    /// always, at deadline 0 if the BFS did not reach it).
+    pub marks: Vec<(u64, u16)>,
+    /// The win rows of frames `1..=horizon`.
+    pub wins: Vec<u64>,
+    pub edges: usize,
+}
+
+/// The rotation graph of the tree in `dir` up to `horizon`: the
+/// remainder-free BFS over the recorded edges (`edges::bfs`) gives the nodes
+/// that can win by the horizon at all, and their deadlines; only the edges
+/// into them are read (`EdgeGraph::preds_at`, the BFS's lookup), and only
+/// those from marked nodes kept - an edge between other nodes is on no path
+/// to a win by the horizon with any remainder. Every loaded edge must carry
+/// its transfer (the tree was recorded at level 0).
+pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
+    use crate::frame::{frame_files, id_layer, pack_id};
+    let t0 = std::time::Instant::now();
+    let mut wins: Vec<u64> = Vec::new();
+    let mut start_id: Option<u64> = None;
+    for f in 0..=horizon {
+        for (seq, file) in frame_files(dir, f)? {
+            if f == 0 {
+                anyhow::ensure!(start_id.is_none(), "{}: more than one start file", dir.display());
+                start_id = Some(pack_id(0, seq, 0));
+            } else {
+                wins.extend(file.win_rows().iter().map(|&(row, _)| pack_id(f, seq, row)));
+            }
+        }
+    }
+    let start_id = start_id.ok_or_else(|| anyhow::anyhow!("{}: no frame-0 row", dir.display()))?;
+    let eg = super::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
+    let (bfs, _) = super::edges::bfs(&eg, horizon, wins.iter().copied());
+    let t_bfs = t0.elapsed();
+    // The BFS never marks layer 0 (the start is given): its deadline is 0
+    // when a win is exactly tight.
+    let mut deadline: FxHashMap<u64, u16> = bfs.with_deadlines().into_iter().collect();
+    deadline.entry(start_id).or_insert(0);
+    let mut marks: Vec<(u64, u16)> = deadline.iter().map(|(&id, &d)| (id, d)).collect();
+    marks.sort_unstable();
+    let mut ids: Vec<u64> = marks.iter().map(|&(id, _)| id).chain(wins.iter().copied()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let index: FxHashMap<u64, u32> = ids.iter().enumerate().map(|(i, &id)| (id, i as u32)).collect();
+    // Into every node, its edges of frames layer..=horizon from nodes; in
+    // parallel over chunks of targets.
+    let t1 = std::time::Instant::now();
+    let threads = crate::frame::threads().max(1);
+    let chunk = ids.len().div_ceil(threads * 8).max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let parts: Vec<anyhow::Result<Vec<(u32, Out)>>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads)
+            .map(|_| {
+                sc.spawn(|| -> anyhow::Result<Vec<(u32, Out)>> {
+                    let (mut out, mut buf) = (Vec::new(), Vec::new());
+                    loop {
+                        let lo = next.fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
+                        if lo >= ids.len() {
+                            return Ok(out);
+                        }
+                        for (k, &target) in ids[lo..(lo + chunk).min(ids.len())].iter().enumerate() {
+                            let dst = (lo + k) as u32;
+                            for frame in id_layer(target).max(1)..=horizon {
+                                buf.clear();
+                                eg.preds_at(target, frame, &mut buf);
+                                for e in &buf {
+                                    let mut pair = None;
+                                    let mut m = e.mask;
+                                    while m != 0 {
+                                        let lane = m.trailing_zeros() as u64;
+                                        m &= m - 1;
+                                        let Some(&src) = index.get(&(e.base + lane)) else { continue };
+                                        let (x, y) = match pair {
+                                            Some(p) => p,
+                                            None => {
+                                                let p = eg.pair(frame, e.xfer).ok_or_else(|| {
+                                                    anyhow::anyhow!("{}: an edge at f{frame} into {target:#x} has no transfer (id {:#x}): not a level-0 tree", dir.display(), e.xfer)
+                                                })?;
+                                                *pair.insert((p.0.transfer(), p.1.transfer()))
+                                            }
+                                        };
+                                        out.push((src, Out { dst, x, y }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("an edge loader panicked")).collect()
+    });
+    let parts: Vec<Vec<(u32, Out)>> = parts.into_iter().collect::<anyhow::Result<_>>()?;
+    let edges: usize = parts.iter().map(|p| p.len()).sum();
+    drop(index);
+    let t_read = t1.elapsed();
+    let t2 = std::time::Instant::now();
+    let graph = Graph::new(ids, parts, id_layer, wins.iter().copied(), Some(&deadline));
+    eprintln!(
+        "[arc] h{horizon}: {} marked nodes, {} win rows, {edges} edges; bfs {:.1} s, edges {:.1} s, graph {:.1} s",
+        marks.len(),
+        wins.len(),
+        t_bfs.as_secs_f64(),
+        t_read.as_secs_f64(),
+        t2.elapsed().as_secs_f64()
+    );
+    let start = graph.index(start_id).expect("the start is a node");
+    Ok(Loaded { graph, start, marks, wins, edges })
+}
+
 /// One frame's winning sets: the nodes (sorted) and their sets (shared
 /// with the neighbouring frames where unchanged).
 #[derive(Default)]
@@ -372,52 +488,6 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
     Winning { frames }
 }
 
-/// The EXACT PARTITION of each node's remainders, irrespective of any goal:
-/// the cut points pulled back from every future within `horizon` frames - two
-/// remainders with no cut between them behave identically on every path
-/// (a bisimulation of the remainder). Per frame `t`, per node occupiable at
-/// `t`, the cut points of its x and y circles (sorted). A cut is where an
-/// edge's guard begins or ends; a rotation carries a successor's cuts back
-/// (shifted), a collision's constant carries none. Two axes are partitioned
-/// separately (the product partition).
-pub fn partition(g: &Graph, horizon: u32) -> Vec<FxHashMap<u32, (Vec<u32>, Vec<u32>)>> {
-    let mut out: Vec<FxHashMap<u32, (Vec<u32>, Vec<u32>)>> = (0..=horizon).map(|_| FxHashMap::default()).collect();
-    for t in (0..horizon).rev() {
-        let (lo, hi) = out.split_at_mut(t as usize + 1);
-        let (cur, next) = (&mut lo[t as usize], &hi[0]);
-        for src in 0..g.len() as u32 {
-            if g.layer_of(src) > t || g.out_of(src).is_empty() {
-                continue;
-            }
-            let (mut xs, mut ys): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
-            for e in g.out_of(src) {
-                let cuts = |tr: &Transfer, succ: &[u32], acc: &mut Vec<u32>| {
-                    if tr.guard.lo != 0 {
-                        acc.push(tr.guard.lo);
-                    }
-                    if let Action::Rotate(v) = tr.action {
-                        for &c in succ {
-                            let back = apply(Action::Rotate(-v), c);
-                            if tr.takes(back) {
-                                acc.push(back);
-                            }
-                        }
-                    }
-                };
-                let (sx, sy) = next.get(&e.dst).map(|(a, b)| (a.as_slice(), b.as_slice())).unwrap_or((&[], &[]));
-                cuts(&e.x, sx, &mut xs);
-                cuts(&e.y, sy, &mut ys);
-            }
-            xs.sort_unstable();
-            xs.dedup();
-            ys.sort_unstable();
-            ys.dedup();
-            cur.insert(src, (xs, ys));
-        }
-    }
-    out
-}
-
 /// The OPTIMUM and a witness: the win frame (from frame 0) and the path to
 /// it (node id, remainder point) frame by frame.
 pub struct Found {
@@ -486,25 +556,57 @@ pub fn fragmentation<'a>(sets: impl Iterator<Item = &'a Region>) -> (usize, usiz
     (v.len(), q(0.5), q(0.9), q(1.0))
 }
 
-/// `rewrite arc-search --witness`: CONCRETE inputs inside the winning sets.
-/// A DFS from the room's start through the reference engine's concrete
-/// step (every input, every `rnd` leaf) admitting a successor only if its
-/// projection onto `level` is a node of `g` (`dir`'s tree, frames
-/// `0..=horizon`) whose winning set holds the successor's exact remainder.
-/// Frame `k` of the run reads `W_{from + k}` (the optimum's frames-left
-/// alignment); a state without a player reads the point (0, 0) (no edge cuts
-/// it). Prints the inputs, or the deepest frame such a run reaches; `save`
-/// gets `witness.txt` (the inputs, then `f x y` per frame, frame 0 the start).
-pub fn concrete_witness(
+/// A concrete witness: the inputs, and the player's cell after each (the
+/// start's first).
+pub struct Witness {
+    pub inputs: Vec<u8>,
+    pub cells: Vec<u32>,
+}
+
+impl Witness {
+    /// The inputs as a comma list (`concrete_run -i`, `pico8_diff/replay.py`).
+    pub fn inputs_text(&self) -> String {
+        self.inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
+    }
+
+    /// `witness.txt`: `inputs ...`, then `f x y` per frame (frame 0 the start).
+    pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let mut text = format!("inputs {}\n", self.inputs_text());
+        for (f, &c) in self.cells.iter().enumerate() {
+            match super::pos_graph::cell_xy(c) {
+                Some((x, y)) => text += &format!("{f} {x} {y}\n"),
+                None => text += &format!("{f} - -\n"),
+            }
+        }
+        Ok(std::fs::write(path, text)?)
+    }
+}
+
+/// THE CONCRETE COUNT-UP: the concrete optimum and its inputs, inside the
+/// winning sets. A DFS from the room's start through the reference
+/// engine's concrete step (every input, every `rnd` leaf) admitting a
+/// successor only if its projection onto `level` is a node of `g` (`dir`'s
+/// tree, frames `0..=horizon`) whose winning set holds the successor's
+/// exact remainder. A run of `f` frames reads `W_{horizon - f + k}` at its
+/// frame `k` (the optimum's frames-left alignment); a state without a player
+/// reads the point (0, 0) (no edge cuts it).
+///
+/// The DFS is EXHAUSTIVE (every input, every `rnd` leaf, a fully explored
+/// concrete state remembered per frame) and prunes only by W, which holds
+/// every concrete winner: so "no win within f" is a proof about the real
+/// game. The graph's optimum `first` is a lower bound (its objects may be
+/// coarse); counting f UP from it to the horizon, the first f with a witness
+/// is the concrete optimum (over every `rnd` draw: a leaf is a
+/// possibility). `None`: no concrete win by the horizon (the deepest run is
+/// printed, with why each successor of its last state is not admitted).
+pub fn concrete_count_up(
     dir: &std::path::Path,
     level: crate::interpreter::abstraction::Level,
     horizon: u32,
     g: &Graph,
     w: &Winning,
-    from: u32,
-    frames: u32,
-    save: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
+    first: u32,
+) -> anyhow::Result<Option<Witness>> {
     use crate::concrete::ConcreteEngine;
     use crate::frame::{frame_files, pack_id, widened_keys, wins_of, Block};
     use crate::interpreter::state::State;
@@ -532,7 +634,7 @@ pub fn concrete_witness(
             }
         }
     }
-    eprintln!("[witness] {} nodes keyed in {:.1} s; a concrete run of {frames} frames inside W from W_{from}", node.len(), t0.elapsed().as_secs_f64());
+    eprintln!("[witness] {} nodes keyed in {:.1} s; counting up from f{first}", node.len(), t0.elapsed().as_secs_f64());
     fn rem_of(rt2: &Rt2) -> Result<(u32, u32)> {
         let ids = crate::compiled::ids();
         let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((super::arcs::point(0), super::arcs::point(0))) };
@@ -606,22 +708,14 @@ pub fn concrete_witness(
         node: &node,
         w,
         level,
-        from,
-        frames,
+        from: horizon - first,
+        frames: first,
         dead: FxHashSet::default(),
         path: Vec::new(),
         cells: Vec::new(),
         steps: 0,
         deepest: (0, Vec::new()),
     };
-    // The DFS is EXHAUSTIVE (every input, every `rnd` leaf, a fully explored
-    // concrete state remembered per frame) and prunes only by W, which holds
-    // every concrete winner: so "no win within f" is a proof about the real
-    // game. The graph's optimum is a lower bound (its objects are coarse);
-    // count UP from it to the horizon - the first f with a witness is the
-    // concrete optimum (over every `rnd` draw: a leaf is a possibility).
-    // Checked on room (5,3) any%: arc 78, none within 78, a witness at 79 =
-    // the ladder's proven 79.
     let show = |v: &[u8]| v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
     let ok = loop {
         let t1 = std::time::Instant::now();
@@ -638,47 +732,148 @@ pub fn concrete_witness(
         cx.frames += 1;
         cx.from -= 1;
     };
-    if !ok {
-        println!("NO CONCRETE WITNESS inside W by f{horizon}: deepest f{}, inputs {}", cx.deepest.0, show(&cx.deepest.1));
-        // Why: from the deepest state, every input's successors - their
-        // node, exact remainder and that node's winning set.
-        let (d, prefix) = cx.deepest.clone();
-        let mut st = initial.clone();
-        for &b in &prefix {
-            let mut next = cx.eng.step_all(&st, b, &initial)?;
-            anyhow::ensure!(next.len() == 1, "the deepest prefix forks ({} leaves): not replayable here", next.len());
-            st = next.pop().expect("one leaf");
-        }
-        for byte in 0u8..64 {
-            for succ in cx.eng.step_all(&st, byte, &initial)? {
-                let b = Block::from_state(&succ)?;
-                let (shape, keys, cells) = widened_keys(&b, level)?;
-                let q = rem_of(b.rt2())?;
-                let at = super::pos_graph::cell_xy(cells[0]);
-                match node.get(&(shape, keys[0], cells[0])) {
-                    None => println!("  input {byte:2}: cell {at:?} - no node"),
-                    Some(&i) => {
-                        let t = cx.from + d + 1;
-                        let set: Vec<String> = w.at(t, i).map(|r| r.slabs().map(|(y, xs)| format!("y[{},{}) x{:?}", y.lo, y.hi, xs.iter().map(|x| (x.lo, x.hi)).collect::<Vec<_>>())).collect()).unwrap_or_default();
-                        println!("  input {byte:2}: cell {at:?} node {i} rem {q:?}: W_{t} {}", if set.is_empty() { "empty".to_string() } else { set.join(" ") });
-                    }
+    if ok {
+        let cells = std::iter::once(start_cell).chain(cx.cells.iter().copied()).collect();
+        return Ok(Some(Witness { inputs: cx.path.clone(), cells }));
+    }
+    println!("NO CONCRETE WITNESS inside W by f{horizon}: deepest f{}, inputs {}", cx.deepest.0, show(&cx.deepest.1));
+    // Why: from the deepest state, every input's successors - their node,
+    // exact remainder and that node's winning set.
+    let (d, prefix) = cx.deepest.clone();
+    let mut st = initial.clone();
+    for &b in &prefix {
+        let mut next = cx.eng.step_all(&st, b, &initial)?;
+        anyhow::ensure!(next.len() == 1, "the deepest prefix forks ({} leaves): not replayable here", next.len());
+        st = next.pop().expect("one leaf");
+    }
+    for byte in 0u8..64 {
+        for succ in cx.eng.step_all(&st, byte, &initial)? {
+            let b = Block::from_state(&succ)?;
+            let (shape, keys, cells) = widened_keys(&b, level)?;
+            let q = rem_of(b.rt2())?;
+            let at = super::pos_graph::cell_xy(cells[0]);
+            match node.get(&(shape, keys[0], cells[0])) {
+                None => println!("  input {byte:2}: cell {at:?} - no node"),
+                Some(&i) => {
+                    let t = cx.from + d + 1;
+                    let set: Vec<String> = w.at(t, i).map(|r| r.slabs().map(|(y, xs)| format!("y[{},{}) x{:?}", y.lo, y.hi, xs.iter().map(|x| (x.lo, x.hi)).collect::<Vec<_>>())).collect()).unwrap_or_default();
+                    println!("  input {byte:2}: cell {at:?} node {i} rem {q:?}: W_{t} {}", if set.is_empty() { "empty".to_string() } else { set.join(" ") });
                 }
             }
         }
-        return Ok(());
     }
-    println!("CONCRETE WITNESS: a win at f{}: {}", cx.path.len(), show(&cx.path));
+    Ok(None)
+}
+
+/// What the arc phase of a search found (`solve`).
+pub struct Solved {
+    /// The optimum over the rotation graph (exact in the remainder; a lower
+    /// bound when the level's objects are coarse). `None`: no win by the
+    /// horizon at all - the horizon is REFUTED.
+    pub arc: Option<u32>,
+    /// The concrete optimum and its witness (`concrete_count_up`), when
+    /// asked for and found.
+    pub concrete: Option<Witness>,
+}
+
+/// THE ARC PHASE over a finished level-0 tree in `dir` (frames and edges
+/// through `horizon`): load the rotation graph (`load`), the winning sets
+/// backward (`backward`), the optimum read off them (`optimum`), and with
+/// `witness` the concrete count-up from it. Prints `[gate]` lines - the
+/// marks' and each frame's winning sets' fingerprints over (shape, key,
+/// cell), which do not depend on the scheduling the ids do - and with
+/// `save`, writes the UI's arc pass there (`export-ui --forward-only --arc`):
+/// the remainder-free marks (`level0.marks.bin`), the ARC-MARKED nodes
+/// (`arc.marks.bin`: a node whose winning set is non-empty at some frame),
+/// both with `dist` the horizon minus the last frame the node still wins
+/// from, and `arc.txt`.
+pub fn solve(
+    dir: &std::path::Path,
+    level: crate::interpreter::abstraction::Level,
+    horizon: u32,
+    witness: bool,
+    save: Option<&std::path::Path>,
+) -> anyhow::Result<Solved> {
+    use crate::frame::{frame_files, id_layer, Visited};
+    use celeste_engine::runtime2::mix64;
+    let ld = load(dir, horizon)?;
+    let g = &ld.graph;
+    let tb = std::time::Instant::now();
+    let w = backward(g, horizon);
+    let tb = tb.elapsed().as_secs_f64();
+    for t in (0..horizon).rev().step_by(4) {
+        let (n, med, p90, max) = fragmentation(w.frame(t).filter(|&(i, _)| !g.is_win(i)).map(|(_, r)| r));
+        eprintln!("[arc] W frame {t:3}: {n} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}");
+    }
+    // The start has no player yet (the spawn): its remainder is no input of
+    // anything; any point stands for it.
+    let p0 = (super::arcs::point(0), super::arcs::point(0));
+    let found = optimum(g, &w, ld.start, p0, horizon);
+    let arc = found.as_ref().map(|f| f.frame);
+    eprintln!("[arc] backward {tb:.2} s; optimum {arc:?}");
+    // The nodes as (shape, key, cell), for the fingerprints and the marks.
+    let mut files = Vec::new();
+    for f in 0..=horizon {
+        files.extend(frame_files(dir, f)?.into_iter().map(|(seq, file)| (f, seq, file)));
+    }
+    let mut node_key: Vec<u64> = Vec::with_capacity(g.len());
+    let all: Vec<(u64, u16)> = (0..g.len() as u32).map(|i| (g.id(i), 0)).collect();
+    super::edges::resolve_ids(&files, &all, |shape, key, cell, _| node_key.push(mix64(shape ^ mix64(key.0 ^ mix64(key.1 ^ (cell as u64) << 1)))))?;
+    let mut marked = Visited::new();
+    super::edges::resolve_ids(&files, &ld.marks, |shape, key, cell, d| {
+        marked.insert_until(shape, key, cell, d);
+    })?;
+    let (n, fp) = marked.fingerprint();
+    println!("[gate] h{horizon} marks {n} {fp:016x}");
+    for t in 0..=horizon {
+        let (mut n, mut acc) = (0usize, 0u64);
+        for (i, r) in w.frame(t) {
+            let mut h = node_key[i as usize];
+            for (y, xs) in r.slabs() {
+                h = mix64(h ^ ((y.lo as u64) << 32 | y.hi as u64));
+                for x in xs {
+                    h = mix64(h ^ ((x.lo as u64) << 32 | x.hi as u64));
+                }
+            }
+            acc = acc.wrapping_add(h);
+            n += 1;
+        }
+        println!("[gate] h{horizon} W f{t:03} {n} {acc:016x}");
+    }
+    println!("[gate] h{horizon} arc optimum {}", arc.map_or("none".to_string(), |f| f.to_string()));
     if let Some(out) = save {
-        let mut text = format!("inputs {}\n", show(&cx.path));
-        for (f, &c) in std::iter::once(&start_cell).chain(&cx.cells).enumerate() {
-            match super::pos_graph::cell_xy(c) {
-                Some((x, y)) => text += &format!("{f} {x} {y}\n"),
-                None => text += &format!("{f} - -\n"),
+        std::fs::create_dir_all(out)?;
+        marked.save(&out.join("level0.marks.bin"), horizon)?;
+        // Per node the LAST frame its winning set is non-empty: the arc
+        // analogue of the BFS's deadline.
+        let mut last = vec![u32::MAX; g.len()];
+        for t in 0..=horizon {
+            for (i, _) in w.frame(t) {
+                last[i as usize] = t;
             }
         }
-        std::fs::write(out.join("witness.txt"), text)?;
+        let ids: Vec<(u64, u16)> = (0..g.len() as u32).filter(|&i| last[i as usize] != u32::MAX).map(|i| (g.id(i), last[i as usize] as u16)).collect();
+        let mut am = Visited::new();
+        super::edges::resolve_ids(&files, &ids, |shape, key, cell, d| {
+            am.insert_until(shape, key, cell, d);
+        })?;
+        am.save(&out.join("arc.marks.bin"), horizon)?;
+        let first_win = ld.wins.iter().map(|&id| id_layer(id)).min();
+        let show = |v: Option<u32>| v.map_or("none".to_string(), |f| f.to_string());
+        std::fs::write(out.join("arc.txt"), format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(arc)))?;
     }
-    Ok(())
+    drop(files);
+    let concrete = match (witness, arc) {
+        (true, Some(f)) => concrete_count_up(dir, level, horizon, g, &w, f)?,
+        _ => None,
+    };
+    if let Some(wt) = &concrete {
+        println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), wt.inputs_text());
+        if let Some(out) = save {
+            wt.save(&out.join("witness.txt"))?;
+        }
+    }
+    Ok(Solved { arc, concrete })
 }
 
 #[cfg(test)]

@@ -189,14 +189,12 @@ enum Command {
         #[arg(long, default_value_t = false)]
         diff: bool,
     },
-    /// THE ROTATION GRAPH on a recorded tree (branch arc-sets, plans/arcs.md):
-    /// a level-0 forward run with `CELESTE_ARC_EDGES=1` (its rows the nodes,
-    /// its arc records the edges with their exact guards and actions), then
-    /// the winning sets backward from the wins at frames <= `--horizon`, the
-    /// exact forward from the start inside them, and the goal-free partition's
-    /// size. Prints whether the horizon is reachable, and the first win.
+    /// THE ROTATION GRAPH on a recorded level-0 tree (`arc_dp::solve`): its
+    /// rows the nodes, its edges with their transfers, the winning sets
+    /// backward from the wins at frames <= `--horizon`, and the optimum read
+    /// off them. Prints whether the horizon is reachable, and the first win.
     ArcSearch {
-        /// The level-0 tree (`frames/`, `edges/arc/`).
+        /// The level-0 tree (`frames/`, `edges/`).
         #[arg(long)]
         level_dir: String,
         #[arg(long)]
@@ -205,14 +203,6 @@ enum Command {
         room: String,
         #[arg(long)]
         win_at: Option<String>,
-        /// Also the goal-free partition (cut points per node and frame).
-        #[arg(long)]
-        partition: bool,
-        /// Load only the edges between nodes the remainder-free backward
-        /// marks (and give a node a set only up to its deadline): every other
-        /// node cannot win by the horizon with any remainder.
-        #[arg(long)]
-        marked_only: bool,
         /// Turn the optimum into CONCRETE inputs: a DFS with the reference
         /// engine (concrete objects) admitting a successor only if its
         /// projection onto `--level` is a node whose winning set holds the
@@ -224,7 +214,7 @@ enum Command {
         #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
         level: Level,
         /// Write the web UI's arc pass into this directory (`export-ui
-        /// --forward-only --arc DIR`; needs `--marked-only`): the
+        /// --forward-only --arc DIR`): the
         /// remainder-free backward's marks (`level0.marks.bin`) and the
         /// ARC-MARKED nodes (`arc.marks.bin`: a node whose winning set is
         /// non-empty at some frame), both as `(shape, cell, key, dist)` rows
@@ -234,10 +224,8 @@ enum Command {
         #[arg(long)]
         save_marks: Option<String>,
     },
-    /// DIAGNOSTIC (branch arc-sets, plans/arcs.md step 1): the ARC-EDGE
-    /// stream of a level-0 tree forwarded with `CELESTE_ARC_EDGES=1`, checked.
-    /// Per frame: every recorded edge (pred, target) has an arc record and
-    /// every arc record's (pred, target) an edge. Then `--samples` records
+    /// DIAGNOSTIC: the TRANSFERS of a level-0 tree's edges, checked. Per
+    /// frame: every recorded edge carries a transfer. Then `--samples` records
     /// per frame, each from one of its preds: the source row stepped by the
     /// REFERENCE engine (all 64 inputs) at remainders INSIDE the record's
     /// guard - some input must reach the target (projected onto `--level`)
@@ -1163,182 +1151,18 @@ fn main() -> Result<()> {
                 states_in[3]
             );
         }
-        Command::ArcSearch { level_dir, horizon, room, win_at, partition, marked_only, witness, level, save_marks } => {
-            anyhow::ensure!(save_marks.is_none() || marked_only, "--save-marks writes the remainder-free marks: it needs --marked-only");
-            use celeste_rust::search::{arc_dp, arc_edges, arcs};
+        Command::ArcSearch { level_dir, horizon, room, win_at, witness, level, save_marks } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
             if let Some(xy) = &win_at {
                 std::env::set_var("CELESTE_WIN_AT_XY", xy);
             }
-            let dir = std::path::Path::new(&level_dir);
-            let t0 = std::time::Instant::now();
-            // The wins (the checkpoint headers' win rows) and the start.
-            let mut wins: Vec<u64> = Vec::new();
-            let mut start: Option<u64> = None;
-            // The frame files, kept for `--save-marks` (resolving ids to rows).
-            let mut files = Vec::new();
-            for f in 0..=horizon {
-                for (seq, file) in frame_files(dir, f)? {
-                    if f == 0 {
-                        start = Some(pack_id(0, seq, 0));
-                    } else {
-                        wins.extend(file.win_rows().iter().map(|&(row, _)| pack_id(f, seq, row)));
-                    }
-                    if save_marks.is_some() {
-                        files.push((f, seq, file));
-                    }
-                }
+            let s = celeste_rust::search::arc_dp::solve(std::path::Path::new(&level_dir), level, horizon, witness, save_marks.as_deref().map(std::path::Path::new))?;
+            match s.arc {
+                Some(f) => println!("h{horizon}: OPTIMAL (remainder-exact over this graph) f{f}"),
+                None => println!("h{horizon}: REFUTED: no win by f{horizon}"),
             }
-            let start = start.ok_or_else(|| anyhow::anyhow!("no frame-0 row"))?;
-            // The remainder-free backward's marks and deadlines (`--marked-only`).
-            let t_bfs = std::time::Instant::now();
-            let deadline: Option<rustc_hash::FxHashMap<u64, u16>> = if marked_only {
-                let eg = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
-                let (marks, _) = celeste_rust::search::edges::bfs(&eg, horizon, wins.iter().copied());
-                // The BFS never marks layer 0 (the start is given): its
-                // deadline is 0 when the win is exactly tight.
-                let mut d: rustc_hash::FxHashMap<u64, u16> = marks.with_deadlines().into_iter().collect();
-                d.entry(start).or_insert(0);
-                Some(d)
-            } else {
-                None
-            };
-            let t_bfs = t_bfs.elapsed().as_secs_f64();
-            let t_read = std::time::Instant::now();
-            // The nodes: the marked ones (and the wins), or every stored row.
-            let mut ids: Vec<u64> = match &deadline {
-                Some(d) => d.keys().copied().chain(wins.iter().copied()).collect(),
-                None => {
-                    let mut v = Vec::new();
-                    for f in 0..=horizon {
-                        for (seq, file) in frame_files(dir, f)? {
-                            let rows: u32 = file.cell_counts().map(|(_, n)| n).sum();
-                            v.extend((0..rows).map(|r| pack_id(f, seq, r)));
-                        }
-                    }
-                    v
-                }
-            };
-            ids.sort_unstable();
-            ids.dedup();
-            let index: rustc_hash::FxHashMap<u64, u32> = ids.iter().enumerate().map(|(i, &id)| (id, i as u32)).collect();
-            // Edges: the arc records of frames 1..=horizon, one per predecessor
-            // bit between indexed nodes, streamed by `threads()` workers
-            // pulling frames.
-            let edges_dir = dir.join("edges");
-            let next = std::sync::atomic::AtomicU32::new(1);
-            let parts: Vec<Result<Vec<(u32, arc_dp::Out)>>> = std::thread::scope(|sc| {
-                let hs: Vec<_> = (0..celeste_rust::frame::threads())
-                    .map(|_| {
-                        sc.spawn(|| -> Result<Vec<(u32, arc_dp::Out)>> {
-                            let mut out = Vec::new();
-                            loop {
-                                let f = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if f > horizon {
-                                    return Ok(out);
-                                }
-                                arc_edges::for_each_rec(&edges_dir, f, |(target, base, x, y, mask)| {
-                                    let Some(&dst) = index.get(&target) else { return };
-                                    let (x, y) = (x.transfer(), y.transfer());
-                                    let mut m = mask;
-                                    while m != 0 {
-                                        let i = m.trailing_zeros() as u64;
-                                        m &= m - 1;
-                                        if let Some(&src) = index.get(&(base + i)) {
-                                            out.push((src, arc_dp::Out { dst, x, y }));
-                                        }
-                                    }
-                                })?;
-                            }
-                        })
-                    })
-                    .collect();
-                hs.into_iter().map(|h| h.join().expect("an edge loader panicked")).collect()
-            });
-            let parts: Vec<Vec<(u32, arc_dp::Out)>> = parts.into_iter().collect::<Result<_>>()?;
-            let n_edges: usize = parts.iter().map(|p| p.len()).sum();
-            let n_marked = deadline.as_ref().map(|d| d.len());
-            drop(index);
-            let t_read = t_read.elapsed().as_secs_f64();
-            let t_graph = std::time::Instant::now();
-            let g = arc_dp::Graph::new(ids, parts, id_layer, wins.iter().copied(), deadline.as_ref());
-            eprintln!(
-                "[arc] {} edges, {} nodes, {} win rows, marked nodes {:?}; loaded in {:.1} s (marks {:.1} s, records {:.1} s, graph {:.1} s)",
-                n_edges,
-                g.len(),
-                wins.len(),
-                n_marked,
-                t0.elapsed().as_secs_f64(),
-                t_bfs,
-                t_read,
-                t_graph.elapsed().as_secs_f64()
-            );
-            let tb = std::time::Instant::now();
-            let w = arc_dp::backward(&g, horizon);
-            let tb = tb.elapsed().as_secs_f64();
-            for t in (0..horizon).rev().step_by(4) {
-                let (n, med, p90, max) = arc_dp::fragmentation(w.frame(t).filter(|&(i, _)| !g.is_win(i)).map(|(_, r)| r));
-                eprintln!("[arc] W frame {t:3}: {n} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}");
-            }
-            if partition {
-                let part = arc_dp::partition(&g, horizon);
-                for t in (0..horizon).rev().step_by(4) {
-                    let mut cx: Vec<usize> = part[t as usize].values().map(|(x, _)| x.len()).collect();
-                    let mut cy: Vec<usize> = part[t as usize].values().map(|(_, y)| y.len()).collect();
-                    cx.sort_unstable();
-                    cy.sort_unstable();
-                    let q = |v: &Vec<usize>, f: f64| if v.is_empty() { 0 } else { v[((v.len() - 1) as f64 * f) as usize] };
-                    eprintln!("[arc] partition frame {t:3}: {} nodes; cuts per node x med {} p90 {} max {}, y med {} p90 {} max {}", cx.len(), q(&cx, 0.5), q(&cx, 0.9), q(&cx, 1.0), q(&cy, 0.5), q(&cy, 0.9), q(&cy, 1.0));
-                }
-            }
-            // The start has no player yet (the spawn): its remainder is no
-            // input of anything; any point stands for it.
-            let p0 = (arcs::point(0), arcs::point(0));
-            let start = g.index(start).ok_or_else(|| anyhow::anyhow!("the start has no edge"))?;
-            let tf = std::time::Instant::now();
-            let found = arc_dp::optimum(&g, &w, start, p0, horizon);
-            println!(
-                "h{horizon}: {}; backward {tb:.2} s, optimum + witness {:.3} s",
-                match &found { Some(f) => format!("OPTIMAL (remainder-exact over this graph) f{}, a witness of {} nodes", f.frame, f.path.len()), None => format!("REFUTED: no win by f{horizon}") },
-                tf.elapsed().as_secs_f64()
-            );
-            let save_dir = save_marks.as_deref().map(std::path::Path::new);
-            if let Some(out) = save_dir {
-                std::fs::create_dir_all(out)?;
-                let ts = std::time::Instant::now();
-                // Marks files (`Visited::save`), each state with its deadline.
-                let save = |name: &str, ids: &[(u64, u16)]| -> Result<usize> {
-                    let mut marks = Visited::new();
-                    celeste_rust::search::edges::resolve_ids(&files, ids, |shape, key, cell, last| {
-                        marks.insert_until(shape, key, cell, last);
-                    })?;
-                    marks.save(&out.join(name), horizon)?;
-                    Ok(marks.len())
-                };
-                let mut l0: Vec<(u64, u16)> = deadline.as_ref().expect("--marked-only").iter().map(|(&id, &t)| (id, t)).collect();
-                l0.sort_unstable();
-                // Per node the LAST frame its winning set is non-empty: the
-                // arc analogue of the BFS's deadline (W_t is non-empty for t
-                // from the node's layer up to it).
-                let mut last = vec![u32::MAX; g.len()];
-                for t in 0..=horizon {
-                    for (i, _) in w.frame(t) {
-                        last[i as usize] = t;
-                    }
-                }
-                let arc: Vec<(u64, u16)> =
-                    (0..g.len() as u32).filter(|&i| last[i as usize] != u32::MAX).map(|i| (g.id(i), last[i as usize] as u16)).collect();
-                let (n0, na) = (save("level0.marks.bin", &l0)?, save("arc.marks.bin", &arc)?);
-                let first_win = wins.iter().map(|&id| id_layer(id)).min();
-                let show = |v: Option<u32>| v.map_or("none".to_string(), |f| f.to_string());
-                std::fs::write(
-                    out.join("arc.txt"),
-                    format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(found.as_ref().map(|f| f.frame))),
-                )?;
-                eprintln!("[arc] saved {n0} level-0 marks and {na} arc-marked nodes to {} in {:.1} s", out.display(), ts.elapsed().as_secs_f64());
-            }
-            if let (true, Some(f)) = (witness, &found) {
-                arc_dp::concrete_witness(dir, level, horizon, &g, &w, horizon - f.frame, f.frame, save_dir)?;
+            if let Some(w) = &s.concrete {
+                println!("CONCRETE WITNESS: a win at f{}: {}", w.inputs.len(), w.inputs_text());
             }
         }
         Command::ArcCheck { level_dir, room, win_at, from, to, samples, level } => {
@@ -1394,20 +1218,27 @@ fn main() -> Result<()> {
                 }
                 Ok(out)
             };
-            let (mut missing_total, mut extra_total, mut records_total) = (0u64, 0u64, 0u64);
+            let (mut missing_total, mut records_total) = (0u64, 0u64);
             let (mut inside, mut inside_bad, mut outside, mut outside_bad, mut no_player) = (0u64, 0u64, 0u64, 0u64, 0u64);
             let (mut sampled, mut kinds) = (0u64, std::collections::BTreeMap::<String, u64>::new());
             let t0 = std::time::Instant::now();
+            /// A record with its transfer decoded.
+            struct Rec {
+                target: u64,
+                base: u64,
+                mask: u64,
+                x: celeste_rust::search::arcs::Transfer,
+                y: celeste_rust::search::arcs::Transfer,
+            }
             for frame in from..=to {
-                let recs = celeste_rust::search::arc_edges::read_frame(&edges_dir, frame)?;
-                records_total += recs.len() as u64;
-                let pairs = |base: u64, mask: u64, target: u64| (0..64).filter(move |l| mask >> l & 1 == 1).map(move |l| (base + l, target));
-                let arc_pairs: rustc_hash::FxHashSet<(u64, u64)> = recs.iter().flat_map(|r| pairs(r.base, r.mask, r.target)).collect();
-                let edge_pairs: rustc_hash::FxHashSet<(u64, u64)> = graph.records_at(frame).iter().flat_map(|e| pairs(e.base, e.mask, e.target)).collect();
-                let missing = edge_pairs.difference(&arc_pairs).count() as u64;
-                let extra = arc_pairs.difference(&edge_pairs).count() as u64;
+                let all = graph.records_at(frame);
+                let missing = all.iter().filter(|e| graph.pair(frame, e.xfer).is_none()).count() as u64;
                 missing_total += missing;
-                extra_total += extra;
+                let recs: Vec<Rec> = all
+                    .iter()
+                    .filter_map(|e| graph.pair(frame, e.xfer).map(|p| Rec { target: e.target, base: e.base, mask: e.mask, x: p.0.transfer(), y: p.1.transfer() }))
+                    .collect();
+                records_total += recs.len() as u64;
                 for r in &recs {
                     for (axis, t) in [("x", &r.x), ("y", &r.y)] {
                         let whole = t.guard == celeste_rust::search::arcs::Seg { lo: 0, hi: celeste_rust::search::arcs::CIRCLE };
@@ -1476,21 +1307,19 @@ fn main() -> Result<()> {
                     }
                 }
                 eprintln!(
-                    "[arc-check] f{frame:03}: {} arc records, {} arc pairs, {} edge pairs, {missing} edges without an arc, {extra} arcs without an edge; so far inside {inside} ({inside_bad} bad), outside {outside} ({outside_bad} bad), {} ref steps, {:.1} s",
+                    "[arc-check] f{frame:03}: {} records, {missing} without a transfer; so far inside {inside} ({inside_bad} bad), outside {outside} ({outside_bad} bad), {} ref steps, {:.1} s",
                     recs.len(),
-                    arc_pairs.len(),
-                    edge_pairs.len(),
                     steps.get(),
                     t0.elapsed().as_secs_f64()
                 );
             }
             println!("arc-check f{from}-f{to}: {records_total} records; transfers per axis {kinds:?}");
-            println!("completeness: {missing_total} recorded edges without an arc record, {extra_total} arc records without an edge");
+            println!("completeness: {missing_total} recorded edges without a transfer");
             println!(
                 "agreement: {sampled} sampled records ({no_player} from a row without a player); inside the guard {inside} probes, {inside_bad} disagree; outside every guard {outside} probes, {outside_bad} reach the target; {} reference steps",
                 steps.get()
             );
-            anyhow::ensure!(missing_total == 0 && extra_total == 0 && inside_bad == 0 && outside_bad == 0, "arc-check: disagreement");
+            anyhow::ensure!(missing_total == 0 && inside_bad == 0 && outside_bad == 0, "arc-check: disagreement");
         }
         Command::RemCensus { level_dir, from, to, level } => {
             let mut ideal: rustc_hash::FxHashSet<(u64, (u64, u64), u32)> = Default::default();

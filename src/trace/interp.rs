@@ -140,7 +140,7 @@ pub struct Interp<'a, D: Domain> {
     /// Literal splits handed out: the ids in `State::frag`.
     next_split: usize,
     /// THE ARC CAPTURE (`search::arc_edges`): set per frame trace by
-    /// `verify::trace_frame` (a level-0 trace in arc mode). Every
+    /// `verify::trace_frame` (every level-0 trace). Every
     /// `__split_by_flr` must then name its site (`split_site_of`), and the
     /// player's own record what they did on the state (`State::arc`).
     pub arc_capture: bool,
