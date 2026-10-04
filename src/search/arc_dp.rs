@@ -32,12 +32,13 @@ pub struct Edge {
     pub y: Transfer,
 }
 
-/// An out-edge in the dense graph: the target's index and the transfers.
+/// An out-edge in the dense graph: the target's index and its transfer pair
+/// (an index into `Graph::xfers`: a graph has a few thousand distinct pairs
+/// and hundreds of millions of edges).
 #[derive(Clone, Copy, Debug)]
 pub struct Out {
     pub dst: u32,
-    pub x: Transfer,
-    pub y: Transfer,
+    pub xfer: u32,
 }
 
 /// The graph, DENSE: nodes are indices `0..len` (in node-id order), edges
@@ -52,6 +53,8 @@ pub struct Graph {
     win: Vec<bool>,
     out_at: Vec<u32>,
     out: Vec<Out>,
+    /// The distinct (x, y) transfer pairs the edges index.
+    xfers: Vec<(Transfer, Transfer)>,
     pred_at: Vec<u32>,
     preds: Vec<u32>,
     /// Non-win nodes by deadline (`by_deadline[t]`: deadline `t`).
@@ -84,10 +87,18 @@ fn csr<I, T>(n: usize, parts: &[Vec<I>], key: impl Fn(&I) -> u32, val: impl Fn(&
 impl Graph {
     /// The graph over the nodes `ids` (sorted, unique; an edge's index is
     /// a position in it): `edges` per source index (in parts, as the loader
-    /// produced them), `layer(id)` the first frame a node can be occupied,
-    /// `deadline` per node the last frame it can still win from (a node
-    /// absent from it never wins; `None`: no bound).
-    pub fn new(ids: Vec<u64>, edges: Vec<Vec<(u32, Out)>>, layer: impl Fn(u64) -> u32, wins: impl IntoIterator<Item = u64>, deadline: Option<&FxHashMap<u64, u16>>) -> Self {
+    /// produced them) over the transfer pairs `xfers`, `layer(id)` the first
+    /// frame a node can be occupied, `deadline` per node the last frame it
+    /// can still win from (a node absent from it never wins; `None`: no
+    /// bound).
+    pub fn new(
+        ids: Vec<u64>,
+        edges: Vec<Vec<(u32, Out)>>,
+        xfers: Vec<(Transfer, Transfer)>,
+        layer: impl Fn(u64) -> u32,
+        wins: impl IntoIterator<Item = u64>,
+        deadline: Option<&FxHashMap<u64, u16>>,
+    ) -> Self {
         let n = ids.len();
         assert!(n < u32::MAX as usize, "{n} nodes do not fit a u32 index");
         debug_assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids sorted and unique");
@@ -111,7 +122,7 @@ impl Graph {
                 by_deadline[t].push(i as u32);
             }
         }
-        Graph { ids, layer, until, win, out_at, out, pred_at, preds, by_deadline }
+        Graph { ids, layer, until, win, out_at, out, xfers, pred_at, preds, by_deadline }
     }
     /// From edges over node ids (small graphs: the prototype, tests).
     pub fn from_edges(edges: Vec<Edge>, layer: impl Fn(u64) -> u32, wins: impl IntoIterator<Item = u64>, deadline: Option<&FxHashMap<u64, u16>>) -> Self {
@@ -120,8 +131,13 @@ impl Graph {
         ids.sort_unstable();
         ids.dedup();
         let idx = |id: u64| ids.binary_search(&id).expect("an edge's node is indexed") as u32;
-        let part: Vec<(u32, Out)> = edges.iter().map(|e| (idx(e.src), Out { dst: idx(e.dst), x: e.x, y: e.y })).collect();
-        Graph::new(ids, vec![part], layer, wins, deadline)
+        let xfers: Vec<(Transfer, Transfer)> = edges.iter().map(|e| (e.x, e.y)).collect();
+        let part: Vec<(u32, Out)> = edges.iter().enumerate().map(|(k, e)| (idx(e.src), Out { dst: idx(e.dst), xfer: k as u32 })).collect();
+        Graph::new(ids, vec![part], xfers, layer, wins, deadline)
+    }
+    /// The transfer pair of edge `e`.
+    pub fn xfer(&self, e: &Out) -> (Transfer, Transfer) {
+        self.xfers[e.xfer as usize]
     }
     pub fn len(&self) -> usize {
         self.ids.len()
@@ -224,6 +240,22 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     ids.sort_unstable();
     ids.dedup();
     let index: FxHashMap<u64, u32> = ids.iter().enumerate().map(|(i, &id)| (id, i as u32)).collect();
+    // The frames' transfer tables into one: per frame, its ids' global ones.
+    let mut xfers: Vec<(Transfer, Transfer)> = Vec::new();
+    let mut global: FxHashMap<super::arc_edges::Pair, u32> = FxHashMap::default();
+    let remap: Vec<Vec<u32>> = (0..=horizon)
+        .map(|f| {
+            eg.pairs(f)
+                .iter()
+                .map(|p| {
+                    *global.entry(*p).or_insert_with(|| {
+                        xfers.push((p.0.transfer(), p.1.transfer()));
+                        xfers.len() as u32 - 1
+                    })
+                })
+                .collect()
+        })
+        .collect();
     // Into every node, its edges of frames layer..=horizon from nodes; in
     // parallel over chunks of targets.
     let t1 = std::time::Instant::now();
@@ -246,22 +278,15 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
                                 buf.clear();
                                 eg.preds_at(target, frame, &mut buf);
                                 for e in &buf {
-                                    let mut pair = None;
+                                    let xfer = *remap[frame as usize].get(e.xfer as usize).ok_or_else(|| {
+                                        anyhow::anyhow!("{}: an edge at f{frame} into {target:#x} has transfer {} past its frame's table", dir.display(), e.xfer)
+                                    })?;
                                     let mut m = e.mask;
                                     while m != 0 {
                                         let lane = m.trailing_zeros() as u64;
                                         m &= m - 1;
                                         let Some(&src) = index.get(&(e.base + lane)) else { continue };
-                                        let (x, y) = match pair {
-                                            Some(p) => p,
-                                            None => {
-                                                let p = eg.pair(frame, e.xfer).ok_or_else(|| {
-                                                    anyhow::anyhow!("{}: an edge at f{frame} into {target:#x} has no transfer (id {:#x}): not a level-0 tree", dir.display(), e.xfer)
-                                                })?;
-                                                *pair.insert((p.0.transfer(), p.1.transfer()))
-                                            }
-                                        };
-                                        out.push((src, Out { dst, x, y }));
+                                        out.push((src, Out { dst, xfer }));
                                     }
                                 }
                             }
@@ -277,9 +302,10 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     drop(index);
     let t_read = t1.elapsed();
     let t2 = std::time::Instant::now();
-    let graph = Graph::new(ids, parts, id_layer, wins.iter().copied(), Some(&deadline));
+    let n_xfers = xfers.len();
+    let graph = Graph::new(ids, parts, xfers, id_layer, wins.iter().copied(), Some(&deadline));
     eprintln!(
-        "[arc] h{horizon}: {} marked nodes, {} win rows, {edges} edges; bfs {:.1} s, edges {:.1} s, graph {:.1} s",
+        "[arc] h{horizon}: {} marked nodes, {} win rows, {edges} edges, {n_xfers} transfer pairs; bfs {:.1} s, edges {:.1} s, graph {:.1} s",
         marks.len(),
         wins.len(),
         t_bfs.as_secs_f64(),
@@ -329,7 +355,8 @@ fn pull<'a>(g: &Graph, i: u32, next: impl Fn(u32) -> Option<&'a Region>, pieces:
     pieces.clear();
     for e in g.out_of(i) {
         if let Some(r) = next(e.dst) {
-            r.pull(e.x, e.y, pieces);
+            let (x, y) = g.xfer(e);
+            r.pull(x, y, pieces);
         }
     }
     Region::from_pieces(pieces, scratch)
@@ -530,10 +557,11 @@ pub fn optimum(g: &Graph, w: &Winning, start: u32, point: (u32, u32), horizon: u
         }
         let mut step = None;
         for e in g.out_of(n) {
-            if !(e.x.takes(p.0) && e.y.takes(p.1)) {
+            let (x, y) = g.xfer(e);
+            if !(x.takes(p.0) && y.takes(p.1)) {
                 continue;
             }
-            let q = (apply(e.x.action, p.0), apply(e.y.action, p.1));
+            let q = (apply(x.action, p.0), apply(y.action, p.1));
             if inside(t + 1, e.dst, q) {
                 step = Some((e.dst, q));
                 if g.is_win(e.dst) {

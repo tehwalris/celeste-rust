@@ -876,7 +876,12 @@ impl EdgeGraph {
     /// The transfer `xfer` of an edge recorded at frame `frame` (`None`: an
     /// id the frame's table does not have).
     pub fn pair(&self, frame: u32, xfer: u32) -> Option<super::arc_edges::Pair> {
-        self.xfers.get(frame as usize)?.get(xfer as usize).copied()
+        self.pairs(frame).get(xfer as usize).copied()
+    }
+
+    /// Frame `frame`'s transfer table (empty past the horizon).
+    pub fn pairs(&self, frame: u32) -> &[super::arc_edges::Pair] {
+        self.xfers.get(frame as usize).map_or(&[], |v| v.as_slice())
     }
 
     /// DIAGNOSTIC (`rewrite arc-check`): every
