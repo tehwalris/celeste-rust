@@ -13,9 +13,12 @@
 //!                       -> the static data the web UI (`ui/`) renders
 //!   * `arcs`          - sets of remainders as arcs of the circle (a frame
 //!                       rotates them), for the rotation graph
+//!   * `arc_edges`     - per recorded edge, what the frame did to the
+//!                       player's remainder (`CELESTE_ARC_EDGES=1`)
 //!
 //! The forward driver itself is `frame::forward_run` (src/frame.rs), on a
 //! `compiled::FrameEngine`.
+pub mod arc_edges;
 pub mod arcs;
 pub mod checkpoint;
 pub mod door;

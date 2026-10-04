@@ -797,6 +797,25 @@ impl EdgeGraph {
     /// whose pred is in `preds` - a full scan of that frame's runs.
     pub fn edges_from(&self, frame: u32, preds: &[u64]) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
+        self.scan(frame, |t, base, mask| {
+            for &p in preds {
+                if p >= base && p < base + 64 && mask & (1u64 << (p - base)) != 0 {
+                    out.push((p, t));
+                }
+            }
+        });
+        out
+    }
+
+    /// DIAGNOSTIC (`rewrite arc-check`): every record of frame `frame`.
+    pub fn records_at(&self, frame: u32) -> Vec<Edge> {
+        let mut out = Vec::new();
+        self.scan(frame, |target, base, mask| out.push(Edge { target, base, mask }));
+        out
+    }
+
+    /// Every record `(target, base, mask)` of frame `frame`'s runs.
+    fn scan(&self, frame: u32, mut f: impl FnMut(u64, u64, u64)) {
         for runs in &self.runs {
             let Some(Some(run)) = runs.get(frame as usize) else { continue };
             let b = &run.map[run.stream..];
@@ -817,14 +836,9 @@ impl EdgeGraph {
                 let mask = get_mask(b, &mut pos);
                 prev_t = t;
                 prev_b = base;
-                for &p in preds {
-                    if p >= base && p < base + 64 && mask & (1u64 << (p - base)) != 0 {
-                        out.push((p, t));
-                    }
-                }
+                f(t, base, mask);
             }
         }
-        out
     }
 
     /// DIAGNOSTIC (`rewrite edge-age`): the pairs recorded at `frame`, per

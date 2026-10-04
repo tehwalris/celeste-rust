@@ -82,6 +82,46 @@ struct AsmBody {
     /// Where this body's rows' speed key comes from (the bucket dispatch,
     /// `dkey_of`). `None` at an exact-speed level or without a player.
     dkey: Option<DKey>,
+    /// The transfer roots (`search::arc_edges`): `None` unless the set was
+    /// traced in arc mode.
+    arc: Option<ArcSlots>,
+}
+
+/// Where a body's transfer roots are (`trace::verify::FrameOut::arc`): per
+/// axis took, pre, frag, ox, fin, each a (byte offset, kind) of the output
+/// buffer; and whether the outcome has a player at its end.
+#[derive(Clone, Copy)]
+struct ArcSlots {
+    roots: [(usize, RootKind); 2 * crate::trace::verify::ARC_AXIS_ROOTS],
+    fin: bool,
+}
+
+impl ArcSlots {
+    /// Lane `i`'s transfer, decoded (`arc_edges::decode_axis`). A refusal,
+    /// or a `took` the lane does not decide, is FATAL: the record would be
+    /// a claim about the remainder nothing checked.
+    fn transfer(&self, buf: &[u8], i: usize, chunk: &Rt2, lane: usize, outcome: usize) -> [crate::search::arc_edges::AxisXfer; 2] {
+        use crate::search::arc_edges::{decode_axis, RawAxis};
+        let ival = |k: usize| -> (i32, i32) {
+            let (off, kind) = self.roots[k];
+            match read_root_av(off, kind, buf, i) {
+                AV::Num(p) => (p.as_raw_u32() as i32, p.as_raw_u32() as i32),
+                AV::Ival(a, b) => (a.as_raw_u32() as i32, b.as_raw_u32() as i32),
+                other => panic!("arc edges: transfer root {k} of a {kind:?} root holds {other:?}"),
+            }
+        };
+        let axis = |a: usize| -> crate::search::arc_edges::AxisXfer {
+            let base = a * crate::trace::verify::ARC_AXIS_ROOTS;
+            let (off, kind) = self.roots[base];
+            let took = match read_root_av(off, kind, buf, i) {
+                AV::Bool(b) => b,
+                other => panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}'s `took` is {other:?}, not a decided boolean", chunk.shape_hash),
+            };
+            let raw = RawAxis { took, pre: ival(base + 1), frag: ival(base + 2), ox: ival(base + 3), fin: self.fin.then(|| ival(base + 4)) };
+            decode_axis(&raw).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}: {e} (raw {raw:?})", chunk.shape_hash))
+        };
+        [axis(0), axis(1)]
+    }
 }
 
 /// A body's rows' speed key: the dash constants per body; the buckets and
@@ -565,6 +605,12 @@ impl AsmKernel {
                         runtime2::mix64(part.1.wrapping_add(h2)),
                     );
                     let cin = cell_in[lanes[i]];
+                    // THE ARC EDGE's transfer (`search::arc_edges`): per
+                    // producer, beside the edge, never in the row.
+                    let arc = match (&body.arc, sink.arc_on && slice_base.is_some()) {
+                        (Some(a), true) => Some(a.transfer(outbuf, i, chunk, lanes[i], body.outcome)),
+                        _ => None,
+                    };
                     // EMISSION-TIME PROVENANCE (plans/buckets.md). The
                     // source of this row is lane `i` of this slice, and
                     // everything that needs to know is told right here:
@@ -594,6 +640,9 @@ impl AsmKernel {
                         match slice_base {
                             Some(b) if r & RowCache::ID_FLAG != 0 && hull.is_none() => {
                                 sink.direct_edge(r & !RowCache::ID_FLAG, b, glane(i));
+                                if let Some(t) = arc {
+                                    sink.arc_direct(r & !RowCache::ID_FLAG, b, glane(i), t);
+                                }
                                 continue;
                             }
                             Some(_) if r & RowCache::ID_FLAG != 0 => {}
@@ -602,7 +651,10 @@ impl AsmKernel {
                             // the cache lost the flush's write-back): push
                             // it again; the flush merges duplicates by key.
                             Some(b) if !sink.mark_pred(r, b, glane(i)) => {}
-                            Some(_) => {
+                            Some(b) => {
+                                if let Some(t) = arc {
+                                    sink.arc_at_ref(r, b, glane(i), t);
+                                }
                                 if let (Some(h), Some(s)) = (hull, cols.spd) {
                                     sink.hull_union_at(r, s[0].0, s[1].0, h);
                                 }
@@ -627,6 +679,9 @@ impl AsmKernel {
                         sink.slots[q].pred_base.push(b);
                         sink.slots[q].pred_mask.push(1u64 << (glane(i)));
                         sink.slots[q].last_extra.push(u32::MAX);
+                        if let Some(t) = arc {
+                            sink.arc_queued(q, b, glane(i), t);
+                        }
                         sink.seen.set_ref(key, sink.row_ref(q));
                     }
                     sink.pushed(q).expect("flushing a full queue");
@@ -2289,7 +2344,9 @@ fn build_one_shape(
     let mut off = 0usize;
     let mut asm_bodies = Vec::with_capacity(bodies.len());
     for (bi, b) in bodies.iter().enumerate() {
-        let nfields = b.roots.len() - 2 - r.bound.outcomes[b.outcome].keys.len(); // roots = [fields.., error, live, keys..]
+        let narc = r.bound.outcomes[b.outcome].arc.len();
+        let nkeys = r.bound.outcomes[b.outcome].keys.len();
+        let nfields = b.roots.len() - 2 - nkeys - narc; // roots = [fields.., error, live, keys.., arc..]
         let outputs = &r.bound.outcomes[b.outcome].outputs;
         anyhow::ensure!(
             outputs.len() == nfields,
@@ -2367,6 +2424,14 @@ fn build_one_shape(
                 Some(KeyField::new(outputs[j].0 as u64, compiled.root_offsets[root] as usize, compiled.root_kinds[root]))
             })
             .collect();
+        let arc = if narc == 0 {
+            None
+        } else {
+            anyhow::ensure!(narc == 2 * crate::trace::verify::ARC_AXIS_ROOTS, "shape {si} outcome {}: {narc} transfer roots", b.outcome);
+            let at = off + nfields + 2 + nkeys;
+            let roots = std::array::from_fn(|k| (compiled.root_offsets[slot_of[at + k]] as usize, compiled.root_kinds[slot_of[at + k]]));
+            Some(ArcSlots { roots, fin: r.bound.outcomes[b.outcome].arc_fin })
+        };
         asm_bodies.push(AsmBody {
             outcome: b.outcome,
             splits: b.splits.clone(),
@@ -2378,6 +2443,7 @@ fn build_one_shape(
             key_fields,
             pos: None,
             dkey,
+            arc,
         });
         off += b.roots.len();
     }

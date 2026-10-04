@@ -74,6 +74,11 @@ pub struct FrameOutcome {
     /// emitter mirrors the boundary: these contribute the widened value from
     /// `KPART`, off the per-lane fold. See `OutField::widen_uniform`.
     pub widen: Vec<(u32, celeste_engine::runtime2::AV)>,
+    /// The transfer roots (`verify::FrameOut::arc`; empty unless arc mode),
+    /// after the keys in a body's roots, and whether the outcome has a player
+    /// at its end.
+    pub arc: Vec<NodeId>,
+    pub arc_fin: bool,
 }
 
 /// A traced frame in the ENGINE's numbering: everything `lower_frame`
@@ -127,6 +132,7 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
         roots.push(o.guard);
         roots.push(o.error);
         roots.extend(o.keys.iter().map(|(_, nd)| *nd));
+        roots.extend(o.arc.iter().copied());
     }
     let (mut graph, mut roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
         .map_err(|e| anyhow::anyhow!("{:#}\nwhere the roots are\n{}", e, root_legend(f)))?;
@@ -172,7 +178,7 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
                 }
             }
             unknown_fields.push(mine);
-            at += n + 2 + o.keys.len();
+            at += n + 2 + o.keys.len() + o.arc.len();
         }
     }
     let mut used = vec![false; graph.len()];
@@ -272,14 +278,17 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
         }
         let keys: Vec<(usize, NodeId)> =
             o.keys.iter().enumerate().map(|(k, (fi, _))| (*fi, roots[at + n + 2 + k])).collect();
+        let arc_at = at + n + 2 + o.keys.len();
         outcomes.push(FrameOutcome {
             outputs,
             keys,
             live: roots[at + n],
             error: roots[at + n + 1],
             widen,
+            arc: roots[arc_at..arc_at + o.arc.len()].to_vec(),
+            arc_fin: o.arc_fin,
         });
-        at += n + 2 + o.keys.len();
+        at = arc_at + o.arc.len();
     }
     Ok(Bound { graph, forks: f.forks, inputs, uni, outcomes })
 }
@@ -307,11 +316,13 @@ pub fn asm_input_reprs(
 
 /// One fused (specialized) body: which outcome it belongs to, the fork
 /// configuration it resolved (the buttons among the forks), and its roots in the FUSED graph - the outcome's output
-/// field nodes in order, then `error`, then `live`.
+/// field nodes in order, then `error`, then `live`, then its key nodes, then
+/// its transfer roots (`FrameOutcome::arc`).
 pub struct AsmBody {
     pub outcome: usize,
     pub splits: Vec<u8>,
-    /// `outputs.len() + 2 + keys` nodes: fields..., error, live, key nodes...
+    /// `outputs.len() + 2 + keys + arc` nodes: fields..., error, live, key
+    /// nodes..., transfer roots...
     pub roots: Vec<NodeId>,
 }
 
@@ -339,7 +350,7 @@ pub fn asm_fused(
     let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = bound
         .outcomes
         .iter()
-        .map(|o| (o.outputs.iter().map(|(_, nd, _)| *nd).collect(), o.error, o.live, o.keys.iter().map(|(_, nd)| *nd).collect()))
+        .map(|o| (o.outputs.iter().map(|(_, nd, _)| *nd).collect(), o.error, o.live, o.keys.iter().map(|(_, nd)| *nd).chain(o.arc.iter().copied()).collect()))
         .collect();
     let (fused, raw_bodies) = crate::transpile::lower::specialize_frame(
         &bound.graph,
@@ -427,6 +438,7 @@ pub fn lower_frame(
             error: o.error,
             live: o.live,
             keys: o.keys.clone(),
+            arc: o.arc.clone(),
         })
         .collect();
     let spec = crate::transpile::lower::lower_outcomes(&e, &mut outs);

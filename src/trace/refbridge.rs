@@ -257,6 +257,7 @@ pub fn to_trace_state_unknowns(
         path: Vec::new(),
         key_override: Vec::new(),
         frag: Vec::new(),
+        arc: None,
     };
     Ok((st, unknown))
 }
