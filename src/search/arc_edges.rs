@@ -3,8 +3,8 @@
 //! axis, as a GUARD (the piece of the circle the edge is taken from) and an
 //! ACTION (a rotation, or a collision's constant).
 //!
-//! Always on: every traced frame at rem Bits(0) (`widen::WidenMode::Level0`)
-//! captures, per body, the transfer roots (`trace::verify::FrameOut::arc`);
+//! Always on: every traced frame that widens (`trace_frame`'s `widen`, every
+//! kernel set) captures, per body, the transfer roots (`trace::verify::FrameOut::arc`);
 //! the kernel computes them beside the row without storing them in it (no
 //! key, column, dedupe or checkpoint sees them) and decodes each producer's
 //! transfer here; the forward interns the (x, y) pair per worker

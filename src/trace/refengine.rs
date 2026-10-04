@@ -166,14 +166,6 @@ impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
             for leaf in engine.run_lane(&input, lane)? {
                 let b = crate::frame::Block::from_state(&leaf)?;
                 let cell_out = b.positions()?[0];
-                let key = b.keys()[0];
-                if let Some(targets) = sink.targets {
-                    sink.emitted += 1;
-                    if targets.contains(key, cell_out) {
-                        sink.hit(lane);
-                    }
-                    continue;
-                }
                 if sink.edges_on {
                     sink.edges.insert((cell_in[lane], cell_out));
                 }

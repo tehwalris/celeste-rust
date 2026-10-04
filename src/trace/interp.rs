@@ -2425,16 +2425,11 @@ mod tests {
         assert_eq!(rooms, vec![6, 7]);
     }
 
-    /// The fly fruit's `move` at a fruit-unknown level on a FINE rem rung:
-    /// `__split_by_flr` of a literal (every lane holds it alike) splits on the
-    /// integers and rejoins into one literal with no error, whatever the
-    /// rung's fork grid. On the bucket grid `rem.y + spd.y + 0.5` in
-    /// [-3.5, 1.5) was 5 * 64 fragments at rem Bits(6), past `MAX_WAYS`, and it
-    /// fell through to a 2-way per-lane fork of the literal: an error on every
-    /// lane where the fruit moved (room (3,1) `r6sxhf` declined its start
-    /// state, 2026-10-01).
+    /// The fly fruit's `move` at a fruit-unknown level: `__split_by_flr` of a
+    /// literal (every lane holds it alike) splits on the integers and rejoins
+    /// into one literal with no error and no per-lane fork.
     #[test]
-    fn a_literal_split_rejoins_without_error_on_a_fine_rem_grid() {
+    fn a_literal_split_rejoins_without_error() {
         let ast = parse(
             r#"
             function mv(r)
@@ -2445,33 +2440,30 @@ mod tests {
             result = mv(input)
             "#,
         );
-        for bits in [0u8, 5, 6, 16] {
-            let mut d = Symbolic::default();
-            d.fruit_unknown = true;
-            d.graph.set_fork_bits(bits);
-            // The literal [-4, 1): the fruit's `rem.y + spd.y`.
-            let input = d.graph.leaf(Op::Const(-4 << 16, (1 << 16) - 1));
-            let mut it = Interp::new(d);
-            let mut st = fresh::<Symbolic>(&mut it.d);
-            let g = st.globals;
-            let globals = &mut st.heap.tables.get_mut(&g).unwrap().hash;
-            globals.insert("input".into(), Value::Num(input));
-            for b in ["__split_by_flr", "flr"] {
-                globals.insert(b.into(), Value::Builtin(b));
-            }
-            let out = it.exec_block(ast.nodes(), st).expect("exec");
-            assert_eq!(out.len(), 1, "Bits({bits}): the fragments rejoined");
-            let s = &out[0].0;
-            let Value::Num(r) = s.heap.tables[&s.globals].hash["result"].clone() else {
-                panic!("expected a number")
-            };
-            // + 0.5 is [-3.5, 1.5): six integers, each fragment's
-            // remainder in [-0.5, 0.5), hulled back into one literal.
-            assert_eq!(it.d.graph.get(r).op, Op::Const(-0x8000, 0x7fff), "Bits({bits}): the remainder is the literal [-0.5, 0.5)");
-            let e = super::super::error::of(&mut it.d, &[r]);
-            assert_eq!(it.d.graph.get(e).op, Op::ConstBool(false), "Bits({bits}): no lane errs");
-            assert_eq!(it.d.forks, 0, "Bits({bits}): no per-lane fork");
+        let mut d = Symbolic::default();
+        d.fruit_unknown = true;
+        // The literal [-4, 1): the fruit's `rem.y + spd.y`.
+        let input = d.graph.leaf(Op::Const(-4 << 16, (1 << 16) - 1));
+        let mut it = Interp::new(d);
+        let mut st = fresh::<Symbolic>(&mut it.d);
+        let g = st.globals;
+        let globals = &mut st.heap.tables.get_mut(&g).unwrap().hash;
+        globals.insert("input".into(), Value::Num(input));
+        for b in ["__split_by_flr", "flr"] {
+            globals.insert(b.into(), Value::Builtin(b));
         }
+        let out = it.exec_block(ast.nodes(), st).expect("exec");
+        assert_eq!(out.len(), 1, "the fragments rejoined");
+        let s = &out[0].0;
+        let Value::Num(r) = s.heap.tables[&s.globals].hash["result"].clone() else {
+            panic!("expected a number")
+        };
+        // + 0.5 is [-3.5, 1.5): six integers, each fragment's
+        // remainder in [-0.5, 0.5), hulled back into one literal.
+        assert_eq!(it.d.graph.get(r).op, Op::Const(-0x8000, 0x7fff), "the remainder is the literal [-0.5, 0.5)");
+        let e = super::super::error::of(&mut it.d, &[r]);
+        assert_eq!(it.d.graph.get(e).op, Op::ConstBool(false), "no lane errs");
+        assert_eq!(it.d.forks, 0, "no per-lane fork");
     }
 
     /// A literal spanning more integers than a split can enumerate is refused

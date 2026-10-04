@@ -438,17 +438,7 @@ impl<'a> Lower<'a> {
     fn flr(&mut self, a: Vreg) -> Vreg {
         self.dbin_c(ROp::AndD, a, FLR_MASK)
     }
-    /// Floor to the graph's fork grid (`Graph::fork_bits`): the multiples
-    /// of `2^-bits`, the integers when `bits == 0`.
-    fn flr_grid(&mut self, a: Vreg) -> Vreg {
-        let (_, mask) = self.grid();
-        self.dbin_c(ROp::AndD, a, mask)
-    }
-    /// One fork-grid step in raw units, and the mask that floors to it.
-    fn grid(&self) -> (i32, i32) {
-        let step = 1i32 << (16 - self.g.fork_bits() as i32);
-        (step, !(step - 1))
-    }
+
     /// `mask_eq(a, b)` as a vector mask.
     fn mask_eq(&mut self, a: Vreg, b: Vreg) -> Vreg {
         self.cmp(0, a, Src::Reg(b))
@@ -522,21 +512,21 @@ impl<'a> Lower<'a> {
         let fh = self.flr(a[1]);
         self.mask_eq(fl, fh)
     }
-    /// `zi_span_ok(a, ways)`: does it span at most `ways` grid cells?
+    /// `zi_span_ok(a, ways)`: does it span at most `ways` floors?
     fn zi_span_ok(&mut self, a: [Vreg; 2], ways: u8) -> Vreg {
-        let (step, _) = self.grid();
-        let fl = self.flr_grid(a[0]);
-        let fh = self.flr_grid(a[1]);
+        let step = 1i32 << 16;
+        let fl = self.flr(a[0]);
+        let fh = self.flr(a[1]);
         let top = self.dbin_c(ROp::AddD, fl, step * (ways as i32 - 1));
         // fh <= fl + (ways - 1) * step  (vpcmpd LE)
         self.cmp(2, fh, Src::Reg(top))
     }
     /// `zi_fork_flr(a, c)`: (fragment interval, valid mask). Fragment
-    /// `c` is the `c`-th grid cell from the low end's, clipped to the
+    /// `c` is the `c`-th floor from the low end's, clipped to the
     /// interval; valid iff the interval reaches it.
     fn zi_fork_flr(&mut self, a: [Vreg; 2], c: u8) -> ([Vreg; 2], Vreg) {
-        let (step, _) = self.grid();
-        let fl = self.flr_grid(a[0]);
+        let step = 1i32 << 16;
+        let fl = self.flr(a[0]);
         let base = if c == 0 { fl } else { self.dbin_c(ROp::AddD, fl, step * c as i32) };
         let top = self.dbin_c(ROp::AddD, base, step - 1);
         let hi = self.dbin(ROp::MinSD, a[1], top);
@@ -545,7 +535,7 @@ impl<'a> Lower<'a> {
             let all = self.num_reg(NumVal::ConstI32(-1));
             ([a[0], hi], all)
         } else {
-            let fh = self.flr_grid(a[1]);
+            let fh = self.flr(a[1]);
             let lo = self.dbin(ROp::MaxSD, a[0], base);
             // base <= fh  (vpcmpd LE)
             let valid = self.cmp(2, base, Src::Reg(fh));
@@ -755,9 +745,9 @@ impl<'a> Lower<'a> {
             Op::Mul => {
                 // Interval * positive-constant scalar: scale each endpoint
                 // (monotone), matching `Pico8NumInterval::scale_positive`
-                // and `graph.eval`. The rem-rung widening
-                // (`trace::widen::rem_bucket_node`) is the only source; a
-                // frame never multiplies an interval otherwise.
+                // and `graph.eval`. (Its one known source, the rem rungs'
+                // bucket snap, is gone; an overflowing endpoint still wraps
+                // unchecked - plans/architecture.md, open.)
                 if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
                     let (ivn, scn) = if self.dom(a[0]) == 2 { (a[0], a[1]) } else { (a[1], a[0]) };
                     if self.dom(scn) == 2 {
@@ -788,7 +778,8 @@ impl<'a> Lower<'a> {
             // (monotone, truncating like the scalar `Div`), matching
             // `Pico8NumInterval::div_positive` and `graph.eval`. Placed
             // before the scalar `Op::Div` Call arm below, which only reads
-            // `as_num`. Source: `rem_bucket_node`'s `old / 2^-k` scale.
+            // `as_num`. (Its one known source was the rem rungs' bucket
+            // snap, `old / 2^-k`, now gone.)
             Op::Div if self.dom(a[0]) == 2 => {
                 if self.pos_const_scalar(a[1]).is_none() {
                     bail!(

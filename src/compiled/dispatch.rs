@@ -1,43 +1,13 @@
 //! Kernel DISPATCH: which kernel set runs, and the hit/miss counters.
 //!
 //! The registry (`super::asm_kernel`) is the constant-lattice kernel set
-//! for the active rem rung: one assembled kernel per start-room heap
+//! for the active level: one assembled kernel per start-room heap
 //! SHAPE, indexed by the chunk's shape hash. A chunk no kernel takes
 //! returns `false`, which is FATAL (`FrameEngine::run_frame_block`): a
 //! coverage gap that only shows up as wall clock is the failure mode this
 //! search refuses to have (CLAUDE.md "Never deopt to the interpreter").
 
 use celeste_engine::runtime2;
-
-/// Which traced set runs, and which boundary its accumulators take
-/// (plans/kernel-ladder.md).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum TracedMode {
-    /// The level-0 set (`WalkOpts::LEVEL0`): the Bits(0) widenings are in
-    /// the graph, accumulators go through `Rt2::boundary`. Valid ONLY at
-    /// rem Bits(0).
-    Level0,
-    /// The ladder set (`WalkOpts::ladder_widen`): the rem rung's widening
-    /// in the graph, rows through `Rt2::boundary_exact`. Serves rem
-    /// Bits(1..=15).
-    Level0Agnostic,
-    /// The exact-rem set (`WalkOpts::EXACT`), for the top rung: interval
-    /// slots as plain numbers, no rem forks, exact rows through
-    /// `Rt2::boundary_exact`. Binds only blocks whose rem is a number,
-    /// which is every block of an exact-rem level.
-    ExactRem,
-}
-
-/// The mode of a rem rung: Bits(0) -> the level-0 set, Bits(1..15) -> the
-/// rung-specific ladder set, Exact -> the exact set.
-pub(crate) fn traced_mode_for(rem: crate::interpreter::abstraction::RemPrecision) -> TracedMode {
-    use crate::interpreter::abstraction::RemPrecision;
-    match rem {
-        RemPrecision::Bits(0) => TracedMode::Level0,
-        RemPrecision::Bits(_) => TracedMode::Level0Agnostic,
-        RemPrecision::Exact => TracedMode::ExactRem,
-    }
-}
 
 /// A one-line miss summary for the strict-mode abort: how many lanes the
 /// ASM kernels could not serve (a shape with no assembled kernel, or a

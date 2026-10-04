@@ -133,24 +133,7 @@ fn owe(errs: &mut SlotErrors, d: &mut Symbolic, p: &Path, holds: <Symbolic as Do
     errs.push((p.clone(), e));
 }
 
-/// Which boundary widenings a traced frame bakes into its graph.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum WidenMode {
-    /// The full Bits(0) boundary widenings (rem -> [-0.5, 0.5), the
-    /// timer globals -> 0, `dash_effect_time` -> max(0, .), a live
-    /// fruit's `off`/`y` -> its bob band), all in the graph. The
-    /// production level-0 set.
-    Level0,
-    /// ONLY the rem widening, at the configured Bits(k) rung, via a
-    /// bucket fork + snap. Phase 1 of moving the ladder widening into
-    /// the graph (plans/keying-widening-flow.md): the rung-agnostic
-    /// ladder kernel emits EXACT rem and leaves the rung widening to the
-    /// campaign boundary; this makes a rung-SPECIFIC variant that emits
-    /// the widened rem so the row is keyed on the value it stores.
-    /// The fruit, timer and object widenings are rung-independent and
-    /// applied as at level 0.
-    RemRung(crate::interpreter::abstraction::RemPrecision),
-}
+
 
 /// A state BETWEEN the two steps of a split frame (`CELESTE_SPLIT_FRAME`,
 /// lua/celeste-minimal-split.lua): `__phase` holds a table there, and at every
@@ -160,21 +143,13 @@ pub fn mid_frame<D: Domain>(st: &State<D>) -> bool {
     st.heap.tables[&st.globals].hash.contains_key("__phase")
 }
 
-/// Apply the boundary widenings selected by `mode` to `st`.
-///
-/// The fruit / dash / timer widenings are rung-INDEPENDENT (the fruit is
-/// widened at every non-exact rung, dash clamped and timers pinned
-/// regardless), so both modes apply them; only rem differs by rung.
-pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Result<SlotErrors> {
-    use crate::interpreter::abstraction::RemPrecision;
-    // The level's rem precision (`abstraction::Level`), explicit so every
-    // level's set can be traced at once.
-    let rem = match mode {
-        WidenMode::Level0 => RemPrecision::Bits(0),
-        WidenMode::RemRung(rem) => rem,
-    };
+/// Apply the boundary widenings to `st`: the player's remainder to
+/// [-1/2, 1/2) (the arcs track it exactly beside the row), `dash_effect_time`
+/// clamped, the timer globals pinned, and the objects as the level's flags
+/// say (each widening below is a no-op where its flag is off).
+pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<SlotErrors> {
     let mut errs = SlotErrors::new();
-    widen_rem(st, d, rem, &mut errs)?;
+    widen_rem(st, d, &mut errs)?;
     widen_dash(st, d)?;
     widen_fruit(st, d, &mut errs)?;
     widen_timers(st, d)?;
@@ -185,6 +160,33 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic, mode: WidenMode) -> Res
     canon_balloon_offset(st, d, &mut errs)?;
     widen_held(st, d)?;
     Ok(errs)
+}
+
+/// The player's remainder := [-1/2, 1/2), the whole circle: the row forgets
+/// it, and the edge's transfer (`search::arc_edges`) carries what the frame
+/// did to it. That the remainder was inside the circle is the widening's own
+/// error.
+fn widen_rem(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
+    let half = P8::from_parts(0, 0x8000);
+    let neg_half = -half;
+    let half_below = half.next_smallest();
+    for obj in objects_of_type(st, "player") {
+        for f in ["x", "y"] {
+            let p = field(&obj, &["rem", f]);
+            let Some(Value::Num(old)) = iface::get(st, &p) else {
+                bail!("{}: rem is not a number", iface::show(&p));
+            };
+            let lo = d.num(neg_half);
+            let hi = d.num(half_below);
+            let a = d.compare(super::domain::Cmp::Ge, &old, &lo)?;
+            let b = d.compare(super::domain::Cmp::Le, &old, &hi)?;
+            let inside = d.and(&a, &b);
+            owe(errs, d, &p, inside);
+            let wide = ival(d, neg_half, half_below);
+            iface::set(st, &p, Value::Num(wide))?;
+        }
+    }
+    Ok(())
 }
 
 /// The balloon's phase `offset` (2026-09-21, room (5,0)): a `rnd` draw, an
@@ -1048,110 +1050,9 @@ fn widen_fly_fruit(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotEr
     Ok(())
 }
 
-/// The rem widening at `precision`, baked into the graph.
-///
-/// `Exact` is a no-op (the exact-rem set carries no rem intervals).
-/// Bits(0) is the historic full-interval widening (one constant bucket,
-/// no fork), byte-identical to the level-0 rem step. Bits(k>0): fork
-/// `old / 2^-k` at its integer floors (the SAME `__split_by_flr`
-/// primitive the `move` code uses - so a straddling lane splits into one
-/// per bucket exactly as `split_rem_straddles` does), then snap each
-/// fragment to its full bucket `[flr*2^-k, (flr+1)*2^-k)`.
-///
-/// The scale is a DIVISION by `width = 2^-k` (a representable P8 down to
-/// k=16, raw `2^(16-k)`), never a multiply by `2^k` (unrepresentable at
-/// k=15: 2^15 is outside the 16.16 range). The containment (rem was inside
-/// [-0.5, 0.5)) is the widening's own error exactly as at level 0; that the
-/// value lay in ONE bucket is the floor's (`rem_bucket_node`).
-fn widen_rem(
-    st: &mut State<Symbolic>,
-    d: &mut Symbolic,
-    precision: crate::interpreter::abstraction::RemPrecision,
-    errs: &mut SlotErrors,
-) -> Result<()> {
-    use crate::interpreter::abstraction::RemPrecision;
-    let half = P8::from_parts(0, 0x8000);
-    let neg_half = -half;
-    let half_below = half.next_smallest();
-
-    let bits = match precision {
-        // The exact rung has its OWN kernel set (no rem intervals at
-        // all), so it never asks for this; leaving rem untouched is the
-        // correct no-op if it ever does.
-        RemPrecision::Exact => return Ok(()),
-        RemPrecision::Bits(b) => b,
-    };
-
-    for obj in objects_of_type(st, "player") {
-        for f in ["x", "y"] {
-            let p = field(&obj, &["rem", f]);
-            let Some(Value::Num(old)) = iface::get(st, &p) else {
-                bail!("{}: rem is not a number", iface::show(&p));
-            };
-            // rem was inside [-0.5, 0.5) - the same claim the boundary
-            // checks.
-            let lo = d.num(neg_half);
-            let hi = d.num(half_below);
-            let a = d.compare(super::domain::Cmp::Ge, &old, &lo)?;
-            let b = d.compare(super::domain::Cmp::Le, &old, &hi)?;
-            let inside = d.and(&a, &b);
-            owe(errs, d, &p, inside);
-
-            if bits == 0 {
-                // One bucket covers the whole range: the historic
-                // constant, no fork - identical to level 0.
-                let wide = ival(d, neg_half, half_below);
-                iface::set(st, &p, Value::Num(wide))?;
-                continue;
-            }
-
-            let at = st.decided(d);
-            let rb = rem_bucket_node(d, old, bits, at)?;
-            iface::set(st, &p, Value::Num(rb))?;
-        }
-    }
-    Ok(())
-}
-
-/// Snap `old` (assumed in [-0.5, 0.5)) to its floor-aligned Bits(`bits`)
-/// bucket `Span(bucket_low, bucket_high)` - WITHOUT forking. The straddle
-/// split happened once already, at `move`'s `__split_by_flr`, on the bucket
-/// grid; here a straddling value is a violated premise, not a case: the
-/// bucket is computed through `Flr(old / width)`, and that floor's own error
-/// is exactly the claim (`trace::error`), so such a lane declines. `bits` in
-/// 1..=16.
-pub(crate) fn rem_bucket_node(
-    d: &mut Symbolic,
-    old: <Symbolic as Domain>::Num,
-    bits: u8,
-    at: <Symbolic as Domain>::Bool,
-) -> Result<<Symbolic as Domain>::Num> {
-    debug_assert!((1..=16).contains(&bits), "rem_bucket_node bits {} out of 1..=16", bits);
-    // width = 2^-k in real units; raw bits = 2^(16-k), always
-    // representable for k in 1..=16.
-    let width_raw: i32 = 0x1_0000 >> bits;
-    let width = d.num(P8::from_raw(width_raw));
-    // scaled = old / width = old * 2^k. The DIVIDEND fits (i64
-    // intermediate in P8 Div) and the RESULT fits i32 for old in
-    // [-0.5, 0.5): |old*2^k| <= 2^(k-1) <= 2^14. Its integer floors are
-    // exactly the bucket boundaries.
-    let scaled = d.arith(super::domain::Arith::Div, &old, &width)?;
-    // bucket index m = flr(scaled) - single-valued iff `old` is inside
-    // one bucket, which is the floor's own error where the snap is
-    // evaluated (`at`).
-    let idx = d.fun1(super::domain::Fun1::Flr, &scaled)?;
-    d.evaluated_at(&idx, &at);
-    // low = m * width; high = low + (width - 1 raw). Snap rem to the
-    // constant-width bucket [low, high] = `rem_bucket(., bits)`.
-    let low = d.arith(super::domain::Arith::Mul, &idx, &width)?;
-    let span_minus_one = d.num(P8::from_raw(width_raw - 1));
-    let high = d.arith(super::domain::Arith::Add, &low, &span_minus_one)?;
-    Ok(d.graph.fold(Op::Span, vec![low, high]))
-}
-
-/// Apply every level-0 boundary widening to `st`, in the boundary's order.
-/// `player.dash_effect_time` := max(0, it) - a clamp (the field decrements forever and is only read `> 0`, so every
-/// value <= 0 is behaviorally identical). Rung-independent.
+/// `player.dash_effect_time` := max(0, it) - a clamp (the field decrements
+/// forever and is only read `> 0`, so every value <= 0 is behaviorally
+/// identical).
 fn widen_dash(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
     let zero = P8::from_i16(0);
     for obj in objects_of_type(st, "player") {
@@ -1268,111 +1169,4 @@ pub fn fork_held_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::transpile::graph::{Op, Val};
-    use std::collections::HashMap;
-
-    /// The reference floor-aligned Bits(`bits`) bucket, in raw units -
-    /// `abstraction::rem_bucket` re-derived here (it is private) so the
-    /// gate depends on the definition, not on an import.
-    fn ref_bucket(v_raw: i32, bits: u8) -> (i32, i32) {
-        let width = 0x1_0000i32 >> bits;
-        let low = v_raw.div_euclid(width) * width;
-        (low, low + width - 1)
-    }
-
-    fn raw(iv: &celeste_core::pico8_num::Pico8NumInterval) -> (i32, i32) {
-        (iv.low.as_raw_u32() as i32, iv.high.as_raw_u32() as i32)
-    }
-
-    /// `rem_bucket_node`, on an EXACT rem value (no fork), snaps every
-    /// representable rem in [-0.5, 0.5) to exactly `rem_bucket`, at every
-    /// rung. This is the "widened the same" half of the A-vs-B gate at
-    /// the value level: the graph's snap == the boundary's (`Rt2::widen_to`).
-    #[test]
-    fn rem_bucket_node_matches_rem_bucket_exact() {
-        for bits in 1..=15u8 {
-            let mut d = Symbolic::default();
-            let old = d.graph.leaf(Op::Cell(0));
-            // No ival mark: an exact input, so no fork.
-            let at = d.boolean(true);
-            let rb = rem_bucket_node(&mut d, old, bits, at).expect("rem_bucket_node");
-            // Sweep the whole rem range; step is coprime-ish to bucket
-            // widths so every bucket and both signs are hit.
-            for v_raw in (-32768..32768).step_by(97) {
-                let v = P8::from_raw(v_raw);
-                let cells = HashMap::from([(0u32, Val::exact_num(v))]);
-                let out = d.graph.eval(&cells).expect("eval");
-                let got = match out[rb as usize] {
-                    Val::Num(iv) => iv,
-                    other => panic!("rem is not a number: {:?}", other),
-                };
-                assert_eq!(
-                    raw(&got),
-                    ref_bucket(v_raw, bits),
-                    "bits {} value raw {}",
-                    bits,
-                    v_raw
-                );
-            }
-        }
-    }
-
-    /// The snap is a FIXED POINT: re-snapping a value already at a bucket
-    /// edge (the low end, which is what the next frame's boundary would
-    /// re-read) lands on the same bucket. The assert-noop property at the
-    /// value level - catches UNDER-widening (a bucket that a second
-    /// widening would move).
-    #[test]
-    fn rem_bucket_node_is_idempotent() {
-        for bits in 1..=15u8 {
-            let mut d = Symbolic::default();
-            let old = d.graph.leaf(Op::Cell(0));
-            let at = d.boolean(true);
-            let rb = rem_bucket_node(&mut d, old, bits, at).expect("rem_bucket_node");
-            for v_raw in (-32768..32768).step_by(97) {
-                let (lo, hi) = ref_bucket(v_raw, bits);
-                // Snapping the low edge and the high edge both stay put.
-                for edge in [lo, hi] {
-                    let cells = HashMap::from([(0u32, Val::exact_num(P8::from_raw(edge)))]);
-                    let out = d.graph.eval(&cells).expect("eval");
-                    let got = match out[rb as usize] {
-                        Val::Num(iv) => iv,
-                        other => panic!("rem is not a number: {:?}", other),
-                    };
-                    assert_eq!(raw(&got), (lo, hi), "bits {} edge {}", bits, edge);
-                }
-            }
-        }
-    }
-
-    /// The boundary snap does NOT fork (the straddle split happened once,
-    /// at `move`, on the bucket grid): an interval inside one bucket snaps
-    /// to that bucket, and the floor's own error is what a straddling value
-    /// would raise.
-    #[test]
-    fn rem_bucket_node_snaps_without_forking() {
-        // bits=2: buckets are 0x4000 wide.
-        let bits = 2u8;
-        let mut d = Symbolic::default();
-        d.ival_cells.insert(0);
-        let old = d.graph.leaf(Op::Cell(0));
-        let at = d.boolean(true);
-        let rb = rem_bucket_node(&mut d, old, bits, at).expect("rem_bucket_node");
-        assert_eq!(d.forks, 0, "no fork registered");
-
-        // Inside the bucket [0, 0x3fff]: snaps to it.
-        let inside = celeste_core::pico8_num::Pico8NumInterval::new(P8::from_raw(100), P8::from_raw(0x3000));
-        let cells = HashMap::from([(0u32, Val::Num(inside))]);
-        let vals = d.graph.eval_narrow_top(&cells).expect("eval");
-        let got = match vals[rb as usize] {
-            Val::Num(iv) => iv,
-            other => panic!("rem is not a number: {:?}", other),
-        };
-        assert_eq!(raw(&got), (0, 0x3fff), "snapped to its bucket");
-    }
 }

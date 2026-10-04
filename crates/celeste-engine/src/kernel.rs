@@ -366,29 +366,16 @@ pub fn zi_flr(a: ZI) -> ZN {
 /// at most TWO floors, so the two fork outcomes can represent it. A
 /// boundary-widened interval has width < 1 and always passes.
 #[inline(always)]
-pub fn zi_span_ok(a: ZI, bits: u8, ways: u8) -> ZB {
-    let (step, mask) = grid(bits);
-    let (fl, fh) = (zn_flr_grid(a.lo, mask), zn_flr_grid(a.hi, mask));
-    // At most `ways` cells: the high end's cell is within `ways - 1`
-    // steps of the low end's.
-    let top = zn_add(fl, zn_splat(P8::from_raw(step.as_raw_u32() as i32 * (ways as i32 - 1))));
+pub fn zi_span_ok(a: ZI, ways: u8) -> ZB {
+    let (fl, fh) = (zn_flr(a.lo), zn_flr(a.hi));
+    // At most `ways` floors: the high end's within `ways - 1` of the low
+    // end's.
+    let top = zn_add(fl, zn_splat(P8::from_raw(STEP * (ways as i32 - 1))));
     ZB { val: mask_le(fh, top), known: ALL }
 }
 
-/// The fork grid for `bits` (`Graph::fork_bits`): one step of `2^-bits`
-/// in raw 16.16 units, and the mask that floors to it. `bits == 0` is
-/// the integer grid.
-#[inline(always)]
-pub fn grid(bits: u8) -> (P8, i32) {
-    let step = 1i32 << (16 - bits as i32);
-    (P8::from_raw(step), !(step - 1))
-}
-
-/// Floor to a grid: `x & mask` (`zn_flr` is the integer grid).
-#[inline(always)]
-pub fn zn_flr_grid(a: ZN, mask: i32) -> ZN {
-    ZN(unsafe { _mm512_and_si512(a.0, m512(mask)) })
-}
+/// One fork-grid step (the integers) in raw 16.16 units.
+const STEP: i32 = 1 << 16;
 
 // ---- comparisons ----
 //
@@ -542,17 +529,14 @@ pub fn zsel_b(c: ZB, t: ZB, f: ZB) -> ZB {
 /// has fragments is what `zi_span_ok` (the premise) takes off the
 /// kernel.
 #[inline(always)]
-pub fn zi_fork_flr(a: ZI, c: usize, bits: u8) -> (ZI, u16) {
-    let (step, mask) = grid(bits);
-    let step = step.as_raw_u32() as i32;
-    let (fl, fh) = (zn_flr_grid(a.lo, mask), zn_flr_grid(a.hi, mask));
-    // Fragment `c` is the `c`-th grid cell from the one the low end
-    // lies in, clipped to the interval, and valid iff the interval
-    // reaches that cell. The fragments of a fork of arity `n` partition
-    // every lane spanning at most `n` cells; a wider lane is what
-    // `zi_span_ok` takes off the kernel.
-    let base = zn_add(fl, zn_splat(P8::from_raw(step * c as i32)));
-    let top = zn_add(base, zn_splat(P8::from_raw(step - 1)));
+pub fn zi_fork_flr(a: ZI, c: usize) -> (ZI, u16) {
+    let (fl, fh) = (zn_flr(a.lo), zn_flr(a.hi));
+    // Fragment `c` is the `c`-th floor from the low end's, clipped to the
+    // interval, and valid iff the interval reaches it. The fragments of a
+    // fork of arity `n` partition every lane spanning at most `n` floors; a
+    // wider lane is what `zi_span_ok` takes off the kernel.
+    let base = zn_add(fl, zn_splat(P8::from_raw(STEP * c as i32)));
+    let top = zn_add(base, zn_splat(P8::from_raw(STEP - 1)));
     let valid = if c == 0 { ALL } else { mask_le(base, fh) };
     (ZI { lo: zn_max(a.lo, base), hi: zn_min(a.hi, top) }, valid)
 }

@@ -9,7 +9,7 @@ use celeste_engine::runtime2::Rt2;
 use celeste_rust::concrete::{start_states, ConcreteEngine};
 use celeste_rust::frame::{forward_frame, frame_files, frame_paths, id_layer, id_row, id_seq, load_row, pack_id, widen_rt2_to, widened_keys, wins_of, Block, FrameStep, Visited};
 use celeste_rust::interpreter::abstraction::{set_level, Level};
-use celeste_rust::search::inspect::{brief, cell_names, field_diff, parse_xy, player_summary, project_all, project_onto, project_row, projection_key, Proj};
+use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary, project_all, project_onto, project_row, projection_key, Proj};
 use clap::{Parser, Subcommand};
 
 /// mimalloc, not glibc: glibc retained ~23 GB of freed slot chunks across
@@ -49,10 +49,9 @@ enum Command {
         /// the model cannot reproduce a real run.
         #[arg(long)]
         ceiling: Option<u32>,
-        /// The level-0 spec (`Level::parse`, e.g. `r0sxhn` for an object
-        /// room). Default: `CELESTE_LADDER`'s first entry, else `r0sx`.
-        #[arg(long, value_parser = Level::parse)]
-        level: Option<Level>,
+        /// The level (`Level::parse`, e.g. `r0sxhn` for an object room).
+        #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
+        level: Level,
         /// The checkpoint dir: the tree goes to `level00/` under it.
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
@@ -82,12 +81,9 @@ enum Command {
         /// Last frame to compute.
         #[arg(long)]
         to: u32,
-        /// A full level spec (`Level::parse`, e.g. `r0sxn`), instead of `k`.
-        #[arg(long, value_parser = Level::parse)]
-        level: Option<Level>,
-        /// Rem precision: bits 0..=15, or >=16 for Exact.
-        #[arg(long, default_value_t = 0)]
-        k: u8,
+        /// The level (`Level::parse`, e.g. `r0sxhn`).
+        #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
+        level: Level,
         /// Checkpoint dir (frames land under it).
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
@@ -180,21 +176,6 @@ enum Command {
         #[arg(long, default_value_t = false)]
         edges: bool,
     },
-    /// Microbenchmark of ONE backward: a level's tree and pos-graph
-    /// (`frames/` and `posgraph.bin` under `level_dir`, as `rewrite forward`
-    /// writes them), the walk at `horizon`, timed.
-    BenchBackward {
-        #[arg(long)]
-        level_dir: String,
-        #[arg(long, default_value_t = 99)]
-        horizon: u32,
-        #[arg(long, default_value = "1,0")]
-        room: String,
-        /// Run BOTH the kernel walk and the BFS and print the states marked
-        /// by only one of them (with their layer and cell).
-        #[arg(long, default_value_t = false)]
-        diff: bool,
-    },
     /// DIAGNOSTIC: the TRANSFERS of a level-0 tree's edges, checked. Per
     /// frame: every recorded edge carries a transfer. Then `--samples` records
     /// per frame, each from one of its preds: the source row stepped by the
@@ -220,28 +201,6 @@ enum Command {
         /// The tree's level (what a successor is projected onto).
         #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
         level: Level,
-    },
-    /// DIAGNOSTIC: the sub-pixel remainders of an EXACT tree, for weighing
-    /// two rem abstractions. Per frame, the rows are grouped by every named
-    /// field but `rem.x`/`rem.y` (the combination the rem would hang off),
-    /// and for each group the exact remainders it holds: (A) one rem
-    /// RECTANGLE per group - its row count is the group count, its precision
-    /// the hull's width per axis; (B) the Bits(k) buckets kept but each
-    /// carrying the hull of what it holds - its row count is today's, its
-    /// precision the hull's width as a fraction of the bucket's.
-    RemCensus {
-        #[arg(long)]
-        level_dir: String,
-        #[arg(long)]
-        from: u32,
-        #[arg(long)]
-        to: u32,
-        /// Also the IDEAL of a level (`r4sxh`): the exact states projected
-        /// through its own widening (`frame::widened_keys`), cumulative - what
-        /// a sound forward at that level would visit with no
-        /// over-approximation beyond the projection itself.
-        #[arg(long, value_parser = Level::parse)]
-        level: Option<Level>,
     },
     /// DIAGNOSTIC: how coarse a level could be. Per frame, the distinct
     /// states of a tree with the named cells (`inspect::cell_names`) whose
@@ -428,37 +387,6 @@ enum Command {
         #[arg(long, value_parser = Level::parse)]
         spec: Option<Level>,
     },
-    /// Extract a concrete input sequence that wins by `horizon` from one
-    /// level's marks: a DFS from the initial state through the reference
-    /// engine's concrete single-input step, admitting a successor only if
-    /// its projection onto the level is a marked state in the NEXT BFS layer
-    /// of that level's tree. Prints the input bytes for `concrete_run -i`, or
-    /// - the diagnosis of a spurious coarse win - the DEEPEST frame a
-    /// concrete run stays inside the marks, its inputs, and per input there
-    /// why the successor is not admitted, next to the closest marked row at
-    /// its cell (the fields the abstraction lets differ).
-    Witness {
-        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
-        checkpoint_dir: String,
-        #[arg(long)]
-        horizon: u32,
-        /// Ladder level INDEX (the tree's `levelNN`).
-        #[arg(long, default_value_t = 16)]
-        level: usize,
-        /// The level's spec as the ladder gave it (`CELESTE_LADDER`'s entry,
-        /// e.g. `r5sxhn`). Absent: `Bits(level)`, or Exact from 16 - the
-        /// default ladder's levels.
-        #[arg(long, value_parser = Level::parse)]
-        spec: Option<Level>,
-        #[arg(long, default_value = "1,0")]
-        room: String,
-        /// Stop after this many concrete steps and report the deepest point.
-        #[arg(long, default_value_t = 20_000_000)]
-        budget: u64,
-        /// The search's `--start-after`: the DFS starts from those states.
-        #[arg(long)]
-        start_after: Option<String>,
-    },
     /// DIAGNOSTIC: follow a CONCRETE input sequence (the reference engine's
     /// concrete step) through one level's tree: per frame, whether the
     /// concrete state projected onto `--level` is a row of the tree, and
@@ -590,13 +518,6 @@ fn main() -> Result<()> {
                 (Some(h), None) | (None, Some(h)) => h,
                 _ => anyhow::bail!("give the horizon: --to H, or --ceiling H for a known solution"),
             };
-            let level = match level {
-                Some(l) => l,
-                None => match std::env::var("CELESTE_LADDER") {
-                    Ok(spec) => Level::parse_ladder(&spec).map_err(|e| anyhow::anyhow!("CELESTE_LADDER: {e}"))?[0],
-                    Err(_) => Level::parse("r0sx").map_err(|e| anyhow::anyhow!(e))?,
-                },
-            };
             set_level(level);
             eprintln!("[search] room {room}, level {level}, horizon {horizon}");
             let t0 = std::time::Instant::now();
@@ -659,24 +580,19 @@ fn main() -> Result<()> {
         Command::Forward {
             to,
             level,
-            k,
             checkpoint_dir,
             room,
             reference,
         } => {
-            use celeste_rust::interpreter::abstraction::{current_level, set_rem_precision, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
-            match level {
-                Some(l) => set_level(l),
-                None => set_rem_precision(if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) }),
-            }
+            set_level(level);
             let t = std::time::Instant::now();
             let engine: Box<dyn FrameStep> = if reference {
                 Box::new(std::sync::Mutex::new(celeste_rust::trace::refengine::RefEngine::new()?))
             } else {
                 Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)
             };
-            eprintln!("[fwd] engine up in {:.2} s ({:?}{})", t.elapsed().as_secs_f64(), current_level(), if reference { ", REFERENCE engine" } else { "" });
+            eprintln!("[fwd] engine up in {:.2} s ({level}{})", t.elapsed().as_secs_f64(), if reference { ", REFERENCE engine" } else { "" });
             let initial = vec![Block::from_state(&ConcreteEngine::new()?.initial_state()?)?];
             let dir = std::path::Path::new(&checkpoint_dir);
             let t = std::time::Instant::now();
@@ -690,7 +606,7 @@ fn main() -> Result<()> {
                 let (pairs, fp) = pg.fingerprint();
                 println!("posgraph f{:03} {pairs} {fp:016x}", fwd.frames);
             }
-            celeste_rust::metrics::dump("forward", Some(dir), &[("k", k.to_string())]);
+            celeste_rust::metrics::dump("forward", Some(dir), &[("level", level.to_string())]);
         }
         Command::DiagProject { fine_dir, coarse_dir, level, from, to, room, fine_marks, coarse_marks } => {
             use celeste_rust::frame::load_frame;
@@ -880,179 +796,6 @@ fn main() -> Result<()> {
             }
             let _ = std::fs::remove_dir_all(&edges_dir);
             celeste_rust::compiled::dispatch::print_kernel_hits();
-        }
-        Command::BenchBackward {
-            level_dir,
-            horizon,
-            room,
-            diff,
-        } => {
-            use celeste_rust::frame::{backward_run, pos_graph_path, threads};
-            use celeste_rust::interpreter::abstraction::RemPrecision;
-            std::env::set_var("CELESTE_START_ROOM", &room);
-            set_level(Level::for_rem(RemPrecision::Bits(0)));
-            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
-            let dir = std::path::Path::new(&level_dir);
-            let graph = celeste_rust::search::pos_graph::PosGraph::load(&pos_graph_path(dir))?;
-            eprintln!("[bench] level-0 tree {}, pos-graph {} pairs; {} threads", dir.display(), graph.pairs(), threads());
-            let t = std::time::Instant::now();
-            if diff {
-                let kern = backward_run(&engine, dir, horizon, &graph)?;
-                let bfs = celeste_rust::search::edges::backward(dir, horizon)?;
-                let a = kern.marked.entries();
-                let b = bfs.marked.entries();
-                let sa: std::collections::BTreeSet<_> = a.iter().copied().collect();
-                let sb: std::collections::BTreeSet<_> = b.iter().copied().collect();
-                // Where a state lives: its (layer, seq, row) through the tree.
-                let mut where_is: rustc_hash::FxHashMap<(u64, u32, (u64, u64)), Vec<u64>> = Default::default();
-                for layer in 0..=horizon {
-                    for (seq, file) in frame_files(dir, layer)? {
-                        let cells = file.row_cells();
-                        for row in 0..file.width() {
-                            let k = (file.shape_hash(), cells[row as usize], file.key_at(row));
-                            if sa.contains(&k) != sb.contains(&k) {
-                                where_is.entry(k).or_default().push(pack_id(layer, seq, row));
-                            }
-                        }
-                    }
-                }
-                println!("[diff] kernel {} states, bfs {} states", a.len(), b.len());
-                let edges = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
-                let only_kernel: Vec<_> = sa.difference(&sb).copied().collect();
-                let only_bfs: Vec<_> = sb.difference(&sa).copied().collect();
-                println!("[diff] only kernel: {} states; only bfs: {} states", only_kernel.len(), only_bfs.len());
-                let mut by_layer: std::collections::BTreeMap<u32, usize> = Default::default();
-                for k in &only_bfs {
-                    for &id in where_is.get(k).map(|v| v.as_slice()).unwrap_or(&[]) {
-                        *by_layer.entry(id_layer(id)).or_default() += 1;
-                    }
-                }
-                println!("[diff] only-bfs states per layer: {:?}", by_layer);
-                let at = |id: u64| format!("l{} s{} r{}", id_layer(id), id_seq(id), id_row(id));
-                // The stored (shape, key, cell) of row `id`, if the tree has it.
-                let stored = |id: u64| -> Result<Option<(u64, (u64, u64), u32)>> {
-                    let (tl, ts, tr) = (id_layer(id), id_seq(id), id_row(id));
-                    Ok(frame_files(dir, tl)?.into_iter().find(|(s, _)| *s == ts).filter(|(_, f)| tr < f.width()).map(|(_, f)| (f.shape_hash(), f.key_at(tr), f.row_cells()[tr as usize])))
-                };
-                // Every target recorded at `frame` from row `pred`.
-                let targets_from = |g: &celeste_rust::search::edges::EdgeGraph, frame: u32, pred: u64| -> Vec<u64> {
-                    g.records_at(frame).into_iter().filter(|e| pred >= e.base && pred < e.base + 64 && e.mask >> (pred - e.base) & 1 == 1).map(|e| e.target).collect()
-                };
-                let shown: Vec<_> = only_kernel.iter().map(|k| ("only kernel", *k)).chain(only_bfs.iter().take(6).map(|k| ("only bfs", *k))).collect();
-                for (which, k) in shown {
-                    let ids: Vec<String> = where_is.get(&k).map(|v| v.iter().map(|&id| at(id)).collect()).unwrap_or_default();
-                    println!("[diff] {which}: shape {:016x} cell {} key {:016x}{:016x} at {:?}", k.0, k.1, k.2 .0, k.2 .1, ids);
-                    // Expand the disputed row alone and look at its successors.
-                    for &id in where_is.get(&k).map(|v| v.as_slice()).unwrap_or(&[]) {
-                        let layer = id_layer(id);
-                        let (rt2, ..) = load_row(dir, id)?;
-                        let (next, _) = rerun(&engine, rt2, id, "diff-edges")?;
-                        let win = frame_files(dir, layer)?.into_iter().any(|(s, f)| s == id_seq(id) && f.win_rows().iter().any(|&(r, _)| r == id_row(id)));
-                        println!("[diff]   win row: {win}; successors: {} blocks", next.len());
-                        // Every recorded edge FROM this row, against its real successors.
-                        let claimed = targets_from(&edges, layer + 1, id);
-                        let mut real: Vec<(u64, (u64, u64), u32)> = Vec::new();
-                        for b in &next {
-                            let cells = celeste_rust::search::pos_graph::block_cells(b.rt2())?;
-                            for (i, key) in b.keys().iter().enumerate() {
-                                real.push((b.rt2().shape_hash, *key, cells[i]));
-                            }
-                        }
-                        let mut recorded_keys = Vec::new();
-                        for &t in &claimed {
-                            let desc = match stored(t)? {
-                                Some(k) => {
-                                    recorded_keys.push(k);
-                                    format!("cell {} key {:016x}{:016x} real successor: {}, marked kernel {} bfs {}", k.2, k.1 .0, k.1 .1, real.contains(&k), kern.marked.contains(k.0, k.1, k.2), bfs.marked.contains(k.0, k.1, k.2))
-                                }
-                                None => "NOT IN THE TREE".to_string(),
-                            };
-                            println!("[diff]   recorded edge -> {}: {desc}", at(t));
-                        }
-                        println!("[diff]   ({} recorded edges from this row, {} real successors)", claimed.len(), real.len());
-                        for k in real.iter().filter(|k| !recorded_keys.contains(k)) {
-                            println!("[diff]   UNRECORDED real successor: cell {} key {:016x}{:016x}", k.2, k.1 .0, k.1 .1);
-                        }
-                        if which == "only bfs" && std::env::var_os("CELESTE_DIFF_RERUN").is_some() {
-                            // The whole frame again with the tree's door: is the
-                            // spurious edge reproduced?
-                            let state = celeste_rust::frame::ForwardState::resume(dir, false)?.expect("a tree");
-                            let blocks = celeste_rust::frame::load_frame(dir, layer)?;
-                            let tmp2 = dir.join("diff-edges-full");
-                            let _ = std::fs::remove_dir_all(&tmp2);
-                            let _ = forward_frame(&engine, blocks, state.door(), None, None, layer + 1, Some(&tmp2))?;
-                            celeste_rust::search::edges::compact_frame(&tmp2, layer + 1)?;
-                            let g2 = celeste_rust::search::edges::EdgeGraph::open(&tmp2, layer + 1)?;
-                            let again = targets_from(&g2, layer + 1, id);
-                            for &t in &claimed {
-                                if stored(t)?.is_none_or(|k| !real.contains(&k)) {
-                                    println!("[diff]   full re-run f{}: spurious target {} recorded again: {}", layer + 1, at(t), again.contains(&t));
-                                }
-                            }
-                            println!("[diff]   full re-run f{}: {} recorded edges from this row (was {})", layer + 1, again.len(), claimed.len());
-                            let _ = std::fs::remove_dir_all(&tmp2);
-                            std::process::exit(0);
-                        }
-                        for b in &next {
-                            let cells = celeste_rust::search::pos_graph::block_cells(b.rt2())?;
-                            for (i, key) in b.keys().iter().enumerate() {
-                                let shape = b.rt2().shape_hash;
-                                let km = kern.marked.contains(shape, *key, cells[i]);
-                                let bm = bfs.marked.contains(shape, *key, cells[i]);
-                                if !km && !bm {
-                                    continue;
-                                }
-                                // Where is this successor in the tree?
-                                let mut found: Vec<u64> = Vec::new();
-                                for l2 in 0..=horizon {
-                                    for (s2, f2) in frame_files(dir, l2)? {
-                                        if f2.shape_hash() != shape {
-                                            continue;
-                                        }
-                                        let c2 = f2.row_cells();
-                                        found.extend((0..f2.width()).filter(|&r2| f2.key_at(r2) == *key && c2[r2 as usize] == cells[i]).map(|r2| pack_id(l2, s2, r2)));
-                                    }
-                                }
-                                let mut recorded = Vec::new();
-                                for &t in &found {
-                                    let mut buf = Vec::new();
-                                    edges.preds_at(t, layer + 1, &mut buf);
-                                    recorded.push((t, buf.iter().filter(|e| e.base <= id && id < e.base + 64 && e.mask & (1u64 << (id - e.base)) != 0).count(), buf.len()));
-                                }
-                                println!(
-                                    "[diff]   succ cell {} key {:016x}{:016x} marked kernel {km} bfs {bm}; in tree at {:?}; edges from this row at f{}: {:?}",
-                                    cells[i],
-                                    key.0,
-                                    key.1,
-                                    found.iter().map(|&t| at(t)).collect::<Vec<_>>(),
-                                    layer + 1,
-                                    recorded
-                                );
-                            }
-                        }
-                    }
-                }
-                return Ok(());
-            }
-            if celeste_rust::frame::bfs_backward() {
-                let bwd = celeste_rust::search::edges::backward(dir, horizon)?;
-                let (n, fp) = bwd.marked.fingerprint();
-                println!(
-                    "[bench] BFS backward h{horizon}: {:.2} s, marked {n} (fingerprint {fp:016x}), {} edges read",
-                    t.elapsed().as_secs_f64(),
-                    bwd.stats.edges_read
-                );
-                return Ok(());
-            }
-            let bwd = backward_run(&engine, dir, horizon, &graph)?;
-            let (n, fp) = bwd.marked.fingerprint();
-            println!(
-                "[bench] backward h{horizon}: {:.2} s, marked {n} (fingerprint {fp:016x}), {} re-runs",
-                t.elapsed().as_secs_f64(),
-                bwd.reruns
-            );
-            celeste_rust::compiled::dispatch::print_kernel_hits();
-            celeste_rust::metrics::dump("bench-backward", None, &[]);
         }
         Command::CellGrowth { level_dir, from, to, top, at, by_age } => {
             let dir = std::path::Path::new(&level_dir);
@@ -1287,155 +1030,6 @@ fn main() -> Result<()> {
                 steps.get()
             );
             anyhow::ensure!(missing_total == 0 && inside_bad == 0 && outside_bad == 0, "arc-check: disagreement");
-        }
-        Command::RemCensus { level_dir, from, to, level } => {
-            let mut ideal: rustc_hash::FxHashSet<(u64, (u64, u64), u32)> = Default::default();
-            use celeste_engine::runtime2::{av_code, mix64, Cell2, AV};
-            let ids = celeste_rust::compiled::ids();
-            let name_hash = |s: &str| -> u64 { s.bytes().fold(0x9e37_79b9_7f4a_7c15u64, |h, b| mix64(h ^ b as u64)) };
-            let code = |v: AV| -> u64 { av_code(if let AV::Ptr(_) = v { AV::Ptr(0) } else { v }) };
-            let q = |v: &mut Vec<f64>, f: f64| -> f64 {
-                if v.is_empty() {
-                    return 0.0;
-                }
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                v[((v.len() - 1) as f64 * f) as usize]
-            };
-            println!("frame | N exact | G (A rows) | Bits(k) rows k=0..8 | A hull px x: med/p90/max, y: med/p90/max | B hull/bucket x,y at k=2,4,6,8 (mean) | cumulative Bits(k) k=0..8");
-            // Every (group, bucket) of every frame so far, per k: the IDEAL a
-            // Bits(k) forward reaches (its `visited`), the exact states projected.
-            let mut seen: Vec<rustc_hash::FxHashSet<(u64, i32, i32)>> = (0..=8).map(|_| Default::default()).collect();
-            for frame in from..=to {
-                // (group, rem.x raw, rem.y raw)
-                let mut rows: Vec<(u64, i32, i32)> = Vec::new();
-                for (_, ff) in frame_files(std::path::Path::new(&level_dir), frame)? {
-                    let width = ff.width();
-                    let mut lo = 0u32;
-                    while lo < width {
-                        let hi = (lo + (1 << 20)).min(width);
-                        let Some(rt2) = ff.load_rows(&[lo..hi])? else { break };
-                        if let Some(l) = level {
-                            let (shape, keys, cells) = celeste_rust::frame::widened_keys_rt2(&rt2, l)?;
-                            ideal.extend(keys.into_iter().zip(cells).map(|(k, c)| (shape, k, c)));
-                        }
-                        let names = cell_names(&rt2, ids);
-                        let (mut rx, mut ry, mut rest) = (None, None, Vec::new());
-                        for c in 0..rt2.cols.len() {
-                            if !matches!(rt2.structure[c], Cell2::Val) {
-                                continue;
-                            }
-                            match names.get(&c).map(|s| s.as_str()) {
-                                Some("rem.x") => rx = Some(c),
-                                Some("rem.y") => ry = Some(c),
-                                other => rest.push((name_hash(other.unwrap_or("?")) ^ c as u64 * u64::from(other.is_none()), c)),
-                            }
-                        }
-                        let (Some(rx), Some(ry)) = (rx, ry) else {
-                            lo = hi;
-                            continue; // no player
-                        };
-                        let raw = |v: AV| -> Result<i32> {
-                            match v {
-                                AV::Num(n) => Ok(n.as_raw_u32() as i32),
-                                AV::Ival(a, b) if a == b => Ok(a.as_raw_u32() as i32),
-                                other => anyhow::bail!("rem-census needs an EXACT tree: a remainder is {other:?}"),
-                            }
-                        };
-                        for l in 0..rt2.width {
-                            let mut g = 0u64;
-                            for &(nh, c) in &rest {
-                                g = mix64(g ^ nh ^ code(rt2.cols[c].at(l)));
-                            }
-                            rows.push((g, raw(rt2.cols[rx].at(l))?, raw(rt2.cols[ry].at(l))?));
-                        }
-                        lo = hi;
-                    }
-                }
-                if rows.is_empty() {
-                    continue;
-                }
-                let n = rows.len();
-                // A: the hull per group.
-                let mut hull: rustc_hash::FxHashMap<u64, (i32, i32, i32, i32)> = Default::default();
-                for &(g, x, y) in &rows {
-                    let e = hull.entry(g).or_insert((x, x, y, y));
-                    *e = (e.0.min(x), e.1.max(x), e.2.min(y), e.3.max(y));
-                }
-                let (mut wx, mut wy): (Vec<f64>, Vec<f64>) = hull.values().map(|h| ((h.1 - h.0) as f64 / 65536.0, (h.3 - h.2) as f64 / 65536.0)).unzip();
-                // The same per group on the CIRCLE: the remainder is taken
-                // mod 1 (a frame rotates it), so a group's remainders are
-                // covered by the shortest ARC - one minus the largest gap
-                // between neighbours, the gap across the wrap included.
-                let mut per: rustc_hash::FxHashMap<u64, (Vec<i32>, Vec<i32>)> = Default::default();
-                for &(g, x, y) in &rows {
-                    let e = per.entry(g).or_default();
-                    e.0.push(x);
-                    e.1.push(y);
-                }
-                let arc = |v: &mut Vec<i32>| -> f64 {
-                    v.sort_unstable();
-                    v.dedup();
-                    let mut gap = (v[0] as i64 + 65536 - *v.last().unwrap() as i64) as f64;
-                    for w in v.windows(2) {
-                        gap = gap.max((w[1] - w[0]) as f64);
-                    }
-                    (65536.0 - gap) / 65536.0
-                };
-                let (mut cx, mut cy): (Vec<f64>, Vec<f64>) = per.values_mut().map(|(xs, ys)| (arc(xs), arc(ys))).unzip();
-
-                // Bits(k) rows, and B's hull per (group, bucket).
-                let bucket = |r: i32, k: u32| -> i32 { (r + 32768) >> (16 - k) };
-                let mut counts = Vec::new();
-                let mut b_frac = Vec::new();
-                for k in 0..=8u32 {
-                    let mut cells: rustc_hash::FxHashMap<(u64, i32, i32), (i32, i32, i32, i32)> = Default::default();
-                    for &(g, x, y) in &rows {
-                        let e = cells.entry((g, bucket(x, k), bucket(y, k))).or_insert((x, x, y, y));
-                        *e = (e.0.min(x), e.1.max(x), e.2.min(y), e.3.max(y));
-                    }
-                    counts.push(cells.len());
-                    seen[k as usize].extend(cells.keys().copied());
-                    if [2, 4, 6, 8].contains(&k) {
-                        let bw = (1i64 << (16 - k)) as f64;
-                        let m = cells.len() as f64;
-                        let fx = cells.values().map(|h| (h.1 - h.0 + 1) as f64 / bw).sum::<f64>() / m;
-                        let fy = cells.values().map(|h| (h.3 - h.2 + 1) as f64 / bw).sum::<f64>() / m;
-                        b_frac.push(format!("{fx:.3},{fy:.3}"));
-                    }
-                }
-                println!(
-                    "f{frame:03} | {n} | {} | {} | x {:.3}/{:.3}/{:.3} y {:.3}/{:.3}/{:.3} | {} | {}",
-                    hull.len(),
-                    counts.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" "),
-                    q(&mut wx, 0.5), q(&mut wx, 0.9), q(&mut wx, 1.0),
-                    q(&mut wy, 0.5), q(&mut wy, 0.9), q(&mut wy, 1.0),
-                    b_frac.join(" "),
-                    seen.iter().map(|c| c.len().to_string()).collect::<Vec<_>>().join(" ")
-                );
-                if level.is_some() {
-                    println!("f{frame:03} ideal of the level, cumulative: {}", ideal.len());
-                }
-                // How many DISTINCT remainders there are: overall, and per
-                // group - a lattice small enough to carry as a set?
-                let mut all_x: rustc_hash::FxHashSet<i32> = Default::default();
-                let mut all_y: rustc_hash::FxHashSet<i32> = Default::default();
-                for &(_, x, y) in &rows {
-                    all_x.insert(x);
-                    all_y.insert(y);
-                }
-                let (mut nx, mut ny): (Vec<f64>, Vec<f64>) = per.values().map(|(xs, ys)| (xs.len() as f64, ys.len() as f64)).unzip();
-                println!(
-                    "f{frame:03} distinct remainders: x {} y {} over the frame; per group x {:.0}/{:.0}/{:.0} y {:.0}/{:.0}/{:.0} (med/p90/max)",
-                    all_x.len(), all_y.len(),
-                    q(&mut nx, 0.5), q(&mut nx, 0.9), q(&mut nx, 1.0),
-                    q(&mut ny, 0.5), q(&mut ny, 0.9), q(&mut ny, 1.0)
-                );
-                println!(
-                    "f{frame:03} A on the circle (shortest arc) px x: {:.3}/{:.3}/{:.3} y: {:.3}/{:.3}/{:.3}",
-                    q(&mut cx, 0.5), q(&mut cx, 0.9), q(&mut cx, 1.0),
-                    q(&mut cy, 0.5), q(&mut cy, 0.9), q(&mut cy, 1.0)
-                );
-            }
         }
         Command::CoarseCensus { level_dir, from, to, erase } => {
             let erase = prefixes(&erase);
@@ -1850,9 +1444,7 @@ fn main() -> Result<()> {
             stop_at_win,
             spec,
         } => {
-            use celeste_rust::interpreter::abstraction::{set_rem_precision, RemPrecision};
             std::env::set_var("CELESTE_START_ROOM", &room);
-            set_rem_precision(RemPrecision::Exact);
             let lines: Vec<(Option<(i32, i32)>, Option<(u64, u64)>)> = std::fs::read_to_string(&trajectory)?
                 .lines()
                 .map(|l| l.trim())
@@ -1919,7 +1511,9 @@ fn main() -> Result<()> {
                                     continue;
                                 }
                             }
-                            let key = block.keys()[0];
+                            // Deduplicated on the EXACT state (the row key
+                            // forgets the remainder).
+                            let key = block.rt2().clone_block().row_keys_canonical()[0];
                             if !seen.insert((key.0, key.1, cell)) {
                                 continue;
                             }
@@ -2127,275 +1721,6 @@ fn main() -> Result<()> {
                 states = next;
             }
             println!("[follow] every frame is in the tree");
-        }
-        Command::Witness {
-            checkpoint_dir,
-            horizon,
-            level,
-            spec,
-            room,
-            budget,
-            start_after,
-        } => {
-            use celeste_rust::frame::marks_path;
-            use celeste_rust::interpreter::abstraction::RemPrecision;
-            use celeste_rust::interpreter::state::State;
-            use rustc_hash::{FxHashMap, FxHashSet};
-            std::env::set_var("CELESTE_START_ROOM", &room);
-            let precision = spec.unwrap_or_else(|| Level::for_rem(if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level as u8) }));
-            set_level(precision);
-            let base = std::path::Path::new(&checkpoint_dir);
-            let dir = if level == 0 {
-                base.join("level00")
-            } else {
-                base.join(format!("h{:03}", horizon)).join(format!("level{:02}", level))
-            };
-            let marks = Visited::load(&marks_path(base, horizon, level))?;
-            // (key, cell) -> the layer a MARKED row was first reached at: the
-            // only rows the DFS admits (all rows would not fit for a coarse
-            // level's tree).
-            let mut layer_of: FxHashMap<(u64, u64, u32), u32> = FxHashMap::default();
-            let mut rows = 0u64;
-            for f in 0..=horizon {
-                for (_, file) in frame_files(&dir, f)? {
-                    if let Some(rt2) = file.load_all()? {
-                        let b = Block::from_rt2(rt2);
-                        let shape = b.rt2().shape_hash;
-                        let cells = b.positions()?;
-                        rows += cells.len() as u64;
-                        for (k, &c) in b.keys().iter().zip(&cells) {
-                            if marks.contains(shape, *k, c) {
-                                layer_of.entry((k.0, k.1, c)).or_insert(f);
-                            }
-                        }
-                    }
-                }
-            }
-            eprintln!(
-                "[witness] h{horizon} level {level} ({precision}): {} marks, {} rows in the tree, {} marked rows by layer",
-                marks.len(),
-                rows,
-                layer_of.len()
-            );
-            let mut eng = ConcreteEngine::new()?;
-            // `initial` is the room's spawn, whose buttons are the boundary's
-            // representation (`restore_buttons`); the DFS starts at `roots`.
-            let initial = eng.initial_state()?;
-            let roots = start_states(start_after.as_deref())?;
-            // The tree must be this room's and the projection the one the
-            // level's kernels stored: the initial state (stored as it is) is
-            // layer 0's row, and some successor of it, projected, is a row of
-            // layer 1.
-            {
-                let rows_of = |f: u32| -> Result<Vec<(celeste_engine::runtime2::Rt2, (u64, u64), u32)>> {
-                    let mut v = Vec::new();
-                    for (_, file) in frame_files(&dir, f)? {
-                        if let Some(rt2) = file.load_all()? {
-                            let t = Block::from_rt2(rt2);
-                            let tc = t.positions()?;
-                            for (l, (k, &c)) in t.keys().iter().zip(&tc).enumerate() {
-                                let mut one = t.rt2().clone_block();
-                                one.gather_lanes(&[l as u32]);
-                                v.push((one, *k, c));
-                            }
-                        }
-                    }
-                    Ok(v)
-                };
-                // The room's spawn is stored as it is: it must be layer 0's
-                // row. A `--start-after` start is stored widened, and its key
-                // has been seen to differ from the witness's projection in a
-                // field the diff does not name (2026-10-03): not checked, the
-                // layer-1 check below still catches a wrong --spec.
-                if start_after.is_none() {
-                    let l0 = rows_of(0)?;
-                    for root in &roots {
-                        let b0 = Block::from_state(root)?;
-                        let (k0, c0) = (b0.keys()[0], b0.positions()?[0]);
-                        anyhow::ensure!(
-                            l0.iter().any(|(_, k, c)| *k == k0 && *c == c0),
-                            "the initial state is not layer 0's row: another room's tree?"
-                        );
-                    }
-                } else {
-                    eprintln!("[witness] --start-after: the start's layer-0 row is not checked");
-                }
-                // Some input's successor (a finer level's layer 1 holds only
-                // the rows its mark filter let through).
-                let l1 = rows_of(1)?;
-                let mut first: Option<Block> = None;
-                let mut found = false;
-                for byte in 0u8..64 {
-                    for succ in eng.step_all(&roots[0], byte, &initial)? {
-                        let b1 = Block::from_state(&succ)?;
-                        let (_, keys, cells) = widened_keys(&b1, precision)?;
-                        found |= l1.iter().any(|(_, k, c)| *k == keys[0] && *c == cells[0]);
-                        first.get_or_insert(b1);
-                    }
-                }
-                if !found {
-                    let mut mine = first.expect("a successor").into_rt2();
-                    widen_rt2_to(&mut mine, precision);
-                    for (theirs, ..) in l1.iter().take(4) {
-                        for line in field_diff(&mine, 0, theirs, 0, 40) {
-                            eprintln!("[witness]   {line}");
-                        }
-                    }
-                    anyhow::bail!("no successor of the start projected onto {precision} is a row of layer 1 (the idle one's diff above): the wrong --spec?");
-                }
-            }
-            struct Ctx<'a> {
-                eng: ConcreteEngine,
-                initial: State,
-                horizon: u32,
-                precision: Level,
-                marks: &'a Visited,
-                layer_of: &'a FxHashMap<(u64, u64, u32), u32>,
-                // Concrete states (key, cell, frame) whose subtree has no win:
-                // keyed on the CONCRETE state, since one coarse row holds many.
-                dead: FxHashSet<(u64, u64, u32, u32)>,
-                path: Vec<u8>,
-                steps: u64,
-                budget: u64,
-                deepest: (u32, Vec<u8>, Option<State>),
-            }
-            fn step_all(cx: &mut Ctx, state: &State, byte: u8) -> Result<Vec<State>> {
-                let out = cx.eng.step_all(state, byte, &cx.initial)?;
-                let before = cx.steps;
-                cx.steps += out.len() as u64;
-                if before / 200_000 != cx.steps / 200_000 {
-                    eprintln!("[witness] {} steps, at depth {}, deepest f{}, {} dead", cx.steps, cx.path.len(), cx.deepest.0, cx.dead.len());
-                }
-                Ok(out)
-            }
-            fn dfs(cx: &mut Ctx, state: &State, f: u32) -> Result<bool> {
-                if f > cx.deepest.0 {
-                    cx.deepest = (f, cx.path.clone(), Some(state.clone()));
-                }
-                if f >= cx.horizon || cx.steps >= cx.budget {
-                    return Ok(false);
-                }
-                for byte in 0u8..64 {
-                    // Every leaf: a frame forks where the cart reads a value
-                    // no input decides (`rnd`), and a leaf on a marked chain
-                    // is as good a witness as the frame has. The real-PICO-8
-                    // replay, with a seed, settles it.
-                    for succ in step_all(cx, state, byte)? {
-                        let block = Block::from_state(&succ)?;
-                        if wins_of(block.rt2())?.iter().any(|&w| w) {
-                            cx.path.push(byte);
-                            eprintln!("[witness] WIN at f{} via input {}", f + 1, byte);
-                            return Ok(true);
-                        }
-                        let concrete = (block.keys()[0], block.positions()?[0]);
-                        let dead_id = (concrete.0 .0, concrete.0 .1, concrete.1, f + 1);
-                        if cx.dead.contains(&dead_id) {
-                            continue;
-                        }
-                        let (shape, keys, cells) = widened_keys(&block, cx.precision)?;
-                        if !cx.marks.contains(shape, keys[0], cells[0]) || cx.layer_of.get(&(keys[0].0, keys[0].1, cells[0])) != Some(&(f + 1)) {
-                            continue;
-                        }
-                        cx.path.push(byte);
-                        if dfs(cx, &succ, f + 1)? {
-                            return Ok(true);
-                        }
-                        cx.path.pop();
-                        cx.dead.insert(dead_id);
-                    }
-                }
-                Ok(false)
-            }
-            let mut cx = Ctx {
-                eng,
-                initial: initial.clone(),
-                horizon,
-                precision,
-                marks: &marks,
-                layer_of: &layer_of,
-                dead: FxHashSet::default(),
-                path: Vec::new(),
-                steps: 0,
-                budget,
-                deepest: (0, Vec::new(), None),
-            };
-            let mut found = false;
-            for root in &roots {
-                if dfs(&mut cx, root, 0)? {
-                    found = true;
-                    break;
-                }
-            }
-            eprintln!(
-                "[witness] {} concrete steps{}, {} dead concrete states",
-                cx.steps,
-                if cx.steps >= cx.budget { " (BUDGET EXHAUSTED)" } else { "" },
-                cx.dead.len()
-            );
-            if found {
-                println!("win at f{}: {}", cx.path.len(), cx.path.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
-                return Ok(());
-            }
-            println!("NO WITNESS: no marked chain has a concrete continuation to a win by f{horizon}");
-            // The diagnosis: the deepest frame a concrete run stays inside
-            // the marks, and why no successor there is admitted.
-            let (d, prefix, state) = std::mem::replace(&mut cx.deepest, (0, Vec::new(), None));
-            let state = state.expect("the DFS visits the initial state");
-            println!("deepest: f{d} inside the marks; inputs {}", prefix.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
-            {
-                let b = Block::from_state(&state)?;
-                println!("  the concrete state at f{d}: {}", player_summary(b.rt2(), 0));
-            }
-            // Layer d+1's marked rows, by cell.
-            let mut next: FxHashMap<u32, Vec<(celeste_engine::runtime2::Rt2, usize)>> = FxHashMap::default();
-            for (_, file) in frame_files(&dir, d + 1)? {
-                if let Some(rt2) = file.load_all()? {
-                    let b = Block::from_rt2(rt2);
-                    let shape = b.rt2().shape_hash;
-                    let cells = b.positions()?;
-                    let lanes: Vec<usize> = (0..cells.len()).filter(|&l| marks.contains(shape, b.keys()[l], cells[l])).collect();
-                    for l in lanes {
-                        next.entry(cells[l]).or_default().push((b.rt2().clone_block(), l));
-                    }
-                }
-            }
-            println!("  layer f{}: {} marked rows over {} cells", d + 1, next.values().map(|v| v.len()).sum::<usize>(), next.len());
-            let mut unmarked_cells = 0usize;
-            for byte in 0u8..64 {
-                for succ in step_all(&mut cx, &state, byte)? {
-                    let block = Block::from_state(&succ)?;
-                    let (shape, keys, cells) = widened_keys(&block, precision)?;
-                    let marked = marks.contains(shape, keys[0], cells[0]);
-                    let layer = layer_of.get(&(keys[0].0, keys[0].1, cells[0])).copied();
-                    let Some(cands) = next.get(&cells[0]) else {
-                        unmarked_cells += 1;
-                        continue;
-                    };
-                    let mut mine = block.into_rt2();
-                    widen_rt2_to(&mut mine, precision);
-                    // The closest marked row at the cell: fewest differing cells.
-                    let best = cands
-                        .iter()
-                        .filter(|(t, _)| t.shape_hash == mine.shape_hash)
-                        .map(|(t, l)| (field_diff(&mine, 0, t, *l, usize::MAX), t, *l))
-                        .min_by_key(|(d, ..)| d.len());
-                    println!(
-                        "  input {byte:2}: successor {} marked {marked} layer {layer:?}; {} marked rows at its cell",
-                        player_summary(&mine, 0),
-                        cands.len()
-                    );
-                    match best {
-                        Some((diff, t, l)) => {
-                            println!("    closest marked row ({} fields differ): {}", diff.len(), player_summary(t, l));
-                            for line in diff.iter().take(12) {
-                                println!("      {line}");
-                            }
-                        }
-                        None => println!("    no marked row of its shape at the cell"),
-                    }
-                }
-            }
-            println!("  {unmarked_cells} successors at cells with no marked row in layer f{}", d + 1);
         }
     }
 

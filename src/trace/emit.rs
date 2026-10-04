@@ -119,7 +119,7 @@ fn root_legend(f: &crate::trace::verify::Frame) -> String {
 /// refuses. A hitbox IS uniform - it is fixed per object type and never
 /// written during a frame - so saying so here is a stand-in for the
 /// classification, not a fudge.
-pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> Result<Bound> {
+pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
     let mut roots: Vec<NodeId> = Vec::new();
     for o in &f.outs {
         roots.extend(o.fields.iter().map(|(_, nd, _)| *nd));
@@ -244,18 +244,14 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph, widen_level0: bool) -> R
             })
             .collect();
         let mut widen: Vec<(u32, AV)> = Vec::new();
-        // LADDER/EXACT sets go through `Rt2::boundary_exact` (no widening), so
-        // their key must NOT widen. Only the LEVEL0 set (widen_level0) does.
-        if widen_level0 {
-            let (rem_cells, _det_cells) = o.rt2.mark_walk(&ids);
-            for c in rem_cells {
-                widen.push((c, rem_ival));
-            }
-            for &tg in &ids.g_timers {
-                let cell = o.rt2.globals[tg as usize];
-                if (cell as usize) < o.rt2.structure.len() {
-                    widen.push((cell, AV::Num(zero)));
-                }
+        let (rem_cells, _det_cells) = o.rt2.mark_walk(&ids);
+        for c in rem_cells {
+            widen.push((c, rem_ival));
+        }
+        for &tg in &ids.g_timers {
+            let cell = o.rt2.globals[tg as usize];
+            if (cell as usize) < o.rt2.structure.len() {
+                widen.push((cell, AV::Num(zero)));
             }
         }
         // The unknown numbers, uniform, off the per-lane key fold. (The unknown

@@ -22,23 +22,20 @@
 use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::frame::{id_layer, pack_id, Visited};
+use crate::frame::{id_layer, pack_id};
 
 /// One edge record in a worker file: the target's (seq, row) - its layer
 /// is the file's - the base's (seq, row) - its layer is the frame's input
 /// layer - the transfer (the worker's id) and the 64-lane mask.
 pub const RECORD_BYTES: usize = 24;
 
-/// The transfer of an edge nothing computed one for (a finer rem rung's
-/// kernels capture none; a reference-engine tree records no edges at all).
-pub const NO_XFER: u32 = u32::MAX;
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Edge {
     pub target: u64,
     pub base: u64,
-    /// The transfer: an index into the frame's table (`EdgeGraph::pair`), or
-    /// `NO_XFER`.
+    /// The transfer: an index into the frame's table (`EdgeGraph::pair`).
     pub xfer: u32,
     pub mask: u64,
 }
@@ -70,7 +67,7 @@ fn decode(b: &[u8], layer: u32, frame: u32, remap: &[u32]) -> Rec {
     (
         pack_id(layer, tseq, trow),
         pack_id(frame - 1, bseq, brow),
-        if x == NO_XFER { NO_XFER } else { remap[x as usize] },
+        remap[x as usize],
         u64::from_le_bytes(b[16..24].try_into().unwrap()),
     )
 }
@@ -253,9 +250,9 @@ fn unzigzag(v: u64) -> i64 {
 }
 
 /// Encode a slice of records already sorted by (target, base, transfer):
-/// equal triples merged, delta-varint blocks of `STRIDE` pairs (the
-/// transfer as `id + 1`, `NO_XFER` as 0). Returns `(index entries (first
-/// target, offset within this stream), stream, pairs)`.
+/// equal triples merged, delta-varint blocks of `STRIDE` pairs. Returns
+/// `(index entries (first target, offset within this stream), stream,
+/// pairs)`.
 fn encode_sorted(recs: &[Rec]) -> (Vec<(u64, u64)>, Vec<u8>, u64) {
     let mut index: Vec<(u64, u64)> = Vec::with_capacity(recs.len() / STRIDE + 1);
     let mut out: Vec<u8> = Vec::with_capacity(recs.len() * 5);
@@ -276,7 +273,7 @@ fn encode_sorted(recs: &[Rec]) -> (Vec<(u64, u64)>, Vec<u8>, u64) {
         }
         put_varint(&mut out, t - prev_t);
         put_varint(&mut out, zigzag(b as i64 - prev_b as i64));
-        put_varint(&mut out, x.wrapping_add(1) as u64);
+        put_varint(&mut out, x as u64);
         put_mask(&mut out, m);
         prev_t = t;
         prev_b = b;
@@ -817,7 +814,7 @@ impl Run {
             }
             let t = prev_t + get_varint(b, &mut pos);
             let base = (prev_b as i64 + unzigzag(get_varint(b, &mut pos))) as u64;
-            let xfer = (get_varint(b, &mut pos) as u32).wrapping_sub(1);
+            let xfer = get_varint(b, &mut pos) as u32;
             let mask = get_mask(b, &mut pos);
             prev_t = t;
             prev_b = base;
@@ -876,13 +873,13 @@ impl EdgeGraph {
         Ok(EdgeGraph { runs, xfers, records, bytes })
     }
 
-    /// The transfer `xfer` of an edge recorded at frame `frame` (`None`:
-    /// `NO_XFER`, or an id the frame's table does not have).
+    /// The transfer `xfer` of an edge recorded at frame `frame` (`None`: an
+    /// id the frame's table does not have).
     pub fn pair(&self, frame: u32, xfer: u32) -> Option<super::arc_edges::Pair> {
         self.xfers.get(frame as usize)?.get(xfer as usize).copied()
     }
 
-    /// DIAGNOSTIC (`rewrite arc-check`, `bench-backward --diff`): every
+    /// DIAGNOSTIC (`rewrite arc-check`): every
     /// record of frame `frame`, a full scan of its runs.
     pub fn records_at(&self, frame: u32) -> Vec<Edge> {
         let mut out = Vec::new();
@@ -909,7 +906,7 @@ impl EdgeGraph {
                 }
                 let t = prev_t + get_varint(b, &mut pos);
                 let base = (prev_b as i64 + unzigzag(get_varint(b, &mut pos))) as u64;
-                let xfer = (get_varint(b, &mut pos) as u32).wrapping_sub(1);
+                let xfer = get_varint(b, &mut pos) as u32;
                 let mask = get_mask(b, &mut pos);
                 prev_t = t;
                 prev_b = base;
@@ -1070,12 +1067,6 @@ pub fn bfs(graph: &EdgeGraph, horizon: u32, seeds: impl IntoIterator<Item = u64>
     (marks, BfsStats { edges_read, lookups, t_open: std::time::Duration::ZERO, t_bfs })
 }
 
-pub struct BackwardResult {
-    pub marked: Visited,
-    pub marks: Marks,
-    pub stats: BfsStats,
-}
-
 /// Each `(id, deadline)` of `ids` (sorted by id) resolved to its row's
 /// `(shape, key, cell)` through the tree's frame files `(layer, seq, file)`
 /// (in `(layer, seq)` order): `f(shape, key, cell, deadline)`. Every id must
@@ -1108,54 +1099,6 @@ pub fn resolve_ids(
     Ok(())
 }
 
-/// The backward over a level dir: seeds from the checkpoint headers' win
-/// rows (layers 1..=horizon), the BFS over `<dir>/edges`, the marked ids
-/// resolved to `(shape, key, cell)` through the checkpoint files.
-pub fn backward(dir: &Path, horizon: u32) -> Result<BackwardResult> {
-    // A tree can END before the horizon (every lane won or died - the
-    // synthetic targets do this): the wins by `horizon` are then the
-    // wins the tree has, and there are no frames past its last to read.
-    let horizon = {
-        let mut last = 0u32;
-        while dir.join("frames").join(format!("f{:03}", last + 1)).is_dir() {
-            last += 1;
-        }
-        horizon.min(last)
-    };
-    let t = std::time::Instant::now();
-    let graph = EdgeGraph::open(&dir.join("edges"), horizon)?;
-    let t_open = t.elapsed();
-    let mut seeds: Vec<u64> = Vec::new();
-    let mut files: Vec<(u32, u32, crate::search::checkpoint::FrameFile)> = Vec::new();
-    for layer in 0..=horizon {
-        for (seq, file) in crate::frame::frame_files(dir, layer)? {
-            if layer >= 1 {
-                seeds.extend(file.win_rows().iter().map(|&(row, _cell)| pack_id(layer, seq, row)));
-            }
-            files.push((layer, seq, file));
-        }
-    }
-    let (marks, mut stats) = bfs(&graph, horizon, seeds);
-    stats.t_open = t_open;
-    // The marked ids as the ladder's (shape, key, cell) set.
-    let t = std::time::Instant::now();
-    let mut marked = Visited::new();
-    resolve_ids(&files, &marks.with_deadlines(), |shape, key, cell, deadline| {
-        marked.insert_until(shape, key, cell, deadline);
-    })?;
-    eprintln!(
-        "[bfs] h{horizon}: {} runs-bytes {:.2} GB, open {:.0} ms, bfs {:.0} ms ({} lookups, {} edges), resolve {:.0} ms",
-        graph.records,
-        graph.bytes as f64 / 1e9,
-        stats.t_open.as_secs_f64() * 1e3,
-        stats.t_bfs.as_secs_f64() * 1e3,
-        stats.lookups,
-        stats.edges_read,
-        t.elapsed().as_secs_f64() * 1e3
-    );
-    Ok(BackwardResult { marked, marks, stats })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,6 +1110,12 @@ mod tests {
             encode_record(&mut buf, e.target, e.base, e.xfer, e.mask);
         }
         std::fs::write(raw_path(dir, frame, layer, worker), buf).unwrap();
+        // The worker's transfer table: one pair, every record's id 0 (a test
+        // with transfers of its own writes its table after this).
+        let mut t = Vec::new();
+        let a = crate::search::arc_edges::AxisXfer { lo: 0, hi: crate::search::arcs::CIRCLE, tag: 0, val: 0 };
+        crate::search::arc_edges::encode_pair(&mut t, &(a, a));
+        std::fs::write(raw_xfer_path(dir, frame, worker), t).unwrap();
     }
 
     /// A mark's deadline is the last frame it still reaches a win by the
@@ -1177,7 +1126,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let (a, b, c, e, w, f, g) =
             (pack_id(0, 0, 0), pack_id(1, 0, 0), pack_id(2, 0, 0), pack_id(2, 0, 1), pack_id(3, 0, 0), pack_id(3, 0, 1), pack_id(3, 0, 2));
-        let edge = |from: u64, to: u64| Edge { target: to, base: from, xfer: NO_XFER, mask: 1 };
+        let edge = |from: u64, to: u64| Edge { target: to, base: from, xfer: 0, mask: 1 };
         // a -> b -> c -> w (the win, layer 3); b -> e -> f; and two REVISITS
         // at frame 4: g -> w (in time: a win at 4) and f -> c (too late: c at
         // 4 wins at 5).
@@ -1215,15 +1164,15 @@ mod tests {
         // one) 30 more times: its records occupy the end of block 0 and
         // the start of block 1. Then target 9000 for 3 * STRIDE records.
         for t in 0..(STRIDE as u64 - 10) {
-            edges.push(Edge { target: pack_id(layer, 0, t as u32), base: pack_id(layer - 1, 0, 16 * t as u32), xfer: NO_XFER, mask: 1 });
+            edges.push(Edge { target: pack_id(layer, 0, t as u32), base: pack_id(layer - 1, 0, 16 * t as u32), xfer: 0, mask: 1 });
         }
         let last = pack_id(layer, 0, STRIDE as u32 - 11);
         for k in 0..30u32 {
-            edges.push(Edge { target: last, base: pack_id(layer - 1, 0, 100_000 + 16 * k), xfer: NO_XFER, mask: 3 });
+            edges.push(Edge { target: last, base: pack_id(layer - 1, 0, 100_000 + 16 * k), xfer: 0, mask: 3 });
         }
         let wide = pack_id(layer, 1, 9000);
         for k in 0..(3 * STRIDE as u32) {
-            edges.push(Edge { target: wide, base: pack_id(layer - 1, 2, 16 * k), xfer: NO_XFER, mask: 0xffff });
+            edges.push(Edge { target: wide, base: pack_id(layer - 1, 2, 16 * k), xfer: 0, mask: 0xffff });
         }
         // Written unsorted, across two workers.
         edges.reverse();
@@ -1246,7 +1195,7 @@ mod tests {
         assert_eq!(buf.len(), 1);
         buf.clear();
         g.preds_at(pack_id(layer, 0, 7), layer, &mut buf);
-        assert_eq!(buf, vec![Edge { target: pack_id(layer, 0, 7), base: pack_id(layer - 1, 0, 112), xfer: NO_XFER, mask: 1 }]);
+        assert_eq!(buf, vec![Edge { target: pack_id(layer, 0, 7), base: pack_id(layer - 1, 0, 112), xfer: 0, mask: 1 }]);
         buf.clear();
         g.preds_at(pack_id(layer, 3, 0), layer, &mut buf);
         assert!(buf.is_empty(), "an absent target");

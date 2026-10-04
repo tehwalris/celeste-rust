@@ -76,9 +76,8 @@ struct AsmBody {
     /// `None`: this outcome has no player object, or its `x`/`y` is not a
     /// plain number (every row is `NO_CELL`, as `block_cells` says).
     pos: Option<[PosSrc; 4]>,
-    /// The transfer roots (`search::arc_edges`): `None` unless the set is
-    /// a level-0 one.
-    arc: Option<ArcSlots>,
+    /// The transfer roots (`search::arc_edges`).
+    arc: ArcSlots,
 }
 
 /// Where a body's transfer roots are (`trace::verify::FrameOut::arc`): per
@@ -414,9 +413,6 @@ impl AsmKernel {
                 );
             }
             let valid = (((1u32 << n) - 1) as u16) & only;
-            // BACKWARD: lanes already known to reach a target; nothing more
-            // to learn from them.
-            let mut hit_lanes: u16 = 0;
             for (body, cols) in self.bodies.iter().zip(body_cols) {
                 // `error`/`live` are tri-state ZB masks, read with ONE
                 // polarity (plans/graph-model.md section 5): each where it
@@ -477,29 +473,6 @@ impl AsmKernel {
                 n_bodies_taken += 1;
                 n_lanes += take.count_ones() as u64;
                 let template = &self.acc_templates[body.outcome];
-                if let Some(targets) = sink.targets {
-                    // BACKWARD: per lane not yet hit, is this output in the
-                    // target set? One bit per input row is the whole result:
-                    // no dedup, nothing materialized, and a lane that has
-                    // hit is done for the rest of the slice.
-                    take &= !hit_lanes;
-                    while take != 0 {
-                        let i = take.trailing_zeros() as usize;
-                        take &= take - 1;
-                        let (h1, h2) = body.key_words(outbuf, i);
-                        let key = (
-                            runtime2::mix64(template.part.0.wrapping_add(h1)),
-                            runtime2::mix64(template.part.1.wrapping_add(h2)),
-                        );
-                        n_unique += 1;
-                        let cout = cell_out(body, outbuf, i);
-                        if targets.contains(key, cout) {
-                            sink.hit(lanes[i]);
-                            hit_lanes |= 1 << i;
-                        }
-                    }
-                    continue;
-                }
                 while take != 0 {
                     let i = take.trailing_zeros() as usize;
                     take &= take - 1;
@@ -514,9 +487,10 @@ impl AsmKernel {
                     let cin = cell_in[lanes[i]];
                     // THE TRANSFER (`search::arc_edges`): per producer,
                     // carried by the edge, never in the row.
-                    let xfer = match (&body.arc, slice_base) {
-                        (Some(a), Some(_)) => sink.xfer_id(a.transfer(outbuf, i, chunk, lanes[i], body.outcome)),
-                        _ => crate::search::edges::NO_XFER,
+                    // (Read only where the slice has ids, `slice_base`.)
+                    let xfer = match slice_base {
+                        Some(_) => sink.xfer_id(body.arc.transfer(outbuf, i, chunk, lanes[i], body.outcome)),
+                        None => 0,
                     };
                     // EMISSION-TIME PROVENANCE (plans/buckets.md). The
                     // source of this row is lane `i` of this slice, and
@@ -1038,13 +1012,8 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
         return;
     }
     let acc = slot.to_rt2();
-    let exact = registry().map(|r| r.exact_boundary).unwrap_or(false);
     let mut b = acc.clone_block();
-    if exact {
-        b.boundary_exact();
-    } else {
-        b.boundary(&super::boundary_ids());
-    }
+    b.boundary(&super::boundary_ids());
     // A queue holds rows from SEVERAL kernel calls (the call's dedup cache
     // is per call), and the
     // flush collapses equal keys - so the append step's DISTINCT keys must
@@ -1179,9 +1148,6 @@ pub(crate) struct Registry {
     /// (`trace::kernel::RegionGrid`), per reached (shape, region) - and a row
     /// with a key that is not here is a coverage gap.
     kernels: HashMap<(u64, Option<Region>), AsmKernel>,
-    /// The rung-agnostic / exact sets go through `boundary_exact`; the
-    /// level-0 set through `boundary`.
-    exact_boundary: bool,
     /// The region grid the set was built on.
     grid: Option<crate::trace::kernel::RegionGrid>,
 }
@@ -1259,13 +1225,7 @@ impl Registry {
 
     /// Retrace the start room and assemble every shape for one lattice set
     /// (`opts`). `root` is the repo root (Lua sources + cart).
-    /// `exact_boundary` selects `boundary_exact` for the ladder and exact
-    /// sets.
-    pub fn build_for_start_room(
-        root: &Path,
-        opts: crate::trace::shapes::WalkOpts,
-        exact_boundary: bool,
-    ) -> Result<Registry> {
+    pub fn build_for_start_room(root: &Path, opts: crate::trace::shapes::WalkOpts) -> Result<Registry> {
         let t_trace = std::time::Instant::now();
         let refs = crate::trace::kernel::lattice_kernel_refs(root, opts)
             .context("retracing the start room for ASM kernels")?;
@@ -1326,7 +1286,7 @@ impl Registry {
             n_workers,
         );
         eprintln!("[asm build]   phases, summed over workers and concurrent builds: {}", crate::transpile::lower::build_profile());
-        Ok(Registry { kernels, exact_boundary, grid: crate::trace::kernel::region_grid() })
+        Ok(Registry { kernels, grid: crate::trace::kernel::region_grid() })
     }
 }
 
@@ -1547,14 +1507,12 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
                 Some(KeyField::new(outputs[j].0 as u64, compiled.root_offsets[root] as usize, compiled.root_kinds[root]))
             })
             .collect();
-        let arc = if narc == 0 {
-            None
-        } else {
-            anyhow::ensure!(narc == 2 * crate::trace::verify::ARC_AXIS_ROOTS, "shape {si} outcome {}: {narc} transfer roots", b.outcome);
-            let at = off + nfields + 2;
-            let roots = std::array::from_fn(|k| (compiled.root_offsets[slot_of[at + k]] as usize, compiled.root_kinds[slot_of[at + k]]));
-            Some(ArcSlots { roots, fin: r.bound.outcomes[b.outcome].arc_fin })
-        };
+        // Every body computes its transfer: an edge without one could not
+        // be in the rotation graph.
+        anyhow::ensure!(narc == 2 * crate::trace::verify::ARC_AXIS_ROOTS, "shape {si} outcome {}: {narc} transfer roots", b.outcome);
+        let at = off + nfields + 2;
+        let roots = std::array::from_fn(|k| (compiled.root_offsets[slot_of[at + k]] as usize, compiled.root_kinds[slot_of[at + k]]));
+        let arc = ArcSlots { roots, fin: r.bound.outcomes[b.outcome].arc_fin };
         asm_bodies.push(AsmBody {
             outcome: b.outcome,
             splits: b.splits.clone(),
@@ -1784,28 +1742,24 @@ const HELD_SLOTS: usize = 2;
 const FRUIT_SLOTS: usize = 2;
 const FLOORS_SLOTS: usize = 2;
 const PLATFORMS_SLOTS: usize = 2;
-const LEVEL_SLOTS: usize = 17 * HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS * PLATFORMS_SLOTS;
+const LEVEL_SLOTS: usize = HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS * PLATFORMS_SLOTS;
 
 /// The kernel set for one LEVEL, built on a big stack (the retrace's init
 /// interpret recurses deeper than a worker thread's default). The root is
 /// `CELESTE_ROOT` or the CWD.
 ///
-/// One set per level (rem rung x held x fruit x floors x platforms): the
-/// ladder kernels specialize to the level, so a ladder that walks levels in
-/// one process needs a distinct set for each - one process-wide set would
-/// freeze at level 0's and serve the wrong kernels to every level above. The
-/// level is an explicit input of the build, not read from the process-global
-/// level, so the sets build in parallel (`prebuild`); one build per level at a
-/// time (`BUILDING`), a second caller waits for it.
+/// One set per level (held x fruit x floors x platforms): the kernels
+/// specialize to the level, so a tool that runs two levels in one process
+/// (`ref-check`, `follow`, `rerun-row` against a tree of another level)
+/// needs a set for each. The level is an explicit input of the build, not
+/// read from the process-global level; one build per level at a time
+/// (`BUILDING`), a second caller waits for it.
 ///
-/// RESIDENT SETS ARE CAPPED (2026-09-19). A set is ~1.7 GB resident (room
-/// (3,0): 306 kernels), and all 18 of a ladder's were 31 GB before the search
-/// started - room (3,0)'s level 1 was OOM-killed at the 60 GB cap with half of
-/// it kernels it was not running. `CELESTE_KERNEL_SETS=N` keeps at most N
-/// built sets; building one more evicts the least recently used, rebuilt if
-/// its level runs again (the next horizon). Unset: no cap, every set stays.
-/// A caller holds its set by `Arc` for the call, so an evicted set lives on
-/// until its last chunk ends.
+/// RESIDENT SETS ARE CAPPED (2026-09-19): a set is ~1.7 GB resident (room
+/// (3,0): 306 kernels). `CELESTE_KERNEL_SETS=N` keeps at most N built sets;
+/// building one more evicts the least recently used, rebuilt if its level
+/// runs again. Unset: no cap, every set stays. A caller holds its set by
+/// `Arc` for the call, so an evicted set lives on until its last chunk ends.
 fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<std::sync::Arc<Registry>> {
     static BUILDING: [std::sync::Mutex<()>; LEVEL_SLOTS] = [const { std::sync::Mutex::new(()) }; LEVEL_SLOTS];
     let slot = level_slot(level);
@@ -1816,7 +1770,7 @@ fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<std::sy
     if let Some(r) = SETS.lock().unwrap().get(slot) {
         return r;
     }
-    let built = build_registry_for_rung(level).map(std::sync::Arc::new);
+    let built = build_registry_for_level(level).map(std::sync::Arc::new);
     let evicted = SETS.lock().unwrap().insert(slot, level, built.clone());
     // Unloaded outside the lock: every other chunk's lookup waits on it.
     drop(evicted);
@@ -1890,35 +1844,11 @@ fn kernel_set_cap() -> Option<usize> {
 }
 
 fn level_slot(level: crate::interpreter::abstraction::Level) -> usize {
-    use crate::interpreter::abstraction::RemPrecision;
-    let rem_slot = match level.rem {
-        RemPrecision::Exact => 16,
-        RemPrecision::Bits(b) => (b as usize).min(16),
-    };
     let held_slot = level.held.is_unknown() as usize;
     let fruit_slot = level.fruit.is_unknown() as usize;
     let floors_slot = level.floors.is_near() as usize;
     let platforms_slot = level.platforms.is_unknown() as usize;
-    (((rem_slot * HELD_SLOTS + held_slot) * FRUIT_SLOTS + fruit_slot) * FLOORS_SLOTS + floors_slot) * PLATFORMS_SLOTS + platforms_slot
-}
-
-/// Build every rung's kernel set now, all rungs at once (one builder
-/// thread per rung, each assembling its shapes in parallel). The ladder
-/// calls this up front: lazily, the 17 builds landed one at a time inside
-/// the first frame of each level - 82 s of a 524 s room (1,0) run.
-/// Under `CELESTE_KERNEL_SETS=N` only the first N (the ladder runs them in
-/// order): building more would only evict them again.
-pub fn prebuild(levels: &[crate::interpreter::abstraction::Level]) {
-    let levels = &levels[..kernel_set_cap().map_or(levels.len(), |n| n.min(levels.len()))];
-    let t = std::time::Instant::now();
-    std::thread::scope(|scope| {
-        for &l in levels {
-            scope.spawn(move || {
-                registry_for(l);
-            });
-        }
-    });
-    eprintln!("[asm build] {} levels prebuilt in {:.1} s", levels.len(), t.elapsed().as_secs_f64());
+    ((held_slot * FRUIT_SLOTS + fruit_slot) * FLOORS_SLOTS + floors_slot) * PLATFORMS_SLOTS + platforms_slot
 }
 
 /// THE KERNEL BUILD'S PURGE DELAY (2026-09-18). `safe-run.sh` has mimalloc
@@ -1971,35 +1901,23 @@ impl Drop for BuildPurgeDelay {
     }
 }
 
-fn build_registry_for_rung(level: crate::interpreter::abstraction::Level) -> Option<Registry> {
-    use crate::interpreter::abstraction::RemPrecision;
+fn build_registry_for_level(level: crate::interpreter::abstraction::Level) -> Option<Registry> {
     use crate::trace::shapes::WalkOpts;
     let _purge = BuildPurgeDelay::start();
-    let rem = level.rem;
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
-    let mode = super::dispatch::traced_mode_for(rem);
-    let objects = |o: WalkOpts| o.with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors_near(level.floors.is_near()).with_platforms(level.platforms.is_unknown());
-    let (opts, exact) = match (mode, rem) {
-        (super::dispatch::TracedMode::Level0, _) => (objects(WalkOpts::LEVEL0), false),
-        // The rung's rem widening baked into the graph (`ladder_widen`),
-        // rows through `boundary_exact` (it emits the widened rem and keys
-        // the emitted field).
-        (super::dispatch::TracedMode::Level0Agnostic, RemPrecision::Bits(b)) => (objects(WalkOpts::ladder_widen(b)), true),
-        (super::dispatch::TracedMode::Level0Agnostic, RemPrecision::Exact) => unreachable!("an exact rem is the exact set"),
-        (super::dispatch::TracedMode::ExactRem, _) => (WalkOpts::EXACT, true),
-    };
+    let opts = WalkOpts::LEVEL0.with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors_near(level.floors.is_near()).with_platforms(level.platforms.is_unknown());
     let built = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || Registry::build_for_start_room(Path::new(&root), opts, exact))
+        .spawn(move || Registry::build_for_start_room(Path::new(&root), opts))
         .expect("spawn asm-kernel builder")
         .join()
         .expect("asm-kernel builder panicked");
     match built {
         Ok(reg) => {
-            eprintln!("ASM kernels ENABLED ({mode:?}, {level}): {} start-room shapes assembled", reg.len());
+            eprintln!("ASM kernels ENABLED ({level}): {} start-room shapes assembled", reg.len());
             Some(reg)
         }
-        Err(e) => panic!("building ASM kernels for {rem:?}: {e:#}"),
+        Err(e) => panic!("building ASM kernels for {level}: {e:#}"),
     }
 }
 

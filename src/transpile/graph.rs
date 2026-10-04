@@ -219,10 +219,8 @@ pub enum Op {
     /// fragments are the numbers themselves, EXACT: `SplitInt(d)` resolves
     /// to `IntFrag(c)`, the low end of fragment `c` as a plain number. Validity is `SplitValid(d)` /
     /// `FragOk(c)` and the premise `SplitOk(n)`, shared with `Split`, on
-    /// the same operand - so the fork grid must be the integers (rem
-    /// Bits(0), `Level::grid_consistent`). A fork over a literal
-    /// (`Symbolic::both_values`) forks one of two grid points instead, at
-    /// any grid.
+    /// the same operand, on the integer grid. A fork over a literal
+    /// (`Symbolic::both_values`) forks one of two integers instead.
     SplitInt(u8),
     IntFrag(u8),
     /// `SplitOk(n)` over the same operand: does this lane's interval span
@@ -272,14 +270,6 @@ pub struct Graph {
     /// room (6,0) trace, nearly all of it probing (2026-09-27). Never
     /// iterated, so the hasher changes no order.
     intern: rustc_hash2::FxHashMap<Node, NodeId>,
-    /// The fork grid: `Split`/`Frag`/`FragOk`/`SplitOk` cut an interval at
-    /// the multiples of `2^-fork_bits` (0 = the integers, the historic
-    /// meaning). One value per graph, because it is one value per traced
-    /// set: the rung's rem bucket width. Rung k's `move` forks at the
-    /// bucket grid, which contains the integers, so one fork per axis
-    /// settles both the integer move and the bucket the new rem lands in
-    /// (plans/waves.md "The finer rungs").
-    fork_bits: u8,
     /// Per fork `d`, how many fragments it has (absent = 2). Set by the
     /// tracer's `fork_flr`; read by the specialization's enumeration.
     fork_ways: Vec<u8>,
@@ -304,6 +294,9 @@ pub enum CellKind {
 /// fork's fragment with a byte.
 pub const MAX_WAYS: usize = 255;
 
+/// One fork-grid step (the integers) in raw 16.16 units.
+const GRID_STEP: i32 = 1 << 16;
+
 impl Graph {
     pub fn new() -> Self {
         Self::default()
@@ -313,7 +306,6 @@ impl Graph {
     /// an output graph from this one starts from.
     pub fn like(&self) -> Self {
         Graph {
-            fork_bits: self.fork_bits,
             fork_ways: self.fork_ways.clone(),
             cell_kinds: self.cell_kinds.clone(),
             ..Default::default()
@@ -357,19 +349,11 @@ impl Graph {
         self.fork_ways[d as usize] = self.fork_ways[d as usize].max(ways);
     }
 
-    pub fn fork_bits(&self) -> u8 {
-        self.fork_bits
-    }
-
-    pub fn set_fork_bits(&mut self, bits: u8) {
-        debug_assert!(bits <= 16, "fork grid 2^-{bits}");
-        self.fork_bits = bits;
-    }
-
-    /// One grid step in raw 16.16 units, and the mask that floors to it.
+    /// The fork grid - `Split`/`Frag`/`FragOk`/`SplitOk` cut an interval
+    /// at the integers - as one step in raw 16.16 units and the mask that
+    /// floors to it.
     fn grid(&self) -> (i32, i32) {
-        let step = 1i32 << (16 - self.fork_bits as i32);
-        (step, !(step - 1))
+        (GRID_STEP, !(GRID_STEP - 1))
     }
 
     pub fn add(&mut self, op: Op, args: Vec<NodeId>) -> NodeId {
@@ -437,7 +421,6 @@ impl Graph {
     /// Entries for unbuilt nodes are `UNBUILT`, which is not a valid id -
     /// reading one is a bug, and it should look like one.
     pub fn specialize_subset_into(&self, splits: &[u8], need: Option<&[bool]>, out: &mut Graph) -> Vec<NodeId> {
-        out.fork_bits = self.fork_bits;
         out.fork_ways = self.fork_ways.clone();
         const UNBUILT: NodeId = NodeId::MAX;
         let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
@@ -526,7 +509,7 @@ impl Graph {
             Op::SplitOk(n) => {
                 if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
                     // In the kernel's own i32 arithmetic, wrap included.
-                    let step = 1i32 << (16 - self.fork_bits as i32);
+                    let step = GRID_STEP;
                     let (fl, fh) = (lo & !(step - 1), hi & !(step - 1));
                     let top = fl.wrapping_add(step.wrapping_mul(n as i32 - 1));
                     return self.leaf(Op::ConstBool(fh <= top));
@@ -921,7 +904,7 @@ impl Graph {
                 // rather than top (room (6,0), 2026-09-28).
                 Op::SplitOk(ways) => {
                     let iv = a(0).as_num("SplitOk")?;
-                    let step = 1i64 << (16 - self.fork_bits as i64);
+                    let step = GRID_STEP as i64;
                     let floor = |v: Pico8Num| (v.as_raw_u32() as i32 as i64).div_euclid(step) * step;
                     if floor(iv.high) <= floor(iv.low) + (*ways as i64 - 1) * step {
                         Val::Bool(Some(true))
@@ -1450,24 +1433,21 @@ mod tests {
     }
 
     /// `SplitOk(n)` over a literal folds to what the kernel computes for it
-    /// (`zi_span_ok`, the definition), at every grid and arity - `eval`
+    /// (`zi_span_ok`, the definition), at every arity - `eval`
     /// cannot model it, so `folding_is_exact_not_merely_sound` cannot.
     #[test]
     fn split_ok_of_a_literal_is_what_zi_span_ok_says() {
         use celeste_engine::kernel::{zi_span_ok, zn_splat, ALL, ZI};
         let raws = [i32::MIN, -0x2_8000, -0x1_0000, -1, 0, 1, 0x8000, 0xffff, 0x1_0000, 0x1_0001, 0x2_0000, 0x3_7fff, i32::MAX - 0x1_0000, i32::MAX];
-        for bits in [0u8, 1, 4, 16] {
-            let mut g = Graph::new();
-            g.set_fork_bits(bits);
-            for &lo in &raws {
-                for &hi in raws.iter().filter(|h| **h >= lo) {
-                    let c = g.leaf(Op::Const(lo, hi));
-                    for ways in 1..=4u8 {
-                        let got = g.fold(Op::SplitOk(ways), vec![c]);
-                        let iv = ZI { lo: zn_splat(Pico8Num::from_raw(lo)), hi: zn_splat(Pico8Num::from_raw(hi)) };
-                        let want = zi_span_ok(iv, bits, ways).val == ALL;
-                        assert_eq!(g.get(got).op, Op::ConstBool(want), "bits {bits} ways {ways} [{lo:#x}, {hi:#x}]");
-                    }
+        let mut g = Graph::new();
+        for &lo in &raws {
+            for &hi in raws.iter().filter(|h| **h >= lo) {
+                let c = g.leaf(Op::Const(lo, hi));
+                for ways in 1..=4u8 {
+                    let got = g.fold(Op::SplitOk(ways), vec![c]);
+                    let iv = ZI { lo: zn_splat(Pico8Num::from_raw(lo)), hi: zn_splat(Pico8Num::from_raw(hi)) };
+                    let want = zi_span_ok(iv, ways).val == ALL;
+                    assert_eq!(g.get(got).op, Op::ConstBool(want), "ways {ways} [{lo:#x}, {hi:#x}]");
                 }
             }
         }
@@ -1715,43 +1695,39 @@ mod tests {
         // fork every lane takes both ways (`Symbolic::both_values`): with
         // right = true the whole thing is 1 whatever left is, so {left,right}
         // and {right} land on the same node and their successor states are
-        // the same. At every fork grid: the buttons are the same forks at
-        // every rung.
-        for bits in [0u8, 1, 15] {
-            let mut d = crate::trace::domain::Symbolic::default();
-            d.graph.set_fork_bits(bits);
-            let left = d.both_values("left");
-            let right = d.both_values("right");
-            // Its coverage premise (`trace::error`) holds on every lane.
-            let fork = d.graph.get(left).args[0];
-            assert!(d.graph.is_literal_fork(fork), "a button is a fork over a literal");
-            let literal = d.graph.get(fork).args[0];
-            let covered = d.graph.fold(Op::SplitOk(2), vec![literal]);
-            assert_eq!(d.graph.get(covered).op, Op::ConstBool(true), "fork bits {bits}: the literal fits two ways");
-            let g = &mut d.graph;
-            let one = g.leaf(Op::Const(n(1).as_raw_u32() as i32, n(1).as_raw_u32() as i32));
-            let neg = g.leaf(Op::Const(n(-1).as_raw_u32() as i32, n(-1).as_raw_u32() as i32));
-            let zero = g.leaf(Op::Const(0, 0));
-            let inner = g.add(Op::Sel, vec![left, neg, zero]);
-            let input = g.add(Op::Sel, vec![right, one, inner]);
+        // the same.
+        let mut d = crate::trace::domain::Symbolic::default();
+        let left = d.both_values("left");
+        let right = d.both_values("right");
+        // Its coverage premise (`trace::error`) holds on every lane.
+        let fork = d.graph.get(left).args[0];
+        assert!(d.graph.is_literal_fork(fork), "a button is a fork over a literal");
+        let literal = d.graph.get(fork).args[0];
+        let covered = d.graph.fold(Op::SplitOk(2), vec![literal]);
+        assert_eq!(d.graph.get(covered).op, Op::ConstBool(true), "the literal fits two ways");
+        let g = &mut d.graph;
+        let one = g.leaf(Op::Const(n(1).as_raw_u32() as i32, n(1).as_raw_u32() as i32));
+        let neg = g.leaf(Op::Const(n(-1).as_raw_u32() as i32, n(-1).as_raw_u32() as i32));
+        let zero = g.leaf(Op::Const(0, 0));
+        let inner = g.add(Op::Sel, vec![left, neg, zero]);
+        let input = g.add(Op::Sel, vec![right, one, inner]);
 
-            let mut shared = Graph::new();
-            let sig = |l: u8, r: u8, shared: &mut Graph| {
-                let map = d.graph.specialize_subset_into(&[l, r], None, shared);
-                (map[input as usize], map[left as usize], map[right as usize])
-            };
-            let r_only = sig(0, 1, &mut shared);
-            let both = sig(1, 1, &mut shared);
-            assert_eq!(r_only.0, both.0, "right dominates left; these are one configuration");
-            let l_only = sig(1, 0, &mut shared);
-            let none = sig(0, 0, &mut shared);
-            assert_ne!(l_only.0, none.0);
-            assert_ne!(l_only.0, both.0);
-            // Each configuration resolves a button to a constant.
-            for (cfg, want) in [(none, (false, false)), (l_only, (true, false)), (both, (true, true))] {
-                assert_eq!(shared.get(cfg.1).op, Op::ConstBool(want.0), "fork bits {bits}: left");
-                assert_eq!(shared.get(cfg.2).op, Op::ConstBool(want.1), "fork bits {bits}: right");
-            }
+        let mut shared = Graph::new();
+        let sig = |l: u8, r: u8, shared: &mut Graph| {
+            let map = d.graph.specialize_subset_into(&[l, r], None, shared);
+            (map[input as usize], map[left as usize], map[right as usize])
+        };
+        let r_only = sig(0, 1, &mut shared);
+        let both = sig(1, 1, &mut shared);
+        assert_eq!(r_only.0, both.0, "right dominates left; these are one configuration");
+        let l_only = sig(1, 0, &mut shared);
+        let none = sig(0, 0, &mut shared);
+        assert_ne!(l_only.0, none.0);
+        assert_ne!(l_only.0, both.0);
+        // Each configuration resolves a button to a constant.
+        for (cfg, want) in [(none, (false, false)), (l_only, (true, false)), (both, (true, true))] {
+            assert_eq!(shared.get(cfg.1).op, Op::ConstBool(want.0), "left");
+            assert_eq!(shared.get(cfg.2).op, Op::ConstBool(want.1), "right");
         }
     }
 

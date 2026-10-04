@@ -139,30 +139,6 @@ pub fn player_summary(rt2: &Rt2, l: usize) -> String {
     brief(&project_row(rt2, &names, l as u32, &[]))
 }
 
-/// The named fields where lane `la` of `a` and lane `lb` of `b` differ
-/// (`project_row` of each, by name, so two structures compare): "name: X vs
-/// Y", at most `cap` of them. A name only one side has is listed as missing.
-pub fn field_diff(a: &Rt2, la: usize, b: &Rt2, lb: usize, cap: usize) -> Vec<String> {
-    let ids = crate::compiled::ids();
-    let pa = project_row(a, &cell_names(a, ids), la as u32, &[]);
-    let pb = project_row(b, &cell_names(b, ids), lb as u32, &[]);
-    let mut out = Vec::new();
-    for (n, va) in &pa {
-        match pb.get(n) {
-            Some(vb) if vb == va => {}
-            Some(vb) => out.push(format!("{n}: {va} vs {vb}")),
-            None => out.push(format!("{n}: {va} vs (missing)")),
-        }
-    }
-    for (n, vb) in &pb {
-        if !pa.contains_key(n) {
-            out.push(format!("{n}: (missing) vs {vb}"));
-        }
-    }
-    out.truncate(cap);
-    out
-}
-
 /// `"x,y"` as a pair (a clap `value_parser`).
 pub fn parse_xy(s: &str) -> Result<(i32, i32), String> {
     let (a, b) = s.split_once(',').ok_or_else(|| format!("{s:?}: expected x,y"))?;

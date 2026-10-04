@@ -251,11 +251,9 @@ pub fn trace_frame<'a>(
     // abstraction is checked by the end-to-end room run instead, against
     // the interpreter, which widens too.
     //
-    // `Some(Level0)` bakes the full Bits(0) widenings in; `Some(RemRung)`
-    // bakes only the rem widening at the configured rung (Phase 1 of
-    // moving the ladder widening into the graph); `None` leaves every
-    // widening to the campaign boundary.
-    widen: Option<super::widen::WidenMode>,
+    // On, the trace also captures the remainder transfers
+    // (`search::arc_edges`).
+    widen: bool,
     // Input slots known to lie in a RANGE (raw 16.16, inclusive): the
     // body is specialized on them (`Symbolic::ranges`, the bucket
     // dispatch), and outside them the frame is in error, like a pin.
@@ -272,17 +270,9 @@ pub fn trace_frame<'a>(
     it.d.graph.reset_forks();
     it.d.clear_ranges();
     it.d.clear_fork_memo();
-    // The fork grid is the rung's rem bucket width: `move` forks at the
-    // bucket edges (which include the integers), so one fork per axis
-    // settles the integer move AND the output bucket, and the boundary
-    // snap below never has to fork again.
-    it.d.graph.set_fork_bits(match widen {
-        Some(super::widen::WidenMode::RemRung(crate::interpreter::abstraction::RemPrecision::Bits(k))) => k,
-        _ => 0,
-    });
     it.d.unknown_atoms = 0;
-    // The arc capture (`search::arc_edges`): every level-0 trace.
-    it.arc_capture = matches!(widen, Some(super::widen::WidenMode::Level0));
+    // The arc capture (`search::arc_edges`): every widening trace.
+    it.arc_capture = widen;
     // What the previous trace left if it failed part-way (a success takes
     // both below).
     it.raised.clear();
@@ -420,10 +410,7 @@ pub fn trace_frame<'a>(
         //
         // After `gc`, because it walks the object list to find the
         // player and the fruit, and a dead object is not one.
-        let owed = match widen {
-            Some(mode) => super::widen::widen(&mut s, &mut it.d, mode)?,
-            None => Vec::new(),
-        };
+        let owed = if widen { super::widen::widen(&mut s, &mut it.d)? } else { Vec::new() };
         let (fields, ubool) = out_fields(&s, &it.d)?;
         // What this outcome owes beyond its operators: the frame's, where its
         // path's model ended (`State::ended`), and the widenings' of the
@@ -485,7 +472,7 @@ pub fn trace_frame<'a>(
         o.error = it.d.graph.fold(crate::transpile::graph::Op::Or, vec![o.error, e]);
     }
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
-        eprintln!("[build] trace_frame {widen:?}: {} forks at the end, {} outcomes, {} pins", it.d.forks, outs.len(), pin.len());
+        eprintln!("[build] trace_frame (widen {widen}): {} forks at the end, {} outcomes, {} pins", it.d.forks, outs.len(), pin.len());
     }
     // DIAGNOSTIC (CELESTE_BUILD_TRACE): how many forks this frame minted, by
     // origin, and how many an outcome can still see.
@@ -2062,7 +2049,7 @@ mod tests {
                 .filter(|p| !under_frozen(&st, p, &frozen))
                 .collect();
             frames += 1;
-            let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &[], &[], None, &[]) {
+            let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &[], &[], false, &[]) {
                 Ok(f) => f,
                 Err(e) => {
                     refused += 1;
@@ -2406,7 +2393,7 @@ mod tests {
         }
         let key = pm1_key(&player, &st, &it.d).expect("pm1 key");
         assert_eq!(key.len(), 6, "the pm1 key is six cells");
-        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[], None, &[]).expect("trace");
+        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[], false, &[]).expect("trace");
         assert_eq!(f.iface.pins.len(), 6, "all six pinned");
 
         // No error in whichever outcome claims this assignment.
@@ -2524,7 +2511,7 @@ mod tests {
         while let Some(key) = queue.pop() {
             let pin: Vec<(Path, Conc)> =
                 paths.iter().cloned().zip(key.iter().copied()).collect();
-            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin, &[], None, &[]) {
+            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin, &[], false, &[]) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("[keys] {} REFUSED: {:#}", show_key(&key), e);
@@ -2618,7 +2605,7 @@ mod tests {
                 "{}: a different input numbering than the first key",
                 show_key(key)
             );
-            match super::super::emit::bind(f, &g, true)
+            match super::super::emit::bind(f, &g)
                 .and_then(|b| super::super::emit::lower_frame(&b, room.clone(), Default::default()))
             {
                 Ok(l) => {
@@ -2849,7 +2836,7 @@ end
         }
 
         let before = it.d.graph.len();
-        let f = trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], None, &[])
+        let f = trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], false, &[])
             .unwrap_or_else(|e| panic!("[verify] symbolic frame stopped at: {e:#}"));
         eprintln!(
             "[verify] {} input cells, {} outcome(s), {} nodes ({} new)",

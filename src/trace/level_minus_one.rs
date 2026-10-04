@@ -465,7 +465,7 @@ impl<'a> Table<'a> {
             &roots,
             &pin_list,
             &ival,
-            Some(super::widen::WidenMode::Level0),
+            true,
             &bound_list,
         )
         .map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"));

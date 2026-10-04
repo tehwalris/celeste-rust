@@ -797,35 +797,17 @@ impl Rt2 {
         self.boundary_finish();
     }
 
-    /// The boundary WITHOUT the widenings: materialize, canonicalize,
-    /// hash, dedup - and nothing else. For the rung-agnostic kernel path
-    /// (plans/kernel-ladder.md): kernels generated with `widen = false`
-    /// hand the campaign EXACT rows, and the campaign applies the
-    /// precision rung's own abstraction downstream. Widening here would
-    /// pre-empt it with Bits(0)'s, which is exactly the refusal
-    /// `compiled_forward` used to make.
-    ///
-    /// Dedup on exact rows is sound at every rung: two byte-identical
-    /// rows are the same state under any widening.
-    pub fn boundary_exact(&mut self) -> usize {
-        self.boundary_prepare();
-        self.boundary_finish();
-        self.boundary_dedup()
-    }
+
 
     /// Per-lane canonical row keys, NO widening and NO dedup: materialize,
     /// canonicalize, hash - then hand back `row_keys` verbatim, lane i of the
     /// input as key i of the output.
     ///
     /// This is the ONE row key of the search (the kernel/engine key), used to
-    /// RECOMPUTE the keys of an already-abstracted state - the backward
-    /// sweep's index build and the band filter. The state handed in is
-    /// already at its final rung abstraction (the campaign widened it before
-    /// the forward's boundary hashed it), so the widening is baked into the
-    /// content and re-applying `boundary_widen` here would be idempotent at
-    /// Bits(0) and WRONG at any finer rung. Skipping it makes this key a pure
-    /// function of the state's content, so it reproduces whatever the
-    /// forward's `boundary` / `boundary_exact` stored, at every level.
+    /// RECOMPUTE the keys of a state as it is: a stored row (already
+    /// widened, so the key is the one the forward's `boundary` stored), or
+    /// a concrete one (its EXACT key: the concrete count-up's memo). A pure
+    /// function of the state's content.
     pub fn row_keys_canonical(&mut self) -> Vec<(u64, u64)> {
         self.boundary_prepare();
         self.boundary_finish();
@@ -859,22 +841,18 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, 0, false, false, FloorsWidening::Exact, false);
+        self.widen_to(ids, false, false, FloorsWidening::Exact, false);
     }
 
-    /// The boundary widenings of the `Bits(rem_bits)` level on this block's
-    /// columns, per lane - what the level's kernels bake into their rows
-    /// (`trace::widen`, `WidenMode::RemRung`), so the ladder's filter can
-    /// look a finer level's rows up in that level's marks. (The Exact level
-    /// widens nothing; its rows are the concrete state.)
+    /// The boundary widenings of a level on this block's columns, per lane -
+    /// what the level's kernels bake into their rows (`trace::widen`), so a
+    /// concrete or finer row can be looked up as the level's node.
     ///
-    ///   1. rem: Bits(0) -> the full [-0.5, 0.5) interval; Bits(k) -> the
-    ///      floor-aligned bucket of width 2^-k containing the value (an
-    ///      interval spans its endpoints' buckets).
+    ///   1. rem -> the full [-0.5, 0.5) interval.
     ///   3. dash_effect_time clamped at 0 from below.
     ///   3b. fruit: off := [0, 39] and y := its bob band, together.
     ///   4. timer globals pinned to 0.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, rem_bits: u8, held: bool, fruit: bool, floors: FloorsWidening, platforms: bool) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, held: bool, fruit: bool, floors: FloorsWidening, platforms: bool) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 1. rem widening.
@@ -882,63 +860,26 @@ impl Rt2 {
         let neg_half = -half;
         let half_below = half.next_smallest();
         let wide = AV::Ival(neg_half, half_below);
-        // The floor-aligned bucket of width 2^-bits containing `n`
-        // (abstraction.rs `rem_bucket`).
-        let bucket = |n: P8, bits: u8| -> (P8, P8) {
-            let width: i32 = 0x1_0000 >> bits;
-            let low = n.to_bits().cast_signed().div_euclid(width) * width;
-            (P8::from_raw(low), P8::from_raw(low + width - 1))
-        };
-        {
-            let bits = rem_bits;
-            for c in rem_cells {
-                let widen = |v: AV| -> AV {
-                    match v {
-                        AV::Num(n) => {
-                            assert!(
-                                n >= neg_half && n <= half_below,
-                                "player_rem value {:?} not in expected interval",
-                                n
-                            );
-                            if bits == 0 {
-                                wide
-                            } else {
-                                let (lo, hi) = bucket(n, bits);
-                                AV::Ival(lo, hi)
-                            }
-                        }
-                        AV::Ival(a, b) => {
-                            assert!(
-                                a >= neg_half && b <= half_below,
-                                "player_rem interval [{:?}, {:?}] not in expected interval",
-                                a,
-                                b
-                            );
-                            if bits == 0 {
-                                wide
-                            } else {
-                                AV::Ival(bucket(a, bits).0, bucket(b, bits).1)
-                            }
-                        }
-                        other => panic!("Unexpected value type for player_rem: {:?}", other),
+        for c in rem_cells {
+            let widen = |v: AV| -> AV {
+                match v {
+                    AV::Num(n) => {
+                        assert!(n >= neg_half && n <= half_below, "player_rem value {:?} not in expected interval", n);
+                        wide
                     }
-                };
-                self.cols[c as usize] = match &self.cols[c as usize] {
-                    Col::U(v) => Col::U(widen(*v)),
-                    Col::V(vs) => Col::V(vs.iter().map(|v| widen(*v)).collect()),
-                    Col::N(vs) => Col::V(vs.iter().map(|n| widen(AV::Num(*n))).collect()),
-                    Col::I(vs) => Col::V(vs.iter().map(|(a, b)| widen(AV::Ival(*a, *b))).collect()),
-                };
-                if bits > 0 {
-                    // A per-lane bucket column: raw intervals where every
-                    // lane is one, uniform where all agree.
-                    let col = std::mem::replace(&mut self.cols[c as usize], Col::U(AV::Nil));
-                    self.cols[c as usize] = collapse_uniform(match col {
-                        Col::V(vs) => compress_num_v(vs),
-                        other => other,
-                    });
+                    AV::Ival(a, b) => {
+                        assert!(a >= neg_half && b <= half_below, "player_rem interval [{:?}, {:?}] not in expected interval", a, b);
+                        wide
+                    }
+                    other => panic!("Unexpected value type for player_rem: {:?}", other),
                 }
-            }
+            };
+            self.cols[c as usize] = match &self.cols[c as usize] {
+                Col::U(v) => Col::U(widen(*v)),
+                Col::V(vs) => Col::V(vs.iter().map(|v| widen(*v)).collect()),
+                Col::N(vs) => Col::V(vs.iter().map(|n| widen(AV::Num(*n))).collect()),
+                Col::I(vs) => Col::V(vs.iter().map(|(a, b)| widen(AV::Ival(*a, *b))).collect()),
+            };
         }
 
         // 3. dash_effect_time clamp.

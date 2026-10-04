@@ -56,14 +56,11 @@
 //! successor; it just belongs to another room's kernel set.
 
 use anyhow::Result;
-use full_moon::ast;
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
 use super::iface::{self, Path, Step};
-use super::interp::Interp;
 use super::state::State;
-use super::verify::{trace_frame, Frame};
 
 /// Tables holding PROGRAM CONSTANTS rather than state: the object
 /// prototypes in `types`, everything reachable from them, and `room`.
@@ -274,31 +271,6 @@ pub fn room_of(st: &State<Symbolic>, d: &Symbolic) -> (i16, i16) {
     (at("x"), at("y"))
 }
 
-/// One shape, and the frame traced from it.
-pub struct Shape {
-    pub state: State<Symbolic>,
-    pub frame: Frame,
-}
-
-/// The walk's result, with everything it declined to follow. Nothing is
-/// dropped silently: a bounded analysis that does not report what it
-/// bounded reads as complete when it is not.
-pub struct Walk {
-    pub shapes: Vec<Shape>,
-    /// Outcomes that left the room - real successors, belonging to
-    /// another room's kernel set.
-    pub left_room: usize,
-    /// Outcomes discarded because the walk hit `cap`. NOT zero means the
-    /// shape set is incomplete and a kernel is missing.
-    pub dropped: usize,
-    /// Traces that stopped, by reason.
-    pub refused: std::collections::BTreeMap<String, usize>,
-}
-
-/// Walk the room's shapes to a fixpoint, tracing one frame per shape.
-///
-/// `start` must be a state in the room the kernels are for; the walk
-/// stays in it.
 /// The scalar fields of `st` that are compile-time constants: their value
 /// node is an exact `Const(v,v)` (numbers) or `ConstBool` (booleans).
 /// These are the fields the per-shape constant lattice can bake in.
@@ -393,26 +365,6 @@ pub fn field_constants(st: &State<Symbolic>, d: &Symbolic, opts: &WalkOpts) -> R
 /// assumes and emits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WalkOpts {
-    /// Apply the Bits(0) boundary widenings inside each traced frame
-    /// (`trace::widen`). `true` is the production level-0 set; `false`
-    /// hands back exact rows and leaves every widening to the campaign
-    /// boundary.
-    pub widen: bool,
-    /// Declare the boundary's interval slots (the player's `rem`, a
-    /// live fruit's `off`/`y`) as interval INPUTS (`ival_paths`).
-    /// `true` matches every rung whose blocks carry them as intervals
-    /// (rem Bits(0..=15)); `false` is the EXACT-rem set, whose blocks
-    /// carry them as plain per-lane numbers, so `__split_by_flr` is the
-    /// identity and the set has no rem forks at all.
-    pub ival: bool,
-    /// Bake ONLY the rem widening, at this Bits(k) rung, into each traced
-    /// frame (`trace::widen`, `WidenMode::RemRung`) - Phase 1 of moving
-    /// the ladder widening into the graph (plans/keying-widening-flow.md).
-    /// Rung-SPECIFIC, which is why the rung is carried here and not read
-    /// from the process-global precision: every rung's set can be built at
-    /// once. Mutually exclusive with `widen` (the
-    /// Bits(0) full widening); `widen_mode` asserts that.
-    pub rem_rung: Option<u8>,
     /// Held buttons unknown (`abstraction::HeldPrecision`, plans/held-buttons.md):
     /// each traced frame forks `p_jump` / `p_dash` into both values and every
     /// outcome writes them unknown.
@@ -429,15 +381,8 @@ pub struct WalkOpts {
 }
 
 impl WalkOpts {
-    /// The level-0 set.
-    pub const LEVEL0: WalkOpts = WalkOpts { widen: true, ival: true, rem_rung: None, held: false, fruit: false, floors_near: false, platforms: false };
-    /// The exact-rem set for the top rung (k = 16).
-    pub const EXACT: WalkOpts = WalkOpts { widen: false, ival: false, rem_rung: None, held: false, fruit: false, floors_near: false, platforms: false };
-    /// The ladder set for rem Bits(bits), the rem widening baked into the
-    /// graph at that rung (plans/keying-widening-flow.md).
-    pub const fn ladder_widen(bits: u8) -> WalkOpts {
-        WalkOpts { widen: false, ival: true, rem_rung: Some(bits), held: false, fruit: false, floors_near: false, platforms: false }
-    }
+    /// Every object exact.
+    pub const LEVEL0: WalkOpts = WalkOpts { held: false, fruit: false, floors_near: false, platforms: false };
     /// These opts with held buttons unknown or exact.
     pub const fn with_held(self, held: bool) -> WalkOpts {
         WalkOpts { held, ..self }
@@ -454,77 +399,6 @@ impl WalkOpts {
     pub const fn with_platforms(self, platforms: bool) -> WalkOpts {
         WalkOpts { platforms, ..self }
     }
-
-    /// The `WidenMode` a traced frame under these opts applies, or `None`
-    /// if it leaves every widening to the boundary.
-    pub fn widen_mode(&self) -> Option<super::widen::WidenMode> {
-        assert!(
-            !(self.widen && self.rem_rung.is_some()),
-            "WalkOpts: widen (Bits(0) full) and rem_rung (Bits(k) rem) are mutually exclusive"
-        );
-        if let Some(bits) = self.rem_rung {
-            Some(super::widen::WidenMode::RemRung(crate::interpreter::abstraction::RemPrecision::Bits(bits)))
-        } else if self.widen {
-            Some(super::widen::WidenMode::Level0)
-        } else {
-            None
-        }
-    }
-}
-
-pub fn walk<'a>(
-    it: &mut Interp<'a, Symbolic>,
-    reset: &'a ast::Ast,
-    frame: &'a ast::Ast,
-    start: State<Symbolic>,
-    cap: usize,
-    opts: WalkOpts,
-) -> Result<Walk> {
-    let room0 = room_of(&start, &it.d);
-    let key = |st: &State<Symbolic>| -> Result<String> { Ok(format!("{:?}", st.shape()?)) };
-
-    let mut seen: std::collections::BTreeMap<String, State<Symbolic>> = Default::default();
-    let mut queue: Vec<String> = vec![key(&start)?];
-    seen.insert(queue[0].clone(), start);
-
-    let mut out = Walk {
-        shapes: Vec::new(),
-        left_room: 0,
-        dropped: 0,
-        refused: Default::default(),
-    };
-    while let Some(k) = queue.pop() {
-        let st = seen[&k].clone();
-        let roots = state_paths(&st)?;
-        let ival = if opts.ival { ival_paths(&st) } else { Vec::new() };
-        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival, opts.widen_mode(), &[]) {
-            Ok(f) => f,
-            Err(e) => {
-                *out.refused.entry(format!("{:#}", e)).or_default() += 1;
-                continue;
-            }
-        };
-        for o in &f.outs {
-            if room_of(&o.st, &it.d) != room0 {
-                out.left_room += 1;
-                continue;
-            }
-            let k = key(&o.st)?;
-            if seen.contains_key(&k) {
-                continue;
-            }
-            if seen.len() >= cap {
-                out.dropped += 1;
-                continue;
-            }
-            let mut next = o.st.clone();
-            blank(&mut next, &mut it.d)?;
-            seen.insert(k.clone(), next);
-            queue.push(k);
-        }
-        out.shapes.push(Shape { state: st, frame: f });
-    }
-    Ok(out)
 }
 
 /// The path of the player INSTANCE in `objects` (the entry whose `type`

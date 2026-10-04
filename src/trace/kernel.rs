@@ -344,7 +344,7 @@ fn no_player_ranges(
         }
         let roots = shapes::state_paths(&st)?;
         let pin: Vec<(super::iface::Path, Conc)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
-        let Ok(f) = super::verify::trace_frame(it, reset, fr, st.clone(), &roots, &pin, &[], opts.widen_mode(), &[]) else { break };
+        let Ok(f) = super::verify::trace_frame(it, reset, fr, st.clone(), &roots, &pin, &[], true, &[]) else { break };
         let [o] = f.outs.as_slice() else { break };
         if o.shape != shape || shapes::player_path(&o.st).is_some() {
             ended = true;
@@ -908,33 +908,29 @@ pub fn room_constant_lattice(
 
 /// `ival_paths` plus a shape's discovered interval slots (`LatticeWalk::
 /// ival_extra`), each once.
-/// The interval inputs the BOUNDARY widens (the player's `rem`): only where the set types intervals at all (`opts.ival`;
-/// not the exact set). The `rnd`-derived ones (`ival_extra`) come on top at
-/// EVERY level, the exact one included: `rnd` is an interval there too, and
-/// room (5,0)'s balloon phase is one from `_init` on (2026-09-21).
+/// The interval inputs the BOUNDARY widens (the player's `rem`, and the
+/// level's widened objects). The `rnd`-derived ones (`ival_extra`) come on
+/// top: `rnd` is an interval at every level, and room (5,0)'s balloon phase
+/// is one from `_init` on (2026-09-21).
 fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: super::shapes::WalkOpts) -> Vec<super::iface::Path> {
-    if opts.ival {
-        let mut ival = super::shapes::ival_paths(st);
-        // The moving platforms' `x` and `last` at a platforms-unknown level:
-        // interval inputs, their whole path (plans/platforms-unknown.md).
-        if opts.platforms {
-            let pp = super::widen::platform_paths(st);
-            ival.extend(pp.x.iter().chain(pp.last.iter()).cloned());
-        }
-        // (The floors' countdowns at a timers or near level are not interval
-        // inputs: they are the unknown number, `widen::forget_countdown_inputs`.)
-        // A near level's floors: `state` an interval input, `collideable` a
-        // boolean input a lane may hold unknown (`iface::symbolize` tells the
-        // two apart by the slot's value; `widen::widen_near_floors`), and the
-        // objects' phases but their countdowns.
-        if opts.floors_near {
-            ival.extend(super::widen::near_floor_paths(st).all().cloned());
-            ival.extend(super::widen::phase_paths(st).into_iter().filter(|(_, r)| !matches!(r, super::widen::PhaseRange::Countdown)).map(|(p, _)| p));
-        }
-        ival
-    } else {
-        Vec::new()
+    let mut ival = super::shapes::ival_paths(st);
+    // The moving platforms' `x` and `last` at a platforms-unknown level:
+    // interval inputs, their whole path (plans/platforms-unknown.md).
+    if opts.platforms {
+        let pp = super::widen::platform_paths(st);
+        ival.extend(pp.x.iter().chain(pp.last.iter()).cloned());
     }
+    // (The floors' countdowns at a near level are not interval inputs: they
+    // are the unknown number, `widen::forget_countdown_inputs`.) A near
+    // level's floors: `state` an interval input, `collideable` a boolean
+    // input a lane may hold unknown (`iface::symbolize` tells the two apart
+    // by the slot's value; `widen::widen_near_floors`), and the objects'
+    // phases but their countdowns.
+    if opts.floors_near {
+        ival.extend(super::widen::near_floor_paths(st).all().cloned());
+        ival.extend(super::widen::phase_paths(st).into_iter().filter(|(_, r)| !matches!(r, super::widen::PhaseRange::Countdown)).map(|(p, _)| p));
+    }
+    ival
 }
 
 fn with_extra(mut ival: Vec<super::iface::Path>, extra: Option<&std::collections::BTreeSet<super::iface::Path>>) -> Vec<super::iface::Path> {
@@ -1044,7 +1040,7 @@ fn walk_trace(
     if let Some(constants) = &job.rebase {
         shapes::rebase(&mut st, &mut tr.it.d, constants)?;
     }
-    let f = match verify::trace_frame(&mut tr.it, tr.reset, tr.fr, st, &job.roots, &job.pin, &job.ival, opts.widen_mode(), &job.bounds) {
+    let f = match verify::trace_frame(&mut tr.it, tr.reset, tr.fr, st, &job.roots, &job.pin, &job.ival, true, &job.bounds) {
         Ok(f) => f,
         // A REFUSED trace can have poisoned paths before it refused, and they
         // count: the refusal says this (shape, region) did not compile, the
@@ -1109,7 +1105,7 @@ fn walk_trace(
         let heap_constants = shapes::heap_constants(&o.st, &tr.it.d);
         outs.push(WalkOutcome { key, constants, ival, regions, st: o.st.clone(), heap_constants });
     }
-    let bound = super::emit::bind(&f, &tr.it.d.graph, opts.widen).map_err(|e| format!("{:#}", e));
+    let bound = super::emit::bind(&f, &tr.it.d.graph).map_err(|e| format!("{:#}", e));
     // DRAINED, not copied: `Interp::illegal` is never cleared, so a worker's
     // map would otherwise accumulate across every job it runs and the walk
     // would count the same poisoned path once per later trace.

@@ -985,14 +985,11 @@ impl Symbolic {
     /// is the same for both (see `Partition`). The validity is dropped rather
     /// than ignored: every configuration applies to every lane.
     ///
-    /// The constant is `[0, one grid step]`: exactly TWO points of the fork
-    /// grid at every rung (`Graph::fork_bits`), so the derived coverage
-    /// premise `SplitOk(2)` folds true and the fragments to `0` and the step.
-    /// Over `[0, 1]` that held at rem Bits(0) only: on a finer grid the
-    /// literal spans more cells than two ways cover, and every lane declined.
+    /// The constant is `[0, 1]`: exactly TWO integers, so the derived
+    /// coverage premise `SplitOk(2)` folds true and the fragments to `0` and
+    /// `1`.
     pub fn both_values(&mut self, origin: &str) -> NodeId {
-        let step = 1i32 << (16 - self.graph.fork_bits() as i32);
-        let choices = self.graph.leaf(Op::Const(0, step));
+        let choices = self.graph.leaf(Op::Const(0, 1 << 16));
         let f = self.fork(&choices, Partition::Ints { ways: 2, memo: false }, origin);
         let zero = self.graph.leaf(Op::Const(0, 0));
         self.graph.fold(Op::Gt, vec![f.value, zero])
@@ -1496,7 +1493,7 @@ impl Domain for Symbolic {
         // and every evaluation of it a violation).
         match self.range_of(*v) {
             Some(ps) => {
-                let sh = 16 - self.graph.fork_bits() as u32;
+                let sh = 16;
                 let w = if self.uncapped_ways {
                     let lo = ps.iter().map(|p| p.0 >> sh).min().unwrap_or(0);
                     let hi = ps.iter().map(|p| p.1 >> sh).max().unwrap_or(0);
@@ -1688,17 +1685,10 @@ impl Domain for Symbolic {
         if lo == hi {
             return Ok(None);
         }
-        // On the INTEGERS, not the fork grid (`Graph::fork_bits`, the rem
-        // bucket at rung k): a fragment only has to make `flr` exact, and the
-        // fragments rejoin into ONE literal hull (`rejoin_fragments`), so a
-        // finer cut buys no precision - within one integer `move` reads the
-        // fragment only through its exact floor and a linear `rem - 0.5 -
-        // amount`. On the bucket grid the fruit's `rem.y + spd.y + 0.5` in
-        // [-3.5, 1.5) was 5 * 2^k fragments: 160 trace states at rem Bits(5),
-        // and past `MAX_WAYS` at Bits(6), where this fell through to a 2-way
-        // per-lane fork of a literal that no lane is covered by - its error
-        // held wherever the fruit moved and the start state declined (room
-        // (3,1) `r6sxhf`, 2026-10-01).
+        // On the INTEGERS: a fragment only has to make `flr` exact, and the
+        // fragments rejoin into ONE literal hull (`rejoin_fragments`) - within
+        // one integer `move` reads the fragment only through its exact floor
+        // and a linear `rem - 0.5 - amount`.
         let step = 1i64 << 16;
         let (lo, hi) = (lo as i64, hi as i64);
         let (fl, fh) = (lo.div_euclid(step) * step, hi.div_euclid(step) * step);
