@@ -1160,6 +1160,10 @@ fn arc_concrete_witness(
     use celeste_rust::search::arcs::point;
     use rustc_hash::{FxHashMap, FxHashSet};
     let level = celeste_rust::interpreter::abstraction::Level::parse(level).map_err(|e| anyhow::anyhow!(e))?;
+    // The engine runs the cart's `_init` under the GLOBAL level: build it
+    // before the level is set (room (5,3) nodiag's level-0 `_init` ended
+    // in no state); its frames run at the exact level whatever is set.
+    let eng = celeste_rust::trace::refengine::RefEngine::new()?;
     celeste_rust::interpreter::abstraction::set_level(level);
     let t0 = std::time::Instant::now();
     // (shape, key, cell) -> the node's index, for the graph's nodes.
@@ -1223,10 +1227,10 @@ fn arc_concrete_witness(
         for byte in 0u8..64 {
             let mut s = st.clone();
             celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
-            for mut succ in cx.eng.run_frame_concrete_all(&s)? {
+            for mut succ in cx.eng.run_frame_concrete_all(&s).map_err(|e| e.context(format!("the frame after f{k} with input {byte}")))? {
                 celeste_rust::concrete::restore_buttons(&cx.initial, &mut succ)?;
                 cx.steps += 1;
-                let b = Block::from_state(&succ)?;
+                let b = Block::from_state(&succ).map_err(|e| e.context(format!("keying the successor of f{k} under input {byte}")))?;
                 let cell = b.positions()?[0];
                 if wins_of(b.rt2())?.iter().any(|&x| x) {
                     cx.path.push(byte);
@@ -1255,14 +1259,32 @@ fn arc_concrete_witness(
         }
         Ok(false)
     }
-    let eng = celeste_rust::trace::refengine::RefEngine::new()?;
     let initial = eng.initial_state()?;
     let start_cell = Block::from_state(&initial)?.positions()?[0];
     let mut cx = Ctx { eng, initial: initial.clone(), node: &node, dead: FxHashSet::default(), path: Vec::new(), cells: Vec::new(), steps: 0, deepest: (0, Vec::new()) };
-    let t1 = std::time::Instant::now();
-    let ok = dfs(&mut cx, &initial, 0, frames, from, level, w, &rem_of)?;
+    // The DFS is EXHAUSTIVE (every input, every `rnd` leaf, a fully explored
+    // concrete state remembered per frame) and prunes only by W, which holds
+    // every concrete winner: so "no win within f" is a proof about the real
+    // game. The graph's optimum is a lower bound (its objects are coarse);
+    // count UP from it to the horizon - the first f with a witness is the
+    // concrete optimum (over every `rnd` draw: a leaf is a possibility).
     let show = |v: &[u8]| v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
-    eprintln!("[witness] {} concrete steps, {} dead states, {:.1} s", cx.steps, cx.dead.len(), t1.elapsed().as_secs_f64());
+    let (mut frames, mut from) = (frames, from);
+    let ok = loop {
+        let t1 = std::time::Instant::now();
+        cx.dead.clear();
+        cx.path.clear();
+        cx.cells.clear();
+        cx.deepest = (0, Vec::new());
+        let ok = dfs(&mut cx, &initial, 0, frames, from, level, w, &rem_of)?;
+        eprintln!("[witness] within f{frames}: {} concrete steps so far, {} dead states, {:.1} s", cx.steps, cx.dead.len(), t1.elapsed().as_secs_f64());
+        if ok || frames == horizon {
+            break ok;
+        }
+        println!("no concrete win within f{frames} (exhaustive inside W, deepest f{})", cx.deepest.0);
+        frames += 1;
+        from -= 1;
+    };
     if ok {
         println!("CONCRETE WITNESS: a win at f{}: {}", cx.path.len(), show(&cx.path));
         if let Some(out) = save {
@@ -1279,6 +1301,35 @@ fn arc_concrete_witness(
         }
     } else {
         println!("NO CONCRETE WITNESS inside W: deepest f{}, inputs {}", cx.deepest.0, show(&cx.deepest.1));
+        // Why: from the deepest state, every input's successors - their
+        // node, exact remainder and that node's winning set.
+        let (d, prefix) = cx.deepest.clone();
+        let mut st = initial.clone();
+        for &b in &prefix {
+            celeste_rust::concrete::set_concrete_buttons(&mut st, b)?;
+            let mut next = cx.eng.run_frame_concrete_all(&st)?;
+            anyhow::ensure!(next.len() == 1, "the deepest prefix forks ({} leaves): not replayable here", next.len());
+            st = next.pop().expect("one leaf");
+            celeste_rust::concrete::restore_buttons(&initial, &mut st)?;
+        }
+        for byte in 0u8..64 {
+            let mut s = st.clone();
+            celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
+            for mut succ in cx.eng.run_frame_concrete_all(&s)? {
+                celeste_rust::concrete::restore_buttons(&initial, &mut succ)?;
+                let b = Block::from_state(&succ)?;
+                let (shape, keys, cells) = widened_keys(&b, level)?;
+                let q = rem_of(b.rt2())?;
+                match node.get(&(shape, keys[0], cells[0])) {
+                    None => println!("  input {byte:2}: cell {:?} - no node", celeste_rust::search::pos_graph::cell_xy(cells[0])),
+                    Some(&i) => {
+                        let set = w.at(from + d + 1, i);
+                        let slabs: Vec<String> = set.map(|r| r.slabs().map(|(y, xs)| format!("y[{},{}) x{:?}", y.lo, y.hi, xs.iter().map(|x| (x.lo, x.hi)).collect::<Vec<_>>())).collect()).unwrap_or_default();
+                        println!("  input {byte:2}: cell {:?} node {i} rem {q:?}: W_{} {}", celeste_rust::search::pos_graph::cell_xy(cells[0]), from + d + 1, if slabs.is_empty() { "empty".to_string() } else { slabs.join(" ") });
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

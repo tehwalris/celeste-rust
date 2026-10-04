@@ -1,6 +1,6 @@
 //! The frame driver for the reference interpreter (`refdomain::RefDomain`).
 //!
-//! `Interp<RefDomain>` runs ONE scalar path of a frame (`run_one`). This
+//! `Interp<RefDomain>` runs ONE scalar path of a frame (`run_frame_all`). This
 //! driver enumerates the whole fork tree by re-execution: run the frame to a
 //! leaf, record the output state, `cursor.advance()` to the next path, and
 //! re-run - a depth-first search (plans/kernel-boundary-and-deletion.md). The
@@ -20,7 +20,6 @@ use full_moon::ast;
 use crate::trace::interp::Interp;
 use crate::trace::refdomain::{Cursor, RefDomain};
 use crate::trace::state::State;
-use crate::trace::verify::run_one;
 
 /// Build an `Interp<RefDomain>` with the room's cart + collision cache and a
 /// fresh cursor. The caller runs the cart toplevel + `_init` on it once to
@@ -89,10 +88,21 @@ pub fn run_frame_all<'a>(
             concretize_near_floors(&mut st, &mut it.d)?;
         }
         crate::trace::widen::fork_pos_inputs(&mut st, &mut it.d, pos)?;
-        let mut out = run_one(it, body, st)?;
-        // The absent-as-zero fields, as the tracer's `trace_frame` writes them.
-        crate::trace::widen::materialize_absent_fields(&mut out, &mut it.d)?;
-        outputs.push(out);
+        // A path that RAISES has no successor (`Interp::poison`; the nodiag
+        // mode's diagonal dash is one): it ends in no state, and only then.
+        it.raised.clear();
+        let ended = it.exec_block(body.nodes(), st)?;
+        match ended.len() {
+            0 => anyhow::ensure!(!it.raised.is_empty(), "a frame path ended in no state without a raise"),
+            1 => {
+                let (mut out, flow) = ended.into_iter().next().expect("one state");
+                anyhow::ensure!(!matches!(flow, crate::trace::interp::Flow::Break), "break at chunk toplevel");
+                // The absent-as-zero fields, as the tracer's `trace_frame` writes them.
+                crate::trace::widen::materialize_absent_fields(&mut out, &mut it.d)?;
+                outputs.push(out);
+            }
+            n => bail!("a frame path ended in {n} states (expected one, or none after a raise)"),
+        }
         paths += 1;
         if paths > 1_000_000 {
             bail!("run_frame_all: >1M paths - fork tree did not terminate");
@@ -127,6 +137,7 @@ fn concretize_near_floors(st: &mut State<RefDomain>, d: &mut RefDomain) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use crate::trace::verify::run_one;
     use super::*;
     use crate::trace::{cart, verify::find_player};
 
