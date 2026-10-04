@@ -58,7 +58,7 @@ latter.
   best-case caveat.)
 - **Believe a result after a witness, not before.** `rewrite witness` (or
   `arc-search --witness`) + a real-PICO-8 replay. The project's own earlier
-  "proven" 94 (room (0,0)) and 100 (room (1,0)) were both a frame too long.
+  "proven" 94 for room (0,0) was a frame too long.
 - **Never deopt to the interpreter silently.** When the kernels cannot take a
   lane it is FATAL (`KERNEL COVERAGE GAP`, with a miss report); there is no
   fall-through. Fix the gap rather than absorbing it. Likewise a ceiling

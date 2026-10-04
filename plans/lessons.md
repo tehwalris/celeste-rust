@@ -25,10 +25,12 @@ regen step, no staleness gate, nothing to keep current.
 **The old forward/backward sweep search** (`src/search/run.rs`, `sweep.rs`,
 `sweep_time.rs`, the deopt-collection path, shape-variant dispatch, banding,
 the g/e/band numbering, and every `bin/rewrite` subcommand but `search`),
-torn out 2026-08-31 for `src/frame.rs`. Its "proven" results were each a
-frame too long: room (0,0) "94" (`51a4d99`) and the 2022 searcher's room
-(1,0) "100" - both 1 over. The lesson: a ladder result is believed after
-`rewrite witness` + a real-PICO-8 replay, not before.
+torn out 2026-08-31 for `src/frame.rs`. Its "proven" room (0,0) "94"
+(`51a4d99`) was a frame too long. The lesson: a ladder result is believed
+after `rewrite witness` + a real-PICO-8 replay, not before. (Room (1,0)'s
+"100" was NOT a frame too long: it is the 2022 searcher's 76-update route
+with its first input on frame 25 instead of 24, a prologue-count
+difference; our 99 is the same route, plans/results.md.)
 
 **Local rewrites of room (6,0)'s kernels** (2026-09-26, five failures in a
 day), which produced the graph model (plans/architecture.md, "The tracer and

@@ -8,14 +8,18 @@ ORIGINAL cart on a real PICO-8 with its input 0 on the first frame the player
 exists ("offset" = the prologue length), then fitted to celeste-minimal by
 `rewrite trajectory` (`tas/room_X_Y_reference_frame_N.txt`).
 
-**Every optimum TIES its community TAS.** Two of them corrected this project's
-own earlier claims, each by one frame: room (0,0)'s 94 "proven optimal" by the
-pre-rebuild ladder (`51a4d99`, 2026-08-07, `tas/room_0_0_exit_frame_94.txt`)
-and room (1,0)'s 100 "proven" by the 2022 searcher
-(`tas/room_1_0_exit_frame_100.txt`, whose model started inputs a frame late:
-`all()` visits the player appended during the walk, so its first update is
-frame 24, not 25). Room (6,0) was first reported as 2 frames under TAS7; that
-was an offset error in the replay (`d1ae910`): it ties.
+**Every optimum TIES its community TAS.** One corrected this project's own
+earlier claim by a frame: room (0,0)'s 94 "proven optimal" by the
+pre-rebuild ladder (`51a4d99`, 2026-08-07, `tas/room_0_0_exit_frame_94.txt`).
+Room (1,0)'s 99 is NOT an improvement on the 2022 searcher: its 0-based
+control frame 75 is 76 player updates, the same as TAS2's 76 inputs and as
+our 99 (prologue 23 + 76). `tas/room_1_0_exit_frame_100.txt` is that route
+with an idle player update on frame 24 (it assumed the player first updates
+on frame 25; under `all()` it updates on frame 24, the frame it is created).
+Replayed on PICO-8, its frames 25-100 are the 99's frames 24-99 shifted by
+one, the same integer position on every frame. A tie. Room (6,0) was first
+reported as 2 frames under TAS7; that was an offset error in the replay
+(`d1ae910`): it ties.
 
 "Proven how": with `--ceiling C` the ladder confirms C through the exact
 level and REFUTES C-1 at the named level (no win by C-1 at a level that
@@ -28,7 +32,7 @@ with the reference engine (`rewrite witness`), replayed on a real PICO-8
 | room | name | optimum | reference | proven how | witness (`tas/`) | date | commit | key insight |
 |---|---|---|---|---|---|---|---|---|
 | (0,0) | 100 m | 93 | TAS1, offset 27 -> 93 | default ladder, count-up from level 0's first win f79; h92 refuted at level 7 | `room_0_0_reference_frame_93.txt` (TAS1 fitted; no search witness extracted) | 09-13 | `43a9f1f` | the old "94 proven" was wrong; 2:32 h on the kernel walk, 23:50 on the explicit graph |
-| (1,0) | 200 m | 99 | TAS2, 23 + 76 = 99 | default ladder; h98 refuted at level 6 | `room_1_0_exit_frame_99.txt` | 09-13 | `d4eaca2` | beat the 2022 searcher's 100 (player's first update is frame 24) |
+| (1,0) | 200 m | 99 | TAS2, 23 + 76 = 99 | default ladder; h98 refuted at level 6 | `room_1_0_exit_frame_99.txt` | 09-13 | `d4eaca2` | ties TAS2 and the 2022 searcher (its control frame 75 = 76 updates = 23 + 76); its "100" counted the prologue as 24 |
 | (2,0) | 300 m | 95 | TAS3, 25 + 70 = 95 | `r0sxh..r15sxh,rxsx`, level -1 (95,5); h94 refuted at level 9 | `room_2_0_exit_frame_95.txt` (TAS3 with two jbuffer presses moved) | 09-17 | `e906986` | held buttons unknown (3.8x); level -1 replaced the unsound 8 px band |
 | (3,0) | 400 m | 89 | TAS4, 27 + 62 = 89 | `r0sxhfb, r1sxhb..r15sxhb, r15sxh, rxsx`; h88 refuted at level 6 | `room_3_0_exit_frame_89.txt` | 09-19 | `8533314` | the mark filter's deadline; the fly fruit is taken (looks necessary); TAS4's raw inputs do not transfer to the minimal cart, its route does |
 | (4,0) | 500 m | 76 | TAS5, 29 + 47 = 76 | default ladder; h75 refuted at level 9 | `room_4_0_optimal_frame_76.txt` | 09-16 | `e0d5852` | the key's `spr`/`flip` pinned with the timers; 3:54 end to end |
