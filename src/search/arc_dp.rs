@@ -188,6 +188,13 @@ impl Winning {
     }
 }
 
+/// A candidate's set at `t`, against its set at `t + 1`.
+enum Recomputed {
+    Empty,
+    Same,
+    New(Arc<Region>),
+}
+
 /// `W_t(i)` from scratch: the union of `i`'s out-edges' preimages of the
 /// next frame's sets (`next(dst)`).
 fn pull<'a>(g: &Graph, i: u32, next: impl Fn(u32) -> Option<&'a Region>, pieces: &mut Vec<super::arcs::Piece>, scratch: &mut Vec<super::arcs::Seg>) -> Region {
@@ -230,25 +237,43 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
         pos[i as usize] = k as u32;
     }
     frames.push(top);
+    // `stamp[i] == t`: i is already a candidate at t.
+    let mut stamp = vec![u32::MAX; n];
     let (mut n_cand, mut n_same, mut n_scan) = (0u64, 0u64, 0u64);
+    let (mut d_cand, mut d_pull, mut d_merge) = (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
     for t in (0..horizon).rev() {
+        let t0 = std::time::Instant::now();
         let next = frames.last().expect("the frame after");
-        let mut cand: Vec<u32> = changed.iter().flat_map(|&c| g.preds_of(c).iter().copied()).filter(|&p| !g.win[p as usize] && g.live(p, t)).collect();
+        let mut cand: Vec<u32> = Vec::new();
+        let mut take = |p: u32, cand: &mut Vec<u32>| {
+            if stamp[p as usize] != t && !g.win[p as usize] && g.live(p, t) {
+                stamp[p as usize] = t;
+                cand.push(p);
+            }
+        };
+        for &c in &changed {
+            for &p in g.preds_of(c) {
+                take(p, &mut cand);
+            }
+        }
         if let Some(fresh) = g.by_deadline.get(t as usize) {
-            cand.extend(fresh.iter().copied().filter(|&i| g.live(i, t)));
+            for &i in fresh {
+                take(i, &mut cand);
+            }
         }
         cand.sort_unstable();
-        cand.dedup();
         n_cand += cand.len() as u64;
-        n_scan += cand.iter().map(|&i| g.out_of(i).len() as u64).sum::<u64>();
-        // Recompute the candidates.
+        d_cand += t0.elapsed();
+        let t0 = std::time::Instant::now();
+        // Recompute the candidates, each against its set at t + 1.
         const CHUNK: usize = 256;
         let at = std::sync::atomic::AtomicUsize::new(0);
+        let pos_ref = &pos;
         let lookup = |d: u32| {
-            let k = pos[d as usize];
+            let k = pos_ref[d as usize];
             (k != u32::MAX).then(|| &*next.sets[k as usize])
         };
-        let mut parts: Vec<(usize, Vec<Region>)> = std::thread::scope(|sc| {
+        let mut parts: Vec<(usize, Vec<Recomputed>, u64)> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..threads)
                 .map(|_| {
                     sc.spawn(|| {
@@ -258,8 +283,22 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
                             if i >= cand.len() {
                                 return out;
                             }
-                            let rs = cand[i..(i + CHUNK).min(cand.len())].iter().map(|&c| pull(g, c, lookup, &mut pieces, &mut scratch)).collect();
-                            out.push((i, rs));
+                            let mut scanned = 0u64;
+                            let rs = cand[i..(i + CHUNK).min(cand.len())]
+                                .iter()
+                                .map(|&c| {
+                                    scanned += g.out_of(c).len() as u64;
+                                    let r = pull(g, c, lookup, &mut pieces, &mut scratch);
+                                    if r.is_empty() {
+                                        Recomputed::Empty
+                                    } else if lookup(c) == Some(&r) {
+                                        Recomputed::Same
+                                    } else {
+                                        Recomputed::New(Arc::new(r))
+                                    }
+                                })
+                                .collect();
+                            out.push((i, rs, scanned));
                         }
                     })
                 })
@@ -267,32 +306,39 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
             hs.into_iter().flat_map(|h| h.join().expect("a backward worker panicked")).collect()
         });
         parts.sort_unstable_by_key(|p| p.0);
-        let mut fresh: Vec<Region> = parts.into_iter().flat_map(|p| p.1).collect();
+        n_scan += parts.iter().map(|p| p.2).sum::<u64>();
+        let fresh: Vec<Recomputed> = parts.into_iter().flat_map(|p| p.1).collect();
+        d_pull += t0.elapsed();
+        let t0 = std::time::Instant::now();
         // Merge: the next frame's sets that persist, overridden by the
         // recomputed candidates.
-        let mut cur = Frame::default();
+        let mut cur = Frame { nodes: Vec::with_capacity(next.nodes.len()), sets: Vec::with_capacity(next.nodes.len()) };
         let mut new_changed: Vec<u32> = Vec::new();
         let (mut a, mut b) = (0usize, 0usize);
+        let mut fresh = fresh.into_iter();
         while a < next.nodes.len() || b < cand.len() {
             let ia = next.nodes.get(a).copied().unwrap_or(u32::MAX);
             let ib = cand.get(b).copied().unwrap_or(u32::MAX);
-            if ib < ia || (ib == ia && ib != u32::MAX) {
-                let r = std::mem::take(&mut fresh[b]);
-                let prev = (ib == ia).then(|| &next.sets[a]);
-                if r.is_empty() {
-                    if prev.is_some() {
-                        new_changed.push(ib);
+            if ib <= ia {
+                let had = ib == ia;
+                match fresh.next().expect("one result per candidate") {
+                    Recomputed::Empty => {
+                        if had {
+                            new_changed.push(ib);
+                        }
                     }
-                } else if let Some(p) = prev.filter(|p| ***p == r) {
-                    n_same += 1;
-                    cur.nodes.push(ib);
-                    cur.sets.push(p.clone());
-                } else {
-                    new_changed.push(ib);
-                    cur.nodes.push(ib);
-                    cur.sets.push(Arc::new(r));
+                    Recomputed::Same => {
+                        n_same += 1;
+                        cur.nodes.push(ib);
+                        cur.sets.push(next.sets[a].clone());
+                    }
+                    Recomputed::New(r) => {
+                        new_changed.push(ib);
+                        cur.nodes.push(ib);
+                        cur.sets.push(r);
+                    }
                 }
-                if ib == ia {
+                if had {
                     a += 1;
                 }
                 b += 1;
@@ -314,8 +360,14 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
         }
         changed = new_changed;
         frames.push(cur);
+        d_merge += t0.elapsed();
     }
-    eprintln!("[arc] backward: {n_cand} recomputations ({n_same} unchanged), {n_scan} out-edges scanned");
+    eprintln!(
+        "[arc] backward: {n_cand} recomputations ({n_same} unchanged), {n_scan} out-edges scanned; candidates {:.2} s, pull {:.2} s, merge {:.2} s",
+        d_cand.as_secs_f64(),
+        d_pull.as_secs_f64(),
+        d_merge.as_secs_f64()
+    );
     frames.reverse();
     Winning { frames }
 }
