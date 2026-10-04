@@ -173,8 +173,10 @@ reasoning about the abstraction.
 steps, but 472k bodies (largest 2^13 configurations), ~16x an `n` set, and
 UNSOUND: the ASM interval subtraction wrapped the full range's low end, so
 `delay <= 0` was "no" and shaking floors never fell. Every `t` level of room
-(3,3) was wrong. The fix (`72fdea7`, branch `asm-interval-wrap`) is not
-merged: it needs the countdown fork first.
+(3,3) was wrong. Fixed on `arc-sets` (`549ecf5`, then `b47b118`: overflow is
+a lane's error, countdowns the unknown number; the first attempt `72fdea7`,
+overflow -> the whole range silently, was rejected). The `t` level itself
+now runs out of memory building room (3,3)'s kernels.
 
 **Exact speed at level 0 in spring rooms** (room (2,0), 2026-09-15). The
 overnight run OOMed at the 90 GB cap in f79: 175M kept at f78, +18%/frame,

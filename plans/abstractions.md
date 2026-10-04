@@ -148,17 +148,20 @@ point-split run at every frame.
   (`runtime2::FLOOR_STATE_RANGE`) with `collideable` DERIVED as `state ~= 2`
   (the cart keeps them in step), exact only where the player overlaps the
   floor at the frame's end (`widen::widen_near_floors`); the countdowns (floor
-  `delay`, balloon `timer`) the whole 16.16 range; the objects' phases
-  (`widen::phase_paths`: spring `spr`/`delay`/`hide_in`/`hide_for`, balloon
-  `spr` and its bob `y` as `start +- 2`) their ranges. A widened object's
+  `delay`, balloon `timer`, spring `delay`/`hide_in`/`hide_for`) the unknown
+  number (`AV::UNum`, since `b47b118`; before it the whole 16.16 interval,
+  which the kernels' interval subtraction wrapped); the other phases
+  (`widen::phase_paths`: spring `spr`, balloon `spr` and its bob `y` as
+  `start +- 2`) their ranges. A widened object's
   update is then "maybe X" (maybe bounce, maybe refill) and nothing else. An
   overlapped floor stores the cart's invariant (hidden), owed per lane
   (`09505c7`); in the split frame a floor the player's `is_solid` can reach
   keeps its computed `collideable` mid-frame (`widen::PLAYER_PROBE`).
 - **Soundness**: `diag-project` checked every row of a room (7,0) `t` tree
-  (7.88M, steps 1-96) projects onto a row of the `n` tree. The interval-wrap
-  caveat (plans/architecture.md "Where it still diverges") means the `n`
-  results are believed sound, not proven.
+  (7.88M, steps 1-96) projects onto a row of the `n` tree. The results were computed before the
+  interval-wrap fix (`549ecf5`, `b47b118`); two rooms re-run after it
+  reproduce their counts exactly, the rest were not re-run
+  (plans/results.md, "Caveats").
 - **Measured**: room (7,0) step 108: `b` 20.2M, `n` 3.4M, `t` 2.8M states
   before the join-bug fix; after `7f6b96e` (the boolean join of an undecided
   `collideable` threw away the player's overlap test, so every collision
@@ -171,19 +174,20 @@ point-split run at every frame.
   stop paying past ~rem 3 (room (4,1): marks 2.9M -> 121M from rem 3 to 8 on a
   spurious 91 the first exact-balloon level refuted at once).
 
-## t: only the countdowns widened (`FloorsPrecision::Timers`) - UNSOUND as built, unused
+## t: only the countdowns widened (`FloorsPrecision::Timers`) - unused, does not build
 
-- **Widens**: each floor's `delay` and the balloon's `timer` to the whole
-  16.16 range; `state`/`collideable` exact. The cart only compares the
+- **Widens**: each floor's `delay` and the balloon's `timer` to the unknown
+  number (since `b47b118`; the whole 16.16 interval before);
+  `state`/`collideable` exact. The cart only compares the
   countdowns with 0 and decrements them, so the whole range is as precise as
   any tighter one.
-- **Why unused**: the ASM interval subtraction wrapped the low end of the full
-  range (`delay - 1` -> [32767.99, 32766.99]), so `delay <= 0` came out "no":
-  shaking floors never fell. Every `t` level of room (3,3) was unsound. And a
-  `t` set is ~16x an `n` set (1.35M bodies, ~13 GB; `CELESTE_KERNEL_SETS=1`
-  required). A sound `t` needs the countdown fork (`delay <= 0` forked, not
-  computed on an interval) - which is also what merging `asm-interval-wrap`
-  needs.
+- **Why unused**: until `549ecf5` the ASM interval subtraction wrapped the
+  low end of the full range (`delay - 1` -> [32767.99, 32766.99]), so
+  `delay <= 0` came out "no": shaking floors never fell, and every `t` level
+  of room (3,3) was unsound. A `t` set is ~16x an `n` set (1.35M bodies,
+  ~13 GB; `CELESTE_KERNEL_SETS=1` required). Since `b47b118` (countdowns as
+  the unknown number) room (3,3) `r4sxht` runs out of memory (60 GB) in the
+  kernel walk/build; not fixed.
 
 ## p: moving platforms unknown (`PlatformsPrecision`) - CURRENT for platform rooms, low rungs only
 

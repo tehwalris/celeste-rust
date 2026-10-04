@@ -66,11 +66,25 @@ with the reference engine (`rewrite witness`), replayed on a real PICO-8
   "some draw wins" and a refutation holds for every draw. Each witness was
   replayed per seed; several exit only for some (the table's seed lists).
   Room (5,0)'s 77 has no witness at all.
-- **The `n` levels' soundness** rests on the interval-wrap caveat
-  (plans/architecture.md, "Where it still diverges"): believed sound, not
-  proven, until the countdown fork lands and `asm-interval-wrap` is merged.
-  Every refutation below an exact-object level involves an `n` level only as
-  a filter, but the filter's marks come from it.
+- **The silent interval wrap** (plans/architecture.md, "Interval
+  overflow"): the ASM kernels wrapped an overflowing interval `+`/`-`/negation
+  until `549ecf5` (2026-10-03 15:15) and `b47b118` (2026-10-03 18:07; now a
+  lane error, countdowns the unknown number). EVERY result in the table except
+  room (3,3)'s arc result (2026-10-04, after both) was computed with the
+  wrapping binary. What the wrap could affect: only an interval whose
+  endpoint reaches the 16.16 limits - in practice the countdowns widened to
+  the whole range at the `t` (timers) and `n` (near) levels, which the cart
+  decrements before `delay <= 0`. At `t` it was decisive: shaking floors never
+  fell (found in room (3,3), where it refuted TAS28's own second half); no
+  table result uses `t`. At `n` the kernels had leaned on it (dropping it
+  declined room (1,1) at f35 until the near-floor owes were fixed in
+  `549ecf5`); after both fixes, room (1,1) `r0sxhn` to f94 and room (6,1)
+  split `r0sxhn` to step 90 reproduce the committed runs' kept and visited
+  counts at every frame. The other `n` rooms ((7,0) recheck, (0,1), (2,1),
+  (4,1), (5,1), (7,1), (0,2), (1,2), (3,2), (4,2), (0,3), (2,3), (4,3),
+  (5,3)) were not re-run. Rooms whose ladders have no `n`/`t` level hold no
+  full-range countdown interval. Interval `Mul`/`Div` by a constant is still
+  unchecked (open).
 - **The arcs result (3,3)** still over-approximates the objects and held
   buttons (level 0 `r0sxhn`); the remainder is exact. The 172 witness is
   concrete.

@@ -82,8 +82,8 @@ latter.
 
 `develop` is the main line; work happens on feature branches off it (current:
 `arc-sets`). `parallel-experiments` (overnight parallelism, deliberately not
-merged), `asm-interval-wrap` (the interval-wrap fix, not mergeable yet - see
-plans/architecture.md), `interpreter-abandoned-2026-01-11` (the January CFG
+merged), `asm-interval-wrap` (a rejected first version of the interval-overflow fix;
+the accepted one is on `arc-sets`), `interpreter-abandoned-2026-01-11` (the January CFG
 optimizer, reading material only).
 
 ## Running safely

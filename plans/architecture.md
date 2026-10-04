@@ -144,6 +144,7 @@ OR(error(args))`, materialized once, after fusion:
 | `Sel(c, t, f)` | `not Known(c)` |
 | a fork fragment | `not SplitOk(ways)` / `not SplitOkTab`: the lane spans more parts than enumerated |
 | an unrolled loop | its condition still holds after the bound (`State::ended`) |
+| interval `Add`/`Sub`/`Neg` | `not NoWrap(op)`: an endpoint overflowed 16.16 on this lane (`b47b118`; skipped where the static ranges bound the result) |
 | a widening | containment of the slot it writes (`widen::SlotErrors`), only where stored |
 | the frame | inputs outside the kernel's admissible set (pins, region bounds) |
 
@@ -196,11 +197,20 @@ platform tension: storing a platform's `x` as its whole path is what lets
 frames merge, and the overlap predicates only fold at ~4.5 px granularity -
 exactly where no cross-frame merge survives; storing zones would cost ~Z
 tuples (one phase drives all ten platforms), the ~18 px middle unmeasured.
-The interval +/- in the ASM kernels WRAPS an overflowing endpoint
-(`vpsubd`): fixed on branch `asm-interval-wrap` (`72fdea7`) but NOT merged,
-because without the wrap the countdown comparisons under `n`/`t` become
-undecided and room (1,1) declines at f35. Before merging, the countdowns
-must fork on `delay <= 0`.
+**Interval overflow.** Until 2026-10-03 the assembled interval `+`, `-` and
+negation WRAPPED an overflowing endpoint silently (plain `vpaddd`/`vpsubd`;
+the Rust primitives panicked, and the per-op tests bounded their inputs).
+Fixed on `arc-sets` by `549ecf5` (overflow -> the whole range; with the
+near-floor changes it exposed) and then `b47b118` (Philippe's design, which
+replaced the whole-range rule): an overflowing interval Add/Sub/Neg is a
+lane's OWN ERROR (`Op::NoWrap`), so the lane declines loudly; and a countdown
+that spans everything (floor `delay`, balloon `timer`, at `n` the spring's
+`delay`/`hide_in`/`hide_for`) is stored and read as the unknown number
+(`AV::UNum`, `widen::forget_countdown_inputs`), never as the interval [MIN,
+MAX]. (`72fdea7` on branch `asm-interval-wrap` was a rejected first version.)
+STILL UNCHECKED: interval `Mul`/`Div` by a positive constant (the rem rung's
+scale) can still wrap - an open item. Which results ran before the fix:
+plans/results.md.
 
 ## The frame: waves (2026-09-13)
 
@@ -468,8 +478,9 @@ splits the interval).
 2. **The in-kernel coarser key**: the rung-k kernel emits the row's key widened
    to the coarser level, so `MarkFilter` is one lookup per row instead of a
    clone + widen + rekey (was ~30% of a level-1 frame).
-3. **The interval wrap** (above): the countdown fork, then merge
-   `asm-interval-wrap` and re-run the `n` gates.
+3. **Overflow in interval `Mul`/`Div` by a constant** is unchecked (it can
+   wrap silently, as Add/Sub did before `b47b118`): give it a `NoWrap`-style
+   own error.
 4. **A batch-invariance test** (`a_lanes_key_does_not_depend_on_its_
    neighbours` went with the old sweep) and a new-path widening-soundness
    check (`diag-project` checks one projection; `ref-check` the kernels).
