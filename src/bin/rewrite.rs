@@ -366,6 +366,26 @@ enum Command {
     /// states of a tree with the named cells (`cell_names`) whose names
     /// start with any `--erase` prefix left out (comma-separated, e.g.
     /// `spd.,rem.,player[3].dash`), and cumulatively through that frame.
+    /// THE ROTATION GRAPH on a recorded tree (branch arc-sets, plans/arcs.md):
+    /// a level-0 forward run with `CELESTE_ARC_EDGES=1` (its rows the nodes,
+    /// its arc records the edges with their exact guards and actions), then
+    /// the winning sets backward from the wins at frames <= `--horizon`, the
+    /// exact forward from the start inside them, and the goal-free partition's
+    /// size. Prints whether the horizon is reachable, and the first win.
+    ArcSearch {
+        /// The level-0 tree (`frames/`, `edges/arc/`).
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        horizon: u32,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+        #[arg(long)]
+        win_at: Option<String>,
+        /// Also the goal-free partition (cut points per node and frame).
+        #[arg(long)]
+        partition: bool,
+    },
     /// PROTOTYPE (branch arc-sets): the ROTATION GRAPH. Nodes are the
     /// game's states with the remainders erased, time-expanded from the room's
     /// start to `--horizon`; an edge is (input, the piece of each axis's
@@ -3098,6 +3118,89 @@ fn main() -> Result<()> {
                 states_in[2],
                 cells_in[3],
                 states_in[3]
+            );
+        }
+        Command::ArcSearch { level_dir, horizon, room, win_at, partition } => {
+            use celeste_rust::frame::{frame_files_seq, pack_id, wins_of};
+            use celeste_rust::search::{arc_dp, arc_edges, arcs};
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            if let Some(xy) = &win_at {
+                std::env::set_var("CELESTE_WIN_AT_XY", xy);
+            }
+            let dir = std::path::Path::new(&level_dir);
+            let t0 = std::time::Instant::now();
+            // Nodes: every stored row of frames 0..=horizon; the wins among them.
+            let mut layer: rustc_hash::FxHashMap<u64, u32> = Default::default();
+            let mut wins: Vec<u64> = Vec::new();
+            let mut start: Option<u64> = None;
+            for f in 0..=horizon {
+                for (seq, file) in frame_files_seq(dir, f)? {
+                    let Some(rt2) = file.load_all()? else { continue };
+                    let w = wins_of(&rt2)?;
+                    for (r, won) in w.into_iter().enumerate() {
+                        let id = pack_id(f, seq, r as u32);
+                        layer.insert(id, f);
+                        if won {
+                            wins.push(id);
+                        }
+                        if f == 0 {
+                            start = Some(id);
+                        }
+                    }
+                }
+            }
+            let start = start.ok_or_else(|| anyhow::anyhow!("no frame-0 row"))?;
+            // Edges: the arc records of frames 1..=horizon, one per predecessor bit.
+            let conv = |t: &arc_edges::Transfer| arc_dp::Transfer { guard: t.guard.clone(), action: t.action };
+            let mut edges = Vec::new();
+            let edges_dir = dir.join("edges");
+            for f in 1..=horizon {
+                for e in arc_edges::read_frame(&edges_dir, f)? {
+                    let mut m = e.mask;
+                    while m != 0 {
+                        let i = m.trailing_zeros() as u64;
+                        m &= m - 1;
+                        edges.push(arc_dp::Edge { src: e.base + i, dst: e.target, x: conv(&e.x), y: conv(&e.y) });
+                    }
+                }
+            }
+            let n_nodes = layer.len();
+            let n_edges = edges.len();
+            let g = arc_dp::Graph::new(edges, layer, wins.clone());
+            eprintln!("[arc] {} nodes, {} edges, {} win rows; loaded in {:.1} s", n_nodes, n_edges, wins.len(), t0.elapsed().as_secs_f64());
+            let tb = std::time::Instant::now();
+            let w = arc_dp::backward(&g, horizon);
+            let tb = tb.elapsed().as_secs_f64();
+            for t in (0..horizon).rev().step_by(4) {
+                let mut m = w.w[t as usize].clone();
+                for n in &wins {
+                    m.remove(n);
+                }
+                let (n, med, p90, max) = arc_dp::fragmentation(&m);
+                eprintln!("[arc] W frame {t:3}: {n} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}");
+            }
+            if partition {
+                let part = arc_dp::partition(&g, horizon);
+                for t in (0..horizon).rev().step_by(4) {
+                    let mut cx: Vec<usize> = part[t as usize].values().map(|(x, _)| x.len()).collect();
+                    let mut cy: Vec<usize> = part[t as usize].values().map(|(_, y)| y.len()).collect();
+                    cx.sort_unstable();
+                    cy.sort_unstable();
+                    let q = |v: &Vec<usize>, f: f64| if v.is_empty() { 0 } else { v[((v.len() - 1) as f64 * f) as usize] };
+                    eprintln!("[arc] partition frame {t:3}: {} nodes; cuts per node x med {} p90 {} max {}, y med {} p90 {} max {}", cx.len(), q(&cx, 0.5), q(&cx, 0.9), q(&cx, 1.0), q(&cy, 0.5), q(&cy, 0.9), q(&cy, 1.0));
+                }
+            }
+            // The start has no player yet (the spawn): its remainder is no
+            // input of anything; any point stands for it.
+            let p0 = (arcs::point(0), arcs::point(0));
+            let in_w = w.at(0, start).is_some_and(|r| r.contains(p0.0, p0.1));
+            let tf = std::time::Instant::now();
+            let found = arc_dp::forward(&g, &w, start, p0, horizon);
+            println!(
+                "h{horizon}: start in W_0 = {in_w}; exact forward: {}; backward {:.2} s, forward {:.2} s",
+                match &found { Some(f) => format!("WIN at f{} (path of {} nodes)", f.frame, f.path.len()), None => "no win".to_string() },
+                tb,
+                tf.elapsed().as_secs_f64()
             );
         }
         Command::ArcProto { room, horizon, win_at, verify, max_nodes, marks, marks_level } => {
