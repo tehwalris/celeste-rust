@@ -1,0 +1,39 @@
+[gate] h35 marks 11576 86a1125435be1bbb
+[gate] h35 W f000 1 062eda0a6639c0eb
+[gate] h35 W f001 2 d5667a6efce2fe59
+[gate] h35 W f002 3 c3aaaf36e9a08e81
+[gate] h35 W f003 3 5a038ad4d3dfc7c0
+[gate] h35 W f004 3 df0a0173142ba44b
+[gate] h35 W f005 3 8ecb8cb23f17bf98
+[gate] h35 W f006 3 0f949aa931dfd7ef
+[gate] h35 W f007 3 9b2bd4c989f24268
+[gate] h35 W f008 3 91d5b5ce536bafa9
+[gate] h35 W f009 3 6f3c1cbc0a9dd95b
+[gate] h35 W f010 3 2c68c9e25bb24113
+[gate] h35 W f011 3 7b150c931ce0e7f0
+[gate] h35 W f012 3 e8454a96d3f2d120
+[gate] h35 W f013 3 c871af5cbb3af5ca
+[gate] h35 W f014 3 d834259483c445a5
+[gate] h35 W f015 3 47ff8017b584f009
+[gate] h35 W f016 3 ab930377ba9ba89e
+[gate] h35 W f017 3 a8a8ad8c601931a5
+[gate] h35 W f018 3 5cf059dc8b73ccc7
+[gate] h35 W f019 3 eabeae6b52024ead
+[gate] h35 W f020 3 75d58785cf77440b
+[gate] h35 W f021 3 dd0234c9dbd0ee04
+[gate] h35 W f022 3 4004f8335f0cdf53
+[gate] h35 W f023 3 d74a976b269b72ba
+[gate] h35 W f024 10 21fcada43e16bf65
+[gate] h35 W f025 45 40e00f24c9a5141a
+[gate] h35 W f026 216 3a133df0d1dda48c
+[gate] h35 W f027 727 360c18e4f28d2d5d
+[gate] h35 W f028 1549 b68f4bce1495b236
+[gate] h35 W f029 2523 c1089d87719c5d0d
+[gate] h35 W f030 3328 f474309c22548682
+[gate] h35 W f031 2642 e604624fdd783022
+[gate] h35 W f032 881 2583e21ac041a49d
+[gate] h35 W f033 813 de3028b6c8df6474
+[gate] h35 W f034 836 984dae3120c47cb2
+[gate] h35 W f035 530 6c2acec3abb6ef50
+[gate] h35 arc optimum 33
+[gate] h35 concrete optimum 33 inputs 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,17,0,0,2,32,0,0,0,0

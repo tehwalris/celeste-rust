@@ -31,21 +31,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// The rebuilt search (src/frame.rs): find the minimal winning frame by
-    /// running the full precision ladder (Bits 0..=15 then Exact) at rising
-    /// horizons until one is confirmed at every level through concrete.
+    /// THE SEARCH (the arc pipeline): the level-0 forward to the horizon,
+    /// recording every edge with its remainder transfer (resumed, or reused
+    /// as it is when the tree already reaches the horizon); the rotation
+    /// graph's winning sets backward from the wins (`arc_dp::solve`), whose
+    /// optimum is exact in the remainder and a LOWER BOUND on the game's
+    /// (the level's other fields may be coarse) - no win there refutes the
+    /// horizon; then the concrete count-up inside the winning sets from that
+    /// bound: the first frame with a concrete witness is the CONCRETE
+    /// optimum, its inputs written to `<checkpoint-dir>/witness_frame_F.txt`.
     Search {
-        /// Lowest horizon to test; level 0 is extended past it until it
-        /// first wins, then the ladder tests each horizon until Confirmed.
-        #[arg(long, default_value_t = 1)]
-        from: u32,
-        /// Last horizon to try.
+        /// The horizon: every frame up to it is searched.
         #[arg(long)]
         to: Option<u32>,
-        /// Deepest bits rung (>=16 means Exact is the top rung).
-        #[arg(long, default_value_t = 15)]
-        maxk: u8,
-        /// Base checkpoint dir (per-horizon, per-level subdirs land under it).
+        /// A KNOWN solution's frame (the replayed community TAS) as the
+        /// horizon: a refutation, or no concrete witness by it, is an error -
+        /// the model cannot reproduce a real run.
+        #[arg(long)]
+        ceiling: Option<u32>,
+        /// The level-0 spec (`Level::parse`, e.g. `r0sxhn` for an object
+        /// room). Default: `CELESTE_LADDER`'s first entry, else `r0sx`.
+        #[arg(long, value_parser = Level::parse)]
+        level: Option<Level>,
+        /// The checkpoint dir: the tree goes to `level00/` under it.
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
         /// Start room "x,y".
@@ -54,20 +62,18 @@ enum Command {
         /// Optional synthetic win "x,y" (CELESTE_WIN_AT_XY) for a cheap run.
         #[arg(long)]
         win_at: Option<String>,
-        /// COUNT DOWN from a known concrete solution's frame (the replayed
-        /// TAS, `frame::find_optimum_from_ceiling`) instead of up from
-        /// level 0's first win: the ceiling must confirm, then each horizon
-        /// below is tested until one is refuted. Two ladder runs when the
-        /// ceiling is optimal. `--from`/`--to` are ignored.
+        /// Stop at the arc bound (no concrete count-up).
         #[arg(long)]
-        ceiling: Option<u32>,
-        /// EXPERIMENT: start not at the room's spawn but at the states a
-        /// concrete INPUT PREFIX leads to (a `tas/`-format file or a comma
-        /// list; every leaf of a frame that forks on `rnd`), frame 0 being
-        /// the prefix's end - the room's second half as a search of its own.
-        /// Use a checkpoint dir of its own.
+        no_witness: bool,
+        /// Write the web UI's arc pass into this directory (`export-ui
+        /// --forward-only --arc DIR`): the remainder-free backward's marks
+        /// (`level0.marks.bin`), the ARC-MARKED nodes (`arc.marks.bin`: a node
+        /// whose winning set is non-empty at some frame), both as `(shape,
+        /// cell, key, dist)` rows with `dist` the horizon minus the last frame
+        /// the node still wins from; `arc.txt`; `witness.txt` (the inputs and
+        /// the player's position per frame).
         #[arg(long)]
-        start_after: Option<String>,
+        save_marks: Option<String>,
     },
     /// ONE forward pass at ONE precision level, exactly as the ladder runs it
     /// (record mode, position partition, sharded checkpoints), with the
@@ -188,41 +194,6 @@ enum Command {
         /// by only one of them (with their layer and cell).
         #[arg(long, default_value_t = false)]
         diff: bool,
-    },
-    /// THE ROTATION GRAPH on a recorded level-0 tree (`arc_dp::solve`): its
-    /// rows the nodes, its edges with their transfers, the winning sets
-    /// backward from the wins at frames <= `--horizon`, and the optimum read
-    /// off them. Prints whether the horizon is reachable, and the first win.
-    ArcSearch {
-        /// The level-0 tree (`frames/`, `edges/`).
-        #[arg(long)]
-        level_dir: String,
-        #[arg(long)]
-        horizon: u32,
-        #[arg(long, default_value = "1,0")]
-        room: String,
-        #[arg(long)]
-        win_at: Option<String>,
-        /// Turn the optimum into CONCRETE inputs: a DFS with the reference
-        /// engine (concrete objects) admitting a successor only if its
-        /// projection onto `--level` is a node whose winning set holds the
-        /// successor's exact remainder. Prints the input bytes, or the
-        /// deepest frame such a run reaches.
-        #[arg(long)]
-        witness: bool,
-        /// The tree's level spec (the projection for `--witness`).
-        #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
-        level: Level,
-        /// Write the web UI's arc pass into this directory (`export-ui
-        /// --forward-only --arc DIR`): the
-        /// remainder-free backward's marks (`level0.marks.bin`) and the
-        /// ARC-MARKED nodes (`arc.marks.bin`: a node whose winning set is
-        /// non-empty at some frame), both as `(shape, cell, key, dist)` rows
-        /// with `dist` the horizon minus the last frame the node still wins
-        /// from; `arc.txt` (horizon, level, first wins); with `--witness`,
-        /// `witness.txt` (its inputs and player position per frame).
-        #[arg(long)]
-        save_marks: Option<String>,
     },
     /// DIAGNOSTIC: the TRANSFERS of a level-0 tree's edges, checked. Per
     /// frame: every recorded edge carries a transfer. Then `--samples` records
@@ -427,7 +398,7 @@ enum Command {
         /// directory, no ladder): exported as one partial horizon.
         #[arg(long)]
         forward_only: bool,
-        /// With `--forward-only`: the `arc-search --save-marks` directory
+        /// With `--forward-only`: the `search --save-marks` directory
         /// over that tree. Level 0 gets the remainder-free backward's marks,
         /// and a second level whose forward is level 0's carries the
         /// remainder-exact arc backward (and the concrete witness, if saved).
@@ -606,73 +577,83 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Search {
-            from,
-            to,
-            maxk,
-            checkpoint_dir,
-            room,
-            win_at,
-            ceiling,
-            start_after,
-        } => {
-            use celeste_rust::frame::find_optimum;
+        Command::Search { to, ceiling, level, checkpoint_dir, room, win_at, no_witness, save_marks } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
             if let Some(xy) = &win_at {
                 std::env::set_var("CELESTE_WIN_AT_XY", xy);
             }
-            // THE LADDER. `CELESTE_LADDER="r0sxhn,r1sxhn,...,rxsx"`: an
-            // explicit list of levels, coarsest first. Otherwise rem
-            // Bits(0..=maxk) then Exact.
-            let precisions: Vec<Level> = match std::env::var("CELESTE_LADDER") {
-                Ok(spec) => Level::parse_ladder(&spec).unwrap_or_else(|e| panic!("CELESTE_LADDER: {e}")),
-                Err(_) => Level::default_ladder(maxk),
-            };
-            eprintln!(
-                "[ladder] levels: {}",
-                precisions
-                    .iter()
-                    .map(|l| l.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ")
+            anyhow::ensure!(
+                std::env::var_os("CELESTE_SPLIT_FRAME").is_none(),
+                "the arc search runs whole frames: CELESTE_SPLIT_FRAME is not supported"
             );
-            let make_engine = |p: Level| {
-                set_level(p);
-                Ok(Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)
-                    as Box<dyn FrameStep>)
+            let horizon = match (ceiling, to) {
+                (Some(h), None) | (None, Some(h)) => h,
+                _ => anyhow::bail!("give the horizon: --to H, or --ceiling H for a known solution"),
             };
-            let starts = start_states(start_after.as_deref())?;
-            // A mid-room start has a player, and the kernels take rows in the
-            // level's form: widen it to the level being run (sound - the
-            // widened row covers the state). The room's own spawn stays as
-            // it is, as it always has (no player, nothing to widen).
-            let widen_starts = start_after.is_some();
-            let make_initial = || {
-                starts
-                    .iter()
-                    .map(|st| {
-                        let b = Block::from_state(st)?;
-                        if !widen_starts {
-                            return Ok(b);
-                        }
-                        let mut rt2 = b.into_rt2();
-                        widen_rt2_to(&mut rt2, celeste_rust::interpreter::abstraction::current_level());
-                        Ok(Block::from_rt2(rt2))
-                    })
-                    .collect::<Result<Vec<_>>>()
+            let level = match level {
+                Some(l) => l,
+                None => match std::env::var("CELESTE_LADDER") {
+                    Ok(spec) => Level::parse_ladder(&spec).map_err(|e| anyhow::anyhow!("CELESTE_LADDER: {e}"))?[0],
+                    Err(_) => Level::parse("r0sx").map_err(|e| anyhow::anyhow!(e))?,
+                },
             };
-            let dir = std::path::Path::new(&checkpoint_dir);
-            // Level 0's kernels are built when it first runs; the finer levels'
-            // all at once after its first backward (`Ladder::at_horizon`), past
-            // the memory peak.
-            let found = if let Some(c) = ceiling {
-                Some(celeste_rust::frame::find_optimum_from_ceiling(make_engine, make_initial, dir, c, &precisions)?)
-            } else {
-                find_optimum(make_engine, make_initial, dir, from, to.unwrap_or(from), &precisions)?
+            set_level(level);
+            eprintln!("[search] room {room}, level {level}, horizon {horizon}");
+            let t0 = std::time::Instant::now();
+            let base = std::path::Path::new(&checkpoint_dir);
+            let dir = base.join("level00");
+            // THE FORWARD. A tree that already reaches the horizon is used as
+            // it is (resuming it would rebuild its door to extend nothing).
+            let first_win = match celeste_rust::frame::tree_first_win_through(&dir, horizon)? {
+                Some(w) => {
+                    eprintln!("[search] {}: the tree reaches f{horizon}", dir.display());
+                    w
+                }
+                None => {
+                    let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+                    let initial = || -> Result<Vec<Block>> { Ok(vec![Block::from_state(&ConcreteEngine::new()?.initial_state()?)?]) };
+                    let mut st = match celeste_rust::frame::ForwardState::resume(&dir, true)? {
+                        Some(s) => s,
+                        None => celeste_rust::frame::ForwardState::start(initial()?, &dir, true)?,
+                    };
+                    st.extend(&engine, &dir, horizon, None)?;
+                    st.win_frame
+                }
             };
-            match found {
-                Some(h) => println!("OPTIMAL win frame: {h}"),
-                None => println!("no win confirmed up to horizon {}", to.unwrap_or(from)),
+            let t_fwd = t0.elapsed().as_secs_f64();
+            eprintln!("[search] forward to f{horizon} in {t_fwd:.1} s; level 0's first win {first_win:?}");
+            // THE ARC PHASE and the concrete count-up.
+            let s = celeste_rust::search::arc_dp::solve(&dir, level, horizon, !no_witness, save_marks.as_deref().map(std::path::Path::new))?;
+            let wall = t0.elapsed().as_secs_f64();
+            let Some(bound) = s.arc else {
+                anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search: a known solution the model cannot reproduce");
+                println!("REFUTED: no win by f{horizon} ({wall:.1} s)");
+                return Ok(());
+            };
+            println!("ARC BOUND: no win before f{bound} (remainder-exact, the level's other fields over-approximated)");
+            if no_witness {
+                return Ok(());
+            }
+            match &s.concrete {
+                Some(w) => {
+                    let f = w.inputs.len();
+                    let path = base.join(format!("witness_frame_{f}.txt"));
+                    std::fs::write(
+                        &path,
+                        format!(
+                            "# Room ({room}): the concrete witness of `rewrite search --level {level} --to {horizon}`{}.\n\
+                             # Arc bound f{bound}; no concrete win before f{f} inside the winning sets (exhaustive).\n\
+                             # A balloon room's win may hold for some `rnd` draws only: replay with seeds.\n{}\n",
+                            win_at.as_ref().map_or(String::new(), |w| format!(" --win-at {w}")),
+                            w.inputs_text()
+                        ),
+                    )?;
+                    println!("OPTIMAL win frame: {f} ({wall:.1} s; forward {t_fwd:.1} s); witness {}", path.display());
+                }
+                None => {
+                    anyhow::ensure!(ceiling.is_none(), "ceiling {horizon}: no concrete witness by it - a known solution the model cannot reproduce");
+                    println!("no concrete win by f{horizon} (arc bound f{bound}; {wall:.1} s)");
+                }
             }
         }
         Command::Forward {
@@ -1150,20 +1131,6 @@ fn main() -> Result<()> {
                 cells_in[3],
                 states_in[3]
             );
-        }
-        Command::ArcSearch { level_dir, horizon, room, win_at, witness, level, save_marks } => {
-            std::env::set_var("CELESTE_START_ROOM", &room);
-            if let Some(xy) = &win_at {
-                std::env::set_var("CELESTE_WIN_AT_XY", xy);
-            }
-            let s = celeste_rust::search::arc_dp::solve(std::path::Path::new(&level_dir), level, horizon, witness, save_marks.as_deref().map(std::path::Path::new))?;
-            match s.arc {
-                Some(f) => println!("h{horizon}: OPTIMAL (remainder-exact over this graph) f{f}"),
-                None => println!("h{horizon}: REFUTED: no win by f{horizon}"),
-            }
-            if let Some(w) = &s.concrete {
-                println!("CONCRETE WITNESS: a win at f{}: {}", w.inputs.len(), w.inputs_text());
-            }
         }
         Command::ArcCheck { level_dir, room, win_at, from, to, samples, level } => {
             use celeste_engine::runtime2::{Col, AV};

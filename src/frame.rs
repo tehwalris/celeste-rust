@@ -2904,7 +2904,7 @@ where
 /// A level tree on disk complete through `horizon` (its frames there and
 /// their edge runs done): its first win, from the frame files' win lists.
 /// `None` when the tree does not reach the horizon.
-fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
+pub fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
     let done = crate::search::edges::done_frame(&dir.join("edges"));
     if done.is_none_or(|d| d < horizon) || !dir.join("frames").join(format!("f{horizon:03}")).is_dir() {
         return Ok(None);

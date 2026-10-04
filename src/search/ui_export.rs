@@ -835,7 +835,7 @@ fn read_keyed(path: &Path) -> Result<FxHashMap<String, String>> {
     Ok(text.lines().filter_map(|l| l.split_once(' ')).map(|(k, v)| (k.to_string(), v.trim().to_string())).collect())
 }
 
-/// `witness.txt` (`arc-search --witness --save-marks`): `inputs a,b,..`, then
+/// `witness.txt` (`search --save-marks`): `inputs a,b,..`, then
 /// `f x y` per frame from 0 (`f - -` without a player).
 fn read_witness(path: &Path) -> Result<Witness> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -857,7 +857,7 @@ fn read_witness(path: &Path) -> Result<Witness> {
     Ok(Witness { label: format!("concrete witness inside the winning sets, a win at f{}", inputs.len()), inputs, path: path_xy })
 }
 
-/// `--arc DIR` (`arc-search --save-marks DIR` over the forward-only tree):
+/// `--arc DIR` (`search --save-marks DIR`, its tree the forward-only one):
 /// the forward's partial horizon becomes a ladder of two backwards over
 /// level 0's forward - the remainder-free BFS (level 0's marks) and the
 /// remainder-exact ARC backward (a second level whose forward is level 0's:
@@ -915,7 +915,7 @@ fn attach_arc(horizons: &mut [HorizonRun], optimal: &mut Option<u32>, dir: &Path
 }
 
 /// The export. `room` is the start room the tree was searched from; `arc`
-/// (with `forward_only`) an `arc-search --save-marks` directory over it.
+/// (with `forward_only`) a `search --save-marks` directory over it.
 pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i16), forward_only: bool, arc: Option<&Path>) -> Result<()> {
     anyhow::ensure!(arc.is_none() || forward_only, "--arc is a backward over one forward's tree: it needs --forward-only");
     let text = std::fs::read_to_string(log_path).with_context(|| format!("reading {}", log_path.display()))?;

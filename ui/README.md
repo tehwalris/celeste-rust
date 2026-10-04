@@ -178,22 +178,22 @@ cp /tmp/room00_search.log /var/tmp/celeste-ui/room00.log
 
 A forward on its own exports with `--forward-only` (one partial horizon,
 no backward). With `--arc DIR` it becomes a two-level run: `DIR` is what
-`rewrite arc-search --marked-only --save-marks DIR [--witness]` wrote over
-the same tree (plans/architecture.md "Arcs") - level 0 gets the remainder-free backward's
+`rewrite search --save-marks DIR` wrote over the same tree (its
+`level00/`; plans/architecture.md "Arcs") - level 0 gets the remainder-free backward's
 marks, and level 1 is the remainder-exact ARC backward over level 0's
 forward (`forward_of: 0` in `run.json`: no forward pass of its own; a node
 is marked when its winning set W_t is non-empty at some frame t, drawn at
-its first-reach layer like every backward). With `--witness`, `witness.txt`
+its first-reach layer like every backward). With a concrete witness, `witness.txt`
 (the concrete inputs and the player's position per frame) is drawn over
 the room as a cyan trail, bright to the current frame (the `witness`
 chip; `w=0` in the hash hides it). Room (3,3) at h172:
 
 ```bash
-./safe-run.sh -- ./target/quick/rewrite arc-search --level-dir /var/tmp/arc33-172 \
-    --horizon 172 --room 3,3 --marked-only --witness --level r0sxhn \
-    --save-marks /var/tmp/arc33-172-ui                  # ~90 s, ~35 GB peak
+CELESTE_LEVEL_MINUS_ONE="172,5" ./safe-run.sh -- ./target/quick/rewrite search \
+    --checkpoint-dir /var/tmp/arc33-172 --to 172 --room 3,3 --level r0sxhn \
+    --save-marks /var/tmp/arc33-172-ui 2> /var/tmp/arc33-172.log
 cp /var/tmp/arc33-172.log /var/tmp/celeste-ui/room33arc172.log   # the forward's log
-./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir /var/tmp/arc33-172 \
+./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir /var/tmp/arc33-172/level00 \
     --forward-only --arc /var/tmp/arc33-172-ui --log /var/tmp/celeste-ui/room33arc172.log \
     --out /var/tmp/celeste-ui/data/room33arc172 --room 3,3
 ```
