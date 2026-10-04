@@ -3,6 +3,7 @@
 //!   transpile --room-consts            the reachable constant lattice report
 //!   transpile --spec-probe SHAPE       specialization collapse for one shape
 //!   transpile --level-minus-one ...    the position-only cost-to-go table
+//!   transpile --level-minus-one-table S  build that table alone, its fingerprint
 //!
 //! The kernel emitter is gone: the kernels are assembled at runtime from the
 //! fused graph (`compiled::asm_kernel`), so there is nothing to generate.
@@ -118,6 +119,26 @@ fn main() -> Result<()> {
                     .join()
                     .map_err(|_| anyhow!("the level -1 probe panicked"))??;
                 print!("{}", report);
+                return Ok(());
+            }
+            // --level-minus-one-table S: build the level -1 table alone, as
+            // the search does (`cost_to_go`), and print its fingerprint: the
+            // A/B check for a change to the build. CELESTE_THREADS workers
+            // (default: every hardware thread, as the search).
+            "--level-minus-one-table" => {
+                let spd_px: i32 = args.next().ok_or_else(|| anyhow!("--level-minus-one-table S"))?.parse().context("--level-minus-one-table S")?;
+                let threads = match std::env::var("CELESTE_THREADS") {
+                    Ok(s) => s.parse().context("CELESTE_THREADS")?,
+                    Err(_) => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+                };
+                let t = std::time::Instant::now();
+                let table = std::thread::Builder::new()
+                    .stack_size(256 * 1024 * 1024)
+                    .spawn(move || celeste_rust::trace::level_minus_one::cost_to_go(std::path::Path::new("."), spd_px, threads))
+                    .context("spawn the level -1 builder")?
+                    .join()
+                    .map_err(|_| anyhow!("the level -1 builder panicked"))??;
+                println!("level -1 table: {} entries, start d {}, fingerprint {:016x}, {:.1} s", table.len(), table.start_d, table.fingerprint(), t.elapsed().as_secs_f64());
                 return Ok(());
             }
             "--room-consts" => {

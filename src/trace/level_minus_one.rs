@@ -1019,6 +1019,23 @@ pub struct CostToGo {
 }
 
 impl CostToGo {
+    /// The number of (shape, cell) entries.
+    pub fn len(&self) -> usize {
+        self.d.len()
+    }
+
+    /// A hash of every entry and the start's d, in a fixed order: two builds
+    /// with the same fingerprint filter identically.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut es: Vec<(&(u64, i16, i16), &u32)> = self.d.iter().collect();
+        es.sort_unstable();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.start_d.hash(&mut h);
+        es.hash(&mut h);
+        h.finish()
+    }
+
     /// Is a row of `shape` at `cell` at `frame` provably unable to exit by
     /// `horizon`? Only a table node is ever refused: a row without a player,
     /// one that has left the room, a shape or a cell the table never reached
