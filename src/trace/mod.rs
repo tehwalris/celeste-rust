@@ -58,6 +58,7 @@ pub mod cart;
 pub mod domain;
 pub mod emit;
 pub mod error;
+#[cfg(test)]
 pub mod eval;
 pub mod heap;
 pub mod iface;

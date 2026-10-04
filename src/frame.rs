@@ -1499,12 +1499,9 @@ impl<'a> MarkFilter<'a> {
     /// earlier frame with no time left (room (3,0) level 1: 14.6M kept at
     /// f51 onto 456k layer-51 marks, 2026-09-19).
     /// Rem widening never moves the integer cell and (coarsening) never splits
-    /// a lane, so the widened block is lane-aligned with the input.
-    ///
-    /// Crosses to the interpreter `State` for the coarsening: the widenings
-    /// live there (`abstraction.rs`) and this is the one place the loop
-    /// still needs them. Paid only at levels >= 1, whose frontiers the
-    /// filter itself keeps small.
+    /// a lane, so the widened block is lane-aligned with the input. The
+    /// coarsening is the block model's (`Rt2::widen_to`), paid only at levels
+    /// >= 1, whose frontiers the filter itself keeps small.
     ///
     /// A row in the MIDDLE of a split frame passes unfiltered: there the
     /// kernels keep what the frame's second step reads unwidened
@@ -1929,6 +1926,7 @@ pub fn backward_run(
 /// The backward walk itself, given the seeds (the states that count as
 /// marked on their own, i.e. the wins, from any layer). Factored out so a
 /// test can seed it directly; `backward_run` seeds from the win lanes.
+#[cfg(test)]
 pub fn backward_walk_in(
     engine: &dyn FrameStep,
     dir: &std::path::Path,
@@ -2595,13 +2593,13 @@ pub fn load_frame_cells(
     Ok(out)
 }
 
-/// The visited set: the keys of every lane ever kept into a frontier. A lane is
-/// kept iff its key was not already here (this is both the within-frame and the
-/// across-frame dedup - one structure, one lookup at the door).
-///
-/// Placeholder over an in-RAM set; the production one is tiered/mmap-backed
-/// (`interpreter::visited`) but that is an implementation swap behind
-/// `insert`/`contains`, not part of this interface.
+/// One row of a marks file (`Visited::save`): `(shape, cell, key.0, key.1,
+/// dist)`.
+type MarkRow = (u64, u32, u64, u64, u32);
+
+/// A set of states, `(shape, cell, key)`: a level's MARKED states (the
+/// backward's result, what `MarkFilter` looks finer rows up in) and the
+/// diagnostics' sets of reached states. In RAM; saved as a marks file.
 #[derive(Default)]
 pub struct Visited {
     /// Sharded by (shape hash, cell): a shard holds the 128-bit content
@@ -2613,9 +2611,9 @@ pub struct Visited {
     ///
     /// Each key maps to its DEADLINE: the last frame a marked state still
     /// reaches a win by the horizon from (`edges::Marks`), what `MarkFilter`
-    /// bounds time with. `u16::MAX` where there is none - a door, a loaded
-    /// marks file (the file stores the set only), the kernel re-run backward:
-    /// the membership test alone, as before deadlines existed.
+    /// bounds time with. `u16::MAX` where there is none - a set of reached
+    /// states, the kernel re-run backward, a marks file from before the
+    /// deadlines were saved: the membership test alone.
     shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashMap<(u64, u64), u16>>,
 }
 
@@ -2667,21 +2665,46 @@ impl Visited {
         self.shards.values().map(|s| s.len()).sum()
     }
 
-    /// Bytes the shards' tables occupy (hashbrown: 16-byte keys plus a
-    /// control byte per bucket, at each set's capacity).
-    pub fn save(&self, path: &std::path::Path) -> Result<()> {
-        let mut v: Vec<(u64, u32, u64, u64)> = Vec::with_capacity(self.len());
+    /// THE MARKS FILE (every reader: `load`, the UI export's `MarksMap`):
+    /// the rows `(shape, cell, key.0, key.1, dist)` - `dist` the horizon minus
+    /// the entry's deadline, the frames of slack it had - and the horizon, as
+    /// one bincode value `(rows, horizon)`. An entry with no deadline is saved
+    /// at the horizon (dist 0): no level runs past its horizon, so the two
+    /// filter alike. `load` gives every entry its deadline back, so a level
+    /// resumed from a marks file filters the next as the uninterrupted run
+    /// did.
+    pub fn save(&self, path: &std::path::Path, horizon: u32) -> Result<()> {
+        let mut rows: Vec<MarkRow> = Vec::with_capacity(self.len());
         for ((shape, cell), keys) in &self.shards {
-            v.extend(keys.keys().map(|&(k0, k1)| (*shape, *cell, k0, k1)));
+            rows.extend(keys.iter().map(|(&(k0, k1), &d)| (*shape, *cell, k0, k1, horizon - (d as u32).min(horizon))));
         }
-        crate::search::checkpoint::save_value_to(path, &v)
+        rows.sort_unstable();
+        crate::search::checkpoint::save_value_to(path, &(rows, horizon))
     }
 
+    /// A marks file (`save`). A file from before the deadlines were saved
+    /// (`(shape, cell, key.0, key.1)` rows, no horizon) loads with no
+    /// deadlines, as it always did.
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let v: Vec<(u64, u32, u64, u64)> = crate::search::checkpoint::load_value_from(path)?;
+        let bytes = std::fs::read(path)?;
+        let payload = crate::search::checkpoint::value_payload(&bytes, path)?;
+        anyhow::ensure!(payload.len() >= 8, "{}: too short for a marks file", path.display());
+        let n = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let body = payload.len() as u64 - 8;
         let mut out = Self::new();
-        for (shape, cell, k0, k1) in v {
-            out.insert(shape, (k0, k1), cell);
+        if n.checked_mul(32).and_then(|b| b.checked_add(4)) == Some(body) {
+            let (rows, horizon): (Vec<MarkRow>, u32) = bincode::deserialize(payload).with_context(|| format!("deserializing {}", path.display()))?;
+            for (shape, cell, k0, k1, dist) in rows {
+                anyhow::ensure!(dist <= horizon, "{}: a mark {dist} frames before h{horizon}", path.display());
+                out.insert_until(shape, (k0, k1), cell, u16::try_from(horizon - dist).unwrap_or(u16::MAX));
+            }
+        } else if n.checked_mul(28) == Some(body) {
+            let rows: Vec<(u64, u32, u64, u64)> = bincode::deserialize(payload).with_context(|| format!("deserializing {}", path.display()))?;
+            for (shape, cell, k0, k1) in rows {
+                out.insert(shape, (k0, k1), cell);
+            }
+        } else {
+            anyhow::bail!("{}: {n} rows do not fit {body} payload bytes as a marks file", path.display());
         }
         Ok(out)
     }
@@ -2914,7 +2937,7 @@ where
                 let bwd = backward_run(engine, &dir, horizon, &graph)?;
                 (bwd.marked, format!("{} re-runs", bwd.reruns))
             };
-            marked.save(&marks_file)?;
+            marked.save(&marks_file, horizon)?;
             // Last, and atomically: its presence says the marks are whole.
             let tmp = win_file.with_extension("win.tmp");
             std::fs::write(&tmp, format!("{h}\n"))?;
@@ -2972,6 +2995,7 @@ pub fn marks_path(base_dir: &std::path::Path, horizon: u32, level: usize) -> std
 
 /// The inner ladder at ONE horizon, from scratch - the tests' entry point;
 /// the search uses `Ladder` so level 0 persists across horizons.
+#[cfg(test)]
 pub fn ladder_at_horizon(
     make_engine: impl FnMut(
         crate::interpreter::abstraction::Level,
@@ -3367,63 +3391,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The position rung below level 0 (`PosPrecision`): a ladder that starts
-    /// at 2 px y-buckets, then level 0, then rem Bits(1), must still confirm
-    /// the synthetic win - the coarser level's marks (its keys widened to
-    /// the bucket) filter level 0 without losing the winning path, and the
-    /// bucket kernels (`IntFrag`: one exact position per fork configuration,
-    /// snapped back at the output) reach it at all.
+    /// A ladder interrupted after level 0 and rerun - level 0's marks loaded
+    /// from their file, the finer levels recomputed under them - is the
+    /// uninterrupted ladder: the same marks at every level, the same level-1
+    /// tree. The marks file keeps each state's DEADLINE (`Visited::save`);
+    /// it once kept the set only, and a resumed level filtered the next with
+    /// no time bound. Slow (three compiled levels); run explicitly.
     #[test]
     #[ignore]
-    fn new_ladder_position_rung_preserves_win() {
+    fn a_ladder_resumed_from_its_marks_matches_the_uninterrupted_one() {
         use crate::interpreter::abstraction::Level;
         std::env::set_var("CELESTE_START_ROOM", "1,0");
         std::env::set_var("CELESTE_WIN_AT_XY", "8,107");
-        let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-pos-test");
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-ladder-marks-resume");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("checkpoint dir");
-        let make_engine = |precision: Level| {
+        fn engine(precision: Level) -> Result<Box<dyn FrameStep>> {
             crate::interpreter::abstraction::set_level(precision);
-            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?) as Box<dyn FrameStep>)
-        };
-        let make_initial = || {
+            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?))
+        }
+        fn initial() -> Result<Vec<Block>> {
             Ok(vec![Block::from_state(&crate::trace::refengine::RefEngine::new()?.initial_state()?)?])
+        }
+        let levels = Level::parse_ladder("r0sx,r1sx,rxsx").expect("ladder");
+        let h = 14;
+        let marks = |l: usize| Visited::load(&marks_path(dir, h, l)).expect("marks");
+        let tree = |l: usize| -> std::collections::BTreeSet<(u64, (u64, u64), u32)> {
+            let ldir = dir.join(format!("h{h:03}")).join(format!("level{l:02}"));
+            let mut out = std::collections::BTreeSet::new();
+            for f in (0..=h).take_while(|f| ldir.join("frames").join(format!("f{f:03}")).is_dir()) {
+                for b in load_frame(&ldir, f).expect("frame") {
+                    let cells = b.positions().expect("cells");
+                    out.extend(b.keys().iter().zip(&cells).map(|(k, &c)| (b.shard_shape(), *k, c)));
+                }
+            }
+            out
         };
-        // `find_optimum` runs the level-0 forward first (the tree persists
-        // across horizons since 2026-09-12; `at_horizon` alone has no tree).
-        let levels = Level::parse_ladder("x2y2r0sx,y2r0sx,r0sx,r1sx,rxsx").expect("ladder");
-        let with_pos = find_optimum(make_engine, make_initial, dir, 1, 14, &levels[..4]).expect("ladder");
+        let outcome = Ladder::new(engine, initial, dir, &levels).at_horizon(h).expect("ladder");
+        assert_eq!(outcome, HorizonOutcome::Confirmed, "the synthetic win");
+        let before: Vec<(usize, u64)> = (0..levels.len()).map(|l| marks(l).fingerprint()).collect();
+        let tree1 = tree(1);
+        // The deadlines are in the file: some level-0 state's runs out before
+        // the horizon.
+        let m0 = marks(0);
+        assert!(
+            m0.entries().iter().any(|&(s, c, k)| m0.deadline(s, k, c).is_some_and(|d| u32::from(d) < h)),
+            "level 0's marks lost their deadlines"
+        );
+        // Interrupted after level 0: everything the finer levels left goes.
+        let hdir = dir.join(format!("h{h:03}"));
+        std::fs::remove_file(hdir.join("outcome.txt")).expect("outcome");
+        for l in 1..levels.len() {
+            std::fs::remove_dir_all(hdir.join(format!("level{l:02}"))).expect("level dir");
+            let m = marks_path(dir, h, l);
+            std::fs::remove_file(m.with_extension("win")).expect("win");
+            std::fs::remove_file(&m).expect("marks");
+        }
+        let outcome = Ladder::new(engine, initial, dir, &levels).at_horizon(h).expect("resumed ladder");
+        assert_eq!(outcome, HorizonOutcome::Confirmed);
+        let after: Vec<(usize, u64)> = (0..levels.len()).map(|l| marks(l).fingerprint()).collect();
+        assert_eq!(after, before, "the resumed ladder's marks");
+        assert_eq!(tree(1), tree1, "level 1 under level 0's marks from the file");
         let _ = std::fs::remove_dir_all(dir);
-        let dir2 = std::path::Path::new("/var/tmp/celeste-frame-ladder-pos-test-ref");
-        let _ = std::fs::remove_dir_all(dir2);
-        std::fs::create_dir_all(dir2).expect("checkpoint dir");
-        let make_engine2 = |precision: Level| {
-            crate::interpreter::abstraction::set_level(precision);
-            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?) as Box<dyn FrameStep>)
-        };
-        let make_initial2 = || {
-            Ok(vec![Block::from_state(&crate::trace::refengine::RefEngine::new()?.initial_state()?)?])
-        };
-        let plain = Level::parse_ladder("r0sx,r1sx,rxsx").expect("ladder");
-        let without = find_optimum(make_engine2, make_initial2, dir2, 1, 14, &plain[..2]).expect("ladder");
-        let _ = std::fs::remove_dir_all(dir2);
-        eprintln!("[ladder] optimum through the position rung {with_pos:?}, without {without:?}");
-        assert!(with_pos.is_some(), "the position rung lost the synthetic win");
-        assert_eq!(with_pos, without, "the position rung changed the answer");
-        // Counting down from a ceiling finds the same optimum.
-        let dir3 = std::path::Path::new("/var/tmp/celeste-frame-ladder-pos-test-down");
-        let _ = std::fs::remove_dir_all(dir3);
-        std::fs::create_dir_all(dir3).expect("checkpoint dir");
-        let make_engine3 = |precision: Level| {
-            crate::interpreter::abstraction::set_level(precision);
-            Ok(Box::new(crate::compiled::FrameEngine::new_for_start_room()?) as Box<dyn FrameStep>)
-        };
-        let make_initial3 = || {
-            Ok(vec![Block::from_state(&crate::trace::refengine::RefEngine::new()?.initial_state()?)?])
-        };
-        let down = find_optimum_from_ceiling(make_engine3, make_initial3, dir3, 14, &levels[..4]).expect("ladder");
-        let _ = std::fs::remove_dir_all(dir3);
-        assert_eq!(Some(down), with_pos, "counting down from the ceiling changed the answer");
+    }
+
+    /// A marks file round-trips every state's deadline; one without a deadline
+    /// comes back at the horizon, which filters alike (no level runs past it).
+    #[test]
+    fn marks_files_keep_their_deadlines() {
+        let path = std::env::temp_dir().join(format!("celeste-marks-roundtrip-{}.bin", std::process::id()));
+        let mut v = Visited::new();
+        v.insert_until(1, (2, 3), 4, 7);
+        v.insert_until(1, (5, 6), 4, 12);
+        v.insert(9, (2, 3), 8);
+        v.save(&path, 12).expect("save");
+        let w = Visited::load(&path).expect("load");
+        std::fs::remove_file(&path).expect("rm");
+        assert_eq!(w.fingerprint(), v.fingerprint());
+        assert_eq!(w.deadline(1, (2, 3), 4), Some(7));
+        assert_eq!(w.deadline(1, (5, 6), 4), Some(12));
+        assert_eq!(w.deadline(9, (2, 3), 8), Some(12), "no deadline: the horizon");
+        // A file from before the deadlines: the set, no deadlines.
+        let old: Vec<(u64, u32, u64, u64)> = vec![(1, 4, 2, 3)];
+        crate::search::checkpoint::save_value_to(&path, &old).expect("save");
+        let w = Visited::load(&path).expect("load");
+        std::fs::remove_file(&path).expect("rm");
+        assert_eq!(w.deadline(1, (2, 3), 4), Some(u16::MAX));
     }
 
     /// forward_resume, extending a checkpointed forward, reproduces a fresh run:

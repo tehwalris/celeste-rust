@@ -1,18 +1,12 @@
-//! Kernel runtime (plans/kernel-plan.md K1): the typed lane primitives the
-//! generated steady-shape kernel (`kernel_gen.rs`) is emitted against.
+//! The 16-lane primitives: the reference semantics the ASM codegen's ops
+//! are checked against (`transpile::asm::tests`), the call-outs the
+//! assembled kernels make (collisions, map reads), and the kernels' per-call
+//! dedup cache (`RowCache`).
 //!
-//! Types are STATIC - the emitter proved every value's type at emit time
-//! against the shape witness, so nothing here carries a tag. Lanes = ROWS
-//! (W = 16 x i32 = one zmm). All ops are per-lane loops over `Pico8Num`'s
-//! own operators, so the semantics are inherited from the certified scalar
-//! implementations rather than re-derived; LLVM autovectorizes the loops
-//! (verified by disassembly in K2), and only measured-hot loops get manual
-//! intrinsics.
-//!
-//! Deopt is a per-lane mask (bit i = lane i must be re-run by the
-//! reference interpreter). Nothing in this module panics on abstract-domain
-//! limits - a limit is a deopt, not an error; panics are reserved for
-//! contract violations (emitter bugs).
+//! Types are STATIC - nothing here carries a tag. Lanes = ROWS (W = 16 x
+//! i32 = one zmm). The ops are built on `Pico8Num`'s own operators, so the
+//! semantics are inherited from the scalar implementation rather than
+//! re-derived.
 
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
@@ -125,10 +119,6 @@ fn m512(v: i32) -> __m512i {
 #[inline(always)]
 pub fn zn_splat(v: P8) -> ZN {
     ZN(m512(v.as_raw_u32() as i32))
-}
-#[inline(always)]
-pub fn zb_splat(b: bool) -> ZB {
-    ZB { val: if b { ALL } else { 0 }, known: ALL }
 }
 
 // ---- 16-lane PICO-8 arithmetic ----
@@ -718,14 +708,6 @@ impl RowCache {
     }
 
 
-    /// Insert `k` with `tag`: `None` if it was not present (it is now, or
-    /// it evicted the oldest of its probe window), `Some(tag of the first
-    /// insert)` if it was.
-    #[inline(always)]
-    pub fn insert_tagged(&mut self, k: (u64, u64), tag: u32) -> Option<u32> {
-        self.insert_ref(k, tag, 0).map(|(t, _)| t)
-    }
-
     /// Set the ref of `k`'s entry. A miss (evicted since) is fine: the
     /// next emission of `k` will push the row again.
     #[inline(always)]
@@ -741,8 +723,9 @@ impl RowCache {
         }
     }
 
-    /// `insert_tagged` with a ref: `Some((tag, ref) of the first insert)`
-    /// if `k` was present.
+    /// Insert `k` with `tag` and ref `r`: `None` if it was not present (it
+    /// is now, or it evicted the oldest of its probe window), `Some((tag,
+    /// ref) of the first insert)` if it was.
     #[inline(always)]
     pub fn insert_ref(&mut self, k: (u64, u64), tag: u32, r: u64) -> Option<(u32, u64)> {
         let base = k.0 as usize;

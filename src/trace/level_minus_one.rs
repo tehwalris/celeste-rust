@@ -1,6 +1,8 @@
 //! LEVEL -1 (plans/level-minus-one.md): a POSITION-ONLY cost-to-go table for
-//! the start room, computed from the traced frame graphs. A PROBE: nothing in
-//! the search reads it.
+//! the start room, computed from the traced frame graphs. The search reads it
+//! as a filter (`CELESTE_LEVEL_MINUS_ONE="H,S"`, `frame::level_minus_one`:
+//! a cell that provably cannot exit by H is dropped); `transpile
+//! --level-minus-one` checks and reports it (`probe`).
 //!
 //! A node is (heap shape, cell of the located object - the player, or the
 //! player spawn). Every other input of the frame is a RANGE (numbers) or
@@ -1554,28 +1556,20 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
     }
 
     // The comparison with the tree.
-    use crate::search::checkpoint::FrameFile;
-    let marks: Option<rustc_hash::FxHashSet<(u64, u32, u64, u64)>> = match &opts.marks {
+    let marks = match &opts.marks {
         Some(p) => {
-            let v: Vec<(u64, u32, u64, u64)> = crate::search::checkpoint::load_value_from(p)?;
+            let v = crate::frame::Visited::load(p)?;
             say!(rep, "\n{} marked states in {}", v.len(), p.display())?;
-            Some(v.into_iter().collect())
+            Some(v)
         }
         None => None,
     };
     say!(rep, "\nframe | states | too late (f + d > {}) | no exit path | band {},8 cut | death (kept) | left the room | other shape | not in the table | marked | MARKED TOO LATE", opts.ceiling, opts.ceiling)?;
     let mut samples: BTreeSet<String> = BTreeSet::new();
     for f in opts.from..=opts.to {
-        let fdir = opts.level_dir.join("frames").join(format!("f{f:03}"));
         let (mut states, mut late, mut nopath, mut band, mut dead, mut left, mut other, mut missing) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         let (mut marked, mut marked_late) = (0u64, 0u64);
-        for e in std::fs::read_dir(&fdir)? {
-            let p = e?.path();
-            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
-            if !(name.starts_with('s') && name.ends_with(".bin")) {
-                continue;
-            }
-            let ff = FrameFile::open(&p)?;
+        for (_, ff) in crate::frame::frame_files(&opts.level_dir, f)? {
             let id = by_hash.get(&ff.shape_hash()).copied();
             let mut late_cells: rustc_hash::FxHashSet<u32> = Default::default();
             for (cell, rows) in ff.cell_counts() {
@@ -1627,7 +1621,7 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
             if let Some(m) = &marks {
                 let shape = ff.shape_hash();
                 for (cell, key) in ff.cell_keys() {
-                    if m.contains(&(shape, cell, key.0, key.1)) {
+                    if m.contains(shape, key, cell) {
                         marked += 1;
                         if late_cells.contains(&cell) {
                             marked_late += 1;

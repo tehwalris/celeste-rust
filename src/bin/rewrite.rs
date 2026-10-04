@@ -466,7 +466,7 @@ enum Command {
         /// Stop once a win is reached (default), else follow to the end.
         #[arg(long, default_value_t = true)]
         stop_at_win: bool,
-        /// The level the keyed lines are projections onto (e.g. `r6sxht`).
+        /// The level the keyed lines are projections onto (e.g. `r6sxhn`).
         #[arg(long, value_parser = Level::parse)]
         spec: Option<Level>,
     },
@@ -488,7 +488,7 @@ enum Command {
         #[arg(long, default_value_t = 16)]
         level: usize,
         /// The level's spec as the ladder gave it (`CELESTE_LADDER`'s entry,
-        /// e.g. `r5sxht`). Absent: `Bits(level)`, or Exact from 16 - the
+        /// e.g. `r5sxhn`). Absent: `Bits(level)`, or Exact from 16 - the
         /// default ladder's levels.
         #[arg(long, value_parser = Level::parse)]
         spec: Option<Level>,
@@ -1307,14 +1307,14 @@ fn main() -> Result<()> {
             if let Some(out) = save_dir {
                 std::fs::create_dir_all(out)?;
                 let ts = std::time::Instant::now();
-                // Rows as the marks files with distances hold them (`ui_export::MarksMap`).
+                // Marks files (`Visited::save`), each state with its deadline.
                 let save = |name: &str, ids: &[(u64, u16)]| -> Result<usize> {
-                    let mut rows: Vec<(u64, u32, u64, u64, u32)> = Vec::with_capacity(ids.len());
+                    let mut marks = Visited::new();
                     celeste_rust::search::edges::resolve_ids(&files, ids, |shape, key, cell, last| {
-                        rows.push((shape, cell, key.0, key.1, horizon - last as u32))
+                        marks.insert_until(shape, key, cell, last);
                     })?;
-                    celeste_rust::search::checkpoint::save_value_to(&out.join(name), &rows)?;
-                    Ok(rows.len())
+                    marks.save(&out.join(name), horizon)?;
+                    Ok(marks.len())
                 };
                 let mut l0: Vec<(u64, u16)> = deadline.as_ref().expect("--marked-only").iter().map(|(&id, &t)| (id, t)).collect();
                 l0.sort_unstable();

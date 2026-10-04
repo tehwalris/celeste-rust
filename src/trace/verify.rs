@@ -22,11 +22,15 @@
 use anyhow::{anyhow, bail, Result};
 use full_moon::ast;
 
-use crate::transpile::graph::{Graph, NodeId};
+use crate::transpile::graph::NodeId;
+#[cfg(test)]
+use crate::transpile::graph::Graph;
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
-use super::iface::{self, Conc, Iface, Path, Step};
+use super::iface::{self, Conc, Iface, Path};
+#[cfg(test)]
+use super::iface::Step;
 use super::interp::{Flow, Interp};
 use super::state::State;
 
@@ -1769,6 +1773,7 @@ fn rebuild_all(d: &mut Symbolic, cone: &[NodeId], subst: &rustc_hash::FxHashMap<
 /// The player is the object with a `djump` field. Naming it by
 /// position would be wrong the moment an object dies: `objects` is a
 /// list and things are deleted from it.
+#[cfg(test)]
 pub fn find_player<D: Domain>(st: &State<D>) -> Option<Path> {
     let objs = vec![iface::key("objects")];
     let Some(Value::Table(t)) = iface::get(st, &objs) else { return None };
@@ -1792,6 +1797,7 @@ pub fn find_player<D: Domain>(st: &State<D>) -> Option<Path> {
 /// a key is dispatchable only to blocks the engine has partitioned on
 /// exactly these cells; drop one here and the pin's error still catches
 /// the mismatch, but every such block declines instead of running.
+#[cfg(test)]
 pub fn pm1_paths(player: &Path) -> Vec<Path> {
     let mut v: Vec<Path> = vec![vec![iface::key("has_dashed")], vec![iface::key("freeze")]];
     for f in ["dash_time", "djump", "p_dash", "p_jump"] {
@@ -1805,6 +1811,7 @@ pub fn pm1_paths(player: &Path) -> Vec<Path> {
 /// The pm1 key a state is IN: the six paths at the values it holds.
 /// Compiling for a different key means handing `trace_frame` a different
 /// value list, not a different state.
+#[cfg(test)]
 pub fn pm1_key(player: &Path, st: &State<Symbolic>, d: &Symbolic) -> Result<Vec<(Path, Conc)>> {
     let mut out = Vec::new();
     for p in pm1_paths(player) {
@@ -1825,6 +1832,7 @@ pub fn pm1_key(player: &Path, st: &State<Symbolic>, d: &Symbolic) -> Result<Vec<
 }
 
 /// Write a concrete button assignment, for the oracle side.
+#[cfg(test)]
 pub fn set_buttons(d: &mut Symbolic, st: &mut State<Symbolic>, bits: &[bool; 6]) -> Result<()> {
     for (i, b) in bits.iter().enumerate() {
         let v = d.boolean(*b);
@@ -1840,6 +1848,7 @@ pub fn set_buttons(d: &mut Symbolic, st: &mut State<Symbolic>, bits: &[bool; 6])
 /// Checking the graph only at the values it was traced at would pass for
 /// a graph that had folded every one of them away, which is the one bug
 /// the whole design is exposed to.
+#[cfg(test)]
 pub fn cells_with(iface: &Iface, over: &[(Path, Conc)]) -> Result<Vec<Conc>> {
     let mut v = iface.init.clone();
     for (p, c) in over {
@@ -1859,6 +1868,7 @@ pub fn cells_with(iface: &Iface, over: &[(Path, Conc)]) -> Result<Vec<Conc>> {
 /// into a fresh graph, and the map to it. The buttons are the forks
 /// `Symbolic::unknown_bool` minted, in the order `__reset_button_states`
 /// asked for them; every other fork is left standing.
+#[cfg(test)]
 pub fn at_buttons(g: &Graph, f: &Frame, bits: &[bool; 6]) -> Result<(Graph, Vec<NodeId>)> {
     let buttons: Vec<u8> = f.fork_origins.iter().filter(|(_, o)| o == super::domain::UNKNOWN_BOOL_ORIGIN).map(|(d, _)| *d).collect();
     if buttons.len() != 6 {
@@ -1880,6 +1890,7 @@ pub fn at_buttons(g: &Graph, f: &Frame, bits: &[bool; 6]) -> Result<(Graph, Vec<
 /// outcome index so a caller can tell whether the guards ever
 /// discriminate, and the count so it can tell "agreed about everything"
 /// from "agreed about nothing, because the paths did not line up".
+#[cfg(test)]
 pub fn check_at(
     it: &Interp<'_, Symbolic>,
     f: &Frame,
@@ -2503,22 +2514,16 @@ mod tests {
                 player = Some(p);
                 break;
             }
-            st = match run_one(&mut it, &frame, st) {
-                Ok(s) => s,
-                Err(e) => return eprintln!("[keys] warm-up stopped at: {:#}", e),
-            };
+            st = run_one(&mut it, &frame, st).unwrap_or_else(|e| panic!("[keys] warm-up stopped at: {e:#}"));
         }
-        let Some(player) = player else { return eprintln!("[keys] no player") };
+        let player = player.expect("[keys] a player within 40 warm-up frames");
         let paths = pm1_paths(&player);
         let mut roots: Vec<Path> = vec![player.clone()];
         for g in ["freeze", "has_dashed", "frames", "will_restart", "delay_restart", "max_djump"] {
             roots.push(vec![iface::key(g)]);
         }
 
-        let k0: Vec<Conc> = match pm1_key(&player, &st, &it.d) {
-            Ok(k) => k.into_iter().map(|(_, c)| c).collect(),
-            Err(e) => return eprintln!("[keys] pm1 key: {:#}", e),
-        };
+        let k0: Vec<Conc> = pm1_key(&player, &st, &it.d).unwrap_or_else(|e| panic!("[keys] pm1 key: {e:#}")).into_iter().map(|(_, c)| c).collect();
         let show_key = |k: &[Conc]| -> String {
             paths
                 .iter()
@@ -2807,10 +2812,11 @@ end
     /// -folded every input away, and re-tracing per point would not test
     /// anything: the claim is that ONE graph answers for all of them.
     ///
-    /// Still a PROBE where it cannot get far enough - it prints and
-    /// returns rather than panicking, because each stop names the next
-    /// thing to implement and a panic hides the ones behind it. Anything
-    /// it does reach, it asserts about.
+    /// Every step up to the comparison must succeed - the warm-up, the
+    /// trace, the oracle at every point: a step that stopped used to print
+    /// and RETURN, which passed the test without comparing anything. A point
+    /// the trace DECLINES is a refusal, counted (and bounded below), not a
+    /// wrong answer.
     #[test]
     fn a_traced_frame_agrees_with_the_oracle() {
         let src = cart::sources().expect("sources");
@@ -2842,14 +2848,9 @@ end
                 player = Some((n, p));
                 break;
             }
-            st = match run_one(&mut it, &frame, st) {
-                Ok(s) => s,
-                Err(e) => return eprintln!("[verify] warm-up frame {} stopped at: {:#}", n, e),
-            };
+            st = run_one(&mut it, &frame, st).unwrap_or_else(|e| panic!("[verify] warm-up frame {n} stopped at: {e:#}"));
         }
-        let Some((warm, player)) = player else {
-            return eprintln!("[verify] no player after 40 frames");
-        };
+        let (warm, player) = player.expect("[verify] a player within 40 warm-up frames");
         eprintln!("[verify] player at {} after {} warm-up frames", iface::show(&player), warm);
 
         // The rest of the frame's INPUT state. Everything else reachable
@@ -2875,10 +2876,8 @@ end
         }
 
         let before = it.d.graph.len();
-        let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], None, &[]) {
-            Ok(f) => f,
-            Err(e) => return eprintln!("[verify] symbolic frame stopped at: {:#}", e),
-        };
+        let f = trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], None, &[])
+            .unwrap_or_else(|e| panic!("[verify] symbolic frame stopped at: {e:#}"));
         eprintln!(
             "[verify] {} input cells, {} outcome(s), {} nodes ({} new)",
             f.iface.slots.len(),
@@ -3057,24 +3056,12 @@ end
                     };
                     iface::set(&mut o, p, v).expect("override a heap slot");
                 }
-                if let Err(e) = set_buttons(&mut it.d, &mut o, &bits) {
-                    return eprintln!("[verify] {} {:?}: {:#}", label, bits, e);
-                }
-                let mut o = match run_one(&mut it, &frame, o) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return eprintln!("[verify] oracle {} {:?} stopped at: {:#}", label, bits, e)
-                    }
-                };
+                set_buttons(&mut it.d, &mut o, &bits).unwrap_or_else(|e| panic!("[verify] {label} {bits:?}: {e:#}"));
+                let mut o = run_one(&mut it, &frame, o).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} stopped at: {e:#}"));
                 // The absent-as-zero fields, as every frame's outcomes write
                 // them (`trace_frame`, `refdriver::run_frame_all`).
                 crate::trace::widen::materialize_absent_fields(&mut o, &mut it.d).expect("materialize the absent fields");
-                let want = match iface::read_concrete(&it.d, &o, &[]) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        return eprintln!("[verify] oracle {} {:?} not concrete: {:#}", label, bits, e)
-                    }
-                };
+                let want = iface::read_concrete(&it.d, &o, &[]).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} not concrete: {e:#}"));
                 match check_at(&it, &f, &at[mask as usize], &cells, &bits, &want) {
                     Ok((which, n)) => {
                         checked += 1;

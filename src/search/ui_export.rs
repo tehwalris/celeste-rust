@@ -431,13 +431,13 @@ fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> Result<T> + Sync) -> Result<V
     Ok(all.into_iter().map(|p| p.1).collect())
 }
 
-/// A marks file, mapped. `Visited::save` writes `(shape, cell, k0, k1)`
-/// rows (28 bytes each); trees from when the marks carried their distance
-/// hold `(shape, cell, k0, k1, dist)` rows (32 bytes). The bincode `Vec`
-/// length prefix says which:
-/// the payload is `n x 32` or `n x 28`, never both. Rows are read in
-/// place, never deserialized as a whole: a level's marks run to 100M rows
-/// (room (6,0) h144: 1.5-2.8 GB per file).
+/// A marks file, mapped. `Visited::save` writes `(shape, cell, k0, k1,
+/// dist)` rows (32 bytes each) followed by the horizon (4 bytes); older
+/// trees hold the rows alone, 32 bytes with the distance or 28 without. The
+/// bincode `Vec` length prefix says which: the payload is `n x 32 + 4`,
+/// `n x 32` or `n x 28`. Rows are read in place, never deserialized as a
+/// whole: a level's marks run to 100M rows (room (6,0) h144: 1.5-2.8 GB per
+/// file).
 struct MarksMap {
     map: memmap2::Mmap,
     rows: usize,
@@ -458,7 +458,7 @@ impl MarksMap {
         anyhow::ensure!(payload.len() >= 8, "{}: too short for a marks file", path.display());
         let n = u64::from_le_bytes(payload[0..8].try_into().unwrap());
         let body = payload.len() as u64 - 8;
-        let stride = if n.checked_mul(32) == Some(body) {
+        let stride = if n.checked_mul(32) == Some(body) || n.checked_mul(32).and_then(|b| b.checked_add(4)) == Some(body) {
             32
         } else if n.checked_mul(28) == Some(body) {
             28
@@ -1154,6 +1154,15 @@ mod tests {
         assert!(t.cells.contains(&(8, 4)) && !t.cells.contains(&(8, 3)));
         assert_eq!(by_cell_dist[0], vec![(3, 0, 2), (4, 0, 1)], "no distances: dist 0");
         assert_eq!(by_cell_dist[1], vec![(3, 1, 1), (3, 2, 1)], "sorted by (dist, cell)");
+        // Today's layout (`Visited::save`: the rows, then the horizon): the
+        // distance is the horizon minus the deadline.
+        let c = dir.join("c.bin");
+        let mut v = crate::frame::Visited::new();
+        v.insert_until(10, (3, 4), 5, 7);
+        v.save(&c, 9).unwrap();
+        let m = MarksMap::open(&c).unwrap();
+        assert!(m.have_dist());
+        assert_eq!((m.rows, m.row(0)), (1, ((10, 5, (3, 4)), 2)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

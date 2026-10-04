@@ -1,14 +1,12 @@
-//! The reference interpreter, and the game setup it needs.
+//! The interpreter's `State` model (heap, values, state), the ladder's
+//! levels (`interpreter::abstraction`), and the game setup (`game_runner`:
+//! the start room, the Lua sources).
 //!
-//! This is the ORACLE: the thing the compiled path is checked against, and
-//! ultimately the definition of what the program means. It sits above
-//! `celeste-core` and below everything that transforms or compiles - the
-//! emitters and the search all depend on it, and it depends on none of them.
-//!
-//! The instrumentation modules travel with it because they instrument it:
-//! `op_census` alone has ~100 call sites inside the interpreter. Several
-//! of them keep process-global state, which is why the test suite has to
-//! run under nextest (one process per test) rather than cargo test.
+//! The reference engine itself is `trace::refengine` in celeste-rust; this
+//! crate is the state representation it and the bridge to the block model
+//! (`compiled::bridge`) speak. The process-global level
+//! (`abstraction::set_level`) is why the test suite runs under nextest (one
+//! process per test) rather than cargo test.
 
 #[macro_use(anyhow)]
 extern crate anyhow;
