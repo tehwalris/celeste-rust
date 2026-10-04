@@ -67,6 +67,40 @@ rotate" distributes over unions (`search::arcs`).
    remainder-free forward filtered by the previous rung's (forward n W)
    nodes. The remainder is exact at every rung - no drift, no rem rungs.
 
+## Built (2026-10-04)
+
+* Recording: `CELESTE_ARC_EDGES=1` on any forward (`search::arc_edges`, 50 B
+  per record beside the edge runs). Checked by `rewrite arc-check` (every edge
+  has its record and back; sampled transfers probed against the reference
+  engine inside and outside the guards): room (1,0) gate, and room (3,3) with
+  exact objects f1-f80 (207M records, 34k probes, 0 disagreements).
+* `rewrite arc-search --level-dir D --horizon H --marked-only`: the level's
+  remainder-free BFS gives the nodes that can win at all and their deadlines;
+  only edges between them are loaded (parallel, streamed, dense indices).
+* `search::arcs::Region`: a set of the torus in CANONICAL form (y slabs, each
+  with its x segments), built in one sweep from pieces; `pull` is the
+  preimage under an edge. Equal sets are equal values.
+* `search::arc_dp::backward`: dense CSR graph, a parallel pull per node,
+  INCREMENTAL - a frame recomputes only the predecessors of nodes whose set
+  changed and the nodes whose deadline starts; the rest share the set.
+* `arc_dp::optimum`: ONE backward gives the optimum: the graph is the same at
+  every frame but for the layers, which never bind on a walk from the start
+  (k steps reach layer <= k), so `point in W_t(start)` means "a win within
+  `H - t`" and the optimum is `H - max t`. The witness is a greedy walk inside
+  W (never backtracks). Property-tested against per-horizon backwards.
+
+Measured (quick profile, room (3,3), objects abstract `r0sxhn`):
+
+| case | edges | load | backward | total | peak |
+|---|---|---|---|---|---|
+| synthetic win (19,23), h88 | 66M | 4.3 s | 1.6 s | 6.4 s | 5.6 GB |
+| same, h110 | 324M | 33 s | 17.5 s | 55 s | 27 GB |
+| real exit, h171 | 346M | 66 s (38 s reading 139 GB of records) | 5.7 s | 74 s | 29 GB |
+
+The synthetic case answers f69, as the full object ladder does (level 1
+refutes 68). Room (3,3) h171: REFUTED; h172: a win at f172 (the reference).
+W's fragmentation stays small: median 1-6 rectangles per node, max ~300.
+
 ## Open
 
 * W's fragmentation (rectangles per node) - the number that decides the cost.
