@@ -139,6 +139,22 @@ pub struct Interp<'a, D: Domain> {
     pub merge_fallbacks: usize,
     /// Literal splits handed out: the ids in `State::frag`.
     next_split: usize,
+    /// THE ARC CAPTURE (`search::arc_edges`): set per frame trace by
+    /// `verify::trace_frame` (a level-0 trace in arc mode). Every
+    /// `__split_by_flr` must then name its site (`split_site_of`), and the
+    /// player's own record what they did on the state (`State::arc`).
+    pub arc_capture: bool,
+    /// The site of the `__split_by_flr` call being made: set by the call
+    /// (`walk_suffixes`) from the argument's syntax, taken by the builtin.
+    split_site: Option<SplitSite>,
+}
+
+/// What a `__split_by_flr` call splits, read off its argument `obj.rem.x`
+/// (resp. `.y`): the PLAYER's remainder on an axis, or another object's.
+#[derive(Clone, Copy, Debug)]
+enum SplitSite {
+    Player(usize),
+    Other,
 }
 
 impl<'a, D: Domain> Interp<'a, D> {
@@ -166,6 +182,8 @@ impl<'a, D: Domain> Interp<'a, D> {
             room_flags: std::collections::HashMap::new(),
             merge_fallbacks: 0,
             next_split: 0,
+            arc_capture: false,
+            split_site: None,
         }
     }
 
@@ -1459,6 +1477,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                             argsets = grown;
                         }
                         for (st, args) in argsets {
+                            if self.arc_capture && matches!(val, Value::Builtin("__split_by_flr")) {
+                                self.split_site = Some(self.split_site_of(arguments, &st)?);
+                            }
                             let got = self
                                 .call_value(val.clone(), args, st)
                                 .map_err(|e| anyhow!("calling {}: {:#}", path, e))?;
@@ -1734,6 +1755,50 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(rest)
     }
 
+    /// THE ARC CAPTURE: what a `__split_by_flr(obj.rem.x)` call splits. Its
+    /// argument must be spelled `<name>.rem.<x|y>` - the cart's `move` - so
+    /// the object is the one `<name>` holds, compared BY IDENTITY with the
+    /// `player` instance (not `player_spawn`, whose remainder is its own).
+    /// Any other spelling is refused: a split nobody can attribute.
+    fn split_site_of(&mut self, arguments: &'a full_moon::ast::punctuated::Punctuated<ast::Expression>, st: &State<D>) -> Result<SplitSite> {
+        let args: Vec<&ast::Expression> = arguments.iter().collect();
+        let spelled = match args.as_slice() {
+            [ast::Expression::Var(v)] => target_hint(v),
+            _ => None,
+        };
+        let parts: Vec<String> = spelled.as_deref().unwrap_or("").split('.').map(str::to_string).collect();
+        let (obj, axis) = match parts.as_slice() {
+            [obj, rem, axis] if rem == "rem" && (axis == "x" || axis == "y") => (obj.clone(), if axis == "x" { 0 } else { 1 }),
+            _ => bail!("arc capture: a `__split_by_flr` whose argument is not `<obj>.rem.<x|y>` ({spelled:?}): no way to tell whose remainder it splits"),
+        };
+        let Value::Table(t) = self.read_name(&obj, st) else { bail!("arc capture: `{obj}` in `__split_by_flr({obj}.rem..)` is not a table") };
+        let players = super::widen::objects_of_type(st, "player");
+        anyhow::ensure!(players.len() <= 1, "arc capture: {} player objects", players.len());
+        let is_player = players.first().is_some_and(|p| super::iface::get(st, p) == Some(Value::Table(t)));
+        Ok(if is_player { SplitSite::Player(axis) } else { SplitSite::Other })
+    }
+
+    /// THE ARC CAPTURE: the player's split on `axis` took fragment `v` of
+    /// `x`; record it, with the move's `ox`/`oy` (the speed it applies), on
+    /// the path. A second one on the same axis in one path (a moving platform
+    /// carrying the player) is refused: one rotation per axis per frame is
+    /// what an arc edge describes.
+    fn capture_player_split(&mut self, st: &mut State<D>, axis: usize, x: &D::Num, v: &D::Num) -> Result<()> {
+        let name = if axis == 0 { "ox" } else { "oy" };
+        let Value::Num(ox) = self.read_name(name, st) else { bail!("arc capture: the player's split on axis {axis} has no number `{name}` in scope") };
+        let Some(arc) = st.arc.as_mut() else { bail!("arc capture: a player split on a path that does not capture") };
+        let a = &mut arc[axis];
+        anyhow::ensure!(
+            self.d.decide(&a.took) == Some(false),
+            "arc capture: a second split of the player's remainder on axis {axis} in one path (a moving platform carrying the player?) - one rotation per axis per frame is all an arc edge describes"
+        );
+        a.took = self.d.boolean(true);
+        a.pre = x.clone();
+        a.frag = v.clone();
+        a.ox = ox;
+        Ok(())
+    }
+
     fn call_builtin(
         &mut self,
         name: &'static str,
@@ -1913,12 +1978,25 @@ impl<'a, D: Domain> Interp<'a, D> {
             // this body cannot run it.
             "__split_by_flr" | "__split_at" => {
                 let x = num(0)?;
+                // The arc capture's site (`split_site_of`), set by the call.
+                let site = match (self.arc_capture && name == "__split_by_flr", self.split_site.take()) {
+                    (false, _) => None,
+                    (true, Some(site)) => Some(site),
+                    (true, None) => bail!("arc capture: a `__split_by_flr` call the tracer did not see the argument of"),
+                };
+                let player_axis = match site {
+                    Some(SplitSite::Player(axis)) => Some(axis),
+                    _ => None,
+                };
                 // A value every lane holds alike (a literal interval at a
                 // fruit-unknown set, plans/fly-fruit.md): each fragment runs as
                 // its own trace state and they rejoin when the enclosing call
                 // returns (`rejoin_fragments`), so the split multiplies no
                 // configuration of the frame.
                 if let Some(frags) = self.d.literal_fragments(&x)? {
+                    // Its fragments rejoin into one hull: no body would hold
+                    // the piece it took.
+                    anyhow::ensure!(player_axis.is_none(), "arc capture: the player's remainder split on axis {player_axis:?} is a literal split");
                     if frags.len() == 1 {
                         return Ok(vec![(st, Value::Num(frags[0].clone()))]);
                     }
@@ -1935,6 +2013,10 @@ impl<'a, D: Domain> Interp<'a, D> {
                         .collect());
                 }
                 if !self.d.is_interval(&x) {
+                    let mut st = st;
+                    if let Some(axis) = player_axis {
+                        self.capture_player_split(&mut st, axis, &x, &x)?;
+                    }
                     (st, args[0].clone())
                 } else {
                     // The fork's coverage is its own error, derived from the
@@ -1945,6 +2027,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                     self.d.evaluated_at(&v, &at);
                     let mut st = st;
                     st.guard = self.d.and(&st.guard, &valid);
+                    if let Some(axis) = player_axis {
+                        self.capture_player_split(&mut st, axis, &x, &v)?;
+                    }
                     (st, Value::Num(v))
                 }
             }
@@ -2158,7 +2243,7 @@ mod tests {
         let scope = heap.new_scope(None);
         let t = d.boolean(true);
         let f = d.boolean(false);
-        State { heap, globals, scope, stack: Vec::new(), guard: t, ended: f, path: Vec::new(), key_override: Vec::new(), frag: Vec::new() }
+        State { heap, globals, scope, stack: Vec::new(), guard: t, ended: f, path: Vec::new(), key_override: Vec::new(), frag: Vec::new(), arc: None }
     }
 
     /// Run `src` and read back the global `result`.

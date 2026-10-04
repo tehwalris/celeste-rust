@@ -110,6 +110,42 @@ pub struct State<D: Domain> {
     /// merge in `collapse`, and rejoin when the call that split them returns
     /// (`Interp::rejoin_fragments`).
     pub frag: Vec<(usize, usize, u16)>,
+    /// THE ARC CAPTURE (`search::arc_edges`, `CELESTE_ARC_EDGES=1`): per
+    /// axis (x, y), what this path's split of the PLAYER's own remainder did
+    /// (`Interp::capture_player_split`). `None` when the trace does not
+    /// capture - every trace but a level-0 one in arc mode. Not in the heap,
+    /// so no shape, key or fingerprint sees it; merged per case like `ended`.
+    pub arc: Option<Box<[ArcAxis<D>; 2]>>,
+}
+
+/// One axis of the arc capture: whether the path took the player's split on
+/// it, and if so the split's argument (`rem + ox + 1/2`), the fragment it
+/// took, and the move's `ox` (`search::arc_edges::RawAxis`).
+pub struct ArcAxis<D: Domain> {
+    pub took: D::Bool,
+    pub pre: D::Num,
+    pub frag: D::Num,
+    pub ox: D::Num,
+}
+
+impl<D: Domain> ArcAxis<D> {
+    /// No split taken (the values are placeholders).
+    pub fn none(d: &mut D) -> Self {
+        let zero = d.num(crate::pico8_num::Pico8Num::from_i16(0));
+        ArcAxis { took: d.boolean(false), pre: zero.clone(), frag: zero.clone(), ox: zero }
+    }
+}
+
+impl<D: Domain> Clone for ArcAxis<D> {
+    fn clone(&self) -> Self {
+        ArcAxis { took: self.took.clone(), pre: self.pre.clone(), frag: self.frag.clone(), ox: self.ox.clone() }
+    }
+}
+
+impl<D: Domain> PartialEq for ArcAxis<D> {
+    fn eq(&self, o: &Self) -> bool {
+        self.took == o.took && self.pre == o.pre && self.frag == o.frag && self.ox == o.ox
+    }
 }
 
 /// How many leading decisions two states share.
@@ -173,6 +209,7 @@ impl<D: Domain> Clone for State<D> {
             path: self.path.clone(),
             key_override: self.key_override.clone(),
             frag: self.frag.clone(),
+            arc: self.arc.clone(),
         }
     }
 }
@@ -432,6 +469,25 @@ fn merge_inner<D: Domain>(
             (root, key) => bail!("merge: slot {} written into {root:?}", key.at(root)),
         }
     }
+    // The arc capture, per case: a select only on a condition the lanes
+    // decide (as the heap's values: refused, two successors, otherwise).
+    // Fragments of a literal split differing in it did not rejoin.
+    let arc = match (&t.arc, &f.arc) {
+        (None, None) => None,
+        (Some(a), Some(b)) if a == b => Some(a.clone()),
+        (Some(_), Some(_)) if rejoin => bail!("merge: a literal split's fragments differ in the player's remainder split (the arc capture)"),
+        (Some(_), Some(_)) if refuse_selects => return Ok(None),
+        (Some(a), Some(b)) => {
+            let axis = |d: &mut D, x: &ArcAxis<D>, y: &ArcAxis<D>| ArcAxis {
+                took: d.sel_bool(cond, &x.took, &y.took),
+                pre: d.sel_num(cond, &x.pre, &y.pre),
+                frag: d.sel_num(cond, &x.frag, &y.frag),
+                ox: d.sel_num(cond, &x.ox, &y.ox),
+            };
+            Some(Box::new([axis(d, &a[0], &b[0]), axis(d, &a[1], &b[1])]))
+        }
+        _ => bail!("merge: one side captures the player's remainder split and the other does not"),
+    };
     let state = State {
         heap,
         globals: t.globals,
@@ -442,6 +498,7 @@ fn merge_inner<D: Domain>(
         path,
         key_override: t.key_override.clone(),
         frag: t.frag.clone(),
+        arc,
     };
     Ok(Some(Merged { state, cond: cond.clone(), fell_back, selects, first_select }))
 }
@@ -560,7 +617,7 @@ mod tests {
     #[test]
     fn where_a_path_ended_merges_per_case() {
         let mut d = Symbolic::default();
-        let mut t: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        let mut t: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new(), arc: None };
         t.globals = t.heap.new_table();
         t.scope = t.heap.new_scope(None);
         let mut f = t.clone();
@@ -591,6 +648,7 @@ mod tests {
             path: Vec::new(),
             key_override: Vec::new(),
             frag: Vec::new(),
+            arc: None,
         };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
@@ -643,7 +701,7 @@ mod tests {
     #[test]
     fn a_merge_selects_on_the_separating_decision_not_the_guard() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new(), arc: None };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let a = d.num(P8::from_i16(1));
@@ -674,7 +732,7 @@ mod tests {
 
         // Two states whose paths do not diverge at one shared decision
         // fall back to the full guard, which is always correct.
-        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ended: d.boolean(false), path: vec![(g, true)], key_override: Vec::new(), frag: Vec::new() };
+        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ended: d.boolean(false), path: vec![(g, true)], key_override: Vec::new(), frag: Vec::new(), arc: None };
         p.globals = p.heap.new_table();
         p.scope = p.heap.new_scope(None);
         let mut q = p.clone();
@@ -689,7 +747,7 @@ mod tests {
     #[test]
     fn differing_shapes_do_not_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new(), arc: None };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let obj = s.heap.new_table();
@@ -714,7 +772,7 @@ mod tests {
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), key_override: Vec::new(), frag: Vec::new(), arc: None };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let mut f = s.clone();

@@ -399,6 +399,34 @@ enum Command {
         #[arg(long, default_value = "r0sx")]
         marks_level: String,
     },
+    /// DIAGNOSTIC (branch arc-sets, plans/arcs.md step 1): the ARC-EDGE
+    /// stream of a level-0 tree forwarded with `CELESTE_ARC_EDGES=1`, checked.
+    /// Per frame: every recorded edge (pred, target) has an arc record and
+    /// every arc record's (pred, target) an edge. Then `--samples` records
+    /// per frame, each from one of its preds: the source row stepped by the
+    /// REFERENCE engine (all 64 inputs) at remainders INSIDE the record's
+    /// guard - some input must reach the target (projected onto `--level`)
+    /// with the remainder the action predicts - and just OUTSIDE it, at
+    /// points no record of that (pred, target) covers - no input may reach
+    /// the target there. Fails (exit != 0) on any disagreement.
+    ArcCheck {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+        /// A synthetic win "x,y" (CELESTE_WIN_AT_XY), as the tree was run.
+        #[arg(long)]
+        win_at: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        #[arg(long, default_value_t = 20)]
+        samples: usize,
+        /// The tree's level (what a successor is projected onto).
+        #[arg(long, default_value = "r0sx")]
+        level: String,
+    },
     /// DIAGNOSTIC: the sub-pixel remainders of an EXACT tree, for weighing
     /// two rem abstractions. Per frame, the rows are grouped by every named
     /// field but `rem.x`/`rem.y` (the combination the rem would hang off),
@@ -3231,6 +3259,179 @@ fn main() -> Result<()> {
                 steps,
                 t0.elapsed().as_secs_f64()
             );
+        }
+        Command::ArcCheck { level_dir, room, win_at, from, to, samples, level } => {
+            use celeste_engine::runtime2::{Col, AV};
+            use celeste_rust::frame::{id_layer, id_row, id_seq, load_frame, widened_keys, Block};
+            use celeste_rust::interpreter::state::State;
+            use celeste_rust::search::arcs::{point, Rect, Rects, Set, CIRCLE};
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            if let Some(xy) = &win_at {
+                std::env::set_var("CELESTE_WIN_AT_XY", xy);
+            }
+            let level = celeste_rust::interpreter::abstraction::Level::parse(&level).map_err(|e| anyhow::anyhow!(e))?;
+            celeste_rust::interpreter::abstraction::set_level(level);
+            let dir = std::path::Path::new(&level_dir);
+            let edges_dir = dir.join("edges");
+            let ids = celeste_rust::compiled::ids();
+            let mut eng = celeste_rust::trace::refengine::RefEngine::new()?;
+            let initial = eng.initial_state()?;
+            let graph = celeste_rust::search::edges::EdgeGraph::open(&edges_dir, to)?;
+            // The PLAYER's rem cells (not `player_spawn`'s).
+            let rem_cells = |rt2: &celeste_engine::runtime2::Rt2| -> Option<(usize, usize)> {
+                let obj = *rt2.player_objects(ids).first()?;
+                let c = rt2.obj_field_cell(obj, ids.f_rem)?;
+                let Col::U(AV::Ptr(sub)) = rt2.cols[c as usize] else { return None };
+                Some((rt2.obj_field_cell(sub, ids.f_x)? as usize, rt2.obj_field_cell(sub, ids.f_y)? as usize))
+            };
+            // One stored row, by id, as a one-lane block.
+            let mut layers: rustc_hash::FxHashMap<u32, Vec<Block>> = Default::default();
+            let mut row_of = |id: u64| -> Result<Block> {
+                let layer = id_layer(id);
+                if !layers.contains_key(&layer) {
+                    layers.insert(layer, load_frame(dir, layer)?);
+                }
+                let b = layers[&layer].iter().find(|b| b.seq() == id_seq(id)).ok_or_else(|| anyhow::anyhow!("no piece for id {id:#x}"))?;
+                let mut mask = vec![false; b.lanes()];
+                *mask.get_mut(id_row(id) as usize).ok_or_else(|| anyhow::anyhow!("id {id:#x} past its piece"))? = true;
+                let row = Block::from_rt2(b.rt2().clone_block()).keep(&mask).expect("one lane");
+                Ok(row)
+            };
+            // Every successor of `row` at remainder `rem` (circle points;
+            // ignored without a player), over all 64 inputs: its projection
+            // onto the level and its player's remainder (circle points).
+            type Succ = ((u64, (u64, u64), u32), Option<(u32, u32)>);
+            let steps = std::cell::Cell::new(0u64);
+            let mut successors = |row: &Block, rem: (u32, u32)| -> Result<Vec<Succ>> {
+                let mut rt2 = row.rt2().clone_block();
+                if let Some((cx, cy)) = rem_cells(&rt2) {
+                    rt2.cols[cx] = Col::U(AV::Num(celeste_rust::pico8_num::Pico8Num::from_raw(rem.0 as i32 - 32768)));
+                    rt2.cols[cy] = Col::U(AV::Num(celeste_rust::pico8_num::Pico8Num::from_raw(rem.1 as i32 - 32768)));
+                }
+                let st: State = Block::from_rt2(rt2).to_state();
+                let mut out = Vec::new();
+                for b in 0..64u8 {
+                    let mut s0 = st.clone();
+                    celeste_rust::concrete::set_concrete_buttons(&mut s0, b)?;
+                    for mut succ in eng.run_frame_concrete_all(&s0)? {
+                        celeste_rust::concrete::restore_buttons(&initial, &mut succ)?;
+                        steps.set(steps.get() + 1);
+                        let blk = Block::from_state(&succ)?;
+                        let q = match rem_cells(blk.rt2()) {
+                            Some((cx, cy)) => {
+                                let raw = |c: usize| -> Result<u32> {
+                                    match blk.rt2().cols[c].at(0) {
+                                        AV::Num(n) => Ok(point(n.as_raw_u32() as i32)),
+                                        other => anyhow::bail!("arc-check: a concrete remainder expected, got {other:?}"),
+                                    }
+                                };
+                                Some((raw(cx)?, raw(cy)?))
+                            }
+                            None => None,
+                        };
+                        let (shape, keys, cells) = widened_keys(&blk, level)?;
+                        out.push(((shape, keys[0], cells[0]), q));
+                    }
+                }
+                Ok(out)
+            };
+            let (mut missing_total, mut extra_total, mut records_total) = (0u64, 0u64, 0u64);
+            let (mut inside, mut inside_bad, mut outside, mut outside_bad, mut no_player) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            let (mut sampled, mut kinds) = (0u64, std::collections::BTreeMap::<String, u64>::new());
+            let t0 = std::time::Instant::now();
+            for frame in from..=to {
+                let recs = celeste_rust::search::arc_edges::read_frame(&edges_dir, frame)?;
+                records_total += recs.len() as u64;
+                let pairs = |base: u64, mask: u64, target: u64| (0..64).filter(move |l| mask >> l & 1 == 1).map(move |l| (base + l, target));
+                let arc_pairs: rustc_hash::FxHashSet<(u64, u64)> = recs.iter().flat_map(|r| pairs(r.base, r.mask, r.target)).collect();
+                let edge_pairs: rustc_hash::FxHashSet<(u64, u64)> = graph.records_at(frame).iter().flat_map(|e| pairs(e.base, e.mask, e.target)).collect();
+                let missing = edge_pairs.difference(&arc_pairs).count() as u64;
+                let extra = arc_pairs.difference(&edge_pairs).count() as u64;
+                missing_total += missing;
+                extra_total += extra;
+                for r in &recs {
+                    for (axis, t) in [("x", &r.x), ("y", &r.y)] {
+                        let whole = t.guard == Set::full();
+                        let k = format!("{axis} {} {}", if whole { "whole" } else { "piece" }, match t.action { celeste_rust::search::arcs::Action::Rotate(_) => "rotate", _ => "const" });
+                        *kinds.entry(k).or_default() += 1;
+                    }
+                }
+                let stride = (recs.len() / samples.max(1)).max(1);
+                for r in recs.iter().step_by(stride).take(samples) {
+                    sampled += 1;
+                    let src = r.base + r.mask.trailing_zeros() as u64;
+                    let src_row = row_of(src)?;
+                    let tgt_row = row_of(r.target)?;
+                    let (tshape, tkeys, tcells) = widened_keys(&tgt_row, level)?;
+                    let target = (tshape, tkeys[0], tcells[0]);
+                    let (gx, gy) = (r.x.guard.0[0], r.y.guard.0[0]);
+                    // Every guard of this (pred, target), as rectangles.
+                    let mut union = Rects::empty();
+                    for q in recs.iter().filter(|q| q.target == r.target && src >= q.base && src < q.base + 64 && q.mask >> (src - q.base) & 1 == 1) {
+                        union.add(Rect { x: q.x.guard.clone(), y: q.y.guard.clone() });
+                    }
+                    let has_player = rem_cells(src_row.rt2()).is_some();
+                    if !has_player {
+                        no_player += 1;
+                    }
+                    let mid = |g: celeste_rust::search::arcs::Seg| (g.lo + g.hi) / 2;
+                    let probes: Vec<(u32, u32)> = if has_player {
+                        vec![(gx.lo, gy.lo), (gx.hi - 1, gy.hi - 1), (mid(gx), mid(gy)), (gx.lo, gy.hi - 1)]
+                    } else {
+                        vec![(CIRCLE / 2, CIRCLE / 2)]
+                    };
+                    for p in probes {
+                        inside += 1;
+                        let want = (r.x.action.image(&Set::point(p.0)), r.y.action.image(&Set::point(p.1)));
+                        let succs = successors(&src_row, p)?;
+                        let ok = succs.iter().any(|(id, q)| {
+                            *id == target
+                                && match q {
+                                    Some((qx, qy)) => want.0.contains(*qx) && want.1.contains(*qy),
+                                    None => true,
+                                }
+                        });
+                        if !ok {
+                            inside_bad += 1;
+                            let reached: Vec<&Option<(u32, u32)>> = succs.iter().filter(|(id, _)| *id == target).map(|(_, q)| q).collect();
+                            eprintln!(
+                                "[arc-check] f{frame} pred {src:#x} -> {:#x}: inside {p:?} the transfer x {:?} y {:?} predicts {want:?}; the reference reaches the target with remainders {reached:?}",
+                                r.target, r.x, r.y
+                            );
+                        }
+                    }
+                    if has_player {
+                        let mut outs: Vec<(u32, u32)> = Vec::new();
+                        for (x, y) in [(gx.lo.wrapping_sub(1), mid(gy)), (gx.hi, mid(gy)), (mid(gx), gy.lo.wrapping_sub(1)), (mid(gx), gy.hi), (gx.hi, gy.hi)] {
+                            if x < CIRCLE && y < CIRCLE && !union.contains(x, y) {
+                                outs.push((x, y));
+                            }
+                        }
+                        for p in outs {
+                            outside += 1;
+                            if successors(&src_row, p)?.iter().any(|(id, _)| *id == target) {
+                                outside_bad += 1;
+                                eprintln!("[arc-check] f{frame} pred {src:#x} -> {:#x}: OUTSIDE every guard of the pair at {p:?}, the reference reaches the target", r.target);
+                            }
+                        }
+                    }
+                }
+                eprintln!(
+                    "[arc-check] f{frame:03}: {} arc records, {} arc pairs, {} edge pairs, {missing} edges without an arc, {extra} arcs without an edge; so far inside {inside} ({inside_bad} bad), outside {outside} ({outside_bad} bad), {} ref steps, {:.1} s",
+                    recs.len(),
+                    arc_pairs.len(),
+                    edge_pairs.len(),
+                    steps.get(),
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+            println!("arc-check f{from}-f{to}: {records_total} records; transfers per axis {kinds:?}");
+            println!("completeness: {missing_total} recorded edges without an arc record, {extra_total} arc records without an edge");
+            println!(
+                "agreement: {sampled} sampled records ({no_player} from a row without a player); inside the guard {inside} probes, {inside_bad} disagree; outside every guard {outside} probes, {outside_bad} reach the target; {} reference steps",
+                steps.get()
+            );
+            anyhow::ensure!(missing_total == 0 && extra_total == 0 && inside_bad == 0 && outside_bad == 0, "arc-check: disagreement");
         }
         Command::RemCensus { level_dir, from, to, level } => {
             let level = match &level {

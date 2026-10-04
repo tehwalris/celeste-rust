@@ -15,10 +15,13 @@
 //!                       rotates them), for the rotation graph
 //!   * `arc_dp`        - the rotation graph's winning sets (backward) and
 //!                       exact forward (plans/arcs.md)
+//!   * `arc_edges`     - per recorded edge, what the frame did to the
+//!                       player's remainder (`CELESTE_ARC_EDGES=1`)
 //!
 //! The forward driver itself is `frame::forward_run` (src/frame.rs), on a
 //! `compiled::FrameEngine`.
 pub mod arc_dp;
+pub mod arc_edges;
 pub mod arcs;
 pub mod checkpoint;
 pub mod door;

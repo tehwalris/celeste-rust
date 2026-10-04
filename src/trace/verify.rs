@@ -85,7 +85,18 @@ pub struct FrameOut {
     /// heap shape only appears by actually advancing a frame, and the
     /// state an outcome ends in is the only thing that has that shape.
     pub st: State<Symbolic>,
+    /// THE TRANSFER ROOTS (`search::arc_edges`, a level-0 trace in arc mode;
+    /// empty otherwise): per axis x then y, `took`, `pre`, `frag`, `ox` (the
+    /// player's split, `State::arc`) and `fin` (the player's remainder
+    /// before the boundary widening; a placeholder 0 without a player at the
+    /// end, `arc_fin`). Computed beside the row, never stored in it.
+    pub arc: Vec<NodeId>,
+    /// Does this outcome have a player at its end (`fin` is real)?
+    pub arc_fin: bool,
 }
+
+/// Roots per axis in `FrameOut::arc`: took, pre, frag, ox, fin.
+pub const ARC_AXIS_ROOTS: usize = 5;
 
 impl Clone for FrameOut {
     /// For splitting an outcome (`split_undecided_selects`): the block is
@@ -102,6 +113,8 @@ impl Clone for FrameOut {
             cells: self.cells.clone(),
             ubool_cells: self.ubool_cells.clone(),
             st: self.st.clone(),
+            arc: self.arc.clone(),
+            arc_fin: self.arc_fin,
         }
     }
 }
@@ -284,6 +297,8 @@ pub fn trace_frame<'a>(
         _ => 2,
     };
     it.d.unknown_atoms = 0;
+    // The arc capture (`search::arc_edges`): a level-0 trace in arc mode.
+    it.arc_capture = crate::search::arc_edges::enabled() && matches!(widen, Some(super::widen::WidenMode::Level0(..)));
     // What the previous trace left if it failed part-way (a success takes
     // both below).
     it.raised.clear();
@@ -381,6 +396,13 @@ pub fn trace_frame<'a>(
             admissible = it.d.graph.fold(crate::transpile::graph::Op::And, vec![admissible, ob]);
         }
     }
+    // A representative state carries an earlier trace's capture: per FRAME.
+    st.arc = if it.arc_capture {
+        let (x, y) = (super::state::ArcAxis::none(&mut it.d), super::state::ArcAxis::none(&mut it.d));
+        Some(Box::new([x, y]))
+    } else {
+        None
+    };
     let st = run_one(it, reset, st)?;
     let finished = it.exec_block(frame.nodes(), st)?;
     // The error of the whole frame, OR-ed into every outcome's: inputs this
@@ -399,6 +421,27 @@ pub fn trace_frame<'a>(
         // The absent-as-zero fields (`widen::ABSENT_AS_ZERO`), at every
         // level: part of the shape, not of the precision.
         super::widen::materialize_absent_fields(&mut s, &mut it.d)?;
+        // The transfer roots, the player's remainder read BEFORE the
+        // widenings replace it (`FrameOut::arc`).
+        let (arc, arc_fin) = match s.arc.as_deref() {
+            None => (Vec::new(), false),
+            Some(axes) => {
+                let players = super::widen::objects_of_type(&s, "player");
+                anyhow::ensure!(players.len() <= 1, "arc capture: {} player objects at the frame's end", players.len());
+                let mut roots = Vec::with_capacity(2 * ARC_AXIS_ROOTS);
+                for (k, a) in axes.iter().enumerate() {
+                    let fin = match players.first() {
+                        Some(pl) => match iface::get(&s, &super::widen::field(pl, &["rem", ["x", "y"][k]])) {
+                            Some(Value::Num(n)) => n,
+                            other => bail!("arc capture: the player's rem.{} is {other:?}", ["x", "y"][k]),
+                        },
+                        None => it.d.graph.leaf(crate::transpile::graph::Op::Const(0, 0)),
+                    };
+                    roots.extend([a.took, a.pre, a.frag, a.ox, fin]);
+                }
+                (roots, !players.is_empty())
+            }
+        };
         // THE WIDENINGS, here rather than at the boundary a moment
         // later, so the graph knows about them and the value a row is
         // hashed on is the value it stores (`trace::widen`). Before
@@ -453,6 +496,8 @@ pub fn trace_frame<'a>(
             cells: cells.to_vec(),
             ubool_cells: ubool_cells.to_vec(),
             st: s,
+            arc,
+            arc_fin,
         });
     }
     // The selects left on a condition a lane can hold undecided are split,
@@ -1086,7 +1131,10 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             t,
             guard: o.guard,
             error: o.error,
-            fields: o.fields.iter().map(|f| f.1).collect(),
+            // The transfer roots (`FrameOut::arc`) ride with the fields: the
+            // same substitutions, and two outcomes are one only where they
+            // agree in them too.
+            fields: o.fields.iter().map(|f| f.1).chain(o.arc.iter().copied()).collect(),
             keys: o.keys.clone(),
             rests: Vec::new(),
         };
@@ -1300,9 +1348,11 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
         // decided already substituted (`three_valued`).
         o.guard = three_valued(d, lite.guard);
         o.error = lite.error;
-        for (f, n) in o.fields.iter_mut().zip(lite.fields) {
-            f.1 = n;
+        let nf = o.fields.len();
+        for (f, n) in o.fields.iter_mut().zip(&lite.fields[..nf]) {
+            f.1 = *n;
         }
+        o.arc = lite.fields[nf..].to_vec();
         o.keys = lite.keys;
         if let (Some(p), Some(pts)) = (points.as_ref(), pts.as_ref()) {
             let g = p.position_guard(d, pts);

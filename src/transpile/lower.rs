@@ -75,6 +75,9 @@ pub(crate) struct Outcome {
     /// Fields keyed on another node than they store: `(field index, key
     /// node)`. The key nodes are roots too, after `error` and `live`.
     pub(crate) keys: Vec<(usize, NodeId)>,
+    /// The transfer roots (`trace::emit::FrameOutcome::arc`), after the
+    /// keys: computed per body, stored in no row.
+    pub(crate) arc: Vec<NodeId>,
 }
 
 /// Specialize a traced frame's graph into ONE fused, hash-consed arena.
@@ -585,7 +588,7 @@ pub(crate) fn specialize_frame(
 pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> (Graph, Vec<SpecializedBody>) {
     let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = outs
         .iter()
-        .map(|o| (o.of.fields.iter().map(|f| f.node).collect(), o.error, o.live, o.keys.iter().map(|(_, n)| *n).collect()))
+        .map(|o| (o.of.fields.iter().map(|f| f.node).collect(), o.error, o.live, o.keys.iter().map(|(_, n)| *n).chain(o.arc.iter().copied()).collect()))
         .collect();
     let (sp, bodies) =
         specialize_frame(&e.graph, &outs_spec, e.fork_depth as u8, e.decide, e.room.as_ref(), &e.ranges);
