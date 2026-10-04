@@ -510,6 +510,10 @@ pub fn concrete_witness(
     use crate::interpreter::state::State;
     use anyhow::Result;
     use celeste_engine::runtime2::{Rt2, AV};
+    // The engine runs the cart's `_init` under the GLOBAL level: build it
+    // before the level is set (room (5,3) nodiag's level-0 `_init` ended in
+    // no state); its frames run at the exact level whatever is set.
+    let eng = ConcreteEngine::new()?;
     crate::interpreter::abstraction::set_level(level);
     let t0 = std::time::Instant::now();
     // (shape, key, cell) -> the node's index, for the graph's nodes.
@@ -563,7 +567,7 @@ pub fn concrete_witness(
             return Ok(false);
         }
         for byte in 0u8..64 {
-            for succ in cx.eng.step_all(st, byte, &cx.initial)? {
+            for succ in cx.eng.step_all(st, byte, &cx.initial).map_err(|e| e.context(format!("the frame after f{k} with input {byte}")))? {
                 cx.steps += 1;
                 let b = Block::from_state(&succ)?;
                 let cell = b.positions()?[0];
@@ -594,7 +598,6 @@ pub fn concrete_witness(
         }
         Ok(false)
     }
-    let eng = ConcreteEngine::new()?;
     let initial = eng.initial_state()?;
     let start_cell = Block::from_state(&initial)?.positions()?[0];
     let mut cx = Ctx {
@@ -611,12 +614,57 @@ pub fn concrete_witness(
         steps: 0,
         deepest: (0, Vec::new()),
     };
-    let t1 = std::time::Instant::now();
-    let ok = dfs(&mut cx, &initial, 0)?;
+    // The DFS is EXHAUSTIVE (every input, every `rnd` leaf, a fully explored
+    // concrete state remembered per frame) and prunes only by W, which holds
+    // every concrete winner: so "no win within f" is a proof about the real
+    // game. The graph's optimum is a lower bound (its objects are coarse);
+    // count UP from it to the horizon - the first f with a witness is the
+    // concrete optimum (over every `rnd` draw: a leaf is a possibility).
+    // Checked on room (5,3) any%: arc 78, none within 78, a witness at 79 =
+    // the ladder's proven 79.
     let show = |v: &[u8]| v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
-    eprintln!("[witness] {} concrete steps, {} dead states, {:.1} s", cx.steps, cx.dead.len(), t1.elapsed().as_secs_f64());
+    let ok = loop {
+        let t1 = std::time::Instant::now();
+        cx.dead.clear();
+        cx.path.clear();
+        cx.cells.clear();
+        cx.deepest = (0, Vec::new());
+        let ok = dfs(&mut cx, &initial, 0)?;
+        eprintln!("[witness] within f{}: {} concrete steps so far, {} dead states, {:.1} s", cx.frames, cx.steps, cx.dead.len(), t1.elapsed().as_secs_f64());
+        if ok || cx.frames == horizon {
+            break ok;
+        }
+        println!("no concrete win within f{} (exhaustive inside W, deepest f{})", cx.frames, cx.deepest.0);
+        cx.frames += 1;
+        cx.from -= 1;
+    };
     if !ok {
-        println!("NO CONCRETE WITNESS inside W: deepest f{}, inputs {}", cx.deepest.0, show(&cx.deepest.1));
+        println!("NO CONCRETE WITNESS inside W by f{horizon}: deepest f{}, inputs {}", cx.deepest.0, show(&cx.deepest.1));
+        // Why: from the deepest state, every input's successors - their
+        // node, exact remainder and that node's winning set.
+        let (d, prefix) = cx.deepest.clone();
+        let mut st = initial.clone();
+        for &b in &prefix {
+            let mut next = cx.eng.step_all(&st, b, &initial)?;
+            anyhow::ensure!(next.len() == 1, "the deepest prefix forks ({} leaves): not replayable here", next.len());
+            st = next.pop().expect("one leaf");
+        }
+        for byte in 0u8..64 {
+            for succ in cx.eng.step_all(&st, byte, &initial)? {
+                let b = Block::from_state(&succ)?;
+                let (shape, keys, cells) = widened_keys(&b, level)?;
+                let q = rem_of(b.rt2())?;
+                let at = super::pos_graph::cell_xy(cells[0]);
+                match node.get(&(shape, keys[0], cells[0])) {
+                    None => println!("  input {byte:2}: cell {at:?} - no node"),
+                    Some(&i) => {
+                        let t = cx.from + d + 1;
+                        let set: Vec<String> = w.at(t, i).map(|r| r.slabs().map(|(y, xs)| format!("y[{},{}) x{:?}", y.lo, y.hi, xs.iter().map(|x| (x.lo, x.hi)).collect::<Vec<_>>())).collect()).unwrap_or_default();
+                        println!("  input {byte:2}: cell {at:?} node {i} rem {q:?}: W_{t} {}", if set.is_empty() { "empty".to_string() } else { set.join(" ") });
+                    }
+                }
+            }
+        }
         return Ok(());
     }
     println!("CONCRETE WITNESS: a win at f{}: {}", cx.path.len(), show(&cx.path));

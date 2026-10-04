@@ -1,0 +1,12 @@
+# Room (5,3) "3000 m", No Diagonal Dashes: exit during frame 96 (2026-10-04).
+# Ties the community nodiag TAS30 (73 inputs at prologue offset 31 = 96).
+#
+# Found by CELESTE_NODIAG=1: level-0 forward (r0sxhn, level -1 filter 96,5,
+# arc records) + arc-search --horizon 96 --witness. The remainder-exact arc
+# optimum over coarse objects is f92 (a lower bound); the concrete witness DFS
+# (reference engine, every input and rnd leaf, pruned only by W) found NO win
+# within 92, 93, 94, 95 frames and this one at 96. No diagonal dash press.
+# Replayed on a real PICO-8:
+#   pico8_diff/replay.py --room 5,3 --balloon-seeds 0,0,0,0,0,0 tas/room_5_3_nodiag_frame_96.txt
+# -> the room changes to (6,3) during frame 96.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,36,0,0,0,0,0,0,0,2,0,2,16,0,0,0,0,0,0,36,0,0,0,0,0,0,33,0,0,0,0,0,0,36,0,0,0,0,0,0,0,0,2,2,0,16,0,0,0,0
