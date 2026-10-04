@@ -36,7 +36,7 @@ with the reference engine (`rewrite witness`), replayed on a real PICO-8
 | (2,0) | 300 m | 95 | TAS3, 25 + 70 = 95 | `r0sxh..r15sxh,rxsx`, level -1 (95,5); h94 refuted at level 9 | `room_2_0_exit_frame_95.txt` (TAS3 with two jbuffer presses moved) | 09-17 | `e906986` | held buttons unknown (3.8x); level -1 replaced the unsound 8 px band |
 | (3,0) | 400 m | 89 | TAS4, 27 + 62 = 89 | `r0sxhfb, r1sxhb..r15sxhb, r15sxh, rxsx`; h88 refuted at level 6 | `room_3_0_exit_frame_89.txt` | 09-19 | `8533314` | the mark filter's deadline; the fly fruit is taken (looks necessary); TAS4's raw inputs do not transfer to the minimal cart, its route does |
 | (4,0) | 500 m | 76 | TAS5, 29 + 47 = 76 | default ladder; h75 refuted at level 9 | `room_4_0_optimal_frame_76.txt` | 09-16 | `e0d5852` | the key's `spr`/`flip` pinned with the timers; 3:54 end to end |
-| (5,0) | 600 m | 77 | TAS6, 29 + 48 = 77 (exits only under some draws) | `r0sxhb..r15sxhb, r15sxh, rxsx`; h76 refuted at level 5 | none: the reference engine refused `rnd` then; NOT replayed | 09-21 | `4e19168` | the balloon's `offset` canonical [0,1) restored cross-frame dedup (f60 10.6M -> 1.1M); 77 is a best case over draws |
+| (5,0) | 600 m | 77 | TAS6, offset 29, its seed | rerun 10-04: `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx` (level -1 refused), `--ceiling 77`; h76 refuted at level 6 | `room_5_0_exit_frame_77.txt` (TAS6's seed 0.636; seeds 0.6-0.9) | 10-04 | `d3e58d5` | the balloon's `offset` canonical [0,1) restored cross-frame dedup (f60 10.6M -> 1.1M, `4e19168`); the second dash is the balloon's refill |
 | (6,0) | 700 m | 70 | TAS7, 23 + 47 = 70 | split frame, `r0sxhfp, r0sxhf, r0sxh, r1sxh..r15sxh, rxsx`; frames 64-69 refuted (h72's level 7 first win at frame 70) | `room_6_0_exit_frame_70.txt` | 09-30 | `7811208` | platforms make every frame's states new: `p` + POINTS + the split frame |
 | (7,0) | 800 m | 84 | TAS8, offset 23, seed 0 | rechecked 10-02: `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx`, level -1 (84,5); h83 refuted at level 10 | `room_7_0_exit_frame_84.txt` (seeds 0, 0.25) | 10-01 | `c76bf10` | the floor-collision join bug `7f6b96e`; the `n` level |
 | (0,1) | 900 m | 100 | TAS9, offset 27 | `r0sxhn, r1sxhn, r1sxh..r15sxh, rxsx` at h100; first win 100 from level 10 | `room_0_1_exit_frame_100.txt` | 10-01 | `b97fa9a` | objects abstract one rem rung longer: level 0 40M -> 14.8M states, the first exact level 26.5M -> 88k |
@@ -69,13 +69,12 @@ with the reference engine (`rewrite witness`), replayed on a real PICO-8
 - **Balloon rooms**: `rnd` is an interval at every level, so a confirmation is
   "some draw wins" and a refutation holds for every draw. Each witness was
   replayed per seed; several exit only for some (the table's seed lists).
-  Room (5,0)'s 77 has no witness at all.
 - **The silent interval wrap** (plans/architecture.md, "Interval
   overflow"): the ASM kernels wrapped an overflowing interval `+`/`-`/negation
   until `549ecf5` (2026-10-03 15:15) and `b47b118` (2026-10-03 18:07; now a
   lane error, countdowns the unknown number). EVERY result in the table except
-  room (3,3)'s arc result (2026-10-04, after both) was computed with the
-  wrapping binary. What the wrap could affect: only an interval whose
+  room (3,3)'s arc result and room (5,0)'s rerun (2026-10-04, after both) was
+  computed with the wrapping binary. What the wrap could affect: only an interval whose
   endpoint reaches the 16.16 limits - in practice the countdowns widened to
   the whole range at the `t` (timers) and `n` (near) levels, which the cart
   decrements before `delay <= 0`. At `t` it was decisive: shaking floors never
@@ -146,7 +145,7 @@ CELESTE_LEVEL_MINUS_ONE="C,5" \
 | (2,0) | 24.0M at f80 with level -1 (62.8M without) | 27:28 incl. the 472 s table | 28.0 GB |
 | (3,0) | frontier peak 22.7M at f74 | 34 min (level 0 resumed) | 12.8 GB, 210 GB of checkpoints |
 | (4,0) | 7.98M at f76 | 3:54 | 8 GB |
-| (5,0) | 2.5M at f70 (balloon canonical; 49.5M before) | ~10 min | |
+| (5,0) | 1.94M/frame max, 35.2M visited (10-04 rerun) | 4:37 (`--ceiling 77`) | 10.9 GB |
 | (6,0) | 1.68G visited to step 150 (split) | overnight | |
 | (7,0) | 71M visited (recheck, unsplit, level -1) | | 5.2 GB |
 | (0,1) | 14.8M states/frame max, 224M visited | minutes after level 0 | 14 GB |
