@@ -101,6 +101,14 @@ The synthetic case answers f69, as the full object ladder does (level 1
 refutes 68). Room (3,3) h171: REFUTED; h172: a win at f172 (the reference).
 W's fragmentation stays small: median 1-6 rectangles per node, max ~300.
 
+## Direction (Philippe, 2026-10-04)
+
+Arcs are the better technique: optimize the implementation and make it the
+ONLY remainder treatment (the rem rungs go). Not started yet. Known costs to
+attack first: the arc records (50 B per edge, written before the marks know
+which edges matter: 139 GB and a 37 s read for room (3,3)), the marks BFS and
+graph build, and the objects/held ladder on top of exact remainders.
+
 ## Open
 
 * W's fragmentation (rectangles per node) - the number that decides the cost.
