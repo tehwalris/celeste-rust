@@ -188,8 +188,12 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     let t0 = std::time::Instant::now();
     let mut wins: Vec<u64> = Vec::new();
     let mut start_id: Option<u64> = None;
+    // Per frame, the rows it kept (its layer).
+    let mut kept: Vec<u32> = Vec::with_capacity(horizon as usize + 1);
     for f in 0..=horizon {
+        let mut rows = 0u32;
         for (seq, file) in frame_files(dir, f)? {
+            rows += file.cell_counts().map(|(_, n)| n).sum::<u32>();
             if f == 0 {
                 anyhow::ensure!(start_id.is_none(), "{}: more than one start file", dir.display());
                 start_id = Some(pack_id(0, seq, 0));
@@ -197,9 +201,17 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
                 wins.extend(file.win_rows().iter().map(|&(row, _)| pack_id(f, seq, row)));
             }
         }
+        kept.push(rows);
     }
     let start_id = start_id.ok_or_else(|| anyhow::anyhow!("{}: no frame-0 row", dir.display()))?;
     let eg = super::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
+    // A frame that kept rows recorded the edges into them: its own layer's
+    // run must be there. A frame that kept none (the level -1 filter can
+    // drop every row at the horizon) may have no run at all.
+    for (f, &rows) in kept.iter().enumerate().skip(1) {
+        let f = f as u32;
+        anyhow::ensure!(rows == 0 || eg.has_run(f, f), "{}: no edge run for f{f}, which kept {rows} rows", dir.display());
+    }
     let (bfs, _) = super::edges::bfs(&eg, horizon, wins.iter().copied());
     let t_bfs = t0.elapsed();
     // The BFS never marks layer 0 (the start is given): its deadline is 0
@@ -678,7 +690,11 @@ pub fn concrete_count_up(
                     cx.cells.push(cell);
                     return Ok(true);
                 }
-                let concrete = (b.keys()[0], cell, k + 1);
+                // The memo is keyed on the EXACT state: `b.keys()` is the
+                // row key at the search's level (remainder and held buttons
+                // widened), and two states one key stands for need not share
+                // their fate.
+                let concrete = (b.rt2().clone_block().row_keys_canonical()[0], cell, k + 1);
                 if cx.dead.contains(&concrete) {
                     continue;
                 }

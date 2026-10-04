@@ -918,6 +918,11 @@ impl EdgeGraph {
         }
     }
 
+    /// Is there a run of the edges recorded at `frame` into layer `layer`?
+    pub fn has_run(&self, layer: u32, frame: u32) -> bool {
+        self.runs.get(layer as usize).and_then(|v| v.get(frame as usize)).is_some_and(|r| r.is_some())
+    }
+
     /// The predecessors of `target` recorded at frame `frame`.
     pub fn preds_at(&self, target: u64, frame: u32, buf: &mut Vec<Edge>) {
         if let Some(Some(run)) = self.runs.get(id_layer(target) as usize).and_then(|v| v.get(frame as usize)) {
