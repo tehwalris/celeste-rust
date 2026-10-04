@@ -1,6 +1,7 @@
 //! CLI for the tracer's level -1 probe (`celeste_rust::trace::level_minus_one`):
 //!
 //!   transpile --level-minus-one S LEVEL_DIR CEILING FROM TO [MARKS]
+//!   transpile --level-minus-one-table S   build the table alone, its fingerprint
 //!
 //! the position-only cost-to-go table for the start room
 //! (plans/level-minus-one.md), with the player's speed in [-S, S] px/frame,
@@ -31,6 +32,26 @@ fn main() -> Result<()> {
                 .join()
                 .map_err(|_| anyhow!("the level -1 probe panicked"))??;
             print!("{}", report);
+            Ok(())
+        }
+        Some("--level-minus-one-table") => {
+            // Build the level -1 table alone, as the search does
+            // (`cost_to_go`), and print its fingerprint: the A/B check for a
+            // change to the build. CELESTE_THREADS workers (default: every
+            // hardware thread, as the search).
+            let spd_px: i32 = args.next().ok_or_else(|| anyhow!("--level-minus-one-table S"))?.parse().context("--level-minus-one-table S")?;
+            let threads = match std::env::var("CELESTE_THREADS") {
+                Ok(s) => s.parse().context("CELESTE_THREADS")?,
+                Err(_) => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+            };
+            let t = std::time::Instant::now();
+            let table = std::thread::Builder::new()
+                .stack_size(256 * 1024 * 1024)
+                .spawn(move || celeste_rust::trace::level_minus_one::cost_to_go(std::path::Path::new("."), spd_px, threads))
+                .context("spawn the level -1 builder")?
+                .join()
+                .map_err(|_| anyhow!("the level -1 builder panicked"))??;
+            println!("level -1 table: {} entries, start d {}, fingerprint {:016x}, {:.1} s", table.len(), table.start_d, table.fingerprint(), t.elapsed().as_secs_f64());
             Ok(())
         }
         other => Err(anyhow!("usage: transpile --level-minus-one S LEVEL_DIR CEILING FROM TO [MARKS] (got {other:?})")),

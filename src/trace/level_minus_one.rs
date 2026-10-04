@@ -293,6 +293,9 @@ struct Traced {
     /// ~25x larger: built the first time a node's plain evaluation is in
     /// violation, and then that node's answer (`eval_node`).
     precise: std::sync::OnceLock<Spec>,
+    /// Which trace this is (`TRACES`): a node's frame is a function of it and
+    /// the seed ranges (`Table::sig`).
+    generation: u64,
     cone: Cone,
     /// The bounds it was traced under (the static ranges the arity came from).
     bounds: BTreeMap<Path, Range>,
@@ -615,7 +618,8 @@ impl<'a> Table<'a> {
             t_trace.as_secs_f64(),
             (t0.elapsed() - t_trace).as_secs_f64()
         ) + &operands.iter().map(|o| format!("\n      {o}")).collect::<String>();
-        self.shapes[id].traced = Some(Traced { seeds, outs, plain, precise: std::sync::OnceLock::new(), cone, bounds, pins, stats });
+        let generation = TRACES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.shapes[id].traced = Some(Traced { seeds, outs, plain, precise: std::sync::OnceLock::new(), generation, cone, bounds, pins, stats });
         Ok(())
     }
 
@@ -629,6 +633,15 @@ impl Cone {
         let mut shared = self.graph.like();
         let mut configs: Vec<Config> = Vec::new();
         let mut seen: HashSet<Vec<NodeId>> = HashSet::new();
+        // Only what a root or a fork operand reads: the lifted cone
+        // (`precise`) holds every intermediate `lift` made, ~45% of it dead.
+        let mut roots: Vec<NodeId> = self.forks.values().copied().collect();
+        for r in &self.roots {
+            roots.extend([r.live, r.error]);
+            roots.extend(r.xy.iter().flat_map(|(x, y)| [*x, *y]));
+            roots.extend(&r.fields);
+        }
+        let need = crate::transpile::bdd::reachable(&self.graph, &roots);
         for c in 0..n_configs {
             let mut splits = vec![0u8; self.n_forks as usize];
             let mut rest = c;
@@ -636,7 +649,7 @@ impl Cone {
                 splits[*k as usize] = (rest % *w as usize) as u8;
                 rest /= *w as usize;
             }
-            let map = self.graph.specialize_subset_into(&splits, None, &mut shared);
+            let map = self.graph.specialize_subset_into(&splits, Some(&need), &mut shared);
             let m = |n: NodeId| map[n as usize];
             let outs_c: Vec<Roots> = self
                 .roots
@@ -682,6 +695,9 @@ impl Cone {
         lifted.specialize()
     }
 }
+
+/// Traces made so far (`Traced::generation`).
+static TRACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `a + b` / `a - b` of a literal interval and a point, as the literal every
 /// lane then holds; `None` for anything else or past the 16.16 range.
@@ -793,7 +809,12 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
     // over-approximate the node's frame, so either answer is sound).
     let vals = t.plain.graph.eval_narrow_top_in(&cells, room)?;
     let (sp, vals) = if in_violation(&t.plain, &vals) {
-        let precise = t.precise.get_or_init(|| t.cone.precise());
+        let precise = t.precise.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let p = t.cone.precise();
+            eprintln!("  shape {id}: the precise frame, {} nodes, {:.1} s", p.graph.len(), t0.elapsed().as_secs_f64());
+            p
+        });
         acc.precise += 1;
         (precise, precise.graph.eval_narrow_top_in(&cells, room)?)
     } else {
@@ -1018,6 +1039,23 @@ pub struct CostToGo {
 }
 
 impl CostToGo {
+    /// The number of (shape, cell) entries.
+    pub fn len(&self) -> usize {
+        self.d.len()
+    }
+
+    /// A hash of every entry and the start's d, in a fixed order: two builds
+    /// with the same fingerprint filter identically.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut es: Vec<(&(u64, i16, i16), &u32)> = self.d.iter().collect();
+        es.sort_unstable();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.start_d.hash(&mut h);
+        es.hash(&mut h);
+        h.finish()
+    }
+
     /// Is a row of `shape` at `cell` at `frame` provably unable to exit by
     /// `horizon`? Only a table node is ever refused: a row without a player,
     /// one that has left the room, a shape or a cell the table never reached
@@ -1042,8 +1080,21 @@ impl CostToGo {
 }
 
 /// Build the level -1 table of the configured start room at player speed bound
-/// `spd_px` (its report goes to stderr as it is built).
+/// `spd_px` (its report goes to stderr as it is built), or read it from the
+/// table cache (`cache_file`) when this binary built it before for the same
+/// inputs.
 pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo> {
+    let cache = cache_file(root, spd_px)?;
+    if let Some((path, _)) = &cache {
+        match CostToGo::load(path) {
+            Ok(Some(t)) => {
+                eprintln!("[level -1] table read from {} ({} entries)", path.display(), t.d.len());
+                return Ok(t);
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("[level -1] the cached table {} is unreadable ({e:#}): building it", path.display()),
+        }
+    }
     let mut rep = String::new();
     let b = build(root, spd_px, threads, &mut rep)?;
     let mut d = HashMap::new();
@@ -1054,7 +1105,570 @@ pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo
             }
         }
     }
-    Ok(CostToGo { d, start_d: b.start_d })
+    let t = CostToGo { d, start_d: b.start_d };
+    if let Some((path, key)) = &cache {
+        match t.save(path, key) {
+            Ok(()) => eprintln!("[level -1] table cached at {}", path.display()),
+            Err(e) => eprintln!("[level -1] could not cache the table at {} ({e:#})", path.display()),
+        }
+    }
+    Ok(t)
+}
+
+/// The table cache's format; bump it when what a file holds changes.
+const CACHE_FORMAT: u32 = 1;
+
+/// Where the table for these inputs is cached, and the key's description:
+/// `CELESTE_L1_CACHE` (a directory, default `/var/tmp/celeste-l1-cache`; `off`
+/// to always build). The table is a function of the code (this binary's own
+/// bytes), the cart (the traced Lua as `trace::cart::sources_in` assembles it,
+/// start room and `CELESTE_SPLIT_FRAME` included, and the map/flag data), the
+/// speed bound, and the knobs the tracer reads - every `CELESTE_*` variable
+/// but the ones that cannot change it, so an unknown knob costs a rebuild,
+/// never a wrong table.
+fn cache_file(root: &FsPath, spd_px: i32) -> Result<Option<(PathBuf, String)>> {
+    use std::hash::{Hash, Hasher};
+    let dir = match std::env::var("CELESTE_L1_CACHE") {
+        Ok(s) if s == "off" => return Ok(None),
+        Ok(s) => PathBuf::from(s),
+        Err(_) => PathBuf::from("/var/tmp/celeste-l1-cache"),
+    };
+    let exe = std::env::current_exe()?;
+    let exe_bytes = std::fs::read(&exe).map_err(|e| anyhow!("reading this binary {}: {e}", exe.display()))?;
+    let lua = super::cart::sources_in(root)?;
+    let mut cart: Vec<(String, Vec<u8>)> = Vec::new();
+    for e in std::fs::read_dir(root.join("cart"))? {
+        let e = e?;
+        if e.file_type()?.is_file() {
+            cart.push((e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path())?));
+        }
+    }
+    cart.sort();
+    const IRRELEVANT: [&str; 3] = ["CELESTE_THREADS", "CELESTE_LEVEL_MINUS_ONE", "CELESTE_L1_CACHE"];
+    let mut env: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k.starts_with("CELESTE_") && !IRRELEVANT.contains(&k.as_str())).collect();
+    env.sort();
+    let room = celeste_interp::game_runner::start_room();
+    // Two 64-bit SipHashes under different prefixes: a 128-bit name.
+    let half = |salt: u8| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (salt, CACHE_FORMAT, &exe_bytes, &lua, &cart, &env, room, spd_px).hash(&mut h);
+        h.finish()
+    };
+    let name = format!("{:016x}{:016x}", half(1), half(2));
+    let key = format!(
+        "level -1 table cache, format {CACHE_FORMAT}\nroom {room:?}, S = {spd_px}\nbinary {} ({} bytes)\nenv {env:?}\ncart files {:?}\n",
+        exe.display(),
+        exe_bytes.len(),
+        cart.iter().map(|c| &c.0).collect::<Vec<_>>()
+    );
+    Ok(Some((dir.join(format!("room{}_{}_s{spd_px}_{name}.bin", room.0, room.1)), key)))
+}
+
+impl CostToGo {
+    /// The cached table at `path`, `None` when there is none.
+    fn load(path: &FsPath) -> Result<Option<CostToGo>> {
+        let b = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Result<&[u8]> {
+            let s = b.get(at..at + n).ok_or_else(|| anyhow!("truncated"))?;
+            at += n;
+            Ok(s)
+        };
+        ensure!(take(4)? == b"CL1T", "not a level -1 table");
+        let u32_of = |s: &[u8]| u32::from_le_bytes(s.try_into().unwrap());
+        let u64_of = |s: &[u8]| u64::from_le_bytes(s.try_into().unwrap());
+        ensure!(u32_of(take(4)?) == CACHE_FORMAT, "another format");
+        let start_d = u32_of(take(4)?);
+        let n = u64_of(take(8)?) as usize;
+        let mut d = HashMap::with_capacity(n);
+        for _ in 0..n {
+            let e = take(16)?;
+            let (h, x, y, v) = (u64_of(&e[0..8]), i16::from_le_bytes([e[8], e[9]]), i16::from_le_bytes([e[10], e[11]]), u32_of(&e[12..16]));
+            d.insert((h, x, y), v);
+        }
+        let fp = u64_of(take(8)?);
+        ensure!(at == b.len(), "trailing bytes");
+        let t = CostToGo { d, start_d };
+        ensure!(t.fingerprint() == fp, "the fingerprint does not match the entries");
+        Ok(Some(t))
+    }
+
+    /// Write the table to `path` (atomically: a reader sees all of it or
+    /// none), with `key` beside it as text.
+    fn save(&self, path: &FsPath, key: &str) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut es: Vec<(&(u64, i16, i16), &u32)> = self.d.iter().collect();
+        es.sort_unstable();
+        let mut b: Vec<u8> = Vec::with_capacity(28 + 16 * es.len());
+        b.extend(b"CL1T");
+        b.extend(CACHE_FORMAT.to_le_bytes());
+        b.extend(self.start_d.to_le_bytes());
+        b.extend((es.len() as u64).to_le_bytes());
+        for ((h, x, y), v) in es {
+            b.extend(h.to_le_bytes());
+            b.extend(x.to_le_bytes());
+            b.extend(y.to_le_bytes());
+            b.extend(v.to_le_bytes());
+        }
+        b.extend(self.fingerprint().to_le_bytes());
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, &b)?;
+        std::fs::rename(&tmp, path)?;
+        std::fs::write(path.with_extension("txt"), key)?;
+        Ok(())
+    }
+}
+
+/// A node `(shape, x, y)` as one word: the key of every map the passes keep.
+fn pack(k: (usize, i16, i16)) -> u64 {
+    debug_assert!(k.0 < 1 << 32);
+    (k.0 as u64) << 32 | (k.1 as u16 as u64) << 16 | k.2 as u16 as u64
+}
+
+fn unpack(p: u64) -> (usize, i16, i16) {
+    ((p >> 32) as usize, (p >> 16) as u16 as i16, p as u16 as i16)
+}
+
+/// What a node's frame is a function of besides its cell: the shape's trace
+/// and the ranges its seeds read (`eval_node`).
+#[derive(Clone, PartialEq)]
+struct Sig {
+    generation: u64,
+    ranges: Vec<Range>,
+}
+
+impl Table<'_> {
+    /// The shape's `Sig`, `None` while it is not traced.
+    fn sig(&self, id: usize) -> Option<Sig> {
+        let sh = &self.shapes[id];
+        let t = sh.traced.as_ref()?;
+        let ranges = t
+            .seeds
+            .iter()
+            .filter_map(|s| match s {
+                Seed::Range(p) => Some(sh.ranges[p]),
+                _ => None,
+            })
+            .collect();
+        Some(Sig { generation: t.generation, ranges })
+    }
+}
+
+/// One node's frame as the passes read it: `eval_node`'s answer with its
+/// boxes expanded, and the node's share of the counts.
+struct NodeEval {
+    /// The successor nodes (packed), sorted, each once.
+    succ: Vec<u64>,
+    exit: bool,
+    /// A successor without a located object (a death).
+    death: bool,
+    /// Death successors (outcome x configuration), for the report.
+    n_deaths: u32,
+    /// A successor box was clipped to `WINDOW`.
+    clipped: bool,
+    /// Clipped successor boxes per target shape (the nonzero ones).
+    clipped_by: Vec<(u32, u64)>,
+    n_violations: u32,
+    /// The first violation's message.
+    violation: Option<String>,
+    precise: bool,
+}
+
+/// Node answers kept across passes. A node's `NodeEval` and observations are
+/// a function of its cell and its shape's `Sig`, so while the `Sig` holds the
+/// node is not evaluated again. Observations are kept per shape as the join
+/// over exactly the nodes `nodes` holds of it (`agg`, `count`): a pass that
+/// reaches every one of them again joins `agg` as it is; one that does not
+/// observes the reached ones again (`observe`).
+#[derive(Default)]
+struct Memo {
+    nodes: rustc_hash::FxHashMap<u64, NodeEval>,
+    sig: Vec<Option<Sig>>,
+    agg: Vec<Vec<Option<Obs>>>,
+    count: Vec<usize>,
+}
+
+impl Memo {
+    /// Forget every shape whose `Sig` is not `sigs`'.
+    fn keep(&mut self, sigs: &[Option<Sig>]) {
+        self.grow(sigs.len(), 0);
+        let stale: Vec<bool> = (0..self.sig.len()).map(|s| self.sig[s].is_none() || self.sig[s] != sigs[s]).collect();
+        self.nodes.retain(|k, _| !stale[unpack(*k).0]);
+        for (s, st) in stale.iter().enumerate() {
+            if *st {
+                self.sig[s] = None;
+                self.agg[s] = Vec::new();
+                self.count[s] = 0;
+            }
+        }
+    }
+
+    fn grow(&mut self, n_shapes: usize, n_obs: usize) {
+        if self.sig.len() < n_shapes {
+            self.sig.resize(n_shapes, None);
+            self.agg.resize(n_shapes, Vec::new());
+            self.count.resize(n_shapes, 0);
+        }
+        for a in &mut self.agg {
+            if a.len() < n_obs {
+                a.resize(n_obs, None);
+            }
+        }
+    }
+}
+
+fn join_obs(into: &mut [Option<Obs>], from: &[Option<Obs>]) -> Result<()> {
+    for (a, b) in into.iter_mut().zip(from) {
+        if let Some(o) = b {
+            *a = Some(match *a {
+                Some(p) => p.join(*o)?,
+                None => *o,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// One node in the pass's graph: its successors' ids and its flags.
+struct Rec {
+    edges: Vec<u32>,
+    exit: bool,
+    death: bool,
+    clipped: bool,
+}
+
+/// Evaluate node `k`: its `NodeEval`, its observations joined into `obs`.
+fn eval_key(shapes: &[Shape], room: &Room, k: u64, n_obs: usize, obs: &mut [Option<Obs>]) -> Result<NodeEval> {
+    let (id, x, y) = unpack(k);
+    let mut acc = Acc { obs: vec![None; n_obs], clipped: vec![0; shapes.len()], violations: Vec::new(), n_violations: 0, precise: 0 };
+    let out = eval_node(shapes, room, id, (x, y), &mut acc)?;
+    join_obs(obs, &acc.obs)?;
+    let mut succ: Vec<u64> = Vec::new();
+    let (mut exit, mut n_deaths) = (false, 0u32);
+    for (tid, bx) in out.succ {
+        if tid == usize::MAX {
+            exit = true;
+            continue;
+        }
+        // An outcome without a located object is a death: no edge
+        // (plans/level-minus-one.md); `sound_d` seeds it with the respawn.
+        let Some((xl, xh, yl, yh)) = bx else {
+            n_deaths += 1;
+            continue;
+        };
+        for x in xl..=xh {
+            for y in yl..=yh {
+                succ.push(pack((tid, x, y)));
+            }
+        }
+    }
+    succ.sort_unstable();
+    succ.dedup();
+    Ok(NodeEval {
+        succ,
+        exit,
+        death: n_deaths > 0,
+        n_deaths,
+        clipped: out.clipped,
+        clipped_by: acc.clipped.iter().enumerate().filter(|(_, c)| **c > 0).map(|(t, c)| (t as u32, *c)).collect(),
+        n_violations: acc.n_violations as u32,
+        violation: acc.violations.into_iter().next(),
+        precise: acc.precise > 0,
+    })
+}
+
+/// The observations of `keys` (nodes of traced shapes), evaluated again.
+fn observe(shapes: &[Shape], room: &Room, keys: &[u64], threads: usize, n_obs: usize) -> Result<Vec<Option<Obs>>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<Result<Vec<Option<Obs>>>> = std::thread::scope(|scope| {
+        let hs: Vec<_> = (0..threads)
+            .map(|_| {
+                let next = &next;
+                scope.spawn(move || -> Result<Vec<Option<Obs>>> {
+                    let mut obs = vec![None; n_obs];
+                    while let Some(&k) = keys.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                        eval_key(shapes, room, k, n_obs, &mut obs)?;
+                    }
+                    Ok(obs)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("level -1 worker panicked")).collect()
+    });
+    let mut obs = vec![None; n_obs];
+    for r in results {
+        join_obs(&mut obs, &r?)?;
+    }
+    Ok(obs)
+}
+
+/// The work list the workers share.
+struct Queue {
+    stack: Vec<(u32, u64)>,
+    /// Workers evaluating a node (and so maybe about to push more).
+    active: usize,
+    pending: Vec<(u32, u64)>,
+    failed: bool,
+}
+
+/// One pass's walk over the reachable nodes: every worker takes a node,
+/// answers it (from the memo, else `eval_key`), and registers its successors
+/// - no layers, no serial merge between them. A node of a shape not traced
+/// yet is set aside (`pending`) for the caller to trace and resume.
+struct Explore {
+    /// Node id -> key, in order of discovery.
+    keys: Vec<u64>,
+    index: rustc_hash::FxHashMap<u64, u32>,
+    recs: Vec<Option<Rec>>,
+    stack: Vec<(u32, u64)>,
+    pending: Vec<(u32, u64)>,
+    /// Evaluated this pass (for the memo).
+    fresh: Vec<(u64, NodeEval)>,
+    /// This pass's evaluations' observations, per shape.
+    fresh_obs: Vec<Option<Vec<Option<Obs>>>>,
+    /// Memo answers taken, per shape.
+    hits: Vec<usize>,
+    n_violations: usize,
+    n_precise: usize,
+    n_deaths: u64,
+    clipped: Vec<u64>,
+    violations: Vec<String>,
+}
+
+impl Explore {
+    fn new(root: u64) -> Explore {
+        let mut index: rustc_hash::FxHashMap<u64, u32> = HashMap::default();
+        index.insert(root, 0);
+        Explore {
+            keys: vec![root],
+            index,
+            recs: Vec::new(),
+            stack: vec![(0, root)],
+            pending: Vec::new(),
+            fresh: Vec::new(),
+            fresh_obs: Vec::new(),
+            hits: Vec::new(),
+            n_violations: 0,
+            n_precise: 0,
+            n_deaths: 0,
+            clipped: Vec::new(),
+            violations: Vec::new(),
+        }
+    }
+
+    /// Answer every node reachable from `stack` through traced shapes.
+    fn run(&mut self, shapes: &[Shape], room: &Room, memo: &Memo, threads: usize, n_obs: usize) -> Result<()> {
+        use std::sync::{Condvar, Mutex};
+        let n_shapes = shapes.len();
+        let traced = |k: u64| shapes[unpack(k).0].traced.is_some();
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.stack).into_iter().partition(|(_, k)| traced(*k));
+        self.pending.extend(waiting);
+        let queue = Mutex::new(Queue { stack: ready, active: 0, pending: Vec::new(), failed: false });
+        let wake = Condvar::new();
+        let index = Mutex::new((std::mem::take(&mut self.index), std::mem::take(&mut self.keys)));
+        /// What a worker hands back.
+        struct Done {
+            recs: Vec<(u32, Rec)>,
+            fresh: Vec<(u64, NodeEval)>,
+            obs: Vec<Option<Vec<Option<Obs>>>>,
+            hits: Vec<usize>,
+            n_violations: usize,
+            n_precise: usize,
+            n_deaths: u64,
+            clipped: Vec<u64>,
+            violations: Vec<String>,
+        }
+        let results: Vec<Result<Done>> = std::thread::scope(|scope| {
+            let hs: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (queue, wake, index, traced) = (&queue, &wake, &index, &traced);
+                    scope.spawn(move || -> Result<Done> {
+                        // A worker that panics stops the others, which would
+                        // otherwise wait for its node forever.
+                        struct OnPanic<'q>(&'q Mutex<Queue>, &'q Condvar);
+                        impl Drop for OnPanic<'_> {
+                            fn drop(&mut self) {
+                                if std::thread::panicking() {
+                                    self.0.lock().unwrap_or_else(|e| e.into_inner()).failed = true;
+                                    self.1.notify_all();
+                                }
+                            }
+                        }
+                        let _on_panic = OnPanic(queue, wake);
+                        let mut d = Done { recs: Vec::new(), fresh: Vec::new(), obs: vec![None; n_shapes], hits: vec![0; n_shapes], n_violations: 0, n_precise: 0, n_deaths: 0, clipped: vec![0; n_shapes], violations: Vec::new() };
+                        loop {
+                            let (n, k) = {
+                                let mut q = queue.lock().unwrap();
+                                loop {
+                                    if q.failed {
+                                        return Ok(d);
+                                    }
+                                    if let Some(item) = q.stack.pop() {
+                                        q.active += 1;
+                                        break item;
+                                    }
+                                    if q.active == 0 {
+                                        return Ok(d);
+                                    }
+                                    q = wake.wait(q).unwrap();
+                                }
+                            };
+                            let s = unpack(k).0;
+                            let mut fresh_e: Option<NodeEval> = None;
+                            let e: &NodeEval = match memo.nodes.get(&k) {
+                                Some(e) => {
+                                    d.hits[s] += 1;
+                                    e
+                                }
+                                None => {
+                                    let obs = d.obs[s].get_or_insert_with(|| vec![None; n_obs]);
+                                    match eval_key(shapes, room, k, n_obs, obs) {
+                                        Ok(e) => fresh_e.insert(e),
+                                        Err(err) => {
+                                            let mut q = queue.lock().unwrap();
+                                            q.failed = true;
+                                            q.active -= 1;
+                                            wake.notify_all();
+                                            return Err(err);
+                                        }
+                                    }
+                                }
+                            };
+                            d.n_violations += e.n_violations as usize;
+                            d.n_precise += e.precise as usize;
+                            d.n_deaths += e.n_deaths as u64;
+                            for &(t, c) in &e.clipped_by {
+                                d.clipped[t as usize] += c;
+                            }
+                            if let Some(v) = &e.violation {
+                                if d.violations.len() < 12 {
+                                    d.violations.push(v.clone());
+                                }
+                            }
+                            let mut edges = Vec::with_capacity(e.succ.len());
+                            let mut new: Vec<(u32, u64)> = Vec::new();
+                            {
+                                let mut ix = index.lock().unwrap();
+                                let (map, keys) = &mut *ix;
+                                for &t in &e.succ {
+                                    let id = match map.get(&t) {
+                                        Some(&id) => id,
+                                        None => {
+                                            let id = keys.len() as u32;
+                                            map.insert(t, id);
+                                            keys.push(t);
+                                            new.push((id, t));
+                                            id
+                                        }
+                                    };
+                                    edges.push(id);
+                                }
+                            }
+                            d.recs.push((n, Rec { edges, exit: e.exit, death: e.death, clipped: e.clipped }));
+                            if let Some(f) = fresh_e {
+                                d.fresh.push((k, f));
+                            }
+                            let mut q = queue.lock().unwrap();
+                            for item in new {
+                                if traced(item.1) {
+                                    q.stack.push(item);
+                                } else {
+                                    q.pending.push(item);
+                                }
+                            }
+                            q.active -= 1;
+                            wake.notify_all();
+                        }
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("level -1 worker panicked")).collect()
+        });
+        let (index, keys) = index.into_inner().unwrap();
+        self.index = index;
+        self.keys = keys;
+        self.pending.extend(queue.into_inner().unwrap().pending);
+        self.recs.resize_with(self.keys.len(), || None);
+        self.hits.resize(n_shapes, 0);
+        self.fresh_obs.resize_with(n_shapes, || None);
+        self.clipped.resize(n_shapes, 0);
+        let mut first_err = None;
+        for r in results {
+            let d = match r {
+                Ok(d) => d,
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                    continue;
+                }
+            };
+            for (n, rec) in d.recs {
+                self.recs[n as usize] = Some(rec);
+            }
+            self.fresh.extend(d.fresh);
+            for (s, o) in d.obs.into_iter().enumerate() {
+                if let Some(o) = o {
+                    match &mut self.fresh_obs[s] {
+                        Some(a) => {
+                            a.resize(n_obs, None);
+                            join_obs(a, &o)?;
+                        }
+                        a @ None => *a = Some(o),
+                    }
+                }
+            }
+            for (h, x) in self.hits.iter_mut().zip(&d.hits) {
+                *h += x;
+            }
+            self.n_violations += d.n_violations;
+            self.n_precise += d.n_precise;
+            self.n_deaths += d.n_deaths;
+            for (c, x) in self.clipped.iter_mut().zip(&d.clipped) {
+                *c += x;
+            }
+            for v in d.violations {
+                if self.violations.len() < 12 {
+                    self.violations.push(v);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Graph1 {
+    /// The pass's graph, its nodes in KEY order (the walk's discovery order
+    /// depends on the scheduling; the table does not).
+    fn from_explore(keys: Vec<u64>, recs: Vec<Option<Rec>>) -> Graph1 {
+        let mut order: Vec<u32> = (0..keys.len() as u32).collect();
+        order.sort_unstable_by_key(|&i| keys[i as usize]);
+        let mut renum = vec![0u32; keys.len()];
+        for (new, &old) in order.iter().enumerate() {
+            renum[old as usize] = new as u32;
+        }
+        let nodes: Vec<(usize, i16, i16)> = order.iter().map(|&i| unpack(keys[i as usize])).collect();
+        let index = nodes.iter().enumerate().map(|(i, k)| (*k, i as u32)).collect();
+        let mut recs = recs;
+        let mut g = Graph1 { nodes, index, edges: Vec::with_capacity(order.len()), exits: Vec::new(), deaths: Vec::new(), clipped: Vec::new() };
+        for &old in &order {
+            let r = recs[old as usize].take().expect("every reached node is answered");
+            let mut es: Vec<u32> = r.edges.iter().map(|e| renum[*e as usize]).collect();
+            es.sort_unstable();
+            g.edges.push(es);
+            g.exits.push(r.exit);
+            g.deaths.push(r.death);
+            g.clipped.push(r.clipped);
+        }
+        g
+    }
 }
 
 /// The table: the lattice walk, the spawn chain, the passes to inductive ranges,
@@ -1154,37 +1768,26 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
     let mut pass = 0usize;
     // How often each range has grown (`widen`).
     let mut grown: BTreeMap<(usize, Path), u32> = BTreeMap::new();
+    // Node answers kept across passes: a node of a shape whose trace and seed
+    // ranges did not change is not evaluated again (`Memo`).
+    let mut memo = Memo::default();
     let g1 = loop {
         pass += 1;
         ensure!(pass <= 16, "the level -1 ranges did not converge in 16 passes");
         let t_pass = std::time::Instant::now();
         let mut t_trace = std::time::Duration::ZERO;
-        let mut g = Graph1 { nodes: Vec::new(), index: HashMap::new(), edges: Vec::new(), exits: Vec::new(), deaths: Vec::new(), clipped: Vec::new() };
-        let mut obs: Vec<Option<Obs>> = Vec::new();
-        let mut violations: Vec<String> = Vec::new();
-        let mut n_violations = 0usize;
-        let mut n_precise = 0usize;
-        let mut clipped: Vec<u64> = Vec::new();
-        let add = |g: &mut Graph1, k: (usize, i16, i16)| -> (u32, bool) {
-            if let Some(&i) = g.index.get(&k) {
-                return (i, false);
+        let sigs: Vec<Option<Sig>> = (0..table.shapes.len()).map(|s| table.sig(s)).collect();
+        memo.keep(&sigs);
+        let mut ex = Explore::new(pack((end_id, end_xy.0, end_xy.1)));
+        loop {
+            ex.run(&table.shapes, &table.room, &memo, threads, table.obs_keys.len())?;
+            // Nodes of shapes not traced yet wait for their trace.
+            let pending = std::mem::take(&mut ex.pending);
+            if pending.is_empty() {
+                break;
             }
-            let i = g.nodes.len() as u32;
-            g.nodes.push(k);
-            g.index.insert(k, i);
-            g.edges.push(Vec::new());
-            g.exits.push(false);
-            g.deaths.push(false);
-            g.clipped.push(false);
-            (i, true)
-        };
-        let mut frontier: Vec<u32> = vec![add(&mut g, (end_id, end_xy.0, end_xy.1)).0];
-        let mut n_deaths = 0u64;
-        let mut layers = 0usize;
-        while !frontier.is_empty() {
-            layers += 1;
             let tt = std::time::Instant::now();
-            let ids: BTreeSet<usize> = frontier.iter().map(|n| g.nodes[*n as usize].0).collect();
+            let ids: BTreeSet<usize> = pending.iter().map(|(_, k)| unpack(*k).0).collect();
             for id in ids {
                 if table.shapes[id].traced.is_none() {
                     table.trace(&mut tr, id)?;
@@ -1192,88 +1795,59 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
                 }
             }
             t_trace += tt.elapsed();
-            let n_obs = table.obs_keys.len();
-            let n_shapes = table.shapes.len();
-            clipped.resize(n_shapes, 0);
-            obs.resize(n_obs, None);
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let (sref, rref, fref, gref) = (&table.shapes, &table.room, &frontier, &g);
-            let results: Vec<Result<(Vec<(u32, NodeOut)>, Acc)>> = std::thread::scope(|scope| {
-                let hs: Vec<_> = (0..threads)
-                    .map(|_| {
-                        let next = &next;
-                        scope.spawn(move || -> Result<(Vec<(u32, NodeOut)>, Acc)> {
-                            let mut acc = Acc { obs: vec![None; n_obs], clipped: vec![0; n_shapes], violations: Vec::new(), n_violations: 0, precise: 0 };
-                            let mut done = Vec::new();
-                            loop {
-                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let Some(&n) = fref.get(i) else { break };
-                                let (id, x, y) = gref.nodes[n as usize];
-                                done.push((n, eval_node(sref, rref, id, (x, y), &mut acc)?));
-                            }
-                            Ok((done, acc))
-                        })
-                    })
-                    .collect();
-                hs.into_iter().map(|h| h.join().expect("level -1 worker panicked")).collect()
-            });
-            let mut new_frontier = Vec::new();
-            for r in results {
-                let (done, acc) = r?;
-                for (slot, o) in acc.obs.into_iter().enumerate() {
-                    if let Some(o) = o {
-                        obs[slot] = Some(match obs[slot] {
-                            Some(p) => p.join(o)?,
-                            None => o,
-                        });
-                    }
-                }
-                n_violations += acc.n_violations;
-                n_precise += acc.precise;
-                for (c, k) in clipped.iter_mut().zip(&acc.clipped) {
-                    *c += k;
-                }
-                violations.extend(acc.violations);
-                for (n, out) in done {
-                    let mut es: BTreeSet<u32> = BTreeSet::new();
-                    if out.clipped {
-                        g.clipped[n as usize] = true;
-                    }
-                    for (tid, bx) in out.succ {
-                        if tid == usize::MAX {
-                            g.exits[n as usize] = true;
-                            continue;
-                        }
-                        // An outcome without a located object is a death:
-                        // no edge (plans/level-minus-one.md); `sound_d` seeds
-                        // it with the respawn.
-                        let Some((xl, xh, yl, yh)) = bx else {
-                            n_deaths += 1;
-                            g.deaths[n as usize] = true;
-                            continue;
-                        };
-                        for (x, y) in (xl..=xh).flat_map(|x| (yl..=yh).map(move |y| (x, y))) {
-                            let (m, new) = add(&mut g, (tid, x, y));
-                            es.insert(m);
-                            if new {
-                                new_frontier.push(m);
-                            }
-                        }
-                    }
-                    g.edges[n as usize] = es.into_iter().collect();
-                }
-            }
-            frontier = new_frontier;
+            ex.stack = pending;
         }
+        let n_obs = table.obs_keys.len();
+        let n_shapes = table.shapes.len();
+        memo.grow(n_shapes, n_obs);
+        // The observations, per shape: the memo's join (when every node it
+        // holds was reached again) and this pass's evaluations.
+        let mut obs: Vec<Option<Obs>> = vec![None; n_obs];
+        let mut reached: Vec<Vec<u64>> = vec![Vec::new(); n_shapes];
+        for &k in &ex.keys {
+            reached[unpack(k).0].push(k);
+        }
+        let mut reobserved = 0usize;
+        for s in 0..n_shapes {
+            let hits = ex.hits.get(s).copied().unwrap_or(0);
+            let mut agg: Vec<Option<Obs>> = if hits == memo.count[s] {
+                std::mem::take(&mut memo.agg[s])
+            } else {
+                // A node the memo holds was not reached: its observations
+                // are in the memo's join, so the reached ones it holds are
+                // observed again and the rest forgotten.
+                let again: Vec<u64> = reached[s].iter().copied().filter(|k| memo.nodes.contains_key(k)).collect();
+                reobserved += again.len();
+                let keep: HashSet<u64> = reached[s].iter().copied().collect();
+                memo.nodes.retain(|k, _| unpack(*k).0 != s || keep.contains(k));
+                observe(&table.shapes, &table.room, &again, threads, n_obs)?
+            };
+            agg.resize(n_obs, None);
+            if let Some(o) = ex.fresh_obs.get_mut(s).and_then(|o| o.take()) {
+                join_obs(&mut agg, &o)?;
+            }
+            join_obs(&mut obs, &agg)?;
+            memo.agg[s] = agg;
+            memo.count[s] = reached[s].len();
+            memo.sig[s] = if reached[s].is_empty() { None } else { table.sig(s) };
+        }
+        let n_fresh = ex.fresh.len();
+        for (k, e) in ex.fresh.drain(..) {
+            memo.nodes.insert(k, e);
+        }
+        let Explore { keys, recs, n_violations, n_precise, n_deaths, mut clipped, violations, .. } = ex;
+        clipped.resize(n_shapes, 0);
+        let g = Graph1::from_explore(keys, recs);
         let n_edges: usize = g.edges.iter().map(|e| e.len()).sum();
         say!(
             rep,
-            "pass {pass}: {} nodes, {} edges, {} exit nodes, {n_deaths} death successors, {layers} layers; {:.1} s ({:.1} s tracing); {n_precise} nodes evaluated precisely; {n_violations} violations",
+            "pass {pass}: {} nodes, {} edges, {} exit nodes, {n_deaths} death successors; {:.1} s ({:.1} s tracing); {n_precise} nodes evaluated precisely; {n_violations} violations; {n_fresh} nodes evaluated, {} reused, {reobserved} observed again",
             g.nodes.len(),
             n_edges,
             g.exits.iter().filter(|e| **e).count(),
             t_pass.elapsed().as_secs_f64(),
-            t_trace.as_secs_f64()
+            t_trace.as_secs_f64(),
+            g.nodes.len() - n_fresh
         )?;
         if clipped.iter().any(|c| *c > 0) {
             say!(rep, "  successors clipped to the window, per target shape: {:?}", clipped.iter().enumerate().filter(|(_, c)| **c > 0).collect::<Vec<_>>())?;
@@ -1281,7 +1855,6 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         for v in violations.iter().take(12) {
             say!(rep, "  VIOLATION {v}")?;
         }
-
         // The inductive check.
         let mut changes: Vec<String> = Vec::new();
         for (slot, (id, p)) in table.obs_keys.clone().iter().enumerate() {

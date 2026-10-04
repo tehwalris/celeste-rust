@@ -178,7 +178,7 @@ pub struct CompactStats {
 /// Records per index block of a run.
 const STRIDE: usize = 256;
 const RUN_MAGIC: &[u8; 4] = b"CERN";
-const RUN_VERSION: u32 = 3;
+const RUN_VERSION: u32 = 4;
 
 #[inline]
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
