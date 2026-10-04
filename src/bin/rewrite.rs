@@ -3148,50 +3148,93 @@ fn main() -> Result<()> {
             }
             let start = start.ok_or_else(|| anyhow::anyhow!("no frame-0 row"))?;
             // The remainder-free backward's marks and deadlines (`--marked-only`).
+            let t_bfs = std::time::Instant::now();
             let deadline: Option<rustc_hash::FxHashMap<u64, u16>> = if marked_only {
                 let eg = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
                 let (marks, _) = celeste_rust::search::edges::bfs(&eg, horizon, wins.iter().copied());
-                Some(marks.with_deadlines().into_iter().collect())
+                // The BFS never marks layer 0 (the start is given): its
+                // deadline is 0 when the win is exactly tight.
+                let mut d: rustc_hash::FxHashMap<u64, u16> = marks.with_deadlines().into_iter().collect();
+                d.entry(start).or_insert(0);
+                Some(d)
             } else {
                 None
             };
-            let keep = |id: u64| deadline.as_ref().is_none_or(|d| d.contains_key(&id) || wins.contains(&id));
-            // Edges: the arc records of frames 1..=horizon, one per predecessor bit.
-            let conv = |t: &arc_edges::Transfer| -> Result<arc_dp::Transfer> {
-                anyhow::ensure!(t.guard.0.len() == 1, "a guard of {} segments", t.guard.0.len());
-                Ok(arc_dp::Transfer { guard: t.guard.0[0], action: t.action })
-            };
-            let mut edges = Vec::new();
-            let edges_dir = dir.join("edges");
-            for f in 1..=horizon {
-                for e in arc_edges::read_frame(&edges_dir, f)? {
-                    if !keep(e.target) {
-                        continue;
-                    }
-                    let (x, y) = (conv(&e.x)?, conv(&e.y)?);
-                    let mut m = e.mask;
-                    while m != 0 {
-                        let i = m.trailing_zeros() as u64;
-                        m &= m - 1;
-                        if keep(e.base + i) {
-                            edges.push(arc_dp::Edge { src: e.base + i, dst: e.target, x, y });
+            let t_bfs = t_bfs.elapsed().as_secs_f64();
+            let t_read = std::time::Instant::now();
+            // The nodes: the marked ones (and the wins), or every stored row.
+            let mut ids: Vec<u64> = match &deadline {
+                Some(d) => d.keys().copied().chain(wins.iter().copied()).collect(),
+                None => {
+                    let mut v = Vec::new();
+                    for f in 0..=horizon {
+                        for (seq, file) in frame_files_seq(dir, f)? {
+                            let rows: u32 = file.cell_counts().map(|(_, n)| n).sum();
+                            v.extend((0..rows).map(|r| pack_id(f, seq, r)));
                         }
                     }
+                    v
                 }
-            }
-            let n_edges = edges.len();
+            };
+            ids.sort_unstable();
+            ids.dedup();
+            let index: rustc_hash::FxHashMap<u64, u32> = ids.iter().enumerate().map(|(i, &id)| (id, i as u32)).collect();
+            // Edges: the arc records of frames 1..=horizon, one per predecessor
+            // bit between indexed nodes, streamed by `threads()` workers
+            // pulling frames.
+            let edges_dir = dir.join("edges");
+            let next = std::sync::atomic::AtomicU32::new(1);
+            let parts: Vec<Result<Vec<(u32, arc_dp::Out)>>> = std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..celeste_rust::frame::threads())
+                    .map(|_| {
+                        sc.spawn(|| -> Result<Vec<(u32, arc_dp::Out)>> {
+                            let mut out = Vec::new();
+                            loop {
+                                let f = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if f > horizon {
+                                    return Ok(out);
+                                }
+                                arc_edges::for_each_rec(&edges_dir, f, |(target, base, x, y, mask)| {
+                                    let Some(&dst) = index.get(&target) else { return };
+                                    let (x, y) = (x.transfer(), y.transfer());
+                                    let mut m = mask;
+                                    while m != 0 {
+                                        let i = m.trailing_zeros() as u64;
+                                        m &= m - 1;
+                                        if let Some(&src) = index.get(&(base + i)) {
+                                            out.push((src, arc_dp::Out { dst, x, y }));
+                                        }
+                                    }
+                                })?;
+                            }
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().expect("an edge loader panicked")).collect()
+            });
+            let parts: Vec<Vec<(u32, arc_dp::Out)>> = parts.into_iter().collect::<Result<_>>()?;
+            let n_edges: usize = parts.iter().map(|p| p.len()).sum();
             let n_marked = deadline.as_ref().map(|d| d.len());
-            let g = arc_dp::Graph::new(edges, Box::new(celeste_rust::frame::id_layer), wins.iter().copied(), deadline);
-            eprintln!("[arc] {} edges, {} win rows, marked nodes {:?}; loaded in {:.1} s", n_edges, wins.len(), n_marked, t0.elapsed().as_secs_f64());
+            drop(index);
+            let t_read = t_read.elapsed().as_secs_f64();
+            let t_graph = std::time::Instant::now();
+            let g = arc_dp::Graph::new(ids, parts, celeste_rust::frame::id_layer, wins.iter().copied(), deadline.as_ref());
+            eprintln!(
+                "[arc] {} edges, {} nodes, {} win rows, marked nodes {:?}; loaded in {:.1} s (marks {:.1} s, records {:.1} s, graph {:.1} s)",
+                n_edges,
+                g.len(),
+                wins.len(),
+                n_marked,
+                t0.elapsed().as_secs_f64(),
+                t_bfs,
+                t_read,
+                t_graph.elapsed().as_secs_f64()
+            );
             let tb = std::time::Instant::now();
             let w = arc_dp::backward(&g, horizon);
             let tb = tb.elapsed().as_secs_f64();
             for t in (0..horizon).rev().step_by(4) {
-                let mut m = w.w[t as usize].clone();
-                for n in &wins {
-                    m.remove(n);
-                }
-                let (n, med, p90, max) = arc_dp::fragmentation(&m);
+                let (n, med, p90, max) = arc_dp::fragmentation(w.frame(t).filter(|&(i, _)| !g.is_win(i)).map(|(_, r)| r));
                 eprintln!("[arc] W frame {t:3}: {n} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}");
             }
             if partition {
@@ -3208,13 +3251,12 @@ fn main() -> Result<()> {
             // The start has no player yet (the spawn): its remainder is no
             // input of anything; any point stands for it.
             let p0 = (arcs::point(0), arcs::point(0));
-            let in_w = w.at(0, start).is_some_and(|r| r.contains(p0.0, p0.1));
+            let start = g.index(start).ok_or_else(|| anyhow::anyhow!("the start has no edge"))?;
             let tf = std::time::Instant::now();
-            let found = arc_dp::forward(&g, &w, start, p0, horizon);
+            let found = arc_dp::optimum(&g, &w, start, p0, horizon);
             println!(
-                "h{horizon}: start in W_0 = {in_w}; exact forward: {}; backward {:.2} s, forward {:.2} s",
-                match &found { Some(f) => format!("WIN at f{} (path of {} nodes)", f.frame, f.path.len()), None => "no win".to_string() },
-                tb,
+                "h{horizon}: {}; backward {tb:.2} s, optimum + witness {:.3} s",
+                match &found { Some(f) => format!("OPTIMAL (remainder-exact over this graph) f{}, a witness of {} nodes", f.frame, f.path.len()), None => format!("REFUTED: no win by f{horizon}") },
                 tf.elapsed().as_secs_f64()
             );
         }
@@ -3333,18 +3375,17 @@ fn main() -> Result<()> {
                     edges.push(arc_dp::Edge {
                         src: ni as u64,
                         dst: match to { To::Win => WIN, To::Node(j) => *j as u64 },
-                        x: arc_dp::Transfer { guard: seg(&e.gx)?, action: e.ax },
-                        y: arc_dp::Transfer { guard: seg(&e.gy)?, action: e.ay },
+                        x: celeste_rust::search::arcs::Transfer { guard: seg(&e.gx)?, action: e.ax },
+                        y: celeste_rust::search::arcs::Transfer { guard: seg(&e.gy)?, action: e.ay },
                     });
                 }
             }
-            let g = arc_dp::Graph::new(edges, Box::new(move |n| layer.get(&n).copied().unwrap_or(u32::MAX)), [WIN], None);
+            let g = arc_dp::Graph::from_edges(edges, move |n| layer.get(&n).copied().unwrap_or(u32::MAX), [WIN], None);
+            let s0 = g.index(0).ok_or_else(|| anyhow::anyhow!("the start has no edge"))?;
             let tw = std::time::Instant::now();
             let w = arc_dp::backward(&g, horizon);
             for t in (0..horizon).rev() {
-                let mut m = w.w[t as usize].clone();
-                m.remove(&WIN);
-                let (n, med, p90, max) = arc_dp::fragmentation(&m);
+                let (n, med, p90, max) = arc_dp::fragmentation(w.frame(t).filter(|&(i, _)| !g.is_win(i)).map(|(_, r)| r));
                 eprintln!("[arc] W frame {t:3}: {n} nodes can win (of {} occupiable); rectangles per node med {med} p90 {p90} max {max}", layer_nodes[t as usize].len());
             }
             // The goal-free exact partition: cut points per node and frame.
@@ -3361,11 +3402,11 @@ fn main() -> Result<()> {
                 );
             }
             let (sx, sy) = (point(start_rem.0), point(start_rem.1));
-            println!("start remainder ({}, {}): in W_0(start) = {}; backward {:.2} s", start_rem.0, start_rem.1, w.at(0, 0).is_some_and(|r| r.contains(sx, sy)), tw.elapsed().as_secs_f64());
-            if let Some(r) = w.at(0, 0).and_then(|r| r.0.first()) {
-                let p = (r.x.0[0].lo, r.y.0[0].lo);
-                eprintln!("[arc] W_0(start) = {:?}", w.at(0, 0));
-                if let Some(f) = arc_dp::forward(&g, &w, 0, p, horizon) {
+            println!("start remainder ({}, {}): in W_0(start) = {}; backward {:.2} s", start_rem.0, start_rem.1, w.at(0, s0).is_some_and(|r| r.contains(sx, sy)), tw.elapsed().as_secs_f64());
+            if let Some((ys, xs)) = w.at(0, s0).and_then(|r| r.slabs().next()) {
+                let p = (xs[0].lo, ys.lo);
+                eprintln!("[arc] W_0(start) = {:?}", w.at(0, s0));
+                if let Some(f) = arc_dp::optimum(&g, &w, s0, p, horizon) {
                     eprintln!("[arc] from {:?} a win at {}:", p, f.frame);
                     for (n, q) in &f.path {
                         let desc = if *n == WIN { "WIN".to_string() } else { player_summary(Block::from_state(&nodes[*n as usize].state)?.rt2()) };
@@ -3373,7 +3414,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            let found = arc_dp::forward(&g, &w, 0, (sx, sy), horizon);
+            let found = arc_dp::optimum(&g, &w, s0, (sx, sy), horizon);
             println!(
                 "exact forward inside W from the start's remainder: earliest win {:?}; {} nodes, {} ref steps, {:.1} s",
                 found.as_ref().map(|f| f.frame),
@@ -3473,7 +3514,7 @@ fn main() -> Result<()> {
                 extra_total += extra;
                 for r in &recs {
                     for (axis, t) in [("x", &r.x), ("y", &r.y)] {
-                        let whole = t.guard == Set::full();
+                        let whole = t.guard == celeste_rust::search::arcs::Seg { lo: 0, hi: celeste_rust::search::arcs::CIRCLE };
                         let k = format!("{axis} {} {}", if whole { "whole" } else { "piece" }, match t.action { celeste_rust::search::arcs::Action::Rotate(_) => "rotate", _ => "const" });
                         *kinds.entry(k).or_default() += 1;
                     }
@@ -3486,11 +3527,11 @@ fn main() -> Result<()> {
                     let tgt_row = row_of(r.target)?;
                     let (tshape, tkeys, tcells) = widened_keys(&tgt_row, level)?;
                     let target = (tshape, tkeys[0], tcells[0]);
-                    let (gx, gy) = (r.x.guard.0[0], r.y.guard.0[0]);
+                    let (gx, gy) = (r.x.guard, r.y.guard);
                     // Every guard of this (pred, target), as rectangles.
                     let mut union = Rects::empty();
                     for q in recs.iter().filter(|q| q.target == r.target && src >= q.base && src < q.base + 64 && q.mask >> (src - q.base) & 1 == 1) {
-                        union.add(Rect { x: q.x.guard.clone(), y: q.y.guard.clone() });
+                        union.add(Rect { x: q.x.guard_set(), y: q.y.guard_set() });
                     }
                     let has_player = rem_cells(src_row.rt2()).is_some();
                     if !has_player {

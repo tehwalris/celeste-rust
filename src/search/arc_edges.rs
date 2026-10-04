@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::arcs::{self, Action, Set, CIRCLE};
+use super::arcs::{self, Action, Seg, Set, Transfer, CIRCLE};
 
 /// `CELESTE_ARC_EDGES=1`: record the arc-edge stream (read once).
 pub fn enabled() -> bool {
@@ -117,7 +117,7 @@ impl AxisXfer {
         }
     }
     pub fn transfer(&self) -> Transfer {
-        Transfer { guard: self.guard(), action: self.action() }
+        Transfer { guard: Seg { lo: self.lo, hi: self.hi }, action: self.action() }
     }
     fn rotate(lo: u32, hi: u32, v: i64) -> Self {
         AxisXfer { lo, hi, tag: 0, val: v.rem_euclid(ONE) as i32 }
@@ -128,14 +128,6 @@ impl AxisXfer {
         }
         Ok(AxisXfer { lo, hi, tag: 1, val: arcs::point(rem as i32) as i32 })
     }
-}
-
-/// What a frame does to one axis's remainder along an edge: taken from
-/// `guard` (a single arc), mapped by `action`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Transfer {
-    pub guard: Set,
-    pub action: Action,
 }
 
 /// One arc-edge record: the predecessors `mask` (bits over the 64 ids from
@@ -285,29 +277,41 @@ pub fn discard_after(edges_dir: &Path, last: u32) -> Result<()> {
 }
 
 /// Every record of frame `frame` (its targets are in any layer up to
-/// `frame`, its predecessors in layer `frame - 1`), compact, in file order.
-pub fn read_frame_raw(edges_dir: &Path, frame: u32) -> Result<Vec<Rec>> {
+/// `frame`, its predecessors in layer `frame - 1`), streamed in file order
+/// without holding the frame: a late frame of a big room is gigabytes.
+pub fn for_each_rec(edges_dir: &Path, frame: u32, mut f: impl FnMut(Rec)) -> Result<()> {
+    use std::io::Read;
     let mut files: Vec<PathBuf> = std::fs::read_dir(frame_dir(edges_dir, frame))
         .with_context(|| format!("no arc records for f{frame} under {}", edges_dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "bin"))
         .collect();
     files.sort();
-    let mut out = Vec::new();
+    let mut buf = vec![0u8; RECORD_BYTES * (1 << 16)];
     for p in files {
-        let b = std::fs::read(&p)?;
-        anyhow::ensure!(b.len() % RECORD_BYTES == 0, "{}: {} bytes, not whole records", p.display(), b.len());
-        out.extend(b.chunks_exact(RECORD_BYTES).map(decode_rec));
+        let mut file = std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
+        let mut have = 0;
+        loop {
+            let n = file.read(&mut buf[have..])?;
+            if n == 0 {
+                anyhow::ensure!(have == 0, "{}: a partial record at the end", p.display());
+                break;
+            }
+            have += n;
+            let whole = have - have % RECORD_BYTES;
+            buf[..whole].chunks_exact(RECORD_BYTES).for_each(|b| f(decode_rec(b)));
+            buf.copy_within(whole..have, 0);
+            have -= whole;
+        }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Every record of frame `frame`, decoded.
 pub fn read_frame(edges_dir: &Path, frame: u32) -> Result<Vec<ArcEdge>> {
-    Ok(read_frame_raw(edges_dir, frame)?
-        .into_iter()
-        .map(|r| ArcEdge { target: r.0, base: r.1, mask: r.4, x: r.2.transfer(), y: r.3.transfer() })
-        .collect())
+    let mut out = Vec::new();
+    for_each_rec(edges_dir, frame, |r| out.push(ArcEdge { target: r.0, base: r.1, mask: r.4, x: r.2.transfer(), y: r.3.transfer() }))?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -367,7 +371,7 @@ mod tests {
     #[test]
     fn no_split_is_identity_or_a_new_player() {
         let none = RawAxis { took: false, pre: (0, 0), frag: (0, 0), ox: (0, 0), fin: Some((-32768, 32767)) };
-        assert_eq!(decode_axis(&none).unwrap().transfer(), Transfer { guard: Set::full(), action: Action::Rotate(0) });
+        assert_eq!(decode_axis(&none).unwrap().transfer(), Transfer { guard: Seg { lo: 0, hi: CIRCLE }, action: Action::Rotate(0) });
         let born = RawAxis { fin: Some((0, 0)), ..none };
         assert_eq!(decode_axis(&born).unwrap().action(), Action::Const(32768));
         let gone = RawAxis { fin: None, ..none };

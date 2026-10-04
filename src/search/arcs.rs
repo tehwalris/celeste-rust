@@ -150,6 +150,24 @@ impl Action {
     }
 }
 
+/// One axis of an edge: the remainders that take it (one piece of the
+/// circle: a guard never wraps - the pieces are cut at the wrap) and what it
+/// does to them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Transfer {
+    pub guard: Seg,
+    pub action: Action,
+}
+
+impl Transfer {
+    pub fn guard_set(&self) -> Set {
+        Set::seg(self.guard.lo, self.guard.hi)
+    }
+    pub fn takes(&self, p: u32) -> bool {
+        self.guard.lo <= p && p < self.guard.hi
+    }
+}
+
 /// The two pieces of the circle a speed `v` (raw) cuts it into: the points
 /// whose `rem + v + 1/2` stays below the next integer, and the rest (one
 /// piece when `v` is a whole number of pixels).
@@ -209,6 +227,173 @@ impl Rects {
     }
 }
 
+/// One axis-aligned piece of the torus: `[y.lo, y.hi) x [x.lo, x.hi)`, no
+/// wrap on either axis (a wrapping arc is two pieces).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Piece {
+    pub y: Seg,
+    pub x: Seg,
+}
+
+/// A slab of a `Region`: `[lo, hi)` of y, its x set `xs[start..end]` (the
+/// start is the previous slab's end).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Slab {
+    lo: u32,
+    hi: u32,
+    end: u32,
+}
+
+/// A set of the torus in CANONICAL form: y slabs, sorted and disjoint, each
+/// with a non-empty x set (sorted, disjoint, non-touching segments), two
+/// touching slabs never with the same x set. Equal sets are equal values, so
+/// a union of many contributions costs one sweep, not a pairwise merge.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Region {
+    slabs: Vec<Slab>,
+    xs: Vec<Seg>,
+}
+
+/// `s` rotated by `d` (already in `0..CIRCLE`): one or two segments.
+fn rot_seg(s: Seg, d: u32, mut f: impl FnMut(Seg)) {
+    let (lo, hi) = (s.lo + d, s.hi + d);
+    if hi <= CIRCLE {
+        f(Seg { lo, hi });
+    } else if lo >= CIRCLE {
+        f(Seg { lo: lo - CIRCLE, hi: hi - CIRCLE });
+    } else {
+        f(Seg { lo, hi: CIRCLE });
+        f(Seg { lo: 0, hi: hi - CIRCLE });
+    }
+}
+
+fn clip(s: Seg, g: Seg) -> Option<Seg> {
+    let (lo, hi) = (s.lo.max(g.lo), s.hi.min(g.hi));
+    (lo < hi).then_some(Seg { lo, hi })
+}
+
+impl Region {
+    pub fn full() -> Self {
+        Region { slabs: vec![Slab { lo: 0, hi: CIRCLE, end: 1 }], xs: vec![Seg { lo: 0, hi: CIRCLE }] }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.slabs.is_empty()
+    }
+    /// Slabs (a y segment and its x set), in y order.
+    pub fn slabs(&self) -> impl Iterator<Item = (Seg, &[Seg])> + '_ {
+        let mut start = 0;
+        self.slabs.iter().map(move |s| {
+            let xs = &self.xs[start as usize..s.end as usize];
+            start = s.end;
+            (Seg { lo: s.lo, hi: s.hi }, xs)
+        })
+    }
+    pub fn n_slabs(&self) -> usize {
+        self.slabs.len()
+    }
+    pub fn n_segs(&self) -> usize {
+        self.xs.len()
+    }
+    fn slab_at(&self, y: u32) -> Option<&[Seg]> {
+        let i = self.slabs.partition_point(|s| s.hi <= y);
+        let s = self.slabs.get(i).filter(|s| s.lo <= y)?;
+        let start = if i == 0 { 0 } else { self.slabs[i - 1].end };
+        Some(&self.xs[start as usize..s.end as usize])
+    }
+    pub fn contains(&self, x: u32, y: u32) -> bool {
+        self.slab_at(y).is_some_and(|xs| {
+            let i = xs.partition_point(|s| s.hi <= x);
+            xs.get(i).is_some_and(|s| s.lo <= x)
+        })
+    }
+    /// The union of `pieces`, canonical (one sweep over y). `pieces` is
+    /// left in an unspecified order.
+    pub fn from_pieces(pieces: &mut [Piece], scratch: &mut Vec<Seg>) -> Region {
+        let mut out = Region::default();
+        if pieces.is_empty() {
+            return out;
+        }
+        pieces.sort_unstable_by_key(|p| p.y.lo);
+        let mut bounds: Vec<u32> = pieces.iter().flat_map(|p| [p.y.lo, p.y.hi]).collect();
+        bounds.sort_unstable();
+        bounds.dedup();
+        let mut active: Vec<Piece> = Vec::new();
+        let mut next = 0;
+        for w in bounds.windows(2) {
+            let (lo, hi) = (w[0], w[1]);
+            active.retain(|p| p.y.hi > lo);
+            while next < pieces.len() && pieces[next].y.lo == lo {
+                active.push(pieces[next]);
+                next += 1;
+            }
+            if active.is_empty() {
+                continue;
+            }
+            scratch.clear();
+            scratch.extend(active.iter().map(|p| p.x));
+            scratch.sort_unstable();
+            let mut merged: Vec<Seg> = Vec::with_capacity(scratch.len());
+            for &s in scratch.iter() {
+                match merged.last_mut() {
+                    Some(l) if s.lo <= l.hi => l.hi = l.hi.max(s.hi),
+                    _ => merged.push(s),
+                }
+            }
+            let start = out.slabs.last().map_or(0, |s| s.end) as usize;
+            let prev_start = if out.slabs.len() >= 2 { out.slabs[out.slabs.len() - 2].end as usize } else { 0 };
+            if let Some(last) = out.slabs.last_mut() {
+                if last.hi == lo && out.xs[prev_start..start] == merged[..] {
+                    last.hi = hi;
+                    continue;
+                }
+            }
+            out.xs.extend_from_slice(&merged);
+            out.slabs.push(Slab { lo, hi, end: out.xs.len() as u32 });
+        }
+        out
+    }
+    /// The preimage of `self` under one edge, inside the edge's guards, as
+    /// pieces appended to `out`: the remainders the edge takes into `self`.
+    pub fn pull(&self, x: Transfer, y: Transfer, out: &mut Vec<Piece>) {
+        let neg = |v: i32| (-(v as i64)).rem_euclid(CIRCLE as i64) as u32;
+        let emit_x = |ys: Seg, xs: &[Seg], out: &mut Vec<Piece>| match x.action {
+            Action::Rotate(v) => {
+                let d = neg(v);
+                for &s in xs {
+                    rot_seg(s, d, |r| {
+                        if let Some(c) = clip(r, x.guard) {
+                            out.push(Piece { y: ys, x: c });
+                        }
+                    });
+                }
+            }
+            Action::Const(c) => {
+                let i = xs.partition_point(|s| s.hi <= c);
+                if xs.get(i).is_some_and(|s| s.lo <= c) {
+                    out.push(Piece { y: ys, x: x.guard });
+                }
+            }
+        };
+        match y.action {
+            Action::Rotate(v) => {
+                let d = neg(v);
+                for (ys, xs) in self.slabs() {
+                    rot_seg(ys, d, |r| {
+                        if let Some(c) = clip(r, y.guard) {
+                            emit_x(c, xs, out);
+                        }
+                    });
+                }
+            }
+            Action::Const(c) => {
+                if let Some(xs) = self.slab_at(c) {
+                    emit_x(y.guard, xs, out);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +419,70 @@ mod tests {
         assert_eq!(amount(cut - 1), 0);
         assert_eq!(amount(cut), 1);
         assert_eq!(pieces(65536).len(), 1, "a whole pixel cuts nothing");
+    }
+
+    /// A tiny deterministic generator for the property tests.
+    fn lcg(s: &mut u64) -> u32 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*s >> 33) as u32
+    }
+
+    /// The canonical sweep against the plain union of pieces, and `pull`
+    /// against the point-wise definition of the preimage, on a coarse grid
+    /// (every boundary and its neighbours are probe points).
+    #[test]
+    fn a_region_is_the_union_and_pull_is_the_preimage() {
+        let mut s = 7u64;
+        let seg = |s: &mut u64| {
+            let a = lcg(s) % CIRCLE;
+            let b = lcg(s) % CIRCLE;
+            let (lo, hi) = (a.min(b), a.max(b) + 1);
+            Seg { lo, hi: hi.min(CIRCLE) }
+        };
+        for _ in 0..200 {
+            let n = 1 + lcg(&mut s) % 12;
+            let mut ps: Vec<Piece> = (0..n).map(|_| Piece { y: seg(&mut s), x: seg(&mut s) }).collect();
+            let orig = ps.clone();
+            let r = Region::from_pieces(&mut ps, &mut Vec::new());
+            let mut probes: Vec<u32> = orig.iter().flat_map(|p| [p.x.lo, p.x.hi, p.y.lo, p.y.hi]).flat_map(|v| [v.saturating_sub(1), v, (v + 1).min(CIRCLE - 1)]).filter(|&v| v < CIRCLE).collect();
+            probes.sort_unstable();
+            probes.dedup();
+            let inside = |x: u32, y: u32| orig.iter().any(|p| p.x.lo <= x && x < p.x.hi && p.y.lo <= y && y < p.y.hi);
+            for &x in &probes {
+                for &y in &probes {
+                    assert_eq!(r.contains(x, y), inside(x, y), "({x}, {y})");
+                }
+            }
+            // Canonical: the same set from the pieces in another order.
+            let mut rev = orig.clone();
+            rev.reverse();
+            assert_eq!(Region::from_pieces(&mut rev, &mut Vec::new()), r);
+            // pull: a point p is in the result iff the guards take it and its image is in r.
+            let act = |s: &mut u64| if lcg(s) % 4 == 0 { Action::Const(lcg(s) % CIRCLE) } else { Action::Rotate((lcg(s) % CIRCLE) as i32 - 32768) };
+            let (tx, ty) = (Transfer { guard: seg(&mut s), action: act(&mut s) }, Transfer { guard: seg(&mut s), action: act(&mut s) });
+            let mut out = Vec::new();
+            r.pull(tx, ty, &mut out);
+            let pr = Region::from_pieces(&mut out, &mut Vec::new());
+            let ap = |a: Action, p: u32| match a {
+                Action::Rotate(v) => (p as i64 + v as i64).rem_euclid(CIRCLE as i64) as u32,
+                Action::Const(c) => c,
+            };
+            let mut pp: Vec<u32> = probes.iter().flat_map(|&v| {
+                let back = |a: Action| match a {
+                    Action::Rotate(d) => (v as i64 - d as i64).rem_euclid(CIRCLE as i64) as u32,
+                    Action::Const(_) => v,
+                };
+                [v, back(tx.action), back(ty.action)]
+            }).chain([tx.guard.lo, tx.guard.hi - 1, ty.guard.lo, ty.guard.hi - 1]).collect();
+            pp.sort_unstable();
+            pp.dedup();
+            for &x in &pp {
+                for &y in &pp {
+                    let want = tx.takes(x) && ty.takes(y) && r.contains(ap(tx.action, x), ap(ty.action, y));
+                    assert_eq!(pr.contains(x, y), want, "pull at ({x}, {y})");
+                }
+            }
+        }
     }
 
     #[test]
