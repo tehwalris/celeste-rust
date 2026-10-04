@@ -576,7 +576,11 @@ pub fn concrete_witness(
                     cx.cells.push(cell);
                     return Ok(true);
                 }
-                let concrete = (b.keys()[0], cell, k + 1);
+                // The memo is keyed on the EXACT state: `b.keys()` is the
+                // row key at the search's level (remainder and held buttons
+                // widened), and two states one key stands for need not share
+                // their fate.
+                let concrete = (b.rt2().clone_block().row_keys_canonical()[0], cell, k + 1);
                 if cx.dead.contains(&concrete) {
                     continue;
                 }
