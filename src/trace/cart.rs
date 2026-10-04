@@ -103,8 +103,30 @@ pub fn sources_in(root: &std::path::Path) -> Result<String> {
     // `CELESTE_SPLIT_FRAME`: the split-frame prototype, one frame as two steps
     // (lua/celeste-minimal-split.lua, plans/room60-overnight-2026-09-28.md).
     let lua = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
-    let game = celeste_interp::game_runner::apply_start_room(&read(lua)?)?;
+    let mut game = celeste_interp::game_runner::apply_start_room(&read(lua)?)?;
+    if nodiag() {
+        game = forbid_diagonal_dashes(&game)?;
+    }
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
+}
+
+/// `CELESTE_NODIAG`: the No Diagonal Dashes category. A dash may not START
+/// with both a horizontal and a vertical direction held.
+pub fn nodiag() -> bool {
+    std::env::var_os("CELESTE_NODIAG").is_some()
+}
+
+/// The diagonal arm of the player's dash start (`if input~=0 then if
+/// v_input~=0 then`) RAISES (`nil > 0`): a raise has no successor (the
+/// tracer routes its lanes to the raise row, `Interp::poison`), so a state
+/// that starts a diagonal dash leaves the search - exactly, at every level
+/// and in the reference engine alike, which run this same source. Every
+/// other path of the cart is unchanged: a dash with no direction held goes
+/// horizontally in the facing direction and stays legal.
+fn forbid_diagonal_dashes(game: &str) -> Result<String> {
+    const ARM: &str = "if input~=0 then\n\t\t  \tif v_input~=0 then\n";
+    anyhow::ensure!(game.matches(ARM).count() == 1, "CELESTE_NODIAG: the cart's diagonal dash arm was not found exactly once");
+    Ok(game.replacen(ARM, &format!("{ARM}\t\t   \tlocal nodiag_violation = nil > 0\n"), 1))
 }
 
 /// Refuse a program that could tell an `ABSENT_AS_ZERO` field's missing
