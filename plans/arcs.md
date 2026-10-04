@@ -101,6 +101,28 @@ The synthetic case answers f69, as the full object ladder does (level 1
 refutes 68). Room (3,3) h171: REFUTED; h172: a win at f172 (the reference).
 W's fragmentation stays small: median 1-6 rectangles per node, max ~300.
 
+**Room (1,0) sanity (2026-10-04)**: against the known truth (the full rem
+ladder: 99 optimal, 98 refuted at Bits(6)). Level-0 forward `r0sx` to f99
+with `CELESTE_ARC_EDGES=1` (quick): 6:58 wall, peak RSS 10.4 GB, first
+remainder-free win f89; 289 GB on disk, 240 GB of it `edges/arc/`.
+`arc-search --marked-only --witness`:
+
+| horizon | answer | edges / nodes loaded | load (records) | backward | wall | peak |
+|---|---|---|---|---|---|---|
+| 99 | OPTIMAL f99 | 214M / 8.8M | 217 s (174 s) | 8.4 s | 5:43 (witness keying 114 s) | 18.2 GB |
+| 98 | REFUTED | 154M / 6.7M | 148 s (121 s) | 1.2 s | 2:30 | 13.1 GB |
+
+At h98 the remainder-free marks still reach the start (they would win from
+f9), so the refutation is the arc sets' (W empty at the start). W at h99:
+median 1-3 rectangles per node, max 37. The concrete witness is
+byte-identical to `tas/room_1_0_exit_frame_99.txt`; `concrete_run` and a
+real PICO-8 (`pico8_diff/replay.py`) both change room during frame 99.
+`arc-check --samples 30` f1-f66 (1.07G records, 7.5k probes inside and
+outside the guards): 0 disagreements, every edge with its record and back;
+23.5 min, then OOM-killed at f67 under a 30 GB cap (its memory follows the
+frame's record count: 13 GB at f58, 30 GB at f67; later frames have up to
+2x more).
+
 ## Direction (Philippe, 2026-10-04)
 
 Arcs are the better technique: optimize the implementation and make it the
