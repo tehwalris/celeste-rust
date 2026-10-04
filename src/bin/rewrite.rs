@@ -390,6 +390,16 @@ enum Command {
         /// node cannot win by the horizon with any remainder.
         #[arg(long)]
         marked_only: bool,
+        /// Turn the optimum into CONCRETE inputs: a DFS with the reference
+        /// engine (concrete objects) admitting a successor only if its
+        /// projection onto `--level` is a node whose winning set holds the
+        /// successor's exact remainder. Prints the input bytes, or the
+        /// deepest frame such a run reaches.
+        #[arg(long)]
+        witness: bool,
+        /// The tree's level spec (the projection for `--witness`).
+        #[arg(long, default_value = "r0sx")]
+        level: String,
     },
     /// PROTOTYPE (branch arc-sets): the ROTATION GRAPH. Nodes are the
     /// game's states with the remainders erased, time-expanded from the room's
@@ -1115,6 +1125,128 @@ fn read_inputs(spec: &str) -> Result<Vec<u8>> {
 /// reference engine's concrete step, every leaf of a frame that forks on
 /// `rnd` kept, duplicates (by row key) dropped, and the buttons restored to
 /// the boundary's representation as the search stores them.
+/// `arc-search --witness`: concrete inputs inside the winning sets. Frame `k`
+/// of the run reads `W_{from + k}` (the optimum's frames-left alignment); a
+/// state without a player reads the point (0, 0) (no edge cuts it).
+fn arc_concrete_witness(
+    dir: &std::path::Path,
+    level: &str,
+    horizon: u32,
+    g: &celeste_rust::search::arc_dp::Graph,
+    w: &celeste_rust::search::arc_dp::Winning,
+    from: u32,
+    frames: u32,
+) -> Result<()> {
+    use celeste_engine::runtime2::{Col, AV};
+    use celeste_rust::frame::{frame_files_seq, pack_id, widened_keys, wins_of, Block};
+    use celeste_rust::interpreter::state::State;
+    use celeste_rust::search::arcs::point;
+    use rustc_hash::{FxHashMap, FxHashSet};
+    let level = celeste_rust::interpreter::abstraction::Level::parse(level).map_err(|e| anyhow::anyhow!(e))?;
+    celeste_rust::interpreter::abstraction::set_level(level);
+    let t0 = std::time::Instant::now();
+    // (shape, key, cell) -> the node's index, for the graph's nodes.
+    let mut node: FxHashMap<(u64, (u64, u64), u32), u32> = FxHashMap::default();
+    for f in 0..=horizon {
+        for (seq, file) in frame_files_seq(dir, f)? {
+            if let Some(rt2) = file.load_all()? {
+                let b = Block::from_rt2(rt2);
+                let shape = b.rt2().shape_hash;
+                let cells = b.positions()?;
+                for (r, (k, &c)) in b.keys().iter().zip(&cells).enumerate() {
+                    if let Some(i) = g.index(pack_id(f, seq, r as u32)) {
+                        node.entry((shape, *k, c)).or_insert(i);
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("[witness] {} nodes keyed in {:.1} s; a concrete run of {frames} frames inside W from W_{from}", node.len(), t0.elapsed().as_secs_f64());
+    let ids = celeste_rust::compiled::ids();
+    let rem_of = |rt2: &celeste_engine::runtime2::Rt2| -> Result<(u32, u32)> {
+        let Some(&obj) = rt2.player_objects(ids).first() else { return Ok((point(0), point(0))) };
+        let c = rt2.obj_field_cell(obj, ids.f_rem).ok_or_else(|| anyhow::anyhow!("a player without rem"))?;
+        let Col::U(AV::Ptr(sub)) = rt2.cols[c as usize] else { anyhow::bail!("rem is not a table") };
+        let raw = |f| -> Result<u32> {
+            let c = rt2.obj_field_cell(sub, f).ok_or_else(|| anyhow::anyhow!("rem without a field"))?;
+            match rt2.cols[c as usize].at(0) {
+                AV::Num(n) => Ok(point(n.as_raw_u32() as i32)),
+                other => anyhow::bail!("a concrete remainder expected, got {other:?}"),
+            }
+        };
+        Ok((raw(ids.f_x)?, raw(ids.f_y)?))
+    };
+    struct Ctx<'a> {
+        eng: celeste_rust::trace::refengine::RefEngine,
+        initial: State,
+        node: &'a FxHashMap<(u64, (u64, u64), u32), u32>,
+        dead: FxHashSet<((u64, u64), u32, u32)>,
+        path: Vec<u8>,
+        steps: u64,
+        deepest: (u32, Vec<u8>),
+    }
+    fn dfs(
+        cx: &mut Ctx,
+        st: &State,
+        k: u32,
+        frames: u32,
+        from: u32,
+        level: celeste_rust::interpreter::abstraction::Level,
+        w: &celeste_rust::search::arc_dp::Winning,
+        rem_of: &dyn Fn(&celeste_engine::runtime2::Rt2) -> Result<(u32, u32)>,
+    ) -> Result<bool> {
+        if k > cx.deepest.0 {
+            cx.deepest = (k, cx.path.clone());
+        }
+        if k >= frames {
+            return Ok(false);
+        }
+        for byte in 0u8..64 {
+            let mut s = st.clone();
+            celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
+            for mut succ in cx.eng.run_frame_concrete_all(&s)? {
+                celeste_rust::concrete::restore_buttons(&cx.initial, &mut succ)?;
+                cx.steps += 1;
+                let b = Block::from_state(&succ)?;
+                if wins_of(b.rt2())?.iter().any(|&x| x) {
+                    cx.path.push(byte);
+                    return Ok(true);
+                }
+                let concrete = (b.keys()[0], b.positions()?[0], k + 1);
+                if cx.dead.contains(&concrete) {
+                    continue;
+                }
+                let (shape, keys, cells) = widened_keys(&b, level)?;
+                let Some(&i) = cx.node.get(&(shape, keys[0], cells[0])) else { continue };
+                let q = rem_of(b.rt2())?;
+                if !w.at(from + k + 1, i).is_some_and(|r| r.contains(q.0, q.1)) {
+                    continue;
+                }
+                cx.path.push(byte);
+                if dfs(cx, &succ, k + 1, frames, from, level, w, rem_of)? {
+                    return Ok(true);
+                }
+                cx.path.pop();
+                cx.dead.insert(concrete);
+            }
+        }
+        Ok(false)
+    }
+    let eng = celeste_rust::trace::refengine::RefEngine::new()?;
+    let initial = eng.initial_state()?;
+    let mut cx = Ctx { eng, initial: initial.clone(), node: &node, dead: FxHashSet::default(), path: Vec::new(), steps: 0, deepest: (0, Vec::new()) };
+    let t1 = std::time::Instant::now();
+    let ok = dfs(&mut cx, &initial, 0, frames, from, level, w, &rem_of)?;
+    let show = |v: &[u8]| v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
+    eprintln!("[witness] {} concrete steps, {} dead states, {:.1} s", cx.steps, cx.dead.len(), t1.elapsed().as_secs_f64());
+    if ok {
+        println!("CONCRETE WITNESS: a win at f{}: {}", cx.path.len(), show(&cx.path));
+    } else {
+        println!("NO CONCRETE WITNESS inside W: deepest f{}, inputs {}", cx.deepest.0, show(&cx.deepest.1));
+    }
+    Ok(())
+}
+
 fn start_states(prefix: Option<&str>) -> Result<Vec<celeste_rust::interpreter::state::State>> {
     use celeste_rust::frame::Block;
     let mut eng = celeste_rust::trace::refengine::RefEngine::new()?;
@@ -3125,7 +3257,7 @@ fn main() -> Result<()> {
                 states_in[3]
             );
         }
-        Command::ArcSearch { level_dir, horizon, room, win_at, partition, marked_only } => {
+        Command::ArcSearch { level_dir, horizon, room, win_at, partition, marked_only, witness, level } => {
             use celeste_rust::frame::{frame_files_seq, pack_id};
             use celeste_rust::search::{arc_dp, arc_edges, arcs};
             std::env::set_var("CELESTE_START_ROOM", &room);
@@ -3259,6 +3391,9 @@ fn main() -> Result<()> {
                 match &found { Some(f) => format!("OPTIMAL (remainder-exact over this graph) f{}, a witness of {} nodes", f.frame, f.path.len()), None => format!("REFUTED: no win by f{horizon}") },
                 tf.elapsed().as_secs_f64()
             );
+            if let (true, Some(f)) = (witness, &found) {
+                arc_concrete_witness(dir, &level, horizon, &g, &w, horizon - f.frame, f.frame)?;
+            }
         }
         Command::ArcProto { room, horizon, win_at, verify, max_nodes, marks, marks_level } => {
             use celeste_rust::frame::Block;
