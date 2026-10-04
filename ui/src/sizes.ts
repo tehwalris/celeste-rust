@@ -106,7 +106,8 @@ export function sizesView(run: Run, onState: () => void): View {
     const peak: Series = {
       name: "frontier peak (the forward's widest frame)",
       color: slots[1],
-      points: hr.levels.map((l) => [l.level, Math.max(0, ...l.frame_states.slice(0, H + 1))] as [number, number]),
+      // A backward over another level's forward ran none of its own.
+      points: hr.levels.filter((l) => l.forward_of == null).map((l) => [l.level, Math.max(0, ...l.frame_states.slice(0, H + 1))] as [number, number]),
     };
     charts.append(
       el("div", { class: "card" }, [
@@ -118,7 +119,7 @@ export function sizesView(run: Run, onState: () => void): View {
     );
 
     // 1. Frontier per frame, per level.
-    const frontier = hr.levels.map((lr) => seriesOf(lr, lr.frame_states.slice(0, H + 1).map((n, f) => [f, n] as [number, number])));
+    const frontier = hr.levels.filter((lr) => lr.forward_of == null).map((lr) => seriesOf(lr, lr.frame_states.slice(0, H + 1).map((n, f) => [f, n] as [number, number])));
     charts.append(
       el("div", { class: "card" }, [
         el("h2", {}, ["Frontier per frame", el("small", { text: `h${H}, one line per level` })]),

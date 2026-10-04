@@ -55,6 +55,11 @@ export interface LevelRun {
   marks_by_dist: number[];
   mlayers_file: string | null;
   marks_by_layer: number[];
+  /** A backward over ANOTHER level's forward (`export-ui --arc`: the
+   *  remainder-exact arc backward over level 0's tree): that level's
+   *  index. Its frames are that level's; it has no forward pass. Absent in
+   *  older exports. */
+  forward_of?: number | null;
 }
 
 export interface HorizonRun {
@@ -97,6 +102,17 @@ export interface Run {
   prebuild_s: number | null;
   optimal: number | null;
   horizons: HorizonRun[];
+  /** A concrete run to draw over the room (`export-ui --arc`). Absent in
+   *  older exports. */
+  witness?: Witness | null;
+}
+
+/** A concrete witness: its inputs and the player's (x, y) per frame, frame
+ *  0 the start (null without a player), in the cells' coordinates. */
+export interface Witness {
+  label: string;
+  inputs: number[];
+  path: ([number, number] | null)[];
 }
 
 /** A state with no player position (see ui_export::NO_POSITION). */

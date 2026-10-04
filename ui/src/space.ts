@@ -27,7 +27,7 @@
 import type { FramesBin, HorizonRun, LevelRun, Run } from "./data";
 import { defaultHorizon, fmtCompact, fmtInt, horizonOrder, horizonVerdict, ladderPrecisions, levelName, loadFrames, loadLayers, precisionName, type VerdictKind } from "./data";
 import { levelCss, levelRamp, marksRamp, heightBand, bandColor, bandHalo, movingColor, HEIGHT_BANDS, rgbCss, levelColor, LEVELS, type RGB } from "./color";
-import { addSparse, RoomRenderer, sparseMax, type HeatLayer, type Scene } from "./room";
+import { addSparse, RoomRenderer, sparseMax, TRAIL, type HeatLayer, type Scene } from "./room";
 import { button, chips, clear, el, icon, scrubber, select, show } from "./ui";
 import { Instances, View3D } from "./view3d";
 import type { View } from "./main";
@@ -116,6 +116,8 @@ export function spaceView(run: Run, onState: () => void): View {
     look: "last" as Look,
     speed: 1,
     pacing: "uniform" as Pacing,
+    /** Draw the run's concrete witness over the room (when it has one). */
+    trail: true,
     /** Real pacing: the playhead in uniform-step units (a float). */
     pos: 0,
     playing: false,
@@ -133,10 +135,14 @@ export function spaceView(run: Run, onState: () => void): View {
       tl = [];
       let start = 0;
       for (const lr of hr.levels) {
-        const last = Math.min(hr.h, Math.max(0, lr.frames - 1));
-        const fwd = Array.from({ length: last + 1 }, (_, i) => i);
-        tl.push({ index: tl.length, lr, phase: "fwd", frames: fwd, start });
-        start += fwd.length;
+        // A backward over another level's forward (the arc backward over
+        // level 0's tree) has no forward pass of its own.
+        if (lr.forward_of == null) {
+          const last = Math.min(hr.h, Math.max(0, lr.frames - 1));
+          const fwd = Array.from({ length: last + 1 }, (_, i) => i);
+          tl.push({ index: tl.length, lr, phase: "fwd", frames: fwd, start });
+          start += fwd.length;
+        }
         if (!lr.refuted && lr.mlayers_file && hr.h >= 2) {
           const bwd = Array.from({ length: hr.h - 1 }, (_, i) => hr.h - 1 - i);
           tl.push({ index: tl.length, lr, phase: "bwd", frames: bwd, start });
@@ -666,7 +672,20 @@ export function spaceView(run: Run, onState: () => void): View {
     },
     { label: "pacing" },
   );
-  const optionCard = el("section", { class: "card options" }, [grainChips.root, lookChips.root, mode3Chips.root, speedChips.root, pacingChips.root]);
+  const trailChips = chips<boolean>(
+    [
+      { value: true, label: "Show", title: run.witness ? `${run.witness.label}: the player's path, bright to the current frame` : "" },
+      { value: false, label: "Hide", title: "no witness over the room" },
+    ],
+    st.trail,
+    (t) => {
+      st.trail = t;
+      render();
+      onState();
+    },
+    { label: "witness" },
+  );
+  const optionCard = el("section", { class: "card options" }, [grainChips.root, lookChips.root, mode3Chips.root, ...(run.witness ? [trailChips.root] : []), speedChips.root, pacingChips.root]);
 
   // ---- DOM: the legend --------------------------------------------------------------
   const key = (color: string, label: string, cls = "") => el("span", { class: "key" }, [el("i", { class: cls, style: color ? `background:${color}` : undefined }), label]);
@@ -696,12 +715,21 @@ export function spaceView(run: Run, onState: () => void): View {
     el("div", { class: "legend-title", text: "3D" }),
     el("p", { class: "note", text: "One finger (or the mouse) orbits: sideways turns, up and down tilts from top-down to edge-on; two fingers (or shift-drag) pan, pinch or scroll zooms; double-tap resets. Columns: a cell's height is its count (log), the moving set as the bright cap. Stack: one layer of cubes per pass, a forward's reached set in the level's colour, a backward's marked set in warm white." }),
   ]);
-  const tilesLegend = el("div", { class: "legend" }, [key("#3a3a37", "wall"), key("#784638", "spikes"), key("#826e32", "spring"), key("#467846", "fruit")]);
+  const tilesLegend = el("div", { class: "legend" }, [
+    key("#3a3a37", "wall"),
+    key("#784638", "spikes"),
+    key("#826e32", "spring"),
+    key("#467846", "fruit"),
+    ...(run.witness ? [key(TRAIL, "the concrete witness (Room, Passes)")] : []),
+  ]);
   const help = el("details", { class: "help" }, [
     el("summary", { text: "How to read this" }),
     el("p", { class: "note", text: "One cell is one player pixel. Brightness is the number of states in the cell, on a log scale against the level's largest cell over the run, so a frame's brightness is comparable to the next one's." }),
     el("p", { class: "note", text: "A horizon H asks: is there a win by frame H? The ladder answers it level by level, coarse to exact: each level's forward sweeps the frames out to H, then its backward marks the states that can still win by H, and the next level searches only inside those marks. A refuted horizon stops at the first level with no win, so nothing on screen wins there - that is the answer, not missing data." }),
     el("p", { class: "note", text: "The backward is drawn by the frame each marked state was first reached at (this tree stores no per-mark distance), swept from the horizon back to frame 1." }),
+    ...(run.horizons.some((hr) => hr.levels.some((l) => l.forward_of != null))
+      ? [el("p", { class: "note", text: "An arc level is a second backward over level 0's forward with the sub-pixel remainder EXACT (plans/arcs.md): a state is marked when some remainder in it still wins by H. Flip between level 0's backward and it to see the corridor the exact remainder leaves." })]
+      : []),
     el("p", { class: "note", text: "Height map: the levels collapsed into seven bands, each cell in the colour of the finest band whose set still contains it (forward and backward alike). The broad coarse bands are dark; lightness climbs with the band, so the exact route is the brightest thing on screen (the two thinnest bands carry a one-cell halo)." }),
     el("div", { class: "keys" }, [
       el("kbd", { text: "space" }), el("span", { text: "play / pause" }),
@@ -749,7 +777,11 @@ export function spaceView(run: Run, onState: () => void): View {
           type: "button",
           class: `ladder-row${!lr ? " not-run" : lr.refuted ? " refuted" : ""}`,
           disabled: !lr,
-          title: !lr ? `level ${level} did not run at h${hr.h}: the ladder stopped below it` : `jump to level ${level}'s forward at h${hr.h}`,
+          title: !lr
+            ? `level ${level} did not run at h${hr.h}: the ladder stopped below it`
+            : lr.forward_of != null
+              ? `jump to level ${level}'s backward at h${hr.h} (over level ${lr.forward_of}'s forward)`
+              : `jump to level ${level}'s forward at h${hr.h}`,
         },
         [
           el("i", { class: "dot", style: `background:${levelCss(level)}` }),
@@ -983,6 +1015,12 @@ export function spaceView(run: Run, onState: () => void): View {
     stage.dataset.loading = on ? "true" : "false";
   };
 
+  /** The witness over the room, bright to frame `f` (a forward's frame, a
+   *  backward's layer). */
+  function drawTrail(f: number) {
+    if (run.witness && st.trail) renderer.trail(canvas, run.witness.path, f);
+  }
+
   let renderToken = 0;
   function render() {
     const token = ++renderToken;
@@ -1019,6 +1057,7 @@ export function spaceView(run: Run, onState: () => void): View {
       const built = passScene(hr, pass);
       shown(built);
       renderer.render(canvas, built.scene);
+      drawTrail(hr.h);
       describePass(hr, pass, null, built.off);
       return;
     }
@@ -1031,6 +1070,7 @@ export function spaceView(run: Run, onState: () => void): View {
       const built = roomScene(hr, pass, i);
       shown(built);
       renderer.render(canvas, built.scene);
+      drawTrail(pass.frames[i]);
       describePass(hr, pass, i, built.off);
     } else {
       // The grid walks the same timeline as the room: only the current
@@ -1512,6 +1552,7 @@ export function spaceView(run: Run, onState: () => void): View {
     if (st.look !== "last") p.set("l", st.look);
     if (st.speed !== 1) p.set("s", String(st.speed));
     if (st.pacing !== "uniform") p.set("pc", st.pacing);
+    if (run.witness && !st.trail) p.set("w", "0");
     return p.toString();
   }
   function apply(p: URLSearchParams) {
@@ -1527,6 +1568,7 @@ export function spaceView(run: Run, onState: () => void): View {
     const s = p.has("s") ? Number(p.get("s")) : 1;
     st.speed = Number.isInteger(s) && s >= 0 && s < SPEEDS.length ? s : 1;
     st.pacing = p.get("pc") === "real" ? "real" : "uniform";
+    st.trail = p.get("w") !== "0";
     const tl = timeline(st.h);
     if (byPass()) {
       const pv = p.has("p") ? Number(p.get("p")) : tl.length - 1;
@@ -1543,6 +1585,7 @@ export function spaceView(run: Run, onState: () => void): View {
     lookChips.set(st.look);
     speedChips.set(st.speed);
     pacingChips.set(st.pacing);
+    trailChips.set(st.trail);
     layout();
   }
 

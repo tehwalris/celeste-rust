@@ -400,6 +400,16 @@ enum Command {
         /// The tree's level spec (the projection for `--witness`).
         #[arg(long, default_value = "r0sx")]
         level: String,
+        /// Write the web UI's arc pass into this directory (`export-ui
+        /// --forward-only --arc DIR`; needs `--marked-only`): the
+        /// remainder-free backward's marks (`level0.marks.bin`) and the
+        /// ARC-MARKED nodes (`arc.marks.bin`: a node whose winning set is
+        /// non-empty at some frame), both as `(shape, cell, key, dist)` rows
+        /// with `dist` the horizon minus the last frame the node still wins
+        /// from; `arc.txt` (horizon, level, first wins); with `--witness`,
+        /// `witness.txt` (its inputs and player position per frame).
+        #[arg(long)]
+        save_marks: Option<String>,
     },
     /// PROTOTYPE (branch arc-sets): the ROTATION GRAPH. Nodes are the
     /// game's states with the remainders erased, time-expanded from the room's
@@ -684,6 +694,12 @@ enum Command {
         /// directory, no ladder): exported as one partial horizon.
         #[arg(long)]
         forward_only: bool,
+        /// With `--forward-only`: the `arc-search --save-marks` directory
+        /// over that tree. Level 0 gets the remainder-free backward's marks,
+        /// and a second level whose forward is level 0's carries the
+        /// remainder-exact arc backward (and the concrete witness, if saved).
+        #[arg(long)]
+        arc: Option<String>,
     },
     /// Census of one checkpointed frame: how many distinct concrete player
     /// classes (position, spd, every scalar field) its rows fall into, how
@@ -1136,6 +1152,7 @@ fn arc_concrete_witness(
     w: &celeste_rust::search::arc_dp::Winning,
     from: u32,
     frames: u32,
+    save: Option<&std::path::Path>,
 ) -> Result<()> {
     use celeste_engine::runtime2::{Col, AV};
     use celeste_rust::frame::{frame_files_seq, pack_id, widened_keys, wins_of, Block};
@@ -1182,6 +1199,8 @@ fn arc_concrete_witness(
         node: &'a FxHashMap<(u64, (u64, u64), u32), u32>,
         dead: FxHashSet<((u64, u64), u32, u32)>,
         path: Vec<u8>,
+        /// The player's cell after each input of `path`.
+        cells: Vec<u32>,
         steps: u64,
         deepest: (u32, Vec<u8>),
     }
@@ -1208,11 +1227,13 @@ fn arc_concrete_witness(
                 celeste_rust::concrete::restore_buttons(&cx.initial, &mut succ)?;
                 cx.steps += 1;
                 let b = Block::from_state(&succ)?;
+                let cell = b.positions()?[0];
                 if wins_of(b.rt2())?.iter().any(|&x| x) {
                     cx.path.push(byte);
+                    cx.cells.push(cell);
                     return Ok(true);
                 }
-                let concrete = (b.keys()[0], b.positions()?[0], k + 1);
+                let concrete = (b.keys()[0], cell, k + 1);
                 if cx.dead.contains(&concrete) {
                     continue;
                 }
@@ -1223,10 +1244,12 @@ fn arc_concrete_witness(
                     continue;
                 }
                 cx.path.push(byte);
+                cx.cells.push(cell);
                 if dfs(cx, &succ, k + 1, frames, from, level, w, rem_of)? {
                     return Ok(true);
                 }
                 cx.path.pop();
+                cx.cells.pop();
                 cx.dead.insert(concrete);
             }
         }
@@ -1234,13 +1257,26 @@ fn arc_concrete_witness(
     }
     let eng = celeste_rust::trace::refengine::RefEngine::new()?;
     let initial = eng.initial_state()?;
-    let mut cx = Ctx { eng, initial: initial.clone(), node: &node, dead: FxHashSet::default(), path: Vec::new(), steps: 0, deepest: (0, Vec::new()) };
+    let start_cell = Block::from_state(&initial)?.positions()?[0];
+    let mut cx = Ctx { eng, initial: initial.clone(), node: &node, dead: FxHashSet::default(), path: Vec::new(), cells: Vec::new(), steps: 0, deepest: (0, Vec::new()) };
     let t1 = std::time::Instant::now();
     let ok = dfs(&mut cx, &initial, 0, frames, from, level, w, &rem_of)?;
     let show = |v: &[u8]| v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
     eprintln!("[witness] {} concrete steps, {} dead states, {:.1} s", cx.steps, cx.dead.len(), t1.elapsed().as_secs_f64());
     if ok {
         println!("CONCRETE WITNESS: a win at f{}: {}", cx.path.len(), show(&cx.path));
+        if let Some(out) = save {
+            // `inputs` then one `f x y` line per frame (`f - -` without a
+            // player position), frame 0 the start.
+            let mut text = format!("inputs {}\n", show(&cx.path));
+            for (f, &c) in std::iter::once(&start_cell).chain(&cx.cells).enumerate() {
+                match celeste_rust::search::pos_graph::cell_xy(c) {
+                    Some((x, y)) => text += &format!("{f} {x} {y}\n"),
+                    None => text += &format!("{f} - -\n"),
+                }
+            }
+            std::fs::write(out.join("witness.txt"), text)?;
+        }
     } else {
         println!("NO CONCRETE WITNESS inside W: deepest f{}, inputs {}", cx.deepest.0, show(&cx.deepest.1));
     }
@@ -3257,7 +3293,8 @@ fn main() -> Result<()> {
                 states_in[3]
             );
         }
-        Command::ArcSearch { level_dir, horizon, room, win_at, partition, marked_only, witness, level } => {
+        Command::ArcSearch { level_dir, horizon, room, win_at, partition, marked_only, witness, level, save_marks } => {
+            anyhow::ensure!(save_marks.is_none() || marked_only, "--save-marks writes the remainder-free marks: it needs --marked-only");
             use celeste_rust::frame::{frame_files_seq, pack_id};
             use celeste_rust::search::{arc_dp, arc_edges, arcs};
             std::env::set_var("CELESTE_START_ROOM", &room);
@@ -3269,12 +3306,17 @@ fn main() -> Result<()> {
             // The wins (the checkpoint headers' win rows) and the start.
             let mut wins: Vec<u64> = Vec::new();
             let mut start: Option<u64> = None;
+            // The frame files, kept for `--save-marks` (resolving ids to rows).
+            let mut files = Vec::new();
             for f in 0..=horizon {
                 for (seq, file) in frame_files_seq(dir, f)? {
                     if f == 0 {
                         start = Some(pack_id(0, seq, 0));
                     } else {
                         wins.extend(file.win_rows().iter().map(|&(row, _)| pack_id(f, seq, row)));
+                    }
+                    if save_marks.is_some() {
+                        files.push((f, seq, file));
                     }
                 }
             }
@@ -3391,8 +3433,43 @@ fn main() -> Result<()> {
                 match &found { Some(f) => format!("OPTIMAL (remainder-exact over this graph) f{}, a witness of {} nodes", f.frame, f.path.len()), None => format!("REFUTED: no win by f{horizon}") },
                 tf.elapsed().as_secs_f64()
             );
+            let save_dir = save_marks.as_deref().map(std::path::Path::new);
+            if let Some(out) = save_dir {
+                std::fs::create_dir_all(out)?;
+                let ts = std::time::Instant::now();
+                // Rows as the marks files with distances hold them (`ui_export::MarksMap`).
+                let save = |name: &str, ids: &[(u64, u16)]| -> Result<usize> {
+                    let mut rows: Vec<(u64, u32, u64, u64, u32)> = Vec::with_capacity(ids.len());
+                    celeste_rust::search::edges::resolve_ids(&files, ids, |shape, key, cell, last| {
+                        rows.push((shape, cell, key.0, key.1, horizon - last as u32))
+                    })?;
+                    celeste_rust::search::checkpoint::save_value_to(&out.join(name), &rows)?;
+                    Ok(rows.len())
+                };
+                let mut l0: Vec<(u64, u16)> = deadline.as_ref().expect("--marked-only").iter().map(|(&id, &t)| (id, t)).collect();
+                l0.sort_unstable();
+                // Per node the LAST frame its winning set is non-empty: the
+                // arc analogue of the BFS's deadline (W_t is non-empty for t
+                // from the node's layer up to it).
+                let mut last = vec![u32::MAX; g.len()];
+                for t in 0..=horizon {
+                    for (i, _) in w.frame(t) {
+                        last[i as usize] = t;
+                    }
+                }
+                let arc: Vec<(u64, u16)> =
+                    (0..g.len() as u32).filter(|&i| last[i as usize] != u32::MAX).map(|i| (g.id(i), last[i as usize] as u16)).collect();
+                let (n0, na) = (save("level0.marks.bin", &l0)?, save("arc.marks.bin", &arc)?);
+                let first_win = wins.iter().map(|&id| celeste_rust::frame::id_layer(id)).min();
+                let show = |v: Option<u32>| v.map_or("none".to_string(), |f| f.to_string());
+                std::fs::write(
+                    out.join("arc.txt"),
+                    format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(found.as_ref().map(|f| f.frame))),
+                )?;
+                eprintln!("[arc] saved {n0} level-0 marks and {na} arc-marked nodes to {} in {:.1} s", out.display(), ts.elapsed().as_secs_f64());
+            }
             if let (true, Some(f)) = (witness, &found) {
-                arc_concrete_witness(dir, &level, horizon, &g, &w, horizon - f.frame, f.frame)?;
+                arc_concrete_witness(dir, &level, horizon, &g, &w, horizon - f.frame, f.frame, save_dir)?;
             }
         }
         Command::ArcProto { room, horizon, win_at, verify, max_nodes, marks, marks_level } => {
@@ -4561,6 +4638,7 @@ fn main() -> Result<()> {
             out,
             room,
             forward_only,
+            arc,
         } => {
             let (rx, ry) = room
                 .split_once(',')
@@ -4572,6 +4650,7 @@ fn main() -> Result<()> {
                 std::path::Path::new(&out),
                 (rx, ry),
                 forward_only,
+                arc.as_deref().map(std::path::Path::new),
             )?;
         }
         Command::Trajectory {

@@ -36,6 +36,10 @@ const NEXT_ROOM_X = 128;
 
 const SPIKE_IDS = new Set([17, 27, 43, 59]);
 
+/** The witness trail (`trail`): cyan, apart from every heat ramp. */
+export const TRAIL = "rgba(70, 220, 255, 0.95)";
+const TRAIL_FAINT = "rgba(70, 220, 255, 0.35)";
+
 export class RoomRenderer {
   readonly box: Box2;
   private readonly tiles: Tiles;
@@ -132,6 +136,53 @@ export class RoomRenderer {
         }
       }
     }
+  }
+
+  /** Draw a path of start-room pixels over the last `render` of `canvas`:
+   *  the whole path faint, frames 0..`upto` bright with a dot at `upto`.
+   *  A point outside the box or in the next room breaks the line. */
+  trail(canvas: HTMLCanvasElement, path: ([number, number] | null)[], upto: number) {
+    const ctx = canvas.getContext("2d")!;
+    const s = canvas.width / this.box.w;
+    const at = (i: number): [number, number] | null => {
+      const p = path[i];
+      if (!p || p[0] >= NEXT_ROOM_X || this.cellIndex(p[0], p[1]) < 0) return null;
+      return [(p[0] - this.box.x0 + 0.5) * s, (p[1] - this.box.y0 + 0.5) * s];
+    };
+    const stroke = (last: number, color: string, width: number) => {
+      ctx.beginPath();
+      let pen = false;
+      for (let i = 0; i <= last; i++) {
+        const q = at(i);
+        if (!q) {
+          pen = false;
+          continue;
+        }
+        if (pen) ctx.lineTo(q[0], q[1]);
+        else ctx.moveTo(q[0], q[1]);
+        pen = true;
+      }
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.stroke();
+    };
+    ctx.save();
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    stroke(path.length - 1, TRAIL_FAINT, Math.max(1, s * 0.4));
+    const u = Math.max(0, Math.min(path.length - 1, upto));
+    stroke(u, TRAIL, Math.max(1.5, s * 0.6));
+    const q = at(u);
+    if (q) {
+      ctx.beginPath();
+      ctx.arc(q[0], q[1], Math.max(3, s * 1.4), 0, 2 * Math.PI);
+      ctx.fillStyle = TRAIL;
+      ctx.fill();
+      ctx.lineWidth = Math.max(1, s * 0.4);
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.8)";
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   /** Composite `scene` into the offscreen and draw it scaled onto `canvas`. */

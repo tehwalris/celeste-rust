@@ -126,6 +126,10 @@ pub struct LevelRun {
     pub mlayers_file: Option<String>,
     /// Per frame, the marked states of that layer.
     pub marks_by_layer: Vec<u64>,
+    /// A backward that ran over ANOTHER level's forward (`export-ui --arc`:
+    /// the remainder-exact arc backward over level 0's tree): that level's
+    /// index. Its frames are that level's, and it has no forward pass.
+    pub forward_of: Option<usize>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -166,6 +170,17 @@ pub struct Run {
     pub prebuild_s: Option<f64>,
     pub optimal: Option<u32>,
     pub horizons: Vec<HorizonRun>,
+    /// A concrete run drawn over the room (`export-ui --arc`, `witness.txt`).
+    pub witness: Option<Witness>,
+}
+
+/// A concrete witness: its inputs and the player's (x, y) per frame (frame 0
+/// the start; `None` without a player), in the cells' pixel coordinates.
+#[derive(Serialize, Debug)]
+pub struct Witness {
+    pub label: String,
+    pub inputs: Vec<u8>,
+    pub path: Vec<Option<(i32, i32)>>,
 }
 
 fn num<T: std::str::FromStr>(tok: &str) -> Result<T>
@@ -306,6 +321,7 @@ pub fn parse_log(text: &str, forward_only: bool) -> Result<(Vec<HorizonRun>, Opt
                 marks_by_dist: Vec::new(),
                 mlayers_file: None,
                 marks_by_layer: Vec::new(),
+                forward_of: None,
             };
             first_win = None;
             match horizons.last_mut() {
@@ -363,6 +379,7 @@ pub fn parse_log(text: &str, forward_only: bool) -> Result<(Vec<HorizonRun>, Opt
             marks_by_dist: Vec::new(),
             mlayers_file: None,
             marks_by_layer: Vec::new(),
+            forward_of: None,
         };
         horizons.push(HorizonRun { h, levels: vec![run], refuted_at: None, partial: true });
     }
@@ -812,10 +829,101 @@ fn room_tiles(room: (i16, i16)) -> Result<Tiles> {
     Ok(Tiles { w, h, ids, solid })
 }
 
-/// The export. `room` is the start room the tree was searched from.
-pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i16), forward_only: bool) -> Result<()> {
+/// `key value` lines (`arc.txt`).
+fn read_keyed(path: &Path) -> Result<FxHashMap<String, String>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(text.lines().filter_map(|l| l.split_once(' ')).map(|(k, v)| (k.to_string(), v.trim().to_string())).collect())
+}
+
+/// `witness.txt` (`arc-search --witness --save-marks`): `inputs a,b,..`, then
+/// `f x y` per frame from 0 (`f - -` without a player).
+fn read_witness(path: &Path) -> Result<Witness> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut lines = text.lines();
+    let inputs: Vec<u8> = lines
+        .next()
+        .and_then(|l| l.strip_prefix("inputs "))
+        .context("witness.txt: no `inputs` line")?
+        .split(',')
+        .map(|b| b.trim().parse::<u8>().context("witness.txt: an input byte"))
+        .collect::<Result<_>>()?;
+    let mut path_xy = Vec::new();
+    for (i, l) in lines.enumerate() {
+        let t: Vec<&str> = l.split_whitespace().collect();
+        anyhow::ensure!(t.len() == 3 && t[0].parse::<usize>().ok() == Some(i), "witness.txt: line {:?} is not frame {i}", l);
+        path_xy.push(if t[1] == "-" { None } else { Some((num(t[1])?, num(t[2])?)) });
+    }
+    anyhow::ensure!(path_xy.len() == inputs.len() + 1, "witness.txt: {} inputs, {} positions", inputs.len(), path_xy.len());
+    Ok(Witness { label: format!("concrete witness inside the winning sets, a win at f{}", inputs.len()), inputs, path: path_xy })
+}
+
+/// `--arc DIR` (`arc-search --save-marks DIR` over the forward-only tree):
+/// the forward's partial horizon becomes a ladder of two backwards over
+/// level 0's forward - the remainder-free BFS (level 0's marks) and the
+/// remainder-exact ARC backward (a second level whose forward is level 0's:
+/// a node is marked when its winning set is non-empty at some frame). The
+/// optimum is the arc search's. Returns the witness when the directory
+/// has one.
+fn attach_arc(horizons: &mut [HorizonRun], optimal: &mut Option<u32>, dir: &Path) -> Result<Option<Witness>> {
+    let kv = read_keyed(&dir.join("arc.txt"))?;
+    let get = |k: &str| kv.get(k).with_context(|| format!("arc.txt: no `{k}`"));
+    let frame = |k: &str| -> Result<Option<u32>> {
+        let v = get(k)?;
+        if v == "none" {
+            Ok(None)
+        } else {
+            Ok(Some(num(v)?))
+        }
+    };
+    let h: u32 = num(get("horizon")?)?;
+    let level = get("level")?.clone();
+    let [hr] = horizons else { bail!("--arc wants one forward's log, got {} horizons", horizons.len()) };
+    anyhow::ensure!(hr.h == h, "--arc: the arc search ran to h{h}, the forward's log to f{}", hr.h);
+    let rows = |name: &str| -> Result<u64> { Ok(MarksMap::open(&dir.join(name))?.rows as u64) };
+    let found = frame("optimal")?;
+    hr.partial = false;
+    let l0 = &mut hr.levels[0];
+    l0.precision = format!("{level}, rem free");
+    l0.first_win = frame("level0_first_win")?;
+    l0.refuted = l0.first_win.is_none();
+    l0.marked = Some(rows("level0.marks.bin")?);
+    let arc = LevelRun {
+        level: 1,
+        precision: format!("arc: {level}, rem exact"),
+        fwd: Vec::new(),
+        bwd: Vec::new(),
+        first_win: found,
+        marked: found.map(|_| rows("arc.marks.bin")).transpose()?,
+        reruns: None,
+        refuted: found.is_none(),
+        frames: 0,
+        frames_file: String::new(),
+        marks_file: None,
+        frame_states: Vec::new(),
+        frame_wins: Vec::new(),
+        marks_have_dist: false,
+        marks_by_dist: Vec::new(),
+        mlayers_file: None,
+        marks_by_layer: Vec::new(),
+        forward_of: Some(0),
+    };
+    hr.levels.push(arc);
+    hr.refuted_at = hr.levels.iter().position(|l| l.refuted);
+    *optimal = if hr.refuted_at.is_none() { found } else { None };
+    let w = dir.join("witness.txt");
+    w.exists().then(|| read_witness(&w)).transpose()
+}
+
+/// The export. `room` is the start room the tree was searched from; `arc`
+/// (with `forward_only`) an `arc-search --save-marks` directory over it.
+pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i16), forward_only: bool, arc: Option<&Path>) -> Result<()> {
+    anyhow::ensure!(arc.is_none() || forward_only, "--arc is a backward over one forward's tree: it needs --forward-only");
     let text = std::fs::read_to_string(log_path).with_context(|| format!("reading {}", log_path.display()))?;
-    let (mut horizons, wall_s, prebuild_s, optimal) = parse_log(&text, forward_only)?;
+    let (mut horizons, wall_s, prebuild_s, mut optimal) = parse_log(&text, forward_only)?;
+    let witness = match arc {
+        Some(dir) => attach_arc(&mut horizons, &mut optimal, dir)?,
+        None => None,
+    };
     eprintln!(
         "[export-ui] log: {} horizons, {} levels, optimal {:?}",
         horizons.len(),
@@ -832,25 +940,35 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
     struct Tree {
         h: u32,
         level: usize,
-        marks_hs: Vec<u32>,
+        /// The marked sets over the tree: (horizon, the level whose marks).
+        sets: Vec<(u32, usize)>,
     }
     let mut trees: Vec<Tree> = Vec::new();
     for hr in &horizons {
         for lr in &hr.levels {
-            // A forward on its own has no backward, so no marks.
-            let marked = !lr.refuted && !forward_only;
-            if lr.level == 0 {
-                if !trees.iter().any(|t| t.level == 0) {
-                    trees.push(Tree { h: hr.h, level: 0, marks_hs: Vec::new() });
+            // A forward on its own has no backward, so no marks (but for
+            // the arc search's).
+            let marked = !lr.refuted && (!forward_only || arc.is_some());
+            // Level 0's tree serves every horizon; a finer level's is its
+            // horizon's own. A backward over another level's forward reads
+            // that level's tree.
+            let level = lr.forward_of.unwrap_or(lr.level);
+            let k = match trees.iter().position(|t| t.level == level && (level == 0 || t.h == hr.h)) {
+                Some(k) => k,
+                None => {
+                    trees.push(Tree { h: hr.h, level, sets: Vec::new() });
+                    trees.len() - 1
                 }
-                if marked {
-                    trees.iter_mut().find(|t| t.level == 0).expect("level 0's tree").marks_hs.push(hr.h);
-                }
-            } else {
-                trees.push(Tree { h: hr.h, level: lr.level, marks_hs: if marked { vec![hr.h] } else { Vec::new() } });
+            };
+            if marked {
+                trees[k].sets.push((hr.h, lr.level));
             }
         }
     }
+    let marks_file = |h: u32, level: usize| match arc {
+        Some(dir) => dir.join(if level == 0 { "level0.marks.bin" } else { "arc.marks.bin" }),
+        None => crate::frame::marks_path(checkpoint_dir, h, level),
+    };
     struct MarksOut {
         h: u32,
         level: usize,
@@ -868,10 +986,10 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
         let tt = std::time::Instant::now();
         let dir = level_dir(checkpoint_dir, tree.h, tree.level, forward_only);
         let sets = tree
-            .marks_hs
+            .sets
             .iter()
-            .map(|&h| {
-                let path = crate::frame::marks_path(checkpoint_dir, h, tree.level);
+            .map(|&(h, level)| {
+                let path = marks_file(h, level);
                 MarksMap::open(&path).with_context(|| format!("marks {}", path.display()))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -895,11 +1013,11 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
         results.push(Done::Frames { h: tree.h, level: tree.level, data });
         if !sets.is_empty() {
             let outs = tree
-                .marks_hs
+                .sets
                 .iter()
                 .zip(&sets)
                 .zip(by_cell_dist.into_iter().zip(layers))
-                .map(|((&h, m), (by_cell_dist, by_layer))| MarksOut { h, level: tree.level, have_dist: m.have_dist(), by_cell_dist, by_layer })
+                .map(|((&(h, level), m), (by_cell_dist, by_layer))| MarksOut { h, level, have_dist: m.have_dist(), by_cell_dist, by_layer })
                 .collect();
             results.push(Done::Marks(outs));
         }
@@ -942,7 +1060,7 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
                 let wins: Vec<u64> = data.frames.iter().map(|(_, w)| w.iter().map(|&(_, n)| n as u64).sum()).collect();
                 for hr in horizons.iter_mut() {
                     for lr in hr.levels.iter_mut() {
-                        if lr.level == *level && (*level == 0 || hr.h == *h) {
+                        if lr.forward_of.unwrap_or(lr.level) == *level && (*level == 0 || hr.h == *h) {
                             lr.frames = data.frames.len() as u32;
                             lr.frames_file = name.clone();
                             lr.frame_states = states.clone();
@@ -995,6 +1113,7 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
         prebuild_s,
         optimal,
         horizons,
+        witness,
     };
     let mut f = std::io::BufWriter::new(std::fs::File::create(out.join("run.json"))?);
     serde_json::to_writer(&mut f, &run)?;

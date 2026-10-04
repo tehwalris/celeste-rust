@@ -45,7 +45,8 @@ falls back to the default.
 states in the cell (log scale against the level's largest cell over the
 run, so one frame's brightness is comparable to the next), hue = the
 ladder level (blue = level 0, through violet and magenta to orange =
-exact), marks in warm white. Nothing is drawn over the room: the titles,
+exact), marks in warm white. Nothing is drawn over the room (but a
+run's concrete witness, when it has one: below): the titles,
 the readout and the colour scale sit around it, so the exits at the top
 edge and the spawn at the bottom stay visible.
 
@@ -173,6 +174,28 @@ cp /tmp/room00_search.log /var/tmp/celeste-ui/room00.log
     --out /var/tmp/celeste-ui/data/room00 --room 0,0
 
 # 3. List it in /var/tmp/celeste-ui/data/runs.json (above).
+```
+
+A forward on its own exports with `--forward-only` (one partial horizon,
+no backward). With `--arc DIR` it becomes a two-level run: `DIR` is what
+`rewrite arc-search --marked-only --save-marks DIR [--witness]` wrote over
+the same tree (plans/arcs.md) - level 0 gets the remainder-free backward's
+marks, and level 1 is the remainder-exact ARC backward over level 0's
+forward (`forward_of: 0` in `run.json`: no forward pass of its own; a node
+is marked when its winning set W_t is non-empty at some frame t, drawn at
+its first-reach layer like every backward). With `--witness`, `witness.txt`
+(the concrete inputs and the player's position per frame) is drawn over
+the room as a cyan trail, bright to the current frame (the `witness`
+chip; `w=0` in the hash hides it). Room (3,3) at h172:
+
+```bash
+./safe-run.sh -- ./target/quick/rewrite arc-search --level-dir /var/tmp/arc33-172 \
+    --horizon 172 --room 3,3 --marked-only --witness --level r0sxhn \
+    --save-marks /var/tmp/arc33-172-ui                  # ~90 s, ~35 GB peak
+cp /var/tmp/arc33-172.log /var/tmp/celeste-ui/room33arc172.log   # the forward's log
+./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir /var/tmp/arc33-172 \
+    --forward-only --arc /var/tmp/arc33-172-ui --log /var/tmp/celeste-ui/room33arc172.log \
+    --out /var/tmp/celeste-ui/data/room33arc172 --room 3,3
 ```
 
 A run's layout (`run.json` + one binary per horizon/level) is documented

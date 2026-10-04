@@ -1064,6 +1064,38 @@ pub struct BackwardResult {
     pub stats: BfsStats,
 }
 
+/// Each `(id, deadline)` of `ids` (sorted by id) resolved to its row's
+/// `(shape, key, cell)` through the tree's frame files `(layer, seq, file)`
+/// (in `(layer, seq)` order): `f(shape, key, cell, deadline)`. Every id must
+/// resolve.
+pub fn resolve_ids(
+    files: &[(u32, u32, crate::search::checkpoint::FrameFile)],
+    ids: &[(u64, u16)],
+    mut f: impl FnMut(u64, (u64, u64), u32, u16),
+) -> Result<()> {
+    let mut i = 0usize;
+    for (layer, seq, file) in files {
+        let lo = ids.partition_point(|&(id, _)| (id_layer(id), crate::frame::id_seq(id)) < (*layer, *seq));
+        let hi = ids.partition_point(|&(id, _)| (id_layer(id), crate::frame::id_seq(id)) <= (*layer, *seq));
+        if lo == hi {
+            continue;
+        }
+        let cells = file.row_cells();
+        for &(id, deadline) in &ids[lo..hi] {
+            let row = crate::frame::id_row(id);
+            ensure!(
+                row < file.width(),
+                "edges: marked id l{layer} s{seq} r{row} is past its file's {} rows",
+                file.width()
+            );
+            f(file.shape_hash(), file.key_at(row), cells[row as usize], deadline);
+            i += 1;
+        }
+    }
+    ensure!(i == ids.len(), "edges: {} marked ids, {} resolved through the checkpoint files", ids.len(), i);
+    Ok(())
+}
+
 /// The backward over a level dir: seeds from the checkpoint headers' win
 /// rows (layers 1..=horizon), the BFS over `<dir>/edges`, the marked ids
 /// resolved to `(shape, key, cell)` through the checkpoint files.
@@ -1096,27 +1128,9 @@ pub fn backward(dir: &Path, horizon: u32) -> Result<BackwardResult> {
     // The marked ids as the ladder's (shape, key, cell) set.
     let t = std::time::Instant::now();
     let mut marked = Visited::new();
-    let ids = marks.with_deadlines();
-    let mut i = 0usize;
-    for (layer, seq, file) in &files {
-        let lo = ids.partition_point(|&(id, _)| (id_layer(id), crate::frame::id_seq(id)) < (*layer, *seq));
-        let hi = ids.partition_point(|&(id, _)| (id_layer(id), crate::frame::id_seq(id)) <= (*layer, *seq));
-        if lo == hi {
-            continue;
-        }
-        let cells = file.row_cells();
-        for &(id, deadline) in &ids[lo..hi] {
-            let row = crate::frame::id_row(id);
-            ensure!(
-                row < file.width(),
-                "edges: marked id l{layer} s{seq} r{row} is past its file's {} rows",
-                file.width()
-            );
-            marked.insert_until(file.shape_hash(), file.key_at(row), cells[row as usize], deadline);
-            i += 1;
-        }
-    }
-    ensure!(i == ids.len(), "edges: {} marked ids, {} resolved through the checkpoint files", ids.len(), i);
+    resolve_ids(&files, &marks.with_deadlines(), |shape, key, cell, deadline| {
+        marked.insert_until(shape, key, cell, deadline);
+    })?;
     eprintln!(
         "[bfs] h{horizon}: {} runs-bytes {:.2} GB, open {:.0} ms, bfs {:.0} ms ({} lookups, {} edges), resolve {:.0} ms",
         graph.records,
