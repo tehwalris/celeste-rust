@@ -28,25 +28,6 @@ pub const FILTER_BRANCH: FilterReason = "filter_branch";
 /// Semantically necessary; this is the search fanning out, not overhead.
 pub const FILTER_SPLIT_FLR: FilterReason = "filter_split_flr";
 
-/// Dropping duplicate lanes during vectorization. Useful work.
-pub const FILTER_DEDUP: FilterReason = "filter_dedup";
-
-/// Frontier-only search: dropping lanes whose canonical row was already
-/// reached at an earlier frame (their successors are reachable earlier via
-/// the same input suffix, so re-expanding them finds nothing new).
-pub const FILTER_VISITED: FilterReason = "filter_visited";
-
-/// Lane-chunking of oversized states before a frame: pure mechanics, no
-/// semantic filtering - the chunks re-merge at the boundary.
-pub const FILTER_CHUNK: FilterReason = "filter_chunk";
-
-/// Partitioning a MIXED interval comparison: the lanes with a definite
-/// answer keep it, the lanes that straddle are carried off into their own
-/// state where `UnknownBool` is honest. See `partition_maybe_bool`. Not
-/// overhead and not the search fanning out - it is precision being kept
-/// that the old whole-value collapse threw away.
-pub const FILTER_STRADDLE: FilterReason = "filter_straddle";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub heap: Heap,

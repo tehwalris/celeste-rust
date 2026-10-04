@@ -15,6 +15,7 @@
 //!                       rotates them), for the rotation graph
 //!   * `arc_dp`        - the rotation graph's winning sets (backward) and
 //!                       exact forward (plans/arcs.md)
+//!   * `inspect`       - a row read by its named fields, for the diagnostics
 //!   * `arc_edges`     - per recorded edge, what the frame did to the
 //!                       player's remainder (`CELESTE_ARC_EDGES=1`)
 //!
@@ -26,5 +27,6 @@ pub mod arcs;
 pub mod checkpoint;
 pub mod door;
 pub mod edges;
+pub mod inspect;
 pub mod pos_graph;
 pub mod ui_export;

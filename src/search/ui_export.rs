@@ -592,7 +592,7 @@ fn frame_counts(dir: &Path, f: u32, marks: Option<&MarkTable>, nsets: usize) -> 
         Err(e) => return Err(e).with_context(|| format!("{} frame {f}", dir.display())),
     };
     let mut per_set = vec![0u32; nsets];
-    for file in files {
+    for (_, file) in files {
         for (cell, n) in file.cell_counts() {
             *out.cells.entry(cell).or_default() += n;
         }

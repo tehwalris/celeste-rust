@@ -466,7 +466,7 @@ pub fn optimum(g: &Graph, w: &Winning, start: u32, point: (u32, u32), horizon: u
 }
 
 /// An action on one point of the circle.
-pub fn apply(a: Action, p: u32) -> u32 {
+fn apply(a: Action, p: u32) -> u32 {
     match a {
         Action::Rotate(v) => (p as i64 + v as i64).rem_euclid(super::arcs::CIRCLE as i64) as u32,
         Action::Const(c) => c,
@@ -484,6 +484,153 @@ pub fn fragmentation<'a>(sets: impl Iterator<Item = &'a Region>) -> (usize, usiz
     v.sort_unstable();
     let q = |f: f64| v[((v.len() - 1) as f64 * f) as usize];
     (v.len(), q(0.5), q(0.9), q(1.0))
+}
+
+/// `rewrite arc-search --witness`: CONCRETE inputs inside the winning sets.
+/// A DFS from the room's start through the reference engine's concrete
+/// step (every input, every `rnd` leaf) admitting a successor only if its
+/// projection onto `level` is a node of `g` (`dir`'s tree, frames
+/// `0..=horizon`) whose winning set holds the successor's exact remainder.
+/// Frame `k` of the run reads `W_{from + k}` (the optimum's frames-left
+/// alignment); a state without a player reads the point (0, 0) (no edge cuts
+/// it). Prints the inputs, or the deepest frame such a run reaches; `save`
+/// gets `witness.txt` (the inputs, then `f x y` per frame, frame 0 the start).
+pub fn concrete_witness(
+    dir: &std::path::Path,
+    level: crate::interpreter::abstraction::Level,
+    horizon: u32,
+    g: &Graph,
+    w: &Winning,
+    from: u32,
+    frames: u32,
+    save: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use crate::concrete::ConcreteEngine;
+    use crate::frame::{frame_files, pack_id, widened_keys, wins_of, Block};
+    use crate::interpreter::state::State;
+    use anyhow::Result;
+    use celeste_engine::runtime2::{Rt2, AV};
+    crate::interpreter::abstraction::set_level(level);
+    let t0 = std::time::Instant::now();
+    // (shape, key, cell) -> the node's index, for the graph's nodes.
+    let mut node: FxHashMap<(u64, (u64, u64), u32), u32> = FxHashMap::default();
+    for f in 0..=horizon {
+        for (seq, file) in frame_files(dir, f)? {
+            if let Some(rt2) = file.load_all()? {
+                let b = Block::from_rt2(rt2);
+                let shape = b.rt2().shape_hash;
+                let cells = b.positions()?;
+                for (r, (k, &c)) in b.keys().iter().zip(&cells).enumerate() {
+                    if let Some(i) = g.index(pack_id(f, seq, r as u32)) {
+                        node.entry((shape, *k, c)).or_insert(i);
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("[witness] {} nodes keyed in {:.1} s; a concrete run of {frames} frames inside W from W_{from}", node.len(), t0.elapsed().as_secs_f64());
+    fn rem_of(rt2: &Rt2) -> Result<(u32, u32)> {
+        let ids = crate::compiled::ids();
+        let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((super::arcs::point(0), super::arcs::point(0))) };
+        let raw = |c: usize| -> Result<u32> {
+            match rt2.cols[c].at(0) {
+                AV::Num(n) => Ok(super::arcs::point(n.as_raw_u32() as i32)),
+                other => anyhow::bail!("a concrete remainder expected, got {other:?}"),
+            }
+        };
+        Ok((raw(cx)?, raw(cy)?))
+    }
+    struct Ctx<'a> {
+        eng: ConcreteEngine,
+        initial: State,
+        node: &'a FxHashMap<(u64, (u64, u64), u32), u32>,
+        w: &'a Winning,
+        level: crate::interpreter::abstraction::Level,
+        from: u32,
+        frames: u32,
+        dead: FxHashSet<((u64, u64), u32, u32)>,
+        path: Vec<u8>,
+        /// The player's cell after each input of `path`.
+        cells: Vec<u32>,
+        steps: u64,
+        deepest: (u32, Vec<u8>),
+    }
+    fn dfs(cx: &mut Ctx, st: &State, k: u32) -> Result<bool> {
+        if k > cx.deepest.0 {
+            cx.deepest = (k, cx.path.clone());
+        }
+        if k >= cx.frames {
+            return Ok(false);
+        }
+        for byte in 0u8..64 {
+            for succ in cx.eng.step_all(st, byte, &cx.initial)? {
+                cx.steps += 1;
+                let b = Block::from_state(&succ)?;
+                let cell = b.positions()?[0];
+                if wins_of(b.rt2())?.iter().any(|&x| x) {
+                    cx.path.push(byte);
+                    cx.cells.push(cell);
+                    return Ok(true);
+                }
+                let concrete = (b.keys()[0], cell, k + 1);
+                if cx.dead.contains(&concrete) {
+                    continue;
+                }
+                let (shape, keys, cells) = widened_keys(&b, cx.level)?;
+                let Some(&i) = cx.node.get(&(shape, keys[0], cells[0])) else { continue };
+                let q = rem_of(b.rt2())?;
+                if !cx.w.at(cx.from + k + 1, i).is_some_and(|r| r.contains(q.0, q.1)) {
+                    continue;
+                }
+                cx.path.push(byte);
+                cx.cells.push(cell);
+                if dfs(cx, &succ, k + 1)? {
+                    return Ok(true);
+                }
+                cx.path.pop();
+                cx.cells.pop();
+                cx.dead.insert(concrete);
+            }
+        }
+        Ok(false)
+    }
+    let eng = ConcreteEngine::new()?;
+    let initial = eng.initial_state()?;
+    let start_cell = Block::from_state(&initial)?.positions()?[0];
+    let mut cx = Ctx {
+        eng,
+        initial: initial.clone(),
+        node: &node,
+        w,
+        level,
+        from,
+        frames,
+        dead: FxHashSet::default(),
+        path: Vec::new(),
+        cells: Vec::new(),
+        steps: 0,
+        deepest: (0, Vec::new()),
+    };
+    let t1 = std::time::Instant::now();
+    let ok = dfs(&mut cx, &initial, 0)?;
+    let show = |v: &[u8]| v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
+    eprintln!("[witness] {} concrete steps, {} dead states, {:.1} s", cx.steps, cx.dead.len(), t1.elapsed().as_secs_f64());
+    if !ok {
+        println!("NO CONCRETE WITNESS inside W: deepest f{}, inputs {}", cx.deepest.0, show(&cx.deepest.1));
+        return Ok(());
+    }
+    println!("CONCRETE WITNESS: a win at f{}: {}", cx.path.len(), show(&cx.path));
+    if let Some(out) = save {
+        let mut text = format!("inputs {}\n", show(&cx.path));
+        for (f, &c) in std::iter::once(&start_cell).chain(&cx.cells).enumerate() {
+            match super::pos_graph::cell_xy(c) {
+                Some((x, y)) => text += &format!("{f} {x} {y}\n"),
+                None => text += &format!("{f} - -\n"),
+            }
+        }
+        std::fs::write(out.join("witness.txt"), text)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

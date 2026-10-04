@@ -122,10 +122,6 @@ impl Block {
         &self.rt2
     }
 
-    pub fn rt2_mut(&mut self) -> &mut Rt2 {
-        &mut self.rt2
-    }
-
     /// The key column: the 128-bit canonical row key per lane (shape + content).
     /// Identity for dedup, the visited set, and checkpoints. One entry per lane.
     pub fn keys(&self) -> &[(u64, u64)] {
@@ -179,11 +175,6 @@ impl Block {
 
     pub fn skip(&self) -> &[bool] {
         &self.skip
-    }
-
-    /// Lanes that will be expanded (not skipped).
-    pub fn active_lanes(&self) -> usize {
-        self.lanes() - self.skip.iter().filter(|&&s| s).count()
     }
 
     /// A piece of a layer: its rows' ids and its file seq.
@@ -1999,7 +1990,7 @@ struct Tree {
 
 impl Tree {
     fn open(dir: &std::path::Path, horizon: u32) -> Result<Self> {
-        Ok(Tree { layers: (0..=horizon).map(|f| frame_files(dir, f)).collect::<Result<_>>()? })
+        Ok(Tree { layers: (0..=horizon).map(|f| Ok(frame_files(dir, f)?.into_iter().map(|(_, file)| file).collect())).collect::<Result<_>>()? })
     }
 
     /// Every row at `cell` in layers `0..=upto`, one block per shape, in
@@ -2705,27 +2696,38 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
     })
 }
 
-/// The checkpoint files of a frame (one per block written), mapped.
-pub fn frame_files(
-    dir: &std::path::Path,
-    frame: u32,
-) -> Result<Vec<crate::search::checkpoint::FrameFile>> {
+/// The checkpoint files of a frame (one per block written, `s{shape}_{seq}.bin`),
+/// with their seq, sorted by name.
+pub fn frame_paths(dir: &std::path::Path, frame: u32) -> Result<Vec<(u32, std::path::PathBuf)>> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
-    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            n.starts_with('s') && n.ends_with(".bin")
-        })
-        .collect();
-    names.sort();
-    names.iter().map(|p| crate::search::checkpoint::FrameFile::open(p)).collect()
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(&fdir)? {
+        let p = e?.path();
+        let Some(n) = p.file_name().and_then(|s| s.to_str()) else { continue };
+        if !(n.starts_with('s') && n.ends_with(".bin")) {
+            continue;
+        }
+        let seq: u32 = n
+            .trim_end_matches(".bin")
+            .rsplit('_')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("{}: no seq in the file name", p.display()))?;
+        out.push((seq, p));
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(out)
+}
+
+/// A frame's files (`frame_paths`), mapped, with their seq.
+pub fn frame_files(dir: &std::path::Path, frame: u32) -> Result<Vec<(u32, crate::search::checkpoint::FrameFile)>> {
+    frame_paths(dir, frame)?.into_iter().map(|(seq, p)| Ok((seq, crate::search::checkpoint::FrameFile::open(&p)?))).collect()
 }
 
 /// Load every block of a checkpointed frame.
 pub fn load_frame(dir: &std::path::Path, frame: u32) -> Result<Vec<Block>> {
     let mut out = Vec::new();
-    for (seq, file) in frame_files_seq(dir, frame)? {
+    for (seq, file) in frame_files(dir, frame)? {
         if let Some(rt2) = file.load_all()? {
             let ids: Vec<u64> = (0..rt2.width as u32).map(|r| pack_id(frame, seq, r)).collect();
             out.push(Block::with_ids(rt2, ids, seq));
@@ -2734,33 +2736,16 @@ pub fn load_frame(dir: &std::path::Path, frame: u32) -> Result<Vec<Block>> {
     Ok(out)
 }
 
-/// A frame's files with their seq (from the name `s{shape}_{seq}.bin`).
-pub fn frame_files_seq(
-    dir: &std::path::Path,
-    frame: u32,
-) -> Result<Vec<(u32, crate::search::checkpoint::FrameFile)>> {
-    let fdir = dir.join("frames").join(format!("f{:03}", frame));
-    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(&fdir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            n.starts_with('s') && n.ends_with(".bin")
-        })
-        .collect();
-    names.sort();
-    names
-        .iter()
-        .map(|p| {
-            let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let seq: u32 = n
-                .trim_end_matches(".bin")
-                .rsplit('_')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| anyhow::anyhow!("{}: no seq in the file name", p.display()))?;
-            Ok((seq, crate::search::checkpoint::FrameFile::open(p)?))
-        })
-        .collect()
+/// One stored row by its id (`pack_id`): the row, its shape and its cell.
+pub fn load_row(dir: &std::path::Path, id: u64) -> Result<(Rt2, u64, u32)> {
+    let (layer, seq, row) = (id_layer(id), id_seq(id), id_row(id));
+    let (_, f) = frame_files(dir, layer)?
+        .into_iter()
+        .find(|(s, _)| *s == seq)
+        .ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq} for id {id:#x}"))?;
+    anyhow::ensure!(row < f.width(), "id {id:#x}: row {row} past its file's {}", f.width());
+    let rt2 = f.load_rows(&[row..row + 1])?.ok_or_else(|| anyhow::anyhow!("no row for id {id:#x}"))?;
+    Ok((rt2, f.shape_hash(), f.row_cells()[row as usize]))
 }
 
 /// Load only the ROWS whose cell is in `cells` - the backward's per-cell
@@ -2771,7 +2756,7 @@ pub fn load_frame_cells(
     cells: &rustc_hash::FxHashSet<u32>,
 ) -> Result<Vec<Block>> {
     let mut out = Vec::new();
-    for file in frame_files(dir, frame)? {
+    for (_, file) in frame_files(dir, frame)? {
         if let Some(rt2) = file.load_cells(cells)? {
             out.push(Block::from_rt2(rt2));
         }

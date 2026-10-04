@@ -1,13 +1,9 @@
-//! Single-lane concrete execution.
+//! Concrete execution: one input byte through the reference engine.
 //!
-//! Every tool that replays a specific input sequence (`concrete_run`,
-//! `measure_k`, the TAS walks in the `rewrite` binary) goes through this
-//! plumbing. The concrete path runs the same interpreter as the abstract
-//! search - there is no separate "simple" interpreter to drift out of
-//! sync - and the same program assembly (`program::Program`), so
-//! a tool can never end up with a franken-room or a frame chunk that
-//! forgets the button-state reset (both happened when each binary
-//! hand-assembled its own copy).
+//! Every tool that replays or searches concrete input sequences
+//! (`concrete_run`, `rewrite witness` / `trajectory` / `follow`, the arc
+//! witness) goes through this plumbing, so none of them can forget the
+//! button-state reset (`restore_buttons`) the search's rows are keyed with.
 
 use anyhow::{anyhow, Result};
 
@@ -94,6 +90,59 @@ impl ConcreteEngine {
         set_concrete_buttons(&mut state, byte)?;
         self.eng.run_frame_concrete(&state)
     }
+
+    /// One concrete frame from `state` under input `byte`, EVERY leaf: a
+    /// frame forks where the cart reads a value no input decides (`rnd`).
+    /// Each successor's buttons are restored to `initial`'s, the boundary's
+    /// representation the search stores and keys rows with.
+    pub fn step_all(&mut self, state: &State, byte: u8, initial: &State) -> Result<Vec<State>> {
+        let mut s = state.clone();
+        set_concrete_buttons(&mut s, byte)?;
+        let mut out = self.eng.run_frame_concrete_all(&s)?;
+        for succ in &mut out {
+            restore_buttons(initial, succ)?;
+        }
+        Ok(out)
+    }
+}
+
+/// Input bytes from a `tas/`-format file (`#` comment lines) or a comma list.
+pub fn read_inputs(spec: &str) -> Result<Vec<u8>> {
+    let text = std::fs::read_to_string(spec).unwrap_or_else(|_| spec.to_string());
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .flat_map(|l| l.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect::<Vec<_>>())
+        .map(|t| t.parse::<u8>().map_err(|e| anyhow!("input byte {t:?}: {e}")))
+        .collect()
+}
+
+/// The search's start: the room's initial state, or (`--start-after`) every
+/// state the concrete input prefix `prefix` (`read_inputs`) leads to - every
+/// leaf of a frame that forks on `rnd` kept, duplicates (by row key) dropped.
+pub fn start_states(prefix: Option<&str>) -> Result<Vec<State>> {
+    use crate::frame::Block;
+    let mut eng = ConcreteEngine::new()?;
+    let initial = eng.initial_state()?;
+    let Some(prefix) = prefix else { return Ok(vec![initial]) };
+    let inputs = read_inputs(prefix)?;
+    let mut states = vec![initial.clone()];
+    for &byte in &inputs {
+        let mut next = Vec::new();
+        let mut seen: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+        for st in &states {
+            for succ in eng.step_all(st, byte, &initial)? {
+                if seen.insert(Block::from_state(&succ)?.keys()[0]) {
+                    next.push(succ);
+                }
+            }
+        }
+        states = next;
+    }
+    eprintln!("[start] after {} prefix inputs: {} state(s)", inputs.len(), states.len());
+    for st in &states {
+        eprintln!("[start]   {}", crate::search::inspect::player_summary(Block::from_state(st)?.rt2(), 0));
+    }
+    Ok(states)
 }
 
 /// Copy the `__button_states` array of `from` over `to`'s: after a
@@ -134,7 +183,6 @@ pub fn restore_buttons(
     }
     Ok(())
 }
-// DFS with memoized dead ends per (key, cell).
 
 /// The moving platforms' fields a world fixes (`platform_worlds`): `x`,
 /// `last`, `rem.x`, `spd.x`, then `y` and `dir` - constant, what a traced

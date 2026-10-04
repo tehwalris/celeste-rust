@@ -288,9 +288,6 @@ impl Region {
             (Seg { lo: s.lo, hi: s.hi }, xs)
         })
     }
-    pub fn n_slabs(&self) -> usize {
-        self.slabs.len()
-    }
     pub fn n_segs(&self) -> usize {
         self.xs.len()
     }

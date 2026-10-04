@@ -607,6 +607,16 @@ impl Rt2 {
         out
     }
 
+    /// The first player INSTANCE's `x`/`y` cells of its table field `f`
+    /// (`rem`, `spd`) - not `player_spawn`'s, whose remainder is real state.
+    pub fn player_xy_cells(&self, ids: &BoundaryIds, f: u32) -> Option<(usize, usize)> {
+        let obj = *self.player_objects(ids).first()?;
+        match self.xy_cells_of(obj, f, ids)[..] {
+            [x, y] => Some((x as usize, y as usize)),
+            _ => None,
+        }
+    }
+
     /// Per lane, the player's speed hull `[x_lo, x_hi, y_lo, y_hi]` (raw),
     /// `None` when the block has no player with a numeric or interval
     /// speed on both axes.
