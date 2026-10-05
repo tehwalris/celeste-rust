@@ -36,3 +36,31 @@ level-0 key until 2026-10-05: unsound, every 'none within' is rechecked).
 The soundness also rests on the projection of a
 concrete state onto a level-0 node matching the tree's keys (a mismatch would
 prune a real winner); `rewrite follow` agrees along the spawn and first moves.
+
+## The improvements against the community TASes (checked 2026-10-05)
+
+The tasdatabase clone is at the remote's HEAD (bf184fa, 2026-07-25; 2900m
+nodiag was last improved there 2026-06-22, 85 -> 81). Both TASes are replayed
+in the ORIGINAL cart (`--lua celeste_ocaml/celeste.lua --begin-game`) in the
+same harness: the community TAS behind the room's prologue (its earliest
+exiting offset; every earlier offset never exits), ours as is. The player
+first exists on the same frame in both, and both exit during the frame
+counted - so the difference is the route, not counting. In the database's
+terms (frames = inputs - 1): 600m 64 -> 63, 1700m 63 -> 61, 2900m 81 -> 76.
+
+Frame-by-frame alignment (/tmp/align.py, positions per frame):
+
+- (5,0) 600m, -1: identical through f68. Ours dashes up at f70 from x=89
+  instead of f71 from x=91, is 2 px higher from there, and the closing
+  wall-jump chain runs one frame ahead.
+- (0,2) 1700m, -2: TAS17 dashes left at once (f26) and climbs; ours jumps,
+  dashes DOWN at f28 to land early, refills on the ground and jumps at f34 -
+  both reach the up-dash at f40. TAS17 is then held against a wall at x=17
+  for f50-52 while pressing right; ours starts its right run from x=14 on a
+  line that is not blocked, up-dashes at f67 (TAS: f68) and jumps at f82
+  (TAS: f83).
+- (4,3) 2900m, -5: TAS29 uses three dashes (R f57, U f71, U f98); ours four
+  (R f53, U f67, R f86, U f93): a lower early line puts the first right dash
+  4 frames earlier, and an extra dash refill around (84,30) that TAS29 does
+  not take allows a second right dash. Ours exits with balloon seeds 0, 0.5
+  and PICO-8's rnd.
