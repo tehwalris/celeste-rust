@@ -48,7 +48,7 @@ first exists on the same frame in both, and both exit during the frame
 counted - so the difference is the route, not counting. In the database's
 terms (frames = inputs - 1): 600m 64 -> 63, 1700m 63 -> 61, 2900m 81 -> 76.
 
-Frame-by-frame alignment (/tmp/align.py, positions per frame):
+Frame-by-frame alignment (`tools/align_tas.py`, positions per frame):
 
 - (5,0) 600m, -1: identical through f68. Ours dashes up at f70 from x=89
   instead of f71 from x=91, is 2 px higher from there, and the closing
