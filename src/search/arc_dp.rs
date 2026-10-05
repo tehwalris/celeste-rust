@@ -139,6 +139,15 @@ impl Graph {
     pub fn xfer(&self, e: &Out) -> (Transfer, Transfer) {
         self.xfers[e.xfer as usize]
     }
+    /// Drop the adjacency (out-edges, predecessors, transfers): what is left
+    /// answers `index`, `id`, `is_win`, `layer_of`.
+    pub fn forget_edges(&mut self) {
+        for v in [&mut self.out_at, &mut self.pred_at, &mut self.preds] {
+            *v = Vec::new();
+        }
+        self.out = Vec::new();
+        self.xfers = Vec::new();
+    }
     pub fn len(&self) -> usize {
         self.ids.len()
     }
@@ -680,7 +689,7 @@ pub fn concrete_search(
             }
         }
     }
-    eprintln!("[concrete] {} nodes keyed in {:.1} s; {workers} workers; the arc bound f{bound}", node.len(), t0.elapsed().as_secs_f64());
+    eprintln!("[concrete] {} nodes keyed in {:.1} s; {workers} workers; the arc bound f{bound}; rss {:.1} GB", node.len(), t0.elapsed().as_secs_f64(), crate::metrics::current_rss_gb());
     fn rem_of(rt2: &Rt2) -> Result<(u32, u32)> {
         let ids = crate::compiled::ids();
         let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((super::arcs::point(0), super::arcs::point(0))) };
@@ -866,12 +875,13 @@ pub fn concrete_search(
             }
         }
         eprintln!(
-            "[concrete] layer {:3}: {} states -> {} inside W{}; {steps} steps so far, {:.1} s",
+            "[concrete] layer {:3}: {} states -> {} inside W{}; {steps} steps so far, {:.1} s, rss {:.1} GB",
             k + 1,
             cur.len(),
             next.len(),
             if won.is_some() { ", A WIN" } else { "" },
-            t.elapsed().as_secs_f64()
+            t.elapsed().as_secs_f64(),
+            crate::metrics::current_rss_gb()
         );
         if let Some((parent, byte, cell)) = won {
             // The path, back through the layers.
@@ -998,8 +1008,12 @@ pub fn solve(
         std::fs::write(out.join("arc.txt"), format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(arc)))?;
     }
     drop(files);
+    // The concrete search reads W and the node index, not the edges: they
+    // go first (room (4,3) nodiag h111: 769M edges, 9.2 GB of adjacency).
+    let mut graph = ld.graph;
+    graph.forget_edges();
     let concrete = match (witness, arc) {
-        (true, Some(f)) => concrete_search(dir, level, horizon, g, &w, f)?,
+        (true, Some(f)) => concrete_search(dir, level, horizon, &graph, &w, f)?,
         _ => None,
     };
     if let Some(wt) = &concrete {
