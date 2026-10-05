@@ -1,17 +1,11 @@
-//! Kernel DISPATCH: which kernel set runs, and the hit/miss counters.
-//!
-//! The registry (`super::asm_kernel`) is the constant-lattice kernel set
-//! for the active level: one assembled kernel per start-room heap
-//! SHAPE, indexed by the chunk's shape hash. A chunk no kernel takes
-//! returns `false`, which is FATAL (`FrameEngine::run_frame_block`): a
-//! coverage gap that only shows up as wall clock is the failure mode this
-//! search refuses to have (CLAUDE.md "Never deopt to the interpreter").
+//! Kernel DISPATCH: the call into the ASM kernel set and the hit/miss
+//! counters. A chunk no kernel takes returns `false`, which is FATAL in
+//! `FrameEngine::run_bucket` (never deopt silently).
 
 use celeste_engine::runtime2;
 
-/// A one-line miss summary for the strict-mode abort: how many lanes the
-/// ASM kernels could not serve (a shape with no assembled kernel, or a
-/// declined lane). The ASM path does not categorize by refusal step.
+/// A one-line miss summary for the abort: lanes the kernels could not serve
+/// (a shape with no kernel, or a declined lane).
 pub(crate) fn miss_report() -> String {
     format!("  {} lanes missed the ASM kernels", missed_lanes())
 }
@@ -22,9 +16,7 @@ pub(crate) fn run_chunk_kernel(
     lanes: std::ops::Range<usize>,
     sink: &mut crate::frame::ForwardSink,
 ) -> bool {
-    // The ASM backend is THE kernel implementation: the fused compute graph
-    // assembled at startup (`asm_kernel`). A miss (no shape, or a declined
-    // lane) is counted here and is fatal in the caller.
+    // A miss is counted here and is fatal in the caller.
     let n = lanes.len() as u64;
     let hit = super::asm_kernel::run_chunk(chunk, cell_in, lanes, sink);
     if hit {
@@ -41,10 +33,8 @@ static KERNEL_HITS: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
-/// Lanes the traced set has MISSED so far, without resetting the counter.
-/// A kernels-against-reference test asserts this is zero: a run where chunks
-/// quietly fell through to the reference path would otherwise pass while
-/// checking interpreter against interpreter.
+/// Lanes the kernels have MISSED so far, without resetting the counter.
+/// Kernels-against-reference tests assert this is zero.
 pub fn missed_lanes() -> u64 {
     KERNEL_HITS[1].load(std::sync::atomic::Ordering::Relaxed)
 }

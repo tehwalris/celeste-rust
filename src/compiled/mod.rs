@@ -62,9 +62,8 @@ pub fn ids() -> &'static runtime2::BoundaryIds {
 }
 
 /// The start room's cart and collision cache, loaded once. Every block
-/// carries these two `Arc`s (the kernels read tiles through them), so
-/// anything that builds a block outside an engine - the checkpoint loader,
-/// `trace::refbridge` - attaches the same pair.
+/// carries these two `Arc`s (the kernels read tiles through them); anything
+/// that builds a block outside an engine attaches the same pair.
 pub fn room_context() -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
     static CTX: std::sync::OnceLock<(Arc<CartData>, Arc<CollisionCache>)> =
         std::sync::OnceLock::new();
@@ -88,12 +87,9 @@ impl FrameEngine {
     }
 
     /// One frame of one BUCKET (one shape's block of the frontier), emitted
-    /// into `sink`: every output row the kernel keeps lands in `sink.out`
-    /// (per outcome, at the boundary, keyed), its pos-graph edge in
-    /// `sink.edges`, and - when the sink carries the visited set - only
-    /// rows new to the search are materialized at all. No pre-partition,
-    /// no chunking (the kernel slices by 16 itself), no post-merge (the
-    /// caller routes rows into next frame's buckets).
+    /// into `sink`: kept rows at the boundary, keyed, with their pos-graph
+    /// edges. The kernel slices by 16 itself; the caller routes rows into
+    /// the next frame's buckets.
     pub fn run_bucket(
         &self,
         bucket: &runtime2::Rt2,
@@ -102,11 +98,8 @@ impl FrameEngine {
         sink: &mut crate::frame::ForwardSink,
     ) {
         if !dispatch::run_chunk_kernel(bucket, cell_in, lanes, sink) {
-            // A chunk the kernels cannot take is a COVERAGE GAP, not a
-            // degraded mode (CLAUDE.md "Never deopt to the interpreter"):
-            // there is no fallback. The search checkpoints per completed
-            // frame, so the run resumes from the previous frame once the
-            // missing shape is traced.
+            // A COVERAGE GAP, not a degraded mode: there is no fallback.
+            // The search resumes from the last completed frame's checkpoint.
             panic!(
                 "KERNEL COVERAGE GAP: a {}-row bucket of shape {:#018x} has no kernel; \
                  reasons:\n{}\ntrace the missing shape and resume from the last checkpoint",
@@ -118,11 +111,8 @@ impl FrameEngine {
     }
 }
 
-/// The compiled kernels as the fast `FrameStep` implementation (interface #1),
-/// the counterpart to `RefEngine`. The block IS the engine's block, so this
-/// is `run_bucket` and nothing else: no bridge, and every output carries
-/// the key column the kernel computed. `&mut self` per the trait; the
-/// engine itself is `&self`.
+/// The compiled kernels as the `FrameStep` implementation, the counterpart
+/// to `RefEngine`: just `run_bucket`.
 impl crate::frame::FrameStep for FrameEngine {
     fn run(
         &self,

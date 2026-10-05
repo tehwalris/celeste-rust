@@ -21,7 +21,6 @@ pub const BUILTIN_NAMES: [&str; 19] = [
     "mget",
     "fget",
     "tile_flag_at",
-    // APPENDED 2026-09-16: `rnd`, an interval draw in the tracer (room
-    // (5,0)'s balloon, the chest). Appended so every index above is unchanged.
+    // Appended, so every index above is unchanged.
     "rnd",
 ];

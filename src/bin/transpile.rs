@@ -1,13 +1,10 @@
-//! CLI for the tracer's level -1 probe (`celeste_rust::trace::level_minus_one`):
+//! CLI for the level -1 cost-to-go table (`trace::level_minus_one`,
+//! plans/level-minus-one.md), player speed in [-S, S] px/frame:
 //!
 //!   transpile --level-minus-one S LEVEL_DIR CEILING FROM TO [MARKS]
+//!       check it against LEVEL_DIR's recorded transitions, frames FROM..=TO
+//!       under CEILING (and the backward's MARKS at that horizon)
 //!   transpile --level-minus-one-table S   build the table alone, its fingerprint
-//!
-//! the position-only cost-to-go table for the start room
-//! (plans/level-minus-one.md), with the player's speed in [-S, S] px/frame,
-//! checked against LEVEL_DIR's recorded transitions and compared with its
-//! frames FROM..=TO under CEILING (and against the backward's MARKS file at
-//! that horizon). CELESTE_THREADS workers (default 8).
 
 use anyhow::{anyhow, Context, Result};
 
@@ -35,10 +32,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("--level-minus-one-table") => {
-            // Build the level -1 table alone, as the search does
-            // (`cost_to_go`), and print its fingerprint: the A/B check for a
-            // change to the build. CELESTE_THREADS workers (default: every
-            // hardware thread, as the search).
+            // Build the table as the search does and print its fingerprint:
+            // the A/B check for a change to the build.
             let spd_px: i32 = args.next().ok_or_else(|| anyhow!("--level-minus-one-table S"))?.parse().context("--level-minus-one-table S")?;
             let threads = match std::env::var("CELESTE_THREADS") {
                 Ok(s) => s.parse().context("CELESTE_THREADS")?,

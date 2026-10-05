@@ -1,14 +1,11 @@
 //! The frame driver for the reference interpreter (`refdomain::RefDomain`).
 //!
-//! `Interp<RefDomain>` runs ONE scalar path of a frame (`run_frame_all`). This
-//! driver enumerates the whole fork tree by re-execution: run the frame to a
-//! leaf, record the output state, `cursor.advance()` to the next path, and
-//! re-run - a depth-first search (plans/kernel-boundary-and-deletion.md). The
-//! set of output states is the frame's successor set for one input state.
-//!
-//! The cursor is the ONLY state carried across reruns; everything else - a
-//! fresh `Interp`, a fresh clone of the input state - is rebuilt each path, so
-//! there is no snapshot/backtrack machinery.
+//! `Interp<RefDomain>` runs ONE scalar path of a frame; `run_frame_all`
+//! enumerates the fork tree depth-first by re-execution (run to a leaf,
+//! record the output, `cursor.advance()`, re-run). The outputs are the
+//! frame's successor set for one input state. The cursor is the only state
+//! carried across reruns: the input is cloned per path, so nothing is
+//! snapshotted or backtracked.
 
 use anyhow::{bail, Result};
 use std::sync::Arc;
@@ -21,9 +18,8 @@ use crate::trace::interp::Interp;
 use crate::trace::refdomain::{Cursor, RefDomain};
 use crate::trace::state::State;
 
-/// Build an `Interp<RefDomain>` with the room's cart + collision cache and a
-/// fresh cursor. The caller runs the cart toplevel + `_init` on it once to
-/// register the function bodies, then reuses it for every frame.
+/// An `Interp<RefDomain>` with the room's cart and collision cache. The caller
+/// runs the cart toplevel and `_init` on it once, then reuses it every frame.
 pub fn fresh_interp<'a>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Interp<'a, RefDomain> {
     let mut it = Interp::new(RefDomain::new());
     it.cart = Some(cart);
@@ -31,27 +27,19 @@ pub fn fresh_interp<'a>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Inte
     it
 }
 
-/// Run one frame from `input`, enumerating every fork path, and return the set
-/// of output states (one per leaf of the decision tree). `body` is the code to
-/// run per path - for a real game frame that is
-/// `__reset_button_states()\n_update()\n_draw()`, so the six buttons and every
-/// internal straddle/floor-split are enumerated by the cursor.
+/// Run one frame of `body` from `input` along every fork path; one output state
+/// per leaf. For a game frame `body` is
+/// `__reset_button_states()\n_update()\n_draw()`, so the buttons are forks too.
 ///
-/// `it` must already have the function bodies registered (run the cart toplevel
-/// on it first) and carry the room's cart/cache; it is REUSED across paths, so
-/// its `d.cursor` is the persistent DFS state. `input` is cloned per path.
+/// `it` must have the cart's functions registered; its `d.cursor` is the DFS
+/// state. A path that REFUSES (e.g. a fork premise a lane cannot satisfy) is
+/// an error; a path that RAISES has no successor.
 ///
-/// A path that REFUSES (a poisoned/illegal frame, e.g. a fork premise a lane
-/// cannot satisfy) propagates as an error.
+/// `level` is passed in, not read from the process-global level: a concrete
+/// step (`RefEngine::step`) is exact whatever the search has set.
 ///
-/// `level` is the precision the frame runs at, passed in rather than read from
-/// the process-global level: a concrete step (`RefEngine::step`) is exact
-/// whatever level the search has set.
-///
-/// `unknown` names the input's fields that hold an unknown boolean
-/// (`refbridge::from_block`): each is a cursor choice of both
-/// values per path, made before the frame runs - as the kernels fork a held
-/// trail, and read a fall floor's unknown `collideable`.
+/// `unknown` names the input's unknown-boolean fields (`refbridge::from_block`):
+/// each is a cursor choice made before the frame runs, as the kernels fork them.
 pub fn run_frame_all<'a>(
     it: &mut Interp<'a, RefDomain>,
     body: &'a ast::Ast,
@@ -62,8 +50,7 @@ pub fn run_frame_all<'a>(
     it.d.cursor = Cursor::new();
     let mut outputs = Vec::new();
     let mut paths = 0usize;
-    // Nor the fly fruit and the moving platforms unknown: their ranges and
-    // worlds have no reference form yet.
+    // Unknown fly fruit and platforms have no reference form yet.
     if level.fruit {
         anyhow::bail!("the reference engine does not run fruit-unknown levels (plans/fly-fruit.md)");
     }
@@ -81,8 +68,7 @@ pub fn run_frame_all<'a>(
         if level.floors_near {
             concretize_near_floors(&mut st, &mut it.d)?;
         }
-        // A path that RAISES has no successor (`Interp::poison`; the nodiag
-        // mode's diagonal dash is one): it ends in no state, and only then.
+        // A path that RAISES (`Interp::poison`) ends in no state, and only then.
         it.raised.clear();
         let ended = it.exec_block(body.nodes(), st)?;
         match ended.len() {

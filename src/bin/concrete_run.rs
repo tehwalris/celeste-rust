@@ -28,10 +28,8 @@ struct Cli {
     object: Option<String>,
 }
 
-/// CAREFUL when parsing this output: the format is floor.frac_hex, NOT
-/// sign-magnitude. For negative numbers the whole part is the FLOOR and the
-/// fraction is the positive offset above it: `-4.76ec` means
-/// (-4 << 16) | 0x76ec = -0x3.8914 (-3.5355), not -(4 + 0x76ec/65536).
+/// Formats as floor.frac_hex, NOT sign-magnitude: `-4.76ec` is
+/// (-4 << 16) | 0x76ec = -3.5355, not -(4 + 0x76ec/65536).
 fn format_num(n: Pico8Num) -> String {
     let whole = n.whole_part_as_i16();
     let frac = n.fraction_part_as_u16();
@@ -132,7 +130,6 @@ fn main() -> Result<()> {
     }
 
     for frame_num in 1..=num_frames {
-        // Input for this frame (0 if past the input sequence)
         let input_byte = inputs.get(frame_num as usize - 1).copied().unwrap_or(0);
         state = eng.step_one(&state, input_byte)?.into_rt2();
         print_frame(&state, frame_num, input_byte);

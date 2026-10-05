@@ -2,8 +2,10 @@
 //!
 //! Numeric, interval and tri-state boolean arithmetic over cells and
 //! constants, stored as packed output columns. Every instruction is chosen
-//! to match `celeste_engine::kernel` bit-for-bit; `super::tests` proves
-//! it. See `plans/asm-backend.md`.
+//! to match `celeste_engine::kernel` bit-for-bit; `super::tests` checks it.
+//!
+//! Pipeline: lower the graph to an SSA instruction stream over vregs (with
+//! GVN), list-schedule it, linear-scan allocate, emit GAS text.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -14,13 +16,13 @@ use crate::transpile::graph::{Graph, NodeId, Op};
 
 // ---- physical register-file partition ----
 //
-// Every temporary is its own allocator-managed vreg. Six registers are
-// reserved (ZERO for Neg, two reload-scratch, two remat helpers, one
-// spilled-result scratch), leaving 26 homes.
+// Every temporary is its own allocator-managed vreg. zmm26..=31 are
+// reserved (ZERO, two operand scratches, a third-operand helper, a
+// spilled-result scratch; zmm27 is unused), leaving 26 homes.
 const ZERO: u8 = 31; // constant 0, for Neg
 const OPA: u8 = 30; // reload/remat scratch, operand A
 const OPB: u8 = 29; // reload/remat scratch, operand B
-const H0: u8 = 28; // remat helper (recompute a sub-operand)
+const H0: u8 = 28; // scratch for a third operand (ternlog)
 const RES: u8 = 26; // scratch for a spilled result
 const N_ALLOC: u8 = 26; // homes zmm0..=zmm25
 
@@ -62,9 +64,8 @@ enum NumVal {
 }
 
 /// One plane of a tri-state boolean (`ZB`): a per-lane VECTOR mask (each
-/// lane all-ones or zero), not a k-register - so the whole boolean layer
-/// stays in the plentiful zmm class and reuses the allocator/scheduler.
-/// `Const(true)` = all-ones, `Const(false)` = zero.
+/// lane all-ones or zero), not a k-register, so booleans share the zmm
+/// allocator. `Const(true)` = all-ones, `Const(false)` = zero.
 #[derive(Clone, Copy)]
 enum MaskVal {
     Reg(Vreg),
@@ -115,11 +116,9 @@ impl Src {
     }
 }
 
-/// A pure instruction's value identity: its op and operand identities,
-/// excluding the destination vreg. Two insts with equal keys compute the
-/// same value, so the second reuses the first's vreg (global value
-/// numbering). Commutative ops sort their register operands so `a+b` and
-/// `b+a` share.
+/// A pure instruction's value identity (op and operands, not the
+/// destination), for global value numbering. Commutative ops sort their
+/// register operands so `a+b` and `b+a` share.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Key {
     Load(u32),
@@ -140,10 +139,8 @@ enum Key {
 /// (`dst`), which is what makes the allocator a single-register problem.
 enum Inst {
     Load { dst: Vreg, off: u32 },
-    /// Load a 16-bit `val` mask from the input buffer at `off` and expand it
-    /// to a per-lane vector mask (`movzwl`; `kmovw`; `vpmovm2d`). The bool
-    /// input path - the reverse of `StoreMask`; `known` is supplied as
-    /// `Const(true)` by the lowerer.
+    /// Load a 16-bit mask from the input buffer at `off` and expand it to a
+    /// per-lane vector mask (the reverse of `StoreMask`).
     LoadMask { dst: Vreg, off: u32 },
     BcastD { dst: Vreg, val: i32 },
     RBin { dst: Vreg, op: ROp, a: Vreg, b: Src },
@@ -172,9 +169,8 @@ enum Inst {
     StoreMask { off: u32, src: Vreg },
 }
 
-/// The type of a root value, so a caller knows how to read its 128-byte
-/// output slot: `Num` = one ZN at +0; `Ival` = two 64-byte planes at
-/// +0/+64; `Bool` = two u16 masks (val at +0, known at +2).
+/// The type of a root value: how to read its output slot
+/// (`Compiled::root_offsets`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RootKind {
     Num,
@@ -182,23 +178,16 @@ pub enum RootKind {
     Ival,
 }
 
-/// How an `Op::Cell` INPUT column is packed in the input buffer, so the
-/// codegen loads it into the right value domain. Every input cell still
-/// occupies one 64-byte slot (`input_cells[i]` at `i*64`); the repr only
-/// changes how those bytes are interpreted:
+/// How an `Op::Cell` INPUT column is packed in the input buffer:
 /// * `Num` - one `ZN` (64 bytes): 16 x i32 raw `Pico8Num`.
-/// * `Bool` - a 16-bit `val` mask in the first 2 bytes of a 64-byte slot;
-///   `known` is implicitly all-ones (block bool inputs are fully known,
-///   e.g. `has_dashed`).
-/// * `Ival` - a `ZI` (128 bytes): the `lo` plane (`ZN`) at +0, the `hi`
-///   plane at +64. A per-lane interval, e.g. `player.rem`.
-/// * `UBool` - a bool a lane may hold UNKNOWN (a near level's floor
-///   `collideable`): the 16-bit `val` mask at +0 and the `known` mask at +2
-///   of a 64-byte slot.
+/// * `Bool` - a 16-bit `val` mask at +0 of a 64-byte slot; `known` is
+///   implicitly all-ones.
+/// * `Ival` - a `ZI` (128 bytes): the `lo` plane at +0, `hi` at +64.
+/// * `UBool` - a bool a lane may hold UNKNOWN: the `val` mask at +0 and the
+///   `known` mask at +2 of a 64-byte slot.
 ///
 /// A cell absent from the repr map defaults to `Num`. Input cells are laid
-/// out in `input_cells` order, each at `Compiled::input_offsets[i]`, sized
-/// by repr (64 or 128 bytes).
+/// out in `input_cells` order at `Compiled::input_offsets`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CellRepr {
     Num,
@@ -221,9 +210,7 @@ impl CellRepr {
 /// needs to pack its buffers.
 pub struct Compiled {
     pub asm: String,
-    /// Input cells, in ascending order. Cell `input_cells[i]` occupies the
-    /// input buffer at byte `input_offsets[i]`, sized by `input_reprs[i]`
-    /// (`Num`/`Bool` 64 bytes, `Ival` 128).
+    /// Input cells, in ascending order (layout: `CellRepr`).
     pub input_cells: Vec<u32>,
     /// Byte offset of each input cell (parallel to `input_cells`).
     pub input_offsets: Vec<u32>,
@@ -245,8 +232,7 @@ pub struct Compiled {
     /// How many spill slots the allocator used (0 = everything fit).
     pub spill_slots: usize,
     /// The kernel's stack frame in bytes (spill slots, save area, call-out
-    /// buffers): what the calling thread's stack must hold below the call
-    /// (`asm_kernel`'s stack check).
+    /// buffers), for the caller's stack check.
     pub frame_bytes: u32,
 }
 
@@ -290,8 +276,7 @@ impl<'a> Lower<'a> {
     }
 
     /// Emit a pure instruction, reusing an existing vreg if one already
-    /// computes the same value (`key`). `mk` builds the `Inst` from the
-    /// freshly allocated destination.
+    /// computes the same value (`key`).
     fn pure(&mut self, key: Key, mk: impl FnOnce(Vreg) -> Inst) -> Vreg {
         if let Some(v) = self.memo.get(&key) {
             return *v;
@@ -331,10 +316,9 @@ impl<'a> Lower<'a> {
         self.pure(Key::BlendImm(mask, a, b), move |d| Inst::BlendImm { dst: d, mask, a, b })
     }
 
-    /// 16.16 fixed-point multiply, the even/odd `vpmuldq` weave from
-    /// `zn_mul`: even lanes are `(a*b)>>16`, odd lanes the same after an
-    /// arithmetic 32-bit right shift brings them into the low i32, then the
-    /// odd results are shifted back up and blended over the even ones.
+    /// 16.16 fixed-point multiply, `zn_mul`'s even/odd `vpmuldq` weave: even
+    /// lanes `(a*b)>>16` directly, odd lanes shifted down, multiplied,
+    /// shifted back up and blended over.
     fn zn_mul(&mut self, a: Vreg, b: Vreg) -> Vreg {
         let ev = self.muldq(a, b);
         let ev = self.sraq(ev, 16);
@@ -360,9 +344,8 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A 32-bit-lane binary op (`vpandd/vpord/vpxord/vpandnd/...`), memoized.
-    /// `AndnD` is `(~a) & b`, so it is NOT commutative; the others among the
-    /// mask ops (`And/Or/Xor`) are and get canonical operand order.
+    /// A 32-bit-lane binary op, memoized; `And/Or/Xor` get canonical operand
+    /// order (`AndnD` is not commutative).
     fn dbin(&mut self, op: ROp, a: Vreg, b: Vreg) -> Vreg {
         let tag = match op {
             ROp::AddD => 0u8,
@@ -444,11 +427,10 @@ impl<'a> Lower<'a> {
         self.cmp(0, a, Src::Reg(b))
     }
 
-    /// Interval `+`, endpoint by endpoint. An endpoint that overflows the
-    /// 16.16 range WRAPS here, and that lane's interval is garbage - which
-    /// is why the op has an own error (`Op::NoWrap`, `trace::error`): the
-    /// lane declines wherever the result is read. Never silently wrapped
-    /// (the inverted countdown of 2026-10-03) and never silently widened.
+    /// Interval `+`, endpoint by endpoint. An endpoint that overflows WRAPS
+    /// and the lane's interval is garbage, which is why the op has its own
+    /// error (`Op::NoWrap`, `trace::error`): the lane declines wherever the
+    /// result is read. Never silently wrapped, never silently widened.
     fn zi_add(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
         [self.dbin(ROp::AddD, a[0], b[0]), self.dbin(ROp::AddD, a[1], b[1])]
     }
@@ -457,11 +439,10 @@ impl<'a> Lower<'a> {
         // Endpoints cross: [a.lo - b.hi, a.hi - b.lo].
         [self.dbin(ROp::SubD, a[0], b[1]), self.dbin(ROp::SubD, a[1], b[0])]
     }
-    /// `Op::NoWrap` of an interval `+` / `-`: the lanes where neither
-    /// endpoint of `r` overflowed, `r`'s endpoints computed from `a` and
-    /// `b` as `zi_add` / `zi_sub` pair them. Per endpoint, `x + y = r`
-    /// overflowed iff `(x ^ r) & (y ^ r)` is negative, and `x - y = r` iff
-    /// `(x ^ y) & (x ^ r)` is (`kernel::zi_add_wraps`, `zi_sub_wraps`).
+    /// `Op::NoWrap` of an interval `+` / `-` with result `r`: the lanes where
+    /// neither endpoint overflowed. `x + y = r` overflowed iff
+    /// `(x ^ r) & (y ^ r)` is negative, `x - y = r` iff `(x ^ y) & (x ^ r)`
+    /// is (`kernel::zi_add_wraps`, `zi_sub_wraps`).
     fn zi_arith_no_wrap(&mut self, sub: bool, a: [Vreg; 2], b: [Vreg; 2], r: [Vreg; 2]) -> Vreg {
         let (bl, bh, imm) = if sub { (b[1], b[0], 0x18) } else { (b[0], b[1], 0x42) };
         let ol = self.ternlog(a[0], bl, r[0], imm);
@@ -556,11 +537,9 @@ impl<'a> Lower<'a> {
         [t, known]
     }
 
-    /// The raw value of `id` if it is a positive constant scalar (a
-    /// degenerate `Op::Const(v, v)` with `v > 0`) - the only scalar an
-    /// interval scale/divide is monotone by. Used to gate the interval
-    /// `Mul`/`Div` paths, matching `graph.eval`'s exact-positive-scalar
-    /// requirement.
+    /// The raw value of `id` if it is a positive constant scalar - the only
+    /// scalar an interval scale/divide is monotone by (as `graph.eval`
+    /// requires).
     fn pos_const_scalar(&self, id: NodeId) -> Option<i32> {
         match self.g.get(id).op {
             Op::Const(lo, hi) if lo == hi && lo > 0 => Some(lo),
@@ -609,9 +588,7 @@ impl<'a> Lower<'a> {
     }
 
     /// Why is `id` an interval: the chain of interval operands down to the
-    /// node that made it one (an interval cell, a split, a span, a literal
-    /// interval, or a select whose arm is one - shown with its condition).
-    /// For the error above.
+    /// node that made it one (for `as_num`'s error).
     fn interval_source(&self, id: NodeId) -> String {
         let mut out = Vec::new();
         let mut cur = id;
@@ -652,8 +629,8 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// The value domain of a node, for domain-dispatched ops (`Eq`, `Sel`,
-    /// `Known`, `Bits`).
+    /// The value domain of a node (0 number, 1 boolean, 2 interval), for
+    /// domain-dispatched ops.
     fn dom(&self, id: NodeId) -> u8 {
         match self.vals[id as usize] {
             Some(Value::Num(_)) => 0,
@@ -686,8 +663,6 @@ impl<'a> Lower<'a> {
                         Value::Num(NumVal::Reg(dst))
                     }
                     CellRepr::Bool => {
-                        // The val plane is a 16-bit mask expanded per lane;
-                        // block bool inputs are fully known.
                         let dst =
                             self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off });
                         Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
@@ -744,10 +719,9 @@ impl<'a> Lower<'a> {
             }
             Op::Mul => {
                 // Interval * positive-constant scalar: scale each endpoint
-                // (monotone), matching `Pico8NumInterval::scale_positive`
-                // and `graph.eval`. (Its one known source, the rem rungs'
-                // bucket snap, is gone; an overflowing endpoint still wraps
-                // unchecked - plans/architecture.md, open.)
+                // (monotone), as `Pico8NumInterval::scale_positive`. No known
+                // source left; an overflowing endpoint wraps UNCHECKED
+                // (no `NoWrap` here; plans/architecture.md, open).
                 if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
                     let (ivn, scn) = if self.dom(a[0]) == 2 { (a[0], a[1]) } else { (a[1], a[0]) };
                     if self.dom(scn) == 2 {
@@ -775,11 +749,8 @@ impl<'a> Lower<'a> {
                 }
             }
             // Interval / positive-constant scalar: divide each endpoint
-            // (monotone, truncating like the scalar `Div`), matching
-            // `Pico8NumInterval::div_positive` and `graph.eval`. Placed
-            // before the scalar `Op::Div` Call arm below, which only reads
-            // `as_num`. (Its one known source was the rem rungs' bucket
-            // snap, `old / 2^-k`, now gone.)
+            // (monotone, truncating), as `Pico8NumInterval::div_positive`.
+            // Before the scalar `Op::Div` arm below, which reads `as_num`.
             Op::Div if self.dom(a[0]) == 2 => {
                 if self.pos_const_scalar(a[1]).is_none() {
                     bail!(
@@ -877,9 +848,8 @@ impl<'a> Lower<'a> {
                 // operand domain.
                 match self.dom(a[0]) {
                     _ if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 => {
-                        // `Graph::compare` on intervals: decided false when
-                        // the boxes are disjoint, decided when both are
-                        // singletons, undecided otherwise.
+                        // As `Graph::compare`: decided false when disjoint,
+                        // decided when both are singletons, else undecided.
                         let (ia, ib) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
                         let (ar, br) = (self.ival_regs(ia), self.ival_regs(ib));
                         let a_single = self.cmp(0, ar[0], Src::Reg(ar[1]));
@@ -945,9 +915,9 @@ impl<'a> Lower<'a> {
                 }
             }
             Op::Known => {
-                // Decidedness. `Known(Flr(x))` where x is an interval reads
-                // the INTERVAL (zi_flr_ok), because Flr is exact BY this very
-                // premise, so asking the result would answer itself.
+                // `Known(Flr(x))` of an interval reads the INTERVAL
+                // (zi_flr_ok): Flr is exact BY this premise, so asking the
+                // result would answer itself.
                 let inner = a[0];
                 if let Op::Flr = self.g.get(inner).op {
                     let src = self.g.get(inner).args[0];
@@ -988,10 +958,8 @@ impl<'a> Lower<'a> {
             Op::Sel => {
                 let c = self.as_bool(a[0])?;
                 let cv = self.mask_reg(c[0]);
-                // Dispatch on the JOINED arm domain, so a select of a number
-                // and an interval takes the interval path (as_ival coerces the
-                // numeric arm to [n, n]) - matching the Rust emitter, which
-                // reads both arms at their common representation.
+                // Dispatch on the JOINED arm domain: a number arm beside an
+                // interval arm is coerced to [n, n].
                 match self.dom(a[1]).max(self.dom(a[2])) {
                     1 => {
                         let (t, f) = (self.as_bool(a[1])?, self.as_bool(a[2])?);
@@ -1035,8 +1003,7 @@ impl<'a> Lower<'a> {
                 let (_, ok) = self.zi_fork_flr(ar, *c);
                 Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
             }
-            // The low end of fragment `c` as an EXACT number (a whole-pixel
-            // position under a bucket).
+            // The low end of fragment `c` as an EXACT number.
             Op::IntFrag(c) => {
                 let iv = self.as_ival(a[0])?;
                 let ar = self.ival_regs(iv);
@@ -1050,10 +1017,9 @@ impl<'a> Lower<'a> {
                 Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
             }
             // The own error of an interval `+`, `-` or negation
-            // (`trace::error`): read off the operation's operands and its
-            // wrapped endpoints, as `Known(Flr(x))` reads the interval under
-            // the floor. An EXACT operation wraps as PICO-8 does - one
-            // number, not an interval whose ends wrapped apart - so it holds.
+            // (`trace::error`), read off the operation's operands and its
+            // wrapped endpoints. An EXACT operation wraps as PICO-8 does, so
+            // it holds.
             Op::NoWrap => {
                 let x = a[0];
                 let xn = self.g.get(x);
@@ -1071,8 +1037,7 @@ impl<'a> Lower<'a> {
                         MaskVal::Reg(self.zi_neg_no_wrap(pr))
                     }
                     // An exact operation, or one a rewrite turned into
-                    // something else (`Graph::fold`'s rule: the same
-                    // definition as `Graph::eval`'s).
+                    // something else (as `Graph::fold` / `Graph::eval`).
                     _ => MaskVal::Const(true),
                 };
                 Value::Bool([ok, MaskVal::Const(true)])
@@ -1133,30 +1098,15 @@ impl<'a> Lower<'a> {
     }
 }
 
-/// Nodes reachable from `roots`.
-/// A lowering order that interleaves independent chains in BATCHES.
-///
-/// Interleaving independent rows by ASAP depth keeps the out-of-order
-/// window full of independent work (the multiply ports stay fed), but
-/// interleaving ALL rows at once makes every row's accumulator and mix
-/// temporaries live simultaneously - hundreds of non-rematerializable
-/// spills. So the roots are processed in batches of `batch`: within a
-/// batch the (still-unscheduled) cone is ordered depth-major to expose
-/// ILP, but only ~`batch` accumulators are ever live at once. Shared nodes
-/// (the `Bits`) are scheduled in the first batch that reaches them and,
-/// being rematerializable, are recomputed for free in later batches.
-///
-/// `depth` (longest path from the leaves) needs one forward pass since ids
-/// refer downward; an operand's depth is strictly smaller, so depth-major
-/// order is a valid evaluation order.
+/// A node lowering order that interleaves independent roots in BATCHES:
+/// within a batch the still-unscheduled cone is ordered depth-major to
+/// expose ILP, while only ~`batch` roots' temporaries are live at once.
+/// Shared nodes are placed in the first batch that reaches them.
 fn schedule(g: &Graph, live: &[bool], roots: &[NodeId], batch: usize) -> Vec<NodeId> {
-    // ALAP depth (as-late-as-possible): a node placed just before its
-    // earliest consumer. ASAP order computes every shared inner `mix64`
-    // up front (their inputs are shallow), so they live the whole program
-    // and spill; ALAP places each one right before the cell-step that uses
-    // it, so its live range is one step. Backward pass in reverse id order:
-    // an operand's consumers all have larger ids, so they are finalized
-    // first.
+    // ALAP depth: a node goes just before its earliest consumer, keeping
+    // shared values' live ranges short. Reverse id order is valid: an
+    // operand's consumers all have larger ids. An operand's depth is
+    // strictly smaller, so depth-major order is a valid evaluation order.
     let maxd = g.len() as u32;
     let mut depth = vec![maxd; g.len()];
     for id in (0..g.len() as NodeId).rev() {
@@ -1202,6 +1152,7 @@ fn schedule(g: &Graph, live: &[bool], roots: &[NodeId], batch: usize) -> Vec<Nod
     order
 }
 
+/// Nodes reachable from `roots`.
 fn reachable(g: &Graph, roots: &[NodeId]) -> Vec<bool> {
     let mut live = vec![false; g.len()];
     let mut stack = roots.to_vec();
@@ -1257,15 +1208,10 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
     }
 }
 
-/// Reorder the flat instruction stream with a critical-path-height list
-/// scheduler. Each vreg is defined once (SSA), so ANY topological order is
-/// valid; emitting the highest-critical-path instruction among those whose
-/// operands are ready spreads the ~24 independent accumulator chains so the
-/// multiply port issues without waiting out each `vpmullq`'s ~15-cycle
-/// latency. Node-level ordering could not do this: it emits each `Mix` as
-/// ~16 contiguous instructions, so the two serial muls inside one `mix64`
-/// sit adjacent with nothing to hide their latency. Spills are free here
-/// (proven: runtime is flat across 120..671 spills), so pressure is ignored.
+/// Reorder the flat instruction stream with a list scheduler. Each vreg is
+/// defined once (SSA), so any topological order is valid; emitting the
+/// highest-critical-path ready instruction interleaves independent chains
+/// to hide latency.
 fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
     let n = insts.len();
     let mut def_inst = vec![u32::MAX; n_vregs as usize];
@@ -1300,13 +1246,10 @@ fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
         height[i] = h;
     }
 
-    // Pressure-aware list scheduling. Emitting the highest-critical-path
-    // ready instruction exposes ILP but starts every independent chain at
-    // once, spilling catastrophically. So above a live-register threshold we
-    // switch objective to FREE registers - prefer the instruction that ends
-    // the most operands' live ranges - and only chase ILP while there is
-    // room. `rem` counts each vreg's not-yet-emitted consumers; a vreg dies
-    // when its last consumer is emitted.
+    // Pressure-aware: chasing critical path alone starts every chain at once
+    // and spills catastrophically, so above `limit` live registers the
+    // objective switches to FREEING registers (the instruction that ends the
+    // most live ranges). `rem` counts each vreg's not-yet-emitted consumers.
     let limit: usize = 16;
     let mut rem: Vec<u32> = vec![0; n_vregs as usize];
     for i in 0..n {
@@ -1314,20 +1257,16 @@ fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
             rem[*v as usize] += 1;
         }
     }
-    // The ready set lives in two heaps - one per objective - with lazy
-    // invalidation: an emitted instruction's stale entries are skipped,
-    // and an entry whose delta has improved (a vreg it reads lost its
-    // other consumers) is re-pushed with the fresh key when that happens,
-    // so the pressure heap's top is exact. O(n log n) against the O(n^2)
-    // scan of a flat ready list, which cost 124 s on a 493k-instruction
-    // kernel (room (2,0) with the speed ladder, 2026-09-14).
+    // The ready set lives in two heaps, one per objective, with lazy
+    // invalidation: stale entries are skipped, and an entry whose delta
+    // improved is re-pushed with the fresh key, so the pressure heap's top
+    // is exact. O(n log n); a flat ready-list scan is quadratic and took
+    // minutes on big kernels.
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     let delta = |i: u32, rem: &[u32]| -> i32 {
         let i = i as usize;
         let dies = uses[i].iter().filter(|v| rem[**v as usize] == 1).count() as i32;
-        // (`consumers` is per instruction: the ones reading what `i`
-        // defines.)
         let gains = match inst_def(&insts[i]) {
             Some(_) if !consumers[i].is_empty() => 1,
             _ => 0,
@@ -1460,19 +1399,14 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
     let mut n_slots: u32 = 0;
     // Spill SLOTS are reused like registers: a slot whose interval has ended
     // goes back to `free_slots` with that end, and is handed only to an
-    // interval that starts after it. (A spilled interval can start before the
-    // current point: `steal` spills an active one.) Before this every spilled
-    // vreg had its own slot for the whole kernel: room (3,0)'s largest kernel
-    // had 1.36M slots, an 83 MB frame, for 173k fused nodes (2026-09-18).
+    // interval that starts after it (a spilled interval can start before
+    // the current point: stealing spills an active one).
     let mut free_slots: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> = Default::default();
-    // Spilled intervals holding a slot: (end, slot), earliest end first. A
-    // heap, not a list scanned per interval: the scan was quadratic, over a
-    // minute of one core for room (3,0)'s spawn kernel (2026-09-18).
+    // Spilled intervals holding a slot: (end, slot), earliest end first (a
+    // heap: a per-interval scan is quadratic).
     let mut spilled: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> = Default::default();
-    // A spilled vreg's location. A rematerializable value (a load, or bits
-    // of a load) costs no stack slot: it is recomputed from input memory at
-    // each use instead of stored/reloaded. That is what keeps the 48 shared
-    // `Bits` off the stack under the interleaved schedule.
+    // A spilled vreg's location. A rematerializable value (a load) costs no
+    // stack slot: it is reloaded from input memory at each use.
     let spill_loc = |(vreg, start, end): (Vreg, u32, u32), n_slots: &mut u32, free_slots: &mut std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>, spilled: &mut std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>| -> Loc {
         if remat[vreg as usize] {
             return Loc::Spill(u32::MAX);
@@ -1560,10 +1494,8 @@ impl<'a> Emitter<'a> {
     }
 
     /// Put vreg `v` into a usable register and return it: its home if it
-    /// has one, otherwise `scratch` filled by a reload OR, for a
-    /// rematerializable value (a load / bits-of-a-load), by recomputing it
-    /// from input memory. Recompute needs at most two helper scratch
-    /// registers (`H0`, `H1`) for the sub-operand and the extract temp.
+    /// has one, otherwise `scratch` filled by a reload or, for a
+    /// rematerializable value, from input memory.
     fn use_reg(&mut self, v: Vreg, scratch: u8) -> u8 {
         match self.home[v as usize] {
             Loc::Reg(r) => r,
@@ -1579,14 +1511,9 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Recompute a rematerializable vreg into `dst` (a scratch reg),
-    /// SELF-CONTAINED from input memory. Crucially it does NOT read any
-    /// operand's register home: a remat happens later than the value's
-    /// recorded live range, so that register may already have been reused.
-    /// A remat chain bottoms at a `Load` (which reads `%rdi`), so recursing
-    /// into the sub-operand and reloading from memory is always valid.
-    /// `Bits`'s source is always a `Load` (it is remat only when its source
-    /// is), so the recursion is at most one deep and `H0`/`H1` suffice.
+    /// Recompute a rematerializable vreg into `dst` (a scratch reg) from
+    /// input memory (`%r13`) alone: a remat happens outside the value's
+    /// recorded live range, so no register home may be read.
     fn rematerialize(&mut self, v: Vreg, dst: u8) {
         match &self.insts[self.def_of[v as usize] as usize] {
             Inst::Load { off, .. } => {
@@ -1615,15 +1542,14 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// A rematerializable value whose home is a spill slot needs no def-site
-    /// computation at all: every use recomputes it. Returns true if the def
-    /// of `v` should be skipped entirely.
+    /// Whether the def of `v` is skipped: a spilled rematerializable value
+    /// is recomputed at every use instead.
     fn skip_def(&self, v: Vreg) -> bool {
         self.remat[v as usize] && matches!(self.home[v as usize], Loc::Spill(_))
     }
 
-    /// A `Src` rendered as an instruction operand (register or broadcast
-    /// memory), given the broadcast width in lanes (16 for d, 8 for q).
+    /// A `Src` rendered as an instruction operand (register or 1to16
+    /// broadcast memory).
     fn src_operand(&mut self, s: Src, scratch: u8) -> String {
         match s {
             Src::Reg(v) => format!("%zmm{}", self.use_reg(v, scratch)),
@@ -1649,8 +1575,6 @@ impl<'a> Emitter<'a> {
                     return;
                 }
                 let d = self.def_reg(*dst);
-                // Load the 16-bit val mask and expand it to a per-lane vector
-                // mask (the reverse of StoreMask).
                 writeln!(self.out, "    movzwl {}(%r13), %eax", off).unwrap();
                 writeln!(self.out, "    kmovw %eax, %k1").unwrap();
                 writeln!(self.out, "    vpmovm2d %k1, %zmm{}", d).unwrap();
@@ -1846,16 +1770,13 @@ impl<'a> Emitter<'a> {
     }
 }
 
-/// Compile `roots` (each a word-domain node) of `g` into AVX-512 assembly.
-/// Drop every stack reload into a register that already holds that slot: a
-/// spilled value is reloaded at each use, often straight back into the
-/// scratch register an earlier use left it in (room (3,0)'s biggest kernel:
-/// 856k of its 4.16M reloads, 2026-09-18). A register holds a slot from a
-/// reload of it or a spill of it until anything writes the register (the last
-/// operand, AT&T); a spill to the slot makes every other holder stale; any
-/// other access to the stack, a label, jump, call, return or `vzeroupper`
-/// forgets everything - so only a straight-line run of our own emitted
-/// reload/spill forms is ever optimized.
+/// Drop every stack reload into a register that already holds that slot
+/// (a spilled value is often reloaded straight back into the scratch an
+/// earlier use left it in). A register holds a slot from a reload or spill
+/// of it until anything writes the register (the last operand, AT&T); a
+/// spill to the slot makes every other holder stale; any other stack
+/// access, label, jump, call, return or `vzeroupper` forgets everything -
+/// so only straight-line runs of our own reload/spill forms are optimized.
 fn drop_redundant_reloads(body: &str) -> String {
     let reg = |s: &str| -> Option<usize> {
         let s = s.strip_prefix("%zmm").or_else(|| s.strip_prefix("%ymm")).or_else(|| s.strip_prefix("%xmm"))?;
@@ -1908,6 +1829,7 @@ fn drop_redundant_reloads(body: &str) -> String {
     out
 }
 
+/// Compile `roots` of `g` into AVX-512 assembly, with the buffer layouts.
 pub fn compile(
     g: &Graph,
     roots: &[NodeId],
@@ -1926,8 +1848,6 @@ pub fn compile(
         .collect();
     cells.sort_unstable();
     cells.dedup();
-    // Repr-aware input layout: each cell sized by its repr (Ival needs two
-    // planes), laid out ascending.
     let input_reprs: Vec<CellRepr> =
         cells.iter().map(|c| cell_reprs.get(c).copied().unwrap_or(CellRepr::Num)).collect();
     let mut input_offsets: Vec<u32> = Vec::with_capacity(cells.len());
@@ -1950,16 +1870,8 @@ pub fn compile(
         cell_reprs,
         memo: HashMap::new(),
     };
-    // Schedule: lower nodes in DEPTH-major order (ASAP level, then id).
-    // The graph is a valid topological order by id, but that emits each
-    // independent row's whole chain back-to-back - ~384 instructions apart,
-    // outside the reorder-buffer window, so the multiply ports starve.
-    // Ordering by (depth, id) interleaves the independent rows step-by-step:
-    // at each depth every row's mix-at-that-step is adjacent, so the two
-    // mul ports stay fed. Operands always have strictly smaller depth, so
-    // this is still a valid evaluation order for the `Value` map.
-    // Batch size for the interleaving scheduler: keeps live accumulators
-    // well under the 26 homes.
+    // Lower nodes in batched depth-major order (`schedule`); a small batch
+    // keeps live temporaries well under the 26 homes.
     let batch = 4;
     let t_lower = std::time::Instant::now();
     let order = schedule(g, &live, roots, batch);
@@ -1988,11 +1900,8 @@ pub fn compile(
     }
     let t_lower = t_lower.elapsed();
 
-    // Roots -> typed stores into a PACKED output buffer (`root_offsets`): the
-    // booleans first, 4 bytes each (`val`, `known`), then the numbers (64
-    // bytes) and the intervals (128), 64-aligned. One 128-byte slot per root
-    // left a big kernel's 12,755 bool roots a cache line each: 44,141 lines,
-    // 5.4 MB per slice, for room (3,0)'s square (6,5) (2026-09-18).
+    // Roots -> typed stores into a PACKED output buffer (`root_offsets`):
+    // booleans first, so they do not take a cache line each.
     let kind_of = |v: &Option<Value>| -> Result<RootKind> {
         Ok(match v {
             Some(Value::Num(_)) => RootKind::Num,
@@ -2053,23 +1962,21 @@ pub fn compile(
         root_kinds.push(kind);
     }
 
-    // Instruction-level list scheduling to interleave the independent mul
-    // chains (see `reschedule`).
+    // Instruction-level list scheduling (`reschedule`).
     let t = std::time::Instant::now();
     lo.insts = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
     }
 
-    // Which vregs are cheap to recompute from input memory (a load, or bits
-    // of a load), and where each is defined. These let the allocator spill
-    // them for free (rematerialize instead of store/reload).
+    // Which vregs are rematerializable (spilled for free), and where each
+    // is defined.
     let mut remat = vec![false; lo.next_vreg as usize];
     let mut def_of = vec![0u32; lo.next_vreg as usize];
     for (i, inst) in lo.insts.iter().enumerate() {
         if let Some(d) = inst_def(inst) {
             def_of[d as usize] = i as u32;
-            // A load is rematerializable (reads `%rdi`); nothing else is.
+            // A load is rematerializable (reads `%r13`); nothing else is.
             remat[d as usize] = matches!(inst, Inst::Load { .. });
         }
     }
@@ -2109,8 +2016,6 @@ pub fn compile(
         eprintln!("[asm stats] {sym} by op (instructions/spilled values/reloads): {}", line.join(", "));
     }
 
-    // Any call-outs? They need a 32-zmm save area and arg buffers above the
-    // spill region, and the r13/r14/r15 prologue.
     let has_calls = lo.insts.iter().any(|i| matches!(i, Inst::Call { .. }));
     let spill_bytes = spill_slots as u32 * 64;
     let save_off = spill_bytes;
@@ -2136,8 +2041,7 @@ pub fn compile(
     let body = drop_redundant_reloads(&body);
 
     // Frame: spill slots, then (if any call-outs) the zmm save area and the
-    // call-out arg buffers. r13/r14/r15 are callee-saved and hold the input,
-    // output and ctx pointers so a `call` may clobber rdi/rsi/rdx.
+    // call-out arg buffers.
     let extra = if has_calls { SAVE_BYTES + ARGBUF_BYTES } else { 0 };
     let frame = spill_bytes + extra;
     let mut asm = String::new();

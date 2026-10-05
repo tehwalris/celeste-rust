@@ -1,23 +1,12 @@
-//! The REFERENCE domain: a scalar abstract interpreter over the Lua AST.
+//! The REFERENCE domain: a scalar abstract interpreter over the Lua AST, the
+//! oracle the kernels are checked against.
 //!
-//! This is the new oracle (plans/kernel-boundary-and-deletion.md). It plugs
-//! into the tracer's `Interp<D>` (`interp.rs`) exactly like `Concrete` and
-//! `Symbolic` do - reusing all the control flow, the heap/state model, the
-//! split builtins, and the frame driver - but instead of running ONE concrete
-//! path (`Concrete`) or tracing ALL paths symbolically (`Symbolic`), it runs
-//! one ABSTRACT scalar path and enumerates the fork tree by RE-EXECUTION.
-//!
-//! `Num` is an interval (`Pico8NumInterval`; a point is `[n,n]`), the only
-//! widened numeric form. `Bool` is a plain `bool`: every fork - a straddling
-//! comparison, an unknown button, a `__split_by_flr` fragment - is resolved to
-//! a concrete choice by a DECISION CURSOR at the value-producing op (all
-//! `&mut self`), so `decide` never returns `None` and `Interp` never merges.
-//! The driver (`refdriver.rs`, later) runs the frame to a leaf, records the
-//! output row key, advances the cursor, and re-runs - a depth-first search
-//! over the decision tree. No merge, no snapshots, no work list.
-//!
-//! The enumerated leaf SET must equal the old vectorized interpreter's split
-//! output - that is the gate.
+//! It plugs into `Interp<D>` like `Concrete` and `Symbolic`, but runs one
+//! ABSTRACT scalar path and enumerates the fork tree by RE-EXECUTION
+//! (`refdriver`). `Num` is an interval (a point is `[n,n]`); `Bool` is a
+//! plain `bool`: every fork (a straddling comparison, an unknown button, a
+//! `__split_by_flr` fragment) is resolved by a DECISION CURSOR, so `decide`
+//! never returns `None` and `Interp` never merges.
 
 use anyhow::{bail, Result};
 
@@ -44,8 +33,7 @@ impl Cursor {
         Cursor::default()
     }
 
-    /// Rewind for the next run. Truncates any stale tail (forks the last run
-    /// did not reach because its path was shorter).
+    /// Rewind for the next run (`advance` drops the stale tail).
     pub fn reset(&mut self) {
         self.pos = 0;
     }
@@ -88,8 +76,7 @@ impl Cursor {
     }
 }
 
-/// The reference domain. Holds only the cursor for now; the cart/collision
-/// cache (for `mget`/`tile_flag_at`) are added when the driver is wired.
+/// The reference domain: the cursor is its only state.
 #[derive(Debug, Default)]
 pub struct RefDomain {
     pub cursor: Cursor,
@@ -110,11 +97,9 @@ fn is_unknown(v: &Iv) -> bool {
     v.low == P8::from_raw(i32::MIN) && v.high == P8::from_raw(i32::MAX)
 }
 
-/// Interval floor helper: how many distinct integer floors `v` spans, and the
-/// sub-interval clipped to the `k`-th one (`k in 0..count`).
+/// How many distinct integer floors `v` spans.
 fn floor_span(v: &Iv) -> u32 {
     let lo = v.low.flr().as_i16_or_err().unwrap_or(0);
-    // high is inclusive; a value exactly at an integer floors to that integer.
     let hi = v.high.flr().as_i16_or_err().unwrap_or(0);
     (hi - lo + 1).max(1) as u32
 }
@@ -122,12 +107,8 @@ fn floor_span(v: &Iv) -> u32 {
 fn floor_fragment(v: &Iv, k: u32) -> Iv {
     let base = v.low.flr().as_i16_or_err().unwrap_or(0) + k as i16;
     let frag_lo = P8::from_i16(base);
-    // The HIGHEST value that still floors to `base` is `base+1 - eps`, NOT
-    // `base+1` (which floors to `base+1`). Clamping to `base+1` inclusive left
-    // the fragment spanning two floors, so the subsequent `flr` refused it -
-    // exposed on a fractional-speed `move` (rem widened, spd non-integer). See `floor_span`: a fragment must span exactly one.
+    // The top is `base+1 - eps`, not `base+1`: a fragment spans exactly one floor.
     let frag_hi_top = P8::from_i16(base + 1).next_smallest();
-    // Clip [base, base+1) to v.
     let lo = if v.low > frag_lo { v.low } else { frag_lo };
     let hi = if v.high < frag_hi_top { v.high } else { frag_hi_top };
     Iv::new(lo, hi)
@@ -145,9 +126,8 @@ impl Domain for RefDomain {
     }
 
     fn arith(&mut self, op: Arith, a: &Iv, b: &Iv) -> Result<Iv> {
-        // An unknown number (the whole 16.16 range: `refbridge`'s form of
-        // `AV::UNum`) stays unknown through any arithmetic: in wrapping 16.16
-        // every result is possible, as the kernels' `UnknownNum` folds.
+        // An unknown number (the whole 16.16 range) stays unknown: in wrapping
+        // 16.16 every result is possible, as the kernels' `UnknownNum` folds.
         if is_unknown(a) || is_unknown(b) {
             return Ok(unknown());
         }
@@ -182,7 +162,6 @@ impl Domain for RefDomain {
                 } else if a.high <= z {
                     a.checked_neg().ok_or_else(|| anyhow::anyhow!("interval abs overflow"))?
                 } else {
-                    // straddles 0: [0, max(|low|, |high|)]
                     let nl = (z - a.low).max(a.high);
                     Iv::new(z, nl)
                 }
@@ -195,7 +174,6 @@ impl Domain for RefDomain {
             }
             Fun1::Sin => match a.to_number() {
                 Some(x) => Iv::from_number(x.pico8_sin()),
-                // sin of an interval -> the full range [-1, 1].
                 None => Iv::new(P8::from_i16(-1), P8::from_i16(1)),
             },
         })
@@ -210,14 +188,14 @@ impl Domain for RefDomain {
 
     fn compare(&mut self, op: Cmp, a: &Iv, b: &Iv) -> Result<bool> {
         // Eq: two points compare directly; a real interval is never equal to
-        // anything (matches op.rs `NumberInterval == _` is always false).
+        // anything.
         if op == Cmp::Eq {
             return Ok(match (a.to_number(), b.to_number()) {
                 (Some(x), Some(y)) => x == y,
                 _ => false,
             });
         }
-        // Ordering: definite when the intervals are separated, else fork.
+        // Definite when the intervals are separated, else fork.
         let definite_true = match op {
             Cmp::Lt => a.high < b.low,
             Cmp::Le => a.high <= b.low,
@@ -237,7 +215,6 @@ impl Domain for RefDomain {
         } else if definite_false {
             false
         } else {
-            // Straddling: enumerate true(0)/false(1) via the cursor.
             self.cursor.choose(2) == 0
         })
     }
@@ -264,8 +241,8 @@ impl Domain for RefDomain {
     }
 
     fn mget(&mut self, _x: &Iv, _y: &Iv) -> Result<Iv> {
-        // Concrete coords are folded by the caller; interval coords only arise
-        // in a symbolic tile scan, which the cart splits before collision.
+        // Concrete coords are folded by the caller; the cart splits interval
+        // coords before collision.
         bail!("RefDomain::mget with non-const coords - TODO (should be split first)");
     }
 
@@ -274,7 +251,6 @@ impl Domain for RefDomain {
     }
 
     fn unknown_bool(&mut self) -> Result<bool> {
-        // A free button: enumerate false(0)/true(1) via the cursor.
         Ok(self.cursor.choose(2) == 1)
     }
 
@@ -310,8 +286,6 @@ mod tests {
 
     #[test]
     fn cursor_enumerates_a_two_by_three_tree_depth_first() {
-        // Two forks: the first 2-way, the second 3-way. Expect 6 leaves,
-        // enumerated depth-first: (0,0)(0,1)(0,2)(1,0)(1,1)(1,2).
         let mut cur = Cursor::new();
         let mut leaves = Vec::new();
         loop {
@@ -331,8 +305,7 @@ mod tests {
 
     #[test]
     fn cursor_handles_a_path_dependent_tree() {
-        // The second fork only exists when the first chose 0. So the tree is
-        // {(0,0),(0,1),(1)} - three leaves, not four.
+        // The second fork exists only when the first chose 0: three leaves.
         let mut cur = Cursor::new();
         let mut leaves: Vec<Vec<u32>> = Vec::new();
         loop {
@@ -354,13 +327,11 @@ mod tests {
         let mut cur = Cursor::new();
         cur.reset();
         assert_eq!(cur.choose(1), 0);
-        // No decision recorded, so the tree is a single leaf.
         assert!(!cur.advance());
     }
 
     #[test]
     fn straddling_compare_forks_both_ways() {
-        // [3,7] < 5 straddles: the cursor enumerates true then false.
         let mut results = Vec::new();
         let mut d = RefDomain::new();
         loop {

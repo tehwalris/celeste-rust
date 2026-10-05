@@ -1,13 +1,10 @@
-//! The frame-step interface, the block, and the forward (plans/architecture.md):
-//! `FrameStep` (the kernels, `compiled::FrameEngine`, and the reference
-//! engine), the `ForwardSink` a step emits into (queues, the door, the edge
-//! records with their transfers), `forward_frame` (one wave) and
-//! `ForwardState` (a forward extended frame by frame, checkpointed, resumed).
-//! The search over a finished forward is `search::arc_dp`.
+//! The block, the frame-step interface and the forward: `FrameStep` (the
+//! kernels or the reference engine), the `ForwardSink` a step emits into
+//! (queues, the door, edge records with transfers), `forward_frame` (one
+//! wave) and `ForwardState` (a forward extended frame by frame, checkpointed,
+//! resumable). The search over a finished forward is `search::arc_dp`.
 //!
-//! A block is OPAQUE to the loop except for two exposed columns - its KEYS
-//! and its POSITIONS; the only other thing that crosses is the frame-step
-//! call.
+//! A block is OPAQUE to the loop except for its KEYS and POSITIONS.
 
 use anyhow::{Context, Result};
 use crate::search::door::Admit;
@@ -17,35 +14,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
-/// The data currency (interface #2). A columnar batch of lanes - the engine's
-/// own block (`Rt2`: one shape, one column per value cell, the key column the
-/// boundary computed), carried as-is. Two columns are EXPOSED - the per-lane
-/// key and the per-lane position - and nothing else; the field data stays
-/// inside. A whole block serializes compactly (the lanes share structure), so
-/// the loop always moves blocks, never individual lanes.
-///
-/// It IS the kernel's block, so there is no bridge in the loop: the frame
-/// step consumes and produces it directly, `keep` is a column filter, the
-/// regroup is a column append, and the checkpoint is the columns. The
-/// reference engine reads and writes one-row blocks too (`trace::refbridge`).
+/// A columnar batch of lanes of one shape: the kernels' own `Rt2` with its
+/// key column. Only the per-lane key and position are exposed.
 pub struct Block {
     rt2: Rt2,
-    /// The rows' stable ids `pack_id(layer, seq, row)` - set when the block
-    /// is a checkpointed layer's piece (or a piece being built for one);
-    /// empty for a block that is not part of a tree yet.
+    /// The rows' stable ids `pack_id(layer, seq, row)` when the block is a
+    /// layer's piece; empty otherwise.
     ids: Vec<u64>,
     /// The piece's file seq within its layer (`s{shape}_{seq}.bin`).
     seq: u32,
-    /// Lanes the frame step must not expand (won rows: checkpointed as
-    /// backward seeds, never expanded); empty when none. Kept as a mask
-    /// rather than dropped so the rows' ids stay consecutive.
+    /// Lanes the frame step must not expand (e.g. won rows); empty when none.
+    /// A mask rather than a drop so the ids stay consecutive.
     skip: Vec<bool>,
 }
 
-/// A state's stable id: its layer (the frame it was first reached), the
-/// piece file within that layer, and its row in the file. Assigned when
-/// the row is admitted (a piece is appended to in flush order, so the row's
-/// position in the file is known then), never renumbered.
+/// A state's stable id: its layer (the frame it was first reached), its
+/// piece file in that layer, and its row in the file. Assigned at admission,
+/// never renumbered.
 pub fn pack_id(layer: u32, seq: u32, row: u32) -> u64 {
     ((layer as u64) << 48) | ((seq as u64) << 32) | row as u64
 }
@@ -63,9 +48,8 @@ pub fn id_row(id: u64) -> u32 {
 }
 
 impl Block {
-    /// Wrap an engine block. Its key column must be present: every producer
-    /// (the kernel boundary, `keyed`, the checkpoint loader) attaches
-    /// it, and nothing downstream re-hashes.
+    /// Wrap an engine block. Its key column must be present: nothing
+    /// downstream re-hashes.
     pub fn from_rt2(rt2: Rt2) -> Self {
         assert_eq!(
             rt2.row_keys.len(),
@@ -77,11 +61,8 @@ impl Block {
         Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() }
     }
 
-    /// A one-row block from the reference engine (`refbridge::to_block`),
-    /// keyed as the kernels key the level's rows: its held buttons widened
-    /// as the level says. The objects are keyed as they are: storing them
-    /// decided is exact (the kernels widen them at the frame's start, and the
-    /// post-`_init` state is a shape no frame returns to).
+    /// A reference-engine block keyed as the level's kernels key it (held
+    /// buttons widened; objects stay decided, which is exact).
     pub fn keyed(mut rt2: Rt2) -> Result<Self> {
         let level = crate::abstraction::Level { held: crate::abstraction::current_level().held, ..crate::abstraction::Level::EXACT };
         let (_, keys, _) = widened_keys_rt2(&rt2, level)?;
@@ -98,14 +79,13 @@ impl Block {
         &self.rt2
     }
 
-    /// The key column: the 128-bit canonical row key per lane (shape + content).
-    /// Identity for dedup, the visited set, and checkpoints. One entry per lane.
+    /// The 128-bit canonical row key per lane (shape + content): the identity
+    /// for dedup, the door and checkpoints.
     pub fn keys(&self) -> &[(u64, u64)] {
         &self.rt2.row_keys
     }
 
-    /// The position column: the player-position cell per lane, for grouping and
-    /// the position graph. Same length as `keys`.
+    /// The player-position cell per lane.
     pub fn positions(&self) -> Result<Vec<u32>> {
         crate::search::pos_graph::block_cells(&self.rt2)
     }
@@ -115,15 +95,12 @@ impl Block {
         wins_of(&self.rt2)
     }
 
-    /// Per lane: has it left the start room (`exits_of`)? A superset of the
-    /// wins: in the orb room an exit without the orb is not a win.
+    /// Per lane: has it left the start room (`exits_of`, a superset of wins)?
     pub fn exits(&self) -> Result<Vec<bool>> {
         exits_of(&self.rt2)
     }
 
-    /// Keep only the lanes whose mask entry is true, as a new block; `None` if
-    /// none survive. The one splitting primitive the loop needs (dedup at the
-    /// door repacks with this).
+    /// Keep only the lanes whose mask entry is true; `None` if none survive.
     pub fn keep(mut self, mask: &[bool]) -> Option<Block> {
         let keep: Vec<u32> = mask
             .iter()
@@ -171,7 +148,7 @@ impl Block {
         self.seq
     }
 
-    /// The block's shard shape. A block is one shape.
+    /// The block's shape.
     pub fn shard_shape(&self) -> u64 {
         self.rt2.shape_hash
     }
@@ -198,21 +175,14 @@ impl Block {
     }
 }
 
-/// The summit (level 30, room (6,3)) has no exit: `player.update` calls
-/// `next_room` only below level 30. Its finish is the FLAG (the original
-/// cart's `flag`, absent from celeste-minimal since it changes nothing else):
-/// `flag.init` moves it 5 px right of its tile (118), and `flag.draw` - the
-/// same frame's draw, after every update - takes the run as finished when
-/// `this.check(player,0,0)` holds. With the player's hitbox (1, 3, 6, 5) and
-/// the flag's default (0, 0, 8, 8) at (fx, fy) the overlap is, in the
-/// player's whole-pixel x/y: fx-6 <= x <= fx+6 and fy-7 <= y <= fy+4.
+/// The summit (room (6,3)) has no exit; it finishes when the player touches
+/// the original cart's FLAG, 5 px right of its tile (118) at (fx, fy): with
+/// both hitboxes, fx-6 <= x <= fx+6 and fy-7 <= y <= fy+4.
 pub const SUMMIT_LEVEL: i16 = 30;
 
-/// The player positions that win, as an inclusive rect (x_lo, x_hi, y_lo,
-/// y_hi) on the player's whole-pixel x/y - a lane wins where its position
-/// MEETS the rect: `CELESTE_WIN_AT_XY`'s
-/// point, or the summit's flag (`SUMMIT_LEVEL`). None: the win is the room
-/// exit.
+/// The winning player positions as an inclusive whole-pixel rect (x_lo,
+/// x_hi, y_lo, y_hi) - `CELESTE_WIN_AT_XY`'s point or the summit's flag; a
+/// lane wins where its position MEETS it. None: the win is the room exit.
 pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
     static RECT: std::sync::OnceLock<Option<(i16, i16, i16, i16)>> = std::sync::OnceLock::new();
     *RECT.get_or_init(|| {
@@ -238,10 +208,8 @@ pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
     })
 }
 
-/// Per lane: has it left the start room? The room-exit test (`room.x` past
-/// the start room) or, where there is a `win_rect` (`CELESTE_WIN_AT_XY`, the
-/// summit's flag), the player's position meeting it. Pure position; no
-/// peeking inside.
+/// Per lane: has it left the start room (`room` is the win room), or, where
+/// there is a `win_rect`, does its position meet it?
 pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Col, AV};
     let ids = crate::compiled::ids();
@@ -250,8 +218,7 @@ pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
         let Some(obj) = crate::search::pos_graph::player_object(rt2) else {
             return Ok(vec![false; lanes]);
         };
-        // An interval position wins where it meets the target - the same
-        // rule as the queue's `any_win`.
+        // An interval position wins where it meets the target (as `any_win`).
         let axis = |f: u32| {
             rt2.obj_field_cell(obj, f)
                 .and_then(|c| crate::search::pos_graph::whole_range_col(rt2, c))
@@ -265,8 +232,7 @@ pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
             _ => vec![false; lanes],
         });
     }
-    // The room `next_room` loads (`game_runner::win_room`): both coordinates,
-    // since the exit from a row's last room wraps to the next row.
+    // Both coordinates: the exit from a row's last room wraps to the next row.
     let (wx, wy) = crate::game_runner::win_room();
     let room = rt2
         .global_target(ids.g_room)
@@ -303,25 +269,16 @@ pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
     Ok(exits.iter().zip(&has_orb).map(|(e, o)| *e && *o).collect())
 }
 
-/// The fewest frames from the orb room's big chest opening (the frame the
-/// player stands on it: `state=1`, `timer=60`, `pause_player`) to a win, as a
-/// SOUND LOWER BOUND read off the cart (lua/celeste-minimal.lua `big_chest`,
-/// `orb`, `player.update`, `_update`): the paused player does not update
-/// until the timer runs out and the orb appears (61 frames); the orb is
-/// collectable only once its `spd.y` has come from -4 to 0 in steps of 0.5 (8
-/// more draws); collecting it sets `freeze=10`, ten frames in which nothing
-/// updates; and the win is a room exit after that: at least 79 frames. Taken
-/// as 70, a margin of 9.
+/// A SOUND LOWER BOUND on the frames from the orb room's big chest opening
+/// to a win, read off the cart: the paused player waits 61 frames for the
+/// orb, the orb is collectable after 8 more (`spd.y` -4 -> 0 by 0.5),
+/// collecting it freezes 10 frames, then the exit: at least 79. Taken as 70,
+/// a margin of 9.
 pub const ORB_MIN_FRAMES_AFTER_CHEST: u32 = 70;
 
-/// Per lane, in the orb room: is it a row whose big chest is still CLOSED at
-/// `frame`, too late to open it and still win by `horizon`
-/// (`ORB_MIN_FRAMES_AFTER_CHEST`)? Such a row cannot win - its chest opens
-/// at `frame + 1` at the earliest - so it is not expanded (the same skip as a
-/// won row). `horizon` is the run's ceiling (the level -1 filter's H: level 0
-/// persists across the count-down's horizons). (2026-10-02: room (5,2)'s
-/// level 0 grew x1.06 a frame to f150 with the players who never open the
-/// chest.)
+/// Per lane, in the orb room: is its big chest still CLOSED at `frame`, too
+/// late to open it and still win by `horizon`? Such a row cannot win, so it
+/// is not expanded. `horizon` is the run's ceiling.
 pub fn orb_deadline_skip(rt2: &Rt2, frame: u32, horizon: u32) -> Vec<bool> {
     use celeste_engine::runtime2::AV;
     let lanes = rt2.width;
@@ -337,19 +294,16 @@ pub fn orb_deadline_skip(rt2: &Rt2, frame: u32, horizon: u32) -> Vec<bool> {
     (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(zero)).collect()
 }
 
-/// The orb room (room (5,2), `game_runner::ORB_LEVEL`): its big chest holds
-/// the orb that gives every later level the second dash, so leaving the room
-/// WITHOUT it is not the level's exit as the game is played (and as TAS22
-/// plays it): a win there also needs `max_djump == 2` (2026-10-02; the bare
-/// room exit is reachable at frame 68 by skipping the chest).
+/// Is the start room the orb room (5,2)? Its orb gives every later level the
+/// second dash, so a win there also needs `max_djump == 2`; leaving without
+/// it is not the level's exit as the game is played.
 pub fn orb_required() -> bool {
     let (x, y) = crate::game_runner::start_room();
     crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL
 }
 
-/// Worker (and owner) count: `CELESTE_THREADS`, else half the logical
-/// CPUs - one per physical core; the kernels are AVX-512 bound and SMT
-/// siblings share those units - and at least 1.
+/// Worker count: `CELESTE_THREADS`, else one per physical core (the kernels
+/// are AVX-512 bound and SMT siblings share those units), at least 1.
 pub fn threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -363,19 +317,17 @@ pub fn threads() -> usize {
     })
 }
 
-/// A typed varying column of emitted rows, as the kernel writes it: raw
-/// 16.16 words, (low, high) pairs, or a tri-state byte per bool (0 false,
-/// 1 true, 2 unknown).
+/// A typed varying column of emitted rows: raw 16.16 words, (low, high)
+/// pairs, or a byte per bool (0 false, 1 true, 2 unknown).
 pub enum TCol {
     Num(Vec<u32>),
     Ival(Vec<(u32, u32)>),
     Bool(Vec<u8>),
 }
 
-/// Rows emitted for one owner at one outcome, written ONCE, typed column by
-/// typed column: the outcome's skeleton (canonical structure, the uniform
-/// columns), one `TCol` per varying cell, the key and cell per row. The
-/// owner gathers the rows it keeps straight from here into its pieces.
+/// A queue of emitted rows of one (shape, cell): the skeleton (canonical
+/// structure, uniform columns), one `TCol` per varying cell, the key and
+/// cell per row, and each row's predecessors for the edge records.
 pub struct Slot {
     pub shape: u64,
     /// The queue's key while live (`ForwardSink::queue`).
@@ -396,24 +348,20 @@ pub struct Slot {
     /// (`ForwardSink::xfer_id`): lanes with another transfer go to `extra`.
     pub pred_xfer: Vec<u32>,
     /// Predecessors from OTHER slices of the same kernel call, or with
-    /// another transfer (the call dedups its emissions, so a row is pushed
-    /// once per call and its later producers land here): `(row, slice base,
-    /// transfer, lane mask)`.
+    /// another transfer (a row is pushed once per call; its later producers
+    /// land here): `(row, slice base, transfer, lane mask)`.
     pub extra: Vec<(u32, u64, u32, u64)>,
-    /// Per row, the index of its latest `extra` entry (`u32::MAX`: none).
-    /// The kernel emits slice by slice, so a row's producers from the
-    /// current slice always merge into that entry.
+    /// Per row, the index of its latest `extra` entry (`u32::MAX`: none);
+    /// the kernel emits slice by slice, so the current slice merges into it.
     pub last_extra: Vec<u32>,
-    /// Bumped at every flush; a row ref (`ForwardSink::row_ref`) carries
-    /// the generation it was made under, so a ref into a flushed queue is
-    /// recognised as stale rather than reaching another cell's rows.
+    /// Bumped at every flush, so a row ref (`ForwardSink::row_ref`) into a
+    /// flushed queue is recognised as stale.
     pub gen: u16,
 }
 
 impl Slot {
-    /// A slot over `skeleton`: a width-0 block whose varying cells hold
-    /// EMPTY typed columns (`Col::N`/`Col::I` for numbers / intervals,
-    /// `Col::V` for bools) and whose other cells are uniform.
+    /// A slot over `skeleton`: a width-0 block, empty typed columns for its
+    /// varying cells.
     pub fn new(skeleton: Rt2) -> Self {
         let cols = skeleton
             .cols
@@ -500,10 +448,9 @@ impl Slot {
         b
     }
 
-    /// Append `rows` of this slot to `piece` (a block of this shape).
-    /// Typed columns extend the piece's typed columns directly; a cell
-    /// that the piece holds differently (uniform here, varying there, or
-    /// two outcomes' uniform values disagreeing) goes through `col_push`.
+    /// Append `rows` of this slot to `piece` (a block of this shape). A cell
+    /// the piece holds differently (uniform vs varying, or another uniform
+    /// value) goes through `col_push`.
     pub fn gather_into(&self, piece: &mut Rt2, rows: &[u32]) {
         use celeste_engine::runtime2::col_push;
         let w = piece.width;
@@ -578,8 +525,7 @@ impl Slot {
     }
 
     /// Does any of `rows` sit on the win target? `wins_of`'s test on the
-    /// slot's columns: the target cells are uniform in the skeleton or
-    /// typed numbers here.
+    /// slot's columns.
     pub fn any_win(&self, rows: &[u32]) -> Result<bool> {
         let ids = crate::compiled::ids();
         let sk = &self.skeleton;
@@ -600,9 +546,8 @@ impl Slot {
             let (Some(cx), Some(cy)) = (sk.obj_field_cell(obj, ids.f_x), sk.obj_field_cell(obj, ids.f_y)) else {
                 return Ok(false);
             };
-            // A position is a number, or an interval: the lane wins if it
-            // meets the target - an over-approximation, which the concrete
-            // concrete search refutes.
+            // An interval position wins if it meets the target: an
+            // over-approximation the concrete search refutes.
             let range_at = |cell: u32| -> Result<Box<dyn Fn(u32) -> (i16, i16) + '_>> {
                 Ok(match &sk.cols[cell as usize] {
                     Col::U(AV::Num(n)) => {
@@ -729,26 +674,17 @@ impl NumView<'_> {
     }
 }
 
-/// Rows per queue (plans/waves.md): a queue that fills is flushed. Small
-/// on purpose - a worker's whole pool stays cache-resident, which the
-/// prototype measured as the difference between ~1000 and ~350 thread-ms
-/// of push time per frame.
+/// Rows per queue; a full queue is flushed. Small so a worker's whole pool
+/// stays cache-resident.
 pub const QUEUE_ROWS: usize = 256;
-/// Live queues per worker; a new (outcome, cell) beyond this evicts the
-/// least recently touched queue (second chance). Eviction only decides
-/// how many flushes happen: a flush is idempotent.
+/// Live queues per worker; beyond this a new (outcome, cell) evicts one
+/// (second chance). Eviction only changes how many flushes happen.
 pub const POOL_QUEUES: usize = 256;
 
-/// One worker's context for a frame: what the frame step emits into. The
-/// step consumes provenance at emission - it knows which input row each
-/// output row came from - and reports through this: the pos-graph edges
-/// `(input cell, output cell)` of every raw output, and the output rows
-/// themselves, keyed, into a QUEUE per (outcome, cell). A queue that
-/// fills (or is evicted from the pool) is FLUSHED right here, by this
-/// worker: rows the level -1 filter rejects dropped, the rest sorted,
-/// admitted at the door (`search::door`, the one shared structure, locked
-/// per shard for the admission only), and the survivors appended into
-/// this worker's piece of the shape.
+/// One worker's sink for a frame: keyed rows into a QUEUE per (outcome,
+/// cell), with predecessors and transfers, plus pos-graph edges. A full or
+/// evicted queue is FLUSHED by this worker: filtered, admitted at the door
+/// (locked per shard), appended to its piece, edges recorded.
 pub struct ForwardSink<'a> {
     /// The pool: every queue ever created by this sink, live or spare.
     pub slots: Vec<Slot>,
@@ -763,27 +699,22 @@ pub struct ForwardSink<'a> {
     last: ((u64, u32), u32),
     door: Option<&'a crate::search::door::Door>,
     filter: Option<&'a MarkFilter<'a>>,
-    /// The ids of the block being run, per lane (set by the worker before
-    /// each unit); the step reads `ids_in[lo]` as the slice's base and
-    /// records predecessors as masks over the slice.
+    /// The ids of the block being run, per lane; the step reads `ids_in[lo]`
+    /// as the slice's base and records predecessors as masks over the slice.
     pub ids_in: Option<&'a [u64]>,
     /// Lanes of the block being run that must not be expanded.
     pub skip_in: Option<&'a [bool]>,
-    /// Where the edges go: `<dir>/raw/f{frame}/l{target layer}_w{worker}.bin`
-    /// (`search::edges::encode_record`), appended as the per-layer buffers
-    /// fill. `None`: no recording.
+    /// Where the edge records go (`edges::raw_path`); `None`: no recording.
     edges_dir: Option<std::path::PathBuf>,
     edge_bufs: Vec<Vec<u8>>,
     pub edge_records: u64,
     /// The within-call dedup cache (`RowCache`), written back by the flush.
     pub seen: celeste_engine::kernel::RowCache,
-    /// Direct-mapped merge of the edges to already-flushed states:
-    /// `(target, base, transfer, mask)` per slot, an entry evicted or
-    /// drained at the call's end becomes a record.
+    /// Direct-mapped merge of edges to already-flushed states, `(target,
+    /// base, transfer, mask)`; an evicted or drained entry becomes a record.
     direct: Vec<(u64, u64, u32, u64)>,
-    /// THE TRANSFERS (`search::arc_edges`): this worker's interned (x, y)
-    /// pairs, an edge record carrying the index; the table is written beside
-    /// the frame's raw records (`edges::raw_xfer_path`).
+    /// This worker's interned transfer pairs (`search::arc_edges`); records
+    /// carry the index, the table goes beside them (`edges::raw_xfer_path`).
     xfer_ids: rustc_hash::FxHashMap<crate::search::arc_edges::Pair, u32>,
     xfer_tab: Vec<crate::search::arc_edges::Pair>,
     /// Time spent encoding and writing edge records (this worker).
@@ -792,8 +723,7 @@ pub struct ForwardSink<'a> {
     /// This worker's next-frame rows, one piece per shape: the block, its
     /// file seq in the layer (`worker * 256 + k`), and its rows' ids.
     pieces: rustc_hash::FxHashMap<u64, (Rt2, u32, Vec<u64>)>,
-    /// The frame being computed (the layer the new rows belong to) and
-    /// this worker's index: what a new row's id is made of.
+    /// The new rows' layer and this worker's index (part of a new row's id).
     frame: u32,
     worker: u32,
     pub won: bool,
@@ -809,8 +739,7 @@ pub struct ForwardSink<'a> {
     rows_buf: Vec<u32>,
     /// Record `edges` at all (off for the backward, which has the graph).
     pub edges_on: bool,
-    /// The distinct edges this worker produced (a set: a block's rows fan
-    /// out into a few hundred distinct cell pairs, not one per row).
+    /// The distinct pos-graph edges this worker produced.
     pub edges: rustc_hash::FxHashSet<(u32, u32)>,
     /// Rows emitted after the step's within-call dedup (the raw fan-out).
     pub emitted: u64,
@@ -898,10 +827,9 @@ impl<'a> ForwardSink<'a> {
         append_record(&mut self.edge_bufs, &mut self.edge_records, dir, self.frame, self.worker, target, base, xfer, mask)
     }
 
-    /// Lane `lane` of the slice based at `base` produced the (already
-    /// flushed) state `target` with the transfer `xfer`: merged with the
-    /// slice's other lanes of that transfer in the direct-mapped cache,
-    /// recorded on eviction.
+    /// Lane `lane` of the slice based at `base` produced the already flushed
+    /// state `target` with transfer `xfer`: merged in the direct-mapped
+    /// cache, recorded on eviction.
     #[inline]
     pub fn direct_edge(&mut self, target: u64, base: u64, xfer: u32, lane: usize) {
         if self.edges_dir.is_none() {
@@ -933,12 +861,10 @@ impl<'a> ForwardSink<'a> {
         }
     }
 
-    /// The step's handle on the row it just pushed into queue `q` (its
-    /// last row): the row (8 bits), the queue (24 bits: the pool is
-    /// `POOL_QUEUES` LIVE queues, but spares are kept per outcome so the
-    /// slot vector grows past that - room (1,0) f65 had a queue index >=
-    /// 256 alias another queue's row, 2026-09-14) and the queue's
-    /// generation (16 bits), below the cache's flag bits.
+    /// A handle on the row just pushed into queue `q`: the row (8 bits), the
+    /// queue (24 bits: spares are kept per outcome, so the slot vector grows
+    /// past `POOL_QUEUES`) and the queue's generation (16 bits), below the
+    /// cache's flag bits.
     #[inline]
     pub fn row_ref(&self, q: usize) -> u64 {
         const _: () = assert!(QUEUE_ROWS <= 256);
@@ -971,9 +897,8 @@ impl<'a> ForwardSink<'a> {
         true
     }
 
-    /// The live queue for `(outcome, cell)`, created over the skeleton
-    /// `init` returns (or a spare of the outcome) on first use, evicting
-    /// the least recently touched queue when the pool is full.
+    /// The live queue for `(outcome, cell)`, created on first use (a spare of
+    /// the outcome, or over `init`'s skeleton), evicting when the pool is full.
     pub fn queue(&mut self, outcome: u64, cell: u32, init: impl FnOnce() -> Rt2) -> usize {
         if self.last.0 == (outcome, cell) {
             return self.last.1 as usize;
@@ -1045,8 +970,7 @@ impl<'a> ForwardSink<'a> {
             crate::compiled::asm_kernel::key_check(slot);
             self.flushes += 1;
             self.flushed_rows += n as u64;
-            // The coarser level's filter (`MarkFilter`): a filtered-out row is
-            // never admitted.
+            // The coarser level's filter (`MarkFilter`).
             let allow = match self.filter {
                 Some(f) => Some(f.allowed(&slot.to_rt2(), self.frame)?),
                 None => None,
@@ -1075,8 +999,7 @@ impl<'a> ForwardSink<'a> {
                 }
                 self.uniq_buf.push(self.keys_buf.len() as u32 - 1);
             }
-            // Per ROW, its index among the distinct keys (`u32::MAX` if
-            // filtered out): what the extra edges are resolved through.
+            // Per ROW, its index among the distinct keys (`u32::MAX`: filtered).
             self.row_uniq.clear();
             self.row_uniq.resize(n, u32::MAX);
             for (e, &u) in self.sort_buf.iter().zip(&self.uniq_buf) {
@@ -1084,9 +1007,8 @@ impl<'a> ForwardSink<'a> {
             }
             self.new_buf.clear();
             self.ids_buf.clear();
-            // The piece the new rows land in, and the id the first of them
-            // gets: the door hands the k-th new key `first_new + k`, and the
-            // rows are appended in that same order.
+            // The door hands the k-th new key `first_new + k`; the rows are
+            // appended to the piece in that same order.
             let n_pieces = self.pieces.len() as u32;
             let (frame, worker) = (self.frame, self.worker);
             let (piece, seq, ids) = self
@@ -1095,10 +1017,8 @@ impl<'a> ForwardSink<'a> {
                 .or_insert_with(|| (slot.empty_piece(), worker * 256 + n_pieces, Vec::new()));
             let first_new = pack_id(frame, *seq, piece.width as u32);
             door.admit(slot.shape, slot.cell, &self.keys_buf, first_new, &mut self.ids_buf, &mut self.new_buf);
-            // The edges: every row (each a predecessor mask) to its state,
-            // plus the extra masks. Rows without ids (a step run on
-            // id-less blocks, e.g. the tests' reference engine) have no
-            // predecessor columns and record nothing.
+            // The edges: each row's predecessor mask to its state, plus the
+            // extras. Rows from id-less blocks have no predecessors.
             if let Some(edges_dir) = self.edges_dir.as_deref().filter(|_| slot.pred_base.len() == n) {
                 let t_e = std::time::Instant::now();
                 let (row_uniq, ids_buf) = (&self.row_uniq, &self.ids_buf);
@@ -1110,9 +1030,8 @@ impl<'a> ForwardSink<'a> {
                         append_record(edge_bufs, edge_records, edges_dir, frame, worker, ids_buf[u as usize], b, x, m)?;
                     }
                 }
-                // Write each row's fate back into the dedup cache: a later
-                // re-emission in this call records an edge to the id
-                // directly (or nothing, for a filtered-out row).
+                // Each row's fate back into the dedup cache, so a later
+                // re-emission in this call records straight to the id.
                 for (r, key) in slot.keys.iter().enumerate() {
                     let u = row_uniq[r];
                     let v = if u == u32::MAX {
@@ -1149,9 +1068,8 @@ impl<'a> ForwardSink<'a> {
         Ok(())
     }
 
-    /// End of the worker's frame: flush every live queue, hand back the
-    /// pieces. The counters (`kept`, `won`, `flushes`, ...) are final only
-    /// after this.
+    /// End of the worker's frame: flush every live queue, write the edge
+    /// buffers and transfers, hand back the pieces. Counters are final after.
     pub fn finish(&mut self) -> Result<Vec<Block>> {
         for q in 0..self.slots.len() {
             if self.slots[q].live {
@@ -1176,17 +1094,14 @@ impl<'a> ForwardSink<'a> {
         }
         let mut out = Vec::new();
         for (mut p, seq, ids) in std::mem::take(&mut self.pieces).into_values() {
-            // A piece a flush opened but never appended to (every key it
-            // admitted was old) is nothing: an empty block would be
-            // id-less and get renumbered at the checkpoint, colliding
-            // with a real seq of this layer (room (1,0) f89, 2026-09-13).
+            // An empty piece is dropped: id-less, it would be renumbered at
+            // the checkpoint and collide with a real seq of this layer.
             if p.width == 0 {
                 continue;
             }
             debug_assert_eq!(ids.len(), p.width);
-            // A queue's columns are typed by its skeleton, not by its rows: a
-            // column every row agrees on goes back to the uniform it is (the
-            // old append step's rule, which the checkpoints were pinned with).
+            // A column every row agrees on becomes uniform (the checkpoint
+            // gates are pinned with this rule).
             for c in p.cols.iter_mut() {
                 if !matches!(c, Col::U(_)) {
                     let taken = std::mem::replace(c, Col::U(AV::Nil));
@@ -1209,9 +1124,8 @@ impl<'a> ForwardSink<'a> {
         debug_assert_eq!(row.width, 1);
         debug_assert_eq!(row.row_keys.len(), 1, "an emitted row carries its key");
         let q = self.queue(row.shape_hash, cell, || {
-            // The skeleton from the row itself: numeric and boolean cells
-            // vary (typed, empty), the rest is uniform - which every row
-            // of a shape agrees on, the shape hash being the structure.
+            // The skeleton from the row: numbers and bools vary, the rest is
+            // uniform (fixed by the shape).
             let mut b = celeste_engine::slots::reshape(row, 0);
             b.cols = row
                 .cols
@@ -1233,21 +1147,19 @@ impl<'a> ForwardSink<'a> {
 }
 
 
-/// THE LEVEL -1 FILTER (`CELESTE_LEVEL_MINUS_ONE="H,S"`, plans/level-minus-one.md):
-/// drop a queue (one player cell) when the level -1 table proves its rows
-/// cannot exit by horizon H (`trace::level_minus_one::CostToGo::too_late`).
-/// It is derived from the traced frames: the table's ranges
-/// are inductive, a clipped successor counts as a possible exit and a death as
-/// a respawn. H must be the LARGEST horizon the run tests - level 0 persists
-/// across horizons - so this is for a `--ceiling` search with H = the ceiling.
-/// Built once, at the first flush, on a thread with the tracer's stack.
+/// THE LEVEL -1 FILTER (`CELESTE_LEVEL_MINUS_ONE="H,S"`,
+/// plans/level-minus-one.md): drop a queue (one player cell) when the table
+/// proves its rows cannot exit by H. Sound because the table's ranges are
+/// inductive, a clipped successor counts as an exit and a death as a respawn.
+/// H must be the LARGEST horizon the run tests (the ceiling). Built once, at
+/// the first flush, on a thread with the tracer's stack.
 fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::CostToGo)> {
     static TABLE: std::sync::OnceLock<Option<(u32, crate::trace::level_minus_one::CostToGo)>> = std::sync::OnceLock::new();
     TABLE
         .get_or_init(|| {
             let s = std::env::var("CELESTE_LEVEL_MINUS_ONE").ok()?;
-            // The table's distances are to the room EXIT; a position win
-            // (the summit's flag) is nearer, and pruning by them is unsound.
+            // The table measures the room EXIT; pruning a position win by it
+            // is unsound.
             assert!(win_rect().is_none(), "CELESTE_LEVEL_MINUS_ONE: the table measures the room exit; this room's win is a position");
             let (h, sp) = s.split_once(',').expect("CELESTE_LEVEL_MINUS_ONE=\"H,S\"");
             let h: u32 = h.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE horizon");
@@ -1273,14 +1185,9 @@ fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::Cos
         .map(|(h, t)| (*h, t))
 }
 
-/// THE TIME BAND (an estimate, not a bound; the level -1 probe compares its
-/// table against it): can a player at `cell` at frame `frame` not reach the
-/// exit (y < -4) by horizon `h`, at `px` pixels per frame up? One frame of slack for when the
-/// exit test runs. A cell with no player (a death) is kept, and so is a cell
-/// past the start room: the position grid places the next room one room to
-/// the right (`pos_graph`), so x >= 128 is a row that has LEFT the room - a
-/// win, which a band reading its new-room y dropped (room (1,0) refuted 99 at
-/// level 0, room (2,0) 95 at level 1, 2026-09-16).
+/// THE TIME BAND (an estimate, not a bound; for the level -1 probe): can a
+/// player at `cell` not reach y < -4 by `h` at `px` pixels per frame up?
+/// Never true without a player or at x >= 128 (already left the room).
 pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
     let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
     if x >= 128 {
@@ -1292,14 +1199,11 @@ pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
 
 /// THE OBJECTS LADDER's link: a finer level's forward keeps a row at frame t
 /// only if its projection onto the coarser level (`Rt2::widen_to`) is a node
-/// the coarser level's arc phase ARC-MARKED with a deadline >= t (its
-/// winning set non-empty at some frame >= t, `arc_dp::arc_marks`). Sound: a
-/// fine state that wins by the horizon from t, with its remainder r, projects
-/// to a coarse node that wins from t with r (the coarse level
-/// over-approximates; the remainder is exact in both), so r is in the coarse
-/// W_t and the node is marked at t. Deadlines matter: membership alone
-/// admitted room (3,0)'s fine states onto coarse states marked from an
-/// earlier frame with no time left (14.6M kept at f51, 2026-09-19).
+/// the coarser level ARC-MARKED with a deadline >= t (`arc_dp::arc_marks`).
+/// Sound: a fine state that wins from t with remainder r projects to a coarse
+/// node that wins from t with r (the coarse level over-approximates, the
+/// remainder is exact in both), so the node is marked at t. Membership
+/// without the deadline would admit nodes marked only with no time left.
 pub struct MarkFilter<'a> {
     marked: &'a Visited,
     coarser: crate::abstraction::Level,
@@ -1317,12 +1221,9 @@ impl<'a> MarkFilter<'a> {
     }
 }
 
-/// Each lane's `(key, cell)` as the `coarser` level keys it: the COMPLETE
-/// coarsening the level's kernels bake into their rows (`Rt2::widen_to`: the
-/// remainder, the dash clamp, the fruit widening, the timer pins, the level's
-/// objects), then the canonical key - on the block's columns, lane for lane.
-/// A concrete state's node at the level (the concrete search, the
-/// diagnostics).
+/// Each lane's `(shape, key, cell)` at the `coarser` level: the COMPLETE
+/// coarsening its kernels bake into their rows (`Rt2::widen_to`), then the
+/// canonical key. A concrete state's node at the level.
 pub fn widened_keys(
     block: &Block,
     coarser: crate::abstraction::Level,
@@ -1330,14 +1231,14 @@ pub fn widened_keys(
     widened_keys_rt2(&block.rt2, coarser)
 }
 
-/// `rt2` projected IN PLACE onto `level` (`Rt2::widen_to`): the row the
-/// level's kernels would store for it (the remainder widened at every level).
+/// `rt2` projected IN PLACE onto `level`: the row the level's kernels would
+/// store for it.
 pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::abstraction::Level) {
     rt2.widen_to(crate::compiled::ids(), level.held, level.fruit, level.floors_near, level.platforms);
 }
 
-/// `(shape, keys, cells)` of the widened rows - the shape is the widened
-/// block's, which is what a level's nodes are keyed by.
+/// `(shape, keys, cells)` of the widened rows; the shape is the widened
+/// block's, which a level's nodes are keyed by.
 pub fn widened_keys_rt2(
     rt2: &Rt2,
     coarser: crate::abstraction::Level,
@@ -1353,34 +1254,21 @@ pub fn widened_keys_rt2(
     Ok((w.shape_hash, keys, cells))
 }
 
-/// The one interface between the outer loop and the engines (interface #1).
-/// `run` takes a block of input lanes and returns every output block - all
-/// internal branching enumerated, already widened for the engine's precision,
-/// each output block's key/position columns already computable. Branching,
-/// widening, and keying happen INSIDE.
-///
-/// Two implementations behind this one trait: the compiled kernels (fast) and
-/// the scalar interpreter (`trace::refengine`, the trusted reference). The loop
-/// holds a `&dyn FrameStep` and never knows which.
+/// The one interface between the loop and the engines: input lanes in, every
+/// successor row out, already branched, widened for the level and keyed.
+/// Implemented by the compiled kernels and the reference engine
+/// (`trace::refengine`); the loop never knows which.
 pub trait FrameStep: Sync {
-    /// One frame of lanes `lanes` of `block` (whose per-lane cells are
-    /// `cell_in`), emitted into `sink`. Called from many workers at once on
-    /// disjoint lane ranges: an implementation keeps its scratch in the
-    /// sink or behind a lock.
+    /// One frame of lanes `lanes` of `block` (cells `cell_in`) into `sink`.
+    /// Called from many workers at once on disjoint ranges: scratch lives in
+    /// the sink or behind a lock.
     fn run(&self, block: &Block, cell_in: &[u32], lanes: Range<usize>, sink: &mut ForwardSink) -> Result<()>;
 }
 
-/// The emit phase's unit: one kernel call covers at most this many lanes of
-/// one block, and a worker pulls one unit at a time, so the step's within-call
-/// dedup (`seen`) spans a unit. `CELESTE_UNIT_LANES` overrides it for a
-/// measurement (a multiple of 64: slices and predecessor groups start at
-/// multiples of 64).
-///
-/// 1024: room (3,0) f44 at `r0sxhfb` (2026-09-18, `bench-frame`, 16 threads)
-/// took 2.23 s with 45% of the workers' time idle at 16384 lanes (a few units
-/// of the heavy kernels outlasted the rest), 1.81 s / 28% at 4096, 1.47 s / 9%
-/// at 1024, 1.53 s / 4% at 256, where the smaller dedup window let more
-/// duplicates through (6.10M raw rows against 6.02M). Same kept set at all.
+/// Lanes per unit of work (one kernel call; the within-call dedup spans it).
+/// 1024 balances load (bigger units leave workers idle behind heavy kernels)
+/// against the dedup window. `CELESTE_UNIT_LANES` overrides it (a multiple
+/// of 64: slices and predecessor masks start at multiples of 64).
 fn unit_lanes() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| match std::env::var("CELESTE_UNIT_LANES") {
@@ -1394,11 +1282,8 @@ fn unit_lanes() -> usize {
 }
 
 /// Stack per frame worker: the ASM kernels keep their spill frames on the
-/// stack (~0.5 MB at level 0, more at the finer rungs, 83 MB for room (3,0)'s
-/// largest kernel with the fruit and the floors unknown, which overflowed the
-/// 64 MB this was: a segfault at f59, 2026-09-18). Virtual: only the pages a
-/// kernel touches are resident. Every call checks its frame fits
-/// (`asm_kernel::set_thread_stack`).
+/// stack (up to ~83 MB seen). Virtual: only touched pages are resident.
+/// Every call checks its frame fits (`asm_kernel::set_thread_stack`).
 const WORKER_STACK: usize = 512 << 20;
 
 /// Cut `blocks` (by lane count) into `(block, lo, hi)` units.
@@ -1415,16 +1300,9 @@ fn units_of(lanes: impl Iterator<Item = usize>, unit: usize) -> Vec<(usize, usiz
     units
 }
 
-/// One forward frame, one pass (plans/waves.md): units of `unit_lanes()`
-/// lanes of the frontier's chunks, in CELL order, pulled by `threads()`
-/// workers. Each worker runs the frame step on its units into its own
-/// `ForwardSink`, whose queues flush as they fill: filter, door
-/// (`search::door::Door`, the one shared structure), append into the
-/// worker's pieces. One barrier, at the end: the door folds this frame's
-/// admissions into its base, and the pieces become the canonical next
-/// frontier. Rows emitted twice by different units are both admitted
-/// against the door, which keeps the first - the same set as one call
-/// would produce.
+/// One forward frame (the wave): units in CELL order pulled by `threads()`
+/// workers, each into its own `ForwardSink`; one barrier at the end, where
+/// the door folds in the frame. The kept set does not depend on scheduling.
 pub fn forward_frame(
     engine: &dyn FrameStep,
     frontier: Vec<Block>,
@@ -1435,10 +1313,8 @@ pub fn forward_frame(
     edges_dir: Option<&std::path::Path>,
 ) -> Result<(Vec<Block>, bool, FrameStats)> {
     use std::time::Instant;
-    // A platforms-unknown level reads its platforms from the worlds a
-    // platform time up to `PLATFORM_WORLD_FRAMES` can reach
-    // (`concrete::platform_worlds`); a frame past that could hold one it
-    // does not have.
+    // A platforms-unknown level only knows the worlds of the first
+    // `PLATFORM_WORLD_FRAMES` frames.
     let level = crate::abstraction::current_level();
     // Under the split-frame prototype a game frame is two steps.
     let game_frame = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { frame.div_ceil(2) } else { frame };
@@ -1455,11 +1331,10 @@ pub fn forward_frame(
     st.rss_start = crate::metrics::current_rss_gb();
 
     let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
-    // Units in WAVE order: by first cell across the (cell-sorted) pieces,
-    // so consecutive units are neighbours in the room.
+    // Units in WAVE order: by first cell across the cell-sorted pieces.
     let mut units = units_of(frontier.iter().map(Block::lanes), unit_lanes());
-    // A unit of nothing but skipped lanes (won rows: checkpointed, never
-    // expanded - their shape has no kernel) is not run.
+    // A unit of only skipped lanes is not run (a won row's shape may have
+    // no kernel).
     units.retain(|&(bi, lo, hi)| {
         let sk = &frontier[bi].skip;
         sk.is_empty() || sk[lo..hi].iter().any(|&s| !s)
@@ -1485,10 +1360,6 @@ pub fn forward_frame(
         let handles: Vec<_> = (0..workers)
             .map(|w| {
                 let (frontier, cells, units, next_unit) = (&frontier, &cells, &units, &next_unit);
-                // The kernels' spill frames are large (hundreds of KB at
-                // level 0, more at the finer rungs, whose graphs are bigger);
-                // the default 2 MB thread stack overflowed on room (0,0)'s
-                // level 1 (2026-09-13).
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     let t = Instant::now();
@@ -1549,10 +1420,8 @@ pub fn forward_frame(
         }
         pieces.extend(d.pieces);
     }
-    // The next frontier: the workers' pieces. The checkpoint sorts each
-    // by (cell, key) in place, which is the order the next frame's units
-    // follow; a cell's rows may sit in several pieces (one per worker
-    // that flushed it), which only the door's delta ever sees.
+    // The next frontier: the workers' pieces (the checkpoint sorts each by
+    // (cell, key)); a cell's rows may sit in several pieces.
     let next: Vec<Block> = pieces;
     st.rss_end = crate::metrics::current_rss_gb();
     st.rss_file = crate::metrics::current_file_rss_gb();
@@ -1562,8 +1431,7 @@ pub fn forward_frame(
 }
 
 
-/// The share of `workers x wall` a phase's workers spent waiting at its
-/// barrier: 1 - busy / (workers * wall), `busy` summed over the workers.
+/// The share of `workers x wall` spent waiting at the barrier.
 fn idle_fraction(wall: std::time::Duration, workers: usize, busy: std::time::Duration) -> f64 {
     if workers == 0 || wall.is_zero() {
         return 0.0;
@@ -1571,29 +1439,25 @@ fn idle_fraction(wall: std::time::Duration, workers: usize, busy: std::time::Dur
     (1.0 - busy.as_secs_f64() / (workers as f64 * wall.as_secs_f64())).max(0.0)
 }
 
-/// Where one forward frame's time went and what it moved, for the
-/// per-frame log line and the phase totals.
+/// One forward frame's timings and sizes, for the `[fwd]` log line.
 #[derive(Default, Clone, Copy)]
 pub struct FrameStats {
     pub blocks_in: usize,
     pub lanes_in: usize,
-    /// Output rows as the workers emitted them (after the step's
-    /// within-call dedup), before the filter/door.
+    /// Rows emitted (after the within-call dedup), before filter and door.
     pub lanes_raw: usize,
     /// Rows that passed the filter and were new at the door.
     pub lanes_kept: usize,
     pub blocks_out: usize,
     pub lanes_out: usize,
-    /// The wave (kernel calls and inline flushes), wall, and its barrier
-    /// idle fraction (`idle_fraction`).
+    /// The wave's wall time and its barrier idle fraction.
     pub t_wave: std::time::Duration,
     pub wave_idle: f64,
     /// The door's end-of-frame merge, wall.
     pub t_door: std::time::Duration,
     pub flushes: u64,
     pub flushed_rows: u64,
-    /// Edge records written (`EDGE_RECORD_BYTES` each), and the workers'
-    /// summed time encoding and writing them (thread-time).
+    /// Edge records written, and the workers' summed time writing them.
     pub edge_records: u64,
     pub t_edges: std::time::Duration,
     /// The input frontier's row storage, bytes.
@@ -1601,18 +1465,16 @@ pub struct FrameStats {
     /// Bytes allocated in the workers' queue pools, and in the door.
     pub queue_bytes: usize,
     pub door_bytes: usize,
-    /// Resident set at the frame's start, after the wave, at the end.
+    /// Anonymous resident set at the frame's start, after the wave, at the end.
     pub rss_start: f64,
     pub rss_wave: f64,
     pub rss_end: f64,
-    /// File-backed resident pages at the end of the frame (page cache).
+    /// File-backed resident pages at the end of the frame.
     pub rss_file: f64,
 }
 
-/// The forward search driver's state: the frontier, the visited set and
-/// the position-graph observer, held in memory so a forward can be
-/// EXTENDED frame by frame (the outer loop's "one more frame at rem zero")
-/// rather than rerun. Every frame is checkpointed as it is produced.
+/// The forward's in-memory state (frontier, door, pos-graph observer), so a
+/// forward can be EXTENDED frame by frame. Every frame is checkpointed.
 pub struct ForwardState {
     frontier: Vec<Block>,
     /// The door: every (shape, cell, key) reached so far (`search::door`).
@@ -1638,23 +1500,19 @@ pub struct ForwardResult {
 }
 
 impl ForwardState {
-    /// Frame 0: seed the visited set from `initial`, checkpoint it, start
-    /// recording the position graph if `record`.
+    /// Frame 0: seed the door from `initial`, checkpoint it, start recording
+    /// the position graph if `record`.
     pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool) -> Result<Self> {
-        // A fresh tree: nothing a killed run left in `dir` may survive. Each
-        // frame's checkpoint replaces its own directory, but an edge run is
-        // one file per (layer, frame), so a stale run for a pair the new
-        // forward never writes would be read by the backward against the
-        // new rows (room (1,1) h94, a level killed and rerun at another
-        // precision: "marked id ... is past its file's rows").
+        // A fresh tree: nothing a killed run left may survive (a stale edge
+        // run for a (layer, frame) the new forward never writes would be read
+        // against the new rows).
         for sub in ["frames", "edges"] {
             let p = dir.join(sub);
             if p.exists() {
                 std::fs::remove_dir_all(&p).with_context(|| p.display().to_string())?;
             }
         }
-        // The checkpoint assigns the initial rows their ids (layer 0); the
-        // door then takes each row under that id.
+        // The checkpoint assigns the ids (layer 0) the door takes.
         checkpoint_frontier(dir, 0, &mut initial)?;
         crate::search::edges::set_done_frame(&dir.join("edges"), 0)?;
         let door = crate::search::door::Door::new();
@@ -1668,8 +1526,7 @@ impl ForwardState {
         }
         door.end_frame(1);
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
-        // A graph (empty) beside f0 from the start: every tree that has
-        // frames has a graph covering at least the trusted ones.
+        // An (empty) graph from the start: every tree with frames has one.
         if let Some(o) = observer.as_ref() {
             save_pos_graph(dir, &o.snapshot(), 0)?;
         }
@@ -1683,12 +1540,9 @@ impl ForwardState {
         })
     }
 
-    /// The forward as its checkpoint tree left it, if `dir` has one: the
-    /// last frame's rows as the frontier (minus the won rows, as `extend`
-    /// leaves them), the door rebuilt from every layer's keys, the first
-    /// win frame from the layers' win lists, the pos graph reloaded. `None`
-    /// when there is no tree. Extending a resumed forward is byte-identical
-    /// to extending the original (`forward_resume_matches_fresh`).
+    /// The forward as its checkpoint tree left it (`None`: no tree), door
+    /// rebuilt from every layer; extending it matches extending the original
+    /// (`forward_extended_frame_by_frame_matches_fresh`).
     pub fn resume(dir: &std::path::Path, record: bool) -> Result<Option<Self>> {
         use crate::search::door::Admit;
         let mut last: Option<u32> = None;
@@ -1697,10 +1551,8 @@ impl ForwardState {
         }
         let Some(mut last) = last else { return Ok(None) };
         let t = std::time::Instant::now();
-        // The frames a resume can trust are those whose edge runs are
-        // complete (`edges/done.txt`, written when a frame's compaction
-        // joined - before the NEXT frame's checkpoint, so at most the last
-        // frame is discarded).
+        // Trust only frames whose edge runs are complete (`edges/done.txt`,
+        // written before the next frame's checkpoint: at most one is lost).
         let edges_dir = dir.join("edges");
         let done = crate::search::edges::done_frame(&edges_dir).unwrap_or(last);
         if done < last {
@@ -1765,9 +1617,8 @@ impl ForwardState {
             let path = pos_graph_path(dir);
             let graph = crate::search::pos_graph::PosGraph::load(&path)
                 .with_context(|| format!("resuming {}: no pos graph at {}", dir.display(), path.display()))?;
-            // The graph must cover every trusted frame. A tree without the
-            // marker predates per-frame saves; its graph was saved when its
-            // forward ended, covering the whole tree.
+            // The graph must cover every trusted frame (no marker: a graph
+            // saved at the forward's end, covering the whole tree).
             if let Some(covered) = pos_graph_frame(dir) {
                 anyhow::ensure!(
                     covered >= last,
@@ -1791,10 +1642,6 @@ impl ForwardState {
         Ok(Some(ForwardState { frontier, door, observer, frames: last, win_frame, compaction: None }))
     }
 
-    /// Compute and checkpoint frames `frames+1 ..= to`. A win does NOT stop
-    /// the run: a horizon is a bound on the win frame, and the backward
-    /// needs every frame up to it (its seeds are the wins at each). Only an
-    /// empty frontier stops it.
     /// The door's size: every distinct state reached so far.
     pub fn visited_len(&self) -> usize {
         self.door.len()
@@ -1804,9 +1651,8 @@ impl ForwardState {
         &self.door
     }
 
-    /// Wait for the compaction running behind the current frame (the
-    /// previous frame's), then mark its frame done for a resume. Returns
-    /// its stats and the time waited.
+    /// Wait for the previous frame's compaction, then mark its frame done for
+    /// a resume. Returns its stats and the time waited.
     fn join_compaction(
         &mut self,
         edges_dir: &std::path::Path,
@@ -1818,6 +1664,9 @@ impl ForwardState {
         Ok(Some((st, t.elapsed())))
     }
 
+    /// Compute and checkpoint frames `frames+1 ..= to`. A win does NOT stop
+    /// the run (the backward seeds from the wins at every frame); only an
+    /// empty frontier does.
     pub fn extend(
         &mut self,
         engine: &dyn FrameStep,
@@ -1832,9 +1681,8 @@ impl ForwardState {
             let edges_dir = dir.join("edges");
             let (mut next, won, st) =
                 forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filter, frame, Some(&edges_dir))?;
-            // The PREVIOUS frame's compaction ran behind this wave; it is
-            // joined and marked done before this frame is checkpointed, so
-            // a resume (which trusts frames up to `done.txt`) never sees a
+            // The previous frame's compaction is joined and marked done
+            // BEFORE this frame is checkpointed, so a resume never trusts a
             // frame whose runs are incomplete.
             let joined = self.join_compaction(&edges_dir)?;
             let (t_edges, compact_records) = joined.as_ref().map_or((std::time::Duration::ZERO, 0), |(c, w)| (*w, c.records));
@@ -1861,14 +1709,9 @@ impl ForwardState {
                 self.win_frame = Some(frame);
                 eprintln!("[fwd] first win at f{frame}");
             }
-            // A won row is checkpointed (it is a backward seed) but never
-            // expanded: its successors have left the room, and the search
-            // is about reaching the exit, not what lies past it (and the
-            // start room's kernel set does not cover the next room's
-            // shapes).
-            // In the orb room a row can leave without the orb: not a win,
-            // but past the room all the same - never expanded either; nor a
-            // row whose chest is still closed too late to win
+            // An exited row is checkpointed (a won one is a backward seed)
+            // but never expanded: the start room's kernels do not cover the
+            // next room. Nor is an orb-room row whose chest opens too late
             // (`orb_deadline_skip`).
             let orb = orb_required();
             let ceiling = level_minus_one().map(|(h, _)| h);
@@ -1898,9 +1741,8 @@ impl ForwardState {
                 next
             };
         }
-        // The last frame's runs, before anything reads them (the backward).
+        // The last frame's runs, before the backward reads them.
         self.join_compaction(&dir.join("edges"))?;
-        // The level's graph so far, beside its frames (the posgraph gate).
         if let Some(o) = self.observer.as_ref() {
             save_pos_graph(dir, &o.snapshot(), self.frames)?;
         }
@@ -1913,15 +1755,10 @@ impl ForwardState {
     }
 }
 
-/// Where a level's position graph is saved alongside its frames.
-/// Persist a level's position graph as it stands after `frame`, beside its
-/// frames: the graph to a temp file renamed over `posgraph.bin`, then the
-/// frame it covers to `posgraph.frame` the same way. Saved every frame, so a
-/// crash between frames leaves a tree `ForwardState::resume` can take up.
-/// Saving it only when a forward ended made every crash unresumable: room
-/// (4,0)'s search died at f62 with f0-f60 on disk and no graph (2026-09-16).
-/// The graph is a union of per-frame edge sets, so a graph saved at a frame
-/// the resume later discards only holds edges its re-run records again.
+/// Persist the position graph as it stands after `frame`: `posgraph.bin`,
+/// then `posgraph.frame`, each by atomic rename. Saved every frame so a
+/// crash leaves a resumable tree; a graph saved at a frame the resume later
+/// discards only holds edges the re-run records again.
 pub fn save_pos_graph(dir: &std::path::Path, graph: &crate::search::pos_graph::PosGraph, frame: u32) -> Result<()> {
     let tmp = dir.join("posgraph.tmp");
     graph.save(&tmp)?;
@@ -1932,9 +1769,8 @@ pub fn save_pos_graph(dir: &std::path::Path, graph: &crate::search::pos_graph::P
     Ok(())
 }
 
-/// The last frame the saved position graph covers (`save_pos_graph`); `None`
-/// for a tree written before per-frame saves, whose graph was saved when its
-/// forward ended.
+/// The last frame the saved position graph covers; `None` if unmarked (a
+/// graph saved at the forward's end).
 pub fn pos_graph_frame(dir: &std::path::Path) -> Option<u32> {
     std::fs::read_to_string(dir.join("posgraph.frame")).ok().and_then(|s| s.trim().parse().ok())
 }
@@ -1943,9 +1779,8 @@ pub fn pos_graph_path(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("posgraph.bin")
 }
 
-/// A whole forward in one call, resuming a tree already in `dir`
-/// (`ForwardState::resume`) or starting one from `initial`, to `max_frames`
-/// - what `rewrite forward` runs.
+/// A whole forward to `max_frames`, resuming the tree in `dir` or starting
+/// from `initial` (`rewrite forward`).
 pub fn forward_resume_or_run(
     engine: &dyn FrameStep,
     initial: Vec<Block>,
@@ -1960,8 +1795,7 @@ pub fn forward_resume_or_run(
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
-/// A fresh forward from `initial` to `max_frames` (the tests' driver; the
-/// search resumes, `forward_resume_or_run`).
+/// A fresh forward from `initial` to `max_frames` (the tests' driver).
 #[cfg(test)]
 pub fn forward_run(
     engine: &dyn FrameStep,
@@ -1975,9 +1809,8 @@ pub fn forward_run(
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
-/// One line per forward frame on stderr, plus the phase totals under
-/// `metrics` (`fwd.*`), so a run's wall time is attributable without
-/// re-running it under a profiler. Times in ms.
+/// The per-frame `[fwd]` line on stderr (times in ms), plus the phase
+/// totals under `metrics` (`fwd.*`).
 fn log_frame(
     frame: u32,
     st: &FrameStats,
@@ -2027,17 +1860,15 @@ fn log_frame(
     crate::metrics::record("fwd.frame", t_total);
 }
 
-/// Checkpoint a frontier: one file per BUCKET under `frames/fNNN/`, named
-/// `b{seq}_s{shape}.bin`.
+/// Checkpoint a frontier: one file per piece under `frames/fNNN/`, named
+/// `s{shape}_{seq}.bin`, in the piece's row order (a row's position is its
+/// id). An id-less block (only the initial frontier) gets its ids here.
 fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]) -> Result<()> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
-    // Fresh: a re-run / resumed frame must not leave stale files behind.
+    // A re-run frame must not leave stale files behind.
     let _ = std::fs::remove_dir_all(&fdir);
     std::fs::create_dir_all(&fdir)?;
-    // One file per piece, written in parallel, in the piece's own row
-    // order: a row's position is its id (`pack_id`), assigned when it was
-    // admitted. A block without ids (the initial frontier) gets them here.
-    // Ids are (layer, seq, row): the seqs of a frame must be distinct.
+    // Ids are (layer, seq, row): a frame's seqs must be distinct.
     {
         let mut seqs: Vec<u32> = frontier.iter().filter(|b| !b.ids.is_empty()).map(|b| b.seq).collect();
         seqs.sort_unstable();
@@ -2069,8 +1900,7 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
     })
 }
 
-/// The checkpoint files of a frame (one per block written, `s{shape}_{seq}.bin`),
-/// with their seq, sorted by name.
+/// A frame's checkpoint files with their seq, sorted by name.
 pub fn frame_paths(dir: &std::path::Path, frame: u32) -> Result<Vec<(u32, std::path::PathBuf)>> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
     let mut out = Vec::new();
@@ -2125,23 +1955,14 @@ pub fn load_row(dir: &std::path::Path, id: u64) -> Result<(Rt2, u64, u32)> {
 /// dist)`.
 type MarkRow = (u64, u32, u64, u64, u32);
 
-/// A set of states, `(shape, cell, key)`: a level's MARKED states (the
-/// remainder-free backward's, the arc-marked nodes: `search --save-marks`,
-/// the UI) and the diagnostics' sets of reached states. In RAM; saved as a
-/// marks file.
+/// An in-memory set of states `(shape, cell, key)`: a level's MARKED states
+/// (`search --save-marks`, the UI, `MarkFilter`) or a diagnostic's reached
+/// states. Saved as a marks file.
 #[derive(Default)]
 pub struct Visited {
-    /// Sharded by (shape hash, cell): a shard holds the 128-bit content
-    /// keys seen at that shape and cell. Two states in different shards can
-    /// never be duplicates (different shape or different content ->
-    /// different cell), so the sharding is a free refinement: small sets,
-    /// per-cell locality, and a run of rows at one cell is one outer
-    /// lookup.
-    ///
-    /// Each key maps to its DEADLINE: the last frame a marked state still
-    /// reaches a win by the horizon from (`edges::Marks`). `u16::MAX` where
-    /// there is none - a set of reached states, a marks file from before the
-    /// deadlines were saved.
+    /// Sharded by (shape, cell), which the key determines, so sharding never
+    /// splits a duplicate. Each key maps to its DEADLINE: the last frame from
+    /// which the state still wins by the horizon; `u16::MAX`: none.
     shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashMap<(u64, u64), u16>>,
 }
 
@@ -2149,9 +1970,7 @@ impl Visited {
     pub fn new() -> Self {
         Self::default()
     }
-    /// `(entries, order-independent hash of the (content, cell) set)` - the
-    /// gate that two backward passes marked the same states. A function of
-    /// the keys and cells only, not of how they are sharded.
+    /// `(entries, order-independent hash of the (key, cell) set)`.
     pub fn fingerprint(&self) -> (usize, u64) {
         use celeste_engine::runtime2::mix64;
         let mut acc = 0u64;
@@ -2162,8 +1981,7 @@ impl Visited {
         }
         (self.len(), acc)
     }
-    /// True if `key` (at `shape`, `cell`) was NOT already present - this
-    /// lane is new, keep it. No deadline.
+    /// True if `key` (at `shape`, `cell`) was new. No deadline.
     pub fn insert(&mut self, shape: u64, key: (u64, u64), cell: u32) -> bool {
         self.insert_until(shape, key, cell, u16::MAX)
     }
@@ -2193,14 +2011,10 @@ impl Visited {
         self.shards.values().map(|s| s.len()).sum()
     }
 
-    /// THE MARKS FILE (every reader: `load`, the UI export's `MarksMap`):
-    /// the rows `(shape, cell, key.0, key.1, dist)` - `dist` the horizon minus
-    /// the entry's deadline, the frames of slack it had - and the horizon, as
-    /// one bincode value `(rows, horizon)`. An entry with no deadline is saved
-    /// at the horizon (dist 0): no level runs past its horizon, so the two
-    /// filter alike. `load` gives every entry its deadline back, so a level
-    /// resumed from a marks file filters the next as the uninterrupted run
-    /// did.
+    /// THE MARKS FILE (read by `load` and the UI export's `MarksMap`): one
+    /// bincode value `(rows, horizon)`, rows `(shape, cell, key.0, key.1,
+    /// dist)` with `dist` = horizon - deadline. No deadline saves as dist 0,
+    /// which filters alike (no level runs past its horizon).
     pub fn save(&self, path: &std::path::Path, horizon: u32) -> Result<()> {
         let mut rows: Vec<MarkRow> = Vec::with_capacity(self.len());
         for ((shape, cell), keys) in &self.shards {
@@ -2227,9 +2041,8 @@ impl Visited {
     }
 }
 
-/// A level tree on disk complete through `horizon` (its frames there and
-/// their edge runs done): its first win, from the frame files' win lists.
-/// `None` when the tree does not reach the horizon.
+/// The first win of a level tree complete (frames and edge runs) through
+/// `horizon`; `None` when the tree does not reach it.
 pub fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
     let done = crate::search::edges::done_frame(&dir.join("edges"));
     if done.is_none_or(|d| d < horizon) || !dir.join("frames").join(format!("f{horizon:03}")).is_dir() {
@@ -2268,9 +2081,8 @@ mod tests {
     }
 
 
-    /// A row ref names its queue in full: with spares kept per outcome the
-    /// slot vector grows past `POOL_QUEUES`, and a queue index above 255
-    /// used to alias another queue's row (room (1,0) f65, 2026-09-14).
+    /// A row ref names its queue in full: the slot vector grows past
+    /// `POOL_QUEUES`, and an index above 255 must not alias another queue.
     #[test]
     fn row_refs_survive_more_than_256_queue_slots() {
         let mut sink = ForwardSink::empty(false);
@@ -2312,15 +2124,8 @@ mod tests {
     use crate::trace::refengine::RefEngine;
     use std::sync::Mutex;
 
-    /// End-to-end proof that the rebuilt outer loop runs: drive `forward_run`
-    /// over the trusted reference engine for a few frames from the initial
-    /// block, checkpointing each frontier, and prove the checkpoint round-trips
-    /// (reload a frame's states and match the count). Uses the interpreter (the
-    /// oracle), so it is slow and needs the cart on disk; run explicitly.
-    /// A fresh forward in a directory a killed run left files in must not
-    /// keep any of them: a stale edge run for a (layer, frame) the new
-    /// forward never writes was read by the backward against the new rows
-    /// (room (1,1) h94, 2026-10-01).
+    /// A fresh forward in a directory a killed run left files in keeps none
+    /// of them (a stale edge run would be read against the new rows).
     #[test]
     fn a_fresh_forward_clears_what_a_killed_run_left() {
         let engine = RefEngine::new().expect("ref engine");
@@ -2358,10 +2163,8 @@ mod tests {
         assert_eq!(w.deadline(9, (2, 3), 8), Some(12), "no deadline: the horizon");
     }
 
-    /// forward_resume, extending a checkpointed forward, reproduces a fresh run:
-    /// run fresh to frame 4, capture frame 4's key set, then resume from frame 2
-    /// out to 4 (rebuilding visited from the checkpoints) and check frame 4 is
-    /// byte-for-byte the same key set.
+    /// Extending a forward frame by frame, and resuming one from its
+    /// checkpoints, reproduce a fresh run's key sets.
     #[test]
     #[ignore]
     fn forward_extended_frame_by_frame_matches_fresh() {
@@ -2385,8 +2188,7 @@ mod tests {
         let fresh4 = keyset(4);
         assert!(!fresh4.is_empty(), "fresh frame 4 empty");
 
-        // The same run extended one frame at a time - the outer loop's
-        // "one more frame at rem zero" - lands on the same key set.
+        // The same run extended one frame at a time.
         {
             let e = RefEngine::new().expect("engine");
             let init = vec![Block::keyed(e.initial().expect("init")).expect("block")];
@@ -2396,9 +2198,7 @@ mod tests {
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
                 assert_eq!(st.frames, to);
-                // Every frame boundary leaves a graph covering the frame: a
-                // crash here resumes (the graph was saved only when a
-                // forward ended, so a crash lost it, 2026-09-16).
+                // Every frame leaves a graph covering it, so a crash resumes.
                 assert_eq!(pos_graph_frame(dir), Some(to), "the pos graph must be saved with frame {to}");
             }
             assert!(st.pos_graph().is_some());
@@ -2407,8 +2207,7 @@ mod tests {
         assert_eq!(fresh4, extended4, "extension diverged from fresh at frame 4");
         eprintln!("[extend] frame 4 key set identical: {} keys", fresh4.len());
 
-        // RESUME: a fresh run to 6 versus the tree above resumed at 4 and
-        // extended to 6 (door and pos graph rebuilt from the layers).
+        // RESUME: a fresh run to 6 against the tree above resumed at 4.
         let fresh_dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-resume-test-fresh6");
         let _ = std::fs::remove_dir_all(fresh_dir);
         std::fs::create_dir_all(fresh_dir).expect("mkdir");
@@ -2435,15 +2234,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(fresh_dir);
     }
 
-    /// THE SPAWN FRAME, kernels against the reference: room (0,2)'s frame
-    /// where `player_spawn` lands and becomes the player at (16, 104), on
-    /// the ground. The kernels' trace has the new player at the spawn's
-    /// TOP `y`, and its `is_solid(0, 1)` folded to false (tile (2, 0) is
-    /// open; `Graph::tile_flag_over` read only row 0 at TOP): every
-    /// successor had the player in the air (grace 0, air acceleration,
-    /// gravity) where the reference and a real PICO-8 have it standing
-    /// (grace 6, a jump), and the exact levels' f80 had no witness
-    /// (2026-10-01). Both engines must make the same successor set.
+    /// THE SPAWN FRAME of room (0,2), where `player_spawn` becomes the player
+    /// standing at (16, 104): kernels and reference make the same successors.
+    /// Guards `Graph::tile_flag_over` reading every row a span covers (once
+    /// only row 0, so the kernels' player spawned in the air).
     #[test]
     fn room_02_spawn_frame_kernels_make_the_reference_successors() {
         use crate::abstraction::{set_level, Level};
@@ -2471,17 +2265,11 @@ mod tests {
         assert_eq!(k.difference(&r).count() + r.difference(&k).count(), 0, "kernels {} successors, reference {}: {} only in the reference", k.len(), r.len(), r.difference(&k).count());
     }
 
-    /// THE EXIT FRAME of room (1,3)'s known 127-frame solution
-    /// (`tas/room_1_3_reference_frame_127.txt`, verified on a real PICO-8):
-    /// from the state before it, projected onto `r0sxh`, the kernels must
-    /// make the concrete exit's state - the KEY the mark filter looks up
-    /// included - and every row they emit must carry the key its columns
-    /// have. The exit loads room (2,3), whose balloon's `y` is a number in
-    /// the outcome the kernel keyed (the key folded it as a number) and
-    /// `[64, 64]` in the shape's union column (the boundary read it as an
-    /// interval): two keys for one state, so the next level's mark filter
-    /// never found level 0's win rows and the ladder refuted the solution
-    /// at level 1 (2026-10-02, `runtime2::av_code`).
+    /// THE EXIT FRAME of room (1,3)'s known 127-frame solution: from the
+    /// state before it at `r0sxh`, the kernels make the concrete exit's
+    /// state, KEY included, and every emitted row carries its columns' key.
+    /// Guards a number and its point interval keying alike
+    /// (`runtime2::av_code`), or the mark filter misses the win rows.
     #[test]
     fn room_13_exit_frame_keys_the_concrete_exit() {
         use crate::abstraction::{set_level, Level};
@@ -2544,17 +2332,12 @@ mod tests {
     }
 
     /// THE SPLIT FRAME (`CELESTE_SPLIT_FRAME`) at a near level reaches the
-    /// unsplit frame's states at every frame boundary: room (2,1) `r0sxhn`,
-    /// where the player spawns onto two fall floors and can dash (a freeze)
-    /// from frame 24. The counts are the UNSPLIT forward's (`rewrite forward
-    /// --level r0sxhn --room 2,1`, 2026-10-01; its (key, cell) sets equal the
-    /// split one's at every even step through f34, `rewrite ckhash`). Two bugs
-    /// made the split frame reach MORE: a global cleared to nil left a slot
-    /// behind (`heap::Table::set_global`), so every state that had sat in a
-    /// freeze was a second shape (f26: 2,742 against 1,810 at `r0sxhnp`); and
-    /// the middle of the frame widened the floors the player's update then
-    /// read (`widen::widen_near_floors`, f25: 318 against 308). The kernels
-    /// are built per process for one level, so the unsplit side is pinned.
+    /// unsplit frame's state counts at every frame boundary (room (2,1)
+    /// `r0sxhn`: two fall floors under the spawn, dashes from frame 24). The
+    /// unsplit counts are pinned (`rewrite forward --level r0sxhn --room
+    /// 2,1`): the kernels are built per process for one level. Guards a
+    /// global set to nil being removed (`heap::Table::set_global`) and the
+    /// mid-frame cut not widening floors the player then reads.
     #[test]
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
         use crate::abstraction::{set_level, Level};

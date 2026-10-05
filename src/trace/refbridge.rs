@@ -1,23 +1,18 @@
 //! The reference engine's edge: one lane of a block <-> a `State<RefDomain>`.
 //!
-//! A block BOXES every slot: a global, an object field and an array element
-//! are each a `Val` cell, and a table, closure or builtin is reached through
-//! an `AV::Ptr` in one (a builtin's FIRST slot, in traversal order, is its
-//! `Bi` cell itself; later slots point at it). The tracer's heap has no
-//! boxes. The canonical row key walks the whole structure, so `to_block`
-//! rebuilds the boxes exactly as the kernels' rows have them, and a
-//! reference successor keys like a kernel row; `from_block` drops them.
+//! A block BOXES every slot (each global, field and array element is a `Val`
+//! cell; tables, closures and builtins are reached through an `AV::Ptr`,
+//! except a builtin's FIRST slot in traversal order, which is its `Bi` cell).
+//! The row key walks the whole structure, so `to_block` must rebuild the
+//! boxes exactly as the kernels do for a reference successor to key like a
+//! kernel row; `from_block` drops them.
 //!
-//! `__button_states`: the kernels write the buttons as `UBool` at the
-//! boundary, while the reference forks them as concrete booleans at the
-//! frame's start and never resets them, so `to_block` writes every boolean
-//! under it back as `UBool`; `from_block` reads a `UBool` as a placeholder
-//! `false` (the buttons are overwritten before they are read; any other
-//! unknown boolean is returned for the driver to fork per path).
-//!
-//! Globals and fields outside `celeste_names` are not in a block: the
-//! tracer's compile-time hint builtins are dropped by `to_block` and
-//! re-added from the engine's base state by `from_block`.
+//! `__button_states`: the kernels write the buttons as `UBool`, so `to_block`
+//! does too; `from_block` reads a `UBool` as a placeholder `false` (buttons
+//! are overwritten before they are read; any other unknown boolean is
+//! returned for the driver to fork). Names outside `celeste_names` (the
+//! tracer's hint builtins) are dropped by `to_block` and restored from the
+//! base state by `from_block`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,8 +74,7 @@ impl FromBlock<'_> {
         Ok(match v {
             AV::Num(n) => TV::Num(Iv::from_number(n)),
             AV::Ival(lo, hi) => TV::Num(Iv::new(lo, hi)),
-            // An unknown number is the whole range; the driver forks where
-            // a comparison straddles it.
+            // The whole range; a straddling comparison forks.
             AV::UNum => TV::Num(Iv::new(P8::from_raw(i32::MIN), P8::from_raw(i32::MAX))),
             AV::Bool(b) => TV::Bool(b),
             AV::UBool => TV::Bool(false),
@@ -147,9 +141,9 @@ impl FromBlock<'_> {
     }
 }
 
-/// Lane `lane` of a block as a reference state, with the base state's
-/// builtins the block does not carry, and the fields that hold an unknown
-/// boolean (the buttons excepted): the driver forks each per path.
+/// Lane `lane` of a block as a reference state (plus the base state's
+/// builtins), and its unknown-boolean fields except the buttons, for the
+/// driver to fork.
 pub fn from_block(
     rt2: &Rt2,
     lane: usize,
@@ -262,9 +256,8 @@ impl ToBlock<'_> {
         let cell = self.cell(Cell2::Unk, Col::U(AV::Nil));
         self.memo_t.insert(t, cell);
         let table = &self.st.heap.tables[&t];
-        // Integer keys past the array part (`got_fruit[1 + level_index()]` on
-        // an empty table) are a dense array with explicit nils, as `bind`
-        // flattens it for the kernels.
+        // Integer keys past the array part become a dense array with explicit
+        // nils, as `bind` flattens it for the kernels.
         let arr: Vec<TV> = if table.ints.is_empty() {
             table.arr.to_vec()
         } else {
@@ -348,8 +341,8 @@ pub fn to_block(st: &State<RefDomain>) -> Result<Rt2> {
     }
     let mut rt2 = cx.rt2;
     rt2.canonicalize_ids();
-    // A string's id is its occurrence in canonical order after the static
-    // ones (the cell's id is part of the key).
+    // A string's id (part of the key) is its occurrence in canonical order
+    // after the static ones.
     let mut strings: Vec<String> = gen::STRINGS.iter().map(|s| s.to_string()).collect();
     let old = std::mem::take(&mut rt2.strings);
     let mut renumber = |col: &mut Col| {

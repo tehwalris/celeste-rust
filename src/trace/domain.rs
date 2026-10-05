@@ -7,24 +7,13 @@
 //! * `Symbolic` - `Num = Bool = NodeId` into a `transpile::graph::Graph`.
 //!   This is the TRACER; what it leaves behind is the graph.
 //!
-//! They are the same code because that is the only way they cannot drift.
-//! An oracle that is a separate implementation is a second definition of
-//! what the program means, and then two things have to be kept true at
-//! once (`plans/tracing.md`).
+//! They are the same code so that the oracle cannot drift from the tracer.
 //!
-//! ## The one method that matters
-//!
-//! `decide` asks "can you tell me this condition's value RIGHT NOW".
-//! `Concrete` always can. `Symbolic` can only when the node folded to a
-//! constant. `None` is exactly the case where the interpreter stops being
-//! an interpreter and starts being a compiler: it traces both arms and
-//! merges them with `sel_*`.
-//!
-//! So the concrete instantiation never calls `sel_*` at all, and the
-//! symbolic one calls it only where the program genuinely branches on
-//! something it cannot know - which, because the HEAP stays concrete, is
-//! far less often than it sounds. `count(objects)` is a number, `#t` is a
-//! number, a table field's presence is a fact; only game data is symbolic.
+//! `decide` asks for a condition's value NOW. `Concrete` always knows it;
+//! `Symbolic` only when the node folded to a constant. On `None` the
+//! interpreter traces both arms and merges them with `sel_*`. The HEAP stays
+//! concrete (`count(objects)`, `#t`, a field's presence are facts), so only
+//! game data is symbolic.
 
 use std::fmt::Debug;
 
@@ -81,22 +70,18 @@ pub enum ForkKind {
 /// sets the buttons concretely finds them (`verify::at_buttons`).
 pub const UNKNOWN_BOOL_ORIGIN: &str = "__new_unknown_boolean";
 
-/// HOW a fork partitions its value's set - the one thing that differs between
-/// the forks a trace takes (plans/graph-model.md section 3). A configuration
-/// index becomes a value by this rule.
+/// HOW a fork partitions its value's set: the rule by which a configuration
+/// index becomes a value.
 pub enum Partition {
     /// Cut an interval at the fork grid's cell edges: fragment `c` is the
-    /// `c`-th cell (`Op::Split` -> `Frag`), which is what `flr` of an
-    /// interval needs, since `flr` is not a function on a set whose points
-    /// have different floors.
+    /// `c`-th cell (`Op::Split` -> `Frag`), so `flr` of each is one number.
     Floors { ways: u8 },
     /// Cut an interval of WHOLE numbers into the numbers themselves, each
     /// EXACT (`Op::SplitInt` -> `IntFrag`): the held trails' unknown booleans.
     ///
     /// `memo` is false where two forks over the SAME node must stay
-    /// independent: the held trails `p_jump` / `p_dash` both fork the constant
-    /// `[0, 1<<16]`, and sharing one choice would tie them together, so the
-    /// pair could never take opposite values.
+    /// independent (`p_jump` / `p_dash` both fork `[0, 1<<16]`; one shared
+    /// choice would tie them together).
     Ints { ways: u8, memo: bool },
 }
 
@@ -145,10 +130,8 @@ pub trait Domain {
     fn compare(&mut self, op: Cmp, a: &Self::Num, b: &Self::Num) -> Result<Self::Bool>;
     fn not(&mut self, a: &Self::Bool) -> Self::Bool;
     fn and(&mut self, a: &Self::Bool, b: &Self::Bool) -> Self::Bool;
-    /// De Morgan by default, which is all `Concrete` needs. `Symbolic`
-    /// overrides it to build `Op::Or` directly: in a GRAPH the difference
-    /// is three nodes against one, and the detour also destroys the
-    /// symmetry, so `a or b` and `b or a` fail to intern together.
+    /// De Morgan by default. `Symbolic` builds `Op::Or` directly: one node,
+    /// and `a or b` interns with `b or a`.
     fn or(&mut self, a: &Self::Bool, b: &Self::Bool) -> Self::Bool {
         let (na, nb) = (self.not(a), self.not(b));
         let both = self.and(&na, &nb);
@@ -164,24 +147,16 @@ pub trait Domain {
     fn sel_num(&mut self, c: &Self::Bool, t: &Self::Num, f: &Self::Num) -> Self::Num;
     fn sel_bool(&mut self, c: &Self::Bool, t: &Self::Bool, f: &Self::Bool) -> Self::Bool;
 
-    /// `mget(x, y)` with coordinates not known at trace time. The map is
-    /// data and it is concrete, so this only arises inside a tile scan
-    /// whose bounds came out symbolic - and there the emitted kernel does
-    /// it in one instruction (`zn_mget`) rather than a lookup table.
+    /// `mget(x, y)` with coordinates not known at trace time (inside a tile
+    /// scan with symbolic bounds); the kernel does it in one call (`zn_mget`).
     fn mget(&mut self, x: &Self::Num, y: &Self::Num) -> Result<Self::Num>;
 
     /// `tile_flag_at(x, y, w, h, flag)` where the coordinates are NOT
     /// known at trace time.
     ///
-    /// This has to be a primitive rather than traced into, for the same
-    /// reason the IR pipeline makes it one (`zn_tile_flag_at`): the Lua
-    /// version scans a tile range with a loop whose bounds are derived
-    /// from x and y, so tracing it with a symbolic x would need the
-    /// unroll machinery for something the emitted kernel does in one
-    /// call. Four of the cart's six symbolic loops are this function.
-    ///
-    /// The caller folds it when everything IS known, so the concrete
-    /// domain never reaches here.
+    /// A primitive (`zn_tile_flag_at`) rather than traced into: the Lua scans
+    /// a tile range whose loop bounds derive from x and y. The caller folds
+    /// it when everything is known, so `Concrete` never reaches here.
     fn tile_flag_at(
         &mut self,
         x: &Self::Num,
@@ -192,58 +167,41 @@ pub trait Domain {
     ) -> Result<Self::Bool>;
 
     /// A fresh UNKNOWN boolean - one of the search's free choices.
-    ///
-    /// The oracle has no such thing: to run a frame concretely you supply
-    /// the actual button values, so `Concrete` refuses rather than
-    /// inventing one. That asymmetry is real and worth the loud failure -
-    /// it is the difference between running the game and compiling it.
+    /// `Concrete` refuses: it runs supplied button values.
     fn unknown_bool(&mut self) -> Result<Self::Bool>;
 
-    /// A number known only to lie in `[lo, hi]` - `rnd`'s value. Like
-    /// `unknown_bool` this is a thing only an abstract domain has: the
-    /// concrete oracle refuses rather than inventing a draw.
+    /// A number known only to lie in `[lo, hi]` - `rnd`'s value. `Concrete`
+    /// refuses rather than inventing a draw.
     fn range_num(&mut self, lo: P8, hi: P8) -> Result<Self::Num> {
         bail!("a number in [{lo:?}, {hi:?}] has no concrete value - this domain runs real inputs only")
     }
 
-    /// How much graph there is, for the tracer's budget check. Zero for a
-    /// domain that does not build one.
+    /// How much graph there is, for the tracer's budget check.
     fn node_count(&self) -> usize {
         0
     }
 
-    /// A number this value definitely is, if the domain knows it. The
-    /// interpreter needs this for things the HEAP depends on - an array
-    /// index, a table key, a loop bound - where an unknown is a refusal
-    /// rather than a branch.
+    /// A number this value definitely is, if known. Needed where the HEAP
+    /// depends on it (an index, a key, a loop bound): unknown is a refusal.
     fn as_const(&self, v: &Self::Num) -> Option<P8>;
 
-    /// What this value IS, for an error message.
-    ///
-    /// A refusal that says "`start` is symbolic" leaves the reader
-    /// guessing between an input cell, a fold that did not fire, and a
-    /// genuine expression - three completely different fixes. Costs
-    /// nothing until something refuses.
+    /// What this value IS, for an error message (an input cell, an unfired
+    /// fold, a genuine expression).
     fn describe(&self, _v: &Self::Num) -> String {
         "<opaque>".to_string()
     }
 
     /// Is this value an INTERVAL - a set of numbers rather than one?
-    ///
-    /// Asked before forking, because forking a value that is already a
-    /// single number costs an outcome and buys nothing. Every object
-    /// calls `move`, so a room with n moving objects would get 2^2n fork
-    /// configurations for the sake of one player.
+    /// Asked before forking: forking a single number costs an outcome and
+    /// buys nothing.
     fn is_interval(&self, _v: &Self::Num) -> bool {
         false
     }
 
     /// Is a merged value a SELECT the kernel reads by its condition's value
-    /// bit (`Op::Sel`), rather than a value the merge folded away (equal
-    /// arms, a decided condition) or into Kleene boolean algebra, which the
-    /// kernel evaluates exactly on (value, known) masks? Only the former
-    /// reads the merge's condition, so only it can make the merge refuse
-    /// (`state::merge`). A concrete merge never selects.
+    /// bit (`Op::Sel`), rather than folded away or into Kleene boolean
+    /// algebra? Only a select reads the merge's condition, so only it can
+    /// make the merge refuse (`state::merge`).
     fn is_select_num(&self, _v: &Self::Num) -> bool {
         false
     }
@@ -253,43 +211,30 @@ pub trait Domain {
         false
     }
 
-    /// Fork at `flr`: the value restricted to a fresh fork choice, and
-    /// which lanes fall in the chosen fragment.
-    ///
-    /// `flr` of an interval is not a function - the lane holds points
-    /// whose floors differ - so the cart marks the place with
-    /// `__split_by_flr` and the program enumerates the cases. This
-    /// returns ONE node, not two states: the fragment is a choice, like
-    /// a button, and specialization enumerates it (`Choice::Split`).
-    ///
-    /// `ways` is the fork's arity - how many floors the fragments cover.
-    ///
-    /// The default is the identity, which is what an exact value needs:
-    /// one fragment, always valid.
+    /// Fork at `flr` (`__split_by_flr`): the value restricted to a fresh fork
+    /// choice, and which lanes fall in the chosen fragment. `flr` of an
+    /// interval is not a function, so the fragment is a choice like a
+    /// button, enumerated by specialization. `ways` is the fork's arity.
+    /// The default (exact values) is the identity, always valid.
     fn fork_flr(&mut self, v: &Self::Num, _ways: u8) -> (Self::Num, Self::Bool) {
         (v.clone(), self.boolean(true))
     }
 
-    /// `n` was computed where `at` holds - a fork's fragment, a floor: the
-    /// operators with an own error (`trace::error`), which holds only on the
-    /// lanes that evaluate them. Off its path a node's operands are whatever
-    /// the lane's own path left there. Nothing to record for a domain that
-    /// has no graph.
+    /// `n`, an operator with an own error (`trace::error`), was computed
+    /// where `at` holds; its error holds only there.
     fn evaluated_at(&mut self, _n: &Self::Num, _at: &Self::Bool) {}
 
-    /// The arity of the fork `__split_by_flr` takes on `v`: `MOVE_WAYS`,
-    /// or where the trace knows `v`'s static range (a region kernel, level
-    /// -1) the most grid cells one piece of it crosses - a lane's interval
-    /// lies within one piece, and `SplitOk` checks it.
+    /// The arity of the fork `__split_by_flr` takes on `v`: `MOVE_WAYS`, or
+    /// where `v`'s static range is known the most grid cells one piece of it
+    /// crosses (a lane's interval lies within one piece; `SplitOk` checks).
     fn flr_ways(&mut self, _v: &Self::Num) -> u8 {
         MOVE_WAYS
     }
 
     /// The join of a merge on a condition NO LANE can decide, where the arms
-    /// are values every lane holds alike (plans/fly-fruit.md): the hull of
-    /// two literal intervals, or the unknown number. `None` keeps the
-    /// ordinary select (and its `Known` premise). Only a fruit-unknown set
-    /// has such conditions; the concrete domain never merges.
+    /// are values every lane holds alike: the hull of two literal intervals,
+    /// or the unknown number. `None` keeps the ordinary select (and its
+    /// `Known` premise).
     fn join_num_independent(&mut self, _c: &Self::Bool, _t: &Self::Num, _f: &Self::Num) -> Option<Self::Num> {
         None
     }
@@ -301,10 +246,8 @@ pub trait Domain {
     }
 
     /// Does the undecided condition `c` read an unknown atom (`Op::UnknownBool`)?
-    /// No lane ever decides an atom, so wherever `c` depends on one it stays
-    /// undecided: a merge on `c` that would leave a select is not a merge but two
-    /// successors, since those lanes would decline the select's `Known(c)`
-    /// premise (`state::merge`).
+    /// No lane decides an atom, so a merge on `c` that would leave a select
+    /// is two successors instead (`state::merge`).
     fn reads_unknown_atom(&mut self, _c: &Self::Bool) -> bool {
         false
     }
@@ -330,13 +273,9 @@ pub trait Domain {
     }
 
     /// A boolean that reads an atom handed out at or after `since` and ESCAPES
-    /// the call that made it (held in the heap, or returned) becomes a fork:
-    /// of both values for a bare atom, else restricted per lane to the values
-    /// it can take (`Symbolic::escaped_atom`). Inside the call it stays as it
-    /// is; after it, a read by lane data (a fall floor's `collideable`, joined
-    /// under undecided `state` branches, read by the player's collisions)
-    /// decides per configuration, consistently across reads. `None` for a
-    /// value that reads no such atom.
+    /// the call that made it (held in the heap, or returned) becomes a fork,
+    /// restricted per lane to the values it can take, so later reads decide
+    /// it consistently per configuration. `None` if it reads no such atom.
     fn escaped_atom(&mut self, _b: &Self::Bool, _since: u32, _origin: &dyn Fn(&Self) -> String) -> Option<Self::Bool> {
         None
     }
@@ -450,31 +389,22 @@ pub struct Symbolic {
     /// The six buttons are among them (`unknown_bool`).
     pub forks: u8,
     /// `flr_ways` takes a static range's FULL width, not capped at
-    /// `move_ways`: level -1, whose speed is a range at every node rather
-    /// than exact per lane (`level_minus_one`). Off everywhere else.
+    /// `move_ways`: level -1, whose speed is a range at every node.
     pub uncapped_ways: bool,
-    /// Held buttons unknown for the set being traced
-    /// (`Level::held`): `trace_frame` forks the player's
-    /// `p_jump` / `p_dash` (`widen::fork_held_inputs`). Set by the walk.
+    /// Held buttons unknown (`Level::held`): `trace_frame` forks `p_jump` /
+    /// `p_dash` (`widen::fork_held_inputs`).
     pub held_unknown: bool,
-    /// The fly fruit unknown for the set being traced
-    /// (`Level::fruit`): `trace_frame`
-    /// replaces the fruit's inputs (`widen::fork_fruit_inputs`), arithmetic on
-    /// literal intervals folds to literals, and a merge on a condition no lane
-    /// decides joins its literal arms (`join_num_independent`). Set by the walk.
+    /// The fly fruit unknown (`Level::fruit`): its inputs are replaced
+    /// (`widen::fork_fruit_inputs`), arithmetic on literal intervals folds
+    /// to literals, and a merge no lane decides joins its literal arms.
     pub fruit_unknown: bool,
-    /// The fall floors widened but where the player overlaps one
-    /// (`Level::floors_near`): `trace_frame` forks each
-    /// floor's `collideable` input (`widen::fork_near_floor_inputs`), every
-    /// outcome stores `state` and `collideable` per lane widened or exact
-    /// (`widen::widen_near_floors`), and each floor's `delay` and the
-    /// balloon's `timer` as the unknown number (`widen::widen_floor_timers`),
-    /// which the next frame reads as unknown
-    /// (`widen::forget_countdown_inputs`). Set by the walk.
+    /// The fall floors widened except where the player overlaps one
+    /// (`Level::floors_near`): each floor's `collideable` input is forked,
+    /// outcomes store `state` / `collideable` widened or exact
+    /// (`widen::widen_near_floors`), and countdowns as the unknown number.
     pub floors_near: bool,
-    /// The moving platforms unknown (`Level::platforms`,
-    /// plans/platforms-unknown.md): `trace_frame` widens their inputs
-    /// (`widen::platform_inputs`), every outcome their outputs.
+    /// The moving platforms unknown (`Level::platforms`): inputs and outputs
+    /// widened (`widen::platform_inputs`).
     pub platforms_unknown: bool,
     /// How many `Op::UnknownBool` atoms this frame handed out.
     pub unknown_atoms: u32,
@@ -484,20 +414,16 @@ pub struct Symbolic {
     /// What each fork `both_values` made was made for (a held trail, an
     /// escaped atom's slot), for the kernel dump. Cleared with `escaped`.
     pub fork_origins: Vec<(u8, String)>,
-    /// WHERE each node with an own error was evaluated: the OR of the path
-    /// guards the tracer built it under (`Domain::evaluated_at`), because
-    /// its error holds only there (`trace::error`). Per trace, like the
-    /// fork numbering.
+    /// WHERE each node with an own error was evaluated: the OR of its path
+    /// guards (`trace::error`). Per trace.
     pub evaluated: rustc_hash::FxHashMap<NodeId, NodeId>,
-    /// Keep a traced frame's undecided selects as selects: level -1, whose
-    /// evaluator joins an undecided select's arms, sets it around its trace.
-    /// Off, the frame's surviving selects on a condition a lane can hold
-    /// undecided become forks (`verify::fork_undecided_selects`).
+    /// Keep undecided selects as selects (level -1, whose evaluator joins
+    /// their arms). Off, they become forks (`verify::fork_undecided_selects`).
     pub no_known_forks: bool,
     /// THE PLATFORM WORLDS (`concrete::platform_worlds`): every arrangement
-    /// of the start room's moving platforms a search can meet, each
-    /// platform's `(x, last, rem.x, spd.x)`. The split pass decides a
-    /// comparison per world (`verify::Points`); no lane ever holds one.
+    /// of the start room's moving platforms, each platform's `(x, last,
+    /// rem.x, spd.x)`. The split pass decides a comparison per world
+    /// (`verify::Points`); no lane holds one.
     pub worlds: Option<std::sync::Arc<Vec<Vec<[i32; crate::concrete::WORLD_FIELDS]>>>>,
     /// This frame's platforms' `x` input cells, in the WORLDS' order (matched
     /// by `y` and `dir`, `widen::platform_inputs`): what a world pins.
@@ -507,61 +433,31 @@ pub struct Symbolic {
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// `reads_unknown_atom`'s memo: structural, like `lane_memo`.
     atom_memo: rustc_hash::FxHashMap<NodeId, bool>,
-    /// Fork choices already handed out THIS FRAME, by the value forked.
+    /// Fork choices already handed out THIS FRAME, by the value forked: a
+    /// second fork of the same value is determined by the first, so it reuses
+    /// its choice rather than adding an empty dimension. Cleared with `forks`.
     ///
-    /// Two call sites that floor the same value do not need two choice
-    /// dimensions: forking one value twice yields the same fragments,
-    /// so the second choice is determined by the first and every
-    /// configuration where they disagree is empty. The runtime masks
-    /// prune those, so it was never wrong - it was two extra levels of
-    /// loop nest and a block of emitted nodes each.
-    ///
-    /// Measured on room (2,0) before this existed: `kernel1` and
-    /// `kernel4` forked 16 times over 14 distinct values, which is
-    /// ~10,600 of their 83,710 nodes (12.7%) and 65,536 runtime
-    /// configurations instead of 16,384.
-    ///
-    /// Per frame, like `forks` itself - cleared beside it.
-    ///
-    /// Keyed by `(value, kind)`, NOT by value: `Floors` and `Ints` over one
-    /// value are different ops (`Split` against `SplitInt`) resolving to
-    /// different fragments, so they are different forks and may not share a
-    /// choice. `Table` is absent from this map by design - see `Partition`.
+    /// Keyed by `(value, kind)`: `Floors` and `Ints` over one value resolve
+    /// to different fragments and may not share a choice.
     fork_memo: std::collections::HashMap<(NodeId, ForkKind), (u8, (NodeId, NodeId))>,
-    /// Input cells that hold an INTERVAL rather than a number - the
-    /// player's `rem.x`/`rem.y`, which the boundary widens.
-    ///
-    /// By CELL, in the tracer's own dense numbering, because that is what
-    /// a graph node names. `is_interval` is a cone query against this
-    /// set: a value is an interval exactly when it was computed from one.
+    /// Input cells (in the tracer's dense numbering) that hold an INTERVAL
+    /// rather than a number - the player's `rem.x`/`rem.y`. A value is an
+    /// interval exactly when it was computed from one (`is_interval`).
     pub ival_cells: std::collections::BTreeSet<u32>,
-    /// `is_interval`'s memo, valid for the current `ival_cells` (nodes never
-    /// change): asked of every select's condition at the end of a frame
-    /// (`verify::fork_undecided_selects`), and a graph-sized memo per call was
-    /// fine only while forks were the one caller. Dropped with
-    /// `forget_intervals` wherever `ival_cells` changes.
+    /// `is_interval`'s memo. This and the four below depend on `ival_cells`
+    /// and are dropped in `forget_intervals` whenever it changes.
     ival_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
-    /// `abstractness`'s memo - the TYPE PROPAGATION pass, which asks whether a
-    /// node's value is a SET rather than a single value. Valid for the current
-    /// `ival_cells` exactly as `ival_memo` is, and dropped beside it in
-    /// `forget_intervals`.
+    /// `abstractness`'s memo.
     abstract_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
-    /// `lane_undecidable`'s memo - THE FORK TRIGGER. Derived from
-    /// `abstractness`, so it depends on `ival_cells` too and is dropped with
-    /// the other two.
+    /// `lane_undecidable`'s memo.
     undecidable_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
-    /// `abstract_beneath_lane_ops`'s memo, dropped with the rest.
+    /// `abstract_beneath_lane_ops`'s memo.
     beneath_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// `may_answers`'s memo: a condition's `(may_true, may_false)` pair.
-    /// Depends on `lane_undecidable` and so on `ival_cells`, so it is dropped
-    /// with the other three in `forget_intervals`.
     may_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, (NodeId, NodeId)>>,
-    /// STATIC RANGES (2026-09-15, the bucket dispatch): input cells whose
-    /// value is known to lie in a range - a body specialized on the
-    /// player's speed BUCKET - and the memo of the range analysis over
-    /// them (`range_of`). A comparison both of whose operands have ranges
-    /// that decide it folds to a constant (`compare`), so the branch is
-    /// never traced and the merge never built. Per frame, like `forks`.
+    /// STATIC RANGES: input cells whose value is known to lie in a range, and
+    /// the memo of the range analysis over them (`range_of`). A comparison
+    /// the ranges decide folds to a constant (`compare`). Per frame.
     pub ranges: std::collections::HashMap<NodeId, (i64, i64)>,
     range_memo: std::collections::HashMap<NodeId, Option<Pieces>>,
     /// Comparisons `compare` decided from ranges this frame (a probe stat).
@@ -587,32 +483,20 @@ impl Symbolic {
         self.may_memo.get_mut().clear();
     }
 
-    /// THE FORK TRIGGER (plans/graph-model.md section 2): can ONE LANE hold
-    /// this condition both ways?
+    /// THE FORK TRIGGER: can ONE LANE hold this condition both ways, i.e.
+    /// does its value differ across the concrete states one lane stands for?
     ///
-    /// Not `abstractness`, and the difference is the whole point. A lane is
-    /// itself a set of states and the kernel computes on interval
-    /// representations, so a value can denote a set and still be one computed
-    /// quantity per lane that the kernel can branch on. What forces a fork is
-    /// narrower: the condition's value differs ACROSS THE CONCRETE STATES ONE
-    /// LANE STANDS FOR.
+    /// Not `abstractness`: a value can denote a set and still be one quantity
+    /// per lane that the kernel branches on. The two exclusions:
     ///
-    /// Exhaustive over every `Op`, because the two exclusions below are the
-    /// load-bearing part and a catch-all hides them (`reads_interval_cmp`'s
-    /// `_ => false` gets them right by accident and would get the next
-    /// genuinely undecidable op wrong):
+    /// * `TileFlagAt` and `Mget` are LANE-DECIDABLE BY INSTRUCTION: one call,
+    ///   one answer, however abstract the coordinates.
+    /// * `Flr` is LANE-DECIDABLE BY ASSERTION (`zi_flr_ok`), and that
+    ///   assertion is the operator's own error (`trace::error`), not a type
+    ///   fact - so `Known(Flr(..))` must not be folded away.
     ///
-    /// * `TileFlagAt` and `Mget` are LANE-DECIDABLE BY INSTRUCTION. They lower
-    ///   to one call over number registers, so a lane gets a single answer
-    ///   however abstract its coordinates are.
-    /// * `Flr` is LANE-DECIDABLE BY ASSERTION - `zi_flr_ok` reads decidedness
-    ///   off the interval - and that assertion is the operator's own error
-    ///   (section 4), not a type fact. This is the one place the two
-    ///   justifications differ, and conflating them is what made me fold
-    ///   `Known(Flr(..))` away unsoundly.
-    ///
-    /// Measured on room (6,0): triggering on `abstractness` instead would mint
-    /// 50-90 extra forks a frame, all of them these two families.
+    /// Exhaustive over `Op` on purpose: a catch-all would hide the next
+    /// undecidable op.
     pub fn lane_undecidable(&self, b: NodeId) -> bool {
         fn go(d: &Symbolic, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(x) = memo.get(&n) {
@@ -622,13 +506,9 @@ impl Symbolic {
             let args = node.args.clone();
             let any = |memo: &mut rustc_hash::FxHashMap<NodeId, bool>, xs: &[NodeId]| xs.iter().any(|x| go(d, memo, *x));
             let r = match node.op {
-                // THE source: a lane's states answer a comparison both ways
-                // exactly when an operand spans values - but "spans values"
-                // here must IGNORE the lane-decidable operators, or the
-                // exclusions below never bite. `Gt(Flr(Split(..)), 0)` has an
-                // abstract operand by `abstractness`, yet the kernel decides
-                // it per lane because the span assertion makes the floor
-                // unique. Same for a coordinate that feeds `TileFlagAt`.
+                // THE source: an operand spans values, judged BENEATH the
+                // lane-decidable operators (`Gt(Flr(Split(..)), 0)` is decided
+                // per lane), or the exclusions below never bite.
                 Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => args.iter().any(|a| d.abstract_beneath_lane_ops(*a)),
                 Op::UnknownBool(_) => true,
                 Op::Not | Op::And | Op::Or | Op::Sel => any(memo, &args),
@@ -653,12 +533,8 @@ impl Symbolic {
 
     /// `abstractness`, but STOPPING at the operators a lane decides for
     /// itself: `Flr` (unique by its span assertion) and `TileFlagAt`/`Mget`
-    /// (one instruction, one answer per lane).
-    ///
-    /// This is what a comparison's operands must be judged by. Asking plain
-    /// `abstractness` there makes `Gt(Flr(Split(..)), 0)` a fork trigger, and
-    /// measured on room (6,0) that is 38-50 spurious forks a frame - the
-    /// difference between this predicate and the `Known` premises it replaces.
+    /// (one instruction, one answer per lane). What a comparison's operands
+    /// are judged by; plain `abstractness` would mint spurious forks.
     pub fn abstract_beneath_lane_ops(&self, n: NodeId) -> bool {
         fn go(d: &Symbolic, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(x) = memo.get(&n) {
@@ -677,16 +553,10 @@ impl Symbolic {
                 Op::Split(_) | Op::Frag(_) => true,
                 Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi => false,
                 Op::ConstBool(_) | Op::Known | Op::NoWrap => false,
-                // THE CONDITION DOES NOT MAKE THE RESULT A SET. `Sel(c, 5, 7)`
-                // is one of two exact numbers whatever `c` is; that a lane may
-                // take either arm is a BRANCHING question, answered by forking
-                // `c` itself, not by calling this operand's value a range.
-                // Counting the condition here (my first version did, via the
-                // catch-all) over-triggered on 31-33 conditions a frame in room
-                // (6,0). `is_interval` has always had this rule; note that
-                // `lane_undecidable` deliberately does the OPPOSITE for
-                // booleans, where a select genuinely straddles when its
-                // condition does.
+                // THE CONDITION DOES NOT MAKE THE RESULT A SET: `Sel(c, 5, 7)`
+                // is one of two exact numbers; which arm is a branching
+                // question, answered by forking `c`. (`lane_undecidable`
+                // does the opposite for booleans, deliberately.)
                 Op::Sel => args[1..].iter().any(|a| go(d, memo, *a)),
                 _ => args.iter().any(|a| go(d, memo, *a)),
             };
@@ -696,33 +566,21 @@ impl Symbolic {
         go(self, &mut self.beneath_memo.borrow_mut(), n)
     }
 
-    /// TYPE PROPAGATION (plans/graph-model.md section 2): does this node's
-    /// value denote a SET of concrete values rather than a single one?
+    /// TYPE PROPAGATION: does this node's value denote a SET of concrete
+    /// values rather than a single one? Static: a singleton every lane
+    /// decides; a set no lane need decide.
     ///
-    /// This is the whole of what decidedness means, and it is static. A node
-    /// whose value is a singleton is one every lane decides; a node whose
-    /// value is a set is one no lane need decide, so a branch on it is what
-    /// stage 2 has to fork.
+    /// NOT `is_interval` (whether a NUMBER is an interval, for the lowering's
+    /// ZI/ZN typing and the widenings). Two load-bearing differences:
     ///
-    /// NOT `is_interval`, which answers a different question and must keep
-    /// doing so: whether a NUMBER is an interval, for the lowering's ZI/ZN
-    /// typing and for the widenings. Two differences are load-bearing:
+    /// * a `Sel` counts its CONDITION: an undecided condition is what makes
+    ///   the select unevaluable;
+    /// * `Flr` FOLLOWS ITS OPERAND: it is a singleton only on pain of its own
+    ///   error (`trace::error`), which is not a type fact; `is_interval`
+    ///   assumes that obligation, and reading it in here would fold
+    ///   `Known(Flr(..))` away unsoundly.
     ///
-    /// * a `Sel` counts its CONDITION, because an undecided condition is
-    ///   precisely what makes the select unevaluable, where for interval-ness
-    ///   only the arms matter;
-    /// * `Flr` FOLLOWS ITS OPERAND. `is_interval` calls it exact because
-    ///   the lane survives only where the floor is unique, i.e. it assumes
-    ///   the very obligation. Here `Flr` is a PARTIAL operator: a singleton
-    ///   only on pain of error, and that error is the operator's own
-    ///   (`trace::error`), not a type fact. Reading
-    ///   the shortcut into this pass is what made me fold `Known(Flr(..))`
-    ///   away unsoundly on 2026-09-26.
-    ///
-    /// Every `Op` is listed on purpose - no catch-all. `reads_interval_cmp`
-    /// has a `_ => false` arm, which silently calls `TileFlagAt` over
-    /// interval coordinates decidable; harmless for a diagnostic, unsound
-    /// the moment it decides whether to fork.
+    /// Every `Op` is listed on purpose - no catch-all.
     pub fn abstractness(&self, n: NodeId) -> bool {
         fn go(g: &Graph, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(b) = memo.get(&n) {
@@ -781,15 +639,12 @@ impl Symbolic {
         matches!(self.graph.get(n).op, Op::UnknownNum)
     }
 
-    /// `n` as `Sel(c, t, f)` where an arm HOLDS the unknown number - is it, or
-    /// is such a select (a countdown a branch set on some lanes and left
-    /// unknown on the others: `if delay <= 0 then delay = 60 end`). An
-    /// operation on one is distributed over its arms (`arith`, `fun1`, `fun2`,
-    /// `compare`), so the unknown stays unknown per arm and never becomes an
-    /// operand of graph arithmetic - which no kernel can compute
-    /// (`Op::UnknownNum`). EXACT: `op(Sel(c, t, f))` and `Sel(c, op(t),
-    /// op(f))` agree for every value of `c`, and where a lane holds `c`
-    /// undecided both selects own the same error (`trace::error`).
+    /// `n` as `Sel(c, t, f)` where an arm HOLDS the unknown number (a
+    /// countdown reset on some lanes: `if delay <= 0 then delay = 60 end`).
+    /// Operations on one are distributed over its arms, so the unknown never
+    /// becomes an operand of graph arithmetic, which no kernel can compute.
+    /// EXACT: `op(Sel(c, t, f)) = Sel(c, op(t), op(f))` for every `c`, and
+    /// both own the same error where `c` is undecided.
     fn unknown_select(&self, n: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
         fn holds(g: &Graph, n: NodeId) -> bool {
             let node = g.get(n);
@@ -803,11 +658,9 @@ impl Symbolic {
         (node.op == Op::Sel && holds(&self.graph, n)).then(|| (node.args[0], node.args[1], node.args[2]))
     }
 
-    /// A fresh undecided atom (`Op::UnknownBool`), distinct from every other
-    /// this frame.
     /// Is anything unknown in the set being traced (the fly fruit, the
-    /// platforms)? The literal folding, the independent joins and the literal
-    /// splits switch on with it.
+    /// platforms)? Switches on the literal folding, the independent joins and
+    /// the literal splits.
     pub fn unknowns(&self) -> bool {
         self.fruit_unknown || self.platforms_unknown
     }
@@ -853,24 +706,11 @@ impl Symbolic {
     /// no interval reaches is decided per lane, `(n, not n)`; connectives
     /// combine; anything else may answer either way.
     /// Judged by `lane_undecidable`, THE SAME PREDICATE THAT DECIDES WHAT TO
-    /// FORK. It has to be: this computes a fork's validity, so if the two
-    /// disagreed about which conditions a lane can hold both ways, a fork's
-    /// answers would be described by a rule other than the one that created
-    /// it. The old `reads_interval_cmp` says `Gt(Flr(interval), 0)` is
-    /// undecidable, where a lane decides it (`zi_flr_ok`) - so it would build
-    /// endpoint comparisons for a condition whose answers are exactly `n` and
-    /// `not n`.
+    /// FORK: this computes a fork's validity, so the two must agree on which
+    /// conditions a lane can hold both ways.
     pub fn may_answers(&mut self, n: NodeId) -> (NodeId, NodeId) {
-        // MEMOISED, like every other pass here, because it is a pure function
-        // of the graph - and because without it this was 99.96% of
-        // `fork_undecided_selects` and half of room (6,0)'s lattice walk.
-        //
-        // The recursion below descends `And`/`Or`/`Not`, and the graph is a
-        // DAG, so an unmemoised walk recomputes every shared subtree once per
-        // path that reaches it - and each recomputation re-runs
-        // `lane_undecidable`, which walks cones of its own. Measured before
-        // this: 14.7 s in one trace for 91 conditions, ~160 ms each, against
-        // 0.6 s for the whole ascending rebuild beside it.
+        // Memoised: the recursion descends a DAG, and unmemoised it re-walks
+        // every shared subtree per path.
         if let Some(hit) = self.may_memo.borrow().get(&n) {
             return *hit;
         }
@@ -902,12 +742,10 @@ impl Symbolic {
                 (self.graph.fold(t, vec![ta, tb]), self.graph.fold(f, vec![fa, fb]))
             }
             // `a == b` can hold iff the two ranges meet, and fail iff they are
-            // not the same single number: `lo(a) < hi(b)` or `hi(a) > lo(b)`
-            // picks two different values (else `lo(a) >= hi(b) >= lo(b) >=
-            // hi(a) >= lo(a)`, all equal). A near level's floor `state == k`
-            // on `[0, 2]` goes both ways, on an exact state one. Only where no
-            // unknown atom exists (`unknowns`): then an operand a lane can hold
-            // both ways is an interval NUMBER, and `Lo`/`Hi` are its ends.
+            // not the same single number (`lo(a) < hi(b)` or `hi(a) > lo(b)`;
+            // else all four ends are equal). Only without unknown atoms
+            // (`unknowns`): then an undecided operand is an interval NUMBER
+            // and `Lo`/`Hi` are its ends.
             Op::Eq if !self.unknowns() => {
                 let (alo, ahi) = (self.graph.fold(Op::Lo, vec![args[0]]), self.graph.fold(Op::Hi, vec![args[0]]));
                 let (blo, bhi) = (self.graph.fold(Op::Lo, vec![args[1]]), self.graph.fold(Op::Hi, vec![args[1]]));
@@ -932,12 +770,10 @@ impl Symbolic {
 
     /// `a - r` where `a` is `r + c` (either operand order): `c`, EXACTLY - the
     /// identity holds in 16.16 wrapping arithmetic - and `r - r` is 0. Also
-    /// under the arms of a select `a`, where an arm cancels (a platform's carry
-    /// `x - last`, with `last` its own input `x` and the wrap's select between,
-    /// plans/platforms-unknown.md). In the tracer's arithmetic, not
-    /// `Graph::fold`: over ranges `(r + c) - r` evaluates wider than `c`, and
-    /// `fold` must agree with the evaluator exactly. `None` where nothing
-    /// cancels.
+    /// under the arms of a select `a` (a platform's carry `x - last`). In the
+    /// tracer's arithmetic, not `Graph::fold`: over ranges `(r + c) - r`
+    /// evaluates wider than `c`, and `fold` must agree with the evaluator
+    /// exactly. `None` where nothing cancels.
     fn cancel_sub(&mut self, a: NodeId, r: NodeId) -> Result<Option<NodeId>> {
         if a == r {
             return Ok(Some(self.konst(P8::from_raw(0))));
@@ -972,15 +808,9 @@ impl Symbolic {
     /// the buttons (`unknown_bool`), the held trails
     /// (`widen::fork_held_inputs`) and the escaped atoms (`escaped_atom`).
     ///
-    /// An `Ints` fork over a CONSTANT, so it goes through `fork` like the
-    /// rest; `Partition::Ints { memo: false }` because two such booleans are
-    /// independent and must not share one choice even though the operand node
-    /// is the same for both (see `Partition`). The validity is dropped rather
-    /// than ignored: every configuration applies to every lane.
-    ///
-    /// The constant is `[0, 1]`: exactly TWO integers, so the derived
-    /// coverage premise `SplitOk(2)` folds true and the fragments to `0` and
-    /// `1`.
+    /// An unmemoized `Ints` fork of the constant `[0, 1]` (independent
+    /// booleans must not share a choice): exactly two integers, so
+    /// `SplitOk(2)` folds true and the fragments to `0` and `1`.
     pub fn both_values(&mut self, origin: &str) -> NodeId {
         let choices = self.graph.leaf(Op::Const(0, 1 << 16));
         let f = self.fork(&choices, Partition::Ints { ways: 2, memo: false }, origin);
@@ -996,27 +826,15 @@ impl Symbolic {
 
     /// THE fork: partition `v`'s set, mint a choice dimension for the pieces,
     /// and hand back the piece this configuration takes plus which lanes fall
-    /// in it (plans/graph-model.md section 3 - "forking is one operation").
+    /// in it. Every fork in a trace comes through here: its id, arity, origin
+    /// (for the kernel dump) and whether it shares an earlier fork's choice.
     ///
-    /// Every fork in a trace comes through here, so the bookkeeping that used
-    /// to be copied into four functions is stated once: the fork id, its
-    /// arity, its origin (for the kernel dump), and whether the choice is
-    /// shared with an earlier fork of the same value.
-    ///
-    /// What differs between partitions is only how a configuration index
-    /// becomes a value, which is the `Partition` - and on the graph, which op
-    /// family carries it. Those ops must stay distinct: `Graph::specialize`
-    /// resolves `Split` to `Frag` and `SplitInt` to `IntFrag`, so they are two
-    /// different computations, not two spellings of one.
+    /// The `Partition`'s op families must stay distinct: `Graph::specialize`
+    /// resolves `Split` to `Frag` and `SplitInt` to `IntFrag`.
     fn fork(&mut self, v: &NodeId, p: Partition, origin: &str) -> Fork {
         let kind = p.kind();
-        // Already forked this exact value this frame? Reuse the choice.
-        //
-        // Hash-consing is what makes this sound and also what makes it FIRE:
-        // two `move` calls on values that are structurally the same
-        // expression are the same node id. Forking one value twice yields the
-        // same fragments, so the second choice is determined by the first and
-        // every configuration where they disagree is empty.
+        // Already forked this value this frame (hash-consing makes equal
+        // expressions one node)? Reuse the choice.
         if p.memoized() {
             if let Some(hit) = self.fork_memo.get(&(*v, kind)) {
                 let (d, out) = *hit;
@@ -1046,15 +864,15 @@ impl Symbolic {
     }
 
     /// THE unknown boolean an output widening writes (held trails, the fly
-    /// fruit's `fly`, the fall floors' `collideable`): one hash-consed node, so
-    /// every body writing it writes the same thing, and `verify::out_fields`
-    /// stores it as the uniform `AV::UBool` rather than as a root. Nothing in
-    /// the frame reads an output, so sharing it between fields correlates
-    /// nothing; inputs and comparisons take fresh atoms (`unknown_bool_atom`).
+    /// fruit's `fly`, the fall floors' `collideable`): one hash-consed node,
+    /// stored as the uniform `AV::UBool` (`verify::out_fields`). Nothing in
+    /// the frame reads an output, so sharing it correlates nothing; inputs
+    /// and comparisons take fresh atoms (`unknown_bool_atom`).
     pub fn unknown_bool_output(&mut self) -> NodeId {
         self.graph.leaf(Op::UnknownBool(u32::MAX))
     }
 
+    /// Is `b` the shared output unknown (`unknown_bool_output`)?
     pub fn is_unknown_output(&self, b: NodeId) -> bool {
         matches!(self.graph.get(b).op, Op::UnknownBool(u32::MAX))
     }
@@ -1119,10 +937,8 @@ impl Symbolic {
     }
 
     /// `op` over LITERAL operands, at least one an interval, in the graph's
-    /// own interval semantics (`Graph::eval` on the literals: one definition,
-    /// not a second): the value, or `None` where eval does not model it (a
-    /// wrap at the 16.16 extremes, a non-positive scale). A fruit-unknown set
-    /// only.
+    /// own interval semantics (`Graph::eval`, one definition): the value, or
+    /// `None` where eval does not model it. Only where `unknowns()`.
     fn eval_literal(&self, op: &Op, args: &[NodeId]) -> Option<crate::transpile::graph::Val> {
         if !self.unknowns() {
             return None;
@@ -1177,9 +993,8 @@ impl Domain for Symbolic {
         self.graph.leaf(Op::ConstBool(b))
     }
     fn arith(&mut self, op: Arith, a: &NodeId, b: &NodeId) -> Result<NodeId> {
-        // Fold where both sides are known, so that everything the heap
-        // depends on - indices, counts, loop bounds - stays concrete
-        // without the interpreter having to ask.
+        // Fold where both sides are known, so what the heap depends on
+        // (indices, counts, loop bounds) stays concrete.
         if let (Some(x), Some(y)) = (self.as_p8(*a), self.as_p8(*b)) {
             let mut c = Concrete;
             return Ok(self.konst(c.arith(op, &x, &y)?));
@@ -1229,11 +1044,9 @@ impl Domain for Symbolic {
             let (x, y) = (self.fun1(f, &t)?, self.fun1(f, &e)?);
             return Ok(self.sel_num(&c, &x, &y));
         }
-        // `sin` of an interval is its full range [-1, 1], matching the
-        // interpreter's `builtin_sin` (game_runner.rs) exactly. Emit the
-        // constant range so the emitter never has to lower a `Sin` over a
-        // ZI (it cannot). This is the fruit bob's `sin((1+off)/40)` once
-        // the boundary has widened `off` - see plans/specialize.md.
+        // `sin` of an interval is its full range [-1, 1], so the emitter
+        // never lowers a `Sin` over a ZI (it cannot): the fruit bob's
+        // `sin((1+off)/40)` with `off` widened.
         if matches!(f, Fun1::Sin) && self.is_interval(a) {
             let lo = self.konst(P8::from_i16(-1));
             let hi = self.konst(P8::from_i16(1));
@@ -1307,9 +1120,8 @@ impl Domain for Symbolic {
             Some(crate::transpile::graph::Val::Bool(None)) => return Ok(self.unknown_bool_atom()),
             _ => {}
         }
-        // Decided by the static ranges (the bucket dispatch): a branch
-        // the specialized body never takes is never traced. Decided iff
-        // every pair of pieces decides it the same way.
+        // Decided by the static ranges iff every pair of pieces decides it
+        // the same way; the branch not taken is never traced.
         if !self.ranges.is_empty() {
             if let (Some(xs), Some(ys)) = (self.range_of(*a), self.range_of(*b)) {
                 let one = |x: (i64, i64), y: (i64, i64)| -> Option<bool> {
@@ -1397,20 +1209,11 @@ impl Domain for Symbolic {
     }
     /// Is this value an interval?
     ///
-    /// NOT a cone query. "An interval input is reachable" is the wrong
-    /// question and it was the first thing I wrote: `dash_effect_time`
-    /// is a `Sel` whose CONDITION compares a position derived from
-    /// `rem`, so an interval reaches it - but its arms are numbers and so
-    /// is the result. Typing it as an interval made the kernel write an
-    /// `AV::Ival` into a column the boundary then refused, at
-    /// `player dash_effect_time is not a number`.
-    ///
-    /// So this is a proper type rule, and deliberately the same one
-    /// `transpile::lower`'s `Repr::wide` applies - a select is an
-    /// interval when an ARM is, `flr` never is (it is exact by guard),
-    /// and a cart lookup never is. The two are checked against each
-    /// other by construction: disagree, and lowering fails with "output
-    /// cell wants a ZN but the graph computes a ZI".
+    /// A type rule, not a cone query (`dash_effect_time` is a `Sel` whose
+    /// condition reads `rem`, but whose arms are numbers). The same rule as
+    /// `transpile::lower`'s `Repr::wide`: a select is an interval when an ARM
+    /// is, `flr` and cart lookups never are. A disagreement fails lowering
+    /// ("output cell wants a ZN but the graph computes a ZI").
     fn is_interval(&self, v: &NodeId) -> bool {
         fn go(g: &Graph, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(b) = memo.get(&n) {
@@ -1427,14 +1230,8 @@ impl Domain for Symbolic {
                 Op::Split(_) => true,
                 // An exact whole number per configuration.
                 Op::SplitInt(_) | Op::Lo | Op::Hi => false,
-                // Unconditionally, like a non-degenerate `Const`: a
-                // span exists precisely because its two bounds are
-                // different nodes. (`fold` collapses a span of two
-                // literals to a `Const`, so the degenerate case is
-                // already gone by the time anything asks.) The literal
-                // interval and the computed one are the same kind of
-                // value, and this is the sibling of `Op::Const(lo, hi)
-                // if lo != hi` above.
+                // A span's bounds are different nodes (`fold` collapses a
+                // span of two literals to a `Const`).
                 Op::Span => true,
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs
                 | Op::Min | Op::Max => any(memo, a),
@@ -1443,20 +1240,15 @@ impl Domain for Symbolic {
                 // Exact where the lane survives: a floor that is not unique
                 // is the operator's own error (`trace::error`).
                 Op::Flr => false,
-                // The walk replaces `sin` of an inexact input with its
-                // RANGE as a constant, so this follows its operand.
+                // `fun1` replaces `sin` of an interval with its range.
                 Op::Sin => any(memo, a),
                 _ => false,
             };
             memo.insert(n, r);
             r
         }
-        // NO early-out on an empty `ival_cells`. A value can be an
-        // interval without any interval INPUT reaching it: the widening
-        // writes `Op::Const(lo, hi)` with `lo != hi`, a literal
-        // interval. Returning false for those typed a widened `rem` as
-        // a `ZN` and the lowering refused it - "output cell 278 wants a
-        // ZN but the graph computes a (P8, P8)".
+        // NO early-out on an empty `ival_cells`: a widening writes literal
+        // intervals (`Op::Const(lo, hi)`, `lo != hi`).
         go(&self.graph, &self.ival_cells, &mut self.ival_memo.borrow_mut(), *v)
     }
 
@@ -1471,19 +1263,12 @@ impl Domain for Symbolic {
         if self.ranges.is_empty() {
             return MOVE_WAYS;
         }
-        // At most `move_ways`: the static range is over ALL lanes, and one
-        // lane's interval spans at most that many floors. A region kernel's
-        // speed range [-S, S] is 2S + 1 floors wide while each lane's speed is
-        // exact, and taking the range's width made the move forks 13-way
-        // (room (3,0) square (5,13) on an 8 px grid: 1,236 bodies -> 35,502,
-        // 2026-09-18). Too small an arity declines loudly (`SplitOk`).
-        // Level -1 (`uncapped_ways`) needs the full width: its lanes ARE
-        // ranges. And the width of the HULL of the pieces, not of the widest
-        // piece: its evaluator joins a select it cannot decide, so the
-        // operand it sees spans every piece at once. The fake wall's
-        // `hit.spd.x = -sign(hit.spd.x)*1.5` is three pieces two floors wide
-        // each and a hull five wide (room (0,2), 2026-10-01: a 2-way fork,
-        // and every evaluation of it a violation).
+        // At most `MOVE_WAYS`: the static range is over ALL lanes (a region
+        // kernel's speed range is wide while each lane's speed is exact), and
+        // one lane's interval spans at most that many floors. Too small an
+        // arity declines loudly (`SplitOk`). Level -1 (`uncapped_ways`) takes
+        // the HULL of the pieces: its lanes ARE ranges and its evaluator joins
+        // the selects between them.
         match self.range_of(*v) {
             Some(ps) => {
                 let sh = 16;
@@ -1529,10 +1314,8 @@ impl Domain for Symbolic {
         match (self.graph.get(*t).op.clone(), self.graph.get(*f).op.clone()) {
             (Op::Const(a0, a1), Op::Const(b0, b1)) => Some(self.graph.leaf(Op::Const(a0.min(b0), a1.max(b1)))),
             // The SAME value plus a literal on each side (a platform's `x0` and
-            // `x0 + 1` from its move's two fragments, plans/platforms-unknown.md):
-            // that value plus the literals' hull. A lane holds one of the two,
-            // both lie in it, and the value stays itself - so what reads it
-            // later still knows it (`x - last` cancels, `Symbolic::cancel_sub`).
+            // `x0 + 1`): that value plus the literals' hull, so later reads
+            // still know the value (`x - last` cancels, `cancel_sub`).
             _ => {
                 let (tb, tk) = self.base_plus_literal(*t);
                 let (fb, fk) = self.base_plus_literal(*f);
@@ -1549,8 +1332,7 @@ impl Domain for Symbolic {
         if !self.unknowns() || self.decide(c).is_some() {
             return false;
         }
-        // Post-order, every node walked memoized (`lane_independent`'s walk):
-        // the conditions a frame merges on share most of their cones.
+        // Post-order and memoized: a frame's conditions share their cones.
         let mut stack: Vec<(NodeId, bool)> = vec![(*c, false)];
         while let Some((x, expanded)) = stack.pop() {
             if self.atom_memo.contains_key(&x) {
@@ -1581,19 +1363,14 @@ impl Domain for Symbolic {
         if t == f {
             return Some(*t);
         }
-        // Arms every lane holds alike (literals, other atoms - a fall floor's
-        // `collideable` writes under its undecided `state`): a fresh atom,
-        // which escapes the call as a fork (`escaped_atom`).
+        // Arms every lane holds alike: a fresh atom, which escapes the call as
+        // a fork (`escaped_atom`).
         if self.lane_independent(*t) && self.lane_independent(*f) {
             return Some(self.unknown_bool_atom());
         }
-        // An arm that reads lane data - `collide`'s `other.collideable and
-        // <overlap>` joined on the floor's atom - is joined EXACTLY, in
-        // three-valued logic the kernels evaluate per lane (`zb_and`,
-        // `zb_or`): `(c and t) or (not c and f)`. A fresh atom here threw the
-        // lane's own overlap away, so every collision with an undecided floor
-        // read "maybe" wherever the floor was not folded out of the region -
-        // on the ground, or a wall, with nothing there (room (7,0), 2026-10-01).
+        // An arm that reads lane data is joined EXACTLY in three-valued logic
+        // (`zb_and`, `zb_or`): `(c and t) or (not c and f)`. A fresh atom
+        // would throw the lane's own data (e.g. its overlap test) away.
         let ct = self.and(c, t);
         let nc = self.not(c);
         let cf = self.and(&nc, f);
@@ -1613,15 +1390,10 @@ impl Domain for Symbolic {
     }
 
     fn escaped_atom(&mut self, b: &NodeId, since: u32, origin: &dyn Fn(&Self) -> String) -> Option<NodeId> {
-        // Only where the set has unknowns (`unknowns`: the floors, the fruit,
-        // the platforms unknown). A timers or near level's atoms are its
-        // countdowns' `delay <= 0` (`widen::widen_floor_timers`): there a
-        // boolean holding one stays three-valued, decided per lane where it
-        // is read - as the interval countdown's comparison was before
-        // 2026-10-03 - and is not a fork. Forked, every shaking floor's
-        // `collideable` was a configuration dimension whether anything read
-        // it or not: room (1,1) `r0sxhn` 10 forks a kernel became 14, the
-        // bodies 12k -> 29k, 1.7x the forward's time, for the same states.
+        // Only where the set has unknowns (`unknowns`). A near level's atoms
+        // are its countdowns' `delay <= 0`: a boolean holding one stays
+        // three-valued, decided per lane where read, not a fork (forking it
+        // adds a configuration dimension whether anything reads it or not).
         if !self.unknowns() {
             return None;
         }
@@ -1638,14 +1410,11 @@ impl Domain for Symbolic {
         }
         let name = origin(self);
         let g = self.both_values(&name);
-        // A bare atom is both values everywhere. Anything else - an atom
-        // joined with lane data (a floor's `collideable` under its unknown
-        // `state`, with the comeback's `not check(player,0,0)`) - is the fork
-        // RESTRICTED per lane to the values `b` can take: may-true and
-        // may-false by substituting every assignment of its atoms. A lane
-        // whose value is decided keeps it; every later read sees one value
-        // per configuration, which three-valued reads of the atom did not
-        // (room (7,0): "solid" for one test and "absent" for the next).
+        // A bare atom is both values everywhere. An atom joined with lane data
+        // is the fork RESTRICTED per lane to the values `b` can take (may-true
+        // and may-false over every assignment of its atoms): a decided lane
+        // keeps its value, and every later read sees one value per
+        // configuration (three-valued reads could disagree between tests).
         let out = if atoms.len() == 1 && atoms[0] == *b {
             g
         } else if atoms.len() > ESCAPE_ATOMS {
@@ -1714,9 +1483,7 @@ impl Domain for Symbolic {
     }
 
     fn describe(&self, v: &NodeId) -> String {
-        // One level of operands as well as the op. A bare `Sel/3` says
-        // "a select" and leaves open the thing that decides whether a
-        // refusal is easy to lift - whether its ARMS are constants.
+        // One level of operands too: whether a select's arms are constants.
         let n = self.graph.get(*v);
         let args: Vec<String> = n
             .args
@@ -1727,13 +1494,12 @@ impl Domain for Symbolic {
     }
 }
 
-/// A refusal the tracer makes rather than guessing. Kept separate from
-/// ordinary errors because these are the interesting ones: each is a place
-/// the heap would have had to become symbolic.
 /// The arity of the `move` fork (`__split_by_flr`): `rem + spd + 0.5` with an
 /// exact speed and a rem within one grid cell spans at most two floors.
 pub const MOVE_WAYS: u8 = 2;
 
+/// A refusal the tracer makes rather than guessing: a place the heap would
+/// have had to become symbolic.
 pub fn refuse_unknown(what: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "{} is not known at trace time - the heap cannot depend on a symbolic value",
@@ -1752,8 +1518,7 @@ mod tests {
     /// The fake wall's `hit.spd.x = -sign(hit.spd.x)*1.5` before the player's
     /// `move`: `rem + sel(.., -1.5, sel(.., 1.5, 0)) + 0.5`, three pieces two
     /// floors wide each. A kernel lane holds one piece (2-way); level -1's
-    /// evaluator joins the select, so its fork spans the HULL, five floors
-    /// (room (0,2), 2026-10-01: built 2-way, every evaluation a violation).
+    /// evaluator joins the select, so its fork spans the HULL, five floors.
     #[test]
     fn level_minus_one_sizes_a_move_fork_by_the_hull_of_its_pieces() {
         let mut d = Symbolic::default();
@@ -1776,14 +1541,8 @@ mod tests {
         assert_eq!(d.flr_ways(&operand), 5, "level -1 joins the pieces: floors -2..=2");
     }
 
-    /// The FORK TRIGGER's contract, pinned on hand-built graphs.
-    ///
-    /// `lane_undecidable` currently agrees with the `Known` premises it is
-    /// about to replace - measured on room (5,0) exactly, and on room (6,0) up
-    /// to the phantom forks it deliberately drops. That agreement is what
-    /// licenses the substitution, and once `Known` is gone NOTHING ELSE PINS
-    /// IT. So the four rules that took four attempts to get right are asserted
-    /// here rather than left to a diagnostic that will be deleted.
+    /// The FORK TRIGGER's contract, pinned on hand-built graphs: nothing else
+    /// pins these rules.
     #[test]
     fn the_fork_trigger_excludes_what_a_lane_decides_for_itself() {
         let mut d = Symbolic::default();
@@ -1800,16 +1559,13 @@ mod tests {
         let exact_cmp = d.graph.fold(Op::Gt, vec![exact, zero]);
         assert!(!d.lane_undecidable(exact_cmp));
 
-        // `Flr` is lane-decidable BY ASSERTION (`zi_flr_ok`), so a comparison
-        // on the floor of an interval does not fork - the span claim is an
-        // `own_error`, not a fork trigger. Reading this the other way is what
-        // made me fold `Known(Flr(..))` away unsoundly.
+        // `Flr` is lane-decidable BY ASSERTION (`zi_flr_ok`): the span claim
+        // is an `own_error`, not a fork trigger.
         let flr = d.graph.fold(Op::Flr, vec![ival]);
         let flr_cmp = d.graph.fold(Op::Gt, vec![flr, zero]);
         assert!(!d.lane_undecidable(flr_cmp), "Flr is decided per lane by its assertion");
 
-        // `TileFlagAt` is lane-decidable BY INSTRUCTION: one call over number
-        // registers, one answer per lane, however abstract the coordinates.
+        // `TileFlagAt` is lane-decidable BY INSTRUCTION.
         let w = d.graph.leaf(Op::Const(8 << 16, 8 << 16));
         let tile = d.graph.fold(Op::TileFlagAt, vec![ival, ival, w, w, zero]);
         assert!(!d.lane_undecidable(tile), "TileFlagAt is decided per lane");
@@ -1817,11 +1573,8 @@ mod tests {
         let not_tile = d.graph.fold(Op::Not, vec![tile]);
         assert!(!d.lane_undecidable(not_tile));
 
-        // THE `Sel` ASYMMETRY, which is easy to "tidy" away wrongly. For a
-        // NUMERIC operand the condition is irrelevant: `Sel(c, 5, 7)` is one of
-        // two exact numbers whatever `c` is, so a comparison on it does not
-        // fork. Counting the condition here over-triggered on 31-33 conditions
-        // a frame in room (6,0).
+        // THE `Sel` ASYMMETRY: for a NUMERIC select the condition is
+        // irrelevant (`Sel(c, 5, 7)` is one of two exact numbers).
         let five = d.graph.leaf(Op::Const(5 << 16, 5 << 16));
         let seven = d.graph.leaf(Op::Const(7 << 16, 7 << 16));
         let num_sel = d.graph.fold(Op::Sel, vec![cmp, five, seven]);
@@ -1838,9 +1591,6 @@ mod tests {
         assert!(d.lane_undecidable(bool_sel), "a boolean select straddles with its condition");
     }
 
-    /// `abstractness` and `lane_undecidable` answer DIFFERENT questions, and
-    /// conflating them cost a day. A value can denote a set and still be one
-    /// computed quantity per lane.
     /// A countdown set on some lanes and unknown on the others (`if delay <= 0
     /// then delay = 60 end`): `delay - 1` and `delay - 1 <= 0` are distributed
     /// over the select, so the unknown number never becomes an operand of
@@ -1862,6 +1612,8 @@ mod tests {
         assert!(crate::trace::verify::cone(&d.graph, &[done]).iter().any(|n| matches!(d.graph.get(*n).op, Op::UnknownBool(_))), "the unknown lanes: an atom");
     }
 
+    /// `abstractness` and `lane_undecidable` answer DIFFERENT questions: a
+    /// value can denote a set and still be one quantity per lane.
     #[test]
     fn abstractness_is_not_the_fork_trigger() {
         let mut d = Symbolic::default();
@@ -1877,11 +1629,9 @@ mod tests {
     }
 
     /// `x == k` on an interval `x` (a near level's floor `state` on `[0, 2]`,
-    /// `widen::widen_near_floors`) can come out true on a lane exactly where
-    /// `k` is in `x`, and false where `x` is not the single number `k`: the
-    /// split's guards (`verify::split_undecided_selects`). One lane's value
-    /// as a literal (the evaluator reads a cell as the hull over lanes):
-    /// `[0, 2]`, `[1, 1]` and `[0, 0]` against `k = 1`.
+    /// `widen::widen_near_floors`) may be true where `k` is in `x`, and false
+    /// where `x` is not the single number `k`. `[0, 2]`, `[1, 1]` and `[0, 0]`
+    /// against `k = 1`.
     #[test]
     fn an_equality_on_an_interval_may_answer_as_its_ends_allow() {
         use crate::transpile::graph::Val;

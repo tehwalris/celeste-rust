@@ -1,10 +1,5 @@
-//! Assemble a GAS `.s` string with `gcc` and load it with `dlopen`.
-//!
-//! The prototype backend emits native AVX-512 text (see `codegen`); this
-//! turns that text into a callable function. `as` assembles AVX-512
-//! natively (a JIT crate would have to hand-encode EVEX), and `objdump`
-//! on the `.so` gives the instruction mix for free. See
-//! `plans/asm-backend.md` for why this mechanism was chosen.
+//! Assemble a GAS `.s` string with `gcc` and load it with `dlopen`. `as`
+//! assembles AVX-512 natively (a JIT crate would have to hand-encode EVEX).
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
@@ -30,16 +25,13 @@ pub type KernelFn = unsafe extern "C" fn(*const u8, *mut u8, *const std::os::raw
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// This process's scratch directory for the `.s` / `.so` pairs,
-/// `target/asm-scratch/<pid>/`. Inside `target/` so it is ignored and
-/// cleaned by `cargo clean`.
+/// `target/asm-scratch/<pid>/`.
 ///
-/// A loaded `.so` stays on disk while the process runs (a profile of a
-/// live run attributes samples to its path), and the kernel registry lives
-/// until exit, so nothing unlinks them on exit, a kill or an OOM. As flat
-/// files, one pair per kernel per run, they reached 641 GB in 240k files
-/// (2026-09-29). So the first call sweeps: the directory of every pid that
-/// is no longer running is removed, and this pid's own directory (left by
-/// a dead process with the same pid) is emptied.
+/// A loaded `.so` stays on disk while the process runs (profiles attribute
+/// samples to its path), and nothing unlinks it on a kill or an OOM, so the
+/// scratch grows without bound across runs. The first call therefore
+/// removes the directory of every pid no longer running and empties this
+/// pid's own.
 fn scratch_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -69,10 +61,8 @@ fn unique_stem(tag: &str) -> String {
 }
 
 /// Write `asm` to a `.s` file and assemble it into a shared object with
-/// `gcc -shared -fPIC`. Returns the `.so` path. Timed separately from
-/// emission by the benchmarks. The `.s` is removed once it has assembled
-/// (kept on failure, for the error to name): it is the bulk of the
-/// scratch, MBs of text for a big kernel against a `.so` of tens of KB.
+/// `gcc -shared -fPIC`. Returns the `.so` path. The `.s` (the bulk of the
+/// scratch) is removed once it has assembled, kept on failure for the error.
 pub fn assemble(asm: &str, tag: &str) -> Result<PathBuf> {
     let dir = scratch_dir();
     let stem = unique_stem(tag);
@@ -104,12 +94,10 @@ pub struct Loaded {
     pub func: KernelFn,
 }
 
-// The `handle` is a dlopen token used only by `dlclose` on drop (single
-// owner), and `func` is a pure, reentrant, stateless kernel - it reads its
-// input buffer and writes its output buffer, with call-outs through the
-// caller-provided `AsmCtx`, and holds no shared mutable state. So a `Loaded`
-// is safe to share and call across threads (the engine dispatches chunks on
-// a worker pool against one shared registry).
+// SAFETY: `handle` is a dlopen token used only by `dlclose` on drop (single
+// owner), and `func` is a pure, reentrant, stateless kernel: it reads its
+// input buffer, writes its output buffer, calls out through the caller's
+// `AsmCtx`, and holds no shared mutable state.
 unsafe impl Send for Loaded {}
 unsafe impl Sync for Loaded {}
 

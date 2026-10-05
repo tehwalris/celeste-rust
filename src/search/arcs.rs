@@ -1,17 +1,14 @@
-//! Sets of sub-pixel remainders as ARCS (plans: the rotation graph,
-//! 2026-10-04). A frame moves a remainder by `rem := (rem + v) mod 1` into
-//! [-1/2, 1/2) - a ROTATION of the circle - and which side of the wrap the
-//! rotated value lands on decides the pixel step. So a set of remainders
-//! that a set of histories can hold is a union of arcs, a frame along one
-//! edge maps it by "intersect with the edge's guard arc, then rotate" (or,
-//! on a collision, to a point), and that map distributes over unions:
-//! pushing sets through a graph tests every path at once.
+//! Sets of sub-pixel remainders as ARCS (the rotation graph). A frame moves
+//! a remainder by `rem := (rem + v) mod 1` into [-1/2, 1/2), a ROTATION of
+//! the circle, and the side of the wrap it lands on decides the pixel step.
+//! Along an edge a set maps by "intersect with the guard arc, then rotate"
+//! (or, on a collision, to a point), which distributes over unions: pushing
+//! sets through a graph tests every path at once.
 //!
 //! Coordinates: a remainder `r` (raw 16.16, in [-32768, 32767]) is the
 //! point `r + 32768` of `0..CIRCLE`. A set is sorted, disjoint, non-adjacent
-//! half-open segments `[lo, hi)` of `0..CIRCLE` (an arc across the wrap is
-//! two segments). Two axes: unions of rectangles (`Rects`), each a pair of
-//! segments.
+//! half-open segments (an arc across the wrap is two). Two axes: `Rects`
+//! (unions of rectangles) and the canonical `Region`.
 
 /// Points on the circle: 1 px in raw 16.16 units.
 pub const CIRCLE: u32 = 1 << 16;
@@ -151,8 +148,7 @@ impl Action {
 }
 
 /// One axis of an edge: the remainders that take it (one piece of the
-/// circle: a guard never wraps - the pieces are cut at the wrap) and what it
-/// does to them.
+/// circle, never wrapping) and what it does to them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Transfer {
     pub guard: Seg,
@@ -236,10 +232,9 @@ struct Slab {
     end: u32,
 }
 
-/// A set of the torus in CANONICAL form: y slabs, sorted and disjoint, each
-/// with a non-empty x set (sorted, disjoint, non-touching segments), two
-/// touching slabs never with the same x set. Equal sets are equal values, so
-/// a union of many contributions costs one sweep, not a pairwise merge.
+/// A set of the torus in CANONICAL form: sorted disjoint y slabs, each with
+/// a non-empty x set, touching slabs never with the same x set. Equal sets
+/// are equal values; a union of many contributions is one sweep.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Region {
     slabs: Vec<Slab>,
@@ -417,8 +412,7 @@ mod tests {
     }
 
     /// The canonical sweep against the plain union of pieces, and `pull`
-    /// against the point-wise definition of the preimage, on a coarse grid
-    /// (every boundary and its neighbours are probe points).
+    /// against the point-wise preimage, probed at every boundary.
     #[test]
     fn a_region_is_the_union_and_pull_is_the_preimage() {
         let mut s = 7u64;

@@ -1,23 +1,14 @@
-//! Naming a block's cells by PATH, and building a block from a shape.
+//! Naming a block's cells by PATH (`objects[0].spd.x`), and building a
+//! block from a shape.
 //!
-//! A kernel generated from a TRACED frame declares the slots it reads
-//! and writes by the path they have in the game's heap
-//! (`objects[0].spd.x`), not by a canonical cell id. The id a slot has
-//! depends on the whole block's shape, so binding by id means the kernel
-//! and the block have to have been numbered by the same walk; binding by
-//! path means the kernel is handed a block and finds out.
-//!
-//! This lives in the engine rather than in the tracer because the
-//! GENERATED code calls it, and generated kernels sit below the tracer.
+//! A cell's id depends on the whole block's shape, so a traced slot is
+//! bound by its heap path and resolved against the block it is handed.
 //! `trace::bind::resolve` delegates here, so there is one walk.
 //!
-//! ## The one thing to get right
-//!
-//! A pointer is a cell of its own. A global holding a table is a
-//! `Cell2::Val` whose column is `AV::Ptr(t)`, and `t` is the `Obj`. So
-//! walking a path dereferences BETWEEN steps but not at the end: the
-//! last step lands on the `Val` cell that holds the scalar, which is the
-//! cell a kernel reads and writes.
+//! A pointer is a cell of its own: a global holding a table is a
+//! `Cell2::Val` whose column is `AV::Ptr(t)`, and `t` is the `Obj`. So a
+//! walk dereferences BETWEEN steps but not at the end: the last step lands
+//! on the `Val` cell holding the scalar, the cell a kernel reads and writes.
 
 use crate::runtime2::{Cell2, Col, Rt2, AV, NONE};
 
@@ -28,32 +19,22 @@ pub enum PathStep {
     Key(String),
     /// A slot of the ARRAY part, zero-based.
     Idx(usize),
-    /// An integer key, by its LUA key (1-based), rather than by array
-    /// position.
-    ///
-    /// Written `[#n]`. Both this and `Idx` land in the array part - the
-    /// interpreter materialises `t[3] = v` on an empty table as a dense
-    /// array with explicit nils, and `trace::refbridge` and
-    /// `trace::bind` both follow it - so the difference is only which
-    /// numbering the path text uses. `[#3]` and `[2]` name the same
-    /// cell.
+    /// An integer key by its Lua key (1-based), written `[#n]`. Integer
+    /// keys live in the array part (`t[3] = v` on an empty table is a dense
+    /// array with explicit nils), so `[#3]` and `[2]` name the same cell.
     Int(i16),
 }
 
 /// Follow a cell holding a pointer to the cell it points at. A cell that
 /// is already a table is returned unchanged, so this is idempotent.
-///
-/// Public because "did this path land ON the slot or on the table the
-/// slot points at" is a real question for anything comparing a resolved
-/// id against a recorded one - the global `objects` and the array it
-/// points at both answer to the name `objects`.
+/// (The global `objects` and the array it points at both answer to the
+/// name `objects`; callers comparing ids need to pick one.)
 pub fn deref(rt2: &Rt2, cell: u32) -> Result<u32, String> {
     match (&rt2.structure[cell as usize], &rt2.cols[cell as usize]) {
         (Cell2::Val, Col::U(AV::Ptr(t))) => Ok(*t),
         (Cell2::Val, Col::V(vs)) => {
-            // Pointer topology is lane-uniform in a block by
-            // construction, so a per-lane column of pointers is either
-            // all one target or a broken premise. Say which.
+            // Pointer topology is lane-uniform in a block, so a per-lane
+            // pointer column must have one target.
             let mut it = vs.iter().filter_map(|v| match v {
                 AV::Ptr(t) => Some(*t),
                 _ => None,
@@ -106,11 +87,7 @@ pub fn resolve_steps(rt2: &Rt2, p: &[PathStep]) -> Result<u32, String> {
                     (Cell2::Arr(items), PathStep::Idx(i)) => *items
                         .get(*i)
                         .ok_or_else(|| format!("[{}]: past the end of a {}-item array", i, items.len()))?,
-                    // A Lua integer key is array slot k-1. This arm was
-                    // missing for as long as an integer key outside the
-                    // array part could not be represented at all; both
-                    // importers flatten now, so the only thing left of
-                    // the distinction is the 1-based numbering.
+                    // A Lua integer key is array slot k-1.
                     (Cell2::Arr(items), PathStep::Int(k)) => {
                         if *k < 1 {
                             return Err(format!("[#{}]: not a Lua array key", k));
@@ -142,14 +119,9 @@ fn kind(c: &Cell2) -> &'static str {
 
 /// A fresh block with the same SHAPE as `src` and a new width.
 ///
-/// Structure, globals and pointer columns are what a shape determines,
-/// so they carry over; every other value cell starts `AV::Nil`. Used to
-/// make an input block to run a kernel against, and to make an output
-/// block from an outcome the tracer recorded.
-///
-/// `Rt2` is deliberately not `Clone` - a block is big and copying one is
-/// usually a mistake - and this is not a clone: the values are dropped
-/// on purpose.
+/// Structure, globals and pointer columns (what a shape determines) carry
+/// over; every other value cell starts `AV::Nil`. Not a clone: `Rt2` is
+/// deliberately not `Clone`, and the values are dropped on purpose.
 pub fn reshape(src: &Rt2, width: usize) -> Rt2 {
     let mut b = Rt2::empty(
         width,

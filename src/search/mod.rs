@@ -1,26 +1,15 @@
-//! The abstract forward search, and the checks that keep it honest.
+//! The search around the frame step (`frame::forward_frame`):
 //!
-//! One frame of the search is `compiled::FrameEngine::run_bucket` - one
-//! shape's block through its assembled kernel. This module is everything
-//! around that:
-//!
-//!   * `checkpoint`    - the frame checkpoint files: one per (frame, shape),
-//!                       rows sorted by (cell, key) with a cell index, raw
-//!                       fixed-width columns loadable by cell range
-//!   * `pos_graph`     - the position-transition graph, the backward pass's
-//!                       predecessor filter (`plans/strategy.md`)
-//!   * `ui_export`     - `rewrite export-ui`: a finished run's tree + log
-//!                       -> the static data the web UI (`ui/`) renders
-//!   * `arcs`          - sets of remainders as arcs of the circle (a frame
-//!                       rotates them), for the rotation graph
-//!   * `arc_dp`        - the rotation graph's winning sets (backward) and
-//!                       exact forward (plans/arcs.md)
-//!   * `inspect`       - a row read by its named fields, for the diagnostics
-//!   * `arc_edges`     - per recorded edge, what the frame did to the
-//!                       player's remainder (the transfer)
-//!
-//! The forward driver itself is `frame::forward_run` (src/frame.rs), on a
-//! `compiled::FrameEngine`.
+//!   * `checkpoint` - frame checkpoint files: one per (frame, shape piece),
+//!                    raw fixed-width columns with a per-cell run index
+//!   * `door`       - the forward's dedup set of every reached state
+//!   * `edges`      - the recorded backward graph and the remainder-free BFS
+//!   * `arc_edges`  - per recorded edge, the remainder transfer
+//!   * `arcs`       - sets of remainders as arcs of the circle
+//!   * `arc_dp`     - THE SEARCH: winning sets, optimum, concrete search
+//!   * `pos_graph`  - player-position cells and the position graph
+//!   * `inspect`    - rows read by named fields, for the diagnostics
+//!   * `ui_export`  - `rewrite export-ui`: a finished run -> the web UI's data
 pub mod arc_dp;
 pub mod arc_edges;
 pub mod arcs;

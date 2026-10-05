@@ -38,19 +38,15 @@ impl CartData {
     }
 
     /// The raw 128x64 map grid (row-major), for hot paths that index it
-    /// directly with their own bounds handling (the lane kernel: `mget`
-    /// through the Result machinery was 13.5% of its profile).
+    /// directly with their own bounds handling.
     pub fn map_grid(&self) -> &[u8] {
         &self.map_data
     }
 
-    /// PICO-8's `mget`: the tile at a whole-number map coordinate, and 0
-    /// outside the 128x64 map (as PICO-8 returns). The cart's own reads stay
-    /// inside (`tile_flag_at` / `spikes_at` clamp to the room), but a
-    /// branch-free kernel evaluates an unrolled loop iteration a lane does not
-    /// take too - `spikes_at`'s second column for a player at x >= 119 reads
-    /// tile column 16 of the room, x = 128 (room (7,0), 2026-09-30). A
-    /// fractional coordinate is refused: the traced cart never makes one.
+    /// PICO-8's `mget`: the tile at a whole-number map coordinate, 0 outside
+    /// the 128x64 map. A branch-free kernel reads outside on loop iterations a
+    /// lane does not take. A fractional coordinate is refused: the traced
+    /// cart never makes one.
     pub fn mget(&self, x: Pico8Num, y: Pico8Num) -> Result<u8> {
         let x = x.as_i16().ok_or_else(|| anyhow!("mget: x is not an integer"))?;
         let y = y.as_i16().ok_or_else(|| anyhow!("mget: y is not an integer"))?;
@@ -73,7 +69,7 @@ impl CartData {
     }
 
     fn as_usize_below(v: Pico8Num, name: &str, high_exclusive: usize) -> Result<usize> {
-        // Use ok_or_else for lazy error message construction (significant perf win!)
+        // `ok_or_else`: the error message is built lazily (hot path).
         let v = v.as_i16().ok_or_else(|| anyhow!("{} is not an integer", name))?;
         if v >= 0 && (v as usize) < high_exclusive {
             Ok(v as usize)
@@ -87,13 +83,9 @@ impl CartData {
 mod tests {
     use super::*;
 
-    /// Every level room (31 of them: (0,0)..(7,3) but the summit's (7,3)) has
-    /// exactly ONE player spawn tile. Map rows 32-63 share memory with the
-    /// lower sprite sheet and are written in a cart's `__gfx__` with each
-    /// byte's nibbles swapped; `map-data.txt` held them unswapped until
-    /// 2026-10-01, which gave the rooms of rows 2 and 3 two to seven spawns
-    /// each (and garbage everywhere else in them) - found when the community
-    /// TAS for room (0,2) never exited.
+    /// Every level room (all but the summit (7,3)) has exactly one player
+    /// spawn tile. Guards the map's lower half: rows 32-63 share memory with
+    /// the sprite sheet and are stored nibble-swapped in `__gfx__`.
     #[test]
     fn every_level_room_has_one_player_spawn() {
         let cart = CartData::load(concat!(env!("CARGO_MANIFEST_DIR"), "/../../cart")).expect("cart");

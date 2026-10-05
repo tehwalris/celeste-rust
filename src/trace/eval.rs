@@ -1,23 +1,11 @@
-//! Evaluating a traced graph at a point, so the trace can be CHECKED.
+//! Evaluating a traced graph at a point, to check the trace against the
+//! concrete interpreter run on the same values.
 //!
-//! The tracer's claim is that the graph it leaves behind computes what
-//! running the program would have computed. That is checkable directly:
-//! substitute concrete values for the input leaves, evaluate, and compare
-//! against the same interpreter run with those same values concrete. This
-//! module is the "evaluate" half.
-//!
-//! It delegates every operation to `domain::Concrete`, on purpose. An
-//! evaluator that reimplemented pico-8 arithmetic would be a THIRD
-//! definition of what the program means, and then the check would be
-//! testing the evaluator as much as the tracer. What is left here is the
-//! `Op` -> `Concrete` mapping, which is one line per op and nothing else.
-//!
-//! ## Why no recursion
-//!
-//! A node's operands are always created before it is, so operand ids are
-//! strictly smaller. One backward pass marks what the root needs and one
-//! forward pass evaluates it, which is linear and cannot blow the stack
-//! on a graph whose depth is a frame's worth of arithmetic.
+//! Every op delegates to `domain::Concrete` on purpose: reimplementing
+//! PICO-8 arithmetic here would be a third definition of the program, and
+//! the check would test the evaluator as much as the tracer. Operand ids are
+//! smaller than their node's, so a backward marking pass and a forward
+//! evaluation pass are linear, with no recursion.
 
 use std::sync::Arc;
 
@@ -70,9 +58,8 @@ pub fn eval(g: &Graph, root: NodeId, env: &Env) -> Result<Conc> {
     val[root as usize].ok_or_else(|| anyhow!("root {} was not evaluated", root))
 }
 
-/// One forward pass. Operands always have smaller ids, so this is linear
-/// and needs no recursion. `strict` decides whether a node that cannot be
-/// evaluated is an error or just a `None` that propagates.
+/// One forward pass. `strict`: a node that cannot be evaluated is an error,
+/// else a `None` that propagates.
 fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<Conc>>> {
     let n = need.len();
     let mut val: Vec<Option<Conc>> = vec![None; n];
@@ -95,12 +82,8 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                 Conc::Num(P8::from_raw(lo))
             }
             Op::ConstBool(b) => Conc::Bool(b),
-            // Concrete: an unknown has no single value to return.
             Op::UnknownNum | Op::UnknownBool(_) => bail!("node {} is an unknown, not a value", id),
-            // This evaluator is CONCRETE - one number per node - so a
-            // span is a value only when it is degenerate, exactly as an
-            // interval literal is. Same refusal, for the same reason:
-            // there is no single number to return.
+            // A span is a value only when degenerate, as an interval literal.
             Op::Span => {
                 let (lo, hi) = (num(a(0)?)?, num(a(1)?)?);
                 if lo != hi {
@@ -155,11 +138,9 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                     a(2)?
                 }
             }
-            // Every leaf was substituted with a value, so everything
-            // reachable IS determined - which is what `Known` asks.
+            // Every leaf was substituted, so everything is determined.
             Op::Known => Conc::Bool(true),
-            // Concrete arithmetic wraps as PICO-8 does: one number, never an
-            // interval whose ends wrapped apart.
+            // Concrete arithmetic wraps as PICO-8 does: never an interval.
             Op::NoWrap => Conc::Bool(true),
             Op::Mget => {
                 let cart = env.cart.clone().ok_or_else(|| anyhow!("mget: no cart"))?;
@@ -173,8 +154,7 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                     .clone()
                     .ok_or_else(|| anyhow!("tile_flag_at: no collision cache"))?;
                 let gi = |v: P8| v.as_i16().ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
-                // Any flag: solid (0), ice (4). A flag no tile of the room
-                // carries folds to false at trace time and never gets here.
+                // Any flag (solid 0, ice 4); one no tile carries folds at trace time.
                 let r = cache.flag_at(
                     &cart,
                     gi(num(a(0)?)?)?,
@@ -185,10 +165,8 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                 )?;
                 Conc::Bool(r)
             }
-            // A fork has no one value, and what resolving one leaves over an
-            // interval is not concrete either. Resolve the configuration
-            // first (`Graph::specialize_subset_into`): the buttons are forks
-            // over a literal, and resolve to constants.
+            // A fork has no one value: resolve the configuration first
+            // (`Graph::specialize_subset_into`).
             Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::IntFrag(_) | Op::SplitOk(_) | Op::Frag(_) | Op::FragOk(_)
             | Op::Lo | Op::Hi => {
                 bail!("node {} is {:?}: resolve the fork configuration before evaluating", id, node.op)
@@ -211,10 +189,8 @@ mod tests {
 
     #[test]
     fn it_evaluates_what_the_symbolic_domain_built() {
-        // Build the same expression twice - once over cells, once over
-        // constants - and check the evaluator agrees with the folding the
-        // domain did for free. That is the whole differential check in
-        // miniature: same code, one side concrete.
+        // The same expression over cells (evaluated) and over constants
+        // (folded by the domain) must agree.
         let mut d = super::super::domain::Symbolic::default();
         let three = P8::from_i16(3);
         let four = P8::from_i16(4);

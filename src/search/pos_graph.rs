@@ -1,67 +1,36 @@
-//! A compact over-approximation of the successor relation, PROJECTED ONTO
-//! THE PLAYER'S POSITION - and nothing else.
+//! The player-position cells, and the position graph: the successor
+//! relation PROJECTED ONTO THE PLAYER'S POSITION, "which positions can step
+//! into this one?". Recorded by the forward (`PosObserver`), read by the
+//! level -1 probe and the UI, pinned as a gate
+//! (`gates/posgraph_room10_f044.txt`).
 //!
-//! "Which positions can step into this position?" - recorded by the forward
-//! (`PosObserver`), read by the level -1 probe and the UI, and pinned as a
-//! gate (`gates/posgraph_room10_f044.txt`). It was the predecessor filter of
-//! the kernel re-run backward (deleted 2026-10-05; the backward is the
-//! recorded edges'). For room (1,0) it is 383,528 `(dst cell, src cell)`
-//! pairs - about 1.5 MB.
+//! It has one node per position cell, never one per row: never a set of
+//! predecessor states. It is horizon-independent and RECORDED, never guessed.
 //!
-//! **This is not, and must never become, a set of predecessor states.** It
-//! has one node per position cell (65,535 of them for a room, plus one for
-//! "no player object"), never one per row; it is a static property of the
-//! game's geometry, not of any particular search. It is RECORDED by the
-//! forward, which sees every transition exactly once, never guessed.
-//!
-//! It is HORIZON-INDEPENDENT by construction: nothing here reads a horizon,
-//! a band or a `g`. It answers "which positions can step into this
-//! position?", which is a property of the game's dynamics. Build once per
-//! room, reuse for every horizon.
-//!
-//! Positions are measured relative to the START room. Object coordinates in
-//! the cart are room-local, so the one frame that crosses into the next room
-//! wraps the player's x from ~128 back to ~0; measured that way it looks
-//! like a 128-pixel teleport, and since the cell it lands in is the seed of
-//! the backward sweep, every candidate mask that touched it covered the
-//! whole room. See BENCHMARK_DATA.md.
-//!
-//! The next room is placed one ROOM_PX to the right, because rooms advance
-//! along `room.x`. That is a labelling, not a geometry: room (0,0) is left
-//! by going UP, so its exit lanes keep their local x (~110) and land at
-//! start-relative x ~238. The grid has to hold the start room AND a whole
-//! room's width past it in both axes, which is why it is 512 wide and why
-//! cells no longer fit in a u16.
+//! Positions are relative to the START room (cart coordinates are
+//! room-local, so a crossing would look like a 128 px teleport). The next
+//! room is labelled one ROOM_PX to the right whichever edge it was left by.
 
 use anyhow::{anyhow, Result};
 
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
-/// Side of the position grid, in pixels. A room is 128x128; the grid holds
-/// the start room plus a whole room's width past it in each axis, because a
-/// row that has crossed into the next room is labelled one ROOM_PX to the
-/// right whichever edge it actually left by. 256 was not enough: room (0,0)
-/// exits upward and its crossing lanes land at start-relative x ~238.
+/// Side of the position grid, in pixels: the start room plus a room's width
+/// past it in each axis (room (0,0) exits upward, landing at x ~238).
 pub const GRID: i32 = 512;
 /// Pixel coordinate mapped to grid index 0.
 pub const ORIGIN: i32 = -64;
 /// Side of a room in pixels - the stride between rooms in the grid.
 const ROOM_PX: i32 = 128;
 
-/// The cell of a row with no player object: the countdown states after a
-/// death, and any state whose objects array has neither `player` nor
-/// `player_spawn`. It is a normal node of the graph - such a row still has
-/// predecessors and successors, they just cannot be located - so it must
-/// participate, not be dropped.
-///
-/// A node of its own past the end of the grid, so no position can alias it.
+/// The cell of a row with no player object (e.g. after a death): a normal
+/// node, past the end of the grid so no position aliases it.
 pub const NO_CELL: u32 = (GRID * GRID) as u32;
 
 /// Number of nodes, including `NO_CELL`.
 pub const CELL_COUNT: usize = (GRID * GRID) as usize + 1;
-/// Grid cell of a whole-pixel START-ROOM-RELATIVE position. Loud rather
-/// than clamping: a position outside the grid would silently distort the
-/// whole table.
+/// Grid cell of a whole-pixel start-room-relative position; an error
+/// outside the grid, never a clamp.
 pub fn cell_of(x: i32, y: i32) -> Result<u32> {
     let (gx, gy) = (x - ORIGIN, y - ORIGIN);
     if !(0..GRID).contains(&gx) || !(0..GRID).contains(&gy) {
@@ -81,10 +50,9 @@ pub fn cell_xy(cell: u32) -> Option<(i32, i32)> {
     (cell != NO_CELL).then(|| (cell as i32 % GRID + ORIGIN, cell as i32 / GRID + ORIGIN))
 }
 
-/// A numeric column's whole parts, one per lane, or `None` if any lane is
-/// not a number or an interval (a pointer, nil). An INTERVAL's cell is its
-/// low corner - the one rule every reader of a position shares
-/// (`block_cells`, the kernel's `pos_sources`).
+/// A numeric column's whole parts per lane (`None` if a lane is neither a
+/// number nor an interval). An INTERVAL's cell is its low corner: ONE rule,
+/// shared with the kernel's `pos_sources`.
 pub(crate) fn whole_i16_col(rt2: &Rt2, cell: u32) -> Option<Vec<i16>> {
     match &rt2.cols[cell as usize] {
         Col::U(AV::Num(n)) => Some(vec![n.whole_part_as_i16(); rt2.width]),
@@ -103,9 +71,8 @@ pub(crate) fn whole_i16_col(rt2: &Rt2, cell: u32) -> Option<Vec<i16>> {
     }
 }
 
-/// A position column's whole-pixel RANGE per lane: `(w, w)` for a number,
-/// the corners for an interval; `None` if any lane is neither. The win
-/// tests use this: an interval wins where the target lies inside it.
+/// A position column's whole-pixel RANGE per lane (`None` if a lane is
+/// neither number nor interval), for the win tests.
 pub fn whole_range_col(rt2: &Rt2, cell: u32) -> Option<Vec<(i16, i16)>> {
     let one = |v: AV| -> Option<(i16, i16)> {
         match v {
@@ -122,9 +89,8 @@ pub fn whole_range_col(rt2: &Rt2, cell: u32) -> Option<Vec<(i16, i16)>> {
     }
 }
 
-/// The player object of a block - the `player` instance, or the
-/// `player_spawn` one during the spawn animation - if it has one. Blocks
-/// share structure across lanes, so this is per block, not per lane.
+/// The block's player object (`player`, else `player_spawn`), if any. Per
+/// block: lanes share structure.
 pub fn player_object(rt2: &Rt2) -> Option<u32> {
     let ids = crate::compiled::ids();
     rt2.player_objects(ids)
@@ -133,10 +99,8 @@ pub fn player_object(rt2: &Rt2) -> Option<u32> {
         .or_else(|| rt2.objects_of_type(ids, ids.g_player_spawn).first().copied())
 }
 
-/// Per-lane cell of an engine block: the SAME rule as `state_cells`, read
-/// off the block's columns. `room.x`/`room.y` must be numbers (a block
-/// without a readable room is an error); a block with no player object, or
-/// a player whose `x`/`y` is not a plain number, is at `NO_CELL`.
+/// Per-lane cell of a block. `room.x`/`room.y` must be numbers; no player
+/// object, or a position that is not numeric, is `NO_CELL`.
 pub fn block_cells(rt2: &Rt2) -> Result<Vec<u32>> {
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
@@ -161,12 +125,9 @@ pub fn block_cells(rt2: &Rt2) -> Result<Vec<u32>> {
         .collect()
 }
 
-/// The labelling offset of a row in room `(rx, ry)`: the start room at 0, the
-/// room `next_room` loads (`game_runner::win_room`) one ROOM_PX to the right -
-/// whichever edge it was left by, including the wrap from a row's last room to
-/// the next row's first (room (7,y) -> (0,y+1), 2026-09-21; `rx - start` put it
-/// 7 rooms LEFT and one down, off the grid). No other room is ever in a block:
-/// a death reloads the start room.
+/// The labelling offset of a row in room `(rx, ry)`: the start room at 0,
+/// `game_runner::win_room` one ROOM_PX to the right (also across the wrap
+/// (7,y) -> (0,y+1)). No other room occurs: a death reloads the start room.
 pub fn room_offset(rx: i16, ry: i16) -> Result<(i32, i32)> {
     let start = crate::game_runner::start_room();
     if (rx, ry) == start {
@@ -178,9 +139,8 @@ pub fn room_offset(rx: i16, ry: i16) -> Result<(i32, i32)> {
     }
 }
 
-/// The finished table: for each destination cell, the cells a predecessor
-/// of it was ever in, as a sorted CSR. Deliberately the transpose - the
-/// sweep only ever asks the backward question.
+/// The finished graph, by destination: each cell's predecessor cells, a
+/// sorted CSR.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct PosGraph {
     /// `srcs[offsets[d] .. offsets[d + 1]]` for destination cell `d`.
@@ -189,8 +149,7 @@ pub struct PosGraph {
 }
 
 impl PosGraph {
-    /// Persist (`ForwardState::extend` writes a level's graph after every
-    /// extension, so a backward can be run on the tree alone).
+    /// Persist (`frame::save_pos_graph`).
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
         crate::search::checkpoint::save_value_to(path, self)
     }
@@ -217,8 +176,7 @@ impl PosGraph {
         self.offsets.windows(2).filter(|w| w[1] > w[0]).count()
     }
 
-    /// `(pairs, order-independent hash of the edge set)` - the gate that two
-    /// recorders built the same graph.
+    /// `(pairs, order-independent hash of the edge set)`: the posgraph gate.
     pub fn fingerprint(&self) -> (usize, u64) {
         use celeste_engine::runtime2::mix64;
         let mut acc = 0u64;
@@ -239,13 +197,8 @@ impl PosGraph {
     }
 }
 
-/// Accumulates `(dst, src)` pairs during the forward pass.
-///
-/// A dense `CELL_COUNT * CELL_COUNT` bitmap would be 512 MB and a hash set
-/// of pairs would cost a lookup per successor LANE - at 645M lanes in one
-/// frame of room (0,0) that is the wrong shape. Instead each destination
-/// keeps a small sorted set, which is what the pairs actually are: 47
-/// sources per destination on room (1,0).
+/// Accumulates `(dst, src)` pairs: per destination a small sorted set of
+/// sources (tens each), not a dense bitmap or a hash set of pairs.
 #[derive(Default, Clone)]
 pub struct PosGraphBuilder {
     /// Destination cell -> its (small) sorted set of source cells.
@@ -280,27 +233,12 @@ impl PosGraphBuilder {
 }
 
 
-/// Collects the table while a run steps frames.
-///
-/// Attribution is AT EMISSION: the frame step knows, for every output row it
-/// produces, the input row it came from (the kernel's slice bit; the
-/// reference engine's lane), and records `(cell of that input row, cell of
-/// the output row)` right there, before any dedup. Nothing is stored on a
-/// row and nothing is inferred from a partition.
-///
-/// The first version of this was read-only and recorded every source cell of
-/// a chunk against every destination cell of it - conservative and useless
-/// (kept 93.6% of the unfiltered candidate set, because an 8,000-lane chunk
-/// spans thousands of cells and the cross product squares that). The second
-/// used a per-lane `POS_ORIGIN` tag; that attributed correctly but, being
-/// per-lane distinct, forbade ALL mid-frame dedup and ballooned room (0,0) to
-/// 101 GB. Partitioning by input position keeps attribution exact while
-/// letting lanes that share an input position AND converge still dedup within
-/// the chunk. See BENCHMARK_DATA.md.
+/// Collects the graph while the forward steps frames. Attribution is AT
+/// EMISSION: the frame step records `(input row's cell, output row's cell)`
+/// as it produces each row, before any dedup; nothing is stored on a row.
 pub struct PosObserver {
-    /// Per-lane `(src cell, dst cell)` pairs, pushed under a lock by
-    /// whichever worker ran the chunk. Folded into the table in `flush`, off
-    /// the workers' critical section.
+    /// `(src cell, dst cell)` pairs pushed by the workers, folded into the
+    /// graph in `flush`.
     pending: std::sync::Mutex<Vec<(u32, u32)>>,
     graph: std::sync::Mutex<PosGraphBuilder>,
 }
@@ -312,8 +250,7 @@ impl Default for PosObserver {
 }
 
 impl PosObserver {
-    /// An observer that already holds `graph`'s pairs: how a resumed
-    /// level-0 forward keeps recording where the checkpointed one left off.
+    /// An observer already holding `graph`'s pairs (a resumed forward).
     pub fn from_graph(graph: &PosGraph) -> Self {
         let mut b = PosGraphBuilder::default();
         for d in 0..CELL_COUNT {
@@ -325,15 +262,12 @@ impl PosObserver {
         Self { pending: std::sync::Mutex::new(Vec::new()), graph: std::sync::Mutex::new(b) }
     }
 
-    /// Record `(src cell, dst cell)` edges, as the frame step observed them
-    /// AT EMISSION: every raw output row, before any dedup, paired with the
-    /// cell of the input row that produced it.
+    /// Record `(src cell, dst cell)` edges observed at emission.
     pub fn record_pairs(&self, pairs: impl Iterator<Item = (u32, u32)>) {
         self.pending.lock().expect("pos observer").extend(pairs);
     }
 
-    /// Fold the frame's observations into the table. Called once per frame
-    /// so the pending list stays a frame's worth, not a run's.
+    /// Fold the pending observations into the graph.
     pub fn flush(&self) {
         let pending = std::mem::take(&mut *self.pending.lock().expect("pos observer"));
         let mut graph = self.graph.lock().expect("pos observer");
@@ -351,9 +285,7 @@ impl PosObserver {
         self.graph.into_inner().expect("pos observer").build()
     }
 
-    /// The table as recorded so far, leaving the observer recording - the
-    /// level-0 forward is EXTENDED across horizons and the backward wants
-    /// the graph at each.
+    /// The graph as recorded so far; the observer keeps recording.
     pub fn snapshot(&self) -> PosGraph {
         self.flush();
         self.graph.lock().expect("pos observer").clone().build()
@@ -370,7 +302,7 @@ mod tests {
         assert_eq!(cell_xy(cell_of(3, -7).unwrap()).unwrap(), (3, -7));
         assert!(cell_of(-64, 0).is_ok());
         assert!(cell_of(-65, 0).is_err());
-        // Room (0,0)'s exit lanes land here, and a 256px grid refused them.
+        // Room (0,0)'s exit lanes land here.
         assert!(cell_of(238, -5).is_ok());
         assert!(cell_of(0, ORIGIN + GRID).is_err());
         // No position can alias the no-position node.

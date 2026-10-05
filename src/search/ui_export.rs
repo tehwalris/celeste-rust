@@ -1,24 +1,17 @@
 //! `rewrite export-ui`: a finished search's checkpoint trees + run log ->
 //! the compact static data the web UI (`ui/`) renders.
 //!
-//! What the UI shows is spatial: per (level, frame) how many states sit in
-//! each player-position cell and which cells hold wins, and per marked set
-//! (the last level's remainder-free marks and its arc-marked nodes, `search
-//! --save-marks`) the marked states per cell by distance to the win. All of
-//! it is in the checkpoint HEADERS - a frame file's cell index gives the
-//! per-cell state count, the win list the win cells - and in the marks
-//! files (`(shape, cell, key, dist)` rows). No row is decoded and no engine
-//! is built: the export is a walk over headers plus, for the marks by layer,
-//! the key column of the runs at marked cells (room (6,0) h144, a 1.7G-row
-//! tree and 70-100M marks per set: ~25 s, 13 GB).
+//! Per (level, frame): states and wins per player-position cell; per marked
+//! set (`search --save-marks`: remainder-free marks, arc-marked nodes): the
+//! marked states per cell by distance to the win. All of it comes from the
+//! checkpoint HEADERS (cell index, win list), the marks files, and the key
+//! column at marked cells: no row is decoded, no engine built.
 //!
-//! The input is a `rewrite search` checkpoint directory (`level00/`,
-//! `level01/`, ... one per level of `--level`) or one `rewrite forward`
-//! tree, with its log. The run is one horizon whose levels are the forward
-//! levels, plus, with `--arc`, a last level carrying the arc backward over
-//! the last forward level's tree (`forward_of`). The JSON keeps the fields
-//! of the deleted precision ladder's runs (`bwd`, `reruns`, several
-//! horizons), which the UI still reads.
+//! The input is a `rewrite search` checkpoint directory (`levelNN/` per
+//! `--level`) or one `rewrite forward` tree, with its log: one horizon whose
+//! levels are the forward levels, plus with `--arc` a last level carrying the
+//! arc backward over the last forward tree (`forward_of`). Some JSON fields
+//! (`bwd`, `reruns`, several horizons) are kept only because the UI reads them.
 //!
 //! Output layout (`--out DIR`):
 //!
@@ -79,7 +72,7 @@ pub struct LevelRun {
     /// The level's spec (`r0sxhn`), or the arc pass's name.
     pub precision: String,
     pub fwd: Vec<FwdLine>,
-    /// The ladder's kernel re-run backward's iterations: always empty.
+    /// Always empty (kept for the UI).
     pub bwd: [u32; 0],
     pub first_win: Option<u32>,
     pub marked: Option<u64>,
@@ -89,9 +82,7 @@ pub struct LevelRun {
     pub frames: u32,
     pub frames_file: String,
     pub marks_file: Option<String>,
-    /// Per frame, the total states in the frontier and the win count
-    /// (from the checkpoint files - the log's `kept` is the same number
-    /// for a fresh frame, but the tree is the truth the heatmap draws).
+    /// Per frame, the states and the win count, from the checkpoint files.
     pub frame_states: Vec<u64>,
     pub frame_wins: Vec<u64>,
     pub marks_have_dist: bool,
@@ -99,9 +90,8 @@ pub struct LevelRun {
     pub mlayers_file: Option<String>,
     /// Per frame, the marked states of that layer.
     pub marks_by_layer: Vec<u64>,
-    /// A backward that ran over ANOTHER level's forward (`--arc`: the arc
-    /// backward over the last level's tree): that level's index. Its frames
-    /// are that level's, and it has no forward pass.
+    /// A backward over ANOTHER level's forward (`--arc`): that level's
+    /// index, whose frames it shares; no forward pass of its own.
     pub forward_of: Option<usize>,
 }
 
@@ -190,8 +180,7 @@ fn parse_fwd(line: &str) -> Result<FwdLine> {
         out_blocks: num(ob)?,
         out_lanes: num(ol)?,
         visited: num(after(&t, "visited", 0)?)?,
-        // The waves frame (2026-09-13) logs `wave` / `door` where the
-        // two-phase frame logged `emit` / `own`; both read.
+        // Older logs say `emit` / `own` for `wave` / `door`.
         emit_ms: num(after(&t, "wave", 0).or_else(|_| after(&t, "emit", 0))?)?,
         emit_idle: num(after(&t, "(idle", 0)?)?,
         own_ms: num(after(&t, "door", 0).or_else(|_| after(&t, "own", 0))?)?,
@@ -199,8 +188,7 @@ fn parse_fwd(line: &str) -> Result<FwdLine> {
         ckpt_ms: num(after(&t, "ckpt", 0)?)?,
         pos_ms: num(after(&t, "pos", 0)?)?,
         total_ms: num(after(&t, "total", 0)?)?,
-        // `rss X GB` before 2026-09-13; `rss start A wave B end C peak D
-        // GB` since - the frame's end value is the one the old line gave.
+        // `rss X GB` (older) or `rss start A wave B end C ...`: the end value.
         rss_gb: match after(&t, "rss", 0)? {
             "start" => num(after(&t, "end", 0)?)?,
             v => num(v)?,
@@ -232,11 +220,10 @@ fn level_run(level: usize, precision: String, fwd: Vec<FwdLine>, first_win: Opti
     }
 }
 
-/// The run log: its `[fwd]` lines split into the search's levels by the
-/// `[search] level i (SPEC): forward to fH ...; first win W` line that
-/// closes each level's forward (a `rewrite forward` log has none: one level,
-/// its horizon its last frame), the horizon, the wall time and the optimum
-/// of the `OPTIMAL win frame: F (S s)` line.
+/// The run log: `[fwd]` lines split into levels by the `[search] level i
+/// (SPEC): forward to fH ...; first win W` line closing each (none in a
+/// `rewrite forward` log: one level), the horizon, and the wall time and
+/// optimum of the `OPTIMAL win frame: F (S s)` line.
 pub fn parse_log(text: &str) -> Result<(Vec<LevelRun>, u32, Option<f64>, Option<u32>)> {
     let mut levels: Vec<LevelRun> = Vec::new();
     let mut fwd: Vec<FwdLine> = Vec::new();
@@ -281,8 +268,8 @@ struct LevelData {
     frames: Vec<(Sparse, Sparse)>,
 }
 
-/// `f(i)` for every `i < n`, on one worker per core pulling indices in
-/// order; the results by index. The first error stops the pulling.
+/// `f(i)` for every `i < n` in parallel, results by index; the first error
+/// stops the pulling.
 fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
@@ -316,8 +303,8 @@ fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> Result<T> + Sync) -> Result<V
 }
 
 /// A marks file, mapped: `Visited::save`'s `(shape, cell, k0, k1, dist)`
-/// rows (32 bytes each) followed by the horizon (4 bytes). Rows are read in
-/// place, never deserialized as a whole: a level's marks run to 100M rows.
+/// rows (32 bytes each) then the horizon (4 bytes), read in place (up to
+/// ~100M rows).
 struct MarksMap {
     map: memmap2::Mmap,
     rows: usize,
@@ -362,16 +349,11 @@ fn mark_shard(shape: u64, cell: u32) -> usize {
 /// One marked state: `(shape, cell, key)`, as the frame rows are keyed.
 type MarkId = (u64, u32, (u64, u64));
 
-/// Every marked state of up to 64 sets over one tree, with the bitmask of
-/// the sets that hold it, and the (shape, cell)s that hold any - so a
-/// frame file's run at a cell with none is skipped unread, and a row of
-/// one that has some is one probe.
-///
-/// A hash probe per row, not a merge against sorted marks: a run is a few
-/// rows (one flush's survivors at one cell) while a cell's marks span every
-/// layer, so a sorted lookup started cold per run and paid a binary search
-/// of cache misses per row (2026-09-30: 70% of the export's CPU at room
-/// (6,0)). A probe that misses - most rows are unmarked - is one cache miss.
+/// Every marked state of up to 64 sets over one tree with the bitmask of
+/// sets holding it, and the (shape, cell)s holding any, so a run at an
+/// unmarked cell is skipped unread. A hash probe per row rather than a
+/// merge against sorted marks: runs are a few rows, and a missing probe is
+/// one cache miss.
 struct MarkTable {
     shards: Vec<FxHashMap<MarkId, u64>>,
     cells: rustc_hash::FxHashSet<(u64, u32)>,
@@ -384,8 +366,7 @@ const MARKS_CHUNK: usize = 1 << 20;
 /// cell).
 fn mark_table(sets: &[MarksMap]) -> Result<(MarkTable, Vec<Vec<(u32, u32, u32)>>)> {
     anyhow::ensure!(sets.len() <= 64, "at most 64 marked sets per tree");
-    // The chunks: every set's rows, read in parallel into per-shard lists
-    // and a per-(dist, cell) count.
+    // Every set's rows in parallel into per-shard lists and (dist, cell) counts.
     let chunks: Vec<(usize, usize)> =
         sets.iter().enumerate().flat_map(|(k, m)| (0..m.rows.div_ceil(MARKS_CHUNK)).map(move |c| (k, c))).collect();
     let read = par_map(chunks.len(), |i| {
@@ -469,10 +450,8 @@ fn frame_counts(dir: &Path, f: u32, marks: Option<&MarkTable>, nsets: usize) -> 
         }
         let Some(t) = marks else { continue };
         let shape = file.shape_hash();
-        // A run is a few rows (one flush's survivors at one cell: ~4 at
-        // room (6,0) level 0, 564M runs over the tree), and a cell's runs
-        // are adjacent: the cell is looked up once, and a run at a cell
-        // without marks is skipped without reading its keys.
+        // A cell's runs are adjacent: look the cell up once, and skip an
+        // unmarked cell's runs without reading their keys.
         let mut last: Option<(u32, bool)> = None;
         for &(cell, start, len) in file.runs() {
             let marked = match last {
@@ -513,10 +492,9 @@ fn sparse(m: FxHashMap<u32, u32>) -> Sparse {
     v
 }
 
-/// Read one level directory: its frames from the headers, and - in the
-/// same pass over the files - the marked sets of `marks` split by layer
-/// (result `[k]` is, per frame, the marked states of set `k` per cell: the
-/// tree's `(cell, key)` rows intersected with the set). Frames in parallel.
+/// Read one level directory: its frames from the headers and, in the same
+/// pass, the sets of `marks` split by layer (`[k]`: per frame, set `k`'s
+/// marked states per cell). Frames in parallel.
 fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
     let fdir = dir.join("frames");
     let mut nframes = 0u32;
@@ -527,33 +505,25 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(Lev
             nframes = nframes.max(n + 1);
         }
     }
-    // The level's position graph, to draw a won state where its player left
-    // from (below). A tree without one draws wins at their own cells; one
-    // that exists and does not load is an error, not a silent skip.
+    // The pos graph, to draw wins where the player left from (below). An
+    // absent graph draws wins in place; an unloadable one is an error.
     let graph_path = dir.join("posgraph.bin");
     let graph = if graph_path.exists() {
         Some(crate::search::pos_graph::PosGraph::load(&graph_path).with_context(|| format!("loading {}", graph_path.display()))?)
     } else {
         None
     };
-    // The latest frames are the largest: pulled first, so the tail of the
-    // parallel pass is the small ones.
+    // The largest (latest) frames first, so the tail is small ones.
     let n = nframes as usize;
     let mut counts = par_map(n, |i| frame_counts(dir, (n - 1 - i) as u32, marks, nsets))?;
     counts.reverse();
     let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(n);
     let mut layers: Vec<Vec<Sparse>> = vec![Vec::with_capacity(n); nsets];
     for FrameCounts { mut cells, mut wins, marked } in counts {
-        // A won state has left the room: its cell is the NEXT room's spawn,
-        // one room over (`pos_graph::room_offset` puts the room it exits to
-        // one room to the right), so drawn as-is the winning states sit in the box's far
-        // corner and the animation never shows the player reach the exit
-        // (room (4,0) f76 at (136,128), room (1,0) f99 at (136,124),
-        // 2026-09-16). Draw each win cell where its player LEFT from instead:
-        // of the cells with a recorded edge into it (the level's pos graph),
-        // the one holding the most states at the previous frame. The count
-        // moves whole, in both the states and the wins record, so totals are
-        // unchanged; with no graph or no occupied source the cell stays.
+        // A won state's cell is in the NEXT room (one room to the right).
+        // Draw it where its player LEFT from: of the pos-graph sources, the
+        // one with the most states at the previous frame. The count moves
+        // whole (states and wins), so totals are unchanged.
         if let (Some(g), Some((prev, _))) = (graph.as_ref(), frames.last()) {
             let prev: &Sparse = prev;
             let busiest = |win: u32| -> Option<u32> {
@@ -714,10 +684,8 @@ fn read_witness(path: &Path) -> Result<Witness> {
 }
 
 /// `--arc DIR` (`search --save-marks DIR`): the last forward level gets the
-/// remainder-free BFS's marks, and a level after it the remainder-exact ARC
-/// backward over the same tree (a node is marked when its winning set is
-/// non-empty at some frame). The optimum is the arc search's. Returns the
-/// witness when the directory has one.
+/// remainder-free marks, and a level after it the ARC backward over the same
+/// tree; the optimum is the arc search's. Returns the witness if present.
 fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path) -> Result<Option<Witness>> {
     let kv = read_keyed(&dir.join("arc.txt"))?;
     let get = |k: &str| kv.get(k).with_context(|| format!("arc.txt: no `{k}`"));
@@ -769,9 +737,8 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
     eprintln!("[export-ui] log: {} levels to f{h}, optimal {optimal:?}", hr.levels.len());
     std::fs::create_dir_all(out)?;
 
-    // One pass per forward level's tree, with the marked sets over it (the
-    // last level's: its rem-free marks and the arc's), its frames and its
-    // marks split by layer read together.
+    // One pass per forward level's tree, reading its frames and its marked
+    // sets by layer together.
     struct MarksOut {
         level: usize,
         by_cell_dist: Vec<(u32, u32, u32)>,

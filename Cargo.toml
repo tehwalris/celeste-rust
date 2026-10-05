@@ -4,10 +4,8 @@ members = [
     "crates/celeste-names",
     "crates/celeste-engine",
 ]
-# Without this, a bare `cargo build` in the repo root builds ONLY the root
-# package, because the root is itself a package. Building every member by
-# default costs one extra link but keeps a change to celeste-rust from
-# silently breaking a member that kept a stale binary in target/.
+# Build every member by default: the root is itself a package, so a bare
+# `cargo build` would otherwise build only it.
 default-members = [
     ".",
     "crates/celeste-core",
@@ -47,15 +45,10 @@ path = "src/bin/concrete_run.rs"
 name = "rewrite"
 path = "src/bin/rewrite.rs"
 
-# The EDIT LOOP profile. Optimized enough that compute-bound tests finish,
-# cheap enough that a one-line change is not a full-workspace relink:
-# `lto = "fat"` + `codegen-units = 1` on the release profile costs ~100 s
-# per edit and buys nothing for a test that runs in milliseconds.
-#
-# Its own target subdir, so release artifacts stay valid - every number in
-# BENCHMARK_DATA.md was measured under `release` and must keep being
-# comparable. Never make the release profile cheaper to speed the loop up;
-# add to this one.
+# The edit-loop profile: optimized enough for compute-bound tests, without
+# release's fat-LTO full-workspace relink on every edit. Never make the
+# release profile cheaper to speed the loop up (every number in
+# BENCHMARK_DATA.md was measured under it); add to this one.
 [profile.quick]
 inherits = "release"
 lto = false
@@ -65,32 +58,13 @@ debug = false
 [profile.release]
 lto = "fat"
 codegen-units = 1
-# unwind, not abort. The deopt path is BUILT on catching panics - a
-# speculated instruction can assert on values the verify horizon never
-# showed it, and run_deopt_frame_granular catches that and re-runs the
-# state under the plain program. Under `abort` that catch_unwind is a
-# no-op and such a panic kills the process instead, which is how a
-# multi-hour room (0,0) campaign died at frame 66 on a one-line bug.
-# Measured cost of unwinding: 2.2% (10.26 -> 10.48 s at 55 frames).
 panic = "unwind"
-# Frame pointers + line tables so `perf` can attribute cycles to source.
-# Costs nothing measurable for the interpreter and makes the profile
-# readable - but it is NOT free on the compiled path, see below.
+# Line tables so `perf` can attribute cycles to source.
 debug = 1
 
-# The compiled path opts out of debuginfo, and this is measured, not
-# inherited superstition. On the f35 one-frame bench (30 reps, min):
-# 103.6 ms with these overrides, 109.9 ms without - +6.1% for line tables
-# over the kernels and the row machinery.
-#
-# The probe used to get this by being outside the workspace with its own
-# `[profile]`; cargo ignores member profiles, which is the conflict that
-# deferred this split under task #133. Per-package overrides at the root
-# are the resolution, and they also keep an escape hatch for the original
-# reason the probe wanted `debug = false`: LLVM's DWARF variable-DIE pass
-# SEGVs on fused generated functions with thousands of locals. That crash
-# is gone with the 29k-line transpiled body (K4 stage 4), so today this is
-# purely the 6%.
+# The engine crate opts out of debuginfo: line tables over the row machinery
+# measured ~6% slower. Member profiles are ignored by cargo, so the override
+# lives here.
 [profile.release.package.celeste-engine]
 debug = false
 

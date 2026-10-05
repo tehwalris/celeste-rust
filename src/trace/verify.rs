@@ -1,23 +1,15 @@
 //! Tracing ONE frame as a kernel, and checking it against the oracle.
 //!
-//! This is the first thing in `trace` that treats a trace as a FUNCTION
-//! rather than as a walk: input cells in, output cells out, plus the two
-//! booleans every outcome has (`guard` - when does this outcome apply;
-//! `error` - where its row is undefined, derived from its values).
+//! A trace is a FUNCTION: input cells in, output cells out, plus per outcome
+//! `guard` (when it applies) and `error` (where its row is undefined,
+//! derived from its values).
 //!
-//! The check is the point. Run the frame twice from the same state:
-//!
-//! * symbolically, with the player's fields replaced by `Op::Cell` leaves
-//!   and the six buttons left free, which produces a graph;
-//! * concretely, with real numbers in those fields and a real button
-//!   assignment, which produces numbers.
-//!
-//! Then evaluate the graph at that assignment and compare. Both runs are
-//! the SAME interpreter over the SAME domain - the "concrete" one is just
-//! the symbolic domain with every leaf already a constant, which folds -
-//! so a disagreement can only be the compilation itself: a bad merge, a
-//! guard that claims the wrong lanes, a select on the wrong condition.
-//! Nothing else is being tested, which is what makes a failure readable.
+//! The check runs the frame twice from the same state: symbolically (fields
+//! as `Op::Cell` leaves, buttons free) into a graph, and with real numbers
+//! and buttons. Both are the SAME interpreter over the SAME domain (the
+//! concrete run is the symbolic domain with every leaf a constant), so a
+//! disagreement can only be the compilation: a bad merge, a wrong guard, a
+//! select on the wrong condition.
 
 use anyhow::{anyhow, bail, Result};
 use full_moon::ast;
@@ -41,50 +33,30 @@ pub struct FrameOut {
     /// lanes live here on which it holds decline. Derived, never carried.
     pub error: NodeId,
     /// Every scalar reachable from the globals table, by path, with the
-    /// KIND the tracer knows it to be. Carrying the kind rather than
-    /// re-deriving it from the node's op matters: `Op::Cell` and `Op::Sel`
-    /// are both, and a guess there is a guess about the boundary.
+    /// KIND the tracer knows it to be (not re-derivable from the op: an
+    /// `Op::Cell` or `Op::Sel` can be either).
     pub fields: Vec<(Path, NodeId, &'static str)>,
-    /// Slots that are DEAD at the frame boundary: the six button cells.
+    /// Slots that are DEAD at the frame boundary: the six button cells
+    /// (`btn(i)` stores its resolved choice back), and the shared output
+    /// unknown.
     ///
-    /// `btn(i)` writes as well as reads - it resolves the unknown to a
-    /// definite value and stores it back, which is what keeps the choice
-    /// consistent within a frame - so at the end of a traced frame these
-    /// hold this frame's resolved choices rather than fresh unknowns.
-    ///
-    /// The PRODUCTION frame chunk ends with `__reset_button_states()`,
-    /// so at its boundary they are fresh unknowns and cannot distinguish
-    /// two rows. The tracer runs the reset at the START, so its boundary
-    /// sits one step earlier in the same cycle. Recording these paths as
-    /// dead is what makes the two boundaries agree; leaving them in
-    /// `fields` would make every row carry this frame's button values and
-    /// stop converged lanes from deduping.
-    ///
-    /// Soundness is the same premise the deleted `widen_buttons` rewrite
-    /// documents: the cells are dead until the next frame's reset
-    /// overwrites them, so overwriting them changes nothing observable.
-    /// That is a property of the whole program rather than of this
-    /// frame, and it is CLAIMED here, not proven - the differential
-    /// screen is what would catch a `btn` read that outlived it.
+    /// The production chunk ends with `__reset_button_states()`; the tracer
+    /// runs the reset at the START, so recording these as dead makes the two
+    /// boundaries agree and lets converged lanes dedup. Sound because the
+    /// cells are dead until the next reset overwrites them - CLAIMED, not
+    /// proven; the differential check would catch a `btn` read outliving it.
     pub ubool: Vec<Path>,
-    /// What kept this outcome from merging with its siblings. Only a
-    /// shape difference can, so keeping it is what turns "twelve
-    /// outcomes" into a statement about the program.
+    /// What kept this outcome from merging with its siblings: only a shape
+    /// difference can.
     pub shape: super::heap::Shape,
     /// The ENGINE's structure for the state this outcome ends in, and
     /// the canonical cell each of `fields` / `ubool` lands on in it.
-    ///
-    /// Per outcome, not once per frame: an outcome that allocates - a
-    /// death making a new player - or that frees one shifts every cell
-    /// after the change, so the ids here are only meaningful against
-    /// `rt2`. They are NOT comparable with `Frame::in_cells` unless the
-    /// outcome kept the input shape.
+    /// Per outcome (an allocation or free shifts cells): NOT comparable with
+    /// `Frame::in_cells` unless the outcome kept the input shape.
     pub rt2: celeste_engine::runtime2::Rt2,
     pub cells: Vec<u32>,
     pub ubool_cells: Vec<u32>,
-    /// The state itself. Kept so a shape walk can step FORWARD: a new
-    /// heap shape only appears by actually advancing a frame, and the
-    /// state an outcome ends in is the only thing that has that shape.
+    /// The state itself, so a shape walk can step FORWARD from it.
     pub st: State<Symbolic>,
     /// THE TRANSFER ROOTS (`search::arc_edges`, a level-0 trace;
     /// empty otherwise): per axis x then y, `took`, `pre`, `frag`, `ox` (the
@@ -130,37 +102,25 @@ pub struct Frame {
     /// What each fork minted as both values was minted for
     /// (`Symbolic::fork_origins`), for the kernel dump.
     pub fork_origins: Vec<(u8, String)>,
-    /// How many FORK choices this frame made (`__split_by_flr` on a
-    /// widened value). The emitter needs it: a node whose cone contains
-    /// a split lives at fork level 1 or deeper, and a body emitted at
-    /// depth 0 silently drops every one of them.
+    /// How many FORK choices this frame made; the emitter enumerates them.
     pub forks: u8,
-    /// The forks' arities AS TRACED (`Graph::fork_ways` at the end of this
-    /// frame). The arena outlives the frame and a later frame's forks
-    /// overwrite them, so a frame carries its own and `emit::bind` installs
-    /// them in the bound graph.
+    /// The forks' arities AS TRACED. The arena outlives the frame and a
+    /// later frame overwrites them, so `emit::bind` installs these.
     pub fork_ways: Vec<u8>,
     pub outs: Vec<FrameOut>,
     /// THE RAISE ROW's liveness: when this frame would have hit a Lua raise,
-    /// as the OR of the path guards at every `Interp::poison` site
-    /// (plans/graph-model.md section 4, "a raise is its own row").
+    /// as the OR of the path guards at every `Interp::poison` site.
+    /// `ConstBool(false)` where nothing raises (all but the rooms where a
+    /// spring stands on a breakable floor).
     ///
-    /// `ConstBool(false)` for a frame that cannot raise, which is every frame
-    /// of every room but the three where a spring stands on a breakable floor
-    /// (rooms (7,0), (6,1), (7,1)) - so it folds away and costs nothing where
-    /// nothing raises.
-    ///
-    /// NOT an element of `outs`: a raise has no field values, while every
-    /// `outs` consumer indexes positionally and assumes `fields` / `rt2` /
-    /// `shape` / `st` are there (`emit::bind`'s roots, `kernel`'s
-    /// `outs.len() == bound.outcomes.len()` pairing, the level -1 walk).
+    /// NOT an element of `outs`: a raise has no field values, and every
+    /// `outs` consumer indexes positionally assuming them.
     pub raise: NodeId,
     /// The canonical cell each `Iface` slot names in the state the frame
     /// STARTS in - the engine's numbering for `Op::Cell(i)`.
     pub in_cells: Vec<u32>,
-    /// The engine's structure for that state. Kept because a kernel is
-    /// RUN against a block of this shape, and the input state is gone by
-    /// then - `celeste_engine::slots::reshape` makes one from it.
+    /// The engine's structure for that state: a kernel runs against a block
+    /// of this shape (`celeste_engine::slots::reshape`).
     pub in_rt2: celeste_engine::runtime2::Rt2,
 }
 
@@ -182,8 +142,7 @@ pub fn run_one<'a, D: Domain>(
     Ok(s)
 }
 
-/// Every scalar the state ends the frame holding, as graph nodes.
-/// Every scalar the frame ends with, split into the ones that carry
+/// Every scalar the frame ends with, as graph nodes, split into the ones that carry
 /// data and the ones that are dead at the boundary (`FrameOut::ubool`).
 fn out_fields(
     st: &State<Symbolic>,
@@ -191,10 +150,8 @@ fn out_fields(
 ) -> Result<(Vec<(Path, NodeId, &'static str)>, Vec<Path>)> {
     let mut out = Vec::new();
     let mut ubool = Vec::new();
-    // A near level's floor `state`s are an interval column in every outcome
-    // (`widen::widen_near_floors`), an exact state `[n, n]` included: a shape's
-    // column keys a point as an interval, and so does the mark filter's
-    // projection (`Rt2::widen_to`).
+    // A near level's floor `state`s are an interval column in every outcome,
+    // an exact `[n, n]` included: the column's type is per shape.
     let ival_always: Vec<Path> = if d.floors_near { super::widen::near_floor_paths(st).state } else { Vec::new() };
     for p in iface::scalars(st, &[])? {
         if p.first() == Some(&iface::key("__button_states")) {
@@ -210,12 +167,9 @@ fn out_fields(
                 continue;
             }
         }
-        // The engine TYPE of the column this slot becomes. Asked of the
-        // graph rather than of the tracer's `Value`, because an interval
-        // is a `Value::Num` too: `player.rem` comes in widened and leaves
-        // as a narrowed fragment, and both are intervals. A slot the
-        // frame computes from one is an interval column, and writing it
-        // as a number would be a narrowing nobody checked.
+        // The engine TYPE of the column, asked of the graph (an interval is
+        // a `Value::Num` too): writing an interval as a number would be an
+        // unchecked narrowing.
         let (n, ty) = match iface::get(st, &p).unwrap() {
             Value::Num(n) => {
                 let ty = if d.is_interval(&n) || ival_always.contains(&p) { "ZI" } else { "ZN" };
@@ -237,34 +191,21 @@ pub fn trace_frame<'a>(
     st: State<Symbolic>,
     roots: &[Path],
     pin: &[(Path, Conc)],
-    // Slots the boundary WIDENS to an interval - the player's
-    // `rem.x`/`rem.y`. A frame that reads one has to fork at
-    // `__split_by_flr` rather than floor it (T24).
+    // Slots the boundary WIDENS to an interval (the player's `rem.x` /
+    // `rem.y`): a frame that reads one forks at `__split_by_flr`.
     ival: &[Path],
-    // Apply the boundary's widenings INSIDE the frame (`trace::widen`),
-    // so the graph knows about them and a row is hashed on the value it
-    // stores.
-    //
-    // Off for the differential check against the CONCRETE oracle, whose
-    // job is frame semantics: it runs the same chunk with real numbers
-    // and has no interval to compare a widened `rem` against. The
-    // abstraction is checked by the end-to-end room run instead, against
-    // the interpreter, which widens too.
-    //
-    // On, the trace also captures the remainder transfers
-    // (`search::arc_edges`).
+    // Apply the boundary's widenings INSIDE the frame (`trace::widen`), so
+    // a row is hashed on the value it stores, and capture the remainder
+    // transfers (`search::arc_edges`). Off for the differential check
+    // against the concrete oracle, which has no intervals.
     widen: bool,
-    // Input slots known to lie in a RANGE (raw 16.16, inclusive): the
-    // body is specialized on them (`Symbolic::ranges`, the bucket
-    // dispatch), and outside them the frame is in error, like a pin.
+    // Input slots known to lie in a RANGE (raw 16.16, inclusive): the body
+    // is specialized on them (`Symbolic::ranges`); outside them the frame is
+    // in error, like a pin.
     bounds: &[(Path, (i32, i32))],
 ) -> Result<Frame> {
     it.trace_start_nodes = it.d.node_count();
     let mut st = st;
-    // Key overrides are per FRAME too: a shape's representative is an
-    // OUTPUT state of an earlier trace and still carries that trace's
-    // overrides, whose key nodes name ITS forks - inherited, the kernel
-    // hashed a stale key (2026-09-15).
     // Fork choices are per FRAME; the six buttons are among them.
     it.d.forks = 0;
     it.d.graph.reset_forks();
@@ -273,18 +214,15 @@ pub fn trace_frame<'a>(
     it.d.unknown_atoms = 0;
     // The arc capture (`search::arc_edges`): every widening trace.
     it.arc_capture = widen;
-    // What the previous trace left if it failed part-way (a success takes
-    // both below).
+    // What a previous trace left if it failed part-way.
     it.raised.clear();
     it.d.escaped.clear();
     it.d.fork_origins.clear();
     it.d.evaluated.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
-    // THE KERNEL'S ADMISSIBLE INPUTS: the pins it was specialised on and the
-    // ranges its region seeded. Built BEFORE the frame runs, so it names the
-    // input cells rather than whatever the frame did to those slots. A lane
-    // outside it should not have been run through this kernel at all, which
-    // is an error of the whole frame rather than of any value it computes.
+    // THE KERNEL'S ADMISSIBLE INPUTS: its pins and its region's ranges, on
+    // the input cells (built before the frame runs). A lane outside them is
+    // an error of the whole frame.
     let mut admissible = iface::pin_guard(&mut it.d, &iface);
     // The player's input position and its region, for the points
     // (`Points`): the bounds on its `x` and `y`.
@@ -301,9 +239,8 @@ pub fn trace_frame<'a>(
                 }
             }
         }
-        // The obligation, built on the graph directly so the range
-        // analysis it seeds cannot fold it away: the lane's value (an
-        // interval: both ends) lies in the range.
+        // The obligation (both ends in the range), built on the graph
+        // directly so the range analysis it seeds cannot fold it away.
         use crate::transpile::graph::Op;
         let (klo, khi) = (it.d.graph.leaf(Op::Const(*lo, *lo)), it.d.graph.leaf(Op::Const(*hi, *hi)));
         let (vlo, vhi) = (it.d.graph.fold(Op::Lo, vec![cell]), it.d.graph.fold(Op::Hi, vec![cell]));
@@ -312,10 +249,8 @@ pub fn trace_frame<'a>(
         let both = it.d.graph.fold(Op::And, vec![a, b]);
         admissible = it.d.graph.fold(Op::And, vec![admissible, both]);
     }
-    // The engine's numbering for the INPUT shape. Here rather than in a
-    // later pass because this is the last moment the input state exists;
-    // `symbolize` changed the values in it and not the shape, so the
-    // structure this describes is the one the boundary handed us.
+    // The engine's numbering for the INPUT shape: the last moment the input
+    // state exists (`symbolize` changed values, not the shape).
     let (cart, cache) = match (it.cart.clone(), it.cache.clone()) {
         (Some(a), Some(b)) => (a, b),
         _ => bail!("tracing a frame needs the cart and the room's collision cache"),
@@ -329,15 +264,13 @@ pub fn trace_frame<'a>(
         super::widen::fork_held_inputs(&mut st, &mut it.d)?;
     }
     // The fly fruit unknown: its widened fields replaced before anything reads
-    // them (plans/fly-fruit.md).
+    // them.
     if it.d.fruit_unknown {
         super::widen::fork_fruit_inputs(&mut st, &mut it.d)?;
     }
-    // A near level's floors: each `collideable` derived from `state`. Not in
-    // the middle of a split frame: there the row stores the `collideable` the
-    // frame's first step computed wherever the second may read it
-    // (`widen::widen_near_floors`), and deriving it from the widened `state`
-    // would throw that away - read as stored, an unknown one forked.
+    // A near level's floors: each `collideable` derived from `state`, except
+    // mid split frame, where the row stores the first step's `collideable`:
+    // read as stored, an unknown one forked.
     if it.d.floors_near {
         if super::widen::mid_frame(&st) {
             super::widen::fork_unknown_near_collideables(&mut st, &mut it.d)?;
@@ -345,9 +278,8 @@ pub fn trace_frame<'a>(
             super::widen::fork_near_floor_inputs(&mut st, &mut it.d)?;
         }
     }
-    // The countdowns of a timers or near level: the unknown number, as stored
-    // (`widen::widen_floor_timers`). After the near floors' inputs, which
-    // materialize the absent fields.
+    // The countdowns of a near level: the unknown number, as stored. After
+    // the near floors' inputs, which materialize the absent fields.
     super::widen::forget_countdown_inputs(&mut st, &mut it.d)?;
     // The moving platforms unknown: their input cells, decided per world by
     // the split pass (`widen::platform_inputs`, `Points`).
@@ -403,27 +335,20 @@ pub fn trace_frame<'a>(
                 (roots, !players.is_empty())
             }
         };
-        // THE WIDENINGS, here rather than at the boundary a moment
-        // later, so the graph knows about them and the value a row is
-        // hashed on is the value it stores (`trace::widen`). Before
-        // `out_fields`, which reads the values off the state.
-        //
-        // After `gc`, because it walks the object list to find the
-        // player and the fruit, and a dead object is not one.
+        // THE WIDENINGS, in the graph so a row is hashed on the value it
+        // stores. Before `out_fields` (reads the state), after `gc` (walks
+        // the live objects).
         let owed = if widen { super::widen::widen(&mut s, &mut it.d)? } else { Vec::new() };
         let (fields, ubool) = out_fields(&s, &it.d)?;
         // What this outcome owes beyond its operators: the frame's, where its
         // path's model ended (`State::ended`), and the widenings' of the
-        // slots it STORES - a widened slot no field holds (its object died)
-        // is no part of the row.
+        // slots it STORES.
         let error = owed
             .iter()
             .filter(|(p, _)| fields.iter().any(|(q, _, _)| q == p))
             .fold(it.d.graph.fold(crate::transpile::graph::Op::Or, vec![global, s.ended]), |e, (_, w)| it.d.graph.fold(crate::transpile::graph::Op::Or, vec![e, *w]));
-        // The engine's numbering for THIS outcome's shape. Fields and
-        // dead cells are resolved together: they share one cell space,
-        // so a collision between the two halves is exactly as wrong as
-        // one within either, and only resolving them together sees it.
+        // The engine's numbering for THIS outcome's shape. Fields and dead
+        // cells share one cell space, so they are resolved together.
         let rt2 = super::bind::structure_of(&s, cart.clone(), cache.clone())?;
         let paths: Vec<Path> =
             fields.iter().map(|(p, _, _)| p.clone()).chain(ubool.iter().cloned()).collect();
@@ -450,20 +375,14 @@ pub fn trace_frame<'a>(
         let points = if it.d.platforms_unknown { Some(Points::new(&it.d, position)?) } else { None };
         let room = crate::transpile::graph::Room { cart: cart.clone(), cache: cache.clone() };
         outs = split_undecided_selects(&mut it.d, outs, points, Some(&room))?;
-        // The conditions an operator was EVALUATED under (`Symbolic::evaluated`)
-        // are read by the error's derivation too (`trace::error`), and they
-        // are the tracer's path guards: a select on a condition the lane
-        // cannot decide left in one reads a garbage bit, and its own error
-        // `not Known(c)` held on every lane that straddles `c` (room (6,0)
-        // f24: 750k such selects under the outcomes' fields, 2026-09-28).
-        // Read three-valued like the guards (`three_valued`): an unknown
-        // condition makes `own and at` unknown, which reads as error.
+        // The conditions an operator was EVALUATED under are path guards
+        // read by the error's derivation; an undecided select left in one
+        // would read a garbage bit. Read three-valued like the guards: an
+        // unknown condition makes `own and at` unknown, which reads as error.
         three_valued_evaluated(&mut it.d, &outs);
     }
-    // ERROR, DERIVED - once, now that the graph each outcome reads is final:
-    // from what the row stores (its fields), from where it is live (an
-    // error in the guard is the whole lane's), and from the conditions it
-    // already owes (`trace::error`).
+    // ERROR, DERIVED once the graph is final: from the fields, the guard
+    // and the conditions already owed (`trace::error`).
     let roots: Vec<Vec<NodeId>> = outs
         .iter()
         .map(|o| o.fields.iter().map(|(_, n, _)| *n).chain([o.guard, o.error]).collect())
@@ -474,15 +393,12 @@ pub fn trace_frame<'a>(
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         eprintln!("[build] trace_frame (widen {widen}): {} forks at the end, {} outcomes, {} pins", it.d.forks, outs.len(), pin.len());
     }
-    // DIAGNOSTIC (CELESTE_BUILD_TRACE): how many forks this frame minted, by
-    // origin, and how many an outcome can still see.
+    // DIAGNOSTIC: forks minted by origin, and how many an outcome still sees.
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
         for (_, o) in &it.d.fork_origins {
             *by.entry(o.as_str()).or_default() += 1;
         }
-        // And how many of them any outcome can still see (its fields, guard,
-        // error): the forks a kernel would really have to enumerate.
         use crate::transpile::graph::Op;
         let mut roots: Vec<NodeId> = Vec::new();
         for o in &outs {
@@ -508,10 +424,7 @@ pub fn trace_frame<'a>(
         );
     }
     let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
-    // The raise row's liveness: the OR over the guards at the raises this
-    // trace hit. Folded from `false`, so a frame that cannot raise gets
-    // `ConstBool(false)` and a frame with one raise gets that guard exactly
-    // (`false OR g` folds to `g`).
+    // The raise row's liveness: the OR of the guards at the raises hit.
     let raise = {
         use super::domain::Domain;
         let raised = std::mem::take(&mut it.raised);
@@ -528,9 +441,8 @@ pub fn trace_frame<'a>(
 type RowKey = (usize, Vec<NodeId>);
 
 /// `split_undecided_selects`' queue: the outcomes still to split, popped
-/// largest cone first, and deduped as they arrive - a side equal to an
-/// outcome still waiting is that outcome, live wherever either is, at the
-/// points either is (`Lite::merge`, `PointSet::union`).
+/// largest cone first, deduped as they arrive (a side equal to a waiting
+/// outcome merges into it: `Lite::merge`, `PointSet::union`).
 #[derive(Default)]
 struct Waiting {
     slots: Vec<Option<(Lite, Option<PointSet>)>>,
@@ -540,8 +452,7 @@ struct Waiting {
 
 /// One outcome of `split_undecided_selects` in flight: what a split changes,
 /// over the outcome it came from (`t`, whose shape, state and structure it
-/// keeps). Cloning the whole `FrameOut` per side held a state and a block
-/// per waiting outcome.
+/// keeps), so no state or block is cloned per side.
 #[derive(Clone)]
 struct Lite {
     t: usize,
@@ -550,8 +461,7 @@ struct Lite {
     fields: Vec<NodeId>,
     /// Conditions every lane DECIDES that a case split of this outcome may
     /// merge into outcomes already made (`absorbed`): what a split's atom
-    /// guarded in the select's condition, carried through every later
-    /// substitution.
+    /// guarded in the select's condition.
     rests: Vec<NodeId>,
 }
 
@@ -567,10 +477,9 @@ impl Lite {
         r
     }
 
-    /// Absorb another with the same row: live wherever either is, and in
-    /// error where the one live there is - each error only counts on its own
-    /// lanes, so the merged error is `(g1 and e1) or (g2 and e2)`, and where
-    /// the two errors are one node, that node.
+    /// Absorb another with the same row: live wherever either is; error
+    /// `(g1 and e1) or (g2 and e2)` (each counts on its own lanes), or the
+    /// one node where both are the same.
     fn merge(&mut self, d: &mut Symbolic, guard: NodeId, error: NodeId, rests: &[NodeId]) {
         for r in rests {
             if !self.rests.contains(r) && self.rests.len() < MAX_RESTS {
@@ -621,14 +530,11 @@ impl Waiting {
 }
 
 /// An outcome's error once its row is resolved: WHERE A LANE MAY ERR, with no
-/// select on an undecided condition left (`MayErr`) - by case analysis on
-/// the error alone, never on the outcome: splitting the outcome on the
-/// error's selects gave two sides with one row that merged back as
-/// `(g1 and e1) or (g2 and e2)`, the guards copied in, doubling each round
-/// (room (6,0): a 41-node row under a 5M-node error). Nor three-valued: a
-/// hull loses what a select's condition says about its value - the
-/// platform wrap `x < -16 ? 128 : (x > 128 ? -16 : x)` hulled to
-/// `[-16, 129]` failed its own containment, and the lane declined.
+/// select on an undecided condition left (`MayErr`). By case analysis on the
+/// error alone, not the outcome (split sides with one row merge back with
+/// the guards copied in, doubling each round); and not three-valued (a hull
+/// loses what a select's condition says about its value, e.g. the platform
+/// wrap).
 fn settle_error(d: &mut Symbolic, points: Option<&mut Points>, pts: Option<&PointSet>, room: Option<&crate::transpile::graph::Room>, mut o: Lite) -> Lite {
     let mut m = MayErr { points, room, memo: Default::default(), cases: 0 };
     let here = pts.cloned();
@@ -640,14 +546,15 @@ fn settle_error(d: &mut Symbolic, points: Option<&mut Points>, pts: Option<&Poin
 const MAY_CASES: usize = 4096;
 
 /// A boolean's `(may be true, may be false)` over the states a lane stands
-/// for, with no undecided select left: an `Or` or `And` or `Not` through its
-/// operands (`or` exact; `and` over-approximates, which for an error is
-/// the safe side), a node that reads an undecided select split on its
-/// lowest undecidable comparison - each case under that answer's `may`
-/// guard (`Symbolic::may_answers`), narrowed to the points that give it,
-/// and a case no point gives dropped - and a node that reads none as it is
-/// (the kernel reads an unknown as both). Past `MAY_CASES` cases, the
-/// three-valued reading (`three_valued`).
+/// for, with no undecided select left:
+/// - `Or` / `And` / `Not` through the operands (`and` over-approximates,
+///   the safe side for an error);
+/// - a node reading an undecided select is split on its lowest undecidable
+///   comparison, each case under that answer's `may` guard
+///   (`Symbolic::may_answers`) and narrowed to the points that give it;
+/// - a node reading none, as it is.
+///
+/// Past `MAY_CASES` cases, the three-valued reading (`three_valued`).
 struct MayErr<'a, 'r> {
     points: Option<&'a mut Points>,
     room: Option<&'r crate::transpile::graph::Room>,
@@ -794,21 +701,17 @@ impl PointSet {
     }
 }
 
-/// THE POINTS a platforms-unknown frame's comparisons are decided over
-/// (plans/graph-model.md step 5, Philippe 2026-09-28): every PLATFORM WORLD
-/// (`concrete::platform_worlds`) at every whole pixel of the player's region.
-/// A path through the frame carries the points still consistent with its
-/// answers: a comparison narrows them to where it can come out as the path
-/// takes it, a comparison that comes out one way at all of them is decided,
-/// and a path left with none is dropped - the answers of one path must all
-/// come from ONE arrangement of the platforms, which ten independent
-/// intervals could not say. Compile time only: a lane never holds a world;
-/// what reaches the kernel is each outcome's pixels (`position_guard`).
+/// THE POINTS a platforms-unknown frame's comparisons are decided over:
+/// every PLATFORM WORLD (`concrete::platform_worlds`) at every whole pixel of
+/// the player's region. A path carries the points consistent with its
+/// answers; a comparison one way at all of them is decided, and a path left
+/// with none is dropped, so one path's answers come from ONE arrangement of
+/// the platforms. Compile time only: what reaches the kernel is each
+/// outcome's pixels (`position_guard`).
 ///
-/// A comparison is decided at a point by the interval evaluator over its
-/// cone with the platforms' cells pinned to the world and the player's to
-/// the pixel (`Graph::eval_lenient_in`, the map included); what else it
-/// reads keeps its range, and a point it leaves undecided goes both ways.
+/// At a point, a comparison is decided by the interval evaluator with the
+/// platform cells pinned to the world and the player's to the pixel
+/// (`Graph::eval_lenient_in`); a point it leaves undecided goes both ways.
 pub struct Points {
     /// Per world, the value of each platform cell: `(cell, raw)`.
     worlds: Vec<Vec<(u32, i32)>>,
@@ -1015,57 +918,30 @@ impl Points {
     }
 }
 
-/// MAKING THE FRAME EXECUTABLE UNDER ABSTRACT INPUTS (plans/graph-model.md
-/// section 1, stage 2). The traced graph computes a row for concrete inputs;
-/// a SELECT whose condition a lane can hold both ways cannot be evaluated -
-/// it stands for concrete states answering each way.
+/// MAKING THE FRAME EXECUTABLE UNDER ABSTRACT INPUTS. A SELECT whose
+/// condition a lane can hold both ways cannot be evaluated: it stands for
+/// concrete states answering each way.
 ///
-/// WHERE IT MATTERS, AND WHERE IT DOES NOT (Philippe, 2026-09-27). A select
-/// the row STORES (a field, a key) must be resolved: the row is one value.
-/// The ERROR is strict, but once the row is resolved it is finished rather
-/// than split (`settle_error`): its splits all came back to one row, merged
-/// as the three-valued reading with the guards copied in. A select in the GUARD
-/// is only a question of whether the lane is live, and that is three-valued
-/// already - an undecided `live` reads as live (`asm_kernel::read_zb_may`).
-/// So the guard is rewritten, not split (`three_valued`): a boolean select
-/// becomes `(c and a) or (not c and b)`, exact in Kleene logic, and a number
-/// selected on an undecided `c` is pushed through whatever reads it into
-/// the select's arms. Splitting the guard's selects too made the player's
-/// every collision test after a move split again on the platforms the move
-/// had already asked about - room (6,0), 50,000 splits for 112 outcomes in
-/// one trace.
+/// A select the row STORES must be resolved (the row is one value), so it is
+/// split on; the ERROR is then settled (`settle_error`), and the GUARD,
+/// three-valued already (`asm_kernel::read_zb_may`), rewritten
+/// (`three_valued`), neither split.
 ///
-/// Then, one at a time: find a select the row reads whose
-/// condition a lane can hold both ways, take the FIRST in program order
-/// (the lowest node: its condition was computed first), and split the
-/// outcome in two - the condition true in one, false in the other,
-/// everything that reads it refolded, each side's guard narrowed to the
-/// lanes where some state they stand for gives that answer
-/// (`Symbolic::may_answers`). Then look again on the split outcomes: a
-/// condition that was undecidable only through the other answer is decided
-/// now, and never split - a loop that stops at the first blocked pixel
-/// comes out as one outcome per stop point. Stop when no stored value has
-/// an undecided select, and fuse the outcomes that came out equal.
-///
-/// Comparisons are refolded with the static ranges (`Symbolic::compare`), so
-/// a branch the kernel's region never takes folds away, and what it read
-/// with it.
-///
-/// At a platforms-unknown level each path also carries its POINTS (`Points`):
-/// the worlds and pixels its answers are consistent with. A comparison only
-/// one answer comes out of at them is decided without a split, and each
-/// outcome ends live only on its pixels.
+/// One split at a time: the FIRST such select in program order, the outcome
+/// in two (condition true / false, readers refolded with the static ranges,
+/// each guard narrowed by `Symbolic::may_answers`), until no stored value
+/// has one; equal outcomes fused. At a platforms-unknown level each path
+/// carries its POINTS (`Points`): a comparison with one answer at them is
+/// decided without a split, and each outcome ends live only on its pixels.
 fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Option<Points>, room: Option<&crate::transpile::graph::Room>) -> Result<Vec<FrameOut>> {
     use crate::transpile::graph::Op;
     const MAX_OUTCOMES: usize = 4096;
     let n_in = outs.len();
     // Templates of one shape share a class: their outcomes dedupe together.
     let class: Vec<usize> = (0..outs.len()).map(|i| (0..=i).find(|&j| outs[j].shape == outs[i].shape).expect("itself")).collect();
-    // The outcomes waiting, LARGEST CONE FIRST. A split only shrinks an
-    // outcome's cone, so every path into a state has arrived - and merged
-    // with it - before the state is split: popped in any other order, a
-    // state reached by several paths was split again for each (room (6,0):
-    // 20k splits churning ~20 outcomes).
+    // The outcomes waiting, LARGEST CONE FIRST. A split only shrinks a cone,
+    // so every path into a state has arrived and merged before it is split
+    // (else it is split again per path).
     let mut work = Waiting::default();
     let everywhere = points.as_ref().map(|p| PointSet::full(p.len()));
     for (t, o) in outs.iter().enumerate() {
@@ -1073,9 +949,8 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             t,
             guard: o.guard,
             error: o.error,
-            // The transfer roots (`FrameOut::arc`) ride with the fields: the
-            // same substitutions, and two outcomes are one only where they
-            // agree in them too.
+            // The transfer roots (`FrameOut::arc`) ride with the fields: same
+            // substitutions, and they are part of what makes two outcomes one.
             fields: o.fields.iter().map(|f| f.1).chain(o.arc.iter().copied()).collect(),
             rests: Vec::new(),
         };
@@ -1086,9 +961,8 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
     let mut done: Vec<(Lite, Option<PointSet>)> = Vec::new();
     while let Some((o, pts)) = work.pop(&class) {
         anyhow::ensure!(work.len() + done.len() < MAX_OUTCOMES, "more than {MAX_OUTCOMES} outcomes splitting undecided selects");
-        // The cone of what must be resolved, in node order - the outcome's
-        // own, not the arena's: each split adds nodes, and a walk of the
-        // whole arena per split made the splitting quadratic.
+        // The cone of what must be resolved, in node order: the outcome's
+        // own, not the arena's (that would be quadratic).
         let reach = cone(&d.graph, &o.row());
         let first: Option<NodeId> = reach
             .iter()
@@ -1096,11 +970,7 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             .map(|n| d.graph.get(*n).args[0])
             .find(|c| d.lane_undecidable(*c));
         let Some(c) = first else {
-            // The row is resolved; the error is finished rather than split
-            // (`settle_error`). Splitting it gave two sides with one row,
-            // merged straight back as `(g1 and e1) or (g2 and e2)` - the
-            // three-valued reading with the guards copied in, doubling each
-            // round (room (6,0): a 41-node row under a 5M-node error).
+            // The row is resolved; the error is settled, not split.
             let o = settle_error(d, points.as_mut(), pts.as_ref(), room, o);
             let same = |p: &Lite| class[p.t] == class[o.t] && p.fields == o.fields;
             match done.iter_mut().find(|(p, _)| same(p)) {
@@ -1114,18 +984,15 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             }
             continue;
         };
-        // Split on the finest undecidable part of it - the lowest comparison
-        // a lane can hold both ways - so the points it is decided over are
-        // the answer's own, not a condition's built of several.
+        // Split on the finest undecidable part: the lowest comparison a lane
+        // can hold both ways.
         let atom = cone(&d.graph, &[c])
             .into_iter()
             .find(|n| matches!(d.graph.get(*n).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::UnknownBool(_)) && d.lane_undecidable(*n))
             .unwrap_or(c);
-        // Where each answer can come from, among this path's points: an
-        // answer no point gives is no side at all, and when only one is
-        // left the comparison is DECIDED here - the same answer at every
-        // point, so every state this path stands for gives it, and no
-        // lane's guard needs narrowing.
+        // Where each answer can come from among this path's points: an
+        // answer no point gives is no side, and with one side left the
+        // comparison is DECIDED (no guard narrowing).
         let sides: Vec<(bool, Option<PointSet>)> = match (points.as_mut(), &pts) {
             (Some(p), Some(here)) => {
                 let (yes, no) = p.answers(d, room, atom);
@@ -1140,14 +1007,10 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             n_splits += 1;
         }
         let (may_true, may_false) = d.may_answers(atom);
-        // The equal side of `x == k` (`k` a literal point, `x` a set a lane
-        // holds) knows `x`: it IS `k` on every state the side stands for, so
-        // the side reads `k` wherever it read `x`. Exact, and what a near
-        // level needs: a floor's `state` on `[0, 2]` splits on its update's
-        // `state == 0 / 1 / 2`, and an outcome that keeps the floor exact (the
-        // player overlaps it) must store the state it narrowed to, as the
-        // mark filter's projection does (`Rt2::widen_to`). The other side
-        // learns nothing an interval can hold.
+        // The equal side of `x == k` (`k` a literal point, `x` a set) reads
+        // `k` wherever it read `x`: exact, and a near level's exact floor must
+        // store the `state` it narrowed to. The other side learns nothing an
+        // interval can hold.
         let narrowed = {
             let node = d.graph.get(atom);
             let point = |n: NodeId| matches!(d.graph.get(n).op, Op::Const(lo, hi) if lo == hi);
@@ -1158,10 +1021,9 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             }
         };
         // The atom's SIBLINGS in the select's condition: the other operands
-        // of a conjunction or disjunction the atom (or its negation) is an
-        // operand of - `not check(player, 0, 0)` beside `delay <= 0`. What
-        // the atom guarded, and what a side may be case split on to merge
-        // (`absorbed`), with the condition itself.
+        // of an `And`/`Or` the atom (or its negation) is in (`not check(player,
+        // 0, 0)` beside `delay <= 0`). With the condition itself, what a side
+        // may be case split on to merge (`absorbed`).
         let sibs: Vec<NodeId> = {
             let not_atom = d.graph.fold(Op::Not, vec![atom]);
             let is_atom = |n: NodeId| n == atom || n == not_atom;
@@ -1203,8 +1065,7 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
                 fields: o.fields.iter().map(|f| m(*f)).collect(),
                 rests: Vec::new(),
             };
-            // This split's candidates first; the inherited ones are tried
-            // again once every outcome is made (below).
+            // This split's candidates first, then the inherited ones.
             let mut fresh: Vec<NodeId> = Vec::new();
             for r in std::iter::once(c).chain(sibs.iter().copied()).map(m) {
                 if !fresh.contains(&r) {
@@ -1240,12 +1101,10 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
             }
         }
     }
-    // The same once every outcome is made, on every candidate an outcome
-    // carries: one whose halves were made only after it was split is
-    // absorbed now. Absorbing makes no row, so an outcome that cannot be
-    // absorbed can become so only by gaining candidates (a merge) - it is
-    // tried again then, until none is. (A merge changes no row either, so
-    // the rows are kept beside `done`.)
+    // Absorption again once every outcome is made (halves made after the
+    // split). Absorbing makes no row, so an outcome is retried only when a
+    // merge gives it new candidates; rows never change, so they are kept
+    // beside `done`.
     let mut keys: Vec<_> = done.iter().map(|(p, _)| Waiting::key(&class, p)).collect();
     let mut dirty = vec![true; done.len()];
     while let Some(i) = dirty.iter().position(|x| *x) {
@@ -1273,19 +1132,15 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         eprintln!("[build] split_undecided_selects: {n_in} outcomes, {n_splits} splits, {n_decided} decided by the points, {n_rest} absorbed by a case split, {} out", done.len());
     }
-    // Each outcome whole again, over its template; what reaches the kernel
-    // of the points is its pixels.
+    // Each outcome whole again, over its template; of the points, only its
+    // pixels reach the kernel.
     let mut whole = Vec::with_capacity(done.len());
     for (lite, pts) in done {
-        // The error settled again: merged outcomes copied their guards into
-        // it, and what a guard's selects read (a tile test at a position a
-        // split left open) is only exact case by case - three-valued, a tile
-        // test past `ARMS` was an unknown in the error and declined the
-        // lanes of the other path (room (6,0) f26, 2026-09-28).
+        // The error settled again: merges copied guards into it, whose
+        // selects are only exact case by case.
         let lite = settle_error(d, points.as_mut(), pts.as_ref(), room, lite);
         let mut o = outs[lite.t].clone();
-        // The guard read three-valued now, with what the row's splits
-        // decided already substituted (`three_valued`).
+        // The guard, three-valued, with the row's splits substituted.
         o.guard = three_valued(d, lite.guard);
         o.error = lite.error;
         let nf = o.fields.len();
@@ -1307,22 +1162,19 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
 /// select becomes `(c and a) or (not c and b)`, exact in Kleene logic. A
 /// NUMBER selected on an undecided `c` becomes the hull of its arms where
 /// the lane does not decide `c`, and the select where it does:
-/// `Sel(Known(c), Sel(c, x, y), [min, max])` - a comparison on the hull that
-/// straddles reads as "may be live", which is what `live` over-approximates
-/// with anyway. (Pushing the readers into the arms instead is exact and
-/// exponential: the player's position after a move is a tree of such
-/// selects, and every sum of two of them multiplies.) Except for the ops the
-/// kernel computes on exact operands only (`exact_only`: a tile lookup at a
-/// hulled position cannot be assembled): those are pushed into the arms,
-/// up to `ARMS` combinations (`arms`).
+/// `Sel(Known(c), Sel(c, x, y), [min, max])` - a straddling comparison on
+/// the hull reads as "may be live", which `live` over-approximates anyway.
+/// (Pushing the readers into the arms is exact but exponential.) Except for
+/// the ops the kernel computes on exact operands only (`exact_only`): those
+/// are pushed into the arms, up to `ARMS` combinations (`arms`).
 ///
 /// Also the error's, once the row is resolved (`settle_error`).
 fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
     use crate::transpile::graph::Op;
     let nodes = cone(&d.graph, &[root]);
-    // The select a wrapper this built already guards (`Sel(Known(c), Sel(c,
-    // ..), hull)`) stays as it is: rewriting it again moved it off the
-    // registration that bounds its error - so this is idempotent.
+    // A select this already wrapped (`Sel(Known(c), Sel(c, ..), hull)`)
+    // stays as it is, keeping the registration that bounds its error:
+    // idempotent.
     let wrapped: rustc_hash::FxHashSet<NodeId> = nodes
         .iter()
         .filter_map(|n| {
@@ -1339,9 +1191,7 @@ fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
         return root;
     }
     // The booleans, typed bottom-up from what each node IS (a boolean op, a
-    // boolean cell, a select of booleans) - not from who reads it: a select
-    // of booleans read as another select's condition, or by `Eq`, was taken
-    // for a number and hulled (room (6,0), 2026-09-28).
+    // boolean cell, a select of booleans), never from who reads it.
     let mut boolean: rustc_hash::FxHashSet<NodeId> = Default::default();
     for &n in &nodes {
         let node = d.graph.get(n);
@@ -1384,13 +1234,11 @@ fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
             } else {
                 let decided = d.graph.fold(Op::Known, vec![c]);
                 let picked = d.graph.fold(Op::Sel, vec![c, x, y]);
-                // Evaluated only where the lane decides `c` - its own error
-                // holds nowhere else (`trace::error`). SET, not added to:
-                // `picked` is the original select itself (hash-consed), and
-                // what the tracer registered for it (an unguarded `true`)
-                // made its `not Known(c)` hold on every lane (room (6,0) f24,
-                // 2026-09-28). This wrapper is the only place a select on an
-                // undecided condition survives the split pass.
+                // Evaluated only where the lane decides `c`, so its own error
+                // holds nowhere else. SET, not OR-ed: `picked` is the original
+                // select (hash-consed), whose earlier registration would make
+                // `not Known(c)` hold everywhere. This wrapper is the only
+                // place a select on an undecided condition survives.
                 d.evaluated.insert(picked, decided);
                 let (xl, yl) = (d.graph.fold(Op::Lo, vec![x]), d.graph.fold(Op::Lo, vec![y]));
                 let (xh, yh) = (d.graph.fold(Op::Hi, vec![x]), d.graph.fold(Op::Hi, vec![y]));
@@ -1400,13 +1248,10 @@ fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
                 d.graph.fold(Op::Sel, vec![decided, picked, hull])
             }
         } else if exact_only(d, &op, &args) && args.iter().any(|x| affected.contains(x) && !boolean.contains(x) && !is_bool_op(&d.graph.get(*x).op)) {
-            // An op the kernel only computes on exact operands (a tile
-            // lookup, `mget`, ...), reading a hull: distributed into the
-            // arms instead, one per combination of the undecided selects
-            // it reads - a boolean joined Kleene-wise over them, a number
-            // the hull of the arms' values. Past `ARMS` combinations, the
-            // weakest value (unknown, or the whole range): sound, and it
-            // has not been seen.
+            // An exact-only op reading a hull: distributed into the arms, one
+            // per combination of the undecided selects it reads (a boolean
+            // joined Kleene-wise, a number the hull of the arms' values).
+            // Past `ARMS`, the weakest value (unknown, or the whole range).
             let mut combos: Option<Vec<(NodeId, Vec<NodeId>)>> = Some(vec![(yes, Vec::new())]);
             for (k, x) in args.iter().enumerate() {
                 let alts = if affected.contains(x) && !boolean.contains(x) && !is_bool_op(&d.graph.get(*x).op) {
@@ -1600,30 +1445,16 @@ const MAX_RESTS: usize = 32;
 /// both halves are outcomes already made (`made`): its halves, to merge into
 /// them, or `None`.
 ///
-/// The atom a split takes is the finest undecidable part of a select's
-/// condition, and with it substituted the rest of the condition may be one
-/// every lane DECIDES: a fall floor's `delay <= 0 and not check(player, 0,
-/// 0)` on its `delay <= 0` side - the floor comes back where the player is
-/// not inside it. That select then stays in the row, a third variant of the
-/// floor's solidity beside "solid" and "hidden": on every lane it IS one of
-/// the two, but as a row it is neither, so each floor a region's player
-/// reaches multiplied the outcomes by 3 instead of 2 (room (6,1), five floors
-/// side by side under its spawn: 2 x 3^4 outcomes in one region, 21k bodies
-/// in one kernel, 2026-10-01). Split on the decided rest, the
-/// halves are the "solid" and the "hidden" rows, which are outcomes of their
-/// own; the outcome is then theirs, live where they are or where it was.
+/// With a split's atom substituted, the rest of a select's condition may be
+/// one every lane DECIDES (a fall floor's `delay <= 0 and not check(player,
+/// 0, 0)` on its `delay <= 0` side). That select would stay in the row as a
+/// third variant beside "solid" and "hidden" - on every lane one of the two,
+/// as a row neither - multiplying outcomes by 3 per floor instead of 2. Split
+/// on the decided rest, the halves are the two existing rows.
 ///
 /// EXACT: a lane decides `cv`, so it takes exactly the half its own answer
-/// gives (no `may`), and that half's row, error and guard are the outcome's
-/// on that lane. Taken only where BOTH halves merge, so it never adds an
-/// outcome: a case split that merges with nothing only adds a body.
-///
-/// Measured: the room's level-0 kernels 287,705 -> 140,323 bodies but 11.6M
-/// -> 10.7M fused nodes, f35-f40 7-21% faster. A kernel's cost is its fused
-/// nodes, and ~80% of those are the outcomes' `live`/`error` cones (the
-/// three-valued guards over the floors' `state`/`delay` intervals, copied
-/// into the errors by `Lite::merge`), not their rows (region (4,6)'s
-/// largest player kernel: 450k nodes, 34k under a field).
+/// gives, with the outcome's row, error and guard on that lane. Taken only
+/// where BOTH halves merge, so it never adds an outcome.
 fn absorbed(
     d: &mut Symbolic,
     class: &[usize],
@@ -1632,10 +1463,9 @@ fn absorbed(
     made: impl Fn(&RowKey) -> bool,
 ) -> Option<Vec<Lite>> {
     use crate::transpile::graph::Op;
-    // Only the ROW is rebuilt: the guard and the error read `cv` as the lane
-    // decides it, so on the lanes of a half (`guard and cv`, `guard and not
-    // cv`) they are the outcome's own unchanged - and an error's cone can be
-    // millions of nodes under a row of tens.
+    // Only the ROW is rebuilt: on a half's lanes the guard and error read
+    // `cv` as the lane decides it, so they are unchanged (and an error's cone
+    // can be huge).
     let mut reach: Option<Vec<NodeId>> = None;
     for &cv in cands {
         if d.lane_undecidable(cv) || d.decide(&cv).is_some() {
@@ -1675,12 +1505,10 @@ fn absorbed(
 /// (`Symbolic::compare`), the rest by `Graph::fold`. Only the nodes that
 /// changed are in the map.
 ///
-/// Where a node was EVALUATED (`Symbolic::evaluated`, what bounds its own
-/// error, `trace::error`) goes with it: its rebuild is registered at the
-/// rebuilt condition, so the cone is widened to those conditions first.
-/// Dropped, the rebuild's own error held everywhere - a three-valued guard's
-/// `Sel(Known(c), Sel(c, ..), ..)` rebuilt by a split erred as `not Known(c)`
-/// on every lane (room (6,0) f24, 2026-09-28).
+/// Where a node was EVALUATED (`Symbolic::evaluated`, which bounds its own
+/// error) goes with it: the rebuild is registered at the rebuilt condition,
+/// so the cone is widened to those conditions first. Dropped, the rebuild's
+/// own error would hold on every lane.
 fn rebuild_all(d: &mut Symbolic, cone: &[NodeId], subst: &rustc_hash::FxHashMap<NodeId, NodeId>) -> rustc_hash::FxHashMap<NodeId, NodeId> {
     use super::domain::{Cmp, Domain};
     use crate::transpile::graph::Op;
@@ -1730,9 +1558,8 @@ fn rebuild_all(d: &mut Symbolic, cone: &[NodeId], subst: &rustc_hash::FxHashMap<
     map
 }
 
-/// The player is the object with a `djump` field. Naming it by
-/// position would be wrong the moment an object dies: `objects` is a
-/// list and things are deleted from it.
+/// The player: the object with a `djump` field (not a position: objects
+/// are deleted from the list).
 #[cfg(test)]
 pub fn find_player<D: Domain>(st: &State<D>) -> Option<Path> {
     let objs = vec![iface::key("objects")];
@@ -1749,14 +1576,9 @@ pub fn find_player<D: Domain>(st: &State<D>) -> Option<Path> {
     None
 }
 
-/// The six cells `Rt2::partition_pm1` splits a block on, as tracer
-/// paths: globals `has_dashed` and `freeze`, and player fields
-/// `dash_time`, `djump`, `p_dash`, `p_jump` (`src/compiled/mod.rs`).
-///
-/// This list is the CONTRACT between the two sides. A body compiled for
-/// a key is dispatchable only to blocks the engine has partitioned on
-/// exactly these cells; drop one here and the pin's error still catches
-/// the mismatch, but every such block declines instead of running.
+/// The six "pm1 key" cells, as tracer paths: globals `has_dashed` and
+/// `freeze`, and player fields `dash_time`, `djump`, `p_dash`, `p_jump`.
+/// A test fixture for pinning a body to one key.
 #[cfg(test)]
 pub fn pm1_paths(player: &Path) -> Vec<Path> {
     let mut v: Vec<Path> = vec![vec![iface::key("has_dashed")], vec![iface::key("freeze")]];
@@ -1768,9 +1590,8 @@ pub fn pm1_paths(player: &Path) -> Vec<Path> {
     v
 }
 
-/// The pm1 key a state is IN: the six paths at the values it holds.
-/// Compiling for a different key means handing `trace_frame` a different
-/// value list, not a different state.
+/// The pm1 key a state is IN: the six paths at the values it holds, as
+/// `trace_frame`'s pin list.
 #[cfg(test)]
 pub fn pm1_key(player: &Path, st: &State<Symbolic>, d: &Symbolic) -> Result<Vec<(Path, Conc)>> {
     let mut out = Vec::new();
@@ -1804,10 +1625,8 @@ pub fn set_buttons(d: &mut Symbolic, st: &mut State<Symbolic>, bits: &[bool; 6])
 /// The input vector for one PERTURBATION of the traced state: the values
 /// the frame was traced at, with some slots replaced.
 ///
-/// This is what makes an input cell a variable rather than a constant.
-/// Checking the graph only at the values it was traced at would pass for
-/// a graph that had folded every one of them away, which is the one bug
-/// the whole design is exposed to.
+/// Checking only at the traced values would pass a graph that had folded
+/// every input away.
 #[cfg(test)]
 pub fn cells_with(iface: &Iface, over: &[(Path, Conc)]) -> Result<Vec<Conc>> {
     let mut v = iface.init.clone();
@@ -1826,8 +1645,8 @@ pub fn cells_with(iface: &Iface, over: &[(Path, Conc)]) -> Result<Vec<Conc>> {
 /// (`bits`, in `__button_states` order), for the concrete evaluator, which
 /// has no value for a fork: the cone of the frame's outcomes specialized
 /// into a fresh graph, and the map to it. The buttons are the forks
-/// `Symbolic::unknown_bool` minted, in the order `__reset_button_states`
-/// asked for them; every other fork is left standing.
+/// `Symbolic::unknown_bool` minted, in `__reset_button_states` order; every
+/// other fork is left standing.
 #[cfg(test)]
 pub fn at_buttons(g: &Graph, f: &Frame, bits: &[bool; 6]) -> Result<(Graph, Vec<NodeId>)> {
     let buttons: Vec<u8> = f.fork_origins.iter().filter(|(_, o)| o == super::domain::UNKNOWN_BOOL_ORIGIN).map(|(d, _)| *d).collect();
@@ -1846,10 +1665,8 @@ pub fn at_buttons(g: &Graph, f: &Frame, bits: &[bool; 6]) -> Result<(Graph, Vec<
 }
 
 /// Check one traced frame against the oracle at one (inputs, buttons)
-/// point, `at` being the frame at those buttons (`at_buttons`). Returns `(which outcome claimed it, fields compared)` - the
-/// outcome index so a caller can tell whether the guards ever
-/// discriminate, and the count so it can tell "agreed about everything"
-/// from "agreed about nothing, because the paths did not line up".
+/// point, `at` being the frame at those buttons (`at_buttons`). Returns
+/// `(which outcome claimed it, fields compared)`.
 #[cfg(test)]
 pub fn check_at(
     it: &Interp<'_, Symbolic>,
@@ -1871,9 +1688,8 @@ pub fn check_at(
             live.push(i);
         }
     }
-    // The frontier's guards are pairwise disjoint and cover everything
-    // (see `State::guard`), so exactly one outcome claims this lane.
-    // Anything else is a broken invariant, not a rounding difference.
+    // The guards are pairwise disjoint and cover everything (`State::guard`):
+    // exactly one outcome claims this lane.
     if live.len() != 1 {
         bail!("{:?}: {} outcomes claim this assignment, not 1", bits, live.len());
     }
@@ -1883,16 +1699,9 @@ pub fn check_at(
     }
     let mut n = 0;
     for (p, want) in oracle {
-        // The button cells are DEAD at the boundary (`FrameOut::ubool`),
-        // so the trace does not compute them and there is nothing to
-        // compare. Skipped rather than dropped from the count: the total
-        // below still has to account for every scalar the oracle has, so
-        // a slot cannot go missing unnoticed.
-        //
-        // What this does NOT check is the deadness claim itself. The
-        // oracle knows the resolved value and the trace declines to; if
-        // a `btn` read ever outlived the boundary, this comparison would
-        // stay silent. That premise lives in `FrameOut::ubool`.
+        // Dead cells (`FrameOut::ubool`) are not computed; skipped, but still
+        // counted by the total below. The deadness claim itself is not
+        // checked here.
         if o.ubool.contains(p) {
             continue;
         }
@@ -1928,11 +1737,9 @@ mod tests {
 
     /// A body compiled for one pm1 key must REFUSE a state in another.
     ///
-    /// The pin folds the key's values into the body, so nothing in it
-    /// reads those cells any more - which is exactly how a specialization
-    /// silently runs the wrong physics if the obligation is left implicit.
-    /// `pin_guard`'s negation is the frame's error, and this is the test that
-    /// it bites: perturb one pinned cell and the frame declines the lane.
+    /// The pin folds the key's values into the body, so nothing reads those
+    /// cells; `pin_guard`'s negation is the frame's error, and this checks it
+    /// bites: perturb one pinned cell and the frame declines the lane.
     #[test]
     fn a_body_pinned_to_a_pm1_key_refuses_any_other_key() {
         let src = cart::sources().expect("sources");
@@ -2003,7 +1810,7 @@ mod tests {
         }
     }
 
-    /// `ice_at` is `tile_flag_at(.., 4)` (2026-10-01: modelled, room (3,1)).
+    /// `ice_at` is `tile_flag_at(.., 4)`.
     /// In every room of the map, with that room's collision cache, the
     /// tracer's answer for a concrete rectangle is the tile scan's - true
     /// on some rectangle in the rooms with ice (so the check is not
@@ -2074,22 +1881,13 @@ mod tests {
 
     /// `break` in a loop whose bound the tracer CANNOT know.
     ///
-    /// The PICO-8 corpus cannot reach this. `run_for_symbolic` only runs
-    /// when the limit is unknown, and every program PICO-8 can also run is
-    /// concrete, so the corpus exercises `run_for` and nothing else. That
-    /// is exactly why the bug lived here and not there: `for_body`
-    /// rewrote `Flow::Break` to `Flow::Normal`, the state went back into
-    /// the frontier and ran the body again, and `break` did nothing.
-    ///
-    /// So: trace the loop once with a symbolic limit, then evaluate the
-    /// resulting graph at each concrete limit and compare with the answer
-    /// worked out by hand. One graph, every point - the same discipline as
-    /// the frame check.
+    /// The PICO-8 corpus cannot reach `run_for_symbolic` (its limits are
+    /// concrete). Trace the loop once with a symbolic limit, then evaluate
+    /// the graph at each concrete limit against the hand-worked answer.
     #[test]
     fn break_leaves_a_loop_whose_bound_is_symbolic() {
-        // `abs(amount)` because `unroll_bound` is keyed on the limit
-        // expression's SOURCE TEXT, and that is the cart's own spelling
-        // (`move_x`/`move_y`), which is where this actually bites.
+        // `abs(amount)`: `unroll_bound` is keyed on the limit expression's
+        // SOURCE TEXT, and this is the cart's own spelling (`move_x`/`move_y`).
         let src = "
 function f(amount)
   local n = 0
@@ -2111,10 +1909,8 @@ end
         let Some(Value::Num(node)) = iface::get(&st, &[iface::key("result")]) else {
             panic!("f did not return a number")
         };
-        // 100 is well past the unroll bound of 8 on purpose: once a
-        // `break` is reached the bound stops mattering, so the frame must be
-        // modelled there too. Before the fix the loop ran on and the "it
-        // finished" obligation made this lane deopt.
+        // 100 is past the unroll bound of 8 on purpose: once `break` is
+        // reached the bound stops mattering, so the lane must not decline.
 
         for a in [0i16, 1, 2, 3, 5, 8, 100] {
             let cells = [Conc::Num(crate::pico8_num::Pico8Num::from_i16(a))];
@@ -2139,18 +1935,12 @@ end
     /// Trace ONE frame with the player's fields symbolic and the six
     /// buttons free, then check that one graph against the oracle at
     /// every point of a position/speed sweep crossed with all 64 button
-    /// assignments.
+    /// assignments: ONE graph must answer for all of them (checking only at
+    /// the traced values would pass a graph that folded its inputs away).
     ///
-    /// The sweep is the part that matters. Checking only at the values
-    /// the frame was traced at would pass for a graph that had constant
-    /// -folded every input away, and re-tracing per point would not test
-    /// anything: the claim is that ONE graph answers for all of them.
-    ///
-    /// Every step up to the comparison must succeed - the warm-up, the
-    /// trace, the oracle at every point: a step that stopped used to print
-    /// and RETURN, which passed the test without comparing anything. A point
-    /// the trace DECLINES is a refusal, counted (and bounded below), not a
-    /// wrong answer.
+    /// Every step up to the comparison must succeed, or the test passes
+    /// without comparing anything. A point the trace DECLINES is a refusal,
+    /// counted, not a wrong answer.
     #[test]
     fn a_traced_frame_agrees_with_the_oracle() {
         let src = cart::sources().expect("sources");
@@ -2172,10 +1962,8 @@ end
         cart::inject_tile_flag_at(&mut st);
         let mut st = run_one(&mut it, &init, st).expect("_init");
 
-        // Warm up with the buttons held concrete (the toplevel leaves
-        // them false and `btn` writes concrete values back, so nothing
-        // symbolic enters). This gets past the spawn animation, which
-        // reads no buttons and would make the check vacuous.
+        // Warm up with the buttons concrete, past the spawn animation (which
+        // reads no buttons and would make the check vacuous).
         let mut player = None;
         for n in 0..40 {
             if let Some(p) = find_player(&st) {
@@ -2187,11 +1975,8 @@ end
         let (warm, player) = player.expect("[verify] a player within 40 warm-up frames");
         eprintln!("[verify] player at {} after {} warm-up frames", iface::show(&player), warm);
 
-        // The rest of the frame's INPUT state. Everything else reachable
-        // from the globals table is static configuration - the `k_*`
-        // button numbers, each type's `tile`, `room.x/y` - or the button
-        // slots, which `__reset_button_states` makes free choices rather
-        // than cells.
+        // The rest of the frame's INPUT state; everything else reachable is
+        // static configuration or the button slots.
         let mut roots: Vec<Path> = vec![player.clone()];
         for g in [
             "deaths",
@@ -2220,13 +2005,9 @@ end
             it.d.graph.len() - before
         );
 
-        // PERTURB THE INPUTS as well as the buttons. Without this the
-        // graph is only ever evaluated at the values it was traced at,
-        // which a graph that folded every input away would also pass.
-        // The same override goes into both sides: written into the heap
-        // for the oracle, into the cell vector for the graph. Nothing is
-        // re-traced - reusing one graph across all of these is the claim
-        // being tested.
+        // PERTURB THE INPUTS as well as the buttons: the same override into
+        // the heap for the oracle and into the cell vector for the graph.
+        // Nothing is re-traced.
         let px = |k: &str| {
             let mut p = player.clone();
             p.push(iface::key(k));
@@ -2243,17 +2024,13 @@ end
             Conc::Bool(_) => panic!("{} is a boolean", iface::show(p)),
         };
         let n = crate::pico8_num::Pico8Num::from_i16;
-        // A cross product rather than a random sample: the interesting
-        // structure is where the player is relative to the tiles, and a
-        // sweep over position and speed hits walls, floors and the pit
-        // below the room, which is what the non-trivial output SHAPES are.
+        // A cross product over position and speed: it hits walls, floors
+        // and the pit below the room, i.e. the non-trivial output SHAPES.
         let mut perts: Vec<(String, Vec<(Path, Conc)>)> = Vec::new();
         for dx in [-8i16, -1, 0, 1, 8] {
             for dy in [-8i16, -1, 0, 1, 8, 24, 64] {
-                // A falling speed of 8 makes `move_y` step further than
-                // the unroll bound, so it is the REFUSAL case - kept on
-                // one column of the sweep so that path stays covered
-                // without spending a quarter of the run on it.
+                // A falling speed of 8 steps past the unroll bound: the
+                // REFUSAL case, on one column of the sweep only.
                 let sys: &[Option<i16>] =
                     if dx == 0 { &[None, Some(-2), Some(2), Some(8)] } else { &[None, Some(-2), Some(2)] };
                 for sy in sys.iter().copied() {
@@ -2268,10 +2045,8 @@ end
                 }
             }
         }
-        // The control-flow inputs, one at a time rather than crossed with
-        // the position sweep: each of these changes which BRANCH the
-        // frame takes rather than where it lands, so crossing them would
-        // multiply the run without touching anything new.
+        // The control-flow inputs, one at a time: each changes which BRANCH
+        // the frame takes, so crossing them adds nothing.
         let g = |k: &str| vec![iface::key(k)];
         for (name, over) in [
             ("freeze", vec![(g("freeze"), Conc::Num(n(1)))]),
@@ -2291,9 +2066,7 @@ end
             ("dashing", vec![(px("dash_time"), Conc::Num(n(3)))]),
             ("dash effect", vec![(px("dash_effect_time"), Conc::Num(n(5)))]),
             ("frames", vec![(g("frames"), Conc::Num(n(29)))]),
-            // Out of the TOP of the room (`this.y < -4`), which is
-            // `next_room()` - a whole new object list, and the only way
-            // to reach the largest of the output shapes.
+            // Out of the TOP of the room: `next_room()`, the largest shape.
             ("top edge", vec![(px("y"), Conc::Num(at(&px("y")) - n(120)))]),
             ("right edge", vec![(px("x"), Conc::Num(at(&px("x")) + n(124)))]),
             ("left edge", vec![(px("x"), Conc::Num(at(&px("x")) - n(16)))]),
@@ -2301,21 +2074,16 @@ end
             perts.push((name.to_string(), over));
         }
 
-        // WHAT are the outcomes? Shape divergence is the only thing that
-        // can leave more than one, so two outcomes with the SAME shape
-        // would be a `collapse` bug, and two with the same scalar count
-        // but different shapes are worth looking at closely - that is how
-        // the body-interning bug was found, where ten of twelve outcomes
-        // were the same 110 scalars and differed only in `BodyId`s.
+        // WHAT are the outcomes? Only shape divergence can leave more than
+        // one, so two with the SAME shape are a `collapse` bug; same scalar
+        // count but different shapes are printed for a closer look.
         {
             let mut by_len: std::collections::BTreeMap<usize, usize> = Default::default();
             for o in &f.outs {
                 *by_len.entry(o.fields.len()).or_default() += 1;
             }
             eprintln!("[verify] outcomes by scalar count: {:?}", by_len);
-            // The object list is what actually distinguishes them: a
-            // player, a player_spawn, nothing at all, or a whole new
-            // room's worth.
+            // The object list is what distinguishes them.
             for (i, o) in f.outs.iter().enumerate() {
                 let mut objs: std::collections::BTreeSet<String> = Default::default();
                 for (q, _, _) in &o.fields {
@@ -2392,8 +2160,7 @@ end
                 }
                 set_buttons(&mut it.d, &mut o, &bits).unwrap_or_else(|e| panic!("[verify] {label} {bits:?}: {e:#}"));
                 let mut o = run_one(&mut it, &frame, o).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} stopped at: {e:#}"));
-                // The absent-as-zero fields, as every frame's outcomes write
-                // them (`trace_frame`, `refdriver::run_frame_all`).
+                // The absent-as-zero fields, as every frame's outcomes write them.
                 crate::trace::widen::materialize_absent_fields(&mut o, &mut it.d).expect("materialize the absent fields");
                 let want = iface::read_concrete(&it.d, &o, &[]).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} not concrete: {e:#}"));
                 match check_at(&it, &f, &at[mask as usize], &cells, &bits, &want) {
@@ -2402,29 +2169,17 @@ end
                         compared += n;
                         used.insert(which);
                     }
-                    // A trace that declined a point is not a wrong
-                    // answer, it is a refusal - count it and keep going,
-                    // because how OFTEN it refuses is the number that
-                    // matters and one panic would hide it.
+                    // A refusal, not a wrong answer: counted.
                     Err(e) if format!("{}", e).contains("declined") => {
                         declined += 1;
                         let n = declined_at.entry(label.to_string()).or_default();
-                        // The first refusal per sweep label, named: a count
-                        // alone does not say which premise refused.
+                        // The first refusal per sweep label, named.
                         if *n == 0 {
                             eprintln!("[verify] {label} {bits:?} declined: {e:#}");
                         }
                         *n += 1;
                     }
-                    // A MISMATCH is a WRONG ANSWER, not a refusal - the
-                    // refusals are counted above and are a measurement.
-                    // This used to `return eprintln!`, so the test passed
-                    // while printing the failure, and a change that broke
-                    // the comparison outright went green (2026-08-23: the
-                    // button cells moved to `FrameOut::ubool` and every
-                    // point started failing with "traced state has no
-                    // __button_states[0]"). A check that cannot fail is
-                    // not a check.
+                    // A MISMATCH is a WRONG ANSWER: it must fail the test.
                     Err(e) => panic!("[verify] MISMATCH {} {:#}", label, e),
                 }
             }
@@ -2455,10 +2210,8 @@ end
         }
         assert_eq!(checked + declined, perts.len() * 64, "every point should have been checked");
         assert!(compared > 0, "nothing was actually compared");
-        // Every outcome the tracer produced has to be REACHABLE, or it
-        // is a successor the program does not have. A new one that this
-        // sweep cannot reach is a thing to explain - either extend the
-        // sweep to reach it, or find out why the tracer kept it.
+        // Every outcome must be REACHED by the sweep, or it is a successor
+        // the program does not have (or the sweep needs extending).
         assert_eq!(
             used.len(),
             f.outs.len(),

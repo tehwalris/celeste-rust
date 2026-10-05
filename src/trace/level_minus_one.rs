@@ -5,61 +5,41 @@
 //! --level-minus-one` checks and reports it (`probe`).
 //!
 //! A node is (heap shape, cell of the located object - the player, or the
-//! player spawn). Every other input of the frame is a RANGE (numbers) or
-//! unknown (booleans), one per shape and the same for every cell of it: the
-//! objects' `rem` its whole [-0.5, 0.5), the player's speed [-S, S], the rest
-//! discovered below. One frame from a node is the shape's traced frame with
-//! every `move` fork RESOLVED per configuration (`specialize_subset_into`: in
-//! a configuration the move amount is one number, so the pixel steps and
-//! their collisions are exact at an exact position) and evaluated over the
-//! ranges with `Graph::eval_narrow_top_in`: a select whose condition the
-//! ranges leave undecided JOINS its arms, the six buttons (forks over a
-//! literal, left standing as that literal) unknown.
-//! Every outcome whose `live` is not definitely false is a successor, at the
-//! cells its position hull covers; an outcome in another room is the EXIT.
-//! `d(node)` is the fewest frames from the node to an exit over that graph.
+//! player spawn). Every other input is a RANGE (numbers) or unknown
+//! (booleans), one per shape: the objects' `rem` [-0.5, 0.5), the player's
+//! speed [-S, S], the rest discovered below. One frame from a node is the
+//! shape's traced frame with every `move` fork RESOLVED per configuration
+//! (the pixel steps and collisions are then exact at an exact position),
+//! evaluated over the ranges with `Graph::eval_narrow_top_in`: an undecided
+//! select JOINS its arms, the buttons are unknown. Every outcome whose `live`
+//! is not definitely false is a successor at the cells its position hull
+//! covers; an outcome in another room is the EXIT. `d(node)` is the fewest
+//! frames to an exit over that graph.
 //!
 //! The table over-approximates the game's transitions only under three
-//! premises, and each is CHECKED, never assumed:
+//! premises, each CHECKED, never assumed:
 //!
 //! * INDUCTIVE RANGES. A successor's values must lie in its shape's ranges
-//!   and agree with its lattice pins. After a pass over the reachable graph
-//!   every observed value is compared; a range that does not contain what
-//!   flows into it widens (`widen`), a pin that does not hold is
-//!   dropped (the shape re-traced without it), and the pass is redone. A pass
-//!   that changes nothing is the answer.
+//!   and agree with its lattice pins. After each pass over the reachable
+//!   graph, a range that does not contain what flows into it widens
+//!   (`widen`), a pin that does not hold is dropped (the shape re-traced),
+//!   and the pass is redone until nothing changes.
 //! * NO `error` on any live outcome (`trace::error`), read with `Known(..)`
-//!   and `SplitOk(..)` as true. `Known(c)` is how a select's own error says
-//!   the kernel reads a DECIDED condition (and a floor's, a single one): this
-//!   evaluator joins an undecided select instead, which is sound.
-//!   `SplitOk(n)` is that a lane's fork operand spans at most `n` floors:
-//!   checked directly on every configuration's operands instead. What is
-//!   left - pin guards, the static range claims, an unrolled loop that had
-//!   not finished, the widenings' containment - must evaluate to FALSE, or
-//!   the node is reported.
+//!   and `SplitOk(..)` as true: this evaluator joins an undecided select
+//!   (sound), and fork spans are checked directly on every configuration's
+//!   operands. Everything else must evaluate to FALSE, or the node is
+//!   reported.
 //! * Every position hull has whole endpoints (a cell is a whole pixel).
 //!
-//! A range is a HULL of the node's values; two refinements keep what the hull
-//! forgets, both exact per state, so the premises above stay checked as they
-//! are (2026-10-01, rooms (6,1), (7,1), (0,2)):
+//! Two refinements, both exact per state, keep what a range's hull forgets:
+//! a slot every state holds as the same literal interval (`Shape::lits`) is
+//! read as that literal, and selects are lifted out of the ops above them
+//! (`lift`; every value op only in the precise frame, `eval_node`).
 //!
-//! * a slot every state holds as the same literal interval (the balloon's
-//!   `rnd` phase, `Shape::lits`) is read as that literal, so its own ends
-//!   (`Lo`/`Hi`) are exact;
-//! * selects are lifted out of the ops above them (`lift`): `Lo`/`Hi`/`Sub`
-//!   in every frame, every value op in the precise frame a node falls back to
-//!   when its plain evaluation is in violation (`eval_node`).
-//!
-//! And three things it does NOT model, each counted in the report:
-//!
-//! * THE SPAWN is run as a chain from the start state (`probe`): as a
-//!   position-only node it has no bound (`solids=false`, one `state` range per
-//!   shape), so its ranges never converge.
-//! * A DEATH (an outcome without a located object) is a dead end.
-//! * A successor cell outside `WINDOW` is clipped.
-//!
-//! The recorded transitions of a level-0 tree are the check that none of the
-//! three dropped a real move (`probe`'s soundness section).
+//! Not modelled, each counted in the report: THE SPAWN (run as a chain from
+//! the start state, `probe`: as a node its ranges never converge), a DEATH
+//! (a dead end), a successor cell outside `WINDOW` (clipped). The recorded
+//! transitions of a level-0 tree check that none dropped a real move.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
@@ -101,10 +81,7 @@ const MAX_BOX: i64 = 4096;
 
 /// The window a successor cell is kept in: the room and 16 px around it. A
 /// player in the room is at x in [-1, 121] (the draw clamp) and y in [-4,
-/// 128] (the exit and the bottom death); what the ranges admit past that is
-/// CLIPPED and counted, never silently: the player spawn has `solids=false`
-/// and a `state` that is one range for every cell, so at level -1 it can keep
-/// rising at any height (plans/level-minus-one.md).
+/// 128]; what the ranges admit past that is CLIPPED and counted.
 const WINDOW: (i64, i64) = (-16, 143);
 
 /// The "no located object" coordinate (a death's countdown).
@@ -130,9 +107,8 @@ pub struct Opts {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Obs {
     Num(i64, i64),
-    /// A LITERAL interval (`Op::Const(lo, hi)`, `lo < hi`): every lane holds
-    /// exactly this interval - the balloon's canonical phase `[0, 1)`, an
-    /// `rnd` draw. `Num` is a hull of lanes' values instead.
+    /// A LITERAL interval every lane holds exactly (an `rnd` draw); `Num` is
+    /// a hull of lanes' values instead.
     Lit(i64, i64),
     Bool { f: bool, t: bool, u: bool },
 }
@@ -173,11 +149,8 @@ fn px(r: i64) -> f64 {
 
 /// Widen `seed` to contain `obs`: the hull, or - for a slot that has already
 /// grown twice (`jump`) - the moved end straight to the 16.16 extreme. The
-/// hull first because anything wider can overshoot what a premise allows (a
-/// fruit's `y` past its bob band leaves `widen_fruit`'s containment premise
-/// undecided); the jump because a range the evaluator cannot bound (an
-/// undecided `if freeze>0 then freeze-1`, whose arm is computed over the
-/// whole range) would otherwise take one pass per step down.
+/// hull first, since wider can overshoot what a premise allows; the jump so
+/// an unbounded range does not take one pass per step.
 fn widen(seed: Range, obs: Range, jump: bool) -> Range {
     let lo = if obs.0 < seed.0 { if jump { i32::MIN as i64 } else { obs.0 } } else { seed.0 };
     let hi = if obs.1 > seed.1 { if jump { i32::MAX as i64 } else { obs.1 } } else { seed.1 };
@@ -306,11 +279,9 @@ struct Traced {
 struct Shape {
     key: String,
     ranges: BTreeMap<Path, Range>,
-    /// The `ranges` that are a LITERAL interval every lane holds (`Obs::Lit`):
-    /// the cone reads the slot as that literal (`Op::Const`), so a lane's own
-    /// ends (`Lo`/`Hi`) are exact - the balloon's full-period premise
-    /// (`widen::canon_balloon_offset`) is decided, where over a hull of the
-    /// lanes' values it is not. Only an `rnd`-derived slot (`ival_extra`).
+    /// The `ranges` that are a LITERAL interval every lane holds (`Obs::Lit`),
+    /// read by the cone as that literal so a lane's own ends are exact (the
+    /// balloon's full-period premise). Only `rnd`-derived slots.
     lits: BTreeSet<Path>,
     /// Ranges not yet observed: taken from a blanked representative (0), so
     /// the first observation REPLACES them rather than joining the 0 in.
@@ -363,8 +334,8 @@ impl<'a> Table<'a> {
     }
 
     /// May slot `p` of shape `key` be a literal (`Shape::lits`)? An
-    /// `rnd`-derived slot only, never a motion slot: a range there stands for
-    /// every concrete value, which is what the table bounds.
+    /// `rnd`-derived slot only, never a motion slot (whose range stands for
+    /// every concrete value).
     fn lit_slot(&self, key: &str, p: &Path) -> bool {
         let motion = p.len() == 4 && p[0] == iface::key("objects") && (p[2] == iface::key("rem") || p[2] == iface::key("spd"));
         !motion && self.lw.ival_extra.get(key).is_some_and(|s| s.contains(p))
@@ -409,12 +380,9 @@ impl<'a> Table<'a> {
             let is_player = |f: &str| player.as_ref().is_some_and(|pl| *p == with(pl, &[f, "x"]) || *p == with(pl, &[f, "y"]));
             let start_ival = key == self.lw.start_key && self.lw.ival_extra.get(&key).is_some_and(|s| s.contains(p));
             let r = if start_ival {
-                // The start state's own interval (the balloon's `offset =
-                // rnd(1)`): its representative holds a blanked point, and
-                // seeded with that point the balloon's phase was no full
-                // period, so `canon_balloon_offset`'s premise failed on the
-                // spawn's first frame (rooms (6,1) and (7,1), 2026-10-01).
-                // A literal: the one start state holds exactly it.
+                // The start state's own interval (`offset = rnd(1)`), not the
+                // representative's blanked point: a literal, since the one
+                // start state holds exactly it.
                 let (lo, hi) = *self.lw.start_ivals.get(p).ok_or_else(|| anyhow!("{key}: the start state's interval {} is not a literal range", iface::show(p)))?;
                 ensure!(self.lit_slot(&key, p), "{key}: the start state's interval {} is not an `rnd` slot", iface::show(p));
                 self.shapes[id].lits.insert(p.clone());
@@ -433,8 +401,7 @@ impl<'a> Table<'a> {
             self.shapes[id].ranges.insert(p.clone(), r);
         }
         // Interval inputs: every object's unpinned rem and speed (so `move`
-        // forks, and the fork's arity comes from their static ranges), and
-        // the boundary's own (a fruit's band, the walk's discovered slots).
+        // forks, its arity from their static ranges), and the boundary's own.
         let mut ival: Vec<Path> = Vec::new();
         let mut bounds: BTreeMap<Path, Range> = BTreeMap::new();
         for p in motion_paths(&st) {
@@ -454,8 +421,8 @@ impl<'a> Table<'a> {
         // The held trails are unknown booleans read from their cells, not a
         // fork (the walk forks them for the kernels).
         tr.it.d.held_unknown = false;
-        // The move forks' arity from the ranges' full width (`flr_ways`): the
-        // speed is [-S, S] at one node, 2S + 1 floors. Restored below.
+        // The move forks' arity from the ranges' full width (`flr_ways`).
+        // Restored below.
         tr.it.d.uncapped_ways = true;
         // And its undecided selects stay selects: this evaluator joins their
         // arms (module doc), a fork would only multiply configurations.
@@ -533,8 +500,7 @@ impl<'a> Table<'a> {
         }
 
         // The cone, copied out of the arena with every fork over a literal
-        // (the buttons) standing for its whole literal - unknown - and the
-        // kernels' premises read as true (module doc).
+        // (the buttons) as that whole literal, and the kernels' premises true.
         let arena = &d.graph;
         let mut rs: Vec<NodeId> = Vec::new();
         for r in &roots_old {
@@ -633,8 +599,7 @@ impl Cone {
         let mut shared = self.graph.like();
         let mut configs: Vec<Config> = Vec::new();
         let mut seen: HashSet<Vec<NodeId>> = HashSet::new();
-        // Only what a root or a fork operand reads: the lifted cone
-        // (`precise`) holds every intermediate `lift` made, ~45% of it dead.
+        // Only what a root or a fork operand reads (`lift` leaves dead nodes).
         let mut roots: Vec<NodeId> = self.forks.values().copied().collect();
         for r in &self.roots {
             roots.extend([r.live, r.error]);
@@ -719,33 +684,23 @@ fn lit_shift(g: &Graph, op: &Op, args: &[NodeId]) -> Option<(i32, i32)> {
 /// Which ops `lift` lifts selects out of.
 #[derive(Clone, Copy)]
 enum Lift {
-    /// A lane's ends and their difference (`Lo`, `Hi`, `Sub`): cheap, and what
-    /// the balloon's full-period width needs at every node of a balloon room.
-    /// The frame every node is evaluated with (`Traced::plain`).
+    /// A lane's ends and their difference (`Lo`, `Hi`, `Sub`): cheap; the
+    /// frame every node is evaluated with (`Traced::plain`).
     Ends,
-    /// Every pure value op: ~25x the graph (room (7,1): 92k -> 2.4M nodes
-    /// specialized), so only where `Ends` is in violation (`Traced::precise`).
+    /// Every pure value op: ~25x the graph, so only where `Ends` is in
+    /// violation (`Traced::precise`).
     All,
 }
 
 /// `op(args)` with every select among the args LIFTED out where they all
 /// select on one condition: `op(.., sel(c, a, b), ..)` is `sel(c, op(.., a,
-/// ..), op(.., b, ..))`, exact per lane - a lane takes one arm of `c` in every
-/// operand at once. This evaluator joins a select it cannot decide, and an
-/// expression of a joined value forgets that its operands moved together:
+/// ..), op(.., b, ..))`, exact per lane. Without it an expression of a joined
+/// select forgets that its operands moved together (see the tests).
 ///
-/// * the balloon's full-period width `Hi(v) - Lo(v)`, `v` a select between two
-///   literal phases (shown or popped), is any difference of the two ends'
-///   hulls, and its premise (`widen::canon_balloon_offset`) is undecided;
-/// * a tile loop's "finished" obligation `start + k <= end`, both ends of the
-///   player's `x` after a `move` the evaluator cannot decide was taken (its
-///   speed range holds 0), puts a loop over 2 tiles at 3 (room (7,1)).
-///
-/// Lifted, each arm is decided on its own. Selects on DIFFERENT conditions
-/// are left joined: lifting those multiplies arms. Never across a fork op (a
-/// fork's operand stays one node) or a select's own condition. And a literal
-/// shifted by a point is the shifted literal (`lit_shift`), which `Graph::fold`
-/// leaves: it is exact with respect to `eval`'s hulls, not per lane.
+/// Selects on DIFFERENT conditions stay joined (lifting multiplies arms).
+/// Never across a fork op or a select's own condition. A literal shifted by
+/// a point is the shifted literal (`lit_shift`): exact with respect to
+/// `eval`'s hulls, not per lane.
 fn lift(g: &mut Graph, op: Op, args: Vec<NodeId>, what: Lift, memo: &mut HashMap<(Op, Vec<NodeId>), NodeId>) -> NodeId {
     let liftable = match what {
         Lift::Ends => matches!(op, Op::Sub | Op::Lo | Op::Hi),
@@ -976,19 +931,14 @@ struct Built {
 
 /// A LOWER BOUND on the frames from each node to an exit - what a filter may
 /// refuse a row on. A multi-source shortest path backward over the edges,
-/// seeded where the graph stops modelling: an exit edge (1); a death successor
-/// (1 + the start state's d, `chain_frames` + d of the chain's end: the room
-/// restarts and replays the spawn chain, however long its countdown). The death
-/// seed reads the end's d, which it cannot lower (a path through a death is
-/// longer than the start's d), so the second run is the answer.
+/// seeded at an exit edge (1) and a death successor (1 + the respawn's
+/// `chain_frames` + d of the chain's end). The death seed cannot lower the
+/// end's d it reads, so the second run is the answer.
 ///
 /// A successor part CLIPPED to `WINDOW` is not a seed: no real player is there
-/// at a frame boundary (the draw clamp keeps x in [-1, 121], skipped on a freeze
-/// frame by at most one move; below y = 128 the update kills; above y = -4 the
-/// room changes), so a clipped part is the evaluator's imprecision. Seeding it
-/// as a possible exit (tried first) put every node near a clamped edge within a
-/// frame or two of an exit and cut nothing in room (2,0). The claim is checked
-/// on every row the filter sees (`CostToGo::too_late`), never assumed.
+/// at a frame boundary, so it is the evaluator's imprecision. (Seeding it as
+/// an exit cuts nothing.) Checked on every row the filter sees
+/// (`CostToGo::too_late`), never assumed.
 fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32) -> Vec<u32> {
     use std::cmp::Reverse;
     let n = g.nodes.len();
@@ -1057,11 +1007,8 @@ impl CostToGo {
     }
 
     /// Is a row of `shape` at `cell` at `frame` provably unable to exit by
-    /// `horizon`? Only a table node is ever refused: a row without a player,
-    /// one that has left the room, a shape or a cell the table never reached
-    /// is kept. A row in the room OUTSIDE `WINDOW` breaks the premise the table
-    /// dropped its clipped successors on (`sound_d`): it panics rather than
-    /// filter on a table that does not cover it.
+    /// `horizon`? Only a table node is ever refused. A row in the room OUTSIDE
+    /// `WINDOW` breaks the premise clipping rests on (`sound_d`): it panics.
     pub fn too_late(&self, shape: u64, cell: u32, frame: u32, horizon: u32) -> bool {
         let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
         if x >= 128 {
@@ -1080,9 +1027,7 @@ impl CostToGo {
 }
 
 /// Build the level -1 table of the configured start room at player speed bound
-/// `spd_px` (its report goes to stderr as it is built), or read it from the
-/// table cache (`cache_file`) when this binary built it before for the same
-/// inputs.
+/// `spd_px` (report to stderr), or read it from the cache (`cache_file`).
 pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo> {
     let cache = cache_file(root, spd_px)?;
     if let Some((path, _)) = &cache {
@@ -1120,12 +1065,9 @@ const CACHE_FORMAT: u32 = 1;
 
 /// Where the table for these inputs is cached, and the key's description:
 /// `CELESTE_L1_CACHE` (a directory, default `/var/tmp/celeste-l1-cache`; `off`
-/// to always build). The table is a function of the code (this binary's own
-/// bytes), the cart (the traced Lua as `trace::cart::sources_in` assembles it,
-/// start room and `CELESTE_SPLIT_FRAME` included, and the map/flag data), the
-/// speed bound, and the knobs the tracer reads - every `CELESTE_*` variable
-/// but the ones that cannot change it, so an unknown knob costs a rebuild,
-/// never a wrong table.
+/// to always build). The key is this binary's bytes, the traced cart and its
+/// data, the speed bound, and every `CELESTE_*` variable but those known not
+/// to matter: an unknown knob costs a rebuild, never a wrong table.
 fn cache_file(root: &FsPath, spd_px: i32) -> Result<Option<(PathBuf, String)>> {
     use std::hash::{Hash, Hasher};
     let dir = match std::env::var("CELESTE_L1_CACHE") {
@@ -1280,12 +1222,10 @@ struct NodeEval {
     precise: bool,
 }
 
-/// Node answers kept across passes. A node's `NodeEval` and observations are
-/// a function of its cell and its shape's `Sig`, so while the `Sig` holds the
-/// node is not evaluated again. Observations are kept per shape as the join
-/// over exactly the nodes `nodes` holds of it (`agg`, `count`): a pass that
-/// reaches every one of them again joins `agg` as it is; one that does not
-/// observes the reached ones again (`observe`).
+/// Node answers kept across passes: a node's `NodeEval` and observations are
+/// a function of its cell and its shape's `Sig`. Observations are kept per
+/// shape as the join over exactly the nodes held (`agg`, `count`); a pass
+/// that does not reach them all re-observes the reached ones (`observe`).
 #[derive(Default)]
 struct Memo {
     nodes: rustc_hash::FxHashMap<u64, NodeEval>,
@@ -1356,8 +1296,7 @@ fn eval_key(shapes: &[Shape], room: &Room, k: u64, n_obs: usize, obs: &mut [Opti
             exit = true;
             continue;
         }
-        // An outcome without a located object is a death: no edge
-        // (plans/level-minus-one.md); `sound_d` seeds it with the respawn.
+        // A death: no edge; `sound_d` seeds it with the respawn.
         let Some((xl, xh, yl, yh)) = bx else {
             n_deaths += 1;
             continue;
@@ -1417,10 +1356,9 @@ struct Queue {
     failed: bool,
 }
 
-/// One pass's walk over the reachable nodes: every worker takes a node,
-/// answers it (from the memo, else `eval_key`), and registers its successors
-/// - no layers, no serial merge between them. A node of a shape not traced
-/// yet is set aside (`pending`) for the caller to trace and resume.
+/// One pass's walk over the reachable nodes: each worker takes a node,
+/// answers it (memo, else `eval_key`) and registers its successors. A node of
+/// a shape not traced yet is set aside (`pending`) for the caller.
 struct Explore {
     /// Node id -> key, in order of discovery.
     keys: Vec<u64>,
@@ -1702,14 +1640,10 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         (at("x")?, at("y")?)
     };
 
-    // THE SPAWN PREFIX. The player spawn reads no button and its `state`,
-    // `delay` and speed are one range per shape at level -1, so as a
-    // position-only node it can rise forever (it has `solids=false`): its
-    // ranges never converge. So the prefix is run as a CHAIN instead: each
-    // frame evaluated at the previous frame's own values (the same traced
-    // frame, the same evaluator), which must give exactly one successor
-    // cell, until the successor has a player. That player state seeds the
-    // table.
+    // THE SPAWN PREFIX, run as a CHAIN (as nodes its ranges never converge):
+    // each frame evaluated at the previous frame's own values, which must
+    // give exactly one successor cell, until the successor has a player. That
+    // player state seeds the table.
     let t_chain = std::time::Instant::now();
     let mut chain: Vec<(usize, (i16, i16))> = vec![(start_id, start_xy)];
     let (end_id, end_xy) = loop {
@@ -1813,9 +1747,8 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
             let mut agg: Vec<Option<Obs>> = if hits == memo.count[s] {
                 std::mem::take(&mut memo.agg[s])
             } else {
-                // A node the memo holds was not reached: its observations
-                // are in the memo's join, so the reached ones it holds are
-                // observed again and the rest forgotten.
+                // A memo node was not reached: re-observe the reached ones,
+                // forget the rest.
                 let again: Vec<u64> = reached[s].iter().copied().filter(|k| memo.nodes.contains_key(k)).collect();
                 reobserved += again.len();
                 let keep: HashSet<u64> = reached[s].iter().copied().collect();
@@ -2223,13 +2156,9 @@ mod tests {
         Val::Num(Pico8NumInterval::new(P8::from_raw(lo), P8::from_raw(hi)))
     }
 
-    /// The balloon's full-period premise `Hi(v) - Lo(v) >= 1` (the width of its
-    /// phase, `widen::canon_balloon_offset`), with `v` a select on a condition
-    /// the evaluator leaves undecided between the phase `[0, 1)` and the phase
-    /// advanced by 0.01. Over the joined select the two ends are independent
-    /// and the premise is undecided - every node of rooms (6,1) and (7,1) in
-    /// violation; lifted (`lift`, `Lift::Ends`) each arm is a literal shifted
-    /// by a point (`lit_shift`), and the premise holds.
+    /// The balloon's full-period premise `Hi(v) - Lo(v) >= 1`, `v` an
+    /// undecided select between the phase `[0, 1)` and it advanced by 0.01:
+    /// undecided over the joined select, it holds once lifted (`Lift::Ends`).
     #[test]
     fn a_select_of_literal_phases_keeps_its_full_period_width() {
         let period = 0xffff;
@@ -2263,13 +2192,9 @@ mod tests {
         }
     }
 
-    /// A tile loop's "another iteration" test `start + 2 <= end` over the
-    /// player's `x` after a `move` the evaluator cannot decide was taken (x 44
-    /// or 52, room (7,1) at (52, 35)): both ends of the loop read the same `x`,
-    /// so per lane the loop is two tiles, but over the joined `x` it may be
-    /// three - the unrolled loop's "finished" obligation undecided. Lifting
-    /// every value op (`Lift::All`, the precise frame) decides it; `Lift::Ends`
-    /// does not touch it.
+    /// A tile loop's "another iteration" test `start + 2 <= end`, both ends
+    /// reading one joined `x`: per lane two tiles, over the join maybe three.
+    /// `Lift::All` decides it; `Lift::Ends` does not.
     #[test]
     fn lifting_keeps_a_tile_loop_over_one_x_two_tiles_wide() {
         let build = |what: Lift| -> (Graph, NodeId) {
@@ -2303,10 +2228,9 @@ mod tests {
 
 #[cfg(test)]
 mod room_tests {
-    /// Room (7,1)'s table builds and is sound by its own checks (rooms (6,1)
-    /// and (7,1) failed at the spawn's first frame on the balloon's phase,
-    /// then on a tile loop over a joined `x`, 2026-10-01): the start state is
-    /// at least 45 frames from the exit (the known optimum is 86).
+    /// Room (7,1)'s table (balloon phase, tile loop over a joined `x`) builds
+    /// and is sound by its own checks: the start state is at least 45 frames
+    /// from the exit (the known optimum is 86).
     #[test]
     #[ignore = "~30 s with 8 threads: a lattice walk and five passes"]
     fn room_71_table_builds_with_its_balloon() {

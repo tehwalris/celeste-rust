@@ -12,14 +12,12 @@ use celeste_rust::abstraction::{set_level, Level};
 use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary, project_all, project_onto, project_row, projection_key, Proj};
 use clap::{Parser, Subcommand};
 
-/// mimalloc, not glibc: glibc retained ~23 GB of freed slot chunks across
-/// its arenas at room (0,0) f90 (RSS 44 GB against ~21 GB live); mimalloc
-/// runs the same frame at 24.8 GB and the same speed (plans/memory.md).
+/// mimalloc, not glibc: glibc retains gigabytes of freed slot chunks across
+/// its arenas (plans/lessons.md).
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// On DISK, not the tmpfs at `/tmp` (a full-room tree is gigabytes, and the
-/// per-block version of it once exhausted /tmp's inodes, 2026-09-07).
+/// On DISK, not the tmpfs at `/tmp`: a full-room tree is gigabytes.
 const DEFAULT_CHECKPOINT_DIR: &str = "/var/tmp/celeste-checkpoints";
 
 #[derive(Parser)]
@@ -32,30 +30,25 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// THE SEARCH (the arc pipeline), per level of `--level` (coarsest
-    /// first): the forward to the horizon, recording every edge with its
-    /// remainder transfer (resumed, or reused as it is when the tree already
-    /// reaches the horizon), filtered by the previous level's arc-marked
+    /// first): the forward to the horizon recording every edge with its
+    /// remainder transfer, filtered by the previous level's arc-marked
     /// nodes; the rotation graph's winning sets backward from the wins
-    /// (`arc_dp::solve`), whose optimum is exact in the remainder and a LOWER
-    /// BOUND on the game's (the level's objects may be coarse) - no win
-    /// refutes the horizon; then the concrete search inside the winning
-    /// sets: a depth-first try at the bound (a win there is the optimum),
-    /// and at the LAST level the whole search. The first concrete win is the
-    /// CONCRETE optimum, its inputs written to
+    /// (`arc_dp::solve`), whose optimum is a LOWER BOUND on the game's (no
+    /// win refutes the horizon); then the concrete search inside the winning
+    /// sets: a try at the bound, and at the LAST level the whole search. The
+    /// first concrete win is the optimum, its inputs written to
     /// `<checkpoint-dir>/witness_frame_F.txt`.
     Search {
         /// The horizon: every frame up to it is searched.
         #[arg(long)]
         to: Option<u32>,
-        /// A KNOWN solution's frame (the replayed community TAS) as the
-        /// horizon: a refutation, or no concrete witness by it, is an error -
-        /// the model cannot reproduce a real run.
+        /// A KNOWN solution's frame (a replayed TAS) as the horizon: a
+        /// refutation, or no concrete witness by it, is an error.
         #[arg(long)]
         ceiling: Option<u32>,
         /// The levels (`Level::parse`), comma-separated, coarsest first:
         /// `r0sx` for a room without objects, `r0sxhn` with objects,
-        /// `r0sxhn,r0sxh` for the objects ladder (an exact-objects level
-        /// filtered by the abstract one: room (7,0)).
+        /// `r0sxhn,r0sxh` for an exact-objects level filtered by the abstract one.
         #[arg(long, default_value = "r0sx")]
         level: String,
         /// The checkpoint dir: level i's tree goes to `level{i:02}/` under it.
@@ -71,17 +64,15 @@ enum Command {
         #[arg(long)]
         no_witness: bool,
         /// Write the web UI's arc pass into this directory (`export-ui
-        /// --forward-only --arc DIR`): the remainder-free backward's marks
-        /// (`level0.marks.bin`), the ARC-MARKED nodes (`arc.marks.bin`: a node
-        /// whose winning set is non-empty at some frame), both as `(shape,
-        /// cell, key, dist)` rows with `dist` the horizon minus the last frame
-        /// the node still wins from; `arc.txt`; `witness.txt` (the inputs and
-        /// the player's position per frame).
+        /// --arc DIR`): the remainder-free backward's marks
+        /// (`level0.marks.bin`) and the ARC-MARKED nodes (`arc.marks.bin`),
+        /// both as `(shape, cell, key, dist)` rows with `dist` the horizon
+        /// minus the last frame the node still wins from; `arc.txt`;
+        /// `witness.txt` (inputs and player position per frame).
         #[arg(long)]
         save_marks: Option<String>,
     },
-    /// ONE forward pass at ONE level, exactly as the search runs it
-    /// (record mode, position partition, sharded checkpoints), with the
+    /// ONE forward pass at ONE level, exactly as the search runs it, with the
     /// per-frame timing line. The profiling entry point for the forward.
     Forward {
         /// Last frame to compute.
@@ -96,21 +87,18 @@ enum Command {
         /// Start room "x,y".
         #[arg(long, default_value = "1,0")]
         room: String,
-        /// Run the REFERENCE engine (the interpreter, one lane per fork leaf)
-        /// instead of the kernels: `ckhash` of the two trees must agree. Slow;
-        /// for a new room's first frames. Not at held-unknown levels.
+        /// Run the REFERENCE engine instead of the kernels: `ckhash` of the
+        /// two trees must agree. Slow. Not at held-unknown levels.
         #[arg(long)]
         reference: bool,
     },
-    /// DIAGNOSTIC: is a coarser level's tree closed over a finer one's rows
-    /// (is the coarse level sound)? Every row of the FINE tree at frames `from..=to`
-    /// (with `--fine-marks`, only its marked rows), projected onto `level`
-    /// (`frame::widened_keys`, the key the filter looks up), must be a row of
-    /// the COARSE tree at that frame or before (the door keeps a state at the
-    /// first frame it is reached) - and with `--coarse-marks`, a marked one.
-    /// Per frame: the fine rows, the projections the coarse tree has not
-    /// reached (a forward loss) and those reached but unmarked (a backward
-    /// loss); then the first misses' cells.
+    /// DIAGNOSTIC: is a coarser level's tree closed over a finer one's rows?
+    /// Every row of the FINE tree at frames `from..=to` (with `--fine-marks`,
+    /// only marked rows), projected onto `level` (`frame::widened_keys`), must
+    /// be a row of the COARSE tree at that frame or before - and with
+    /// `--coarse-marks`, a marked one. Per frame: the fine rows, the
+    /// projections not reached (a forward loss) and those reached but
+    /// unmarked (a backward loss); then the first misses' cells.
     DiagProject {
         #[arg(long)]
         fine_dir: String,
@@ -135,9 +123,8 @@ enum Command {
     },
 
     /// Fingerprint a forward checkpoint tree: per frame, the lane count and an
-    /// order-independent hash of its (row key, cell) set. Two runs that agree
-    /// here reached the same states; the format they stored them in is
-    /// irrelevant.
+    /// order-independent hash of its (row key, cell) set, independent of the
+    /// storage format.
     Ckhash {
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
@@ -152,10 +139,9 @@ enum Command {
         #[arg(long)]
         cells: Option<usize>,
     },
-    /// Microbenchmark of ONE forward frame: load a checkpointed frame of a
-    /// level-0 tree and run `forward_frame` on it `reps` times (empty
-    /// visited set, no filter, no pos-graph), printing the per-rep phase
-    /// times. Isolates the kernel + append loop from the search around it.
+    /// Microbenchmark of ONE forward frame: run `forward_frame` on a
+    /// checkpointed frame `reps` times (empty door, no filter), printing the
+    /// per-rep phase times.
     BenchFrame {
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
@@ -176,14 +162,12 @@ enum Command {
         #[arg(long, default_value_t = false)]
         edges: bool,
     },
-    /// DIAGNOSTIC: the TRANSFERS of a level-0 tree's edges, checked. Per
-    /// frame: every recorded edge carries a transfer. Then `--samples` records
-    /// per frame, each from one of its preds: the source row stepped by the
-    /// REFERENCE engine (all 64 inputs) at remainders INSIDE the record's
-    /// guard - some input must reach the target (projected onto `--level`)
-    /// with the remainder the action predicts - and just OUTSIDE it, at
-    /// points no record of that (pred, target) covers - no input may reach
-    /// the target there. Fails (exit != 0) on any disagreement.
+    /// DIAGNOSTIC: the TRANSFERS of a level-0 tree's edges, checked. Every
+    /// recorded edge carries a transfer; then `--samples` records per frame,
+    /// the source row stepped by the REFERENCE engine (all 64 inputs): at
+    /// remainders INSIDE the guard some input must reach the target with the
+    /// predicted remainder, and at points no record of that (pred, target)
+    /// covers none may. Fails (exit != 0) on any disagreement.
     ArcCheck {
         #[arg(long)]
         level_dir: String,
@@ -216,12 +200,10 @@ enum Command {
         #[arg(long, default_value = "")]
         erase: String,
     },
-    /// DIAGNOSTIC: does a cell's visited set saturate? A frame's rows are
-    /// the states NEW at it (the door dedupes across frames), so a cell's
-    /// visited set is the sum of its rows over frames. Reads the checkpoint
-    /// cell indexes only: the `top` cells by visited count (and `--at x,y`)
-    /// with their new states per frame, and every cell's new states at `to`
-    /// as a share of its visited set.
+    /// DIAGNOSTIC: does a cell's visited set saturate? (A frame's rows are the
+    /// states NEW at it.) From the cell indexes only: the `top` cells by
+    /// visited count (and `--at x,y`) with their new states per frame, and
+    /// every cell's new states at `to` as a share of its visited set.
     CellGrowth {
         #[arg(long)]
         level_dir: String,
@@ -233,23 +215,18 @@ enum Command {
         top: usize,
         #[arg(long, value_parser = parse_xy)]
         at: Option<(i32, i32)>,
-        /// Also the growth by AGE: for every age `a` (frames since a cell's
-        /// first state, a multiple of this step), over the cells reached at
-        /// least `a` frames before `to`, the median, 90th percentile and mean
-        /// of the states a cell had visited by that age - comparable across
-        /// rooms, where the per-frame totals are not.
+        /// Also the growth by AGE (frames since a cell's first state, in
+        /// steps of this): the median, p90 and mean of the states a cell had
+        /// visited by that age. Comparable across rooms.
         #[arg(long)]
         by_age: Option<usize>,
     },
     /// THE KERNELS AGAINST THE REFERENCE ENGINE, row by row: `samples` stored
-    /// rows first reached at step `frame` (in player cell `--cell x,y` if
-    /// given) each run one step through the compiled kernels of `--level` and
-    /// through the reference engine (`RefEngine`, the interpreter enumerating
-    /// every fork path, unknown inputs forked per path), both sides projected
-    /// onto the level (`frame::widen_rt2_to`) and compared by named fields.
-    /// A reference successor the kernels miss is a SOUNDNESS gap; a kernel
-    /// successor the reference never makes is a PRECISION gap (room (7,0)'s
-    /// floor-collision join, `7f6b96e`).
+    /// rows first reached at step `frame` (in `--cell x,y` if given) each run
+    /// one step through the kernels of `--level` and through `RefEngine`, both
+    /// sides projected onto the level and compared by named fields. A
+    /// reference successor the kernels miss is a SOUNDNESS gap; a kernel
+    /// successor the reference never makes is a PRECISION gap.
     RefCheck {
         #[arg(long)]
         level_dir: String,
@@ -280,17 +257,14 @@ enum Command {
         erase: String,
     },
     /// DIAGNOSTIC: where a tree's states come from. `samples` states of
-    /// `--coarse` first reached at `step` in the player cell(s) `--cell`
-    /// are walked back through the recorded edges, `depth` steps, printing
-    /// at each the predecessor's cell and what changed across the step
-    /// (every named value cell but the `--erase` prefixes).
+    /// `--coarse` first reached at `step` in `--cell` are walked back through
+    /// the recorded edges, `depth` steps, printing each predecessor's cell and
+    /// what changed (named value cells but the `--erase` prefixes).
     ///
-    /// With `--real` (a finer tree), which states are SPURIOUS and where
-    /// they first went wrong: a coarse state whose projection the real tree
-    /// never reached in its cell by `step` is spurious; the per-field value
-    /// distributions are printed against the real ones', the samples are
-    /// spurious states, and each walk stops at the first predecessor whose
-    /// projection the real tree did reach - the first spurious transition.
+    /// With `--real` (a finer tree): a coarse state whose projection the real
+    /// tree never reached in its cell by `step` is SPURIOUS; field
+    /// distributions are compared, and each walk stops at the first
+    /// predecessor the real tree did reach - the first spurious transition.
     Spurious {
         #[arg(long)]
         coarse: String,
@@ -313,16 +287,14 @@ enum Command {
         #[arg(long)]
         chain_out: Option<String>,
     },
-    /// DIAGNOSTIC: per-column cardinalities of one frame, streamed file by
-    /// file and row range by row range. Per shape: rows, then every varying
-    /// column's distinct value count (capped at `cap`), named
-    /// (`inspect::cell_names`), and the distinct (spd.x, spd.y) pairs.
+    /// DIAGNOSTIC: per-column cardinalities of one frame, streamed. Per
+    /// shape: rows, every varying column's distinct value count (capped at
+    /// `cap`), named, and the distinct (spd.x, spd.y) pairs.
     ///
-    /// With `--cell x,y`, only that position's rows (the values themselves
-    /// listed), and whether the position SATURATES: over steps 0..=`frame`
-    /// every `every` steps, its cumulative distinct states (projected
-    /// without the `--erase` prefixes), distinct (spd.x, spd.y) pairs, and
-    /// distinct "inner" states (the projection without speed).
+    /// With `--cell x,y`, only that position's rows (values listed), and
+    /// whether it SATURATES: every `every` steps up to `frame`, its cumulative
+    /// distinct states (without the `--erase` prefixes), speed pairs, and
+    /// states without speed.
     ColCensus {
         #[arg(long)]
         level_dir: String,
@@ -337,10 +309,8 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         every: u32,
     },
-    /// Export a finished run for the web UI (`ui/`): per (level, frame) the
-    /// states per player-position cell and the win cells, per marked set the
-    /// marks per cell by distance, and the log's per-frame timings - from the
-    /// checkpoint HEADERS and the marks files only. See `search::ui_export`.
+    /// Export a finished run for the web UI (`ui/`) from the checkpoint
+    /// HEADERS, the marks files and the log. See `search::ui_export`.
     ExportUi {
         /// A `rewrite search` checkpoint dir (`level00/`, ...) or one
         /// `rewrite forward` tree.
@@ -354,21 +324,16 @@ enum Command {
         out: String,
         #[arg(long, default_value = "1,0")]
         room: String,
-        /// The search's `--save-marks` directory: the last level gets the
-        /// remainder-free backward's marks, and a level after it the
-        /// remainder-exact arc backward over the same tree (and the concrete
-        /// witness, if saved).
+        /// The search's `--save-marks` directory: the remainder-free and the
+        /// arc backward's marks over the last level's tree (and the witness).
         #[arg(long)]
         arc: Option<String>,
     },
     /// A concrete input sequence that follows a given TRAJECTORY of player
-    /// positions frame by frame (one "x,y" per line, frame 1 first; a
-    /// line `-` accepts any position, e.g. during the spawn), found by a
-    /// breadth-first search over the reference engine's concrete step:
-    /// every frame, all 64 inputs of every surviving state, keeping the
-    /// successors at the trajectory's position, deduplicated exactly.
-    /// Prints the input bytes for `concrete_run -i` / `pico8_diff/replay.py`,
-    /// or the first frame the trajectory could not be followed.
+    /// positions (one "x,y" per line from frame 1; `-` accepts any), found
+    /// breadth-first over the reference engine's concrete step, deduplicated
+    /// exactly. Prints the input bytes for `concrete_run -i` /
+    /// `pico8_diff/replay.py`, or the first frame it could not follow.
     Trajectory {
         /// One line per frame: `x,y`, `-`, or `x,y K0 K1` - a position AND
         /// the row key (hex) its state must have projected onto `--spec`: an
@@ -380,20 +345,16 @@ enum Command {
         /// Stop once a win is reached (default), else follow to the end.
         #[arg(long, default_value_t = true)]
         stop_at_win: bool,
-        /// The level the keyed lines are projections onto (e.g. `r6sxhn`).
+        /// The level the keyed lines are projections onto (e.g. `r0sxhn`).
         #[arg(long, value_parser = Level::parse)]
         spec: Option<Level>,
     },
-    /// DIAGNOSTIC: follow a CONCRETE input sequence (the reference engine's
-    /// concrete step) through one level's tree: per frame, whether the
-    /// concrete state projected onto `--level` is a row of the tree, and
-    /// where. At the first frame it is not, or at the win (never stored), the
-    /// parent row goes through the level's kernels and the concrete
-    /// successor's projection is printed next to the closest kernel
-    /// successors: a concrete successor no kernel successor equals is a
-    /// SOUNDNESS gap; one that is a kernel successor was not stored (a win,
-    /// or the level -1 filter). Found room (1,3)'s win rows keyed
-    /// apart from their columns (2026-10-02, `runtime2::av_code`).
+    /// DIAGNOSTIC: follow a CONCRETE input sequence through one level's tree:
+    /// per frame, whether the projected concrete state is a row of the tree.
+    /// At the first frame it is not, or at the win (never stored), the parent
+    /// row goes through the kernels and the concrete successor is printed
+    /// next to the closest kernel successors: no equal one is a SOUNDNESS
+    /// gap; an equal one was not stored (a win, or the level -1 filter).
     Follow {
         #[arg(long)]
         level_dir: String,
@@ -407,10 +368,9 @@ enum Command {
     },
 }
 
-/// `coarse-census`: one frame's states with the named value cells
-/// (`inspect::cell_names`) under an `erase` prefix left out, as hashes; and
-/// the frame's row count. Pointers count as structure (the names describe
-/// it), not by their cell numbers.
+/// `coarse-census`: one frame's states as hashes, the named value cells
+/// under an `erase` prefix left out (pointers count as structure); and the
+/// frame's row count.
 fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String]) -> Result<(u64, rustc_hash::FxHashSet<u64>)> {
     use celeste_engine::runtime2::{av_code, mix64, Cell2, Col, AV};
     let ids = celeste_rust::compiled::ids();
@@ -505,16 +465,14 @@ fn main() -> Result<()> {
             eprintln!("[search] room {room}, levels {level}, horizon {horizon}");
             let t0 = std::time::Instant::now();
             let base = std::path::Path::new(&checkpoint_dir);
-            // The previous level's arc-marked nodes and that level: the
-            // filter of the next one's forward (`frame::MarkFilter`).
+            // The previous level's arc-marked nodes: the next forward's filter.
             let mut prev: Option<(Visited, Level)> = None;
             for (li, &lvl) in levels.iter().enumerate() {
                 let last = li + 1 == levels.len();
                 set_level(lvl);
                 let dir = base.join(format!("level{li:02}"));
                 // THE FORWARD. A tree that already reaches the horizon is
-                // used as it is (resuming it would rebuild its door to extend
-                // nothing); a finer level's tree is the filtered one of this
+                // used as it is; a finer level's tree is filtered for this
                 // horizon - delete it to change the horizon or the levels.
                 let t = std::time::Instant::now();
                 let first_win = match celeste_rust::frame::tree_first_win_through(&dir, horizon)? {
@@ -535,9 +493,8 @@ fn main() -> Result<()> {
                     }
                 };
                 eprintln!("[search] level {li} ({lvl}): forward to f{horizon} in {:.1} s; first win {first_win:?}", t.elapsed().as_secs_f64());
-                // THE ARC PHASE, and the concrete search: at a coarser level
-                // the try at the bound only (a win there is the optimum), at
-                // the last the whole search.
+                // THE ARC PHASE and the concrete search (at a coarser level
+                // only the try at the bound).
                 let concrete = match (no_witness, last) {
                     (true, _) => Concrete::None,
                     (false, true) => Concrete::Full,
@@ -730,9 +687,8 @@ fn main() -> Result<()> {
                 forward_frame(&engine, small, &Door::new(), None, None, frame + 1, None)?;
             }
             let edges_dir = dir.join("bench-edges");
-            // With edges, the tree's own door: every re-emitted old state
-            // then resolves to its real (earlier) layer, as in the search,
-            // which is what the compaction's per-layer split sees.
+            // With edges, the tree's own door, so a re-emitted old state
+            // resolves to its real layer, as in the search.
             let tree_door = if edges {
                 let t = std::time::Instant::now();
                 let state = celeste_rust::frame::ForwardState::resume(&dir, false)?.expect("a checkpoint tree");
@@ -742,8 +698,7 @@ fn main() -> Result<()> {
                 None
             };
             for rep in 0..reps {
-                // With their ids (as the search runs them: predecessor masks
-                // are tracked whenever the input has ids).
+                // With their ids, as the search runs them.
                 let input: Vec<Block> = frontier
                     .iter()
                     .map(|b| Block::with_ids(b.rt2().clone_block(), b.ids().to_vec(), b.seq()))
@@ -886,9 +841,8 @@ fn main() -> Result<()> {
             let rem_cells = |rt2: &Rt2| rt2.player_xy_cells(ids, ids.f_rem);
             // One stored row, by id, as a one-lane block.
             let row_of = |id: u64| -> Result<Block> { Ok(Block::from_rt2(load_row(dir, id)?.0)) };
-            // Every successor of `row` at remainder `rem` (circle points;
-            // ignored without a player), over all 64 inputs: its projection
-            // onto the level and its player's remainder (circle points).
+            // Every successor of `row` at remainder `rem` over all 64 inputs:
+            // its projection onto the level and its player's remainder.
             type Succ = ((u64, (u64, u64), u32), Option<(u32, u32)>);
             let steps = std::cell::Cell::new(0u64);
             let mut successors = |row: &Block, rem: (u32, u32)| -> Result<Vec<Succ>> {
@@ -1061,8 +1015,7 @@ fn main() -> Result<()> {
                 for b in next {
                     kset.extend(project_onto(&mut b.into_rt2(), level));
                 }
-                // The reference engine's, from the same row projected onto the
-                // level (the input the kernels' own widening reads).
+                // The reference engine's, from the row projected onto the level.
                 let mut input = rt2.clone_block();
                 widen_rt2_to(&mut input, level);
                 let mut rset: std::collections::BTreeSet<Proj> = Default::default();
@@ -1139,8 +1092,7 @@ fn main() -> Result<()> {
                     *d.entry(n.clone()).or_default().entry(v.clone()).or_default() += 1;
                 }
             };
-            // The real tree's projections in a cell, each with the first step
-            // it was reached at, through `step`; and their values at `step`.
+            // The real tree's projections per cell with their first step.
             let mut real_cells: HashMap<u32, HashMap<u64, u32>> = Default::default();
             let mut real_vals = Dist::new();
             let mut real_of = |c: u32, vals: Option<&mut Dist>| -> Result<HashMap<u64, u32>> {
@@ -1166,8 +1118,7 @@ fn main() -> Result<()> {
                 real_cells.insert(c, m.clone());
                 Ok(m)
             };
-            // The coarse tree's new states at `step` in the cells: the samples
-            // (with `--real`, the spurious ones).
+            // The samples: the coarse tree's new states at `step` in the cells.
             let (mut total, mut sp_vals, mut co_vals) = (0u64, Dist::new(), Dist::new());
             let mut chosen: Vec<u64> = Vec::new();
             for &want in &wants {
@@ -1192,8 +1143,7 @@ fn main() -> Result<()> {
                 println!("[spurious] {total} states first reached at f{step:03} in x {x0}..={x1}, y {y0}..={y1}");
             } else {
                 println!("[spurious] x {x0}..={x1}, y {y0}..={y1}, step {step}: coarse {total} new states, {} spurious (projection never reached by the real tree)", chosen.len());
-                // Per-field distributions: the real tree at this step, the
-                // coarse states it has, the spurious ones.
+                // Per-field distributions: real, coarse-and-real, spurious.
                 let fmt_dist = |m: Option<&BTreeMap<String, u64>>| -> String {
                     let Some(m) = m else { return "-".into() };
                     let mut v: Vec<(&String, &u64)> = m.iter().collect();
@@ -1212,8 +1162,7 @@ fn main() -> Result<()> {
                     println!("  {nm}\n    real     {}\n    coarse-ok {}\n    spurious {}", fmt_dist(real_vals.get(nm)), fmt_dist(co_vals.get(nm)), fmt_dist(sp_vals.get(nm)));
                 }
             }
-            // Walk the samples back (with `--real`, to their first spurious
-            // transition).
+            // Walk the samples back.
             let edges = celeste_rust::search::edges::EdgeGraph::open(&coarse.join("edges"), step)?;
             let n = samples.min(chosen.len());
             for k in 0..n {
@@ -1308,8 +1257,7 @@ fn main() -> Result<()> {
             for (_, p) in frame_paths(dir, frame)? {
                 let ff = celeste_rust::search::checkpoint::FrameFile::open(&p)?;
                 let width = ff.width();
-                // The row ranges to read: the whole file in 1M-row pieces, or
-                // one cell's rows.
+                // The whole file in 1M-row pieces, or one cell's rows.
                 let pieces: Vec<std::ops::Range<u32>> = match only_cell {
                     Some(c) => ff.rows_of_cell(c),
                     None => (0..width).step_by(1 << 20).map(|lo| lo..(lo + (1 << 20)).min(width)).collect(),
@@ -1470,15 +1418,13 @@ fn main() -> Result<()> {
                 // At the right position but projected onto another row.
                 let mut off_chain = 0usize;
                 let mut off_chain_sample: Option<celeste_engine::runtime2::Rt2> = None;
-                // A `-` frame (any position: the spawn) takes only the idle
-                // input; the inputs before the player exists cannot matter
-                // to a witness, and 64 x 24 frames of them would.
+                // A `-` frame (the spawn) takes only the idle input: inputs
+                // before the player exists cannot matter.
                 let inputs: std::ops::Range<u8> = if want.is_some() { 0..64 } else { 0..1 };
                 for (st, path) in &layer {
                     for byte in inputs.clone() {
-                        // Every leaf: a leaf at the wanted position is as good
-                        // a witness as the frame has. The real-PICO-8 replay
-                        // is what settles it.
+                        // Every leaf at the wanted position is a candidate;
+                        // the real-PICO-8 replay settles it.
                         for block in eng.step(st, byte)? {
                             tried += 1;
                             let cell = block.positions()?[0];
@@ -1497,8 +1443,7 @@ fn main() -> Result<()> {
                                     continue;
                                 }
                             }
-                            // Deduplicated on the EXACT state (the row key
-                            // forgets the remainder).
+                            // Deduplicated on the EXACT state's key.
                             let key = block.rt2().clone_block().row_keys_canonical()[0];
                             if !seen.insert((key.0, key.1, cell)) {
                                 continue;

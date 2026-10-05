@@ -1,32 +1,24 @@
-//! The explicit backward graph (plans/waves.md, "the explicit graph").
+//! The recorded backward graph.
 //!
-//! The forward records, at every flush, one record per (emitted state,
-//! slice that produced it, transfer): the state's id (`frame::pack_id`),
-//! the id of the slice's first input row, the remainder transfer of those
-//! lanes (`search::arc_edges`, as the worker's interned id) and a 64-bit
-//! mask of the lanes that produced the state - `crate::frame::ForwardSink`.
-//! The records land in `<level>/edges/raw/f{frame}/l{target layer}_w{worker}.bin`
-//! beside each worker's transfer table (`x_w{worker}.bin`), and at the end of
-//! the frame `compact_frame` merges the tables into the frame's
-//! (`xfer/f{frame}.bin`, sorted by value) and sorts each layer's records by
-//! (target, base, transfer) into the RUN `l{layer}/f{frame}.bin`. A run
-//! holds, for the frame it was recorded at, every edge into that layer's
-//! states; the edges' sources are rows of layer `frame - 1` (the frame's
-//! input frontier).
-//!
-//! The backward is then a BFS over these files (`backward`): no kernel is
-//! re-run. Its marked set reproduces the kernel backward's exactly (the
-//! eligibility rule is the same: at iteration i, a predecessor is marked
-//! iff its layer is <= i), which is what `gates/marks_*` pins.
+//! At every flush the forward (`frame::ForwardSink`) records one record per
+//! (emitted state, producing slice, transfer): the state's id, the slice's
+//! first input id, the remainder transfer (`search::arc_edges`, a worker-local
+//! id) and a 64-lane mask. Records land in
+//! `<level>/edges/raw/f{frame}/l{target layer}_w{worker}.bin` beside each
+//! worker's transfer table (`x_w{worker}.bin`); `compact_frame` then merges
+//! the tables into the frame's (`xfer/f{frame}.bin`, sorted by value) and
+//! sorts each layer's records by (target, base, transfer) into the RUN
+//! `l{layer}/f{frame}.bin`: every edge recorded at that frame into that
+//! layer, sources in layer `frame - 1`. The backward (`bfs`) reads only runs.
 
 use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::frame::{id_layer, pack_id};
 
-/// One edge record in a worker file: the target's (seq, row) - its layer
-/// is the file's - the base's (seq, row) - its layer is the frame's input
-/// layer - the transfer (the worker's id) and the 64-lane mask.
+/// One edge record in a worker file: the target's (seq, row) (layer: the
+/// file's), the base's (seq, row) (layer: the frame's input), the transfer
+/// (worker-local id) and the 64-lane mask.
 pub const RECORD_BYTES: usize = 24;
 
 
@@ -54,9 +46,8 @@ pub fn encode_record(out: &mut Vec<u8>, target: u64, base: u64, xfer: u32, mask:
     out.extend_from_slice(&mask.to_le_bytes());
 }
 
-/// Decode a record of a file for layer `layer`, recorded at frame
-/// `frame` (so the base is in layer `frame - 1`), its worker-local transfer
-/// id mapped through `remap` (the worker's table into the frame's).
+/// Decode a record of layer `layer` recorded at `frame` (base in layer
+/// `frame - 1`), its transfer id mapped through `remap` into the frame's.
 #[inline]
 fn decode(b: &[u8], layer: u32, frame: u32, remap: &[u32]) -> Rec {
     let tseq = u16::from_le_bytes(b[0..2].try_into().unwrap()) as u32;
@@ -134,9 +125,8 @@ fn raw_files(dir: &Path, frame: u32) -> Vec<(u32, Vec<RawFile>, u64)> {
         .collect()
 }
 
-/// The last frame whose runs are complete (`<dir>/done.txt`, written as
-/// 0 when a forward starts). `None` if there is no marker at all: a tree
-/// written before the marker existed, whose frames are all trusted.
+/// The last frame whose runs are complete (`<dir>/done.txt`); `None`: no
+/// marker, every frame trusted.
 pub fn done_frame(dir: &Path) -> Option<u32> {
     std::fs::read_to_string(dir.join("done.txt")).ok().and_then(|s| s.trim().parse().ok())
 }
@@ -249,10 +239,9 @@ fn unzigzag(v: u64) -> i64 {
     ((v >> 1) as i64) ^ -((v & 1) as i64)
 }
 
-/// Encode a slice of records already sorted by (target, base, transfer):
-/// equal triples merged, delta-varint blocks of `STRIDE` pairs. Returns
-/// `(index entries (first target, offset within this stream), stream,
-/// pairs)`.
+/// Encode records sorted by (target, base, transfer): equal triples merged,
+/// delta-varint blocks of `STRIDE`. Returns `(index (first target, offset),
+/// stream, pairs)`.
 fn encode_sorted(recs: &[Rec]) -> (Vec<(u64, u64)>, Vec<u8>, u64) {
     let mut index: Vec<(u64, u64)> = Vec::with_capacity(recs.len() / STRIDE + 1);
     let mut out: Vec<u8> = Vec::with_capacity(recs.len() * 5);
@@ -287,15 +276,14 @@ fn encode_sorted(recs: &[Rec]) -> (Vec<(u64, u64)>, Vec<u8>, u64) {
 }
 
 
-/// Records per sort chunk of a big layer: 32M x 32 B = 1 GB of sort
-/// buffer, whatever the layer's size.
+/// Records per sort chunk of a big layer: bounds the sort buffer (~1 GB)
+/// whatever the layer's size.
 const CHUNK_RECORDS: usize = 32 << 20;
 
-/// `sort_layer` in CHUNKS of target ranks: the same rank histogram and
-/// claimed scatter, but one contiguous rank range at a time (each at most
-/// `chunk_records` records), each range scattered by a pass over every
-/// file, base-sorted, and appended to `writer`. Ranks are target order,
-/// so the run is sorted as a whole. Returns (sort time, write time).
+/// A layer's counting sort by target rank, one contiguous rank range (at
+/// most `chunk_records`) at a time: each range scattered by a pass over every
+/// file, base-sorted, appended to `writer`. Ranks are target order, so the
+/// run is sorted as a whole. Returns (sort time, write time).
 fn sort_layer_chunked(
     files: &[(&[u8], &[u32])],
     layer: u32,
@@ -418,9 +406,8 @@ fn sort_layer_chunked(
     Ok((t_sort0.elapsed() - t_write, t_write))
 }
 
-/// A run file written in sorted slices: the index kept in memory, the
-/// stream appended to a temp file, and `finish` assembling header + index
-/// + stream (the format `write_run` writes in one go).
+/// A run file written in sorted slices (index in memory, stream to a temp
+/// file); `finish` writes `write_run`'s format.
 struct RunWriter {
     index: Vec<(u64, u64)>,
     stream: std::io::BufWriter<std::fs::File>,
@@ -574,17 +561,13 @@ fn write_run(sorted: &[Rec], encode_chunks: usize, path: &Path, tmp: &Path) -> R
 }
 
 /// Records above which a layer gets the parallel counting sort; smaller
-/// layers are comparison-sorted whole, several layers at a time (a
-/// single-threaded sort of 4M records was the compaction's critical path
-/// at 4M; at 512k it is ~40 ms).
+/// layers are comparison-sorted whole, several at a time (~40 ms at this
+/// size, so no single small layer becomes the critical path).
 const BIG_LAYER: usize = 1 << 19;
 
 /// After frame `frame`: turn every layer's worker files into the run
-/// `l{layer}/f{frame}.bin` - the records sorted by (target, base), equal
-/// pairs merged, delta-varint encoded in blocks of `STRIDE` with an index
-/// of (first target, offset) per block - and delete them. Big layers one
-/// at a time, each with every thread (`sort_layer`); small layers in
-/// parallel, one thread each.
+/// `l{layer}/f{frame}.bin` and delete them. Big layers one at a time with
+/// every thread; small layers in parallel, one thread each.
 pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
     let remaps = merge_xfer_tables(dir, frame)?;
     let remap_of = |worker: u32| -> &[u32] { remaps.get(&worker).map_or(&[], |v| v.as_slice()) };
@@ -612,10 +595,8 @@ pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
     let (big, small): (Vec<_>, Vec<_>) = layers.into_iter().partition(|(_, _, bytes)| *bytes as usize / RECORD_BYTES >= BIG_LAYER);
     for (layer, files, bytes) in &big {
         let t0 = std::time::Instant::now();
-        // The raw records are MAPPED, not read: a big layer is the frame's
-        // whole emission (room (2,0) f69: 323M records, 6.5 GB) and a copy
-        // of it in the heap sat in RSS for the whole of the next frame's
-        // wave, which the compaction runs behind. Mapped, it is page cache.
+        // MAPPED, not read: a big layer is GBs, and a heap copy would sit
+        // in RSS through the next frame's wave; mapped, it is page cache.
         let maps: Vec<memmap2::Mmap> = files
             .iter()
             .map(|(f, _)| -> Result<memmap2::Mmap> {
@@ -630,9 +611,7 @@ pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
         let views: Vec<(&[u8], &[u32])> = maps.iter().zip(files).map(|(m, (_, w))| (&m[..], remap_of(*w))).collect();
         st.records += *bytes / RECORD_BYTES as u64;
         st.t_read += t0.elapsed();
-        // Sorted in CHUNKS of target ranks, each streamed into the run as
-        // it is done, so the sort's own buffer is bounded (`CHUNK_RECORDS`
-        // x 24 B) instead of the whole layer's (7.8 GB at room (2,0) f69).
+        // Sorted in CHUNKS streamed into the run: a bounded sort buffer.
         let ldir = layer_dir(dir, *layer);
         std::fs::create_dir_all(&ldir)?;
         let mut writer = RunWriter::new(&ldir.join(format!("tmp-f{:03}.stream", frame)))?;
@@ -700,10 +679,9 @@ pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
     Ok(st)
 }
 
-/// The workers' transfer tables of frame `frame` merged into the frame's
-/// (`xfer/f{frame}.bin`: the distinct pairs, sorted by value, so the table
-/// and the runs are a function of the frame, not of the scheduling). Returns
-/// per worker the map from its ids to the frame's.
+/// Merge the workers' transfer tables into the frame's (`xfer/f{frame}.bin`,
+/// distinct pairs sorted by value: independent of scheduling). Returns per
+/// worker the map from its ids to the frame's.
 fn merge_xfer_tables(dir: &Path, frame: u32) -> Result<rustc_hash::FxHashMap<u32, Vec<u32>>> {
     use super::arc_edges::{decode_pair, encode_pair, Pair, PAIR_BYTES};
     let mut tables: Vec<(u32, Vec<Pair>)> = Vec::new();
@@ -794,9 +772,8 @@ impl Run {
 
     /// The pairs with `target`, in (base) order.
     fn edges_of(&self, target: u64, out: &mut Vec<Edge>) {
-        // The pairs with `target` begin in the last block whose first
-        // target is < target (or the one after it) and may run on across
-        // block boundaries.
+        // They begin in the last block whose first target is < target (or
+        // the next) and may span blocks.
         let mut blk = self.index.partition_point(|&(t, _)| t < target).saturating_sub(1);
         if blk >= self.index.len() {
             return;
@@ -884,8 +861,7 @@ impl EdgeGraph {
         self.xfers.get(frame as usize).map_or(&[], |v| v.as_slice())
     }
 
-    /// DIAGNOSTIC (`rewrite arc-check`): every
-    /// record of frame `frame`, a full scan of its runs.
+    /// Every record of frame `frame`, a full scan (`rewrite arc-check`).
     pub fn records_at(&self, frame: u32) -> Vec<Edge> {
         let mut out = Vec::new();
         self.scan(frame, |e| out.push(e));
@@ -938,8 +914,7 @@ impl EdgeGraph {
 pub struct Marks {
     bits: rustc_hash::FxHashMap<(u32, u32), Vec<u64>>,
     /// Each marked id's DEADLINE: the last frame from which it still reaches
-    /// a win by the horizon - the BFS iteration that marked it (a seed's is
-    /// the horizon). What the next level's filter bounds time with.
+    /// a win by the horizon (the BFS iteration that marked it).
     deadlines: Vec<(u64, u16)>,
     pub count: usize,
 }
@@ -985,14 +960,11 @@ pub struct BfsStats {
     pub t_bfs: std::time::Duration,
 }
 
-/// The BFS backward: `seeds` (win rows, layer <= horizon) and their
-/// transitive predecessors under the eligibility rule - iteration i
-/// (i = horizon-1 down to 1) marks a predecessor of an i+1-frontier state
-/// iff the predecessor's layer is <= i. A state's edges are consulted
-/// once, when it enters the frontier: its runs of frames layer..=i+1.
-/// So iteration i marks exactly the states that reach a win by the horizon
-/// from frame i but not from i+1: i is the state's DEADLINE (`Marks`),
-/// horizon - its distance to a win, for any state first reached by then.
+/// The remainder-free BFS backward from `seeds` (win rows): iteration i
+/// (horizon-1 down to 1) marks a predecessor of an i+1-frontier state iff
+/// its layer is <= i, reading the state's runs of frames layer..=i+1 once.
+/// So iteration i marks exactly the states that win by the horizon from
+/// frame i but not from i+1: i is the state's DEADLINE.
 pub fn bfs(graph: &EdgeGraph, horizon: u32, seeds: impl IntoIterator<Item = u64>) -> (Marks, BfsStats) {
     let t = std::time::Instant::now();
     let mut marks = Marks::default();
@@ -1008,9 +980,8 @@ pub fn bfs(graph: &EdgeGraph, horizon: u32, seeds: impl IntoIterator<Item = u64>
         let t_it = std::time::Instant::now();
         frontier.sort_unstable();
         let last_frame = (i + 1).min(horizon);
-        // The lookups in parallel over the frontier (the marks read-only:
-        // a predecessor seen by two workers is deduplicated at the insert
-        // below), the inserts sequential and in frontier order.
+        // Lookups in parallel (marks read-only), inserts sequential in
+        // frontier order (deduplicating predecessors seen twice).
         let chunk = frontier.len().div_ceil(workers).max(1);
         let found: Vec<(Vec<u64>, u64, u64)> = std::thread::scope(|scope| {
             let hs: Vec<_> = frontier
@@ -1072,10 +1043,9 @@ pub fn bfs(graph: &EdgeGraph, horizon: u32, seeds: impl IntoIterator<Item = u64>
     (marks, BfsStats { edges_read, lookups, t_open: std::time::Duration::ZERO, t_bfs })
 }
 
-/// Each `(id, deadline)` of `ids` (sorted by id) resolved to its row's
-/// `(shape, key, cell)` through the tree's frame files `(layer, seq, file)`
-/// (in `(layer, seq)` order): `f(shape, key, cell, deadline)`. Every id must
-/// resolve.
+/// Resolve each `(id, deadline)` of `ids` (sorted) to its row's `(shape,
+/// key, cell)` through the frame files `(layer, seq, file)` (sorted), calling
+/// `f(shape, key, cell, deadline)`. Every id must resolve.
 pub fn resolve_ids(
     files: &[(u32, u32, crate::search::checkpoint::FrameFile)],
     ids: &[(u64, u16)],

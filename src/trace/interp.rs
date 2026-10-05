@@ -1,20 +1,10 @@
-//! The AST interpreter. One implementation, two domains.
+//! The AST interpreter, generic over the domain.
 //!
-//! Control flow is ordinary recursion because the AST says where things
-//! join: the end of an `if` statement is right there in the syntax, so
-//! there is no post-dominator analysis and no CFG. A call is recursion
-//! too - hand the callee the state, get the state back - so nothing is
-//! inlined because nothing has to be.
-//!
-//! ## Where it fans out
-//!
-//! A statement returns a LIST of outcomes, because a branch the domain
-//! cannot decide runs both arms and they do not always merge back (an
-//! object destroyed on one side changes the shape). An EXPRESSION threads
-//! a single state, and refuses loudly if a call inside it fans out. That
-//! is a real restriction and it is deliberate for now: in this program
-//! shape divergence happens in statement position (`del(objects, obj)`),
-//! and a loud refusal is the right way to find out if that is ever wrong.
+//! Control flow is recursion: the AST says where things join, and a call
+//! hands the callee the state and gets it back, so nothing is inlined.
+//! Anything that runs code (statements and expressions alike) returns a LIST
+//! of outcomes, because an undecided branch runs both arms and they do not
+//! always merge back (an object destroyed on one side changes the shape).
 
 use anyhow::{anyhow, bail, Result};
 use full_moon::ast;
@@ -49,9 +39,8 @@ impl<D: Domain> Flow<D> {
 
 }
 
-/// Can these two values be joined into one? Only numbers and booleans
-/// can differ - everything else is concrete, so it either matches
-/// outright or the two states are genuinely different successors.
+/// Can these two values be joined into one? Only numbers and booleans can
+/// differ; anything else must match or the states are different successors.
 fn joinable<D: Domain>(a: &Value<D>, b: &Value<D>) -> bool {
     matches!(
         (a, b),
@@ -59,90 +48,56 @@ fn joinable<D: Domain>(a: &Value<D>, b: &Value<D>) -> bool {
     ) || a == b
 }
 
-/// One or more `(state, thing)` outcomes.
-///
-/// EVERYTHING that can run code returns one of these, expressions
-/// included. An expression is not pure: it can contain a call, the call
-/// can branch on something unknown, and the two arms may disagree about
-/// the heap's shape and so fail to merge. Threading a single state through
-/// expressions was not a simplification, it was wrong.
+/// One or more `(state, thing)` outcomes. Expressions return these too: a
+/// call inside one can branch and its arms may not merge.
 pub type Multi<D, T> = Vec<(State<D>, T)>;
 pub type Outcome<D> = Multi<D, Flow<D>>;
 
-/// Cloneable so key-set workers can each trace from a copy of one walked
-/// tracer (its arena holds the shapes' representative states).
+/// The interpreter. Cloneable so workers can each trace from a copy of one
+/// walked tracer (its arena holds the shapes' representative states).
 #[derive(Clone)]
 pub struct Interp<'a, D: Domain> {
     pub d: D,
-    /// Function bodies, referred to by id from closures - the AST outlives
-    /// the heap, so the heap stores an index rather than a reference.
+    /// Function bodies, by `BodyId`.
     bodies: Vec<&'a ast::FunctionBody>,
-    /// AST node -> its id, so evaluating the same `function ... end`
-    /// twice yields the SAME closure body.
-    ///
-    /// This is not a cache. Minting a fresh id per evaluation made two
-    /// states that had built the same closure structurally different, and
-    /// since a `Func` slot is part of the SHAPE, they then could not
-    /// merge. It cost ten unmergeable outcomes on the first frame that
-    /// was traced as a kernel, all of them the same 110 scalars and
-    /// differing only in these numbers.
+    /// AST node -> its id, so evaluating the same `function ... end` twice
+    /// yields the SAME body. Not a cache: the body is part of the SHAPE, and
+    /// a fresh id per evaluation would keep equal states from merging.
     body_ids: std::collections::HashMap<*const ast::FunctionBody, BodyId>,
     /// See `hint_name`.
     hint: Vec<String>,
-    /// Paths poisoned by `poison`: a Lua type error means no legal run
-    /// takes that path, so its lanes deopt rather than aborting the
-    /// trace. Counted by reason, because turning an error into a deopt
-    /// would otherwise hide a modelling gap at build time.
+    /// Paths poisoned by `poison` (a Lua error: no legal run takes the path),
+    /// counted by reason so a modelling gap stays visible at build time.
     pub illegal: std::collections::BTreeMap<String, usize>,
-    /// WHERE each poisoned path was, as the path guard at the raise, with the
-    /// reason: the raise row's liveness is the OR of these
-    /// (plans/graph-model.md section 4, "a raise is its own row").
-    ///
-    /// `illegal` counts by reason and so cannot build that - a string is not a
-    /// condition. Kept beside it rather than replacing it, because the count
-    /// is the build-time diagnostic and this is the value the kernel needs.
-    /// Per trace: `verify::trace_frame` resets it and takes it.
+    /// WHERE each poisoned path was (its guard at the raise) and why: the
+    /// raise row's liveness is the OR of these. Per trace:
+    /// `verify::trace_frame` resets and takes it.
     pub raised: Vec<(D::Bool, String)>,
     /// The cart and the room's collision cache, for `mget`/`fget` and
-    /// `tile_flag_at`. Optional so the unit tests can run programs that
-    /// never touch the map.
+    /// `tile_flag_at` (optional for unit tests that never touch the map).
     pub cart: Option<std::sync::Arc<celeste_core::cart_data::CartData>>,
     pub cache: Option<std::sync::Arc<celeste_core::collision_cache::CollisionCache>>,
-    /// Budgets, so a blow-up is a DIAGNOSIS rather than a hang. A tracer
-    /// that runs forever tells you nothing about where it went wrong; one
-    /// that stops at a limit tells you exactly which construct did it.
+    /// Budgets, so a blow-up is a DIAGNOSIS naming the construct, not a hang.
     pub max_states: usize,
     pub max_nodes: usize,
-    /// The graph's size when the current frame trace began
-    /// (`verify::trace_frame`): `max_nodes` bounds ONE trace's growth. A
-    /// walk traces many frames into one arena, and bounding the arena's
-    /// total made a trace refuse because of the traces before it (room
-    /// (3,0): 12 fall floors, two shapes refused at `__reset_button_states`,
-    /// 2026-09-16).
+    /// The graph's size when the current frame trace began: `max_nodes`
+    /// bounds ONE trace's growth, not the shared arena's total.
     pub trace_start_nodes: usize,
-    /// What `printh` has printed, in order. This exists so a program can
-    /// be run in the tracer AND in real PICO-8 and the two outputs
-    /// compared line for line (`lua/probe/`), which is the only way to
-    /// settle a question like what `#` does to a table with a hole in it.
+    /// What `printh` has printed, in order: compared line for line against a
+    /// real PICO-8 running the same probe (`lua/probe/`).
     pub prints: Vec<String>,
-    /// Loop bodies traced (`for_body` calls): how far the unrolled loops
-    /// ran. A probe statistic.
+    /// Loop bodies traced (`for_body` calls); a probe statistic.
     pub for_iterations: u64,
-    /// `(room x, room y, flag bit) -> does any tile in that room carry
-    /// it`. Answering costs 256 map lookups, and `ice_at` asks every
-    /// frame for every object.
+    /// `(room x, room y, flag bit) -> does any tile in that room carry it`,
+    /// memoized: 256 map lookups, asked by `ice_at` for every object.
     room_flags: std::collections::HashMap<(i16, i16, i16), bool>,
-    /// Merges whose two sides did not diverge at one shared decision, so
-    /// the select condition was the full guard (`state::Merged::fell_back`).
-    /// A count, because whether `collapse`'s pairing ever produces this
-    /// case is a number and not an argument.
+    /// Merges that selected on the full guard (`state::Merged::fell_back`).
     pub merge_fallbacks: usize,
     /// Literal splits handed out: the ids in `State::frag`.
     next_split: usize,
-    /// THE ARC CAPTURE (`search::arc_edges`): set per frame trace by
-    /// `verify::trace_frame` (every level-0 trace). Every
-    /// `__split_by_flr` must then name its site (`split_site_of`), and the
-    /// player's own record what they did on the state (`State::arc`).
+    /// THE ARC CAPTURE (`search::arc_edges`), set per level-0 frame trace by
+    /// `verify::trace_frame`: every `__split_by_flr` must then name its site
+    /// (`split_site_of`), and the player's record what they did (`State::arc`).
     pub arc_capture: bool,
     /// The site of the `__split_by_flr` call being made: set by the call
     /// (`walk_suffixes`) from the argument's syntax, taken by the builtin.
@@ -169,9 +124,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             cart: None,
             cache: None,
             max_states: 256,
-            // `CELESTE_MAX_TRACE_NODES` overrides the budget for a MEASUREMENT
-            // (how big a refused trace really is), never silently in production:
-            // the default stays the runaway guard it was.
+            // `CELESTE_MAX_TRACE_NODES`: for measuring a refused trace only.
             max_nodes: std::env::var("CELESTE_MAX_TRACE_NODES")
                 .ok()
                 .map(|v| v.parse().unwrap_or_else(|_| panic!("CELESTE_MAX_TRACE_NODES={v:?} is not a number")))
@@ -189,13 +142,9 @@ impl<'a, D: Domain> Interp<'a, D> {
 
     /// The engine's index for a function named `name`.
     ///
-    /// `FN_NAMES` spells a function as `base_N`, where `N` is a counter
-    /// the IR frontend assigns in compile order. Reproducing that
-    /// counter here would mean reproducing the frontend's traversal and
-    /// keeping the two in step forever, so this matches on the BASE and
-    /// requires the match to be unique. It is, for all 74 named
-    /// functions; the only ambiguous base is `anonymous`, which has four
-    /// and which this refuses by construction.
+    /// `FN_NAMES` spells a function `base_N` with a compile-order counter
+    /// `N`; this matches on the BASE and requires it to be unique (true for
+    /// every named function; the ambiguous `anonymous` is refused).
     fn fn_id_of(name: &str) -> Option<u32> {
         let mut found = None;
         for (i, n) in celeste_names::gen::FN_NAMES.iter().enumerate() {
@@ -213,14 +162,11 @@ impl<'a, D: Domain> Interp<'a, D> {
         found
     }
 
-    /// The name a function expression is being stored under, as the IR
-    /// frontend would spell it: the enclosing assignment target, extended
-    /// by each table-constructor field on the way in. `player = { init =
-    /// function ... }` is `player.init`, which is `player.init_20`.
-    ///
-    /// A STACK rather than a parameter threaded through `eval`: the hint
-    /// is syntactic, so pushing it around the sub-evaluation is exact,
-    /// and `eval`'s signature is on every expression in the tracer.
+    /// The name a function expression is being stored under, as `FN_NAMES`
+    /// spells it: the assignment target, extended by each table-constructor
+    /// field on the way in (`player = { init = function ... }` is
+    /// `player.init`). A stack, not an `eval` parameter: the hint is
+    /// syntactic, so pushing it around the sub-evaluation is exact.
     fn hint_name(&self) -> Option<String> {
         if self.hint.is_empty() {
             return None;
@@ -228,44 +174,28 @@ impl<'a, D: Domain> Interp<'a, D> {
         Some(self.hint.join("."))
     }
 
-    /// The free variables of a body that resolve to a LOCAL of the
-    /// defining scope - which is what the IR frontend captures, and what
-    /// `Cell2::Clo` carries as columns.
+    /// The free variables of a body that resolve to a LOCAL of the defining
+    /// scope: what `Cell2::Clo` carries as columns.
     ///
-    /// Free is decided syntactically, by visiting the variable and prefix
-    /// positions only: a field name after a dot is not a variable, and
-    /// `obj.x` must not capture a local `x` that happens to be in scope.
-    /// `init_object` has exactly that shape - locals `obj`, `type`, `x`,
-    /// `y`, and a body full of `obj.x` - so a text scan would capture
-    /// three things the interpreter does not.
-    ///
-    /// Names the scope chain does not have are globals, which are not
-    /// captured. Parameters and body-locals are not in the DEFINING
-    /// scope, so the same filter removes them.
+    /// Decided syntactically, visiting variable and prefix positions only (a
+    /// field name after a dot is not a variable: `obj.x` must not capture a
+    /// local `x`). Names the scope chain lacks are globals, not captured.
     fn captures_of(
         &self,
         body: &'a ast::FunctionBody,
         env: super::heap::ScopeId,
         st: &State<D>,
     ) -> Vec<String> {
-        // `Visit::visit`, not the `visit_function_body` HOOK. Calling
-        // the hook by name runs that one method and recurses into
-        // nothing, which looks like a body with no free variables at all
-        // - every closure came out with an empty capture list.
+        // `Visit::visit`, not the `visit_function_body` HOOK: calling the hook
+        // by name recurses into nothing (an empty capture list).
         use full_moon::visitors::{Visit, Visitor};
 
         #[derive(Default)]
         struct Names {
             order: Vec<String>,
             seen: std::collections::HashSet<String>,
-            /// Names BOUND inside the body: its parameters, every
-            /// `local`, and every loop variable - including nested
-            /// functions', which over-subtracts. A capture missed that
-            /// way is a difference
-            /// `the_tracer_encodes_a_block_the_way_the_importer_does`
-            /// reports, which is the reason to prefer this to a
-            /// scope-accurate walk that would have to agree with the IR
-            /// frontend's by inspection.
+            /// Names BOUND inside the body: parameters, `local`s and loop
+            /// variables, including nested functions' (which over-subtracts).
             bound: std::collections::HashSet<String>,
         }
         impl Names {
@@ -323,10 +253,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     fn intern_body(&mut self, b: &'a ast::FunctionBody) -> BodyId {
-        // By POINTER: the AST outlives the interpreter and never moves,
-        // so the address is a stable name for the syntax. Two closures
-        // over the same syntax still differ when they captured different
-        // scopes - that is what `Func::env` is for.
+        // By POINTER: the AST outlives the interpreter and never moves.
         let k = b as *const ast::FunctionBody;
         if let Some(id) = self.body_ids.get(&k) {
             return *id;
@@ -339,24 +266,10 @@ impl<'a, D: Domain> Interp<'a, D> {
 
     // ------------------------------------------------------------ blocks
 
-    /// A BLOCK IS A SCOPE. Without this, a `local` declared inside an
-    /// `if` arm lands in the enclosing FUNCTION's scope and outlives the
-    /// arm, which is not what Lua does:
-    ///
-    /// ```text
-    /// local m=1 if true then local m=2 printh(m) end printh(m)   -- 2, then 1
-    /// if true then local leaked=7 end printh(leaked)             -- [nil]
-    /// ```
-    ///
-    /// Nothing in this cart shadows a name, so it was never a wrong
-    /// VALUE. It was a merge failure: a leaked name is part of
-    /// `Shape::scopes`, so the two arms of `if this.dash_time>0 then ..
-    /// else <maxrun, accel, deccel, maxfall, gravity, ..> end` ended with
-    /// different scope key sets and could not merge.
-    ///
-    /// Only when the block actually declares something. A scope object
-    /// per `if` arm would otherwise be allocated, walked by GC and
-    /// canonicalised for every branch in the program, to hold nothing.
+    /// Run a block. A BLOCK IS A SCOPE, as in Lua: a `local` declared in an
+    /// `if` arm must not outlive it (a leaked name is part of
+    /// `Shape::scopes`, so the arms would not merge). A scope is allocated
+    /// only when the block declares something.
     pub fn exec_block(&mut self, block: &'a ast::Block, st: State<D>) -> Result<Outcome<D>> {
         if !declares_local(block) {
             return self.exec_block_flat(block, st);
@@ -381,9 +294,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                     continue;
                 }
                 // A RAISED path executes no further: its lanes are in the
-                // raise row (`poison`), so it is live nowhere, and running
-                // on would intern nodes nothing reads - on the shape walk
-                // that was most of a two-million-node graph.
+                // raise row (`poison`), and running on interns dead nodes.
                 if self.d.decide(&s.guard) == Some(false) {
                     continue;
                 }
@@ -547,13 +458,10 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
     }
 
-    /// `if` is where the tracer stops being an interpreter. A condition the
-    /// domain can decide just takes its arm - most of them, because the
-    /// heap is concrete. One it cannot runs BOTH arms from a copy of the
-    /// state and merges the results.
+    /// `if`: a condition the domain decides takes its arm; an undecided one
+    /// runs BOTH arms from a copy of the state and merges the results.
     fn exec_if(&mut self, iff: &'a ast::If, st: State<D>) -> Result<Outcome<D>> {
-        // `elseif` chains are the same thing nested, so build the arms in
-        // order and recurse over the tail.
+        // `elseif` chains are nested arms: recurse over the tail.
         let mut arms: Vec<(&'a ast::Expression, &'a ast::Block)> =
             vec![(iff.condition(), iff.block())];
         if let Some(eis) = iff.else_if() {
@@ -583,10 +491,6 @@ impl<'a, D: Domain> Interp<'a, D> {
                 Some(true) => self.exec_block(blk, s)?,
                 Some(false) => self.exec_arms(rest, els, s)?,
                 None => {
-                    // Each arm only happens under its own condition, so
-                    // record that before running it. A merge puts the
-                    // original back, because either side happening IS the
-                    // original condition.
                     let (ts, fs) = split(&mut self.d, s, &cond);
                     let t = match ts {
                         Some(x) => self.exec_block(blk, x)?,
@@ -614,29 +518,16 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(out)
     }
 
-    /// Merge every pair of outcomes that can be merged, to a fixpoint.
-    ///
-    /// Any two same-kind outcomes with a mergeable shape now merge, on
-    /// `t`'s guard - there is no sibling relation to establish first. The
-    /// rule this replaces could only pair outcomes differing in exactly
-    /// ONE assumed literal, which is sound (two such outcomes cover their
-    /// parent) but far too weak: an `elseif` ladder inside a loop
-    /// accumulates one `return` per rung, each a literal deeper than the
-    /// last, and `spikes_at` reached 276 of them - all returning `true`
-    /// from a function that mutates nothing. One behaviour the rule could
-    /// not see.
-    ///
-    /// Run after every statement, so the collapse cascades bottom-up and
-    /// the frontier stays at the number of genuinely different futures
-    /// rather than the product of every branch taken to get there.
+    /// Merge every pair of outcomes that can be merged, to a fixpoint: any
+    /// two same-kind outcomes with a mergeable shape, not only siblings (an
+    /// `elseif` ladder in a loop leaves one `return` per rung). Run after
+    /// every statement, so the frontier stays at the number of genuinely
+    /// different futures, not the product of the branches taken.
     pub fn collapse(&mut self, mut outs: Outcome<D>) -> Result<Outcome<D>> {
         self.drop_raised(&mut outs);
         let mut pairing = Pairing::new(outs.len());
         'again: loop {
-            // Siblings first (longest shared decision prefix), so that a
-            // merge selects on the decision that separates its two sides
-            // rather than falling back to the full guard - see
-            // `State::path` and `merge_order`.
+            // Siblings first (`merge_order`).
             let states: Vec<&State<D>> = outs.iter().map(|o| &o.0).collect();
             pairing.prepare(&states)?;
             let pairs = super::state::merge_order(&states, |i, j| {
@@ -705,18 +596,14 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(outs)
     }
 
-    /// Drop the states live nowhere before merging: a raise cleared their
-    /// guard (`poison`) and its lanes are in the raise row. Merged instead,
-    /// such a state would put a select on the separating decision into
-    /// every slot it disagrees in, for lanes that cannot take it.
+    /// Drop the states live nowhere before merging (a raise cleared their
+    /// guard, `poison`): merged, they would add selects no lane can take.
     fn drop_raised<T>(&mut self, outs: &mut Vec<(State<D>, T)>) {
         outs.retain(|(s, _)| self.d.decide(&s.guard) != Some(false));
     }
 
-    /// Can these two flows be joined - WITHOUT building any nodes? Asked
-    /// before the merge so a rejected pair costs nothing; `collapse` now
-    /// tries every pair rather than only siblings, so most pairs are
-    /// rejected and building a `Sel` for each would be pure garbage.
+    /// Can these two flows be joined? Builds no nodes, so the many rejected
+    /// pairs `collapse` tries cost nothing.
     fn can_join(&self, a: &Flow<D>, b: &Flow<D>) -> bool {
         match (a, b) {
             (Flow::Return(x), Flow::Return(y)) => joinable(x, y),
@@ -749,12 +636,10 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
     }
 
-    /// Only numbers and booleans actually differ; `joinable` has already
-    /// established that this pair is one of those or is equal outright.
+    /// Join two `joinable` values: only numbers and booleans differ.
     fn join_value(&mut self, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Value<D> {
         match (a, b) {
-            // As a heap slot's join (`state::join`): a condition no lane
-            // decides over values every lane holds alike joins, not selects.
+            // As `state::join`.
             (Value::Num(x), Value::Num(y)) => Value::Num(match self.d.join_num_independent(cond, x, y) {
                 Some(j) => j,
                 None => self.d.sel_num(cond, x, y),
@@ -768,18 +653,16 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
 
-    /// Numeric `for`. The bounds must be CONCRETE, which they are almost
-    /// everywhere because the heap is: `for i=1,count(objects)` reads a
-    /// real table. The exceptions are the pixel-steppers in `move_x`/
-    /// `move_y`; those get a bound and a guard, which is not built yet.
+    /// Numeric `for`. The bounds are concrete almost everywhere (the heap
+    /// is); a symbolic one (the pixel-steppers, the tile scans) is unrolled
+    /// to `unroll_bound` by `run_for_symbolic`.
     fn exec_for(&mut self, f: &'a ast::NumericFor, st: State<D>) -> Result<Outcome<D>> {
         if f.step().is_some() {
             bail!("numeric for with an explicit step is not supported");
         }
         let name = ident(f.index_variable())?;
         let mut all: Outcome<D> = Vec::new();
-        // Bounds can themselves fan out (they are expressions), so each
-        // combination is its own loop.
+        // Bounds can fan out: each combination is its own loop.
         let mut bounds: Multi<D, Bound<D>> = Vec::new();
         for (s, from) in self.eval(f.start(), st)? {
             for (s, to) in self.eval(f.end(), s)? {
@@ -788,11 +671,8 @@ impl<'a, D: Domain> Interp<'a, D> {
                 };
                 match (self.d.as_const(a), self.d.as_const(b)) {
                     (Some(a), Some(b)) => bounds.push((s, Bound::Concrete(a, b))),
-                    // Either end unknown: unroll under a heuristic and
-                    // require that the loop had finished. The START can be
-                    // symbolic too - the tile scans begin at
-                    // `max(0, flr(x/8))` - so the loop variable is
-                    // `start + k`, itself a symbolic value.
+                    // Either end unknown (the tile scans start at
+                    // `max(0, flr(x/8))`): the variable is `start + k`.
                     _ => bounds.push((s, Bound::Symbolic(a.clone(), b.clone()))),
                 }
             }
@@ -817,14 +697,11 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     /// Unroll a loop whose limit is not known at trace time, masking each
-    /// iteration by `i <= limit` and merging straight away - so the result
-    /// is ONE state whose values are nested selects, which is what
-    /// `mask_loop` produced as a rewrite.
+    /// iteration by `i <= limit` and merging straight away.
     ///
-    /// After the bound runs out, the state is REQUIRED to have finished.
-    /// Too small a bound therefore fails at run time rather than silently
-    /// truncating the loop, which is what makes the number above a
-    /// performance choice instead of a correctness one.
+    /// A lane still looping when the bound runs out is an error
+    /// (`State::ended`), never a silently truncated loop, so the bound is a
+    /// performance choice, not a correctness one.
     fn run_for_symbolic(
         &mut self,
         f: &'a ast::NumericFor,
@@ -834,23 +711,9 @@ impl<'a, D: Domain> Interp<'a, D> {
         s: State<D>,
         bound: u32,
     ) -> Result<Outcome<D>> {
-        // Two lists, exactly as `run_for` keeps them. A state LEAVES the
-        // loop when it goes past the limit, breaks, or returns, and a
-        // state that has left must not re-enter.
-        //
-        // `for_body` used to rewrite `Flow::Break` to `Flow::Normal`, so a
-        // broken-out state went straight back into `running` and ran the
-        // body again - `break` was a no-op on this path. `run_for` has a
-        // comment saying that exact bug was fixed there once; it was
-        // still here.
-        //
-        // Splitting out the states that went PAST the limit matters for a
-        // second reason. They used to be merged back into the frontier
-        // and re-tested at every later k, and since the guard is opaque
-        // the tracer cannot see that `i <= limit` is already false - so it
-        // split again, and explored a body under `g and c and not c`.
-        // `Graph::fold` only collapses a constant `And`, so those states
-        // are built, traced and selected away rather than never existing.
+        // A state LEAVES the loop (past the limit, break, return) and never
+        // re-enters: the guard is opaque, so a re-tested `i <= limit` would
+        // split again and trace a body under `g and c and not c`.
         let mut running: Outcome<D> = vec![(s, Flow::Normal)];
         let mut done: Outcome<D> = Vec::new();
         for k in 0..bound {
@@ -864,7 +727,6 @@ impl<'a, D: Domain> Interp<'a, D> {
                 let iv = self.d.arith(Arith::Add, &start, &off)?;
                 let cond = self.d.compare(Cmp::Le, &iv, &limit)?;
                 match self.decide(&cond) {
-                    // Past the limit on this path: out of the loop.
                     Some(false) => done.push((s, Flow::Normal)),
                     Some(true) => next.extend(self.for_body(f, name, &iv, s)?),
                     None => {
@@ -887,11 +749,8 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
             }
         }
-        // Where the model ENDS: a state still running when the bound ran
-        // out goes on as if the loop were over, and the lanes on which it
-        // was not are unmodelled from here (`State::ended`). Only the states
-        // that never left: one that broke or returned never depended on the
-        // bound.
+        // Where the model ENDS (`State::ended`): only for states still
+        // running; one that broke or returned never depended on the bound.
         let off = self.d.num(P8::from_i16(bound as i16));
         let iv = self.d.arith(Arith::Add, &start, &off)?;
         let over = self.d.compare(Cmp::Le, &iv, &limit)?;
@@ -918,9 +777,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         let mut out = Vec::new();
         for (mut s2, f2) in self.exec_block(f.block(), cur)? {
             s2.scope = outer;
-            // `Flow::Break` is passed THROUGH. The caller decides what
-            // leaving the loop means; swallowing it here made `break` a
-            // no-op for the symbolic-bound loop.
+            // `Flow::Break` passes THROUGH: the caller ends the loop.
             out.push((s2, f2));
         }
         Ok(out)
@@ -935,10 +792,8 @@ impl<'a, D: Domain> Interp<'a, D> {
         s: State<D>,
     ) -> Result<Outcome<D>> {
 
-        // A `break` ends the LOOP for that state, not the state: it moves
-        // to `done` and carries on after the loop. Getting this wrong the
-        // first time made `break` a no-op, so `foreach`'s bounded walk ran
-        // its full 32767 iterations instead of stopping.
+        // A `break` ends the LOOP for that state, not the state: it moves to
+        // `done` and carries on after the loop.
         let mut running: Outcome<D> = vec![(s, Flow::Normal)];
         let mut done: Outcome<D> = Vec::new();
         let one = P8::from_i16(1);
@@ -967,29 +822,21 @@ impl<'a, D: Domain> Interp<'a, D> {
             running = next;
             i = i + one;
         }
-        // Whatever was still going when the bound ran out just continues.
         done.extend(running.into_iter().map(|(s, _)| (s, Flow::Normal)));
         Ok(done)
     }
 
     // ------------------------------------------------------- expressions
 
-    /// Decide a condition, consulting what the path already assumed. A
-    /// literal branched on earlier is not unknown any more, and that is
-    /// what stops `a and b or c` fanning out twice on the same question.
-    /// The condition's value, if the domain knows it. There is nothing
-    /// else to consult: a state's guard is opaque by design, and the
-    /// measurement that justified looking inside it stopped firing once
-    /// `and`/`or` handed on the constant they had just split on.
+    /// The condition's value, if the domain knows it (a state's guard is
+    /// opaque by design: nothing else is consulted).
     fn decide(&self, cond: &D::Bool) -> Option<bool> {
         self.d.decide(cond)
     }
 
 
     fn truthy(&mut self, v: &Value<D>) -> D::Bool {
-        // Lua: only nil and false are falsy. So a number condition is
-        // statically TRUE, which removes most would-be branches before
-        // the domain is even asked.
+        // Lua: only nil and false are falsy.
         match v {
             Value::Nil => self.d.boolean(false),
             Value::Bool(b) => b.clone(),
@@ -1040,14 +887,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                             (st, Value::Num(r))
                         }
                         ast::UnOp::Hash(_) => {
-                            // Concrete, because the heap is. This is why
-                            // `for i=1,#t` needs no unrolling heuristic.
+                            // Concrete, because the heap is.
                             let Value::Table(t) = v else { bail!("# of a non-table") };
-                            // `Table::len` is Lua's `luaH_getn`, checked
-                            // against real PICO-8 by `lua/probe/tables.lua`.
-                            // It is NOT `arr.len()`: a hole makes the
-                            // answer a border, and which border you get
-                            // depends on how the table was built.
+                            // `Table::len`, NOT `arr.len()` (holes).
                             let len = st.heap.tables[&t].len().ok_or_else(|| {
                                 anyhow!(
                                     "# of a table this model cannot measure exactly: PICO-8's \
@@ -1069,8 +911,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 Ok(out)
             }
             ast::Expression::BinaryOperator { lhs, binop, rhs } => {
-                // Carry the SOURCE TEXT. A type error in an expression is
-                // useless without knowing which expression.
+                // Carry the SOURCE TEXT into the error.
                 self.eval_binop(lhs, binop, rhs, st).map_err(|err| {
                     let t = e.to_string();
                     let t = t.trim();
@@ -1112,10 +953,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                         match field {
                             ast::Field::NameKey { key, value, .. } => {
                                 let k = ident(key)?;
-                                // `player = { init = function ... }` is
-                                // `player.init` to the IR frontend, so the
-                                // field name extends the hint for exactly
-                                // this sub-evaluation.
+                                // The field name extends the hint (`hint_name`).
                                 self.hint.push(k.clone());
                                 let vs = self.eval(value, st);
                                 self.hint.pop();
@@ -1148,11 +986,9 @@ impl<'a, D: Domain> Interp<'a, D> {
         rhs: &'a ast::Expression,
         st: State<D>,
     ) -> Result<Multi<D, Value<D>>> {
-        // `and`/`or` short-circuit and return VALUES, not booleans - so
-        // `btn(r) and 1` is either a boolean or a number. Those are
-        // different SHAPES, so an undecided condition fans out here and
-        // the two sides merge again only if they agree on kind. The
-        // enclosing `or` is what collapses the idiom back to a number.
+        // `and`/`or` short-circuit and return VALUES, not booleans
+        // (`btn(r) and 1` is a boolean or a number): an undecided condition
+        // fans out, and the sides merge only if they agree on kind.
         if matches!(binop, ast::BinOp::And(_) | ast::BinOp::Or(_)) {
             let is_and = matches!(binop, ast::BinOp::And(_));
             let mut out = Vec::new();
@@ -1169,20 +1005,10 @@ impl<'a, D: Domain> Interp<'a, D> {
                             None => Vec::new(),
                         };
                         let kept: Multi<D, Value<D>> = match fs {
-                            // The kept operand is the one whose truthiness
-                            // we JUST decided, so hand on the CONSTANT, not
-                            // the symbolic node we split on. `and` keeps a
-                            // falsy left operand, `or` a truthy one, so the
-                            // constant is `!is_and`.
-                            //
-                            // Without this the idiom leaks: `btn(u) and -1`
-                            // hands `Bool(U)` to the enclosing `or`, which
-                            // splits on U AGAIN and produces a state where
-                            // `v_input` is a bool - and four lines later
-                            // `v_input*d_half` is arithmetic on a boolean.
-                            // Only `Value::Bool` is rewritten; a falsy `Nil`
-                            // or a truthy table is already as concrete as it
-                            // gets.
+                            // The kept operand's truthiness was JUST decided:
+                            // hand on the CONSTANT `!is_and`, not the node
+                            // split on, or the enclosing `or` of
+                            // `btn(u) and -1 or ...` splits on it again.
                             Some(x) => {
                                 let v = match a {
                                     Value::Bool(_) => Value::Bool(self.d.boolean(!is_and)),
@@ -1210,9 +1036,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             for (mut st, b) in self.eval(rhs, st)? {
                 let (v, illegal) = self.binop_values(binop, &a, &b)?;
                 if let Some(why) = illegal {
-                    // The source text, built only when it is needed: a
-                    // type error is useless without knowing which
-                    // expression, and `to_string` on every binop is not.
+                    // The source text, built only when needed.
                     let t = format!("{}{}{}", lhs, binop, rhs);
                     let t = t.trim();
                     self.poison(&mut st, format!("`{}`: {}", &t[..t.len().min(48)], why));
@@ -1223,40 +1047,24 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(out)
     }
 
-    /// A LUA RAISE on this path: route its lanes to the frame's raise row.
+    /// A LUA RAISE on this path (e.g. `nil > 0`): route its lanes to the
+    /// frame's raise row.
     ///
-    /// PICO-8 raises on `nil > 0`, and a raise ends the game: the lanes that
-    /// get here have NO successor, which is what clearing `guard` says. It is
-    /// not a silent drop, because nothing is thrown away - the guard at the
-    /// raise goes to `raised`, whose OR is the raise row's liveness
-    /// (`verify::Frame::raise`, plans/graph-model.md section 4), so every
-    /// lane still ends in exactly one row. The lanes that raise are a set the
-    /// build can name and the walk reports when it is not empty
-    /// (`kernel::room_constant_lattice`).
-    ///
-    /// Where it fires, the real game cannot reach it: in rooms (7,0), (6,1)
-    /// and (7,1) a spring standing on a breakable floor reaches `this.delay
-    /// > 0` with `delay` unset only through a merge that lost the
-    /// correlation between `spr` and `hide_for` (plans/graph-model.md, "The
-    /// raise is NOT reachable concretely"). Routing those lanes away is exact
-    /// either way: a state that raises has no successor, and one that does
-    /// not takes the other arm, whose guard is emitted.
-    ///
-    /// Counted in `illegal` by reason as well, the build-time diagnostic.
+    /// A raise ends the game, so these lanes have NO successor: clearing
+    /// `guard` says so. Not a silent drop: the guard goes to `raised`, whose
+    /// OR is the raise row's liveness (`verify::Frame::raise`), so every lane
+    /// still ends in exactly one row. Exact even where only a merge's lost
+    /// correlation reaches the raise: a state that raises has no successor,
+    /// one that does not takes the other arm. Also counted in `illegal`.
     fn poison(&mut self, st: &mut State<D>, why: String) {
-        // The lanes are ROUTED, not declined: they leave this state for the
-        // raise row, whose liveness is the OR of the guards recorded here, so
-        // every lane still ends in exactly one outcome.
         self.raised.push((st.guard.clone(), why.clone()));
         st.guard = self.d.boolean(false);
         *self.illegal.entry(why).or_default() += 1;
     }
 
-    /// The value, and - if Lua itself would have raised - why this path
-    /// is not a legal run. The caller poisons, because it is the caller
-    /// that knows which expression this was. An undecided comparison is its
-    /// plain node: a select on it becomes a fork only if one survives the
-    /// traced frame (`verify::fork_undecided_selects`).
+    /// The value, and - if Lua would have raised - why. The caller poisons
+    /// (it knows the expression). An undecided comparison is its plain node
+    /// (`verify::fork_undecided_selects` forks surviving selects).
     fn binop_values(
         &mut self,
         binop: &ast::BinOp,
@@ -1279,7 +1087,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         };
         if let Some(op) = num_op {
             let (Value::Num(x), Value::Num(y)) = (a, b) else {
-                // Lua raises here, so this path is not a legal run.
+                // Lua raises.
                 let zero = Value::Num(self.d.num(P8::from_i16(0)));
                 let why = format!("arithmetic on {} and {}", kind_of(a), kind_of(b));
                 return Ok((zero, Some(why)));
@@ -1289,27 +1097,16 @@ impl<'a, D: Domain> Interp<'a, D> {
         let op = cmp_op.unwrap();
         let r = match (a, b) {
             (Value::Num(x), Value::Num(y)) => self.d.compare(op, x, y)?,
-            // Two booleans compare by VALUE in Lua, so this is
-            // answerable exactly rather than by comparing node ids -
-            // which is what the fallthrough below would do, making two
-            // distinct symbolic booleans unconditionally unequal and
-            // `b == true` unconditionally false.
+            // Booleans compare by VALUE, not by node id.
             (Value::Bool(x), Value::Bool(y)) if op == Cmp::Eq => {
                 let both = self.d.and(x, y);
                 let (nx, ny) = (self.d.not(x), self.d.not(y));
                 let neither = self.d.and(&nx, &ny);
                 self.d.or(&both, &neither)
             }
-            // Two closures. The SAME object is equal in any model, so
-            // that much is answerable; anything else is not. PICO-8 is
-            // Lua 5.2 and caches closures on (prototype, upvalue cells),
-            // so two closures this model calls distinct can be one object
-            // there - `function() end` evaluated twice is cached, because
-            // it captures nothing. This model approximates the cells by
-            // the enclosing scope and so cannot tell. Refuse rather than
-            // answer; the cart never compares two functions (every `==`
-            // and `~=` in the three Lua files was checked, and the only
-            // function comparisons are against nil).
+            // Two closures: the SAME object is equal; distinct ones may be one
+            // object in PICO-8 (`Value::Func`), so refuse. The cart compares
+            // functions only against nil.
             (Value::Func(x), Value::Func(y)) if op == Cmp::Eq => {
                 if x != y {
                     bail!(
@@ -1320,14 +1117,12 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
                 self.d.boolean(true)
             }
-            // Everything but numbers and booleans is concrete, so equality
-            // on it is decidable right here.
+            // Everything else is concrete.
             _ if op == Cmp::Eq => {
                 let same = a == b;
                 self.d.boolean(same)
             }
-            // Lua raises when an ordered comparison gets a non-number,
-            // so this path is not a legal run either.
+            // Lua raises on an ordered comparison of non-numbers.
             _ => {
                 let why = format!("comparison of {} and {}", kind_of(a), kind_of(b));
                 return Ok((Value::Bool(self.d.boolean(false)), Some(why)));
@@ -1372,9 +1167,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
     }
 
-    /// The key a `[..]` index denotes. It has to be CONCRETE - the heap
-    /// cannot be indexed by something symbolic, and refusing is the whole
-    /// point rather than a limitation.
+    /// The key a `[..]` index denotes; it must be CONCRETE (the heap is).
     fn index_key(&mut self, v: &Value<D>) -> Result<Key> {
         Ok(match v {
             Value::Str(s) => {
@@ -1429,10 +1222,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         suffixes: &[&'a ast::Suffix],
         st: State<D>,
     ) -> Result<Multi<D, Value<D>>> {
-        // A readable path, so "calling a non-function: nil" says WHICH
-        // nil. Costs a string per suffix at trace time and nothing at run
-        // time, and it is the difference between a five-minute diagnosis
-        // and an hour of bisecting Lua.
+        // A readable path, so "calling a non-function: nil" says WHICH nil.
         let base = match p {
             ast::Prefix::Name(t) => ident(t).unwrap_or_else(|_| "?".into()),
             _ => "(expr)".to_string(),
@@ -1496,11 +1286,9 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(cur.into_iter().map(|(s, (v, _))| (s, v)).collect())
     }
 
-    /// Work out WHERE an assignment will store, without storing. Split
-    /// out from the store itself so the left-hand side can be evaluated
-    /// BEFORE the right-hand side, which is the order Lua uses:
-    /// `t[f()] = g()` calls `f` and then `g`. This model used to do it
-    /// the other way round.
+    /// Work out WHERE an assignment will store, without storing, so the
+    /// left-hand side is evaluated BEFORE the right, as in Lua
+    /// (`t[f()] = g()` calls `f`, then `g`).
     fn resolve_target(
         &mut self,
         var: &'a ast::Var,
@@ -1534,8 +1322,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
     }
 
-    /// Does any tile in the loaded room carry this flag bit? The room is
-    /// in the heap (`room.x` / `room.y`), so this needs no plumbing.
+    /// Does any tile in the loaded room (`room.x` / `room.y`) carry this flag bit?
     fn room_has_flag(&mut self, st: &State<D>, flag: i16) -> Result<bool> {
         let Some(Value::Table(rt)) = st.heap.tables[&st.globals].hash.get("room").cloned() else {
             bail!("tile_flag_at: no `room` global to check the flag against");
@@ -1591,9 +1378,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         self.walk_suffixes(call.prefix(), &suffixes, st)
     }
 
-    /// A call is RECURSION - hand the callee the state, get it back. There
-    /// is no inlining because there is nothing to inline into, and a call
-    /// that fans out is just a call that fans out.
+    /// A call is RECURSION: hand the callee the state, get it back.
     fn call_value(
         &mut self,
         f: Value<D>,
@@ -1619,9 +1404,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                         .declare(frame, &name, args.get(i).cloned().unwrap_or(Value::Nil));
                 }
                 let outer = st.scope;
-                // The caller's scope must stay a GC ROOT while the callee
-                // runs: the frame's parent is the closure's captured
-                // scope, not the caller's.
+                // The caller's scope stays a GC ROOT (`State::stack`).
                 st.stack.push(outer);
                 st.scope = frame;
                 let atoms_before = self.d.atoms_minted();
@@ -1656,10 +1439,8 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// after `since` become that atom's fork of both values
     /// (`Domain::escaped_atom`).
     fn fork_escaped_atoms(&mut self, mut s: State<D>, v: Value<D>, since: u32) -> (State<D>, Value<D>) {
-        // Only what the caller can still reach: the callee's frame is garbage,
-        // and a fork for an atom in it spends a fork id on nothing (room (3,0)
-        // with the fruit and the floors unknown: 63 forks, when a fork mask
-        // held 58).
+        // Only what the caller can still reach: a fork for an atom in the
+        // callee's dead frame would spend a scarce fork id on nothing.
         let mut roots = s.roots();
         super::heap::push_value(&v, &mut roots);
         let (tables, scopes, _) = s.heap.reachable(&roots);
@@ -1703,7 +1484,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     /// Rejoin the fragments of the literal splits made inside a call that has
-    /// just returned (`State::frag`, plans/fly-fruit.md). The states of one
+    /// just returned (`State::frag`). The states of one
     /// split, alike in every other fragment tag, merge on an undecided atom:
     /// no lane picks a fragment (the split value is the same in every lane),
     /// so everything they differ in must JOIN - a literal hull or the unknown
@@ -1805,12 +1586,8 @@ impl<'a, D: Domain> Interp<'a, D> {
         args: Vec<Value<D>>,
         st: State<D>,
     ) -> Result<Multi<D, Value<D>>> {
-        // By INDEX, and bounds-checked. `min(5)` used to be a Rust index
-        // panic on `args[1]`. PICO-8 answers it (`min(5)` is 0, `max(5)`
-        // is 5, treating the absent argument as 0), but the cart always
-        // passes two, and a coercion of nil to 0 is not something to
-        // infer from one measurement - so this raises, which is the other
-        // half of "match exactly or raise".
+        // Bounds-checked: a missing argument raises rather than coercing nil
+        // to 0 as PICO-8 does (the cart always passes them all).
         let num = |i: usize| -> Result<D::Num> {
             let v = args.get(i).ok_or_else(|| {
                 anyhow!("{}: needs at least {} arguments, got {}", name, i + 1, args.len())
@@ -1833,9 +1610,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 self.d.evaluated_at(&v, &at);
                 (st, Value::Num(v))
             }
-            // The map is DATA, not code, and it is concrete - so a lookup
-            // with concrete coordinates folds to a constant here exactly
-            // as it would in the interpreter.
+            // The map is concrete data: concrete coordinates fold.
             "mget" | "fget" => {
                 let cart = self
                     .cart
@@ -1857,33 +1632,19 @@ impl<'a, D: Domain> Interp<'a, D> {
                     _ => bail!("fget with unknown arguments is not modelled"),
                 }
             }
-            // Native, exactly as the IR pipeline makes it. With concrete
-            // coordinates it folds to a constant here; otherwise it is one
-            // graph node, where tracing the Lua would have been a scan
-            // loop over a symbolic range.
+            // Native: folds with concrete coordinates, else one graph node
+            // (the Lua would be a scan over a symbolic range).
             "tile_flag_at" => {
                 let (x, y, w, h, fl) = (num(0)?, num(1)?, num(2)?, num(3)?, num(4)?);
                 let gi = |v: P8| v.as_i16().ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
-                // THE FLAG DECIDES FIRST, before the coordinates: a flag no
-                // tile of the loaded room carries (ice, outside the ice
-                // rooms) is false for every rectangle in the room - exact,
-                // and it keeps the node out of the graph. A flag the room
-                // does carry is answered like solid, by the cache
-                // (`CollisionCache::flag_at`) or a graph node. (Until
-                // 2026-10-01 a room with ice raised here: only flag 0 was
-                // modelled, and both engines had answered `false`
-                // everywhere before that guard.)
-                //
-                // Checking the flag before the coordinates matters: with a
-                // symbolic player position `ice_at` has unknown x and y,
-                // so the room check must not sit in the all-known branch.
+                // THE FLAG DECIDES FIRST, before the coordinates (`ice_at`
+                // has unknown x and y): a flag no tile of the room carries is
+                // false for every rectangle, exactly, with no node. Any other
+                // flag is answered like solid, by the cache or a graph node.
                 let Some(fi) = self.d.as_const(&fl).map(gi).transpose()? else {
                     bail!("tile_flag_at with an unknown flag");
                 };
                 if fi != 0 && !self.room_has_flag(&st, fi)? {
-                    // No tile in this room carries it, so the answer is
-                    // false for every rectangle in the room. Exact, and
-                    // it keeps the node out of the graph entirely.
                     let b = self.d.boolean(false);
                     (st, Value::Bool(b))
                 } else {
@@ -1913,8 +1674,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
             }
             "print" | "__print" => (st, Value::Nil),
-            // Rendered the way PICO-8's `printh` renders a value, because
-            // the golden files in `lua/probe/` are literally its stdout.
+            // Rendered as PICO-8's `printh` does (the `lua/probe/` goldens).
             "printh" => {
                 let text = match args.first() {
                     None | Some(Value::Nil) => "[nil]".to_string(),
@@ -1932,27 +1692,18 @@ impl<'a, D: Domain> Interp<'a, D> {
                 self.prints.push(text);
                 (st, Value::Nil)
             }
-            // A merge HINT. The frontend turns it into a block flag so the
-            // interpreter's worklist accumulates states there; the tracer
-            // merges at every join by construction.
+            // A merge hint: the tracer merges at every join anyway.
             "_hint_normalize" => (st, Value::Nil),
-            // Shrinking an array is a SHAPE change, which is exactly what
-            // the tracer is built to let happen.
+            // A SHAPE change.
             "__array_table_drop_last" => {
                 let Value::Table(t) = &args[0] else {
                     bail!("__array_table_drop_last on a non-table: {:?}", args[0])
                 };
                 let mut st = st;
                 let tab = st.heap.tables.get_mut(t).unwrap();
-                // Exactly `list[#list] = nil`, which is what the shim it
-                // replaces means (`del` in builtin_level_4). NOT
-                // `arr.pop()`: that removes the last SLOT, and after a
-                // hole has been punched the last slot is not the last
-                // element. Shrinking the array part is not observationally
-                // neutral either - `arr=[a,nil,nil]` has `#==1`, but
-                // shrinking it to `[a]` and then writing t[3] puts 3 in
-                // the integer part and gives `#==1` where leaving the
-                // array part alone gives 3.
+                // Exactly `list[#list] = nil` (`del` in builtin_level_4).
+                // NOT `arr.pop()`: after a hole the last slot is not the last
+                // element, and shrinking the array part changes later `#`.
                 let n = tab.len().ok_or_else(|| {
                     anyhow!("__array_table_drop_last on a table whose length is not exact")
                 })?;
@@ -1962,20 +1713,15 @@ impl<'a, D: Domain> Interp<'a, D> {
                 tab.set_index(n as i16, Value::Nil);
                 (st, Value::Nil)
             }
-            // On an EXACT value the floor is unique, so there is one
-            // fragment and this is the identity. On a WIDENED one the
-            // lane holds points whose floors differ, and this is the
-            // place the cart marks for the program to enumerate the
-            // cases (T24).
+            // On an EXACT value there is one fragment (the identity); on a
+            // WIDENED one the lane's floors differ and this enumerates them.
             //
             // The fork is a CHOICE, not a state fan-out: one node whose
-            // value depends on the fragment, which specialization
-            // enumerates exactly as it does the six buttons. Its
-            // validity goes in the GUARD, because the fragments
-            // partition the lane and a lane in neither is not a lane at
-            // all; its coverage is the fork's own error, because a lane
-            // spanning more floors than there are fragments is REAL and
-            // this body cannot run it.
+            // value depends on the fragment, enumerated by specialization
+            // like the buttons. Its validity goes in the GUARD (the
+            // fragments partition the lane); its coverage is the fork's own
+            // error (a lane spanning more floors than fragments is REAL and
+            // this body cannot run it).
             "__split_by_flr" | "__split_at" => {
                 let x = num(0)?;
                 // The arc capture's site (`split_site_of`), set by the call.
@@ -1988,11 +1734,10 @@ impl<'a, D: Domain> Interp<'a, D> {
                     Some(SplitSite::Player(axis)) => Some(axis),
                     _ => None,
                 };
-                // A value every lane holds alike (a literal interval at a
-                // fruit-unknown set, plans/fly-fruit.md): each fragment runs as
-                // its own trace state and they rejoin when the enclosing call
-                // returns (`rejoin_fragments`), so the split multiplies no
-                // configuration of the frame.
+                // A value every lane holds alike (a literal interval): each
+                // fragment runs as its own trace state and they rejoin when
+                // the enclosing call returns (`rejoin_fragments`), so the split
+                // multiplies no configuration of the frame.
                 if let Some(frags) = self.d.literal_fragments(&x)? {
                     // Its fragments rejoin into one hull: no body would hold
                     // the piece it took.
@@ -2019,8 +1764,8 @@ impl<'a, D: Domain> Interp<'a, D> {
                     }
                     (st, args[0].clone())
                 } else {
-                    // The fork's coverage is its own error, derived from the
-                    // fork node where it was evaluated (`trace::error`).
+                    // The fork's coverage error is derived where it was
+                    // evaluated (`trace::error`).
                     let ways = self.d.flr_ways(&x);
                     let (v, valid) = self.d.fork_flr(&x, ways);
                     let at = st.decided(&mut self.d);
@@ -2034,12 +1779,10 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
             }
             "__new_unknown_boolean" => (st, Value::Bool(self.d.unknown_bool()?)),
-            // `rnd(x)`: PICO-8's generator draws in [0, x), `x` defaulting
-            // to 1. The draw depends on a seed nothing in the search
-            // models, so its value is the whole range - a sound
-            // over-approximation (room (5,0)'s balloon phase, the chest's
-            // shake). A bound that is not a positive constant is refused,
-            // not guessed.
+            // `rnd(x)`: a draw in [0, x) (`x` defaults to 1) from a seed the
+            // search does not model, so the whole range: a sound
+            // over-approximation. A bound that is not a positive constant is
+            // refused.
             "rnd" => {
                 let x = match args.first() {
                     None => P8::from_i16(1),
@@ -2070,7 +1813,7 @@ enum Bound<D: Domain> {
     Symbolic(D::Num, D::Num),
 }
 
-/// A resolved table key. Concrete by construction - see `index_key`.
+/// A resolved table key, concrete by construction (`index_key`).
 #[derive(Clone)]
 enum Key {
     Field(String),
@@ -2090,9 +1833,8 @@ fn declares_local(block: &ast::Block) -> bool {
     block.stmts().any(|s| matches!(s, ast::Stmt::LocalAssignment(_)))
 }
 
-/// An assignment target as the IR frontend spells it: a bare name, or a
-/// dotted path (`obj.is_solid`). `None` for anything else - an index
-/// expression names nothing a function could be looked up by.
+/// An assignment target as a function name is spelled: a bare name or a
+/// dotted path (`obj.is_solid`); `None` for anything else.
 fn target_hint(var: &ast::Var) -> Option<String> {
     match var {
         ast::Var::Name(t) => Some(t.token().to_string().trim().to_string()),
@@ -2116,27 +1858,16 @@ fn target_hint(var: &ast::Var) -> Option<String> {
     }
 }
 
-/// How far to unroll a loop whose limit the tracer cannot know.
+/// How far to unroll a loop whose limit the tracer cannot know, keyed by the
+/// LIMIT EXPRESSION'S SOURCE TEXT (line numbers move with the builtin files).
 ///
-/// Keyed by the LIMIT EXPRESSION'S SOURCE TEXT, not a line number: the
-/// chunk concatenates the two builtin files ahead of the cart, so absolute
-/// lines move whenever those change.
-///
-/// This is a PERFORMANCE choice only. Every unrolled loop carries a
-/// run-time predicate that it actually finished, so a bound that is too
-/// small - or a key that stops matching - fails loudly instead of quietly
-/// truncating the loop.
-///
-/// The cart has exactly two such loops, the pixel-steppers in
-/// `obj.move_x` / `obj.move_y`. The other four symbolic loops were inside
-/// `tile_flag_at`, which is a native builtin here.
+/// A PERFORMANCE choice only: a lane still looping at the bound is an error
+/// (`State::ended`), and an unknown key is refused, never truncated.
 fn unroll_bound(limit_src: &str) -> Option<u32> {
     match limit_src {
-        // `for i=start,abs(amount)` / `for i=0,abs(amount)`: the player
-        // moves well under 8 px in a frame.
+        // The pixel-steppers in `move_x` / `move_y`: well under 8 px a frame.
         "abs(amount)" => Some(8),
-        // The tile scans in `spikes_at` / `solid_at`: a range clamped to
-        // [0, 15] but only ever a tile or two wide for these hitboxes.
+        // The tile scans in `spikes_at` / `solid_at`: a tile or two wide.
         "min(15,(x+w-1)/8)" | "min(15,(y+h-1)/8)" => Some(3),
         _ => None,
     }
@@ -2152,16 +1883,13 @@ fn ident(t: &full_moon::tokenizer::TokenReference) -> Result<String> {
 
 /// Which pairs of a `collapse` frontier are worth trying to merge.
 ///
-/// Every outcome has an id, increasing with its position (so a pair's ids are
-/// in the order of its indices), and its shape's hash: two different shapes
-/// never merge. A pair that refused stays refused - `merge` is a function of
-/// the two states, and nothing here changes a state, it only replaces a merged
-/// pair - so it is tried once per collapse rather than again after every
-/// merge. A frontier that keeps successors apart used to re-try all of its
-/// pairs after each merge (room (3,0) at a fruit-unknown set, 2026-09-17).
+/// Every outcome has an id, increasing with its position, and its shape's
+/// hash: two different shapes never merge. A pair that refused stays refused
+/// (`merge` is a function of the two states, which never change), so it is
+/// tried once per collapse.
 struct Pairing {
     /// Per outcome: its id, and its shape's hash and `Canon` once `prepare`
-    /// computed them - once per outcome rather than per attempt.
+    /// computed them.
     keys: Vec<(usize, Option<(u64, Canon)>)>,
     /// Every outcome holds the first one's heap (`state::same_heap`): they
     /// pair object by object and need no `Canon`.
@@ -2276,14 +2004,11 @@ mod tests {
         );
         let (it, v) = run(Concrete, &ast);
         let Value::Num(n) = v else { panic!("expected a number, got {:?}", v) };
-        // 3*3 + 4*4 = 25, plus 1+2+3 = 6.
         assert_eq!(it.d.as_const(&n), Some(P8::from_i16(31)));
     }
 
-    /// The same program under the tracing domain folds to the same
-    /// constant, because nothing in it is unknown. Everything the heap
-    /// depends on - the field names, the loop bound, the call target -
-    /// stayed concrete without the interpreter special-casing any of it.
+    /// The same program under the tracing domain folds to the same constant:
+    /// nothing in it is unknown.
     #[test]
     fn the_symbolic_domain_agrees_when_nothing_is_unknown() {
         let ast = parse(
@@ -2304,9 +2029,8 @@ mod tests {
         assert_eq!(it.d.as_const(&n), Some(P8::from_i16(31)));
     }
 
-    /// And the thing the tracer exists for: a branch on something it
-    /// cannot know runs BOTH arms and merges them into one select, with
-    /// no rewrite anywhere in sight.
+    /// A branch on something unknown runs BOTH arms and merges them into one
+    /// select.
     #[test]
     fn an_unknown_branch_becomes_a_select() {
         let ast = parse(
@@ -2319,7 +2043,6 @@ mod tests {
             "#,
         );
         let mut d = Symbolic::default();
-        // `input` stands in for game data the tracer cannot know.
         let sym = d.graph.leaf(Op::Cell(1));
         let mut it = Interp::new(d);
         let mut st = fresh::<Symbolic>(&mut it.d);
@@ -2334,16 +2057,13 @@ mod tests {
         };
         let node = it.d.graph.get(r);
         assert_eq!(node.op, Op::Sel);
-        // Two constants under one condition - the `if` became data.
         assert_eq!(it.d.graph.get(node.args[1]).op, Op::Const(10 << 16, 10 << 16));
         assert_eq!(it.d.graph.get(node.args[2]).op, Op::Const(20 << 16, 20 << 16));
     }
 
     /// A call whose branches leave the heap alike but RETURN different
-    /// numbers: the value is a select, and its own error is its condition
-    /// being undecided - derived from the value (`trace::error`), where it
-    /// used to be conjoined into the state by the merge. Without it a lane
-    /// where the condition is undecided took one arm silently.
+    /// numbers: the value is a select, and its error (`trace::error`) is its
+    /// condition being undecided, so no lane takes one arm silently.
     #[test]
     fn a_returned_select_owns_its_condition_being_decided() {
         let ast = parse(
@@ -2382,13 +2102,7 @@ mod tests {
     }
 
     /// `room` is a program constant (`shapes::frozen_tables`): two states of
-    /// one shape in DIFFERENT rooms stay two successors. Merged, `room.x`
-    /// became a select, the walk read the merged outcome's room as "another
-    /// room" (`shapes::room_of` is -1 for a non-constant) and skipped it - and
-    /// with it the in-room arm. Room (6,2) `r0sxhf`: the respawn's
-    /// `player_spawn` staying a spawn merged with `next_room`'s fresh
-    /// `player_spawn` of room (7,2), the spawn's `spd.y` stayed pinned at -4,
-    /// and the row at -3.5 declined (KERNEL COVERAGE GAP at f72, 2026-10-02).
+    /// one shape in DIFFERENT rooms stay two successors (`state::same_room`).
     #[test]
     fn states_in_different_rooms_stay_apart() {
         let ast = parse(
@@ -2425,9 +2139,8 @@ mod tests {
         assert_eq!(rooms, vec![6, 7]);
     }
 
-    /// The fly fruit's `move` at a fruit-unknown level: `__split_by_flr` of a
-    /// literal (every lane holds it alike) splits on the integers and rejoins
-    /// into one literal with no error and no per-lane fork.
+    /// `__split_by_flr` of a literal (every lane holds it alike) splits on the
+    /// integers and rejoins into one literal with no error and no per-lane fork.
     #[test]
     fn a_literal_split_rejoins_without_error() {
         let ast = parse(
@@ -2486,8 +2199,8 @@ mod tests {
 }
 
 /// A pico-8 number the way `printh` renders it: whole numbers without a
-/// point, fractions to four places with trailing zeros stripped. Four is
-/// not a guess - `printh(1/3)` prints `0.3333`.
+/// point, fractions to four places with trailing zeros stripped
+/// (`printh(1/3)` prints `0.3333`).
 fn fmt_p8(v: P8) -> String {
     if let Some(i) = v.as_i16() {
         return format!("{}", i);
@@ -2498,9 +2211,8 @@ fn fmt_p8(v: P8) -> String {
     s
 }
 
-/// A value's Lua type name, for the messages `poison` records. The
-/// VALUE is deliberately not included: two paths that fail the same way
-/// on different symbolic operands are one modelling gap, not two.
+/// A value's Lua type name, for `poison`'s messages (not the value: the same
+/// failure on different operands is one modelling gap).
 fn kind_of<D: Domain>(v: &Value<D>) -> &'static str {
     match v {
         Value::Nil => "nil",

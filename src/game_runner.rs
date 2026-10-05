@@ -4,10 +4,8 @@
 use anyhow::{anyhow, Result};
 
 /// The room the search starts in, from `CELESTE_START_ROOM` ("x,y"),
-/// default (1, 0). Drives the `_init` load_room substitution
-/// (`apply_start_room`), the collision cache room, and the checkpoint config
-/// fingerprint - all must agree, which is why this is the single source of
-/// truth.
+/// default (1, 0). The single source of truth for the `_init` substitution,
+/// the collision cache's room and the checkpoint fingerprint, which must agree.
 pub fn start_room() -> (i16, i16) {
     static ROOM: std::sync::OnceLock<(i16, i16)> = std::sync::OnceLock::new();
     *ROOM.get_or_init(|| match std::env::var("CELESTE_START_ROOM") {
@@ -24,12 +22,9 @@ pub fn start_room() -> (i16, i16) {
     })
 }
 
-/// The room that means "won" for the configured start room: the room the
-/// player lands in after exiting, as the cart's `next_room` loads it -
-/// `(x + 1, y)` along a map row, and `(0, y + 1)` from a row's last room
-/// (x == 7: rooms (7,0), (7,1), (7,2); until 2026-09-21 this asserted x < 7,
-/// which room (7,0) hit). Compare BOTH coordinates: the wrapped exit changes
-/// `room.y`.
+/// The room that means "won": the one the cart's `next_room` loads after
+/// the start room, `(x + 1, y)`, or `(0, y + 1)` from a row's last room.
+/// Compare BOTH coordinates: the wrapped exit changes `room.y`.
 pub fn win_room() -> (i16, i16) {
     let (x, y) = start_room();
     if x == 7 {
@@ -39,11 +34,8 @@ pub fn win_room() -> (i16, i16) {
     }
 }
 
-/// Directory-name stem for per-room checkpoint trees under a base dir:
-/// level 0 lives at `<base>/<stem>`, level k at `<base>/<stem>-k<k>`.
-/// The default room keeps its historical name "room1" so existing
-/// checkpoint trees on disk stay addressable; other rooms get "room<x><y>"
-/// (e.g. "room00").
+/// Directory-name stem for a room's checkpoint tree: "room1" for the
+/// default room, "room<x><y>" for others.
 pub fn room_dir_stem() -> String {
     let (x, y) = start_room();
     if (x, y) == (1, 0) {
@@ -53,9 +45,6 @@ pub fn room_dir_stem() -> String {
     }
 }
 
-/// Point the game's `_init` at the configured start room. Strict: the
-/// checked-in lua must contain the default call exactly once, so a source
-/// edit can never silently disable the substitution.
 /// The cart's `level_index()` of room (x, y).
 pub fn level_index(x: i16, y: i16) -> i16 {
     x % 8 + y * 8
@@ -64,6 +53,9 @@ pub fn level_index(x: i16, y: i16) -> i16 {
 /// The level whose big chest holds the orb (`max_djump=2`): room (5,2).
 pub const ORB_LEVEL: i16 = 21;
 
+/// Point the game's `_init` at the configured start room. Strict: the lua
+/// must contain the default call exactly once, so an edit cannot silently
+/// disable the substitution.
 pub fn apply_start_room(game_lua: &str) -> Result<String> {
     const PAT: &str = "load_room(1, 0)";
     let count = game_lua.matches(PAT).count();
@@ -75,11 +67,8 @@ pub fn apply_start_room(game_lua: &str) -> Result<String> {
         ));
     }
     let (x, y) = start_room();
-    // The orb in room (5,2)'s big chest (level index 21) sets `max_djump=2`
-    // for the rest of the game, and every later level is designed (and
-    // TASed) with the second dash. Starting a later room directly must start
-    // as a play-through reaches it: with the orb taken (2026-10-02, room
-    // (6,2): TAS23 never exited with one dash).
+    // The orb sets `max_djump=2` for the rest of the game; a later room
+    // must start as a play-through reaches it, with the orb taken.
     let orb = if level_index(x, y) > ORB_LEVEL { "max_djump=2 " } else { "" };
     Ok(game_lua.replacen(PAT, &format!("{}load_room({}, {})", orb, x, y), 1))
 }
@@ -88,17 +77,14 @@ pub fn apply_start_room(game_lua: &str) -> Result<String> {
 mod tests {
     use super::apply_start_room;
 
-    // start_room() is a process-wide OnceLock, so tests can only exercise
-    // the default (1,0) configuration; the non-default path is exercised by
-    // the room-(0,0) pipeline runs.
+    // start_room() is a process-wide OnceLock: tests see only room (1,0).
     #[test]
     fn win_and_dir_stem_for_default_room() {
         assert_eq!(super::win_room(), (2, 0));
         assert_eq!(super::room_dir_stem(), "room1");
     }
 
-    // These run with the default start room (1,0), where the substitution
-    // must be an exact identity - and the strictness must still hold.
+    // In the default room the substitution is the identity.
     #[test]
     fn apply_start_room_is_identity_for_default_room() {
         let src = "function _init()\n\tload_room(1, 0)\nend\n";

@@ -1,12 +1,9 @@
-//! Graph -> the fused, fork-free frame (`plans/multi-output-fusion.md`).
+//! Graph -> the fused, fork-free frame.
 //!
-//! The tracer's walk records what each value MEANS as a node in
-//! `transpile::graph`; `specialize_frame` resolves every fork
-//! configuration of that graph into ONE hash-consed arena, and
-//! `lower_outcomes` reads the per-outcome constants the kernel needs off
-//! the result. The ASM backend (`trace::emit::asm_fused`) assembles the
-//! same arena. (The Rust-source renderer that used to live here went with
-//! the generated kernel crates; nothing rendered text any more, 2026-09-08.)
+//! `specialize_frame` resolves every fork configuration of the traced graph
+//! into ONE hash-consed arena, and `lower_outcomes` reads the per-outcome
+//! constants the kernel needs off the result. The ASM backend
+//! (`trace::emit::asm_fused`) assembles the same arena.
 
 use std::collections::BTreeMap;
 
@@ -26,9 +23,8 @@ pub(crate) const BUILD_PHASES: [&str; 9] = [
     "assemble (gcc + load)",
 ];
 
-/// Build-time accounting (2026-09-15): nanoseconds per phase of
-/// `BUILD_PHASES`, summed over workers and over every build since the last
-/// `build_profile`, so a set's build time can be attributed.
+/// Build-time accounting: nanoseconds per phase of `BUILD_PHASES`, summed
+/// over workers and builds since the last `build_profile`.
 static BUILD_NS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
 
 /// Add the time since `t` to phase `phase`.
@@ -77,22 +73,6 @@ pub(crate) struct Outcome {
     pub(crate) arc: Vec<NodeId>,
 }
 
-/// Specialize a traced frame's graph into ONE fused, hash-consed arena.
-///
-/// Every fork configuration is resolved: `Split`/`SplitValid`/`SplitInt`
-/// become `Frag`/`FragOk`/`IntFrag` (ordinary ops), so NO fork node survives and configurations that agree
-/// share nodes ("duplicate, then fuse again"). The six buttons are forks
-/// like any other (`Symbolic::both_values`): a configuration of theirs is a
-/// set of inputs, and it folds them to constants. Returns the fused graph
-/// and one body per DISTINCT (outcome, row): `(outcome, splits, roots)`,
-/// where `roots` is that outcome's fields in order, then `error`, then
-/// `live`, then its extra roots (the transfer roots, `Outcome::arc`), as
-/// node ids in the fused graph.
-///
-/// This is the SINGLE source of the specialized compute: the AVX-512
-/// backend assembles it (`trace::emit::asm_fused`) and `lower_outcomes`
-/// reads the per-outcome constants off it, so both see byte-for-byte the
-/// same thing - there is no parallel specialization.
 /// One specialized body: `(outcome, splits, roots)` - `splits` the fragment
 /// per fork (`graph::ANY_VALID` for a dead one; 0 for a fork outside the
 /// outcome's cone).
@@ -106,8 +86,7 @@ fn roots_under(graph: &Graph, cfg: &[u8], need: &[bool], want: &[NodeId], out: &
 
 /// The roots of each configuration of `cfgs` DECIDED (the interval fold with
 /// the region's ranges and the map), in one fresh arena so equal results are
-/// one node: a test of the player against one world's platform folds only
-/// with the ranges, and before that every world is a different node.
+/// one node (before the fold, e.g. each platform world is a different node).
 fn decided_roots(
     graph: &Graph,
     cfgs: &[Vec<u8>],
@@ -126,6 +105,15 @@ fn decided_roots(
         .collect()
 }
 
+/// Specialize a traced frame's graph into ONE fused, hash-consed arena.
+///
+/// Every fork configuration is resolved (`Split`/`SplitValid`/`SplitInt`
+/// become `Frag`/`FragOk`/`IntFrag`), so no fork node survives and
+/// configurations that agree share nodes. Returns the fused graph and one
+/// body per distinct (outcome, row), whose roots are the outcome's fields
+/// in order, then `error`, then `live`, then the transfer roots
+/// (`Outcome::arc`). This is the single source of the specialized compute:
+/// the ASM backend and `lower_outcomes` both read it.
 pub(crate) fn specialize_frame(
     graph: &Graph,
     outs: &[(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)],
@@ -136,9 +124,8 @@ pub(crate) fn specialize_frame(
 ) -> (Graph, Vec<SpecializedBody>) {
     let trace = std::env::var_os("CELESTE_BUILD_TRACE").is_some();
     let t0 = std::time::Instant::now();
-    // --- 1. which forks each outcome actually depends on: the forks in its
-    // cone, read off the reachable set it needs anyway (no per-node mask, so
-    // no limit on how many forks a frame has) ---
+    // --- 1. the forks each outcome depends on: those in its cone (read off
+    // the reachable set, so no limit on a frame's fork count) ---
     let bits_of = |need: &[bool]| -> Vec<u8> {
         let mut forks: std::collections::BTreeSet<u8> = Default::default();
         for (i, n) in need.iter().enumerate() {
@@ -155,24 +142,18 @@ pub(crate) fn specialize_frame(
     //
     // Two kinds of fork, by what a configuration of it MEANS:
     //
-    // * A fork every lane takes both ways (`Symbolic::both_values`: the
-    //   buttons, the held trails, the escaped atoms - the outcome reads no
-    //   validity of it). A configuration of these is a set of INPUTS, and
-    //   two that give the same roots are one: resolved ONE AT A TIME with
-    //   the rest standing (`graph::OPEN`), a configuration is kept only
-    //   where its roots differ from every one kept before it at that step.
-    //   Resolving is substitution, and substitution preserves equality, so
-    //   two that agree with the rest standing agree in every completion. This
-    //   folds the buttons' 64 assignments to the ones that differ (left and
-    //   right together being neither, a jump nothing can take being no jump).
-    // * A fork that PARTITIONS the lanes (its validity read). Its
-    //   fragments' `live` differ by that validity, so two of them
-    //   agree only where the fork is dead; per fork, with every other fork
-    //   standing, its dead-ness and its values that agree are decided (per
-    //   outcome and per class of the first kind), and the configurations are
-    //   the product. A fork whose validity the outcome does not read (a move
-    //   whose fragment does not decide `live`) is of the first kind: every
-    //   lane takes both of its fragments' rows.
+    // * A fork every lane takes both ways (`Symbolic::both_values`: buttons,
+    //   held trails, escaped atoms; the outcome reads no validity of it). A
+    //   configuration of these is a set of INPUTS. They are resolved one at a
+    //   time with the rest standing (`graph::OPEN`), keeping a configuration
+    //   only where its roots differ from every one kept before. Sound because
+    //   substitution preserves equality: two that agree with the rest standing
+    //   agree in every completion.
+    // * A fork that PARTITIONS the lanes (its validity is read). Per fork, with
+    //   every other fork standing, its dead-ness and its agreeing values are
+    //   decided (per outcome and per class of the first kind); the
+    //   configurations are the product. A fork whose validity the outcome does
+    //   not read is of the first kind.
     let mut sp = graph.like();
     let mut cands: Vec<SpecializedBody> = Vec::new();
     for (oi, (fields, error, live, extra)) in outs.iter().enumerate() {
@@ -180,9 +161,7 @@ pub(crate) fn specialize_frame(
         want.push(*error);
         want.push(*live);
         want.extend(extra.iter().copied());
-        // An outcome reaches a fraction of the graph, and mapping the
-        // whole arena once per configuration is most of the work and none
-        // of the answer.
+        // An outcome reaches a fraction of the graph; map only that.
         let need = reachable(graph, &want);
         let bits = bits_of(&need);
         let validity_read: std::collections::BTreeSet<u8> = (0..graph.len())
@@ -193,9 +172,8 @@ pub(crate) fn specialize_frame(
             })
             .collect();
         let (parts, takes_both): (Vec<u8>, Vec<u8>) = bits.iter().partition(|&&d| validity_read.contains(&d));
-        // Every configuration's roots land in ONE arena, so a comparison of
-        // roots is a comparison of node ids. The forks outside the cone are
-        // unread: 0.
+        // Every configuration's roots land in ONE arena, so comparing roots is
+        // comparing node ids. Forks outside the cone are unread: 0.
         let mut open = vec![0u8; forks as usize];
         for &d in &bits {
             open[d as usize] = crate::transpile::graph::OPEN;
@@ -218,17 +196,13 @@ pub(crate) fn specialize_frame(
             classes = next;
         }
         let n_classes = classes.len();
-        // A DEAD fork: every fragment gives the same fields and error,
-        // and the same `live` once the fork's own validity is set aside - it
-        // is taken once, validity true (`graph::ANY_VALID`): the OR of its
-        // fragments' validities is the lane covered. Room (6,0)'s no-player
-        // frames move all ten platforms through a floor fork each and then
-        // widen where they stand: 1024 configurations of one row per outcome
-        // (2026-09-28). Decided here once, with every other
-        // fork standing and compared DECIDED where the body is: dead so, it is
-        // dead in every class (resolving is substitution). A fork this misses
-        // is checked per class below; one both miss is enumerated, which
-        // costs candidates and never a row.
+        // A DEAD fork (every fragment gives the same fields and error, and the
+        // same `live` once its own validity is set aside) is taken once, validity
+        // true (`graph::ANY_VALID`): the OR of its fragments' validities is the
+        // lane covered. Decided here once with every other fork standing, and
+        // compared decided: dead so, it is dead in every class. A fork this misses
+        // is checked per class below; one both miss is enumerated, which costs
+        // candidates and never a row.
         let dead_everywhere: std::collections::BTreeSet<u8> = parts
             .iter()
             .copied()
@@ -250,15 +224,12 @@ pub(crate) fn specialize_frame(
             })
             .collect();
         let mut total_cfgs = 0u64;
-        // The most fragments one class enumerates per partitioning fork (for
-        // the trace).
+        // The most fragments one class enumerates per partitioning fork (trace only).
         let mut ways_max = vec![0u8; parts.len()];
         for m in classes {
-            // A class's own arena: what it builds is its own, and one shared
-            // across the classes grew with each.
+            // A class's own arena: one shared across classes grew with each.
             let mut probe = graph.like();
-            // Move forks keep their traced arity (`Domain::flr_ways`: from
-            // the same ranges), which their `SplitOk` premise checks.
+            // Move forks keep their traced arity, which their `SplitOk` premise checks.
             let valid: Vec<u8> = parts.iter().map(|&d| graph.fork_ways(d)).collect();
             for (i, n) in valid.iter().enumerate() {
                 ways_max[i] = ways_max[i].max(*n);
@@ -273,9 +244,8 @@ pub(crate) fn specialize_frame(
                         c[d as usize] = v;
                         c
                     };
-                    // Dead for the whole outcome (above), or for this class:
-                    // compared as built here, since dead-ness only a decided
-                    // comparison shows is read once, with every fork standing.
+                    // Dead for the whole outcome (above), or for this class (compared as
+                    // built: decided-only dead-ness is read once, above).
                     if dead_everywhere.contains(&d) {
                         return vec![crate::transpile::graph::ANY_VALID];
                     }
@@ -288,13 +258,8 @@ pub(crate) fn specialize_frame(
                     if valid[i] <= 2 {
                         return (0..valid[i]).collect();
                     }
-                    // PER FORK, ITS VALUES THAT AGREE, compared DECIDED when
-                    // the body is: a test of the player against one world's
-                    // platform folds only with the region's ranges, and before
-                    // that every world is a different node. Built for a
-                    // 128-way fork over the platform worlds (since replaced by
-                    // deciding per world at compile time, `verify::Points`),
-                    // which from one region mostly looked alike.
+                    // Per fork, its values that agree, compared decided when the body is:
+                    // a test against one platform world folds only with the region's ranges.
                     let plain: Vec<Vec<u8>> = (0..valid[i]).map(with).collect();
                     let sigs = if decide {
                         decided_roots(graph, &plain, this, room, ranges)
@@ -340,10 +305,9 @@ pub(crate) fn specialize_frame(
             crate::transpile::ival::fold_with(&sp, &all, room, ranges).expect("interval fold");
         build_add(4, t_phase);
         let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
-        // DIAGNOSTIC (CELESTE_BUILD_TRACE): a body whose `error` folded to
-        // true while it is live somewhere declines every lane it takes.
-        // Say which disjunct: the leaves of the unfolded `error`'s Or-tree
-        // the interval evaluator decided true.
+        // DIAGNOSTIC (CELESTE_BUILD_TRACE): a body whose `error` folded to true
+        // while live somewhere declines every lane it takes. Show the leaves of
+        // its `error` Or-tree the interval evaluator decided true.
         if trace {
             let cells = crate::transpile::ival::seed_cells(&sp, ranges);
             let vals = match room {
@@ -369,8 +333,8 @@ pub(crate) fn specialize_frame(
                         stack.extend(nd.args.iter().copied());
                     } else if matches!(vals[n as usize], crate::transpile::graph::Val::Bool(Some(true))) {
                         leaves.push(format!("{n}={:?}({})", nd.op, nd.args.iter().map(|a| format!("{a}={:?}={:?}", sp.get(*a).op, vals[*a as usize])).collect::<Vec<_>>().join(", ")));
-                        // Where an unbounded value came from: down the
-                        // first full-range operand to the node that made it.
+                        // Where an unbounded value came from: down the first full-range
+                        // operand to the node that made it.
                         let is_top = |v: &crate::transpile::graph::Val| matches!(v, crate::transpile::graph::Val::Num(iv) if iv.low.as_raw_u32() == 0x8000_0000 || iv.high.as_raw_u32() == 0x7fff_ffff);
                         for a in nd.args.iter().copied() {
                             let mut cur = a;
@@ -395,8 +359,7 @@ pub(crate) fn specialize_frame(
                 eprintln!("[build]   outcome {} cfg {:?}: error folds TRUE while live; true disjuncts: {}", c.0, c.1, leaves.join(" | "));
             }
         }
-        // The boolean layer, simplified locally (`bdd::simplify_local`: one
-        // pass, per node on a small BDD of its own cone).
+        // The boolean layer, simplified locally (`bdd::simplify_local`).
         let t_phase = std::time::Instant::now();
         let (g2, m2, bst) =
             crate::transpile::bdd::simplify_local(&g1, &r1, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
@@ -442,21 +405,14 @@ pub(crate) fn specialize_frame(
         );
     }
     // --- 4. candidates that write the same row are ONE body; a body live
-    // nowhere (its guard decided false) is no body ---
+    // nowhere is no body ---
     //
-    // Candidates of one outcome with the same fields write the
-    // same row wherever they are live, so they fuse: `live` the OR of
-    // theirs, and `error` - where the members' errors are one node, as they
-    // are when error comes only from the row's own values - that node
-    // unchanged (plans/graph-model.md section 4: fusion never touches
+    // Candidates of one outcome with the same fields write the same row
+    // wherever they are live, so they fuse: `live` the OR of theirs, `error`
+    // the members' shared node when they share one (fusion never touches
     // error), else `OR_i (live_i & error_i)`. Either way a lane declines
-    // exactly where some candidate declined (`L & E` is `OR_i (L_i & E_i)`
-    // when every `E_i` is `E`, and by definition otherwise; in the kernels'
-    // three-valued masks too, both read where they MAY hold), and is kept
-    // where some candidate kept it; the door keeps one copy of the row
-    // either way. Before, a per-configuration `ok` or `live` node kept them
-    // apart: room (3,0) with the fall floors unknown, 336 bodies over 14
-    // distinct rows per outcome (2026-09-18).
+    // exactly where some candidate declined (also in the three-valued masks,
+    // both read where they MAY hold) and is kept where some candidate kept it.
     let bodies: Vec<SpecializedBody> = {
         let mut groups: Vec<Vec<SpecializedBody>> = Vec::new();
         let mut index: BTreeMap<(usize, Vec<NodeId>), usize> = BTreeMap::new();
@@ -499,13 +455,10 @@ pub(crate) fn specialize_frame(
     (sp, bodies)
 }
 
-/// The fused bodies' constant-output analysis. For each outcome field,
-/// `konst_av` is the `AV` it holds in EVERY row: set when every body of
-/// that outcome computes the same node for it (configuration-
-/// independent) and that node is a compile-time constant. The ASM
-/// accumulator writes such a column ONCE as `Col::U` instead of pushing
-/// it per row, and the within-chunk dedup fold skips it. Returns the
-/// number of distinct bodies (a size measure for the probes).
+/// The fused bodies' constant-output analysis. Sets each outcome field's
+/// `konst_av` to the `AV` it holds in EVERY row: when every body of the
+/// outcome computes the same node for it and that node is a compile-time
+/// constant. Returns the fused graph and its bodies (`specialize_frame`).
 pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> (Graph, Vec<SpecializedBody>) {
     let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = outs
         .iter()
@@ -520,8 +473,7 @@ pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> (Graph, Vec<Spec
         };
         for (fi, f) in o.of.fields.iter_mut().enumerate() {
             let node = first[fi];
-            // The arena is hash-consed, so "every body writes the same
-            // node" is "every body writes the same value".
+            // The arena is hash-consed: same node is same value.
             let agreed = mine.iter().all(|r| r[fi] == node);
             f.konst_av = if !agreed {
                 None
@@ -529,9 +481,8 @@ pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> (Graph, Vec<Spec
                 use celeste_core::pico8_num::Pico8Num;
                 use celeste_engine::runtime2::AV;
                 match sp.get(node).op {
-                    // A point in an INTERVAL field is the interval `[v, v]`:
-                    // the field's column is an interval column, which keys a
-                    // point as one (`asm_kernel::KeyRead::NumAsIval`).
+                    // A point in an INTERVAL field is the interval `[v, v]`: an interval
+                    // column keys a point as one (`asm_kernel::KeyRead::NumAsIval`).
                     Op::Const(lo, hi) if lo == hi && f.ty == "ZI" => Some(AV::Ival(Pico8Num::from_raw(lo), Pico8Num::from_raw(lo))),
                     Op::Const(lo, hi) if lo == hi => Some(AV::Num(Pico8Num::from_raw(lo))),
                     Op::Const(lo, hi) => {

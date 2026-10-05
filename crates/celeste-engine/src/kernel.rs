@@ -3,47 +3,25 @@
 //! assembled kernels make (collisions, map reads), and the kernels' per-call
 //! dedup cache (`RowCache`).
 //!
-//! Types are STATIC - nothing here carries a tag. Lanes = ROWS (W = 16 x
-//! i32 = one zmm). The ops are built on `Pico8Num`'s own operators, so the
-//! semantics are inherited from the scalar implementation rather than
-//! re-derived.
+//! Types are static; lanes are rows (W = 16 x i32 = one zmm). Each op must
+//! agree bit-exactly with `Pico8Num`'s scalar operator (the tests check it).
 
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::pico8_num::{Pico8Num as P8, Pico8NumInterval as IV};
 
-// The whole lane layer is AVX-512; see `ZN`'s doc for why the
-// representation is a register and not an array.
+// The whole lane layer is AVX-512.
 use std::arch::x86_64::*;
 
 pub const W: usize = 16;
 
 pub use crate::runtime2::{cell_mix, mix64};
 
-/// One num column: 16 `Pico8Num`s, which is 16 raw `i32`s, which is one
-/// zmm register.
+/// One num column: 16 `Pico8Num`s = 16 raw `i32`s = one zmm register.
 ///
-/// A REGISTER, not `[Pico8Num; 16]`, and that is the single most
-/// consequential line in this file. Measured 2026-08-23 on the array
-/// version: `kernel1::frame` was 163,098 instructions of which **61%
-/// were scalar** - 34,362 scalar `mov`, 11,804 scalar `imul`, 2,514
-/// `vpextrd` whose only job is pulling one lane out of a vector - in a
-/// function where every value is a 16-lane column. Writing the
-/// primitives as `for i in 0..W` loops over scalar operators and
-/// trusting the loop vectorizer got 39% of the way, per site and
-/// unpredictably.
-///
-/// It cannot be fixed one primitive at a time: forcing a single one
-/// (`zn_lt`) to AVX-512 while its neighbours stayed arrays was 27%
-/// SLOWER, because the column then had to be assembled and taken apart
-/// around it. On a synthetic with this kernel's op mix and live-set
-/// width, changing only the lane type was 20x on instruction count,
-/// runtime AND build time, for the same checksum. See
-/// `plans/tracing.md`.
-///
-/// The consequence for anything added here: a primitive that drops to
-/// `to_array` punches a hole in exactly the same way, so it needs a
-/// reason and a measurement, not a shrug.
+/// A register, not `[Pico8Num; 16]`: an array forces the column to be
+/// assembled and taken apart around every vector op. A primitive that drops
+/// to `to_array` punches that hole, so it needs a reason and a measurement.
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct ZN(pub __m512i);
@@ -56,11 +34,9 @@ compile_error!(
 );
 
 impl ZN {
-    /// SAFETY, both directions: `P8` is `#[repr(transparent)]` over
-    /// `i32` (its own doc says so, and says it is for this), so
-    /// `[P8; 16]` is 16 contiguous `i32`s - 512 bits, same size and same
-    /// lane order as `__m512i`. Alignment does not enter into it: these
-    /// transmute VALUES, not references.
+    /// SAFETY, both directions: `P8` is `#[repr(transparent)]` over `i32`,
+    /// so `[P8; 16]` has the size and lane order of `__m512i`. These
+    /// transmute values, not references, so alignment does not matter.
     #[inline(always)]
     pub fn from_array(a: [P8; W]) -> ZN {
         ZN(unsafe { std::mem::transmute(a) })
@@ -69,9 +45,8 @@ impl ZN {
     pub fn to_array(self) -> [P8; W] {
         unsafe { std::mem::transmute(self.0) }
     }
-    /// One lane, for `append` and the row-key walk - which really do
-    /// write out one row at a time. NOT for arithmetic: that is the hole
-    /// described above.
+    /// One lane, for code that really works one row at a time. Not for
+    /// arithmetic.
     #[inline(always)]
     pub fn lane(self, i: usize) -> P8 {
         self.to_array()[i]
@@ -97,12 +72,8 @@ pub struct ZI {
     pub hi: ZN,
 }
 /// One tri-state bool column slice. `val` is meaningful where `known` is
-/// set; an unknown lane deopts at any use that needs the value.
-///
-/// STILL a pair of `u16`, deliberately: 16 bits IS an AVX-512 mask
-/// register, a Kleene AND really is two `kandw`, and `zsel_n` is one
-/// `vpblendmd` precisely because `val` is already in mask form. The
-/// codegen census found the boolean layer was never the problem.
+/// set. A pair of `u16` because 16 bits is an AVX-512 mask register: Kleene
+/// ops are `kandw`s and `zsel_n` is one `vpblendmd`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZB {
     pub val: u16,
@@ -151,12 +122,8 @@ pub fn zn_abs(a: ZN) -> ZN {
     ZN(unsafe { _mm512_abs_epi32(a.0) })
 }
 
-/// `flr`, in one instruction.
-///
-/// `P8::flr` is `from_i16((self.0 >> 16) as i16)`, i.e.
-/// `((x >> 16) as i16 as i32) << 16`. The `as i16` cannot lose anything -
-/// an arithmetic `>> 16` of an `i32` lands in `[-32768, 32767]`, which is
-/// exactly `i16` - so the whole thing is `x & 0xffff_0000`.
+/// `flr`: `P8::flr` is `((x >> 16) as i16 as i32) << 16`, and the `as i16`
+/// loses nothing after an arithmetic `>> 16`, so it is `x & 0xffff_0000`.
 #[inline(always)]
 pub fn zn_flr(a: ZN) -> ZN {
     ZN(unsafe { _mm512_and_si512(a.0, m512(0xffff_0000u32 as i32)) })
@@ -164,13 +131,10 @@ pub fn zn_flr(a: ZN) -> ZN {
 
 /// 16.16 multiply: `(a as i64 * b as i64) >> 16`, truncated to i32.
 ///
-/// x86 has no 32x32 -> shifted-64 instruction, so this is the standard
-/// even/odd split. `vpmuldq` multiplies the LOW i32 of each 64-bit
-/// element, sign-extended - which is the even lanes; shifting both
-/// operands right by 32 (ARITHMETIC, for the sign) brings the odd lanes
-/// into that position for the second multiply. Each 64-bit product is
-/// shifted down by 16, and the two are woven back by putting the odd
-/// results into the odd i32 slots and blending.
+/// The even/odd split: `vpmuldq` multiplies the sign-extended low i32 of
+/// each 64-bit element (the even lanes); an ARITHMETIC `>> 32` brings the
+/// odd lanes down for the second multiply. Both products are shifted by 16
+/// and the odd ones blended back into the odd slots.
 #[inline(always)]
 pub fn zn_mul(a: ZN, b: ZN) -> ZN {
     unsafe {
@@ -183,16 +147,9 @@ pub fn zn_mul(a: ZN, b: ZN) -> ZN {
     }
 }
 
-/// Divide and remainder go out to scalar, and this IS a hole in the
-/// representation - see `ZN`'s doc for why that costs something.
-///
-/// x86 has no integer vector divide. Both are reachable through `f64`
-/// (an `i32` and a 47-bit shifted numerator are both exact in a 53-bit
-/// mantissa) plus a correction step for round-to-nearest, which is
-/// Philippe's point and is right. It is not done yet because the room's
-/// kernels contain **4 `zn_div` and 4 `zn_rem` sites against ~13,700
-/// nodes**, so the hole is measurable before it is worth closing.
-/// Close it with a number, not with an assumption.
+/// Divide and remainder go out to scalar (x86 has no integer vector
+/// divide). A vector version through `f64` plus a rounding correction is
+/// possible; the sites are rare enough that it has not been worth it.
 #[inline(always)]
 pub fn zn_div(a: ZN, b: ZN) -> ZN {
     let (x, y) = (a.to_array(), b.to_array());
@@ -203,28 +160,22 @@ pub fn zn_rem(a: ZN, b: ZN) -> ZN {
     let (x, y) = (a.to_array(), b.to_array());
     ZN::from_array(std::array::from_fn(|i| x[i] % y[i]))
 }
-/// A 16,384-entry table lookup per lane. `vpgatherdd` would do it; there
-/// are ZERO `zn_sin` sites in the room's kernels, so it waits.
+/// `sin`, per lane in scalar (rare in the kernels).
 #[inline(always)]
 pub fn zn_sin(a: ZN) -> ZN {
     let x = a.to_array();
     ZN::from_array(std::array::from_fn(|i| x[i].pico8_sin()))
 }
 
-// ---- interval ops (per-lane ports of runtime2's av_* interval arms) ----
+// ---- interval ops ----
 //
-// Componentwise on the two planes, which is what makes them vector at
-// all: an interval endpoint is a `Pico8Num` and the interval rules are
-// selections between endpoints, never a per-lane branch.
+// Componentwise on the two planes: the interval rules are selections
+// between endpoints, never a per-lane branch.
 //
-// The WRAP CHECK survives. `Pico8NumInterval`'s `Add`/`Sub` go through
-// `from_i64_endpoints`, which panics if the result leaves `i32` - a real
-// guard, not a formality, because a widened interval is exactly the
-// thing that can run away. A plain `vpaddd` would wrap silently. So each
-// arm computes the signed-overflow predicate in vector form and hands
-// the whole column to the scalar implementation if ANY lane trips it,
-// which panics with the message it always did. Four extra instructions
-// on a path that is never taken.
+// An endpoint must never wrap silently (a widened interval is exactly what
+// can run away). `Pico8NumInterval`'s `Add`/`Sub` panic when a result leaves
+// `i32`, so each arm computes the signed-overflow predicate and hands the
+// whole column to the scalar implementation if any lane trips it.
 
 /// Signed 32-bit add-overflow, per lane: the sign of both operands
 /// differs from the sign of the result. `((a^r) & (b^r)) < 0`.
@@ -244,9 +195,8 @@ fn sub_overflows(a: __m512i, b: __m512i, r: __m512i) -> u16 {
     }
 }
 
-/// The scalar interval implementation, per lane. Reached only when a
-/// vector arm detects a wrap and wants its panic, and by the tests,
-/// which use it as the oracle for every arm above.
+/// The scalar interval implementation, per lane: reached only when a vector
+/// arm detects a wrap, for its panic.
 #[inline(always)]
 fn zi_scalar(a: ZI, b: ZI, f: impl Fn(IV, IV) -> IV) -> ZI {
     let (alo, ahi) = (a.lo.to_array(), a.hi.to_array());
@@ -261,9 +211,8 @@ fn zi_scalar(a: ZI, b: ZI, f: impl Fn(IV, IV) -> IV) -> ZI {
     ZI { lo: ZN::from_array(lo), hi: ZN::from_array(hi) }
 }
 
-/// The lanes where an interval `+` OVERFLOWS an endpoint: the assembled
-/// kernel's own error for it (`Op::NoWrap`), and the guard `zi_add`
-/// panics on.
+/// The lanes where an interval `+` overflows an endpoint: the assembled
+/// kernel's error for it (`Op::NoWrap`) and the guard `zi_add` panics on.
 #[inline(always)]
 pub fn zi_add_wraps(a: ZI, b: ZI) -> u16 {
     unsafe {
@@ -300,8 +249,7 @@ pub fn zi_add(a: ZI, b: ZI) -> ZI {
 }
 #[inline(always)]
 pub fn zi_sub(a: ZI, b: ZI) -> ZI {
-    // `[a.low - b.high, a.high - b.low]` - the endpoints CROSS, which is
-    // the whole content of interval subtraction.
+    // `[a.low - b.high, a.high - b.low]`: the endpoints cross.
     if zi_sub_wraps(a, b) != 0 {
         return zi_scalar(a, b, |x, y| x - y);
     }
@@ -318,23 +266,17 @@ pub fn zi_max(a: ZI, b: ZI) -> ZI {
 
 #[inline(always)]
 pub fn zi_neg(a: ZI) -> ZI {
-    // `-MIN` wraps to `MIN`: PANIC on it, as `zi_add` / `zi_sub` do on
-    // theirs. The assembled kernel declines such a lane instead (its own
-    // error, `Op::NoWrap`); neither ever wraps silently.
+    // `-MIN` wraps to `MIN`: panic, as `zi_add` / `zi_sub` do. The
+    // assembled kernel declines such a lane instead (`Op::NoWrap`).
     if zi_neg_wraps(a) != 0 {
         return zi_scalar(a, a, |x, _| x.checked_neg().unwrap_or_else(|| panic!("interval negation wraps: -[{:?}, {:?}]", x.low, x.high)));
     }
     ZI { lo: zn_neg(a.hi), hi: zn_neg(a.lo) }
 }
 
-/// `abs` of an interval: three cases, and no branch.
-///
-///   * entirely non-negative -> unchanged;
-///   * entirely non-positive -> reflected, endpoints swapping;
-///   * straddling zero       -> `[0, max(|lo|, |hi|)]`.
-///
-/// Each case is a mask and the result is two blends, because the cases
-/// PARTITION the lanes.
+/// `abs` of an interval, branch-free: unchanged if non-negative, reflected
+/// if non-positive, else `[0, max(|lo|, |hi|)]`. The cases partition the
+/// lanes, so each is a mask and the result is blends.
 #[inline(always)]
 pub fn zi_abs(a: ZI) -> ZI {
     unsafe {
@@ -342,8 +284,7 @@ pub fn zi_abs(a: ZI) -> ZI {
         let pos = _mm512_cmpge_epi32_mask(a.lo.0, zero);
         let neg = _mm512_cmple_epi32_mask(a.hi.0, zero);
         let (al, ah) = (_mm512_abs_epi32(a.lo.0), _mm512_abs_epi32(a.hi.0));
-        // Straddling is the fallback, so build it first and blend the
-        // two decided cases over it.
+        // Straddling is the fallback; blend the decided cases over it.
         let mut lo = zero;
         let mut hi = _mm512_max_epi32(al, ah);
         lo = _mm512_mask_blend_epi32(neg, lo, ah);
@@ -354,22 +295,19 @@ pub fn zi_abs(a: ZI) -> ZI {
     }
 }
 
-/// av_flr interval arm. Whether the floor is UNIQUE is a premise
-/// (the floor premise), so this just takes the low endpoint's floor - which is
-/// the floor, on every lane that survives the premise.
+/// Interval `flr`. That the floor is unique is a premise, so this takes the
+/// low endpoint's floor - the floor on every lane that survives it.
 #[inline(always)]
 pub fn zi_flr(a: ZI) -> ZN {
     zn_flr(a.lo)
 }
 
-/// The premise `zi_fork_flr` is taken under: this lane's interval spans
-/// at most TWO floors, so the two fork outcomes can represent it. A
-/// boundary-widened interval has width < 1 and always passes.
+/// The premise `zi_fork_flr` is taken under: the lane's interval spans at
+/// most `ways` floors, so the fork's fragments cover it.
 #[inline(always)]
 pub fn zi_span_ok(a: ZI, ways: u8) -> ZB {
     let (fl, fh) = (zn_flr(a.lo), zn_flr(a.hi));
-    // At most `ways` floors: the high end's within `ways - 1` of the low
-    // end's.
+    // The high end's floor within `ways - 1` of the low end's.
     let top = zn_add(fl, zn_splat(P8::from_raw(STEP * (ways as i32 - 1))));
     ZB { val: mask_le(fh, top), known: ALL }
 }
@@ -379,17 +317,8 @@ const STEP: i32 = 1 << 16;
 
 // ---- comparisons ----
 //
-// `Pico8Num` derives `Ord` from its raw `i32`, so an abstract comparison
-// IS a signed 32-bit compare - and `vpcmpd` produces exactly the 16-bit
-// mask `ZB` wants, in one instruction.
-//
-// NOTE, because the history is instructive: this was tried on 2026-08-23
-// while `ZN` was still `[Pico8Num; 16]` and was **27% SLOWER**, which is
-// recorded under "REFUTED" in plans/tracing.md. Nothing about the
-// instruction was wrong; the column had to be assembled from an array
-// and taken apart again around it. With `ZN` a register the assembly
-// disappears and the same instruction is free. That is the whole
-// argument for changing the representation rather than the primitives.
+// `Pico8Num` orders by its raw `i32`, so a comparison is one signed
+// `vpcmpd`, which yields exactly the 16-bit mask `ZB` wants.
 
 /// Defines `$name`, the `ZB`-returning primitive the kernels call, and
 /// `$mask`, the raw lane mask `zi_cmp` and the interval premises
@@ -422,14 +351,12 @@ pub enum Cmp {
     Ge,
 }
 
-/// The av_cmp tri-state judge, per lane, on intervals (degenerate
-/// intervals give the same answers as plain numbers for ORDERED compares).
+/// The tri-state interval comparison, per lane (degenerate intervals answer
+/// as plain numbers).
 ///
-/// Each arm is two of the number masks above. `t` is "definitely true"
-/// and `f` is "definitely false"; a lane in neither is unknown. The two
-/// are disjoint by construction - for `Lt`, `ah < bl` and `al >= bh`
-/// together give `bh <= al <= ah < bl <= bh` - so `val = t` needs no
-/// masking against `f`.
+/// `t` is "definitely true", `f` "definitely false", neither is unknown.
+/// They are disjoint (for `Lt`, both would give `bh <= al <= ah < bl <=
+/// bh`), so `val = t` needs no masking.
 #[inline(always)]
 pub fn zi_cmp(op: Cmp, a: ZI, b: ZI) -> ZB {
     let (t, f) = match op {
@@ -459,17 +386,9 @@ pub fn zi_eq(a: ZI, b: ZI) -> ZB {
 pub fn zb_not(a: ZB) -> ZB {
     ZB { val: !a.val, known: a.known }
 }
-/// Tri-state AND, Kleene. Known where BOTH are known, and also where
-/// either is known FALSE - `false and anything` is false whether or not
-/// the other side is known. That matches `Graph::fold`'s rule for
-/// `Op::And`, which is the point: the emitter and the folder have to
-/// agree about what an AND means or a folded graph and an emitted one
-/// answer differently.
-///
-/// The old front end never needed this. Every `And` it built was either
-/// the `Known(x) AND x` idiom or a validity conjunct that the emitter
-/// flattened, so an AND was never rendered as a value. A traced graph
-/// builds them freely - a guard is `g AND c` - so they have to lower.
+/// Tri-state AND, Kleene: known where both are known, or either is known
+/// false. Must match `Graph::fold`'s rule for `Op::And`, or a folded graph
+/// and an emitted one answer differently.
 #[inline(always)]
 pub fn zb_and(a: ZB, b: ZB) -> ZB {
     let known_false = (a.known & !a.val) | (b.known & !b.val);
@@ -484,22 +403,17 @@ pub fn zb_or(a: ZB, b: ZB) -> ZB {
     ZB { val: a.val | b.val, known: (a.known & b.known) | known_true }
 }
 
-/// av_eq bool arm: equal where both known; unknown where either is not.
+/// Bool equality: known where both are known.
 #[inline(always)]
 pub fn zb_eq(a: ZB, b: ZB) -> ZB {
     ZB { val: !(a.val ^ b.val), known: a.known & b.known }
 }
 
-// ---- select / guard / deopt ----
+// ---- select ----
 
-/// Per-lane blend. That the condition is DECIDED is a premise, recorded
-/// as a validity conjunct by the emitter (`Known(c)`), so an undecided
-/// lane blends as if false and is filtered out downstream.
-///
-/// One `vpblendmd`. `ZB::val` is already a mask register's worth of
-/// bits, which is why the boolean layer keeps its lanes as a `u16` -
-/// and this is the primitive that decision was made for: the census
-/// counts 1,442 of these in `kernel1`, more than twice the comparisons.
+/// Per-lane blend, one `vpblendmd`. That the condition is decided is a
+/// premise (`Known(c)`), so an undecided lane blends as if false and is
+/// filtered out downstream.
 #[inline(always)]
 pub fn zsel_n(c: ZB, t: ZN, f: ZN) -> ZN {
     ZN(unsafe { _mm512_mask_blend_epi32(c.val, f.0, t.0) })
@@ -518,23 +432,16 @@ pub fn zsel_b(c: ZB, t: ZB, f: ZB) -> ZB {
 
 // ---- refinement splits ----
 
-/// __split_by_flr as an n-way FORK (plans/kernel-plan.md K2): a
-/// boundary-widened rem has width < 1 and an exact speed, so `rem +
-/// spd + 0.5` spans at most two floors and the fork has two fragments
-/// (a wider operand, e.g. a region's ranges, may take more). Fragment
-/// `c` is the `c`-th floor from the low end's, clipped to the lane;
-/// fragment 0 is always non-empty. Returns (fragment `c` per lane,
-/// valid mask); a lane with an empty fragment simply produces no row in
-/// this fork configuration. A lane spanning more floors than the fork
-/// has fragments is what `zi_span_ok` (the premise) takes off the
-/// kernel.
+/// `__split_by_flr` as an n-way fork. Fragment `c` is the `c`-th floor
+/// from the low end's, clipped to the lane; fragment 0 is never empty.
+/// Returns (fragment `c` per lane, valid mask); a lane with an empty
+/// fragment produces no row in this fork configuration. The fragments of a
+/// fork of arity `n` partition every lane spanning at most `n` floors; a
+/// wider lane is what `zi_span_ok` (the premise) takes off the kernel.
 #[inline(always)]
 pub fn zi_fork_flr(a: ZI, c: usize) -> (ZI, u16) {
     let (fl, fh) = (zn_flr(a.lo), zn_flr(a.hi));
-    // Fragment `c` is the `c`-th floor from the low end's, clipped to the
-    // interval, and valid iff the interval reaches it. The fragments of a
-    // fork of arity `n` partition every lane spanning at most `n` floors; a
-    // wider lane is what `zi_span_ok` takes off the kernel.
+    // Valid iff the interval reaches the `c`-th floor.
     let base = zn_add(fl, zn_splat(P8::from_raw(STEP * c as i32)));
     let top = zn_add(base, zn_splat(P8::from_raw(STEP - 1)));
     let valid = if c == 0 { ALL } else { mask_le(base, fh) };
@@ -543,10 +450,9 @@ pub fn zi_fork_flr(a: ZI, c: usize) -> (ZI, u16) {
 
 // ---- cart / collision builtins (per-lane; x/y vary, w/h/flag uniform) ----
 
-/// mget, per lane. Semantics identical to `CartData::mget(..).expect(..)`:
-/// 0 outside the map (PICO-8's; a branch-free kernel reads there on a lane
-/// that does not take the iteration), and a fractional coordinate panics
-/// (the traced cart never makes one).
+/// mget, per lane: 0 outside the map (as PICO-8; a branch-free kernel reads
+/// there on lanes that do not take the iteration); a fractional coordinate
+/// panics (the traced cart never makes one).
 #[inline(always)]
 pub fn zn_mget(cart: &CartData, x: ZN, y: ZN) -> ZN {
     let (x, y) = (x.to_array(), y.to_array());
@@ -594,23 +500,13 @@ pub fn zn_tile_flag_at(
     ZB { val, known: ALL }
 }
 
-// ---- scalar (block-uniform) helpers the generated code leans on ----
+// ---- per-lane box ----
 
-/// Scalar interval + interval (the uniform twin of zi_add).
 #[inline(always)]
-/// `tile_flag_at` with a PER-LANE box.
-///
-/// The box is block-uniform in almost every frame - a hitbox is fixed
-/// per object type - but not in the frame an object is CREATED, because
-/// `init_object` gives it a default 8x8 and `type.init` may or may not
-/// replace it. Whether a given lane's object was just created is a
-/// per-lane fact, so the width arrives as a select over it.
-///
-/// Slower than the uniform form on purpose: `CollisionCache::solid_map`
-/// is keyed by (w, h), so a per-lane box cannot use it and every lane
-/// takes the general path. Callers should use `zn_tile_flag_at` whenever
-/// the box is uniform, which the emitter decides from the operands'
-/// representation.
+/// `tile_flag_at` with a per-lane box: in the frame an object is created
+/// its hitbox depends on whether `type.init` replaced the default 8x8.
+/// Always takes the scan (the precomputed maps are keyed by the box); use
+/// `zn_tile_flag_at` when the box is uniform.
 pub fn zn_tile_flag_at_lanes(
     cache: &CollisionCache,
     cart: &CartData,
@@ -635,27 +531,18 @@ pub fn zn_tile_flag_at_lanes(
     ZB { val, known: ALL }
 }
 
-/// The within-call dedup CACHE: one per outcome per kernel call, keyed by
-/// the row key, carrying one `u32` TAG per key - what the row's first
-/// emission learned that a re-emission of the same row needs (its source
-/// cell for the pos-graph in the forward; whether it hit a target in the
-/// backward), so the re-emission never materializes anything
-/// (`compiled::asm_kernel`).
+/// The within-call dedup cache, keyed by the row key, with one `u32` tag
+/// per key: what the row's first emission learned that a re-emission needs,
+/// so the re-emission materializes nothing (`compiled::asm_kernel`).
 ///
-/// A cache, not a set: fixed capacity, direct-mapped with a short probe,
-/// a colliding new key evicts. The fused graph re-emits the same row
-/// from NEIGHBOURING input lanes ~8x over (inputs are sorted by cell, so
-/// the duplicates are close in time), which a bounded, L2-resident table
-/// catches; whatever it misses reaches the owner's door, which is the
-/// dedup of record. The unbounded open-addressing set it replaced grew to
-/// megabytes per unit and every probe was a cache miss - a third of the
-/// append loop (2026-09-14).
+/// A cache, not a set: fixed capacity, a short probe, a colliding new key
+/// evicts. Duplicates come from neighbouring input lanes (inputs are sorted
+/// by cell), so a bounded L2-resident table catches most; a miss reaches
+/// the door, which is the dedup of record.
 pub struct RowCache {
     /// `(key.1, ref, generation, tag)`; the slot index comes from `key.0`.
-    /// The ref is the emitter's handle on what it did with this key: the
-    /// queued row (the forward's queue and row), or - once that row was
-    /// flushed - the state's id, so a later emission of the same key from
-    /// another lane can record itself as a predecessor either way.
+    /// The ref is the queued row, or once flushed the state's id
+    /// (`ID_FLAG`), so a later emission of the key can record its edge.
     slots: Vec<(u64, u64, u32, u32)>,
     mask: usize,
     gen: u32,
@@ -707,7 +594,7 @@ impl RowCache {
     }
 
     /// Insert `k` with `tag` and ref `r`: `None` if it was not present (it
-    /// is now, or it evicted the oldest of its probe window), `Some((tag,
+    /// is now, or it evicted the first slot of its probe window), `Some((tag,
     /// ref) of the first insert)` if it was.
     #[inline(always)]
     pub fn insert_ref(&mut self, k: (u64, u64), tag: u32, r: u64) -> Option<(u32, u64)> {
@@ -733,10 +620,8 @@ impl RowCache {
 mod tests {
     use super::*;
 
-    /// A deterministic spread of raw 16.16 patterns: zero, both signs,
-    /// the fractional boundaries `flr` cares about, and the extremes -
-    /// because an operation that only ever sees small positive numbers
-    /// would not notice a sign or an overflow bug in either direction.
+    /// A deterministic spread of raw 16.16 patterns: zero, both signs, the
+    /// fractional boundaries `flr` cares about, and the extremes.
     fn spread() -> Vec<P8> {
         let mut v: Vec<P8> = vec![
             P8::from_raw(0),
@@ -754,8 +639,7 @@ mod tests {
         for _ in 0..40 {
             s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             v.push(P8::from_raw(s as i32));
-            // Small values too: the spread above is dominated by huge
-            // ones, and the game's numbers are mostly in [-256, 256].
+            // Small values too: the game's are mostly in [-256, 256].
             v.push(P8::from_i16((s % 512) as i16 - 256));
         }
         v
@@ -766,8 +650,7 @@ mod tests {
         ZN::from_array(std::array::from_fn(|i| s[(seed * 7 + i * 5) % s.len()]))
     }
 
-    /// A column of SMALL values, for the arms that would overflow on the
-    /// extremes and whose scalar version panics rather than wrapping.
+    /// A column of small values, for the arms that panic on overflow.
     fn small(seed: usize) -> ZN {
         let mut s = (seed as u32).wrapping_mul(2_654_435_761).wrapping_add(1);
         ZN::from_array(std::array::from_fn(|_| {
@@ -781,10 +664,7 @@ mod tests {
         ZI { lo: zn_min(a, b), hi: zn_max(a, b) }
     }
 
-    /// The oracle for every `zn_*` arm: the scalar operator, one lane at
-    /// a time. This IS the implementation these primitives had until the
-    /// lane type became a register, so a disagreement is a regression
-    /// against code that ran for months.
+    /// The oracle for every `zn_*` arm: the scalar operator, per lane.
     fn ref2(a: ZN, b: ZN, f: impl Fn(P8, P8) -> P8) -> ZN {
         let (x, y) = (a.to_array(), b.to_array());
         ZN::from_array(std::array::from_fn(|i| f(x[i], y[i])))
@@ -811,8 +691,7 @@ mod tests {
             assert_eq!(zn_add(a, b), ref2(a, b, |x, y| x + y), "add {}", seed);
             assert_eq!(zn_sub(a, b), ref2(a, b, |x, y| x - y), "sub {}", seed);
             assert_eq!(zn_mul(a, b), ref2(a, b, |x, y| x * y), "mul {}", seed);
-            // min/max/neg/abs/flr are total, so they get the WIDE spread
-            // including i32::MIN, where `abs` and `neg` are interesting.
+            // The total ops get the wide spread, including i32::MIN.
             let (a, b) = (column(seed), column(seed + 31));
             assert_eq!(zn_min(a, b), ref2(a, b, |x, y| x.min(y)), "min {}", seed);
             assert_eq!(zn_max(a, b), ref2(a, b, |x, y| x.max(y)), "max {}", seed);
@@ -822,18 +701,15 @@ mod tests {
         }
     }
 
-    /// `zn_mul` is the one arm that is not a single instruction - an
-    /// even/odd `vpmuldq` split woven back together - so it gets its own
-    /// test with the lane pattern that would catch a weave bug: every
-    /// lane a different value, so swapping even and odd shows.
+    /// The even/odd weave of `zn_mul`: every lane a different value, so a
+    /// swap shows.
     #[test]
     fn the_multiply_weave_puts_every_lane_back_where_it_came_from() {
         let a = ZN::from_array(std::array::from_fn(|i| P8::from_i16(i as i16 + 1)));
         let b = ZN::from_array(std::array::from_fn(|i| P8::from_i16(100 - i as i16)));
         assert_eq!(zn_mul(a, b), ref2(a, b, |x, y| x * y));
-        // Negative operands in alternating lanes: the odd-lane path uses
-        // an ARITHMETIC shift to bring the high i32 down, and a logical
-        // one would only show up on negatives.
+        // Negatives in alternating lanes: the odd-lane shift must be
+        // arithmetic.
         let c = ZN::from_array(std::array::from_fn(|i| {
             P8::from_i16(if i % 2 == 0 { -(i as i16) - 1 } else { i as i16 + 1 })
         }));
@@ -872,10 +748,8 @@ mod tests {
         }
     }
 
-    /// The interval arms, against the `Pico8NumInterval` operators they
-    /// are ports of. Small operands, because `zi_add`/`zi_sub` PANIC on
-    /// a wrap rather than wrapping and this checks the ordinary path;
-    /// the wrap path has its own test.
+    /// The interval arms against the `Pico8NumInterval` operators. Small
+    /// operands: the wrap path has its own tests.
     #[test]
     fn vector_interval_ops_match_the_interval_operators() {
         for seed in 0..96 {
@@ -930,11 +804,7 @@ mod tests {
         }
     }
 
-    /// `zi_add` and `zi_sub` must PANIC on a wrap, not wrap silently.
-    /// The vector arms compute the overflow predicate and hand the whole
-    /// column to the scalar implementation when any lane trips it - so
-    /// this checks the guard still bites, which a `vpaddd` alone would
-    /// have removed.
+    /// `zi_add` must panic on a wrap, not wrap silently.
     #[test]
     #[should_panic]
     fn an_interval_add_that_wraps_still_panics() {
@@ -943,8 +813,7 @@ mod tests {
         let _ = zi_add(a, a);
     }
 
-    /// `zi_sub` too: the whole range minus 1 (a timers level's countdown,
-    /// before it became the unknown number, 2026-10-03).
+    /// `zi_sub` too: the whole range minus 1.
     #[test]
     #[should_panic]
     fn an_interval_sub_that_wraps_still_panics() {
@@ -961,9 +830,8 @@ mod tests {
         let _ = zi_neg(ZI { lo: min, hi: zero });
     }
 
-    /// Round-tripping a column through an array must be the identity,
-    /// which is the premise `append` and the row-key walk rely on when
-    /// they read one lane at a time.
+    /// Round-tripping a column through an array is the identity, and
+    /// `lane` agrees with it.
     #[test]
     fn a_column_survives_a_round_trip_through_an_array() {
         for seed in 0..64 {
@@ -979,16 +847,13 @@ mod tests {
         }
     }
 
-    /// The interval judge is now four number masks and an OR. Check it
-    /// against the tri-state definition it replaced, spelled out here
-    /// rather than shared with the implementation.
+    /// The interval comparison against the tri-state definition, spelled
+    /// out here rather than shared with the implementation.
     #[test]
     fn interval_comparisons_match_the_tristate_definition() {
         let ops = [Cmp::Lt, Cmp::Le, Cmp::Gt, Cmp::Ge];
         for seed in 0..64 {
-            // Build intervals that are genuinely ordered, and let some of
-            // them be degenerate - a degenerate interval must give the
-            // same answer as the plain number comparison.
+            // Ordered intervals, some degenerate.
             let (p, q) = (column(seed), column(seed + 13));
             let (r, s) = (column(seed + 29), column(seed + 41));
             let a = ZI { lo: zn_min(p, q), hi: zn_max(p, q) };
@@ -1000,8 +865,7 @@ mod tests {
                 for i in 0..W {
                     let (al, ah) = (a.lo.lane(i), a.hi.lane(i));
                     let (bl, bh) = (b.lo.lane(i), b.hi.lane(i));
-                    // Enumerate the definition: the comparison is decided
-                    // iff every pair drawn from the two intervals agrees.
+                    // Decided iff every pair from the two intervals agrees.
                     let (t, f) = match op {
                         Cmp::Lt => (ah < bl, al >= bh),
                         Cmp::Le => (ah <= bl, al > bh),

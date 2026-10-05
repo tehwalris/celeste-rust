@@ -1,18 +1,14 @@
-//! The block engine: the `(shape, rows)` data model and the lane runtime the
-//! generated kernels are emitted against.
+//! The block engine: the `(shape, rows)` data model and the lane runtime.
 //!
-//! Two modules, and the split between them is the split between GENERIC and
-//! GENERATED. `runtime2` is the block itself - `Rt2`'s structure/columns, the
-//! boundary abstraction, dedup, k-way merge, retain, row keys, the shape hash
-//! and the pm1 partitioning. `kernel` is the typed per-lane primitives
-//! (`W = 16` rows, static types, deopt as a mask) that `celeste-kernels`'
-//! emitted straight-line code calls.
+//! `runtime2` is the block itself - `Rt2`'s structure and columns, the
+//! boundary abstraction, dedup, merge, retain, row keys and the shape hash.
+//! `kernel` holds the typed 16-lane primitives: the reference semantics the
+//! ASM codegen is tested against, and the call-outs the assembled kernels make.
 //!
-//! What this crate deliberately does NOT know about is the interpreter. It
-//! reaches down to `celeste-core` for PICO-8 numbers, the cart and the
-//! collision cache, and down to `celeste-names` for `FIELD_NAMES`, and that
-//! is the whole of its dependencies. Translating the reference interpreter's
-//! state into a block is `trace::refbridge`, up in `celeste-rust`.
+//! This crate does not know about the interpreter: it depends only on
+//! `celeste-core` (numbers, cart, collision cache) and `celeste-names`
+//! (`FIELD_NAMES`). Translating reference states into blocks is
+//! `trace::refbridge` in `celeste-rust`.
 
 pub mod kernel;
 pub mod runtime2;
@@ -20,10 +16,6 @@ pub mod slots;
 
 pub use runtime2::{Cell2, Col, Rt2, AV, NONE};
 
-/// The hasher the row machinery keys with, re-exported because it is part
-/// of this crate's ABI rather than an implementation detail: callers that
-/// build the dedup and census maps `runtime2` consumes have to use the
-/// same one, and rustc-hash 1 and 2 hash differently. celeste-rust is on
-/// 1.x for its own maps, so without this the frame interface would quietly
-/// key with the other hasher.
+/// The hasher the row machinery keys with. Part of this crate's ABI: maps
+/// passed into `runtime2` must use the same one (rustc-hash 1 and 2 differ).
 pub use rustc_hash::FxHashMap;

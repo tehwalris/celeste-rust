@@ -54,22 +54,19 @@ pub fn num_at(rt2: &Rt2, obj: u32, path: &[&str]) -> Option<P8> {
     None
 }
 
-/// The moving platforms' fields a world fixes (`platform_worlds`): `x`,
-/// `last`, `rem.x`, `spd.x`, then `y` and `dir` - constant, what a traced
-/// state's platform is matched to a world's by (`widen::platform_inputs`) -
-/// in that order, raw 16.16.
+/// The platform fields a world fixes, raw 16.16, in order: `x`, `last`,
+/// `rem.x`, `spd.x`, then the constant `y` and `dir` (what
+/// `widen::platform_inputs` matches a traced platform by).
 pub const WORLD_FIELDS: usize = 6;
 
 /// THE PLATFORM WORLDS of the start room: every arrangement of its moving
-/// platforms in the first `frames` frames, each platform's `(x, last, rem.x,
-/// spd.x, y, dir)` in `objects` order, deduplicated.
+/// platforms in the first `frames` frames (`WORLD_FIELDS` per platform, in
+/// `objects` order), deduplicated.
 ///
-/// A platform moves by `dir * 0.65` a frame and nothing the player does
-/// moves it, so the arrangement is a function of one number - how many
-/// frames the platforms have updated since the room loaded - and running
-/// the room with no input visits every arrangement a search of up to
-/// `frames` frames can meet (a freeze or a restart only makes that number
-/// smaller). The caller must refuse a search further than `frames`.
+/// Nothing the player does moves a platform, so the arrangement depends only
+/// on how many frames the platforms have updated (a freeze or restart only
+/// lowers that), and a no-input run visits every arrangement a search of up
+/// to `frames` frames can meet. The caller must refuse a longer search.
 pub fn platform_worlds(frames: usize) -> Result<Vec<Vec<[i32; WORLD_FIELDS]>>> {
     let mut eng = RefEngine::new()?;
     let mut state = eng.initial()?;
@@ -95,20 +92,16 @@ pub fn platform_worlds(frames: usize) -> Result<Vec<Vec<[i32; WORLD_FIELDS]>>> {
 mod tests {
     use super::*;
 
-    /// THE SPLIT FRAME (`CELESTE_SPLIT_FRAME`, lua/celeste-minimal-split.lua)
-    /// must run exactly the original frame: after its two steps a state is
-    /// the unsplit frame's, down to the SHAPE - equal game states in two
-    /// shapes never dedupe. Room (1,0)'s witness dashes on frame 24, so
-    /// frames 25-26 take the freeze path, whose part a sets `__frozen` and
-    /// whose part b clears it (a global cleared to nil must be removed, as
-    /// Lua does: `Table::set_global`).
+    /// The split frame (`CELESTE_SPLIT_FRAME`) must run exactly the original
+    /// frame, down to the SHAPE (equal states in two shapes never dedupe).
+    /// The witness's dash on frame 24 covers the freeze path, where part b
+    /// clears `__frozen` (a global set to nil must be removed, as in Lua).
     #[test]
     fn split_frame_lands_on_the_unsplit_states_through_a_dash_freeze() {
         let bytes = read_inputs("tas/room_1_0_exit_frame_99.txt").expect("tas");
         assert_eq!(bytes.len(), 99);
         let fingerprint = |r: &Rt2| (r.shape_hash_of(), r.clone_block().row_keys_canonical());
-        // The cart is read when an engine is built; nextest runs this test
-        // in its own process.
+        // The cart is read when an engine is built (nextest: own process).
         std::env::remove_var("CELESTE_SPLIT_FRAME");
         let mut whole = RefEngine::new().expect("engine");
         std::env::set_var("CELESTE_SPLIT_FRAME", "1");

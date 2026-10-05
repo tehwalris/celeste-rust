@@ -1,21 +1,11 @@
-//! Differential corpora against REAL PICO-8.
+//! Differential corpora against REAL PICO-8, for questions another model
+//! could get wrong the same way (`#` on a table with a hole depends on how
+//! the table was BUILT, not on what it holds).
 //!
-//! The tracer's oracle has always been another model - the interpreter,
-//! and before that the OCaml one. That is enough to catch drift between
-//! them and nothing at all to catch a question they both get wrong.
-//! `#` on a table with a hole in it is exactly such a question: it is
-//! usually described as "undefined", which invites picking an answer and
-//! moving on, and the answer PICO-8 actually gives depends on how the
-//! table was BUILT rather than on what it holds.
-//!
-//! So: a corpus in `lua/probe/*.lua` that runs unchanged in both places,
-//! and its real PICO-8 stdout checked in beside it. `./regen-pico8-golden.sh`
-//! regenerates the golden files and needs a PICO-8 install; the tests do
-//! not, which is the point of checking them in.
-//!
-//! The corpus talks to the outside world only through `printh`, one value
-//! per call - no `tostr` and no `..`, because the tracer implements
-//! neither and the source has to be the same source.
+//! Each `lua/probe/*.lua` runs unchanged in the tracer and in PICO-8; its
+//! real stdout is checked in beside it (`./regen-pico8-golden.sh` needs a
+//! PICO-8 install, the tests do not). The corpus prints only through
+//! `printh`, one value per call: the tracer has no `tostr` or `..`.
 
 use anyhow::{bail, Result};
 
@@ -33,6 +23,7 @@ pub fn run_probe(name: &str) -> Result<Vec<String>> {
     Ok(std::mem::take(&mut it.prints))
 }
 
+/// The checked-in PICO-8 output of one corpus.
 pub fn golden(name: &str) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(format!("lua/probe/{}.expected", name))?;
     Ok(text.lines().map(|l| l.to_string()).collect())
@@ -78,11 +69,9 @@ pub fn compare(name: &str) -> Result<usize> {
 /// Corpora the tracer must reproduce EXACTLY.
 pub const MATCHING: &[&str] = &["tables"];
 
-/// Corpora the tracer must REFUSE. Each is a `#` whose value depends on
-/// the array part's capacity, and so on the table's rehash history rather
-/// than on its keys - see `heap::Table::len`. Their golden files record
-/// what PICO-8 actually says, so what we are declining to guess stays
-/// written down and stays checked.
+/// Corpora the tracer must REFUSE: each is a `#` that depends on the table's
+/// rehash history, not its keys (`heap::Table::len`). Their golden files
+/// still record what PICO-8 says.
 pub const REFUSED: &[&str] = &[
     "len_add_to_hole",
     "len_after_sparse_write",
@@ -94,8 +83,7 @@ pub const REFUSED: &[&str] = &[
     "len_sparse",
 ];
 
-/// Every corpus on disk, so adding one cannot be forgotten by the
-/// currency check.
+/// Every corpus on disk, so a new one cannot escape the checks.
 pub fn all_corpora() -> Result<Vec<String>> {
     let mut out = Vec::new();
     for e in std::fs::read_dir("lua/probe")? {
@@ -134,10 +122,7 @@ mod tests {
         }
     }
 
-    /// The other half of "exactly match PICO-8 or raise": these RAISE, and
-    /// that has to be checked, or the rule is just a comment. A silent
-    /// wrong answer and a refusal are very different things, and only one
-    /// of them is allowed.
+    /// The other half of "exactly match PICO-8 or raise": these must RAISE.
     #[test]
     fn corpora_that_cannot_be_answered_are_refused() {
         for name in REFUSED {
@@ -165,13 +150,9 @@ mod tests {
 
     /// Is the checked-in golden file still what PICO-8 says?
     ///
-    /// Compares BYTES either side of a regeneration rather than asking
-    /// git: a golden file that is merely staged, or not yet added, is not
-    /// stale, and `git status --porcelain` calls both of those a change.
-    ///
-    /// Only runnable where PICO-8 is installed, so it SKIPS rather than
-    /// fails - but it skips loudly, since a silent skip on the machine
-    /// that has the oracle would be the whole check quietly not running.
+    /// Compares bytes either side of a regeneration (not the VCS status: a
+    /// staged or unadded file is not stale). Without PICO-8 it skips,
+    /// loudly.
     #[test]
     fn the_golden_files_are_current() {
         let p8 = std::env::var("PICO8").unwrap_or_else(|_| {
@@ -192,8 +173,7 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         for (i, n) in names.iter().enumerate() {
             let after = std::fs::read_to_string(format!("lua/probe/{}.expected", n)).unwrap();
-            // The file on disk is now the NEW output, which is what you
-            // want to look at if this fires.
+            // The file on disk is now the NEW output, for the diff.
             assert_eq!(
                 before[i], after,
                 "lua/probe/{}.expected is stale - real PICO-8 now says something else, \

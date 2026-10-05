@@ -1,20 +1,10 @@
-//! The tracer's BOUNDARY: which heap slots are a frame's INPUTS, and how
-//! to read the same slots back out afterwards.
+//! The tracer's BOUNDARY: which heap slots are a frame's INPUTS (in order),
+//! and how to read the same slots back out afterwards. This numbering is the
+//! tracer's own, not `celeste_names::FIELD_NAMES`.
 //!
-//! Everything else in `trace` treats the heap as an implementation
-//! detail. A kernel cannot: it is a function from a fixed list of input
-//! cells to a fixed list of output cells, so somebody has to say WHICH
-//! slots those are and in what order. That is this module, and it is
-//! deliberately the tracer's own answer rather than the boundary's
-//! (`celeste_names::FIELD_NAMES`) - lining the two numberings up is a
-//! separate job, and doing it first would have meant debugging two
-//! things at once.
-//!
-//! A slot is named by its PATH from the globals table (`objects[0].spd.x`)
-//! rather than by a table id, because a frame can replace an object -
-//! death allocates a new player - and the id would then name nothing. A
-//! path either resolves in the output state or it does not, and "does not"
-//! is a shape difference, which is a real answer.
+//! A slot is named by its PATH from the globals (`objects[0].spd.x`), not a
+//! table id: a frame can replace an object (death allocates a new player),
+//! and a path that no longer resolves is a shape difference.
 
 use std::collections::BTreeSet;
 
@@ -32,9 +22,8 @@ pub enum Step {
     Key(String),
     /// A slot of the ARRAY part, zero-based.
     Idx(usize),
-    /// An integer key outside the array part (`Table::ints`), by its Lua
-    /// key. Separate from `Idx` because they are different places: the
-    /// array part is what `#` measures.
+    /// An integer key outside the array part (`Table::ints`, not measured by
+    /// `#`), by its Lua key.
     Int(i16),
 }
 
@@ -65,9 +54,7 @@ pub fn key(k: &str) -> Step {
     Step::Key(k.to_string())
 }
 
-/// A scalar outside any domain - what a slot concretely holds. The
-/// differential check needs to talk about both sides' values in one
-/// vocabulary, and neither domain's own type is that vocabulary.
+/// A scalar outside any domain: what a slot concretely holds.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Conc {
     Num(P8),
@@ -110,21 +97,12 @@ pub fn set<D: Domain>(st: &mut State<D>, p: &[Step], v: Value<D>) -> Result<()> 
     Ok(())
 }
 
-/// Every scalar slot reachable from `root`, in a deterministic order.
+/// Every scalar slot reachable from `root`, in an order that depends only on
+/// the content (the hash part is a `BTreeMap`), not the allocation history.
 ///
-/// Deterministic because the hash part is a `BTreeMap` and the array part
-/// is a `Vec`, so the order is a property of the CONTENT and not of the
-/// allocation history - which is the same reason `Heap::shape_and_order`
-/// numbers objects canonically, and the same thing that makes two runs
-/// comparable.
-///
-/// A slot gets the FIRST path that reaches it, and the heap is a graph:
-/// `spring.tile` is named `objects[2].type.tile` in a room that contains
-/// a spring, because the object list is walked before the globals that
-/// alias it. So a path names a slot only RELATIVE TO A SHAPE. Comparing
-/// two states of the same shape by path is exact, which is what the
-/// differential check does; comparing across shapes is not, and would
-/// need a canonical name rather than a first-found one.
+/// A slot gets the FIRST path that reaches it (the heap is a graph: aliases
+/// are found through `objects` first), so a path names a slot only RELATIVE
+/// TO A SHAPE: comparing two states of the same shape by path is exact.
 pub fn scalars<D: Domain>(st: &State<D>, root: &[Step]) -> Result<Vec<Path>> {
     let v = get(st, root).ok_or_else(|| anyhow!("{}: no such slot", show(&root.to_vec())))?;
     let mut out = Vec::new();
@@ -143,8 +121,7 @@ fn collect<D: Domain>(
     match v {
         Value::Num(_) | Value::Bool(_) => out.push(p),
         Value::Table(t) => {
-            // Cycles are real: every object has a `type` pointing at a
-            // table that the object list also reaches.
+            // Cycles and aliases are real (`type` tables).
             if !seen.insert(*t) {
                 return;
             }
@@ -172,50 +149,29 @@ fn collect<D: Domain>(
 /// The input cells of one traced frame: cell `i` lives at `slots[i]` and
 /// held `init[i]` before it was replaced by a graph leaf.
 ///
-/// `pins` is the specialization: `(cell index, value)` for inputs whose
-/// value was BAKED INTO the body instead of being read from the cell.
-/// The cell still exists and is still an input - that is what lets
-/// `pin_guard` build the runtime check that the state actually agrees.
+/// `pins`: `(cell index, value)` for inputs BAKED INTO the body. The cell is
+/// still an input, so `pin_guard` can check that the state agrees.
 pub struct Iface {
     pub slots: Vec<Path>,
     pub init: Vec<Conc>,
     pub pins: Vec<(usize, Conc)>,
-    /// Slots that hold an INTERVAL rather than a number, parallel to
-    /// `slots`: the player's `rem.x`/`rem.y`, which the boundary widens.
-    ///
-    /// `init` still records a point, because a block has to be built
-    /// from something and every other consumer wants one. What makes the
-    /// slot an interval is this flag, which the emitter turns into an
-    /// `ival` input and the tracer into a value it will fork on.
-    ///
-    /// On a BOOLEAN slot the flag says a lane may hold it unknown (a near
-    /// level's floor `collideable`, `widen::fork_near_floor_inputs`): the
-    /// emitter makes it a `ubool` input, whose known mask the kernel reads.
+    /// Parallel to `slots`: a number slot holds an INTERVAL (the widened
+    /// fields; `init` still records a point), which the emitter makes an
+    /// `ival` input. A boolean slot may be unknown in a lane (a near level's
+    /// floor `collideable`), which the emitter makes a `ubool` input.
     pub ival: Vec<bool>,
 }
 
 /// Replace every scalar under `roots` with a fresh `Op::Cell` leaf, and
-/// remember what it used to be.
+/// remember what it held.
 ///
-/// Under the given roots, never the whole heap: the tracer's leverage
-/// comes from the heap staying concrete, and `btn(k_left)` indexes a
-/// table with a global that would become a cell if this were applied
-/// everywhere. Which slots are the right ones is a MEASUREMENT, not a
-/// principle - a slot left concrete is a specialization, and the check
-/// is valid either way because both sides specialize the same.
+/// Only under the roots, never the whole heap: the tracer's leverage is the
+/// heap staying concrete (`btn(k_left)` indexes with a global). A slot
+/// reached twice gets one cell; cells are numbered in root order.
 ///
-/// Overlapping roots are fine: a slot reached twice gets one cell, and
-/// the cell numbering follows the order the roots are given in.
-///
-/// `pin` is a KEY: slots to hold at a stated value rather than read from
-/// a cell, so the trace folds through the constant. This is how a class
-/// specialization is expressed - "compile this frame for freeze = 0,
-/// dash_time = 0" is six entries. The value is the CALLER's, not the
-/// state's, so one state can be compiled for several keys.
-///
-/// A pinned slot is still an input cell. Nothing in the body reads it -
-/// the constant was folded in - but `pin_guard` reads it, which is what
-/// turns "this body assumes freeze = 0" from a comment into a check.
+/// `pin` holds slots at the CALLER's value instead of reading a cell, so the
+/// trace folds through the constant. A pinned slot is still an input cell,
+/// read only by `pin_guard`, which turns the assumption into a check.
 pub fn symbolize(
     d: &mut Symbolic,
     st: &mut State<Symbolic>,
@@ -258,7 +214,6 @@ pub fn symbolize(
             other => bail!("{} is {:?}, not a scalar", show(p), other),
         };
         let (c, new) = match (pinned, held) {
-            // Pinned: keep it concrete, at the KEY's value.
             (Some(Conc::Num(v)), Conc::Num(_)) => {
                 let n = d.num(v);
                 (Conc::Num(v), Value::Num(n))
@@ -268,11 +223,9 @@ pub fn symbolize(
                 (Conc::Bool(v), Value::Bool(b))
             }
             (Some(v), h) => bail!("{}: pinned {:?} but the slot holds {:?}", show(p), v, h),
-            // Not pinned: the slot becomes the cell.
             (None, Conc::Num(v)) => (Conc::Num(v), Value::Num(cell)),
             (None, Conc::Bool(v)) => (Conc::Bool(v), Value::Bool(cell)),
         };
-        // The cell's kind, recorded on the graph for every later pass.
         d.graph.set_cell_kind(
             i as u32,
             match (&c, ival.contains(p)) {
@@ -285,8 +238,7 @@ pub fn symbolize(
         set(st, p, new)?;
     }
     let ival: Vec<bool> = slots.iter().map(|p| ival.contains(p)).collect();
-    // A NUMBER slot in `ival` is an interval; a boolean one a boolean a lane
-    // may hold unknown (`Iface::ival`), which is no interval cell.
+    // Only NUMBER slots in `ival` are interval cells.
     d.ival_cells = ival
         .iter()
         .zip(&init)
@@ -301,13 +253,9 @@ pub fn symbolize(
 /// The obligation a pinned body carries: every pinned cell holds the
 /// value the body was compiled for.
 ///
-/// Its negation is an ERROR of the whole frame, not a `guard`. A lane whose
-/// key disagrees is a REAL lane that this body cannot run, and a declined
-/// lane is what says so loudly. Putting it in `guard` would silently drop
-/// the lane from every outcome, which is the missing-successor failure the
-/// whole boolean split exists to prevent.
-///
-/// Returns `ConstBool(true)` when nothing is pinned, which folds away.
+/// Its negation is an ERROR of the frame, not a `guard`: a disagreeing lane
+/// is real and must be declined loudly; a guard would silently drop it.
+/// `ConstBool(true)` when nothing is pinned.
 pub fn pin_guard(d: &mut Symbolic, iface: &Iface) -> NodeId {
     let mut acc = d.graph.leaf(Op::ConstBool(true));
     for (i, c) in &iface.pins {
@@ -325,11 +273,8 @@ pub fn pin_guard(d: &mut Symbolic, iface: &Iface) -> NodeId {
     acc
 }
 
-/// Read every scalar under `root` as a CONCRETE value. This is what the
-/// oracle side of the differential check produces, and it fails loudly
-/// rather than skipping a slot that stayed symbolic - a frame run with
-/// concrete inputs that leaves something symbolic behind is exactly the
-/// bug this is looking for.
+/// Read every scalar under `root` as a CONCRETE value (the oracle side of the
+/// differential check). A slot that stayed symbolic is an error, never skipped.
 pub fn read_concrete(d: &Symbolic, st: &State<Symbolic>, root: &[Step]) -> Result<Vec<(Path, Conc)>> {
     let mut out = Vec::new();
     for p in scalars(st, root)? {

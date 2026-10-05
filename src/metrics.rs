@@ -1,14 +1,7 @@
-//! Always-on coarse phase metrics.
-//!
-//! `--profile` span tracing costs a few percent because it instruments hot
-//! interpreter paths; this module instruments only PHASE boundaries (a
-//! handful of `record` calls per frame or per sweep stage), so the overhead
-//! is nanoseconds and it can stay on unconditionally. Every driver run
-//! prints a phase summary at exit and appends one JSON line to
-//! `metrics.jsonl` next to the checkpoints (when a checkpoint dir is known),
-//! giving a machine-readable history of where wall time went - the
-//! "forward vs backward vs merge vs IO" questions that previously required
-//! log archaeology.
+//! Always-on coarse phase metrics: wall time per named phase, recorded only
+//! at phase boundaries so the overhead is negligible. A run prints the
+//! totals at exit and appends one JSON line to `metrics.jsonl` next to the
+//! checkpoints.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -16,8 +9,8 @@ use std::time::Duration;
 
 static PHASES: Mutex<BTreeMap<&'static str, (u64, u64)>> = Mutex::new(BTreeMap::new());
 
-/// Add `dur` under `name`. Call at phase granularity only (per frame, per
-/// sweep stage) - never inside per-lane or per-instruction loops.
+/// Add `dur` under `name`. Call at phase granularity only, never in
+/// per-lane loops.
 pub fn record(name: &'static str, dur: Duration) {
     let mut phases = PHASES.lock().unwrap();
     let entry = phases.entry(name).or_insert((0, 0));
@@ -36,12 +29,9 @@ fn status_gb(field: &str) -> f64 {
         .map_or(0.0, |kb| kb / 1e6)
 }
 
-/// The process's CURRENT ANONYMOUS resident set (`RssAnon`), in GB: the
-/// heap - what the door, the frontier and the queues occupy, and what a
-/// memory cap is really about. File-backed pages (`current_file_rss_gb`:
-/// the mapped raw edge files, the checkpoints being read) are page cache
-/// the kernel reclaims before it kills anything, and counting them
-/// (`VmRSS`) mistook the compaction's mmaps for heap (2026-09-14).
+/// The process's current ANONYMOUS resident set (`RssAnon`), in GB: the
+/// heap, what a memory cap is about. Not `VmRSS`, which counts mmapped files
+/// the kernel reclaims first.
 pub fn current_rss_gb() -> f64 {
     status_gb("RssAnon:")
 }
@@ -59,12 +49,9 @@ pub fn peak_rss_gb() -> f64 {
 
 /// Print the phase summary and, when `dir` is known, append one JSON line
 /// to `<dir>/metrics.jsonl`: {"kind", "phases": {name: {"s", "calls"}},
-/// "extra": ...}. Failures to write are loud on stderr but never fatal -
-/// metrics must not kill a run that already computed its answer.
+/// "extra": ...}. A write failure is reported, never fatal.
 pub fn dump(kind: &str, dir: Option<&std::path::Path>, extra: &[(&str, String)]) {
-    // Kernel coverage, when a compiled run was in play. Which lanes the
-    // class kernels actually took is the difference between "the compiled
-    // engine is slow" and "the compiled engine barely ran".
+    // Kernel coverage, when a compiled run was in play.
     crate::compiled::dispatch::print_kernel_hits();
     let phases = PHASES.lock().unwrap();
     if phases.is_empty() {

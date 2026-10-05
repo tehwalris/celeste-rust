@@ -1,33 +1,16 @@
-//! INTERVAL folding: decide what the graph computes without knowing any
-//! of its inputs.
+//! INTERVAL folding: decide what the graph computes without knowing its
+//! inputs.
 //!
-//! `transpile::bdd` decides the BOOLEAN layer, and it is blind by
-//! construction to why a comparison is constant: every comparison is an
-//! independent variable, so `0 > abs(x)` is a free variable that could
-//! go either way. It cannot: `abs` is non-negative, so that node is
-//! false for every input there has ever been.
+//! `transpile::bdd` treats every comparison as an independent variable, so
+//! it cannot see that `0 > abs(x)` is always false. This pass runs the
+//! interval evaluator (`Graph::eval`) with every input at TOP (or its known
+//! range), and every node it pins down is a constant, unconditionally.
 //!
-//! `Graph::eval` already knows this - it evaluates over
-//! `Pico8NumInterval` and models `Abs` with its sign case split - and
-//! until now it existed only in tests. This pass is the missing
-//! consumer: run the interval evaluator with every input at TOP, and
-//! every node it pins down is a constant, unconditionally.
-//!
-//! **Why this is exact rather than merely sound.** A node the evaluator
-//! reports as `Bool(Some(b))` under TOP inputs is `b` under every
-//! assignment those inputs admit, because the interval domain is an
-//! over-approximation: the concrete value is always in the abstract one.
-//! Replacing it with the constant therefore changes nothing the graph
-//! computes. It can only IMPROVE the abstract precision downstream,
-//! which is the property that makes it safe where a general
-//! equality-substitution is not (see `bdd`'s "proved and deliberately
-//! not acted on").
-//!
-//! The measurement that motivated it: after the BDD had run on a traced
-//! frame of room (0,0), 1,141 of 2,916 surviving nodes still evaluated
-//! to the same value at all 193 probe points, and the two biggest such
-//! buckets were led by `Gt(Const(0), Abs(..))` and `Le(Const(0),
-//! Abs(..))`.
+//! **Exact, not merely sound.** The interval domain over-approximates, so a
+//! node evaluated to `Bool(Some(b))` under TOP inputs is `b` under every
+//! assignment. Replacing it changes nothing the graph computes and can only
+//! improve precision downstream (unlike a general equality substitution,
+//! see `bdd`'s "proved and deliberately not acted on").
 
 use std::collections::HashMap;
 
@@ -50,8 +33,6 @@ pub struct Stats {
     pub nums: usize,
 }
 
-/// Which cells hold BOOLEANS, by where they are used.
-///
 /// Every node the interval evaluator can pin down, replaced by that
 /// constant, and the graph rebuilt over the nodes `roots` reach.
 ///
@@ -86,9 +67,7 @@ pub(crate) fn seed_cells(g: &Graph, ranges: &HashMap<u32, (i32, i32)>) -> HashMa
 }
 
 /// `fold` with input cells `ranges` known to lie in a range (raw,
-/// inclusive) - a region kernel's input ranges (`CELESTE_REGION`). The
-/// evaluator sees the range instead of top, so a comparison or a table
-/// fork's validity the range decides folds to a constant.
+/// inclusive), e.g. a region kernel's input ranges.
 pub fn fold_with(
     g: &Graph,
     roots: &[NodeId],
@@ -100,9 +79,8 @@ pub fn fold_with(
     Ok((out, map, st))
 }
 
-/// `fold_with`, writing into `out` - so what several graphs fold to lands
-/// in one hash-consed arena, and equal results are the same node
-/// (`lower::specialize_frame` groups a fork's values by it).
+/// `fold_with`, writing into `out`: what several graphs fold to lands in one
+/// hash-consed arena, so equal results are the same node.
 pub fn fold_with_into(
     g: &Graph,
     roots: &[NodeId],
@@ -151,8 +129,7 @@ pub fn fold_with_into(
 mod tests {
     use super::*;
 
-    /// The finding that motivated the pass, as a test: `abs` is
-    /// non-negative, so a comparison of it against zero is not a free
+    /// `abs` is non-negative, so a comparison of it against zero is not a free
     /// variable however opaque its operand is.
     #[test]
     fn a_comparison_of_abs_against_zero_is_not_a_free_variable() {
@@ -170,19 +147,9 @@ mod tests {
         assert_eq!(st.bools, 2);
     }
 
-    /// The map IS a constant, so a collision test at a known position is
-    /// decidable - and at an unknown position it genuinely is not.
-    ///
-    /// The second half is the point. This mechanism was built because
-    /// 658 surviving nodes led by `And(.., TileFlagAt(..))` evaluated
-    /// false at all 193 census points, and I expected the cart to
-    /// collapse them. It does not, and the reason is not a weakness of
-    /// the two-sided rectangle test: with the player's position at TOP
-    /// the player could be anywhere, so "is there a wall here" really
-    /// can go either way. Those nodes are constant AROUND ONE STATE, not
-    /// constant. Deciding them needs BOUNDS on the position inputs -
-    /// which is a specialization, and would need the same error a pin
-    /// gets.
+    /// The map is a constant, so a collision test at a known position is
+    /// decidable; at an unknown position it genuinely is not (the player could
+    /// be anywhere). Deciding those needs bounds on the position inputs.
     #[test]
     fn a_collision_test_is_decided_at_a_known_position_and_not_at_an_unknown_one() {
         let cart = std::sync::Arc::new(
@@ -210,10 +177,8 @@ mod tests {
                 _ => None,
             }
         };
-        // Every exact position must be decided, and must agree with the
-        // concrete collision routine. Anything else is a divergence
-        // between the abstract and concrete answers, which is the bug
-        // this mechanism could actually introduce.
+        // Every exact position must be decided and agree with the concrete
+        // collision routine.
         let mut solid_seen = false;
         let mut open_seen = false;
         for y in (0..128).step_by(8) {
@@ -226,8 +191,7 @@ mod tests {
         }
         assert!(solid_seen && open_seen, "the room has both walls and space");
 
-        // An UNKNOWN position is not decidable, and saying so is the
-        // honest answer rather than a missed optimisation.
+        // An UNKNOWN position is not decidable.
         let mut g = Graph::new();
         let cell = g.leaf(Op::Cell(0));
         let n = |g: &mut Graph, v: i16| {
@@ -241,16 +205,10 @@ mod tests {
         assert_eq!(out.get(map[t as usize]).op, Op::TileFlagAt, "unknown stays unknown");
     }
 
-    /// A collision test with ONE coordinate at TOP is decided false only
-    /// where no position along that axis is solid, in every level room.
-    ///
-    /// The fold used to cap the derived rectangle's corner and size apart:
-    /// at TOP that is the rectangle [-4096, 0), tile row (column) 0 only,
-    /// so the test read "nothing solid" wherever row 0 was open at that
-    /// column. Room (0,2)'s spawn frame traces the new player at a TOP
-    /// `y` (the spawn's), and its `is_solid(0, 1)` at x = 16 folded to
-    /// false over tile (2, 0): the kernels put the player in the air on
-    /// the ground and the room's witness was lost (2026-10-01).
+    /// A collision test with ONE coordinate at TOP is decided false only where
+    /// no position along that axis is solid, in every level room. (Capping the
+    /// derived rectangle's corner and size apart once read TOP as tile row 0
+    /// only and put a spawning player in the air on the ground.)
     #[test]
     fn a_collision_test_at_a_top_coordinate_folds_only_to_what_every_position_gives() {
         let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
@@ -301,8 +259,8 @@ mod tests {
         assert!(decided > 0 && decided < checked, "{decided} of {checked} decided");
     }
 
-    /// A node it CANNOT model must not be decided, and must not poison
-    /// the nodes that do not depend on it.
+    /// A node it cannot model must not be decided, and must not poison the
+    /// nodes that do not depend on it.
     #[test]
     fn an_unmodelled_op_becomes_top_rather_than_an_error() {
         let mut g = Graph::new();
@@ -319,13 +277,10 @@ mod tests {
         assert_eq!(out.get(map[both as usize]).op, Op::TileFlagAt);
     }
 
-    /// Fork validity is a per-LANE fact, and the interval pass sees a
-    /// hull over every lane. A hull that spans many floors contains lanes
-    /// that span exactly two, so `FragOk(1)` must stay undecided there -
-    /// deciding it false from the hull deleted every fragment-1 path from
-    /// the flat-fork kernels' `live` and lost 38 rows at room (1,0)'s
-    /// first straddle (2026-08-25). A hull inside ONE floor is the one
-    /// case that decides it: no lane in it can straddle.
+    /// Fork validity is a per-LANE fact, and the interval pass sees a hull over
+    /// every lane. A hull spanning many floors contains lanes that span exactly
+    /// two, so `FragOk(1)` must stay undecided there (deciding it false loses
+    /// rows). A hull inside ONE floor decides it: no lane can straddle.
     #[test]
     fn fragment_validity_is_not_decided_from_a_wide_hull() {
         let mut g = Graph::new();
@@ -346,11 +301,9 @@ mod tests {
         assert_eq!(out.get(map[ok1 as usize]).op, Op::ConstBool(false));
     }
 
-    /// `Known` is a per-lane fact too: a hull that spans several floors
-    /// contains lanes whose floor IS decided, so `Known(Flr(hull))` must
-    /// stay undecided under the interval pass, not fold to false. This is
-    /// the boundary's one-bucket premise at the finer rungs; folding it to
-    /// false refused every lane (2026-09-13).
+    /// `Known` is a per-lane fact too: a hull spanning several floors contains
+    /// lanes whose floor IS decided, so `Known(Flr(hull))` must stay undecided,
+    /// not fold to false (which refuses every lane).
     #[test]
     fn known_of_a_wide_hull_is_undecided() {
         let mut g = Graph::new();
@@ -369,9 +322,7 @@ mod tests {
         assert_eq!(out.get(map[known as usize]).op, Op::ConstBool(true));
     }
 
-    /// Folding must not change what the graph computes. Sampled, because
-    /// the property is universal quantification over inputs and the
-    /// point of the pass is that it holds at all of them.
+    /// Folding must not change what the graph computes (sampled).
     #[test]
     fn folding_does_not_change_what_the_graph_computes() {
         let mut g = Graph::new();

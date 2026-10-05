@@ -1,11 +1,7 @@
-//! A PROTOTYPE native AVX-512 assembly backend for the row-key hashing
-//! slice of a traced kernel graph (`plans/asm-backend.md`).
-//!
-//! This is ALONGSIDE the production Rust emitter (`super::lower`), not a
-//! replacement: it exists to measure the compile-time and runtime cost of
-//! emitting AVX-512 directly (assembled with `as`, loaded with `dlopen`)
-//! against the graph -> Rust -> rustc+LLVM path. It is not wired into any
-//! kernel; `super::tests` is its correctness gate.
+//! The AVX-512 assembly backend: a traced kernel graph is compiled to GAS
+//! text (`codegen`), assembled with gcc and loaded with `dlopen` (`jit`).
+//! Ops it does not vectorise inline go through call-outs (`callout`).
+//! `tests` checks every op bit-exact against the Rust lane primitives.
 
 mod callout;
 mod codegen;
@@ -55,10 +51,8 @@ pub fn compile_and_load_reprs(
             t_asm.as_secs_f64()
         );
     }
-    // `CELESTE_ASM_STATS`: per kernel, the instructions and how many of them
-    // are stack traffic - the measure codegen changes are judged by (a big
-    // kernel's reloads miss the caches: room (3,0), 0.12 instructions per
-    // cycle, 2026-09-18).
+    // `CELESTE_ASM_STATS`: per kernel, the instruction count and the share of
+    // stack traffic (a big kernel's reloads miss the caches).
     if std::env::var_os("CELESTE_ASM_STATS").is_some() {
         let (mut insts, mut reloads, mut spills) = (0usize, 0usize, 0usize);
         for line in compiled.asm.lines() {
@@ -92,8 +86,8 @@ pub fn compile_and_load_reprs(
             count(RootKind::Bool)
         );
     }
-    // The assembly TEXT is only the assembler's input: dropped once the .so
-    // is loaded (room (2,0)'s 17 kernel sets held ~8 GB of it).
+    // The assembly text is only the assembler's input: drop it once loaded
+    // (it is GBs across a room's kernel sets).
     compiled.asm = String::new();
     Ok((compiled, loaded))
 }

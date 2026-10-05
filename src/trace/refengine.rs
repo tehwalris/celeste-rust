@@ -1,8 +1,7 @@
 //! `RefEngine`: the reference interpreter (`Interp<RefDomain>`) as a frame
-//! step on blocks. One lane in (`refbridge::from_block`), every fork leaf of
-//! its frame out as a keyed one-row block (`refbridge::to_block`,
-//! `Block::keyed`), so a reference successor keys like a kernel row. Slow by
-//! design (one lane, one path at a time): callers that run it wide sample.
+//! step on blocks. One lane in, every fork leaf out as a keyed one-row block,
+//! so a reference successor keys like a kernel row. Slow by design (one lane,
+//! one path at a time).
 
 use anyhow::{ensure, Result};
 use std::sync::Arc;
@@ -23,13 +22,11 @@ use crate::trace::verify::run_one;
 
 pub struct RefEngine {
     it: Interp<'static, RefDomain>,
-    /// `__reset_button_states();_update();_draw()`: the six buttons are
-    /// forks like any other.
+    /// `__reset_button_states();_update();_draw()`: the buttons are forks.
     body: &'static ast::Ast,
     /// `_update();_draw()` with no reset: the caller has set the buttons.
     body_concrete: &'static ast::Ast,
-    /// The post-`_init` state: the room's start, and the builtins a block
-    /// does not carry.
+    /// The post-`_init` state: the room's start, and what a block does not carry.
     base: State<RefDomain>,
     fn_info: FnInfo,
 }
@@ -40,8 +37,7 @@ pub struct RefEngine {
 unsafe impl Send for RefEngine {}
 
 impl RefEngine {
-    /// Parse the cart, run its toplevel and `_init` for the configured start
-    /// room.
+    /// Parse the cart, run its toplevel and `_init` for the start room.
     pub fn new() -> Result<Self> {
         let leak = |src: &str| -> Result<&'static ast::Ast> { Ok(Box::leak(Box::new(full_moon::parse(src)?))) };
         let top = leak(&crate::trace::cart::sources()?)?;
@@ -69,13 +65,11 @@ impl RefEngine {
     }
 
     /// One CONCRETE frame of row 0 of `row` under input `byte`: every leaf,
-    /// keyed at the current level. A concrete input forks only where the
-    /// cart reads a value no input decides (`rnd`); unknown fields of the row
-    /// are read as their placeholder, not forked.
+    /// keyed. It forks only where no input decides (`rnd`); unknown fields of
+    /// the row are read as their placeholder, not forked.
     pub fn step(&mut self, row: &Rt2, byte: u8) -> Result<Vec<Block>> {
         let (mut st, _) = from_block(row, 0, &self.fn_info, &self.base)?;
         set_buttons(&mut st, byte)?;
-        // Concrete: exact, whatever level the search has set.
         let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT)?;
         leaves.iter().map(|l| Block::keyed(to_block(l)?)).collect()
     }
@@ -96,9 +90,8 @@ impl RefEngine {
     }
 }
 
-/// The interpreter as the trusted `FrameStep` (interface #1), behind a lock:
-/// the `Interp` is reused across lanes and paths. Each fork leaf is one
-/// single-lane row, emitted with its source lane's cell as the kernels do.
+/// The interpreter as the trusted `FrameStep`, behind a lock (the `Interp` is
+/// reused). Each fork leaf is one row, emitted with its source lane's cell.
 impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
     fn run(
         &self,

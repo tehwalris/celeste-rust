@@ -1,24 +1,13 @@
-//! Runtime AVX-512 kernels: retrace the start room at startup, assemble the
-//! FUSED graph of each shape, and dispatch chunks to it - the replacement
-//! for the generated Rust kernel crates.
+//! Runtime AVX-512 kernels: retrace the start room at startup
+//! (`trace::kernel::lattice_kernel_refs`), assemble each (shape, region)'s
+//! fused, fork-free graph (`transpile::asm::compile_and_load_reprs`), and
+//! dispatch chunks to it. The search is single-room, so only the start
+//! room's shapes are built.
 //!
-//! The search is single-room (an exited-room lane is absorbing, and
-//! `Dispatch` refuses cross-room shape collisions), so a process only ever
-//! dispatches `start_room()`'s shapes. So the registry retraces just the
-//! start room (`trace::kernel::room_kernels_in`), turns each shape's fused,
-//! fork-free graph (`trace::emit::asm_fused` -> `lower::specialize_frame`)
-//! into one assembly kernel (`transpile::asm::compile_and_load_reprs`), and
-//! keys them by `shape_hash`. No checked-in artifact and no multi-room
-//! retrace: the compile-time win is that `gcc` assembles the graph in
-//! milliseconds where rustc+LLVM took minutes over ~900k lines.
-//!
-//! The compute is the SAME fused graph the Rust kernel is emitted from; the
-//! append here is the generic runtime equivalent of the generated
-//! `acc{i}`/`append{i}`: clone the per-outcome template block, push each
-//! `live & !error` lane's ASM-computed field values into it, and let
-//! `Rt2::boundary` recompute the row keys (its `boundary_finish` folds the
-//! cell contents into the exact same key the generated kernel precomputed)
-//! and dedup. See plans/asm-and-posgraph-execution.md.
+//! The APPEND step emits each `live & !error` lane straight at the boundary:
+//! canonical structure (the outcome's template), its row key folded here
+//! exactly as `Rt2::boundary_finish` would (`CELESTE_KERNEL_KEY_CHECK=1`
+//! checks that), its pos-graph edge and its transfer.
 
 use std::collections::HashMap;
 use std::os::raw::c_void;
@@ -34,22 +23,17 @@ use celeste_engine::slots::reshape;
 use crate::transpile::asm::{AsmCtx, CellRepr, CollisionEnv, Compiled, Loaded, RootKind};
 use crate::transpile::graph::Room;
 
-/// One output field of a body: which output cell it writes, the flat root
-/// slot the assembly wrote it to, and how to read that slot. Which fields
-/// enter the per-row key is decided at build (`build_one_shape`): a per-row
-/// column (`konst_av` = None) that the boundary does not widen to uniform
-/// (`widen_uniform` = None); the rest are in the outcome's `part`. Every
-/// non-konst field is still PUSHED (`push_field` no-ops on the konst
-/// `Col::U` cells).
+/// One output field of a body: which output cell it writes, where the
+/// assembly wrote it, and how to read that slot.
 struct AsmField {
     cell: usize,
     /// The root's byte offset in the output buffer (`Compiled::root_offsets`).
     off: usize,
     kind: RootKind,
-    /// A boolean root an output widening may write UNKNOWN in some lanes (it
-    /// reads the canonical output unknown, `Symbolic::unknown_bool_output`: a
-    /// near level's floor `collideable`). Any other undecided boolean is a
-    /// branch on an unknown that no premise declined, and fatal (`push_row`).
+    /// A boolean root an output widening may write UNKNOWN (it reads the
+    /// canonical output unknown, `Symbolic::unknown_bool_output`). Any other
+    /// undecided boolean is a branch on an unknown no premise declined, and
+    /// fatal (`push_row`).
     may_unknown: bool,
 }
 
@@ -67,14 +51,12 @@ struct AsmBody {
     /// root_offsets`).
     error_off: usize,
     live_off: usize,
-    /// The fields the row key folds (`key_words`): the body's varying ones -
-    /// a per-row column the boundary does not widen to uniform.
+    /// The fields the row key folds (`key_words`): per-row columns the
+    /// boundary does not widen to uniform; the rest are in the template's
+    /// `part`.
     key_fields: Vec<KeyField>,
-    /// Where an emitted row's player x, player y, room x, room y come from
-    /// (`search::pos_graph::block_cells`' inputs), so the append step can
-    /// compute the row's position cell straight off the output buffer.
-    /// `None`: this outcome has no player object, or its `x`/`y` is not a
-    /// plain number (every row is `NO_CELL`, as `block_cells` says).
+    /// Where an emitted row's player x, player y, room x, room y come from,
+    /// to compute its position cell off the output buffer (`pos_sources`).
     pos: Option<[PosSrc; 4]>,
     /// The transfer roots (`search::arc_edges`).
     arc: ArcSlots,
@@ -117,15 +99,12 @@ impl ArcSlots {
     }
 }
 
-/// One field of a body's row key: its cell, the byte offset it is read from,
-/// and how its slot is read. A number and the point interval `[v, v]` key alike (`runtime2::av_code`),
-/// so a number root keys the same whether its column stores it as a number
-/// or, typed by the shape's union, as `[v, v]`.
+/// One field of a body's row key. A number and the point interval `[v, v]`
+/// key alike (`runtime2::av_code`), so a number root keys the same whether
+/// the shape's union stores it as a number or as `[v, v]`.
 ///
 /// Specialized at build time: `c` is `seed ^ cell * CELL_K` per half, and
-/// `read` reads the slot straight into `runtime2::av_code`'s code - no `AV`
-/// is built per row (the fold was ~16% of a big frame's cycles through
-/// `read_root_av` and `av_code`, 2026-09-18).
+/// `read` produces `runtime2::av_code`'s code without building an `AV`.
 struct KeyField {
     c: [u64; 2],
     root: usize,
@@ -176,7 +155,7 @@ impl KeyField {
 impl AsmBody {
     /// Row `i`'s `(h1, h2)`: `Σ cell_mix` over the key fields, per half.
     /// `mix64(part + h)` is the boundary's key exactly (`acc_template`
-    /// computes `part`; `check_against_boundary` gates it).
+    /// computes `part`; `key_check` gates it).
     #[inline]
     fn key_words(&self, buf: &[u8], i: usize) -> (u64, u64) {
         use celeste_engine::runtime2::mix64;
@@ -209,30 +188,24 @@ enum ColInit {
 }
 
 /// A per-outcome accumulator recipe: an empty structural skeleton plus the
-/// column initializers, so a fresh acc is `reshape` + apply - and the
-/// boundary's per-outcome constants, so the append step can hand back a
-/// block that IS at the boundary (canonical structure, exact row keys)
-/// without running `Rt2::boundary` over it.
+/// column initializers, and the boundary's per-outcome constants, so the
+/// append step emits rows already at the boundary.
 struct AccTemplate {
     skeleton: Rt2,
     inits: Vec<(usize, ColInit)>,
     /// The skeleton's canonical structure hash - the block's shape key.
     shape_hash: u64,
     /// The boundary key's uniform part `(part1, part2)`
-    /// (`Rt2::boundary_finish`): the shape hash plus every cell that is
-    /// uniform AT THE BOUNDARY - pointers, nils, konst outputs, UBool
-    /// cells, and the level-0 widened-to-uniform cells (rem, timers) at
-    /// their WIDENED value. A row's key is `mix64(part + h)` with `h` the
-    /// per-row fold over the remaining (varying) fields.
+    /// (`Rt2::boundary_finish`): the shape hash plus every cell uniform AT
+    /// THE BOUNDARY, widened cells at their WIDENED value. A row's key is
+    /// `mix64(part + h)` with `h` the per-row fold over the varying fields.
     part: (u64, u64),
-    /// This outcome's own skeleton (`build()`), kept for the uniform
-    /// writes: cells this outcome holds uniform that the shape's union
-    /// makes typed.
+    /// This outcome's own skeleton (`build()`), for the cells it holds
+    /// uniform that the shape's union makes typed.
     own: Rt2,
-    /// The SHAPE's skeleton: the union over every outcome of this shape
-    /// in the registry of the cells any of them varies (plans/waves.md,
-    /// invariant 3). Every queue and piece of the shape has these columns,
-    /// so a flush appends column for column. Set by `Registry::unify`.
+    /// The SHAPE's skeleton: typed wherever any outcome of the shape in the
+    /// registry varies a cell. Every queue and piece of the shape has these
+    /// columns, so a flush appends column for column. Set by `unify`.
     union: std::sync::Arc<Rt2>,
 }
 
@@ -261,12 +234,10 @@ thread_local! {
     static THREAD_STACK: std::cell::Cell<usize> = const { std::cell::Cell::new(DEFAULT_THREAD_STACK) };
 }
 
-/// Record this thread's stack size. Every kernel call checks that its spill
-/// frame fits (`Compiled::frame_bytes`): a kernel whose frame outgrew the
-/// forward workers' stack touched past it and segfaulted (room (3,0) with the
-/// fruit and the floors unknown, an 83 MB frame on a 64 MB stack, 2026-09-18).
-/// Call it first thing in a thread spawned with `stack_size(bytes)` that runs
-/// kernels.
+/// Record this thread's stack size, so every kernel call can check that its
+/// spill frame (`Compiled::frame_bytes`) fits instead of overrunning the
+/// stack. Call it first thing in a thread spawned with `stack_size(bytes)`
+/// that runs kernels.
 pub fn set_thread_stack(bytes: usize) {
     THREAD_STACK.with(|s| s.set(bytes));
 }
@@ -282,16 +253,14 @@ struct AsmKernel {
     compiled: Compiled,
     bodies: Vec<AsmBody>,
     acc_templates: Vec<AccTemplate>,
-    /// The traced frame's fork count (`Frame::forks`): binary splits the
-    /// bodies enumerate.
+    /// The traced frame's fork count (`Frame::forks`).
     forks: u8,
     /// Per body: where its output roots (and its outcome's uniform cells)
     /// go in the shape's union columns. Built by `Registry::unify`.
     body_cols: Vec<BodyCols>,
-    /// The fused graph + its flat roots + the room, what a decline's
-    /// explanation evaluates (`explain_error`). KEPT ONLY under
-    /// `kernel_graph_kept()`: otherwise empty, since every kernel set holding
-    /// its graphs was gigabytes for nothing (2026-09-18).
+    /// The fused graph, its flat roots and the room, for `explain_error`.
+    /// Kept only under `kernel_graph_kept()` (otherwise empty: gigabytes per
+    /// set).
     fused: crate::transpile::graph::Graph,
     flat_roots: Vec<crate::transpile::graph::NodeId>,
     room: Room,
@@ -305,10 +274,9 @@ struct AsmKernel {
 impl AsmKernel {
     /// Run lanes `lanes` of one block. Per 16-lane slice: pack inputs, call
     /// the assembly, and for each body push its `live & !error` lanes into
-    /// the sink's slot for (owner, outcome shape) - keyed, at the boundary,
-    /// with the pos-graph edge recorded - or, in backward mode, mark the
-    /// input rows whose outputs hit a target. A nonzero `live & error`
-    /// (declined) fails the whole call (a coverage gap).
+    /// the sink's queue for (outcome shape, cell) - keyed, at the boundary,
+    /// with their edges recorded. A nonzero `live & error` (declined) fails
+    /// the whole call (a coverage gap).
     fn run(
         &self,
         chunk: &Rt2,
@@ -319,22 +287,15 @@ impl AsmKernel {
         debug_assert_eq!(cell_in.len(), chunk.width, "one input cell per input row");
         debug_assert!(lanes.end <= chunk.width);
         CALL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Within-call dedup (`ForwardSink::seen`, a `RowCache`): the fused
-        // graph's configurations re-emit the same row from neighbouring
-        // lanes ~8x over; the cache catches those (keyed by the row key,
-        // which is unique across outcomes) and the owner's door catches
-        // the rest. It lives in the sink because the flush writes each
-        // row's id back into it (the edges).
+        // Within-call dedup (`ForwardSink::seen`; the door catches the rest).
+        // In the sink because the flush writes each row's id back into it.
         sink.seen.clear();
         let mut lo = lanes.start;
         let mut idx = [0usize; 16];
         while lo < lanes.end {
             // A slice never crosses a 64-lane id group: its predecessor
-            // records are (the group's first id, a bit per lane). A bucket
-            // dispatch's run of one speed key starts at any lane, and a
-            // 16-lane slice from lane 60 recorded lanes 64..75 against
-            // group 0 - edges to the wrong states, a backward that lost
-            // exact marks (2026-09-15).
+            // records are (the group's first id, a bit per lane), and a run
+            // may start at any lane.
             let n = 16.min(lanes.end - lo).min(64 - (lo & 63));
             for (i, l) in idx.iter_mut().enumerate().take(n) {
                 *l = lo + i;
@@ -367,27 +328,22 @@ impl AsmKernel {
         let views = self.input_views(chunk);
         let env = CollisionEnv { cart: &chunk.cart, cache: &chunk.cache };
         let ctx = AsmCtx::new(&env as *const CollisionEnv as *const c_void);
-        // The call's scratch - buffers, the per-outcome staging, the dedup
-        // cache - lives with the thread and is reused call after call
-        // (`Scratch::take`); a fresh multi-megabyte allocation per unit
-        // was a page fault per page.
+        // The buffers live with the thread and are reused call after call
+        // (`Scratch::take`): a fresh multi-megabyte allocation per unit
+        // faults every page.
         let mut sc = Scratch::take(self);
         let Scratch { inbuf, outbuf, .. } = &mut sc;
         let body_cols = &self.body_cols;
 
         CALL_STATS[1].fetch_add(only.count_ones().min(n as u32) as u64, std::sync::atomic::Ordering::Relaxed);
         CALL_STATS[2].fetch_add(16, std::sync::atomic::Ordering::Relaxed);
-        // The call's utilization tallies (folded into `CALL_STATS` once at
-        // the end): (body, slice) pairs evaluated and those with any taken
-        // lane, lane emissions before and after the dedup cache.
+        // Utilization tallies, folded into `CALL_STATS[3..]` at the end.
         let (mut n_bodies, mut n_bodies_taken, mut n_lanes, mut n_unique) = (0u64, 0u64, 0u64, 0u64);
         {
             let lo = lanes[0];
-            // The slice's predecessor GROUP: 64 consecutive input lanes
-            // (ids are consecutive within a block, units start at
-            // multiples of 64), so a state's producers from four adjacent
-            // slices share one record. Lane `i` of the slice is lane
-            // `lanes[i] & 63` of the group.
+            // The slice's predecessor GROUP: 64 consecutive input lanes (ids
+            // are consecutive within a block); slice lane `i` is group lane
+            // `lanes[i] & 63`.
             let slice_base: Option<u64> = sink.ids_in.map(|ids| ids[lo & !63]);
             let glane = |i: usize| lanes[i] & 63;
             let skip: u16 = match sink.skip_in {
@@ -414,21 +370,14 @@ impl AsmKernel {
             }
             let valid = (((1u32 << n) - 1) as u16) & only;
             for (body, cols) in self.bodies.iter().zip(body_cols) {
-                // `error`/`live` are tri-state ZB masks, read with ONE
-                // polarity (plans/graph-model.md section 5): each where it
-                // MAY hold. An unknown `live` reads as live (the row's hull
-                // over-approximates, the concrete search refutes); an unknown
-                // `error` reads as error, so a lane the trace failed to
-                // fork or decide declines loudly instead of producing a row
-                // from the garbage `val` bit.
+                // `error`/`live` are tri-state masks, each read where it MAY
+                // hold (`read_zb_may`).
                 let error = read_zb_may(outbuf, body.error_off);
                 let live = read_zb_may(outbuf, body.live_off);
                 if live & error & valid != 0 {
                     // Declined: a live lane the kernel could not keep (or
-                    // could not DECIDE). A coverage gap for the whole call -
-                    // fatal in the caller, so say what was declined: the
-                    // body's outcome and the lanes' player rem / spd (the
-                    // interval slots the rungs fork on).
+                    // decide). Fatal in the caller, so say what was declined:
+                    // the body's outcome and the lanes' player rem / spd.
                     let declined = live & error & valid;
                     let ids = crate::compiled::ids();
                     let mut rows = String::new();
@@ -476,8 +425,6 @@ impl AsmKernel {
                 while take != 0 {
                     let i = take.trailing_zeros() as usize;
                     take &= take - 1;
-                    // The row's (h1,h2) fold over the varying, non-widened
-                    // cells.
                     let (h1, h2) = body.key_words(outbuf, i);
                     let part = template.part;
                     let key = (
@@ -486,28 +433,20 @@ impl AsmKernel {
                     );
                     let cin = cell_in[lanes[i]];
                     // THE TRANSFER (`search::arc_edges`): per producer,
-                    // carried by the edge, never in the row.
-                    // (Read only where the slice has ids, `slice_base`.)
+                    // carried by the edge, never in the row; only where the
+                    // slice has ids.
                     let xfer = match slice_base {
                         Some(_) => sink.xfer_id(body.arc.transfer(outbuf, i, chunk, lanes[i], body.outcome)),
                         None => 0,
                     };
-                    // EMISSION-TIME PROVENANCE (plans/buckets.md). The
-                    // source of this row is lane `i` of this slice, and
-                    // everything that needs to know is told right here:
-                    // the pos-graph edge and THE EDGE (plans/waves.md, the
-                    // explicit graph): the input rows are lanes `lo..lo+n`,
-                    // consecutive ids from `slice_base`, and a queued row
-                    // carries a 16-bit mask of the lanes that produced it,
-                    // reached through the cache's row ref.
+                    // EMISSION-TIME PROVENANCE: the row's source is lane `i`,
+                    // so its pos-graph edge and its backward edge (a queued
+                    // row's mask of producing lanes, reached through the
+                    // cache's row ref) are recorded right here.
                     if let Some((first_cin, r)) = sink.seen.insert_ref(key, cin, 0) {
-                        // A re-emission of a row this call already produced.
-                        // Nothing to push - but if it came from a DIFFERENT
-                        // input cell, that is a pos-graph edge the first
-                        // emission did not record - and this lane is one
-                        // more predecessor of it: onto the queued row's
-                        // mask, or straight to a record if the row was
-                        // flushed (its id is in the cache then).
+                        // A re-emission: maybe a new pos-graph edge, and one
+                        // more predecessor (onto the queued row's mask, or a
+                        // direct record if it was flushed).
                         if sink.edges_on && first_cin != cin {
                             sink.edges.insert((cin, cell_out(body, outbuf, i)));
                         }
@@ -517,9 +456,9 @@ impl AsmKernel {
                                 continue;
                             }
                             Some(_) if r & RowCache::DROP_FLAG != 0 => continue,
-                            // The row was flushed (a stale ref, only if
-                            // the cache lost the flush's write-back): push
-                            // it again; the flush merges duplicates by key.
+                            // A stale ref (the cache lost the flush's
+                            // write-back): push it again; the flush merges
+                            // duplicates by key.
                             Some(b) if !sink.mark_pred(r, b, xfer, glane(i)) => {}
                             Some(_) => continue,
                             None => continue,
@@ -533,8 +472,7 @@ impl AsmKernel {
                         sink.edges.insert((cin, cout));
                     }
                     // The queue for (shape, cell), over the shape's union
-                    // skeleton: the run cache makes this one compare for a
-                    // run of rows at one cell.
+                    // skeleton.
                     let q = sink.queue(template.shape_hash, cout, || (*template.union).clone_block());
                     cols.push_row(&mut sink.slots[q], outbuf, i, key, cout);
                     if let Some(b) = slice_base {
@@ -598,9 +536,8 @@ impl AsmKernel {
                     .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
                     .collect();
                 eprintln!("[kernel]   error disjunct {} {:?} = {:?}; args {}", n, node.op, vals[n as usize], args.join(", "));
-                // The undecided CONDITION behind it: follow Sels through
-                // their known conditions (and a comparison's Sel operands)
-                // to the first condition the lane cannot decide.
+                // The undecided CONDITION behind it: follow Sels to the
+                // first condition the lane cannot decide.
                 let mut cur = n;
                 for _ in 0..12 {
                     let nd = self.fused.get(cur);
@@ -638,11 +575,9 @@ impl AsmKernel {
                         None => break,
                     }
                 }
-                // The FAILING premise: follow a false conjunct through the
-                // strict merges (`And(Known(c), Sel(c, ok_a, ok_b))`) - an
-                // And into its false children, a decided Sel into its taken
-                // arm, an Or into every child - to the leaves that are
-                // decided false, which name the premise the lane fails.
+                // The FAILING premise: follow false conjuncts through the
+                // strict merges (`And(Known(c), Sel(c, ok_a, ok_b))`) to the
+                // leaves decided false.
                 let mut stack = vec![n];
                 let mut walked = std::collections::HashSet::new();
                 let mut leaves = 0;
@@ -662,9 +597,7 @@ impl AsmKernel {
                             leaves += 1;
                             let args: Vec<String> = nd.args.iter().map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize])).collect();
                             eprintln!("[kernel]     failing premise {} {:?} = {:?}; args {}", x, nd.op, vals[x as usize], args.join(", "));
-                            // A `Known` premise fails on an undecided
-                            // condition: its undecided operands, down to the
-                            // comparisons the lane cannot decide.
+                            // A `Known` premise: its undecided operands.
                             if matches!(nd.op, Op::Known) {
                                 let mut todo = vec![(nd.args[0], 0usize)];
                                 let mut shown = std::collections::HashSet::new();
@@ -685,9 +618,7 @@ impl AsmKernel {
         }
     }
 
-    /// The input columns of `chunk` as slices, resolved once per call:
-    /// packing a slice is then a copy per field, not a `col.at()` match
-    /// per value.
+    /// The input columns of `chunk` as slices, resolved once per call.
     fn input_views<'c>(&self, chunk: &'c Rt2) -> Vec<InputView<'c>> {
         self.compiled
             .input_cells
@@ -701,10 +632,9 @@ impl AsmKernel {
             .collect()
     }
 
-    /// Pack lanes `[lo, lo+16)` into `buf` from the resolved `views`. Tail
-    /// lanes past `n` clamp to the last valid lane, so the assembly's
-    /// per-lane call-outs (div/mget/...) never fault on garbage - the `take`
-    /// mask discards those lanes anyway.
+    /// Pack `lanes` into `buf` from the resolved `views`. Tail lanes past
+    /// `n` repeat the last valid lane, so the per-lane call-outs never see
+    /// garbage (the `take` mask discards them).
     fn pack_input(&self, views: &[InputView], lanes: &[usize], buf: &mut [u8]) {
         let n = lanes.len();
         for (view, &off) in views.iter().zip(&self.compiled.input_offsets) {
@@ -778,8 +708,7 @@ impl AsmKernel {
                     buf[off + 2..off + 4].copy_from_slice(&known.to_le_bytes());
                 }
                 InputView::Any(col, repr) => {
-                    // The general case (a materialized `AV` column feeding a
-                    // numeric input): per value, as before.
+                    // The general case: a materialized `AV` column, per value.
                     for l in 0..16 {
                         let v = col.at(lane(l));
                         match repr {
@@ -803,8 +732,7 @@ impl AsmKernel {
 }
 
 /// A thread's reusable scratch for one kernel: the packed input and the
-/// output buffer. Kept per (thread, kernel) across calls so no unit
-/// allocates them afresh.
+/// output buffer, kept per (thread, kernel) across calls.
 struct Scratch {
     kernel: usize,
     inbuf: Vec<u8>,
@@ -838,10 +766,8 @@ impl Scratch {
     }
 }
 
-/// A body's output roots, grouped by kind, each paired with the index of
-/// its queue column (`Slot::cols`, the shape's union skeleton) - plus the
-/// union columns this body's outcome holds UNIFORM, with the value to
-/// write per row.
+/// A body's output roots by kind, each with its union column index, plus
+/// the union columns its outcome holds UNIFORM and the value to write.
 struct BodyCols {
     num: Vec<(usize, usize)>,
     ival: Vec<(usize, usize)>,
@@ -861,10 +787,8 @@ impl BodyCols {
         let (mut num, mut ival, mut num_as_ival, mut bool_) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut written = vec![false; proto.cols.len()];
         for f in &body.fields {
-            // A field whose output column the union makes uniform (a
-            // widened-to-uniform cell in every outcome of the shape, e.g.
-            // level 0's `rem`) is computed by the kernel but not stored:
-            // the column already holds the widened value.
+            // A field the union holds uniform (widened in every outcome of
+            // the shape, e.g. `rem`) is computed but not stored.
             let Some(ci) = proto.cols.iter().position(|(cell, _)| *cell == f.cell) else {
                 continue;
             };
@@ -891,9 +815,7 @@ impl BodyCols {
                 (TCol::Ival(_), AV::Num(n)) => uniform_ival.push((ci, (n.as_raw_u32(), n.as_raw_u32()))),
                 (TCol::Bool(_), AV::Bool(x)) => uniform_bool.push((ci, *x as u8)),
                 // The canonical output unknown an output widening writes
-                // (`TCol::Bool`'s 2): a near level's floor `collideable` is
-                // unknown in the outcomes where the player is statically far
-                // from the floor, and per lane in the others.
+                // (`TCol::Bool`'s 2).
                 (TCol::Bool(_), AV::UBool) => uniform_bool.push((ci, 2)),
                 (_, v) => anyhow::bail!("union column at cell {cell}: the outcome's uniform {v:?} does not fit its kind"),
             }
@@ -927,10 +849,9 @@ impl BodyCols {
                 let val = u16::from_le_bytes([buf[root], buf[root + 1]]);
                 let known = u16::from_le_bytes([buf[root + 2], buf[root + 3]]);
                 if known >> i & 1 == 0 {
-                    // FATAL, not a `2`, unless an output widening wrote it
-                    // (`AsmField::may_unknown`): an undecided boolean here
-                    // means a branch on an unknown reached the output without
-                    // its `Known` premise declining the lane.
+                    // FATAL unless an output widening wrote it
+                    // (`AsmField::may_unknown`): otherwise a branch on an
+                    // unknown reached the output without a premise declining.
                     assert!(may_unknown, "emitted row holds an undecided boolean (column {ci}, cell {}, root {root}): no premise declined it", slot.cols[ci].0);
                     v.push(2);
                 } else {
@@ -986,8 +907,7 @@ impl<'c> InputView<'c> {
             (CellRepr::Bool, Col::V(v)) => InputView::Bool(v),
             (CellRepr::Bool, Col::U(v)) => match v {
                 AV::Bool(b) => InputView::BoolU(if *b { 0xffff } else { 0 }),
-                // A kernel reads this cell, and a bool input is DECIDED
-                // (`CellRepr::Bool`): packing an unknown as false would
+                // A bool input is DECIDED: packing an unknown as false would
                 // silently drop the true arm.
                 other => return Err(format!("ASM bool input column holds {other:?}: a kernel reads a boolean the block does not decide")),
             },
@@ -1002,11 +922,9 @@ impl<'c> InputView<'c> {
 }
 
 /// `CELESTE_KERNEL_KEY_CHECK=1`: run the real `Rt2::boundary` over a copy
-/// of an emitted slot block and demand it changes NOTHING - same
-/// structure, same shape hash, same row keys, same width (no within-block
-/// duplicates left for its dedup). This is the gate that the append step's
-/// shortcut is exact; a difference here would silently change what the
-/// search dedups on. A no-op unless the variable is set.
+/// of an emitted slot block and demand it changes nothing (structure, shape
+/// hash, distinct row keys). The gate that the append step's keys are
+/// exact; a difference would silently change what the search dedups on.
 pub(crate) fn key_check(slot: &crate::frame::Slot) {
     if !key_check_on() {
         return;
@@ -1014,12 +932,9 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     let acc = slot.to_rt2();
     let mut b = acc.clone_block();
     b.boundary(&super::boundary_ids());
-    // A queue holds rows from SEVERAL kernel calls (the call's dedup cache
-    // is per call), and the
-    // flush collapses equal keys - so the append step's DISTINCT keys must
-    // be the boundary's, duplicates allowed. Demanding no duplicates fired
-    // on the exact-speed forward that reproduces every pinned gate
-    // (width 56 vs 57, 2026-09-15).
+    // A queue holds rows from SEVERAL kernel calls (the dedup cache is per
+    // call) and the flush collapses equal keys, so compare DISTINCT keys:
+    // duplicates are allowed.
     let mut distinct = acc.row_keys.clone();
     distinct.sort_unstable();
     distinct.dedup();
@@ -1029,8 +944,7 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
         return;
     }
     // Say WHICH rows and cells: each block's first rows, their keys, and the
-    // cells whose values are not the same in every row of the append step's
-    // block (the fields that tell its rows apart).
+    // cells that vary in the append step's block.
     let varying: Vec<usize> = (0..acc.cols.len())
         .filter(|&c| matches!(acc.structure.get(c), Some(celeste_engine::runtime2::Cell2::Val)))
         .filter(|&c| (1..acc.width).any(|i| acc.cols[c].at(i) != acc.cols[c].at(0)))
@@ -1059,8 +973,7 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     );
 }
 
-/// `CELESTE_KERNEL_KEY_CHECK=1`: verify every finished acc against
-/// `Rt2::boundary` (see `check_against_boundary`).
+/// `CELESTE_KERNEL_KEY_CHECK=1` (see `key_check`).
 fn key_check_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_KEY_CHECK").is_some())
@@ -1088,32 +1001,25 @@ fn ival_raw(av: AV) -> (i32, i32) {
     }
 }
 
-/// A tri-state mask read where it MAY hold - `val`, or not known - which
-/// is the one polarity for both of a body's masks (plans/graph-model.md
-/// section 5). `val` at +0, `known` at +2 of the 128-byte slot.
+/// A tri-state mask read where it MAY hold - `val`, or not known - the one
+/// polarity for both of a body's masks. `val` at +0, `known` at +2.
 ///
-/// For `live` it means an UNKNOWN guard reads as live. An unknown guard is
-/// a branch condition on a value the lane holds an INTERVAL of, which the
-/// tracer could not merge away - the two arms have different shapes, or the
-/// merged guard `Or(g & c, g & !c)` is itself unknown where `c` is. The lane
-/// stands for points on both sides, so the body's hull covers some of them:
-/// emitting the row over-approximates (the concrete search refutes the spurious
-/// half), while NOT emitting it loses real successors (room (2,0)'s speed
-/// buckets silently dropped lanes in 813 slices that way, 2026-09-14).
+/// For `live`, an UNKNOWN guard (a branch on an interval the tracer could
+/// not merge away) reads as live: the lane stands for points on both sides,
+/// so emitting over-approximates (sound; the concrete search refutes) while
+/// not emitting would lose real successors.
 ///
-/// For `error` it means an undecided error is a decline: strict.
+/// For `error`, an undecided error is a decline: strict.
 fn read_zb_may(buf: &[u8], off: usize) -> u16 {
     let val = u16::from_le_bytes([buf[off], buf[off + 1]]);
     let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
     val | !known
 }
 
-/// The boundary's row-key mix seeds (see `runtime2::boundary_finish`); the
-/// append folds the same cell_mix so its dedup key equals the boundary's.
+/// The boundary's row-key mix seeds (`runtime2::boundary_finish`).
 use celeste_engine::runtime2::{KEY_SEED1, KEY_SEED2};
 
-/// The `AV` the output root at byte offset `base`, of kind `kind`, holds for
-/// lane `i`.
+/// The `AV` an output root holds for lane `i`.
 #[inline]
 fn read_root_av(base: usize, kind: RootKind, buf: &[u8], i: usize) -> AV {
     match kind {
@@ -1141,12 +1047,10 @@ fn read_root_av(base: usize, kind: RootKind, buf: &[u8], i: usize) -> AV {
 }
 
 
-/// The start room's assembled kernels, keyed by input shape hash, for one
-/// rem-precision mode.
+/// The start room's assembled kernels for one level.
 pub(crate) struct Registry {
-    /// One kernel per input shape - with a region key
-    /// (`trace::kernel::RegionGrid`), per reached (shape, region) - and a row
-    /// with a key that is not here is a coverage gap.
+    /// One kernel per reached (shape, region); a row whose key is not here
+    /// is a coverage gap.
     kernels: HashMap<(u64, Option<Region>), AsmKernel>,
     /// The region grid the set was built on.
     grid: Option<crate::trace::kernel::RegionGrid>,
@@ -1159,10 +1063,8 @@ impl Registry {
         self.kernels.len()
     }
 
-    /// Run `chunk` on the matching kernel; `false` if no kernel binds (a
-    /// miss) or the chunk declined. With a region key the rows come in cell
-    /// order, so in runs of one region, and each run goes to its region's
-    /// kernel as a contiguous range.
+    /// Run `chunk` on the matching kernel; `false` on a miss or a decline.
+    /// Rows come in cell order, so each region's run is one contiguous range.
     pub fn run_chunk(
         &self,
         chunk: &Rt2,
@@ -1173,9 +1075,8 @@ impl Registry {
         if self.grid.is_none() {
             return self.run_key(chunk, None, cell_in, lanes, sink);
         }
-        // A region only where the shape has a PLAYER (`shapes::player_path`,
-        // the walk's rule): a row's cell also locates a `player_spawn`, whose
-        // shape's kernel has no region (room (3,0) f1: the spawn at y=128).
+        // A region only where the shape has a PLAYER (the walk's rule): a
+        // row's cell also locates a `player_spawn`, whose kernel has none.
         let grid = self.grid.filter(|_| !chunk.player_objects(crate::compiled::ids()).is_empty());
         let key_of = |lane: usize| -> Option<Region> { grid.and_then(|g| g.of_cell(cell_in[lane])) };
         let mut lo = lanes.start;
@@ -1204,8 +1105,7 @@ impl Registry {
         match self.kernels.get(&(chunk.shape_hash, key)) {
             Some(k) => k.run(chunk, cell_in, lanes, sink),
             None => {
-                // Diagnose a coverage gap: which (shape, key) has no
-                // assembled kernel. Printed once per distinct one.
+                // A coverage gap, printed once per (shape, key).
                 static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u64, Option<Region>)>>> =
                     std::sync::OnceLock::new();
                 let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -1321,9 +1221,7 @@ fn typed(kind: Kind) -> Col {
 /// two outcomes hold it uniform at different values (Num and Ival unify
 /// to Ival); otherwise it stays uniform at the common value. Then map
 /// every body's roots and its outcome's uniform cells onto the union's
-/// columns (`BodyCols`). The reference engine's rule (every numeric and
-/// boolean cell typed) is the same idea without the registry to narrow
-/// it.
+/// columns (`BodyCols`).
 fn unify(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel>) -> Result<()> {
     let mut unions: HashMap<u64, Rt2> = HashMap::new();
     for kernel in by_shape.values() {
@@ -1370,9 +1268,7 @@ fn unify(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel>) -> Result<()>
     let templates: usize = by_shape.values().map(|k| k.acc_templates.len()).sum();
     let bodies: usize = by_shape.values().map(|k| k.bodies.len()).sum();
     let fused: usize = by_shape.values().map(|k| k.fused_nodes).sum();
-    // Per kernel, largest first: bodies, the traced forks, the forks its bodies
-    // ENUMERATE (a split that differs between two of its bodies), fused nodes,
-    // the spill frame, the region.
+    // Per kernel, largest first, for the build report.
     let mut per_shape: Vec<(usize, u8, usize, usize, String, String, String)> = by_shape
         .iter()
         .map(|((_, key), k)| {
@@ -1413,10 +1309,9 @@ fn apply_union(kernel: &mut AsmKernel, unions: &HashMap<u64, std::sync::Arc<Rt2>
     Ok(())
 }
 
-/// Assemble ONE start-room shape: fuse its graph, gcc + dlopen it, and map
-/// its bodies' roots onto flat slots. Independent per shape, so
-/// `build_for_start_room` runs these in parallel. `tag` distinguishes the
-/// region-keyed kernels of one shape.
+/// Assemble ONE start-room frame: gcc + dlopen its fused graph and map its
+/// bodies' roots onto output slots. `tag` distinguishes the region-keyed
+/// kernels of one shape.
 fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) -> Result<(u64, AsmKernel)> {
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
@@ -1424,19 +1319,10 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
     let (fused, bodies, flat_roots, reprs) =
         crate::trace::emit::asm_fused_from(&r.bound, &r.lowered.spec)
             .with_context(|| format!("fusing shape {si} (hash {shape:#x})"))?;
-    // THE ROW KEY is folded per EMITTED row, in the append step
-    // (`AsmBody::key_words`, over `key_fields`), not in the kernel. In the
-    // kernel every body hashed every lane, and a big kernel's bodies are
-    // mostly not taken on a lane: room (3,0)'s square (6,5), 13,812 bodies,
-    // ~22 rows per lane - the key chains were 40% of its 9.7M instructions and
-    // most of its 9.3 MB spill frame (2026-09-18).
-    // One output SLOT per DISTINCT root node. Bodies share most of their
-    // roots (a fork configuration changes a handful of fields), and the
-    // kernel writes every slot per slice: room (2,0)'s level-0 bucket set
-    // has a 6,369-body shape whose bodies' roots concatenated were ~255k
-    // slots - 32 MB of stores per 16-lane slice, most of them the same
-    // value again (2026-09-14). `slot_of[k]` is the slot of concatenated
-    // root k.
+    // The row key is folded per EMITTED row (`AsmBody::key_words`), not in
+    // the kernel, where every body would hash every lane.
+    // One output SLOT per DISTINCT root node (bodies share most roots);
+    // `slot_of[k]` is the slot of concatenated root k.
     let mut slot_of: Vec<usize> = Vec::with_capacity(flat_roots.len());
     let mut distinct: Vec<crate::transpile::graph::NodeId> = Vec::new();
     {
@@ -1472,8 +1358,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
         }
         out
     };
-    // Map each fused body's roots onto their SLOTS: the bodies' roots
-    // concatenated in order, through `slot_of`.
+    // Each body's roots onto their slots, through `slot_of`.
     let mut off = 0usize;
     let mut asm_bodies = Vec::with_capacity(bodies.len());
     for b in &bodies {
@@ -1502,8 +1387,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
                     return None;
                 }
                 let root = slot_of[off + j];
-                // A number root of an INTERVAL column is stored `[v, v]`
-                // (`BodyCols::num_as_ival`), which keys as the number.
+                // A number stored `[v, v]` keys as the number.
                 Some(KeyField::new(outputs[j].0 as u64, compiled.root_offsets[root] as usize, compiled.root_kinds[root]))
             })
             .collect();
@@ -1564,13 +1448,11 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
     ))
 }
 
-/// Where a body's emitted rows carry their position: the player object's
-/// `x`/`y` and the room's `x`/`y`, each either a numeric output root of the
-/// body or a numeric constant of the outcome's template. `None` when the
-/// outcome has no player object (the death countdown) or its `x`/`y` is
-/// not a plain number - every row is then at `NO_CELL`, the
-/// `pos_graph::block_cells` rule. A non-numeric room coordinate is an
-/// error, as there.
+/// Where a body's emitted rows carry their position: the player's and the
+/// room's `x`/`y`, each a numeric output root or a template constant.
+/// `None` (every row at `NO_CELL`) without a player or with a non-numeric
+/// player position, as `pos_graph::block_cells`; a non-numeric room
+/// coordinate is an error.
 fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]>> {
     let ids = crate::compiled::ids();
     let Some(obj) = crate::search::pos_graph::player_object(template) else {
@@ -1582,9 +1464,8 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]
     // `None` = not a plain number in every row.
     let src_of = |cell: u32| -> Result<Option<PosSrc>> {
         if let Some(f) = fields.iter().find(|f| f.cell == cell as usize) {
-            // An interval root's low lanes sit at the same offset as a
-            // number's; its cell is the low corner
-            // (`pos_graph::whole_i16_col`).
+            // An interval root's low end sits at a number's offset; its
+            // cell is the low corner (`pos_graph::whole_i16_col`).
             return Ok(match f.kind {
                 RootKind::Num | RootKind::Ival => Some(PosSrc::Root(f.off)),
                 _ => None,
@@ -1614,8 +1495,8 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]
     Ok(Some([px, py, rx, ry]))
 }
 
-/// The position cell of lane `i` of a body's output, read straight off the
-/// output buffer. `Pico8Num::whole_part_as_i16` is `raw >> 16`.
+/// The position cell of lane `i` of a body's output, off the output buffer
+/// (`raw >> 16` is `Pico8Num::whole_part_as_i16`).
 #[inline]
 fn cell_out(body: &AsmBody, buf: &[u8], i: usize) -> u32 {
     use crate::search::pos_graph::{cell_of, room_offset, NO_CELL};
@@ -1637,15 +1518,11 @@ fn cell_out(body: &AsmBody, buf: &[u8], i: usize) -> u32 {
     cell_of(px as i32 + ox, py as i32 + oy).unwrap_or_else(|e| panic!("emitted row: {e}"))
 }
 
-/// The accumulator recipe for one outcome: the outcome's structural
-/// template, each output field as a uniform constant (`konst_av`) or an
-/// empty typed column (by `ty`), the UBool cells - and the boundary's
-/// per-outcome constants (`shape_hash`, `part`).
+/// The accumulator recipe for one outcome, with the boundary's per-outcome
+/// constants (`shape_hash`, `part`).
 fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTemplate> {
     let skeleton = reshape(&r.frame.outs[oi].rt2, 0);
-    // The structure must be canonical already: the boundary's renumbering
-    // is a no-op on it. Checked against the one implementation of the rule
-    // rather than trusted.
+    // The structure must be canonical already (checked, not trusted).
     {
         let mut probe = skeleton.clone_block();
         probe.canonicalize_ids();
@@ -1658,11 +1535,8 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
     let mut inits: Vec<(usize, ColInit)> = Vec::new();
     for f in &r.lowered.outs[oi].fields {
         let cell = f.cell as usize;
-        // A boundary-widened-to-uniform cell holds its widened value, whatever
-        // the body computes for it: rem and the timers are constants in the
-        // graph too, the unknown numbers are written `AV::UNum` (`emit::bind`)
-        // - the value its key folds into `part`. The unknown booleans an output
-        // widening writes are no fields (`ubool_cells` below).
+        // A widened-to-uniform cell holds its widened value whatever the body
+        // computes (the value `part` folds).
         if let Some(av) = f.widen_uniform.or(f.konst_av) {
             inits.push((cell, ColInit::Uniform(av)));
         } else {
@@ -1692,11 +1566,8 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
     t.own = t.build();
     t.union = std::sync::Arc::new(t.build());
     // The uniform part of the key, exactly as `boundary_finish` folds it:
-    // every `Cell2::Val` cell that is `Col::U` at the boundary. Non-output
-    // cells are uniform in the skeleton (pointers, nils); konst and UBool
-    // outputs are uniform by `inits`; the level-0 widened cells (rem,
-    // timers) are pushed per row but the boundary replaces them with the
-    // widened uniform value, so they fold in at that value.
+    // every `Cell2::Val` cell that is `Col::U` at the boundary, widened
+    // cells at their widened value.
     let widen = &r.bound.outcomes[oi].widen;
     let empty = t.build();
     let mut part1: u64 = shape_hash;
@@ -1721,9 +1592,9 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
     Ok(t)
 }
 
-/// Kernel call shape: [0] calls, [1] rows offered, [2] slice-lanes executed
-/// (16 per slice, so `[2] - [1]` is the padding). The per-call fixed cost
-/// (accumulators, buffers, seen sets, boundary) is paid once per [0].
+/// Kernel call counters: [0] calls, [1] rows offered, [2] slice-lanes
+/// executed (`[2] - [1]` is padding), [3] (body, slice) evaluations, [4]
+/// those that took a lane, [5] lane emissions, [6] after the dedup cache.
 static CALL_STATS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
@@ -1733,12 +1604,9 @@ pub(crate) fn take_call_stats() -> [u64; 7] {
 }
 
 /// The kernel set of the process-global level, built on first use. ONE set
-/// is resident (a set is ~1.7 GB, room (3,0)): a call at another level drops
-/// it and builds that level's, on a big stack (the retrace's init interpret
-/// recurses deeper than a worker thread's default); concurrent callers wait
-/// for the build. A caller holds its set by `Arc` for the call, so a dropped
-/// set lives on until its last chunk ends. Levels only change between
-/// forwards (the objects ladder runs its levels in order).
+/// is resident (a set can be GBs): a call at another level drops it and
+/// builds that level's; concurrent callers wait for the build. A caller
+/// holds its set by `Arc`, so a dropped set lives until its last chunk ends.
 pub(crate) fn registry() -> Option<std::sync::Arc<Registry>> {
     type Resident = Option<(crate::abstraction::Level, Option<std::sync::Arc<Registry>>)>;
     static SET: std::sync::Mutex<Resident> = std::sync::Mutex::new(None);
@@ -1755,12 +1623,10 @@ pub(crate) fn registry() -> Option<std::sync::Arc<Registry>> {
     }
 }
 
-/// THE KERNEL BUILD'S PURGE DELAY (2026-09-18). `safe-run.sh` has mimalloc
-/// return freed pages at once (`MIMALLOC_PURGE_DELAY=0`, for the search's
-/// resident memory), and under the build's tracer threads those purges were a
-/// third of the room walk, in TLB shootdowns (room (3,0) on an 8 px grid: the
-/// walk 26.0 s, 16.5 s with a 1 s delay). While any kernel set builds, purges
-/// wait a second; the process's own setting is back when the last build ends.
+/// THE KERNEL BUILD'S PURGE DELAY. `safe-run.sh` has mimalloc purge freed
+/// pages at once, which under the build's tracer threads costs a third of
+/// the walk in TLB shootdowns. While any kernel set builds, purges wait a
+/// second; the process's own setting returns when the last build ends.
 struct BuildPurgeDelay;
 
 /// Builds in progress, and the purge delay they found.
@@ -1798,8 +1664,6 @@ impl Drop for BuildPurgeDelay {
             unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, b.1) };
             // And purge what the build freed under the delay: the builder
             // threads have exited, so nothing else runs their delayed purges.
-            // (Not what made a built set big: that was every kernel keeping
-            // its fused graph, `kernel_graph_kept`.)
             unsafe { libmimalloc_sys::mi_collect(true) };
         }
     }
@@ -1823,8 +1687,8 @@ fn build_registry_for_level(level: crate::abstraction::Level) -> Option<Registry
     }
 }
 
-/// Run one chunk through the ASM kernels. `false` = miss or declined (the
-/// caller routes to the reference path).
+/// Run one chunk through the ASM kernels. `false` = miss or declined, which
+/// is fatal in the caller.
 pub(crate) fn run_chunk(
     chunk: &Rt2,
     cell_in: &[u32],

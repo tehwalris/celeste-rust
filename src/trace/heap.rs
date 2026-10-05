@@ -1,24 +1,13 @@
 //! The CONCRETE heap the tracer keeps while the values go symbolic.
 //!
-//! This is the half of the design that makes the whole thing work. Tables,
-//! their fields, their lengths, closure identity and scope structure are
-//! all facts at trace time, so `count(objects)`, `#t`, `obj.hitbox.w` and
-//! `objects[i]` resolve without anything symbolic entering the picture.
-//! What stays symbolic is game DATA - positions, speeds, timers, button
-//! state - and nothing indexes the heap with those.
+//! Tables, fields, lengths, closure identity and scope structure are facts
+//! at trace time; only game DATA (positions, speeds, timers, buttons) is
+//! symbolic, and nothing indexes the heap with it. Where something does,
+//! the tracer REFUSES (`domain::refuse_unknown`) rather than widening.
 //!
-//! Where one does, the tracer REFUSES (`domain::refuse_unknown`) rather
-//! than widening. That is the same stance as everywhere else here: a
-//! transformation we cannot check is worse than no transformation.
-//!
-//! ## Scopes are boxed, always
-//!
-//! Every lexical scope is a heap object and a closure captures it by id,
-//! so writing through an upvalue works without any capture analysis. That
-//! is deliberately the most general thing rather than the cheapest: the
-//! tracer runs at build time over one state, so an extra indirection per
-//! variable read costs nothing anyone will ever measure, while getting
-//! capture semantics subtly wrong would cost a silently wrong graph.
+//! Every lexical scope is a heap object and a closure captures it by id, so
+//! writing through an upvalue needs no capture analysis: the most general
+//! model, chosen over the cheapest because the tracer runs once per shape.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -40,43 +29,14 @@ pub enum Value<D: Domain> {
     Bool(D::Bool),
     Str(Arc<str>),
     Table(TableId),
-    /// A closure. A HEAP OBJECT, like a table, referred to by id.
+    /// A closure: a HEAP OBJECT with identity, referred to by id, so GC
+    /// collects it and `shape`'s canonical BFS renumbers it.
     ///
-    /// Not `{ body, env }` inline, which is what this was: a closure has
-    /// an identity of its own, and the old interpreter models it that way
-    /// too (`HeapValue::Closure` sits at a `HeapId` behind a
-    /// `Value::Pointer`, so it has content AND identity). Being in the
-    /// heap also means the existing machinery does the work - GC collects
-    /// one nothing refers to, and `shape`'s canonical BFS renumbers it,
-    /// so two states that each built the same closure have the same
-    /// SHAPE and merge.
-    ///
-    /// ## What PICO-8 actually does, which is not what Lua 5.4 does
-    ///
-    /// PICO-8 is Lua 5.2, which CACHES closures: `OP_CLOSURE` reuses an
-    /// existing one with the same prototype and the same upvalue CELLS.
-    /// (5.4 removed this, which is where the folklore that
-    /// `function() end == function() end` is false comes from.) Measured,
-    /// not assumed - `/tmp` carts run against ~/pico-8/pico8:
-    ///
-    /// ```text
-    /// two calls, body has no upvalues              true   (cached)
-    /// two calls, upvalue is a fresh local          false
-    /// same local captured at two different sites   false  (two prototypes)
-    /// body only reads a GLOBAL, so no upvalues     true
-    /// same site, same upvalue cell                 true
-    /// same site, different frames, equal values    false
-    /// loop capturing i                             false
-    /// loop capturing nothing                       true
-    /// ```
-    ///
-    /// So identity is (prototype, upvalue cells). This model has the
-    /// prototype exactly (`BodyId`, interned by AST node) but approximates
-    /// the cells by the whole enclosing SCOPE, which is exact only when
-    /// every capture comes from that scope. Two closures can therefore be
-    /// distinct here and the same object in PICO-8. `==` on two closures
-    /// is refused for that reason rather than answered - see
-    /// `Interp::eval_binop`.
+    /// PICO-8 (Lua 5.2, measured on a real PICO-8) CACHES closures: identity
+    /// is (prototype, upvalue cells), so e.g. two calls of a body with no
+    /// upvalues return the SAME closure. This model has the prototype
+    /// (`BodyId`) but approximates the cells by the enclosing scope, so `==`
+    /// on two closures is refused rather than answered (`Interp::eval_binop`).
     Func(ClosureId),
     Builtin(&'static str),
 }
@@ -115,9 +75,7 @@ impl<D: Domain> std::fmt::Debug for Value<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Nil => write!(f, "nil"),
-            // Tag the kind: both domains render a Num and a Bool the same
-            // way (a node id, or a raw number), and "arithmetic on
-            // non-numbers: 201 and 184" says nothing without it.
+            // Tag the kind: domains render a Num and a Bool alike.
             Value::Num(n) => write!(f, "num({:?})", n),
             Value::Bool(b) => write!(f, "bool({:?})", b),
             Value::Str(s) => write!(f, "{:?}", s),
@@ -128,36 +86,14 @@ impl<D: Domain> std::fmt::Debug for Value<D> {
     }
 }
 
-/// A Lua table: a string part, an ARRAY part and an integer part, which
-/// is the split Lua itself has and the reason `#` behaves the way it
-/// does. The IR collapses this into `ObjectTable`/`ArrayTable`; keeping
-/// all three avoids having to decide what a fresh `{}` is before anything
-/// has been put in it.
-///
-/// ## Why the integer part has to exist
-///
-/// `t[3] = v` on an empty table is legal Lua and puts 3 in the HASH part,
-/// leaving the array part empty - so `#t` is 0, not 3. Modelling arrays
-/// densely and materialising the gap as nils gets the READS right and the
-/// length wrong. Measured in real PICO-8 (`lua/probe/tables.lua`, whose
-/// output is checked in):
-///
-/// ```text
-/// t={}      #t == 0
-/// t[3]="c"  #t == 0     -- dense-with-nils would say 3
-/// t[1]="a"  #t == 1
-/// t[2]="b"  #t == 3     -- the array part absorbs 3 once the gap closes
-/// {"a",nil,"c"}         #t == 3   -- a CONSTRUCTOR sizes the array part
-/// {"a","b","c"} t[3]=nil #t == 2  -- a border search inside the array
-/// ```
-///
-/// The same contents give different lengths depending on how the table
-/// was BUILT, which is why this is a matter for measurement rather than
-/// for reasoning about what "undefined for tables with holes" permits.
+/// A Lua table: a string part, an ARRAY part and an integer part, the split
+/// Lua itself has. The integer part must exist because `#` depends on it:
+/// on a real PICO-8 (`lua/probe/tables.lua`), `t={} t[3]="c"` has `#t == 0`
+/// (dense-with-nils would say 3), and `t[1]="a" t[2]="b"` then gives 3 once
+/// the array part absorbs the gap.
 pub struct Table<D: Domain> {
     pub hash: BTreeMap<String, Value<D>>,
-    /// The array part. May contain explicit `Nil`s; Lua does not shrink
-    /// it when one is punched, and `len` finds the border instead.
+    /// The array part. May contain explicit `Nil`s (Lua does not shrink it).
     pub arr: Vec<Value<D>>,
     /// Integer keys OUTSIDE the array part - too large, or zero, or
     /// negative. Absorbed into `arr` when an append closes the gap.
@@ -165,45 +101,20 @@ pub struct Table<D: Domain> {
 }
 
 impl<D: Domain> Table<D> {
-    /// Every value the table holds. The ONE place that knows a table has
-    /// three parts: `gc`, `shape` and the merge's canonical order went through
-    /// their own hand-written `hash.values().chain(arr.iter())`, so
-    /// adding the integer part meant finding all three, and a fourth
-    /// would mean finding them again.
+    /// Every value the table holds: the ONE place that knows a table has
+    /// three parts (`gc` and `shape` go through it).
     pub fn values(&self) -> impl Iterator<Item = &Value<D>> {
         self.hash.values().chain(self.arr.iter()).chain(self.ints.values())
     }
 
-    /// `#t`, WHEN THIS MODEL CAN ANSWER IT EXACTLY. `None` means raise.
+    /// `#t`, when this model can answer it exactly; `None` means raise.
     ///
-    /// Lua's `luaH_getn` searches the array part's CAPACITY, which grows
-    /// in powers of two at rehash and therefore depends on the table's
-    /// history rather than its contents. Two tables holding the same
-    /// keys can have different lengths:
-    ///
-    /// ```text
-    /// t={} t[1]=1 t[2]=2 t[3]=3 t[2]=nil    #t == 1
-    /// {"a",nil,"c"}                          #t == 3
-    /// t={} t[1]=1 t[2]=2 t[4]=4              #t == 4  (rehash pulled 4 in)
-    /// ```
-    ///
-    /// Line 1 and line 2 hold the same keys. Line 3's answer skips a
-    /// genuine hole at 3, because `computesizes` decided a 4-slot array
-    /// part was worth it. Reproducing any of this means reproducing
-    /// `computesizes` and the node part's occupancy, and then the
-    /// capacity becomes part of the SHAPE - a merge cost paid for
-    /// something the cart cannot reach (`del` shifts left and drops the
-    /// last, and `got_fruit` never has `#` taken of it).
-    ///
-    /// So: answer exactly, or raise. The answer is exact precisely when
-    /// the integer part is empty and the array part has no INTERIOR hole,
-    /// because then the border is the last non-nil index whatever the
-    /// capacity is - Lua's binary search over any capacity at least that
-    /// large lands in the same place, and with a full array part
-    /// `unbound_search` starts past the end and stops immediately.
-    /// Trailing holes are fine, which matters: that is what
-    /// `__array_table_drop_last` leaves behind, and `del` then takes `#`
-    /// of it on the next call.
+    /// Lua's `luaH_getn` depends on the array part's CAPACITY (the table's
+    /// history), which this model does not track and the cart never needs.
+    /// The answer is exact when the integer part is empty and the array part
+    /// has no INTERIOR hole: the border is then the last non-nil index for
+    /// any capacity. Trailing holes are fine (`__array_table_drop_last`
+    /// leaves them, and `del` takes `#` next).
     pub fn len(&self) -> Option<usize> {
         if !self.ints.is_empty() {
             return None;
@@ -219,24 +130,15 @@ impl<D: Domain> Table<D> {
         Some(last)
     }
 
-    /// `name = v` for a GLOBAL, Lua's way: assigning nil removes the key.
-    /// A global held as an explicit `Nil` is a structural slot to the
-    /// boundary (`bind::structure_of` gives every present global a cell,
-    /// and the canonical numbering counts it), so a state that once
-    /// assigned a global and then cleared it was a different SHAPE from one
-    /// that never assigned it - equal game states that never dedupe. The
-    /// split frame (lua/celeste-minimal-split.lua) clears `__phase` every
-    /// frame and `__frozen` after a freeze, which made every state that had
-    /// sat in a dash freeze a second copy (room (2,1): 2.8-3.8x the unsplit
-    /// states, plans/room21-2026-10-01.md).
+    /// `name = v` for a GLOBAL, Lua's way: assigning nil removes the key. An
+    /// explicit `Nil` global is a structural slot to the boundary, so a
+    /// cleared global would otherwise be a different SHAPE from a never-set
+    /// one (equal game states that never dedupe).
     ///
-    /// Globals only. An object FIELD assigned nil keeps its slot: the cart
-    /// does that in `init_object` (`obj.spr = type.tile`, nil for the
-    /// player's type), to every object of the type alike, and removing the
-    /// slot renumbers every state with a player in every room - room (1,0)
-    /// f0-f44 moved every fingerprint from f24 with every count, the pos
-    /// graph and the marks unchanged - which invalidates the pinned gates
-    /// and every checkpoint tree on disk for no merge.
+    /// Globals only: an object FIELD assigned nil keeps its slot (the cart
+    /// does it to every object of a type alike, in `init_object`); removing it
+    /// would renumber every state's key and invalidate the pinned gates and
+    /// every checkpoint tree for no merge.
     pub fn set_global(&mut self, name: String, v: Value<D>) {
         if matches!(v, Value::Nil) {
             self.hash.remove(&name);
@@ -260,10 +162,7 @@ impl<D: Domain> Table<D> {
         }
         if i >= 1 && i as usize == self.arr.len() + 1 {
             self.arr.push(v);
-            // MIGRATE. The array part absorbs whatever the integer part
-            // has sitting immediately after it, which is what makes
-            // `t={} t[3]=c t[1]=a t[2]=b` end at `#t == 3` while
-            // `t={} t[3]=c` on its own is `#t == 0`.
+            // The array part absorbs the integer keys right after it.
             while let Ok(k) = i16::try_from(self.arr.len() + 1) {
                 match self.ints.remove(&k) {
                     Some(next) => self.arr.push(next),
@@ -324,37 +223,23 @@ impl<D: Domain> Heap<D> {
     }
 }
 
-/// A closure object: which function body, and the scope it captured.
-/// Both are immutable, so unlike a table there is nothing here to merge -
+/// A closure object: its function body and captured scope, both immutable;
 /// it is in the heap for its IDENTITY.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Closure {
     pub body: BodyId,
     pub env: ScopeId,
-    /// This function's index in `celeste_names::gen::FN_NAMES` - the
-    /// engine's name for it, which `Cell2::Clo` carries.
+    /// This function's index in `celeste_names::gen::FN_NAMES` (what
+    /// `Cell2::Clo` carries), resolved AT CREATION where the naming
+    /// declaration is in hand; nothing downstream can recover it.
     ///
-    /// Resolved AT CREATION, where the declaration or assignment that
-    /// names the function is in hand, because nothing downstream can
-    /// recover it: a heap closure is a body id and a scope, and a body
-    /// id is a pointer into the AST.
-    ///
-    /// `None` is an anonymous function. Four exist in the cart, all
-    /// `foreach` callbacks, and none outlives the frame that makes it -
-    /// so one reaching a block is worth refusing rather than numbering.
+    /// `None` is an anonymous function (the cart's are `foreach` callbacks
+    /// that never outlive their frame); one reaching a block is refused.
     pub fn_id: Option<u32>,
-    /// The names this closure CAPTURES: the free variables of its body
-    /// that resolve to a local of the defining scope.
-    ///
-    /// Names rather than values, so the state stays the single source of
-    /// what a capture holds - `Closure` is not generic over the domain
-    /// and should not become so to store one pointer.
-    ///
-    /// The engine's block carries captures as columns and hashes them
-    /// into the row key, so this exists to agree with `refbridge::to_block`.
-    /// Measured over 30 frames of room (1,0): every closure captures
-    /// exactly one thing, the object that owns it, and no capture column
-    /// ever varies.
+    /// The names this closure CAPTURES: the free variables of its body that
+    /// resolve to a local of the defining scope. Names, not values, so the
+    /// state stays the single source of what a capture holds. The block
+    /// carries captures as key columns; `refbridge::to_block` must agree.
     pub captures: Vec<String>,
 }
 
@@ -453,10 +338,9 @@ impl<D: Domain> Heap<D> {
         }
     }
 
-    /// Drop everything unreachable from `roots`. Merging compares SHAPES,
-    /// and two states that did the same thing by different routes leave
-    /// different garbage behind, so collecting is what makes them
-    /// comparable rather than merely tidy.
+    /// Drop everything unreachable from `roots`: two states that did the same
+    /// thing by different routes leave different garbage, and merging
+    /// compares SHAPES.
     pub fn gc(&mut self, roots: &[Root]) {
         let (live_t, live_s, live_c) = self.reachable(roots);
         self.tables.retain(|k, _| live_t.contains(k));
@@ -516,10 +400,8 @@ pub enum Root {
     Scope(ScopeId),
 }
 
-/// The objects a value refers to. The ONE place that knows which value
-/// kinds are references, so `gc` and `shape_and_order` cannot disagree about
-/// it - they each had their own copy (with the merge's canonical order, a
-/// third), and adding closures to the heap meant finding all three.
+/// The objects a value refers to: the ONE place that knows which value kinds
+/// are references, so `gc` and `shape_and_order` cannot disagree.
 pub fn push_value<D: Domain>(v: &Value<D>, stack: &mut Vec<Root>) {
     match v {
         Value::Table(t) => stack.push(Root::Table(*t)),
@@ -530,13 +412,9 @@ pub fn push_value<D: Domain>(v: &Value<D>, stack: &mut Vec<Root>) {
 
 /// The part of a state that decides whether two states can MERGE.
 ///
-/// Everything here is structure, not data: which objects exist, what keys
-/// they have, how long the arrays are, which function each closure is. Two
-/// states with the same shape differ only in symbolic values, so they
-/// merge into one with a `Sel` per differing slot. Two states with
-/// different shapes are different successors and both survive - which is
-/// how a frame that kills the player naturally produces two output shapes
-/// rather than needing a specialization set to express it.
+/// Structure, not data: which objects exist, their keys, array lengths and
+/// closure bodies. Same-shape states merge with a `Sel` per differing slot;
+/// different shapes are different successors and both survive.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Slot {
     Nil,
@@ -544,19 +422,16 @@ pub enum Slot {
     Bool,
     Str(String),
     Table(u32),
-    /// The CANONICAL closure number, exactly as `Table` is the canonical
-    /// table number. Which body it is and what it captured live in
-    /// `Shape::closures`, so identity and content stay separate here too.
+    /// The CANONICAL closure number, as `Table`; its body and scope are in
+    /// `Shape::closures`.
     Func(u32),
     Builtin(&'static str),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Shape {
-    /// Canonical (BFS-numbered) tables: their keys and their slot kinds,
-    /// for all THREE parts - string, array, integer. The integer part is
-    /// part of the shape for the same reason the others are: two states
-    /// whose tables differ there cannot be merged with a select.
+    /// Canonical (BFS-numbered) tables: keys and slot kinds of all THREE
+    /// parts (string, array, integer).
     pub tables: Vec<(Vec<(String, Slot)>, Vec<Slot>, Vec<(i16, Slot)>)>,
     pub scopes: Vec<(Vec<(String, Slot)>, Option<u32>)>,
     /// Canonical (BFS-numbered) closures: their body, and the canonical
