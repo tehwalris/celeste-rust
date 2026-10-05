@@ -703,6 +703,90 @@ pub fn concrete_search(
         st: State,
     }
     let start_cell = Block::from_state(&initial)?.positions()?[0];
+    // THE FAST PATH: a depth-first search for a win AT the bound, inside
+    // `W_{H - bound + k}` (the bound's frames-left alignment), on one engine,
+    // with a step budget. Where the bound is the optimum (no level widening
+    // made it lower) it finds the witness in a few hundred steps, where the
+    // breadth-first search would expand whole layers. Either way the answer
+    // is sound: a win found here is at the bound, and the bound is a lower
+    // bound; an exhausted or abandoned DFS proves nothing and the BFS runs.
+    {
+        struct Dfs<'a> {
+            eng: &'a mut ConcreteEngine,
+            initial: &'a State,
+            node: &'a FxHashMap<(u64, (u64, u64), u32), u32>,
+            w: &'a Winning,
+            level: crate::interpreter::abstraction::Level,
+            from: u32,
+            frames: u32,
+            dead: FxHashSet<((u64, u64), u32, u32)>,
+            path: Vec<(u8, u32)>,
+            steps: u64,
+        }
+        /// `Ok(None)`: out of budget.
+        fn dfs(cx: &mut Dfs, st: &State, k: u32) -> Result<Option<bool>> {
+            if k >= cx.frames {
+                return Ok(Some(false));
+            }
+            for byte in 0u8..64 {
+                for succ in cx.eng.step_all(st, byte, cx.initial)? {
+                    cx.steps += 1;
+                    if cx.steps > DFS_BUDGET {
+                        return Ok(None);
+                    }
+                    let b = Block::from_state(&succ)?;
+                    let cell = b.positions()?[0];
+                    if wins_of(b.rt2())?.iter().any(|&x| x) {
+                        // The bound is a lower bound: a concrete win before it
+                        // would say the arc backward lost a path.
+                        anyhow::ensure!(k + 1 == cx.frames, "a concrete win at f{} before the arc bound f{}: the backward lost a path", k + 1, cx.frames);
+                        cx.path.push((byte, cell));
+                        return Ok(Some(true));
+                    }
+                    let exact = (b.rt2().clone_block().row_keys_canonical()[0], cell, k + 1);
+                    if cx.dead.contains(&exact) {
+                        continue;
+                    }
+                    let (shape, keys, cells) = widened_keys(&b, cx.level)?;
+                    let Some(&i) = cx.node.get(&(shape, keys[0], cells[0])) else { continue };
+                    let q = rem_of(b.rt2())?;
+                    if !cx.w.at(cx.from + k + 1, i).is_some_and(|r| r.contains(q.0, q.1)) {
+                        continue;
+                    }
+                    cx.path.push((byte, cell));
+                    match dfs(cx, &succ, k + 1)? {
+                        Some(true) => return Ok(Some(true)),
+                        None => return Ok(None),
+                        Some(false) => {}
+                    }
+                    cx.path.pop();
+                    cx.dead.insert(exact);
+                }
+            }
+            Ok(Some(false))
+        }
+        /// Concrete steps the fast path may take before it gives up.
+        const DFS_BUDGET: u64 = 200_000;
+        let t = std::time::Instant::now();
+        let mut eng = engines[0].lock().expect("an engine");
+        let mut cx = Dfs { eng: &mut eng, initial: &initial, node: &node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0 };
+        let found = dfs(&mut cx, &initial, 0)?;
+        eprintln!(
+            "[concrete] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
+            match found {
+                Some(true) => "a win",
+                Some(false) => "no win (exhaustive)",
+                None => "out of budget",
+            },
+            cx.steps,
+            t.elapsed().as_secs_f64()
+        );
+        if found == Some(true) {
+            let inputs = cx.path.iter().map(|&(b, _)| b).collect();
+            let cells = std::iter::once(start_cell).chain(cx.path.iter().map(|&(_, c)| c)).collect();
+            return Ok(Some(Witness { inputs, cells }));
+        }
+    }
     // Per layer k >= 1, each state's (parent index in layer k-1, input, cell).
     let mut back: Vec<Vec<(u32, u8, u32)>> = Vec::new();
     let mut cur: Vec<State> = vec![initial.clone()];
