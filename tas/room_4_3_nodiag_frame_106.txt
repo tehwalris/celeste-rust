@@ -1,15 +1,17 @@
 # Room (4,3) "2900 m", No Diagonal Dashes: exit during frame 106 (2026-10-05).
-# 5 frames under the community nodiag TAS29 (111 at the any% prologue offset 29).
+# FIVE FRAMES FASTER than the community nodiag TAS29 (82 inputs at prologue
+# offset 29 = 111 in our counting; tasdatabase classic/nodiag TAS29, "81
+# frames"). Ours: 77 inputs after the 29-frame prologue.
 #
-# Found by CELESTE_NODIAG=1 CELESTE_LEVEL_MINUS_ONE=111,5 rewrite search
-# --room 4,3 --level r0sxhn,r0sxh --ceiling 111 (branch arc-only, the objects
-# ladder on the arcs): the r0sxhn arc bound is f104 and the exhaustive concrete
-# search found no win at 104 (18.7k steps); the r0sxh forward filtered by
-# r0sxhn's arc-marked nodes has its bound at f106, and the depth-first try at
-# the bound found this in 392 steps - so 106 is the optimum (the bound is a
-# lower bound, over every `rnd` draw). No diagonal dash press (four dashes,
-# all straight).
-#
-# Exits on a real PICO-8 with balloon seeds 0, 0.5 and PICO-8's own rnd:
-#   pico8_diff/replay.py --room 4,3 --balloon-seeds 0 tas/room_4_3_nodiag_frame_106.txt
+# Found by the arc search with the objects ladder (branch arc-only,
+# `rewrite search --level r0sxhn,r0sxh`, CELESTE_NODIAG=1, level -1 111,5):
+# r0sxhn (objects coarse) bound 104, no concrete win at 104; r0sxh (objects
+# exact, held buttons unknown) bound 106 - a sound lower bound - and the
+# exhaustive concrete count-up found this witness at 106: OPTIMAL.
+# Dash presses: f53 R, f67 U, f86 R, f93 U - no diagonal dash.
+# Replayed on a real PICO-8, room changes to (5,3) during frame 106, in BOTH
+# celeste-minimal and the ORIGINAL cart (player first exists at frame 30 in
+# both), with balloon seeds 0 and 0.5 (and PICO-8's own rnd):
+#   pico8_diff/replay.py --room 4,3 --balloon-seeds 0,0,0 tas/room_4_3_nodiag_frame_106.txt
+#   pico8_diff/replay.py --lua ~/src/github.com/tehwalris/celeste_ocaml/celeste.lua --begin-game --room 4,3 --balloon-seeds 0,0,0 tas/room_4_3_nodiag_frame_106.txt
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,0,1,1,0,16,0,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,34,0,0,0,0,0,0,0,0,0,0,0,0,0,36,0,0,0,0,0,0,2,2,2,2,2,0,18,0,2,0,2,16,34,0,0,0,0,0,0,36,0,0,0,0,0,0,0,16,0,0,16,0,0
