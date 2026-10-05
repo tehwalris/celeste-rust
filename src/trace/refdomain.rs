@@ -187,12 +187,13 @@ impl Domain for RefDomain {
     }
 
     fn compare(&mut self, op: Cmp, a: &Iv, b: &Iv) -> Result<bool> {
-        // Eq: two points compare directly; a real interval is never equal to
-        // anything.
+        // Eq: two points compare directly; disjoint intervals are unequal;
+        // overlapping ones may be either (fork, as the orderings below).
         if op == Cmp::Eq {
             return Ok(match (a.to_number(), b.to_number()) {
                 (Some(x), Some(y)) => x == y,
-                _ => false,
+                _ if a.high < b.low || b.high < a.low => false,
+                _ => self.cursor.choose(2) == 0,
             });
         }
         // Definite when the intervals are separated, else fork.

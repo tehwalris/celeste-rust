@@ -279,6 +279,21 @@ pub fn orb_deadline_skip(rt2: &Rt2, frame: u32, horizon: u32) -> Vec<bool> {
     (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(zero)).collect()
 }
 
+/// Per lane of a frame's rows: NOT expanded further. An exited row (no kernels
+/// for the next room; a win or a `--win-at` exit), and in the orb room a row
+/// whose chest is still closed too late for the ceiling (`orb_deadline_skip`).
+/// The forward and a resume both take the frontier through this, so a resumed
+/// run expands exactly the rows an uninterrupted one does.
+pub fn not_expanded(b: &Block, frame: u32) -> Result<Vec<bool>> {
+    let mut skip = b.exits()?;
+    if let (true, Some((h, _))) = (orb_required(), level_minus_one()) {
+        for (w, late) in skip.iter_mut().zip(orb_deadline_skip(b.rt2(), frame, h)) {
+            *w |= late;
+        }
+    }
+    Ok(skip)
+}
+
 /// Is the start room the orb room (5,2)? A win there also needs the orb
 /// (`max_djump == 2`): later levels are played with the second dash.
 pub fn orb_required() -> bool {
@@ -1523,11 +1538,12 @@ impl ForwardState {
             };
         }
         let door = crate::search::door::Door::from_shards(shards);
-        // The frontier: the last layer minus its won rows.
+        // The frontier: the last layer minus the rows the forward does not
+        // expand (`not_expanded`, as `extend` decides it).
         let mut frontier: Vec<Block> = load_frame(dir, last)?;
         for b in &mut frontier {
-            let wins = b.wins()?;
-            b.set_skip(wins);
+            let skip = not_expanded(b, last)?;
+            b.set_skip(skip);
         }
         let observer = if record {
             let path = pos_graph_path(dir);
@@ -1620,23 +1636,17 @@ impl ForwardState {
                 self.win_frame = Some(frame);
                 eprintln!("[fwd] first win at f{frame}");
             }
-            // Exited rows are checkpointed but never expanded (no kernels for
-            // the next room); nor are orb rows past `orb_deadline_skip`.
+            // Exited rows are checkpointed but never expanded; nor are orb
+            // rows past their deadline (`not_expanded`).
             let orb = orb_required();
-            let ceiling = level_minus_one().map(|(h, _)| h);
             self.frontier = if won || orb {
                 std::thread::scope(|scope| {
                     let handles: Vec<_> = next
                         .into_iter()
                         .map(|mut b| {
                             scope.spawn(move || -> Result<Block> {
-                                let mut wins = b.exits()?;
-                                if let (true, Some(h)) = (orb, ceiling) {
-                                    for (w, late) in wins.iter_mut().zip(orb_deadline_skip(b.rt2(), frame, h)) {
-                                        *w |= late;
-                                    }
-                                }
-                                b.set_skip(wins);
+                                let skip = not_expanded(&b, frame)?;
+                                b.set_skip(skip);
                                 Ok(b)
                             })
                         })
