@@ -42,7 +42,7 @@ static KERNEL_HITS: [std::sync::atomic::AtomicU64; 2] = [
 ];
 
 /// Lanes the traced set has MISSED so far, without resetting the counter.
-/// The ladder differential tests assert this is zero: a run where chunks
+/// A kernels-against-reference test asserts this is zero: a run where chunks
 /// quietly fell through to the reference path would otherwise pass while
 /// checking interpreter against interpreter.
 pub fn missed_lanes() -> u64 {

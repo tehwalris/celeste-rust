@@ -1,4 +1,4 @@
-//! The interpreter's `State` model (heap, values, state), the ladder's
+//! The interpreter's `State` model (heap, values, state), the search's
 //! levels (`interpreter::abstraction`), and the game setup (`game_runner`:
 //! the start room, the Lua sources).
 //!

@@ -1,13 +1,13 @@
-//! The frame-step interface, the block, and the minimal outer loop
-//! (plans/architecture.md).
+//! The frame-step interface, the block, and the forward (plans/architecture.md):
+//! `FrameStep` (the kernels, `compiled::FrameEngine`, and the reference
+//! engine), the `ForwardSink` a step emits into (queues, the door, the edge
+//! records with their transfers), `forward_frame` (one wave) and
+//! `ForwardState` (a forward extended frame by frame, checkpointed, resumed).
+//! The search over a finished forward is `search::arc_dp`.
 //!
-//! Rebuilt core, written fresh against the agreed interfaces rather than copied
-//! from `search/run.rs`. A block is OPAQUE to the loop except for two exposed
-//! columns - its KEYS and its POSITIONS; the only other thing that crosses is
-//! the frame-step call.
-//!
-//! Impls (kernel runner + `trace::refengine`) and the loop's checkpoint /
-//! position-graph growth come next; this is the interface + the frame spine.
+//! A block is OPAQUE to the loop except for two exposed columns - its KEYS
+//! and its POSITIONS; the only other thing that crosses is the frame-step
+//! call.
 
 use anyhow::{Context, Result};
 use crate::search::door::Admit;
@@ -29,8 +29,8 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 /// step consumes and produces it directly, `keep` is a column filter, the
 /// regroup is a column append, and the checkpoint is the columns. The
 /// interpreter `State` appears only at the edges - the initial state, the
-/// reference engine, and the ladder filter's coarsening - through
-/// `from_state` / `to_state`.
+/// reference engine, the concrete count-up - through `from_state` /
+/// `to_state`.
 pub struct Block {
     rt2: Rt2,
     /// The rows' stable ids `pack_id(layer, seq, row)` - set when the block
@@ -107,7 +107,7 @@ impl Block {
     }
 
     /// The block as an interpreter `State` (`bridge::export_block`), for the
-    /// reference engine and the ladder filter's coarsening.
+    /// reference engine.
     pub fn to_state(&self) -> State {
         crate::compiled::bridge::export_block(&self.rt2)
     }
@@ -604,8 +604,7 @@ impl Slot {
         piece.width = w + rows.len();
     }
 
-    /// The whole slot as a block (the ladder filter and the checks read
-    /// blocks).
+    /// The whole slot as a block (the checks read blocks).
     pub fn to_rt2(&self) -> Rt2 {
         let mut b = self.empty_piece();
         let all: Vec<u32> = (0..self.rows() as u32).collect();
@@ -637,8 +636,8 @@ impl Slot {
                 return Ok(false);
             };
             // A position is a number, or an interval: the lane wins if it
-            // meets the target - the over-approximation a coarser level is
-            // entitled to, and what the finer levels refute.
+            // meets the target - an over-approximation, which the concrete
+            // count-up refutes.
             let range_at = |cell: u32| -> Result<Box<dyn Fn(u32) -> (i16, i16) + '_>> {
                 Ok(match &sk.cols[cell as usize] {
                     Col::U(AV::Num(n)) => {
@@ -781,7 +780,7 @@ pub const POOL_QUEUES: usize = 256;
 /// `(input cell, output cell)` of every raw output, and the output rows
 /// themselves, keyed, into a QUEUE per (outcome, cell). A queue that
 /// fills (or is evicted from the pool) is FLUSHED right here, by this
-/// worker: rows the ladder filter rejects dropped, the rest sorted,
+/// worker: rows the level -1 filter rejects dropped, the rest sorted,
 /// admitted at the door (`search::door`, the one shared structure, locked
 /// per shard for the admission only), and the survivors appended into
 /// this worker's piece of the shape.
@@ -1347,7 +1346,7 @@ pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::interpreter::abstraction::Level
 }
 
 /// `(shape, keys, cells)` of the widened rows - the shape is the widened
-/// block's, which is what the coarser level's marks are sharded by.
+/// block's, which is what a level's nodes are keyed by.
 pub fn widened_keys_rt2(
     rt2: &Rt2,
     coarser: crate::interpreter::abstraction::Level,
@@ -2134,8 +2133,9 @@ pub fn load_row(dir: &std::path::Path, id: u64) -> Result<(Rt2, u64, u32)> {
 type MarkRow = (u64, u32, u64, u64, u32);
 
 /// A set of states, `(shape, cell, key)`: a level's MARKED states (the
-/// backward's result, what `MarkFilter` looks finer rows up in) and the
-/// diagnostics' sets of reached states. In RAM; saved as a marks file.
+/// remainder-free backward's, the arc-marked nodes: `search --save-marks`,
+/// the UI) and the diagnostics' sets of reached states. In RAM; saved as a
+/// marks file.
 #[derive(Default)]
 pub struct Visited {
     /// Sharded by (shape hash, cell): a shard holds the 128-bit content
@@ -2146,10 +2146,9 @@ pub struct Visited {
     /// lookup.
     ///
     /// Each key maps to its DEADLINE: the last frame a marked state still
-    /// reaches a win by the horizon from (`edges::Marks`), what `MarkFilter`
-    /// bounds time with. `u16::MAX` where there is none - a set of reached
-    /// states, the kernel re-run backward, a marks file from before the
-    /// deadlines were saved: the membership test alone.
+    /// reaches a win by the horizon from (`edges::Marks`). `u16::MAX` where
+    /// there is none - a set of reached states, a marks file from before the
+    /// deadlines were saved.
     shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashMap<(u64, u64), u16>>,
 }
 
@@ -2267,12 +2266,6 @@ pub fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Opt
         }
     }
     Ok(Some(None))
-}
-
-/// Where a level's marked set at a horizon is saved (level 0's checkpoints
-/// are shared across horizons; its marks are not).
-pub fn marks_path(base_dir: &std::path::Path, horizon: u32, level: usize) -> std::path::PathBuf {
-    base_dir.join(format!("h{:03}", horizon)).join(format!("level{:02}.marks.bin", level))
 }
 
 #[cfg(test)]

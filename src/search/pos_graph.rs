@@ -1,30 +1,23 @@
 //! A compact over-approximation of the successor relation, PROJECTED ONTO
 //! THE PLAYER'S POSITION - and nothing else.
 //!
-//! The backward sweep needs predecessors: "who steps into the rows that just
-//! got marked?". The frame function only answers successors, so today that
-//! inversion is materialized as an explicit edge graph - 10,072,724,145
-//! `(src row, dst row)` pairs and 58 GB for room (1,0), and an outright OOM
-//! on room (0,0). This replaces it with the same question asked about
-//! POSITIONS: "which positions can step into this position?". For room (1,0)
-//! the answer is 383,528 `(dst cell, src cell)` pairs - about 1.5 MB.
+//! "Which positions can step into this position?" - recorded by the forward
+//! (`PosObserver`), read by the level -1 probe and the UI, and pinned as a
+//! gate (`gates/posgraph_room10_f044.txt`). It was the predecessor filter of
+//! the kernel re-run backward (deleted 2026-10-05; the backward is the
+//! recorded edges'). For room (1,0) it is 383,528 `(dst cell, src cell)`
+//! pairs - about 1.5 MB.
 //!
 //! **This is not, and must never become, a set of predecessor states.** It
 //! has one node per position cell (65,535 of them for a room, plus one for
 //! "no player object"), never one per row; it is a static property of the
-//! game's geometry, not of any particular search; and it is used only to
-//! shrink the candidate set that the sweep then actually expands. The
-//! expansion is what establishes an edge. If this table were too small the
-//! sweep would be wrong, so it is RECORDED - by replaying the saved frontier
-//! batches, which is the same work the forward pass did and so sees every
-//! transition exactly once (frontier-only, and the successor relation is a
-//! static graph over rows) - never guessed. If it is too LARGE the sweep is
-//! merely slower, which is why an over-approximation is safe.
+//! game's geometry, not of any particular search. It is RECORDED by the
+//! forward, which sees every transition exactly once, never guessed.
 //!
 //! It is HORIZON-INDEPENDENT by construction: nothing here reads a horizon,
 //! a band or a `g`. It answers "which positions can step into this
 //! position?", which is a property of the game's dynamics. Build once per
-//! room, reuse for every horizon of the ladder.
+//! room, reuse for every horizon.
 //!
 //! Positions are measured relative to the START room. Object coordinates in
 //! the cart are room-local, so the one frame that crosses into the next room

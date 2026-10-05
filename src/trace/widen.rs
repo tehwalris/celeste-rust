@@ -200,7 +200,7 @@ fn widen_rem(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) 
 /// (`fall_floor_paths`) actually merge pop histories. The claim that the
 /// interval is a full period is the widening's own error: a narrower phase (a
 /// concrete draw) declines loudly, never widened. The block model projects the same way
-/// (`Rt2::widen_to`), for the mark filter.
+/// (`Rt2::widen_to`), for the concrete count-up's node lookup.
 fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
     for obj in objects_of_type(st, "balloon") {
         let p = field(&obj, &["offset"]);
@@ -491,7 +491,7 @@ pub const PLAYER_PROBE: [(i16, i16); 2] = [(-3, 3), (-1, 0)];
 /// overlapped floor is hidden and comes back only `if delay <= 0 and not
 /// check(player, 0, 0)` - its `delay` is not read while the player is inside
 /// (and an exact one could not be kept anyway: a floor the player enters was
-/// widened a frame before, and the mark filter keys a row by its projection,
+/// widened a frame before, and a concrete row is looked up by its projection,
 /// `Rt2::widen_to`, which has no history). The widened `state` contains the
 /// computed one, or the widening's own error says where not.
 ///
@@ -511,7 +511,7 @@ pub const PLAYER_PROBE: [(i16, i16); 2] = [(-3, 3), (-1, 0)];
 /// region's player half split 4,614 times into 3,638 outcomes (344k bodies),
 /// four regions past the 4,096 cap; with the invariant stored, 108 outcomes
 /// (5,454 bodies): only what the player's collisions read - each floor solid
-/// or not - is still split. Exactly what the mark filter's projection of a
+/// or not - is still split. Exactly what the projection of a
 /// concrete row holds there (`Rt2::widen_to` keeps an overlapped floor as it
 /// is, and in the game it is hidden).
 ///
@@ -934,7 +934,7 @@ fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::tra
 }
 
 /// The fly fruit's `spd.y` and `rem.y` ranges: ONE definition, shared with the
-/// block model's projection (`Rt2::widen_to`), or the mark filter misses.
+/// block model's projection (`Rt2::widen_to`), or the count-up's node lookup misses.
 use celeste_engine::runtime2::{FLY_FRUIT_REM_Y as FRUIT_REM_Y, FLY_FRUIT_SPD_Y as FRUIT_SPD_Y};
 
 /// The fields a fruit-unknown level widens, per live fly fruit

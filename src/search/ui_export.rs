@@ -967,7 +967,9 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
     }
     let marks_file = |h: u32, level: usize| match arc {
         Some(dir) => dir.join(if level == 0 { "level0.marks.bin" } else { "arc.marks.bin" }),
-        None => crate::frame::marks_path(checkpoint_dir, h, level),
+        // A precision-ladder run's (the ladder was deleted 2026-10-05; its
+        // finished runs still export): `hNNN/levelNN.marks.bin`.
+        None => checkpoint_dir.join(format!("h{h:03}")).join(format!("level{level:02}.marks.bin")),
     };
     struct MarksOut {
         h: u32,

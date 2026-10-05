@@ -248,7 +248,7 @@ pub enum FloorsWidening {
 /// only values the cart gives it. An interval, not the unknown number: a lane
 /// may hold it or an exact state (an interval column holds a number as
 /// `[n, n]`). Raw 16.16. ONE definition, shared with the tracer
-/// (`widen::widen_near_floors`), or the mark filter misses.
+/// (`widen::widen_near_floors`), or the count-up's node lookup misses.
 pub const FLOOR_STATE_RANGE: (i32, i32) = (0, 2 << 16);
 
 /// A spring's `spr` where a near level widens it: 0 hidden, 18 ready, 19
@@ -276,7 +276,7 @@ pub const FLOOR_HITBOX: [i16; 4] = [0, 0, 8, 8];
 /// windows `(lo, hi)` for its `x` and its `y` - it overlaps iff `lo < x < hi`
 /// on both axes. With the hitboxes above, `x` in `(fx - 7, fx + 7)` and `y` in
 /// `(fy - 8, fy + 5)`. ONE definition, shared with the tracer
-/// (`widen::widen_near_floors`), or the mark filter misses.
+/// (`widen::widen_near_floors`), or the count-up's node lookup misses.
 pub fn floor_player_window(floor: (P8, P8)) -> [(P8, P8); 2] {
     let [px, py, pw, ph] = PLAYER_HITBOX;
     let [fx, fy, fw, fh] = FLOOR_HITBOX;

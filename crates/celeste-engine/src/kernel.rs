@@ -678,7 +678,7 @@ impl RowCache {
 
     /// The ref of a flushed row: the state's id, flagged.
     pub const ID_FLAG: u64 = 1 << 63;
-    /// The ref of a row the ladder filter dropped: nothing to record.
+    /// The ref of a row the level -1 filter dropped: nothing to record.
     pub const DROP_FLAG: u64 = 1 << 62;
 
     /// Forget every key (O(1): bumps the generation).

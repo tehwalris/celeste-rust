@@ -1,8 +1,8 @@
-//! The search driver: `rewrite search` (the precision ladder), `rewrite
-//! forward` (one forward pass with timing), `rewrite ckhash` (checkpoint
-//! fingerprints), `rewrite export-ui` (the web UI's data), the arc search,
-//! the concrete witnesses, and the diagnostics that read a finished tree
-//! (rows by name: `search::inspect`).
+//! The search driver: `rewrite search` (the level-0 forward, the rotation
+//! graph's backward and the concrete count-up), `rewrite forward` (one
+//! forward pass with timing), `rewrite ckhash` (checkpoint fingerprints),
+//! `rewrite export-ui` (the web UI's data), and the diagnostics that read a
+//! finished tree (rows by name: `search::inspect`).
 
 use anyhow::Result;
 use celeste_engine::runtime2::Rt2;
@@ -74,7 +74,7 @@ enum Command {
         #[arg(long)]
         save_marks: Option<String>,
     },
-    /// ONE forward pass at ONE precision level, exactly as the ladder runs it
+    /// ONE forward pass at ONE level, exactly as the search runs it
     /// (record mode, position partition, sharded checkpoints), with the
     /// per-frame timing line. The profiling entry point for the forward.
     Forward {
@@ -96,8 +96,8 @@ enum Command {
         #[arg(long)]
         reference: bool,
     },
-    /// DIAGNOSTIC: is a coarser level closed over a finer one's rows, as the
-    /// mark filter needs? Every row of the FINE tree at frames `from..=to`
+    /// DIAGNOSTIC: is a coarser level's tree closed over a finer one's rows
+    /// (is the coarse level sound)? Every row of the FINE tree at frames `from..=to`
     /// (with `--fine-marks`, only its marked rows), projected onto `level`
     /// (`frame::widened_keys`, the key the filter looks up), must be a row of
     /// the COARSE tree at that frame or before (the door keeps a state at the
