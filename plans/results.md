@@ -64,6 +64,53 @@ with the reference engine (`rewrite witness`), replayed on a real PICO-8
 | (6,3) | summit | 55 | TAS31, 23 + 34 = 55 (touches the flag) | default ladder, `--ceiling 55`; h54 refuted at level 6 | `room_6_3_exit_frame_55.txt` | 10-02 | `0e67dfe` | no exit: the win is the flag's rect, x 55..67, y 41..52 (`c195f8c`, the original cart's `flag.draw`) |
 | (7,3) | title | - | - | not a level (`level_index() == 31` is the title screen) | | | | |
 
+## The arc pipeline (2026-10-05): the known optima again
+
+`rewrite search` with no rem rungs (branch `arc-only`; plans/architecture.md
+"The search"), on rooms whose optimum the ladder had proven. Release binary,
+`--ceiling` the known optimum, the same level -1 filters; every witness
+replayed on a real PICO-8 (`pico8_diff/replay.py`) exits on the optimum's
+frame. Wall times are on a machine other searches shared (load 40-60 on 32
+threads); peak is `VmHWM` (`/usr/bin/time`), the mapped edge runs and
+checkpoints included.
+
+| room | level(s), level -1 | known | arc bound | concrete search | found | PICO-8 | wall | peak | the ladder's |
+|---|---|---|---|---|---|---|---|---|---|
+| (1,0) | `r0sx`, - | 99 | 99 | DFS at the bound: 383 steps, 0.2 s | 99 | exits f99 (inputs = `room_1_0_exit_frame_99.txt`) | 5:33 (forward 4:32; 8.8M nodes, 214M edges, arc 62 s) | 32.7 GB (forward 10.1) | 2:56 one default ladder, 25 GB; arc-sets: 6:58 + 5:43, 18.2 GB |
+| (4,2) | `r0sxhn`, (71,5) | 71 | 71 | DFS: 191 steps | 71 | exits f71, seeds 0 and 0.5 | 0:50 | 3.2 GB | 9 GB |
+| (5,3) | `r0sxhn`, (79,5) | 79 | 78 | DFS at 78: none (7.2k steps, 4.7 s); BFS: 165k steps, 66 s | 79 | exits f79, seeds 0,0,0.1855,0 and zeros | 5:44 (the level -1 table 4:05) | 5.0 GB | 28.5 GB |
+| (3,3) | `r0sxhn`, (172,5) | 172 | 172 | DFS: 608 steps, 0.9 s | 172 | exits f172, seeds 0,0.1534 (inputs = `room_3_3_arc_witness_frame_172.txt`) | 10:29 (forward 8:32; 16.1M nodes, 412M edges) | 40.1 GB* | six ladders out of memory |
+| (7,0) | `r0sxhn`, (84,5) | 84 | 80 | DFS at 80: none, 172k steps, 4:18; at 81: 1.29M steps, 28 min; stopped | - | | | 13.4 GB | 5.2 GB |
+| (7,0) | `r0sxhn,r0sxh`, (84,5) | 84 | 80, then 84 | level 0: DFS at 80 none (172k, 4:18); level 1 (filtered, 6.9 s): DFS at 84, 292 steps | 84 | exits f84, seeds 0 and 0.25 | 14:40 | 11.5 GB | |
+
+\* (3,3) ran on the edge format before `9b967c3` (36 B per loaded edge,
+against 8 B since): its peak is the old graph's.
+
+What decides the cost is the concrete search's region: the concrete states
+the level lets into W. Where the bound is the optimum it is a few hundred
+steps; one frame of slack in (5,3) was 165k; four in (7,0) would have been
+~300M (the region grew 6.5x a frame) - there the objects ladder takes over.
+Room (7,0) with exact objects at level 0 alone (`r0sxh`, unfiltered) is no
+alternative: 48.8M states kept at f55 (against 2.6M at `r0sxhn`), 300 s a
+frame, stopped.
+
+**Room (4,3) No Diagonal Dashes at h111** (`CELESTE_NODIAG=1`, level -1
+(111,5); the nodiag TAS29 is 111): the `r0sxhn` forward visited 311M states
+(10:14, peak 14 GB); its arc graph, 38.2M nodes and 769M edges, loaded in
+3:18 (bfs 49 s, edges 127 s, graph 22 s; the old separate arc records were
+OOM-killed at 60 GB on this tree), the backward 12 s, the bound 104; no
+concrete win at 104 (18.7k steps). Alone, the breadth-first search then grew
+~1.4x a layer (29k states at layer 46 of 111): OOM-killed at 40 GB twice
+(the graph's edges alive, then interpreter states in the layers: `1b76615`,
+`66d962a`) and stopped at 37.6 GB a third time (every successor's row kept
+until the merge: `3135c9a`, not rerun here). The objects ladder
+`r0sxhn,r0sxh` instead: the filtered `r0sxh`
+forward 2:28, its bound 106, the witness at 106 in 392 steps - **106, five
+frames under TAS29**, exiting on a real PICO-8 with seeds 0, 0.5 and
+PICO-8's rnd, no diagonal dash (`tas/room_4_3_nodiag_frame_106.txt`,
+plans/nodiag.md). 9:23 with the level-0 tree reused, peak 40.7 GB (VmHWM,
+mapped files included).
+
 ## Caveats on what "optimal" means here
 
 - **Balloon rooms**: `rnd` is an interval at every level, so a confirmation is

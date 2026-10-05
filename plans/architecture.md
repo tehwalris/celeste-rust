@@ -386,9 +386,12 @@ abstract objects let too many concrete states into W. An exact-objects level
 0 (`r0sxh`) does not run either (48.8M states kept at f55 against `r0sxhn`'s
 2.6M). The ladder `r0sxhn,r0sxh` does: the filtered `r0sxh` forward took
 6.9 s, its bound is 84 and the try at the bound found the witness in 292
-steps (14:40 for the room). So: one level where the bound is tight, the
-objects ladder where it is not; a level-0 bound well below the reference is
-the sign.
+steps (14:40 for the room). Room (4,3) nodiag the same way: `r0sxhn` bound
+104, its breadth-first search past 40 GB by layer 47 of 111; `r0sxhn,r0sxh`
+bound 106 and the witness at 106 - five frames under the community TAS,
+replayed on PICO-8. So: one level where the bound is tight, the objects
+ladder where it is not; a level-0 bound well below the reference is the
+sign.
 
 **What deleted (2026-10-05).** The rem rungs (`RemPrecision`, the bucket
 widening and fork grid, the rem-keyed kernel sets), the precision ladder's

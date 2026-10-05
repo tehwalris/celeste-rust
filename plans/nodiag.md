@@ -16,7 +16,7 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (4,2) 2100m | 71 | 71 (TAS21) | 71 | ladder (any% recipe, L-1 71,5): h70 refuted at level 7 - validation |
 | (5,3) 3000m | 79 | 96 (TAS30, offset 31) | 96 (RECHECK PENDING) | arc lower bound 92; concrete DFS: none within 92-95, witness at 96 (PICO-8: exits during f96). The 'none within' runs used a memo keyed on the WIDENED key (unsound, fixed 2026-10-05) - re-running |
 | (7,0) 800m | 84 | 99 (TAS8, offset 23) | - | |
-| (4,3) 2900m | 85 | 111 (TAS29, offset 29) | - | |
+| (4,3) 2900m | 85 | 111 (TAS29, offset 29) | **106** | the objects ladder on the arcs (`--level r0sxhn,r0sxh`, L-1 111,5): r0sxhn bound 104, no concrete win at 104; r0sxh (filtered) bound 106, witness at 106 (PICO-8: exits during f106, seeds 0, 0.5, rnd). 5 under TAS29 - `tas/room_4_3_nodiag_frame_106.txt` |
 | (1,1) 1000m | 94 | 94 (TAS10) | - | (validation, not run) |
 
 ## The concrete count-up (`rewrite search`)

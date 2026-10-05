@@ -1,0 +1,15 @@
+# Room (4,3) "2900 m", No Diagonal Dashes: exit during frame 106 (2026-10-05).
+# 5 frames under the community nodiag TAS29 (111 at the any% prologue offset 29).
+#
+# Found by CELESTE_NODIAG=1 CELESTE_LEVEL_MINUS_ONE=111,5 rewrite search
+# --room 4,3 --level r0sxhn,r0sxh --ceiling 111 (branch arc-only, the objects
+# ladder on the arcs): the r0sxhn arc bound is f104 and the exhaustive concrete
+# search found no win at 104 (18.7k steps); the r0sxh forward filtered by
+# r0sxhn's arc-marked nodes has its bound at f106, and the depth-first try at
+# the bound found this in 392 steps - so 106 is the optimum (the bound is a
+# lower bound, over every `rnd` draw). No diagonal dash press (four dashes,
+# all straight).
+#
+# Exits on a real PICO-8 with balloon seeds 0, 0.5 and PICO-8's own rnd:
+#   pico8_diff/replay.py --room 4,3 --balloon-seeds 0 tas/room_4_3_nodiag_frame_106.txt
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,0,1,1,0,16,0,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,34,0,0,0,0,0,0,0,0,0,0,0,0,0,36,0,0,0,0,0,0,2,2,2,2,2,0,18,0,2,0,2,16,34,0,0,0,0,0,0,36,0,0,0,0,0,0,0,16,0,0,16,0,0
