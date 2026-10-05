@@ -14,7 +14,6 @@ use crate::search::door::Admit;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::interpreter::state::State;
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
@@ -28,9 +27,7 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 /// It IS the kernel's block, so there is no bridge in the loop: the frame
 /// step consumes and produces it directly, `keep` is a column filter, the
 /// regroup is a column append, and the checkpoint is the columns. The
-/// interpreter `State` appears only at the edges - the initial state, the
-/// reference engine, the concrete search - through `from_state` /
-/// `to_state`.
+/// reference engine reads and writes one-row blocks too (`trace::refbridge`).
 pub struct Block {
     rt2: Rt2,
     /// The rows' stable ids `pack_id(layer, seq, row)` - set when the block
@@ -67,7 +64,7 @@ pub fn id_row(id: u64) -> u32 {
 
 impl Block {
     /// Wrap an engine block. Its key column must be present: every producer
-    /// (the kernel boundary, `from_state`, the checkpoint loader) attaches
+    /// (the kernel boundary, `keyed`, the checkpoint loader) attaches
     /// it, and nothing downstream re-hashes.
     pub fn from_rt2(rt2: Rt2) -> Self {
         assert_eq!(
@@ -80,36 +77,23 @@ impl Block {
         Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() }
     }
 
-    /// A block from a reference-interpreter `State`, keyed by the one
-    /// canonical rule (`Rt2::row_keys_canonical`: what `engine_row_keys`
-    /// computed). The state must already be at its rung's abstraction.
-    pub fn from_state(state: &State) -> Result<Self> {
-        let (cart, cache) = crate::compiled::room_context()?;
-        let mut rt2 = crate::compiled::bridge::import_block(state, cart, cache);
-        // The key is the level's WIDENED row, the rule the kernels' boundary
-        // applies. A fruit-unknown level keys the state's fly fruit as it is: storing
-        // the decided fruit is exact, the kernel replaces it at the frame's
-        // start (`widen::fork_fruit_inputs`), and the post-`_init` state is a
-        // shape no frame returns to, so no key has to agree with it
-        // (plans/fly-fruit.md).
-        let level = crate::interpreter::abstraction::Level {
-            fruit: crate::interpreter::abstraction::FruitPrecision::Exact,
-            // Likewise the fall floors (`widen::fork_near_floor_inputs`) and
-            // the moving platforms (`widen::platform_inputs`).
-            floors: crate::interpreter::abstraction::FloorsPrecision::Exact,
-            platforms: crate::interpreter::abstraction::PlatformsPrecision::Exact,
-            ..crate::interpreter::abstraction::current_level()
+    /// A one-row block from the reference engine (`refbridge::to_block`),
+    /// keyed as the kernels key the level's rows: its held buttons widened
+    /// as the level says. The objects are keyed as they are: storing them
+    /// decided is exact (the kernels widen them at the frame's start, and the
+    /// post-`_init` state is a shape no frame returns to).
+    pub fn keyed(mut rt2: Rt2) -> Result<Self> {
+        use crate::abstraction::{current_level, FloorsPrecision, FruitPrecision, Level, PlatformsPrecision};
+        let level = Level {
+            fruit: FruitPrecision::Exact,
+            floors: FloorsPrecision::Exact,
+            platforms: PlatformsPrecision::Exact,
+            ..current_level()
         };
         let (_, keys, _) = widened_keys_rt2(&rt2, level)?;
         rt2.row_keys_canonical();
         rt2.row_keys = keys;
         Ok(Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() })
-    }
-
-    /// The block as an interpreter `State` (`bridge::export_block`), for the
-    /// reference engine.
-    pub fn to_state(&self) -> State {
-        crate::compiled::bridge::export_block(&self.rt2)
     }
 
     pub fn into_rt2(self) -> Rt2 {
@@ -238,7 +222,7 @@ pub const SUMMIT_LEVEL: i16 = 30;
 pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
     static RECT: std::sync::OnceLock<Option<(i16, i16, i16, i16)>> = std::sync::OnceLock::new();
     *RECT.get_or_init(|| {
-        if let Some((x, y)) = crate::interpreter::abstraction::synthetic_win_xy() {
+        if let Some((x, y)) = crate::abstraction::synthetic_win_xy() {
             return Some((x, x, y, y));
         }
         // EXPERIMENT (like `CELESTE_WIN_AT_XY`, a different search whose trees
@@ -1221,8 +1205,7 @@ impl<'a> ForwardSink<'a> {
             debug_assert_eq!(ids.len(), p.width);
             // A queue's columns are typed by its skeleton, not by its rows: a
             // column every row agrees on goes back to the uniform it is (the
-            // old append step's rule; the State bridge, which the reference
-            // engine's rows cross, has no per-lane form for an unknown bool).
+            // old append step's rule, which the checkpoints were pinned with).
             for c in p.cols.iter_mut() {
                 if !matches!(c, Col::U(_)) {
                     let taken = std::mem::replace(c, Col::U(AV::Nil));
@@ -1338,11 +1321,11 @@ pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
 /// earlier frame with no time left (14.6M kept at f51, 2026-09-19).
 pub struct MarkFilter<'a> {
     marked: &'a Visited,
-    coarser: crate::interpreter::abstraction::Level,
+    coarser: crate::abstraction::Level,
 }
 
 impl<'a> MarkFilter<'a> {
-    pub fn new(marked: &'a Visited, coarser: crate::interpreter::abstraction::Level) -> Self {
+    pub fn new(marked: &'a Visited, coarser: crate::abstraction::Level) -> Self {
         MarkFilter { marked, coarser }
     }
 
@@ -1361,14 +1344,14 @@ impl<'a> MarkFilter<'a> {
 /// diagnostics).
 pub fn widened_keys(
     block: &Block,
-    coarser: crate::interpreter::abstraction::Level,
+    coarser: crate::abstraction::Level,
 ) -> Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
     widened_keys_rt2(&block.rt2, coarser)
 }
 
 /// The fall-floor projection a level's rows are keyed on (`Rt2::widen_to`).
-pub fn floors_widening(floors: crate::interpreter::abstraction::FloorsPrecision) -> celeste_engine::runtime2::FloorsWidening {
-    use crate::interpreter::abstraction::FloorsPrecision as P;
+pub fn floors_widening(floors: crate::abstraction::FloorsPrecision) -> celeste_engine::runtime2::FloorsWidening {
+    use crate::abstraction::FloorsPrecision as P;
     use celeste_engine::runtime2::FloorsWidening as W;
     match floors {
         P::Exact => W::Exact,
@@ -1378,7 +1361,7 @@ pub fn floors_widening(floors: crate::interpreter::abstraction::FloorsPrecision)
 
 /// `rt2` projected IN PLACE onto `level` (`Rt2::widen_to`): the row the
 /// level's kernels would store for it (the remainder widened at every level).
-pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::interpreter::abstraction::Level) {
+pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::abstraction::Level) {
     rt2.widen_to(crate::compiled::ids(), level.held.is_unknown(), level.fruit.is_unknown(), floors_widening(level.floors), level.platforms.is_unknown());
 }
 
@@ -1386,7 +1369,7 @@ pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::interpreter::abstraction::Level
 /// block's, which is what a level's nodes are keyed by.
 pub fn widened_keys_rt2(
     rt2: &Rt2,
-    coarser: crate::interpreter::abstraction::Level,
+    coarser: crate::abstraction::Level,
 ) -> Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
     let mut w = rt2.clone_block();
     widen_rt2_to(&mut w, coarser);
@@ -1485,7 +1468,7 @@ pub fn forward_frame(
     // platform time up to `PLATFORM_WORLD_FRAMES` can reach
     // (`concrete::platform_worlds`); a frame past that could hold one it
     // does not have.
-    let level = crate::interpreter::abstraction::current_level();
+    let level = crate::abstraction::current_level();
     // Under the split-frame prototype a game frame is two steps.
     let game_frame = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { frame.div_ceil(2) } else { frame };
     anyhow::ensure!(
@@ -2313,9 +2296,9 @@ mod tests {
     /// up to the node's deadline, and nothing else.
     #[test]
     fn the_mark_filter_admits_up_to_the_deadline() {
-        use crate::interpreter::abstraction::Level;
+        use crate::abstraction::Level;
         let engine = RefEngine::new().expect("ref engine");
-        let block = Block::from_state(&engine.initial_state().expect("initial state")).expect("block");
+        let block = Block::keyed(engine.initial().expect("initial state")).expect("block");
         let coarse = Level::parse("r0sxh").expect("level");
         let (shape, keys, cells) = widened_keys(&block, coarse).expect("keys");
         let mut marked = Visited::new();
@@ -2335,7 +2318,7 @@ mod tests {
     fn row_refs_survive_more_than_256_queue_slots() {
         let mut sink = ForwardSink::empty(false);
         let engine = RefEngine::new().expect("ref engine");
-        let skeleton = Block::from_state(&engine.initial_state().expect("initial state")).expect("block").into_rt2();
+        let skeleton = Block::keyed(engine.initial().expect("initial state")).expect("block").into_rt2();
         for q in 0..300 {
             sink.slots.push(Slot::new(skeleton.clone_block()));
             let s = &mut sink.slots[q];
@@ -2384,7 +2367,7 @@ mod tests {
     #[test]
     fn a_fresh_forward_clears_what_a_killed_run_left() {
         let engine = RefEngine::new().expect("ref engine");
-        let init = vec![Block::from_state(&engine.initial_state().expect("initial state")).expect("block")];
+        let init = vec![Block::keyed(engine.initial().expect("initial state")).expect("block")];
         let dir = std::path::Path::new("/var/tmp/celeste-frame-fresh-start-test");
         let _ = std::fs::remove_dir_all(dir);
         let stale = [dir.join("edges/l9/f009.bin"), dir.join("edges/raw/f009/w0.bin"), dir.join("frames/f009/b0_s0.bin")];
@@ -2404,7 +2387,7 @@ mod tests {
     #[ignore]
     fn forward_run_drives_the_reference_engine() {
         let engine = RefEngine::new().expect("ref engine");
-        let init = vec![Block::from_state(&engine.initial_state().expect("initial state")).expect("block")];
+        let init = vec![Block::keyed(engine.initial().expect("initial state")).expect("block")];
 
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-test");
         let _ = std::fs::remove_dir_all(dir);
@@ -2472,7 +2455,7 @@ mod tests {
 
         {
             let e = RefEngine::new().expect("engine");
-            let init = vec![Block::from_state(&e.initial_state().expect("init")).expect("block")];
+            let init = vec![Block::keyed(e.initial().expect("init")).expect("block")];
             forward_run(&Mutex::new(e), init, dir, 4, true).expect("fresh");
         }
         let fresh4 = keyset(4);
@@ -2482,7 +2465,7 @@ mod tests {
         // "one more frame at rem zero" - lands on the same key set.
         {
             let e = RefEngine::new().expect("engine");
-            let init = vec![Block::from_state(&e.initial_state().expect("init")).expect("block")];
+            let init = vec![Block::keyed(e.initial().expect("init")).expect("block")];
             let e = Mutex::new(e);
             let mut st = ForwardState::start(init, dir, true).expect("start");
             assert_eq!(pos_graph_frame(dir), Some(0), "start must leave a graph beside f0");
@@ -2507,7 +2490,7 @@ mod tests {
         std::fs::create_dir_all(fresh_dir).expect("mkdir");
         {
             let e = RefEngine::new().expect("engine");
-            let init = vec![Block::from_state(&e.initial_state().expect("init")).expect("block")];
+            let init = vec![Block::keyed(e.initial().expect("init")).expect("block")];
             forward_run(&Mutex::new(e), init, fresh_dir, 6, true).expect("fresh 6");
         }
         {
@@ -2539,21 +2522,18 @@ mod tests {
     /// (2026-10-01). Both engines must make the same successor set.
     #[test]
     fn room_02_spawn_frame_kernels_make_the_reference_successors() {
-        use crate::interpreter::abstraction::{set_level, Level};
+        use crate::abstraction::{set_level, Level};
         std::env::set_var("CELESTE_START_ROOM", "0,2");
         set_level(Level::parse("r0sx").expect("level"));
         let kernels = crate::compiled::FrameEngine::new_for_start_room().expect("kernels");
         let reference = Mutex::new(RefEngine::new().expect("ref engine"));
         // 25 frames of no input: the spawn's last frame is the 26th.
-        let mut concrete = crate::concrete::ConcreteEngine::new().expect("concrete");
-        let init = concrete.initial_state().expect("initial state");
-        let mut st = init.clone();
+        let mut concrete = RefEngine::new().expect("ref engine");
+        let mut row = concrete.initial().expect("initial state");
         for _ in 0..25 {
-            st = concrete.step_frame(st, 0).expect("frame");
-            crate::concrete::restore_buttons(&init, &mut st).expect("buttons");
+            row = concrete.step_one(&row, 0).expect("frame").into_rt2();
         }
         // The state as a row of the level: its boundary widenings applied.
-        let mut row = Block::from_state(&st).expect("block").into_rt2();
         widen_rt2_to(&mut row, Level::EXACT);
         let successors = |engine: &dyn FrameStep| -> std::collections::BTreeSet<((u64, u64), u32)> {
             let door = crate::search::door::Door::new();
@@ -2580,7 +2560,7 @@ mod tests {
     /// at level 1 (2026-10-02, `runtime2::av_code`).
     #[test]
     fn room_13_exit_frame_keys_the_concrete_exit() {
-        use crate::interpreter::abstraction::{set_level, Level};
+        use crate::abstraction::{set_level, Level};
         std::env::set_var("CELESTE_START_ROOM", "1,3");
         let level = Level::parse("r0sxh").expect("level");
         set_level(level);
@@ -2593,23 +2573,13 @@ mod tests {
             .collect();
         assert_eq!(inputs.len(), 127);
         let mut reference = RefEngine::new().expect("ref engine");
-        let init = reference.initial_state().expect("initial state");
-        let step = |reference: &mut RefEngine, st: &crate::interpreter::state::State, byte: u8| {
-            let mut s = st.clone();
-            crate::concrete::set_concrete_buttons(&mut s, byte).expect("buttons");
-            let mut out = reference.run_frame_concrete_all(&s).expect("frame");
-            assert_eq!(out.len(), 1, "one concrete successor");
-            let mut next = out.pop().unwrap();
-            crate::concrete::restore_buttons(&init, &mut next).expect("buttons");
-            next
-        };
-        let mut st = init.clone();
+        let mut st = reference.initial().expect("initial state");
         for &b in &inputs[..126] {
-            st = step(&mut reference, &st, b);
+            st = reference.step_one(&st, b).expect("one concrete successor").into_rt2();
         }
-        let exit = Block::from_state(&step(&mut reference, &st, inputs[126])).expect("block");
+        let exit = reference.step_one(&st, inputs[126]).expect("one concrete successor");
         assert!(wins_of(exit.rt2()).expect("wins")[0], "the reference solution exits at frame 127");
-        let mut parent = Block::from_state(&st).expect("block").into_rt2();
+        let mut parent = st;
         widen_rt2_to(&mut parent, level);
         let door = crate::search::door::Door::new();
         let (next, _, _) = forward_frame(&kernels, vec![Block::from_rt2(parent)], &door, None, None, 127, None).expect("frame");
@@ -2640,17 +2610,12 @@ mod tests {
             .collect();
         assert_eq!(inputs.len(), 55);
         let mut reference = RefEngine::new().expect("ref engine");
-        let init = reference.initial_state().expect("initial state");
-        let mut st = init.clone();
+        let mut st = reference.initial().expect("initial state");
         for (i, &b) in inputs.iter().enumerate() {
-            let mut s = st.clone();
-            crate::concrete::set_concrete_buttons(&mut s, b).expect("buttons");
-            let mut out = reference.run_frame_concrete_all(&s).expect("frame");
-            assert_eq!(out.len(), 1, "one concrete successor");
-            st = out.pop().unwrap();
-            crate::concrete::restore_buttons(&init, &mut st).expect("buttons");
-            let won = wins_of(Block::from_state(&st).expect("block").rt2()).expect("wins")[0];
+            let next = reference.step_one(&st, b).expect("one concrete successor");
+            let won = wins_of(next.rt2()).expect("wins")[0];
             assert_eq!(won, i + 1 == 55, "frame {}: won {won}", i + 1);
+            st = next.into_rt2();
         }
     }
 
@@ -2668,7 +2633,7 @@ mod tests {
     /// are built per process for one level, so the unsplit side is pinned.
     #[test]
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
-        use crate::interpreter::abstraction::{set_level, Level};
+        use crate::abstraction::{set_level, Level};
         std::env::set_var("CELESTE_START_ROOM", "2,1");
         std::env::set_var("CELESTE_SPLIT_FRAME", "1");
         set_level(Level::parse("r0sxhn").expect("level"));
@@ -2676,7 +2641,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("checkpoint dir");
         let engine = crate::compiled::FrameEngine::new_for_start_room().expect("engine");
-        let init = vec![Block::from_state(&RefEngine::new().expect("ref").initial_state().expect("init")).expect("block")];
+        let init = vec![Block::keyed(RefEngine::new().expect("ref").initial().expect("init")).expect("block")];
         // Unsplit, frame by frame: 1 state a frame through the spawn, then these.
         let unsplit: Vec<(u32, usize)> = (0..24).map(|f| (f, 1)).chain([(24, 27), (25, 308), (26, 1576), (27, 5559), (28, 15348)]).collect();
         let last = unsplit.last().unwrap().0;

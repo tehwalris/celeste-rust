@@ -125,8 +125,7 @@ fn floor_fragment(v: &Iv, k: u32) -> Iv {
     // The HIGHEST value that still floors to `base` is `base+1 - eps`, NOT
     // `base+1` (which floors to `base+1`). Clamping to `base+1` inclusive left
     // the fragment spanning two floors, so the subsequent `flr` refused it -
-    // exposed by the bridge gate on a fractional-speed `move` (rem widened,
-    // spd non-integer). See `floor_span`: a fragment must span exactly one.
+    // exposed on a fractional-speed `move` (rem widened, spd non-integer). See `floor_span`: a fragment must span exactly one.
     let frag_hi_top = P8::from_i16(base + 1).next_smallest();
     // Clip [base, base+1) to v.
     let lo = if v.low > frag_lo { v.low } else { frag_lo };
@@ -146,7 +145,7 @@ impl Domain for RefDomain {
     }
 
     fn arith(&mut self, op: Arith, a: &Iv, b: &Iv) -> Result<Iv> {
-        // An unknown number (the whole 16.16 range: the bridge's form of
+        // An unknown number (the whole 16.16 range: `refbridge`'s form of
         // `AV::UNum`) stays unknown through any arithmetic: in wrapping 16.16
         // every result is possible, as the kernels' `UnknownNum` folds.
         if is_unknown(a) || is_unknown(b) {

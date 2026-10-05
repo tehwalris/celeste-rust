@@ -1,11 +1,5 @@
-//! ONE frame of the abstract search, behind one interface.
-//!
-//! `FrameEngine::run_frame_block` is `(shape, rows) -> [(shape, rows)]`: the
-//! runtime-assembled ASM kernels (`asm_kernel`) over the engine's columnar
-//! blocks, with the pre-partition, cross-block dedup and the k-way
-//! same-shape merge around them. `bridge` translates an interpreter `State`
-//! into a block and back - the one place in the codebase that names both
-//! `State` and `Rt2`, which is why it is HERE and not in celeste-engine.
+//! ONE frame of the abstract search: `FrameEngine`, the runtime-assembled
+//! ASM kernels (`asm_kernel`) over the engine's columnar blocks.
 
 use std::sync::Arc;
 
@@ -17,7 +11,6 @@ use celeste_engine::runtime2;
 use celeste_names as gen;
 
 pub(crate) mod asm_kernel;
-pub mod bridge;
 pub mod dispatch;
 
 pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
@@ -71,7 +64,7 @@ pub fn ids() -> &'static runtime2::BoundaryIds {
 /// The start room's cart and collision cache, loaded once. Every block
 /// carries these two `Arc`s (the kernels read tiles through them), so
 /// anything that builds a block outside an engine - the checkpoint loader,
-/// the bridge from a reference `State` - attaches the same pair.
+/// `trace::refbridge` - attaches the same pair.
 pub fn room_context() -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
     static CTX: std::sync::OnceLock<(Arc<CartData>, Arc<CollisionCache>)> =
         std::sync::OnceLock::new();

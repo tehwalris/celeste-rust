@@ -533,7 +533,7 @@ pub fn room_constant_lattice(
 
     let mut it: Interp<'static, Symbolic> = Interp::new(Symbolic::default());
     let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
-    let (rx, ry) = celeste_interp::game_runner::start_room();
+    let (rx, ry) = crate::game_runner::start_room();
     let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
     it.cache = Some(cache.clone());
     it.cart = Some(cart_data.clone());

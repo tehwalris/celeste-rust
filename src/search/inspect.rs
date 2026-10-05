@@ -103,7 +103,7 @@ pub fn project_all(rt2: &Rt2) -> Vec<Proj> {
 }
 
 /// Every row of `rt2` widened onto `level` (`frame::widen_rt2_to`), projected.
-pub fn project_onto(rt2: &mut Rt2, level: crate::interpreter::abstraction::Level) -> Vec<Proj> {
+pub fn project_onto(rt2: &mut Rt2, level: crate::abstraction::Level) -> Vec<Proj> {
     crate::frame::widen_rt2_to(rt2, level);
     project_all(rt2)
 }

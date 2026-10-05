@@ -35,7 +35,7 @@ pub fn mix64(mut x: u64) -> u64 {
 /// types a cell as an interval column if any of its outcomes writes an
 /// interval there, and a number lands in it as `[n, n]`,
 /// `asm_kernel::BodyCols`), and the kernels, the boundary, `widen_to` and the
-/// bridge from a `State` do not all type a cell alike. Coded apart, one state
+/// reference engine's rows do not all type a cell alike. Coded apart, one state
 /// had two keys: room (1,3)'s exit rows carry the next room's balloon `y`,
 /// a number in the outcome the kernel keyed but `[64, 64]` in the column, so
 /// the mark filter (canonical keys of the widened finer rows) never found

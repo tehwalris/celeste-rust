@@ -1,15 +1,7 @@
-//! Game setup: the start-room configuration the whole search agrees on.
-//!
-//! This file used to also hold the reference interpreter's builtin
-//! implementations (`min`, `max`, `flr`, `tile_flag_at`, ...) and the
-//! `FixedEnv` that registered them. Those fed the CFG interpreter, which is
-//! gone (the tracer's `RefEngine` is the reference now and reimplements the
-//! builtins over its own domain), so the builtins and `FixedEnv` went with it
-//! (`fixed_env.rs`). What is left is the start-room configuration, which is
-//! still the single source of truth for the cart substitution, the collision
-//! cache room, and the checkpoint fingerprint.
+//! Game setup: the start-room configuration the whole search agrees on (the
+//! cart substitution, the collision cache's room, the win room).
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 /// The room the search starts in, from `CELESTE_START_ROOM` ("x,y"),
 /// default (1, 0). Drives the `_init` load_room substitution

@@ -70,8 +70,8 @@ fn kind(c: &Cell2) -> &'static str {
 
 /// Build the ENGINE's structure for a traced state.
 ///
-/// The mirror of `compiled::bridge::import_block`, over the tracer's
-/// heap instead of the interpreter's. It exists because an outcome that
+/// The same boxed layout `trace::refbridge::to_block` builds, over the
+/// tracer's symbolic heap. It exists because an outcome that
 /// allocates ends in a shape the input block does not have, so its
 /// output paths have nothing to resolve against until someone builds
 /// that shape.
@@ -203,8 +203,7 @@ pub fn structure_of(
             }
             Todo::Val(Value::Builtin(name)) => {
                 // IN PLACE, not behind a pointer. The engine names a
-                // builtin by index into `BUILTIN_NAMES` - the ABI
-                // `compiled::bridge` translates - and the importer puts
+                // builtin by index into `BUILTIN_NAMES`, and a block puts
                 // that cell AT the slot rather than adding an
                 // indirection, unlike a table or a closure.
                 //
@@ -241,7 +240,7 @@ pub fn structure_of(
                 // tracer's heap models the same table as a sparse
                 // `ints` map instead, which is a finer model - and a
                 // DIFFERENT one, so a block bound from it would have a
-                // structure `import_block` never produces and a shape
+                // structure `refbridge::to_block` never produces and a shape
                 // hash no kernel matches.
                 //
                 // So flatten here, the interpreter's way. Not a choice
@@ -295,7 +294,7 @@ pub fn structure_of(
                     Cell2::Unk
                 } else if arr.is_empty() {
                     // Fields the boundary does not name are dropped,
-                    // exactly as `import_block` drops them: no generated
+                    // exactly as `refbridge::to_block` drops them: no generated
                     // code can access one, so it is unreachable weight.
                     let mut fields: Vec<(u32, u32)> = Vec::new();
                     for (k, v) in tab.hash.iter() {
@@ -528,7 +527,7 @@ mod tests {
         let cart = std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
         );
-        let (rx, ry) = celeste_interp::game_runner::start_room();
+        let (rx, ry) = crate::game_runner::start_room();
         let cache = std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).expect("cache"),
         );
@@ -665,7 +664,7 @@ mod tests {
         let cd = std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
         );
-        let (rx, ry) = celeste_interp::game_runner::start_room();
+        let (rx, ry) = crate::game_runner::start_room();
         let cache = std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
         );
@@ -718,7 +717,7 @@ mod tests {
         let cd = std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
         );
-        let (rx, ry) = celeste_interp::game_runner::start_room();
+        let (rx, ry) = crate::game_runner::start_room();
         let cache = std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
         );

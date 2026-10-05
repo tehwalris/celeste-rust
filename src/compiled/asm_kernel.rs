@@ -1734,7 +1734,7 @@ pub(crate) fn take_call_stats() -> [u64; 7] {
 
 /// The kernel set of the process-global level (built on first use).
 pub(crate) fn registry() -> Option<std::sync::Arc<Registry>> {
-    registry_for(crate::interpreter::abstraction::current_level())
+    registry_for(crate::abstraction::current_level())
 }
 
 // Held buttons, the fly fruit, the floors and the platforms widened or exact.
@@ -1760,7 +1760,7 @@ const LEVEL_SLOTS: usize = HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS * PLATFORMS_S
 /// building one more evicts the least recently used, rebuilt if its level
 /// runs again. Unset: no cap, every set stays. A caller holds its set by
 /// `Arc` for the call, so an evicted set lives on until its last chunk ends.
-fn registry_for(level: crate::interpreter::abstraction::Level) -> Option<std::sync::Arc<Registry>> {
+fn registry_for(level: crate::abstraction::Level) -> Option<std::sync::Arc<Registry>> {
     static BUILDING: [std::sync::Mutex<()>; LEVEL_SLOTS] = [const { std::sync::Mutex::new(()) }; LEVEL_SLOTS];
     let slot = level_slot(level);
     if let Some(r) = SETS.lock().unwrap().get(slot) {
@@ -1787,7 +1787,7 @@ struct Sets {
 
 struct ResidentSet {
     slot: usize,
-    level: crate::interpreter::abstraction::Level,
+    level: crate::abstraction::Level,
     /// `None`: the level has no kernel set (cached too; costs nothing).
     set: Option<std::sync::Arc<Registry>>,
     used: u64,
@@ -1808,7 +1808,7 @@ impl Sets {
     fn insert(
         &mut self,
         slot: usize,
-        level: crate::interpreter::abstraction::Level,
+        level: crate::abstraction::Level,
         set: Option<std::sync::Arc<Registry>>,
     ) -> Vec<ResidentSet> {
         self.tick += 1;
@@ -1843,7 +1843,7 @@ fn kernel_set_cap() -> Option<usize> {
     })
 }
 
-fn level_slot(level: crate::interpreter::abstraction::Level) -> usize {
+fn level_slot(level: crate::abstraction::Level) -> usize {
     let held_slot = level.held.is_unknown() as usize;
     let fruit_slot = level.fruit.is_unknown() as usize;
     let floors_slot = level.floors.is_near() as usize;
@@ -1901,7 +1901,7 @@ impl Drop for BuildPurgeDelay {
     }
 }
 
-fn build_registry_for_level(level: crate::interpreter::abstraction::Level) -> Option<Registry> {
+fn build_registry_for_level(level: crate::abstraction::Level) -> Option<Registry> {
     use crate::trace::shapes::WalkOpts;
     let _purge = BuildPurgeDelay::start();
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());

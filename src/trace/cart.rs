@@ -103,7 +103,7 @@ pub fn sources_in(root: &std::path::Path) -> Result<String> {
     // `CELESTE_SPLIT_FRAME`: the split-frame prototype, one frame as two steps
     // (lua/celeste-minimal-split.lua, plans/room60-overnight-2026-09-28.md).
     let lua = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
-    let mut game = celeste_interp::game_runner::apply_start_room(&read(lua)?)?;
+    let mut game = crate::game_runner::apply_start_room(&read(lua)?)?;
     if nodiag() {
         game = forbid_diagonal_dashes(&game)?;
     }

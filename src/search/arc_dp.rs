@@ -654,25 +654,24 @@ impl Witness {
 /// steps ran on one core.)
 pub fn concrete_search(
     dir: &std::path::Path,
-    level: crate::interpreter::abstraction::Level,
+    level: crate::abstraction::Level,
     horizon: u32,
     g: &Graph,
     w: &Winning,
     bound: u32,
     breadth_first: bool,
 ) -> anyhow::Result<Option<Witness>> {
-    use crate::concrete::ConcreteEngine;
     use crate::frame::{frame_files, pack_id, widened_keys, wins_of, Block};
-    use crate::interpreter::state::State;
     use anyhow::Result;
+    use crate::trace::refengine::RefEngine;
     use celeste_engine::runtime2::{Rt2, AV};
     // The engines run the cart's `_init` under the GLOBAL level: build them
     // before the level is set (room (5,3) nodiag's level-0 `_init` ended in
     // no state); their frames run at the exact level whatever is set.
     let workers = crate::frame::threads().max(1);
-    let engines: Vec<std::sync::Mutex<ConcreteEngine>> = (0..workers).map(|_| ConcreteEngine::new().map(std::sync::Mutex::new)).collect::<Result<_>>()?;
-    let initial = engines[0].lock().expect("an engine").initial_state()?;
-    crate::interpreter::abstraction::set_level(level);
+    let engines: Vec<std::sync::Mutex<RefEngine>> = (0..workers).map(|_| RefEngine::new().map(std::sync::Mutex::new)).collect::<Result<_>>()?;
+    let initial = engines[0].lock().expect("an engine").initial()?;
+    crate::abstraction::set_level(level);
     let t0 = std::time::Instant::now();
     // (shape, key, cell) -> the node's index, for the graph's nodes.
     let mut node: FxHashMap<(u64, (u64, u64), u32), u32> = FxHashMap::default();
@@ -710,11 +709,10 @@ pub fn concrete_search(
         cell: u32,
         win: bool,
         exact: (u64, u64),
-        /// The state as its one-row block: an interpreter `State` is ~0.6 MB
-        /// (room (4,3) nodiag: 20k of them past 40 GB), the row a few KB.
         row: Rt2,
     }
-    let start_cell = Block::from_state(&initial)?.positions()?[0];
+    let start = Block::keyed(initial)?;
+    let start_cell = start.positions()?[0];
     // THE FAST PATH: a depth-first search for a win AT the bound, inside
     // `W_{H - bound + k}` (the bound's frames-left alignment), on one engine,
     // with a step budget. Where the bound is the optimum (no level widening
@@ -724,11 +722,10 @@ pub fn concrete_search(
     // bound; an exhausted or abandoned DFS proves nothing and the BFS runs.
     {
         struct Dfs<'a> {
-            eng: &'a mut ConcreteEngine,
-            initial: &'a State,
+            eng: &'a mut RefEngine,
             node: &'a FxHashMap<(u64, (u64, u64), u32), u32>,
             w: &'a Winning,
-            level: crate::interpreter::abstraction::Level,
+            level: crate::abstraction::Level,
             from: u32,
             frames: u32,
             dead: FxHashSet<((u64, u64), u32, u32)>,
@@ -736,17 +733,16 @@ pub fn concrete_search(
             steps: u64,
         }
         /// `Ok(None)`: out of budget.
-        fn dfs(cx: &mut Dfs, st: &State, k: u32) -> Result<Option<bool>> {
+        fn dfs(cx: &mut Dfs, st: &Rt2, k: u32) -> Result<Option<bool>> {
             if k >= cx.frames {
                 return Ok(Some(false));
             }
             for byte in 0u8..64 {
-                for succ in cx.eng.step_all(st, byte, cx.initial)? {
+                for b in cx.eng.step(st, byte)? {
                     cx.steps += 1;
                     if cx.steps > DFS_BUDGET {
                         return Ok(None);
                     }
-                    let b = Block::from_state(&succ)?;
                     let cell = b.positions()?[0];
                     if wins_of(b.rt2())?.iter().any(|&x| x) {
                         // The bound is a lower bound: a concrete win before it
@@ -766,7 +762,7 @@ pub fn concrete_search(
                         continue;
                     }
                     cx.path.push((byte, cell));
-                    match dfs(cx, &succ, k + 1)? {
+                    match dfs(cx, b.rt2(), k + 1)? {
                         Some(true) => return Ok(Some(true)),
                         None => return Ok(None),
                         Some(false) => {}
@@ -781,8 +777,8 @@ pub fn concrete_search(
         const DFS_BUDGET: u64 = 200_000;
         let t = std::time::Instant::now();
         let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { eng: &mut eng, initial: &initial, node: &node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0 };
-        let found = dfs(&mut cx, &initial, 0)?;
+        let mut cx = Dfs { eng: &mut eng, node: &node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0 };
+        let found = dfs(&mut cx, start.rt2(), 0)?;
         eprintln!(
             "[concrete] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
             match found {
@@ -804,9 +800,7 @@ pub fn concrete_search(
     }
     // Per layer k >= 1, each state's (parent index in layer k-1, input, cell).
     let mut back: Vec<Vec<(u32, u8, u32)>> = Vec::new();
-    let start = Block::from_state(&initial)?;
-    let start_exact = start.rt2().clone_block().row_keys_canonical()[0];
-    let mut cur: Vec<(Rt2, (u64, u64))> = vec![(start.into_rt2(), start_exact)];
+    let mut cur: Vec<Rt2> = vec![start.into_rt2()];
     let mut steps = 0u64;
     for k in 0..horizon {
         let t = std::time::Instant::now();
@@ -817,7 +811,7 @@ pub fn concrete_search(
             let hs: Vec<_> = engines
                 .iter()
                 .map(|engine| {
-                    let (cur, node, initial, next_chunk) = (&cur, &node, &initial, &next_chunk);
+                    let (cur, node, next_chunk) = (&cur, &node, &next_chunk);
                     sc.spawn(move || -> Result<(Vec<(usize, Vec<Succ>)>, u64)> {
                         let mut eng = engine.lock().expect("an engine");
                         let (mut out, mut steps) = (Vec::new(), 0u64);
@@ -833,16 +827,10 @@ pub fn concrete_search(
                             // kept one holds a row.
                             let mut got = Vec::new();
                             let mut chunk_seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
-                            for (p, (row, exact)) in cur.iter().enumerate().skip(lo).take(CHUNK) {
-                                // The row back as a state, checked: its exact key
-                                // must survive the round trip.
-                                let st = Block::from_rt2(row.clone_block()).to_state();
-                                let back = Block::from_state(&st)?.rt2().clone_block().row_keys_canonical()[0];
-                                anyhow::ensure!(back == *exact, "layer {k} row {p}: the state does not survive its block's round trip");
+                            for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
                                 for byte in 0u8..64 {
-                                    for succ in eng.step_all(&st, byte, initial).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
+                                    for b in eng.step(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
                                         steps += 1;
-                                        let b = Block::from_state(&succ)?;
                                         let cell = b.positions()?[0];
                                         // The memo key is the EXACT state: `b.keys()` is
                                         // the row key at the search's level (the
@@ -885,7 +873,7 @@ pub fn concrete_search(
         // The layer: each exact state once, the first in (parent, input,
         // leaf) order; the first win ends the search.
         let mut seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
-        let (mut next, mut links): (Vec<(Rt2, (u64, u64))>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
+        let (mut next, mut links): (Vec<Rt2>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
         let mut won: Option<(u32, u8, u32)> = None;
         for s in succs {
             if s.win {
@@ -893,7 +881,7 @@ pub fn concrete_search(
                 break;
             }
             if seen.insert((s.exact, s.cell)) {
-                next.push((s.row, s.exact));
+                next.push(s.row);
                 links.push((s.parent, s.byte, s.cell));
             }
         }
@@ -975,7 +963,7 @@ pub struct Solved {
 /// from, and `arc.txt`.
 pub fn solve(
     dir: &std::path::Path,
-    level: crate::interpreter::abstraction::Level,
+    level: crate::abstraction::Level,
     horizon: u32,
     concrete: Concrete,
     want_marks: bool,

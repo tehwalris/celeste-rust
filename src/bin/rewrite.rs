@@ -6,9 +6,9 @@
 
 use anyhow::Result;
 use celeste_engine::runtime2::Rt2;
-use celeste_rust::concrete::{start_states, ConcreteEngine};
+use celeste_rust::trace::refengine::RefEngine;
 use celeste_rust::frame::{forward_frame, frame_files, frame_paths, id_layer, id_row, id_seq, load_row, pack_id, widen_rt2_to, widened_keys, wins_of, Block, FrameStep, Visited};
-use celeste_rust::interpreter::abstraction::{set_level, Level};
+use celeste_rust::abstraction::{set_level, Level};
 use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary, project_all, project_onto, project_row, projection_key, Proj};
 use clap::{Parser, Subcommand};
 
@@ -407,10 +407,6 @@ enum Command {
         inputs: String,
         #[arg(long, default_value_t = 5)]
         show: usize,
-        /// The search's `--start-after`: follow from those states (frame 0
-        /// the prefix's end).
-        #[arg(long)]
-        start_after: Option<String>,
     },
 }
 
@@ -531,7 +527,7 @@ fn main() -> Result<()> {
                     }
                     None => {
                         let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
-                        let initial = || -> Result<Vec<Block>> { Ok(vec![Block::from_state(&ConcreteEngine::new()?.initial_state()?)?]) };
+                        let initial = || -> Result<Vec<Block>> { Ok(vec![Block::keyed(RefEngine::new()?.initial()?)?]) };
                         let mut st = match celeste_rust::frame::ForwardState::resume(&dir, true)? {
                             Some(s) => s,
                             None => celeste_rust::frame::ForwardState::start(initial()?, &dir, true)?,
@@ -601,7 +597,7 @@ fn main() -> Result<()> {
                 Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)
             };
             eprintln!("[fwd] engine up in {:.2} s ({level}{})", t.elapsed().as_secs_f64(), if reference { ", REFERENCE engine" } else { "" });
-            let initial = vec![Block::from_state(&ConcreteEngine::new()?.initial_state()?)?];
+            let initial = vec![Block::keyed(RefEngine::new()?.initial()?)?];
             let dir = std::path::Path::new(&checkpoint_dir);
             let t = std::time::Instant::now();
             let fwd = celeste_rust::frame::forward_resume_or_run(engine.as_ref(), initial, dir, to)?;
@@ -879,7 +875,6 @@ fn main() -> Result<()> {
         }
         Command::ArcCheck { level_dir, room, win_at, from, to, samples, level } => {
             use celeste_engine::runtime2::{Col, AV};
-            use celeste_rust::interpreter::state::State;
             use celeste_rust::search::arcs::{point, Rect, Rects, Set, CIRCLE};
             std::env::set_var("CELESTE_START_ROOM", &room);
             if let Some(xy) = &win_at {
@@ -889,8 +884,7 @@ fn main() -> Result<()> {
             let dir = std::path::Path::new(&level_dir);
             let edges_dir = dir.join("edges");
             let ids = celeste_rust::compiled::ids();
-            let mut eng = ConcreteEngine::new()?;
-            let initial = eng.initial_state()?;
+            let mut eng = RefEngine::new()?;
             let graph = celeste_rust::search::edges::EdgeGraph::open(&edges_dir, to)?;
             let rem_cells = |rt2: &Rt2| rt2.player_xy_cells(ids, ids.f_rem);
             // One stored row, by id, as a one-lane block.
@@ -906,12 +900,10 @@ fn main() -> Result<()> {
                     rt2.cols[cx] = Col::U(AV::Num(celeste_rust::pico8_num::Pico8Num::from_raw(rem.0 as i32 - 32768)));
                     rt2.cols[cy] = Col::U(AV::Num(celeste_rust::pico8_num::Pico8Num::from_raw(rem.1 as i32 - 32768)));
                 }
-                let st: State = Block::from_rt2(rt2).to_state();
                 let mut out = Vec::new();
                 for b in 0..64u8 {
-                    for succ in eng.step_all(&st, b, &initial)? {
+                    for blk in eng.step(&rt2, b)? {
                         steps.set(steps.get() + 1);
-                        let blk = Block::from_state(&succ)?;
                         let q = match rem_cells(blk.rt2()) {
                             Some((cx, cy)) => {
                                 let raw = |c: usize| -> Result<u32> {
@@ -1047,7 +1039,7 @@ fn main() -> Result<()> {
             let dir = std::path::Path::new(&level_dir);
             set_level(level);
             let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
-            let mut reference = celeste_rust::trace::refengine::RefEngine::new()?;
+            let mut reference = RefEngine::new()?;
             let only = cell.map(cell_at).transpose()?;
             // Every candidate row (seq, row), then `samples` evenly spaced.
             let files = frame_files(dir, frame)?;
@@ -1076,10 +1068,9 @@ fn main() -> Result<()> {
                 // level (the input the kernels' own widening reads).
                 let mut input = rt2.clone_block();
                 widen_rt2_to(&mut input, level);
-                let state = Block::from_rt2(input).to_state();
                 let mut rset: std::collections::BTreeSet<Proj> = Default::default();
-                for leaf in reference.run_lane(&state, 0)? {
-                    rset.extend(project_onto(&mut Block::from_state(&leaf)?.into_rt2(), level));
+                for leaf in reference.run_lane(&input, 0)? {
+                    rset.extend(project_onto(&mut leaf.into_rt2(), level));
                 }
                 let missing: Vec<&Proj> = rset.difference(&kset).collect();
                 let extra: Vec<&Proj> = kset.difference(&rset).collect();
@@ -1471,13 +1462,12 @@ fn main() -> Result<()> {
             let keyed: Vec<Option<(u64, u64)>> = lines.iter().map(|(_, k)| *k).collect();
             let level = spec;
             anyhow::ensure!(level.is_some() || keyed.iter().all(|k| k.is_none()), "keyed trajectory lines need --spec");
-            let mut eng = ConcreteEngine::new()?;
-            let initial = eng.initial_state()?;
+            let mut eng = RefEngine::new()?;
             // (state, the inputs that led to it)
-            let mut layer: Vec<(celeste_rust::interpreter::state::State, Vec<u8>)> = vec![(initial.clone(), Vec::new())];
+            let mut layer: Vec<(Rt2, Vec<u8>)> = vec![(eng.initial()?, Vec::new())];
             for (i, want) in traj.iter().enumerate() {
                 let f = i as u32 + 1;
-                let mut next: Vec<(celeste_rust::interpreter::state::State, Vec<u8>)> = Vec::new();
+                let mut next: Vec<(Rt2, Vec<u8>)> = Vec::new();
                 let mut seen: rustc_hash::FxHashSet<(u64, u64, u32)> = Default::default();
                 let mut tried = 0usize;
                 // Where the successors went: reported when none is at `want`.
@@ -1494,9 +1484,8 @@ fn main() -> Result<()> {
                         // Every leaf: a leaf at the wanted position is as good
                         // a witness as the frame has. The real-PICO-8 replay
                         // is what settles it.
-                        for succ in eng.step_all(st, byte, &initial)? {
+                        for block in eng.step(st, byte)? {
                             tried += 1;
-                            let block = Block::from_state(&succ)?;
                             let cell = block.positions()?[0];
                             let pos = celeste_rust::search::pos_graph::cell_xy(cell);
                             if let Some(w) = want {
@@ -1526,7 +1515,7 @@ fn main() -> Result<()> {
                                 println!("{}", p.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
                                 return Ok(());
                             }
-                            next.push((succ, p));
+                            next.push((block.into_rt2(), p));
                         }
                     }
                 }
@@ -1552,7 +1541,7 @@ fn main() -> Result<()> {
             println!("[trajectory] followed to the end: {} states; one input sequence:", layer.len());
             println!("{}", layer[0].1.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
         }
-        Command::Follow { level_dir, level, inputs, show, start_after } => {
+        Command::Follow { level_dir, level, inputs, show } => {
             let dir = std::path::Path::new(&level_dir);
             let lvl = level;
             set_level(lvl);
@@ -1573,26 +1562,24 @@ fn main() -> Result<()> {
                 layers += 1;
             }
             eprintln!("[follow] {} rows in {layers} layers, {} inputs", at.len(), bytes.len());
-            let mut eng = ConcreteEngine::new()?;
-            let initial = eng.initial_state()?;
-            let mut states = start_states(start_after.as_deref())?;
+            let mut eng = RefEngine::new()?;
+            let mut states = vec![eng.initial()?];
             let mut parent: Option<(u32, u32, u32)> = None;
             for (f, &byte) in bytes.iter().enumerate() {
                 let f = f as u32 + 1;
                 let mut next = Vec::new();
                 for s0 in &states {
-                    next.extend(eng.step_all(s0, byte, &initial)?);
+                    next.extend(eng.step(s0, byte)?);
                 }
                 // Where the tree has one of the concrete leaves (an `rnd` fork
                 // makes several).
                 let mut found = None;
                 let mut won = false;
-                for succ in &next {
-                    let block = Block::from_state(succ)?;
+                for block in &next {
                     if wins_of(block.rt2())?.iter().any(|&w| w) {
                         won = true;
                     }
-                    let (_, keys, cells) = widened_keys(&block, lvl)?;
+                    let (_, keys, cells) = widened_keys(block, lvl)?;
                     if let Some(&loc) = at.get(&(keys[0].0, keys[0].1, cells[0])) {
                         found = Some(loc);
                     }
@@ -1605,7 +1592,7 @@ fn main() -> Result<()> {
                     let (rt2, ..) = load_row(dir, id)?;
                     println!("    parent row (layer {layer} s{seq} r{r}): {}", brief(&project_onto(&mut rt2.clone_block(), lvl)[0]));
                     for s in &states {
-                        println!("    concrete parent: {}", brief(&project_all(Block::from_state(s)?.rt2())[0]));
+                        println!("    concrete parent: {}", brief(&project_all(s)[0]));
                     }
                     let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
                     let (out, _) = rerun(&kernels, rt2, id, "follow")?;
@@ -1619,7 +1606,7 @@ fn main() -> Result<()> {
                     }
                     println!("    {} kernel successors, {kwins} of them wins", kset.len());
                     for succ in &next {
-                        let p = project_onto(&mut Block::from_state(succ)?.into_rt2(), lvl).remove(0);
+                        let p = project_onto(&mut succ.rt2().clone_block(), lvl).remove(0);
                         let verdict = if kset.contains(&p) { "a kernel successor (not stored: a win, or dropped by level -1)" } else { "NOT a kernel successor" };
                         println!("    concrete successor, {verdict}: {}", brief(&p));
                         let dist = |k: &Proj| k.iter().filter(|(n, v)| p.get(*n) != Some(*v)).count() + p.keys().filter(|n| !k.contains_key(*n)).count();
@@ -1638,7 +1625,7 @@ fn main() -> Result<()> {
                 };
                 println!("[follow] f{f} input {byte}: in the tree at layer {} (s{} r{})", loc.0, loc.1, loc.2);
                 parent = Some(loc);
-                states = next;
+                states = next.into_iter().map(Block::into_rt2).collect();
             }
             println!("[follow] every frame is in the tree");
         }

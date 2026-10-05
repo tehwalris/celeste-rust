@@ -1,17 +1,12 @@
-//! Concrete interpreter - runs the game with specific input sequences.
-//!
-//! This is for debugging and validation: run a known TAS input sequence
-//! and observe the resulting player positions. The program and the
-//! per-frame plumbing come from `program` / `concrete`, so this
-//! runs exactly what the abstract search runs.
+//! Runs the game (the reference engine) with a fixed input sequence and
+//! prints the player per frame: the basis for checking a witness against a
+//! real PICO-8 (`pico8_diff/replay.py`, same frame convention).
 
 use anyhow::Result;
-use celeste_rust::concrete;
-use celeste_rust::interpreter::inspect::StateHelper;
-use celeste_rust::interpreter::heap::HeapId;
-use celeste_rust::interpreter::state::State;
-use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
+use celeste_engine::runtime2::{Rt2, AV, NONE};
+use celeste_rust::concrete::{format_input, num_at, objects_of_type};
 use celeste_rust::pico8_num::Pico8Num;
+use celeste_rust::trace::refengine::RefEngine;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -33,83 +28,6 @@ struct Cli {
     object: Option<String>,
 }
 
-/// One object's number fields for `--object`: what a design experiment reads
-/// off it per frame (room (3,0)'s waiting fly fruit, plans/room30.md).
-fn print_object(state: &State, type_name: &str) {
-    let helper = StateHelper::new(state);
-    let Some(id) = find_object(state, type_name) else {
-        return println!("  {type_name}: none");
-    };
-    let mut parts = Vec::new();
-    for f in ["x", "y", "step", "start", "off", "state", "delay"] {
-        if let Some(n) = object_number_field(&helper, id, f) {
-            parts.push(format!("{f}={}", format_num(n)));
-        }
-    }
-    for f in ["spd", "rem"] {
-        if let Some((x, y)) = object_xy_field(&helper, id, f) {
-            parts.push(format!("{f}=({}, {})", format_num(x), format_num(y)));
-        }
-    }
-    println!("  {type_name}: {}", parts.join(" "));
-}
-
-/// Read a scalar-number field of an object behind `player_id`.
-fn object_number_field(helper: &StateHelper, object_id: HeapId, field: &str) -> Option<Pico8Num> {
-    let object = match helper.load(object_id) {
-        HeapValue::ObjectTable(obj) => obj,
-        _ => return None,
-    };
-    object.get(field).and_then(|id| match helper.load(*id) {
-        HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => Some(*n),
-        _ => None,
-    })
-}
-
-/// Read an (x, y) pair off a sub-object field like `spd` or `rem`.
-fn object_xy_field(
-    helper: &StateHelper,
-    object_id: HeapId,
-    field: &str,
-) -> Option<(Pico8Num, Pico8Num)> {
-    let object = match helper.load(object_id) {
-        HeapValue::ObjectTable(obj) => obj,
-        _ => return None,
-    };
-    let sub_id = match helper.load(*object.get(field)?) {
-        HeapValue::Value(Value::Pointer(id)) => *id,
-        _ => return None,
-    };
-    let x = object_number_field(helper, sub_id, "x")?;
-    let y = object_number_field(helper, sub_id, "y")?;
-    Some((x, y))
-}
-
-/// The first object of `type_name` in the objects array, if any.
-fn find_object(state: &State, type_name: &str) -> Option<HeapId> {
-    let helper = StateHelper::new(state);
-    let objects_id = helper.find_global("objects")?;
-    let objects_array_id = match helper.load(objects_id) {
-        HeapValue::Value(Value::Pointer(id)) => *id,
-        _ => return None,
-    };
-    helper
-        .find_objects_by_type(objects_array_id, type_name)
-        .ok()?
-        .first()
-        .copied()
-}
-
-/// Get freeze global value
-fn get_freeze(state: &State) -> Option<Pico8Num> {
-    let helper = StateHelper::new(state);
-    let freeze_id = helper.find_global("freeze")?;
-    match helper.load(freeze_id) {
-        HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => Some(*n),
-        _ => None,
-    }
-}
-
 /// CAREFUL when parsing this output: the format is floor.frac_hex, NOT
 /// sign-magnitude. For negative numbers the whole part is the FLOOR and the
 /// fraction is the positive offset above it: `-4.76ec` means
@@ -124,52 +42,65 @@ fn format_num(n: Pico8Num) -> String {
     }
 }
 
-fn print_frame(state: &State, frame_num: u32, input_byte: u8) {
-    let helper = StateHelper::new(state);
-    let freeze = get_freeze(state).map(format_num).unwrap_or("?".to_string());
-    let position = |id| {
-        Some((
-            object_number_field(&helper, id, "x")?,
-            object_number_field(&helper, id, "y")?,
-        ))
+fn first_object(st: &Rt2, type_name: &str) -> Option<u32> {
+    objects_of_type(st, type_name).first().copied()
+}
+
+fn xy(st: &Rt2, obj: u32, field: &str) -> Option<(Pico8Num, Pico8Num)> {
+    Some((num_at(st, obj, &[field, "x"])?, num_at(st, obj, &[field, "y"])?))
+}
+
+fn position(st: &Rt2, obj: u32) -> Option<(Pico8Num, Pico8Num)> {
+    Some((num_at(st, obj, &["x"])?, num_at(st, obj, &["y"])?))
+}
+
+/// One object's number fields for `--object`.
+fn print_object(st: &Rt2, type_name: &str) {
+    let Some(id) = first_object(st, type_name) else {
+        return println!("  {type_name}: none");
     };
-    if let Some((x, y)) = find_object(state, "player").and_then(&position) {
-        let player_id = find_object(state, "player").unwrap();
-        let (spd_x, spd_y) = object_xy_field(&helper, player_id, "spd")
-            .unwrap_or((Pico8Num::from_i16(0), Pico8Num::from_i16(0)));
-        let rem_str = match object_xy_field(&helper, player_id, "rem") {
-            Some((rem_x, rem_y)) => {
-                format!(" rem=({}, {})", format_num(rem_x), format_num(rem_y))
-            }
+    let mut parts = Vec::new();
+    for f in ["x", "y", "step", "start", "off", "state", "delay"] {
+        if let Some(n) = num_at(st, id, &[f]) {
+            parts.push(format!("{f}={}", format_num(n)));
+        }
+    }
+    for f in ["spd", "rem"] {
+        if let Some((x, y)) = xy(st, id, f) {
+            parts.push(format!("{f}=({}, {})", format_num(x), format_num(y)));
+        }
+    }
+    println!("  {type_name}: {}", parts.join(" "));
+}
+
+fn freeze(st: &Rt2) -> Option<Pico8Num> {
+    let cell = st.globals[celeste_names::global_id("freeze")? as usize];
+    match (cell != NONE).then(|| st.cols[cell as usize].at(0))? {
+        AV::Num(n) => Some(n),
+        _ => None,
+    }
+}
+
+fn print_frame(st: &Rt2, frame_num: u32, input_byte: u8) {
+    let freeze = freeze(st).map(format_num).unwrap_or("?".to_string());
+    let input = format_input(input_byte);
+    if let Some((player, (x, y))) = first_object(st, "player").and_then(|p| Some((p, position(st, p)?))) {
+        let (spd_x, spd_y) = xy(st, player, "spd").unwrap_or((Pico8Num::from_i16(0), Pico8Num::from_i16(0)));
+        let rem = match xy(st, player, "rem") {
+            Some((rx, ry)) => format!(" rem=({}, {})", format_num(rx), format_num(ry)),
             None => String::new(),
         };
         println!(
-            "Frame {}: player at ({}, {}) spd=({}, {}){} freeze={} input={}",
-            frame_num,
+            "Frame {frame_num}: player at ({}, {}) spd=({}, {}){rem} freeze={freeze} input={input}",
             format_num(x),
             format_num(y),
             format_num(spd_x),
             format_num(spd_y),
-            rem_str,
-            freeze,
-            concrete::format_input(input_byte)
         );
-    } else if let Some((x, y)) = find_object(state, "player_spawn").and_then(&position) {
-        println!(
-            "Frame {}: player_spawn at ({}, {}) freeze={} input={}",
-            frame_num,
-            format_num(x),
-            format_num(y),
-            freeze,
-            concrete::format_input(input_byte)
-        );
+    } else if let Some((x, y)) = first_object(st, "player_spawn").and_then(|p| position(st, p)) {
+        println!("Frame {frame_num}: player_spawn at ({}, {}) freeze={freeze} input={input}", format_num(x), format_num(y));
     } else {
-        println!(
-            "Frame {}: no player/player_spawn found, freeze={} input={}",
-            frame_num,
-            freeze,
-            concrete::format_input(input_byte)
-        );
+        println!("Frame {frame_num}: no player/player_spawn found, freeze={freeze} input={input}");
     }
 }
 
@@ -186,48 +117,24 @@ fn main() -> Result<()> {
 
     println!("Running {} frames with {} inputs", num_frames, inputs.len());
     println!("Input sequence: {:?}", inputs);
-    println!(
-        "Decoded: {}",
-        inputs
-            .iter()
-            .map(|&i| concrete::format_input(i))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    println!("Decoded: {}", inputs.iter().map(|&i| format_input(i)).collect::<Vec<_>>().join(", "));
     println!();
 
     println!("Running game init...");
-    let mut ce = concrete::ConcreteEngine::new()?;
-    let mut state = ce.initial_state()?;
+    let mut eng = RefEngine::new()?;
+    let mut state = eng.initial()?;
     println!("Init complete.\n");
 
-    // Print initial state
-    let helper = StateHelper::new(&state);
-    if let Some(id) = find_object(&state, "player_spawn") {
-        if let (Some(x), Some(y)) = (
-            object_number_field(&helper, id, "x"),
-            object_number_field(&helper, id, "y"),
-        ) {
-            println!("Frame 0: player_spawn at ({}, {})", format_num(x), format_num(y));
-        }
-    } else if let Some(id) = find_object(&state, "player") {
-        if let (Some(x), Some(y)) = (
-            object_number_field(&helper, id, "x"),
-            object_number_field(&helper, id, "y"),
-        ) {
-            println!("Frame 0: player at ({}, {})", format_num(x), format_num(y));
-        }
+    if let Some((x, y)) = first_object(&state, "player_spawn").and_then(|p| position(&state, p)) {
+        println!("Frame 0: player_spawn at ({}, {})", format_num(x), format_num(y));
+    } else if let Some((x, y)) = first_object(&state, "player").and_then(|p| position(&state, p)) {
+        println!("Frame 0: player at ({}, {})", format_num(x), format_num(y));
     }
-    drop(helper);
 
     for frame_num in 1..=num_frames {
         // Input for this frame (0 if past the input sequence)
-        let input_byte = if (frame_num as usize) <= inputs.len() {
-            inputs[(frame_num as usize) - 1]
-        } else {
-            0
-        };
-        state = ce.step_frame(state, input_byte)?;
+        let input_byte = inputs.get(frame_num as usize - 1).copied().unwrap_or(0);
+        state = eng.step_one(&state, input_byte)?.into_rt2();
         print_frame(&state, frame_num, input_byte);
         if let Some(t) = &cli.object {
             print_object(&state, t);

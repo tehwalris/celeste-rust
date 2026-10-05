@@ -17,5 +17,4 @@ extern crate anyhow;
 pub mod builtins;
 pub mod cart_data;
 pub mod collision_cache;
-pub mod ids;
 pub mod pico8_num;

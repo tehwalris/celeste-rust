@@ -33,7 +33,7 @@ pub enum PathStep {
     ///
     /// Written `[#n]`. Both this and `Idx` land in the array part - the
     /// interpreter materialises `t[3] = v` on an empty table as a dense
-    /// array with explicit nils, and `compiled::bridge` and
+    /// array with explicit nils, and `trace::refbridge` and
     /// `trace::bind` both follow it - so the difference is only which
     /// numbering the path text uses. `[#3]` and `[2]` name the same
     /// cell.

@@ -42,17 +42,14 @@ pub fn fresh_interp<'a>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Inte
 /// its `d.cursor` is the persistent DFS state. `input` is cloned per path.
 ///
 /// A path that REFUSES (a poisoned/illegal frame, e.g. a fork premise a lane
-/// cannot satisfy) is a real coverage answer, not a crash - but for now it
-/// propagates so the gate sees it; the driver will classify refusals once the
-/// row-key extraction lands.
+/// cannot satisfy) propagates as an error.
 ///
 /// `level` is the precision the frame runs at, passed in rather than read from
-/// the process-global level: a concrete run (`RefEngine::run_frame_concrete`)
-/// is exact whatever level the search has set (2026-09-21: level -1's platform
-/// snapshots, taken while the search held level 0).
+/// the process-global level: a concrete step (`RefEngine::step`) is exact
+/// whatever level the search has set.
 ///
 /// `unknown` names the input's fields that hold an unknown boolean
-/// (`refbridge::to_trace_state_unknowns`): each is a cursor choice of both
+/// (`refbridge::from_block`): each is a cursor choice of both
 /// values per path, made before the frame runs - as the kernels fork a held
 /// trail, and read a fall floor's unknown `collideable`.
 pub fn run_frame_all<'a>(
@@ -60,7 +57,7 @@ pub fn run_frame_all<'a>(
     body: &'a ast::Ast,
     input: &State<RefDomain>,
     unknown: &[(crate::trace::heap::TableId, String)],
-    level: crate::interpreter::abstraction::Level,
+    level: crate::abstraction::Level,
 ) -> Result<Vec<State<RefDomain>>> {
     it.d.cursor = Cursor::new();
     let mut outputs = Vec::new();
@@ -81,7 +78,7 @@ pub fn run_frame_all<'a>(
             let b = it.d.cursor.choose(2) == 1;
             st.heap.tables.get_mut(t).expect("an unknown field's table").hash.insert(k.clone(), crate::trace::heap::Value::Bool(b));
         }
-        if level.floors == crate::interpreter::abstraction::FloorsPrecision::Near {
+        if level.floors == crate::abstraction::FloorsPrecision::Near {
             concretize_near_floors(&mut st, &mut it.d)?;
         }
         // A path that RAISES has no successor (`Interp::poison`; the nodiag
@@ -129,52 +126,4 @@ fn concretize_near_floors(st: &mut State<RefDomain>, d: &mut RefDomain) -> Resul
         iface::set(st, &pc, Value::Bool(k != 2))?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::trace::verify::run_one;
-    use super::*;
-    use crate::trace::{cart, verify::find_player};
-
-    /// Smoke: run the real cart forward through RefDomain to where the player
-    /// exists, then enumerate one real frame's successor states. Exercises the
-    /// whole domain - arithmetic, collision, control flow, the six buttons,
-    /// and any floor-splits - on the actual game. Not a correctness gate yet
-    /// (that needs the row-key extraction), but proves RefDomain runs a real
-    /// frame end to end and the fork enumeration terminates.
-    #[test]
-    #[ignore] // needs the cart on disk; run explicitly
-    fn refdomain_runs_a_real_frame_end_to_end() {
-        let src = cart::sources().expect("sources");
-        let top = full_moon::parse(&src).expect("parse top");
-        let init = full_moon::parse("_init()").expect("parse _init");
-        let body = full_moon::parse("__reset_button_states()\n_update()\n_draw()")
-            .expect("parse body");
-
-        let cd = Arc::new(CartData::load("cart").expect("cart"));
-        let (rx, ry) = celeste_interp::game_runner::start_room();
-        let cache = Arc::new(CollisionCache::new(&cd, rx, ry).expect("cache"));
-
-        let mut it = fresh_interp(cd.clone(), cache.clone());
-        let st = cart::fresh_state::<RefDomain>(&mut it.d);
-        let mut st = run_one(&mut it, &top, st).expect("toplevel");
-        cart::inject_tile_flag_at(&mut st);
-        let mut st = run_one(&mut it, &init, st).expect("_init");
-
-        // Warm up to where the player object exists (the intro sequence),
-        // driving buttons as a single fixed path (the cursor's first leaf).
-        for _ in 0..40 {
-            if find_player(&st).is_some() {
-                break;
-            }
-            let outs = run_frame_all(&mut it, &body, &st, &[], crate::interpreter::abstraction::Level::EXACT).expect("warmup frame");
-            st = outs.into_iter().next().expect("at least one successor");
-        }
-        assert!(find_player(&st).is_some(), "player never appeared in warm-up");
-
-        let outs = run_frame_all(&mut it, &body, &st, &[], crate::interpreter::abstraction::Level::EXACT).expect("frame");
-        assert!(!outs.is_empty(), "a frame produced no successors");
-        eprintln!("[refdriver] one frame -> {} successor states", outs.len());
-    }
 }

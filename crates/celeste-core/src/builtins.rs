@@ -1,11 +1,6 @@
-//! The builtin ABI: index-to-name, folded down here when `celeste-ir` was
-//! deleted.
-//!
-//! `BUILTIN_NAMES` is index-to-name, and the index is what `Cell2::Bi`
-//! stores, what the tracer's bridge emits, and what `import`/`export`
-//! translate through in both directions - so the ORDER is load-bearing in
-//! exactly the way `FIELD_NAMES`' order is. The names and their semantics
-//! come from the reference interpreter's builtin set.
+//! The builtin ABI: `BUILTIN_NAMES` is index-to-name, and the index is what
+//! `Cell2::Bi` stores (the tracer's `bind` and `refbridge` both write it), so
+//! the ORDER is load-bearing in exactly the way `FIELD_NAMES`' order is.
 
 pub const BUILTIN_NAMES: [&str; 19] = [
     "__print",

@@ -351,7 +351,7 @@ pub struct Closure {
     /// and should not become so to store one pointer.
     ///
     /// The engine's block carries captures as columns and hashes them
-    /// into the row key, so this exists to agree with `import_block`.
+    /// into the row key, so this exists to agree with `refbridge::to_block`.
     /// Measured over 30 frames of room (1,0): every closure captures
     /// exactly one thing, the object that owns it, and no capture column
     /// ever varies.

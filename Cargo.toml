@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "crates/celeste-core",
-    "crates/celeste-interp",
     "crates/celeste-names",
     "crates/celeste-engine",
 ]
@@ -12,7 +11,6 @@ members = [
 default-members = [
     ".",
     "crates/celeste-core",
-    "crates/celeste-interp",
     "crates/celeste-names",
     "crates/celeste-engine",
 ]
@@ -24,22 +22,17 @@ edition = "2021"
 
 [dependencies]
 celeste-core = { path = "crates/celeste-core" }
-celeste-interp = { path = "crates/celeste-interp" }
 celeste-engine = { path = "crates/celeste-engine" }
 celeste-names = { path = "crates/celeste-names" }
 mimalloc = { version = "0.1", default-features = false }
 # `mi_option_set`: the kernel build's purge delay (`compiled::asm_kernel`).
 libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 anyhow = "1.0.62"
-im = { version = "15.1.0", features = ["serde"] }
-lazy_static = "1.4.0"
-hex = "0.4.3"
 rustc-hash = "1.1.0"
 # 2.x for the graph's intern table only (`transpile::graph::Graph`): 1.1's
 # Fx ends in a bare multiply, and hashbrown indexes by the low bits.
 rustc-hash2 = { package = "rustc-hash", version = "2.1.3" }
 full_moon = "0.19.0"
-itertools = "0.12.0"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"

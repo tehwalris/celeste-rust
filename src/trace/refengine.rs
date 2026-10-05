@@ -1,63 +1,54 @@
-//! `RefEngine`: the reference interpreter as a frame step - one multi-lane
-//! boundary `State` in, its frame successors out, keyed identically to the
-//! kernels (the gate proves it).
-//!
-//! It owns the parsed cart ASTs (leaked to `'static` so the `Interp` can
-//! borrow the function bodies for its whole life) and a base state with the
-//! cart's functions registered, and runs each input lane through the bridge:
-//! `to_trace_state` -> `run_frame_all` (DFS over the fork tree) ->
-//! `to_interp_state`. Slow by design (per-lane, no vectorization); this is the
-//! REFERENCE, so callers that run it on many lanes sample.
+//! `RefEngine`: the reference interpreter (`Interp<RefDomain>`) as a frame
+//! step on blocks. One lane in (`refbridge::from_block`), every fork leaf of
+//! its frame out as a keyed one-row block (`refbridge::to_block`,
+//! `Block::keyed`), so a reference successor keys like a kernel row. Slow by
+//! design (one lane, one path at a time): callers that run it wide sample.
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use std::sync::Arc;
 
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
+use celeste_engine::runtime2::Rt2;
 use full_moon::ast;
 
-use crate::interpreter::state::State as OState;
+use crate::frame::Block;
+use crate::abstraction::{current_level, Level};
 use crate::trace::interp::Interp;
-use crate::trace::refbridge::{
-    add_missing_builtins, fn_info_of, patch_closures_for, to_interp_state, to_trace_state, to_trace_state_unknowns, FnInfo,
-};
+use crate::trace::refbridge::{fn_info_of, from_block, set_buttons, to_block, FnInfo};
 use crate::trace::refdomain::RefDomain;
 use crate::trace::refdriver::{fresh_interp, run_frame_all};
-use crate::trace::state::State as TState;
+use crate::trace::state::State;
 use crate::trace::verify::run_one;
 
 pub struct RefEngine {
     it: Interp<'static, RefDomain>,
+    /// `__reset_button_states();_update();_draw()`: the six buttons are
+    /// forks like any other.
     body: &'static ast::Ast,
-    /// The concrete frame body: `_update();_draw()` with NO button reset, so
-    /// a caller that has already set the six buttons concretely gets one
-    /// deterministic leaf (the concrete replay path: `concrete_run`, the TAS
-    /// walks). The forking body (`body`) resets and re-forks the buttons.
+    /// `_update();_draw()` with no reset: the caller has set the buttons.
     body_concrete: &'static ast::Ast,
-    base: TState<RefDomain>,
+    /// The post-`_init` state: the room's start, and the builtins a block
+    /// does not carry.
+    base: State<RefDomain>,
     fn_info: FnInfo,
 }
 
-// The raw pointers inside (`FnInfo`'s function-body keys, the `Interp`'s
-// AST references) all point into the `'static` ASTs leaked in `new` -
-// immutable and never freed - so moving the engine to another thread
-// (behind the `Mutex` the `FrameStep` impl uses) is sound.
+// The raw pointers inside (`Interp`'s AST references) point into the
+// `'static` ASTs leaked in `new`, immutable and never freed, so moving the
+// engine to another thread is sound.
 unsafe impl Send for RefEngine {}
 
 impl RefEngine {
-    /// Set up the reference interpreter for the configured start room: parse
-    /// the cart, register the function bodies, and capture the base state the
-    /// bridge patches closures against.
+    /// Parse the cart, run its toplevel and `_init` for the configured start
+    /// room.
     pub fn new() -> Result<Self> {
-        let src = crate::trace::cart::sources()?;
-        let top: &'static ast::Ast = Box::leak(Box::new(full_moon::parse(&src)?));
+        let leak = |src: &str| -> Result<&'static ast::Ast> { Ok(Box::leak(Box::new(full_moon::parse(src)?))) };
+        let top = leak(&crate::trace::cart::sources()?)?;
         crate::trace::cart::check_absent_fields(top)?;
-        let init: &'static ast::Ast = Box::leak(Box::new(full_moon::parse("_init()")?));
-        let body: &'static ast::Ast = Box::leak(Box::new(full_moon::parse(
-            "__reset_button_states()\n_update()\n_draw()",
-        )?));
-        let body_concrete: &'static ast::Ast =
-            Box::leak(Box::new(full_moon::parse("_update()\n_draw()")?));
+        let init = leak("_init()")?;
+        let body = leak("__reset_button_states()\n_update()\n_draw()")?;
+        let body_concrete = leak("_update()\n_draw()")?;
 
         let cart = Arc::new(CartData::load("cart")?);
         let (rx, ry) = crate::game_runner::start_room();
@@ -69,102 +60,56 @@ impl RefEngine {
         crate::trace::cart::inject_tile_flag_at(&mut st0);
         let base = run_one(&mut it, init, st0)?;
         let fn_info = fn_info_of(&base)?;
-
         Ok(RefEngine { it, body, body_concrete, base, fn_info })
     }
 
-    /// The frame-0 state (post-`_init`, with the native `tile_flag_at`
-    /// injected) as a one-lane old-interpreter boundary state - the
-    /// RefEngine equivalent of `interpret_cfg(init_cfg, ...)`. Used to seed
-    /// the search and the frame-0 blocks now that the CFG interpreter is
-    /// gone. The bridge gate proves each subsequent frame reproduces the
-    /// interpreter; the init is frame 0 of that same derivation.
-    pub fn initial_state(&self) -> Result<OState> {
-        crate::trace::refbridge::to_interp_state(&self.base)
+    /// The room's start (post-`_init`) as a one-row block, without keys.
+    pub fn initial(&self) -> Result<Rt2> {
+        to_block(&self.base)
     }
 
-    /// One CONCRETE frame of a single-lane state whose six buttons the caller
-    /// has already set (`concrete::set_concrete_buttons`). Runs
-    /// `_update();_draw()` with no reset and no forking, so a fully concrete
-    /// input yields exactly one successor - the drop-in for
-    /// `concrete::step_frame`.
-    pub fn run_frame_concrete(&mut self, input: &OState) -> Result<OState> {
-        use anyhow::bail;
-        if input.vector_size != 1 {
-            bail!("run_frame_concrete expects one lane, got {}", input.vector_size);
-        }
-        let mut d = RefDomain::new();
-        let mut bridged = to_trace_state(input, 0, &mut d)?;
-        patch_closures_for(&mut bridged, &self.fn_info)?;
-        add_missing_builtins(&mut bridged, &self.base);
+    /// One CONCRETE frame of row 0 of `row` under input `byte`: every leaf,
+    /// keyed at the current level. A concrete input forks only where the
+    /// cart reads a value no input decides (`rnd`); unknown fields of the row
+    /// are read as their placeholder, not forked.
+    pub fn step(&mut self, row: &Rt2, byte: u8) -> Result<Vec<Block>> {
+        let (mut st, _) = from_block(row, 0, &self.fn_info, &self.base)?;
+        set_buttons(&mut st, byte)?;
         // Concrete: exact, whatever level the search has set.
-        let leaves = run_frame_all(&mut self.it, self.body_concrete, &bridged, &[], crate::interpreter::abstraction::Level::EXACT)?;
-        if leaves.len() != 1 {
-            bail!("concrete frame produced {} leaves (expected exactly 1)", leaves.len());
-        }
-        to_interp_state(&leaves[0])
+        let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT)?;
+        leaves.iter().map(|l| Block::keyed(to_block(l)?)).collect()
     }
 
-    /// `run_frame_concrete` where the frame may FORK: every leaf, each a
-    /// state. Buttons are the caller's, as there. A concrete input forks
-    /// only where the cart reads a value no input decides, e.g. `rnd`'s
-    /// draw (room (5,0)'s balloon phase is an interval, so a hit test near
-    /// it can go both ways). A caller that needs a concrete witness keeps
-    /// the leaves it wants and checks the result on a real PICO-8.
-    pub fn run_frame_concrete_all(&mut self, input: &OState) -> Result<Vec<OState>> {
-        use anyhow::bail;
-        if input.vector_size != 1 {
-            bail!("run_frame_concrete_all expects one lane, got {}", input.vector_size);
-        }
-        let mut d = RefDomain::new();
-        let mut bridged = to_trace_state(input, 0, &mut d)?;
-        patch_closures_for(&mut bridged, &self.fn_info)?;
-        add_missing_builtins(&mut bridged, &self.base);
-        run_frame_all(&mut self.it, self.body_concrete, &bridged, &[], crate::interpreter::abstraction::Level::EXACT)?
-            .iter()
-            .map(to_interp_state)
-            .collect()
+    /// `step` where the frame must not fork: the one successor.
+    pub fn step_one(&mut self, row: &Rt2, byte: u8) -> Result<Block> {
+        let mut out = self.step(row, byte)?;
+        ensure!(out.len() == 1, "concrete frame produced {} leaves (expected exactly 1)", out.len());
+        Ok(out.remove(0))
     }
 
-    /// One frame of ONE lane of `input`: every fork leaf as a state.
-    /// An unknown field of the input (a held trail, a fall floor's unknown
-    /// `collideable`) is forked per path; an unknown number is the whole range.
-    pub fn run_lane(&mut self, input: &OState, lane: usize) -> Result<Vec<OState>> {
-        let mut d = RefDomain::new();
-        let (mut bridged, unknown) = to_trace_state_unknowns(input, lane, &mut d)?;
-        patch_closures_for(&mut bridged, &self.fn_info)?;
-        add_missing_builtins(&mut bridged, &self.base);
-        // The engine as a `FrameStep`: the level the search runs.
-        run_frame_all(&mut self.it, self.body, &bridged, &unknown, crate::interpreter::abstraction::current_level())?
-            .iter()
-            .map(to_interp_state)
-            .collect()
+    /// One frame of lane `lane` at the current level: every fork leaf (the
+    /// buttons, and each unknown boolean of the row, are forked per path).
+    pub fn run_lane(&mut self, block: &Rt2, lane: usize) -> Result<Vec<Block>> {
+        let (st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
+        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, current_level())?;
+        leaves.iter().map(|l| Block::keyed(to_block(l)?)).collect()
     }
 }
 
-/// The interpreter as the trusted `FrameStep` implementation (interface #1),
-/// behind a lock: the `Interp` is reused across lanes and paths, and the
-/// loop runs the step from many workers. Each fork leaf is one single-lane
-/// row - correct but unvectorized, which is exactly the reference's
-/// contract (callers that run it wide sample).
+/// The interpreter as the trusted `FrameStep` (interface #1), behind a lock:
+/// the `Interp` is reused across lanes and paths. Each fork leaf is one
+/// single-lane row, emitted with its source lane's cell as the kernels do.
 impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
     fn run(
         &self,
-        block: &crate::frame::Block,
+        block: &Block,
         cell_in: &[u32],
         lanes: std::ops::Range<usize>,
         sink: &mut crate::frame::ForwardSink,
     ) -> Result<()> {
         let mut engine = self.lock().expect("reference engine lock");
-        // The reference runs on interpreter `State`s: cross the bridge both
-        // ways. `Block::from_state` keys each leaf by the one canonical rule,
-        // so the loop sees the same key column the kernels would attach.
-        // Provenance is per lane here: every leaf of lane `l` came from row
-        // `l`, and the sink is told at emission exactly as the kernel does.
-        let input = block.to_state();
         for lane in lanes {
-            for leaf in engine.run_lane(&input, lane)? {
-                let b = crate::frame::Block::from_state(&leaf)?;
+            for b in engine.run_lane(block.rt2(), lane)? {
                 let cell_out = b.positions()?[0];
                 if sink.edges_on {
                     sink.edges.insert((cell_in[lane], cell_out));

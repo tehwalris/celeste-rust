@@ -1147,7 +1147,7 @@ fn cache_file(root: &FsPath, spd_px: i32) -> Result<Option<(PathBuf, String)>> {
     const IRRELEVANT: [&str; 3] = ["CELESTE_THREADS", "CELESTE_LEVEL_MINUS_ONE", "CELESTE_L1_CACHE"];
     let mut env: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k.starts_with("CELESTE_") && !IRRELEVANT.contains(&k.as_str())).collect();
     env.sort();
-    let room = celeste_interp::game_runner::start_room();
+    let room = crate::game_runner::start_room();
     // Two 64-bit SipHashes under different prefixes: a 128-bit name.
     let half = |salt: u8| {
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1675,7 +1675,7 @@ impl Graph1 {
 /// and d.
 fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result<Built> {
     let t_all = std::time::Instant::now();
-    let room0 = celeste_interp::game_runner::start_room();
+    let room0 = crate::game_runner::start_room();
     let lw = super::kernel::room_constant_lattice(root, super::shapes::WalkOpts::LEVEL0.with_held(true))?;
     say!(rep, "room {room0:?}: lattice walk {} shapes, {:.1} s", lw.lattice.len(), t_all.elapsed().as_secs_f64())?;
     let mut tr = lw.tracer.clone();

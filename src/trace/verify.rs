@@ -2017,7 +2017,7 @@ mod tests {
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd =
             std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
-        let (rx, ry) = celeste_interp::game_runner::start_room();
+        let (rx, ry) = crate::game_runner::start_room();
         it.cache = Some(std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
         ));
@@ -2369,7 +2369,7 @@ mod tests {
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd =
             std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
-        let (rx, ry) = celeste_interp::game_runner::start_room();
+        let (rx, ry) = crate::game_runner::start_room();
         it.cache = Some(std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
         ));
@@ -2459,7 +2459,7 @@ mod tests {
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd =
             std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
-        let (rx, ry) = celeste_interp::game_runner::start_room();
+        let (rx, ry) = crate::game_runner::start_room();
         it.cache = Some(std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
         ));
@@ -2651,7 +2651,7 @@ mod tests {
             .map(|(x, y, w, h)| full_moon::parse(&format!("ice_probe = ice_at({x},{y},{w},{h})")).expect("parse probe"))
             .collect();
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let (rx0, ry0) = celeste_interp::game_runner::start_room();
+        let (rx0, ry0) = crate::game_runner::start_room();
         it.cache = Some(std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx0, ry0).expect("cache"),
         ));
@@ -2787,7 +2787,7 @@ end
 
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
-        let (rx, ry) = celeste_interp::game_runner::start_room();
+        let (rx, ry) = crate::game_runner::start_room();
         it.cache = Some(std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
         ));

@@ -226,11 +226,11 @@ grep '^\[gate\]' log | diff - gates/arc_room10_win9-101_h35.txt          # empty
 
 A cargo workspace; the dependency order is load-bearing:
 `celeste-core` (numbers, cart, collision) and `celeste-names` (frozen tables)
-<- `celeste-interp` (the interpreter's `State`, `abstraction::Level`) and
-`celeste-engine` (`Rt2` blocks, keys, lane primitives) <- `celeste-rust`
-(the search `src/frame.rs` + `src/search/`, the tracer `src/trace/`, the
-graph IR / lowering / assembler `src/transpile/`, the kernel registry
-`src/compiled/`, the bins). Details: plans/architecture.md.
+<- `celeste-engine` (`Rt2` blocks, keys, lane primitives) <- `celeste-rust`
+(the search `src/frame.rs` + `src/search/`, the tracer `src/trace/` with the
+reference engine `refengine`, the graph IR / lowering / assembler
+`src/transpile/`, the kernel registry `src/compiled/`, the level
+`src/abstraction.rs`, the bins). Details: plans/architecture.md.
 
 There is NO checked-in kernel artifact: `compiled::asm_kernel::registry`
 retraces the start room's shapes at startup, specializes each on the constant
