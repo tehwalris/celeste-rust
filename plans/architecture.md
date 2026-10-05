@@ -16,7 +16,7 @@ ladder this branch deleted.
 
 **The search is the arc pipeline** (Philippe's direction, 2026-10-04; built
 2026-10-05): the rotation graph ("arcs") is the only treatment of the
-sub-pixel remainder, and an exhaustive concrete count-up inside its winning
+sub-pixel remainder, and an exhaustive concrete search inside its winning
 sets is the only treatment of everything else a level widens. No rem rungs,
 no objects ladder, no mark filter. See "The search" and "Arcs" below.
 
@@ -62,7 +62,7 @@ crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        
   src/search/            checkpoint, door, edges (recorded graph + BFS +
                          transfer tables), arc_edges (the transfer decode),
                          arcs (remainder sets), arc_dp (THE SEARCH: load,
-                         backward, optimum, concrete count-up), pos_graph,
+                         backward, optimum, concrete search), pos_graph,
                          ui_export
   src/trace/             the AST tracer (Lua -> transpile::graph::Graph), the
                          constant-lattice walk (kernel.rs), widen.rs, verify.rs
@@ -90,7 +90,7 @@ fixes made that true: a global assigned nil is REMOVED, as Lua does
 cut keeps a floor's computed `collideable` wherever the player's `is_solid`
 can reach it (`widen::PLAYER_PROBE`). With platforms abstract the split still
 reaches slightly FEWER states than unsplit in room (2,1) (unresolved). The
-search refuses the split frame (its count-up steps whole frames; transfers
+search refuses the split frame (its concrete search steps whole frames; transfers
 over two steps are unchecked).
 
 ## The tracer and the kernel model (from the 2026-09-27 graph model)
@@ -341,16 +341,20 @@ remainder; every backward reads the records and re-runs no kernel
    computes the winning sets `W_t`; `arc_dp::optimum` reads the optimum off
    them. That optimum is exact in the remainder and over-approximates the
    level's other widenings (and `rnd`): a LOWER BOUND, and no win REFUTES H.
-4. **The concrete count-up** (`arc_dp::concrete_count_up`): from the bound,
-   for f = bound, bound + 1, ... <= H, an exhaustive DFS over concrete states
+4. **The concrete search** (`arc_dp::concrete_search`) over concrete states
    (the reference engine's concrete step, every input, every `rnd` leaf) from
    the room's start, admitting a successor only if its projection onto the
-   level is a node whose `W_{H-f+k}` holds its exact remainder, with a
-   per-frame memo of fully explored EXACT states. W holds every concrete
-   winner, so "no win within f" is a proof about the game; the first f with a
+   level is a node whose W holds its exact remainder, and holding each EXACT
+   state once. W holds every concrete winner, so the search is exhaustive
+   inside it and prunes by nothing else. First a depth-first try for a win AT
+   the bound (`W_{H-bound+k}`, one engine, 200k steps at most: where the bound
+   is the optimum it takes a few hundred); then a breadth-first search inside
+   `W_k` (aligned to H), layers expanded in parallel: the first layer with a
    win is the CONCRETE optimum and its path the witness
    (`<dir>/witness_frame_F.txt`). With `--ceiling` a refutation or no witness
-   is an error (a known solution the model cannot reproduce).
+   is an error (a known solution the model cannot reproduce). Its cost is the
+   number of concrete states inside W, which the level's widenings decide:
+   see "Validation".
 
 Resume: rerun the same command; the forward resumes or is reused, the arc
 phase reruns (minutes). A fresh forward clears `frames/` and `edges/`.
@@ -361,9 +365,15 @@ levels. Fused graphs are dropped after assembly unless
 `CELESTE_ASM_EVAL_CHECK` / `CELESTE_KERNEL_EXPLAIN`.
 
 Validation (plans/results.md, "The arc pipeline"): rooms (1,0) 99, (4,2) 71,
-(5,3) 79, (7,0) 84 and (3,3) 172 reproduce their known optima, each witness
-replayed on a real PICO-8. The count-up has not been the cost: at most one
-frame past the bound, ~100k concrete steps.
+(5,3) 79 and (3,3) 172 reproduce their known optima, each witness replayed
+on a real PICO-8. Where the bound is the optimum ((1,0), (4,2), (3,3)) the
+concrete search takes a few hundred steps; (5,3) (bound 78) refuted 78 in
+7.2k steps and found 79 in 99k. Room (7,0) at `r0sxhn` is where it BLOWS
+UP: bound 80 against 84, and the exhaustive region grew 6.5x a frame of
+slack (the old per-frame DFS: 172k steps at f80, 1.29M at f81; ~300M to
+reach 84) - the abstract objects leave W too loose. What decides it is how
+many concrete states the level's widenings let into W; see results.md for
+(7,0) at exact objects.
 
 **What deleted (2026-10-05).** The rem rungs (`RemPrecision`, the bucket
 widening and fork grid, the rem-keyed kernel sets), the precision ladder
@@ -422,7 +432,7 @@ unions, so the union over all paths is pushed exactly (`search::arcs`).
    action_e^-1(W_{t+1}(dst_e))`, a win edge contributing its guard.
 3. **Forward, exact, inside W** from the start's remainder (a point): the
    first win is the optimum at the node graph's precision (the bound); the
-   concrete count-up (above) makes it the game's.
+   concrete search (above) makes it the game's.
 
 **Built.**
 

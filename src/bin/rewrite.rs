@@ -1,5 +1,5 @@
 //! The search driver: `rewrite search` (the level-0 forward, the rotation
-//! graph's backward and the concrete count-up), `rewrite forward` (one
+//! graph's backward and the concrete search), `rewrite forward` (one
 //! forward pass with timing), `rewrite ckhash` (checkpoint fingerprints),
 //! `rewrite export-ui` (the web UI's data), and the diagnostics that read a
 //! finished tree (rows by name: `search::inspect`).
@@ -37,7 +37,7 @@ enum Command {
     /// graph's winning sets backward from the wins (`arc_dp::solve`), whose
     /// optimum is exact in the remainder and a LOWER BOUND on the game's
     /// (the level's other fields may be coarse) - no win there refutes the
-    /// horizon; then the concrete count-up inside the winning sets from that
+    /// horizon; then the concrete search inside the winning sets from that
     /// bound: the first frame with a concrete witness is the CONCRETE
     /// optimum, its inputs written to `<checkpoint-dir>/witness_frame_F.txt`.
     Search {
@@ -61,7 +61,7 @@ enum Command {
         /// Optional synthetic win "x,y" (CELESTE_WIN_AT_XY) for a cheap run.
         #[arg(long)]
         win_at: Option<String>,
-        /// Stop at the arc bound (no concrete count-up).
+        /// Stop at the arc bound (no concrete search).
         #[arg(long)]
         no_witness: bool,
         /// Write the web UI's arc pass into this directory (`export-ui
@@ -526,7 +526,7 @@ fn main() -> Result<()> {
             };
             let t_fwd = t0.elapsed().as_secs_f64();
             eprintln!("[search] forward to f{horizon} in {t_fwd:.1} s; level 0's first win {first_win:?}");
-            // THE ARC PHASE and the concrete count-up.
+            // THE ARC PHASE and the concrete search.
             let s = celeste_rust::search::arc_dp::solve(&dir, level, horizon, !no_witness, save_marks.as_deref().map(std::path::Path::new))?;
             let wall = t0.elapsed().as_secs_f64();
             let Some(bound) = s.arc else {

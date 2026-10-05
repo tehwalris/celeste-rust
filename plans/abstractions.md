@@ -12,10 +12,10 @@ the precision ladder that ran several (rem rungs, then exact objects,
 ## The rules every flag obeys
 
 - **Never widen a field without something exact that refutes it**
-  (CLAUDE.md). The flags below are refuted by the concrete count-up: it runs
+  (CLAUDE.md). The flags below are refuted by the concrete search: it runs
   the real game (the reference engine's concrete step, every input, every
   `rnd` leaf) and prunes by nothing but the arcs' exact winning sets, so a
-  win the widening invented has no concrete path and the count-up moves past
+  win the widening invented has no concrete path and the concrete search moves past
   it. The exceptions are listed under "Widened at every level" and are either
   exact (lose nothing) or a stated best-case caveat.
 - **A widening only replaces a value by something visibly containing it**: a
@@ -28,12 +28,12 @@ the precision ladder that ran several (rem rungs, then exact objects,
   rows because `move`'s `__split_by_flr` forks it.
 - **Projection must agree**: the tracer's in-graph widening (`trace::widen`)
   and the block model's (`Rt2::widen_to`, which projects a CONCRETE state
-  onto the level for the count-up's node lookup) must produce the same row,
-  or the count-up misses the node and prunes a real path - a wrong "no win
+  onto the level for the concrete search's node lookup) must produce the same row,
+  or the concrete search misses the node and prunes a real path - a wrong "no win
   within f". `rewrite follow` (a known solution against a tree) checks it.
 - **The reference engine as a frame step refuses `f` and `p`** (no reference
   form for their ranges and worlds; `h` and `n` it forks per path). The
-  count-up's concrete steps are exact whatever the level.
+  concrete search's concrete steps are exact whatever the level.
 
 ## Decided: fork AFTER the frame, never eagerly (Philippe, 2026-09-21)
 
@@ -85,7 +85,7 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   literal [0, 1], no validity (every block writes them unknown).
 - **Soundness**: a held button may retrigger (a ground jump then a wall jump
   on consecutive frames); over-approximation, refuted by the concrete
-  count-up. The same widening with nothing exact behind it was rejected twice
+  concrete search. The same widening with nothing exact behind it was rejected twice
   (2026-08-06, 2026-08-16).
 - **Measured**: room (1,0) level 0 3.8x fewer states at f70, first win
   unchanged (f89), OPTIMAL 99 in 1:38. Room (2,0) f68: 50.7M -> 13.3M states,
@@ -146,8 +146,8 @@ memory in the kernel walk). plans/lessons.md has the measurements.
 - **On the ladder** (before 2026-10-05) it was kept through a few rem rungs
   (room (0,1): the first exact-objects level peaked at 88k states a frame
   after `r1sxhn`, 26.5M straight after level 0). With the arcs it is the
-  level-0 option of every object room, refuted by the count-up: room (5,3)
-  had its bound at 78 and the count-up refuted 78 in 7.2k concrete steps.
+  level-0 option of every object room, refuted by the concrete search: room (5,3)
+  had its bound at 78 and the concrete search refuted 78 in 7.2k concrete steps.
 
 ## p: moving platforms unknown (`PlatformsPrecision`) - kept, but its rooms cannot run the search yet
 
@@ -181,7 +181,7 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   against 1.42M (it had stopped all cross-frame dedup: `offset` advanced 0.01
   every frame).
 - **`rnd`** is an interval at every level (decided with Philippe
-  2026-09-20); the count-up takes every leaf of a frame that forks on it. A
+  2026-09-20); the concrete search takes every leaf of a frame that forks on it. A
   refutation holds for every draw; a confirmation means "some draw wins". The witness is replayed on PICO-8 per
   seed (`pico8_diff/replay.py --balloon-seeds`, the TAS file's header fixes
   each balloon's offset); several witnesses exit only for some seeds

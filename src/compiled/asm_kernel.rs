@@ -417,7 +417,7 @@ impl AsmKernel {
                 // `error`/`live` are tri-state ZB masks, read with ONE
                 // polarity (plans/graph-model.md section 5): each where it
                 // MAY hold. An unknown `live` reads as live (the row's hull
-                // over-approximates, the concrete count-up refutes); an unknown
+                // over-approximates, the concrete search refutes); an unknown
                 // `error` reads as error, so a lane the trace failed to
                 // fork or decide declines loudly instead of producing a row
                 // from the garbage `val` bit.
@@ -1097,7 +1097,7 @@ fn ival_raw(av: AV) -> (i32, i32) {
 /// tracer could not merge away - the two arms have different shapes, or the
 /// merged guard `Or(g & c, g & !c)` is itself unknown where `c` is. The lane
 /// stands for points on both sides, so the body's hull covers some of them:
-/// emitting the row over-approximates (the concrete count-up refutes the spurious
+/// emitting the row over-approximates (the concrete search refutes the spurious
 /// half), while NOT emitting it loses real successors (room (2,0)'s speed
 /// buckets silently dropped lanes in 813 slices that way, 2026-09-14).
 ///

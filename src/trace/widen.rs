@@ -200,7 +200,7 @@ fn widen_rem(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) 
 /// (`fall_floor_paths`) actually merge pop histories. The claim that the
 /// interval is a full period is the widening's own error: a narrower phase (a
 /// concrete draw) declines loudly, never widened. The block model projects the same way
-/// (`Rt2::widen_to`), for the concrete count-up's node lookup.
+/// (`Rt2::widen_to`), for the concrete search's node lookup.
 fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
     for obj in objects_of_type(st, "balloon") {
         let p = field(&obj, &["offset"]);
@@ -934,7 +934,7 @@ fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::tra
 }
 
 /// The fly fruit's `spd.y` and `rem.y` ranges: ONE definition, shared with the
-/// block model's projection (`Rt2::widen_to`), or the count-up's node lookup misses.
+/// block model's projection (`Rt2::widen_to`), or the concrete search's node lookup misses.
 use celeste_engine::runtime2::{FLY_FRUIT_REM_Y as FRUIT_REM_Y, FLY_FRUIT_SPD_Y as FRUIT_SPD_Y};
 
 /// The fields a fruit-unknown level widens, per live fly fruit

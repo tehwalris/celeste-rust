@@ -14,9 +14,10 @@ steps (`rewrite search`, plans/architecture.md "The search"):
 2. a BACKWARD over the rotation graph ("arcs"): per node the exact set of
    remainders that still win by the horizon. Its optimum is exact in the
    remainder and a lower bound on the game's (no win refutes the horizon);
-3. the CONCRETE COUNT-UP: an exhaustive concrete search (reference engine,
-   every input, every `rnd` leaf) pruned only by those sets, from the bound
-   up. Its first win is the concrete optimum and the witness.
+3. the CONCRETE SEARCH: exhaustive over concrete states (reference engine,
+   every input, every `rnd` leaf), pruned only by those sets - a depth-first
+   try at the bound, then a parallel breadth-first search. Its first win is
+   the concrete optimum and the witness.
 
 Every room has a confirmed optimum (`plans/results.md`); all tie the
 community TAS. The precision ladder that found them (rem rungs, an objects
@@ -29,7 +30,7 @@ comments, 7.4k tests); a cleanup toward ~10k is in progress.
 
 - `plans/architecture.md` - the current design: interfaces, the tracer and
   kernel model, the waves frame and the door, the recorded edges and their
-  transfers, the search (arcs, the concrete count-up), gates, open issues.
+  transfers, the search (arcs, the concrete search), gates, open issues.
 - `plans/abstractions.md` - every level flag (`h f n p`; the remainder):
   what it widens, why it is sound, what refutes it, its status.
 - `plans/results.md` - every room's optimum, how it was proven, its witness;
@@ -60,10 +61,10 @@ latter.
 - **Never widen a field without something EXACT that refutes it.** Every
   widening is an over-approximation: sound for REFUTING a horizon, never for
   confirming one. The remainder's widening is undone by the arcs (exact
-  transfers); every other one (the level's flags) by the concrete count-up,
+  transfers); every other one (the level's flags) by the concrete search,
   which runs the real game - and it is a proof only because it is
   EXHAUSTIVE and prunes by nothing but the arcs' exact winning sets. A
-  widening the count-up also sees (a memo keyed on a widened key was one,
+  widening the concrete search also sees (a memo keyed on a widened key was one,
   `522de36`) is refuted by nothing. This has come up three times
   (`p_jump`/`p_dash` twice). The cost of a new abstraction is the
   abstraction PLUS what refutes it; anything advertised as a free merge is

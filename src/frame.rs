@@ -29,7 +29,7 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 /// step consumes and produces it directly, `keep` is a column filter, the
 /// regroup is a column append, and the checkpoint is the columns. The
 /// interpreter `State` appears only at the edges - the initial state, the
-/// reference engine, the concrete count-up - through `from_state` /
+/// reference engine, the concrete search - through `from_state` /
 /// `to_state`.
 pub struct Block {
     rt2: Rt2,
@@ -637,7 +637,7 @@ impl Slot {
             };
             // A position is a number, or an interval: the lane wins if it
             // meets the target - an over-approximation, which the concrete
-            // count-up refutes.
+            // concrete search refutes.
             let range_at = |cell: u32| -> Result<Box<dyn Fn(u32) -> (i16, i16) + '_>> {
                 Ok(match &sk.cols[cell as usize] {
                     Col::U(AV::Num(n)) => {
@@ -1320,7 +1320,7 @@ pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
 /// coarsening the level's kernels bake into their rows (`Rt2::widen_to`: the
 /// remainder, the dash clamp, the fruit widening, the timer pins, the level's
 /// objects), then the canonical key - on the block's columns, lane for lane.
-/// A concrete state's node at the level (the concrete count-up, the
+/// A concrete state's node at the level (the concrete search, the
 /// diagnostics).
 pub fn widened_keys(
     block: &Block,

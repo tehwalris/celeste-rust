@@ -105,7 +105,7 @@ CELESTE_LEVEL_MINUS_ONE="C,5" \
 - The level: `r0sx` for a room without objects, `r0sxhn` with springs, fall
   floors, balloons, key and chest (everything abstract but where the player
   overlaps a floor; held buttons unknown); `f` for the fly fruit. The concrete
-  count-up refutes what the level invents. Platform rooms cannot run yet (the
+  concrete search refutes what the level invents. Platform rooms cannot run yet (the
   arcs refuse a frame where the player moves twice); the split frame is
   refused.
 - The level -1 filter (plans/level-minus-one.md) with H = the ceiling (or
@@ -114,10 +114,10 @@ CELESTE_LEVEL_MINUS_ONE="C,5" \
 - `--ceiling C` is a known solution (the replayed community TAS): a
   refutation, or no concrete witness by C, is an error, never a result.
   Without a reference, `--to H` with H generous: the forward is the cost, and
-  the count-up stops at the first concrete win.
+  the concrete search stops at the first concrete win.
 - The witness lands in `DIR/witness_frame_F.txt`. **Balloon rooms**: replay it
   with the TAS's seeds (`pico8_diff/replay.py --balloon-seeds a,b`, the
-  tasdatabase header) and with 0 / 0.5 / PICO-8's own rnd - the count-up
+  tasdatabase header) and with 0 / 0.5 / PICO-8's own rnd - the concrete search
   takes every `rnd` leaf, so a witness may exit for some draws only.
 - **When a level grows, look at the states before reasoning about counts**:
   `rewrite cell-growth --by-age`, `col-census --cell x,y` (what varies at one
