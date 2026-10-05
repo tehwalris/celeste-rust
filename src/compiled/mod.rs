@@ -1,11 +1,5 @@
-//! ONE frame of the abstract search, behind one interface.
-//!
-//! `FrameEngine::run_frame_block` is `(shape, rows) -> [(shape, rows)]`: the
-//! runtime-assembled ASM kernels (`asm_kernel`) over the engine's columnar
-//! blocks, with the pre-partition, cross-block dedup and the k-way
-//! same-shape merge around them. `bridge` translates an interpreter `State`
-//! into a block and back - the one place in the codebase that names both
-//! `State` and `Rt2`, which is why it is HERE and not in celeste-engine.
+//! ONE frame of the abstract search: `FrameEngine`, the runtime-assembled
+//! ASM kernels (`asm_kernel`) over the engine's columnar blocks.
 
 use std::sync::Arc;
 
@@ -17,7 +11,6 @@ use celeste_engine::runtime2;
 use celeste_names as gen;
 
 pub(crate) mod asm_kernel;
-pub mod bridge;
 pub mod dispatch;
 
 pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
@@ -69,9 +62,8 @@ pub fn ids() -> &'static runtime2::BoundaryIds {
 }
 
 /// The start room's cart and collision cache, loaded once. Every block
-/// carries these two `Arc`s (the kernels read tiles through them), so
-/// anything that builds a block outside an engine - the checkpoint loader,
-/// the bridge from a reference `State` - attaches the same pair.
+/// carries these two `Arc`s (the kernels read tiles through them); anything
+/// that builds a block outside an engine attaches the same pair.
 pub fn room_context() -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
     static CTX: std::sync::OnceLock<(Arc<CartData>, Arc<CollisionCache>)> =
         std::sync::OnceLock::new();
@@ -85,48 +77,19 @@ pub fn room_context() -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
     Ok(CTX.get().expect("just set").clone())
 }
 
-pub struct FrameEngine {
-    ids: runtime2::BoundaryIds,
-    cart: Arc<CartData>,
-    cache: Arc<CollisionCache>,
-}
+pub struct FrameEngine;
 
 impl FrameEngine {
-    pub fn new(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Self {
-        FrameEngine {
-            ids: boundary_ids(),
-            cart,
-            cache,
-        }
-    }
-
-    /// The engine for the configured start room (`room_context`).
+    /// The engine for the configured start room (its cart loads here).
     pub fn new_for_start_room() -> Result<Self> {
-        let (cart, cache) = room_context()?;
-        Ok(Self::new(cart, cache))
-    }
-
-    pub fn ids(&self) -> &runtime2::BoundaryIds {
-        &self.ids
-    }
-
-    /// The room this engine was built for. Exposed so a caller comparing
-    /// against it can import a state into a block the same way it does.
-    pub fn cart(&self) -> Arc<CartData> {
-        self.cart.clone()
-    }
-
-    pub fn cache(&self) -> Arc<CollisionCache> {
-        self.cache.clone()
+        room_context()?;
+        Ok(FrameEngine)
     }
 
     /// One frame of one BUCKET (one shape's block of the frontier), emitted
-    /// into `sink`: every output row the kernel keeps lands in `sink.out`
-    /// (per outcome, at the boundary, keyed), its pos-graph edge in
-    /// `sink.edges`, and - when the sink carries the visited set - only
-    /// rows new to the search are materialized at all. No pre-partition,
-    /// no chunking (the kernel slices by 16 itself), no post-merge (the
-    /// caller routes rows into next frame's buckets).
+    /// into `sink`: kept rows at the boundary, keyed, with their pos-graph
+    /// edges. The kernel slices by 16 itself; the caller routes rows into
+    /// the next frame's buckets.
     pub fn run_bucket(
         &self,
         bucket: &runtime2::Rt2,
@@ -135,11 +98,8 @@ impl FrameEngine {
         sink: &mut crate::frame::ForwardSink,
     ) {
         if !dispatch::run_chunk_kernel(bucket, cell_in, lanes, sink) {
-            // A chunk the kernels cannot take is a COVERAGE GAP, not a
-            // degraded mode (CLAUDE.md "Never deopt to the interpreter"):
-            // there is no fallback. The search checkpoints per completed
-            // frame, so the run resumes from the previous frame once the
-            // missing shape is traced.
+            // A COVERAGE GAP, not a degraded mode: there is no fallback.
+            // The search resumes from the last completed frame's checkpoint.
             panic!(
                 "KERNEL COVERAGE GAP: a {}-row bucket of shape {:#018x} has no kernel; \
                  reasons:\n{}\ntrace the missing shape and resume from the last checkpoint",
@@ -151,11 +111,8 @@ impl FrameEngine {
     }
 }
 
-/// The compiled kernels as the fast `FrameStep` implementation (interface #1),
-/// the counterpart to `RefEngine`. The block IS the engine's block, so this
-/// is `run_bucket` and nothing else: no bridge, and every output carries
-/// the key column the kernel computed. `&mut self` per the trait; the
-/// engine itself is `&self`.
+/// The compiled kernels as the `FrameStep` implementation, the counterpart
+/// to `RefEngine`: just `run_bucket`.
 impl crate::frame::FrameStep for FrameEngine {
     fn run(
         &self,

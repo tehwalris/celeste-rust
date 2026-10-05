@@ -1,15 +1,8 @@
-//! Tracing the actual game.
+//! The game's sources and chunks for the tracer: the builtin Lua, then the
+//! cart, then `_init()`.
 //!
-//! The sources and the chunk layout are the pipeline's
-//! (`program::Sources`): the builtin Lua, then the cart, then
-//! `_init()`. What differs is that nothing is compiled to IR and nothing
-//! is rewritten - the interpreter walks the AST.
-//!
-//! The initial heap is built by the SAME interpreter under the symbolic
-//! domain, which folds everything it can. Nothing in `_init()` is unknown,
-//! so the whole thing folds to constants and the heap that comes out is
-//! concrete - no domain crossing, and it exercises the folding claim on a
-//! real program rather than on a unit test.
+//! The initial heap is built by the same interpreter under the symbolic
+//! domain; nothing in `_init()` is unknown, so it folds to a concrete heap.
 
 use anyhow::{anyhow, Result};
 
@@ -18,9 +11,8 @@ use super::heap::{Heap, Value};
 use super::interp::{Flow, Interp};
 use super::state::State;
 
-/// The builtins that are native rather than written in Lua. The Lua-level
-/// ones (`add`, `foreach`, ...) come from the builtin chunks and need no
-/// help here.
+/// The builtins that are native rather than written in Lua (`add`,
+/// `foreach`, ... come from the builtin chunks).
 pub const NATIVE: &[&str] = &[
     "__print",
     "__new_unknown_boolean",
@@ -43,12 +35,9 @@ pub const NATIVE: &[&str] = &[
     "printh",
 ];
 
-/// `tile_flag_at` is defined in the CART as Lua, and has to be replaced
-/// AFTER the toplevel runs or the Lua definition overwrites the builtin.
-/// The interpreter does the same thing (`inject_tile_flag_at_builtin`) and
-/// for the same reason: the Lua version reads the `room` global and scans
-/// a tile range, which is both stale-prone and a loop over symbolic
-/// bounds once the coordinates stop being constants.
+/// Replace the cart's Lua `tile_flag_at` with the builtin. Must run AFTER the
+/// toplevel, or the Lua definition overwrites it: the Lua version scans a
+/// tile range, a loop over symbolic bounds once the coordinates are unknown.
 pub fn inject_tile_flag_at<D: Domain>(st: &mut State<D>) {
     let g = st.globals;
     st.heap
@@ -64,46 +53,21 @@ pub fn sources() -> Result<String> {
 }
 
 
-/// What ONE FRAME is, for the tracer.
+/// What ONE FRAME is, for the tracer (`trace_frame` runs the button reset
+/// itself, before it).
 ///
-/// The same chunk `program::FRAME_CODE` gives the interpreter,
-/// minus the button reset - `trace_frame` runs that itself, at the same
-/// boundary, before the frame rather than after.
-///
-/// `_draw()` is NOT cosmetic and leaving it out was a real bug. The
-/// player's screen clamp lives there:
-///
-/// ```lua
-/// draw=function(this)
-///   if this.x<-1 or this.x>121 then
-///     this.x=clamp(this.x,-1,121)
-///     this.spd.x=0
-///   end
-/// end
-/// ```
-///
-/// so a lane that walks off the left edge is stopped by `_draw`, not by
-/// `_update`. Tracing `_update()` alone let four lanes drift to x=-2 and
-/// x=-3 at frame 28 of room (1,0), which the widened `rem` then doubled
-/// into eight rows the interpreter did not have. The oracle test could
-/// not catch it: both sides ran the same chunk, so both were wrong the
-/// same way.
+/// `_draw()` is NOT cosmetic: the player's screen clamp (`x` to [-1, 121],
+/// `spd.x = 0`) lives in the player's `draw`.
 pub const FRAME_CODE: &str = "_update()\n_draw()";
 
 /// The cart's Lua, read relative to `root`.
-///
-/// The paths used to be relative to the process's working directory,
-/// which is the repo root for every test in the workspace. The traced
-/// kernel's run check is a crate OUTSIDE the workspace - deliberately,
-/// see its Cargo.toml - so its working directory is not the repo root.
 pub fn sources_in(root: &std::path::Path) -> Result<String> {
     let read = |p: &str| std::fs::read_to_string(root.join(p));
     let b3 = read("lua/builtin_level_3.lua")?;
     let b4 = read("lua/builtin_level_4.lua")?;
-    // `CELESTE_SPLIT_FRAME`: the split-frame prototype, one frame as two steps
-    // (lua/celeste-minimal-split.lua, plans/room60-overnight-2026-09-28.md).
+    // `CELESTE_SPLIT_FRAME`: the split-frame prototype, one frame as two steps.
     let lua = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
-    let mut game = celeste_interp::game_runner::apply_start_room(&read(lua)?)?;
+    let mut game = crate::game_runner::apply_start_room(&read(lua)?)?;
     if nodiag() {
         game = forbid_diagonal_dashes(&game)?;
     }
@@ -116,13 +80,10 @@ pub fn nodiag() -> bool {
     std::env::var_os("CELESTE_NODIAG").is_some()
 }
 
-/// The diagonal arm of the player's dash start (`if input~=0 then if
-/// v_input~=0 then`) RAISES (`nil > 0`): a raise has no successor (the
-/// tracer routes its lanes to the raise row, `Interp::poison`), so a state
-/// that starts a diagonal dash leaves the search - exactly, at every level
-/// and in the reference engine alike, which run this same source. Every
-/// other path of the cart is unchanged: a dash with no direction held goes
-/// horizontally in the facing direction and stays legal.
+/// Make the diagonal arm of the player's dash start RAISE (`nil > 0`): a raise
+/// has no successor (`Interp::poison`), so a diagonal dash leaves the search
+/// exactly, at every level and in the reference engine alike. A dash with no
+/// direction held (horizontal, facing direction) stays legal.
 fn forbid_diagonal_dashes(game: &str) -> Result<String> {
     const ARM: &str = "if input~=0 then\n\t\t  \tif v_input~=0 then\n";
     anyhow::ensure!(game.matches(ARM).count() == 1, "CELESTE_NODIAG: the cart's diagonal dash arm was not found exactly once");
@@ -131,14 +92,12 @@ fn forbid_diagonal_dashes(game: &str) -> Result<String> {
 
 /// Refuse a program that could tell an `ABSENT_AS_ZERO` field's missing
 /// value (nil) from the 0 every frame writes there
-/// (`widen::materialize_absent_fields`). Every `.field` in the program must
-/// be an assignment target or a DIRECT operand of arithmetic (`+ - * / % ^`)
-/// or of an ordering comparison (`< <= > >=`) - on nil each of those is a
-/// runtime error, so a path reading the missing value halts the real game.
-/// Anything else (`==`, `and`/`or`, `not`, a call argument, a local,
-/// parentheses, a further index) refuses. Counted rather than walked with
-/// parents: all `.field` indexes must equal the targets plus such operands.
-/// A bracketed `t["field"]` is refused at trace time (`Interp::index_key`).
+/// (`widen::materialize_absent_fields`). Every `.field` must be an assignment
+/// target or a DIRECT operand of arithmetic or an ordering comparison: on nil
+/// those are runtime errors, so reading the missing value halts the real
+/// game. Checked by counting: all `.field` indexes must equal the targets
+/// plus such operands. A bracketed `t["field"]` is refused at trace time
+/// (`Interp::index_key`).
 pub fn check_absent_fields(ast: &full_moon::ast::Ast) -> Result<()> {
     use full_moon::ast;
     use full_moon::visitors::Visitor;

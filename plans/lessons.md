@@ -113,8 +113,9 @@ size on disk; checkpoints live on disk, not tmpfs).
 
 **Prebuilt kernel sets for every level.** With 18 levels prebuilt, room
 (3,0) held ~30 GB before its frontier (every kernel kept its fused graph).
-Now graphs are dropped after assembly (7.3 -> 1.6 GB a set) and
-`CELESTE_KERNEL_SETS` caps the resident sets.
+Now graphs are dropped after assembly (7.3 -> 1.6 GB a set) and one set
+is resident (the LRU cap `CELESTE_KERNEL_SETS` went with the rem ladder,
+tier 3: levels now only change between forwards).
 
 ## Abstractions
 
@@ -266,3 +267,65 @@ within f" was not a proof. Every count-up refutation before the fix (room
 (5,3) any% 78, nodiag 92-95) had to be rechecked. A cache in front of an
 exact check must be keyed EXACTLY; the widening it inherits is refuted by
 nothing.
+
+
+## Measurements moved out of code comments (tier 3, 2026-10-05)
+
+The code's comments used to carry the story behind each design; the
+design-deciding numbers are kept here, one line each.
+
+- **Lane type as a register** (`ZN`, kernel.rs, 2026-08-23): as
+  `[Pico8Num; 16]` the frame kernel was 61% scalar instructions (the loop
+  vectorizer got 39% of the way); converting one primitive to AVX-512 while
+  the rest stayed arrays was 27% SLOWER; changing only the lane type was 20x
+  on instructions, runtime and build time.
+- **`RowCache` is bounded** (2026-09-14): the unbounded open-addressing set
+  it replaced grew to MBs per unit, missed the cache on every probe and was
+  a third of the append loop; the fused graph re-emits each row ~8x from
+  neighbouring lanes, which an L2-resident table catches.
+- **Debuginfo off for celeste-engine in release**: line tables cost 6.1% on
+  the f35 one-frame bench (103.6 vs 109.9 ms).
+- **The global BDD analysis** (one table for the whole graph): its 2^22-node
+  cap filled on the first formulas and 5.5-8.3k boolean nodes per kernel
+  went unanalysed at nearly all the build's CPU. `bdd::simplify_local` (a
+  small BDD per node over its bounded cone, 2026-09-15) finds more (room
+  (1,0) player shape 11,844 -> 7,569 fused nodes) at ~1/150 the time;
+  expansion 4-32 finds the same, 64+ overflows the local table.
+- **Merging a node into any same-BDD node of its cone** (plans/graph-audit.md):
+  the proof was wrong; the preservation gate caught it losing a decided
+  lane. Only the common-factor shape survives (counterexample in bdd.rs).
+- **`State::ended` per path**: frame-global (OR-ed into every outcome) took
+  room (3,0)'s largest kernel from 78k to 3.3M configurations (2026-09-27).
+- **Own errors scoped to the path's decisions, not the guard**: the guard is
+  exact but makes every fork site's guard a kernel root (room (3,0)'s
+  largest: 456k -> 1.41M nodes).
+- **A merge selects on the separating decision, not the guard**: on the
+  guard one two-valued `freeze` became 37 nodes and 37 bodies.
+- **`merge_inner` reads both sides only once the merge is certain**: copying
+  and GC'ing both heaps per attempt took room (3,0)'s fruit-unknown walk
+  21 s -> 415 s (2026-09-17).
+- **Error derivation in one bottom-up pass**: per-outcome cone walks were
+  outcomes x graph (room (3,0) trace 25 s -> 448 s). Exact (Kleene-lazy)
+  derivation cost +23% frame time on room (1,0) f0-f44; dropping "where it
+  was evaluated" (strict) declined room (1,0) at f25. Plain `abstractness`
+  for an own error added 1M fused error nodes in room (3,0)'s largest kernel.
+- **`flr_ways` capped**: the region's full speed range made move forks
+  13-way (room (3,0) square (5,13): 1,236 -> 35,502 bodies).
+- **Near-level countdown atoms not forked on escape**: forking them took
+  room (1,1) `r0sxhn` from 10 to 14 forks a kernel, 12k -> 29k bodies, 1.7x
+  forward time, same states.
+- **Split pass order and targets**: splitting the guard's selects gave room
+  (6,0) 50,000 splits for 112 outcomes; splitting the error gave a 41-node
+  row under a 5M-node error; anything but largest-cone-first churned 20k
+  splits over ~20 outcomes. `absorbed`: room (6,1) bodies 287,705 ->
+  140,323 but fused nodes only 11.6M -> 10.7M (~80% are `live`/`error`
+  cones). An unmemoised `may_answers` was 14.7 s per trace.
+- **Near floors store the cart's invariant where overlapped**
+  (`widen_near_floors`): storing the computed `state`/`collideable` made the
+  split pass resolve each floor's whole update (room (6,1): 3,638 outcomes,
+  344k bodies, four regions past the 4,096 cap); storing "hidden" and owing
+  it gave 108 outcomes (5,454 bodies). Room (7,0) level 0 f54: erasing the
+  floor delays merged 3.1x, all floor fields 4.6x.
+- **Split frame, middle of the frame**: widening a floor's `collideable`
+  inside the player's probe window let step 2 read a floor step 1 had
+  decided as both (room (2,1) `r0sxhn` f34: 496k states against 387k).

@@ -1,57 +1,37 @@
-//! `rewrite export-ui`: a finished search's checkpoint tree + run log ->
+//! `rewrite export-ui`: a finished search's checkpoint trees + run log ->
 //! the compact static data the web UI (`ui/`) renders.
 //!
-//! What the UI shows is spatial: per (horizon, level, frame) how many
-//! states sit in each player-position cell, which cells hold wins, and per
-//! (horizon, level) the backward's marked states per cell by distance to
-//! the win. All of it is in the checkpoint HEADERS - the cell index of a
-//! frame file gives the per-cell state count as consecutive index
-//! differences, the win list gives the win cells - and in the marks files
-//! (`(shape, cell, key, dist)` rows). No row is decoded and no engine is
-//! built: the export is a walk over headers plus, for the marks by layer,
-//! the key column of the runs at marked cells.
+//! Per (level, frame): states and wins per player-position cell; per marked
+//! set (`search --save-marks`: remainder-free marks, arc-marked nodes): the
+//! marked states per cell by distance to the win. All of it comes from the
+//! checkpoint HEADERS (cell index, win list), the marks files, and the key
+//! column at marked cells: no row is decoded, no engine built.
 //!
-//! How it reads (2026-09-30; room (6,0) h144 levels 0-5, a 1.7G-row level
-//! 0 and 70-100M marks per level: 556 s and 48 GB before, ~25 s and 13 GB
-//! after, on a machine a search was running on). One checkpoint tree at a
-//! time, each read by one worker per core frame by frame, the latest (the
-//! largest) first. A tree's marked sets are read in place off the mapped
-//! marks files (never deserialized as a whole) into hash shards by
-//! (shape, cell), and a frame file's rows are probed against them - a run
-//! at a cell with no marks is skipped without touching its keys. The marks
-//! used to be one hash map built by one thread per tree and probed by that
-//! thread with every row of the tree, which for level 0 was the whole
-//! export.
+//! The input is a `rewrite search` checkpoint directory (`levelNN/` per
+//! `--level`) or one `rewrite forward` tree, with its log: one horizon whose
+//! levels are the forward levels, plus with `--arc` a last level carrying the
+//! arc backward over the last forward tree (`forward_of`). Some JSON fields
+//! (`bwd`, `reruns`, several horizons) are kept only because the UI reads them.
 //!
 //! Output layout (`--out DIR`):
 //!
 //! * `run.json` - the run: room, the cell box every binary indexes into,
-//!   the room's tiles, and per horizon per level the log's per-frame
-//!   forward stats, per-iteration backward stats, the ladder verdict and
-//!   the names of the level's binary files. The UI's timeline, size plots
-//!   and chapter list are all built from this one file.
-//! * `l00.frames.bin` - level 0's frames (persistent across horizons, so
-//!   exported once); `hHHH_lLL.frames.bin` for every finer level.
-//!   Format: `"CUF1" | u32 nframes | nframes x (u32 cells_off, u32
-//!   ncells, u32 wins_off, u32 nwins) | data`, where a cells record at
+//!   the room's tiles, and per level the log's per-frame forward stats and
+//!   the names of the level's binary files.
+//! * `l00.frames.bin` - level 0's frames; `hHHH_lLL.frames.bin` for every
+//!   finer level. Format: `"CUF1" | u32 nframes | nframes x (u32 cells_off,
+//!   u32 ncells, u32 wins_off, u32 nwins) | data`, where a cells record at
 //!   `cells_off` (bytes from file start) is `ncells x u32 idx` followed by
 //!   `ncells x u32 count`, and a wins record likewise; `idx` is
 //!   `(x - box.x0) + (y - box.y0) * box.w`, or `NO_POSITION` (u32::MAX)
 //!   for a state whose player object is gone. Frame f is entry f.
-//! * `hHHH_lLL.marks.bin` - the marked set of that (horizon, level):
-//!   `"CUM1" | u32 n | n x u32 idx | n x u32 dist | n x u32 count`, sorted
-//!   by (dist, idx). `dist` is the state's distance to a win, i.e. the
-//!   backward iteration `horizon - dist` that marked it, so an ascending
-//!   prefix is the backward growing from the wins. A marks file written
-//!   before `dist` was stored (4-tuple rows) exports every dist as 0 and
-//!   `marks_have_dist: false` in `run.json`.
+//! * `hHHH_lLL.marks.bin` - a marked set: `"CUM1" | u32 n | n x u32 idx |
+//!   n x u32 dist | n x u32 count`, sorted by (dist, idx). `dist` is the
+//!   horizon minus the last frame the state still wins from.
 //! * `hHHH_lLL.mlayers.bin` - the same marked set split by the FRAME each
-//!   state was first reached at (its BFS layer): the frames format above
-//!   (magic `"CUL1"`, empty win records), entry f holding the marked
-//!   states of layer f per cell. This is the marks against the forward
-//!   that produced them - a level's forward under its backward - and it
-//!   comes from intersecting the marks with each frame file's `(cell,
-//!   key)` rows, which is the one place the export reads the data region.
+//!   state was first reached at (its BFS layer): the frames format (magic
+//!   `"CUL1"`, empty win records), from intersecting the marks with each
+//!   frame file's `(cell, key)` rows.
 //!
 //! Everything is little-endian u32 at 4-byte alignment, so the UI reads
 //! it as `Uint32Array` views without a parser.
@@ -60,7 +40,7 @@ use anyhow::{bail, Context, Result};
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::search::pos_graph::cell_xy;
 
@@ -85,29 +65,15 @@ pub struct FwdLine {
     pub rss_gb: f64,
 }
 
-/// One backward iteration's line of the run log.
-#[derive(Serialize, Clone, Debug)]
-pub struct BwdLine {
-    pub f: u32,
-    pub targets: u64,
-    pub cand_cells: u64,
-    pub loaded: u64,
-    pub rerun: u64,
-    pub marked: u64,
-    pub load_thread_ms: u64,
-    pub par_ms: u64,
-    pub par_idle: u32,
-    pub total_ms: u64,
-}
-
-/// One (horizon, level) of the ladder as the log tells it.
+/// One level of the run.
 #[derive(Serialize, Clone, Debug)]
 pub struct LevelRun {
     pub level: usize,
-    /// `"Bits(k)"` or `"Exact"`.
+    /// The level's spec (`r0sxhn`), or the arc pass's name.
     pub precision: String,
     pub fwd: Vec<FwdLine>,
-    pub bwd: Vec<BwdLine>,
+    /// Always empty (kept for the UI).
+    pub bwd: [u32; 0],
     pub first_win: Option<u32>,
     pub marked: Option<u64>,
     pub reruns: Option<u64>,
@@ -116,9 +82,7 @@ pub struct LevelRun {
     pub frames: u32,
     pub frames_file: String,
     pub marks_file: Option<String>,
-    /// Per frame, the total states in the frontier and the win count
-    /// (from the checkpoint files - the log's `kept` is the same number
-    /// for a fresh frame, but the tree is the truth the heatmap draws).
+    /// Per frame, the states and the win count, from the checkpoint files.
     pub frame_states: Vec<u64>,
     pub frame_wins: Vec<u64>,
     pub marks_have_dist: bool,
@@ -126,9 +90,8 @@ pub struct LevelRun {
     pub mlayers_file: Option<String>,
     /// Per frame, the marked states of that layer.
     pub marks_by_layer: Vec<u64>,
-    /// A backward that ran over ANOTHER level's forward (`export-ui --arc`:
-    /// the remainder-exact arc backward over level 0's tree): that level's
-    /// index. Its frames are that level's, and it has no forward pass.
+    /// A backward over ANOTHER level's forward (`--arc`): that level's
+    /// index, whose frames it shares; no forward pass of its own.
     pub forward_of: Option<usize>,
 }
 
@@ -137,8 +100,7 @@ pub struct HorizonRun {
     pub h: u32,
     pub levels: Vec<LevelRun>,
     pub refuted_at: Option<usize>,
-    /// A forward on its own (`export-ui --forward-only`): level 0's frames
-    /// up to `h`, no backward and no verdict.
+    /// No backward (exported without `--arc`): frames up to `h`, no verdict.
     pub partial: bool,
 }
 
@@ -218,8 +180,7 @@ fn parse_fwd(line: &str) -> Result<FwdLine> {
         out_blocks: num(ob)?,
         out_lanes: num(ol)?,
         visited: num(after(&t, "visited", 0)?)?,
-        // The waves frame (2026-09-13) logs `wave` / `door` where the
-        // two-phase frame logged `emit` / `own`; both read.
+        // Older logs say `emit` / `own` for `wave` / `door`.
         emit_ms: num(after(&t, "wave", 0).or_else(|_| after(&t, "emit", 0))?)?,
         emit_idle: num(after(&t, "(idle", 0)?)?,
         own_ms: num(after(&t, "door", 0).or_else(|_| after(&t, "own", 0))?)?,
@@ -227,8 +188,7 @@ fn parse_fwd(line: &str) -> Result<FwdLine> {
         ckpt_ms: num(after(&t, "ckpt", 0)?)?,
         pos_ms: num(after(&t, "pos", 0)?)?,
         total_ms: num(after(&t, "total", 0)?)?,
-        // `rss X GB` before 2026-09-13; `rss start A wave B end C peak D
-        // GB` since - the frame's end value is the one the old line gave.
+        // `rss X GB` (older) or `rss start A wave B end C ...`: the end value.
         rss_gb: match after(&t, "rss", 0)? {
             "start" => num(after(&t, "end", 0)?)?,
             v => num(v)?,
@@ -236,157 +196,68 @@ fn parse_fwd(line: &str) -> Result<FwdLine> {
     })
 }
 
-fn parse_bwd(line: &str) -> Result<BwdLine> {
-    let t: Vec<&str> = line.split_whitespace().collect();
-    Ok(BwdLine {
-        f: num(t[1])?,
-        targets: num(after(&t, "targets", 0)?)?,
-        cand_cells: num(after(&t, "cand-cells", 0)?)?,
-        loaded: num(after(&t, "loaded", 0)?)?,
-        rerun: num(after(&t, "rerun", 0)?)?,
-        marked: num(after(&t, "marked", 0)?)?,
-        load_thread_ms: num(after(&t, "load", 0)?)?,
-        par_ms: num(after(&t, "par", 0)?)?,
-        par_idle: num(after(&t, "(idle", 0)?)?,
-        total_ms: num(after(&t, "total", 0)?)?,
-    })
+/// A level with only what the log says.
+fn level_run(level: usize, precision: String, fwd: Vec<FwdLine>, first_win: Option<u32>) -> LevelRun {
+    LevelRun {
+        level,
+        precision,
+        fwd,
+        bwd: [],
+        first_win,
+        marked: None,
+        reruns: None,
+        refuted: false,
+        frames: 0,
+        frames_file: String::new(),
+        marks_file: None,
+        frame_states: Vec::new(),
+        frame_wins: Vec::new(),
+        marks_have_dist: true,
+        marks_by_dist: Vec::new(),
+        mlayers_file: None,
+        marks_by_layer: Vec::new(),
+        forward_of: None,
+    }
 }
 
-/// Parse the run log into horizons in execution order. A `[ladder] hH
-/// level L` line closes the `[fwd]`/`[bwd]` lines since the previous one
-/// as that (horizon, level); the initial level-0 forward therefore lands
-/// in the first horizon's level 0, and each later horizon's level 0 holds
-/// the one frame it was extended by.
-/// With `forward_only` the log is one forward (`rewrite forward`): its
-/// `[fwd]` lines are closed into one partial horizon at its last frame.
-pub fn parse_log(text: &str, forward_only: bool) -> Result<(Vec<HorizonRun>, Option<f64>, Option<f64>, Option<u32>)> {
-    let mut horizons: Vec<HorizonRun> = Vec::new();
+/// The run log: `[fwd]` lines split into levels by the `[search] level i
+/// (SPEC): forward to fH ...; first win W` line closing each (none in a
+/// `rewrite forward` log: one level), the horizon, and the wall time and
+/// optimum of the `OPTIMAL win frame: F (S s)` line.
+pub fn parse_log(text: &str) -> Result<(Vec<LevelRun>, u32, Option<f64>, Option<u32>)> {
+    let mut levels: Vec<LevelRun> = Vec::new();
     let mut fwd: Vec<FwdLine> = Vec::new();
-    let mut bwd: Vec<BwdLine> = Vec::new();
     let mut first_win: Option<u32> = None;
-    let (mut wall, mut prebuild, mut optimal) = (None, None, None);
+    let (mut horizon, mut wall, mut optimal) = (None, None, None);
     for (ln, line) in text.lines().enumerate() {
         let ctx = || format!("log line {}: {line}", ln + 1);
         if line.starts_with("[fwd] first win at f") {
             first_win = Some(num(line.rsplit(' ').next().unwrap_or("")).with_context(ctx)?);
         } else if line.starts_with("[fwd] f") {
             fwd.push(parse_fwd(line).with_context(ctx)?);
-        } else if line.starts_with("[bwd] f") {
-            bwd.push(parse_bwd(line).with_context(ctx)?);
-        } else if line.starts_with("[ladder] h") {
-            let t: Vec<&str> = line.split_whitespace().collect();
-            let h: u32 = num(t[1]).with_context(ctx)?;
-            let level: usize = num(t[3]).with_context(ctx)?;
-            // `(Bits(0)):` -> `Bits(0)`: strip exactly the wrapping parens and
-            // the colon (a `trim_matches` on ')' ate the inner one too).
-            let precision = t[4]
-                .strip_suffix("):")
-                .or_else(|| t[4].strip_suffix(')'))
-                .and_then(|s| s.strip_prefix('('))
-                .unwrap_or(t[4])
-                .to_string();
-            let refuted = line.contains("NO WIN");
-            let (marked, reruns) = if refuted {
-                (None, None)
-            } else {
-                // `N re-runs` (the kernel walk) or `N edges read` (the BFS,
-                // 2026-09-13): the number before the trailing word(s).
-                let work = if line.ends_with("edges read") { t[t.len() - 3] } else { t[t.len() - 2] };
-                (
-                    Some(num(after(&t, "marked", 0)?).with_context(ctx)?),
-                    Some(num(work).with_context(ctx)?),
-                )
-            };
-            let run = LevelRun {
-                level,
-                precision,
-                fwd: std::mem::take(&mut fwd),
-                bwd: std::mem::take(&mut bwd),
-                // The ladder line carries the level's first win even when
-                // this horizon only extended it (no `[fwd] first win` line).
-                first_win: if refuted {
-                    None
-                } else {
-                    Some(num(after(&t, "win", 0)?).with_context(ctx)?).or(first_win.take())
-                },
-                marked,
-                reruns,
-                refuted,
-                frames: 0,
-                frames_file: String::new(),
-                marks_file: None,
-                frame_states: Vec::new(),
-                frame_wins: Vec::new(),
-                marks_have_dist: false,
-                marks_by_dist: Vec::new(),
-                mlayers_file: None,
-                marks_by_layer: Vec::new(),
-                forward_of: None,
-            };
+        } else if let Some(rest) = line.strip_prefix("[search] level ") {
+            let t: Vec<&str> = rest.split_whitespace().collect();
+            let level: usize = num(t[0]).with_context(ctx)?;
+            anyhow::ensure!(level == levels.len(), "{}: level {level} after {} levels", ctx(), levels.len());
+            let spec = t[1].trim_start_matches('(').trim_end_matches("):").to_string();
+            horizon = Some(num(after(&t, "to", 0)?).with_context(ctx)?);
+            let win = line.rsplit("first win ").next().unwrap_or("");
+            let win = win.strip_prefix("Some(").map(|w| num(w)).transpose().with_context(ctx)?;
+            levels.push(level_run(level, spec, std::mem::take(&mut fwd), win));
             first_win = None;
-            match horizons.last_mut() {
-                Some(hr) if hr.h == h => hr.levels.push(run),
-                _ => horizons.push(HorizonRun { h, levels: vec![run], refuted_at: None, partial: false }),
-            }
-        } else if line.starts_with("[search] horizon ") {
-            let t: Vec<&str> = line.split_whitespace().collect();
-            if let Some(hr) = horizons.last_mut() {
-                hr.refuted_at = Some(num(t[t.len() - 1]).with_context(ctx)?);
-            }
-        } else if line.starts_with("[asm build] ") && line.contains("prebuilt in") {
-            let t: Vec<&str> = line.split_whitespace().collect();
-            prebuild = Some(num(t[t.len() - 2]).with_context(ctx)?);
-        } else if line.starts_with("OPTIMAL win frame: ") {
-            optimal = Some(num(line.rsplit(' ').next().unwrap_or("")).with_context(ctx)?);
-        } else if line.starts_with("ELAPSED ") {
-            // The search's own `ELAPSED 9098.66 s` line (no GNU time).
-            wall = Some(num(line.split_whitespace().nth(1).unwrap_or("")).with_context(ctx)?);
-        } else if line.contains("Elapsed (wall clock) time") {
-            // `h:mm:ss or m:ss`.
-            let clock = line.rsplit(' ').next().unwrap_or("");
-            let mut secs = 0.0;
-            for part in clock.split(':') {
-                secs = secs * 60.0 + num::<f64>(part).with_context(ctx)?;
-            }
-            wall = Some(secs);
+        } else if let Some(rest) = line.strip_prefix("OPTIMAL win frame: ") {
+            let t: Vec<&str> = rest.split_whitespace().collect();
+            optimal = Some(num(t[0]).with_context(ctx)?);
+            wall = t.get(1).map(|w| num(w)).transpose().with_context(ctx)?;
         }
     }
-    if forward_only {
-        if !horizons.is_empty() || !bwd.is_empty() || fwd.is_empty() {
-            bail!(
-                "--forward-only wants the log of one forward: {} [ladder] horizons, {} backward lines, {} forward lines",
-                horizons.len(),
-                bwd.len(),
-                fwd.len()
-            );
-        }
-        let h = fwd.last().map_or(0, |l| l.f);
-        let run = LevelRun {
-            level: 0,
-            precision: "forward only".to_string(),
-            fwd: std::mem::take(&mut fwd),
-            bwd: Vec::new(),
-            first_win: first_win.take(),
-            marked: None,
-            reruns: None,
-            refuted: false,
-            frames: 0,
-            frames_file: String::new(),
-            marks_file: None,
-            frame_states: Vec::new(),
-            frame_wins: Vec::new(),
-            marks_have_dist: false,
-            marks_by_dist: Vec::new(),
-            mlayers_file: None,
-            marks_by_layer: Vec::new(),
-            forward_of: None,
-        };
-        horizons.push(HorizonRun { h, levels: vec![run], refuted_at: None, partial: true });
+    if levels.is_empty() {
+        anyhow::ensure!(!fwd.is_empty(), "the log has neither `[search] level` nor `[fwd]` lines");
+        horizon = fwd.last().map(|l| l.f);
+        levels.push(level_run(0, "forward".to_string(), std::mem::take(&mut fwd), first_win));
     }
-    if !fwd.is_empty() || !bwd.is_empty() {
-        bail!("log ends with {} forward / {} backward lines not closed by a [ladder] line", fwd.len(), bwd.len());
-    }
-    Ok((horizons, wall, prebuild, optimal))
+    anyhow::ensure!(fwd.is_empty(), "the log ends with {} `[fwd]` lines after its last level", fwd.len());
+    Ok((levels, horizon.expect("set with every level"), wall, optimal))
 }
 
 /// Sparse per-cell counts of one frame: `(cell, count)` ascending by cell.
@@ -397,8 +268,8 @@ struct LevelData {
     frames: Vec<(Sparse, Sparse)>,
 }
 
-/// `f(i)` for every `i < n`, on one worker per core pulling indices in
-/// order; the results by index. The first error stops the pulling.
+/// `f(i)` for every `i < n` in parallel, results by index; the first error
+/// stops the pulling.
 fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
@@ -431,17 +302,12 @@ fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> Result<T> + Sync) -> Result<V
     Ok(all.into_iter().map(|p| p.1).collect())
 }
 
-/// A marks file, mapped. `Visited::save` writes `(shape, cell, k0, k1,
-/// dist)` rows (32 bytes each) followed by the horizon (4 bytes); older
-/// trees hold the rows alone, 32 bytes with the distance or 28 without. The
-/// bincode `Vec` length prefix says which: the payload is `n x 32 + 4`,
-/// `n x 32` or `n x 28`. Rows are read in place, never deserialized as a
-/// whole: a level's marks run to 100M rows (room (6,0) h144: 1.5-2.8 GB per
-/// file).
+/// A marks file, mapped: `Visited::save`'s `(shape, cell, k0, k1, dist)`
+/// rows (32 bytes each) then the horizon (4 bytes), read in place (up to
+/// ~100M rows).
 struct MarksMap {
     map: memmap2::Mmap,
     rows: usize,
-    stride: usize,
 }
 
 /// Bytes before the first row: the checkpoint value header (16) and the
@@ -458,27 +324,16 @@ impl MarksMap {
         anyhow::ensure!(payload.len() >= 8, "{}: too short for a marks file", path.display());
         let n = u64::from_le_bytes(payload[0..8].try_into().unwrap());
         let body = payload.len() as u64 - 8;
-        let stride = if n.checked_mul(32) == Some(body) || n.checked_mul(32).and_then(|b| b.checked_add(4)) == Some(body) {
-            32
-        } else if n.checked_mul(28) == Some(body) {
-            28
-        } else {
-            bail!("{}: {n} rows do not fit {body} payload bytes as 32- or 28-byte rows", path.display())
-        };
-        Ok(MarksMap { map, rows: n as usize, stride })
+        anyhow::ensure!(n.checked_mul(32).and_then(|b| b.checked_add(4)) == Some(body), "{}: {n} rows do not fit {body} payload bytes", path.display());
+        Ok(MarksMap { map, rows: n as usize })
     }
 
-    fn have_dist(&self) -> bool {
-        self.stride == 32
-    }
-
-    /// Row `i` as `((shape, cell, key), dist)`; dist 0 without distances.
+    /// Row `i` as `((shape, cell, key), dist)`.
     fn row(&self, i: usize) -> ((u64, u32, (u64, u64)), u32) {
-        let b = &self.map[MARKS_ROWS_AT + i * self.stride..MARKS_ROWS_AT + (i + 1) * self.stride];
+        let b = &self.map[MARKS_ROWS_AT + i * 32..MARKS_ROWS_AT + (i + 1) * 32];
         let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-        let dist = if self.stride == 32 { u32_at(28) } else { 0 };
-        ((u64_at(0), u32_at(8), (u64_at(12), u64_at(20))), dist)
+        ((u64_at(0), u32_at(8), (u64_at(12), u64_at(20))), u32_at(28))
     }
 }
 
@@ -494,16 +349,11 @@ fn mark_shard(shape: u64, cell: u32) -> usize {
 /// One marked state: `(shape, cell, key)`, as the frame rows are keyed.
 type MarkId = (u64, u32, (u64, u64));
 
-/// Every marked state of up to 64 sets over one tree, with the bitmask of
-/// the sets that hold it, and the (shape, cell)s that hold any - so a
-/// frame file's run at a cell with none is skipped unread, and a row of
-/// one that has some is one probe.
-///
-/// A hash probe per row, not a merge against sorted marks: a run is a few
-/// rows (one flush's survivors at one cell) while a cell's marks span every
-/// layer, so a sorted lookup started cold per run and paid a binary search
-/// of cache misses per row (2026-09-30: 70% of the export's CPU at room
-/// (6,0)). A probe that misses - most rows are unmarked - is one cache miss.
+/// Every marked state of up to 64 sets over one tree with the bitmask of
+/// sets holding it, and the (shape, cell)s holding any, so a run at an
+/// unmarked cell is skipped unread. A hash probe per row rather than a
+/// merge against sorted marks: runs are a few rows, and a missing probe is
+/// one cache miss.
 struct MarkTable {
     shards: Vec<FxHashMap<MarkId, u64>>,
     cells: rustc_hash::FxHashSet<(u64, u32)>,
@@ -513,11 +363,10 @@ struct MarkTable {
 const MARKS_CHUNK: usize = 1 << 20;
 
 /// The sets' table, and per set its `(cell, dist, count)` sorted by (dist,
-/// cell) (dist 0 throughout when the file has none).
+/// cell).
 fn mark_table(sets: &[MarksMap]) -> Result<(MarkTable, Vec<Vec<(u32, u32, u32)>>)> {
     anyhow::ensure!(sets.len() <= 64, "at most 64 marked sets per tree");
-    // The chunks: every set's rows, read in parallel into per-shard lists
-    // and a per-(dist, cell) count.
+    // Every set's rows in parallel into per-shard lists and (dist, cell) counts.
     let chunks: Vec<(usize, usize)> =
         sets.iter().enumerate().flat_map(|(k, m)| (0..m.rows.div_ceil(MARKS_CHUNK)).map(move |c| (k, c))).collect();
     let read = par_map(chunks.len(), |i| {
@@ -601,10 +450,8 @@ fn frame_counts(dir: &Path, f: u32, marks: Option<&MarkTable>, nsets: usize) -> 
         }
         let Some(t) = marks else { continue };
         let shape = file.shape_hash();
-        // A run is a few rows (one flush's survivors at one cell: ~4 at
-        // room (6,0) level 0, 564M runs over the tree), and a cell's runs
-        // are adjacent: the cell is looked up once, and a run at a cell
-        // without marks is skipped without reading its keys.
+        // A cell's runs are adjacent: look the cell up once, and skip an
+        // unmarked cell's runs without reading their keys.
         let mut last: Option<(u32, bool)> = None;
         for &(cell, start, len) in file.runs() {
             let marked = match last {
@@ -645,10 +492,9 @@ fn sparse(m: FxHashMap<u32, u32>) -> Sparse {
     v
 }
 
-/// Read one level directory: its frames from the headers, and - in the
-/// same pass over the files - the marked sets of `marks` split by layer
-/// (result `[k]` is, per frame, the marked states of set `k` per cell: the
-/// tree's `(cell, key)` rows intersected with the set). Frames in parallel.
+/// Read one level directory: its frames from the headers and, in the same
+/// pass, the sets of `marks` split by layer (`[k]`: per frame, set `k`'s
+/// marked states per cell). Frames in parallel.
 fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
     let fdir = dir.join("frames");
     let mut nframes = 0u32;
@@ -659,33 +505,25 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(Lev
             nframes = nframes.max(n + 1);
         }
     }
-    // The level's position graph, to draw a won state where its player left
-    // from (below). A tree without one draws wins at their own cells; one
-    // that exists and does not load is an error, not a silent skip.
+    // The pos graph, to draw wins where the player left from (below). An
+    // absent graph draws wins in place; an unloadable one is an error.
     let graph_path = dir.join("posgraph.bin");
     let graph = if graph_path.exists() {
         Some(crate::search::pos_graph::PosGraph::load(&graph_path).with_context(|| format!("loading {}", graph_path.display()))?)
     } else {
         None
     };
-    // The latest frames are the largest: pulled first, so the tail of the
-    // parallel pass is the small ones.
+    // The largest (latest) frames first, so the tail is small ones.
     let n = nframes as usize;
     let mut counts = par_map(n, |i| frame_counts(dir, (n - 1 - i) as u32, marks, nsets))?;
     counts.reverse();
     let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(n);
     let mut layers: Vec<Vec<Sparse>> = vec![Vec::with_capacity(n); nsets];
     for FrameCounts { mut cells, mut wins, marked } in counts {
-        // A won state has left the room: its cell is the NEXT room's spawn,
-        // one room over (`pos_graph::room_offset` puts the room it exits to
-        // one room to the right), so drawn as-is the winning states sit in the box's far
-        // corner and the animation never shows the player reach the exit
-        // (room (4,0) f76 at (136,128), room (1,0) f99 at (136,124),
-        // 2026-09-16). Draw each win cell where its player LEFT from instead:
-        // of the cells with a recorded edge into it (the level's pos graph),
-        // the one holding the most states at the previous frame. The count
-        // moves whole, in both the states and the wins record, so totals are
-        // unchanged; with no graph or no occupied source the cell stays.
+        // A won state's cell is in the NEXT room (one room to the right).
+        // Draw it where its player LEFT from: of the pos-graph sources, the
+        // one with the most states at the previous frame. The count moves
+        // whole (states and wins), so totals are unchanged.
         if let (Some(g), Some((prev, _))) = (graph.as_ref(), frames.last()) {
             let prev: &Sparse = prev;
             let busiest = |win: u32| -> Option<u32> {
@@ -711,18 +549,6 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(Lev
         }
     }
     Ok((LevelData { frames }, layers))
-}
-
-/// A level's directory under a search's checkpoint base; a forward's
-/// tree (`forward_only`) is its own level 0.
-fn level_dir(base: &Path, h: u32, level: usize, forward_only: bool) -> PathBuf {
-    if forward_only {
-        base.to_path_buf()
-    } else if level == 0 {
-        base.join("level00")
-    } else {
-        base.join(format!("h{h:03}")).join(format!("level{level:02}"))
-    }
 }
 
 struct Writer {
@@ -857,14 +683,10 @@ fn read_witness(path: &Path) -> Result<Witness> {
     Ok(Witness { label: format!("concrete witness inside the winning sets, a win at f{}", inputs.len()), inputs, path: path_xy })
 }
 
-/// `--arc DIR` (`search --save-marks DIR`, its tree the forward-only one):
-/// the forward's partial horizon becomes a ladder of two backwards over
-/// level 0's forward - the remainder-free BFS (level 0's marks) and the
-/// remainder-exact ARC backward (a second level whose forward is level 0's:
-/// a node is marked when its winning set is non-empty at some frame). The
-/// optimum is the arc search's. Returns the witness when the directory
-/// has one.
-fn attach_arc(horizons: &mut [HorizonRun], optimal: &mut Option<u32>, dir: &Path) -> Result<Option<Witness>> {
+/// `--arc DIR` (`search --save-marks DIR`): the last forward level gets the
+/// remainder-free marks, and a level after it the ARC backward over the same
+/// tree; the optimum is the arc search's. Returns the witness if present.
+fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path) -> Result<Option<Witness>> {
     let kv = read_keyed(&dir.join("arc.txt"))?;
     let get = |k: &str| kv.get(k).with_context(|| format!("arc.txt: no `{k}`"));
     let frame = |k: &str| -> Result<Option<u32>> {
@@ -876,37 +698,20 @@ fn attach_arc(horizons: &mut [HorizonRun], optimal: &mut Option<u32>, dir: &Path
         }
     };
     let h: u32 = num(get("horizon")?)?;
-    let level = get("level")?.clone();
-    let [hr] = horizons else { bail!("--arc wants one forward's log, got {} horizons", horizons.len()) };
-    anyhow::ensure!(hr.h == h, "--arc: the arc search ran to h{h}, the forward's log to f{}", hr.h);
+    anyhow::ensure!(hr.h == h, "--arc: the arc search ran to h{h}, the log's forward to f{}", hr.h);
     let rows = |name: &str| -> Result<u64> { Ok(MarksMap::open(&dir.join(name))?.rows as u64) };
     let found = frame("optimal")?;
     hr.partial = false;
-    let l0 = &mut hr.levels[0];
-    l0.precision = format!("{level}, rem free");
-    l0.first_win = frame("level0_first_win")?;
-    l0.refuted = l0.first_win.is_none();
-    l0.marked = Some(rows("level0.marks.bin")?);
-    let arc = LevelRun {
-        level: 1,
-        precision: format!("arc: {level}, rem exact"),
-        fwd: Vec::new(),
-        bwd: Vec::new(),
-        first_win: found,
-        marked: found.map(|_| rows("arc.marks.bin")).transpose()?,
-        reruns: None,
-        refuted: found.is_none(),
-        frames: 0,
-        frames_file: String::new(),
-        marks_file: None,
-        frame_states: Vec::new(),
-        frame_wins: Vec::new(),
-        marks_have_dist: false,
-        marks_by_dist: Vec::new(),
-        mlayers_file: None,
-        marks_by_layer: Vec::new(),
-        forward_of: Some(0),
-    };
+    let last = hr.levels.len() - 1;
+    let lr = &mut hr.levels[last];
+    lr.precision = format!("{}, rem free", get("level")?);
+    lr.first_win = frame("level0_first_win")?;
+    lr.refuted = lr.first_win.is_none();
+    lr.marked = Some(rows("level0.marks.bin")?);
+    let mut arc = level_run(last + 1, format!("arc: {}, rem exact", get("level")?), Vec::new(), found);
+    arc.marked = found.map(|_| rows("arc.marks.bin")).transpose()?;
+    arc.refuted = found.is_none();
+    arc.forward_of = Some(last);
     hr.levels.push(arc);
     hr.refuted_at = hr.levels.iter().position(|l| l.refuted);
     *optimal = if hr.refuted_at.is_none() { found } else { None };
@@ -914,117 +719,64 @@ fn attach_arc(horizons: &mut [HorizonRun], optimal: &mut Option<u32>, dir: &Path
     w.exists().then(|| read_witness(&w)).transpose()
 }
 
-/// The export. `room` is the start room the tree was searched from; `arc`
-/// (with `forward_only`) a `search --save-marks` directory over it.
-pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i16), forward_only: bool, arc: Option<&Path>) -> Result<()> {
-    anyhow::ensure!(arc.is_none() || forward_only, "--arc is a backward over one forward's tree: it needs --forward-only");
+/// The export. `checkpoint_dir` is a search's (`levelNN/` under it) or one
+/// forward's tree; `room` the start room it ran from; `arc` its `search
+/// --save-marks` directory.
+pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i16), arc: Option<&Path>) -> Result<()> {
     let text = std::fs::read_to_string(log_path).with_context(|| format!("reading {}", log_path.display()))?;
-    let (mut horizons, wall_s, prebuild_s, mut optimal) = parse_log(&text, forward_only)?;
+    let (levels, h, wall_s, mut optimal) = parse_log(&text)?;
+    let search = checkpoint_dir.join("level00").exists();
+    anyhow::ensure!(search || levels.len() == 1, "{}: one forward's tree, but the log has {} levels", checkpoint_dir.display(), levels.len());
+    let tree_dir = |level: usize| if search { checkpoint_dir.join(format!("level{level:02}")) } else { checkpoint_dir.to_path_buf() };
+    let nforward = levels.len();
+    let mut hr = HorizonRun { h, levels, refuted_at: None, partial: true };
     let witness = match arc {
-        Some(dir) => attach_arc(&mut horizons, &mut optimal, dir)?,
+        Some(dir) => attach_arc(&mut hr, &mut optimal, dir)?,
         None => None,
     };
-    eprintln!(
-        "[export-ui] log: {} horizons, {} levels, optimal {:?}",
-        horizons.len(),
-        horizons.iter().map(|h| h.levels.len()).sum::<usize>(),
-        optimal
-    );
+    eprintln!("[export-ui] log: {} levels to f{h}, optimal {optimal:?}", hr.levels.len());
     std::fs::create_dir_all(out)?;
 
-    // One pass per checkpoint tree: level 0's once, every finer level's,
-    // each with the marked sets over it (level 0: one per horizon), its
-    // frames and its marks split by layer read together. The trees go one
-    // at a time, each read in parallel inside, so the memory is one tree's
-    // marked sets at a time.
-    struct Tree {
-        h: u32,
-        level: usize,
-        /// The marked sets over the tree: (horizon, the level whose marks).
-        sets: Vec<(u32, usize)>,
-    }
-    let mut trees: Vec<Tree> = Vec::new();
-    for hr in &horizons {
-        for lr in &hr.levels {
-            // A forward on its own has no backward, so no marks (but for
-            // the arc search's).
-            let marked = !lr.refuted && (!forward_only || arc.is_some());
-            // Level 0's tree serves every horizon; a finer level's is its
-            // horizon's own. A backward over another level's forward reads
-            // that level's tree.
-            let level = lr.forward_of.unwrap_or(lr.level);
-            let k = match trees.iter().position(|t| t.level == level && (level == 0 || t.h == hr.h)) {
-                Some(k) => k,
-                None => {
-                    trees.push(Tree { h: hr.h, level, sets: Vec::new() });
-                    trees.len() - 1
-                }
-            };
-            if marked {
-                trees[k].sets.push((hr.h, lr.level));
-            }
-        }
-    }
-    let marks_file = |h: u32, level: usize| match arc {
-        Some(dir) => dir.join(if level == 0 { "level0.marks.bin" } else { "arc.marks.bin" }),
-        // A precision-ladder run's (the ladder was deleted 2026-10-05; its
-        // finished runs still export): `hNNN/levelNN.marks.bin`.
-        None => checkpoint_dir.join(format!("h{h:03}")).join(format!("level{level:02}.marks.bin")),
-    };
+    // One pass per forward level's tree, reading its frames and its marked
+    // sets by layer together.
     struct MarksOut {
-        h: u32,
         level: usize,
-        have_dist: bool,
         by_cell_dist: Vec<(u32, u32, u32)>,
         by_layer: Vec<Sparse>,
     }
     enum Done {
-        Frames { h: u32, level: usize, data: LevelData },
+        Frames { level: usize, data: LevelData },
         Marks(Vec<MarksOut>),
     }
     let mut results: Vec<Done> = Vec::new();
     let t = std::time::Instant::now();
-    for tree in &trees {
+    for level in 0..nforward {
         let tt = std::time::Instant::now();
-        let dir = level_dir(checkpoint_dir, tree.h, tree.level, forward_only);
-        let sets = tree
-            .sets
-            .iter()
-            .map(|&(h, level)| {
-                let path = marks_file(h, level);
-                MarksMap::open(&path).with_context(|| format!("marks {}", path.display()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let (table, by_cell_dist) = if sets.is_empty() {
+        let dir = tree_dir(level);
+        let (mut set_levels, mut maps): (Vec<usize>, Vec<MarksMap>) = (Vec::new(), Vec::new());
+        if let Some(a) = arc.filter(|_| level == nforward - 1) {
+            for (l, name) in [(level, "level0.marks.bin"), (level + 1, "arc.marks.bin")] {
+                if !hr.levels[l].refuted {
+                    set_levels.push(l);
+                    maps.push(MarksMap::open(&a.join(name))?);
+                }
+            }
+        }
+        let (table, by_cell_dist) = if maps.is_empty() {
             (None, Vec::new())
         } else {
-            let (table, by_cell_dist) = mark_table(&sets).with_context(|| format!("marks of {}", dir.display()))?;
+            let (table, by_cell_dist) = mark_table(&maps).with_context(|| format!("marks of {}", dir.display()))?;
             (Some(table), by_cell_dist)
         };
-        let t_marks = tt.elapsed();
-        let (data, layers) = read_tree(&dir, table.as_ref(), sets.len()).with_context(|| format!("frames of {}", dir.display()))?;
-        eprintln!(
-            "[export-ui] {}: {} frames, {} marked sets ({} states) in {:.1} s ({:.1} s marks)",
-            dir.display(),
-            data.frames.len(),
-            sets.len(),
-            sets.iter().map(|m| m.rows).sum::<usize>(),
-            tt.elapsed().as_secs_f64(),
-            t_marks.as_secs_f64()
-        );
-        results.push(Done::Frames { h: tree.h, level: tree.level, data });
-        if !sets.is_empty() {
-            let outs = tree
-                .sets
-                .iter()
-                .zip(&sets)
-                .zip(by_cell_dist.into_iter().zip(layers))
-                .map(|((&(h, level), m), (by_cell_dist, by_layer))| MarksOut { h, level, have_dist: m.have_dist(), by_cell_dist, by_layer })
-                .collect();
+        let (data, layers) = read_tree(&dir, table.as_ref(), maps.len()).with_context(|| format!("frames of {}", dir.display()))?;
+        eprintln!("[export-ui] {}: {} frames, {} marked sets in {:.1} s", dir.display(), data.frames.len(), maps.len(), tt.elapsed().as_secs_f64());
+        results.push(Done::Frames { level, data });
+        if !maps.is_empty() {
+            let outs = set_levels.iter().zip(by_cell_dist.into_iter().zip(layers)).map(|(&level, (by_cell_dist, by_layer))| MarksOut { level, by_cell_dist, by_layer }).collect();
             results.push(Done::Marks(outs));
         }
     }
-    eprintln!("[export-ui] read {} trees in {:.1} s", trees.len(), t.elapsed().as_secs_f64());
+    eprintln!("[export-ui] read {nforward} trees in {:.1} s", t.elapsed().as_secs_f64());
 
     // The cell box: everything seen, and at least the start room.
     let (mut x0, mut y0, mut x1, mut y1) = (0i32, 0i32, 127i32, 127i32);
@@ -1055,25 +807,21 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
 
     for d in &results {
         match d {
-            Done::Frames { h, level, data } => {
+            Done::Frames { level, data } => {
                 let name = if *level == 0 { "l00.frames.bin".to_string() } else { format!("h{h:03}_l{level:02}.frames.bin") };
                 write_frames_bin(&out.join(&name), data, b"CUF1", &cell_box)?;
                 let states: Vec<u64> = data.frames.iter().map(|(c, _)| c.iter().map(|&(_, n)| n as u64).sum()).collect();
                 let wins: Vec<u64> = data.frames.iter().map(|(_, w)| w.iter().map(|&(_, n)| n as u64).sum()).collect();
-                for hr in horizons.iter_mut() {
-                    for lr in hr.levels.iter_mut() {
-                        if lr.forward_of.unwrap_or(lr.level) == *level && (*level == 0 || hr.h == *h) {
-                            lr.frames = data.frames.len() as u32;
-                            lr.frames_file = name.clone();
-                            lr.frame_states = states.clone();
-                            lr.frame_wins = wins.clone();
-                        }
-                    }
+                for lr in hr.levels.iter_mut().filter(|lr| lr.forward_of.unwrap_or(lr.level) == *level) {
+                    lr.frames = data.frames.len() as u32;
+                    lr.frames_file = name.clone();
+                    lr.frame_states = states.clone();
+                    lr.frame_wins = wins.clone();
                 }
             }
             Done::Marks(outs) => {
                 for o in outs {
-                    let (h, level) = (o.h, o.level);
+                    let level = o.level;
                     let name = format!("h{h:03}_l{level:02}.marks.bin");
                     write_marks_bin(&out.join(&name), &o.by_cell_dist, &cell_box)?;
                     let lname = format!("h{h:03}_l{level:02}.mlayers.bin");
@@ -1084,13 +832,8 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
                     for &(_, d, n) in &o.by_cell_dist {
                         by_dist[d as usize] += n as u64;
                     }
-                    let lr = horizons
-                        .iter_mut()
-                        .find(|hr| hr.h == h)
-                        .and_then(|hr| hr.levels.iter_mut().find(|l| l.level == level))
-                        .expect("job came from the log");
+                    let lr = &mut hr.levels[level];
                     lr.marks_file = Some(name);
-                    lr.marks_have_dist = o.have_dist;
                     lr.marks_by_dist = by_dist;
                     lr.mlayers_file = Some(lname);
                     lr.marks_by_layer = o.by_layer.iter().map(|c| c.iter().map(|&(_, n)| n as u64).sum()).collect();
@@ -1098,12 +841,8 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
             }
         }
     }
-    for hr in &horizons {
-        for lr in &hr.levels {
-            if lr.frames_file.is_empty() {
-                bail!("h{} level {}: no frames exported", hr.h, lr.level);
-            }
-        }
+    for lr in &hr.levels {
+        anyhow::ensure!(!lr.frames_file.is_empty(), "level {}: no frames exported", lr.level);
     }
 
     let run = Run {
@@ -1112,9 +851,9 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
         cell_box,
         tiles: room_tiles(room)?,
         wall_s,
-        prebuild_s,
+        prebuild_s: None,
         optimal,
-        horizons,
+        horizons: vec![hr],
         witness,
     };
     let mut f = std::io::BufWriter::new(std::fs::File::create(out.join("run.json"))?);
@@ -1129,23 +868,27 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
 mod tests {
     use super::*;
 
-    /// Both marks layouts read in place, and a state in two sets is one
-    /// entry holding both sets' bits (what level 0's horizons share).
+    /// Marks files read in place, and a state in two sets is one entry
+    /// holding both sets' bits.
     #[test]
     fn marks_files_read_in_place_into_one_table() {
         let dir = std::env::temp_dir().join(format!("celeste-ui-marks-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let (a, b) = (dir.join("a.bin"), dir.join("b.bin"));
-        // Set 0 without distances (`Visited::save`'s 28-byte rows), set 1
-        // with them (32-byte rows); they share the state (7, 3, (1, 2)).
-        let rows_a: Vec<(u64, u32, u64, u64)> = vec![(7, 3, 1, 2), (7, 3, 5, 6), (8, 4, 1, 2)];
-        let rows_b: Vec<(u64, u32, u64, u64, u32)> = vec![(7, 3, 1, 2, 2), (9, 3, 0, 0, 1)];
-        crate::search::checkpoint::save_value_to(&a, &rows_a).unwrap();
-        crate::search::checkpoint::save_value_to(&b, &rows_b).unwrap();
-        let sets = [MarksMap::open(&a).unwrap(), MarksMap::open(&b).unwrap()];
-        assert!(!sets[0].have_dist() && sets[1].have_dist());
+        let save = |name: &str, rows: &[((u64, u64), u32, u64, u16)]| {
+            let mut v = crate::frame::Visited::new();
+            for &(key, cell, shape, deadline) in rows {
+                v.insert_until(shape, key, cell, deadline);
+            }
+            let path = dir.join(name);
+            v.save(&path, 9).unwrap();
+            MarksMap::open(&path).unwrap()
+        };
+        // dist = the horizon (9) minus the deadline.
+        let sets = [
+            save("a.bin", &[((1, 2), 3, 7, 9), ((5, 6), 3, 7, 9), ((1, 2), 4, 8, 9)]),
+            save("b.bin", &[((1, 2), 3, 7, 7), ((0, 0), 3, 9, 8)]),
+        ];
         assert_eq!((sets[0].rows, sets[1].rows), (3, 2));
-        assert_eq!(sets[1].row(0), ((7, 3, (1, 2)), 2));
         let (t, by_cell_dist) = mark_table(&sets).unwrap();
         let get = |s: u64, c: u32, k: (u64, u64)| t.shards[mark_shard(s, c)].get(&(s, c, k)).copied();
         assert_eq!(get(7, 3, (1, 2)), Some(0b11), "the shared state holds both sets");
@@ -1154,68 +897,32 @@ mod tests {
         assert_eq!(get(7, 4, (1, 2)), None, "a key is looked up at its own cell");
         assert_eq!(t.shards.iter().map(|s| s.len()).sum::<usize>(), 4);
         assert!(t.cells.contains(&(8, 4)) && !t.cells.contains(&(8, 3)));
-        assert_eq!(by_cell_dist[0], vec![(3, 0, 2), (4, 0, 1)], "no distances: dist 0");
+        assert_eq!(by_cell_dist[0], vec![(3, 0, 2), (4, 0, 1)]);
         assert_eq!(by_cell_dist[1], vec![(3, 1, 1), (3, 2, 1)], "sorted by (dist, cell)");
-        // Today's layout (`Visited::save`: the rows, then the horizon): the
-        // distance is the horizon minus the deadline.
-        let c = dir.join("c.bin");
-        let mut v = crate::frame::Visited::new();
-        v.insert_until(10, (3, 4), 5, 7);
-        v.save(&c, 9).unwrap();
-        let m = MarksMap::open(&c).unwrap();
-        assert!(m.have_dist());
-        assert_eq!((m.rows, m.row(0)), (1, ((10, 5, (3, 4)), 2)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn the_log_lines_parse_and_close_into_horizons() {
-        let log = "\
-[asm build] 17 rungs prebuilt in 8.8 s
-[fwd] f001 in 1/1 raw 1 kept 1 out 1/1 visited 2 | emit 1 (idle 99%) own 1 (idle 100%) ckpt 0 pos 0 total 2 ms | rss 4.24 GB
-[search] level 0 has no win by f1
-[fwd] f002 in 32/4129487 raw 24530998 kept 4286939 out 32/4286939 visited 146895302 | emit 1302 (idle 3%) own 197 (idle 5%) ckpt 157 pos 2 total 1667 ms | rss 12.55 GB
-[fwd] first win at f2
-[bwd] f001 targets 1 cand-cells 29 loaded 160 rerun 160 marked 160 | load 5 (thread-ms) par 2 (idle 54%) total 3 ms
-[ladder] h2 level 0 (Bits(0)): first win f2, marked 7857 states (fingerprint cda9202a7cbb2234), 392258 re-runs
-[fwd] f001 in 1/1 raw 1 kept 1 out 1/1 visited 2 | emit 1 (idle 100%) own 1 (idle 100%) ckpt 0 pos 0 total 1 ms | rss 13.35 GB
-[ladder] h2 level 1 (Bits(1)): NO WIN -> Refuted
-[search] horizon 2 refuted at level 1
-[fwd] f003 in 1/1 raw 1 kept 1 out 1/1 visited 2 | emit 1 (idle 100%) own 1 (idle 100%) ckpt 0 pos 0 total 1 ms | rss 13.35 GB
-[bwd] f002 targets 1 cand-cells 29 loaded 160 rerun 160 marked 160 | load 5 (thread-ms) par 2 (idle 54%) total 3 ms
-[ladder] h3 level 0 (Bits(0)): first win f2, marked 9 states (fingerprint cda9202a7cbb2234), 10 re-runs
-[fwd] f003 in 1/1 raw 1 kept 1 out 1/1 visited 4 | wave 7 (idle 94%) door 3 ckpt 0 pos 0 total 11 ms | flushes 1 (1 rows avg) | in 0.00 queues 0.00 door 0.00 GB rss start 1.26 wave 1.27 end 1.28 peak 8.25 GB
-[ladder] h3 level 16 (Exact): first win f3, marked 1 states (fingerprint cda9202a7cbb2234), 2 re-runs
-OPTIMAL win frame: 3
-	Elapsed (wall clock) time (h:mm:ss or m:ss): 7:13.31
-";
-        assert_eq!(parse_log("[ladder] h3 level 0 (Bits(0)): NO WIN -> Refuted\nELAPSED 9098.66 s\n", false).unwrap().1, Some(9098.66));
-        let (hs, wall, prebuild, optimal) = parse_log(log, false).unwrap();
-        assert_eq!(hs.len(), 2);
-        assert_eq!((hs[0].h, hs[1].h), (2, 3));
-        let l0 = &hs[0].levels[0];
-        assert_eq!(l0.fwd.len(), 2);
-        assert_eq!(l0.fwd[1].emit_idle, 3);
-        assert_eq!(l0.fwd[1].own_idle, 5);
-        assert_eq!(l0.fwd[1].rss_gb, 12.55);
-        assert_eq!(l0.bwd[0].par_idle, 54);
-        assert_eq!(l0.first_win, Some(2));
-        assert_eq!(l0.marked, Some(7857));
-        assert_eq!(l0.reruns, Some(392258));
-        let l1 = &hs[0].levels[1];
-        assert!(l1.refuted && l1.first_win.is_none() && l1.bwd.is_empty());
-        assert_eq!(hs[0].refuted_at, Some(1));
-        assert_eq!(hs[1].levels[0].fwd.len(), 1);
-        assert_eq!(hs[1].levels[0].first_win, Some(2));
-        assert_eq!(hs[1].levels[1].precision, "Exact");
-        assert_eq!(l0.precision, "Bits(0)", "the inner paren survives");
-        let hs2 = parse_log("[ladder] h5 level 0 (Bits(0)): first win f5, marked 12 states (fingerprint cda9202a7cbb2234), 34 edges read\n", false).unwrap().0;
-        assert_eq!(hs2[0].levels[0].reruns, Some(34), "the BFS's line");
-        let waves = &hs[1].levels[1].fwd[0];
-        assert_eq!((waves.emit_ms, waves.emit_idle, waves.own_ms, waves.own_idle, waves.total_ms), (7, 94, 3, 0, 11));
-        assert_eq!(waves.rss_gb, 1.28);
-        assert_eq!(wall, Some(433.31));
-        assert_eq!(prebuild, Some(8.8));
-        assert_eq!(optimal, Some(3));
+    fn the_search_log_splits_into_its_levels() {
+        let fwd = |f: u32| format!("[fwd] f{f:03} in 1/1 raw 1 kept 1 out 1/1 visited 4 | wave 7 (idle 94%) door 3 ckpt 0 pos 0 total 11 ms | flushes 1 (1 rows avg) | in 0.00 queues 0.00 door 0.00 GB rss start 1.26 wave 1.27 end 1.28 peak 8.25 GB");
+        let log = [
+            "[search] room 7,0, levels r0sxhn,r0sxh, horizon 2".to_string(),
+            fwd(1),
+            fwd(2),
+            "[fwd] first win at f2".to_string(),
+            "[search] level 0 (r0sxhn): forward to f2 in 2.7 s; first win Some(2)".to_string(),
+            fwd(1),
+            "[search] level 1 (r0sxh): forward to f2 in 0.1 s; first win None".to_string(),
+            "OPTIMAL win frame: 2 (3.5 s); witness /x/witness_frame_2.txt".to_string(),
+        ]
+        .join("\n");
+        let (levels, h, wall, optimal) = parse_log(&log).unwrap();
+        assert_eq!((levels.len(), h, wall, optimal), (2, 2, Some(3.5), Some(2)));
+        assert_eq!((levels[0].precision.as_str(), levels[0].fwd.len(), levels[0].first_win), ("r0sxhn", 2, Some(2)));
+        assert_eq!((levels[1].precision.as_str(), levels[1].fwd.len(), levels[1].first_win), ("r0sxh", 1, None));
+        assert_eq!(levels[0].fwd[1].rss_gb, 1.28);
+        // A `rewrite forward` log: one level to its last frame.
+        let (levels, h, _, _) = parse_log(&[fwd(1), fwd(2), fwd(3)].join("\n")).unwrap();
+        assert_eq!((levels.len(), h, levels[0].fwd.len()), (1, 3, 3));
     }
 }

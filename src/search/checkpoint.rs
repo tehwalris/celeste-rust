@@ -1,22 +1,16 @@
-//! Frame checkpoints: one file per (frame, shape), rows sorted by
-//! `(cell, key)` with a cell index, the columns stored RAW and fixed-width
-//! so that "the rows in these cells" is a handful of range copies out of an
-//! mmap rather than a decode of the whole layer.
-//!
-//! The partition is the search's own: the shape is the kernel's dispatch
-//! key and the row format, the cell is locality (the backward asks for
-//! rows by cell, and a frontier is spatially local), the frame is when the
-//! row was written. Nothing else is in the file name.
+//! Frame checkpoints: one file per (frame, shape piece), rows in flush order
+//! (a row's position is its id) with an index of per-cell runs, columns RAW
+//! and fixed-width, so "the rows in these cells" is a few range copies out
+//! of an mmap.
 //!
 //! Layout: `magic | version u32 | header_len u64 | header (bincode) | data`.
-//! The header carries everything that is not per-row (structure, globals,
-//! strings, the uniform columns, the win rows) plus the `cell -> first row`
-//! index and the data offset of every varying column; the data region is
-//! the varying columns and the key column, each `width` fixed-width entries.
-//! A version mismatch is refused loudly, not migrated.
+//! The header holds everything not per-row (structure, globals, strings,
+//! uniform columns, win rows), the cell index and each varying column's data
+//! offset; the data region is the varying columns and the key column, `width`
+//! fixed-width entries each. A version mismatch is refused, not migrated.
 //!
-//! Writes go to a `tmp-` sibling and are renamed into place last, so a crash
-//! mid-write never leaves a loadable-looking half file.
+//! Writes go to a `tmp-` sibling renamed into place, so a crash never leaves
+//! a loadable-looking half file.
 
 use anyhow::{anyhow, ensure, Context, Result};
 use celeste_core::pico8_num::Pico8Num as P8;
@@ -27,19 +21,8 @@ use std::path::Path;
 use celeste_engine::runtime2::{Cell2, Col, Rt2, AV};
 
 const MAGIC: &[u8; 4] = b"C8TB";
-/// Bump whenever the meaning or layout of ANY checkpoint content changes.
-///
-/// 3..7: the bincode-over-zstd block images (see git history for the
-/// per-version notes; every one was "refuse, don't migrate").
-/// 7 -> 8: one file per (frame, shape) instead of per bucket, rows sorted
-/// by `(cell, key)` with a cell index, raw fixed-width columns, no
-/// compression, win rows listed in the header. A v7 tree is a different
-/// layout altogether and is refused.
-/// 8 -> 9: rows in FLUSH order (a piece is appended to by its worker's
-/// queue flushes, each a run of one cell), so a row's file position is
-/// its stable id `(layer, file seq, row)` from the moment it is admitted;
-/// the cell index lists RUNS `(cell, start, len)` instead of one range per
-/// cell; win rows carry their cell. A v8 tree is refused.
+/// Bump whenever the meaning or layout of ANY checkpoint content changes
+/// (older trees are refused; history in git).
 pub const FORMAT_VERSION: u32 = 9;
 
 /// Where one column lives: uniform (in the header) or raw in the data
@@ -71,9 +54,8 @@ struct Header {
     cols: Vec<ColMeta>,
     /// Data offset of the key column, 16 bytes per row.
     keys: u64,
-    /// The runs of rows at one cell: `(cell, start, len)`, sorted by
-    /// `(cell, start)`. A cell has one run per flush that appended to
-    /// this piece.
+    /// The runs of rows at one cell, `(cell, start, len)` sorted by
+    /// `(cell, start)`: one per flush that appended to the piece.
     index: Vec<(u32, u32, u32)>,
     /// The rows that are wins (`Block::wins`), ascending, with their cell.
     wins: Vec<(u32, u32)>,
@@ -115,10 +97,8 @@ fn decode_av(bytes: &[u8]) -> Result<AV> {
     })
 }
 
-/// Save one shape's block of a frame in ITS OWN row order (the piece's
-/// flush order: runs of one cell each). `cells` is the block's per-row
-/// cell; `wins` marks the win rows. Atomic: written to a `tmp-` sibling,
-/// renamed into place.
+/// Save one piece in ITS OWN row order; `cells` per row, `wins` marks the
+/// win rows. Atomic.
 pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Result<()> {
     let width = rt2.width;
     ensure!(rt2.row_keys.len() == width, "checkpointing a block without its key column");
@@ -241,8 +221,7 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
     Ok(())
 }
 
-/// One checkpointed (frame, shape) file, mapped: the header decoded, the
-/// data region addressable. Every load is a set of row ranges gathered
+/// One checkpoint file, mapped, its header decoded; loads gather row ranges
 /// into a fresh block.
 pub struct FrameFile {
     map: memmap2::Mmap,
@@ -284,30 +263,24 @@ impl FrameFile {
         self.header.shape_hash
     }
 
-    /// `(cell, rows at that cell)` for every distinct cell, ascending by
-    /// cell - straight off the index, no row decoded. The UI export's
-    /// per-cell state counts are exactly this.
+    /// `(cell, rows at that cell)` per distinct cell, ascending, off the index.
     pub fn cell_counts(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         // Runs are sorted by cell: sum each cell's.
         let idx = &self.header.index;
         idx.chunk_by(|a, b| a.0 == b.0).map(|runs| (runs[0].0, runs.iter().map(|r| r.2).sum()))
     }
 
-    /// Every row's `(cell, key)`, cell by cell (a cell's runs in file
-    /// order): the cell from the index, the key straight off the map.
+    /// Every row's `(cell, key)`, cell by cell (runs in file order).
     pub fn cell_keys(&self) -> impl Iterator<Item = (u32, (u64, u64))> + '_ {
         self.header.index.iter().flat_map(move |&(cell, start, len)| (start..start + len).map(move |r| (cell, self.key(r))))
     }
 
-    /// Every row's `(row, (cell, key))`, cell by cell - `cell_keys` with the
-    /// row position, which is the row's id within this file.
+    /// `cell_keys` with each row's position (its id within the file).
     pub fn cell_keys_rows(&self) -> impl Iterator<Item = (u32, (u32, (u64, u64)))> + '_ {
         self.header.index.iter().flat_map(move |&(cell, start, len)| (start..start + len).map(move |r| (r, (cell, self.key(r)))))
     }
 
-    /// The cell index itself: the runs `(cell, start, len)`, sorted by
-    /// `(cell, start)` - for a reader that decides per run whether to read
-    /// its keys (`key_at`) at all.
+    /// The cell index: runs `(cell, start, len)` sorted by `(cell, start)`.
     pub fn runs(&self) -> &[(u32, u32, u32)] {
         &self.header.index
     }
@@ -407,19 +380,6 @@ impl FrameFile {
     pub fn load_all(&self) -> Result<Option<Rt2>> {
         self.load_rows(&[0..self.header.width])
     }
-
-    /// The rows in `cells`, as one block (`None` if there are none).
-    pub fn load_cells(&self, cells: &rustc_hash::FxHashSet<u32>) -> Result<Option<Rt2>> {
-        let mut ranges: Vec<std::ops::Range<u32>> = self
-            .header
-            .index
-            .iter()
-            .filter(|(c, _, _)| cells.contains(c))
-            .map(|&(_, s, n)| s..s + n)
-            .collect();
-        ranges.sort_by_key(|r| r.start);
-        self.load_rows(&ranges)
-    }
 }
 
 /// Save any serializable value (the marks, the pos-graph) under the same
@@ -451,9 +411,8 @@ pub fn load_value_from<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T>
     bincode::deserialize(value_payload(&bytes, path)?).with_context(|| format!("deserializing {}", path.display()))
 }
 
-/// The bincode payload of a `save_value_to` file's bytes (`path` names it in
-/// errors), its header checked - for a reader that walks a large value in
-/// place (the UI export's marks, mapped) instead of deserializing it.
+/// The bincode payload of a `save_value_to` file's bytes, header checked,
+/// for readers that walk a large value in place.
 pub fn value_payload<'a>(bytes: &'a [u8], path: &Path) -> Result<&'a [u8]> {
     ensure!(bytes.len() >= 16 && &bytes[0..4] == MAGIC, "{}: bad magic", path.display());
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());

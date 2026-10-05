@@ -1,22 +1,17 @@
-//! The rotation graph's dynamic programme (plans/arcs.md, steps 2 and 3):
-//! over a STATIC remainder-free transition graph whose edges carry, per axis,
-//! a guard (the remainders that take the edge) and an action (a rotation or a
-//! collision's constant) - `search::arcs` - compute
+//! The rotation graph's dynamic programme (plans/architecture.md "Arcs"):
+//! over the remainder-free transition graph whose edges carry per axis a
+//! guard and an action (`search::arcs`), compute
 //!
-//! * BACKWARD, the winning sets `W_t(n)`: the remainder rectangles from which
-//!   node `n`, occupied at frame `t`, wins by the horizon
+//! * BACKWARD, the winning sets `W_t(n)`: the remainders from which node `n`,
+//!   occupied at frame `t`, wins by the horizon
 //!   (`W_t(n) = U_e guard_e  n  action_e^-1( W_{t+1}(dst_e) )`, a win node's
 //!   set the whole torus), and
 //! * FORWARD, exact, inside them: the start's remainder pushed along the
-//!   edges as points, kept only where `W` says they can still win. The first
-//!   frame a point reaches a win node is the optimum for the graph's
-//!   precision (exact in the remainder); the path is the witness.
+//!   edges as points, kept only where `W` says they can still win.
 //!
-//! Exactness rests on "intersect with the guard, then act" distributing over
-//! unions, so a node's set at a frame is the union over every path into it.
-//! The graph is frame-independent (a node's transitions do not depend on when
-//! it is occupied), so one recorded expansion per node serves every frame;
-//! a node is occupied no earlier than the layer it was first reached.
+//! Exact because "intersect with the guard, then act" distributes over
+//! unions. The graph is frame-independent, so one recorded expansion per node
+//! serves every frame; a node is occupied no earlier than its layer.
 
 use std::sync::Arc;
 
@@ -32,18 +27,16 @@ pub struct Edge {
     pub y: Transfer,
 }
 
-/// An out-edge in the dense graph: the target's index and its transfer pair
-/// (an index into `Graph::xfers`: a graph has a few thousand distinct pairs
-/// and hundreds of millions of edges).
+/// An out-edge in the dense graph: the target's index and its transfer
+/// pair's index into `Graph::xfers` (few distinct pairs, many edges).
 #[derive(Clone, Copy, Debug)]
 pub struct Out {
     pub dst: u32,
     pub xfer: u32,
 }
 
-/// The graph, DENSE: nodes are indices `0..len` (in node-id order), edges
-/// compressed by source (`out`) with the reverse adjacency (`preds`) for the
-/// backward's change propagation.
+/// The graph, DENSE: nodes are indices `0..len` in id order, edges
+/// compressed by source, plus the reverse adjacency for the backward.
 pub struct Graph {
     ids: Vec<u64>,
     layer: Vec<u32>,
@@ -61,8 +54,8 @@ pub struct Graph {
     by_deadline: Vec<Vec<u32>>,
 }
 
-/// Compressed adjacency by key, a counting sort (no comparison sort): `at[i]..at[i + 1]`
-/// indexes the result for key `i`; within a key, the input order.
+/// Compressed adjacency by key (a counting sort): `at[i]..at[i + 1]` indexes
+/// key `i`'s values, in input order.
 fn csr<I, T>(n: usize, parts: &[Vec<I>], key: impl Fn(&I) -> u32, val: impl Fn(&I) -> T) -> (Vec<u32>, Vec<T>) {
     let mut at = vec![0u32; n + 1];
     for p in parts.iter().flatten() {
@@ -85,12 +78,10 @@ fn csr<I, T>(n: usize, parts: &[Vec<I>], key: impl Fn(&I) -> u32, val: impl Fn(&
 }
 
 impl Graph {
-    /// The graph over the nodes `ids` (sorted, unique; an edge's index is
-    /// a position in it): `edges` per source index (in parts, as the loader
-    /// produced them) over the transfer pairs `xfers`, `layer(id)` the first
-    /// frame a node can be occupied, `deadline` per node the last frame it
-    /// can still win from (a node absent from it never wins; `None`: no
-    /// bound).
+    /// The graph over `ids` (sorted, unique): `edges` as (source index, out)
+    /// in parts, `layer(id)` the first frame a node can be occupied,
+    /// `deadline` the last frame it can still win from (absent: never;
+    /// `None`: no bound).
     pub fn new(
         ids: Vec<u64>,
         edges: Vec<Vec<(u32, Out)>>,
@@ -139,8 +130,7 @@ impl Graph {
     pub fn xfer(&self, e: &Out) -> (Transfer, Transfer) {
         self.xfers[e.xfer as usize]
     }
-    /// Drop the adjacency (out-edges, predecessors, transfers): what is left
-    /// answers `index`, `id`, `is_win`, `layer_of`.
+    /// Drop the adjacency; `index`, `id`, `is_win`, `layer_of` still work.
     pub fn forget_edges(&mut self) {
         for v in [&mut self.out_at, &mut self.pred_at, &mut self.preds] {
             *v = Vec::new();
@@ -176,8 +166,8 @@ impl Graph {
     fn live(&self, i: u32, t: u32) -> bool {
         self.layer[i as usize] <= t && t < self.until[i as usize]
     }
-    /// Does node `i` have a set at `t` at all: a win node from its layer on,
-    /// any other while live.
+    /// Does node `i` have a set at `t`: a win node from its layer on, any
+    /// other while live.
     fn present(&self, i: u32, t: u32) -> bool {
         if self.win[i as usize] {
             self.layer[i as usize] <= t
@@ -192,22 +182,18 @@ pub struct Loaded {
     pub graph: Graph,
     /// The start's node index (layer 0, its frame file's row 0).
     pub start: u32,
-    /// The remainder-free backward's marks: every id that wins by the
-    /// horizon with SOME remainder, with its deadline, by id (the start
-    /// always, at deadline 0 if the BFS did not reach it).
+    /// The remainder-free BFS's marks, sorted by id: every id that wins by
+    /// the horizon with SOME remainder, with its deadline (the start always).
     pub marks: Vec<(u64, u16)>,
     /// The win rows of frames `1..=horizon`.
     pub wins: Vec<u64>,
     pub edges: usize,
 }
 
-/// The rotation graph of the tree in `dir` up to `horizon`: the
-/// remainder-free BFS over the recorded edges (`edges::bfs`) gives the nodes
-/// that can win by the horizon at all, and their deadlines; only the edges
-/// into them are read (`EdgeGraph::preds_at`, the BFS's lookup), and only
-/// those from marked nodes kept - an edge between other nodes is on no path
-/// to a win by the horizon with any remainder. Every loaded edge must carry
-/// its transfer (the tree was recorded at level 0).
+/// The rotation graph of the tree in `dir` up to `horizon`, restricted to the
+/// nodes the remainder-free BFS (`edges::bfs`) marks: an edge between other
+/// nodes is on no path to a win with any remainder. Every loaded edge must
+/// carry its transfer.
 pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     use crate::frame::{frame_files, id_layer, pack_id};
     let t0 = std::time::Instant::now();
@@ -230,17 +216,15 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     }
     let start_id = start_id.ok_or_else(|| anyhow::anyhow!("{}: no frame-0 row", dir.display()))?;
     let eg = super::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
-    // A frame that kept rows recorded the edges into them: its own layer's
-    // run must be there. A frame that kept none (the level -1 filter can
-    // drop every row at the horizon) may have no run at all.
+    // A frame that kept rows must have its own layer's run; one that kept
+    // none (the level -1 filter) may have none.
     for (f, &rows) in kept.iter().enumerate().skip(1) {
         let f = f as u32;
         anyhow::ensure!(rows == 0 || eg.has_run(f, f), "{}: no edge run for f{f}, which kept {rows} rows", dir.display());
     }
     let (bfs, _) = super::edges::bfs(&eg, horizon, wins.iter().copied());
     let t_bfs = t0.elapsed();
-    // The BFS never marks layer 0 (the start is given): its deadline is 0
-    // when a win is exactly tight.
+    // The BFS never marks layer 0; the start defaults to deadline 0.
     let mut deadline: FxHashMap<u64, u16> = bfs.with_deadlines().into_iter().collect();
     deadline.entry(start_id).or_insert(0);
     let mut marks: Vec<(u64, u16)> = deadline.iter().map(|(&id, &d)| (id, d)).collect();
@@ -265,8 +249,7 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
                 .collect()
         })
         .collect();
-    // Into every node, its edges of frames layer..=horizon from nodes; in
-    // parallel over chunks of targets.
+    // Every node's in-edges from nodes, frames layer..=horizon, in parallel.
     let t1 = std::time::Instant::now();
     let threads = crate::frame::threads().max(1);
     let chunk = ids.len().div_ceil(threads * 8).max(1);
@@ -372,16 +355,13 @@ fn pull<'a>(g: &Graph, i: u32, next: impl Fn(u32) -> Option<&'a Region>, pieces:
 }
 
 /// BACKWARD: `W_t` for `t = horizon` down to 0. A win node's set is the whole
-/// torus from its layer on; every other node's is the union of its
-/// out-edges' preimages of `W_{t+1}`, while it is live (occupiable, within
-/// its deadline).
+/// torus from its layer on; any other's is the union of its out-edges'
+/// preimages of `W_{t+1}`, while it is live.
 ///
 /// INCREMENTAL: `W_t(i) = W_{t+1}(i)` when `i` is live at both and none of
-/// its successors' sets changed between `t + 1` and `t + 2`, so a frame
-/// recomputes only the predecessors of the nodes that changed, and the nodes
-/// that become live at `t` (their deadline); the rest share the next frame's
-/// set. The recomputation is a PULL per node (reads only `W_{t+1}`), in
-/// parallel, its contributions made canonical in one sweep.
+/// its successors' sets changed, so a frame recomputes (a parallel PULL per
+/// node) only the predecessors of changed nodes and the nodes that become
+/// live at `t`; the rest share the next frame's set.
 pub fn backward(g: &Graph, horizon: u32) -> Winning {
     let n = g.len();
     let threads = crate::frame::threads();
@@ -474,8 +454,7 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
         let fresh: Vec<Recomputed> = parts.into_iter().flat_map(|p| p.1).collect();
         d_pull += t0.elapsed();
         let t0 = std::time::Instant::now();
-        // Merge: the next frame's sets that persist, overridden by the
-        // recomputed candidates.
+        // Merge: the next frame's persisting sets, overridden by the candidates.
         let mut cur = Frame { nodes: Vec::with_capacity(next.nodes.len()), sets: Vec::with_capacity(next.nodes.len()) };
         let mut new_changed: Vec<u32> = Vec::new();
         let (mut a, mut b) = (0usize, 0usize);
@@ -543,17 +522,14 @@ pub struct Found {
     pub path: Vec<(u64, (u32, u32))>,
 }
 
-/// The OPTIMUM from node `start` with the remainder point `point`, read off
-/// ONE backward: `p` in `W_t(start)` says "a win within `horizon - t`
-/// frames", because the graph is the same at every frame but for the
-/// layers, and a layer (a node's first-reach frame) never binds on a walk
-/// from the start: k steps from it reach only nodes of layer <= k. So the
-/// optimum is `horizon - max{t : point in W_t(start)}`.
+/// The OPTIMUM from `start` at remainder `point`, read off ONE backward:
+/// `horizon - max{t : point in W_t(start)}`. Valid because the graph is the
+/// same at every frame but for the layers, and k steps from the start reach
+/// only layers <= k, so a layer never binds.
 ///
-/// The witness is a greedy walk from there: a point inside `W_t(n)` (n not
-/// a win) has, by the definition of `W_t`, an out-edge into `W_{t+1}`, and
-/// at the horizon only win nodes have sets, so the walk never backtracks;
-/// started with the fewest frames left, it wins in exactly that many.
+/// The witness is a greedy walk: a point in `W_t(n)` (n not a win) has an
+/// out-edge into `W_{t+1}`, and at the horizon only win nodes have sets, so
+/// the walk never backtracks and wins in exactly the fewest frames.
 pub fn optimum(g: &Graph, w: &Winning, start: u32, point: (u32, u32), horizon: u32) -> Option<Found> {
     let inside = |t: u32, n: u32, p: (u32, u32)| w.at(t, n).is_some_and(|r| r.contains(p.0, p.1));
     let from = (0..=horizon).rev().find(|&t| inside(t, start, point))?;
@@ -592,9 +568,8 @@ fn apply(a: Action, p: u32) -> u32 {
     }
 }
 
-/// Fragmentation of a frame's winning sets: per node its x segments over
-/// all slabs (a rectangle count of the canonical form), as (nodes, median,
-/// p90, max).
+/// Fragmentation of winning sets (x segments per node, over all slabs) as
+/// (nodes, median, p90, max).
 pub fn fragmentation<'a>(sets: impl Iterator<Item = &'a Region>) -> (usize, usize, usize, usize) {
     let mut v: Vec<usize> = sets.map(|r| r.n_segs()).collect();
     if v.is_empty() {
@@ -631,48 +606,37 @@ impl Witness {
     }
 }
 
-/// THE CONCRETE SEARCH: the concrete optimum and its inputs, inside the
-/// winning sets. A BREADTH-FIRST search over concrete states from the room's
-/// start through the reference engine's concrete step (every input, every
-/// `rnd` leaf), layer k+1 admitting a successor only if its projection onto
-/// `level` is a node of `g` (`dir`'s tree, frames `0..=horizon`) whose
-/// `W_{k+1}` holds the successor's exact remainder (a state without a player
-/// reads the point (0, 0): no edge cuts it), and holding each EXACT state
-/// once (the first in (parent, input, leaf) order: deterministic).
+/// THE CONCRETE SEARCH: the concrete optimum and its inputs. A BREADTH-FIRST
+/// search over concrete states through the reference engine (every input,
+/// every `rnd` leaf), layer k+1 admitting a successor only if its projection
+/// onto `level` is a node of `g` whose `W_{k+1}` holds its exact remainder
+/// (no player: the point (0, 0)), each EXACT state once (the first in
+/// (parent, input, leaf) order: deterministic).
 ///
-/// W_t holds every state that wins within `horizon - t` frames, so every
-/// concrete path that wins by the horizon stays inside it: the search is
-/// EXHAUSTIVE inside W and prunes by nothing else, and the first layer with a
-/// win is the CONCRETE optimum (over every `rnd` draw: a leaf is a
-/// possibility). `None`: no concrete win by the horizon. The graph's optimum
-/// `bound` is a lower bound on it (the level's widenings over-approximate);
-/// layers before it are reported but cannot win.
-///
-/// Layers are expanded in parallel, one reference engine per worker. (It was
-/// a DFS counting up from the bound, one exhaustive pass per frame: room
-/// (7,0)'s pass grew 6.5x a frame, 172k steps at f80, 1.29M at f81, and the
-/// steps ran on one core.)
+/// Sound: every concrete path that wins by the horizon stays inside W, so
+/// the search is EXHAUSTIVE inside W and prunes by nothing else; its first
+/// win is the CONCRETE optimum. `None`: no concrete win by the horizon.
+/// `bound` (the graph's optimum) is a lower bound on it. Layers run in
+/// parallel, one reference engine per worker.
 pub fn concrete_search(
     dir: &std::path::Path,
-    level: crate::interpreter::abstraction::Level,
+    level: crate::abstraction::Level,
     horizon: u32,
     g: &Graph,
     w: &Winning,
     bound: u32,
     breadth_first: bool,
 ) -> anyhow::Result<Option<Witness>> {
-    use crate::concrete::ConcreteEngine;
     use crate::frame::{frame_files, pack_id, widened_keys, wins_of, Block};
-    use crate::interpreter::state::State;
     use anyhow::Result;
+    use crate::trace::refengine::RefEngine;
     use celeste_engine::runtime2::{Rt2, AV};
-    // The engines run the cart's `_init` under the GLOBAL level: build them
-    // before the level is set (room (5,3) nodiag's level-0 `_init` ended in
-    // no state); their frames run at the exact level whatever is set.
+    // Build the engines BEFORE setting the level: `_init` runs under the
+    // global level. Their frames run exact whatever is set.
     let workers = crate::frame::threads().max(1);
-    let engines: Vec<std::sync::Mutex<ConcreteEngine>> = (0..workers).map(|_| ConcreteEngine::new().map(std::sync::Mutex::new)).collect::<Result<_>>()?;
-    let initial = engines[0].lock().expect("an engine").initial_state()?;
-    crate::interpreter::abstraction::set_level(level);
+    let engines: Vec<std::sync::Mutex<RefEngine>> = (0..workers).map(|_| RefEngine::new().map(std::sync::Mutex::new)).collect::<Result<_>>()?;
+    let initial = engines[0].lock().expect("an engine").initial()?;
+    crate::abstraction::set_level(level);
     let t0 = std::time::Instant::now();
     // (shape, key, cell) -> the node's index, for the graph's nodes.
     let mut node: FxHashMap<(u64, (u64, u64), u32), u32> = FxHashMap::default();
@@ -710,25 +674,20 @@ pub fn concrete_search(
         cell: u32,
         win: bool,
         exact: (u64, u64),
-        /// The state as its one-row block: an interpreter `State` is ~0.6 MB
-        /// (room (4,3) nodiag: 20k of them past 40 GB), the row a few KB.
         row: Rt2,
     }
-    let start_cell = Block::from_state(&initial)?.positions()?[0];
-    // THE FAST PATH: a depth-first search for a win AT the bound, inside
-    // `W_{H - bound + k}` (the bound's frames-left alignment), on one engine,
-    // with a step budget. Where the bound is the optimum (no level widening
-    // made it lower) it finds the witness in a few hundred steps, where the
-    // breadth-first search would expand whole layers. Either way the answer
-    // is sound: a win found here is at the bound, and the bound is a lower
-    // bound; an exhausted or abandoned DFS proves nothing and the BFS runs.
+    let start = Block::keyed(initial)?;
+    let start_cell = start.positions()?[0];
+    // THE FAST PATH: a budgeted depth-first search for a win AT the bound,
+    // inside `W_{H - bound + k}`, on one engine. Sound: a win here is at the
+    // lower bound, hence optimal; an exhausted or abandoned DFS proves nothing
+    // and the BFS runs.
     {
         struct Dfs<'a> {
-            eng: &'a mut ConcreteEngine,
-            initial: &'a State,
+            eng: &'a mut RefEngine,
             node: &'a FxHashMap<(u64, (u64, u64), u32), u32>,
             w: &'a Winning,
-            level: crate::interpreter::abstraction::Level,
+            level: crate::abstraction::Level,
             from: u32,
             frames: u32,
             dead: FxHashSet<((u64, u64), u32, u32)>,
@@ -736,21 +695,19 @@ pub fn concrete_search(
             steps: u64,
         }
         /// `Ok(None)`: out of budget.
-        fn dfs(cx: &mut Dfs, st: &State, k: u32) -> Result<Option<bool>> {
+        fn dfs(cx: &mut Dfs, st: &Rt2, k: u32) -> Result<Option<bool>> {
             if k >= cx.frames {
                 return Ok(Some(false));
             }
             for byte in 0u8..64 {
-                for succ in cx.eng.step_all(st, byte, cx.initial)? {
+                for b in cx.eng.step(st, byte)? {
                     cx.steps += 1;
                     if cx.steps > DFS_BUDGET {
                         return Ok(None);
                     }
-                    let b = Block::from_state(&succ)?;
                     let cell = b.positions()?[0];
                     if wins_of(b.rt2())?.iter().any(|&x| x) {
-                        // The bound is a lower bound: a concrete win before it
-                        // would say the arc backward lost a path.
+                        // A win before the lower bound means a lost path.
                         anyhow::ensure!(k + 1 == cx.frames, "a concrete win at f{} before the arc bound f{}: the backward lost a path", k + 1, cx.frames);
                         cx.path.push((byte, cell));
                         return Ok(Some(true));
@@ -766,7 +723,7 @@ pub fn concrete_search(
                         continue;
                     }
                     cx.path.push((byte, cell));
-                    match dfs(cx, &succ, k + 1)? {
+                    match dfs(cx, b.rt2(), k + 1)? {
                         Some(true) => return Ok(Some(true)),
                         None => return Ok(None),
                         Some(false) => {}
@@ -781,8 +738,8 @@ pub fn concrete_search(
         const DFS_BUDGET: u64 = 200_000;
         let t = std::time::Instant::now();
         let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { eng: &mut eng, initial: &initial, node: &node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0 };
-        let found = dfs(&mut cx, &initial, 0)?;
+        let mut cx = Dfs { eng: &mut eng, node: &node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0 };
+        let found = dfs(&mut cx, start.rt2(), 0)?;
         eprintln!(
             "[concrete] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
             match found {
@@ -804,9 +761,7 @@ pub fn concrete_search(
     }
     // Per layer k >= 1, each state's (parent index in layer k-1, input, cell).
     let mut back: Vec<Vec<(u32, u8, u32)>> = Vec::new();
-    let start = Block::from_state(&initial)?;
-    let start_exact = start.rt2().clone_block().row_keys_canonical()[0];
-    let mut cur: Vec<(Rt2, (u64, u64))> = vec![(start.into_rt2(), start_exact)];
+    let mut cur: Vec<Rt2> = vec![start.into_rt2()];
     let mut steps = 0u64;
     for k in 0..horizon {
         let t = std::time::Instant::now();
@@ -817,7 +772,7 @@ pub fn concrete_search(
             let hs: Vec<_> = engines
                 .iter()
                 .map(|engine| {
-                    let (cur, node, initial, next_chunk) = (&cur, &node, &initial, &next_chunk);
+                    let (cur, node, next_chunk) = (&cur, &node, &next_chunk);
                     sc.spawn(move || -> Result<(Vec<(usize, Vec<Succ>)>, u64)> {
                         let mut eng = engine.lock().expect("an engine");
                         let (mut out, mut steps) = (Vec::new(), 0u64);
@@ -826,29 +781,19 @@ pub fn concrete_search(
                             if lo >= cur.len() {
                                 return Ok((out, steps));
                             }
-                            // Each exact state once per chunk already (the
-                            // first in order, as the merge keeps it): a layer's
-                            // successors are mostly repeats (room (4,3) nodiag
-                            // layer 45: 1.29M steps, 25.5k states), and every
-                            // kept one holds a row.
+                            // Dedup within the chunk already (the first in
+                            // order, as the merge keeps it): most successors
+                            // are repeats.
                             let mut got = Vec::new();
                             let mut chunk_seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
-                            for (p, (row, exact)) in cur.iter().enumerate().skip(lo).take(CHUNK) {
-                                // The row back as a state, checked: its exact key
-                                // must survive the round trip.
-                                let st = Block::from_rt2(row.clone_block()).to_state();
-                                let back = Block::from_state(&st)?.rt2().clone_block().row_keys_canonical()[0];
-                                anyhow::ensure!(back == *exact, "layer {k} row {p}: the state does not survive its block's round trip");
+                            for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
                                 for byte in 0u8..64 {
-                                    for succ in eng.step_all(&st, byte, initial).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
+                                    for b in eng.step(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
                                         steps += 1;
-                                        let b = Block::from_state(&succ)?;
                                         let cell = b.positions()?[0];
-                                        // The memo key is the EXACT state: `b.keys()` is
-                                        // the row key at the search's level (the
-                                        // remainder and held buttons widened), and two
-                                        // states one key stands for need not share
-                                        // their fate (`522de36`).
+                                        // Dedup on the EXACT key, never `b.keys()` (the
+                                        // level's widened key): states sharing it need
+                                        // not share their fate (`522de36`).
                                         let exact = b.rt2().clone_block().row_keys_canonical()[0];
                                         let win = wins_of(b.rt2())?.iter().any(|&x| x);
                                         if !win && chunk_seen.contains(&(exact, cell)) {
@@ -882,10 +827,9 @@ pub fn concrete_search(
         }
         chunks.sort_unstable_by_key(|c| c.0);
         let succs = chunks.into_iter().flat_map(|c| c.1);
-        // The layer: each exact state once, the first in (parent, input,
-        // leaf) order; the first win ends the search.
+        // Each exact state once, in order; the first win ends the search.
         let mut seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
-        let (mut next, mut links): (Vec<(Rt2, (u64, u64))>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
+        let (mut next, mut links): (Vec<Rt2>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
         let mut won: Option<(u32, u8, u32)> = None;
         for s in succs {
             if s.win {
@@ -893,7 +837,7 @@ pub fn concrete_search(
                 break;
             }
             if seen.insert((s.exact, s.cell)) {
-                next.push((s.row, s.exact));
+                next.push(s.row);
                 links.push((s.parent, s.byte, s.cell));
             }
         }
@@ -939,8 +883,7 @@ pub fn concrete_search(
 pub enum Concrete {
     None,
     /// The depth-first try at the bound only (a coarse level of the objects
-    /// ladder: a win there is the optimum, no win sends the search on to the
-    /// finer level).
+    /// ladder; no win sends the search on to the finer level).
     AtBound,
     /// The whole search: the try at the bound, then breadth-first.
     Full,
@@ -948,34 +891,25 @@ pub enum Concrete {
 
 /// What the arc phase of a search found (`solve`).
 pub struct Solved {
-    /// The optimum over the rotation graph (exact in the remainder; a lower
-    /// bound when the level's objects are coarse). `None`: no win by the
-    /// horizon at all - the horizon is REFUTED.
+    /// The optimum over the rotation graph, a lower bound on the game's.
+    /// `None`: the horizon is REFUTED.
     pub arc: Option<u32>,
-    /// The concrete optimum and its witness (`concrete_search`), when
-    /// asked for and found.
+    /// The concrete optimum and its witness, when asked for and found.
     pub concrete: Option<Witness>,
-    /// The ARC-MARKED nodes as `(shape, key, cell)` with their deadlines (the
-    /// last frame their winning set is non-empty): the next level's filter
-    /// (`frame::MarkFilter`). Computed when asked for.
+    /// The ARC-MARKED nodes with their deadlines (the last frame their
+    /// winning set is non-empty): the next level's `frame::MarkFilter`.
     pub arc_marks: Option<crate::frame::Visited>,
 }
 
-/// THE ARC PHASE over a finished level-0 tree in `dir` (frames and edges
-/// through `horizon`): load the rotation graph (`load`), the winning sets
-/// backward (`backward`), the optimum read off them (`optimum`), and as much
-/// of the concrete search (`concrete_search`) as `concrete` says. Prints
-/// `[gate]` lines - the
-/// marks' and each frame's winning sets' fingerprints over (shape, key,
-/// cell), which do not depend on the scheduling the ids do - and with
-/// `save`, writes the UI's arc pass there (`export-ui --forward-only --arc`):
-/// the remainder-free marks (`level0.marks.bin`), the ARC-MARKED nodes
-/// (`arc.marks.bin`: a node whose winning set is non-empty at some frame),
-/// both with `dist` the horizon minus the last frame the node still wins
-/// from, and `arc.txt`.
+/// THE ARC PHASE over a finished tree in `dir`: `load`, `backward`,
+/// `optimum`, and as much of `concrete_search` as `concrete` says. Prints
+/// the `[gate]` fingerprints (over (shape, key, cell), independent of
+/// scheduling). With `save`, writes the UI's arc pass: `level0.marks.bin`
+/// (remainder-free marks), `arc.marks.bin` (arc-marked nodes), `arc.txt`
+/// and the witness.
 pub fn solve(
     dir: &std::path::Path,
-    level: crate::interpreter::abstraction::Level,
+    level: crate::abstraction::Level,
     horizon: u32,
     concrete: Concrete,
     want_marks: bool,
@@ -992,8 +926,7 @@ pub fn solve(
         let (n, med, p90, max) = fragmentation(w.frame(t).filter(|&(i, _)| !g.is_win(i)).map(|(_, r)| r));
         eprintln!("[arc] W frame {t:3}: {n} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}");
     }
-    // The start has no player yet (the spawn): its remainder is no input of
-    // anything; any point stands for it.
+    // The start has no player yet: any point stands for its remainder.
     let p0 = (super::arcs::point(0), super::arcs::point(0));
     let found = optimum(g, &w, ld.start, p0, horizon);
     let arc = found.as_ref().map(|f| f.frame);
@@ -1028,8 +961,7 @@ pub fn solve(
         println!("[gate] h{horizon} W f{t:03} {n} {acc:016x}");
     }
     println!("[gate] h{horizon} arc optimum {}", arc.map_or("none".to_string(), |f| f.to_string()));
-    // Per node the LAST frame its winning set is non-empty: the arc
-    // analogue of the BFS's deadline.
+    // Per node the LAST frame its winning set is non-empty (its deadline).
     let arc_marks = if want_marks || save.is_some() {
         let mut last = vec![u32::MAX; g.len()];
         for t in 0..=horizon {
@@ -1055,8 +987,7 @@ pub fn solve(
         std::fs::write(out.join("arc.txt"), format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(arc)))?;
     }
     drop(files);
-    // The concrete search reads W and the node index, not the edges: they
-    // go first (room (4,3) nodiag h111: 769M edges, 9.2 GB of adjacency).
+    // The concrete search reads W and the node index, not the edges (GBs).
     let mut graph = ld.graph;
     graph.forget_edges();
     let found = match (concrete, arc) {
@@ -1110,9 +1041,8 @@ mod tests {
         assert!(optimum(&g, &w1, s, (point(-6553), point(0)), 1).is_some());
     }
 
-    /// The incremental backward against the definition: every live node
-    /// recomputed at every frame. Random layered graphs with cycles, random
-    /// guards, rotations and collisions, deadlines.
+    /// The incremental backward equals the definition (every live node
+    /// recomputed every frame) on random layered graphs with deadlines.
     #[test]
     fn the_incremental_backward_is_the_definition() {
         let mut s = 11u64;
@@ -1179,10 +1109,8 @@ mod tests {
         }
     }
 
-    /// One backward reads off the optimum: on graphs whose layers are first-
-    /// reach frames from the start (as the forward's are), the optimum from
-    /// `backward(H)` is the smallest `h` whose own backward holds the start,
-    /// for every start remainder.
+    /// With first-reach layers, the optimum read off `backward(H)` is the
+    /// smallest `h` whose own backward holds the start.
     #[test]
     fn one_backward_gives_the_optimum() {
         let mut s = 5u64;

@@ -7,10 +7,10 @@ the cost-to-go filter in `plans/level-minus-one.md`.
 
 ## Status, honestly
 
-The code is ~44.9k lines of Rust (26.2k code, 9.1k comments, 7.4k tests;
-`arc-only`, 2026-10-05: 47.5k before it deleted the rem ladder and the kernel
-re-run backward). The 2026-08-30 target was ~10-12k;
-it was never met, and a cleanup toward ~10k is in progress. Every room of the
+The code is ~36.5k lines of Rust (25.6k code, 4.4k comments, 4.7k tests;
+47.5k before `arc-only` deleted the rem ladder and the kernel re-run
+backward, 44.9k before the `tier3` cleanup). The 2026-08-30 target was
+~10-12k; a cleanup toward ~10k is in progress. Every room of the
 game has a confirmed optimum (`plans/results.md`), found by the precision
 ladder this branch deleted.
 
@@ -35,8 +35,10 @@ kernels come from the **tracer** via one hand-off.
    carrying its KEY and its CELL (player position), already widened for the
    level. Branching, widening and keying happen inside. Two impls: the
    compiled `compiled::FrameEngine` and the reference `trace::refengine`
-   (`RefEngine`, which crosses `compiled::bridge` - the only module naming both
-   `State` and `Rt2` - at its edge). The loop never touches a `State`.
+   (`RefEngine`: the tracer's interpreter over `RefDomain`, one lane and one
+   fork path at a time; `trace::refbridge` turns a block's lane into its
+   state and each leaf back into a one-row block, boxes and all, so its rows
+   key like the kernels'). The loop never touches an interpreter state.
 2. **The block** (`Rt2` in `celeste-engine`, `frame::Block` = an `Rt2` with its
    key column and its rows' ids). Columnar; key and cell are exposed, the
    fields are opaque columns. Serialized whole (`search::checkpoint`).
@@ -54,8 +56,6 @@ checkpoint, marks) and its cell (wave order, sharding, the pos graph, level
 crates/celeste-core      pico8_num, cart_data, collision_cache, ids, builtins   deps: -
 crates/celeste-names     FROZEN name tables (FIELD_NAMES order = canonical      deps: -
                          field order; append only)
-crates/celeste-interp    the interpreter's State model, abstraction::Level      deps: core
-                         (a level's object flags), game_runner
 crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        deps: core, names
 .  (celeste-rust)        everything else                                         deps: all
   src/frame.rs           Block, FrameStep, ForwardSink (queues, door, edge
@@ -68,11 +68,13 @@ crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        
                          ui_export
   src/trace/             the AST tracer (Lua -> transpile::graph::Graph), the
                          constant-lattice walk (kernel.rs), widen.rs, verify.rs
-                         (split pass), error.rs, level_minus_one.rs, refengine
+                         (split pass), error.rs, level_minus_one.rs, the
+                         reference engine (refengine, refdriver, refbridge)
   src/transpile/         graph IR, lowering (lower::specialize_frame), ASM
                          assembler (transpile::asm)
-  src/compiled/          FrameEngine, the kernel registry and append step,
-                         the State <-> block bridge
+  src/compiled/          FrameEngine, the kernel registry and append step
+  src/abstraction.rs     abstraction::Level (a level's object flags)
+  src/game_runner.rs     the start room, the win room
   src/bin/               rewrite (search + tools), transpile (probes, level -1),
                          concrete_run
 ```
@@ -281,8 +283,8 @@ kernel-bound.
    rows as a range. (One file per cell-uniform block was ~17k files a frame;
    zstd-bincode layers cost the H=89 backward 35 s per iteration to decode.)
 
-The initial state (`RefEngine::initial_state` -> one bucket) and the
-reference oracle are the only places a `State` meets the loop. A row's
+The initial state (`RefEngine::initial` -> one bucket) and the
+reference oracle are the only places the interpreter meets the loop. A row's
 projection onto a level is on the columns (`Rt2::widen_to`); exporting
 buckets through `State` once reached 62.8 GB at H=55.
 
@@ -369,10 +371,9 @@ the list (coarsest first; one level is the usual case):
 Resume: rerun the same command; the forward resumes or is reused, the arc
 phase reruns (minutes). A fresh forward clears `frames/` and `edges/`.
 Nothing on disk records the level: reusing a tree under another `--level` is
-on you. Kernel sets are keyed by the level's four flags;
-`CELESTE_KERNEL_SETS=N` caps the resident ones (LRU) for tools that run two
-levels. Fused graphs are dropped after assembly unless
-`CELESTE_ASM_EVAL_CHECK` / `CELESTE_KERNEL_EXPLAIN`.
+on you. One kernel set is resident, the process-global level's; a call at
+another level drops it and builds that level's. Fused graphs are dropped
+after assembly unless `CELESTE_KERNEL_EXPLAIN`.
 
 **The objects ladder, and when it is needed.** Validation (plans/results.md,
 "The arc pipeline"): rooms (1,0) 99, (4,2) 71, (5,3) 79, (3,3) 172 and
@@ -544,9 +545,9 @@ test).
 4. **A batch-invariance test** (`a_lanes_key_does_not_depend_on_its_
    neighbours` went with the old sweep) and a widening-soundness check
    (`diag-project` checks one projection; `ref-check` the kernels).
-5. **The UI export** still reads the deleted ladder's run layout
-   (`hNNN/levelNN`, `[ladder]` log lines) for old runs; the search's own runs
-   export as `--forward-only --arc`.
+5. **The UI** (`ui/`, TypeScript) still carries the ladder's concepts
+   (several horizons, kernel re-run backward iterations, the band colours);
+   the exporter writes one horizon and leaves those fields empty.
 
 ## Where the old plans went (2026-10-04)
 

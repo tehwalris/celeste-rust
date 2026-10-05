@@ -1,17 +1,10 @@
-//! A traced state, and the operation the whole design rests on: MERGE.
+//! A traced state, and MERGE.
 //!
-//! At a branch the tracer cannot decide, it runs both arms from a copy of
-//! the state and then tries to put the results back together. Two states
-//! whose SHAPES agree - same objects, same fields, same lengths, same
-//! closures - differ only in symbolic values, so they merge into one state
-//! with a `Sel` on the branch condition at every slot that differs. Slots
-//! that agree stay one node, which `Graph::fold` does for free and which
-//! is what stops a per-cell merge from costing a select per heap cell.
-//!
-//! Two states whose shapes DIFFER are genuinely different successors and
-//! both survive. That is not a failure case: it is how a frame that kills
-//! the player produces two output shapes without anyone having to write a
-//! specialization set to express it.
+//! At an undecided branch the tracer runs both arms from a copy of the state
+//! and merges the results: two states whose SHAPES agree differ only in
+//! symbolic values, so they become one state with a `Sel` at every slot that
+//! differs (slots that agree stay one node, by `Graph::fold`). States whose
+//! shapes differ are different successors and both survive.
 
 use anyhow::{bail, Result};
 
@@ -20,89 +13,55 @@ use super::heap::{Heap, Root, ScopeId, Shape, TableId, Value};
 
 pub struct State<D: Domain> {
     pub heap: Heap<D>,
-    /// The globals table - always root 0, so canonical numbering starts
-    /// from something both sides of a merge agree on.
+    /// The globals table: always root 0, so canonical numbering agrees.
     pub globals: TableId,
     /// The scope the interpreter is currently executing in.
     pub scope: ScopeId,
-    /// The scopes of the callers waiting on this one - the CALL STACK.
-    ///
-    /// They have to be GC roots. A callee's frame has the closure's
-    /// captured scope as its parent, NOT the caller's, so the caller's
-    /// scope is unreachable from the current one. Without this a merge
-    /// inside a call collects the scope the caller is about to return to,
-    /// and the restored id points at nothing - which showed up as `this`
-    /// being nil in a function whose body had branched.
+    /// The scopes of the callers waiting on this one - the CALL STACK. They
+    /// must be GC roots: a callee's scope parent is the closure's captured
+    /// scope, not the caller's, so a merge inside a call would otherwise
+    /// collect the scope the caller returns to.
     pub stack: Vec<ScopeId>,
-    /// WHEN does this state apply? One boolean, built up as `g and c` /
-    /// `g and not c` at every branch and OR-ed back together at every
-    /// merge.
+    /// WHEN does this state apply: `g and c` / `g and not c` at every branch,
+    /// OR-ed together at every merge. Downstream it is the emitted lane mask
+    /// (`Emit::live`).
     ///
-    /// Downstream it is the emitted lane mask (`Emit::live`). Nothing
-    /// decides anything by looking inside it - an earlier design carried
-    /// a list of assumed literals so that a re-tested condition could be
-    /// decided syntactically; measuring showed it firing 10 times in 25
-    /// frames, and all 10 disappeared once `and`/`or` stopped handing on
-    /// the node they had just split on.
-    ///
-    /// It is NOT what a merge selects on. It used to be, and that put the
-    /// whole path guard inside every merged value: `freeze' = Sel(guard,
-    /// 2, freeze)` where `guard` was three levels of `(A & p) | (A & !p)`
-    /// from the dash block's direction arms, a different node per button
-    /// combination, so one value that only ever takes two forms was 37
-    /// distinct nodes and 37 emitted bodies (plans/graph-audit.md). The
-    /// merge now selects on the one decision in `path` that separates
-    /// the two arms.
+    /// NOT what a merge selects on (that is the separating decision in
+    /// `path`): selecting on the guard put the whole path guard into every
+    /// merged value, one distinct node per button combination.
     ///
     /// INVARIANT: the guards of the outcomes in one frontier are pairwise
-    /// DISJOINT. Every fan-out is a split on some condition, so this holds
-    /// by construction - and `merge` relies on it: on a lane where the
-    /// merged guard holds, exactly one side's guard holds, and the
-    /// separating decision is KNOWN there, so the select picks that side.
+    /// DISJOINT (every fan-out is a split). `merge` relies on it: where the
+    /// merged guard holds, exactly one side's does, and the separating
+    /// decision is known there.
     pub guard: D::Bool,
     /// Where this path's MODEL ENDED: the lanes on which an unrolled loop's
-    /// bound ran out while the path still looped, and it went on as if the
-    /// loop were over (`Interp`'s numeric `for`). An error of the path, not
-    /// of any value - the loop changed nothing a row stores by running too
-    /// few times - so it is carried the one place a path's properties live,
-    /// and merged per case (the lanes a merged state takes from `t` ended
-    /// where `t`'s did). OR-ed into the outcome's error at the frame's end.
-    ///
-    /// The one thing `ok` carried that is not derivable from values
-    /// (plans/graph-model.md step 4). Made frame-global instead - OR-ed into
-    /// every outcome - each outcome's error read every path's loops, their
-    /// forks with them: room (3,0)'s largest kernel specialised 3.3M
-    /// configurations where it had 78k (2026-09-27).
+    /// bound ran out while the path still looped (`Interp`'s numeric `for`).
+    /// An error of the path, not of a value, so it lives on the state, is
+    /// merged per case, and is OR-ed into the outcome's error at the frame's
+    /// end. Per path, not frame-global: a frame-global one makes every
+    /// outcome's error read every path's forks (far more configurations).
     pub ended: D::Bool,
-    /// The branch decisions this state took since the frame started, in
-    /// order: `(condition, which way)`. `split` pushes one; `merge` keeps
-    /// the common prefix of the two sides.
+    /// The branch decisions taken since the frame started, in order:
+    /// `(condition, which way)`. `split` pushes one; `merge` keeps the common
+    /// prefix. Its job is to find what a merge selects on: the first entry
+    /// where two siblings' paths differ is the split that separates them.
     ///
-    /// Its one job is to find the condition a merge should select on.
-    /// Two states being merged diverged at exactly one split, and
-    /// everything before it is common to both, so the first entry where
-    /// their paths differ IS that split: the same condition, taken both
-    /// ways. Selecting on it, rather than on the full guard, keeps the
-    /// guard algebra out of the value layer - on the lanes where the
-    /// merged state applies the two choices agree everywhere else.
-    ///
-    /// The conjunction of the path's literals is NOT the guard: a fork
-    /// (`__split_by_flr`) narrows `guard` by its validity without a
-    /// split, and merging ORs two guards together. The guard stays the
-    /// authority on WHEN; the path only says WHICH WAY.
+    /// The conjunction of the literals is NOT the guard (a fork narrows the
+    /// guard without a split, and merges OR guards): the guard says WHEN, the
+    /// path only WHICH WAY.
     pub path: Vec<(D::Bool, bool)>,
-    /// The LITERAL SPLITS this state is a fragment of (plans/fly-fruit.md):
+    /// The LITERAL SPLITS this state is a fragment of:
     /// `(call depth, split id, fragment)`, innermost last. A `__split_by_flr`
     /// of a value every lane holds alike runs each fragment as its own state
     /// (`Domain::literal_fragments`); states of different fragments never
     /// merge in `collapse`, and rejoin when the call that split them returns
     /// (`Interp::rejoin_fragments`).
     pub frag: Vec<(usize, usize, u16)>,
-    /// THE ARC CAPTURE (`search::arc_edges`): per
-    /// axis (x, y), what this path's split of the PLAYER's own remainder did
-    /// (`Interp::capture_player_split`). `None` when the trace does not
-    /// capture - every trace but a level-0 one. Not in the heap,
-    /// so no shape, key or fingerprint sees it; merged per case like `ended`.
+    /// THE ARC CAPTURE (`search::arc_edges`): per axis, what this path's split
+    /// of the PLAYER's own remainder did (`Interp::capture_player_split`).
+    /// `None` unless the trace captures (level 0). Not in the heap, so no
+    /// shape, key or fingerprint sees it; merged per case like `ended`.
     pub arc: Option<Box<[ArcAxis<D>; 2]>>,
 }
 
@@ -141,16 +100,10 @@ pub fn common_prefix<D: Domain>(a: &State<D>, b: &State<D>) -> usize {
     a.path.iter().zip(b.path.iter()).take_while(|(x, y)| x == y).count()
 }
 
-/// The order in which `collapse` should TRY to merge pairs: every
-/// joinable `(i, j)` with `i < j`, siblings first.
-///
-/// Two states that diverged at the most recent split share the longest
-/// decision prefix, and merging them first is what lets `merge` find a
-/// single separating decision to select on. Merging a state with its
-/// cousin before its sibling leaves a pair whose paths do not split at
-/// one shared condition, and that pair has to fall back to the full
-/// guard. Ties break on `(i, j)` so the order - and the graph - is
-/// deterministic.
+/// The order in which `collapse` should TRY to merge pairs: every joinable
+/// `(i, j)` with `i < j`, longest common prefix (siblings) first, so `merge`
+/// finds a single separating decision instead of falling back to the guard.
+/// Ties break on `(i, j)` so the graph is deterministic.
 pub fn merge_order<D: Domain>(
     states: &[&State<D>],
     joinable: impl Fn(usize, usize) -> bool,
@@ -172,10 +125,8 @@ pub struct Merged<D: Domain> {
     pub state: State<D>,
     /// The condition every merged value selects on - true on `t`'s lanes.
     pub cond: D::Bool,
-    /// The two paths did not diverge at one shared decision (they can
-    /// fail to when `collapse` pairs two states that are not siblings),
-    /// so `cond` is `t.guard`, the always-correct choice the merge used
-    /// to make unconditionally. Counted so its frequency is a number.
+    /// The paths did not diverge at one shared decision (not siblings), so
+    /// `cond` is `t.guard`, which is always correct.
     pub fell_back: bool,
     /// A select survived the merge in a heap value, so the kernel reads
     /// `cond`'s value bit on this state's lanes.
@@ -217,12 +168,9 @@ impl<D: Domain> State<D> {
 
     /// The DECISIONS this state's path took, as one condition: where an
     /// operator evaluated on it means anything (`Domain::evaluated_at`,
-    /// `trace::error`). A superset of the lanes `guard` names - a fork's
-    /// validity narrows the guard and not the path, and a merge keeps the
-    /// common prefix - so an own error scoped to it errs on no fewer lanes
-    /// than it should. Scoped to `guard` itself it was exact and far bigger:
-    /// every fork site's intermediate guard became a root of the kernel
-    /// (room (3,0)'s largest, 456k nodes -> 1.41M, 2026-09-27).
+    /// `trace::error`). A superset of `guard`'s lanes, so an error scoped to
+    /// it errs on no fewer lanes than it should; scoping to `guard` would be
+    /// exact but makes every fork site's guard a kernel root (much bigger).
     pub fn decided(&self, d: &mut D) -> D::Bool {
         let mut at = d.boolean(true);
         for (c, way) in &self.path {
@@ -234,15 +182,9 @@ impl<D: Domain> State<D> {
 }
 
 /// Merge `t` (condition true) and `f` (condition false) if their shapes
-/// allow it. `None` means they are different successors.
-///
-/// Both sides are GC'd first, because two states that did the same thing
-/// by different routes leave different garbage behind and would otherwise
-/// look like different shapes.
-/// Merge two states. The condition is `t`'s own guard - the merged state
-/// happens when EITHER side would have, and picks t's value exactly where
-/// t applies. This needs the two guards to be disjoint; see the invariant
-/// on `State::guard`.
+/// allow it; `None` means they are different successors. The condition is
+/// the separating decision (`State::path`), else `t.guard`; the merged guard
+/// is the OR, which needs the guards disjoint (`State::guard`).
 pub fn merge<D: Domain>(d: &mut D, t: &State<D>, f: &State<D>) -> Result<Option<Merged<D>>> {
     if same_heap(t, f) {
         return merge_inner(d, t, f, Sides::Same, None);
@@ -261,21 +203,16 @@ pub fn merge_on<D: Domain>(d: &mut D, t: &State<D>, f: &State<D>, cond: D::Bool)
 }
 
 /// `merge` with the sides already paired: `Interp::collapse` tries many pairs
-/// of the same outcomes, and computing the shapes and orders per attempt was
-/// most of a trace after the copies went (room (3,0), 2026-09-17).
+/// of the same outcomes, so it computes each `Canon` once.
 pub fn merge_canon<D: Domain>(d: &mut D, t: &State<D>, f: &State<D>, sides: Sides<'_>) -> Result<Option<Merged<D>>> {
     merge_inner(d, t, f, sides, None)
 }
 
 /// Do both states hold the same `room`? It is a PROGRAM CONSTANT
-/// (`shapes::frozen_tables`): `load_room` only ever writes it constants, and
-/// everything downstream reads a state's room as one - the walk
-/// (`shapes::room_of`, -1 for anything else), level -1 (which refuses
-/// otherwise). Merged on a lane-dependent condition, `room.x` became a select
-/// and the walk skipped the merged outcome as "another room", losing its
-/// in-room arm with it: room (6,2), the respawned `player_spawn` and
-/// `next_room`'s fresh one in (7,2) have one shape, so the spawn's `spd.y` was
-/// never seen to leave -4 and a row at -3.5 declined (2026-10-02).
+/// (`shapes::frozen_tables`) that everything downstream reads as one (the
+/// walk's `shapes::room_of`, level -1). Merging two rooms would make
+/// `room.x` a select, and the walk would skip the merged outcome as "another
+/// room", losing its in-room arm.
 fn same_room<D: Domain>(t: &State<D>, f: &State<D>) -> bool {
     fn room<D: Domain>(s: &State<D>) -> Option<&std::collections::BTreeMap<String, Value<D>>> {
         match s.heap.tables.get(&s.globals)?.hash.get("room")? {
@@ -295,19 +232,16 @@ pub enum Sides<'c> {
 }
 
 /// The two states hold the same heap, object by object BY ID, with the same
-/// roots: they forked and neither wrote since - the arms of `a and b` where
-/// `b` only reads. Every slot then pairs with an equal one, so the merge has
-/// no shape to compare and nothing to join, and computing both `Canon`s was
-/// a third of the room walk (room (3,0), 2026-09-18). Anything else
-/// (a temporary allocated, a different numbering) pairs by `Canon`.
+/// roots: they forked and neither wrote since (the arms of `a and b` where
+/// `b` only reads). Every slot pairs with an equal one, so the merge skips
+/// computing the `Canon`s.
 pub fn same_heap<D: Domain>(t: &State<D>, f: &State<D>) -> bool {
     t.globals == f.globals && t.scope == f.scope && t.stack == f.stack && t.frag == f.frag && t.heap.same_as(&f.heap)
 }
 
 /// What a merge compares and pairs a state by: its shape, and the canonical
-/// BFS order of its reachable objects (two heaps built by different
-/// allocation histories number the same objects the same). Both walk only
-/// what the roots reach.
+/// BFS order of its reachable objects (independent of allocation history
+/// and of garbage).
 pub struct Canon {
     shape: Shape,
     order: Vec<Root>,
@@ -324,13 +258,9 @@ impl Canon {
     }
 }
 
-/// Both sides are READ: nothing is copied or collected until the merge is
-/// known to happen. `collapse` tries every pair and most of them refuse, and
-/// copying and collecting both heaps per attempt was three quarters of a
-/// trace once a fruit-unknown set kept successors apart (room (3,0),
-/// 2026-09-17: the walk went from 21 s to 415 s, in `BTreeMap::clone`, `gc`
-/// and the allocator). A `Canon` walks only what the roots reach, so garbage
-/// cannot make two states look different.
+/// Both sides are only READ until the merge is known to happen: `collapse`
+/// tries every pair and most refuse, so copying and collecting per attempt
+/// dominated the trace.
 fn merge_inner<D: Domain>(
     d: &mut D,
     t: &State<D>,
@@ -351,7 +281,7 @@ fn merge_inner<D: Domain>(
         return Ok(None);
     }
 
-    // The decision that separates the two sides - see `State::path`.
+    // The separating decision (`State::path`).
     let l = common_prefix(&t, &f);
     let rejoin = over.is_some();
     let (cond, fell_back) = match (over,t.path.get(l), f.path.get(l)) {
@@ -364,33 +294,21 @@ fn merge_inner<D: Domain>(
     let cond = &cond;
     let path: Vec<(D::Bool, bool)> = t.path[..l].to_vec();
 
-    // Rebuild into the T SIDE'S NUMBERING, not a fresh canonical one.
-    //
-    // Both sides descend from the same pre-branch state, so every id the
-    // CALLER is holding - the scope to return to, a table it is midway
-    // through building - is valid in `t` and unchanged there. Renumbering
-    // into a fresh canonical space invalidated all of them, which showed
-    // up as `this` being nil inside a function whose body had merged: the
-    // caller restored a scope id that no longer existed.
-    //
-    // Canonical order is still what PAIRS the two sides, so allocation
-    // history cannot make equal states look different. It just is not
-    // what the result is numbered by.
-    // Same heap: every slot pairs with an equal one, nothing to walk.
+    // The result keeps the T SIDE'S NUMBERING: every id the caller holds (the
+    // scope to return to, a half-built table) stays valid. Canonical order
+    // only PAIRS the two sides.
     let (t_order, f_order): (&[Root], &[Root]) = match sides {
         Sides::Same => (&[], &[]),
         Sides::Canon(ct, cf) => (&ct.order, &cf.order),
     };
     if t_order.len() != f_order.len() {
-        // Equal shapes should guarantee this; if it ever fires, the shape
-        // is not describing what merging actually depends on.
+        // Equal shapes guarantee this; if not, the shape misses something.
         bail!("merge: canonical orders disagree after equal shapes");
     }
 
-    // A condition that reads an unknown atom cannot be selected on: the lanes
-    // it depends on the atom in would decline its `Known` premise. Two such
-    // states are two successors (plans/fly-fruit.md), refused at the first
-    // select; only a rejoin (`merge_on`) reports it instead.
+    // A condition that reads an unknown atom cannot be selected on (its lanes
+    // would decline the `Known` premise): two successors, refused at the
+    // first select. A rejoin (`merge_on`) reports it instead.
     let refuse_selects = !rejoin && d.reads_unknown_atom(cond);
     let mut joined = Joined { writes: Vec::new(), selects: false, first_select: None };
     for (rt, rf) in t_order.iter().zip(f_order.iter()) {
@@ -422,10 +340,8 @@ fn merge_inner<D: Domain>(
                     joined.slot(d, cond,*rt, || SlotKey::Var(k.clone()), va, vb)?;
                 }
             }
-            // A closure has no mutable content - which body it is and
-            // what it captured are both fixed at creation - so pairing
-            // the two sides is all there is to do. It has to be in the
-            // traversal so the scope it captured gets visited.
+            // A closure is immutable; it is in the order only so its scope
+            // is visited.
             (Root::Closure(_), Root::Closure(_)) => {}
             _ => bail!("merge: canonical orders disagree in kind after equal shapes"),
         }
@@ -456,9 +372,8 @@ fn merge_inner<D: Domain>(
             (root, key) => bail!("merge: slot {} written into {root:?}", key.at(root)),
         }
     }
-    // The arc capture, per case: a select only on a condition the lanes
-    // decide (as the heap's values: refused, two successors, otherwise).
-    // Fragments of a literal split differing in it did not rejoin.
+    // The arc capture, per case: selected like the heap's values (refused
+    // on an undecided condition); literal-split fragments must agree on it.
     let arc = match (&t.arc, &f.arc) {
         (None, None) => None,
         (Some(a), Some(b)) if a == b => Some(a.clone()),
@@ -534,11 +449,8 @@ impl<D: Domain> Joined<D> {
         b: &Value<D>,
     ) -> Result<()> {
         let j = join(d, cond, a, b)?;
-        // Only the selects THIS merge made read `cond`'s value bit: a slot both
-        // sides hold alike keeps whatever select an earlier merge left there,
-        // which reads its own condition and owns its own error. (Counting
-        // those too made every merge on an undecided atom refuse over the
-        // spawn's `delay`, room (3,0) with the floors unknown, 2026-09-18.)
+        // Only the selects THIS merge made read `cond`'s value bit: a select an
+        // earlier merge left in a slot both sides share reads its own condition.
         let sel = a != b
             && match &j {
                 Value::Num(n) => d.is_select_num(n),
@@ -565,14 +477,12 @@ impl<D: Domain> Joined<D> {
     }
 }
 
-/// Merge one slot. Only numbers and booleans can actually differ - the
-/// shapes agreed about everything else - so this is where the `Sel` nodes
-/// come from, and `Graph::fold` collapses the ones whose arms are equal,
-/// which is the overwhelming majority.
+/// Merge one slot. Only numbers and booleans can differ (the shapes agreed),
+/// so this is where `Sel` nodes come from; `Graph::fold` collapses equal arms.
 fn join<D: Domain>(d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Result<Value<D>> {
     Ok(match (a, b) {
         // A condition no lane decides, over values every lane holds alike: the
-        // join, not a select no lane can take (`Domain::join_num_independent`).
+        // join, not a select (`Domain::join_num_independent`).
         (Value::Num(x), Value::Num(y)) => Value::Num(match d.join_num_independent(cond, x, y) {
             Some(j) => j,
             None => d.sel_num(cond, x, y),
@@ -581,8 +491,7 @@ fn join<D: Domain>(d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Res
             Some(j) => j,
             None => d.sel_bool(cond, x, y),
         }),
-        // The shapes agreed about everything else, and the result keeps
-        // the t side's structure, so t's own value is already right.
+        // The shapes agreed, and the result keeps t's structure.
         (x, Value::Table(_) | Value::Func(_) | Value::Nil | Value::Str(_)
             | Value::Builtin(_)) => x.clone(),
         (x, y) => bail!("merge: {:?} and {:?} after equal shapes", x, y),
@@ -596,8 +505,6 @@ mod tests {
     use crate::trace::domain::{Cmp, Symbolic};
     use crate::transpile::graph::Op;
 
-    /// Two states that differ in one field merge into one state with one
-    /// select, and everything they agree on stays a single node.
     /// Where a path's model ended is merged PER CASE: the lanes the merged
     /// state takes from one side ended where that side's did, and no more.
     #[test]
@@ -621,6 +528,8 @@ mod tests {
         assert_eq!(m.ended, d.graph.fold(Op::And, vec![cond, over]), "ended only on t's lanes");
     }
 
+    /// Two states that differ in one field merge with one select; everything
+    /// they agree on stays a single node.
     #[test]
     fn merging_costs_a_select_only_where_the_arms_disagree() {
         let mut d = Symbolic::default();
@@ -651,12 +560,10 @@ mod tests {
         let mut f = s.clone();
         f.heap.tables.get_mut(&player).unwrap().hash.insert("x".into(), Value::Num(b));
 
-        // An undecided condition, as a real branch would have.
         let sym = d.graph.leaf(Op::Cell(1));
         let zero = d.num(P8::from_i16(0));
         let cond = d.compare(Cmp::Gt, &sym, &zero).unwrap();
         assert_eq!(d.decide(&cond), None);
-        // A real branch leaves each side guarded by the literal it took.
         s.guard = cond.clone();
         f.guard = d.not(&cond);
 
@@ -666,11 +573,8 @@ mod tests {
             ref v => panic!("expected a table, got {:?}", v),
         };
         let tab = &m.heap.tables[&player_m];
-        // The field they agreed on is the SAME node, not a select of it
-        // with itself - this is what stops a per-cell merge costing a
-        // select per heap cell.
+        // The agreed field is the SAME node, not a select of it with itself.
         assert_eq!(tab.hash["untouched"], Value::Num(same));
-        // The field they disagreed on became one.
         let x = match tab.hash["x"] {
             Value::Num(n) => n,
             ref v => panic!("expected a number, got {:?}", v),
@@ -679,10 +583,8 @@ mod tests {
         assert_eq!(d.graph.get(x).args, vec![cond, a, b]);
     }
 
-    /// The merge selects on the DECISION that separates the two sides,
-    /// not on their full guards. Here both sides sit under an outer
-    /// guard `g`; the select must name `c`, and the merged guard must
-    /// still be the OR of the two guards.
+    /// The merge selects on the separating DECISION `c`, not on the guards
+    /// (both under an outer `g`); the merged guard is still their OR.
     #[test]
     fn a_merge_selects_on_the_separating_decision_not_the_guard() {
         let mut d = Symbolic::default();
@@ -715,8 +617,7 @@ mod tests {
         assert_eq!(m.state.guard, d.or(&tg, &fg), "the guard is still the OR of both sides");
         assert_eq!(m.state.path, vec![(g, true)], "the merged path is the common prefix");
 
-        // Two states whose paths do not diverge at one shared decision
-        // fall back to the full guard, which is always correct.
+        // Paths not diverging at one shared decision fall back to the guard.
         let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ended: d.boolean(false), path: vec![(g, true)], frag: Vec::new(), arc: None };
         p.globals = p.heap.new_table();
         p.scope = p.heap.new_scope(None);
@@ -738,8 +639,7 @@ mod tests {
         let obj = s.heap.new_table();
         s.heap.tables.get_mut(&s.globals).unwrap().arr.push(Value::Table(obj));
 
-        // The other arm killed it - the array is shorter, so the heaps
-        // are not the same shape and both states survive.
+        // The other arm killed it: a shorter array, a different shape.
         let mut f = s.clone();
         f.heap.tables.get_mut(&f.globals).unwrap().arr.clear();
 
@@ -751,9 +651,7 @@ mod tests {
         assert!(merge(&mut d, &s, &f).unwrap().is_none());
     }
 
-    /// GC before comparing: two states that reached the same place by
-    /// different routes leave different garbage, and without collecting it
-    /// they would look like different shapes and never merge.
+    /// Garbage left by different routes does not make two shapes differ.
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
@@ -774,9 +672,8 @@ mod tests {
     }
 }
 
-/// Split a state on an undecided condition. Each side's guard picks up
-/// the literal; a side whose guard folds to false is DEAD and is not
-/// returned, so the caller never explores it.
+/// Split a state on an undecided condition. Each side's guard picks up the
+/// literal; a side whose guard folds to false is DEAD and not returned.
 pub fn split<D: Domain>(
     d: &mut D,
     s: State<D>,

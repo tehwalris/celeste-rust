@@ -1,52 +1,26 @@
-//! Deciding boolean equality on the graph, instead of sampling it.
+//! Deciding boolean equality on the graph with ROBDDs, instead of
+//! pattern-matching it.
 //!
-//! `Graph::fold` normalizes: it rewrites syntax it recognizes. That is
-//! cheap and it halved the emitted body, but it is bounded by the shapes
-//! someone thought to write down. Measuring what was left said so
-//! bluntly - of the 514 nodes where constancy is CREATED (constant at
-//! every one of 193 sampled game states, with no constant operand), the
-//! three patterns worth guessing at from a handful of examples
-//! (`a and not a`, `a or not a`, `(a and x) or (not a and x)`) covered
-//! 23. The other 491 are `And`/`Or` nodes with no shape in common.
-//!
-//! So the question "is this boolean node constant" has to be DECIDED
-//! rather than pattern-matched. That is what an ROBDD does: build each
-//! boolean node's function over its atoms, and two nodes are equal
-//! exactly when their BDDs are the same reference. Constant is the
-//! special case where the reference is a terminal.
+//! `Graph::fold` only rewrites shapes someone wrote down; most constant
+//! `And`/`Or` nodes share no shape. A BDD decides it: two nodes are equal
+//! exactly when their BDDs are the same reference, constant when that
+//! reference is a terminal.
 //!
 //! `simplify_local` does this PER NODE, on a small BDD of the node's own
-//! bounded cone, once, in topological order over the rewritten graph. A
-//! global analysis - one table for the whole graph, iterated four times -
-//! stood here until 2026-09-15: on a fused kernel of the bucket dispatch
-//! its 2^22-node cap filled on the first formulas and 5,500 to 8,300
-//! `And`/`Or`/`Not` per kernel went unanalysed, at ~all of the build's
-//! CPU. The local pass finds more (room (1,0)'s exact-speed player shape:
-//! 11,844 fused nodes against 7,569) at ~1/150 of the time.
+//! bounded cone, once, in topological order over the rewritten graph. (One
+//! global table for the whole graph overflows its cap on a fused kernel's
+//! first formulas and leaves the rest unanalysed.)
 //!
 //! ## What counts as an atom
 //!
 //! Everything that is not `And`, `Or`, `Not`, `ConstBool` or a `Sel`
-//! between booleans: comparisons, `TileFlagAt`, `Known`, boolean
-//! input cells. Atoms are treated as INDEPENDENT free variables, which is
-//! the source of this analysis's incompleteness and also of its
-//! soundness:
+//! between booleans: comparisons, `TileFlagAt`, `Known`, boolean input
+//! cells. Atoms are INDEPENDENT free variables. That makes the analysis
+//! incomplete (`x < 3 and x > 5` is not folded) and sound: a function
+//! constant over ALL assignments of its atoms is constant over the
+//! realizable ones, a subset.
 //!
-//! * `x < 3` and `x > 5` are two atoms, so their conjunction is
-//!   satisfiable here and the analysis will not fold it. It MISSES real
-//!   constants. That is fine.
-//! * `Known(x)` and `x` are two atoms, likewise.
-//! * But if a function is constant when its atoms range over ALL
-//!   assignments, it is constant over the realizable ones too, because
-//!   those are a subset. So everything this DOES conclude holds.
-//!
-//! Incomplete and sound is the right side to err on: a missed fold costs
-//! emitted lines, an unsound one costs correctness.
-//!
-//! ## What this is not
-//!
-//! Not a SAT solver over pico-8 arithmetic. The numeric layer is left
-//! alone - but it still benefits, because a numeric `Sel` whose condition
+//! The numeric layer is left alone, but a numeric `Sel` whose condition
 //! this proves constant folds through `Graph::fold` when the graph is
 //! rebuilt.
 
@@ -56,10 +30,8 @@ use super::graph::{Graph, NodeId, Op};
 
 /// `simplify_local`'s settings for the lowering: the most BDD nodes one
 /// node's analysis may build, and the compound nodes of its cone it expands
-/// before treating the rest as opaque. Measured on six kernels of room
-/// (1,0) (2026-09-15): every expansion from 4 to 32 finds the same rewrites
-/// (3,110 merges, 8 constants, 71,008 fused nodes against the global
-/// pass's 84,923); 64 and above overflow the local table and find LESS.
+/// before treating the rest as opaque. Expansions from 4 to 32 find the same
+/// rewrites; 64 and above overflow the table and find LESS.
 pub const LOCAL_CAP: usize = 1 << 12;
 pub const LOCAL_EXPAND: usize = 8;
 
@@ -87,10 +59,9 @@ pub struct Bdd {
     nodes: Vec<Triple>,
     intern: FxHashMap<Triple, Ref>,
     memo: FxHashMap<(Ref, Ref, Ref), Ref>,
-    /// The budget. An ROBDD can be exponential in its variable count, and
-    /// a guard chain over hundreds of atoms is exactly the shape that
-    /// blows up, so the cap is not decoration. Hitting it makes the
-    /// operation return `None`, which the caller counts (`Stats::unanalysed`).
+    /// The budget: an ROBDD can be exponential in its variable count. Hitting
+    /// it makes the operation return `None`, which the caller counts
+    /// (`Stats::unanalysed`).
     cap: usize,
 }
 
@@ -118,8 +89,8 @@ impl Bdd {
     }
 
     /// The reduce step: a node whose branches agree is not a node, and an
-    /// identical triple is the same node. Together these are what make
-    /// equality of functions the same thing as equality of references.
+    /// identical triple is the same node. Together these make equality of
+    /// functions equality of references.
     fn mk(&mut self, var: u32, lo: Ref, hi: Ref) -> Option<Ref> {
         if lo == hi {
             return Some(lo);
@@ -199,9 +170,8 @@ impl Bdd {
     }
 }
 
-/// Does this op PRODUCE a boolean, whatever its operands are? Used only
-/// to decide whether a `Sel` is a boolean select; everything else is
-/// driven by the op itself.
+/// Does this op PRODUCE a boolean, whatever its operands are? Used only to
+/// decide whether a `Sel` is a boolean select.
 fn inherently_bool(op: &Op) -> bool {
     matches!(
         op,
@@ -237,9 +207,8 @@ pub fn reachable(g: &Graph, roots: &[NodeId]) -> Vec<bool> {
     need
 }
 
-/// What `simplify_local` did, for reporting. Every field exists because a
-/// simplifier that reports only its output size cannot be told from one
-/// that silently gave up.
+/// What `simplify_local` did, for reporting (so a simplifier that gave up
+/// can be told from one that found nothing).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
     pub before: usize,
@@ -248,14 +217,12 @@ pub struct Stats {
     pub constants: usize,
     /// Boolean nodes proved equal to an ATOM and replaced by it.
     pub to_atom: usize,
-    /// Branch re-merges collapsed to their common factor - the
-    /// `(A & p) | (A & not p) -> A` family. See the safety proof on
-    /// `simplify_local`.
+    /// Branch re-merges collapsed to their common factor (the
+    /// `(A & p) | (A & not p) -> A` family, see `simplify_local`).
     pub merged: usize,
-    /// Of `merged`, those of the tracer's re-merge shape with SYNTACTIC
-    /// complements - two terms, one residual each, `p` and `Not(p)` or a
-    /// complementary comparison over the same operands: the ones no BDD
-    /// is needed to prove (2026-09-15, measuring what the BDD buys).
+    /// Of `merged`, those with SYNTACTIC complements (two terms, one residual
+    /// each, `p` and `Not(p)` or complementary comparisons): the ones no BDD is
+    /// needed to prove.
     pub merged_simple: usize,
     /// `And`/`Or`/`Not` nodes the analysis gave no function (the cap ran
     /// out before them, or an operand had none): not simplified at all.
@@ -300,28 +267,14 @@ fn syntactic_complements(g: &Graph, x: NodeId, y: NodeId) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// THE LOCAL PASS (2026-09-15)
+// THE LOCAL PASS
 //
-// The global analysis this replaced built every boolean node's function in
-// ONE table shared by the whole graph. On a fused kernel of the bucket
-// dispatch (~700 atoms, guard chains across hundreds of configurations) a few
-// early formulas filled its 2^22-node cap, and every node after them - 5,500
-// to 8,300 `And`/`Or`/`Not` per kernel, the `ok`/`live` region included (`ok`
-// is `error` since 2026-09-27) - was
-// left unanalysed; four passes of that were ~all of the level-0 bucketed
-// set's build CPU (7,292 CPU-seconds of the build's ~7,200 user seconds).
-// What it found was almost entirely the common-factor collapse, and a
-// collapse needs the functions of a handful of residual leaves, not of the
-// graph.
-//
-// `simplify_local` applies the same three rewrites, under the same safety
-// rules, each proved on a small BDD of the node's OWN bounded cone: past the
-// expansion budget a compound node is an opaque variable, which proves less
-// and never anything false (a tautology over independent variables holds for
-// the realizable assignments too). It runs once, in topological order over
-// the REWRITTEN graph, so a collapse that exposes another is seen in the
-// same pass - what the global analysis needed further passes for (a second
-// local pass finds nothing on room (1,0)'s kernels).
+// Each rewrite is proved on a small BDD of the node's OWN bounded cone: past
+// the expansion budget a compound node is an opaque variable, which proves
+// less and never anything false (a tautology over independent variables
+// holds for the realizable assignments too). It runs once, in topological
+// order over the REWRITTEN graph, so a collapse that exposes another is
+// seen in the same pass.
 // ---------------------------------------------------------------------------
 
 /// A variable of a local analysis: a comparison in canonical form - `Lt`
@@ -333,7 +286,7 @@ enum LocalVar {
     Node(NodeId),
 }
 
-/// A `Sel` between booleans (the test `analyze` uses: an arm's own op).
+/// A `Sel` between booleans (by an arm's own op).
 fn is_bool_sel(g: &Graph, n: NodeId) -> bool {
     let node = g.get(n);
     matches!(node.op, Op::Sel) && (inherently_bool(&g.get(node.args[1]).op) || inherently_bool(&g.get(node.args[2]).op))
@@ -498,46 +451,33 @@ fn factor_local(g: &Graph, local: &mut Local, id: NodeId, expand: usize) -> Opti
 }
 
 /// Rebuild `g` over the nodes `roots` reach with the boolean layer
-/// simplified LOCALLY (see the section note): per `And`/`Or`/`Not`/boolean
-/// `Sel` of the rewritten graph, its function on a BDD of at most `cap`
-/// nodes over its cone expanded to `expand` compound nodes, then a
-/// constant, a genuine atom, or the common-factor collapse where proved.
-/// Returns the new graph, the old -> new map (`UNREACHABLE` outside the
-/// reachable set) and what it did (`Stats::unanalysed`: nodes whose local
-/// table overflowed).
-///
-/// The numeric layer is copied through `fold`, which is where it picks up
-/// the benefit: a select whose condition just became `ConstBool` folds to
-/// one of its arms, and nothing the other arm used is referenced any more.
+/// simplified LOCALLY: per `And`/`Or`/`Not`/boolean `Sel` of the rewritten
+/// graph, its function on a BDD of at most `cap` nodes over its cone
+/// expanded to `expand` compound nodes, then a constant, a genuine atom, or
+/// the common-factor collapse where proved. Returns the new graph, the old
+/// -> new map (`UNREACHABLE` outside the reachable set) and `Stats`. The
+/// numeric layer is copied through `fold`, so a select whose condition
+/// became constant folds to one arm.
 ///
 /// ## Why only constants and atoms
 ///
-/// The BDD proves that two nodes compute the same CONCRETE function. It
-/// does not follow that they are interchangeable, because the graph is
-/// also evaluated ABSTRACTLY - in Kleene, per lane - and two forms of one
-/// function approximate it differently. `And(x, y)` decides `false` as
-/// soon as either side is known false; a select-shaped form of the same
-/// function may answer `unknown` there. Substituting the coarser form for
-/// the finer one is SOUND, but it makes lanes undecided that were
-/// decided, and an undecided `live` is not merely slower - it is a lane
-/// that may fall out of every outcome.
+/// The BDD proves that two nodes compute the same CONCRETE function. That
+/// does not make them interchangeable: the graph is also evaluated
+/// ABSTRACTLY (Kleene, per lane), and two forms of one function approximate
+/// it differently (`And(x, y)` is false as soon as either side is; a
+/// select-shaped form may answer unknown there). Substituting the coarser
+/// form is sound but makes decided lanes undecided, and an undecided `live`
+/// may drop a lane from every outcome.
 ///
-/// Constants and atoms are the two cases where the representative is
-/// provably the MOST precise form there is:
+/// Constants and atoms are provably the MOST precise form there is: a
+/// constant is exact, and a node equal to an atom computes exactly "read
+/// this input". Hence a GENUINE atom only, never an opaque compound
+/// standing in for its cone.
 ///
-/// * a constant is exact by definition;
-/// * an atom's abstract value is its input's, and a node equal to that
-///   atom computes exactly "read this input", so no form of it can be
-///   more precise. Hence a GENUINE atom only: an opaque compound standing
-///   in for its cone is not one.
+/// ## The common-factor collapse
 ///
-/// ## The common-factor collapse (2026-08-26)
-///
-/// There is a THIRD safe case, and it is a specific SHAPE, not a
-/// general "merge into anything in your own cone". The dominant
-/// redundancy in a traced frame is the tracer's branch re-merge
-/// `(A & p) | (A & not p)`, which is `A` again - three levels deep in
-/// the dash block, once per direction combo (`plans/graph-audit.md`).
+/// A THIRD safe case, a specific SHAPE: the tracer's branch re-merge
+/// `(A & p) | (A & not p)`, which is `A` again.
 ///
 /// **Rule.** Let `N` be an `Or` whose flattened disjuncts are
 /// `And`-trees `dᵢ = ⋀ Cᵢ ∪ Pᵢ`, where every disjunct contains the same
@@ -567,34 +507,26 @@ fn factor_local(g: &Graph, local: &mut Local, id: NodeId, expand: usize) -> Opti
 /// So `N` decided forces `⋀C` decided and equal; `N` undecided needs
 /// nothing. ∎
 ///
-/// **Why not the audit's broader rule.** `plans/graph-audit.md`
-/// proposed merging `N` into ANY node `M` of `N`'s own cone with the
-/// same BDD reference, with a monotonicity proof. That proof is WRONG:
-/// it writes `N = F(M, v)` and lets `M` range independently of `v`,
-/// which fails when `v` shares atoms with `M`. Counterexample:
-/// `A = (a ∧ ¬a) ∨ (d ∧ e)` (concretely `d ∧ e`), `N = A ∧ (d ∧ e)` -
-/// same BDD reference, `A` in `N`'s cone, but at `a = ⊥, d = false`
-/// Kleene gives `N = ⊥ ∧ false = false` (decided) while `A = ⊥`.
-/// `false ∧ ⊥ = false` MANUFACTURES decidedness, so an ancestor is not
-/// always at-least-as-decided. The general merge was implemented first
-/// and the preservation gate caught it losing a decided lane; only the
-/// factor shape above survives.
+/// **Why not a broader rule.** Merging `N` into ANY node `M` of its own
+/// cone with the same BDD reference is UNSOUND: `M` does not range
+/// independently of the rest. Counterexample: `A = (a ∧ ¬a) ∨ (d ∧ e)`
+/// (concretely `d ∧ e`), `N = A ∧ (d ∧ e)` - same BDD reference, `A` in
+/// `N`'s cone, but at `a = ⊥, d = false` Kleene gives `N = false`
+/// (decided) while `A = ⊥`. `false ∧ ⊥ = false` MANUFACTURES decidedness,
+/// so an ancestor is not always at-least-as-decided.
 ///
-/// This is deliberately NOT a `Graph::fold` rule: `fold`'s contract
-/// (`folding_is_exact_not_merely_sound`) is exactness in Kleene, and
-/// this rewrite is a refinement (at `A = true`, `p = ⊥` the merged form
-/// is `⊥`, `A` is `true`). It also needs the complementary-comparison
-/// knowledge (`gt`/`le` on the same operands are one variable) that
-/// only the BDD has. Dropping a duplicate leaf, by contrast, IS exact in
-/// Kleene (idempotence, associativity, commutativity).
+/// Deliberately NOT a `Graph::fold` rule: `fold`'s contract
+/// (`folding_is_exact_not_merely_sound`) is exactness in Kleene, and this
+/// rewrite is a refinement (at `A = true`, `p = ⊥` the merged form is `⊥`).
+/// Dropping a duplicate leaf, by contrast, IS exact in Kleene.
 pub fn simplify_local(g: &Graph, roots: &[NodeId], cap: usize, expand: usize) -> (Graph, Vec<NodeId>, Stats) {
     let need = reachable(g, roots);
     let mut out = g.like();
     let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
     let mut st = Stats { before: need.iter().filter(|x| **x).count(), ..Default::default() };
     let mut local = Local::new(cap);
-    // Per node of `out`, what it settled to: hash-consing hands back a node
-    // already analysed.
+    // Per node of `out`, what it settled to (hash-consing hands back nodes
+    // already analysed).
     let mut settled: FxHashMap<NodeId, NodeId> = FxHashMap::default();
     for id in 0..g.len() {
         if !need[id] {
@@ -608,9 +540,7 @@ pub fn simplify_local(g: &Graph, roots: &[NodeId], cap: usize, expand: usize) ->
             continue;
         }
         // A leaf repeated in an `And`/`Or` tree goes: idempotence, with
-        // associativity and commutativity, is exact in Kleene. The census
-        // of room (1,0)'s kernels counted 17 to 410 such leaves per kernel
-        // after the rewrites below (2026-09-15).
+        // associativity and commutativity, is exact in Kleene.
         let new = match out.get(built).op {
             Op::And | Op::Or => {
                 let op = out.get(built).op.clone();
@@ -679,148 +609,6 @@ pub fn simplify_local(g: &Graph, roots: &[NodeId], cap: usize, expand: usize) ->
     (out, map, st)
 }
 
-/// The census of what a simplified graph still holds, for finding the next
-/// simplification in the data rather than by guessing (`transpile
-/// --key-probe`, 2026-09-15): the op histogram over what `roots` reach; the
-/// maximal `And`/`Or` trees, and in them complementary or duplicate leaves,
-/// common factors (all terms, or some pair) and comparisons of one operand
-/// against constants; and the select shapes that could collapse.
-pub fn census(g: &Graph, roots: &[NodeId]) -> String {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::fmt::Write as _;
-    let live = reachable(g, roots);
-    let ids: Vec<NodeId> = (0..g.len() as NodeId).filter(|n| live[*n as usize]).collect();
-    let mut out = String::new();
-    // The histogram.
-    let mut ops: BTreeMap<String, usize> = BTreeMap::new();
-    for &n in &ids {
-        let name = format!("{:?}", g.get(n).op);
-        let name = name.split('(').next().unwrap_or("").to_string();
-        *ops.entry(name).or_default() += 1;
-    }
-    let mut by_count: Vec<(String, usize)> = ops.into_iter().collect();
-    by_count.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-    let _ = writeln!(out, "    census: {} live nodes; ops {}", ids.len(), by_count.iter().map(|(o, c)| format!("{o} {c}")).collect::<Vec<_>>().join(", "));
-    // A node is the root of its same-op tree when no live parent has its op.
-    let mut same_parent = vec![false; g.len()];
-    for &n in &ids {
-        let node = g.get(n);
-        if matches!(node.op, Op::And | Op::Or) {
-            for a in &node.args {
-                if g.get(*a).op == node.op {
-                    same_parent[*a as usize] = true;
-                }
-            }
-        }
-    }
-    let is_cmp_const = |x: NodeId| -> Option<NodeId> {
-        let nd = g.get(x);
-        if !matches!(nd.op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq) {
-            return None;
-        }
-        match (&g.get(nd.args[0]).op, &g.get(nd.args[1]).op) {
-            (Op::Const(..), Op::Const(..)) => None,
-            (_, Op::Const(..)) => Some(nd.args[0]),
-            (Op::Const(..), _) => Some(nd.args[1]),
-            _ => None,
-        }
-    };
-    // What a rewrite would REMOVE, not just where it applies: duplicate
-    // leaves past the first, same-direction comparisons of one operand
-    // against constants past the tightest, and the conjuncts a full common
-    // factor repeats.
-    let (mut dup_removable, mut range_removable, mut factor_removable) = (0usize, 0usize, 0usize);
-    let (mut trees, mut leaves_total, mut complement, mut duplicate, mut full_factor, mut pair_factor, mut range_merge) = (0, 0, 0, 0, 0, 0, 0);
-    for &n in &ids {
-        let node = g.get(n);
-        if !matches!(node.op, Op::And | Op::Or) || same_parent[n as usize] {
-            continue;
-        }
-        let want_and = matches!(node.op, Op::And);
-        let Some(leaves) = flatten(g, n, want_and, 256) else { continue };
-        trees += 1;
-        leaves_total += leaves.len();
-        let set: BTreeSet<NodeId> = leaves.iter().copied().collect();
-        if set.len() < leaves.len() {
-            duplicate += 1;
-            dup_removable += leaves.len() - set.len();
-        }
-        if leaves.iter().enumerate().any(|(i, x)| leaves[i + 1..].iter().any(|y| syntactic_complements(g, *x, *y))) {
-            complement += 1;
-        }
-        // Comparisons of one operand against constants, conjoined; the same
-        // direction (lower bound / upper bound) merges into one.
-        if want_and {
-            let mut per: BTreeMap<(NodeId, bool), BTreeSet<NodeId>> = BTreeMap::new();
-            for l in set.iter() {
-                if let Some(x) = is_cmp_const(*l) {
-                    let nd = g.get(*l);
-                    let const_right = nd.args[0] == x;
-                    // A lower bound on x: `x > k`, `x >= k`, `k < x`, `k <= x`.
-                    let lower = match nd.op {
-                        Op::Gt | Op::Ge => const_right,
-                        Op::Lt | Op::Le => !const_right,
-                        _ => continue,
-                    };
-                    per.entry((x, lower)).or_default().insert(*l);
-                }
-            }
-            if per.values().any(|c| c.len() >= 2) {
-                range_merge += 1;
-                range_removable += per.values().map(|c| c.len().saturating_sub(1)).sum::<usize>();
-            }
-        }
-        // Common factors among the terms (the terms of an Or are And-trees).
-        if leaves.len() >= 2 {
-            let parts: Vec<BTreeSet<NodeId>> = leaves.iter().filter_map(|t| flatten(g, *t, !want_and, 256)).map(|v| v.into_iter().collect()).collect();
-            if parts.len() == leaves.len() {
-                let mut common = parts[0].clone();
-                for p in &parts[1..] {
-                    common = common.intersection(p).copied().collect();
-                }
-                if !common.is_empty() {
-                    full_factor += 1;
-                    factor_removable += (parts.len() - 1) * common.len();
-                } else if parts.iter().enumerate().any(|(i, p)| parts[i + 1..].iter().any(|q| p.intersection(q).next().is_some())) {
-                    pair_factor += 1;
-                }
-            }
-        }
-    }
-    let _ = writeln!(
-        out,
-        "    boolean trees: {trees} maximal And/Or trees, {leaves_total} leaves; with a complementary pair {complement}, a duplicate leaf {duplicate} ({dup_removable} removable), a factor common to all terms {full_factor} ({factor_removable} repeated conjuncts), one shared by some pair {pair_factor}; And-trees with same-direction comparisons of one operand against constants {range_merge} ({range_removable} removable)"
-    );
-    // Select shapes.
-    let (mut same_arms, mut nested_same_cond, mut threshold_equal_arm) = (0, 0, 0);
-    for &n in &ids {
-        let nd = g.get(n);
-        if !matches!(nd.op, Op::Sel) {
-            continue;
-        }
-        let (c, t, f) = (nd.args[0], nd.args[1], nd.args[2]);
-        if t == f {
-            same_arms += 1;
-        }
-        for arm in [t, f] {
-            let an = g.get(arm);
-            if matches!(an.op, Op::Sel) && an.args[0] == c {
-                nested_same_cond += 1;
-            }
-        }
-        let fnode = g.get(f);
-        if matches!(fnode.op, Op::Sel) && fnode.args[1] == t && matches!(g.get(t).op, Op::Const(..)) {
-            threshold_equal_arm += 1;
-        }
-        let _ = c;
-    }
-    let _ = writeln!(
-        out,
-        "    selects: identical arms {same_arms}, an arm selecting on the same condition {nested_same_cond}, `Sel(c1, k, Sel(c2, k, r))` with a constant k {threshold_equal_arm}"
-    );
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,12 +628,9 @@ mod tests {
 
     #[test]
     fn the_merged_form_is_never_more_decided_than_its_ancestor() {
-        // The property test the rewrite's safety rests on: for the
-        // remerge shape, at EVERY tri-state assignment, wherever the
-        // merged form `(A & p) | (A & not p)` is decided, `A` is
-        // decided and agrees - so substituting `A` never turns a
-        // decided lane undecided. Built over a pool of ancestors that
-        // are themselves compound, not just atoms.
+        // The property the rewrite's safety rests on: for the remerge shape,
+        // at EVERY tri-state assignment, wherever `(A & p) | (A & not p)` is
+        // decided, `A` is decided and agrees. Ancestors include compounds.
         let mut g = Graph::new();
         let cells: Vec<NodeId> = (0..3).map(|i| g.leaf(Op::Cell(i))).collect();
         let ancestors = vec![
@@ -877,12 +662,9 @@ mod tests {
                     for (merged, anc) in &pairs {
                         let (m, a) = (out[*merged as usize], out[*anc as usize]);
                         match (m, a) {
-                            // Merged undecided: substituting A only
-                            // ever ADDS decidedness. Fine.
+                            // Merged undecided: substituting A only adds decidedness.
                             (Val::Bool(None), _) => {}
-                            // Merged decided: A must be decided the
-                            // same way, or the substitution would
-                            // change a decided lane.
+                            // Merged decided: A must agree.
                             (Val::Bool(Some(x)), Val::Bool(Some(y))) => {
                                 assert_eq!(x, y, "decided disagreement at {:?}", cells)
                             }
@@ -899,11 +681,8 @@ mod tests {
 
     #[test]
     fn complementary_comparisons_are_one_variable_and_its_negation() {
-        // `fold` rewrites `Not(Lt(x,y))` to `Ge(x,y)`, which is a good
-        // rewrite and which - if the BDD treated every comparison as its
-        // own variable - would hide the complementarity that the `Not`
-        // made obvious. So normalization would have blinded the analysis
-        // it was meant to feed. `x < y or x >= y` is the test.
+        // `fold` rewrites `Not(Lt(x,y))` to `Ge(x,y)`; if every comparison were
+        // its own variable that would hide the complementarity.
         let mut g = Graph::new();
         let (x, y) = (g.leaf(Op::Cell(1)), g.leaf(Op::Cell(2)));
         let lt = g.fold(Op::Lt, vec![x, y]);
@@ -924,16 +703,14 @@ mod tests {
         assert_eq!(out.get(map[either as usize]).op, Op::ConstBool(true));
     }
 
-    /// The same gate for the local pass.
+    /// Simplifying preserves what the graph evaluates to (`check_preserves`).
     #[test]
     fn simplifying_locally_preserves_what_the_graph_evaluates_to() {
         check_preserves(local);
     }
 
-    /// The local pass decides what the global one did - contradiction,
-    /// tautology, the re-merge - and through a SWAPPED comparison
-    /// (`Gt(y, x)` is `Lt(x, y)`), which the global analysis's variables
-    /// never see.
+    /// The local pass decides contradiction, tautology, the re-merge, and
+    /// through a SWAPPED comparison (`Gt(y, x)` is `Lt(x, y)`).
     #[test]
     fn local_decides_tautologies_remerges_and_swapped_comparisons() {
         let mut g = Graph::new();
@@ -976,8 +753,8 @@ mod tests {
         let l1 = {
             let l = g.fold(Op::And, vec![a, p]);
             let r = g.fold(Op::And, vec![a, np]);
-            // `add`, not `fold`: `Graph::fold` folds a remerge over one
-            // condition itself now, and this pass is what is under test.
+            // `add`, not `fold`: `Graph::fold` folds a remerge over one condition
+            // itself, and this pass is what is under test.
             g.add(Op::Or, vec![l, r])
         };
         let gt = g.fold(Op::Gt, vec![x, y]);
@@ -997,15 +774,14 @@ mod tests {
         let (out, map, st) = local(&g, &[l3]);
         assert_eq!(map[l3 as usize], map[a as usize], "the whole chain is A");
         assert_eq!(out.get(map[l3 as usize]).op, Op::And);
-        // The pass rebuilds through `Graph::fold`, which folds each level's
-        // remerge itself now (`Graph::complements`), so nothing is left to count
-        // as a BDD merge: what remains is A's three nodes, in one pass.
+        // `Graph::fold` folds each level's remerge itself
+        // (`Graph::complements`): what remains is A's three nodes.
         assert_eq!(st.after, 3, "the chain is A's three nodes: {:?}", st);
     }
 
-    /// What `simplify_until_stable` needed a second pass for, the local pass
-    /// sees in one: the select collapses, the two comparisons become one
-    /// node, and the formula over them is then a tautology.
+    /// A collapse the pass created is seen in the same pass: the select
+    /// collapses, the two comparisons become one node, and the formula over
+    /// them is then a tautology.
     #[test]
     fn local_sees_a_collapse_it_created_in_the_same_pass() {
         let mut g = Graph::new();
@@ -1054,21 +830,19 @@ mod tests {
         assert_eq!(out.get(map[both as usize]).op, Op::And);
     }
 
-    /// Build a pile of boolean algebra over atoms, simplify, and check the
-    /// two graphs agree at every tri-state assignment - which is a stronger
-    /// demand than the concrete one, and the one that would catch a
-    /// mis-ordered `ite`. The one legitimate difference is a node DECIDED
-    /// where the original was unknown.
+    /// Build a pile of boolean algebra over atoms, simplify, and check the two
+    /// graphs agree at every tri-state assignment (stronger than the concrete
+    /// demand; catches a mis-ordered `ite`). The one legitimate difference is
+    /// a node DECIDED where the original was unknown.
     fn check_preserves(simplifier: impl Fn(&Graph, &[NodeId]) -> (Graph, Vec<NodeId>, Stats)) {
         let mut g = Graph::new();
         let cells: Vec<NodeId> = (0..4).map(|i| g.leaf(Op::Cell(i))).collect();
         let nums: Vec<NodeId> = (10..12).map(|i| g.leaf(Op::Cell(i))).collect();
         let mut pool = cells.clone();
         pool.push(g.fold(Op::Lt, vec![nums[0], nums[1]]));
-        // The COMPLEMENT of the one above, so the differential check
-        // covers the one-variable-and-its-negation path - which is the
-        // riskiest thing in `analyze`, since getting the polarity
-        // backwards would still typecheck and still produce a graph.
+        // The COMPLEMENT of the one above, so the check covers the
+        // one-variable-and-its-negation path (wrong polarity would still
+        // produce a graph).
         pool.push(g.fold(Op::Ge, vec![nums[0], nums[1]]));
         pool.push(g.fold(Op::Le, vec![nums[1], nums[0]]));
         // The swapped forms, which the local pass maps onto one variable.
@@ -1133,12 +907,8 @@ mod tests {
                                     if x == y {
                                         continue;
                                     }
-                                    // The one legitimate difference: the
-                                    // BDD knows things Kleene does not, so
-                                    // the simplified node may be DECIDED
-                                    // where the original was unknown. The
-                                    // reverse, or a decided disagreement,
-                                    // is a bug.
+                                    // The one legitimate difference: the simplified node
+                                    // DECIDED where the original was unknown.
                                     match (x, y) {
                                         (Val::Bool(None), Val::Bool(_)) => {}
                                         _ => panic!(
@@ -1157,9 +927,8 @@ mod tests {
 
     #[test]
     fn the_cap_is_reported_rather_than_silent() {
-        // A truncated analysis that finds nothing reads exactly like a
-        // complete one that finds nothing, so the count is the whole
-        // safety property here.
+        // A truncated analysis that finds nothing reads like a complete one
+        // that finds nothing, so the count is the safety property here.
         let mut g = Graph::new();
         let cells: Vec<NodeId> = (0..40).map(|i| g.leaf(Op::Cell(i))).collect();
         // Parity over 40 independent atoms - the textbook BDD blow-up

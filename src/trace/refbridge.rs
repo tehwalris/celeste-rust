@@ -1,252 +1,180 @@
-//! Bridging the OLD vectorized interpreter and the NEW reference interpreter.
+//! The reference engine's edge: one lane of a block <-> a `State<RefDomain>`.
 //!
-//! Two directions and a gate:
+//! A block BOXES every slot (each global, field and array element is a `Val`
+//! cell; tables, closures and builtins are reached through an `AV::Ptr`,
+//! except a builtin's FIRST slot in traversal order, which is its `Bi` cell).
+//! The row key walks the whole structure, so `to_block` must rebuild the
+//! boxes exactly as the kernels do for a reference successor to key like a
+//! kernel row; `from_block` drops them.
 //!
-//! * `to_trace_state` turns ONE LANE of an old-interpreter boundary `State`
-//!   into a `trace::state::State<RefDomain>` (a fresh heap). This is the
-//!   INPUT bridge: it feeds the reference driver a mid-game state that the
-//!   old interpreter (or a checkpoint) produced.
-//! * `to_interp_state` is its inverse for a single-lane trace state; the
-//!   search keys the result through `frame::Block::from_state` so a
-//!   reference output gets the SAME canonical `(shape_hash, content_hash)`
-//!   the compiled engine assigns. Going through the one keyer rather than re-deriving
-//!   the hash is deliberate - there is exactly one keyer and both sides use
-//!   it.
-//! * `gate` (behind an ignored test) runs an early checkpoint frame through
-//!   both interpreters and asserts the two output row-key SETS agree.
-//!
-//! ## The two heap models, and the box convention that separates them
-//!
-//! The old interpreter BOXES every slot: a global, an object field and an
-//! array element are each their own `HeapValue::Value` cell, and a reference
-//! to a table is a `Value::Pointer` INTO that box. So `player.spd` is
-//! `player(ObjectTable){spd -> box}` -> `box(Value::Pointer(spdCell))` ->
-//! `spdCell(ObjectTable)`. The tracer's heap has no boxes: a `Table.hash`
-//! maps a name straight to a `Value`, and `Value::Table(id)` is the only way
-//! to name a sub-table. The canonical row hash (`Rt2::shape_hash_of` +
-//! `boundary_finish`) walks the WHOLE reachable heap, so the boxes are part
-//! of the key: `to_interp_state` must re-materialize every one of them, and
-//! it does, uniformly.
-//!
-//! ## `__button_states`
-//!
-//! `__button_states` is a hashed global, and the two interpreters leave it in
-//! different states at a frame boundary. The old program resets the buttons
-//! LAST (`_update();_draw();__reset_button_states()`), so its output holds
-//! `UnknownBool`; the reference driver resets them FIRST (so the six free
-//! choices are forkable) and never resets again, so its output holds the
-//! concrete forked bool. The engine's own kernels treat the buttons as
-//! dead-at-boundary and write `UBool`, so that is the canonical form:
-//! `to_interp_state` rewrites every bool under `__button_states` back to
-//! `UnknownBool`. `to_trace_state` maps the incoming `UnknownBool` to a
-//! placeholder `false` (it is overwritten by the reset before it is read).
+//! `__button_states`: the kernels write the buttons as `UBool`, so `to_block`
+//! does too; `from_block` reads a `UBool` as a placeholder `false` (buttons
+//! are overwritten before they are read; any other unknown boolean is
+//! returned for the driver to fork). Names outside `celeste_names` (the
+//! tracer's hint builtins) are dropped by `to_block` and restored from the
+//! base state by `from_block`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
-
-use celeste_core::pico8_num::Pico8NumInterval as Iv;
+use anyhow::{anyhow, bail, ensure, Result};
+use celeste_core::pico8_num::{Pico8Num as P8, Pico8NumInterval as Iv};
+use celeste_engine::runtime2::{Cell2, Col, Rt2, AV, NONE};
 use celeste_names as gen;
 
 use crate::builtins::BUILTIN_NAMES;
-use crate::interpreter::heap::HeapId;
-use crate::interpreter::state::State as OState;
-use crate::interpreter::value::{HeapValue, MaybeVector, Value as OValue};
-
-use crate::ir::GlobalId;
-use crate::trace::heap::{Heap as THeap, TableId, Value as TValue};
+use crate::trace::heap::{BodyId, ClosureId, Heap, TableId, Value};
 use crate::trace::refdomain::RefDomain;
-use crate::trace::state::State as TState;
+use crate::trace::state::State;
+
+type TV = Value<RefDomain>;
 
 const BUTTON_GLOBAL: &str = "__button_states";
 
-// ------------------------------------------------------------------
-// lane readers
-// ------------------------------------------------------------------
+/// Per function (`gen::FN_NAMES` index): the body the interpreter registered
+/// and the names its closures capture, which a block does not record.
+pub type FnInfo = HashMap<u32, (BodyId, Vec<String>)>;
 
-fn lane_of<T: Clone + std::fmt::Debug + PartialEq + Eq>(mv: &MaybeVector<T>, lane: usize) -> T {
-    match mv {
-        MaybeVector::Scalar(s) => s.clone(),
-        MaybeVector::Vector(v) => v[lane].clone(),
+/// `FnInfo` off a state the interpreter built (the cart toplevel + `_init`).
+/// Every closure of one function agrees on both; a disagreement is a bug.
+pub fn fn_info_of(base: &State<RefDomain>) -> Result<FnInfo> {
+    let mut map: FnInfo = HashMap::new();
+    for cl in base.heap.closures.values() {
+        let Some(fn_id) = cl.fn_id else { continue };
+        let entry = (cl.body, cl.captures.clone());
+        if let Some(prev) = map.insert(fn_id, entry.clone()) {
+            ensure!(prev == entry, "fn {} has inconsistent closures", gen::FN_NAMES[fn_id as usize]);
+        }
     }
+    Ok(map)
 }
 
-/// The `&'static str` interning a builtin name; the trace `Value::Builtin`
-/// wants a `'static`, and `BUILTIN_NAMES` is the canonical static table.
-fn builtin_static(name: &str) -> Result<&'static str> {
-    BUILTIN_NAMES
-        .iter()
-        .copied()
-        .find(|n| *n == name)
-        .ok_or_else(|| anyhow!("unknown builtin {:?} has no static name", name))
-}
-
-// ==================================================================
-// INPUT bridge: old State (one lane) -> trace State<RefDomain>
-// ==================================================================
-
-struct ToTrace<'a> {
-    old: &'a OState,
+struct FromBlock<'a> {
+    rt2: &'a Rt2,
     lane: usize,
-    heap: THeap<RefDomain>,
-    /// old target cell (table/closure/builtin) -> trace value naming it.
-    memo: HashMap<HeapId, TValue<RefDomain>>,
-    /// The table fields whose old value was `UnknownBool`: the driver forks
-    /// each per path (`refdriver::run_frame_all`).
+    fn_info: &'a FnInfo,
+    heap: Heap<RefDomain>,
+    memo: HashMap<u32, TV>,
     unknown: Vec<(TableId, String)>,
 }
 
-impl<'a> ToTrace<'a> {
-    /// Read a SLOT (a box HeapId): a global, an object field or an array
-    /// element. Almost always `HeapValue::Value`; a slot that points
-    /// straight at a target is tolerated for robustness.
-    fn conv_slot(&mut self, box_id: HeapId) -> Result<TValue<RefDomain>> {
-        match self.old.heap.get(box_id) {
-            HeapValue::Value(v) => self.conv_value(&v.clone()),
-            _ => self.conv_target(box_id),
+impl FromBlock<'_> {
+    fn is_unknown(&self, cell: u32) -> bool {
+        matches!(self.rt2.structure[cell as usize], Cell2::Val) && self.rt2.cols[cell as usize].at(self.lane) == AV::UBool
+    }
+
+    fn slot(&mut self, cell: u32) -> Result<TV> {
+        match self.rt2.structure[cell as usize] {
+            Cell2::Val => self.value(self.rt2.cols[cell as usize].at(self.lane)),
+            _ => self.target(cell),
         }
     }
 
-    /// Does the slot hold an `UnknownBool`?
-    fn is_unknown_bool(&self, box_id: HeapId) -> bool {
-        matches!(self.old.heap.get(box_id), HeapValue::Value(OValue::UnknownBool))
-    }
-
-    fn conv_value(&mut self, v: &OValue) -> Result<TValue<RefDomain>> {
+    fn value(&mut self, v: AV) -> Result<TV> {
         Ok(match v {
-            OValue::Number(mv) => TValue::Num(Iv::from_number(lane_of(mv, self.lane))),
-            OValue::NumberInterval(mv) => {
-                let iv = lane_of(mv, self.lane);
-                TValue::Num(Iv::new(iv.low, iv.high))
-            }
-            OValue::Bool(mv) => TValue::Bool(lane_of(mv, self.lane)),
-            // A placeholder keeping RefDomain's `Bool = bool` total: the
-            // buttons are overwritten by `__reset_button_states` before any
-            // read, and every other unknown field is forked per path by the
-            // driver (`ToTrace::unknown`).
-            OValue::UnknownBool => TValue::Bool(false),
-            OValue::String(s) => TValue::Str(Arc::from(s.as_str())),
-            OValue::Nil(_) => TValue::Nil,
-            OValue::NilPointer(_) => TValue::Nil,
-            OValue::Pointer(id) => self.conv_target(*id)?,
+            AV::Num(n) => TV::Num(Iv::from_number(n)),
+            AV::Ival(lo, hi) => TV::Num(Iv::new(lo, hi)),
+            // The whole range; a straddling comparison forks.
+            AV::UNum => TV::Num(Iv::new(P8::from_raw(i32::MIN), P8::from_raw(i32::MAX))),
+            AV::Bool(b) => TV::Bool(b),
+            AV::UBool => TV::Bool(false),
+            AV::Str(s) => TV::Str(Arc::from(self.rt2.strings[s as usize].as_str())),
+            AV::Nil | AV::NilPtr => TV::Nil,
+            AV::Ptr(p) => self.target(p)?,
         })
     }
 
-    fn conv_target(&mut self, id: HeapId) -> Result<TValue<RefDomain>> {
-        if let Some(v) = self.memo.get(&id) {
+    fn target(&mut self, cell: u32) -> Result<TV> {
+        if let Some(v) = self.memo.get(&cell) {
             return Ok(v.clone());
         }
-        match self.old.heap.get(id).clone() {
-            HeapValue::ObjectTable(fields) => {
+        let rt2 = self.rt2;
+        Ok(match &rt2.structure[cell as usize] {
+            Cell2::Obj(fields) => {
                 let t = self.heap.new_table();
-                self.memo.insert(id, TValue::Table(t));
-                // Sort by name so the (concrete) heap is deterministic; the
-                // trace `Table.hash` is a BTreeMap so order is by key anyway.
-                let mut names: Vec<(&String, &HeapId)> = fields.iter().collect();
-                names.sort();
-                for (name, fid) in names {
-                    if self.is_unknown_bool(*fid) {
-                        self.unknown.push((t, name.clone()));
+                self.memo.insert(cell, TV::Table(t));
+                let mut named: Vec<(&str, u32)> = fields.iter().map(|&(f, c)| (gen::FIELD_NAMES[f as usize], c)).collect();
+                named.sort();
+                for (name, c) in named {
+                    if self.is_unknown(c) {
+                        self.unknown.push((t, name.to_string()));
                     }
-                    let cv = self.conv_slot(*fid)?;
-                    self.heap.tables.get_mut(&t).unwrap().hash.insert(name.clone(), cv);
+                    let v = self.slot(c)?;
+                    self.heap.tables.get_mut(&t).expect("just made").hash.insert(name.to_string(), v);
                 }
-                Ok(TValue::Table(t))
+                TV::Table(t)
             }
-            HeapValue::ArrayTable(items) => {
+            Cell2::Arr(items) => {
                 let t = self.heap.new_table();
-                self.memo.insert(id, TValue::Table(t));
-                for it in items {
-                    let cv = self.conv_slot(it)?;
-                    self.heap.tables.get_mut(&t).unwrap().arr.push(cv);
+                self.memo.insert(cell, TV::Table(t));
+                for &c in items {
+                    let v = self.slot(c)?;
+                    self.heap.tables.get_mut(&t).expect("just made").arr.push(v);
                 }
-                Ok(TValue::Table(t))
+                TV::Table(t)
             }
-            HeapValue::Closure(gid, caps) => {
-                // Captured values are stored positionally in the old model;
-                // the trace model names them, so synthesize names `cap0..`
-                // and hang them off a fresh scope. `body` is a placeholder
-                // (0): a state built only for KEYING is never executed, and
-                // the gate patches the body to the interp's real one before
-                // running (see `patch_closures_for`).
+            // A `{}` that never had a field stored.
+            Cell2::Unk => {
+                let t = self.heap.new_table();
+                self.memo.insert(cell, TV::Table(t));
+                TV::Table(t)
+            }
+            Cell2::Clo(f, caps) => {
+                let (body, names) = self.fn_info.get(f).ok_or_else(|| anyhow!("no registered body for {}", gen::FN_NAMES[*f as usize]))?;
+                ensure!(names.len() == caps.len(), "{}: {} captures in the block, {} registered", gen::FN_NAMES[*f as usize], caps.len(), names.len());
                 let env = self.heap.new_scope(None);
-                let mut capture_names = Vec::with_capacity(caps.len());
-                for (i, cv) in caps.iter().enumerate() {
-                    let name = format!("cap{}", i);
-                    let tv = self.conv_value(cv)?;
-                    self.heap.scopes.get_mut(&env).unwrap().vars.insert(name.clone(), tv);
-                    capture_names.push(name);
+                for (name, cap) in names.iter().zip(caps.iter()) {
+                    let v = self.value(cap.at(self.lane))?;
+                    self.heap.scopes.get_mut(&env).expect("just made").vars.insert(name.clone(), v);
                 }
-                let fn_id = gen::FN_NAMES.iter().position(|n| *n == gid.as_str()).map(|p| p as u32);
-                let c = self.heap.new_closure(0, env, fn_id, capture_names);
-                self.memo.insert(id, TValue::Func(c));
-                Ok(TValue::Func(c))
+                let c = self.heap.new_closure(*body, env, Some(*f), names.clone());
+                self.memo.insert(cell, TV::Func(c));
+                TV::Func(c)
             }
-            HeapValue::BuiltinFun(name) => {
-                let v = TValue::Builtin(builtin_static(&name)?);
-                self.memo.insert(id, v.clone());
-                Ok(v)
+            Cell2::Bi(b) => {
+                let v = TV::Builtin(BUILTIN_NAMES[*b as usize]);
+                self.memo.insert(cell, v.clone());
+                v
             }
-            HeapValue::UnknownTable => {
-                // A freshly-created `{}` that never had a field stored
-                // (`StoreEmptyTable`). Its trace equivalent is an empty
-                // table; `to_interp_state` maps an empty table back to
-                // `UnknownTable`.
-                let t = self.heap.new_table();
-                self.memo.insert(id, TValue::Table(t));
-                Ok(TValue::Table(t))
-            }
-            HeapValue::Value(v) => {
-                // A pointer chain landing on a boxed value (not a table);
-                // convert it as a plain value (no identity to preserve).
-                self.conv_value(&v.clone())
-            }
-        }
+            Cell2::Val => self.value(rt2.cols[cell as usize].at(self.lane))?,
+        })
     }
 }
 
-/// Build a `State<RefDomain>` equivalent to LANE `lane` of an old-interpreter
-/// boundary state. Preserves table identity (shared pointers become a shared
-/// `TableId`). Closures get a placeholder body id; see `patch_closures_for`.
-pub fn to_trace_state(
-    old: &OState,
+/// Lane `lane` of a block as a reference state (plus the base state's
+/// builtins), and its unknown-boolean fields except the buttons, for the
+/// driver to fork.
+pub fn from_block(
+    rt2: &Rt2,
     lane: usize,
-    d: &mut RefDomain,
-) -> Result<TState<RefDomain>> {
-    Ok(to_trace_state_unknowns(old, lane, d)?.0)
-}
-
-/// `to_trace_state`, and the fields that held an unknown boolean (the
-/// buttons excepted, which every frame resets before reading): the
-/// reference engine forks each of them per path.
-pub fn to_trace_state_unknowns(
-    old: &OState,
-    lane: usize,
-    _d: &mut RefDomain,
-) -> Result<(TState<RefDomain>, Vec<(TableId, String)>)> {
-    if lane >= old.vector_size {
-        bail!("lane {} out of range (vector_size {})", lane, old.vector_size);
-    }
-    let mut cx = ToTrace { old, lane, heap: THeap::default(), memo: HashMap::new(), unknown: Vec::new() };
+    fn_info: &FnInfo,
+    base: &State<RefDomain>,
+) -> Result<(State<RefDomain>, Vec<(TableId, String)>)> {
+    ensure!(lane < rt2.width, "lane {lane} of a {}-lane block", rt2.width);
+    let mut cx = FromBlock { rt2, lane, fn_info, heap: Heap::default(), memo: HashMap::new(), unknown: Vec::new() };
     let globals = cx.heap.new_table();
     let scope = cx.heap.new_scope(None);
-    // Globals in sorted order (OrdMap is already sorted).
-    let names: Vec<(String, HeapId)> =
-        old.global_env.iter().map(|(k, v)| (k.clone(), *v)).collect();
-    for (name, box_id) in names {
-        if cx.is_unknown_bool(box_id) {
-            cx.unknown.push((globals, name.clone()));
+    let mut named: Vec<(&str, u32)> =
+        gen::GLOBAL_NAMES.iter().zip(&rt2.globals).filter(|(_, &c)| c != NONE).map(|(n, &c)| (*n, c)).collect();
+    named.sort();
+    for (name, c) in named {
+        if cx.is_unknown(c) {
+            cx.unknown.push((globals, name.to_string()));
         }
-        let v = cx.conv_slot(box_id)?;
-        cx.heap.tables.get_mut(&globals).unwrap().hash.insert(name, v);
+        let v = cx.slot(c)?;
+        cx.heap.tables.get_mut(&globals).expect("just made").hash.insert(name.to_string(), v);
+    }
+    for (k, v) in &base.heap.tables[&base.globals].hash {
+        if let TV::Builtin(n) = v {
+            cx.heap.tables.get_mut(&globals).expect("just made").hash.entry(k.clone()).or_insert(TV::Builtin(n));
+        }
     }
     let buttons = match cx.heap.tables[&globals].hash.get(BUTTON_GLOBAL) {
-        Some(TValue::Table(t)) => Some(*t),
+        Some(TV::Table(t)) => Some(*t),
         _ => None,
     };
-    let unknown: Vec<(TableId, String)> = cx.unknown.into_iter().filter(|(t, _)| Some(*t) != buttons).collect();
-    let st = TState {
+    let unknown = cx.unknown.into_iter().filter(|(t, _)| Some(*t) != buttons).collect();
+    let st = State {
         heap: cx.heap,
         globals,
         scope,
@@ -260,303 +188,177 @@ pub fn to_trace_state_unknowns(
     Ok((st, unknown))
 }
 
-/// What a function's closures look like in a state that the interp itself
-/// built: the registered body id, and the NAMES the closure captures (which
-/// the old positional model does not record and `to_trace_state` cannot know).
-pub type FnInfo = HashMap<u32, (crate::trace::heap::BodyId, Vec<String>)>;
-
-/// Read `FnInfo` off a state the interp built by running the cart toplevel +
-/// `_init`. Every instance of one function agrees on body and capture names,
-/// so the last-writer-wins map is well defined; a disagreement is a bug and
-/// is surfaced.
-pub fn fn_info_of(base: &TState<RefDomain>) -> Result<FnInfo> {
-    let mut map: FnInfo = HashMap::new();
-    for cl in base.heap.closures.values() {
-        let Some(fn_id) = cl.fn_id else { continue };
-        let entry = (cl.body, cl.captures.clone());
-        if let Some(prev) = map.get(&fn_id) {
-            if *prev != entry {
-                bail!(
-                    "fn_id {} ({}) has inconsistent closures across instances",
-                    fn_id,
-                    gen::FN_NAMES[fn_id as usize]
-                );
-            }
-        }
-        map.insert(fn_id, entry);
-    }
-    Ok(map)
-}
-
-/// Repoint every closure in a bridged state at the REAL body the interp
-/// registered, and rename its synthetic `cap{i}` captures to the interp's
-/// real capture names, so the reference driver can CALL the methods and their
-/// captured `obj` resolves. The bridge stamps a placeholder body id and
-/// positional names; this fixes both from `FnInfo`.
-pub fn patch_closures_for(st: &mut TState<RefDomain>, fn_info: &FnInfo) -> Result<()> {
-    let ids: Vec<_> = st.heap.closures.keys().copied().collect();
-    for cid in ids {
-        let (fn_id, old_caps) = {
-            let cl = &st.heap.closures[&cid];
-            (cl.fn_id, cl.captures.clone())
-        };
-        let Some(fn_id) = fn_id else {
-            bail!("bridged closure #{} has no fn_id (anonymous) - cannot patch", cid);
-        };
-        let (body, names) = fn_info.get(&fn_id).ok_or_else(|| {
-            anyhow!("no registered body for fn_id {} ({})", fn_id, gen::FN_NAMES[fn_id as usize])
-        })?;
-        if names.len() != old_caps.len() {
-            bail!(
-                "fn_id {} ({}): bridged {} captures but interp has {} - shape mismatch",
-                fn_id,
-                gen::FN_NAMES[fn_id as usize],
-                old_caps.len(),
-                names.len()
-            );
-        }
-        // Rename the captured values in the closure's own env scope from
-        // `cap{i}` to the real name, in order.
-        let env = st.heap.closures[&cid].env;
-        for (i, real) in names.iter().enumerate() {
-            let synth = format!("cap{}", i);
-            if let Some(v) = st.heap.scopes.get_mut(&env).unwrap().vars.remove(&synth) {
-                st.heap.scopes.get_mut(&env).unwrap().vars.insert(real.clone(), v);
-            }
-        }
-        let cl = st.heap.closures.get_mut(&cid).unwrap();
-        cl.body = *body;
-        cl.captures = names.clone();
+/// Set the six buttons of a reference state from an input byte (bit 0 left,
+/// 1 right, 2 up, 3 down, 4 jump, 5 dash).
+pub fn set_buttons(st: &mut State<RefDomain>, byte: u8) -> Result<()> {
+    let Some(TV::Table(t)) = st.heap.tables[&st.globals].hash.get(BUTTON_GLOBAL).cloned() else {
+        bail!("no {BUTTON_GLOBAL} table")
+    };
+    let arr = &mut st.heap.tables.get_mut(&t).expect("a live table").arr;
+    for (i, b) in arr.iter_mut().enumerate() {
+        *b = TV::Bool(byte >> i & 1 == 1);
     }
     Ok(())
 }
 
-/// Add the tracer's native BUILTIN globals that a bridged state is missing,
-/// copying them from a `base` state the interp built. The old frontend
-/// CONSUMES some builtin calls at compile time (`_hint_normalize` marks a
-/// merge block rather than calling a function), so those names never appear in
-/// an old-interpreter state - but the AST interpreter really calls them, so
-/// they must be present. They sit OUTSIDE `gen::GLOBAL_NAMES`, so they are
-/// dropped on import and do not affect any row key.
-pub fn add_missing_builtins(st: &mut TState<RefDomain>, base: &TState<RefDomain>) {
-    let base_g = &base.heap.tables[&base.globals].hash;
-    let g = st.globals;
-    let present: std::collections::BTreeSet<String> =
-        st.heap.tables[&g].hash.keys().cloned().collect();
-    let add: Vec<(String, &'static str)> = base_g
-        .iter()
-        .filter_map(|(k, v)| match v {
-            TValue::Builtin(n) if !present.contains(k) => Some((k.clone(), *n)),
-            _ => None,
-        })
-        .collect();
-    for (k, n) in add {
-        st.heap.tables.get_mut(&g).unwrap().hash.insert(k, TValue::Builtin(n));
+struct ToBlock<'a> {
+    st: &'a State<RefDomain>,
+    rt2: Rt2,
+    memo_t: HashMap<TableId, u32>,
+    memo_c: HashMap<ClosureId, u32>,
+    memo_b: HashMap<&'static str, u32>,
+}
+
+impl ToBlock<'_> {
+    fn cell(&mut self, cell: Cell2, col: Col) -> u32 {
+        self.rt2.structure.push(cell);
+        self.rt2.cols.push(col);
+        (self.rt2.structure.len() - 1) as u32
     }
-}
 
-// ==================================================================
-// OUTPUT bridge: trace State<RefDomain> (one lane) -> old State
-// ==================================================================
-
-struct ToInterp<'a> {
-    ts: &'a TState<RefDomain>,
-    st: OState,
-    memo_t: HashMap<TableId, HeapId>,
-    memo_c: HashMap<crate::trace::heap::ClosureId, HeapId>,
-    memo_b: HashMap<&'static str, HeapId>,
-}
-
-impl<'a> ToInterp<'a> {
-    /// Convert a trace value to an old `Value` (a scalar, or a `Pointer` to a
-    /// target cell). `ubool` forces booleans to `UnknownBool` (the
-    /// `__button_states` subtree).
-    fn conv_value(&mut self, v: &TValue<RefDomain>, ubool: bool) -> Result<OValue> {
+    /// `ubool`: under `__button_states`, where a boolean is written `UBool`.
+    fn value(&mut self, v: &TV, ubool: bool) -> Result<AV> {
         Ok(match v {
-            TValue::Nil => OValue::Nil(None),
-            TValue::Num(iv) => match iv.to_number() {
-                Some(n) => OValue::Number(MaybeVector::Scalar(n)),
-                None => OValue::NumberInterval(MaybeVector::Scalar(*iv)),
+            TV::Nil => AV::Nil,
+            TV::Num(iv) => match iv.to_number() {
+                Some(n) => AV::Num(n),
+                None => AV::Ival(iv.low, iv.high),
             },
-            TValue::Bool(_) if ubool => OValue::UnknownBool,
-            TValue::Bool(b) => OValue::Bool(MaybeVector::Scalar(*b)),
-            TValue::Str(s) => OValue::String(s.to_string()),
-            TValue::Table(t) => OValue::Pointer(self.conv_table(*t, ubool)?),
-            TValue::Func(c) => OValue::Pointer(self.conv_closure(*c)?),
-            TValue::Builtin(name) => OValue::Pointer(self.conv_builtin(name)?),
+            TV::Bool(_) if ubool => AV::UBool,
+            TV::Bool(b) => AV::Bool(*b),
+            TV::Str(s) => {
+                self.rt2.strings.push(s.to_string());
+                AV::Str((self.rt2.strings.len() - 1) as u32)
+            }
+            TV::Table(t) => AV::Ptr(self.table(*t, ubool)?),
+            TV::Func(c) => AV::Ptr(self.closure(*c)?),
+            TV::Builtin(n) => AV::Ptr(self.builtin(n)?),
         })
     }
 
-    /// A SLOT (global / field / array element) holding `v`, returning the slot
-    /// cell's id.
-    ///
-    /// The old interpreter seeds native BUILTINS inline: their global cell IS
-    /// the `BuiltinFun` (a read returns a self-pointer), so the first slot
-    /// holding a builtin is its canonical cell and a later slot is a
-    /// `Value::Pointer` to it. Everything else - CLOSURES and TABLES alike -
-    /// is boxed: the constructor (`StoreClosure` / a table constructor)
-    /// allocates its own cell and the slot holds a `Value::Pointer` to it (two
-    /// cells). Getting the builtin case wrong adds a cell per builtin and
-    /// diverges every downstream canonical id.
-    fn box_slot(&mut self, v: &TValue<RefDomain>, ubool: bool) -> Result<HeapId> {
-        match v {
-            TValue::Builtin(name) => {
-                if let Some(&h) = self.memo_b.get(name) {
-                    let id = self.st.heap.alloc();
-                    self.st.heap.set(id, HeapValue::Value(OValue::Pointer(h)));
-                    Ok(id)
-                } else {
-                    self.conv_builtin(name)
-                }
-            }
-            _ => {
-                let ov = self.conv_value(v, ubool)?;
-                let id = self.st.heap.alloc();
-                self.st.heap.set(id, HeapValue::Value(ov));
-                Ok(id)
-            }
+    /// A slot holding `v`: its own `Val` cell, except a builtin's first slot,
+    /// which is the builtin's cell.
+    fn slot(&mut self, v: &TV, ubool: bool) -> Result<u32> {
+        if let TV::Builtin(n) = v {
+            return match self.memo_b.get(n) {
+                Some(&b) => Ok(self.cell(Cell2::Val, Col::U(AV::Ptr(b)))),
+                None => self.builtin(n),
+            };
         }
+        let av = self.value(v, ubool)?;
+        Ok(self.cell(Cell2::Val, Col::U(av)))
     }
 
-    fn conv_table(&mut self, t: TableId, ubool: bool) -> Result<HeapId> {
+    fn table(&mut self, t: TableId, ubool: bool) -> Result<u32> {
         if let Some(&c) = self.memo_t.get(&t) {
             return Ok(c);
         }
-        let cell = self.st.heap.alloc();
+        let cell = self.cell(Cell2::Unk, Col::U(AV::Nil));
         self.memo_t.insert(t, cell);
-        let table = &self.ts.heap.tables[&t];
-        // Object vs Array: string keys -> ObjectTable, else the array part
-        // -> ArrayTable. The two are disjoint in this program (the IR chose
-        // one at each allocation site); a table carrying both parts is a
-        // modelling surprise worth surfacing.
-        // Integer keys past the array part (`got_fruit[1 + level_index()]`
-        // on an empty table, room (3,0)'s fruit): the interpreter keeps the
-        // table dense with the gap as explicit nils - exactly as `bind`
-        // flattens it for the engine, so the exported state keys like the
-        // forward's rows.
-        let arr: Vec<TValue<RefDomain>> = if table.ints.is_empty() {
+        let table = &self.st.heap.tables[&t];
+        // Integer keys past the array part become a dense array with explicit
+        // nils, as `bind` flattens it for the kernels.
+        let arr: Vec<TV> = if table.ints.is_empty() {
             table.arr.to_vec()
         } else {
-            if !table.hash.is_empty() {
-                bail!("to_interp_state: table #{} has integer keys AND named fields", t);
-            }
-            let (Some(&lo), Some(&top)) = (table.ints.keys().next(), table.ints.keys().next_back()) else {
-                unreachable!("checked non-empty")
-            };
-            if lo < 1 {
-                bail!("to_interp_state: table #{} has a non-positive integer key", t);
-            }
+            ensure!(table.hash.is_empty(), "table #{t} has integer keys and named fields");
+            let lo = *table.ints.keys().next().expect("non-empty");
+            let top = *table.ints.keys().next_back().expect("non-empty");
+            ensure!(lo >= 1, "table #{t} has a non-positive integer key");
             let mut arr = table.arr.to_vec();
-            arr.resize(top as usize, TValue::Nil);
+            arr.resize(top as usize, TV::Nil);
             for (k, v) in &table.ints {
                 arr[*k as usize - 1] = v.clone();
             }
             arr
         };
-        let has_hash = !table.hash.is_empty();
-        let has_arr = !arr.is_empty();
-        if has_hash && has_arr {
-            bail!("to_interp_state: table #{} has both string and array parts", t);
-        }
-        let hv = if !has_hash && !has_arr {
-            // An empty table is an as-yet-unwritten `{}`: `UnknownTable`,
-            // the inverse of `to_trace_state`'s UnknownTable handling.
-            HeapValue::UnknownTable
-        } else if has_hash {
-            // Object (also the default for an empty table). The map type is
-            // `HeapValue::ObjectTable`'s (an FxHashMap); build it by
-            // inference through the constructor below.
-            let mut fields = std::collections::HashMap::with_hasher(Default::default());
-            // Collect first to avoid borrowing `self.ts` across `self` mutation.
-            let entries: Vec<(String, TValue<RefDomain>)> =
-                table.hash.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            for (name, v) in entries {
-                let child_ubool = ubool || name_is_buttons(&name);
-                let bid = self.box_slot(&v, child_ubool)?;
-                fields.insert(name, bid);
+        ensure!(table.hash.is_empty() || arr.is_empty(), "table #{t} has both named and array parts");
+        let shape = if !table.hash.is_empty() {
+            let mut fields = Vec::new();
+            for (name, v) in &table.hash {
+                let b = self.slot(v, ubool || name == BUTTON_GLOBAL)?;
+                if let Some(f) = gen::field_id(name) {
+                    fields.push((f, b));
+                }
             }
-            HeapValue::ObjectTable(fields)
+            Cell2::Obj(fields)
+        } else if !arr.is_empty() {
+            let mut items = Vec::with_capacity(arr.len());
+            for v in &arr {
+                items.push(self.slot(v, ubool)?);
+            }
+            Cell2::Arr(items)
         } else {
-            let mut out = Vec::with_capacity(arr.len());
-            for v in arr {
-                out.push(self.box_slot(&v, ubool)?);
-            }
-            HeapValue::ArrayTable(out)
+            Cell2::Unk
         };
-        self.st.heap.set(cell, hv);
+        self.rt2.structure[cell as usize] = shape;
         Ok(cell)
     }
 
-    fn conv_closure(&mut self, c: crate::trace::heap::ClosureId) -> Result<HeapId> {
+    fn closure(&mut self, c: ClosureId) -> Result<u32> {
         if let Some(&h) = self.memo_c.get(&c) {
             return Ok(h);
         }
-        let cell = self.st.heap.alloc();
+        let cell = self.cell(Cell2::Unk, Col::U(AV::Nil));
         self.memo_c.insert(c, cell);
-        let cl = self.ts.heap.closures[&c].clone();
-        let fn_id = cl
-            .fn_id
-            .ok_or_else(|| anyhow!("anonymous closure #{} cannot be exported", c))?;
-        let gid = GlobalId::from(gen::FN_NAMES[fn_id as usize].to_string());
-        // Captures, positionally, looked up by name in the closure's scope.
+        let cl = &self.st.heap.closures[&c];
+        let f = cl.fn_id.ok_or_else(|| anyhow!("anonymous closure #{c} at a frame boundary"))?;
         let mut caps = Vec::with_capacity(cl.captures.len());
         for name in &cl.captures {
-            let v = self
-                .ts
-                .heap
-                .lookup(cl.env, name)
-                .ok_or_else(|| anyhow!("capture {:?} of closure #{} not in its scope", name, c))?
-                .clone();
-            caps.push(self.conv_value(&v, false)?);
+            let v = self.st.heap.lookup(cl.env, name).ok_or_else(|| anyhow!("capture {name:?} of closure #{c} not in its scope"))?;
+            caps.push(Col::U(self.value(v, false)?));
         }
-        self.st.heap.set(cell, HeapValue::Closure(gid, caps));
+        self.rt2.structure[cell as usize] = Cell2::Clo(f, caps.into_boxed_slice());
         Ok(cell)
     }
 
-    fn conv_builtin(&mut self, name: &'static str) -> Result<HeapId> {
-        if let Some(&h) = self.memo_b.get(name) {
-            return Ok(h);
+    fn builtin(&mut self, name: &'static str) -> Result<u32> {
+        if let Some(&b) = self.memo_b.get(name) {
+            return Ok(b);
         }
-        let cell = self.st.heap.alloc();
-        self.st.heap.set(cell, HeapValue::BuiltinFun(name.to_string()));
-        self.memo_b.insert(name, cell);
-        Ok(cell)
+        let i = BUILTIN_NAMES.iter().position(|n| *n == name).ok_or_else(|| anyhow!("unknown builtin {name:?}"))?;
+        let b = self.cell(Cell2::Bi(i as u32), Col::U(AV::Nil));
+        self.memo_b.insert(name, b);
+        Ok(b)
     }
 }
 
-fn name_is_buttons(name: &str) -> bool {
-    name == BUTTON_GLOBAL
-}
-
-/// Turn a single-lane trace state into a one-lane old-interpreter boundary
-/// state - the inverse of `to_trace_state`.
-pub fn to_interp_state(ts: &TState<RefDomain>) -> Result<OState> {
-    let mut cx = ToInterp {
-        ts,
-        st: OState::new(),
-        memo_t: HashMap::new(),
-        memo_c: HashMap::new(),
-        memo_b: HashMap::new(),
+/// A reference state as a one-lane block in canonical cell order (no row
+/// keys: `frame::Block::keyed` adds the level's).
+pub fn to_block(st: &State<RefDomain>) -> Result<Rt2> {
+    let (cart, cache) = crate::compiled::room_context()?;
+    let rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cart, cache);
+    let mut cx = ToBlock { st, rt2, memo_t: HashMap::new(), memo_c: HashMap::new(), memo_b: HashMap::new() };
+    for (name, v) in &st.heap.tables[&st.globals].hash {
+        // The tracer's compile-time hint builtins (`_hint_normalize`, ...).
+        if matches!(v, TV::Builtin(n) if !BUILTIN_NAMES.contains(n)) {
+            continue;
+        }
+        let b = cx.slot(v, name == BUTTON_GLOBAL)?;
+        if let Some(g) = gen::GLOBAL_NAMES.iter().position(|n| n == name) {
+            cx.rt2.globals[g] = b;
+        }
+    }
+    let mut rt2 = cx.rt2;
+    rt2.canonicalize_ids();
+    // A string's id (part of the key) is its occurrence in canonical order
+    // after the static ones.
+    let mut strings: Vec<String> = gen::STRINGS.iter().map(|s| s.to_string()).collect();
+    let old = std::mem::take(&mut rt2.strings);
+    let mut renumber = |col: &mut Col| {
+        if let Col::U(AV::Str(s)) = col {
+            strings.push(old[*s as usize].clone());
+            *s = (strings.len() - 1) as u32;
+        }
     };
-    cx.st.vector_size = 1;
-    let globals = &ts.heap.tables[&ts.globals];
-    let entries: Vec<(String, TValue<RefDomain>)> =
-        globals.hash.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    for (name, v) in entries {
-        // The tracer's base registers COMPILE-TIME hint builtins
-        // (`_hint_normalize` etc.) that the frontend consumes, so a real
-        // interpreter state never holds them and re-importing one
-        // (`to_trace_state`/`builtin_static`) would fail. They sit outside
-        // `GLOBAL_NAMES`, so no row key sees them; drop them on export, the
-        // inverse of `add_missing_builtins` adding them on import.
-        if let TValue::Builtin(n) = &v {
-            if !BUILTIN_NAMES.iter().any(|b| b == n) {
-                continue;
-            }
+    for (cell, col) in rt2.structure.iter_mut().zip(rt2.cols.iter_mut()) {
+        match cell {
+            Cell2::Val => renumber(col),
+            Cell2::Clo(_, caps) => caps.iter_mut().for_each(&mut renumber),
+            _ => {}
         }
-        let ubool = name_is_buttons(&name);
-        let bid = cx.box_slot(&v, ubool)?;
-        cx.st.global_env.insert(name, bid);
     }
-    Ok(cx.st)
+    rt2.strings = strings;
+    rt2.shape_hash = rt2.shape_hash_of();
+    Ok(rt2)
 }

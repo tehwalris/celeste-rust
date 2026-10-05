@@ -27,8 +27,9 @@ Every room has a confirmed optimum (`plans/results.md`); all tie the
 community TAS. The rem rungs of the precision ladder that found them were
 deleted on 2026-10-05 (branch `arc-only`).
 
-State of the code (2026-10-05): ~44.9k lines of Rust (26.2k code, 9.1k
-comments, 7.4k tests); a cleanup toward ~10k is in progress.
+State of the code (2026-10-05, after the `tier3` cleanup): ~36.5k lines of
+Rust (25.6k code, 4.4k comments, 4.7k tests, 1.8k blank; 44.9k before it); a
+cleanup toward ~10k is in progress.
 
 ## Read these before doing anything substantial
 
@@ -149,8 +150,8 @@ always reaching for the most expensive profile out of habit.
   `lto = "fat"` + `codegen-units = 1`: a one-line edit relinks the workspace,
   ~100 s to run a test that executes in 6 ms.
 - **Do not run the full suite in plain debug**: the compute-bound tests
-  (`every_start_room_kernel_graph_asm_compiles_the_fused_graph`,
-  `a_traced_frame_agrees_with_the_oracle`) are slow without optimization.
+  (`a_traced_frame_agrees_with_the_oracle`, `ice_at_answers_the_tile_scan_in_every_room`)
+  are slow without optimization.
   Debug wins when a filter keeps them out; `--cargo-profile quick` otherwise.
 - **Tools get `--profile quick`, not `--release`** (`transpile` probes,
   `rewrite` diagnostics, export-ui): 15 s to build against ~78 s. "Too slow
@@ -173,19 +174,13 @@ always reaching for the most expensive profile out of habit.
 - **`touch` the file you care about** to measure what an edit really costs:
   `touch src/transpile/lower.rs && time cargo nextest run transpile`.
 
-**The ignored tests** (7, `#[ignore]` rather than an env check so nextest
-prints them as skipped): `every_reachable_pm1_key_gets_its_own_body`
-(~240 s), `forward_extended_frame_by_frame_matches_fresh`,
-`the_rooms_shape_set_is_a_fixpoint`, `room_71_table_builds_with_its_balloon`
-(level -1), and the reference-engine end-to-end tests. They are NOT part of
-the pre-commit run (Philippe, 2026-08-23: ~6 min each time costs more than
-the occasional bisect). Run them when you have a reason:
-
-- touched the tracer, the lowering, the ASM codegen or the edge recording ->
-  the ignored tests AND the three pinned oracles (below); the kernels are
-  assembled at startup, so the oracles are what check what they COMPUTE;
-- touched the tracer's pinning or key walk ->
-  `every_reachable_pm1_key_gets_its_own_body`.
+**The ignored tests** (2, `#[ignore]` rather than an env check so nextest
+prints them as skipped): `forward_extended_frame_by_frame_matches_fresh`
+(resume) and `room_71_table_builds_with_its_balloon` (level -1). They are
+NOT part of the pre-commit run. Run them, AND the three pinned oracles
+(below), when you touched the tracer, the lowering, the ASM codegen, the
+edge recording, resume or level -1: the kernels are assembled at startup,
+so the oracles are what check what they COMPUTE.
 
 Do NOT read past the "N skipped" line and call the suite green when one of
 those reasons applies. That is the exact mistake behind `a8f4635`.
@@ -226,11 +221,11 @@ grep '^\[gate\]' log | diff - gates/arc_room10_win9-101_h35.txt          # empty
 
 A cargo workspace; the dependency order is load-bearing:
 `celeste-core` (numbers, cart, collision) and `celeste-names` (frozen tables)
-<- `celeste-interp` (the interpreter's `State`, `abstraction::Level`) and
-`celeste-engine` (`Rt2` blocks, keys, lane primitives) <- `celeste-rust`
-(the search `src/frame.rs` + `src/search/`, the tracer `src/trace/`, the
-graph IR / lowering / assembler `src/transpile/`, the kernel registry
-`src/compiled/`, the bins). Details: plans/architecture.md.
+<- `celeste-engine` (`Rt2` blocks, keys, lane primitives) <- `celeste-rust`
+(the search `src/frame.rs` + `src/search/`, the tracer `src/trace/` with the
+reference engine `refengine`, the graph IR / lowering / assembler
+`src/transpile/`, the kernel registry `src/compiled/`, the level
+`src/abstraction.rs`, the bins). Details: plans/architecture.md.
 
 There is NO checked-in kernel artifact: `compiled::asm_kernel::registry`
 retraces the start room's shapes at startup, specializes each on the constant
@@ -253,8 +248,7 @@ CELESTE_LEVEL_MINUS_ONE="C,5" ./safe-run.sh -- ./target/release/rewrite search \
 # the r0sxh forward filtered by r0sxhn's arc-marked nodes.
 CELESTE_LEVEL_MINUS_ONE="84,5" ./safe-run.sh -- ./target/release/rewrite search \
     --room 7,0 --level r0sxhn,r0sxh --ceiling 84 --checkpoint-dir DIR
-# Other knobs: CELESTE_THREADS, CELESTE_KERNEL_SETS=N (resident kernel sets),
-# CELESTE_REGION="px,S" | off. (CELESTE_SPLIT_FRAME=1 still runs a forward,
+# Other knobs: CELESTE_THREADS, CELESTE_REGION="px,S" | off. (CELESTE_SPLIT_FRAME=1 still runs a forward,
 # two steps a frame, but the search refuses it.)
 
 # One forward at one level, with the per-frame [fwd] line; then its fingerprint.
@@ -291,19 +285,18 @@ CELESTE_START_ROOM=X,Y ./target/quick/transpile --level-minus-one-table S
 ### The UI (`ui/`)
 
 A phone-first web view of one finished search: the room as a heatmap per
-(horizon, level, pass, frame), set sizes, the timing waterfall, and an arc
-pass (`search --save-marks`; old ladder runs still export with their
-bands). Static: `rewrite export-ui` turns a finished
-checkpoint tree + its run log into `run.json` + per-level binaries; a Vite
+(level, pass, frame), set sizes, the timing waterfall, and the arc pass
+(`search --save-marks`). Static: `rewrite export-ui` turns a finished
+search's checkpoint dir + its log into `run.json` + per-level binaries; a Vite
 build plus `ui/serve.mjs` serve it under `/celeste/` on port 3011
 (UI-HOSTING.md; control model and data layout in `ui/README.md` and at the
 top of `src/search/ui_export.rs`).
 
 ```bash
-cp /tmp/room10f.log /var/tmp/celeste-ui/room10f.log      # the run's log is the timing source
-./one-cargo.sh ./safe-run.sh -- cargo build --profile quick --bin rewrite
-./safe-run.sh -- ./target/quick/rewrite export-ui --log /var/tmp/celeste-ui/room10f.log \
-    --out /var/tmp/celeste-ui/data --room 1,0             # from the repo root (loads cart/)
+./safe-run.sh -- ./target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR \
+    --save-marks MARKS 2> /var/tmp/celeste-ui/room10.log  # the log is the timing source
+./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir DIR --arc MARKS \
+    --log /var/tmp/celeste-ui/room10.log --out /var/tmp/celeste-ui/data/room10 --room 1,0   # from the repo root
 cd ui && npm install && npm run typecheck && npm run build
 systemd-run --user --scope -p MemoryMax=2G --quiet node serve.mjs &   # http://localhost:3011/celeste/
 ```

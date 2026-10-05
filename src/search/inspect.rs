@@ -1,7 +1,5 @@
-//! Reading a block's rows by NAME, for the diagnostics (`rewrite ref-check`,
-//! `follow`, `spurious`, `witness`, ...) that compare rows across shapes and
-//! levels: two shapes number their cells differently, so a row is compared
-//! as its named value cells.
+//! A block's rows by NAME, for the diagnostics that compare rows across
+//! shapes and levels (shapes number their cells differently).
 
 use celeste_engine::runtime2::{BoundaryIds, Cell2, Col, Rt2, AV};
 use std::collections::{BTreeMap, HashMap};
@@ -18,10 +16,9 @@ pub fn av_show(v: AV) -> String {
     }
 }
 
-/// A block's value cells by NAME: the player's position, speed and
-/// remainder (`player.x`, `spd.x`, `rem.y`, `dash_effect_time`), and every
-/// object's fields as `type[i].field` (and `type[i].field.sub` one table
-/// deeper). A cell no name reaches (a global's) is left out.
+/// A block's value cells by NAME: the player's (`player.x`, `spd.x`,
+/// `rem.y`, `dash_effect_time`) and every object's as `type[i].field[.sub]`.
+/// Globals are left out.
 pub fn cell_names(rt2: &Rt2, ids: &BoundaryIds) -> HashMap<usize, String> {
     let mut names = HashMap::new();
     if let Some(obj) = crate::search::pos_graph::player_object(rt2) {
@@ -42,8 +39,7 @@ pub fn cell_names(rt2: &Rt2, ids: &BoundaryIds) -> HashMap<usize, String> {
             }
         }
     }
-    // Every other object's fields: the column that multiplies a frontier is
-    // as often a platform's or a fall floor's as the player's.
+    // Every other object's fields.
     if let Some(arr) = rt2.global_target(ids.g_objects) {
         if let Cell2::Arr(items) = &rt2.structure[arr as usize] {
             let type_name = |t: u32| -> String {
@@ -84,9 +80,8 @@ pub fn cell_names(rt2: &Rt2, ids: &BoundaryIds) -> HashMap<usize, String> {
     names
 }
 
-/// Row `r`'s projection: every named value cell (`cell_names`) but those
-/// whose name starts with an `erase` prefix, and no pointers (structure,
-/// renumbered between shapes).
+/// Row `r`'s named value cells, minus `erase` prefixes and pointers
+/// (renumbered between shapes).
 pub fn project_row(rt2: &Rt2, names: &HashMap<usize, String>, r: u32, erase: &[String]) -> Proj {
     names
         .iter()
@@ -103,7 +98,7 @@ pub fn project_all(rt2: &Rt2) -> Vec<Proj> {
 }
 
 /// Every row of `rt2` widened onto `level` (`frame::widen_rt2_to`), projected.
-pub fn project_onto(rt2: &mut Rt2, level: crate::interpreter::abstraction::Level) -> Vec<Proj> {
+pub fn project_onto(rt2: &mut Rt2, level: crate::abstraction::Level) -> Vec<Proj> {
     crate::frame::widen_rt2_to(rt2, level);
     project_all(rt2)
 }
@@ -116,8 +111,7 @@ pub fn projection_key(p: &Proj) -> u64 {
     h.finish()
 }
 
-/// The player's fields of a projection, for reading: position, remainder,
-/// speed, dash, the player object's scalars.
+/// The player's fields of a projection, for reading.
 pub fn brief(p: &Proj) -> String {
     p.iter()
         .filter(|(n, _)| {

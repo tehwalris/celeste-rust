@@ -1,22 +1,12 @@
-//! The generated name tables, and nothing else.
+//! The name tables, and nothing else.
 //!
-//! `gen.rs` is CHECKED IN and FROZEN. It was written by the IR walk
-//! `transpile::names` from the rewritten `rewrites-compile.jsonl` program
-//! (last regenerated in cfe8680, 2026-08-18); that walk was deleted with
-//! the walk kernels (plans/delete-the-interpreter.md Phase 1), so the file
-//! is now edited by hand, APPEND-ONLY, and only if the Lua grows a name.
+//! `gen.rs` is checked in and FROZEN: its generator is gone, so it is edited
+//! by hand, APPEND-ONLY, and only if the Lua grows a name. It is its own crate
+//! because `celeste-engine` needs `FIELD_NAMES` below it.
 //!
-//! Why it is its OWN crate, below the engine: `celeste-engine` reads
-//! `FIELD_NAMES` (it is the canonical field ordering the boundary hashes),
-//! while the generated kernels read `celeste_engine::{Rt2, Col, AV}`. Put
-//! both generated modules in one crate and that is a cycle. Splitting them
-//! by direction - name tables BELOW the engine, kernels ABOVE it - is
-//! forced by the dependency graph, not a matter of taste.
-//!
-//! The ORDER of these tables is load-bearing. `FIELD_NAMES`' order is the
-//! field ordering `Cell2::Obj` interns against, so it feeds the shape hash,
-//! which feeds the row key, which is what the search dedups on: a reorder
-//! is a different search, not a cosmetic change.
+//! The ORDER is load-bearing: `FIELD_NAMES`' order is the field ordering
+//! `Cell2::Obj` interns against, so it feeds the shape hash and the row key
+//! the search dedups on. A reorder is a different search.
 
 pub mod gen;
 

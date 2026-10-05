@@ -1,13 +1,12 @@
-//! Precomputed collision lookup tables for fast solid_at queries.
-//!
-//! This replaces the interpreted solid_at/tile_flag_at calls with direct table lookups.
+//! Precomputed per-room `tile_flag_at` tables for the common boxes, with the
+//! tile scan as the fallback.
 
 use crate::cart_data::CartData;
 use crate::pico8_num::Pico8Num;
 use anyhow::Result;
 use std::cmp;
 
-/// Range for position map
+/// The position range a `BoolMap` covers (inclusive).
 #[derive(Clone)]
 pub struct PosMapRange {
     pub min_x: i16,
@@ -22,15 +21,8 @@ impl PosMapRange {
     }
 }
 
-/// 2D bitmap indexed by (x, y) position.
-///
-/// One bit per position rather than one byte. The three solid maps cover
-/// 193x193 positions each; as `Vec<bool>` that is 112 KB of tables that 16
-/// frame-worker threads probe at random from lane coordinates, and as bits
-/// it is 14 KB - small enough to stay resident next to everything else the
-/// frame body is touching. (Philippe: "for tile_flag_at we could
-/// significantly compress the memory that it reads"; a room is 16x16 tiles,
-/// so the underlying information is 256 bits.)
+/// 2D bitmap indexed by (x, y) position. Bits, not bytes, so the maps
+/// (probed at random from lane coordinates) stay cache-resident.
 pub struct BoolMap {
     words: Vec<u64>,
     range: PosMapRange,
@@ -88,23 +80,21 @@ impl BoolMap {
 
 /// Precomputed collision cache for a specific room
 pub struct CollisionCache {
-    /// Room coordinates (for validation)
+    /// Room coordinates.
     pub room_x: i16,
     pub room_y: i16,
 
-    /// tile_flag_at cache for flag 0 (solid), w=6, h=5 (player hitbox)
-    /// Indexed by (x + hitbox_x, y + hitbox_y) where hitbox is (1, 3)
+    /// Flag 0 (solid), w=6, h=5 (player hitbox), indexed by the object
+    /// position (the hitbox offset is (1, 3)).
     solid_player_hitbox: BoolMap,
 
-    /// tile_flag_at cache for flag 0 (solid), w=1, h=1 (single pixel)
+    /// Flag 0, w=1, h=1.
     solid_1x1: BoolMap,
 
-    /// tile_flag_at cache for flag 0 (solid), w=8, h=8 (full tile)
+    /// Flag 0, w=8, h=8.
     solid_8x8: BoolMap,
 
-    /// tile_flag_at cache for flag 4 (ice, `ICE_FLAG`), the player hitbox:
-    /// `is_ice` asks it every frame (`on_ice`, the wall jump). Indexed like
-    /// `solid_player_hitbox`.
+    /// `ICE_FLAG`, the player hitbox, indexed like `solid_player_hitbox`.
     ice_player_hitbox: BoolMap,
 }
 
@@ -112,9 +102,9 @@ pub struct CollisionCache {
 pub const ICE_FLAG: i16 = 4;
 
 impl CollisionCache {
-    /// Create a new collision cache for the given room
+    /// The collision cache for one room.
     pub fn new(cart_data: &CartData, room_x: i16, room_y: i16) -> Result<Self> {
-        // Range that covers player movement area with some margin
+        // The room plus a margin.
         let range = PosMapRange {
             min_x: -32,
             max_x: 160,
@@ -127,9 +117,7 @@ impl CollisionCache {
         let mut solid_8x8 = BoolMap::new(range.clone());
         let mut ice_player_hitbox = BoolMap::new(range.clone());
 
-        // Precompute tile_flag_at for different hitbox sizes
         solid_player_hitbox.fill(|x, y| {
-            // Player hitbox: x+1, y+3, w=6, h=5
             Self::tile_flag_at_impl(cart_data, room_x, room_y, x + 1, y + 3, 6, 5, 0)
                 .unwrap_or(false)
         });
@@ -159,24 +147,21 @@ impl CollisionCache {
         })
     }
 
-    /// Lookup solid_at for 1x1 area
+    /// Cached `solid_at` for a 1x1 box.
     #[inline]
     pub fn solid_1x1(&self, x: i16, y: i16) -> Option<bool> {
         self.solid_1x1.get(x, y)
     }
 
-    /// Lookup solid_at for 8x8 area
+    /// Cached `solid_at` for an 8x8 box.
     #[inline]
     pub fn solid_8x8(&self, x: i16, y: i16) -> Option<bool> {
         self.solid_8x8.get(x, y)
     }
 
     /// The precomputed map answering `tile_flag_at(x, y, w, h, flag=0)`,
-    /// with the offset its rows were built at: look up `(x + dx, y + dy)`.
-    ///
-    /// Exists so a caller looping over lanes can pick the map ONCE instead
-    /// of re-testing the (w, h) pair per lane - w and h are the same
-    /// constant for every lane of a call.
+    /// with its offset: look up `(x + dx, y + dy)`. Lets a lane loop pick
+    /// the map once per call.
     #[inline]
     pub fn solid_map(&self, w: i16, h: i16) -> Option<(&BoolMap, i16, i16)> {
         match (w, h) {
@@ -215,9 +200,8 @@ impl CollisionCache {
         Self::tile_flag_at_impl(cart_data, self.room_x, self.room_y, x, y, w, h, flag)
     }
 
-    /// Generic solid_at lookup - falls back to computation if not cached
+    /// `solid_at`: the cached maps where they cover the query, else the scan.
     pub fn solid_at(&self, cart_data: &CartData, x: i16, y: i16, w: i16, h: i16) -> Result<bool> {
-        // Try cached lookups first for common cases
         if w == 1 && h == 1 {
             if let Some(v) = self.solid_1x1(x, y) {
                 return Ok(v);
@@ -230,11 +214,10 @@ impl CollisionCache {
             }
         }
 
-        // Fall back to computation
         Self::tile_flag_at_impl(cart_data, self.room_x, self.room_y, x, y, w, h, 0)
     }
 
-    /// Implementation of tile_flag_at - checks if any tile in the rectangle has the given flag
+    /// The tile scan: does any tile of the room under the box have `flag`.
     fn tile_flag_at_impl(
         cart_data: &CartData,
         room_x: i16,
@@ -252,7 +235,6 @@ impl CollisionCache {
 
         for ty in tile_min_y..=tile_max_y {
             for tx in tile_min_x..=tile_max_x {
-                // Get tile at room-relative position
                 let world_tx = room_x * 16 + tx;
                 let world_ty = room_y * 16 + ty;
 
@@ -289,8 +271,7 @@ mod tests {
         let mut map = BoolMap::new(range);
 
         map.set(0, 0, true);
-        // A neighbour in the same 64-bit word must be unaffected, which is
-        // the failure mode a bitmap has and a byte array does not.
+        // A neighbour in the same 64-bit word must be unaffected.
         assert_eq!(map.get(0, 0), Some(true));
         assert_eq!(map.get(1, 0), Some(false));
         assert_eq!(map.get(-1, 0), Some(false));

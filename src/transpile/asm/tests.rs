@@ -243,14 +243,24 @@ fn zn_bytes(z: ZN) -> [u8; 64] {
     o
 }
 
-/// Assert the emitted kernel's typed roots match the reference evaluator.
-fn check_typed(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
+/// Assemble `g`'s roots, run the kernel on 8 random input batches (`cols`)
+/// and assert every root bit-exact against the reference evaluator (a bool's
+/// `val` on its known lanes only, where it is defined).
+fn check(
+    g: &Graph,
+    roots: &[NodeId],
+    tag: &str,
+    rng: &mut Lcg,
+    cols: fn(&[u32], &mut Lcg) -> HashMap<u32, [i32; 16]>,
+    ctx: *const std::os::raw::c_void,
+    room: Option<(&CartData, &CollisionCache)>,
+) {
     let (compiled, loaded) = compile_and_load(g, roots, tag).expect("compile+load");
     for _ in 0..8 {
-        let cols = random_columns(&compiled.input_cells, rng);
+        let cols = cols(&compiled.input_cells, rng);
         let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,std::ptr::null());
-        let vals = eval_nodes(g, &cols, None);
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes, ctx);
+        let vals = eval_nodes(g, &cols, room);
         for (ri, r) in roots.iter().enumerate() {
             let base = compiled.root_offsets[ri] as usize;
             match (compiled.root_kinds[ri], vals[*r as usize]) {
@@ -264,8 +274,8 @@ fn check_typed(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
                 (RootKind::Bool, V::B(z)) => {
                     let val = u16::from_le_bytes([out[base], out[base + 1]]);
                     let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
-                    assert_eq!(val, z.val, "{tag}: bool val root {ri}");
                     assert_eq!(known, z.known, "{tag}: bool known root {ri}");
+                    assert_eq!(val & known, z.val & known, "{tag}: bool val root {ri}");
                 }
                 (k, _) => panic!("{tag}: root {ri} kind {k:?} vs oracle type mismatch"),
             }
@@ -305,8 +315,7 @@ fn build_value_graph(cells: &[u32], _rng: &mut Lcg) -> (Graph, Vec<NodeId>) {
 }
 
 /// Small bounded columns (raw ~ +-8.0 fixed) so interval add/sub cannot
-/// overflow (the kernel `zi_*` ops panic on overflow, a contract path we do
-/// not replicate).
+/// overflow (the `zi_*` primitives panic on overflow).
 fn random_small_columns(cells: &[u32], rng: &mut Lcg) -> HashMap<u32, [i32; 16]> {
     cells
         .iter()
@@ -314,42 +323,9 @@ fn random_small_columns(cells: &[u32], rng: &mut Lcg) -> HashMap<u32, [i32; 16]>
         .collect()
 }
 
-/// Like `check_typed` but with bounded inputs, for the interval ops.
-fn check_typed_small(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
-    let (compiled, loaded) = compile_and_load(g, roots, tag).expect("compile+load");
-    for _ in 0..8 {
-        let cols = random_small_columns(&compiled.input_cells, rng);
-        let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,std::ptr::null());
-        let vals = eval_nodes(g, &cols, None);
-        for (ri, r) in roots.iter().enumerate() {
-            let base = compiled.root_offsets[ri] as usize;
-            match (compiled.root_kinds[ri], vals[*r as usize]) {
-                (RootKind::Num, V::N(z)) => {
-                    assert_eq!(&out[base..base + 64], &zn_bytes(z), "{tag}: num root {ri}");
-                }
-                (RootKind::Ival, V::I(z)) => {
-                    assert_eq!(&out[base..base + 64], &zn_bytes(z.lo), "{tag}: ival lo {ri}");
-                    assert_eq!(&out[base + 64..base + 128], &zn_bytes(z.hi), "{tag}: ival hi {ri}");
-                }
-                (RootKind::Bool, V::B(z)) => {
-                    // Only the KNOWN lanes' val bits are defined; compare val
-                    // masked by known, and known exactly.
-                    let val = u16::from_le_bytes([out[base], out[base + 1]]);
-                    let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
-                    assert_eq!(known, z.known, "{tag}: bool known root {ri}");
-                    assert_eq!(val & known, z.val & known, "{tag}: bool val root {ri}");
-                }
-                (k, _) => panic!("{tag}: root {ri} kind {k:?} vs oracle type mismatch"),
-            }
-        }
-    }
-}
-
 /// Build intervals (via Span and a wide Const) and exercise the interval
 /// ops: zi_add/sub/min/max/neg/abs, zi_flr + Known(Flr), zi_cmp (all four
-/// orders), Frag/FragOk/SplitOk, Sel over intervals, and Bits-of-interval
-/// feeding the hash.
+/// orders), Frag/FragOk/SplitOk, IntFrag, and Sel over intervals.
 fn build_interval_graph(cells: &[u32]) -> (Graph, Vec<NodeId>) {
     let mut g = Graph::new();
     let two = g.leaf(Op::Const(ONE_FIXED2, ONE_FIXED2)); // +2.0
@@ -362,7 +338,6 @@ fn build_interval_graph(cells: &[u32]) -> (Graph, Vec<NodeId>) {
         let shifted = g.add(Op::Add, vec![ivl, band]); // interval + interval
         let neg = g.add(Op::Neg, vec![shifted]);
         // their no-wrap premises, which hold on these bounded inputs
-        // (`asm_interval_overflow_declines` covers the lanes that wrap)
         let nw_add = g.add(Op::NoWrap, vec![shifted]);
         let nw_neg = g.add(Op::NoWrap, vec![neg]);
         let ab = g.add(Op::Abs, vec![neg]);
@@ -377,7 +352,6 @@ fn build_interval_graph(cells: &[u32]) -> (Graph, Vec<NodeId>) {
         let lt = g.add(Op::Lt, vec![ivl, shifted]);
         let ge = g.add(Op::Ge, vec![mx, ivl]);
         // interval equality: interval vs interval, interval vs number
-        // (the spd ladder compares widened speeds with constants)
         let eqi = g.add(Op::Eq, vec![ivl, shifted]);
         let eqn = g.add(Op::Eq, vec![mx, base]);
         // fork, at arity 2 and 3
@@ -425,41 +399,7 @@ fn asm_interval_layer_matches_primitives() {
     for k in [2usize, 4, 7] {
         let cells: Vec<u32> = (0..k as u32).map(|i| i * 3 + 2).collect();
         let (g, roots) = build_interval_graph(&cells);
-        check_typed_small(&g, &roots, &format!("iv{k}"), &mut rng);
-    }
-}
-
-/// Compare typed roots with a real `AsmCtx` (for the call-out ops). `env`
-/// may be null for div/rem/sin (they do not touch it).
-fn check_typed_ctx(
-    g: &Graph,
-    roots: &[NodeId],
-    tag: &str,
-    rng: &mut Lcg,
-    ctx: &crate::transpile::asm::AsmCtx,
-) {
-    let (compiled, loaded) = compile_and_load(g, roots, tag).expect("compile+load");
-    let ctxp = ctx as *const _ as *const std::os::raw::c_void;
-    for _ in 0..8 {
-        let cols = random_small_columns(&compiled.input_cells, rng);
-        let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,ctxp);
-        let vals = eval_nodes(g, &cols, None);
-        for (ri, r) in roots.iter().enumerate() {
-            let base = compiled.root_offsets[ri] as usize;
-            match (compiled.root_kinds[ri], vals[*r as usize]) {
-                (RootKind::Num, V::N(z)) => {
-                    assert_eq!(&out[base..base + 64], &zn_bytes(z), "{tag}: num root {ri}");
-                }
-                (RootKind::Bool, V::B(z)) => {
-                    let val = u16::from_le_bytes([out[base], out[base + 1]]);
-                    let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
-                    assert_eq!(known, z.known, "{tag}: bool known {ri}");
-                    assert_eq!(val & known, z.val & known, "{tag}: bool val {ri}");
-                }
-                (k, _) => panic!("{tag}: root {ri} kind {k:?} mismatch"),
-            }
-        }
+        check(&g, &roots, &format!("iv{k}"), &mut rng, random_small_columns, std::ptr::null(), None);
     }
 }
 
@@ -486,7 +426,7 @@ fn asm_callout_div_rem_sin_matches_primitives() {
         roots.push(sn);
         roots.push(d2);
     }
-    check_typed_ctx(&g, &roots, "callout", &mut rng, &ctx);
+    check(&g, &roots, "callout", &mut rng, random_small_columns, &ctx as *const _ as *const std::os::raw::c_void, None);
 }
 
 /// mget + tile_flag_at, emitted as call-outs into the real collision cache
@@ -525,35 +465,13 @@ fn asm_callout_collision_matches_primitives() {
         roots.push(g.add(Op::Add, vec![mg, w8]));
     }
 
-    let (compiled, loaded) = compile_and_load(&g, &roots, "collision").expect("compile+load");
-    let ctxp = &ctx as *const _ as *const std::os::raw::c_void;
     let mut rng = Lcg(0xc0111_5107);
-    for _ in 0..8 {
-        let cols = random_columns(&compiled.input_cells, &mut rng);
-        let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,ctxp);
-        let vals = eval_nodes(&g, &cols, Some((&cart, &cache)));
-        for (ri, r) in roots.iter().enumerate() {
-            let base = compiled.root_offsets[ri] as usize;
-            match (compiled.root_kinds[ri], vals[*r as usize]) {
-                (RootKind::Num, V::N(z)) => {
-                    assert_eq!(&out[base..base + 64], &zn_bytes(z), "collision num root {ri}");
-                }
-                (RootKind::Bool, V::B(z)) => {
-                    let val = u16::from_le_bytes([out[base], out[base + 1]]);
-                    let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
-                    assert_eq!(known, z.known, "collision bool known {ri}");
-                    assert_eq!(val & known, z.val & known, "collision bool val {ri}");
-                }
-                (k, _) => panic!("collision root {ri} kind {k:?} mismatch"),
-            }
-        }
-    }
+    check(&g, &roots, "collision", &mut rng, random_columns, &ctx as *const _ as *const std::os::raw::c_void, Some((&cart, &cache)));
 }
 
-/// Ice (flag 4, 2026-10-01): the lane primitive's answer through the
-/// precomputed player-hitbox ice map is the tile scan's, at every position
-/// of an ice room ((3,1)), and true somewhere (the map is not empty).
+/// Ice (flag 4): the lane primitive's answer through the precomputed
+/// player-hitbox ice map is the tile scan's at every position of an ice
+/// room ((3,1)), and true somewhere.
 #[test]
 fn tile_flag_ice_map_matches_the_scan() {
     let cart = CartData::load("cart").expect("cart");
@@ -590,16 +508,14 @@ fn asm_value_and_bool_layer_matches_primitives() {
     for k in [3usize, 5, 9, 16] {
         let cells: Vec<u32> = (0..k as u32).map(|i| i * 2 + 3).collect();
         let (g, roots) = build_value_graph(&cells, &mut rng);
-        check_typed(&g, &roots, &format!("val{k}"), &mut rng);
+        check(&g, &roots, &format!("val{k}"), &mut rng, random_columns, std::ptr::null(), None);
     }
 }
 
 /// A bool INPUT cell (`CellRepr::Bool`): the input buffer carries a 16-bit
 /// `val` mask (known implicitly all-ones), the codegen expands it to a
 /// per-lane vector mask, and it flows through `Not`/`Sel` to Num and Bool
-/// roots. This is the input marshalling the ASM kernel dispatch needs -
-/// room (1,0) kernels take `has_dashed`/`will_restart`/... as bool inputs.
-/// Compared bit-exact against the real `ZB`/`ZN` primitives.
+/// roots. Bit-exact against the `ZB`/`ZN` primitives.
 #[test]
 fn asm_bool_input_matches_primitives() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr, RootKind};
@@ -701,10 +617,9 @@ fn asm_ubool_input_carries_its_known_mask() {
 }
 
 /// An interval (`ZI`) INPUT cell (`CellRepr::Ival`): two `ZN` planes (lo at
-/// +0, hi at +64 of a 128-byte slot), the codegen loads both, and the
-/// interval flows through `Add`/`Flr` to Ival and Num roots. Real room
-/// kernels take `player.rem` as an ival input. Packed via `input_offsets`
-/// (repr-aware layout) and compared bit-exact against `zi_add`/`zi_flr`.
+/// +0, hi at +64 of a 128-byte slot) flowing through `Add`/`Flr` to Ival
+/// and Num roots, packed via `input_offsets` and compared bit-exact against
+/// `zi_add`/`zi_flr`.
 #[test]
 fn asm_ival_input_matches_primitives() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr, RootKind};
@@ -764,15 +679,11 @@ fn asm_ival_input_matches_primitives() {
 }
 
 /// Interval `+`, `-` and negation whose endpoints OVERFLOW the 16.16 range
-/// are an ERROR in that lane, never a value: the assembled kernel's
-/// `NoWrap` premise is false exactly where the primitives' wrap guard
-/// (`zi_add_wraps`, `zi_sub_wraps`, `zi_neg_wraps` - the lanes `zi_add`,
-/// `zi_sub`, `zi_neg` panic on) fires, and a body whose result reads such
-/// an operation declines there (`trace::error`). Every other lane is
-/// bit-exact with the primitives. Until 2026-10-03 the assembled ops wrapped
-/// each endpoint silently, which inverted the interval: a timers level's
-/// floor `delay` (the whole range) minus 1 decided `<= 0` as "no", and a
-/// shaking floor never fell (room (3,3)).
+/// are an ERROR in that lane, never a value: the kernel's `NoWrap` premise
+/// is false exactly where the primitives' wrap guards (`zi_add_wraps`,
+/// `zi_sub_wraps`, `zi_neg_wraps`) fire, so a body reading such an
+/// operation declines there (`trace::error`). Every other lane is bit-exact.
+/// A silently wrapped endpoint inverts the interval.
 #[test]
 fn asm_interval_overflow_declines() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr};
@@ -788,9 +699,9 @@ fn asm_interval_overflow_declines() {
     reprs.insert(0u32, CellRepr::Ival);
     let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "ivalovf", &reprs).expect("compile+load");
     let one = 0x1_0000;
-    // Per lane (lo, hi, num): the whole range plus/minus one, a top end
-    // that overflows on +1, a bottom end on -1, MIN negated, and lanes that
-    // come right up to the ends without overflowing.
+    // Per lane (lo, hi, num): the whole range plus/minus one, a top end that
+    // overflows on +1, a bottom end on -1, MIN negated, and lanes right up to
+    // the ends without overflowing.
     let lanes: [(i32, i32, i32); 16] = [
         (i32::MIN, i32::MAX, one),
         (i32::MIN, i32::MAX, -one),
@@ -836,8 +747,8 @@ fn asm_interval_overflow_declines() {
         let o = compiled.root_offsets[3 + k] as usize;
         assert_eq!(word(o + 2), 0xffff, "{name}: the premise is decided on every lane");
         assert_eq!(word(o), !wraps[k], "{name}: NoWrap false exactly where the primitives' guard fires");
-        // The other lanes are bit-exact with the primitives, run on those
-        // lanes alone (they panic on the rest).
+        // The other lanes are bit-exact with the primitives (run on those lanes
+        // alone: the primitives panic on the rest).
         let (lo, hi) = (plane(k, 0), plane(k, 64));
         for l in (0..16).filter(|l| wraps[k] >> l & 1 == 0) {
             let pick = |z: ZN| ZN::from_array([z.to_array()[l]; 16]);
@@ -852,11 +763,3 @@ fn asm_interval_overflow_declines() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Benchmark: asserts BOTH the asm backend and a self-contained rustc build
-// of the identical graph match the primitives, then prints compile-time and
-// runtime numbers. #[ignore] because it shells out to rustc (~0.3 s) and is
-// only meaningful under an optimized profile.
-// ---------------------------------------------------------------------------
-

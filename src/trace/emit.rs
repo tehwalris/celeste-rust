@@ -1,24 +1,12 @@
-//! Lowering a TRACED graph with the kernel emitter.
+//! Binding a TRACED frame to the engine's numbering and lowering it.
 //!
-//! This is the join between the two halves of the campaign. `transpile::
-//! lower` turns a graph into the lines of a kernel and is the emitter the
-//! generated crates already use; `trace` produces a graph without any of
-//! the rewrites the old front half needed. If the second graph goes
-//! through the first emitter, the rewrites have nothing left to do.
+//! `bind` resolves the tracer's paths to the engine's canonical cell ids
+//! (`trace::bind`), so everything downstream names cells an `Rt2` has.
 //!
-//! The BOUNDARY NUMBERING is `bind` below. The cell ids the emitter sees
-//! are the engine's canonical ones, resolved from the tracer's paths by
-//! `trace::bind` - so the lines this produces name cells an `Rt2` has.
-//! The tracer's own dense slot numbering never leaves the tracer.
-//!
-//! Inputs and outputs are two numbering spaces, and keeping them apart
-//! is the thing to get right. An outcome that allocates or frees an
-//! object shifts every canonical id after the change, so its output
-//! cells are ids in ITS structure, not in the input block's. The
-//! generated code reads inputs off the chunk and writes outputs onto an
-//! accumulator built from the outcome's structure, which are different
-//! blocks - so the two spaces coexist, and an id is only meaningful
-//! against the structure it came from.
+//! Inputs and outputs are two numbering spaces: an outcome that allocates
+//! or frees an object shifts every canonical id after the change, so its
+//! output cells are ids in ITS structure, not the input block's. An id is
+//! only meaningful against the structure it came from.
 
 use anyhow::Result;
 
@@ -34,17 +22,12 @@ pub struct Lowered {
     /// size measure for the probes.
     pub bodies: usize,
     /// THE specialization (`lower::specialize_frame`): the fused graph and
-    /// its bodies, computed once here and consumed by `asm_fused_from` -
-    /// specialize + decide were half a kernel build, and used to run
-    /// twice per shape (2026-09-14).
+    /// its bodies, computed once here and consumed by `asm_fused_from`.
     pub(crate) spec: (Graph, Vec<crate::transpile::lower::SpecializedBody>),
 }
 
-/// A node's subtree, to a bounded depth, as text. For DIAGNOSTICS: the
-/// graph is a DAG with tens of thousands of nodes, so printing one whole
-/// is useless, but three levels around a node says what kind of thing it
-/// is. Nodes past the depth limit print as `Op#id` so they can be looked
-/// up if they matter.
+/// A node's subtree, to a bounded depth, as text (for diagnostics). Nodes
+/// past the depth limit print as `Op#id`.
 pub fn show_tree(g: &Graph, root: NodeId, depth: usize) -> String {
     let nd = g.get(root);
     if depth == 0 {
@@ -64,9 +47,8 @@ pub struct FrameOutcome {
     pub live: NodeId,
     pub error: NodeId,
     /// Cells `Rt2::boundary` widens to a UNIFORM value at level 0 (rem x/y ->
-    /// the [-0.5, 0.5) interval; timer globals -> 0), with that value. The key
-    /// emitter mirrors the boundary: these contribute the widened value from
-    /// `KPART`, off the per-lane fold. See `OutField::widen_uniform`.
+    /// [-0.5, 0.5); timer globals -> 0), with that value. The key emitter
+    /// mirrors the boundary (`OutField::widen_uniform`).
     pub widen: Vec<(u32, celeste_engine::runtime2::AV)>,
     /// The transfer roots (`verify::FrameOut::arc`; empty but at level 0),
     /// after `live` in a body's roots, and whether the outcome has a player
@@ -87,9 +69,8 @@ pub struct Bound {
 }
 
 
-/// What each root index passed to `renumber_cells` is: the roots are
-/// every outcome's fields then its `live` and `error`, flattened, and a
-/// failure that says "root #58" means nothing without that key.
+/// What each root index passed to `renumber_cells` is (every outcome's
+/// fields then its `live` and `error`, flattened), for error messages.
 fn root_legend(f: &crate::trace::verify::Frame) -> String {
     let mut out = Vec::new();
     let mut k = 0usize;
@@ -107,18 +88,13 @@ fn root_legend(f: &crate::trace::verify::Frame) -> String {
 
 /// Resolve a traced frame against the engine's numbering.
 ///
-/// `g` is passed separately because the tracer's graph lives on the
-/// interpreter's domain and a frame only holds node ids into it. Several
-/// frames traced through one interpreter share that graph - which is how
-/// per-pm1-key bodies share subexpressions - so this renumbers the whole
-/// arena and remaps the frame's roots through it.
+/// `g` is passed separately: frames traced through one interpreter share
+/// its graph (and so subexpressions), and a frame only holds node ids into
+/// it. This renumbers the whole arena and remaps the frame's roots.
 ///
-/// UNIFORM vs PER-LANE is a boundary decision the tracer does not model
-/// yet, and the emitter needs it: `tile_flag_at` takes its width and
-/// height as block-uniform `P8`, so a per-lane hitbox is a narrowing it
-/// refuses. A hitbox IS uniform - it is fixed per object type and never
-/// written during a frame - so saying so here is a stand-in for the
-/// classification, not a fudge.
+/// Hitbox cells are declared UNIFORM: `tile_flag_at` needs a block-uniform
+/// width and height, and a hitbox is fixed per object type and never
+/// written during a frame.
 pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
     let mut roots: Vec<NodeId> = Vec::new();
     for o in &f.outs {
@@ -137,24 +113,14 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
         }
     }
 
-    // Only the cells the graph actually READS.
+    // Only the cells the graph actually READS: a dead input (e.g. a button
+    // cell, `AV::UBool` at the boundary and overwritten before use) would
+    // make the kernel refuse a block for a value it never reads. Kernel and
+    // block agree on the SHAPE hash, not on this list.
     //
-    // `symbolize` turns every scalar under the roots into a cell, and
-    // some of them are dead by construction: `__reset_button_states`
-    // runs before the frame body, so the six button cells are
-    // overwritten before anything looks at them. Declaring one anyway is
-    // not merely wasteful - the kernel's row gather demands a DECIDED
-    // boolean, and a button cell at a frame boundary is `AV::UBool`, so
-    // a dead input is a block the kernel refuses for a value it was
-    // never going to read.
-    //
-    // Dropping it costs no check. What a kernel must agree with a block
-    // about is its SHAPE, and that is the dispatcher's hash, not this
-    // list.
-    // THE UNKNOWN NUMBER never reaches a kernel (plans/fly-fruit.md): a field
-    // holding it is stored as the uniform `AV::UNum` (below), so the root the
-    // kernel would compute for it is unread and gets a literal placeholder,
-    // and any other root that reads one is refused (the walk below).
+    // THE UNKNOWN NUMBER never reaches a kernel: a field holding it is
+    // stored as the uniform `AV::UNum` (below), so its root gets a literal
+    // placeholder, and any other root that reads one is refused.
     let placeholder = graph.leaf(crate::transpile::graph::Op::Const(0, 0));
     let mut unknown_fields: Vec<Vec<bool>> = Vec::with_capacity(f.outs.len());
     {
@@ -198,12 +164,8 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
     let mut uni: Vec<(u32, &'static str)> = Vec::new();
     for (i, c) in f.iface.init.iter().enumerate() {
         let kind = match c {
-            // An interval slot is still a number to `Conc`, which
-            // records a point because a block has to be built from one.
-            // What makes it an interval is `Iface::ival`, and the
-            // emitter needs to know: an `ival` input is a `ZI` lane and
-            // a `num` one is a `ZN`.
-            // A boolean slot flagged `ival` is one a lane may hold unknown.
+            // `Iface::ival` marks an interval slot (a `ZI` lane, not `ZN`);
+            // on a boolean slot, one a lane may hold unknown.
             crate::trace::iface::Conc::Bool(_) if f.iface.ival[i] => "ubool",
             _ if f.iface.ival[i] => "ival",
             crate::trace::iface::Conc::Num(_) => "num",
@@ -220,12 +182,11 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
         }
     }
 
-    // Level-0 boundary WIDENINGS that make a cell UNIFORM (rem -> [-0.5, 0.5)
-    // interval; timer globals -> 0). The kernel key must contribute these the
-    // way `Rt2::boundary` does - from the constant KPART, off the per-lane
-    // fold - or `mix64(KPART+h)` != `b.row_keys` and Option 1's probe misses.
-    // Identified with the boundary's OWN walk (`mark_walk`, `g_timers`), on
-    // each outcome's output structure, so this is exactly what it widens.
+    // Level-0 boundary WIDENINGS that make a cell UNIFORM (rem -> [-0.5, 0.5);
+    // timer globals -> 0). The kernel key must take these from the constant
+    // KPART, off the per-lane fold, exactly as `Rt2::boundary` does, or the
+    // keys disagree. Found with the boundary's OWN walk (`mark_walk`,
+    // `g_timers`) on each outcome's structure, so the two cannot drift.
     use celeste_engine::runtime2::AV;
     let ids = crate::compiled::boundary_ids();
     let half = celeste_core::pico8_num::Pico8Num::from_parts(0, 0x8000);
@@ -254,9 +215,9 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
                 widen.push((cell, AV::Num(zero)));
             }
         }
-        // The unknown numbers, uniform, off the per-lane key fold. (The unknown
-        // BOOLEANS an output widening writes - held trails, `fly`, `collideable`
-        // - are no fields at all: `verify::out_fields` stores them uniform.)
+        // The unknown numbers, uniform, off the per-lane key fold. (Unknown
+        // BOOLEANS are not fields at all: `verify::out_fields` stores them
+        // uniform.)
         for (i, u) in unknown_fields[oi].iter().enumerate() {
             if *u {
                 widen.push((o.cells[i], AV::UNum));
@@ -297,53 +258,14 @@ pub fn asm_input_reprs(
     Ok(reprs)
 }
 
-/// One fused (specialized) body: which outcome it belongs to, the fork
-/// configuration it resolved (the buttons among the forks), and its roots in the FUSED graph - the outcome's output
-/// field nodes in order, then `error`, then `live`, then its transfer roots
-/// (`FrameOutcome::arc`).
+/// One fused (specialized) body: its outcome, the fork configuration it
+/// resolved (buttons included), and its roots in the FUSED graph.
 pub struct AsmBody {
     pub outcome: usize,
     pub splits: Vec<u8>,
     /// `outputs.len() + 2 + arc` nodes: fields..., error, live, transfer
     /// roots...
     pub roots: Vec<NodeId>,
-}
-
-/// The FUSED ASM graph, its bodies, the flat root list, and the input
-/// reprs for a bound frame.
-///
-/// `lower::specialize_frame` resolves every fork configuration into ONE
-/// shared, hash-consed graph - `Split` -> `Frag`, a button's fork -> a
-/// constant - so the result holds only ordinary ops the codegen lowers. The
-/// row key is not in the graph: the ASM path computes it in Rust from the
-/// output cells (`Rt2::boundary`, the one definition of the key).
-///
-/// `flat_roots` is every body's roots concatenated (what `compile` wants);
-/// `bodies` keeps the per-body structure the append step needs.
-pub fn asm_fused(
-    bound: &Bound,
-    room: Option<&crate::transpile::graph::Room>,
-    decide: bool,
-) -> Result<(
-    Graph,
-    Vec<AsmBody>,
-    Vec<NodeId>,
-    std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
-)> {
-    let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = bound
-        .outcomes
-        .iter()
-        .map(|o| (o.outputs.iter().map(|(_, nd, _)| *nd).collect(), o.error, o.live, o.arc.clone()))
-        .collect();
-    let (fused, raw_bodies) = crate::transpile::lower::specialize_frame(
-        &bound.graph,
-        &outs_spec,
-        bound.forks,
-        decide,
-        room,
-        &std::collections::HashMap::new(),
-    );
-    asm_fused_of(bound, fused, raw_bodies)
 }
 
 /// `asm_fused` on a specialization already computed (`Lowered::spec`).
@@ -379,13 +301,9 @@ fn asm_fused_of(
     Ok((fused, bodies, flat_roots, reprs))
 }
 
-/// Lower a traced frame - ALL of its output shapes into ONE body.
-///
-/// A frame that kills an object ends in a different heap shape than one
-/// that does not, and both are real successors. Lowering them separately
-/// emits the whole frame up to the branch once per outcome. Lowering
-/// them together emits it once, because they are nodes in one graph and
-/// the emitter binds a node once.
+/// Lower a traced frame - ALL of its output shapes together, so the part
+/// of the frame before outcomes diverge is emitted once (one graph, each
+/// node bound once).
 pub fn lower_frame(
     bound: &Bound,
     room: Option<crate::transpile::graph::Room>,
@@ -408,8 +326,7 @@ pub fn lower_frame(
                         ty,
                         node: *node,
                         konst_av: None,
-                        // Boundary-widened-to-uniform cells (rem, timers): the
-                        // key emitter excludes them from the per-lane fold.
+                        // Excluded from the per-lane key fold.
                         widen_uniform: o
                             .widen
                             .iter()

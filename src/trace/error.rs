@@ -1,11 +1,10 @@
-//! ERROR, DERIVED from the operators (plans/graph-model.md section 4).
+//! ERROR, derived from the operators.
 //!
 //! Error is a property of a value: an operator whose input has error has
-//! error, and an operator may add error of its own as a function of its
-//! inputs. So an outcome's error is the error of what it stores and of the
-//! guard that says where it is live, and nothing carries it while the frame
-//! is traced. It is derived once, here, from the graph - so an obligation of
-//! a value nothing reads contributes nothing.
+//! error, and an operator may add an own error as a function of its inputs.
+//! An outcome's error is the error of what it stores and of its live guard;
+//! nothing carries error while the frame is traced, so an obligation of a
+//! value nothing reads contributes nothing.
 //!
 //! The operators with an own error are the ones the kernel computes only
 //! partially:
@@ -17,30 +16,22 @@
 //! | `Sel(c, t, f)`, `c` lane-undecidable | `not Known(c)` | the kernel picks an arm by `c`'s value bit |
 //! | `Add`, `Sub`, `Neg` of an interval, not bounded inside the 16.16 range by the static ranges | `not NoWrap(op)` | the kernel computes each endpoint in wrapping i32: an overflow wraps it apart from the other |
 //!
-//! A fork's VALIDITY (`SplitValid*`) owns nothing: whether this
-//! configuration's part is non-empty is defined on every lane. What an
-//! uncovered lane loses is the states in the parts nobody enumerated, and
-//! that is only wrong where something reads a part's VALUE - a row that does
-//! not depend on the fragment is the right row for the missing part too.
+//! A fork's VALIDITY (`SplitValid*`) owns nothing: it is defined on every
+//! lane, and a row that does not read a fragment's value is the right row
+//! for an unenumerated part too.
 //!
 //! AN OWN ERROR HOLDS WHERE ITS OPERATOR IS EVALUATED. The kernel computes
-//! every node on every lane, but the tracer built each one on a path, and
-//! off that path its operands are whatever the lane's other path left in
-//! them: a `move` fork's operand spans three floors on a lane that dashed
-//! the other way. So a source's error is `own and at`, `at` the OR of the
-//! path guards where the tracer evaluated it (`Symbolic::evaluated`). Error
-//! derived without it - strict through every `And`/`Or` - declined room
-//! (1,0) at f25 on the first try (2026-09-27); derived EXACTLY instead
-//! (Kleene-lazy `And`/`Or`/`Sel`, which is what the kernel computes) it was
-//! a copy of the guard and value DAG above every source, +23% frame time on
-//! room (1,0) f0-f44 for four sources a frame. Where the tracer never said
-//! where a source was evaluated, `at` is true: strict, so it declines rather
-//! than drops.
+//! every node on every lane, but off the tracer's path a node's operands are
+//! whatever the other path left (a `move` fork's operand spans three floors
+//! on a lane that dashed the other way). So a source's error is `own and
+//! at`, `at` the OR of the path guards it was evaluated under
+//! (`Symbolic::evaluated`); without a recorded site `at` is true, so it
+//! declines rather than drops. This is cheaper than an exact Kleene-lazy
+//! derivation, which would copy the guard and value DAG above every source.
 //!
-//! What is NOT here is anything an operator in the graph does not carry: an
-//! output widening's containment, the kernel's admissible inputs, an unrolled
-//! loop that had not finished. Those are stated by the tracer where they
-//! arise and OR-ed into the outcome's error beside what this derives
+//! Not here: what no graph operator carries (an output widening's
+//! containment, the kernel's admissible inputs, an unfinished unrolled
+//! loop). The tracer states those and ORs them into the outcome's error
 //! (`verify::trace_frame`).
 
 use crate::transpile::graph::{NodeId, Op};
@@ -58,9 +49,8 @@ pub fn of(d: &mut Symbolic, roots: &[NodeId]) -> NodeId {
 /// source THEY reach counts as well.
 ///
 /// One bottom-up pass for all outcomes: each node's set of sources below it,
-/// interned (most nodes share their operands' set, most of those the empty
-/// one). Walking each outcome's cone separately was outcomes x graph, and
-/// room (3,0)'s trace went from 25 s to 448 s with it (2026-09-27).
+/// interned (most nodes share their operands' set). A cone walk per outcome
+/// would be outcomes x graph.
 pub fn for_outcomes(d: &mut Symbolic, outcomes: &[Vec<NodeId>]) -> Vec<NodeId> {
     let sites: Vec<NodeId> = d.evaluated.values().copied().collect();
     let all: Vec<NodeId> = outcomes.iter().flatten().copied().chain(sites).collect();
@@ -150,16 +140,11 @@ pub fn for_outcomes(d: &mut Symbolic, outcomes: &[Vec<NodeId>]) -> Vec<NodeId> {
 fn own_error(d: &mut Symbolic, n: NodeId) -> Option<NodeId> {
     let node = d.graph.get(n);
     let (op, a) = (node.op.clone(), node.args.first().copied());
-    // "Can a lane's value here be a SET?" is asked with every other
-    // operator's own error assumed to hold - `abstract_beneath_lane_ops`,
-    // which takes an inner `Flr` as the singleton it is on pain of its own
-    // error - because where one does not hold, that operator is itself a
-    // source in the same cone and its error is counted. Plain `abstractness`
-    // made every floor of the player's position after a `move` a runtime
-    // check (`spikes_at`'s `flr((x + 3) / 8)` of `x + flr(fragment)`): four
-    // sources a frame the old premises never had, and on room (3,0)'s
-    // largest kernel 1M nodes of fused error, because no two of its 3.3M
-    // configurations then shared one (2026-09-27).
+    // "Can a lane's value here be a SET?" assumes every other operator's own
+    // error holds (`abstract_beneath_lane_ops` takes an inner `Flr` as a
+    // singleton): where one does not, that operator is itself a source in
+    // the same cone and is counted. Plain abstractness would make every
+    // floor of the player's position after a `move` a runtime check.
     let own = match op {
         Op::Flr if d.abstract_beneath_lane_ops(a?) && !within_one_integer(d, a?) => undecided(d, n),
         Op::Split(k) | Op::SplitInt(k) if d.abstract_beneath_lane_ops(a?) => {
@@ -167,18 +152,13 @@ fn own_error(d: &mut Symbolic, n: NodeId) -> Option<NodeId> {
             let covered = d.graph.fold(Op::SplitOk(ways), vec![a?]);
             d.graph.fold(Op::Not, vec![covered])
         }
-        // Only where a LANE can hold `c` both ways: a condition the kernel
-        // decides per lane - by instruction (`TileFlagAt`), or over a floor
-        // whose own error covers it - owns nothing here
-        // (`Symbolic::lane_undecidable`, the fork trigger: after
-        // `fork_undecided_selects` such a select survives only where the
-        // level keeps it, level -1).
+        // Only where a LANE can hold `c` both ways (`Symbolic::lane_undecidable`):
+        // a condition the kernel decides per lane owns nothing.
         Op::Sel if d.lane_undecidable(a?) => undecided(d, a?),
-        // Overflow is an ASSERTION (2026-10-03): an interval whose endpoint
-        // wrapped is not the result, so the lane declines - never wraps
-        // silently, never widens silently. Only where the result is an
-        // interval in the kernel (an exact operation wraps as PICO-8 does)
-        // and the static ranges do not already bound it inside the range.
+        // Overflow is an assertion: a wrapped interval endpoint is not the
+        // result, so the lane declines, never wraps or widens silently. Only
+        // for interval results (an exact operation wraps as PICO-8 does) the
+        // static ranges do not bound.
         Op::Add | Op::Sub | Op::Neg if d.is_interval(&n) && !bounded(d, n) => {
             let fits = d.graph.fold(Op::NoWrap, vec![n]);
             d.graph.fold(Op::Not, vec![fits])
@@ -189,10 +169,8 @@ fn own_error(d: &mut Symbolic, n: NodeId) -> Option<NodeId> {
 }
 
 /// Does every lane's value of `n` lie within one integer, so that its floor
-/// is exact by construction? A floor fork's fragment does (a grid cell is at
-/// most one integer wide - `move`'s `flr(__split_by_flr(rem))` is the case),
-/// a literal whose ends share a floor does, a select of such values does
-/// (its condition's own error is the select's), and so does a value that is
+/// is exact by construction? True for a floor fork's fragment, a literal
+/// whose ends share a floor, a select of such values, and a value that is
 /// one number on the lane. Anything else is checked per lane.
 fn within_one_integer(d: &Symbolic, n: NodeId) -> bool {
     let node = d.graph.get(n);
@@ -204,9 +182,8 @@ fn within_one_integer(d: &Symbolic, n: NodeId) -> bool {
     }
 }
 
-/// Do the static ranges (`Symbolic::range_of`, the bucket dispatch's
-/// runtime-guarded seeds) put every value of `n` inside the 16.16 range? In
-/// i64, so a bound past it is seen rather than wrapped.
+/// Do the static ranges (`Symbolic::range_of`) put every value of `n` inside
+/// the 16.16 range? In i64, so a bound past it is seen rather than wrapped.
 fn bounded(d: &mut Symbolic, n: NodeId) -> bool {
     d.range_of(n).is_some_and(|pieces| pieces.iter().all(|&(lo, hi)| lo >= i32::MIN as i64 && hi <= i32::MAX as i64))
 }

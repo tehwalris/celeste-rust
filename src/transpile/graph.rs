@@ -1,32 +1,10 @@
-//! The minimal graph IR (`plans/multi-output-fusion.md`, P1' stage 1).
-//!
-//! A member of a specialization set is a pure DAG:
-//!
-//! ```text
-//! Node   = (op, [operand ids])
-//! Leaf   = input cell | literal
-//! Member = { outputs: cell -> node, valid: node }
-//! ```
-//!
-//! Three things are DELIBERATELY absent, and their absence is the point:
-//!
-//! * **Lanes.** The graph describes ONE lane. `zn_splat`/`zb_splat`/
-//!   `zi_splat` are 35% of the emitted steady kernel's nodes and carry no
-//!   meaning - they only move a uniform value into vector-land. Uniformity
-//!   is recovered afterwards by a forward pass from the leaves. It is also
-//!   a source of spurious divergence between members: 20 of the 31
-//!   divergence roots measured between the steady and pinned-dying members
-//!   were splats and constants.
-//! * **Effects.** No `&mut dp`. Validity is an ordinary boolean node:
-//!   a guard is `valid := valid AND c`, and a select on an unknown
-//!   condition is `valid := valid AND known(c)`. The graph is therefore
-//!   purely functional, which is what makes optimizing over it tractable.
-//! * **Types beyond bool/number.** Exactness (is this number a singleton?)
-//!   and uniformity are DERIVED PROPERTIES of a value, propagated over the
-//!   finished graph, not distinct node types. So `zn_mul` and `zi_mul_pos`
-//!   are one op, as are `zsel_n`/`zsel_b`/`zsel_i` and `if c {a} else {b}`.
+//! The graph IR: one traced frame as a pure, hash-consed DAG of
+//! `(op, [operand ids])` over input cells and literals. It describes ONE
+//! lane (uniformity is derived later), has no effects (a body's `live` and
+//! `error` are boolean nodes), and no types beyond bool/number: exactness is
+//! a property of the value, so one op covers every width.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use std::sync::Arc;
 
@@ -37,10 +15,8 @@ use celeste_core::collision_cache::CollisionCache;
 
 use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 
-/// An abstract value for ONE lane.
-///
-/// Exactness and knownness live here, in the value, not in the type: an
-/// exact number is a singleton interval, and a known boolean is `Some`.
+/// An abstract value for ONE lane: an exact number is a singleton interval,
+/// a known boolean is `Some`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Val {
     Num(Pico8NumInterval),
@@ -75,44 +51,33 @@ impl Val {
 
 pub type NodeId = u32;
 
-/// In a `splits` vector (`Graph::specialize_subset_into`): leave this fork
-/// standing.
+/// In a `splits` vector: leave this fork standing.
 pub const OPEN: u8 = u8::MAX;
 
-/// In a `splits` vector, OR-ed into a fragment index: that fragment, with the
-/// fork's validity TRUE - a DEAD fork (`lower::specialize_frame`), whose
-/// fragments all give the outcome the same row, taken once for all of them:
-/// the OR of its fragments' validities is the lane covered.
+/// OR-ed into a `splits` fragment index: that fragment with validity TRUE, for
+/// a DEAD fork whose fragments all give the same row (the OR of their
+/// validities is the lane covered).
 pub const ANY_VALID: u8 = 0x80;
 
-/// The map, for the evaluator. `CollisionCache` already carries which
-/// room it is for, so this is just the pair the cart queries need.
+/// The map, for the evaluator (`CollisionCache` knows its room).
 #[derive(Clone)]
 pub struct Room {
     pub cart: Arc<CartData>,
     pub cache: Arc<CollisionCache>,
 }
 
-/// The op vocabulary. Semantic, not representational: one variant per
-/// MEANING, however many emitted forms that meaning currently has.
+/// The op vocabulary: one variant per MEANING, not per emitted form.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Op {
     // ---- leaves ----
-    /// A literal number, as raw 16.16 bit patterns for its low and high
-    /// bound. An EXACT literal is the singleton `Const(x, x)` - exactness
-    /// is a property of the value, not a separate kind of node, so the
-    /// widened literals the emitter produces (e.g. sin of a non-exact
-    /// input, which it emits as the constant [-1, 1]) need no special
-    /// case. Raw bit patterns rather than `Pico8Num` so `Op` is `Hash`
-    /// without imposing anything on the numeric type.
+    /// A literal: raw 16.16 low and high bounds (raw so `Op` is `Hash`); an
+    /// exact literal is `Const(x, x)`.
     Const(i32, i32),
     ConstBool(bool),
-    /// An input cell. NOT split into uniform/per-lane: that is a derived
-    /// property, computed after the graph exists.
+    /// An input cell.
     Cell(u32),
-    /// `Split(d)` over one operand: that value RESTRICTED to the outcome
-    /// of split choice d - a real operation on the operand, eliminated by
-    /// specialization (`Graph::specialize_subset_into`).
+    /// `Split(d)`: the operand RESTRICTED to fork d's outcome, eliminated by
+    /// specialization.
     Split(u8),
 
     // ---- number -> number ----
@@ -127,33 +92,14 @@ pub enum Op {
     Sin,
     Min,
     Max,
-    /// `Span(lo, hi)` - the interval running from `lo`'s low bound to
-    /// `hi`'s high bound.
-    ///
-    /// The graph could always REPRESENT an interval (every number node
-    /// is one), but the only way to BUILD one was the literal
-    /// `Const(lo, hi)`. That is enough for a widening whose bounds are
-    /// known at trace time - `player.rem` := [-0.5, 0.5) - and not
-    /// enough for one whose bounds are computed: a fruit's bob band is
-    /// `start +- 2.5`, and `start` is an input column, so the band is a
-    /// different interval in every lane. Without this op the tracer
-    /// refused room (2,0) at its first shape.
-    ///
-    /// Sound because it is exactly the hull: whatever concrete values
-    /// the operands take, the result contains the band around them.
-    /// That the widened field was INSIDE the band is the widening's own
-    /// error, built by the caller from ordinary comparisons
-    /// (`widen::SlotErrors`), so nothing here has to decide anything at
-    /// trace time.
+    /// `Span(lo, hi)`: from `lo`'s low to `hi`'s high bound, for a widening
+    /// with per-lane bounds (a fruit's bob band). Exactly the hull; containment
+    /// is the widening's own error.
     Span,
-    /// THE UNKNOWN NUMBER (plans/fly-fruit.md): a number about which nothing
-    /// is known - the fly fruit's `step` and `y` at a fruit-unknown level. NOT
-    /// the full-range interval: interval arithmetic at the 16.16 extremes
-    /// raises, and this stays unknown under every operation instead
-    /// (`Symbolic::arith`, `fun1`, `fun2`), and a comparison with it is an
-    /// undecided atom (`UnknownBool`). It never reaches a kernel: its only
-    /// stored form is the uniform `AV::UNum` (`emit::bind`), and `bind`
-    /// refuses a root that reads it.
+    /// THE UNKNOWN NUMBER. Not the full-range interval (interval arithmetic
+    /// at the extremes raises): it stays unknown under every operation and a
+    /// comparison with it is an `UnknownBool`. It never reaches a kernel: it
+    /// is stored only as `AV::UNum`, and `bind` refuses a root reading it.
     UnknownNum,
 
     // ---- number -> bool ----
@@ -167,85 +113,41 @@ pub enum Op {
     Not,
     /// Tri-state AND: a decided `false` wins over an unknown.
     And,
-    /// Tri-state OR: a decided `true` wins over an unknown.
-    ///
-    /// This used to be deliberately absent, on the grounds that nothing
-    /// constructed one. The TRACER constructs them: `a or b` is a Lua
-    /// operator, and expressing it as `not (not a and not b)` costs three
-    /// nodes instead of one and - worse - hides the symmetry, so `a or b`
-    /// and `b or a` interned as different subgraphs. Measured on outcome 2
-    /// of a traced frame, `Not` was the single most common op in the
-    /// emitted body.
+    /// Tri-state OR: a decided `true` wins (its own node so `a or b` and
+    /// `b or a` intern alike).
     Or,
-    /// An UNDECIDED boolean, the same in every lane (plans/fly-fruit.md): a
-    /// comparison with an unknown number, or a comparison of literal
-    /// intervals nothing decides. The index separates the sites, so boolean
-    /// simplification never treats two independent unknowns as one atom
-    /// (`c and not c` of two different atoms is not false).
+    /// An UNDECIDED boolean, the same in every lane. The index separates
+    /// sites, so simplification never treats two independent unknowns as one.
     UnknownBool(u32),
 
-    /// `Sel(cond, then, else)` - the former `if`, in every width.
+    /// `Sel(cond, then, else)`, in every width.
     Sel,
 
-    /// `Known(v)`: is this value DETERMINED - a decided boolean, or a
-    /// number whose interval is a singleton? One op for both domains,
-    /// because it asks the same question of both: is this abstract set a
-    /// single element? It is what lets validity be an ordinary value
-    /// instead of a side channel.
+    /// `Known(v)`: is the value DETERMINED? Survives only in derived errors.
     Known,
-    /// `SplitValid(d)` over the same operand as `Split(d)`: which lanes
-    /// fall in the chosen outcome - the outcomes of a split PARTITION the
-    /// lanes, so the primitive returns a (value, validity) pair and it is
-    /// two nodes. (A fork every lane takes both ways, `Symbolic::both_values`,
-    /// drops it.)
+    /// `SplitValid(d)`: which lanes fall in the chosen fragment (fragments
+    /// PARTITION the lanes). Dropped for forks every lane takes both ways.
     SplitValid(u8),
-    /// `Split(d)` after specialization: fragment `c` of an interval,
-    /// `c` being a CONCRETE fork configuration rather than a runtime
-    /// loop variable. Fragment `c` is the interval's `c`-th grid cell
-    /// counted from the cell its low end lies in, clipped to the
-    /// interval: `Frag` narrows to it, `FragOk` says whether the
-    /// interval reaches it - together they are exactly
-    /// `zi_fork_flr(x, c)`. How many fragments a fork HAS is the fork's
-    /// arity (`Graph::fork_ways`): 2 for every fork but the player's
-    /// `move` under a range wider than one grid cell (`Domain::flr_ways`).
-    ///
-    /// Ordinary unary ops, which is the whole point: they intern and
-    /// fold like anything else, so the configurations SHARE every node
-    /// they agree on instead of the emitter running the tail of the
-    /// frame once per configuration. See `specialize_subset_into`.
+    /// `Split(d)` specialized: fragment `c` is the `c`-th grid cell from the
+    /// one the low end lies in, clipped to the interval. `Frag` narrows to it,
+    /// `FragOk` says whether the interval reaches it (together `zi_fork_flr`).
+    /// Ordinary unary ops, so configurations SHARE every node they agree on.
     Frag(u8),
     FragOk(u8),
-    /// A fork like `Split(d)` over an interval of WHOLE numbers whose
-    /// fragments are the numbers themselves, EXACT: `SplitInt(d)` resolves
-    /// to `IntFrag(c)`, the low end of fragment `c` as a plain number. Validity is `SplitValid(d)` /
-    /// `FragOk(c)` and the premise `SplitOk(n)`, shared with `Split`, on
-    /// the same operand, on the integer grid. A fork over a literal
-    /// (`Symbolic::both_values`) forks one of two integers instead.
+    /// A fork over WHOLE numbers whose fragments are the numbers, EXACT:
+    /// resolves to `IntFrag(c)`, fragment `c`'s low end. Validity and premise
+    /// are shared with `Split`.
     SplitInt(u8),
     IntFrag(u8),
-    /// `SplitOk(n)` over the same operand: does this lane's interval span
-    /// at most `n` floors, `n` being the fork's arity? Below that the
-    /// fragments partition the lane; above it there is no fragment to
-    /// put the rest in, so the lane deopts. OUTCOME-INDEPENDENT (indexed
-    /// by the arity, not the outcome), so every configuration of one
-    /// fork shares the one node. It exists so the validity chain
-    /// accounts for every lane `zi_fork_flr` gives up on.
+    /// `SplitOk(n)`: does this lane's interval span at most `n` floors (the
+    /// arity)? Otherwise the lane declines. Shared by every configuration.
     SplitOk(u8),
-    /// `NoWrap(x)`, `x` an interval `+`, `-` or negation: did no endpoint of
-    /// `x` OVERFLOW the 16.16 range on this lane? The kernel computes each
-    /// endpoint in wrapping i32 arithmetic, so where one overflowed the
-    /// lane's interval is not the result (its ends wrapped apart, or the
-    /// interval inverted) - and that is the operation's OWN ERROR
-    /// (`trace::error`): the lane declines, loudly, rather than carry an
-    /// interval that says something false. (Until 2026-10-03 the kernels
-    /// wrapped silently: a timers level's countdown, the whole range,
-    /// minus 1 decided `<= 0` as "no" and a shaking floor never fell.) Of
-    /// anything else - an exact operation, which wraps as PICO-8 does, or a
-    /// node a rewrite made of `x` - it is true.
+    /// `NoWrap(x)`, `x` an interval `+`, `-` or negation: did no endpoint
+    /// OVERFLOW on this lane? The kernel wraps in i32, so an overflow is the
+    /// operation's OWN ERROR and the lane declines. True of anything else.
     NoWrap,
-    /// An interval's endpoints as plain numbers (`Lo(v)` = its low end,
-    /// `Hi(v)` its high end; of a number, the number). What lets a fork
-    /// at a TABLE of cuts be ordinary arithmetic after specialization.
+    /// An interval's endpoints as plain numbers (of a number, the number), so
+    /// a fork at a TABLE of cuts is ordinary arithmetic once specialized.
     Lo,
     Hi,
     // ---- cart lookups ----
@@ -259,26 +161,16 @@ pub struct Node {
     pub args: Vec<NodeId>,
 }
 
-/// A hash-consed arena. Interning is the whole sharing mechanism: two
-/// nodes are the same node iff they are the same op over the same operand
-/// ids, and operand ids are themselves interned, so identity composes
-/// bottom-up.
+/// A hash-consed arena: same op over same operand ids is the same node.
 #[derive(Default, Clone)]
 pub struct Graph {
     nodes: Vec<Node>,
-    /// Hashed with rustc-hash 2: with 1.1's Fx, lookups here were 86% of a
-    /// room (6,0) trace, nearly all of it probing (2026-09-27). Never
-    /// iterated, so the hasher changes no order.
+    /// rustc-hash 2 (1.1's Fx made probing dominate). Never iterated.
     intern: rustc_hash2::FxHashMap<Node, NodeId>,
-    /// Per fork `d`, how many fragments it has (absent = 2). Set by the
-    /// tracer's `fork_flr`; read by the specialization's enumeration.
+    /// Per fork `d`, its fragment count (absent = 2).
     fork_ways: Vec<u8>,
-    /// Each input cell's KIND, recorded where the cell is made
-    /// (`iface::symbolize`) and carried through every rebuild: what the
-    /// interval evaluator gives a cell as its weakest value (a number the
-    /// full range, a boolean unknown). Guessing it from the cell's uses
-    /// missed a boolean read only as a select's arm and seeded it as a
-    /// number (2026-09-15).
+    /// Each input cell's KIND, recorded where made and carried through every
+    /// rebuild: the evaluator's weakest value for it. Not guessed from uses.
     cell_kinds: rustc_hash::FxHashMap<u32, CellKind>,
 }
 
@@ -290,8 +182,7 @@ pub enum CellKind {
     Bool,
 }
 
-/// The most fragments one fork can have: a configuration names each
-/// fork's fragment with a byte.
+/// The most fragments one fork can have (a byte names a fragment).
 pub const MAX_WAYS: usize = 255;
 
 /// One fork-grid step (the integers) in raw 16.16 units.
@@ -302,8 +193,7 @@ impl Graph {
         Self::default()
     }
 
-    /// An empty graph on the same fork grid: what every pass that builds
-    /// an output graph from this one starts from.
+    /// An empty graph on the same fork grid and cell kinds.
     pub fn like(&self) -> Self {
         Graph {
             fork_ways: self.fork_ways.clone(),
@@ -316,8 +206,7 @@ impl Graph {
         self.cell_kinds.insert(cell, kind);
     }
 
-    /// The recorded kind of `cell`; a cell never declared is a number (the
-    /// per-op tests' graphs, whose reprs come from the caller).
+    /// The recorded kind of `cell`; an undeclared cell is a number.
     pub fn cell_kind(&self, cell: u32) -> CellKind {
         self.cell_kinds.get(&cell).copied().unwrap_or(CellKind::Num)
     }
@@ -327,8 +216,7 @@ impl Graph {
         self.cell_kinds.iter().map(|(c, k)| (*c, *k))
     }
 
-    /// Forget every fork's arity: a new frame's forks start at 0 in an arena
-    /// that outlives the frame.
+    /// Forget every fork's arity: a new frame's forks restart at 0.
     pub fn reset_forks(&mut self) {
         self.fork_ways.clear();
     }
@@ -338,9 +226,8 @@ impl Graph {
         self.fork_ways.get(d as usize).copied().unwrap_or(2)
     }
 
-    /// Give fork `d` (at least) `ways` fragments. Monotone: a value forked
-    /// twice (`fork_memo`) keeps the wider request, since each site's own
-    /// `SplitOk` premise is what bounds the lanes IT admits.
+    /// Give fork `d` at least `ways` fragments. Monotone: each site's own
+    /// `SplitOk` bounds the lanes it admits.
     pub fn set_fork_ways(&mut self, d: u8, ways: u8) {
         debug_assert!(ways >= 1, "fork arity {ways}");
         if self.fork_ways.len() <= d as usize {
@@ -349,9 +236,7 @@ impl Graph {
         self.fork_ways[d as usize] = self.fork_ways[d as usize].max(ways);
     }
 
-    /// The fork grid - `Split`/`Frag`/`FragOk`/`SplitOk` cut an interval
-    /// at the integers - as one step in raw 16.16 units and the mask that
-    /// floors to it.
+    /// The fork grid: one step in raw 16.16 and the mask flooring to it.
     fn grid(&self) -> (i32, i32) {
         (GRID_STEP, !(GRID_STEP - 1))
     }
@@ -383,43 +268,17 @@ impl Graph {
         self.nodes.is_empty()
     }
 
-    /// Is `n` a fork over a LITERAL - one every lane takes both ways
-    /// (`Symbolic::both_values`: the buttons, the held trails, the escaped
-    /// atoms), so that every configuration of it applies to every lane?
+    /// Is `n` a fork over a LITERAL, one every lane takes both ways?
     pub fn is_literal_fork(&self, n: NodeId) -> bool {
         let node = self.get(n);
         matches!(node.op, Op::Split(_) | Op::SplitInt(_)) && matches!(self.get(node.args[0]).op, Op::Const(lo, hi) if lo != hi)
     }
 
-    /// Rebuild this graph into `out` with the forks RESOLVED per `splits`,
-    /// over a SUBSET of the nodes, folding as it goes. Returns the mapping
-    /// old -> new.
-    ///
-    /// This is the "duplicate, then fuse again" step: `out` is SHARED across
-    /// configurations and hash-consed, so two configurations that compute
-    /// the same thing land on the SAME node ids, and comparing their output
-    /// tuples decides whether they are the same successor state for every
-    /// lane. E.g. `input` is `Sel(right, 1, Sel(left, -1, 0))`, so with
-    /// right pressed the whole thing folds to 1 whatever left is: those two
-    /// configurations of the buttons' forks collapse.
-    ///
-    /// A resolved split becomes ORDINARY ARITHMETIC (`Frag` / `FragOk` /
-    /// `IntFrag`): it interns and folds, so
-    /// every node the configurations agree on is ONE node, and a fork over a
-    /// literal (`Symbolic::both_values`: the buttons) folds to a constant.
-    /// The cost is the nodes that genuinely differ: those are emitted once
-    /// per configuration.
-    ///
-    /// `splits` is the fragment per fork; an entry of `OPEN` leaves that fork
-    /// standing (what `lower::specialize_frame` groups configurations by).
-    ///
-    /// `need[i]` false means node `i`'s image is never read, so it is
-    /// not built: an outcome reaches a fraction of the graph, and mapping
-    /// the whole arena per configuration is most of the work and none of
-    /// the answer. Ids only ever refer downward (`add` appends), so a needed
-    /// node's arguments are needed too and one forward pass is enough.
-    /// Entries for unbuilt nodes are `UNBUILT`, which is not a valid id -
-    /// reading one is a bug, and it should look like one.
+    /// Rebuild into `out` with forks RESOLVED per `splits` (`OPEN` leaves one
+    /// standing), over a SUBSET (`need[i]` false maps `i` to `UNBUILT`),
+    /// folding as it goes; returns old -> new. `out` is shared and
+    /// hash-consed, so configurations computing the same thing share node ids.
+    /// Ids only refer downward, so one forward pass suffices.
     pub fn specialize_subset_into(&self, splits: &[u8], need: Option<&[bool]>, out: &mut Graph) -> Vec<NodeId> {
         out.fork_ways = self.fork_ways.clone();
         const UNBUILT: NodeId = NodeId::MAX;
@@ -449,28 +308,17 @@ impl Graph {
         map
     }
 
-    /// Is operand order meaningless for this op? Structural interning is
-    /// the ONLY sharing mechanism, so `a op b` and `b op a` are two nodes
-    /// unless something puts them in a canonical order first.
-    ///
-    /// `Mul` is absent on purpose even though multiplication commutes:
-    /// `arith` below is only monotone with the EXACT side second, so
-    /// swapping can turn a form it evaluates into one it refuses. It gets
-    /// its own one-directional rule instead.
+    /// Is operand order meaningless? Commuting ops get a canonical order since
+    /// interning is the only sharing. Not `Mul`: `arith` is monotone only with
+    /// the EXACT side second.
     fn commutes(op: &Op) -> bool {
         matches!(op, Op::Add | Op::Min | Op::Max | Op::Eq | Op::And | Op::Or)
     }
 
-    /// Add `op(args)`, normalizing and folding.
-    ///
-    /// Every rule here is EXACT with respect to `eval`: the node this
-    /// returns evaluates to the same abstract value as the unfolded node
-    /// would have, for every assignment of the leaves. Not "sound" -
-    /// exact. A rule that merely refined the result would still be
-    /// correct in isolation but would change which lanes are in error,
-    /// and `folding_is_exact` enumerates the tri-state assignments to
-    /// keep that honest. Rules that WOULD refine (`x and not x` is false
-    /// concretely but unknown in Kleene) are therefore left out.
+    /// Add `op(args)`, normalizing and folding. Every rule is EXACT w.r.t.
+    /// `eval`, not merely sound: a refining rule (`x and not x` -> false)
+    /// would change which lanes are in error
+    /// (`folding_is_exact_not_merely_sound`).
     pub fn fold(&mut self, op: Op, mut args: Vec<NodeId>) -> NodeId {
         if args.len() == 2 {
             if Self::commutes(&op) {
@@ -491,21 +339,10 @@ impl Graph {
             })
         };
         match op {
-            // Fragment 0 of any interval is non-empty, always: it is the
-            // cell the low end lies in, whatever the span (`zi_span_ok`
-            // is what takes an over-wide lane off the kernel). So
-            // `FragOk(0)` is a constant, and folding it is what makes
-            // configuration 0 as cheap as no fork at all.
-            //
-            // EXACT, not a refinement: `eval`'s `FragOk(0)` arm returns
-            // `Some(true)` for every operand, and the two are checked
-            // against each other by `folding_is_exact`.
+            // Fragment 0 is never empty, so `FragOk(0)` is true (as in `eval`),
+            // making configuration 0 as cheap as no fork.
             Op::FragOk(0) => return self.leaf(Op::ConstBool(true)),
-            // The span premise over a LITERAL interval is decided: the same
-            // test `zi_span_ok` makes per lane (the high end's grid cell
-            // within `n - 1` steps of the low end's), made once. A fork of a
-            // constant (`Symbolic::both_values`' two answers) derives its
-            // coverage through here, and it always fits.
+            // The span premise over a LITERAL is decided once (`zi_span_ok`).
             Op::SplitOk(n) => {
                 if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
                     // In the kernel's own i32 arithmetic, wrap included.
@@ -515,12 +352,8 @@ impl Graph {
                     return self.leaf(Op::ConstBool(fh <= top));
                 }
             }
-            // `IntFrag(c)` of a literal interval is a constant, by `eval`'s
-            // definition: the grid floor of the low end plus `c` steps, at
-            // least the low end. EXACT. A fork every lane takes both ways
-            // (`Symbolic::both_values`: the buttons, the held trails) forks
-            // a literal, and folding it is what makes a body's buttons, and
-            // so its `jump` / `dash`, constants.
+            // `IntFrag(c)` of a literal is a constant (as in `eval`): buttons
+            // become constants.
             Op::IntFrag(c) if matches!(self.nodes[args[0] as usize].op, Op::Const(..)) => {
                 let Op::Const(lo, _) = self.nodes[args[0] as usize].op else { unreachable!("guarded above") };
                 let (step, mask) = self.grid();
@@ -528,19 +361,13 @@ impl Graph {
                 let v = (lo as i64).max(base).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                 return self.leaf(Op::Const(v, v));
             }
-            // The no-wrap premise of anything but an interval `+`, `-` or
-            // negation holds (`eval`'s definition): a rebuild that folded
-            // the operation to a constant evaluated it without a wrap.
+            // No-wrap of anything but an interval `+`/`-`/negation holds (as in
+            // `eval`).
             Op::NoWrap if !matches!(self.nodes[args[0] as usize].op, Op::Add | Op::Sub | Op::Neg) => {
                 return self.leaf(Op::ConstBool(true));
             }
-            // Arithmetic on literal POINTS is a constant, in PICO-8's
-            // arithmetic (the concrete domain's). The tracer folds these
-            // before they reach the graph; a rebuild that substitutes the
-            // buttons or a condition leaves `Mul(Const, Const)` and
-            // `Eq(Mul(..), Const)` behind, and a select on such a
-            // comparison must fold or a later split takes both arms
-            // (2026-09-15: 48 dash-constant sets for 10).
+            // Arithmetic on literal POINTS folds (PICO-8 arithmetic), so a
+            // select on it folds instead of being split both ways.
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max => {
                 let point = |g: &Graph, i: usize| match g.nodes[args[i] as usize].op {
                     Op::Const(lo, hi) if lo == hi => Some(Pico8Num::from_raw(lo)),
@@ -593,46 +420,28 @@ impl Graph {
                     return self.leaf(Op::ConstBool(r));
                 }
             }
-            // A span of two literals IS a literal interval, and folding
-            // it back to one is what keeps a `Span` built over constant
-            // bounds identical to the `Const` the caller would have
-            // written by hand. EXACT: `eval`'s arm takes operand 0's low
-            // and operand 1's high, which is precisely these two fields.
+            // A span of two literals IS a literal interval (as in `eval`).
             Op::Span => {
                 let lit = |g: &Graph, i: usize| match g.nodes[args[i] as usize].op {
                     Op::Const(lo, hi) => Some((lo, hi)),
                     _ => None,
                 };
                 if let (Some((lo, _)), Some((_, hi))) = (lit(self, 0), lit(self, 1)) {
-                    // Tolerant of `lo > hi`: a table-fork fragment the
-                    // lane never reaches (its validity is false, its
-                    // value unread) - a literal interval is never inverted.
+                    // Tolerant of `lo > hi` (an unreached table-fork fragment).
                     return self.leaf(Op::Const(lo.min(hi), lo.max(hi)));
                 }
             }
-            // The one that matters: a decided condition picks its arm, so
-            // the other arm (and whatever only it used) disappears.
+            // A decided condition picks its arm.
             Op::Sel => {
                 if let Some(c) = cbool(self, 0) {
                     return if c { args[1] } else { args[2] };
                 }
-                // Both arms the same value: the condition cannot matter,
-                // decided or not. This is the fold that makes MERGING AT A
-                // JOIN affordable - a per-cell merge of two branch outcomes
-                // emits a select for every cell in the heap, and the
-                // overwhelming majority of cells were not touched by either
-                // arm.
+                // Same arms: the condition cannot matter (keeps joins cheap).
                 if args[1] == args[2] {
                     return args[1];
                 }
-                // A select between BOOLEANS with a constant arm is not a
-                // select at all, it is boolean algebra - and this is the
-                // shape the tracer produces at EVERY merge of a boolean
-                // whose branch condition it could not decide, which is
-                // most of the guard algebra in a frame. Each case is
-                // exact in Kleene: with an undecided condition the select
-                // joins its arms, and the join of `true` with x is
-                // precisely `true or x`.
+                // A boolean select with a constant arm is boolean algebra,
+                // exact in Kleene (`sel(c, true, x)` = `c or x`).
                 let (c, t, f) = (args[0], args[1], args[2]);
                 match (cbool(self, 1), cbool(self, 2)) {
                     (Some(true), Some(false)) => return c,
@@ -659,12 +468,8 @@ impl Graph {
                 if inner.op == Op::Not {
                     return inner.args[0];
                 }
-                // A negated comparison is the opposite comparison. Exact
-                // on intervals as well as on numbers, because both are
-                // decided by the same four corners. This is worth more
-                // than the node it saves: it makes `x < y` and
-                // `not (x >= y)` the SAME node, which structural
-                // interning could never do.
+                // A negated comparison is the opposite comparison (exact on
+                // intervals): `x < y` and `not (x >= y)` are one node.
                 let flip = match inner.op {
                     Op::Lt => Some(Op::Ge),
                     Op::Le => Some(Op::Gt),
@@ -680,8 +485,7 @@ impl Graph {
                 if cbool(self, 0).is_some() {
                     return self.leaf(Op::ConstBool(true));
                 }
-                // Negation preserves decidedness, so asking of `not x` is
-                // asking of `x`.
+                // Negation preserves decidedness.
                 let inner = self.nodes[args[0] as usize].clone();
                 if inner.op == Op::Not {
                     return self.fold(Op::Known, inner.args);
@@ -692,8 +496,7 @@ impl Graph {
                     return args[0];
                 }
                 let (x, y) = (cbool(self, 0), cbool(self, 1));
-                // `false AND anything` is false even when the other side
-                // is symbolic.
+                // `false AND anything` is false.
                 if x == Some(false) || y == Some(false) {
                     return self.leaf(Op::ConstBool(false));
                 }
@@ -709,9 +512,7 @@ impl Graph {
                     return args[0];
                 }
                 let (x, y) = (cbool(self, 0), cbool(self, 1));
-                // `true OR anything` is true even when the other side is
-                // symbolic - the mirror of the AND rule above, and the
-                // reason an OR is worth a node of its own.
+                // `true OR anything` is true.
                 if x == Some(true) || y == Some(true) {
                     return self.leaf(Op::ConstBool(true));
                 }
@@ -721,12 +522,8 @@ impl Graph {
                     (None, Some(_)) => return args[0],
                     _ => {}
                 }
-                // `(g and c) or (g and not c)` is `g`, exactly, for every
-                // concrete `c`. A split's two guards merge into this, and
-                // left unfolded the merged guard - an outcome's `live` - reads
-                // the split's condition, so every fork it split on enters the
-                // configuration product (room (3,0), 2026-09-18: each fall
-                // floor's forked `collideable` in `collide`'s `and`, 2^12).
+                // `(g and c) or (g and not c)` is `g`, exactly; otherwise `live`
+                // would pull every split fork into the configuration product.
                 let and_args = |g: &Graph, n: NodeId| -> Option<[NodeId; 2]> {
                     let node = &g.nodes[n as usize];
                     (node.op == Op::And).then(|| [node.args[0], node.args[1]])
@@ -746,8 +543,7 @@ impl Graph {
         self.add(op, args)
     }
 
-    /// Is `y` the negation of `x`: `Not(x)`, or the opposite comparison over
-    /// the same operands (`fold(Not)` turns `not (a < b)` into `a >= b`)?
+    /// Is `y` the negation of `x` (`Not(x)` or the opposite comparison)?
     fn complements(&self, x: NodeId, y: NodeId) -> bool {
         let (nx, ny) = (&self.nodes[x as usize], &self.nodes[y as usize]);
         if (nx.op == Op::Not && nx.args[0] == y) || (ny.op == Op::Not && ny.args[0] == x) {
@@ -760,54 +556,30 @@ impl Graph {
         opposite && nx.args == ny.args
     }
 
-    /// Evaluate `roots` given the input cells, in one pass over the arena.
-    /// Nodes are appended after their operands, so a forward sweep is a
-    /// valid evaluation order.
+    /// Evaluate every node from the input cells in one forward pass. Exact or
+    /// an error.
     pub fn eval(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
         self.eval_inner(cells, false, true, None)
     }
 
-    /// The same evaluator, but a node it cannot model becomes TOP for its
-    /// kind instead of an error.
-    ///
-    /// `eval` is exact-or-nothing, which is right for a check and useless
-    /// for a transformation: one `TileFlagAt` anywhere makes the whole
-    /// graph unevaluable, and every real traced graph has hundreds. Top
-    /// is the sound answer - "this node could be anything" - so every
-    /// value derived from one stays sound, and the nodes that do NOT
-    /// depend on it are still decided.
-    ///
-    /// Deliberately the same match arm-for-arm rather than a second
-    /// evaluator: two implementations of `Abs` over intervals is exactly
-    /// the kind of divergence that is impossible to notice.
+    /// As `eval`, but an unmodelled node is TOP for its kind (sound) instead
+    /// of an error. The same match, so the two cannot diverge.
     pub fn eval_lenient(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
         self.eval_inner(cells, true, false, None)
     }
 
-    /// `eval_lenient` WITH the map, so `TileFlagAt` is decided instead of
-    /// becoming top.
-    ///
-    /// The map is a constant. A collision test is only unknown because
-    /// the evaluator was never given the room, not because the answer
-    /// depends on anything it cannot see - and `TileFlagAt` is one of the
-    /// two ops through which TOP enters a traced graph at all.
+    /// `eval_lenient` with the map, deciding `TileFlagAt`.
     pub fn eval_lenient_in(&self, cells: &HashMap<u32, Val>, room: &Room) -> Result<Vec<Val>> {
         self.eval_inner(cells, true, false, Some(room))
     }
 
-    /// Forks RESOLVED via `Frag` (narrowing), but a node the evaluator
-    /// cannot model (`Mget`, and `TileFlagAt` without a room) becomes TOP
-    /// instead of an error. Lets the narrowing on the modellable part be
-    /// checked even when the graph also contains unmodellable ops.
+    /// Forks resolved via `Frag`; an unmodelled node (`Mget`, roomless
+    /// `TileFlagAt`) is TOP.
     pub fn eval_narrow_top_in(&self, cells: &HashMap<u32, Val>, room: &Room) -> Result<Vec<Val>> {
         self.eval_inner(cells, false, false, Some(room))
     }
 
-    /// `eval_narrow_top_in` WITHOUT a room: forks resolved via `Frag`
-    /// (narrowing), any node the evaluator cannot model (`SplitOk`,
-    /// `Mget`, `TileFlagAt`) becomes TOP. For evaluating a bare
-    /// arithmetic sub-DAG - the rem-bucket gate builds one with no cart
-    /// lookups, so no room is needed.
+    /// `eval_narrow_top_in` without a room, for bare arithmetic sub-DAGs.
     pub fn eval_narrow_top(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
         self.eval_inner(cells, false, false, None)
     }
@@ -840,18 +612,14 @@ impl Graph {
                 Op::ConstBool(b) => Val::Bool(Some(*b)),
                 // Nothing is known, in every lane.
                 Op::UnknownBool(_) => Val::Bool(None),
-                // No interval holds an unknown number without raising at the
-                // extremes: unmodelled (TOP under the lenient evaluators).
+                // No interval holds it: unmodelled (TOP when lenient).
                 Op::UnknownNum => bail!("node {}: an unknown number has no interval", i),
-                // The hull, and the definition `fold`'s two-constant
-                // rule below is checked against. Tolerant of `lo > hi`.
+                // The hull (`fold`'s two-constant rule agrees). Tolerant of `lo > hi`.
                 Op::Span => {
                     let (lo, hi) = (a!(0).as_num("Span")?.low, a!(1).as_num("Span")?.high);
                     Val::Num(Pico8NumInterval::new(lo.min(hi), lo.max(hi)))
                 }
-                // A split RESTRICTS its operand, so under `lenient` the
-                // operand's own range still contains the result - which
-                // is strictly better than top and costs nothing.
+                // A split RESTRICTS its operand: lenient, the operand covers it.
                 Op::Split(d) if lenient => {
                     let _ = d;
                     a!(0)
@@ -860,14 +628,9 @@ impl Graph {
                 Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) => {
                     bail!("node {}: split {} has no value outside an outcome", i, d)
                 }
-                // ONE lane's low (high) end, over the lanes. A value's `Val`
-                // is the hull of every lane's interval, so a lane's end is
-                // anywhere in it - except a span's, which IS its operand
-                // (anywhere in that operand's hull), and a literal
-                // interval's, the same in every lane. Returning the hull's
-                // end as a point let the interval fold replace `Lo(v)` by a
-                // constant and decide premises on it: every body of the
-                // relative table fork's kernels declined (2026-09-15).
+                // ONE lane's end, over the lanes: anywhere in the hull (except a
+                // span's or a literal's). Never the hull's end as a point, or
+                // the fold decides premises on it.
                 Op::Lo | Op::Hi => {
                     let low = matches!(node.op, Op::Lo);
                     let arg = &self.nodes[node.args[0] as usize];
@@ -880,15 +643,13 @@ impl Graph {
                         _ => Val::Num(a!(0).as_num("Lo/Hi")?),
                     }
                 }
-                // The low end of fragment `c`, exact; under `lenient` the
-                // hull of that over the lanes: `[fl + c, fh + c]` cells.
+                // Fragment `c`'s low end, exact (lenient: its hull over lanes).
                 Op::IntFrag(c) => {
                     let iv = a!(0).as_num("IntFrag")?;
                     let (step, mask) = self.grid();
                     let gflr = |p: Pico8Num| p.as_raw_u32() as i32 as i64 & mask as i64;
                     let (fl, fh) = (gflr(iv.low), gflr(iv.high));
-                    // Clamped to the 16.16 range: the full-range hull's
-                    // high end plus a step would wrap.
+                    // Clamped: the full-range hull's high end plus a step would wrap.
                     let clamp = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                     let base = fl + *c as i64 * step as i64;
                     let lo = clamp((iv.low.as_raw_u32() as i32 as i64).max(base));
@@ -899,13 +660,8 @@ impl Graph {
                         Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(lo), Pico8Num::from_raw(lo)))
                     }
                 }
-                // The span premise: whether the interval fits in the
-                // fork's fragment count (`zi_span_ok`: the floor of its high
-                // end at most `ways - 1` grid cells above its low end's).
-                // A value here is the hull over the lanes: fitting, every
-                // lane fits; not fitting, a lane still may - unknown. So
-                // the kernel's explanation reads what the kernel computed
-                // rather than top (room (6,0), 2026-09-28).
+                // `zi_span_ok`: high end's floor at most `ways - 1` cells above
+                // the low end's. On a hull: fits => every lane fits, else unknown.
                 Op::SplitOk(ways) => {
                     let iv = a!(0).as_num("SplitOk")?;
                     let step = GRID_STEP as i64;
@@ -918,10 +674,8 @@ impl Graph {
                         bail!("node {}: SplitOk of an interval that may not fit", i)
                     }
                 }
-                // The no-wrap premise: the operation's operands, in i64.
-                // Under `lenient` they are hulls over the lanes - no wrap on
-                // the hull, none on any lane; a wrap on the hull, a lane may
-                // still fit: unknown. On one lane's interval, decided.
+                // No-wrap in i64. On a hull: no wrap is no wrap on any lane; a
+                // wrap is unknown per lane.
                 Op::NoWrap => {
                     let x = &self.nodes[node.args[0] as usize];
                     let fits = match x.op {
@@ -934,50 +688,29 @@ impl Graph {
                     };
                     Val::Bool(if fits || !lenient { Some(fits) } else { None })
                 }
-                // The RESOLVED fork: `zi_fork_flr`, on one interval
-                // instead of sixteen lanes. Exact, and it is the
-                // definition `fold`'s `FragOk(0)` rule is checked
-                // against.
+                // The RESOLVED fork: `zi_fork_flr` on one interval.
                 Op::Frag(c) | Op::FragOk(c) => {
                     let iv = a!(0).as_num("Frag")?;
                     let (step, mask) = self.grid();
                     let gflr = |p: Pico8Num| Pico8Num::from_raw(p.as_raw_u32() as i32 & mask);
                     let (fl, fh) = (gflr(iv.low), gflr(iv.high));
-                    // Cells the interval spans, minus one: `fh = fl + n * step`.
-                    // In i64: the full-range hull (`i32::MIN..=i32::MAX`)
-                    // overflows the subtraction.
+                    // Cells spanned minus one, in i64 (a full-range hull overflows).
                     let n = (fh.as_raw_u32() as i32 as i64 - fl.as_raw_u32() as i32 as i64) / step as i64;
                     let c = *c as i64;
-                    // Under `lenient` the operand is a HULL over many lanes,
-                    // not one lane's interval, and `two` is not a property
-                    // a hull inherits: a lane inside a 40-floor hull can
-                    // still span exactly two floors. Deciding `FragOk(1)`
-                    // from the hull said "fragment 1 is never valid" for
-                    // every lane of room (1,0), `ival::fold` made that a
-                    // constant, and the flat-fork kernels silently wrote
-                    // no fragment-1 row at the first straddle (frame 25,
-                    // 38 rows lost; found by the 30-frame check run,
-                    // 2026-08-25). The only hull that decides it is one
-                    // inside a single floor, where no lane can straddle.
-                    // The fragment VALUE is the hull itself: fragment 0
-                    // of a lane that sits entirely in the hull's upper
-                    // floor is that lane's whole interval, which the
-                    // "exactly two floors" split below would exclude.
+                    // Lenient, the operand is a HULL over lanes: a lane in a wide
+                    // hull may still span two floors, so `FragOk(c)` is decided
+                    // only where the hull rules it out. The value is the hull.
                     if lenient {
                         return Ok(match (&node.op, c) {
                             (Op::Frag(_), _) => a!(0),
                             (_, 0) => Val::Bool(Some(true)),
-                            // A hull spanning fewer cells than fragment
-                            // `c` needs contains no lane that reaches it.
+                            // Too few cells: no lane reaches fragment `c`.
                             _ if n < c => Val::Bool(Some(false)),
                             _ => Val::Bool(None),
                         });
                     }
-                    // Fragment `c` is the `c`-th cell from the low end's,
-                    // clipped to the interval; valid iff the interval
-                    // reaches it. An interval that does not keeps its
-                    // whole value there (the fragment is invalid, so the
-                    // value is never taken).
+                    // Valid iff the interval reaches cell `c`; an invalid fragment
+                    // keeps the whole value (never taken).
                     let valid = n >= c;
                     match &node.op {
                         Op::Frag(_) if valid => {
@@ -994,11 +727,8 @@ impl Graph {
                     Some(v) => *v,
                     None => bail!("node {}: input cell {} was not supplied", i, c),
                 },
-                // CHECKED, because this evaluator runs with inputs at
-                // TOP on purpose (`transpile::ival`) and a wrap there is
-                // expected rather than a modeling bug. An evaluator that
-                // panics on its own intended input is not usable as a
-                // transformation.
+                // CHECKED: inputs run at TOP on purpose (`transpile::ival`), so
+                // a wrap is expected.
                 Op::Add => Val::Num(
                     a!(0)
                         .as_num("Add")?
@@ -1060,8 +790,7 @@ impl Graph {
                 Op::Not => Val::Bool(a!(0).as_bool("Not")?.map(|b| !b)),
                 Op::And => {
                     let (x, y) = (a!(0).as_bool("And")?, a!(1).as_bool("And")?);
-                    // Short-circuit on a decided false, so `false AND
-                    // unknown` is false rather than unknown.
+                    // Short-circuit: `false AND unknown` is false.
                     Val::Bool(match (x, y) {
                         (Some(p), Some(q)) => Some(p && q),
                         (Some(false), None) | (None, Some(false)) => Some(false),
@@ -1080,18 +809,12 @@ impl Graph {
                 Op::Sel => match a!(0).as_bool("Sel")? {
                     Some(true) => a!(1),
                     Some(false) => a!(2),
-                    // Undecided: the lane is invalid (its `valid` node
-                    // carries `Known(cond)`), so any SOUND value serves.
-                    // The join is the sound one.
+                    // Undecided: the lane is in error (the select's own), so the
+                    // join serves.
                     None => Self::join(a!(1), a!(2))?,
                 },
-                // Decidedness is a per-LANE fact. Under `lenient` the
-                // operand is a HULL over many lanes: a decided hull means
-                // every lane is decided (true), an undecided hull says
-                // nothing about any one lane (undecided, NOT false).
-                // Answering false from a hull folded the boundary's
-                // one-bucket premise `Known(Flr(rem/w))` to a constant and
-                // refused every lane of every finer rung (2026-09-13).
+                // Per-LANE decidedness. On a hull: decided means every lane is;
+                // undecided says nothing (unknown, NOT false).
                 Op::Known => {
                     let decided = match a!(0) {
                         Val::Bool(b) => b.is_some(),
@@ -1108,9 +831,7 @@ impl Graph {
                 Op::TileFlagAt if room.is_some() => {
                     Self::tile_flag_over(room.unwrap(), a!(0), a!(1), a!(2), a!(3), a!(4))?
                 }
-                // `mget` on EXACT coordinates, the only form the kernels
-                // take (`zn_mget` panics on a fractional one, reads 0
-                // outside the map); an interval coordinate is refused.
+                // `mget` on EXACT coordinates only, as in the kernels.
                 Op::Mget if room.is_some() => {
                     let (x, y) = (a!(0).as_num("Mget")?, a!(1).as_num("Mget")?);
                     if x.low != x.high || y.low != y.high {
@@ -1125,10 +846,8 @@ impl Graph {
                 }
                 })
             })();
-            // ONE place where `lenient` acts, rather than one per arm:
-            // whatever the reason a node cannot be modelled, TOP for its
-            // kind is the sound answer, and centralizing it means a new
-            // unmodelled case cannot forget to be sound.
+                // The ONE place `lenient` acts: TOP for its kind is sound
+                // whatever the reason.
             let v = match computed {
                 Ok(v) => v,
                 Err(e) => {
@@ -1143,9 +862,8 @@ impl Graph {
         Ok(out)
     }
 
-    /// The weakest value a node of this op could have: `Bool(None)` for
-    /// the ops that produce booleans, the full numeric range otherwise.
-    /// `Sel` follows its branches, since it produces whatever they do.
+    /// The weakest value of this op: `Bool(None)` for booleans, the full
+    /// range for numbers; `Sel` follows its arms.
     fn top_of(op: &Op, args: &[NodeId], out: &[Val], full: Val) -> Val {
         match op {
             Op::ConstBool(_)
@@ -1172,26 +890,11 @@ impl Graph {
         }
     }
 
-    /// `tile_flag_at` over INTERVALS of x and y.
-    ///
-    /// For one concrete (x, y) the answer is "does any tile in the
-    /// w-by-h rectangle carry the flag". Over a BOX of positions there
-    /// are two sound one-sided tests, and unknown lies between them.
-    ///
-    /// FALSE everywhere, if the UNION of all those rectangles holds no
-    /// flagged tile. That union is itself one rectangle: start at the
-    /// lowest corner, grow by how far the box spans.
-    ///
-    /// TRUE everywhere, if the INTERSECTION holds a flagged tile. That
-    /// is also one rectangle: start at the highest corner, shrink by the
-    /// span. It is empty once the box spans further than the rectangle
-    /// is wide, which is why the size check comes first.
-    ///
-    /// Each test is one ordinary `solid_at` call on a derived rectangle,
-    /// so this costs two map queries and introduces no new machinery.
+    /// `tile_flag_at` over INTERVALS: FALSE if the UNION of the rectangles
+    /// holds no flagged tile, TRUE if their INTERSECTION holds one, unknown
+    /// between. Two `solid_at` calls on derived rectangles.
     fn tile_flag_over(room: &Room, x: Val, y: Val, w: Val, h: Val, flag: Val) -> Result<Val> {
-        // The size and flag must be exact. A symbolic hitbox is a
-        // different question.
+        // The size and flag must be exact.
         let ex = |v: Val, what: &str| -> Result<i32> {
             v.as_exact()
                 .and_then(|n| n.as_i16())
@@ -1200,9 +903,8 @@ impl Graph {
         };
         let (w, h) = (ex(w, "w")?, ex(h, "h")?);
         let flag = ex(flag, "flag")? as i16;
-        // An interval covers every integer from floor(low) to
-        // floor(high). Non-integer coordinates fail concretely, so
-        // covering them here is conservative rather than wrong.
+        // Every integer from floor(low) to floor(high); non-integers fail
+        // concretely, so covering them is conservative.
         let span = |v: Val, what: &str| -> Result<(i32, i32)> {
             let i = v.as_num(what)?;
             let lo = i.low.flr().as_i16().ok_or_else(|| anyhow!("{}: unbounded", what))? as i32;
@@ -1211,18 +913,8 @@ impl Graph {
         };
         let (xlo, xhi) = span(x, "x")?;
         let (ylo, yhi) = span(y, "y")?;
-        // A room is 16 tiles across and `solid_at` clamps to it, so any
-        // span past the room edge is the whole room. Clamping also keeps
-        // the derived rectangle inside i16 when an input is at TOP.
-        //
-        // Clamp the rectangle's EDGES, never its corner and its size
-        // apart: with a coordinate at TOP the corner is -32768 and the
-        // size 65536+, and capping each on its own left the rectangle
-        // [-4096, 0) - tile row (or column) 0 only, so a TOP position
-        // read "nothing solid anywhere" wherever that row is open and
-        // the frame folded the collision to false. Room (0,2)'s spawn
-        // frame: the new player's `is_solid(0, 1)` at y = TOP, tile
-        // (2, 0) open, the player in the air on the ground (2026-10-01).
+        // Clamp the rectangle's EDGES to the 16-tile room, never corner and
+        // size apart: at TOP that leaves only row 0, reading "nothing solid".
         let edges = |lo: i32, size: i32| -> (i16, i16) {
             let hi = lo + size - 1;
             let (lo, hi) = (lo.clamp(-4096, 4096), hi.clamp(-4096, 4096));
@@ -1261,8 +953,7 @@ impl Graph {
         if scalar <= Pico8Num::from_i16(0) {
             bail!("{:?} by a non-positive scalar is not modelled", op);
         }
-        // Checked for the same reason as `Add`: at TOP a scale wraps,
-        // and the caller that wants that has a sound answer for it.
+        // Checked, as for `Add`: at TOP a scale wraps.
         Ok(Val::Num(match op {
             Op::Mul => xi
                 .checked_scale_positive(scalar)
@@ -1295,8 +986,7 @@ impl Graph {
                 f(a.high, b.low),
                 f(a.high, b.high),
             ];
-            // For the order comparisons the extremes bound the whole box;
-            // equality needs the disjointness test below instead.
+            // Order comparisons: corners bound the box; equality needs disjointness.
             if corners.iter().all(|c| *c) {
                 Some(true)
             } else if corners.iter().all(|c| !*c) {
@@ -1332,14 +1022,6 @@ impl Graph {
     }
 }
 
-/// One member of a specialization set: what it writes, and whether the
-/// result counts. That is the whole interface.
-pub struct Member {
-    pub label: String,
-    pub outputs: BTreeMap<u32, NodeId>,
-    pub valid: NodeId,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,9 +1039,7 @@ mod tests {
         let s2 = g.add(Op::Add, vec![a, b]);
         assert_eq!(s1, s2, "identical op over identical operands is one node");
         assert_eq!(g.len(), 3);
-        // Operand order matters: Add is commutative in VALUE but this is
-        // structural interning, which is exactly the property that made
-        // the pinned member fail to fuse.
+        // `add` does not normalize (`fold` does).
         let s3 = g.add(Op::Add, vec![b, a]);
         assert_ne!(s1, s3);
     }
@@ -1397,8 +1077,7 @@ mod tests {
 
     #[test]
     fn validity_is_an_ordinary_node() {
-        // The whole point of P1': a guard is `valid AND c`, and a select on
-        // an undecided condition is `valid AND known(c)`. No side channel.
+        // Validity is an ordinary node: a select is valid only where `known(c)`.
         let mut g = Graph::new();
         let c = g.leaf(Op::Cell(1));
         let t = g.leaf(Op::Const(n(1).as_raw_u32() as i32, n(1).as_raw_u32() as i32));
@@ -1430,15 +1109,12 @@ mod tests {
         let a = g.leaf(Op::Cell(1));
         let b = g.leaf(Op::Cell(2));
         let and = g.add(Op::And, vec![a, b]);
-        // false AND unknown is FALSE, not unknown - precision that matters
-        // because validity is built out of these.
+        // false AND unknown is FALSE, not unknown.
         let cells = HashMap::from([(1u32, Val::Bool(Some(false))), (2u32, Val::Bool(None))]);
         assert_eq!(g.eval(&cells).unwrap()[and as usize], Val::Bool(Some(false)));
     }
 
-    /// `SplitOk(n)` over a literal folds to what the kernel computes for it
-    /// (`zi_span_ok`, the definition), at every arity - `eval`
-    /// cannot model it, so `folding_is_exact_not_merely_sound` cannot.
+    /// `SplitOk(n)` over a literal folds to what `zi_span_ok` computes.
     #[test]
     fn split_ok_of_a_literal_is_what_zi_span_ok_says() {
         use celeste_engine::kernel::{zi_span_ok, zn_splat, ALL, ZI};
@@ -1459,24 +1135,15 @@ mod tests {
 
     #[test]
     fn folding_is_exact_not_merely_sound() {
-        // Every rule in `fold` has to be EXACT: `fold(op, args)` and
-        // `add(op, args)` must evaluate to the SAME abstract value at
-        // every assignment of the leaves. A rule that merely refined the
-        // answer would be correct in isolation and would still change
-        // which lanes are in error and which rows dedup together, so "it
-        // can only help" is not a defence. This enumerates rather than
-        // arguing - it is the reason `x and not x -> false` is absent,
-        // since Kleene says unknown there and `false` would be a
-        // refinement.
+        // Every `fold` rule must be EXACT: `fold` and `add` evaluate alike at
+        // every leaf assignment (hence no `x and not x -> false`).
         let mut g = Graph::new();
         let b: Vec<NodeId> = (0..3).map(|i| g.leaf(Op::Cell(i))).collect();
         let nums: Vec<NodeId> = (10..12).map(|i| g.leaf(Op::Cell(i))).collect();
         let tt = g.leaf(Op::ConstBool(true));
         let ff = g.leaf(Op::ConstBool(false));
 
-        // A pool of boolean subexpressions, built with `add` so that the
-        // pool itself is unfolded and the rules have something to bite
-        // on: a `Not`, a comparison to flip, a nested `Not`.
+        // Boolean subexpressions built unfolded, for the rules to bite on.
         let not0 = g.add(Op::Not, vec![b[0]]);
         let nn1 = g.add(Op::Not, vec![b[1]]);
         let notnot1 = g.add(Op::Not, vec![nn1]);
@@ -1558,8 +1225,7 @@ mod tests {
                 }
             }
         }
-        // A guard against the test silently checking nothing, and against
-        // the pool shrinking to the point where no rule fires.
+        // Guard against the test silently checking nothing.
         assert!(pairs.len() > 1_000, "pool collapsed to {} pairs", pairs.len());
         let fired = pairs.iter().filter(|(f, p)| f != p).count();
         assert!(fired > 500, "only {} of {} pairs were folded", fired, pairs.len());
@@ -1573,11 +1239,7 @@ mod tests {
 
     #[test]
     fn commutative_operands_are_put_in_a_canonical_order() {
-        // Structural interning is the only sharing mechanism, so without
-        // this `a + b` and `b + a` are two nodes and everything built on
-        // them diverges. `add` is the raw constructor and still does not
-        // normalize - that is what makes it usable as the control in
-        // `folding_is_exact_not_merely_sound`.
+        // `add` stays the raw constructor (the control above).
         let mut g = Graph::new();
         let a = g.leaf(Op::Cell(1));
         let b = g.leaf(Op::Cell(2));
@@ -1591,9 +1253,8 @@ mod tests {
         }
         // Subtraction does not commute, and must not be normalized.
         assert_ne!(g.fold(Op::Sub, vec![a, b]), g.fold(Op::Sub, vec![b, a]));
-        // Multiplication DOES commute, but `eval` is only monotone with
-        // the exact side second, so the rule is one-directional: a
-        // constant moves right, and two symbolic operands are left alone.
+        // `Mul` commutes but `eval` is monotone only with the exact side
+        // second: a constant moves right.
         let k = g.leaf(Op::Const(0, 0));
         assert_eq!(g.fold(Op::Mul, vec![k, a]), g.fold(Op::Mul, vec![a, k]));
         assert_ne!(g.fold(Op::Mul, vec![a, b]), g.fold(Op::Mul, vec![b, a]));
@@ -1601,9 +1262,7 @@ mod tests {
 
     #[test]
     fn a_select_between_boolean_constants_is_boolean_algebra() {
-        // The shape the tracer produces at every merge of a boolean whose
-        // branch condition it could not decide. `if c then true else x`
-        // is `c or x`, and saying so costs one node instead of three.
+        // `if c then true else x` is `c or x`.
         let mut g = Graph::new();
         let c = g.leaf(Op::Cell(1));
         let x = g.leaf(Op::Cell(2));
@@ -1624,9 +1283,7 @@ mod tests {
 
     #[test]
     fn a_split_guard_merged_back_is_the_guard() {
-        // `split` guards the two arms `g and c` / `g and not c`, and `merge`
-        // ORs them: the result is `g` for every concrete `c`, and must not
-        // read `c` (or its fork) any more.
+        // `(g and c) or (g and not c)` is `g` and must not read `c`.
         let mut g = Graph::new();
         let guard = g.leaf(Op::Cell(1));
         let c = g.leaf(Op::Cell(2));
@@ -1649,9 +1306,7 @@ mod tests {
 
     #[test]
     fn a_negated_comparison_is_the_opposite_comparison() {
-        // Worth more than the `Not` it saves: it makes `x < y` and
-        // `not (x >= y)` the SAME node, which structural interning could
-        // never do on its own.
+        // Makes `x < y` and `not (x >= y)` the SAME node.
         let mut g = Graph::new();
         let (x, y) = (g.leaf(Op::Cell(1)), g.leaf(Op::Cell(2)));
         for (op, opp) in [
@@ -1673,12 +1328,7 @@ mod tests {
 
     #[test]
     fn a_select_between_equal_arms_is_not_a_select() {
-        // The fold that makes merging at a join affordable. A per-cell
-        // merge of two branch outcomes proposes a select for EVERY cell in
-        // the heap; almost none of them were touched by either arm, and
-        // without this each one would cost a node - and, at the emit site,
-        // a `Known(cond)` validity conjunct that would deopt lanes over a
-        // value that cannot depend on the condition.
+        // A join proposes a select per cell, almost all untouched: free.
         let mut g = Graph::new();
         let c = g.leaf(Op::Cell(1));
         let x = g.leaf(Op::Cell(2));
@@ -1695,11 +1345,8 @@ mod tests {
 
     #[test]
     fn specializing_the_button_forks_collapses_the_configurations_that_agree() {
-        // `input` is Sel(right, 1, Sel(left, -1, 0)) over two buttons, each a
-        // fork every lane takes both ways (`Symbolic::both_values`): with
-        // right = true the whole thing is 1 whatever left is, so {left,right}
-        // and {right} land on the same node and their successor states are
-        // the same.
+        // `input` is Sel(right, 1, Sel(left, -1, 0)) over two buttons: with
+        // right = true, {left,right} and {right} share a node.
         let mut d = crate::trace::domain::Symbolic::default();
         let left = d.both_values("left");
         let right = d.both_values("right");
@@ -1737,8 +1384,7 @@ mod tests {
 
     #[test]
     fn unmodelled_operations_are_loud() {
-        // Correctness beats cleverness: an op we cannot evaluate EXACTLY
-        // must error, never return an approximation.
+        // An op we cannot evaluate EXACTLY must error, never approximate.
         let mut g = Graph::new();
         let a = g.leaf(Op::Cell(1));
         let b = g.leaf(Op::Cell(2));
@@ -1752,8 +1398,7 @@ mod tests {
         assert!(err.contains("not modelled"), "unexpected error: {}", err);
     }
 
-    /// The pieces analysis: a select on a non-constant condition is the
-    /// UNION of its arms, not the hull, and arithmetic maps each piece.
+    /// A select on a non-constant condition is the UNION of its arms.
     #[test]
     fn pieces_keep_a_select_as_a_union() {
         let mut g = Graph::new();
@@ -1772,10 +1417,8 @@ mod tests {
         assert_eq!(pieces_of(&g, &seeds, &mut memo, sum), None);
     }
 
-    /// `Lo`/`Hi` of a value known only as a hull over lanes are not points:
-    /// a lane's end is anywhere in the hull, so neither the evaluator nor
-    /// the pieces analysis may decide a comparison on it that one lane
-    /// could fail - and the interval fold must not pin it.
+    /// `Lo`/`Hi` of a hull are not points, so nothing may decide a comparison
+    /// one lane could fail.
     #[test]
     fn the_ends_of_a_hull_are_not_points() {
         let mut g = Graph::new();
@@ -1800,9 +1443,8 @@ pub type Pieces = Vec<(i64, i64)>;
 /// The most pieces a range keeps; past that it is one hull.
 pub const MAX_PIECES: usize = 64;
 
-/// Sort, merge the overlapping and adjacent, refuse what the 16.16 range
-/// cannot hold (an overflow is "unknown": the kernel's arithmetic panics
-/// rather than wraps), and cap the count.
+/// Sort, merge overlapping/adjacent, refuse a 16.16 overflow ("unknown"),
+/// and cap the count.
 pub fn normalize_pieces(mut v: Pieces) -> Option<Pieces> {
     v.retain(|(lo, hi)| lo <= hi);
     if v.is_empty() || v.iter().any(|(lo, hi)| *lo < i32::MIN as i64 || *hi > i32::MAX as i64) {
@@ -1822,15 +1464,11 @@ pub fn normalize_pieces(mut v: Pieces) -> Option<Pieces> {
     Some(out)
 }
 
-/// The static range of `n` in raw 16.16 units, if the analysis has one:
-/// from the seeded nodes (input cells known to lie in a range - a body
-/// specialized on a region's ranges) through the arithmetic the
-/// graph does on them, as PIECES. A select whose condition is not
-/// constant is the union of its arms, not their hull: the dash writes ±5
-/// next to a run speed under 1, and the hull would cross every bucket in
-/// between. `None` is "unknown", never a wrong bound; the runtime guard
-/// on the seeds is what makes a bound a fact rather than an assumption.
-/// `memo` persists across calls on one graph with the same seeds.
+/// The static range of `n` (raw 16.16) as PIECES, from seeded input cells
+/// through the arithmetic; a select on a non-constant condition is the union
+/// of its arms (the dash's ±5 beside a run speed under 1). `None` is unknown,
+/// never wrong; the runtime guard on the seeds makes it a fact. `memo` is
+/// valid for one graph and seed set.
 pub fn pieces_of(
     g: &Graph,
     seeds: &HashMap<NodeId, (i64, i64)>,
@@ -1879,9 +1517,7 @@ pub fn pieces_of(
                 })
                 .collect(),
         ),
-        // A product or quotient by a CONSTANT is monotone in the other
-        // operand, so the endpoints map to the endpoints (in the exact
-        // 16.16 arithmetic, not a real-number bound).
+        // Product/quotient by a CONSTANT is monotone in the other operand.
         Op::Mul | Op::Div => {
             let (ka, kb) = (konst(g, args[0]), konst(g, args[1]));
             let (k_of, k, is_div) = match (ka, kb) {
@@ -1925,8 +1561,7 @@ pub fn pieces_of(
         }
         // A fragment lies within its operand.
         Op::Split(_) | Op::SplitInt(_) | Op::Frag(_) | Op::IntFrag(_) => rec(memo, 0),
-        // A lane's end, over the lanes (see `eval`'s `Lo`): anywhere in the
-        // operand's pieces, but a span's operand and a literal's own end.
+        // A lane's end, over the lanes (see `eval`'s `Lo`).
         Op::Lo | Op::Hi => {
             let low = matches!(op, Op::Lo);
             let arg = g.get(args[0]).clone();

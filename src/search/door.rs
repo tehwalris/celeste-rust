@@ -1,18 +1,12 @@
-//! The door: the set of every `(shape, cell, key)` the forward has reached,
-//! against which emitted rows are deduplicated (plans/waves.md).
+//! The door: every `(shape, cell, key)` the forward has reached, against
+//! which emitted rows are deduplicated.
 //!
-//! Sharded by `(shape, cell)` - two rows in different shards can never be
-//! the same state - and, within a shard, a SORTED array of 128-bit keys
-//! (`base`, everything up to the previous frame, immutable during a
-//! frame) plus a small sorted `delta` (this frame's admissions). A flush
-//! `admit`s a sorted batch of keys with one merge-join sweep over both;
-//! `end_frame` merges every delta into its base, once per frame. So the
-//! big set is only READ while a frame runs. Each entry is the key and the
-//! state's id (`(layer, file seq, row)`): what an edge to an old state
-//! is written as (plans/waves.md, the explicit graph).
-//!
-//! `HashDoor` is the same contract over a hash set per shard (the
-//! pre-2026-09-13 representation), kept as the oracle for `Door`'s tests.
+//! Sharded by `(shape, cell)` (which the key determines); within a shard a
+//! SORTED `base` (up to the previous frame, read-only during a frame) plus a
+//! small sorted `delta` (this frame's admissions). `admit` merge-joins a
+//! sorted batch against both; `end_frame` folds the deltas into the bases.
+//! Each entry carries the state's id, which edges to old states are written
+//! as. `HashDoor` (tests only) is the oracle for the same contract.
 
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -26,11 +20,9 @@ pub type Entry = (Key, u64);
 /// The door's contract: admit sorted, deduplicated key batches; merge at
 /// the end of a frame.
 pub trait Admit: Sync {
-    /// `keys` sorted ascending with no duplicates. For each key, its id:
-    /// an existing entry's, or - for a key NOT in the shard - a fresh one,
-    /// `first_new + k` for the k-th new key in order, which the shard
-    /// records. `ids` receives one id per key (in `keys`' order), `new`
-    /// the indices of the new keys.
+    /// `keys` sorted, no duplicates. `ids` gets each key's id: the existing
+    /// entry's, or `first_new + k` for the k-th new key (recorded); `new`
+    /// gets the new keys' indices.
     fn admit(&self, shape: u64, cell: u32, keys: &[Key], first_new: u64, ids: &mut Vec<u64>, new: &mut Vec<u32>);
     /// The frame is over: fold this frame's admissions into the base.
     fn end_frame(&self, workers: usize);
@@ -45,10 +37,9 @@ pub trait Admit: Sync {
 #[derive(Default)]
 struct Shard {
     base: Vec<Entry>,
-    /// Bucket starts into `base` by the top bits of `key.0` (the keys are
-    /// uniform hashes): `index.len() - 1` buckets of ~8 entries, so a
-    /// lookup touches one index word and one or two lines of `base`
-    /// instead of galloping through it. 0.5 B/entry. Rebuilt with `base`.
+    /// Bucket starts into `base` by the top bits of `key.0` (uniform
+    /// hashes), ~8 entries a bucket: a lookup touches one index word and a
+    /// line or two of `base`. Rebuilt with `base`.
     index: Vec<u32>,
     delta: Vec<Entry>,
 }
@@ -215,8 +206,7 @@ impl Door {
         Self::default()
     }
 
-    /// A door already holding `entries` (each shard's entries, in any
-    /// order) - the union of a level's layers so far.
+    /// A door already holding `entries` (per shard, any order).
     pub fn from_shards(entries: impl IntoIterator<Item = ((u64, u32), Vec<Entry>)>) -> Self {
         let mut shards = FxHashMap::default();
         for ((shape, cell), mut keys) in entries {
@@ -342,9 +332,8 @@ impl Admit for HashDoor {
 mod tests {
     use super::*;
 
-    /// A deterministic stream of (shape, cell, key) batches over a few
-    /// frames, with heavy repetition within a batch, across batches of a
-    /// frame, and across frames.
+    /// Deterministic (shape, cell, key) batches over a few frames, with
+    /// heavy repetition within and across batches and frames.
     fn stream(seed: u64) -> Vec<Vec<(u64, u32, Vec<Key>)>> {
         let mut x = seed;
         let mut rnd = move || {

@@ -149,54 +149,32 @@ order, the first one the default:
 ```
 
 Each run's subdirectory (`id`) is produced by `rewrite export-ui`
-(`src/search/ui_export.rs`) from that run's checkpoint tree and its log.
-It reads only the checkpoint headers (per-cell counts = the cell index,
-win cells = the win list), the marks files, and - to split the marks by
-layer - each frame file's `(cell, key)` rows. Room (1,0)'s full ladder
-to 99 exports in ~6 s to 8.8 MB; room (0,0)'s ladder to 93 (15
-horizons, 64 levels) in ~20 s to 18 MB.
-
-```bash
-# 1. Keep the run's log somewhere stable (it is the timing source).
-cp /tmp/room10f.log /var/tmp/celeste-ui/room10f.log
-cp /tmp/room00_search.log /var/tmp/celeste-ui/room00.log
-
-# 2. Export each run into its own subdirectory (from the repo root: it
-#    loads cart/ for the room's tiles).
-./one-cargo.sh ./safe-run.sh -- cargo build --profile quick --bin rewrite
-./safe-run.sh -- ./target/quick/rewrite export-ui \
-    --checkpoint-dir /var/tmp/celeste-checkpoints \
-    --log /var/tmp/celeste-ui/room10f.log \
-    --out /var/tmp/celeste-ui/data/room10 --room 1,0
-./safe-run.sh -- ./target/quick/rewrite export-ui \
-    --checkpoint-dir /var/tmp/celeste-search-room00 \
-    --log /var/tmp/celeste-ui/room00.log \
-    --out /var/tmp/celeste-ui/data/room00 --room 0,0
-
-# 3. List it in /var/tmp/celeste-ui/data/runs.json (above).
-```
-
-A forward on its own exports with `--forward-only` (one partial horizon,
-no backward). With `--arc DIR` it becomes a two-level run: `DIR` is what
-`rewrite search --save-marks DIR` wrote over the same tree (its
-`level00/`; plans/architecture.md "Arcs") - level 0 gets the remainder-free backward's
-marks, and level 1 is the remainder-exact ARC backward over level 0's
-forward (`forward_of: 0` in `run.json`: no forward pass of its own; a node
-is marked when its winning set W_t is non-empty at some frame t, drawn at
-its first-reach layer like every backward). With a concrete witness, `witness.txt`
-(the concrete inputs and the player's position per frame) is drawn over
-the room as a cyan trail, bright to the current frame (the `witness`
-chip; `w=0` in the hash hides it). Room (3,3) at h172:
+(`src/search/ui_export.rs`) from a `rewrite search` checkpoint dir (or one
+`rewrite forward` tree) and its log. It reads only the checkpoint headers
+(per-cell counts = the cell index, win cells = the win list), the marks
+files, and - to split the marks by layer - each frame file's `(cell, key)`
+rows. A run is one horizon: one level per `--level` of the search, and with
+`--arc DIR` (what `search --save-marks DIR` wrote) the last level gets the
+remainder-free backward's marks and one more level is the remainder-exact
+ARC backward over the same tree (`forward_of` in `run.json`: no forward
+pass of its own; a node is marked when its winning set W_t is non-empty at
+some frame t, drawn at its first-reach layer). With a concrete witness,
+`witness.txt` (the inputs and the player's position per frame) is drawn
+over the room as a cyan trail (the `witness` chip; `w=0` in the hash hides
+it). Room (3,3) at h172 (from the repo root: it loads cart/ for the tiles):
 
 ```bash
 CELESTE_LEVEL_MINUS_ONE="172,5" ./safe-run.sh -- ./target/quick/rewrite search \
     --checkpoint-dir /var/tmp/arc33-172 --to 172 --room 3,3 --level r0sxhn \
-    --save-marks /var/tmp/arc33-172-ui 2> /var/tmp/arc33-172.log
-cp /var/tmp/arc33-172.log /var/tmp/celeste-ui/room33arc172.log   # the forward's log
-./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir /var/tmp/arc33-172/level00 \
-    --forward-only --arc /var/tmp/arc33-172-ui --log /var/tmp/celeste-ui/room33arc172.log \
+    --save-marks /var/tmp/arc33-172-ui 2> /var/tmp/celeste-ui/room33arc172.log
+./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir /var/tmp/arc33-172 \
+    --arc /var/tmp/arc33-172-ui --log /var/tmp/celeste-ui/room33arc172.log \
     --out /var/tmp/celeste-ui/data/room33arc172 --room 3,3
+# then list it in /var/tmp/celeste-ui/data/runs.json (above)
 ```
+
+Runs exported by the deleted precision ladder (several horizons, `[ladder]`
+logs) still render; the exporter no longer reads their layout.
 
 A run's layout (`run.json` + one binary per horizon/level) is documented
 at the top of `src/search/ui_export.rs`; `ui/src/data.ts` is its reader,

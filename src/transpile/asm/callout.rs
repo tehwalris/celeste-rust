@@ -1,13 +1,10 @@
-//! The call-out ABI: ops the emitter cannot (or will not) vectorise inline -
-//! `Div`/`Rem`/`Sin` (scalar per-lane in the Rust primitives too) and the
-//! collision look-ups `Mget`/`TileFlagAt` (a cart/cache query mid-DAG) - are
-//! emitted as a `call` through a function pointer carried in `AsmCtx`, the
-//! kernel's third argument. Every SIMD operand is marshalled through a stack
-//! buffer and the result read back, so the wrappers just invoke the exact
-//! `celeste_engine::kernel` primitive and the result is bit-identical by
-//! construction. The emitted code save/restores all 32 zmm around the call
-//! (a call clobbers every vector register); that is correctness-first, not
-//! fast - see `plans/asm-backend.md`.
+//! The call-out ABI: ops the emitter does not vectorise inline -
+//! `Div`/`Rem`/`Sin` and the collision look-ups `Mget`/`TileFlagAt` - are a
+//! `call` through a function pointer in `AsmCtx`, the kernel's third
+//! argument. Operands are marshalled through a stack buffer and the wrappers
+//! invoke the exact `celeste_engine::kernel` primitive, so the result is
+//! bit-identical by construction. The emitted code saves and restores all
+//! 32 zmm around the call.
 
 use std::os::raw::c_void;
 

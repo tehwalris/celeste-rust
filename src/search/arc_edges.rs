@@ -3,15 +3,13 @@
 //! axis, as a GUARD (the piece of the circle the edge is taken from) and an
 //! ACTION (a rotation, or a collision's constant).
 //!
-//! Always on: every traced frame that widens (`trace_frame`'s `widen`, every
-//! kernel set) captures, per body, the transfer roots (`trace::verify::FrameOut::arc`);
-//! the kernel computes them beside the row without storing them in it (no
-//! key, column, dedupe or checkpoint sees them) and decodes each producer's
-//! transfer here; the forward interns the (x, y) pair per worker
-//! (`ForwardSink::xfer_id`) and the edge record carries its id. The
-//! compaction turns the workers' ids into one table per frame
-//! (`search::edges`, `xfer/f{frame}.bin`), so a run's records are keyed by
-//! (target, base, transfer) and a mask is OR-ed only across equal transfers.
+//! Every traced frame captures per body the transfer roots
+//! (`trace::verify::FrameOut::arc`); the kernel computes them beside the row
+//! (no key, column, dedup or checkpoint sees them) and each producer's
+//! transfer is decoded here. The forward interns the (x, y) pair per worker
+//! (`ForwardSink::xfer_id`); the compaction merges the ids into one table
+//! per frame (`search::edges`), so a mask is OR-ed only across equal
+//! transfers.
 //!
 //! ## What the kernel computes per axis (`RawAxis`)
 //!
@@ -26,9 +24,8 @@
 //! * `fin` - the player's remainder at the frame's end BEFORE the boundary
 //!   widening (`None`: no player at the end).
 //!
-//! The "image" of plans/arcs.md - the remainder right after `rem -= 1/2 +
-//! amount` - is `frag - 1/2 - flr(frag)`, derived here rather than in the
-//! graph: one floor per fragment is checked, not assumed.
+//! The "image" (the remainder right after `rem -= 1/2 + amount`) is
+//! `frag - 1/2 - flr(frag)`, with one floor per fragment checked, not assumed.
 //!
 //! ## The decoded transfer (`decode_axis`), every case
 //!
@@ -40,10 +37,9 @@
 //!     (the remainder untouched): `Rotate(0)`;
 //!   - `fin` a point (a player created this frame, `rem = 0`): `Const(fin)`;
 //!   - anything else: REFUSED.
-//! * A split: `ox` must be a point and `pre` exactly `[ox, ox + 1)` - that
-//!   is, the remainder at the move was the whole circle and the speed exact
-//!   (anything else, e.g. a bucketed speed: REFUSED). `frag` must lie in
-//!   `pre` within one floor `f` (else REFUSED). Then
+//! * A split: `ox` must be a point and `pre` exactly `[ox, ox + 1)` (the
+//!   remainder at the move the whole circle, the speed exact; else REFUSED).
+//!   `frag` must lie in `pre` within one floor `f` (else REFUSED). Then
 //!   - guard: `[frag.lo - ox, frag.hi - ox + 1)` - the input remainders whose
 //!     `rem + ox + 1/2` lands in the fragment. It must be the whole circle or
 //!     touch one of its ends, with the image touching the OTHER end (the piece
@@ -52,17 +48,14 @@
 //!     A point guard (a fragment one raw unit wide) is a piece like any other.
 //!   - rotation: `(ox - f) mod 1` - the image of `rem` is `rem + ox - f`.
 //!   - action: `fin == image`: `Rotate(rotation)`; `fin` a point other than
-//!     the image (a blocked step reset the remainder): `Const(fin)` (where the
-//!     image is itself a point equal to `fin`, `Rotate` maps the one-point
-//!     guard to the same point: the two agree); no player at the end (a
-//!     death): `Rotate(rotation)`, the target's remainder being a dummy
-//!     coordinate (a node without a player has no remainder; every
-//!     transfer out of one has a whole-circle guard, so its winning set is
-//!     the whole circle or nothing and any action into it is exact);
-//!     `fin` anything else (an interval that is not the image): REFUSED.
+//!     the image (a blocked step reset the remainder): `Const(fin)` (if the
+//!     image is that same point, the two agree); no player at the end (a
+//!     death): `Rotate(rotation)` into a dummy coordinate (every transfer out
+//!     of a player-less node has a whole-circle guard, so its winning set is
+//!     all or nothing and any action into it is exact); anything else: REFUSED.
 //!
-//! A refusal is FATAL in the forward (the kernel's append step): the record
-//! would be a claim about the remainder that nothing checked.
+//! A refusal is FATAL in the forward: the record would be an unchecked claim
+//! about the remainder.
 
 use super::arcs::{self, Action, Seg, Set, Transfer, CIRCLE};
 
