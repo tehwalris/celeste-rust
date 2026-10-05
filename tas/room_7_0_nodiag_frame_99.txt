@@ -1,0 +1,9 @@
+# Room (7,0) "800 m", No Diagonal Dashes: exit during frame 99 (2026-10-05).
+# Ties the community nodiag TAS8 (76 inputs at prologue offset 23 = 99).
+# rewrite search --room 7,0 --ceiling 99 --level r0sxhn,r0sxh, CELESTE_NODIAG=1,
+# level -1 99,5 (integrate 6fea215): arc bound 99 at r0sxh (objects exact,
+# held unknown: a sound lower bound), concrete witness at 99 in 287 steps.
+# 1302 s, 29.5 GB peak. Dashes: f34 U, f67 U.
+# Replayed on a real PICO-8: room changes to (0,1) during frame 99:
+#   pico8_diff/replay.py --room 7,0 --balloon-seeds 0 tas/room_7_0_nodiag_frame_99.txt
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,1,0,1,1,1,1,1,0,2,36,0,0,0,0,0,0,2,2,2,2,0,0,16,0,0,16,0,0,0,0,0,0,0,2,0,0,1,1,1,0,1,1,36,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,16,0,0,0,0,0,0,0,0,16,0,0,0,0
