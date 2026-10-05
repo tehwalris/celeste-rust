@@ -884,6 +884,7 @@ pub fn concrete_search(
             crate::metrics::current_rss_gb()
         );
         if let Some((parent, byte, cell)) = won {
+            anyhow::ensure!(k + 1 >= bound, "a concrete win at f{} before the arc bound f{bound}: the backward lost a path", k + 1);
             // The path, back through the layers.
             let (mut inputs, mut cells) = (vec![byte], vec![cell]);
             let mut p = parent;
