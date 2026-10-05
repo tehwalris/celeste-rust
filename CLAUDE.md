@@ -149,8 +149,8 @@ always reaching for the most expensive profile out of habit.
   `lto = "fat"` + `codegen-units = 1`: a one-line edit relinks the workspace,
   ~100 s to run a test that executes in 6 ms.
 - **Do not run the full suite in plain debug**: the compute-bound tests
-  (`every_start_room_kernel_graph_asm_compiles_the_fused_graph`,
-  `a_traced_frame_agrees_with_the_oracle`) are slow without optimization.
+  (`a_traced_frame_agrees_with_the_oracle`, `ice_at_answers_the_tile_scan_in_every_room`)
+  are slow without optimization.
   Debug wins when a filter keeps them out; `--cargo-profile quick` otherwise.
 - **Tools get `--profile quick`, not `--release`** (`transpile` probes,
   `rewrite` diagnostics, export-ui): 15 s to build against ~78 s. "Too slow
@@ -173,19 +173,13 @@ always reaching for the most expensive profile out of habit.
 - **`touch` the file you care about** to measure what an edit really costs:
   `touch src/transpile/lower.rs && time cargo nextest run transpile`.
 
-**The ignored tests** (7, `#[ignore]` rather than an env check so nextest
-prints them as skipped): `every_reachable_pm1_key_gets_its_own_body`
-(~240 s), `forward_extended_frame_by_frame_matches_fresh`,
-`the_rooms_shape_set_is_a_fixpoint`, `room_71_table_builds_with_its_balloon`
-(level -1), and the reference-engine end-to-end tests. They are NOT part of
-the pre-commit run (Philippe, 2026-08-23: ~6 min each time costs more than
-the occasional bisect). Run them when you have a reason:
-
-- touched the tracer, the lowering, the ASM codegen or the edge recording ->
-  the ignored tests AND the three pinned oracles (below); the kernels are
-  assembled at startup, so the oracles are what check what they COMPUTE;
-- touched the tracer's pinning or key walk ->
-  `every_reachable_pm1_key_gets_its_own_body`.
+**The ignored tests** (2, `#[ignore]` rather than an env check so nextest
+prints them as skipped): `forward_extended_frame_by_frame_matches_fresh`
+(resume) and `room_71_table_builds_with_its_balloon` (level -1). They are
+NOT part of the pre-commit run. Run them, AND the three pinned oracles
+(below), when you touched the tracer, the lowering, the ASM codegen, the
+edge recording, resume or level -1: the kernels are assembled at startup,
+so the oracles are what check what they COMPUTE.
 
 Do NOT read past the "N skipped" line and call the suite green when one of
 those reasons applies. That is the exact mistake behind `a8f4635`.

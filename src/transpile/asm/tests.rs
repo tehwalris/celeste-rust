@@ -243,14 +243,24 @@ fn zn_bytes(z: ZN) -> [u8; 64] {
     o
 }
 
-/// Assert the emitted kernel's typed roots match the reference evaluator.
-fn check_typed(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
+/// Assemble `g`'s roots, run the kernel on 8 random input batches (`cols`)
+/// and assert every root bit-exact against the reference evaluator (a bool's
+/// `val` on its known lanes only, where it is defined).
+fn check(
+    g: &Graph,
+    roots: &[NodeId],
+    tag: &str,
+    rng: &mut Lcg,
+    cols: fn(&[u32], &mut Lcg) -> HashMap<u32, [i32; 16]>,
+    ctx: *const std::os::raw::c_void,
+    room: Option<(&CartData, &CollisionCache)>,
+) {
     let (compiled, loaded) = compile_and_load(g, roots, tag).expect("compile+load");
     for _ in 0..8 {
-        let cols = random_columns(&compiled.input_cells, rng);
+        let cols = cols(&compiled.input_cells, rng);
         let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,std::ptr::null());
-        let vals = eval_nodes(g, &cols, None);
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes, ctx);
+        let vals = eval_nodes(g, &cols, room);
         for (ri, r) in roots.iter().enumerate() {
             let base = compiled.root_offsets[ri] as usize;
             match (compiled.root_kinds[ri], vals[*r as usize]) {
@@ -264,8 +274,8 @@ fn check_typed(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
                 (RootKind::Bool, V::B(z)) => {
                     let val = u16::from_le_bytes([out[base], out[base + 1]]);
                     let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
-                    assert_eq!(val, z.val, "{tag}: bool val root {ri}");
                     assert_eq!(known, z.known, "{tag}: bool known root {ri}");
+                    assert_eq!(val & known, z.val & known, "{tag}: bool val root {ri}");
                 }
                 (k, _) => panic!("{tag}: root {ri} kind {k:?} vs oracle type mismatch"),
             }
@@ -312,38 +322,6 @@ fn random_small_columns(cells: &[u32], rng: &mut Lcg) -> HashMap<u32, [i32; 16]>
         .iter()
         .map(|c| (*c, std::array::from_fn::<i32, 16, _>(|_| (rng.i32() % 0x8_0000) - 0x4_0000)))
         .collect()
-}
-
-/// Like `check_typed` but with bounded inputs, for the interval ops.
-fn check_typed_small(g: &Graph, roots: &[NodeId], tag: &str, rng: &mut Lcg) {
-    let (compiled, loaded) = compile_and_load(g, roots, tag).expect("compile+load");
-    for _ in 0..8 {
-        let cols = random_small_columns(&compiled.input_cells, rng);
-        let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,std::ptr::null());
-        let vals = eval_nodes(g, &cols, None);
-        for (ri, r) in roots.iter().enumerate() {
-            let base = compiled.root_offsets[ri] as usize;
-            match (compiled.root_kinds[ri], vals[*r as usize]) {
-                (RootKind::Num, V::N(z)) => {
-                    assert_eq!(&out[base..base + 64], &zn_bytes(z), "{tag}: num root {ri}");
-                }
-                (RootKind::Ival, V::I(z)) => {
-                    assert_eq!(&out[base..base + 64], &zn_bytes(z.lo), "{tag}: ival lo {ri}");
-                    assert_eq!(&out[base + 64..base + 128], &zn_bytes(z.hi), "{tag}: ival hi {ri}");
-                }
-                (RootKind::Bool, V::B(z)) => {
-                    // Only the KNOWN lanes' val bits are defined; compare val
-                    // masked by known, and known exactly.
-                    let val = u16::from_le_bytes([out[base], out[base + 1]]);
-                    let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
-                    assert_eq!(known, z.known, "{tag}: bool known root {ri}");
-                    assert_eq!(val & known, z.val & known, "{tag}: bool val root {ri}");
-                }
-                (k, _) => panic!("{tag}: root {ri} kind {k:?} vs oracle type mismatch"),
-            }
-        }
-    }
 }
 
 /// Build intervals (via Span and a wide Const) and exercise the interval
@@ -425,41 +403,7 @@ fn asm_interval_layer_matches_primitives() {
     for k in [2usize, 4, 7] {
         let cells: Vec<u32> = (0..k as u32).map(|i| i * 3 + 2).collect();
         let (g, roots) = build_interval_graph(&cells);
-        check_typed_small(&g, &roots, &format!("iv{k}"), &mut rng);
-    }
-}
-
-/// Compare typed roots with a real `AsmCtx` (for the call-out ops). `env`
-/// may be null for div/rem/sin (they do not touch it).
-fn check_typed_ctx(
-    g: &Graph,
-    roots: &[NodeId],
-    tag: &str,
-    rng: &mut Lcg,
-    ctx: &crate::transpile::asm::AsmCtx,
-) {
-    let (compiled, loaded) = compile_and_load(g, roots, tag).expect("compile+load");
-    let ctxp = ctx as *const _ as *const std::os::raw::c_void;
-    for _ in 0..8 {
-        let cols = random_small_columns(&compiled.input_cells, rng);
-        let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,ctxp);
-        let vals = eval_nodes(g, &cols, None);
-        for (ri, r) in roots.iter().enumerate() {
-            let base = compiled.root_offsets[ri] as usize;
-            match (compiled.root_kinds[ri], vals[*r as usize]) {
-                (RootKind::Num, V::N(z)) => {
-                    assert_eq!(&out[base..base + 64], &zn_bytes(z), "{tag}: num root {ri}");
-                }
-                (RootKind::Bool, V::B(z)) => {
-                    let val = u16::from_le_bytes([out[base], out[base + 1]]);
-                    let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
-                    assert_eq!(known, z.known, "{tag}: bool known {ri}");
-                    assert_eq!(val & known, z.val & known, "{tag}: bool val {ri}");
-                }
-                (k, _) => panic!("{tag}: root {ri} kind {k:?} mismatch"),
-            }
-        }
+        check(&g, &roots, &format!("iv{k}"), &mut rng, random_small_columns, std::ptr::null(), None);
     }
 }
 
@@ -486,7 +430,7 @@ fn asm_callout_div_rem_sin_matches_primitives() {
         roots.push(sn);
         roots.push(d2);
     }
-    check_typed_ctx(&g, &roots, "callout", &mut rng, &ctx);
+    check(&g, &roots, "callout", &mut rng, random_small_columns, &ctx as *const _ as *const std::os::raw::c_void, None);
 }
 
 /// mget + tile_flag_at, emitted as call-outs into the real collision cache
@@ -525,30 +469,8 @@ fn asm_callout_collision_matches_primitives() {
         roots.push(g.add(Op::Add, vec![mg, w8]));
     }
 
-    let (compiled, loaded) = compile_and_load(&g, &roots, "collision").expect("compile+load");
-    let ctxp = &ctx as *const _ as *const std::os::raw::c_void;
     let mut rng = Lcg(0xc0111_5107);
-    for _ in 0..8 {
-        let cols = random_columns(&compiled.input_cells, &mut rng);
-        let input = pack_inputs(&compiled.input_cells, &cols);
-        let out = run_asm_raw(&loaded, &input, compiled.out_bytes,ctxp);
-        let vals = eval_nodes(&g, &cols, Some((&cart, &cache)));
-        for (ri, r) in roots.iter().enumerate() {
-            let base = compiled.root_offsets[ri] as usize;
-            match (compiled.root_kinds[ri], vals[*r as usize]) {
-                (RootKind::Num, V::N(z)) => {
-                    assert_eq!(&out[base..base + 64], &zn_bytes(z), "collision num root {ri}");
-                }
-                (RootKind::Bool, V::B(z)) => {
-                    let val = u16::from_le_bytes([out[base], out[base + 1]]);
-                    let known = u16::from_le_bytes([out[base + 2], out[base + 3]]);
-                    assert_eq!(known, z.known, "collision bool known {ri}");
-                    assert_eq!(val & known, z.val & known, "collision bool val {ri}");
-                }
-                (k, _) => panic!("collision root {ri} kind {k:?} mismatch"),
-            }
-        }
-    }
+    check(&g, &roots, "collision", &mut rng, random_columns, &ctx as *const _ as *const std::os::raw::c_void, Some((&cart, &cache)));
 }
 
 /// Ice (flag 4, 2026-10-01): the lane primitive's answer through the
@@ -590,7 +512,7 @@ fn asm_value_and_bool_layer_matches_primitives() {
     for k in [3usize, 5, 9, 16] {
         let cells: Vec<u32> = (0..k as u32).map(|i| i * 2 + 3).collect();
         let (g, roots) = build_value_graph(&cells, &mut rng);
-        check_typed(&g, &roots, &format!("val{k}"), &mut rng);
+        check(&g, &roots, &format!("val{k}"), &mut rng, random_columns, std::ptr::null(), None);
     }
 }
 

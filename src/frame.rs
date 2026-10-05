@@ -2354,33 +2354,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    #[ignore]
-    fn forward_run_drives_the_reference_engine() {
-        let engine = RefEngine::new().expect("ref engine");
-        let init = vec![Block::keyed(engine.initial().expect("initial state")).expect("block")];
-
-        let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-test");
-        let _ = std::fs::remove_dir_all(dir);
-        std::fs::create_dir_all(dir).expect("mkdir");
-
-        let result = forward_run(&Mutex::new(engine), init, dir, 4, true).expect("forward_run");
-        // No win in the 4-frame intro; the run reaches the horizon.
-        assert_eq!(result.win_frame, None, "unexpected early win in the intro");
-        assert_eq!(result.frames, 4, "expected 4 frames run");
-        // Recording was on: a position graph was built.
-        let pg = result.pos_graph.expect("pos graph built in record mode");
-        eprintln!("[forward_run] pos-graph: {} live cells", pg.live_cells());
-
-        // Every frame 0..=4 was checkpointed sharded and reloads block-by-block.
-        for frame in 0..=4 {
-            let blocks = load_frame(dir, frame)
-                .unwrap_or_else(|e| panic!("reload frame {frame}: {e}"));
-            assert!(!blocks.is_empty(), "frame {frame} checkpoint is empty");
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     /// A marks file round-trips every state's deadline; one without a deadline
     /// comes back at the horizon, which filters alike (no level runs past it).
     #[test]

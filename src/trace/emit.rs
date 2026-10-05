@@ -309,43 +309,6 @@ pub struct AsmBody {
     pub roots: Vec<NodeId>,
 }
 
-/// The FUSED ASM graph, its bodies, the flat root list, and the input
-/// reprs for a bound frame.
-///
-/// `lower::specialize_frame` resolves every fork configuration into ONE
-/// shared, hash-consed graph - `Split` -> `Frag`, a button's fork -> a
-/// constant - so the result holds only ordinary ops the codegen lowers. The
-/// row key is not in the graph: the ASM path computes it in Rust from the
-/// output cells (`Rt2::boundary`, the one definition of the key).
-///
-/// `flat_roots` is every body's roots concatenated (what `compile` wants);
-/// `bodies` keeps the per-body structure the append step needs.
-pub fn asm_fused(
-    bound: &Bound,
-    room: Option<&crate::transpile::graph::Room>,
-    decide: bool,
-) -> Result<(
-    Graph,
-    Vec<AsmBody>,
-    Vec<NodeId>,
-    std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
-)> {
-    let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = bound
-        .outcomes
-        .iter()
-        .map(|o| (o.outputs.iter().map(|(_, nd, _)| *nd).collect(), o.error, o.live, o.arc.clone()))
-        .collect();
-    let (fused, raw_bodies) = crate::transpile::lower::specialize_frame(
-        &bound.graph,
-        &outs_spec,
-        bound.forks,
-        decide,
-        room,
-        &std::collections::HashMap::new(),
-    );
-    asm_fused_of(bound, fused, raw_bodies)
-}
-
 /// `asm_fused` on a specialization already computed (`Lowered::spec`).
 pub fn asm_fused_from(
     bound: &Bound,

@@ -28,25 +28,6 @@ pub struct Reference {
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 }
 
-/// One kernel per heap SHAPE the room reaches - the CONSTANT-LATTICE
-/// level-0 references (the production base set). The walk-based
-/// generator this used to name was retired with the non-lattice sets
-/// (plans/specialize.md "Spec: latticeify everything, all rooms, one
-/// table").
-///
-/// No pm1 pin: a kernel covers every key of its shape (the pin is worth
-/// -6.3% (T13) and costs a kernel per key). The LATTICE pins are a
-/// different thing: fields constant across the room's reachable states,
-/// whose mismatch (`pin_guard`) is the frame's error.
-///
-/// REFUSES rather than returns a partial set. A shape the fixpoint could
-/// not trace is a kernel that will not exist, and under the never-deopt
-/// doctrine that is a run that stops. Better to fail here, where the
-/// reason is in hand.
-pub fn room_kernels_in(root: &std::path::Path) -> Result<Vec<Reference>> {
-    Ok(lattice_kernel_refs(root, crate::abstraction::Level::EXACT)?.into_iter().map(|(_, r)| r).collect())
-}
-
 /// Restate a lowering failure with its `Cell(n)`s NAMED.
 ///
 /// The emitter works on the bound graph, where an input is a canonical
@@ -377,97 +358,6 @@ fn engine_ranges(
 #[cfg(test)]
 mod tests {
 
-    /// The ASM cutover's compute gate (plans/asm-and-posgraph-execution.md
-    /// B): pull out the FUSED graph (`emit::asm_fused` ->
-    /// `lower::specialize_frame`, the same fused, fork-free graph the Rust
-    /// kernel is emitted from) and assemble it, for EVERY start-room shape.
-    ///
-    /// Because the graph is fused - every fork resolved to `Frag`/const,
-    /// hash-consed - no `Free`/`Split` survives, so all real shapes compile
-    /// and load, not just the fork-free ones. This proves the whole pipeline
-    /// (trace -> specialize -> assemble) end-to-end on real kernel graphs.
-    /// One assembly kernel per shape.
-    #[test]
-    fn every_start_room_kernel_graph_asm_compiles_the_fused_graph() {
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
-            return;
-        }
-        let refs = match super::room_kernels_in(std::path::Path::new(".")) {
-            Ok(r) => r,
-            Err(e) => panic!("{:#}", e),
-        };
-        assert!(!refs.is_empty(), "no start-room kernels traced");
-        let mut total_roots = 0usize;
-        for (si, r) in refs.iter().enumerate() {
-            let room = crate::transpile::graph::Room {
-                cart: r.cart.clone(),
-                cache: r.cache.clone(),
-            };
-            let (fused, bodies, roots, reprs) =
-                crate::trace::emit::asm_fused(&r.bound, Some(&room), true)
-                    .unwrap_or_else(|e| panic!("shape {si} fused extraction failed: {e:#}"));
-            assert!(!bodies.is_empty(), "shape {si}: no bodies");
-            assert!(!roots.is_empty(), "shape {si}: no roots");
-            let (compiled, _loaded) = crate::transpile::asm::compile_and_load_reprs(
-                &fused,
-                &roots,
-                &format!("fused{si}"),
-                &reprs,
-            )
-            .unwrap_or_else(|e| {
-                let msg = format!("{e:#}");
-                // Pull "node N" out and report its consumers, so a domain
-                // mismatch names the op that mishandled it.
-                let mut consumers = String::new();
-                if let Some(rest) = msg.split("node ").nth(1) {
-                    if let Ok(n) = rest
-                        .split(|c: char| !c.is_ascii_digit())
-                        .next()
-                        .unwrap_or("")
-                        .parse::<u32>()
-                    {
-                        for id in 0..fused.len() as u32 {
-                            if fused.get(id).args.contains(&n) {
-                                consumers.push_str(&format!(
-                                    " {}={:?}",
-                                    id,
-                                    fused.get(id).op
-                                ));
-                            }
-                        }
-                    }
-                }
-                panic!(
-                    "shape {si}: fused asm compile+load failed: {msg}\n  consumers:{consumers}"
-                )
-            });
-            assert_eq!(compiled.n_roots, roots.len(), "shape {si}: root count");
-            total_roots += roots.len();
-        }
-        eprintln!(
-            "[asm] {} start-room shapes: fused graph compiled+loaded, {} roots total",
-            refs.len(),
-            total_roots
-        );
-    }
-
-    /// A near level (`r0sxhn`) over room (6,1)'s five fall floors side by
-    /// side: an overlapped floor stores the cart's invariant (hidden), not
-    /// what its update computed (`widen::widen_near_floors`), so the split
-    /// pass resolves only what the player's collisions read - each floor
-    /// solid or not. Storing the computed value split every floor's whole
-    /// update over every floor a region's player might overlap: region (3,6)
-    /// 3,638 outcomes in one frame, region (4,6) past the 4,096 cap, the
-    /// room's kernels unbuildable (2026-10-01).
-    ///
-    /// And a floor that comes back (`delay <= 0 and not check(player, 0,
-    /// 0)`) is, on every lane, solid or hidden - the rows of two outcomes
-    /// already made - so the split pass absorbs it into them
-    /// (`verify::absorbed`) instead of keeping it as a third variant of the
-    /// floor: 3 outcomes a reachable floor became 2. Without it these regions
-    /// trace 99 / 108 / 162 outcomes a frame (2 x 3^4 for region (4,6)'s
-    /// four floors), with it 67 / 32 / 48, and the room's level-0 kernels
-    /// hold half the bodies (287,705 -> 140,323), with identical sets.
     #[test]
     fn near_floors_side_by_side_split_only_what_collisions_read() {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {

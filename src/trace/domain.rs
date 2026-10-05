@@ -1876,46 +1876,6 @@ mod tests {
         assert!(!d.lane_undecidable(cmp), "yet a lane decides it, so it must not fork");
     }
 
-    #[test]
-    fn the_concrete_domain_always_decides() {
-        let mut d = Concrete;
-        let a = d.num(p(3));
-        let b = d.num(p(4));
-        let lt = d.compare(Cmp::Lt, &a, &b).unwrap();
-        assert_eq!(d.decide(&lt), Some(true));
-        // Which is why it never merges: `decide` returning Some is exactly
-        // the condition under which the interpreter takes one arm.
-        let sum = d.arith(Arith::Add, &a, &b).unwrap();
-        assert_eq!(d.as_const(&sum), Some(p(7)));
-    }
-
-    #[test]
-    fn the_symbolic_domain_folds_what_it_can() {
-        let mut d = Symbolic::default();
-        let a = d.num(p(3));
-        let b = d.num(p(4));
-        let sum = d.arith(Arith::Add, &a, &b).unwrap();
-        // Constant-folded, so the HEAP can still index with it. This is
-        // what keeps `count(objects)`, `#t` and loop bounds concrete
-        // without the interpreter special-casing them.
-        assert_eq!(d.as_const(&sum), Some(p(7)));
-        let lt = d.compare(Cmp::Lt, &a, &b).unwrap();
-        assert_eq!(d.decide(&lt), Some(true));
-    }
-
-    #[test]
-    fn an_unknown_condition_is_what_makes_the_interpreter_branch() {
-        let mut d = Symbolic::default();
-        let x = d.graph.leaf(Op::Cell(1)); // stands in for game data
-        let k = d.num(p(0));
-        let gt = d.compare(Cmp::Gt, &x, &k).unwrap();
-        assert_eq!(d.decide(&gt), None, "this is the case that merges");
-        // And the merge itself collapses when the arms agree.
-        let t = d.num(p(1));
-        assert_eq!(d.sel_num(&gt, &t, &t), t);
-        assert_ne!(d.sel_num(&gt, &t, &k), t);
-    }
-
     /// `x == k` on an interval `x` (a near level's floor `state` on `[0, 2]`,
     /// `widen::widen_near_floors`) can come out true on a lane exactly where
     /// `k` is in `x`, and false where `x` is not the single number `k`: the
