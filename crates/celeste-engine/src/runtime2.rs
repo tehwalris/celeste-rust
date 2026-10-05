@@ -229,22 +229,8 @@ pub struct BoundaryIds {
 /// filter misses.
 pub const BALLOON_PERIOD_RAW: i32 = 0xffff;
 
-/// Which fall-floor widening a level applies (`abstraction::FloorsPrecision`,
-/// which lives above this crate): what `Rt2::widen_to` projects a row onto.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FloorsWidening {
-    Exact,
-    /// The countdowns - each fall floor's `delay`, the balloon's respawn
-    /// `timer` - the unknown number (`AV::UNum`), the objects' phases their
-    /// ranges, and every
-    /// floor's `state` and `collideable` widened (`FLOOR_STATE_RANGE`,
-    /// unknown) except in the lanes where the player overlaps it
-    /// (`floor_player_window`).
-    Near,
-}
-
 /// A fall floor's `state` where a near level widens it
-/// (`abstraction::FloorsPrecision::Near`): 0 idle, 1 shaking, 2 hidden, the
+/// (`Level::floors_near`): 0 idle, 1 shaking, 2 hidden, the
 /// only values the cart gives it. An interval, not the unknown number: a lane
 /// may hold it or an exact state (an interval column holds a number as
 /// `[n, n]`). Raw 16.16. ONE definition, shared with the tracer
@@ -841,7 +827,7 @@ impl Rt2 {
     /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
     /// and the abstraction.rs line references).
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, false, false, FloorsWidening::Exact, false);
+        self.widen_to(ids, false, false, false, false);
     }
 
     /// The boundary widenings of a level on this block's columns, per lane -
@@ -852,7 +838,7 @@ impl Rt2 {
     ///   3. dash_effect_time clamped at 0 from below.
     ///   3b. fruit: off := [0, 39] and y := its bob band, together.
     ///   4. timer globals pinned to 0.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, held: bool, fruit: bool, floors: FloorsWidening, platforms: bool) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, held: bool, fruit: bool, floors_near: bool, platforms: bool) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 1. rem widening.
@@ -1055,7 +1041,7 @@ impl Rt2 {
         // `widen::widen_near_phases` writes them. A spring that never bounced
         // has no `delay` (the post-`_init` block, keyed exact): nothing there
         // to widen.
-        if floors == FloorsWidening::Near {
+        if floors_near {
             let phases = self
                 .objects_of_type(ids, ids.g_spring)
                 .into_iter()
@@ -1101,7 +1087,7 @@ impl Rt2 {
         // (`widen::widen_floor_timers`): every fall floor's `delay` and the
         // balloon's `timer` the unknown number. A floor with no `delay` (the
         // post-`_init` block, keyed exact) has nothing there to widen.
-        if floors == FloorsWidening::Near {
+        if floors_near {
             for (ty, f, name) in [(ids.g_fall_floor, ids.f_delay, "delay"), (ids.g_balloon, ids.f_timer, "timer")] {
                 for obj in self.objects_of_type(ids, ty) {
                     let Some(c) = self.obj_field_cell(obj, f) else { continue };
@@ -1111,7 +1097,7 @@ impl Rt2 {
             }
         }
 
-        // 8b. Near (`abstraction::FloorsPrecision::Near`), as that level's
+        // 8b. Near (`Level::floors_near`), as that level's
         // kernels write them (`widen::widen_near_floors`): per lane, every
         // fall floor's `state` the interval `FLOOR_STATE_RANGE` and its
         // `collideable` unknown - but in the lanes
@@ -1119,7 +1105,7 @@ impl Rt2 {
         // (`player_overlaps_floor`, on the positions step 0 left), which keep
         // both as they are. `state` is an interval column in every lane (an
         // exact one `[n, n]`), as the kernels store it.
-        if floors == FloorsWidening::Near {
+        if floors_near {
             let (slo, shi) = (P8::from_raw(FLOOR_STATE_RANGE.0), P8::from_raw(FLOOR_STATE_RANGE.1));
             let span = |v: AV, what: &str| match v {
                 AV::Num(n) => (n, n),
@@ -1353,87 +1339,6 @@ impl Rt2 {
             self.row_keys = keep.iter().map(|&i| self.row_keys[i as usize]).collect();
         }
         self.width = keep.len();
-    }
-
-    /// Append `rows` of `src` (a same-shape block) to this block, column
-    /// by column, keeping a column uniform for as long as every appended
-    /// value equals it. This is the bucket write: no clone, no merge, no
-    /// re-partition - rows land in the block they belong to.
-    pub fn append_rows(&mut self, src: &Rt2, rows: &[u32]) {
-        assert_eq!(self.shape_hash, src.shape_hash, "append_rows: different shapes");
-        assert_eq!(self.structure.len(), src.structure.len());
-        let w = self.width;
-        for c in 0..self.cols.len() {
-            if !matches!(self.structure[c], Cell2::Val) {
-                continue;
-            }
-            let dst = &mut self.cols[c];
-            let sc = &src.cols[c];
-            // Fast path: both uniform and equal.
-            if let (Col::U(a), Col::U(b)) = (&*dst, sc) {
-                if a == b {
-                    continue;
-                }
-            }
-            if w == 0 {
-                // An empty block takes the first append's column as-is:
-                // uniform if the rows agree, else the raw typed form.
-                let vs: Vec<AV> = rows.iter().map(|&r| sc.at(r as usize)).collect();
-                *dst = collapse_uniform(compress_num_v(vs));
-            } else {
-                // The running width: a uniform column that first diverges
-                // at the n-th appended row materializes `w + n` copies.
-                for (n, &r) in rows.iter().enumerate() {
-                    col_push(dst, w + n, sc.at(r as usize));
-                }
-            }
-        }
-        for cell in self.structure.iter_mut() {
-            if let Cell2::Clo(_, caps) = cell {
-                for cap in caps.iter_mut() {
-                    if let Col::U(_) = cap {
-                        continue;
-                    }
-                    panic!("append_rows: a closure capture is not uniform");
-                }
-            }
-        }
-        self.row_keys.extend(rows.iter().map(|&r| src.row_keys[r as usize]));
-        self.width = w + rows.len();
-    }
-
-    /// A copy of just the lanes in `[lo, hi)` - the chunking fast path
-    /// (clone_block + retain_lanes copies the whole block first).
-    pub fn slice_lanes(&self, lo: usize, hi: usize) -> Rt2 {
-        let slice_col = |c: &Col| -> Col {
-            match c {
-                Col::U(a) => Col::U(*a),
-                Col::V(vs) => Col::V(vs[lo..hi].to_vec()),
-                Col::N(vs) => Col::N(vs[lo..hi].to_vec()),
-                Col::I(vs) => Col::I(vs[lo..hi].to_vec()),
-            }
-        };
-        Rt2 {
-            width: hi - lo,
-            structure: self
-                .structure
-                .iter()
-                .map(|cell| match cell {
-                    Cell2::Clo(f, caps) => {
-                        Cell2::Clo(*f, caps.iter().map(&slice_col).collect())
-                    }
-                    other => other.clone(),
-                })
-                .collect(),
-            cols: self.cols.iter().map(&slice_col).collect(),
-            globals: self.globals.clone(),
-            strings: self.strings.clone(),
-            cart: self.cart.clone(),
-            cache: self.cache.clone(),
-            prints: self.prints.clone(),
-            shape_hash: self.shape_hash,
-            row_keys: Vec::new(),
-        }
     }
 
     /// A clone that shares the immutable context (cart/cache Arcs).

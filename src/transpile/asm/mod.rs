@@ -92,12 +92,9 @@ pub fn compile_and_load_reprs(
             count(RootKind::Bool)
         );
     }
-    // The assembly TEXT is only the assembler's input: dropped once the
-    // .so is loaded (room (2,0)'s 17 kernel sets held ~8 GB after their
-    // prebuild, 2026-09-14). `CELESTE_KEEP_ASM` keeps it for a dump.
-    if std::env::var_os("CELESTE_KEEP_ASM").is_none() {
-        compiled.asm = String::new();
-    }
+    // The assembly TEXT is only the assembler's input: dropped once the .so
+    // is loaded (room (2,0)'s 17 kernel sets held ~8 GB of it).
+    compiled.asm = String::new();
     Ok((compiled, loaded))
 }
 

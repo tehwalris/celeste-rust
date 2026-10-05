@@ -277,19 +277,12 @@ pub trait Domain {
     /// has no graph.
     fn evaluated_at(&mut self, _n: &Self::Num, _at: &Self::Bool) {}
 
-    /// The arity of the fork `__split_by_flr` takes on `v`: `move_ways`,
+    /// The arity of the fork `__split_by_flr` takes on `v`: `MOVE_WAYS`,
     /// or where the trace knows `v`'s static range (a region kernel, level
     /// -1) the most grid cells one piece of it crosses - a lane's interval
     /// lies within one piece, and `SplitOk` checks it.
     fn flr_ways(&mut self, _v: &Self::Num) -> u8 {
-        self.move_ways()
-    }
-
-    /// The arity of the `move` fork (`__split_by_flr`): `rem + spd + 0.5`
-    /// with an exact speed and a rem within one grid cell spans at most two
-    /// floors.
-    fn move_ways(&self) -> u8 {
-        2
+        MOVE_WAYS
     }
 
     /// The join of a merge on a condition NO LANE can decide, where the arms
@@ -461,17 +454,17 @@ pub struct Symbolic {
     /// than exact per lane (`level_minus_one`). Off everywhere else.
     pub uncapped_ways: bool,
     /// Held buttons unknown for the set being traced
-    /// (`abstraction::HeldPrecision`): `trace_frame` forks the player's
+    /// (`Level::held`): `trace_frame` forks the player's
     /// `p_jump` / `p_dash` (`widen::fork_held_inputs`). Set by the walk.
     pub held_unknown: bool,
     /// The fly fruit unknown for the set being traced
-    /// (`abstraction::FruitPrecision`, plans/fly-fruit.md): `trace_frame`
+    /// (`Level::fruit`): `trace_frame`
     /// replaces the fruit's inputs (`widen::fork_fruit_inputs`), arithmetic on
     /// literal intervals folds to literals, and a merge on a condition no lane
     /// decides joins its literal arms (`join_num_independent`). Set by the walk.
     pub fruit_unknown: bool,
     /// The fall floors widened but where the player overlaps one
-    /// (`abstraction::FloorsPrecision::Near`): `trace_frame` forks each
+    /// (`Level::floors_near`): `trace_frame` forks each
     /// floor's `collideable` input (`widen::fork_near_floor_inputs`), every
     /// outcome stores `state` and `collideable` per lane widened or exact
     /// (`widen::widen_near_floors`), and each floor's `delay` and the
@@ -479,7 +472,7 @@ pub struct Symbolic {
     /// which the next frame reads as unknown
     /// (`widen::forget_countdown_inputs`). Set by the walk.
     pub floors_near: bool,
-    /// The moving platforms unknown (`abstraction::PlatformsPrecision`,
+    /// The moving platforms unknown (`Level::platforms`,
     /// plans/platforms-unknown.md): `trace_frame` widens their inputs
     /// (`widen::platform_inputs`), every outcome their outputs.
     pub platforms_unknown: bool,
@@ -1476,7 +1469,7 @@ impl Domain for Symbolic {
         // Only a trace with seeded ranges knows a static range: an
         // unspecialized trace keeps the fixed arity (and its gates).
         if self.ranges.is_empty() {
-            return self.move_ways();
+            return MOVE_WAYS;
         }
         // At most `move_ways`: the static range is over ALL lanes, and one
         // lane's interval spans at most that many floors. A region kernel's
@@ -1499,11 +1492,11 @@ impl Domain for Symbolic {
                     let hi = ps.iter().map(|p| p.1 >> sh).max().unwrap_or(0);
                     (hi - lo + 1).min(i64::from(u8::MAX))
                 } else {
-                    ps.iter().map(|p| (p.1 >> sh) - (p.0 >> sh) + 1).max().unwrap_or(1).min(self.move_ways() as i64)
+                    ps.iter().map(|p| (p.1 >> sh) - (p.0 >> sh) + 1).max().unwrap_or(1).min(MOVE_WAYS as i64)
                 };
                 w.max(1) as u8
             }
-            None => self.move_ways(),
+            None => MOVE_WAYS,
         }
     }
 
@@ -1737,15 +1730,16 @@ impl Domain for Symbolic {
 /// A refusal the tracer makes rather than guessing. Kept separate from
 /// ordinary errors because these are the interesting ones: each is a place
 /// the heap would have had to become symbolic.
+/// The arity of the `move` fork (`__split_by_flr`): `rem + spd + 0.5` with an
+/// exact speed and a rem within one grid cell spans at most two floors.
+pub const MOVE_WAYS: u8 = 2;
+
 pub fn refuse_unknown(what: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "{} is not known at trace time - the heap cannot depend on a symbolic value",
         what
     )
 }
-
-#[allow(dead_code)]
-fn _assert_object_safe(_: &dyn Fn(&mut Symbolic)) {}
 
 #[cfg(test)]
 mod tests {

@@ -44,7 +44,7 @@ pub struct Reference {
 /// doctrine that is a run that stops. Better to fail here, where the
 /// reason is in hand.
 pub fn room_kernels_in(root: &std::path::Path) -> Result<Vec<Reference>> {
-    Ok(lattice_kernel_refs(root, super::shapes::WalkOpts::LEVEL0)?.into_iter().map(|(_, r)| r).collect())
+    Ok(lattice_kernel_refs(root, crate::abstraction::Level::EXACT)?.into_iter().map(|(_, r)| r).collect())
 }
 
 /// Restate a lowering failure with its `Cell(n)`s NAMED.
@@ -86,7 +86,7 @@ fn name_cells(f: &super::verify::Frame, e: anyhow::Error) -> anyhow::Error {
 /// strict mode, not a fallback.
 pub(crate) fn lattice_kernel_refs(
     root: &std::path::Path,
-    opts: super::shapes::WalkOpts,
+    opts: crate::abstraction::Level,
 ) -> Result<Vec<(Option<Region>, Reference)>> {
     let mut lw = room_constant_lattice(root, opts)?;
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
@@ -313,7 +313,7 @@ fn no_player_ranges(
     reset: &'static full_moon::ast::Ast,
     fr: &'static full_moon::ast::Ast,
     start: &super::state::State<super::domain::Symbolic>,
-    opts: super::shapes::WalkOpts,
+    opts: crate::abstraction::Level,
 ) -> Result<Bounds> {
     use super::iface::Conc;
     use super::shapes;
@@ -475,9 +475,7 @@ mod tests {
         }
         std::env::set_var("CELESTE_START_ROOM", "6,1");
         std::env::set_var("CELESTE_WALK_REGIONS", "(3,6) (4,6)");
-        let opts = crate::trace::shapes::WalkOpts::LEVEL0
-            .with_held(true)
-            .with_floors_near(true);
+        let opts = crate::abstraction::Level { held: true, floors_near: true, ..crate::abstraction::Level::EXACT };
         let lw = super::room_constant_lattice(std::path::Path::new("."), opts).unwrap_or_else(|e| panic!("{e:#}"));
         let mut traced = 0;
         for ((shape, region), f) in &lw.frames {
@@ -512,7 +510,7 @@ mod tests {
 /// see the variant it generates for.
 pub fn room_constant_lattice(
     root: &std::path::Path,
-    opts: super::shapes::WalkOpts,
+    opts: crate::abstraction::Level,
 ) -> Result<LatticeWalk> {
     use super::domain::Symbolic;
     use super::interp::Interp;
@@ -912,7 +910,7 @@ pub fn room_constant_lattice(
 /// level's widened objects). The `rnd`-derived ones (`ival_extra`) come on
 /// top: `rnd` is an interval at every level, and room (5,0)'s balloon phase
 /// is one from `_init` on (2026-09-21).
-fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: super::shapes::WalkOpts) -> Vec<super::iface::Path> {
+fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: crate::abstraction::Level) -> Vec<super::iface::Path> {
     let mut ival = super::shapes::ival_paths(st);
     // The moving platforms' `x` and `last` at a platforms-unknown level:
     // interval inputs, their whole path (plans/platforms-unknown.md).
@@ -1015,7 +1013,7 @@ pub struct WalkFrame {
 fn walk_trace(
     tr: &mut Tracer,
     job: &WalkJob,
-    opts: super::shapes::WalkOpts,
+    opts: crate::abstraction::Level,
     grid: Option<RegionGrid>,
     room0: (i16, i16),
 ) -> Result<WalkTraced> {
@@ -1137,7 +1135,7 @@ pub struct LatticeWalk {
     pub tracer: Tracer,
     /// Shape hash (of the input structure) -> the walk's shape key.
     pub by_hash: std::collections::HashMap<u64, String>,
-    pub opts: super::shapes::WalkOpts,
+    pub opts: crate::abstraction::Level,
     /// The start state's shape key.
     pub start_key: String,
     pub lattice: std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,

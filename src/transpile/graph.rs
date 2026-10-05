@@ -26,7 +26,7 @@
 //!   finished graph, not distinct node types. So `zn_mul` and `zi_mul_pos`
 //!   are one op, as are `zsel_n`/`zsel_b`/`zsel_i` and `if c {a} else {b}`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use std::sync::Arc;
 
@@ -1330,14 +1330,6 @@ impl Graph {
             _ => bail!("cannot join a number with a boolean"),
         })
     }
-}
-
-/// One member of a specialization set: what it writes, and whether the
-/// result counts. That is the whole interface.
-pub struct Member {
-    pub label: String,
-    pub outputs: BTreeMap<u32, NodeId>,
-    pub valid: NodeId,
 }
 
 #[cfg(test)]

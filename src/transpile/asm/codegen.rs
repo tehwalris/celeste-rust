@@ -1307,10 +1307,7 @@ fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
     // the most operands' live ranges - and only chase ILP while there is
     // room. `rem` counts each vreg's not-yet-emitted consumers; a vreg dies
     // when its last consumer is emitted.
-    let limit: usize = std::env::var("CELESTE_ASM_PRESSURE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
+    let limit: usize = 16;
     let mut rem: Vec<u32> = vec![0; n_vregs as usize];
     for i in 0..n {
         for v in &uses[i] {
@@ -1961,13 +1958,9 @@ pub fn compile(
     // at each depth every row's mix-at-that-step is adjacent, so the two
     // mul ports stay fed. Operands always have strictly smaller depth, so
     // this is still a valid evaluation order for the `Value` map.
-    // Batch size for the interleaving scheduler. Env-tunable while the
-    // sweet spot is being measured; defaults to a value that keeps live
-    // accumulators well under the 26 homes.
-    let batch = std::env::var("CELESTE_ASM_BATCH")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(4);
+    // Batch size for the interleaving scheduler: keeps live accumulators
+    // well under the 26 homes.
+    let batch = 4;
     let t_lower = std::time::Instant::now();
     let order = schedule(g, &live, roots, batch);
     // `CELESTE_ASM_STATS`: which graph op each vreg and instruction came from.
@@ -2061,14 +2054,11 @@ pub fn compile(
     }
 
     // Instruction-level list scheduling to interleave the independent mul
-    // chains (see `reschedule`). On by default; CELESTE_ASM_SCHED=0 disables
-    // it for A/B.
-    if std::env::var("CELESTE_ASM_SCHED").map(|s| s != "0").unwrap_or(true) {
-        let t = std::time::Instant::now();
-        lo.insts = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
-        if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
-            eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
-        }
+    // chains (see `reschedule`).
+    let t = std::time::Instant::now();
+    lo.insts = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
+    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+        eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
     }
 
     // Which vregs are cheap to recompute from input memory (a load, or bits

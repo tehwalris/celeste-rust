@@ -371,10 +371,9 @@ the list (coarsest first; one level is the usual case):
 Resume: rerun the same command; the forward resumes or is reused, the arc
 phase reruns (minutes). A fresh forward clears `frames/` and `edges/`.
 Nothing on disk records the level: reusing a tree under another `--level` is
-on you. Kernel sets are keyed by the level's four flags;
-`CELESTE_KERNEL_SETS=N` caps the resident ones (LRU) for tools that run two
-levels. Fused graphs are dropped after assembly unless
-`CELESTE_ASM_EVAL_CHECK` / `CELESTE_KERNEL_EXPLAIN`.
+on you. One kernel set is resident, the process-global level's; a call at
+another level drops it and builds that level's. Fused graphs are dropped
+after assembly unless `CELESTE_KERNEL_EXPLAIN`.
 
 **The objects ladder, and when it is needed.** Validation (plans/results.md,
 "The arc pipeline"): rooms (1,0) 99, (4,2) 71, (5,3) 79, (3,3) 172 and

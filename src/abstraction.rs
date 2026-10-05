@@ -14,96 +14,32 @@
 //! kernels' boundary) and in the block model (`Rt2::widen_to`, a row's
 //! projection onto a level); this module only names them.
 
-/// The player's HELD-BUTTON trails `p_jump` / `p_dash` (plans/abstractions.md).
-/// They only record last frame's jump / dash button, to detect a press, and
-/// each doubles the state count. `Unknown`: the kernels write both unknown at
-/// the boundary and fork both values inside the frame, so one row covers both
-/// twins. Holding a button may then re-trigger a press - an
-/// over-approximation the concrete count-up refutes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum HeldPrecision {
-    Unknown,
-    Exact,
-}
-
-impl HeldPrecision {
-    pub fn is_unknown(self) -> bool {
-        self == HeldPrecision::Unknown
-    }
-}
-
-/// The FLY FRUIT (plans/abstractions.md): `Unknown`, its `step` and `y` are
-/// unknown numbers, its `spd.y` / `rem.y` their whole ranges and `fly` an
-/// unknown boolean (`widen::fork_fruit_inputs`, `widen::widen_fly_fruit`),
-/// so the uncollected fruit is one row per frame.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum FruitPrecision {
-    Unknown,
-    Exact,
-}
-
-impl FruitPrecision {
-    pub fn is_unknown(self) -> bool {
-        self == FruitPrecision::Unknown
-    }
-}
-
-/// The FALL FLOORS and the objects' phases (plans/abstractions.md). `Near`
-/// (2026-09-30, room (7,0)) stores the countdowns - each floor's `delay`, the
-/// balloon's respawn `timer`, the spring's - as the unknown number
-/// (`widen::widen_floor_timers`), each floor's `state` as the interval [0, 2]
-/// and its `collideable` unknown - EXCEPT where the player overlaps the floor
-/// at the end of the frame (`runtime2::floor_player_window`), where they stay
-/// exact - hidden, the cart's invariant there, owed by the widening
-/// (`widen::widen_near_floors`) - and the objects' phases as their ranges
-/// (`widen::phase_paths`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum FloorsPrecision {
-    Near,
-    Exact,
-}
-
-impl FloorsPrecision {
-    /// Widened except where the player overlaps the floor (`Near`).
-    pub fn is_near(self) -> bool {
-        self == FloorsPrecision::Near
-    }
-}
-
-/// The moving PLATFORMS (plans/abstractions.md): `Unknown`, every platform's
-/// `x` and `last` are the interval of its whole path and its `rem.x` the
-/// whole remainder - its phase forgotten, so states from different frames
-/// merge.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum PlatformsPrecision {
-    Unknown,
-    Exact,
-}
-
-impl PlatformsPrecision {
-    pub fn is_unknown(self) -> bool {
-        self == PlatformsPrecision::Unknown
-    }
-}
-
-/// A LEVEL: the objects it widens. The process-global level (`set_level`)
-/// names the level whose kernels the engine dispatches to.
+/// A LEVEL: which objects the forward widens (plans/abstractions.md). Each
+/// widening over-approximates; the concrete search refutes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct Level {
-    pub held: HeldPrecision,
-    pub fruit: FruitPrecision,
-    pub floors: FloorsPrecision,
-    pub platforms: PlatformsPrecision,
+    /// `h`: the player's held-button trails `p_jump` / `p_dash` unknown at
+    /// the boundary and forked both ways inside the frame (holding a button
+    /// may then re-trigger a press).
+    pub held: bool,
+    /// `f`: the fly fruit's `step` and `y` unknown numbers, `spd.y` / `rem.y`
+    /// their whole ranges, `fly` unknown (`widen::fork_fruit_inputs`,
+    /// `widen::widen_fly_fruit`).
+    pub fruit: bool,
+    /// `n`: the countdowns (floor `delay`, balloon `timer`, the spring's) the
+    /// unknown number, each fall floor's `state` [0, 2] and `collideable`
+    /// unknown except where the player overlaps the floor at the frame's end
+    /// (`runtime2::floor_player_window`), the objects' phases their ranges
+    /// (`widen::widen_near_floors`, `widen::phase_paths`).
+    pub floors_near: bool,
+    /// `p`: every moving platform's `x` and `last` the interval of its whole
+    /// path, its `rem.x` the whole remainder (its phase forgotten).
+    pub platforms: bool,
 }
 
 impl Level {
     /// Every object exact (`r0sx`).
-    pub const EXACT: Level = Level {
-        held: HeldPrecision::Exact,
-        fruit: FruitPrecision::Exact,
-        floors: FloorsPrecision::Exact,
-        platforms: PlatformsPrecision::Exact,
-    };
+    pub const EXACT: Level = Level { held: false, fruit: false, floors_near: false, platforms: false };
 
     /// A level from `r0sx[h][f][n][p]` (the remainder rung 0 and the exact
     /// speed every level has, then the flags): `h` held buttons unknown, `f`
@@ -124,14 +60,11 @@ impl Level {
                 None => false,
             }
         };
-        let held = if flag('h') { HeldPrecision::Unknown } else { HeldPrecision::Exact };
-        let fruit = if flag('f') { FruitPrecision::Unknown } else { FruitPrecision::Exact };
-        let floors = if flag('n') { FloorsPrecision::Near } else { FloorsPrecision::Exact };
-        let platforms = if flag('p') { PlatformsPrecision::Unknown } else { PlatformsPrecision::Exact };
+        let level = Level { held: flag('h'), fruit: flag('f'), floors_near: flag('n'), platforms: flag('p') };
         if !rest.is_empty() {
             return Err(format!("level {spec:?}: unexpected {rest:?} (flags are h, f, n, p in that order)"));
         }
-        Ok(Level { held, fruit, floors, platforms })
+        Ok(level)
     }
 }
 
@@ -139,7 +72,7 @@ impl std::fmt::Display for Level {
     /// The spec `parse` reads.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "r0sx")?;
-        for (on, c) in [(self.held.is_unknown(), 'h'), (self.fruit.is_unknown(), 'f'), (self.floors.is_near(), 'n'), (self.platforms.is_unknown(), 'p')] {
+        for (on, c) in [(self.held, 'h'), (self.fruit, 'f'), (self.floors_near, 'n'), (self.platforms, 'p')] {
             if on {
                 write!(f, "{c}")?;
             }
@@ -172,7 +105,7 @@ mod tests {
             assert_eq!(Level::parse(spec).unwrap().to_string(), spec);
         }
         let hn = Level::parse("r0sxhn").unwrap();
-        assert!(hn.held.is_unknown() && hn.floors.is_near() && !hn.fruit.is_unknown() && !hn.platforms.is_unknown());
+        assert!(hn.held && hn.floors_near && !hn.fruit && !hn.platforms);
         // The rem rungs, speed buckets and position buckets are gone.
         assert!(Level::parse("r1sx").is_err());
         assert!(Level::parse("rxsx").is_err());

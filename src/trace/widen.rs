@@ -368,7 +368,7 @@ pub fn forget_countdown_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Re
 }
 
 /// The fields a near level widens but where the player overlaps the floor
-/// (`abstraction::FloorsPrecision::Near`), per fall floor; its countdowns are
+/// (`Level::floors_near`), per fall floor; its countdowns are
 /// `floor_timer_paths`, the objects' phases `phase_paths`.
 pub struct NearFloorPaths {
     pub floors: Vec<Path>,
@@ -426,7 +426,7 @@ fn widen_near_phases(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
     Ok(())
 }
 
-/// A near level's INPUT side (`abstraction::FloorsPrecision::Near`): a floor's
+/// A near level's INPUT side (`Level::floors_near`): a floor's
 /// `state` arrives as an interval input (`FLOOR_STATE_RANGE`, or `[n, n]`) and
 /// is read as it is - its update's `state == k` is undecided on a widened lane
 /// and split (`verify::split_undecided_selects`, the equal side narrowed to
@@ -481,7 +481,7 @@ pub fn fork_unknown_near_collideables(st: &mut State<Symbolic>, d: &mut Symbolic
 /// `check` at `(ox, oy)` overlaps where the player at `(x + ox, y + oy)` would.
 pub const PLAYER_PROBE: [(i16, i16); 2] = [(-3, 3), (-1, 0)];
 
-/// A near level's OUTPUT side (`abstraction::FloorsPrecision::Near`,
+/// A near level's OUTPUT side (`Level::floors_near`,
 /// 2026-09-30, room (7,0)): every fall floor stores its `state`
 /// as the interval `FLOOR_STATE_RANGE` and its `collideable` unknown - EXCEPT
 /// where a player overlaps it (the cart's `floor.collide(player, 0, 0)`,

@@ -1225,7 +1225,7 @@ impl Registry {
 
     /// Retrace the start room and assemble every shape for one lattice set
     /// (`opts`). `root` is the repo root (Lua sources + cart).
-    pub fn build_for_start_room(root: &Path, opts: crate::trace::shapes::WalkOpts) -> Result<Registry> {
+    pub fn build_for_start_room(root: &Path, opts: crate::abstraction::Level) -> Result<Registry> {
         let t_trace = std::time::Instant::now();
         let refs = crate::trace::kernel::lattice_kernel_refs(root, opts)
             .context("retracing the start room for ASM kernels")?;
@@ -1732,123 +1732,27 @@ pub(crate) fn take_call_stats() -> [u64; 7] {
     std::array::from_fn(|i| CALL_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
-/// The kernel set of the process-global level (built on first use).
+/// The kernel set of the process-global level, built on first use. ONE set
+/// is resident (a set is ~1.7 GB, room (3,0)): a call at another level drops
+/// it and builds that level's, on a big stack (the retrace's init interpret
+/// recurses deeper than a worker thread's default); concurrent callers wait
+/// for the build. A caller holds its set by `Arc` for the call, so a dropped
+/// set lives on until its last chunk ends. Levels only change between
+/// forwards (the objects ladder runs its levels in order).
 pub(crate) fn registry() -> Option<std::sync::Arc<Registry>> {
-    registry_for(crate::abstraction::current_level())
-}
-
-// Held buttons, the fly fruit, the floors and the platforms widened or exact.
-const HELD_SLOTS: usize = 2;
-const FRUIT_SLOTS: usize = 2;
-const FLOORS_SLOTS: usize = 2;
-const PLATFORMS_SLOTS: usize = 2;
-const LEVEL_SLOTS: usize = HELD_SLOTS * FRUIT_SLOTS * FLOORS_SLOTS * PLATFORMS_SLOTS;
-
-/// The kernel set for one LEVEL, built on a big stack (the retrace's init
-/// interpret recurses deeper than a worker thread's default). The root is
-/// `CELESTE_ROOT` or the CWD.
-///
-/// One set per level (held x fruit x floors x platforms): the kernels
-/// specialize to the level, so a tool that runs two levels in one process
-/// (`ref-check`, `follow`, `rerun-row` against a tree of another level)
-/// needs a set for each. The level is an explicit input of the build, not
-/// read from the process-global level; one build per level at a time
-/// (`BUILDING`), a second caller waits for it.
-///
-/// RESIDENT SETS ARE CAPPED (2026-09-19): a set is ~1.7 GB resident (room
-/// (3,0): 306 kernels). `CELESTE_KERNEL_SETS=N` keeps at most N built sets;
-/// building one more evicts the least recently used, rebuilt if its level
-/// runs again. Unset: no cap, every set stays. A caller holds its set by
-/// `Arc` for the call, so an evicted set lives on until its last chunk ends.
-fn registry_for(level: crate::abstraction::Level) -> Option<std::sync::Arc<Registry>> {
-    static BUILDING: [std::sync::Mutex<()>; LEVEL_SLOTS] = [const { std::sync::Mutex::new(()) }; LEVEL_SLOTS];
-    let slot = level_slot(level);
-    if let Some(r) = SETS.lock().unwrap().get(slot) {
-        return r;
-    }
-    let _building = BUILDING[slot].lock().unwrap();
-    if let Some(r) = SETS.lock().unwrap().get(slot) {
-        return r;
-    }
-    let built = build_registry_for_level(level).map(std::sync::Arc::new);
-    let evicted = SETS.lock().unwrap().insert(slot, level, built.clone());
-    // Unloaded outside the lock: every other chunk's lookup waits on it.
-    drop(evicted);
-    built
-}
-
-/// The built kernel sets, most recently used last.
-static SETS: std::sync::Mutex<Sets> = std::sync::Mutex::new(Sets { resident: Vec::new(), tick: 0 });
-
-struct Sets {
-    resident: Vec<ResidentSet>,
-    tick: u64,
-}
-
-struct ResidentSet {
-    slot: usize,
-    level: crate::abstraction::Level,
-    /// `None`: the level has no kernel set (cached too; costs nothing).
-    set: Option<std::sync::Arc<Registry>>,
-    used: u64,
-}
-
-impl Sets {
-    fn get(&mut self, slot: usize) -> Option<Option<std::sync::Arc<Registry>>> {
-        self.tick += 1;
-        let tick = self.tick;
-        self.resident.iter_mut().find(|r| r.slot == slot).map(|r| {
-            r.used = tick;
-            r.set.clone()
-        })
-    }
-
-    /// Add a built set; returns the sets the cap evicts, for the caller to
-    /// drop outside the lock.
-    fn insert(
-        &mut self,
-        slot: usize,
-        level: crate::abstraction::Level,
-        set: Option<std::sync::Arc<Registry>>,
-    ) -> Vec<ResidentSet> {
-        self.tick += 1;
-        self.resident.push(ResidentSet { slot, level, set, used: self.tick });
-        let mut evicted = Vec::new();
-        let Some(cap) = kernel_set_cap() else { return evicted };
-        while self.resident.iter().filter(|r| r.set.is_some()).count() > cap {
-            let (i, _) = self
-                .resident
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.set.is_some())
-                .min_by_key(|(_, r)| r.used)
-                .expect("over the cap, so one is built");
-            let r = self.resident.remove(i);
-            eprintln!("[asm build] evicted the {} kernel set (CELESTE_KERNEL_SETS={cap})", r.level);
-            evicted.push(r);
+    type Resident = Option<(crate::abstraction::Level, Option<std::sync::Arc<Registry>>)>;
+    static SET: std::sync::Mutex<Resident> = std::sync::Mutex::new(None);
+    let level = crate::abstraction::current_level();
+    let mut set = SET.lock().unwrap();
+    match &*set {
+        Some((l, r)) if *l == level => r.clone(),
+        _ => {
+            *set = None;
+            let built = build_registry_for_level(level).map(std::sync::Arc::new);
+            *set = Some((level, built.clone()));
+            built
         }
-        evicted
     }
-}
-
-/// `CELESTE_KERNEL_SETS`: the most built kernel sets kept at once (>= 1).
-fn kernel_set_cap() -> Option<usize> {
-    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("CELESTE_KERNEL_SETS").ok().map(|v| {
-            let n: usize = v.parse().unwrap_or_else(|_| panic!("CELESTE_KERNEL_SETS={v}: not a count"));
-            assert!(n >= 1, "CELESTE_KERNEL_SETS=0: the running level needs its set");
-            n
-        })
-    })
-}
-
-fn level_slot(level: crate::abstraction::Level) -> usize {
-    let held_slot = level.held.is_unknown() as usize;
-    let fruit_slot = level.fruit.is_unknown() as usize;
-    let floors_slot = level.floors.is_near() as usize;
-    let platforms_slot = level.platforms.is_unknown() as usize;
-    ((held_slot * FRUIT_SLOTS + fruit_slot) * FLOORS_SLOTS + floors_slot) * PLATFORMS_SLOTS + platforms_slot
 }
 
 /// THE KERNEL BUILD'S PURGE DELAY (2026-09-18). `safe-run.sh` has mimalloc
@@ -1902,13 +1806,11 @@ impl Drop for BuildPurgeDelay {
 }
 
 fn build_registry_for_level(level: crate::abstraction::Level) -> Option<Registry> {
-    use crate::trace::shapes::WalkOpts;
     let _purge = BuildPurgeDelay::start();
     let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
-    let opts = WalkOpts::LEVEL0.with_held(level.held.is_unknown()).with_fruit(level.fruit.is_unknown()).with_floors_near(level.floors.is_near()).with_platforms(level.platforms.is_unknown());
     let built = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || Registry::build_for_start_room(Path::new(&root), opts))
+        .spawn(move || Registry::build_for_start_room(Path::new(&root), level))
         .expect("spawn asm-kernel builder")
         .join()
         .expect("asm-kernel builder panicked");

@@ -83,13 +83,7 @@ impl Block {
     /// decided is exact (the kernels widen them at the frame's start, and the
     /// post-`_init` state is a shape no frame returns to).
     pub fn keyed(mut rt2: Rt2) -> Result<Self> {
-        use crate::abstraction::{current_level, FloorsPrecision, FruitPrecision, Level, PlatformsPrecision};
-        let level = Level {
-            fruit: FruitPrecision::Exact,
-            floors: FloorsPrecision::Exact,
-            platforms: PlatformsPrecision::Exact,
-            ..current_level()
-        };
+        let level = crate::abstraction::Level { held: crate::abstraction::current_level().held, ..crate::abstraction::Level::EXACT };
         let (_, keys, _) = widened_keys_rt2(&rt2, level)?;
         rt2.row_keys_canonical();
         rt2.row_keys = keys;
@@ -224,19 +218,6 @@ pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
     *RECT.get_or_init(|| {
         if let Some((x, y)) = crate::abstraction::synthetic_win_xy() {
             return Some((x, x, y, y));
-        }
-        // EXPERIMENT (like `CELESTE_WIN_AT_XY`, a different search whose trees
-        // are comparable to no real campaign's): `CELESTE_WIN_RECT="x0,x1,y0,y1"`,
-        // an artificial finish line part-way through a room, to study the
-        // ladder on the room's first half.
-        if let Ok(raw) = std::env::var("CELESTE_WIN_RECT") {
-            let v: Vec<i16> = raw
-                .split(',')
-                .map(|t| t.trim().parse().unwrap_or_else(|e| panic!("CELESTE_WIN_RECT {raw:?}: {e}")))
-                .collect();
-            let [x0, x1, y0, y1] = v[..] else { panic!("CELESTE_WIN_RECT must be \"x0,x1,y0,y1\", got {raw:?}") };
-            eprintln!("[win] EXPERIMENT: the player wins at x {x0}..={x1}, y {y0}..={y1} (CELESTE_WIN_RECT)");
-            return Some((x0, x1, y0, y1));
         }
         let (rx, ry) = crate::game_runner::start_room();
         if crate::game_runner::level_index(rx, ry) != SUMMIT_LEVEL {
@@ -1349,20 +1330,10 @@ pub fn widened_keys(
     widened_keys_rt2(&block.rt2, coarser)
 }
 
-/// The fall-floor projection a level's rows are keyed on (`Rt2::widen_to`).
-pub fn floors_widening(floors: crate::abstraction::FloorsPrecision) -> celeste_engine::runtime2::FloorsWidening {
-    use crate::abstraction::FloorsPrecision as P;
-    use celeste_engine::runtime2::FloorsWidening as W;
-    match floors {
-        P::Exact => W::Exact,
-        P::Near => W::Near,
-    }
-}
-
 /// `rt2` projected IN PLACE onto `level` (`Rt2::widen_to`): the row the
 /// level's kernels would store for it (the remainder widened at every level).
 pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::abstraction::Level) {
-    rt2.widen_to(crate::compiled::ids(), level.held.is_unknown(), level.fruit.is_unknown(), floors_widening(level.floors), level.platforms.is_unknown());
+    rt2.widen_to(crate::compiled::ids(), level.held, level.fruit, level.floors_near, level.platforms);
 }
 
 /// `(shape, keys, cells)` of the widened rows - the shape is the widened
@@ -1472,7 +1443,7 @@ pub fn forward_frame(
     // Under the split-frame prototype a game frame is two steps.
     let game_frame = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { frame.div_ceil(2) } else { frame };
     anyhow::ensure!(
-        !level.platforms.is_unknown() || game_frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
+        !level.platforms || game_frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
         "frame {frame} at {level}: the platform worlds cover {} frames",
         crate::trace::kernel::PLATFORM_WORLD_FRAMES
     );

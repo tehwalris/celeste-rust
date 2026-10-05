@@ -78,39 +78,13 @@ pub fn room_context() -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
     Ok(CTX.get().expect("just set").clone())
 }
 
-pub struct FrameEngine {
-    ids: runtime2::BoundaryIds,
-    cart: Arc<CartData>,
-    cache: Arc<CollisionCache>,
-}
+pub struct FrameEngine;
 
 impl FrameEngine {
-    pub fn new(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Self {
-        FrameEngine {
-            ids: boundary_ids(),
-            cart,
-            cache,
-        }
-    }
-
-    /// The engine for the configured start room (`room_context`).
+    /// The engine for the configured start room (its cart loads here).
     pub fn new_for_start_room() -> Result<Self> {
-        let (cart, cache) = room_context()?;
-        Ok(Self::new(cart, cache))
-    }
-
-    pub fn ids(&self) -> &runtime2::BoundaryIds {
-        &self.ids
-    }
-
-    /// The room this engine was built for. Exposed so a caller comparing
-    /// against it can import a state into a block the same way it does.
-    pub fn cart(&self) -> Arc<CartData> {
-        self.cart.clone()
-    }
-
-    pub fn cache(&self) -> Arc<CollisionCache> {
-        self.cache.clone()
+        room_context()?;
+        Ok(FrameEngine)
     }
 
     /// One frame of one BUCKET (one shape's block of the frontier), emitted

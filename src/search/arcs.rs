@@ -197,9 +197,6 @@ impl Rects {
     pub fn empty() -> Self {
         Rects(Vec::new())
     }
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
     pub fn contains(&self, x: u32, y: u32) -> bool {
         self.0.iter().any(|r| r.x.contains(x) && r.y.contains(y))
     }
@@ -219,11 +216,6 @@ impl Rects {
             }
         }
         self.0.push(r);
-    }
-    pub fn extend(&mut self, o: Rects) {
-        for r in o.0 {
-            self.add(r);
-        }
     }
 }
 

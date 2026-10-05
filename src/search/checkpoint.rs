@@ -407,19 +407,6 @@ impl FrameFile {
     pub fn load_all(&self) -> Result<Option<Rt2>> {
         self.load_rows(&[0..self.header.width])
     }
-
-    /// The rows in `cells`, as one block (`None` if there are none).
-    pub fn load_cells(&self, cells: &rustc_hash::FxHashSet<u32>) -> Result<Option<Rt2>> {
-        let mut ranges: Vec<std::ops::Range<u32>> = self
-            .header
-            .index
-            .iter()
-            .filter(|(c, _, _)| cells.contains(c))
-            .map(|&(_, s, n)| s..s + n)
-            .collect();
-        ranges.sort_by_key(|r| r.start);
-        self.load_rows(&ranges)
-    }
 }
 
 /// Save any serializable value (the marks, the pos-graph) under the same

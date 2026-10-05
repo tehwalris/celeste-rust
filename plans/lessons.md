@@ -113,8 +113,9 @@ size on disk; checkpoints live on disk, not tmpfs).
 
 **Prebuilt kernel sets for every level.** With 18 levels prebuilt, room
 (3,0) held ~30 GB before its frontier (every kernel kept its fused graph).
-Now graphs are dropped after assembly (7.3 -> 1.6 GB a set) and
-`CELESTE_KERNEL_SETS` caps the resident sets.
+Now graphs are dropped after assembly (7.3 -> 1.6 GB a set) and one set
+is resident (the LRU cap `CELESTE_KERNEL_SETS` went with the rem ladder,
+tier 3: levels now only change between forwards).
 
 ## Abstractions
 

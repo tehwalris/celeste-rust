@@ -1676,7 +1676,7 @@ impl Graph1 {
 fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result<Built> {
     let t_all = std::time::Instant::now();
     let room0 = crate::game_runner::start_room();
-    let lw = super::kernel::room_constant_lattice(root, super::shapes::WalkOpts::LEVEL0.with_held(true))?;
+    let lw = super::kernel::room_constant_lattice(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT })?;
     say!(rep, "room {room0:?}: lattice walk {} shapes, {:.1} s", lw.lattice.len(), t_all.elapsed().as_secs_f64())?;
     let mut tr = lw.tracer.clone();
     let mut table = Table {

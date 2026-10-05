@@ -279,7 +279,7 @@ pub fn room_of(st: &State<Symbolic>, d: &Symbolic) -> (i16, i16) {
 /// player's `rem` (ival_paths) and every live fruit's `off`/`y`
 /// (widen.rs). The lattice must not bake these, or a mid-game block whose
 /// `off` is an interval will not bind a kernel that expects a number.
-pub fn boundary_widened_paths(st: &State<Symbolic>, opts: &WalkOpts) -> std::collections::BTreeSet<Path> {
+pub fn boundary_widened_paths(st: &State<Symbolic>, opts: &crate::abstraction::Level) -> std::collections::BTreeSet<Path> {
     let mut out: std::collections::BTreeSet<Path> = ival_paths(st).into_iter().collect();
     // The fields a level widens beyond the boundary's own: the moving
     // platforms, the fly fruit, the fall floors.
@@ -312,7 +312,7 @@ pub fn boundary_widened_paths(st: &State<Symbolic>, opts: &WalkOpts) -> std::col
 /// The object fields a level widens (the moving platforms, the fly fruit,
 /// the fall floors, at the levels that widen them): never compile-time
 /// constants, whatever a trace computes.
-pub fn level_widened_paths(st: &State<Symbolic>, opts: &WalkOpts) -> Vec<Path> {
+pub fn level_widened_paths(st: &State<Symbolic>, opts: &crate::abstraction::Level) -> Vec<Path> {
     let mut out = Vec::new();
     if opts.platforms {
         out.extend(super::widen::platform_paths(st).all().cloned());
@@ -328,7 +328,7 @@ pub fn level_widened_paths(st: &State<Symbolic>, opts: &WalkOpts) -> Vec<Path> {
     out
 }
 
-pub fn field_constants(st: &State<Symbolic>, d: &Symbolic, opts: &WalkOpts) -> Result<std::collections::BTreeMap<Path, super::iface::Conc>> {
+pub fn field_constants(st: &State<Symbolic>, d: &Symbolic, opts: &crate::abstraction::Level) -> Result<std::collections::BTreeMap<Path, super::iface::Conc>> {
     use super::domain::Domain;
     use super::iface::Conc;
     let widened = boundary_widened_paths(st, opts);
@@ -357,48 +357,6 @@ pub fn field_constants(st: &State<Symbolic>, d: &Symbolic, opts: &WalkOpts) -> R
         }
     }
     Ok(out)
-}
-
-/// Which kernel set a walk is for (plans/kernel-ladder.md). The SHAPE
-/// fixpoint is the same in every mode - `blank` erases the values that
-/// would differ - so the modes differ only in what each traced frame
-/// assumes and emits.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct WalkOpts {
-    /// Held buttons unknown (`abstraction::HeldPrecision`, plans/held-buttons.md):
-    /// each traced frame forks `p_jump` / `p_dash` into both values and every
-    /// outcome writes them unknown.
-    pub held: bool,
-    /// The fly fruit unknown (`abstraction::FruitPrecision`, plans/fly-fruit.md).
-    pub fruit: bool,
-    /// The fall floors' `state` and `collideable` widened but where the player
-    /// overlaps one, their countdowns and the objects' phases
-    /// (`abstraction::FloorsPrecision::Near`).
-    pub floors_near: bool,
-    /// The moving platforms unknown (`abstraction::PlatformsPrecision`,
-    /// plans/platforms-unknown.md).
-    pub platforms: bool,
-}
-
-impl WalkOpts {
-    /// Every object exact.
-    pub const LEVEL0: WalkOpts = WalkOpts { held: false, fruit: false, floors_near: false, platforms: false };
-    /// These opts with held buttons unknown or exact.
-    pub const fn with_held(self, held: bool) -> WalkOpts {
-        WalkOpts { held, ..self }
-    }
-    /// These opts with the fly fruit unknown or exact.
-    pub const fn with_fruit(self, fruit: bool) -> WalkOpts {
-        WalkOpts { fruit, ..self }
-    }
-    /// These opts with the floors widened but where the player overlaps one, or not.
-    pub const fn with_floors_near(self, floors_near: bool) -> WalkOpts {
-        WalkOpts { floors_near, ..self }
-    }
-    /// These opts with the moving platforms unknown or exact.
-    pub const fn with_platforms(self, platforms: bool) -> WalkOpts {
-        WalkOpts { platforms, ..self }
-    }
 }
 
 /// The path of the player INSTANCE in `objects` (the entry whose `type`

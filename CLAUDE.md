@@ -253,8 +253,7 @@ CELESTE_LEVEL_MINUS_ONE="C,5" ./safe-run.sh -- ./target/release/rewrite search \
 # the r0sxh forward filtered by r0sxhn's arc-marked nodes.
 CELESTE_LEVEL_MINUS_ONE="84,5" ./safe-run.sh -- ./target/release/rewrite search \
     --room 7,0 --level r0sxhn,r0sxh --ceiling 84 --checkpoint-dir DIR
-# Other knobs: CELESTE_THREADS, CELESTE_KERNEL_SETS=N (resident kernel sets),
-# CELESTE_REGION="px,S" | off. (CELESTE_SPLIT_FRAME=1 still runs a forward,
+# Other knobs: CELESTE_THREADS, CELESTE_REGION="px,S" | off. (CELESTE_SPLIT_FRAME=1 still runs a forward,
 # two steps a frame, but the search refuses it.)
 
 # One forward at one level, with the per-frame [fwd] line; then its fingerprint.

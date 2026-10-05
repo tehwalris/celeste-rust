@@ -64,10 +64,10 @@ pub fn run_frame_all<'a>(
     let mut paths = 0usize;
     // Nor the fly fruit and the moving platforms unknown: their ranges and
     // worlds have no reference form yet.
-    if level.fruit.is_unknown() {
+    if level.fruit {
         anyhow::bail!("the reference engine does not run fruit-unknown levels (plans/fly-fruit.md)");
     }
-    if level.platforms.is_unknown() {
+    if level.platforms {
         anyhow::bail!("the reference engine does not run platforms-unknown levels (plans/platforms-unknown.md)");
     }
     loop {
@@ -78,7 +78,7 @@ pub fn run_frame_all<'a>(
             let b = it.d.cursor.choose(2) == 1;
             st.heap.tables.get_mut(t).expect("an unknown field's table").hash.insert(k.clone(), crate::trace::heap::Value::Bool(b));
         }
-        if level.floors == crate::abstraction::FloorsPrecision::Near {
+        if level.floors_near {
             concretize_near_floors(&mut st, &mut it.d)?;
         }
         // A path that RAISES has no successor (`Interp::poison`; the nodiag
