@@ -178,8 +178,10 @@ A path (Room and Passes grains; the `witness` / `paths` chip, `w=0` in
 the hash hides them) is the player's 8x8 box at the frame shown - ours
 cyan and filled, the reference yellow and outlined, so on the same spot
 both still read - the three frames before it as fading outlines, the
-route as a thick translucent ribbon through the box centres (brighter up
-to the frame) with a dot per frame (wide spacing = fast), and an arrow
+route as a thick dark-cased ribbon through the box centres (brighter up
+to the frame; the reference's wider, so where the two run together it is
+a yellow edge around ours) with a dark dot per frame (wide spacing =
+fast), and an arrow
 where each dash starts, faint until it has happened. Under the room, a
 line says where each is at the frame (`f53 · ours 29,66 dash → · TAS29
 27,56`). Room (3,3) at h172 (from the repo root: it loads cart/ for the

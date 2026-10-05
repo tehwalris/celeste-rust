@@ -182,7 +182,11 @@ export class RoomRenderer {
       };
       const last = path.length - 1;
       const u = Math.min(last, upto);
-      const ribbon = (from: number, to: number, a: number) => {
+      // The outlined path's ribbon is wider, so where the two paths run
+      // together the reference shows as a yellow edge around ours; a dark
+      // casing under each keeps it apart from any heat colour.
+      const width = (d.filled ? 2 : 3.6) * s;
+      const ribbon = (from: number, to: number, stroke: string, w: number) => {
         ctx.beginPath();
         let pen = false;
         for (let i = from; i <= to; i++) {
@@ -195,19 +199,20 @@ export class RoomRenderer {
           else ctx.moveTo(q[0], q[1]);
           pen = true;
         }
-        ctx.strokeStyle = col(a);
-        ctx.lineWidth = Math.max(4, s * 3);
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = w;
         ctx.stroke();
       };
-      ribbon(Math.max(0, u), last, 0.2);
-      ribbon(0, u, 0.42);
-      // A dot per frame.
+      ribbon(0, last, "rgba(8, 10, 12, 0.6)", width + Math.max(2, s * 0.8));
+      ribbon(Math.max(0, u), last, col(0.35), width);
+      ribbon(0, u, col(0.7), width);
+      // A dark dot per frame on the ribbon.
       for (let i = 0; i <= last; i++) {
         const q = centre(i);
         if (!q) continue;
         ctx.beginPath();
-        ctx.arc(q[0], q[1], Math.max(1.5, s * 0.55), 0, 2 * Math.PI);
-        ctx.fillStyle = col(i <= u ? 1 : 0.5);
+        ctx.arc(q[0], q[1], Math.max(1.2, s * 0.45), 0, 2 * Math.PI);
+        ctx.fillStyle = i <= u ? "rgba(8, 10, 12, 0.8)" : "rgba(8, 10, 12, 0.45)";
         ctx.fill();
       }
       // The dashes: an arrow on the box centre, pointing its way.
