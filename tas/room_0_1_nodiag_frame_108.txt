@@ -1,0 +1,6 @@
+# Room (0,1) "900 m", No Diagonal Dashes: exit during frame 108 (2026-10-05).
+# Ties the community nodiag TAS9 (81 inputs at prologue offset 27 = 108).
+# rewrite search --room 0,1 --ceiling 108 --level r0sxhn,r0sxh, CELESTE_NODIAG=1,
+# level -1 108,5: bounds 106 (r0sxhn) and 108 (r0sxh), witness at 108. 619 s,
+# 17.5 GB. Replay: pico8_diff/replay.py --room 0,1 --balloon-seeds 0,0.04 FILE
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,16,0,0,0,0,34,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,36,0,0,0,0,0,0,1,1,1,1,1,1,33,0,0,0,0,0,0,0,36,0,0,0,0,0,0,2,2,16,0,0,0,0,16,0,0,0
