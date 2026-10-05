@@ -7,10 +7,10 @@ the cost-to-go filter in `plans/level-minus-one.md`.
 
 ## Status, honestly
 
-The code is ~44.9k lines of Rust (26.2k code, 9.1k comments, 7.4k tests;
-`arc-only`, 2026-10-05: 47.5k before it deleted the rem ladder and the kernel
-re-run backward). The 2026-08-30 target was ~10-12k;
-it was never met, and a cleanup toward ~10k is in progress. Every room of the
+The code is ~36.5k lines of Rust (25.6k code, 4.4k comments, 4.7k tests;
+47.5k before `arc-only` deleted the rem ladder and the kernel re-run
+backward, 44.9k before the `tier3` cleanup). The 2026-08-30 target was
+~10-12k; a cleanup toward ~10k is in progress. Every room of the
 game has a confirmed optimum (`plans/results.md`), found by the precision
 ladder this branch deleted.
 

@@ -1,45 +1,29 @@
 //! LEVEL -1 (plans/level-minus-one.md): a POSITION-ONLY cost-to-go table for
-//! the start room, computed from the traced frame graphs. The search reads it
-//! as a filter (`CELESTE_LEVEL_MINUS_ONE="H,S"`, `frame::level_minus_one`:
-//! a cell that provably cannot exit by H is dropped); `transpile
-//! --level-minus-one` checks and reports it (`probe`).
+//! the start room, from the traced frame graphs; the search uses it as a
+//! filter (`CELESTE_LEVEL_MINUS_ONE="H,S"`), `transpile --level-minus-one`
+//! checks it (`probe`).
 //!
-//! A node is (heap shape, cell of the located object - the player, or the
-//! player spawn). Every other input is a RANGE (numbers) or unknown
-//! (booleans), one per shape: the objects' `rem` [-0.5, 0.5), the player's
-//! speed [-S, S], the rest discovered below. One frame from a node is the
-//! shape's traced frame with every `move` fork RESOLVED per configuration
-//! (the pixel steps and collisions are then exact at an exact position),
-//! evaluated over the ranges with `Graph::eval_narrow_top_in`: an undecided
-//! select JOINS its arms, the buttons are unknown. Every outcome whose `live`
-//! is not definitely false is a successor at the cells its position hull
-//! covers; an outcome in another room is the EXIT. `d(node)` is the fewest
-//! frames to an exit over that graph.
+//! A node is (heap shape, cell of the player or player spawn); every other
+//! input is a range or unknown per shape (`rem` [-0.5, 0.5), speed [-S, S],
+//! the rest discovered). A frame is the shape's traced frame with every
+//! `move` fork resolved per configuration, evaluated over the ranges
+//! (undecided selects JOIN, buttons unknown); every outcome not definitely
+//! dead is a successor at the cells its position hull covers, another room
+//! is the EXIT, and `d(node)` is the fewest frames to an exit.
 //!
-//! The table over-approximates the game's transitions only under three
-//! premises, each CHECKED, never assumed:
+//! It over-approximates the game only under three CHECKED premises:
+//! * INDUCTIVE RANGES: successors lie in their shape's ranges and pins; a
+//!   range that does not widens, a pin that fails is dropped, and passes
+//!   repeat to a fixpoint.
+//! * NO `error` on a live outcome (`Known`/`SplitOk` read as true: selects
+//!   are joined and fork spans checked directly); anything else is reported.
+//! * Every position hull has whole endpoints.
 //!
-//! * INDUCTIVE RANGES. A successor's values must lie in its shape's ranges
-//!   and agree with its lattice pins. After each pass over the reachable
-//!   graph, a range that does not contain what flows into it widens
-//!   (`widen`), a pin that does not hold is dropped (the shape re-traced),
-//!   and the pass is redone until nothing changes.
-//! * NO `error` on any live outcome (`trace::error`), read with `Known(..)`
-//!   and `SplitOk(..)` as true: this evaluator joins an undecided select
-//!   (sound), and fork spans are checked directly on every configuration's
-//!   operands. Everything else must evaluate to FALSE, or the node is
-//!   reported.
-//! * Every position hull has whole endpoints (a cell is a whole pixel).
-//!
-//! Two refinements, both exact per state, keep what a range's hull forgets:
-//! a slot every state holds as the same literal interval (`Shape::lits`) is
-//! read as that literal, and selects are lifted out of the ops above them
-//! (`lift`; every value op only in the precise frame, `eval_node`).
-//!
-//! Not modelled, each counted in the report: THE SPAWN (run as a chain from
-//! the start state, `probe`: as a node its ranges never converge), a DEATH
-//! (a dead end), a successor cell outside `WINDOW` (clipped). The recorded
-//! transitions of a level-0 tree check that none dropped a real move.
+//! Two exact refinements keep what a hull forgets: literal-interval slots
+//! (`Shape::lits`) and selects lifted out of the ops above them (`lift`).
+//! Not modelled, each counted: THE SPAWN (a chain from the start, `probe`),
+//! DEATH (a dead end), cells outside `WINDOW` (clipped). A level-0 tree's
+//! recorded transitions check that none dropped a real move.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
@@ -75,13 +59,11 @@ const REM: Range = (-0x8000, 0x7fff);
 /// More fork configurations than this in one shape is refused, not traced.
 const MAX_CONFIGS: usize = 1 << 14;
 
-/// A successor box larger than this (cells) is refused: an imprecision that
-/// size is a finding to look at, not a table to build.
+/// A successor box larger than this (cells) is refused as a finding.
 const MAX_BOX: i64 = 4096;
 
-/// The window a successor cell is kept in: the room and 16 px around it. A
-/// player in the room is at x in [-1, 121] (the draw clamp) and y in [-4,
-/// 128]; what the ranges admit past that is CLIPPED and counted.
+/// The window successor cells are kept in (the room +/- 16 px; a real player
+/// stays in x [-1, 121], y [-4, 128]); beyond it is CLIPPED and counted.
 const WINDOW: (i64, i64) = (-16, 143);
 
 /// The "no located object" coordinate (a death's countdown).
@@ -96,9 +78,7 @@ pub struct Opts {
     pub ceiling: u32,
     pub from: u32,
     pub to: u32,
-    /// The tree's backward marks at horizon `ceiling` (`hNNN/level00.marks.bin`):
-    /// states on a level-0 winning path, none of which the table may call
-    /// too late.
+    /// The tree's marks at `ceiling`: winning states the table may not call too late.
     pub marks: Option<PathBuf>,
     pub threads: usize,
 }
@@ -107,8 +87,7 @@ pub struct Opts {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Obs {
     Num(i64, i64),
-    /// A LITERAL interval every lane holds exactly (an `rnd` draw); `Num` is
-    /// a hull of lanes' values instead.
+    /// A LITERAL interval every lane holds (an `rnd` draw), not a hull.
     Lit(i64, i64),
     Bool { f: bool, t: bool, u: bool },
 }
@@ -147,18 +126,15 @@ fn px(r: i64) -> f64 {
     r as f64 / 65536.0
 }
 
-/// Widen `seed` to contain `obs`: the hull, or - for a slot that has already
-/// grown twice (`jump`) - the moved end straight to the 16.16 extreme. The
-/// hull first, since wider can overshoot what a premise allows; the jump so
-/// an unbounded range does not take one pass per step.
+/// Widen `seed` to contain `obs`: the hull, or with `jump` (a slot that grew
+/// twice) the moved end to the 16.16 extreme, so unbounded growth converges.
 fn widen(seed: Range, obs: Range, jump: bool) -> Range {
     let lo = if obs.0 < seed.0 { if jump { i32::MIN as i64 } else { obs.0 } } else { seed.0 };
     let hi = if obs.1 > seed.1 { if jump { i32::MAX as i64 } else { obs.1 } } else { seed.1 };
     (lo, hi)
 }
 
-/// The object a cell is read from: the player, or during the spawn the
-/// player spawn - `pos_graph::player_object`'s rule.
+/// The player, else the player spawn (`pos_graph::player_object`'s rule).
 fn located_object(st: &State<Symbolic>) -> Option<Path> {
     if let Some(p) = super::shapes::player_path(st) {
         return Some(p);
@@ -232,8 +208,7 @@ struct Roots {
     fields: Vec<NodeId>,
 }
 
-/// One configuration's roots: per outcome, and the fork operands with their
-/// arities.
+/// One configuration's per-outcome roots and fork operands (with arities).
 struct Config {
     outs: Vec<Roots>,
     operands: Vec<(u8, NodeId)>,
@@ -245,8 +220,7 @@ struct Spec {
     configs: Vec<Config>,
 }
 
-/// What a shape's frame is before specialization: the cone with its roots
-/// and forks (in the cone's ids), from which `Spec`s are built.
+/// A shape's frame before specialization: the cone, its roots and forks.
 struct Cone {
     graph: Graph,
     roots: Vec<Roots>,
@@ -262,15 +236,13 @@ struct Traced {
     outs: Vec<OutSpec>,
     /// The frame specialized as traced: what every node is evaluated with.
     plain: Spec,
-    /// The same frame with its selects LIFTED (`lift`), more precise and
-    /// ~25x larger: built the first time a node's plain evaluation is in
-    /// violation, and then that node's answer (`eval_node`).
+    /// The frame with every select LIFTED (~25x larger), built lazily for
+    /// nodes whose plain evaluation is in violation (`eval_node`).
     precise: std::sync::OnceLock<Spec>,
-    /// Which trace this is (`TRACES`): a node's frame is a function of it and
-    /// the seed ranges (`Table::sig`).
+    /// Which trace this is (`TRACES`), part of a node's signature (`Table::sig`).
     generation: u64,
     cone: Cone,
-    /// The bounds it was traced under (the static ranges the arity came from).
+    /// The static ranges it was traced under (the arities' source).
     bounds: BTreeMap<Path, Range>,
     pins: BTreeMap<Path, Conc>,
     stats: String,
@@ -279,12 +251,11 @@ struct Traced {
 struct Shape {
     key: String,
     ranges: BTreeMap<Path, Range>,
-    /// The `ranges` that are a LITERAL interval every lane holds (`Obs::Lit`),
-    /// read by the cone as that literal so a lane's own ends are exact (the
-    /// balloon's full-period premise). Only `rnd`-derived slots.
+    /// `rnd`-derived ranges every lane holds as a LITERAL (`Obs::Lit`), read
+    /// as that literal so a lane's own ends stay exact.
     lits: BTreeSet<Path>,
-    /// Ranges not yet observed: taken from a blanked representative (0), so
-    /// the first observation REPLACES them rather than joining the 0 in.
+    /// Ranges from a blanked representative (0): the first observation
+    /// REPLACES them rather than joining the 0 in.
     unseeded: BTreeSet<Path>,
     demoted: BTreeSet<Path>,
     traced: Option<Traced>,
@@ -333,9 +304,7 @@ impl<'a> Table<'a> {
         Ok(i)
     }
 
-    /// May slot `p` of shape `key` be a literal (`Shape::lits`)? An
-    /// `rnd`-derived slot only, never a motion slot (whose range stands for
-    /// every concrete value).
+    /// May slot `p` be a literal (`Shape::lits`)? `rnd`-derived, never motion.
     fn lit_slot(&self, key: &str, p: &Path) -> bool {
         let motion = p.len() == 4 && p[0] == iface::key("objects") && (p[2] == iface::key("rem") || p[2] == iface::key("spd"));
         !motion && self.lw.ival_extra.get(key).is_some_and(|s| s.contains(p))
@@ -351,8 +320,8 @@ impl<'a> Table<'a> {
         i
     }
 
-    /// Trace shape `id` under its current ranges and pins, and specialize its
-    /// frame on every fork configuration into one shared graph.
+    /// Trace shape `id` under its ranges and pins and specialize every fork
+    /// configuration into one shared graph.
     fn trace(&mut self, tr: &mut Tracer, id: usize) -> Result<()> {
         let t0 = std::time::Instant::now();
         let key = self.shapes[id].key.clone();
@@ -369,9 +338,8 @@ impl<'a> Table<'a> {
             Some(o) => (Some(with(o, &["x"])), Some(with(o, &["y"]))),
             None => (None, None),
         };
-        // Seed every numeric slot not pinned: a range kept from an earlier
-        // pass, else the player's rem half and speed [-S, S], or the value the
-        // representative holds (the start state's own, a blanked shape's 0).
+        // Seed unpinned numeric slots: an earlier pass's range, else the
+        // player's rem/speed bounds, else the representative's value.
         for p in &roots {
             if pins.contains_key(p) || self.shapes[id].ranges.contains_key(p) || Some(p) == xp.as_ref() || Some(p) == yp.as_ref() {
                 continue;
@@ -380,9 +348,7 @@ impl<'a> Table<'a> {
             let is_player = |f: &str| player.as_ref().is_some_and(|pl| *p == with(pl, &[f, "x"]) || *p == with(pl, &[f, "y"]));
             let start_ival = key == self.lw.start_key && self.lw.ival_extra.get(&key).is_some_and(|s| s.contains(p));
             let r = if start_ival {
-                // The start state's own interval (`offset = rnd(1)`), not the
-                // representative's blanked point: a literal, since the one
-                // start state holds exactly it.
+                // The start state's own `rnd` interval, a literal.
                 let (lo, hi) = *self.lw.start_ivals.get(p).ok_or_else(|| anyhow!("{key}: the start state's interval {} is not a literal range", iface::show(p)))?;
                 ensure!(self.lit_slot(&key, p), "{key}: the start state's interval {} is not an `rnd` slot", iface::show(p));
                 self.shapes[id].lits.insert(p.clone());
@@ -400,8 +366,7 @@ impl<'a> Table<'a> {
             };
             self.shapes[id].ranges.insert(p.clone(), r);
         }
-        // Interval inputs: every object's unpinned rem and speed (so `move`
-        // forks, its arity from their static ranges), and the boundary's own.
+        // Interval inputs: unpinned rem and speed (`move` forks), and the boundary's.
         let mut ival: Vec<Path> = Vec::new();
         let mut bounds: BTreeMap<Path, Range> = BTreeMap::new();
         for p in motion_paths(&st) {
@@ -418,14 +383,11 @@ impl<'a> Table<'a> {
         }
         let pin_list: Vec<(Path, Conc)> = pins.iter().map(|(p, c)| (p.clone(), *c)).collect();
         let bound_list: Vec<(Path, (i32, i32))> = bounds.iter().map(|(p, r)| (p.clone(), (r.0 as i32, r.1 as i32))).collect();
-        // The held trails are unknown booleans read from their cells, not a
-        // fork (the walk forks them for the kernels).
+        // Held trails are unknown booleans, not forks.
         tr.it.d.held_unknown = false;
-        // The move forks' arity from the ranges' full width (`flr_ways`).
-        // Restored below.
+        // Move-fork arity from the ranges' full width; restored below.
         tr.it.d.uncapped_ways = true;
-        // And its undecided selects stay selects: this evaluator joins their
-        // arms (module doc), a fork would only multiply configurations.
+        // Undecided selects stay selects (joined here, no extra configurations).
         tr.it.d.no_known_forks = true;
         let f = super::verify::trace_frame(
             &mut tr.it,
@@ -499,8 +461,7 @@ impl<'a> Table<'a> {
             roots_old.push(Roots { live: o.guard, error: o.error, xy, fields: fnodes });
         }
 
-        // The cone, copied out of the arena with every fork over a literal
-        // (the buttons) as that whole literal, and the kernels' premises true.
+        // The cone: literal forks (buttons) whole, the kernels' premises true.
         let arena = &d.graph;
         let mut rs: Vec<NodeId> = Vec::new();
         for r in &roots_old {
@@ -592,8 +553,7 @@ impl<'a> Table<'a> {
 }
 
 impl Cone {
-    /// Every fork configuration, specialized into one shared graph; the
-    /// configurations that come out identical kept once.
+    /// Every fork configuration in one shared graph, duplicates kept once.
     fn specialize(&self) -> Spec {
         let n_configs: usize = self.arities.iter().map(|(_, w)| *w as usize).product();
         let mut shared = self.graph.like();
@@ -664,8 +624,7 @@ impl Cone {
 /// Traces made so far (`Traced::generation`).
 static TRACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `a + b` / `a - b` of a literal interval and a point, as the literal every
-/// lane then holds; `None` for anything else or past the 16.16 range.
+/// A literal interval plus/minus a point, as the shifted literal (in range).
 fn lit_shift(g: &Graph, op: &Op, args: &[NodeId]) -> Option<(i32, i32)> {
     let c = |n: NodeId| match g.get(n).op {
         Op::Const(lo, hi) => Some((lo as i64, hi as i64)),
@@ -684,23 +643,16 @@ fn lit_shift(g: &Graph, op: &Op, args: &[NodeId]) -> Option<(i32, i32)> {
 /// Which ops `lift` lifts selects out of.
 #[derive(Clone, Copy)]
 enum Lift {
-    /// A lane's ends and their difference (`Lo`, `Hi`, `Sub`): cheap; the
-    /// frame every node is evaluated with (`Traced::plain`).
+    /// `Lo`, `Hi`, `Sub` only: cheap (`Traced::plain`).
     Ends,
-    /// Every pure value op: ~25x the graph, so only where `Ends` is in
-    /// violation (`Traced::precise`).
+    /// Every pure value op: ~25x the graph (`Traced::precise`).
     All,
 }
 
-/// `op(args)` with every select among the args LIFTED out where they all
-/// select on one condition: `op(.., sel(c, a, b), ..)` is `sel(c, op(.., a,
-/// ..), op(.., b, ..))`, exact per lane. Without it an expression of a joined
-/// select forgets that its operands moved together (see the tests).
-///
-/// Selects on DIFFERENT conditions stay joined (lifting multiplies arms).
-/// Never across a fork op or a select's own condition. A literal shifted by
-/// a point is the shifted literal (`lit_shift`): exact with respect to
-/// `eval`'s hulls, not per lane.
+/// `op(args)` with selects on ONE shared condition lifted out, `op(sel(c, a,
+/// b)) = sel(c, op(a), op(b))` (exact per lane), so a joined select keeps
+/// that its operands moved together. Selects on different conditions stay
+/// joined; never across a fork op. A shifted literal is `lit_shift`'s.
 fn lift(g: &mut Graph, op: Op, args: Vec<NodeId>, what: Lift, memo: &mut HashMap<(Op, Vec<NodeId>), NodeId>) -> NodeId {
     let liftable = match what {
         Lift::Ends => matches!(op, Op::Sub | Op::Lo | Op::Hi),
@@ -739,8 +691,8 @@ fn lift(g: &mut Graph, op: Op, args: Vec<NodeId>, what: Lift, memo: &mut HashMap
     r
 }
 
-/// One node's frame: evaluate every configuration over the shape's ranges at
-/// cell `xy`. Free of the `Table`, whose tracer is not `Sync`.
+/// One node's frame: every configuration over the shape's ranges at cell
+/// `xy` (free of the `Table`, whose tracer is not `Sync`).
 fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut Acc) -> Result<NodeOut> {
     let sh = &shapes[id];
     let t = sh.traced.as_ref().expect("a node's shape is traced before its layer");
@@ -760,8 +712,7 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
         };
         cells.insert(i as u32, v);
     }
-    // The plain frame first; where it is in violation, the precise one (both
-    // over-approximate the node's frame, so either answer is sound).
+    // Plain first, precise on violation (both over-approximate: either is sound).
     let vals = t.plain.graph.eval_narrow_top_in(&cells, room)?;
     let (sp, vals) = if in_violation(&t.plain, &vals) {
         let precise = t.precise.get_or_init(|| {
@@ -857,9 +808,7 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
     Ok(out)
 }
 
-/// Would `eval_node` report a violation of this evaluation: a fork operand
-/// wider than its arity, a live outcome's error not false, a successor
-/// position not whole pixels or too large a box?
+/// Would `eval_node` report a violation of this evaluation?
 fn in_violation(spec: &Spec, vals: &[Val]) -> bool {
     let whole = |v: Val| matches!(v, Val::Num(i) if raw(i.low) & 0xffff == 0 && raw(i.high) & 0xffff == 0);
     let cells = |i: Pico8NumInterval| (raw(i.high) >> 16) - (raw(i.low) >> 16) + 1;
@@ -876,8 +825,7 @@ fn in_violation(spec: &Spec, vals: &[Val]) -> bool {
     })
 }
 
-/// Which disjunct keeps `n` from being false: down the `Or`s and decided
-/// selects to the first node that is not, with its operands' values.
+/// The node (down `Or`s and selects) that keeps `n` from being false.
 fn culprit(g: &Graph, vals: &[Val], mut n: NodeId) -> String {
     loop {
         let nd = g.get(n);
@@ -919,8 +867,7 @@ struct Graph1 {
     clipped: Vec<bool>,
 }
 
-/// What `build` hands on: per block shape hash its table shape, the converged
-/// graph, the sound d per node (`sound_d`), and the spawn chain.
+/// `build`'s result: shapes by block hash, the graph, `sound_d`, the spawn chain.
 struct Built {
     by_hash: HashMap<u64, usize>,
     g1: Graph1,
@@ -929,16 +876,10 @@ struct Built {
     start_d: u32,
 }
 
-/// A LOWER BOUND on the frames from each node to an exit - what a filter may
-/// refuse a row on. A multi-source shortest path backward over the edges,
-/// seeded at an exit edge (1) and a death successor (1 + the respawn's
-/// `chain_frames` + d of the chain's end). The death seed cannot lower the
-/// end's d it reads, so the second run is the answer.
-///
-/// A successor part CLIPPED to `WINDOW` is not a seed: no real player is there
-/// at a frame boundary, so it is the evaluator's imprecision. (Seeding it as
-/// an exit cuts nothing.) Checked on every row the filter sees
-/// (`CostToGo::too_late`), never assumed.
+/// A LOWER BOUND on the frames from each node to an exit: a backward
+/// shortest path seeded at exits (1) and deaths (1 + `chain_frames` + d of
+/// the chain's end, iterated to a fixpoint). A CLIPPED successor is not a
+/// seed (no real player is outside `WINDOW`), which `too_late` checks per row.
 fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32) -> Vec<u32> {
     use std::cmp::Reverse;
     let n = g.nodes.len();
@@ -994,8 +935,7 @@ impl CostToGo {
         self.d.len()
     }
 
-    /// A hash of every entry and the start's d, in a fixed order: two builds
-    /// with the same fingerprint filter identically.
+    /// A hash of every entry and the start's d (equal hashes filter alike).
     pub fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut es: Vec<(&(u64, i16, i16), &u32)> = self.d.iter().collect();
@@ -1006,9 +946,8 @@ impl CostToGo {
         h.finish()
     }
 
-    /// Is a row of `shape` at `cell` at `frame` provably unable to exit by
-    /// `horizon`? Only a table node is ever refused. A row in the room OUTSIDE
-    /// `WINDOW` breaks the premise clipping rests on (`sound_d`): it panics.
+    /// Is a row provably unable to exit by `horizon`? Only table nodes are
+    /// refused; a row outside `WINDOW` breaks `sound_d`'s premise and panics.
     pub fn too_late(&self, shape: u64, cell: u32, frame: u32, horizon: u32) -> bool {
         let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
         if x >= 128 {
@@ -1026,8 +965,7 @@ impl CostToGo {
     }
 }
 
-/// Build the level -1 table of the configured start room at player speed bound
-/// `spd_px` (report to stderr), or read it from the cache (`cache_file`).
+/// The start room's level -1 table at speed bound `spd_px`, built or cached.
 pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo> {
     let cache = cache_file(root, spd_px)?;
     if let Some((path, _)) = &cache {
@@ -1063,11 +1001,9 @@ pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo
 /// The table cache's format; bump it when what a file holds changes.
 const CACHE_FORMAT: u32 = 1;
 
-/// Where the table for these inputs is cached, and the key's description:
-/// `CELESTE_L1_CACHE` (a directory, default `/var/tmp/celeste-l1-cache`; `off`
-/// to always build). The key is this binary's bytes, the traced cart and its
-/// data, the speed bound, and every `CELESTE_*` variable but those known not
-/// to matter: an unknown knob costs a rebuild, never a wrong table.
+/// The cache file under `CELESTE_L1_CACHE` (`off` disables) and its key: the
+/// binary, the cart, `spd_px` and every `CELESTE_*` variable not known to be
+/// irrelevant, so an unknown knob costs a rebuild, never a wrong table.
 fn cache_file(root: &FsPath, spd_px: i32) -> Result<Option<(PathBuf, String)>> {
     use std::hash::{Hash, Hasher};
     let dir = match std::env::var("CELESTE_L1_CACHE") {
@@ -1139,8 +1075,7 @@ impl CostToGo {
         Ok(Some(t))
     }
 
-    /// Write the table to `path` (atomically: a reader sees all of it or
-    /// none), with `key` beside it as text.
+    /// Write the table to `path` atomically, with `key` beside it as text.
     fn save(&self, path: &FsPath, key: &str) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -1177,8 +1112,7 @@ fn unpack(p: u64) -> (usize, i16, i16) {
     ((p >> 32) as usize, (p >> 16) as u16 as i16, p as u16 as i16)
 }
 
-/// What a node's frame is a function of besides its cell: the shape's trace
-/// and the ranges its seeds read (`eval_node`).
+/// What a node's frame depends on besides its cell.
 #[derive(Clone, PartialEq)]
 struct Sig {
     generation: u64,
@@ -1202,30 +1136,24 @@ impl Table<'_> {
     }
 }
 
-/// One node's frame as the passes read it: `eval_node`'s answer with its
-/// boxes expanded, and the node's share of the counts.
+/// One node's frame as the passes read it: boxes expanded, plus its counts.
 struct NodeEval {
     /// The successor nodes (packed), sorted, each once.
     succ: Vec<u64>,
     exit: bool,
-    /// A successor without a located object (a death).
     death: bool,
-    /// Death successors (outcome x configuration), for the report.
     n_deaths: u32,
-    /// A successor box was clipped to `WINDOW`.
     clipped: bool,
-    /// Clipped successor boxes per target shape (the nonzero ones).
+    /// Clipped successor boxes per target shape (nonzero only).
     clipped_by: Vec<(u32, u64)>,
     n_violations: u32,
-    /// The first violation's message.
     violation: Option<String>,
     precise: bool,
 }
 
-/// Node answers kept across passes: a node's `NodeEval` and observations are
-/// a function of its cell and its shape's `Sig`. Observations are kept per
-/// shape as the join over exactly the nodes held (`agg`, `count`); a pass
-/// that does not reach them all re-observes the reached ones (`observe`).
+/// Node answers kept across passes (valid while the shape's `Sig` holds).
+/// Observations are the join over exactly the nodes held (`agg`, `count`);
+/// a pass that does not reach them all re-observes the reached ones.
 #[derive(Default)]
 struct Memo {
     nodes: rustc_hash::FxHashMap<u64, NodeEval>,
@@ -1356,9 +1284,8 @@ struct Queue {
     failed: bool,
 }
 
-/// One pass's walk over the reachable nodes: each worker takes a node,
-/// answers it (memo, else `eval_key`) and registers its successors. A node of
-/// a shape not traced yet is set aside (`pending`) for the caller.
+/// One pass's parallel walk over the reachable nodes (memo, else `eval_key`);
+/// nodes of untraced shapes are set aside in `pending` for the caller.
 struct Explore {
     /// Node id -> key, in order of discovery.
     keys: Vec<u64>,
@@ -1366,11 +1293,10 @@ struct Explore {
     recs: Vec<Option<Rec>>,
     stack: Vec<(u32, u64)>,
     pending: Vec<(u32, u64)>,
-    /// Evaluated this pass (for the memo).
     fresh: Vec<(u64, NodeEval)>,
-    /// This pass's evaluations' observations, per shape.
+    /// Observations of this pass's evaluations, per shape.
     fresh_obs: Vec<Option<Vec<Option<Obs>>>>,
-    /// Memo answers taken, per shape.
+    /// Memo hits per shape.
     hits: Vec<usize>,
     n_violations: usize,
     n_precise: usize,
@@ -1427,8 +1353,7 @@ impl Explore {
                 .map(|_| {
                     let (queue, wake, index, traced) = (&queue, &wake, &index, &traced);
                     scope.spawn(move || -> Result<Done> {
-                        // A worker that panics stops the others, which would
-                        // otherwise wait for its node forever.
+                        // A panicking worker stops the others (else they wait forever).
                         struct OnPanic<'q>(&'q Mutex<Queue>, &'q Condvar);
                         impl Drop for OnPanic<'_> {
                             fn drop(&mut self) {
@@ -1583,8 +1508,7 @@ impl Explore {
 }
 
 impl Graph1 {
-    /// The pass's graph, its nodes in KEY order (the walk's discovery order
-    /// depends on the scheduling; the table does not).
+    /// The pass's graph in KEY order, independent of scheduling.
     fn from_explore(keys: Vec<u64>, recs: Vec<Option<Rec>>) -> Graph1 {
         let mut order: Vec<u32> = (0..keys.len() as u32).collect();
         order.sort_unstable_by_key(|&i| keys[i as usize]);
@@ -1609,8 +1533,7 @@ impl Graph1 {
     }
 }
 
-/// The table: the lattice walk, the spawn chain, the passes to inductive ranges,
-/// and d.
+/// The table: lattice walk, spawn chain, passes to inductive ranges, d.
 fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result<Built> {
     let t_all = std::time::Instant::now();
     let room0 = crate::game_runner::start_room();
@@ -1640,10 +1563,8 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         (at("x")?, at("y")?)
     };
 
-    // THE SPAWN PREFIX, run as a CHAIN (as nodes its ranges never converge):
-    // each frame evaluated at the previous frame's own values, which must
-    // give exactly one successor cell, until the successor has a player. That
-    // player state seeds the table.
+    // THE SPAWN PREFIX as a CHAIN (as nodes its ranges never converge): one
+    // successor cell per frame until a player exists, which seeds the table.
     let t_chain = std::time::Instant::now();
     let mut chain: Vec<(usize, (i16, i16))> = vec![(start_id, start_xy)];
     let (end_id, end_xy) = loop {
@@ -1702,8 +1623,6 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
     let mut pass = 0usize;
     // How often each range has grown (`widen`).
     let mut grown: BTreeMap<(usize, Path), u32> = BTreeMap::new();
-    // Node answers kept across passes: a node of a shape whose trace and seed
-    // ranges did not change is not evaluated again (`Memo`).
     let mut memo = Memo::default();
     let g1 = loop {
         pass += 1;
@@ -1734,8 +1653,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
         let n_obs = table.obs_keys.len();
         let n_shapes = table.shapes.len();
         memo.grow(n_shapes, n_obs);
-        // The observations, per shape: the memo's join (when every node it
-        // holds was reached again) and this pass's evaluations.
+        // Per shape: the memo's join (if all its nodes were reached) and this pass's.
         let mut obs: Vec<Option<Obs>> = vec![None; n_obs];
         let mut reached: Vec<Vec<u64>> = vec![Vec::new(); n_shapes];
         for &k in &ex.keys {
@@ -1747,8 +1665,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
             let mut agg: Vec<Option<Obs>> = if hits == memo.count[s] {
                 std::mem::take(&mut memo.agg[s])
             } else {
-                // A memo node was not reached: re-observe the reached ones,
-                // forget the rest.
+                // Re-observe the reached memo nodes, forget the rest.
                 let again: Vec<u64> = reached[s].iter().copied().filter(|k| memo.nodes.contains_key(k)).collect();
                 reobserved += again.len();
                 let keep: HashSet<u64> = reached[s].iter().copied().collect();
@@ -1795,8 +1712,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
             let eligible = table.lit_slot(&table.shapes[*id].key, p);
             let sh = &mut table.shapes[*id];
             let Some(t) = sh.traced.as_ref() else {
-                // Observed flowing into a shape no node of reached: nothing to
-                // check it against.
+                // A shape with no reached node: nothing to check against.
                 continue;
             };
             if let Some(c) = t.pins.get(p) {
@@ -1820,8 +1736,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
             if !t.seeds.iter().any(|s| matches!(s, Seed::Range(q) if q == p)) {
                 continue;
             }
-            // A literal holds while exactly it flows in; anything else and the
-            // slot is a hull of the lanes' values from now on.
+            // A literal holds while exactly it flows in, else becomes a hull.
             if sh.lits.contains(p) {
                 let r = sh.ranges[p];
                 if o != Obs::Lit(r.0, r.1) {
@@ -1854,8 +1769,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
                     continue;
                 }
                 if lo < r.0 || hi > r.1 {
-                    // A rem stays in [-0.5, 0.5) by `move`'s own arithmetic:
-                    // one outside is a finding, not a range to widen.
+                    // `move` keeps rem in [-0.5, 0.5): outside is a finding.
                     ensure!(!is_rem(p) || (lo >= REM.0 && hi <= REM.1), "shape {id}: {} = [{}, {}] leaves rem's [-0.5, 0.5)", iface::show(p), px(lo), px(hi));
                     let n = grown.entry((*id, p.clone())).or_insert(0);
                     *n += 1;
@@ -1964,8 +1878,7 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
     let t_all = std::time::Instant::now();
     let Built { by_hash, g1, sound, chain, .. } = build(root, opts.spd_px, opts.threads, &mut rep)?;
 
-    // The d map: per 8 px tile, the smallest sound d of any table node in it
-    // (0-9, then a-z for 10-35, '+' above, '*' no exit path, '.' no node).
+    // Min sound d per 8 px tile (0-9, a-z, '+' above, '*' no path, '.' no node).
     say!(rep, "\nsound d per 8 px tile, the smallest over the table's shapes:")?;
     let mut best: HashMap<(i16, i16), u32> = HashMap::new();
     for (i, &(_, x, y)) in g1.nodes.iter().enumerate() {
@@ -1984,8 +1897,7 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
             .collect();
         say!(rep, "{:4} {line}", ty as i32 * 8)?;
     }
-    // `CELESTE_L1_PATH="x,y"`: the table's fastest path from that cell, one
-    // successor of d - 1 per step, to see HOW it gets to the exit.
+    // `CELESTE_L1_PATH="x,y"`: the table's fastest path from that cell.
     if let Ok(s) = std::env::var("CELESTE_L1_PATH") {
         let (x, y) = s
             .split_once(',')
@@ -2120,8 +2032,7 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
                     }
                 }
             }
-            // The level-0 backward's marks: a marked state is on a winning path
-            // by the horizon, so the table calling it too late is a finding.
+            // A marked state wins by the horizon: called too late is a finding.
             if let Some(m) = &marks {
                 let shape = ff.shape_hash();
                 for (cell, key) in ff.cell_keys() {
@@ -2156,9 +2067,8 @@ mod tests {
         Val::Num(Pico8NumInterval::new(P8::from_raw(lo), P8::from_raw(hi)))
     }
 
-    /// The balloon's full-period premise `Hi(v) - Lo(v) >= 1`, `v` an
-    /// undecided select between the phase `[0, 1)` and it advanced by 0.01:
-    /// undecided over the joined select, it holds once lifted (`Lift::Ends`).
+    /// The balloon's full-period premise over a select of two literal phases:
+    /// undecided when joined, true once lifted.
     #[test]
     fn a_select_of_literal_phases_keeps_its_full_period_width() {
         let period = 0xffff;
@@ -2192,9 +2102,8 @@ mod tests {
         }
     }
 
-    /// A tile loop's "another iteration" test `start + 2 <= end`, both ends
-    /// reading one joined `x`: per lane two tiles, over the join maybe three.
-    /// `Lift::All` decides it; `Lift::Ends` does not.
+    /// A tile loop's `start + 2 <= end` over one joined `x`: `Lift::All`
+    /// decides it (two tiles per lane), `Lift::Ends` does not.
     #[test]
     fn lifting_keeps_a_tile_loop_over_one_x_two_tiles_wide() {
         let build = |what: Lift| -> (Graph, NodeId) {
@@ -2228,9 +2137,8 @@ mod tests {
 
 #[cfg(test)]
 mod room_tests {
-    /// Room (7,1)'s table (balloon phase, tile loop over a joined `x`) builds
-    /// and is sound by its own checks: the start state is at least 45 frames
-    /// from the exit (the known optimum is 86).
+    /// Room (7,1)'s table builds and passes its own checks: start d = 45
+    /// (the optimum is 86).
     #[test]
     #[ignore = "~30 s with 8 threads: a lattice walk and five passes"]
     fn room_71_table_builds_with_its_balloon() {

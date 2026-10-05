@@ -1,7 +1,5 @@
-//! The kernel pipeline's front half: the constant-lattice walk over a
-//! room's (shape, region) nodes (`room_constant_lattice`), then binding and
-//! lowering each traced frame (`lattice_kernel_refs`) for the ASM backend
-//! (`compiled::asm_kernel`).
+//! The kernel pipeline's front half: the constant-lattice walk over a room's
+//! (shape, region) nodes, then binding and lowering each traced frame.
 
 use anyhow::Result;
 
@@ -9,8 +7,7 @@ use super::emit::{Bound, Lowered};
 use super::verify::Frame;
 
 
-/// One traced frame, bound and lowered, everything owned (nothing borrows
-/// the tracer's ASTs).
+/// One traced frame, bound and lowered, everything owned.
 pub struct Reference {
     pub frame: Frame,
     pub bound: Bound,
@@ -19,8 +16,7 @@ pub struct Reference {
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 }
 
-/// Restate a lowering failure with its `Cell(n)`s NAMED by their
-/// interface paths.
+/// Restate a lowering failure with its `Cell(n)`s named by interface path.
 fn name_cells(f: &super::verify::Frame, e: anyhow::Error) -> anyhow::Error {
     let msg = format!("{:#}", e);
     let mut seen: std::collections::BTreeSet<u32> = Default::default();
@@ -46,9 +42,8 @@ fn name_cells(f: &super::verify::Frame, e: anyhow::Error) -> anyhow::Error {
 }
 
 
-/// The constant-lattice `Reference`s for the configured start room, in
-/// the walk's (deterministic) node order. A frame that fails to bind or
-/// lower is FATAL: a missing kernel would be a coverage gap at runtime.
+/// The constant-lattice `Reference`s for the start room, in walk order. A
+/// frame that fails to bind or lower is FATAL (a coverage gap otherwise).
 pub(crate) fn lattice_kernel_refs(
     root: &std::path::Path,
     opts: crate::abstraction::Level,
@@ -63,11 +58,10 @@ pub(crate) fn lattice_kernel_refs(
             Ok((region, wf.frame, wf.bounds, bound))
         })
         .collect::<Result<Vec<_>>>()?;
-    // Lower (specialize + decide, the expensive half of a build), in parallel.
+    // Lower (the expensive half of a build), in parallel.
     let (cart, cache) = (lw.cart.clone(), lw.cache.clone());
     let room = &room;
-    // A pool pulling frames off an atomic index. `CELESTE_BUILD_THREADS`
-    // caps the frames lowered at once: the largest take several GB each.
+    // `CELESTE_BUILD_THREADS` caps concurrent frames: the largest take GBs.
     let n_workers = std::env::var("CELESTE_BUILD_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -109,10 +103,9 @@ pub(crate) fn lattice_kernel_refs(
 }
 
 /// THE REGION KEY: a kernel is specialized on the player's whole-pixel
-/// position lying in one square of a `px`-pixel grid and its speed in
-/// `[-speed, speed]` px per frame; a lane outside declines loudly. Bounding
-/// the position lets the range analysis fold away far-off objects'
-/// collision tests. Rows dispatch on the region of their input cell.
+/// position in one `px`-pixel grid square and speed in `[-speed, speed]`,
+/// so the range analysis folds away far-off collision tests; a lane outside
+/// declines loudly.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Region {
     pub ix: i16,
@@ -126,11 +119,9 @@ pub struct RegionGrid {
     pub speed: i32,
 }
 
-/// The region grid of every kernel set. `CELESTE_REGION="px,S"` sets it,
-/// `off` leaves every kernel set unkeyed (one kernel per shape); unset it is
-/// 16 px with speeds within 6 px. `S` is at most 7: the move loop is
-/// unrolled for `abs(amount) <= 8` (`Interp::unroll_bound`), and `amount`
-/// is `flr(rem + spd + 0.5)`.
+/// The region grid of every kernel set: `CELESTE_REGION="px,S"`, `off` for
+/// none, default 16 px / speed 6. `S <= 7` because the move loop unrolls
+/// for `abs(amount) <= 8` and `amount = flr(rem + spd + 0.5)`.
 pub fn region_grid() -> Option<RegionGrid> {
     static GRID: std::sync::OnceLock<Option<RegionGrid>> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
@@ -178,8 +169,7 @@ impl RegionGrid {
             (field(&["y"]), (y0 * ONE, (y0 + self.px - 1) * ONE)),
             (field(&["spd", "x"]), (-self.speed * ONE, self.speed * ONE)),
             (field(&["spd", "y"]), (-self.speed * ONE, self.speed * ONE)),
-            // `move` leaves `rem` in `[-0.5, 0.5)`; bounding it gives the
-            // move amount a range (collisions reach 7 px each way, not 8).
+            // `move` leaves `rem` in `[-0.5, 0.5)`; bounding it bounds the move.
             (field(&["rem", "x"]), (-0x8000, 0x7fff)),
             (field(&["rem", "y"]), (-0x8000, 0x7fff)),
         ]
@@ -189,20 +179,16 @@ impl RegionGrid {
 /// The input bounds a frame is traced under (`verify::trace_frame`).
 pub type Bounds = Vec<(super::iface::Path, (i32, i32))>;
 
-/// How many frames of platform motion the platform worlds cover
-/// (`concrete::platform_worlds`): a platforms-unknown level is sound only for
-/// a search no longer than this, and refuses a longer one
-/// (`frame::forward_frame`).
+/// Frames of platform motion the platform worlds cover: a platforms-unknown
+/// level is sound only up to this horizon and refuses a longer search.
 pub const PLATFORM_WORLD_FRAMES: usize = 127;
 
 /// A node of the constant-lattice walk: a shape key and a region.
 pub type WalkNode = (String, Option<Region>);
 
-/// The regions a state's rows can be in: `None` without a grid or without a
-/// player; otherwise every region the hull of the player's whole-pixel `x`
-/// and `y` touches, clamped to the screen plus one region on each side (an
-/// axis with no static range takes that whole window). Over-covering only
-/// adds kernels; a row outside every region stops the run.
+/// The regions a state's rows can be in (`None` without a grid or player):
+/// every region the hull of the player's `x`/`y` touches, clamped to the
+/// screen plus one region. Over-covering only adds kernels.
 fn successor_regions(
     st: &super::state::State<super::domain::Symbolic>,
     d: &mut super::domain::Symbolic,
@@ -227,8 +213,7 @@ fn successor_regions(
         anyhow::ensure!(hull[axis].0 <= hull[axis].1, "{}: its range lies outside the screen window {window:?}", iface::show(&p));
     }
     let (a, b) = (g.of(hull[0].0 as i32, hull[1].0 as i32), g.of(hull[0].1 as i32, hull[1].1 as i32));
-    // THE WALK PROBE: `CELESTE_WALK_REGIONS="(ix,iy) .."` traces only those
-    // regions. Not a search mode: every other row has no kernel.
+    // Probe only: `CELESTE_WALK_REGIONS="(ix,iy) .."` traces just those.
     static ONLY: std::sync::OnceLock<Option<Vec<(i16, i16)>>> = std::sync::OnceLock::new();
     let only = ONLY.get_or_init(|| {
         std::env::var("CELESTE_WALK_REGIONS").ok().map(|v| {
@@ -242,19 +227,15 @@ fn successor_regions(
         })
     });
     if let Some(o) = only {
-        // Reachable or not.
         return Ok(o.iter().map(|&(ix, iy)| Some(Region { ix, iy })).collect());
     }
     Ok((a.iy..=b.iy).flat_map(|iy| (a.ix..=b.ix).map(move |ix| Some(Region { ix, iy }))).collect())
 }
 
-/// THE NO-PLAYER PHASE'S RANGES (region-keyed rooms). One trace covers
-/// every frame of the spawn, so a field that varies over it (the spawn's
-/// `y`) would be an unbounded input and the player it creates could be
-/// anywhere. No input matters before the player exists, so the phase is
-/// DETERMINISTIC: run it fully pinned while the shape stays the no-player
-/// shape, and bound each numeric field to the hull of what it took.
-/// Asserted like a region's bounds: a lane outside declines.
+/// THE NO-PLAYER PHASE'S RANGES. One trace covers the whole spawn, so a field
+/// varying over it would be an unbounded input. No input matters before the
+/// player exists, so run the phase fully pinned and bound each numeric field
+/// to the hull it took; a lane outside declines.
 fn no_player_ranges(
     it: &mut super::interp::Interp<'static, super::domain::Symbolic>,
     reset: &'static full_moon::ast::Ast,
@@ -270,13 +251,10 @@ fn no_player_ranges(
     let shape = start.shape()?;
     let mut hull: std::collections::BTreeMap<super::iface::Path, (i32, i32)> = Default::default();
     let mut st = start.clone();
-    // The values, read before `rebase` blanks them and pinned back by the
-    // next trace.
+    // Read before `rebase` blanks them; the next trace pins them back.
     let mut consts = shapes::field_constants(start, &it.d, &opts)?;
-    // The spawn takes ~20 frames; the cap stops a phase that never ends.
-    // Only a phase run to its END (the player appears, or the shape
-    // changes) bounds anything; one that cannot run concretely (an `rnd`
-    // draw) is not deterministic and bounds nothing.
+    // Only a phase run to its END bounds anything; one that cannot run
+    // concretely (an `rnd` draw) bounds nothing. The cap stops a runaway.
     let mut ended = false;
     for _ in 0..240 {
         for (p, c) in &consts {
@@ -306,8 +284,7 @@ fn no_player_ranges(
     Ok(hull.into_iter().filter(|(_, (lo, hi))| lo < hi).collect())
 }
 
-/// A frame's bounds by ENGINE cell: what the lowering's decide step and
-/// fragment pruning read.
+/// A frame's bounds by ENGINE cell, for the lowering's decide and pruning.
 fn engine_ranges(
     f: &super::verify::Frame,
     bounds: &[(super::iface::Path, (i32, i32))],
@@ -340,17 +317,11 @@ mod tests {
     }
 }
 
-/// The per-shape constant lattice by FIXPOINT over (shape, region) nodes.
-///
-/// Seeds from the concrete spawn state and traces forward with each
-/// shape's known-constant fields PINNED, so a field no frame changes stays
-/// a constant and folds what depends on it. An outcome's constants are
-/// INTERSECTED into its shape's lattice; a shape whose lattice shrinks is
-/// re-traced. Monotone (fields only go constant -> abstract), so it
-/// terminates.
-///
-/// Every frame is traced under `opts` (the level), so the shape set and the
-/// frames are consistent with the level the kernels are built for.
+/// The per-shape constant lattice by FIXPOINT over (shape, region) nodes:
+/// trace forward from the spawn with each shape's known constants PINNED,
+/// INTERSECT each outcome's constants into its shape's lattice, re-trace a
+/// shape that shrinks. Monotone (constant -> abstract only), so it
+/// terminates. Every frame is traced under `opts`, the kernels' level.
 pub fn room_constant_lattice(
     root: &std::path::Path,
     opts: crate::abstraction::Level,
@@ -363,8 +334,7 @@ pub fn room_constant_lattice(
     type Cmap = std::collections::BTreeMap<super::iface::Path, super::iface::Conc>;
 
     let src = cart::sources_in(root)?;
-    // Leaked: the tracer is kept (`LatticeWalk::tracer`) and `Interp`
-    // borrows the ASTs.
+    // Leaked: the kept tracer's `Interp` borrows the ASTs.
     let leak = |a: full_moon::ast::Ast| -> &'static full_moon::ast::Ast { Box::leak(Box::new(a)) };
     let top = leak(full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?);
     cart::check_absent_fields(top)?;
@@ -378,8 +348,7 @@ pub fn room_constant_lattice(
     let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
     it.cache = Some(cache.clone());
     it.cart = Some(cart_data.clone());
-    // The level's widenings, for every frame this walk (and every copy of
-    // its tracer) traces.
+    // The level's widenings, for every frame this walk traces.
     it.d.held_unknown = opts.held;
     it.d.fruit_unknown = opts.fruit;
     it.d.floors_near = opts.floors_near;
@@ -402,7 +371,7 @@ pub fn room_constant_lattice(
     let mut frames: std::collections::BTreeMap<WalkNode, WalkFrame> = Default::default();
     let mut forkops: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let mut refused: std::collections::BTreeMap<WalkNode, String> = Default::default();
-    // Poisoned paths over the whole walk, by reason (summed per-job drains).
+    // Poisoned paths by reason, summed over jobs.
     let mut illegal: std::collections::BTreeMap<String, usize> = Default::default();
     // The nodes whose `Frame::raise` did not fold to false.
     let mut raising: std::collections::BTreeSet<WalkNode> = Default::default();
@@ -420,11 +389,9 @@ pub fn room_constant_lattice(
     }
     lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, &opts)?);
     reps.insert(sk.clone(), start.clone());
-    // The START state's own intervals (an `rnd` draw in `_init`, e.g. a
-    // balloon's `offset`) are interval inputs too, at every level: no traced
-    // frame wrote them, so the write discovery below would never type them.
-    // Only the representative holds a blanked POINT; the lattice was read
-    // from `start`, where the slot is no constant.
+    // The START state's own intervals (an `rnd` draw in `_init`) are interval
+    // inputs at every level: no traced frame wrote them, so write discovery
+    // would miss them.
     let mut start_ivals: std::collections::BTreeMap<super::iface::Path, (i32, i32)> = Default::default();
     {
         use super::domain::Domain as _;
@@ -451,18 +418,15 @@ pub fn room_constant_lattice(
     let room0 = shapes::room_of(&start, &it.d);
     let lattice_trace = std::env::var_os("CELESTE_LATTICE_TRACE").is_some();
 
-    // THE ROUNDS: each traces its whole frontier in parallel against the
-    // round's lattice snapshot; results are applied in node order between
-    // rounds. A new shape's representative crosses from a worker's arena
-    // into the walk's through `shapes::rebase`; each frame is bound in the
-    // arena it was traced in (`WalkFrame::bound`).
+    // THE ROUNDS: each traces its frontier in parallel against a lattice
+    // snapshot; results apply in node order between rounds. Each frame is
+    // bound in the worker arena it was traced in.
     let mut rep_constants: std::collections::BTreeMap<String, std::collections::HashMap<u32, super::iface::Conc>> = Default::default();
-    // `CELESTE_WALK_THREADS` caps the workers: each holds its own arena,
-    // and the heaviest traces take GBs each.
+    // `CELESTE_WALK_THREADS` caps workers: each holds an arena of GBs.
     let n_workers = std::env::var("CELESTE_WALK_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
     let mut tracers: Vec<Tracer> = (0..n_workers).map(|_| Tracer { it: it.clone(), reset, fr }).collect();
     let mut frontier: Vec<WalkNode> = start_regions.into_iter().map(|r| (sk.clone(), r)).collect();
-    // Shapes whose reached regions wait for a re-trace (the deferred re-trace).
+    // Shapes waiting for the deferred re-trace.
     let mut dirty: std::collections::BTreeSet<String> = Default::default();
     let (mut traces, mut round) = (0usize, 0usize);
     let t_walk = std::time::Instant::now();
@@ -487,9 +451,7 @@ pub fn room_constant_lattice(
                         g.bounds(&pl, r).into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect()
                     }
                     (None, None, _) => Vec::new(),
-                    // The spawn phase's hull, on ITS shape only: bounds are
-                    // by path, and in another shape `objects[k]` is another
-                    // object.
+                    // The spawn hull, on ITS shape only (bounds are by path).
                     (Some(_), None, None) if st.shape()? == no_player_shape => {
                         no_player.iter().filter(|(p, _)| roots.iter().any(|q| q == p)).cloned().collect()
                     }
@@ -503,8 +465,7 @@ pub fn room_constant_lattice(
         let next = std::sync::atomic::AtomicUsize::new(0);
         let (jobs_ref, next_ref) = (&jobs, &next);
         let results: Vec<Result<Vec<(usize, WalkTraced)>>> = std::thread::scope(|scope| {
-            // Each worker OWNS its pristine copy (a `Tracer` is `Send`, not
-            // `Sync`) and only ever clones from it.
+            // Each worker owns its copy (`Tracer` is `Send`, not `Sync`).
             let handles: Vec<_> = tracers
                 .iter_mut()
                 .map(|tr| {
@@ -515,10 +476,8 @@ pub fn room_constant_lattice(
                             loop {
                                 let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let Some(job) = jobs_ref.get(i) else { break };
-                                // Every job in a FRESH copy of the starting
-                                // arena, so a frame's graph is a function of
-                                // the job, not of scheduling (`renumber_cells`
-                                // orders commutative operands by arena id).
+                                // A FRESH arena per job, so a graph depends on
+                                // the job, not scheduling (`renumber_cells`).
                                 let mut fresh = Tracer { it: tr.it.clone(), reset: tr.reset, fr: tr.fr };
                                 done.push((i, walk_trace(&mut fresh, job, opts, grid, room0)?));
                             }
@@ -543,11 +502,9 @@ pub fn room_constant_lattice(
                     for (why, n) in poisoned {
                         *illegal.entry(why).or_default() += n;
                     }
-                    // Remembered: a node that never traces is a MISSING
-                    // KERNEL, a hard error after the fixpoint (a later
-                    // successful re-trace clears it). The node's EARLIER
-                    // frame goes too: it was traced under pins the lattice
-                    // has since dropped, so it would bake stale constants.
+                    // A node that never traces is a MISSING KERNEL (an error
+                    // after the fixpoint). Its earlier frame goes too: it
+                    // was traced under pins since dropped.
                     refused.insert(job.node.clone(), e);
                     frames.remove(&job.node);
                 }
@@ -579,8 +536,7 @@ pub fn room_constant_lattice(
                     }
                     for o in outs {
                         let tk = o.key;
-                        // Slots written an interval beyond the boundary's
-                        // widenings: interval inputs of the next frame.
+                        // Intervals beyond the boundary's widenings: inputs next frame.
                         let mut new_ival = false;
                         for p in o.ival {
                             if lattice_trace && !ival_extra.get(&tk).is_some_and(|s| s.contains(&p)) {
@@ -614,8 +570,7 @@ pub fn room_constant_lattice(
                                 m.len() != before
                             }
                         };
-                        // New regions are traced next round; a narrowed
-                        // shape is re-traced later (`dirty`, below).
+                        // New regions trace next round; narrowed shapes later (`dirty`).
                         let reached = regions.entry(tk.clone()).or_default();
                         if changed || new_ival {
                             dirty.insert(tk.clone());
@@ -631,12 +586,9 @@ pub fn room_constant_lattice(
                 }
             }
         }
-        // THE DEFERRED RE-TRACE: a shape whose lattice narrowed (or gained
-        // an interval slot) is re-traced in every region it reached once the
-        // walk finds no new region, not at each narrowing. Sound: pins only
-        // drop, so a trace under older pins sees a subset of what the final
-        // ones admit, and the re-trace under the final lattice finds the
-        // rest, repeating until nothing changes.
+        // THE DEFERRED RE-TRACE: once no new region appears, re-trace each
+        // narrowed shape in every region it reached. Sound: pins only drop,
+        // and the re-trace repeats until nothing changes.
         if next_frontier.is_empty() {
             for k in std::mem::take(&mut dirty) {
                 for r in regions.get(&k).into_iter().flatten() {
@@ -649,8 +601,7 @@ pub fn room_constant_lattice(
         }
         frontier = next_frontier.into_iter().collect();
     }
-    // Every reachable node must have a frame, or its kernel is missing and
-    // the gap would only show at runtime.
+    // Every reachable node needs a frame, or the gap shows only at runtime.
     let nodes: Vec<WalkNode> = regions.iter().flat_map(|(k, rs)| rs.iter().map(move |r| (k.clone(), *r))).collect();
     let missing: Vec<String> = nodes
         .iter()
@@ -671,8 +622,8 @@ pub fn room_constant_lattice(
         nodes.len(),
         t_walk.elapsed().as_secs_f64()
     );
-    // POISONED PATHS, always reported: a Lua type error the tracer could
-    // not prove unreachable is a modelling gap (zero in every room so far).
+    // POISONED PATHS: a Lua type error not proven unreachable is a
+    // modelling gap.
     if !illegal.is_empty() {
         let total: usize = illegal.values().sum();
         eprintln!("[walk] {total} POISONED paths (a Lua raise the tracer could not rule out), by reason:");
@@ -680,8 +631,7 @@ pub fn room_constant_lattice(
             eprintln!("[walk]   {n} x {why}");
         }
     }
-    // THE RAISE ROW: the poison count is how often the tracer HIT a raise
-    // site; this is whether the resulting condition survived folding.
+    // Poison counts raise-site hits; this is whether the condition survived.
     if !raising.is_empty() {
         eprintln!(
             "[walk] {} of {} (shape, region) nodes have a LIVE raise row (`Frame::raise` did not fold to false)",
@@ -697,9 +647,8 @@ pub fn room_constant_lattice(
     Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops, tracer: Tracer { it, reset, fr }, by_hash, opts, start_key, ival_extra, start_ivals })
 }
 
-/// The interval inputs the BOUNDARY widens (the player's `rem`, and the
-/// level's widened objects). The `rnd`-derived ones (`ival_extra`) come on
-/// top (`with_extra`).
+/// The interval inputs the BOUNDARY widens (`rem`, the level's widened
+/// objects); `rnd`-derived ones come on top (`with_extra`).
 fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: crate::abstraction::Level) -> Vec<super::iface::Path> {
     let mut ival = super::shapes::ival_paths(st);
     // The moving platforms' `x` and `last` at a platforms-unknown level.
@@ -707,9 +656,8 @@ fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: crate:
         let pp = super::widen::platform_paths(st);
         ival.extend(pp.x.iter().chain(pp.last.iter()).cloned());
     }
-    // A near level's floors (`state` an interval, `collideable` a boolean a
-    // lane may hold unknown) and the objects' phases. Not the countdowns:
-    // those are the unknown number (`widen::forget_countdown_inputs`).
+    // Near level: floors and object phases (countdowns are the unknown
+    // number instead, `widen::forget_countdown_inputs`).
     if opts.floors_near {
         ival.extend(super::widen::near_floor_paths(st).all().cloned());
         ival.extend(super::widen::phase_paths(st).into_iter().filter(|(_, r)| !matches!(r, super::widen::PhaseRange::Countdown)).map(|(p, _)| p));
@@ -727,8 +675,7 @@ fn with_extra(mut ival: Vec<super::iface::Path>, extra: Option<&std::collections
     ival
 }
 
-/// What one walk node is traced under, from its round's snapshot of the
-/// lattice.
+/// What one walk node is traced under.
 struct WalkJob {
     node: WalkNode,
     st: super::state::State<super::domain::Symbolic>,
@@ -736,8 +683,7 @@ struct WalkJob {
     pin: Vec<(super::iface::Path, super::iface::Conc)>,
     ival: Vec<super::iface::Path>,
     bounds: Bounds,
-    /// For a representative that is not the start state: its heap's
-    /// constants in the walk's arena, to rebase it into the worker's.
+    /// A non-start representative's heap constants, to rebase it.
     rebase: Option<std::collections::HashMap<u32, super::iface::Conc>>,
 }
 
@@ -765,25 +711,21 @@ enum WalkTraced {
         arena: usize,
         outs: Vec<WalkOutcome>,
         skipped: Vec<&'static str>,
-        /// Paths this trace POISONED, by reason (`Interp::illegal`, drained
-        /// per job so the walk can sum them).
+        /// Paths this trace POISONED, by reason (drained per job).
         illegal: std::collections::BTreeMap<String, usize>,
-        /// `Frame::raise` did not fold to `false` (decided in the worker,
-        /// whose arena the node lives in).
+        /// `Frame::raise` did not fold to `false`.
         can_raise: bool,
     },
 }
 
-/// A walk node's converged frame, the bounds it was traced under, and the
-/// frame bound in the arena it was traced in (or why it did not bind).
+/// A walk node's converged frame, its bounds, and its binding (or why not).
 pub struct WalkFrame {
     pub frame: super::verify::Frame,
     pub bounds: Bounds,
     pub bound: std::result::Result<Bound, String>,
 }
 
-/// Trace one walk node on a worker's tracer and read what the walk needs off
-/// it, all in that worker's arena.
+/// Trace one walk node on a worker's tracer, in that worker's arena.
 fn walk_trace(
     tr: &mut Tracer,
     job: &WalkJob,
@@ -794,9 +736,7 @@ fn walk_trace(
     use super::domain::Domain;
     use super::{shapes, verify};
     use crate::transpile::graph::Op;
-    // `Interp::illegal` accumulates across a worker's jobs, so both
-    // `WalkTraced` exits DRAIN it; the `?` exits need not, since an `Err`
-    // fails the whole walk.
+    // `illegal` accumulates per worker, so both `WalkTraced` exits DRAIN it.
     debug_assert!(tr.it.illegal.is_empty(), "a previous job left {} poison reasons behind", tr.it.illegal.len());
     tr.it.illegal.clear();
     let mut st = job.st.clone();
@@ -834,9 +774,8 @@ fn walk_trace(
     let mut outs = Vec::new();
     let mut skipped = Vec::new();
     for o in &f.outs {
-        // A non-constant room (-1) is not "another room": it may hold this
-        // room's states, so it is an error rather than skipped
-        // (`state::same_room` keeps rooms apart, so it should not happen).
+        // A non-constant room (-1) may hold this room's states: an error,
+        // not skipped.
         let room = shapes::room_of(&o.st, &tr.it.d);
         anyhow::ensure!(room.0 >= 0 && room.1 >= 0, "an outcome whose room is not a constant: {room:?}");
         if room != room0 {
@@ -866,15 +805,13 @@ fn walk_trace(
         outs.push(WalkOutcome { key, constants, ival, regions, st: o.st.clone(), heap_constants });
     }
     let bound = super::emit::bind(&f, &tr.it.d.graph).map_err(|e| format!("{:#}", e));
-    // DRAINED, not copied (see the top of this function).
     let illegal = std::mem::take(&mut tr.it.illegal);
     // Decided HERE: `f.raise` names a node of this worker's arena.
     let can_raise = tr.it.d.decide(&f.raise) != Some(false);
     Ok(WalkTraced::Traced { frame: f, bound, forks: live_forks, forkops, nodes_added, arena: tr.it.d.node_count(), outs, skipped, illegal, can_raise })
 }
 
-/// The tracer a walk ran in, kept so a shape can be re-traced later in
-/// the same arena (the walk's states are graph nodes of it).
+/// The tracer a walk ran in, kept to re-trace a shape in the same arena.
 #[derive(Clone)]
 pub struct Tracer {
     pub it: super::interp::Interp<'static, super::domain::Symbolic>,
@@ -882,9 +819,8 @@ pub struct Tracer {
     pub fr: &'static full_moon::ast::Ast,
 }
 
-// SAFETY: the raw pointers inside (`Interp::body_ids`' keys, the AST
-// references) point into the leaked `'static` ASTs, immutable and never
-// freed, so a copy of the tracer can move to a walk worker.
+// SAFETY: the raw pointers inside point into the leaked `'static` ASTs,
+// immutable and never freed, so a copy can move to a worker.
 unsafe impl Send for Tracer {}
 
 /// The output of `room_constant_lattice`.
@@ -904,12 +840,10 @@ pub struct LatticeWalk {
     pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
     pub forkops: std::collections::BTreeMap<String, Vec<String>>,
-    /// Per shape, the input slots a reachable frame WROTE an interval to
-    /// beyond the boundary's widenings (an `rnd`-derived value), typed as
-    /// interval inputs. Monotone like the constants.
+    /// Per shape, input slots a reachable frame wrote an `rnd`-derived
+    /// interval to, typed as interval inputs. Monotone.
     pub ival_extra: std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>>,
-    /// The START state's own intervals (an `rnd` draw), by path: the
-    /// representative holds a blanked POINT there, so a reader seeding values
-    /// from it (level -1) takes the real range from here.
+    /// The start state's own intervals by path (the representative holds a
+    /// blanked point there; level -1 seeds from this).
     pub start_ivals: std::collections::BTreeMap<super::iface::Path, (i32, i32)>,
 }

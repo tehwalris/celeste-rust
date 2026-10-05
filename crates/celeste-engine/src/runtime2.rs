@@ -1,11 +1,7 @@
-//! The columnar block: the search's data currency and the ASM kernels'
-//! input/output.
-//!
-//! A block of abstract lanes: heap structure is shared (uniform across lanes
-//! by the shape premise), values are per-lane columns. This module owns the
-//! lane primitives (retain, gather) and the BOUNDARY: a level's widenings
-//! (`widen_to`, the twins of `trace::widen`), canonical renumbering, the
-//! shape hash, the row keys and the within-block dedup.
+//! The columnar block, the kernels' input/output: heap structure shared by
+//! every lane (the shape premise), values in per-lane columns. Owns the lane
+//! primitives and the BOUNDARY: a level's widenings (`widen_to`, twins of
+//! `trace::widen`), canonical renumbering, shape hash, row keys and dedup.
 
 use std::sync::Arc;
 
@@ -26,10 +22,8 @@ pub fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// A value's contribution to the row key. A number and the point interval
-/// `[n, n]` code ALIKE: which one a row stores depends on its column's type
-/// (`asm_kernel::BodyCols`), which not every producer agrees on, and coded
-/// apart one state would have two keys.
+/// A value's contribution to the row key. A number and `[n, n]` code ALIKE:
+/// producers disagree on column types, and one state must have one key.
 #[inline]
 pub fn av_code(v: AV) -> u64 {
     match v {
@@ -51,8 +45,7 @@ pub fn num_code(n: u32) -> u64 {
     1u64 << 56 | n as u64
 }
 
-/// `av_code` of the interval with raw bits `[lo, hi]`: a point interval
-/// codes as its number.
+/// `av_code` of the interval `[lo, hi]` (raw); a point codes as its number.
 #[inline]
 pub fn ival_code(lo: u32, hi: u32) -> u64 {
     if lo == hi {
@@ -62,8 +55,7 @@ pub fn ival_code(lo: u32, hi: u32) -> u64 {
     }
 }
 
-/// The two seeds of the 128-bit row key (one per half) and the cell-id
-/// multiplier. Shared with the ASM kernels (`transpile::graph::Op::CellMix`).
+/// Row-key seeds (one per half) and cell-id multiplier; shared with `Op::CellMix`.
 pub const KEY_SEED1: u64 = 0x5bf0_3635;
 pub const KEY_SEED2: u64 = 0x27d4_eb2f;
 pub const CELL_K: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -84,8 +76,7 @@ pub enum AV {
     Ival(P8, P8),
     Bool(bool),
     UBool,
-    /// An UNKNOWN number: what a level that widens a number to nothing
-    /// stores, uniform; no kernel reads it (`graph::Op::UnknownNum`).
+    /// An UNKNOWN number (a fully widened field); no kernel reads it.
     UNum,
     Str(u32),
     Nil,
@@ -106,8 +97,7 @@ pub enum Col {
 }
 
 impl Col {
-    /// The lane's value regardless of how the column is stored: the way to
-    /// compare columns by content rather than representation.
+    /// The lane's value, independent of the column's representation.
     #[inline]
     pub fn at(&self, lane: usize) -> AV {
         match self {
@@ -118,17 +108,15 @@ impl Col {
         }
     }
 
-    /// The one number every lane of a `width`-lane column holds, however
-    /// the column stores it; `None` otherwise.
+    /// The one number every lane of a `width`-lane column holds, if any.
     pub fn uniform_num(&self, width: usize) -> Option<P8> {
         let AV::Num(n) = self.at(0) else { return None };
         (0..width).all(|lane| self.at(lane) == AV::Num(n)).then_some(n)
     }
 }
 
-/// Shared heap structure. Value cells' per-lane contents live in
-/// `Rt2::cols` at the same index; the other kinds are uniform by the
-/// shape premise. Closure captures are snapshots of the captured values.
+/// Shared heap structure; a `Val` cell's contents are `Rt2::cols` at the same
+/// index, other kinds are uniform. Closure captures are value snapshots.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Cell2 {
     Val,
@@ -143,11 +131,9 @@ pub enum Cell2 {
 pub struct BoundaryIds {
     pub g_objects: u32,
     pub g_player: u32,
-    /// The spawn-animation type table: the search's position column reads
-    /// the `player` instance, or the `player_spawn` one before it exists.
+    /// The position column reads `player_spawn` before the player exists.
     pub g_player_spawn: u32,
-    /// The `room` table (`x`/`y` fields via `f_x`/`f_y`): the position
-    /// column is start-room-relative, and the win test is `room.x`.
+    /// `room` (`x`/`y`): positions are start-room-relative; wins test `room.x`.
     pub g_room: u32,
     /// `max_djump`: 2 once the orb is taken (`frame::wins_of`).
     pub g_max_djump: u32,
@@ -158,13 +144,11 @@ pub struct BoundaryIds {
     pub f_x: u32,
     pub f_y: u32,
     pub f_dash_effect_time: u32,
-    /// Fruit-off widening ids (`widen::widen_fruit`); `f_y` is the bob-band
-    /// target.
+    /// Fruit-off widening ids (`widen::widen_fruit`).
     pub g_fruit: u32,
     pub f_off: u32,
     pub f_start: u32,
-    /// The key object type and the two fields its update derives from
-    /// `frames`: pinned with the timers.
+    /// The key and its two `frames`-derived fields, pinned with the timers.
     pub g_key: u32,
     pub f_spr: u32,
     pub f_flip: u32,
@@ -175,8 +159,7 @@ pub struct BoundaryIds {
     pub g_fly_fruit: u32,
     pub f_step: u32,
     pub f_fly: u32,
-    /// The moving platforms at a platforms-unknown level
-    /// (`abstraction::PlatformsPrecision`).
+    /// Moving platforms at a platforms-unknown level (`PlatformsPrecision`).
     pub g_platform: u32,
     pub f_last: u32,
     /// The fall floors at a floors-unknown level (`abstraction::FloorsPrecision`).
@@ -197,40 +180,32 @@ pub struct BoundaryIds {
     pub f_hide_for: u32,
 }
 
-/// A full period of `sin` as an inclusive raw 16.16 interval's width
-/// (`[a, a + 1)` is `[a, a + 0xffff]`, what `rnd(1)` draws); the balloon's
-/// canonical phase is `[0, BALLOON_PERIOD_RAW]`. ONE definition, shared with
-/// `widen::canon_balloon_offset`, or lookups miss.
+/// A full `sin` period as an inclusive raw interval width (`rnd(1)`'s range);
+/// the balloon's canonical phase is `[0, BALLOON_PERIOD_RAW]`. ONE
+/// definition, shared with `widen::canon_balloon_offset`, or lookups miss.
 pub const BALLOON_PERIOD_RAW: i32 = 0xffff;
 
-/// A fall floor's `state` where a near level widens it: 0 idle, 1 shaking,
-/// 2 hidden. An interval, not the unknown number, so a lane may hold it or
-/// an exact state. Raw 16.16. ONE definition, shared with
+/// A fall floor's widened `state` (0 idle, 1 shaking, 2 hidden), an interval
+/// so a lane may hold it or an exact state. Raw. ONE definition, shared with
 /// `widen::widen_near_floors`, or lookups miss.
 pub const FLOOR_STATE_RANGE: (i32, i32) = (0, 2 << 16);
 
-/// A spring's `spr` where a near level widens it: 0 hidden, 18 ready, 19
-/// compressed. Raw 16.16. ONE definition, shared with `widen::phase_paths`.
+/// A spring's widened `spr` (0 hidden, 18 ready, 19 compressed); `widen::phase_paths`.
 pub const SPRING_SPR_RANGE: (i32, i32) = (0, 19 << 16);
 
-/// A balloon's `spr` where a near level widens it: 0 popped, 22 present.
-/// Raw 16.16. ONE definition, shared with `widen::phase_paths`.
+/// A balloon's widened `spr` (0 popped, 22 present); `widen::phase_paths`.
 pub const BALLOON_SPR_RANGE: (i32, i32) = (0, 22 << 16);
 
-/// A balloon's bob radius where a near level widens its `y` (`start +
-/// sin(offset) * 2`). Raw 16.16. ONE definition, shared with
-/// `widen::phase_paths`.
+/// A balloon's bob radius (`y = start + sin(offset) * 2`); `widen::phase_paths`.
 pub const BALLOON_BOB_RAW: i32 = 2 << 16;
 
-/// The player's hitbox and every other object's, `(x, y, w, h)`. The tracer
-/// checks the traced state holds these (`widen::widen_near_floors`).
+/// Hitboxes `(x, y, w, h)`, checked by the tracer (`widen::widen_near_floors`).
 pub const PLAYER_HITBOX: [i16; 4] = [1, 3, 6, 5];
 pub const FLOOR_HITBOX: [i16; 4] = [0, 0, 8, 8];
 
-/// Where the player overlaps the fall floor at `floor`: the cart's
-/// `floor.collide(player, 0, 0)` solved for the player's position, as OPEN
-/// windows `(lo, hi)` for `x` and `y` (overlap iff `lo < x < hi` on both).
-/// ONE definition, shared with `widen::widen_near_floors`, or lookups miss.
+/// The cart's `floor.collide(player, 0, 0)` solved for the player: OPEN
+/// windows `(lo, hi)` for `x` and `y`. ONE definition, shared with
+/// `widen::widen_near_floors`, or lookups miss.
 pub fn floor_player_window(floor: (P8, P8)) -> [(P8, P8); 2] {
     let [px, py, pw, ph] = PLAYER_HITBOX;
     let [fx, fy, fw, fh] = FLOOR_HITBOX;
@@ -238,27 +213,23 @@ pub fn floor_player_window(floor: (P8, P8)) -> [(P8, P8); 2] {
     [(at(floor.0, fx - px - pw), at(floor.0, fx + fw - px)), (at(floor.1, fy - py - ph), at(floor.1, fy + fh - py))]
 }
 
-/// Does a player in the inclusive ranges `x`, `y` CERTAINLY overlap the
-/// window's floor? A range straddling the edge does not: the floor is
-/// widened there, the safe side. ONE definition with the tracer's.
+/// Does a player in ranges `x`, `y` CERTAINLY overlap? A straddling range
+/// does not (the floor stays widened, the safe side). Shared with the tracer.
 pub fn player_overlaps_floor(window: [(P8, P8); 2], x: (P8, P8), y: (P8, P8)) -> bool {
     let [(xlo, xhi), (ylo, yhi)] = window;
     x.0 > xlo && x.1 < xhi && y.0 > ylo && y.1 < yhi
 }
 
 
-/// A moving platform's whole path in whole pixels: it wraps between -16 and
-/// 128, so its `x` (and `last`, equal at every frame boundary) is always in
-/// here. ONE definition, shared with `widen::widen_platforms`.
+/// A moving platform's `x` (and `last`) range: it wraps between -16 and 128.
+/// ONE definition, shared with `widen::widen_platforms`.
 pub const PLATFORM_PATH: (i16, i16) = (-16, 128);
 
-/// A platform's `rem.x` at a platforms-unknown level: the whole remainder
-/// `[-0.5, 0.5)`, raw.
+/// A platform's widened `rem.x`: the whole `[-0.5, 0.5)`, raw.
 pub const PLATFORM_REM: (i32, i32) = (-0x8000, 0x7fff);
 
-/// The fly fruit's `spd.y` range at a fruit-unknown level (raw 16.16,
-/// inclusive; waiting and flying both stay inside). Shared by
-/// `widen::widen_fly_fruit` (which checks it) and `Rt2::widen_to`.
+/// The fly fruit's widened `spd.y` (raw, inclusive), checked by
+/// `widen::widen_fly_fruit`.
 pub const FLY_FRUIT_SPD_Y: (i32, i32) = (-0x3_8000, 0x8000);
 /// The fly fruit's `rem.y` range, [-0.5, 0.5): `move`'s own arithmetic.
 pub const FLY_FRUIT_REM_Y: (i32, i32) = (-0x8000, 0x7fff);
@@ -266,8 +237,7 @@ pub const FLY_FRUIT_REM_Y: (i32, i32) = (-0x8000, 0x7fff);
 pub struct Rt2 {
     pub width: usize,
     pub structure: Vec<Cell2>,
-    /// Per-cell value columns, parallel to `structure` (meaningful for
-    /// `Cell2::Val`).
+    /// Per-cell value columns, parallel to `structure` (for `Cell2::Val`).
     pub cols: Vec<Col>,
     pub globals: Vec<u32>,
     pub strings: Vec<String>,
@@ -357,10 +327,8 @@ fn compress_num(c: Col) -> Col {
     }
 }
 
-/// A column whose lanes all agree becomes that uniform value; anything else
-/// is returned as-is. Row keys do not depend on it, but kernel binding
-/// requires `Col::U` for block-uniform inputs, so blocks of the same content
-/// must agree on it (the append step, `ForwardSink::finish`, the boundary).
+/// A column whose lanes all agree becomes `Col::U`. Kernel binding requires
+/// `Col::U` for uniform inputs, so every producer must apply it.
 pub fn collapse_uniform(c: Col) -> Col {
     let all_same = match &c {
         Col::U(_) => return c,
@@ -408,8 +376,7 @@ impl Rt2 {
 
 
 impl Rt2 {
-    /// The cell a table-valued global points at (`None` if unset or not a
-    /// table pointer).
+    /// The cell a table-valued global points at, if any.
     pub fn global_target(&self, g: u32) -> Option<u32> {
         let cell = self.globals[g as usize];
         if cell == NONE {
@@ -433,14 +400,12 @@ impl Rt2 {
         }
     }
 
-    /// The player INSTANCES in `objects` (`g_player` is the type table,
-    /// not an instance).
+    /// The player INSTANCES in `objects` (`g_player` is the type table).
     pub fn player_objects(&self, ids: &BoundaryIds) -> Vec<u32> {
         self.objects_of_type(ids, ids.g_player)
     }
 
-    /// Instances in `objects` whose `type` field points at the type
-    /// table held by global `type_global`.
+    /// Instances in `objects` whose `type` is global `type_global`'s table.
     pub fn objects_of_type(&self, ids: &BoundaryIds, type_global: u32) -> Vec<u32> {
         let mut found = Vec::new();
         let Some(arr) = self.global_target(ids.g_objects) else {
@@ -510,8 +475,7 @@ impl Rt2 {
         }
     }
 
-    /// The block's shape key: a hash of the structure and globals.
-    /// Meaningful only when the structure is in canonical order.
+    /// The shape key: a hash of the (canonical) structure and globals.
     pub fn shape_hash_of(&self) -> u64 {
         use std::hash::Hasher;
         let mut h = rustc_hash::FxHasher::default();
@@ -551,25 +515,19 @@ impl Rt2 {
         h.finish()
     }
 
-    /// The boundary: the level-0 widenings (`widen_to` with no flags),
-    /// canonical renumbering (the per-frame GC), the per-lane row keys, and
-    /// dedup within the block. Returns the surviving lane count.
+    /// The boundary: level-0 widenings, canonical renumbering (the GC), row
+    /// keys, and in-block dedup. Returns the surviving lane count.
     pub fn boundary(&mut self, ids: &BoundaryIds) -> usize {
         self.boundary_canonicalize(ids);
         self.boundary_dedup()
     }
 
-    /// Renumber every cell into CANONICAL order, and compact.
-    ///
-    /// Breadth-first from the globals in global-index order, children in
-    /// stored order: the discovery order IS the numbering. Isomorphic heaps
-    /// compact to identical structures, so blocks concatenate and the row
-    /// key is block-independent. Public so a producer that claims canonical
-    /// ids (`trace::bind::structure_of`) is checked against this one rule.
+    /// Renumber every cell into CANONICAL order (BFS discovery from the
+    /// globals, children in stored order) and compact, so isomorphic heaps
+    /// are identical and row keys block-independent. Public so producers
+    /// that claim canonical ids (`trace::bind::structure_of`) are checked.
     pub fn canonicalize_ids(&mut self) {
-        // Canonical field order: objects carry fields in store order, so
-        // sort them by name, or one object hashes to different shapes
-        // depending on how it was created.
+        // Fields sorted by name, or creation order changes the shape.
         for cell in self.structure.iter_mut() {
             if let Cell2::Obj(fields) = cell {
                 fields.sort_by_key(|(k, _)| celeste_names::FIELD_NAMES[*k as usize]);
@@ -642,8 +600,7 @@ impl Rt2 {
             }
         }
 
-        // Compact: rebuild over the live cells in canonical order, remapping
-        // every structural and per-lane pointer.
+        // Compact over the live cells, remapping every pointer.
         let remap_av = |v: AV, new_id: &[u32]| -> AV {
             match v {
                 AV::Ptr(t) => AV::Ptr(new_id[t as usize]),
@@ -693,8 +650,7 @@ impl Rt2 {
         self.cols = new_cols;
     }
 
-    /// The boundary without the final dedup: widening, canonical
-    /// compaction, and the row keys of all `width` lanes in lane order.
+    /// The boundary without the dedup: every lane keeps its row key.
     pub fn boundary_canonicalize(&mut self, ids: &BoundaryIds) {
         self.boundary_prepare();
         self.boundary_widen(ids);
@@ -703,9 +659,8 @@ impl Rt2 {
 
 
 
-    /// Per-lane canonical row keys, no widening and no dedup (key i is
-    /// lane i): the ONE row key of the search, recomputed for a state as it
-    /// is - a stored row's (the key `boundary` stored) or a concrete one's.
+    /// Per-lane row keys without widening or dedup: the search's ONE row key,
+    /// recomputed for a state as it is (stored or concrete).
     pub fn row_keys_canonical(&mut self) -> Vec<(u64, u64)> {
         self.boundary_prepare();
         self.boundary_finish();
@@ -714,7 +669,6 @@ impl Rt2 {
 
     /// Shared boundary head: check every column is at block width.
     fn boundary_prepare(&mut self) {
-        // The boundary walks whole columns, so check rather than assume.
         let full = |c: &Col| match c {
             Col::U(_) => true,
             Col::V(v) => v.len() == self.width,
@@ -736,10 +690,8 @@ impl Rt2 {
         self.widen_to(ids, false, false, false, false);
     }
 
-    /// A level's widenings on this block's columns, per lane: what the
-    /// level's kernels bake into their rows (`trace::widen`), so a concrete
-    /// or finer row can be looked up as the level's node. Every widening
-    /// asserts it only grows the value it replaces.
+    /// A level's widenings, as its kernels bake them (`trace::widen`), so a
+    /// finer row can be looked up as the level's node. Each asserts it only grows.
     pub fn widen_to(&mut self, ids: &BoundaryIds, held: bool, fruit: bool, floors_near: bool, platforms: bool) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
@@ -787,9 +739,8 @@ impl Rt2 {
             };
         }
 
-        // 3b. Fruit (`widen::widen_fruit`): `off` the full period [0, 39]
-        // and `y` the whole bob band start +/- 2.5, TOGETHER (one without
-        // the other is a row the kernels never write).
+        // 3b. Fruit: `off` [0, 39] and `y` start +/- 2.5, TOGETHER, as the
+        // kernels write them.
         for obj in self.objects_of_type(ids, ids.g_fruit) {
             let field = |rt: &Self, name: &str, f: u32| {
                 rt.obj_field_cell(obj, f).unwrap_or_else(|| {
@@ -854,10 +805,8 @@ impl Rt2 {
             }
         }
 
-        // 5. The key's `frames`-derived `spr` and `flip.x`, pinned WITH the
-        // timers (`widen::widen_timers`): only the key's own update and draw
-        // read them, and pinning `frames` alone leaves exact rows with no
-        // widened counterpart.
+        // 5. The key's `frames`-derived `spr`/`flip.x`, pinned WITH the timers
+        // (`widen::widen_timers`), or exact rows have no widened counterpart.
         for obj in self.objects_of_type(ids, ids.g_key) {
             let spr = self.obj_field_cell(obj, ids.f_spr).unwrap_or_else(|| panic!("key pin: key has no `spr` field"));
             self.cols[spr as usize] = Col::U(AV::Num(P8::from_i16(8)));
@@ -879,9 +828,7 @@ impl Rt2 {
             }
         }
 
-        // 7. The fly fruit at a fruit-unknown level (`widen::widen_fly_fruit`):
-        // `step` and `y` the unknown number, `fly` unknown, `spd.y` and
-        // `rem.y` their ranges.
+        // 7. The fly fruit at a fruit-unknown level (`widen::widen_fly_fruit`).
         let check = |rt: &Self, c: u32, name: &str, ok: &dyn Fn(AV) -> bool| {
             for lane in 0..rt.width {
                 let v = rt.cols[c as usize].at(lane);
@@ -926,9 +873,8 @@ impl Rt2 {
             };
             (get(ids.f_x), get(ids.f_y))
         };
-        // 8. The springs' and balloons' phases at a near level
-        // (`widen::phase_paths`, `widen::widen_near_phases`). A spring that
-        // never bounced has no `delay`: nothing to widen.
+        // 8. Spring and balloon phases at a near level (`widen::phase_paths`).
+        // A spring that never bounced has no `delay`.
         if floors_near {
             let phases = self
                 .objects_of_type(ids, ids.g_spring)
@@ -949,8 +895,7 @@ impl Rt2 {
                         assert!(f == ids.f_delay, "phase widening: no `{name}` field");
                         continue;
                     };
-                    // Phases are their ranges; the spring's countdowns
-                    // (`None`) the unknown number, as in 8a.
+                    // Phases become their ranges, countdowns (`None`) unknown.
                     if let Some((lo, hi)) = range {
                         let (lo, hi) = (P8::from_raw(lo), P8::from_raw(hi));
                         check(self, c, name, &|v| match v {
@@ -967,9 +912,7 @@ impl Rt2 {
             }
         }
 
-        // 8a. The countdowns at a near level (`widen::widen_floor_timers`):
-        // every fall floor's `delay` and the balloon's `timer` the unknown
-        // number (where present).
+        // 8a. Floor `delay` and balloon `timer` unknown at a near level.
         if floors_near {
             for (ty, f, name) in [(ids.g_fall_floor, ids.f_delay, "delay"), (ids.g_balloon, ids.f_timer, "timer")] {
                 for obj in self.objects_of_type(ids, ty) {
@@ -980,11 +923,9 @@ impl Rt2 {
             }
         }
 
-        // 8b. The fall floors at a near level (`widen::widen_near_floors`):
-        // per lane, `state` the interval `FLOOR_STATE_RANGE` and
-        // `collideable` unknown, except in lanes where a player overlaps the
-        // floor at the frame's end, which keep both. `state` is an interval
-        // column in every lane, as the kernels store it.
+        // 8b. Fall floors at a near level (`widen::widen_near_floors`): `state`
+        // and `collideable` widened except where a player overlaps the floor;
+        // `state` is an interval column, as the kernels store it.
         if floors_near {
             let (slo, shi) = (P8::from_raw(FLOOR_STATE_RANGE.0), P8::from_raw(FLOOR_STATE_RANGE.1));
             let span = |v: AV, what: &str| match v {
@@ -1039,10 +980,8 @@ impl Rt2 {
             }
         }
 
-        // 8c. The moving platforms at a platforms-unknown level
-        // (`widen::widen_platforms`): `x` and `last` the whole path, `rem.x`
-        // the whole remainder. The kernels read `last` as `x` (equal at every
-        // frame end), so a row where they differ asserts.
+        // 8c. Platforms (`widen::widen_platforms`): the kernels read `last` as
+        // `x` (equal at every frame end), so a row where they differ asserts.
         if platforms {
             let (plo, phi) = (P8::from_i16(PLATFORM_PATH.0), P8::from_i16(PLATFORM_PATH.1));
             let (rlo, rhi) = (P8::from_raw(PLATFORM_REM.0), P8::from_raw(PLATFORM_REM.1));
@@ -1072,10 +1011,8 @@ impl Rt2 {
             }
         }
 
-        // 9. The balloon's phase at EVERY level (`widen::canon_balloon_offset`):
-        // an interval a full period wide becomes the canonical [0, 1) (exact:
-        // `sin` of any such is [-1, 1]). A concrete phase stays; a narrower
-        // interval is no row a kernel writes, and asserts.
+        // 9. At EVERY level, a full-period balloon phase becomes the canonical
+        // [0, 1) (exact: `sin` is [-1, 1] either way); a narrower one asserts.
         for obj in self.objects_of_type(ids, ids.g_balloon) {
             let Some(c) = self.obj_field_cell(obj, ids.f_offset) else { continue };
             if (0..self.width).all(|lane| matches!(self.cols[c as usize].at(lane), AV::Num(_))) {
@@ -1087,21 +1024,17 @@ impl Rt2 {
         }
     }
 
-    /// Shared boundary tail: canonical ids, the shape hash, and the
-    /// per-lane row keys.
+    /// Shared boundary tail: canonical ids, shape hash, per-lane row keys.
     fn boundary_finish(&mut self) {
         assert!(self.prints.is_empty(), "prints at a frame boundary: {:?}", self.prints);
 
         self.canonicalize_ids();
 
-        // Structure hash (uniform across lanes) - the block's shape key.
         let shape_hash = self.shape_hash_of();
         self.shape_hash = shape_hash;
 
-        // Per-lane 128-bit row key: per-cell mixes SUMMED per lane, so the
-        // key is order-independent and uniform cells fold once into a block
-        // partial - keys agree whichever cells happen to be uniform. The
-        // kernels build theirs from the same primitives.
+        // 128-bit row key: per-cell mixes SUMMED, so uniform cells fold once
+        // and keys agree whichever cells are uniform. The kernels match this.
         let w = self.width;
         let mut part1: u64 = shape_hash;
         let mut part2: u64 = 0xa076_1d64_78bd_642f ^ shape_hash;
@@ -1124,8 +1057,7 @@ impl Rt2 {
                     }
                 }
                 Col::N(vs) => {
-                    // `cell_mix(ci, AV::Num(v), seed)` with the per-cell
-                    // constants hoisted (vectorizable).
+                    // `cell_mix` with the per-cell constants hoisted.
                     let c1 = KEY_SEED1 ^ ci.wrapping_mul(CELL_K);
                     let c2 = KEY_SEED2 ^ ci.wrapping_mul(CELL_K);
                     for i in 0..w {
@@ -1151,8 +1083,7 @@ impl Rt2 {
             .collect();
     }
 
-    /// The boundary's tail: dedup within the block, keeping the first lane
-    /// of each row key.
+    /// In-block dedup, keeping the first lane of each row key.
     fn boundary_dedup(&mut self) -> usize {
         let w = self.width;
         let mut keep: Vec<u32> = Vec::new();
@@ -1169,8 +1100,7 @@ impl Rt2 {
         self.width
     }
 
-    /// Keep only the given lanes (ascending indices), in every value
-    /// column, closure capture and row key.
+    /// Keep only the given lanes (ascending) in every column and row key.
     pub fn retain_lanes(&mut self, keep: &[u32]) {
         if keep.len() == self.width && keep.iter().enumerate().all(|(i, &k)| k as usize == i) {
             return;
@@ -1178,8 +1108,7 @@ impl Rt2 {
         self.gather_lanes(keep);
     }
 
-    /// Rebuild every column as `keep`'s lanes in `keep`'s order - a
-    /// gather, so a permutation reorders and a subset filters.
+    /// Gather `keep`'s lanes in `keep`'s order (reorder and/or filter).
     pub fn gather_lanes(&mut self, keep: &[u32]) {
         let retain_col = |col: &mut Col| match col {
             Col::U(_) => {}
@@ -1234,8 +1163,7 @@ impl Rt2 {
 mod tests {
     use super::*;
 
-    /// A number and the point interval of it are one value to the row key
-    /// (`av_code`): a column typed as an interval stores a number as `[n, n]`.
+    /// A number and its point interval are one value to the row key.
     #[test]
     fn a_point_interval_keys_as_its_number() {
         for raw in [0i32, 1, -1, 64 << 16, -(5 << 15), i32::MAX, i32::MIN] {
@@ -1251,9 +1179,8 @@ mod tests {
         assert_ne!(av_code(AV::Ival(a, b)), av_code(AV::Ival(b, b)));
     }
 
-    /// `floor_player_window` is the cart's `floor.collide(player, 0, 0)`
-    /// (spelled out as the cart writes it) at every whole-pixel position
-    /// around a floor.
+    /// `floor_player_window` is the cart's `floor.collide(player, 0, 0)` at
+    /// every whole-pixel position around a floor.
     #[test]
     fn the_overlap_window_is_the_carts_collide() {
         let (fx, fy) = (48i16, 112i16);

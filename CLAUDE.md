@@ -27,8 +27,9 @@ Every room has a confirmed optimum (`plans/results.md`); all tie the
 community TAS. The rem rungs of the precision ladder that found them were
 deleted on 2026-10-05 (branch `arc-only`).
 
-State of the code (2026-10-05): ~44.9k lines of Rust (26.2k code, 9.1k
-comments, 7.4k tests); a cleanup toward ~10k is in progress.
+State of the code (2026-10-05, after the `tier3` cleanup): ~36.5k lines of
+Rust (25.6k code, 4.4k comments, 4.7k tests, 1.8k blank; 44.9k before it); a
+cleanup toward ~10k is in progress.
 
 ## Read these before doing anything substantial
 
