@@ -7,7 +7,7 @@ the cost-to-go filter in `plans/level-minus-one.md`.
 
 ## Status, honestly
 
-The code is ~44.7k lines of Rust (26.0k code, 9.0k comments, 7.4k tests;
+The code is ~44.9k lines of Rust (26.2k code, 9.1k comments, 7.4k tests;
 `arc-only`, 2026-10-05: 47.5k before it deleted the rem ladder and the kernel
 re-run backward). The 2026-08-30 target was ~10-12k;
 it was never met, and a cleanup toward ~10k is in progress. Every room of the
@@ -60,7 +60,7 @@ crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        
 .  (celeste-rust)        everything else                                         deps: all
   src/frame.rs           Block, FrameStep, ForwardSink (queues, door, edge
                          records with transfers), forward_frame,
-                         ForwardState (extend, resume)  ~2.6k lines
+                         ForwardState (extend, resume), MarkFilter  ~2.7k lines
   src/search/            checkpoint, door, edges (recorded graph + BFS +
                          transfer tables), arc_edges (the transfer decode),
                          arcs (remainder sets), arc_dp (THE SEARCH: load,
@@ -387,8 +387,10 @@ abstract objects let too many concrete states into W. An exact-objects level
 2.6M). The ladder `r0sxhn,r0sxh` does: the filtered `r0sxh` forward took
 6.9 s, its bound is 84 and the try at the bound found the witness in 292
 steps (14:40 for the room). Room (4,3) nodiag the same way: `r0sxhn` bound
-104, its breadth-first search past 40 GB by layer 47 of 111; `r0sxhn,r0sxh`
-bound 106 and the witness at 106 - five frames under the community TAS,
+104 (no concrete win there, 18.7k steps), then its breadth-first search grew
+~1.4x a layer - 2.0M steps and 20k states by layer 44, 4.2M steps and 29k
+states by layer 46 of 111, at the 40 GB cap; `r0sxhn,r0sxh` bound 106 and
+the witness at 106 in 392 steps - five frames under the community TAS,
 replayed on PICO-8. So: one level where the bound is tight, the objects
 ladder where it is not; a level-0 bound well below the reference is the
 sign.

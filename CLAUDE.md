@@ -27,7 +27,7 @@ Every room has a confirmed optimum (`plans/results.md`); all tie the
 community TAS. The rem rungs of the precision ladder that found them were
 deleted on 2026-10-05 (branch `arc-only`).
 
-State of the code (2026-10-05): ~44.7k lines of Rust (26.0k code, 9.0k
+State of the code (2026-10-05): ~44.9k lines of Rust (26.2k code, 9.1k
 comments, 7.4k tests); a cleanup toward ~10k is in progress.
 
 ## Read these before doing anything substantial
@@ -42,7 +42,7 @@ comments, 7.4k tests); a cleanup toward ~10k is in progress.
 - `plans/lessons.md` - abandoned approaches and the measurement that killed
   each. Check it before proposing something that sounds familiar.
 - `plans/level-minus-one.md` - the cost-to-go filter.
-- `src/frame.rs` (~2.6k lines: the block, the frame step, the forward) and
+- `src/frame.rs` (~2.7k lines: the block, the frame step, the forward) and
   `src/search/` (door, edges, checkpoint, arcs, arc_dp: the search).
 - `BENCHMARK_DATA.md` - dated measurements, newest first; partly stale (see
   its first line).
