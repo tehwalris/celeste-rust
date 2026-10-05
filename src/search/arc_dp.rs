@@ -710,7 +710,9 @@ pub fn concrete_search(
         cell: u32,
         win: bool,
         exact: (u64, u64),
-        st: State,
+        /// The state as its one-row block: an interpreter `State` is ~0.6 MB
+        /// (room (4,3) nodiag: 20k of them past 40 GB), the row a few KB.
+        row: Rt2,
     }
     let start_cell = Block::from_state(&initial)?.positions()?[0];
     // THE FAST PATH: a depth-first search for a win AT the bound, inside
@@ -802,7 +804,9 @@ pub fn concrete_search(
     }
     // Per layer k >= 1, each state's (parent index in layer k-1, input, cell).
     let mut back: Vec<Vec<(u32, u8, u32)>> = Vec::new();
-    let mut cur: Vec<State> = vec![initial.clone()];
+    let start = Block::from_state(&initial)?;
+    let start_exact = start.rt2().clone_block().row_keys_canonical()[0];
+    let mut cur: Vec<(Rt2, (u64, u64))> = vec![(start.into_rt2(), start_exact)];
     let mut steps = 0u64;
     for k in 0..horizon {
         let t = std::time::Instant::now();
@@ -823,9 +827,14 @@ pub fn concrete_search(
                                 return Ok((out, steps));
                             }
                             let mut got = Vec::new();
-                            for (p, st) in cur.iter().enumerate().skip(lo).take(CHUNK) {
+                            for (p, (row, exact)) in cur.iter().enumerate().skip(lo).take(CHUNK) {
+                                // The row back as a state, checked: its exact key
+                                // must survive the round trip.
+                                let st = Block::from_rt2(row.clone_block()).to_state();
+                                let back = Block::from_state(&st)?.rt2().clone_block().row_keys_canonical()[0];
+                                anyhow::ensure!(back == *exact, "layer {k} row {p}: the state does not survive its block's round trip");
                                 for byte in 0u8..64 {
-                                    for succ in eng.step_all(st, byte, initial).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
+                                    for succ in eng.step_all(&st, byte, initial).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
                                         steps += 1;
                                         let b = Block::from_state(&succ)?;
                                         let cell = b.positions()?[0];
@@ -844,7 +853,7 @@ pub fn concrete_search(
                                                 continue;
                                             }
                                         }
-                                        got.push(Succ { parent: p as u32, byte, cell, win, exact, st: succ });
+                                        got.push(Succ { parent: p as u32, byte, cell, win, exact, row: b.into_rt2() });
                                     }
                                 }
                             }
@@ -866,7 +875,7 @@ pub fn concrete_search(
         // The layer: each exact state once, the first in (parent, input,
         // leaf) order; the first win ends the search.
         let mut seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
-        let (mut next, mut links): (Vec<State>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
+        let (mut next, mut links): (Vec<(Rt2, (u64, u64))>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
         let mut won: Option<(u32, u8, u32)> = None;
         for s in succs {
             if s.win {
@@ -874,7 +883,7 @@ pub fn concrete_search(
                 break;
             }
             if seen.insert((s.exact, s.cell)) {
-                next.push(s.st);
+                next.push((s.row, s.exact));
                 links.push((s.parent, s.byte, s.cell));
             }
         }
