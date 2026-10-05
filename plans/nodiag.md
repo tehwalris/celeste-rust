@@ -14,7 +14,7 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | room | any% (ours) | nodiag ref | ours | how |
 |---|---|---|---|---|
 | (4,2) 2100m | 71 | 71 (TAS21) | 71 | ladder (any% recipe, L-1 71,5): h70 refuted at level 7 - validation |
-| (5,3) 3000m | 79 | 96 (TAS30, offset 31) | 96 (RECHECK PENDING) | arc lower bound 92; concrete DFS: none within 92-95, witness at 96 (PICO-8: exits during f96). The 'none within' runs used a memo keyed on the WIDENED key (unsound, fixed 2026-10-05) - re-running |
+| (5,3) 3000m | 79 | 96 (TAS30, offset 31) | 96 (tie) | `rewrite search --level r0sxhn,r0sxh` (L-1 96,5): r0sxhn bound 92 (no concrete win at 92); r0sxh (objects exact) bound 96 = a sound lower bound, witness at 96 (311 steps); 363 s, 9.6 GB. The first run's count-up refutations (92-95) used the unsound memo; this proof does not rely on them. `tas/room_5_3_nodiag_frame_96.txt` (PICO-8: exits f96) |
 | (7,0) 800m | 84 | 99 (TAS8, offset 23) | 99 (tie) | `rewrite search --level r0sxhn,r0sxh` (L-1 99,5): bound 99 at both levels, witness 287 steps; 1302 s, 29.5 GB; PICO-8 exits f99. `tas/room_7_0_nodiag_frame_99.txt` |
 | (4,3) 2900m | 85 | 111 (TAS29, offset 29) | **106 - 5 FASTER** | arc-only `rewrite search --level r0sxhn,r0sxh` (L-1 111,5): r0sxhn bound 104, no concrete win at 104; r0sxh bound 106, concrete witness at 106 (392 steps); exits during f106 on a real PICO-8 in celeste-minimal AND the original cart, seeds 0 / 0.5 / rnd. `tas/room_4_3_nodiag_frame_106.txt` |
 | (1,1) 1000m | 94 | 94 (TAS10) | - | (validation, not run) |
