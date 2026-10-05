@@ -1,0 +1,12 @@
+# Room (5,0) "600 m", No Diagonal Dashes: exit during frame 93 (2026-10-05).
+# ONE FRAME FASTER than the community nodiag TAS6 (65 inputs at prologue
+# offset 29 = 94 in our counting, for every balloon seed tried).
+# rewrite search --room 5,0 --ceiling 94 --level r0sxhn,r0sxh, CELESTE_NODIAG=1
+# (no level -1: its table refuses the balloon's interval y): bounds 91
+# (r0sxhn) and 93 (r0sxh, objects exact, held unknown - a sound lower bound),
+# concrete witness at 93: OPTIMAL. 132 s, 5.1 GB. Dashes: f30 R, f44 R, f57 U,
+# f70 U. Replayed on a real PICO-8, room changes to (6,0) during frame 93 in
+# celeste-minimal AND the original cart for balloon seeds 0, 0.25, 0.5,
+# 0.636 and 0.75:
+#   pico8_diff/replay.py --room 5,0 --balloon-seeds 0 tas/room_5_0_nodiag_frame_93.txt
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,16,0,0,0,0,0,36,0,0,0,0,0,0,2,2,2,0,2,2,36,0,0,0,0,0,0,2,2,2,2,2,16,0,16,0,16,0,16,0,16,0,16,0
