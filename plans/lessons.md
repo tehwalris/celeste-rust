@@ -238,18 +238,24 @@ refuted 171 in 74 s (`c0de454`).
   `__phase`/`__frozen` globals). The edge-count "re-pins" `ffe939e`,
   `9921c0d` were scheduling noise in "edges read".
 
-**The precision ladder, the objects ladder and the mark filter** (2026-08-30
-.. 2026-10-05, deleted on `arc-only`). The ladder confirmed a horizon by
-running every level - rem rungs, then exact objects - each a fresh forward
-filtered by the coarser level's marks (`MarkFilter`, with deadlines), and it
-found every room's optimum. It went because both of its axes have exact
-replacements: the remainder by the arcs (no drift: room (3,3), where six
-ladders failed, refuted 171 in 74 s), and the objects by the concrete
-count-up, which turned out to be cheap where it was feared to explode - rooms
-(1,0), (4,2) found the witness AT the arc bound, (5,3) refuted the bound (78)
-in 7.2k concrete steps and found 79 in 99k (plans/results.md, "The arc
-pipeline"). With it went the kernel re-run backward (the BFS's oracle, which
-found every graph bug of 2026-09) and its pinned marks gate.
+**The precision ladder** (2026-08-30 .. 2026-10-05; its rem rungs and driver
+deleted on `arc-only`). The ladder confirmed a horizon by running every level
+- rem rungs, then exact objects - each a fresh forward filtered by the
+coarser level's marks (`MarkFilter`, with deadlines), and it found every
+room's optimum. The remainder axis went: the arcs track it exactly (room
+(3,3), where six ladders drifted out of memory, refuted 171 in 74 s). The
+objects axis was deleted too, on the strength of rooms (1,0), (4,2), (5,3),
+where the concrete search alone was cheap - and came back the same day:
+room (7,0) at `r0sxhn` has its bound 4 frames under the optimum and the
+search's region grew 6.5x a frame of slack (1.29M steps for f81, ~300M for
+84), and an unfiltered exact-objects level 0 was 19x the states by f55. The
+objects ladder on the arcs (`--level r0sxhn,r0sxh`, the filter now on the
+coarse level's ARC marks) does the room in 14:40, its filtered second level
+in 6.9 s. Lesson: an abstraction's cost is not the abstraction's alone but
+its refutation's, and that can explode per frame of slack - measure on the
+room where the bound is loosest. With the rem rungs went the kernel re-run
+backward (the BFS's oracle, which found every graph bug of 2026-09) and its
+pinned marks gate.
 
 **The count-up's memo keyed on the level's row key** (`arc-sets`, fixed
 `522de36`). The DFS remembered fully explored concrete states by

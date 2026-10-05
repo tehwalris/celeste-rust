@@ -19,9 +19,13 @@ steps (`rewrite search`, plans/architecture.md "The search"):
    try at the bound, then a parallel breadth-first search. Its first win is
    the concrete optimum and the witness.
 
+Where an abstract level's bound is loose, `--level r0sxhn,r0sxh` runs the
+OBJECTS LADDER: the finer level's forward is filtered by the coarser one's
+arc-marked nodes (room (7,0)).
+
 Every room has a confirmed optimum (`plans/results.md`); all tie the
-community TAS. The precision ladder that found them (rem rungs, an objects
-ladder, mark filters) was deleted on 2026-10-05 (branch `arc-only`).
+community TAS. The rem rungs of the precision ladder that found them were
+deleted on 2026-10-05 (branch `arc-only`).
 
 State of the code (2026-10-05): ~44.7k lines of Rust (26.0k code, 9.0k
 comments, 7.4k tests); a cleanup toward ~10k is in progress.
@@ -245,6 +249,10 @@ always what the tracer produces from the Lua in this checkout.
 # (plans/results.md, "How to run a room").
 CELESTE_LEVEL_MINUS_ONE="C,5" ./safe-run.sh -- ./target/release/rewrite search \
     --room X,Y --level r0sxhn --ceiling C --checkpoint-dir DIR [--save-marks UIDIR]
+# The objects ladder, where r0sxhn's bound is loose (room (7,0): 80 against 84):
+# the r0sxh forward filtered by r0sxhn's arc-marked nodes.
+CELESTE_LEVEL_MINUS_ONE="84,5" ./safe-run.sh -- ./target/release/rewrite search \
+    --room 7,0 --level r0sxhn,r0sxh --ceiling 84 --checkpoint-dir DIR
 # Other knobs: CELESTE_THREADS, CELESTE_KERNEL_SETS=N (resident kernel sets),
 # CELESTE_REGION="px,S" | off. (CELESTE_SPLIT_FRAME=1 still runs a forward,
 # two steps a frame, but the search refuses it.)

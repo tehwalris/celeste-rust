@@ -104,10 +104,14 @@ CELESTE_LEVEL_MINUS_ONE="C,5" \
 
 - The level: `r0sx` for a room without objects, `r0sxhn` with springs, fall
   floors, balloons, key and chest (everything abstract but where the player
-  overlaps a floor; held buttons unknown); `f` for the fly fruit. The concrete
-  concrete search refutes what the level invents. Platform rooms cannot run yet (the
-  arcs refuse a frame where the player moves twice); the split frame is
-  refused.
+  overlaps a floor; held buttons unknown); `f` for the fly fruit. The
+  concrete search refutes what the level invents. Platform rooms cannot run
+  yet (the arcs refuse a frame where the player moves twice); the split frame
+  is refused.
+- **When the level-0 bound is well below the reference** (room (7,0):
+  `r0sxhn` 80 against 84) the concrete search's region grows several-fold a
+  frame of slack: run the objects ladder, `--level r0sxhn,r0sxh` (the exact
+  objects' forward filtered by `r0sxhn`'s arc-marked nodes; 6.9 s for (7,0)).
 - The level -1 filter (plans/level-minus-one.md) with H = the ceiling (or
   `--to`), where its table builds; the table is cached on disk
   (`/var/tmp/celeste-l1-cache`).

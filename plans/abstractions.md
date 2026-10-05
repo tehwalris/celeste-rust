@@ -4,15 +4,16 @@ A level is `abstraction::Level { held, fruit, floors, platforms }`, written
 `r0sx[h][f][n][p]` (`Level::parse`): `r0sxhn` = held buttons unknown, fall
 floors (and every object's phase) widened except where the player overlaps.
 The `r0sx` prefix says what every level shares: the remainder widened at the
-boundary and tracked exactly by the arcs, the speed exact. One search runs
-ONE level (`rewrite search --level`, plans/architecture.md "The search");
-the precision ladder that ran several (rem rungs, then exact objects,
-`CELESTE_LADDER`) was deleted on 2026-10-05.
+boundary and tracked exactly by the arcs, the speed exact. A search runs one
+level, or the OBJECTS LADDER (`--level r0sxhn,r0sxh`: each finer level
+filtered by the coarser one's arc-marked nodes; plans/architecture.md "The
+search"). The rem rungs were deleted on 2026-10-05.
 
 ## The rules every flag obeys
 
 - **Never widen a field without something exact that refutes it**
-  (CLAUDE.md). The flags below are refuted by the concrete search: it runs
+  (CLAUDE.md). The flags below are refuted by the concrete search (or by a
+  finer level of the objects ladder, and then by the search): it runs
   the real game (the reference engine's concrete step, every input, every
   `rnd` leaf) and prunes by nothing but the arcs' exact winning sets, so a
   win the widening invented has no concrete path and the concrete search moves past
@@ -148,6 +149,9 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   after `r1sxhn`, 26.5M straight after level 0). With the arcs it is the
   level-0 option of every object room, refuted by the concrete search: room (5,3)
   had its bound at 78 and the concrete search refuted 78 in 7.2k concrete steps.
+  Room (7,0) is where it is too loose for the search alone (bound 80, the
+  optimum 84, the search's region 6.5x larger per frame of slack): there the
+  ladder `r0sxhn,r0sxh` (bound 84, the witness in 292 steps).
 
 ## p: moving platforms unknown (`PlatformsPrecision`) - kept, but its rooms cannot run the search yet
 

@@ -8,17 +8,19 @@ the cost-to-go filter in `plans/level-minus-one.md`.
 ## Status, honestly
 
 The code is ~44.7k lines of Rust (26.0k code, 9.0k comments, 7.4k tests;
-`arc-only`, 2026-10-05: 47.5k before it deleted the rem ladder, the objects
-ladder and the kernel re-run backward). The 2026-08-30 target was ~10-12k;
+`arc-only`, 2026-10-05: 47.5k before it deleted the rem ladder and the kernel
+re-run backward). The 2026-08-30 target was ~10-12k;
 it was never met, and a cleanup toward ~10k is in progress. Every room of the
 game has a confirmed optimum (`plans/results.md`), found by the precision
 ladder this branch deleted.
 
 **The search is the arc pipeline** (Philippe's direction, 2026-10-04; built
 2026-10-05): the rotation graph ("arcs") is the only treatment of the
-sub-pixel remainder, and an exhaustive concrete search inside its winning
-sets is the only treatment of everything else a level widens. No rem rungs,
-no objects ladder, no mark filter. See "The search" and "Arcs" below.
+sub-pixel remainder; what a level widens beyond it (the objects, the held
+buttons) is refuted by an exhaustive concrete search inside the winning
+sets, and where that is too loose by a finer level filtered by the coarser
+one (the objects ladder, room (7,0)). No rem rungs. See "The search" and
+"Arcs" below.
 
 ## The whole system in one line
 
@@ -326,14 +328,21 @@ remainder; every backward reads the records and re-runs no kernel
 
 ## The search (2026-10-05, branch `arc-only`)
 
-`rewrite search --to H | --ceiling H [--level SPEC]`:
+`rewrite search --to H | --ceiling H [--level SPEC[,SPEC...]]`, per level of
+the list (coarsest first; one level is the usual case):
 
 1. **[Level -1]** (`CELESTE_LEVEL_MINUS_ONE="H,S"`, plans/level-minus-one.md):
    cells that provably cannot exit by H are dropped at the flush.
-2. **The forward** at the level (`--level`, default `r0sx`; `r0sxhn` for an
-   object room), to H, into `<dir>/level00` (`ForwardState`: resumed from
-   its checkpoints, or used as it is when it already reaches H). Won rows are
-   checkpointed (backward seeds) and not expanded.
+2. **The forward** at the level (default `r0sx`; `r0sxhn` for an object
+   room), to H, into `<dir>/level{i:02}` (`ForwardState`: resumed from its
+   checkpoints, or used as it is when it already reaches H). Won rows are
+   checkpointed (backward seeds) and not expanded. **A finer level is
+   filtered** (`frame::MarkFilter`): a row at frame t is kept only if its
+   projection onto the previous level is ARC-MARKED there (its winning set
+   non-empty at some frame) with a deadline >= t. Sound because the remainder
+   is exact at both levels: a fine state that wins from t with remainder r
+   projects to a coarse node that wins from t with r. This is the OBJECTS
+   LADDER (below), the only ladder left.
 3. **The arc phase** (`arc_dp::solve`): the remainder-free BFS marks the
    nodes that can win by H at all, with their deadlines; only the edges into
    them, from them, are loaded (`preds_at`, the BFS's lookup), each with an
@@ -354,7 +363,8 @@ remainder; every backward reads the records and re-runs no kernel
    (`<dir>/witness_frame_F.txt`). With `--ceiling` a refutation or no witness
    is an error (a known solution the model cannot reproduce). Its cost is the
    number of concrete states inside W, which the level's widenings decide:
-   see "Validation".
+   see "Validation". At a level that is not the last only the try at the
+   bound runs (a win there is the optimum); otherwise the next level.
 
 Resume: rerun the same command; the forward resumes or is reused, the arc
 phase reruns (minutes). A fresh forward clears `frames/` and `edges/`.
@@ -364,23 +374,29 @@ on you. Kernel sets are keyed by the level's four flags;
 levels. Fused graphs are dropped after assembly unless
 `CELESTE_ASM_EVAL_CHECK` / `CELESTE_KERNEL_EXPLAIN`.
 
-Validation (plans/results.md, "The arc pipeline"): rooms (1,0) 99, (4,2) 71,
-(5,3) 79 and (3,3) 172 reproduce their known optima, each witness replayed
-on a real PICO-8. Where the bound is the optimum ((1,0), (4,2), (3,3)) the
-concrete search takes a few hundred steps; (5,3) (bound 78) refuted 78 in
-7.2k steps and found 79 in 99k. Room (7,0) at `r0sxhn` is where it BLOWS
-UP: bound 80 against 84, and the exhaustive region grew 6.5x a frame of
-slack (the old per-frame DFS: 172k steps at f80, 1.29M at f81; ~300M to
-reach 84) - the abstract objects leave W too loose. What decides it is how
-many concrete states the level's widenings let into W; see results.md for
-(7,0) at exact objects.
+**The objects ladder, and when it is needed.** Validation (plans/results.md,
+"The arc pipeline"): rooms (1,0) 99, (4,2) 71, (5,3) 79, (3,3) 172 and
+(7,0) 84 reproduce their known optima, each witness replayed on a real
+PICO-8. Where the bound is the optimum ((1,0), (4,2), (3,3)) the concrete
+search takes a few hundred steps; (5,3) (bound 78) refuted 78 in 7.2k steps
+and found 79 in 165k. Room (7,0) at `r0sxhn` alone is where it BLOWS UP:
+bound 80 against 84, and the exhaustive region grew 6.5x a frame of slack
+(172k concrete steps at f80, 1.29M at f81; ~300M to reach 84) - the
+abstract objects let too many concrete states into W. An exact-objects level
+0 (`r0sxh`) does not run either (48.8M states kept at f55 against `r0sxhn`'s
+2.6M). The ladder `r0sxhn,r0sxh` does: the filtered `r0sxh` forward took
+6.9 s, its bound is 84 and the try at the bound found the witness in 292
+steps (14:40 for the room). So: one level where the bound is tight, the
+objects ladder where it is not; a level-0 bound well below the reference is
+the sign.
 
 **What deleted (2026-10-05).** The rem rungs (`RemPrecision`, the bucket
-widening and fork grid, the rem-keyed kernel sets), the precision ladder
-(`Ladder`, `find_optimum*`, `CELESTE_LADDER`, `--maxk`), the objects ladder's
-`MarkFilter`, the kernel re-run backward (`backward_run`,
-`CELESTE_BACKWARD=kernel`, `bench-backward`), `rewrite witness`, `arc-search`.
-Why: plans/lessons.md "The rem ladder".
+widening and fork grid, the rem-keyed kernel sets), the precision ladder's
+driver (`Ladder`, `find_optimum*`, `CELESTE_LADDER`, `--maxk`; the mark
+filter came back as the objects ladder's link, now on arc marks), the kernel
+re-run backward (`backward_run`, `CELESTE_BACKWARD=kernel`, `bench-backward`),
+`rewrite witness`, `arc-search`. Why: plans/lessons.md "The precision
+ladder".
 
 Win conditions: the room exit (`game_runner::win_room()`, including the wrap
 from a row's last room to (0, y+1)); the summit's flag rect
