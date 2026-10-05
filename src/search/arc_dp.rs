@@ -826,7 +826,13 @@ pub fn concrete_search(
                             if lo >= cur.len() {
                                 return Ok((out, steps));
                             }
+                            // Each exact state once per chunk already (the
+                            // first in order, as the merge keeps it): a layer's
+                            // successors are mostly repeats (room (4,3) nodiag
+                            // layer 45: 1.29M steps, 25.5k states), and every
+                            // kept one holds a row.
                             let mut got = Vec::new();
+                            let mut chunk_seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
                             for (p, (row, exact)) in cur.iter().enumerate().skip(lo).take(CHUNK) {
                                 // The row back as a state, checked: its exact key
                                 // must survive the round trip.
@@ -845,6 +851,9 @@ pub fn concrete_search(
                                         // their fate (`522de36`).
                                         let exact = b.rt2().clone_block().row_keys_canonical()[0];
                                         let win = wins_of(b.rt2())?.iter().any(|&x| x);
+                                        if !win && chunk_seen.contains(&(exact, cell)) {
+                                            continue;
+                                        }
                                         if !win {
                                             let (shape, keys, cells) = widened_keys(&b, level)?;
                                             let Some(&i) = node.get(&(shape, keys[0], cells[0])) else { continue };
@@ -853,6 +862,7 @@ pub fn concrete_search(
                                                 continue;
                                             }
                                         }
+                                        chunk_seen.insert((exact, cell));
                                         got.push(Succ { parent: p as u32, byte, cell, win, exact, row: b.into_rt2() });
                                     }
                                 }
