@@ -337,15 +337,16 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         every: u32,
     },
-    /// Export a finished run for the web UI (`ui/`): per (horizon, level,
-    /// frame) the states per player-position cell and the win cells, per
-    /// (horizon, level) the marks per cell by distance, and the log's
-    /// per-frame / per-iteration timings - from the checkpoint HEADERS and
-    /// the marks files only. See `search::ui_export` for the layout.
+    /// Export a finished run for the web UI (`ui/`): per (level, frame) the
+    /// states per player-position cell and the win cells, per marked set the
+    /// marks per cell by distance, and the log's per-frame timings - from the
+    /// checkpoint HEADERS and the marks files only. See `search::ui_export`.
     ExportUi {
+        /// A `rewrite search` checkpoint dir (`level00/`, ...) or one
+        /// `rewrite forward` tree.
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
-        /// The run's log (the `[fwd]` / `[bwd]` / `[ladder]` lines).
+        /// The run's log (its `[fwd]` and `[search] level` lines).
         #[arg(long)]
         log: String,
         /// Output directory (the UI serves it as `data/`).
@@ -353,14 +354,10 @@ enum Command {
         out: String,
         #[arg(long, default_value = "1,0")]
         room: String,
-        /// The tree and log of one `rewrite forward` (frames under the
-        /// directory, no ladder): exported as one partial horizon.
-        #[arg(long)]
-        forward_only: bool,
-        /// With `--forward-only`: the `search --save-marks` directory
-        /// over that tree. Level 0 gets the remainder-free backward's marks,
-        /// and a second level whose forward is level 0's carries the
-        /// remainder-exact arc backward (and the concrete witness, if saved).
+        /// The search's `--save-marks` directory: the last level gets the
+        /// remainder-free backward's marks, and a level after it the
+        /// remainder-exact arc backward over the same tree (and the concrete
+        /// witness, if saved).
         #[arg(long)]
         arc: Option<String>,
     },
@@ -1415,7 +1412,6 @@ fn main() -> Result<()> {
             log,
             out,
             room,
-            forward_only,
             arc,
         } => {
             let (rx, ry) = room
@@ -1427,7 +1423,6 @@ fn main() -> Result<()> {
                 std::path::Path::new(&log),
                 std::path::Path::new(&out),
                 (rx, ry),
-                forward_only,
                 arc.as_deref().map(std::path::Path::new),
             )?;
         }

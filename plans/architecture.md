@@ -545,9 +545,9 @@ test).
 4. **A batch-invariance test** (`a_lanes_key_does_not_depend_on_its_
    neighbours` went with the old sweep) and a widening-soundness check
    (`diag-project` checks one projection; `ref-check` the kernels).
-5. **The UI export** still reads the deleted ladder's run layout
-   (`hNNN/levelNN`, `[ladder]` log lines) for old runs; the search's own runs
-   export as `--forward-only --arc`.
+5. **The UI** (`ui/`, TypeScript) still carries the ladder's concepts
+   (several horizons, kernel re-run backward iterations, the band colours);
+   the exporter writes one horizon and leaves those fields empty.
 
 ## Where the old plans went (2026-10-04)
 

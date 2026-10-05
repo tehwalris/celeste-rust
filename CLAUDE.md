@@ -284,19 +284,18 @@ CELESTE_START_ROOM=X,Y ./target/quick/transpile --level-minus-one-table S
 ### The UI (`ui/`)
 
 A phone-first web view of one finished search: the room as a heatmap per
-(horizon, level, pass, frame), set sizes, the timing waterfall, and an arc
-pass (`search --save-marks`; old ladder runs still export with their
-bands). Static: `rewrite export-ui` turns a finished
-checkpoint tree + its run log into `run.json` + per-level binaries; a Vite
+(level, pass, frame), set sizes, the timing waterfall, and the arc pass
+(`search --save-marks`). Static: `rewrite export-ui` turns a finished
+search's checkpoint dir + its log into `run.json` + per-level binaries; a Vite
 build plus `ui/serve.mjs` serve it under `/celeste/` on port 3011
 (UI-HOSTING.md; control model and data layout in `ui/README.md` and at the
 top of `src/search/ui_export.rs`).
 
 ```bash
-cp /tmp/room10f.log /var/tmp/celeste-ui/room10f.log      # the run's log is the timing source
-./one-cargo.sh ./safe-run.sh -- cargo build --profile quick --bin rewrite
-./safe-run.sh -- ./target/quick/rewrite export-ui --log /var/tmp/celeste-ui/room10f.log \
-    --out /var/tmp/celeste-ui/data --room 1,0             # from the repo root (loads cart/)
+./safe-run.sh -- ./target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR \
+    --save-marks MARKS 2> /var/tmp/celeste-ui/room10.log  # the log is the timing source
+./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir DIR --arc MARKS \
+    --log /var/tmp/celeste-ui/room10.log --out /var/tmp/celeste-ui/data/room10 --room 1,0   # from the repo root
 cd ui && npm install && npm run typecheck && npm run build
 systemd-run --user --scope -p MemoryMax=2G --quiet node serve.mjs &   # http://localhost:3011/celeste/
 ```

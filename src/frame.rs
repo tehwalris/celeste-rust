@@ -2210,29 +2210,15 @@ impl Visited {
         crate::search::checkpoint::save_value_to(path, &(rows, horizon))
     }
 
-    /// A marks file (`save`). A file from before the deadlines were saved
-    /// (`(shape, cell, key.0, key.1)` rows, no horizon) loads with no
-    /// deadlines, as it always did.
+    /// A marks file (`save`).
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let bytes = std::fs::read(path)?;
         let payload = crate::search::checkpoint::value_payload(&bytes, path)?;
-        anyhow::ensure!(payload.len() >= 8, "{}: too short for a marks file", path.display());
-        let n = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-        let body = payload.len() as u64 - 8;
+        let (rows, horizon): (Vec<MarkRow>, u32) = bincode::deserialize(payload).with_context(|| format!("deserializing {}", path.display()))?;
         let mut out = Self::new();
-        if n.checked_mul(32).and_then(|b| b.checked_add(4)) == Some(body) {
-            let (rows, horizon): (Vec<MarkRow>, u32) = bincode::deserialize(payload).with_context(|| format!("deserializing {}", path.display()))?;
-            for (shape, cell, k0, k1, dist) in rows {
-                anyhow::ensure!(dist <= horizon, "{}: a mark {dist} frames before h{horizon}", path.display());
-                out.insert_until(shape, (k0, k1), cell, u16::try_from(horizon - dist).unwrap_or(u16::MAX));
-            }
-        } else if n.checked_mul(28) == Some(body) {
-            let rows: Vec<(u64, u32, u64, u64)> = bincode::deserialize(payload).with_context(|| format!("deserializing {}", path.display()))?;
-            for (shape, cell, k0, k1) in rows {
-                out.insert(shape, (k0, k1), cell);
-            }
-        } else {
-            anyhow::bail!("{}: {n} rows do not fit {body} payload bytes as a marks file", path.display());
+        for (shape, cell, k0, k1, dist) in rows {
+            anyhow::ensure!(dist <= horizon, "{}: a mark {dist} frames before h{horizon}", path.display());
+            out.insert_until(shape, (k0, k1), cell, u16::try_from(horizon - dist).unwrap_or(u16::MAX));
         }
         Ok(out)
     }
@@ -2370,12 +2356,6 @@ mod tests {
         assert_eq!(w.deadline(1, (2, 3), 4), Some(7));
         assert_eq!(w.deadline(1, (5, 6), 4), Some(12));
         assert_eq!(w.deadline(9, (2, 3), 8), Some(12), "no deadline: the horizon");
-        // A file from before the deadlines: the set, no deadlines.
-        let old: Vec<(u64, u32, u64, u64)> = vec![(1, 4, 2, 3)];
-        crate::search::checkpoint::save_value_to(&path, &old).expect("save");
-        let w = Visited::load(&path).expect("load");
-        std::fs::remove_file(&path).expect("rm");
-        assert_eq!(w.deadline(1, (2, 3), 4), Some(u16::MAX));
     }
 
     /// forward_resume, extending a checkpointed forward, reproduces a fresh run:
