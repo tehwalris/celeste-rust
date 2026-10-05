@@ -34,17 +34,6 @@ pub fn win_room() -> (i16, i16) {
     }
 }
 
-/// Directory-name stem for a room's checkpoint tree: "room1" for the
-/// default room, "room<x><y>" for others.
-pub fn room_dir_stem() -> String {
-    let (x, y) = start_room();
-    if (x, y) == (1, 0) {
-        "room1".to_string()
-    } else {
-        format!("room{}{}", x, y)
-    }
-}
-
 /// The cart's `level_index()` of room (x, y).
 pub fn level_index(x: i16, y: i16) -> i16 {
     x % 8 + y * 8
@@ -79,9 +68,8 @@ mod tests {
 
     // start_room() is a process-wide OnceLock: tests see only room (1,0).
     #[test]
-    fn win_and_dir_stem_for_default_room() {
+    fn win_room_of_the_default_room() {
         assert_eq!(super::win_room(), (2, 0));
-        assert_eq!(super::room_dir_stem(), "room1");
     }
 
     // In the default room the substitution is the identity.
