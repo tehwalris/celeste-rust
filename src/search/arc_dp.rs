@@ -622,40 +622,46 @@ impl Witness {
     }
 }
 
-/// THE CONCRETE COUNT-UP: the concrete optimum and its inputs, inside the
-/// winning sets. A DFS from the room's start through the reference
-/// engine's concrete step (every input, every `rnd` leaf) admitting a
-/// successor only if its projection onto `level` is a node of `g` (`dir`'s
-/// tree, frames `0..=horizon`) whose winning set holds the successor's
-/// exact remainder. A run of `f` frames reads `W_{horizon - f + k}` at its
-/// frame `k` (the optimum's frames-left alignment); a state without a player
-/// reads the point (0, 0) (no edge cuts it).
+/// THE CONCRETE SEARCH: the concrete optimum and its inputs, inside the
+/// winning sets. A BREADTH-FIRST search over concrete states from the room's
+/// start through the reference engine's concrete step (every input, every
+/// `rnd` leaf), layer k+1 admitting a successor only if its projection onto
+/// `level` is a node of `g` (`dir`'s tree, frames `0..=horizon`) whose
+/// `W_{k+1}` holds the successor's exact remainder (a state without a player
+/// reads the point (0, 0): no edge cuts it), and holding each EXACT state
+/// once (the first in (parent, input, leaf) order: deterministic).
 ///
-/// The DFS is EXHAUSTIVE (every input, every `rnd` leaf, a fully explored
-/// concrete state remembered per frame) and prunes only by W, which holds
-/// every concrete winner: so "no win within f" is a proof about the real
-/// game. The graph's optimum `first` is a lower bound (its objects may be
-/// coarse); counting f UP from it to the horizon, the first f with a witness
-/// is the concrete optimum (over every `rnd` draw: a leaf is a
-/// possibility). `None`: no concrete win by the horizon (the deepest run is
-/// printed, with why each successor of its last state is not admitted).
-pub fn concrete_count_up(
+/// W_t holds every state that wins within `horizon - t` frames, so every
+/// concrete path that wins by the horizon stays inside it: the search is
+/// EXHAUSTIVE inside W and prunes by nothing else, and the first layer with a
+/// win is the CONCRETE optimum (over every `rnd` draw: a leaf is a
+/// possibility). `None`: no concrete win by the horizon. The graph's optimum
+/// `bound` is a lower bound on it (the level's widenings over-approximate);
+/// layers before it are reported but cannot win.
+///
+/// Layers are expanded in parallel, one reference engine per worker. (It was
+/// a DFS counting up from the bound, one exhaustive pass per frame: room
+/// (7,0)'s pass grew 6.5x a frame, 172k steps at f80, 1.29M at f81, and the
+/// steps ran on one core.)
+pub fn concrete_search(
     dir: &std::path::Path,
     level: crate::interpreter::abstraction::Level,
     horizon: u32,
     g: &Graph,
     w: &Winning,
-    first: u32,
+    bound: u32,
 ) -> anyhow::Result<Option<Witness>> {
     use crate::concrete::ConcreteEngine;
     use crate::frame::{frame_files, pack_id, widened_keys, wins_of, Block};
     use crate::interpreter::state::State;
     use anyhow::Result;
     use celeste_engine::runtime2::{Rt2, AV};
-    // The engine runs the cart's `_init` under the GLOBAL level: build it
+    // The engines run the cart's `_init` under the GLOBAL level: build them
     // before the level is set (room (5,3) nodiag's level-0 `_init` ended in
-    // no state); its frames run at the exact level whatever is set.
-    let eng = ConcreteEngine::new()?;
+    // no state); their frames run at the exact level whatever is set.
+    let workers = crate::frame::threads().max(1);
+    let engines: Vec<std::sync::Mutex<ConcreteEngine>> = (0..workers).map(|_| ConcreteEngine::new().map(std::sync::Mutex::new)).collect::<Result<_>>()?;
+    let initial = engines[0].lock().expect("an engine").initial_state()?;
     crate::interpreter::abstraction::set_level(level);
     let t0 = std::time::Instant::now();
     // (shape, key, cell) -> the node's index, for the graph's nodes.
@@ -674,7 +680,7 @@ pub fn concrete_count_up(
             }
         }
     }
-    eprintln!("[witness] {} nodes keyed in {:.1} s; counting up from f{first}", node.len(), t0.elapsed().as_secs_f64());
+    eprintln!("[concrete] {} nodes keyed in {:.1} s; {workers} workers; the arc bound f{bound}", node.len(), t0.elapsed().as_secs_f64());
     fn rem_of(rt2: &Rt2) -> Result<(u32, u32)> {
         let ids = crate::compiled::ids();
         let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((super::arcs::point(0), super::arcs::point(0))) };
@@ -686,126 +692,127 @@ pub fn concrete_count_up(
         };
         Ok((raw(cx)?, raw(cy)?))
     }
-    struct Ctx<'a> {
-        eng: ConcreteEngine,
-        initial: State,
-        node: &'a FxHashMap<(u64, (u64, u64), u32), u32>,
-        w: &'a Winning,
-        level: crate::interpreter::abstraction::Level,
-        from: u32,
-        frames: u32,
-        dead: FxHashSet<((u64, u64), u32, u32)>,
-        path: Vec<u8>,
-        /// The player's cell after each input of `path`.
-        cells: Vec<u32>,
-        steps: u64,
-        deepest: (u32, Vec<u8>),
+    /// A successor that stays inside W (or wins), in (parent, input, leaf)
+    /// order within its worker's chunk.
+    struct Succ {
+        parent: u32,
+        byte: u8,
+        cell: u32,
+        win: bool,
+        exact: (u64, u64),
+        st: State,
     }
-    fn dfs(cx: &mut Ctx, st: &State, k: u32) -> Result<bool> {
-        if k > cx.deepest.0 {
-            cx.deepest = (k, cx.path.clone());
-        }
-        if k >= cx.frames {
-            return Ok(false);
-        }
-        for byte in 0u8..64 {
-            for succ in cx.eng.step_all(st, byte, &cx.initial).map_err(|e| e.context(format!("the frame after f{k} with input {byte}")))? {
-                cx.steps += 1;
-                let b = Block::from_state(&succ)?;
-                let cell = b.positions()?[0];
-                if wins_of(b.rt2())?.iter().any(|&x| x) {
-                    cx.path.push(byte);
-                    cx.cells.push(cell);
-                    return Ok(true);
-                }
-                // The memo is keyed on the EXACT state: `b.keys()` is the
-                // row key at the search's level (remainder and held buttons
-                // widened), and two states one key stands for need not share
-                // their fate.
-                let concrete = (b.rt2().clone_block().row_keys_canonical()[0], cell, k + 1);
-                if cx.dead.contains(&concrete) {
-                    continue;
-                }
-                let (shape, keys, cells) = widened_keys(&b, cx.level)?;
-                let Some(&i) = cx.node.get(&(shape, keys[0], cells[0])) else { continue };
-                let q = rem_of(b.rt2())?;
-                if !cx.w.at(cx.from + k + 1, i).is_some_and(|r| r.contains(q.0, q.1)) {
-                    continue;
-                }
-                cx.path.push(byte);
-                cx.cells.push(cell);
-                if dfs(cx, &succ, k + 1)? {
-                    return Ok(true);
-                }
-                cx.path.pop();
-                cx.cells.pop();
-                cx.dead.insert(concrete);
-            }
-        }
-        Ok(false)
-    }
-    let initial = eng.initial_state()?;
     let start_cell = Block::from_state(&initial)?.positions()?[0];
-    let mut cx = Ctx {
-        eng,
-        initial: initial.clone(),
-        node: &node,
-        w,
-        level,
-        from: horizon - first,
-        frames: first,
-        dead: FxHashSet::default(),
-        path: Vec::new(),
-        cells: Vec::new(),
-        steps: 0,
-        deepest: (0, Vec::new()),
-    };
-    let show = |v: &[u8]| v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
-    let ok = loop {
-        let t1 = std::time::Instant::now();
-        cx.dead.clear();
-        cx.path.clear();
-        cx.cells.clear();
-        cx.deepest = (0, Vec::new());
-        let ok = dfs(&mut cx, &initial, 0)?;
-        eprintln!("[witness] within f{}: {} concrete steps so far, {} dead states, {:.1} s", cx.frames, cx.steps, cx.dead.len(), t1.elapsed().as_secs_f64());
-        if ok || cx.frames == horizon {
-            break ok;
+    // Per layer k >= 1, each state's (parent index in layer k-1, input, cell).
+    let mut back: Vec<Vec<(u32, u8, u32)>> = Vec::new();
+    let mut cur: Vec<State> = vec![initial.clone()];
+    let mut steps = 0u64;
+    for k in 0..horizon {
+        let t = std::time::Instant::now();
+        let t_w = k + 1;
+        const CHUNK: usize = 16;
+        let next_chunk = std::sync::atomic::AtomicUsize::new(0);
+        let parts: Vec<Result<(Vec<(usize, Vec<Succ>)>, u64)>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = engines
+                .iter()
+                .map(|engine| {
+                    let (cur, node, initial, next_chunk) = (&cur, &node, &initial, &next_chunk);
+                    sc.spawn(move || -> Result<(Vec<(usize, Vec<Succ>)>, u64)> {
+                        let mut eng = engine.lock().expect("an engine");
+                        let (mut out, mut steps) = (Vec::new(), 0u64);
+                        loop {
+                            let lo = next_chunk.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);
+                            if lo >= cur.len() {
+                                return Ok((out, steps));
+                            }
+                            let mut got = Vec::new();
+                            for (p, st) in cur.iter().enumerate().skip(lo).take(CHUNK) {
+                                for byte in 0u8..64 {
+                                    for succ in eng.step_all(st, byte, initial).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
+                                        steps += 1;
+                                        let b = Block::from_state(&succ)?;
+                                        let cell = b.positions()?[0];
+                                        // The memo key is the EXACT state: `b.keys()` is
+                                        // the row key at the search's level (the
+                                        // remainder and held buttons widened), and two
+                                        // states one key stands for need not share
+                                        // their fate (`522de36`).
+                                        let exact = b.rt2().clone_block().row_keys_canonical()[0];
+                                        let win = wins_of(b.rt2())?.iter().any(|&x| x);
+                                        if !win {
+                                            let (shape, keys, cells) = widened_keys(&b, level)?;
+                                            let Some(&i) = node.get(&(shape, keys[0], cells[0])) else { continue };
+                                            let q = rem_of(b.rt2())?;
+                                            if !w.at(t_w, i).is_some_and(|r| r.contains(q.0, q.1)) {
+                                                continue;
+                                            }
+                                        }
+                                        got.push(Succ { parent: p as u32, byte, cell, win, exact, st: succ });
+                                    }
+                                }
+                            }
+                            out.push((lo, got));
+                        }
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("a concrete worker panicked")).collect()
+        });
+        let mut chunks: Vec<(usize, Vec<Succ>)> = Vec::new();
+        for p in parts {
+            let (c, s) = p?;
+            chunks.extend(c);
+            steps += s;
         }
-        println!("no concrete win within f{} (exhaustive inside W, deepest f{})", cx.frames, cx.deepest.0);
-        cx.frames += 1;
-        cx.from -= 1;
-    };
-    if ok {
-        let cells = std::iter::once(start_cell).chain(cx.cells.iter().copied()).collect();
-        return Ok(Some(Witness { inputs: cx.path.clone(), cells }));
-    }
-    println!("NO CONCRETE WITNESS inside W by f{horizon}: deepest f{}, inputs {}", cx.deepest.0, show(&cx.deepest.1));
-    // Why: from the deepest state, every input's successors - their node,
-    // exact remainder and that node's winning set.
-    let (d, prefix) = cx.deepest.clone();
-    let mut st = initial.clone();
-    for &b in &prefix {
-        let mut next = cx.eng.step_all(&st, b, &initial)?;
-        anyhow::ensure!(next.len() == 1, "the deepest prefix forks ({} leaves): not replayable here", next.len());
-        st = next.pop().expect("one leaf");
-    }
-    for byte in 0u8..64 {
-        for succ in cx.eng.step_all(&st, byte, &initial)? {
-            let b = Block::from_state(&succ)?;
-            let (shape, keys, cells) = widened_keys(&b, level)?;
-            let q = rem_of(b.rt2())?;
-            let at = super::pos_graph::cell_xy(cells[0]);
-            match node.get(&(shape, keys[0], cells[0])) {
-                None => println!("  input {byte:2}: cell {at:?} - no node"),
-                Some(&i) => {
-                    let t = cx.from + d + 1;
-                    let set: Vec<String> = w.at(t, i).map(|r| r.slabs().map(|(y, xs)| format!("y[{},{}) x{:?}", y.lo, y.hi, xs.iter().map(|x| (x.lo, x.hi)).collect::<Vec<_>>())).collect()).unwrap_or_default();
-                    println!("  input {byte:2}: cell {at:?} node {i} rem {q:?}: W_{t} {}", if set.is_empty() { "empty".to_string() } else { set.join(" ") });
-                }
+        chunks.sort_unstable_by_key(|c| c.0);
+        let succs = chunks.into_iter().flat_map(|c| c.1);
+        // The layer: each exact state once, the first in (parent, input,
+        // leaf) order; the first win ends the search.
+        let mut seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
+        let (mut next, mut links): (Vec<State>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
+        let mut won: Option<(u32, u8, u32)> = None;
+        for s in succs {
+            if s.win {
+                won = Some((s.parent, s.byte, s.cell));
+                break;
+            }
+            if seen.insert((s.exact, s.cell)) {
+                next.push(s.st);
+                links.push((s.parent, s.byte, s.cell));
             }
         }
+        eprintln!(
+            "[concrete] layer {:3}: {} states -> {} inside W{}; {steps} steps so far, {:.1} s",
+            k + 1,
+            cur.len(),
+            next.len(),
+            if won.is_some() { ", A WIN" } else { "" },
+            t.elapsed().as_secs_f64()
+        );
+        if let Some((parent, byte, cell)) = won {
+            // The path, back through the layers.
+            let (mut inputs, mut cells) = (vec![byte], vec![cell]);
+            let mut p = parent;
+            for layer in back.iter().rev() {
+                let (pp, b, c) = layer[p as usize];
+                inputs.push(b);
+                cells.push(c);
+                p = pp;
+            }
+            inputs.reverse();
+            cells.push(start_cell);
+            cells.reverse();
+            eprintln!("[concrete] a win at f{} after {steps} concrete steps, {:.1} s", inputs.len(), t0.elapsed().as_secs_f64());
+            return Ok(Some(Witness { inputs, cells }));
+        }
+        if next.is_empty() {
+            println!("NO CONCRETE WIN by f{horizon}: no concrete state inside W past layer {k} ({steps} steps)");
+            return Ok(None);
+        }
+        back.push(links);
+        cur = next;
     }
+    println!("NO CONCRETE WIN by f{horizon} ({steps} steps)");
     Ok(None)
 }
 
@@ -815,7 +822,7 @@ pub struct Solved {
     /// bound when the level's objects are coarse). `None`: no win by the
     /// horizon at all - the horizon is REFUTED.
     pub arc: Option<u32>,
-    /// The concrete optimum and its witness (`concrete_count_up`), when
+    /// The concrete optimum and its witness (`concrete_search`), when
     /// asked for and found.
     pub concrete: Option<Witness>,
 }
@@ -823,7 +830,7 @@ pub struct Solved {
 /// THE ARC PHASE over a finished level-0 tree in `dir` (frames and edges
 /// through `horizon`): load the rotation graph (`load`), the winning sets
 /// backward (`backward`), the optimum read off them (`optimum`), and with
-/// `witness` the concrete count-up from it. Prints `[gate]` lines - the
+/// `witness` the concrete search (`concrete_search`). Prints `[gate]` lines - the
 /// marks' and each frame's winning sets' fingerprints over (shape, key,
 /// cell), which do not depend on the scheduling the ids do - and with
 /// `save`, writes the UI's arc pass there (`export-ui --forward-only --arc`):
@@ -908,7 +915,7 @@ pub fn solve(
     }
     drop(files);
     let concrete = match (witness, arc) {
-        (true, Some(f)) => concrete_count_up(dir, level, horizon, g, &w, f)?,
+        (true, Some(f)) => concrete_search(dir, level, horizon, g, &w, f)?,
         _ => None,
     };
     if let Some(wt) = &concrete {
