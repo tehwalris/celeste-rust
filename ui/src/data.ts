@@ -89,6 +89,12 @@ export interface Tiles {
 export interface RunInfo {
   id: string;
   label: string;
+  /** The run category (`any%`, `No Diagonal Dashes`): the room switch's
+   *  group. Absent = `any%`. */
+  category?: string;
+  /** What the room switch shows after the room (`ours 106 vs TAS 111`);
+   *  absent = the frame the label names (`exit at frame 85` -> `85 f`). */
+  pick?: string;
 }
 
 export interface Run {
@@ -105,14 +111,20 @@ export interface Run {
   /** A concrete run to draw over the room (`export-ui --arc`). Absent in
    *  older exports. */
   witness?: Witness | null;
+  /** Another concrete run to compare with (`export-ui --reference`: a
+   *  community TAS replayed in the original cart). Absent in older exports. */
+  reference?: Witness | null;
 }
 
 /** A concrete witness: its inputs and the player's (x, y) per frame, frame
- *  0 the start (null without a player), in the cells' coordinates. */
+ *  0 the start (null without a player), in the cells' coordinates; the
+ *  frames a dash starts at, with its way (`R`, `U`, ...; absent in older
+ *  exports). */
 export interface Witness {
   label: string;
   inputs: number[];
   path: ([number, number] | null)[];
+  dashes?: [number, string][];
 }
 
 /** A state with no player position (see ui_export::NO_POSITION). */
@@ -319,18 +331,31 @@ export function roomOf(info: RunInfo): [number, number] | null {
   return m ? [Number(m[1]), Number(m[2])] : null;
 }
 
-/** `Room (4,0) · 500 m`: the label the room switch shows. */
+/** `Room (4,0) · 500 m`: the room of a run, as the header names it. */
 export function roomLabel(info: RunInfo): string {
   const r = roomOf(info);
   return r ? `Room (${r[0]},${r[1]}) · ${roomTitle(r[0], r[1])}` : info.label;
 }
 
-/** The runs in game order (level index); unparseable labels keep their
- *  runs.json order after the rooms. */
+/** `Room (4,3) · 2900 m · ours 106 vs TAS 111`: what the room switch shows,
+ *  the room and the run's frames (`pick`, or the frame its label names). */
+export function pickLabel(info: RunInfo): string {
+  const f = /(?:frame|optimal) (\d+)/.exec(info.label);
+  const pick = info.pick ?? (f ? `${f[1]} f` : null);
+  return roomOf(info) && pick ? `${roomLabel(info)} · ${pick}` : roomLabel(info);
+}
+
+export const ANY = "any%";
+export const categoryOf = (info: RunInfo) => info.category ?? ANY;
+
+/** The runs grouped by category (any% first, then the others in runs.json
+ *  order), each group in game order (level index); unparseable labels keep
+ *  their runs.json order after the rooms. */
 export function runsInGameOrder(runs: RunInfo[]): RunInfo[] {
+  const cats = [ANY, ...new Set(runs.map(categoryOf).filter((c) => c !== ANY))];
   const key = (r: RunInfo) => {
     const room = roomOf(r);
-    return room ? levelIndex(room[0], room[1]) : 1e9;
+    return cats.indexOf(categoryOf(r)) * 1e9 + (room ? levelIndex(room[0], room[1]) : 1e8);
   };
   return runs.map((r, i) => ({ r, i })).sort((a, b) => key(a.r) - key(b.r) || a.i - b.i).map((e) => e.r);
 }

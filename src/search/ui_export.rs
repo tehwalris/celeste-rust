@@ -132,17 +132,24 @@ pub struct Run {
     pub prebuild_s: Option<f64>,
     pub optimal: Option<u32>,
     pub horizons: Vec<HorizonRun>,
-    /// A concrete run drawn over the room (`export-ui --arc`, `witness.txt`).
+    /// A concrete run drawn over the room (`export-ui --arc`, `witness.txt`;
+    /// `--witness FILE` replaces it).
     pub witness: Option<Witness>,
+    /// Another concrete run to compare it with (`--reference FILE`: e.g. the
+    /// community TAS replayed in the original cart).
+    pub reference: Option<Witness>,
 }
 
 /// A concrete witness: its inputs and the player's (x, y) per frame (frame 0
-/// the start; `None` without a player), in the cells' pixel coordinates.
+/// the start; `None` without a player), in the cells' pixel coordinates, and
+/// the frames a dash starts at with its direction (`R`, `U`, ...; only when
+/// the file lists them).
 #[derive(Serialize, Debug)]
 pub struct Witness {
     pub label: String,
     pub inputs: Vec<u8>,
     pub path: Vec<Option<(i32, i32)>>,
+    pub dashes: Vec<(u32, String)>,
 }
 
 fn num<T: std::str::FromStr>(tok: &str) -> Result<T>
@@ -662,25 +669,41 @@ fn read_keyed(path: &Path) -> Result<FxHashMap<String, String>> {
 }
 
 /// `witness.txt` (`search --save-marks`): `inputs a,b,..`, then
-/// `f x y` per frame from 0 (`f - -` without a player).
+/// `f x y` per frame from 0 (`f - -` without a player). A file for
+/// `--witness` / `--reference` (`tools/align_tas.py`) may start with
+/// `label TEXT` and carry `dashes F:DIR ...` before the frames; the frames
+/// may end early (at the exit).
 fn read_witness(path: &Path) -> Result<Witness> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut lines = text.lines();
+    let name = path.display();
+    let mut lines = text.lines().peekable();
+    let label = lines.next_if(|l| l.starts_with("label ")).map(|l| l["label ".len()..].trim().to_string());
     let inputs: Vec<u8> = lines
         .next()
         .and_then(|l| l.strip_prefix("inputs "))
-        .context("witness.txt: no `inputs` line")?
+        .with_context(|| format!("{name}: no `inputs` line"))?
         .split(',')
-        .map(|b| b.trim().parse::<u8>().context("witness.txt: an input byte"))
+        .map(|b| b.trim().parse::<u8>().with_context(|| format!("{name}: an input byte")))
         .collect::<Result<_>>()?;
+    let dashes = match lines.next_if(|l| l.starts_with("dashes")) {
+        Some(l) => l["dashes".len()..]
+            .split_whitespace()
+            .map(|d| {
+                let (f, dir) = d.split_once(':').with_context(|| format!("{name}: dash {d:?} is not F:DIR"))?;
+                Ok((num(f)?, dir.to_string()))
+            })
+            .collect::<Result<_>>()?,
+        None => Vec::new(),
+    };
     let mut path_xy = Vec::new();
     for (i, l) in lines.enumerate() {
         let t: Vec<&str> = l.split_whitespace().collect();
-        anyhow::ensure!(t.len() == 3 && t[0].parse::<usize>().ok() == Some(i), "witness.txt: line {:?} is not frame {i}", l);
+        anyhow::ensure!(t.len() == 3 && t[0].parse::<usize>().ok() == Some(i), "{name}: line {:?} is not frame {i}", l);
         path_xy.push(if t[1] == "-" { None } else { Some((num(t[1])?, num(t[2])?)) });
     }
-    anyhow::ensure!(path_xy.len() == inputs.len() + 1, "witness.txt: {} inputs, {} positions", inputs.len(), path_xy.len());
-    Ok(Witness { label: format!("concrete witness inside the winning sets, a win at f{}", inputs.len()), inputs, path: path_xy })
+    anyhow::ensure!((1..=inputs.len() + 1).contains(&path_xy.len()), "{name}: {} inputs, {} positions", inputs.len(), path_xy.len());
+    let label = label.unwrap_or_else(|| format!("concrete witness inside the winning sets, a win at f{}", inputs.len()));
+    Ok(Witness { label, inputs, path: path_xy, dashes })
 }
 
 /// `--arc DIR` (`search --save-marks DIR`): the last forward level gets the
@@ -719,10 +742,17 @@ fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path) -> Res
     w.exists().then(|| read_witness(&w)).transpose()
 }
 
+/// The concrete runs drawn over the room: `witness` (replacing the arc
+/// directory's) and `reference`, files in `read_witness`'s format.
+pub struct Paths<'a> {
+    pub witness: Option<&'a Path>,
+    pub reference: Option<&'a Path>,
+}
+
 /// The export. `checkpoint_dir` is a search's (`levelNN/` under it) or one
 /// forward's tree; `room` the start room it ran from; `arc` its `search
 /// --save-marks` directory.
-pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i16), arc: Option<&Path>) -> Result<()> {
+pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i16), arc: Option<&Path>, paths: Paths) -> Result<()> {
     let text = std::fs::read_to_string(log_path).with_context(|| format!("reading {}", log_path.display()))?;
     let (levels, h, wall_s, mut optimal) = parse_log(&text)?;
     let search = checkpoint_dir.join("level00").exists();
@@ -734,6 +764,11 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
         Some(dir) => attach_arc(&mut hr, &mut optimal, dir)?,
         None => None,
     };
+    let witness = match paths.witness {
+        Some(p) => Some(read_witness(p)?),
+        None => witness,
+    };
+    let reference = paths.reference.map(read_witness).transpose()?;
     eprintln!("[export-ui] log: {} levels to f{h}, optimal {optimal:?}", hr.levels.len());
     std::fs::create_dir_all(out)?;
 
@@ -855,6 +890,7 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
         optimal,
         horizons: vec![hr],
         witness,
+        reference,
     };
     let mut f = std::io::BufWriter::new(std::fs::File::create(out.join("run.json"))?);
     serde_json::to_writer(&mut f, &run)?;
@@ -899,6 +935,26 @@ mod tests {
         assert!(t.cells.contains(&(8, 4)) && !t.cells.contains(&(8, 3)));
         assert_eq!(by_cell_dist[0], vec![(3, 0, 2), (4, 0, 1)]);
         assert_eq!(by_cell_dist[1], vec![(3, 1, 1), (3, 2, 1)], "sorted by (dist, cell)");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The search's `witness.txt` and a labelled path file with dashes that
+    /// ends at the exit both read; a skipped frame does not.
+    #[test]
+    fn witness_and_reference_files_read() {
+        let dir = std::env::temp_dir().join(format!("celeste-ui-witness-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let read = |text: &str| {
+            let p = dir.join("w.txt");
+            std::fs::write(&p, text).unwrap();
+            read_witness(&p)
+        };
+        let w = read("inputs 0,34\n0 - -\n1 8 96\n2 13 96\n").unwrap();
+        assert_eq!((w.inputs, w.path, w.dashes.len()), (vec![0, 34], vec![None, Some((8, 96)), Some((13, 96))], 0));
+        assert!(w.label.contains("f2"));
+        let r = read("label TAS29 (community)\ninputs 0,34,0\ndashes 2:R\n0 - -\n1 8 96\n2 13 96\n").unwrap();
+        assert_eq!((r.label.as_str(), r.path.len(), r.dashes), ("TAS29 (community)", 3, vec![(2, "R".to_string())]));
+        assert!(read("inputs 0,34\n0 - -\n2 8 96\n").is_err(), "frames are consecutive from 0");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

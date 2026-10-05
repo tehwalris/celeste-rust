@@ -27,7 +27,7 @@
 import type { FramesBin, HorizonRun, LevelRun, Run } from "./data";
 import { defaultHorizon, fmtCompact, fmtInt, horizonOrder, horizonVerdict, ladderPrecisions, levelName, loadFrames, loadLayers, precisionName, type VerdictKind } from "./data";
 import { levelCss, levelRamp, marksRamp, heightBand, bandColor, bandHalo, movingColor, HEIGHT_BANDS, rgbCss, levelColor, LEVELS, type RGB } from "./color";
-import { addSparse, RoomRenderer, sparseMax, TRAIL, type HeatLayer, type Scene } from "./room";
+import { addSparse, OURS, REFERENCE, RoomRenderer, sparseMax, type DrawPath, type HeatLayer, type Scene } from "./room";
 import { button, chips, clear, el, icon, scrubber, select, show } from "./ui";
 import { Instances, View3D } from "./view3d";
 import type { View } from "./main";
@@ -540,7 +540,36 @@ export function spaceView(run: Run, onState: () => void): View {
 
   const probeEl = el("div", { class: "probe", "aria-live": "polite" });
   const scaleEl = el("div", { class: "scale" });
-  const stageFoot = el("div", { class: "stage-foot" }, [probeEl, scaleEl]);
+  // The concrete paths (ours: the witness, filled box; the reference: a
+  // community TAS, outlined box), the reference drawn lowest, and the
+  // readout of where each is at the frame shown.
+  const pathRows: { w: NonNullable<Run["witness"]>; name: string; color: RGB; filled: boolean }[] = [
+    ...(run.reference ? [{ w: run.reference, name: run.reference.label.split(/[\s:(]/)[0], color: REFERENCE, filled: false }] : []),
+    ...(run.witness ? [{ w: run.witness, name: "ours", color: OURS, filled: true }] : []),
+  ];
+  const drawPaths: DrawPath[] = pathRows.map((r) => ({ path: r.w.path, dashes: r.w.dashes ?? [], color: r.color, filled: r.filled }));
+  const pathsEl = el("div", { class: "paths-info", "aria-live": "off" });
+  const ARROW: Record<string, string> = { R: "→", L: "←", U: "↑", D: "↓" };
+  function pathsInfo(f: number | null) {
+    show(pathsEl, f != null);
+    if (f == null) return;
+    pathsEl.replaceChildren(
+      el("b", { text: `f${f}` }),
+      ...[...pathRows].reverse().map((r) => {
+        const exit = r.w.path.length - 1;
+        const p = r.w.path[f];
+        const where = f >= exit ? `out at f${exit}` : p ? `${p[0]},${p[1]}` : "spawning";
+        const dash = r.w.dashes?.find((d) => d[0] === f);
+        return el("span", { class: "pi" }, [
+          el("i", { class: r.filled ? "" : "ring", style: `--c:${rgbCss(r.color)}` }),
+          el("span", { class: "nm", text: r.name }),
+          where,
+          dash ? el("b", { class: "dash", style: `color:${rgbCss(r.color)}`, text: `dash ${dash[1].split("").map((c) => ARROW[c] ?? c).join("")}` }) : null,
+        ]);
+      }),
+    );
+  }
+  const stageFoot = el("div", { class: "stage-foot" }, [...(pathRows.length ? [pathsEl] : []), probeEl, scaleEl]);
   const stageCol = el("section", { class: "space-stage card" }, [stageHead, stage, stageFoot]);
 
   // ---- DOM: the transport (play, step, scrub) ------------------------------------------
@@ -674,8 +703,8 @@ export function spaceView(run: Run, onState: () => void): View {
   );
   const trailChips = chips<boolean>(
     [
-      { value: true, label: "Show", title: run.witness ? `${run.witness.label}: the player's path, bright to the current frame` : "" },
-      { value: false, label: "Hide", title: "no witness over the room" },
+      { value: true, label: "Show", title: `${pathRows.map((r) => r.w.label).join("; ")}: the player's box at the current frame, the route as a ribbon with a dot per frame, arrows where it dashes` },
+      { value: false, label: "Hide", title: "no path over the room" },
     ],
     st.trail,
     (t) => {
@@ -683,9 +712,9 @@ export function spaceView(run: Run, onState: () => void): View {
       render();
       onState();
     },
-    { label: "witness" },
+    { label: run.reference ? "paths" : "witness" },
   );
-  const optionCard = el("section", { class: "card options" }, [grainChips.root, lookChips.root, mode3Chips.root, ...(run.witness ? [trailChips.root] : []), speedChips.root, pacingChips.root]);
+  const optionCard = el("section", { class: "card options" }, [grainChips.root, lookChips.root, mode3Chips.root, ...(pathRows.length ? [trailChips.root] : []), speedChips.root, pacingChips.root]);
 
   // ---- DOM: the legend --------------------------------------------------------------
   const key = (color: string, label: string, cls = "") => el("span", { class: "key" }, [el("i", { class: cls, style: color ? `background:${color}` : undefined }), label]);
@@ -720,7 +749,10 @@ export function spaceView(run: Run, onState: () => void): View {
     key("#784638", "spikes"),
     key("#826e32", "spring"),
     key("#467846", "fruit"),
-    ...(run.witness ? [key(TRAIL, "the concrete witness (Room, Passes)")] : []),
+    ...[...pathRows].reverse().map((r) =>
+      el("span", { class: "key path-key" }, [el("i", { class: r.filled ? "" : "ring", style: `--c:${rgbCss(r.color)}` }), r.w.label]),
+    ),
+    ...(pathRows.length ? [el("p", { class: "note", text: "A path (Room, Passes): the player's 8x8 box at the frame shown (ours filled, the reference outlined), the three frames before it fading, the route as a ribbon with a dot per frame (wide spacing = fast), an arrow where a dash starts." })] : []),
   ]);
   const help = el("details", { class: "help" }, [
     el("summary", { text: "How to read this" }),
@@ -1015,15 +1047,19 @@ export function spaceView(run: Run, onState: () => void): View {
     stage.dataset.loading = on ? "true" : "false";
   };
 
-  /** The witness over the room, bright to frame `f` (a forward's frame, a
-   *  backward's layer). */
+  /** The paths over the room at frame `f` (a forward's frame, a backward's
+   *  layer), and the readout of where each is. */
   function drawTrail(f: number) {
-    if (run.witness && st.trail) renderer.trail(canvas, run.witness.path, f);
+    const on = drawPaths.length > 0 && st.trail;
+    if (on) renderer.paths(canvas, drawPaths, f);
+    pathsInfo(on ? f : null);
   }
 
   let renderToken = 0;
   function render() {
     const token = ++renderToken;
+    // Only the Room and Passes grains draw the paths (drawTrail).
+    pathsInfo(null);
     // A scrub / jump moved the step under the float playhead: follow it.
     if (!st.playing) st.pos = (byPass() ? passCum(st.h) : stepCum(st.h))[Math.max(0, byPass() ? st.pass : st.step)] ?? 0;
     const hr = run.horizons[st.h];
@@ -1552,7 +1588,7 @@ export function spaceView(run: Run, onState: () => void): View {
     if (st.look !== "last") p.set("l", st.look);
     if (st.speed !== 1) p.set("s", String(st.speed));
     if (st.pacing !== "uniform") p.set("pc", st.pacing);
-    if (run.witness && !st.trail) p.set("w", "0");
+    if (drawPaths.length && !st.trail) p.set("w", "0");
     return p.toString();
   }
   function apply(p: URLSearchParams) {

@@ -143,10 +143,17 @@ order, the first one the default:
 {
   "runs": [
     { "id": "room10", "label": "Room (1,0)" },
-    { "id": "room00", "label": "Room (0,0)" }
+    { "id": "room00", "label": "Room (0,0)" },
+    { "id": "room43nodiag", "label": "Room (4,3) · ...",
+      "category": "No Diagonal Dashes", "pick": "ours 106 vs TAS 111" }
   ]
 }
 ```
+
+`category` (absent = `any%`) groups the room switch: any% first, then the
+other categories in runs.json order, each in game order. The switch shows
+`Room (4,3) · 2900 m · ` plus `pick`, or without one the frame the label
+names (`exit at frame 85` -> `85 f`).
 
 Each run's subdirectory (`id`) is produced by `rewrite export-ui`
 (`src/search/ui_export.rs`) from a `rewrite search` checkpoint dir (or one
@@ -160,8 +167,23 @@ ARC backward over the same tree (`forward_of` in `run.json`: no forward
 pass of its own; a node is marked when its winning set W_t is non-empty at
 some frame t, drawn at its first-reach layer). With a concrete witness,
 `witness.txt` (the inputs and the player's position per frame) is drawn
-over the room as a cyan trail (the `witness` chip; `w=0` in the hash hides
-it). Room (3,3) at h172 (from the repo root: it loads cart/ for the tiles):
+over the room as a path (below). `--witness FILE` replaces it and
+`--reference FILE` adds a second one to compare with, in the same format
+plus an optional `label` line and `dashes F:DIR ...`: `tools/align_tas.py
+ROOM 2900m PROLOGUE OUR_TAS SEEDS OUTDIR` writes both (`ours.txt`,
+`reference.txt`) from a community TAS and ours replayed in the ORIGINAL
+cart, so the two are directly comparable.
+
+A path (Room and Passes grains; the `witness` / `paths` chip, `w=0` in
+the hash hides them) is the player's 8x8 box at the frame shown - ours
+cyan and filled, the reference yellow and outlined, so on the same spot
+both still read - the three frames before it as fading outlines, the
+route as a thick translucent ribbon through the box centres (brighter up
+to the frame) with a dot per frame (wide spacing = fast), and an arrow
+where each dash starts, faint until it has happened. Under the room, a
+line says where each is at the frame (`f53 · ours 29,66 dash → · TAS29
+27,56`). Room (3,3) at h172 (from the repo root: it loads cart/ for the
+tiles):
 
 ```bash
 CELESTE_LEVEL_MINUS_ONE="172,5" ./safe-run.sh -- ./target/quick/rewrite search \

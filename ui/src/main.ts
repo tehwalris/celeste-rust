@@ -12,11 +12,13 @@
 //
 // The header is one row on a wide screen (title and headline numbers,
 // the room, the tabs) and two on a phone (the room and the tabs, then
-// the numbers). The room switch lists the runs in GAME order (level
+// the numbers). The room switch groups the runs by category (`category` in
+// runs.json: any% first, then e.g. No Diagonal Dashes) and lists each group
+// in GAME order (level
 // index) with the altitude the game shows on entering the room; the
 // default run is still runs.json's first entry.
 import "./style.css";
-import { chapters, fmtDuration, loadRun, loadRuns, roomLabel, runsInGameOrder, type Chapter, type Run, type RunInfo } from "./data";
+import { categoryOf, chapters, fmtDuration, loadRun, loadRuns, pickLabel, runsInGameOrder, type Chapter, type Run, type RunInfo } from "./data";
 import { el, clear, button, select, type Select } from "./ui";
 import { spaceView } from "./space";
 import { sizesView } from "./sizes";
@@ -91,7 +93,7 @@ async function main() {
   }
   const labelOf = (id: string) => {
     const r = runs.find((x) => x.id === id);
-    return r ? roomLabel(r) : id;
+    return r ? pickLabel(r) : id;
   };
 
   // ---- the header: title, the run, the tabs ----------------------------------
@@ -143,7 +145,7 @@ async function main() {
       return;
     }
     runPicker = select<string>(
-      runsInGameOrder(runs).map((r) => ({ value: r.id, label: roomLabel(r) })),
+      runsInGameOrder(runs).map((r) => ({ value: r.id, label: pickLabel(r), group: categoryOf(r) })),
       runId,
       (id) => go(id, tab ?? "space"),
       { label: "room", hideLabel: true, class: "run-picker" },
@@ -200,6 +202,8 @@ async function main() {
       const wall = run.wall_s != null ? fmtDuration(run.wall_s * 1000) : "";
       // The room is on the switch; the sub is the run's headline numbers.
       sub.replaceChildren(el("span", {}, [run.optimal != null ? el("b", { text: `optimum ${run.optimal} frames` }) : "no optimum found"]));
+      // A reference path's exit frame (its last position) against it.
+      if (run.reference) sub.append(el("span", { text: `${run.reference.label.split(/[\s:(]/)[0]}: ${run.reference.path.length - 1} frames` }));
       sub.append(el("span", { text: `${run.horizons.length} horizon${run.horizons.length === 1 ? "" : "s"} tested` }));
       if (wall) sub.append(el("span", { text: `${wall} search` }));
     }

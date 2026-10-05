@@ -328,6 +328,15 @@ enum Command {
         /// arc backward's marks over the last level's tree (and the witness).
         #[arg(long)]
         arc: Option<String>,
+        /// A concrete run to draw instead of the arc directory's witness:
+        /// `[label TEXT]`, `inputs a,b,..`, `[dashes F:DIR ..]`, then `f x y`
+        /// per frame from 0 (`tools/align_tas.py ... OUTDIR` writes one).
+        #[arg(long)]
+        witness: Option<String>,
+        /// Another concrete run to draw next to it (same format): e.g. the
+        /// community TAS replayed in the original cart.
+        #[arg(long)]
+        reference: Option<String>,
     },
     /// A concrete input sequence that follows a given TRAJECTORY of player
     /// positions (one "x,y" per line from frame 1; `-` accepts any), found
@@ -1361,6 +1370,8 @@ fn main() -> Result<()> {
             out,
             room,
             arc,
+            witness,
+            reference,
         } => {
             let (rx, ry) = room
                 .split_once(',')
@@ -1372,6 +1383,10 @@ fn main() -> Result<()> {
                 std::path::Path::new(&out),
                 (rx, ry),
                 arc.as_deref().map(std::path::Path::new),
+                celeste_rust::search::ui_export::Paths {
+                    witness: witness.as_deref().map(std::path::Path::new),
+                    reference: reference.as_deref().map(std::path::Path::new),
+                },
             )?;
         }
         Command::Trajectory {

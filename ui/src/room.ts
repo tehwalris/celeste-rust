@@ -36,9 +36,21 @@ const NEXT_ROOM_X = 128;
 
 const SPIKE_IDS = new Set([17, 27, 43, 59]);
 
-/** The witness trail (`trail`): cyan, apart from every heat ramp. */
-export const TRAIL = "rgba(70, 220, 255, 0.95)";
-const TRAIL_FAINT = "rgba(70, 220, 255, 0.35)";
+/** The concrete paths' colours, apart from every heat ramp (blue through
+ *  violet and magenta to orange, warm-white marks): ours cyan, the
+ *  reference (a community TAS) yellow. */
+export const OURS: RGB = [70, 220, 255];
+export const REFERENCE: RGB = [255, 214, 50];
+
+/** A concrete path to draw (`RoomRenderer.paths`). */
+export interface DrawPath {
+  path: ([number, number] | null)[];
+  /** `[frame, "R" | "U" | ...]` where a dash starts. */
+  dashes: [number, string][];
+  color: RGB;
+  /** The current frame's box filled (else a heavy outline). */
+  filled: boolean;
+}
 
 export class RoomRenderer {
   readonly box: Box2;
@@ -138,49 +150,112 @@ export class RoomRenderer {
     }
   }
 
-  /** Draw a path of start-room pixels over the last `render` of `canvas`:
-   *  the whole path faint, frames 0..`upto` bright with a dot at `upto`.
-   *  A point outside the box or in the next room breaks the line. */
-  trail(canvas: HTMLCanvasElement, path: ([number, number] | null)[], upto: number) {
+  /** Draw concrete paths over the last `render` of `canvas`, the first one
+   *  lowest. Per path: the route as a thick translucent ribbon through the
+   *  player's 8x8 sprite box centres (brighter up to frame `upto`), a dot
+   *  per frame (their spacing is the speed), an arrow where each dash
+   *  starts (pointing its way; faint until it has happened), the three
+   *  frames before `upto` as fading box outlines, and the box at `upto`
+   *  solid - filled for a `filled` path, a heavy outline otherwise, so two
+   *  paths on the same spot still read as two. A position is the player's
+   *  `(x, y)`, the cell the heat layers count it in: the box's top-left. A
+   *  frame without a player, or in the next room, breaks the ribbon; past
+   *  its last frame (the exit) a path shows no box. */
+  paths(canvas: HTMLCanvasElement, list: DrawPath[], upto: number) {
     const ctx = canvas.getContext("2d")!;
     const s = canvas.width / this.box.w;
-    const at = (i: number): [number, number] | null => {
-      const p = path[i];
-      if (!p || p[0] >= NEXT_ROOM_X || this.cellIndex(p[0], p[1]) < 0) return null;
-      return [(p[0] - this.box.x0 + 0.5) * s, (p[1] - this.box.y0 + 0.5) * s];
-    };
-    const stroke = (last: number, color: string, width: number) => {
-      ctx.beginPath();
-      let pen = false;
-      for (let i = 0; i <= last; i++) {
-        const q = at(i);
-        if (!q) {
-          pen = false;
-          continue;
-        }
-        if (pen) ctx.lineTo(q[0], q[1]);
-        else ctx.moveTo(q[0], q[1]);
-        pen = true;
-      }
-      ctx.strokeStyle = color;
-      ctx.lineWidth = width;
-      ctx.stroke();
-    };
+    const ink = "rgba(8, 10, 12, 0.85)";
     ctx.save();
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
-    stroke(path.length - 1, TRAIL_FAINT, Math.max(1, s * 0.4));
-    const u = Math.max(0, Math.min(path.length - 1, upto));
-    stroke(u, TRAIL, Math.max(1.5, s * 0.6));
-    const q = at(u);
-    if (q) {
-      ctx.beginPath();
-      ctx.arc(q[0], q[1], Math.max(3, s * 1.4), 0, 2 * Math.PI);
-      ctx.fillStyle = TRAIL;
-      ctx.fill();
-      ctx.lineWidth = Math.max(1, s * 0.4);
-      ctx.strokeStyle = "rgba(0, 0, 0, 0.8)";
-      ctx.stroke();
+    for (const d of list) {
+      const { path, color } = d;
+      const col = (a: number) => `rgba(${color[0]},${color[1]},${color[2]},${a})`;
+      const corner = (i: number): [number, number] | null => {
+        const p = i >= 0 ? path[i] : null;
+        if (!p || p[0] >= NEXT_ROOM_X) return null;
+        return [(p[0] - this.box.x0) * s, (p[1] - this.box.y0) * s];
+      };
+      const centre = (i: number): [number, number] | null => {
+        const q = corner(i);
+        return q && [q[0] + 4 * s, q[1] + 4 * s];
+      };
+      const last = path.length - 1;
+      const u = Math.min(last, upto);
+      const ribbon = (from: number, to: number, a: number) => {
+        ctx.beginPath();
+        let pen = false;
+        for (let i = from; i <= to; i++) {
+          const q = centre(i);
+          if (!q) {
+            pen = false;
+            continue;
+          }
+          if (pen) ctx.lineTo(q[0], q[1]);
+          else ctx.moveTo(q[0], q[1]);
+          pen = true;
+        }
+        ctx.strokeStyle = col(a);
+        ctx.lineWidth = Math.max(4, s * 3);
+        ctx.stroke();
+      };
+      ribbon(Math.max(0, u), last, 0.2);
+      ribbon(0, u, 0.42);
+      // A dot per frame.
+      for (let i = 0; i <= last; i++) {
+        const q = centre(i);
+        if (!q) continue;
+        ctx.beginPath();
+        ctx.arc(q[0], q[1], Math.max(1.5, s * 0.55), 0, 2 * Math.PI);
+        ctx.fillStyle = col(i <= u ? 1 : 0.5);
+        ctx.fill();
+      }
+      // The dashes: an arrow on the box centre, pointing its way.
+      for (const [f, dir] of d.dashes) {
+        const q = centre(f);
+        if (!q) continue;
+        const dx = (dir.includes("R") ? 1 : 0) - (dir.includes("L") ? 1 : 0);
+        const dy = (dir.includes("D") ? 1 : 0) - (dir.includes("U") ? 1 : 0);
+        const n = Math.hypot(dx, dy) || 1;
+        const [ux, uy] = [dx / n, dy / n];
+        const r = Math.max(7, s * 4.2);
+        ctx.beginPath();
+        ctx.moveTo(q[0] + ux * r, q[1] + uy * r);
+        ctx.lineTo(q[0] - ux * r * 0.55 - uy * r * 0.7, q[1] - uy * r * 0.55 + ux * r * 0.7);
+        ctx.lineTo(q[0] - ux * r * 0.2, q[1] - uy * r * 0.2);
+        ctx.lineTo(q[0] - ux * r * 0.55 + uy * r * 0.7, q[1] - uy * r * 0.55 - ux * r * 0.7);
+        ctx.closePath();
+        ctx.fillStyle = col(f <= u ? 1 : 0.45);
+        ctx.fill();
+        ctx.lineWidth = Math.max(1, s * 0.4);
+        ctx.strokeStyle = ink;
+        ctx.stroke();
+      }
+      if (upto > last) continue;
+      // The frames just before: fading outlines.
+      for (let k = 3; k >= 1; k--) {
+        const q = corner(u - k);
+        if (!q) continue;
+        ctx.lineWidth = Math.max(1, s * 0.5);
+        ctx.strokeStyle = col(0.55 - 0.13 * k);
+        ctx.strokeRect(q[0], q[1], 8 * s, 8 * s);
+      }
+      // The current frame's box.
+      const q = corner(u);
+      if (q) {
+        const [x, y, w] = [q[0], q[1], 8 * s];
+        const lw = Math.max(2, s * 0.9);
+        ctx.lineWidth = lw + Math.max(2, s * 0.6);
+        ctx.strokeStyle = ink;
+        ctx.strokeRect(x, y, w, w);
+        if (d.filled) {
+          ctx.fillStyle = col(0.55);
+          ctx.fillRect(x, y, w, w);
+        }
+        ctx.lineWidth = lw;
+        ctx.strokeStyle = col(1);
+        ctx.strokeRect(x, y, w, w);
+      }
     }
     ctx.restore();
   }

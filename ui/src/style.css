@@ -1001,6 +1001,53 @@ details summary:focus-visible {
   height: 3px;
   border-radius: 2px;
 }
+/* A path's swatch: its box at the current frame, filled (ours) or
+   outlined (the reference), as on the room. */
+.legend .path-key i,
+.paths-info .pi i {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  display: inline-block;
+  flex: 0 0 auto;
+  border: 2px solid var(--c);
+  background: color-mix(in srgb, var(--c) 55%, transparent);
+}
+.legend .path-key i.ring,
+.paths-info .pi i.ring {
+  background: none;
+}
+.legend .path-key {
+  flex-basis: 100%;
+}
+
+/* Where each path is at the frame shown, under the room. */
+.paths-info {
+  flex: 1 1 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 14px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+}
+.paths-info > b {
+  color: var(--ink);
+  min-width: 3.2em;
+}
+.paths-info .pi {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.paths-info .nm {
+  color: var(--ink);
+  font-weight: 600;
+}
+.paths-info .dash {
+  font-weight: 700;
+}
 .level-strip {
   display: flex;
   gap: 2px;
