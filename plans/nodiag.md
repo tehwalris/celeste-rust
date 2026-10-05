@@ -19,7 +19,7 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (4,3) 2900m | 85 | 111 (TAS29, offset 29) | - | |
 | (1,1) 1000m | 94 | 94 (TAS10) | - | (validation, not run) |
 
-## The concrete count-up (arc-search --witness)
+## The concrete count-up (`rewrite search`)
 
 The arc optimum over coarse objects is only a lower bound. The witness DFS is
 EXHAUSTIVE (all 64 inputs, every `rnd` leaf, a fully explored concrete state

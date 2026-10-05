@@ -4,30 +4,41 @@
 
 An abstract interpreter for PICO-8 Celeste, used to search for provably
 optimal per-room TASes. It traces the cart's Lua into a graph IR, assembles
-that into branch-free AVX-512 kernels at startup, and runs a forward /
-backward / precision-ladder search over columnar blocks of abstract game
-states. Every room now has a confirmed optimum (`plans/results.md`); all tie
-the community TAS.
+that into branch-free AVX-512 kernels at startup, and searches in three
+steps (`rewrite search`, plans/architecture.md "The search"):
 
-State of the code (2026-10-04): ~56k lines of Rust (35k code, 12.6k
-comments, 8.8k tests); a cleanup toward ~10k is in progress on other
-branches. The direction: the rotation graph ("arcs", exact sub-pixel
-remainders) replaces the rem rungs of the ladder.
+1. a level-0 FORWARD over columnar blocks of abstract states (the player's
+   sub-pixel remainder widened to the whole pixel, optionally the room's
+   objects too), recording every edge WITH what the frame did to the
+   remainder (its transfer);
+2. a BACKWARD over the rotation graph ("arcs"): per node the exact set of
+   remainders that still win by the horizon. Its optimum is exact in the
+   remainder and a lower bound on the game's (no win refutes the horizon);
+3. the CONCRETE COUNT-UP: an exhaustive concrete search (reference engine,
+   every input, every `rnd` leaf) pruned only by those sets, from the bound
+   up. Its first win is the concrete optimum and the witness.
+
+Every room has a confirmed optimum (`plans/results.md`); all tie the
+community TAS. The precision ladder that found them (rem rungs, an objects
+ladder, mark filters) was deleted on 2026-10-05 (branch `arc-only`).
+
+State of the code (2026-10-05): ~44.7k lines of Rust (26.0k code, 9.0k
+comments, 7.4k tests); a cleanup toward ~10k is in progress.
 
 ## Read these before doing anything substantial
 
 - `plans/architecture.md` - the current design: interfaces, the tracer and
-  kernel model, the waves frame and the door, the recorded backward graph,
-  the outer loop and ladder, arcs, gates, open issues.
-- `plans/abstractions.md` - every level flag (`h f b n t p`, pos, spd, rem):
-  what it widens, why it is sound, what narrows it, its status.
+  kernel model, the waves frame and the door, the recorded edges and their
+  transfers, the search (arcs, the concrete count-up), gates, open issues.
+- `plans/abstractions.md` - every level flag (`h f n p`; the remainder):
+  what it widens, why it is sound, what refutes it, its status.
 - `plans/results.md` - every room's optimum, how it was proven, its witness;
   how to run an object room.
 - `plans/lessons.md` - abandoned approaches and the measurement that killed
   each. Check it before proposing something that sounds familiar.
 - `plans/level-minus-one.md` - the cost-to-go filter.
-- `src/frame.rs` (~3.9k lines: the loop) and `src/search/` (door, edges,
-  checkpoint, arcs).
+- `src/frame.rs` (~2.6k lines: the block, the frame step, the forward) and
+  `src/search/` (door, edges, checkpoint, arcs, arc_dp: the search).
 - `BENCHMARK_DATA.md` - dated measurements, newest first; partly stale (see
   its first line).
 
@@ -46,23 +57,25 @@ latter.
 - **Correctness beats cleverness.** A transformation we cannot check is worse
   than no transformation. If you cannot verify something, insert a runtime
   guard instead of assuming.
-- **Never widen a field without a rung that narrows it back.** Every
-  widening is an over-approximation: sound for REFUTING a horizon, but the
-  ladder reports "optimum = H" when every level wins at H, and that rests on
-  the last level being EXACT in every coordinate. A widening applied at EVERY
-  level is refuted by nothing and survives to report a spurious optimum. This
-  has come up twice (`p_jump`/`p_dash`). The cost of a new abstraction is the
-  abstraction PLUS its refinement ladder; anything advertised as a free merge
-  is mispriced. (The two exceptions in the code are listed in
-  plans/abstractions.md: exact canonicalizations, and `rnd`, which is a stated
-  best-case caveat.)
-- **Believe a result after a witness, not before.** `rewrite witness` (or
-  `arc-search --witness`) + a real-PICO-8 replay. The project's own earlier
-  "proven" 94 for room (0,0) was a frame too long.
+- **Never widen a field without something EXACT that refutes it.** Every
+  widening is an over-approximation: sound for REFUTING a horizon, never for
+  confirming one. The remainder's widening is undone by the arcs (exact
+  transfers); every other one (the level's flags) by the concrete count-up,
+  which runs the real game - and it is a proof only because it is
+  EXHAUSTIVE and prunes by nothing but the arcs' exact winning sets. A
+  widening the count-up also sees (a memo keyed on a widened key was one,
+  `522de36`) is refuted by nothing. This has come up three times
+  (`p_jump`/`p_dash` twice). The cost of a new abstraction is the
+  abstraction PLUS what refutes it; anything advertised as a free merge is
+  mispriced. (The exceptions in the code are listed in plans/abstractions.md:
+  exact canonicalizations, and `rnd`, which is a stated best-case caveat.)
+- **Believe a result after a witness, not before.** `rewrite search` writes
+  the concrete witness; replay it on a real PICO-8. The project's own
+  earlier "proven" 94 for room (0,0) was a frame too long.
 - **Never deopt to the interpreter silently.** When the kernels cannot take a
   lane it is FATAL (`KERNEL COVERAGE GAP`, with a miss report); there is no
   fall-through. Fix the gap rather than absorbing it. Likewise a ceiling
-  REFUTED at a coarse level is a bug, never a result.
+  REFUTED (or without a concrete witness) is a bug, never a result.
 - **Measure before and after.** Any change that claims a performance effect
   needs numbers from an actual run, not reasoning.
 - **No dead code.** The build is warning-free; keep it that way.
@@ -80,11 +93,12 @@ latter.
 
 ## Branches
 
-`develop` is the main line; work happens on feature branches off it (current:
-`arc-sets`). `parallel-experiments` (overnight parallelism, deliberately not
-merged), `asm-interval-wrap` (a rejected first version of the interval-overflow fix;
-the accepted one is on `arc-sets`), `interpreter-abandoned-2026-01-11` (the January CFG
-optimizer, reading material only).
+`develop` is the main line; work happens on feature branches off it
+(current: `integrate`, and `arc-only` for the arc-only search).
+`parallel-experiments` (overnight parallelism, deliberately not merged),
+`asm-interval-wrap` (a rejected first version of the interval-overflow fix;
+the accepted one is on `arc-sets`), `interpreter-abandoned-2026-01-11` (the
+January CFG optimizer, reading material only).
 
 ## Running safely
 
@@ -112,8 +126,7 @@ thing that fails.
   copies resident). Override it in the environment to experiment.
 - A search RESUMES from its checkpoint directory: rerun the same command
   after a crash or kill; delete the directory for a fresh run. Nothing on disk
-  records a level's spec, so do not resume a tree under a changed ladder
-  unless the levels it reuses are the same.
+  records a level's spec, so do not resume a tree under another `--level`.
 
 ## Iterating quickly - read this before running anything
 
@@ -155,18 +168,17 @@ always reaching for the most expensive profile out of habit.
 - **`touch` the file you care about** to measure what an edit really costs:
   `touch src/transpile/lower.rs && time cargo nextest run transpile`.
 
-**The ignored tests** (14, `#[ignore]` rather than an env check so nextest
-prints them as skipped): all four `new_ladder_*` tests,
-`every_reachable_pm1_key_gets_its_own_body` (~240 s),
-`forward_extended_frame_by_frame_matches_fresh`, and the reference-engine
-end-to-end tests. They are NOT part of the pre-commit run (Philippe,
-2026-08-23: ~6 min each time costs more than the occasional bisect). Run
-them when you have a reason:
+**The ignored tests** (7, `#[ignore]` rather than an env check so nextest
+prints them as skipped): `every_reachable_pm1_key_gets_its_own_body`
+(~240 s), `forward_extended_frame_by_frame_matches_fresh`,
+`the_rooms_shape_set_is_a_fixpoint`, `room_71_table_builds_with_its_balloon`
+(level -1), and the reference-engine end-to-end tests. They are NOT part of
+the pre-commit run (Philippe, 2026-08-23: ~6 min each time costs more than
+the occasional bisect). Run them when you have a reason:
 
-- touched the tracer, the lowering, the ASM codegen, the ladder or the mark
-  filter -> the `new_ladder_*` tests AND the three pinned oracles (below);
-  the kernels are assembled at startup, so the oracles are what check what
-  they COMPUTE;
+- touched the tracer, the lowering, the ASM codegen or the edge recording ->
+  the ignored tests AND the three pinned oracles (below); the kernels are
+  assembled at startup, so the oracles are what check what they COMPUTE;
 - touched the tracer's pinning or key walk ->
   `every_reachable_pm1_key_gets_its_own_body`.
 
@@ -179,27 +191,28 @@ Every change to the loop, the kernels or the tracer must reproduce the three
 pinned room (1,0) oracles:
 
 ```bash
-./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0        # prints the posgraph line
-./target/release/rewrite ckhash --to 44 --room 1,0 | diff - gates/ckhash_room10_f000-044.txt   # empty
-# the [posgraph] line must equal gates/posgraph_room10_f044.txt
-./safe-run.sh -- ./target/release/rewrite search --from 29 --to 35 --maxk 1 --win-at 9,101 > log
-grep -E '^\[ladder\] h[0-9]+ level|^OPTIMAL' log | sed -E 's/, [0-9]+ (edges read|re-runs)$//' \
-    | diff - gates/marks_room10_win9-101_h29-33.txt                         # empty; ends OPTIMAL 33
+./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0 --checkpoint-dir D   # prints the posgraph line
+./target/release/rewrite ckhash --to 44 --room 1,0 --checkpoint-dir D | diff - gates/ckhash_room10_f000-044.txt   # empty
+# the posgraph line must equal gates/posgraph_room10_f044.txt
+./safe-run.sh -- ./target/release/rewrite search --to 35 --win-at 9,101 --checkpoint-dir D2 > log
+grep '^\[gate\]' log | diff - gates/arc_room10_win9-101_h35.txt          # empty
 ```
 
-- Strip the work count: "edges read" counts RECORDS, and how lanes group into
-  records depends on scheduling (1850 vs 1878 at h32 for one binary).
-- The marks must also match under `CELESTE_BACKWARD=kernel` (the kernel
-  re-run walk, the BFS's oracle).
+- The arc gate (2026-10-05, replacing the ladder's marks gate) pins the
+  remainder-free marks at h35 (count and a fingerprint over (shape, key,
+  cell)), the winning sets W at every frame 0-35 (node count and a
+  fingerprint over each node's (shape, key, cell) and its region), the arc
+  optimum (33) and the concrete witness (its 33 inputs). Ids depend on the
+  scheduling; none of these do (identical at 3 and 32 threads, and over a
+  reused tree).
 - **Re-pin only on evidence that the SETS did not move** - posgraph
   identical, every per-frame kept count, marked count, first win and the
-  OPTIMAL line identical - and say so in the commit (done for `4e2d2e9` and
+  optimum identical - and say so in the commit (done for `4e2d2e9` and
   `18208c6`, both new globals that move every key).
-- After any change to the edge recording: `rewrite bench-backward --level-dir
-  D --horizon H --diff` on a real room's tree (the two backwards' symmetric
-  difference must be empty; `CELESTE_DIFF_RERUN=1` re-runs the frame).
-- After any change to the arc recording: `rewrite arc-check --level-dir D
-  --to N` (exits non-zero on any disagreement).
+- After any change to the edge or transfer recording: `rewrite arc-check
+  --level-dir D/level00 --to N` (every record has a transfer; sampled
+  transfers probed with the reference engine inside and outside their
+  guards; exits non-zero on any disagreement).
 - Kernel keys against the boundary, per row: `CELESTE_KERNEL_KEY_CHECK=1` on a
   forward. Kernels against the reference engine, row by row: `rewrite
   ref-check`. `kernel lanes: missed 0` in every log.
@@ -222,39 +235,31 @@ always what the tracer produces from the Lua in this checkout.
 ## Useful entry points
 
 ```bash
-# THE SEARCH. --ceiling C counts down from a known solution (the replayed
-# community TAS): C must confirm, then C-1 is tested until refuted. Without it,
-# count up from level 0's first win. --win-at x,y forces a cheap synthetic win.
-./safe-run.sh -- ./target/release/rewrite search --room 1,0 --ceiling 99 [--checkpoint-dir DIR]
-# Object rooms: an explicit ladder and the level -1 filter (plans/results.md)
-CELESTE_LADDER="r0sxhn,r1sxhn,r2sxhn,r3sxhn,r4sxhn,r4sxh,r5sxh,...,r15sxh,rxsx" \
-CELESTE_LEVEL_MINUS_ONE="C,5" ./safe-run.sh -- ./target/release/rewrite search --room X,Y --ceiling C
+# THE SEARCH (the horizon: --to H, or --ceiling H for a known solution, where
+# a refutation or no witness is an error). The tree goes to DIR/level00 and
+# is reused when it already reaches the horizon; the witness to
+# DIR/witness_frame_F.txt. --win-at x,y forces a cheap synthetic win.
+./safe-run.sh -- ./target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR
+# Object rooms: the objects abstract at level 0 and the level -1 filter
+# (plans/results.md, "How to run a room").
+CELESTE_LEVEL_MINUS_ONE="C,5" ./safe-run.sh -- ./target/release/rewrite search \
+    --room X,Y --level r0sxhn --ceiling C --checkpoint-dir DIR [--save-marks UIDIR]
 # Other knobs: CELESTE_THREADS, CELESTE_KERNEL_SETS=N (resident kernel sets),
-# CELESTE_SPLIT_FRAME=1 (two steps a frame; horizons in steps),
-# CELESTE_REGION="px,S" | off.
+# CELESTE_REGION="px,S" | off. (CELESTE_SPLIT_FRAME=1 still runs a forward,
+# two steps a frame, but the search refuses it.)
 
 # One forward at one level, with the per-frame [fwd] line; then its fingerprint.
 ./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0 [--level r0sxhn]
 ./target/release/rewrite ckhash --to 44 --room 1,0
 
-# ARCS (plans/architecture.md): a level-0 forward recording arc edges, then the
-# remainder-exact search over it (and its concrete witness), and the checker.
-CELESTE_ARC_EDGES=1 CELESTE_LEVEL_MINUS_ONE="171,5" \
-    ./safe-run.sh -- ./target/quick/rewrite forward --room 3,3 --to 171 --level r0sxhn --checkpoint-dir D
-./safe-run.sh -- ./target/quick/rewrite arc-search --level-dir D --horizon 171 \
-    --room 3,3 --marked-only --level r0sxhn [--witness] [--save-marks UIDIR]
-./safe-run.sh -- ./target/quick/rewrite arc-check --level-dir D --room 3,3 --to 80 --level r0sxhn
+# The transfers of a tree, checked against the reference engine.
+./safe-run.sh -- ./target/quick/rewrite arc-check --level-dir DIR/level00 --room 3,3 --to 80 --level r0sxhn
 
 # Level -1 as a probe (the table against a tree, too-late share per frame).
 CELESTE_START_ROOM=2,0 ./safe-run.sh -- ./target/quick/transpile --level-minus-one S LEVEL_DIR CEILING FROM TO [MARKS]
 
-# The concrete witness behind a ladder result: DFS through one level's marks
-# with the reference engine. Prints the inputs, or "NO WITNESS" (what a
-# spurious win looks like). --level is the ladder INDEX; with a CELESTE_LADDER
-# give its entry as --spec (else Bits(level), Exact from 16).
-./target/release/rewrite witness --horizon 99 --level 16 --room 1,0 [--spec r4sxh]
-# A known solution stepped against a level's tree (which state or filter loses it).
-./target/release/rewrite follow --level-dir D --level SPEC --inputs tas/FILE.txt [--marks M --coarser SPEC]
+# A known solution stepped against a level's tree (which state loses it).
+./target/release/rewrite follow --level-dir D --level SPEC --inputs tas/FILE.txt
 
 # Single-lane concrete execution; the same inputs on a REAL PICO-8, headless.
 ./target/release/concrete_run -i 42,0,0,0,0,16,2,2,2,2 -f 10
@@ -267,16 +272,19 @@ pico8_diff/replay.py --room 7,0 --balloon-seeds 0 tas/room_7_0_exit_frame_84.txt
 ./target/quick/rewrite trajectory --trajectory positions.txt --room 0,0
 
 # Diagnostics (rewrite subcommands, quick profile): cell-growth --by-age,
-# col-census --cell x,y, coarse-census --erase F, cell-saturation, spurious,
-# ancestry, rerun-row, ref-check, diag-project, bench-frame, bench-backward.
-# The reachable constant lattice: ./target/quick/transpile --room-consts
+# col-census [--cell x,y --erase F --every N], coarse-census --erase F,
+# spurious [--chain-out], rerun-row, ref-check, diag-project [--fine-marks
+# --coarse-marks], bench-frame, trajectory.
+# The level -1 table alone, with its fingerprint (cached in /var/tmp/celeste-l1-cache):
+CELESTE_START_ROOM=X,Y ./target/quick/transpile --level-minus-one-table S
 ```
 
 ### The UI (`ui/`)
 
 A phone-first web view of one finished search: the room as a heatmap per
-(horizon, level, pass, frame) with the ladder's bands, set sizes, the timing
-waterfall, and an arc pass. Static: `rewrite export-ui` turns a finished
+(horizon, level, pass, frame), set sizes, the timing waterfall, and an arc
+pass (`search --save-marks`; old ladder runs still export with their
+bands). Static: `rewrite export-ui` turns a finished
 checkpoint tree + its run log into `run.json` + per-level binaries; a Vite
 build plus `ui/serve.mjs` serve it under `/celeste/` on port 3011
 (UI-HOSTING.md; control model and data layout in `ui/README.md` and at the

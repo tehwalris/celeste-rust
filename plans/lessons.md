@@ -122,10 +122,10 @@ Now graphs are dropped after assembly (7.3 -> 1.6 GB a set) and
 field census 2026-08-16). A held trail made unknown admits a ground jump at n
 and a wall jump at n+1; applied at every level, nothing narrowed it, and the
 ladder could report a spurious optimum. Rejected twice; the rule "never widen
-without a narrowing rung" came from it. The working version (`h`) is off at
-the exact level.
+without something exact that refutes it" came from it. The working version
+(`h`) is refuted by the concrete count-up.
 
-**Speed buckets and the bucket dispatch** (2026-09-14..16; BEING REMOVED).
+**Speed buckets and the bucket dispatch** (2026-09-14..16; deleted 2026-10-04).
 Post-hoc census promised 4.5x (room (1,0)) and 19x (room (2,0), the spring's
 `spd.x *= 0.2`). Realized: a lane holding a speed hull enumerates the
 successors of every speed in it - room (1,0) f50 1.11x fewer states, 1.5 rows
@@ -140,7 +140,7 @@ per-bucket kernels behind a mutex, a sound join on undecided selects and
 level 0 only cost about what rem-only cost; every speed refinement above it
 was pure cost.
 
-**The position rung** (`x2`/`y2`, 2026-09-14; BEING REMOVED). Halves a
+**The position rung** (`x2`/`y2`, 2026-09-14; deleted 2026-10-04). Halves a
 frame's states for its own forward, then filters nothing: room (1,0) one
 ladder at h99 9:32 against 2:56. The rule it taught: a coarse level only cuts
 when the horizon is close to its own first win; a level whose backward marks
@@ -199,7 +199,7 @@ exactly. Only precision narrows.
 2026-09-21): `r0s16hb` OOMed in the kernel build past 60 GB; `x2y2r0s16hb`
 was at 54 GB after 14 min. Platforms needed `p`.
 
-**The rem rungs and their drift** (2026-10-02/03; BEING REMOVED). Room (3,3):
+**The rem rungs and their drift** (2026-10-02/03; deleted 2026-10-05). Room (3,3):
 the coarse levels won at f154-f165 against the real 172 and the marks GREW
 2-2.6x per rung; six ladders (objects abstract longer, timers only, held
 exact at rem 6) ran out of memory. The mechanism (`ancestry --chain-out`,
@@ -237,3 +237,26 @@ refuted 171 in 74 s (`c0de454`).
   identical): `4e2d2e9` (`rnd` became a global), 2026-10-02 (`18208c6`'s
   `__phase`/`__frozen` globals). The edge-count "re-pins" `ffe939e`,
   `9921c0d` were scheduling noise in "edges read".
+
+**The precision ladder, the objects ladder and the mark filter** (2026-08-30
+.. 2026-10-05, deleted on `arc-only`). The ladder confirmed a horizon by
+running every level - rem rungs, then exact objects - each a fresh forward
+filtered by the coarser level's marks (`MarkFilter`, with deadlines), and it
+found every room's optimum. It went because both of its axes have exact
+replacements: the remainder by the arcs (no drift: room (3,3), where six
+ladders failed, refuted 171 in 74 s), and the objects by the concrete
+count-up, which turned out to be cheap where it was feared to explode - rooms
+(1,0), (4,2) found the witness AT the arc bound, (5,3) refuted the bound (78)
+in 7.2k concrete steps and found 79 in 99k (plans/results.md, "The arc
+pipeline"). With it went the kernel re-run backward (the BFS's oracle, which
+found every graph bug of 2026-09) and its pinned marks gate.
+
+**The count-up's memo keyed on the level's row key** (`arc-sets`, fixed
+`522de36`). The DFS remembered fully explored concrete states by
+`Block::keys()`, the row key AT THE SEARCH'S LEVEL - remainder widened, held
+buttons unknown at `h` - so two different concrete states shared one entry,
+and a state that could win was skipped as "explored": "no concrete win
+within f" was not a proof. Every count-up refutation before the fix (room
+(5,3) any% 78, nodiag 92-95) had to be rechecked. A cache in front of an
+exact check must be keyed EXACTLY; the widening it inherits is refuted by
+nothing.

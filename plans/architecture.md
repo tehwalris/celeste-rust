@@ -1,4 +1,4 @@
-# Architecture (the current design, 2026-10-04)
+# Architecture (the current design, 2026-10-05)
 
 The load-bearing design: what the search is, the invariants every change must
 keep, and where it is going. Results are in `plans/results.md`, the level
@@ -7,17 +7,18 @@ the cost-to-go filter in `plans/level-minus-one.md`.
 
 ## Status, honestly
 
-The code is ~56k lines of Rust (35k code, 12.6k comments, 8.8k tests). The
-2026-08-30 target was ~10-12k; it was never met, and a cleanup toward ~10k is
-in progress on other branches (deleting the diagnostics, the speed buckets, the
-rem rungs). Every room of the game has a confirmed optimum
-(`plans/results.md`).
+The code is ~44.7k lines of Rust (26.0k code, 9.0k comments, 7.4k tests;
+`arc-only`, 2026-10-05: 47.5k before it deleted the rem ladder, the objects
+ladder and the kernel re-run backward). The 2026-08-30 target was ~10-12k;
+it was never met, and a cleanup toward ~10k is in progress. Every room of the
+game has a confirmed optimum (`plans/results.md`), found by the precision
+ladder this branch deleted.
 
-The direction (Philippe, 2026-10-04): **the rotation graph ("arcs") becomes the
-only treatment of the sub-pixel remainder**, replacing the rem rungs of the
-precision ladder. The remaining ladder is over the objects and the held
-buttons only. See "Arcs" below. Code for the speed buckets, the position rung
-and the rem rungs is described here only as far as it still runs.
+**The search is the arc pipeline** (Philippe's direction, 2026-10-04; built
+2026-10-05): the rotation graph ("arcs") is the only treatment of the
+sub-pixel remainder, and an exhaustive concrete count-up inside its winning
+sets is the only treatment of everything else a level widens. No rem rungs,
+no objects ladder, no mark filter. See "The search" and "Arcs" below.
 
 ## The whole system in one line
 
@@ -51,16 +52,18 @@ checkpoint, marks) and its cell (wave order, sharding, the pos graph, level
 crates/celeste-core      pico8_num, cart_data, collision_cache, ids, builtins   deps: -
 crates/celeste-names     FROZEN name tables (FIELD_NAMES order = canonical      deps: -
                          field order; append only)
-crates/celeste-interp    the interpreter's State model, the abstraction layer   deps: core
-                         (abstraction::Level and its widenings), game_runner
+crates/celeste-interp    the interpreter's State model, abstraction::Level      deps: core
+                         (a level's object flags), game_runner
 crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        deps: core, names
 .  (celeste-rust)        everything else                                         deps: all
-  src/frame.rs           Block, FrameStep, ForwardSink, ForwardState (extend),
-                         Ladder / find_optimum, MarkFilter, the kernel re-run
-                         backward (backward_run, the BFS's oracle)  ~3.9k lines
-  src/search/            checkpoint, door, edges (recorded graph + BFS),
-                         pos_graph, arc_edges / arcs / arc_dp (the rotation
-                         graph), ui_export
+  src/frame.rs           Block, FrameStep, ForwardSink (queues, door, edge
+                         records with transfers), forward_frame,
+                         ForwardState (extend, resume)  ~2.6k lines
+  src/search/            checkpoint, door, edges (recorded graph + BFS +
+                         transfer tables), arc_edges (the transfer decode),
+                         arcs (remainder sets), arc_dp (THE SEARCH: load,
+                         backward, optimum, concrete count-up), pos_graph,
+                         ui_export
   src/trace/             the AST tracer (Lua -> transpile::graph::Graph), the
                          constant-lattice walk (kernel.rs), widen.rs, verify.rs
                          (split pass), error.rs, level_minus_one.rs, refengine
@@ -85,9 +88,10 @@ states at frame boundaries (room (6,1) f0-f45, ckhash-equal). Two fidelity
 fixes made that true: a global assigned nil is REMOVED, as Lua does
 (`__frozen = nil` had left a slot that shifted every heap pointer), and the
 cut keeps a floor's computed `collideable` wherever the player's `is_solid`
-can reach it (`widen::PLAYER_PROBE`); mid-frame rows pass the mark filter
-(`frame::mid_frame_rt2`). With platforms abstract the split still reaches
-slightly FEWER states than unsplit in room (2,1) (unresolved).
+can reach it (`widen::PLAYER_PROBE`). With platforms abstract the split still
+reaches slightly FEWER states than unsplit in room (2,1) (unresolved). The
+search refuses the split frame (its count-up steps whole frames; transfers
+over two steps are unchecked).
 
 ## The tracer and the kernel model (from the 2026-09-27 graph model)
 
@@ -208,9 +212,9 @@ that spans everything (floor `delay`, balloon `timer`, at `n` the spring's
 `delay`/`hide_in`/`hide_for`) is stored and read as the unknown number
 (`AV::UNum`, `widen::forget_countdown_inputs`), never as the interval [MIN,
 MAX]. (`72fdea7` on branch `asm-interval-wrap` was a rejected first version.)
-STILL UNCHECKED: interval `Mul`/`Div` by a positive constant (the rem rung's
-scale) can still wrap - an open item. Which results ran before the fix:
-plans/results.md.
+STILL UNCHECKED: interval `Mul`/`Div` by a positive constant (its known
+source, the rem rungs' scale, is gone) can still wrap - an open item. Which
+results ran before the fix: plans/results.md.
 
 ## The frame: waves (2026-09-13)
 
@@ -232,7 +236,7 @@ One pass per frame, no owners, no budget, one barrier.
    varying cells). Small queues won: 128-256 rows beat 4096 by 1.9x (the pool
    stays cache-resident); the frame's whole transient is ~60-80 MB.
 3. **Flush** (when a queue fills or is evicted, by the worker holding it):
-   ladder filter (`MarkFilter`), sort, `Door::admit` under the shard's lock
+   the level -1 filter, sort, `Door::admit` under the shard's lock
    only, survivors gathered into the worker's piece, the win check, the
    edge records. **A flush is idempotent** - the door is a set - so nothing
    needs to know when a cell is "done"; eviction policy changes only the
@@ -276,88 +280,97 @@ kernel-bound.
    zstd-bincode layers cost the H=89 backward 35 s per iteration to decode.)
 
 The initial state (`RefEngine::initial_state` -> one bucket) and the
-reference oracle are the only places a `State` meets the loop.
-`MarkFilter` widens on the columns (`Rt2::widen_to`); exporting buckets
-through `State` reached 62.8 GB at H=55.
+reference oracle are the only places a `State` meets the loop. A row's
+projection onto a level is on the columns (`Rt2::widen_to`); exporting
+buckets through `State` once reached 62.8 GB at H=55.
 
-## The backward: an explicit graph (2026-09-13)
+## The recorded graph (2026-09-13; transfers 2026-10-05)
 
-The forward records every edge once; the backward is a BFS that re-runs no
-kernel (`search::edges`).
+The forward records every edge once, with what the frame did to the
+remainder; every backward reads the records and re-runs no kernel
+(`search::edges`).
 
 - **Ids.** `frame::pack_id(layer, seq, row)`: the checkpoint file and the
   row in it. The door stores the id with the key, so a re-emission of an old
   state resolves to its id; a resume rebuilds that from the files.
-- **Recording.** A queued row carries `(pred_base, pred_mask)`: a 64-lane
-  predecessor group and the lanes that produced it; re-emissions OR their bit
-  in through the dedup cache, and after the flush the cache holds the door's id
-  so later re-emissions go through a direct-mapped `(target, base) -> mask`
-  merge. Records (20 B, layer-local) go to `edges/raw/f{frame}/`.
-- **Runs.** At each frame's end each layer's records are range-partitioned by
-  target, sorted (a parallel counting sort on the target's dense rank above
-  512k records), merged, and delta-varint encoded in 256-pair blocks with an
-  index: `<level>/edges/l{layer}/f{frame}.bin` (~5 B/pair). The compaction runs
-  BEHIND the next frame's wave; `edges/done.txt` names the last complete
-  frame, and a resume trusts frames up to it and discards the rest (at most
-  one).
+- **Recording.** A queued row carries `(pred_base, pred_xfer, pred_mask)`: a
+  64-lane predecessor group, the TRANSFER of those lanes (the worker's
+  interned id of the (x, y) pair the kernel decoded, `ForwardSink::xfer_id`)
+  and the lanes; a re-emission ORs its bit in only under an equal transfer,
+  else it is an extra entry; after the flush the cache holds the door's id
+  so later re-emissions go through a direct-mapped `(target, base, transfer)
+  -> mask` merge. Records (24 B, layer-local) go to `edges/raw/f{frame}/`,
+  each worker's transfer table beside them.
+- **Runs.** At each frame's end the workers' tables merge into the frame's
+  (`edges/xfer/f{frame}.bin`, sorted by value: a function of the frame, not
+  the scheduling), and each layer's records are range-partitioned by target,
+  sorted (a parallel counting sort on the target's dense rank above 512k
+  records) by (target, base, transfer), merged, and delta-varint encoded in
+  256-record blocks with an index: `<level>/edges/l{layer}/f{frame}.bin` (run
+  v4). The compaction runs BEHIND the next frame's wave; `edges/done.txt`
+  names the last complete frame, and a resume trusts frames up to it and
+  discards the rest (at most one). Room (1,0) f0-f44: 408 MB of runs against
+  216 MB without transfers and 2.8 GB for the separate arc-record stream it
+  replaced (`d7c373a`).
 - **The BFS** (`edges::bfs`). Seeds: the win rows of EVERY layer <= H (a win
   reached at H is filed under the layer that first reached the state). For
   i = H-1 down to 1, each newly marked state's runs f = layer..=i+1 are looked
   up; lookups parallel, inserts sequential in frontier order (the marks are a
   function of the graph). Iteration i marks exactly the states that win by H
-  from frame i but not i+1: i is the state's DEADLINE, kept with the mark.
-- **The oracle.** The kernel re-run walk (`frame::backward_run`,
-  `CELESTE_BACKWARD=kernel`) stays. `rewrite bench-backward --level-dir D
-  --horizon H --diff` prints the two walks' symmetric difference (must be
-  empty) and, per disputed state, its recorded edges against its real
-  successors (`CELESTE_DIFF_RERUN=1` re-runs the frame with the tree's door).
-  It found every graph bug so far (a lookup across an index block, a queue
-  index overflowing the row ref's 8 bits, empty pieces renumbered). Run it on
-  a real room's tree after any change to the recording.
+  from frame i but not i+1 - with SOME remainder: i is the state's DEADLINE.
+- **Checks.** `rewrite arc-check` (every record has a transfer; sampled
+  transfers probed with the reference engine inside and outside their
+  guards). The kernel re-run backward that was the BFS's oracle
+  (`bench-backward --diff`, which found every graph bug of 2026-09) is gone
+  with the ladder (2026-10-05); the arc gate pins the BFS's marks.
 
-Room (0,0) end to end: 2 h 32 min on the kernel walk -> 23:50 on the graph,
-every ladder fingerprint identical.
+## The search (2026-10-05, branch `arc-only`)
 
-## The outer loop
+`rewrite search --to H | --ceiling H [--level SPEC]`:
 
-1. **Level 0 persists across horizons** and is EXTENDED one frame per step
-   (`ForwardState`): frontier, door, pos graph and first win carry over. It is
-   dropped from memory while the finer levels run (`Ladder::drop_level0`,
-   ~10 GB idle in room (3,0)) and resumed from disk.
-2. **Every level runs TO the horizon** and the backward seeds from the wins at
-   every frame <= it (the forward used to stop at the first win, so no horizon
-   past it could confirm). Won rows are not expanded.
-3. **Finer levels are filtered** by the coarser level's marks (`MarkFilter`:
-   project the fine row onto the coarser level with `Rt2::widen_to`, look up
-   its key) **with a deadline**: a fine state at frame t is admitted only onto
-   a coarse state whose deadline is >= t. Sound (a fine state that wins from t
-   widens to a coarse state that does), prunes only states with no winning
-   descendant, and turned room (3,0)'s level 1 from an OOM into a 15.7M peak.
-   Marks loaded without deadlines (`u16::MAX`) fall back to membership.
-4. **The ladder at horizon H**: levels coarsest first; a level with no win by H
-   REFUTES H (sound: every level over-approximates). If the exact last level
-   wins at H, H is confirmed. A level's first win is a lower bound on the
-   optimum. A second forward/backward round at the SAME level reproduces its
-   marks exactly (they are closed under predecessors): only precision narrows.
-5. **Horizons.** Without a reference, count up from level 0's first win (each
-   horizon a ladder). With one (`--ceiling C`, the replayed community TAS),
-   count DOWN: C must confirm (a refutation there is an error: the model
-   cannot reproduce a known solution), then C-1 is tested until refuted - two
-   ladders when the ceiling is optimal. Every room since room (2,0) ran this
-   way.
-6. **Resume.** A search resumes from its checkpoint directory: level 0's
-   frames reload as the forward (frontier minus won rows, `Door::from_shards`
-   over every layer, the pos graph, saved per frame since `78fbb60` with a
-   `posgraph.frame` marker), horizons with `hNNN/outcome.txt` are skipped, the
-   finer levels of the horizon in progress recompute. A fresh forward clears
-   its level's `frames/` and `edges/` (a killed run's stale edge runs were read
-   against new rows once). Nothing on disk records a level's spec: reusing a
-   tree under a changed ladder is on you.
-7. **Kernel sets** are keyed by the full level; `CELESTE_KERNEL_SETS=N` keeps
-   at most N built sets (LRU, rebuilt on demand, ~35-75 s): needed where sets
-   are big (`t` sets ~13 GB each). Fused graphs are dropped after assembly
-   unless `CELESTE_ASM_EVAL_CHECK` / `CELESTE_KERNEL_EXPLAIN` (7.3 -> 1.6 GB a
-   set).
+1. **[Level -1]** (`CELESTE_LEVEL_MINUS_ONE="H,S"`, plans/level-minus-one.md):
+   cells that provably cannot exit by H are dropped at the flush.
+2. **The forward** at the level (`--level`, default `r0sx`; `r0sxhn` for an
+   object room), to H, into `<dir>/level00` (`ForwardState`: resumed from
+   its checkpoints, or used as it is when it already reaches H). Won rows are
+   checkpointed (backward seeds) and not expanded.
+3. **The arc phase** (`arc_dp::solve`): the remainder-free BFS marks the
+   nodes that can win by H at all, with their deadlines; only the edges into
+   them, from them, are loaded (`preds_at`, the BFS's lookup), each with an
+   index into the merged transfer table (8 B an edge); `arc_dp::backward`
+   computes the winning sets `W_t`; `arc_dp::optimum` reads the optimum off
+   them. That optimum is exact in the remainder and over-approximates the
+   level's other widenings (and `rnd`): a LOWER BOUND, and no win REFUTES H.
+4. **The concrete count-up** (`arc_dp::concrete_count_up`): from the bound,
+   for f = bound, bound + 1, ... <= H, an exhaustive DFS over concrete states
+   (the reference engine's concrete step, every input, every `rnd` leaf) from
+   the room's start, admitting a successor only if its projection onto the
+   level is a node whose `W_{H-f+k}` holds its exact remainder, with a
+   per-frame memo of fully explored EXACT states. W holds every concrete
+   winner, so "no win within f" is a proof about the game; the first f with a
+   win is the CONCRETE optimum and its path the witness
+   (`<dir>/witness_frame_F.txt`). With `--ceiling` a refutation or no witness
+   is an error (a known solution the model cannot reproduce).
+
+Resume: rerun the same command; the forward resumes or is reused, the arc
+phase reruns (minutes). A fresh forward clears `frames/` and `edges/`.
+Nothing on disk records the level: reusing a tree under another `--level` is
+on you. Kernel sets are keyed by the level's four flags;
+`CELESTE_KERNEL_SETS=N` caps the resident ones (LRU) for tools that run two
+levels. Fused graphs are dropped after assembly unless
+`CELESTE_ASM_EVAL_CHECK` / `CELESTE_KERNEL_EXPLAIN`.
+
+Validation (plans/results.md, "The arc pipeline"): rooms (1,0) 99, (4,2) 71,
+(5,3) 79, (7,0) 84 and (3,3) 172 reproduce their known optima, each witness
+replayed on a real PICO-8. The count-up has not been the cost: at most one
+frame past the bound, ~100k concrete steps.
+
+**What deleted (2026-10-05).** The rem rungs (`RemPrecision`, the bucket
+widening and fork grid, the rem-keyed kernel sets), the precision ladder
+(`Ladder`, `find_optimum*`, `CELESTE_LADDER`, `--maxk`), the objects ladder's
+`MarkFilter`, the kernel re-run backward (`backward_run`,
+`CELESTE_BACKWARD=kernel`, `bench-backward`), `rewrite witness`, `arc-search`.
+Why: plans/lessons.md "The rem ladder".
 
 Win conditions: the room exit (`game_runner::win_room()`, including the wrap
 from a row's last room to (0, y+1)); the summit's flag rect
@@ -366,16 +379,14 @@ from a row's last room to (0, y+1)); the summit's flag rect
 `CELESTE_WIN_RECT` / `--win-at` for experiments. Rooms past (5,2) start with
 `max_djump = 2` (`26a0e54`).
 
-### The ladder is a list of levels
+### A level is a set of object flags
 
-A level is `abstraction::Level { pos, rem, spd, held, fruit, floors,
-platforms }`. `CELESTE_LADDER="r0sxhn,r1sxhn,...,rxsx"` gives an explicit
-list, each level coarser-or-equal to the next in every coordinate and the
-last exact in all. Without it the ladder is rem `Bits(0..=15)` then exact,
-everything else exact. The flags, what each widens and its status:
-`plans/abstractions.md`. The recipe for object rooms: `plans/results.md`.
+`abstraction::Level { held, fruit, floors, platforms }`, spec
+`r0sx[h][f][n][p]` (the remainder's rung 0 and the exact speed are in every
+spec; `r1sx`/`rxsx` are refused). The flags, what each widens and its
+status: `plans/abstractions.md`.
 
-## Arcs: the rotation graph (2026-10-04, branch `arc-sets`)
+## Arcs: the rotation graph (2026-10-04; the only remainder treatment since 2026-10-05)
 
 Stop refining the sub-pixel remainder rung by rung; track it exactly.
 
@@ -410,22 +421,15 @@ unions, so the union over all paths is pushed exactly (`search::arcs`).
    n at frame t wins by the horizon. `W_t(n) = U_e guard_e ∩
    action_e^-1(W_{t+1}(dst_e))`, a win edge contributing its guard.
 3. **Forward, exact, inside W** from the start's remainder (a point): the
-   first win is the optimum at the node graph's precision; the path is the
-   witness.
-4. **The remaining ladder is over everything but the remainder**: objects
-   (`n` -> exact) and held buttons (`h` -> exact), each rung a remainder-free
-   forward filtered by the previous rung's nodes. No rem rungs, no drift.
+   first win is the optimum at the node graph's precision (the bound); the
+   concrete count-up (above) makes it the game's.
 
 **Built.**
 
-- `CELESTE_ARC_EDGES=1` on any forward records `search::arc_edges` (50 B per
-  record beside the edge runs). `rewrite arc-check` checks it: every edge has
-  its record and back, and sampled transfers are probed with the reference
-  engine inside and outside the guards (room (1,0) gate; room (3,3) with exact
-  objects f1-f80: 207M records, 34k probes, 0 disagreements).
-- `rewrite arc-search --level-dir D --horizon H --marked-only [--witness]`:
-  the level's remainder-free BFS gives the nodes that can win at all and their
-  deadlines; only edges between them are loaded (parallel, streamed, dense).
+- The transfers are always recorded at every level (they used to be a
+  separate 50 B-per-edge stream behind `CELESTE_ARC_EDGES=1`; since
+  `d7c373a` they are part of the edge record). A body without transfer roots
+  is refused at the kernel build.
 - `search::arcs::Region`: a set of the torus in CANONICAL form (y slabs with
   x segments): equal sets are equal values. `pull` is the preimage under an
   edge.
@@ -434,8 +438,9 @@ unions, so the union over all paths is pushed exactly (`search::arcs`).
   whose deadline starts). `arc_dp::optimum`: ONE backward gives the optimum -
   the graph is the same at every frame but for the layers, which never bind
   on a walk from the start - so `point ∈ W_t(start)` means "a win within
-  H - t". The witness is a greedy walk inside W. Property-tested against
-  per-horizon backwards.
+  H - t". Property-tested against per-horizon backwards.
+
+Measured on `arc-sets` (the separate record stream, before `d7c373a`):
 
 | case (room (3,3), quick, `r0sxhn`) | edges | load | backward | total | peak |
 |---|---|---|---|---|---|
@@ -452,7 +457,8 @@ The synthetic case answers f69, as the full object ladder does. Room (3,3):
 ladder: 99 optimal, 98 refuted at Bits(6)). Level-0 forward `r0sx` to f99
 with `CELESTE_ARC_EDGES=1` (quick): 6:58 wall, peak RSS 10.4 GB, first
 remainder-free win f89; 289 GB on disk, 240 GB of it `edges/arc/`.
-`arc-search --marked-only --witness`:
+`arc-search --marked-only --witness` (the old separate stream; `search`
+does this now):
 
 | horizon | answer | edges / nodes loaded | load (records) | backward | wall | peak |
 |---|---|---|---|---|---|---|
@@ -470,12 +476,11 @@ outside the guards): 0 disagreements, every edge with its record and back;
 frame's record count: 13 GB at f58, 30 GB at f67; later frames have up to
 2x more).
 
-**Direction and open.** Make arcs the only remainder treatment. Costs to
-attack first: the arc records (50 B per edge, written before the marks know
-which edges matter: 139 GB and a 37 s read for room (3,3)), the marks BFS and
-graph build, and the object/held ladder on top of exact remainders. Open: W's
-fragmentation (the number that decides the cost), time-indexing W only where
-it changes, moving platforms (two player moves in a frame).
+**Open.** W's fragmentation (the number that decides the backward's cost;
+small so far: median 1-6 rectangles per node), time-indexing W only where it
+changes, moving platforms (two player moves in a frame are refused at the
+capture: the platform rooms (6,0), (2,1), (1,2) cannot run the search yet),
+the split frame (refused by the search).
 
 ## Gates
 
@@ -483,29 +488,34 @@ Every change to the loop, the kernels or the tracer must reproduce the
 three pinned room (1,0) oracles (commands and comparison in CLAUDE.md):
 `gates/ckhash_room10_f000-044.txt` (frontier sets f0-f44),
 `gates/posgraph_room10_f044.txt` (pos-graph edges), and
-`gates/marks_room10_win9-101_h29-33.txt` (the backward's marked sets per
-horizon and level, ending `OPTIMAL win frame: 33`). Plus the quick suite,
-`kernel lanes: missed 0`, and for the recording `bench-backward --diff`, for
-arcs `arc-check`. A kernels-against-interpreter check: `rewrite ref-check`
-(row by row; note ckhash equality with the reference engine is a test only at
-an exact level - at Bits(0) the kernels over-approximate where the reference
-splits the interval).
+`gates/arc_room10_win9-101_h35.txt` (the search at a synthetic win at h35:
+the remainder-free marks, W's fingerprint at every frame, the arc optimum 33
+and the concrete witness; it replaced the ladder's marks gate on
+2026-10-05). Plus the quick suite, `kernel lanes: missed 0`, and for the
+recording `arc-check`. A kernels-against-interpreter check: `rewrite
+ref-check` (row by row; the kernels over-approximate where the reference
+splits an interval, so ckhash equality with the reference engine is no
+test).
 
 ## Deferred follow-ups
 
 1. **One file per (shape, cell), dispatch key inside** (Philippe,
    2026-09-15): blocks per dispatch key with a key -> range index; count files
    and keys per frame on a real tree first (the per-shape layout exists because
-   of the inode blow-up). Mostly moot if the speed buckets go.
-2. **The in-kernel coarser key**: the rung-k kernel emits the row's key widened
-   to the coarser level, so `MarkFilter` is one lookup per row instead of a
-   clone + widen + rekey (was ~30% of a level-1 frame).
+   of the inode blow-up).
+2. **The transfer capture costs the forward** ~25-45% CPU (room (1,0)
+   f0-f44, `d7c373a`); the kernels compute five roots per axis per body
+   where the transfer depends only on the fork configuration and `ox`.
 3. **Overflow in interval `Mul`/`Div` by a constant** is unchecked (it can
    wrap silently, as Add/Sub did before `b47b118`): give it a `NoWrap`-style
-   own error.
+   own error - or refuse it: its one known source was the rem rungs' bucket
+   snap, gone.
 4. **A batch-invariance test** (`a_lanes_key_does_not_depend_on_its_
-   neighbours` went with the old sweep) and a new-path widening-soundness
-   check (`diag-project` checks one projection; `ref-check` the kernels).
+   neighbours` went with the old sweep) and a widening-soundness check
+   (`diag-project` checks one projection; `ref-check` the kernels).
+5. **The UI export** still reads the deleted ladder's run layout
+   (`hNNN/levelNN`, `[ladder]` log lines) for old runs; the search's own runs
+   export as `--forward-only --arc`.
 
 ## Where the old plans went (2026-10-04)
 

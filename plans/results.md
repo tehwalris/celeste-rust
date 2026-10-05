@@ -94,47 +94,49 @@ with the reference engine (`rewrite witness`), replayed on a real PICO-8
 - The room (3,3) second-half experiment (from TAS28's state after 113 inputs)
   found 59 optimal from there, under `n`.
 
-## How to run an object room
-
-The ladder to start a room with objects (springs, fall floors, balloons, key
-and chest), established on rooms (7,0) and (0,1):
+## How to run a room (the arc search, 2026-10-05)
 
 ```
-CELESTE_LADDER="r0sxhn,r1sxhn,r2sxhn,r3sxhn,r4sxhn,r4sxh,r5sxh,...,r15sxh,rxsx" \
 CELESTE_LEVEL_MINUS_ONE="C,5" \
-  ./safe-run.sh -- ./target/release/rewrite search --room X,Y --ceiling C
+  ./safe-run.sh -- ./target/release/rewrite search --room X,Y --level r0sxhn \
+  --ceiling C --checkpoint-dir DIR [--save-marks UIDIR]
 ```
 
-- Every object abstract at level 0 (`n`), and kept abstract a few rem rungs
-  (the switch to exact objects then happens on narrow marks); balloons stop
-  paying past ~rem 3. Fly fruit rooms: `f` instead of `n` for rungs 0-4.
-  Platform rooms: `p` at level 0 at least, longer if the first exact-platform
-  level's marks explode. No object at all: `r0sxh..r15sxh,rxsx`.
-- The level -1 filter (plans/level-minus-one.md) with H = the ceiling, where
-  its table builds.
-- Big kernel sets: `CELESTE_KERNEL_SETS=1` (or 2) caps the prebuilt sets;
-  `CELESTE_SPLIT_FRAME=1` for floor-heavy or platform rooms whose kernels
-  pass ~100k bodies (horizons and ceilings are then in steps, 2 per frame).
+- The level: `r0sx` for a room without objects, `r0sxhn` with springs, fall
+  floors, balloons, key and chest (everything abstract but where the player
+  overlaps a floor; held buttons unknown); `f` for the fly fruit. The concrete
+  count-up refutes what the level invents. Platform rooms cannot run yet (the
+  arcs refuse a frame where the player moves twice); the split frame is
+  refused.
+- The level -1 filter (plans/level-minus-one.md) with H = the ceiling (or
+  `--to`), where its table builds; the table is cached on disk
+  (`/var/tmp/celeste-l1-cache`).
+- `--ceiling C` is a known solution (the replayed community TAS): a
+  refutation, or no concrete witness by C, is an error, never a result.
+  Without a reference, `--to H` with H generous: the forward is the cost, and
+  the count-up stops at the first concrete win.
+- The witness lands in `DIR/witness_frame_F.txt`. **Balloon rooms**: replay it
+  with the TAS's seeds (`pico8_diff/replay.py --balloon-seeds a,b`, the
+  tasdatabase header) and with 0 / 0.5 / PICO-8's own rnd - the count-up
+  takes every `rnd` leaf, so a witness may exit for some draws only.
 - **When a level grows, look at the states before reasoning about counts**:
   `rewrite cell-growth --by-age`, `col-census --cell x,y` (what varies at one
   position), `coarse-census --erase FIELD` (the merge ceiling of a widening),
-  `cell-saturation`, `spurious --real T --coarse C` (a coarse level's states a
-  finer tree never reaches, traced to the first spurious step), `ancestry`,
-  `rerun-row` (one stored row through a level's kernels), `ref-check`
-  (kernels against the reference engine, row by row), `follow` (a known
-  concrete solution stepped against a level's tree). That chain found the
-  floor-collision join bug (99.8% of room (7,0)'s fully-unknown states at one
-  cell were impossible) and room (1,3)'s keying bug.
-- A ceiling REFUTED at a coarse level ("a known concrete solution the model
-  cannot reproduce") is a bug, never a result.
-- **Balloon rooms**: replay the witness with the TAS's seeds
-  (`pico8_diff/replay.py --balloon-seeds a,b`, the tasdatabase header) and
-  with 0 / 0.5 / PICO-8's own rnd.
+  `spurious --real T --coarse C` (a coarse tree's states a finer tree never
+  reaches, traced to the first spurious step; `--chain-out`), `rerun-row`
+  (one stored row through a level's kernels), `ref-check` (kernels against
+  the reference engine, row by row), `follow` (a known concrete solution
+  stepped against a level's tree). That chain found the floor-collision join
+  bug (99.8% of room (7,0)'s fully-unknown states at one cell were
+  impossible) and room (1,3)'s keying bug.
 - Finding the reference: scan prologue offsets (the first frame the player
   exists is the convention; it ranged 23-37), replay in the original cart
   (`replay.py --lua ~/src/github.com/tehwalris/celeste_ocaml/celeste.lua
   --begin-game`), then `rewrite trajectory` to fit it to celeste-minimal (the
   minimal cart has no jump buffer, so raw inputs often do not transfer).
+- Before 2026-10-05 a room ran a precision LADDER (`CELESTE_LADDER="r0sxhn,
+  r1sxhn,...,r4sxhn,r4sxh,...,r15sxh,rxsx"`): every result in the table
+  above but (3,3)'s came from one; the recipes are in its "proven how" column.
 
 ## Runtime and memory worth keeping
 

@@ -1,18 +1,23 @@
-# The level flags: what each widens, why it is sound, what narrows it
+# The level flags: what each widens, why it is sound, what refutes it
 
-A level is `abstraction::Level { pos, rem, spd, held, fruit, floors,
-platforms }`, written `[x2][y2]r<k|x>s<w|x>[h][f][b|n|t][p]`
-(`Level::parse`): `r0sxhn` = rem rung 0, exact speed, held buttons unknown,
-fall floors (and every object's phase) widened except where the player
-overlaps. A ladder (`CELESTE_LADDER`) lists levels coarsest first, each
-coarser-or-equal to the next in every coordinate, the last exact in all.
+A level is `abstraction::Level { held, fruit, floors, platforms }`, written
+`r0sx[h][f][n][p]` (`Level::parse`): `r0sxhn` = held buttons unknown, fall
+floors (and every object's phase) widened except where the player overlaps.
+The `r0sx` prefix says what every level shares: the remainder widened at the
+boundary and tracked exactly by the arcs, the speed exact. One search runs
+ONE level (`rewrite search --level`, plans/architecture.md "The search");
+the precision ladder that ran several (rem rungs, then exact objects,
+`CELESTE_LADDER`) was deleted on 2026-10-05.
 
 ## The rules every flag obeys
 
-- **Never widen a field without a rung that narrows it back** (CLAUDE.md).
-  Every flag below is off at the exact level. The exceptions are listed under
-  "Widened at every level" and are either exact (lose nothing) or a stated
-  best-case caveat.
+- **Never widen a field without something exact that refutes it**
+  (CLAUDE.md). The flags below are refuted by the concrete count-up: it runs
+  the real game (the reference engine's concrete step, every input, every
+  `rnd` leaf) and prunes by nothing but the arcs' exact winning sets, so a
+  win the widening invented has no concrete path and the count-up moves past
+  it. The exceptions are listed under "Widened at every level" and are either
+  exact (lose nothing) or a stated best-case caveat.
 - **A widening only replaces a value by something visibly containing it**: a
   range that holds it, or unknown. Never by another value (`step := 0.5`
   because nobody reads it is out, however true).
@@ -22,11 +27,13 @@ coarser-or-equal to the next in every coordinate, the last exact in all.
 - **An uncollected object is one row**, its fields intervals - not several
   rows because `move`'s `__split_by_flr` forks it.
 - **Projection must agree**: the tracer's in-graph widening (`trace::widen`)
-  and the block model's (`Rt2::widen_to`, which `MarkFilter` uses to key a
-  fine row on the coarser level) must produce the same row, or the next rung
-  drops everything. Check with a synthetic win and a small ladder.
-- **The reference engine refuses every flag but rem/pos/spd** (`h`, `f`,
-  `b`/`n`/`t`, `p`): witnesses run at exact levels.
+  and the block model's (`Rt2::widen_to`, which projects a CONCRETE state
+  onto the level for the count-up's node lookup) must produce the same row,
+  or the count-up misses the node and prunes a real path - a wrong "no win
+  within f". `rewrite follow` (a known solution against a tree) checks it.
+- **The reference engine as a frame step refuses `f` and `p`** (no reference
+  form for their ranges and worlds; `h` and `n` it forks per path). The
+  count-up's concrete steps are exact whatever the level.
 
 ## Decided: fork AFTER the frame, never eagerly (Philippe, 2026-09-21)
 
@@ -41,70 +48,51 @@ undecided select SURVIVES folding - first `verify::fork_known_premises`, now
 kernel model"). Room (5,0) level 0 kept counts were identical to the
 point-split run at every frame.
 
-## rem: the sub-pixel remainder (rungs `r0`..`r15`, `rx`) - BEING REMOVED (arcs)
+## The remainder: arcs, at every level
 
-- **Widens**: the player's `rem.x`/`rem.y` to a bucket of width 2^-k
-  (`RemPrecision::Bits(k)`); rung 0 is the whole [-0.5, 0.5).
-- **Mechanism**: the single-grid fork (`740e093`, `Graph::fork_bits`): at
-  rung k the integers are bucket edges, so `move` cuts `rem + spd + 0.5` once
-  at the bucket grid and each piece's floor is single; the boundary only
-  snaps. Rung 1's bodies 2,451 -> 723, the level-1 frame 2.2 s -> 0.19 s.
-- **Narrowed by**: the next rung; exact at `rx`.
-- **Status**: every result in plans/results.md rests on it - and it DRIFTS.
-  A move that straddles a bucket edge emits a sliver row the boundary widens
-  to the whole bucket; no concrete state is in it, and the abstract player
-  gains up to a bucket width per frame per axis (~1.9 px over 120 airborne
-  frames at rem 6). In long rooms the marks grow 2-2.6x per rung instead of
-  shrinking (room (3,3): six ladders out of memory). The rotation graph
-  (plans/architecture.md "Arcs") tracks the remainder exactly and replaces
-  the rungs.
+- **Widens**: the player's `rem.x`/`rem.y` to the whole [-0.5, 0.5) at the
+  boundary (`widen::widen_rem`), with its containment the widening's own
+  error.
+- **Refuted by**: nothing needs to: the transfer of every recorded edge
+  (`search::arc_edges`, plans/architecture.md "Arcs") says EXACTLY what the
+  frame did to it, and the backward over them is exact in the remainder.
+- **History**: until 2026-10-05 the remainder was refined by rungs
+  (`RemPrecision::Bits(1..=15)`, then exact), which DRIFTED: a move that
+  straddles a bucket edge emits a sliver row the boundary widens to the whole
+  bucket, the abstract player gaining up to a bucket a frame per axis, and in
+  long rooms the marks grew 2-2.6x per rung (room (3,3): six ladders out of
+  memory). Every result in plans/results.md before 2026-10-04 rests on the
+  rungs; the arcs reproduce them (plans/results.md, "The arc pipeline").
 
-## pos: 2 px position buckets (`x2`, `y2`) - unused, BEING REMOVED
+## Deleted: position buckets (`x2`, `y2`), speed buckets (`s16`, ...), floors unknown (`b`), timers only (`t`)
 
-- **Widens**: the player's whole-pixel `x`/`y` to a 2 px bucket, one rung
-  below level 0. The frame never runs an interval position:
-  `widen::fork_pos_inputs` forks the bucket into its pixels (`IntFrag`, an
-  exact number per configuration), collisions are exact, and the output
-  snaps back. Needs rem `Bits(0)` (`grid_consistent`); widths above 2 refused.
-- **Measured**: post-hoc 2 px halves a frame's states (y alone 1.6x, x 1.3x).
-  Realized on room (1,0): one ladder at h99 9:32 against 2:56 - the rung
-  first wins at f74, so at h99 it marks 56% of what it visits and filters
-  nothing. A coarse level only cuts near its OWN first win. Off by default.
-
-## spd: speed buckets (`s16`, `s20x`, ...) - a loss everywhere, BEING REMOVED
-
-- **Widens**: the player's `spd.x`/`spd.y` to buckets of a table (the cart's
-  thresholds plus a grid, `celeste_core::spd_buckets`), dispatched per
-  bucket key (`trace::kernel::SpeedKey`, the key fixpoint) so no comparison
-  on the speed is undecided; `move`'s fork gets arity 3 where a spring
-  rewrites the speed first. `CELESTE_SPD_LADDER` presets: `exact` (default),
-  `bucket`, `level0`.
-- **Measured**: room (1,0) f50: the realized merge 1.11x against a post-hoc
-  ceiling of 1.8x, 1.5 rows per state from hull growth, 9x the raw rows, a
-  frame 30-36x slower. The bucket ladder on room (1,0): 24 min to h88 against
-  4:51 for the whole exact search. Room (2,0) (spring: 3,200 `spd.x` values,
-  19x post-hoc) did not build; room (7,0) `r0s16h` 9,821 kernels, 36 GB, more
-  states than exact; room (0,2) `r0s16hn` OOMed building. The level -1 filter
-  is what handled the spring rooms instead.
+All four are gone from the code (2026-10-04/05; git history). The position
+rung cut a frame's states in half post hoc but marked 56% of what it
+visited at h99 and filtered nothing. The speed buckets were a loss
+everywhere (room (1,0) f50: a realized merge of 1.11x against a post-hoc
+1.8x, frames 30-36x slower; the spring rooms were handled by level -1
+instead). `b` let the player fall through any floor from frame 1 (room (7,0)
+step 80: 2.0M states against 143k exact; superseded by `n`). `t` did not
+build after the interval-wrap fix (`b47b118`: room (3,3) `r4sxht` out of
+memory in the kernel walk). plans/lessons.md has the measurements.
 
 ## h: held buttons unknown (`HeldPrecision`) - CURRENT, every object room
 
 - **Widens**: the player's `p_jump`/`p_dash` (the previous frame's buttons,
-  used only to detect a press) to unknown at every non-exact level. Output: the
+  used only to detect a press) to unknown. Output: the
   uniform `AV::UBool` through the widen list (out of the per-lane key). Input:
   `widen::fork_held_inputs`, one 2-way `SplitInt` fork per trail over the
   literal [0, 1], no validity (every block writes them unknown).
 - **Soundness**: a held button may retrigger (a ground jump then a wall jump
-  on consecutive frames); over-approximation, refuted by the exact level. The
-  same widening applied at EVERY level was rejected twice (2026-08-06,
-  2026-08-16): nothing narrowed it.
+  on consecutive frames); over-approximation, refuted by the concrete
+  count-up. The same widening with nothing exact behind it was rejected twice
+  (2026-08-06, 2026-08-16).
 - **Measured**: room (1,0) level 0 3.8x fewer states at f70, first win
   unchanged (f89), OPTIMAL 99 in 1:38. Room (2,0) f68: 50.7M -> 13.3M states,
   81 s -> 16 s a frame, 28.7 -> 8.7 GB. A constant factor, not a slower curve.
-- **Later**: dominance at the exact rung (drop a held twin whose released twin
-  is visited).
+- **Later**: dominance (drop a held twin whose released twin is visited).
 
-## f: the fly fruit unknown (`FruitPrecision`) - CURRENT for fruit rooms, low rungs only
+## f: the fly fruit unknown (`FruitPrecision`) - CURRENT for fruit rooms
 
 - **Widens**: the fly fruit's `step`, `y` to the unknown number
   (`Op::UnknownNum`: stays unknown under every operation, never raises - a
@@ -123,24 +111,11 @@ point-split run at every frame.
   fragment as its own trace state and rejoins at the call's return
   (`Interp::rejoin_fragments`), cut on the integers (`5a98e20`).
 - **Measured**: room (3,0) level 0 3.6x fewer at f50, kernels 25k -> 90k
-  bodies. Above level 0 it merges nothing (the undecided `collide(player)`
-  forks collected / not) and fanned out in room (6,0) (331 trace states, cap
-  256), so ladders keep it to rungs 0-4 (`r0sxhf .. r4sxhf, r4sxh ..`).
-  Collected-or-not after it flew away stays two shapes by design (a collect
-  refills the dash).
-
-## b: fall floors fully unknown (`FloorsPrecision::Unknown`) - SUPERSEDED by `n`
-
-- **Widens**: every fall floor's `state`/`delay` to the unknown number,
-  `collideable` an unknown boolean, every frame, touched or not. An atom made
-  inside a call that escapes it becomes one fork of both values at the
-  return (`Domain::escaped_atom`), so the player (which updates after the
-  floors) reads forks and its collisions are decided per configuration.
-- **Why it lost**: "maybe absent" from frame 1 lets the player fall through any
-  floor; room (7,0) step 80 2.0M states against 143k exact. Its fixes were
-  worth keeping: a merge counts only the selects it made; `(g and c) or (g and
-  not c)` folds to `g`; worker stacks 512 MB with a per-call frame-fits check.
-- Room (3,0)'s 89 used `b` (`r1sxhb .. r15sxhb`); it is otherwise unused.
+  bodies. On the old finer rem rungs it merged nothing (the undecided
+  `collide(player)` forks collected / not) and fanned out in room (6,0) (331
+  trace states, cap 256). Collected-or-not after it flew away stays two
+  shapes by design (a collect refills the dash). Not yet run through the arc
+  search.
 
 ## n: everything abstract except where the player overlaps (`FloorsPrecision::Near`) - CURRENT, the object default
 
@@ -168,28 +143,13 @@ point-split run at every frame.
   near a floor read "maybe") `n` level 0 reached step 168 at 15.4M states max,
   22.7 GB. Room (0,1) level 0 at f100: 14.8M states / 14 GB, against 40.0M /
   30 GB with the balloon's `spr` exact.
-- **How long to keep it**: one rem rung past level 0 at least (room (0,1):
-  the first exact-objects level peaked at 88k states a frame after `r1sxhn`,
-  26.5M straight after level 0); through rem 4 is the usual recipe; balloons
-  stop paying past ~rem 3 (room (4,1): marks 2.9M -> 121M from rem 3 to 8 on a
-  spurious 91 the first exact-balloon level refuted at once).
+- **On the ladder** (before 2026-10-05) it was kept through a few rem rungs
+  (room (0,1): the first exact-objects level peaked at 88k states a frame
+  after `r1sxhn`, 26.5M straight after level 0). With the arcs it is the
+  level-0 option of every object room, refuted by the count-up: room (5,3)
+  had its bound at 78 and the count-up refuted 78 in 7.2k concrete steps.
 
-## t: only the countdowns widened (`FloorsPrecision::Timers`) - unused, does not build
-
-- **Widens**: each floor's `delay` and the balloon's `timer` to the unknown
-  number (since `b47b118`; the whole 16.16 interval before);
-  `state`/`collideable` exact. The cart only compares the
-  countdowns with 0 and decrements them, so the whole range is as precise as
-  any tighter one.
-- **Why unused**: until `549ecf5` the ASM interval subtraction wrapped the
-  low end of the full range (`delay - 1` -> [32767.99, 32766.99]), so
-  `delay <= 0` came out "no": shaking floors never fell, and every `t` level
-  of room (3,3) was unsound. A `t` set is ~16x an `n` set (1.35M bodies,
-  ~13 GB; `CELESTE_KERNEL_SETS=1` required). Since `b47b118` (countdowns as
-  the unknown number) room (3,3) `r4sxht` runs out of memory (60 GB) in the
-  kernel walk/build; not fixed.
-
-## p: moving platforms unknown (`PlatformsPrecision`) - CURRENT for platform rooms, low rungs only
+## p: moving platforms unknown (`PlatformsPrecision`) - kept, but its rooms cannot run the search yet
 
 - **Widens**: every platform's `x` and `last` to the whole path [-16, 128],
   `rem.x` the literal [-0.5, 0.5). `last == x` holds at every frame boundary
@@ -208,7 +168,9 @@ point-split run at every frame.
 - **Measured**: room (6,0) `r0sxhfp` split frame: level 0 to step 150, 1.68G
   visited; optimum 70. Room (2,1): `r0sxhnp` then `r0sxhn` (platform exact at
   level 1). Room (1,2): the platform exact at level 1 marked 253M states
-  (level 0: 22.6M) - keep `p` through a few rem rungs next time.
+  (level 0: 22.6M). The arcs refuse a frame where the player moves twice (a
+  platform carrying it), so the platform rooms ((6,0), (2,1), (1,2)) cannot
+  run the search yet.
 
 ## Widened at every level (exact, or a stated caveat)
 
@@ -218,9 +180,9 @@ point-split run at every frame.
   reaches the same 1,374,280 balloon-free states through f50 in 296k rows
   against 1.42M (it had stopped all cross-frame dedup: `offset` advanced 0.01
   every frame).
-- **`rnd`** is an interval at every level, the exact one included (decided
-  with Philippe 2026-09-20). A refutation holds for every draw; a
-  confirmation means "some draw wins". The witness is replayed on PICO-8 per
+- **`rnd`** is an interval at every level (decided with Philippe
+  2026-09-20); the count-up takes every leaf of a frame that forks on it. A
+  refutation holds for every draw; a confirmation means "some draw wins". The witness is replayed on PICO-8 per
   seed (`pico8_diff/replay.py --balloon-seeds`, the TAS file's header fixes
   each balloon's offset); several witnesses exit only for some seeds
   (plans/results.md).
@@ -230,8 +192,7 @@ point-split run at every frame.
   1`, `delay <= 0` with it, each a runtime error on nil, and
   `cart::check_absent_fields` refuses a cart that reads it any other way.
   Philippe: a hack. Replacement: a real nil-or-number field (a per-row
-  presence tag) at the exact levels; at the widened levels the unknown can
-  cover nil.
+  presence tag); at a widened level the unknown can cover nil.
 - **The region key** (`RegionGrid`, not a widening): kernels are specialized on
   the player being in one 16 px square with speed in [-6, 6], guarded per
   lane; a lane outside declines.
