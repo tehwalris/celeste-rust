@@ -31,15 +31,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// THE SEARCH (the arc pipeline): the level-0 forward to the horizon,
-    /// recording every edge with its remainder transfer (resumed, or reused
-    /// as it is when the tree already reaches the horizon); the rotation
-    /// graph's winning sets backward from the wins (`arc_dp::solve`), whose
-    /// optimum is exact in the remainder and a LOWER BOUND on the game's
-    /// (the level's other fields may be coarse) - no win there refutes the
-    /// horizon; then the concrete search inside the winning sets from that
-    /// bound: the first frame with a concrete witness is the CONCRETE
-    /// optimum, its inputs written to `<checkpoint-dir>/witness_frame_F.txt`.
+    /// THE SEARCH (the arc pipeline), per level of `--level` (coarsest
+    /// first): the forward to the horizon, recording every edge with its
+    /// remainder transfer (resumed, or reused as it is when the tree already
+    /// reaches the horizon), filtered by the previous level's arc-marked
+    /// nodes; the rotation graph's winning sets backward from the wins
+    /// (`arc_dp::solve`), whose optimum is exact in the remainder and a LOWER
+    /// BOUND on the game's (the level's objects may be coarse) - no win
+    /// refutes the horizon; then the concrete search inside the winning
+    /// sets: a depth-first try at the bound (a win there is the optimum),
+    /// and at the LAST level the whole search. The first concrete win is the
+    /// CONCRETE optimum, its inputs written to
+    /// `<checkpoint-dir>/witness_frame_F.txt`.
     Search {
         /// The horizon: every frame up to it is searched.
         #[arg(long)]
@@ -49,10 +52,13 @@ enum Command {
         /// the model cannot reproduce a real run.
         #[arg(long)]
         ceiling: Option<u32>,
-        /// The level (`Level::parse`, e.g. `r0sxhn` for an object room).
-        #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
-        level: Level,
-        /// The checkpoint dir: the tree goes to `level00/` under it.
+        /// The levels (`Level::parse`), comma-separated, coarsest first:
+        /// `r0sx` for a room without objects, `r0sxhn` with objects,
+        /// `r0sxhn,r0sxh` for the objects ladder (an exact-objects level
+        /// filtered by the abstract one: room (7,0)).
+        #[arg(long, default_value = "r0sx")]
+        level: String,
+        /// The checkpoint dir: level i's tree goes to `level{i:02}/` under it.
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
         /// Start room "x,y".
@@ -479,7 +485,7 @@ fn rerun(engine: &dyn FrameStep, rt2: Rt2, id: u64, scratch: &str) -> Result<(Ve
     let tmp = std::env::temp_dir().join(format!("{scratch}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let door = celeste_rust::search::door::Door::new();
-    let (next, won, _) = forward_frame(engine, vec![block], &door, None, id_layer(id) + 1, Some(&tmp))?;
+    let (next, won, _) = forward_frame(engine, vec![block], &door, None, None, id_layer(id) + 1, Some(&tmp))?;
     let _ = std::fs::remove_dir_all(&tmp);
     Ok((next, won))
 }
@@ -489,6 +495,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Search { to, ceiling, level, checkpoint_dir, room, win_at, no_witness, save_marks } => {
+            use celeste_rust::search::arc_dp::{solve, Concrete};
             std::env::set_var("CELESTE_START_ROOM", &room);
             if let Some(xy) = &win_at {
                 std::env::set_var("CELESTE_WIN_AT_XY", xy);
@@ -501,63 +508,81 @@ fn main() -> Result<()> {
                 (Some(h), None) | (None, Some(h)) => h,
                 _ => anyhow::bail!("give the horizon: --to H, or --ceiling H for a known solution"),
             };
-            set_level(level);
-            eprintln!("[search] room {room}, level {level}, horizon {horizon}");
+            let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
+            eprintln!("[search] room {room}, levels {level}, horizon {horizon}");
             let t0 = std::time::Instant::now();
             let base = std::path::Path::new(&checkpoint_dir);
-            let dir = base.join("level00");
-            // THE FORWARD. A tree that already reaches the horizon is used as
-            // it is (resuming it would rebuild its door to extend nothing).
-            let first_win = match celeste_rust::frame::tree_first_win_through(&dir, horizon)? {
-                Some(w) => {
-                    eprintln!("[search] {}: the tree reaches f{horizon}", dir.display());
-                    w
-                }
-                None => {
-                    let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
-                    let initial = || -> Result<Vec<Block>> { Ok(vec![Block::from_state(&ConcreteEngine::new()?.initial_state()?)?]) };
-                    let mut st = match celeste_rust::frame::ForwardState::resume(&dir, true)? {
-                        Some(s) => s,
-                        None => celeste_rust::frame::ForwardState::start(initial()?, &dir, true)?,
-                    };
-                    st.extend(&engine, &dir, horizon)?;
-                    st.win_frame
-                }
-            };
-            let t_fwd = t0.elapsed().as_secs_f64();
-            eprintln!("[search] forward to f{horizon} in {t_fwd:.1} s; level 0's first win {first_win:?}");
-            // THE ARC PHASE and the concrete search.
-            let s = celeste_rust::search::arc_dp::solve(&dir, level, horizon, !no_witness, save_marks.as_deref().map(std::path::Path::new))?;
-            let wall = t0.elapsed().as_secs_f64();
-            let Some(bound) = s.arc else {
-                anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search: a known solution the model cannot reproduce");
-                println!("REFUTED: no win by f{horizon} ({wall:.1} s)");
-                return Ok(());
-            };
-            println!("ARC BOUND: no win before f{bound} (remainder-exact, the level's other fields over-approximated)");
-            if no_witness {
-                return Ok(());
-            }
-            match &s.concrete {
-                Some(w) => {
+            // The previous level's arc-marked nodes and that level: the
+            // filter of the next one's forward (`frame::MarkFilter`).
+            let mut prev: Option<(Visited, Level)> = None;
+            for (li, &lvl) in levels.iter().enumerate() {
+                let last = li + 1 == levels.len();
+                set_level(lvl);
+                let dir = base.join(format!("level{li:02}"));
+                // THE FORWARD. A tree that already reaches the horizon is
+                // used as it is (resuming it would rebuild its door to extend
+                // nothing); a finer level's tree is the filtered one of this
+                // horizon - delete it to change the horizon or the levels.
+                let t = std::time::Instant::now();
+                let first_win = match celeste_rust::frame::tree_first_win_through(&dir, horizon)? {
+                    Some(w) => {
+                        eprintln!("[search] {}: the tree reaches f{horizon}", dir.display());
+                        w
+                    }
+                    None => {
+                        let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+                        let initial = || -> Result<Vec<Block>> { Ok(vec![Block::from_state(&ConcreteEngine::new()?.initial_state()?)?]) };
+                        let mut st = match celeste_rust::frame::ForwardState::resume(&dir, true)? {
+                            Some(s) => s,
+                            None => celeste_rust::frame::ForwardState::start(initial()?, &dir, true)?,
+                        };
+                        let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l));
+                        st.extend(&engine, &dir, horizon, filter.as_ref())?;
+                        st.win_frame
+                    }
+                };
+                eprintln!("[search] level {li} ({lvl}): forward to f{horizon} in {:.1} s; first win {first_win:?}", t.elapsed().as_secs_f64());
+                // THE ARC PHASE, and the concrete search: at a coarser level
+                // the try at the bound only (a win there is the optimum), at
+                // the last the whole search.
+                let concrete = match (no_witness, last) {
+                    (true, _) => Concrete::None,
+                    (false, true) => Concrete::Full,
+                    (false, false) => Concrete::AtBound,
+                };
+                let s = solve(&dir, lvl, horizon, concrete, !last, if last { save_marks.as_deref().map(std::path::Path::new) } else { None })?;
+                let wall = t0.elapsed().as_secs_f64();
+                let Some(bound) = s.arc else {
+                    anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
+                    println!("REFUTED: no win by f{horizon} (level {li}, {lvl}; {wall:.1} s)");
+                    return Ok(());
+                };
+                println!("ARC BOUND: no win before f{bound} (level {li}, {lvl}: remainder-exact, the level's objects over-approximated)");
+                if let Some(w) = &s.concrete {
                     let f = w.inputs.len();
                     let path = base.join(format!("witness_frame_{f}.txt"));
                     std::fs::write(
                         &path,
                         format!(
                             "# Room ({room}): the concrete witness of `rewrite search --level {level} --to {horizon}`{}.\n\
-                             # Arc bound f{bound}; no concrete win before f{f} inside the winning sets (exhaustive).\n\
+                             # Arc bound f{bound} (level {li}, {lvl}); no concrete win before f{f} inside the winning sets (exhaustive).\n\
                              # A balloon room's win may hold for some `rnd` draws only: replay with seeds.\n{}\n",
                             win_at.as_ref().map_or(String::new(), |w| format!(" --win-at {w}")),
                             w.inputs_text()
                         ),
                     )?;
-                    println!("OPTIMAL win frame: {f} ({wall:.1} s; forward {t_fwd:.1} s); witness {}", path.display());
+                    println!("OPTIMAL win frame: {f} ({wall:.1} s); witness {}", path.display());
+                    return Ok(());
                 }
-                None => {
+                if no_witness && last {
+                    return Ok(());
+                }
+                if last {
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon}: no concrete witness by it - a known solution the model cannot reproduce");
                     println!("no concrete win by f{horizon} (arc bound f{bound}; {wall:.1} s)");
+                    return Ok(());
                 }
+                prev = Some((s.arc_marks.expect("asked for"), lvl));
             }
         }
         Command::Forward {
@@ -709,7 +734,7 @@ fn main() -> Result<()> {
                 let n = b.lanes();
                 let mask: Vec<bool> = (0..n).map(|i| i < 64).collect();
                 let small = vec![b.keep(&mask).expect("a non-empty block")];
-                forward_frame(&engine, small, &Door::new(), None, frame + 1, None)?;
+                forward_frame(&engine, small, &Door::new(), None, None, frame + 1, None)?;
             }
             let edges_dir = dir.join("bench-edges");
             // With edges, the tree's own door: every re-emitted old state
@@ -735,7 +760,7 @@ fn main() -> Result<()> {
                 let _ = std::fs::remove_dir_all(&edges_dir);
                 let t = std::time::Instant::now();
                 let (next, _won, st) =
-                    forward_frame(&engine, input, door, None, frame + 1, edges.then_some(edges_dir.as_path()))?;
+                    forward_frame(&engine, input, door, None, None, frame + 1, edges.then_some(edges_dir.as_path()))?;
                 let t_fwd = t.elapsed();
                 let (t_compact, records) = if edges {
                     let t = std::time::Instant::now();

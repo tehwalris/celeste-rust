@@ -797,6 +797,7 @@ pub struct ForwardSink<'a> {
     /// The run cache: rows arrive in runs of one (outcome, cell).
     last: ((u64, u32), u32),
     door: Option<&'a crate::search::door::Door>,
+    filter: Option<&'a MarkFilter<'a>>,
     /// The ids of the block being run, per lane (set by the worker before
     /// each unit); the step reads `ids_in[lo]` as the slice's base and
     /// records predecessors as masks over the slice.
@@ -861,6 +862,7 @@ impl<'a> ForwardSink<'a> {
             clock: 0,
             last: NO_QUEUE,
             door: None,
+            filter: None,
             ids_in: None,
             skip_in: None,
             edges_dir: None,
@@ -892,10 +894,11 @@ impl<'a> ForwardSink<'a> {
         }
     }
 
-    /// Worker `worker`'s sink for `frame`: flushes through `door`; its
-    /// pieces' rows get ids in layer `frame`.
+    /// Worker `worker`'s sink for `frame`: flushes through `door` (and
+    /// `filter`); its pieces' rows get ids in layer `frame`.
     pub fn forward(
         door: &'a crate::search::door::Door,
+        filter: Option<&'a MarkFilter<'a>>,
         edges_on: bool,
         frame: u32,
         worker: u32,
@@ -903,6 +906,7 @@ impl<'a> ForwardSink<'a> {
     ) -> Self {
         let mut s = Self::empty(edges_on);
         s.door = Some(door);
+        s.filter = filter;
         s.frame = frame;
         s.worker = worker;
         s.edges_dir = edges_dir.map(|p| p.to_path_buf());
@@ -1076,10 +1080,16 @@ impl<'a> ForwardSink<'a> {
             crate::compiled::asm_kernel::key_check(slot);
             self.flushes += 1;
             self.flushed_rows += n as u64;
+            // The coarser level's filter (`MarkFilter`): a filtered-out row is
+            // never admitted.
+            let allow = match self.filter {
+                Some(f) => Some(f.allowed(&slot.to_rt2(), self.frame)?),
+                None => None,
+            };
             // The level -1 filter: the queue's cell provably cannot exit by H.
             let allow = match level_minus_one() {
                 Some((h, table)) if table.too_late(slot.shape, slot.cell, self.frame, h) => Some(vec![false; n]),
-                _ => None,
+                _ => allow,
             };
             self.sort_buf.clear();
             self.sort_buf.extend(
@@ -1316,6 +1326,33 @@ pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
     frame + (frames.max(1) - 1) as u32 > h
 }
 
+/// THE OBJECTS LADDER's link: a finer level's forward keeps a row at frame t
+/// only if its projection onto the coarser level (`Rt2::widen_to`) is a node
+/// the coarser level's arc phase ARC-MARKED with a deadline >= t (its
+/// winning set non-empty at some frame >= t, `arc_dp::arc_marks`). Sound: a
+/// fine state that wins by the horizon from t, with its remainder r, projects
+/// to a coarse node that wins from t with r (the coarse level
+/// over-approximates; the remainder is exact in both), so r is in the coarse
+/// W_t and the node is marked at t. Deadlines matter: membership alone
+/// admitted room (3,0)'s fine states onto coarse states marked from an
+/// earlier frame with no time left (14.6M kept at f51, 2026-09-19).
+pub struct MarkFilter<'a> {
+    marked: &'a Visited,
+    coarser: crate::interpreter::abstraction::Level,
+}
+
+impl<'a> MarkFilter<'a> {
+    pub fn new(marked: &'a Visited, coarser: crate::interpreter::abstraction::Level) -> Self {
+        MarkFilter { marked, coarser }
+    }
+
+    /// Per lane of `rt2` (rows of frame `frame`): admitted?
+    pub fn allowed(&self, rt2: &Rt2, frame: u32) -> Result<Vec<bool>> {
+        let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser)?;
+        Ok(keys.iter().zip(&cells).map(|(k, &c)| self.marked.deadline(shape, *k, c).is_some_and(|d| u32::from(d) >= frame)).collect())
+    }
+}
+
 /// Each lane's `(key, cell)` as the `coarser` level keys it: the COMPLETE
 /// coarsening the level's kernels bake into their rows (`Rt2::widen_to`: the
 /// remainder, the dash clamp, the fruit widening, the timer pins, the level's
@@ -1439,6 +1476,7 @@ pub fn forward_frame(
     frontier: Vec<Block>,
     door: &crate::search::door::Door,
     pos: Option<&crate::search::pos_graph::PosObserver>,
+    filter: Option<&MarkFilter>,
     frame: u32,
     edges_dir: Option<&std::path::Path>,
 ) -> Result<(Vec<Block>, bool, FrameStats)> {
@@ -1500,7 +1538,7 @@ pub fn forward_frame(
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     let t = Instant::now();
-                    let mut sink = ForwardSink::forward(door, pos.is_some(), frame, w as u32, edges_dir);
+                    let mut sink = ForwardSink::forward(door, filter, pos.is_some(), frame, w as u32, edges_dir);
                     loop {
                         let u = next_unit.fetch_add(1, Ordering::Relaxed);
                         let Some(&(bi, lo, hi)) = units.get(u) else { break };
@@ -1831,6 +1869,7 @@ impl ForwardState {
         engine: &dyn FrameStep,
         dir: &std::path::Path,
         to: u32,
+        filter: Option<&MarkFilter>,
     ) -> Result<()> {
         while self.frames < to && !self.frontier.is_empty() {
             let frame = self.frames + 1;
@@ -1838,7 +1877,7 @@ impl ForwardState {
             let frontier = std::mem::take(&mut self.frontier);
             let edges_dir = dir.join("edges");
             let (mut next, won, st) =
-                forward_frame(engine, frontier, &self.door, self.observer.as_ref(), frame, Some(&edges_dir))?;
+                forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filter, frame, Some(&edges_dir))?;
             // The PREVIOUS frame's compaction ran behind this wave; it is
             // joined and marked done before this frame is checkpointed, so
             // a resume (which trusts frames up to `done.txt`) never sees a
@@ -1963,7 +2002,7 @@ pub fn forward_resume_or_run(
         Some(st) => st,
         None => ForwardState::start(initial, dir, true)?,
     };
-    st.extend(engine, dir, max_frames)?;
+    st.extend(engine, dir, max_frames, None)?;
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
@@ -1978,7 +2017,7 @@ pub fn forward_run(
     record: bool,
 ) -> Result<ForwardResult> {
     let mut st = ForwardState::start(initial, dir, record)?;
-    st.extend(engine, dir, max_frames)?;
+    st.extend(engine, dir, max_frames, None)?;
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
@@ -2270,6 +2309,24 @@ pub fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Opt
 
 #[cfg(test)]
 mod tests {
+    /// The objects ladder's filter admits a row onto a marked coarse node
+    /// up to the node's deadline, and nothing else.
+    #[test]
+    fn the_mark_filter_admits_up_to_the_deadline() {
+        use crate::interpreter::abstraction::Level;
+        let engine = RefEngine::new().expect("ref engine");
+        let block = Block::from_state(&engine.initial_state().expect("initial state")).expect("block");
+        let coarse = Level::parse("r0sxh").expect("level");
+        let (shape, keys, cells) = widened_keys(&block, coarse).expect("keys");
+        let mut marked = Visited::new();
+        marked.insert_until(shape, keys[0], cells[0], 5);
+        let f = MarkFilter::new(&marked, coarse);
+        assert_eq!(f.allowed(block.rt2(), 5).expect("filter"), vec![true], "at the deadline");
+        assert_eq!(f.allowed(block.rt2(), 6).expect("filter"), vec![false], "past it");
+        let empty = Visited::new();
+        assert_eq!(MarkFilter::new(&empty, coarse).allowed(block.rt2(), 0).expect("filter"), vec![false], "not marked");
+    }
+
 
     /// A row ref names its queue in full: with spares kept per outcome the
     /// slot vector grows past `POOL_QUEUES`, and a queue index above 255
@@ -2430,7 +2487,7 @@ mod tests {
             let mut st = ForwardState::start(init, dir, true).expect("start");
             assert_eq!(pos_graph_frame(dir), Some(0), "start must leave a graph beside f0");
             for to in 1..=4 {
-                st.extend(&e, dir, to).expect("extend");
+                st.extend(&e, dir, to, None).expect("extend");
                 assert_eq!(st.frames, to);
                 // Every frame boundary leaves a graph covering the frame: a
                 // crash here resumes (the graph was saved only when a
@@ -2458,7 +2515,7 @@ mod tests {
             let mut st = ForwardState::resume(dir, true).expect("resume").expect("a tree to resume");
             assert_eq!(st.frames, 4);
             let door_before = st.visited_len();
-            st.extend(&e, dir, 6).expect("extend resumed");
+            st.extend(&e, dir, 6, None).expect("extend resumed");
             assert!(st.visited_len() >= door_before);
         }
         let keyset_in = |d: &std::path::Path, frame: u32| -> FxHashSet<(u64, u64)> {
@@ -2500,7 +2557,7 @@ mod tests {
         widen_rt2_to(&mut row, Level::EXACT);
         let successors = |engine: &dyn FrameStep| -> std::collections::BTreeSet<((u64, u64), u32)> {
             let door = crate::search::door::Door::new();
-            let (next, _, _) = forward_frame(engine, vec![Block::from_rt2(row.clone_block())], &door, None, 26, None).expect("frame");
+            let (next, _, _) = forward_frame(engine, vec![Block::from_rt2(row.clone_block())], &door, None, None, 26, None).expect("frame");
             next.iter().flat_map(|b| b.keys().iter().copied().zip(b.positions().expect("cells"))).collect()
         };
         let (k, r) = (successors(&kernels), successors(&reference));
@@ -2555,7 +2612,7 @@ mod tests {
         let mut parent = Block::from_state(&st).expect("block").into_rt2();
         widen_rt2_to(&mut parent, level);
         let door = crate::search::door::Door::new();
-        let (next, _, _) = forward_frame(&kernels, vec![Block::from_rt2(parent)], &door, None, 127, None).expect("frame");
+        let (next, _, _) = forward_frame(&kernels, vec![Block::from_rt2(parent)], &door, None, None, 127, None).expect("frame");
         let mut made: std::collections::BTreeSet<(u64, (u64, u64), u32)> = Default::default();
         for b in &next {
             let stored = b.keys().to_vec();

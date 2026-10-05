@@ -659,6 +659,7 @@ pub fn concrete_search(
     g: &Graph,
     w: &Winning,
     bound: u32,
+    breadth_first: bool,
 ) -> anyhow::Result<Option<Witness>> {
     use crate::concrete::ConcreteEngine;
     use crate::frame::{frame_files, pack_id, widened_keys, wins_of, Block};
@@ -795,6 +796,9 @@ pub fn concrete_search(
             let cells = std::iter::once(start_cell).chain(cx.path.iter().map(|&(_, c)| c)).collect();
             return Ok(Some(Witness { inputs, cells }));
         }
+        if !breadth_first {
+            return Ok(None);
+        }
     }
     // Per layer k >= 1, each state's (parent index in layer k-1, input, cell).
     let mut back: Vec<Vec<(u32, u8, u32)>> = Vec::new();
@@ -911,6 +915,18 @@ pub fn concrete_search(
     Ok(None)
 }
 
+/// How much of the concrete search `solve` runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Concrete {
+    None,
+    /// The depth-first try at the bound only (a coarse level of the objects
+    /// ladder: a win there is the optimum, no win sends the search on to the
+    /// finer level).
+    AtBound,
+    /// The whole search: the try at the bound, then breadth-first.
+    Full,
+}
+
 /// What the arc phase of a search found (`solve`).
 pub struct Solved {
     /// The optimum over the rotation graph (exact in the remainder; a lower
@@ -920,12 +936,17 @@ pub struct Solved {
     /// The concrete optimum and its witness (`concrete_search`), when
     /// asked for and found.
     pub concrete: Option<Witness>,
+    /// The ARC-MARKED nodes as `(shape, key, cell)` with their deadlines (the
+    /// last frame their winning set is non-empty): the next level's filter
+    /// (`frame::MarkFilter`). Computed when asked for.
+    pub arc_marks: Option<crate::frame::Visited>,
 }
 
 /// THE ARC PHASE over a finished level-0 tree in `dir` (frames and edges
 /// through `horizon`): load the rotation graph (`load`), the winning sets
-/// backward (`backward`), the optimum read off them (`optimum`), and with
-/// `witness` the concrete search (`concrete_search`). Prints `[gate]` lines - the
+/// backward (`backward`), the optimum read off them (`optimum`), and as much
+/// of the concrete search (`concrete_search`) as `concrete` says. Prints
+/// `[gate]` lines - the
 /// marks' and each frame's winning sets' fingerprints over (shape, key,
 /// cell), which do not depend on the scheduling the ids do - and with
 /// `save`, writes the UI's arc pass there (`export-ui --forward-only --arc`):
@@ -937,7 +958,8 @@ pub fn solve(
     dir: &std::path::Path,
     level: crate::interpreter::abstraction::Level,
     horizon: u32,
-    witness: bool,
+    concrete: Concrete,
+    want_marks: bool,
     save: Option<&std::path::Path>,
 ) -> anyhow::Result<Solved> {
     use crate::frame::{frame_files, id_layer, Visited};
@@ -987,11 +1009,9 @@ pub fn solve(
         println!("[gate] h{horizon} W f{t:03} {n} {acc:016x}");
     }
     println!("[gate] h{horizon} arc optimum {}", arc.map_or("none".to_string(), |f| f.to_string()));
-    if let Some(out) = save {
-        std::fs::create_dir_all(out)?;
-        marked.save(&out.join("level0.marks.bin"), horizon)?;
-        // Per node the LAST frame its winning set is non-empty: the arc
-        // analogue of the BFS's deadline.
+    // Per node the LAST frame its winning set is non-empty: the arc
+    // analogue of the BFS's deadline.
+    let arc_marks = if want_marks || save.is_some() {
         let mut last = vec![u32::MAX; g.len()];
         for t in 0..=horizon {
             for (i, _) in w.frame(t) {
@@ -1003,7 +1023,14 @@ pub fn solve(
         super::edges::resolve_ids(&files, &ids, |shape, key, cell, d| {
             am.insert_until(shape, key, cell, d);
         })?;
-        am.save(&out.join("arc.marks.bin"), horizon)?;
+        Some(am)
+    } else {
+        None
+    };
+    if let Some(out) = save {
+        std::fs::create_dir_all(out)?;
+        marked.save(&out.join("level0.marks.bin"), horizon)?;
+        arc_marks.as_ref().expect("computed with save").save(&out.join("arc.marks.bin"), horizon)?;
         let first_win = ld.wins.iter().map(|&id| id_layer(id)).min();
         let show = |v: Option<u32>| v.map_or("none".to_string(), |f| f.to_string());
         std::fs::write(out.join("arc.txt"), format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(arc)))?;
@@ -1013,17 +1040,17 @@ pub fn solve(
     // go first (room (4,3) nodiag h111: 769M edges, 9.2 GB of adjacency).
     let mut graph = ld.graph;
     graph.forget_edges();
-    let concrete = match (witness, arc) {
-        (true, Some(f)) => concrete_search(dir, level, horizon, &graph, &w, f)?,
-        _ => None,
+    let found = match (concrete, arc) {
+        (Concrete::None, _) | (_, None) => None,
+        (c, Some(f)) => concrete_search(dir, level, horizon, &graph, &w, f, c == Concrete::Full)?,
     };
-    if let Some(wt) = &concrete {
+    if let Some(wt) = &found {
         println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), wt.inputs_text());
         if let Some(out) = save {
             wt.save(&out.join("witness.txt"))?;
         }
     }
-    Ok(Solved { arc, concrete })
+    Ok(Solved { arc, concrete: found, arc_marks: if want_marks { arc_marks } else { None } })
 }
 
 #[cfg(test)]
