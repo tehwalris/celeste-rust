@@ -1,0 +1,12 @@
+# Room (0,2) "1700 m", No Diagonal Dashes: exit during frame 87 (2026-10-05).
+# TWO FRAMES FASTER than the community nodiag TAS17 (64 inputs at prologue
+# offset 25 = 89 in our counting).
+# rewrite search --room 0,2 --ceiling 89 --level r0sxhn,r0sxh, CELESTE_NODIAG=1,
+# level -1 89,5 (integrate 6fea215): the arc bound at r0sxhn (objects coarse,
+# a sound lower bound) is already 87 and the concrete witness reaches 87:
+# OPTIMAL. 316 s, 14.5 GB. Dashes: f28 D, f40 U, f67 U.
+# Replayed on a real PICO-8, room changes to (1,2) during frame 87, in
+# celeste-minimal and in the ORIGINAL cart:
+#   pico8_diff/replay.py --room 0,2 tas/room_0_2_nodiag_frame_87.txt
+#   pico8_diff/replay.py --lua ~/src/github.com/tehwalris/celeste_ocaml/celeste.lua --begin-game --room 0,2 tas/room_0_2_nodiag_frame_87.txt
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,17,0,40,0,0,0,0,0,16,0,0,0,0,0,36,0,0,0,0,0,0,0,0,2,2,2,2,2,2,2,18,2,2,2,2,2,2,2,2,2,2,36,0,0,0,0,0,0,2,2,2,2,2,2,2,2,16,0,0,0,0,0
