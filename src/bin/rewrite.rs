@@ -523,7 +523,9 @@ fn main() -> Result<()> {
                     (false, true) => Concrete::Full,
                     (false, false) => Concrete::AtBound,
                 };
-                let s = solve(&dir, lvl, horizon, concrete, !last, if last { save_marks.as_deref().map(std::path::Path::new) } else { None }, prefer.as_deref())?;
+                // Every level saves its marks (the next overwrites): the search can end
+                // at a coarser level when its try at the bound finds the witness.
+                let s = solve(&dir, lvl, horizon, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref())?;
                 let wall = t0.elapsed().as_secs_f64();
                 let Some(bound) = s.arc else {
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");

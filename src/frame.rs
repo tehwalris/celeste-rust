@@ -244,7 +244,13 @@ pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
 /// Per lane: on the win target? The exit, plus the orb in the orb room.
 pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::AV;
-    let exits = exits_of(rt2)?;
+    let mut exits = exits_of(rt2)?;
+    if crate::game_runner::hundred() {
+        // 100%: the exit counts only with this room's berry taken.
+        for (e, b) in exits.iter_mut().zip(got_fruit(rt2)?) {
+            *e &= b;
+        }
+    }
     if win_rect().is_some() || !orb_required() {
         return Ok(exits);
     }
@@ -256,6 +262,27 @@ pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
         (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(two)).collect()
     };
     Ok(exits.iter().zip(&has_orb).map(|(e, o)| *e && *o).collect())
+}
+
+/// Per lane: has the start room's berry been taken (`got_fruit[1 +
+/// level_index()]`, an array the cart pads with nils up to that index)? An
+/// unknown value (a coarse level) counts as taken: a win there is only an
+/// over-approximation, and the exact level decides.
+pub fn got_fruit(rt2: &Rt2) -> Result<Vec<bool>> {
+    use celeste_engine::runtime2::{Cell2, Col, AV};
+    let lanes = rt2.width;
+    let g = celeste_names::gen::global_id("got_fruit").expect("`got_fruit` is a global name");
+    let (x, y) = crate::game_runner::start_room();
+    let i = crate::game_runner::level_index(x, y) as usize;
+    let Some(arr) = rt2.global_target(g) else { return Ok(vec![false; lanes]) };
+    let Cell2::Arr(items) = &rt2.structure[arr as usize] else { return Ok(vec![false; lanes]) };
+    let Some(&c) = items.get(i) else { return Ok(vec![false; lanes]) };
+    Ok((0..lanes)
+        .map(|l| match &rt2.cols[c as usize] {
+            Col::U(v) => matches!(v, AV::Bool(true) | AV::UBool),
+            col => matches!(col.at(l), AV::Bool(true) | AV::UBool),
+        })
+        .collect())
 }
 
 /// A SOUND LOWER BOUND on frames from the big chest opening to a win: 61
@@ -298,7 +325,7 @@ pub fn not_expanded(b: &Block, frame: u32) -> Result<Vec<bool>> {
 /// (`max_djump == 2`): later levels are played with the second dash.
 pub fn orb_required() -> bool {
     let (x, y) = crate::game_runner::start_room();
-    crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL
+    crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !crate::game_runner::gemskip()
 }
 
 /// Worker count: `CELESTE_THREADS`, else one per physical core (AVX-512 units

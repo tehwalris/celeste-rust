@@ -39,6 +39,18 @@ pub fn level_index(x: i16, y: i16) -> i16 {
     x % 8 + y * 8
 }
 
+/// `CELESTE_GEMSKIP`: the gemskip categories skip the orb - the orb room
+/// is won without it and every later room starts with ONE dash.
+pub fn gemskip() -> bool {
+    std::env::var_os("CELESTE_GEMSKIP").is_some()
+}
+
+/// `CELESTE_HUNDRED`: the 100% category - a room is won only by exiting with
+/// its berry taken (`frame::got_fruit`).
+pub fn hundred() -> bool {
+    std::env::var_os("CELESTE_HUNDRED").is_some()
+}
+
 /// The level whose big chest holds the orb (`max_djump=2`): room (5,2).
 pub const ORB_LEVEL: i16 = 21;
 
@@ -58,7 +70,7 @@ pub fn apply_start_room(game_lua: &str) -> Result<String> {
     let (x, y) = start_room();
     // The orb sets `max_djump=2` for the rest of the game; a later room
     // must start as a play-through reaches it, with the orb taken.
-    let orb = if level_index(x, y) > ORB_LEVEL { "max_djump=2 " } else { "" };
+    let orb = if level_index(x, y) > ORB_LEVEL && !gemskip() { "max_djump=2 " } else { "" };
     Ok(game_lua.replacen(PAT, &format!("{}load_room({}, {})", orb, x, y), 1))
 }
 

@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Run a queue of (category, room) searches against the community tasdatabase
+and verify every result end to end.
+
+    tools/category_runner.py JOBS.json OUTDIR
+
+JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
+"offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"}; re-read
+before every job, so jobs can be appended while it runs; a job whose key is
+already in OUTDIR/results.jsonl is skipped.
+
+Per job:
+ 1. the reference: the community TAS replayed in the ORIGINAL cart behind the
+    room's prologue (the earliest offset around `offset` that exits);
+ 2. `rewrite search --ceiling REF --prefer <the community TAS>` with the
+    category's mode (CELESTE_NODIAG / CELESTE_GEMSKIP / CELESTE_HUNDRED) and
+    the level -1 filter if `l1` (retried without it if its table refuses);
+ 3. our witness replayed in the original cart (must exit at the optimum; no
+    diagonal dash in a nodiag category);
+ 4. both files through UniversalClassicTas (tools/uct/validate.sh): the clean
+    save of ours is the upload file (OUTDIR/upload/<cat>/TAS<n>.tas);
+ 5. an improvement gets a web UI run (export-ui + runs.json).
+Results: one JSON line per job in OUTDIR/results.jsonl.
+"""
+import json, os, re, shutil, subprocess, sys, time
+
+M = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB = os.path.expanduser("~/src/github.com/CelesteClassic/tasdatabase")
+ORIG = os.path.expanduser("~/src/github.com/tehwalris/celeste_ocaml/celeste.lua")
+UI = "/var/tmp/celeste-ui/data"
+CAT_LABEL = {"nodiag": "No Diagonal Dashes", "gemskipany": "Gemskip any%", "gemskipnodiag": "Gemskip No Diagonal Dashes", "100": "100%"}
+
+
+def mode_env(cat):
+    env = {}
+    if "nodiag" in cat:
+        env["CELESTE_NODIAG"] = "1"
+    if cat.startswith("gemskip"):
+        env["CELESTE_GEMSKIP"] = "1"
+    if cat in ("100", "gemskip100"):
+        env["CELESTE_HUNDRED"] = "1"
+    return env
+
+
+def replay_args(cat):
+    return ["--one-dash"] if cat.startswith("gemskip") else []
+
+
+def parse_tas(text):
+    seeds = text[text.index("[") + 1:text.index("]")].strip().rstrip(",")
+    return seeds, [int(x) for x in re.findall(r"\d+", text[text.index("]") + 1:])]
+
+
+def replay_exit(room, inputs, seeds, cat):
+    """The frame the room changes during, replaying `inputs` in the ORIGINAL cart."""
+    cmd = [f"{M}/pico8_diff/replay.py", "--lua", ORIG, "--begin-game", "--room", room, "--inputs", ",".join(map(str, inputs)), "--frames", str(len(inputs) + 3)] + replay_args(cat)
+    if seeds:
+        cmd += ["--balloon-seeds", seeds]
+    out = subprocess.run(cmd, capture_output=True, text=True, cwd=M, timeout=900).stdout
+    for line in out.splitlines():
+        m = re.match(r"f(\d+) room (\S+)", line)
+        if m and m.group(2) != room:
+            return int(m.group(1)), out
+    return None, out
+
+
+def diag_dashes(inputs):
+    bad, prev = [], 0
+    for i, b in enumerate(inputs):
+        if b & 32 and not prev & 32 and (b & 3) and (b & 12):
+            bad.append(i + 1)
+        prev = b
+    return bad
+
+
+def uct(level, path, cat):
+    env = dict(os.environ)
+    if cat.startswith("gemskip"):
+        env["UCT_DASHES"] = "1"
+    out = subprocess.run([f"{M}/tools/uct/validate.sh", str(level), path], capture_output=True, text=True, env=env, timeout=1800).stdout
+    m = re.search(r"(finished, clean save|DID NOT FINISH[^,]*), (\d+) inputs", out)
+    saved = os.path.expanduser(f"~/.local/share/love/CelesteTAS/TAS{level}.tas")
+    return (m.group(1).startswith("finished") if m else False), (int(m.group(2)) if m else None), saved, out
+
+
+def run(job, outdir, binary):
+    cat, room, name = job["cat"], job["room"], job["name"]
+    key = f"{cat}/{name}"
+    jd = os.path.join(outdir, cat, name)
+    shutil.rmtree(jd, ignore_errors=True)
+    os.makedirs(jd)
+    res = {"key": key, "cat": cat, "room": room, "name": name, "start": time.strftime("%H:%M")}
+    entry = [e for e in json.load(open(f"{DB}/database.json"))["classic"][cat] if e["name"] == name]
+    if not entry:
+        return {**res, "status": "no database entry"}
+    entry = entry[0]
+    dbtext = open(f"{DB}/classic/{cat}/{entry['file']}").read()
+    seeds, dbin = parse_tas(dbtext)
+    res["db_file"], res["db_frames"] = entry["file"], entry.get("frames")
+    # 1. the reference
+    ref = None
+    for off in range(job["offset"] - 2, job["offset"] + 3):
+        e, _ = replay_exit(room, [0] * off + dbin, seeds, cat)
+        if e is not None:
+            ref, prologue = e, off
+            break
+    if ref is None:
+        return {**res, "status": "the community TAS does not exit in the original cart"}
+    res["ref"], res["prologue"] = ref, prologue
+    prefer = os.path.join(jd, "prefer.txt")
+    open(prefer, "w").write(",".join(map(str, [0] * prologue + dbin)))
+    # 2. the search
+    def search(l1):
+        env = dict(os.environ, **mode_env(cat))
+        if l1:
+            env["CELESTE_LEVEL_MINUS_ONE"] = f"{ref},5"
+        log = os.path.join(jd, "search.log")
+        shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--ceiling", str(ref), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", os.path.join(jd, "tree")]
+        t = time.time()
+        with open(log, "w") as f:
+            rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=M, timeout=job.get("timeout", 4 * 3600)).returncode
+        return rc, open(log, errors="replace").read(), time.time() - t
+    try:
+        rc, log, secs = search(job.get("l1", True))
+        if rc != 0 and job.get("l1", True) and rc != 137 and re.search(r"building the level -1 table|level_minus_one", log):
+            res["l1"] = "refused"
+            rc, log, secs = search(False)
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+        return {**res, "status": "search timed out"}
+    res["search_s"] = round(secs)
+    peak = re.findall(r"peak ([\d.]+) GB", log)
+    res["peak_gb"] = peak[-1] if peak else None
+    m = re.search(r"OPTIMAL win frame: (\d+)", log)
+    if rc != 0 or not m:
+        shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+        tail = [l for l in log.splitlines() if l.strip()][-3:]
+        return {**res, "status": f"search failed (exit {rc})", "tail": tail}
+    opt = int(m.group(1))
+    ours = [int(x) for x in re.search(r"concrete optimum \d+ inputs (\S+)", log).group(1).split(",")]
+    res["ours"] = opt
+    open(os.path.join(jd, "witness.txt"), "w").write(",".join(map(str, ours)))
+    # 3. verification in the original cart
+    e, out = replay_exit(room, ours, seeds, cat)
+    res["ours_original_cart_exit"] = e
+    if cat in ("100", "gemskip100"):
+        # The berry taken before the exit: a `lifeup` appears where it was.
+        res["berry"] = any(" lifeup " in l and int(l.split()[0][1:]) < e for l in out.splitlines() if re.match(r"f\d+ ", l)) if e else False
+    if "nodiag" in cat:
+        res["diagonal_dashes"] = diag_dashes(ours)
+    lead = next((i for i, b in enumerate(ours) if b), len(ours))
+    res["prologue_ok"] = lead >= prologue
+    # 4. UniversalClassicTas
+    level = int(name.rstrip("m")) // 100 if name.endswith("m") else None
+    if level and lead >= prologue:
+        mine = os.path.join(jd, f"ours-{entry['file']}")
+        open(mine, "w").write(f"[{seeds}]" + ",".join(map(str, ours[prologue:])))
+        ok_db, n_db, _, _ = uct(level, f"{DB}/classic/{cat}/{entry['file']}", cat)
+        ok, n, saved, _ = uct(level, mine, cat)
+        res["uct_db"] = f"{'finished' if ok_db else 'NOT finished'} {n_db} inputs"
+        res["uct_ours"] = f"{'finished' if ok else 'NOT finished'} {n} inputs"
+        if ok:
+            up = os.path.join(outdir, "upload", cat)
+            os.makedirs(up, exist_ok=True)
+            shutil.copy(saved, os.path.join(up, entry["file"]))
+            res["upload"] = os.path.join(up, entry["file"])
+    res["status"] = "IMPROVED" if opt < ref else ("tie" if opt == ref else "WORSE?")
+    res["verified"] = (e == opt) and not res.get("diagonal_dashes") and "finished" in res.get("uct_ours", "") and res.get("berry", True)
+    # 5. the UI
+    if opt < ref:
+        try:
+            paths = os.path.join(jd, "paths")
+            env = dict(os.environ, TAS_CATEGORY=cat, REPLAY_ARGS=" ".join(replay_args(cat)))
+            subprocess.run([sys.executable, f"{M}/tools/align_tas.py", room, name, str(prologue), os.path.join(jd, "witness.txt"), seeds or "-", paths], env=env, cwd=M, capture_output=True, timeout=1800, check=True)
+            # The UI's download must be the upload file: its seeds as UCT wrote them.
+            if res.get("upload"):
+                up_seeds, _ = parse_tas(open(res["upload"]).read())
+                p = f"{paths}/ours.txt"
+                text = open(p).read()
+                open(p, "w").write(re.sub(r"(?m)^seeds .*$", f"seeds [{up_seeds}]", text, count=1))
+            rid = f"room{room.replace(',', '')}{cat}"
+            ex = subprocess.run([binary, "export-ui", "--checkpoint-dir", os.path.join(jd, "tree"), "--log", os.path.join(jd, "search.log"), "--out", f"{UI}/{rid}", "--room", room, "--arc", os.path.join(jd, "marks"), "--witness", f"{paths}/ours.txt", "--reference", f"{paths}/reference.txt"], cwd=M, capture_output=True, text=True, timeout=3600)
+            if ex.returncode != 0:
+                raise RuntimeError("export-ui: " + ex.stderr.strip().splitlines()[-1] if ex.stderr.strip() else "export-ui failed")
+            # The UI's download must equal the upload file.
+            if res.get("upload"):
+                t = json.load(open(f"{UI}/{rid}/run.json"))["witness"]["tas"]["text"]
+                res["ui_download_equals_upload"] = t == open(res["upload"]).read()
+            runs = json.load(open(f"{UI}/runs.json"))
+            runs["runs"] = [r for r in runs["runs"] if r["id"] != rid]
+            tasn = entry["file"].replace(".tas", "")
+            runs["runs"].append({"id": rid, "label": f"Room ({room}) · {CAT_LABEL.get(cat, cat)}: exit at frame {opt} against {tasn}'s {ref} (community TAS drawn as the reference path)", "category": CAT_LABEL.get(cat, cat), "pick": f"ours {opt} vs TAS {ref}"})
+            json.dump(runs, open(f"{UI}/runs.json", "w"), indent=1)
+            res["ui"] = rid
+        except Exception as ex:  # the result stands; the UI can be redone
+            res["ui_error"] = str(ex)[:200]
+    shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+    return res
+
+
+def main():
+    jobs_path, outdir = sys.argv[1], sys.argv[2]
+    os.makedirs(outdir, exist_ok=True)
+    results = os.path.join(outdir, "results.jsonl")
+    while True:
+        done = set()
+        if os.path.exists(results):
+            done = {json.loads(l)["key"] for l in open(results) if l.strip()}
+        todo = [j for j in json.load(open(jobs_path)) if f"{j['cat']}/{j['name']}" not in done]
+        if not todo:
+            print("all jobs done", flush=True)
+            return
+        job = todo[0]
+        binary = os.environ.get("RUNNER_BIN", f"{outdir}/rewrite")
+        print(f"[{time.strftime('%H:%M')}] {job['cat']} {job['name']} {job['room']}", flush=True)
+        try:
+            res = run(job, outdir, binary)
+        except Exception as ex:
+            res = {"key": f"{job['cat']}/{job['name']}", "status": f"runner error: {ex}"[:300]}
+        res["end"] = time.strftime("%H:%M")
+        with open(results, "a") as f:
+            f.write(json.dumps(res) + "\n")
+        print("   ", json.dumps(res)[:400], flush=True)
+
+
+if __name__ == "__main__":
+    main()

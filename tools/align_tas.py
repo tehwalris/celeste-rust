@@ -61,5 +61,6 @@ def write(path,label,seq,R):
             o.write(f"{f} {r[1]:.0f} {r[2]:.0f}\n" if r and r[0]==room and r[1] is not None else f"{f} - -\n")
     print(f"wrote {path}: {label}, dashes {' '.join(dashes(R,end))}")
 if outdir:
+    os.makedirs(outdir, exist_ok=True)
     write(f"{outdir}/reference.txt",f"{e['file'][:-4]} (community, {name}, original cart): exits f{ex(A)}",tas,A)
     write(f"{outdir}/ours.txt",f"ours (search witness, original cart): exits f{ex(B)}",ours,B)
