@@ -81,6 +81,7 @@ dependencies = [
  "celeste-names",
  "clap",
  "full_moon",
+ "libc",
  "libmimalloc-sys",
  "memmap2",
  "mimalloc",

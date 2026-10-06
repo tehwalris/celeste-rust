@@ -19,6 +19,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+libc = "0.2"
 celeste-core = { path = "crates/celeste-core" }
 celeste-engine = { path = "crates/celeste-engine" }
 celeste-names = { path = "crates/celeste-names" }

@@ -1631,6 +1631,7 @@ impl ForwardState {
             }
             let t_pos = t.elapsed();
             log_frame(frame, &st, t_edges, compact_records, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
+            ensure_disk_space(dir)?;
             self.frames = frame;
             if won && self.win_frame.is_none() {
                 self.win_frame = Some(frame);
@@ -1725,6 +1726,30 @@ pub fn forward_run(
 }
 
 /// The per-frame `[fwd]` line (ms) and the `fwd.*` metrics totals.
+/// Stop the forward before the checkpoint disk fills: below
+/// `CELESTE_MIN_FREE_GB` (default 20) free on `dir`'s filesystem, an error -
+/// a full disk otherwise fails a worker mid-write (room (5,1) nodiag,
+/// 2026-10-06) and starves everything else on the machine.
+fn ensure_disk_space(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let min_gb: u64 = match std::env::var("CELESTE_MIN_FREE_GB") {
+        Ok(v) => v.parse().context("CELESTE_MIN_FREE_GB")?,
+        Err(_) => 20,
+    };
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    // SAFETY: `path` is NUL-terminated; `st` is a valid out-parameter that
+    // statvfs fills on success.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    anyhow::ensure!(unsafe { libc::statvfs(path.as_ptr(), &mut st) } == 0, "statvfs {}: {}", dir.display(), std::io::Error::last_os_error());
+    let free_gb = st.f_bavail as u64 * st.f_frsize as u64 >> 30;
+    anyhow::ensure!(
+        free_gb >= min_gb,
+        "only {free_gb} GB free on {}'s filesystem (CELESTE_MIN_FREE_GB = {min_gb}): stopping the forward before the disk fills",
+        dir.display()
+    );
+    Ok(())
+}
+
 fn log_frame(
     frame: u32,
     st: &FrameStats,
