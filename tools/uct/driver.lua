@@ -13,6 +13,8 @@ function D.tick()
       D.phase = "load"; D.mark = D.t
     end
   elseif D.phase == "load" and D.t > D.mark + 10 then
+    -- UCT_DASHES: the dash count key (0-3; the gemskip categories: 1).
+    if os.getenv("UCT_DASHES") then press(os.getenv("UCT_DASHES")) end
     print("[driver] at level index " .. tostring(pico8.cart.level_index() + 1) .. ", loading TAS")
     press("w"); D.phase = "restart"; D.mark = D.t
   elseif D.phase == "restart" and D.t > D.mark + 5 then

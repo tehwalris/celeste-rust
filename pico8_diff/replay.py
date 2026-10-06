@@ -33,7 +33,7 @@ def hexbytes(path, n):
     return bytes.fromhex(h)
 
 
-def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, balloon_seeds=None):
+def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, balloon_seeds=None, one_dash=False):
     lua = open(lua_path or os.path.join(ROOT, "lua", "celeste-minimal.lua")).read()
     if balloon_seeds is not None:
         # A balloon's phase is `offset=rnd(1)` at load, which PICO-8 seeds
@@ -53,7 +53,8 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
         assert lua.count(pat) == 1, f"expected exactly one {pat!r} in the Lua"
         # Past the orb (room (5,2)'s big chest, level 21) a play-through has
         # the second dash: max_djump=2 (celeste-interp game_runner, the same).
-        orb = "max_djump=2 " if room[0] % 8 + room[1] * 8 > 21 else ""
+        # --one-dash: the gemskip categories skip the orb, one dash throughout.
+        orb = "max_djump=2 " if room[0] % 8 + room[1] * 8 > 21 and not one_dash else ""
         lua = lua.replace(pat, f"{orb}load_room({room[0]}, {room[1]})")
     map_data = hexbytes(os.path.join(ROOT, "cart", "map-data.txt"), 8192)
     flags = hexbytes(os.path.join(ROOT, "cart", "flag-data.txt"), 256)
@@ -135,6 +136,7 @@ def main():
     ap.add_argument("--lua", help="the game's Lua (default lua/celeste-minimal.lua)")
     ap.add_argument("--begin-game", action="store_true", help="call begin_game() after _init() (the original cart)")
     ap.add_argument("--balloon-seeds", help="comma-separated balloon offsets in creation order (the tasdatabase header), instead of rnd(1); missing ones are 0")
+    ap.add_argument("--one-dash", action="store_true", help="rooms past the orb with ONE dash (the gemskip categories)")
     ap.add_argument("--room", help="start room \"x,y\" (minimal cart: replaces _init's load_room(1, 0); with --begin-game: begin_game's load_room(0,0))")
     args = ap.parse_args()
     if args.inputs:
@@ -149,7 +151,7 @@ def main():
     cart = os.path.join(work, "replay.p8")
     room = tuple(int(v) for v in args.room.split(",")) if args.room else None
     seeds = [float(v) for v in args.balloon_seeds.split(",") if v] if args.balloon_seeds is not None else None
-    build_cart(inputs, frames, cart, args.lua, args.begin_game, room, seeds)
+    build_cart(inputs, frames, cart, args.lua, args.begin_game, room, seeds, args.one_dash)
     print(f"[replay] {len(inputs)} inputs, {frames} frames, cart {cart}", file=sys.stderr)
     proc = subprocess.run([pico8, "-x", cart], capture_output=True, text=True, timeout=120)
     lines = [l[len("@P8@ "):] for l in proc.stdout.splitlines() if l.startswith("@P8@ ")]

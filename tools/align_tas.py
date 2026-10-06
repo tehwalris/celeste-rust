@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # Align a community tasdatabase TAS with one of ours, frame by frame, in the ORIGINAL cart.
-# usage: tools/align_tas.py ROOM DBNAME(e.g. 2900m) PROLOGUE OUR_TAS_FILE SEEDS|- [OUTDIR]   (category: classic/nodiag)
+# usage: tools/align_tas.py ROOM DBNAME(e.g. 2900m) PROLOGUE OUR_TAS_FILE SEEDS|- [OUTDIR]
+# env TAS_CATEGORY: the tasdatabase category (default nodiag); REPLAY_ARGS: extra replay.py flags (e.g. --one-dash)
 # With OUTDIR, also writes OUTDIR/ours.txt and OUTDIR/reference.txt: the two paths for
 # `rewrite export-ui --witness ours.txt --reference reference.txt` (label, inputs, dash
 # starts, the tasdatabase name / prologue / seeds, then `f x y` per frame from 0 to the exit).
 import json,os,re,subprocess,sys
 D='/home/philippe/src/github.com/CelesteClassic/tasdatabase'
 M='/home/philippe/src/github.com/tehwalris/celeste-rust'
+CAT=os.environ.get('TAS_CATEGORY','nodiag')
 room,name,off,ours_file,seeds=sys.argv[1:6]
 outdir=sys.argv[6] if len(sys.argv)>6 else None
-e=[e for e in json.load(open(D+'/database.json'))['classic']['nodiag'] if e['name']==name][0]
-s=open(f"{D}/classic/nodiag/{e['file']}").read()
+e=[e for e in json.load(open(D+'/database.json'))['classic'][CAT] if e['name']==name][0]
+s=open(f"{D}/classic/{CAT}/{e['file']}").read()
 tas=[0]*int(off)+[int(x) for x in re.findall(r'\d+',s[s.index(']')+1:])]
 ours=[int(x) for x in open(os.path.join(M, ours_file)).read().split('\n') if x and not x.startswith('#') for x in x.split(',')]
 def fix(h):  # tostr(v, true): 16.16 fixed point in hex, 0xiiii.ffff
@@ -18,6 +20,7 @@ def fix(h):  # tostr(v, true): 16.16 fixed point in hex, 0xiiii.ffff
     return (v-(1<<32) if v>=1<<31 else v)/65536
 def run(seq):
     cmd=[M+'/pico8_diff/replay.py','--lua','/home/philippe/src/github.com/tehwalris/celeste_ocaml/celeste.lua','--begin-game','--room',room,'--inputs',','.join(map(str,seq)),'--frames',str(len(seq)+1)]
+    cmd+=os.environ.get('REPLAY_ARGS','').split()
     if seeds!='-': cmd+=['--balloon-seeds',seeds]
     out=subprocess.run(cmd,capture_output=True,text=True,cwd=M,timeout=600).stdout
     rows={}
@@ -52,7 +55,7 @@ def write(path,label,seq,R):
     with open(path,'w') as o:
         # db / prologue / seeds: the UI's "Download .tas" (the database's format, the community file's seeds)
         o.write(f"label {label}\ninputs {','.join(map(str,seq))}\ndashes {' '.join(dashes(R,end))}\n"
-                f"db {name} nodiag\nprologue {off}\nseeds {s[:s.index(']')+1].strip()}\n0 - -\n")
+                f"db {name} {CAT}\nprologue {off}\nseeds {s[:s.index(']')+1].strip()}\n0 - -\n")
         for f in range(1,end+1):
             r=R.get(f)
             o.write(f"{f} {r[1]:.0f} {r[2]:.0f}\n" if r and r[0]==room and r[1] is not None else f"{f} - -\n")

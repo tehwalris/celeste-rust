@@ -6,7 +6,7 @@
 # AppImage, extracted, works without installing anything), and a celeste.p8
 # in UCT's carts/ (the original cart's Lua + cart/ map and flags).
 #   tools/uct/validate.sh LEVEL FILE.tas [more LEVEL FILE pairs...]
-# Env: UCT (clone, default ~/src/github.com/gonengazit/UniversalClassicTas),
+# Env: UCT_DASHES (dash count key, gemskip: 1); UCT (clone, default ~/src/github.com/gonengazit/UniversalClassicTas),
 #      LOVE (default /var/tmp/love/squashfs-root/AppRun).
 set -e
 UCT=${UCT:-$HOME/src/github.com/gonengazit/UniversalClassicTas}
