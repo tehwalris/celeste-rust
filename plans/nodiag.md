@@ -64,3 +64,18 @@ Frame-by-frame alignment (`tools/align_tas.py`, positions per frame):
   4 frames earlier, and an extra dash refill around (84,30) that TAS29 does
   not take allows a second right dash. Ours exits with balloon seeds 0, 0.5
   and PICO-8's rnd.
+
+## Submission files (tasdatabase format)
+
+`tas/tasdatabase/nodiag/{600m,1700m,2900m}_nodiag.tas`: `[seeds]` + inputs
+from the room's first controllable frame (our witness minus the spawn
+prologue), no trailing newline, the same seed list as the file they replace.
+Replayed on a real PICO-8 in the original cart, same harness for both (the
+community file behind the prologue; an earlier offset never exits; the DB's
+frames = exit frame - prologue - 1, which reproduces every listed count):
+
+| room | DB file, listed | its replay | ours | our replay |
+|---|---|---|---|---|
+| 600m | TAS6, 64f | exit f94 = 64f | 63f (64 inputs) | exit f93 = 63f |
+| 1700m | TAS17, 63f | exit f89 = 63f | 61f (62 inputs) | exit f87 = 61f |
+| 2900m | TAS29, 81f | exit f111 = 81f | 76f (77 inputs) | exit f106 = 76f |
