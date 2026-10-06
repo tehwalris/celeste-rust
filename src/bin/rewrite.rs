@@ -71,6 +71,13 @@ enum Command {
         /// `witness.txt` (inputs and player position per frame).
         #[arg(long)]
         save_marks: Option<String>,
+        /// A known solution (a `tas/` file or a comma list of input bytes,
+        /// the spawn prologue included): the concrete search tries its input
+        /// first at every frame, so among the optimal routes the witness
+        /// follows it wherever it can - the smallest change to an existing
+        /// TAS. Every input is still tried; only WHICH optimum is found.
+        #[arg(long)]
+        prefer: Option<String>,
     },
     /// ONE forward pass at ONE level, exactly as the search runs it, with the
     /// per-frame timing line. The profiling entry point for the forward.
@@ -462,7 +469,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Search { to, ceiling, level, checkpoint_dir, room, win_at, no_witness, save_marks } => {
+        Command::Search { to, ceiling, level, checkpoint_dir, room, win_at, no_witness, save_marks, prefer } => {
+            let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
             use celeste_rust::search::arc_dp::{solve, Concrete};
             std::env::set_var("CELESTE_START_ROOM", &room);
             if let Some(xy) = &win_at {
@@ -515,7 +523,7 @@ fn main() -> Result<()> {
                     (false, true) => Concrete::Full,
                     (false, false) => Concrete::AtBound,
                 };
-                let s = solve(&dir, lvl, horizon, concrete, !last, if last { save_marks.as_deref().map(std::path::Path::new) } else { None })?;
+                let s = solve(&dir, lvl, horizon, concrete, !last, if last { save_marks.as_deref().map(std::path::Path::new) } else { None }, prefer.as_deref())?;
                 let wall = t0.elapsed().as_secs_f64();
                 let Some(bound) = s.arc else {
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");

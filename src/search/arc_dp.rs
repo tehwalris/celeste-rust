@@ -607,6 +607,15 @@ impl Witness {
 }
 
 /// THE CONCRETE SEARCH: the concrete optimum and its inputs. A BREADTH-FIRST
+/// The 64 inputs in the order the concrete search tries them at the frame
+/// after `k`: `prefer[k]` first (`rewrite search --prefer`: a known TAS, so
+/// the witness follows it wherever an optimal route allows), then the rest.
+/// Every input is still tried: the order only picks WHICH optimal witness.
+fn input_order(prefer: Option<&[u8]>, k: u32) -> impl Iterator<Item = u8> {
+    let first = prefer.and_then(|p| p.get(k as usize).copied()).filter(|&b| b < 64);
+    first.into_iter().chain((0u8..64).filter(move |&b| Some(b) != first))
+}
+
 /// search over concrete states through the reference engine (every input,
 /// every `rnd` leaf), layer k+1 admitting a successor only if its projection
 /// onto `level` is a node of `g` whose `W_{k+1}` holds its exact remainder
@@ -626,6 +635,7 @@ pub fn concrete_search(
     w: &Winning,
     bound: u32,
     breadth_first: bool,
+    prefer: Option<&[u8]>,
 ) -> anyhow::Result<Option<Witness>> {
     use crate::frame::{frame_files, pack_id, widened_keys, wins_of, Block};
     use anyhow::Result;
@@ -693,13 +703,14 @@ pub fn concrete_search(
             dead: FxHashSet<((u64, u64), u32, u32)>,
             path: Vec<(u8, u32)>,
             steps: u64,
+            prefer: Option<&'a [u8]>,
         }
         /// `Ok(None)`: out of budget.
         fn dfs(cx: &mut Dfs, st: &Rt2, k: u32) -> Result<Option<bool>> {
             if k >= cx.frames {
                 return Ok(Some(false));
             }
-            for byte in 0u8..64 {
+            for byte in input_order(cx.prefer, k) {
                 for b in cx.eng.step(st, byte)? {
                     cx.steps += 1;
                     if cx.steps > DFS_BUDGET {
@@ -738,7 +749,7 @@ pub fn concrete_search(
         const DFS_BUDGET: u64 = 200_000;
         let t = std::time::Instant::now();
         let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { eng: &mut eng, node: &node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0 };
+        let mut cx = Dfs { eng: &mut eng, node: &node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer };
         let found = dfs(&mut cx, start.rt2(), 0)?;
         eprintln!(
             "[concrete] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
@@ -787,7 +798,7 @@ pub fn concrete_search(
                             let mut got = Vec::new();
                             let mut chunk_seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
                             for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
-                                for byte in 0u8..64 {
+                                for byte in input_order(prefer, k) {
                                     for b in eng.step(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
                                         steps += 1;
                                         let cell = b.positions()?[0];
@@ -914,6 +925,7 @@ pub fn solve(
     concrete: Concrete,
     want_marks: bool,
     save: Option<&std::path::Path>,
+    prefer: Option<&[u8]>,
 ) -> anyhow::Result<Solved> {
     use crate::frame::{frame_files, id_layer, Visited};
     use celeste_engine::runtime2::mix64;
@@ -992,7 +1004,7 @@ pub fn solve(
     graph.forget_edges();
     let found = match (concrete, arc) {
         (Concrete::None, _) | (_, None) => None,
-        (c, Some(f)) => concrete_search(dir, level, horizon, &graph, &w, f, c == Concrete::Full)?,
+        (c, Some(f)) => concrete_search(dir, level, horizon, &graph, &w, f, c == Concrete::Full, prefer)?,
     };
     if let Some(wt) = &found {
         println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), wt.inputs_text());
