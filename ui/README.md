@@ -174,6 +174,23 @@ ROOM 2900m PROLOGUE OUR_TAS SEEDS OUTDIR` writes both (`ours.txt`,
 `reference.txt`) from a community TAS and ours replayed in the ORIGINAL
 cart, so the two are directly comparable.
 
+A path file may also name the run in the CelesteClassic tasdatabase:
+`db 2900m nodiag`, `prologue 29` (the spawn frames before the player
+exists - the earliest offset the community TAS exits at, never inferred
+from leading zeros; the export refuses a prologue that presses anything)
+and `seeds [0,0,0]` (the community file's seed list, `seeds []` without;
+`align_tas.py` writes all three). The witness's `tas` in `run.json` is
+then the file itself, and the header has a **Download .tas** button
+saving `2900m_nodiag.tas` byte for byte (`[seeds]` + the inputs after the
+prologue, comma-separated, no trailing newline), next to the frame count
+in the database's convention (inputs after the prologue - 1: `76f vs
+TAS29 81f`). When only the path files changed (the trees may be long
+gone), `export-ui --paths-only --out DIR --witness F --reference F`
+replaces those two entries of `DIR/run.json` and nothing else; that is how
+the three nodiag runs got theirs (2026-10-06, from the files in
+`/var/tmp/celeste-ui/nodiag-paths/`; the downloads are identical to the
+PICO-8-verified `tas/tasdatabase/nodiag/*.tas`).
+
 A path (Room and Passes grains; the `witness` / `paths` chip, `w=0` in
 the hash hides them) is the player's 8x8 box at the frame shown - ours
 cyan and filled, the reference yellow and outlined, so on the same spot

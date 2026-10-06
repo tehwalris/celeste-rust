@@ -82,7 +82,8 @@ header.top {
   grid-template-columns: minmax(0, 1fr) auto;
   grid-template-areas:
     "run tabs"
-    "brand brand";
+    "brand brand"
+    "tas tas";
   gap: 6px 10px;
   align-items: center;
   padding: 8px 10px 6px;
@@ -123,6 +124,23 @@ header.top {
   grid-area: run;
   min-width: 0;
 }
+/* The run's TAS download and its frame count (database convention). */
+.tas-dl {
+  grid-area: tas;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.tas-dl:empty {
+  display: none;
+}
+.tas-frames {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 nav.tabs {
   grid-area: tabs;
   display: flex;
@@ -155,8 +173,8 @@ nav.tabs button.on {
 }
 @media (min-width: 760px) {
   header.top {
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    grid-template-areas: "brand run tabs";
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    grid-template-areas: "brand run tas tabs";
     gap: 16px;
     padding: 8px 16px;
     position: sticky;

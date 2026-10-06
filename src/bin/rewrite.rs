@@ -317,8 +317,8 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
         /// The run's log (its `[fwd]` and `[search] level` lines).
-        #[arg(long)]
-        log: String,
+        #[arg(long, required_unless_present = "paths_only")]
+        log: Option<String>,
         /// Output directory (the UI serves it as `data/`).
         #[arg(long, default_value = "/var/tmp/celeste-ui/data")]
         out: String,
@@ -329,14 +329,20 @@ enum Command {
         #[arg(long)]
         arc: Option<String>,
         /// A concrete run to draw instead of the arc directory's witness:
-        /// `[label TEXT]`, `inputs a,b,..`, `[dashes F:DIR ..]`, then `f x y`
-        /// per frame from 0 (`tools/align_tas.py ... OUTDIR` writes one).
+        /// `[label TEXT]`, `inputs a,b,..`, `[dashes F:DIR ..]`, `[db NAME
+        /// CATEGORY` + `prologue N` + `seeds [..]]` (the UI's tasdatabase
+        /// download), then `f x y` per frame from 0 (`tools/align_tas.py ...
+        /// OUTDIR` writes one).
         #[arg(long)]
         witness: Option<String>,
         /// Another concrete run to draw next to it (same format): e.g. the
         /// community TAS replayed in the original cart.
         #[arg(long)]
         reference: Option<String>,
+        /// Only replace `--witness` / `--reference` in the existing
+        /// `--out/run.json` (no trees, no log read).
+        #[arg(long)]
+        paths_only: bool,
     },
     /// A concrete input sequence that follows a given TRAJECTORY of player
     /// positions (one "x,y" per line from frame 1; `-` accepts any), found
@@ -1372,22 +1378,28 @@ fn main() -> Result<()> {
             arc,
             witness,
             reference,
+            paths_only,
         } => {
-            let (rx, ry) = room
-                .split_once(',')
-                .and_then(|(a, b)| Some((a.parse::<i16>().ok()?, b.parse::<i16>().ok()?)))
-                .ok_or_else(|| anyhow::anyhow!("--room must be \"x,y\", got {room:?}"))?;
-            celeste_rust::search::ui_export::export(
-                std::path::Path::new(&checkpoint_dir),
-                std::path::Path::new(&log),
-                std::path::Path::new(&out),
-                (rx, ry),
-                arc.as_deref().map(std::path::Path::new),
-                celeste_rust::search::ui_export::Paths {
-                    witness: witness.as_deref().map(std::path::Path::new),
-                    reference: reference.as_deref().map(std::path::Path::new),
-                },
-            )?;
+            let paths = celeste_rust::search::ui_export::Paths {
+                witness: witness.as_deref().map(std::path::Path::new),
+                reference: reference.as_deref().map(std::path::Path::new),
+            };
+            if paths_only {
+                celeste_rust::search::ui_export::update_paths(std::path::Path::new(&out), paths)?;
+            } else {
+                let (rx, ry) = room
+                    .split_once(',')
+                    .and_then(|(a, b)| Some((a.parse::<i16>().ok()?, b.parse::<i16>().ok()?)))
+                    .ok_or_else(|| anyhow::anyhow!("--room must be \"x,y\", got {room:?}"))?;
+                celeste_rust::search::ui_export::export(
+                    std::path::Path::new(&checkpoint_dir),
+                    std::path::Path::new(log.as_deref().expect("clap: --log is required without --paths-only")),
+                    std::path::Path::new(&out),
+                    (rx, ry),
+                    arc.as_deref().map(std::path::Path::new),
+                    paths,
+                )?;
+            }
         }
         Command::Trajectory {
             trajectory,

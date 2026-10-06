@@ -16,7 +16,9 @@
 // runs.json: any% first, then e.g. No Diagonal Dashes) and lists each group
 // in GAME order (level
 // index) with the altitude the game shows on entering the room; the
-// default run is still runs.json's first entry.
+// default run is still runs.json's first entry. A run whose witness carries
+// a tasdatabase file (`tas`) gets a "Download .tas" button and its frame
+// count in the database's convention (its own row on a phone).
 import "./style.css";
 import { categoryOf, chapters, fmtDuration, loadRun, loadRuns, pickLabel, runsInGameOrder, type Chapter, type Run, type RunInfo } from "./data";
 import { el, clear, button, select, type Select } from "./ui";
@@ -75,6 +77,19 @@ function errorCard(title: string, detail: string, retry?: () => void): HTMLEleme
   return card;
 }
 
+/** Save `text` as a file named `name`, byte for byte (a Blob and an
+ *  anchor with `download`: works on phone browsers too). octet-stream so
+ *  no browser appends `.txt` to the name. */
+function download(name: string, text: string) {
+  const url = URL.createObjectURL(new Blob([text], { type: "application/octet-stream" }));
+  const a = el("a", { href: url, download: name, style: "display:none" });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  // Safari reads the blob after click() returns.
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
 async function main() {
   const app = document.getElementById("app")!;
   let runs: RunInfo[];
@@ -103,7 +118,9 @@ async function main() {
   let runPicker: Select<string> | null = null;
   const runBox = el("div", { class: "run-switch" });
   const nav = el("nav", { class: "tabs", "aria-label": "views" });
-  const header = el("header", { class: "top" }, [brand, runBox, nav]);
+  // The run's TAS in the tasdatabase's format, when the export carries it.
+  const tasBox = el("div", { class: "tas-dl" });
+  const header = el("header", { class: "top" }, [brand, runBox, tasBox, nav]);
   const main = el("main");
   clear(app);
   app.append(header, main);
@@ -169,6 +186,7 @@ async function main() {
       const label = labelOf(runId);
       buildRunSwitch(runId);
       sub.textContent = "";
+      tasBox.replaceChildren();
       document.title = `${label} · Celeste search`;
       clear(main);
       main.append(spinner(`Loading ${label}…`));
@@ -206,6 +224,13 @@ async function main() {
       if (run.reference) sub.append(el("span", { text: `${run.reference.label.split(/[\s:(]/)[0]}: ${run.reference.path.length - 1} frames` }));
       sub.append(el("span", { text: `${run.horizons.length} horizon${run.horizons.length === 1 ? "" : "s"} tested` }));
       if (wall) sub.append(el("span", { text: `${wall} search` }));
+      const tas = run.witness?.tas;
+      if (tas) {
+        const dl = button("Download .tas", () => download(tas.file, tas.text), "small", `Download ${tas.file} (tasdatabase format)`);
+        // Frames in the database's convention: inputs after the spawn - 1.
+        const ref = run.reference?.tas ? ` vs ${run.reference.label.split(/[\s:(]/)[0]} ${run.reference.tas.frames}f` : "";
+        tasBox.replaceChildren(dl, el("span", { class: "tas-frames", text: `${tas.frames}f${ref}` }));
+      }
     }
     const v = build(t);
     if (tab !== t) {

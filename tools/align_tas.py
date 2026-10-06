@@ -3,7 +3,7 @@
 # usage: tools/align_tas.py ROOM DBNAME(e.g. 2900m) PROLOGUE OUR_TAS_FILE SEEDS|- [OUTDIR]   (category: classic/nodiag)
 # With OUTDIR, also writes OUTDIR/ours.txt and OUTDIR/reference.txt: the two paths for
 # `rewrite export-ui --witness ours.txt --reference reference.txt` (label, inputs, dash
-# starts, then `f x y` per frame from 0 to the exit).
+# starts, the tasdatabase name / prologue / seeds, then `f x y` per frame from 0 to the exit).
 import json,re,subprocess,sys
 D='/home/philippe/src/github.com/CelesteClassic/tasdatabase'
 M='/home/philippe/src/github.com/tehwalris/celeste-rust'
@@ -50,7 +50,9 @@ def dashes(R,end):
 def write(path,label,seq,R):
     end=ex(R)
     with open(path,'w') as o:
-        o.write(f"label {label}\ninputs {','.join(map(str,seq))}\ndashes {' '.join(dashes(R,end))}\n0 - -\n")
+        # db / prologue / seeds: the UI's "Download .tas" (the database's format, the community file's seeds)
+        o.write(f"label {label}\ninputs {','.join(map(str,seq))}\ndashes {' '.join(dashes(R,end))}\n"
+                f"db {name} nodiag\nprologue {off}\nseeds {s[:s.index(']')+1].strip()}\n0 - -\n")
         for f in range(1,end+1):
             r=R.get(f)
             o.write(f"{f} {r[1]:.0f} {r[2]:.0f}\n" if r and r[0]==room and r[1] is not None else f"{f} - -\n")

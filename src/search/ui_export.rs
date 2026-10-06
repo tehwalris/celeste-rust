@@ -143,13 +143,44 @@ pub struct Run {
 /// A concrete witness: its inputs and the player's (x, y) per frame (frame 0
 /// the start; `None` without a player), in the cells' pixel coordinates, and
 /// the frames a dash starts at with its direction (`R`, `U`, ...; only when
-/// the file lists them).
+/// the file lists them). With `db` / `prologue` / `seeds` lines, also the run
+/// as a tasdatabase file (`tas`).
 #[derive(Serialize, Debug)]
 pub struct Witness {
     pub label: String,
     pub inputs: Vec<u8>,
     pub path: Vec<Option<(i32, i32)>>,
     pub dashes: Vec<(u32, String)>,
+    pub tas: Option<TasFile>,
+}
+
+/// A run in the CelesteClassic tasdatabase's format: `[seeds]` then the
+/// input bytes comma-separated, no trailing newline, starting at the room's
+/// first controllable frame - the spawn PROLOGUE (the frames before the
+/// player exists; the earliest offset the community TAS exits at) is not in
+/// it. `frames` is the database's count: inputs after the prologue - 1.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct TasFile {
+    /// `2900m_nodiag.tas`: the database's room name and category.
+    pub file: String,
+    pub text: String,
+    pub frames: u32,
+    pub prologue: u32,
+}
+
+impl TasFile {
+    fn new(name: &str, category: &str, prologue: usize, seeds: &[u32], inputs: &[u8]) -> Result<Self> {
+        anyhow::ensure!(prologue < inputs.len(), "prologue {prologue}: only {} inputs", inputs.len());
+        // The prologue is dropped, so it must not press anything.
+        anyhow::ensure!(inputs[..prologue].iter().all(|&b| b == 0), "the prologue's {prologue} inputs are not all 0: {:?}", &inputs[..prologue]);
+        let list = |v: Vec<String>| v.join(",");
+        let text = format!(
+            "[{}]{}",
+            list(seeds.iter().map(|s| s.to_string()).collect()),
+            list(inputs[prologue..].iter().map(|b| b.to_string()).collect())
+        );
+        Ok(TasFile { file: format!("{name}_{category}.tas"), text, frames: (inputs.len() - prologue - 1) as u32, prologue: prologue as u32 })
+    }
 }
 
 fn num<T: std::str::FromStr>(tok: &str) -> Result<T>
@@ -670,30 +701,50 @@ fn read_keyed(path: &Path) -> Result<FxHashMap<String, String>> {
 
 /// `witness.txt` (`search --save-marks`): `inputs a,b,..`, then
 /// `f x y` per frame from 0 (`f - -` without a player). A file for
-/// `--witness` / `--reference` (`tools/align_tas.py`) may start with
-/// `label TEXT` and carry `dashes F:DIR ...` before the frames; the frames
-/// may end early (at the exit).
+/// `--witness` / `--reference` (`tools/align_tas.py`) may also carry, before
+/// the frames and in any order, `label TEXT`, `dashes F:DIR ...`, and for the
+/// tasdatabase file (`TasFile`) all three of `db NAME CATEGORY` (`db 2900m
+/// nodiag`), `prologue N` (the spawn frames to strip) and `seeds [a,b,..]`
+/// (`seeds []` without); the frames may end early (at the exit).
 fn read_witness(path: &Path) -> Result<Witness> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let name = path.display();
     let mut lines = text.lines().peekable();
-    let label = lines.next_if(|l| l.starts_with("label ")).map(|l| l["label ".len()..].trim().to_string());
-    let inputs: Vec<u8> = lines
-        .next()
-        .and_then(|l| l.strip_prefix("inputs "))
+    let mut head: FxHashMap<&str, &str> = FxHashMap::default();
+    while let Some(l) = lines.next_if(|l| !l.starts_with(|c: char| c.is_ascii_digit())) {
+        let (k, v) = l.split_once(' ').unwrap_or((l, ""));
+        anyhow::ensure!(["label", "inputs", "dashes", "db", "prologue", "seeds"].contains(&k), "{name}: unknown line {l:?}");
+        anyhow::ensure!(head.insert(k, v.trim()).is_none(), "{name}: two `{k}` lines");
+    }
+    let inputs: Vec<u8> = head
+        .get("inputs")
         .with_context(|| format!("{name}: no `inputs` line"))?
         .split(',')
         .map(|b| b.trim().parse::<u8>().with_context(|| format!("{name}: an input byte")))
         .collect::<Result<_>>()?;
-    let dashes = match lines.next_if(|l| l.starts_with("dashes")) {
-        Some(l) => l["dashes".len()..]
-            .split_whitespace()
-            .map(|d| {
-                let (f, dir) = d.split_once(':').with_context(|| format!("{name}: dash {d:?} is not F:DIR"))?;
-                Ok((num(f)?, dir.to_string()))
-            })
-            .collect::<Result<_>>()?,
-        None => Vec::new(),
+    let dashes = head
+        .get("dashes")
+        .map_or("", |v| v)
+        .split_whitespace()
+        .map(|d| {
+            let (f, dir) = d.split_once(':').with_context(|| format!("{name}: dash {d:?} is not F:DIR"))?;
+            Ok((num(f)?, dir.to_string()))
+        })
+        .collect::<Result<_>>()?;
+    let tas = match (head.get("db"), head.get("prologue"), head.get("seeds")) {
+        (None, None, None) => None,
+        (Some(db), Some(prologue), Some(seeds)) => {
+            let (db_name, category) = db.split_once(' ').with_context(|| format!("{name}: `db {db}` is not `db NAME CATEGORY`"))?;
+            let inner = seeds.strip_prefix('[').and_then(|s| s.strip_suffix(']')).with_context(|| format!("{name}: `seeds {seeds}` is not `seeds [a,b,..]`"))?;
+            let seeds: Vec<u32> = inner
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().parse::<u32>().with_context(|| format!("{name}: a seed")))
+                .collect::<Result<_>>()?;
+            let prologue: usize = prologue.parse().with_context(|| format!("{name}: `prologue {prologue}`"))?;
+            Some(TasFile::new(db_name, category.trim(), prologue, &seeds, &inputs).with_context(|| format!("{name}: the tasdatabase file"))?)
+        }
+        _ => bail!("{name}: `db`, `prologue` and `seeds` go together"),
     };
     let mut path_xy = Vec::new();
     for (i, l) in lines.enumerate() {
@@ -702,8 +753,8 @@ fn read_witness(path: &Path) -> Result<Witness> {
         path_xy.push(if t[1] == "-" { None } else { Some((num(t[1])?, num(t[2])?)) });
     }
     anyhow::ensure!((1..=inputs.len() + 1).contains(&path_xy.len()), "{name}: {} inputs, {} positions", inputs.len(), path_xy.len());
-    let label = label.unwrap_or_else(|| format!("concrete witness inside the winning sets, a win at f{}", inputs.len()));
-    Ok(Witness { label, inputs, path: path_xy, dashes })
+    let label = head.get("label").map_or_else(|| format!("concrete witness inside the winning sets, a win at f{}", inputs.len()), |l| l.to_string());
+    Ok(Witness { label, inputs, path: path_xy, dashes, tas })
 }
 
 /// `--arc DIR` (`search --save-marks DIR`): the last forward level gets the
@@ -747,6 +798,24 @@ fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path) -> Res
 pub struct Paths<'a> {
     pub witness: Option<&'a Path>,
     pub reference: Option<&'a Path>,
+}
+
+/// `export-ui --paths-only`: replace the concrete paths (`witness`,
+/// `reference`) in an existing export's `run.json` and nothing else - for
+/// path files that changed after the run's trees were deleted.
+pub fn update_paths(out: &Path, paths: Paths) -> Result<()> {
+    anyhow::ensure!(paths.witness.is_some() || paths.reference.is_some(), "--paths-only needs --witness or --reference");
+    let p = out.join("run.json");
+    let text = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+    let mut run: serde_json::Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
+    let obj = run.as_object_mut().with_context(|| format!("{}: not an object", p.display()))?;
+    for (key, file) in [("witness", paths.witness), ("reference", paths.reference)] {
+        if let Some(file) = file {
+            obj.insert(key.to_string(), serde_json::to_value(read_witness(file)?)?);
+            eprintln!("[export-ui] {}: `{key}` from {}", p.display(), file.display());
+        }
+    }
+    std::fs::write(&p, serde_json::to_string(&run)?).with_context(|| format!("writing {}", p.display()))
 }
 
 /// The export. `checkpoint_dir` is a search's (`levelNN/` under it) or one
@@ -955,6 +1024,13 @@ mod tests {
         let r = read("label TAS29 (community)\ninputs 0,34,0\ndashes 2:R\n0 - -\n1 8 96\n2 13 96\n").unwrap();
         assert_eq!((r.label.as_str(), r.path.len(), r.dashes), ("TAS29 (community)", 3, vec![(2, "R".to_string())]));
         assert!(read("inputs 0,34\n0 - -\n2 8 96\n").is_err(), "frames are consecutive from 0");
+        // The tasdatabase file: the prologue stripped, the seeds in front, no newline.
+        let t = read("label ours\ninputs 0,0,16,0,2\ndb 2900m nodiag\nprologue 2\nseeds [0,0,0]\n0 - -\n").unwrap().tas.unwrap();
+        assert_eq!(t, TasFile { file: "2900m_nodiag.tas".into(), text: "[0,0,0]16,0,2".into(), frames: 2, prologue: 2 });
+        let t = read("inputs 0,17,0\nprologue 1\nseeds []\ndb 600m nodiag\n0 - -\n").unwrap().tas.unwrap();
+        assert_eq!((t.text.as_str(), t.frames), ("[]17,0", 1));
+        assert!(read("inputs 0,17,0\nprologue 2\nseeds []\ndb 600m nodiag\n0 - -\n").is_err(), "a prologue that presses a button");
+        assert!(read("inputs 0,17,0\nprologue 1\n0 - -\n").is_err(), "db, prologue and seeds go together");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

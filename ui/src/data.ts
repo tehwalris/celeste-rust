@@ -125,6 +125,19 @@ export interface Witness {
   inputs: number[];
   path: ([number, number] | null)[];
   dashes?: [number, string][];
+  /** The run as a CelesteClassic tasdatabase file (`db` / `prologue` /
+   *  `seeds` in the path file; absent otherwise and in older exports). */
+  tas?: TasFile | null;
+}
+
+/** A tasdatabase file: `file` its name (`2900m_nodiag.tas`), `text` its
+ *  exact content (`[seeds]` + the inputs after the spawn prologue, no
+ *  newline), `frames` the database's count (those inputs - 1). */
+export interface TasFile {
+  file: string;
+  text: string;
+  frames: number;
+  prologue: number;
 }
 
 /** A state with no player position (see ui_export::NO_POSITION). */
