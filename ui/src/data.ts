@@ -130,7 +130,7 @@ export interface Witness {
   tas?: TasFile | null;
 }
 
-/** A tasdatabase file: `file` its name (`2900m_nodiag.tas`), `text` its
+/** A tasdatabase file: `file` its name (`TAS29.tas`), `text` its
  *  exact content (`[seeds]` + the inputs after the spawn prologue, no
  *  newline), `frames` the database's count (those inputs - 1). */
 export interface TasFile {
