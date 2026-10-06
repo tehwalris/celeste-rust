@@ -154,14 +154,16 @@ pub struct Witness {
     pub tas: Option<TasFile>,
 }
 
-/// A run in the CelesteClassic tasdatabase's format: `[seeds]` then the
-/// input bytes comma-separated, no trailing newline, starting at the room's
-/// first controllable frame - the spawn PROLOGUE (the frames before the
-/// player exists; the earliest offset the community TAS exits at) is not in
-/// it. `frames` is the database's count: inputs after the prologue - 1.
+/// A run as the community's TAS tool (UniversalClassicTas) clean-saves it,
+/// the file the tasdatabase upload takes: `[` each seed then `,` `]`, each
+/// input byte then `,`, no newline, starting at the room's first
+/// controllable frame - the spawn PROLOGUE (the frames before the player
+/// exists; the earliest offset the community TAS exits at) is not in it.
+/// Named `TAS<level>.tas` (2900m: level 29). `frames` is the database's
+/// count: inputs after the prologue - 1.
 #[derive(Serialize, Debug, PartialEq)]
 pub struct TasFile {
-    /// `2900m_nodiag.tas`: the database's room name and category.
+    /// `TAS29.tas`: the database's file name for the level.
     pub file: String,
     pub text: String,
     pub frames: u32,
@@ -169,17 +171,18 @@ pub struct TasFile {
 }
 
 impl TasFile {
-    fn new(name: &str, category: &str, prologue: usize, seeds: &[u32], inputs: &[u8]) -> Result<Self> {
+    fn new(name: &str, prologue: usize, seeds: &[u32], inputs: &[u8]) -> Result<Self> {
         anyhow::ensure!(prologue < inputs.len(), "prologue {prologue}: only {} inputs", inputs.len());
         // The prologue is dropped, so it must not press anything.
         anyhow::ensure!(inputs[..prologue].iter().all(|&b| b == 0), "the prologue's {prologue} inputs are not all 0: {:?}", &inputs[..prologue]);
-        let list = |v: Vec<String>| v.join(",");
+        let level: u32 = name.strip_suffix('m').and_then(|m| m.parse::<u32>().ok()).filter(|m| m % 100 == 0).map(|m| m / 100).with_context(|| format!("{name}: not a level name like 2900m"))?;
+        let each = |v: Vec<String>| v.iter().map(|x| format!("{x},")).collect::<String>();
         let text = format!(
             "[{}]{}",
-            list(seeds.iter().map(|s| s.to_string()).collect()),
-            list(inputs[prologue..].iter().map(|b| b.to_string()).collect())
+            each(seeds.iter().map(|s| s.to_string()).collect()),
+            each(inputs[prologue..].iter().map(|b| b.to_string()).collect())
         );
-        Ok(TasFile { file: format!("{name}_{category}.tas"), text, frames: (inputs.len() - prologue - 1) as u32, prologue: prologue as u32 })
+        Ok(TasFile { file: format!("TAS{level}.tas"), text, frames: (inputs.len() - prologue - 1) as u32, prologue: prologue as u32 })
     }
 }
 
@@ -734,7 +737,7 @@ fn read_witness(path: &Path) -> Result<Witness> {
     let tas = match (head.get("db"), head.get("prologue"), head.get("seeds")) {
         (None, None, None) => None,
         (Some(db), Some(prologue), Some(seeds)) => {
-            let (db_name, category) = db.split_once(' ').with_context(|| format!("{name}: `db {db}` is not `db NAME CATEGORY`"))?;
+            let (db_name, _category) = db.split_once(' ').with_context(|| format!("{name}: `db {db}` is not `db NAME CATEGORY`"))?;
             let inner = seeds.strip_prefix('[').and_then(|s| s.strip_suffix(']')).with_context(|| format!("{name}: `seeds {seeds}` is not `seeds [a,b,..]`"))?;
             let seeds: Vec<u32> = inner
                 .split(',')
@@ -742,7 +745,7 @@ fn read_witness(path: &Path) -> Result<Witness> {
                 .map(|s| s.trim().parse::<u32>().with_context(|| format!("{name}: a seed")))
                 .collect::<Result<_>>()?;
             let prologue: usize = prologue.parse().with_context(|| format!("{name}: `prologue {prologue}`"))?;
-            Some(TasFile::new(db_name, category.trim(), prologue, &seeds, &inputs).with_context(|| format!("{name}: the tasdatabase file"))?)
+            Some(TasFile::new(db_name, prologue, &seeds, &inputs).with_context(|| format!("{name}: the tasdatabase file"))?)
         }
         _ => bail!("{name}: `db`, `prologue` and `seeds` go together"),
     };
@@ -1026,9 +1029,9 @@ mod tests {
         assert!(read("inputs 0,34\n0 - -\n2 8 96\n").is_err(), "frames are consecutive from 0");
         // The tasdatabase file: the prologue stripped, the seeds in front, no newline.
         let t = read("label ours\ninputs 0,0,16,0,2\ndb 2900m nodiag\nprologue 2\nseeds [0,0,0]\n0 - -\n").unwrap().tas.unwrap();
-        assert_eq!(t, TasFile { file: "2900m_nodiag.tas".into(), text: "[0,0,0]16,0,2".into(), frames: 2, prologue: 2 });
+        assert_eq!(t, TasFile { file: "TAS29.tas".into(), text: "[0,0,0,]16,0,2,".into(), frames: 2, prologue: 2 });
         let t = read("inputs 0,17,0\nprologue 1\nseeds []\ndb 600m nodiag\n0 - -\n").unwrap().tas.unwrap();
-        assert_eq!((t.text.as_str(), t.frames), ("[]17,0", 1));
+        assert_eq!((t.text.as_str(), t.frames), ("[]17,0,", 1));
         assert!(read("inputs 0,17,0\nprologue 2\nseeds []\ndb 600m nodiag\n0 - -\n").is_err(), "a prologue that presses a button");
         assert!(read("inputs 0,17,0\nprologue 1\n0 - -\n").is_err(), "db, prologue and seeds go together");
         std::fs::remove_dir_all(&dir).unwrap();
