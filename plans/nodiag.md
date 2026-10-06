@@ -79,3 +79,18 @@ frames = exit frame - prologue - 1, which reproduces every listed count):
 | 600m | TAS6, 64f | exit f94 = 64f | 63f (64 inputs) | exit f93 = 63f |
 | 1700m | TAS17, 63f | exit f89 = 63f | 61f (62 inputs) | exit f87 = 61f |
 | 2900m | TAS29, 81f | exit f111 = 81f | 76f (77 inputs) | exit f106 = 76f |
+
+## Checked in the community tool, UniversalClassicTas (2026-10-06)
+
+`tools/uct/validate.sh LEVEL FILE...` runs files through UCT
+(CelesteClassic/UniversalClassicTas, 2022-01-09) headlessly: the official
+LOVE 11.5 AppImage, extracted, with `SDL_VIDEODRIVER=offscreen` (no X, no
+pacman), a `celeste.p8` built from the original cart's Lua + cart/ data, and a
+small driver (`tools/uct/driver.lua`) that presses W (load), D (restart) and U
+(clean save: play back, trim at the level end). All six files - the three
+database files and ours - finish and clean-save unchanged: 600m 65 -> 64 inputs
+(64f -> 63f), 1700m 64 -> 62 (63f -> 61f), 2900m 82 -> 77 (81f -> 76f), the
+same counts as the real PICO-8. Upload files, as UCT's clean save writes them
+(trailing commas; 600m's one balloon seed written as `[0,]`):
+`tas/tasdatabase/nodiag/upload/TAS{6,17,29}.tas`. To submit: one Discord
+message `!uploadtas classic nodiag` with the three files attached.
