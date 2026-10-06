@@ -1,0 +1,6 @@
+# Room (3,3) "2800m", No Diagonal Dashes: exit during frame 179 (2026-10-06).
+# Community nodiag TAS28: 184 in our counting. rewrite search --level r0sxhn,r0sxh,
+# CELESTE_NODIAG=1, level -1 at the ceiling; arc bound = optimum, concrete witness.
+# Verified: original cart via tools/align_tas.py (seeds 0,0); UniversalClassicTas clean save
+# (tools/uct/validate.sh). Upload file: tas/tasdatabase/nodiag/upload/TAS28.tas
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,2,2,18,2,2,2,2,2,2,0,0,0,0,0,16,0,0,0,0,0,0,0,0,1,0,1,1,1,0,0,2,0,2,2,0,2,2,0,2,2,34,0,0,0,0,0,0,0,0,0,40,0,0,0,0,0,0,2,2,2,34,0,0,0,0,0,0,16,0,0,0,34,0,0,0,0,0,0,0,0,0,0,36,0,0,0,0,0,0,0,0,0,36,0,0,0,0,0,0,0,1,1,1,17,1,1,1,1,1,1,36,0,0,0,0,0,0,0,36,0,0,0,0,0,0,0,0

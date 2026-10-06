@@ -21,6 +21,11 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (5,0) 600m | 77 | 94 (TAS6, offset 29, any seed) | **93 - 1 FASTER** | `rewrite search --level r0sxhn,r0sxh` (no L-1: balloon y): bounds 91, 93; witness 93; 132 s, 5.1 GB; exits f93 on a real PICO-8 in both carts for every seed tried. `tas/room_5_0_nodiag_frame_93.txt` |
 | (0,1) 900m | 100 | 108 (TAS9, offset 27) | 108 (tie) | bounds 106, 108 (r0sxh); 619 s, 17.5 GB. `tas/room_0_1_nodiag_frame_108.txt` |
 | (2,0) 300m | 95 | 108 (TAS3, offset 25) | - | level 0 explodes (122M states at f76, 620M visited, with level -1): the spring's speed spread; stopped |
+| (1,3) 2600m | 127 | 135 (TAS26, offset 25) | **133 - 2 FASTER** | arc bound 133 at r0sxhn, witness; 153 s, 8.1 GB; original cart: TAS26 f135, ours f133; UCT: 109f -> 107f. `tas/room_1_3_nodiag_frame_133.txt` |
+| (5,2) 2200m | 150 | 158 (TAS22, offset 25) | **157 - 1 FASTER** | arc bound 157 at r0sxhn, witness; 2027 s, 44.5 GB; original cart: TAS22 f158, ours f157; UCT: 132f -> 131f (TAS22's file has 3 inputs past the exit, which UCT's clean save trims). `tas/room_5_2_nodiag_frame_157.txt` |
+| (3,3) 2800m | 172 | 184 (TAS28, offset 49) | **179 - 5 FASTER** | arc bound 179 at r0sxhn, witness; 262 s, 13.8 GB; original cart: TAS28 f184, ours f179; UCT: 134f -> 129f. `tas/room_3_3_nodiag_frame_179.txt` |
+| (5,1) 1400m | 104 | 121 (TAS14, offset 25) | - | out of memory with level -1 (62 GB); the retry without it filled the disk; not solved |
+| (3,2) 2000m | 128 | 152 (TAS20, offset 31) | - | out of memory; not solved |
 | (1,1) 1000m | 94 | 94 (TAS10) | - | (validation, not run) |
 
 ## The concrete count-up (arc-search --witness)
@@ -92,5 +97,5 @@ database files and ours - finish and clean-save unchanged: 600m 65 -> 64 inputs
 (64f -> 63f), 1700m 64 -> 62 (63f -> 61f), 2900m 82 -> 77 (81f -> 76f), the
 same counts as the real PICO-8. Upload files, as UCT's clean save writes them
 (trailing commas; 600m's one balloon seed written as `[0,]`):
-`tas/tasdatabase/nodiag/upload/TAS{6,17,29}.tas`. To submit: one Discord
+`tas/tasdatabase/nodiag/upload/TAS{6,17,29}.tas` (and, verified the same way 2026-10-06, TAS{22,26,28}.tas). To submit: one Discord
 message `!uploadtas classic nodiag` with the three files attached.

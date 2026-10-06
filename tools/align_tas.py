@@ -4,7 +4,7 @@
 # With OUTDIR, also writes OUTDIR/ours.txt and OUTDIR/reference.txt: the two paths for
 # `rewrite export-ui --witness ours.txt --reference reference.txt` (label, inputs, dash
 # starts, the tasdatabase name / prologue / seeds, then `f x y` per frame from 0 to the exit).
-import json,re,subprocess,sys
+import json,os,re,subprocess,sys
 D='/home/philippe/src/github.com/CelesteClassic/tasdatabase'
 M='/home/philippe/src/github.com/tehwalris/celeste-rust'
 room,name,off,ours_file,seeds=sys.argv[1:6]
@@ -12,7 +12,7 @@ outdir=sys.argv[6] if len(sys.argv)>6 else None
 e=[e for e in json.load(open(D+'/database.json'))['classic']['nodiag'] if e['name']==name][0]
 s=open(f"{D}/classic/nodiag/{e['file']}").read()
 tas=[0]*int(off)+[int(x) for x in re.findall(r'\d+',s[s.index(']')+1:])]
-ours=[int(x) for x in open(f"{M}/{ours_file}").read().split('\n') if x and not x.startswith('#') for x in x.split(',')]
+ours=[int(x) for x in open(os.path.join(M, ours_file)).read().split('\n') if x and not x.startswith('#') for x in x.split(',')]
 def fix(h):  # tostr(v, true): 16.16 fixed point in hex, 0xiiii.ffff
     v=int(h.replace('0x','').replace('.',''),16)
     return (v-(1<<32) if v>=1<<31 else v)/65536
