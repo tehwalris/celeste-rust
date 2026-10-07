@@ -226,7 +226,9 @@ One pass per frame, no owners, no budget, one barrier.
 
 1. **Units in cell order.** The frontier is the workers' pieces of the
    previous frame, each sorted by (cell, key) and checkpointed in FLUSH order
-   (format v9, a run index of `(cell, start, len)` per file). Units of
+   (format v10, a run index of `(cell, start, len)` per file; v10 stores a
+   mixed column in 9 B a row and a boolean-like one in 1 B, against 16 B).
+   Units of
    `unit_lanes()` lanes (1024 since 2026-09-18; `CELESTE_UNIT_LANES`, a
    multiple of 64) are pulled by `threads()` workers (default one per physical
    core, `CELESTE_THREADS`) in cell order across pieces: the wave. A unit is

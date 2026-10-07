@@ -23,7 +23,7 @@ use celeste_engine::runtime2::{Cell2, Col, Rt2, AV};
 const MAGIC: &[u8; 4] = b"C8TB";
 /// Bump whenever the meaning or layout of ANY checkpoint content changes
 /// (older trees are refused; history in git).
-pub const FORMAT_VERSION: u32 = 9;
+pub const FORMAT_VERSION: u32 = 10;
 
 /// Where one column lives: uniform (in the header) or raw in the data
 /// region at a byte offset, `width` entries of the kind's fixed width.
@@ -34,13 +34,20 @@ enum ColMeta {
     N(u64),
     /// `Col::I`: 8 bytes per row (low, high).
     I(u64),
-    /// `Col::V`: 16 bytes per row (`encode_av`).
+    /// `Col::V`: 9 bytes per row, the tag and two payload words
+    /// (`av_parts`).
     V(u64),
+    /// `Col::V` whose every row is a tag with a payload of 0 or 1 and no
+    /// second word (booleans, unknown booleans, nils): 1 byte per row, `tag
+    /// << 1 | payload`. (Format 10: room (5,1) nodiag's rows carried four
+    /// such columns at 16 B each, 64 of a row's 148 B.)
+    S(u64),
 }
 
 const N_BYTES: usize = 4;
 const I_BYTES: usize = 8;
-const V_BYTES: usize = 16;
+const V_BYTES: usize = 9;
+const S_BYTES: usize = 1;
 const KEY_BYTES: usize = 16;
 
 #[derive(Serialize, Deserialize)]
@@ -61,9 +68,9 @@ struct Header {
     wins: Vec<(u32, u32)>,
 }
 
-/// A row's `AV` as 16 fixed bytes: tag, two payload words, zero.
-fn encode_av(v: AV, out: &mut [u8]) {
-    let (tag, a, b): (u32, u32, u32) = match v {
+/// A row's `AV` as its tag and two payload words.
+fn av_parts(v: AV) -> (u8, u32, u32) {
+    match v {
         AV::Num(n) => (0, n.as_raw_u32(), 0),
         AV::Ival(lo, hi) => (1, lo.as_raw_u32(), hi.as_raw_u32()),
         AV::Bool(x) => (2, x as u32, 0),
@@ -73,16 +80,11 @@ fn encode_av(v: AV, out: &mut [u8]) {
         AV::Ptr(p) => (6, p, 0),
         AV::NilPtr => (7, 0, 0),
         AV::UNum => (8, 0, 0),
-    };
-    out[0..4].copy_from_slice(&tag.to_le_bytes());
-    out[4..8].copy_from_slice(&a.to_le_bytes());
-    out[8..12].copy_from_slice(&b.to_le_bytes());
-    out[12..16].copy_from_slice(&0u32.to_le_bytes());
+    }
 }
 
-fn decode_av(bytes: &[u8]) -> Result<AV> {
-    let w = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-    let (tag, a, b) = (w(0), w(1), w(2));
+/// `av_parts` inverted.
+fn av_of(tag: u8, a: u32, b: u32) -> Result<AV> {
     Ok(match tag {
         0 => AV::Num(P8::from_raw(a as i32)),
         1 => AV::Ival(P8::from_raw(a as i32), P8::from_raw(b as i32)),
@@ -95,6 +97,28 @@ fn decode_av(bytes: &[u8]) -> Result<AV> {
         8 => AV::UNum,
         t => return Err(anyhow!("checkpoint: unknown AV tag {t}")),
     })
+}
+
+/// A `ColMeta::V` row: the tag and both payload words.
+fn encode_v(v: AV, d: &mut [u8]) {
+    let (tag, a, b) = av_parts(v);
+    d[0] = tag;
+    d[1..5].copy_from_slice(&a.to_le_bytes());
+    d[5..9].copy_from_slice(&b.to_le_bytes());
+}
+
+fn decode_v(d: &[u8]) -> Result<AV> {
+    av_of(d[0], u32::from_le_bytes(d[1..5].try_into().unwrap()), u32::from_le_bytes(d[5..9].try_into().unwrap()))
+}
+
+/// A `ColMeta::S` row, if `v` fits one: `tag << 1 | payload`.
+fn encode_s(v: AV) -> Option<u8> {
+    let (tag, a, b) = av_parts(v);
+    (a <= 1 && b == 0).then_some(tag << 1 | a as u8)
+}
+
+fn decode_s(x: u8) -> Result<AV> {
+    av_of(x >> 1, (x & 1) as u32, 0)
 }
 
 /// Save one piece in ITS OWN row order; `cells` per row, `wins` marks the
@@ -128,9 +152,10 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
                 off += (width * I_BYTES) as u64;
                 m
             }
-            Col::V(_) => {
-                let m = ColMeta::V(off);
-                off += (width * V_BYTES) as u64;
+            Col::V(vs) => {
+                let small = vs.iter().all(|&v| encode_s(v).is_some());
+                let (m, bytes) = if small { (ColMeta::S(off), S_BYTES) } else { (ColMeta::V(off), V_BYTES) };
+                off += (width * bytes) as u64;
                 m
             }
         });
@@ -187,7 +212,13 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
             (Col::V(vs), ColMeta::V(o)) => {
                 let o = *o as usize;
                 for (i, v) in vs.iter().enumerate() {
-                    encode_av(*v, &mut data[o + i * V_BYTES..o + (i + 1) * V_BYTES]);
+                    encode_v(*v, &mut data[o + i * V_BYTES..o + (i + 1) * V_BYTES]);
+                }
+            }
+            (Col::V(vs), ColMeta::S(o)) => {
+                let o = *o as usize;
+                for (i, v) in vs.iter().enumerate() {
+                    data[o + i] = encode_s(*v).expect("a small column");
                 }
             }
             (Col::U(_), ColMeta::U(_)) => {}
@@ -366,9 +397,8 @@ impl FrameFile {
                             })
                             .collect(),
                     ),
-                    ColMeta::V(o) => {
-                        Col::V(rows().map(|r| decode_av(at(*o, r, V_BYTES))).collect::<Result<Vec<_>>>()?)
-                    }
+                    ColMeta::V(o) => Col::V(rows().map(|r| decode_v(at(*o, r, V_BYTES))).collect::<Result<Vec<_>>>()?),
+                    ColMeta::S(o) => Col::V(rows().map(|r| decode_s(at(*o, r, S_BYTES)[0])).collect::<Result<Vec<_>>>()?),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -433,7 +463,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn av_round_trips_through_the_fixed_encoding() {
+    fn av_round_trips_through_both_encodings() {
         let vals = [
             AV::Num(P8::from_raw(-0x1_2345)),
             AV::Ival(P8::from_raw(3), P8::from_raw(0x7fff_ffff)),
@@ -444,11 +474,20 @@ mod tests {
             AV::Nil,
             AV::Ptr(0xdead_beef),
             AV::NilPtr,
+            AV::UNum,
+            AV::Num(P8::from_raw(1)),
         ];
         for v in vals {
-            let mut b = [0u8; 16];
-            encode_av(v, &mut b);
-            assert_eq!(decode_av(&b).unwrap(), v);
+            let mut b = [0u8; V_BYTES];
+            encode_v(v, &mut b);
+            assert_eq!(decode_v(&b).unwrap(), v);
+            if let Some(x) = encode_s(v) {
+                assert_eq!(decode_s(x).unwrap(), v);
+            }
         }
+        // The small encoding takes the booleans and the payload-free tags,
+        // not a number past 1 or an interval.
+        assert!([AV::Bool(true), AV::Bool(false), AV::UBool, AV::Nil, AV::NilPtr, AV::UNum].iter().all(|&v| encode_s(v).is_some()));
+        assert!(encode_s(AV::Num(P8::from_raw(2))).is_none() && encode_s(AV::Ival(P8::from_raw(0), P8::from_raw(1))).is_none());
     }
 }
