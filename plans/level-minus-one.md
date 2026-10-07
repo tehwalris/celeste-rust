@@ -82,6 +82,12 @@ The table is horizon-independent: one per room.
 - Room (0,2): 288,366 recorded in-room transitions of an unfiltered `r0sxhn`
   tree, 0 not in the table.
 
+- A known solution against the table: `CELESTE_START_ROOM=X,Y rewrite
+  l1-check --inputs tas/FILE --horizon EXIT` steps it with the reference
+  engine and fails if any state of the exiting lineage is too late. 0 too
+  late (2026-10-07): (1,0) at 99, (5,0) at 77, (2,3) at 106, (6,2) at 75,
+  (3,0) at 89, (6,2) nodiag at 80, (6,2) gemskip (TAS23's 120).
+
 ## Measurements that matter
 
 | room | table build | nodes | start's d | known optimum | effect |
@@ -116,9 +122,28 @@ unfiltered counts at f50 (d = 31 against the real 46); that needed `p`.
 - **The point split** (2026-09-20) and the move arity cap (`7dce5b4`) had
   silently broken level -1 everywhere, room (1,0) included, unnoticed because
   the room being run did not use it. Repaired in `4b31c1b`.
-- **Still refused** (rooms run unfiltered): a balloon's bob `y` widened at `n`
-  in the start state (rooms (1,2), (2,3): "not a literal range"); the unknown
-  fly fruit's `rem.y` (room (6,2)); the summit (it measures the room exit).
+- **The fly fruit** (rooms (3,0), (6,2); 2026-10-07): exact, its flight
+  (`spd.y = appr(spd.y, -3.5, 0.25)`, `fly` unknown) grows `spd.y` by 0.25 a
+  pass until the widening jumps to the 16.16 extreme; its `move` fork then
+  spans 65,536 floors at arity 2 and `rem.y` leaves [-0.5, 0.5). Now a shape
+  with a player and a fly fruit is traced with the `f` level's fruit
+  (`widen::fork_fruit_inputs`: `step`/`y` unknown, `spd.y`/`rem.y` their
+  literal ranges, `fly` unknown; the evaluator reads the unknown number as
+  TOP). Sound because only the player is measured: a forgotten fruit is
+  "maybe collected, maybe gone" everywhere, which only weakens d. The spawn
+  prefix stays exact (one concrete chain). Room (3,0): 64,650 nodes, start
+  d 45, 5:38; room (6,2): 62,484 nodes, start d 45, 2:25 (the same table with
+  `CELESTE_GEMSKIP=1`).
+- **A start slot only a later frame writes an interval to** (rooms (5,0),
+  (2,3): the balloon's bob `y`, "not a literal range"): the start state holds
+  a constant there; only slots the start state itself holds as an interval
+  (`LatticeWalk::start_ivals`, now with `None` for a non-literal) are seeded
+  from the start's literal, the rest from the representative's value. Room
+  (5,0): 17,342 nodes, start d 46; room (2,3): 19,222 nodes, start d 44.
+- Rooms that built before keep their fingerprints ((1,0) `b909eb5d1645fad6`,
+  (4,2) `af00ed208170568a`, (7,0) `9d3b5f393a563677`).
+- **Still refused**: the summit (it measures the room exit); not re-checked:
+  room (1,2) (a platform room).
 - **Reverted** (`4b31c1b`, Philippe: the table was not asked for every room
   and did not rescue room (6,0)): platform phases from concrete snapshots, an
   "unmodelled node gets d = 1" rule, range-reading other objects' forks.

@@ -346,10 +346,13 @@ impl<'a> Table<'a> {
             }
             let Some(Value::Num(n)) = iface::get(&st, p) else { continue };
             let is_player = |f: &str| player.as_ref().is_some_and(|pl| *p == with(pl, &[f, "x"]) || *p == with(pl, &[f, "y"]));
-            let start_ival = key == self.lw.start_key && self.lw.ival_extra.get(&key).is_some_and(|s| s.contains(p));
+            // The start state's OWN interval (its representative holds a
+            // blank there). A slot only a later frame writes an interval to
+            // (`ival_extra`: a balloon's bob) holds its start value.
+            let start_ival = key == self.lw.start_key && self.lw.start_ivals.contains_key(p);
             let r = if start_ival {
                 // The start state's own `rnd` interval, a literal.
-                let (lo, hi) = *self.lw.start_ivals.get(p).ok_or_else(|| anyhow!("{key}: the start state's interval {} is not a literal range", iface::show(p)))?;
+                let (lo, hi) = self.lw.start_ivals[p].ok_or_else(|| anyhow!("{key}: the start state's interval {} is not a literal range", iface::show(p)))?;
                 ensure!(self.lit_slot(&key, p), "{key}: the start state's interval {} is not an `rnd` slot", iface::show(p));
                 self.shapes[id].lits.insert(p.clone());
                 (lo as i64, hi as i64)
@@ -389,6 +392,14 @@ impl<'a> Table<'a> {
         tr.it.d.uncapped_ways = true;
         // Undecided selects stay selects (joined here, no extra configurations).
         tr.it.d.no_known_forks = true;
+        // A fly fruit as the `f` level stores it (`widen::fork_fruit_inputs`):
+        // `step`/`y` unknown, `spd.y`/`rem.y` their literal ranges, `fly`
+        // unknown. Exact, its flight's speed grows past every inductive range
+        // and its `move` fork past any arity. Only the player is measured, so
+        // a forgotten fruit only weakens d. The spawn prefix (no player) stays
+        // exact: it is one concrete chain.
+        let fruit_before = tr.it.d.fruit_unknown;
+        tr.it.d.fruit_unknown = player.is_some() && !super::widen::objects_of_type(&st, "fly_fruit").is_empty();
         let f = super::verify::trace_frame(
             &mut tr.it,
             tr.reset,
@@ -403,6 +414,7 @@ impl<'a> Table<'a> {
         .map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"));
         tr.it.d.uncapped_ways = false;
         tr.it.d.no_known_forks = false;
+        tr.it.d.fruit_unknown = fruit_before;
         let f = f?;
         let t_trace = t0.elapsed();
         let n_slots = f.iface.slots.len();
@@ -958,10 +970,20 @@ impl CostToGo {
             x64 >= WINDOW.0 && y64 >= WINDOW.0 && y64 <= WINDOW.1,
             "level -1 filter: a row of shape {shape:#x} at ({x}, {y}), frame {frame}, lies outside the window {WINDOW:?} the table assumes a player never leaves"
         );
-        match self.d.get(&(shape, x as i16, y as i16)) {
+        match self.d_of(shape, cell) {
             None => false,
-            Some(&d) => d == u32::MAX || frame.saturating_add(d) > horizon,
+            Some(d) => d == u32::MAX || frame.saturating_add(d) > horizon,
         }
+    }
+
+    /// A row's d (`u32::MAX`: no exit), `None` where the table has no node
+    /// (no player cell, outside the room, a shape or cell never reached).
+    pub fn d_of(&self, shape: u64, cell: u32) -> Option<u32> {
+        let (x, y) = crate::search::pos_graph::cell_xy(cell)?;
+        if x >= 128 {
+            return None;
+        }
+        self.d.get(&(shape, x as i16, y as i16)).copied()
     }
 }
 

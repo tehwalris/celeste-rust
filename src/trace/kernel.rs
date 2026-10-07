@@ -392,7 +392,7 @@ pub fn room_constant_lattice(
     // The START state's own intervals (an `rnd` draw in `_init`) are interval
     // inputs at every level: no traced frame wrote them, so write discovery
     // would miss them.
-    let mut start_ivals: std::collections::BTreeMap<super::iface::Path, (i32, i32)> = Default::default();
+    let mut start_ivals: std::collections::BTreeMap<super::iface::Path, Option<(i32, i32)>> = Default::default();
     {
         use super::domain::Domain as _;
         for r in shapes::state_paths(&start)? {
@@ -401,9 +401,11 @@ pub fn room_constant_lattice(
                 if it.d.as_const(&n).is_some() {
                     continue;
                 }
-                if let crate::transpile::graph::Op::Const(lo, hi) = it.d.graph.get(n).op {
-                    start_ivals.insert(p.clone(), (lo, hi));
-                }
+                let lit = match it.d.graph.get(n).op {
+                    crate::transpile::graph::Op::Const(lo, hi) => Some((lo, hi)),
+                    _ => None,
+                };
+                start_ivals.insert(p.clone(), lit);
                 let zero = it.d.num(celeste_core::pico8_num::Pico8Num::from_i16(0));
                 super::iface::set(reps.get_mut(&sk).expect("inserted above"), &p, super::heap::Value::Num(zero))?;
                 ival_extra.entry(sk.clone()).or_default().insert(p);
@@ -843,7 +845,9 @@ pub struct LatticeWalk {
     /// Per shape, input slots a reachable frame wrote an `rnd`-derived
     /// interval to, typed as interval inputs. Monotone.
     pub ival_extra: std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>>,
-    /// The start state's own intervals by path (the representative holds a
-    /// blanked point there; level -1 seeds from this).
-    pub start_ivals: std::collections::BTreeMap<super::iface::Path, (i32, i32)>,
+    /// The start state's own intervals by path, the literal or `None` (the
+    /// representative holds a blanked point there; level -1 seeds from this).
+    /// A path absent here holds its start value in the representative, even
+    /// where a later frame writes an interval to it (`ival_extra`).
+    pub start_ivals: std::collections::BTreeMap<super::iface::Path, Option<(i32, i32)>>,
 }
