@@ -4,7 +4,7 @@
 //! The initial heap is built by the same interpreter under the symbolic
 //! domain; nothing in `_init()` is unknown, so it folds to a concrete heap.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
 use super::domain::Domain;
 use super::heap::{Heap, Value};
@@ -71,7 +71,47 @@ pub fn sources_in(root: &std::path::Path) -> Result<String> {
     if nodiag() {
         game = forbid_diagonal_dashes(&game)?;
     }
+    if let Ok(seeds) = std::env::var("CELESTE_BALLOON_SEEDS") {
+        game = fix_balloon_seeds(&game, &seeds, root)?;
+    }
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
+}
+
+/// `CELESTE_BALLOON_SEEDS="s1,s2,.."`: the start room's balloons' phases
+/// FIXED, in creation order, as the TAS tool (UniversalClassicTas) and a
+/// tasdatabase file's `[seeds]` fix them - instead of `rnd(1)`, an interval
+/// at every level, under which a witness may mix branches no single seed
+/// takes. With them the search is exact for those seeds (missing ones: 0).
+/// No new global (the name table is frozen): each balloon's seed is inlined,
+/// chosen by its position; creation order is `load_room`'s tile loop
+/// (x outer, y inner).
+fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path) -> Result<String> {
+    const PAT: &str = "this.offset=rnd(1)";
+    anyhow::ensure!(game.matches(PAT).count() == 1, "CELESTE_BALLOON_SEEDS: the balloon's `{PAT}` was not found exactly once");
+    let seeds: Vec<f64> = seeds.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.parse::<f64>().with_context(|| format!("CELESTE_BALLOON_SEEDS: {s:?}"))).collect::<Result<_>>()?;
+    let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
+    let (rx, ry) = crate::game_runner::start_room();
+    // The tool's seed list runs over balloons (tile 22) AND chests (tile 20)
+    // in creation order; only the balloons' phases are fixed here (a chest's
+    // shake decides only where its berry appears).
+    let mut seeded = Vec::new();
+    for tx in 0..16i16 {
+        for ty in 0..16i16 {
+            let tile = cart.mget_whole(rx * 16 + tx, ry * 16 + ty);
+            if tile == 22 || tile == 20 {
+                seeded.push((tile, tx * 8, ty * 8));
+            }
+        }
+    }
+    anyhow::ensure!(seeds.len() <= seeded.len(), "CELESTE_BALLOON_SEEDS: {} seeds for {} balloons and chests", seeds.len(), seeded.len());
+    let mut expr = "0".to_string();
+    for (i, &(tile, x, y)) in seeded.iter().enumerate().rev() {
+        if tile == 22 {
+            let v = seeds.get(i).copied().unwrap_or(0.0);
+            expr = format!("((this.x=={x} and this.y=={y}) and {v} or {expr})");
+        }
+    }
+    Ok(game.replacen(PAT, &format!("this.offset={expr}"), 1))
 }
 
 /// `CELESTE_NODIAG`: the No Diagonal Dashes category. A dash may not START

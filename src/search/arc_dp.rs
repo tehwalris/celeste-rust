@@ -607,6 +607,30 @@ impl Witness {
 }
 
 /// THE CONCRETE SEARCH: the concrete optimum and its inputs. A BREADTH-FIRST
+/// A concrete state's node key. With seeded balloons (`concrete_search`),
+/// the state holds each balloon's phase as one number and its `y` as one
+/// point, where the tree - built with the phase an interval - holds the
+/// canonical phase `[0, 1)` and the bob `y` `[start - 2, start + 2]` (the
+/// forward recomputes `y` from the interval phase every frame); the lookup
+/// maps them there, the key of the node that over-approximates the state.
+fn lookup_keys(b: &crate::frame::Block, level: crate::abstraction::Level, seeded: bool) -> anyhow::Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
+    use celeste_engine::runtime2::{Col, AV, BALLOON_BOB_RAW, BALLOON_PERIOD_RAW};
+    use crate::pico8_num::Pico8Num as P8;
+    if !seeded {
+        return crate::frame::widened_keys(b, level);
+    }
+    let ids = crate::compiled::ids();
+    let mut rt2 = b.rt2().clone_block();
+    for obj in rt2.objects_of_type(ids, ids.g_balloon) {
+        let (Some(oc), Some(yc), Some(sc)) = (rt2.obj_field_cell(obj, ids.f_offset), rt2.obj_field_cell(obj, ids.f_y), rt2.obj_field_cell(obj, ids.f_start)) else { continue };
+        let AV::Num(start) = rt2.cols[sc as usize].at(0) else { anyhow::bail!("a balloon's `start` is not a number") };
+        let s = start.as_raw_u32() as i32;
+        rt2.cols[oc as usize] = Col::U(AV::Ival(P8::from_raw(0), P8::from_raw(BALLOON_PERIOD_RAW)));
+        rt2.cols[yc as usize] = Col::U(AV::Ival(P8::from_raw(s - BALLOON_BOB_RAW), P8::from_raw(s + BALLOON_BOB_RAW)));
+    }
+    crate::frame::widened_keys(&crate::frame::Block::from_rt2(rt2), level)
+}
+
 /// The 64 inputs in the order the concrete search tries them at the frame
 /// after `k`: `prefer[k]` first (`rewrite search --prefer`: a known TAS, so
 /// the witness follows it wherever an optimal route allows), then the rest.
@@ -637,14 +661,28 @@ pub fn concrete_search(
     breadth_first: bool,
     prefer: Option<&[u8]>,
 ) -> anyhow::Result<Option<Witness>> {
-    use crate::frame::{frame_files, pack_id, widened_keys, wins_of, Block};
+    use crate::frame::{frame_files, pack_id, wins_of, Block};
     use anyhow::Result;
     use crate::trace::refengine::RefEngine;
     use celeste_engine::runtime2::{Rt2, AV};
     // Build the engines BEFORE setting the level: `_init` runs under the
     // global level. Their frames run exact whatever is set.
     let workers = crate::frame::threads().max(1);
-    let engines: Vec<std::sync::Mutex<RefEngine>> = (0..workers).map(|_| RefEngine::new().map(std::sync::Mutex::new)).collect::<Result<_>>()?;
+    // `CELESTE_CONCRETE_BALLOON_SEEDS`: the concrete steps run with the
+    // balloons' phases FIXED (a tasdatabase file's seeds), so the witness is
+    // one real run under them - the tree and W keep the phase an interval
+    // (sound for every seed), and a concrete state's key maps its phase to
+    // that interval (`widen::canon_balloon_offset`, `Rt2::widen_to`).
+    let seeds = std::env::var("CELESTE_CONCRETE_BALLOON_SEEDS").ok();
+    let seeded = seeds.is_some();
+    if let Some(s) = &seeds {
+        std::env::set_var("CELESTE_BALLOON_SEEDS", s);
+    }
+    let engines: Result<Vec<std::sync::Mutex<RefEngine>>> = (0..workers).map(|_| RefEngine::new().map(std::sync::Mutex::new)).collect();
+    if seeded {
+        std::env::remove_var("CELESTE_BALLOON_SEEDS");
+    }
+    let engines = engines?;
     let initial = engines[0].lock().expect("an engine").initial()?;
     crate::abstraction::set_level(level);
     let t0 = std::time::Instant::now();
@@ -704,6 +742,7 @@ pub fn concrete_search(
             path: Vec<(u8, u32)>,
             steps: u64,
             prefer: Option<&'a [u8]>,
+            seeded: bool,
         }
         /// `Ok(None)`: out of budget.
         fn dfs(cx: &mut Dfs, st: &Rt2, k: u32) -> Result<Option<bool>> {
@@ -727,7 +766,7 @@ pub fn concrete_search(
                     if cx.dead.contains(&exact) {
                         continue;
                     }
-                    let (shape, keys, cells) = widened_keys(&b, cx.level)?;
+                    let (shape, keys, cells) = lookup_keys(&b, cx.level, cx.seeded)?;
                     let Some(&i) = cx.node.get(&(shape, keys[0], cells[0])) else { continue };
                     let q = rem_of(b.rt2())?;
                     if !cx.w.at(cx.from + k + 1, i).is_some_and(|r| r.contains(q.0, q.1)) {
@@ -749,7 +788,7 @@ pub fn concrete_search(
         const DFS_BUDGET: u64 = 200_000;
         let t = std::time::Instant::now();
         let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { eng: &mut eng, node: &node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer };
+        let mut cx = Dfs { eng: &mut eng, node: &node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer, seeded };
         let found = dfs(&mut cx, start.rt2(), 0)?;
         eprintln!(
             "[concrete] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
@@ -811,7 +850,7 @@ pub fn concrete_search(
                                             continue;
                                         }
                                         if !win {
-                                            let (shape, keys, cells) = widened_keys(&b, level)?;
+                                            let (shape, keys, cells) = lookup_keys(&b, level, seeded)?;
                                             let Some(&i) = node.get(&(shape, keys[0], cells[0])) else { continue };
                                             let q = rem_of(b.rt2())?;
                                             if !w.at(t_w, i).is_some_and(|r| r.contains(q.0, q.1)) {

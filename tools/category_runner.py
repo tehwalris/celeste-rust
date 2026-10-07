@@ -144,6 +144,9 @@ def run(job, outdir, binary):
     # 2. the search
     def search(l1):
         env = dict(os.environ, **mode_env(cat))
+        # The concrete steps under the community file's balloon seeds ([]: 0):
+        # the witness is then one real run under them.
+        env["CELESTE_CONCRETE_BALLOON_SEEDS"] = seeds
         if l1:
             env["CELESTE_LEVEL_MINUS_ONE"] = f"{ref},5"
         log = os.path.join(jd, "search.log")
