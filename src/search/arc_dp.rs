@@ -220,6 +220,24 @@ fn par_chunks<T: Send>(n: usize, f: impl Fn(usize, usize) -> anyhow::Result<T> +
     Ok(parts.into_iter().map(|p| p.1).collect())
 }
 
+/// Frames `0..=horizon` of the tree in `dir`, each its files `(seq, file)`.
+/// A forward whose frontier died (a finer level of the objects ladder,
+/// filtered down to nothing) has no frames past the empty one: they are
+/// empty too. Any other missing frame is an error.
+fn tree_frames(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Vec<Vec<(u32, crate::search::checkpoint::FrameFile)>>> {
+    let mut out: Vec<Vec<(u32, crate::search::checkpoint::FrameFile)>> = Vec::with_capacity(horizon as usize + 1);
+    for f in 0..=horizon {
+        if !dir.join("frames").join(format!("f{f:03}")).is_dir() {
+            let died = out.last().is_some_and(|last| last.iter().all(|(_, file)| file.width() == 0));
+            anyhow::ensure!(died, "{}: no frame f{f}, and the frontier before it was not empty", dir.display());
+            out.push(Vec::new());
+            continue;
+        }
+        out.push(crate::frame::frame_files(dir, f)?);
+    }
+    Ok(out)
+}
+
 /// The rotation graph of the tree in `dir` up to `horizon`, restricted to the
 /// nodes the remainder-free BFS (`edges::bfs`) marks: an edge between other
 /// nodes is on no path to a win with any remainder. Every loaded edge must
@@ -232,16 +250,17 @@ fn par_chunks<T: Send>(n: usize, f: impl Fn(usize, usize) -> anyhow::Result<T> +
 /// 12 B an edge, the graph's own (room (2,3) gemskip h137, 373M edges: 28 B
 /// an edge and a 12.1 GB peak before).
 pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
-    use crate::frame::{frame_files, id_layer, pack_id};
+    use crate::frame::{id_layer, pack_id};
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     let t0 = std::time::Instant::now();
     let mut wins: Vec<u64> = Vec::new();
     let mut start_id: Option<u64> = None;
     // Per frame, the rows it kept (its layer).
     let mut kept: Vec<u32> = Vec::with_capacity(horizon as usize + 1);
-    for f in 0..=horizon {
+    for (f, files) in tree_frames(dir, horizon)?.into_iter().enumerate() {
+        let f = f as u32;
         let mut rows = 0u32;
-        for (seq, file) in frame_files(dir, f)? {
+        for (seq, file) in files {
             rows += file.cell_counts().map(|(_, n)| n).sum::<u32>();
             if f == 0 {
                 anyhow::ensure!(start_id.is_none(), "{}: more than one start file", dir.display());
@@ -1138,7 +1157,7 @@ pub fn solve(
     save: Option<&std::path::Path>,
     prefer: Option<&[u8]>,
 ) -> anyhow::Result<Solved> {
-    use crate::frame::{frame_files, id_layer, mark_row, save_marks, MarkRow, Visited};
+    use crate::frame::{id_layer, mark_row, save_marks, MarkRow, Visited};
     use celeste_engine::runtime2::mix64;
     crate::metrics::mem_phase("arc: start");
     let Loaded { graph, start, marks, wins, .. } = load(dir, horizon)?;
@@ -1156,8 +1175,8 @@ pub fn solve(
     // marks are the nodes, in order): the fingerprints, the marks file and
     // the concrete search's keys.
     let mut files = Vec::new();
-    for f in 0..=horizon {
-        files.extend(frame_files(dir, f)?.into_iter().map(|(seq, file)| (f, seq, file)));
+    for (f, fs) in tree_frames(dir, horizon)?.into_iter().enumerate() {
+        files.extend(fs.into_iter().map(|(seq, file)| (f as u32, seq, file)));
     }
     let keyed = concrete != Concrete::None && arc.is_some();
     let mut node_key: Vec<u64> = Vec::with_capacity(g.len());
