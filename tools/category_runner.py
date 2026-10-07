@@ -54,8 +54,9 @@ def parse_tas(text):
 def replay_exit(room, inputs, seeds, cat):
     """The frame the room changes during, replaying `inputs` in the ORIGINAL cart."""
     cmd = [f"{M}/pico8_diff/replay.py", "--lua", ORIG, "--begin-game", "--room", room, "--inputs", ",".join(map(str, inputs)), "--frames", str(len(inputs) + 3)] + replay_args(cat)
-    if seeds:
-        cmd += ["--balloon-seeds", seeds]
+    # `[]` in a tasdatabase file: UniversalClassicTas seeds every balloon 0
+    # (not PICO-8's rnd), so the replay does too.
+    cmd += ["--balloon-seeds", seeds or "0"]
     out = subprocess.run(cmd, capture_output=True, text=True, cwd=M, timeout=900).stdout
     for line in out.splitlines():
         m = re.match(r"f(\d+) room (\S+)", line)
