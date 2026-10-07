@@ -74,23 +74,26 @@ def diag_dashes(inputs):
     return bad
 
 
-def canon_jumps(room, inputs, cat):
+def canon_jumps(room, inputs, seeds, cat):
     """Keep the jump bit only where a jump FIRES in the minimal cart (the
     search's model). The original cart buffers a press for 4 frames (jbuffer),
     so a press that does nothing in the minimal cart - one copied from a
     community TAS by --prefer - can fire later there. With every press firing
-    at once, the buffer never holds one: the same route in both carts."""
-    env = dict(os.environ, CELESTE_START_ROOM=room, **mode_env(cat))
-    out = subprocess.run([f"{M}/target/quick/concrete_run", "-i", ",".join(map(str, inputs))], capture_output=True, text=True, env=env, cwd=M, timeout=600).stdout
+    at once, the buffer never holds one: the same route in both carts. The
+    minimal cart is replayed under the file's balloon seeds (concrete_run has
+    none: a balloon room's run diverged there and kept a press, gemskip
+    2800m 2026-10-07)."""
+    cmd = [f"{M}/pico8_diff/replay.py", "--room", room, "--inputs", ",".join(map(str, inputs)), "--frames", str(len(inputs) + 1), "--balloon-seeds", seeds or "0"] + replay_args(cat)
+    out = subprocess.run(cmd, capture_output=True, text=True, cwd=M, timeout=900).stdout
     spd_y = {}
     for line in out.splitlines():
-        m = re.match(r"Frame (\d+): player at \([^)]*\) spd=\([^,]*, ([^)]*)\)", line)
+        m = re.match(r"f(\d+) .* spd \S+,(\S+)", line)
         if m:
-            spd_y[int(m.group(1))] = m.group(2).strip()
+            spd_y[int(m.group(1))] = m.group(2)
     canon, prev = [], 0
     for i, b in enumerate(inputs):
         f = i + 1
-        fired = b & 16 and not prev & 16 and spd_y.get(f) == "-2"
+        fired = b & 16 and not prev & 16 and spd_y.get(f) == "0xfffe.0000"
         canon.append((b & ~16) | (16 if fired else 0))
         prev = b
     return canon
@@ -181,7 +184,7 @@ def run(job, outdir, binary):
     if e != opt:
         # A jump press that does nothing in the minimal cart can fire later in
         # the original (its jump buffer): keep only the presses that fire.
-        canon = canon_jumps(room, ours, cat)
+        canon = canon_jumps(room, ours, seeds, cat)
         e2, out2 = replay_exit(room, canon, seeds, cat)
         res["jump_canonicalized"] = f"original cart exit {e} -> {e2}"
         if e2 == opt:
