@@ -328,6 +328,18 @@ pub fn orb_required() -> bool {
     crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !crate::game_runner::gemskip()
 }
 
+/// `CELESTE_TRIM_ROWS=1`: a frame's checkpoint files keep only keys, cells
+/// and wins once a later frame's runs are complete (`checkpoint::trim`) -
+/// what the search reads of them, and what a resume and `export-ui` read.
+/// The rows' values are most of a frame's files: room (2,3) gemskip h137,
+/// level 0's frames 3.03 -> 0.78 GB (room (5,1) nodiag's format-9 rows: 148
+/// B, of which the key is 16). The diagnostics that load old rows
+/// (`rerun-row`, `follow`, `arc-check`, ...) refuse a trimmed tree.
+pub fn trim_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CELESTE_TRIM_ROWS").is_ok_and(|v| v == "1"))
+}
+
 /// Worker count: `CELESTE_THREADS`, else one per physical core (AVX-512 units
 /// are shared by SMT siblings).
 pub fn threads() -> usize {
@@ -1618,6 +1630,14 @@ impl ForwardState {
         let t = std::time::Instant::now();
         let st = handle.join().expect("compaction thread panicked")?;
         crate::search::edges::set_done_frame(edges_dir, frame)?;
+        // A resume loads frame `frame` as its frontier and never an earlier
+        // one's rows: those may go.
+        if trim_rows() && frame >= 2 {
+            let dir = edges_dir.parent().expect("a level dir");
+            for (_, p) in frame_paths(dir, frame - 1)? {
+                crate::search::checkpoint::trim(&p)?;
+            }
+        }
         Ok(Some((st, t.elapsed())))
     }
 
@@ -2122,6 +2142,32 @@ mod tests {
             assert!(!f.exists(), "{} survived a fresh start", f.display());
         }
         assert!(dir.join("frames/f000").is_dir(), "frame 0 checkpointed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A trimmed checkpoint keeps everything the search reads of an old
+    /// frame - width, shape, keys, cells, the cell index, the wins - and
+    /// refuses to load its rows.
+    #[test]
+    fn a_trimmed_frame_keeps_its_keys_cells_and_wins() {
+        let engine = std::sync::Mutex::new(RefEngine::new().expect("ref engine"));
+        let init = vec![Block::keyed(engine.lock().unwrap().initial().expect("initial state")).expect("block")];
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-trim-test");
+        let _ = std::fs::remove_dir_all(dir);
+        let mut st = ForwardState::start(init, dir, true).expect("start");
+        st.extend(&engine, dir, 2, None).expect("two frames");
+        type Seen = (u32, u64, Vec<(u32, (u64, u64))>, Vec<u32>, Vec<(u64, (u64, u64), u32)>);
+        let seen = |f: &crate::search::checkpoint::FrameFile| -> Seen {
+            (f.width(), f.shape_hash(), f.cell_keys().collect(), f.row_cells(), f.wins())
+        };
+        for (_, p) in frame_paths(dir, 1).expect("frame 1") {
+            let before = seen(&crate::search::checkpoint::FrameFile::open(&p).expect("open"));
+            assert!(crate::search::checkpoint::trim(&p).expect("trim") > 0, "the rows' values are gone");
+            let f = crate::search::checkpoint::FrameFile::open(&p).expect("reopen");
+            assert_eq!(seen(&f), before);
+            assert!(f.load_all().is_err(), "a trimmed frame's rows do not load");
+            assert_eq!(crate::search::checkpoint::trim(&p).expect("trim again"), 0);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

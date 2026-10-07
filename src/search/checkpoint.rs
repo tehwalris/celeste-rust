@@ -23,7 +23,7 @@ use celeste_engine::runtime2::{Cell2, Col, Rt2, AV};
 const MAGIC: &[u8; 4] = b"C8TB";
 /// Bump whenever the meaning or layout of ANY checkpoint content changes
 /// (older trees are refused; history in git).
-pub const FORMAT_VERSION: u32 = 10;
+pub const FORMAT_VERSION: u32 = 11;
 
 /// Where one column lives: uniform (in the header) or raw in the data
 /// region at a byte offset, `width` entries of the kind's fixed width.
@@ -66,6 +66,9 @@ struct Header {
     index: Vec<(u32, u32, u32)>,
     /// The rows that are wins (`Block::wins`), ascending, with their cell.
     wins: Vec<(u32, u32)>,
+    /// The rows' values are gone (`trim`): keys, cells and wins only, `cols`
+    /// empty.
+    trimmed: bool,
 }
 
 /// A row's `AV` as its tag and two payload words.
@@ -187,6 +190,7 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
             .enumerate()
             .filter_map(|(i, &w)| w.then_some((i as u32, cells[i])))
             .collect(),
+        trimmed: false,
     };
     let header_bytes = bincode::serialize(&header).context("serializing checkpoint header")?;
 
@@ -232,6 +236,11 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
         data[base + 8..base + 16].copy_from_slice(&b.to_le_bytes());
     }
 
+    write_file(path, &header_bytes, &data)
+}
+
+/// Write a checkpoint file: to a `tmp-` sibling, renamed into place.
+fn write_file(path: &Path, header_bytes: &[u8], data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -244,12 +253,42 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
         file.write_all(MAGIC)?;
         file.write_all(&FORMAT_VERSION.to_le_bytes())?;
         file.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
-        file.write_all(&header_bytes)?;
-        file.write_all(&data)?;
+        file.write_all(header_bytes)?;
+        file.write_all(data)?;
         file.flush()?;
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// TRIM a checkpoint file to what the search reads of a frame that is no
+/// longer the frontier: the keys, the cell index and the wins (the door on a
+/// resume, the backward's ids, the marks, the UI). The rows' values go; a
+/// load of its rows is an error. Atomic. Returns the bytes saved.
+pub fn trim(path: &Path) -> Result<u64> {
+    let f = FrameFile::open(path)?;
+    if f.header.trimmed {
+        return Ok(0);
+    }
+    let width = f.header.width as usize;
+    let keys = &f.map[f.data + f.header.keys as usize..f.data + f.header.keys as usize + width * KEY_BYTES];
+    let header = Header {
+        width: f.header.width,
+        structure: f.header.structure.clone(),
+        globals: f.header.globals.clone(),
+        strings: f.header.strings.clone(),
+        prints: f.header.prints.clone(),
+        shape_hash: f.header.shape_hash,
+        cols: Vec::new(),
+        keys: 0,
+        index: f.header.index.clone(),
+        wins: f.header.wins.clone(),
+        trimmed: true,
+    };
+    let header_bytes = bincode::serialize(&header).context("serializing checkpoint header")?;
+    let before = f.map.len() as u64;
+    write_file(path, &header_bytes, keys)?;
+    Ok(before.saturating_sub((16 + header_bytes.len() + keys.len()) as u64))
 }
 
 /// One checkpoint file, mapped, its header decoded; loads gather row ranges
@@ -363,6 +402,7 @@ impl FrameFile {
             return Ok(None);
         }
         let h = &self.header;
+        ensure!(!h.trimmed, "a trimmed checkpoint (CELESTE_TRIM_ROWS: keys, cells and wins only): its rows are gone");
         let (cart, cache) = crate::compiled::room_context()?;
         let mut rt2 = Rt2::empty(total, h.globals.len(), &[], cart, cache);
         rt2.structure = h.structure.clone();

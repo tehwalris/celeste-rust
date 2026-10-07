@@ -393,6 +393,13 @@ the list (coarsest first; one level is the usual case):
 
 Resume: rerun the same command; the forward resumes or is reused, the arc
 phase reruns (minutes). A fresh forward clears `frames/` and `edges/`.
+`CELESTE_TRIM_ROWS=1` (2026-10-07) trims every frame's checkpoint files to
+keys, cells and wins once a later frame's runs are complete
+(`checkpoint::trim`): the search, a resume and `export-ui` read nothing
+else of an old frame, and the rows' values are most of a tree's frames
+(room (2,3) gemskip h137, level 0: 3.03 -> 0.78 GB; the tree 7.0 -> 4.8
+GB). The diagnostics that load old rows refuse a trimmed tree, so it is off
+by default.
 Nothing on disk records the level: reusing a tree under another `--level` is
 on you. One kernel set is resident, the process-global level's; a call at
 another level drops it and builds that level's. Fused graphs are dropped
