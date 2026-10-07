@@ -754,11 +754,11 @@ fn main() -> Result<()> {
                     let t = std::time::Instant::now();
                     let c = celeste_rust::search::edges::compact_frame(&edges_dir, frame + 1)?;
                     println!(
-                        "[bench]   compaction: {} records -> {} pairs, {:.1} MB runs ({:.2} B/pair); read {:.0} sort {:.0} write {:.0} ms",
+                        "[bench]   compaction: {} records -> {} edges, {:.1} MB runs ({:.2} B/edge); read {:.0} sort {:.0} write {:.0} ms",
                         c.records,
-                        c.pairs,
+                        c.edges,
                         c.bytes as f64 / 1e6,
-                        c.bytes as f64 / c.pairs.max(1) as f64,
+                        c.bytes as f64 / c.edges.max(1) as f64,
                         c.t_read.as_secs_f64() * 1e3,
                         c.t_sort.as_secs_f64() * 1e3,
                         c.t_write.as_secs_f64() * 1e3

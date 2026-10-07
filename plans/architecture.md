@@ -303,15 +303,23 @@ remainder; every backward reads the records and re-runs no kernel
   and the lanes; a re-emission ORs its bit in only under an equal transfer,
   else it is an extra entry; after the flush the cache holds the door's id
   so later re-emissions go through a direct-mapped `(target, base, transfer)
-  -> mask` merge. Records (24 B, layer-local) go to `edges/raw/f{frame}/`,
-  each worker's transfer table beside them.
+  -> mask` merge. Records go to `edges/raw/f{frame}/`, one per lane (16 B,
+  layer-local: target, source, transfer), each worker's transfer table
+  beside them.
 - **Runs.** At each frame's end the workers' tables merge into the frame's
   (`edges/xfer/f{frame}.bin`, sorted by value: a function of the frame, not
   the scheduling), and each layer's records are range-partitioned by target,
-  sorted (a parallel counting sort on the target's dense rank above 512k
-  records) by (target, base, transfer), merged, and delta-varint encoded in
-  256-record blocks with an index: `<level>/edges/l{layer}/f{frame}.bin` (run
-  v4). The compaction runs BEHIND the next frame's wave; `edges/done.txt`
+  sorted by it (a parallel counting sort on the target's dense rank above
+  512k records), and encoded in 256-edge blocks with an index:
+  `<level>/edges/l{layer}/f{frame}.bin` (run v5, 2026-10-07). Per edge a
+  varint head (a new target's delta, or the source's delta under the same
+  target), the source as a DENSE number (the source pieces laid end to end,
+  a table in the header) when the target is new, and the transfer's RANK in
+  the run (its transfers by descending use, a table in the header): ~4 B an
+  edge, against 8.8 B a v4 record (lanes per record: 1.006) - room (2,3)
+  gemskip f0-f137 8.27 -> 4.00 GB, room (1,0) f0-f44 433 -> 292 MB. A run is
+  read in place (mmap), index and tables included. The compaction runs
+  BEHIND the next frame's wave; `edges/done.txt`
   names the last complete frame, and a resume trusts frames up to it and
   discards the rest (at most one). Room (1,0) f0-f44: 408 MB of runs against
   216 MB without transfers and 2.8 GB for the separate arc-record stream it
