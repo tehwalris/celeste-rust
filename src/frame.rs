@@ -674,8 +674,16 @@ fn append_record(
 }
 
 /// Append `buf` to the worker's raw file for `layer` at `frame`, and clear it.
+/// Its equal records go once: an edge re-recorded by another kernel call of
+/// the same unit lands in the same buffer (the compaction would merge it).
 fn write_edges(dir: &std::path::Path, frame: u32, layer: usize, worker: u32, buf: &mut Vec<u8>) -> Result<()> {
+    use crate::search::edges::RECORD_BYTES;
     use std::io::Write;
+    let mut recs: Vec<[u8; RECORD_BYTES]> = buf.chunks_exact(RECORD_BYTES).map(|c| c.try_into().expect("a record")).collect();
+    recs.sort_unstable();
+    recs.dedup();
+    buf.clear();
+    buf.extend(recs.iter().flatten());
     let path = crate::search::edges::raw_path(dir, frame, layer as u32, worker);
     std::fs::create_dir_all(path.parent().expect("a raw dir"))?;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
