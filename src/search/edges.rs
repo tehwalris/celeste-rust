@@ -1044,15 +1044,22 @@ pub fn bfs(graph: &EdgeGraph, horizon: u32, seeds: impl IntoIterator<Item = u64>
 }
 
 /// Resolve each `(id, deadline)` of `ids` (sorted) to its row's `(shape,
-/// key, cell)` through the frame files `(layer, seq, file)` (sorted), calling
-/// `f(shape, key, cell, deadline)`. Every id must resolve.
+/// key, cell)` through the frame files `(layer, seq, file)`, calling `f(shape,
+/// key, cell, deadline)` IN THE ORDER OF `ids`. Every id must resolve.
+///
+/// (`frame_paths` sorts a frame's files by name, shape hash first, not by
+/// seq: walking them in that order called `f` out of id order wherever a
+/// frame has two shapes, and the arc gate's W fingerprints, which index by
+/// call order, depended on which seq the scheduling gave each shape.)
 pub fn resolve_ids(
     files: &[(u32, u32, crate::search::checkpoint::FrameFile)],
     ids: &[(u64, u16)],
     mut f: impl FnMut(u64, (u64, u64), u32, u16),
 ) -> Result<()> {
+    let mut order: Vec<&(u32, u32, crate::search::checkpoint::FrameFile)> = files.iter().collect();
+    order.sort_by_key(|&&(layer, seq, _)| (layer, seq));
     let mut i = 0usize;
-    for (layer, seq, file) in files {
+    for (layer, seq, file) in order {
         let lo = ids.partition_point(|&(id, _)| (id_layer(id), crate::frame::id_seq(id)) < (*layer, *seq));
         let hi = ids.partition_point(|&(id, _)| (id_layer(id), crate::frame::id_seq(id)) <= (*layer, *seq));
         if lo == hi {
