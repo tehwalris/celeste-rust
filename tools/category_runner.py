@@ -243,6 +243,12 @@ def main():
         if not todo:
             print("all jobs done", flush=True)
             return
+        # OUTDIR/STOP: exit before the next job (a restart that cannot overlap a
+        # running search: two searches in one tree corrupt its edge records).
+        if os.path.exists(os.path.join(outdir, "STOP")):
+            os.remove(os.path.join(outdir, "STOP"))
+            print("stopped by OUTDIR/STOP", flush=True)
+            return
         job = todo[0]
         binary = os.environ.get("RUNNER_BIN", f"{outdir}/rewrite")
         print(f"[{time.strftime('%H:%M')}] {job['cat']} {job['name']} {job['room']}", flush=True)
