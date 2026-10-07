@@ -328,6 +328,18 @@ pub fn orb_required() -> bool {
     crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !crate::game_runner::gemskip()
 }
 
+/// `CELESTE_TRIM_ROWS=1`: a frame's checkpoint files keep only keys, cells
+/// and wins once a later frame's runs are complete (`checkpoint::trim`) -
+/// what the search reads of them, and what a resume and `export-ui` read.
+/// The rows' values are most of a frame's files: room (2,3) gemskip h137,
+/// level 0's frames 3.03 -> 0.78 GB (room (5,1) nodiag's format-9 rows: 148
+/// B, of which the key is 16). The diagnostics that load old rows
+/// (`rerun-row`, `follow`, `arc-check`, ...) refuse a trimmed tree.
+pub fn trim_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CELESTE_TRIM_ROWS").is_ok_and(|v| v == "1"))
+}
+
 /// Worker count: `CELESTE_THREADS`, else one per physical core (AVX-512 units
 /// are shared by SMT siblings).
 pub fn threads() -> usize {
@@ -662,8 +674,16 @@ fn append_record(
 }
 
 /// Append `buf` to the worker's raw file for `layer` at `frame`, and clear it.
+/// Its equal records go once: an edge re-recorded by another kernel call of
+/// the same unit lands in the same buffer (the compaction would merge it).
 fn write_edges(dir: &std::path::Path, frame: u32, layer: usize, worker: u32, buf: &mut Vec<u8>) -> Result<()> {
+    use crate::search::edges::RECORD_BYTES;
     use std::io::Write;
+    let mut recs: Vec<[u8; RECORD_BYTES]> = buf.chunks_exact(RECORD_BYTES).map(|c| c.try_into().expect("a record")).collect();
+    recs.sort_unstable();
+    recs.dedup();
+    buf.clear();
+    buf.extend(recs.iter().flatten());
     let path = crate::search::edges::raw_path(dir, frame, layer as u32, worker);
     std::fs::create_dir_all(path.parent().expect("a raw dir"))?;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
@@ -1618,6 +1638,14 @@ impl ForwardState {
         let t = std::time::Instant::now();
         let st = handle.join().expect("compaction thread panicked")?;
         crate::search::edges::set_done_frame(edges_dir, frame)?;
+        // A resume loads frame `frame` as its frontier and never an earlier
+        // one's rows: those may go.
+        if trim_rows() && frame >= 2 {
+            let dir = edges_dir.parent().expect("a level dir");
+            for (_, p) in frame_paths(dir, frame - 1)? {
+                crate::search::checkpoint::trim(&p)?;
+            }
+        }
         Ok(Some((st, t.elapsed())))
     }
 
@@ -1630,6 +1658,7 @@ impl ForwardState {
         to: u32,
         filter: Option<&MarkFilter>,
     ) -> Result<()> {
+        let mut last_free = None;
         while self.frames < to && !self.frontier.is_empty() {
             let frame = self.frames + 1;
             let t_frame = std::time::Instant::now();
@@ -1658,7 +1687,7 @@ impl ForwardState {
             }
             let t_pos = t.elapsed();
             log_frame(frame, &st, t_edges, compact_records, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
-            ensure_disk_space(dir)?;
+            ensure_disk_space(dir, &mut last_free)?;
             self.frames = frame;
             if won && self.win_frame.is_none() {
                 self.win_frame = Some(frame);
@@ -1752,13 +1781,16 @@ pub fn forward_run(
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
-/// The per-frame `[fwd]` line (ms) and the `fwd.*` metrics totals.
 /// Stop the forward before the checkpoint disk fills: below
 /// `CELESTE_MIN_FREE_GB` (default 20) plus three times what the last frame
 /// wrote, free on `dir`'s filesystem, an error -
 /// a full disk otherwise fails a worker mid-write (room (5,1) nodiag,
-/// 2026-10-06) and starves everything else on the machine.
-fn ensure_disk_space(dir: &std::path::Path) -> Result<()> {
+/// 2026-10-06) and starves everything else on the machine. `last_free`: the
+/// free bytes after the previous frame of THIS forward (`None` at its first:
+/// a delta across the arc phase between two levels counted everything the
+/// other processes wrote meanwhile as the frame's, and stopped room (2,3)'s
+/// second level at its first frame, 2026-10-07).
+fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let min_gb: u64 = match std::env::var("CELESTE_MIN_FREE_GB") {
         Ok(v) => v.parse().context("CELESTE_MIN_FREE_GB")?,
@@ -1772,9 +1804,7 @@ fn ensure_disk_space(dir: &std::path::Path) -> Result<()> {
     let free = st.f_bavail as u64 * st.f_frsize as u64;
     // A frame can write tens of GB (a room whose frontier explodes): keep room
     // for three more frames like the last one, not just the fixed floor.
-    static LAST_FREE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let last = LAST_FREE.swap(free, std::sync::atomic::Ordering::Relaxed);
-    let frame_bytes = last.saturating_sub(free);
+    let frame_bytes = last_free.replace(free).map_or(0, |last| last.saturating_sub(free));
     let need = (min_gb << 30) + 3 * frame_bytes;
     anyhow::ensure!(
         free >= need,
@@ -1786,6 +1816,7 @@ fn ensure_disk_space(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// The per-frame `[fwd]` line (ms) and the `fwd.*` metrics totals.
 fn log_frame(
     frame: u32,
     st: &FrameStats,
@@ -1926,7 +1957,20 @@ pub fn load_row(dir: &std::path::Path, id: u64) -> Result<(Rt2, u64, u32)> {
 }
 
 /// One row of a marks file: `(shape, cell, key.0, key.1, dist)`.
-type MarkRow = (u64, u32, u64, u64, u32);
+pub type MarkRow = (u64, u32, u64, u64, u32);
+
+/// The marks-file row of a state with `deadline` (`u16::MAX`: none, saved
+/// as 0).
+pub fn mark_row(shape: u64, key: (u64, u64), cell: u32, deadline: u16, horizon: u32) -> MarkRow {
+    (shape, cell, key.0, key.1, horizon - (deadline as u32).min(horizon))
+}
+
+/// A marks file (`Visited::save`) from its rows, in any order, each state
+/// once.
+pub fn save_marks(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32) -> Result<()> {
+    rows.sort_unstable();
+    crate::search::checkpoint::save_value_to(path, &(rows, horizon))
+}
 
 /// An in-memory set of states `(shape, cell, key)` (a level's MARKED states
 /// or a diagnostic's), saved as a marks file.
@@ -1987,10 +2031,9 @@ impl Visited {
     pub fn save(&self, path: &std::path::Path, horizon: u32) -> Result<()> {
         let mut rows: Vec<MarkRow> = Vec::with_capacity(self.len());
         for ((shape, cell), keys) in &self.shards {
-            rows.extend(keys.iter().map(|(&(k0, k1), &d)| (*shape, *cell, k0, k1, horizon - (d as u32).min(horizon))));
+            rows.extend(keys.iter().map(|(&key, &d)| mark_row(*shape, key, *cell, d, horizon)));
         }
-        rows.sort_unstable();
-        crate::search::checkpoint::save_value_to(path, &(rows, horizon))
+        save_marks(path, rows, horizon)
     }
 
     /// A marks file (`save`).
@@ -2107,6 +2150,32 @@ mod tests {
             assert!(!f.exists(), "{} survived a fresh start", f.display());
         }
         assert!(dir.join("frames/f000").is_dir(), "frame 0 checkpointed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A trimmed checkpoint keeps everything the search reads of an old
+    /// frame - width, shape, keys, cells, the cell index, the wins - and
+    /// refuses to load its rows.
+    #[test]
+    fn a_trimmed_frame_keeps_its_keys_cells_and_wins() {
+        let engine = std::sync::Mutex::new(RefEngine::new().expect("ref engine"));
+        let init = vec![Block::keyed(engine.lock().unwrap().initial().expect("initial state")).expect("block")];
+        let dir = std::path::Path::new("/var/tmp/celeste-frame-trim-test");
+        let _ = std::fs::remove_dir_all(dir);
+        let mut st = ForwardState::start(init, dir, true).expect("start");
+        st.extend(&engine, dir, 2, None).expect("two frames");
+        type Seen = (u32, u64, Vec<(u32, (u64, u64))>, Vec<u32>, Vec<(u64, (u64, u64), u32)>);
+        let seen = |f: &crate::search::checkpoint::FrameFile| -> Seen {
+            (f.width(), f.shape_hash(), f.cell_keys().collect(), f.row_cells(), f.wins())
+        };
+        for (_, p) in frame_paths(dir, 1).expect("frame 1") {
+            let before = seen(&crate::search::checkpoint::FrameFile::open(&p).expect("open"));
+            assert!(crate::search::checkpoint::trim(&p).expect("trim") > 0, "the rows' values are gone");
+            let f = crate::search::checkpoint::FrameFile::open(&p).expect("reopen");
+            assert_eq!(seen(&f), before);
+            assert!(f.load_all().is_err(), "a trimmed frame's rows do not load");
+            assert_eq!(crate::search::checkpoint::trim(&p).expect("trim again"), 0);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

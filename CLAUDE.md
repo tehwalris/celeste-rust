@@ -249,7 +249,8 @@ CELESTE_LEVEL_MINUS_ONE="C,5" ./safe-run.sh -- ./target/release/rewrite search \
 CELESTE_LEVEL_MINUS_ONE="84,5" ./safe-run.sh -- ./target/release/rewrite search \
     --room 7,0 --level r0sxhn,r0sxh --ceiling 84 --checkpoint-dir DIR
 # Other knobs: CELESTE_THREADS, CELESTE_REGION="px,S" | off. (CELESTE_SPLIT_FRAME=1 still runs a forward,
-# two steps a frame, but the search refuses it.)
+# two steps a frame, but the search refuses it.) CELESTE_TRIM_ROWS=1: old frames keep keys, cells and
+# wins only (a big room's tree ~30-40% smaller; diagnostics that load old rows refuse it).
 
 # One forward at one level, with the per-frame [fwd] line; then its fingerprint.
 ./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0 [--level r0sxhn]

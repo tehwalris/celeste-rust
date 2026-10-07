@@ -225,7 +225,7 @@ pub struct Piece {
 
 /// A slab of a `Region`: `[lo, hi)` of y, its x set `xs[start..end]` (the
 /// start is the previous slab's end).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Slab {
     lo: u32,
     hi: u32,
@@ -235,7 +235,7 @@ struct Slab {
 /// A set of the torus in CANONICAL form: sorted disjoint y slabs, each with
 /// a non-empty x set, touching slabs never with the same x set. Equal sets
 /// are equal values; a union of many contributions is one sweep.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Region {
     slabs: Vec<Slab>,
     xs: Vec<Seg>,

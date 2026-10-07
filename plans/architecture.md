@@ -226,7 +226,9 @@ One pass per frame, no owners, no budget, one barrier.
 
 1. **Units in cell order.** The frontier is the workers' pieces of the
    previous frame, each sorted by (cell, key) and checkpointed in FLUSH order
-   (format v9, a run index of `(cell, start, len)` per file). Units of
+   (format v10, a run index of `(cell, start, len)` per file; v10 stores a
+   mixed column in 9 B a row and a boolean-like one in 1 B, against 16 B).
+   Units of
    `unit_lanes()` lanes (1024 since 2026-09-18; `CELESTE_UNIT_LANES`, a
    multiple of 64) are pulled by `threads()` workers (default one per physical
    core, `CELESTE_THREADS`) in cell order across pieces: the wave. A unit is
@@ -303,15 +305,23 @@ remainder; every backward reads the records and re-runs no kernel
   and the lanes; a re-emission ORs its bit in only under an equal transfer,
   else it is an extra entry; after the flush the cache holds the door's id
   so later re-emissions go through a direct-mapped `(target, base, transfer)
-  -> mask` merge. Records (24 B, layer-local) go to `edges/raw/f{frame}/`,
-  each worker's transfer table beside them.
+  -> mask` merge. Records go to `edges/raw/f{frame}/`, one per lane (16 B,
+  layer-local: target, source, transfer), each worker's transfer table
+  beside them.
 - **Runs.** At each frame's end the workers' tables merge into the frame's
   (`edges/xfer/f{frame}.bin`, sorted by value: a function of the frame, not
   the scheduling), and each layer's records are range-partitioned by target,
-  sorted (a parallel counting sort on the target's dense rank above 512k
-  records) by (target, base, transfer), merged, and delta-varint encoded in
-  256-record blocks with an index: `<level>/edges/l{layer}/f{frame}.bin` (run
-  v4). The compaction runs BEHIND the next frame's wave; `edges/done.txt`
+  sorted by it (a parallel counting sort on the target's dense rank above
+  512k records), and encoded in 256-edge blocks with an index:
+  `<level>/edges/l{layer}/f{frame}.bin` (run v5, 2026-10-07). Per edge a
+  varint head (a new target's delta, or the source's delta under the same
+  target), the source as a DENSE number (the source pieces laid end to end,
+  a table in the header) when the target is new, and the transfer's RANK in
+  the run (its transfers by descending use, a table in the header): ~4 B an
+  edge, against 8.8 B a v4 record (lanes per record: 1.006) - room (2,3)
+  gemskip f0-f137 8.27 -> 4.00 GB, room (1,0) f0-f44 433 -> 292 MB. A run is
+  read in place (mmap), index and tables included. The compaction runs
+  BEHIND the next frame's wave; `edges/done.txt`
   names the last complete frame, and a resume trusts frames up to it and
   discards the rest (at most one). Room (1,0) f0-f44: 408 MB of runs against
   216 MB without transfers and 2.8 GB for the separate arc-record stream it
@@ -348,10 +358,23 @@ the list (coarsest first; one level is the usual case):
 3. **The arc phase** (`arc_dp::solve`): the remainder-free BFS marks the
    nodes that can win by H at all, with their deadlines; only the edges into
    them, from them, are loaded (`preds_at`, the BFS's lookup), each with an
-   index into the merged transfer table (8 B an edge); `arc_dp::backward`
-   computes the winning sets `W_t`; `arc_dp::optimum` reads the optimum off
-   them. That optimum is exact in the remainder and over-approximates the
-   level's other widenings (and `rnd`): a LOWER BOUND, and no win REFUTES H.
+   index into the merged transfer table; `arc_dp::backward` computes the
+   winning sets `W_t`; `arc_dp::optimum` reads the optimum off them. That
+   optimum is exact in the remainder and over-approximates the level's other
+   widenings (and `rnd`): a LOWER BOUND, and no win REFUTES H.
+   MEMORY (2026-10-07, `[mem]` lines at every phase boundary): a node is the
+   rank of its mark in the BFS's own bitmaps (`edges::MarkRanks`, no hash
+   map); the edges are read twice, counting then filling the two adjacencies
+   in place (12 B an edge, nothing held beside them); W is kept as SPANS
+   (node, frames, set: 12 B per unchanged run) into an arena of the distinct
+   sets instead of a table per frame of `Arc`s; one pass over the frame
+   files yields the gate's fingerprints, the marks files and the concrete
+   search's sorted node keys (no hash maps). Room (2,3) gemskip h137, level
+   0 (18.6M nodes, 373M edges, 18.5M spans over 2.9M distinct sets): arc
+   phase peak 14.2 -> 8.1 GB anonymous, 20.2 -> 9.3 GB with the mapped runs;
+   W 4.4 -> 0.9 GB; the graph's build 12.1 -> 5.4 GB. Level 1 (22.9M nodes,
+   58.5M spans over 0.65M sets): peak 17.6 -> 7.2 GB, 2.6 GB left for the
+   concrete search (17.0 before).
 4. **The concrete search** (`arc_dp::concrete_search`) over concrete states
    (the reference engine's concrete step, every input, every `rnd` leaf) from
    the room's start, admitting a successor only if its projection onto the
@@ -370,6 +393,13 @@ the list (coarsest first; one level is the usual case):
 
 Resume: rerun the same command; the forward resumes or is reused, the arc
 phase reruns (minutes). A fresh forward clears `frames/` and `edges/`.
+`CELESTE_TRIM_ROWS=1` (2026-10-07) trims every frame's checkpoint files to
+keys, cells and wins once a later frame's runs are complete
+(`checkpoint::trim`): the search, a resume and `export-ui` read nothing
+else of an old frame, and the rows' values are most of a tree's frames
+(room (2,3) gemskip h137, level 0: 3.03 -> 0.78 GB; the tree 7.0 -> 4.8
+GB). The diagnostics that load old rows refuse a trimmed tree, so it is off
+by default.
 Nothing on disk records the level: reusing a tree under another `--level` is
 on you. One kernel set is resident, the process-global level's; a call at
 another level drops it and builds that level's. Fused graphs are dropped
