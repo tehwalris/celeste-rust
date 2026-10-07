@@ -129,7 +129,15 @@ def run(job, outdir, binary):
             ref, prologue = e, off
             break
     if ref is None:
-        return {**res, "status": "the community TAS does not exit in the original cart"}
+        # The community file finishes in UniversalClassicTas but not on a real
+        # PICO-8 (the tool is a reimplementation): its count is the reference.
+        level = int(name.rstrip("m")) // 100 if name.endswith("m") else None
+        ok, n, _, _ = uct(level, f"{DB}/classic/{cat}/{entry['file']}", cat) if level else (False, None, None, None)
+        if not ok:
+            return {**res, "status": "the community TAS does not exit in the original cart nor in UniversalClassicTas"}
+        prologue = job["offset"]
+        ref = prologue + n
+        res["ref_source"] = "UniversalClassicTas only (does not finish on a real PICO-8)"
     res["ref"], res["prologue"] = ref, prologue
     prefer = os.path.join(jd, "prefer.txt")
     open(prefer, "w").write(",".join(map(str, [0] * prologue + dbin)))
