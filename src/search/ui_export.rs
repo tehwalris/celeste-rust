@@ -171,7 +171,7 @@ pub struct TasFile {
 }
 
 impl TasFile {
-    fn new(name: &str, prologue: usize, seeds: &[u32], inputs: &[u8]) -> Result<Self> {
+    fn new(name: &str, prologue: usize, seeds: &[String], inputs: &[u8]) -> Result<Self> {
         anyhow::ensure!(prologue < inputs.len(), "prologue {prologue}: only {} inputs", inputs.len());
         // The prologue is dropped, so it must not press anything.
         anyhow::ensure!(inputs[..prologue].iter().all(|&b| b == 0), "the prologue's {prologue} inputs are not all 0: {:?}", &inputs[..prologue]);
@@ -179,7 +179,7 @@ impl TasFile {
         let each = |v: Vec<String>| v.iter().map(|x| format!("{x},")).collect::<String>();
         let text = format!(
             "[{}]{}",
-            each(seeds.iter().map(|s| s.to_string()).collect()),
+            each(seeds.to_vec()),
             each(inputs[prologue..].iter().map(|b| b.to_string()).collect())
         );
         Ok(TasFile { file: format!("TAS{level}.tas"), text, frames: (inputs.len() - prologue - 1) as u32, prologue: prologue as u32 })
@@ -739,10 +739,12 @@ fn read_witness(path: &Path) -> Result<Witness> {
         (Some(db), Some(prologue), Some(seeds)) => {
             let (db_name, _category) = db.split_once(' ').with_context(|| format!("{name}: `db {db}` is not `db NAME CATEGORY`"))?;
             let inner = seeds.strip_prefix('[').and_then(|s| s.strip_suffix(']')).with_context(|| format!("{name}: `seeds {seeds}` is not `seeds [a,b,..]`"))?;
-            let seeds: Vec<u32> = inner
+            // Balloon seeds are the tool's numbers as written (`0.02485`).
+            let seeds: Vec<String> = inner
                 .split(',')
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.trim().parse::<u32>().with_context(|| format!("{name}: a seed")))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse::<f64>().map(|_| s.to_string()).with_context(|| format!("{name}: a seed {s:?}")))
                 .collect::<Result<_>>()?;
             let prologue: usize = prologue.parse().with_context(|| format!("{name}: `prologue {prologue}`"))?;
             Some(TasFile::new(db_name, prologue, &seeds, &inputs).with_context(|| format!("{name}: the tasdatabase file"))?)
@@ -1030,8 +1032,8 @@ mod tests {
         // The tasdatabase file: the prologue stripped, the seeds in front, no newline.
         let t = read("label ours\ninputs 0,0,16,0,2\ndb 2900m nodiag\nprologue 2\nseeds [0,0,0]\n0 - -\n").unwrap().tas.unwrap();
         assert_eq!(t, TasFile { file: "TAS29.tas".into(), text: "[0,0,0,]16,0,2,".into(), frames: 2, prologue: 2 });
-        let t = read("inputs 0,17,0\nprologue 1\nseeds []\ndb 600m nodiag\n0 - -\n").unwrap().tas.unwrap();
-        assert_eq!((t.text.as_str(), t.frames), ("[]17,0,", 1));
+        let t = read("inputs 0,17,0\nprologue 1\nseeds [0,0.02485]\ndb 600m nodiag\n0 - -\n").unwrap().tas.unwrap();
+        assert_eq!((t.text.as_str(), t.frames), ("[0,0.02485,]17,0,", 1));
         assert!(read("inputs 0,17,0\nprologue 2\nseeds []\ndb 600m nodiag\n0 - -\n").is_err(), "a prologue that presses a button");
         assert!(read("inputs 0,17,0\nprologue 1\n0 - -\n").is_err(), "db, prologue and seeds go together");
         std::fs::remove_dir_all(&dir).unwrap();
