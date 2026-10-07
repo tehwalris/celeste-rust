@@ -265,8 +265,10 @@ export class RoomRenderer {
     ctx.restore();
   }
 
-  /** Composite `scene` into the offscreen and draw it scaled onto `canvas`. */
-  render(canvas: HTMLCanvasElement, scene: Scene) {
+  /** Composite `scene` into the offscreen and draw it scaled onto `canvas`:
+   *  sized to its CSS box (times the device pixel ratio), or to `size`
+   *  pixels exactly when given (the image / video export, off screen). */
+  render(canvas: HTMLCanvasElement, scene: Scene, size?: { w: number; h: number }) {
     const { w, h } = this.box;
     const n = w * h;
     const acc = this.acc;
@@ -302,8 +304,8 @@ export class RoomRenderer {
     const dpr = window.devicePixelRatio || 1;
     const cw = canvas.clientWidth || w;
     const ch = Math.round((cw * h) / w);
-    const pw = Math.round(cw * dpr);
-    const ph = Math.round(ch * dpr);
+    const pw = size ? size.w : Math.round(cw * dpr);
+    const ph = size ? size.h : Math.round(ch * dpr);
     if (canvas.width !== pw || canvas.height !== ph) {
       canvas.width = pw;
       canvas.height = ph;

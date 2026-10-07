@@ -31,6 +31,7 @@ import { addSparse, OURS, REFERENCE, RoomRenderer, sparseMax, type DrawPath, typ
 import { button, chips, clear, el, icon, scrubber, select, show } from "./ui";
 import { Instances, View3D } from "./view3d";
 import type { View } from "./main";
+import { exportScale, openVideoDialog, savePng, type Pacing, type Range, type VideoPlan } from "./export";
 
 type Phase = "fwd" | "bwd";
 type Grain = "room" | "grid" | "passes" | "3d";
@@ -38,11 +39,10 @@ type Grain = "room" | "grid" | "passes" | "3d";
  *  timeline) or stack (one layer of cubes per pass, on the pass timeline). */
 type Mode3 = "columns" | "stack";
 type Look = "full" | "sweep" | "last";
-/** Uniform: every step takes the same time. Real: a step's share of the
- *  playback is its share of the run's logged time (the level-0 passes
- *  crawl, the high-bit passes flick by), normalised so a playthrough
- *  lasts as long as the uniform one at the same speed. */
-type Pacing = "uniform" | "real";
+/** Pacing (export.ts) - uniform: every step takes the same time. Real: a
+ *  step's share of the playback is its share of the run's logged time (the
+ *  level-0 passes crawl, the high-bit passes flick by), normalised so a
+ *  playthrough lasts as long as the uniform one at the same speed. */
 
 interface LevelFiles {
   frames: FramesBin;
@@ -407,16 +407,16 @@ export function spaceView(run: Run, onState: () => void): View {
     return 0;
   }
 
-  /** Room grain: the current pass at its time. */
-  function roomScene(hr: HorizonRun, pass: Pass, i: number): Built {
+  /** Room grain: the current pass at its time (in `look`, the exports' Full). */
+  function roomScene(hr: HorizonRun, pass: Pass, i: number, look: Look = st.look): Built {
     const layers: HeatLayer[] = [];
     const probe: Named[] = [];
-    if (st.look === "last") {
+    if (look === "last") {
       paintPasses(hr, timeline(st.h), pass.index, layers, probe);
       const off = paintCurrent(pass.lr, pass.phase, pass.frames[i], hr.h, layers, probe);
       return { scene: { layers }, probe, off };
     }
-    const full = st.look === "full";
+    const full = look === "full";
     if (full && pass.lr.level !== 0) base(hr, layers, probe);
     if (full) bands(hr, pass.lr.level, layers, probe);
     const { off, scale } = levelAt(pass.lr, pass.phase, pass.frames[i], hr.h, full, layers, probe);
@@ -480,14 +480,14 @@ export function spaceView(run: Run, onState: () => void): View {
   /** Passes grain: a whole pass. A forward is everything the level
    *  reached by H (bright); a backward its whole marked set (bright warm
    *  white) over the reached set dimmed. Closed levels recede underneath. */
-  function passScene(hr: HorizonRun, pass: Pass): Built {
+  function passScene(hr: HorizonRun, pass: Pass, look: Look = st.look): Built {
     const layers: HeatLayer[] = [];
     const probe: Named[] = [];
-    if (st.look === "last") {
+    if (look === "last") {
       paintPasses(hr, timeline(st.h), pass.index + 1, layers, probe);
       return { scene: { layers }, probe, off: 0 };
     }
-    const full = st.look === "full";
+    const full = look === "full";
     const files = have(pass.lr);
     if (!files) return empty();
     if (full && pass.lr.level !== 0) base(hr, layers, probe);
@@ -714,7 +714,14 @@ export function spaceView(run: Run, onState: () => void): View {
     },
     { label: run.reference ? "paths" : "witness" },
   );
-  const optionCard = el("section", { class: "card options" }, [grainChips.root, lookChips.root, mode3Chips.root, ...(pathRows.length ? [trailChips.root] : []), speedChips.root, pacingChips.root]);
+  // The exports: the room's grid alone in the Full look, at an integer
+  // scale - the still on screen as a PNG, the traversal as a video.
+  const exportRow = el("div", { class: "chips export-row" }, [
+    el("span", { class: "chips-label", text: "export" }),
+    button("Save image", () => void saveImage(), "small", "the room as a PNG: this step, Full look, no overlays"),
+    button("Export video…", () => exportVideo(), "small", "the traversal as a video: Full look, uniform or real-time pacing"),
+  ]);
+  const optionCard = el("section", { class: "card options" }, [grainChips.root, lookChips.root, mode3Chips.root, ...(pathRows.length ? [trailChips.root] : []), speedChips.root, pacingChips.root, exportRow]);
 
   // ---- DOM: the legend --------------------------------------------------------------
   const key = (color: string, label: string, cls = "") => el("span", { class: "key" }, [el("i", { class: cls, style: color ? `background:${color}` : undefined }), label]);
@@ -783,6 +790,79 @@ export function spaceView(run: Run, onState: () => void): View {
 
   const sideCol = el("aside", { class: "space-side" }, [optionCard, ladderCard, legendCard]);
   root.append(stageCol, bar, sideCol);
+
+  // ---- exports (export.ts) ---------------------------------------------------------
+  const exportSize = (() => {
+    const k = exportScale(run.cell_box.w, run.cell_box.h);
+    return { w: run.cell_box.w * k, h: run.cell_box.h * k };
+  })();
+  const phaseWord = (p: Pass) => (p.phase === "fwd" ? "forward" : "backward");
+  /** The playhead as a step (Passes and the 3D stack: its pass's start). */
+  const currentStep = () => (byPass() ? (timeline(st.h)[st.pass]?.start ?? 0) : st.step);
+  /** Draw step `step` of the current horizon in the Full look, grid only. */
+  function drawExport(c: HTMLCanvasElement, step: number) {
+    const hr = run.horizons[st.h];
+    const { pass, i } = locate(timeline(st.h), step);
+    renderer.render(c, roomScene(hr, pass, i, "full").scene, exportSize);
+  }
+  async function saveImage() {
+    const hr = run.horizons[st.h];
+    const tl = timeline(st.h);
+    if (!tl.length) return;
+    await ensure(hr.levels);
+    const c = el("canvas", { width: exportSize.w, height: exportSize.h });
+    let name: string;
+    if (byPass()) {
+      // A step is a whole pass: the pass's whole set, as the Passes grain.
+      const pass = tl[Math.max(0, Math.min(tl.length - 1, st.pass))];
+      renderer.render(c, passScene(hr, pass, "full").scene, exportSize);
+      name = `${run.id}_h${hr.h}_L${pass.lr.level}-${phaseWord(pass)}-whole_full.png`;
+    } else {
+      const { pass, i } = locate(tl, st.step);
+      drawExport(c, st.step);
+      name = `${run.id}_h${hr.h}_f${String(pass.frames[i]).padStart(3, "0")}_L${pass.lr.level}-${phaseWord(pass)}_full.png`;
+    }
+    await savePng(c, name);
+  }
+  function exportVideo() {
+    stop();
+    const SPEED_FILE = ["slow", "med", "fast"];
+    openVideoDialog({
+      size: exportSize,
+      speeds: SPEEDS,
+      defaults: { pacing: st.pacing, speed: st.speed },
+      passLabel: () => {
+        const { pass } = locate(timeline(st.h), currentStep());
+        return `level ${pass.lr.level} ${phaseWord(pass)}`;
+      },
+      ready: () => ensure(run.horizons[st.h].levels).then(() => undefined),
+      draw: drawExport,
+      plan(range: Range, pacing: Pacing, speed: number): VideoPlan {
+        const hr = run.horizons[st.h];
+        const tl = timeline(st.h);
+        let a = 0;
+        let b = stepsOf(tl) - 1;
+        let what = `h${hr.h}, every pass`;
+        let part = "all";
+        if (range === "pass") {
+          const { pass } = locate(tl, currentStep());
+          a = pass.start;
+          b = pass.start + pass.frames.length - 1;
+          what = `h${hr.h}, level ${pass.lr.level} ${phaseWord(pass)}`;
+          part = `L${pass.lr.level}-${phaseWord(pass)}`;
+        }
+        const rate = SPEEDS[speed].steps;
+        const name = `${run.id}_h${hr.h}_${part}_full_${pacing === "real" ? "realtime" : "uniform"}-${SPEED_FILE[speed] ?? speed}`;
+        const steps = b - a + 1;
+        if (pacing === "uniform") return { steps, duration: steps / rate, stepAt: (t) => Math.min(b, a + Math.floor(t * rate)), what, name };
+        // The live playback's real-time pacing: the float playhead in
+        // uniform-step units moves at `rate`, the step under it is set by
+        // the log's weights (stepCum).
+        const cum = stepCum(st.h);
+        return { steps, duration: (cum[b + 1] - cum[a]) / rate, stepAt: (t) => Math.max(a, Math.min(b, indexAt(cum, cum[a] + t * rate))), what, name };
+      },
+    });
+  }
 
   // ---- the ladder panel ------------------------------------------------------------
   let ladderFor = -1;

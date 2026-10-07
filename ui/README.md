@@ -107,6 +107,25 @@ legend's "How to read this" holds the longer explanation and the keys:
 | `home` `end` | start / end of the horizon |
 | `1` `2` `3` | speed |
 
+**Exports** (the options card's `export` row; `src/export.ts`): the
+room's grid alone - tiles and coloured cells in the *Full* look, no
+paths, labels or controls - at an even integer scale (the longer side at
+most 768 px: room (4,3)'s 141x133-cell box is 4x, 564x532). *Save image*
+is the step on screen as a PNG (`room43nodiag_h111_f053_L0-forward_full.png`;
+in Passes / 3D stack the whole pass, `..._L2-backward-whole_full.png`).
+*Export video…* opens a dialog: range (every pass of the horizon, or the
+pass the playhead is in), pacing and speed exactly as the playback's
+(uniform or real time; 15 / 60 / 250 steps per second; real time keeps
+the same total), the last frame held 1 s, 30 fps at slow and 60 above.
+The canvas is recorded in real time with `captureStream` + `MediaRecorder`
+(MP4/H.264 where `isTypeSupported` says so - iOS Safari, Chrome - else
+WebM), so recording takes as long as the video and the tab must stay in
+front; a live preview, a progress bar and Cancel while it runs, then the
+video, Download, and Share (the phone's share sheet, to save it to the
+photos) where `navigator.canShare` allows files. The file is named
+`room43nodiag_h111_all_full_uniform-med.mp4` (`L2-backward` for one pass,
+`realtime`, `slow` / `med` / `fast`).
+
 A note on the backward: the checkpoint tree written by this run stores
 each mark without its distance to the win, so a backward is shown as the
 marked set split by the frame each state was first reached at, swept
@@ -262,4 +281,5 @@ src/view3d.ts    the 3D grain's WebGL2 renderer
 src/sizes.ts     the Sizes tab
 src/chart.ts     the line chart
 src/timeline.ts  the Time tab (the waterfall)
+src/export.ts    the PNG and video exports of the room
 ```

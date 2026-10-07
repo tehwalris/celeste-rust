@@ -23,6 +23,19 @@ export function el<K extends keyof HTMLElementTagNameMap>(
   return e;
 }
 
+/** Save `blob` as a file named `name`, byte for byte (an anchor with
+ *  `download`: works on phone browsers too). Text goes as
+ *  application/octet-stream so no browser appends `.txt` to the name. */
+export function download(name: string, blob: Blob) {
+  const url = URL.createObjectURL(blob);
+  const a = el("a", { href: url, download: name, style: "display:none" });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  // Safari reads the blob after click() returns.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
 export function clear(e: HTMLElement) {
   while (e.firstChild) e.removeChild(e.firstChild);
 }

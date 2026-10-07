@@ -21,7 +21,7 @@
 // count in the database's convention (its own row on a phone).
 import "./style.css";
 import { categoryOf, chapters, fmtDuration, loadRun, loadRuns, pickLabel, runsInGameOrder, type Chapter, type Run, type RunInfo } from "./data";
-import { el, clear, button, select, type Select } from "./ui";
+import { el, clear, button, download, select, type Select } from "./ui";
 import { spaceView } from "./space";
 import { sizesView } from "./sizes";
 import { timelineView } from "./timeline";
@@ -75,19 +75,6 @@ function errorCard(title: string, detail: string, retry?: () => void): HTMLEleme
   const card = el("div", { class: "card err-card", role: "alert" }, [el("h2", { text: title }), el("pre", { text: detail })]);
   if (retry) card.append(button("Try again", retry, "small"));
   return card;
-}
-
-/** Save `text` as a file named `name`, byte for byte (a Blob and an
- *  anchor with `download`: works on phone browsers too). octet-stream so
- *  no browser appends `.txt` to the name. */
-function download(name: string, text: string) {
-  const url = URL.createObjectURL(new Blob([text], { type: "application/octet-stream" }));
-  const a = el("a", { href: url, download: name, style: "display:none" });
-  document.body.append(a);
-  a.click();
-  a.remove();
-  // Safari reads the blob after click() returns.
-  setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
 async function main() {
@@ -226,7 +213,7 @@ async function main() {
       if (wall) sub.append(el("span", { text: `${wall} search` }));
       const tas = run.witness?.tas;
       if (tas) {
-        const dl = button("Download .tas", () => download(tas.file, tas.text), "small", `Download ${tas.file} (tasdatabase format)`);
+        const dl = button("Download .tas", () => download(tas.file, new Blob([tas.text], { type: "application/octet-stream" })), "small", `Download ${tas.file} (tasdatabase format)`);
         // Frames in the database's convention: inputs after the spawn - 1.
         const ref = run.reference?.tas ? ` vs ${run.reference.label.split(/[\s:(]/)[0]} ${run.reference.tas.frames}f` : "";
         tasBox.replaceChildren(dl, el("span", { class: "tas-frames", text: `${tas.frames}f${ref}` }));
