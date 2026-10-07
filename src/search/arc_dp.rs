@@ -952,7 +952,8 @@ pub fn concrete_search(
         cell: u32,
         win: bool,
         exact: (u64, u64),
-        row: Rt2,
+        /// `None` for a win (its state is never expanded).
+        row: Option<Rt2>,
     }
     let start = Block::keyed(initial)?;
     let start_cell = start.positions()?[0];
@@ -1066,7 +1067,7 @@ pub fn concrete_search(
                             // are repeats.
                             let mut got = Vec::new();
                             let mut chunk_seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
-                            for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
+                            'chunk: for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
                                 for byte in input_order(prefer, k) {
                                     for b in eng.step(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
                                         steps += 1;
@@ -1088,7 +1089,15 @@ pub fn concrete_search(
                                             }
                                         }
                                         chunk_seen.insert((exact, cell));
-                                        got.push(Succ { parent: p as u32, byte, cell, win, exact, row: b.into_rt2() });
+                                        // A win keeps no state (only its link), and the chunk
+                                        // ends at its first: the earliest win (chunks merge in
+                                        // order) ends the search. Every successor of the last
+                                        // layer can win - kept whole, room (4,3) 100% reached
+                                        // 100 GB there.
+                                        got.push(Succ { parent: p as u32, byte, cell, win, exact, row: (!win).then(|| b.into_rt2()) });
+                                        if win {
+                                            break 'chunk;
+                                        }
                                     }
                                 }
                             }
@@ -1117,7 +1126,7 @@ pub fn concrete_search(
                 break;
             }
             if seen.insert((s.exact, s.cell)) {
-                next.push(s.row);
+                next.push(s.row.expect("a non-winning successor keeps its state"));
                 links.push((s.parent, s.byte, s.cell));
             }
         }
