@@ -73,6 +73,28 @@ def diag_dashes(inputs):
     return bad
 
 
+def canon_jumps(room, inputs, cat):
+    """Keep the jump bit only where a jump FIRES in the minimal cart (the
+    search's model). The original cart buffers a press for 4 frames (jbuffer),
+    so a press that does nothing in the minimal cart - one copied from a
+    community TAS by --prefer - can fire later there. With every press firing
+    at once, the buffer never holds one: the same route in both carts."""
+    env = dict(os.environ, CELESTE_START_ROOM=room, **mode_env(cat))
+    out = subprocess.run([f"{M}/target/quick/concrete_run", "-i", ",".join(map(str, inputs))], capture_output=True, text=True, env=env, cwd=M, timeout=600).stdout
+    spd_y = {}
+    for line in out.splitlines():
+        m = re.match(r"Frame (\d+): player at \([^)]*\) spd=\([^,]*, ([^)]*)\)", line)
+        if m:
+            spd_y[int(m.group(1))] = m.group(2).strip()
+    canon, prev = [], 0
+    for i, b in enumerate(inputs):
+        f = i + 1
+        fired = b & 16 and not prev & 16 and spd_y.get(f) == "-2"
+        canon.append((b & ~16) | (16 if fired else 0))
+        prev = b
+    return canon
+
+
 def uct(level, path, cat):
     env = dict(os.environ)
     if cat.startswith("gemskip"):
@@ -85,8 +107,9 @@ def uct(level, path, cat):
 
 def run(job, outdir, binary):
     cat, room, name = job["cat"], job["room"], job["name"]
-    key = f"{cat}/{name}"
-    jd = os.path.join(outdir, cat, name)
+    # `tag`: a retry of a room with other settings, recorded apart.
+    key = f"{cat}/{name}{job.get('tag', '')}"
+    jd = os.path.join(outdir, cat, name + job.get("tag", ""))
     shutil.rmtree(jd, ignore_errors=True)
     os.makedirs(jd)
     res = {"key": key, "cat": cat, "room": room, "name": name, "start": time.strftime("%H:%M")}
@@ -143,6 +166,15 @@ def run(job, outdir, binary):
     open(os.path.join(jd, "witness.txt"), "w").write(",".join(map(str, ours)))
     # 3. verification in the original cart
     e, out = replay_exit(room, ours, seeds, cat)
+    if e != opt:
+        # A jump press that does nothing in the minimal cart can fire later in
+        # the original (its jump buffer): keep only the presses that fire.
+        canon = canon_jumps(room, ours, cat)
+        e2, out2 = replay_exit(room, canon, seeds, cat)
+        res["jump_canonicalized"] = f"original cart exit {e} -> {e2}"
+        if e2 == opt:
+            ours, e, out = canon, e2, out2
+            open(os.path.join(jd, "witness.txt"), "w").write(",".join(map(str, ours)))
     res["ours_original_cart_exit"] = e
     if cat in ("100", "gemskip100"):
         # The berry taken before the exit: a `lifeup` appears where it was.
@@ -207,7 +239,7 @@ def main():
         done = set()
         if os.path.exists(results):
             done = {json.loads(l)["key"] for l in open(results) if l.strip()}
-        todo = [j for j in json.load(open(jobs_path)) if f"{j['cat']}/{j['name']}" not in done]
+        todo = [j for j in json.load(open(jobs_path)) if f"{j['cat']}/{j['name']}{j.get('tag', '')}" not in done]
         if not todo:
             print("all jobs done", flush=True)
             return
@@ -217,7 +249,7 @@ def main():
         try:
             res = run(job, outdir, binary)
         except Exception as ex:
-            res = {"key": f"{job['cat']}/{job['name']}", "status": f"runner error: {ex}"[:300]}
+            res = {"key": f"{job['cat']}/{job['name']}{job.get('tag', '')}", "status": f"runner error: {ex}"[:300]}
         res["end"] = time.strftime("%H:%M")
         with open(results, "a") as f:
             f.write(json.dumps(res) + "\n")

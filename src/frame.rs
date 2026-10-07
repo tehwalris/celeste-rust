@@ -1754,7 +1754,8 @@ pub fn forward_run(
 
 /// The per-frame `[fwd]` line (ms) and the `fwd.*` metrics totals.
 /// Stop the forward before the checkpoint disk fills: below
-/// `CELESTE_MIN_FREE_GB` (default 20) free on `dir`'s filesystem, an error -
+/// `CELESTE_MIN_FREE_GB` (default 20) plus three times what the last frame
+/// wrote, free on `dir`'s filesystem, an error -
 /// a full disk otherwise fails a worker mid-write (room (5,1) nodiag,
 /// 2026-10-06) and starves everything else on the machine.
 fn ensure_disk_space(dir: &std::path::Path) -> Result<()> {
@@ -1768,11 +1769,19 @@ fn ensure_disk_space(dir: &std::path::Path) -> Result<()> {
     // statvfs fills on success.
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     anyhow::ensure!(unsafe { libc::statvfs(path.as_ptr(), &mut st) } == 0, "statvfs {}: {}", dir.display(), std::io::Error::last_os_error());
-    let free_gb = st.f_bavail as u64 * st.f_frsize as u64 >> 30;
+    let free = st.f_bavail as u64 * st.f_frsize as u64;
+    // A frame can write tens of GB (a room whose frontier explodes): keep room
+    // for three more frames like the last one, not just the fixed floor.
+    static LAST_FREE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let last = LAST_FREE.swap(free, std::sync::atomic::Ordering::Relaxed);
+    let frame_bytes = last.saturating_sub(free);
+    let need = (min_gb << 30) + 3 * frame_bytes;
     anyhow::ensure!(
-        free_gb >= min_gb,
-        "only {free_gb} GB free on {}'s filesystem (CELESTE_MIN_FREE_GB = {min_gb}): stopping the forward before the disk fills",
-        dir.display()
+        free >= need,
+        "only {} GB free on {}'s filesystem, the last frame used {} GB (CELESTE_MIN_FREE_GB = {min_gb}, plus 3 frames): stopping the forward before the disk fills",
+        free >> 30,
+        dir.display(),
+        frame_bytes >> 30
     );
     Ok(())
 }
