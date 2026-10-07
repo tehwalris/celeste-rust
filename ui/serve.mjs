@@ -27,6 +27,8 @@ const MIME = {
   ".png": "image/png",
   ".ico": "image/x-icon",
   ".map": "application/json",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
 };
 
 // `cache`: "immutable" for hashed assets, "revalidate" for the data (a
@@ -60,7 +62,23 @@ function send(req, res, file, cache) {
       headers["vary"] = "accept-encoding";
       res.writeHead(200, headers);
       fs.createReadStream(file).pipe(zlib.createGzip({ level: 6 })).pipe(res);
+    } else if (/^bytes=\d*-\d*$/.test(req.headers.range || "")) {
+      // A byte range: what a <video> asks for (iOS Safari plays nothing
+      // from a server that answers it with the whole file).
+      const [a, b] = req.headers.range.slice(6).split("-");
+      const start = a === "" ? Math.max(0, st.size - Number(b)) : Number(a);
+      const end = a === "" || b === "" ? st.size - 1 : Math.min(Number(b), st.size - 1);
+      if (start > end || start >= st.size) {
+        res.writeHead(416, { "content-range": `bytes */${st.size}` });
+        res.end();
+        return;
+      }
+      headers["content-range"] = `bytes ${start}-${end}/${st.size}`;
+      headers["content-length"] = end - start + 1;
+      res.writeHead(206, headers);
+      fs.createReadStream(file, { start, end }).pipe(res);
     } else {
+      headers["accept-ranges"] = "bytes";
       headers["content-length"] = st.size;
       res.writeHead(200, headers);
       fs.createReadStream(file).pipe(res);
