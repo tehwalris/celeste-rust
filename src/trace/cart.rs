@@ -103,7 +103,8 @@ fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path) -> Result<
             }
         }
     }
-    anyhow::ensure!(seeds.len() <= seeded.len(), "CELESTE_BALLOON_SEEDS: {} seeds for {} balloons and chests", seeds.len(), seeded.len());
+    // More seeds than objects: the tool (UniversalClassicTas `set_seeds`)
+    // applies one per balloon/chest present and ignores the rest.
     let mut expr = "0".to_string();
     for (i, &(tile, x, y)) in seeded.iter().enumerate().rev() {
         if tile == 22 {
