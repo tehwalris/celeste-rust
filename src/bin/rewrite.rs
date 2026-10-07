@@ -531,6 +531,7 @@ fn main() -> Result<()> {
                     }
                 };
                 eprintln!("[search] level {li} ({lvl}): forward to f{horizon} in {:.1} s; first win {first_win:?}", t.elapsed().as_secs_f64());
+                celeste_rust::metrics::mem_phase("forward");
                 // THE ARC PHASE and the concrete search (at a coarser level
                 // only the try at the bound).
                 let concrete = match (no_witness, last) {

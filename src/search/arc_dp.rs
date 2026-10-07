@@ -13,8 +13,6 @@
 //! unions. The graph is frame-independent, so one recorded expansion per node
 //! serves every frame; a node is occupied no earlier than its layer.
 
-use std::sync::Arc;
-
 use super::arcs::{Action, Region, Transfer};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -44,11 +42,11 @@ pub struct Graph {
     /// no bound).
     until: Vec<u32>,
     win: Vec<bool>,
-    out_at: Vec<u32>,
+    out_at: Vec<u64>,
     out: Vec<Out>,
     /// The distinct (x, y) transfer pairs the edges index.
     xfers: Vec<(Transfer, Transfer)>,
-    pred_at: Vec<u32>,
+    pred_at: Vec<u64>,
     preds: Vec<u32>,
     /// Non-win nodes by deadline (`by_deadline[t]`: deadline `t`).
     by_deadline: Vec<Vec<u32>>,
@@ -56,53 +54,44 @@ pub struct Graph {
 
 /// Compressed adjacency by key (a counting sort): `at[i]..at[i + 1]` indexes
 /// key `i`'s values, in input order.
-fn csr<I, T>(n: usize, parts: &[Vec<I>], key: impl Fn(&I) -> u32, val: impl Fn(&I) -> T) -> (Vec<u32>, Vec<T>) {
-    let mut at = vec![0u32; n + 1];
-    for p in parts.iter().flatten() {
+fn csr<I, T>(n: usize, items: &[I], key: impl Fn(&I) -> u32, val: impl Fn(&I) -> T) -> (Vec<u64>, Vec<T>) {
+    let mut at = vec![0u64; n + 1];
+    for p in items {
         at[key(p) as usize + 1] += 1;
     }
     for i in 0..n {
         at[i + 1] += at[i];
     }
-    let total = at[n] as usize;
     let mut fill = at.clone();
-    let mut order = vec![(0u32, 0u32); total];
-    for (pi, part) in parts.iter().enumerate() {
-        for (k, p) in part.iter().enumerate() {
-            let slot = &mut fill[key(p) as usize];
-            order[*slot as usize] = (pi as u32, k as u32);
-            *slot += 1;
-        }
+    let mut order = vec![0u32; items.len()];
+    for (k, p) in items.iter().enumerate() {
+        let slot = &mut fill[key(p) as usize];
+        order[*slot as usize] = k as u32;
+        *slot += 1;
     }
-    (at, order.into_iter().map(|(pi, k)| val(&parts[pi as usize][k as usize])).collect())
+    (at, order.into_iter().map(|k| val(&items[k as usize])).collect())
+}
+
+/// The adjacency of a graph (`Graph::from_csr`): `out_at`/`out` by source,
+/// `pred_at`/`preds` by target, the same edges.
+struct Csr {
+    out_at: Vec<u64>,
+    out: Vec<Out>,
+    pred_at: Vec<u64>,
+    preds: Vec<u32>,
 }
 
 impl Graph {
-    /// The graph over `ids` (sorted, unique): `edges` as (source index, out)
-    /// in parts, `layer(id)` the first frame a node can be occupied,
-    /// `deadline` the last frame it can still win from (absent: never;
-    /// `None`: no bound).
-    pub fn new(
-        ids: Vec<u64>,
-        edges: Vec<Vec<(u32, Out)>>,
-        xfers: Vec<(Transfer, Transfer)>,
-        layer: impl Fn(u64) -> u32,
-        wins: impl IntoIterator<Item = u64>,
-        deadline: Option<&FxHashMap<u64, u16>>,
-    ) -> Self {
+    /// The graph over `ids` (sorted, unique) and its adjacency: `layer(id)`
+    /// the first frame a node can be occupied, `win` the win nodes, `until`
+    /// one past the last frame each can still win from (0: never;
+    /// `u32::MAX`: no bound).
+    fn from_csr(ids: Vec<u64>, adj: Csr, xfers: Vec<(Transfer, Transfer)>, layer: impl Fn(u64) -> u32, win: Vec<bool>, until: Vec<u32>) -> Self {
         let n = ids.len();
         assert!(n < u32::MAX as usize, "{n} nodes do not fit a u32 index");
         debug_assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids sorted and unique");
-        let (out_at, out) = csr(n, &edges, |p| p.0, |p| p.1);
-        let (pred_at, preds) = csr(n, &edges, |p| p.1.dst, |p| p.0);
-        drop(edges);
-        let wins: FxHashSet<u64> = wins.into_iter().collect();
+        assert!(adj.out_at.len() == n + 1 && adj.pred_at.len() == n + 1 && win.len() == n && until.len() == n);
         let layer: Vec<u32> = ids.iter().map(|&id| layer(id)).collect();
-        let win: Vec<bool> = ids.iter().map(|id| wins.contains(id)).collect();
-        let until: Vec<u32> = match deadline {
-            None => vec![u32::MAX; n],
-            Some(d) => ids.iter().map(|id| d.get(id).map_or(0, |&t| t as u32 + 1)).collect(),
-        };
         let mut by_deadline: Vec<Vec<u32>> = Vec::new();
         for i in 0..n {
             if !win[i] && until[i] != 0 && until[i] != u32::MAX {
@@ -113,6 +102,7 @@ impl Graph {
                 by_deadline[t].push(i as u32);
             }
         }
+        let Csr { out_at, out, pred_at, preds } = adj;
         Graph { ids, layer, until, win, out_at, out, xfers, pred_at, preds, by_deadline }
     }
     /// From edges over node ids (small graphs: the prototype, tests).
@@ -121,10 +111,19 @@ impl Graph {
         let mut ids: Vec<u64> = edges.iter().flat_map(|e| [e.src, e.dst]).chain(wins.iter().copied()).collect();
         ids.sort_unstable();
         ids.dedup();
+        let n = ids.len();
         let idx = |id: u64| ids.binary_search(&id).expect("an edge's node is indexed") as u32;
         let xfers: Vec<(Transfer, Transfer)> = edges.iter().map(|e| (e.x, e.y)).collect();
         let part: Vec<(u32, Out)> = edges.iter().enumerate().map(|(k, e)| (idx(e.src), Out { dst: idx(e.dst), xfer: k as u32 })).collect();
-        Graph::new(ids, vec![part], xfers, layer, wins, deadline)
+        let (out_at, out) = csr(n, &part, |p| p.0, |p| p.1);
+        let (pred_at, preds) = csr(n, &part, |p| p.1.dst, |p| p.0);
+        let wins: FxHashSet<u64> = wins.into_iter().collect();
+        let win: Vec<bool> = ids.iter().map(|id| wins.contains(id)).collect();
+        let until: Vec<u32> = match deadline {
+            None => vec![u32::MAX; n],
+            Some(d) => ids.iter().map(|id| d.get(id).map_or(0, |&t| t as u32 + 1)).collect(),
+        };
+        Graph::from_csr(ids, Csr { out_at, out, pred_at, preds }, xfers, layer, win, until)
     }
     /// The transfer pair of edge `e`.
     pub fn xfer(&self, e: &Out) -> (Transfer, Transfer) {
@@ -132,9 +131,9 @@ impl Graph {
     }
     /// Drop the adjacency; `index`, `id`, `is_win`, `layer_of` still work.
     pub fn forget_edges(&mut self) {
-        for v in [&mut self.out_at, &mut self.pred_at, &mut self.preds] {
-            *v = Vec::new();
-        }
+        self.out_at = Vec::new();
+        self.pred_at = Vec::new();
+        self.preds = Vec::new();
         self.out = Vec::new();
         self.xfers = Vec::new();
     }
@@ -184,18 +183,57 @@ pub struct Loaded {
     pub start: u32,
     /// The remainder-free BFS's marks, sorted by id: every id that wins by
     /// the horizon with SOME remainder, with its deadline (the start always).
+    /// They are the graph's nodes, in its order: node `i` is `marks[i]`.
     pub marks: Vec<(u64, u16)>,
     /// The win rows of frames `1..=horizon`.
     pub wins: Vec<u64>,
     pub edges: usize,
 }
 
+/// Run `f` over the nodes `0..n` in parallel chunks (`f(lo, hi)`), collecting
+/// its results in chunk order.
+fn par_chunks<T: Send>(n: usize, f: impl Fn(usize, usize) -> anyhow::Result<T> + Sync) -> anyhow::Result<Vec<T>> {
+    let threads = crate::frame::threads().max(1);
+    let chunk = n.div_ceil(threads * 8).max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut parts: Vec<(usize, T)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads)
+            .map(|_| {
+                sc.spawn(|| -> anyhow::Result<Vec<(usize, T)>> {
+                    let mut out = Vec::new();
+                    loop {
+                        let lo = next.fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
+                        if lo >= n {
+                            return Ok(out);
+                        }
+                        out.push((lo, f(lo, (lo + chunk).min(n))?));
+                    }
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("a graph loader panicked")).collect::<anyhow::Result<Vec<_>>>()
+    })?
+    .into_iter()
+    .flatten()
+    .collect();
+    parts.sort_unstable_by_key(|p| p.0);
+    Ok(parts.into_iter().map(|p| p.1).collect())
+}
+
 /// The rotation graph of the tree in `dir` up to `horizon`, restricted to the
 /// nodes the remainder-free BFS (`edges::bfs`) marks: an edge between other
 /// nodes is on no path to a win with any remainder. Every loaded edge must
 /// carry its transfer.
+///
+/// MEMORY: the nodes are the BFS's marks, numbered by their rank in its own
+/// bitmaps (`edges::MarkRanks`, no hash map), and the edges are read TWICE -
+/// a pass counting each node's in- and out-degree, then a pass filling the
+/// two adjacencies in place - so no edge list is ever held beside the graph:
+/// 12 B an edge, the graph's own (room (2,3) gemskip h137, 373M edges: 28 B
+/// an edge and a 12.1 GB peak before).
 pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     use crate::frame::{frame_files, id_layer, pack_id};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     let t0 = std::time::Instant::now();
     let mut wins: Vec<u64> = Vec::new();
     let mut start_id: Option<u64> = None;
@@ -216,23 +254,22 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     }
     let start_id = start_id.ok_or_else(|| anyhow::anyhow!("{}: no frame-0 row", dir.display()))?;
     let eg = super::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
+    crate::metrics::mem_phase("arc: runs opened");
     // A frame that kept rows must have its own layer's run; one that kept
     // none (the level -1 filter) may have none.
     for (f, &rows) in kept.iter().enumerate().skip(1) {
         let f = f as u32;
         anyhow::ensure!(rows == 0 || eg.has_run(f, f), "{}: no edge run for f{f}, which kept {rows} rows", dir.display());
     }
-    let (bfs, _) = super::edges::bfs(&eg, horizon, wins.iter().copied());
+    let (mut bfs, _) = super::edges::bfs(&eg, horizon, wins.iter().copied());
     let t_bfs = t0.elapsed();
-    // The BFS never marks layer 0; the start defaults to deadline 0.
-    let mut deadline: FxHashMap<u64, u16> = bfs.with_deadlines().into_iter().collect();
-    deadline.entry(start_id).or_insert(0);
-    let mut marks: Vec<(u64, u16)> = deadline.iter().map(|(&id, &d)| (id, d)).collect();
-    marks.sort_unstable();
-    let mut ids: Vec<u64> = marks.iter().map(|&(id, _)| id).chain(wins.iter().copied()).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    let index: FxHashMap<u64, u32> = ids.iter().enumerate().map(|(i, &id)| (id, i as u32)).collect();
+    // The BFS never marks layer 0: the start, deadline 0. The wins are
+    // seeds, marked; so the marks are the nodes.
+    bfs.insert_absent(start_id, 0);
+    let (ranks, marks) = bfs.into_ranked();
+    let n = marks.len();
+    anyhow::ensure!(n < u32::MAX as usize, "{n} nodes do not fit a u32 index");
+    crate::metrics::mem_phase("arc: bfs, node numbers");
     // The frames' transfer tables into one: per frame, its ids' global ones.
     let mut xfers: Vec<(Transfer, Transfer)> = Vec::new();
     let mut global: FxHashMap<super::arc_edges::Pair, u32> = FxHashMap::default();
@@ -249,55 +286,121 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
                 .collect()
         })
         .collect();
-    // Every node's in-edges from nodes, frames layer..=horizon, in parallel.
-    let t1 = std::time::Instant::now();
-    let threads = crate::frame::threads().max(1);
-    let chunk = ids.len().div_ceil(threads * 8).max(1);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let parts: Vec<anyhow::Result<Vec<(u32, Out)>>> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..threads)
-            .map(|_| {
-                sc.spawn(|| -> anyhow::Result<Vec<(u32, Out)>> {
-                    let (mut out, mut buf) = (Vec::new(), Vec::new());
-                    loop {
-                        let lo = next.fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
-                        if lo >= ids.len() {
-                            return Ok(out);
-                        }
-                        for (k, &target) in ids[lo..(lo + chunk).min(ids.len())].iter().enumerate() {
-                            let dst = (lo + k) as u32;
-                            for frame in id_layer(target).max(1)..=horizon {
-                                buf.clear();
-                                eg.preds_at(target, frame, &mut buf);
-                                for e in &buf {
-                                    let xfer = *remap[frame as usize].get(e.xfer as usize).ok_or_else(|| {
-                                        anyhow::anyhow!("{}: an edge at f{frame} into {target:#x} has transfer {} past its frame's table", dir.display(), e.xfer)
-                                    })?;
-                                    let mut m = e.mask;
-                                    while m != 0 {
-                                        let lane = m.trailing_zeros() as u64;
-                                        m &= m - 1;
-                                        let Some(&src) = index.get(&(e.base + lane)) else { continue };
-                                        out.push((src, Out { dst, xfer }));
-                                    }
-                                }
-                            }
-                        }
+    drop(global);
+    // Node `dst`'s in-edges from nodes, frames layer..=horizon: `f(src, xfer)`
+    // in the runs' order.
+    let in_edges = |dst: u32, buf: &mut Vec<super::edges::Edge>, f: &mut dyn FnMut(u32, u32)| -> anyhow::Result<()> {
+        let target = marks[dst as usize].0;
+        for frame in id_layer(target).max(1)..=horizon {
+            buf.clear();
+            eg.preds_at(target, frame, buf);
+            for e in buf.iter() {
+                let xfer = *remap[frame as usize].get(e.xfer as usize).ok_or_else(|| {
+                    anyhow::anyhow!("{}: an edge at f{frame} into {target:#x} has transfer {} past its frame's table", dir.display(), e.xfer)
+                })?;
+                let mut m = e.mask;
+                while m != 0 {
+                    let lane = m.trailing_zeros() as u64;
+                    m &= m - 1;
+                    if let Some(src) = ranks.rank(e.base + lane) {
+                        f(src, xfer);
                     }
-                })
+                }
+            }
+        }
+        Ok(())
+    };
+    // Pass 1: the degrees.
+    let t1 = std::time::Instant::now();
+    let out_deg: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+    let in_deg: Vec<Vec<u64>> = par_chunks(n, |lo, hi| {
+        let mut buf = Vec::new();
+        (lo..hi)
+            .map(|dst| {
+                let mut k = 0u64;
+                in_edges(dst as u32, &mut buf, &mut |src, _| {
+                    out_deg[src as usize].fetch_add(1, Relaxed);
+                    k += 1;
+                })?;
+                Ok(k)
             })
-            .collect();
-        hs.into_iter().map(|h| h.join().expect("an edge loader panicked")).collect()
-    });
-    let parts: Vec<Vec<(u32, Out)>> = parts.into_iter().collect::<anyhow::Result<_>>()?;
-    let edges: usize = parts.iter().map(|p| p.len()).sum();
-    drop(index);
+            .collect()
+    })?;
+    let prefix = |deg: &mut dyn Iterator<Item = u64>| -> Vec<u64> {
+        let mut at = Vec::with_capacity(n + 1);
+        let mut acc = 0u64;
+        at.push(0);
+        for d in deg {
+            acc += d;
+            at.push(acc);
+        }
+        at
+    };
+    let pred_at = prefix(&mut in_deg.into_iter().flatten());
+    let out_at = prefix(&mut out_deg.into_iter().map(|d| d.into_inner()));
+    let edges = pred_at[n] as usize;
+    anyhow::ensure!(out_at[n] as usize == edges, "the edge count pass disagrees with itself");
+    // Pass 2: the adjacencies, filled in place. `preds` by target, each
+    // target's chunk owned by one worker; `out` by source through a cursor per
+    // source, then each source's edges sorted (deterministic whatever the
+    // scheduling).
+    let mut preds: Vec<u32> = vec![0; edges];
+    let mut out: Vec<Out> = vec![Out { dst: 0, xfer: 0 }; edges];
+    {
+        let cursor: Vec<AtomicU64> = out_at[..n].iter().map(|&a| AtomicU64::new(a)).collect();
+        let (preds_ptr, out_ptr) = (preds.as_mut_ptr() as usize, out.as_mut_ptr() as usize);
+        par_chunks(n, |lo, hi| {
+            let mut buf = Vec::new();
+            for dst in lo..hi {
+                let mut at = pred_at[dst];
+                in_edges(dst as u32, &mut buf, &mut |src, xfer| {
+                    let slot = cursor[src as usize].fetch_add(1, Relaxed);
+                    assert!(at < pred_at[dst + 1] && slot < out_at[src as usize + 1], "the edge fill pass disagrees with the count");
+                    // SAFETY: `at` is in `dst`'s range, which only this
+                    // worker writes; `slot` was claimed once from `src`'s
+                    // range by the atomic cursor. Both are below `edges`.
+                    unsafe {
+                        (preds_ptr as *mut u32).add(at as usize).write(src);
+                        (out_ptr as *mut Out).add(slot as usize).write(Out { dst: dst as u32, xfer });
+                    }
+                    at += 1;
+                })?;
+                anyhow::ensure!(at == pred_at[dst + 1], "the edge fill pass disagrees with the count");
+            }
+            Ok(())
+        })?;
+        anyhow::ensure!(cursor.iter().zip(&out_at[1..]).all(|(c, &e)| c.load(Relaxed) == e), "the edge fill pass disagrees with the count");
+    }
+    {
+        let (out_ref, out_at_ref) = (out.as_mut_ptr() as usize, &out_at);
+        par_chunks(n, |lo, hi| {
+            // SAFETY: the sources `lo..hi` own the disjoint range
+            // `out_at[lo]..out_at[hi]`.
+            let s = unsafe { std::slice::from_raw_parts_mut((out_ref as *mut Out).add(out_at_ref[lo] as usize), (out_at_ref[hi] - out_at_ref[lo]) as usize) };
+            let base = out_at_ref[lo];
+            for src in lo..hi {
+                s[(out_at_ref[src] - base) as usize..(out_at_ref[src + 1] - base) as usize].sort_unstable_by_key(|o| (o.dst, o.xfer));
+            }
+            Ok(())
+        })?;
+    }
+    drop(ranks);
+    drop(eg);
     let t_read = t1.elapsed();
+    crate::metrics::mem_phase("arc: edges read");
     let t2 = std::time::Instant::now();
     let n_xfers = xfers.len();
-    let graph = Graph::new(ids, parts, xfers, id_layer, wins.iter().copied(), Some(&deadline));
+    let mut win = vec![false; n];
+    for &w in &wins {
+        let i = marks.binary_search_by_key(&w, |m| m.0).map_err(|_| anyhow::anyhow!("a win row {w:#x} the BFS did not mark"))?;
+        win[i] = true;
+    }
+    let until: Vec<u32> = marks.iter().map(|&(_, d)| d as u32 + 1).collect();
+    let ids: Vec<u64> = marks.iter().map(|&(id, _)| id).collect();
+    let graph = Graph::from_csr(ids, Csr { out_at, out, pred_at, preds }, xfers, id_layer, win, until);
+    crate::metrics::mem_phase("arc: graph built");
     eprintln!(
-        "[arc] h{horizon}: {} marked nodes, {} win rows, {edges} edges, {n_xfers} transfer pairs; bfs {:.1} s, edges {:.1} s, graph {:.1} s",
+        "[arc] h{horizon}: {} marked nodes, {} win rows, {edges} edges, {n_xfers} transfer pairs; bfs {:.1} s, edges {:.1} s (two passes), graph {:.1} s",
         marks.len(),
         wins.len(),
         t_bfs.as_secs_f64(),
@@ -308,38 +411,59 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     Ok(Loaded { graph, start, marks, wins, edges })
 }
 
-/// One frame's winning sets: the nodes (sorted) and their sets (shared
-/// with the neighbouring frames where unchanged).
+/// One frame's winning sets: the nodes (sorted) and their sets (indices
+/// into the backward's arena), with the last frame of each set's span so far
+/// (the backward runs down in `t`).
 #[derive(Default)]
 struct Frame {
     nodes: Vec<u32>,
-    sets: Vec<Arc<Region>>,
+    sets: Vec<u32>,
+    his: Vec<u16>,
 }
 
-/// The winning sets per frame, `t` in `0..=horizon`.
+/// Node `node`'s winning set (`Winning::sets[set]`) over the frames
+/// `lo..=hi`, where it does not change.
+struct Span {
+    node: u32,
+    lo: u16,
+    hi: u16,
+    set: u32,
+}
+
+/// The winning sets, `t` in `0..=horizon`, as SPANS: a node's set changes
+/// at a few frames, so one entry per (node, unchanged run of frames) - 12 B -
+/// into an arena of the distinct sets. A table per frame (12 B per node and
+/// frame it is present at, each set an `Arc`) held 4.4 GB for room (2,3)
+/// gemskip h137, 18.6M nodes.
 pub struct Winning {
-    frames: Vec<Frame>,
+    /// By (node, lo), disjoint per node.
+    spans: Vec<Span>,
+    sets: Vec<Region>,
 }
 
 impl Winning {
     /// `W_t(i)` (`None` = empty).
     pub fn at(&self, t: u32, i: u32) -> Option<&Region> {
-        let f = self.frames.get(t as usize)?;
-        f.nodes.binary_search(&i).ok().map(|k| &*f.sets[k])
+        let lo = self.spans.partition_point(|s| s.node < i);
+        let hi = lo + self.spans[lo..].partition_point(|s| s.node == i);
+        let k = lo + self.spans[lo..hi].partition_point(|s| (s.hi as u32) < t);
+        self.spans.get(k).filter(|s| s.node == i && s.lo as u32 <= t && t <= s.hi as u32).map(|s| &self.sets[s.set as usize])
     }
-    /// Every non-empty `W_t(i)` of frame `t`.
-    pub fn frame(&self, t: u32) -> impl Iterator<Item = (u32, &Region)> + '_ {
-        let f = &self.frames[t as usize];
-        f.nodes.iter().copied().zip(f.sets.iter().map(|r| &**r))
+    /// Every span `(node, lo, hi, set)`: `W_t(node) = set` for `t` in
+    /// `lo..=hi`, empty at the frames no span covers.
+    pub fn spans(&self) -> impl Iterator<Item = (u32, u32, u32, &Region)> + '_ {
+        self.spans.iter().map(|s| (s.node, s.lo as u32, s.hi as u32, &self.sets[s.set as usize]))
     }
 }
 
-/// A candidate's set at `t`, against its set at `t + 1`.
-enum Recomputed {
-    Empty,
-    Same,
-    New(Arc<Region>),
-}
+/// A candidate's set at `t`, against its set at `t + 1`, as a code: empty,
+/// the same, NEW (the next of the pull's new sets, with its hash), or the
+/// index of a set already in the arena (found by the pulling worker). Four
+/// bytes: a 64-byte enum carrying the new sets made the merge read ~1 GB a
+/// frame (room (2,3) level 1: merge 5 -> 50 s).
+const EMPTY: u32 = u32::MAX;
+const SAME: u32 = u32::MAX - 1;
+const NEW: u32 = u32::MAX - 2;
 
 /// `W_t(i)` from scratch: the union of `i`'s out-edges' preimages of the
 /// next frame's sets (`next(dst)`).
@@ -361,33 +485,45 @@ fn pull<'a>(g: &Graph, i: u32, next: impl Fn(u32) -> Option<&'a Region>, pieces:
 /// INCREMENTAL: `W_t(i) = W_{t+1}(i)` when `i` is live at both and none of
 /// its successors' sets changed, so a frame recomputes (a parallel PULL per
 /// node) only the predecessors of changed nodes and the nodes that become
-/// live at `t`; the rest share the next frame's set.
+/// live at `t`; the rest share the next frame's set. Prints the sets'
+/// fragmentation every 4th frame.
 pub fn backward(g: &Graph, horizon: u32) -> Winning {
     let n = g.len();
+    assert!(horizon < u16::MAX as u32, "a horizon past u16");
     let threads = crate::frame::threads();
-    let full = Arc::new(Region::full());
-    let mut frames: Vec<Frame> = Vec::with_capacity(horizon as usize + 1);
-    let mut top = Frame::default();
+    // The ARENA of sets, equal sets once (found by hash; a collision with a
+    // different set is stored apart). Index 0: the whole torus.
+    let mut sets: Vec<Region> = vec![Region::full()];
+    let mut interned: FxHashMap<u64, u32> = FxHashMap::default();
+    let hash_of = |r: &Region| {
+        use std::hash::{Hash, Hasher};
+        let mut hs = rustc_hash::FxHasher::default();
+        r.hash(&mut hs);
+        hs.finish()
+    };
+    interned.insert(hash_of(&sets[0]), 0);
+    let mut spans: Vec<Span> = Vec::new();
+    let mut next = Frame::default();
     for i in 0..n as u32 {
         if g.win[i as usize] && g.layer[i as usize] <= horizon {
-            top.nodes.push(i);
-            top.sets.push(full.clone());
+            next.nodes.push(i);
+            next.sets.push(0);
+            next.his.push(horizon as u16);
         }
     }
-    let mut changed: Vec<u32> = top.nodes.clone();
+    let mut changed: Vec<u32> = next.nodes.clone();
     // `pos[i]`: i's position in the next frame's lists (u32::MAX: no set).
     let mut pos = vec![u32::MAX; n];
-    for (k, &i) in top.nodes.iter().enumerate() {
+    for (k, &i) in next.nodes.iter().enumerate() {
         pos[i as usize] = k as u32;
     }
-    frames.push(top);
     // `stamp[i] == t`: i is already a candidate at t.
     let mut stamp = vec![u32::MAX; n];
     let (mut n_cand, mut n_same, mut n_scan) = (0u64, 0u64, 0u64);
     let (mut d_cand, mut d_pull, mut d_merge) = (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let mut fragments: Vec<String> = Vec::new();
     for t in (0..horizon).rev() {
         let t0 = std::time::Instant::now();
-        let next = frames.last().expect("the frame after");
         let mut cand: Vec<u32> = Vec::new();
         let mut take = |p: u32, cand: &mut Vec<u32>| {
             if stamp[p as usize] != t && !g.win[p as usize] && g.live(p, t) {
@@ -412,12 +548,13 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
         // Recompute the candidates, each against its set at t + 1.
         const CHUNK: usize = 256;
         let at = std::sync::atomic::AtomicUsize::new(0);
-        let pos_ref = &pos;
+        let (pos_ref, next_ref, sets_ref, interned_ref) = (&pos, &next, &sets, &interned);
         let lookup = |d: u32| {
             let k = pos_ref[d as usize];
-            (k != u32::MAX).then(|| &*next.sets[k as usize])
+            (k != u32::MAX).then(|| &sets_ref[next_ref.sets[k as usize] as usize])
         };
-        let mut parts: Vec<(usize, Vec<Recomputed>, u64)> = std::thread::scope(|sc| {
+        type Part = (usize, Vec<u32>, Vec<(Region, u64)>, u64);
+        let mut parts: Vec<Part> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..threads)
                 .map(|_| {
                     sc.spawn(|| {
@@ -428,21 +565,30 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
                                 return out;
                             }
                             let mut scanned = 0u64;
-                            let rs = cand[i..(i + CHUNK).min(cand.len())]
+                            let mut news = Vec::new();
+                            let codes = cand[i..(i + CHUNK).min(cand.len())]
                                 .iter()
                                 .map(|&c| {
                                     scanned += g.out_of(c).len() as u64;
                                     let r = pull(g, c, lookup, &mut pieces, &mut scratch);
                                     if r.is_empty() {
-                                        Recomputed::Empty
+                                        EMPTY
                                     } else if lookup(c) == Some(&r) {
-                                        Recomputed::Same
+                                        SAME
                                     } else {
-                                        Recomputed::New(Arc::new(r))
+                                        // Looked up (and a duplicate freed) here, in parallel.
+                                        let h = hash_of(&r);
+                                        match interned_ref.get(&h) {
+                                            Some(&s) if sets_ref[s as usize] == r => s,
+                                            _ => {
+                                                news.push((r, h));
+                                                NEW
+                                            }
+                                        }
                                     }
                                 })
                                 .collect();
-                            out.push((i, rs, scanned));
+                            out.push((i, codes, news, scanned));
                         }
                     })
                 })
@@ -450,51 +596,95 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
             hs.into_iter().flat_map(|h| h.join().expect("a backward worker panicked")).collect()
         });
         parts.sort_unstable_by_key(|p| p.0);
-        n_scan += parts.iter().map(|p| p.2).sum::<u64>();
-        let fresh: Vec<Recomputed> = parts.into_iter().flat_map(|p| p.1).collect();
+        let (mut codes, mut news): (Vec<u32>, Vec<(Region, u64)>) = (Vec::with_capacity(cand.len()), Vec::new());
+        for (_, c, nw, sc) in parts {
+            codes.extend(c);
+            news.extend(nw);
+            n_scan += sc;
+        }
         d_pull += t0.elapsed();
         let t0 = std::time::Instant::now();
-        // Merge: the next frame's persisting sets, overridden by the candidates.
-        let mut cur = Frame { nodes: Vec::with_capacity(next.nodes.len()), sets: Vec::with_capacity(next.nodes.len()) };
+        // Merge: the next frame's persisting sets, overridden by the
+        // candidates. A set that ends at t + 1 closes its span.
+        let mut cur = Frame { nodes: Vec::with_capacity(next.nodes.len()), sets: Vec::with_capacity(next.nodes.len()), his: Vec::with_capacity(next.nodes.len()) };
         let mut new_changed: Vec<u32> = Vec::new();
         let (mut a, mut b) = (0usize, 0usize);
-        let mut fresh = fresh.into_iter();
+        let (mut codes, mut news) = (codes.into_iter(), news.into_iter());
+        // New sets equal to one interned earlier in this frame: freed in
+        // parallel below, not one by one here (they were allocated by the
+        // pulling workers; freeing ~5M in the merge cost 3.5 s at one frame
+        // of room (2,3) level 1).
+        let mut garbage: Vec<Region> = Vec::new();
+        let close = |a: usize, spans: &mut Vec<Span>| spans.push(Span { node: next.nodes[a], lo: t as u16 + 1, hi: next.his[a], set: next.sets[a] });
         while a < next.nodes.len() || b < cand.len() {
             let ia = next.nodes.get(a).copied().unwrap_or(u32::MAX);
             let ib = cand.get(b).copied().unwrap_or(u32::MAX);
             if ib <= ia {
                 let had = ib == ia;
-                match fresh.next().expect("one result per candidate") {
-                    Recomputed::Empty => {
-                        if had {
-                            new_changed.push(ib);
-                        }
-                    }
-                    Recomputed::Same => {
+                let set = match codes.next().expect("one result per candidate") {
+                    EMPTY => None,
+                    SAME => {
                         n_same += 1;
                         cur.nodes.push(ib);
-                        cur.sets.push(next.sets[a].clone());
+                        cur.sets.push(next.sets[a]);
+                        cur.his.push(next.his[a]);
+                        b += 1;
+                        a += 1;
+                        continue;
                     }
-                    Recomputed::New(r) => {
-                        new_changed.push(ib);
-                        cur.nodes.push(ib);
-                        cur.sets.push(r);
+                    NEW => {
+                        let (r, h) = news.next().expect("a new set per NEW");
+                        Some(match interned.get(&h) {
+                            Some(&s) if sets[s as usize] == r => {
+                                garbage.push(r);
+                                s
+                            }
+                            found => {
+                                let s = sets.len() as u32;
+                                assert!(s < NEW, "more distinct sets than set codes");
+                                sets.push(r);
+                                if found.is_none() {
+                                    interned.insert(h, s);
+                                }
+                                s
+                            }
+                        })
                     }
-                }
+                    known => Some(known),
+                };
                 if had {
+                    new_changed.push(ib);
+                    close(a, &mut spans);
                     a += 1;
+                }
+                if let Some(s) = set {
+                    if !had {
+                        new_changed.push(ib);
+                    }
+                    cur.nodes.push(ib);
+                    cur.sets.push(s);
+                    cur.his.push(t as u16);
                 }
                 b += 1;
             } else {
                 if g.present(ia, t) {
                     cur.nodes.push(ia);
-                    cur.sets.push(next.sets[a].clone());
+                    cur.sets.push(next.sets[a]);
+                    cur.his.push(next.his[a]);
                 } else {
                     new_changed.push(ia);
+                    close(a, &mut spans);
                 }
                 a += 1;
             }
         }
+        let per = garbage.len().div_ceil(threads).max(1);
+        std::thread::scope(|sc| {
+            while !garbage.is_empty() {
+                let part = garbage.split_off(garbage.len().saturating_sub(per));
+                sc.spawn(move || drop(part));
+            }
+        });
         for &i in &next.nodes {
             pos[i as usize] = u32::MAX;
         }
@@ -502,17 +692,30 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
             pos[i as usize] = k as u32;
         }
         changed = new_changed;
-        frames.push(cur);
+        next = cur;
         d_merge += t0.elapsed();
+        if (horizon - 1 - t) % 4 == 0 {
+            let (k, med, p90, max) = fragmentation(next.nodes.iter().zip(&next.sets).filter(|&(&i, _)| !g.is_win(i)).map(|(_, &s)| &sets[s as usize]));
+            fragments.push(format!("[arc] W frame {t:3}: {k} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}"));
+        }
     }
+    for a in 0..next.nodes.len() {
+        spans.push(Span { node: next.nodes[a], lo: 0, hi: next.his[a], set: next.sets[a] });
+    }
+    drop(next);
+    spans.sort_unstable_by_key(|s| (s.node, s.lo));
     eprintln!(
-        "[arc] backward: {n_cand} recomputations ({n_same} unchanged), {n_scan} out-edges scanned; candidates {:.2} s, pull {:.2} s, merge {:.2} s",
+        "[arc] backward: {n_cand} recomputations ({n_same} unchanged), {n_scan} out-edges scanned; candidates {:.2} s, pull {:.2} s, merge {:.2} s; {} spans, {} distinct sets",
         d_cand.as_secs_f64(),
         d_pull.as_secs_f64(),
-        d_merge.as_secs_f64()
+        d_merge.as_secs_f64(),
+        spans.len(),
+        sets.len()
     );
-    frames.reverse();
-    Winning { frames }
+    for f in fragments {
+        eprintln!("{f}");
+    }
+    Winning { spans, sets }
 }
 
 /// The OPTIMUM and a witness: the win frame (from frame 0) and the path to
@@ -606,6 +809,30 @@ impl Witness {
     }
 }
 
+/// The graph's nodes by `(shape, key, cell)`, for the concrete search:
+/// sorted, 32 B a node (a hash map took ~80).
+pub struct NodeKeys(Vec<(u64, (u64, u64), u32, u32)>);
+
+impl NodeKeys {
+    /// From `(shape, key, cell, node)` in any order; a key twice keeps its
+    /// lowest node.
+    fn new(mut v: Vec<(u64, (u64, u64), u32, u32)>) -> Self {
+        v.sort_unstable();
+        v.dedup_by_key(|e| (e.0, e.1, e.2));
+        NodeKeys(v)
+    }
+    fn get(&self, shape: u64, key: (u64, u64), cell: u32) -> Option<u32> {
+        let k = (shape, key, cell);
+        self.0.binary_search_by(|e| (e.0, e.1, e.2).cmp(&k)).ok().map(|j| self.0[j].3)
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// THE CONCRETE SEARCH: the concrete optimum and its inputs. A BREADTH-FIRST
 /// The 64 inputs in the order the concrete search tries them at the frame
 /// after `k`: `prefer[k]` first (`rewrite search --prefer`: a known TAS, so
@@ -628,16 +855,15 @@ fn input_order(prefer: Option<&[u8]>, k: u32) -> impl Iterator<Item = u8> {
 /// `bound` (the graph's optimum) is a lower bound on it. Layers run in
 /// parallel, one reference engine per worker.
 pub fn concrete_search(
-    dir: &std::path::Path,
     level: crate::abstraction::Level,
     horizon: u32,
-    g: &Graph,
+    node: &NodeKeys,
     w: &Winning,
     bound: u32,
     breadth_first: bool,
     prefer: Option<&[u8]>,
 ) -> anyhow::Result<Option<Witness>> {
-    use crate::frame::{frame_files, pack_id, widened_keys, wins_of, Block};
+    use crate::frame::{widened_keys, wins_of, Block};
     use anyhow::Result;
     use crate::trace::refengine::RefEngine;
     use celeste_engine::runtime2::{Rt2, AV};
@@ -648,23 +874,8 @@ pub fn concrete_search(
     let initial = engines[0].lock().expect("an engine").initial()?;
     crate::abstraction::set_level(level);
     let t0 = std::time::Instant::now();
-    // (shape, key, cell) -> the node's index, for the graph's nodes.
-    let mut node: FxHashMap<(u64, (u64, u64), u32), u32> = FxHashMap::default();
-    for f in 0..=horizon {
-        for (seq, file) in frame_files(dir, f)? {
-            if let Some(rt2) = file.load_all()? {
-                let b = Block::from_rt2(rt2);
-                let shape = b.rt2().shape_hash;
-                let cells = b.positions()?;
-                for (r, (k, &c)) in b.keys().iter().zip(&cells).enumerate() {
-                    if let Some(i) = g.index(pack_id(f, seq, r as u32)) {
-                        node.entry((shape, *k, c)).or_insert(i);
-                    }
-                }
-            }
-        }
-    }
-    eprintln!("[concrete] {} nodes keyed in {:.1} s; {workers} workers; the arc bound f{bound}; rss {:.1} GB", node.len(), t0.elapsed().as_secs_f64(), crate::metrics::current_rss_gb());
+    eprintln!("[concrete] {} nodes keyed; {workers} workers; the arc bound f{bound}", node.len());
+    crate::metrics::mem_phase("concrete: engines up");
     fn rem_of(rt2: &Rt2) -> Result<(u32, u32)> {
         let ids = crate::compiled::ids();
         let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((super::arcs::point(0), super::arcs::point(0))) };
@@ -695,7 +906,7 @@ pub fn concrete_search(
     {
         struct Dfs<'a> {
             eng: &'a mut RefEngine,
-            node: &'a FxHashMap<(u64, (u64, u64), u32), u32>,
+            node: &'a NodeKeys,
             w: &'a Winning,
             level: crate::abstraction::Level,
             from: u32,
@@ -728,7 +939,7 @@ pub fn concrete_search(
                         continue;
                     }
                     let (shape, keys, cells) = widened_keys(&b, cx.level)?;
-                    let Some(&i) = cx.node.get(&(shape, keys[0], cells[0])) else { continue };
+                    let Some(i) = cx.node.get(shape, keys[0], cells[0]) else { continue };
                     let q = rem_of(b.rt2())?;
                     if !cx.w.at(cx.from + k + 1, i).is_some_and(|r| r.contains(q.0, q.1)) {
                         continue;
@@ -749,7 +960,7 @@ pub fn concrete_search(
         const DFS_BUDGET: u64 = 200_000;
         let t = std::time::Instant::now();
         let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { eng: &mut eng, node: &node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer };
+        let mut cx = Dfs { eng: &mut eng, node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer };
         let found = dfs(&mut cx, start.rt2(), 0)?;
         eprintln!(
             "[concrete] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
@@ -783,7 +994,7 @@ pub fn concrete_search(
             let hs: Vec<_> = engines
                 .iter()
                 .map(|engine| {
-                    let (cur, node, next_chunk) = (&cur, &node, &next_chunk);
+                    let (cur, next_chunk) = (&cur, &next_chunk);
                     sc.spawn(move || -> Result<(Vec<(usize, Vec<Succ>)>, u64)> {
                         let mut eng = engine.lock().expect("an engine");
                         let (mut out, mut steps) = (Vec::new(), 0u64);
@@ -812,7 +1023,7 @@ pub fn concrete_search(
                                         }
                                         if !win {
                                             let (shape, keys, cells) = widened_keys(&b, level)?;
-                                            let Some(&i) = node.get(&(shape, keys[0], cells[0])) else { continue };
+                                            let Some(i) = node.get(shape, keys[0], cells[0]) else { continue };
                                             let q = rem_of(b.rt2())?;
                                             if !w.at(t_w, i).is_some_and(|r| r.contains(q.0, q.1)) {
                                                 continue;
@@ -927,84 +1138,103 @@ pub fn solve(
     save: Option<&std::path::Path>,
     prefer: Option<&[u8]>,
 ) -> anyhow::Result<Solved> {
-    use crate::frame::{frame_files, id_layer, Visited};
+    use crate::frame::{frame_files, id_layer, mark_row, save_marks, MarkRow, Visited};
     use celeste_engine::runtime2::mix64;
-    let ld = load(dir, horizon)?;
-    let g = &ld.graph;
+    crate::metrics::mem_phase("arc: start");
+    let Loaded { graph, start, marks, wins, .. } = load(dir, horizon)?;
+    let g = &graph;
     let tb = std::time::Instant::now();
     let w = backward(g, horizon);
+    crate::metrics::mem_phase("arc: backward");
     let tb = tb.elapsed().as_secs_f64();
-    for t in (0..horizon).rev().step_by(4) {
-        let (n, med, p90, max) = fragmentation(w.frame(t).filter(|&(i, _)| !g.is_win(i)).map(|(_, r)| r));
-        eprintln!("[arc] W frame {t:3}: {n} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}");
-    }
     // The start has no player yet: any point stands for its remainder.
     let p0 = (super::arcs::point(0), super::arcs::point(0));
-    let found = optimum(g, &w, ld.start, p0, horizon);
+    let found = optimum(g, &w, start, p0, horizon);
     let arc = found.as_ref().map(|f| f.frame);
     eprintln!("[arc] backward {tb:.2} s; optimum {arc:?}");
-    // The nodes as (shape, key, cell), for the fingerprints and the marks.
+    // The nodes as (shape, key, cell), in ONE pass over the frame files (the
+    // marks are the nodes, in order): the fingerprints, the marks file and
+    // the concrete search's keys.
     let mut files = Vec::new();
     for f in 0..=horizon {
         files.extend(frame_files(dir, f)?.into_iter().map(|(seq, file)| (f, seq, file)));
     }
+    let keyed = concrete != Concrete::None && arc.is_some();
     let mut node_key: Vec<u64> = Vec::with_capacity(g.len());
-    let all: Vec<(u64, u16)> = (0..g.len() as u32).map(|i| (g.id(i), 0)).collect();
-    super::edges::resolve_ids(&files, &all, |shape, key, cell, _| node_key.push(mix64(shape ^ mix64(key.0 ^ mix64(key.1 ^ (cell as u64) << 1)))))?;
-    let mut marked = Visited::new();
-    super::edges::resolve_ids(&files, &ld.marks, |shape, key, cell, d| {
-        marked.insert_until(shape, key, cell, d);
+    let mut keys: Vec<(u64, (u64, u64), u32, u32)> = Vec::with_capacity(if keyed { g.len() } else { 0 });
+    let mut rows: Vec<MarkRow> = Vec::new();
+    let mut fp = 0u64;
+    super::edges::resolve_ids(&files, &marks, |shape, key, cell, d| {
+        node_key.push(mix64(shape ^ mix64(key.0 ^ mix64(key.1 ^ (cell as u64) << 1))));
+        // `Visited::fingerprint`: the marks are distinct states (the door).
+        fp = fp.wrapping_add(mix64(key.0 ^ mix64(key.1 ^ (cell as u64) << 1)));
+        if keyed {
+            keys.push((shape, key, cell, keys.len() as u32));
+        }
+        if save.is_some() {
+            rows.push(mark_row(shape, key, cell, d, horizon));
+        }
     })?;
-    let (n, fp) = marked.fingerprint();
-    println!("[gate] h{horizon} marks {n} {fp:016x}");
-    for t in 0..=horizon {
-        let (mut n, mut acc) = (0usize, 0u64);
-        for (i, r) in w.frame(t) {
-            let mut h = node_key[i as usize];
-            for (y, xs) in r.slabs() {
-                h = mix64(h ^ ((y.lo as u64) << 32 | y.hi as u64));
-                for x in xs {
-                    h = mix64(h ^ ((x.lo as u64) << 32 | x.hi as u64));
-                }
-            }
-            acc = acc.wrapping_add(h);
-            n += 1;
-        }
-        println!("[gate] h{horizon} W f{t:03} {n} {acc:016x}");
-    }
-    println!("[gate] h{horizon} arc optimum {}", arc.map_or("none".to_string(), |f| f.to_string()));
-    // Per node the LAST frame its winning set is non-empty (its deadline).
-    let arc_marks = if want_marks || save.is_some() {
-        let mut last = vec![u32::MAX; g.len()];
-        for t in 0..=horizon {
-            for (i, _) in w.frame(t) {
-                last[i as usize] = t;
-            }
-        }
-        let ids: Vec<(u64, u16)> = (0..g.len() as u32).filter(|&i| last[i as usize] != u32::MAX).map(|i| (g.id(i), last[i as usize] as u16)).collect();
-        let mut am = Visited::new();
-        super::edges::resolve_ids(&files, &ids, |shape, key, cell, d| {
-            am.insert_until(shape, key, cell, d);
-        })?;
-        Some(am)
-    } else {
-        None
-    };
+    println!("[gate] h{horizon} marks {} {fp:016x}", marks.len());
+    drop(marks);
     if let Some(out) = save {
         std::fs::create_dir_all(out)?;
-        marked.save(&out.join("level0.marks.bin"), horizon)?;
-        arc_marks.as_ref().expect("computed with save").save(&out.join("arc.marks.bin"), horizon)?;
-        let first_win = ld.wins.iter().map(|&id| id_layer(id)).min();
+        save_marks(&out.join("level0.marks.bin"), std::mem::take(&mut rows), horizon)?;
+    }
+    // Per frame, the nodes with a set and the sum of their (node, set) hashes.
+    let mut per_frame = vec![(0usize, 0u64); horizon as usize + 1];
+    for (i, lo, hi, r) in w.spans() {
+        let mut h = node_key[i as usize];
+        for (y, xs) in r.slabs() {
+            h = mix64(h ^ ((y.lo as u64) << 32 | y.hi as u64));
+            for x in xs {
+                h = mix64(h ^ ((x.lo as u64) << 32 | x.hi as u64));
+            }
+        }
+        for f in &mut per_frame[lo as usize..=hi as usize] {
+            f.0 += 1;
+            f.1 = f.1.wrapping_add(h);
+        }
+    }
+    for (t, (n, acc)) in per_frame.into_iter().enumerate() {
+        println!("[gate] h{horizon} W f{t:03} {n} {acc:016x}");
+    }
+    drop(node_key);
+    println!("[gate] h{horizon} arc optimum {}", arc.map_or("none".to_string(), |f| f.to_string()));
+    crate::metrics::mem_phase("arc: fingerprints");
+    // Per node the LAST frame its winning set is non-empty (its deadline):
+    // the next level's filter, and the UI's arc marks.
+    let mut arc_marks = want_marks.then(Visited::new);
+    if want_marks || save.is_some() {
+        let mut last = vec![u32::MAX; g.len()];
+        for (i, _, hi, _) in w.spans() {
+            let l = &mut last[i as usize];
+            *l = if *l == u32::MAX { hi } else { (*l).max(hi) };
+        }
+        let ids: Vec<(u64, u16)> = (0..g.len() as u32).filter(|&i| last[i as usize] != u32::MAX).map(|i| (g.id(i), last[i as usize] as u16)).collect();
+        drop(last);
+        super::edges::resolve_ids(&files, &ids, |shape, key, cell, d| {
+            if let Some(am) = &mut arc_marks {
+                am.insert_until(shape, key, cell, d);
+            }
+            if save.is_some() {
+                rows.push(mark_row(shape, key, cell, d, horizon));
+            }
+        })?;
+    }
+    if let Some(out) = save {
+        save_marks(&out.join("arc.marks.bin"), rows, horizon)?;
+        let first_win = wins.iter().map(|&id| id_layer(id)).min();
         let show = |v: Option<u32>| v.map_or("none".to_string(), |f| f.to_string());
         std::fs::write(out.join("arc.txt"), format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(arc)))?;
     }
     drop(files);
-    // The concrete search reads W and the node index, not the edges (GBs).
-    let mut graph = ld.graph;
-    graph.forget_edges();
+    // The concrete search reads W and the node keys, not the graph (GBs).
+    drop(graph);
+    crate::metrics::mem_phase("arc: marks for the next level, graph dropped");
     let found = match (concrete, arc) {
         (Concrete::None, _) | (_, None) => None,
-        (c, Some(f)) => concrete_search(dir, level, horizon, &graph, &w, f, c == Concrete::Full, prefer)?,
+        (c, Some(f)) => concrete_search(level, horizon, &NodeKeys::new(keys), &w, f, c == Concrete::Full, prefer)?,
     };
     if let Some(wt) = &found {
         println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), wt.inputs_text());
@@ -1012,7 +1242,7 @@ pub fn solve(
             wt.save(&out.join("witness.txt"))?;
         }
     }
-    Ok(Solved { arc, concrete: found, arc_marks: if want_marks { arc_marks } else { None } })
+    Ok(Solved { arc, concrete: found, arc_marks })
 }
 
 #[cfg(test)]

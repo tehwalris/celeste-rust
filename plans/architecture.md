@@ -356,10 +356,23 @@ the list (coarsest first; one level is the usual case):
 3. **The arc phase** (`arc_dp::solve`): the remainder-free BFS marks the
    nodes that can win by H at all, with their deadlines; only the edges into
    them, from them, are loaded (`preds_at`, the BFS's lookup), each with an
-   index into the merged transfer table (8 B an edge); `arc_dp::backward`
-   computes the winning sets `W_t`; `arc_dp::optimum` reads the optimum off
-   them. That optimum is exact in the remainder and over-approximates the
-   level's other widenings (and `rnd`): a LOWER BOUND, and no win REFUTES H.
+   index into the merged transfer table; `arc_dp::backward` computes the
+   winning sets `W_t`; `arc_dp::optimum` reads the optimum off them. That
+   optimum is exact in the remainder and over-approximates the level's other
+   widenings (and `rnd`): a LOWER BOUND, and no win REFUTES H.
+   MEMORY (2026-10-07, `[mem]` lines at every phase boundary): a node is the
+   rank of its mark in the BFS's own bitmaps (`edges::MarkRanks`, no hash
+   map); the edges are read twice, counting then filling the two adjacencies
+   in place (12 B an edge, nothing held beside them); W is kept as SPANS
+   (node, frames, set: 12 B per unchanged run) into an arena of the distinct
+   sets instead of a table per frame of `Arc`s; one pass over the frame
+   files yields the gate's fingerprints, the marks files and the concrete
+   search's sorted node keys (no hash maps). Room (2,3) gemskip h137, level
+   0 (18.6M nodes, 373M edges, 18.5M spans over 2.9M distinct sets): arc
+   phase peak 14.2 -> 8.1 GB anonymous, 20.2 -> 9.3 GB with the mapped runs;
+   W 4.4 -> 0.9 GB; the graph's build 12.1 -> 5.4 GB. Level 1 (22.9M nodes,
+   58.5M spans over 0.65M sets): peak 17.6 -> 7.2 GB, 2.6 GB left for the
+   concrete search (17.0 before).
 4. **The concrete search** (`arc_dp::concrete_search`) over concrete states
    (the reference engine's concrete step, every input, every `rnd` leaf) from
    the room's start, admitting a successor only if its projection onto the

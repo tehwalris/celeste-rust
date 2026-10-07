@@ -47,6 +47,32 @@ pub fn peak_rss_gb() -> f64 {
     status_gb("VmHWM:")
 }
 
+/// The highest `RssAnon` (in KB) sampled since the last `mem_phase`.
+static PHASE_PEAK_KB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One line of memory at a phase boundary: the anonymous resident set now,
+/// its highest value since the previous call (a sampler thread reads it every
+/// 50 ms, started by the first call), the file-backed pages now, and
+/// `VmHWM`. `[mem] TAG: anon A GB (phase peak P) file F GB, peak H GB`.
+pub fn mem_phase(tag: &str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SAMPLER: std::sync::Once = std::sync::Once::new();
+    SAMPLER.call_once(|| {
+        std::thread::spawn(|| loop {
+            PHASE_PEAK_KB.fetch_max((current_rss_gb() * 1e6) as u64, Relaxed);
+            std::thread::sleep(Duration::from_millis(50));
+        });
+    });
+    let now = current_rss_gb();
+    let peak = PHASE_PEAK_KB.swap((now * 1e6) as u64, Relaxed) as f64 / 1e6;
+    eprintln!(
+        "[mem] {tag}: anon {now:.2} GB (phase peak {:.2}) file {:.2} GB, peak {:.2} GB",
+        peak.max(now),
+        current_file_rss_gb(),
+        peak_rss_gb()
+    );
+}
+
 /// Print the phase summary and, when `dir` is known, append one JSON line
 /// to `<dir>/metrics.jsonl`: {"kind", "phases": {name: {"s", "calls"}},
 /// "extra": ...}. A write failure is reported, never fatal.

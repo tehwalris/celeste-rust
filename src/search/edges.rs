@@ -1015,11 +1015,52 @@ impl Marks {
             .is_some_and(|w| w & (1 << (row % 64)) != 0)
     }
 
-    /// Every marked id with its deadline, by (layer, seq, row).
-    pub fn with_deadlines(&self) -> Vec<(u64, u16)> {
-        let mut v = self.deadlines.clone();
-        v.sort_unstable();
-        v
+    /// Mark `id` with `deadline` unless it is marked (the start, which the
+    /// BFS never marks).
+    pub fn insert_absent(&mut self, id: u64, deadline: u16) {
+        self.insert(id, deadline as u32);
+    }
+
+    /// The marks as DENSE numbers - an id's rank among the marked ids in id
+    /// order (`MarkRanks`) - and every marked id with its deadline, in that
+    /// order. Consumes the marks: nothing is copied.
+    pub fn into_ranked(self) -> (MarkRanks, Vec<(u64, u16)>) {
+        let mut deadlines = self.deadlines;
+        deadlines.sort_unstable();
+        let mut bits = self.bits;
+        let mut keys: Vec<(u32, u32)> = bits.keys().copied().collect();
+        keys.sort_unstable();
+        let mut pieces = rustc_hash::FxHashMap::default();
+        let mut base = 0u64;
+        for k in keys {
+            let words = bits.remove(&k).expect("a key of the map");
+            let mut before = Vec::with_capacity(words.len());
+            for w in &words {
+                before.push(u32::try_from(base).expect("more than u32::MAX marks"));
+                base += w.count_ones() as u64;
+            }
+            pieces.insert(k, (words, before));
+        }
+        debug_assert_eq!(base as usize, deadlines.len());
+        (MarkRanks { pieces }, deadlines)
+    }
+}
+
+/// The marked ids' dense numbers (`Marks::into_ranked`): per `(layer, seq)`
+/// piece its bitmap and, per word, the marks before it. ~1.5 bits a visited
+/// row, against ~40 B a mark for a hash map.
+pub struct MarkRanks {
+    pieces: rustc_hash::FxHashMap<(u32, u32), (Vec<u64>, Vec<u32>)>,
+}
+
+impl MarkRanks {
+    /// `id`'s rank among the marked ids (`None`: not marked).
+    pub fn rank(&self, id: u64) -> Option<u32> {
+        let (layer, seq, row) = (id_layer(id), crate::frame::id_seq(id), crate::frame::id_row(id));
+        let (words, before) = self.pieces.get(&(layer, seq))?;
+        let (w, b) = ((row / 64) as usize, row % 64);
+        let word = *words.get(w)?;
+        (word >> b & 1 == 1).then(|| before[w] + (word & ((1u64 << b) - 1)).count_ones())
     }
 }
 
@@ -1200,7 +1241,12 @@ mod tests {
         let (marks, _) = bfs(&g4, 4, [w]);
         let mut want = vec![(a, 1u16), (b, 2), (c, 3), (w, 4), (g, 3)];
         want.sort_unstable();
-        assert_eq!(marks.with_deadlines(), want, "e and f reach a win only after frame 4");
+        let (ranks, got) = marks.into_ranked();
+        assert_eq!(got, want, "e and f reach a win only after frame 4");
+        for (k, &(id, _)) in got.iter().enumerate() {
+            assert_eq!(ranks.rank(id), Some(k as u32), "a mark's rank is its place in id order");
+        }
+        assert_eq!(ranks.rank(e), None, "e is not marked");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

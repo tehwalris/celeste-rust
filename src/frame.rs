@@ -1926,7 +1926,20 @@ pub fn load_row(dir: &std::path::Path, id: u64) -> Result<(Rt2, u64, u32)> {
 }
 
 /// One row of a marks file: `(shape, cell, key.0, key.1, dist)`.
-type MarkRow = (u64, u32, u64, u64, u32);
+pub type MarkRow = (u64, u32, u64, u64, u32);
+
+/// The marks-file row of a state with `deadline` (`u16::MAX`: none, saved
+/// as 0).
+pub fn mark_row(shape: u64, key: (u64, u64), cell: u32, deadline: u16, horizon: u32) -> MarkRow {
+    (shape, cell, key.0, key.1, horizon - (deadline as u32).min(horizon))
+}
+
+/// A marks file (`Visited::save`) from its rows, in any order, each state
+/// once.
+pub fn save_marks(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32) -> Result<()> {
+    rows.sort_unstable();
+    crate::search::checkpoint::save_value_to(path, &(rows, horizon))
+}
 
 /// An in-memory set of states `(shape, cell, key)` (a level's MARKED states
 /// or a diagnostic's), saved as a marks file.
@@ -1987,10 +2000,9 @@ impl Visited {
     pub fn save(&self, path: &std::path::Path, horizon: u32) -> Result<()> {
         let mut rows: Vec<MarkRow> = Vec::with_capacity(self.len());
         for ((shape, cell), keys) in &self.shards {
-            rows.extend(keys.iter().map(|(&(k0, k1), &d)| (*shape, *cell, k0, k1, horizon - (d as u32).min(horizon))));
+            rows.extend(keys.iter().map(|(&key, &d)| mark_row(*shape, key, *cell, d, horizon)));
         }
-        rows.sort_unstable();
-        crate::search::checkpoint::save_value_to(path, &(rows, horizon))
+        save_marks(path, rows, horizon)
     }
 
     /// A marks file (`save`).
