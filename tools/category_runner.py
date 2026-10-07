@@ -5,7 +5,8 @@ and verify every result end to end.
     tools/category_runner.py JOBS.json OUTDIR
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
-"offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"}; re-read
+"offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
+"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"); re-read
 before every job, so jobs can be appended while it runs; a job whose key is
 already in OUTDIR/results.jsonl is skipped.
 
@@ -146,7 +147,7 @@ def run(job, outdir, binary):
     open(prefer, "w").write(",".join(map(str, [0] * prologue + dbin)))
     # 2. the search
     def search(l1):
-        env = dict(os.environ, **mode_env(cat))
+        env = dict(os.environ, **mode_env(cat), **job.get("env", {}))
         # The concrete steps under the community file's balloon seeds ([]: 0):
         # the witness is then one real run under them.
         env["CELESTE_CONCRETE_BALLOON_SEEDS"] = seeds
