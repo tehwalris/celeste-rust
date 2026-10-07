@@ -917,6 +917,43 @@ impl Engines {
     fn start(&self) -> anyhow::Result<crate::frame::Block> {
         crate::frame::Block::keyed(self.initial.clone_block())
     }
+
+    /// Per sequence, the first frame it wins at (the reference engine from
+    /// the start; `None`: no win within it), in parallel. An `rnd` fork on
+    /// the way is an error: the answer would depend on the draw.
+    pub fn first_wins(&self, seqs: &[Vec<u8>]) -> anyhow::Result<Vec<Option<usize>>> {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let out: Vec<std::sync::Mutex<Option<usize>>> = seqs.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        std::thread::scope(|sc| -> anyhow::Result<()> {
+            let hs: Vec<_> = self
+                .engines
+                .iter()
+                .map(|engine| {
+                    let (next, out) = (&next, &out);
+                    sc.spawn(move || -> anyhow::Result<()> {
+                        let mut eng = engine.lock().expect("an engine");
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(x) = seqs.get(i) else { return Ok(()) };
+                            let mut b = self.start()?;
+                            for (k, &byte) in x.iter().enumerate() {
+                                b = eng.step_one(b.rt2(), byte).map_err(|e| e.context(format!("frame {} of sequence {i}", k + 1)))?;
+                                if crate::frame::wins_of(b.rt2())?.iter().any(|&w| w) {
+                                    *out[i].lock().expect("a slot") = Some(k + 1);
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for h in hs {
+                h.join().expect("a reference worker panicked")?;
+            }
+            Ok(())
+        })?;
+        Ok(out.into_iter().map(|m| m.into_inner().expect("a slot")).collect())
+    }
 }
 
 /// A margin's cap, raw (1/65536 px): half a pixel.
@@ -1337,7 +1374,7 @@ fn bottleneck(profile: &[(u16, u16)]) -> (u16, usize, &'static str) {
 /// robust paths, the one nearest the known TAS). Both profiles are then
 /// replayed: the robust one's bottleneck must be the DP's.
 #[allow(clippy::too_many_arguments)]
-pub fn robust_search(engines: &Engines, level: crate::abstraction::Level, horizon: u32, node: &NodeKeys, w: &Winning, prefer: Option<&[u8]>, first: &Witness) -> anyhow::Result<Witness> {
+pub fn robust_search(engines: &Engines, level: crate::abstraction::Level, horizon: u32, node: &NodeKeys, w: &Winning, prefer: Option<&[u8]>, first: &Witness, dag: Option<&std::path::Path>) -> anyhow::Result<Witness> {
     use anyhow::Context;
     use celeste_engine::runtime2::Rt2;
     const WIN: u32 = u32::MAX;
@@ -1354,6 +1391,8 @@ pub fn robust_search(engines: &Engines, level: crate::abstraction::Level, horizo
         margins: Vec<(u16, u16)>,
         links: Vec<(u32, u32, u8)>,
         win_cells: FxHashMap<u32, u32>,
+        /// Every input of each link: (parent, child, the set of bytes).
+        bytes: Vec<(u32, u32, u64)>,
     }
     let start = engines.start()?;
     let mut layers = vec![Layer { cells: vec![start.positions()?[0]], margins: vec![start_margin(&start)?], ..Default::default() }];
@@ -1366,6 +1405,7 @@ pub fn robust_search(engines: &Engines, level: crate::abstraction::Level, horizo
         let mut index: FxHashMap<((u64, u64), u32), u32> = FxHashMap::default();
         let (mut rows, mut next, mut links, mut win_cells) = (Vec::new(), Layer::default(), Vec::new(), FxHashMap::default());
         let (mut parent, mut kids) = (u32::MAX, FxHashSet::default());
+        let mut bytes: FxHashMap<(u32, u32), u64> = FxHashMap::default();
         for s in succs {
             anyhow::ensure!(!s.win || k + 1 == opt, "a concrete win at f{} before the optimum f{opt}", k + 1);
             let child = if s.win {
@@ -1388,6 +1428,7 @@ pub fn robust_search(engines: &Engines, level: crate::abstraction::Level, horizo
             if kids.insert(child) {
                 links.push((s.parent, child, s.byte));
             }
+            *bytes.entry((s.parent, child)).or_default() |= 1u64 << s.byte;
         }
         eprintln!(
             "[robust] layer {:3}: {} states -> {} inside W, {} links, {} winning; {steps} steps so far, {:.1} s, rss {:.1} GB",
@@ -1401,6 +1442,8 @@ pub fn robust_search(engines: &Engines, level: crate::abstraction::Level, horizo
         );
         let l = &mut layers[k as usize];
         (l.links, l.win_cells) = (links, win_cells);
+        l.bytes = bytes.into_iter().map(|((p, c), m)| (p, c, m)).collect();
+        l.bytes.sort_unstable();
         layers.push(next);
         cur = rows;
     }
@@ -1423,6 +1466,13 @@ pub fn robust_search(engines: &Engines, level: crate::abstraction::Level, horizo
     }
     let best = value[0][0];
     anyhow::ensure!(best >= 0, "no concrete path wins at f{opt} in the robust layers");
+    if let Some(path) = dag {
+        // Every link (the DAG drops those off the optimal paths, and refuses
+        // an input with two successors: an `rnd` fork).
+        let links = layers.iter().enumerate().flat_map(|(k, l)| l.bytes.iter().map(move |&(p, c, m)| (k as u32, p, (c != WIN).then_some(c), m)));
+        super::playable::Dag::from_links(opt, links)?.save(path)?;
+        eprintln!("[robust] the optimal-path DAG -> {}", path.display());
+    }
     // Forward: the first child of the largest value.
     let (mut inputs, mut cells, mut p) = (Vec::new(), vec![layers[0].cells[0]], 0u32);
     for k in 0..opt as usize {
@@ -1494,7 +1544,8 @@ pub struct Solved {
 /// the `[gate]` fingerprints (over (shape, key, cell), independent of
 /// scheduling). With `save`, writes the UI's arc pass: `level0.marks.bin`
 /// (remainder-free marks), `arc.marks.bin` (arc-marked nodes), `arc.txt`
-/// and the witness. `robust`: the witness is `robust_search`'s.
+/// and the witness. `robust`: the witness is `robust_search`'s (`dag`: its
+/// optimal-path DAG saved there, `playable::Dag`).
 #[allow(clippy::too_many_arguments)]
 pub fn solve(
     dir: &std::path::Path,
@@ -1505,6 +1556,7 @@ pub fn solve(
     save: Option<&std::path::Path>,
     prefer: Option<&[u8]>,
     robust: bool,
+    dag: Option<&std::path::Path>,
 ) -> anyhow::Result<Solved> {
     use crate::frame::{id_layer, mark_row, save_marks, MarkRow, Visited};
     use celeste_engine::runtime2::mix64;
@@ -1608,7 +1660,7 @@ pub fn solve(
         if let Some(wt) = &found {
             println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), wt.inputs_text());
             if robust {
-                found = Some(robust_search(&engines, level, horizon, &node, &w, prefer, wt)?);
+                found = Some(robust_search(&engines, level, horizon, &node, &w, prefer, wt, dag)?);
             }
         }
     }

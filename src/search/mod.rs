@@ -7,6 +7,7 @@
 //!   * `arc_edges`  - per recorded edge, the remainder transfer
 //!   * `arcs`       - sets of remainders as arcs of the circle
 //!   * `arc_dp`     - THE SEARCH: winning sets, optimum, concrete search
+//!   * `playable`   - the optimal path easiest for a human (`rewrite playable`)
 //!   * `pos_graph`  - player-position cells and the position graph
 //!   * `inspect`    - rows read by named fields, for the diagnostics
 //!   * `ui_export`  - `rewrite export-ui`: a finished run -> the web UI's data
@@ -17,5 +18,6 @@ pub mod checkpoint;
 pub mod door;
 pub mod edges;
 pub mod inspect;
+pub mod playable;
 pub mod pos_graph;
 pub mod ui_export;

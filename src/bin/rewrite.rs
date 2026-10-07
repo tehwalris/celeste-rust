@@ -85,6 +85,51 @@ enum Command {
         /// margin profiles are printed (`[robust]`).
         #[arg(long)]
         robust: bool,
+        /// With --robust: write the optimal-path DAG (every optimal path,
+        /// every input byte of each step) to this file, for `rewrite playable`.
+        #[arg(long)]
+        save_dag: Option<String>,
+    },
+    /// PLAYABILITY (`search::playable`): over the optimal-path DAG of
+    /// `search --robust --save-dag`, the optimal input sequence easiest for a
+    /// human: per button edge its timing window (the shifts of that edge
+    /// alone that still win at the optimum), the cost `sum -ln p` (p: the
+    /// chance a timing error N(0, sigma) frames lands in the window). Scores
+    /// the --inputs, optimizes (DP for the fewest edges, then local search),
+    /// prints per-event tables and the frame-perfect edges every optimal path
+    /// has. With --room, every window's edges re-simulated in the reference
+    /// engine (the run's env: CELESTE_GEMSKIP, CELESTE_CONCRETE_BALLOON_SEEDS).
+    Playable {
+        #[arg(long)]
+        dag: String,
+        /// Sequences to score and to seed the optimizer: files or comma
+        /// lists, the spawn prologue included (repeatable).
+        #[arg(long)]
+        inputs: Vec<String>,
+        /// The spawn prologue's length: the table's TAS-file column is the
+        /// index past it.
+        #[arg(long, default_value_t = 25)]
+        prologue: usize,
+        /// The human's timing error (frames, one standard deviation).
+        #[arg(long, default_value_t = 1.0)]
+        sigma: f64,
+        /// Fewest-event DP optima (ties broken per seed) to polish.
+        #[arg(long, default_value_t = 16)]
+        seeds: u64,
+        /// Random restarts from the best.
+        #[arg(long, default_value_t = 100)]
+        kicks: u64,
+        /// Write the optimized sequence here.
+        #[arg(long)]
+        out: Option<String>,
+        /// Re-simulate the windows' edges in the reference engine (room "x,y").
+        #[arg(long)]
+        room: Option<String>,
+        /// Write every shifted variant of each scored sequence here
+        /// (`name event shift inputs` per line), for an original-cart check
+        /// (tools/playable_orig.py).
+        #[arg(long)]
+        shifts: Option<String>,
     },
     /// ONE forward pass at ONE level, exactly as the search runs it, with the
     /// per-frame timing line. The profiling entry point for the forward.
@@ -491,7 +536,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Search { to, ceiling, level, checkpoint_dir, room, win_at, no_witness, save_marks, prefer, robust } => {
+        Command::Search { to, ceiling, level, checkpoint_dir, room, win_at, no_witness, save_marks, prefer, robust, save_dag } => {
+            anyhow::ensure!(save_dag.is_none() || robust, "--save-dag needs --robust");
             let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
             use celeste_rust::search::arc_dp::{solve, Concrete};
             std::env::set_var("CELESTE_START_ROOM", &room);
@@ -548,7 +594,7 @@ fn main() -> Result<()> {
                 };
                 // Every level saves its marks (the next overwrites): the search can end
                 // at a coarser level when its try at the bound finds the witness.
-                let s = solve(&dir, lvl, horizon, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref(), robust)?;
+                let s = solve(&dir, lvl, horizon, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref(), robust, save_dag.as_deref().map(std::path::Path::new))?;
                 let wall = t0.elapsed().as_secs_f64();
                 let Some(bound) = s.arc else {
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
@@ -583,6 +629,7 @@ fn main() -> Result<()> {
                 prev = Some((s.arc_marks.expect("asked for"), lvl));
             }
         }
+        Command::Playable { dag, inputs, prologue, sigma, seeds, kicks, out, room, shifts } => playable(&dag, &inputs, prologue, sigma, seeds, kicks, out.as_deref(), room.as_deref(), shifts.as_deref())?,
         Command::Forward {
             to,
             level,
@@ -1694,5 +1741,129 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// `rewrite playable`: see the command's doc and `search::playable`.
+#[allow(clippy::too_many_arguments)]
+fn playable(dag: &str, inputs: &[String], prologue: usize, sigma: f64, seeds: u64, kicks: u64, out: Option<&str>, room: Option<&str>, shifts: Option<&str>) -> Result<()> {
+    use celeste_rust::search::playable::{events, joint_success, optimize, p_hit, score, shift, Dag, Score, BUTTONS, SHIFT_CAP};
+    let csv = |x: &[u8]| x.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
+    let t = std::time::Instant::now();
+    let d = Dag::load(std::path::Path::new(dag))?;
+    let opt = d.opt as usize;
+    println!("[playable] DAG: optimum f{opt}, {} states ({:.1} s)", d.states(), t.elapsed().as_secs_f64());
+    let win = |y: &[u8]| d.wins(y);
+    let given: Vec<(String, Vec<u8>)> = inputs.iter().map(|s| Ok((s.rsplit('/').next().unwrap_or(s).to_string(), celeste_rust::concrete::read_inputs(s)?))).collect::<Result<_>>()?;
+    let summary = |name: &str, x: &[u8], s: &Score| {
+        println!(
+            "[playable] {name}: {} events, {} frame-perfect, min window {}, sum log2 window {:.1}, cost {:.3} (P all right, independent: {:.3}); joint P sigma 0.5 {:.3}, sigma 1 {:.3}",
+            s.events.len(),
+            s.frame_perfect(),
+            s.min_window(),
+            s.log2_windows(),
+            s.cost,
+            (-s.cost).exp(),
+            joint_success(&d, x, 0.5, 20000),
+            joint_success(&d, x, 1.0, 20000)
+        );
+    };
+    let table = |name: &str, s: &Score| {
+        println!("[table] {name}: frame (ours, 1-based) | TAS-file input (1-based) | button | edge | window [lo, hi] | width (+: capped) | frame-perfect | p (sigma {sigma})");
+        for &(e, lo, hi) in &s.events {
+            let w = |v: i32| if v.abs() >= SHIFT_CAP { format!("{}{SHIFT_CAP}", if v < 0 { "-" } else { "+" }) } else { format!("{v:+}") };
+            println!(
+                "[table] {name} f{:03} | {:>4} | {:5} | {:7} | [{}, {}] | {:>2}{} | {} | {:.3}",
+                e.at + 1,
+                e.at as i64 + 1 - prologue as i64,
+                BUTTONS[e.button],
+                if e.press { "press" } else { "release" },
+                w(lo),
+                w(hi),
+                hi - lo + 1,
+                if lo <= -SHIFT_CAP || hi >= SHIFT_CAP { "+" } else { " " },
+                if lo == 0 && hi == 0 { "FRAME-PERFECT" } else { "-" },
+                p_hit(lo, hi, sigma)
+            );
+        }
+    };
+    let mut scored: Vec<(String, Vec<u8>, Score)> = Vec::new();
+    for (name, x) in &given {
+        if !d.wins(x) {
+            println!("[playable] {name}: does NOT win at f{opt} in the DAG ({} inputs)", x.len());
+            continue;
+        }
+        let s = score(&win, x, sigma);
+        summary(name, x, &s);
+        scored.push((name.clone(), x.clone(), s));
+    }
+    // The frame-perfect edges every optimal path has.
+    let forced = d.forced();
+    let mut unavoidable = Vec::new();
+    for k in 0..opt {
+        for (b, name) in BUTTONS.iter().enumerate() {
+            let m = 1u8 << b;
+            let (set_k, clear_k) = (forced[k].0 & m != 0, forced[k].1 & m != 0);
+            let (set_p, clear_p) = if k == 0 { (false, true) } else { (forced[k - 1].0 & m != 0, forced[k - 1].1 & m != 0) };
+            if clear_p && set_k {
+                unavoidable.push(format!("f{:03} {name} press", k + 1));
+            } else if set_p && clear_k {
+                unavoidable.push(format!("f{:03} {name} release", k + 1));
+            }
+        }
+    }
+    let nforced: u32 = forced.iter().map(|&(s, c)| (s | c).count_ones()).sum();
+    println!("[playable] (frame, button) bits the same on every optimal path: {nforced} of {}", 6 * opt);
+    println!("[playable] UNAVOIDABLE frame-perfect edges ({}): {}", unavoidable.len(), unavoidable.join(", "));
+    let t = std::time::Instant::now();
+    let (bx, bs) = optimize(&d, &given.iter().map(|g| g.1.clone()).collect::<Vec<_>>(), seeds, kicks, sigma);
+    println!("[playable] optimized in {:.1} s", t.elapsed().as_secs_f64());
+    summary("optimized", &bx, &bs);
+    println!("[playable] optimized inputs {}", csv(&bx));
+    scored.push(("optimized".to_string(), bx.clone(), bs));
+    for (name, _, s) in &scored {
+        table(name, s);
+    }
+    if let Some(p) = out {
+        std::fs::write(p, csv(&bx) + "\n")?;
+    }
+    // Every valid shift of every edge, within the cap.
+    let variants = |x: &[u8]| -> Vec<(usize, i32, Vec<u8>)> {
+        let mut v = Vec::new();
+        for (k, e) in events(x).into_iter().enumerate() {
+            for s in (-SHIFT_CAP..=SHIFT_CAP).filter(|&s| s != 0) {
+                if let Some(y) = shift(x, e, s) {
+                    v.push((k, s, y));
+                }
+            }
+        }
+        v
+    };
+    if let Some(p) = shifts {
+        use std::fmt::Write;
+        let mut text = String::new();
+        for (name, x, _) in &scored {
+            writeln!(text, "{name} base 0 {}", csv(x))?;
+            for (k, s, y) in variants(x) {
+                writeln!(text, "{name} {k} {s} {}", csv(&y))?;
+            }
+        }
+        std::fs::write(p, text)?;
+    }
+    if let Some(room) = room {
+        // The reference engine on every shift: it must agree with the DAG.
+        std::env::set_var("CELESTE_START_ROOM", room);
+        let engines = celeste_rust::search::arc_dp::Engines::new()?;
+        for (name, x, _) in &scored {
+            let mut seqs = vec![x.clone()];
+            seqs.extend(variants(x).into_iter().map(|v| v.2));
+            let t = std::time::Instant::now();
+            let got = engines.first_wins(&seqs)?;
+            let bad = seqs.iter().zip(&got).filter(|(y, g)| d.wins(y) != (**g == Some(opt))).count();
+            let early = got.iter().filter(|g| g.is_some_and(|f| f < opt)).count();
+            println!("[playable] {name}: reference engine on {} shifted sequences ({:.1} s): {bad} disagree with the DAG, {early} win before f{opt}", seqs.len(), t.elapsed().as_secs_f64());
+            anyhow::ensure!(bad == 0 && early == 0, "the reference engine disagrees with the DAG");
+        }
+    }
     Ok(())
 }
