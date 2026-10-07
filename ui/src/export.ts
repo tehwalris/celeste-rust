@@ -2,15 +2,14 @@
 // video of the traversal - the room's grid alone (tiles and the coloured
 // cells; no paths, labels or controls), at a crisp integer scale.
 //
-// The video is recorded the way it plays: the canvas is drawn in real time
-// while a MediaRecorder records `canvas.captureStream()`, the step shown at
-// video time t being the step the live playback would show at t (space.ts,
-// `VideoPlan.stepAt`). With `requestFrame` (captureStream(0)) a video frame
-// is pushed once per tick at the chosen frame rate, after the draw, so no
-// frame is captured half-drawn. A recording therefore takes as long as the
-// video lasts; the tab has to stay in front (a hidden tab gets no animation
-// frames, and the video would freeze for as long).
+// The video shows at time t the step the live playback would show at t
+// (space.ts, `VideoPlan.stepAt`). It is ENCODED, not recorded: each frame is
+// drawn and handed to WebCodecs with its timestamp, and mediabunny writes a
+// plain MP4 (a MediaRecorder recording in real time wrote a fragmented file
+// whose header only knew its first second: players showed a 1-2 s duration
+// and stopped seeking there, 2026-10-07).
 
+import { BufferTarget, CanvasSource, Mp4OutputFormat, Output, getFirstEncodableVideoCodec, type VideoCodec } from "mediabunny";
 import { button, chips, download, el, show } from "./ui";
 
 /** The pixel scale of an export: an even integer (H.264 needs even sides),
@@ -61,82 +60,56 @@ export interface VideoSource {
 /** The last frame is held this long, so a video does not end on a flash. */
 const HOLD_S = 1;
 
-/** The container / codec to record, by what the browser says it supports:
- *  MP4 first (iOS Safari only has it; it is what a phone can share and
- *  save to its photos), then WebM. */
-function pickMime(): string | null {
-  if (typeof MediaRecorder === "undefined") return null;
-  const candidates = ["video/mp4;codecs=avc1", "video/mp4", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
-  return candidates.find((m) => MediaRecorder.isTypeSupported(m)) ?? null;
-}
-const extOf = (mime: string) => (mime.startsWith("video/mp4") ? "mp4" : "webm");
+/** The codecs to encode with, in order: H.264 first (what a phone can
+ *  share and save to its photos), then VP9 / AV1 in WebM-less MP4. */
+const CODECS: VideoCodec[] = ["avc", "vp9", "av1"];
+
+/** Whether this browser can encode video at all (WebCodecs). */
+const canEncode = () => typeof VideoEncoder !== "undefined";
 
 const fmtS = (s: number) => (s < 60 ? `${s.toFixed(1)} s` : `${Math.floor(s / 60)} min ${Math.round(s % 60)} s`);
 const fmtMB = (b: number) => (b < 1e6 ? `${Math.max(1, Math.round(b / 1e3))} kB` : `${(b / 1e6).toFixed(1)} MB`);
 
-interface Recording {
-  blob: Blob;
-  mime: string;
-}
-
-/** Record `plan` drawn into `canvas`. `progress(t)` is called per frame
- *  with the video time; `signal` cancels (the promise then rejects). */
-async function record(src: VideoSource, plan: VideoPlan, canvas: HTMLCanvasElement, fps: number, progress: (t: number) => void, signal: AbortSignal): Promise<Recording> {
-  const mime = pickMime();
-  if (!mime || typeof canvas.captureStream !== "function") throw new Error("This browser cannot record video (no MediaRecorder or canvas capture).");
-  const Track = (window as unknown as { CanvasCaptureMediaStreamTrack?: { prototype: object } }).CanvasCaptureMediaStreamTrack;
-  const manual = !!Track && "requestFrame" in Track.prototype;
-  const stream = canvas.captureStream(manual ? 0 : fps);
-  const track = stream.getVideoTracks()[0] as MediaStreamTrack & { requestFrame?: () => void };
-  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
-  const chunks: Blob[] = [];
-  rec.ondataavailable = (e) => {
-    if (e.data.size) chunks.push(e.data);
-  };
-  const stopped = new Promise<void>((resolve) => (rec.onstop = () => resolve()));
-
-  let shown = plan.stepAt(0);
-  src.draw(canvas, shown);
-  rec.start(1000);
-  track.requestFrame?.();
+/** Encode `plan` drawn into `canvas`, frame by frame, as a plain
+ *  (non-fragmented, fast-start) MP4: every frame is drawn, then handed to
+ *  the encoder with its exact timestamp, so the file's duration is right in
+ *  its header and nothing depends on the tab's animation timing. It runs as
+ *  fast as the encoder does. `progress(t)` is called with the video time;
+ *  `signal` cancels (the promise then rejects). */
+async function record(src: VideoSource, plan: VideoPlan, canvas: HTMLCanvasElement, fps: number, progress: (t: number) => void, signal: AbortSignal): Promise<Blob> {
+  const codec = await getFirstEncodableVideoCodec(CODECS, { width: canvas.width, height: canvas.height });
+  if (!codec) throw new Error("This browser cannot encode H.264, VP9 or AV1 video.");
+  const output = new Output({ format: new Mp4OutputFormat({ fastStart: "in-memory" }), target: new BufferTarget() });
+  const source = new CanvasSource(canvas, { codec, bitrate: 8_000_000, keyFrameInterval: 2 });
+  output.addVideoTrack(source, { frameRate: fps });
+  await output.start();
   const total = plan.duration + HOLD_S;
-  await new Promise<void>((resolve, reject) => {
-    let t0 = 0;
-    let lastK = 0;
-    const tick = (now: number) => {
-      if (signal.aborted) return reject(new DOMException("cancelled", "AbortError"));
-      if (!t0) t0 = now;
-      const t = (now - t0) / 1000;
-      const k = Math.floor(t * fps);
-      if (k > lastK) {
-        lastK = k;
-        const step = plan.stepAt(Math.min(k / fps, plan.duration - 1e-6));
-        if (step !== shown) {
-          shown = step;
-          src.draw(canvas, step);
-        } else {
-          // Chrome captures a frame only from a canvas drawn since the last
-          // one: without this a held step (the end's hold, a slow speed) is
-          // missing from the video and it ends early. Copying the canvas
-          // onto itself is cheap and changes no pixel.
-          canvas.getContext("2d")!.drawImage(canvas, 0, 0);
-        }
-        track.requestFrame?.();
-        progress(Math.min(t, total));
+  const frames = Math.ceil(total * fps);
+  let shown = -1;
+  let lastYield = performance.now();
+  try {
+    for (let k = 0; k < frames; k++) {
+      if (signal.aborted) throw new DOMException("cancelled", "AbortError");
+      const step = plan.stepAt(Math.min(k / fps, plan.duration - 1e-6));
+      if (step !== shown) {
+        shown = step;
+        src.draw(canvas, step);
       }
-      if (t >= total) resolve();
-      else requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
-  }).catch((e) => {
-    rec.stop();
-    track.stop();
+      await source.add(k / fps, 1 / fps);
+      // Let the page repaint (the preview, the progress bar) now and then.
+      if (performance.now() - lastYield > 50) {
+        progress((k + 1) / fps);
+        await new Promise((r) => setTimeout(r, 0));
+        lastYield = performance.now();
+      }
+    }
+    await output.finalize();
+  } catch (e) {
+    await output.cancel();
     throw e;
-  });
-  rec.stop();
-  await stopped;
-  track.stop();
-  return { blob: new Blob(chunks, { type: rec.mimeType || mime }), mime: rec.mimeType || mime };
+  }
+  progress(total);
+  return new Blob([output.target.buffer!], { type: "video/mp4" });
 }
 
 /** The "Export video" dialog: range, pacing, speed; then the recording
@@ -185,14 +158,14 @@ export function openVideoDialog(src: VideoSource) {
   );
   const summary = el("p", { class: "note export-summary" });
   const fpsOf = (i: number) => (src.speeds[i].steps <= 15 ? 30 : 60);
-  const mime = pickMime();
+  const ok = canEncode();
   function summarize() {
     const p = src.plan(range, pacing, speed);
     const sp = src.speeds[speed];
     summary.textContent =
       `${p.what}: ${p.steps} steps at ${sp.steps} per second${pacing === "real" ? " on average (each step its share of the logged time)" : ""}` +
       ` → ${fmtS(p.duration)} + ${HOLD_S} s on the last frame. ${src.size.w}×${src.size.h} px, ${fpsOf(speed)} fps, ` +
-      (mime ? `${extOf(mime).toUpperCase()}. Recording takes as long as the video: keep this tab in front.` : "but this browser cannot record video.");
+      (ok ? "MP4." : "but this browser cannot encode video (no WebCodecs).");
     // The first frame as the preview, once the files are in.
     void src.ready().then(() => {
       if (dlg.dataset.phase === "setup") src.draw(canvas, p.stepAt(0));
@@ -204,8 +177,8 @@ export function openVideoDialog(src: VideoSource) {
   const barText = el("div", { class: "export-bar-text" });
   const result = el("div", { class: "export-result" });
 
-  const go = button("Record", () => void start(), "primary");
-  go.disabled = !mime;
+  const go = button("Export", () => void start(), "primary");
+  go.disabled = !ok;
   const cancel = button("Cancel", () => abort?.abort());
   const closeBtn = button("Close", close);
 
@@ -221,7 +194,7 @@ export function openVideoDialog(src: VideoSource) {
     show(go, p !== "recording");
     show(closeBtn, p !== "recording");
     show(result, p === "done");
-    go.textContent = p === "done" ? "Record again" : "Record";
+    go.textContent = p === "done" ? "Export again" : "Export";
     // Once there is a video, Download is the one primary action.
     go.classList.toggle("primary", p !== "done");
     dlg.dataset.phase = p;
@@ -240,27 +213,27 @@ export function openVideoDialog(src: VideoSource) {
     fill.style.width = "0%";
     try {
       await src.ready();
-      const rec = await record(
+      const blob = await record(
         src,
         plan,
         canvas,
         fpsOf(speed),
         (t) => {
           fill.style.width = `${((100 * t) / total).toFixed(1)}%`;
-          barText.textContent = `recording ${fmtS(t)} of ${fmtS(total)}`;
+          barText.textContent = `encoding ${fmtS(t)} of ${fmtS(total)}`;
         },
         abort.signal,
       );
-      const name = `${plan.name}.${extOf(rec.mime)}`;
-      url = URL.createObjectURL(rec.blob);
+      const name = `${plan.name}.mp4`;
+      url = URL.createObjectURL(blob);
       const video = el("video", { src: url, controls: true, playsinline: true, muted: true, loop: true, class: "export-video" });
-      const file = new File([rec.blob], name, { type: rec.blob.type });
+      const file = new File([blob], name, { type: blob.type });
       const nav = navigator as Navigator & { canShare?: (d: { files: File[] }) => boolean };
       const canShare = !!nav.canShare && nav.canShare({ files: [file] });
       result.replaceChildren(
         video,
         el("div", { class: "export-actions" }, [
-          button("Download", () => download(name, rec.blob), "primary", `save ${name}`),
+          button("Download", () => download(name, blob), "primary", `save ${name}`),
           canShare
             ? button("Share…", () => {
                 navigator.share({ files: [file] }).catch(() => undefined);
@@ -268,8 +241,8 @@ export function openVideoDialog(src: VideoSource) {
             : null,
         ].filter((x): x is HTMLButtonElement => x != null)),
       );
-      barText.textContent = `${name} · ${fmtMB(rec.blob.size)} · ${fmtS(total)}`;
-      dlg.dataset.bytes = String(rec.blob.size);
+      barText.textContent = `${name} · ${fmtMB(blob.size)} · ${fmtS(total)}`;
+      dlg.dataset.bytes = String(blob.size);
       phase("done");
     } catch (e) {
       const cancelled = (e as Error).name === "AbortError";

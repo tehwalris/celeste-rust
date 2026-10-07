@@ -117,10 +117,12 @@ in Passes / 3D stack the whole pass, `..._L2-backward-whole_full.png`).
 pass the playhead is in), pacing and speed exactly as the playback's
 (uniform or real time; 15 / 60 / 250 steps per second; real time keeps
 the same total), the last frame held 1 s, 30 fps at slow and 60 above.
-The canvas is recorded in real time with `captureStream` + `MediaRecorder`
-(MP4/H.264 where `isTypeSupported` says so - iOS Safari, Chrome - else
-WebM), so recording takes as long as the video and the tab must stay in
-front; a live preview, a progress bar and Cancel while it runs, then the
+Each frame is drawn and encoded with WebCodecs (H.264, else VP9 / AV1)
+and muxed by `mediabunny` into a plain fast-start MP4, faster than real
+time and independent of the tab's animation timing (the first version
+recorded `captureStream` with a `MediaRecorder` in 1 s slices: a
+fragmented file whose header gave players a 1-2 s duration);
+a live preview, a progress bar and Cancel while it runs, then the
 video, Download, and Share (the phone's share sheet, to save it to the
 photos) where `navigator.canShare` allows files. The file is named
 `room43nodiag_h111_all_full_uniform-med.mp4` (`L2-backward` for one pass,
