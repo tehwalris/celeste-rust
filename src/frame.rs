@@ -1630,6 +1630,7 @@ impl ForwardState {
         to: u32,
         filter: Option<&MarkFilter>,
     ) -> Result<()> {
+        let mut last_free = None;
         while self.frames < to && !self.frontier.is_empty() {
             let frame = self.frames + 1;
             let t_frame = std::time::Instant::now();
@@ -1658,7 +1659,7 @@ impl ForwardState {
             }
             let t_pos = t.elapsed();
             log_frame(frame, &st, t_edges, compact_records, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
-            ensure_disk_space(dir)?;
+            ensure_disk_space(dir, &mut last_free)?;
             self.frames = frame;
             if won && self.win_frame.is_none() {
                 self.win_frame = Some(frame);
@@ -1752,13 +1753,16 @@ pub fn forward_run(
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
-/// The per-frame `[fwd]` line (ms) and the `fwd.*` metrics totals.
 /// Stop the forward before the checkpoint disk fills: below
 /// `CELESTE_MIN_FREE_GB` (default 20) plus three times what the last frame
 /// wrote, free on `dir`'s filesystem, an error -
 /// a full disk otherwise fails a worker mid-write (room (5,1) nodiag,
-/// 2026-10-06) and starves everything else on the machine.
-fn ensure_disk_space(dir: &std::path::Path) -> Result<()> {
+/// 2026-10-06) and starves everything else on the machine. `last_free`: the
+/// free bytes after the previous frame of THIS forward (`None` at its first:
+/// a delta across the arc phase between two levels counted everything the
+/// other processes wrote meanwhile as the frame's, and stopped room (2,3)'s
+/// second level at its first frame, 2026-10-07).
+fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let min_gb: u64 = match std::env::var("CELESTE_MIN_FREE_GB") {
         Ok(v) => v.parse().context("CELESTE_MIN_FREE_GB")?,
@@ -1772,9 +1776,7 @@ fn ensure_disk_space(dir: &std::path::Path) -> Result<()> {
     let free = st.f_bavail as u64 * st.f_frsize as u64;
     // A frame can write tens of GB (a room whose frontier explodes): keep room
     // for three more frames like the last one, not just the fixed floor.
-    static LAST_FREE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let last = LAST_FREE.swap(free, std::sync::atomic::Ordering::Relaxed);
-    let frame_bytes = last.saturating_sub(free);
+    let frame_bytes = last_free.replace(free).map_or(0, |last| last.saturating_sub(free));
     let need = (min_gb << 30) + 3 * frame_bytes;
     anyhow::ensure!(
         free >= need,
@@ -1786,6 +1788,7 @@ fn ensure_disk_space(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// The per-frame `[fwd]` line (ms) and the `fwd.*` metrics totals.
 fn log_frame(
     frame: u32,
     st: &FrameStats,
