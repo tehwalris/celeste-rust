@@ -4,13 +4,14 @@
 -- draw per iteration (UCT's own loop is paced by the wall clock, so it may
 -- update twice per draw), fixed random seeds, no audio. During the playback
 -- (the driver's "wait" phase) every frame the cart updated is written to DIR:
---   frames.bin  per frame 3 x 128x128 RGBA8 layers: the screen (the palette
+--   frames.bin  per frame 4 x 128x128 RGBA8 layers: the screen (the palette
 --               INDEX is in red, index = round(r * 15 / 255); UCT's shaders
 --               work in indices), the player layer (player or player_spawn
---               with its hair, alpha 0 elsewhere), the smoke layer;
+--               with its hair, alpha 0 elsewhere), the smoke layer, the berry
+--               layer (fruit, fly_fruit with its wings, the lifeup "1000");
 --   frames.jsonl per frame: the input the update consumed, UCT's timer, the
 --               player, and whether the room changed during it (`exit`).
--- The player and smoke layers come from drawing those objects a second time
+-- The player, smoke and berry layers come from drawing those objects a second time
 -- into their own canvas, the hair saved and restored around it (draw_hair
 -- moves the hair), so the game's own frame is unchanged.
 -- UCT's overlay (timer, input display) is turned off: the compositor draws its own.
@@ -36,11 +37,13 @@ function C.setup(drv)
   C.meta = assert(io.open(C.dir .. "/frames.jsonl", "w"))
   C.P = love.graphics.newCanvas(128, 128)
   C.S = love.graphics.newCanvas(128, 128)
+  C.F = love.graphics.newCanvas(128, 128)
   C.n = 0
   local draw_object = cart.draw_object
   cart.draw_object = function(o)
     local t = o.type
-    local layer = (t == cart.player or t == cart.player_spawn) and C.P or (t == cart.smoke and C.S) or nil
+    local layer = (t == cart.player or t == cart.player_spawn) and C.P or (t == cart.smoke and C.S)
+      or ((t == cart.fruit or t == cart.fly_fruit or t == cart.lifeup) and C.F) or nil
     if layer then
       local s = hair_save(o)
       love.graphics.setCanvas(layer)
@@ -77,7 +80,7 @@ function C.pre_draw()
   C.drv.TAS.showdebug = false
   -- A freeze frame draws nothing (`_draw` returns early): keep the layers too.
   if (pico8.cart.freeze or 0) <= 0 then
-    for _, c in ipairs({C.P, C.S}) do
+    for _, c in ipairs({C.P, C.S, C.F}) do
       love.graphics.setCanvas(c)
       love.graphics.clear(0, 0, 0, 0)
     end
@@ -89,7 +92,7 @@ function C.post_draw()
   local TAS = C.drv.TAS
   if C.drv.phase ~= "wait" or not TAS.cart_update then return end
   love.graphics.setCanvas()
-  for _, c in ipairs({pico8.screen, C.P, C.S}) do
+  for _, c in ipairs({pico8.screen, C.P, C.S, C.F}) do
     C.bin:write(c:newImageData():getString())
   end
   love.graphics.setCanvas(pico8.screen)
