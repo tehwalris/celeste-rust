@@ -852,7 +852,6 @@ impl NodeKeys {
     }
 }
 
-/// THE CONCRETE SEARCH: the concrete optimum and its inputs. A BREADTH-FIRST
 /// A concrete state's node key. With seeded balloons (`concrete_search`),
 /// the state holds each balloon's phase as one number and its `y` as one
 /// point, where the tree - built with the phase an interval - holds the
@@ -886,6 +885,235 @@ fn input_order(prefer: Option<&[u8]>, k: u32) -> impl Iterator<Item = u8> {
     first.into_iter().chain((0u8..64).filter(move |&b| Some(b) != first))
 }
 
+/// The reference engines of the concrete search, one per worker, and the
+/// room's start. `CELESTE_CONCRETE_BALLOON_SEEDS`: the concrete steps run
+/// with the balloons' phases FIXED (a tasdatabase file's seeds), so the
+/// witness is one real run under them - the tree and W keep the phase an
+/// interval (sound for every seed), and a concrete state's key maps its
+/// phase to that interval (`widen::canon_balloon_offset`, `Rt2::widen_to`).
+pub struct Engines {
+    engines: Vec<std::sync::Mutex<crate::trace::refengine::RefEngine>>,
+    initial: celeste_engine::runtime2::Rt2,
+    seeded: bool,
+}
+
+impl Engines {
+    pub fn new() -> anyhow::Result<Self> {
+        use crate::trace::refengine::RefEngine;
+        let workers = crate::frame::threads().max(1);
+        let seeds = std::env::var("CELESTE_CONCRETE_BALLOON_SEEDS").ok();
+        let seeded = seeds.is_some();
+        if let Some(s) = &seeds {
+            std::env::set_var("CELESTE_BALLOON_SEEDS", s);
+        }
+        let engines: anyhow::Result<Vec<std::sync::Mutex<RefEngine>>> = (0..workers).map(|_| RefEngine::new().map(std::sync::Mutex::new)).collect();
+        if seeded {
+            std::env::remove_var("CELESTE_BALLOON_SEEDS");
+        }
+        let engines = engines?;
+        let initial = engines[0].lock().expect("an engine").initial()?;
+        Ok(Engines { engines, initial, seeded })
+    }
+    fn start(&self) -> anyhow::Result<crate::frame::Block> {
+        crate::frame::Block::keyed(self.initial.clone_block())
+    }
+}
+
+/// A margin's cap, raw (1/65536 px): half a pixel.
+pub const MARGIN_CAP: u16 = 1 << 15;
+
+/// A raw margin in pixels.
+fn px(m: u16) -> f64 {
+    m as f64 / super::arcs::CIRCLE as f64
+}
+
+/// The player's remainder as a point of the circle (no player: `(0, 0)`).
+fn rem_of(rt2: &celeste_engine::runtime2::Rt2) -> anyhow::Result<(u32, u32)> {
+    use celeste_engine::runtime2::AV;
+    let ids = crate::compiled::ids();
+    let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((super::arcs::point(0), super::arcs::point(0))) };
+    let raw = |c: usize| -> anyhow::Result<u32> {
+        match rt2.cols[c].at(0) {
+            AV::Num(n) => Ok(super::arcs::point(n.as_raw_u32() as i32)),
+            other => anyhow::bail!("a concrete remainder expected, got {other:?}"),
+        }
+    };
+    Ok((raw(cx)?, raw(cy)?))
+}
+
+/// What the concrete search checks a state against: the graph's nodes and
+/// their winning sets.
+struct Inside<'a> {
+    level: crate::abstraction::Level,
+    node: &'a NodeKeys,
+    w: &'a Winning,
+    seeded: bool,
+}
+
+impl Inside<'_> {
+    fn node_of(&self, b: &crate::frame::Block) -> anyhow::Result<Option<u32>> {
+        let (shape, keys, cells) = lookup_keys(b, self.level, self.seeded)?;
+        Ok(self.node.get(shape, keys[0], cells[0]))
+    }
+    /// `b`'s node and remainder, when that node's `W_t` holds the remainder.
+    fn at(&self, b: &crate::frame::Block, t: u32) -> anyhow::Result<Option<(u32, (u32, u32))>> {
+        let Some(i) = self.node_of(b)? else { return Ok(None) };
+        let q = rem_of(b.rt2())?;
+        Ok(self.w.at(t, i).is_some_and(|r| r.contains(q.0, q.1)).then_some((i, q)))
+    }
+    /// THE MARGIN of `b` (inside `W_t` at node `i`, remainder `q`), per axis:
+    /// the largest `d <= MARGIN_CAP` (raw) such that moving the player by
+    /// any `e` in `[-d, d]` along that axis ALONE - every other field as it
+    /// is - keeps it inside `W_t`. A move past the pixel's edge is the same
+    /// state one pixel over (its node looked up like any state's; no node:
+    /// outside). No player (the spawn): nothing to move, the cap.
+    fn margins(&self, b: &crate::frame::Block, i: u32, q: (u32, u32), t: u32) -> anyhow::Result<(u16, u16)> {
+        use super::arcs::CIRCLE;
+        use crate::pico8_num::Pico8Num as P8;
+        use anyhow::Context;
+        use celeste_engine::runtime2::{Col, AV};
+        let cap = MARGIN_CAP as u32;
+        let ids = crate::compiled::ids();
+        let rt2 = b.rt2();
+        let Some(&obj) = rt2.player_objects(ids).first() else { return Ok((MARGIN_CAP, MARGIN_CAP)) };
+        let r = self.w.at(t, i).context("a margin outside W")?;
+        let (rx, ry) = rt2.player_xy_cells(ids, ids.f_rem).context("a player without a remainder")?;
+        let mut out = [0u16; 2];
+        for (axis, (pos_f, rem_c)) in [(ids.f_x, rx), (ids.f_y, ry)].into_iter().enumerate() {
+            let run = |reg: &Region, p: (u32, u32)| if axis == 0 { reg.x_run(p.0, p.1) } else { reg.y_run(p.0, p.1) };
+            let s = run(r, q).context("a margin outside W")?;
+            let p = [q.0, q.1][axis];
+            // The run continued into the pixel `dir` over, from its side
+            // facing this one: the points it adds.
+            let beyond = |dir: i32| -> anyhow::Result<u32> {
+                let mut nb = rt2.clone_block();
+                let pc = rt2.obj_field_cell(obj, pos_f).context("the player's position")? as usize;
+                let AV::Num(v) = rt2.cols[pc].at(0) else { anyhow::bail!("a concrete position expected") };
+                nb.cols[pc] = Col::U(AV::Num(P8::from_raw(v.as_raw_u32() as i32 + dir * CIRCLE as i32)));
+                let edge = if dir > 0 { 0 } else { CIRCLE - 1 };
+                nb.cols[rem_c] = Col::U(AV::Num(P8::from_raw(edge as i32 - 32768)));
+                let Some(j) = self.node_of(&crate::frame::Block::from_rt2(nb))? else { return Ok(0) };
+                let pt = if axis == 0 { (edge, q.1) } else { (q.0, edge) };
+                Ok(match self.w.at(t, j).and_then(|rj| run(rj, pt)) {
+                    None => 0,
+                    Some(s2) if dir > 0 => s2.hi,
+                    Some(s2) => CIRCLE - s2.lo,
+                })
+            };
+            let mut up = s.hi - 1 - p;
+            if s.hi == CIRCLE && up < cap {
+                up += beyond(1)?;
+            }
+            let mut down = p - s.lo;
+            if s.lo == 0 && down < cap {
+                down += beyond(-1)?;
+            }
+            out[axis] = up.min(down).min(cap) as u16;
+        }
+        Ok((out[0], out[1]))
+    }
+}
+
+/// A successor that wins or stays inside W, in (parent, input, leaf) order
+/// within its worker's chunk.
+struct Succ {
+    parent: u32,
+    byte: u8,
+    cell: u32,
+    win: bool,
+    exact: (u64, u64),
+    /// `None` for a win (its state is never expanded) and for a repeat.
+    row: Option<celeste_engine::runtime2::Rt2>,
+    /// Its margins (`all` only).
+    margin: (u16, u16),
+}
+
+/// One breadth-first layer: the successors of layer `k` (`cur`; every input
+/// in `input_order`, every `rnd` leaf) that win or stay inside `W_t`, in
+/// (parent, input, leaf) order, and the steps taken. Parallel, one reference
+/// engine per worker. `all` (the robust search): every such successor with
+/// its margins, a repeat of an exact state as a link without its state, past
+/// a win; otherwise each exact state once per chunk, a chunk ending at its
+/// first win.
+fn expand(engines: &Engines, inside: &Inside, prefer: Option<&[u8]>, cur: &[celeste_engine::runtime2::Rt2], k: u32, t: u32, all: bool) -> anyhow::Result<(Vec<Succ>, u64)> {
+    use crate::frame::wins_of;
+    use anyhow::Result;
+    const CHUNK: usize = 16;
+    let next_chunk = std::sync::atomic::AtomicUsize::new(0);
+    let parts: Vec<Result<(Vec<(usize, Vec<Succ>)>, u64)>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = engines
+            .engines
+            .iter()
+            .map(|engine| {
+                let next_chunk = &next_chunk;
+                sc.spawn(move || -> Result<(Vec<(usize, Vec<Succ>)>, u64)> {
+                    let mut eng = engine.lock().expect("an engine");
+                    let (mut out, mut steps) = (Vec::new(), 0u64);
+                    loop {
+                        let lo = next_chunk.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);
+                        if lo >= cur.len() {
+                            return Ok((out, steps));
+                        }
+                        // Dedup within the chunk already (the first in
+                        // order, as the merge keeps it): most successors
+                        // are repeats.
+                        let mut got = Vec::new();
+                        let mut chunk_seen: FxHashMap<((u64, u64), u32), (u16, u16)> = FxHashMap::default();
+                        'chunk: for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
+                            for byte in input_order(prefer, k) {
+                                for b in eng.step(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
+                                    steps += 1;
+                                    let cell = b.positions()?[0];
+                                    // Dedup on the EXACT key, never `b.keys()` (the
+                                    // level's widened key): states sharing it need
+                                    // not share their fate (`522de36`).
+                                    let exact = b.rt2().clone_block().row_keys_canonical()[0];
+                                    let win = wins_of(b.rt2())?.iter().any(|&x| x);
+                                    let mut margin = (0, 0);
+                                    if !win {
+                                        if let Some(&m) = chunk_seen.get(&(exact, cell)) {
+                                            if all {
+                                                got.push(Succ { parent: p as u32, byte, cell, win, exact, row: None, margin: m });
+                                            }
+                                            continue;
+                                        }
+                                        let Some((i, q)) = inside.at(&b, t)? else { continue };
+                                        if all {
+                                            margin = inside.margins(&b, i, q, t)?;
+                                        }
+                                        chunk_seen.insert((exact, cell), margin);
+                                    }
+                                    // A win keeps no state (only its link), and (but
+                                    // for `all`) the chunk ends at its first: the
+                                    // earliest win (chunks merge in order) ends the
+                                    // search. Every successor of the last layer can
+                                    // win - kept whole, room (4,3) 100% reached 100 GB
+                                    // there.
+                                    got.push(Succ { parent: p as u32, byte, cell, win, exact, row: (!win).then(|| b.into_rt2()), margin });
+                                    if win && !all {
+                                        break 'chunk;
+                                    }
+                                }
+                            }
+                        }
+                        out.push((lo, got));
+                    }
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("a concrete worker panicked")).collect()
+    });
+    let (mut chunks, mut steps): (Vec<(usize, Vec<Succ>)>, u64) = (Vec::new(), 0);
+    for p in parts {
+        let (c, s) = p?;
+        chunks.extend(c);
+        steps += s;
+    }
+    chunks.sort_unstable_by_key(|c| c.0);
+    Ok((chunks.into_iter().flat_map(|c| c.1).collect(), steps))
+}
+
+/// THE CONCRETE SEARCH: the concrete optimum and its inputs. A BREADTH-FIRST
 /// search over concrete states through the reference engine (every input,
 /// every `rnd` leaf), layer k+1 admitting a successor only if its projection
 /// onto `level` is a node of `g` whose `W_{k+1}` holds its exact remainder
@@ -895,9 +1123,12 @@ fn input_order(prefer: Option<&[u8]>, k: u32) -> impl Iterator<Item = u8> {
 /// Sound: every concrete path that wins by the horizon stays inside W, so
 /// the search is EXHAUSTIVE inside W and prunes by nothing else; its first
 /// win is the CONCRETE optimum. `None`: no concrete win by the horizon.
-/// `bound` (the graph's optimum) is a lower bound on it. Layers run in
-/// parallel, one reference engine per worker.
+/// `bound` (the graph's optimum) is a lower bound on it. The engines are
+/// built BEFORE the level is set here: `_init` runs under the global level;
+/// their frames run exact whatever is set.
+#[allow(clippy::too_many_arguments)]
 pub fn concrete_search(
+    engines: &Engines,
     level: crate::abstraction::Level,
     horizon: u32,
     node: &NodeKeys,
@@ -906,56 +1137,16 @@ pub fn concrete_search(
     breadth_first: bool,
     prefer: Option<&[u8]>,
 ) -> anyhow::Result<Option<Witness>> {
-    use crate::frame::{wins_of, Block};
-    use anyhow::Result;
+    use crate::frame::wins_of;
     use crate::trace::refengine::RefEngine;
-    use celeste_engine::runtime2::{Rt2, AV};
-    // Build the engines BEFORE setting the level: `_init` runs under the
-    // global level. Their frames run exact whatever is set.
-    let workers = crate::frame::threads().max(1);
-    // `CELESTE_CONCRETE_BALLOON_SEEDS`: the concrete steps run with the
-    // balloons' phases FIXED (a tasdatabase file's seeds), so the witness is
-    // one real run under them - the tree and W keep the phase an interval
-    // (sound for every seed), and a concrete state's key maps its phase to
-    // that interval (`widen::canon_balloon_offset`, `Rt2::widen_to`).
-    let seeds = std::env::var("CELESTE_CONCRETE_BALLOON_SEEDS").ok();
-    let seeded = seeds.is_some();
-    if let Some(s) = &seeds {
-        std::env::set_var("CELESTE_BALLOON_SEEDS", s);
-    }
-    let engines: Result<Vec<std::sync::Mutex<RefEngine>>> = (0..workers).map(|_| RefEngine::new().map(std::sync::Mutex::new)).collect();
-    if seeded {
-        std::env::remove_var("CELESTE_BALLOON_SEEDS");
-    }
-    let engines = engines?;
-    let initial = engines[0].lock().expect("an engine").initial()?;
+    use anyhow::Result;
+    use celeste_engine::runtime2::Rt2;
     crate::abstraction::set_level(level);
     let t0 = std::time::Instant::now();
-    eprintln!("[concrete] {} nodes keyed; {workers} workers; the arc bound f{bound}", node.len());
+    eprintln!("[concrete] {} nodes keyed; {} workers; the arc bound f{bound}", node.len(), engines.engines.len());
     crate::metrics::mem_phase("concrete: engines up");
-    fn rem_of(rt2: &Rt2) -> Result<(u32, u32)> {
-        let ids = crate::compiled::ids();
-        let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((super::arcs::point(0), super::arcs::point(0))) };
-        let raw = |c: usize| -> Result<u32> {
-            match rt2.cols[c].at(0) {
-                AV::Num(n) => Ok(super::arcs::point(n.as_raw_u32() as i32)),
-                other => anyhow::bail!("a concrete remainder expected, got {other:?}"),
-            }
-        };
-        Ok((raw(cx)?, raw(cy)?))
-    }
-    /// A successor that stays inside W (or wins), in (parent, input, leaf)
-    /// order within its worker's chunk.
-    struct Succ {
-        parent: u32,
-        byte: u8,
-        cell: u32,
-        win: bool,
-        exact: (u64, u64),
-        /// `None` for a win (its state is never expanded).
-        row: Option<Rt2>,
-    }
-    let start = Block::keyed(initial)?;
+    let inside = Inside { level, node, w, seeded: engines.seeded };
+    let start = engines.start()?;
     let start_cell = start.positions()?[0];
     // THE FAST PATH: a budgeted depth-first search for a win AT the bound,
     // inside `W_{H - bound + k}`, on one engine. Sound: a win here is at the
@@ -964,16 +1155,13 @@ pub fn concrete_search(
     {
         struct Dfs<'a> {
             eng: &'a mut RefEngine,
-            node: &'a NodeKeys,
-            w: &'a Winning,
-            level: crate::abstraction::Level,
+            inside: &'a Inside<'a>,
             from: u32,
             frames: u32,
             dead: FxHashSet<((u64, u64), u32, u32)>,
             path: Vec<(u8, u32)>,
             steps: u64,
             prefer: Option<&'a [u8]>,
-            seeded: bool,
         }
         /// `Ok(None)`: out of budget.
         fn dfs(cx: &mut Dfs, st: &Rt2, k: u32) -> Result<Option<bool>> {
@@ -997,10 +1185,7 @@ pub fn concrete_search(
                     if cx.dead.contains(&exact) {
                         continue;
                     }
-                    let (shape, keys, cells) = lookup_keys(&b, cx.level, cx.seeded)?;
-                    let Some(i) = cx.node.get(shape, keys[0], cells[0]) else { continue };
-                    let q = rem_of(b.rt2())?;
-                    if !cx.w.at(cx.from + k + 1, i).is_some_and(|r| r.contains(q.0, q.1)) {
+                    if cx.inside.at(&b, cx.from + k + 1)?.is_none() {
                         continue;
                     }
                     cx.path.push((byte, cell));
@@ -1018,8 +1203,8 @@ pub fn concrete_search(
         /// Concrete steps the fast path may take before it gives up.
         const DFS_BUDGET: u64 = 200_000;
         let t = std::time::Instant::now();
-        let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { eng: &mut eng, node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer, seeded };
+        let mut eng = engines.engines[0].lock().expect("an engine");
+        let mut cx = Dfs { eng: &mut eng, inside: &inside, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer };
         let found = dfs(&mut cx, start.rt2(), 0)?;
         eprintln!(
             "[concrete] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
@@ -1046,76 +1231,8 @@ pub fn concrete_search(
     let mut steps = 0u64;
     for k in 0..horizon {
         let t = std::time::Instant::now();
-        let t_w = k + 1;
-        const CHUNK: usize = 16;
-        let next_chunk = std::sync::atomic::AtomicUsize::new(0);
-        let parts: Vec<Result<(Vec<(usize, Vec<Succ>)>, u64)>> = std::thread::scope(|sc| {
-            let hs: Vec<_> = engines
-                .iter()
-                .map(|engine| {
-                    let (cur, next_chunk) = (&cur, &next_chunk);
-                    sc.spawn(move || -> Result<(Vec<(usize, Vec<Succ>)>, u64)> {
-                        let mut eng = engine.lock().expect("an engine");
-                        let (mut out, mut steps) = (Vec::new(), 0u64);
-                        loop {
-                            let lo = next_chunk.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);
-                            if lo >= cur.len() {
-                                return Ok((out, steps));
-                            }
-                            // Dedup within the chunk already (the first in
-                            // order, as the merge keeps it): most successors
-                            // are repeats.
-                            let mut got = Vec::new();
-                            let mut chunk_seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
-                            'chunk: for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
-                                for byte in input_order(prefer, k) {
-                                    for b in eng.step(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
-                                        steps += 1;
-                                        let cell = b.positions()?[0];
-                                        // Dedup on the EXACT key, never `b.keys()` (the
-                                        // level's widened key): states sharing it need
-                                        // not share their fate (`522de36`).
-                                        let exact = b.rt2().clone_block().row_keys_canonical()[0];
-                                        let win = wins_of(b.rt2())?.iter().any(|&x| x);
-                                        if !win && chunk_seen.contains(&(exact, cell)) {
-                                            continue;
-                                        }
-                                        if !win {
-                                            let (shape, keys, cells) = lookup_keys(&b, level, seeded)?;
-                                            let Some(i) = node.get(shape, keys[0], cells[0]) else { continue };
-                                            let q = rem_of(b.rt2())?;
-                                            if !w.at(t_w, i).is_some_and(|r| r.contains(q.0, q.1)) {
-                                                continue;
-                                            }
-                                        }
-                                        chunk_seen.insert((exact, cell));
-                                        // A win keeps no state (only its link), and the chunk
-                                        // ends at its first: the earliest win (chunks merge in
-                                        // order) ends the search. Every successor of the last
-                                        // layer can win - kept whole, room (4,3) 100% reached
-                                        // 100 GB there.
-                                        got.push(Succ { parent: p as u32, byte, cell, win, exact, row: (!win).then(|| b.into_rt2()) });
-                                        if win {
-                                            break 'chunk;
-                                        }
-                                    }
-                                }
-                            }
-                            out.push((lo, got));
-                        }
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("a concrete worker panicked")).collect()
-        });
-        let mut chunks: Vec<(usize, Vec<Succ>)> = Vec::new();
-        for p in parts {
-            let (c, s) = p?;
-            chunks.extend(c);
-            steps += s;
-        }
-        chunks.sort_unstable_by_key(|c| c.0);
-        let succs = chunks.into_iter().flat_map(|c| c.1);
+        let (succs, s) = expand(engines, &inside, prefer, &cur, k, k + 1, false)?;
+        steps += s;
         // Each exact state once, in order; the first win ends the search.
         let mut seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
         let (mut next, mut links): (Vec<Rt2>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
@@ -1167,6 +1284,188 @@ pub fn concrete_search(
     Ok(None)
 }
 
+/// The margins along a path that wins at its last input, replayed from the
+/// start: frame k's state inside `W_{from + k}` (frame 0 the start, the win
+/// frame excluded); at a `rnd` fork the leaf at `cells[k]`. An error where
+/// the path leaves W or does not win.
+fn margin_profile(engines: &Engines, inside: &Inside, from: u32, w: &Witness) -> anyhow::Result<Vec<(u16, u16)>> {
+    use anyhow::Context;
+    let mut eng = engines.engines[0].lock().expect("an engine");
+    let mut b = engines.start()?;
+    let mut out = Vec::new();
+    for (k, &byte) in w.inputs.iter().enumerate() {
+        let t = from + k as u32;
+        if k == 0 {
+            out.push(start_margin(&b)?);
+        } else {
+            let (i, q) = inside.at(&b, t)?.with_context(|| format!("the path leaves W at f{k}"))?;
+            out.push(inside.margins(&b, i, q, t)?);
+        }
+        let leaves = eng.step(b.rt2(), byte)?;
+        let n = leaves.len();
+        b = leaves.into_iter().find(|l| l.positions().is_ok_and(|p| p[0] == w.cells[k + 1])).with_context(|| format!("none of {n} leaves at the path's cell at f{}", k + 1))?;
+    }
+    anyhow::ensure!(crate::frame::wins_of(b.rt2())?.iter().any(|&x| x), "the path does not win at f{}", w.inputs.len());
+    Ok(out)
+}
+
+/// The start's margins: the cap, as it has no player (the concrete search
+/// never looks the start up: its key need not be the tree's start node's).
+fn start_margin(start: &crate::frame::Block) -> anyhow::Result<(u16, u16)> {
+    anyhow::ensure!(start.rt2().player_objects(crate::compiled::ids()).is_empty(), "the start has a player: its margin needs a lookup");
+    Ok((MARGIN_CAP, MARGIN_CAP))
+}
+
+/// A margin profile's bottleneck: (margin, frame, axis), the earliest least.
+fn bottleneck(profile: &[(u16, u16)]) -> (u16, usize, &'static str) {
+    profile.iter().enumerate().map(|(f, &(x, y))| if x <= y { (x, f, "x") } else { (y, f, "y") }).min_by_key(|&(m, f, _)| (m, f)).unwrap_or((MARGIN_CAP, 0, "-"))
+}
+
+/// THE MOST ROBUST OPTIMAL PATH (`rewrite search --robust`): among every
+/// concrete path that wins at the optimum `opt` (the length of `first`, the
+/// concrete search's witness), one whose BOTTLENECK MARGIN - the least, over
+/// its frames, of its states' margins (`Inside::margins`) inside
+/// `W_{H - opt + k}`, the sets that still win AT `opt` - is largest.
+///
+/// The layers are the concrete search's (every input, every `rnd` leaf,
+/// each exact state once) inside the sets of the optimum, so they hold every
+/// optimal path; each keeps its states' margins and its distinct
+/// (parent, child) links (the first input of each). Backward, a widest-path
+/// DP: `value(s) = min(margin(s), max over children value(child))`, a win
+/// the cap, a state without a winning child none. The path follows the first
+/// child of the largest value (the `prefer` input first: among equally
+/// robust paths, the one nearest the known TAS). Both profiles are then
+/// replayed: the robust one's bottleneck must be the DP's.
+#[allow(clippy::too_many_arguments)]
+pub fn robust_search(engines: &Engines, level: crate::abstraction::Level, horizon: u32, node: &NodeKeys, w: &Winning, prefer: Option<&[u8]>, first: &Witness) -> anyhow::Result<Witness> {
+    use anyhow::Context;
+    use celeste_engine::runtime2::Rt2;
+    const WIN: u32 = u32::MAX;
+    let opt = first.inputs.len() as u32;
+    let from = horizon - opt;
+    crate::abstraction::set_level(level);
+    let inside = Inside { level, node, w, seeded: engines.seeded };
+    let t0 = std::time::Instant::now();
+    /// A layer's states (cell, margins) and their links to the next layer's
+    /// (parent, child, input), by parent; a win's child `WIN`, its cell kept.
+    #[derive(Default)]
+    struct Layer {
+        cells: Vec<u32>,
+        margins: Vec<(u16, u16)>,
+        links: Vec<(u32, u32, u8)>,
+        win_cells: FxHashMap<u32, u32>,
+    }
+    let start = engines.start()?;
+    let mut layers = vec![Layer { cells: vec![start.positions()?[0]], margins: vec![start_margin(&start)?], ..Default::default() }];
+    let mut cur: Vec<Rt2> = vec![start.into_rt2()];
+    let mut steps = 0u64;
+    for k in 0..opt {
+        let t = std::time::Instant::now();
+        let (succs, s) = expand(engines, &inside, prefer, &cur, k, from + k + 1, true)?;
+        steps += s;
+        let mut index: FxHashMap<((u64, u64), u32), u32> = FxHashMap::default();
+        let (mut rows, mut next, mut links, mut win_cells) = (Vec::new(), Layer::default(), Vec::new(), FxHashMap::default());
+        let (mut parent, mut kids) = (u32::MAX, FxHashSet::default());
+        for s in succs {
+            anyhow::ensure!(!s.win || k + 1 == opt, "a concrete win at f{} before the optimum f{opt}", k + 1);
+            let child = if s.win {
+                win_cells.entry(s.parent).or_insert(s.cell);
+                WIN
+            } else {
+                match index.entry((s.exact, s.cell)) {
+                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        rows.push(s.row.context("the first of an exact state keeps it")?);
+                        next.cells.push(s.cell);
+                        next.margins.push(s.margin);
+                        *e.insert(next.cells.len() as u32 - 1)
+                    }
+                }
+            };
+            if s.parent != parent {
+                (parent, kids) = (s.parent, FxHashSet::default());
+            }
+            if kids.insert(child) {
+                links.push((s.parent, child, s.byte));
+            }
+        }
+        eprintln!(
+            "[robust] layer {:3}: {} states -> {} inside W, {} links, {} winning; {steps} steps so far, {:.1} s, rss {:.1} GB",
+            k + 1,
+            cur.len(),
+            next.cells.len(),
+            links.len(),
+            win_cells.len(),
+            t.elapsed().as_secs_f64(),
+            crate::metrics::current_rss_gb()
+        );
+        let l = &mut layers[k as usize];
+        (l.links, l.win_cells) = (links, win_cells);
+        layers.push(next);
+        cur = rows;
+    }
+    drop(cur);
+    // Backward: each state's value, the best bottleneck from it to a win.
+    let mut value: Vec<Vec<i32>> = vec![Vec::new(); opt as usize + 1];
+    for k in (0..opt as usize).rev() {
+        let l = &layers[k];
+        let mut v = vec![-1i32; l.cells.len()];
+        for &(p, c, _) in &l.links {
+            let cv = if c == WIN { MARGIN_CAP as i32 } else { value[k + 1][c as usize] };
+            v[p as usize] = v[p as usize].max(cv);
+        }
+        for (x, m) in v.iter_mut().zip(&l.margins) {
+            if *x >= 0 {
+                *x = (*x).min(m.0.min(m.1) as i32);
+            }
+        }
+        value[k] = v;
+    }
+    let best = value[0][0];
+    anyhow::ensure!(best >= 0, "no concrete path wins at f{opt} in the robust layers");
+    // Forward: the first child of the largest value.
+    let (mut inputs, mut cells, mut p) = (Vec::new(), vec![layers[0].cells[0]], 0u32);
+    for k in 0..opt as usize {
+        let l = &layers[k];
+        let lo = l.links.partition_point(|e| e.0 < p);
+        let hi = lo + l.links[lo..].partition_point(|e| e.0 == p);
+        let val = |c: u32| if c == WIN { MARGIN_CAP as i32 } else { value[k + 1][c as usize] };
+        // `max_by_key` keeps the LAST maximum: reversed, the first.
+        let &(_, c, byte) = l.links[lo..hi].iter().rev().max_by_key(|e| val(e.1)).context("a state on the path without a link")?;
+        inputs.push(byte);
+        if c == WIN {
+            cells.push(l.win_cells[&p]);
+            break;
+        }
+        cells.push(layers[k + 1].cells[c as usize]);
+        p = c;
+    }
+    anyhow::ensure!(inputs.len() == opt as usize, "the robust path does not win at f{opt}");
+    let robust = Witness { inputs, cells };
+    // Per frame, the largest margin any optimal path has there (a state
+    // with a value is on one): where it equals the bottleneck, no path
+    // escapes it.
+    let reach: Vec<u16> = layers.iter().zip(&value).map(|(l, v)| l.margins.iter().zip(v).filter(|(_, &x)| x >= 0).map(|(m, _)| m.0.min(m.1)).max().unwrap_or(0)).collect();
+    let states: usize = layers.iter().map(|l| l.cells.len()).sum();
+    let nlinks: usize = layers.iter().map(|l| l.links.len()).sum();
+    drop(layers);
+    drop(value);
+    eprintln!("[robust] {states} states, {nlinks} links over {opt} layers, {steps} steps, {:.1} s, rss {:.1} GB", t0.elapsed().as_secs_f64(), crate::metrics::current_rss_gb());
+    let a = margin_profile(engines, &inside, from, first)?;
+    let b = margin_profile(engines, &inside, from, &robust)?;
+    println!("[robust] frame, first witness x y, robust x y, best of any optimal path: margins (px) inside the sets that win at f{opt}, cap {}", px(MARGIN_CAP));
+    for (f, (m, n)) in a.iter().zip(&b).enumerate() {
+        let diff = if first.inputs[f] != robust.inputs[f] { format!("  input {} -> {}", first.inputs[f], robust.inputs[f]) } else { String::new() };
+        println!("[robust] f{f:03} {:.4} {:.4}  {:.4} {:.4}  {:.4}{diff}", px(m.0), px(m.1), px(n.0), px(n.1), px(reach[f]));
+    }
+    let (ma, fa, xa) = bottleneck(&a);
+    let (mb, fb, xb) = bottleneck(&b);
+    anyhow::ensure!(mb as i32 == best, "the robust path's replayed bottleneck {mb} is not the DP's {best}");
+    println!("[robust] bottleneck: first witness {:.4} px at f{fa} ({xa}); robust {:.4} px at f{fb} ({xb})", px(ma), px(mb));
+    println!("[robust] robust optimum {} inputs {}", robust.inputs.len(), robust.inputs_text());
+    Ok(robust)
+}
+
 /// How much of the concrete search `solve` runs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Concrete {
@@ -1195,7 +1494,8 @@ pub struct Solved {
 /// the `[gate]` fingerprints (over (shape, key, cell), independent of
 /// scheduling). With `save`, writes the UI's arc pass: `level0.marks.bin`
 /// (remainder-free marks), `arc.marks.bin` (arc-marked nodes), `arc.txt`
-/// and the witness.
+/// and the witness. `robust`: the witness is `robust_search`'s.
+#[allow(clippy::too_many_arguments)]
 pub fn solve(
     dir: &std::path::Path,
     level: crate::abstraction::Level,
@@ -1204,6 +1504,7 @@ pub fn solve(
     want_marks: bool,
     save: Option<&std::path::Path>,
     prefer: Option<&[u8]>,
+    robust: bool,
 ) -> anyhow::Result<Solved> {
     use crate::frame::{id_layer, mark_row, save_marks, MarkRow, Visited};
     use celeste_engine::runtime2::mix64;
@@ -1299,12 +1600,19 @@ pub fn solve(
     // The concrete search reads W and the node keys, not the graph (GBs).
     drop(graph);
     crate::metrics::mem_phase("arc: marks for the next level, graph dropped");
-    let found = match (concrete, arc) {
-        (Concrete::None, _) | (_, None) => None,
-        (c, Some(f)) => concrete_search(level, horizon, &NodeKeys::new(keys), &w, f, c == Concrete::Full, prefer)?,
-    };
+    let mut found = None;
+    if let (Concrete::AtBound | Concrete::Full, Some(f)) = (concrete, arc) {
+        let engines = Engines::new()?;
+        let node = NodeKeys::new(keys);
+        found = concrete_search(&engines, level, horizon, &node, &w, f, concrete == Concrete::Full, prefer)?;
+        if let Some(wt) = &found {
+            println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), wt.inputs_text());
+            if robust {
+                found = Some(robust_search(&engines, level, horizon, &node, &w, prefer, wt)?);
+            }
+        }
+    }
     if let Some(wt) = &found {
-        println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), wt.inputs_text());
         if let Some(out) = save {
             wt.save(&out.join("witness.txt"))?;
         }

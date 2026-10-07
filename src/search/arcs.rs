@@ -290,6 +290,33 @@ impl Region {
             xs.get(i).is_some_and(|s| s.lo <= x)
         })
     }
+    /// The maximal x segment through `(x, y)` inside the set (`None`: the
+    /// point is outside).
+    pub fn x_run(&self, x: u32, y: u32) -> Option<Seg> {
+        let xs = self.slab_at(y)?;
+        let i = xs.partition_point(|s| s.hi <= x);
+        xs.get(i).copied().filter(|s| s.lo <= x)
+    }
+    /// The maximal y segment through `(x, y)` inside the set: the run of
+    /// touching slabs around `y` whose x sets all hold `x`.
+    pub fn y_run(&self, x: u32, y: u32) -> Option<Seg> {
+        let i = self.slabs.partition_point(|s| s.hi <= y);
+        let holds = |j: usize| {
+            let start = if j == 0 { 0 } else { self.slabs[j - 1].end };
+            self.xs[start as usize..self.slabs[j].end as usize].iter().any(|s| s.lo <= x && x < s.hi)
+        };
+        if i >= self.slabs.len() || self.slabs[i].lo > y || !holds(i) {
+            return None;
+        }
+        let (mut lo, mut hi) = (i, i);
+        while lo > 0 && self.slabs[lo - 1].hi == self.slabs[lo].lo && holds(lo - 1) {
+            lo -= 1;
+        }
+        while hi + 1 < self.slabs.len() && self.slabs[hi].hi == self.slabs[hi + 1].lo && holds(hi + 1) {
+            hi += 1;
+        }
+        Some(Seg { lo: self.slabs[lo].lo, hi: self.slabs[hi].hi })
+    }
     /// The union of `pieces`, canonical (one sweep over y). `pieces` is
     /// left in an unspecified order.
     pub fn from_pieces(pieces: &mut [Piece], scratch: &mut Vec<Seg>) -> Region {
@@ -434,6 +461,27 @@ mod tests {
             for &x in &probes {
                 for &y in &probes {
                     assert_eq!(r.contains(x, y), inside(x, y), "({x}, {y})");
+                }
+            }
+            // x_run / y_run: the maximal runs through a point, against `inside`.
+            for &x in &probes {
+                for &y in &probes {
+                    let (xr, yr) = (r.x_run(x, y), r.y_run(x, y));
+                    assert_eq!(xr.is_some(), inside(x, y));
+                    assert_eq!(yr.is_some(), inside(x, y));
+                    if let (Some(a), Some(b)) = (xr, yr) {
+                        assert!(a.lo <= x && x < a.hi && b.lo <= y && y < b.hi);
+                        // Inside throughout (every probe in it; the pieces'
+                        // bounds are probes), outside just past either end.
+                        for &v in &probes {
+                            assert!(!(a.lo <= v && v < a.hi) || inside(v, y), "x run at ({x}, {y}) holds {v}");
+                            assert!(!(b.lo <= v && v < b.hi) || inside(x, v), "y run at ({x}, {y}) holds {v}");
+                        }
+                        assert!(a.lo == 0 || !inside(a.lo - 1, y), "x run at ({x}, {y}) is maximal below");
+                        assert!(a.hi == CIRCLE || !inside(a.hi, y), "x run at ({x}, {y}) is maximal above");
+                        assert!(b.lo == 0 || !inside(x, b.lo - 1), "y run at ({x}, {y}) is maximal below");
+                        assert!(b.hi == CIRCLE || !inside(x, b.hi), "y run at ({x}, {y}) is maximal above");
+                    }
                 }
             }
             // Canonical: the same set from the pieces in another order.

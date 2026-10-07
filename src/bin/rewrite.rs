@@ -78,6 +78,13 @@ enum Command {
         /// TAS. Every input is still tried; only WHICH optimum is found.
         #[arg(long)]
         prefer: Option<String>,
+        /// After the concrete optimum, the MOST ROBUST path of the same
+        /// length (`arc_dp::robust_search`): the one whose least margin -
+        /// how far the player's x or y remainder can move while it still
+        /// wins at the optimum - is largest. It becomes the witness; both
+        /// margin profiles are printed (`[robust]`).
+        #[arg(long)]
+        robust: bool,
     },
     /// ONE forward pass at ONE level, exactly as the search runs it, with the
     /// per-frame timing line. The profiling entry point for the forward.
@@ -484,7 +491,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Search { to, ceiling, level, checkpoint_dir, room, win_at, no_witness, save_marks, prefer } => {
+        Command::Search { to, ceiling, level, checkpoint_dir, room, win_at, no_witness, save_marks, prefer, robust } => {
             let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
             use celeste_rust::search::arc_dp::{solve, Concrete};
             std::env::set_var("CELESTE_START_ROOM", &room);
@@ -541,7 +548,7 @@ fn main() -> Result<()> {
                 };
                 // Every level saves its marks (the next overwrites): the search can end
                 // at a coarser level when its try at the bound finds the witness.
-                let s = solve(&dir, lvl, horizon, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref())?;
+                let s = solve(&dir, lvl, horizon, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref(), robust)?;
                 let wall = t0.elapsed().as_secs_f64();
                 let Some(bound) = s.arc else {
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
