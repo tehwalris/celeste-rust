@@ -1,5 +1,50 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# Fitting the big rooms: arc-phase memory and tree bytes, 2026-10-07 (quick, 16 threads, branch `fit-big`)
+
+Measured on a machine shared with the overnight queue: times are noisy,
+sizes and `[mem]` lines (anonymous RSS at each phase boundary, its peak over
+the phase; VmHWM includes the mapped runs, which the kernel reclaims) are not.
+
+Room (2,3) gemskip any%, `--ceiling 137 --level r0sxhn,r0sxh`, L1 137,5 (level
+0: 56.5M visited, 18.6M marked nodes, 373M edges; level 1: 22.9M nodes, 178M
+edges). Every `[gate]` line of both levels identical before/after, witness 136.
+
+| | before | after |
+|---|---|---|
+| level-0 runs (edge records) | 8.27 GB (v4, 8.8 B a record) | 4.00 GB (v5, ~4 B an edge) |
+| level-0 frames | 3.97 GB (format 9) | 3.03 GB (10), 0.78 GB trimmed (`CELESTE_TRIM_ROWS=1`) |
+| level-0 tree per visited state | 216 B | 124 B, 85 B trimmed |
+| raw records per frame (f070) | 43.7M | 28.8M (buffers deduplicated) |
+| level-0 arc phase, anon peak | 14.2 GB (graph build 12.1, W 4.4) | 8.1 GB (graph 5.4, W 0.9) |
+| level-0 arc phase, VmHWM | 20.2 GB | 9.3 GB |
+| level-1 arc phase, anon peak / held through the concrete search | 17.6 / 17.0 GB | 7.2 / 2.6 GB |
+
+Room (1,0) f0-f44: runs 433 -> 292 MB, frames 319 -> 176 MB (69 MB trimmed);
+the pinned gates unchanged.
+
+Room (5,1) nodiag, `--ceiling 121 --level r0sxhn,r0sxh`, L1 121,5,
+`CELESTE_TRIM_ROWS=1`, `--memory 60G`: **OPTIMAL 119** (the community nodiag
+reference is 121), no diagonal dash, the room changes at f119 on a real
+PICO-8 (original cart). Before: OOM-killed at 62 GB in `arc_dp::load`, and
+a level-0 tree that filled the disk at f104.
+
+| phase | level 0 (r0sxhn) | level 1 (r0sxh, filtered) |
+|---|---|---|
+| forward | 1.018G visited, peak kept 62.5M (f100), anon 25.8 GB at the end, 37.6 GB at its widest wave (f101) | 192M visited, 11.2 GB |
+| tree | runs 125 GB + frames 18 GB = 140 B a state | 8.3 + 3.1 GB |
+| raw records per frame (f100) | 1.86G (3.3G at f99 without the dedup: 53 GB at 16 B) | |
+| graph | 73.4M nodes, 2.135G edges: 29.4 GB | 183.6M nodes, 2.081G edges: 36.0 GB |
+| backward | 256 s, 99.3M spans over 21.1M sets, +6 GB | 288 s, 344M spans over 1.4M sets, +4.8 GB |
+| arc phase anon peak | 41.2 GB | 48.1 GB |
+| concrete search | bound f100, no win at it (26k steps) | bound f119, a win in 355 steps |
+
+The old code would have held 12 B an edge of parts plus 16 B of CSR order
+beside the 12 B graph (~60 GB at 2.1G edges) and ~114 B a node of hash maps.
+What still limits the room is the disk: a late frame's raw records (tens of
+GB, deleted at its compaction) count in the disk guard's "three more
+frames".
+
 # Rooms (1,0), (2,0), (3,0), 2026-09-17 (release, 32 threads)
 
 Held ladder `CELESTE_LADDER="r0sxh,r1sxh,...,r15sxh,rxsx"` throughout.
