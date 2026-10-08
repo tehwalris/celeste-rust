@@ -734,7 +734,7 @@ fn read_witness(path: &Path) -> Result<Witness> {
             Ok((num(f)?, dir.to_string()))
         })
         .collect::<Result<_>>()?;
-    let tas = match (head.get("db"), head.get("prologue"), head.get("seeds")) {
+    let mut tas = match (head.get("db"), head.get("prologue"), head.get("seeds")) {
         (None, None, None) => None,
         (Some(db), Some(prologue), Some(seeds)) => {
             let (db_name, _category) = db.split_once(' ').with_context(|| format!("{name}: `db {db}` is not `db NAME CATEGORY`"))?;
@@ -758,6 +758,14 @@ fn read_witness(path: &Path) -> Result<Witness> {
         path_xy.push(if t[1] == "-" { None } else { Some((num(t[1])?, num(t[2])?)) });
     }
     anyhow::ensure!((1..=inputs.len() + 1).contains(&path_xy.len()), "{name}: {} inputs, {} positions", inputs.len(), path_xy.len());
+    // The database's count is to the EXIT: a file may carry inputs past it
+    // (100% TAS23: 71 inputs, exits after 68), and the path ends there.
+    if let Some(t) = tas.as_mut() {
+        let exit = path_xy.len() as u32 - 1;
+        if exit > t.prologue {
+            t.frames = t.frames.min(exit - t.prologue - 1);
+        }
+    }
     let label = head.get("label").map_or_else(|| format!("concrete witness inside the winning sets, a win at f{}", inputs.len()), |l| l.to_string());
     Ok(Witness { label, inputs, path: path_xy, dashes, tas })
 }
