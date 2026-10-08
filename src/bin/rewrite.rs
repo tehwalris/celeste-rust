@@ -512,6 +512,7 @@ fn main() -> Result<()> {
                 // used as it is; a finer level's tree is filtered for this
                 // horizon - delete it to change the horizon or the levels.
                 let t = std::time::Instant::now();
+                celeste_rust::frame::check_level_minus_one(&dir, steps)?;
                 let first_win = match celeste_rust::frame::tree_first_win_through(&dir, steps)? {
                     Some(w) => {
                         eprintln!("[search] {}: the tree reaches step {steps}", dir.display());

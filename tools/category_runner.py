@@ -6,14 +6,16 @@ and verify every result end to end.
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
-"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"; "reuse": a level-0 tree to reuse); re-read
+"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"; "reuse": a level-0 tree to reuse;
+"to": a horizon H instead of the reference, `--to H` with level -1 at H - a
+lower horizon cuts far more, and a refutation is a result: no win by H); re-read
 before every job, so jobs can be appended while it runs; a job whose key is
 already in OUTDIR/results.jsonl is skipped.
 
 Per job:
  1. the reference: the community TAS replayed in the ORIGINAL cart behind the
     room's prologue (the earliest offset around `offset` that exits);
- 2. `rewrite search --ceiling REF --prefer <the community TAS>` with the
+ 2. `rewrite search --ceiling REF` (or `--to H`) `--prefer <the community TAS>` with the
     category's mode (CELESTE_NODIAG / CELESTE_GEMSKIP / CELESTE_HUNDRED) and
     the level -1 filter if `l1` (retried without it if its table refuses);
  3. our witness replayed in the original cart (must exit at the optimum; no
@@ -137,14 +139,17 @@ def run(job, outdir, binary):
         # PICO-8 (the tool is a reimplementation): its count is the reference.
         level = int(name.rstrip("m")) // 100 if name.endswith("m") else None
         ok, n, _, _ = uct(level, f"{DB}/classic/{cat}/{entry['file']}", cat) if level else (False, None, None, None)
-        if not ok:
+        if not ok and not job.get("to"):
             return {**res, "status": "the community TAS does not exit in the original cart nor in UniversalClassicTas"}
         prologue = job["offset"]
-        ref = prologue + n
-        res["ref_source"] = "UniversalClassicTas only (does not finish on a real PICO-8)"
+        ref = prologue + n if ok else None
+        res["ref_source"] = "UniversalClassicTas only (does not finish on a real PICO-8)" if ok else "none: the community TAS finishes nowhere"
     res["ref"], res["prologue"] = ref, prologue
     prefer = os.path.join(jd, "prefer.txt")
     open(prefer, "w").write(",".join(map(str, [0] * prologue + dbin)))
+    # The horizon: the reference (a refutation is an error), or `to`.
+    horizon = job.get("to") or ref
+    res["horizon"] = horizon
     # 2. the search
     def search(l1):
         env = dict(os.environ, **mode_env(cat), **job.get("env", {}))
@@ -153,7 +158,7 @@ def run(job, outdir, binary):
         env["CELESTE_CONCRETE_BALLOON_SEEDS"] = seeds
         if l1:
             # Level -1 counts search steps: two a frame under the split frame.
-            steps = ref * (2 if env.get("CELESTE_SPLIT_FRAME") else 1)
+            steps = horizon * (2 if env.get("CELESTE_SPLIT_FRAME") else 1)
             env["CELESTE_LEVEL_MINUS_ONE"] = f"{steps},5"
         log = os.path.join(jd, "search.log")
         tree = os.path.join(jd, "tree")
@@ -163,7 +168,7 @@ def run(job, outdir, binary):
         if job.get("reuse") and os.path.isdir(job["reuse"]):
             os.makedirs(tree)
             shutil.move(job["reuse"], os.path.join(tree, "level00"))
-        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--ceiling", str(ref), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", os.path.join(jd, "tree")]
+        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--to" if job.get("to") else "--ceiling", str(horizon), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", os.path.join(jd, "tree")]
         t = time.time()
         with open(log, "w") as f:
             rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=M, timeout=job.get("timeout", 4 * 3600)).returncode
@@ -179,7 +184,12 @@ def run(job, outdir, binary):
     res["search_s"] = round(secs)
     peak = re.findall(r"peak ([\d.]+) GB", log)
     res["peak_gb"] = peak[-1] if peak else None
+    res["arc_bounds"] = [int(b) for b in re.findall(r"ARC BOUND: no win before f(\d+)", log)]
     m = re.search(r"OPTIMAL win frame: (\d+)", log)
+    if rc == 0 and not m and job.get("to") and re.search(r"^(REFUTED: no win by f|no concrete win by f)", log, re.M):
+        # A proof about the game: no win by the horizon.
+        shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+        return {**res, "status": f"no win by f{horizon}"}
     if rc != 0 or not m:
         shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
         tail = [l for l in log.splitlines() if l.strip()][-3:]
@@ -234,10 +244,10 @@ def run(job, outdir, binary):
                 shutil.copy(saved, os.path.join(up, entry["file"]))
                 res["upload"] = os.path.join(up, entry["file"])
                 break
-    res["status"] = "IMPROVED" if opt < ref else ("tie" if opt == ref else "WORSE?")
+    res["status"] = "no reference" if ref is None else "IMPROVED" if opt < ref else ("tie" if opt == ref else "WORSE?")
     res["verified"] = (e == opt) and not res.get("diagonal_dashes") and res.get("uct_ours", "").startswith("finished") and res.get("berry", True)
     # 5. the UI
-    if opt < ref:
+    if ref is not None and opt < ref:
         try:
             paths = os.path.join(jd, "paths")
             env = dict(os.environ, TAS_CATEGORY=cat, REPLAY_ARGS=" ".join(replay_args(cat)))

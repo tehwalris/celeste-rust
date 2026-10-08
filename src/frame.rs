@@ -1171,12 +1171,9 @@ fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::Cos
     static TABLE: std::sync::OnceLock<Option<(u32, crate::trace::level_minus_one::CostToGo)>> = std::sync::OnceLock::new();
     TABLE
         .get_or_init(|| {
-            let s = std::env::var("CELESTE_LEVEL_MINUS_ONE").ok()?;
+            let (h, sp) = level_minus_one_env()?;
             // The table measures the EXIT: unsound for a position win.
             assert!(win_rect().is_none(), "CELESTE_LEVEL_MINUS_ONE: the table measures the room exit; this room's win is a position");
-            let (h, sp) = s.split_once(',').expect("CELESTE_LEVEL_MINUS_ONE=\"H,S\"");
-            let h: u32 = h.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE horizon");
-            let sp: i32 = sp.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE speed bound (px per frame)");
             let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
             let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             let t = std::time::Instant::now();
@@ -1196,6 +1193,39 @@ fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::Cos
         })
         .as_ref()
         .map(|(h, t)| (*h, t))
+}
+
+/// `CELESTE_LEVEL_MINUS_ONE="H,S"`: the horizon (in search steps) and the speed bound.
+fn level_minus_one_env() -> Option<(u32, i32)> {
+    let s = std::env::var("CELESTE_LEVEL_MINUS_ONE").ok()?;
+    let (h, sp) = s.split_once(',').expect("CELESTE_LEVEL_MINUS_ONE=\"H,S\"");
+    let h: u32 = h.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE horizon");
+    let sp: i32 = sp.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE speed bound (px per frame)");
+    Some((h, sp))
+}
+
+/// A tree whose forward ran under level -1 at H holds no row that cannot
+/// exit by H, so it serves horizons up to H only: reused (or resumed) for a
+/// larger one it would miss every win the filter dropped. `<dir>/
+/// level_minus_one.txt` records the smallest H any run on the tree filtered
+/// at; this refuses a horizon past it, or a filter below this run's horizon,
+/// and records this run's filter. Called before a tree is read or extended.
+pub fn check_level_minus_one(dir: &std::path::Path, horizon: u32) -> Result<()> {
+    let path = dir.join("level_minus_one.txt");
+    let recorded: Option<u32> = match std::fs::read_to_string(&path) {
+        Ok(s) => Some(s.trim().parse().with_context(|| path.display().to_string())?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| path.display().to_string()),
+    };
+    if let Some(h) = recorded {
+        anyhow::ensure!(horizon <= h, "{}: the tree was filtered by level -1 at step {h}; it cannot serve step {horizon} (delete it)", dir.display());
+    }
+    if let Some((h, _)) = level_minus_one_env() {
+        anyhow::ensure!(horizon <= h, "CELESTE_LEVEL_MINUS_ONE at step {h} is below the horizon, step {horizon}");
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(&path, format!("{}\n", recorded.map_or(h, |r| r.min(h))))?;
+    }
+    Ok(())
 }
 
 /// THE TIME BAND (an estimate, not a bound; for the level -1 probe): can a
