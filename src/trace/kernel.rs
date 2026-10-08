@@ -232,24 +232,28 @@ fn successor_regions(
     Ok((a.iy..=b.iy).flat_map(|iy| (a.ix..=b.ix).map(move |ix| Some(Region { ix, iy }))).collect())
 }
 
-/// THE NO-PLAYER PHASE'S RANGES. One trace covers the whole spawn, so a field
-/// varying over it would be an unbounded input. No input matters before the
-/// player exists, so run the phase fully pinned and bound each numeric field
-/// to the hull it took; a lane outside declines.
+/// THE NO-PLAYER PHASE'S RANGES. One trace covers a whole stretch of the
+/// spawn, so a field varying over it would be an unbounded input. No input
+/// matters before the player exists, so run the phase fully pinned and bound
+/// each numeric field to the hull it took, PER SHAPE: the phase may change
+/// shape before the player appears (room (3,0): the start's shape lasts one
+/// frame, and a later spawn shape traced unbounded made every fall floor
+/// "near", 2^12 outcomes). A shape the chain never visits (a RESPAWN after a
+/// death: the same spawn, the other objects reset or gone) gets the spawn
+/// object's hull by type (`NoPlayer::bounds`). A lane outside declines.
 fn no_player_ranges(
     it: &mut super::interp::Interp<'static, super::domain::Symbolic>,
     reset: &'static full_moon::ast::Ast,
     fr: &'static full_moon::ast::Ast,
     start: &super::state::State<super::domain::Symbolic>,
     opts: crate::abstraction::Level,
-) -> Result<Bounds> {
+) -> Result<NoPlayer> {
     use super::iface::Conc;
     use super::shapes;
     if shapes::player_path(start).is_some() {
-        return Ok(Vec::new());
+        return Ok(NoPlayer::default());
     }
-    let shape = start.shape()?;
-    let mut hull: std::collections::BTreeMap<super::iface::Path, (i32, i32)> = Default::default();
+    let mut hulls: Vec<(super::heap::Shape, std::collections::BTreeMap<super::iface::Path, (i32, i32)>)> = Vec::new();
     let mut st = start.clone();
     // Read before `rebase` blanks them; the next trace pins them back.
     let mut consts = shapes::field_constants(start, &it.d, &opts)?;
@@ -257,10 +261,18 @@ fn no_player_ranges(
     // concretely (an `rnd` draw) bounds nothing. The cap stops a runaway.
     let mut ended = false;
     for _ in 0..240 {
+        let shape = st.shape()?;
+        let at = match hulls.iter().position(|(s, _)| *s == shape) {
+            Some(i) => i,
+            None => {
+                hulls.push((shape, Default::default()));
+                hulls.len() - 1
+            }
+        };
         for (p, c) in &consts {
             if let Conc::Num(v) = c {
                 let r = v.as_raw_u32() as i32;
-                let e = hull.entry(p.clone()).or_insert((r, r));
+                let e = hulls[at].1.entry(p.clone()).or_insert((r, r));
                 *e = (e.0.min(r), e.1.max(r));
             }
         }
@@ -268,7 +280,7 @@ fn no_player_ranges(
         let pin: Vec<(super::iface::Path, Conc)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
         let Ok(f) = super::verify::trace_frame(it, reset, fr, st.clone(), &roots, &pin, &[], true, &[]) else { break };
         let [o] = f.outs.as_slice() else { break };
-        if o.shape != shape || shapes::player_path(&o.st).is_some() {
+        if shapes::player_path(&o.st).is_some() {
             ended = true;
             break;
         }
@@ -279,9 +291,50 @@ fn no_player_ranges(
         st = next;
     }
     if !ended {
-        return Ok(Vec::new());
+        return Ok(NoPlayer::default());
     }
-    Ok(hull.into_iter().filter(|(_, (lo, hi))| lo < hi).collect())
+    // The spawn object's fields over the whole chain, by the path below it.
+    let mut spawn: std::collections::BTreeMap<super::iface::Path, (i32, i32)> = Default::default();
+    let spawn_objs = super::widen::objects_of_type(start, "player_spawn");
+    for (_, h) in &hulls {
+        for (p, &(lo, hi)) in h {
+            if let Some(o) = spawn_objs.iter().find(|o| p.starts_with(o)) {
+                let e = spawn.entry(p[o.len()..].to_vec()).or_insert((lo, hi));
+                *e = (e.0.min(lo), e.1.max(hi));
+            }
+        }
+    }
+    Ok(NoPlayer {
+        shapes: hulls.into_iter().map(|(s, h)| (s, h.into_iter().filter(|(_, (lo, hi))| lo < hi).collect())).collect(),
+        spawn: spawn.into_iter().filter(|(_, (lo, hi))| lo < hi).collect(),
+    })
+}
+
+/// The no-player phase's bounds: per shape of the start's chain, and the
+/// spawn object's (by the path below the object) for any other.
+#[derive(Default)]
+struct NoPlayer {
+    shapes: Vec<(super::heap::Shape, Bounds)>,
+    spawn: Bounds,
+}
+
+impl NoPlayer {
+    /// A no-player state's bounds, by path.
+    fn bounds(&self, st: &super::state::State<super::domain::Symbolic>) -> Result<Bounds> {
+        let shape = st.shape()?;
+        if let Some((_, b)) = self.shapes.iter().find(|(s, _)| *s == shape) {
+            return Ok(b.clone());
+        }
+        let mut out = Bounds::new();
+        for o in super::widen::objects_of_type(st, "player_spawn") {
+            for (suffix, r) in &self.spawn {
+                let mut p = o.clone();
+                p.extend(suffix.iter().cloned());
+                out.push((p, *r));
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// A frame's bounds by ENGINE cell, for the lowering's decide and pruning.
@@ -379,13 +432,16 @@ pub fn room_constant_lattice(
 
     let sk = key(&start)?;
     let start_key = sk.clone();
-    let no_player_shape = start.shape()?;
     let no_player = match region_grid() {
         Some(_) => no_player_ranges(&mut it, reset, fr, &start, opts)?,
-        None => Vec::new(),
+        None => NoPlayer::default(),
     };
     if std::env::var_os("CELESTE_LATTICE_TRACE").is_some() {
-        eprintln!("[walk] no-player ranges: {:?}", no_player.iter().map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>());
+        let show = |b: &Bounds| b.iter().map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>();
+        for (i, (_, b)) in no_player.shapes.iter().enumerate() {
+            eprintln!("[walk] no-player shape {i} ranges: {:?}", show(b));
+        }
+        eprintln!("[walk] the spawn object's ranges: {:?}", show(&no_player.spawn));
     }
     lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, &opts)?);
     reps.insert(sk.clone(), start.clone());
@@ -453,11 +509,8 @@ pub fn room_constant_lattice(
                         g.bounds(&pl, r).into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect()
                     }
                     (None, None, _) => Vec::new(),
-                    // The spawn hull, on ITS shape only (bounds are by path).
-                    (Some(_), None, None) if st.shape()? == no_player_shape => {
-                        no_player.iter().filter(|(p, _)| roots.iter().any(|q| q == p)).cloned().collect()
-                    }
-                    (Some(_), None, None) => Vec::new(),
+                    // The no-player phase's hull (bounds are by path).
+                    (Some(_), None, None) => no_player.bounds(&st)?.into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect(),
                     (g, r, pl) => bail!("walk node {r:?} of a shape {} a player under grid {g:?}", if pl.is_some() { "with" } else { "without" }),
                 };
                 let rebase = if *k == start_key { None } else { Some(rep_constants[k].clone()) };
