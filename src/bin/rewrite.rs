@@ -34,9 +34,9 @@ enum Command {
     /// remainder transfer, filtered by the previous level's arc-marked
     /// nodes; the rotation graph's winning sets backward from the wins
     /// (`arc_dp::solve`), whose optimum is a LOWER BOUND on the game's (no
-    /// win refutes the horizon); then the concrete search inside the winning
-    /// sets: a try at the bound, and at the LAST level the whole search. The
-    /// first concrete win is the optimum, its inputs written to
+    /// win refutes the horizon); then, at the LAST level only, the concrete
+    /// search inside the winning sets (a try at the bound, then breadth-first).
+    /// The first concrete win is the optimum, its inputs written to
     /// `<checkpoint-dir>/witness_frame_F.txt`.
     Search {
         /// The horizon: every frame up to it is searched.
@@ -486,7 +486,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Search { to, ceiling, level, checkpoint_dir, room, win_at, no_witness, save_marks, prefer } => {
             let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
-            use celeste_rust::search::arc_dp::{solve, Concrete};
+            use celeste_rust::search::arc_dp::solve;
             std::env::set_var("CELESTE_START_ROOM", &room);
             if let Some(xy) = &win_at {
                 std::env::set_var("CELESTE_WIN_AT_XY", xy);
@@ -532,15 +532,13 @@ fn main() -> Result<()> {
                 // `f` counts search steps (`ui_export::parse_log` reads this line).
                 eprintln!("[search] level {li} ({lvl}): forward to f{steps} in {:.1} s; first win {first_win:?}", t.elapsed().as_secs_f64());
                 celeste_rust::metrics::mem_phase("forward");
-                // THE ARC PHASE and the concrete search (at a coarser level
-                // only the try at the bound).
-                let concrete = match (no_witness, last) {
-                    (true, _) => Concrete::None,
-                    (false, true) => Concrete::Full,
-                    (false, false) => Concrete::AtBound,
-                };
-                // Every level saves its marks (the next overwrites): the search can end
-                // at a coarser level when its try at the bound finds the witness.
+                // THE ARC PHASE, and the concrete search at the LAST level only:
+                // a coarser level's bound is loose wherever its objects are
+                // (gemskip-nodiag 2800m h192: 379 s of a 450 s search went to a
+                // fruitless try at level 0's bound f186; the optimum was 191),
+                // and the finer level decides the optimum anyway.
+                let concrete = last && !no_witness;
+                // Every level saves its marks (the next overwrites).
                 let s = solve(&dir, lvl, steps, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref())?;
                 let wall = t0.elapsed().as_secs_f64();
                 let Some(bound) = s.arc else {

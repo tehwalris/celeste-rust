@@ -1063,7 +1063,6 @@ pub fn concrete_search(
     node: &NodeKeys,
     w: &Winning,
     bound: u32,
-    breadth_first: bool,
     prefer: Option<&[u8]>,
 ) -> anyhow::Result<Option<Witness>> {
     use crate::frame::{wins_of, Block};
@@ -1208,9 +1207,6 @@ pub fn concrete_search(
             let cells = std::iter::once(start_cell).chain(cx.path.iter().map(|&(_, c)| c)).collect();
             return Ok(Some(Witness { inputs, cells }));
         }
-        if !breadth_first {
-            return Ok(None);
-        }
     }
     // Per layer k >= 1, each state's (parent index in layer k-1, input, cell).
     let mut back: Vec<Vec<(u32, u8, u32)>> = Vec::new();
@@ -1345,17 +1341,6 @@ pub fn concrete_search(
     Ok(None)
 }
 
-/// How much of the concrete search `solve` runs.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Concrete {
-    None,
-    /// The depth-first try at the bound only (a coarse level of the objects
-    /// ladder; no win sends the search on to the finer level).
-    AtBound,
-    /// The whole search: the try at the bound, then breadth-first.
-    Full,
-}
-
 /// What the arc phase of a search found (`solve`).
 pub struct Solved {
     /// The optimum over the rotation graph, a lower bound on the game's, in
@@ -1379,7 +1364,7 @@ pub fn solve(
     dir: &std::path::Path,
     level: crate::abstraction::Level,
     horizon: u32,
-    concrete: Concrete,
+    concrete: bool,
     want_marks: bool,
     save: Option<&std::path::Path>,
     prefer: Option<&[u8]>,
@@ -1408,7 +1393,7 @@ pub fn solve(
     for (f, fs) in tree_frames(dir, horizon)?.into_iter().enumerate() {
         files.extend(fs.into_iter().map(|(seq, file)| (f as u32, seq, file)));
     }
-    let keyed = concrete != Concrete::None && arc.is_some();
+    let keyed = concrete && arc.is_some();
     let mut node_key: Vec<u64> = Vec::with_capacity(g.len());
     let mut keys: Vec<(u64, (u64, u64), u32, u32)> = Vec::with_capacity(if keyed { g.len() } else { 0 });
     let mut rows: Vec<MarkRow> = Vec::new();
@@ -1481,8 +1466,8 @@ pub fn solve(
     drop(graph);
     crate::metrics::mem_phase("arc: marks for the next level, graph dropped");
     let found = match (concrete, arc) {
-        (Concrete::None, _) | (_, None) => None,
-        (c, Some(f)) => concrete_search(level, horizon, &NodeKeys::new(keys), &w, f, c == Concrete::Full, prefer)?,
+        (true, Some(f)) => concrete_search(level, horizon, &NodeKeys::new(keys), &w, f, prefer)?,
+        _ => None,
     };
     if let Some(wt) = &found {
         println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), wt.inputs_text());

@@ -419,6 +419,12 @@ on you. One kernel set is resident, the process-global level's; a call at
 another level drops it and builds that level's. Fused graphs are dropped
 after assembly unless `CELESTE_KERNEL_EXPLAIN`.
 
+**The concrete search runs at the LAST level only** (2026-10-08). A coarser
+level's try at its bound almost never wins (its bound is loose wherever its
+objects are) and the finer level decides the optimum anyway: gemskip-nodiag
+2800m at h192 spent 379 s of a 450 s search in level 0's fruitless try at
+f186 (optimum 191, found by level 1 in 0.4 s).
+
 **The objects ladder, and when it is needed.** Validation (plans/results.md,
 "The arc pipeline"): rooms (1,0) 99, (4,2) 71, (5,3) 79, (3,3) 172 and
 (7,0) 84 reproduce their known optima, each witness replayed on a real
