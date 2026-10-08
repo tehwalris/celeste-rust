@@ -1066,6 +1066,87 @@ details summary:focus-visible {
 .paths-info .dash {
   font-weight: 700;
 }
+
+/* The buttons each path holds (inputs.ts): per path a name, a UCT-style
+   pad and the strip of frames around the one shown. */
+.inputs {
+  flex: 1 1 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 2px 0 4px;
+}
+.irow {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.iname {
+  flex: 0 0 44px;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+  padding-top: 3px;
+  min-width: 0;
+}
+.iname b {
+  font-size: 13px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.iname span {
+  font-size: 10px;
+  color: var(--muted);
+}
+.iname span.frozen {
+  color: var(--ink);
+  font-weight: 600;
+}
+.ipad {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: repeat(3, 22px) 4px repeat(2, 22px);
+  grid-template-rows: repeat(2, 22px);
+  gap: 2px;
+  padding-top: 2px;
+}
+.ik {
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--muted);
+  background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px var(--line);
+  user-select: none;
+}
+.ik.k-up { grid-area: 1 / 2; }
+.ik.k-left { grid-area: 2 / 1; }
+.ik.k-down { grid-area: 2 / 2; }
+.ik.k-right { grid-area: 2 / 3; }
+.ik.k-jump { grid-area: 1 / 5 / 3 / 6; }
+.ik.k-dash { grid-area: 1 / 6 / 3 / 7; }
+.ik.on {
+  background: var(--c);
+  color: #0c0c0d;
+  box-shadow: none;
+}
+.ik.fresh {
+  box-shadow: 0 0 0 2px #fff;
+}
+.ipad[data-state="frozen"] .ik,
+.ipad[data-state="none"] .ik {
+  opacity: 0.35;
+}
+.iroll {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: block;
+}
 .level-strip {
   display: flex;
   gap: 2px;

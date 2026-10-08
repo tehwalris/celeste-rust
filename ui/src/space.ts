@@ -29,6 +29,7 @@ import { defaultHorizon, fmtCompact, fmtInt, horizonOrder, horizonVerdict, ladde
 import { levelCss, levelRamp, marksRamp, heightBand, bandColor, bandHalo, movingColor, HEIGHT_BANDS, rgbCss, levelColor, LEVELS, type RGB } from "./color";
 import { addSparse, OURS, REFERENCE, RoomRenderer, sparseMax, type DrawPath, type HeatLayer, type Scene } from "./room";
 import { button, chips, clear, el, icon, scrubber, select, show } from "./ui";
+import { inputPanel } from "./inputs";
 import { Instances, View3D } from "./view3d";
 import type { View } from "./main";
 import { exportScale, openVideoDialog, savePng, type Pacing, type Range, type VideoPlan } from "./export";
@@ -118,6 +119,8 @@ export function spaceView(run: Run, onState: () => void): View {
     pacing: "uniform" as Pacing,
     /** Draw the run's concrete witness over the room (when it has one). */
     trail: true,
+    /** Show the buttons each path holds around the frame (inputs.ts). */
+    keys: true,
     /** Real pacing: the playhead in uniform-step units (a float). */
     pos: 0,
     playing: false,
@@ -569,7 +572,9 @@ export function spaceView(run: Run, onState: () => void): View {
       }),
     );
   }
-  const stageFoot = el("div", { class: "stage-foot" }, [...(pathRows.length ? [pathsEl] : []), probeEl, scaleEl]);
+  // The buttons each path holds at the frame, ours first as in the readout.
+  const inputs = inputPanel([...pathRows].reverse().map((r) => ({ w: r.w, name: r.name, sub: r.filled ? "search" : "database", color: r.color })));
+  const stageFoot = el("div", { class: "stage-foot" }, [...(pathRows.length ? [pathsEl, inputs.root] : []), probeEl, scaleEl]);
   const stageCol = el("section", { class: "space-stage card" }, [stageHead, stage, stageFoot]);
 
   // ---- DOM: the transport (play, step, scrub) ------------------------------------------
@@ -714,6 +719,19 @@ export function spaceView(run: Run, onState: () => void): View {
     },
     { label: run.reference ? "paths" : "witness" },
   );
+  const keysChips = chips<boolean>(
+    [
+      { value: true, label: "Show", title: "the buttons each path holds at the frame, and the frames around it (one lane per button)" },
+      { value: false, label: "Hide", title: "no input display" },
+    ],
+    st.keys,
+    (k) => {
+      st.keys = k;
+      render();
+      onState();
+    },
+    { label: "inputs" },
+  );
   // The exports: the room's grid alone in the Full look, at an integer
   // scale - the still on screen as a PNG, the traversal as a video.
   const exportRow = el("div", { class: "chips export-row" }, [
@@ -721,7 +739,7 @@ export function spaceView(run: Run, onState: () => void): View {
     button("Save image", () => void saveImage(), "small", "the room as a PNG: this step, Full look, no overlays"),
     button("Export video…", () => exportVideo(), "small", "the traversal as a video: Full look, uniform or real-time pacing"),
   ]);
-  const optionCard = el("section", { class: "card options" }, [grainChips.root, lookChips.root, mode3Chips.root, ...(pathRows.length ? [trailChips.root] : []), speedChips.root, pacingChips.root, exportRow]);
+  const optionCard = el("section", { class: "card options" }, [grainChips.root, lookChips.root, mode3Chips.root, ...(pathRows.length ? [trailChips.root, keysChips.root] : []), speedChips.root, pacingChips.root, exportRow]);
 
   // ---- DOM: the legend --------------------------------------------------------------
   const key = (color: string, label: string, cls = "") => el("span", { class: "key" }, [el("i", { class: cls, style: color ? `background:${color}` : undefined }), label]);
@@ -760,6 +778,7 @@ export function spaceView(run: Run, onState: () => void): View {
       el("span", { class: "key path-key" }, [el("i", { class: r.filled ? "" : "ring", style: `--c:${rgbCss(r.color)}` }), r.w.label]),
     ),
     ...(pathRows.length ? [el("p", { class: "note", text: "A path (Room, Passes): the player's 8x8 box at the frame shown (ours filled, the reference outlined), the three frames before it fading, the route as a ribbon with a dot per frame (wide spacing = fast), an arrow where a dash starts." })] : []),
+    ...(pathRows.length ? [el("p", { class: "note", text: "Inputs: the buttons held on the frame shown - the input the game read to get there - as a pad (J jump, X dash), and the frames around it, one lane per button, the frame shown outlined. A fresh press of jump or dash (what the game acts on) is bright with a white edge, a held one dim. Hatched: the two frames frozen after a dash, which ignore their input." })] : []),
   ]);
   const help = el("details", { class: "help" }, [
     el("summary", { text: "How to read this" }),
@@ -1133,6 +1152,7 @@ export function spaceView(run: Run, onState: () => void): View {
     const on = drawPaths.length > 0 && st.trail;
     if (on) renderer.paths(canvas, drawPaths, f);
     pathsInfo(on ? f : null);
+    inputs.set(drawPaths.length > 0 && st.keys ? f : null);
   }
 
   let renderToken = 0;
@@ -1140,6 +1160,7 @@ export function spaceView(run: Run, onState: () => void): View {
     const token = ++renderToken;
     // Only the Room and Passes grains draw the paths (drawTrail).
     pathsInfo(null);
+    inputs.set(null);
     // A scrub / jump moved the step under the float playhead: follow it.
     if (!st.playing) st.pos = (byPass() ? passCum(st.h) : stepCum(st.h))[Math.max(0, byPass() ? st.pass : st.step)] ?? 0;
     const hr = run.horizons[st.h];
@@ -1669,6 +1690,7 @@ export function spaceView(run: Run, onState: () => void): View {
     if (st.speed !== 1) p.set("s", String(st.speed));
     if (st.pacing !== "uniform") p.set("pc", st.pacing);
     if (drawPaths.length && !st.trail) p.set("w", "0");
+    if (drawPaths.length && !st.keys) p.set("k", "0");
     return p.toString();
   }
   function apply(p: URLSearchParams) {
@@ -1685,6 +1707,7 @@ export function spaceView(run: Run, onState: () => void): View {
     st.speed = Number.isInteger(s) && s >= 0 && s < SPEEDS.length ? s : 1;
     st.pacing = p.get("pc") === "real" ? "real" : "uniform";
     st.trail = p.get("w") !== "0";
+    st.keys = p.get("k") !== "0";
     const tl = timeline(st.h);
     if (byPass()) {
       const pv = p.has("p") ? Number(p.get("p")) : tl.length - 1;
@@ -1702,6 +1725,7 @@ export function spaceView(run: Run, onState: () => void): View {
     speedChips.set(st.speed);
     pacingChips.set(st.pacing);
     trailChips.set(st.trail);
+    keysChips.set(st.keys);
     layout();
   }
 

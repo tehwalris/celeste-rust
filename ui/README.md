@@ -222,7 +222,20 @@ a yellow edge around ours) with a dark dot per frame (wide spacing =
 fast), and an arrow
 where each dash starts, faint until it has happened. Under the room, a
 line says where each is at the frame (`f53 · ours 29,66 dash → · TAS29
-27,56`). Room (3,3) at h172 (from the repo root: it loads cart/ for the
+27,56`). Under that line, the **inputs** (the options card's `inputs` row; `k=0`
+in the hash hides them; `src/inputs.ts`): per path - ours, then the
+database TAS - a UCT-style pad (the arrows, J jump, X dash) lit with the
+buttons held at the frame shown, and a strip of the frames around it, one
+lane per button, the frame shown outlined, a frame number every 10. The
+byte at frame f is `inputs[f-1]`, the one the game read to reach the box
+drawn at f (replay.py's convention), so a dash marked at f has X held at
+f. A fresh press of jump or dash (held, and not on the last frame the
+player read input) is bright with a white edge, a held one dim. The two
+frames after each dash start are hatched and labelled `frozen`: the cart's
+`freeze=2` skips `_update`, so their input does nothing. They come from
+the `dashes` list; the orb's `freeze=10` (room (5,2)) is not marked.
+
+Room (3,3) at h172 (from the repo root: it loads cart/ for the
 tiles):
 
 ```bash
