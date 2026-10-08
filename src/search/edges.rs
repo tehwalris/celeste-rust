@@ -1031,7 +1031,7 @@ impl EdgeGraph {
     }
 
     /// Every edge of frame `frame`'s runs.
-    fn scan(&self, frame: u32, mut f: impl FnMut(Edge)) {
+    pub fn scan(&self, frame: u32, mut f: impl FnMut(Edge)) {
         for runs in &self.runs {
             for run in runs.get(frame as usize).into_iter().flatten() {
                 run.decode_from(0, |t, s, r| {

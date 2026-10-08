@@ -291,6 +291,42 @@ pub fn trim(path: &Path) -> Result<u64> {
     Ok(before.saturating_sub((16 + header_bytes.len() + keys.len()) as u64))
 }
 
+/// One column of a checkpoint file as stored (`FrameFile::col_view`), for
+/// readers that walk the raw data without building a block.
+pub enum ColView<'a> {
+    U(AV),
+    N(&'a [u8]),
+    I(&'a [u8]),
+    V(&'a [u8]),
+    S(&'a [u8]),
+}
+
+impl ColView<'_> {
+    /// Row `row`'s value as `av_code`.
+    pub fn code(&self, row: usize) -> Result<u64> {
+        use celeste_engine::runtime2::{av_code, ival_code, num_code};
+        let w = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        Ok(match self {
+            ColView::U(v) => av_code(*v),
+            ColView::N(b) => num_code(w(b, row * N_BYTES)),
+            ColView::I(b) => ival_code(w(b, row * I_BYTES), w(b, row * I_BYTES + 4)),
+            ColView::V(b) => av_code(decode_v(&b[row * V_BYTES..(row + 1) * V_BYTES])?),
+            ColView::S(b) => av_code(decode_s(b[row])?),
+        })
+    }
+
+    /// Bytes a row of this column takes on disk.
+    pub fn disk_bytes(&self) -> usize {
+        match self {
+            ColView::U(_) => 0,
+            ColView::N(_) => N_BYTES,
+            ColView::I(_) => I_BYTES,
+            ColView::V(_) => V_BYTES,
+            ColView::S(_) => S_BYTES,
+        }
+    }
+}
+
 /// One checkpoint file, mapped, its header decoded; loads gather row ranges
 /// into a fresh block.
 pub struct FrameFile {
@@ -385,6 +421,24 @@ impl FrameFile {
             cells[start as usize..(start + len) as usize].fill(cell);
         }
         cells
+    }
+
+    /// The number of columns (one per structure cell).
+    pub fn n_cols(&self) -> usize {
+        self.header.cols.len()
+    }
+
+    /// Column `c` as stored. A trimmed file has no columns.
+    pub fn col_view(&self, c: usize) -> ColView<'_> {
+        let width = self.header.width as usize;
+        let at = |o: u64, bytes: usize| &self.map[self.data + o as usize..self.data + o as usize + width * bytes];
+        match &self.header.cols[c] {
+            ColMeta::U(v) => ColView::U(*v),
+            ColMeta::N(o) => ColView::N(at(*o, N_BYTES)),
+            ColMeta::I(o) => ColView::I(at(*o, I_BYTES)),
+            ColMeta::V(o) => ColView::V(at(*o, V_BYTES)),
+            ColMeta::S(o) => ColView::S(at(*o, S_BYTES)),
+        }
     }
 
     pub fn key_at(&self, row: u32) -> (u64, u64) {

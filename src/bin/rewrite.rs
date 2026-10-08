@@ -346,6 +346,18 @@ enum Command {
         #[arg(long)]
         horizon: u32,
     },
+    /// DIAGNOSTIC: a finished forward tree re-encoded, as drafts, in
+    /// candidate formats for the level-0 graph (states bit-packed per shard,
+    /// dense ids, edges by target or source); sizes and a few timings
+    /// printed, nothing written. plans/format-study.md.
+    FormatStudy {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        to: u32,
+        #[arg(long, default_value_t = 4)]
+        threads: usize,
+    },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed. Per
     /// shape: rows, every varying column's distinct value count (capped at
     /// `cap`), named, and the distinct (spd.x, spd.y) pairs.
@@ -1465,6 +1477,9 @@ fn main() -> Result<()> {
             println!("transfers per pair: {hist:?}");
             println!("pairs whose transfers are exactly x-pieces x y-pieces: {product} ({:.1}%); x part constant {x_const} ({:.1}%), y part constant {y_const} ({:.1}%)", 100.0 * product as f64 / n_pairs as f64, 100.0 * x_const as f64 / n_pairs as f64, 100.0 * y_const as f64 / n_pairs as f64);
             println!("distinct transfer sets {}, x sets {}, y sets {} (frame table: {} pairs)", sets.len(), xsets.len(), ysets.len(), pairs.len());
+        }
+        Command::FormatStudy { level_dir, to, threads } => {
+            celeste_rust::search::format_study::run(std::path::Path::new(&level_dir), to, threads)?;
         }
         Command::ColCensus { level_dir, frame, cap, cell, erase, every } => {
             use celeste_engine::runtime2::{av_code, num_code, Cell2, Col, AV};

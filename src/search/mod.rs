@@ -9,6 +9,7 @@
 //!   * `arc_dp`     - THE SEARCH: winning sets, optimum, concrete search
 //!   * `known`      - a known solution checked against every pruning step
 //!   * `pos_graph`  - player-position cells and the position graph
+//!   * `format_study` - `rewrite format-study`: a tree sized in draft formats
 //!   * `inspect`    - rows read by named fields, for the diagnostics
 //!   * `ui_export`  - `rewrite export-ui`: a finished run -> the web UI's data
 pub mod arc_dp;
@@ -17,6 +18,7 @@ pub mod arcs;
 pub mod checkpoint;
 pub mod door;
 pub mod edges;
+pub mod format_study;
 pub mod inspect;
 pub mod known;
 pub mod pos_graph;
