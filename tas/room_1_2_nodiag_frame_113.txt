@@ -1,0 +1,7 @@
+# Room (1,2) "1800m", No Diagonal Dashes: exit during frame 113 (2026-10-08), OPTIMAL.
+# Community nodiag TAS18: 118 in our counting. CELESTE_NODIAG=1, no level -1 (it refuses p),
+# rewrite search --level r0sxhnp,r0sxhn,r0sxh,r0sx (the reach-filtered ladder): --to 112 REFUTED at r0sxh;
+# --to 118: r0sxh arc bound 113, the try at the bound wins (176 steps). Original cart on PICO-8 exits f113.
+# UniversalClassicTas: this alignment does not finish there (UCT is a pixel off PICO-8 on the platforms);
+# one frame later it does: clean save 87 inputs = 86f against TAS18's 91 = 90f. Upload: tas/tasdatabase/nodiag/upload/TAS18.tas
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,2,2,2,2,2,2,18,2,2,34,34,2,2,2,2,2,2,2,2,2,2,2,2,0,0,1,17,2,16,0,0,0,0,0,16,2,2,2,2,1,36,17,1,1,1,1,1,2,2,2,2,16,1,1,1,1,1,33,36,36,36,1,1,1,1,1,1,1,1,16,1,1,17,36,1,1,1,1,1,1,0,2,2,16,1

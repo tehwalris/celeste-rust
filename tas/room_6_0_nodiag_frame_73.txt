@@ -1,0 +1,7 @@
+# Room (6,0) "700m", No Diagonal Dashes: exit during frame 73 (2026-10-08), OPTIMAL.
+# Community nodiag TAS7: 74 in our counting. CELESTE_SPLIT_FRAME=1 CELESTE_NODIAG=1, no level -1,
+# rewrite search --level r0sxhfp,r0sxh,r0sx (the reach-filtered ladder) on one kept r0sxhfp tree (step 148):
+# --to 69 REFUTED at r0sxh; --to 74: bounds f68 (r0sxhfp), f73 (r0sxh), the try at 73 wins in 134 steps.
+# Verified: original cart on PICO-8 exits f73, no diagonal dash; UniversalClassicTas clean save
+# 50 inputs = 49f against TAS7's 51 = 50f. Upload: tas/tasdatabase/nodiag/upload/TAS7.tas
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,17,2,1,1,36,2,2,2,2,2,36,1,0,16,0,0,36,2,2,2,36,0,0,2,2,2,18,2,0,0,16,2,2,0,0,0,16,0,0,16,0,36,36,0,0,0,0,0,0

@@ -212,11 +212,16 @@ def run(job, outdir, binary):
     # offset, but a witness may press on the frame before (the player exists
     # and updates on the frame it is created: room (2,1) nodiag, 2026-10-08),
     # so that cut is tried too, and UCT decides. A cut never drops a press.
+    # Last, a frame before the prologue: UCT computes in Lua doubles, not
+    # 16.16, and on room (1,2)'s platforms its player is a pixel off PICO-8's
+    # from frame 55 (TAS18 too); our 113 does not finish there at the PICO-8
+    # alignment, one frame later it does (2026-10-08: the file one zero
+    # longer, one frame slower).
     level = int(name.rstrip("m")) // 100 if name.endswith("m") else None
     if level:
         ok_db, n_db, _, _ = uct(level, f"{DB}/classic/{cat}/{entry['file']}", cat)
         res["uct_db"] = f"{'finished' if ok_db else 'NOT finished'} {n_db} inputs"
-        for cut in [prologue] + ([lead] if lead < prologue else []):
+        for cut in [prologue] + ([lead] if lead < prologue else []) + [prologue - 1]:
             if any(ours[:cut]):
                 continue
             mine = os.path.join(jd, f"ours-{entry['file']}")

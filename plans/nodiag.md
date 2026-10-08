@@ -29,9 +29,57 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (3,2) 2000m | 128 | 152 (TAS20, offset 31, seeds 0) | **148 - 4 FASTER** | `rewrite search --level r0sxhn,r0sxh` with `arc_dp::reach` (L-1 152,5, `CELESTE_TRIM_ROWS=1`): bounds 133, 148; witness at 148 in 446 steps; level 0 13 min, level-1 forward 71 min, the arc phases ~25 min; peak 75 GB (the level-1 arc phase; below); exits f148 in the original cart under TAS20's seeds (0,0,0,0; not under 0.5 or PICO-8's rnd); UCT: 120f -> 116f. `tas/room_3_2_nodiag_frame_148.txt` |
 | (1,1) 1000m | 94 | 94 (TAS10) | - | (validation, not run) |
 | (6,1) 1500m | 89 | 93 (TAS15, offset 25) | **92 - 1 FASTER** (UCT: 66f against 67f) | 2026-10-08, split frame, `r0sxhn`, level -1 (186,5) steps, one kept tree: arc bound f90 (no concrete win at 90); `--to 91`: no concrete win inside W (exhaustive, 153k steps); `--to 92`: the breadth-first search's first win at 92 (983 s with the tree reused). Jumps canonicalized; original cart (seeds 0,0) exits f92; UCT 67 inputs = 66f. `tas/room_6_1_nodiag_frame_92.txt`, `tas/tasdatabase/nodiag/upload/TAS15.tas` |
-| (6,0) 700m | 70 | 74 (TAS7, offset 23) | - (no win by 68) | 2026-10-08, split frame, `r0sxhfp`, no level -1 (its table did not finish in 17 min): the forward reached step 136 (730M visited, 15-20M states a step, the door 18 GB, peak 26.9 GB) before the 30 GB cap ended it near step 140; first remainder-free win at step 128. On that tree: arc bound f68 = the horizon (step 136), no concrete win by 68 (35k steps, exhaustive). Resuming to step 140 ran out of memory rebuilding the door. No transfer was refused in the whole run. Open: 69-74 |
-| (1,2) 1800m | 103 | 118 (TAS18, offset 27) | - (no win by 111) | 2026-10-08, `r0sxhnp` (level -1 refused with `p`): forward to f118 in 169 s, arc bound 107 (no concrete win at 107). The ladder `r0sxhnp,r0sxhn` ran out of memory in level 1's arc phase (116.8M marked nodes, 1.52G edges: almost every node of the exact-platform level can still win with 11 frames of slack). Counted up at level 0 with a kept tree: no concrete win by 110 (1.36M concrete steps, 1.2k states a layer at most), none by 111 (7.4M steps, 8.5k states a layer); at 112 the breadth-first search grew 1.25x a layer to 48k states at layer 81 of 112 (6 min a layer) and was stopped; 114 reached 66k states at layer 59, doubling. Open: 112-118 |
+| (6,0) 700m | 70 | 74 (TAS7, offset 23) | **73 OPTIMAL - 1 FASTER** (UCT: 49f against 50f) | 2026-10-08, split frame, the reach-filtered ladder `r0sxhfp,r0sxh,r0sx` (no level -1) on one kept `r0sxhfp` tree: that forward to step 148 (h74) took 2526 s, 884M visited, at most 20M kept a step, the door 21.8 GB, peak 28.4 GB (under a 55 GB cap; it had stopped at the 30 GB cap near step 140 before); `--to 69` REFUTED at `r0sxh` (126 s); `--to 74`: bounds f68 (`r0sxhfp`, no concrete win at 68), f73 (`r0sxh`, 856k marked nodes), the try at 73 wins in 134 steps (248 s). Original cart on PICO-8 exits f73, no diagonal dash; UCT 50 inputs = 49f. `tas/room_6_0_nodiag_frame_73.txt`, `tas/tasdatabase/nodiag/upload/TAS7.tas` |
+| (1,2) 1800m | 103 | 118 (TAS18, offset 27) | **113 OPTIMAL - 5 FASTER** (UCT: 86f against 90f) | 2026-10-08, the reach-filtered ladder `r0sxhnp,r0sxhn,r0sxh,r0sx` (level -1 refused with `p`) on one kept level-0 tree: `--to 112` REFUTED at `r0sxh` (192 s); `--to 118`: bounds 107, 109, 113, the try at 113 wins in 176 steps (359 s, peak 11.6 GB). Original cart on PICO-8 exits f113, no diagonal dash. UCT does not finish it at the PICO-8 alignment (a pixel off on the platforms, below); one frame later it does: 87 inputs = 86f. `tas/room_1_2_nodiag_frame_113.txt`, `tas/tasdatabase/nodiag/upload/TAS18.tas`. Before (`r0sxhnp` alone, count-up): no concrete win by 111; 112 grew 1.25x a layer |
 | (2,1) 1100m | 82 | 87 (TAS11, offset 24) | **85 - 2 FASTER** (UCT: 61f against 62f) | 2026-10-08, `r0sxhnp,r0sxhn` (level -1 refused with `p`): r0sxhnp bound 82 (no concrete win at 82, 14k steps), r0sxhn (platform exact, filtered) bound 85, witness at 85 (2.2k steps); 697 s, 13.7 GB. Original cart (seeds 0, 0.8905): exits f85. Our first press is on frame 24, the frame the player is created (the community file's earliest exiting offset is 24 zeros): the upload starts there, 62 inputs = 61f in UCT, `tas/tasdatabase/nodiag/upload/TAS11.tas`, `tas/room_2_1_nodiag_frame_85.txt` |
+
+## 700m and 1800m finished: the reach ladder down to exact objects (2026-10-08, branch `nodiag-finish`)
+
+Both rooms were open because the objects' widening was refuted only by
+the concrete count-up, which grows per frame of slack. What closed them is
+the objects ladder with the reach filter (`3e324e5`) run down to EXACT
+objects, `--level <level 0>,...,r0sxh,r0sx`, on one kept level-0 tree,
+with the horizon counted from the bound rather than set at the reference:
+each finer forward is filtered by the coarser level's REACHED nodes and
+is tiny, and at `r0sxh` (only the held buttons widened) the arc bound is
+the answer, so a horizon below it is REFUTED by the arcs themselves and a
+horizon at or above it finds the witness at the bound in a few hundred
+steps.
+
+- **1800m (1,2): OPTIMAL 113, TAS18 118.** Level 0 `r0sxhnp` (forward to
+  f118 169 s, 5.7 GB tree), bound 107. `--to 112`: level 1 `r0sxhn`
+  (platforms exact) forward 136k visited in 8.5 s, bound 109, no win at
+  109 by the try (41.7k steps); level 2 `r0sxh` (floors exact too) 22k
+  visited, every state gone by f91: REFUTED (192 s). Level 1 alone would
+  not have done it: its concrete breadth-first search at h112 had the SAME
+  layer counts as level 0's (layers 61-63: 13,878, 14,320, 13,216 states
+  at both) - the exact platform cut nothing the arcs had not; the exact
+  floors did. `--to 118`: bounds 107, 109, 113 (level 1 4.6M visited,
+  level 2 2.35M), the try at 113 wins in 176 steps; 359 s, peak 11.3 GB.
+- **700m (6,0): OPTIMAL 73, TAS7 74.** The `r0sxhfp` split-frame forward
+  to step 148 (h74) under a 55 GB cap: 2526 s, 884M visited, door 21.8 GB,
+  peak 28.4 GB, in one run (the earlier forward was stopped at step 137
+  and its resume ran out of memory rebuilding the door under 30 GB). Bound f68 (the try: no win
+  at 68, 6.5k steps). `--to 69`: level 1 `r0sxh` (fruit and platforms
+  exact) 4.7k visited, every state gone by step 108 (f54): REFUTED
+  (126 s). `--to 74`: level 1 2.57M visited, 856k marked nodes, bound f73,
+  the try at 73 wins in 134 steps (248 s; the level-0 arc phase's VmHWM
+  36.8 GB with the mapped runs, 15.9 GB anonymous). Level -1 was not
+  needed.
+- **The concrete search runs one input per class** (`25a4879`): a frame
+  that reads only some buttons has the same successors for every input
+  agreeing on them (`RefEngine::frame_reads`; the freeze and spawn frames
+  read none, up/down matter only where a dash starts). Room (1,2) h111 at
+  level 0: 7.37M -> 1.45M concrete steps, 688 -> 236 s, every layer equal.
+- **UCT is not PICO-8 on the platforms.** UniversalClassicTas computes in
+  Lua doubles (not 16.16); in room (1,2) its player is a pixel off PICO-8's
+  from frame 55 while riding a platform, for TAS18 as for ours (UCT
+  capture against the original-cart replay, frame by frame). Our 113
+  does not finish in UCT at the PICO-8 alignment (the file's first input
+  on the player's first frame); one frame later (the witness's own leading
+  zero kept) it does: 87 inputs = 86f against TAS18's 91 = 90f, where
+  PICO-8 counts 85f. `category_runner` now tries that cut last. 700m's
+  file finishes at the PICO-8 alignment (50 inputs = 49f).
 
 ## The platform rooms and the split frame (2026-10-08, branch `nodiag-platforms`)
 
@@ -231,5 +279,5 @@ database files and ours - finish and clean-save unchanged: 600m 65 -> 64 inputs
 (64f -> 63f), 1700m 64 -> 62 (63f -> 61f), 2900m 82 -> 77 (81f -> 76f), the
 same counts as the real PICO-8. Upload files, as UCT's clean save writes them
 (trailing commas; 600m's one balloon seed written as `[0,]`):
-`tas/tasdatabase/nodiag/upload/TAS{6,17,29}.tas` (and, verified the same way, TAS{22,26,28}.tas on 2026-10-06 and TAS20.tas on 2026-10-08). To submit: one Discord
+`tas/tasdatabase/nodiag/upload/TAS{6,17,29}.tas` (and, verified the same way, TAS{22,26,28}.tas on 2026-10-06 and TAS{20,7,18}.tas on 2026-10-08). To submit: one Discord
 message `!uploadtas classic nodiag` with the three files attached.

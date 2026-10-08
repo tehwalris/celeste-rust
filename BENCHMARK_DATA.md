@@ -1,5 +1,36 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# Nodiag 700m and 1800m by the reach ladder down to exact objects, 2026-10-08 night (release, 16 threads, branch `nodiag-finish`)
+
+Shared machine (another agent's search alongside): times are noisy; counts
+and peaks are not. Each level-0 tree built once and kept; `[fwd]` peaks
+are VmHWM.
+
+Room (1,2) nodiag (`CELESTE_NODIAG=1 CELESTE_TRIM_ROWS=1`, no level -1):
+
+| run | level 0 `r0sxhnp` | level 1 `r0sxhn` | level 2 `r0sxh` | answer | wall |
+|---|---|---|---|---|---|
+| forward to f118, `--no-witness` | 169 s, tree 5.7 GB | | | bound 107 | |
+| `--to 112` | 14.0M marked, 273M edges | 136k visited, 8.5 s, bound 109 | 22k visited, none past f90 | REFUTED | 192 s |
+| `--to 113` | 15.0M marked, 299M edges | 288k marked, bound 109 | 1,422 marked, bound 113 | OPTIMAL 113 (184 steps) | 149 s |
+| `--to 118` | 20.5M marked, 449M edges | 4.6M visited, 32 s | 2.35M visited, 15 s, bound 113 | OPTIMAL 113 (176 steps) | 359 s, peak 11.3 GB |
+
+The level-1 concrete breadth-first search at h112 (before the ladder went
+on): layers 61-63 had 13,878 / 14,320 / 13,216 states, exactly level 0's.
+
+Room (6,0) nodiag, split frame (`CELESTE_SPLIT_FRAME=1`, no level -1):
+`r0sxhfp` forward to step 148 (h74) 2526 s, 883.6M visited, at most 20.1M
+kept a step, door 21.8 GB at the end, peak 28.4 GB (55 GB cap). Its arc
+phase at h74: 61.3M marked nodes, 372M edges, VmHWM 36.8 GB (anonymous
+15.9 GB). `--to 69,r0sxhfp,r0sxh,r0sx`: level 1 4.7k visited, none past
+step 107: REFUTED in 126 s. `--to 74`: level 1 2.57M visited, 856k marked,
+bound f73, the try wins in 134 steps: OPTIMAL 73 in 248 s.
+
+The concrete search, one input per class of the buttons read (`25a4879`),
+room (1,2) `r0sxhnp --to 111` (kept tree): 7,373,494 -> 1,451,487 concrete
+steps, the breadth-first layers' sum 688 -> 236 s, every layer's counts
+identical (no concrete win by 111, past layer 89 in both).
+
 # The objects ladder filtered by REACH, and the nodiag big rooms, 2026-10-08 (release, 16 threads, branch `nodiag-big`)
 
 Shared machine (another search and another agent's runs alongside; load

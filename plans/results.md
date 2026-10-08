@@ -123,6 +123,19 @@ file's seeds (plans/nodiag.md). The level-1 arc phase peaked at 75 GB.
 every spring is 2.4x the states by f65) and the horizon at the answer, not
 at the reference - level -1's cut moves with it.
 
+**The platform rooms, by the reach ladder down to exact objects
+(2026-10-08, branch `nodiag-finish`).** `--level <level 0>,...,r0sxh,r0sx`
+on one kept level-0 tree: the filtered finer forwards are tiny, and at
+`r0sxh` the arc bound is the answer, so a lower horizon is REFUTED by the
+arcs and a higher one finds the witness at the bound. **(1,2) nodiag 113,
+five under TAS18's 118**: `r0sxhnp` bound 107, `r0sxhn` 109, `r0sxh` 113;
+`--to 112` REFUTED at `r0sxh`; the witness in 176 steps (359 s, 11.3 GB).
+**(6,0) nodiag 73, one under TAS7's 74** (split frame): `r0sxhfp` to step
+148 (42 min, 28.4 GB), bound f68; `r0sxh` bound f73, `--to 69` REFUTED;
+the witness in 134 steps. Both exit at the optimum in the original cart on
+PICO-8 and finish in UniversalClassicTas (1800m one frame later there:
+plans/nodiag.md).
+
 ## Caveats on what "optimal" means here
 
 - **Balloon rooms**: `rnd` is an interval at every level, so a confirmation is
