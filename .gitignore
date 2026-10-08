@@ -4,3 +4,4 @@
 perf.data*
 perf_*.data*
 checkpoints/
+__pycache__/
