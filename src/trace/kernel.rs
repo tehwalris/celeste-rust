@@ -254,42 +254,53 @@ fn no_player_ranges(
         return Ok(NoPlayer::default());
     }
     let mut hulls: Vec<(super::heap::Shape, std::collections::BTreeMap<super::iface::Path, (i32, i32)>)> = Vec::new();
-    let mut st = start.clone();
-    // Read before `rebase` blanks them; the next trace pins them back.
-    let mut consts = shapes::field_constants(start, &it.d, &opts)?;
-    // Only a phase run to its END bounds anything; one that cannot run
-    // concretely (an `rnd` draw) bounds nothing. The cap stops a runaway.
+    // The chain runs with the fly fruit EXACT (unknown, its `fly` and `y`
+    // fork every frame into outcomes, and the chain needs one), and the
+    // fruit's fields, unknown at a fruit level, bound nothing there.
+    let fruit = std::mem::replace(&mut it.d.fruit_unknown, false);
+    let chain_opts = crate::abstraction::Level { fruit: false, ..opts };
     let mut ended = false;
-    for _ in 0..240 {
-        let shape = st.shape()?;
-        let at = match hulls.iter().position(|(s, _)| *s == shape) {
-            Some(i) => i,
-            None => {
-                hulls.push((shape, Default::default()));
-                hulls.len() - 1
+    let run = (|| -> Result<()> {
+        let mut st = start.clone();
+        // Read before `rebase` blanks them; the next trace pins them back.
+        let mut consts = shapes::field_constants(start, &it.d, &chain_opts)?;
+        // Only a phase run to its END bounds anything; one that cannot run
+        // concretely (an `rnd` draw) bounds nothing. The cap stops a runaway.
+        for _ in 0..240 {
+            let shape = st.shape()?;
+            let at = match hulls.iter().position(|(s, _)| *s == shape) {
+                Some(i) => i,
+                None => {
+                    hulls.push((shape, Default::default()));
+                    hulls.len() - 1
+                }
+            };
+            let fruit_objs = if fruit { super::widen::objects_of_type(&st, "fly_fruit") } else { Vec::new() };
+            for (p, c) in &consts {
+                if let (Conc::Num(v), false) = (c, fruit_objs.iter().any(|o| p.starts_with(o))) {
+                    let r = v.as_raw_u32() as i32;
+                    let e = hulls[at].1.entry(p.clone()).or_insert((r, r));
+                    *e = (e.0.min(r), e.1.max(r));
+                }
             }
-        };
-        for (p, c) in &consts {
-            if let Conc::Num(v) = c {
-                let r = v.as_raw_u32() as i32;
-                let e = hulls[at].1.entry(p.clone()).or_insert((r, r));
-                *e = (e.0.min(r), e.1.max(r));
+            let roots = shapes::state_paths(&st)?;
+            let pin: Vec<(super::iface::Path, Conc)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
+            let Ok(f) = super::verify::trace_frame(it, reset, fr, st.clone(), &roots, &pin, &[], true, &[]) else { return Ok(()) };
+            let [o] = f.outs.as_slice() else { return Ok(()) };
+            if shapes::player_path(&o.st).is_some() {
+                ended = true;
+                return Ok(());
             }
+            consts = shapes::field_constants(&o.st, &it.d, &chain_opts)?;
+            let heap = shapes::heap_constants(&o.st, &it.d);
+            let mut next = o.st.clone();
+            shapes::rebase(&mut next, &mut it.d, &heap)?;
+            st = next;
         }
-        let roots = shapes::state_paths(&st)?;
-        let pin: Vec<(super::iface::Path, Conc)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
-        let Ok(f) = super::verify::trace_frame(it, reset, fr, st.clone(), &roots, &pin, &[], true, &[]) else { break };
-        let [o] = f.outs.as_slice() else { break };
-        if shapes::player_path(&o.st).is_some() {
-            ended = true;
-            break;
-        }
-        consts = shapes::field_constants(&o.st, &it.d, &opts)?;
-        let heap = shapes::heap_constants(&o.st, &it.d);
-        let mut next = o.st.clone();
-        shapes::rebase(&mut next, &mut it.d, &heap)?;
-        st = next;
-    }
+        Ok(())
+    })();
+    it.d.fruit_unknown = fruit;
+    run?;
     if !ended {
         return Ok(NoPlayer::default());
     }

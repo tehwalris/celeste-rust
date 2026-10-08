@@ -115,8 +115,28 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   bodies. On the old finer rem rungs it merged nothing (the undecided
   `collide(player)` forks collected / not) and fanned out in room (6,0) (331
   trace states, cap 256). Collected-or-not after it flew away stays two
-  shapes by design (a collect refills the dash). Not yet run through the arc
-  search.
+  shapes by design (a collect refills the dash).
+- **With `n` (`r0sxhfn`, 2026-10-08)**: the fruit's atoms refuse merges, and
+  at `n` the countdowns are the unknown number too, so every floor's
+  `delay <= 0` was a fruit-like atom and kept its two paths apart (room
+  (3,0): 8192 trace states after the spawn frame's `foreach`; the level did
+  not build). A comparison READING a countdown field (`<name>.delay`,
+  `.timer`, `.hide_in`, `.hide_for`: `domain::COUNTDOWN_FIELDS`, the
+  interpreter's hint) mints a COUNTDOWN atom instead, three-valued as at `n`
+  without the fruit: merges select on it, the split pass splits what a row
+  stores, an escape is no fork, and the independent joins refuse it (a hull
+  would lose `state`/`collideable`'s correlation). And `may_answers` reads
+  an equality's ends unless an OPERAND reads an unknown (it used to give up
+  whenever the frame had any): a hidden floor's exact `state == 2` was
+  "both ways", and its solid side owed `collideable` false with the player
+  inside - a coverage gap at f42. Refuted like every flag, by the objects
+  ladder (`r0sxhfn,r0sxhn,r0sxh`) and the concrete search. `rewrite
+  arc-check` cannot run at an `f` level (the reference engine does not step
+  an unknown fruit; it reports the spawn frame's records as bad and runs out
+  of memory); `rewrite follow` with the community route agrees with the
+  `r0sxhfn` tree's keys through the spawn and the fruit taking off (f35)
+  to the end of a tree built to f46. Room (3,0) nodiag: bound 76 against
+  the optimum 93 (plans/nodiag.md).
 
 ## n: everything abstract except where the player overlaps (`FloorsPrecision::Near`) - CURRENT, the object default
 
@@ -184,7 +204,8 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   countdowns' `delay <= 0` atoms too. Room (2,1) `r0sxhnp` traced 354 states
   at the spawn (limit 256; `r0sxhn`: 5). Now (`Symbolic::countdown_atom`) a
   comparison of the unknown number is a COUNTDOWN atom wherever no fly
-  fruit is unknown (every unknown number is then a countdown): three-valued
+  fruit is unknown (every unknown number is then a countdown; with the fruit
+  unknown, one reading a countdown field: `f` above): three-valued
   as at `n` alone - no merge refusal, no independent join on it alone, no
   escape fork (an escape fork for a platform atom enumerates the countdown
   atoms it reads too, so its restriction reads none). Then the near floors'
@@ -199,6 +220,14 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   a lane is evaluated there and its owe fails; at `n` alone the merge
   selects and the split pass decides it per lane. Storing the computed value
   turns that into spurious states, which the concrete search refutes.
+  Since `p` met the equality's per-operand may-answers (`f`, "With `n`",
+  merged 2026-10-08): room (2,1) `r0sxhnp` keeps the same states through
+  the spawn (f24 21, f25 198) and fewer after (f26 938 against 1,266, f40
+  322,059 against 672,322; with only that change reverted, every count and
+  the ckhash equal the old ones); `--win-at 38,99 --to 45` still gives arc
+  optimum 37 and the same 37-input witness. The `state == 2` "both ways"
+  that change removed is the same kind of thing as the solid overlapped
+  floor above; whether it was the cause is not tested.
 
 ## Widened at every level (exact, or a stated caveat)
 

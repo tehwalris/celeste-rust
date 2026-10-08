@@ -221,6 +221,12 @@ pub trait Domain {
         false
     }
 
+    /// The next comparisons read a COUNTDOWN (the interpreter's hint, from
+    /// the field read: `COUNTDOWN_FIELDS`): an unknown number there mints a
+    /// countdown atom (`Symbolic::countdown_atom`) also with the fly fruit
+    /// unknown, where an unknown number may be the fruit's.
+    fn set_countdown_hint(&mut self, _on: bool) {}
+
     /// `__split_by_flr` of a literal interval: its integer fragments, run as
     /// separate trace states and rejoined when the call returns. `None`: an
     /// ordinary per-lane fork.
@@ -355,6 +361,11 @@ impl Domain for Concrete {
 
 // ---------------------------------------------------------------- symbolic
 
+/// The fields the cart counts down and compares with 0, a near level's
+/// unknown numbers (`widen::floor_timer_paths`, `widen::phase_paths`): a
+/// comparison reading one is a countdown's (`Domain::set_countdown_hint`).
+pub const COUNTDOWN_FIELDS: [&str; 4] = ["delay", "timer", "hide_in", "hide_for"];
+
 /// The tracing domain. Owns the graph it is building.
 #[derive(Default, Clone)]
 pub struct Symbolic {
@@ -376,6 +387,8 @@ pub struct Symbolic {
     pub platforms_unknown: bool,
     /// How many `Op::UnknownBool` atoms this frame handed out.
     pub unknown_atoms: u32,
+    /// `Domain::set_countdown_hint`.
+    countdown_hint: bool,
     /// `escaped_atom`'s memo, cleared with `unknown_atoms` (ids restart).
     pub escaped: rustc_hash::FxHashMap<NodeId, NodeId>,
     /// What each `both_values` fork was made for, for the kernel dump.
@@ -663,9 +676,13 @@ impl Symbolic {
                 (self.graph.fold(t, vec![ta, tb]), self.graph.fold(f, vec![fa, fb]))
             }
             // `a == b` may hold iff the ranges meet, and fail iff they are not
-            // one single number. Only without unknowns, where `Lo`/`Hi` are an
-            // interval number's ends.
-            Op::Eq if !self.unknowns() => {
+            // one single number. Only where neither operand reads an unknown
+            // (`Op::UnknownNum`/`UnknownBool`), so `Lo`/`Hi` are an interval
+            // number's ends. Per node, not per frame: with the fly fruit
+            // unknown a near floor's `state == 2` on an exact hidden floor
+            // gave both sides live, the solid one with the player inside
+            // (room (3,0) `r0sxhfn` f42, a coverage gap).
+            Op::Eq if !self.reads_unknown(&args) => {
                 let (alo, ahi) = (self.graph.fold(Op::Lo, vec![args[0]]), self.graph.fold(Op::Hi, vec![args[0]]));
                 let (blo, bhi) = (self.graph.fold(Op::Lo, vec![args[1]]), self.graph.fold(Op::Hi, vec![args[1]]));
                 let (meet_a, meet_b) = (self.graph.fold(Op::Le, vec![alo, bhi]), self.graph.fold(Op::Le, vec![blo, ahi]));
@@ -685,6 +702,11 @@ impl Symbolic {
             }
             _ => (yes, yes),
         }
+    }
+
+    /// Does any of `ns` read an unknown number or boolean atom?
+    fn reads_unknown(&self, ns: &[NodeId]) -> bool {
+        crate::trace::verify::cone(&self.graph, ns).into_iter().any(|n| matches!(self.graph.get(n).op, Op::UnknownNum | Op::UnknownBool(_)))
     }
 
     /// `a - r` where `a` is `r + c`: `c` EXACTLY (true in wrapping 16.16),
@@ -809,20 +831,24 @@ impl Symbolic {
     pub fn unknown_bool_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;
+        assert!(k < COUNTDOWN_ATOM, "atom ids ran into the countdown tag");
         self.graph.leaf(Op::UnknownBool(k))
     }
 
-    /// A COUNTDOWN's atom: a comparison of the unknown number at a level
-    /// whose unknown numbers are all countdowns (a near level's floor
-    /// `delay`, balloon `timer`, spring timers; no fly fruit unknown). It
-    /// stays THREE-VALUED wherever the set has other unknowns too (the
+    /// A COUNTDOWN's atom: a comparison of the unknown number where it is a
+    /// countdown (a near level's floor `delay`, balloon `timer`, spring
+    /// timers): every comparison of it without the fly fruit unknown, one
+    /// the interpreter hints at (`set_countdown_hint`) with it. It stays THREE-VALUED wherever the set has other unknowns too (the
     /// platforms): decided per lane where it is read and split by the
     /// split pass, as at a near level alone - never a merge refusal
     /// (`reads_unknown_atom`) or an escape fork (`escaped_atom`). Treated
     /// as the platforms' atoms, every fall floor's `delay <= 0` made two
     /// successors that never merged: room (2,1) `r0sxhnp` traced 354 states
     /// at the spawn against 5 at `r0sxhn` (over the 256 limit) since
-    /// `b47b118` made the countdowns the unknown number.
+    /// `b47b118` made the countdowns the unknown number. With the fruit
+    /// unknown, room (3,0) `r0sxhfn`'s 12 floors' `delay <= 0` as fruit atoms
+    /// kept every floor's two paths apart (2^13 trace states after the spawn
+    /// frame's `foreach`).
     fn countdown_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;
@@ -1014,7 +1040,7 @@ impl Domain for Symbolic {
         }
         // With an unknown number nothing is decided.
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
-            return Ok(if self.fruit_unknown { self.unknown_bool_atom() } else { self.countdown_atom() });
+            return Ok(if self.countdown_hint || !self.fruit_unknown { self.countdown_atom() } else { self.unknown_bool_atom() });
         }
         if let Some((c, t, f)) = self.unknown_select(*a) {
             let (x, y) = (self.compare(op, &t, b)?, self.compare(op, &f, b)?);
@@ -1261,6 +1287,10 @@ impl Domain for Symbolic {
             }
         }
         self.atom_memo[c]
+    }
+
+    fn set_countdown_hint(&mut self, on: bool) {
+        self.countdown_hint = on;
     }
 
     fn join_bool_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
@@ -1524,26 +1554,39 @@ mod tests {
     }
 
     /// `x == k` on an interval `x` may be true where `k` is in `x` and false
-    /// where `x` is not exactly `k` (`[0, 2]`, `[1, 1]`, `[0, 0]` vs `k = 1`).
+    /// where `x` is not exactly `k` (`[0, 2]`, `[1, 1]`, `[0, 0]` vs `k = 1`),
+    /// also with the fly fruit unknown elsewhere in the frame (a hidden near
+    /// floor's exact `state == 2` was "both ways" there: room (3,0) `r0sxhfn`).
     #[test]
     fn an_equality_on_an_interval_may_answer_as_its_ends_allow() {
         use crate::transpile::graph::Val;
         let one = 1 << 16;
-        let answers = |lo: i32, hi: i32| {
-            let mut d = Symbolic::default();
-            let x = d.graph.leaf(Op::Const(lo, hi));
-            let k = d.graph.leaf(Op::Const(one, one));
-            let eq = d.graph.fold(Op::Eq, vec![x, k]);
-            let (t, f) = d.may_answers(eq);
-            let v = d.graph.eval(&Default::default()).unwrap();
-            let b = |n: NodeId| match v[n as usize] {
-                Val::Bool(b) => b,
-                Val::Num(_) => panic!("a number"),
+        for fruit_unknown in [false, true] {
+            let answers = |lo: i32, hi: i32| {
+                let mut d = Symbolic { fruit_unknown, ..Default::default() };
+                let x = d.graph.leaf(Op::Const(lo, hi));
+                let k = d.graph.leaf(Op::Const(one, one));
+                let eq = d.graph.fold(Op::Eq, vec![x, k]);
+                let (t, f) = d.may_answers(eq);
+                let v = d.graph.eval(&Default::default()).unwrap();
+                let b = |n: NodeId| match v[n as usize] {
+                    Val::Bool(b) => b,
+                    Val::Num(_) => panic!("a number"),
+                };
+                (b(t), b(f))
             };
-            (b(t), b(f))
-        };
-        assert_eq!(answers(0, 2 * one), (Some(true), Some(true)), "[0, 2] both ways");
-        assert_eq!(answers(one, one), (Some(true), Some(false)), "[1, 1] only equal");
-        assert_eq!(answers(0, 0), (Some(false), Some(true)), "[0, 0] only unequal");
+            assert_eq!(answers(0, 2 * one), (Some(true), Some(true)), "[0, 2] both ways");
+            assert_eq!(answers(one, one), (Some(true), Some(false)), "[1, 1] only equal");
+            assert_eq!(answers(0, 0), (Some(false), Some(true)), "[0, 0] only unequal");
+        }
+        // An operand reading an unknown: no ends to read, both ways.
+        let mut d = Symbolic { fruit_unknown: true, ..Default::default() };
+        let u = d.unknown_bool_atom();
+        let (a, b) = (d.graph.leaf(Op::Const(0, 2 * one)), d.graph.leaf(Op::Const(one, one)));
+        let x = d.graph.fold(Op::Sel, vec![u, a, b]);
+        let k = d.graph.leaf(Op::Const(one, one));
+        let eq = d.graph.fold(Op::Eq, vec![x, k]);
+        let yes = d.graph.leaf(Op::ConstBool(true));
+        assert_eq!(d.may_answers(eq), (yes, yes));
     }
 }

@@ -122,6 +122,14 @@ file's seeds (plans/nodiag.md). The level-1 arc phase peaked at 75 GB.
 `--to 100` (47 min, 36 GB): the springs exact (`n`'s "maybe bounce" at
 every spring is 2.4x the states by f65) and the horizon at the answer, not
 at the reference - level -1's cut moves with it.
+**(3,0) nodiag 93, a tie with TAS4**, by the three-level ladder
+`r0sxhfn,r0sxhn,r0sxh` at `--to 93`: the fruit AND the floors abstract at
+level 0 (it builds since `nodiag-30`: countdown atoms under the fruit, and
+equality's may-answers per operand), bound 76; `r0sxhn` filtered by its
+reach (383,604 nodes) bound 93 and the witness at 93 - the community route.
+Its level 0 needs `CELESTE_REGION=8,6`: at 16 px the floors' square's three
+kernels were 81 MB of code each and a frame of ~5M lanes took 19 min
+(plans/nodiag.md).
 
 **The platform rooms, by the reach ladder down to exact objects
 (2026-10-08, branch `nodiag-finish`).** `--level <level 0>,...,r0sxh,r0sx`

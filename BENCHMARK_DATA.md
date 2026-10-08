@@ -31,6 +31,38 @@ room (1,2) `r0sxhnp --to 111` (kept tree): 7,373,494 -> 1,451,487 concrete
 steps, the breadth-first layers' sum 688 -> 236 s, every layer's counts
 identical (no concrete win by 111, past layer 89 in both).
 
+# Room (3,0) nodiag on `r0sxhfn,r0sxhn,r0sxh`, 2026-10-08 (release, 16 threads, branch `nodiag-30`)
+
+Shared machine (two other agents' searches, ~14 threads each; load 36-52 on
+32 threads): times are noisy, counts are not. `CELESTE_NODIAG=1`, L-1 93,5,
+`CELESTE_TRIM_ROWS=1`, `--to 93`.
+
+The `r0sxhfn` kernel set, before and after equality's may-answers per
+operand (the coverage-gap fix): 119,733 bodies both, fused nodes 10.1M ->
+25.8M, the largest kernel (region (6,5), the floors' square) 1.33M -> 7.77M
+nodes, 15.5 -> 80.9 MB of code. By region size (`CELESTE_REGION`), one
+frame (f50 -> f51, 1,333,482 lanes, `bench-frame`, 8 threads):
+
+| region | kernels | fused nodes | largest | f50 frame |
+|---|---|---|---|---|
+| 16 px | 307 | 25.8M | 7.77M / 80.9 MB | 48.2 s (beside the search) |
+| 8 px | 979 | 17.2M | 450k / 4.4 MB | 12.3 s |
+| 4 px | 3475 | - | - | 12.6 s |
+
+The search at 16 px: f50 17.6 s, f58 111 s, f60 239 s, f61 608 s, f62
+1141 s (5.08M lanes; 83% of the time in the three (6,5) kernels); killed
+and resumed from f61 at 8 px: f63 96 s, then 2-10 min a frame. Level-0
+forward kept: f40 92,350, f50 1,333,482, f60 4,412,827, f70 7,746,866,
+f75 8,535,249 (widest; f74-f77 ~10 min a frame), f80 5,747,217, f85
+3,395,183, f90 350,703; 206.9M visited, first remainder-free win f66, anon
+at most 15.2 GB in a wave. Level-0 arc phase: 17.1M marked nodes, 391M edges
+(bfs 19 s, edges 37 s), backward 8.3 s, bound 76, peak 11.5 GB anonymous;
+no concrete win at 76 (12,800 steps, 47 s); reach 383,604 of 17.1M nodes
+(6.7 s). Level 1 `r0sxhn`: kernel build ~85 s, filtered forward 102.5 s,
+first win f90; arc phase 129,929 nodes, 701k edges, bound 93; the try at
+93 wins in 93 steps (0.3 s). OPTIMAL 93: 5720 s for the resumed run, VmHWM
+35.1 GB (kernel build), tree 31 GB.
+
 # The objects ladder filtered by REACH, and the nodiag big rooms, 2026-10-08 (release, 16 threads, branch `nodiag-big`)
 
 Shared machine (another search and another agent's runs alongside; load
