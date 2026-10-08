@@ -91,7 +91,8 @@ end
 
 function C.post_draw()
   local TAS = C.drv.TAS
-  if C.drv.phase ~= "wait" or not TAS.cart_update then return end
+  -- "done": the driver quit on this update (the exit frame is still drawn).
+  if (C.drv.phase ~= "wait" and C.drv.phase ~= "done") or not TAS.cart_update then return end
   love.graphics.setCanvas()
   for _, c in ipairs({pico8.screen, C.P, C.S, C.F}) do
     C.bin:write(c:newImageData():getString())
