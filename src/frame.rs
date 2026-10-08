@@ -1207,23 +1207,34 @@ fn level_minus_one_env() -> Option<(u32, i32)> {
 /// A tree whose forward ran under level -1 at H holds no row that cannot
 /// exit by H, so it serves horizons up to H only: reused (or resumed) for a
 /// larger one it would miss every win the filter dropped. `<dir>/
-/// level_minus_one.txt` records the smallest H any run on the tree filtered
-/// at; this refuses a horizon past it, or a filter below this run's horizon,
-/// and records this run's filter. Called before a tree is read or extended.
+/// level_minus_one.txt` records the smallest H any forward that ADDED rows to
+/// the tree filtered at (`record_level_minus_one`); this refuses a horizon
+/// past it. Called before a tree is read or extended.
 pub fn check_level_minus_one(dir: &std::path::Path, horizon: u32) -> Result<()> {
-    let path = dir.join("level_minus_one.txt");
-    let recorded: Option<u32> = match std::fs::read_to_string(&path) {
-        Ok(s) => Some(s.trim().parse().with_context(|| path.display().to_string())?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| path.display().to_string()),
-    };
-    if let Some(h) = recorded {
+    if let Some(h) = recorded_level_minus_one(dir)? {
         anyhow::ensure!(horizon <= h, "{}: the tree was filtered by level -1 at step {h}; it cannot serve step {horizon} (delete it)", dir.display());
     }
+    Ok(())
+}
+
+fn recorded_level_minus_one(dir: &std::path::Path) -> Result<Option<u32>> {
+    let path = dir.join("level_minus_one.txt");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(s.trim().parse().with_context(|| path.display().to_string())?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| path.display().to_string()),
+    }
+}
+
+/// Before a forward adds rows to the tree for `horizon`: this run's level -1
+/// filter (if any) must not be below the horizon, and it is recorded (the
+/// smaller of it and the tree's record).
+pub fn record_level_minus_one(dir: &std::path::Path, horizon: u32) -> Result<()> {
     if let Some((h, _)) = level_minus_one_env() {
         anyhow::ensure!(horizon <= h, "CELESTE_LEVEL_MINUS_ONE at step {h} is below the horizon, step {horizon}");
+        let recorded = recorded_level_minus_one(dir)?;
         std::fs::create_dir_all(dir)?;
-        std::fs::write(&path, format!("{}\n", recorded.map_or(h, |r| r.min(h))))?;
+        std::fs::write(dir.join("level_minus_one.txt"), format!("{}\n", recorded.map_or(h, |r| r.min(h))))?;
     }
     Ok(())
 }

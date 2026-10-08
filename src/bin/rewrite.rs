@@ -519,6 +519,7 @@ fn main() -> Result<()> {
                         w
                     }
                     None => {
+                        celeste_rust::frame::record_level_minus_one(&dir, steps)?;
                         let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
                         let initial = || -> Result<Vec<Block>> { Ok(vec![Block::keyed(RefEngine::new()?.initial()?)?]) };
                         let mut st = match celeste_rust::frame::ForwardState::resume(&dir, true)? {
