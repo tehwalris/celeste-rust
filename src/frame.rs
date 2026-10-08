@@ -744,9 +744,6 @@ pub const POOL_QUEUES: usize = 256;
 
 /// One worker's sink for a frame: keyed rows into a QUEUE per (outcome,
 /// cell); a full or evicted queue is FLUSHED (filter, door, piece, edges).
-/// A transfer as the kernel computed it (`arc_edges::RawAxis` per axis).
-pub type RawPair = (crate::search::arc_edges::RawAxis, crate::search::arc_edges::RawAxis);
-
 /// Entries of `ForwardSink::xfer_id_raw`'s cache.
 const XFER_CACHE: usize = 1 << 12;
 
@@ -792,7 +789,7 @@ pub struct ForwardSink<'a> {
     /// This worker's interned transfers (records carry the index).
     xfer_ids: rustc_hash::FxHashMap<crate::search::arc_edges::Pair, u32>,
     /// `xfer_id_raw`'s cache (allocated on first use).
-    xfer_cache: Vec<Option<(RawPair, u32)>>,
+    xfer_cache: Vec<(crate::compiled::asm_kernel::RawWords, u32)>,
     xfer_tab: Vec<crate::search::arc_edges::Pair>,
     /// Time spent encoding and writing edge records (this worker).
     pub t_edges: std::time::Duration,
@@ -909,21 +906,21 @@ impl<'a> ForwardSink<'a> {
     /// raw -> id: a frame has few distinct transfers (room (1,0) to f99:
     /// 17k) against one lookup per emitted lane, and the decode plus the
     /// hash-map intern was ~17% of a forward.
-    pub fn xfer_id_raw(&mut self, raw: RawPair, decode: impl FnOnce(&RawPair) -> crate::search::arc_edges::Pair) -> u32 {
-        use std::hash::{Hash, Hasher};
-        let mut h = rustc_hash::FxHasher::default();
-        raw.hash(&mut h);
-        let slot = (h.finish() as usize) & (XFER_CACHE - 1);
+    pub fn xfer_id_raw(&mut self, words: &crate::compiled::asm_kernel::RawWords, decode: impl FnOnce(&crate::compiled::asm_kernel::RawWords) -> crate::search::arc_edges::Pair) -> u32 {
+        let mut h = 0u64;
+        for pair in words.chunks_exact(2) {
+            h = (h ^ ((pair[0] as u64) << 32 | pair[1] as u64)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+        }
+        let slot = (h as usize) & (XFER_CACHE - 1);
         if self.xfer_cache.is_empty() {
-            self.xfer_cache = vec![None; XFER_CACHE];
+            self.xfer_cache = vec![([0; crate::compiled::asm_kernel::RAW_WORDS], u32::MAX); XFER_CACHE];
         }
-        if let Some((r, id)) = self.xfer_cache[slot] {
-            if r == raw {
-                return id;
-            }
+        let (w, id) = &self.xfer_cache[slot];
+        if *id != u32::MAX && w == words {
+            return *id;
         }
-        let id = self.xfer_id(decode(&raw));
-        self.xfer_cache[slot] = Some((raw, id));
+        let id = self.xfer_id(decode(words));
+        self.xfer_cache[slot] = (*words, id);
         id
     }
 

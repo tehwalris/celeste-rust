@@ -52,6 +52,10 @@ struct AsmBody {
 
 /// A body's transfer roots (`FrameOut::arc`): per axis took, pre, frag, ox,
 /// fin as (offset, kind); `fin` whether the outcome ends with a player.
+/// `ArcSlots::words`: two words per transfer root.
+pub(crate) const RAW_WORDS: usize = 4 * crate::trace::verify::ARC_AXIS_ROOTS;
+pub(crate) type RawWords = [u32; RAW_WORDS];
+
 #[derive(Clone, Copy)]
 struct ArcSlots {
     roots: [(usize, RootKind); 2 * crate::trace::verify::ARC_AXIS_ROOTS],
@@ -59,28 +63,45 @@ struct ArcSlots {
 }
 
 impl ArcSlots {
-    /// Lane `i`'s transfer as the kernel computed it, read straight off the
-    /// output slots (no `AV`): what `decode` turns into the record's pair. An
-    /// undecided `took` is FATAL: the record would be an unchecked claim
-    /// about the remainder.
-    fn raw(&self, buf: &[u8], i: usize, chunk: &Rt2, lane: usize, outcome: usize) -> (RawAxis, RawAxis) {
-        let word = |o: usize| i32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
-        let ival = |k: usize| -> (i32, i32) {
-            let (off, kind) = self.roots[k];
-            match kind {
-                RootKind::Num => (word(off + i * 4), word(off + i * 4)),
-                RootKind::Ival => (word(off + i * 4), word(off + 64 + i * 4)),
-                RootKind::Bool => panic!("arc edges: transfer root {k} is a boolean"),
+    /// Lane `i`'s transfer as the kernel computed it, as plain words off the
+    /// output slots: per root its (low, high) 16.16 words, a boolean root's
+    /// (value, known) bits; `RAW_WORDS` words, the fin roots 0 where the
+    /// outcome has none. What `ForwardSink::xfer_id_raw` caches on.
+    #[inline]
+    fn words(&self, buf: &[u8], i: usize) -> RawWords {
+        let w = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+        let mut out = [0u32; RAW_WORDS];
+        for (k, &(off, kind)) in self.roots.iter().enumerate() {
+            if !self.fin && k % crate::trace::verify::ARC_AXIS_ROOTS == 4 {
+                continue;
             }
-        };
+            let (lo, hi) = match kind {
+                RootKind::Num => (w(off + i * 4), w(off + i * 4)),
+                RootKind::Ival => (w(off + i * 4), w(off + 64 + i * 4)),
+                RootKind::Bool => {
+                    let v = u16::from_le_bytes([buf[off], buf[off + 1]]);
+                    let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
+                    ((v >> i & 1) as u32, (known >> i & 1) as u32)
+                }
+            };
+            out[2 * k] = lo;
+            out[2 * k + 1] = hi;
+        }
+        out
+    }
+
+    /// The raw transfer of `words`. An undecided `took` is FATAL: the
+    /// record would be an unchecked claim about the remainder.
+    fn raw(&self, words: &RawWords, chunk: &Rt2, lane: usize, outcome: usize) -> (RawAxis, RawAxis) {
         let axis = |a: usize| -> RawAxis {
             let base = a * crate::trace::verify::ARC_AXIS_ROOTS;
-            let (off, kind) = self.roots[base];
-            let took = match read_root_av(off, kind, buf, i) {
-                AV::Bool(b) => b,
-                other => panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}'s `took` is {other:?}, not a decided boolean", chunk.shape_hash),
-            };
-            RawAxis { took, pre: ival(base + 1), frag: ival(base + 2), ox: ival(base + 3), fin: self.fin.then(|| ival(base + 4)) }
+            let pair = |k: usize| (words[2 * (base + k)] as i32, words[2 * (base + k) + 1] as i32);
+            assert!(
+                self.roots[base].1 == RootKind::Bool && words[2 * base + 1] == 1,
+                "arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}'s `took` is not a decided boolean",
+                chunk.shape_hash
+            );
+            RawAxis { took: words[2 * base] == 1, pre: pair(1), frag: pair(2), ox: pair(3), fin: self.fin.then(|| pair(4)) }
         };
         (axis(0), axis(1))
     }
@@ -400,8 +421,8 @@ impl AsmKernel {
                     // THE TRANSFER: per producer, on the edge, never in the row.
                     let xfer = match slice_base {
                         Some(_) => {
-                            let raw = body.arc.raw(outbuf, i, chunk, lanes[i], body.outcome);
-                            sink.xfer_id_raw(raw, |r| ArcSlots::decode(r, chunk, lanes[i], body.outcome))
+                            let words = body.arc.words(outbuf, i);
+                            sink.xfer_id_raw(&words, |w| ArcSlots::decode(&body.arc.raw(w, chunk, lanes[i], body.outcome), chunk, lanes[i], body.outcome))
                         }
                         None => 0,
                     };
@@ -957,32 +978,6 @@ fn read_zb_may(buf: &[u8], off: usize) -> u16 {
 /// The boundary's row-key mix seeds (`runtime2::boundary_finish`).
 use celeste_engine::runtime2::{KEY_SEED1, KEY_SEED2};
 
-/// The `AV` an output root holds for lane `i`.
-#[inline]
-fn read_root_av(base: usize, kind: RootKind, buf: &[u8], i: usize) -> AV {
-    match kind {
-        RootKind::Num => {
-            AV::Num(P8::from_raw(i32::from_le_bytes(
-                buf[base + i * 4..base + i * 4 + 4].try_into().unwrap(),
-            )))
-        }
-        RootKind::Bool => {
-            let val = u16::from_le_bytes([buf[base], buf[base + 1]]);
-            let known = u16::from_le_bytes([buf[base + 2], buf[base + 3]]);
-            if known & (1 << i) != 0 {
-                AV::Bool(val & (1 << i) != 0)
-            } else {
-                AV::UBool
-            }
-        }
-        RootKind::Ival => {
-            let lo = i32::from_le_bytes(buf[base + i * 4..base + i * 4 + 4].try_into().unwrap());
-            let hi =
-                i32::from_le_bytes(buf[base + 64 + i * 4..base + 64 + i * 4 + 4].try_into().unwrap());
-            AV::Ival(P8::from_raw(lo), P8::from_raw(hi))
-        }
-    }
-}
 
 
 /// The start room's assembled kernels for one level.

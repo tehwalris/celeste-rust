@@ -333,6 +333,19 @@ enum Command {
         #[arg(long)]
         chain_out: Option<String>,
     },
+    /// DIAGNOSTIC: the shape of a frame's recorded edges. Groups the edges
+    /// recorded at `frame` by (source, target) and reports how many
+    /// transfers a pair carries, how its x and y parts vary (a product of
+    /// per-axis pieces?), and how many distinct transfer SETS there are (what
+    /// one edge per pair with an interned set would store).
+    EdgeCensus {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        frame: u32,
+        #[arg(long)]
+        horizon: u32,
+    },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed. Per
     /// shape: rows, every varying column's distinct value count (capped at
     /// `cap`), named, and the distinct (spd.x, spd.y) pairs.
@@ -1402,6 +1415,56 @@ fn main() -> Result<()> {
                     println!("[spurious] wrote the chain (frames 1..={step}) to {path}");
                 }
             }
+        }
+        Command::EdgeCensus { level_dir, frame, horizon } => {
+            use celeste_rust::search::edges::EdgeGraph;
+            let g = EdgeGraph::open(std::path::Path::new(&level_dir), horizon)?;
+            let pairs = g.pairs(frame);
+            let mut recs = g.records_at(frame);
+            recs.sort_unstable_by_key(|e| (e.base, e.target, e.xfer));
+            let n_edges = recs.len();
+            let mut hist = std::collections::BTreeMap::<usize, u64>::new();
+            let (mut n_pairs, mut product, mut x_const, mut y_const, mut dup) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut sets = rustc_hash::FxHashSet::<Vec<u32>>::default();
+            let mut xsets = rustc_hash::FxHashSet::<Vec<(u32, u32, u8, i32)>>::default();
+            let mut ysets = rustc_hash::FxHashSet::<Vec<(u32, u32, u8, i32)>>::default();
+            let mut i = 0;
+            while i < recs.len() {
+                let mut j = i;
+                while j < recs.len() && (recs[j].base, recs[j].target) == (recs[i].base, recs[i].target) {
+                    j += 1;
+                }
+                let mut ids: Vec<u32> = recs[i..j].iter().map(|e| e.xfer).collect();
+                let before = ids.len();
+                ids.dedup();
+                dup += (before - ids.len()) as u64;
+                n_pairs += 1;
+                *hist.entry(ids.len()).or_default() += 1;
+                let key = |a: &celeste_rust::search::arc_edges::AxisXfer| (a.lo, a.hi, a.tag, a.val);
+                let mut xs: Vec<_> = ids.iter().map(|&x| key(&pairs[x as usize].0)).collect();
+                let mut ys: Vec<_> = ids.iter().map(|&x| key(&pairs[x as usize].1)).collect();
+                xs.sort_unstable();
+                xs.dedup();
+                ys.sort_unstable();
+                ys.dedup();
+                if xs.len() == 1 {
+                    x_const += 1;
+                }
+                if ys.len() == 1 {
+                    y_const += 1;
+                }
+                if xs.len() * ys.len() == ids.len() {
+                    product += 1;
+                }
+                xsets.insert(xs);
+                ysets.insert(ys);
+                sets.insert(ids);
+                i = j;
+            }
+            println!("frame {frame}: {n_edges} edges, {n_pairs} (source, target) pairs, {:.2} transfers a pair, {dup} duplicate edges", n_edges as f64 / n_pairs as f64);
+            println!("transfers per pair: {hist:?}");
+            println!("pairs whose transfers are exactly x-pieces x y-pieces: {product} ({:.1}%); x part constant {x_const} ({:.1}%), y part constant {y_const} ({:.1}%)", 100.0 * product as f64 / n_pairs as f64, 100.0 * x_const as f64 / n_pairs as f64, 100.0 * y_const as f64 / n_pairs as f64);
+            println!("distinct transfer sets {}, x sets {}, y sets {} (frame table: {} pairs)", sets.len(), xsets.len(), ysets.len(), pairs.len());
         }
         Command::ColCensus { level_dir, frame, cap, cell, erase, every } => {
             use celeste_engine::runtime2::{av_code, num_code, Cell2, Col, AV};
