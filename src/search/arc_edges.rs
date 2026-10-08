@@ -37,6 +37,11 @@
 //!     (the remainder untouched): `Rotate(0)`;
 //!   - `fin` a point (a player created this frame, `rem = 0`): `Const(fin)`;
 //!   - anything else: REFUSED.
+//! * A split of ONE point `pre` (`ox` a point): the remainder was SET this
+//!   frame before the move (a platform's carry blocked by a wall, `rem.x =
+//!   0`; nothing else reads the input remainder): the whole circle, and
+//!   `Const(fin)` (`fin` a point; no player at the end: `Rotate(0)`).
+//!   `pre - ox - 1/2` must be a remainder and `frag` that point, else REFUSED.
 //! * A split: `ox` must be a point and `pre` exactly `[ox, ox + 1)` (the
 //!   remainder at the move the whole circle, the speed exact; else REFUSED).
 //!   `frag` must lie in `pre` within one floor `f` (else REFUSED). Then
@@ -146,6 +151,9 @@ pub fn decode_axis(r: &RawAxis) -> std::result::Result<AxisXfer, String> {
         return Err(format!("the applied speed {:?} is not exact", r.ox));
     }
     let pre = wide(r.pre);
+    if pre.0 == pre.1 {
+        return set_before_the_move(pre.0, ox, wide(r.frag), r.fin.map(wide));
+    }
     if pre != (ox, ox + ONE - 1) {
         return Err(format!("the split's argument {pre:?} is not the whole circle shifted by the speed {ox} (the remainder at the move was not [-1/2, 1/2))"));
     }
@@ -178,6 +186,28 @@ pub fn decode_axis(r: &RawAxis) -> std::result::Result<AxisXfer, String> {
         Some(fin) if fin == image => Ok(AxisXfer::rotate(lo, hi, rot)),
         Some((a, b)) if a == b => AxisXfer::konst(lo, hi, a),
         Some(fin) => Err(format!("the final remainder {fin:?} is neither the image {image:?} nor a point")),
+    }
+}
+
+/// A split whose argument is ONE point: the remainder at the move does not
+/// depend on the frame's input remainder - it was SET earlier in the frame
+/// (a moving platform's carry blocked by a wall: `move_x` sets `rem.x = 0`
+/// before the player's own `move`; `move_x` steps whole pixels and never
+/// reads `rem`). Nothing else in the frame reads the input remainder (only
+/// `move` does, at its split), so every input remainder takes this edge: the
+/// guard is the whole circle and the action the constant `fin`.
+fn set_before_the_move(pre: i64, ox: i64, frag: (i64, i64), fin: Option<(i64, i64)>) -> std::result::Result<AxisXfer, String> {
+    let rem = pre - ox - HALF;
+    if !(-HALF..HALF).contains(&rem) {
+        return Err(format!("the split's argument {pre} is the point {rem} + {ox} + 1/2, a remainder outside [-1/2, 1/2)"));
+    }
+    if frag != (pre, pre) {
+        return Err(format!("the fragment {frag:?} is not the split's one-point argument {pre}"));
+    }
+    match fin {
+        None => Ok(AxisXfer::rotate(0, CIRCLE, 0)),
+        Some((a, b)) if a == b => AxisXfer::konst(0, CIRCLE, a),
+        Some(f) => Err(format!("the remainder was set before the move, but the final remainder {f:?} is not a point")),
     }
 }
 
@@ -233,6 +263,25 @@ mod tests {
         let x = decode_axis(&split(ox, (131072, 131072), Some((-32768, -32768)))).unwrap();
         assert_eq!((x.lo, x.hi), (65535, 65536));
         assert_eq!(x.action().image(&x.guard()), Set::point(0));
+    }
+
+    /// A platform's carry blocked by a wall set `rem.x = 0` (and `spd.x =
+    /// 0`) before the player's move: the split's argument is the point 1/2,
+    /// and the edge maps EVERY input remainder to the final one.
+    #[test]
+    fn a_remainder_set_before_the_move_is_a_constant_from_the_whole_circle() {
+        let set = RawAxis { took: true, pre: (32768, 32768), frag: (32768, 32768), ox: (0, 0), fin: Some((0, 0)) };
+        let x = decode_axis(&set).unwrap();
+        assert_eq!(x.transfer(), Transfer { guard: Seg { lo: 0, hi: CIRCLE }, action: Action::Const(arcs::point(0)) });
+        // With a speed: the point is the set remainder plus the speed plus 1/2.
+        let moved = RawAxis { took: true, pre: (32768 + 13107, 32768 + 13107), frag: (32768 + 13107, 32768 + 13107), ox: (13107, 13107), fin: Some((13107, 13107)) };
+        assert_eq!(decode_axis(&moved).unwrap().action(), Action::Const(arcs::point(13107)));
+        // A death after it: the whole circle, into the dummy coordinate.
+        assert_eq!(decode_axis(&RawAxis { fin: None, ..set }).unwrap().guard(), Set::full());
+        // Not a remainder, a fragment off the point, a final remainder not a point.
+        assert!(decode_axis(&RawAxis { pre: (100_000, 100_000), frag: (100_000, 100_000), ..set }).is_err());
+        assert!(decode_axis(&RawAxis { frag: (0, 0), ..set }).is_err());
+        assert!(decode_axis(&RawAxis { fin: Some((0, 9)), ..set }).is_err());
     }
 
     #[test]
