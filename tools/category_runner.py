@@ -74,15 +74,10 @@ def replay_exit(room, inputs, seeds, cat):
 def chest_seed_variants(room, seeds):
     """The seed list with each chest's entry replaced by every class of
     draws: a chest's berry appears at x = start + s, s in [-1, 2), and only
-    which side of a pixel it lies on matters to a whole-pixel player. The
-    list runs over balloons (tile 22) and chests (tile 20) in creation order
-    (`load_room`: x outer, y inner), as UniversalClassicTas reads it."""
-    rx, ry = (int(v) for v in room.split(","))
-    hexmap = re.sub(r"\s", "", open(f"{M}/cart/map-data.txt").read())
-    tile = lambda x, y: int(hexmap[2 * (y * 128 + x):2 * (y * 128 + x) + 2], 16)
-    objs = [tile(rx * 16 + tx, ry * 16 + ty) for tx in range(16) for ty in range(16)]
-    objs = [t for t in objs if t in (20, 22)]
-    vals = [v for v in seeds.split(",") if v.strip()]
+    which side of a pixel it lies on matters to a whole-pixel player
+    (`seed_tiles`: the objects the list runs over)."""
+    objs = seed_tiles(room)
+    vals = [v.strip() for v in seeds.split(",") if v.strip()]
     vals += ["0"] * (len(objs) - len(vals))
     out = []
     for i, t in enumerate(objs):
