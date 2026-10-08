@@ -1,0 +1,3 @@
+# Room (1,0), synthetic win at (9, 101): the arc gate's concrete witness (f33),
+# the known route `search --prefer` checks against every pruning step (search::known).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,17,0,0,2,32,0,0,0,0

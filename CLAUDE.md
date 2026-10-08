@@ -194,9 +194,23 @@ pinned room (1,0) oracles:
 ./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0 --checkpoint-dir D   # prints the posgraph line
 ./target/release/rewrite ckhash --to 44 --room 1,0 --checkpoint-dir D | diff - gates/ckhash_room10_f000-044.txt   # empty
 # the posgraph line must equal gates/posgraph_room10_f044.txt
-./safe-run.sh -- ./target/release/rewrite search --to 35 --win-at 9,101 --checkpoint-dir D2 > log
+./safe-run.sh -- ./target/release/rewrite search --to 35 --win-at 9,101 --checkpoint-dir D2 \
+    --prefer gates/known_room10_win9-101.txt > log    # exits non-zero if the known route is pruned
 grep '^\[gate\]' log | diff - gates/arc_room10_win9-101_h35.txt          # empty
 ```
+
+- **The known-route check** (`search::known`, plans/architecture.md
+  "Gates"): `search --prefer FILE` steps a known solution through the
+  reference engine and, when it exits by the horizon, asserts at every level
+  and step that no pruning drops it - level -1, the ladder's filter, the
+  arc graph's node, its `W` at the exact remainder, the reach marks - and
+  FAILS the search with the first step that does (`[known] PRUNED`). Run
+  real rooms with `--prefer` their community TAS or our witness (the
+  category runner does); `rewrite check-known --checkpoint-dir D --level
+  SPEC --horizon H --inputs FILE` checks finished trees alone. A pruned
+  known route is a soundness bug, never a result: it is how room (6,1)'s
+  wrong refutation of 93 (`5ccf712`) shows up, at the mid-frame step the
+  filter drops.
 
 - The arc gate (2026-10-05, replacing the ladder's marks gate) pins the
   remainder-free marks at h35 (count and a fingerprint over (shape, key,
@@ -264,6 +278,9 @@ CELESTE_START_ROOM=2,0 ./safe-run.sh -- ./target/quick/transpile --level-minus-o
 
 # A known solution stepped against a level's tree (which state loses it).
 ./target/release/rewrite follow --level-dir D --level SPEC --inputs tas/FILE.txt
+# A known solution against every pruning step of a finished search (same env as the search:
+# CELESTE_LEVEL_MINUS_ONE, CELESTE_SPLIT_FRAME, seeds); `search --prefer` runs it too.
+./safe-run.sh -- ./target/quick/rewrite check-known --checkpoint-dir DIR --level SPEC --horizon H --room X,Y --inputs tas/FILE.txt
 
 # Single-lane concrete execution; the same inputs on a REAL PICO-8, headless.
 ./target/release/concrete_run -i 42,0,0,0,0,16,2,2,2,2 -f 10

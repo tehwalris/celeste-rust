@@ -1167,7 +1167,7 @@ impl<'a> ForwardSink<'a> {
 /// the table proves its cell cannot exit by H (sound: inductive ranges,
 /// clipped successors and deaths accounted). H must be the ceiling. Built
 /// once, at the first flush, on a thread with the tracer's stack.
-fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::CostToGo)> {
+pub(crate) fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::CostToGo)> {
     static TABLE: std::sync::OnceLock<Option<(u32, crate::trace::level_minus_one::CostToGo)>> = std::sync::OnceLock::new();
     TABLE
         .get_or_init(|| {
@@ -1236,8 +1236,19 @@ impl<'a> MarkFilter<'a> {
         if frame % steps_per_frame() != 0 {
             return Ok(vec![true; rt2.width]);
         }
+        Ok(self.deadlines(rt2)?.into_iter().map(|d| d.is_some_and(|d| u32::from(d) >= frame)).collect())
+    }
+
+    /// Per lane of `rt2`, its projection's deadline at the coarser level
+    /// (`None`: not marked there).
+    pub fn deadlines(&self, rt2: &Rt2) -> Result<Vec<Option<u16>>> {
         let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser)?;
-        Ok(keys.iter().zip(&cells).map(|(k, &c)| self.marked.deadline(shape, *k, c).is_some_and(|d| u32::from(d) >= frame)).collect())
+        Ok(keys.iter().zip(&cells).map(|(k, &c)| self.marked.deadline(shape, *k, c)).collect())
+    }
+
+    /// The coarser level.
+    pub fn coarser(&self) -> crate::abstraction::Level {
+        self.coarser
     }
 }
 

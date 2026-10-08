@@ -580,6 +580,44 @@ ref-check` (row by row; the kernels over-approximate where the reference
 splits an interval, so ckhash equality with the reference engine is no
 test).
 
+**A known solution against the pruning** (`search::known`, 2026-10-08).
+Every pruning step of the search - level -1, the objects ladder's filter,
+the remainder-free BFS, the winning sets the concrete search looks states up
+in, and under them the kernels' successors, the door and the split frame's
+mid-frame steps - removes real winners silently if it is wrong: the result
+is a wrong optimum or a false tie, never a fake improvement (witnesses are
+replayed), so nothing else notices. Room (6,1) nodiag `r0sxhn,r0sxh` REFUTED
+93, which TAS15 reaches (plans/nodiag.md, `5ccf712`). The check steps a known
+route (a TAS, or an earlier witness) through the reference engine, under
+the concrete search's seeds, and per level asserts at every search step s
+that level -1 does not call its cell too late and the ladder's filter
+admits it, and at every frame boundary that its projection
+(`arc_dp::lookup_keys`, the concrete search's own) is a node of the arc
+graph whose `W_s` holds its exact remainder, and, where the level filters
+the next one, that the node is REACHED with a deadline >= s. Mid-frame
+states are not looked up (they carry the split frame's cut widening, which
+`Rt2::widen_to` does not apply); `W` at the next boundary is pulled through
+them. One winning `rnd` lineage passing everywhere suffices. On a failure
+it prints each winning lineage's first failing step - the check, the node
+`(shape, key, cell)` and whether the tree holds it at all, `W_s` against
+the remainder, the player - and the two frames after, then fails.
+`rewrite search --prefer FILE` runs it at every level before the concrete
+search whenever the file exits by the horizon (a file that does not is
+reported and skipped); `rewrite check-known --checkpoint-dir D --level SPEC
+--horizon H --inputs FILE` reruns the arc phases over finished trees and
+checks alone. The gate's arc search runs it (`--prefer
+gates/known_room10_win9-101.txt`). Cost (quick profile, loaded machine):
+the route's concrete steps and one lookup per frame - room (1,0) gate 0.05 s;
+(6,1) nodiag split `r0sxhn,r0sxh` synthetic h40: 0.2-0.4 s a level; (5,0)
+nodiag `r0sxhn,r0sxh` to 93 (the TAS, bounds 91 and 93): 0.63 + 0.17 s of a
+471 s search; `check-known` over those finished trees 25 s (the two arc
+phases rerun). Caught, injected in a scratch build: the split-frame filter
+fix reverted (room (6,1) nodiag, `--win-at 70,104 --to 40`: level 1 found
+no win at all) - `LEAVES THE TREE at step 57 (mid-frame 29): THE LADDER'S
+FILTER drops it`, its projection onto `r0sxhn` unmarked; and `reach`
+skipping the `Const` transfers (room (1,0), `--level r0sx,r0sx`) - `NOT
+REACHED` at frame 24, the frame the player spawns with `rem` set to 0.
+
 ## Deferred follow-ups
 
 1. **One file per (shape, cell), dispatch key inside** (Philippe,

@@ -978,7 +978,7 @@ impl NodeKeys {
         v.dedup_by_key(|e| (e.0, e.1, e.2));
         NodeKeys(v)
     }
-    fn get(&self, shape: u64, key: (u64, u64), cell: u32) -> Option<u32> {
+    pub(super) fn get(&self, shape: u64, key: (u64, u64), cell: u32) -> Option<u32> {
         let k = (shape, key, cell);
         self.0.binary_search_by(|e| (e.0, e.1, e.2).cmp(&k)).ok().map(|j| self.0[j].3)
     }
@@ -990,21 +990,29 @@ impl NodeKeys {
     }
 }
 
-/// THE CONCRETE SEARCH: the concrete optimum and its inputs. A BREADTH-FIRST
-/// A concrete state's node key. With seeded balloons (`concrete_search`),
-/// the state holds each balloon's phase as one number and its `y` as one
-/// point, where the tree - built with the phase an interval - holds the
-/// canonical phase `[0, 1)` and the bob `y` `[start - 2, start + 2]` (the
-/// forward recomputes `y` from the interval phase every frame); the lookup
-/// maps them there, the key of the node that over-approximates the state.
-fn lookup_keys(b: &crate::frame::Block, level: crate::abstraction::Level, seeded: bool) -> anyhow::Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
-    use celeste_engine::runtime2::{Col, AV, BALLOON_BOB_RAW, BALLOON_PERIOD_RAW};
-    use crate::pico8_num::Pico8Num as P8;
+/// A concrete state's node key at `level` (`lookup_view`, widened).
+pub(super) fn lookup_keys(b: &crate::frame::Block, level: crate::abstraction::Level, seeded: bool) -> anyhow::Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
     if !seeded {
         return crate::frame::widened_keys(b, level);
     }
+    crate::frame::widened_keys_rt2(&lookup_view(b.rt2(), seeded)?, level)
+}
+
+/// A concrete state as the tree holds it before the level's widening. With
+/// seeded balloons (`concrete_search`), the state holds each balloon's
+/// phase as one number and its `y` as one point, where the tree - built
+/// with the phase an interval - holds the canonical phase `[0, 1)` and the
+/// bob `y` `[start - 2, start + 2]` (the forward recomputes `y` from the
+/// interval phase every frame); the view maps them there, so its key is the
+/// node that over-approximates the state.
+pub(super) fn lookup_view(row: &celeste_engine::runtime2::Rt2, seeded: bool) -> anyhow::Result<celeste_engine::runtime2::Rt2> {
+    use celeste_engine::runtime2::{Col, AV, BALLOON_BOB_RAW, BALLOON_PERIOD_RAW};
+    use crate::pico8_num::Pico8Num as P8;
+    let mut rt2 = row.clone_block();
+    if !seeded {
+        return Ok(rt2);
+    }
     let ids = crate::compiled::ids();
-    let mut rt2 = b.rt2().clone_block();
     for obj in rt2.objects_of_type(ids, ids.g_balloon) {
         let (Some(oc), Some(yc), Some(sc)) = (rt2.obj_field_cell(obj, ids.f_offset), rt2.obj_field_cell(obj, ids.f_y), rt2.obj_field_cell(obj, ids.f_start)) else { continue };
         let AV::Num(start) = rt2.cols[sc as usize].at(0) else { anyhow::bail!("a balloon's `start` is not a number") };
@@ -1012,7 +1020,40 @@ fn lookup_keys(b: &crate::frame::Block, level: crate::abstraction::Level, seeded
         rt2.cols[oc as usize] = Col::U(AV::Ival(P8::from_raw(0), P8::from_raw(BALLOON_PERIOD_RAW)));
         rt2.cols[yc as usize] = Col::U(AV::Ival(P8::from_raw(s - BALLOON_BOB_RAW), P8::from_raw(s + BALLOON_BOB_RAW)));
     }
-    crate::frame::widened_keys(&crate::frame::Block::from_rt2(rt2), level)
+    Ok(rt2)
+}
+
+/// A concrete state's remainder as a point of the torus (no player: the
+/// point (0, 0)).
+pub(super) fn rem_of(rt2: &celeste_engine::runtime2::Rt2) -> anyhow::Result<(u32, u32)> {
+    use celeste_engine::runtime2::AV;
+    let ids = crate::compiled::ids();
+    let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((super::arcs::point(0), super::arcs::point(0))) };
+    let raw = |c: usize| -> anyhow::Result<u32> {
+        match rt2.cols[c].at(0) {
+            AV::Num(n) => Ok(super::arcs::point(n.as_raw_u32() as i32)),
+            other => anyhow::bail!("a concrete remainder expected, got {other:?}"),
+        }
+    };
+    Ok((raw(cx)?, raw(cy)?))
+}
+
+/// `n` reference engines for concrete steps, and whether they run seeded:
+/// `CELESTE_CONCRETE_BALLOON_SEEDS` fixes the balloons' phases (a
+/// tasdatabase file's seeds), so a concrete run is one real run under them -
+/// the tree and W keep the phase an interval (sound for every seed), and a
+/// concrete state's key maps its phase to that interval (`lookup_view`).
+/// Built under the global level: `_init` runs under it.
+pub(super) fn concrete_engines(n: usize) -> anyhow::Result<(Vec<crate::trace::refengine::RefEngine>, bool)> {
+    let seeds = std::env::var("CELESTE_CONCRETE_BALLOON_SEEDS").ok();
+    if let Some(s) = &seeds {
+        std::env::set_var("CELESTE_BALLOON_SEEDS", s);
+    }
+    let engines: anyhow::Result<Vec<_>> = (0..n).map(|_| crate::trace::refengine::RefEngine::new()).collect();
+    if seeds.is_some() {
+        std::env::remove_var("CELESTE_BALLOON_SEEDS");
+    }
+    Ok((engines?, seeds.is_some()))
 }
 
 /// The inputs a state has been stepped under, each with the buttons its
@@ -1069,25 +1110,12 @@ pub fn concrete_search(
     use crate::frame::{wins_of, Block};
     use anyhow::Result;
     use crate::trace::refengine::RefEngine;
-    use celeste_engine::runtime2::{Rt2, AV};
+    use celeste_engine::runtime2::Rt2;
     // Build the engines BEFORE setting the level: `_init` runs under the
     // global level. Their frames run exact whatever is set.
     let workers = crate::frame::threads().max(1);
-    // `CELESTE_CONCRETE_BALLOON_SEEDS`: the concrete steps run with the
-    // balloons' phases FIXED (a tasdatabase file's seeds), so the witness is
-    // one real run under them - the tree and W keep the phase an interval
-    // (sound for every seed), and a concrete state's key maps its phase to
-    // that interval (`widen::canon_balloon_offset`, `Rt2::widen_to`).
-    let seeds = std::env::var("CELESTE_CONCRETE_BALLOON_SEEDS").ok();
-    let seeded = seeds.is_some();
-    if let Some(s) = &seeds {
-        std::env::set_var("CELESTE_BALLOON_SEEDS", s);
-    }
-    let engines: Result<Vec<std::sync::Mutex<RefEngine>>> = (0..workers).map(|_| RefEngine::new().map(std::sync::Mutex::new)).collect();
-    if seeded {
-        std::env::remove_var("CELESTE_BALLOON_SEEDS");
-    }
-    let engines = engines?;
+    let (engines, seeded) = concrete_engines(workers)?;
+    let engines: Vec<std::sync::Mutex<RefEngine>> = engines.into_iter().map(std::sync::Mutex::new).collect();
     let initial = engines[0].lock().expect("an engine").initial()?;
     crate::abstraction::set_level(level);
     // W is indexed by search STEP; the concrete search steps whole frames
@@ -1098,17 +1126,6 @@ pub fn concrete_search(
     let t0 = std::time::Instant::now();
     eprintln!("[concrete] {} nodes keyed; {workers} workers; the arc bound f{bound}", node.len());
     crate::metrics::mem_phase("concrete: engines up");
-    fn rem_of(rt2: &Rt2) -> Result<(u32, u32)> {
-        let ids = crate::compiled::ids();
-        let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((super::arcs::point(0), super::arcs::point(0))) };
-        let raw = |c: usize| -> Result<u32> {
-            match rt2.cols[c].at(0) {
-                AV::Num(n) => Ok(super::arcs::point(n.as_raw_u32() as i32)),
-                other => anyhow::bail!("a concrete remainder expected, got {other:?}"),
-            }
-        };
-        Ok((raw(cx)?, raw(cy)?))
-    }
     /// A successor that stays inside W (or wins), in (parent, input, leaf)
     /// order within its worker's chunk.
     struct Succ {
@@ -1367,6 +1384,9 @@ pub struct Solved {
     /// The ARC-MARKED nodes with their deadlines (the last frame their
     /// winning set is non-empty): the next level's `frame::MarkFilter`.
     pub arc_marks: Option<crate::frame::Visited>,
+    /// The known route's exit frame when it was checked (`search::known`):
+    /// it wins by the horizon and survives every pruning step.
+    pub known: Option<u32>,
 }
 
 /// THE ARC PHASE over a finished tree in `dir`: `load`, `backward`,
@@ -1374,7 +1394,10 @@ pub struct Solved {
 /// the `[gate]` fingerprints (over (shape, key, cell), independent of
 /// scheduling). With `save`, writes the UI's arc pass: `level0.marks.bin`
 /// (remainder-free marks), `arc.marks.bin` (arc-marked nodes), `arc.txt`
-/// and the witness.
+/// and the witness. With `known`, checks a known solution against every
+/// pruning step before the concrete search (`search::known`): an error if
+/// one drops it.
+#[allow(clippy::too_many_arguments)]
 pub fn solve(
     dir: &std::path::Path,
     level: crate::abstraction::Level,
@@ -1383,6 +1406,7 @@ pub fn solve(
     want_marks: bool,
     save: Option<&std::path::Path>,
     prefer: Option<&[u8]>,
+    known: Option<&super::known::Route>,
 ) -> anyhow::Result<Solved> {
     use crate::frame::{id_layer, mark_row, save_marks, MarkRow, Visited};
     use celeste_engine::runtime2::mix64;
@@ -1408,7 +1432,7 @@ pub fn solve(
     for (f, fs) in tree_frames(dir, horizon)?.into_iter().enumerate() {
         files.extend(fs.into_iter().map(|(seq, file)| (f as u32, seq, file)));
     }
-    let keyed = concrete != Concrete::None && arc.is_some();
+    let keyed = (concrete != Concrete::None && arc.is_some()) || known.is_some();
     let mut node_key: Vec<u64> = Vec::with_capacity(g.len());
     let mut keys: Vec<(u64, (u64, u64), u32, u32)> = Vec::with_capacity(if keyed { g.len() } else { 0 });
     let mut rows: Vec<MarkRow> = Vec::new();
@@ -1476,13 +1500,21 @@ pub fn solve(
         let show = |v: Option<u32>| v.map_or("none".to_string(), |f| f.to_string());
         std::fs::write(out.join("arc.txt"), format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(arc)))?;
     }
+    let node = NodeKeys::new(keys);
+    let known = match known {
+        Some(route) => {
+            let p = super::known::Pruning { level, horizon, node: &node, start, w: &w, reached: arc_marks.as_ref(), files: &files };
+            super::known::check(route, &p)?
+        }
+        None => None,
+    };
     drop(files);
     // The concrete search reads W and the node keys, not the graph (GBs).
     drop(graph);
     crate::metrics::mem_phase("arc: marks for the next level, graph dropped");
     let found = match (concrete, arc) {
         (Concrete::None, _) | (_, None) => None,
-        (c, Some(f)) => concrete_search(level, horizon, &NodeKeys::new(keys), &w, f, c == Concrete::Full, prefer)?,
+        (c, Some(f)) => concrete_search(level, horizon, &node, &w, f, c == Concrete::Full, prefer)?,
     };
     if let Some(wt) = &found {
         println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), wt.inputs_text());
@@ -1490,7 +1522,7 @@ pub fn solve(
             wt.save(&out.join("witness.txt"))?;
         }
     }
-    Ok(Solved { arc, concrete: found, arc_marks })
+    Ok(Solved { arc, concrete: found, arc_marks, known })
 }
 
 #[cfg(test)]
