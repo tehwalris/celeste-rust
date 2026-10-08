@@ -202,6 +202,21 @@ DESTROYABLE = {26, 28, 8, 20, 64}
 MAX_SPEED = 6
 
 
+def room_objects(room):
+    """The object tiles of a room in load_room's creation order (the original cart's)."""
+    m = replay.hexbytes(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cart", "map-data.txt"), 8192)
+    return [t for t in (m[(room[1] * 16 + ty) * 128 + room[0] * 16 + tx] for tx in range(16) for ty in range(16)) if t in replay.OBJECT_TILES]
+
+
+def celia_jank(level):
+    """The J Celia's IL load uses (cctas.lua `load_level`, offset 0): the
+    previous room's object count at its load, the title left out - as if the
+    player left it with nothing destroyed and the title gone. It differs from
+    the boot chain's where the previous room's play destroys objects (any%
+    levels 5, 8, 13, 18; most 100% levels after a berry): both are checked."""
+    return None if level == 1 else len(room_objects(room_of(level - 1)))
+
+
 def feasible_janks(level):
     """Every J a play of the previous room can enter `level` with - a
     SOUND over-approximation of the history the room-entry state depends on.
@@ -221,7 +236,9 @@ def feasible_janks(level):
     lines = single("any", level - 1, [], [0])
     start = min(int(l.split()[0][1:]) for l in lines if l.startswith("f") and " player " in l)
     climb = -(-(spawn_y + 5) // MAX_SPEED)
-    title = [0, 1] if start + climb - 1 <= 36 else [0]
+    # start - 1: in real play the previous room's own loading frame may have
+    # updated its spawn too (a frame ahead).
+    title = [0, 1] if (start - 1) + climb - 1 <= 36 else [0]
     smoke = [0, 1] if climb <= 10 else [0]
     return sorted({1 + (k - 1 - x) + t + sm for x in range(d + 1) for t in title for sm in smoke})
 

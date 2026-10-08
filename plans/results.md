@@ -226,8 +226,27 @@ claimed count unless noted:
   - **2300m 63 is INVALID: it dies in Celia, the chain and the boot chain.**
   - All 11 ties are VALID.
 - nodiag: **1800m 86 (TAS18, submitted) is INVALID**, dying in Celia, the
-  chain and the boot chain. Room (1,2)'s platforms are janked. Every other
-  nodiag upload is VALID.
+  chain and the boot chain. The runner had cut it one frame early so that
+  UCT would finish it.
+  - Re-searched at J 3 (the boot chain's) and at J 4 (Celia's, its other
+    start class): 113 both, the same optimum as before.
+  - At the PICO-8 alignment the witness is **85, VALID** in IL, Celia, the
+    chain and the boot chain. Only UCT fails it.
+  - The runner now chooses the upload's cut by real play; UCT is
+    information only.
+  - Every other nodiag upload is VALID.
+
+**Celia's J is not always the boot chain's.** Celia uses the previous room's
+object count, as if nothing had been destroyed there. Real play destroys
+objects:
+- any% differs at levels 5, 8, 13 and 18 (a fly fruit flown off, a fake wall
+  broken, ...);
+- 100% and key differ at most levels after a berry.
+
+Where the two give different start states, a submittable witness must exit
+in both. `check_uploads` requires both, and the runner searches Celia's class
+too. Which convention the database verifies with (Celia's IL, or a
+full-game playback) is a question for the community.
 - gemskipany and gemskipnodiag: every upload is VALID. The gemskipany boot
   chain breaks at the database's own 2600m, which dies on PICO-8 in every
   mode but finishes in UCT and Celia (they compute in doubles). Past it the

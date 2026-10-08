@@ -26,10 +26,10 @@ Per job:
     `--to H` instead with a job's "to";
  3. our witness replayed in the original cart (must exit at the optimum; no
     diagonal dash in a nodiag category);
- 4. both files through UniversalClassicTas (tools/uct/validate.sh): the clean
-    save of ours is the upload file (OUTDIR/upload/<cat>/TAS<n>.tas); then,
-    mandatory, the upload in REAL PLAY: the boot chain on a real PICO-8 and
-    Celia (tools/uct/check_uploads.py), "real_play" in the result;
+ 4. the upload (OUTDIR/upload/<cat>/TAS<n>.tas): the first candidate cut
+    VALID in REAL PLAY - the boot chain on a real PICO-8 and Celia
+    (tools/uct/check_uploads.py), "real_play" in the result; both files
+    through UniversalClassicTas for information;
  5. an improvement gets a web UI run (export-ui + runs.json).
 Results: one JSON line per job in OUTDIR/results.jsonl.
 """
@@ -201,8 +201,11 @@ def run(job, outdir, binary):
         jank = chain.entry_jank(cat, rx + 8 * ry + 1)
     jank = None if jank == "none" else jank
     res["jank"] = jank
+    # The verdict needs the witness valid at the boot chain's J AND at Celia's
+    # (check_uploads); where they are different start classes, Celia's class
+    # is also searched (a search-only job) and its optimum recorded.
     if job.get("jank_classes"):
-        res["jank_classes"] = job["jank_classes"]
+        res["jank_classes"], res["celia_jank"] = job["jank_classes"], job.get("celia_jank")
     # 1. the reference
     ref = None
     for off in range(job["offset"] - 2, job["offset"] + 3):
@@ -320,24 +323,26 @@ def run(job, outdir, binary):
         res["diagonal_dashes"] = diag_dashes(ours)
     lead = next((i for i, b in enumerate(ours) if b), len(ours))
     res["first_input"] = lead
-    # 4. UniversalClassicTas. The upload starts at the room's first
+    # 4. The upload, chosen by REAL PLAY. It starts at the room's first
     # controllable frame: usually the community file's earliest exiting
     # offset, but a witness may press on the frame before (the player exists
     # and updates on the frame it is created: room (2,1) nodiag, 2026-10-08),
-    # so that cut is tried too, and UCT decides. A cut never drops a press.
-    # Last, a frame before the prologue: UCT computes in Lua doubles, not
-    # 16.16, and on room (1,2)'s platforms its player is a pixel off PICO-8's
-    # from frame 55 (TAS18 too); our 113 does not finish there at the PICO-8
-    # alignment, one frame later it does (2026-10-08: the file one zero
-    # longer, one frame slower).
+    # so that cut is tried too; a cut never drops a press. Each candidate
+    # (cut, seeds) goes through tools/uct/check_uploads.py - the boot chain
+    # on a real PICO-8 and Celia - and the first VALID one is the upload,
+    # written by us (the witness ends at the exit: no trailing input).
+    # UniversalClassicTas is run on it for information only: it has no
+    # loading frame and computes in doubles. Until 2026-10-08 UCT chose the
+    # cut, and nodiag 1800m's upload was cut a frame early so that UCT
+    # finished (86): that file dies in real play, the PICO-8 alignment (85)
+    # is valid. When the file's seeds die, the balloons' phases are nudged
+    # (nudged_seeds; still optimal: the bound holds for every seed).
     level = int(name.rstrip("m")) // 100 if name.endswith("m") else None
     if level:
+        sys.path.insert(0, os.path.join(M, "tools", "uct"))
+        import check_uploads
         ok_db, n_db, _, _ = uct(level, f"{DB}/classic/{cat}/{entry['file']}", cat)
         res["uct_db"] = f"{'finished' if ok_db else 'NOT finished'} {n_db} inputs"
-        # A death in UCT is a failure (validate.sh), never a "finished" from a
-        # later attempt. When the file's seeds die in UCT, the balloons'
-        # phases are nudged (nudged_seeds): checked in both, and the upload
-        # carries the seeds used (still optimal: the bound holds for every seed).
         cuts = [c for c in [prologue] + ([lead] if lead < prologue else []) + [prologue - 1] if not any(ours[:c])]
         tries = [(seeds, c) for c in cuts] + [(sd, c) for sd in nudged_seeds(room, seeds or "0") for c in cuts]
         for sd, cut in tries:
@@ -345,26 +350,20 @@ def run(job, outdir, binary):
                 continue
             mine = os.path.join(jd, f"ours-{entry['file']}")
             open(mine, "w").write(f"[{sd}]" + ",".join(map(str, ours[cut:])))
-            ok, n, saved, out = uct(level, mine, cat)
-            st = re.search(r"(finished, clean save|DID NOT FINISH[^,]*)", out)
-            res["uct_ours"], res["upload_cut"] = f"{'finished' if ok else (st.group(1) if st else 'NOT finished')} {n} inputs", cut
-            if ok:
+            res["real_play"], res["upload_cut"] = check_uploads.check(mine, False, cat), cut
+            if res["real_play"].endswith("\tVALID"):
                 if sd != seeds:
                     res["upload_seeds"] = sd
                 up = os.path.join(outdir, "upload", cat)
                 os.makedirs(up, exist_ok=True)
-                shutil.copy(saved, os.path.join(up, entry["file"]))
+                shutil.copy(mine, os.path.join(up, entry["file"]))
                 res["upload"] = os.path.join(up, entry["file"])
+                ok, n, _, out = uct(level, mine, cat)
+                st = re.search(r"(finished, clean save|DID NOT FINISH[^,]*)", out)
+                res["uct_ours"] = f"{'finished' if ok else (st.group(1) if st else 'NOT finished')} {n} inputs (information only)"
                 break
     res["status"] = "IMPROVED" if opt < ref else ("tie" if opt == ref else "WORSE?")
-    # 4b. MANDATORY: the upload in real play - the boot chain on a real
-    # PICO-8 and Celia (tools/uct/check_uploads.py): UCT's IL load is not
-    # real play (2026-10-08: a 100% 2300m 63 that UCT finishes dies in both).
-    if res.get("upload"):
-        sys.path.insert(0, os.path.join(M, "tools", "uct"))
-        import check_uploads
-        res["real_play"] = check_uploads.check(res["upload"], False, cat)
-    res["verified"] = (e == opt) and not res.get("diagonal_dashes") and res.get("uct_ours", "").startswith("finished") and res.get("berry", True) and res.get("real_play", "").endswith("\tVALID")
+    res["verified"] = (e == opt) and not res.get("diagonal_dashes") and res.get("berry", True) and bool(res.get("upload"))
     # 5. the UI
     if opt < ref and not job.get("witness"):
         try:
@@ -418,7 +417,7 @@ def expand(job, cache):
             concrete = os.environ.get("CONCRETE_RUN", f"{M}/target/release/concrete_run")
             classes = chain.start_classes(level, concrete, job["cat"])
             others = [{**job, "jank": c[0], "tag": job.get("tag", "") + f"-J{c[0]}", "search_only": True} for c in classes if j not in c]
-            cache[key] = [{**job, "jank": j, "jank_classes": classes}] + others
+            cache[key] = [{**job, "jank": j, "jank_classes": classes, "celia_jank": chain.celia_jank(level)}] + others
     return cache[key]
 
 
