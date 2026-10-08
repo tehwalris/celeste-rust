@@ -152,7 +152,9 @@ def run(job, outdir, binary):
         # the witness is then one real run under them.
         env["CELESTE_CONCRETE_BALLOON_SEEDS"] = seeds
         if l1:
-            env["CELESTE_LEVEL_MINUS_ONE"] = f"{ref},5"
+            # Level -1 counts search steps: two a frame under the split frame.
+            steps = ref * (2 if env.get("CELESTE_SPLIT_FRAME") else 1)
+            env["CELESTE_LEVEL_MINUS_ONE"] = f"{steps},5"
         log = os.path.join(jd, "search.log")
         shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
         cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--ceiling", str(ref), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", os.path.join(jd, "tree")]

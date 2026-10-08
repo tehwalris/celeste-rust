@@ -74,6 +74,21 @@ impl RefEngine {
         leaves.iter().map(|l| Block::keyed(to_block(l)?)).collect()
     }
 
+    /// One whole GAME frame: `step` once, or under the split frame
+    /// (`frame::steps_per_frame`) its two parts, both under `byte` (the
+    /// buttons are the frame's; part a reads none). Every leaf of both.
+    pub fn frame(&mut self, row: &Rt2, byte: u8) -> Result<Vec<Block>> {
+        let mut out = self.step(row, byte)?;
+        for _ in 1..crate::frame::steps_per_frame() {
+            let mut next = Vec::new();
+            for b in &out {
+                next.extend(self.step(b.rt2(), byte)?);
+            }
+            out = next;
+        }
+        Ok(out)
+    }
+
     /// `step` where the frame must not fork: the one successor.
     pub fn step_one(&mut self, row: &Rt2, byte: u8) -> Result<Block> {
         let mut out = self.step(row, byte)?;

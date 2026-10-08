@@ -895,8 +895,10 @@ fn input_order(prefer: Option<&[u8]>, k: u32) -> impl Iterator<Item = u8> {
 /// Sound: every concrete path that wins by the horizon stays inside W, so
 /// the search is EXHAUSTIVE inside W and prunes by nothing else; its first
 /// win is the CONCRETE optimum. `None`: no concrete win by the horizon.
-/// `bound` (the graph's optimum) is a lower bound on it. Layers run in
-/// parallel, one reference engine per worker.
+/// `bound` (the graph's optimum, in frames) is a lower bound on it. Layers
+/// run in parallel, one reference engine per worker. `horizon` is in search
+/// steps, W's index: under the split frame layer k is W at step `2k`, a
+/// frame boundary, whose nodes key exactly as a whole frame's states.
 pub fn concrete_search(
     level: crate::abstraction::Level,
     horizon: u32,
@@ -930,6 +932,11 @@ pub fn concrete_search(
     let engines = engines?;
     let initial = engines[0].lock().expect("an engine").initial()?;
     crate::abstraction::set_level(level);
+    // W is indexed by search STEP; the concrete search steps whole frames
+    // (`RefEngine::frame`), and frame k ends at step `spf * k`.
+    let spf = crate::frame::steps_per_frame();
+    anyhow::ensure!(horizon % spf == 0, "the horizon {horizon} is not a whole number of frames ({spf} steps each)");
+    let frames = horizon / spf;
     let t0 = std::time::Instant::now();
     eprintln!("[concrete] {} nodes keyed; {workers} workers; the arc bound f{bound}", node.len());
     crate::metrics::mem_phase("concrete: engines up");
@@ -974,6 +981,7 @@ pub fn concrete_search(
             steps: u64,
             prefer: Option<&'a [u8]>,
             seeded: bool,
+            spf: u32,
         }
         /// `Ok(None)`: out of budget.
         fn dfs(cx: &mut Dfs, st: &Rt2, k: u32) -> Result<Option<bool>> {
@@ -981,7 +989,7 @@ pub fn concrete_search(
                 return Ok(Some(false));
             }
             for byte in input_order(cx.prefer, k) {
-                for b in cx.eng.step(st, byte)? {
+                for b in cx.eng.frame(st, byte)? {
                     cx.steps += 1;
                     if cx.steps > DFS_BUDGET {
                         return Ok(None);
@@ -1000,7 +1008,7 @@ pub fn concrete_search(
                     let (shape, keys, cells) = lookup_keys(&b, cx.level, cx.seeded)?;
                     let Some(i) = cx.node.get(shape, keys[0], cells[0]) else { continue };
                     let q = rem_of(b.rt2())?;
-                    if !cx.w.at(cx.from + k + 1, i).is_some_and(|r| r.contains(q.0, q.1)) {
+                    if !cx.w.at(cx.spf * (cx.from + k + 1), i).is_some_and(|r| r.contains(q.0, q.1)) {
                         continue;
                     }
                     cx.path.push((byte, cell));
@@ -1019,7 +1027,7 @@ pub fn concrete_search(
         const DFS_BUDGET: u64 = 200_000;
         let t = std::time::Instant::now();
         let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { eng: &mut eng, node, w, level, from: horizon - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer, seeded };
+        let mut cx = Dfs { eng: &mut eng, node, w, level, from: frames - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer, seeded, spf };
         let found = dfs(&mut cx, start.rt2(), 0)?;
         eprintln!(
             "[concrete] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
@@ -1044,9 +1052,9 @@ pub fn concrete_search(
     let mut back: Vec<Vec<(u32, u8, u32)>> = Vec::new();
     let mut cur: Vec<Rt2> = vec![start.into_rt2()];
     let mut steps = 0u64;
-    for k in 0..horizon {
+    for k in 0..frames {
         let t = std::time::Instant::now();
-        let t_w = k + 1;
+        let t_w = spf * (k + 1);
         const CHUNK: usize = 16;
         let next_chunk = std::sync::atomic::AtomicUsize::new(0);
         let parts: Vec<Result<(Vec<(usize, Vec<Succ>)>, u64)>> = std::thread::scope(|sc| {
@@ -1069,7 +1077,7 @@ pub fn concrete_search(
                             let mut chunk_seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
                             'chunk: for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
                                 for byte in input_order(prefer, k) {
-                                    for b in eng.step(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
+                                    for b in eng.frame(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
                                         steps += 1;
                                         let cell = b.positions()?[0];
                                         // Dedup on the EXACT key, never `b.keys()` (the
@@ -1157,13 +1165,13 @@ pub fn concrete_search(
             return Ok(Some(Witness { inputs, cells }));
         }
         if next.is_empty() {
-            println!("NO CONCRETE WIN by f{horizon}: no concrete state inside W past layer {k} ({steps} steps)");
+            println!("NO CONCRETE WIN by f{frames}: no concrete state inside W past layer {k} ({steps} steps)");
             return Ok(None);
         }
         back.push(links);
         cur = next;
     }
-    println!("NO CONCRETE WIN by f{horizon} ({steps} steps)");
+    println!("NO CONCRETE WIN by f{frames} ({steps} steps)");
     Ok(None)
 }
 
@@ -1180,7 +1188,8 @@ pub enum Concrete {
 
 /// What the arc phase of a search found (`solve`).
 pub struct Solved {
-    /// The optimum over the rotation graph, a lower bound on the game's.
+    /// The optimum over the rotation graph, a lower bound on the game's, in
+    /// FRAMES (`horizon` and the marks' deadlines are in search steps).
     /// `None`: the horizon is REFUTED.
     pub arc: Option<u32>,
     /// The concrete optimum and its witness, when asked for and found.
@@ -1217,8 +1226,11 @@ pub fn solve(
     // The start has no player yet: any point stands for its remainder.
     let p0 = (super::arcs::point(0), super::arcs::point(0));
     let found = optimum(g, &w, start, p0, horizon);
-    let arc = found.as_ref().map(|f| f.frame);
-    eprintln!("[arc] backward {tb:.2} s; optimum {arc:?}");
+    let arc_steps = found.as_ref().map(|f| f.frame);
+    // In frames: a win at step s is during frame ceil(s / spf) (a lower
+    // bound still: a frame's win is a win at its last step at the latest).
+    let arc = arc_steps.map(|s| s.div_ceil(crate::frame::steps_per_frame()));
+    eprintln!("[arc] backward {tb:.2} s; optimum {arc_steps:?} (steps)");
     // The nodes as (shape, key, cell), in ONE pass over the frame files (the
     // marks are the nodes, in order): the fingerprints, the marks file and
     // the concrete search's keys.
@@ -1267,7 +1279,7 @@ pub fn solve(
         println!("[gate] h{horizon} W f{t:03} {n} {acc:016x}");
     }
     drop(node_key);
-    println!("[gate] h{horizon} arc optimum {}", arc.map_or("none".to_string(), |f| f.to_string()));
+    println!("[gate] h{horizon} arc optimum {}", arc_steps.map_or("none".to_string(), |f| f.to_string()));
     crate::metrics::mem_phase("arc: fingerprints");
     // Per node the LAST frame its winning set is non-empty (its deadline):
     // the next level's filter, and the UI's arc marks.

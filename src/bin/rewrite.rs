@@ -491,14 +491,13 @@ fn main() -> Result<()> {
             if let Some(xy) = &win_at {
                 std::env::set_var("CELESTE_WIN_AT_XY", xy);
             }
-            anyhow::ensure!(
-                std::env::var_os("CELESTE_SPLIT_FRAME").is_none(),
-                "the arc search runs whole frames: CELESTE_SPLIT_FRAME is not supported"
-            );
             let horizon = match (ceiling, to) {
                 (Some(h), None) | (None, Some(h)) => h,
                 _ => anyhow::bail!("give the horizon: --to H, or --ceiling H for a known solution"),
             };
+            // The horizon is in FRAMES; the tree, the arcs and the marks
+            // count search steps (two a frame under the split frame).
+            let steps = horizon * celeste_rust::frame::steps_per_frame();
             let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
             eprintln!("[search] room {room}, levels {level}, horizon {horizon}");
             let t0 = std::time::Instant::now();
@@ -513,9 +512,9 @@ fn main() -> Result<()> {
                 // used as it is; a finer level's tree is filtered for this
                 // horizon - delete it to change the horizon or the levels.
                 let t = std::time::Instant::now();
-                let first_win = match celeste_rust::frame::tree_first_win_through(&dir, horizon)? {
+                let first_win = match celeste_rust::frame::tree_first_win_through(&dir, steps)? {
                     Some(w) => {
-                        eprintln!("[search] {}: the tree reaches f{horizon}", dir.display());
+                        eprintln!("[search] {}: the tree reaches step {steps}", dir.display());
                         w
                     }
                     None => {
@@ -526,11 +525,11 @@ fn main() -> Result<()> {
                             None => celeste_rust::frame::ForwardState::start(initial()?, &dir, true)?,
                         };
                         let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l));
-                        st.extend(&engine, &dir, horizon, filter.as_ref())?;
+                        st.extend(&engine, &dir, steps, filter.as_ref())?;
                         st.win_frame
                     }
                 };
-                eprintln!("[search] level {li} ({lvl}): forward to f{horizon} in {:.1} s; first win {first_win:?}", t.elapsed().as_secs_f64());
+                eprintln!("[search] level {li} ({lvl}): forward to step {steps} in {:.1} s; first win {first_win:?} (step)", t.elapsed().as_secs_f64());
                 celeste_rust::metrics::mem_phase("forward");
                 // THE ARC PHASE and the concrete search (at a coarser level
                 // only the try at the bound).
@@ -541,7 +540,7 @@ fn main() -> Result<()> {
                 };
                 // Every level saves its marks (the next overwrites): the search can end
                 // at a coarser level when its try at the bound finds the witness.
-                let s = solve(&dir, lvl, horizon, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref())?;
+                let s = solve(&dir, lvl, steps, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref())?;
                 let wall = t0.elapsed().as_secs_f64();
                 let Some(bound) = s.arc else {
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
