@@ -193,7 +193,12 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   under the spawn). With `p` an overlapped floor now stores its COMPUTED
   `state`/`collideable`, owing nothing (exact; `Rt2::widen_to` keeps an
   overlapped floor's values). Why `p` reaches an outcome with the
-  overlapped floor solid is not understood (n alone does not).
+  overlapped floor solid is not proven. The likely reason: a merge `p`
+  refuses leaves two outcomes whose live guards read a platform atom
+  (three-valued, and an unknown `live` reads as live), so an outcome dead on
+  a lane is evaluated there and its owe fails; at `n` alone the merge
+  selects and the split pass decides it per lane. Storing the computed value
+  turns that into spurious states, which the concrete search refutes.
 
 ## Widened at every level (exact, or a stated caveat)
 
