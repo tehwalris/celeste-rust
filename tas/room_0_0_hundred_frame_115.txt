@@ -1,0 +1,4 @@
+# Room (0,0) "100m", 100% (berry taken): exit during frame 115 (2026-10-08), OPTIMAL.
+# Community 100% TAS1: 118 in our counting. CELESTE_HUNDRED=1, r0sxhn,r0sxh, level -1 (118,5), --ceiling 118: arc bound 115 at level 0, the try at the bound wins (405 steps).
+# Original cart on PICO-8 under seeds []: berry taken, exits f115; UCT finished 88 inputs (database finished 91 inputs).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,18,2,2,2,2,2,2,2,34,0,0,0,0,0,0,0,0,0,0,16,1,1,1,2,1,2,37,0,0,0,0,0,0,0,0,1,1,0,32,0,0,0,0,0,42,2,0,42,0,0,42,0,0,0,0,0,0,16,0,0,0,0,2,2,2,2,2,2,2,2,2,2,2,38,2,2,2,2,38,0,0,0,0,0,16,0,0,16

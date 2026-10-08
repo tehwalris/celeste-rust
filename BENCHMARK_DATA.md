@@ -1,5 +1,26 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# 100%, 2026-10-08 (release, 16 threads, branch `hundred`, 55 GB cap)
+
+Shared machine (the gemskip campaign alongside): times are noisy. Peaks are
+VmHWM; "kept" is a frame's new states. All with `CELESTE_HUNDRED=1
+CELESTE_TRIM_ROWS=1`, level -1 at (REF, 5) unless noted.
+
+`frame::berry_lost` + the berry-aware level -1, room (3,1) `r0sxhf`, L1
+78: f45 936,820 -> 468,412, f50 3,779,828 -> 1,889,884 kept (the fly fruit
+gone once the player dashes).
+
+| room | levels | kept, widest | peak | wall | answer |
+|---|---|---|---|---|---|
+| (3,1) 1200m | `r0sxhf,r0sxh` | ~9M (f61) | 16.4 GB | 1093 s (overnight binary: 2496 s to the arc phase) | bounds 76, 78; tie 78 |
+| (4,3) 2900m | `r0sxhn,r0sxh` | 22.0M (f90) | 26.4 GB | 2768 s | bounds 106, 107 (no win at either), BFS win at 109 |
+| (0,3) 2500m | `r0sxhn,r0sxh` | 12.6M (f96) | 42.3 GB | 2452 s | bound 134 at level 0; overnight (no berry rule): 56.5M at f111, still growing |
+| (6,1) 1500m split | `r0sxhn,r0sxh` | 18.3M a step (193) | 30.5 GB | 4164 s | bounds f112, f113; BFS win at 114 |
+| (5,1) 1400m | `r0sxhn` | 63.8M at f94, +11%/frame | 39.6 GB at f94 | stopped | - |
+| (6,0) 700m split, no L1 | `r0sxhfp` | 30.3M a step (130), 14.6k at 198 | 50.9 GB forward, then OOM (55 GB) in the arc phase after the BFS | 5577 s | - |
+| (6,0) 700m split, no L1 | `r0sxhp` (fruit exact) | 19.5M at step 85 (`f`: 2.5M at 80) | | stopped | - |
+| (2,0) 300m | `r0sxh` | the overnight curve (104M at f84) | | stopped at f61 | - |
+
 # Nodiag 700m and 1800m by the reach ladder down to exact objects, 2026-10-08 night (release, 16 threads, branch `nodiag-finish`)
 
 Shared machine (another agent's search alongside): times are noisy; counts

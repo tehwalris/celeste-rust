@@ -166,6 +166,10 @@ pub struct BoundaryIds {
     pub g_fall_floor: u32,
     /// The orb room's big chest (`frame::orb_deadline_skip`).
     pub g_big_chest: u32,
+    /// The berry's other sources (`frame::berry_lost`): the chest the key
+    /// opens, and the fake wall that drops one when broken.
+    pub g_chest: u32,
+    pub g_fake_wall: u32,
     pub f_state: u32,
     pub f_delay: u32,
     pub f_collideable: u32,
