@@ -6,7 +6,8 @@ and verify every result end to end.
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
-"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"; "reuse": a level-0 tree to reuse;
+"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"; "reuse": a level-0 tree directory, moved in when it exists and moved back
+there when the job ends - so jobs can count horizons up on one kept tree;
 "to": a horizon H instead of the reference, `--to H` with level -1 at H - a
 lower horizon cuts far more, and a refutation is a result: no win by H); re-read
 before every job, so jobs can be appended while it runs; a job whose key is
@@ -143,6 +144,15 @@ def nudged_seeds(room, seeds, steps=10):
             yield ",".join(out + vals[len(tiles):])
 
 
+def drop_tree(jd, job):
+    """Delete a job's tree; its level 0 goes back to `reuse` (or there for the first time)."""
+    tree = os.path.join(jd, "tree")
+    keep = job.get("reuse")
+    if keep and os.path.isdir(os.path.join(tree, "level00")) and not os.path.exists(keep):
+        shutil.move(os.path.join(tree, "level00"), keep)
+    shutil.rmtree(tree, ignore_errors=True)
+
+
 def run(job, outdir, binary):
     cat, room, name = job["cat"], job["room"], job["name"]
     # `tag`: a retry of a room with other settings, recorded apart.
@@ -193,9 +203,11 @@ def run(job, outdir, binary):
             env["CELESTE_LEVEL_MINUS_ONE"] = f"{steps},5"
         log = os.path.join(jd, "search.log")
         tree = os.path.join(jd, "tree")
-        shutil.rmtree(tree, ignore_errors=True)
-        # `reuse`: a finished level-0 tree of this room, level and horizon (a
-        # retry with a longer objects ladder), moved in so `search` reuses it.
+        drop_tree(jd, job)
+        # `reuse`: a level-0 tree of this room and level (a retry with a
+        # longer objects ladder, or another horizon - at most the one its level
+        # -1 filter ran at, which the search checks), moved in so `search`
+        # reuses it.
         if job.get("reuse") and os.path.isdir(job["reuse"]):
             os.makedirs(tree)
             shutil.move(job["reuse"], os.path.join(tree, "level00"))
@@ -210,7 +222,7 @@ def run(job, outdir, binary):
             res["l1"] = "refused"
             rc, log, secs = search(False)
     except subprocess.TimeoutExpired:
-        shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+        drop_tree(jd, job)
         return {**res, "status": "search timed out"}
     res["search_s"] = round(secs)
     peak = re.findall(r"peak ([\d.]+) GB", log)
@@ -219,10 +231,10 @@ def run(job, outdir, binary):
     m = re.search(r"OPTIMAL win frame: (\d+)", log)
     if rc == 0 and not m and job.get("to") and re.search(r"^(REFUTED: no win by f|no concrete win by f)", log, re.M):
         # A proof about the game: no win by the horizon.
-        shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+        drop_tree(jd, job)
         return {**res, "status": f"no win by f{horizon}"}
     if rc != 0 or not m:
-        shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+        drop_tree(jd, job)
         tail = [l for l in log.splitlines() if l.strip()][-3:]
         return {**res, "status": f"search failed (exit {rc})", "tail": tail}
     opt = int(m.group(1))
@@ -314,7 +326,7 @@ def run(job, outdir, binary):
             res["ui"] = rid
         except Exception as ex:  # the result stands; the UI can be redone
             res["ui_error"] = str(ex)[:200]
-    shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+    drop_tree(jd, job)
     return res
 
 
