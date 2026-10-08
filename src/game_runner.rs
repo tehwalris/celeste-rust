@@ -51,6 +51,33 @@ pub fn hundred() -> bool {
     std::env::var_os("CELESTE_HUNDRED").is_some()
 }
 
+/// `CELESTE_LOADING_JANK=J`: start the room as REAL PLAY enters it - the
+/// transition's loading frame updates the new room's objects from the
+/// leaving player's index J on (`trace::cart::apply_loading_frame`; J as
+/// `pico8_diff/chain.py` reports it, in the original cart's object order).
+/// Unset (or `none`): the IL load, the room alone - UniversalClassicTas's
+/// start, which real play does not have where an object updated by the
+/// loading frame changes (room (6,2)'s fly fruit, 2026-10-08: a 63 that dies
+/// in real play). tools/category_runner.py always sets it.
+pub fn loading_jank() -> Option<usize> {
+    static J: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *J.get_or_init(|| {
+        let j = match std::env::var("CELESTE_LOADING_JANK") {
+            Ok(s) if s != "none" => {
+                let j: usize = s.trim().parse().unwrap_or_else(|_| panic!("CELESTE_LOADING_JANK must be an object index >= 1 or `none`, got {s:?}"));
+                assert!(j >= 1, "CELESTE_LOADING_JANK must be >= 1");
+                Some(j)
+            }
+            _ => None,
+        };
+        match j {
+            Some(j) => eprintln!("[start] the room as real play enters it: its loading frame from object {j}"),
+            None => eprintln!("[start] IL load: no loading frame (CELESTE_LOADING_JANK unset) - not real play where the room's objects move on it"),
+        }
+        j
+    })
+}
+
 /// The level whose big chest holds the orb (`max_djump=2`): room (5,2).
 pub const ORB_LEVEL: i16 = 21;
 

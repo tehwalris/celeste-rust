@@ -571,6 +571,41 @@ frame's record count: 13 GB at f58, 30 GB at f67; later frames have up to
 small so far: median 1-6 rectangles per node), time-indexing W only where it
 changes. (Moving platforms and the split frame run since 2026-10-08.)
 
+## The room's start: as real play enters it (2026-10-08)
+
+The search starts from `_init()` on the minimal cart: `load_room(x, y)` for
+the start room (`game_runner::apply_start_room`). Real play enters a room
+differently. The leaving player's update calls `next_room()` INSIDE
+`_update`'s `foreach`, and PICO-8's `all` resumes at the same index in the
+new `objects`. So the new room's objects from the leaving player's index J
+on get one update (move, then update) on the loading frame, and then the
+frame draws.
+
+`CELESTE_LOADING_JANK=J` (`trace::cart::apply_loading_frame`) appends that
+loop and a `_draw()` to the start room's load. J counts the ORIGINAL cart's
+objects; it is translated past the `message` and `flag` that the minimal cart
+lacks (`minimal_index`). Unset, the start is the IL load, and the binary says
+so on stderr (`[start]`). The patch is in the Lua sources, so everything that
+reads `cart::sources` sees the same start: the kernels' retrace, the
+reference engine, level -1 (whose cache key includes the env and the Lua) and
+the platform worlds.
+
+Room (1,0) with J >= 2 is the IL start: it has only the spawn, and the gates
+are unchanged. J = 1 (a 100% run) moves the spawn one frame earlier, and the
+arc gate's optimum becomes 32.
+
+J is HISTORY: it depends on how the previous room was played (plans/results.md
+"Real play"). The sound treatment is the set of feasible J's, grouped by the
+start state each gives:
+- `pico8_diff/chain.py` `feasible_janks` / `start_classes` compute the
+  classes, using `concrete_run --dump-start` to compare start states;
+- `tools/category_runner.py` `expand` runs one search per class;
+- the boot chain's class carries the witness and the upload.
+
+The ground truth for both the start and the verdict is the boot chain on a
+real PICO-8 (`chain.py --boot`). `chain.py --check-start CONCRETE_RUN`
+compares the search's start against it, field by field.
+
 ## Gates
 
 Every change to the loop, the kernels or the tracer must reproduce the

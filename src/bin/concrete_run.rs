@@ -26,6 +26,73 @@ struct Cli {
     /// (e.g. `fly_fruit`: its `step`, `y`, `spd`, `rem`).
     #[arg(long)]
     object: Option<String>,
+
+    /// Print the start state (every object's fields, as `pico8_diff/replay.py
+    /// --dump` prints them on a real PICO-8) and exit: the search's room
+    /// entry, to compare field by field with a real chain's
+    /// (`pico8_diff/chain.py --check-start`).
+    #[arg(long)]
+    dump_start: bool,
+}
+
+/// The object types `--dump-start` names (pico8_diff/replay.py TYPES).
+const TYPES: &[&str] = &["player", "player_spawn", "spring", "balloon", "fall_floor", "smoke", "fruit", "fly_fruit", "lifeup", "fake_wall", "key", "chest", "platform", "message", "big_chest", "orb", "flag", "room_title"];
+
+/// PICO-8's `tostr(v, true)`: the 16.16 bits as `0xwwww.ffff`.
+fn hex(n: Pico8Num) -> String {
+    let b = n.to_bits();
+    format!("0x{:04x}.{:04x}", b >> 16, b & 0xffff)
+}
+
+/// One value as `replay.py`'s dump prints it; a table of numbers inline.
+fn dump_value(st: &Rt2, c: u32) -> Option<String> {
+    use celeste_engine::runtime2::Cell2;
+    Some(match st.cols[c as usize].at(0) {
+        AV::Num(n) => hex(n),
+        AV::Bool(b) => b.to_string(),
+        AV::Ptr(t) => {
+            let Cell2::Obj(fields) = &st.structure[t as usize] else { return None };
+            let mut s = String::new();
+            for k in ["x", "y", "w", "h"] {
+                if let Some(&(_, fc)) = fields.iter().find(|(f, _)| Some(*f) == celeste_names::field_id(k)) {
+                    match st.cols[fc as usize].at(0) {
+                        AV::Num(n) => s += &format!("{k}={},", hex(n)),
+                        AV::Bool(v) => s += &format!("{k}={v},"),
+                        _ => {}
+                    }
+                }
+            }
+            format!("{{{s}}}")
+        }
+        _ => return None,
+    })
+}
+
+/// `obj I TYPE k=v ...` per object in `objects` order, keys sorted.
+fn dump_start(st: &Rt2) {
+    use celeste_engine::runtime2::Cell2;
+    let mut names = std::collections::HashMap::new();
+    for t in TYPES {
+        for o in objects_of_type(st, t) {
+            names.insert(o, *t);
+        }
+    }
+    let Some(arr) = celeste_names::global_id("objects").and_then(|g| st.global_target(g)) else { return };
+    let Cell2::Arr(items) = &st.structure[arr as usize] else { return };
+    for (i, &item) in items.iter().enumerate() {
+        let AV::Ptr(o) = st.cols[item as usize].at(0) else { continue };
+        let Cell2::Obj(fields) = &st.structure[o as usize] else { continue };
+        let mut kv: Vec<(String, String)> = fields
+            .iter()
+            .filter_map(|&(f, c)| {
+                let k = celeste_names::FIELD_NAMES[f as usize];
+                (k != "type" && k != "hair").then(|| Some((k.to_string(), dump_value(st, c)?))).flatten()
+            })
+            .collect();
+        kv.sort();
+        let kv: Vec<String> = kv.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+        println!("obj {} {} {}", i + 1, names.get(&o).unwrap_or(&"?"), kv.join(" "));
+    }
 }
 
 /// Formats as floor.frac_hex, NOT sign-magnitude: `-4.76ec` is
@@ -104,6 +171,10 @@ fn print_frame(st: &Rt2, frame_num: u32, input_byte: u8) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.dump_start {
+        dump_start(&RefEngine::new()?.initial()?);
+        return Ok(());
+    }
 
     let inputs: Vec<u8> = cli
         .inputs

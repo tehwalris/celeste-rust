@@ -157,6 +157,82 @@ cuts), 700m (the `f` level's arc phase past 55 GB). Two exact changes made
 them fit: rows whose berry is lost are not expanded, and level -1 drops
 exits that leave the berry behind. Witnesses: `tas/room_X_Y_hundred_frame_N.txt`.
 
+## Real play: the loading jank (2026-10-08, branch `loading-jank`)
+
+**Every result above was searched and verified from an IL LOAD** (the room
+loaded alone, as UniversalClassicTas loads it). Real play does not enter a
+room that way. The leaving player's `_update` calls `next_room()` from inside
+`_update`'s `foreach(objects, ...)`. PICO-8's `all` resumes at the same index
+in the NEW list, so the new room's objects from the leaving player's index J
+on get one update (move, then update) on the loading frame. Then the frame
+draws. Celia (gonengazit/Celia, the community's current tool) models this:
+its IL load updates objects from the previous room's object count on.
+
+Found on 100% 2300m (6,2). Our 63 (TAS23, submitted) exits in the IL load
+and in UCT. It dies in Celia, in the chain from (5,2) and in the boot chain.
+J = 2 there, so the fly fruit is one bob ahead (`step` 0.55, not 0.5). The
+database's 68 exits in all of them. A community member doubted the 63 and
+was right.
+
+The tools:
+
+- `pico8_diff/chain.py` plays rooms on a real PICO-8 through the real
+  transitions, using the tasdatabase's files (the category's, else
+  FALLBACK's).
+  - `--boot` starts from 100m: this is the ground truth.
+  - `--modes` diffs the room-entry state of the IL load and of the jank
+    model against the chain's, field by field.
+  - `--check-start` does the same for the search's own start state.
+  - `--feasible` lists every J a play of the previous room can give.
+  - `--vary` compares the entry state after every category's boot chain.
+- `tools/celia/validate.sh` runs Celia headless.
+- `tools/uct/check_uploads.py` runs IL, UCT, Celia, the chain and the boot
+  chain, and gives a verdict.
+
+Every database 100%/any% file from 100m to 2300m replays in the boot chain
+at its database count. The jank model (`replay.py --jank J`, and the search's
+`CELESTE_LOADING_JANK=J`) gives the chain's entry state exactly. Only these
+fields differ: `seconds`, `music_timer`, `new_bg` and `frames` (timer, music,
+background), and the key's sprite, which is drawn from `frames`.
+
+**What the room entry depends on.** The jank index J depends on how the
+previous room was played: J = 1 + the objects before the player when it
+leaves. That is the previous room's objects less the spawn, less every
+destroyed one (a berry taken, a fly fruit, a key, a chest, a fake wall),
+plus the room title or the spawn's smoke if the exit came soon enough.
+- 100% runs collect berries, which lowers J. Room (1,0) is entered with
+  J 1 in 100% and J 2 in any%: the spawn itself is one frame ahead.
+- Room (5,0)'s spawn and balloon move, in 100% and key.
+- `--vary` over all levels, comparing 8 categories' boot chains: only J
+  moves objects.
+- Among the globals, only these vary: `max_djump` (the category's orb),
+  `got_fruit` (the category's own record, not this room's) and the
+  cosmetic ones.
+- No held button carries over (a new player has `p_jump`/`p_dash` false).
+- `freeze` at entry can be 2 after a dash on the exit frame. It freezes
+  every object alike, so no count changes.
+- `rnd` is seeded by the file's `[seeds]`, the stated caveat.
+
+The search therefore takes the room's start as a set of J classes.
+`category_runner` runs the main search at the boot chain's J (its witness is
+valid after the database's previous rooms) and one search-only job per other
+feasible start (`chain.start_classes`). The history-widened optimum is the
+least of them.
+
+Re-verification (2026-10-08). IL / UCT / Celia / boot chain, all at the
+claimed count unless noted:
+- 100%:
+  - 100m 87, 500m 122 and 2600m 135 are VALID.
+  - **2300m 63 is INVALID: it dies in Celia, the chain and the boot chain.**
+  - All 11 ties are VALID.
+- nodiag: **1800m 86 (TAS18, submitted) is INVALID**, dying in Celia, the
+  chain and the boot chain. Room (1,2)'s platforms are janked. Every other
+  nodiag upload is VALID.
+- gemskipany and gemskipnodiag: every upload is VALID. The gemskipany boot
+  chain breaks at the database's own 2600m, which dies on PICO-8 in every
+  mode but finishes in UCT and Celia (they compute in doubles). Past it the
+  boot restarts at 2700m.
+
 ## Caveats on what "optimal" means here
 
 - **Balloon rooms**: `rnd` is an interval at every level, so a confirmation is

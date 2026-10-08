@@ -15,6 +15,9 @@ before every job, so jobs can be appended while it runs; a job whose key is
 already in OUTDIR/results.jsonl is skipped.
 
 Per job:
+ 0. the room's start as real play enters it: its loading frame from object
+    J (pico8_diff/chain.py entry_jank: the category's boot chain; a job's
+    "jank": J or "none"), for the search (CELESTE_LOADING_JANK) and every replay;
  1. the reference: the community TAS replayed in the ORIGINAL cart behind the
     room's prologue (the earliest offset around `offset` that exits);
  2. `rewrite search --ceiling REF --prefer <the community TAS>` with the
@@ -24,13 +27,17 @@ Per job:
  3. our witness replayed in the original cart (must exit at the optimum; no
     diagonal dash in a nodiag category);
  4. both files through UniversalClassicTas (tools/uct/validate.sh): the clean
-    save of ours is the upload file (OUTDIR/upload/<cat>/TAS<n>.tas);
+    save of ours is the upload file (OUTDIR/upload/<cat>/TAS<n>.tas); then,
+    mandatory, the upload in REAL PLAY: the boot chain on a real PICO-8 and
+    Celia (tools/uct/check_uploads.py), "real_play" in the result;
  5. an improvement gets a web UI run (export-ui + runs.json).
 Results: one JSON line per job in OUTDIR/results.jsonl.
 """
 import json, os, re, shutil, subprocess, sys, time
 
 M = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(M, "pico8_diff"))
+import chain  # noqa: E402
 DB = os.path.expanduser("~/src/github.com/CelesteClassic/tasdatabase")
 ORIG = os.path.expanduser("~/src/github.com/tehwalris/celeste_ocaml/celeste.lua")
 UI = "/var/tmp/celeste-ui/data"
@@ -57,9 +64,16 @@ def parse_tas(text):
     return seeds, [int(x) for x in re.findall(r"\d+", text[text.index("]") + 1:])]
 
 
-def replay_exit(room, inputs, seeds, cat):
-    """The frame the room changes during, replaying `inputs` in the ORIGINAL cart."""
-    cmd = [f"{M}/pico8_diff/replay.py", "--lua", ORIG, "--begin-game", "--room", room, "--inputs", ",".join(map(str, inputs)), "--frames", str(len(inputs) + 3)] + replay_args(cat)
+def jank_args(jank):
+    """The room's start as real play enters it (`run`'s `jank`)."""
+    return ["--jank", str(jank)] if jank else []
+
+
+def replay_exit(room, inputs, seeds, cat, jank=None):
+    """The frame the room changes during, replaying `inputs` in the ORIGINAL
+    cart, the room started as the search starts it (its loading frame from
+    object `jank`)."""
+    cmd = [f"{M}/pico8_diff/replay.py", "--lua", ORIG, "--begin-game", "--room", room, "--inputs", ",".join(map(str, inputs)), "--frames", str(len(inputs) + 3)] + replay_args(cat) + jank_args(jank)
     # `[]` in a tasdatabase file: UniversalClassicTas seeds every balloon 0
     # (not PICO-8's rnd), so the replay does too.
     cmd += ["--balloon-seeds", seeds or "0"]
@@ -96,7 +110,7 @@ def diag_dashes(inputs):
     return bad
 
 
-def canon_jumps(room, inputs, seeds, cat):
+def canon_jumps(room, inputs, seeds, cat, jank=None):
     """Keep the jump bit only where a jump FIRES in the minimal cart (the
     search's model). The original cart buffers a press for 4 frames (jbuffer),
     so a press that does nothing in the minimal cart - one copied from a
@@ -105,7 +119,7 @@ def canon_jumps(room, inputs, seeds, cat):
     minimal cart is replayed under the file's balloon seeds (concrete_run has
     none: a balloon room's run diverged there and kept a press, gemskip
     2800m 2026-10-07)."""
-    cmd = [f"{M}/pico8_diff/replay.py", "--room", room, "--inputs", ",".join(map(str, inputs)), "--frames", str(len(inputs) + 1), "--balloon-seeds", seeds or "0"] + replay_args(cat)
+    cmd = [f"{M}/pico8_diff/replay.py", "--room", room, "--inputs", ",".join(map(str, inputs)), "--frames", str(len(inputs) + 1), "--balloon-seeds", seeds or "0"] + replay_args(cat) + jank_args(jank)
     out = subprocess.run(cmd, capture_output=True, text=True, cwd=M, timeout=900).stdout
     spd_y = {}
     for line in out.splitlines():
@@ -177,10 +191,22 @@ def run(job, outdir, binary):
     dbtext = open(f"{DB}/classic/{cat}/{entry['file']}").read()
     seeds, dbin = parse_tas(dbtext)
     res["db_file"], res["db_frames"] = entry["file"], entry.get("frames")
+    # 0. the room's start as REAL PLAY enters it: the transition's loading
+    # frame updates its objects from the leaving player's index J (the
+    # category's boot chain measures it; a job's "jank" overrides it, "none":
+    # the IL load). The search, every replay and the reference start so.
+    rx, ry = (int(v) for v in room.split(","))
+    jank = job.get("jank", "measure")
+    if jank == "measure":
+        jank = chain.entry_jank(cat, rx + 8 * ry + 1)
+    jank = None if jank == "none" else jank
+    res["jank"] = jank
+    if job.get("jank_classes"):
+        res["jank_classes"] = job["jank_classes"]
     # 1. the reference
     ref = None
     for off in range(job["offset"] - 2, job["offset"] + 3):
-        e, _ = replay_exit(room, [0] * off + dbin, seeds, cat)
+        e, _ = replay_exit(room, [0] * off + dbin, seeds, cat, jank)
         if e is not None:
             ref, prologue = e, off
             break
@@ -200,6 +226,7 @@ def run(job, outdir, binary):
     # 2. the search
     def search(l1):
         env = dict(os.environ, **mode_env(cat), **job.get("env", {}))
+        env["CELESTE_LOADING_JANK"] = str(jank) if jank else "none"
         # The concrete steps under the community file's balloon seeds ([]: 0):
         # the witness is then one real run under them.
         env["CELESTE_CONCRETE_BALLOON_SEEDS"] = seeds
@@ -256,6 +283,9 @@ def run(job, outdir, binary):
         opt = int(m.group(1))
         ours = [int(x) for x in re.search(r"concrete optimum \d+ inputs (\S+)", log).group(1).split(",")]
     res["ours"] = opt
+    if job.get("search_only"):
+        drop_tree()
+        return {**res, "status": "search only: another start class of the room (the widened optimum is the least)"}
     open(os.path.join(jd, "witness.txt"), "w").write(",".join(map(str, ours)))
     # 3. verification in the original cart
     hundred = cat in ("100", "gemskip100")
@@ -264,12 +294,12 @@ def run(job, outdir, binary):
     # berry where the file's chest seed does not put it: then the other
     # chest seeds are tried, and the upload carries the one that works.
     for sd in [seeds] + (chest_seed_variants(room, seeds) if hundred else []):
-        mine, e, out = ours, *replay_exit(room, ours, sd, cat)
+        mine, e, out = ours, *replay_exit(room, ours, sd, cat, jank)
         if e != opt:
             # A jump press that does nothing in the minimal cart can fire later in
             # the original (its jump buffer): keep only the presses that fire.
-            canon = canon_jumps(room, ours, sd, cat)
-            e2, out2 = replay_exit(room, canon, sd, cat)
+            canon = canon_jumps(room, ours, sd, cat, jank)
+            e2, out2 = replay_exit(room, canon, sd, cat, jank)
             res["jump_canonicalized"] = f"original cart exit {e} -> {e2}"
             if e2 == opt:
                 mine, e, out = canon, e2, out2
@@ -311,7 +341,7 @@ def run(job, outdir, binary):
         cuts = [c for c in [prologue] + ([lead] if lead < prologue else []) + [prologue - 1] if not any(ours[:c])]
         tries = [(seeds, c) for c in cuts] + [(sd, c) for sd in nudged_seeds(room, seeds or "0") for c in cuts]
         for sd, cut in tries:
-            if sd != seeds and replay_exit(room, ours, sd, cat)[0] != opt:
+            if sd != seeds and replay_exit(room, ours, sd, cat, jank)[0] != opt:
                 continue
             mine = os.path.join(jd, f"ours-{entry['file']}")
             open(mine, "w").write(f"[{sd}]" + ",".join(map(str, ours[cut:])))
@@ -327,7 +357,14 @@ def run(job, outdir, binary):
                 res["upload"] = os.path.join(up, entry["file"])
                 break
     res["status"] = "IMPROVED" if opt < ref else ("tie" if opt == ref else "WORSE?")
-    res["verified"] = (e == opt) and not res.get("diagonal_dashes") and res.get("uct_ours", "").startswith("finished") and res.get("berry", True)
+    # 4b. MANDATORY: the upload in real play - the boot chain on a real
+    # PICO-8 and Celia (tools/uct/check_uploads.py): UCT's IL load is not
+    # real play (2026-10-08: a 100% 2300m 63 that UCT finishes dies in both).
+    if res.get("upload"):
+        sys.path.insert(0, os.path.join(M, "tools", "uct"))
+        import check_uploads
+        res["real_play"] = check_uploads.check(res["upload"], False, cat)
+    res["verified"] = (e == opt) and not res.get("diagonal_dashes") and res.get("uct_ours", "").startswith("finished") and res.get("berry", True) and res.get("real_play", "").endswith("\tVALID")
     # 5. the UI
     if opt < ref and not job.get("witness"):
         try:
@@ -360,15 +397,41 @@ def run(job, outdir, binary):
     return res
 
 
+def expand(job, cache):
+    """A job is run as real play enters its room: its loading frame from the
+    J of the category's boot chain (`chain.entry_jank`). Where another play
+    of the previous room gives the room another start (`chain.start_classes`:
+    every feasible J, grouped by the start state), one SEARCH-ONLY job per
+    other start, tagged `-J<j>`: the history-WIDENED optimum is the least of
+    them all; the main job's witness is valid after the database's previous
+    rooms. A job with its own "jank", or a "witness", is run as it is."""
+    if "jank" in job or job.get("witness"):
+        return [job]
+    key = f"{job['cat']}/{job['name']}{job.get('tag', '')}"
+    if key not in cache:
+        rx, ry = (int(v) for v in job["room"].split(","))
+        level = rx + 8 * ry + 1
+        j = chain.entry_jank(job["cat"], level)
+        if j is None:
+            cache[key] = [{**job, "jank": "none"}]
+        else:
+            concrete = os.environ.get("CONCRETE_RUN", f"{M}/target/release/concrete_run")
+            classes = chain.start_classes(level, concrete, job["cat"])
+            others = [{**job, "jank": c[0], "tag": job.get("tag", "") + f"-J{c[0]}", "search_only": True} for c in classes if j not in c]
+            cache[key] = [{**job, "jank": j, "jank_classes": classes}] + others
+    return cache[key]
+
+
 def main():
     jobs_path, outdir = sys.argv[1], sys.argv[2]
     os.makedirs(outdir, exist_ok=True)
     results = os.path.join(outdir, "results.jsonl")
+    cache = {}
     while True:
         done = set()
         if os.path.exists(results):
             done = {json.loads(l)["key"] for l in open(results) if l.strip()}
-        todo = [j for j in json.load(open(jobs_path)) if f"{j['cat']}/{j['name']}{j.get('tag', '')}" not in done]
+        todo = [j for job in json.load(open(jobs_path)) for j in expand(job, cache) if f"{j['cat']}/{j['name']}{j.get('tag', '')}" not in done]
         if not todo:
             print("all jobs done", flush=True)
             return

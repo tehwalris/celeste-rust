@@ -231,6 +231,31 @@ grep '^\[gate\]' log | diff - gates/arc_room10_win9-101_h35.txt          # empty
   forward. Kernels against the reference engine, row by row: `rewrite
   ref-check`. `kernel lanes: missed 0` in every log.
 
+## Verifying a result: REAL PLAY, not the IL load
+
+A per-room TAS is valid only if it works in a full-game chain. In real play
+a room is entered through a transition: its objects from the leaving
+player's index J get one extra update on the loading frame (the "loading
+jank"; plans/architecture.md "The room's start").
+- UniversalClassicTas loads a room alone and misses this. A 100% 2300m 63
+  that UCT finished died in real play (2026-10-08).
+- Celia (gonengazit/Celia) models it.
+- Searches run with `CELESTE_LOADING_JANK=J`. The category runner sets it,
+  and searches the other feasible J's too.
+
+```bash
+tools/uct/check_uploads.py [--cat CAT] FILE.tas...   # IL, UCT, Celia, chain, BOOT chain -> VALID/INVALID
+tools/celia/validate.sh LEVEL FILE.tas               # Celia headless (CELIA_DASHES=1 for gemskip)
+pico8_diff/chain.py CAT LEVEL FILE --boot            # real PICO-8 from 100m with the database's files
+pico8_diff/chain.py CAT LEVEL FILE --modes           # IL / jank / chain entry states diffed field by field
+pico8_diff/chain.py CAT LEVEL x --check-start target/quick/concrete_run   # the search's start vs the boot chain
+pico8_diff/chain.py CAT LEVEL x --feasible target/quick/concrete_run      # every J a previous-room play gives
+```
+
+The boot chain is the verdict; a passing UCT run is not. Some database files
+die on PICO-8 but finish in UCT and Celia (both compute in doubles), e.g.
+gemskipany 2600m. A boot chain broken by one restarts after it and says so.
+
 ## Code layout
 
 A cargo workspace; the dependency order is load-bearing:

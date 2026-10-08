@@ -68,6 +68,9 @@ pub fn sources_in(root: &std::path::Path) -> Result<String> {
     // `CELESTE_SPLIT_FRAME`: the split-frame prototype, one frame as two steps.
     let lua = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
     let mut game = crate::game_runner::apply_start_room(&read(lua)?)?;
+    if let Some(j) = crate::game_runner::loading_jank() {
+        game = apply_loading_frame(&game, j, root)?;
+    }
     if nodiag() {
         game = forbid_diagonal_dashes(&game)?;
     }
@@ -113,6 +116,83 @@ fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path) -> Result<
         }
     }
     Ok(game.replacen(PAT, &format!("this.offset={expr}"), 1))
+}
+
+/// The tiles `load_room` makes an object of, in the ORIGINAL cart, and
+/// whether the minimal cart makes it too: platforms (11, 12) and the types
+/// with a `tile`. The minimal cart has no `message` (86, room (3,1)) nor
+/// `flag` (118, the summit); `room_title` is the original's last object.
+const OBJECT_TILES: &[(u8, bool)] = &[
+    (1, true),
+    (8, true),
+    (11, true),
+    (12, true),
+    (18, true),
+    (20, true),
+    (22, true),
+    (23, true),
+    (26, true),
+    (28, true),
+    (64, true),
+    (96, true),
+    (86, false),
+    (118, false),
+];
+
+/// The start room's LOADING FRAME as a real transition runs it
+/// (`CELESTE_LOADING_JANK=J`, `game_runner::loading_jank`): the leaving
+/// player's `_update` loads the room, and the frame's `foreach` goes on over
+/// the NEW room's objects from the player's index J - one update each
+/// (move, then update) - then the frame draws. J counts the ORIGINAL cart's
+/// objects (pico8_diff/chain.py reports it); it is translated to the minimal
+/// cart's list, which lacks `message` and `flag`. Measured against a real
+/// PICO-8 chain field by field (`pico8_diff/chain.py --modes`).
+fn apply_loading_frame(game: &str, j: usize, root: &std::path::Path) -> Result<String> {
+    let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
+    let (rx, ry) = crate::game_runner::start_room();
+    let first = minimal_index(&cart, (rx, ry), j);
+    let call = format!("load_room({}, {})", rx, ry);
+    anyhow::ensure!(game.matches(&call).count() == 1, "CELESTE_LOADING_JANK: the start room's `{call}` was not found exactly once");
+    let frame = format!(
+        "{call} for i={first},#objects do local o=objects[i] if o.spd.x ~= 0 or o.spd.y ~= 0 then o.move(o.spd.x,o.spd.y) end if o.type.update~=nil then o.type.update(o) end end _draw()"
+    );
+    Ok(game.replacen(&call, &frame, 1))
+}
+
+/// The minimal cart's index of room `(rx, ry)`'s first object updated by the
+/// loading frame, the original's J-th: one past the minimal cart's objects
+/// the original creates before it.
+fn minimal_index(cart: &celeste_core::cart_data::CartData, (rx, ry): (i16, i16), j: usize) -> usize {
+    let mut original = 0;
+    let mut before = 0;
+    for tx in 0..16i16 {
+        for ty in 0..16i16 {
+            let tile = cart.mget_whole(rx * 16 + tx, ry * 16 + ty);
+            if let Some(&(_, minimal)) = OBJECT_TILES.iter().find(|(t, _)| *t == tile) {
+                original += 1;
+                if original < j && minimal {
+                    before += 1;
+                }
+            }
+        }
+    }
+    before + 1
+}
+
+#[cfg(test)]
+mod loading_frame_tests {
+    /// Room (3,1) is the spawn, the `message` (original cart only), then the
+    /// fly fruit: a loading frame from the original's 3rd object (the fly
+    /// fruit) starts at the minimal cart's 2nd; one from the message, too.
+    /// Room (6,2) (spawn, fly fruit) needs no translation.
+    #[test]
+    fn the_original_cart_index_maps_past_the_missing_message() {
+        let cart = celeste_core::cart_data::CartData::load(std::path::Path::new("cart")).unwrap();
+        assert_eq!(super::minimal_index(&cart, (3, 1), 3), 2);
+        assert_eq!(super::minimal_index(&cart, (3, 1), 2), 2);
+        assert_eq!(super::minimal_index(&cart, (3, 1), 1), 1);
+        assert_eq!(super::minimal_index(&cart, (6, 2), 2), 2);
+    }
 }
 
 /// `CELESTE_NODIAG`: the No Diagonal Dashes category. A dash may not START
