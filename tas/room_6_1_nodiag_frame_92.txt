@@ -1,0 +1,6 @@
+# Room (6,1) "1500m", No Diagonal Dashes: exit during frame 92 (2026-10-08).
+# Community nodiag TAS15: 93 in our counting. CELESTE_SPLIT_FRAME=1 CELESTE_NODIAG=1, level -1 (186,5) steps,
+# rewrite search --level r0sxhn: arc bound f90; --to 91: no concrete win (exhaustive); --to 92: concrete witness.
+# Jumps canonicalized against the minimal cart. Verified: original cart on PICO-8 (seeds 0,0) exits f92;
+# UniversalClassicTas clean save 67 inputs = 66f against TAS15's 67f. Upload: tas/tasdatabase/nodiag/upload/TAS15.tas
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,2,2,2,2,2,2,0,2,2,2,2,18,2,2,0,0,0,17,0,0,0,0,2,2,2,2,2,0,0,2,1,1,1,1,1,1,1,1,33,33,1,1,1,1,1,1,1,1,16,1,1,36,36,1,36,0,0,0,0,0,16,0,16,0,0,0

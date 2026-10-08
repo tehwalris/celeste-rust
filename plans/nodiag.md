@@ -27,6 +27,7 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (5,1) 1400m | 104 | 121 (TAS14, offset 25) | - | out of memory with level -1 (62 GB); the retry without it filled the disk; not solved |
 | (3,2) 2000m | 128 | 152 (TAS20, offset 31) | - | out of memory; not solved |
 | (1,1) 1000m | 94 | 94 (TAS10) | - | (validation, not run) |
+| (6,1) 1500m | 89 | 93 (TAS15, offset 25) | **92 - 1 FASTER** (UCT: 66f against 67f) | 2026-10-08, split frame, `r0sxhn`, level -1 (186,5) steps, one kept tree: arc bound f90 (no concrete win at 90); `--to 91`: no concrete win inside W (exhaustive, 153k steps); `--to 92`: the breadth-first search's first win at 92 (983 s with the tree reused). Jumps canonicalized; original cart (seeds 0,0) exits f92; UCT 67 inputs = 66f. `tas/room_6_1_nodiag_frame_92.txt`, `tas/tasdatabase/nodiag/upload/TAS15.tas` |
 | (2,1) 1100m | 82 | 87 (TAS11, offset 24) | **85 - 2 FASTER** (UCT: 61f against 62f) | 2026-10-08, `r0sxhnp,r0sxhn` (level -1 refused with `p`): r0sxhnp bound 82 (no concrete win at 82, 14k steps), r0sxhn (platform exact, filtered) bound 85, witness at 85 (2.2k steps); 697 s, 13.7 GB. Original cart (seeds 0, 0.8905): exits f85. Our first press is on frame 24, the frame the player is created (the community file's earliest exiting offset is 24 zeros): the upload starts there, 62 inputs = 61f in UCT, `tas/tasdatabase/nodiag/upload/TAS11.tas`, `tas/room_2_1_nodiag_frame_85.txt` |
 
 ## The platform rooms and the split frame (2026-10-08, branch `nodiag-platforms`)
@@ -54,7 +55,14 @@ solved in any% only with the split frame. What blocked them, and what changed:
   took ~70 min (25M states a step at most, peak 27.5 GB with the arc phase),
   arc bound f90 (ref 93), no concrete win at 90 (18.6k steps); the
   breadth-first search then grew to 27k states a layer by layer 61 at ~5 min
-  a layer: stopped for the objects ladder.
+  a layer: stopped for the objects ladder. `r0sxhn,r0sxh` (after the filter
+  fix): level 0 reproduced every kept and visited count of the first run
+  (the `p` changes leave `n` alone untouched); level 1 (exact objects,
+  filtered) kept 11-18M states a step near the horizon and its arc phase
+  ran out of memory reading the edges (25 GB anonymous, 30.9 GB peak, the
+  30 GB cap). Counting up at level 0 with a kept tree instead (`--to 91`,
+  then 92: the breadth-first search's region is several times smaller per
+  frame of slack) found 92 (the table above).
 - 700m: the level -1 table did not finish in 17 min (`r0sxhfp`, split);
   rerun without it.
 - `rewrite arc-check` runs out of memory on any tree with an unknown number
