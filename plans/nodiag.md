@@ -27,6 +27,7 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (5,1) 1400m | 104 | 121 (TAS14, offset 25) | - | out of memory with level -1 (62 GB); the retry without it filled the disk; not solved |
 | (3,2) 2000m | 128 | 152 (TAS20, offset 31) | - | out of memory; not solved |
 | (1,1) 1000m | 94 | 94 (TAS10) | - | (validation, not run) |
+| (2,1) 1100m | 82 | 87 (TAS11, offset 24) | **85 - 2 FASTER** (UCT: 61f against 62f) | 2026-10-08, `r0sxhnp,r0sxhn` (level -1 refused with `p`): r0sxhnp bound 82 (no concrete win at 82, 14k steps), r0sxhn (platform exact, filtered) bound 85, witness at 85 (2.2k steps); 697 s, 13.7 GB. Original cart (seeds 0, 0.8905): exits f85. Our first press is on frame 24, the frame the player is created (the community file's earliest exiting offset is 24 zeros): the upload starts there, 62 inputs = 61f in UCT, `tas/tasdatabase/nodiag/upload/TAS11.tas`, `tas/room_2_1_nodiag_frame_85.txt` |
 
 ## The concrete count-up (arc-search --witness)
 

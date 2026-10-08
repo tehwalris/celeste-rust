@@ -1,0 +1,6 @@
+# Room (2,1) "1100m", No Diagonal Dashes: exit during frame 85 (2026-10-08).
+# Community nodiag TAS11: 87 in our counting. rewrite search --level r0sxhnp,r0sxhn,
+# CELESTE_NODIAG=1 (level -1 refused with p); level 1 arc bound 85 = optimum, concrete witness.
+# Verified: original cart on PICO-8 (seeds 0,0.8905) exits f85; UniversalClassicTas clean save
+# 62 inputs = 61f against TAS11's 62f (the upload starts at frame 24). Upload: tas/tasdatabase/nodiag/upload/TAS11.tas
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,2,18,2,18,34,2,2,2,34,2,2,2,2,2,2,2,18,36,36,36,36,36,2,2,16,2,2,18,2,2,0,0,0,0,0,16,0,0,2,2,16,2,2,36,2,2,36,0,2,2,18,2,16,18,2,2,0,16,18
