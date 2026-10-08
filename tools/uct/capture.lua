@@ -7,11 +7,12 @@
 --   frames.bin  per frame 4 x 128x128 RGBA8 layers: the screen (the palette
 --               INDEX is in red, index = round(r * 15 / 255); UCT's shaders
 --               work in indices), the player layer (player or player_spawn
---               with its hair, alpha 0 elsewhere), the smoke layer, the berry
---               layer (fruit, fly_fruit with its wings, the lifeup "1000");
+--               with its hair, alpha 0 elsewhere), the smoke layer, the objects
+--               layer (fruit, fly_fruit with its wings, the lifeup "1000",
+--               balloons);
 --   frames.jsonl per frame: the input the update consumed, UCT's timer, the
 --               player, and whether the room changed during it (`exit`).
--- The player, smoke and berry layers come from drawing those objects a second time
+-- The player, smoke and objects layers come from drawing those objects a second time
 -- into their own canvas, the hair saved and restored around it (draw_hair
 -- moves the hair), so the game's own frame is unchanged.
 -- UCT's overlay (timer, input display) is turned off: the compositor draws its own.
@@ -43,7 +44,7 @@ function C.setup(drv)
   cart.draw_object = function(o)
     local t = o.type
     local layer = (t == cart.player or t == cart.player_spawn) and C.P or (t == cart.smoke and C.S)
-      or ((t == cart.fruit or t == cart.fly_fruit or t == cart.lifeup) and C.F) or nil
+      or ((t == cart.fruit or t == cart.fly_fruit or t == cart.lifeup or t == cart.balloon) and C.F) or nil
     if layer then
       local s = hair_save(o)
       love.graphics.setCanvas(layer)
@@ -96,13 +97,13 @@ function C.post_draw()
     C.bin:write(c:newImageData():getString())
   end
   love.graphics.setCanvas(pico8.screen)
-  local cart, px, py = pico8.cart, "null", "null"
+  local cart, px, py, dj = pico8.cart, "null", "null", "null"
   for _, o in pairs(cart.objects) do
-    if o.type == cart.player then px, py = o.x, o.y end
+    if o.type == cart.player then px, py, dj = o.x, o.y, o.djump end
   end
   C.meta:write(string.format(
-    '{"n":%d,"input":%d,"keypress_frame":%d,"practice_time":%d,"exit":%s,"freeze":%d,"room":[%d,%d],"player":[%s,%s]}\n',
-    C.n, C.input, C.kf, TAS.practice_time, tostring(C.exited), cart.freeze or 0, cart.room.x, cart.room.y, px, py))
+    '{"n":%d,"input":%d,"keypress_frame":%d,"practice_time":%d,"exit":%s,"freeze":%d,"room":[%d,%d],"player":[%s,%s],"djump":%s,"max_djump":%d,"deaths":%d}\n',
+    C.n, C.input, C.kf, TAS.practice_time, tostring(C.exited), cart.freeze or 0, cart.room.x, cart.room.y, px, py, dj, cart.max_djump, cart.deaths or 0))
   C.n = C.n + 1
   if C.exited then C.bin:flush(); C.meta:flush() end
 end
