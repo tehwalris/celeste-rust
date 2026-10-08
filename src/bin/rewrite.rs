@@ -7,7 +7,7 @@
 use anyhow::Result;
 use celeste_engine::runtime2::Rt2;
 use celeste_rust::trace::refengine::RefEngine;
-use celeste_rust::frame::{forward_frame, frame_files, frame_paths, id_layer, id_row, id_seq, load_row, pack_id, widen_rt2_to, widened_keys, wins_of, Block, FrameStep, Visited};
+use celeste_rust::frame::{forward_frame, frame_files, frame_paths, id_layer, Filters, Layer, MinusOne, id_row, id_seq, load_row, pack_id, widen_rt2_to, widened_keys, wins_of, Block, FrameStep, Visited};
 use celeste_rust::abstraction::{set_level, Level};
 use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary, project_all, project_onto, project_row, projection_key, Proj};
 use clap::{Parser, Subcommand};
@@ -178,6 +178,12 @@ enum Command {
         /// (to pick a synthetic `--win-at` target with real fan-out).
         #[arg(long)]
         cells: Option<usize>,
+        /// Also fingerprint each frame's recorded edges (`e{frame} count
+        /// hash`) by the states they join and their transfers: two trees
+        /// with the same lines have the same graph (a raised tree against a
+        /// fresh one).
+        #[arg(long)]
+        edges: bool,
     },
     /// Microbenchmark of ONE forward frame: run `forward_frame` on a
     /// checkpointed frame `reps` times (empty door, no filter), printing the
@@ -508,9 +514,9 @@ fn rerun(engine: &dyn FrameStep, rt2: Rt2, id: u64, scratch: &str) -> Result<(Ve
     let tmp = std::env::temp_dir().join(format!("{scratch}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let door = celeste_rust::search::door::Door::new();
-    let (next, won, _) = forward_frame(engine, vec![block], &door, None, None, id_layer(id) + 1, Some(&tmp))?;
+    let wave = forward_frame(engine, vec![block], &door, None, Filters::default(), id_layer(id) + 1, Some(&tmp), Layer::New)?;
     let _ = std::fs::remove_dir_all(&tmp);
-    Ok((next, won))
+    Ok((wave.next, wave.won))
 }
 
 fn main() -> Result<()> {
@@ -541,27 +547,35 @@ fn main() -> Result<()> {
                 let last = li + 1 == levels.len();
                 set_level(lvl);
                 let dir = base.join(format!("level{li:02}"));
-                let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l));
-                // THE FORWARD. A tree that already reaches the horizon is
-                // used as it is; a finer level's tree is filtered for this
-                // horizon - delete it to change the horizon or the levels.
+                // THE FORWARD. Level 0's tree is reused, extended, or RAISED
+                // to this run's level -1 horizon (`grow_tree`). A finer
+                // level's tree is filtered by the coarser marks for one
+                // horizon: kept only for the same marks, horizon and level
+                // -1, else built again (it is the cheap one).
                 let t = std::time::Instant::now();
-                let first_win = match celeste_rust::frame::tree_first_win_through(&dir, steps)? {
-                    Some(w) => {
-                        eprintln!("[search] {}: the tree reaches step {steps}", dir.display());
-                        w
+                let want = MinusOne::from_env();
+                let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l));
+                if let Some((m, _)) = &prev {
+                    let key = format!("steps {steps} level-1 {want:?} marks {} {:016x}\n", m.len(), m.filter_fingerprint());
+                    let key_path = dir.join("filtered_for.txt");
+                    if std::fs::read_to_string(&key_path).ok().as_deref() != Some(key.as_str()) {
+                        if dir.exists() {
+                            eprintln!("[search] {}: filtered for other marks or another horizon: built again", dir.display());
+                            std::fs::remove_dir_all(&dir)?;
+                        }
+                        std::fs::create_dir_all(&dir)?;
+                        std::fs::write(&key_path, key)?;
                     }
-                    None => {
-                        let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
-                        let initial = || -> Result<Vec<Block>> { Ok(vec![Block::keyed(RefEngine::new()?.initial()?)?]) };
-                        let mut st = match celeste_rust::frame::ForwardState::resume(&dir, true)? {
-                            Some(s) => s,
-                            None => celeste_rust::frame::ForwardState::start(initial()?, &dir, true)?,
-                        };
-                        st.extend(&engine, &dir, steps, filter.as_ref())?;
-                        st.win_frame
-                    }
-                };
+                }
+                let first_win = celeste_rust::frame::grow_tree(
+                    &dir,
+                    steps,
+                    want,
+                    filter.as_ref(),
+                    || Ok(Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)),
+                    || Ok(vec![Block::keyed(RefEngine::new()?.initial()?)?]),
+                )?
+                .win_frame;
                 // `f` counts search steps (`ui_export::parse_log` reads this line).
                 eprintln!("[search] level {li} ({lvl}): forward to f{steps} in {:.1} s; first win {first_win:?}", t.elapsed().as_secs_f64());
                 celeste_rust::metrics::mem_phase("forward");
@@ -656,10 +670,17 @@ fn main() -> Result<()> {
                 Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)
             };
             eprintln!("[fwd] engine up in {:.2} s ({level}{})", t.elapsed().as_secs_f64(), if reference { ", REFERENCE engine" } else { "" });
-            let initial = vec![Block::keyed(RefEngine::new()?.initial()?)?];
             let dir = std::path::Path::new(&checkpoint_dir);
             let t = std::time::Instant::now();
-            let fwd = celeste_rust::frame::forward_resume_or_run(engine.as_ref(), initial, dir, to)?;
+            // Resumed, RAISED to this run's level -1 horizon, or started.
+            let fwd = celeste_rust::frame::grow_tree(
+                dir,
+                to,
+                MinusOne::from_env(),
+                None,
+                || Ok(engine),
+                || Ok(vec![Block::keyed(RefEngine::new()?.initial()?)?]),
+            )?;
             let wall = t.elapsed().as_secs_f64();
             match fwd.win_frame {
                 Some(h) => println!("win at f{h} ({wall:.2} s)"),
@@ -724,13 +745,20 @@ fn main() -> Result<()> {
             to,
             room,
             cells: top_cells,
+            edges,
         } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
             let dir = std::path::Path::new(&checkpoint_dir);
             let mut by_cell: rustc_hash::FxHashMap<u32, usize> = Default::default();
+            let mut died = false;
             for frame in 0..=to {
                 let mut n = 0usize;
                 let mut acc: u64 = 0;
+                // A forward whose frontier died has no frames past the empty one.
+                if died && !dir.join("frames").join(format!("f{frame:03}")).is_dir() {
+                    println!("f{frame:03} 0 {acc:016x}");
+                    continue;
+                }
                 for block in celeste_rust::frame::load_frame(dir, frame)? {
                     let cells = block.positions()?;
                     for (k, &c) in block.keys().iter().zip(&cells) {
@@ -744,6 +772,39 @@ fn main() -> Result<()> {
                     }
                 }
                 println!("f{frame:03} {n} {acc:016x}");
+                died = n == 0;
+            }
+            // The recorded edges per frame, by what they join: (shape, key,
+            // cell) of target and source, and the transfer - ids and table
+            // positions depend on scheduling (and on a raise), these do not.
+            if edges {
+                let eg = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), to)?;
+                let mut files: rustc_hash::FxHashMap<(u32, u32), (celeste_rust::search::checkpoint::FrameFile, Vec<u32>)> = Default::default();
+                let mut node = |id: u64| -> Result<u64> {
+                    let (layer, seq, row) = (id_layer(id), id_seq(id), id_row(id));
+                    if !files.contains_key(&(layer, seq)) {
+                        let (_, f) = frame_files(dir, layer)?.into_iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
+                        let cells = f.row_cells();
+                        files.insert((layer, seq), (f, cells));
+                    }
+                    let (f, cells) = &files[&(layer, seq)];
+                    let k = f.key_at(row);
+                    let mix = celeste_engine::runtime2::mix64;
+                    Ok(mix(k.0 ^ mix(k.1 ^ mix(f.shape_hash() ^ cells[row as usize] as u64))))
+                };
+                for frame in 1..=to {
+                    let (mut n, mut acc) = (0usize, 0u64);
+                    for e in eg.records_at(frame) {
+                        let pair = eg.pair(frame, e.xfer).ok_or_else(|| anyhow::anyhow!("f{frame}: an edge without its transfer"))?;
+                        let mut b = Vec::new();
+                        celeste_rust::search::arc_edges::encode_pair(&mut b, &pair);
+                        let p = b.iter().fold(0u64, |h, &x| celeste_engine::runtime2::mix64(h ^ x as u64));
+                        let (t, s) = (node(e.target)?, node(e.base)?);
+                        acc = acc.wrapping_add(celeste_engine::runtime2::mix64(t ^ s.rotate_left(21) ^ p.rotate_left(42)));
+                        n += 1;
+                    }
+                    println!("e{frame:03} {n} {acc:016x}");
+                }
             }
             if let Some(top) = top_cells {
                 let mut v: Vec<(u32, usize)> = by_cell.into_iter().collect();
@@ -789,7 +850,7 @@ fn main() -> Result<()> {
                 let n = b.lanes();
                 let mask: Vec<bool> = (0..n).map(|i| i < 64).collect();
                 let small = vec![b.keep(&mask).expect("a non-empty block")];
-                forward_frame(&engine, small, &Door::new(), None, None, frame + 1, None)?;
+                forward_frame(&engine, small, &Door::new(), None, Filters::default(), frame + 1, None, Layer::New)?;
             }
             let edges_dir = dir.join("bench-edges");
             // With edges, the tree's own door, so a re-emitted old state
@@ -812,8 +873,8 @@ fn main() -> Result<()> {
                 let door: &Door = tree_door.as_ref().map_or(&fresh, |s| s.door());
                 let _ = std::fs::remove_dir_all(&edges_dir);
                 let t = std::time::Instant::now();
-                let (next, _won, st) =
-                    forward_frame(&engine, input, door, None, None, frame + 1, edges.then_some(edges_dir.as_path()))?;
+                let wave = forward_frame(&engine, input, door, None, Filters::default(), frame + 1, edges.then_some(edges_dir.as_path()), Layer::New)?;
+                let (next, st) = (wave.next, wave.stats);
                 let t_fwd = t.elapsed();
                 let (t_compact, records) = if edges {
                     let t = std::time::Instant::now();

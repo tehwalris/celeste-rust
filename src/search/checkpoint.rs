@@ -333,6 +333,11 @@ impl FrameFile {
         self.header.shape_hash
     }
 
+    /// Were its rows' values trimmed away (`trim`)?
+    pub fn trimmed(&self) -> bool {
+        self.header.trimmed
+    }
+
     /// `(cell, rows at that cell)` per distinct cell, ascending, off the index.
     pub fn cell_counts(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         // Runs are sorted by cell: sum each cell's.

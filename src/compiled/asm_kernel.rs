@@ -257,6 +257,12 @@ impl AsmKernel {
             for (i, l) in idx.iter_mut().enumerate().take(n) {
                 *l = lo + i;
             }
+            // A slice of only skipped lanes emits nothing (a raise re-expands
+            // a few rows of each 64-row group it loads).
+            if sink.skip_in.is_some_and(|sk| idx[..n].iter().all(|&l| sk[l])) {
+                lo += n;
+                continue;
+            }
             if !self.run_slice(chunk, cell_in, &idx[..n], u16::MAX, sink) {
                 return false;
             }
@@ -397,7 +403,10 @@ impl AsmKernel {
                                 sink.direct_edge(r & !RowCache::ID_FLAG, b, xfer, glane(i));
                                 continue;
                             }
-                            Some(_) if r & RowCache::DROP_FLAG != 0 => continue,
+                            Some(b) if r & RowCache::DROP_FLAG != 0 => {
+                                sink.dropped_again(b, glane(i), r & !RowCache::DROP_FLAG);
+                                continue;
+                            }
                             // A stale ref: push again; the flush merges by key.
                             Some(b) if !sink.mark_pred(r, b, xfer, glane(i)) => {}
                             Some(_) => continue,
