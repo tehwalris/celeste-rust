@@ -104,7 +104,10 @@ it the optimum. Verified as the runner does: exits during f100 in the
 ORIGINAL cart, dashes at f38 (none held), f75 and f90 (up), no diagonal;
 UCT finishes it in 75 inputs (TAS3: 83; 82f -> 74f). Upload file
 `tas/tasdatabase/nodiag/upload/TAS3.tas`, witness
-`tas/room_2_0_nodiag_frame_100.txt`.
+`tas/room_2_0_nodiag_frame_100.txt`; the web UI's run `room20nodiag`
+(rerun with `--save-marks`, 1713 s, the same witness; the UI's download
+equals the upload file). (3,2) has no UI run: `--save-marks` keeps a row
+per level-1 BFS mark (379M) on top of its 75 GB arc phase.
 
 Before that, measured on the way: nodiag is SMALLER than any% frame for
 frame (`r0sxh`, f62: 3.22M kept, 26.2M visited, against 5.56M / 45.7M);
