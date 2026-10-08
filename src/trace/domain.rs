@@ -214,8 +214,9 @@ pub trait Domain {
         None
     }
 
-    /// Does undecided `c` read an unknown atom? No lane decides one, so a
-    /// merge that would select on `c` is two successors instead.
+    /// Does undecided `c` read an unknown atom (a countdown's does not count:
+    /// `Symbolic::countdown_atom`)? No lane decides one, so a merge that
+    /// would select on `c` is two successors instead.
     fn reads_unknown_atom(&mut self, _c: &Self::Bool) -> bool {
         false
     }
@@ -249,6 +250,15 @@ pub trait Domain {
     fn describe_num(&self, n: &Self::Num) -> String {
         format!("{n:?}")
     }
+}
+
+/// The tag of a countdown's atom id (`Symbolic::countdown_atom`).
+const COUNTDOWN_ATOM: u32 = 1 << 31;
+
+/// Is atom id `k` a countdown's (three-valued)? `u32::MAX` is the shared
+/// output unknown (`Symbolic::unknown_bool_output`), not an atom.
+fn is_countdown_atom(k: u32) -> bool {
+    k != u32::MAX && k & COUNTDOWN_ATOM != 0
 }
 
 /// How many atoms an escaping value may read before its fork is left
@@ -802,6 +812,24 @@ impl Symbolic {
         self.graph.leaf(Op::UnknownBool(k))
     }
 
+    /// A COUNTDOWN's atom: a comparison of the unknown number at a level
+    /// whose unknown numbers are all countdowns (a near level's floor
+    /// `delay`, balloon `timer`, spring timers; no fly fruit unknown). It
+    /// stays THREE-VALUED wherever the set has other unknowns too (the
+    /// platforms): decided per lane where it is read and split by the
+    /// split pass, as at a near level alone - never a merge refusal
+    /// (`reads_unknown_atom`) or an escape fork (`escaped_atom`). Treated
+    /// as the platforms' atoms, every fall floor's `delay <= 0` made two
+    /// successors that never merged: room (2,1) `r0sxhnp` traced 354 states
+    /// at the spawn against 5 at `r0sxhn` (over the 256 limit) since
+    /// `b47b118` made the countdowns the unknown number.
+    fn countdown_atom(&mut self) -> NodeId {
+        let k = self.unknown_atoms;
+        self.unknown_atoms += 1;
+        assert!(k < COUNTDOWN_ATOM - 1, "atom ids overflow into the countdown tag");
+        self.graph.leaf(Op::UnknownBool(COUNTDOWN_ATOM | k))
+    }
+
     /// Does no lane's data reach `n` - no input cell or fork?
     pub fn lane_independent(&mut self, n: NodeId) -> bool {
         let mut stack: Vec<(NodeId, bool)> = vec![(n, false)];
@@ -986,7 +1014,7 @@ impl Domain for Symbolic {
         }
         // With an unknown number nothing is decided.
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
-            return Ok(self.unknown_bool_atom());
+            return Ok(if self.fruit_unknown { self.unknown_bool_atom() } else { self.countdown_atom() });
         }
         if let Some((c, t, f)) = self.unknown_select(*a) {
             let (x, y) = (self.compare(op, &t, b)?, self.compare(op, &f, b)?);
@@ -1180,7 +1208,9 @@ impl Domain for Symbolic {
     }
 
     fn join_num_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
-        if !self.unknowns() || self.decide(c).is_some() || !self.lane_independent(*c) {
+        // A condition that reads no atom but a countdown's (`countdown_atom`)
+        // is a select, as at a near level alone.
+        if !self.reads_unknown_atom(c) || !self.lane_independent(*c) {
             return None;
         }
         if t == f {
@@ -1217,7 +1247,7 @@ impl Domain for Symbolic {
             }
             let node = self.graph.get(x);
             if matches!(node.op, Op::UnknownBool(_)) || node.args.is_empty() {
-                let atom = matches!(node.op, Op::UnknownBool(_));
+                let atom = matches!(node.op, Op::UnknownBool(k) if !is_countdown_atom(k));
                 self.atom_memo.insert(x, atom);
                 continue;
             }
@@ -1234,7 +1264,9 @@ impl Domain for Symbolic {
     }
 
     fn join_bool_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
-        if !self.unknowns() || self.decide(c).is_some() || !self.lane_independent(*c) {
+        // A condition that reads no atom but a countdown's (`countdown_atom`)
+        // is a select, as at a near level alone.
+        if !self.reads_unknown_atom(c) || !self.lane_independent(*c) {
             return None;
         }
         if t == f {
@@ -1265,20 +1297,24 @@ impl Domain for Symbolic {
     }
 
     fn escaped_atom(&mut self, b: &NodeId, since: u32, origin: &dyn Fn(&Self) -> String) -> Option<NodeId> {
-        // Only with unknowns. A near level's countdown atoms stay three-valued
-        // (decided where read): forking adds a dimension even if unread.
+        // Only with unknowns, and never a countdown's atom (`countdown_atom`):
+        // those stay three-valued (decided where read); forking adds a
+        // dimension even if unread.
         if !self.unknowns() {
             return None;
         }
         if let Some(f) = self.escaped.get(b) {
             return Some(*f);
         }
-        // The atoms of this call that `b` reads.
+        // The atoms of this call that `b` reads. Only those make a fork; every
+        // countdown's `b` reads is enumerated with them all the same, so the
+        // restriction below reads no atom (one left in it is unknown on every
+        // lane: the fork's coverage would decline them all).
         let atoms: Vec<NodeId> = crate::trace::verify::cone(&self.graph, &[*b])
             .into_iter()
-            .filter(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(k) if k >= since && k != u32::MAX))
+            .filter(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(k) if is_countdown_atom(k) || (k >= since && k != u32::MAX)))
             .collect();
-        if atoms.is_empty() {
+        if !atoms.iter().any(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(k) if !is_countdown_atom(k))) {
             return None;
         }
         let name = origin(self);

@@ -366,8 +366,9 @@ pub const PLAYER_PROBE: [(i16, i16); 2] = [(-3, 3), (-1, 0)];
 /// overlapped floor stores the CART'S INVARIANT (hidden: `state` 2,
 /// `collideable` false, the player cannot be inside a solid floor), with the
 /// computed value owed; storing the computed value makes the split resolve
-/// every floor the player MIGHT overlap (room (6,1): 3,638 outcomes vs 108).
-/// Mid split frame (`mid`), `collideable` also stays computed in the
+/// every floor the player MIGHT overlap (room (6,1): 3,638 outcomes vs 108)
+/// - except with the platforms unknown, where it stores the computed value
+/// (below). Mid split frame (`mid`), `collideable` also stays computed in the
 /// `PLAYER_PROBE` window: widening there would let the second step reach
 /// states the unsplit frame does not. `Rt2::widen_to` agrees.
 fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors, mid: bool) -> Result<()> {
@@ -442,12 +443,20 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
         let apart = d.not(&overlap);
         let two = d.num(P8::from_i16(2));
         let range = d.graph.leaf(Op::Const(slo, shi));
-        let state = d.sel_num(&overlap, &two, &range);
+        // With the platforms unknown, the overlapped floor stores what the
+        // frame COMPUTED instead (exact, nothing owed): there the hidden
+        // invariant failed on every lane of the spawn's first player frame in
+        // room (2,1) `r0sxhnp` (a KERNEL COVERAGE GAP at f26: some outcome
+        // computes the overlapped floor solid), which the near level alone
+        // never meets. A stored computed `state`/`collideable` agrees with
+        // `Rt2::widen_to` (it keeps an overlapped floor's values as they are).
+        let computed = d.platforms_unknown;
+        let state = d.sel_num(&overlap, if computed { &state } else { &two }, &range);
         iface::set(st, ps, Value::Num(state))?;
         let Some(Value::Bool(coll)) = iface::get(st, pc) else { bail!("{}: not a boolean", iface::show(pc)) };
         // Owed at the frame's END only: mid-frame the shaking floor's
         // `delay - 1 <= 0` is not split yet and would decline valid lanes.
-        if !mid {
+        if !mid && !computed {
             let passable = d.not(&coll);
             let held = d.or(&apart, &passable);
             owe(errs, d, pc, held);
@@ -455,7 +464,7 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
         let (unknown, absent) = (d.unknown_bool_output(), d.boolean(false));
         // Mid-frame, in the probe window: the computed `collideable`, kept.
         let unread = if mid { d.sel_bool(&probe, &coll, &unknown) } else { unknown };
-        let coll = d.sel_bool(&overlap, &absent, &unread);
+        let coll = d.sel_bool(&overlap, if computed { &coll } else { &absent }, &unread);
         iface::set(st, pc, Value::Bool(coll))?;
     }
     Ok(())

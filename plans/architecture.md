@@ -94,8 +94,12 @@ fixes made that true: a global assigned nil is REMOVED, as Lua does
 cut keeps a floor's computed `collideable` wherever the player's `is_solid`
 can reach it (`widen::PLAYER_PROBE`). With platforms abstract the split still
 reaches slightly FEWER states than unsplit in room (2,1) (unresolved). The
-search refuses the split frame (its concrete search steps whole frames; transfers
-over two steps are unchecked).
+search runs it (2026-10-08): the tree, the arcs, the marks and level -1 count
+STEPS (`frame::steps_per_frame`; `--to`/`--ceiling` stay frames), each step's
+transfer decoded as usual (part a holds the player's one split, part b
+none); the arc optimum in steps s bounds the game at ceil(s / 2) frames; the
+concrete search steps WHOLE frames (`RefEngine::frame`, both parts under the
+frame's input) and looks a state up in W at step 2k, a frame boundary.
 
 ## The tracer and the kernel model (from the 2026-09-27 graph model)
 
@@ -477,8 +481,17 @@ unions, so the union over all paths is pushed exactly (`search::arcs`).
    touches; action = a rotation by `image.lo - guard.lo`, or the constant
    `final` on a collision; identity where the frame has no player split on the
    axis. Captured as per-body transfer roots where the tracer forks
-   `__split_by_flr` on the player's own `rem`. More than one player split per
-   axis in a frame (a platform carrying the player) is refused, loudly.
+   `__split_by_flr` on the player's own `rem`. A second player split on an
+   axis in one path is refused, loudly - and cannot happen: `move` is the
+   only splitter and `_update` calls it once per object. A moving platform
+   carries the player with `move_x` (whole pixels, no split, `rem`
+   untouched) - unless a wall blocks the step, which sets `rem.x = 0` before
+   the player's own move (platforms precede the player in `objects`); that
+   split's argument is then one point, decoded as `Const(fin)` from the whole
+   circle (`arc_edges::set_before_the_move`). (Until 2026-10-08 this was
+   written up as "two player moves in a frame", and the platform rooms were
+   believed blocked by it; they were blocked by the `p` level itself, see
+   plans/abstractions.md.)
 2. **Backward, arc sets.** `W_t(n)`: the remainder rectangles from which node
    n at frame t wins by the horizon. `W_t(n) = U_e guard_e ∩
    action_e^-1(W_{t+1}(dst_e))`, a win edge contributing its guard.
@@ -540,9 +553,7 @@ frame's record count: 13 GB at f58, 30 GB at f67; later frames have up to
 
 **Open.** W's fragmentation (the number that decides the backward's cost;
 small so far: median 1-6 rectangles per node), time-indexing W only where it
-changes, moving platforms (two player moves in a frame are refused at the
-capture: the platform rooms (6,0), (2,1), (1,2) cannot run the search yet),
-the split frame (refused by the search).
+changes. (Moving platforms and the split frame run since 2026-10-08.)
 
 ## Gates
 

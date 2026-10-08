@@ -153,7 +153,7 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   optimum 84, the search's region 6.5x larger per frame of slack): there the
   ladder `r0sxhn,r0sxh` (bound 84, the witness in 292 steps).
 
-## p: moving platforms unknown (`PlatformsPrecision`) - kept, but its rooms cannot run the search yet
+## p: moving platforms unknown (`PlatformsPrecision`) - CURRENT for the platform rooms
 
 - **Widens**: every platform's `x` and `last` to the whole path [-16, 128],
   `rem.x` the literal [-0.5, 0.5). `last == x` holds at every frame boundary
@@ -172,9 +172,28 @@ memory in the kernel walk). plans/lessons.md has the measurements.
 - **Measured**: room (6,0) `r0sxhfp` split frame: level 0 to step 150, 1.68G
   visited; optimum 70. Room (2,1): `r0sxhnp` then `r0sxhn` (platform exact at
   level 1). Room (1,2): the platform exact at level 1 marked 253M states
-  (level 0: 22.6M). The arcs refuse a frame where the player moves twice (a
-  platform carrying it), so the platform rooms ((6,0), (2,1), (1,2)) cannot
-  run the search yet.
+  (level 0: 22.6M).
+- **The arcs** (2026-10-08): the carry is `move_x` (whole pixels, no split);
+  a carry blocked by a wall sets `rem.x = 0` before the player's own move,
+  decoded as a constant (plans/architecture.md "Arcs"). There never was a
+  second player split.
+- **With `n` (the near level), broken since `b47b118`** (2026-10-03, the
+  countdowns made the unknown number) and repaired 2026-10-08: `p` turns on
+  the "unknowns" rules (`Symbolic::unknowns`: a merge on a condition reading
+  an atom is two successors, an escaping atom is a fork), and they took the
+  countdowns' `delay <= 0` atoms too. Room (2,1) `r0sxhnp` traced 354 states
+  at the spawn (limit 256; `r0sxhn`: 5). Now (`Symbolic::countdown_atom`) a
+  comparison of the unknown number is a COUNTDOWN atom wherever no fly
+  fruit is unknown (every unknown number is then a countdown): three-valued
+  as at `n` alone - no merge refusal, no independent join on it alone, no
+  escape fork (an escape fork for a platform atom enumerates the countdown
+  atoms it reads too, so its restriction reads none). Then the near floors'
+  hidden invariant failed: room (2,1) f26 declined every lane of the first
+  player frame's bucket (the owed `apart or not collideable` of the floor
+  under the spawn). With `p` an overlapped floor now stores its COMPUTED
+  `state`/`collideable`, owing nothing (exact; `Rt2::widen_to` keeps an
+  overlapped floor's values). Why `p` reaches an outcome with the
+  overlapped floor solid is not understood (n alone does not).
 
 ## Widened at every level (exact, or a stated caveat)
 
