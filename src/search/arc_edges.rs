@@ -69,7 +69,7 @@ const ONE: i64 = 65536;
 
 /// One axis of a frame's remainder transfer, as the kernel computed it on
 /// one lane (raw 16.16, inclusive intervals). See the module doc.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RawAxis {
     pub took: bool,
     pub pre: (i32, i32),

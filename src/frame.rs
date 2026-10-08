@@ -744,6 +744,12 @@ pub const POOL_QUEUES: usize = 256;
 
 /// One worker's sink for a frame: keyed rows into a QUEUE per (outcome,
 /// cell); a full or evicted queue is FLUSHED (filter, door, piece, edges).
+/// A transfer as the kernel computed it (`arc_edges::RawAxis` per axis).
+pub type RawPair = (crate::search::arc_edges::RawAxis, crate::search::arc_edges::RawAxis);
+
+/// Entries of `ForwardSink::xfer_id_raw`'s cache.
+const XFER_CACHE: usize = 1 << 12;
+
 pub struct ForwardSink<'a> {
     /// The pool: every queue ever created by this sink, live or spare.
     pub slots: Vec<Slot>,
@@ -785,6 +791,8 @@ pub struct ForwardSink<'a> {
     direct: Vec<(u64, u64, u32, u64)>,
     /// This worker's interned transfers (records carry the index).
     xfer_ids: rustc_hash::FxHashMap<crate::search::arc_edges::Pair, u32>,
+    /// `xfer_id_raw`'s cache (allocated on first use).
+    xfer_cache: Vec<Option<(RawPair, u32)>>,
     xfer_tab: Vec<crate::search::arc_edges::Pair>,
     /// Time spent encoding and writing edge records (this worker).
     pub t_edges: std::time::Duration,
@@ -838,6 +846,7 @@ impl<'a> ForwardSink<'a> {
             seen: celeste_engine::kernel::RowCache::new(),
             direct: Vec::new(),
             xfer_ids: Default::default(),
+            xfer_cache: Vec::new(),
             xfer_tab: Vec::new(),
             t_edges: std::time::Duration::ZERO,
             pieces: Default::default(),
@@ -896,6 +905,28 @@ impl<'a> ForwardSink<'a> {
 
     /// The transfer pair `t` as this worker's id (interned on first use).
     #[inline]
+    /// `xfer_id` of a raw transfer, through a small direct-mapped cache of
+    /// raw -> id: a frame has few distinct transfers (room (1,0) to f99:
+    /// 17k) against one lookup per emitted lane, and the decode plus the
+    /// hash-map intern was ~17% of a forward.
+    pub fn xfer_id_raw(&mut self, raw: RawPair, decode: impl FnOnce(&RawPair) -> crate::search::arc_edges::Pair) -> u32 {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        raw.hash(&mut h);
+        let slot = (h.finish() as usize) & (XFER_CACHE - 1);
+        if self.xfer_cache.is_empty() {
+            self.xfer_cache = vec![None; XFER_CACHE];
+        }
+        if let Some((r, id)) = self.xfer_cache[slot] {
+            if r == raw {
+                return id;
+            }
+        }
+        let id = self.xfer_id(decode(&raw));
+        self.xfer_cache[slot] = Some((raw, id));
+        id
+    }
+
     pub fn xfer_id(&mut self, t: crate::search::arc_edges::Pair) -> u32 {
         if let Some(&id) = self.xfer_ids.get(&t) {
             return id;
@@ -1556,6 +1587,13 @@ pub fn forward_frame(
                         sink.ids_in = (!b.ids.is_empty()).then_some(b.ids.as_slice());
                         sink.skip_in = (!b.skip.is_empty()).then_some(b.skip.as_slice());
                         sink.sources_old = raised.is_some_and(|r| b.seq < r.old_seqs);
+                        // Dedup within the UNIT (the door catches the rest). Per
+                        // kernel call it caught little once the kernels were keyed
+                        // by region: a unit's cell order changes region every
+                        // ~12 rows (room (1,0) f0-f70: 1.37M calls, 2.6x the
+                        // rows after the cache). Its refs stay valid across
+                        // calls: queued rows carry a generation, flushed ones an id.
+                        sink.seen.clear();
                         engine.run(b, &cells[bi], lo..hi, &mut sink)?;
                     }
                     let pieces = sink.finish()?;

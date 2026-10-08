@@ -5,6 +5,7 @@
 //! `Rt2::boundary_finish` (`CELESTE_KERNEL_KEY_CHECK=1`), its pos-graph edge
 //! and its transfer.
 
+use crate::search::arc_edges::{decode_axis, RawAxis};
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::path::Path;
@@ -58,29 +59,38 @@ struct ArcSlots {
 }
 
 impl ArcSlots {
-    /// Lane `i`'s decoded transfer. A refusal or undecided `took` is FATAL:
-    /// the record would be an unchecked claim about the remainder.
-    fn transfer(&self, buf: &[u8], i: usize, chunk: &Rt2, lane: usize, outcome: usize) -> crate::search::arc_edges::Pair {
-        use crate::search::arc_edges::{decode_axis, RawAxis};
+    /// Lane `i`'s transfer as the kernel computed it, read straight off the
+    /// output slots (no `AV`): what `decode` turns into the record's pair. An
+    /// undecided `took` is FATAL: the record would be an unchecked claim
+    /// about the remainder.
+    fn raw(&self, buf: &[u8], i: usize, chunk: &Rt2, lane: usize, outcome: usize) -> (RawAxis, RawAxis) {
+        let word = |o: usize| i32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
         let ival = |k: usize| -> (i32, i32) {
             let (off, kind) = self.roots[k];
-            match read_root_av(off, kind, buf, i) {
-                AV::Num(p) => (p.as_raw_u32() as i32, p.as_raw_u32() as i32),
-                AV::Ival(a, b) => (a.as_raw_u32() as i32, b.as_raw_u32() as i32),
-                other => panic!("arc edges: transfer root {k} of a {kind:?} root holds {other:?}"),
+            match kind {
+                RootKind::Num => (word(off + i * 4), word(off + i * 4)),
+                RootKind::Ival => (word(off + i * 4), word(off + 64 + i * 4)),
+                RootKind::Bool => panic!("arc edges: transfer root {k} is a boolean"),
             }
         };
-        let axis = |a: usize| -> crate::search::arc_edges::AxisXfer {
+        let axis = |a: usize| -> RawAxis {
             let base = a * crate::trace::verify::ARC_AXIS_ROOTS;
             let (off, kind) = self.roots[base];
             let took = match read_root_av(off, kind, buf, i) {
                 AV::Bool(b) => b,
                 other => panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}'s `took` is {other:?}, not a decided boolean", chunk.shape_hash),
             };
-            let raw = RawAxis { took, pre: ival(base + 1), frag: ival(base + 2), ox: ival(base + 3), fin: self.fin.then(|| ival(base + 4)) };
-            decode_axis(&raw).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}: {e} (raw {raw:?})", chunk.shape_hash))
+            RawAxis { took, pre: ival(base + 1), frag: ival(base + 2), ox: ival(base + 3), fin: self.fin.then(|| ival(base + 4)) }
         };
         (axis(0), axis(1))
+    }
+
+    /// The record's pair of a raw transfer (`raw`).
+    fn decode(raw: &(RawAxis, RawAxis), chunk: &Rt2, lane: usize, outcome: usize) -> crate::search::arc_edges::Pair {
+        let axis = |a: usize, r: &RawAxis| {
+            decode_axis(r).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}: {e} (raw {r:?})", chunk.shape_hash))
+        };
+        (axis(0, &raw.0), axis(1, &raw.1))
     }
 }
 
@@ -246,8 +256,6 @@ impl AsmKernel {
         debug_assert_eq!(cell_in.len(), chunk.width, "one input cell per input row");
         debug_assert!(lanes.end <= chunk.width);
         CALL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Within-call dedup (the door catches the rest).
-        sink.seen.clear();
         let mut lo = lanes.start;
         let mut idx = [0usize; 16];
         while lo < lanes.end {
@@ -391,7 +399,10 @@ impl AsmKernel {
                     let cin = cell_in[lanes[i]];
                     // THE TRANSFER: per producer, on the edge, never in the row.
                     let xfer = match slice_base {
-                        Some(_) => sink.xfer_id(body.arc.transfer(outbuf, i, chunk, lanes[i], body.outcome)),
+                        Some(_) => {
+                            let raw = body.arc.raw(outbuf, i, chunk, lanes[i], body.outcome);
+                            sink.xfer_id_raw(raw, |r| ArcSlots::decode(r, chunk, lanes[i], body.outcome))
+                        }
                         None => 0,
                     };
                     // EMISSION-TIME PROVENANCE: the pos-graph and backward
@@ -1002,20 +1013,45 @@ impl Registry {
             return self.run_key(chunk, None, cell_in, lanes, sink);
         }
         // Regions only for shapes with a PLAYER (not `player_spawn`).
-        let grid = self.grid.filter(|_| !chunk.player_objects(crate::compiled::ids()).is_empty());
-        let key_of = |lane: usize| -> Option<Region> { grid.and_then(|g| g.of_cell(cell_in[lane])) };
+        let Some(grid) = self.grid.filter(|_| !chunk.player_objects(crate::compiled::ids()).is_empty()) else {
+            return self.run_key(chunk, None, cell_in, lanes, sink);
+        };
+        // Slice by slice in lane order, each slice once per region it holds
+        // (the other lanes masked off), not one call per run of a region: a
+        // unit's cell order changes region every ~12 rows, so per-run calls
+        // left half of every slice empty (room (1,0) f0-f70: 48% padding).
+        CALL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut lo = lanes.start;
+        let mut idx = [0usize; 16];
+        let mut key = [None; 16];
         while lo < lanes.end {
-            let k = key_of(lo);
-            let mut hi = lo + 1;
-            while hi < lanes.end && key_of(hi) == k {
-                hi += 1;
+            // A slice stays in one 64-lane id group (predecessor records are
+            // the group's first id plus a lane bit).
+            let n = 16.min(lanes.end - lo).min(64 - (lo & 63));
+            for i in 0..n {
+                idx[i] = lo + i;
+                key[i] = grid.of_cell(cell_in[lo + i]);
             }
-            if !self.run_key(chunk, k, cell_in, lo..hi, sink) {
-                return false;
+            lo += n;
+            if sink.skip_in.is_some_and(|sk| idx[..n].iter().all(|&l| sk[l])) {
+                continue;
             }
-            lo = hi;
+            let mut done = 0u16;
+            for i in 0..n {
+                if done >> i & 1 != 0 {
+                    continue;
+                }
+                let only = (i..n).filter(|&j| key[j] == key[i]).fold(0u16, |m, j| m | 1 << j);
+                done |= only;
+                let Some(k) = self.kernels.get(&(chunk.shape_hash, key[i])) else {
+                    return self.run_key(chunk, key[i], cell_in, idx[i]..idx[i] + 1, sink);
+                };
+                if !k.run_slice(chunk, cell_in, &idx[..n], only, sink) {
+                    return false;
+                }
+            }
         }
+        sink.end_call();
         true
     }
 
