@@ -6,7 +6,7 @@ and verify every result end to end.
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
-"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"); re-read
+"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"; "reuse": a level-0 tree to reuse); re-read
 before every job, so jobs can be appended while it runs; a job whose key is
 already in OUTDIR/results.jsonl is skipped.
 
@@ -156,7 +156,13 @@ def run(job, outdir, binary):
             steps = ref * (2 if env.get("CELESTE_SPLIT_FRAME") else 1)
             env["CELESTE_LEVEL_MINUS_ONE"] = f"{steps},5"
         log = os.path.join(jd, "search.log")
-        shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+        tree = os.path.join(jd, "tree")
+        shutil.rmtree(tree, ignore_errors=True)
+        # `reuse`: a finished level-0 tree of this room, level and horizon (a
+        # retry with a longer objects ladder), moved in so `search` reuses it.
+        if job.get("reuse") and os.path.isdir(job["reuse"]):
+            os.makedirs(tree)
+            shutil.move(job["reuse"], os.path.join(tree, "level00"))
         cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--ceiling", str(ref), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", os.path.join(jd, "tree")]
         t = time.time()
         with open(log, "w") as f:

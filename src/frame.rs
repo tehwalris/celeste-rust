@@ -1224,8 +1224,18 @@ impl<'a> MarkFilter<'a> {
         MarkFilter { marked, coarser }
     }
 
-    /// Per lane of `rt2` (rows of frame `frame`): admitted?
+    /// Per lane of `rt2` (rows of frame `frame`): admitted? Under the split
+    /// frame only at frame boundaries (even steps): a mid-frame row's
+    /// projection does not key as the coarser tree's mid-frame rows
+    /// (`widen::widen_near_floors` keeps a near floor's computed
+    /// `collideable` in the player's probe window there, `Rt2::widen_to`
+    /// does not), so filtering it would drop marked paths - room (6,1)
+    /// nodiag `r0sxhn,r0sxh` REFUTED 93, which the community TAS reaches.
+    /// The next boundary filters its successors.
     pub fn allowed(&self, rt2: &Rt2, frame: u32) -> Result<Vec<bool>> {
+        if frame % steps_per_frame() != 0 {
+            return Ok(vec![true; rt2.width]);
+        }
         let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser)?;
         Ok(keys.iter().zip(&cells).map(|(k, &c)| self.marked.deadline(shape, *k, c).is_some_and(|d| u32::from(d) >= frame)).collect())
     }
