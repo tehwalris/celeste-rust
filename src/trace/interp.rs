@@ -90,6 +90,10 @@ pub struct Interp<'a, D: Domain> {
     pub arc_capture: bool,
     /// The site of the `__split_by_flr` call being made, taken by the builtin.
     split_site: Option<SplitSite>,
+    /// THE BUTTON READS (`RefEngine::frame_reads`): the button table and a
+    /// mask of the buttons the frame read from it (bit `i - 1` for
+    /// `[i]`; any other read of the table sets every bit).
+    pub button_reads: Option<(TableId, u8)>,
 }
 
 /// What a `__split_by_flr(obj.rem.x|y)` splits: the PLAYER's remainder on an
@@ -125,6 +129,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             next_split: 0,
             arc_capture: false,
             split_site: None,
+            button_reads: None,
         }
     }
 
@@ -1143,6 +1148,14 @@ impl<'a, D: Domain> Interp<'a, D> {
         let Value::Table(t) = tab else {
             bail!("indexing a non-table: {:?}", tab)
         };
+        if let Some((bt, mask)) = &mut self.button_reads {
+            if bt == t {
+                *mask |= match k {
+                    Key::Index(i @ 1..=6) => 1 << (i - 1),
+                    _ => 0x3f,
+                };
+            }
+        }
         let table = &st.heap.tables[t];
         Ok(match k {
             Key::Field(f) => table.hash.get(f).cloned().unwrap_or(Value::Nil),

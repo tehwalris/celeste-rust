@@ -68,25 +68,46 @@ impl RefEngine {
     /// keyed. It forks only where no input decides (`rnd`); unknown fields of
     /// the row are read as their placeholder, not forked.
     pub fn step(&mut self, row: &Rt2, byte: u8) -> Result<Vec<Block>> {
+        Ok(self.step_reads(row, byte)?.0)
+    }
+
+    /// `step`, and the mask of the buttons it READ (`Interp::button_reads`,
+    /// over every fork path). The successors are a function of the row and
+    /// of the buttons read alone - the output writes every button `UBool`
+    /// (`refbridge`) - so an input that agrees with `byte` on the mask has
+    /// the same successors.
+    fn step_reads(&mut self, row: &Rt2, byte: u8) -> Result<(Vec<Block>, u8)> {
         let (mut st, _) = from_block(row, 0, &self.fn_info, &self.base)?;
-        set_buttons(&mut st, byte)?;
-        let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT)?;
-        leaves.iter().map(|l| Block::keyed(to_block(l)?)).collect()
+        let buttons = set_buttons(&mut st, byte)?;
+        self.it.button_reads = Some((buttons, 0));
+        let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT);
+        let (_, mask) = self.it.button_reads.take().expect("set above");
+        let out = leaves?.iter().map(|l| Block::keyed(to_block(l)?)).collect::<Result<_>>()?;
+        Ok((out, mask))
     }
 
     /// One whole GAME frame: `step` once, or under the split frame
     /// (`frame::steps_per_frame`) its two parts, both under `byte` (the
     /// buttons are the frame's; part a reads none). Every leaf of both.
     pub fn frame(&mut self, row: &Rt2, byte: u8) -> Result<Vec<Block>> {
-        let mut out = self.step(row, byte)?;
+        Ok(self.frame_reads(row, byte)?.0)
+    }
+
+    /// `frame`, and the buttons it read (`step_reads`; the union over its
+    /// steps and their leaves): every input that agrees with `byte` there
+    /// has the same successors, so the concrete search runs one of them.
+    pub fn frame_reads(&mut self, row: &Rt2, byte: u8) -> Result<(Vec<Block>, u8)> {
+        let (mut out, mut mask) = self.step_reads(row, byte)?;
         for _ in 1..crate::frame::steps_per_frame() {
             let mut next = Vec::new();
             for b in &out {
-                next.extend(self.step(b.rt2(), byte)?);
+                let (o, m) = self.step_reads(b.rt2(), byte)?;
+                next.extend(o);
+                mask |= m;
             }
             out = next;
         }
-        Ok(out)
+        Ok((out, mask))
     }
 
     /// `step` where the frame must not fork: the one successor.
@@ -126,5 +147,45 @@ impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The concrete search runs one input per class of `frame_reads`
+    /// (`arc_dp::Covered`): every input that agrees with a run input on the
+    /// buttons that run read must make the same successors, exactly. Checked
+    /// for all 64 inputs at states along room (1,0)'s 99-frame exit.
+    #[test]
+    fn inputs_agreeing_on_the_buttons_read_make_the_same_successors() {
+        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the exit's inputs");
+        let mut eng = RefEngine::new().expect("ref engine");
+        let exact = |bs: Vec<Block>| -> Vec<((u64, u64), u32)> { bs.iter().map(|b| (b.rt2().clone_block().row_keys_canonical()[0], b.positions().expect("cells")[0])).collect() };
+        let mut row = eng.initial().expect("initial state");
+        let (mut runs, mut checked) = (0, 0);
+        for (f, &byte) in inputs.iter().enumerate() {
+            if f % 4 == 0 {
+                let mut ran: Vec<(u8, u8, Vec<((u64, u64), u32)>)> = Vec::new();
+                for b in 0..64u8 {
+                    let (succ, read) = eng.frame_reads(&row, b).expect("frame");
+                    let succ = exact(succ);
+                    if let Some((r, _, s)) = ran.iter().find(|(r, m, _)| (r ^ b) & m == 0) {
+                        assert_eq!(&succ, s, "f{f}: input {b} agrees with input {r} on the buttons read, but not in its successors");
+                        checked += 1;
+                    } else {
+                        ran.push((b, read, succ));
+                    }
+                }
+                runs += ran.len();
+            }
+            row = eng.step_one(&row, byte).expect("frame").into_rt2();
+        }
+        // The point of it: most inputs are repeats (the spawn and freeze
+        // frames read no button; up/down only matter where a dash starts).
+        eprintln!("{runs} inputs run, {checked} covered");
+        assert!(checked > 2 * runs, "{checked} inputs covered, {runs} run");
     }
 }

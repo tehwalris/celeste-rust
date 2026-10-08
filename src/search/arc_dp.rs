@@ -1015,6 +1015,26 @@ fn lookup_keys(b: &crate::frame::Block, level: crate::abstraction::Level, seeded
     crate::frame::widened_keys(&crate::frame::Block::from_rt2(rt2), level)
 }
 
+/// The inputs a state has been stepped under, each with the buttons its
+/// frame read (`RefEngine::frame_reads`). An input that agrees with one of
+/// them on every button that one read runs the same frame - the same reads,
+/// the same values, the same successors (the output writes no button) - so
+/// its successors are repeats of states already emitted in (parent, input)
+/// order, which the search's exact dedup would drop: skipping it changes
+/// nothing but the step count.
+#[derive(Default)]
+struct Covered(Vec<(u8, u8)>);
+
+impl Covered {
+    fn covers(&self, byte: u8) -> bool {
+        self.0.iter().any(|&(b, read)| (b ^ byte) & read == 0)
+    }
+
+    fn push(&mut self, byte: u8, read: u8) {
+        self.0.push((byte, read));
+    }
+}
+
 /// The 64 inputs in the order the concrete search tries them at the frame
 /// after `k`: `prefer[k]` first (`rewrite search --prefer`: a known TAS, so
 /// the witness follows it wherever an optimal route allows), then the rest.
@@ -1126,8 +1146,14 @@ pub fn concrete_search(
             if k >= cx.frames {
                 return Ok(Some(false));
             }
+            let mut ran = Covered::default();
             for byte in input_order(cx.prefer, k) {
-                for b in cx.eng.frame(st, byte)? {
+                if ran.covers(byte) {
+                    continue;
+                }
+                let (succ, read) = cx.eng.frame_reads(st, byte)?;
+                ran.push(byte, read);
+                for b in succ {
                     cx.steps += 1;
                     if cx.steps > DFS_BUDGET {
                         return Ok(None);
@@ -1214,8 +1240,14 @@ pub fn concrete_search(
                             let mut got = Vec::new();
                             let mut chunk_seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
                             'chunk: for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
+                                let mut ran = Covered::default();
                                 for byte in input_order(prefer, k) {
-                                    for b in eng.frame(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))? {
+                                    if ran.covers(byte) {
+                                        continue;
+                                    }
+                                    let (succ, read) = eng.frame_reads(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))?;
+                                    ran.push(byte, read);
+                                    for b in succ {
                                         steps += 1;
                                         let cell = b.positions()?[0];
                                         // Dedup on the EXACT key, never `b.keys()` (the
