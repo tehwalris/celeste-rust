@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Render a side-by-side-in-time comparison of two TASes of one Celeste
-Classic room: the NEW run in full colour, the OLD run's player and berry as a
+Classic room: the NEW run in full colour, the OLD run's player and objects (berry, balloons) as a
 semi-transparent grayscale ghost on top of it, both input displays, a frame
 counter and the margin when the new run exits.
 
@@ -56,6 +56,16 @@ def load(outdir, tas):
     raw = np.fromfile(f"{outdir}/frames.bin", dtype=np.uint8).reshape(len(meta), 4, 128, 128, 4)
     if not meta[-1]["exit"] or any(m["exit"] for m in meta[:-1]):
         sys.exit(f"{outdir}: the capture does not end with exactly one room change")
+    # A playback that died restarts from input 1: draw the attempt that exits
+    # (the last start of the input sequence), and say so.
+    starts = [k for k in range(len(meta)) if meta[k]["keypress_frame"] == 1 and (k == 0 or meta[k - 1]["keypress_frame"] != 1)]
+    if starts[-1] > 0:
+        print(f"WARNING {tas}: the playback restarted {len(starts) - 1} time(s) (a death) before the run that exits; drawing that run", file=sys.stderr)
+        # Aligned so the exiting run's spawn is as far in as the first
+        # attempt's (a fresh room load), whatever the restart's own lead-in.
+        sp0 = next(i for i, m in enumerate(meta) if m["practice_time"] >= 1)
+        spl = next(i for i in range(starts[-1], len(meta)) if meta[i]["practice_time"] >= 1)
+        meta, raw = meta[spl - sp0:], raw[spl - sp0:]
     meta, raw = meta[:-1], raw[:-1]          # the exit frame already shows the reloaded room
     idx = np.rint(raw[..., 0].astype(np.float32) * 15 / 255).astype(np.int64)
     alpha = raw[..., 3] > 127
@@ -65,7 +75,7 @@ def load(outdir, tas):
     if frames != n_inputs - 1:
         sys.exit(f"{tas}: exits after {frames} frames in UCT, the file has {n_inputs} inputs")
     spawn = next(i for i, m in enumerate(meta) if m["practice_time"] >= 1)
-    return {"meta": meta, "screen": idx[:, 0], "player": (idx[:, 1], alpha[:, 1]), "smoke": (idx[:, 2], alpha[:, 2]), "berry": (idx[:, 3], alpha[:, 3]),
+    return {"meta": meta, "screen": idx[:, 0], "player": (idx[:, 1], alpha[:, 1]), "smoke": (idx[:, 2], alpha[:, 2]), "objects": (idx[:, 3], alpha[:, 3]),
             "frames": frames, "spawn": spawn}
 
 
@@ -129,10 +139,15 @@ GRAY_RGB = np.stack([0.45 * 255 + 0.55 * GRAY] * 3, axis=1)  # lifted: reads on 
 def game_frame(new, old, i_new, i_old):
     """The 128x128 composite: new screen, old ghost (grayscale), new player on top."""
     rgb = PAL[new["screen"][i_new]].copy()
-    for layer, a in ((old["smoke"], SMOKE_ALPHA), (old["berry"], GHOST_ALPHA), (old["player"], GHOST_ALPHA)):
+    for layer, a in ((old["smoke"], SMOKE_ALPHA), (old["objects"], GHOST_ALPHA), (old["player"], GHOST_ALPHA)):
         if i_old is None:
             continue
         idx, m = layer[0][i_old], layer[1][i_old]
+        if layer is old["objects"]:
+            # An object drawn the same in both runs (a balloon at the same
+            # phase, the berry not yet moved) is not a ghost.
+            nidx, nm = new["objects"][0][i_new], new["objects"][1][i_new]
+            m = m & ~(nm & (nidx == idx))
         rgb[m] = rgb[m] * (1 - a) + GRAY_RGB[idx[m]] * a
     if i_new is not None:
         idx, m = new["player"][0][i_new], new["player"][1][i_new]
@@ -152,7 +167,7 @@ def compose(args, new, old, t, hud):
         # ghost (which covers exactly the player's own pixels in its screen).
         # Both out (the final hold): the room the old run left.
         rgb = PAL[old["screen"][i_old if i_old is not None else n_old - 1]] * 0.75
-        for layer, a in ((old["smoke"], SMOKE_ALPHA), (old["berry"], 1.0), (old["player"], 1.0)):
+        for layer, a in ((old["smoke"], SMOKE_ALPHA), (old["objects"], 1.0), (old["player"], 1.0)):
             if i_old is None:
                 break
             idx, m = layer[0][i_old], layer[1][i_old]

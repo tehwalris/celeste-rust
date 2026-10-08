@@ -40,7 +40,12 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
         # itself, so a route past a balloon replays only under some draws.
         # The TAS tool (gonengazit/UniversalClassicTas) fixes each balloon's
         # offset instead - the `[s1,s2,]` header of a tasdatabase file, in
-        # object creation order - and so does this.
+        # object creation order - and so does this. The same seed is the same
+        # phase at the room load in both, but NOT the same run: UCT adds 0.01
+        # a frame in Lua doubles, PICO-8 0x0.028f, so a balloon whose y meets
+        # an integer can be touched here and missed there (seed 0 puts y at
+        # exactly `start` at offset 0.5 in UCT). Check uploads in UCT too
+        # (tools/uct/validate.sh; category_runner.nudged_seeds).
         pat = "this.offset=rnd(1)"
         assert lua.count(pat) == 1, f"expected exactly one {pat!r} in the Lua"
         lua = lua.replace(pat, "this.offset=__balloon_seed()")
