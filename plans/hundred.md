@@ -58,6 +58,12 @@ the any% witness `tas/room_3_0_exit_frame_89.txt` takes the fly fruit: it
 verifies as a 100% run (berry, f89 in the original cart, UCT 62 inputs).
 UPLOAD_400
 
+Every upload starts at the room's prologue (the player's first frame), and
+its UCT input count is the PICO-8 exit frame minus the prologue (UCT inputs
+- 1 = ours in DB terms on every row): no file was lengthened to finish in
+UCT, and no reference is "UCT only" any more (1300m and 3000m exit on
+PICO-8 once the chests are seeded).
+
 Upload files (UCT clean save): `/var/tmp/h100/final/upload/100/TAS*.tas`;
 the four improvements are also in `tas/tasdatabase/100/upload/` with their
 witnesses `tas/room_X_Y_hundred_frame_N.txt`.
