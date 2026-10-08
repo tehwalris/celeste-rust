@@ -34,6 +34,15 @@ Room (3,2) nodiag at level 0 alone (`--level r0sxhn`): the concrete
 breadth-first search grew 1.4x a layer from layer 33 (32,518 states at layer
 43, 4.3M steps): stopped.
 
+Room (2,0) nodiag, `rewrite search --level r0sxh --to 100`, L-1 100,5,
+`CELESTE_TRIM_ROWS=1`: **OPTIMAL 100** (TAS3: 108). Forward 2830 s, kept
+f70 7.94M, f75 16.6M, f80 31.7M, f83 40.1M (the widest), f85 24.6M, f90
+1.15M; 465M visited; anon 12.5 GB at the end, peak 24.0 GB. Arc phase 9.88M
+marked nodes, 162M edges, backward 2.8 s, bound 100; the try at the bound
+wins in 393 steps. Wall 2883 s, VmHWM 35.7 GB. For comparison, `r0sxhn`
+(springs abstract) with L-1 at 108: f65 10.3M, f70 31.4M, f75 98.2M
+(`r0sxh` with L-1 at 100: 4.28M, 7.94M, 16.6M).
+
 Room (2,0), `r0sxh`, f62, nodiag against any%: 3,220,138 kept / 26.2M
 visited against 5,559,103 / 45.7M (wave 16.6 s against 34.7 s).
 

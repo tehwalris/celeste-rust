@@ -20,7 +20,7 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (0,2) 1700m | 81 | 89 (TAS17, offset 25) | **87 - 2 FASTER** | `rewrite search --level r0sxhn,r0sxh` (L-1 89,5): r0sxhn bound 87, witness 87; 316 s, 14.5 GB; exits f87 on a real PICO-8 in celeste-minimal and the original cart. `tas/room_0_2_nodiag_frame_87.txt` |
 | (5,0) 600m | 77 | 94 (TAS6, offset 29, any seed) | **93 - 1 FASTER** | `rewrite search --level r0sxhn,r0sxh` (no L-1: balloon y): bounds 91, 93; witness 93; 132 s, 5.1 GB; exits f93 on a real PICO-8 in both carts for every seed tried. `tas/room_5_0_nodiag_frame_93.txt` |
 | (0,1) 900m | 100 | 108 (TAS9, offset 27) | 108 (tie) | bounds 106, 108 (r0sxh); 619 s, 17.5 GB. `tas/room_0_1_nodiag_frame_108.txt` |
-| (2,0) 300m | 95 | 108 (TAS3, offset 25) | - | level 0 explodes (122M states at f76, 620M visited, with level -1): the speed spread, below; not solved (2026-10-08) |
+| (2,0) 300m | 95 | 108 (TAS3, offset 25) | **100 - 8 FASTER** | `rewrite search --level r0sxh --to 100` (L-1 100,5): bound 100, witness in 393 steps; 47 min, 36 GB; the earlier failures ran `r0sxhn` (2.4x the states by f65) at 108 (below). Original cart f100, no diagonal dash; UCT 82f -> 74f. `tas/room_2_0_nodiag_frame_100.txt` |
 | (3,0) 400m | 89 | 93 (TAS4, offset 27) | - | no level 0 fits: `r0sxhn` (fruit exact) 5.3M kept at f50, x1.46 a frame; `r0sxhf` (floors exact) 10.2M at f55, x1.5; `r0sxhfn` does not build (below); not solved (2026-10-08) |
 | (1,3) 2600m | 127 | 135 (TAS26, offset 25) | **133 - 2 FASTER** | arc bound 133 at r0sxhn, witness; 153 s, 8.1 GB; original cart: TAS26 f135, ours f133; UCT: 109f -> 107f. `tas/room_1_3_nodiag_frame_133.txt` |
 | (5,2) 2200m | 150 | 158 (TAS22, offset 25) | **157 - 1 FASTER** | arc bound 157 at r0sxhn, witness; 2027 s, 44.5 GB; original cart: TAS22 f158, ours f157; UCT: 132f -> 131f (TAS22's file has 3 inputs past the exit, which UCT's clean save trims). `tas/room_5_2_nodiag_frame_157.txt` |
@@ -83,19 +83,29 @@ kept, the same as `r0sxhf`: no gain yet that early), and stops on a KERNEL
 COVERAGE GAP - lanes falling at `spd.y` 2 decline on an error disjunct
 (`CELESTE_KERNEL_EXPLAIN`); not investigated further.
 
-**(2,0) 300m** (2 springs). Nodiag is SMALLER than any% frame for frame
-(`r0sxh`, f62: 3.22M kept, 26.2M visited, against 5.56M / 45.7M), but 13
-frames longer: the level -1 cut at 108 starts ~13 frames later than at 95,
-on a frontier growing x1.26 a frame (`r0sxhn`: 31.4M at f70, 98.2M at
-f75, 497M visited, nothing yet too late). What grows is the speed: at the
-hottest cell (48,88), f62, 548 `spd.x` and 49 `spd.y` values, 8,433 speed
-pairs against 465 states without the speed, the pairs still growing
-(`col-census --cell`); `spring` multiplies `spd.x` by 0.2 and the
-`appr` steps keep the odd fractions. Level -1's d is position-only (the
-start's d 45 against 95/108), so it cannot cut early. What would fix it: a
-cost-to-go that knows the speed and the dash count (plans/level-minus-one.md,
-"the off-screen lane" / "speed per node"), or an exact speed refinement the
-arcs can carry - neither exists.
+**(2,0) 300m** (2 springs): **OPTIMAL 100, eight frames under TAS3's 108.**
+What had failed was the HORIZON and the level, not the room: `r0sxhn` (the
+springs abstract: "maybe bounce" at every spring) is larger than `r0sxh`
+here (f65, before any level -1 cut: 10.3M kept against 4.28M; f75, L-1 at
+108 against 100: 98.2M against 16.6M), and the level -1 cut (`t + d > H`)
+moves with H. `rewrite search --level
+r0sxh --to 100` (L-1 100,5, `CELESTE_TRIM_ROWS=1`): the forward peaks at
+40.1M kept (f83), 465M visited, 2830 s, 24 GB; the arc phase 9.9M marked
+nodes, 162M edges, bound 100; the try at the bound wins in 393 steps. The
+level's one widening is `h`, so 100 is a lower bound and the witness makes
+it the optimum. Verified as the runner does: exits during f100 in the
+ORIGINAL cart, dashes at f38 (none held), f75 and f90 (up), no diagonal;
+UCT finishes it in 75 inputs (TAS3: 83; 82f -> 74f). Upload file
+`tas/tasdatabase/nodiag/upload/TAS3.tas`, witness
+`tas/room_2_0_nodiag_frame_100.txt`.
+
+Before that, measured on the way: nodiag is SMALLER than any% frame for
+frame (`r0sxh`, f62: 3.22M kept, 26.2M visited, against 5.56M / 45.7M);
+what grows is the speed - at the hottest cell (48,88), f62, 548 `spd.x` and
+49 `spd.y` values, 8,433 speed pairs against 465 states without the speed
+(`col-census --cell`); `spring` multiplies `spd.x` by 0.2 and the `appr`
+steps keep the odd fractions. A search at 108 itself (the community TAS's
+frame, the obvious `--ceiling`) was not needed: the optimum is 100.
 
 ## The concrete count-up (arc-search --witness)
 

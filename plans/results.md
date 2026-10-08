@@ -118,6 +118,10 @@ remainder (`arc_dp::reach`), not every node with a winning set: in room
 under TAS20's 152**: level 0 `r0sxhn` bound 133, level 1 `r0sxh` bound 148
 and its witness in 446 steps, exiting f148 in the original cart under the
 file's seeds (plans/nodiag.md). The level-1 arc phase peaked at 75 GB.
+**(2,0) nodiag 100, eight under TAS3's 108**, by a single `r0sxh` level at
+`--to 100` (47 min, 36 GB): the springs exact (`n`'s "maybe bounce" at
+every spring is 2.4x the states by f65) and the horizon at the answer, not
+at the reference - level -1's cut moves with it.
 
 ## Caveats on what "optimal" means here
 
