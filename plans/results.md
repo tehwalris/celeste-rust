@@ -164,9 +164,10 @@ CELESTE_LEVEL_MINUS_ONE="C,5" \
 - The level: `r0sx` for a room without objects, `r0sxhn` with springs, fall
   floors, balloons, key and chest (everything abstract but where the player
   overlaps a floor; held buttons unknown); `f` for the fly fruit. The
-  concrete search refutes what the level invents. Platform rooms cannot run
-  yet (the arcs refuse a frame where the player moves twice); the split frame
-  is refused.
+  concrete search refutes what the level invents. `p` for moving platforms
+  (with `n`: `r0sxhnp`). `CELESTE_SPLIT_FRAME=1` where the unsplit kernels
+  are too big (rooms (6,0), (6,1)): `--ceiling` stays in frames, level -1's
+  horizon is in steps (`2 x C`).
 - **When the level-0 bound is well below the reference** (room (7,0):
   `r0sxhn` 80 against 84) the concrete search's region grows several-fold a
   frame of slack: run the objects ladder, `--level r0sxhn,r0sxh` (the exact

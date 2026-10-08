@@ -340,6 +340,17 @@ pub fn trim_rows() -> bool {
     *ON.get_or_init(|| std::env::var("CELESTE_TRIM_ROWS").is_ok_and(|v| v == "1"))
 }
 
+/// Search steps per game frame: 2 under the split frame
+/// (`CELESTE_SPLIT_FRAME`: part a up to and including the player's move,
+/// part b the rest; step `2k` is the end of frame `k`), else 1.
+pub fn steps_per_frame() -> u32 {
+    if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() {
+        2
+    } else {
+        1
+    }
+}
+
 /// Worker count: `CELESTE_THREADS`, else one per physical core (AVX-512 units
 /// are shared by SMT siblings).
 pub fn threads() -> usize {
@@ -1213,8 +1224,18 @@ impl<'a> MarkFilter<'a> {
         MarkFilter { marked, coarser }
     }
 
-    /// Per lane of `rt2` (rows of frame `frame`): admitted?
+    /// Per lane of `rt2` (rows of frame `frame`): admitted? Under the split
+    /// frame only at frame boundaries (even steps): a mid-frame row's
+    /// projection does not key as the coarser tree's mid-frame rows
+    /// (`widen::widen_near_floors` keeps a near floor's computed
+    /// `collideable` in the player's probe window there, `Rt2::widen_to`
+    /// does not), so filtering it would drop marked paths - room (6,1)
+    /// nodiag `r0sxhn,r0sxh` REFUTED 93, which the community TAS reaches.
+    /// The next boundary filters its successors.
     pub fn allowed(&self, rt2: &Rt2, frame: u32) -> Result<Vec<bool>> {
+        if frame % steps_per_frame() != 0 {
+            return Ok(vec![true; rt2.width]);
+        }
         let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser)?;
         Ok(keys.iter().zip(&cells).map(|(k, &c)| self.marked.deadline(shape, *k, c).is_some_and(|d| u32::from(d) >= frame)).collect())
     }
@@ -1303,8 +1324,8 @@ pub fn forward_frame(
     use std::time::Instant;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
     let level = crate::abstraction::current_level();
-    // Under the split-frame prototype a game frame is two steps.
-    let game_frame = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { frame.div_ceil(2) } else { frame };
+    // Under the split frame a game frame is two steps.
+    let game_frame = frame.div_ceil(steps_per_frame());
     anyhow::ensure!(
         !level.platforms || game_frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
         "frame {frame} at {level}: the platform worlds cover {} frames",

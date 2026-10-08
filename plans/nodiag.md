@@ -28,6 +28,51 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (5,1) 1400m | 104 | 121 (TAS14, offset 25) | **119 - 2 FASTER** | `fit-big` (2026-10-07): `r0sxhn,r0sxh`, L-1 121,5, `CELESTE_TRIM_ROWS=1`, 60 GB; BENCHMARK_DATA.md |
 | (3,2) 2000m | 128 | 152 (TAS20, offset 31, seeds 0) | **148 - 4 FASTER** | `rewrite search --level r0sxhn,r0sxh` with `arc_dp::reach` (L-1 152,5, `CELESTE_TRIM_ROWS=1`): bounds 133, 148; witness at 148 in 446 steps; level 0 13 min, level-1 forward 71 min, the arc phases ~25 min; peak 75 GB (the level-1 arc phase; below); exits f148 in the original cart under TAS20's seeds (0,0,0,0; not under 0.5 or PICO-8's rnd); UCT: 120f -> 116f. `tas/room_3_2_nodiag_frame_148.txt` |
 | (1,1) 1000m | 94 | 94 (TAS10) | - | (validation, not run) |
+| (6,1) 1500m | 89 | 93 (TAS15, offset 25) | **92 - 1 FASTER** (UCT: 66f against 67f) | 2026-10-08, split frame, `r0sxhn`, level -1 (186,5) steps, one kept tree: arc bound f90 (no concrete win at 90); `--to 91`: no concrete win inside W (exhaustive, 153k steps); `--to 92`: the breadth-first search's first win at 92 (983 s with the tree reused). Jumps canonicalized; original cart (seeds 0,0) exits f92; UCT 67 inputs = 66f. `tas/room_6_1_nodiag_frame_92.txt`, `tas/tasdatabase/nodiag/upload/TAS15.tas` |
+| (6,0) 700m | 70 | 74 (TAS7, offset 23) | - (no win by 68) | 2026-10-08, split frame, `r0sxhfp`, no level -1 (its table did not finish in 17 min): the forward reached step 136 (730M visited, 15-20M states a step, the door 18 GB, peak 26.9 GB) before the 30 GB cap ended it near step 140; first remainder-free win at step 128. On that tree: arc bound f68 = the horizon (step 136), no concrete win by 68 (35k steps, exhaustive). Resuming to step 140 ran out of memory rebuilding the door. No transfer was refused in the whole run. Open: 69-74 |
+| (1,2) 1800m | 103 | 118 (TAS18, offset 27) | - (no win by 111) | 2026-10-08, `r0sxhnp` (level -1 refused with `p`): forward to f118 in 169 s, arc bound 107 (no concrete win at 107). The ladder `r0sxhnp,r0sxhn` ran out of memory in level 1's arc phase (116.8M marked nodes, 1.52G edges: almost every node of the exact-platform level can still win with 11 frames of slack). Counted up at level 0 with a kept tree: no concrete win by 110 (1.36M concrete steps, 1.2k states a layer at most), none by 111 (7.4M steps, 8.5k states a layer); at 112 the breadth-first search grew 1.25x a layer to 48k states at layer 81 of 112 (6 min a layer) and was stopped; 114 reached 66k states at layer 59, doubling. Open: 112-118 |
+| (2,1) 1100m | 82 | 87 (TAS11, offset 24) | **85 - 2 FASTER** (UCT: 61f against 62f) | 2026-10-08, `r0sxhnp,r0sxhn` (level -1 refused with `p`): r0sxhnp bound 82 (no concrete win at 82, 14k steps), r0sxhn (platform exact, filtered) bound 85, witness at 85 (2.2k steps); 697 s, 13.7 GB. Original cart (seeds 0, 0.8905): exits f85. Our first press is on frame 24, the frame the player is created (the community file's earliest exiting offset is 24 zeros): the upload starts there, 62 inputs = 61f in UCT, `tas/tasdatabase/nodiag/upload/TAS11.tas`, `tas/room_2_1_nodiag_frame_85.txt` |
+
+## The platform rooms and the split frame (2026-10-08, branch `nodiag-platforms`)
+
+700m (6,0), 1100m (2,1), 1800m (1,2) have moving platforms; 1500m (6,1) was
+solved in any% only with the split frame. What blocked them, and what changed:
+
+- **Not a second player split.** The capture's "two player moves in a
+  frame" never happens: `move` is the only `__split_by_flr` of the player and
+  `_update` calls it once per object; the platform carries the player with
+  `move_x` (whole pixels, `rem` untouched). The one real case: a carry
+  blocked by a wall sets `rem.x = 0` before the player's move, a split of one
+  point, now `Const(fin)` from the whole circle (`arc_edges`, `9ed9124`).
+- **The `p` level itself had not built with `n` since `b47b118`** (room (2,1)
+  `r0sxhnp`: 354 trace states at the spawn; bisected). Countdown atoms stay
+  three-valued under `p`, and with `p` an overlapped floor stores its
+  computed state (`d5c6234`; plans/abstractions.md "p").
+- **The split frame in the search** (`0231de8`): the tree in steps, the
+  concrete search in whole frames. The objects ladder under it filtered
+  mid-frame rows with a projection that does not key as the coarser tree's
+  mid-frame rows: room (6,1) `r0sxhn,r0sxh` REFUTED 93, which TAS15 reaches in
+  the minimal cart on PICO-8; filtering at frame boundaries only fixed it
+  (`5ccf712`).
+- 1500m `r0sxhn` alone (split, level -1 186 steps): the forward to step 186
+  took ~70 min (25M states a step at most, peak 27.5 GB with the arc phase),
+  arc bound f90 (ref 93), no concrete win at 90 (18.6k steps); the
+  breadth-first search then grew to 27k states a layer by layer 61 at ~5 min
+  a layer: stopped for the objects ladder. `r0sxhn,r0sxh` (after the filter
+  fix): level 0 reproduced every kept and visited count of the first run
+  (the `p` changes leave `n` alone untouched); level 1 (exact objects,
+  filtered) kept 11-18M states a step near the horizon and its arc phase
+  ran out of memory reading the edges (25 GB anonymous, 30.9 GB peak, the
+  30 GB cap). Counting up at level 0 with a kept tree instead (`--to 91`,
+  then 92: the breadth-first search's region is several times smaller per
+  frame of slack) found 92 (the table above).
+- 700m: the level -1 table did not finish in 17 min (`r0sxhfp`, split);
+  without it the forward outgrows 30 GB near step 140 (the table above).
+- `rewrite arc-check` runs out of memory on any tree with an unknown number
+  (the near level's countdowns since `b47b118`, the fly fruit): it steps
+  stored rows through the concrete engine, which reads `UNum` as the whole
+  16.16 range (room (7,0) `r0sxhn`: OOM at f2 under 12 GB). Not run on these
+  rooms' trees; the witnesses on PICO-8 are the check.
 
 ## The three rooms that failed on size (2026-10-08, branch `nodiag-big`)
 

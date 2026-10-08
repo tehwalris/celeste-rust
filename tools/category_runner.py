@@ -6,7 +6,7 @@ and verify every result end to end.
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
-"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"); re-read
+"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"; "reuse": a level-0 tree to reuse); re-read
 before every job, so jobs can be appended while it runs; a job whose key is
 already in OUTDIR/results.jsonl is skipped.
 
@@ -152,9 +152,17 @@ def run(job, outdir, binary):
         # the witness is then one real run under them.
         env["CELESTE_CONCRETE_BALLOON_SEEDS"] = seeds
         if l1:
-            env["CELESTE_LEVEL_MINUS_ONE"] = f"{ref},5"
+            # Level -1 counts search steps: two a frame under the split frame.
+            steps = ref * (2 if env.get("CELESTE_SPLIT_FRAME") else 1)
+            env["CELESTE_LEVEL_MINUS_ONE"] = f"{steps},5"
         log = os.path.join(jd, "search.log")
-        shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+        tree = os.path.join(jd, "tree")
+        shutil.rmtree(tree, ignore_errors=True)
+        # `reuse`: a finished level-0 tree of this room, level and horizon (a
+        # retry with a longer objects ladder), moved in so `search` reuses it.
+        if job.get("reuse") and os.path.isdir(job["reuse"]):
+            os.makedirs(tree)
+            shutil.move(job["reuse"], os.path.join(tree, "level00"))
         cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--ceiling", str(ref), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", os.path.join(jd, "tree")]
         t = time.time()
         with open(log, "w") as f:
@@ -198,23 +206,31 @@ def run(job, outdir, binary):
     if "nodiag" in cat:
         res["diagonal_dashes"] = diag_dashes(ours)
     lead = next((i for i, b in enumerate(ours) if b), len(ours))
-    res["prologue_ok"] = lead >= prologue
-    # 4. UniversalClassicTas
+    res["first_input"] = lead
+    # 4. UniversalClassicTas. The upload starts at the room's first
+    # controllable frame: usually the community file's earliest exiting
+    # offset, but a witness may press on the frame before (the player exists
+    # and updates on the frame it is created: room (2,1) nodiag, 2026-10-08),
+    # so that cut is tried too, and UCT decides. A cut never drops a press.
     level = int(name.rstrip("m")) // 100 if name.endswith("m") else None
-    if level and lead >= prologue:
-        mine = os.path.join(jd, f"ours-{entry['file']}")
-        open(mine, "w").write(f"[{seeds}]" + ",".join(map(str, ours[prologue:])))
+    if level:
         ok_db, n_db, _, _ = uct(level, f"{DB}/classic/{cat}/{entry['file']}", cat)
-        ok, n, saved, _ = uct(level, mine, cat)
         res["uct_db"] = f"{'finished' if ok_db else 'NOT finished'} {n_db} inputs"
-        res["uct_ours"] = f"{'finished' if ok else 'NOT finished'} {n} inputs"
-        if ok:
-            up = os.path.join(outdir, "upload", cat)
-            os.makedirs(up, exist_ok=True)
-            shutil.copy(saved, os.path.join(up, entry["file"]))
-            res["upload"] = os.path.join(up, entry["file"])
+        for cut in [prologue] + ([lead] if lead < prologue else []):
+            if any(ours[:cut]):
+                continue
+            mine = os.path.join(jd, f"ours-{entry['file']}")
+            open(mine, "w").write(f"[{seeds}]" + ",".join(map(str, ours[cut:])))
+            ok, n, saved, _ = uct(level, mine, cat)
+            res["uct_ours"], res["upload_cut"] = f"{'finished' if ok else 'NOT finished'} {n} inputs", cut
+            if ok:
+                up = os.path.join(outdir, "upload", cat)
+                os.makedirs(up, exist_ok=True)
+                shutil.copy(saved, os.path.join(up, entry["file"]))
+                res["upload"] = os.path.join(up, entry["file"])
+                break
     res["status"] = "IMPROVED" if opt < ref else ("tie" if opt == ref else "WORSE?")
-    res["verified"] = (e == opt) and not res.get("diagonal_dashes") and "finished" in res.get("uct_ours", "") and res.get("berry", True)
+    res["verified"] = (e == opt) and not res.get("diagonal_dashes") and res.get("uct_ours", "").startswith("finished") and res.get("berry", True)
     # 5. the UI
     if opt < ref:
         try:
