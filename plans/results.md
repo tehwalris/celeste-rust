@@ -195,6 +195,23 @@ at its database count. The jank model (`replay.py --jank J`, and the search's
 fields differ: `seconds`, `music_timer`, `new_bg` and `frames` (timer, music,
 background), and the key's sprite, which is drawn from `frames`.
 
+**The jank model checked against real chains, every room.** Each any%
+database file from 200m to 3000m was played through the transition from the
+previous room (`chain.py --modes`):
+- The jank model at the chain's J gives the chain's entry state in EVERY
+  room. The only difference is `got_fruit` bookkeeping at 500m. It also
+  gives the same exit.
+- This covers platforms ((6,0), (2,1), (1,2)), balloons, springs, fall
+  floors, the fly fruits, keys and chests.
+- The IL load differs from real play in gameplay fields in 14 rooms. It has
+  14 differing fields at (6,0), where the platforms are a frame off.
+- At 1100m (2,1) the database's own any% file DIES from the IL load but exits
+  (57) in real play.
+- The search's start (`concrete_run --dump-start` under the boot chain's J)
+  matches the boot chain's entry field by field in all 37 cases checked. The
+  only exception is a key's sprite, which is drawn from the cosmetic
+  `frames`.
+
 **What the room entry depends on.** The jank index J depends on how the
 previous room was played: J = 1 + the objects before the player when it
 leaves. That is the previous room's objects less the spawn, less every
