@@ -350,11 +350,21 @@ the list (coarsest first; one level is the usual case):
    checkpoints, or used as it is when it already reaches H). Won rows are
    checkpointed (backward seeds) and not expanded. **A finer level is
    filtered** (`frame::MarkFilter`): a row at frame t is kept only if its
-   projection onto the previous level is ARC-MARKED there (its winning set
-   non-empty at some frame) with a deadline >= t. Sound because the remainder
-   is exact at both levels: a fine state that wins from t with remainder r
-   projects to a coarse node that wins from t with r. This is the OBJECTS
-   LADDER (below), the only ladder left.
+   projection onto the previous level is ARC-MARKED there with a deadline
+   >= t. Sound because the remainder is exact at both levels: a fine state
+   that wins from t with remainder r projects to a coarse node that wins
+   from t with r. This is the OBJECTS LADDER (below), the only ladder left.
+   ARC-MARKED (2026-10-08, `arc_dp::reach`) is REACHED inside W: the
+   rotation graph run forward from the start's remainder, `R_{t+1}(m) =
+   U push_e(R_t(p)) ∩ W_{t+1}(m)` (`Region::push`: the image inside the
+   guards), the deadline the last frame R is non-empty. A concrete winner's
+   remainder is in W_t of its node and is the image of its previous one
+   along the recorded edge, so it is in R_t by induction. Before, a node
+   was marked when its W was non-empty at some frame: room (3,2) nodiag at
+   h145 marked 38.0M nodes that way and 486k by reach, and the filtered
+   `r0sxh` forward took 16.7 s instead of 681 s, with the same answer. A set
+   past 32 segments is replaced by W_t (a superset: the filter only
+   loosens). The UI's `arc.marks.bin` are the same reached nodes.
 3. **The arc phase** (`arc_dp::solve`): the remainder-free BFS marks the
    nodes that can win by H at all, with their deadlines; only the edges into
    them, from them, are loaded (`preds_at`, the BFS's lookup), each with an

@@ -1,5 +1,47 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# The objects ladder filtered by REACH, and the nodiag big rooms, 2026-10-08 (release, 16 threads, branch `nodiag-big`)
+
+Shared machine (another search and another agent's runs alongside; load
+~34 on 32 threads): times are noisy, counts and `[mem]` lines are not.
+
+`arc_dp::reach` (`3e324e5`): the next level's filter marks the nodes the
+rotation graph REACHES inside W from the start's remainder, not every node
+whose W is non-empty. Room (3,2) nodiag, `r0sxhn,r0sxh`, the level-0 tree
+(L-1 at 152) reused:
+
+| horizon | marked for level 1 | reach | level-1 forward | its widest frame | answer |
+|---|---|---|---|---|---|
+| 145, W-marked | 37,994,078 | - | 680.7 s | 4.4M kept | REFUTED |
+| 145, reached | 485,850 | 7.8 s | 16.7 s | 165k kept | REFUTED |
+| 152, W-marked | 61,652,179 | - | stopped at f106 (15.1M kept, x1.12 a frame) | | |
+| 152, reached | 1,651,951 | 146.8 s | 4275 s, 425M visited | 21.3M kept (f115) | OPTIMAL 148 |
+
+Validation on a known optimum, room (7,0) any% (`--ceiling 84`, L-1 84,5,
+`r0sxhn,r0sxh`): reach marks 22,985 of 2,533,820 nodes; level 0 bound 80
+(no concrete win at 80, 164k steps), level 1 forward 6.4 s, bound 84, the
+witness in 255 steps: OPTIMAL 84, as before (1166 s, peak 7.0 GB).
+
+Room (3,2) nodiag h152, the rest of the run: level 0 forward 797.5 s
+(127.9M visited, tree 17 GB trimmed, peak 6.5 GB); level-0 arc phase graph
+1.99G edges / 26.8 GB, backward 102M spans over 5.8M sets, arc bound 133,
+peak 41 GB VmHWM; level 1 tree 19 GB; level-1 arc phase 379M marked nodes,
+2.66G edges, graph 51.1 GB, backward 283 s (640M spans, 200k distinct
+sets), anon peak 74.5 GB (OOM-killed under 50 GB, done under 72 GB with the
+trees reused: 1443 s); the try at the bound 148 wins in 446 steps.
+
+Room (3,2) nodiag at level 0 alone (`--level r0sxhn`): the concrete
+breadth-first search grew 1.4x a layer from layer 33 (32,518 states at layer
+43, 4.3M steps): stopped.
+
+Room (2,0), `r0sxh`, f62, nodiag against any%: 3,220,138 kept / 26.2M
+visited against 5,559,103 / 45.7M (wave 16.6 s against 34.7 s).
+
+Room (3,0) nodiag level 0 (no level fits): `r0sxhf` f50 1,517,251, f55
+10,221,041 (x1.5 a frame, peak 10 GB at the cap); `r0sxhn` (after
+`d15af76`; kernels 119.6k bodies, 25.6M fused nodes, the build peaks at 40
+GB) f40 119,636, f50 5,275,464 (59 s a frame).
+
 # Fitting the big rooms: arc-phase memory and tree bytes, 2026-10-07 (quick, 16 threads, branch `fit-big`)
 
 Measured on a machine shared with the overnight queue: times are noisy,

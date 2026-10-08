@@ -111,6 +111,14 @@ PICO-8's rnd, no diagonal dash (`tas/room_4_3_nodiag_frame_106.txt`,
 plans/nodiag.md). 9:23 with the level-0 tree reused, peak 40.7 GB (VmHWM,
 mapped files included).
 
+**The ladder filtered by reach (2026-10-08).** The finer level is filtered
+by the nodes the rotation graph REACHES inside W from the start's
+remainder (`arc_dp::reach`), not every node with a winning set: in room
+(3,2) nodiag 1.3-2.7% of them. That made **(3,2) nodiag 148, four frames
+under TAS20's 152**: level 0 `r0sxhn` bound 133, level 1 `r0sxh` bound 148
+and its witness in 446 steps, exiting f148 in the original cart under the
+file's seeds (plans/nodiag.md). The level-1 arc phase peaked at 75 GB.
+
 ## Caveats on what "optimal" means here
 
 - **Balloon rooms**: `rnd` is an interval at every level, so a confirmation is

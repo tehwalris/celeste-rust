@@ -20,13 +20,82 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (0,2) 1700m | 81 | 89 (TAS17, offset 25) | **87 - 2 FASTER** | `rewrite search --level r0sxhn,r0sxh` (L-1 89,5): r0sxhn bound 87, witness 87; 316 s, 14.5 GB; exits f87 on a real PICO-8 in celeste-minimal and the original cart. `tas/room_0_2_nodiag_frame_87.txt` |
 | (5,0) 600m | 77 | 94 (TAS6, offset 29, any seed) | **93 - 1 FASTER** | `rewrite search --level r0sxhn,r0sxh` (no L-1: balloon y): bounds 91, 93; witness 93; 132 s, 5.1 GB; exits f93 on a real PICO-8 in both carts for every seed tried. `tas/room_5_0_nodiag_frame_93.txt` |
 | (0,1) 900m | 100 | 108 (TAS9, offset 27) | 108 (tie) | bounds 106, 108 (r0sxh); 619 s, 17.5 GB. `tas/room_0_1_nodiag_frame_108.txt` |
-| (2,0) 300m | 95 | 108 (TAS3, offset 25) | - | level 0 explodes (122M states at f76, 620M visited, with level -1): the spring's speed spread; stopped |
+| (2,0) 300m | 95 | 108 (TAS3, offset 25) | - | level 0 explodes (122M states at f76, 620M visited, with level -1): the speed spread, below; not solved (2026-10-08) |
+| (3,0) 400m | 89 | 93 (TAS4, offset 27) | - | no level 0 fits: `r0sxhn` (fruit exact) 5.3M kept at f50, x1.46 a frame; `r0sxhf` (floors exact) 10.2M at f55, x1.5; `r0sxhfn` does not build (below); not solved (2026-10-08) |
 | (1,3) 2600m | 127 | 135 (TAS26, offset 25) | **133 - 2 FASTER** | arc bound 133 at r0sxhn, witness; 153 s, 8.1 GB; original cart: TAS26 f135, ours f133; UCT: 109f -> 107f. `tas/room_1_3_nodiag_frame_133.txt` |
 | (5,2) 2200m | 150 | 158 (TAS22, offset 25) | **157 - 1 FASTER** | arc bound 157 at r0sxhn, witness; 2027 s, 44.5 GB; original cart: TAS22 f158, ours f157; UCT: 132f -> 131f (TAS22's file has 3 inputs past the exit, which UCT's clean save trims). `tas/room_5_2_nodiag_frame_157.txt` |
 | (3,3) 2800m | 172 | 184 (TAS28, offset 49) | **179 - 5 FASTER** | arc bound 179 at r0sxhn, witness; 262 s, 13.8 GB; original cart: TAS28 f184, ours f179; UCT: 134f -> 129f. `tas/room_3_3_nodiag_frame_179.txt` |
-| (5,1) 1400m | 104 | 121 (TAS14, offset 25) | - | out of memory with level -1 (62 GB); the retry without it filled the disk; not solved |
-| (3,2) 2000m | 128 | 152 (TAS20, offset 31) | - | out of memory; not solved |
+| (5,1) 1400m | 104 | 121 (TAS14, offset 25) | **119 - 2 FASTER** | `fit-big` (2026-10-07): `r0sxhn,r0sxh`, L-1 121,5, `CELESTE_TRIM_ROWS=1`, 60 GB; BENCHMARK_DATA.md |
+| (3,2) 2000m | 128 | 152 (TAS20, offset 31, seeds 0) | **148 - 4 FASTER** | `rewrite search --level r0sxhn,r0sxh` with `arc_dp::reach` (L-1 152,5, `CELESTE_TRIM_ROWS=1`): bounds 133, 148; witness at 148 in 446 steps; level 0 13 min, level-1 forward 71 min, the arc phases ~25 min; peak 75 GB (the level-1 arc phase; below); exits f148 in the original cart under TAS20's seeds (0,0,0,0; not under 0.5 or PICO-8's rnd); UCT: 120f -> 116f. `tas/room_3_2_nodiag_frame_148.txt` |
 | (1,1) 1000m | 94 | 94 (TAS10) | - | (validation, not run) |
+
+## The three rooms that failed on size (2026-10-08, branch `nodiag-big`)
+
+**(3,2) 2000m** (4 balloons, 1 fall floor). Level 0 `r0sxhn` with L-1 152,5:
+the forward is cheap (127M visited, 13 min, 6.5 GB; tree 17 GB trimmed), the
+arc bound is 133 against the reference's 152, and every way on from there
+was too loose:
+- the concrete search at level 0 alone (`--level r0sxhn`): 1.4x a layer from
+  layer 33 (32k states at layer 43 of 152), stopped;
+- the objects ladder with the old filter (every node whose W is non-empty):
+  61.7M of the tree's nodes marked, the filtered `r0sxh` forward 15M kept at
+  f106 and x1.12 a frame (exact balloons: `timer` counts 60 frames after a
+  collection, a frame stamp until the balloon is back), stopped;
+- the ladder at lower horizons, the level-0 tree reused (`--to H`): h138
+  REFUTED in 96 s (level 1 dies at f43); h145 REFUTED in 17 min (level 1
+  680 s, 4.4M kept at its widest). So the optimum is above 145.
+`arc_dp::reach` (plans/architecture.md, "The search"): mark only the nodes
+the rotation graph REACHES inside W from the start's remainder. h145: 38.0M
+-> 486k nodes, level 1 680 s -> 16.7 s, the same answer. h152: 61.7M ->
+1.65M nodes; the filtered `r0sxh` forward 4275 s, 425M visited, at most
+21.3M kept a frame (f115), first remainder-free win f134; its arc phase
+needs more than 50 GB (graph 51.3 GB built, OOM-killed in the backward).
+With the trees kept and 72 GB (the machine had 105 GB available): the
+level-1 arc phase marked 379M nodes over 2.66G edges (graph 51.1 GB,
+built in 8 min), backward 283 s (640M spans over 200k distinct sets), anon
+peak 74.5 GB, VmHWM 75.3 GB; level-1 arc bound **148**, and the depth-first
+try at the bound found the witness in 446 steps: **OPTIMAL 148, four frames
+under TAS20** (and above the 145 refuted directly). Verified like the
+runner does (`/var/tmp/nd-big/verify.py`, its steps 3-4): exits during f148
+in the ORIGINAL cart under TAS20's seeds 0,0,0,0, no diagonal dash, UCT
+finishes it in 117 inputs (TAS20: 121); the upload file is
+`tas/tasdatabase/nodiag/upload/TAS20.tas`. Under seeds 0.5 or PICO-8's rnd
+it does not exit (the concrete search steps under the file's seeds).
+
+**(3,0) 400m** (the fly fruit, 12 fall floors). No level 0 fits: with the
+fruit exact (`r0sxhn`) every waiting frame's `step` is new (a frame
+counter): 119.6k kept at f40, 5.3M at f50 (x1.46 a frame, 59 s a frame);
+with the floors exact (`r0sxhf`) 10.2M at f55 (x1.5). The any% level
+(`r0sxhfb`) had `b`, deleted. `r0sxhn` did not BUILD before `d15af76` (the
+spawn shapes after the first frame were traced unbounded: every floor
+"near", 2^12 outcomes); `r0sxhfn` still does not: with the fruit unknown
+(`Symbolic::unknowns()`) a comparison with the unknown number mints an atom
+that refuses merges (`state::merge_inner`, `refuse_selects`), and at `n` the
+floors' countdowns ARE the unknown number, so each floor's `delay <= 0`
+keeps its two paths apart: 8192 trace states (2 shapes) after the spawn
+frame's `foreach`, then minutes of merge attempts. Tried on branch
+`nodiag-big-fn-wip` (`76c5a82`, not merged): a comparison reading a
+countdown field mints a COUNTDOWN atom that stays three-valued as at `n`
+(joined, split by the split pass, not forked on escape) while the fruit's
+keep refusing, and the no-player chain runs with the fruit exact. Then
+`r0sxhfn` BUILDS (307 kernels, the walk 158 s) and runs to f42 (f40 92,350
+kept, the same as `r0sxhf`: no gain yet that early), and stops on a KERNEL
+COVERAGE GAP - lanes falling at `spd.y` 2 decline on an error disjunct
+(`CELESTE_KERNEL_EXPLAIN`); not investigated further.
+
+**(2,0) 300m** (2 springs). Nodiag is SMALLER than any% frame for frame
+(`r0sxh`, f62: 3.22M kept, 26.2M visited, against 5.56M / 45.7M), but 13
+frames longer: the level -1 cut at 108 starts ~13 frames later than at 95,
+on a frontier growing x1.26 a frame (`r0sxhn`: 31.4M at f70, 98.2M at
+f75, 497M visited, nothing yet too late). What grows is the speed: at the
+hottest cell (48,88), f62, 548 `spd.x` and 49 `spd.y` values, 8,433 speed
+pairs against 465 states without the speed, the pairs still growing
+(`col-census --cell`); `spring` multiplies `spd.x` by 0.2 and the
+`appr` steps keep the odd fractions. Level -1's d is position-only (the
+start's d 45 against 95/108), so it cannot cut early. What would fix it: a
+cost-to-go that knows the speed and the dash count (plans/level-minus-one.md,
+"the off-screen lane" / "speed per node"), or an exact speed refinement the
+arcs can carry - neither exists.
 
 ## The concrete count-up (arc-search --witness)
 
@@ -97,5 +166,5 @@ database files and ours - finish and clean-save unchanged: 600m 65 -> 64 inputs
 (64f -> 63f), 1700m 64 -> 62 (63f -> 61f), 2900m 82 -> 77 (81f -> 76f), the
 same counts as the real PICO-8. Upload files, as UCT's clean save writes them
 (trailing commas; 600m's one balloon seed written as `[0,]`):
-`tas/tasdatabase/nodiag/upload/TAS{6,17,29}.tas` (and, verified the same way 2026-10-06, TAS{22,26,28}.tas). To submit: one Discord
+`tas/tasdatabase/nodiag/upload/TAS{6,17,29}.tas` (and, verified the same way, TAS{22,26,28}.tas on 2026-10-06 and TAS20.tas on 2026-10-08). To submit: one Discord
 message `!uploadtas classic nodiag` with the three files attached.

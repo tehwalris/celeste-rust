@@ -1,0 +1,4 @@
+# Room (3,2): the concrete witness of `rewrite search --level r0sxhn,r0sxh --to 152`.
+# Arc bound f148 (level 1, r0sxh); no concrete win before f148 inside the winning sets (exhaustive).
+# A balloon room's win may hold for some `rnd` draws only: replay with seeds.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,0,0,0,0,0,2,2,2,16,0,18,18,2,2,2,2,2,2,36,0,36,0,0,0,0,16,0,0,0,0,2,2,2,2,2,2,2,34,2,2,2,2,2,2,2,2,2,2,2,2,2,2,36,36,0,0,0,0,2,2,2,2,16,2,2,18,36,0,0,36,0,0,0,1,1,33,1,1,1,1,33,1,1,1,1,33,1,1,1,33,0,0,33,0,0,0,33,1,1,16,1,17,1,1,1,17,0,0
