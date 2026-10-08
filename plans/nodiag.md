@@ -29,6 +29,40 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (1,1) 1000m | 94 | 94 (TAS10) | - | (validation, not run) |
 | (2,1) 1100m | 82 | 87 (TAS11, offset 24) | **85 - 2 FASTER** (UCT: 61f against 62f) | 2026-10-08, `r0sxhnp,r0sxhn` (level -1 refused with `p`): r0sxhnp bound 82 (no concrete win at 82, 14k steps), r0sxhn (platform exact, filtered) bound 85, witness at 85 (2.2k steps); 697 s, 13.7 GB. Original cart (seeds 0, 0.8905): exits f85. Our first press is on frame 24, the frame the player is created (the community file's earliest exiting offset is 24 zeros): the upload starts there, 62 inputs = 61f in UCT, `tas/tasdatabase/nodiag/upload/TAS11.tas`, `tas/room_2_1_nodiag_frame_85.txt` |
 
+## The platform rooms and the split frame (2026-10-08, branch `nodiag-platforms`)
+
+700m (6,0), 1100m (2,1), 1800m (1,2) have moving platforms; 1500m (6,1) was
+solved in any% only with the split frame. What blocked them, and what changed:
+
+- **Not a second player split.** The capture's "two player moves in a
+  frame" never happens: `move` is the only `__split_by_flr` of the player and
+  `_update` calls it once per object; the platform carries the player with
+  `move_x` (whole pixels, `rem` untouched). The one real case: a carry
+  blocked by a wall sets `rem.x = 0` before the player's move, a split of one
+  point, now `Const(fin)` from the whole circle (`arc_edges`, `9ed9124`).
+- **The `p` level itself had not built with `n` since `b47b118`** (room (2,1)
+  `r0sxhnp`: 354 trace states at the spawn; bisected). Countdown atoms stay
+  three-valued under `p`, and with `p` an overlapped floor stores its
+  computed state (`d5c6234`; plans/abstractions.md "p").
+- **The split frame in the search** (`0231de8`): the tree in steps, the
+  concrete search in whole frames. The objects ladder under it filtered
+  mid-frame rows with a projection that does not key as the coarser tree's
+  mid-frame rows: room (6,1) `r0sxhn,r0sxh` REFUTED 93, which TAS15 reaches in
+  the minimal cart on PICO-8; filtering at frame boundaries only fixed it
+  (`5ccf712`).
+- 1500m `r0sxhn` alone (split, level -1 186 steps): the forward to step 186
+  took ~70 min (25M states a step at most, peak 27.5 GB with the arc phase),
+  arc bound f90 (ref 93), no concrete win at 90 (18.6k steps); the
+  breadth-first search then grew to 27k states a layer by layer 61 at ~5 min
+  a layer: stopped for the objects ladder.
+- 700m: the level -1 table did not finish in 17 min (`r0sxhfp`, split);
+  rerun without it.
+- `rewrite arc-check` runs out of memory on any tree with an unknown number
+  (the near level's countdowns since `b47b118`, the fly fruit): it steps
+  stored rows through the concrete engine, which reads `UNum` as the whole
+  16.16 range (room (7,0) `r0sxhn`: OOM at f2 under 12 GB). Not run on these
+  rooms' trees; the witnesses on PICO-8 are the check.
+
 ## The concrete count-up (arc-search --witness)
 
 The arc optimum over coarse objects is only a lower bound. The witness DFS is
