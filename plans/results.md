@@ -144,6 +144,19 @@ the witness in 134 steps. Both exit at the optimum in the original cart on
 PICO-8 and finish in UniversalClassicTas (1800m one frame later there:
 plans/nodiag.md).
 
+## 100% (2026-10-08, branch `hundred`; plans/hundred.md)
+
+`CELESTE_HUNDRED=1`: the exit counts only with the room's berry taken. Of
+the 18 rooms of the tasdatabase's 100% list, 15 are verified end to end
+(original cart on PICO-8 with the berry, UniversalClassicTas with no
+death): four IMPROVE on the community TAS - 100m 115 (-3), 500m 152 (-1),
+2300m 89 (-5), 2600m 161 (-2) - and eleven tie (400m 89, 900m 122, 1200m
+78, 1300m 153, 1500m 114, 1700m 90, 1900m 131, 2500m 134, 2800m 187, 2900m
+109, 3000m 114). Open: 300m and 1400m (level 0 past 55 GB before level -1
+cuts), 700m (the `f` level's arc phase past 55 GB). Two exact changes made
+them fit: rows whose berry is lost are not expanded, and level -1 drops
+exits that leave the berry behind. Witnesses: `tas/room_X_Y_hundred_frame_N.txt`.
+
 ## Caveats on what "optimal" means here
 
 - **Balloon rooms**: `rnd` is an interval at every level, so a confirmation is
