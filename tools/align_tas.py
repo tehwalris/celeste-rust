@@ -42,11 +42,20 @@ for f in range(int(off),max(ex(A),ex(B))+1):
     pa=f"{a[1]:.0f},{a[2]:.0f}" if a[1] is not None else a[0]; pb=f"{b[1]:.0f},{b[2]:.0f}" if b[1] is not None else b[0]
     print(f"{f:3} {ia:>6} {pa:>9}      {ib:>6} {pb:>9}{mark}")
 def dashes(R,end):
-    # A dash sets the speed to 5 px/frame along its axis (d_full); nothing else reaches 4.5.
+    # A dash's first frame: 5 px/frame along one axis (d_full), or 5/sqrt(2) =
+    # 3.54 on BOTH axes for a diagonal one (d_half). Nothing else reaches 4.5
+    # on one axis or 3.5 on both (springs: spd.y -3; falls: 2; runs, wall jumps: 2).
+    # (Until 2026-10-08 only the axis-aligned case was detected: no diagonal
+    # dash was ever marked in the UI.)
     out=[]; was=False
     for f in range(1,end+1):
         sx,sy=(R.get(f,(None,)*5)[3:] or (None,None))
-        d=''.join(c for c,v in (('R',sx),('L',sx and -sx),('D',sy),('U',sy and -sy)) if v is not None and v>=4.5)
+        if sx is None or sy is None:
+            d=''
+        elif abs(sx)>=3.5 and abs(sy)>=3.5:
+            d=('U' if sy<0 else 'D')+('L' if sx<0 else 'R')
+        else:
+            d=''.join(c for c,v in (('R',sx),('L',-sx),('D',sy),('U',-sy)) if v>=4.5)
         if d and not was: out.append(f"{f}:{d}")
         was=bool(d)
     return out
