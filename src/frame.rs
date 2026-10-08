@@ -306,13 +306,31 @@ pub fn orb_deadline_skip(rt2: &Rt2, frame: u32, horizon: u32) -> Vec<bool> {
     (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(zero)).collect()
 }
 
+/// 100%, per lane: can no successor take the room's berry any more? Not
+/// taken (`got_fruit` false, not unknown) and nothing left that holds or
+/// drops it - the fruit, the fly fruit (gone once it flew off), the key and
+/// its chest, a fake wall. Exact: every state the row stands for is lost.
+pub fn berry_lost(rt2: &Rt2) -> Result<Vec<bool>> {
+    let lanes = rt2.width;
+    let ids = crate::compiled::ids();
+    let sources = [ids.g_fruit, ids.g_fly_fruit, ids.g_key, ids.g_chest, ids.g_fake_wall];
+    if !crate::game_runner::hundred() || sources.iter().any(|&g| !rt2.objects_of_type(ids, g).is_empty()) {
+        return Ok(vec![false; lanes]);
+    }
+    Ok(got_fruit(rt2)?.into_iter().map(|taken| !taken).collect())
+}
+
 /// Per lane of a frame's rows: NOT expanded further. An exited row (no kernels
-/// for the next room; a win or a `--win-at` exit), and in the orb room a row
-/// whose chest is still closed too late for the ceiling (`orb_deadline_skip`).
+/// for the next room; a win or a `--win-at` exit), a 100% row whose berry is
+/// lost (`berry_lost`), and in the orb room a row whose chest is still closed
+/// too late for the ceiling (`orb_deadline_skip`).
 /// The forward and a resume both take the frontier through this, so a resumed
 /// run expands exactly the rows an uninterrupted one does.
 pub fn not_expanded(b: &Block, frame: u32) -> Result<Vec<bool>> {
     let mut skip = b.exits()?;
+    for (w, lost) in skip.iter_mut().zip(berry_lost(b.rt2())?) {
+        *w |= lost;
+    }
     if let (true, Some((h, _))) = (orb_required(), level_minus_one()) {
         for (w, late) in skip.iter_mut().zip(orb_deadline_skip(b.rt2(), frame, h)) {
             *w |= late;

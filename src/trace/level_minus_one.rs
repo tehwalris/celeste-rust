@@ -134,6 +134,21 @@ fn widen(seed: Range, obs: Range, jump: bool) -> Range {
     (lo, hi)
 }
 
+/// Does outcome state `st` certainly not hold `room`'s berry as taken
+/// (`got_fruit[1 + level_index()]` nil or the constant false)? An unknown
+/// or selected value may be true: the exit is kept.
+fn berry_left_behind(st: &State<Symbolic>, d: &Symbolic, room: (i16, i16)) -> bool {
+    let Some(Value::Table(t)) = iface::get(st, &[iface::key("got_fruit")]) else { return true };
+    let k = 1 + crate::game_runner::level_index(room.0, room.1);
+    let tab = &st.heap.tables[&t];
+    let v = tab.ints.get(&k).or_else(|| tab.arr.get(k as usize - 1));
+    match v {
+        None | Some(Value::Nil) => true,
+        Some(Value::Bool(b)) => d.decide(b) == Some(false),
+        Some(_) => false,
+    }
+}
+
 /// The player, else the player spawn (`pos_graph::player_object`'s rule).
 fn located_object(st: &State<Symbolic>) -> Option<Path> {
     if let Some(p) = super::shapes::player_path(st) {
@@ -448,6 +463,11 @@ impl<'a> Table<'a> {
             let room = super::shapes::room_of(&o.st, d);
             ensure!(room.0 >= 0 && room.1 >= 0, "shape {id}: an outcome whose room is not a constant");
             if room != self.room0 {
+                // 100%: an exit that certainly leaves the berry behind wins
+                // nothing - the run ends there, no successor.
+                if crate::game_runner::hundred() && berry_left_behind(&o.st, d, self.room0) {
+                    continue;
+                }
                 outs.push(OutSpec { target: Target::Exit, fields: Vec::new() });
                 roots_old.push(Roots { live: o.guard, error: o.error, xy: None, fields: Vec::new() });
                 continue;

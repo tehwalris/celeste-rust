@@ -6,7 +6,11 @@ and verify every result end to end.
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
-"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"; "reuse": a level-0 tree to reuse); re-read
+"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"; "reuse": a level-0 tree to reuse;
+"to": a horizon H instead of the reference - `--to H`, level -1 at H, and a
+refutation is a result (the optimum is above H); "keep_tree": leave the tree
+in OUTDIR for a later job's "reuse"; "witness": a file of our inputs to verify,
+no search); re-read
 before every job, so jobs can be appended while it runs; a job whose key is
 already in OUTDIR/results.jsonl is skipped.
 
@@ -16,6 +20,7 @@ Per job:
  2. `rewrite search --ceiling REF --prefer <the community TAS>` with the
     category's mode (CELESTE_NODIAG / CELESTE_GEMSKIP / CELESTE_HUNDRED) and
     the level -1 filter if `l1` (retried without it if its table refuses);
+    `--to H` instead with a job's "to";
  3. our witness replayed in the original cart (must exit at the optimum; no
     diagonal dash in a nodiag category);
  4. both files through UniversalClassicTas (tools/uct/validate.sh): the clean
@@ -64,6 +69,27 @@ def replay_exit(room, inputs, seeds, cat):
         if m and m.group(2) != room:
             return int(m.group(1)), out
     return None, out
+
+
+def chest_seed_variants(room, seeds):
+    """The seed list with each chest's entry replaced by every class of
+    draws: a chest's berry appears at x = start + s, s in [-1, 2), and only
+    which side of a pixel it lies on matters to a whole-pixel player. The
+    list runs over balloons (tile 22) and chests (tile 20) in creation order
+    (`load_room`: x outer, y inner), as UniversalClassicTas reads it."""
+    rx, ry = (int(v) for v in room.split(","))
+    hexmap = re.sub(r"\s", "", open(f"{M}/cart/map-data.txt").read())
+    tile = lambda x, y: int(hexmap[2 * (y * 128 + x):2 * (y * 128 + x) + 2], 16)
+    objs = [tile(rx * 16 + tx, ry * 16 + ty) for tx in range(16) for ty in range(16)]
+    objs = [t for t in objs if t in (20, 22)]
+    vals = [v for v in seeds.split(",") if v.strip()]
+    vals += ["0"] * (len(objs) - len(vals))
+    out = []
+    for i, t in enumerate(objs):
+        for s in ["-1", "-0.5", "0", "0.5", "1", "1.5"]:
+            if t == 20 and vals[i] != s:
+                out.append(",".join(vals[:i] + [s] + vals[i + 1:]))
+    return out
 
 
 def diag_dashes(inputs):
@@ -153,7 +179,7 @@ def run(job, outdir, binary):
         env["CELESTE_CONCRETE_BALLOON_SEEDS"] = seeds
         if l1:
             # Level -1 counts search steps: two a frame under the split frame.
-            steps = ref * (2 if env.get("CELESTE_SPLIT_FRAME") else 1)
+            steps = horizon * (2 if env.get("CELESTE_SPLIT_FRAME") else 1)
             env["CELESTE_LEVEL_MINUS_ONE"] = f"{steps},5"
         log = os.path.join(jd, "search.log")
         tree = os.path.join(jd, "tree")
@@ -163,46 +189,77 @@ def run(job, outdir, binary):
         if job.get("reuse") and os.path.isdir(job["reuse"]):
             os.makedirs(tree)
             shutil.move(job["reuse"], os.path.join(tree, "level00"))
-        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--ceiling", str(ref), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", os.path.join(jd, "tree")]
+        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--to" if "to" in job else "--ceiling", str(horizon), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", os.path.join(jd, "tree")]
         t = time.time()
         with open(log, "w") as f:
             rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=M, timeout=job.get("timeout", 4 * 3600)).returncode
         return rc, open(log, errors="replace").read(), time.time() - t
+    horizon = job.get("to", ref)
+    keep = job.get("keep_tree")
+    drop_tree = lambda: None if keep else shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+    if job.get("witness"):
+        ours = [int(x) for x in re.findall(r"\d+", "".join(l for l in open(job["witness"]) if not l.startswith("#")))]
+        opt, res["witness_from"] = len(ours), job["witness"]
+    else:
+        opt = None
     try:
-        rc, log, secs = search(job.get("l1", True))
-        if rc != 0 and job.get("l1", True) and rc != 137 and re.search(r"building the level -1 table|level_minus_one", log):
-            res["l1"] = "refused"
-            rc, log, secs = search(False)
+        if opt is None:
+            rc, log, secs = search(job.get("l1", True))
+            if rc != 0 and job.get("l1", True) and rc != 137 and re.search(r"building the level -1 table|level_minus_one", log):
+                res["l1"] = "refused"
+                rc, log, secs = search(False)
     except subprocess.TimeoutExpired:
-        shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+        drop_tree()
         return {**res, "status": "search timed out"}
-    res["search_s"] = round(secs)
-    peak = re.findall(r"peak ([\d.]+) GB", log)
-    res["peak_gb"] = peak[-1] if peak else None
-    m = re.search(r"OPTIMAL win frame: (\d+)", log)
-    if rc != 0 or not m:
-        shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
-        tail = [l for l in log.splitlines() if l.strip()][-3:]
-        return {**res, "status": f"search failed (exit {rc})", "tail": tail}
-    opt = int(m.group(1))
-    ours = [int(x) for x in re.search(r"concrete optimum \d+ inputs (\S+)", log).group(1).split(",")]
+    if opt is None:
+        res["search_s"] = round(secs)
+        peak = re.findall(r"peak ([\d.]+) GB", log)
+        res["peak_gb"] = peak[-1] if peak else None
+        bounds = re.findall(r"ARC BOUND: no win before f(\d+)", log)
+        res["arc_bounds"] = [int(b) for b in bounds]
+        m = re.search(r"OPTIMAL win frame: (\d+)", log)
+        # Under `--to H` a refutation is a result: no win by H at all.
+        refuted = re.search(r"^(REFUTED: no win by f\d+|no concrete win by f\d+)", log, re.M)
+        if rc == 0 and refuted and "to" in job:
+            drop_tree()
+            return {**res, "status": f"refuted at {horizon}", "detail": refuted.group(1)}
+        if rc != 0 or not m:
+            drop_tree()
+            tail = [l for l in log.splitlines() if l.strip()][-3:]
+            return {**res, "status": f"search failed (exit {rc})", "tail": tail}
+        opt = int(m.group(1))
+        ours = [int(x) for x in re.search(r"concrete optimum \d+ inputs (\S+)", log).group(1).split(",")]
     res["ours"] = opt
     open(os.path.join(jd, "witness.txt"), "w").write(",".join(map(str, ours)))
     # 3. verification in the original cart
-    e, out = replay_exit(room, ours, seeds, cat)
-    if e != opt:
-        # A jump press that does nothing in the minimal cart can fire later in
-        # the original (its jump buffer): keep only the presses that fire.
-        canon = canon_jumps(room, ours, seeds, cat)
-        e2, out2 = replay_exit(room, canon, seeds, cat)
-        res["jump_canonicalized"] = f"original cart exit {e} -> {e2}"
-        if e2 == opt:
-            ours, e, out = canon, e2, out2
-            open(os.path.join(jd, "witness.txt"), "w").write(",".join(map(str, ours)))
-    res["ours_original_cart_exit"] = e
-    if cat in ("100", "gemskip100"):
+    hundred = cat in ("100", "gemskip100")
+    # The search steps a chest's last shake as every draw (`rnd` is an
+    # interval; only the balloons are seeded), so its witness may take the
+    # berry where the file's chest seed does not put it: then the other
+    # chest seeds are tried, and the upload carries the one that works.
+    for sd in [seeds] + (chest_seed_variants(room, seeds) if hundred else []):
+        mine, e, out = ours, *replay_exit(room, ours, sd, cat)
+        if e != opt:
+            # A jump press that does nothing in the minimal cart can fire later in
+            # the original (its jump buffer): keep only the presses that fire.
+            canon = canon_jumps(room, ours, sd, cat)
+            e2, out2 = replay_exit(room, canon, sd, cat)
+            res["jump_canonicalized"] = f"original cart exit {e} -> {e2}"
+            if e2 == opt:
+                mine, e, out = canon, e2, out2
         # The berry taken before the exit: a `lifeup` appears where it was.
-        res["berry"] = any(" lifeup " in l and int(l.split()[0][1:]) < e for l in out.splitlines() if re.match(r"f\d+ ", l)) if e else False
+        berry = any(" lifeup " in l and int(l.split()[0][1:]) < e for l in out.splitlines() if re.match(r"f\d+ ", l)) if e else False
+        if e == opt and (berry or not hundred):
+            break
+    if e == opt and sd != seeds:
+        res["chest_seeds"] = f"[{seeds}] -> [{sd}]"
+        seeds = sd
+    if e == opt:
+        ours = mine
+        open(os.path.join(jd, "witness.txt"), "w").write(",".join(map(str, ours)))
+    res["ours_original_cart_exit"] = e
+    if hundred:
+        res["berry"] = berry
     if "nodiag" in cat:
         res["diagonal_dashes"] = diag_dashes(ours)
     lead = next((i for i, b in enumerate(ours) if b), len(ours))
@@ -237,7 +294,7 @@ def run(job, outdir, binary):
     res["status"] = "IMPROVED" if opt < ref else ("tie" if opt == ref else "WORSE?")
     res["verified"] = (e == opt) and not res.get("diagonal_dashes") and res.get("uct_ours", "").startswith("finished") and res.get("berry", True)
     # 5. the UI
-    if opt < ref:
+    if opt < ref and not job.get("witness"):
         try:
             paths = os.path.join(jd, "paths")
             env = dict(os.environ, TAS_CATEGORY=cat, REPLAY_ARGS=" ".join(replay_args(cat)))
@@ -264,7 +321,7 @@ def run(job, outdir, binary):
             res["ui"] = rid
         except Exception as ex:  # the result stands; the UI can be redone
             res["ui_error"] = str(ex)[:200]
-    shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+    drop_tree()
     return res
 
 

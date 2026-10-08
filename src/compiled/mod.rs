@@ -44,6 +44,8 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
         f_last: f("last"),
         g_fall_floor: g("fall_floor"),
         g_big_chest: g("big_chest"),
+        g_chest: g("chest"),
+        g_fake_wall: g("fake_wall"),
         f_state: f("state"),
         f_delay: f("delay"),
         f_collideable: f("collideable"),
