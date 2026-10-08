@@ -1,0 +1,3 @@
+# Room (7,2) gemskipnodiag: the concrete witness of `CELESTE_GEMSKIP=1 CELESTE_NODIAG=1 rewrite search --level r0sxhn,r0sxh --ceiling 114` (L-1 at the horizon).
+# Arc bounds [99]; exits during f99 in the original cart (--one-dash) under balloon seeds [].
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,34,2,2,2,2,2,32,2,2,16,2,2,2,2,2,2,36,2,2,2,2,2,36,2,2,0,16,2,2,2,2,2,2,2,2,2,16,2,2,2,2,16,2,2,2,1,1,36,1,0,32,1,1,1,1,1,1,1,1,1,1,1,17,1,1,1,1,1,16,1,1,1,1,16,0

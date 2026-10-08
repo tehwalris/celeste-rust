@@ -30,7 +30,8 @@ attempt; `15e7834`: balloon seeds nudged where UCT's doubles and PICO-8's
 | category | room | DB | ref | ours | UCT | how | status |
 |---|---|---|---|---|---|---|---|
 | any% | 2900m (4,3) | 60 | 90 | 90 | 61 -> 61 | `r0sxhn` bound 90, witness at the bound; 330 s, 12.4 GB | OPTIMAL, tie |
-| any% | 2600m (1,3) | 123 | - | 151 | 124 -> dies | see "2600m any%" below | PICO-8 optimum; no file valid in both |
+| any% | 2600m (1,3) | 123 | - | 151 | 124 -> dies | see "2600m any%" below | PARKED (the community run is valid in UCT only); no upload |
+| any% | Summit (6,3) | open | 64 | **57** | flag at keypress 41 -> 34 | `r0sx --to 64` (exact: no objects; no level -1, the win is the flag rect): bound 57, witness at the bound; 887 s | OPTIMAL, -7 |
 | nodiag | 3000m (5,3) | 88 | 120 | **106** | 89 -> 75 | `r0sxhn` bound 106, witness at the bound; 922 s, 9.6 GB; upload seeds nudged to `[0.9999,0,0.9999,0.9999]` | OPTIMAL, -14 |
 | nodiag | 2900m (4,3) | 93 | 123 | **109** | 94 -> 80 | bounds 106 (`r0sxhn`), 109 (`r0sxh`); 4663 s, VmHWM 56.8 GB (anon 33.5) | OPTIMAL, -14 |
 | nodiag | 2400m (7,2) | 90 | 114 | **99** | 91 -> 76 | `r0sxhn` bound 99, witness at the bound; 783 s | OPTIMAL, -15 (= gemskip any%'s 99) |
@@ -55,6 +56,19 @@ optimum** (1489 s, VmHWM 50.6 GB). But UCT kills our file at keypress 64:
 the two agree to f78, and at f79 (x 37) PICO-8's player stays at y 61 while
 UCT's falls a pixel (Lua doubles against 16.16, the same class as 1800m
 nodiag's platform pixel, plans/nodiag.md). Neither file is valid in both.
+Policy (Philippe, 2026-10-08): our result is the PICO-8 optimum; where UCT
+disagrees, look for a same-length variant that also finishes in UCT, never
+a longer run; a room whose community run is valid only in UCT ("too fast
+for fixed point") is parked for discussion, without an upload.
+
+### The summit
+
+The database's gemskip any% Summit entry has a file (TAS31, 50 inputs) but
+no frame count. In the original cart it touches the flag during f64 (the
+any% TAS31 at f55, our known any% optimum). UCT's clean save never fires at
+the summit (the driver reports "raw save only" for the any% file too), so
+the check is the capture's positions: TAS31 touches the flag at keypress
+41, ours at 34. The upload is our file as is.
 
 ## How the rooms were run
 
