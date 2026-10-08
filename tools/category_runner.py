@@ -108,8 +108,39 @@ def uct(level, path, cat):
         env["UCT_DASHES"] = "1"
     out = subprocess.run([f"{M}/tools/uct/validate.sh", str(level), path], capture_output=True, text=True, env=env, timeout=1800).stdout
     m = re.search(r"(finished, clean save|DID NOT FINISH[^,]*), (\d+) inputs", out)
-    saved = os.path.expanduser(f"~/.local/share/love/CelesteTAS/TAS{level}.tas")
+    # validate.sh runs each file under its own save identity and prints where.
+    p = re.search(r"-> (\S+\.tas)\s*$", out, re.M)
+    saved = p.group(1) if p else os.path.expanduser(f"~/.local/share/love/CelesteTAS/TAS{level}.tas")
     return (m.group(1).startswith("finished") if m else False), (int(m.group(2)) if m else None), saved, out
+
+
+def seed_tiles(room):
+    """The objects a `[seeds]` list runs over: balloons (22) and chests (20)
+    in creation order (`load_room`: x outer, y inner), as UCT's set_seeds."""
+    rx, ry = (int(v) for v in room.split(","))
+    hexmap = re.sub(r"\s", "", open(f"{M}/cart/map-data.txt").read())
+    tile = lambda x, y: int(hexmap[2 * (y * 128 + x):2 * (y * 128 + x) + 2], 16)
+    return [t for t in (tile(rx * 16 + tx, ry * 16 + ty) for tx in range(16) for ty in range(16)) if t in (20, 22)]
+
+
+def nudged_seeds(room, seeds, steps=10):
+    """The file's seeds with every BALLOON's phase moved by k * 0.0001,
+    k = -1, +1, -2, +2, .. A seed does not mean exactly the same in UCT and
+    PICO-8: the phase advances 0.01 a frame in UCT's doubles and 0x0.028f
+    (0.0099945) in 16.16, so UCT runs ahead by 5.5e-6 a frame, and where a
+    balloon's y meets an integer (seed 0: y = start EXACTLY at offset 0.5)
+    the touch can differ (gemskip-nodiag 3000m: PICO-8 refills at f54 at y
+    111.997, UCT's balloon is at 112.000 and misses). A nudge of -0.0003 is
+    UCT's phase at PICO-8's around frame 55. Every candidate is checked in
+    BOTH (the original-cart replay must still exit at the optimum, UCT must
+    finish with no death); chests (a berry position) are kept."""
+    tiles = seed_tiles(room)
+    vals = [v.strip() for v in seeds.split(",") if v.strip()]
+    vals += ["0"] * (len(tiles) - len(vals))
+    for k in range(1, steps + 1):
+        for sign in (-1, 1):
+            out = [(f"{(float(v) + sign * k * 1e-4) % 1:.4f}".rstrip("0").rstrip(".") or "0") if t == 22 else v for v, t in zip(vals, tiles)]
+            yield ",".join(out + vals[len(tiles):])
 
 
 def run(job, outdir, binary):
@@ -231,14 +262,23 @@ def run(job, outdir, binary):
     if level:
         ok_db, n_db, _, _ = uct(level, f"{DB}/classic/{cat}/{entry['file']}", cat)
         res["uct_db"] = f"{'finished' if ok_db else 'NOT finished'} {n_db} inputs"
-        for cut in [prologue] + ([lead] if lead < prologue else []) + [prologue - 1]:
-            if any(ours[:cut]):
+        # A death in UCT is a failure (validate.sh), never a "finished" from a
+        # later attempt. When the file's seeds die in UCT, the balloons'
+        # phases are nudged (nudged_seeds): checked in both, and the upload
+        # carries the seeds used (still optimal: the bound holds for every seed).
+        cuts = [c for c in [prologue] + ([lead] if lead < prologue else []) + [prologue - 1] if not any(ours[:c])]
+        tries = [(seeds, c) for c in cuts] + [(sd, c) for sd in nudged_seeds(room, seeds or "0") for c in cuts]
+        for sd, cut in tries:
+            if sd != seeds and replay_exit(room, ours, sd, cat)[0] != opt:
                 continue
             mine = os.path.join(jd, f"ours-{entry['file']}")
-            open(mine, "w").write(f"[{seeds}]" + ",".join(map(str, ours[cut:])))
-            ok, n, saved, _ = uct(level, mine, cat)
-            res["uct_ours"], res["upload_cut"] = f"{'finished' if ok else 'NOT finished'} {n} inputs", cut
+            open(mine, "w").write(f"[{sd}]" + ",".join(map(str, ours[cut:])))
+            ok, n, saved, out = uct(level, mine, cat)
+            st = re.search(r"(finished, clean save|DID NOT FINISH[^,]*)", out)
+            res["uct_ours"], res["upload_cut"] = f"{'finished' if ok else (st.group(1) if st else 'NOT finished')} {n} inputs", cut
             if ok:
+                if sd != seeds:
+                    res["upload_seeds"] = sd
                 up = os.path.join(outdir, "upload", cat)
                 os.makedirs(up, exist_ok=True)
                 shutil.copy(saved, os.path.join(up, entry["file"]))
