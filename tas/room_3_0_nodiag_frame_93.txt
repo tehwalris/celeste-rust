@@ -1,0 +1,4 @@
+# Room (3,0): the concrete witness of `rewrite search --level r0sxhfn,r0sxhn,r0sxh --to 93`.
+# Arc bound f93 (level 1, r0sxhn); no concrete win before f93 inside the winning sets (exhaustive).
+# A balloon room's win may hold for some `rnd` draws only: replay with seeds.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,2,2,2,2,2,2,32,2,2,2,2,2,2,2,2,2,2,2,2,2,18,2,0,0,0,18,2,2,2,2,2,17,1,1,1,1,1,16,0,0,0,36,0,0,0,0,0,0,0,1,1,1,1,17,1,1,1,1,1,36,0,0,0,0,0

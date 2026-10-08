@@ -21,7 +21,7 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (5,0) 600m | 77 | 94 (TAS6, offset 29, any seed) | **93 - 1 FASTER** | `rewrite search --level r0sxhn,r0sxh` (no L-1: balloon y): bounds 91, 93; witness 93; 132 s, 5.1 GB; exits f93 on a real PICO-8 in both carts for every seed tried. `tas/room_5_0_nodiag_frame_93.txt` |
 | (0,1) 900m | 100 | 108 (TAS9, offset 27) | 108 (tie) | bounds 106, 108 (r0sxh); 619 s, 17.5 GB. `tas/room_0_1_nodiag_frame_108.txt` |
 | (2,0) 300m | 95 | 108 (TAS3, offset 25) | **100 - 8 FASTER** | `rewrite search --level r0sxh --to 100` (L-1 100,5): bound 100, witness in 393 steps; 47 min, 36 GB; the earlier failures ran `r0sxhn` (2.4x the states by f65) at 108 (below). Original cart f100, no diagonal dash; UCT 82f -> 74f. `tas/room_2_0_nodiag_frame_100.txt` |
-| (3,0) 400m | 89 | 93 (TAS4, offset 27) | - | no level 0 fits: `r0sxhn` (fruit exact) 5.3M kept at f50, x1.46 a frame; `r0sxhf` (floors exact) 10.2M at f55, x1.5; `r0sxhfn` does not build (below); not solved (2026-10-08) |
+| (3,0) 400m | 89 | 93 (TAS4, offset 27) | 93 (tie) | `rewrite search --level r0sxhfn,r0sxhn,r0sxh --to 93` (L-1 93,5, `CELESTE_REGION=8,6`, `CELESTE_TRIM_ROWS=1`): `r0sxhfn` bound 76 (no concrete win at 76), `r0sxhn` filtered by reach bound 93, witness at 93 in 93 steps; level 0 ~2.6 h, level 1 102 s; peak 35 GB. Original cart f93, no diagonal dash; UCT 66 inputs, both files. `tas/room_3_0_nodiag_frame_93.txt` (below) |
 | (1,3) 2600m | 127 | 135 (TAS26, offset 25) | **133 - 2 FASTER** | arc bound 133 at r0sxhn, witness; 153 s, 8.1 GB; original cart: TAS26 f135, ours f133; UCT: 109f -> 107f. `tas/room_1_3_nodiag_frame_133.txt` |
 | (5,2) 2200m | 150 | 158 (TAS22, offset 25) | **157 - 1 FASTER** | arc bound 157 at r0sxhn, witness; 2027 s, 44.5 GB; original cart: TAS22 f158, ours f157; UCT: 132f -> 131f (TAS22's file has 3 inputs past the exit, which UCT's clean save trims). `tas/room_5_2_nodiag_frame_157.txt` |
 | (3,3) 2800m | 172 | 184 (TAS28, offset 49) | **179 - 5 FASTER** | arc bound 179 at r0sxhn, witness; 262 s, 13.8 GB; original cart: TAS28 f184, ours f179; UCT: 134f -> 129f. `tas/room_3_3_nodiag_frame_179.txt` |
@@ -29,7 +29,7 @@ room's any% prologue offset (the earliest exit), our frame counting.
 | (3,2) 2000m | 128 | 152 (TAS20, offset 31, seeds 0) | **148 - 4 FASTER** | `rewrite search --level r0sxhn,r0sxh` with `arc_dp::reach` (L-1 152,5, `CELESTE_TRIM_ROWS=1`): bounds 133, 148; witness at 148 in 446 steps; level 0 13 min, level-1 forward 71 min, the arc phases ~25 min; peak 75 GB (the level-1 arc phase; below); exits f148 in the original cart under TAS20's seeds (0,0,0,0; not under 0.5 or PICO-8's rnd); UCT: 120f -> 116f. `tas/room_3_2_nodiag_frame_148.txt` |
 | (1,1) 1000m | 94 | 94 (TAS10) | - | (validation, not run) |
 
-## The three rooms that failed on size (2026-10-08, branch `nodiag-big`)
+## The three rooms that failed on size (2026-10-08, branch `nodiag-big`; all three solved since)
 
 **(3,2) 2000m** (4 balloons, 1 fall floor). Level 0 `r0sxhn` with L-1 152,5:
 the forward is cheap (127M visited, 13 min, 6.5 GB; tree 17 GB trimmed), the
@@ -83,12 +83,50 @@ kept, the same as `r0sxhf`: no gain yet that early), and stops on a KERNEL
 COVERAGE GAP - lanes falling at `spd.y` 2 decline on an error disjunct
 (`CELESTE_KERNEL_EXPLAIN`, followed down: the error reads `UnknownBool(0)`,
 the frame's first atom - the fruit's `fly` - next to `Cell(20) <= 0`, so it
-is three-valued and reads as error); not fixed.
+is three-valued and reads as error); fixed below - that reading was wrong.
 
 The (2,0) lesson (search at the answer, not at the reference) does not
 rescue (3,0): nodiag's optimum is at least any%'s 89, and `r0sxhf` at
 `--to 89` (L-1 89,5) cut nothing by f59: 53.9M kept, x1.5 a frame, 37 GB;
 stopped.
+
+**(3,0) solved (2026-10-08, branch `nodiag-30`): OPTIMAL 93, a tie with
+TAS4.** Two fixes made `r0sxhfn` run (`plans/abstractions.md`, "f", "With
+`n`"): the countdown atoms of `76c5a82`, and the coverage gap at f42, which
+was `may_answers` giving `a == b` no ends whenever the frame held ANY
+unknown - a hidden floor's exact `state == 2` split both ways, and its
+solid side owed `collideable` false with the player inside it (`CELESTE_
+KERNEL_EXPLAIN`: the declined lanes' error was the floor overlap with
+`collideable` folded to true, not the fruit's `fly` the atoms in the guard
+suggested). Equality reads its ends now unless an operand reads an
+unknown. That made the kernels honest and big: 10.1M -> 25.8M fused nodes,
+the three (6,5) kernels (the floors' square) 1.3M -> 7.8M nodes / 81 MB of
+code each, and once the states gathered there (f60) they took 83% of the
+time: f61 608 s, f62 1141 s for ~5M lanes (225 us a lane). `CELESTE_REGION=8,6`
+(979 kernels, the largest 450k nodes; the same states, so the tree resumed
+under it): f63 96 s; the widest frame f74-f76 (8.6M kept, 5-11 min a frame
+on a machine shared with two other searches); 4 px is no faster than 8 at
+f50 (12.6 s against 12.3 s, 8 threads). The forward to f93 with L-1 at 93:
+kept f50 1.33M, f60 4.41M, f70 7.75M, f75 8.54M (the widest), f80 5.75M,
+f85 3.40M, f90 351k; 206.9M visited. Its arc phase: 17.1M marked nodes,
+391M edges, bound **76** (the fruit "maybe collected" is a free dash
+refill; no concrete win at 76, 12.8k steps); reach marked 383,604 nodes for
+level 1. `r0sxhn` filtered by them: 102.5 s, first remainder-free win f90,
+arc bound **93**, and the try at the bound won in 93 steps - the community
+route itself (the witness equals `--prefer`, TAS4's inputs behind the 27
+spawn frames). Verified as the runner does (`/var/tmp/nd30/verify.py`):
+exits during f93 in the ORIGINAL cart, dashes at f28 (right), f35 (none
+held), f70 and f88 (up), no diagonal; UCT finishes both files in 66 inputs.
+`tas/tasdatabase/nodiag/upload/TAS4.tas` is byte-identical to the
+database's TAS4.tas: a proof that it is optimal, nothing to submit. Search
+1:35 h wall after the region change (5720 s, level 0 resumed at f61; the
+region-16 part to f61 1:04 h), VmHWM 35 GB (the kernel build).
+
+The any% recipe's `b` (`r0sxhfb, r1sxhb..`: the floors fully unknown) has
+no separate arc-era equivalent: `b` was deleted on 2026-10-04 because `n`
+is finer and smaller (room (7,0): 5-6x fewer states from step 100), and
+`r0sxhfn` IS the any% level 0 with `n` for `b`. Its looseness (bound 76
+against 93) is the fruit's, which the ladder's `r0sxhn` removes.
 
 **(2,0) 300m** (2 springs): **OPTIMAL 100, eight frames under TAS3's 108.**
 What had failed was the HORIZON and the level, not the room: `r0sxhn` (the
@@ -186,5 +224,5 @@ database files and ours - finish and clean-save unchanged: 600m 65 -> 64 inputs
 (64f -> 63f), 1700m 64 -> 62 (63f -> 61f), 2900m 82 -> 77 (81f -> 76f), the
 same counts as the real PICO-8. Upload files, as UCT's clean save writes them
 (trailing commas; 600m's one balloon seed written as `[0,]`):
-`tas/tasdatabase/nodiag/upload/TAS{6,17,29}.tas` (and, verified the same way, TAS{22,26,28}.tas on 2026-10-06 and TAS20.tas on 2026-10-08). To submit: one Discord
+`tas/tasdatabase/nodiag/upload/TAS{6,17,29}.tas` (and, verified the same way, TAS{22,26,28}.tas on 2026-10-06, TAS20.tas on 2026-10-08, and TAS4.tas, the tie, identical to the database file). To submit: one Discord
 message `!uploadtas classic nodiag` with the three files attached.

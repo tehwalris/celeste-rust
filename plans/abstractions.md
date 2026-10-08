@@ -115,8 +115,28 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   bodies. On the old finer rem rungs it merged nothing (the undecided
   `collide(player)` forks collected / not) and fanned out in room (6,0) (331
   trace states, cap 256). Collected-or-not after it flew away stays two
-  shapes by design (a collect refills the dash). Not yet run through the arc
-  search.
+  shapes by design (a collect refills the dash).
+- **With `n` (`r0sxhfn`, 2026-10-08)**: the fruit's atoms refuse merges, and
+  at `n` the countdowns are the unknown number too, so every floor's
+  `delay <= 0` was a fruit-like atom and kept its two paths apart (room
+  (3,0): 8192 trace states after the spawn frame's `foreach`; the level did
+  not build). A comparison READING a countdown field (`<name>.delay`,
+  `.timer`, `.hide_in`, `.hide_for`: `domain::COUNTDOWN_FIELDS`, the
+  interpreter's hint) mints a COUNTDOWN atom instead, three-valued as at `n`
+  without the fruit: merges select on it, the split pass splits what a row
+  stores, an escape is no fork, and the independent joins refuse it (a hull
+  would lose `state`/`collideable`'s correlation). And `may_answers` reads
+  an equality's ends unless an OPERAND reads an unknown (it used to give up
+  whenever the frame had any): a hidden floor's exact `state == 2` was
+  "both ways", and its solid side owed `collideable` false with the player
+  inside - a coverage gap at f42. Refuted like every flag, by the objects
+  ladder (`r0sxhfn,r0sxhn,r0sxh`) and the concrete search. `rewrite
+  arc-check` cannot run at an `f` level (the reference engine does not step
+  an unknown fruit; it reports the spawn frame's records as bad and runs out
+  of memory); `rewrite follow` with the community route agrees with the
+  `r0sxhfn` tree's keys through the spawn and the fruit taking off (f35)
+  to the end of a tree built to f46. Room (3,0) nodiag: bound 76 against
+  the optimum 93 (plans/nodiag.md).
 
 ## n: everything abstract except where the player overlaps (`FloorsPrecision::Near`) - CURRENT, the object default
 
