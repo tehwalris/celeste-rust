@@ -981,9 +981,17 @@ impl CostToGo {
     /// Is a row provably unable to exit by `horizon`? Only table nodes are
     /// refused; a row outside `WINDOW` breaks `sound_d`'s premise and panics.
     pub fn too_late(&self, shape: u64, cell: u32, frame: u32, horizon: u32) -> bool {
-        let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
+        self.admitted_from(shape, cell, frame) > horizon
+    }
+
+    /// The smallest horizon at which a row at frame `frame` is NOT
+    /// `too_late`: `frame + d`; 0 off the table (never refused), `u32::MAX`
+    /// with no exit. What a level-0 tree notes of a dropped row, so that a
+    /// RAISE knows which rows a larger horizon admits (`frame::ForwardState::raise`).
+    pub fn admitted_from(&self, shape: u64, cell: u32, frame: u32) -> u32 {
+        let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return 0 };
         if x >= 128 {
-            return false;
+            return 0;
         }
         let (x64, y64) = (x as i64, y as i64);
         assert!(
@@ -991,8 +999,8 @@ impl CostToGo {
             "level -1 filter: a row of shape {shape:#x} at ({x}, {y}), frame {frame}, lies outside the window {WINDOW:?} the table assumes a player never leaves"
         );
         match self.d_of(shape, cell) {
-            None => false,
-            Some(d) => d == u32::MAX || frame.saturating_add(d) > horizon,
+            None => 0,
+            Some(d) => frame.saturating_add(d),
         }
     }
 

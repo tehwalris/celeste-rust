@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use crate::search::door::Admit;
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{Col, Rt2, AV};
@@ -325,13 +325,14 @@ pub fn berry_lost(rt2: &Rt2) -> Result<Vec<bool>> {
 /// lost (`berry_lost`), and in the orb room a row whose chest is still closed
 /// too late for the ceiling (`orb_deadline_skip`).
 /// The forward and a resume both take the frontier through this, so a resumed
-/// run expands exactly the rows an uninterrupted one does.
-pub fn not_expanded(b: &Block, frame: u32) -> Result<Vec<bool>> {
+/// run expands exactly the rows an uninterrupted one does. `minus_one`: the
+/// tree's level -1 horizon, the orb deadline's ceiling.
+pub fn not_expanded(b: &Block, frame: u32, ceiling: Option<u32>) -> Result<Vec<bool>> {
     let mut skip = b.exits()?;
     for (w, lost) in skip.iter_mut().zip(berry_lost(b.rt2())?) {
         *w |= lost;
     }
-    if let (true, Some((h, _))) = (orb_required(), level_minus_one()) {
+    if let (true, Some(h)) = (orb_required(), ceiling) {
         for (w, late) in skip.iter_mut().zip(orb_deadline_skip(b.rt2(), frame, h)) {
             *w |= late;
         }
@@ -755,7 +756,21 @@ pub struct ForwardSink<'a> {
     /// The run cache: rows arrive in runs of one (outcome, cell).
     last: ((u64, u32), u32),
     door: Option<&'a crate::search::door::Door>,
-    filter: Option<&'a MarkFilter<'a>>,
+    filters: Filters<'a>,
+    /// Note the sources of the rows level -1 drops (`drops`): a level-0
+    /// tree's, so that a raise can re-expand them.
+    note_drops: bool,
+    /// Per source id, the smallest horizon that admits one of its dropped
+    /// successors (`CostToGo::admitted_from`).
+    pub drops: rustc_hash::FxHashMap<u64, u32>,
+    /// The next piece's seq, shared by the wave's workers.
+    seqs: Option<&'a AtomicU32>,
+    /// A raise's wave (`Layer::Raised`): no state may come from a later
+    /// layer, and the tree's sources' edges it admitted are not recorded again.
+    raised: Option<Raised>,
+    /// Are the lanes of the kernel call being run the tree's (not added by
+    /// the raise)? A call runs one block, so one or the other.
+    pub sources_old: bool,
     /// The ids of the block being run (slice bases for predecessor masks).
     pub ids_in: Option<&'a [u64]>,
     /// Lanes of the block being run that must not be expanded.
@@ -809,7 +824,12 @@ impl<'a> ForwardSink<'a> {
             clock: 0,
             last: NO_QUEUE,
             door: None,
-            filter: None,
+            filters: Filters::default(),
+            note_drops: false,
+            drops: Default::default(),
+            seqs: None,
+            raised: None,
+            sources_old: false,
             ids_in: None,
             skip_in: None,
             edges_dir: None,
@@ -841,22 +861,37 @@ impl<'a> ForwardSink<'a> {
         }
     }
 
-    /// Worker `worker`'s sink for `frame` (new ids in layer `frame`).
+    /// Worker `worker`'s sink for `frame` (new ids in layer `frame`, its
+    /// pieces numbered from `seqs`).
     pub fn forward(
         door: &'a crate::search::door::Door,
-        filter: Option<&'a MarkFilter<'a>>,
+        filters: Filters<'a>,
         edges_on: bool,
         frame: u32,
         worker: u32,
         edges_dir: Option<&std::path::Path>,
+        seqs: &'a AtomicU32,
+        raised: Option<Raised>,
     ) -> Self {
         let mut s = Self::empty(edges_on);
         s.door = Some(door);
-        s.filter = filter;
+        s.filters = filters;
+        s.note_drops = filters.notes_drops() && edges_dir.is_some();
         s.frame = frame;
         s.worker = worker;
         s.edges_dir = edges_dir.map(|p| p.to_path_buf());
+        s.seqs = Some(seqs);
+        s.raised = raised;
         s
+    }
+
+    /// A re-emission of a row a filter dropped (its cache ref `r` carries
+    /// `admitted_from`; 0: a raise's known edge): one more source to note.
+    #[inline]
+    pub fn dropped_again(&mut self, base: u64, lane: usize, r: u64) {
+        if self.note_drops && r != 0 {
+            note_drop(&mut self.drops, base, 1u64 << lane, r as u32);
+        }
     }
 
     /// The transfer pair `t` as this worker's id (interned on first use).
@@ -1014,15 +1049,24 @@ impl<'a> ForwardSink<'a> {
             self.flushes += 1;
             self.flushed_rows += n as u64;
             // The coarser level's filter (`MarkFilter`).
-            let allow = match self.filter {
+            let allow = match self.filters.marks {
                 Some(f) => Some(f.allowed(&slot.to_rt2(), self.frame)?),
                 None => None,
             };
-            // The level -1 filter: the queue's cell provably cannot exit by H.
-            let allow = match level_minus_one() {
-                Some((h, table)) if table.too_late(slot.shape, slot.cell, self.frame, h) => Some(vec![false; n]),
-                _ => allow,
-            };
+            // The level -1 filter: the queue's cell provably cannot exit by
+            // H. `dropped`: the smallest horizon that would admit it.
+            let dropped = self.filters.minus_one.and_then(|m| {
+                let from = m.table().admitted_from(slot.shape, slot.cell, self.frame);
+                (from > m.h).then_some(from)
+            });
+            let allow = if dropped.is_some() { Some(vec![false; n]) } else { allow };
+            // A level-0 tree notes the dropped rows' sources (`raise`).
+            if let (Some(from), true) = (dropped, self.note_drops && slot.pred_base.len() == n) {
+                let rows = slot.pred_base.iter().zip(&slot.pred_mask).map(|(&b, &m)| (b, m));
+                for (b, m) in rows.chain(slot.extra.iter().map(|&(_, b, _, m)| (b, m))) {
+                    note_drop(&mut self.drops, b, m, from);
+                }
+            }
             self.sort_buf.clear();
             self.sort_buf.extend(
                 slot.keys
@@ -1050,14 +1094,30 @@ impl<'a> ForwardSink<'a> {
             self.new_buf.clear();
             self.ids_buf.clear();
             // The k-th new key gets `first_new + k`, appended in that order.
-            let n_pieces = self.pieces.len() as u32;
-            let (frame, worker) = (self.frame, self.worker);
-            let (piece, seq, ids) = self
-                .pieces
-                .entry(slot.shape)
-                .or_insert_with(|| (slot.empty_piece(), worker * 256 + n_pieces, Vec::new()));
+            let frame = self.frame;
+            let seqs = self.seqs.expect("a flush without piece numbers");
+            let (piece, seq, ids) = self.pieces.entry(slot.shape).or_insert_with(|| {
+                let seq = seqs.fetch_add(1, Ordering::Relaxed);
+                assert!(seq <= u16::MAX as u32, "frame {frame}: piece seq {seq} past the 16 bits an id holds");
+                (slot.empty_piece(), seq, Vec::new())
+            });
             let first_new = pack_id(frame, *seq, piece.width as u32);
             door.admit(slot.shape, slot.cell, &self.keys_buf, first_new, &mut self.ids_buf, &mut self.new_buf);
+            // A RAISE runs old frames against the whole tree's door: a state
+            // of a later layer here means the larger horizon reaches it
+            // sooner, which would renumber the tree - refused, never absorbed.
+            if let Some(&id) = self.ids_buf.iter().find(|&&id| self.raised.is_some() && id_layer(id) > frame) {
+                anyhow::bail!(
+                    "frame {frame}: a state the tree first reached at frame {} is reached at frame {frame}: the raised tree would move it to an earlier layer (the level -1 table is not consistent along this edge), so it cannot be extended exactly - delete the tree",
+                    id_layer(id)
+                );
+            }
+            // A raise re-expands sources of the tree: where the tree's own
+            // filter admitted this queue, their edges into it are recorded.
+            let known: Option<u32> = self
+                .raised
+                .filter(|r| dropped.is_none() && r.old.table().admitted_from(slot.shape, slot.cell, frame) <= r.old.h)
+                .map(|r| r.old_seqs);
             // Each row's predecessors and extras (none from id-less blocks).
             if let Some(edges_dir) = self.edges_dir.as_deref().filter(|_| slot.pred_base.len() == n) {
                 let t_e = std::time::Instant::now();
@@ -1066,7 +1126,7 @@ impl<'a> ForwardSink<'a> {
                 let rows = slot.pred_base.iter().zip(&slot.pred_xfer).zip(&slot.pred_mask).enumerate().map(|(r, ((&b, &x), &m))| (r as u32, b, x, m));
                 for (r, b, x, m) in rows.chain(slot.extra.iter().copied()) {
                     let u = row_uniq[r as usize];
-                    if u != u32::MAX {
+                    if u != u32::MAX && known.is_none_or(|old_seqs| id_seq(b) >= old_seqs) {
                         append_record(edge_bufs, edge_records, edges_dir, frame, worker, ids_buf[u as usize], b, x, m)?;
                     }
                 }
@@ -1074,6 +1134,9 @@ impl<'a> ForwardSink<'a> {
                 for (r, key) in slot.keys.iter().enumerate() {
                     let u = row_uniq[r];
                     let v = if u == u32::MAX {
+                        celeste_engine::kernel::RowCache::DROP_FLAG | dropped.unwrap_or(u32::MAX) as u64
+                    } else if known.is_some() && self.sources_old {
+                        // Recorded already, nothing to note.
                         celeste_engine::kernel::RowCache::DROP_FLAG
                     } else {
                         celeste_engine::kernel::RowCache::ID_FLAG | ids_buf[u as usize]
@@ -1181,39 +1244,85 @@ impl<'a> ForwardSink<'a> {
 }
 
 
-/// THE LEVEL -1 FILTER (`CELESTE_LEVEL_MINUS_ONE="H,S"`): drop a queue when
-/// the table proves its cell cannot exit by H (sound: inductive ranges,
-/// clipped successors and deaths accounted). H must be the ceiling. Built
-/// once, at the first flush, on a thread with the tracer's stack.
-pub(crate) fn level_minus_one() -> Option<(u32, &'static crate::trace::level_minus_one::CostToGo)> {
-    static TABLE: std::sync::OnceLock<Option<(u32, crate::trace::level_minus_one::CostToGo)>> = std::sync::OnceLock::new();
-    TABLE
-        .get_or_init(|| {
-            let s = std::env::var("CELESTE_LEVEL_MINUS_ONE").ok()?;
-            // The table measures the EXIT: unsound for a position win.
-            assert!(win_rect().is_none(), "CELESTE_LEVEL_MINUS_ONE: the table measures the room exit; this room's win is a position");
-            let (h, sp) = s.split_once(',').expect("CELESTE_LEVEL_MINUS_ONE=\"H,S\"");
-            let h: u32 = h.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE horizon");
-            let sp: i32 = sp.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE speed bound (px per frame)");
-            let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
-            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-            let t = std::time::Instant::now();
-            let table = std::thread::Builder::new()
-                .stack_size(256 * 1024 * 1024)
-                .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new(&root), sp, threads))
-                .expect("spawn the level -1 builder")
-                .join()
-                .expect("the level -1 builder panicked")
-                .unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"));
-            eprintln!(
-                "[level -1] table built in {:.1} s (S = {sp}): the start state's d = {}; dropping cells that cannot exit by f{h}",
-                t.elapsed().as_secs_f64(),
-                table.start_d
-            );
-            Some((h, table))
-        })
-        .as_ref()
-        .map(|(h, t)| (*h, t))
+/// THE LEVEL -1 FILTER at a horizon (`CELESTE_LEVEL_MINUS_ONE="H,S"`, H in
+/// search steps): drop a queue when the table proves its cell cannot exit
+/// by `h` (sound: inductive ranges, clipped successors and deaths
+/// accounted). A tree records the filter its frames were built under
+/// (`TreeFilter`); a forward runs under its tree's, not the environment's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MinusOne {
+    pub h: u32,
+    /// The table's speed bound S, px per frame.
+    pub speed: i32,
+}
+
+impl MinusOne {
+    /// `CELESTE_LEVEL_MINUS_ONE="H,S"`, if set.
+    pub fn from_env() -> Option<MinusOne> {
+        let s = std::env::var("CELESTE_LEVEL_MINUS_ONE").ok()?;
+        let (h, sp) = s.split_once(',').expect("CELESTE_LEVEL_MINUS_ONE=\"H,S\"");
+        let h: u32 = h.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE horizon");
+        let speed: i32 = sp.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE speed bound (px per frame)");
+        assert!(h < u32::MAX, "CELESTE_LEVEL_MINUS_ONE horizon {h}");
+        Some(MinusOne { h, speed })
+    }
+
+    /// The start room's table at this speed bound (one per process).
+    pub fn table(&self) -> &'static crate::trace::level_minus_one::CostToGo {
+        minus_one_table(self.speed)
+    }
+}
+
+/// The level -1 table at speed bound `speed`, built (or read from its cache)
+/// once, on a thread with the tracer's stack.
+fn minus_one_table(speed: i32) -> &'static crate::trace::level_minus_one::CostToGo {
+    static TABLE: std::sync::OnceLock<(i32, crate::trace::level_minus_one::CostToGo)> = std::sync::OnceLock::new();
+    let (sp, table) = TABLE.get_or_init(|| {
+        // The table measures the EXIT: unsound for a position win.
+        assert!(win_rect().is_none(), "CELESTE_LEVEL_MINUS_ONE: the table measures the room exit; this room's win is a position");
+        let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let t = std::time::Instant::now();
+        let table = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new(&root), speed, threads))
+            .expect("spawn the level -1 builder")
+            .join()
+            .expect("the level -1 builder panicked")
+            .unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"));
+        eprintln!("[level -1] table ready in {:.1} s (S = {speed}): the start state's d = {}", t.elapsed().as_secs_f64(), table.start_d);
+        (speed, table)
+    });
+    assert_eq!(*sp, speed, "one level -1 table per process: S = {sp}, then S = {speed}");
+    table
+}
+
+/// What a forward's flush filters by.
+#[derive(Clone, Copy, Default)]
+pub struct Filters<'a> {
+    /// The coarser level's arc marks (the objects ladder).
+    pub marks: Option<&'a MarkFilter<'a>>,
+    /// Level -1.
+    pub minus_one: Option<MinusOne>,
+}
+
+impl Filters<'_> {
+    /// Are level -1's drops noted? In a tree filtered by nothing else - one a
+    /// raise extends (a marks-filtered tree is rebuilt for another horizon).
+    pub fn notes_drops(&self) -> bool {
+        self.marks.is_none() && self.minus_one.is_some()
+    }
+}
+
+/// Note `mask`'s lanes from `base` as sources of a row dropped until horizon
+/// `from`, keeping each source's smallest.
+fn note_drop(drops: &mut rustc_hash::FxHashMap<u64, u32>, base: u64, mut mask: u64, from: u32) {
+    while mask != 0 {
+        let id = base + mask.trailing_zeros() as u64;
+        mask &= mask - 1;
+        let e = drops.entry(id).or_insert(from);
+        *e = (*e).min(from);
+    }
 }
 
 /// THE TIME BAND (an estimate, not a bound; for the level -1 probe): can a
@@ -1339,17 +1448,52 @@ fn units_of(lanes: impl Iterator<Item = usize>, unit: usize) -> Vec<(usize, usiz
     units
 }
 
+/// Where a wave's new states go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// A new frame: pieces numbered from 0.
+    New,
+    /// A frame the tree already has (a RAISE).
+    Raised(Raised),
+}
+
+/// What a raise's wave knows of the tree it adds to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Raised {
+    /// The new pieces' first seq (after the frame's own).
+    pub first_seq: u32,
+    /// The filter the tree was built under: where it admitted a queue, the
+    /// tree's sources' edges into it are recorded already.
+    pub old: MinusOne,
+    /// The sources (layer `frame - 1`) below this seq are the tree's; from
+    /// it on, the raise added them.
+    pub old_seqs: u32,
+}
+
+/// One wave's output.
+pub struct Wave {
+    /// The new states, as pieces with their ids.
+    pub next: Vec<Block>,
+    pub won: bool,
+    pub stats: FrameStats,
+    /// The level -1 drops' sources (`Filters::notes_drops`): `(id, the
+    /// smallest horizon admitting one of its dropped successors)`, by id.
+    pub dropped: Vec<(u64, u32)>,
+}
+
 /// One forward frame (the wave): units in CELL order pulled by workers into
 /// their own sinks; one barrier. The kept set does not depend on scheduling.
+#[allow(clippy::too_many_arguments)]
 pub fn forward_frame(
     engine: &dyn FrameStep,
     frontier: Vec<Block>,
     door: &crate::search::door::Door,
     pos: Option<&crate::search::pos_graph::PosObserver>,
-    filter: Option<&MarkFilter>,
+    filters: Filters,
     frame: u32,
     edges_dir: Option<&std::path::Path>,
-) -> Result<(Vec<Block>, bool, FrameStats)> {
+    layer: Layer,
+) -> Result<Wave> {
     use std::time::Instant;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
     let level = crate::abstraction::current_level();
@@ -1377,10 +1521,15 @@ pub fn forward_frame(
     });
     units.sort_by_key(|&(bi, lo, _)| (cells[bi][lo], bi, lo));
     let next_unit = AtomicUsize::new(0);
+    let (seqs, raised) = match layer {
+        Layer::New => (AtomicU32::new(0), None),
+        Layer::Raised(r) => (AtomicU32::new(r.first_seq), Some(r)),
+    };
 
     let t = Instant::now();
     struct Done {
         pieces: Vec<Block>,
+        drops: rustc_hash::FxHashMap<u64, u32>,
         won: bool,
         kept: usize,
         flushes: u64,
@@ -1395,22 +1544,24 @@ pub fn forward_frame(
     let done: Vec<Done> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
-                let (frontier, cells, units, next_unit) = (&frontier, &cells, &units, &next_unit);
+                let (frontier, cells, units, next_unit, seqs) = (&frontier, &cells, &units, &next_unit, &seqs);
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     let t = Instant::now();
-                    let mut sink = ForwardSink::forward(door, filter, pos.is_some(), frame, w as u32, edges_dir);
+                    let mut sink = ForwardSink::forward(door, filters, pos.is_some(), frame, w as u32, edges_dir, seqs, raised);
                     loop {
                         let u = next_unit.fetch_add(1, Ordering::Relaxed);
                         let Some(&(bi, lo, hi)) = units.get(u) else { break };
                         let b = &frontier[bi];
                         sink.ids_in = (!b.ids.is_empty()).then_some(b.ids.as_slice());
                         sink.skip_in = (!b.skip.is_empty()).then_some(b.skip.as_slice());
+                        sink.sources_old = raised.is_some_and(|r| b.seq < r.old_seqs);
                         engine.run(b, &cells[bi], lo..hi, &mut sink)?;
                     }
                     let pieces = sink.finish()?;
                     Ok(Done {
                         pieces,
+                        drops: std::mem::take(&mut sink.drops),
                         won: sink.won,
                         kept: sink.kept,
                         flushes: sink.flushes,
@@ -1442,7 +1593,9 @@ pub fn forward_frame(
 
     let mut won = false;
     let mut pieces: Vec<Block> = Vec::new();
+    let mut dropped: Vec<(u64, u32)> = Vec::new();
     for d in done {
+        dropped.extend(d.drops);
         st.lanes_raw += d.emitted as usize;
         st.lanes_kept += d.kept;
         st.flushes += d.flushes;
@@ -1462,7 +1615,10 @@ pub fn forward_frame(
     st.rss_file = crate::metrics::current_file_rss_gb();
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
-    Ok((next, won, st))
+    // Per source its smallest horizon (sorted, so the first of an id's).
+    dropped.sort_unstable();
+    dropped.dedup_by_key(|e| e.0);
+    Ok(Wave { next, won, stats: st, dropped })
 }
 
 
@@ -1508,6 +1664,146 @@ pub struct FrameStats {
     pub rss_file: f64,
 }
 
+/// The level -1 filter a tree's frames were built under
+/// (`<dir>/level_minus_one.txt`). A forward extends a tree under ITS
+/// filter, never the environment's, so every frame of a tree is filtered
+/// alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeFilter {
+    /// None (`off`): the frames do not depend on the horizon.
+    Off,
+    /// Level -1 at `m`, with its table's fingerprint: the tree serves
+    /// horizons up to `m.h`. A level-0 tree notes every frame's drops
+    /// (`dropped/`), so a RAISE extends it exactly to a larger one.
+    MinusOne { m: MinusOne, table: u64 },
+    /// Filtered at this horizon by a binary that noted no drops (a bare
+    /// number, the `gemskip-campaign` record): serves complete horizons up
+    /// to it, cannot be extended.
+    Legacy(u32),
+}
+
+impl TreeFilter {
+    fn of(m: Option<MinusOne>) -> TreeFilter {
+        match m {
+            None => TreeFilter::Off,
+            Some(m) => TreeFilter::MinusOne { m, table: m.table().fingerprint() },
+        }
+    }
+
+    fn path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("level_minus_one.txt")
+    }
+
+    /// The tree's record; `None` without one (a tree from before records,
+    /// filtered or not: unknown).
+    pub fn read(dir: &std::path::Path) -> Result<Option<TreeFilter>> {
+        let path = Self::path(dir);
+        let s = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| path.display().to_string()),
+        };
+        let s = s.trim();
+        if s == "off" {
+            return Ok(Some(TreeFilter::Off));
+        }
+        if let Ok(h) = s.parse::<u32>() {
+            return Ok(Some(TreeFilter::Legacy(h)));
+        }
+        let w: Vec<&str> = s.split_whitespace().collect();
+        let parsed = match w[..] {
+            ["h", h, "speed", sp, "table", fp] => (|| Some((h.parse().ok()?, sp.parse().ok()?, u64::from_str_radix(fp, 16).ok()?)))(),
+            _ => None,
+        };
+        let (h, speed, table) = parsed.ok_or_else(|| anyhow::anyhow!("{}: not a level -1 record: {s:?}", path.display()))?;
+        Ok(Some(TreeFilter::MinusOne { m: MinusOne { h, speed }, table }))
+    }
+
+    fn write(&self, dir: &std::path::Path) -> Result<()> {
+        let s = match self {
+            TreeFilter::Off => "off".to_string(),
+            TreeFilter::MinusOne { m, table } => format!("h {} speed {} table {table:016x}", m.h, m.speed),
+            TreeFilter::Legacy(h) => h.to_string(),
+        };
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join("level_minus_one.tmp");
+        std::fs::write(&tmp, format!("{s}\n"))?;
+        std::fs::rename(&tmp, Self::path(dir))?;
+        Ok(())
+    }
+
+    /// The filter a forward extending the tree runs under.
+    fn minus_one(&self, dir: &std::path::Path) -> Result<Option<MinusOne>> {
+        match *self {
+            TreeFilter::Off => Ok(None),
+            TreeFilter::MinusOne { m, .. } => Ok(Some(m)),
+            TreeFilter::Legacy(h) => {
+                anyhow::bail!("{}: filtered by level -1 at step {h} before drops were noted: it cannot be extended (delete it)", dir.display())
+            }
+        }
+    }
+
+    /// The horizon the tree's frames were filtered for (`None`: none).
+    fn ceiling(&self) -> Option<u32> {
+        match *self {
+            TreeFilter::Off => None,
+            TreeFilter::MinusOne { m, .. } => Some(m.h),
+            TreeFilter::Legacy(h) => Some(h),
+        }
+    }
+}
+
+/// Frame `frame`'s level -1 drops, as their SOURCES (rows of layer `frame -
+/// 1`): `(id, the smallest horizon that admits one of its dropped
+/// successors)`, sorted by id.
+fn dropped_path(dir: &std::path::Path, frame: u32) -> std::path::PathBuf {
+    dir.join("dropped").join(format!("f{frame:03}.bin"))
+}
+
+/// Present while a raise rewrites the tree's frames: a tree with it is
+/// refused (half raised, it is neither the old tree nor the new one).
+fn raise_marker(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("raising.txt")
+}
+
+/// The rows `ids` (sorted) of layer `layer`, as one block per file of the
+/// whole 64-row id groups holding them (a kernel slice reads its lanes' ids
+/// as the group's first plus the lane), every other row skipped.
+fn load_sources(dir: &std::path::Path, layer: u32, ids: &[u64]) -> Result<Vec<Block>> {
+    let files = frame_files(dir, layer)?;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < ids.len() {
+        let seq = id_seq(ids[i]);
+        let j = i + ids[i..].partition_point(|&id| id_seq(id) == seq);
+        let (_, file) = files
+            .iter()
+            .find(|(s, _)| *s == seq)
+            .ok_or_else(|| anyhow::anyhow!("{}: no file of layer {layer} with seq {seq}", dir.display()))?;
+        let width = file.width();
+        let mut ranges: Vec<Range<u32>> = Vec::new();
+        for &id in &ids[i..j] {
+            let row = id_row(id);
+            anyhow::ensure!(id_layer(id) == layer && row < width, "{}: id {id:#x} is not a row of layer {layer}", dir.display());
+            let g = row / 64 * 64;
+            let group = g..(g + 64).min(width);
+            match ranges.last_mut() {
+                Some(r) if r.end >= group.start => r.end = r.end.max(group.end),
+                _ => ranges.push(group),
+            }
+        }
+        let rt2 = file.load_rows(&ranges)?.expect("rows of a non-empty range");
+        let row_ids: Vec<u64> = ranges.iter().flat_map(|r| r.clone()).map(|r| pack_id(layer, seq, r)).collect();
+        let wanted: rustc_hash::FxHashSet<u64> = ids[i..j].iter().copied().collect();
+        let skip = row_ids.iter().map(|id| !wanted.contains(id)).collect();
+        let mut b = Block::with_ids(rt2, row_ids, seq);
+        b.set_skip(skip);
+        out.push(b);
+        i = j;
+    }
+    Ok(out)
+}
+
 /// The forward's in-memory state, EXTENDED frame by frame (each checkpointed).
 pub struct ForwardState {
     frontier: Vec<Block>,
@@ -1518,6 +1814,9 @@ pub struct ForwardState {
     pub frames: u32,
     /// The first frame a lane won, if any so far.
     pub win_frame: Option<u32>,
+    /// The filter the tree's frames were built under (`None`: a tree from
+    /// before records, which is not extended).
+    pub filter: Option<TreeFilter>,
     /// The last frame's edge compaction, running behind the next wave.
     compaction: Option<(u32, std::thread::JoinHandle<Result<crate::search::edges::CompactStats>>)>,
 }
@@ -1533,17 +1832,20 @@ pub struct ForwardResult {
 }
 
 impl ForwardState {
-    /// Frame 0: seed the door from `initial` and checkpoint it.
-    pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool) -> Result<Self> {
+    /// Frame 0: seed the door from `initial` and checkpoint it; the tree is
+    /// filtered by `minus_one` (recorded).
+    pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool, minus_one: Option<MinusOne>) -> Result<Self> {
         // A fresh tree keeps nothing a killed run left (stale edge runs).
-        for sub in ["frames", "edges"] {
+        for sub in ["frames", "edges", "dropped"] {
             let p = dir.join(sub);
             if p.exists() {
                 std::fs::remove_dir_all(&p).with_context(|| p.display().to_string())?;
             }
         }
+        let filter = TreeFilter::of(minus_one);
+        filter.write(dir)?;
         // The checkpoint assigns the ids (layer 0) the door takes.
-        checkpoint_frontier(dir, 0, &mut initial)?;
+        checkpoint_frontier(dir, 0, &mut initial, true)?;
         crate::search::edges::set_done_frame(&dir.join("edges"), 0)?;
         let door = crate::search::door::Door::new();
         for b in &initial {
@@ -1566,6 +1868,7 @@ impl ForwardState {
             observer,
             frames: 0,
             win_frame: None,
+            filter: Some(filter),
             compaction: None,
         })
     }
@@ -1574,6 +1877,12 @@ impl ForwardState {
     /// it matches extending the original.
     pub fn resume(dir: &std::path::Path, record: bool) -> Result<Option<Self>> {
         use crate::search::door::Admit;
+        anyhow::ensure!(
+            !raise_marker(dir).exists(),
+            "{}: a raise was interrupted ({}); its frames are half raised - delete the tree",
+            dir.display(),
+            raise_marker(dir).display()
+        );
         let mut last: Option<u32> = None;
         while dir.join("frames").join(format!("f{:03}", last.map_or(0, |f| f + 1))).is_dir() {
             last = Some(last.map_or(0, |f| f + 1));
@@ -1586,11 +1895,13 @@ impl ForwardState {
         if done < last {
             for f in done + 1..=last {
                 std::fs::remove_dir_all(dir.join("frames").join(format!("f{:03}", f)))?;
+                let _ = std::fs::remove_file(dropped_path(dir, f));
             }
             eprintln!("[resume] frames f{} to f{last} discarded: their edge runs were not complete", done + 1);
             last = done;
         }
         crate::search::edges::discard_after(&edges_dir, last)?;
+        let filter = TreeFilter::read(dir)?;
         // Every layer's keys into the door, one file per unit of work.
         let mut files: Vec<(u32, u32, std::path::PathBuf)> = Vec::new();
         for f in 0..=last {
@@ -1636,10 +1947,15 @@ impl ForwardState {
         }
         let door = crate::search::door::Door::from_shards(shards);
         // The frontier: the last layer minus the rows the forward does not
-        // expand (`not_expanded`, as `extend` decides it).
+        // expand (`not_expanded`, as `extend` decides it; a tree without a
+        // record by the environment's ceiling, as it was built).
+        let ceiling = match filter {
+            Some(f) => f.ceiling(),
+            None => MinusOne::from_env().map(|m| m.h),
+        };
         let mut frontier: Vec<Block> = load_frame(dir, last)?;
         for b in &mut frontier {
-            let skip = not_expanded(b, last)?;
+            let skip = not_expanded(b, last, ceiling)?;
             b.set_skip(skip);
         }
         let observer = if record {
@@ -1659,15 +1975,16 @@ impl ForwardState {
             None
         };
         eprintln!(
-            "[resume] {}: f{last} ({} lanes), door {} entries from {} files, first win {:?}, {:.1} s",
+            "[resume] {}: f{last} ({} lanes), door {} entries from {} files, first win {:?}, level -1 {:?}, {:.1} s",
             dir.display(),
             frontier.iter().map(Block::lanes).sum::<usize>(),
             door.len(),
             files.len(),
             win_frame,
+            filter,
             t.elapsed().as_secs_f64()
         );
-        Ok(Some(ForwardState { frontier, door, observer, frames: last, win_frame, compaction: None }))
+        Ok(Some(ForwardState { frontier, door, observer, frames: last, win_frame, filter, compaction: None }))
     }
 
     /// The door's size: every distinct state reached so far.
@@ -1699,28 +2016,38 @@ impl ForwardState {
         Ok(Some((st, t.elapsed())))
     }
 
-    /// Compute and checkpoint frames `frames+1 ..= to`; only an empty
+    /// Compute and checkpoint frames `frames+1 ..= to` under the tree's
+    /// level -1 filter and the coarser level's `marks`; only an empty
     /// frontier stops it (the backward seeds from wins at every frame).
     pub fn extend(
         &mut self,
         engine: &dyn FrameStep,
         dir: &std::path::Path,
         to: u32,
-        filter: Option<&MarkFilter>,
+        marks: Option<&MarkFilter>,
     ) -> Result<()> {
+        let minus_one = match self.filter {
+            Some(f) => f.minus_one(dir)?,
+            None => anyhow::bail!("{}: no level -1 record (a tree from before records): it cannot be extended (delete it)", dir.display()),
+        };
+        let filters = Filters { marks, minus_one };
         let mut last_free = None;
         while self.frames < to && !self.frontier.is_empty() {
             let frame = self.frames + 1;
             let t_frame = std::time::Instant::now();
             let frontier = std::mem::take(&mut self.frontier);
             let edges_dir = dir.join("edges");
-            let (mut next, won, st) =
-                forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filter, frame, Some(&edges_dir))?;
+            let wave = forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filters, frame, Some(&edges_dir), Layer::New)?;
+            let (mut next, won, st) = (wave.next, wave.won, wave.stats);
+            // Before the frame is trusted (its checkpoint, then its runs).
+            if filters.notes_drops() {
+                crate::search::checkpoint::save_value_to(&dropped_path(dir, frame), &wave.dropped)?;
+            }
             // Joined BEFORE this checkpoint: a resume never trusts incomplete runs.
             let joined = self.join_compaction(&edges_dir)?;
             let (t_edges, compact_records) = joined.as_ref().map_or((std::time::Duration::ZERO, 0), |(c, w)| (*w, c.records));
             let t = std::time::Instant::now();
-            checkpoint_frontier(dir, frame, &mut next)?;
+            checkpoint_frontier(dir, frame, &mut next, true)?;
             let t_ckpt = t.elapsed();
             // This frame's raw records into runs, in the background.
             {
@@ -1746,13 +2073,14 @@ impl ForwardState {
             // Exited rows are checkpointed but never expanded; nor are orb
             // rows past their deadline (`not_expanded`).
             let orb = orb_required();
+            let ceiling = minus_one.map(|m| m.h);
             self.frontier = if won || orb {
                 std::thread::scope(|scope| {
                     let handles: Vec<_> = next
                         .into_iter()
                         .map(|mut b| {
                             scope.spawn(move || -> Result<Block> {
-                                let skip = not_expanded(&b, frame)?;
+                                let skip = not_expanded(&b, frame, ceiling)?;
                                 b.set_skip(skip);
                                 Ok(b)
                             })
@@ -1775,10 +2103,234 @@ impl ForwardState {
         Ok(())
     }
 
+    /// RAISE the tree's level -1 filter to `to` (`None`: off) over the frames
+    /// it has. A larger horizon keeps a superset at every frame: the rows
+    /// the old filter dropped that `to` admits, and everything they reach.
+    /// Each frame noted the SOURCES of its drops with the smallest horizon
+    /// admitting one (`dropped/`), so frame by frame this re-expands those
+    /// sources and the states the raise added one frame earlier, under `to`,
+    /// against the whole tree's door: a new state joins the frame's layer
+    /// (new pieces, numbered after its own), an old one gets its edge; a
+    /// re-expanded source's edges into queues the old filter admitted are
+    /// recorded already and skipped (`Raised`). The new edges go to the
+    /// frame's RAISED runs (`edges::compact_raised`), so the frame's runs are
+    /// not rewritten. The result is the tree a fresh
+    /// forward under `to` makes - the same states per frame, the same edges,
+    /// the same notes - unless the larger horizon reaches a state SOONER
+    /// than the tree does (the table inconsistent along an edge), which would
+    /// renumber the tree: refused (`ForwardSink::flush`). Then `extend`
+    /// continues under `to`.
+    pub fn raise(&mut self, engine: &dyn FrameStep, dir: &std::path::Path, to: Option<MinusOne>) -> Result<()> {
+        let Some(TreeFilter::MinusOne { m: from, .. }) = self.filter else {
+            anyhow::bail!("{}: only a tree built under level -1 can be raised (its record: {:?})", dir.display(), self.filter);
+        };
+        let h_new = to.map_or(u32::MAX, |m| m.h);
+        anyhow::ensure!(h_new > from.h, "{}: a raise from step {} to {to:?} is not a raise", dir.display(), from.h);
+        anyhow::ensure!(to.is_none_or(|m| m.speed == from.speed), "{}: the tree's level -1 table has S = {}, the raise asks for {to:?}", dir.display(), from.speed);
+        anyhow::ensure!(
+            !orb_required(),
+            "{}: in the orb room the rows not expanded past the chest's deadline depend on the horizon: a raise is not supported (delete the tree)",
+            dir.display()
+        );
+        let t0 = std::time::Instant::now();
+        let last = self.frames;
+        let edges_dir = dir.join("edges");
+        let notes: Vec<Vec<(u64, u32)>> = (1..=last)
+            .map(|t| {
+                let p = dropped_path(dir, t);
+                crate::search::checkpoint::load_value_from(&p).with_context(|| format!("{}: frame {t}'s level -1 drops were not noted: the tree cannot be raised (delete it)", p.display()))
+            })
+            .collect::<Result<_>>()?;
+        // Before touching the tree: the rows to re-expand hold their values.
+        for t in 1..=last {
+            let seqs: rustc_hash::FxHashSet<u32> = notes[t as usize - 1].iter().filter(|e| e.1 <= h_new).map(|e| id_seq(e.0)).collect();
+            for (seq, file) in frame_files(dir, t - 1)? {
+                anyhow::ensure!(
+                    !seqs.contains(&seq) || !file.trimmed(),
+                    "{}: frame {}'s rows were trimmed (CELESTE_TRIM_ROWS) and the raise must re-expand some: delete the tree",
+                    dir.display(),
+                    t - 1
+                );
+            }
+        }
+        std::fs::write(raise_marker(dir), format!("raising level -1 from step {} to {to:?}\n", from.h))?;
+        eprintln!("[raise] {}: level -1 from step {} to {}, frames 1-{last}", dir.display(), from.h, to.map_or("off".to_string(), |m| format!("step {}", m.h)));
+        let filters = Filters { marks: None, minus_one: to };
+        let mut compaction: Option<std::thread::JoinHandle<Result<crate::search::edges::CompactStats>>> = None;
+        let mut new_prev: Vec<Block> = Vec::new();
+        let (mut redone, mut added) = (0usize, 0usize);
+        // The first seq the raise gave the previous layer (`u32::MAX`: none).
+        let mut old_seqs = u32::MAX;
+        for t in 1..=last {
+            let notes_t = &notes[t as usize - 1];
+            let redo: Vec<u64> = notes_t.iter().filter(|e| e.1 <= h_new).map(|e| e.0).collect();
+            if redo.is_empty() && new_prev.is_empty() {
+                old_seqs = u32::MAX;
+                continue;
+            }
+            let t_frame = std::time::Instant::now();
+            let mut frontier = load_sources(dir, t - 1, &redo)?;
+            let n_new = new_prev.iter().map(Block::lanes).sum::<usize>();
+            frontier.append(&mut new_prev);
+            let first_seq = frame_paths(dir, t)?.iter().map(|(s, _)| s + 1).max().unwrap_or(0);
+            let layer = Layer::Raised(Raised { first_seq, old: from, old_seqs });
+            let wave = forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filters, t, Some(&edges_dir), layer)?;
+            old_seqs = first_seq;
+            let mut next = wave.next;
+            checkpoint_frontier(dir, t, &mut next, false)?;
+            // The frame's notes: the sources not re-expanded keep theirs.
+            if to.is_some() {
+                let mut kept: Vec<(u64, u32)> = notes_t.iter().copied().filter(|e| e.1 > h_new).collect();
+                kept.extend(wave.dropped);
+                kept.sort_unstable();
+                kept.dedup_by_key(|e| e.0);
+                crate::search::checkpoint::save_value_to(&dropped_path(dir, t), &kept)?;
+            }
+            // The frame's new edges into its raised runs (an earlier raise's
+            // reopened and merged), behind the next frame's wave.
+            if let Some(h) = compaction.take() {
+                h.join().expect("compaction thread panicked")?;
+            }
+            if wave.stats.edge_records > 0 {
+                let edges_dir = edges_dir.clone();
+                compaction = Some(std::thread::Builder::new().name(format!("raised-f{t}")).spawn(move || {
+                    crate::search::edges::reopen_raised(&edges_dir, t)?;
+                    crate::search::edges::compact_raised(&edges_dir, t)
+                })?);
+            } else {
+                let raw = crate::search::edges::raw_dir(&edges_dir, t);
+                if raw.exists() {
+                    std::fs::remove_dir_all(&raw)?;
+                }
+            }
+            if wave.won {
+                self.win_frame = Some(self.win_frame.map_or(t, |w| w.min(t)));
+            }
+            let kept = next.iter().map(Block::lanes).sum::<usize>();
+            eprintln!(
+                "[raise] f{t:03} re-expanded {} sources + {n_new} new, raw {} kept {kept} new, {} edge records, {:.0} ms",
+                redo.len(),
+                wave.stats.lanes_raw,
+                wave.stats.edge_records,
+                t_frame.elapsed().as_secs_f64() * 1e3
+            );
+            redone += redo.len();
+            added += kept;
+            for b in &mut next {
+                let skip = not_expanded(b, t, to.map(|m| m.h))?;
+                b.set_skip(skip);
+            }
+            new_prev = next;
+        }
+        if let Some(h) = compaction.take() {
+            h.join().expect("compaction thread panicked")?;
+        }
+        // The last layer's new states join the frontier `extend` expands.
+        self.frontier.append(&mut new_prev);
+        let filter = TreeFilter::of(to);
+        filter.write(dir)?;
+        self.filter = Some(filter);
+        if to.is_none() && dir.join("dropped").exists() {
+            std::fs::remove_dir_all(dir.join("dropped"))?;
+        }
+        if let Some(o) = self.observer.as_ref() {
+            save_pos_graph(dir, &o.snapshot(), self.frames)?;
+        }
+        std::fs::remove_file(raise_marker(dir))?;
+        eprintln!(
+            "[raise] {}: {redone} sources re-expanded, {added} states added over f1-f{last} in {:.1} s",
+            dir.display(),
+            t0.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+
     /// The position graph recorded so far (None when not recording).
     pub fn pos_graph(&self) -> Option<crate::search::pos_graph::PosGraph> {
         self.observer.as_ref().map(|o| o.snapshot())
     }
+}
+
+/// A level's tree through step `to` under the run's level -1 filter `want`
+/// (`CELESTE_LEVEL_MINUS_ONE`): used as it is when it reaches `to` under a
+/// filter that serves it (none, or one at a horizon >= `to`); else resumed -
+/// RAISED to `want` first when its filter is below `to` - and extended under
+/// its filter, or started under `want`. A tree is never filtered lower than
+/// it was built: frames of one tree are filtered alike. `marks`: the coarser
+/// level's filter (the caller rebuilds such a tree for another horizon).
+/// `engine` is built only when frames are computed.
+pub fn grow_tree(
+    dir: &std::path::Path,
+    to: u32,
+    want: Option<MinusOne>,
+    marks: Option<&MarkFilter>,
+    engine: impl FnOnce() -> Result<Box<dyn FrameStep>>,
+    initial: impl FnOnce() -> Result<Vec<Block>>,
+) -> Result<ForwardResult> {
+    if let Some(w) = want {
+        anyhow::ensure!(to <= w.h, "CELESTE_LEVEL_MINUS_ONE at step {} is below the horizon, step {to}", w.h);
+    }
+    let complete = tree_first_win_through(dir, to)?;
+    let raise_to: Option<Option<MinusOne>> = if !dir.join("frames").join("f000").is_dir() {
+        None
+    } else {
+        match TreeFilter::read(dir)? {
+            None => {
+                anyhow::ensure!(
+                    complete.is_some(),
+                    "{}: the tree has no level -1 record (built before records), so it is used only where it is complete: delete it to extend it",
+                    dir.display()
+                );
+                None
+            }
+            Some(TreeFilter::Legacy(h)) => {
+                anyhow::ensure!(
+                    complete.is_some() && to <= h,
+                    "{}: filtered by level -1 at step {h} before drops were noted: it serves complete horizons up to step {h} only (delete it)",
+                    dir.display()
+                );
+                None
+            }
+            Some(TreeFilter::Off) => {
+                if want.is_some() {
+                    eprintln!("[forward] {}: the tree is not filtered by level -1; it stays unfiltered", dir.display());
+                }
+                None
+            }
+            Some(TreeFilter::MinusOne { m, table }) => {
+                if let Some(w) = want {
+                    anyhow::ensure!(w.speed == m.speed, "{}: the tree's level -1 table has S = {}, the run asks for S = {}", dir.display(), m.speed, w.speed);
+                }
+                if to <= m.h {
+                    None
+                } else {
+                    if let Some(w) = want {
+                        anyhow::ensure!(
+                            w.table().fingerprint() == table,
+                            "{}: the level -1 table changed since the tree was built, so its notes do not raise it exactly (delete it)",
+                            dir.display()
+                        );
+                    }
+                    Some(want)
+                }
+            }
+        }
+    };
+    if let (None, Some(first_win)) = (raise_to, complete) {
+        eprintln!("[forward] {}: the tree reaches step {to}", dir.display());
+        let pos_graph = crate::search::pos_graph::PosGraph::load(&pos_graph_path(dir)).ok();
+        return Ok(ForwardResult { win_frame: first_win, frames: to, pos_graph });
+    }
+    let engine = engine()?;
+    let mut st = match ForwardState::resume(dir, true)? {
+        Some(s) => s,
+        None => ForwardState::start(initial()?, dir, true, want)?,
+    };
+    if let Some(target) = raise_to {
+        st.raise(engine.as_ref(), dir, target)?;
+    }
+    st.extend(engine.as_ref(), dir, to, marks)?;
+    Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
 /// Persist the position graph after `frame` (atomic renames), every frame so
@@ -1802,21 +2354,6 @@ pub fn pos_graph_path(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("posgraph.bin")
 }
 
-/// A whole forward to `max_frames`, resuming `dir` or from `initial`.
-pub fn forward_resume_or_run(
-    engine: &dyn FrameStep,
-    initial: Vec<Block>,
-    dir: &std::path::Path,
-    max_frames: u32,
-) -> Result<ForwardResult> {
-    let mut st = match ForwardState::resume(dir, true)? {
-        Some(st) => st,
-        None => ForwardState::start(initial, dir, true)?,
-    };
-    st.extend(engine, dir, max_frames, None)?;
-    Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
-}
-
 /// A fresh forward from `initial` to `max_frames` (the tests' driver).
 #[cfg(test)]
 pub fn forward_run(
@@ -1826,7 +2363,7 @@ pub fn forward_run(
     max_frames: u32,
     record: bool,
 ) -> Result<ForwardResult> {
-    let mut st = ForwardState::start(initial, dir, record)?;
+    let mut st = ForwardState::start(initial, dir, record, None)?;
     st.extend(engine, dir, max_frames, None)?;
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
@@ -1918,10 +2455,14 @@ fn log_frame(
 
 /// Checkpoint a frontier: `frames/fNNN/s{shape}_{seq}.bin` per piece, in row
 /// order (position = id); the id-less initial frontier gets its ids here.
-fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]) -> Result<()> {
+/// `fresh`: a new frame (any old files go); else pieces a raise adds to the
+/// frame, beside its own.
+fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block], fresh: bool) -> Result<()> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
     // A re-run frame must not leave stale files behind.
-    let _ = std::fs::remove_dir_all(&fdir);
+    if fresh {
+        let _ = std::fs::remove_dir_all(&fdir);
+    }
     std::fs::create_dir_all(&fdir)?;
     // Ids are (layer, seq, row): a frame's seqs must be distinct.
     {
@@ -1944,6 +2485,7 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
                     let cells = block.positions()?;
                     let wins = block.wins()?;
                     let path = fdir.join(format!("s{:016x}_{:04}.bin", block.shard_shape(), block.seq));
+                    anyhow::ensure!(fresh || !path.exists(), "checkpoint f{frame}: {} exists", path.display());
                     crate::search::checkpoint::save_block(&path, &block.rt2, &cells, &wins)
                 })
             })
@@ -2045,6 +2587,18 @@ impl Visited {
             }
         }
         (self.len(), acc)
+    }
+    /// An order-independent hash of every `(shape, cell, key, deadline)`:
+    /// equal values filter alike (`MarkFilter`).
+    pub fn filter_fingerprint(&self) -> u64 {
+        use celeste_engine::runtime2::mix64;
+        let mut acc = 0u64;
+        for ((shape, cell), keys) in &self.shards {
+            for (&(k0, k1), &d) in keys {
+                acc = acc.wrapping_add(mix64(k0 ^ mix64(k1 ^ mix64(*shape ^ ((*cell as u64) << 16 | d as u64)))));
+            }
+        }
+        acc
     }
     /// True if `key` (at `shape`, `cell`) was new. No deadline.
     pub fn insert(&mut self, shape: u64, key: (u64, u64), cell: u32) -> bool {
@@ -2195,7 +2749,7 @@ mod tests {
             std::fs::create_dir_all(f.parent().unwrap()).expect("mkdir");
             std::fs::write(f, b"stale").expect("write");
         }
-        ForwardState::start(init, dir, true).expect("start");
+        ForwardState::start(init, dir, true, None).expect("start");
         for f in &stale {
             assert!(!f.exists(), "{} survived a fresh start", f.display());
         }
@@ -2212,7 +2766,7 @@ mod tests {
         let init = vec![Block::keyed(engine.lock().unwrap().initial().expect("initial state")).expect("block")];
         let dir = std::path::Path::new("/var/tmp/celeste-frame-trim-test");
         let _ = std::fs::remove_dir_all(dir);
-        let mut st = ForwardState::start(init, dir, true).expect("start");
+        let mut st = ForwardState::start(init, dir, true, None).expect("start");
         st.extend(&engine, dir, 2, None).expect("two frames");
         type Seen = (u32, u64, Vec<(u32, (u64, u64))>, Vec<u32>, Vec<(u64, (u64, u64), u32)>);
         let seen = |f: &crate::search::checkpoint::FrameFile| -> Seen {
@@ -2227,6 +2781,24 @@ mod tests {
             assert_eq!(crate::search::checkpoint::trim(&p).expect("trim again"), 0);
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A tree's level -1 record round-trips, reads the campaign's bare
+    /// number as a legacy filter, and is absent (unknown) on an old tree.
+    #[test]
+    fn a_trees_level_minus_one_record_round_trips() {
+        let dir = std::env::temp_dir().join(format!("celeste-tree-filter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(TreeFilter::read(&dir).expect("read"), None, "no record: unknown");
+        for f in [TreeFilter::Off, TreeFilter::MinusOne { m: MinusOne { h: 186, speed: 5 }, table: 0x0123_4567_89ab_cdef }, TreeFilter::Legacy(111)] {
+            f.write(&dir).expect("write");
+            assert_eq!(TreeFilter::read(&dir).expect("read"), Some(f));
+        }
+        std::fs::write(dir.join("level_minus_one.txt"), "116\n").expect("write");
+        assert_eq!(TreeFilter::read(&dir).expect("read"), Some(TreeFilter::Legacy(116)));
+        std::fs::write(dir.join("level_minus_one.txt"), "h 3 speed\n").expect("write");
+        assert!(TreeFilter::read(&dir).is_err(), "a garbled record is an error");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A marks file round-trips deadlines (none comes back as the horizon).
@@ -2275,7 +2847,7 @@ mod tests {
             let e = RefEngine::new().expect("engine");
             let init = vec![Block::keyed(e.initial().expect("init")).expect("block")];
             let e = Mutex::new(e);
-            let mut st = ForwardState::start(init, dir, true).expect("start");
+            let mut st = ForwardState::start(init, dir, true, None).expect("start");
             assert_eq!(pos_graph_frame(dir), Some(0), "start must leave a graph beside f0");
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
@@ -2333,7 +2905,7 @@ mod tests {
         widen_rt2_to(&mut row, Level::EXACT);
         let successors = |engine: &dyn FrameStep| -> std::collections::BTreeSet<((u64, u64), u32)> {
             let door = crate::search::door::Door::new();
-            let (next, _, _) = forward_frame(engine, vec![Block::from_rt2(row.clone_block())], &door, None, None, 26, None).expect("frame");
+            let next = forward_frame(engine, vec![Block::from_rt2(row.clone_block())], &door, None, Filters::default(), 26, None, Layer::New).expect("frame").next;
             next.iter().flat_map(|b| b.keys().iter().copied().zip(b.positions().expect("cells"))).collect()
         };
         let (k, r) = (successors(&kernels), successors(&reference));
@@ -2369,7 +2941,7 @@ mod tests {
         let mut parent = st;
         widen_rt2_to(&mut parent, level);
         let door = crate::search::door::Door::new();
-        let (next, _, _) = forward_frame(&kernels, vec![Block::from_rt2(parent)], &door, None, None, 127, None).expect("frame");
+        let next = forward_frame(&kernels, vec![Block::from_rt2(parent)], &door, None, Filters::default(), 127, None, Layer::New).expect("frame").next;
         let mut made: std::collections::BTreeSet<(u64, (u64, u64), u32)> = Default::default();
         for b in &next {
             let stored = b.keys().to_vec();

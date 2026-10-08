@@ -9,8 +9,10 @@
 //! the tables into the frame's (`xfer/f{frame}.bin`, sorted by value) and
 //! sorts each layer's records by target into the RUN `l{layer}/f{frame}.bin`
 //! (v5, `encode_sorted`: ~4 B an edge): every edge recorded at that frame
-//! into that layer, sources in layer `frame - 1`. The backward (`bfs`) reads
-//! only runs.
+//! into that layer, sources in layer `frame - 1`. A RAISE adds a frame's new
+//! edges beside its runs, in RAISED runs `l{layer}/f{frame}.raised.bin`
+//! (`compact_raised`, transfers appended to the frame's table). The backward
+//! (`bfs`) reads only runs, raised ones included.
 
 use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
@@ -600,7 +602,22 @@ const BIG_LAYER: usize = 1 << 19;
 /// `l{layer}/f{frame}.bin` and delete them. Big layers one at a time with
 /// every thread; small layers in parallel, one thread each.
 pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
-    let remaps = merge_xfer_tables(dir, frame)?;
+    compact(dir, frame, false)
+}
+
+/// A RAISE's records at frame `frame` (`frame::ForwardState::raise`: only
+/// edges the frame's runs do not hold, and the frame's earlier raised run
+/// reopened, `reopen_raised`) into the RAISED runs `l{layer}/f{frame}.raised.bin`
+/// beside its runs; their new transfers are appended to the frame's table,
+/// so the runs' ids keep their meaning. A frame's edges are its runs' and
+/// its raised runs' (`EdgeGraph`).
+pub fn compact_raised(dir: &Path, frame: u32) -> Result<CompactStats> {
+    compact(dir, frame, true)
+}
+
+fn compact(dir: &Path, frame: u32, raised: bool) -> Result<CompactStats> {
+    let out_path = |layer: u32| if raised { raised_path(dir, layer, frame) } else { run_path(dir, layer, frame) };
+    let remaps = merge_xfer_tables(dir, frame, raised)?;
     let remap_of = |worker: u32| -> &[u32] { remaps.get(&worker).map_or(&[], |v| v.as_slice()) };
     let mut layers: Vec<(u32, Vec<RawFile>, u64)> = raw_files(dir, frame);
     layers.sort_by_key(|&(_, _, bytes)| std::cmp::Reverse(bytes));
@@ -650,7 +667,7 @@ pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
         drop(maps);
         st.t_sort += t_sort;
         let t0 = std::time::Instant::now();
-        let (edges, bytes) = writer.finish(&run_path(dir, *layer, frame), &ldir.join(format!("tmp-f{:03}.bin", frame)))?;
+        let (edges, bytes) = writer.finish(&out_path(*layer), &ldir.join(format!("tmp-f{:03}.bin", frame)))?;
         for (f, _) in files {
             std::fs::remove_file(f)?;
         }
@@ -664,7 +681,7 @@ pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
     let totals: Vec<(u64, u64, u64)> = std::thread::scope(|scope| {
         let hs: Vec<_> = (0..crate::frame::threads().min(small.len().max(1)))
             .map(|_| {
-                let (small, next, read_all, remap_of) = (&small, &next, &read_all, &remap_of);
+                let (small, next, read_all, remap_of, out_path) = (&small, &next, &read_all, &remap_of, &out_path);
                 scope.spawn(move || -> Result<(u64, u64, u64)> {
                     let (mut records, mut edges, mut bytes) = (0u64, 0u64, 0u64);
                     loop {
@@ -682,7 +699,7 @@ pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
                         let ldir = layer_dir(dir, *layer);
                         std::fs::create_dir_all(&ldir)?;
                         let n = recs.len() as u64;
-                        let (p, b) = write_run(recs, &run_path(dir, *layer, frame), &ldir.join(format!("tmp-f{:03}.bin", frame)))?;
+                        let (p, b) = write_run(recs, &out_path(*layer), &ldir.join(format!("tmp-f{:03}.bin", frame)))?;
                         for (f, _) in files {
                             std::fs::remove_file(f)?;
                         }
@@ -710,35 +727,92 @@ pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
 }
 
 /// Merge the workers' transfer tables into the frame's (`xfer/f{frame}.bin`,
-/// distinct pairs sorted by value: independent of scheduling). Returns per
+/// distinct pairs sorted by value: independent of scheduling; `append`: the
+/// existing table first, as it is, then the new pairs sorted). Returns per
 /// worker the map from its ids to the frame's.
-fn merge_xfer_tables(dir: &Path, frame: u32) -> Result<rustc_hash::FxHashMap<u32, Vec<u32>>> {
+fn merge_xfer_tables(dir: &Path, frame: u32, append: bool) -> Result<rustc_hash::FxHashMap<u32, Vec<u32>>> {
     use super::arc_edges::{decode_pair, encode_pair, Pair, PAIR_BYTES};
+    let read = |p: &Path| -> Result<Vec<Pair>> {
+        let b = std::fs::read(p).with_context(|| p.display().to_string())?;
+        ensure!(b.len() % PAIR_BYTES == 0, "{}: truncated transfer table", p.display());
+        Ok(b.chunks_exact(PAIR_BYTES).map(decode_pair).collect())
+    };
     let mut tables: Vec<(u32, Vec<Pair>)> = Vec::new();
     for e in std::fs::read_dir(raw_dir(dir, frame)).into_iter().flatten().flatten() {
         let p = e.path();
         let Some(n) = p.file_name().and_then(|s| s.to_str()) else { continue };
         let Some(w) = n.strip_prefix("x_w").and_then(|s| s.strip_suffix(".bin")).and_then(|s| s.parse::<u32>().ok()) else { continue };
-        let b = std::fs::read(&p).with_context(|| p.display().to_string())?;
-        ensure!(b.len() % PAIR_BYTES == 0, "{}: truncated transfer table", p.display());
-        tables.push((w, b.chunks_exact(PAIR_BYTES).map(decode_pair).collect()));
+        tables.push((w, read(&p)?));
     }
-    let mut all: Vec<Pair> = tables.iter().flat_map(|(_, t)| t.iter().copied()).collect();
-    all.sort_unstable();
-    all.dedup();
+    let path = xfer_path(dir, frame);
+    let mut all: Vec<Pair> = if append && path.exists() { read(&path)? } else { Vec::new() };
+    let mut index: rustc_hash::FxHashMap<Pair, u32> = all.iter().enumerate().map(|(i, p)| (*p, i as u32)).collect();
+    let mut new: Vec<Pair> = tables.iter().flat_map(|(_, t)| t.iter().copied()).filter(|p| !index.contains_key(p)).collect();
+    new.sort_unstable();
+    new.dedup();
+    for p in new {
+        index.insert(p, all.len() as u32);
+        all.push(p);
+    }
     let mut buf = Vec::with_capacity(all.len() * PAIR_BYTES);
     for p in &all {
         encode_pair(&mut buf, p);
     }
-    let path = xfer_path(dir, frame);
     std::fs::create_dir_all(path.parent().expect("an xfer dir"))?;
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, buf)?;
     std::fs::rename(&tmp, &path)?;
-    Ok(tables
-        .into_iter()
-        .map(|(w, t)| (w, t.iter().map(|p| all.binary_search(p).expect("a merged pair") as u32).collect()))
-        .collect())
+    Ok(tables.into_iter().map(|(w, t)| (w, t.iter().map(|p| index[p]).collect())).collect())
+}
+
+/// The worker number a reopened raised run's edges are written back under
+/// (`reopen_raised`); a wave's workers are numbered below it.
+const REOPENED: u32 = 999;
+
+/// A frame's RAISED run into `layer`: the edges raises added after its run
+/// was written (`compact_raised`).
+fn raised_path(dir: &Path, layer: u32, frame: u32) -> PathBuf {
+    layer_dir(dir, layer).join(format!("f{:03}.raised.bin", frame))
+}
+
+/// Turn frame `frame`'s raised runs back into raw files (worker `REOPENED`,
+/// with the frame's table, which `compact_raised` only appends to), so that
+/// a frame keeps ONE raised run per layer however often it is raised.
+pub fn reopen_raised(dir: &Path, frame: u32) -> Result<()> {
+    use std::io::Write;
+    ensure!((crate::frame::threads() as u32) < REOPENED, "{} workers: the reopened frame's worker number {REOPENED} is taken", crate::frame::threads());
+    std::fs::create_dir_all(raw_dir(dir, frame))?;
+    let table = xfer_path(dir, frame);
+    if table.exists() {
+        std::fs::copy(&table, raw_xfer_path(dir, frame, REOPENED)).with_context(|| table.display().to_string())?;
+    }
+    for layer in layers(dir) {
+        let p = raised_path(dir, layer, frame);
+        if !p.exists() {
+            continue;
+        }
+        let run = Run::open(&p, frame)?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(raw_path(dir, frame, layer, REOPENED))?);
+        let mut buf: Vec<u8> = Vec::with_capacity(RECORD_BYTES);
+        let mut err: Option<std::io::Error> = None;
+        run.decode_from(0, |t, s, r| {
+            let e = run.edge(t, s, r);
+            buf.clear();
+            encode_record(&mut buf, e.target, e.base, e.xfer, e.mask);
+            match w.write_all(&buf) {
+                Ok(()) => true,
+                Err(e) => {
+                    err = Some(e);
+                    false
+                }
+            }
+        });
+        if let Some(e) = err {
+            return Err(e).with_context(|| format!("reopening {}", p.display()));
+        }
+        w.flush()?;
+    }
+    Ok(())
 }
 
 /// Drop what a run past `last` (the last frame whose runs are complete)
@@ -752,7 +826,8 @@ pub fn discard_after(dir: &Path, last: u32) -> Result<()> {
         for e in std::fs::read_dir(&ldir)?.flatten() {
             let p = e.path();
             let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let run: Option<u32> = n.strip_prefix('f').and_then(|s| s.strip_suffix(".bin")).and_then(|s| s.parse().ok());
+            // `f{frame}.bin` or `f{frame}.raised.bin`.
+            let run: Option<u32> = n.strip_prefix('f').and_then(|s| s.split('.').next()).and_then(|s| s.parse().ok());
             if n.starts_with("tmp-") || run.is_some_and(|f| f > last) {
                 std::fs::remove_file(&p)?;
             }
@@ -895,16 +970,17 @@ impl Run {
 /// A level's graph up to a horizon: `runs[layer][frame]`, and per frame its
 /// transfer table.
 pub struct EdgeGraph {
-    runs: Vec<Vec<Option<Run>>>,
+    /// Per layer and frame: the run, then the raised run (`compact_raised`).
+    runs: Vec<Vec<Vec<Run>>>,
     xfers: Vec<Vec<super::arc_edges::Pair>>,
     pub records: u64,
     pub bytes: u64,
 }
 
 impl EdgeGraph {
-    /// Map every run `l{layer}/f{frame}.bin` with `frame <= horizon`.
+    /// Map every run `l{layer}/f{frame}.bin` (and `.raised.bin`) with `frame <= horizon`.
     pub fn open(dir: &Path, horizon: u32) -> Result<Self> {
-        let mut runs: Vec<Vec<Option<Run>>> = Vec::new();
+        let mut runs: Vec<Vec<Vec<Run>>> = Vec::new();
         let (mut records, mut bytes) = (0u64, 0u64);
         for layer in layers(dir) {
             if layer > horizon {
@@ -913,18 +989,17 @@ impl EdgeGraph {
             while runs.len() <= layer as usize {
                 runs.push(Vec::new());
             }
+            let v = &mut runs[layer as usize];
+            v.resize_with(horizon as usize + 1, Vec::new);
             for frame in layer..=horizon {
-                let p = run_path(dir, layer, frame);
-                let run = if p.exists() { Some(Run::open(&p, frame)?) } else { None };
-                if let Some(r) = &run {
-                    records += r.edges;
-                    bytes += r.map.len() as u64;
+                for p in [run_path(dir, layer, frame), raised_path(dir, layer, frame)] {
+                    if p.exists() {
+                        let r = Run::open(&p, frame)?;
+                        records += r.edges;
+                        bytes += r.map.len() as u64;
+                        v[frame as usize].push(r);
+                    }
                 }
-                let v = &mut runs[layer as usize];
-                while v.len() <= frame as usize {
-                    v.push(None);
-                }
-                v[frame as usize] = run;
             }
         }
         let mut xfers = Vec::with_capacity(horizon as usize + 1);
@@ -958,22 +1033,23 @@ impl EdgeGraph {
     /// Every edge of frame `frame`'s runs.
     fn scan(&self, frame: u32, mut f: impl FnMut(Edge)) {
         for runs in &self.runs {
-            let Some(Some(run)) = runs.get(frame as usize) else { continue };
-            run.decode_from(0, |t, s, r| {
-                f(run.edge(t, s, r));
-                true
-            });
+            for run in runs.get(frame as usize).into_iter().flatten() {
+                run.decode_from(0, |t, s, r| {
+                    f(run.edge(t, s, r));
+                    true
+                });
+            }
         }
     }
 
     /// Is there a run of the edges recorded at `frame` into layer `layer`?
     pub fn has_run(&self, layer: u32, frame: u32) -> bool {
-        self.runs.get(layer as usize).and_then(|v| v.get(frame as usize)).is_some_and(|r| r.is_some())
+        self.runs.get(layer as usize).and_then(|v| v.get(frame as usize)).is_some_and(|r| !r.is_empty())
     }
 
     /// The predecessors of `target` recorded at frame `frame`.
     pub fn preds_at(&self, target: u64, frame: u32, buf: &mut Vec<Edge>) {
-        if let Some(Some(run)) = self.runs.get(id_layer(target) as usize).and_then(|v| v.get(frame as usize)) {
+        for run in self.runs.get(id_layer(target) as usize).and_then(|v| v.get(frame as usize)).into_iter().flatten() {
             run.edges_of(target, buf);
         }
     }

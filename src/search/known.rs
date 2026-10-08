@@ -101,7 +101,7 @@ pub fn check(route: &Route, p: &Pruning) -> anyhow::Result<Option<u32>> {
         return Ok(None);
     };
     let frame = exit.div_ceil(spf);
-    let l1 = crate::frame::level_minus_one();
+    let l1 = crate::frame::MinusOne::from_env().map(|m| (m.h, m.table()));
     // Per step and state: the first check it fails (`None`: it passes).
     let mut verdicts: Vec<Vec<Option<Miss>>> = Vec::with_capacity(run.layers.len());
     for (s, layer) in run.layers.iter().enumerate() {

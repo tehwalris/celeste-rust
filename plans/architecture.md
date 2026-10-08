@@ -407,6 +407,62 @@ the list (coarsest first; one level is the usual case):
 
 Resume: rerun the same command; the forward resumes or is reused, the arc
 phase reruns (minutes). A fresh forward clears `frames/` and `edges/`.
+
+**Raising the horizon** (2026-10-08, `frame::grow_tree`,
+`ForwardState::raise`). Campaigns count horizons up (`--to H`, then H+1,
+...): a low H lets level -1 cut far more. Level -1 at H drops exactly the
+(shape, cell) queues with `f + d > H`, so at H' > H every frame keeps a
+superset, and the tree built for H misses those rows and all they reach. A
+tree records the filter its frames were built under,
+`<level>/level_minus_one.txt` (`TreeFilter`: `off`, `h H speed S table FP`,
+or a bare number - `gemskip-campaign`'s record, which noted nothing); a
+forward extends a tree under ITS filter, never the environment's, so one
+tree is filtered alike at every frame (`--to H` under a tree filtered at
+H2 >= H just uses it, as before). A level-0 forward under level -1 NOTES the
+SOURCES of every dropped row: `dropped/f{t}.bin`, per source id (a row of
+layer t-1) the smallest horizon that admits one of its dropped successors
+(`CostToGo::admitted_from` = f + d; the kernels' within-call cache carries it
+for a re-emission, `RowCache::DROP_FLAG`). A search past the tree's H then
+RAISES it to the run's H' before extending: frame by frame from 1, the
+sources whose note is <= H' (their files' 64-row id groups, the other rows
+skipped) and the states the raise added one frame earlier run one wave under
+H', against the WHOLE tree's door. A new state joins the frame's layer (new
+pieces numbered after its own, `Layer::Raised`), an old one gets its edge; a
+re-expanded source's edges into queues the OLD filter admitted exist already
+and are not recorded again (a kernel call runs one block, so its sources are
+all the tree's or all the raise's). The new edges go into the frame's RAISED
+runs, `l{layer}/f{frame}.raised.bin` beside the runs, their new transfers
+appended to the frame's table (`edges::compact_raised`; a later raise reopens
+and merges them, so a frame has one per layer); `EdgeGraph` reads both. The
+notes of the frame are rewritten (the untouched sources keep theirs). (A
+first version reopened and recompacted each touched frame's whole runs:
+room (1,0) 97 -> 98 took 121 s against a fresh 264 s, most of it rewriting
+runs.) The result is the tree a fresh forward under
+H' makes: the same (key, cell) set per frame, the same edges, the same pos
+graph, the same notes - unless H' reaches a state SOONER than the tree did,
+which would renumber it: the flush refuses a door hit from a later layer
+(possible only where the table's d is not consistent along a real edge; it
+has not fired). Checked by `gates/raise.sh` (a tree raised H1 -> H2 -> ...
+against a fresh tree per horizon: `ckhash --edges`, the pos graph, the
+search's `[gate]` lines and answer): room (1,0) 55 -> 56 -> 58 and 60 -> 61
+-> 65; room (4,2) `r0sxhn,r0sxh --no-witness` 70 -> 71 -> 73 (level 1
+rebuilt each time) and with the concrete search 69 -> 70 -> 71 -> 72
+(REFUTED, REFUTED, the same 71-frame witness twice); a raise to OFF (no
+level -1) 48 -> 50; `arc-check` on the raised (1,0) tree, 0
+disagreements. MEASURED (release, 8 threads, room
+(1,0) `forward`, level -1 at 97 then 98): the raise 97 -> 98 took 29 s
+(22.6 s raising f1-f97: 6.3M sources re-expanded, 6.1M states added; the
+door's reload 6 s) and 4.8 GB peak, against 265 s and 6.0 GB for a fresh
+98 - and its tree is identical (`ckhash --edges`, pos graph). The notes
+cost the forward nothing measurable (fresh 98: 265 s, the build before
+them 272 s) and 82 MB on a 29 GB tree. Refused, loudly: a trimmed tree
+(`CELESTE_TRIM_ROWS`: the sources' values are gone), the orb room (its
+not-expanded rows depend on the horizon), another S or a changed table, a
+tree without a record (only used where complete), and a tree whose raise was
+interrupted (`raising.txt`: half raised, delete it). A FINER level's tree
+(the objects ladder) is filtered by the coarser marks for one horizon; it is
+kept only for the same marks (with deadlines), horizon and level -1
+(`filtered_for.txt`), else built again - it is the cheap one.
 `CELESTE_TRIM_ROWS=1` (2026-10-07) trims every frame's checkpoint files to
 keys, cells and wins once a later frame's runs are complete
 (`checkpoint::trim`): the search, a resume and `export-ui` read nothing
@@ -619,7 +675,8 @@ and the concrete witness; it replaced the ladder's marks gate on
 recording `arc-check`. A kernels-against-interpreter check: `rewrite
 ref-check` (row by row; the kernels over-approximate where the reference
 splits an interval, so ckhash equality with the reference engine is no
-test).
+test). After a change to the forward's filters, the notes or the runs:
+`gates/raise.sh` (a raised tree against fresh ones, "Raising the horizon").
 
 **A known solution against the pruning** (`search::known`, 2026-10-08).
 Every pruning step of the search - level -1, the objects ladder's filter,

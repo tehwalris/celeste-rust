@@ -65,8 +65,16 @@ makes it sound where the probe only counted:
   room (2,0) f80 kept exactly the unfiltered 62.8M);
 - **only table nodes are refused**: a row without a player cell, outside the
   room, or of a shape or cell the table never reached is kept;
-- **H is the largest horizon the run tests**: level 0 persists across
-  horizons, so this is for a `--ceiling` search with H = the ceiling.
+- **H bounds the horizon, and a tree remembers it**: a search refuses
+  `--to` past H, and a tree is extended under the filter it was built
+  under (`<level>/level_minus_one.txt`), whatever the environment says.
+  For a LARGER horizon the level-0 tree is RAISED, not rebuilt: every frame
+  noted the sources of its drops with `f + d` (`CostToGo::admitted_from`),
+  so a raise to H' re-expands just the sources with `f + d <= H'` and what
+  they add, frame by frame, and ends as exactly the tree a fresh run at H'
+  makes (plans/architecture.md, "Raising the horizon"). Count-ups (`--to H`,
+  H+1, ...) with `CELESTE_LEVEL_MINUS_ONE` = each horizon pay the forward
+  once.
 
 The table is horizon-independent: one per room.
 
