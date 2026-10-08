@@ -81,7 +81,14 @@ keep refusing, and the no-player chain runs with the fruit exact. Then
 `r0sxhfn` BUILDS (307 kernels, the walk 158 s) and runs to f42 (f40 92,350
 kept, the same as `r0sxhf`: no gain yet that early), and stops on a KERNEL
 COVERAGE GAP - lanes falling at `spd.y` 2 decline on an error disjunct
-(`CELESTE_KERNEL_EXPLAIN`); not investigated further.
+(`CELESTE_KERNEL_EXPLAIN`, followed down: the error reads `UnknownBool(0)`,
+the frame's first atom - the fruit's `fly` - next to `Cell(20) <= 0`, so it
+is three-valued and reads as error); not fixed.
+
+The (2,0) lesson (search at the answer, not at the reference) does not
+rescue (3,0): nodiag's optimum is at least any%'s 89, and `r0sxhf` at
+`--to 89` (L-1 89,5) cut nothing by f59: 53.9M kept, x1.5 a frame, 37 GB;
+stopped.
 
 **(2,0) 300m** (2 springs): **OPTIMAL 100, eight frames under TAS3's 108.**
 What had failed was the HORIZON and the level, not the room: `r0sxhn` (the
