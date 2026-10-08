@@ -737,6 +737,144 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
     Winning { spans, sets }
 }
 
+/// FORWARD inside W: `R_t(i)`, the remainders with which node `i` is reached
+/// at frame `t` from the start (at `point`) along the graph's edges and
+/// still wins - `R_0 = {point}` at the start, `R_{t+1}(m) = U push_e(R_t(p))
+/// ∩ W_{t+1}(m)` over the edges `p -> m` (a win node is not left). Per node
+/// the LAST frame its `R` is non-empty (`u32::MAX`: never), for the next
+/// level's filter.
+///
+/// Sound as a filter where `W`'s deadline is: a concrete winning path's
+/// remainder at frame `t` is in `W_t` of its node (W holds every winner)
+/// and is the image of its remainder at `t - 1` along the recorded edge (the
+/// arc model `arc-check` probes), so by induction it is in `R_t`. Tighter:
+/// a node `W` lets win from some remainder no path from the start brings is
+/// not marked.
+///
+/// A set more fragmented than `REACH_SEGS` segments is replaced by `W_t`
+/// itself (a superset: the filter only loosens), which bounds the memory -
+/// W's sets are shared, a node's reached set is its own.
+pub fn reach(g: &Graph, w: &Winning, start: u32, point: (u32, u32), horizon: u32) -> Vec<u32> {
+    use super::arcs::Piece;
+    let n = g.len();
+    let threads = crate::frame::threads().max(1);
+    let mut last = vec![u32::MAX; n];
+    const REACH_SEGS: usize = 32;
+    // The current frame's sets, by node (`None`: W_t of the node); `pos[i]`
+    // its index (u32::MAX: none).
+    let mut cur: Vec<(u32, Option<Region>)> = Vec::new();
+    let mut pos = vec![u32::MAX; n];
+    if let Some(r) = w.at(0, start) {
+        if r.contains(point.0, point.1) {
+            let p = Piece { y: super::arcs::Seg { lo: point.1, hi: point.1 + 1 }, x: super::arcs::Seg { lo: point.0, hi: point.0 + 1 } };
+            cur.push((start, Some(Region::from_pieces(&mut [p], &mut Vec::new()))));
+            pos[start as usize] = 0;
+            last[start as usize] = 0;
+        }
+    }
+    let mut stamp = vec![u32::MAX; n];
+    let (mut active_max, mut in_w) = (0usize, 0u64);
+    for t in 0..horizon {
+        if cur.is_empty() {
+            break;
+        }
+        active_max = active_max.max(cur.len());
+        if t % 16 == 0 {
+            let own = cur.iter().filter(|c| c.1.is_some()).count();
+            let segs: usize = cur.iter().filter_map(|c| c.1.as_ref()).map(|r| r.n_segs()).sum();
+            eprintln!("[arc] reach f{t:03}: {} nodes ({own} own sets, {segs} segments; the rest W's)", cur.len());
+        }
+        // Candidates: the successors of the nodes with a set, W non-empty at t + 1.
+        let mut cand: Vec<u32> = Vec::new();
+        for (i, _) in &cur {
+            if g.is_win(*i) {
+                continue;
+            }
+            for e in g.out_of(*i) {
+                if stamp[e.dst as usize] != t && w.at(t + 1, e.dst).is_some() {
+                    stamp[e.dst as usize] = t;
+                    cand.push(e.dst);
+                }
+            }
+        }
+        cand.sort_unstable();
+        // Each candidate's set, pulled from its predecessors' (in parallel).
+        const CHUNK: usize = 256;
+        let at = std::sync::atomic::AtomicUsize::new(0);
+        let (cur_ref, pos_ref, cand_ref) = (&cur, &pos, &cand);
+        let mut parts: Vec<(usize, Vec<Option<Option<Region>>>)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads)
+                .map(|_| {
+                    sc.spawn(|| {
+                        let (mut out, mut pieces, mut clipped, mut scratch) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                        loop {
+                            let lo = at.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);
+                            if lo >= cand_ref.len() {
+                                return out;
+                            }
+                            let sets: Vec<Option<Option<Region>>> = cand_ref[lo..(lo + CHUNK).min(cand_ref.len())]
+                                .iter()
+                                .map(|&m| {
+                                    let wm = w.at(t + 1, m).expect("a candidate has a winning set");
+                                    pieces.clear();
+                                    let mut preds: Vec<u32> = g.preds_of(m).to_vec();
+                                    preds.sort_unstable();
+                                    preds.dedup();
+                                    for p in preds {
+                                        let k = pos_ref[p as usize];
+                                        if k == u32::MAX || g.is_win(p) {
+                                            continue;
+                                        }
+                                        let r = match &cur_ref[k as usize].1 {
+                                            Some(r) => r,
+                                            None => w.at(t, p).expect("a node reached in W has a set"),
+                                        };
+                                        for e in g.out_of(p).iter().filter(|e| e.dst == m) {
+                                            let (x, y) = g.xfer(e);
+                                            r.push(x, y, &mut pieces);
+                                        }
+                                    }
+                                    clipped.clear();
+                                    for &pc in &pieces {
+                                        wm.clip_into(pc, &mut clipped);
+                                    }
+                                    let r = Region::from_pieces(&mut clipped, &mut scratch);
+                                    if r.is_empty() {
+                                        None
+                                    } else if r.n_segs() > REACH_SEGS {
+                                        Some(None)
+                                    } else {
+                                        Some(Some(r))
+                                    }
+                                })
+                                .collect();
+                            out.push((lo, sets));
+                        }
+                    })
+                })
+                .collect();
+            hs.into_iter().flat_map(|h| h.join().expect("a reach worker panicked")).collect()
+        });
+        parts.sort_unstable_by_key(|p| p.0);
+        for (i, _) in &cur {
+            pos[*i as usize] = u32::MAX;
+        }
+        let mut next: Vec<(u32, Option<Region>)> = Vec::new();
+        for (m, r) in cand.iter().zip(parts.into_iter().flat_map(|p| p.1)) {
+            if let Some(r) = r {
+                in_w += r.is_none() as u64;
+                pos[*m as usize] = next.len() as u32;
+                last[*m as usize] = t + 1;
+                next.push((*m, r));
+            }
+        }
+        cur = next;
+    }
+    let marked = last.iter().filter(|&&l| l != u32::MAX).count();
+    eprintln!("[arc] reach: {marked} of {n} nodes reached inside W from the start (at most {active_max} a frame; {in_w} sets widened to W)");
+    last
+}
+
 /// The OPTIMUM and a witness: the win frame (from frame 0) and the path to
 /// it (node id, remainder point) frame by frame.
 pub struct Found {
@@ -1269,15 +1407,14 @@ pub fn solve(
     drop(node_key);
     println!("[gate] h{horizon} arc optimum {}", arc.map_or("none".to_string(), |f| f.to_string()));
     crate::metrics::mem_phase("arc: fingerprints");
-    // Per node the LAST frame its winning set is non-empty (its deadline):
-    // the next level's filter, and the UI's arc marks.
+    // Per node the LAST frame it is reached inside W from the start (`reach`;
+    // at most its W deadline): the next level's filter, and the UI's arc marks.
     let mut arc_marks = want_marks.then(Visited::new);
     if want_marks || save.is_some() {
-        let mut last = vec![u32::MAX; g.len()];
-        for (i, _, hi, _) in w.spans() {
-            let l = &mut last[i as usize];
-            *l = if *l == u32::MAX { hi } else { (*l).max(hi) };
-        }
+        let tr = std::time::Instant::now();
+        let last = reach(g, &w, start, p0, horizon);
+        eprintln!("[arc] reach {:.2} s", tr.elapsed().as_secs_f64());
+        crate::metrics::mem_phase("arc: reach");
         let ids: Vec<(u64, u16)> = (0..g.len() as u32).filter(|&i| last[i as usize] != u32::MAX).map(|i| (g.id(i), last[i as usize] as u16)).collect();
         drop(last);
         super::edges::resolve_ids(&files, &ids, |shape, key, cell, d| {
@@ -1416,6 +1553,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `reach` against the points themselves: from one start point every
+    /// frame's reached set is finite, so walk every (node, point) through the
+    /// edges whose guards take it, keeping those inside W.
+    #[test]
+    fn reach_is_the_forward_of_the_start_point_inside_w() {
+        let mut s = 23u64;
+        let mut r = move |m: u32| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as u32) % m
+        };
+        let mut nonempty = 0;
+        for _ in 0..80 {
+            let n = 3 + r(14) as u64;
+            let mut edges = Vec::new();
+            for _ in 0..n * 3 {
+                let (a, b) = (r(n as u32) as u64, r(n as u32) as u64);
+                let tr = |r: &mut dyn FnMut(u32) -> u32| {
+                    let cut = 1 + r(CIRCLE - 1);
+                    let guard = match r(3) { 0 => Seg { lo: 0, hi: CIRCLE }, 1 => Seg { lo: 0, hi: cut }, _ => Seg { lo: cut, hi: CIRCLE } };
+                    let action = if r(5) == 0 { Action::Const(r(CIRCLE)) } else { Action::Rotate(r(CIRCLE) as i32 - 32768) };
+                    Transfer { guard, action }
+                };
+                let (x, y) = (tr(&mut r), tr(&mut r));
+                edges.push(Edge { src: a, dst: b, x, y });
+            }
+            let mut dist = vec![u32::MAX; n as usize];
+            dist[0] = 0;
+            for _ in 0..n {
+                for e in &edges {
+                    if dist[e.src as usize] != u32::MAX && dist[e.src as usize] + 1 < dist[e.dst as usize] {
+                        dist[e.dst as usize] = dist[e.src as usize] + 1;
+                    }
+                }
+            }
+            edges.retain(|e| dist[e.src as usize] != u32::MAX);
+            let wins: Vec<u64> = (1..n).filter(|&i| dist[i as usize] != u32::MAX && r(3) == 0).collect();
+            if edges.is_empty() {
+                continue;
+            }
+            let horizon = 7;
+            let d = dist.clone();
+            let g = Graph::from_edges(edges, move |id| d[id as usize], wins, None);
+            let Some(start) = g.index(0) else { continue };
+            let w = backward(&g, horizon);
+            let p0 = (r(CIRCLE), r(CIRCLE));
+            let got = reach(&g, &w, start, p0, horizon);
+            let mut want = vec![u32::MAX; g.len()];
+            let inside = |t: u32, i: u32, p: (u32, u32)| w.at(t, i).is_some_and(|reg| reg.contains(p.0, p.1));
+            let mut cur: FxHashSet<(u32, (u32, u32))> = FxHashSet::default();
+            if inside(0, start, p0) {
+                cur.insert((start, p0));
+                want[start as usize] = 0;
+            }
+            for t in 0..horizon {
+                let mut next = FxHashSet::default();
+                for &(i, p) in &cur {
+                    if g.is_win(i) {
+                        continue;
+                    }
+                    for e in g.out_of(i) {
+                        let (x, y) = g.xfer(e);
+                        if x.takes(p.0) && y.takes(p.1) {
+                            let q = (apply(x.action, p.0), apply(y.action, p.1));
+                            if inside(t + 1, e.dst, q) {
+                                next.insert((e.dst, q));
+                                want[e.dst as usize] = t + 1;
+                            }
+                        }
+                    }
+                }
+                cur = next;
+            }
+            nonempty += want.iter().filter(|&&l| l != u32::MAX).count();
+            assert_eq!(got, want);
+        }
+        assert!(nonempty > 50, "only {nonempty} reached nodes over the cases");
     }
 
     /// With first-reach layers, the optimum read off `backward(H)` is the

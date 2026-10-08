@@ -336,6 +336,40 @@ impl Region {
         }
         out
     }
+    /// The IMAGE of `self` under one edge, as pieces appended to `out`: the
+    /// points of `self` inside the edge's guards, moved by its actions.
+    pub fn push(&self, x: Transfer, y: Transfer, out: &mut Vec<Piece>) {
+        let image = |t: Transfer, s: Seg, f: &mut dyn FnMut(Seg)| {
+            if let Some(c) = clip(s, t.guard) {
+                match t.action {
+                    Action::Rotate(v) => rot_seg(c, v.rem_euclid(CIRCLE as i32) as u32, f),
+                    Action::Const(p) => f(Seg { lo: p, hi: p + 1 }),
+                }
+            }
+        };
+        let mut ximg: Vec<Seg> = Vec::new();
+        for (ys, xs) in self.slabs() {
+            ximg.clear();
+            for &s in xs {
+                image(x, s, &mut |r| ximg.push(r));
+            }
+            if ximg.is_empty() {
+                continue;
+            }
+            image(y, ys, &mut |r| out.extend(ximg.iter().map(|&xr| Piece { y: r, x: xr })));
+        }
+    }
+    /// `p` intersected with `self`, as pieces appended to `out`.
+    pub fn clip_into(&self, p: Piece, out: &mut Vec<Piece>) {
+        for (ys, xs) in self.slabs() {
+            let Some(y) = clip(ys, p.y) else { continue };
+            for &s in xs {
+                if let Some(x) = clip(s, p.x) {
+                    out.push(Piece { y, x });
+                }
+            }
+        }
+    }
     /// The preimage of `self` under one edge, inside the edge's guards, as
     /// pieces appended to `out`: the remainders the edge takes into `self`.
     pub fn pull(&self, x: Transfer, y: Transfer, out: &mut Vec<Piece>) {
@@ -463,6 +497,40 @@ mod tests {
                 for &y in &pp {
                     let want = tx.takes(x) && ty.takes(y) && r.contains(ap(tx.action, x), ap(ty.action, y));
                     assert_eq!(pr.contains(x, y), want, "pull at ({x}, {y})");
+                }
+            }
+            // push: a point q is in the image iff some point of r inside the
+            // guards maps to it - checked from both sides: every probed point
+            // of r maps into the image, and the image's points pull back into r.
+            let mut out = Vec::new();
+            r.push(tx, ty, &mut out);
+            let img = Region::from_pieces(&mut out, &mut Vec::new());
+            for &x in &pp {
+                for &y in &pp {
+                    if tx.takes(x) && ty.takes(y) && r.contains(x, y) {
+                        assert!(img.contains(ap(tx.action, x), ap(ty.action, y)), "push misses the image of ({x}, {y})");
+                    }
+                }
+            }
+            let mut back = Vec::new();
+            img.pull(tx, ty, &mut back);
+            let mut inter = Vec::new();
+            for p in back {
+                r.clip_into(p, &mut inter);
+            }
+            let back = Region::from_pieces(&mut inter, &mut Vec::new());
+            let mut again = Vec::new();
+            back.push(tx, ty, &mut again);
+            assert_eq!(Region::from_pieces(&mut again, &mut Vec::new()), img, "the image is exactly the image of its preimage in r");
+            // clip_into is the intersection.
+            let q = Piece { y: seg(&mut s), x: seg(&mut s) };
+            let mut cl = Vec::new();
+            r.clip_into(q, &mut cl);
+            let cr = Region::from_pieces(&mut cl, &mut Vec::new());
+            for &x in &probes {
+                for &y in &probes {
+                    let inq = q.x.lo <= x && x < q.x.hi && q.y.lo <= y && y < q.y.hi;
+                    assert_eq!(cr.contains(x, y), inq && r.contains(x, y), "clip at ({x}, {y})");
                 }
             }
         }
