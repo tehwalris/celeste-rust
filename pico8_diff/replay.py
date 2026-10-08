@@ -56,6 +56,14 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
         for pat, new in (("this.timer=20", "this.timer=20 this.seed=__balloon_seed()"), ("this.x=this.start-1+rnd(3)", "this.x=this.start-1+(this.timer<=0 and this.seed+1 or rnd(3))")):
             assert lua.count(pat) == 1, f"expected exactly one {pat!r} in the Lua"
             lua = lua.replace(pat, new)
+    # Each dash START, as the game itself decides it: the player's dash
+    # branch (`if this.djump>0 and dash then`, entered neither during freeze
+    # nor during a dash, nor with djump 0) records the held direction and the
+    # facing, the driver prints it on the frame's line and clears it. A global
+    # write only: nothing the game reads.
+    pat = "local v_input=(btn(k_up) and -1 or (btn(k_down) and 1 or 0))"
+    assert lua.count(pat) == 1, f"expected exactly one {pat!r} (the dash branch) in the Lua"
+    lua = lua.replace(pat, pat + " __dash_start={input,v_input,this.flip.x}")
     if room is not None:
         # The minimal cart's _init loads room (1,0); the search patches the
         # same call (celeste-interp game_runner) to start elsewhere. The
@@ -111,6 +119,15 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
         "    elseif lifeup and o.type == lifeup then",
         "      line = line..' lifeup '..o.x..','..o.y",
         "    end",
+        "  end",
+        # ` dash DIR` (R L U D UR UL DR DL): the dash started this frame. With
+        # no direction held the game dashes horizontally the way it faces.
+        "  if __dash_start then",
+        "    local h, v, flip = __dash_start[1], __dash_start[2], __dash_start[3]",
+        "    local d = (v < 0 and 'U' or (v > 0 and 'D' or ''))..(h > 0 and 'R' or (h < 0 and 'L' or ''))",
+        "    if d == '' then d = flip and 'L' or 'R' end",
+        "    line = line..' dash '..d",
+        "    __dash_start = nil",
         "  end",
         "  printh('@P8@ '..line)",
         "end",
