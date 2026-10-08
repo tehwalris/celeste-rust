@@ -206,23 +206,31 @@ def run(job, outdir, binary):
     if "nodiag" in cat:
         res["diagonal_dashes"] = diag_dashes(ours)
     lead = next((i for i, b in enumerate(ours) if b), len(ours))
-    res["prologue_ok"] = lead >= prologue
-    # 4. UniversalClassicTas
+    res["first_input"] = lead
+    # 4. UniversalClassicTas. The upload starts at the room's first
+    # controllable frame: usually the community file's earliest exiting
+    # offset, but a witness may press on the frame before (the player exists
+    # and updates on the frame it is created: room (2,1) nodiag, 2026-10-08),
+    # so that cut is tried too, and UCT decides. A cut never drops a press.
     level = int(name.rstrip("m")) // 100 if name.endswith("m") else None
-    if level and lead >= prologue:
-        mine = os.path.join(jd, f"ours-{entry['file']}")
-        open(mine, "w").write(f"[{seeds}]" + ",".join(map(str, ours[prologue:])))
+    if level:
         ok_db, n_db, _, _ = uct(level, f"{DB}/classic/{cat}/{entry['file']}", cat)
-        ok, n, saved, _ = uct(level, mine, cat)
         res["uct_db"] = f"{'finished' if ok_db else 'NOT finished'} {n_db} inputs"
-        res["uct_ours"] = f"{'finished' if ok else 'NOT finished'} {n} inputs"
-        if ok:
-            up = os.path.join(outdir, "upload", cat)
-            os.makedirs(up, exist_ok=True)
-            shutil.copy(saved, os.path.join(up, entry["file"]))
-            res["upload"] = os.path.join(up, entry["file"])
+        for cut in [prologue] + ([lead] if lead < prologue else []):
+            if any(ours[:cut]):
+                continue
+            mine = os.path.join(jd, f"ours-{entry['file']}")
+            open(mine, "w").write(f"[{seeds}]" + ",".join(map(str, ours[cut:])))
+            ok, n, saved, _ = uct(level, mine, cat)
+            res["uct_ours"], res["upload_cut"] = f"{'finished' if ok else 'NOT finished'} {n} inputs", cut
+            if ok:
+                up = os.path.join(outdir, "upload", cat)
+                os.makedirs(up, exist_ok=True)
+                shutil.copy(saved, os.path.join(up, entry["file"]))
+                res["upload"] = os.path.join(up, entry["file"])
+                break
     res["status"] = "IMPROVED" if opt < ref else ("tie" if opt == ref else "WORSE?")
-    res["verified"] = (e == opt) and not res.get("diagonal_dashes") and "finished" in res.get("uct_ours", "") and res.get("berry", True)
+    res["verified"] = (e == opt) and not res.get("diagonal_dashes") and res.get("uct_ours", "").startswith("finished") and res.get("berry", True)
     # 5. the UI
     if opt < ref:
         try:

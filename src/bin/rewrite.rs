@@ -529,7 +529,8 @@ fn main() -> Result<()> {
                         st.win_frame
                     }
                 };
-                eprintln!("[search] level {li} ({lvl}): forward to step {steps} in {:.1} s; first win {first_win:?} (step)", t.elapsed().as_secs_f64());
+                // `f` counts search steps (`ui_export::parse_log` reads this line).
+                eprintln!("[search] level {li} ({lvl}): forward to f{steps} in {:.1} s; first win {first_win:?}", t.elapsed().as_secs_f64());
                 celeste_rust::metrics::mem_phase("forward");
                 // THE ARC PHASE and the concrete search (at a coarser level
                 // only the try at the bound).
