@@ -77,6 +77,34 @@ pub fn cell_names(rt2: &Rt2, ids: &BoundaryIds) -> HashMap<usize, String> {
             }
         }
     }
+    // Globals: a value global by its name, a table global's entries as
+    // `name[i]` (arrays, 1-based as in Lua) or `name.field`.
+    for (g, gname) in celeste_names::GLOBAL_NAMES.iter().enumerate() {
+        let Some(&cell) = rt2.globals.get(g) else { continue };
+        if cell == celeste_engine::runtime2::NONE || cell as usize >= rt2.structure.len() {
+            continue;
+        }
+        match (&rt2.structure[cell as usize], &rt2.cols[cell as usize]) {
+            (Cell2::Val, Col::U(AV::Ptr(t))) => match &rt2.structure[*t as usize] {
+                Cell2::Arr(items) => {
+                    for (i, &c) in items.iter().enumerate() {
+                        names.entry(c as usize).or_insert_with(|| format!("{gname}[{}]", i + 1));
+                    }
+                }
+                Cell2::Obj(fields) => {
+                    for &(f, c) in fields {
+                        let field = celeste_names::FIELD_NAMES.get(f as usize).copied().unwrap_or("?");
+                        names.entry(c as usize).or_insert_with(|| format!("{gname}.{field}"));
+                    }
+                }
+                _ => {}
+            },
+            (Cell2::Val, _) => {
+                names.entry(cell as usize).or_insert_with(|| gname.to_string());
+            }
+            _ => {}
+        }
+    }
     names
 }
 

@@ -329,9 +329,13 @@ impl AsmKernel {
                 // Tri-state masks, each read where it MAY hold.
                 let error = read_zb_may(outbuf, body.error_off);
                 let live = read_zb_may(outbuf, body.live_off);
-                if live & error & valid != 0 {
+                // A SKIPPED lane (an exit, a lost berry: never expanded) has no
+                // successors to lose, so its error is no decline. Room (6,2)
+                // 100% at f84: an exited row (room (7,2), a restart pending)
+                // shared a slice with a live respawn and its error was fatal.
+                if live & error & valid & !skip != 0 {
                     // Declined (fatal in the caller): report the lanes.
-                    let declined = live & error & valid;
+                    let declined = live & error & valid & !skip;
                     let ids = crate::compiled::ids();
                     let mut rows = String::new();
                     let mut m = declined;
