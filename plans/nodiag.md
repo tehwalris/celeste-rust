@@ -115,12 +115,20 @@ solved in any% only with the split frame. What blocked them, and what changed:
   then 92: the breadth-first search's region is several times smaller per
   frame of slack) found 92 (the table above).
 - 700m: the level -1 table did not finish in 17 min (`r0sxhfp`, split);
-  without it the forward outgrows 30 GB near step 140 (the table above).
+  without it the forward was stopped near step 140 at 30 GB (it reached
+  step 148 in one run at 28.4 GB peak under a 55 GB cap: "700m and 1800m
+  finished" above).
 - `rewrite arc-check` runs out of memory on any tree with an unknown number
   (the near level's countdowns since `b47b118`, the fly fruit): it steps
   stored rows through the concrete engine, which reads `UNum` as the whole
   16.16 range (room (7,0) `r0sxhn`: OOM at f2 under 12 GB). Not run on these
   rooms' trees; the witnesses on PICO-8 are the check.
+  Measured 2026-10-08 (room (7,0) `r0sxhn`, f2, under 12 GB): it is not
+  one wide `flr` but the path count - `RefEngine::step` reads a widened
+  field as its range and forks every straddling comparison on it
+  independently, past 8,192 paths per stored row at ~20 two-way forks
+  deep, each path a full state. A fix needs a different probe (e.g.
+  concrete members of the row), not a bigger cap.
 
 ## The three rooms that failed on size (2026-10-08, branch `nodiag-big`)
 
