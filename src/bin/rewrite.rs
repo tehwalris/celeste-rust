@@ -76,8 +76,41 @@ enum Command {
         /// first at every frame, so among the optimal routes the witness
         /// follows it wherever it can - the smallest change to an existing
         /// TAS. Every input is still tried; only WHICH optimum is found.
+        /// When it exits by the horizon it is also CHECKED against every
+        /// pruning step at every level (`search::known`, as `check-known`):
+        /// the search fails if one drops it.
         #[arg(long)]
         prefer: Option<String>,
+    },
+    /// A KNOWN solution against the pruning of finished search trees
+    /// (`search::known`): stepped through the reference engine, at every
+    /// step it must pass level -1 (`CELESTE_LEVEL_MINUS_ONE`, as the search
+    /// ran) and the objects ladder's filter, and at every frame boundary
+    /// project onto an arc-graph node whose W holds its exact remainder,
+    /// reached (at a level that filters the next) - per level of `--level`,
+    /// the arc phase rerun over `<checkpoint-dir>/level{i:02}` as `search`
+    /// runs it, without the concrete search. Exits non-zero on the first
+    /// check that drops it, with the step, the node and the state.
+    CheckKnown {
+        /// The search's checkpoint dir (its `level{i:02}` trees).
+        #[arg(long)]
+        checkpoint_dir: String,
+        /// The search's levels, comma-separated, coarsest first.
+        #[arg(long, default_value = "r0sx")]
+        level: String,
+        /// The known solution: a `tas/` file or a comma list of input bytes,
+        /// the spawn prologue included.
+        #[arg(long)]
+        inputs: String,
+        /// The search's horizon in frames (the trees must reach it).
+        #[arg(long)]
+        horizon: u32,
+        /// Start room "x,y".
+        #[arg(long, default_value = "1,0")]
+        room: String,
+        /// The synthetic win "x,y" the search ran with, if any.
+        #[arg(long)]
+        win_at: Option<String>,
     },
     /// ONE forward pass at ONE level, exactly as the search runs it, with the
     /// per-frame timing line. The profiling entry point for the forward.
@@ -508,6 +541,7 @@ fn main() -> Result<()> {
                 let last = li + 1 == levels.len();
                 set_level(lvl);
                 let dir = base.join(format!("level{li:02}"));
+                let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l));
                 // THE FORWARD. A tree that already reaches the horizon is
                 // used as it is; a finer level's tree is filtered for this
                 // horizon - delete it to change the horizon or the levels.
@@ -524,7 +558,6 @@ fn main() -> Result<()> {
                             Some(s) => s,
                             None => celeste_rust::frame::ForwardState::start(initial()?, &dir, true)?,
                         };
-                        let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l));
                         st.extend(&engine, &dir, steps, filter.as_ref())?;
                         st.win_frame
                     }
@@ -539,7 +572,8 @@ fn main() -> Result<()> {
                 // and the finer level decides the optimum anyway.
                 let concrete = last && !no_witness;
                 // Every level saves its marks (the next overwrites).
-                let s = solve(&dir, lvl, steps, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref())?;
+                let known = prefer.as_deref().map(|inputs| celeste_rust::search::known::Route { inputs, filter: filter.as_ref() });
+                let s = solve(&dir, lvl, steps, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref(), known.as_ref())?;
                 let wall = t0.elapsed().as_secs_f64();
                 let Some(bound) = s.arc else {
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
@@ -573,6 +607,38 @@ fn main() -> Result<()> {
                 }
                 prev = Some((s.arc_marks.expect("asked for"), lvl));
             }
+        }
+        Command::CheckKnown { checkpoint_dir, level, inputs, horizon, room, win_at } => {
+            use celeste_rust::search::arc_dp::solve;
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            if let Some(xy) = &win_at {
+                std::env::set_var("CELESTE_WIN_AT_XY", xy);
+            }
+            let inputs = celeste_rust::concrete::read_inputs(&inputs)?;
+            let steps = horizon * celeste_rust::frame::steps_per_frame();
+            let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
+            let t0 = std::time::Instant::now();
+            let mut prev: Option<(Visited, Level)> = None;
+            for (li, &lvl) in levels.iter().enumerate() {
+                let last = li + 1 == levels.len();
+                set_level(lvl);
+                let dir = std::path::Path::new(&checkpoint_dir).join(format!("level{li:02}"));
+                anyhow::ensure!(
+                    celeste_rust::frame::tree_first_win_through(&dir, steps)?.is_some(),
+                    "{}: no tree through step {steps} (run the search first)",
+                    dir.display()
+                );
+                let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l));
+                let route = celeste_rust::search::known::Route { inputs: &inputs, filter: filter.as_ref() };
+                let s = solve(&dir, lvl, steps, false, !last, None, None, Some(&route))?;
+                let f = s.known.ok_or_else(|| anyhow::anyhow!("the known route does not exit by f{horizon}: nothing to check"))?;
+                println!("[check-known] level {li} ({lvl}): the known route (exit f{f}) survives (arc bound {:?})", s.arc);
+                if last {
+                    break;
+                }
+                prev = Some((s.arc_marks.expect("asked for"), lvl));
+            }
+            println!("[check-known] every level passes ({:.1} s)", t0.elapsed().as_secs_f64());
         }
         Command::Forward {
             to,
