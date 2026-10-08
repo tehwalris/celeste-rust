@@ -1,0 +1,4 @@
+# Room (1,3) "2600m", 100% (berry taken): exit during frame 161 (2026-10-08), OPTIMAL.
+# Community 100% TAS26: 163 in our counting. CELESTE_HUNDRED=1, r0sxhn,r0sxh, level -1 (163,5), --ceiling 163: arc bound 161 at level 0, the try wins (598 steps); berry from the chest under chest seed 0.5 (the file has 0).
+# Original cart on PICO-8 under seeds [0.5,]: berry taken, exits f161; UCT finished 136 inputs (database finished 138 inputs).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,18,0,42,0,0,0,0,0,0,0,0,16,0,6,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,38,2,2,2,2,2,1,1,0,37,0,0,0,0,0,0,0,0,0,0,0,33,33,0,0,0,0,0,16,0,0,0,0,1,1,1,36,36,0,0,0,17,1,1,1,1,1,38,0,38,0,0,0,0,0,0,0,16,2,42,18,42,42,34,0,0,0,38,6,38,38,0,0,0,0,0,0,0,0,2,2,2,2,2,2,2,10,42,2,42,0,0,0,0,36,36,36,0,36,36,0,36,36,52,0,36,36
