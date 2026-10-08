@@ -13,7 +13,7 @@ gone once the player dashes).
 | room | levels | kept, widest | peak | wall | answer |
 |---|---|---|---|---|---|
 | (3,1) 1200m | `r0sxhf,r0sxh` | ~9M (f61) | 16.4 GB | 1093 s (overnight binary: 2496 s to the arc phase) | bounds 76, 78; tie 78 |
-| (4,3) 2900m | `r0sxhn,r0sxh` | 17.4M (f85) | 26.4 GB | 2768 s | bounds 106, 107 (no win at either), BFS win at 109 |
+| (4,3) 2900m | `r0sxhn,r0sxh` | 22.0M (f90) | 26.4 GB | 2768 s | bounds 106, 107 (no win at either), BFS win at 109 |
 | (0,3) 2500m | `r0sxhn,r0sxh` | 12.6M (f96) | 42.3 GB | 2452 s | bound 134 at level 0; overnight (no berry rule): 56.5M at f111, still growing |
 | (6,1) 1500m split | `r0sxhn,r0sxh` | 18.3M a step (193) | 30.5 GB | 4164 s | bounds f112, f113; BFS win at 114 |
 | (5,1) 1400m | `r0sxhn` | 63.8M at f94, +11%/frame | 39.6 GB at f94 | stopped | - |
