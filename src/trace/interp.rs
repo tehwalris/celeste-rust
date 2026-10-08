@@ -990,9 +990,19 @@ impl<'a, D: Domain> Interp<'a, D> {
             return Ok(out);
         }
         let mut out = Vec::new();
+        // A comparison reading a countdown field (`domain::COUNTDOWN_FIELDS`).
+        let countdown = |e: &ast::Expression| {
+            let t = e.to_string();
+            let t = t.trim();
+            crate::trace::domain::COUNTDOWN_FIELDS.iter().any(|f| t.strip_suffix(f).is_some_and(|h| h.ends_with('.')))
+        };
+        let hint = countdown(lhs) || countdown(rhs);
         for (st, a) in self.eval(lhs, st)? {
             for (mut st, b) in self.eval(rhs, st)? {
-                let (v, illegal) = self.binop_values(binop, &a, &b)?;
+                self.d.set_countdown_hint(hint);
+                let r = self.binop_values(binop, &a, &b);
+                self.d.set_countdown_hint(false);
+                let (v, illegal) = r?;
                 if let Some(why) = illegal {
                     let t = format!("{}{}{}", lhs, binop, rhs);
                     let t = t.trim();

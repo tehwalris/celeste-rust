@@ -183,6 +183,7 @@ pub fn trace_frame<'a>(
     it.d.clear_ranges();
     it.d.clear_fork_memo();
     it.d.unknown_atoms = 0;
+    it.d.countdown_atoms = 0;
     it.arc_capture = widen;
     // Left over by a trace that failed part-way.
     it.raised.clear();

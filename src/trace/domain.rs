@@ -220,6 +220,11 @@ pub trait Domain {
         false
     }
 
+    /// The next comparisons read a COUNTDOWN (the interpreter's hint, from
+    /// the field read: `COUNTDOWN_FIELDS`): an unknown number there mints a
+    /// countdown atom (`COUNTDOWN_ATOMS`), not a fruit's.
+    fn set_countdown_hint(&mut self, _on: bool) {}
+
     /// `__split_by_flr` of a literal interval: its integer fragments, run as
     /// separate trace states and rejoined when the call returns. `None`: an
     /// ordinary per-lane fork.
@@ -345,6 +350,19 @@ impl Domain for Concrete {
 
 // ---------------------------------------------------------------- symbolic
 
+/// Atom ids from here up are COUNTDOWN atoms (`Symbolic::countdown_atom`);
+/// `u32::MAX` stays the shared output unknown.
+pub const COUNTDOWN_ATOMS: u32 = 1 << 30;
+
+fn is_countdown_atom(k: u32) -> bool {
+    (COUNTDOWN_ATOMS..u32::MAX).contains(&k)
+}
+
+/// The fields the cart counts down and compares with 0, a near level's
+/// unknown numbers (`widen::floor_timer_paths`, `widen::phase_paths`): a
+/// comparison reading one is a countdown's (`Domain::set_countdown_hint`).
+pub const COUNTDOWN_FIELDS: [&str; 4] = ["delay", "timer", "hide_in", "hide_for"];
+
 /// The tracing domain. Owns the graph it is building.
 #[derive(Default, Clone)]
 pub struct Symbolic {
@@ -366,6 +384,10 @@ pub struct Symbolic {
     pub platforms_unknown: bool,
     /// How many `Op::UnknownBool` atoms this frame handed out.
     pub unknown_atoms: u32,
+    /// How many COUNTDOWN atoms this frame handed out (`COUNTDOWN_ATOMS`).
+    pub countdown_atoms: u32,
+    /// `Domain::set_countdown_hint`.
+    countdown_hint: bool,
     /// `escaped_atom`'s memo, cleared with `unknown_atoms` (ids restart).
     pub escaped: rustc_hash::FxHashMap<NodeId, NodeId>,
     /// What each `both_values` fork was made for, for the kernel dump.
@@ -384,6 +406,8 @@ pub struct Symbolic {
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// `reads_unknown_atom`'s memo: structural, like `lane_memo`.
     atom_memo: rustc_hash::FxHashMap<NodeId, bool>,
+    /// `countdown_only`'s memo, structural too.
+    countdown_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// Fork choices handed out THIS FRAME by `(value, kind)`: a second fork
     /// of one value reuses the first's choice instead of an empty dimension.
     /// Cleared with `forks`.
@@ -799,7 +823,50 @@ impl Symbolic {
     pub fn unknown_bool_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;
+        assert!(k < COUNTDOWN_ATOMS, "atom ids ran into the countdown range");
         self.graph.leaf(Op::UnknownBool(k))
+    }
+
+    /// A countdown's comparison with the unknown number: an atom that stays
+    /// THREE-VALUED, as at a near level without unknowns (merges select on
+    /// it, the split pass splits what a row stores, an escape is no fork),
+    /// where a fruit's atom refuses merges (`reads_unknown_atom`). Room
+    /// (3,0) at `r0sxhfn`: the 12 floors' `delay <= 0` as fruit atoms kept
+    /// every floor's two paths apart, 2^13 trace states after the spawn
+    /// frame's `foreach`.
+    fn countdown_atom(&mut self) -> NodeId {
+        let k = COUNTDOWN_ATOMS + self.countdown_atoms;
+        self.countdown_atoms += 1;
+        assert!(k < u32::MAX, "countdown atom ids exhausted");
+        self.graph.leaf(Op::UnknownBool(k))
+    }
+
+    /// Does `c` read countdown atoms and no other (`reads_unknown_atom`)?
+    fn countdown_only(&mut self, c: NodeId) -> bool {
+        if self.reads_unknown_atom(&c) {
+            return false;
+        }
+        let mut stack: Vec<(NodeId, bool)> = vec![(c, false)];
+        while let Some((x, expanded)) = stack.pop() {
+            if self.countdown_memo.contains_key(&x) {
+                continue;
+            }
+            let node = self.graph.get(x);
+            if node.args.is_empty() {
+                let atom = matches!(node.op, Op::UnknownBool(k) if is_countdown_atom(k));
+                self.countdown_memo.insert(x, atom);
+                continue;
+            }
+            let args = node.args.clone();
+            if expanded {
+                let r = args.iter().any(|a| self.countdown_memo[a]);
+                self.countdown_memo.insert(x, r);
+            } else {
+                stack.push((x, true));
+                stack.extend(args.iter().filter(|a| !self.countdown_memo.contains_key(a)).map(|a| (*a, false)));
+            }
+        }
+        self.countdown_memo[&c]
     }
 
     /// Does no lane's data reach `n` - no input cell or fork?
@@ -986,7 +1053,7 @@ impl Domain for Symbolic {
         }
         // With an unknown number nothing is decided.
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
-            return Ok(self.unknown_bool_atom());
+            return Ok(if self.countdown_hint { self.countdown_atom() } else { self.unknown_bool_atom() });
         }
         if let Some((c, t, f)) = self.unknown_select(*a) {
             let (x, y) = (self.compare(op, &t, b)?, self.compare(op, &f, b)?);
@@ -1180,7 +1247,7 @@ impl Domain for Symbolic {
     }
 
     fn join_num_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
-        if !self.unknowns() || self.decide(c).is_some() || !self.lane_independent(*c) {
+        if !self.unknowns() || self.decide(c).is_some() || !self.lane_independent(*c) || self.countdown_only(*c) {
             return None;
         }
         if t == f {
@@ -1217,7 +1284,7 @@ impl Domain for Symbolic {
             }
             let node = self.graph.get(x);
             if matches!(node.op, Op::UnknownBool(_)) || node.args.is_empty() {
-                let atom = matches!(node.op, Op::UnknownBool(_));
+                let atom = matches!(node.op, Op::UnknownBool(k) if !is_countdown_atom(k));
                 self.atom_memo.insert(x, atom);
                 continue;
             }
@@ -1233,8 +1300,12 @@ impl Domain for Symbolic {
         self.atom_memo[c]
     }
 
+    fn set_countdown_hint(&mut self, on: bool) {
+        self.countdown_hint = on;
+    }
+
     fn join_bool_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
-        if !self.unknowns() || self.decide(c).is_some() || !self.lane_independent(*c) {
+        if !self.unknowns() || self.decide(c).is_some() || !self.lane_independent(*c) || self.countdown_only(*c) {
             return None;
         }
         if t == f {
@@ -1276,7 +1347,7 @@ impl Domain for Symbolic {
         // The atoms of this call that `b` reads.
         let atoms: Vec<NodeId> = crate::trace::verify::cone(&self.graph, &[*b])
             .into_iter()
-            .filter(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(k) if k >= since && k != u32::MAX))
+            .filter(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(k) if k >= since && k != u32::MAX && !is_countdown_atom(k)))
             .collect();
         if atoms.is_empty() {
             return None;
