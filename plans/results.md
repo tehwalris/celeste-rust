@@ -247,6 +247,10 @@ Where the two give different start states, a submittable witness must exit
 in both. `check_uploads` requires both, and the runner searches Celia's class
 too. Which convention the database verifies with (Celia's IL, or a
 full-game playback) is a question for the community.
+**Decision (Philippe, 2026-10-08): Celia should be FIXED** (upstream: count
+the objects real play leaves, not the room's original count). Parked until
+one of our results actually passes one convention and fails the other, or
+the project's cleanup phase. Until then both must pass.
 - gemskipany and gemskipnodiag: every upload is VALID. The gemskipany boot
   chain breaks at the database's own 2600m, which dies on PICO-8 in every
   mode but finishes in UCT and Celia (they compute in doubles). Past it the
