@@ -788,3 +788,68 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     if std::env::var_os("BENCH_NOCHECK").is_some() { return; }
     check(mode, &pd, &edges, n_door, &|m| old_ids.contains(&m), false);
 }
+
+/// `bitintern`: `bits` with the 128-bit spd.y mask INTERNED - a directory
+/// entry is (high digits, id of a shared mask); the room's distinct masks
+/// (~80k at f57) sit in one small table, hash-consed on insert.
+pub fn run_intern(dir: &str, n_door: usize) {
+    let t = std::time::Instant::now();
+    let pd = format!("{dir}/prep");
+    let map = |f: &str| unsafe { memmap2::Mmap::map(&std::fs::File::open(format!("{pd}/{f}")).unwrap()).unwrap() };
+    let (qm, dm, pm, sm, dsm) = (map("qb.bin"), map("d.bin"), map("pcnt.bin"), map("dshard.bin"), map("db.bin"));
+    let qs: &[QB] = crate::from_bytes(&qm); let ds: &[u32] = crate::from_bytes(&dm); let pcnt: &[u64] = crate::from_bytes(&pm);
+    let dsh: &[u32] = crate::from_bytes(&sm); let db: &[(u32, u32)] = crate::from_bytes(&dsm);
+    let n_src: usize = std::fs::read_to_string(format!("{pd}/nsrc.txt")).unwrap().trim().parse().unwrap();
+    let mut off: Vec<(u32, u32)> = Vec::with_capacity(pcnt.len());
+    let mut total = 0u64;
+    for &c in pcnt { let cap = (2 * c.max(1)).next_power_of_two(); off.push((total as u32, (cap - 1) as u32)); total += cap; }
+    assert!(total * 128 < 1 << 32);
+    #[repr(C)] #[derive(Clone, Copy)] struct E { hk: u32, set: u32 }
+    let mut tab: Vec<E> = vec![E { hk: 0, set: 0 }; total as usize];
+    let mut masks: Vec<u128> = vec![0];
+    let mut intern: FxHashMap<u128, u32> = FxHashMap::default();
+    intern.insert(0, 0);
+    macro_rules! probe { ($sh:expr, $hk:expr) => {{
+        let (b, m) = off[$sh as usize];
+        let mut s = slot_of($hk, (b, m));
+        loop { let e = &mut tab[s as usize]; if e.hk == $hk { break; } if e.hk == 0 { e.hk = $hk; break; } s = b + ((s - b + 1) & m); }
+        s
+    }}; }
+    // The door: each entry's mask, then interned.
+    let mut acc: Vec<u128> = vec![0; total as usize];
+    let mut old_ids: FxHashSet<u32> = FxHashSet::default();
+    for i in 0..n_door { let (h, l) = db[i]; let s = probe!(dsh[i], h + 1); acc[s as usize] |= 1u128 << l; old_ids.insert(s << 7 | l); }
+    for (s, m) in acc.iter().enumerate() { if *m != 0 { let n = masks.len() as u32; let id = *intern.entry(*m).or_insert_with(|| { masks.push(*m); n }); tab[s].set = id; } }
+    drop(acc);
+    let n_old_masks = masks.len();
+    let mem = total as f64 * 8.0;
+    eprintln!("[bitintern] setup {:.1} s: directory {total} slots x 8 B = {:.2} GB; {n_old_masks} distinct masks at the frame start ({:.1} MB)", t.elapsed().as_secs_f64(), mem / 1e9, n_old_masks as f64 * 16.0 / 1e6);
+    let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * crate::PAYLOAD);
+    let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qs.len());
+    let mut dropmin: Vec<u32> = vec![u32::MAX; n_src];
+    crate::perf_on(true);
+    let t = std::time::Instant::now();
+    for &d in ds { let m = &mut dropmin[d as usize]; *m = (*m).min(1); }
+    let t_drops = t.elapsed().as_secs_f64();
+    let mut nw = 0u64;
+    for q in qs {
+        let s = probe!(q.shard, q.high + 1);
+        let e = &mut tab[s as usize];
+        let m = masks[e.set as usize];
+        let b = 1u128 << q.low;
+        if m & b == 0 {
+            let nm = m | b;
+            let n = masks.len() as u32;
+            e.set = *intern.entry(nm).or_insert_with(|| { masks.push(nm); n });
+            nw += 1; frontier.extend_from_slice(&[0u8; crate::PAYLOAD]);
+        }
+        edges.push((q.src, s << 7 | q.low, q.xfer));
+    }
+    let dt = t.elapsed().as_secs_f64();
+    crate::perf_on(false);
+    std::hint::black_box((&frontier, &dropmin));
+    eprintln!("[bitintern] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {nw} ({}), {:.1} ns per query; directory {:.2} GB + masks {} ({:.1} MB) at the frame end",
+        if nw == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qs.len() as f64, mem / 1e9, masks.len(), masks.len() as f64 * 16.0 / 1e6);
+    if std::env::var_os("BENCH_NOCHECK").is_some() { return; }
+    check("bitintern", &pd, &edges, n_door, &|m| old_ids.contains(&m), false);
+}

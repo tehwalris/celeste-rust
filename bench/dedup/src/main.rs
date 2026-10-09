@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 mod bits;
+mod structure;
 
 const REC: usize = 48;
 const PAYLOAD: usize = 64;
@@ -30,6 +31,7 @@ extern "C" { fn prctl(option: i32, ...) -> i32; }
 /// With `PERF_CTL=FIFO` (perf stat -D -1 --control fifo:FIFO), the counters
 /// are switched by perf itself.
 pub fn perf_on(on: bool) {
+    if on { if let Ok(r) = std::fs::read_to_string("/proc/self/smaps_rollup") { eprintln!("[mem] {}", r.lines().filter(|l| l.starts_with("Rss") || l.starts_with("AnonHugePages")).map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(", ")); } }
     unsafe { prctl(if on { 32 } else { 31 }, 0, 0, 0, 0); }
     if let Some(p) = std::env::var_os("PERF_CTL") {
         use std::io::Write;
@@ -47,6 +49,8 @@ fn main() {
     if variant == "splits" { return bits::splits(dir); }
     if variant == "packtime" { return bits::pack_time(dir); }
     if variant == "cellcensus" { return bits::cell_census(dir); }
+    if variant == "structure" { return structure::structure(dir); }
+    if variant == "sharing" { return structure::sharing(dir); }
     let t0 = Instant::now();
     // Inputs, mapped.
     let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with('w')).collect();
@@ -79,6 +83,7 @@ fn main() {
         "prepbits" => bits::prep_bits(dir, &door),
         "bits" => bits::run_bits(dir, door.len() / 40, false),
         "bitsr" => bits::run_bits(dir, door.len() / 40, true),
+        "bitintern" => bits::run_intern(dir, door.len() / 40),
         "bitcell" | "bitspd" | "bitspd2" => bits::run_words(dir, door.len() / 40, variant),
         other => panic!("unknown variant {other}"),
     }
