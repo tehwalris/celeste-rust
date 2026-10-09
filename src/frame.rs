@@ -1697,6 +1697,25 @@ pub fn forward_frame(
         "frame {frame} at {level}: the platform worlds cover {} frames",
         crate::trace::kernel::PLATFORM_WORLD_FRAMES
     );
+    if let Some(d) = crate::capture::dir() {
+        std::fs::create_dir_all(d)?;
+        let n = door.dump(&std::path::Path::new(d).join("door.bin"))?;
+        {
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(std::fs::File::create(std::path::Path::new(d).join("src.bin"))?);
+            for b in &frontier {
+                let cells = b.positions()?;
+                for (l, c) in cells.iter().enumerate() {
+                    let id = b.ids.get(l).copied().unwrap_or(0);
+                    w.write_all(&id.to_le_bytes())?;
+                    w.write_all(&c.to_le_bytes())?;
+                    w.write_all(&b.rt2().shape_hash.to_le_bytes())?;
+                }
+            }
+            w.flush()?;
+        }
+        eprintln!("[capture] f{frame}: door {n} entries -> {d}/door.bin");
+    }
     let t_warm = Instant::now();
     engine.warm();
     if let Some(m) = filters.minus_one {
@@ -1771,10 +1790,12 @@ pub fn forward_frame(
                         // rows after the cache). Its refs stay valid across
                         // calls: queued rows carry a generation, flushed ones an id.
                         sink.seen.clear();
+                        crate::capture::record(u as u64, (bi as u64, (hi - lo) as u64), 0, 0, 0, 2);
                         let t_unit = phases::start();
                         engine.run(b, &cells[bi], &order[bi][lo..hi], &mut sink)?;
                         phases::add(phases::UNIT, t_unit);
                     }
+                    crate::capture::flush();
                     let t_fin = phases::start();
                     let pieces = sink.finish()?;
                     phases::add(phases::FINISH, t_fin);

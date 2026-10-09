@@ -497,6 +497,7 @@ impl AsmKernel {
                     couts[i] = cout;
                     if let Some(from) = sink.minus_one_drop(template.union.shape_hash, cout) {
                         take &= !(1 << i);
+                        crate::capture::record(sink.ids_in.map_or(0, |ids| ids[lanes[i]]), (0, 0), template.union.shape_hash, cout, 0, 1);
                         let cin = cell_in[lanes[i]];
                         if sink.edges_on && last_edge != (cin, cout) {
                             last_edge = (cin, cout);
@@ -529,6 +530,7 @@ impl AsmKernel {
                         }
                         None => 0,
                     };
+                    crate::capture::record(sink.ids_in.map_or(0, |ids| ids[lanes[i]]), key, template.union.shape_hash, couts[i], xfer, 0);
                     // EMISSION-TIME PROVENANCE: the pos-graph and backward
                     // edges from lane `i` are recorded right here.
                     if let Some((first_cin, r)) = sink.seen.insert_ref(key, cin, 0) {

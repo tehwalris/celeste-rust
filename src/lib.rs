@@ -1,6 +1,7 @@
 
 pub mod abstraction;
 pub mod canon;
+pub mod capture;
 pub mod compiled;
 pub mod frame;
 pub mod game_runner;

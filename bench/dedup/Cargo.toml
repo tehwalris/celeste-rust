@@ -1,0 +1,15 @@
+[package]
+name = "dedup-bench"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone: not a member of the parent workspace.
+[workspace]
+
+[dependencies]
+memmap2 = "0.9"
+rustc-hash = "2"
+
+[profile.release]
+debug = true
+codegen-units = 1

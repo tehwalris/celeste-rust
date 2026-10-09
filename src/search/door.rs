@@ -176,6 +176,28 @@ pub struct Door {
 }
 
 impl Door {
+    /// DIAGNOSTIC (`capture`): every entry as `(shape, cell, key, id)`.
+    pub fn dump(&self, path: &std::path::Path) -> std::io::Result<u64> {
+        use std::io::Write;
+        let mut w = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(path)?);
+        let mut n = 0u64;
+        for ((shape, cell), sh) in self.shards.read().expect("door").iter() {
+            let sh = sh.lock().expect("door shard");
+            for (k, id) in sh.base.iter().copied().chain(sh.delta.iter().map(|(k, id)| (*k, *id))) {
+                let mut b = [0u8; 40];
+                b[0..8].copy_from_slice(&shape.to_le_bytes());
+                b[8..12].copy_from_slice(&cell.to_le_bytes());
+                b[16..24].copy_from_slice(&k.0.to_le_bytes());
+                b[24..32].copy_from_slice(&k.1.to_le_bytes());
+                b[32..40].copy_from_slice(&id.to_le_bytes());
+                w.write_all(&b)?;
+                n += 1;
+            }
+        }
+        w.flush()?;
+        Ok(n)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
