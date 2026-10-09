@@ -48,6 +48,53 @@ struct AsmBody {
     pos: Option<[PosSrc; 4]>,
     /// The transfer roots (`search::arc_edges`).
     arc: ArcSlots,
+    /// Earlier bodies of the same outcome one fork away, with the root
+    /// slots whose equality makes a lane's emission theirs (`DupRef`).
+    dup_refs: Vec<DupRef>,
+}
+
+/// An earlier body `body` and the (its slot, my slot, kind) pairs that
+/// differ in slot: every root the emission reads (stored fields, key
+/// fields, position sources, transfer roots). Equal on a lane in all of
+/// them, the two bodies emit the identical row, edge and transfer.
+struct DupRef {
+    body: usize,
+    pairs: Vec<(usize, usize, RootKind)>,
+}
+
+impl DupRef {
+    /// The lanes of `cand` on which every pair is equal.
+    #[inline]
+    fn eq_mask(&self, buf: &[u8], cand: u16) -> u16 {
+        let block = |o: usize| -> [u32; 16] {
+            let b: &[u8; 64] = buf[o..o + 64].try_into().unwrap();
+            std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
+        };
+        let eq16 = |a: usize, b: usize| -> u16 {
+            let (x, y) = (block(a), block(b));
+            let mut m = 0u16;
+            for i in 0..16 {
+                m |= ((x[i] == y[i]) as u16) << i;
+            }
+            m
+        };
+        let mut m = cand;
+        for &(a, b, kind) in &self.pairs {
+            m &= match kind {
+                RootKind::Num => eq16(a, b),
+                RootKind::Ival => eq16(a, b) & eq16(a + 64, b + 64),
+                RootKind::Bool => {
+                    let w = |o: usize| (u16::from_le_bytes([buf[o], buf[o + 1]]), u16::from_le_bytes([buf[o + 2], buf[o + 3]]));
+                    let ((va, ka), (vb, kb)) = (w(a), w(b));
+                    !((va ^ vb) | (ka ^ kb))
+                }
+            };
+            if m == 0 {
+                break;
+            }
+        }
+        m
+    }
 }
 
 /// A body's transfer roots (`FrameOut::arc`): per axis took, pre, frag, ox,
@@ -346,7 +393,7 @@ impl AsmKernel {
         let ctx = AsmCtx::new(&env as *const CollisionEnv as *const c_void);
         // Per-thread reused buffers: a fresh allocation faults every page.
         let mut sc = Scratch::take(self);
-        let Scratch { inbuf, outbuf, .. } = &mut sc;
+        let Scratch { inbuf, outbuf, took, .. } = &mut sc;
         let body_cols = &self.body_cols;
 
         // Utilization tallies, folded into `CALL_STATS[3..]` at the end.
@@ -382,7 +429,7 @@ impl AsmKernel {
             let t_emit = crate::frame::phases::add(crate::frame::phases::KERNEL, t_ph);
             let flush_before = sink.flush_ticks;
             let valid = (((1u32 << n) - 1) as u16) & only;
-            for (body, cols) in self.bodies.iter().zip(body_cols) {
+            for (bi, (body, cols)) in self.bodies.iter().zip(body_cols).enumerate() {
                 // Tri-state masks, each read where it MAY hold.
                 let error = read_zb_may(outbuf, body.error_off);
                 let live = read_zb_may(outbuf, body.live_off);
@@ -429,6 +476,21 @@ impl AsmKernel {
                     return false;
                 }
                 let mut take = live & !error & valid & !skip;
+                // A lane whose emission equals an earlier body's (same
+                // outcome, every stored root and transfer root equal) is
+                // that body's emission again: skip it (`DupRef`).
+                took[bi] = take;
+                if take != 0 {
+                    for r in &body.dup_refs {
+                        let cand = take & took[r.body];
+                        if cand != 0 {
+                            take &= !(cand & r.eq_mask(outbuf, cand));
+                            if take == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
                 n_bodies += 1;
                 if take == 0 {
                     continue;
@@ -745,6 +807,8 @@ struct Scratch {
     kernel: usize,
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
+    /// Per body, the lanes it took this slice before `dup_refs` masking.
+    took: Vec<u16>,
 }
 
 thread_local! {
@@ -763,6 +827,7 @@ impl Scratch {
                     kernel: id,
                     inbuf: vec![0u8; k.compiled.input_bytes as usize],
                     outbuf: vec![0u8; k.compiled.out_bytes as usize],
+                    took: vec![0u16; k.bodies.len()],
                 },
             }
         })
@@ -1377,6 +1442,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
             key_fields,
             pos: None,
             arc,
+            dup_refs: Vec::new(),
         });
         off += b.roots.len();
     }
@@ -1387,6 +1453,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
     for b in asm_bodies.iter_mut() {
         b.pos = pos_sources(&acc_templates[b.outcome].build(), &b.fields)?;
     }
+    dup_refs(&mut asm_bodies);
 
     let input_names = compiled
         .input_cells
@@ -1416,6 +1483,60 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
             input_names,
         },
     ))
+}
+
+/// Every body's `dup_refs`: the earlier bodies of its outcome whose fork
+/// configuration differs from its own in exactly one fork. Every root slot
+/// is compared (fields, so whatever the union stores; key fields and
+/// position sources are fields); a pair of kinds that differ is no ref.
+fn dup_refs(bodies: &mut [AsmBody]) {
+    let n = bodies.len();
+    for j in 0..n {
+        let mut refs = Vec::new();
+        for i in 0..j {
+            let (a, b) = (&bodies[i], &bodies[j]);
+            if a.outcome != b.outcome || a.splits.len() != b.splits.len() || a.arc.fin != b.arc.fin {
+                continue;
+            }
+            if a.splits.iter().zip(&b.splits).filter(|(x, y)| x != y).count() != 1 {
+                continue;
+            }
+            assert_eq!(a.fields.len(), b.fields.len(), "two bodies of one outcome");
+            let mut pairs: Vec<(usize, usize, RootKind)> = Vec::new();
+            let mut ok = true;
+            for (fa, fb) in a.fields.iter().zip(&b.fields) {
+                assert_eq!(fa.cell, fb.cell, "two bodies of one outcome");
+                // The kinds, and the undecided-boolean guard (`may_unknown`),
+                // must agree: a masked lane skips its own body's push.
+                if fa.kind != fb.kind || fa.may_unknown != fb.may_unknown {
+                    ok = false;
+                    break;
+                }
+                if fa.off != fb.off {
+                    pairs.push((fa.off, fb.off, fa.kind));
+                }
+            }
+            for k in 0..a.arc.roots.len() {
+                if !a.arc.fin && k % crate::trace::verify::ARC_AXIS_ROOTS == 4 {
+                    continue;
+                }
+                let ((oa, ka), (ob, kb)) = (a.arc.roots[k], b.arc.roots[k]);
+                if ka != kb {
+                    ok = false;
+                    break;
+                }
+                if oa != ob {
+                    pairs.push((oa, ob, ka));
+                }
+            }
+            if ok {
+                pairs.sort_unstable_by_key(|p| (p.0, p.1));
+                pairs.dedup_by_key(|p| (p.0, p.1));
+                refs.push(DupRef { body: i, pairs });
+            }
+        }
+        bodies[j].dup_refs = refs;
+    }
 }
 
 /// Where a body's rows get player and room `x`/`y`; `None` (`NO_CELL`)
