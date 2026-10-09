@@ -39,7 +39,7 @@ is the optimum.
 | (2,2) | 1900m | 107 | 131 | 131 (107f), tie | 131 | tie, verified | overnight, 709 s, 44 GB |
 | (6,2) | 2300m | 68 | 94 | **93 (67f), -1** | real-play start (J 2): `r0sxhf,r0sxh`: 89, 93 | OPTIMAL (real-play start), VALID in IL, UCT, Celia, the chain and the boot chain | 2026-10-08, 27:20, 31.8 GB (e50c575); the earlier 89 (63f) held only from an IL load and is withdrawn (tas/invalid) |
 | (0,3) | 2500m | 108 | 134 | 134 (108f), tie | `r0sxhn,r0sxh`: 134 | tie, verified | 2452 s, 42.3 GB |
-| (1,3) | 2600m | 137 | 163 | **161 (135f), -2** | `r0sxhn,r0sxh`: 161 | OPTIMAL, verified (chest seed 0.5) | overnight, 527 s, 34 GB |
+| (1,3) | 2600m | 137 | 163 | **161 (135f), -2** | `r0sxhn,r0sxh`: 161; real-play start (J 6, class {6, 7, 8}): 161, 161 | OPTIMAL under the real-play start, VALID in IL, UCT, Celia, the chain and the boot chain (chest seed 0.5) | overnight, 527 s, 34 GB; 2026-10-09 real play 485 s, 31.5 GB (`/var/tmp/night2`) |
 | (3,3) | 2800m | 137 | 187 | 187 (137f), tie | 187 | tie, verified | overnight, 502 s |
 | (4,3) | 2900m | 79 | 109 | 109 (79f), tie | `r0sxhn,r0sxh`: 106, 107 | tie, verified | 2768 s, 26.4 GB |
 | (5,3) | 3000m | 82 | 114 | 114 (82f), tie | 102, 114 | tie, verified | overnight, 5581 s, 75 GB |
