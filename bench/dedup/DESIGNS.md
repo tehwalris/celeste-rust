@@ -406,3 +406,46 @@ frame's regions, so (src region, rank) is already canonical.
 
 Quiet run left for later: /var/tmp/emitcap/regionbatch/bench.sh (cpu 4,
 perf stat --control over the timed loops, interleaved with bits).
+
+### J2. regionbatch on all cores (`regionpar`; 2026-10-09, quiet: load 1.6-3.7)
+
+regionpar R fmt T:sched:split...: the J pipeline (decode, open-addressing
+in-core table, re-encode), dedup only, specialized per mask width (8x8: a u64 mask, 16-B table
+entries; J used 80-B entries for both, hence 0.57 s here against 0.97 s).
+Untimed and reported apart: grouping + loading every region's at-rest bytes
+and its batch (8-B (key, pos) entries) 11 s; building the units (heavy
+regions split by a hash of the key into disjoint sub-batches, each with the
+matching subset of the stored entries) 1-16 s; per-thread scratch prefaulted
+to the largest unit (10-48 MB a thread, 0.05-0.16 s). Nothing in the timed
+section allocates; the decision bits are pre-touched. Units heaviest first,
+taken by an atomic index (steal) or assigned up front (static, LPT). Pinned:
+1 thread cpu 4; 8 = cpus 0-7 (the V-cache CCD); 16 = 0-15; 32 = 0-31 (SMT).
+Every run: 6,735,699 new, 0 decision mismatches, fingerprint 51e2f3ecb444e25d.
+
+Wall, 3 interleaved reps (8x8 varint / 8x8 varint+zstd -1 / 16x16 varint):
+
+| threads | no split | split 1M lookups | split 0.5M |
+|---|---|---|---|
+| 1 | 0.568-0.570 / 0.601-0.604 / 0.578-0.579 s | - | - |
+| 8 | 0.085-0.086 / 0.089 / 0.136-0.137 | 0.078-0.079 / 0.085-0.086 / 0.074 | - |
+| 16 | 0.078-0.081 / 0.082-0.094 / 0.152-0.154 | **0.057-0.058** / 0.059-0.060 / 0.064 | - |
+| 32 | 0.094-0.097 / 0.096-0.107 / 0.152-0.155 | 0.064-0.067 / 0.067-0.068 / 0.074-0.076 | 0.059 / 0.061-0.063 / 0.065-0.066 |
+
+Speedup (8x8 varint, best split): 7.2x at 8, 10x at 16, 9.6x at 32 threads.
+- Critical path without a split = the heaviest region (15.1M lookups at 8x8:
+  32 ms alone, 47 ms at 8 threads, 78-96 ms at 16-32 with the others
+  running); 32 threads idle 27-35% (8x8), 67-70% (16x16). Splitting by key
+  hash fixes it: idle 1-6% (steal). Static LPT: 22-31% idle at 32.
+- Busy time grows with threads (sum 0.57 s at 1, 0.63 at 8, 0.90 at 16, 1.8-2.0
+  at 32): bandwidth. System-wide DRAM (amd_umc CAS x 64 B) over the timed
+  part: 1 thread 2.67 GB in 0.567 s; 8 threads 2.34 GB in 78 ms (30 GB/s);
+  16 threads 2.53 GB in 58 ms (**44 GB/s**, the measured DRAM ceiling); 32
+  threads 2.54 GB in 60 ms. The traffic is the batch stream itself (257.7M x
+  8 B = 2.06 GB) + the at-rest sets: the region work is in-cache, the frame
+  is bound by streaming its lookups once. zstd -1 at rest costs +3-5%.
+- Partition cost (NOT measured, mental estimate): writing the 257.7M lookups
+  into region batches = another 2.06 GB write + read at ~40 GB/s = ~0.1 s,
+  unless the kernel's emissions go straight into per-region buffers. A
+  pre-dedup of the emissions (G, the unit cache, 8x) would shrink the batch
+  stream, the bound here, by the same factor.
+Script: /var/tmp/emitcap/regionpar/bench.sh; log reps.log next to it.

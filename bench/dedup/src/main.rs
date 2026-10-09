@@ -13,6 +13,7 @@ mod bits;
 mod structure;
 mod posregion;
 mod regionbatch;
+mod regionpar;
 
 const REC: usize = 48;
 const PAYLOAD: usize = 64;
@@ -87,6 +88,7 @@ fn main() {
         "bits" => bits::run_bits(dir, door.len() / 40, false),
         "bitsr" => bits::run_bits(dir, door.len() / 40, true),
         "regionbatch8" | "regionbatch16" => regionbatch::regionbatch(dir, door.len() / 40, variant[11..].parse().unwrap(), args.get(3).map_or("merge,hash", |s| s.as_str()), args.get(4).is_some_and(|s| s == "ids")),
+        "regionpar" => regionpar::regionpar(dir, door.len() / 40, &args[3..]),
         "bitintern" => bits::run_intern(dir, door.len() / 40),
         "bitcell" | "bitspd" | "bitspd2" | "posmask4" | "posmask8" => bits::run_words(dir, door.len() / 40, variant),
         other => panic!("unknown variant {other}"),
