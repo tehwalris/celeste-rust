@@ -206,6 +206,15 @@ impl Door {
         Door { shards: RwLock::new(shards) }
     }
 
+    /// BENCH ADDITION (verification only): every entry, base and delta.
+    pub fn for_each_entry(&self, mut f: impl FnMut(&Key, u64)) {
+        for s in self.shards.read().expect("door").values() {
+            let s = s.lock().expect("door shard");
+            s.base.iter().for_each(|e| f(&e.0, e.1));
+            s.delta.iter().for_each(|(k, &id)| f(k, id));
+        }
+    }
+
     fn shard(&self, shape: u64, cell: u32) -> Arc<Mutex<Shard>> {
         if let Some(s) = self.shards.read().expect("door").get(&(shape, cell)) {
             return s.clone();

@@ -195,3 +195,94 @@ fingerprint 51e2f3ecb444e25d, exhaustive decision + id check 0 violations.
 Production would need each cell's spd.y dictionary (or an append-only per-cell
 one assigned on first sight, itself a lookup per emission), and the room's
 flag/dash/spd.x value sets in advance or a fatal guard on a new value.
+
+## Sweep front (`sweep`, src/bin/sweep; 2026-10-09)
+
+Approach #2, doing what `vprod` does, multithreaded, from the same capture.
+
+**The work** (per frame, all of it timed): every emission (257.7M lookups +
+254.1M level -1 drops) checks the level -1 table (a dense per-(shape, cell)
+`from` array, not production's FxHashMap); a drop notes its source's min
+`from`; every lookup writes an EDGE RECORD, 12 B (source row index, target
+id, transfer), staged per thread in L1 and written with non-temporal stores
+into 1M-edge segments of one arena (NOT production's format: vprod writes 16-B
+words varint-coded per 64k chunk to per-(layer, worker) files, 1.19 GB);
+every new state writes its 64-B row ONCE, at its insert, into its thread's
+piece (one NT line; production pushes every non-cached emission's row into a
+queue and gathers the new ones at the flush: here the decision is immediate,
+so the push is the gather); the pos-graph edges per thread behind a
+last-pair cache; and the frame's end.
+
+**The sweep is over SOURCES.** The lookups arrive in source order (the
+kernel emits per source block); a source emits targets within a few cells
+(the per-cell window above), so a front over sources IS a front over targets
+a few cells wide. Sweeping over targets would need design D's partition pass
+(~6 GB more traffic) first. The streams (prep/q.bin, sweep/d2.bin: the drops
+with their target shard, `sweep DIR prep`) are x-major by source cell, cut
+into ~1024-lookup chunks at source boundaries (a source's drops and lookups
+in one chunk, so its drop note has one writer). Threads, pinned one per
+core, claim chunks from ONE atomic counter (`front=shared`): all threads
+stay within ~T chunks of the line, so the live window (7-11 MB of states)
+is one shared L3 working set. `front=ccd`: two counters over two x-bands
+split at equal work, CCD0's threads (cpus 0-7, 16-23; 96 MB L3) on the left
+band and CCD1's (8-15, 24-31; 32 MB) on the right, each L3 holding only its
+band's window; a thread whose band is done steals from the other's front.
+
+**Per chunk:** (1) the drops; (2) scan: the table check, the pos edge, and a
+per-thread 4096-entry direct-mapped cache of recent keys (design G; 64.6% of
+lookups hit it; an in-chunk repeat of a pending miss joins that miss, 9.2%),
+(3) the misses (26%) go to the `Probe` (probe.rs, a trait with a batch
+`resolve`, the hook for dedup-mlp's prefetching probe), (4) rows and edges.
+
+**The table** (probe.rs): v4's (16-B slot: 64-bit fingerprint + id; load
+0.8, 1.25 GB; an exploration as v4 is) or `probe=exact` (v3c's exact 16-B
+keys, 24-B slot, load 0.5). Per-(shape, cell) open addressing, sized from
+cnt.bin as v3c/v4 are. LOOKUPS ARE LOCK-FREE: slots only go empty -> full; a
+slot is published by one Release store of its first word after the rest is
+written, readers Acquire-load it. INSERTS take a per-shard spinlock (own
+64-B line) and re-probe. Why a lock and not owner-only or CAS: inserts are
+2.6% of lookups (6.7M), so the lock is off the hot path (10k races where the
+locked re-probe found another thread's insert); owner-only would need the
+lookups routed to the owner (D's pass) since chunks are claimed
+dynamically; a CAS insert of an exact key needs a 16-B CAS or a
+claim-then-fill protocol readers must wait on.
+
+**Ids and determinism.** A new state gets a provisional id `n_door + thread
+x 2^23 + k` (its row's place in the thread's piece). The frame's end
+(`end_frame`, timed, ~0.09 s at 16 threads): per thread count rows per
+shard, scatter (shard, key) into shard order, sort each shard by key, the
+canonical id = `n_door +` position; the table's ids are rewritten (one owner
+a shard) and a provisional -> canonical map kept for the edges (production's
+`Renumber`). Canonical ids are therefore independent of the scheduling: the
+fingerprint over (source, canonical target id, transfer) is `62aa7f1d56847ad4`
+at 16 and 32 threads, shared and ccd fronts, v4 and exact, with and without
+the cache.
+
+**Validated** (`verify=1`, canon.rs; vprod `VPROD_VERIFY=1` prints the
+same): new 6,735,699; 257,724,013 edges, all distinct; the edge SET over
+(source id, target KEY, transfer) fp `3b4f8b60b8767421`, equal to vprod's;
+drop notes 5,725,599, fp `5bbf9f41b591bd12`, equal to vprod's; level -1
+mismatches 0; every new key's table id is its canonical id. Not compared:
+the pos-graph edge set (191,284 distinct here; vprod only prints a per-worker
+sum).
+
+**Envelope.** Bytes production also moves: the table's touched lines 0.7 GB
+(10.9M targets x 64 B, each once if the window stays in L3), edges 3.09 GB
+(NT, no read-for-ownership), rows 0.43 GB, notes 23 MB: 4.2 GB / 45 GB/s =
+**0.09 s**. The HARNESS adds its input streams, 8.25 GB (q.bin) + 2.03 GB
+(d2.bin) = 10.3 GB, 0.23 s more (production's emissions are in registers):
+**0.32 s floor for this bench**; `read=1` measures it. Latency: 67.7M table
+probes (the cache's misses) at ~40 ns (L3, the window) / (16 threads x 1 in
+flight) = 0.17 s (0.085 s at 32); the 10.9M first touches from DRAM at 100 ns
+/ 16 = 0.07 s; prefetching (MLP 4-8) would divide both.
+
+Smoke timings, NOISY (load 3-7, other agents running; best-of-1, verify
+runs): vprod 16 workers 2.15 s wave + 0.10 s end_frame (in VPROD_VERIFY
+mode); sweep 16 shared 0.62 + 0.09 s; 16 ccd/exact 0.47 + 0.09 s; 32 ccd
+0.39 + 0.09 s; 32 shared without the cache (chunk 256) 0.56 + 0.10 s. Worker
+time at 16 shared: drops 24%, scan 35%, probe 25%, emit 15%. The real
+numbers: /var/tmp/emitcap/sweep/bench.sh (a copy: bench/dedup/sweep-bench.sh)
+when the machine is quiet: interleaved reps of vprod 16 and sweep 16/32 x
+shared/ccd, with phases, AnonHugePages, per-process perf (L2 misses, L3 /
+other-CCD / DRAM fills) and system-wide UMC CAS reads+writes (DRAM bytes;
+needs `sudo modprobe amd_uncore`, done 2026-10-09, not persistent).

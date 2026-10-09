@@ -31,6 +31,8 @@
 //! Usage: vprod CAPTURE_DIR [vprod | vprod1 | vread | vread1] [EDGES_DIR]
 
 mod door;
+#[path = "../../canon.rs"]
+mod canon;
 
 use door::{Admit, Door, Entry, Key};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -342,9 +344,10 @@ fn raw_path(dir: &std::path::Path, frame: u32, layer: u32, worker: u32) -> std::
     dir.join(format!("raw_f{frame:03}")).join(format!("l{:03}_w{:03}.bin", layer, worker))
 }
 
-/// Validation only (`VPROD_VERIFY=1`): every word written, fingerprinted
-/// with its layer, to count the distinct (source, target, transfer).
-static VERIFY: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+/// Validation only (`VPROD_VERIFY=1`): every word written, as (target id,
+/// `canon::sx_hash(source id, transfer)`); after `end_frame` the target id is
+/// replaced by its KEY (the door), so the fingerprint is id-free (canon.rs).
+static VERIFY: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 fn verify_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VPROD_VERIFY").is_ok_and(|v| v == "1"))
@@ -358,7 +361,10 @@ fn write_edges(dir: &std::path::Path, frame: u32, layer: usize, worker: u32, buf
     use std::io::Write;
     if verify_on() {
         let mut v = VERIFY.lock().unwrap();
-        v.extend(buf.iter().map(|&w| mix64(w as u64 ^ mix64((w >> 64) as u64 ^ (layer as u64) << 56))));
+        v.extend(buf.iter().map(|&w| {
+            let (t, s, x) = word_fields(w);
+            ((layer as u64) << 48 | t, canon::sx_hash(((FRAME - 1) as u64) << 48 | s, x))
+        }));
     }
     let path = raw_path(dir, frame, layer as u32, worker);
     std::fs::create_dir_all(path.parent().expect("a raw dir")).unwrap();
@@ -953,6 +959,19 @@ fn worker(sh: &Shared, worker: u32, units: &[&[u8]]) -> Done {
     }
 }
 
+/// Bench harness: perf counters over the wave and `end_frame` only - every
+/// fifo in `PERF_CTL` (comma-separated, `perf stat -D -1 --control fifo:F`).
+fn perf_on(on: bool) {
+    if let Ok(list) = std::env::var("PERF_CTL") {
+        use std::io::Write;
+        for p in list.split(',').filter(|p| !p.is_empty()) {
+            let mut f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.write_all(if on { b"enable\n" } else { b"disable\n" }).unwrap();
+            f.flush().unwrap();
+        }
+    }
+}
+
 fn read_u64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
@@ -1112,6 +1131,7 @@ fn main() {
     let sh = Shared { door: &door, table: &table, notes: &notes, seqs: &seqs, cells_in: &cells_in, edges_dir: &edges_dir, drop_mismatch: &drop_mismatch };
     let workers = if single { 1 } else { maps.len() };
     assert!(single || workers == WORKERS, "16 worker files");
+    perf_on(true);
     let t = Instant::now();
     let done: Vec<Done> = if single {
         // One worker, the units in WAVE order (their indices), as a
@@ -1155,6 +1175,7 @@ fn main() {
     let t = Instant::now();
     door.end_frame(workers, Some(&renumber));
     let t_door = t.elapsed();
+    perf_on(false);
     let (kept, flushes, flushed_rows, emitted, edge_records): (usize, u64, u64, u64, u64) =
         done.iter().fold((0, 0, 0, 0, 0), |a, d| (a.0 + d.kept, a.1 + d.flushes, a.2 + d.flushed_rows, a.3 + d.emitted, a.4 + d.edge_records));
     let pos_edges: usize = done.iter().map(|d| d.edges).sum();
@@ -1173,11 +1194,33 @@ fn main() {
         drop_mismatch.load(Ordering::Relaxed)
     );
     phases::print_phases(t_wave, workers);
+    eprintln!("[mem] AnonHugePages {} MB after the wave", canon::anon_huge_kb() / 1024);
     if verify_on() {
-        let mut v = std::mem::take(&mut *VERIFY.lock().unwrap());
-        let n = v.len();
-        v.sort_unstable();
-        v.dedup();
-        eprintln!("[verify] edge words {n} (want 257724013 = the capture's non-dropped emissions), distinct {} ", v.len());
+        let t = Instant::now();
+        let v = std::mem::take(&mut *VERIFY.lock().unwrap());
+        // Every id the door holds after `end_frame` (old and this frame's) -> its key's hash.
+        let mut key_of: FxHashMap<u64, u64> = FxHashMap::default();
+        key_of.reserve(door.len());
+        door.for_each_entry(|k, id| {
+            key_of.insert(id, canon::key_hash(k.0, k.1));
+        });
+        let per = v.len().div_ceil(16).max(1);
+        let hs: Vec<u64> = std::thread::scope(|s| {
+            let parts: Vec<_> = v.chunks(per).map(|c| { let key_of = &key_of; s.spawn(move || c.iter().map(|&(tid, sx)| canon::edge_hash(sx, *key_of.get(&tid).expect("an edge target the door does not hold"))).collect::<Vec<u64>>()) }).collect();
+            parts.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        drop(v);
+        let (n, distinct, sum) = canon::summarize(hs, 16);
+        let (mut nn, mut nsum) = (0u64, 0u64);
+        for &(start, len, off) in &notes.runs {
+            for i in 0..len {
+                let m = notes.mins[(off + i) as usize].load(Ordering::Relaxed);
+                if m != u32::MAX {
+                    nn += 1;
+                    nsum = nsum.wrapping_add(canon::note_hash(start + i as u64, m));
+                }
+            }
+        }
+        eprintln!("[verify] canon edges {n} (want 257724013) distinct {distinct} fp {sum:016x}; notes {nn} fp {nsum:016x}; {:.1} s", t.elapsed().as_secs_f64());
     }
 }
