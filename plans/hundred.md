@@ -27,7 +27,7 @@ is the optimum.
 |---|---|---|---|---|---|---|---|
 | (0,0) | 100m | 90 | 118 | **115 (87f), -3** | `r0sxhn,r0sxh`: 115 | OPTIMAL, verified | overnight, 1051 s, 10.1 GB |
 | (2,0) | 300m | 103 | 129 | - | `r0sxh` | OPEN: level 0 too big (below) | |
-| (3,0) | 400m | 61 | 89 | 89 (61f), tie | any% optimum 89 is a lower bound | tie, verified | any% witness (takes the fly fruit) |
+| (3,0) | 400m | 61 | 89 | 89 (61f), tie | real-play start (J 3): `r0sxhfn,r0sxhn,r0sxh`, h88 refuted at level 1 (level 0 bound 71) | OPTIMAL (real-play start), tie, verified | 2026-10-09, 1955 s, 27.2 GB (`/var/tmp/night2`); any% witness (takes the fly fruit) |
 | (4,0) | 500m | 123 | 153 | **152 (122f), -1** | `r0sxhn,r0sxh`: 152 | OPTIMAL, verified (chest seed -1, the file's) | overnight, 2855 s, 11.7 GB |
 | (6,0) | 700m | 75 | 99 | - | `r0sxhfp,r0sxh,r0sx` split | OPEN: arc phase out of memory (below) | |
 | (0,1) | 900m | 94 | 122 | 122 (94f), tie | 114, 122 | tie, verified | overnight, 5365 s, 71 GB |
@@ -37,7 +37,7 @@ is the optimum.
 | (6,1) | 1500m | 88 | 114 | 114 (88f), tie | `r0sxhn,r0sxh` split: f112, f113 | tie, verified | 4164 s, 30.5 GB |
 | (0,2) | 1700m | 64 | 90 | 90 (64f), tie | 90 | tie, verified | overnight, 692 s |
 | (2,2) | 1900m | 107 | 131 | 131 (107f), tie | 131 | tie, verified | overnight, 709 s, 44 GB |
-| (6,2) | 2300m | 68 | 94 | **89 (63f), -5** | `r0sxhf,r0sxh`: 89 | OPTIMAL, verified | overnight, 3718 s, 42.7 GB |
+| (6,2) | 2300m | 68 | 94 | **93 (67f), -1** | real-play start (J 2): `r0sxhf,r0sxh`: 89, 93 | OPTIMAL (real-play start), VALID in IL, UCT, Celia, the chain and the boot chain | 2026-10-08, 27:20, 31.8 GB (e50c575); the earlier 89 (63f) held only from an IL load and is withdrawn (tas/invalid) |
 | (0,3) | 2500m | 108 | 134 | 134 (108f), tie | `r0sxhn,r0sxh`: 134 | tie, verified | 2452 s, 42.3 GB |
 | (1,3) | 2600m | 137 | 163 | **161 (135f), -2** | `r0sxhn,r0sxh`: 161 | OPTIMAL, verified (chest seed 0.5) | overnight, 527 s, 34 GB |
 | (3,3) | 2800m | 137 | 187 | 187 (137f), tie | 187 | tie, verified | overnight, 502 s |
@@ -56,6 +56,10 @@ expanded), `CELESTE_TRIM_ROWS=1`, under 55 GB.
 level, so the interval-wrap caveat does not apply) is a lower bound, and
 the any% witness `tas/room_3_0_exit_frame_89.txt` takes the fly fruit: it
 verifies as a 100% run (berry, f89 in the original cart, UCT 62 inputs).
+2026-10-09: rerun under the REAL-PLAY start (`CELESTE_LOADING_JANK=3`, the
+boot chain's J; the start classes {3, 4} are one): `--to 88` refuted at
+level 1 (r0sxhn) after level 0 (r0sxhfn, 8 px regions) - so 89 is the
+optimum of the room as real play enters it, not only a lower bound.
 UPLOAD_400
 
 Every upload starts at the room's prologue (the player's first frame), and
