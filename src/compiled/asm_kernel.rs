@@ -1042,38 +1042,32 @@ impl Registry {
         let Some(grid) = self.grid.filter(|_| !chunk.player_objects(crate::compiled::ids()).is_empty()) else {
             return self.run_key(chunk, None, cell_in, lanes, sink);
         };
-        // Slice by slice in lane order, each slice once per region it holds
-        // (the other lanes masked off), not one call per run of a region: a
-        // unit's cell order changes region every ~12 rows, so per-run calls
-        // left half of every slice empty (room (1,0) f0-f70: 48% padding).
+        // Per 64-lane id group (predecessor records are the group's first id
+        // plus a lane bit), the live lanes bucketed by region, each bucket cut
+        // into slices of 16. Slicing in lane order instead ran every slice
+        // once per region it held: a unit's cell order changes region every
+        // ~12 rows, and room (6,2) 100% f57 executed 53% padding.
         stats([1, 0, 0, 0, 0, 0, 0]);
         let mut lo = lanes.start;
-        let mut idx = [0usize; 16];
-        let mut key = [None; 16];
+        let mut by_region: Vec<(Option<Region>, usize)> = Vec::with_capacity(64);
+        let mut idx: Vec<usize> = Vec::with_capacity(16);
         while lo < lanes.end {
-            // A slice stays in one 64-lane id group (predecessor records are
-            // the group's first id plus a lane bit).
-            let n = 16.min(lanes.end - lo).min(64 - (lo & 63));
-            for i in 0..n {
-                idx[i] = lo + i;
-                key[i] = grid.of_cell(cell_in[lo + i]);
-            }
-            lo += n;
-            if sink.skip_in.is_some_and(|sk| idx[..n].iter().all(|&l| sk[l])) {
-                continue;
-            }
-            let mut done = 0u16;
-            for i in 0..n {
-                if done >> i & 1 != 0 {
-                    continue;
-                }
-                let only = (i..n).filter(|&j| key[j] == key[i]).fold(0u16, |m, j| m | 1 << j);
-                done |= only;
-                let Some(k) = self.kernels.get(&(chunk.shape_hash, key[i])) else {
-                    return self.run_key(chunk, key[i], cell_in, idx[i]..idx[i] + 1, sink);
+            let hi = lanes.end.min((lo & !63) + 64);
+            by_region.clear();
+            by_region.extend((lo..hi).filter(|&l| !sink.skip_in.is_some_and(|sk| sk[l])).map(|l| (grid.of_cell(cell_in[l]), l)));
+            by_region.sort_unstable();
+            lo = hi;
+            for run in by_region.chunk_by(|a, b| a.0 == b.0) {
+                let key = run[0].0;
+                let Some(k) = self.kernels.get(&(chunk.shape_hash, key)) else {
+                    return self.run_key(chunk, key, cell_in, run[0].1..run[0].1 + 1, sink);
                 };
-                if !k.run_slice(chunk, cell_in, &idx[..n], only, sink) {
-                    return false;
+                for part in run.chunks(16) {
+                    idx.clear();
+                    idx.extend(part.iter().map(|&(_, l)| l));
+                    if !k.run_slice(chunk, cell_in, &idx, ((1u32 << idx.len()) - 1) as u16, sink) {
+                        return false;
+                    }
                 }
             }
         }
