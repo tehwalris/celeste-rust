@@ -92,11 +92,17 @@ schedules and against the binary before), plus the gates and the full suite.
    (perf on the live search at f67, the binary before the unit-wide
    slices). Half of that was padding (49% of slice lanes empty at 8 px),
    now 11% (f49: kernel 21.7 -> 7.7 worker-s, wave 3.77 -> 2.08 s). What
-   remains: a slice evaluates every body's nodes, live or not (32% of
-   (body, slice) pairs take a lane there). Evaluating the fork conditions
-   first and skipping body groups no lane reaches would be the structural
-   fix (a codegen change: values live across a skipped region must not
-   move); not started.
+   remains: a slice evaluates every body's nodes, live or not. MEASURED
+   (branch `skip-research`, `CELESTE_SKIP_CENSUS`, sampled slices of both
+   harnesses): 78% (room (3,0)) and 89% (room (6,2)) of bodies have a live
+   lane in a slice, so skipping dead ones saves little - ideally 25% / 31%
+   of kernel instructions, with one guard per outcome 16% / 18%, i.e.
+   ~4.5% / ~1.6% of the frame before guard and spill costs; guards by
+   fork prefix save 0%. (A body's `error` cone must be skipped with it,
+   else ~1%: the emit loop reads `error` only under `live`.) Not worth a
+   codegen change. The real gap is 78-89% live against 44-51% taking a
+   lane: bodies that duplicate a neighbour (the mask drops them after the
+   kernel) - decision 4 would remove them before it.
 
 The compaction's own cost (`rewrite compact-bench` over a frame's raw
 records kept by `CELESTE_KEEP_RAW=1`): f57's 258M records, 2.6 s wall and
