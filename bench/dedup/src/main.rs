@@ -51,6 +51,10 @@ fn main() {
         "v1" => vcell(&maps, &door, &srcf, false),
         "v2" => vcell(&maps, &door, &srcf, true),
         "ages" => ages(&maps, &door),
+        "v3" => v3(&maps, &door, &srcf),
+        "prep" => prep(dir, &maps, &door, &srcf),
+        "v3c" => vq(dir, &door, false),
+        "v4" => vq(dir, &door, true),
         other => panic!("unknown variant {other}"),
     }
 }
@@ -354,4 +358,212 @@ fn ages(maps: &[memmap2::Mmap], door: &[u8]) {
     let total_hits: u64 = hits_by_layer.iter().sum();
     eprintln!("[ages] frame 57: per layer L (age 57-L): states, share touched this frame, share of this frame's old hits");
     for l in 0..64 { if size[l] > 0 { eprintln!("[ages]   L{l:02} age {:2}: {:9} states, {:5.1}% touched, {:5.1}% of hits", 57 - l, size[l], 100.0 * tch[l] as f64 / size[l] as f64, 100.0 * hits_by_layer[l] as f64 / total_hits as f64); } }
+}
+
+
+/// v3: SINGLE-THREADED. Queries in a left-to-right sweep over source cells;
+/// the visited set as one flat open-addressing table per (shape, cell) in
+/// one arena (keys and ids in separate arrays; the key's low bits index).
+fn v3(maps: &[memmap2::Mmap], door: &[u8], srcf: &[u8]) {
+    let t = Instant::now();
+    let n_door = door.len() / 40;
+    let n_src = srcf.len() / 20;
+    let mut src_of: rustc_hash::FxHashMap<u64, (u32, u32)> = rustc_hash::FxHashMap::default();
+    for i in 0..n_src { let id = u64::from_le_bytes(srcf[i * 20..i * 20 + 8].try_into().unwrap()); src_of.insert(id, (i as u32, u32::from_le_bytes(srcf[i * 20 + 8..i * 20 + 12].try_into().unwrap()))); }
+    // Shards: count old entries + this frame's distinct new keys per (shape, cell).
+    let mut dir: rustc_hash::FxHashMap<(u64, u32), u32> = rustc_hash::FxHashMap::default();
+    let mut count: Vec<u64> = Vec::new();
+    let shard = |dir: &mut rustc_hash::FxHashMap<(u64, u32), u32>, count: &mut Vec<u64>, k: (u64, u32)| -> u32 { *dir.entry(k).or_insert_with(|| { count.push(0); (count.len() - 1) as u32 }) };
+    for i in 0..n_door { let b = &door[i * 40..i * 40 + 40]; let s = shard(&mut dir, &mut count, (u64::from_le_bytes(b[0..8].try_into().unwrap()), u32::from_le_bytes(b[8..12].try_into().unwrap()))); count[s as usize] += 1; }
+    // Queries (sweep order) and drops.
+    let mut q: Vec<(u64, u32, u32, u32, u128)> = Vec::with_capacity(260_000_000); // order, shard, src, xfer, key
+    let mut drops_list: Vec<(u64, u32)> = Vec::with_capacity(260_000_000);
+    let mut newkeys: rustc_hash::FxHashSet<u128> = Default::default();
+    for m in maps { for c in m.chunks_exact(REC) {
+        let r = rec(c);
+        if r.flags == 2 { continue; }
+        let (si, scell) = src_of[&r.src];
+        let (x, y) = cell_xy(scell);
+        let order = (((x + 64) as u64) << 48) | (((y + 64) as u64) << 32) | si as u64;
+        if r.flags == 1 { drops_list.push((order, si)); continue; }
+        let s = shard(&mut dir, &mut count, (r.shape, r.cell));
+        if newkeys.insert(r.key) { count[s as usize] += 1; }
+        q.push((order, s, si, r.xfer, r.key));
+    } }
+    q.sort_unstable_by_key(|a| a.0);
+    drops_list.sort_unstable_by_key(|a| a.0);
+    // Compact query stream: (shard u32, src u32, xfer u32, pad, key u128) = 32 B aligned.
+    #[repr(C)] #[derive(Clone, Copy)] struct Q { shard: u32, src: u32, xfer: u32, _p: u32, key: u128 }
+    let qs: Vec<Q> = q.iter().map(|a| Q { shard: a.1, src: a.2, xfer: a.3, _p: 0, key: a.4 }).collect();
+    let ds: Vec<u32> = drops_list.iter().map(|a| a.1).collect();
+    drop(q); drop(drops_list); drop(newkeys);
+    // Arena: per shard capacity = next pow2 >= 2 * count (load <= 0.5).
+    let mut off: Vec<(u64, u64)> = Vec::with_capacity(count.len());
+    let mut total = 0u64;
+    for &c in &count { let cap = (2 * c.max(1)).next_power_of_two(); off.push((total, cap - 1)); total += cap; }
+    let mut keys: Vec<u128> = vec![0; total as usize]; // 0 = empty (keys are hashes; 0 does not occur)
+    let mut ids: Vec<u32> = vec![0; total as usize];
+    let probe_insert = |keys: &mut [u128], ids: &mut [u32], (base, mask): (u64, u64), k: u128, id: u32| -> (u32, bool) {
+        let mut i = (k as u64) & mask;
+        loop {
+            let slot = (base + i) as usize;
+            let kk = keys[slot];
+            if kk == k { return (ids[slot], false); }
+            if kk == 0 { keys[slot] = k; ids[slot] = id; return (id, true); }
+            i = (i + 1) & mask;
+        }
+    };
+    for i in 0..n_door {
+        let b = &door[i * 40..i * 40 + 40];
+        let s = dir[&(u64::from_le_bytes(b[0..8].try_into().unwrap()), u32::from_le_bytes(b[8..12].try_into().unwrap()))];
+        let k = (u64::from_le_bytes(b[16..24].try_into().unwrap()) as u128) | ((u64::from_le_bytes(b[24..32].try_into().unwrap()) as u128) << 64);
+        probe_insert(&mut keys, &mut ids, off[s as usize], k, i as u32);
+    }
+    eprintln!("[v3] setup {:.1} s (untimed): {} shards, arena {} slots ({:.2} GB), {} queries ({:.2} GB), {} drops",
+        t.elapsed().as_secs_f64(), off.len(), total, total as f64 * 20.0 / 1e9, qs.len(), qs.len() as f64 * 32.0 / 1e9, ds.len());
+    // THE TIMED LOOP.
+    let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * PAYLOAD);
+    let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qs.len());
+    let mut dropmin: Vec<u32> = vec![u32::MAX; n_src];
+    let mut next = n_door as u32;
+    let t = Instant::now();
+    for &d in &ds { let m = &mut dropmin[d as usize]; *m = (*m).min(1); }
+    let t_drops = t.elapsed().as_secs_f64();
+    let mut new = 0u64;
+    for qq in &qs {
+        let (id, ins) = probe_insert(&mut keys, &mut ids, off[qq.shard as usize], qq.key, next);
+        if ins { next += 1; new += 1; frontier.extend_from_slice(&[0u8; PAYLOAD]); }
+        edges.push((qq.src, id, qq.xfer));
+    }
+    let dt = t.elapsed().as_secs_f64();
+    std::hint::black_box((&frontier, &edges, &dropmin));
+    eprintln!("[v3] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new states {new} ({}), edges {}; {:.1} ns per query",
+        if new == 6735699 { "OK" } else { "MISMATCH" }, edges.len(), (dt - t_drops) * 1e9 / qs.len() as f64);
+}
+
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Q { shard: u32, src: u32, xfer: u32, _p: u32, key: u128 }
+
+fn as_bytes<T>(v: &[T]) -> &[u8] { unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) } }
+fn from_bytes<T: Copy>(b: &[u8]) -> &[T] { assert_eq!(b.as_ptr() as usize % std::mem::align_of::<T>(), 0); unsafe { std::slice::from_raw_parts(b.as_ptr() as *const T, b.len() / std::mem::size_of::<T>()) } }
+
+/// Prepare the sweep-ordered inputs once: DIR/prep/{q.bin, d.bin, cnt.bin, dshard.bin},
+/// plus the per-STATE live window of the sweep.
+fn prep(dir: &str, maps: &[memmap2::Mmap], door: &[u8], srcf: &[u8]) {
+    let t = Instant::now();
+    let n_door = door.len() / 40;
+    let n_src = srcf.len() / 20;
+    let mut src_of: rustc_hash::FxHashMap<u64, (u32, u32)> = rustc_hash::FxHashMap::default();
+    for i in 0..n_src { let id = u64::from_le_bytes(srcf[i * 20..i * 20 + 8].try_into().unwrap()); src_of.insert(id, (i as u32, u32::from_le_bytes(srcf[i * 20 + 8..i * 20 + 12].try_into().unwrap()))); }
+    let mut dir_: rustc_hash::FxHashMap<(u64, u32), u32> = rustc_hash::FxHashMap::default();
+    let mut count: Vec<u64> = Vec::new();
+    let mut shard = |k: (u64, u32), count: &mut Vec<u64>| -> u32 { *dir_.entry(k).or_insert_with(|| { count.push(0); (count.len() - 1) as u32 }) };
+    let mut dshard: Vec<u32> = Vec::with_capacity(n_door);
+    let mut keyidx: rustc_hash::FxHashMap<u128, u32> = rustc_hash::FxHashMap::default();
+    keyidx.reserve(n_door + 7_000_000);
+    for i in 0..n_door {
+        let b = &door[i * 40..i * 40 + 40];
+        let s = shard((u64::from_le_bytes(b[0..8].try_into().unwrap()), u32::from_le_bytes(b[8..12].try_into().unwrap())), &mut count);
+        count[s as usize] += 1; dshard.push(s);
+        let k = (u64::from_le_bytes(b[16..24].try_into().unwrap()) as u128) | ((u64::from_le_bytes(b[24..32].try_into().unwrap()) as u128) << 64);
+        keyidx.insert(k, i as u32);
+    }
+    let mut q: Vec<(u64, Q)> = Vec::with_capacity(258_000_000);
+    let mut d: Vec<(u64, u32)> = Vec::with_capacity(255_000_000);
+    let mut next = n_door as u32;
+    for m in maps { for c in m.chunks_exact(REC) {
+        let r = rec(c);
+        if r.flags == 2 { continue; }
+        let (si, scell) = src_of[&r.src];
+        let (x, y) = cell_xy(scell);
+        let order = (((x + 64) as u64) << 48) | (((y + 64) as u64) << 32) | si as u64;
+        if r.flags == 1 { d.push((order, si)); continue; }
+        let s = shard((r.shape, r.cell), &mut count);
+        keyidx.entry(r.key).or_insert_with(|| { count[s as usize] += 1; next += 1; next - 1 });
+        q.push((order, Q { shard: s, src: si, xfer: r.xfer, _p: 0, key: r.key }));
+    } }
+    q.sort_unstable_by_key(|a| a.0);
+    d.sort_unstable_by_key(|a| a.0);
+    // Per-STATE live window over the sweep (time = query index).
+    let n_states = next as usize;
+    let mut first = vec![u32::MAX; n_states]; let mut last = vec![0u32; n_states];
+    for (i, (_, qq)) in q.iter().enumerate() { let e = keyidx[&qq.key] as usize; if first[e] == u32::MAX { first[e] = i as u32; } last[e] = i as u32; }
+    let n = q.len();
+    let mut diff = vec![0i64; n + 1];
+    let mut touched = 0u64;
+    for e in 0..n_states { if first[e] != u32::MAX { diff[first[e] as usize] += 1; diff[last[e] as usize + 1] -= 1; touched += 1; } }
+    let (mut cur, mut peak, mut sum) = (0i64, 0i64, 0f64);
+    for t in 0..n { cur += diff[t]; peak = peak.max(cur); sum += cur as f64; }
+    eprintln!("[prep] per-STATE live window over the x-major sweep: {touched} states touched; live peak {peak} ({:.0} MB at 12 B, {:.0} MB at 20 B), mean {:.0}",
+        peak as f64 * 12.0 / 1e6, peak as f64 * 20.0 / 1e6, sum / n as f64);
+    let pd = format!("{dir}/prep");
+    std::fs::create_dir_all(&pd).unwrap();
+    let qs: Vec<Q> = q.into_iter().map(|a| a.1).collect();
+    let ds: Vec<u32> = d.into_iter().map(|a| a.1).collect();
+    std::fs::write(format!("{pd}/q.bin"), as_bytes(&qs)).unwrap();
+    std::fs::write(format!("{pd}/d.bin"), as_bytes(&ds)).unwrap();
+    std::fs::write(format!("{pd}/cnt.bin"), as_bytes(&count)).unwrap();
+    std::fs::write(format!("{pd}/dshard.bin"), as_bytes(&dshard)).unwrap();
+    std::fs::write(format!("{pd}/nsrc.txt"), format!("{n_src}")).unwrap();
+    eprintln!("[prep] wrote {pd}: {} queries, {} drops, {} shards; {:.1} s", qs.len(), ds.len(), count.len(), t.elapsed().as_secs_f64());
+}
+
+/// v3c / v4 from the prepared inputs. v3c: per shard open addressing, load
+/// <= 0.5, 16-B keys + 4-B ids. v4: load <= 0.8, 8-B fingerprint + 4-B id in
+/// one 12-B slot (an EXPLORATION: production needs exact keys).
+fn vq(dir: &str, door: &[u8], dense: bool) {
+    let t = Instant::now();
+    let pd = format!("{dir}/prep");
+    let map = |f: &str| unsafe { memmap2::Mmap::map(&std::fs::File::open(format!("{pd}/{f}")).unwrap()).unwrap() };
+    let (qm, dm, cm, sm) = (map("q.bin"), map("d.bin"), map("cnt.bin"), map("dshard.bin"));
+    let qs: &[Q] = from_bytes(&qm); let ds: &[u32] = from_bytes(&dm); let cnt: &[u64] = from_bytes(&cm); let dsh: &[u32] = from_bytes(&sm);
+    let n_src: usize = std::fs::read_to_string(format!("{pd}/nsrc.txt")).unwrap().trim().parse().unwrap();
+    let n_door = door.len() / 40;
+    let load = if dense { 0.8 } else { 0.5 };
+    let mut off: Vec<(u64, u64)> = Vec::with_capacity(cnt.len());
+    let mut total = 0u64;
+    for &c in cnt { let cap = ((c.max(1) as f64 / load).ceil() as u64).next_power_of_two(); off.push((total, cap - 1)); total += cap; }
+    let tag = if dense { "v4" } else { "v3c" };
+    let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * PAYLOAD);
+    let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qs.len());
+    let mut dropmin: Vec<u32> = vec![u32::MAX; n_src];
+    let key_of = |i: usize| (u64::from_le_bytes(door[i * 40 + 16..i * 40 + 24].try_into().unwrap()) as u128) | ((u64::from_le_bytes(door[i * 40 + 24..i * 40 + 32].try_into().unwrap()) as u128) << 64);
+    let (dt, t_drops, new);
+    if dense {
+        // slot: (fingerprint u64, id u32) packed into 12 B; fingerprint 0 = empty.
+        #[repr(C, packed)] #[derive(Clone, Copy)] struct S { fp: u64, id: u32 }
+        let mut tab: Vec<S> = vec![S { fp: 0, id: 0 }; total as usize];
+        let fp_of = |k: u128| { let f = (k >> 64) as u64; if f == 0 { 1 } else { f } };
+        let pi = |tab: &mut [S], (base, mask): (u64, u64), k: u128, id: u32| -> (u32, bool) {
+            let f = fp_of(k); let mut i = (k as u64) & mask;
+            loop { let sl = &mut tab[(base + i) as usize]; let g = sl.fp; if g == f { return (sl.id, false); } if g == 0 { *sl = S { fp: f, id }; return (id, true); } i = (i + 1) & mask; }
+        };
+        for i in 0..n_door { pi(&mut tab, off[dsh[i] as usize], key_of(i), i as u32); }
+        eprintln!("[{tag}] setup {:.1} s: arena {} slots ({:.2} GB)", t.elapsed().as_secs_f64(), total, total as f64 * 12.0 / 1e9);
+        let t = Instant::now();
+        for &d in ds { let m = &mut dropmin[d as usize]; *m = (*m).min(1); }
+        t_drops = t.elapsed().as_secs_f64();
+        let mut next = n_door as u32; let mut nw = 0u64;
+        for qq in qs { let (id, ins) = pi(&mut tab, off[qq.shard as usize], qq.key, next); if ins { next += 1; nw += 1; frontier.extend_from_slice(&[0u8; PAYLOAD]); } edges.push((qq.src, id, qq.xfer)); }
+        dt = t.elapsed().as_secs_f64(); new = nw;
+    } else {
+        let mut keys: Vec<u128> = vec![0; total as usize]; let mut ids: Vec<u32> = vec![0; total as usize];
+        let pi = |keys: &mut [u128], ids: &mut [u32], (base, mask): (u64, u64), k: u128, id: u32| -> (u32, bool) {
+            let mut i = (k as u64) & mask;
+            loop { let s = (base + i) as usize; let kk = keys[s]; if kk == k { return (ids[s], false); } if kk == 0 { keys[s] = k; ids[s] = id; return (id, true); } i = (i + 1) & mask; }
+        };
+        for i in 0..n_door { pi(&mut keys, &mut ids, off[dsh[i] as usize], key_of(i), i as u32); }
+        eprintln!("[{tag}] setup {:.1} s: arena {} slots ({:.2} GB)", t.elapsed().as_secs_f64(), total, total as f64 * 20.0 / 1e9);
+        let t = Instant::now();
+        for &d in ds { let m = &mut dropmin[d as usize]; *m = (*m).min(1); }
+        t_drops = t.elapsed().as_secs_f64();
+        let mut next = n_door as u32; let mut nw = 0u64;
+        for qq in qs { let (id, ins) = pi(&mut keys, &mut ids, off[qq.shard as usize], qq.key, next); if ins { next += 1; nw += 1; frontier.extend_from_slice(&[0u8; PAYLOAD]); } edges.push((qq.src, id, qq.xfer)); }
+        dt = t.elapsed().as_secs_f64(); new = nw;
+    }
+    std::hint::black_box((&frontier, &edges, &dropmin));
+    eprintln!("[{tag}] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {new} ({}), {:.1} ns per query",
+        if new == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qs.len() as f64);
 }
