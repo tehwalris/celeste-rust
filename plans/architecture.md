@@ -259,7 +259,8 @@ One pass per frame, no owners, no budget, one barrier.
    are old) and `delta` (the same state twice in one frame would be two
    frontier rows).
 5. **End of frame**: the door merges, the pieces are the next frontier, the
-   checkpoint is written, the edge compaction runs behind the next wave.
+   checkpoint is written, `edges/done.txt` names the frame (its raw edge
+   records are complete; they are inverted only by the backward).
 
 The result is a function of the frame, not of scheduling: the gates are
 identical at 1, 16 and 32 threads. Room (1,0) f0-f70: same speed as the
@@ -309,10 +310,17 @@ remainder; every backward reads the records and re-runs no kernel
   and the lanes; a re-emission ORs its bit in only under an equal transfer,
   else it is an extra entry; after the flush the cache holds the door's id
   so later re-emissions go through a direct-mapped `(target, base, transfer)
-  -> mask` merge. Records go to `edges/raw/f{frame}/`, one per lane (16 B,
-  layer-local: target, source, transfer), each worker's transfer table
-  beside them.
-- **Runs.** At each frame's end the workers' tables merge into the frame's
+  -> mask` merge. Records go to `edges/raw/f{frame}/`, one per lane
+  (layer-local: target, source, transfer), per worker and target layer, in
+  CHUNKS of 64k (`edges::write_chunk`: varint deltas of target and source
+  in the order recorded, the transfer behind a per-chunk predictor keyed
+  by the source; ~3.6 B a record against 16 for the plain record), each
+  worker's transfer table beside them. They STAY raw through the forward
+  (2026-10-09, branch `edge-inversion`): no compaction beside the waves.
+- **Runs.** The graph is INVERTED once, when it is first read
+  (`EdgeGraph::open` -> `edges::invert`: the search's arc phase, and every
+  diagnostic that reads edges), frame by frame, every thread on a frame.
+  Per frame the workers' tables merge into the frame's
   (`edges/xfer/f{frame}.bin`, sorted by value: a function of the frame, not
   the scheduling), and each layer's records are range-partitioned by target,
   sorted by it (a parallel counting sort on the target's dense rank above
@@ -324,10 +332,13 @@ remainder; every backward reads the records and re-runs no kernel
   the run (its transfers by descending use, a table in the header): ~4 B an
   edge, against 8.8 B a v4 record (lanes per record: 1.006) - room (2,3)
   gemskip f0-f137 8.27 -> 4.00 GB, room (1,0) f0-f44 433 -> 292 MB. A run is
-  read in place (mmap), index and tables included. The compaction runs
-  BEHIND the next frame's wave; `edges/done.txt`
-  names the last complete frame, and a resume trusts frames up to it and
-  discards the rest (at most one). Room (1,0) f0-f44: 408 MB of runs against
+  read in place (mmap), index and tables included. `edges/done.txt` names
+  the last frame whose records are complete (set after its checkpoint); a
+  resume trusts frames up to it and discards the rest (at most one), raw
+  records of later frames included. A frame is inverted once its raw dir
+  is gone; an inversion killed midway resumes (a layer whose run is in
+  place is done - runs are renamed into place complete - and its leftover
+  raw files go). A raise inverts the tree first. Room (1,0) f0-f44: 408 MB of runs against
   216 MB without transfers and 2.8 GB for the separate arc-record stream it
   replaced (`d7c373a`).
 - **The BFS** (`edges::bfs`). Seeds: the win rows of EVERY layer <= H (a win

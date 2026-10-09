@@ -336,8 +336,8 @@ enum Command {
     /// BENCH: compact frame `frame`'s raw edge records again, from a copy
     /// (hardlinks into `scratch`, which is replaced): the wall and CPU time
     /// of `edges::compact_frame` and its phases, and the runs it writes
-    /// (`scratch/l*/f{frame}.bin`, to compare byte for byte). The raw
-    /// records survive a forward only under `CELESTE_KEEP_RAW=1`.
+    /// (`scratch/l*/f{frame}.bin`, to compare byte for byte). A tree's
+    /// frames keep their raw records until the backward inverts them.
     CompactBench {
         #[arg(long)]
         edges_dir: String,

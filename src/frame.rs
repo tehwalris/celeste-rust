@@ -735,9 +735,6 @@ impl Slot {
     }
 }
 
-/// A worker's per-layer edge buffer is appended to its file at this many
-/// records (1 MB).
-const EDGE_BUF_RECORDS: usize = 1 << 16;
 /// Slots of the direct-mapped edge merge cache (`ForwardSink::direct_edge`).
 const DIRECT_SLOTS: usize = 1 << 12;
 
@@ -761,27 +758,32 @@ fn append_record(
     let buf = &mut edge_bufs[layer];
     crate::search::edges::push_records(buf, target, base, xfer, mask);
     *edge_records += 1;
-    if buf.len() >= EDGE_BUF_RECORDS {
+    if buf.len() >= crate::search::edges::CHUNK_WORDS {
         write_edges(dir, frame, layer, worker, buf)?;
     }
     Ok(())
 }
 
-/// Append `buf` to the worker's raw file for `layer` at `frame`, and clear it.
-/// Written as it is: equal records are merged by the compaction
-/// (`encode_sorted`), and the sink's merges leave none to sort out here
-/// (room (6,2) 100% f57: 0 of 252M records were duplicates in a buffer;
-/// the sort was ~1/3 of `flush.edges`).
+/// Append `buf` to the worker's raw file for `layer` at `frame` as a chunk
+/// (`edges::write_chunk`), and clear it. Written in the order recorded:
+/// equal records are merged by the inversion (`encode_sorted`), and the
+/// sink's merges leave none to sort out here (room (6,2) 100% f57: 0 of
+/// 252M records were duplicates in a buffer; the sort was ~1/3 of
+/// `flush.edges`).
 fn write_edges(dir: &std::path::Path, frame: u32, layer: usize, worker: u32, buf: &mut Vec<u128>) -> Result<()> {
     use std::io::Write;
-    // A record is its word's little-endian bytes (`edges::push_records`).
-    const _: () = assert!(cfg!(target_endian = "little"));
-    // SAFETY: u128 has no padding; the bytes of `buf` are initialized.
-    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * crate::search::edges::RECORD_BYTES) };
+    thread_local! {
+        static BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
     let path = crate::search::edges::raw_path(dir, frame, layer as u32, worker);
     std::fs::create_dir_all(path.parent().expect("a raw dir"))?;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    f.write_all(bytes)?;
+    BYTES.with_borrow_mut(|bytes| -> Result<()> {
+        bytes.clear();
+        crate::search::edges::write_chunk(bytes, buf);
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        f.write_all(bytes)?;
+        Ok(())
+    })?;
     buf.clear();
     Ok(())
 }
@@ -2037,8 +2039,6 @@ pub struct ForwardState {
     /// The filter the tree's frames were built under (`None`: a tree from
     /// before records, which is not extended).
     pub filter: Option<TreeFilter>,
-    /// The last frame's edge compaction, running behind the next wave.
-    compaction: Option<(u32, std::thread::JoinHandle<Result<crate::search::edges::CompactStats>>)>,
 }
 
 /// What a forward run reports.
@@ -2089,7 +2089,6 @@ impl ForwardState {
             frames: 0,
             win_frame: None,
             filter: Some(filter),
-            compaction: None,
         })
     }
 
@@ -2109,7 +2108,7 @@ impl ForwardState {
         }
         let Some(mut last) = last else { return Ok(None) };
         let t = std::time::Instant::now();
-        // Trust only frames whose edge runs are complete (at most one lost).
+        // Trust only frames whose edge records are complete (at most one lost).
         let edges_dir = dir.join("edges");
         let done = crate::search::edges::done_frame(&edges_dir).unwrap_or(last);
         if done < last {
@@ -2117,7 +2116,7 @@ impl ForwardState {
                 std::fs::remove_dir_all(dir.join("frames").join(format!("f{:03}", f)))?;
                 let _ = std::fs::remove_file(dropped_path(dir, f));
             }
-            eprintln!("[resume] frames f{} to f{last} discarded: their edge runs were not complete", done + 1);
+            eprintln!("[resume] frames f{} to f{last} discarded: their edge records were not complete", done + 1);
             last = done;
         }
         crate::search::edges::discard_after(&edges_dir, last)?;
@@ -2204,7 +2203,7 @@ impl ForwardState {
             filter,
             t.elapsed().as_secs_f64()
         );
-        Ok(Some(ForwardState { frontier, door, observer, frames: last, win_frame, filter, compaction: None }))
+        Ok(Some(ForwardState { frontier, door, observer, frames: last, win_frame, filter }))
     }
 
     /// The door's size: every distinct state reached so far.
@@ -2214,26 +2213,6 @@ impl ForwardState {
 
     pub fn door(&self) -> &crate::search::door::Door {
         &self.door
-    }
-
-    /// Join the previous compaction and mark its frame done; stats and wait.
-    fn join_compaction(
-        &mut self,
-        edges_dir: &std::path::Path,
-    ) -> Result<Option<(crate::search::edges::CompactStats, std::time::Duration)>> {
-        let Some((frame, handle)) = self.compaction.take() else { return Ok(None) };
-        let t = std::time::Instant::now();
-        let st = handle.join().expect("compaction thread panicked")?;
-        crate::search::edges::set_done_frame(edges_dir, frame)?;
-        // A resume loads frame `frame` as its frontier and never an earlier
-        // one's rows: those may go.
-        if trim_rows() && frame >= 2 {
-            let dir = edges_dir.parent().expect("a level dir");
-            for (_, p) in frame_paths(dir, frame - 1)? {
-                crate::search::checkpoint::trim(&p)?;
-            }
-        }
-        Ok(Some((st, t.elapsed())))
     }
 
     /// Compute and checkpoint frames `frames+1 ..= to` under the tree's
@@ -2259,31 +2238,30 @@ impl ForwardState {
             let edges_dir = dir.join("edges");
             let wave = forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filters, frame, Some(&edges_dir), Layer::New)?;
             let (mut next, won, st) = (wave.next, wave.won, wave.stats);
-            // Before the frame is trusted (its checkpoint, then its runs).
+            // Before the frame is trusted (its checkpoint, then done.txt).
             if filters.notes_drops() {
                 crate::search::checkpoint::save_value_to(&dropped_path(dir, frame), &wave.dropped)?;
             }
-            // Joined BEFORE this checkpoint: a resume never trusts incomplete runs.
-            let joined = self.join_compaction(&edges_dir)?;
-            let (t_edges, compact_records) = joined.as_ref().map_or((std::time::Duration::ZERO, 0), |(c, w)| (*w, c.records));
             let t = std::time::Instant::now();
             checkpoint_frontier(dir, frame, &mut next, true)?;
             let t_ckpt = t.elapsed();
-            // This frame's raw records into runs, in the background.
-            {
-                let edges_dir = edges_dir.clone();
-                let handle = std::thread::Builder::new()
-                    .name(format!("compact-f{frame}"))
-                    .spawn(move || crate::search::edges::compact_frame(&edges_dir, frame))
-                    .expect("spawn compaction");
-                self.compaction = Some((frame, handle));
+            // The wave wrote every raw record (`ForwardSink::finish`): the
+            // frame is complete. Its records stay raw until the backward
+            // inverts them (`edges::invert`).
+            crate::search::edges::set_done_frame(&edges_dir, frame)?;
+            // A resume loads frame `frame` as its frontier and never an
+            // earlier one's rows: those may go.
+            if trim_rows() && frame >= 2 {
+                for (_, p) in frame_paths(dir, frame - 1)? {
+                    crate::search::checkpoint::trim(&p)?;
+                }
             }
             let t = std::time::Instant::now();
             if let Some(o) = self.observer.as_ref() {
                 save_pos_graph(dir, &o.snapshot(), frame)?;
             }
             let t_pos = t.elapsed();
-            log_frame(frame, &st, t_edges, compact_records, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
+            log_frame(frame, &st, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
             ensure_disk_space(dir, &mut last_free)?;
             self.frames = frame;
             if won && self.win_frame.is_none() {
@@ -2315,8 +2293,6 @@ impl ForwardState {
                 next
             };
         }
-        // The last frame's runs, before the backward reads them.
-        self.join_compaction(&dir.join("edges"))?;
         if let Some(o) = self.observer.as_ref() {
             save_pos_graph(dir, &o.snapshot(), self.frames)?;
         }
@@ -2355,6 +2331,10 @@ impl ForwardState {
         let t0 = std::time::Instant::now();
         let last = self.frames;
         let edges_dir = dir.join("edges");
+        // The raise writes each frame's new records as raw files of their
+        // own, compacted into its RAISED runs: the frames' own records are
+        // inverted into their runs first.
+        crate::search::edges::invert(&edges_dir, last)?;
         let notes: Vec<Vec<(u64, u32)>> = (1..=last)
             .map(|t| {
                 let p = dropped_path(dir, t);
@@ -2627,8 +2607,6 @@ fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Resu
 fn log_frame(
     frame: u32,
     st: &FrameStats,
-    t_edges: std::time::Duration,
-    edge_records: u64,
     t_ckpt: std::time::Duration,
     t_pos: std::time::Duration,
     t_total: std::time::Duration,
@@ -2637,7 +2615,7 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         wave {:.0} (idle {:.0}%) door {:.0} edges {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
+         wave {:.0} (idle {:.0}%) door {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
          flushes {} ({:.0} rows avg) edges {} | \
          in {:.2} queues {:.2} door {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2})",
         st.blocks_in,
@@ -2650,13 +2628,12 @@ fn log_frame(
         ms(st.t_wave),
         st.wave_idle * 100.0,
         ms(st.t_door),
-        ms(t_edges),
         ms(t_ckpt),
         ms(t_pos),
         ms(t_total),
         st.flushes,
         st.flushed_rows as f64 / st.flushes.max(1) as f64,
-        edge_records,
+        st.edge_records,
         st.bytes_in as f64 / 1e9,
         st.queue_bytes as f64 / 1e9,
         st.door_bytes as f64 / 1e9,
