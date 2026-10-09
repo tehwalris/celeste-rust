@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 mod bits;
+mod compact;
 mod structure;
 
 const REC: usize = 48;
@@ -84,6 +85,8 @@ fn main() {
         "bits" => bits::run_bits(dir, door.len() / 40, false),
         "bitsr" => bits::run_bits(dir, door.len() / 40, true),
         "bitintern" => bits::run_intern(dir, door.len() / 40),
+        "compactprep" => compact::prep(dir, &door),
+        "cqa" | "cqb" | "cqc" => compact::run(dir, door.len() / 40, variant),
         "bitcell" | "bitspd" | "bitspd2" => bits::run_words(dir, door.len() / 40, variant),
         other => panic!("unknown variant {other}"),
     }
@@ -556,15 +559,15 @@ fn vq(dir: &str, door: &[u8], dense: bool) {
     let mut total = 0u64;
     for &c in cnt { let cap = ((c.max(1) as f64 / load).ceil() as u64).next_power_of_two(); off.push((total, cap - 1)); total += cap; }
     let tag = if dense { "v4" } else { "v3c" };
-    let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * PAYLOAD);
-    let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qs.len());
+    let mut frontier: compact::HugeVec<u8> = compact::HugeVec::with_capacity(7_000_000 * PAYLOAD);
+    let mut edges: compact::HugeVec<(u32, u32, u32)> = compact::HugeVec::with_capacity(qs.len());
     let mut dropmin: Vec<u32> = vec![u32::MAX; n_src];
     let key_of = |i: usize| (u64::from_le_bytes(door[i * 40 + 16..i * 40 + 24].try_into().unwrap()) as u128) | ((u64::from_le_bytes(door[i * 40 + 24..i * 40 + 32].try_into().unwrap()) as u128) << 64);
     let (dt, t_drops, new);
     if dense {
         // slot: (fingerprint u64, id u32) packed into 12 B; fingerprint 0 = empty.
         #[repr(C, packed)] #[derive(Clone, Copy)] struct S { fp: u64, id: u32 }
-        let mut tab: Vec<S> = vec![S { fp: 0, id: 0 }; total as usize];
+        let mut tab: compact::HugeVec<S> = compact::HugeVec::zeroed(total as usize); // fp 0 = empty
         let fp_of = |k: u128| { let f = (k >> 64) as u64; if f == 0 { 1 } else { f } };
         let pi = |tab: &mut [S], (base, mask): (u64, u64), k: u128, id: u32| -> (u32, bool) {
             let f = fp_of(k); let mut i = (k as u64) & mask;
@@ -572,27 +575,29 @@ fn vq(dir: &str, door: &[u8], dense: bool) {
         };
         for i in 0..n_door { pi(&mut tab, off[dsh[i] as usize], key_of(i), i as u32); }
         eprintln!("[{tag}] setup {:.1} s: arena {} slots ({:.2} GB)", t.elapsed().as_secs_f64(), total, total as f64 * 12.0 / 1e9);
+        compact::huge_report(tag, &[tab.region(), edges.region(), frontier.region()]);
         perf_on(true);
         let t = Instant::now();
         for &d in ds { let m = &mut dropmin[d as usize]; *m = (*m).min(1); }
         t_drops = t.elapsed().as_secs_f64();
         let mut next = n_door as u32; let mut nw = 0u64;
-        for qq in qs { let (id, ins) = pi(&mut tab, off[qq.shard as usize], qq.key, next); if ins { next += 1; nw += 1; frontier.extend_from_slice(&[0u8; PAYLOAD]); } edges.push((qq.src, id, qq.xfer)); }
+        for qq in qs { let (id, ins) = pi(&mut tab, off[qq.shard as usize], qq.key, next); if ins { next += 1; nw += 1; frontier.extend_zero(PAYLOAD); } edges.push((qq.src, id, qq.xfer)); }
         dt = t.elapsed().as_secs_f64(); new = nw; perf_on(false);
     } else {
-        let mut keys: Vec<u128> = vec![0; total as usize]; let mut ids: Vec<u32> = vec![0; total as usize];
+        let mut keys: compact::HugeVec<u128> = compact::HugeVec::zeroed(total as usize); let mut ids: compact::HugeVec<u32> = compact::HugeVec::zeroed(total as usize);
         let pi = |keys: &mut [u128], ids: &mut [u32], (base, mask): (u64, u64), k: u128, id: u32| -> (u32, bool) {
             let mut i = (k as u64) & mask;
             loop { let s = (base + i) as usize; let kk = keys[s]; if kk == k { return (ids[s], false); } if kk == 0 { keys[s] = k; ids[s] = id; return (id, true); } i = (i + 1) & mask; }
         };
         for i in 0..n_door { pi(&mut keys, &mut ids, off[dsh[i] as usize], key_of(i), i as u32); }
         eprintln!("[{tag}] setup {:.1} s: arena {} slots ({:.2} GB)", t.elapsed().as_secs_f64(), total, total as f64 * 20.0 / 1e9);
+        compact::huge_report(tag, &[keys.region(), ids.region(), edges.region(), frontier.region()]);
         perf_on(true);
         let t = Instant::now();
         for &d in ds { let m = &mut dropmin[d as usize]; *m = (*m).min(1); }
         t_drops = t.elapsed().as_secs_f64();
         let mut next = n_door as u32; let mut nw = 0u64;
-        for qq in qs { let (id, ins) = pi(&mut keys, &mut ids, off[qq.shard as usize], qq.key, next); if ins { next += 1; nw += 1; frontier.extend_from_slice(&[0u8; PAYLOAD]); } edges.push((qq.src, id, qq.xfer)); }
+        for qq in qs { let (id, ins) = pi(&mut keys, &mut ids, off[qq.shard as usize], qq.key, next); if ins { next += 1; nw += 1; frontier.extend_zero(PAYLOAD); } edges.push((qq.src, id, qq.xfer)); }
         dt = t.elapsed().as_secs_f64(); new = nw; perf_on(false);
     }
     std::hint::black_box((&frontier, &edges, &dropmin));
@@ -601,6 +606,6 @@ fn vq(dir: &str, door: &[u8], dense: bool) {
     // UNTIMED: the per-lookup decision fingerprint (as bits::run_bits prints it).
     let mut seen = vec![false; n_door + new as usize];
     let mut fp = 0u64;
-    for e in &edges { let is_new = e.1 as usize >= n_door && !seen[e.1 as usize]; seen[e.1 as usize] = true; fp = fp.wrapping_mul(0x100_0000_01b3) ^ (is_new as u64); }
+    for e in edges.iter() { let is_new = e.1 as usize >= n_door && !seen[e.1 as usize]; seen[e.1 as usize] = true; fp = fp.wrapping_mul(0x100_0000_01b3) ^ (is_new as u64); }
     eprintln!("[{tag}] decision fingerprint {fp:016x}");
 }

@@ -449,7 +449,7 @@ pub fn run_bits(dir: &str, n_door: usize, rank: bool) {
 /// UNTIMED: every lookup's decision and target against the reference (v3c's
 /// ids: door index, new states numbered in sweep order); the fingerprint is
 /// over THIS variant's decisions.
-fn check(tag: &str, pd: &str, edges: &[(u32, u32, u32)], n_door: usize, is_old: &dyn Fn(u32) -> bool, rank: bool) {
+pub(crate) fn check(tag: &str, pd: &str, edges: &[(u32, u32, u32)], n_door: usize, is_old: &dyn Fn(u32) -> bool, rank: bool) {
     let rm = unsafe { memmap2::Mmap::map(&std::fs::File::open(format!("{pd}/refid.bin")).unwrap()).unwrap() };
     let refid: &[u32] = crate::from_bytes(&rm);
     let mut mine_of_ref: Vec<u32> = vec![u32::MAX; n_door + 6_735_699];
@@ -750,7 +750,7 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     #[repr(C, packed)]
     #[derive(Clone, Copy)]
     struct W { hk: u32, bits: u64 }
-    let mut tab: Vec<W> = vec![W { hk: 0, bits: 0 }; total as usize];
+    let mut tab: crate::compact::HugeVec<W> = crate::compact::HugeVec::zeroed(total as usize); // hk 0 = empty
     macro_rules! probe { ($sh:expr, $hk:expr) => {{
         let (b, m) = off[$sh as usize];
         let mut s = slot_of($hk, (b, m));
@@ -765,8 +765,10 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     eprintln!("[{mode}] setup {:.1} s (untimed): mask widths: {} shards, mean {:.1} bits (by entries); {n_old} entries at the frame start, {entries} at its end ({:.2} states each, mask fill {:.2}%); directory {} slots x {} B at load {load} = {:.2} GB",
         t.elapsed().as_secs_f64(), n_shards, wsum(&|s| pcnt[s] * width[s].min(64)) as f64 / entries as f64, (n_door + 6_735_699) as f64 / entries as f64,
         100.0 * (n_door + 6_735_699) as f64 / wsum(&|s| pcnt[s] * 64) as f64, total, std::mem::size_of::<W>(), mem / 1e9);
-    let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * crate::PAYLOAD);
-    let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qw.len());
+    drop(local);
+    let mut frontier: crate::compact::HugeVec<u8> = crate::compact::HugeVec::with_capacity(7_000_000 * crate::PAYLOAD);
+    let mut edges: crate::compact::HugeVec<(u32, u32, u32)> = crate::compact::HugeVec::with_capacity(qw.len());
+    crate::compact::huge_report(mode, &[tab.region(), edges.region(), frontier.region()]);
     let mut dropmin: Vec<u32> = vec![u32::MAX; n_src];
     crate::perf_on(true);
     let t = std::time::Instant::now();
@@ -777,7 +779,7 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
         let s = probe!(q.shard, q.high);
         let e = &mut tab[s as usize];
         let (w, b) = (e.bits, 1u64 << q.low);
-        if w & b == 0 { e.bits = w | b; nw += 1; frontier.extend_from_slice(&[0u8; crate::PAYLOAD]); }
+        if w & b == 0 { e.bits = w | b; nw += 1; frontier.extend_zero(crate::PAYLOAD); }
         edges.push((q.src, s << 6 | q.low, q.xfer));
     }
     let dt = t.elapsed().as_secs_f64();
