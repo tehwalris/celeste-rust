@@ -1048,6 +1048,29 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     );
 }
 
+/// `CELESTE_KERNEL_KEY_CHECK=1` on a block the forward STORES (a canonical
+/// piece, `canon::canonical_layer`): the boundary over a copy must keep its
+/// shape, structure and keys - its gather moved rows, not values.
+pub(crate) fn key_check_block(blk: &Rt2) {
+    if !key_check_on() {
+        return;
+    }
+    let mut b = blk.clone_block();
+    b.boundary(&super::boundary_ids());
+    let (mut want, mut got) = (blk.row_keys.clone(), b.row_keys.clone());
+    want.sort_unstable();
+    got.sort_unstable();
+    assert!(
+        b.shape_hash == blk.shape_hash && b.structure == blk.structure && got == want,
+        "KERNEL KEY CHECK: a stored piece of shape {:#x} ({} rows) is not what the boundary keys it as (shape {:#x}, structure {}, {} keys)",
+        blk.shape_hash,
+        blk.width,
+        b.shape_hash,
+        if b.structure == blk.structure { "same" } else { "DIFFERENT" },
+        if got == want { "same" } else { "DIFFERENT" },
+    );
+}
+
 /// `CELESTE_KERNEL_KEY_CHECK=1` (see `key_check`).
 fn key_check_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

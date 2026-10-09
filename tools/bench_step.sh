@@ -32,10 +32,10 @@ for rep in $(seq 1 "$REPS"); do
   "$SAFE" --memory "${MEM:-40G}" -- "$BIN" forward --to $((F + ${FRAMES:-1})) --room "$ROOM" --level "$LEVEL" --checkpoint-dir "$S" > "$S.out" 2> "$S.err"
   t1=$(date +%s.%N)
   [ -n "${PAUSE_PIDS:-}" ] && { kill -CONT $PAUSE_PIDS 2>/dev/null || true; }
-  line=$(grep "^\[fwd\] f$(printf %03d $((F + 1)))" "$S.err" | sed -E 's/.*\| wave ([0-9]+) \(idle ([0-9]+)%\) door ([0-9]+) edges ([0-9]+) ckpt ([0-9]+) pos ([0-9]+) total ([0-9]+) ms.*/wave \1 ms (idle \2%) door \3 edges \4 ckpt \5 pos \6 frame \7 ms/')
+  line=$(grep "^\[fwd\] f$(printf %03d $((F + 1)))" "$S.err" | sed -E 's/.*\| wave ([0-9]+) \(idle ([0-9]+)%\)( canon ([0-9]+))? door ([0-9]+) edges ([0-9]+) ckpt ([0-9]+) pos ([0-9]+) total ([0-9]+) ms.*/wave \1 ms (idle \2%) canon \4 door \5 edges \6 ckpt \7 pos \8 frame \9 ms/')
   resume=$(grep -o "^\[resume\].*in [0-9.]* s\|, [0-9.]* s$" "$S.err" | head -1 | grep -o "[0-9.]* s$" || true)
   for g in $(seq 2 "${FRAMES:-1}"); do
-    grep "^\[fwd\] f$(printf %03d $((F + g))) " "$S.err" | sed -E "s/.*\| wave ([0-9]+) .*/rep $rep: f$((F + g)) wave \1 ms/"
+    grep "^\[fwd\] f$(printf %03d $((F + g))) " "$S.err" | sed -E "s/.*\| wave ([0-9]+) \(idle [0-9]+%\)( canon ([0-9]+))? .*/rep $rep: f$((F + g)) wave \1 ms canon \3/"
   done
   echo "rep $rep: f$F->f$((F + 1)) | $line | process $(awk "BEGIN{printf \"%.1f\", $t1 - $t0}") s (resume ${resume:-?})"
 done
