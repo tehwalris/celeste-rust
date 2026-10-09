@@ -733,3 +733,50 @@ by-target invalidation becomes coarser but cheap: a changed state's region
 marks the regions holding it as a ghost (the translation table inverted,
 1.25M entries), and those regions re-pull their affected sources (or all of
 them).
+
+### N2. The ghost layout built in the region pass (`ghost`; 2026-10-10)
+
+Units = SOURCE 8x8 regions (split by a hash of the TARGET key into parts of
+<= 50k / 100k emissions; parts own disjoint target keys), emissions in
+capture order, 16-B elements. Each unit holds R's unified set: per key an
+entry with its own core mask (64 cells) and a window mask (16x16: the core
++ a 4-px halo). Per emission ONE lookup gives the target's LOCAL index
+(entry lid, window cell): an own core target is deduplicated right there
+(own-new counted by its owner only); a halo target sets a ghost bit; beyond
+the halo or another shape (2.35M emissions, 0.9%) an overflow ghost. The
+edge is written flat in emission order - varint(source local, 0 = same as
+the previous edge), varint(lid << 9 | overflow << 8 | window cell),
+varint(global transfer id) - no grouping. Then the TRANSLATION pass,
+parallel per OWNER: its set after the own passes, its ghost requests sorted
+(key, cell); a request whose bit is not set is NEW, inserted once.
+
+Validation (untimed, every edges run's first pass; EDGE_NOCHECK otherwise):
+new 6,735,699 = 5,440,972 own + 1,294,727 via ghosts; every edge decoded
+(source local -> old entry key + cell; target lid -> key + window cell, or
+overflow -> owner cell) - fingerprint fca41b0f1a28b51d EQUAL to the
+capture's; 6,108,841 ghost requests translated, 0 wrong; id bijection over
+all 43,841,605 states, 0 violations.
+Bundling consecutive edges in EMISSION order (same src entry, tgt entry,
+transfer, shift) gives nothing: 257.71M runs for 257.72M edges (consecutive
+emissions come from one source cell and go to different targets).
+
+Wall, 3 interleaved reps (load 2.0-3.5 at the starts), own pass + translation:
+
+| threads | ghost, edges written | ghost, no edges | dedup alone (target-side, M) |
+|---|---|---|---|
+| 1 | 2.84-2.85 + 0.34 = 3.18-3.19 s (12.3 ns an edge) | 1.27 + 0.33-0.34 = 1.60-1.61 s | 0.627-0.630 s |
+| 8 | 0.370-0.372 + 0.087-0.096 = 0.46-0.47 | 0.162-0.163 + 0.085-0.095 = 0.25-0.26 | 0.102-0.103 |
+| 16 (100k) | 0.225-0.228 + 0.081-0.086 = 0.306-0.313 | 0.110-0.111 + 0.069-0.081 = 0.18-0.19 | 0.107 |
+| 16 (50k) | 0.214-0.219 + 0.055-0.059 = **0.272-0.278** | 0.106-0.108 + 0.055-0.056 = 0.162-0.164 | 0.104-0.106 |
+| 32 (50k) | 0.228-0.233 + 0.055-0.060 = 0.286-0.292 | 0.111-0.113 + 0.057-0.060 = 0.168-0.173 | 0.115-0.117 |
+
+Edges 7.01-7.16 B an edge (flat varints; + 0.01 B of lid -> key tables);
+1.8 GB written a frame. At 16 threads: edges + dedup 0.275 s against the
+target-side dedup alone 0.105 s = 2.6x (not the 1.5x target); against the
+same ghost pass without edges 1.7x. The own pass doubles with the edge
+writes (0.108 -> 0.217 s: ~1.8 GB of varints on top of the 4.1 GB batch
+stream, at the DRAM ceiling); the translation pass (0.055 s, 6.1M requests,
+per-owner hash rebuilds) is the rest. Cheaper next: a tighter edge format
+(per-unit transfer dictionary, fixed-width lid / cell fields: ~4 B), an 8-B
+emission, and the translation against the owners' tables kept from the own
+pass instead of rebuilt.
