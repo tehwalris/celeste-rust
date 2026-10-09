@@ -451,7 +451,7 @@ pub fn run_bits(dir: &str, n_door: usize, rank: bool) {
 /// UNTIMED: every lookup's decision and target against the reference (v3c's
 /// ids: door index, new states numbered in sweep order); the fingerprint is
 /// over THIS variant's decisions.
-fn check(tag: &str, pd: &str, edges: &[(u32, u32, u32)], n_door: usize, is_old: &dyn Fn(u32) -> bool, rank: bool) {
+pub fn check(tag: &str, pd: &str, edges: &[(u32, u32, u32)], n_door: usize, is_old: &dyn Fn(u32) -> bool, rank: bool) {
     let rm = unsafe { memmap2::Mmap::map(&std::fs::File::open(format!("{pd}/refid.bin")).unwrap()).unwrap() };
     let refid: &[u32] = crate::from_bytes(&rm);
     let mut mine_of_ref: Vec<u32> = vec![u32::MAX; n_door + 6_735_699];

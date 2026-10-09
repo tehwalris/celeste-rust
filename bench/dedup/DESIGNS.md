@@ -344,3 +344,65 @@ the drops loop alone varied 0.30-0.63 s): posmask4 1.89 s, posmask8 2.19 s
 (and 3.16 / 4.59 s under heavier contention), bits 4.64 s in the same
 contended window (2.27 quiet). AnonHugePages at the timed loop 4-8.7 GB of
 21 GB RSS (most RSS is the untimed precompute; the table is 70-190 MB).
+
+## J. Batched per-region processing (`regionbatch8`, `regionbatch16`; 2026-10-09)
+
+The visited set at rest per (shape, R x R region); a core takes one region
+and its batch of the frame's lookups: DECODE into an in-core structure, run
+the batch (membership + inserts), RE-ENCODE. All regions of f57 run (397 at
+8x8, 131 at 16x16), one core, in sequence. A state in a region: key =
+flags+dash > spd.x > spd.y mixed radix (< 2^32), pos = its cell; an entry =
+(key, mask over the region's cells). The batches (key, pos, query index; 12 B)
+are built in the untimed setup, in sweep order: in production that grouping
+is a partition pass over the emissions (design D's envelope, ~0.1-0.3 s at
+32 threads), NOT included below.
+
+At rest, bytes a frame-start state (37.1M), 8x8 / 16x16: (a) a posmask
+table at load 0.5 1.69 / 2.53; (d) sorted (u32 key, mask) array 0.60 / 0.92,
++ zstd -1 0.16 / 0.11; (b) varint key delta + raw mask 0.46 / 0.85; (c) (b) +
+zstd -1 0.06 / 0.05, zstd -3 0.05 / 0.05. (No lz4 crate offline.)
+
+In-core structures: HASH (open addressing on the key, entries (key, old
+mask, new mask), the batch in sweep order; at the end the entries sorted by
+key for the re-encode) and MERGE (sort the batch by (key, pos), merge with
+the decoded sorted entries: no hash table; std sort_unstable, no radix).
+
+SMOKE timings, load 4-6, cpu 4 shared - NOISY, dedup only (no ids):
+
+| R | format + structure | decode | batch | re-encode | total | ns a lookup |
+|---|---|---|---|---|---|---|
+| 8x8 | raw + hash | 0 | 0.96 s | 0 | 0.97 s | 3.7 |
+| 8x8 | varint + hash | 0.01 | 0.96 | 0.00 | 0.97 | 3.8 |
+| 8x8 | varint + zstd -1 + hash | 0.02 | 0.99 | 0.03 | 1.04 | 4.0 |
+| 8x8 | varint + merge | 0.01 | 4.73 | 0.00 | 4.74 | 18.4 (the sort) |
+| 16x16 | varint + hash | 0.01 | 1.83 | 0.01 | 1.84 | 7.2 |
+| 16x16 | varint + zstd -1 + hash | 0.03 | 1.71 | 0.07 | 1.81 | 7.0 |
+| 16x16 | varint + merge | 0.01 | 9.01 | 0.00 | 9.02 | 35 |
+
+Per region (8x8, varint + hash): median 26,748 states / 104,501 lookups:
+decode 2.2 us, run 381 us, encode 1.9 us (3.7 ns a lookup, 14 ns a stored
+state); weighted-median 895,781 / 5.40M: 65 + 17,425 + 51 us (3.3 ns);
+heaviest 1,556,132 / 15.07M: 350 + 56,826 + 227 us (3.8 ns). Decode and
+re-encode are <1% even with zstd: the batch (24 lookups a target, 2.6% new)
+dominates. bits ran 2.27 s quiet (4.64 s in the same contended window).
+All variants: 6,735,699 new, every lookup's decision equal to v3c's,
+fingerprint 51e2f3ecb444e25d (merge at 16x16 first overflowed a 24-bit
+batch index: fixed).
+
+IDs (kept optional, `regionbatch8 merge,hash ids`; validated once: ids dense
+in [0, 43,841,605), bijection with v3c's, 0 violations): CANONICAL RANKS,
+final when a region finishes - an old state = old_base[region] + rank in
+the region's frame-start (key, pos) order (a prefix popcount over the
+entries + popcount below pos), a new state = n_door + new_base[region] + rank
+among the region's new states. Cost with ids: hash 1.77 s, merge 5.8 s (noisy).
+Ideas for edges later, not implemented: (1) edges recorded per DESTINATION
+region in the batch itself (src, xfer, pos, key) - the batch is the edge list
+sorted by target, the backward's order; the destination id is the batch
+entry's rank, resolved in the region pass; (2) a stable intermediate index:
+(region, entry slot, pos) with slots append-only within a frame (inserts
+never move an entry; re-encode compacts at end_frame and emits a slot ->
+rank map); (3) source-side: the frontier's ids are ranks of the previous
+frame's regions, so (src region, rank) is already canonical.
+
+Quiet run left for later: /var/tmp/emitcap/regionbatch/bench.sh (cpu 4,
+perf stat --control over the timed loops, interleaved with bits).
