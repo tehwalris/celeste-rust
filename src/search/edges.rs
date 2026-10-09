@@ -595,8 +595,9 @@ const MEM_PER_RAW_BYTE: u64 = 4;
 const INVERT_MEM: u64 = 24 << 30;
 
 /// Compact `frames`' raw records into their runs (`raised`: raised runs):
-/// every (frame, layer) is one job (`invert_layer`), largest first, on
-/// every hardware thread, the layers in flight bounded by `INVERT_MEM`.
+/// every (frame, layer) is one job (`invert_layer`), largest first (the
+/// smallest while the largest left would pass the memory bound,
+/// `INVERT_MEM`), on every hardware thread.
 /// A frame's raw dir goes after its last layer: a frame is inverted once
 /// its raw dir is gone. Crash-safe: a run is renamed into place complete,
 /// and a layer whose (non-raised) run exists is done - its leftover raw
@@ -675,26 +676,45 @@ fn compact_frames(dir: &Path, frames: &[u32], raised: bool) -> Result<CompactSta
             finish_frame(i)?;
         }
     }
-    let next = AtomicUsize::new(0);
-    let budget = (std::sync::Mutex::new(0u64), std::sync::Condvar::new());
+    // The queue: jobs[front..back] left, largest first. A worker takes the
+    // largest left if the memory in flight allows it, else the smallest
+    // (they fit, and keep every thread busy while the large ones queue).
+    let need_of = |k: usize| jobs[k].3 * MEM_PER_RAW_BYTE;
+    let queue = (std::sync::Mutex::new((0usize, jobs.len(), 0u64)), std::sync::Condvar::new());
+    let take = || -> Option<usize> {
+        let mut q = queue.0.lock().expect("inversion queue");
+        loop {
+            let (front, back, held) = *q;
+            if front >= back {
+                return None;
+            }
+            if held == 0 || held + need_of(front) <= INVERT_MEM {
+                *q = (front + 1, back, held + need_of(front));
+                return Some(front);
+            }
+            if back - 1 > front && held + need_of(back - 1) <= INVERT_MEM {
+                *q = (front, back - 1, held + need_of(back - 1));
+                return Some(back - 1);
+            }
+            q = queue.1.wait(q).expect("inversion queue");
+        }
+    };
+    let release = |need: u64| {
+        queue.0.lock().expect("inversion queue").2 -= need;
+        queue.1.notify_all();
+    };
     let workers = std::thread::available_parallelism().map_or(2, |n| n.get()).min(jobs.len());
     let totals: Vec<(u64, u64, u64)> = std::thread::scope(|scope| {
         let hs: Vec<_> = (0..workers)
             .map(|_| {
-                let (jobs, next, budget, left, maps, finish_frame) = (&jobs, &next, &budget, &left, &maps, &finish_frame);
+                let (jobs, take, release, left, maps, finish_frame) = (&jobs, &take, &release, &left, &maps, &finish_frame);
                 scope.spawn(move || -> Result<(u64, u64, u64)> {
                     let mut bufs = LayerBufs::default();
                     let mut tot = (0u64, 0u64, 0u64);
-                    while let Some((i, layer, files, bytes)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    while let Some(k) = take() {
+                        let (i, layer, files, bytes) = &jobs[k];
                         let (i, layer, frame) = (*i, *layer, frames[*i]);
                         let need = bytes * MEM_PER_RAW_BYTE;
-                        {
-                            let mut held = budget.0.lock().expect("budget");
-                            while *held > 0 && *held + need > INVERT_MEM {
-                                held = budget.1.wait(held).expect("budget");
-                            }
-                            *held += need;
-                        }
                         let out = if raised { raised_path(dir, layer, frame) } else { run_path(dir, layer, frame) };
                         let tmp = layer_dir(dir, layer).join(format!("tmp-f{:03}.bin", frame));
                         let r = invert_layer(files, maps[i].as_ref().expect("a frame with layers to do has its maps"), layer, frame, &out, &tmp, &mut bufs)
@@ -703,8 +723,7 @@ fn compact_frames(dir: &Path, frames: &[u32], raised: bool) -> Result<CompactSta
                         if need > INVERT_MEM / 8 {
                             bufs = LayerBufs::default();
                         }
-                        *budget.0.lock().expect("budget") -= need;
-                        budget.1.notify_all();
+                        release(need);
                         let (records, edges, b) = r?;
                         tot = (tot.0 + records, tot.1 + edges, tot.2 + b);
                         if left[i].fetch_sub(1, Ordering::AcqRel) == 1 {
