@@ -52,7 +52,7 @@ struct AsmBody {
 
 /// A body's transfer roots (`FrameOut::arc`): per axis took, pre, frag, ox,
 /// fin as (offset, kind); `fin` whether the outcome ends with a player.
-/// `ArcSlots::words16`: two words per transfer root, then the outcome's
+/// `ArcSlots::words`: two words per transfer root, then the outcome's
 /// `fin` flag - the words alone do not decode: without a fin root its words
 /// are 0 and the axis has no `fin`, with one they are `fin = Some((0, 0))`.
 /// Keyed on the words alone, `ForwardSink::xfer_id_raw`'s cache gave a lane
@@ -68,69 +68,32 @@ struct ArcSlots {
 }
 
 impl ArcSlots {
-    /// Every lane's transfer words, word-major: `out[k][i]` is lane `i`'s
-    /// word `k` of `words`.
+    /// Lane `i`'s transfer as plain words off the output slots: per root
+    /// its (low, high) 16.16 words, a boolean root's (value, known) bits,
+    /// the fin roots 0 where the outcome has none, and the `fin` flag last.
+    /// (Grouping a slice's lanes by their words, word-major, cost more than
+    /// it saved at ~7 live lanes a body: room (6,2) f57 emit 104 -> 181 s.)
     #[inline]
-    fn words16(&self, buf: &[u8]) -> [[u32; 16]; RAW_WORDS] {
-        let w16 = |o: usize| -> [u32; 16] {
-            let b: &[u8; 64] = buf[o..o + 64].try_into().unwrap();
-            std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
-        };
-        let mut out = [[0u32; 16]; RAW_WORDS];
+    fn words(&self, buf: &[u8], i: usize) -> RawWords {
+        let w = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+        let mut out = [0u32; RAW_WORDS];
         for (k, &(off, kind)) in self.roots.iter().enumerate() {
             if !self.fin && k % crate::trace::verify::ARC_AXIS_ROOTS == 4 {
                 continue;
             }
-            match kind {
-                RootKind::Num => {
-                    let v = w16(off);
-                    out[2 * k] = v;
-                    out[2 * k + 1] = v;
-                }
-                RootKind::Ival => {
-                    out[2 * k] = w16(off);
-                    out[2 * k + 1] = w16(off + 64);
-                }
+            let (lo, hi) = match kind {
+                RootKind::Num => (w(off + i * 4), w(off + i * 4)),
+                RootKind::Ival => (w(off + i * 4), w(off + 64 + i * 4)),
                 RootKind::Bool => {
                     let v = u16::from_le_bytes([buf[off], buf[off + 1]]);
                     let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
-                    out[2 * k] = std::array::from_fn(|i| (v >> i & 1) as u32);
-                    out[2 * k + 1] = std::array::from_fn(|i| (known >> i & 1) as u32);
+                    ((v >> i & 1) as u32, (known >> i & 1) as u32)
                 }
-            }
+            };
+            out[2 * k] = lo;
+            out[2 * k + 1] = hi;
         }
-        out[RAW_WORDS - 1] = [self.fin as u32; 16];
-        out
-    }
-
-    /// The transfer id of every lane in `take`: lanes are grouped by EXACT
-    /// equality of all their words (word-major compares), one interning
-    /// per group - a body's lanes in a slice mostly share their transfer.
-    #[inline]
-    fn ids16(&self, buf: &[u8], take: u16, chunk: &Rt2, lanes: &[usize], outcome: usize, sink: &mut crate::frame::ForwardSink) -> [u32; 16] {
-        let w = self.words16(buf);
-        let mut out = [0u32; 16];
-        let mut left = take;
-        while left != 0 {
-            let l = left.trailing_zeros() as usize;
-            let mut same = left;
-            for row in &w {
-                let v = row[l];
-                let mut m = 0u16;
-                for (i, &x) in row.iter().enumerate() {
-                    m |= ((x == v) as u16) << i;
-                }
-                same &= m;
-            }
-            let words: RawWords = std::array::from_fn(|k| w[k][l]);
-            let id = sink.xfer_id_raw(&words, |ws| ArcSlots::decode(&self.raw(ws, chunk, lanes[l], outcome), chunk, lanes[l], outcome));
-            let mut m = same;
-            while m != 0 {
-                out[m.trailing_zeros() as usize] = id;
-                m &= m - 1;
-            }
-            left &= !same;
-        }
+        out[RAW_WORDS - 1] = self.fin as u32;
         out
     }
 
@@ -474,10 +437,6 @@ impl AsmKernel {
                 n_lanes += take.count_ones() as u64;
                 let template = &self.acc_templates[body.outcome];
                 let keys = body.key_words16(outbuf);
-                let xfers = match slice_base {
-                    Some(_) => body.arc.ids16(outbuf, take, chunk, lanes, body.outcome, sink),
-                    None => [0; 16],
-                };
                 while take != 0 {
                     let i = take.trailing_zeros() as usize;
                     take &= take - 1;
@@ -489,7 +448,13 @@ impl AsmKernel {
                     );
                     let cin = cell_in[lanes[i]];
                     // THE TRANSFER: per producer, on the edge, never in the row.
-                    let xfer = xfers[i];
+                    let xfer = match slice_base {
+                        Some(_) => {
+                            let words = body.arc.words(outbuf, i);
+                            sink.xfer_id_raw(&words, |w| ArcSlots::decode(&body.arc.raw(w, chunk, lanes[i], body.outcome), chunk, lanes[i], body.outcome))
+                        }
+                        None => 0,
+                    };
                     // EMISSION-TIME PROVENANCE: the pos-graph and backward
                     // edges from lane `i` are recorded right here.
                     if let Some((first_cin, r)) = sink.seen.insert_ref(key, cin, 0) {

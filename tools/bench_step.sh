@@ -8,7 +8,9 @@
 #
 #   tools/bench_step.sh BASE_TREE ROOM LEVEL REPS [BIN]
 #   env: whatever the base was built with (CELESTE_HUNDRED, CELESTE_LOADING_JANK,
-#   CELESTE_LEVEL_MINUS_ONE, ...), CELESTE_THREADS.
+#   CELESTE_LEVEL_MINUS_ONE, ...), CELESTE_THREADS; PAUSE_PIDS: processes
+#   stopped (SIGSTOP) for the timed run and resumed after, so a long search
+#   on the same machine does not skew it.
 set -euo pipefail
 BASE=$1; ROOM=$2; LEVEL=$3; REPS=$4
 BIN=${5:-$(dirname "$0")/../target/release/rewrite}
@@ -23,9 +25,11 @@ for rep in $(seq 1 "$REPS"); do
   cp "$BASE/edges/done.txt" "$S/edges/"
   for f in "$BASE"/*; do [ -f "$f" ] && cp "$f" "$S/"; done
   sync
+  [ -n "${PAUSE_PIDS:-}" ] && { kill -STOP $PAUSE_PIDS 2>/dev/null || true; }
   t0=$(date +%s.%N)
   "$SAFE" --memory "${MEM:-40G}" -- "$BIN" forward --to $((F + 1)) --room "$ROOM" --level "$LEVEL" --checkpoint-dir "$S" > "$S.out" 2> "$S.err"
   t1=$(date +%s.%N)
+  [ -n "${PAUSE_PIDS:-}" ] && { kill -CONT $PAUSE_PIDS 2>/dev/null || true; }
   line=$(grep "^\[fwd\] f$(printf %03d $((F + 1)))" "$S.err" | sed -E 's/.*\| wave ([0-9]+) \(idle ([0-9]+)%\) door ([0-9]+) edges ([0-9]+) ckpt ([0-9]+) pos ([0-9]+) total ([0-9]+) ms.*/wave \1 ms (idle \2%) door \3 edges \4 ckpt \5 pos \6 frame \7 ms/')
   resume=$(grep -o "^\[resume\].*in [0-9.]* s\|, [0-9.]* s$" "$S.err" | head -1 | grep -o "[0-9.]* s$" || true)
   echo "rep $rep: f$F->f$((F + 1)) | $line | process $(awk "BEGIN{printf \"%.1f\", $t1 - $t0}") s (resume ${resume:-?})"
