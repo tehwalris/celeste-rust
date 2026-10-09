@@ -333,6 +333,8 @@ struct AsmKernel {
     fused_nodes: usize,
     /// Per input cell, its traced path (named by packing failures).
     input_names: Vec<String>,
+    /// `CELESTE_KERNEL_MIX`: the slices this kernel ran (`compiled::mix`).
+    mix_slices: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl AsmKernel {
@@ -371,6 +373,9 @@ impl AsmKernel {
         let t_setup = crate::frame::phases::start();
         let n = lanes.len();
         debug_assert!((1..=16).contains(&n));
+        if let Some(c) = &self.mix_slices {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // Skip the set insert for a repeated (input cell, output cell) pair.
         let mut last_edge = (u32::MAX, u32::MAX);
         let views = self.input_views(chunk);
@@ -1488,7 +1493,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
     }
     dup_refs(&mut asm_bodies);
 
-    let input_names = compiled
+    let input_names: Vec<String> = compiled
         .input_cells
         .iter()
         .map(|c| {
@@ -1500,6 +1505,41 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
                 .unwrap_or_else(|| format!("cell {c}, not an input slot"))
         })
         .collect();
+    let mut compiled = compiled;
+    let mix_slices = if crate::transpile::asm::mix_on() {
+        let mut roles = vec![0u8; flat_roots.len()];
+        let mut guards = Vec::with_capacity(asm_bodies.len());
+        let mut off = 0usize;
+        for b in &bodies {
+            let nfields = b.roots.len() - 2 - r.bound.outcomes[b.outcome].arc.len();
+            for (j, _) in b.roots.iter().enumerate() {
+                roles[slot_of[off + j]] |= match j {
+                    j if j < nfields => crate::compiled::mix::ROLE_FIELD,
+                    j if j == nfields => crate::compiled::mix::ROLE_ERROR,
+                    j if j == nfields + 1 => crate::compiled::mix::ROLE_LIVE,
+                    _ => crate::compiled::mix::ROLE_ARC,
+                };
+            }
+            guards.push((b.roots[nfields], b.roots[nfields + 1]));
+            off += b.roots.len();
+        }
+        let names: HashMap<u32, String> = compiled.input_cells.iter().copied().zip(input_names.iter().cloned()).collect();
+        crate::compiled::mix::report(&crate::compiled::mix::Input {
+            fused: &fused,
+            roots: &flat_roots,
+            roles: &roles,
+            bodies: &guards,
+            compiled: &compiled,
+            so: loaded.path(),
+            names: &names,
+            cart: &room.cart,
+        })
+        .with_context(|| format!("the mix report of {}", compiled.sym))?;
+        compiled.asm = String::new();
+        Some(crate::compiled::mix::counter(&compiled.sym))
+    } else {
+        None
+    };
     Ok((
         shape,
         AsmKernel {
@@ -1510,6 +1550,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
             forks: r.bound.forks,
             body_cols: Vec::new(),
             fused_nodes: fused.len(),
+            mix_slices,
             fused: if kernel_graph_kept() { fused } else { crate::transpile::graph::Graph::new() },
             flat_roots: if kernel_graph_kept() { flat_roots } else { Vec::new() },
             room,
