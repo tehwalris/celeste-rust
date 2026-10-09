@@ -96,7 +96,7 @@ impl FrameEngine {
         &self,
         bucket: &runtime2::Rt2,
         cell_in: &[u32],
-        lanes: std::ops::Range<usize>,
+        lanes: &[usize],
         sink: &mut crate::frame::ForwardSink,
     ) {
         if !dispatch::run_chunk_kernel(bucket, cell_in, lanes, sink) {
@@ -120,7 +120,7 @@ impl crate::frame::FrameStep for FrameEngine {
         &self,
         block: &crate::frame::Block,
         cell_in: &[u32],
-        lanes: std::ops::Range<usize>,
+        lanes: &[usize],
         sink: &mut crate::frame::ForwardSink,
     ) -> anyhow::Result<()> {
         self.run_bucket(block.rt2(), cell_in, lanes, sink);

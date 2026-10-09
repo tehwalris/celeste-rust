@@ -1603,7 +1603,7 @@ pub fn widened_keys_rt2(
 pub trait FrameStep: Sync {
     /// One frame of `lanes` of `block` into `sink`; called concurrently on
     /// disjoint ranges (scratch in the sink or behind a lock).
-    fn run(&self, block: &Block, cell_in: &[u32], lanes: Range<usize>, sink: &mut ForwardSink) -> Result<()>;
+    fn run(&self, block: &Block, cell_in: &[u32], lanes: &[usize], sink: &mut ForwardSink) -> Result<()>;
 
     /// Build what the engine builds on first use (the kernels) before a
     /// wave's clock starts: built inside the wave, the first frame's workers
@@ -1723,14 +1723,25 @@ pub fn forward_frame(
     st.rss_start = crate::metrics::current_rss_gb();
 
     let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
-    // Units in WAVE order: by first cell across the cell-sorted pieces.
-    let mut units = units_of(frontier.iter().map(Block::lanes), unit_lanes(frontier.iter().map(Block::lanes).sum(), workers));
-    // A unit of only skipped lanes is not run (it may have no kernel).
-    units.retain(|&(bi, lo, hi)| {
-        let sk = &frontier[bi].skip;
-        sk.is_empty() || sk[lo..hi].iter().any(|&s| !s)
-    });
-    units.sort_by_key(|&(bi, lo, _)| (cells[bi][lo], bi, lo));
+    // Per block its live lanes (a skipped lane is never expanded) by
+    // POSITION: region (the kernel key's), then cell. A piece holds its
+    // flushed queues in flush order, so neighbouring rows changed region
+    // every ~12 rows; in this order a unit is a few regions and few cells,
+    // its slices fill, and its dedup cache sees the outputs of neighbouring
+    // inputs together. Ids stay the rows' own (a slice may span id groups).
+    let grid = crate::trace::kernel::region_grid();
+    let order: Vec<Vec<usize>> = frontier
+        .iter()
+        .zip(&cells)
+        .map(|(b, c)| {
+            let mut o: Vec<usize> = (0..b.lanes()).filter(|&l| b.skip.is_empty() || !b.skip[l]).collect();
+            o.sort_by_key(|&l| (grid.and_then(|g| g.of_cell(c[l])), c[l], l));
+            o
+        })
+        .collect();
+    // Units in WAVE order: by first position.
+    let mut units = units_of(order.iter().map(Vec::len), unit_lanes(order.iter().map(Vec::len).sum(), workers));
+    units.sort_by_key(|&(bi, lo, _)| (cells[bi][order[bi][lo]], bi, lo));
     let next_unit = AtomicUsize::new(0);
     // Level -1's drops are noted against the input rows (`DropNotes`).
     let notes = (filters.notes_drops() && edges_dir.is_some()).then(|| DropNotes::new(&frontier));
@@ -1756,7 +1767,7 @@ pub fn forward_frame(
     let done: Vec<Done> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
-                let (frontier, cells, units, next_unit, seqs, notes) = (&frontier, &cells, &units, &next_unit, &seqs, notes.as_ref());
+                let (frontier, cells, order, units, next_unit, seqs, notes) = (&frontier, &cells, &order, &units, &next_unit, &seqs, notes.as_ref());
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     let t = Instant::now();
@@ -1776,7 +1787,7 @@ pub fn forward_frame(
                         // calls: queued rows carry a generation, flushed ones an id.
                         sink.seen.clear();
                         let t_unit = phases::start();
-                        engine.run(b, &cells[bi], lo..hi, &mut sink)?;
+                        engine.run(b, &cells[bi], &order[bi][lo..hi], &mut sink)?;
                         phases::add(phases::UNIT, t_unit);
                     }
                     let t_fin = phases::start();

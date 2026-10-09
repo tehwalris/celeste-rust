@@ -13,7 +13,7 @@ pub(crate) fn miss_report() -> String {
 pub(crate) fn run_chunk_kernel(
     chunk: &runtime2::Rt2,
     cell_in: &[u32],
-    lanes: std::ops::Range<usize>,
+    lanes: &[usize],
     sink: &mut crate::frame::ForwardSink,
 ) -> bool {
     // A miss is counted here and is fatal in the caller.
