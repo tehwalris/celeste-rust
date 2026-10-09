@@ -1,5 +1,50 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# The forward frame, 2026-10-09 night (release, 16 threads, branch `fg-2300`)
+
+The harness: `tools/bench_step.sh /var/tmp/h23base 6,2 r0sxhf 1 BIN` (room
+(6,2) 100%, 2300m, `CELESTE_HUNDRED=1 CELESTE_LOADING_JANK=2
+CELESTE_LEVEL_MINUS_ONE=94,5`; a hardlinked copy of a tree that ends at f56,
+then `forward --to 57`), the other search on the machine SIGSTOPped
+(`PAUSE_PIDS`). `FRAMES=2` also runs f58, which no binary builds anything in
+and which overlaps f57's edge compaction, as every frame of a real run does.
+f56 holds 5.86M states; f57 keeps 6.74M, f58 7.56M (identical in every row).
+
+**Caveat on the one-frame numbers below 38ea337:** the kernels (3.9 s) and,
+after a rebuild of the binary, the level -1 table (~34 s) were built lazily
+INSIDE the first wave, the other workers waiting on the build's lock (61 of
+152 worker-s). Those waves include ~3.9 s of build; f58 does not.
+
+| commit | change | f57 wave | f58 wave |
+|---|---|---|---|
+| e50c575 | the day's start | - | 17.7 s |
+| d357011 | per-unit dedup, region masking, raw transfer cache | 16.9 s (incl. build) | 17.0 s |
+| 2a381f3 | door delta hash map, dense drop notes, ids16 | 18.7 (incl. build) | - |
+| 2cbfcb4 | transfer words read per lane (ids16 dropped: emit 181 -> 93 worker-s) | 13.35 (incl. build) | - |
+| d8361a3 | each id group's lanes bucketed by region (padding 53% -> 36%) | 12.8 (incl. build) | - |
+| 691b80a | edge records: one 16-B store, dedup sorted as u128 (flush.edges 23 -> 18.5 worker-s) | ~12.8 (incl. build) | - |
+| f7264fd | one-fork-neighbour emission mask (emissions 1.03G -> 512M) | 11.0 (incl. build) | - |
+| eabc2a8 | level -1 at emission (rows after the unit dedup 113M -> 56.6M) | 9.5 (incl. build) | - |
+| 38ea337 | kernels and level -1 table built before the wave | **5.6** | **8.0** |
+
+The f57 phases now (worker-seconds of 16 x 5.9 s, `CELESTE_PHASES=1`): kernel
+8.9, emit 51.7, flush 29.1 (sort 1.2, door admit 7.4, edges 13.6, gather
+5.5, pre 0.9), the rest < 1. Unaccounted: none (unit 90.9 of 94.8).
+
+The edge compaction of the previous frame runs beside each wave: perf on
+f58 gives the `compact-f57` thread 17.3k samples at 499 Hz, ~35 CPU-s (134
+ns an edge over 258M edges), on the SMT siblings of the 16 workers. f58's
+2.4 s over f57 is that plus 12% more rows.
+
+Threads (f57 / f58): 16 -> 5.74 / 8.13 s, 24 -> 5.43 / 8.04, 32 -> 5.28 /
+8.02. Not worth a default change.
+
+Every change above left the graph byte-identical: `ckhash --edges` (room
+(1,0) `r0sxh` to f62 twice; room (6,2) to f40 against the binary before;
+the dropped-notes file, f057 states, e057 edges and posgraph.bin against the
+binary before for the level -1 change), plus the three gates and `nextest
+--cargo-profile quick --run-ignored all`.
+
 # 100%, 2026-10-08 (release, 16 threads, branch `hundred`, 55 GB cap)
 
 Shared machine (the gemskip campaign alongside): times are noisy. Peaks are

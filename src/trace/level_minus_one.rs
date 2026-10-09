@@ -956,7 +956,9 @@ fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32) -> Ve
 /// THE LEVEL -1 FILTER's table (`frame::level_minus_one`): per (block shape
 /// hash, player cell), a lower bound on the frames to an exit (`sound_d`).
 pub struct CostToGo {
-    d: HashMap<(u64, i16, i16), u32>,
+    /// Fx, not SipHash: probed per emitted row (`ForwardSink::minus_one_drop`).
+    /// Every iteration sorts first (`fingerprint`, `save`).
+    d: rustc_hash::FxHashMap<(u64, i16, i16), u32>,
     /// The start state's d: no exit is sooner than this.
     pub start_d: u32,
 }
@@ -1030,7 +1032,7 @@ pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo
     }
     let mut rep = String::new();
     let b = build(root, spd_px, threads, &mut rep)?;
-    let mut d = HashMap::new();
+    let mut d = rustc_hash::FxHashMap::default();
     for (&h, &id) in &b.by_hash {
         for (i, &(sid, x, y)) in b.g1.nodes.iter().enumerate() {
             if sid == id {
@@ -1112,7 +1114,7 @@ impl CostToGo {
         ensure!(u32_of(take(4)?) == CACHE_FORMAT, "another format");
         let start_d = u32_of(take(4)?);
         let n = u64_of(take(8)?) as usize;
-        let mut d = HashMap::with_capacity(n);
+        let mut d = rustc_hash::FxHashMap::with_capacity_and_hasher(n, Default::default());
         for _ in 0..n {
             let e = take(16)?;
             let (h, x, y, v) = (u64_of(&e[0..8]), i16::from_le_bytes([e[8], e[9]]), i16::from_le_bytes([e[10], e[11]]), u32_of(&e[12..16]));
