@@ -77,9 +77,10 @@ def check(path, nudge, cat):
     cst, cn = celia(level, path, gemskip)
     ch, ch_s = chain_result(chain.chain(cat, level, seeds, inputs, max(level - 1, 1)), 2 if level > 1 else 1)
     # A database file that dies on PICO-8, or never exits there (it was made
-    # in a tool computing in doubles: gemskipany 2600m dies, gemskip100 2800m
-    # never exits), breaks the boot chain: it restarts at the level after it,
-    # by an IL load, and says so (as chain.entry_jank does).
+    # in a tool computing in doubles: gemskipany 2600m dies), breaks the boot
+    # chain: it restarts at the level after it, by an IL load, and says so (as
+    # chain.entry_jank does). Where we have a valid file of our own for such a
+    # room (chain.OVERRIDES: gemskip100 2800m), the chain plays it instead.
     first = 1
     while True:
         nsegs = level - first + 1

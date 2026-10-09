@@ -255,6 +255,21 @@ the project's cleanup phase. Until then both must pass.
   chain breaks at the database's own 2600m, which dies on PICO-8 in every
   mode but finishes in UCT and Celia (they compute in doubles). Past it the
   boot restarts at 2700m.
+- gemskip100 (2026-10-09, branch `gs2900-verify`): the database's 2800m
+  (TAS28, 164) never exits on PICO-8 (it finishes in Celia only). Instead of
+  restarting the boot chain after it, we searched the room as real play
+  enters it (J 3, the only feasible start class; `r0sxhn,r0sxh`, level -1 at
+  H, `--to` 195 and 210 refuted at level 0, 216 raised: arc bound 213 at both
+  levels, concrete optimum **213 = 163f**, 1 under the database). The first
+  witness exits on PICO-8 but dies in UCT and Celia (doubles: a remainder
+  that is 0x0.7fff in 16.16 is exactly 0.5 there); a second optimal witness
+  (the concrete search's input order without `--prefer`) is VALID in IL,
+  UCT (163), Celia (163), the chain and the boot chain, chest seed 1.5.
+  It is `tas/tasdatabase/gemskip100/upload/TAS28.tas`, and
+  `pico8_diff/chain.py` plays it in the gemskip100 chain (`OVERRIDES`):
+  the boot chain runs unbroken from 100m to 3000m. 2900m is entered with
+  J 5 (start state matches field by field); our 115 (85f) is VALID there and
+  optimal at J 5.
 
 ## Caveats on what "optimal" means here
 
