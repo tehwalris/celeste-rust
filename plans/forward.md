@@ -15,7 +15,7 @@ kept), 16 workers on a 7950X3D (16 cores, 32 threads), DDR5 at 3600 MT/s
 | flush.admit | 6.3 | the door |
 | flush.gather | 4.9 | kept rows into the next frame's pieces |
 | flush (sort, pre, post) | 1.8 | |
-| beside the wave | ~27 CPU-s | the previous frame's edge compaction (raw records -> runs sorted by target) |
+| beside the wave | ~27 CPU-s | the previous frame's edge compaction (raw records -> runs sorted by target); GONE since `edge-inversion` (below) |
 
 **It is not memory-bound.** The format study's DRAM estimate for today's
 format is 45-85 GB a frame (1-1.9 s at 45 GB/s); the wave is 4.6 s of 16
@@ -110,6 +110,30 @@ schedules and against the binary before), plus the gates and the full suite.
    codegen change. The real gap is 78-89% live against 44-51% taking a
    lane: bodies that duplicate a neighbour (the mask drops them after the
    kernel) - decision 4 would remove them before it.
+
+## The edges inverted once (2026-10-09, branch `edge-inversion`)
+
+The forward keeps every frame's raw records (no compaction beside the
+waves) as 64k-record CHUNKS (`edges::write_chunk`, ~3.6 B a record against
+16), and the backward inverts the whole tree into the unchanged runs when
+it first opens the graph (`edges::invert` -> `compact_frames`: every
+(frame, layer) one single-threaded job on every hardware thread, under a
+memory bound). Measured (BENCHMARK_DATA.md, "The edges inverted once"):
+
+- the harness's f58 wave loses the compaction's contention: 6.76 -> 4.91 s
+  (quiet window; f57 4.4-4.5 s in all);
+- the 2300m tree's raw records are 46 GB (16-B records: 207 GB, more than
+  the disk had), its runs 48 GB;
+- inverting its 13.0G records: 71.5 s / 1670 CPU-s with per-frame
+  compactions 4 at a time -> 36-48 s / ~800-1000 CPU-s as layer jobs
+  (~28 cores busy in steady state; inside the search, on a machine shared
+  with other searches at load 20-49, 61-90 s). The runs are written at the
+  disk's ~1.3-1.4 GB/s: ~35 s is the floor on this machine;
+- end to end (shared machine, load 18-49, so wall times swing by 50%):
+  the branch 451 / 461 / 384 / 484 s against fg-2300's 585 / 391 / 587 /
+  473 s and bb09512's 749 / 770 s; user CPU 5463 / 5357 / 4595 / 5233 s
+  against 6653 / 5831 / 6564 / 6375 s (~-20%). Same optimum, witness and
+  gate lines in every run.
 
 The compaction's own cost (`rewrite compact-bench` over a frame's raw
 records kept by `CELESTE_KEEP_RAW=1`): f57's 258M records, 2.6 s wall and

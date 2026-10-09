@@ -337,16 +337,19 @@ enum Command {
         #[arg(long)]
         chain_out: Option<String>,
     },
-    /// BENCH: compact frame `frame`'s raw edge records again, from a copy
+    /// BENCH: invert frames `frame..=to`'s raw edge records, from a copy
     /// (hardlinks into `scratch`, which is replaced): the wall and CPU time
-    /// of `edges::compact_frame` and its phases, and the runs it writes
-    /// (`scratch/l*/f{frame}.bin`, to compare byte for byte). The raw
-    /// records survive a forward only under `CELESTE_KEEP_RAW=1`.
+    /// of `edges::invert` and its phases, and the runs it writes
+    /// (`scratch/l*/f*.bin`, to compare byte for byte). A tree's frames keep
+    /// their raw records until the backward inverts them.
     CompactBench {
         #[arg(long)]
         edges_dir: String,
         #[arg(long)]
         frame: u32,
+        /// The last frame (default: `frame`).
+        #[arg(long)]
+        to: Option<u32>,
         #[arg(long)]
         scratch: String,
     },
@@ -930,14 +933,12 @@ fn main() -> Result<()> {
                     let t = std::time::Instant::now();
                     let c = celeste_rust::search::edges::compact_frame(&edges_dir, frame + 1)?;
                     println!(
-                        "[bench]   compaction: {} records -> {} edges, {:.1} MB runs ({:.2} B/edge); read {:.0} sort {:.0} write {:.0} ms",
+                        "[bench]   compaction: {} records -> {} edges, {:.1} MB runs ({:.2} B/edge), {} layers",
                         c.records,
                         c.edges,
                         c.bytes as f64 / 1e6,
                         c.bytes as f64 / c.edges.max(1) as f64,
-                        c.t_read.as_secs_f64() * 1e3,
-                        c.t_sort.as_secs_f64() * 1e3,
-                        c.t_write.as_secs_f64() * 1e3
+                        c.layers
                     );
                     (t.elapsed(), c.records)
                 } else {
@@ -1453,20 +1454,24 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::CompactBench { edges_dir, frame, scratch } => {
-            use celeste_rust::search::edges::{compact_frame, raw_dir};
-            let (src, dst) = (raw_dir(std::path::Path::new(&edges_dir), frame), std::path::Path::new(&scratch));
+        Command::CompactBench { edges_dir, frame, to, scratch } => {
+            use celeste_rust::search::edges::{invert, raw_dir, set_done_frame};
+            let dst = std::path::Path::new(&scratch);
             if dst.exists() {
                 std::fs::remove_dir_all(dst)?;
             }
-            let to = raw_dir(dst, frame);
-            std::fs::create_dir_all(&to)?;
+            let last = to.unwrap_or(frame);
             let mut n = 0;
-            for e in std::fs::read_dir(&src).map_err(|e| anyhow::anyhow!("{}: {e}", src.display()))? {
-                let p = e?.path();
-                std::fs::hard_link(&p, to.join(p.file_name().expect("a file")))?;
-                n += 1;
+            for f in frame..=last {
+                let (src, to) = (raw_dir(std::path::Path::new(&edges_dir), f), raw_dir(dst, f));
+                std::fs::create_dir_all(&to)?;
+                for e in std::fs::read_dir(&src).map_err(|e| anyhow::anyhow!("{}: {e}", src.display()))? {
+                    let p = e?.path();
+                    std::fs::hard_link(&p, to.join(p.file_name().expect("a file")))?;
+                    n += 1;
+                }
             }
+            set_done_frame(dst, last)?;
             let cpu = || {
                 // SAFETY: getrusage fills the struct it is given.
                 let mut u: libc::rusage = unsafe { std::mem::zeroed() };
@@ -1474,17 +1479,15 @@ fn main() -> Result<()> {
                 u.ru_utime.tv_sec as f64 + u.ru_utime.tv_usec as f64 * 1e-6 + u.ru_stime.tv_sec as f64 + u.ru_stime.tv_usec as f64 * 1e-6
             };
             let (t0, c0) = (std::time::Instant::now(), cpu());
-            let st = compact_frame(dst, frame)?;
+            let st = invert(dst, last)?;
             println!(
-                "[compact-bench] f{frame:03}: {n} raw files, {} records -> {} edges, {:.1} MB runs; wall {:.2} s, cpu {:.1} s; read {:.2} sort {:.2} write {:.2} s",
+                "[compact-bench] f{frame:03}-f{last:03}: {n} raw files, {} layers, {} records -> {} edges, {:.1} MB runs; wall {:.2} s, cpu {:.1} s",
+                st.layers,
                 st.records,
                 st.edges,
                 st.bytes as f64 / 1e6,
                 t0.elapsed().as_secs_f64(),
-                cpu() - c0,
-                st.t_read.as_secs_f64(),
-                st.t_sort.as_secs_f64(),
-                st.t_write.as_secs_f64()
+                cpu() - c0
             );
         }
         Command::EdgeCensus { level_dir, frame, horizon } => {

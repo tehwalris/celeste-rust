@@ -5,14 +5,18 @@
 //! the source's id and the remainder transfer (`search::arc_edges`, a
 //! worker-local id). Records land in
 //! `<level>/edges/raw/f{frame}/l{target layer}_w{worker}.bin` beside each
-//! worker's transfer table (`x_w{worker}.bin`); `compact_frame` then merges
-//! the tables into the frame's (`xfer/f{frame}.bin`, sorted by value) and
-//! sorts each layer's records by target into the RUN `l{layer}/f{frame}.bin`
-//! (v5, `encode_sorted`: ~4 B an edge): every edge recorded at that frame
-//! into that layer, sources in layer `frame - 1`. A RAISE adds a frame's new
-//! edges beside its runs, in RAISED runs `l{layer}/f{frame}.raised.bin`
-//! (`compact_raised`, transfers appended to the frame's table). The backward
-//! (`bfs`) reads only runs, raised ones included.
+//! worker's transfer table (`x_w{worker}.bin`), and stay there through the
+//! forward: `edges/done.txt` names the last frame whose records are complete.
+//! The graph is INVERTED once, when it is first read (`EdgeGraph::open` ->
+//! `invert`): per frame `compact_frame` merges the tables into the frame's
+//! (`xfer/f{frame}.bin`, sorted by value) and sorts each layer's records by
+//! target into the RUN `l{layer}/f{frame}.bin` (v5, `encode_groups`: ~4 B an
+//! edge): every edge recorded at that frame into that layer, sources in layer
+//! `frame - 1`. A frame is inverted once its raw dir is gone. A RAISE inverts
+//! the tree first, then adds a frame's new edges beside its runs, in RAISED
+//! runs `l{layer}/f{frame}.raised.bin` (`compact_raised`, transfers appended
+//! to the frame's table). The backward (`bfs`) reads only runs, raised ones
+//! included.
 
 use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
@@ -20,13 +24,14 @@ use std::path::{Path, PathBuf};
 use crate::canon::Renumber;
 use crate::frame::{id_layer, pack_id};
 
-/// One edge record in a worker file, ONE LANE: the target's (seq, row)
-/// (layer: the file's), the source's (seq, row) (layer: the frame's input)
-/// and the transfer (worker-local id). The 64-lane mask records of run v4
-/// (24 B) averaged 1.006 lanes in room (6,2) gemskip nodiag f70, the rooms
-/// whose disk matters; room (1,0) f44 averaged 2.3, so its raw files grow
-/// 1.5x - they hold one frame, deleted at its compaction.
-pub const RECORD_BYTES: usize = 16;
+/// One edge record in a worker's buffer, ONE LANE, a u128 (`push_records`):
+/// the target's (seq, row) (layer: the buffer's), the source's (seq, row)
+/// (layer: the frame's input) and the transfer (worker-local id). The 64-lane
+/// mask records of run v4 (24 B) averaged 1.006 lanes in room (6,2) gemskip
+/// nodiag f70. A full buffer is written to the worker's raw file of its layer
+/// as a CHUNK (`write_chunk`, ~3.6 B a record): a tree keeps its frames' raw
+/// files until they are inverted, ~13.6G records in room (6,2) 100%.
+type Word = u128;
 
 /// Edges into `target` from the lanes `base + i` for the bits `i` of `mask`,
 /// one transfer (a run returns one edge each: `mask` 1).
@@ -39,13 +44,9 @@ pub struct Edge {
     pub mask: u64,
 }
 
-/// An edge in the compaction: `(target, source, transfer)`.
-type Rec = (u64, u64, u32);
-
-/// The edges of `mask`'s lanes from `base` into `target`, a record each, as
-/// u128s whose little-endian bytes are the record (`encode_record`).
+/// The edges of `mask`'s lanes from `base` into `target`, a record each.
 #[inline]
-pub fn push_records(out: &mut Vec<u128>, target: u64, base: u64, xfer: u32, mut mask: u64) {
+pub fn push_records(out: &mut Vec<Word>, target: u64, base: u64, xfer: u32, mut mask: u64) {
     // The target's half once; one word per source.
     let (tseq, trow) = (crate::frame::id_seq(target) as u16 as u128, crate::frame::id_row(target) as u128);
     let head = tseq | trow << 16 | (xfer as u128) << 96;
@@ -56,36 +57,101 @@ pub fn push_records(out: &mut Vec<u128>, target: u64, base: u64, xfer: u32, mut 
     }
 }
 
-/// Append the edges of `mask`'s lanes from `base` into `target` to a byte
-/// buffer, a record each.
-pub fn encode_record(out: &mut Vec<u8>, target: u64, base: u64, xfer: u32, mask: u64) {
-    let mut words = Vec::with_capacity(mask.count_ones() as usize);
-    push_records(&mut words, target, base, xfer, mask);
-    out.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+/// A record's target and source as (seq << 32 | row), and its transfer.
+#[inline]
+fn word_fields(w: Word) -> (u64, u64, u32) {
+    let t = (w as u64 & 0xffff) << 32 | (w >> 16) as u64 & 0xffff_ffff;
+    let s = ((w >> 48) as u64 & 0xffff) << 32 | (w >> 64) as u64 & 0xffff_ffff;
+    (t, s, (w >> 96) as u32)
 }
 
-/// Decode a record of layer `layer` recorded at `frame` (source in layer
-/// `frame - 1`), its transfer id mapped through `remap` into the frame's,
-/// its target through `ren` (the frame's own layer: `canon::Renumber`).
+/// Records a worker buffers per layer before it writes them as a chunk.
+pub const CHUNK_WORDS: usize = 1 << 16;
+
+/// Slots (log2) of a chunk's transfer predictor: per source hash, the last
+/// transfer recorded from it.
+const PREDICT_BITS: u32 = 10;
+
 #[inline]
-fn decode(b: &[u8], layer: u32, frame: u32, remap: &[u32], ren: Option<&Renumber>) -> Rec {
-    let tseq = u16::from_le_bytes(b[0..2].try_into().unwrap()) as u32;
-    let trow = u32::from_le_bytes(b[2..6].try_into().unwrap());
-    let sseq = u16::from_le_bytes(b[6..8].try_into().unwrap()) as u32;
-    let srow = u32::from_le_bytes(b[8..12].try_into().unwrap());
-    let x = u32::from_le_bytes(b[12..16].try_into().unwrap());
-    let target = pack_id(layer, tseq, trow);
-    (ren.map_or(target, |r| r.map(target)), pack_id(frame - 1, sseq, srow), remap[x as usize])
+fn predict_slot(s: u64) -> usize {
+    (s.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - PREDICT_BITS)) as usize
 }
 
-/// The target (seq, row) of record `i` as a sortable 48-bit value, through
-/// `ren` as `decode` maps it.
 #[inline]
-fn target_local(b: &[u8], i: usize, ren: Option<&Renumber>) -> u64 {
-    let o = i * RECORD_BYTES;
-    let t = ((u16::from_le_bytes(b[o..o + 2].try_into().unwrap()) as u64) << 32)
-        | u32::from_le_bytes(b[o + 2..o + 6].try_into().unwrap()) as u64;
-    ren.map_or(t, |r| r.map_local(t))
+fn zigzag(d: i64) -> u64 {
+    ((d << 1) ^ (d >> 63)) as u64
+}
+
+#[inline]
+fn unzigzag(v: u64) -> i64 {
+    (v >> 1) as i64 ^ -((v & 1) as i64)
+}
+
+/// Append `words` to `out` as one CHUNK: varints of the record count and
+/// the payload's bytes, then per record, varints: the target's (seq << 32 |
+/// row) as a zigzag delta from the previous record's; the source's likewise,
+/// shifted left by one over a HIT bit (the transfer is the predictor's for
+/// the source's slot, `PREDICT_BITS`); the transfer unless hit. Deltas and
+/// predictor restart at each chunk. Room (6,2) 100% f57: 3.57 B a record
+/// (target 1.66, source 1.1, the transfer 0.8 at a 66% hit rate), against 16.
+pub fn write_chunk(out: &mut Vec<u8>, words: &[Word]) {
+    if words.is_empty() {
+        return;
+    }
+    // The payload is written after room for the header, which is then
+    // written and the payload moved up to it (no second buffer).
+    const ROOM: usize = 20;
+    let start = out.len();
+    out.resize(start + ROOM, 0);
+    let mut predict = [u32::MAX; 1 << PREDICT_BITS];
+    let (mut pt, mut ps) = (0u64, 0u64);
+    for &w in words {
+        let (t, s, x) = word_fields(w);
+        let slot = predict_slot(s);
+        let hit = predict[slot] == x;
+        put_varint(out, zigzag(t.wrapping_sub(pt) as i64));
+        put_varint(out, zigzag(s.wrapping_sub(ps) as i64) << 1 | hit as u64);
+        if !hit {
+            put_varint(out, x as u64);
+            predict[slot] = x;
+        }
+        (pt, ps) = (t, s);
+    }
+    let len = out.len() - start - ROOM;
+    let mut head = Vec::with_capacity(ROOM);
+    put_varint(&mut head, words.len() as u64);
+    put_varint(&mut head, len as u64);
+    out[start..start + head.len()].copy_from_slice(&head);
+    out.copy_within(start + ROOM.., start + head.len());
+    out.truncate(start + head.len() + len);
+}
+
+/// Decode a raw file's chunks (`write_chunk`): `f(target, source, transfer)`
+/// per record, in the order written. Returns the records.
+fn read_chunks(b: &[u8], name: &Path, mut f: impl FnMut(u64, u64, u32)) -> Result<u64> {
+    let (mut pos, mut records) = (0usize, 0u64);
+    while pos < b.len() {
+        let n = get_varint_checked(b, &mut pos).with_context(|| format!("{}: a truncated chunk header", name.display()))?;
+        let len = get_varint_checked(b, &mut pos).with_context(|| format!("{}: a truncated chunk header", name.display()))? as usize;
+        ensure!(b.len() - pos >= len, "{}: a truncated chunk ({len} bytes, {} left)", name.display(), b.len() - pos);
+        let p = &b[pos..pos + len];
+        let mut predict = [u32::MAX; 1 << PREDICT_BITS];
+        let (mut q, mut t, mut s) = (0usize, 0u64, 0u64);
+        for _ in 0..n {
+            t = t.wrapping_add(unzigzag(get_varint(p, &mut q)) as u64);
+            let head = get_varint(p, &mut q);
+            s = s.wrapping_add(unzigzag(head >> 1) as u64);
+            let slot = predict_slot(s);
+            if head & 1 == 0 {
+                predict[slot] = get_varint(p, &mut q) as u32;
+            }
+            f(t, s, predict[slot]);
+        }
+        ensure!(q == len, "{}: a chunk of {n} records decoded {q} of its {len} bytes", name.display());
+        pos += len;
+        records += n;
+    }
+    Ok(records)
 }
 
 fn layer_dir(dir: &Path, layer: u32) -> PathBuf {
@@ -177,15 +243,13 @@ fn layers(dir: &Path) -> Vec<u32> {
     v
 }
 
+#[derive(Default)]
 pub struct CompactStats {
     pub records: u64,
     pub edges: u64,
     pub bytes: u64,
+    /// The layers compacted.
     pub layers: usize,
-    /// Wall time in the three phases: read + bucket, sort + encode, write.
-    pub t_read: std::time::Duration,
-    pub t_sort: std::time::Duration,
-    pub t_write: std::time::Duration,
 }
 
 /// Edges per index block of a run.
@@ -202,6 +266,24 @@ fn put_varint(out: &mut Vec<u8>, mut v: u64) {
         v >>= 7;
     }
     out.push(v as u8);
+}
+
+/// `get_varint` over bytes that may end early (`None`).
+fn get_varint_checked(b: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut v = 0u64;
+    let mut shift = 0;
+    loop {
+        let x = *b.get(*pos)?;
+        *pos += 1;
+        v |= ((x & 0x7f) as u64).checked_shl(shift)?;
+        if x & 0x80 == 0 {
+            return Some(v);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
 }
 
 #[inline]
@@ -246,33 +328,19 @@ struct TableCounts {
 }
 
 impl TableCounts {
-    fn add(&mut self, &(_, src, xfer): &Rec) {
-        let seq = crate::frame::id_seq(src) as usize;
+    /// An edge from `src` (seq << 32 | row) with transfer `xfer`.
+    #[inline]
+    fn add(&mut self, src: u64, xfer: u32) {
+        let seq = (src >> 32) as usize;
         if self.rows.len() <= seq {
             self.rows.resize(seq + 1, 0);
         }
-        self.rows[seq] = self.rows[seq].max(crate::frame::id_row(src) + 1);
+        self.rows[seq] = self.rows[seq].max(src as u32 + 1);
         let x = xfer as usize;
         if self.uses.len() <= x {
             self.uses.resize(x + 1, 0);
         }
         self.uses[x] += 1;
-    }
-
-    fn merge(mut self, o: TableCounts) -> TableCounts {
-        if self.rows.len() < o.rows.len() {
-            self.rows.resize(o.rows.len(), 0);
-        }
-        for (a, b) in self.rows.iter_mut().zip(o.rows) {
-            *a = (*a).max(b);
-        }
-        if self.uses.len() < o.uses.len() {
-            self.uses.resize(o.uses.len(), 0);
-        }
-        for (a, b) in self.uses.iter_mut().zip(o.uses) {
-            *a += b;
-        }
-        self
     }
 }
 
@@ -299,33 +367,31 @@ impl RunTables {
     }
 }
 
-/// Encode records sorted by target into blocks of `STRIDE` edges, a
-/// target's edges sorted by (source, transfer rank) and deduplicated. Per
-/// edge, varints: a HEAD, `delta << 1 | 1` at a block's or a target's first
-/// edge (the target's delta, then the source, dense (`RunTables`), in
-/// full), else `delta << 1` (the source's delta from the previous edge's,
-/// same target); then the transfer's rank. Returns `(index (first target,
+/// Encode a layer's edges, target by target in id order (`groups`: each
+/// target and its edges as `dense source << 32 | transfer rank`, which are
+/// sorted and deduplicated here), into blocks of `STRIDE` edges. Per edge,
+/// varints: a HEAD, `delta << 1 | 1` at a block's or a target's first edge
+/// (the target's delta, then the source, dense (`RunTables`), in full),
+/// else `delta << 1` (the source's delta from the previous edge's, same
+/// target); then the transfer's rank. Returns `(index (first target,
 /// offset), stream, edges)`. (Room (6,2) gemskip nodiag f70: 4.3 B an edge,
 /// 8.8 B a record in run v4; room (1,0) f44, 2.3 lanes a record: 3.1 B an
 /// edge, 9.5 B a record.)
-fn encode_sorted(recs: &[Rec], tabs: &RunTables) -> (Vec<(u64, u64)>, Vec<u8>, u64) {
-    let mut index: Vec<(u64, u64)> = Vec::with_capacity(recs.len() / STRIDE + 1);
-    let mut out: Vec<u8> = Vec::with_capacity(recs.len() * 5);
+fn encode_groups<'a>(groups: impl Iterator<Item = (u64, &'a mut [u64])>, records: usize) -> (Vec<(u64, u64)>, Vec<u8>, u64) {
+    let mut index: Vec<(u64, u64)> = Vec::with_capacity(records / STRIDE + 1);
+    let mut out: Vec<u8> = Vec::with_capacity(records * 4);
     let (mut edges, mut in_block) = (0u64, 0usize);
     let (mut prev_t, mut prev_s) = (0u64, 0u32);
-    let mut group: Vec<(u32, u32)> = Vec::new();
-    let mut i = 0;
-    while i < recs.len() {
-        let t = recs[i].0;
-        group.clear();
-        while i < recs.len() && recs[i].0 == t {
-            let (_, src, x) = recs[i];
-            group.push((tabs.seq_start[crate::frame::id_seq(src) as usize] + crate::frame::id_row(src), tabs.rank[x as usize]));
-            i += 1;
-        }
+    for (t, group) in groups {
         group.sort_unstable();
-        group.dedup();
-        for (k, &(s, r)) in group.iter().enumerate() {
+        let mut last = u64::MAX;
+        let mut k = 0usize;
+        for &e in group.iter() {
+            if e == last {
+                continue;
+            }
+            last = e;
+            let (s, r) = ((e >> 32) as u32, e as u32);
             let fresh = in_block == 0;
             if fresh {
                 index.push((t, out.len() as u64));
@@ -341,6 +407,7 @@ fn encode_sorted(recs: &[Rec], tabs: &RunTables) -> (Vec<(u64, u64)>, Vec<u8>, u
             prev_t = t;
             prev_s = s;
             edges += 1;
+            k += 1;
             in_block += 1;
             if in_block == STRIDE {
                 in_block = 0;
@@ -376,304 +443,136 @@ fn write_head(w: &mut impl std::io::Write, edges: u64, index: &[(u64, u64)], tab
 fn head_bytes(index: &[(u64, u64)], tabs: &RunTables) -> u64 {
     (RUN_HEADER + index.len() * 16 + tabs.seqs.len() * 8 + tabs.xfers.len() * 4) as u64
 }
-/// Records per sort chunk of a big layer: bounds the sort buffer (~1 GB)
-/// whatever the layer's size.
-const CHUNK_RECORDS: usize = 32 << 20;
-
-/// A layer's sort by target, one contiguous range of rank BUCKETS (at most
-/// `chunk_records` records) at a time: each range scattered by a pass over
-/// every file, its buckets sorted, appended to a `RunWriter` streaming to
-/// `stream_path`. Buckets are target order, so the run is sorted as a
-/// whole. Returns (the writer, sort time, write time).
-fn sort_layer_chunked(
-    files: &[(&[u8], &[u32])],
-    layer: u32,
-    frame: u32,
-    ren: Option<&Renumber>,
-    chunk_records: usize,
-    stream_path: &Path,
-) -> Result<(RunWriter, std::time::Duration, std::time::Duration)> {
-    let t_sort0 = std::time::Instant::now();
-    let mut t_write = std::time::Duration::ZERO;
-    let n_total: usize = files.iter().map(|(b, _)| b.len() / RECORD_BYTES).sum();
-    // Per file the targets' extent, and the counts toward the run's tables.
-    let scanned: Vec<(Vec<u32>, TableCounts)> = std::thread::scope(|scope| {
-        let hs: Vec<_> = files
-            .iter()
-            .map(|&(b, remap)| {
-                scope.spawn(move || {
-                    let mut max_row: Vec<u32> = Vec::new();
-                    let mut counts = TableCounts::default();
-                    for i in 0..b.len() / RECORD_BYTES {
-                        let t = target_local(b, i, ren);
-                        let (seq, row) = ((t >> 32) as usize, t as u32);
-                        if max_row.len() <= seq {
-                            max_row.resize(seq + 1, 0);
-                        }
-                        max_row[seq] = max_row[seq].max(row + 1);
-                        counts.add(&decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], layer, frame, remap, ren));
-                    }
-                    (max_row, counts)
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().expect("scan")).collect()
-    });
-    let mut counts = TableCounts::default();
-    let mut per_file_max: Vec<Vec<u32>> = Vec::with_capacity(scanned.len());
-    for (m, c) in scanned {
-        per_file_max.push(m);
-        counts = counts.merge(c);
-    }
-    let mut writer = RunWriter::new(stream_path, RunTables::new(counts)?)?;
-    let n_seq = per_file_max.iter().map(|m| m.len()).max().unwrap_or(0);
-    let mut piece_off: Vec<usize> = vec![0; n_seq + 1];
-    for seq in 0..n_seq {
-        let w = per_file_max.iter().map(|m| m.get(seq).copied().unwrap_or(0)).max().unwrap_or(0) as usize;
-        piece_off[seq + 1] = piece_off[seq] + w;
-    }
-    let n_ranks = piece_off[n_seq];
-    let rank_of = |t: u64| piece_off[(t >> 32) as usize] + t as u32 as usize;
-    // BUCKETS of 2^shift consecutive ranks, ~BUCKET_RECORDS records each on
-    // average: per file a histogram over buckets (its own, no atomics),
-    // then per chunk of buckets each file scatters into its own slots of
-    // every bucket, and each bucket is sorted by target in cache. (Counting
-    // by RANK with shared atomic cursors, a random atomic on a tens-of-MB
-    // array per record twice, was ~40% of a compaction.)
-    const BUCKET_RECORDS: usize = 1 << 14;
-    let per_rank = (n_total / n_ranks.max(1)).max(1);
-    let shift = (BUCKET_RECORDS / per_rank).max(1).ilog2();
-    let n_buckets = (n_ranks >> shift) + 1;
-    let bucket_of = |t: u64| rank_of(t) >> shift;
-    let per_file: Vec<Vec<u32>> = std::thread::scope(|scope| {
-        let hs: Vec<_> = files
-            .iter()
-            .map(|&(b, _)| {
-                let bucket_of = &bucket_of;
-                scope.spawn(move || {
-                    let mut h = vec![0u32; n_buckets];
-                    for i in 0..b.len() / RECORD_BYTES {
-                        h[bucket_of(target_local(b, i, ren))] += 1;
-                    }
-                    h
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().expect("bucket histogram")).collect()
-    });
-    let totals: Vec<usize> = (0..n_buckets).map(|k| per_file.iter().map(|h| h[k] as usize).sum()).collect();
-    debug_assert_eq!(totals.iter().sum::<usize>(), n_total);
-    // Chunk cuts at bucket boundaries: a chunk closes once it holds
-    // `chunk_records` (a bucket is never split).
-    let mut cuts: Vec<(usize, usize)> = vec![(0, 0)]; // (bucket, first position)
-    let mut acc = 0usize;
-    for (k, &c) in totals.iter().enumerate() {
-        if acc - cuts.last().unwrap().1 >= chunk_records && c > 0 {
-            cuts.push((k, acc));
-        }
-        acc += c;
-    }
-    cuts.push((n_buckets, n_total));
-    // One buffer for every chunk: a fresh one faulted in each time.
-    let max_chunk = cuts.windows(2).map(|w| w[1].1 - w[0].1).max().unwrap_or(0);
-    let mut out: Vec<Rec> = Vec::with_capacity(max_chunk);
-    let threads = crate::frame::threads().max(1);
-    for w in cuts.windows(2) {
-        let ((k_lo, base), (k_hi, end)) = (w[0], w[1]);
-        let n_chunk = end - base;
-        if n_chunk == 0 {
-            continue;
-        }
-        let nb = k_hi - k_lo;
-        let mut starts = vec![0usize; nb + 1];
-        for k in 0..nb {
-            starts[k + 1] = starts[k] + totals[k_lo + k];
-        }
-        // File f's slots in bucket k start after the earlier files'.
-        let mut cursors: Vec<Vec<usize>> = Vec::with_capacity(files.len());
-        let mut next = starts[..nb].to_vec();
-        for h in &per_file {
-            cursors.push(next.clone());
-            for k in 0..nb {
-                next[k] += h[k_lo + k] as usize;
-            }
-        }
-        out.clear();
-        // SAFETY: every position 0..n_chunk is written exactly once below
-        // (the files' slots partition each bucket, the buckets the chunk);
-        // the element type has no drop glue.
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            out.set_len(n_chunk);
-        }
-        {
-            let out_ptr = out.as_mut_ptr() as usize;
-            std::thread::scope(|scope| {
-                for (&(b, remap), mut cur) in files.iter().zip(cursors) {
-                    let bucket_of = &bucket_of;
-                    scope.spawn(move || {
-                        let out_ptr = out_ptr as *mut Rec;
-                        for i in 0..b.len() / RECORD_BYTES {
-                            let k = bucket_of(target_local(b, i, ren));
-                            if k < k_lo || k >= k_hi {
-                                continue;
-                            }
-                            let e = decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], layer, frame, remap, ren);
-                            let pos = cur[k - k_lo];
-                            cur[k - k_lo] += 1;
-                            // SAFETY: this file's own slot, unique and < n_chunk.
-                            unsafe { out_ptr.add(pos).write(e) };
-                        }
-                    });
-                }
-            });
-        }
-        // Each bucket by target (a target's records are one run; their
-        // order within it is `encode_sorted`'s).
-        {
-            let mut slices: Vec<Vec<&mut [Rec]>> = (0..threads).map(|_| Vec::new()).collect();
-            let mut rest: &mut [Rec] = &mut out;
-            for k in 0..nb {
-                let (head, tail) = rest.split_at_mut(starts[k + 1] - starts[k]);
-                slices[k % threads].push(head);
-                rest = tail;
-            }
-            std::thread::scope(|scope| {
-                for mine in slices {
-                    scope.spawn(move || {
-                        for sl in mine {
-                            sl.sort_unstable_by_key(|r| r.0);
-                        }
-                    });
-                }
-            });
-        }
-        let t0 = std::time::Instant::now();
-        writer.append(&out, crate::frame::threads() * 2)?;
-        t_write += t0.elapsed();
-    }
-    Ok((writer, t_sort0.elapsed() - t_write, t_write))
-}
-
-/// A run file written in sorted slices (index in memory, stream to a temp
-/// file); `finish` writes the run.
-struct RunWriter {
-    tabs: RunTables,
-    index: Vec<(u64, u64)>,
-    stream: std::io::BufWriter<std::fs::File>,
-    stream_path: PathBuf,
-    off: u64,
-    edges: u64,
-}
-
-impl RunWriter {
-    fn new(stream_path: &Path, tabs: RunTables) -> Result<Self> {
-        Ok(RunWriter {
-            tabs,
-            index: Vec::new(),
-            stream: std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(stream_path)?),
-            stream_path: stream_path.to_path_buf(),
-            off: 0,
-            edges: 0,
-        })
-    }
-
-    /// Append a slice sorted by target, whose targets all follow the
-    /// previous slice's; `encode_chunks` parallel ranges.
-    fn append(&mut self, sorted: &[Rec], encode_chunks: usize) -> Result<()> {
-        use std::io::Write;
-        debug_assert!(self.index.last().is_none_or(|&(t, _)| sorted.first().is_none_or(|r| r.0 > t)));
-        let tabs = &self.tabs;
-        let encoded: Vec<(Vec<(u64, u64)>, Vec<u8>, u64)> = if encode_chunks <= 1 {
-            vec![encode_sorted(sorted, tabs)]
-        } else {
-            let cuts = cuts_at_target_changes(sorted, encode_chunks);
-            std::thread::scope(|scope| {
-                let hs: Vec<_> = cuts
-                    .windows(2)
-                    .map(|w| {
-                        let sl = &sorted[w[0]..w[1]];
-                        scope.spawn(move || encode_sorted(sl, tabs))
-                    })
-                    .collect();
-                hs.into_iter().map(|h| h.join().expect("edge encoder panicked")).collect()
-            })
+/// The records of one layer of one frame, decoded from its raw files:
+/// `f(target (seq << 32 | row), source (seq << 32 | row), the frame's
+/// transfer id)`, the target through `ren` (the frame's renumbering, when
+/// `files` are its own layer's). The one place a record's fields are
+/// interpreted.
+fn layer_records(files: &[(memmap2::Mmap, &Path, &[u32])], ren: Option<&Renumber>, mut f: impl FnMut(u64, u64, u32)) -> Result<u64> {
+    let mut n = 0;
+    for (b, path, remap) in files {
+        n += match ren {
+            Some(r) => read_chunks(b, path, |t, s, x| f(r.map_local(t), s, remap[x as usize]))?,
+            None => read_chunks(b, path, |t, s, x| f(t, s, remap[x as usize]))?,
         };
-        for (ix, s, e) in &encoded {
-            for &(t, o) in ix {
-                self.index.push((t, o + self.off));
-            }
-            self.stream.write_all(s)?;
-            self.off += s.len() as u64;
-            self.edges += e;
-        }
-        Ok(())
     }
-
-    /// Write the run to `tmp`, rename it to `path`. Returns (edges, bytes).
-    fn finish(mut self, path: &Path, tmp: &Path) -> Result<(u64, u64)> {
-        use std::io::Write;
-        self.stream.flush()?;
-        drop(self.stream);
-        {
-            let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(tmp)?);
-            write_head(&mut w, self.edges, &self.index, &self.tabs)?;
-            let mut s = std::fs::File::open(&self.stream_path)?;
-            std::io::copy(&mut s, &mut w)?;
-            w.flush()?;
-        }
-        std::fs::remove_file(&self.stream_path)?;
-        std::fs::rename(tmp, path)?;
-        Ok((self.edges, head_bytes(&self.index, &self.tabs) + self.off))
-    }
+    Ok(n)
 }
 
-/// Boundaries of `chunks` ranges over `recs` (sorted by target), moved
-/// forward so no target's group straddles one.
-fn cuts_at_target_changes(recs: &[Rec], chunks: usize) -> Vec<usize> {
-    let n = recs.len();
-    let mut cuts: Vec<usize> = vec![0];
-    for k in 1..chunks {
-        let mut i = (k * n) / chunks;
-        while i < n && i > 0 && recs[i].0 == recs[i - 1].0 {
-            i += 1;
-        }
-        cuts.push(i);
-    }
-    cuts.push(n);
-    cuts.dedup();
-    cuts
+/// Per worker of an inversion: the buffers its layers reuse (a fresh one
+/// faulted in per layer was a third of an inversion's time, in the kernel).
+#[derive(Default)]
+struct LayerBufs {
+    /// Per target seq, the records into each row (then their slots).
+    counts: Vec<Vec<u32>>,
+    items: Vec<u64>,
 }
 
-/// Encode a layer's records into a run file (`tmp` then renamed to `path`),
-/// in one piece. Returns (edges, bytes).
-fn write_run(mut recs: Vec<Rec>, path: &Path, tmp: &Path) -> Result<(u64, u64)> {
-    let tabs = RunTables::new(recs.iter().fold(TableCounts::default(), |mut c, r| {
-        c.add(r);
-        c
-    }))?;
-    recs.sort_unstable_by_key(|r| r.0);
-    let (index, stream, edges) = encode_sorted(&recs, &tabs);
+/// One layer's raw files at `frame` into the run `out` (written to `tmp`,
+/// renamed): two passes over the records - target counts per (seq, row)
+/// and the run's tables, then a counting sort of the edges as encoded
+/// (dense source, transfer rank) into place - and the encoder
+/// over the whole layer (`remaps`: per worker, its transfer ids' in the
+/// frame's table; `renumber`: the frame's, applied to its own layer). Single-threaded: an inversion runs many layers at
+/// once (`compact_frames`). Returns (records, edges, run bytes).
+fn invert_layer(files: &[RawFile], (remaps, renumber): &(rustc_hash::FxHashMap<u32, Vec<u32>>, Renumber), layer: u32, frame: u32, out: &Path, tmp: &Path, bufs: &mut LayerBufs) -> Result<(u64, u64, u64)> {
+    let maps: Vec<(memmap2::Mmap, &Path, &[u32])> = files
+        .iter()
+        .map(|(f, w)| -> Result<_> {
+            let file = std::fs::File::open(f).with_context(|| f.display().to_string())?;
+            // SAFETY: the worker files are complete and never modified once
+            // the frame's wave is over; they are deleted below.
+            Ok((unsafe { memmap2::Mmap::map(&file)? }, f.as_path(), remaps.get(w).map_or(&[][..], |v| v.as_slice())))
+        })
+        .collect::<Result<_>>()?;
+    let ren = (renumber.layer() == layer).then_some(renumber);
+    let counts = &mut bufs.counts;
+    for c in counts.iter_mut() {
+        c.clear();
+    }
+    let mut tc = TableCounts::default();
+    let n = layer_records(&maps, ren, |t, s, x| {
+        let (seq, row) = ((t >> 32) as usize, t as u32 as usize);
+        if counts.len() <= seq {
+            counts.resize_with(seq + 1, Vec::new);
+        }
+        let c = &mut counts[seq];
+        if c.len() <= row {
+            c.resize(row + 1, 0);
+        }
+        c[row] += 1;
+        tc.add(s, x);
+    })? as usize;
+    let tabs = RunTables::new(tc)?;
+    // Each (seq, row)'s first slot, targets in id order.
+    let mut acc = 0u32;
+    for c in counts.iter_mut() {
+        for v in c.iter_mut() {
+            let k = *v;
+            *v = acc;
+            acc += k;
+        }
+    }
+    debug_assert_eq!(acc as usize, n);
+    // The edges as they are encoded, `dense source << 32 | transfer rank`
+    // (8 B: the scatter's random writes are the inversion's main cost).
+    let items = &mut bufs.items;
+    items.clear();
+    items.reserve(n);
+    {
+        let ptr = items.as_mut_ptr();
+        let mut placed = 0usize;
+        layer_records(&maps, ren, |t, s, x| {
+            let slot = &mut counts[(t >> 32) as usize][t as u32 as usize];
+            let e = ((tabs.seq_start[(s >> 32) as usize] + s as u32) as u64) << 32 | tabs.rank[x as usize] as u64;
+            // SAFETY: the slots of the first pass's counts partition 0..n,
+            // and this pass decodes the same records.
+            unsafe { ptr.add(*slot as usize).write(e) };
+            *slot += 1;
+            placed += 1;
+        })?;
+        ensure!(placed == n, "layer {layer} of frame {frame}: {placed} records on the second pass, {n} on the first");
+        // SAFETY: every slot below n was written once above.
+        unsafe { items.set_len(n) };
+    }
+    drop(maps);
+    // Each (seq, row)'s slot is now its group's end.
+    let groups = counts.iter().enumerate().flat_map(|(seq, c)| c.iter().enumerate().map(move |(row, &end)| (pack_id(layer, seq as u32, row as u32), end as usize)));
+    let mut rest: &mut [u64] = &mut items[..];
+    let mut start = 0usize;
+    let groups = groups.filter_map(|(t, end)| {
+        if end == start {
+            return None;
+        }
+        let (g, r) = std::mem::take(&mut rest).split_at_mut(end - start);
+        rest = r;
+        start = end;
+        Some((t, g))
+    });
+    let (index, stream, edges) = encode_groups(groups, n);
     {
         use std::io::Write;
         let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(tmp)?);
         write_head(&mut w, edges, &index, &tabs)?;
         w.write_all(&stream)?;
         w.flush()?;
+        // Its writeback started now: 49 GB of runs left dirty stalled a
+        // whole inversion under the search's memory cap (page cache counts).
+        use std::os::fd::AsRawFd;
+        // SAFETY: a valid fd; SYNC_FILE_RANGE_WRITE only starts writeback.
+        unsafe { libc::sync_file_range(w.get_ref().as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) };
     }
-    std::fs::rename(tmp, path)?;
-    Ok((edges, head_bytes(&index, &tabs) + stream.len() as u64))
+    std::fs::rename(tmp, out)?;
+    for (f, _) in files {
+        std::fs::remove_file(f)?;
+    }
+    Ok((n as u64, edges, head_bytes(&index, &tabs) + stream.len() as u64))
 }
-/// Records above which a layer gets the parallel counting sort; smaller
-/// layers are comparison-sorted whole, several at a time (~40 ms at this
-/// size, so no single small layer becomes the critical path).
-const BIG_LAYER: usize = 1 << 19;
 
 /// After frame `frame`: turn every layer's worker files into the run
-/// `l{layer}/f{frame}.bin` and delete them. Big layers one at a time with
-/// every thread; small layers in parallel, one thread each.
+/// `l{layer}/f{frame}.bin` and delete them (`compact_frames`).
 pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
-    compact(dir, frame, false)
+    compact_frames(dir, &[frame], false)
 }
 
 /// A RAISE's records at frame `frame` (`frame::ForwardState::raise`: only
@@ -683,128 +582,164 @@ pub fn compact_frame(dir: &Path, frame: u32) -> Result<CompactStats> {
 /// so the runs' ids keep their meaning. A frame's edges are its runs' and
 /// its raised runs' (`EdgeGraph`).
 pub fn compact_raised(dir: &Path, frame: u32) -> Result<CompactStats> {
-    compact(dir, frame, true)
+    compact_frames(dir, &[frame], true)
 }
 
-/// `CELESTE_KEEP_RAW=1`: a compaction leaves the raw files (for
-/// `rewrite compact-bench`, which compacts a copy of them).
-fn keep_raw() -> bool {
-    std::env::var("CELESTE_KEEP_RAW").is_ok_and(|v| v == "1")
-}
+/// Bytes of memory a layer's inversion holds per byte of its raw files
+/// (~3.6 B a record: the sorted edges at 8 B, the run's stream, counts).
+const MEM_PER_RAW_BYTE: u64 = 4;
 
-fn compact(dir: &Path, frame: u32, raised: bool) -> Result<CompactStats> {
-    let out_path = |layer: u32| if raised { raised_path(dir, layer, frame) } else { run_path(dir, layer, frame) };
-    let remaps = merge_xfer_tables(dir, frame, raised)?;
-    // Targets in the frame's own layer were written as flush ids.
-    let renumber = Renumber::load(&renumber_path(dir, frame))?;
-    let ren_of = |layer: u32| (renumber.layer() == layer).then_some(&renumber);
-    let remap_of = |worker: u32| -> &[u32] { remaps.get(&worker).map_or(&[], |v| v.as_slice()) };
-    let mut layers: Vec<(u32, Vec<RawFile>, u64)> = raw_files(dir, frame);
-    layers.sort_by_key(|&(_, _, bytes)| std::cmp::Reverse(bytes));
-    let mut st = CompactStats {
-        records: 0,
-        edges: 0,
-        bytes: 0,
-        layers: layers.len(),
-        t_read: std::time::Duration::ZERO,
-        t_sort: std::time::Duration::ZERO,
-        t_write: std::time::Duration::ZERO,
-    };
-    let read_all = |files: &[RawFile]| -> Result<Vec<Vec<u8>>> {
-        files
-            .iter()
-            .map(|(f, _)| {
-                let b = std::fs::read(f).with_context(|| f.display().to_string())?;
-                ensure!(b.len() % RECORD_BYTES == 0, "{}: truncated edge file", f.display());
-                Ok(b)
-            })
-            .collect()
-    };
-    let (big, small): (Vec<_>, Vec<_>) = layers.into_iter().partition(|(_, _, bytes)| *bytes as usize / RECORD_BYTES >= BIG_LAYER);
-    for (layer, files, bytes) in &big {
-        let t0 = std::time::Instant::now();
-        // MAPPED, not read: a big layer is GBs, and a heap copy would sit
-        // in RSS through the next frame's wave; mapped, it is page cache.
-        let maps: Vec<memmap2::Mmap> = files
-            .iter()
-            .map(|(f, _)| -> Result<memmap2::Mmap> {
-                let file = std::fs::File::open(f).with_context(|| f.display().to_string())?;
-                // SAFETY: the worker files are complete and never modified
-                // once the frame's wave is over; they are deleted below.
-                let m = unsafe { memmap2::Mmap::map(&file)? };
-                ensure!(m.len() % RECORD_BYTES == 0, "{}: truncated edge file", f.display());
-                Ok(m)
-            })
-            .collect::<Result<_>>()?;
-        let views: Vec<(&[u8], &[u32])> = maps.iter().zip(files).map(|(m, (_, w))| (&m[..], remap_of(*w))).collect();
-        st.records += *bytes / RECORD_BYTES as u64;
-        st.t_read += t0.elapsed();
-        // Sorted in CHUNKS streamed into the run: a bounded sort buffer.
-        let ldir = layer_dir(dir, *layer);
-        std::fs::create_dir_all(&ldir)?;
-        let (writer, t_sort, t_write) = sort_layer_chunked(&views, *layer, frame, ren_of(*layer), CHUNK_RECORDS, &ldir.join(format!("tmp-f{:03}.stream", frame)))?;
-        drop(views);
-        drop(maps);
-        st.t_sort += t_sort;
-        let t0 = std::time::Instant::now();
-        let (edges, bytes) = writer.finish(&out_path(*layer), &ldir.join(format!("tmp-f{:03}.bin", frame)))?;
-        for (f, _) in files.iter().filter(|_| !keep_raw()) {
-            std::fs::remove_file(f)?;
+/// The memory the layers in flight may hold together (`MEM_PER_RAW_BYTE`);
+/// a layer alone may exceed it. Room (6,2) 100%'s largest layer is 454 MB
+/// of raw records (~4 GB inverted).
+const INVERT_MEM: u64 = 24 << 30;
+
+/// Compact `frames`' raw records into their runs (`raised`: raised runs):
+/// every (frame, layer) is one job (`invert_layer`), largest first (the
+/// smallest while the largest left would pass the memory bound,
+/// `INVERT_MEM`), on every hardware thread.
+/// A frame's raw dir goes after its last layer: a frame is inverted once
+/// its raw dir is gone. Crash-safe: a run is renamed into place complete,
+/// and a layer whose (non-raised) run exists is done - its leftover raw
+/// files are stale and go.
+fn compact_frames(dir: &Path, frames: &[u32], raised: bool) -> Result<CompactStats> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut st = CompactStats::default();
+    // Every layer still to do as a job; a layer whose (non-raised) run is
+    // in place is done, its leftover raw files stale.
+    let mut jobs: Vec<(usize, u32, Vec<RawFile>, u64)> = Vec::new();
+    for (i, &frame) in frames.iter().enumerate() {
+        for (layer, files, bytes) in raw_files(dir, frame) {
+            if !raised && run_path(dir, layer, frame).exists() {
+                for (f, _) in &files {
+                    std::fs::remove_file(f)?;
+                }
+                continue;
+            }
+            std::fs::create_dir_all(layer_dir(dir, layer))?;
+            jobs.push((i, layer, files, bytes));
         }
-        st.edges += edges;
-        st.bytes += bytes;
-        st.t_write += t_write + t0.elapsed();
     }
-    // The small layers: a pool of threads, a layer each.
-    let t0 = std::time::Instant::now();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let totals: Vec<(u64, u64, u64)> = std::thread::scope(|scope| {
-        let hs: Vec<_> = (0..crate::frame::threads().min(small.len().max(1)))
-            .map(|_| {
-                let (small, next, read_all, remap_of, out_path, ren_of) = (&small, &next, &read_all, &remap_of, &out_path, &ren_of);
-                scope.spawn(move || -> Result<(u64, u64, u64)> {
-                    let (mut records, mut edges, mut bytes) = (0u64, 0u64, 0u64);
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some((layer, files, fbytes)) = small.get(i) else { break };
-                        let contents = read_all(files)?;
-                        let mut recs: Vec<Rec> = Vec::with_capacity(*fbytes as usize / RECORD_BYTES);
-                        for (b, (_, w)) in contents.iter().zip(files) {
-                            let remap = remap_of(*w);
-                            for i in 0..b.len() / RECORD_BYTES {
-                                recs.push(decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], *layer, frame, remap, ren_of(*layer)));
+    jobs.sort_by_key(|j| std::cmp::Reverse(j.3));
+    st.layers = jobs.len();
+    let left: Vec<AtomicUsize> = (0..frames.len()).map(|i| AtomicUsize::new(jobs.iter().filter(|j| j.0 == i).count())).collect();
+    // Per frame with layers to do: its transfer remaps (the workers' tables
+    // merged, in parallel: a tree's are seconds of work) and its renumbering
+    // (`canon::Renumber`: the targets in its own layer were written as flush
+    // ids; a frame's raw records are refused without it). A frame with none
+    // left (an inversion killed after its last layer) only loses its leftovers:
+    // merging its remaining tables again would overwrite the frame's.
+    type FrameMaps = Option<(rustc_hash::FxHashMap<u32, Vec<u32>>, Renumber)>;
+    let todo: Vec<usize> = (0..frames.len()).collect();
+    let maps: Vec<FrameMaps> = std::thread::scope(|scope| {
+        let chunk = todo.len().div_ceil(std::thread::available_parallelism().map_or(2, |n| n.get())).max(1);
+        let hs: Vec<_> = todo
+            .chunks(chunk)
+            .map(|part| {
+                let left = &left;
+                scope.spawn(move || -> Result<Vec<FrameMaps>> {
+                    part.iter()
+                        .map(|&i| {
+                            if left[i].load(Ordering::Relaxed) == 0 {
+                                return Ok(None);
                             }
-                        }
-                        drop(contents);
-                        let ldir = layer_dir(dir, *layer);
-                        std::fs::create_dir_all(&ldir)?;
-                        let n = recs.len() as u64;
-                        let (p, b) = write_run(recs, &out_path(*layer), &ldir.join(format!("tmp-f{:03}.bin", frame)))?;
-                        for (f, _) in files.iter().filter(|_| !keep_raw()) {
-                            std::fs::remove_file(f)?;
-                        }
-                        records += n;
-                        edges += p;
-                        bytes += b;
-                    }
-                    Ok((records, edges, bytes))
+                            let remaps = merge_xfer_tables(dir, frames[i], raised)?;
+                            Ok(Some((remaps, Renumber::load(&renumber_path(dir, frames[i]))?)))
+                        })
+                        .collect()
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().expect("edge compaction worker panicked")).collect::<Result<Vec<_>>>()
-    })?;
-    for (r, p, b) in totals {
-        st.records += r;
-        st.edges += p;
-        st.bytes += b;
-    }
-    st.t_sort += t0.elapsed();
-    if !keep_raw() {
-        for w in remaps.keys() {
-            std::fs::remove_file(raw_xfer_path(dir, frame, *w))?;
+        hs.into_iter().map(|h| h.join().expect("transfer table merge panicked")).collect::<Result<Vec<_>>>()
+    })?
+    .into_iter()
+    .flatten()
+    .collect();
+    // A frame's tables and renumbering go after its last layer, then (last)
+    // its raw dir: a frame is inverted once its raw dir is gone (`invert`).
+    let finish_frame = |i: usize| -> Result<()> {
+        let raw = raw_dir(dir, frames[i]);
+        for e in std::fs::read_dir(&raw).into_iter().flatten().flatten() {
+            let p = e.path();
+            let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if n.starts_with("x_w") || n == "renumber.bin" {
+                std::fs::remove_file(&p)?;
+            }
         }
-        std::fs::remove_file(renumber_path(dir, frame))?;
-        let _ = std::fs::remove_dir(raw_dir(dir, frame));
+        if raw.exists() {
+            std::fs::remove_dir(&raw).with_context(|| format!("{}: left over after the compaction", raw.display()))?;
+        }
+        Ok(())
+    };
+    for (i, l) in left.iter().enumerate() {
+        if l.load(Ordering::Relaxed) == 0 {
+            finish_frame(i)?;
+        }
+    }
+    // The queue: jobs[front..back] left, largest first. A worker takes the
+    // largest left if the memory in flight allows it, else the smallest
+    // (they fit, and keep every thread busy while the large ones queue).
+    let need_of = |k: usize| jobs[k].3 * MEM_PER_RAW_BYTE;
+    let queue = (std::sync::Mutex::new((0usize, jobs.len(), 0u64)), std::sync::Condvar::new());
+    let take = || -> Option<usize> {
+        let mut q = queue.0.lock().expect("inversion queue");
+        loop {
+            let (front, back, held) = *q;
+            if front >= back {
+                return None;
+            }
+            if held == 0 || held + need_of(front) <= INVERT_MEM {
+                *q = (front + 1, back, held + need_of(front));
+                return Some(front);
+            }
+            if back - 1 > front && held + need_of(back - 1) <= INVERT_MEM {
+                *q = (front, back - 1, held + need_of(back - 1));
+                return Some(back - 1);
+            }
+            q = queue.1.wait(q).expect("inversion queue");
+        }
+    };
+    let release = |need: u64| {
+        queue.0.lock().expect("inversion queue").2 -= need;
+        queue.1.notify_all();
+    };
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get()).min(jobs.len());
+    let totals: Vec<(u64, u64, u64)> = std::thread::scope(|scope| {
+        let hs: Vec<_> = (0..workers)
+            .map(|_| {
+                let (jobs, take, release, left, maps, finish_frame) = (&jobs, &take, &release, &left, &maps, &finish_frame);
+                scope.spawn(move || -> Result<(u64, u64, u64)> {
+                    let mut bufs = LayerBufs::default();
+                    let mut tot = (0u64, 0u64, 0u64);
+                    while let Some(k) = take() {
+                        let (i, layer, files, bytes) = &jobs[k];
+                        let (i, layer, frame) = (*i, *layer, frames[*i]);
+                        let need = bytes * MEM_PER_RAW_BYTE;
+                        let out = if raised { raised_path(dir, layer, frame) } else { run_path(dir, layer, frame) };
+                        let tmp = layer_dir(dir, layer).join(format!("tmp-f{:03}.bin", frame));
+                        let r = invert_layer(files, maps[i].as_ref().expect("a frame with layers to do has its maps"), layer, frame, &out, &tmp, &mut bufs)
+                            .with_context(|| format!("inverting layer {layer} of frame {frame} in {}", dir.display()));
+                        // Big buffers go back after a big layer.
+                        if need > INVERT_MEM / 8 {
+                            bufs = LayerBufs::default();
+                        }
+                        release(need);
+                        let (records, edges, b) = r?;
+                        tot = (tot.0 + records, tot.1 + edges, tot.2 + b);
+                        if left[i].fetch_sub(1, Ordering::AcqRel) == 1 {
+                            finish_frame(i)?;
+                        }
+                    }
+                    Ok(tot)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("inversion worker panicked")).collect::<Result<Vec<_>>>()
+    })?;
+    for (r, e, b) in totals {
+        st.records += r;
+        st.edges += e;
+        st.bytes += b;
     }
     Ok(st)
 }
@@ -876,13 +811,21 @@ pub fn reopen_raised(dir: &Path, frame: u32) -> Result<()> {
         }
         let run = Run::open(&p, frame)?;
         let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(raw_path(dir, frame, layer, REOPENED))?);
-        let mut buf: Vec<u8> = Vec::with_capacity(RECORD_BYTES);
+        let (mut words, mut buf): (Vec<Word>, Vec<u8>) = (Vec::with_capacity(CHUNK_WORDS), Vec::new());
         let mut err: Option<std::io::Error> = None;
+        let mut flush = |words: &mut Vec<Word>, buf: &mut Vec<u8>| -> std::io::Result<()> {
+            buf.clear();
+            write_chunk(buf, words);
+            words.clear();
+            w.write_all(buf)
+        };
         run.decode_from(0, |t, s, r| {
             let e = run.edge(t, s, r);
-            buf.clear();
-            encode_record(&mut buf, e.target, e.base, e.xfer, e.mask);
-            match w.write_all(&buf) {
+            push_records(&mut words, e.target, e.base, e.xfer, e.mask);
+            if words.len() < CHUNK_WORDS {
+                return true;
+            }
+            match flush(&mut words, &mut buf) {
                 Ok(()) => true,
                 Err(e) => {
                     err = Some(e);
@@ -893,16 +836,23 @@ pub fn reopen_raised(dir: &Path, frame: u32) -> Result<()> {
         if let Some(e) = err {
             return Err(e).with_context(|| format!("reopening {}", p.display()));
         }
+        flush(&mut words, &mut buf).with_context(|| format!("reopening {}", p.display()))?;
         w.flush()?;
     }
     Ok(())
 }
 
-/// Drop what a run past `last` (the last frame whose runs are complete)
-/// left behind: every raw file and every run of a later frame.
+/// Drop what a run past `last` (the last frame whose records are complete)
+/// left behind: every raw file, run and table of a later frame, and the
+/// temporary files of an interrupted compaction. The raw records of frames
+/// up to `last` stay: they are the graph until `invert`.
 pub fn discard_after(dir: &Path, last: u32) -> Result<()> {
-    if dir.join("raw").is_dir() {
-        std::fs::remove_dir_all(dir.join("raw"))?;
+    for e in std::fs::read_dir(dir.join("raw")).into_iter().flatten().flatten() {
+        let p = e.path();
+        let frame: Option<u32> = p.file_name().and_then(|s| s.to_str()).and_then(|n| n.strip_prefix('f')).and_then(|s| s.parse().ok());
+        if frame.is_none_or(|f| f > last) {
+            std::fs::remove_dir_all(&p).with_context(|| p.display().to_string())?;
+        }
     }
     for layer in layers(dir) {
         let ldir = layer_dir(dir, layer);
@@ -925,6 +875,33 @@ pub fn discard_after(dir: &Path, last: u32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Invert the raw records of every frame up to `horizon` into runs (sorted
+/// by target), all at once (`compact_frames`). Only complete frames (up to
+/// `done.txt`) are inverted: a later frame's records are a killed wave's,
+/// which the forward's resume discards. Resumable: a frame is inverted when
+/// its raw dir is gone, and an interrupted inversion keeps the runs it
+/// completed. Returns the totals (`layers`: the layers inverted).
+pub fn invert(dir: &Path, horizon: u32) -> Result<CompactStats> {
+    let last = done_frame(dir).map_or(horizon, |d| d.min(horizon));
+    let frames: Vec<u32> = (1..=last).filter(|&f| raw_dir(dir, f).is_dir()).collect();
+    if frames.is_empty() {
+        return Ok(CompactStats::default());
+    }
+    let t0 = std::time::Instant::now();
+    let st = compact_frames(dir, &frames, false)?;
+    eprintln!(
+        "[invert] {}: {} frames, {} layers, {} records -> {} edges, {:.2} GB of runs, {:.1} s",
+        dir.display(),
+        frames.len(),
+        st.layers,
+        st.records,
+        st.edges,
+        st.bytes as f64 / 1e9,
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(st)
 }
 
 /// A run, mapped: header, index, tables and stream all read in place (a
@@ -1061,8 +1038,10 @@ pub struct EdgeGraph {
 }
 
 impl EdgeGraph {
-    /// Map every run `l{layer}/f{frame}.bin` (and `.raised.bin`) with `frame <= horizon`.
+    /// Map every run `l{layer}/f{frame}.bin` (and `.raised.bin`) with `frame
+    /// <= horizon`, the frames still raw inverted first (`invert`).
     pub fn open(dir: &Path, horizon: u32) -> Result<Self> {
+        invert(dir, horizon)?;
         let mut runs: Vec<Vec<Vec<Run>>> = Vec::new();
         let (mut records, mut bytes) = (0u64, 0u64);
         for layer in layers(dir) {
@@ -1357,10 +1336,15 @@ mod tests {
 
     fn write_worker(dir: &Path, frame: u32, layer: u32, worker: u32, edges: &[Edge]) {
         std::fs::create_dir_all(raw_dir(dir, frame)).unwrap();
-        let mut buf = Vec::new();
+        // Two chunks (the deltas and the predictor restart).
+        let mut words = Vec::new();
         for e in edges {
-            encode_record(&mut buf, e.target, e.base, e.xfer, e.mask);
+            push_records(&mut words, e.target, e.base, e.xfer, e.mask);
         }
+        let mut buf = Vec::new();
+        let (a, b) = words.split_at(words.len() / 2);
+        write_chunk(&mut buf, a);
+        write_chunk(&mut buf, b);
         std::fs::write(raw_path(dir, frame, layer, worker), buf).unwrap();
         // The worker's transfer table: one pair, every record's id 0 (a test
         // with transfers of its own writes its table after this).
@@ -1498,6 +1482,68 @@ mod tests {
         g.preds_at(pack_id(layer, 3, 0), layer, &mut buf);
         assert!(buf.is_empty(), "an absent target");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A chunk decodes to the records written, in order: deltas both ways,
+    /// seq changes, transfers the predictor has and has not, and two chunks
+    /// back to back; a truncated file is refused.
+    #[test]
+    fn raw_chunks_round_trip() {
+        let mut words: Vec<Word> = Vec::new();
+        let mut v = 0x1234_5678_9abc_def0u64;
+        for i in 0..5000u64 {
+            v = v.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let (tseq, sseq) = ((v >> 60) as u32 * 300, (v >> 56 & 3) as u32);
+            let target = pack_id(7, tseq, (v >> 8) as u32 & 0xff_ffff);
+            let base = pack_id(6, sseq, (i as u32 * 7) ^ (v >> 40) as u32 & 0xfff);
+            push_records(&mut words, target, base, (v >> 33) as u32 % 5 * 100_000, 1 << (v & 3));
+        }
+        let mut b = Vec::new();
+        write_chunk(&mut b, &words[..1234]);
+        write_chunk(&mut b, &words[1234..]);
+        let mut got: Vec<(u64, u64, u32)> = Vec::new();
+        let n = read_chunks(&b, Path::new("t"), |t, s, x| got.push((t, s, x))).unwrap();
+        assert_eq!(n, words.len() as u64);
+        assert_eq!(got, words.iter().map(|&w| word_fields(w)).collect::<Vec<_>>());
+        assert!(read_chunks(&b[..b.len() - 1], Path::new("t"), |_, _, _| ()).is_err(), "a truncated file");
+    }
+
+    /// The graph is inverted when it is opened, only up to the last complete
+    /// frame, and an inversion killed between a layer's run and the deletion
+    /// of its raw files resumes into the same runs.
+    #[test]
+    fn an_interrupted_inversion_resumes_into_the_same_runs() {
+        let root = std::env::temp_dir().join(format!("celeste-edges-invert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (whole, cut) = (root.join("whole"), root.join("cut"));
+        let e = |t: u64, s: u64| Edge { target: t, base: s, xfer: 0, mask: 1 };
+        // Frame 2 into layers 1 and 2, two workers; frame 3 is not complete.
+        let write = |dir: &Path| {
+            write_worker(dir, 2, 1, 0, &[e(pack_id(1, 0, 0), pack_id(1, 0, 1)), e(pack_id(1, 0, 1), pack_id(1, 0, 0))]);
+            write_worker(dir, 2, 1, 1, &[e(pack_id(1, 0, 1), pack_id(1, 0, 1))]);
+            write_worker(dir, 2, 2, 0, &[e(pack_id(2, 0, 0), pack_id(1, 0, 0)), e(pack_id(2, 0, 3), pack_id(1, 0, 1))]);
+            write_worker(dir, 3, 3, 0, &[e(pack_id(3, 0, 0), pack_id(2, 0, 0))]);
+            set_done_frame(dir, 2).unwrap();
+        };
+        write(&whole);
+        let g = EdgeGraph::open(&whole, 3).unwrap();
+        assert!(!raw_dir(&whole, 2).exists(), "frame 2 inverted when opened");
+        assert!(raw_dir(&whole, 3).exists() && !g.has_run(3, 3), "frame 3 is past done.txt: left alone");
+        // The cut: layer 1's run is in place, one of its raw files gone.
+        write(&cut);
+        std::fs::create_dir_all(layer_dir(&cut, 1)).unwrap();
+        std::fs::copy(run_path(&whole, 1, 2), run_path(&cut, 1, 2)).unwrap();
+        std::fs::remove_file(raw_path(&cut, 2, 1, 0)).unwrap();
+        invert(&cut, 3).unwrap();
+        assert!(!raw_dir(&cut, 2).exists(), "the stale raw file of layer 1 is gone");
+        for layer in [1, 2] {
+            assert_eq!(std::fs::read(run_path(&cut, layer, 2)).unwrap(), std::fs::read(run_path(&whole, layer, 2)).unwrap(), "layer {layer}'s run");
+        }
+        assert_eq!(std::fs::read(xfer_path(&cut, 2)).unwrap(), std::fs::read(xfer_path(&whole, 2)).unwrap(), "the frame's transfer table");
+        // A resume past frame 2 drops frame 3's raw records, keeps the rest.
+        discard_after(&cut, 2).unwrap();
+        assert!(!raw_dir(&cut, 3).exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Two workers' tables intern the same transfers under different ids:
