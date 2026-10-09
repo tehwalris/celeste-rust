@@ -41,20 +41,26 @@ pub struct Edge {
 /// An edge in the compaction: `(target, source, transfer)`.
 type Rec = (u64, u64, u32);
 
-/// Append the edges of `mask`'s lanes from `base` into `target` to a worker
-/// buffer, a record each.
+/// The edges of `mask`'s lanes from `base` into `target`, a record each, as
+/// u128s whose little-endian bytes are the record (`encode_record`).
 #[inline]
-pub fn encode_record(out: &mut Vec<u8>, target: u64, base: u64, xfer: u32, mut mask: u64) {
-    // The target's half once; one 16-byte store per source.
+pub fn push_records(out: &mut Vec<u128>, target: u64, base: u64, xfer: u32, mut mask: u64) {
+    // The target's half once; one word per source.
     let (tseq, trow) = (crate::frame::id_seq(target) as u16 as u128, crate::frame::id_row(target) as u128);
     let head = tseq | trow << 16 | (xfer as u128) << 96;
-    out.reserve(mask.count_ones() as usize * RECORD_BYTES);
     while mask != 0 {
         let src = base + mask.trailing_zeros() as u64;
         mask &= mask - 1;
-        let rec = head | (crate::frame::id_seq(src) as u16 as u128) << 48 | (crate::frame::id_row(src) as u128) << 64;
-        out.extend_from_slice(&rec.to_le_bytes());
+        out.push(head | (crate::frame::id_seq(src) as u16 as u128) << 48 | (crate::frame::id_row(src) as u128) << 64);
     }
+}
+
+/// Append the edges of `mask`'s lanes from `base` into `target` to a byte
+/// buffer, a record each.
+pub fn encode_record(out: &mut Vec<u8>, target: u64, base: u64, xfer: u32, mask: u64) {
+    let mut words = Vec::with_capacity(mask.count_ones() as usize);
+    push_records(&mut words, target, base, xfer, mask);
+    out.extend(words.iter().flat_map(|w| w.to_le_bytes()));
 }
 
 /// Decode a record of layer `layer` recorded at `frame` (source in layer

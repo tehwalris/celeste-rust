@@ -26,6 +26,7 @@ INSIDE the first wave, the other workers waiting on the build's lock (61 of
 | f7264fd | one-fork-neighbour emission mask (emissions 1.03G -> 512M) | 11.0 (incl. build) | - |
 | eabc2a8 | level -1 at emission (rows after the unit dedup 113M -> 56.6M) | 9.5 (incl. build) | - |
 | 38ea337 | kernels and level -1 table built before the wave | **5.6** | **8.0** |
+| (next) | edge buffers as u128 words sorted in place (page faults 5.1M -> 3.3M a 2-frame run) | **5.2** | **7.7** |
 
 The f57 phases now (worker-seconds of 16 x 5.9 s, `CELESTE_PHASES=1`): kernel
 8.9, emit 51.7, flush 29.1 (sort 1.2, door admit 7.4, edges 13.6, gather
@@ -35,6 +36,12 @@ The edge compaction of the previous frame runs beside each wave: perf on
 f58 gives the `compact-f57` thread 17.3k samples at 499 Hz, ~35 CPU-s (134
 ns an edge over 258M edges), on the SMT siblings of the 16 workers. f58's
 2.4 s over f57 is that plus 12% more rows.
+
+mimalloc's purge delay (2-frame runs; f57 / f58 wave, page faults, sys,
+peak): 0 (safe-run.sh's) 5.53 / 8.00 s, 5.1M, 32 s, 5.5 GB; 100 ms 5.23 /
+7.24 s, 1.2M, 12 s, 7.7 GB; 250 ms 5.29 / 7.26; 1000 ms 5.21 / 7.11 s, 0.9M,
+10 s, 7.9 GB. A delay keeps ~2 GB more resident at each frame's end (rss end
+5.7 against 3.6 GB at f57): left at 0 (memory binds big rooms first).
 
 Threads (f57 / f58): 16 -> 5.74 / 8.13 s, 24 -> 5.43 / 8.04, 32 -> 5.28 /
 8.02. Not worth a default change.

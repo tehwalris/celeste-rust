@@ -735,15 +735,16 @@ impl Slot {
     }
 }
 
-/// A worker's per-layer edge buffer is appended to its file at this size.
-const EDGE_BUF_BYTES: usize = 1 << 20;
+/// A worker's per-layer edge buffer is appended to its file at this many
+/// records (1 MB).
+const EDGE_BUF_RECORDS: usize = 1 << 16;
 /// Slots of the direct-mapped edge merge cache (`ForwardSink::direct_edge`).
 const DIRECT_SLOTS: usize = 1 << 12;
 
 /// Append one record to the target layer's buffer, written out when full.
 #[inline]
 fn append_record(
-    edge_bufs: &mut Vec<Vec<u8>>,
+    edge_bufs: &mut Vec<Vec<u128>>,
     edge_records: &mut u64,
     dir: &std::path::Path,
     frame: u32,
@@ -758,9 +759,9 @@ fn append_record(
         edge_bufs.resize_with(layer + 1, Vec::new);
     }
     let buf = &mut edge_bufs[layer];
-    crate::search::edges::encode_record(buf, target, base, xfer, mask);
+    crate::search::edges::push_records(buf, target, base, xfer, mask);
     *edge_records += 1;
-    if buf.len() >= EDGE_BUF_BYTES {
+    if buf.len() >= EDGE_BUF_RECORDS {
         write_edges(dir, frame, layer, worker, buf)?;
     }
     Ok(())
@@ -769,20 +770,21 @@ fn append_record(
 /// Append `buf` to the worker's raw file for `layer` at `frame`, and clear it.
 /// Its equal records go once: an edge re-recorded by another kernel call of
 /// the same unit lands in the same buffer (the compaction would merge it).
-fn write_edges(dir: &std::path::Path, frame: u32, layer: usize, worker: u32, buf: &mut Vec<u8>) -> Result<()> {
-    use crate::search::edges::RECORD_BYTES;
+/// Sorted and written in place: a fresh buffer per write was a fifth of the
+/// wave's page faults (room (6,2) 100% f57).
+fn write_edges(dir: &std::path::Path, frame: u32, layer: usize, worker: u32, buf: &mut Vec<u128>) -> Result<()> {
     use std::io::Write;
-    // As u128s: a sort of byte arrays compares bytewise (~4% of a frame).
     // Only the dedup matters here; the compaction sorts by target.
-    let mut recs: Vec<u128> = buf.chunks_exact(RECORD_BYTES).map(|c| u128::from_le_bytes(c.try_into().expect("a record"))).collect();
-    recs.sort_unstable();
-    recs.dedup();
-    buf.clear();
-    buf.extend(recs.iter().flat_map(|r| r.to_le_bytes()));
+    buf.sort_unstable();
+    buf.dedup();
+    // A record is its word's little-endian bytes (`edges::push_records`).
+    const _: () = assert!(cfg!(target_endian = "little"));
+    // SAFETY: u128 has no padding; the bytes of `buf` are initialized.
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * crate::search::edges::RECORD_BYTES) };
     let path = crate::search::edges::raw_path(dir, frame, layer as u32, worker);
     std::fs::create_dir_all(path.parent().expect("a raw dir"))?;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    f.write_all(buf)?;
+    f.write_all(bytes)?;
     buf.clear();
     Ok(())
 }
@@ -847,7 +849,7 @@ pub struct ForwardSink<'a> {
     pub skip_in: Option<&'a [bool]>,
     /// Where the edge records go (`edges::raw_path`); `None`: no recording.
     edges_dir: Option<std::path::PathBuf>,
-    edge_bufs: Vec<Vec<u8>>,
+    edge_bufs: Vec<Vec<u128>>,
     pub edge_records: u64,
     /// The within-call dedup cache (`RowCache`), written back by the flush.
     pub seen: celeste_engine::kernel::RowCache,
