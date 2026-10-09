@@ -1796,6 +1796,7 @@ pub fn forward_frame(
                         phases::add(phases::UNIT, t_unit);
                     }
                     crate::capture::flush();
+                    crate::capture::dump_xfers(&sink.xfer_tab);
                     let t_fin = phases::start();
                     let pieces = sink.finish()?;
                     phases::add(phases::FINISH, t_fin);

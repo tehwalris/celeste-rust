@@ -16,6 +16,8 @@ static NEXT: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
     static OUT: RefCell<Option<std::io::BufWriter<std::fs::File>>> = const { RefCell::new(None) };
+    /// This thread's file number (`w{n}.bin`), once it has written.
+    static FILE_N: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 pub fn dir() -> Option<&'static str> {
@@ -30,6 +32,7 @@ pub fn record(src: u64, key: (u64, u64), shape: u64, cell: u32, xfer: u32, flags
         let mut o = o.borrow_mut();
         let w = o.get_or_insert_with(|| {
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            FILE_N.with(|f| f.set(Some(n)));
             std::fs::create_dir_all(d).expect("capture dir");
             std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(format!("{d}/w{n:03}.bin")).expect("capture file"))
         });
@@ -52,4 +55,16 @@ pub fn flush() {
             w.flush().expect("capture flush");
         }
     });
+}
+
+/// This worker's transfer table (`ForwardSink::xfer_tab`, ids are its
+/// indexes): `DIR/x{n}.bin`, n = the thread's `w{n}.bin`, `encode_pair` each.
+pub fn dump_xfers(tab: &[crate::search::arc_edges::Pair]) {
+    let Some(d) = dir() else { return };
+    let Some(n) = FILE_N.with(|f| f.get()) else { return };
+    let mut buf = Vec::with_capacity(tab.len() * crate::search::arc_edges::PAIR_BYTES);
+    for p in tab {
+        crate::search::arc_edges::encode_pair(&mut buf, p);
+    }
+    std::fs::write(format!("{d}/x{n:03}.bin"), buf).expect("capture xfer table");
 }

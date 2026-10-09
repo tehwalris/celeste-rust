@@ -485,7 +485,7 @@ pub fn check(tag: &str, pd: &str, edges: &[(u32, u32, u32)], n_door: usize, is_o
 enum Raw { Affine { min: i32, k: u32 }, Search(Vec<i32>) }
 
 #[inline(always)]
-fn mix64(mut x: u64) -> u64 {
+pub fn mix64(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^ (x >> 31)

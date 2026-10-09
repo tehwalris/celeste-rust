@@ -493,39 +493,77 @@ pipeline as J, run backward).
 - before production: check the codec is EXACT (injective on the key) for the
   object levels and the platform levels, not only room (6,2) r0sxhf.
 
-### K1. Edge bundle census (`edgecensus`; analysis only)
+### K1. Edge bundle census (`edgecensus`, `edgepairs`; analysis only)
 
 All 257,724,013 edges of f57 (the capture's non-dropped emissions; sources
 from door.bin via src ids, targets by key, both through the field dump's
-packing). 62,870 distinct transfer ids. 853,523 edges shift > 8 px and
-2,341,353 change shape (deaths / respawns).
+packing). TRANSFERS MUST BE CANONICAL BY CONTENT: `ForwardSink::xfer_id`
+interns per worker, so the first census (62,870 "transfers", 151.7M bundles
+of 1.70 edges, the transfer "splitting" 4.8x) was an artifact. The capture
+now also writes each worker's table (`x{n}.bin`, `capture::dump_xfers`); it
+was rerun for f56 -> f57 (CELESTE_HUNDRED=1 CELESTE_LOADING_JANK=2
+CELESTE_LEVEL_MINUS_ONE=94,5, tree /var/tmp/cap2-tree, capture
+/var/tmp/emitcap2) and reproduces the emissions exactly (raw 31,685,344,
+kept 6,735,699, order-free multiset fingerprint d013be0be5231f9d in both).
+92,406 distinct transfers by content. 853,523 edges shift > 8 px, 2,341,353
+change shape (deaths / respawns).
 
-- SOURCE-side bundles (src shape + 8x8 region + packed key, transfer, tgt
-  shape + key, shift): **151.7M bundles, 1.70 edges each**; median 1 cell,
-  p90 3, max 56; edge-weighted median 2, p90 6; 63.7% of bundles (37.5% of
-  edges) single-cell. Target regions a shifted mask spans: 1: 132.6M, 2:
-  17.8M, 3: 1.18M, 4: 0.16M.
-- TARGET-side (mask of target cells): 153.5M bundles, 1.68 edges each, 64.8%
-  single-cell. No better.
-- The TRANSFER is what splits them: without it in the key, 31.5M bundles
-  (**8.2 edges each**); with it, 4.8x as many. The transfer (the remainder
-  map of the frame) varies with the cell inside an otherwise identical
-  bundle. Bundles pay only if transfers are factored out (e.g. stored per
-  (target entry, cell) once, or the transfer made cell-independent).
-- Bytes an edge: (b) bundle records (src entry u32, one tgt entry u32 per
-  spanned region, shift 1 B, transfer varint, u64 mask), sorted by target
-  region: raw 11.7, zstd -1 **1.20**; (a) flat edges with stable ids (region,
-  entry, cell), sorted per target region, varint (target delta, source delta
-  or id, transfer): raw **4.76**, zstd -1 2.65. Production: /var/tmp/vprod-edges
-  raw_f057 1.1 GB = ~4.3 B an edge (~4.7 by the earlier estimate).
-  So: flat stable-id edges match production raw; bundles only win under a
-  general compressor, and by 2.2x over flat + zstd.
+Global bundles (no region pairing):
+- source side (src shape + 8x8 region + key, transfer, tgt shape + key,
+  shift): **35.3M bundles, 7.30 edges each**; median 4 cells, p90 18;
+  edge-weighted median 16, p90 35; 21.6% single-cell (3.0% of edges). A
+  shifted mask spans 1 / 2 / 3 / 4 target regions: 23.1M / 10.4M / 0.25M /
+  1.55M. Target side: 36.0M bundles, 7.15 edges each.
+- the transfer still splits 12.1% of the transfer-free bundles (31.5M ->
+  35.3M). Of the 3.43M split groups: 1.52M have ONE source cell (one source
+  state reaches the same target state through several guard pieces of its
+  remainder: the move or a collision depends on where in [-0.5, 0.5) the
+  remainder lies - e.g. x [0, 65534) const 32768 (stopped by a wall) against
+  [65534, 65536) rot 2); 1.47M have several cells all with the SAME transfer
+  set (the same guard pieces in every cell); only 0.45M differ ACROSS cells.
+  By component: y guard + action kind 1.47M, y guard 0.92M, x guard + kind
+  0.75M, x guard 0.28M: guards at remainder thresholds, and const actions
+  (a wall or the floor stopping the move).
+- bytes an edge: (b) bundle records (src entry u32, one tgt entry u32 per
+  spanned region, shift 1 B, global transfer id varint, u64 mask) 2.92 raw,
+  0.34 zstd -1; (a) flat stable-id edges per target region 4.76 raw, 1.37
+  zstd -1.
+
+Per (source 8x8 region, target 8x8 region) PAIR (`edgepairs`): 2,152 pairs;
+edges a pair median 3,534, edge-weighted median 2.29M, max 12.5M (the
+diagonal pairs dominate: the heaviest are a region to itself); a source
+region reaches median 9 target regions (max 21). Within a pair, fields:
+src entry, src cell, tgt entry, tgt cell, transfer. Bytes an edge:
+
+| encoding (per pair) | B an edge |
+|---|---|
+| DFS first-changed varint, src entry > src cell > tgt entry > tgt cell > transfer (flat) | 4.78 |
+| same, src entry > tgt entry > transfer > src cell > tgt cell | 3.42 |
+| same, transfer > src entry > tgt entry > src cell > tgt cell (best) | 3.29 |
+| LOUDS trie estimate, best order | 2.47 |
+| flat bound log2 C(product of local alphabets, n) | 4.45 |
+| (c) relation (src entry, tgt entry, transfer) -> cell pairs: 49.6M groups of 5.19 edges, 98.3% with ONE uniform shift (shift + u64 mask, or a short list) | **1.76** |
+| (c) + zstd -1 / -3 per pair block | **0.18 / 0.16** |
+| best DFS + zstd -1 / -3 per pair block | 0.28 / 0.25 |
+
+Against production ~4.3 B an edge (vprod-edges raw_f057 1.1 GB) and flat
+4.76: the per-pair relation is 2.4x smaller raw and ~25x with zstd. The flat
+bound exceeds the trie and relation sizes because the relation's structure
+(a uniform shift inside a group) is not in the product alphabet.
+Dumps: /var/tmp/emitcap/edgepairs/ (small pair complete; the weighted-median
+and heaviest pairs truncated to 3,000 lines). What one pair looks like: a
+source entry fans out to a few target entries (different spd / flags after
+the frame's inputs) at one or two shifts (the remainder's guard pieces land
+in different cells), and the same (src entry, tgt entry, transfer) repeats
+across a run of source cells with one shift - the mask.
 
 ## L. Roadmap (agreed with Philippe)
 
-1. **Edges in the bench**: choose bundles vs flat stable-id edges from K1
-   (flat raw ~ production; bundles + zstd 2.2x smaller); write them from
-   regionpar; validate the edge set against vprod's key-based fingerprint
+1. **Edges in the bench**: from K1, the per-(source region, target region)
+   relation - (src entry, tgt entry, transfer) -> a uniform shift + a source
+   cell mask (98.3%), else a list: 1.76 B an edge raw, 0.18 with zstd -1,
+   against 4.3-4.7 now; write them from regionpar (a region pass emits its
+   pairs' blocks); validate the edge set against vprod's key-based fingerprint
    (`3b4f8b60b8767421`, the sweep branch).
 2. **A realistic bench**: no untimed grouping - a producer replays the
    emissions in kernel / source order into per-target-region chunk buffers
