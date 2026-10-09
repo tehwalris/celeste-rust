@@ -17,7 +17,8 @@ the frame its player is created, as UniversalClassicTas and Celia do):
     here J is the one the chain measured;
  3. chain (the ground truth): the previous room (`--from L`: from level L;
     `--boot`: from 100m, the game's start) played with the database's files
-    (the category's, else a fallback category's: FALLBACK), then FILE.
+    (the category's, else a fallback category's: FALLBACK; our own file
+    where the database's never exits on PICO-8: OVERRIDES), then FILE.
 The default runs the chain from the previous level only. Prints each
 segment's exit (frame, the room's count, the leaving player's index J, the
 berry), and with --modes each mode's count and the room-entry state of
@@ -66,8 +67,22 @@ def parse_tas(text):
     return seeds, [int(x) for x in re.findall(r"\d+", text)]
 
 
+# Rooms whose database file is not PICO-8 valid (made in a tool computing in
+# doubles, it never exits on a real PICO-8), played in a category's chain with
+# OUR file instead, so the chain runs on unbroken (it used to restart after
+# such a room by an IL load): (category, level) -> a file, relative to the
+# repo. Only files verified like any submission (check_uploads: VALID).
+OVERRIDES = {
+    # The database's 164 finishes in Celia only; ours exits on PICO-8.
+    ("gemskip100", 28): "tas/tasdatabase/gemskip100/upload/TAS28.tas",
+}
+
+
 def db_file(cat, level):
-    """The database file a full run of `cat` plays in `level`, and its category."""
+    """The file a full run of `cat` plays in `level` (the database's, the
+    category's, else FALLBACK's; an OVERRIDES entry first), and its category."""
+    if (cat, level) in OVERRIDES:
+        return cat, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), OVERRIDES[(cat, level)])
     db = json.load(open(f"{DB}/database.json"))["classic"]
     for c in FALLBACK[cat]:
         for e in db.get(c, []):
@@ -139,6 +154,11 @@ def summary(name, lines, nsegs=1):
         s += ("PREVIOUS ROOM FAILED (" if early else "FAILED (") + "; ".join(bad) + ")"
     if last:
         s += f"exit {last['count']}f berry {last['berry']}"
+    elif not bad and len(exits) < nsegs - 1:
+        # An earlier segment's database file never exits on PICO-8 (it
+        # finishes only in UCT/Celia, which compute in doubles): this room
+        # is never reached.
+        s += f"PREVIOUS ROOM DID NOT EXIT (segment {len(exits) + 1} of {nsegs})"
     elif not bad:
         s += "NO EXIT"
     return s, last
