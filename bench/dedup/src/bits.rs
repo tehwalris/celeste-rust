@@ -331,6 +331,8 @@ pub fn prep_bits(dir: &str, door: &[u8]) {
     std::fs::write(format!("{pd}/pcnt.bin"), crate::as_bytes(&pcnt)).unwrap();
     std::fs::write(format!("{pd}/refid.bin"), crate::as_bytes(&refid)).unwrap();
     let sshape: Vec<u32> = (0..n_shards).map(|i| shard_sc[i].0 as u32).collect();
+    let scell: Vec<u32> = (0..n_shards).map(|i| shard_sc[i].1).collect();
+    std::fs::write(format!("{pd}/scell.bin"), crate::as_bytes(&scell)).unwrap();
     std::fs::write(format!("{pd}/sshape.bin"), crate::as_bytes(&sshape)).unwrap();
     eprintln!("[prepbits] wrote {pd}/qb.bin, db.bin, pcnt.bin, refid.bin; {:.1} s", t.elapsed().as_secs_f64());
 }
@@ -682,6 +684,18 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     let dsh: &[u32] = crate::from_bytes(&sm); let db: &[(u32, u32)] = crate::from_bytes(&dsm); let sshape: &[u32] = crate::from_bytes(&shm);
     let n_src: usize = std::fs::read_to_string(format!("{pd}/nsrc.txt")).unwrap().trim().parse().unwrap();
     let n_shards = sshape.len();
+    // posmask{R}: the directory per (shape, R x R region) on (high, spd.y), the mask over the region's cells.
+    let pr: i32 = mode.strip_prefix("posmask").map_or(0, |r| r.parse().unwrap());
+    let scm = map("scell.bin");
+    let scell: &[u32] = crate::from_bytes(&scm);
+    let mut gid: FxHashMap<(u32, i32, i32), u32> = FxHashMap::default();
+    let (grp, ppos): (Vec<u32>, Vec<u32>) = (0..n_shards).map(|s| {
+        if pr == 0 { return (s as u32, 0); }
+        let (x, y) = crate::structure::cell_xy(scell[s]);
+        let n = gid.len() as u32;
+        (*gid.entry((sshape[s], x.div_euclid(pr), y.div_euclid(pr))).or_insert(n), (x.rem_euclid(pr) + pr * y.rem_euclid(pr)) as u32)
+    }).unzip();
+    let n_groups = if pr == 0 { n_shards } else { gid.len() };
     // The packing's digits per shape (as prepbits built them).
     let f = Fields::open(dir);
     let mut by_shape: Vec<Vec<usize>> = vec![Vec::new(); f.shapes.len()];
@@ -705,6 +719,7 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
         match mode {
             "bitcell" => (high as u64, low as u64),
             "bitspd" => (spd * dar + da, fl),
+            _ if pr > 0 => (high as u64 * low_r[s] + low as u64, ppos[sh as usize] as u64),
             _ => (spd, fl * dar + da),
         }
     };
@@ -714,25 +729,28 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     let mut local: Vec<FxHashMap<u64, u32>> = vec![Default::default(); n_shards];
     let mut width: Vec<u64> = vec![0; n_shards];
     let mut keyed: FxHashMap<(u32, u32, u32), (u32, u32)> = FxHashMap::default(); // (shard, high, low) -> (hk, bit), memo
-    if mode == "bitspd" {
+    if pr > 0 {
+        for s in 0..n_shards { width[s] = (pr * pr) as u64; }
+    } else if mode == "bitspd" {
         for s in 0..n_shards { let sp = sshape[s] as usize; width[s] = roles[sp].iter().filter(|x| x.1 == 0).map(|x| x.0).product(); }
     } else {
         for (sh, h, l) in all() { let (_, m) = split(sh, h, l); let d = &mut local[sh as usize]; let n = d.len() as u32; d.entry(m).or_insert(n); }
         for s in 0..n_shards { width[s] = local[s].len().max(1) as u64; }
     }
     let words: Vec<u64> = width.iter().map(|w| w.div_ceil(64)).collect();
-    let mut pre: Vec<FxHashSet<u32>> = vec![Default::default(); n_shards];
+    let mut pre: Vec<FxHashSet<u32>> = vec![Default::default(); n_groups];
     let mut key_of = |sh: u32, h: u32, l: u32| -> (u32, u32) {
         *keyed.entry((sh, h, l)).or_insert_with(|| {
             let (k, m) = split(sh, h, l);
-            let m = if mode == "bitspd" { m } else { local[sh as usize][&m] as u64 };
+            let m = if mode == "bitspd" || pr > 0 { m } else { local[sh as usize][&m] as u64 };
             let hk = k * words[sh as usize] + (m >> 6) + 1;
             assert!(hk < u32::MAX as u64);
             (hk as u32, (m & 63) as u32)
         })
     };
     let dq: Vec<(u32, u32)> = (0..n_door).map(|i| key_of(dsh[i], db[i].0, db[i].1)).collect();
-    let qw: Vec<QB> = qs.iter().map(|q| { let (hk, b) = key_of(q.shard, q.high, q.low); QB { shard: q.shard, src: q.src, xfer: q.xfer, low: b, high: hk, _p: [0; 3] } }).collect();
+    let qw: Vec<QB> = qs.iter().map(|q| { let (hk, b) = key_of(q.shard, q.high, q.low); QB { shard: grp[q.shard as usize], src: q.src, xfer: q.xfer, low: b, high: hk, _p: [0; 3] } }).collect();
+    let dsh: Vec<u32> = dsh.iter().map(|&s| grp[s as usize]).collect();
     drop(keyed);
     for (i, &(hk, _)) in dq.iter().enumerate() { pre[dsh[i] as usize].insert(hk); }
     let n_old = pre.iter().map(|p| p.len()).sum::<usize>();
@@ -743,7 +761,7 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     let mut load = 0.5;
     let cap_of = |c: u64, load: f64| ((c.max(1) as f64 / load).ceil() as u64).next_power_of_two();
     if pcnt.iter().map(|&c| cap_of(c, load)).sum::<u64>() * 64 >= 1 << 32 { load = 0.8; }
-    let mut off: Vec<(u32, u32)> = Vec::with_capacity(n_shards);
+    let mut off: Vec<(u32, u32)> = Vec::with_capacity(n_groups);
     let mut total = 0u64;
     for &c in &pcnt { let cap = cap_of(c, load); off.push((total as u32, (cap - 1) as u32)); total += cap; }
     assert!(total * 64 < 1 << 32, "ids slot << 6 | bit must fit 32 bits");
@@ -761,9 +779,9 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     for i in 0..n_door { let (hk, b) = dq[i]; let s = probe!(dsh[i], hk); let e = &mut tab[s as usize]; let w = e.bits; e.bits = w | 1 << b; old_ids.insert(s << 6 | b); }
     drop(dq);
     let mem = total as f64 * std::mem::size_of::<W>() as f64;
-    let wsum = |g: &dyn Fn(usize) -> u64| (0..n_shards).map(g).sum::<u64>();
-    eprintln!("[{mode}] setup {:.1} s (untimed): mask widths: {} shards, mean {:.1} bits (by entries); {n_old} entries at the frame start, {entries} at its end ({:.2} states each, mask fill {:.2}%); directory {} slots x {} B at load {load} = {:.2} GB",
-        t.elapsed().as_secs_f64(), n_shards, wsum(&|s| pcnt[s] * width[s].min(64)) as f64 / entries as f64, (n_door + 6_735_699) as f64 / entries as f64,
+    let wsum = |g: &dyn Fn(usize) -> u64| (0..n_groups).map(g).sum::<u64>();
+    eprintln!("[{mode}] setup {:.1} s (untimed): mask widths: {} directory groups, mean {:.1} bits (by entries); {n_old} entries at the frame start, {entries} at its end ({:.2} states each, mask fill {:.2}%); directory {} slots x {} B at load {load} = {:.2} GB",
+        t.elapsed().as_secs_f64(), n_groups, wsum(&|s| pcnt[s] * width[s].min(64)) as f64 / entries as f64, (n_door + 6_735_699) as f64 / entries as f64,
         100.0 * (n_door + 6_735_699) as f64 / wsum(&|s| pcnt[s] * 64) as f64, total, std::mem::size_of::<W>(), mem / 1e9);
     drop(local);
     let mut frontier: crate::compact::HugeVec<u8> = crate::compact::HugeVec::with_capacity(7_000_000 * crate::PAYLOAD);

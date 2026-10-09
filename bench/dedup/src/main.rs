@@ -12,6 +12,7 @@ use std::time::Instant;
 mod bits;
 mod compact;
 mod structure;
+mod posregion;
 
 const REC: usize = 48;
 const PAYLOAD: usize = 64;
@@ -52,6 +53,7 @@ fn main() {
     if variant == "cellcensus" { return bits::cell_census(dir); }
     if variant == "structure" { return structure::structure(dir); }
     if variant == "sharing" { return structure::sharing(dir); }
+    if variant == "posregion" { return posregion::posregion(dir); }
     let t0 = Instant::now();
     // Inputs, mapped.
     let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with('w')).collect();
@@ -87,7 +89,7 @@ fn main() {
         "bitintern" => bits::run_intern(dir, door.len() / 40),
         "compactprep" => compact::prep(dir, &door),
         "cqa" | "cqb" | "cqc" => compact::run(dir, door.len() / 40, variant),
-        "bitcell" | "bitspd" | "bitspd2" => bits::run_words(dir, door.len() / 40, variant),
+        "bitcell" | "bitspd" | "bitspd2" | "posmask4" | "posmask8" => bits::run_words(dir, door.len() / 40, variant),
         other => panic!("unknown variant {other}"),
     }
 }

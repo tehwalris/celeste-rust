@@ -10,17 +10,17 @@ use std::io::Write;
 /// the rows); the five spawn / death shapes (~120 rows) are left out.
 pub const NAMES: [&str; 13] = ["freeze", "has_dashed", "dash_effect_time", "dash_time", "djump", "grace", "dash_accel.x", "dash_accel.y", "dash_target.x", "dash_target.y", "flip.x", "spd.x", "spd.y"];
 const SPDX: usize = 11;
-const NF: usize = 13;
+pub const NF: usize = 13;
 
-type Row = (u32, [u16; NF]);
+pub type Row = (u32, [u16; NF]);
 
 fn num(show: &str) -> f64 {
     match show { "Bool(false)" => 0.0, "Bool(true)" => 1.0, s => s.parse().unwrap_or_else(|_| panic!("not a number: {s}")) }
 }
 
-struct Set { rows: Vec<Row>, shards: Vec<(usize, u32)>, alpha: [usize; NF], shows: Vec<[Vec<String>; NF]> }
+pub struct Set { pub rows: Vec<Row>, pub shards: Vec<(usize, u32)>, pub alpha: [usize; NF], shows: Vec<[Vec<String>; NF]> }
 
-fn load(dir: &str) -> Set {
+pub fn load(dir: &str) -> Set {
     let f = Fields::open(dir);
     // Per shape: field index per canonical name, and dict index -> numeric rank.
     let ns = f.shapes.len();
@@ -60,13 +60,13 @@ fn load(dir: &str) -> Set {
     Set { rows, shards, alpha, shows }
 }
 
-fn cell_xy(c: u32) -> (i32, i32) { (c as i32 % 512 - 64, c as i32 / 512 - 64) }
+pub fn cell_xy(c: u32) -> (i32, i32) { (c as i32 % 512 - 64, c as i32 / 512 - 64) }
 
 fn sort_by(rows: &mut [Row], order: &[usize]) {
     rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| order.iter().map(|&k| a.1[k].cmp(&b.1[k])).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)));
 }
 
-fn lg_choose(n: u64, k: u64) -> f64 {
+pub fn lg_choose(n: u64, k: u64) -> f64 {
     // log2 C(n, k) via lgamma-free summation for small k, Stirling otherwise.
     let k = k.min(n - k);
     if k < 64 { return (0..k).map(|i| ((n - i) as f64 / (i + 1) as f64).log2()).sum(); }
