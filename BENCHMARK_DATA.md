@@ -33,6 +33,43 @@ route), two back-to-back pairs (load in brackets):
 Every run OPTIMAL 93 with the same witness and identical `[gate]` lines
 (195: W fingerprints at every frame, both levels). Peak RSS unchanged
 (~29.3 GB). The forward gains, the inversion gives it back.
+
+**The inversion as layer jobs** (`compact_frames`, after the merge of
+fg-2300's canonical layers). Whole 2300m level-0 tree, `compact-bench
+--frame 1 --to 94` (13.0G records, 1791 layers):
+
+| binary | wall | CPU | cores busy | note |
+|---|---|---|---|---|
+| 4 frames at once (d31f1f3) | 71.5 s | 1670 s | ~23 | load 6 -> 29 |
+| layer jobs, 24-B records scattered | 67.2 s | 1235 s | ~18 | 52 GB peak (budget too loose) |
+| layer jobs, 8-B encoded edges scattered | 36-46 s | 860-920 s | ~28 steady | outside the 60G cgroup 35.6 s |
+| + parallel table merge, early writeback | 39-40 s | ~780 s | | under safe-run, load 20-26 |
+| + smallest job while the largest waits on memory (final) | 47.6 / 48.5 s | ~1040 s | 17-21 in the first 20 s (was 12) | just after a forward: raw records partly on disk, load 20-29 |
+
+Reading the raw files with read() instead of mmap: no better (1029-1090
+against 898-1003 CPU-s). The runs are written at ~1.3 GB/s (`dd`
+direct: 1.4 GB/s): 48 GB, ~35 s, is the floor here. Under the search's
+cgroup, page cache counts against 60G: without the early writeback the
+dirty runs stalled whole seconds.
+
+End to end after the merge, the same search (load 18-49: wall swings by
+50%; user CPU is the steadier measure):
+
+| run | forward | inversion | total | user CPU |
+|---|---|---|---|---|
+| branch (65d82c3) | 294.1 s | 86.0 s | 451.3 s | 5463 s |
+| fg-2300 bf2dbf6 | 500.6 s | - | 585.3 s | 6653 s |
+| bb09512 | 620.0 s | - | 748.9 s | 7956 s |
+| bb09512 | 655.0 s | - | 770.2 s | 7817 s |
+| fg-2300 bf2dbf6 | 341.5 s | - | 391.0 s | 5831 s |
+| branch (65d82c3) | 315.9 s | 79.6 s | 460.9 s | 5357 s |
+| branch (final) | 234.4 s | 60.8 s | 384.2 s | 4595 s |
+| fg-2300 bf2dbf6 | 452.4 s | - | 586.7 s | 6564 s |
+| fg-2300 bf2dbf6 | 419.0 s | - | 473.0 s | 6375 s |
+| branch (final) | 298.0 s | 89.7 s | 483.7 s | 5233 s |
+
+Every run OPTIMAL 93, the same witness, identical `[gate]` lines.
+
 # Canonical layers, 2026-10-09 (release, 16 threads, branch `canonical-layers`)
 
 Each new layer stored by (shape, region, cell, key) (`canon`, 274eeee +

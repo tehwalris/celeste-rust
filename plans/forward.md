@@ -116,21 +116,24 @@ schedules and against the binary before), plus the gates and the full suite.
 The forward keeps every frame's raw records (no compaction beside the
 waves) as 64k-record CHUNKS (`edges::write_chunk`, ~3.6 B a record against
 16), and the backward inverts the whole tree into the unchanged runs when
-it first opens the graph (`edges::invert`, 4 frames at once). Measured
-(BENCHMARK_DATA.md, "The edges inverted once"): on the harness the
-contention was ~25% of f58's wave (6.76 -> 5.11 s without the compaction,
-4.91 s with the chunked writes; f57 4.4-4.5 s in all three); the raw tree
-of the 2300m search is 46.3 GB (16-B records would have been 207 GB, more
-than the disk had), its runs 49.2 GB; inverting its 13.0G records takes
-~105 s (4 frames at once; 225 s one at a time). End to end, on a shared
-machine (load 17-38), two pairs of the whole 2300m search: forward 349 /
-431 s before, 319 / 292 s after; totals 439.5 / 523.4 s before, 484.9 /
-464.5 s after (the inversion included). So the forward is faster but the
-inversion gives it back: a wash end to end, at ~8% less CPU. The
-inversion runs ~11 of 32 threads (90 ns of CPU an edge: the chunk
-decodes, the bucket sorts, the run encoder); it would have to get ~3x
-faster to make this a clear win. The 16-B records were only workable with
-the per-frame compaction: a whole tree of them does not fit.
+it first opens the graph (`edges::invert` -> `compact_frames`: every
+(frame, layer) one single-threaded job on every hardware thread, under a
+memory bound). Measured (BENCHMARK_DATA.md, "The edges inverted once"):
+
+- the harness's f58 wave loses the compaction's contention: 6.76 -> 4.91 s
+  (quiet window; f57 4.4-4.5 s in all);
+- the 2300m tree's raw records are 46 GB (16-B records: 207 GB, more than
+  the disk had), its runs 48 GB;
+- inverting its 13.0G records: 71.5 s / 1670 CPU-s with per-frame
+  compactions 4 at a time -> 36-48 s / ~800-1000 CPU-s as layer jobs
+  (~28 cores busy in steady state; inside the search, on a machine shared
+  with other searches at load 20-49, 61-90 s). The runs are written at the
+  disk's ~1.3-1.4 GB/s: ~35 s is the floor on this machine;
+- end to end (shared machine, load 18-49, so wall times swing by 50%):
+  the branch 451 / 461 / 384 / 484 s against fg-2300's 585 / 391 / 587 /
+  473 s and bb09512's 749 / 770 s; user CPU 5463 / 5357 / 4595 / 5233 s
+  against 6653 / 5831 / 6564 / 6375 s (~-20%). Same optimum, witness and
+  gate lines in every run.
 
 The compaction's own cost (`rewrite compact-bench` over a frame's raw
 records kept by `CELESTE_KEEP_RAW=1`): f57's 258M records, 2.6 s wall and

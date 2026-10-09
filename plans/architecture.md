@@ -327,12 +327,16 @@ remainder; every backward reads the records and re-runs no kernel
   (2026-10-09, branch `edge-inversion`): no compaction beside the waves.
 - **Runs.** The graph is INVERTED once, when it is first read
   (`EdgeGraph::open` -> `edges::invert`: the search's arc phase, and every
-  diagnostic that reads edges), 4 frames at a time.
-  Per frame the workers' tables merge into the frame's
-  (`edges/xfer/f{frame}.bin`, sorted by value: a function of the frame, not
-  the scheduling), and each layer's records are range-partitioned by target,
-  sorted by it (a parallel counting sort on the target's dense rank above
-  512k records), and encoded in 256-edge blocks with an index:
+  diagnostic that reads edges): every (frame, layer) is one single-threaded
+  job (`edges::compact_frames`), largest first, on every hardware thread,
+  the layers in flight bounded by memory (`INVERT_MEM`). Per frame the
+  workers' tables merge into the frame's (`edges/xfer/f{frame}.bin`, sorted
+  by value: a function of the frame, not the scheduling); a job decodes its
+  layer's chunks twice (the frame's renumbering, `canon::Renumber`, applied
+  to targets in the frame's own layer): counts per target and the run's
+  tables, then a counting sort that scatters each edge as it is encoded
+  (dense source, transfer rank: 8 B) into its target's slot; and encodes
+  the layer in 256-edge blocks with an index:
   `<level>/edges/l{layer}/f{frame}.bin` (run v5, 2026-10-07). Per edge a
   varint head (a new target's delta, or the source's delta under the same
   target), the source as a DENSE number (the source pieces laid end to end,
