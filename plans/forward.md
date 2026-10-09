@@ -80,3 +80,16 @@ schedules and against the binary before), plus the gates and the full suite.
    frames here, proportionally more in a big room. Left at 0; the better
    fix is fewer transient allocations (the edge buffers were the first, a
    fifth of the faults).
+6. **Kernel-bound rooms.** Room (3,0) 100% at `r0sxhfn` (8 px regions):
+   335k bodies, the largest kernel 3,328 bodies and 221k fused nodes; a
+   frame of 8.4M states takes ~90 s, 54% of it in the kernels themselves
+   (perf on the live search, f67). A slice evaluates every body's nodes
+   whichever are live. Evaluating the fork conditions first and skipping
+   body groups no lane reaches would be the structural fix there (a
+   codegen change); the harness room is emit-bound instead (kernel 9%).
+
+The compaction's own cost (`rewrite compact-bench` over a frame's raw
+records kept by `CELESTE_KEEP_RAW=1`): f57's 258M records, 2.6 s wall and
+29.8 CPU-s; with the bucketed scatter (no shared atomics, one buffer) 2.45
+s and 27.2 CPU-s, the runs byte-identical. What remains is the encoder
+(group sorts and varints into fresh buffers) and the per-file counts.

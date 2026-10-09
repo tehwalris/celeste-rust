@@ -369,11 +369,11 @@ fn head_bytes(index: &[(u64, u64)], tabs: &RunTables) -> u64 {
 /// whatever the layer's size.
 const CHUNK_RECORDS: usize = 32 << 20;
 
-/// A layer's counting sort by target rank, one contiguous rank range (at
-/// most `chunk_records`) at a time: each range scattered by a pass over every
-/// file, appended to a `RunWriter` streaming to `stream_path`. Ranks are
-/// target order, so the run is sorted as a whole. Returns (the writer, sort
-/// time, write time).
+/// A layer's sort by target, one contiguous range of rank BUCKETS (at most
+/// `chunk_records` records) at a time: each range scattered by a pass over
+/// every file, its buckets sorted, appended to a `RunWriter` streaming to
+/// `stream_path`. Buckets are target order, so the run is sorted as a
+/// whole. Returns (the writer, sort time, write time).
 fn sort_layer_chunked(
     files: &[(&[u8], &[u32])],
     layer: u32,
@@ -381,7 +381,6 @@ fn sort_layer_chunked(
     chunk_records: usize,
     stream_path: &Path,
 ) -> Result<(RunWriter, std::time::Duration, std::time::Duration)> {
-    use std::sync::atomic::{AtomicU32, Ordering};
     let t_sort0 = std::time::Instant::now();
     let mut t_write = std::time::Duration::ZERO;
     let n_total: usize = files.iter().map(|(b, _)| b.len() / RECORD_BYTES).sum();
@@ -423,41 +422,73 @@ fn sort_layer_chunked(
     }
     let n_ranks = piece_off[n_seq];
     let rank_of = |t: u64| piece_off[(t >> 32) as usize] + t as u32 as usize;
-    let hist: Vec<AtomicU32> = (0..n_ranks).map(|_| AtomicU32::new(0)).collect();
-    std::thread::scope(|scope| {
-        for &(b, _) in files {
-            let (hist, rank_of) = (&hist, &rank_of);
-            scope.spawn(move || {
-                for i in 0..b.len() / RECORD_BYTES {
-                    hist[rank_of(target_local(b, i))].fetch_add(1, Ordering::Relaxed);
-                }
-            });
-        }
+    // BUCKETS of 2^shift consecutive ranks, ~BUCKET_RECORDS records each on
+    // average: per file a histogram over buckets (its own, no atomics),
+    // then per chunk of buckets each file scatters into its own slots of
+    // every bucket, and each bucket is sorted by target in cache. (Counting
+    // by RANK with shared atomic cursors, a random atomic on a tens-of-MB
+    // array per record twice, was ~40% of a compaction.)
+    const BUCKET_RECORDS: usize = 1 << 14;
+    let per_rank = (n_total / n_ranks.max(1)).max(1);
+    let shift = (BUCKET_RECORDS / per_rank).max(1).ilog2();
+    let n_buckets = (n_ranks >> shift) + 1;
+    let bucket_of = |t: u64| rank_of(t) >> shift;
+    let per_file: Vec<Vec<u32>> = std::thread::scope(|scope| {
+        let hs: Vec<_> = files
+            .iter()
+            .map(|&(b, _)| {
+                let bucket_of = &bucket_of;
+                scope.spawn(move || {
+                    let mut h = vec![0u32; n_buckets];
+                    for i in 0..b.len() / RECORD_BYTES {
+                        h[bucket_of(target_local(b, i))] += 1;
+                    }
+                    h
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("bucket histogram")).collect()
     });
-    // Prefix sums, and the chunk cuts in rank space: a chunk closes once
-    // it holds `chunk_records` (a single rank's group is never split).
-    let mut cuts: Vec<(usize, usize)> = vec![(0, 0)]; // (rank, first position)
-    let mut acc = 0u32;
-    for (r, h) in hist.iter().enumerate() {
-        let c = h.load(Ordering::Relaxed);
-        h.store(acc, Ordering::Relaxed);
-        if acc as usize - cuts.last().unwrap().1 >= chunk_records && c > 0 {
-            cuts.push((r, acc as usize));
+    let totals: Vec<usize> = (0..n_buckets).map(|k| per_file.iter().map(|h| h[k] as usize).sum()).collect();
+    debug_assert_eq!(totals.iter().sum::<usize>(), n_total);
+    // Chunk cuts at bucket boundaries: a chunk closes once it holds
+    // `chunk_records` (a bucket is never split).
+    let mut cuts: Vec<(usize, usize)> = vec![(0, 0)]; // (bucket, first position)
+    let mut acc = 0usize;
+    for (k, &c) in totals.iter().enumerate() {
+        if acc - cuts.last().unwrap().1 >= chunk_records && c > 0 {
+            cuts.push((k, acc));
         }
         acc += c;
     }
-    debug_assert_eq!(acc as usize, n_total);
-    cuts.push((n_ranks, n_total));
-    let next = hist;
+    cuts.push((n_buckets, n_total));
+    // One buffer for every chunk: a fresh one faulted in each time.
+    let max_chunk = cuts.windows(2).map(|w| w[1].1 - w[0].1).max().unwrap_or(0);
+    let mut out: Vec<Rec> = Vec::with_capacity(max_chunk);
+    let threads = crate::frame::threads().max(1);
     for w in cuts.windows(2) {
-        let ((r_lo, base), (r_hi, end)) = (w[0], w[1]);
+        let ((k_lo, base), (k_hi, end)) = (w[0], w[1]);
         let n_chunk = end - base;
         if n_chunk == 0 {
             continue;
         }
-        let mut out: Vec<Rec> = Vec::with_capacity(n_chunk);
+        let nb = k_hi - k_lo;
+        let mut starts = vec![0usize; nb + 1];
+        for k in 0..nb {
+            starts[k + 1] = starts[k] + totals[k_lo + k];
+        }
+        // File f's slots in bucket k start after the earlier files'.
+        let mut cursors: Vec<Vec<usize>> = Vec::with_capacity(files.len());
+        let mut next = starts[..nb].to_vec();
+        for h in &per_file {
+            cursors.push(next.clone());
+            for k in 0..nb {
+                next[k] += h[k_lo + k] as usize;
+            }
+        }
+        out.clear();
         // SAFETY: every position 0..n_chunk is written exactly once below
-        // (the claims of the ranks in [r_lo, r_hi) partition base..end);
+        // (the files' slots partition each bucket, the buckets the chunk);
         // the element type has no drop glue.
         #[allow(clippy::uninit_vec)]
         unsafe {
@@ -466,19 +497,40 @@ fn sort_layer_chunked(
         {
             let out_ptr = out.as_mut_ptr() as usize;
             std::thread::scope(|scope| {
-                for &(b, remap) in files {
-                    let (next, rank_of) = (&next, &rank_of);
+                for (&(b, remap), mut cur) in files.iter().zip(cursors) {
+                    let bucket_of = &bucket_of;
                     scope.spawn(move || {
                         let out_ptr = out_ptr as *mut Rec;
                         for i in 0..b.len() / RECORD_BYTES {
-                            let r = rank_of(target_local(b, i));
-                            if r < r_lo || r >= r_hi {
+                            let k = bucket_of(target_local(b, i));
+                            if k < k_lo || k >= k_hi {
                                 continue;
                             }
                             let e = decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], layer, frame, remap);
-                            let pos = next[r].fetch_add(1, Ordering::Relaxed) as usize - base;
-                            // SAFETY: a claimed position, unique and < n_chunk.
+                            let pos = cur[k - k_lo];
+                            cur[k - k_lo] += 1;
+                            // SAFETY: this file's own slot, unique and < n_chunk.
                             unsafe { out_ptr.add(pos).write(e) };
+                        }
+                    });
+                }
+            });
+        }
+        // Each bucket by target (a target's records are one run; their
+        // order within it is `encode_sorted`'s).
+        {
+            let mut slices: Vec<Vec<&mut [Rec]>> = (0..threads).map(|_| Vec::new()).collect();
+            let mut rest: &mut [Rec] = &mut out;
+            for k in 0..nb {
+                let (head, tail) = rest.split_at_mut(starts[k + 1] - starts[k]);
+                slices[k % threads].push(head);
+                rest = tail;
+            }
+            std::thread::scope(|scope| {
+                for mine in slices {
+                    scope.spawn(move || {
+                        for sl in mine {
+                            sl.sort_unstable_by_key(|r| r.0);
                         }
                     });
                 }
@@ -622,6 +674,12 @@ pub fn compact_raised(dir: &Path, frame: u32) -> Result<CompactStats> {
     compact(dir, frame, true)
 }
 
+/// `CELESTE_KEEP_RAW=1`: a compaction leaves the raw files (for
+/// `rewrite compact-bench`, which compacts a copy of them).
+fn keep_raw() -> bool {
+    std::env::var("CELESTE_KEEP_RAW").is_ok_and(|v| v == "1")
+}
+
 fn compact(dir: &Path, frame: u32, raised: bool) -> Result<CompactStats> {
     let out_path = |layer: u32| if raised { raised_path(dir, layer, frame) } else { run_path(dir, layer, frame) };
     let remaps = merge_xfer_tables(dir, frame, raised)?;
@@ -675,7 +733,7 @@ fn compact(dir: &Path, frame: u32, raised: bool) -> Result<CompactStats> {
         st.t_sort += t_sort;
         let t0 = std::time::Instant::now();
         let (edges, bytes) = writer.finish(&out_path(*layer), &ldir.join(format!("tmp-f{:03}.bin", frame)))?;
-        for (f, _) in files {
+        for (f, _) in files.iter().filter(|_| !keep_raw()) {
             std::fs::remove_file(f)?;
         }
         st.edges += edges;
@@ -707,7 +765,7 @@ fn compact(dir: &Path, frame: u32, raised: bool) -> Result<CompactStats> {
                         std::fs::create_dir_all(&ldir)?;
                         let n = recs.len() as u64;
                         let (p, b) = write_run(recs, &out_path(*layer), &ldir.join(format!("tmp-f{:03}.bin", frame)))?;
-                        for (f, _) in files {
+                        for (f, _) in files.iter().filter(|_| !keep_raw()) {
                             std::fs::remove_file(f)?;
                         }
                         records += n;
@@ -726,10 +784,12 @@ fn compact(dir: &Path, frame: u32, raised: bool) -> Result<CompactStats> {
         st.bytes += b;
     }
     st.t_sort += t0.elapsed();
-    for w in remaps.keys() {
-        std::fs::remove_file(raw_xfer_path(dir, frame, *w))?;
+    if !keep_raw() {
+        for w in remaps.keys() {
+            std::fs::remove_file(raw_xfer_path(dir, frame, *w))?;
+        }
+        let _ = std::fs::remove_dir(raw_dir(dir, frame));
     }
-    let _ = std::fs::remove_dir(raw_dir(dir, frame));
     Ok(st)
 }
 

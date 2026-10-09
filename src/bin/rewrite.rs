@@ -333,6 +333,19 @@ enum Command {
         #[arg(long)]
         chain_out: Option<String>,
     },
+    /// BENCH: compact frame `frame`'s raw edge records again, from a copy
+    /// (hardlinks into `scratch`, which is replaced): the wall and CPU time
+    /// of `edges::compact_frame` and its phases, and the runs it writes
+    /// (`scratch/l*/f{frame}.bin`, to compare byte for byte). The raw
+    /// records survive a forward only under `CELESTE_KEEP_RAW=1`.
+    CompactBench {
+        #[arg(long)]
+        edges_dir: String,
+        #[arg(long)]
+        frame: u32,
+        #[arg(long)]
+        scratch: String,
+    },
     /// DIAGNOSTIC: the shape of a frame's recorded edges. Groups the edges
     /// recorded at `frame` by (source, target) and reports how many
     /// transfers a pair carries, how its x and y parts vary (a product of
@@ -1418,6 +1431,40 @@ fn main() -> Result<()> {
                     println!("[spurious] wrote the chain (frames 1..={step}) to {path}");
                 }
             }
+        }
+        Command::CompactBench { edges_dir, frame, scratch } => {
+            use celeste_rust::search::edges::{compact_frame, raw_dir};
+            let (src, dst) = (raw_dir(std::path::Path::new(&edges_dir), frame), std::path::Path::new(&scratch));
+            if dst.exists() {
+                std::fs::remove_dir_all(dst)?;
+            }
+            let to = raw_dir(dst, frame);
+            std::fs::create_dir_all(&to)?;
+            let mut n = 0;
+            for e in std::fs::read_dir(&src).map_err(|e| anyhow::anyhow!("{}: {e}", src.display()))? {
+                let p = e?.path();
+                std::fs::hard_link(&p, to.join(p.file_name().expect("a file")))?;
+                n += 1;
+            }
+            let cpu = || {
+                // SAFETY: getrusage fills the struct it is given.
+                let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+                u.ru_utime.tv_sec as f64 + u.ru_utime.tv_usec as f64 * 1e-6 + u.ru_stime.tv_sec as f64 + u.ru_stime.tv_usec as f64 * 1e-6
+            };
+            let (t0, c0) = (std::time::Instant::now(), cpu());
+            let st = compact_frame(dst, frame)?;
+            println!(
+                "[compact-bench] f{frame:03}: {n} raw files, {} records -> {} edges, {:.1} MB runs; wall {:.2} s, cpu {:.1} s; read {:.2} sort {:.2} write {:.2} s",
+                st.records,
+                st.edges,
+                st.bytes as f64 / 1e6,
+                t0.elapsed().as_secs_f64(),
+                cpu() - c0,
+                st.t_read.as_secs_f64(),
+                st.t_sort.as_secs_f64(),
+                st.t_write.as_secs_f64()
+            );
         }
         Command::EdgeCensus { level_dir, frame, horizon } => {
             use celeste_rust::search::edges::EdgeGraph;
