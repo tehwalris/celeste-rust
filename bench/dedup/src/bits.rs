@@ -757,6 +757,22 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     for q in &qw { pre[q.shard as usize].insert(q.high); }
     let pcnt: Vec<u64> = pre.iter().map(|p| p.len() as u64).collect();
     drop(pre);
+    if let Some(out) = std::env::var_os("PM_DUMP") {
+        // For `sweep probe=pm8`: each door entry's and each lookup's
+        // (group, directory key, bit) as `group << 38 | hk << 6 | bit`, and
+        // the directory entries per group.
+        assert!(pr > 0 && n_groups < 1 << 26, "PM_DUMP: posmask modes only");
+        let out = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(&out).unwrap();
+        let pk = |g: u32, hk: u32, b: u32| (g as u64) << 38 | (hk as u64) << 6 | b as u64;
+        let door_pk: Vec<u64> = dq.iter().enumerate().map(|(i, &(hk, b))| pk(dsh[i], hk, b)).collect();
+        let q_pk: Vec<u64> = qw.iter().map(|q| pk(q.shard, q.high, q.low)).collect();
+        std::fs::write(out.join(format!("{mode}door.bin")), crate::as_bytes(&door_pk)).unwrap();
+        std::fs::write(out.join(format!("{mode}q.bin")), crate::as_bytes(&q_pk)).unwrap();
+        std::fs::write(out.join(format!("{mode}cnt.bin")), crate::as_bytes(&pcnt)).unwrap();
+        eprintln!("[{mode}] PM_DUMP: wrote {mode}{{door,q,cnt}}.bin to {}: {n_groups} groups, {} entries", out.display(), pcnt.iter().sum::<u64>());
+        return;
+    }
     let entries: u64 = pcnt.iter().sum();
     let mut load = 0.5;
     let cap_of = |c: u64, load: f64| ((c.max(1) as f64 / load).ceil() as u64).next_power_of_two();

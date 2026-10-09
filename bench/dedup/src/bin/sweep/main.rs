@@ -24,18 +24,19 @@
 //! over two disjoint x-bands (`front=ccd`, stealing the other band's tail).
 //! Per chunk: a per-thread L2 cache of recent keys (design G; in-chunk
 //! duplicates resolve to the first one's pending lookup), the misses
-//! resolved by the `Probe` (probe.rs: lock-free lookups, inserts under a
-//! per-shard spinlock), then rows and edges written.
+//! resolved by the `Probe` (probe.rs: posmask8 by default, lock-free; the
+//! keyed tables v4/exact insert under a per-shard spinlock), then rows and
+//! edges written.
 //!
 //! Usage: sweep DIR prep | sweep DIR run [threads=16] [front=shared|ccd]
-//!   [probe=v4|exact] [chunk=1024] [cache=12] [split=0.5] [verify=0|1]
+//!   [probe=pm8|v4|exact] [chunk=1024] [cache=12] [split=0.5] [verify=0|1]
 //!   [prefault=0|1] [read=0|1] [cpus=0,1,...]
 
 #[path = "../../canon.rs"]
 mod canon;
 mod probe;
 
-use probe::{Exact, Pending, Probe, ProbeStats, V4};
+use probe::{Exact, NewState, Pending, Pm8, Probe, ProbeStats, V4};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -161,6 +162,10 @@ fn main() {
             match o.probe.as_str() {
                 "v4" => run(&dir, &o, |cnt| V4::new(cnt, o.load.unwrap_or(0.8))),
                 "exact" => run(&dir, &o, |cnt| Exact::new(cnt, o.load.unwrap_or(0.5))),
+                "pm8" => {
+                    let n_door = std::fs::metadata(format!("{dir}/door.bin")).unwrap().len() as usize / 40;
+                    run(&dir, &o, |_| Pm8::new(&format!("{dir}/sweep"), n_door, o.load.unwrap_or(0.5)))
+                }
                 p => panic!("probe {p}"),
             }
         }
@@ -276,7 +281,7 @@ impl Opts {
         Opts {
             threads,
             front: g("front", "shared"),
-            probe: g("probe", "v4"),
+            probe: g("probe", "pm8"),
             chunk: g("chunk", "1024").parse().unwrap(),
             cache_bits: g("cache", "12").parse().unwrap(),
             split: g("split", "0.5").parse().unwrap(),
@@ -389,7 +394,7 @@ fn worker<P: Probe>(sh: &Shared<P>, t: usize, home: usize) -> Done {
     pin(sh.o.cpus[t]);
     let mut d = Done::default();
     let base_id = sh.n_door + t as u32 * CAP;
-    let mut local = 0u32;
+    let (mut local, mut nrows) = (0u32, 0u32);
     let cache_on = sh.o.cache_bits > 0;
     let mut cache: Vec<CacheEnt> = vec![CacheEnt::default(); if cache_on { 1 << sh.o.cache_bits } else { 0 }];
     let cmask = cache.len().wrapping_sub(1);
@@ -516,7 +521,8 @@ fn worker<P: Probe>(sh: &Shared<P>, t: usize, home: usize) -> Done {
                 *e = CacheEnt { lo, hi, val: pj, gen };
             }
             ids.push(pj);
-            pend.push(Pending { key: q.key, shard: q.shard, at: k as u32, id: 0, inserted: false });
+            let (ps, pk) = sh.probe.query(ch.qa as usize + k, q.shard, q.key);
+            pend.push(Pending { key: pk, shard: ps, at: k as u32, id: 0, inserted: false });
         }
         tick!(2);
         {
@@ -532,7 +538,8 @@ fn worker<P: Probe>(sh: &Shared<P>, t: usize, home: usize) -> Done {
         // Emit: the new rows (64 B, one non-temporal line each), the cache, the edges.
         for (j, p) in pend.iter().enumerate() {
             if p.inserted {
-                let l = (p.id - base_id) as usize;
+                let l = nrows as usize;
+                nrows += 1;
                 while d.row_segs.len() <= l / SEG_R {
                     d.row_segs.push(sh.rows.take());
                 }
@@ -541,14 +548,15 @@ fn worker<P: Probe>(sh: &Shared<P>, t: usize, home: usize) -> Done {
                 unsafe { std::ptr::copy_nonoverlapping(q as *const Q as *const u32, row.as_mut_ptr(), 8) };
                 row[8] = sh.src_cell[q.src as usize];
                 row[9] = sh.shard_cell[q.shard as usize];
-                row[10] = l as u32;
-                row[11] = t as u32;
+                row[10] = p.id;
+                row[11] = ch.qa + p.at;
                 row[12..16].copy_from_slice(&[q.key as u32, (q.key >> 32) as u32, (q.key >> 64) as u32, (q.key >> 96) as u32]);
                 unsafe { nt_copy(sh.rows.at(d.row_segs[l / SEG_R], l % SEG_R) as *mut u8, row.as_ptr() as *const u8, 4) };
             }
             if cache_on {
-                let e = &mut cache[(p.key >> 64) as usize & cmask];
-                if e.val == PEND | j as u32 && e.gen == gen && e.lo == p.key as u64 {
+                let k = qs[p.at as usize].key;
+                let e = &mut cache[(k >> 64) as usize & cmask];
+                if e.val == PEND | j as u32 && e.gen == gen && e.lo == k as u64 {
                     e.val = p.id;
                 }
             }
@@ -574,7 +582,8 @@ fn worker<P: Probe>(sh: &Shared<P>, t: usize, home: usize) -> Done {
     unsafe { core::arch::x86_64::_mm_sfence() };
     tick!(5);
     std::hint::black_box(c0);
-    d.rows = local;
+    std::hint::black_box(local);
+    d.rows = nrows;
     d.busy = t0.elapsed().as_secs_f64();
     d
 }
@@ -643,8 +652,10 @@ fn run<P: Probe, F: Fn(&[u64]) -> P>(dir: &str, o: &Opts, make: F) {
         let dsh: &[u32] = from_bytes(&dsm);
         let per = n_door.div_ceil(32);
         let bad = AtomicU64::new(0);
+        // (pm8 is filled from its own key dump when it is built.)
+        let prefill = probe.positional_ids().is_none();
         std::thread::scope(|s| {
-            for t in 0..32 {
+            for t in (0..32).filter(|_| prefill) {
                 let (probe, door, dsh, bad) = (&probe, &door, dsh, &bad);
                 s.spawn(move || {
                     let mut st = ProbeStats::default();
@@ -717,7 +728,7 @@ fn run<P: Probe, F: Fn(&[u64]) -> P>(dir: &str, o: &Opts, make: F) {
     let row_at = |t: usize, l: usize| -> &[u8; 64] { unsafe { &*rows_out.at(done[t].row_segs[l / SEG_R], l % SEG_R) } };
     let row_shard = |r: &[u8; 64]| u32::from_le_bytes(r[0..4].try_into().unwrap());
     let row_key = |r: &[u8; 64]| u128::from_le_bytes(r[16..32].try_into().unwrap());
-    let mut ph_end = [0f64; 3];
+    let mut ph_end = [0f64; 4];
     let c = Instant::now();
     // Per thread, its rows per shard.
     let counts: Vec<Vec<u32>> = std::thread::scope(|s| {
@@ -752,11 +763,7 @@ fn run<P: Probe, F: Fn(&[u64]) -> P>(dir: &str, o: &Opts, make: F) {
     drop(counts);
     ph_end[0] = c.elapsed().as_secs_f64();
     let c = Instant::now();
-    #[derive(Clone, Copy, Default)]
-    struct It {
-        key: u128,
-        tl: u32,
-    }
+    type It = NewState;
     let mut items: Vec<It> = Vec::with_capacity(n_new);
     let ip = items.as_mut_ptr() as usize;
     std::thread::scope(|s| {
@@ -767,7 +774,7 @@ fn run<P: Probe, F: Fn(&[u64]) -> P>(dir: &str, o: &Opts, make: F) {
                 for l in 0..done[t].rows as usize {
                     let r = row_at(t, l);
                     let sh_ = row_shard(r) as usize;
-                    unsafe { (ip as *mut It).add(st[sh_] as usize).write(It { key: row_key(r), tl: (t as u32) << 23 | l as u32 }) };
+                    unsafe { (ip as *mut It).add(st[sh_] as usize).write(It { key: row_key(r), shard: sh_ as u32, prov: u32::from_le_bytes(r[40..44].try_into().unwrap()), qi: u32::from_le_bytes(r[44..48].try_into().unwrap()) }) };
                     st[sh_] += 1;
                 }
             });
@@ -776,15 +783,16 @@ fn run<P: Probe, F: Fn(&[u64]) -> P>(dir: &str, o: &Opts, make: F) {
     unsafe { items.set_len(n_new) };
     ph_end[1] = c.elapsed().as_secs_f64();
     let c = Instant::now();
-    // Per shard: sort by key; canonical id = n_door + position; the table's
-    // ids rewritten (this thread owns the shard); provisional -> canonical.
-    let renum: Vec<Vec<AtomicU32>> = done.iter().map(|d| (0..d.rows).map(|_| AtomicU32::new(u32::MAX)).collect()).collect();
+    // Per shard: sort by key; canonical id = n_door + position; the map
+    // provisional -> canonical (indexed by provisional - n_door: sparse,
+    // zero-page backed); then the table's own end of frame.
+    let renum: probe::Arena<AtomicU32> = probe::Arena::zeroed(probe.renum_prepare(o.threads).unwrap_or(o.threads * CAP as usize));
     {
         let next = AtomicUsize::new(0);
         let ip = items.as_mut_ptr() as usize;
         std::thread::scope(|s| {
             for t in 0..o.threads {
-                let (next, shard_start, probe, renum) = (&next, &shard_start, &probe, &renum);
+                let (next, shard_start, renum, probe) = (&next, &shard_start, &renum, &probe);
                 s.spawn(move || {
                     pin(o.cpus[t]);
                     loop {
@@ -797,9 +805,8 @@ fn run<P: Probe, F: Fn(&[u64]) -> P>(dir: &str, o: &Opts, make: F) {
                             let v = unsafe { std::slice::from_raw_parts_mut((ip as *mut It).add(lo), hi - lo) };
                             v.sort_unstable_by_key(|x| x.key);
                             for (k, x) in v.iter().enumerate() {
-                                let cid = (n_door + lo + k) as u32;
-                                probe.set_id(sh_ as u32, x.key, cid);
-                                renum[(x.tl >> 23) as usize][(x.tl & (CAP - 1)) as usize].store(cid, Ordering::Relaxed);
+                                // (+1: zero is "none" in the zeroed map)
+                                renum.at(probe.renum_index(x.prov, n_door as u32)).store((n_door + lo + k) as u32 + 1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -808,6 +815,14 @@ fn run<P: Probe, F: Fn(&[u64]) -> P>(dir: &str, o: &Opts, make: F) {
         });
     }
     ph_end[2] = c.elapsed().as_secs_f64();
+    let c = Instant::now();
+    let renum_of = |prov: u32| -> u32 {
+        let c = renum.at(probe.renum_index(prov, n_door as u32)).load(Ordering::Relaxed);
+        assert_ne!(c, 0, "a new state without a canonical id");
+        c - 1
+    };
+    probe.end_frame(&items, &renum_of, n_door as u32, o.threads);
+    ph_end[3] = c.elapsed().as_secs_f64();
     let t_end = t_end.elapsed().as_secs_f64();
     perf_on(false);
 
@@ -837,7 +852,7 @@ fn run<P: Probe, F: Fn(&[u64]) -> P>(dir: &str, o: &Opts, make: F) {
         }
     }
     let line: Vec<String> = PH.iter().zip(ph).map(|(n, t)| format!("{n} {:.2}s ({:.0}%)", t as f64 / hz, 100.0 * t as f64 / hz / budget)).collect();
-    eprintln!("[phases] worker-seconds of {budget:.2} ({} x {t_wave:.3} s): {}; end: count {:.3} s, scatter {:.3} s, sort+renumber {:.3} s", o.threads, line.join(", "), ph_end[0], ph_end[1], ph_end[2]);
+    eprintln!("[phases] worker-seconds of {budget:.2} ({} x {t_wave:.3} s): {}; end: count {:.3} s, scatter {:.3} s, sort+renumber {:.3} s, table {:.3} s", o.threads, line.join(", "), ph_end[0], ph_end[1], ph_end[2], ph_end[3]);
     let pst = done.iter().fold(ProbeStats::default(), |a, d| ProbeStats { lookups: a.lookups + d.pst.lookups, found: a.found + d.pst.found, inserts: a.inserts + d.pst.inserts, raced: a.raced + d.pst.raced, lock_spins: a.lock_spins + d.pst.lock_spins });
     eprintln!(
         "[stats] cache hits {} ({:.1}%), in-chunk dups {}, table lookups {} (found {}, inserts {}, raced {}, lock spins {}), chunks {} (stolen {}), bytes: edges {:.2} GB, rows {:.2} GB",
@@ -863,12 +878,15 @@ fn run<P: Probe, F: Fn(&[u64]) -> P>(dir: &str, o: &Opts, make: F) {
     let t = Instant::now();
     let src_id: Vec<u64> = (0..n_src).map(|i| rd64(&srcf, i * 20)).collect();
     let door_kh = |i: usize| canon::key_hash(rd64(&door, i * 40 + 16), rd64(&door, i * 40 + 24));
+    // (The table's end of frame consumed its provisional ids: a map from the rows.)
+    let canon_of: FxHashMap<u32, u32> = items.iter().enumerate().map(|(k, it)| (it.prov, (n_door + k) as u32)).collect();
+    let renum_of = |prov: u32| canon_of[&prov];
     let segs: Vec<(usize, usize)> = done.iter().flat_map(|d| d.edge_segs.iter().copied()).collect();
     let next = AtomicUsize::new(0);
     let (hs, idfp): (Vec<u64>, u64) = std::thread::scope(|s| {
         let hs: Vec<_> = (0..32)
             .map(|_| {
-                let (segs, next, src_id, renum, items, edges_out, door_kh) = (&segs, &next, &src_id, &renum, &items, &edges_out, &door_kh);
+                let (segs, next, src_id, renum_of, items, edges_out, door_kh) = (&segs, &next, &src_id, &renum_of, &items, &edges_out, &door_kh);
                 s.spawn(move || {
                     let (mut h, mut idfp) = (Vec::new(), 0u64);
                     loop {
@@ -879,9 +897,7 @@ fn run<P: Probe, F: Fn(&[u64]) -> P>(dir: &str, o: &Opts, make: F) {
                             let (cid, kh) = if (e.tgt as usize) < n_door {
                                 (e.tgt, door_kh(e.tgt as usize))
                             } else {
-                                let p = e.tgt - n_door as u32;
-                                let c = renum[(p / CAP) as usize][(p % CAP) as usize].load(Ordering::Relaxed);
-                                assert_ne!(c, u32::MAX, "an edge to a new state without a canonical id");
+                                let c = renum_of(e.tgt);
                                 let it = &items[c as usize - n_door];
                                 (c, canon::key_hash(it.key as u64, (it.key >> 64) as u64))
                             };
@@ -913,8 +929,9 @@ fn run<P: Probe, F: Fn(&[u64]) -> P>(dir: &str, o: &Opts, make: F) {
     }
     // The table after the frame's end: every new key at its canonical id.
     let bad = items.iter().enumerate().filter(|(k, it)| {
-        let sh_ = shard_start.partition_point(|&s| s as usize <= *k) - 1;
-        probe.lookup(sh_ as u32, it.key) != Some((n_door + k) as u32)
+        let (ps, pk) = probe.query(it.qi as usize, it.shard, it.key);
+        assert_eq!(qs[it.qi as usize].key, it.key, "a row's lookup is not its key's");
+        probe.lookup(ps, pk) != Some((n_door + k) as u32)
     }).count();
     eprintln!("[verify] canon edges {n} (want 257724013) distinct {distinct} fp {fp:016x}; notes {nn} fp {nsum:016x}; canonical-id fp {idfp:016x}; table ids wrong {bad}; {:.1} s", t.elapsed().as_secs_f64());
 }
