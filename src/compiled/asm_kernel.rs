@@ -498,6 +498,31 @@ impl AsmKernel {
                 n_bodies_taken += 1;
                 n_lanes += take.count_ones() as u64;
                 let template = &self.acc_templates[body.outcome];
+                // Level -1 first: a dropped cell's row needs no key, transfer
+                // or queue, only its pos-graph edge and its sources' notes
+                // (what `flush` records for a dropped queue).
+                let mut couts = [0u32; 16];
+                let mut m = take;
+                while m != 0 {
+                    let i = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let cout = cell_out(body, outbuf, i);
+                    couts[i] = cout;
+                    if let Some(from) = sink.minus_one_drop(template.union.shape_hash, cout) {
+                        take &= !(1 << i);
+                        let cin = cell_in[lanes[i]];
+                        if sink.edges_on && last_edge != (cin, cout) {
+                            last_edge = (cin, cout);
+                            sink.edges.insert((cin, cout));
+                        }
+                        if let Some(b) = slice_base {
+                            sink.dropped_again(b, glane(i), from as u64);
+                        }
+                    }
+                }
+                if take == 0 {
+                    continue;
+                }
                 let keys = body.key_words16(outbuf);
                 while take != 0 {
                     let i = take.trailing_zeros() as usize;
@@ -523,7 +548,7 @@ impl AsmKernel {
                         // A re-emission: one more predecessor (on the queued
                         // row's mask, or direct if flushed).
                         if sink.edges_on && first_cin != cin {
-                            sink.edges.insert((cin, cell_out(body, outbuf, i)));
+                            sink.edges.insert((cin, couts[i]));
                         }
                         match slice_base {
                             Some(b) if r & RowCache::ID_FLAG != 0 => {
@@ -542,12 +567,15 @@ impl AsmKernel {
                     }
                     sink.emitted += 1;
                     n_unique += 1;
-                    let cout = cell_out(body, outbuf, i);
+                    let cout = couts[i];
                     if sink.edges_on && last_edge != (cin, cout) {
                         last_edge = (cin, cout);
                         sink.edges.insert((cin, cout));
                     }
                     let q = sink.queue(template.shape_hash, cout, || (*template.union).clone_block());
+                    // `minus_one_drop` judged the row by the union's shape:
+                    // the queue's must be that one (flush filters by it).
+                    assert_eq!(sink.slots[q].shape, template.union.shape_hash, "a queue's shape is its template union's");
                     cols.push_row(&mut sink.slots[q], outbuf, i, key, cout);
                     if let Some(b) = slice_base {
                         sink.slots[q].pred_base.push(b);

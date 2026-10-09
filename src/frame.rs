@@ -823,6 +823,8 @@ pub struct ForwardSink<'a> {
     clock: usize,
     /// The run cache: rows arrive in runs of one (outcome, cell).
     last: ((u64, u32), u32),
+    /// `minus_one_drop`'s last answer: emissions come in runs of one cell.
+    drop_last: Option<((u64, u32), Option<u32>)>,
     door: Option<&'a crate::search::door::Door>,
     filters: Filters<'a>,
     /// Note the sources of the rows level -1 drops (`drops`): a level-0
@@ -895,6 +897,7 @@ impl<'a> ForwardSink<'a> {
             spare: Default::default(),
             clock: 0,
             last: NO_QUEUE,
+            drop_last: None,
             door: None,
             filters: Filters::default(),
             note_drops: false,
@@ -958,6 +961,24 @@ impl<'a> ForwardSink<'a> {
         s.seqs = Some(seqs);
         s.raised = raised;
         s
+    }
+
+    /// The level -1 filter at EMISSION: `Some(from)` where it drops every
+    /// row of (`shape`, `cell`) at this frame - exactly the queues `flush`
+    /// would drop whole - so the row is never keyed, queued or flushed.
+    /// Half the unit-unique rows of room (6,2) 100% f57 (56M of 113M).
+    #[inline]
+    pub fn minus_one_drop(&mut self, shape: u64, cell: u32) -> Option<u32> {
+        let m = self.filters.minus_one?;
+        if let Some((at, r)) = self.drop_last {
+            if at == (shape, cell) {
+                return r;
+            }
+        }
+        let from = m.table().admitted_from(shape, cell, self.frame);
+        let r = (from > m.h).then_some(from);
+        self.drop_last = Some(((shape, cell), r));
+        r
     }
 
     /// A re-emission of a row a filter dropped (its cache ref `r` carries

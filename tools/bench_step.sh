@@ -10,7 +10,7 @@
 #   env: whatever the base was built with (CELESTE_HUNDRED, CELESTE_LOADING_JANK,
 #   CELESTE_LEVEL_MINUS_ONE, ...), CELESTE_THREADS; PAUSE_PIDS: processes
 #   stopped (SIGSTOP) for the timed run and resumed after, so a long search
-#   on the same machine does not skew it.
+#   on the same machine does not skew it. KEEP=1: leave the scratch tree.
 set -euo pipefail
 BASE=$1; ROOM=$2; LEVEL=$3; REPS=$4
 BIN=${5:-$(dirname "$0")/../target/release/rewrite}
@@ -35,4 +35,4 @@ for rep in $(seq 1 "$REPS"); do
   echo "rep $rep: f$F->f$((F + 1)) | $line | process $(awk "BEGIN{printf \"%.1f\", $t1 - $t0}") s (resume ${resume:-?})"
 done
 grep -E "^kernel (calls|util)" "$S.err" | cut -c1-200
-rm -rf "$S"
+[ -n "${KEEP:-}" ] || rm -rf "$S"
