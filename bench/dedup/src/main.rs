@@ -14,15 +14,16 @@ mod structure;
 mod posregion;
 mod regionbatch;
 mod regionpar;
+mod edgecensus;
 
 const REC: usize = 48;
 const PAYLOAD: usize = 64;
 
 #[derive(Clone, Copy)]
-struct Rec { src: u64, key: u128, shape: u64, cell: u32, xfer: u32, flags: u32 }
+pub struct Rec { src: u64, key: u128, shape: u64, cell: u32, xfer: u32, flags: u32 }
 
 #[inline]
-fn rec(b: &[u8]) -> Rec {
+pub fn rec(b: &[u8]) -> Rec {
     let u64_ = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
     let u32_ = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
     Rec { src: u64_(0), key: (u64_(8) as u128) | ((u64_(16) as u128) << 64), shape: u64_(24), cell: u32_(32), xfer: u32_(36), flags: u32_(40) }
@@ -88,6 +89,7 @@ fn main() {
         "bits" => bits::run_bits(dir, door.len() / 40, false),
         "bitsr" => bits::run_bits(dir, door.len() / 40, true),
         "regionbatch8" | "regionbatch16" => regionbatch::regionbatch(dir, door.len() / 40, variant[11..].parse().unwrap(), args.get(3).map_or("merge,hash", |s| s.as_str()), args.get(4).is_some_and(|s| s == "ids")),
+        "edgecensus" => edgecensus::edgecensus(dir, &door, &maps),
         "regionpar" => regionpar::regionpar(dir, door.len() / 40, &args[3..]),
         "bitintern" => bits::run_intern(dir, door.len() / 40),
         "bitcell" | "bitspd" | "bitspd2" | "posmask4" | "posmask8" => bits::run_words(dir, door.len() / 40, variant),

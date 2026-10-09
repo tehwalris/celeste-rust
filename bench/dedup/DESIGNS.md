@@ -449,3 +449,90 @@ Speedup (8x8 varint, best split): 7.2x at 8, 10x at 16, 9.6x at 32 threads.
   pre-dedup of the emissions (G, the unit cache, 8x) would shrink the batch
   stream, the bound here, by the same factor.
 Script: /var/tmp/emitcap/regionpar/bench.sh; log reps.log next to it.
+
+## K. Interfaces and edges (design notes, not built)
+
+(a) **Stable ids under posmask**: a state's id = (region, entry number,
+cell). Entries are numbered per region in order of first appearance; within
+a frame, canonically, by sorting the frame's new entries by key at the
+region's end. A new bit in an existing entry never moves an id; a new entry
+appends. Cost: ~4 B an entry (its number, or a key -> number map), spread
+over ~20 states at 8x8.
+
+(b) **Edge bundles**: a source-cell mask + one shift (dx, dy) + a transfer,
+from one source entry to one target entry, split per target region (a
+shifted 8x8 mask spans up to 4 target regions). Measured in K1 below. Open:
+mapping the backward's per-remainder winning sets W onto mask operations (W
+is per state and per remainder interval; a bundle shares the transfer, so
+one W lookup per target entry could serve every cell of the mask, but the
+W of different target cells differ).
+
+(c) **Edges written per target region straight out of the region pass**
+(J's batch IS the edge list sorted by target): the backward reads them in
+target order and needs no inversion (today 36-90 s a search).
+
+(d) **Fallback**: edges carry target KEYS, not ids; the backward resolves
+them with its own per-region batch against the stored sets (the same
+pipeline as J, run backward).
+
+(e) **Kernel / storage interface options**:
+- one generated STATE CODEC (field order, dictionaries, the joint
+  flags+dash digit, region geometry), consumed by the ASM assembler (SIMD
+  pack / unpack in the kernels) and by the storage;
+- batch-granularity, monomorphized calls: arrays of packed emissions per
+  L2-sized chunk, no per-element calls or callbacks;
+- the storage owns the schedule: the sweep calls the kernels as producers
+  and their emissions go straight into per-target-region buffers - this
+  also removes the partition pass (J2's estimate ~0.1 s);
+- the stored state IS the row (exact packing): the kernels decode the
+  frontier from storage, no separate columns;
+- migration: a thin adapter, a posmask door behind the existing admit call;
+- a dictionary miss (a value the codec does not know): FATAL plus a rebuild
+  at the frame boundary, or an exact, counted, LOUD slow path inside the
+  storage - never silent (CLAUDE.md: no silent deopt, no unrefuted widening);
+- before production: check the codec is EXACT (injective on the key) for the
+  object levels and the platform levels, not only room (6,2) r0sxhf.
+
+### K1. Edge bundle census (`edgecensus`; analysis only)
+
+All 257,724,013 edges of f57 (the capture's non-dropped emissions; sources
+from door.bin via src ids, targets by key, both through the field dump's
+packing). 62,870 distinct transfer ids. 853,523 edges shift > 8 px and
+2,341,353 change shape (deaths / respawns).
+
+- SOURCE-side bundles (src shape + 8x8 region + packed key, transfer, tgt
+  shape + key, shift): **151.7M bundles, 1.70 edges each**; median 1 cell,
+  p90 3, max 56; edge-weighted median 2, p90 6; 63.7% of bundles (37.5% of
+  edges) single-cell. Target regions a shifted mask spans: 1: 132.6M, 2:
+  17.8M, 3: 1.18M, 4: 0.16M.
+- TARGET-side (mask of target cells): 153.5M bundles, 1.68 edges each, 64.8%
+  single-cell. No better.
+- The TRANSFER is what splits them: without it in the key, 31.5M bundles
+  (**8.2 edges each**); with it, 4.8x as many. The transfer (the remainder
+  map of the frame) varies with the cell inside an otherwise identical
+  bundle. Bundles pay only if transfers are factored out (e.g. stored per
+  (target entry, cell) once, or the transfer made cell-independent).
+- Bytes an edge: (b) bundle records (src entry u32, one tgt entry u32 per
+  spanned region, shift 1 B, transfer varint, u64 mask), sorted by target
+  region: raw 11.7, zstd -1 **1.20**; (a) flat edges with stable ids (region,
+  entry, cell), sorted per target region, varint (target delta, source delta
+  or id, transfer): raw **4.76**, zstd -1 2.65. Production: /var/tmp/vprod-edges
+  raw_f057 1.1 GB = ~4.3 B an edge (~4.7 by the earlier estimate).
+  So: flat stable-id edges match production raw; bundles only win under a
+  general compressor, and by 2.2x over flat + zstd.
+
+## L. Roadmap (agreed with Philippe)
+
+1. **Edges in the bench**: choose bundles vs flat stable-id edges from K1
+   (flat raw ~ production; bundles + zstd 2.2x smaller); write them from
+   regionpar; validate the edge set against vprod's key-based fingerprint
+   (`3b4f8b60b8767421`, the sweep branch).
+2. **A realistic bench**: no untimed grouping - a producer replays the
+   emissions in kernel / source order into per-target-region chunk buffers
+   drained in cache, no counting pass; rows for the new states (or "the
+   stored state is the row"); the packing cost; drop notes and level -1;
+   several consecutive frames (needs a multi-frame capture); an object or
+   platform room to check the codec is exact.
+3. **The real kernels end to end**, behind the gates (ckhash, posgraph, arc
+   gate, arc-check, the known route), at the same throughput. The goal state
+   is kernel compute (~0.44 s a frame) being the limit.
