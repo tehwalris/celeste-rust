@@ -240,8 +240,8 @@ pub const SUMMIT_LEVEL: i16 = 30;
 pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
     static RECT: std::sync::OnceLock<Option<(i16, i16, i16, i16)>> = std::sync::OnceLock::new();
     *RECT.get_or_init(|| {
-        if let Some((x, y)) = crate::abstraction::synthetic_win_xy() {
-            return Some((x, x, y, y));
+        if let Some(rect) = crate::abstraction::synthetic_win_rect() {
+            return Some(rect);
         }
         let (rx, ry) = crate::game_runner::start_room();
         if crate::game_runner::level_index(rx, ry) != SUMMIT_LEVEL {
@@ -264,7 +264,6 @@ pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
 
 /// Per lane: has it left the start room, or met the `win_rect`?
 pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
-    use celeste_engine::runtime2::{Col, AV};
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
     if let Some((txl, txh, tyl, tyh)) = win_rect() {
@@ -286,7 +285,14 @@ pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
         });
     }
     // Both coordinates: the exit from a row's last room wraps to the next row.
-    let (wx, wy) = crate::game_runner::win_room();
+    room_is(rt2, crate::game_runner::win_room())
+}
+
+/// Per lane: is the `room` global (`room.x`, `room.y`) = `(wx, wy)`?
+fn room_is(rt2: &Rt2, (wx, wy): (i16, i16)) -> Result<Vec<bool>> {
+    use celeste_engine::runtime2::{Col, AV};
+    let ids = crate::compiled::ids();
+    let lanes = rt2.width;
     let room = rt2
         .global_target(ids.g_room)
         .ok_or_else(|| anyhow::anyhow!("wins: no `room` global"))?;
@@ -392,6 +398,14 @@ pub fn berry_lost(rt2: &Rt2) -> Result<Vec<bool>> {
 /// tree's level -1 horizon, the orb deadline's ceiling.
 pub fn not_expanded(b: &Block, frame: u32, ceiling: Option<u32>) -> Result<Vec<bool>> {
     let mut skip = b.exits()?;
+    // Under a win rectangle (`--win-at`, the summit's flag) a row that LEFT
+    // the room is no win, but it is not this room's search either (its
+    // shape has no kernel: a coverage gap at room (0,3) f93).
+    if win_rect().is_some() {
+        for (w, here) in skip.iter_mut().zip(room_is(b.rt2(), crate::game_runner::start_room())?) {
+            *w |= !here;
+        }
+    }
     for (w, lost) in skip.iter_mut().zip(berry_lost(b.rt2())?) {
         *w |= lost;
     }
