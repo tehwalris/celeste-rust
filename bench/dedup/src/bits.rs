@@ -232,7 +232,7 @@ impl Packing {
 /// the stream is the same size as v3c's).
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct QB { pub shard: u32, pub src: u32, pub xfer: u32, pub low: u32, pub high: u32, _p: [u32; 3] }
+pub struct QB { pub shard: u32, pub src: u32, pub xfer: u32, pub low: u32, pub high: u32, pub _p: [u32; 3] }
 
 fn bits_of(x: u64) -> f64 { (x as f64).log2() }
 
@@ -347,7 +347,7 @@ struct E { hk: u32, base: u32, bits: [u64; 2] }
 struct ER { hk: u32, base: u32, old: [u64; 2], new: [u64; 2] }
 
 #[inline(always)]
-fn slot_of(hk: u32, (base, mask): (u32, u32)) -> u32 { base + (hk.wrapping_mul(0x9E37_79B1).rotate_left(16) & mask) }
+pub fn slot_of(hk: u32, (base, mask): (u32, u32)) -> u32 { base + (hk.wrapping_mul(0x9E37_79B1).rotate_left(16) & mask) }
 
 /// `bits` / `bitsr`: the timed loop over the same 257.7M sweep-ordered
 /// lookups, each a directory probe in its shard + one bit test-and-set.
@@ -368,10 +368,10 @@ pub fn run_bits(dir: &str, n_door: usize, rank: bool) {
     assert!(total << 7 < 1 << 32 && (total * 96 + n_door as u64) < (1 << 32), "slot ids must fit 32 bits");
     assert!(qs.iter().all(|q| q.low < 96));
     let tag = if rank { "bitsr" } else { "bits" };
-    let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * crate::PAYLOAD);
-    let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qs.len());
+    let mut frontier: Vec<u8> = crate::huge_cap(7_000_000 * crate::PAYLOAD);
+    let mut edges: Vec<(u32, u32, u32)> = crate::huge_cap(qs.len());
     let mut dropmin: Vec<u32> = vec![u32::MAX; n_src];
-    let (dt, t_drops, t_end, new, mem);
+    let (dt, t_drops, t_end, new, mem, hp_tab);
     let mut old_ids: FxHashSet<u32> = FxHashSet::default();
     macro_rules! probe { ($tab:expr, $sh:expr, $hk:expr) => {{
         let (b, m) = off[$sh as usize];
@@ -380,7 +380,7 @@ pub fn run_bits(dir: &str, n_door: usize, rank: bool) {
         s
     }}; }
     if !rank {
-        let mut tab: Vec<E> = vec![E { hk: 0, base: 0, bits: [0; 2] }; total as usize];
+        let mut tab: Vec<E> = crate::huge_vec(total as usize, E { hk: 0, base: 0, bits: [0; 2] });
         for i in 0..n_door { let (h, l) = db[i]; let s = probe!(tab, dsh[i], h + 1); tab[s as usize].bits[(l >> 6) as usize] |= 1 << (l & 63); old_ids.insert(s << 7 | l); }
         mem = total as f64 * std::mem::size_of::<E>() as f64;
         eprintln!("[{tag}] setup {:.1} s: directory {} slots x {} B = {:.2} GB", t.elapsed().as_secs_f64(), total, std::mem::size_of::<E>(), mem / 1e9);
@@ -397,8 +397,9 @@ pub fn run_bits(dir: &str, n_door: usize, rank: bool) {
             edges.push((q.src, s << 7 | q.low, q.xfer));
         }
         dt = t.elapsed().as_secs_f64(); new = nw; t_end = 0.0; crate::perf_on(false);
+        hp_tab = crate::hp_at(&tab);
     } else {
-        let mut tab: Vec<ER> = vec![ER { hk: 0, base: 0, old: [0; 2], new: [0; 2] }; total as usize];
+        let mut tab: Vec<ER> = crate::huge_vec(total as usize, ER { hk: 0, base: 0, old: [0; 2], new: [0; 2] });
         for i in 0..n_door { let (h, l) = db[i]; let s = probe!(tab, dsh[i], h + 1); tab[s as usize].old[(l >> 6) as usize] |= 1 << (l & 63); }
         // Rank bases over the frame-start set, in arena (= shard, slot) order.
         let mut acc = 0u32;
@@ -426,6 +427,7 @@ pub fn run_bits(dir: &str, n_door: usize, rank: bool) {
             edges.push((q.src, id, q.xfer));
         }
         dt = t.elapsed().as_secs_f64(); new = nw; crate::perf_on(false);
+        hp_tab = crate::hp_at(&tab);
         // The frame's end: new states ranked in arena order, their edges resolved.
         let t = std::time::Instant::now();
         let mut acc = n_door as u32;
@@ -441,9 +443,9 @@ pub fn run_bits(dir: &str, n_door: usize, rank: bool) {
         t_end = t.elapsed().as_secs_f64();
     }
     std::hint::black_box((&frontier, &dropmin));
-    eprintln!("[{tag}] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {new} ({}), {:.1} ns per query{}; structure {:.2} GB",
+    eprintln!("[{tag}] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {new} ({}), {:.1} ns per query{}; structure {:.2} GB; {hp_tab}; after: {}",
         if new == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qs.len() as f64,
-        if rank { format!("; frame-end rank pass {t_end:.2} s") } else { String::new() }, mem / 1e9);
+        if rank { format!("; frame-end rank pass {t_end:.2} s") } else { String::new() }, mem / 1e9, crate::hp());
     if std::env::var_os("BENCH_NOCHECK").is_some() { return; }
     if rank { check(tag, &pd, &edges, n_door, &|m| (m as usize) < n_door, true) } else { check(tag, &pd, &edges, n_door, &|m| old_ids.contains(&m), false) }
 }
@@ -451,7 +453,7 @@ pub fn run_bits(dir: &str, n_door: usize, rank: bool) {
 /// UNTIMED: every lookup's decision and target against the reference (v3c's
 /// ids: door index, new states numbered in sweep order); the fingerprint is
 /// over THIS variant's decisions.
-fn check(tag: &str, pd: &str, edges: &[(u32, u32, u32)], n_door: usize, is_old: &dyn Fn(u32) -> bool, rank: bool) {
+pub fn check(tag: &str, pd: &str, edges: &[(u32, u32, u32)], n_door: usize, is_old: &dyn Fn(u32) -> bool, rank: bool) {
     let rm = unsafe { memmap2::Mmap::map(&std::fs::File::open(format!("{pd}/refid.bin")).unwrap()).unwrap() };
     let refid: &[u32] = crate::from_bytes(&rm);
     let mut mine_of_ref: Vec<u32> = vec![u32::MAX; n_door + 6_735_699];
@@ -665,24 +667,20 @@ pub fn cell_census(dir: &str) {
     }
 }
 
-/// `bitcell` / `bitspd` / `bitspd2`: one 64-bit mask word per directory
-/// entry, the entry's key carrying the word's index. Per (shape, cell) shard:
-/// - `bitcell`: key = the high digits (freeze, djump, grace, flip, spd.x, dash
-///   combo), mask over spd.y's PER-CELL dictionary (<= 75 values here);
-/// - `bitspd`: key = (spd.x, spd.y, dash combo), mask over freeze x djump x
-///   grace x flip (room radix, 126 for shape 2);
-/// - `bitspd2`: key = (spd.x, spd.y), mask over the PER-CELL dictionary of
-///   the (flags, dash combo) joint.
-/// The per-cell dictionaries come from the data (door + the frame); the
-/// (key, bit) of every state is precomputed untimed, as `bits`' packing is.
-pub fn run_words(dir: &str, n_door: usize, mode: &str) {
-    let t = std::time::Instant::now();
+/// The per-state (directory group, mask key, bit) of `bitcell` / `bitspd` /
+/// `bitspd2` (group = the (shape, cell) shard) and `posmask{R}` (group = the
+/// (shape, R x R region)): the queries `qw` (QB with `shard` = the group,
+/// `high` = the entry key, `low` = the bit), the door `dq` (in door order, its
+/// groups `dsh`), directory entries per group at the frame's end `pcnt`, the
+/// mask widths (per shard), the entries at the frame start.
+pub struct WordsPrep { pub qw: Vec<QB>, pub dq: Vec<(u32, u32)>, pub dsh: Vec<u32>, pub pcnt: Vec<u64>, pub width: Vec<u64>, pub n_old: usize }
+
+pub fn words_prep(dir: &str, n_door: usize, mode: &str) -> WordsPrep {
     let pd = format!("{dir}/prep");
     let map = |f: &str| unsafe { memmap2::Mmap::map(&std::fs::File::open(format!("{pd}/{f}")).unwrap()).unwrap() };
-    let (qm, dm, sm, dsm, shm) = (map("qb.bin"), map("d.bin"), map("dshard.bin"), map("db.bin"), map("sshape.bin"));
-    let qs: &[QB] = crate::from_bytes(&qm); let ds: &[u32] = crate::from_bytes(&dm);
+    let (qm, sm, dsm, shm) = (map("qb.bin"), map("dshard.bin"), map("db.bin"), map("sshape.bin"));
+    let qs: &[QB] = crate::from_bytes(&qm);
     let dsh: &[u32] = crate::from_bytes(&sm); let db: &[(u32, u32)] = crate::from_bytes(&dsm); let sshape: &[u32] = crate::from_bytes(&shm);
-    let n_src: usize = std::fs::read_to_string(format!("{pd}/nsrc.txt")).unwrap().trim().parse().unwrap();
     let n_shards = sshape.len();
     // posmask{R}: the directory per (shape, R x R region) on (high, spd.y), the mask over the region's cells.
     let pr: i32 = mode.strip_prefix("posmask").map_or(0, |r| r.parse().unwrap());
@@ -757,6 +755,28 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     for q in &qw { pre[q.shard as usize].insert(q.high); }
     let pcnt: Vec<u64> = pre.iter().map(|p| p.len() as u64).collect();
     drop(pre);
+    WordsPrep { qw, dq, dsh, pcnt, width, n_old }
+}
+
+/// `bitcell` / `bitspd` / `bitspd2`: one 64-bit mask word per directory
+/// entry, the entry's key carrying the word's index. Per (shape, cell) shard:
+/// - `bitcell`: key = the high digits (freeze, djump, grace, flip, spd.x, dash
+///   combo), mask over spd.y's PER-CELL dictionary (<= 75 values here);
+/// - `bitspd`: key = (spd.x, spd.y, dash combo), mask over freeze x djump x
+///   grace x flip (room radix, 126 for shape 2);
+/// - `bitspd2`: key = (spd.x, spd.y), mask over the PER-CELL dictionary of
+///   the (flags, dash combo) joint.
+/// The per-cell dictionaries come from the data (door + the frame); the
+/// (key, bit) of every state is precomputed untimed, as `bits`' packing is.
+pub fn run_words(dir: &str, n_door: usize, mode: &str) {
+    let t = std::time::Instant::now();
+    let pd = format!("{dir}/prep");
+    let map = |f: &str| unsafe { memmap2::Mmap::map(&std::fs::File::open(format!("{pd}/{f}")).unwrap()).unwrap() };
+    let dm = map("d.bin");
+    let ds: &[u32] = crate::from_bytes(&dm);
+    let n_src: usize = std::fs::read_to_string(format!("{pd}/nsrc.txt")).unwrap().trim().parse().unwrap();
+    let WordsPrep { qw, dq, dsh, pcnt, width, n_old } = words_prep(dir, n_door, mode);
+    let n_groups = pcnt.len();
     let entries: u64 = pcnt.iter().sum();
     let mut load = 0.5;
     let cap_of = |c: u64, load: f64| ((c.max(1) as f64 / load).ceil() as u64).next_power_of_two();
@@ -768,8 +788,7 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     #[repr(C, packed)]
     #[derive(Clone, Copy)]
     struct W { hk: u32, bits: u64 }
-    let mut tab: Vec<W> = vec![W { hk: 0, bits: 0 }; total as usize];
-    huge(&mut tab);
+    let mut tab: Vec<W> = crate::huge_vec(total as usize, W { hk: 0, bits: 0 });
     macro_rules! probe { ($sh:expr, $hk:expr) => {{
         let (b, m) = off[$sh as usize];
         let mut s = slot_of($hk, (b, m));
@@ -784,8 +803,8 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     eprintln!("[{mode}] setup {:.1} s (untimed): mask widths: {} directory groups, mean {:.1} bits (by entries); {n_old} entries at the frame start, {entries} at its end ({:.2} states each, mask fill {:.2}%); directory {} slots x {} B at load {load} = {:.2} GB",
         t.elapsed().as_secs_f64(), n_groups, wsum(&|s| pcnt[s] * width[s].min(64)) as f64 / entries as f64, (n_door + 6_735_699) as f64 / entries as f64,
         100.0 * (n_door + 6_735_699) as f64 / wsum(&|s| pcnt[s] * 64) as f64, total, std::mem::size_of::<W>(), mem / 1e9);
-    let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * crate::PAYLOAD);
-    let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qw.len());
+    let mut frontier: Vec<u8> = crate::huge_cap(7_000_000 * crate::PAYLOAD);
+    let mut edges: Vec<(u32, u32, u32)> = crate::huge_cap(qw.len());
     let mut dropmin: Vec<u32> = vec![u32::MAX; n_src];
     crate::perf_on(true);
     let t = std::time::Instant::now();
@@ -802,8 +821,8 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     let dt = t.elapsed().as_secs_f64();
     crate::perf_on(false);
     std::hint::black_box((&frontier, &dropmin));
-    eprintln!("[{mode}] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {nw} ({}), {:.1} ns per query; structure {:.2} GB",
-        if nw == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qw.len() as f64, mem / 1e9);
+    eprintln!("[{mode}] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {nw} ({}), {:.1} ns per query; structure {:.2} GB; {}; after: {}",
+        if nw == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qw.len() as f64, mem / 1e9, crate::hp_at(&tab), crate::hp());
     if std::env::var_os("BENCH_NOCHECK").is_some() { return; }
     check(mode, &pd, &edges, n_door, &|m| old_ids.contains(&m), false);
 }
@@ -824,7 +843,7 @@ pub fn run_intern(dir: &str, n_door: usize) {
     for &c in pcnt { let cap = (2 * c.max(1)).next_power_of_two(); off.push((total as u32, (cap - 1) as u32)); total += cap; }
     assert!(total * 128 < 1 << 32);
     #[repr(C)] #[derive(Clone, Copy)] struct E { hk: u32, set: u32 }
-    let mut tab: Vec<E> = vec![E { hk: 0, set: 0 }; total as usize];
+    let mut tab: Vec<E> = crate::huge_vec(total as usize, E { hk: 0, set: 0 });
     let mut masks: Vec<u128> = vec![0];
     let mut intern: FxHashMap<u128, u32> = FxHashMap::default();
     intern.insert(0, 0);
@@ -843,8 +862,8 @@ pub fn run_intern(dir: &str, n_door: usize) {
     let n_old_masks = masks.len();
     let mem = total as f64 * 8.0;
     eprintln!("[bitintern] setup {:.1} s: directory {total} slots x 8 B = {:.2} GB; {n_old_masks} distinct masks at the frame start ({:.1} MB)", t.elapsed().as_secs_f64(), mem / 1e9, n_old_masks as f64 * 16.0 / 1e6);
-    let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * crate::PAYLOAD);
-    let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qs.len());
+    let mut frontier: Vec<u8> = crate::huge_cap(7_000_000 * crate::PAYLOAD);
+    let mut edges: Vec<(u32, u32, u32)> = crate::huge_cap(qs.len());
     let mut dropmin: Vec<u32> = vec![u32::MAX; n_src];
     crate::perf_on(true);
     let t = std::time::Instant::now();
@@ -867,15 +886,8 @@ pub fn run_intern(dir: &str, n_door: usize) {
     let dt = t.elapsed().as_secs_f64();
     crate::perf_on(false);
     std::hint::black_box((&frontier, &dropmin));
-    eprintln!("[bitintern] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {nw} ({}), {:.1} ns per query; directory {:.2} GB + masks {} ({:.1} MB) at the frame end",
-        if nw == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qs.len() as f64, mem / 1e9, masks.len(), masks.len() as f64 * 16.0 / 1e6);
+    eprintln!("[bitintern] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {nw} ({}), {:.1} ns per query; directory {:.2} GB + masks {} ({:.1} MB) at the frame end; {}; after: {}",
+        if nw == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qs.len() as f64, mem / 1e9, masks.len(), masks.len() as f64 * 16.0 / 1e6, crate::hp_at(&tab), crate::hp());
     if std::env::var_os("BENCH_NOCHECK").is_some() { return; }
     check("bitintern", &pd, &edges, n_door, &|m| old_ids.contains(&m), false);
-}
-
-/// MADV_HUGEPAGE over a fresh (untouched) table.
-pub fn huge<T>(v: &mut [T]) {
-    let (p, n) = (v.as_mut_ptr() as usize, std::mem::size_of_val(v));
-    let a = (p + 4095) & !4095;
-    if n > 8192 { unsafe { libc::madvise(a as *mut libc::c_void, (p + n - a) & !4095, libc::MADV_HUGEPAGE); } }
 }

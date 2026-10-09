@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 mod bits;
+mod mlp;
 mod structure;
 mod posregion;
 
@@ -40,6 +41,48 @@ pub fn perf_on(on: bool) {
         f.write_all(if on { b"enable\n" } else { b"disable\n" }).unwrap();
         f.flush().unwrap();
     }
+}
+
+extern "C" { fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; }
+/// madvise(MADV_HUGEPAGE) the 2 MB-aligned interior of a vector's capacity.
+/// THP here is `enabled=always, defrag=madvise`: without the advice a fault
+/// takes a huge page only if one is free, so under memory pressure the timed
+/// tables came out mostly on 4 KB pages (bitcell 2.1 -> 2.8 s, dTLB misses
+/// 14x). Call before the pages are first touched.
+pub fn advise_huge<T>(v: &Vec<T>) {
+    const H: usize = 2 << 20;
+    let a = v.as_ptr() as usize;
+    let (start, end) = ((a + H - 1) & !(H - 1), (a + v.capacity() * std::mem::size_of::<T>()) & !(H - 1));
+    if end > start { unsafe { madvise(start as *mut u8, end - start, 14); } }
+}
+/// An empty vector of capacity `n`, advised onto huge pages.
+pub fn huge_cap<T>(n: usize) -> Vec<T> { let v = Vec::with_capacity(n); advise_huge(&v); v }
+/// `vec![x; n]`, advised onto huge pages before it is filled.
+pub fn huge_vec<T: Clone>(n: usize, x: T) -> Vec<T> { let mut v = huge_cap(n); v.resize(n, x); v }
+/// AnonHugePages / Anonymous of this process (/proc/self/smaps_rollup), GB.
+pub fn hp() -> String {
+    let r = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+    let kb = |k: &str| r.lines().find_map(|l| l.strip_prefix(k)).and_then(|l| l.split_whitespace().next()).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    format!("AnonHugePages {:.2} of Anonymous {:.2} GB", kb("AnonHugePages:") / 1e6, kb("Anonymous:") / 1e6)
+}
+
+/// AnonHugePages / Rss of the mappings under `v` (/proc/self/smaps), GB: did
+/// THIS table get huge pages.
+pub fn hp_at<T>(v: &[T]) -> String {
+    let (a, b) = (v.as_ptr() as usize, v.as_ptr() as usize + std::mem::size_of_val(v));
+    let r = std::fs::read_to_string("/proc/self/smaps").unwrap_or_default();
+    let (mut inside, mut rss, mut huge) = (false, 0f64, 0f64);
+    for l in r.lines() {
+        let f = l.split_whitespace().next().unwrap_or("");
+        if let Some((x, y)) = f.split_once('-').filter(|(x, _)| x.chars().all(|c| c.is_ascii_hexdigit())) {
+            let (x, y) = (usize::from_str_radix(x, 16).unwrap_or(0), usize::from_str_radix(y, 16).unwrap_or(0));
+            inside = x < b && y > a;
+        } else if inside {
+            let kb = || l.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+            if l.starts_with("Rss:") { rss += kb(); } else if l.starts_with("AnonHugePages:") { huge += kb(); }
+        }
+    }
+    format!("table on huge pages {:.2} of {:.2} GB", huge / 1e6, rss / 1e6)
 }
 
 fn main() {
@@ -87,6 +130,7 @@ fn main() {
         "bitsr" => bits::run_bits(dir, door.len() / 40, true),
         "bitintern" => bits::run_intern(dir, door.len() / 40),
         "bitcell" | "bitspd" | "bitspd2" | "posmask4" | "posmask8" => bits::run_words(dir, door.len() / 40, variant),
+        "mlp" => mlp::main(dir, &door, &args[3], &args[4]),
         other => panic!("unknown variant {other}"),
     }
 }
@@ -558,15 +602,15 @@ fn vq(dir: &str, door: &[u8], dense: bool) {
     let mut total = 0u64;
     for &c in cnt { let cap = ((c.max(1) as f64 / load).ceil() as u64).next_power_of_two(); off.push((total, cap - 1)); total += cap; }
     let tag = if dense { "v4" } else { "v3c" };
-    let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * PAYLOAD);
-    let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qs.len());
+    let mut frontier: Vec<u8> = huge_cap(7_000_000 * PAYLOAD);
+    let mut edges: Vec<(u32, u32, u32)> = huge_cap(qs.len());
     let mut dropmin: Vec<u32> = vec![u32::MAX; n_src];
     let key_of = |i: usize| (u64::from_le_bytes(door[i * 40 + 16..i * 40 + 24].try_into().unwrap()) as u128) | ((u64::from_le_bytes(door[i * 40 + 24..i * 40 + 32].try_into().unwrap()) as u128) << 64);
-    let (dt, t_drops, new);
+    let (dt, t_drops, new, hp_tab);
     if dense {
         // slot: (fingerprint u64, id u32) packed into 12 B; fingerprint 0 = empty.
         #[repr(C, packed)] #[derive(Clone, Copy)] struct S { fp: u64, id: u32 }
-        let mut tab: Vec<S> = vec![S { fp: 0, id: 0 }; total as usize];
+        let mut tab: Vec<S> = huge_vec(total as usize, S { fp: 0, id: 0 });
         let fp_of = |k: u128| { let f = (k >> 64) as u64; if f == 0 { 1 } else { f } };
         let pi = |tab: &mut [S], (base, mask): (u64, u64), k: u128, id: u32| -> (u32, bool) {
             let f = fp_of(k); let mut i = (k as u64) & mask;
@@ -581,8 +625,9 @@ fn vq(dir: &str, door: &[u8], dense: bool) {
         let mut next = n_door as u32; let mut nw = 0u64;
         for qq in qs { let (id, ins) = pi(&mut tab, off[qq.shard as usize], qq.key, next); if ins { next += 1; nw += 1; frontier.extend_from_slice(&[0u8; PAYLOAD]); } edges.push((qq.src, id, qq.xfer)); }
         dt = t.elapsed().as_secs_f64(); new = nw; perf_on(false);
+        hp_tab = hp_at(&tab);
     } else {
-        let mut keys: Vec<u128> = vec![0; total as usize]; let mut ids: Vec<u32> = vec![0; total as usize];
+        let mut keys: Vec<u128> = huge_vec(total as usize, 0); let mut ids: Vec<u32> = huge_vec(total as usize, 0);
         let pi = |keys: &mut [u128], ids: &mut [u32], (base, mask): (u64, u64), k: u128, id: u32| -> (u32, bool) {
             let mut i = (k as u64) & mask;
             loop { let s = (base + i) as usize; let kk = keys[s]; if kk == k { return (ids[s], false); } if kk == 0 { keys[s] = k; ids[s] = id; return (id, true); } i = (i + 1) & mask; }
@@ -596,10 +641,11 @@ fn vq(dir: &str, door: &[u8], dense: bool) {
         let mut next = n_door as u32; let mut nw = 0u64;
         for qq in qs { let (id, ins) = pi(&mut keys, &mut ids, off[qq.shard as usize], qq.key, next); if ins { next += 1; nw += 1; frontier.extend_from_slice(&[0u8; PAYLOAD]); } edges.push((qq.src, id, qq.xfer)); }
         dt = t.elapsed().as_secs_f64(); new = nw; perf_on(false);
+        hp_tab = format!("{} + {}", hp_at(&keys), hp_at(&ids));
     }
     std::hint::black_box((&frontier, &edges, &dropmin));
-    eprintln!("[{tag}] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {new} ({}), {:.1} ns per query",
-        if new == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qs.len() as f64);
+    eprintln!("[{tag}] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {new} ({}), {:.1} ns per query; {}; after: {}",
+        if new == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qs.len() as f64, hp_tab, hp());
     // UNTIMED: the per-lookup decision fingerprint (as bits::run_bits prints it).
     let mut seen = vec![false; n_door + new as usize];
     let mut fp = 0u64;

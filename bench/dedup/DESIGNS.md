@@ -344,3 +344,94 @@ the drops loop alone varied 0.30-0.63 s): posmask4 1.89 s, posmask8 2.19 s
 (and 3.16 / 4.59 s under heavier contention), bits 4.64 s in the same
 contended window (2.27 quiet). AnonHugePages at the timed loop 4-8.7 GB of
 21 GB RSS (most RSS is the untimed precompute; the table is 70-190 MB).
+
+## MLP: many misses in flight per thread (`mlp`, 2026-10-09)
+
+`dedup-bench DIR mlp TABLE MODES` (src/mlp.rs) drives the existing tables
+with latency-hiding loops, every one with EXACTLY the sequential order's
+decisions and ids:
+
+- `seq`: the plain loop (must time as the baseline);
+- `gG` group prefetching (Chen et al. 2004): for G lookups compute the home
+  line(s) and prefetch, then run the ordinary sequential probe on each;
+- `pD` rolling prefetch at distance D: prefetch lookup i + D's home, probe i;
+- `aK` AMAC (Kocberber et al. 2015): a ring of K lookups, each a state
+  machine (prefetched -> scanned read-only -> resolved), COMMITTED IN QUERY
+  ORDER.
+
+Tables: `v4`, `bitcell`, `posmask4`, `posmask8`, `bitintern` (the baselines'
+layouts), and `v4b`, `bitcellb`, `posmask4b`, `posmask8b`: the same keys in
+64-B buckets of 5 entries (5 x 8-B fingerprint + 5 x 4-B id, or 5 x 4-B key +
+5 x 8-B mask word), one AVX-512 masked compare a bucket. The keys are their
+own tags, so there are no Swiss-table control bytes, which would cost a second line.
+
+Exactness. A scan is read-only and may run before earlier lookups commit. Slots
+are never deleted or moved, and a key, once written, never changes, so a
+scan's Hit(s) stays valid. Its Empty(s) is re-checked at commit: s still empty
+-> insert (the sequential probe stops there too); s now holds OUR key -> hit
+(an in-flight duplicate: two lookups of one new state, the second sees the
+first's insert); s holds another key -> continue the sequential probe after
+s. Mutable payload (the id, the mask word, the interned mask) is touched only
+at commit, in order. Chains longer than the prefetched lines: the scan stops
+at the first slot outside them; AMAC re-prefetches and requeues it (or, for
+the ring's head, which blocks every commit, finishes it with demand misses);
+group/rolling prefetch take the demand miss in the sequential probe. Counted:
+`re-prefetches` 13% of lookups for v4 (12-B slots at load 0.8), 4-7% for the
+linear bitcell/posmask/bitintern tables, 0.4-0.6% for the buckets.
+
+Validated, every table x mode (9 x 10: seq g8 g16 g32 p8 p16 p32 a8 a16 a32):
+6,735,699 new, decision fingerprint 51e2f3ecb444e25d, 0 id-bijection /
+decision violations against v3c's ids (bits::check); v4 and v4b ids
+IDENTICAL to v3c's (0 of 257,724,013 differ).
+
+The timed tables (and the edges/frontier buffers) are now
+madvise(MADV_HUGEPAGE)d BEFORE first touch in every baseline too (THP is
+`enabled=always, defrag=madvise`: without the advice a fault only takes a
+free huge page, which explains H2 -> I's bitcell 2.1 -> 2.8 s); each TIMED line reports
+the table's mappings' AnonHugePages and the process's.
+
+### The envelope
+
+    t_lookup ~ max(compute, sum over levels of misses/lookup x latency / in-flight)
+
+Per lookup (quiet counters of H/H2; DRAM ~100 ns, L3 ~12 ns):
+
+| table | DRAM fills/lk | L3 hits/lk | at 1 in flight | measured (quiet) | implied in flight | at 8 in flight | compute floor (insn/lk / IPC ~3, 4.5 GHz) |
+|---|---|---|---|---|---|---|---|
+| v4 | 0.165 | 0.14 | 18 ns | 10.4 ns | ~1.7 | 2.3 ns | ~80 / 3 -> ~6 ns |
+| bitcell | 0.099 | 0.08 | 11 ns | 7.0 ns | ~1.6 | 1.4 ns | ~80 / 3 -> ~6 ns |
+| posmask8 (70 MB table) | (stream only) | ~0.1-0.2 | 1-2 ns | ~4.3 ns (smoke) | - | <0.3 ns | ~70 / 3 -> ~5 ns |
+
+The out-of-order core already keeps ~1.6-1.7 misses in flight (lookups are
+independent), and the x-major sweep keeps 84-90% of lookups in cache. So
+MLP can cut v4 by at most ~1.7x and bitcell by ~1.2x, down to the compute
+floor. The prefetch pass costs instructions (home computed twice: v4b 63 ->
+114-128 insn/lk with g32/p16; AMAC ~190), and on posmask8's L3-resident table
+there is nothing left to hide: prefetching there can only lose.
+
+### Smoke timings (NOISY: load 2-6, shared machine, cpu 6; not results)
+
+Single runs (validation runs, checks excluded; `smoke-bench` with perf):
+v4: seq 2.85, g8/16/32 3.06/2.87/2.65, p8/16/32 3.39/3.33/2.83, a8/16/32
+5.03-6.59/4.82-5.55/3.77-4.62 s. v4b: seq 2.22, g32 1.86, p16 1.99, a16 2.78
+s. bitcell: g32 2.24, p16 2.28, a16 3.22 (its seq outlier 5.14). bitcellb: seq
+1.70, g32 1.67, p32 1.68, a16 2.44. posmask8: seq 1.34, g32 1.71, p16 1.69,
+a16 2.71; posmask8b seq 1.37. posmask4 seq 1.71, posmask4b p32 1.67.
+bitintern: seq 2.67, g32 2.41, p32 2.33, a16 3.35. Counters (one smoke run
+each, per lookup): v4 2.3 branch misses and 176 insn (a 7.1 s outlier run),
+v4b seq 0.2 and 63. In this noise, the bucket layout (c) is the visible win
+(fewer mispredicted probe loops); group/rolling prefetch are worth 0-15%;
+AMAC is slower everywhere (its per-step bookkeeping ~2-3x the instructions,
+nothing out of order to exploit under in-order commit).
+
+### Run it (quiet machine)
+
+`/var/tmp/emitcap/mlp/bench.sh [CPU]` (copy: bench/dedup/mlp-bench.sh):
+baselines v3c v4 bitcell bitintern posmask4 posmask8 and every table x mode,
+interleaved x3, `taskset` to one cpu (default 4), `perf stat -D -1 --control
+fifo` over the timed loop only (cycles, instructions, branch misses, L1D /
+dTLB / L2 misses, L3 and DRAM fills), `uptime` per run, then a summary table
+(min/median/max, ns and counters per lookup, IPC, the table's huge pages);
+`bench.sh --summary LOG` reprints it. ~1 h for the full matrix (TABLES, MODES,
+BASE, REPS override); the bitcell/posmask precompute is cached under
+/var/tmp/emitcap/mlp/cache, keyed on its inputs' size and mtime.
