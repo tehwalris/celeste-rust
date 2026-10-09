@@ -138,3 +138,34 @@ order): **16.2-17.1 s** + end_frame 0.69 s. Of that: emit 12.9, flush 4.2
 (admit 1.74, edges 1.70, sort 0.55). Reading and parsing the capture alone
 (`vread`) takes 0.58 s at 16 threads and 1.45 s at 1 thread, and that is
 inside emit.
+
+## H. Bit-packed state + bitset (`census`, `splits`, `prepbits`, `bits`, `bitsr`, `packtime`; 2026-10-09)
+
+The 2022 hard-coded version (`67e341d`): a dense `PosMap` by position, the
+player's flags mixed-radix (`CompressedPlayerFlags`, 18480 values) with the
+dash fields as ONE joint digit (`VALID_DASH_COMBOS`), a bitset over the flags.
+Applied here to the capture's abstract states via `rewrite field-dump`
+(every row of the tree `/var/tmp/canon-h62-f56`, r0sxhf, level -1 94,5,
+f0-f57: its value cells' `av_code`s; every key recomputed from (shape,
+fields): 0 mismatches). Only 15 cells vary (shape 2, 95.5% of the rows); rem,
+p_jump/p_dash/jbuffer and every object are uniform at this level.
+
+Shape 2 budget: shard = (shape, cell) (10531 occupied of a 126 x 113 box);
+high = freeze 3 x djump 3 x grace 7 x flip 2 x spd.x 1351 x dash combo 89
+(7 fields: dash_time, dash_effect_time, target x/y, accel x/y, has_dashed;
+product 8910) = 15.15M (23.85 bits); low = spd.y 96 (6.58 bits). 30.44 bits
+a shard, 43.8 with the cell. A dense bitset: 1.5e13 bits (1.9 TB) for 43.8M
+states (density 3e-6) - infeasible by ~4 orders even per shard (182 MB a
+cell). What fits: a per-shard open-addressing DIRECTORY on the exact high
+digits (u32) holding a 128-bit bitset over spd.y (10.06M entries, 4.4 states
+each, fill 4.5%): 0.69 GB at load 0.5 (v3c 2.54, v4 0.94).
+
+Single thread, cpu 4, interleaved x3, load 1.5-2.1, counters over the timed
+loop: v3c 2.98-3.00 s, v4 2.98-3.01 s, `bits` 2.24-2.25 s (7.6 ns a lookup;
+id = slot << 7 | low), `bitsr` 2.94-2.95 s + 0.49 s frame-end pass (dense
+rank ids: old = rank in the frame-start set, new ranked at the end).
+DRAM fills 52.5M / 42.4M / 28.5M / 31.0M; L2 misses 102M / 79M / 46M / 57M.
+All: 6,735,699 new, decision fingerprint 51e2f3ecb444e25d, and an exhaustive
+per-lookup decision + id-bijection check against v3c's ids: 0 violations.
+Packing from raw fields (scalar, binary search for spd): 34.6 ns a row
+against 29.7 ns for the scalar 2 x 15 mix64 key.

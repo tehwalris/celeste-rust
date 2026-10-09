@@ -236,6 +236,22 @@ enum Command {
         #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
         level: Level,
     },
+    /// DIAGNOSTIC (bench/dedup's bitset packing): every stored row of frames
+    /// 0..=to as its FIELD VALUES. Pass 1, a census per (shape, value cell):
+    /// the distinct `av_code`s (what the row key hashes) -> OUT/census.txt.
+    /// Pass 2, OUT/rows.bin: per row `(key0, key1 u64, shape u32, cell u32,
+    /// frame u32, then K u32)`, K = the most varying cells of any shape: each
+    /// varying cell's index into its sorted dictionary (OUT/dicts.txt).
+    /// Every row's key is recomputed from (shape, codes) and must equal the
+    /// stored one: the fields are exactly what the key distinguishes.
+    FieldDump {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        to: u32,
+        #[arg(long)]
+        out: String,
+    },
     /// DIAGNOSTIC: how coarse a level could be. Per frame, the distinct
     /// states of a tree with the named cells (`inspect::cell_names`) whose
     /// names start with any `--erase` prefix left out (comma-separated, e.g.
@@ -511,6 +527,125 @@ fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String]) -> Result<
         }
     }
     Ok((rows, states))
+}
+
+/// `field-dump`: see the subcommand.
+fn field_dump(dir: &std::path::Path, to: u32, out: &std::path::Path) -> Result<()> {
+    use celeste_engine::runtime2::{av_code, cell_mix, mix64, Cell2, KEY_SEED1, KEY_SEED2};
+    use std::io::Write;
+    let ids = celeste_rust::compiled::ids();
+    std::fs::create_dir_all(out)?;
+    // Per shape: its Val cells, their names, per cell code -> (count, a value).
+    struct Sh { hash: u64, cells: Vec<usize>, names: Vec<String>, dict: Vec<rustc_hash::FxHashMap<u64, (u64, celeste_engine::runtime2::AV)>>, rows: u64 }
+    let mut shapes: Vec<Sh> = Vec::new();
+    let mut shape_ix: rustc_hash::FxHashMap<u64, usize> = Default::default();
+    let each = |f: &mut dyn FnMut(u32, &Rt2, u64) -> Result<()>| -> Result<()> {
+        for frame in 0..=to {
+            for (_, path) in frame_paths(dir, frame)? {
+                let ff = celeste_rust::search::checkpoint::FrameFile::open(&path)?;
+                let width = ff.width();
+                for lo in (0..width).step_by(1 << 20) {
+                    let Some(rt2) = ff.load_rows(&[lo..(lo + (1 << 20)).min(width)])? else { break };
+                    f(frame, &rt2, ff.shape_hash())?;
+                }
+            }
+        }
+        Ok(())
+    };
+    let t = std::time::Instant::now();
+    let mut nrows = 0u64;
+    each(&mut |_frame, rt2, sh| {
+        let i = *shape_ix.entry(sh).or_insert_with(|| {
+            let cells: Vec<usize> = (0..rt2.structure.len()).filter(|&c| matches!(rt2.structure[c], Cell2::Val)).collect();
+            let nm = cell_names(rt2, ids);
+            let names = cells.iter().map(|c| nm.get(c).cloned().unwrap_or_else(|| format!("cell{c}"))).collect();
+            shapes.push(Sh { hash: sh, dict: vec![Default::default(); cells.len()], cells, names, rows: 0 });
+            shapes.len() - 1
+        });
+        let s = &mut shapes[i];
+        anyhow::ensure!(s.cells.len() == (0..rt2.structure.len()).filter(|&c| matches!(rt2.structure[c], Cell2::Val)).count(), "shape {sh:#x}: cell layout differs");
+        s.rows += rt2.width as u64;
+        nrows += rt2.width as u64;
+        for (k, &c) in s.cells.iter().enumerate() {
+            for r in 0..rt2.width {
+                let v = rt2.cols[c].at(r);
+                s.dict[k].entry(av_code(v)).or_insert((0, v)).0 += 1;
+            }
+        }
+        Ok(())
+    })?;
+    eprintln!("[field-dump] pass 1: {nrows} rows, {} shapes, {:.1} s", shapes.len(), t.elapsed().as_secs_f64());
+    // Sorted dictionaries; the varying cells per shape.
+    let mut census = std::io::BufWriter::new(std::fs::File::create(out.join("census.txt"))?);
+    let mut dicts = std::io::BufWriter::new(std::fs::File::create(out.join("dicts.txt"))?);
+    let mut lookup: Vec<Vec<rustc_hash::FxHashMap<u64, u32>>> = Vec::new();
+    let mut varying: Vec<Vec<usize>> = Vec::new();
+    for (si, s) in shapes.iter().enumerate() {
+        writeln!(census, "shape {si} {:#018x}: {} rows, {} value cells", s.hash, s.rows, s.cells.len())?;
+        let mut lk = Vec::new();
+        let mut vary = Vec::new();
+        for (k, d) in s.dict.iter().enumerate() {
+            let mut codes: Vec<u64> = d.keys().copied().collect();
+            codes.sort_unstable();
+            let show = |c: &u64| format!("{}x{}", celeste_rust::search::inspect::av_show(d[c].1), d[c].0);
+            if codes.len() == 1 {
+                writeln!(census, "  uniform cell{} {}: {}", s.cells[k], s.names[k], show(&codes[0]))?;
+                lk.push(Default::default());
+                continue;
+            }
+            let list: Vec<String> = codes.iter().take(40).map(show).collect();
+            writeln!(census, "  VARY    cell{} {}: {} distinct: {}{}", s.cells[k], s.names[k], codes.len(), list.join(" "), if codes.len() > 40 { " ..." } else { "" })?;
+            writeln!(dicts, "{si} {k} {} {} {}", s.cells[k], s.names[k], codes.len())?;
+            for c in &codes {
+                writeln!(dicts, "  {c:#x} {} {}", celeste_rust::search::inspect::av_show(d[c].1), d[c].0)?;
+            }
+            vary.push(k);
+            lk.push(codes.iter().enumerate().map(|(i, c)| (*c, i as u32)).collect());
+        }
+        lookup.push(lk);
+        varying.push(vary);
+    }
+    census.flush()?;
+    dicts.flush()?;
+    let kmax = varying.iter().map(|v| v.len()).max().unwrap_or(0);
+    eprintln!("[field-dump] {kmax} varying cells at most; writing rows");
+    // Pass 2: rows, every key recomputed.
+    let mut w = std::io::BufWriter::with_capacity(16 << 20, std::fs::File::create(out.join("rows.bin"))?);
+    let mut bad = 0u64;
+    each(&mut |frame, rt2, sh| {
+        let si = shape_ix[&sh];
+        let s = &shapes[si];
+        let cells = celeste_rust::search::pos_graph::block_cells(rt2)?;
+        for r in 0..rt2.width {
+            let (mut h1, mut h2) = (sh, 0xa076_1d64_78bd_642f ^ sh);
+            for &c in &s.cells {
+                let v = rt2.cols[c].at(r);
+                h1 = h1.wrapping_add(cell_mix(c as u64, v, KEY_SEED1));
+                h2 = h2.wrapping_add(cell_mix(c as u64, v, KEY_SEED2));
+            }
+            let key = (mix64(h1), mix64(h2));
+            if key != rt2.row_keys[r] {
+                bad += 1;
+            }
+            let mut b = Vec::with_capacity(28 + 4 * kmax);
+            b.extend_from_slice(&rt2.row_keys[r].0.to_le_bytes());
+            b.extend_from_slice(&rt2.row_keys[r].1.to_le_bytes());
+            b.extend_from_slice(&(si as u32).to_le_bytes());
+            b.extend_from_slice(&cells[r].to_le_bytes());
+            b.extend_from_slice(&frame.to_le_bytes());
+            for j in 0..kmax {
+                let ix = varying[si].get(j).map_or(0, |&k| lookup[si][k][&av_code(rt2.cols[s.cells[k]].at(r))]);
+                b.extend_from_slice(&ix.to_le_bytes());
+            }
+            w.write_all(&b)?;
+        }
+        Ok(())
+    })?;
+    w.flush()?;
+    std::fs::write(out.join("layout.txt"), format!("kmax {kmax}\nrecord {}\nrows {nrows}\n", 28 + 4 * kmax))?;
+    eprintln!("[field-dump] pass 2: {nrows} rows, {bad} keys NOT reproduced from (shape, fields); {:.1} s", t.elapsed().as_secs_f64());
+    anyhow::ensure!(bad == 0, "{bad} rows' keys are not a function of their fields");
+    Ok(())
 }
 
 /// A comma-separated list of name prefixes (`--erase`).
@@ -1192,6 +1327,7 @@ fn main() -> Result<()> {
             );
             anyhow::ensure!(missing_total == 0 && inside_bad == 0 && outside_bad == 0, "arc-check: disagreement");
         }
+        Command::FieldDump { level_dir, to, out } => field_dump(std::path::Path::new(&level_dir), to, std::path::Path::new(&out))?,
         Command::CoarseCensus { level_dir, from, to, erase } => {
             let erase = prefixes(&erase);
             let mut through: rustc_hash::FxHashSet<u64> = Default::default();

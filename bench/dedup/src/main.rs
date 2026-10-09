@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
+mod bits;
+
 const REC: usize = 48;
 const PAYLOAD: usize = 64;
 
@@ -22,10 +24,28 @@ fn rec(b: &[u8]) -> Rec {
     Rec { src: u64_(0), key: (u64_(8) as u128) | ((u64_(16) as u128) << 64), shape: u64_(24), cell: u32_(32), xfer: u32_(36), flags: u32_(40) }
 }
 
+extern "C" { fn prctl(option: i32, ...) -> i32; }
+/// Counters of a `perf stat` on this process count only between `perf_on(true)`
+/// and `perf_on(false)` (PR_TASK_PERF_EVENTS_ENABLE / _DISABLE): the timed loop.
+/// With `PERF_CTL=FIFO` (perf stat -D -1 --control fifo:FIFO), the counters
+/// are switched by perf itself.
+pub fn perf_on(on: bool) {
+    unsafe { prctl(if on { 32 } else { 31 }, 0, 0, 0, 0); }
+    if let Some(p) = std::env::var_os("PERF_CTL") {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.write_all(if on { b"enable\n" } else { b"disable\n" }).unwrap();
+        f.flush().unwrap();
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = &args[1];
     let variant = args.get(2).map(|s| s.as_str()).unwrap_or("v0");
+    if variant == "census" { return bits::census(dir); }
+    if variant == "splits" { return bits::splits(dir); }
+    if variant == "packtime" { return bits::pack_time(dir); }
     let t0 = Instant::now();
     // Inputs, mapped.
     let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with('w')).collect();
@@ -55,6 +75,9 @@ fn main() {
         "prep" => prep(dir, &maps, &door, &srcf),
         "v3c" => vq(dir, &door, false),
         "v4" => vq(dir, &door, true),
+        "prepbits" => bits::prep_bits(dir, &door),
+        "bits" => bits::run_bits(dir, door.len() / 40, false),
+        "bitsr" => bits::run_bits(dir, door.len() / 40, true),
         other => panic!("unknown variant {other}"),
     }
 }
@@ -542,12 +565,13 @@ fn vq(dir: &str, door: &[u8], dense: bool) {
         };
         for i in 0..n_door { pi(&mut tab, off[dsh[i] as usize], key_of(i), i as u32); }
         eprintln!("[{tag}] setup {:.1} s: arena {} slots ({:.2} GB)", t.elapsed().as_secs_f64(), total, total as f64 * 12.0 / 1e9);
+        perf_on(true);
         let t = Instant::now();
         for &d in ds { let m = &mut dropmin[d as usize]; *m = (*m).min(1); }
         t_drops = t.elapsed().as_secs_f64();
         let mut next = n_door as u32; let mut nw = 0u64;
         for qq in qs { let (id, ins) = pi(&mut tab, off[qq.shard as usize], qq.key, next); if ins { next += 1; nw += 1; frontier.extend_from_slice(&[0u8; PAYLOAD]); } edges.push((qq.src, id, qq.xfer)); }
-        dt = t.elapsed().as_secs_f64(); new = nw;
+        dt = t.elapsed().as_secs_f64(); new = nw; perf_on(false);
     } else {
         let mut keys: Vec<u128> = vec![0; total as usize]; let mut ids: Vec<u32> = vec![0; total as usize];
         let pi = |keys: &mut [u128], ids: &mut [u32], (base, mask): (u64, u64), k: u128, id: u32| -> (u32, bool) {
@@ -556,14 +580,20 @@ fn vq(dir: &str, door: &[u8], dense: bool) {
         };
         for i in 0..n_door { pi(&mut keys, &mut ids, off[dsh[i] as usize], key_of(i), i as u32); }
         eprintln!("[{tag}] setup {:.1} s: arena {} slots ({:.2} GB)", t.elapsed().as_secs_f64(), total, total as f64 * 20.0 / 1e9);
+        perf_on(true);
         let t = Instant::now();
         for &d in ds { let m = &mut dropmin[d as usize]; *m = (*m).min(1); }
         t_drops = t.elapsed().as_secs_f64();
         let mut next = n_door as u32; let mut nw = 0u64;
         for qq in qs { let (id, ins) = pi(&mut keys, &mut ids, off[qq.shard as usize], qq.key, next); if ins { next += 1; nw += 1; frontier.extend_from_slice(&[0u8; PAYLOAD]); } edges.push((qq.src, id, qq.xfer)); }
-        dt = t.elapsed().as_secs_f64(); new = nw;
+        dt = t.elapsed().as_secs_f64(); new = nw; perf_on(false);
     }
     std::hint::black_box((&frontier, &edges, &dropmin));
     eprintln!("[{tag}] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {new} ({}), {:.1} ns per query",
         if new == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qs.len() as f64);
+    // UNTIMED: the per-lookup decision fingerprint (as bits::run_bits prints it).
+    let mut seen = vec![false; n_door + new as usize];
+    let mut fp = 0u64;
+    for e in &edges { let is_new = e.1 as usize >= n_door && !seen[e.1 as usize]; seen[e.1 as usize] = true; fp = fp.wrapping_mul(0x100_0000_01b3) ^ (is_new as u64); }
+    eprintln!("[{tag}] decision fingerprint {fp:016x}");
 }
