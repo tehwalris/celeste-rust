@@ -11,6 +11,7 @@ use celeste_engine::runtime2;
 use celeste_names as gen;
 
 pub(crate) mod asm_kernel;
+mod smt;
 pub mod dispatch;
 
 pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {

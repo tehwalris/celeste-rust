@@ -320,6 +320,8 @@ fn thread_stack() -> usize {
 struct AsmKernel {
     /// DIAGNOSTIC: per body (lanes taken, lanes emitted after the dup mask).
     body_stats: Vec<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
+    /// DIAGNOSTIC: per input slot (min, max, bool flags: 1 true, 2 false, 4 unknown) over packed lanes.
+    cell_seen: std::sync::Mutex<Vec<(i32, i32, u8, u32)>>,
     loaded: Loaded,
     compiled: Compiled,
     bodies: Vec<AsmBody>,
@@ -412,6 +414,25 @@ impl AsmKernel {
             };
             let t_ph = crate::frame::phases::add(crate::frame::phases::SETUP, t_setup);
             self.pack_input(&views, lanes, inbuf);
+            if std::env::var_os("CELESTE_BODY_STATS").is_some() {
+                let mut seen = self.cell_seen.lock().unwrap();
+                let rd = |o: usize| i32::from_le_bytes(inbuf[o..o + 4].try_into().unwrap());
+                let rm = |o: usize| u16::from_le_bytes(inbuf[o..o + 2].try_into().unwrap());
+                for (k, (&off, rp)) in self.compiled.input_offsets.iter().zip(&self.compiled.input_reprs).enumerate() {
+                    let off = off as usize;
+                    for l in 0..n {
+                        let e = &mut seen[k];
+                        match rp {
+                            crate::transpile::asm::CellRepr::Num => { let v = rd(off + 4 * l); e.0 = e.0.min(v); e.1 = e.1.max(v); e.3 |= v as u32 & 0xffff; }
+                            crate::transpile::asm::CellRepr::Ival => { e.0 = e.0.min(rd(off + 4 * l)); e.1 = e.1.max(rd(off + 64 + 4 * l)); e.3 |= (rd(off + 4 * l) | rd(off + 64 + 4 * l)) as u32 & 0xffff; }
+                            crate::transpile::asm::CellRepr::Bool => { e.2 |= if rm(off) >> l & 1 == 1 { 1 } else { 2 }; }
+                            crate::transpile::asm::CellRepr::UBool => {
+                                if rm(off + 2) >> l & 1 == 0 { e.2 |= 4 } else { e.2 |= if rm(off) >> l & 1 == 1 { 1 } else { 2 }; }
+                            }
+                        }
+                    }
+                }
+            }
             let t_ph = crate::frame::phases::add(crate::frame::phases::PACK, t_ph);
             // The spill frame is on THIS thread's stack: refuse rather than overrun.
             let (frame, stack) = (self.compiled.frame_bytes as usize, thread_stack());
@@ -1485,6 +1506,9 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
         b.pos = pos_sources(&acc_templates[b.outcome].build(), &b.fields)?;
     }
     dup_refs(&mut asm_bodies);
+    if let Ok(dir) = std::env::var("CELESTE_SMT_DUMP") {
+        smt_dump(&dir, &fused, &bodies, &asm_bodies, &reprs, &compiled.sym, r)?;
+    }
     if let Ok(th) = std::env::var("CELESTE_GRAPH_REPORT") {
         static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let th: usize = th.parse().unwrap_or(300);
@@ -1623,6 +1647,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
         })
         .collect();
     let asm_bodies_len = asm_bodies.len();
+    let n_inputs = compiled.input_cells.len();
     Ok((
         shape,
         AsmKernel {
@@ -1638,6 +1663,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
             room,
             input_names,
             body_stats: (0..asm_bodies_len).map(|_| Default::default()).collect(),
+            cell_seen: std::sync::Mutex::new(vec![(i32::MAX, i32::MIN, 0, 0); n_inputs]),
         },
     ))
 }
@@ -2195,7 +2221,175 @@ pub(crate) fn print_body_stats() {
             }
         }
         std::fs::write(&path, out).expect("write body stats");
+        let mut seen = String::new();
+        for k in reg.kernels.values() {
+            for (i, (lo, hi, fl, fr)) in k.cell_seen.lock().unwrap().iter().enumerate() {
+                seen.push_str(&format!("{}\t{}\t{lo}\t{hi}\t{fl}\t{fr}\n", k.compiled.sym, k.compiled.input_cells[i]));
+            }
+        }
+        std::fs::write(format!("{path}.seen"), seen).expect("write seen ranges");
     }
     worst.sort_by_key(|w| std::cmp::Reverse(w.0));
     for (_, w) in worst.iter().take(6) { eprintln!("[bodies]   {w}"); }
+}
+
+
+/// DIAGNOSTIC (CELESTE_SMT_DUMP=DIR, CELESTE_SMT_TSV=FILE): `compiled::smt`.
+fn smt_dump(
+    dir: &str,
+    fused: &crate::transpile::graph::Graph,
+    bodies: &[crate::trace::emit::AsmBody],
+    asm_bodies: &[AsmBody],
+    reprs: &HashMap<u32, crate::transpile::asm::CellRepr>,
+    sym: &str,
+    r: &crate::trace::kernel::Reference,
+) -> Result<()> {
+    use std::fmt::Write as _;
+    let tsv = std::env::var("CELESTE_SMT_TSV").map_err(|_| anyhow::anyhow!("CELESTE_SMT_DUMP needs CELESTE_SMT_TSV"))?;
+    // (body, splits, taken, emitted) of this kernel's rows.
+    let mut region: Option<String> = None;
+    let rows: Vec<(usize, String, u64, u64)> = std::fs::read_to_string(&tsv)?
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            if c[0] == sym {
+                region = Some(c[2].to_string());
+            }
+            (c[0] == sym).then(|| (c[3].parse().unwrap(), c[5].to_string(), c[6].parse().unwrap(), c[7].parse().unwrap()))
+        })
+        .collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    anyhow::ensure!(rows.len() == bodies.len(), "{sym}: {} TSV rows vs {} bodies", rows.len(), bodies.len());
+    for (b, s, _, _) in &rows {
+        anyhow::ensure!(format!("{:?}", bodies[*b].splits) == *s, "{sym} body {b}: splits {:?} vs TSV {s}", bodies[*b].splits);
+    }
+    let ordered = std::env::var_os("CELESTE_SMT_UNORDERED").is_none();
+    let mut enc = super::smt::Enc::new(fused, reprs, ordered);
+    // The region kernel's traced bounds (folded away by the range analysis,
+    // so the kernel ASSUMES them: x/y by dispatch, speed/rem by the game).
+    let mut ranges: HashMap<u32, (i32, i32)> = HashMap::new();
+    let mut ranges_xy: Option<(i32, i32)> = None;
+    if std::env::var_os("CELESTE_SMT_NO_BOUNDS").is_none() {
+        if let (Some(reg), Some(grid)) = (region.as_deref().and_then(|s| {
+            let n: Vec<i16> = s.split(|c: char| !c.is_ascii_digit() && c != '-').filter(|t| !t.is_empty()).map(|t| t.parse().unwrap()).collect();
+            (n.len() == 2).then(|| crate::trace::kernel::Region { ix: n[0], iy: n[1] })
+        }), crate::trace::kernel::region_grid())
+        {
+            let nm = crate::search::inspect::cell_names(&r.frame.in_rt2, crate::compiled::ids());
+            let px = nm.iter().find(|(_, n)| n.as_str() == "player.x").map(|(c, _)| *c as u32).ok_or_else(|| anyhow::anyhow!("{sym}: no player.x"))?;
+            let slot = r.frame.in_cells.iter().position(|x| *x == px).ok_or_else(|| anyhow::anyhow!("{sym}: player.x not an input"))?;
+            let mut pl = r.frame.iface.slots[slot].clone();
+            pl.pop();
+            ranges = crate::trace::kernel::engine_ranges(&r.frame, &grid.bounds(&pl, reg));
+            ranges_xy = Some((reg.ix as i32 * grid.px, reg.iy as i32 * grid.px));
+        }
+    }
+    enc.ranges = ranges.clone();
+    if let Ok(seen) = std::env::var("CELESTE_SMT_SEEN") {
+        for l in std::fs::read_to_string(seen)?.lines() {
+            let c: Vec<&str> = l.split('\t').collect();
+            if c[0] == sym {
+                enc.seen.insert(c[1].parse()?, (c[2].parse()?, c[3].parse()?, c[4].parse()?, c.get(5).map_or(Ok(u32::MAX), |x| x.parse())?));
+            }
+        }
+    }
+    let nf = |b: &crate::trace::emit::AsmBody| b.roots.len() - 2 - r.bound.outcomes[b.outcome].arc.len();
+    // The compared root pairs of (j, ref i), as `dup_refs` builds them.
+    let pairs = |i: usize, j: usize| -> Vec<(u32, u32)> {
+        let (a, b) = (&bodies[i], &bodies[j]);
+        let n = nf(a);
+        let mut v: Vec<(u32, u32)> = (0..n).map(|k| (a.roots[k], b.roots[k])).collect();
+        for k in 0..a.roots.len() - n - 2 {
+            if !asm_bodies[i].arc.fin && k % crate::trace::verify::ARC_AXIS_ROOTS == 4 {
+                continue;
+            }
+            v.push((a.roots[n + 2 + k], b.roots[n + 2 + k]));
+        }
+        v
+    };
+    let mut queries: Vec<(usize, String, Vec<String>)> = Vec::new();
+    let mut meta = String::new();
+    let mut took: std::collections::BTreeSet<usize> = Default::default();
+    for &(j, _, taken, emitted) in &rows {
+        if taken == 0 {
+            continue;
+        }
+        let refs: Vec<usize> = asm_bodies[j].dup_refs.iter().map(|d| d.body).collect();
+        for &i in refs.iter().chain(std::iter::once(&j)) {
+            if took.insert(i) {
+                let b = &bodies[i];
+                let n = nf(b);
+                let roots: Vec<u32> = b.roots.clone();
+                enc.cone(&roots);
+                let (err, live) = (b.roots[n], b.roots[n + 1]);
+                let t = format!("(and {} (not {}))", enc.may(live), enc.may(err));
+                let _ = writeln!(enc.defs, "(define-fun take{i} () Bool {t})");
+            }
+        }
+        let mut q = format!("(and take{j}");
+        let mut diag = vec![format!("take{j}")];
+        for &i in &refs {
+            let eqs: Vec<String> = pairs(i, j).iter().map(|&(x, y)| enc.eq(x, y)).filter(|e| e != "true").collect();
+            let _ = writeln!(enc.defs, "(define-fun eq{j}_{i} () Bool (and true {}))", eqs.join(" "));
+            let _ = write!(q, " (not (and take{i} eq{j}_{i}))");
+            diag.push(format!("take{i}"));
+            diag.push(format!("eq{j}_{i}"));
+        }
+        q.push(')');
+        queries.push((j, q, diag));
+        let _ = writeln!(meta, "{j}\t{taken}\t{emitted}\t{}\t{:?}", refs.len(), bodies[j].splits);
+    }
+    // Cell names for models.
+    let mut names = String::new();
+    for (c, rp) in &enc.cells {
+        let n = r.frame.in_cells.iter().position(|x| x == c).map(|i| crate::trace::iface::show(&r.frame.iface.slots[i])).unwrap_or(format!("cell {c}"));
+        let _ = writeln!(names, "{c}\t{rp:?}\t{n}");
+    }
+    let labels: Vec<String> = {
+        let mut nb = 0;
+        let ns = ["left", "right", "up", "down", "jump", "dash"];
+        r.frame.fork_origins.iter().map(|(_, o)| if o == crate::trace::domain::UNKNOWN_BOOL_ORIGIN { nb += 1; ns.get(nb - 1).unwrap_or(&"btn?").to_string() } else { o.replace(['\t', '\n'], " ") }).collect()
+    };
+    std::fs::create_dir_all(dir)?;
+    let base = format!("{dir}/{sym}");
+    // The map: every constant-box tile-flag function tabulated on the whole
+    // pixels around the region (the callout's own `flag_at`); elsewhere it
+    // stays uninterpreted.
+    let mut map_axioms = String::new();
+    if std::env::var_os("CELESTE_SMT_NO_MAP").is_none() {
+        if let Some((x0, y0)) = ranges_xy {
+            for uf in enc.ufs.iter().filter(|u| u.starts_with("tf_")) {
+                let p: Vec<u32> = uf[3..].split('_').map(|t| t.parse().unwrap()).collect();
+                let (w, h, f) = (p[0] as i32 >> 16, p[1] as i32 >> 16, p[2] as i32 >> 16);
+                for y in y0 - 24..y0 + 40 {
+                    for x in x0 - 24..x0 + 40 {
+                        let v = r.cache.flag_at(&r.cart, x as i16, y as i16, w as i16, h as i16, f as i16)?;
+                        let _ = writeln!(map_axioms, "(assert (= ({uf} #x{:08x} #x{:08x}) {v}))", (x << 16) as u32, (y << 16) as u32);
+                    }
+                }
+            }
+        }
+    }
+    let gv: Vec<String> = enc
+        .cells
+        .iter()
+        .flat_map(|(c, rp)| match rp {
+            crate::transpile::asm::CellRepr::Num => vec![format!("c{c}")],
+            crate::transpile::asm::CellRepr::Bool => vec![format!("c{c}v")],
+            crate::transpile::asm::CellRepr::UBool => vec![format!("c{c}v"), format!("c{c}k")],
+            crate::transpile::asm::CellRepr::Ival => vec![format!("c{c}l"), format!("c{c}h")],
+        })
+        .collect();
+    let mut qtext = String::new();
+    for (j, q, diag) in &queries {
+        let _ = writeln!(qtext, "(echo \"Q {j}\")\n(push 1)\n(assert {q})\n(check-sat)\n(get-value ({} {}))\n(pop 1)", diag.join(" "), gv.join(" "));
+    }
+    std::fs::write(format!("{base}.smt2"), format!("(set-logic QF_UFBV)\n{}{}{map_axioms}{}{qtext}", enc.decls, enc.bounds, enc.defs))?;
+    std::fs::write(format!("{base}.meta"), meta)?;
+    std::fs::write(format!("{base}.names"), names)?;
+    std::fs::write(format!("{base}.forks"), labels.join("\n") + "\n")?;
+    Ok(())
 }

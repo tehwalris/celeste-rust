@@ -154,7 +154,7 @@ impl RegionGrid {
     }
 
     /// The bounds a region's kernel is traced under, by path under `pl`.
-    fn bounds(&self, pl: &super::iface::Path, r: Region) -> Bounds {
+    pub(crate) fn bounds(&self, pl: &super::iface::Path, r: Region) -> Bounds {
         const ONE: i32 = 1 << 16;
         let field = |fs: &[&str]| -> super::iface::Path {
             let mut q = pl.clone();
@@ -349,7 +349,7 @@ impl NoPlayer {
 }
 
 /// A frame's bounds by ENGINE cell, for the lowering's decide and pruning.
-fn engine_ranges(
+pub(crate) fn engine_ranges(
     f: &super::verify::Frame,
     bounds: &[(super::iface::Path, (i32, i32))],
 ) -> std::collections::HashMap<u32, (i32, i32)> {
