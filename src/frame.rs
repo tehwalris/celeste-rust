@@ -87,8 +87,9 @@ pub struct Block {
     skip: Vec<bool>,
 }
 
-/// A state's stable id (layer = first frame reached, piece seq, row),
-/// assigned at admission and never renumbered.
+/// A state's stable id (layer = first frame reached, piece seq, row): its
+/// place in the layer's canonical order (`canon`), fixed at the end of the
+/// wave that reached it (during the wave, its flush id).
 pub fn pack_id(layer: u32, seq: u32, row: u32) -> u64 {
     ((layer as u64) << 48) | ((seq as u64) << 32) | row as u64
 }
@@ -860,8 +861,9 @@ pub struct ForwardSink<'a> {
     /// Time spent encoding and writing edge records (this worker).
     pub t_edges: std::time::Duration,
 
-    /// Next-frame pieces per shape: block, seq (`worker * 256 + k`), ids.
-    pieces: rustc_hash::FxHashMap<u64, (Rt2, u32, Vec<u64>)>,
+    /// Next-frame pieces per shape: block, seq (from the wave's counter),
+    /// each row's cell; renumbered at the wave's end (`canon`).
+    pieces: rustc_hash::FxHashMap<u64, (Rt2, u32, Vec<u32>)>,
     /// The new rows' layer and this worker's index (part of a new row's id).
     frame: u32,
     worker: u32,
@@ -1230,7 +1232,7 @@ impl<'a> ForwardSink<'a> {
             // The k-th new key gets `first_new + k`, appended in that order.
             let frame = self.frame;
             let seqs = self.seqs.expect("a flush without piece numbers");
-            let (piece, seq, ids) = self.pieces.entry(slot.shape).or_insert_with(|| {
+            let (piece, seq, piece_cells) = self.pieces.entry(slot.shape).or_insert_with(|| {
                 let seq = seqs.fetch_add(1, Ordering::Relaxed);
                 assert!(seq <= u16::MAX as u32, "frame {frame}: piece seq {seq} past the 16 bits an id holds");
                 (slot.empty_piece(), seq, Vec::new())
@@ -1292,8 +1294,8 @@ impl<'a> ForwardSink<'a> {
                 self.kept += self.rows_buf.len();
                 self.won |= slot.any_win(&self.rows_buf)?;
                 slot.gather_into(piece, &self.rows_buf);
-                ids.extend((0..self.rows_buf.len() as u32).map(|k| first_new + k as u64));
-                debug_assert_eq!(ids.len(), piece.width);
+                piece_cells.extend(std::iter::repeat_n(slot.cell, self.rows_buf.len()));
+                debug_assert_eq!(piece_cells.len(), piece.width);
             }
             let t_ph = phases::add(phases::GATHER, t_ph);
             slot.clear();
@@ -1309,8 +1311,9 @@ impl<'a> ForwardSink<'a> {
         Ok(())
     }
 
-    /// End of the worker's frame: flush everything, hand back the pieces.
-    pub fn finish(&mut self) -> Result<Vec<Block>> {
+    /// End of the worker's frame: flush everything, hand back the pieces
+    /// (in flush order: `canon::canonical_layer` orders the layer).
+    pub fn finish(&mut self) -> Result<Vec<crate::canon::Flushed>> {
         for q in 0..self.slots.len() {
             if self.slots[q].live {
                 self.flush(q)?;
@@ -1332,23 +1335,12 @@ impl<'a> ForwardSink<'a> {
                 std::fs::write(path, buf)?;
             }
         }
-        let mut out = Vec::new();
-        for (mut p, seq, ids) in std::mem::take(&mut self.pieces).into_values() {
-            // Drop empty pieces (renumbered, they would collide with a seq).
-            if p.width == 0 {
-                continue;
-            }
-            debug_assert_eq!(ids.len(), p.width);
-            // Agreeing columns become uniform (the gates are pinned with it).
-            for c in p.cols.iter_mut() {
-                if !matches!(c, Col::U(_)) {
-                    let taken = std::mem::replace(c, Col::U(AV::Nil));
-                    *c = celeste_engine::runtime2::collapse_uniform(taken);
-                }
-            }
-            out.push(Block::with_ids(p, ids, seq));
-        }
-        Ok(out)
+        // Empty pieces hold no rows to renumber.
+        Ok(std::mem::take(&mut self.pieces)
+            .into_values()
+            .filter(|(p, _, _)| p.width > 0)
+            .map(|(rt2, seq, cells)| crate::canon::Flushed { rt2, seq, cells })
+            .collect())
     }
 
     /// Bytes allocated across the pool (capacities).
@@ -1723,22 +1715,15 @@ pub fn forward_frame(
     st.rss_start = crate::metrics::current_rss_gb();
 
     let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
-    // Per block its live lanes (a skipped lane is never expanded) by
-    // POSITION: region (the kernel key's), then cell. A piece holds its
-    // flushed queues in flush order, so neighbouring rows changed region
-    // every ~12 rows; in this order a unit is a few regions and few cells,
-    // its slices fill, and its dedup cache sees the outputs of neighbouring
-    // inputs together. Ids stay the rows' own (a slice may span id groups).
-    let grid = crate::trace::kernel::region_grid();
-    let order: Vec<Vec<usize>> = frontier
-        .iter()
-        .zip(&cells)
-        .map(|(b, c)| {
-            let mut o: Vec<usize> = (0..b.lanes()).filter(|&l| b.skip.is_empty() || !b.skip[l]).collect();
-            o.sort_by_key(|&l| (grid.and_then(|g| g.of_cell(c[l])), c[l], l));
-            o
-        })
-        .collect();
+    // Per block its live lanes (a skipped lane is never expanded), in
+    // storage order, which is POSITION order: a layer is stored by region
+    // (the kernel key's), cell, key (`canon`). So a unit is a few regions
+    // and few cells, its slices fill, and its dedup cache sees the outputs
+    // of neighbouring inputs together. (Sorting here instead, a213214, was
+    // the identity on every canonical block and 0.1-0.2 s serial a frame
+    // on room (6,2) 100% f57; a tree written before `canon` runs its first
+    // frame after a resume in flush order: slower, the same states.)
+    let order: Vec<Vec<usize>> = frontier.iter().map(|b| (0..b.lanes()).filter(|&l| b.skip.is_empty() || !b.skip[l]).collect()).collect();
     // Units in WAVE order: by first position.
     let mut units = units_of(order.iter().map(Vec::len), unit_lanes(order.iter().map(Vec::len).sum(), workers));
     units.sort_by_key(|&(bi, lo, _)| (cells[bi][order[bi][lo]], bi, lo));
@@ -1752,7 +1737,7 @@ pub fn forward_frame(
 
     let t = Instant::now();
     struct Done {
-        pieces: Vec<Block>,
+        pieces: Vec<crate::canon::Flushed>,
         won: bool,
         kept: usize,
         flushes: u64,
@@ -1820,13 +1805,8 @@ pub fn forward_frame(
     st.rss_wave = crate::metrics::current_rss_gb();
     drop(frontier);
 
-    let t = Instant::now();
-    door.end_frame(workers);
-    st.t_door = t.elapsed();
-    st.door_bytes = door.alloc_bytes();
-
     let mut won = false;
-    let mut pieces: Vec<Block> = Vec::new();
+    let mut pieces: Vec<crate::canon::Flushed> = Vec::new();
     for d in done {
         st.lanes_raw += d.emitted as usize;
         st.lanes_kept += d.kept;
@@ -1841,8 +1821,23 @@ pub fn forward_frame(
         }
         pieces.extend(d.pieces);
     }
-    // The next frontier: the workers' pieces (a cell may span several).
-    let next: Vec<Block> = pieces;
+    // The next frontier: the layer in CANONICAL order (`canon`); the ids the
+    // wave handed out are renumbered in the door and, where the compaction
+    // decodes them, in the edge records.
+    let t = Instant::now();
+    let first_seq = match layer {
+        Layer::New => 0,
+        Layer::Raised(r) => r.first_seq,
+    };
+    let (next, renumber) = crate::canon::canonical_layer(pieces, frame, first_seq)?;
+    if let Some(dir) = edges_dir {
+        renumber.save(&crate::search::edges::renumber_path(dir, frame))?;
+    }
+    st.t_canon = t.elapsed();
+    let t = Instant::now();
+    door.end_frame(workers, Some(&renumber));
+    st.t_door = t.elapsed();
+    st.door_bytes = door.alloc_bytes();
     st.rss_end = crate::metrics::current_rss_gb();
     st.rss_file = crate::metrics::current_file_rss_gb();
     st.blocks_out = next.len();
@@ -1875,6 +1870,8 @@ pub struct FrameStats {
     /// The wave's wall time and its barrier idle fraction.
     pub t_wave: std::time::Duration,
     pub wave_idle: f64,
+    /// The layer's renumbering into canonical order (`canon`), wall.
+    pub t_canon: std::time::Duration,
     /// The door's end-of-frame merge, wall.
     pub t_door: std::time::Duration,
     pub flushes: u64,
@@ -1987,7 +1984,7 @@ impl TreeFilter {
 /// Frame `frame`'s level -1 drops, as their SOURCES (rows of layer `frame -
 /// 1`): `(id, the smallest horizon that admits one of its dropped
 /// successors)`, sorted by id.
-fn dropped_path(dir: &std::path::Path, frame: u32) -> std::path::PathBuf {
+pub fn dropped_path(dir: &std::path::Path, frame: u32) -> std::path::PathBuf {
     dir.join("dropped").join(format!("f{frame:03}.bin"))
 }
 
@@ -2087,7 +2084,7 @@ impl ForwardState {
                 door.admit(shape, cell, &[key], id, &mut ids, &mut new);
             }
         }
-        door.end_frame(1);
+        door.end_frame(1, None);
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
         // An (empty) graph from the start: every tree with frames has one.
         if let Some(o) = observer.as_ref() {
@@ -2648,7 +2645,7 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         wave {:.0} (idle {:.0}%) door {:.0} edges {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
+         wave {:.0} (idle {:.0}%) canon {:.0} door {:.0} edges {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
          flushes {} ({:.0} rows avg) edges {} | \
          in {:.2} queues {:.2} door {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2})",
         st.blocks_in,
@@ -2660,6 +2657,7 @@ fn log_frame(
         visited,
         ms(st.t_wave),
         st.wave_idle * 100.0,
+        ms(st.t_canon),
         ms(st.t_door),
         ms(t_edges),
         ms(t_ckpt),
@@ -2678,6 +2676,7 @@ fn log_frame(
         st.rss_file,
     );
     crate::metrics::record("fwd.wave", st.t_wave);
+    crate::metrics::record("fwd.canon", st.t_canon);
     crate::metrics::record("fwd.door", st.t_door);
     crate::metrics::record("fwd.checkpoint", t_ckpt);
     crate::metrics::record("fwd.posgraph", t_pos);

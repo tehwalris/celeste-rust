@@ -1,5 +1,35 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# Canonical layers, 2026-10-09 (release, 16 threads, branch `canonical-layers`)
+
+Each new layer stored by (shape, region, cell, key) (`canon`, 274eeee +
+1095c1d) against a213214 (flush order, sorted per block at load). Shared
+machine, another agent's 16-thread search alongside (load 20-60): times
+interleaved A/B, 5 reps each, medians; the counts are deterministic. Each
+binary on a base tree of its own format (fresh forwards, the same graph),
+`FRAMES=2`.
+
+| harness | | a213214 | canonical |
+|---|---|---|---|
+| room (6,2) 100% f56->f57 | wave | 5.93 s (3.5-8.4) | 5.38 s (3.2-5.9) |
+| | canon (beside: no load-time sort, 0.1-0.2 s serial) | - | 0.17-0.46 s |
+| | rows after the unit cache / flushes | 33.4M / 342k | 31.7M / 185k |
+| room (6,2) f58 | wave | 8.09 s (6.7-10.5) | 8.16 s (5.2-8.9) |
+| | frame total | 9.90 s | 9.19 s |
+| room (3,0) r0sxhfn 8 px f48->f49 | wave | 1.47 s (1.44-1.48) | 1.18 s (1.12-1.19) |
+| | canon | - | 0.10 s |
+| | rows after the unit cache / flushes / padding | 5.37M / 151k / 1.8% | 3.65M / 44k / 0.2% |
+| room (3,0) f50 | wave / frame total | 2.06 / 2.31 s | 1.81 / 2.06 s |
+
+The win is the UNIT dedup: a canonical piece holds every row of its cells,
+where a worker's piece held ~1/16 of them, so a unit's cache sees all of a
+cell's inputs. The reorder itself (sort by cell buckets, gather, the
+renumbering) is 0.03-0.1 s per 1M new rows here, on the critical path; the
+renumbering file (8 B a new state, beside the raw records) and its lookups
+in the compaction (5 a record into the frame's own layer) are the rest.
+Checkpoints: room (6,2) frames to f58 3.64 -> 3.40 GB, edge runs 6.34 ->
+6.22 GB; room (3,0) to f49 470 -> 408 MB and 381 -> 365 MB.
+
 # The forward frame, 2026-10-09 night (release, 16 threads, branch `fg-2300`)
 
 The harness: `tools/bench_step.sh /var/tmp/h23base 6,2 r0sxhf 1 BIN` (room

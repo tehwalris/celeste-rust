@@ -4,7 +4,7 @@
 //! `rewrite export-ui` (the web UI's data), and the diagnostics that read a
 //! finished tree (rows by name: `search::inspect`).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use celeste_engine::runtime2::Rt2;
 use celeste_rust::trace::refengine::RefEngine;
 use celeste_rust::frame::{forward_frame, frame_files, frame_paths, id_layer, Filters, Layer, MinusOne, id_row, id_seq, load_row, pack_id, widen_rt2_to, widened_keys, wins_of, Block, FrameStep, Visited};
@@ -184,6 +184,10 @@ enum Command {
         /// fresh one).
         #[arg(long)]
         edges: bool,
+        /// Also fingerprint each frame's level -1 drop notes (`d{frame}
+        /// count hash`) by their sources' (shape, key, cell) and horizons.
+        #[arg(long)]
+        dropped: bool,
     },
     /// Microbenchmark of ONE forward frame: run `forward_frame` on a
     /// checkpointed frame `reps` times (empty door, no filter), printing the
@@ -772,6 +776,7 @@ fn main() -> Result<()> {
             room,
             cells: top_cells,
             edges,
+            dropped,
         } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
             let dir = std::path::Path::new(&checkpoint_dir);
@@ -803,21 +808,22 @@ fn main() -> Result<()> {
             // The recorded edges per frame, by what they join: (shape, key,
             // cell) of target and source, and the transfer - ids and table
             // positions depend on scheduling (and on a raise), these do not.
+            // A state by what it is, not by its id.
+            let mut files: rustc_hash::FxHashMap<(u32, u32), (celeste_rust::search::checkpoint::FrameFile, Vec<u32>)> = Default::default();
+            let mut node = |id: u64| -> Result<u64> {
+                let (layer, seq, row) = (id_layer(id), id_seq(id), id_row(id));
+                if !files.contains_key(&(layer, seq)) {
+                    let (_, f) = frame_files(dir, layer)?.into_iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
+                    let cells = f.row_cells();
+                    files.insert((layer, seq), (f, cells));
+                }
+                let (f, cells) = &files[&(layer, seq)];
+                let k = f.key_at(row);
+                let mix = celeste_engine::runtime2::mix64;
+                Ok(mix(k.0 ^ mix(k.1 ^ mix(f.shape_hash() ^ cells[row as usize] as u64))))
+            };
             if edges {
                 let eg = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), to)?;
-                let mut files: rustc_hash::FxHashMap<(u32, u32), (celeste_rust::search::checkpoint::FrameFile, Vec<u32>)> = Default::default();
-                let mut node = |id: u64| -> Result<u64> {
-                    let (layer, seq, row) = (id_layer(id), id_seq(id), id_row(id));
-                    if !files.contains_key(&(layer, seq)) {
-                        let (_, f) = frame_files(dir, layer)?.into_iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
-                        let cells = f.row_cells();
-                        files.insert((layer, seq), (f, cells));
-                    }
-                    let (f, cells) = &files[&(layer, seq)];
-                    let k = f.key_at(row);
-                    let mix = celeste_engine::runtime2::mix64;
-                    Ok(mix(k.0 ^ mix(k.1 ^ mix(f.shape_hash() ^ cells[row as usize] as u64))))
-                };
                 for frame in 1..=to {
                     let (mut n, mut acc) = (0usize, 0u64);
                     for e in eg.records_at(frame) {
@@ -833,6 +839,21 @@ fn main() -> Result<()> {
                         n += 1;
                     }
                     println!("e{frame:03} {n} {acc:016x}");
+                }
+            }
+            if dropped {
+                for frame in 1..=to {
+                    let p = celeste_rust::frame::dropped_path(dir, frame);
+                    // A forward whose frontier died has no frames past it.
+                    if !dir.join("frames").join(format!("f{frame:03}")).is_dir() {
+                        break;
+                    }
+                    let notes: Vec<(u64, u32)> = celeste_rust::search::checkpoint::load_value_from(&p).with_context(|| p.display().to_string())?;
+                    let mut acc = 0u64;
+                    for &(id, h) in &notes {
+                        acc = acc.wrapping_add(celeste_engine::runtime2::mix64(node(id)? ^ (h as u64).rotate_left(32)));
+                    }
+                    println!("d{frame:03} {} {acc:016x}", notes.len());
                 }
             }
             if let Some(top) = top_cells {

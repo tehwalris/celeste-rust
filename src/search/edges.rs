@@ -17,6 +17,7 @@
 use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
+use crate::canon::Renumber;
 use crate::frame::{id_layer, pack_id};
 
 /// One edge record in a worker file, ONE LANE: the target's (seq, row)
@@ -64,23 +65,27 @@ pub fn encode_record(out: &mut Vec<u8>, target: u64, base: u64, xfer: u32, mask:
 }
 
 /// Decode a record of layer `layer` recorded at `frame` (source in layer
-/// `frame - 1`), its transfer id mapped through `remap` into the frame's.
+/// `frame - 1`), its transfer id mapped through `remap` into the frame's,
+/// its target through `ren` (the frame's own layer: `canon::Renumber`).
 #[inline]
-fn decode(b: &[u8], layer: u32, frame: u32, remap: &[u32]) -> Rec {
+fn decode(b: &[u8], layer: u32, frame: u32, remap: &[u32], ren: Option<&Renumber>) -> Rec {
     let tseq = u16::from_le_bytes(b[0..2].try_into().unwrap()) as u32;
     let trow = u32::from_le_bytes(b[2..6].try_into().unwrap());
     let sseq = u16::from_le_bytes(b[6..8].try_into().unwrap()) as u32;
     let srow = u32::from_le_bytes(b[8..12].try_into().unwrap());
     let x = u32::from_le_bytes(b[12..16].try_into().unwrap());
-    (pack_id(layer, tseq, trow), pack_id(frame - 1, sseq, srow), remap[x as usize])
+    let target = pack_id(layer, tseq, trow);
+    (ren.map_or(target, |r| r.map(target)), pack_id(frame - 1, sseq, srow), remap[x as usize])
 }
 
-/// The target (seq, row) of record `i` as a sortable 48-bit value.
+/// The target (seq, row) of record `i` as a sortable 48-bit value, through
+/// `ren` as `decode` maps it.
 #[inline]
-fn target_local(b: &[u8], i: usize) -> u64 {
+fn target_local(b: &[u8], i: usize, ren: Option<&Renumber>) -> u64 {
     let o = i * RECORD_BYTES;
-    ((u16::from_le_bytes(b[o..o + 2].try_into().unwrap()) as u64) << 32)
-        | u32::from_le_bytes(b[o + 2..o + 6].try_into().unwrap()) as u64
+    let t = ((u16::from_le_bytes(b[o..o + 2].try_into().unwrap()) as u64) << 32)
+        | u32::from_le_bytes(b[o + 2..o + 6].try_into().unwrap()) as u64;
+    ren.map_or(t, |r| r.map_local(t))
 }
 
 fn layer_dir(dir: &Path, layer: u32) -> PathBuf {
@@ -104,6 +109,12 @@ pub fn raw_path(dir: &Path, frame: u32, layer: u32, worker: u32) -> PathBuf {
 /// A worker's transfer table of one frame: the pairs its records' ids index.
 pub fn raw_xfer_path(dir: &Path, frame: u32, worker: u32) -> PathBuf {
     raw_dir(dir, frame).join(format!("x_w{:03}.bin", worker))
+}
+
+/// The frame's renumbering of its own layer's ids (`canon::Renumber`),
+/// which the targets of its records into that layer were written under.
+pub fn renumber_path(dir: &Path, frame: u32) -> PathBuf {
+    raw_dir(dir, frame).join("renumber.bin")
 }
 
 /// The frame's transfer table (`EdgeGraph::pair`).
@@ -378,6 +389,7 @@ fn sort_layer_chunked(
     files: &[(&[u8], &[u32])],
     layer: u32,
     frame: u32,
+    ren: Option<&Renumber>,
     chunk_records: usize,
     stream_path: &Path,
 ) -> Result<(RunWriter, std::time::Duration, std::time::Duration)> {
@@ -393,13 +405,13 @@ fn sort_layer_chunked(
                     let mut max_row: Vec<u32> = Vec::new();
                     let mut counts = TableCounts::default();
                     for i in 0..b.len() / RECORD_BYTES {
-                        let t = target_local(b, i);
+                        let t = target_local(b, i, ren);
                         let (seq, row) = ((t >> 32) as usize, t as u32);
                         if max_row.len() <= seq {
                             max_row.resize(seq + 1, 0);
                         }
                         max_row[seq] = max_row[seq].max(row + 1);
-                        counts.add(&decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], layer, frame, remap));
+                        counts.add(&decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], layer, frame, remap, ren));
                     }
                     (max_row, counts)
                 })
@@ -441,7 +453,7 @@ fn sort_layer_chunked(
                 scope.spawn(move || {
                     let mut h = vec![0u32; n_buckets];
                     for i in 0..b.len() / RECORD_BYTES {
-                        h[bucket_of(target_local(b, i))] += 1;
+                        h[bucket_of(target_local(b, i, ren))] += 1;
                     }
                     h
                 })
@@ -502,11 +514,11 @@ fn sort_layer_chunked(
                     scope.spawn(move || {
                         let out_ptr = out_ptr as *mut Rec;
                         for i in 0..b.len() / RECORD_BYTES {
-                            let k = bucket_of(target_local(b, i));
+                            let k = bucket_of(target_local(b, i, ren));
                             if k < k_lo || k >= k_hi {
                                 continue;
                             }
-                            let e = decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], layer, frame, remap);
+                            let e = decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], layer, frame, remap, ren);
                             let pos = cur[k - k_lo];
                             cur[k - k_lo] += 1;
                             // SAFETY: this file's own slot, unique and < n_chunk.
@@ -683,6 +695,9 @@ fn keep_raw() -> bool {
 fn compact(dir: &Path, frame: u32, raised: bool) -> Result<CompactStats> {
     let out_path = |layer: u32| if raised { raised_path(dir, layer, frame) } else { run_path(dir, layer, frame) };
     let remaps = merge_xfer_tables(dir, frame, raised)?;
+    // Targets in the frame's own layer were written as flush ids.
+    let renumber = Renumber::load(&renumber_path(dir, frame))?;
+    let ren_of = |layer: u32| (renumber.layer() == layer).then_some(&renumber);
     let remap_of = |worker: u32| -> &[u32] { remaps.get(&worker).map_or(&[], |v| v.as_slice()) };
     let mut layers: Vec<(u32, Vec<RawFile>, u64)> = raw_files(dir, frame);
     layers.sort_by_key(|&(_, _, bytes)| std::cmp::Reverse(bytes));
@@ -727,7 +742,7 @@ fn compact(dir: &Path, frame: u32, raised: bool) -> Result<CompactStats> {
         // Sorted in CHUNKS streamed into the run: a bounded sort buffer.
         let ldir = layer_dir(dir, *layer);
         std::fs::create_dir_all(&ldir)?;
-        let (writer, t_sort, t_write) = sort_layer_chunked(&views, *layer, frame, CHUNK_RECORDS, &ldir.join(format!("tmp-f{:03}.stream", frame)))?;
+        let (writer, t_sort, t_write) = sort_layer_chunked(&views, *layer, frame, ren_of(*layer), CHUNK_RECORDS, &ldir.join(format!("tmp-f{:03}.stream", frame)))?;
         drop(views);
         drop(maps);
         st.t_sort += t_sort;
@@ -746,7 +761,7 @@ fn compact(dir: &Path, frame: u32, raised: bool) -> Result<CompactStats> {
     let totals: Vec<(u64, u64, u64)> = std::thread::scope(|scope| {
         let hs: Vec<_> = (0..crate::frame::threads().min(small.len().max(1)))
             .map(|_| {
-                let (small, next, read_all, remap_of, out_path) = (&small, &next, &read_all, &remap_of, &out_path);
+                let (small, next, read_all, remap_of, out_path, ren_of) = (&small, &next, &read_all, &remap_of, &out_path, &ren_of);
                 scope.spawn(move || -> Result<(u64, u64, u64)> {
                     let (mut records, mut edges, mut bytes) = (0u64, 0u64, 0u64);
                     loop {
@@ -757,7 +772,7 @@ fn compact(dir: &Path, frame: u32, raised: bool) -> Result<CompactStats> {
                         for (b, (_, w)) in contents.iter().zip(files) {
                             let remap = remap_of(*w);
                             for i in 0..b.len() / RECORD_BYTES {
-                                recs.push(decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], *layer, frame, remap));
+                                recs.push(decode(&b[i * RECORD_BYTES..(i + 1) * RECORD_BYTES], *layer, frame, remap, ren_of(*layer)));
                             }
                         }
                         drop(contents);
@@ -788,6 +803,7 @@ fn compact(dir: &Path, frame: u32, raised: bool) -> Result<CompactStats> {
         for w in remaps.keys() {
             std::fs::remove_file(raw_xfer_path(dir, frame, *w))?;
         }
+        std::fs::remove_file(renumber_path(dir, frame))?;
         let _ = std::fs::remove_dir(raw_dir(dir, frame));
     }
     Ok(st)
@@ -1352,6 +1368,45 @@ mod tests {
         let a = crate::search::arc_edges::AxisXfer { lo: 0, hi: crate::search::arcs::CIRCLE, tag: 0, val: 0 };
         crate::search::arc_edges::encode_pair(&mut t, &(a, a));
         std::fs::write(raw_xfer_path(dir, frame, worker), t).unwrap();
+        // Targets already canonical (a test renumbering writes its own).
+        if !renumber_path(dir, frame).exists() {
+            Renumber::identity(frame).save(&renumber_path(dir, frame)).unwrap();
+        }
+    }
+
+    /// The frame's records into its own layer carry flush ids: the run holds
+    /// them renumbered (`canon::Renumber`), sorted by the canonical target;
+    /// records into older layers keep theirs.
+    #[test]
+    fn a_frames_own_targets_are_renumbered_at_compaction() {
+        let dir = std::env::temp_dir().join(format!("celeste-edges-renumber-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let frame = 3;
+        // Flush piece 2 of layer 3, rows 0..4, are canonically (5, 3 - r).
+        let to: Vec<u64> = (0..4).map(|r| pack_id(frame, 5, 3 - r)).collect();
+        std::fs::create_dir_all(raw_dir(&dir, frame)).unwrap();
+        Renumber::of_piece(frame, 2, to.clone()).save(&renumber_path(&dir, frame)).unwrap();
+        let src = |r: u32| pack_id(frame - 1, 0, r);
+        let own: Vec<Edge> = (0..4).map(|r| Edge { target: pack_id(frame, 2, r), base: src(r), xfer: 0, mask: 1 }).collect();
+        write_worker(&dir, frame, frame, 0, &own);
+        let old = Edge { target: pack_id(1, 2, 1), base: src(9), xfer: 0, mask: 1 };
+        write_worker(&dir, frame, 1, 0, &[old]);
+        compact_frame(&dir, frame).unwrap();
+        assert!(!raw_dir(&dir, frame).exists(), "the renumbering goes with the raw files");
+        let g = EdgeGraph::open(&dir, frame).unwrap();
+        let mut buf = Vec::new();
+        for r in 0..4u32 {
+            buf.clear();
+            g.preds_at(to[r as usize], frame, &mut buf);
+            assert_eq!(buf, vec![Edge { target: to[r as usize], base: src(r), xfer: 0, mask: 1 }], "flush row {r}");
+        }
+        buf.clear();
+        g.preds_at(pack_id(frame, 2, 0), frame, &mut buf);
+        assert!(buf.is_empty(), "no edge under a flush id");
+        buf.clear();
+        g.preds_at(old.target, frame, &mut buf);
+        assert_eq!(buf, vec![old], "an older layer's target is not renumbered");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A mark's deadline is the last frame it still reaches a win by the
