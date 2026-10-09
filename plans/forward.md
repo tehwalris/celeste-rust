@@ -15,7 +15,7 @@ kept), 16 workers on a 7950X3D (16 cores, 32 threads), DDR5 at 3600 MT/s
 | flush.admit | 6.3 | the door |
 | flush.gather | 4.9 | kept rows into the next frame's pieces |
 | flush (sort, pre, post) | 1.8 | |
-| beside the wave | ~27 CPU-s | the previous frame's edge compaction (raw records -> runs sorted by target) |
+| beside the wave | ~27 CPU-s | the previous frame's edge compaction (raw records -> runs sorted by target); GONE since `edge-inversion` (below) |
 
 **It is not memory-bound.** The format study's DRAM estimate for today's
 format is 45-85 GB a frame (1-1.9 s at 45 GB/s); the wave is 4.6 s of 16
@@ -103,6 +103,27 @@ schedules and against the binary before), plus the gates and the full suite.
    codegen change. The real gap is 78-89% live against 44-51% taking a
    lane: bodies that duplicate a neighbour (the mask drops them after the
    kernel) - decision 4 would remove them before it.
+
+## The edges inverted once (2026-10-09, branch `edge-inversion`)
+
+The forward keeps every frame's raw records (no compaction beside the
+waves) as 64k-record CHUNKS (`edges::write_chunk`, ~3.6 B a record against
+16), and the backward inverts the whole tree into the unchanged runs when
+it first opens the graph (`edges::invert`, 4 frames at once). Measured
+(BENCHMARK_DATA.md, "The edges inverted once"): on the harness the
+contention was ~25% of f58's wave (6.76 -> 5.11 s without the compaction,
+4.91 s with the chunked writes; f57 4.4-4.5 s in all three); the raw tree
+of the 2300m search is 46.3 GB (16-B records would have been 207 GB, more
+than the disk had), its runs 49.2 GB; inverting its 13.0G records takes
+~105 s (4 frames at once; 225 s one at a time). End to end, on a shared
+machine (load 17-38), two pairs of the whole 2300m search: forward 349 /
+431 s before, 319 / 292 s after; totals 439.5 / 523.4 s before, 484.9 /
+464.5 s after (the inversion included). So the forward is faster but the
+inversion gives it back: a wash end to end, at ~8% less CPU. The
+inversion runs ~11 of 32 threads (90 ns of CPU an edge: the chunk
+decodes, the bucket sorts, the run encoder); it would have to get ~3x
+faster to make this a clear win. The 16-B records were only workable with
+the per-frame compaction: a whole tree of them does not fit.
 
 The compaction's own cost (`rewrite compact-bench` over a frame's raw
 records kept by `CELESTE_KEEP_RAW=1`): f57's 258M records, 2.6 s wall and
