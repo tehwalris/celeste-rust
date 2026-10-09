@@ -5,23 +5,24 @@ Measured on the harness in BENCHMARK_DATA.md ("The forward frame,
 kept), 16 workers on a 7950X3D (16 cores, 32 threads), DDR5 at 3600 MT/s
 (~45 GB/s measured).
 
-## Where the frame goes now (5.6 s wave, 95 worker-s)
+## Where the frame goes now (4.6 s wave, 76 worker-s; f58 7.0 s)
 
 | phase | worker-s | what |
 |---|---|---|
-| kernel | 8.9 | the AVX-512 kernels themselves |
-| emit | 51.7 | per (lane, body): cell, level -1, key (14.6 fields, 2 mixes each), transfer words and their id, the unit's dedup cache, the row push |
-| flush.edges | 13.6 | 16-B raw edge records into per-worker files |
-| flush.admit | 7.4 | the door |
-| flush.gather | 5.5 | kept rows into the next frame's pieces |
-| flush (sort, pre, post) | 2.3 | |
-| beside the wave | ~35 CPU-s | the previous frame's edge compaction (raw records -> runs sorted by target) |
+| kernel | 6.6 | the AVX-512 kernels themselves (11% padding left) |
+| emit | 41 | per (lane, body): cell, level -1, key (14.6 fields, 2 mixes each), transfer words and their id, the unit's dedup cache, the row push |
+| flush.edges | 10.6 | 16-B raw edge records into per-worker files |
+| flush.admit | 6.3 | the door |
+| flush.gather | 4.9 | kept rows into the next frame's pieces |
+| flush (sort, pre, post) | 1.8 | |
+| beside the wave | ~27 CPU-s | the previous frame's edge compaction (raw records -> runs sorted by target) |
 
 **It is not memory-bound.** The format study's DRAM estimate for today's
-format is 45-85 GB a frame (1-1.9 s at 45 GB/s); the wave is 5.6 s of 16
-busy cores. The time is per-emission COMPUTE: 512M emissions (87 per input
-state) of which half land on cells level -1 drops; 56.6M rows survive the
-unit's dedup; 6.7M are new.
+format is 45-85 GB a frame (1-1.9 s at 45 GB/s); the wave is 4.6 s of 16
+busy cores. The time is per-emission COMPUTE, and the emit profile is now
+flat (no line above ~1%): 512M emissions (87 per input state) of which half
+land on cells level -1 drops; 49.5M rows survive the unit's dedup; 6.7M are
+new.
 
 ## What changed tonight, and why it is exact
 
@@ -39,8 +40,13 @@ unit's dedup; 6.7M are new.
   the kernel gives the cell; it records only its pos-graph edge and its
   source's drop note, as flush did. A runtime guard asserts the queue's
   shape is the one judged.
-- Slices by region within an id group (d8361a3), transfer words per lane
-  (2cbfcb4), edge record stores (691b80a): plain overhead.
+- **Slices by region across a whole unit** (4163a00, 197267a): a slice
+  may span 64-lane id groups (each lane's predecessor records keyed by its
+  own group), so a unit's lanes are bucketed by region, and units are ~16
+  a worker (1024-4096 lanes). Padding 53% -> 11% here, 49% -> 11% in the
+  kernel-bound room (3,0) at 8 px (its frame 3.77 -> 2.08 s).
+- Transfer words per lane (2cbfcb4), edge record stores (691b80a, 853724c),
+  the compaction's sort (a0cf74c): plain overhead.
 - **The kernels and the level -1 table are built before the wave**
   (38ea337). Not a speedup of a real run (it paid the build once), but every
   one-frame number before it held a 3.9 s build (or a 34 s table rebuild).
