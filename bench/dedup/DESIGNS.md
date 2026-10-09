@@ -114,3 +114,27 @@ of 32 threads by itself).
 Implement D, E, G (and B without a mutex: single-owner shards) in the bench;
 measure each against its envelope with `perf stat` (LLC misses, bytes,
 instructions); capture 3-4 consecutive frames for F.
+
+## `vprod`: production's dedup path replayed (src/bin/vprod, 2026-10-09)
+
+A faithful copy of production's path (fg-2300 d2eda1c: `run_slice`'s
+emission loop, `ForwardSink`, `RowCache`, `DropNotes`, the direct edge
+cache, the door verbatim, `end_frame`), driven by the capture; the
+simplifications are listed at the top of src/bin/vprod/main.rs (a 64-B row
+payload, key and transfer id given, level -1 table rebuilt from the drop
+flags, `last_edge` reset per unit rather than per slice, no `any_win`, an
+identity `Renumber`). It reproduces f57 exactly: raw 31,685,344, flushes
+184,432, kept 6,735,699, edge words 257,724,013 (all distinct). The edge
+record count (256.63M) moves by ~100 between runs because new ids depend on
+which worker admits first, and those ids hash into the direct cache.
+The emitted rows (raw) and kept counts are the same at 1 worker; flushes are
+173,203 there.
+
+Measured on a LOADED machine (load 27-41, other agents' searches running),
+best of 3. 16 workers: wave **1.73-1.80 s** + end_frame 0.09 s. Of 28.8
+worker-s: emit (net of flush) 18.7, flush 6.9 (admit 3.1, edges 2.75, sort
+0.6, gather 0.27), end_call 0.1, finish 0.26. 1 worker (units in wave
+order): **16.2-17.1 s** + end_frame 0.69 s. Of that: emit 12.9, flush 4.2
+(admit 1.74, edges 1.70, sort 0.55). Reading and parsing the capture alone
+(`vread`) takes 0.58 s at 16 threads and 1.45 s at 1 thread, and that is
+inside emit.
