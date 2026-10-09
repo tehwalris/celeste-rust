@@ -1615,18 +1615,23 @@ pub trait FrameStep: Sync {
     fn warm(&self) {}
 }
 
-/// Lanes per unit (one kernel call): load balance against the dedup window.
-/// `CELESTE_UNIT_LANES` overrides it (a multiple of 64, the id groups).
-fn unit_lanes() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| match std::env::var("CELESTE_UNIT_LANES") {
-        Ok(v) => {
+/// Lanes per unit (one kernel call) for a frame of `lanes` input rows on
+/// `workers`: ~16 units a worker, between 1024 and 4096 lanes. A bigger unit
+/// fills more of each region's slices and dedups more before the queues
+/// (room (3,0) 100% r0sxhfn at 8 px, f49: 1024 -> 4096 lanes, padding 22%
+/// -> 11%, wave 2.48 -> 2.03 s; room (6,2) 100% f57 4.80 -> 4.71 s); a small
+/// frame keeps enough units to balance. `CELESTE_UNIT_LANES` fixes it (a
+/// multiple of 64, the id groups).
+fn unit_lanes(lanes: usize, workers: usize) -> usize {
+    static FIXED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let fixed = *FIXED.get_or_init(|| {
+        std::env::var("CELESTE_UNIT_LANES").ok().map(|v| {
             let n: usize = v.parse().unwrap_or_else(|_| panic!("CELESTE_UNIT_LANES={v:?} is not a number"));
             assert!(n >= 64 && n % 64 == 0, "CELESTE_UNIT_LANES={n}: must be a positive multiple of 64");
             n
-        }
-        Err(_) => 1024,
-    })
+        })
+    });
+    fixed.unwrap_or_else(|| (lanes / (workers.max(1) * 16)).clamp(1024, 4096) & !63)
 }
 
 /// Stack per frame worker: kernel spill frames reach ~83 MB (virtual; each
@@ -1721,7 +1726,7 @@ pub fn forward_frame(
 
     let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
     // Units in WAVE order: by first cell across the cell-sorted pieces.
-    let mut units = units_of(frontier.iter().map(Block::lanes), unit_lanes());
+    let mut units = units_of(frontier.iter().map(Block::lanes), unit_lanes(frontier.iter().map(Block::lanes).sum(), workers));
     // A unit of only skipped lanes is not run (it may have no kernel).
     units.retain(|&(bi, lo, hi)| {
         let sk = &frontier[bi].skip;

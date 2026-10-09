@@ -27,12 +27,14 @@ INSIDE the first wave, the other workers waiting on the build's lock (61 of
 | eabc2a8 | level -1 at emission (rows after the unit dedup 113M -> 56.6M) | 9.5 (incl. build) | - |
 | 38ea337 | kernels and level -1 table built before the wave | **5.6** | **8.0** |
 | 853724c | edge buffers as u128 words sorted in place (page faults 5.1M -> 3.3M a 2-frame run) | 5.2 | 7.7 |
-| (next) | a unit's lanes bucketed by region across id groups (padding 36% -> 11%, kernel 10.5 -> 7.2 worker-s) | **4.85** | - |
+| 4163a00 | a unit's lanes bucketed by region across id groups (padding 36% -> 11%, kernel 10.5 -> 7.2 worker-s) | 4.85 | 7.19 |
+| (next) | units of ~16 a worker, 1024-4096 lanes (here 4096) | **4.56** | **6.97** |
 
 A kernel-bound second harness: room (3,0) 100% at `r0sxhfn` with 8 px regions
 (`CELESTE_LOADING_JANK=3 CELESTE_REGION=8,6 CELESTE_LEVEL_MINUS_ONE=88,5`),
 a tree to f48, f48 -> f49 (937k states): the unit-wide bucketing takes padding
-49% -> 22%, kernel 21.7 -> 11.1 worker-s, emit 27 -> 19.3, wave 3.77 -> 2.53 s.
+49% -> 22%, kernel 21.7 -> 11.1 worker-s, emit 27 -> 19.3, wave 3.77 -> 2.53 s;
+units of 4096 lanes (adaptive): 2.08 s.
 
 The f57 phases now (worker-seconds of 16 x 5.9 s, `CELESTE_PHASES=1`): kernel
 8.9, emit 51.7, flush 29.1 (sort 1.2, door admit 7.4, edges 13.6, gather
