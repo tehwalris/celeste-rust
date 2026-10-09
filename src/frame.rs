@@ -1605,6 +1605,12 @@ pub trait FrameStep: Sync {
     /// One frame of `lanes` of `block` into `sink`; called concurrently on
     /// disjoint ranges (scratch in the sink or behind a lock).
     fn run(&self, block: &Block, cell_in: &[u32], lanes: Range<usize>, sink: &mut ForwardSink) -> Result<()>;
+
+    /// Build what the engine builds on first use (the kernels) before a
+    /// wave's clock starts: built inside the wave, the first frame's workers
+    /// all waited on the build's lock (room (6,2) 100% f57: 61 of 152
+    /// worker-s, so a one-frame bench timed the build).
+    fn warm(&self) {}
 }
 
 /// Lanes per unit (one kernel call): load balance against the dedup window.
@@ -1695,6 +1701,14 @@ pub fn forward_frame(
         "frame {frame} at {level}: the platform worlds cover {} frames",
         crate::trace::kernel::PLATFORM_WORLD_FRAMES
     );
+    let t_warm = Instant::now();
+    engine.warm();
+    if let Some(m) = filters.minus_one {
+        let _ = m.table();
+    }
+    if t_warm.elapsed().as_secs_f64() > 0.5 {
+        eprintln!("[fwd] f{frame}: engine and level -1 table built in {:.1} s, before the wave", t_warm.elapsed().as_secs_f64());
+    }
     let mut st = FrameStats::default();
     let workers = threads();
     let t_frame = std::time::Instant::now();

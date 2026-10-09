@@ -126,4 +126,9 @@ impl crate::frame::FrameStep for FrameEngine {
         self.run_bucket(block.rt2(), cell_in, lanes, sink);
         Ok(())
     }
+
+    fn warm(&self) {
+        // A level without kernels fails loudly in `run_bucket`, not here.
+        let _ = asm_kernel::registry();
+    }
 }
