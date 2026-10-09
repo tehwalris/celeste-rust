@@ -319,7 +319,7 @@ remainder; every backward reads the records and re-runs no kernel
   (2026-10-09, branch `edge-inversion`): no compaction beside the waves.
 - **Runs.** The graph is INVERTED once, when it is first read
   (`EdgeGraph::open` -> `edges::invert`: the search's arc phase, and every
-  diagnostic that reads edges), frame by frame, every thread on a frame.
+  diagnostic that reads edges), 4 frames at a time.
   Per frame the workers' tables merge into the frame's
   (`edges/xfer/f{frame}.bin`, sorted by value: a function of the frame, not
   the scheduling), and each layer's records are range-partitioned by target,
