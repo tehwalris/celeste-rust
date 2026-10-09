@@ -47,9 +47,9 @@ pub fn fold(g: &Graph, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph, 
 }
 
 /// Every input cell at its weakest value - a bool cell unknown, a number
-/// cell the full range or, when `ranges` bounds it, that range.
+/// cell the full range (a bounded input's range is its `Op::Restrict`'s).
 /// The kind is the graph's (`Graph::cell_kind`, recorded at `symbolize`).
-pub(crate) fn seed_cells(g: &Graph, ranges: &HashMap<u32, (i32, i32)>) -> HashMap<u32, Val> {
+pub(crate) fn seed_cells(g: &Graph) -> HashMap<u32, Val> {
     let full = Val::Num(Pico8NumInterval::new(
         Pico8Num::from_raw(i32::MIN),
         Pico8Num::from_raw(i32::MAX),
@@ -57,13 +57,7 @@ pub(crate) fn seed_cells(g: &Graph, ranges: &HashMap<u32, (i32, i32)>) -> HashMa
     let mut cells: HashMap<u32, Val> = HashMap::new();
     for id in 0..g.len() {
         if let Op::Cell(c) = g.get(id as NodeId).op {
-            let v = if g.cell_kind(c) == super::graph::CellKind::Bool {
-                Val::Bool(None)
-            } else if let Some((lo, hi)) = ranges.get(&c) {
-                Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(*lo), Pico8Num::from_raw(*hi)))
-            } else {
-                full
-            };
+            let v = if g.cell_kind(c) == super::graph::CellKind::Bool { Val::Bool(None) } else { full };
             cells.insert(c, v);
         }
     }
@@ -81,7 +75,7 @@ pub fn fold_into(
     out: &mut Graph,
 ) -> Result<(Vec<NodeId>, Stats)> {
     let need = super::bdd::reachable(g, roots);
-    let cells = seed_cells(g, &HashMap::new());
+    let cells = seed_cells(g);
     let vals = match room {
         Some(r) => g.eval_lenient_in(&cells, r)?,
         None => g.eval_lenient(&cells)?,

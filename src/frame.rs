@@ -3194,6 +3194,67 @@ mod tests {
         assert!(!runs(&with(ids.f_rem, ids.f_x, half)), "a remainder of 0.5 declines");
     }
 
+    /// A PLATFORMS-UNKNOWN KERNEL CHECKS ITS PLATFORMS: a lane whose platform
+    /// `x` reaches past the path, whose `rem.x` lies outside the literal the
+    /// kernel reads in its place, or whose `spd.x` lies outside its range over
+    /// the worlds DECLINES. Before `x` was a restriction it was a seeded range
+    /// (`Symbolic::ranges`, gone), checked nowhere, and `rem.x` was not read:
+    /// such a lane was computed silently wrong.
+    #[test]
+    fn a_lane_outside_its_platform_bounds_declines() {
+        use crate::abstraction::{set_level, Level};
+        std::env::set_var("CELESTE_START_ROOM", "2,1");
+        let level = Level::parse("r0sxhnp").expect("level");
+        set_level(level);
+        let _kernels = crate::compiled::FrameEngine::new_for_start_room().expect("kernels");
+        let mut reference = RefEngine::new().expect("ref engine");
+        let mut row = reference.initial().expect("initial state");
+        let ids = crate::compiled::ids();
+        let mut after = 0;
+        while after < 3 {
+            row = reference.step_one(&row, 0).expect("frame").into_rt2();
+            if !row.player_objects(ids).is_empty() {
+                after += 1;
+            }
+        }
+        widen_rt2_to(&mut row, level);
+        let platform = *row.objects_of_type(ids, ids.g_platform).first().expect("a moving platform");
+        let sub = |rt2: &Rt2, f: u32, axis: u32| -> usize {
+            let pc = rt2.obj_field_cell(platform, f).expect("the platform's table field");
+            let Col::U(AV::Ptr(t)) = rt2.cols[pc as usize] else { panic!("the platform's field is not a table") };
+            rt2.obj_field_cell(t, axis).expect("its axis") as usize
+        };
+        let x = row.obj_field_cell(platform, ids.f_x).expect("the platform's x") as usize;
+        let (rem, spd) = (sub(&row, ids.f_rem, ids.f_x), sub(&row, ids.f_spd, ids.f_x));
+        // `row` with one cell set; an interval column stays one.
+        let with = |c: usize, lo: P8, hi: P8| -> Rt2 {
+            let mut r = row.clone_block();
+            r.cols[c] = match r.cols[c] {
+                Col::U(AV::Ival(..)) | Col::I(_) => Col::U(AV::Ival(lo, hi)),
+                _ => {
+                    assert_eq!(lo, hi, "a number column holds a point");
+                    Col::U(AV::Num(lo))
+                }
+            };
+            r
+        };
+        let runs = |r: &Rt2| -> bool {
+            let cells = crate::search::pos_graph::block_cells(r).expect("cells");
+            let mut sink = ForwardSink::empty(false);
+            crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
+        };
+        let px = |n: i16| P8::from_i16(n);
+        let (path_lo, path_hi) = (px(celeste_engine::runtime2::PLATFORM_PATH.0), px(celeste_engine::runtime2::PLATFORM_PATH.1));
+        let half = P8::from_parts(0, 0x8000);
+        let Col::U(AV::Num(speed)) = row.cols[spd] else { panic!("the platform's spd.x is not a number") };
+        assert!(runs(&row), "the lane as played runs");
+        assert!(runs(&with(x, path_lo, path_hi)), "x over the whole path runs");
+        assert!(!runs(&with(x, path_lo, path_hi + P8::from_raw(1))), "x past the path declines");
+        assert!(!runs(&with(x, path_lo - px(1), path_hi)), "x before the path declines");
+        assert!(!runs(&with(rem, -half, half)), "a remainder reaching 0.5 declines");
+        assert!(!runs(&with(spd, speed + px(1), speed + px(1))), "spd.x past its worlds' range declines");
+    }
+
     /// Room (1,3)'s 127-frame EXIT FRAME: the kernels make the concrete exit's
     /// state, KEY included. Guards a number and its point interval keying alike.
     #[test]

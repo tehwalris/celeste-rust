@@ -193,7 +193,10 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   and is bound as symbolic identity at the input (checked on every traced
   output: the output `last` is the output `x`'s node); the carry `(b + c) - b
   = c` cancels exactly in the tracer's subtraction; the wrap keeps x inside
-  the path (proved on the traced select, else a per-lane error).
+  the path (proved on the traced select, else a per-lane error). At the
+  input `x` is `Restrict`ed to the path and `spd.x` to its worlds' range;
+  the literal read for `rem.x` owes the lane's value inside it (per-lane
+  errors, plans/architecture.md "A bound is a node").
 - **Why**: an exact platform is a frame counter in every state - nothing merges
   across frames (room (6,0) level 0 x1.4 a frame, 81M states at f50).
 - **The points**: the platforms are a function of one number (frames since

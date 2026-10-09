@@ -498,8 +498,11 @@ pub fn platform_paths<D: Domain>(st: &State<D>) -> PlatformPaths {
 /// `rem.x` the literal whole remainder (a literal's floor rejoins as
 /// fragments; the price is a pixel of slack at this level). The `x` cells are
 /// recorded so the split decides player-vs-platform comparisons per PLATFORM
-/// WORLD, keeping platforms mutually consistent. Each unpinned `spd.x` gets
-/// its range over the worlds; returned as per-lane obligations, never assumed.
+/// WORLD, keeping platforms mutually consistent. `x` is read through its
+/// restriction to the path and each unpinned `spd.x` through its range over
+/// the worlds (`Op::Restrict`: the range analyses read the range off the
+/// node, its own error checks the raw cell). Returned: per-lane obligations
+/// (the no-player speed; `rem.x` inside the literal that replaces it).
 pub fn platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<crate::transpile::graph::NodeId>> {
     let worlds = d.worlds.clone().ok_or_else(|| anyhow::anyhow!("the platforms are unknown but there is no world table"))?;
     let platforms = objects_of_type(st, "platform");
@@ -546,19 +549,20 @@ pub fn platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec
             if matches!(d.graph.get(sv).op, Op::Cell(_)) {
                 let lo = worlds.iter().map(|w| w[j][3]).min().expect("a world");
                 let hi = worlds.iter().map(|w| w[j][3]).max().expect("a world");
-                d.ranges.insert(sv, (lo as i64, hi as i64));
-                let (klo, khi) = (d.graph.leaf(Op::Const(lo, lo)), d.graph.leaf(Op::Const(hi, hi)));
-                let (vlo, vhi) = (d.graph.fold(Op::Lo, vec![sv]), d.graph.fold(Op::Hi, vec![sv]));
-                let a = d.graph.fold(Op::Ge, vec![vlo, klo]);
-                let b = d.graph.fold(Op::Le, vec![vhi, khi]);
-                obligations.push(d.graph.fold(Op::And, vec![a, b]));
+                let r = d.restrict(sv, lo, hi);
+                iface::set(st, &spd, Value::Num(r))?;
             }
         }
         let (x, last, rem) = (field(obj, &["x"]), field(obj, &["last"]), field(obj, &["rem", "x"]));
         let Some(Value::Num(xv)) = iface::get(st, &x) else { bail!("{}: not a number", iface::show(&x)) };
         anyhow::ensure!(matches!(d.graph.get(xv).op, Op::Cell(_)), "a platform's `x` must be an input cell");
-        d.ranges.insert(xv, ((PLATFORM_PATH.0 as i64) << 16, (PLATFORM_PATH.1 as i64) << 16));
-        iface::set(st, &last, Value::Num(xv))?;
+        let xr = d.restrict(xv, (PLATFORM_PATH.0 as i32) << 16, (PLATFORM_PATH.1 as i32) << 16);
+        iface::set(st, &x, Value::Num(xr))?;
+        iface::set(st, &last, Value::Num(xr))?;
+        // `rem.x` is replaced by the literal whole remainder: sound for a
+        // lane whose own lies inside, which is owed.
+        let Some(Value::Num(rv)) = iface::get(st, &rem) else { bail!("{}: not a number", iface::show(&rem)) };
+        obligations.extend(contain(d, rv, (PLATFORM_REM.0 as i64, PLATFORM_REM.1 as i64)));
         let r = d.graph.leaf(Op::Const(PLATFORM_REM.0, PLATFORM_REM.1));
         iface::set(st, &rem, Value::Num(r))?;
         cells[j] = Some(xv);
@@ -680,8 +684,8 @@ fn comparison_facts(d: &Symbolic, c: crate::transpile::graph::NodeId) -> Option<
     Some((x, yes, no))
 }
 
-/// A static raw range of `n` (literals, a platform's input `x`, a bounded
-/// input, sums and differences), narrowed by the enclosing branches; `None` otherwise.
+/// A static raw range of `n` (literals, a bounded input - a platform's
+/// `x` among them -, sums and differences), narrowed by the enclosing branches; `None` otherwise.
 fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::transpile::graph::NodeId, i64, i64)]) -> Option<(i64, i64)> {
     let node = d.graph.get(n);
     let structural = || -> Option<(i64, i64)> {
@@ -705,7 +709,6 @@ fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::tra
                 let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
                 (a.0 - b.1, a.1 - b.0)
             }
-            Op::Cell(_) if d.ranges.contains_key(&n) => d.ranges[&n],
             // A bounded input (`Op::Restrict`; as `graph::pieces_of`).
             Op::Restrict(lo, hi) => {
                 let (lo, hi) = (lo as i64, hi as i64);
@@ -765,17 +768,21 @@ pub fn fly_fruit_paths<D: Domain>(st: &State<D>) -> FlyFruitPaths {
 }
 
 /// The fly fruit's INPUT side at a fruit-unknown level: `step`/`y` unknown,
-/// `spd.y`/`rem.y` their ranges as literals, `fly` an undecided atom. A
-/// decided input lies inside, so no premise.
-pub fn fork_fruit_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+/// `spd.y`/`rem.y` their ranges as literals, `fly` an undecided atom. The
+/// literal stands for the lane's value only where that lies inside: returned
+/// as per-lane obligations on the raw input (the stored rows hold the
+/// literal itself, but nothing else made the start state's values checked).
+pub fn fork_fruit_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<crate::transpile::graph::NodeId>> {
     let fp = fly_fruit_paths(st);
+    let mut obligations = Vec::new();
     for p in &fp.unknown {
         let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
         let u = d.unknown_num();
         iface::set(st, p, Value::Num(u))?;
     }
     for (p, (lo, hi)) in &fp.ranges {
-        let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
+        let Some(Value::Num(v)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
+        obligations.extend(contain(d, v, (*lo as i64, *hi as i64)));
         let r = d.graph.leaf(Op::Const(*lo, *hi));
         iface::set(st, p, Value::Num(r))?;
     }
@@ -784,7 +791,7 @@ pub fn fork_fruit_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<(
         let b = d.unknown_bool_atom();
         iface::set(st, p, Value::Bool(b))?;
     }
-    Ok(())
+    Ok(obligations)
 }
 
 /// The fly fruit's OUTPUT side: as the input side. A range replaces only

@@ -1419,19 +1419,20 @@ mod tests {
     #[test]
     fn pieces_keep_a_select_as_a_union() {
         let mut g = Graph::new();
-        let s = g.leaf(Op::Cell(0));
+        let raw = g.leaf(Op::Cell(0));
+        let s = g.add(Op::Restrict(-(1 << 16), 1 << 16), vec![raw]);
         let five = g.leaf(Op::Const(5 << 16, 5 << 16));
         let cond = g.leaf(Op::Cell(1));
         let sel = g.add(Op::Sel, vec![cond, five, s]);
         let neg = g.add(Op::Neg, vec![sel]);
-        let seeds: HashMap<NodeId, (i64, i64)> = HashMap::from([(s, (-(1i64 << 16), 1i64 << 16))]);
         let mut memo = HashMap::new();
-        assert_eq!(pieces_of(&g, &seeds, &mut memo, sel), Some(vec![(-(1 << 16), 1 << 16), (5 << 16, 5 << 16)]));
-        assert_eq!(pieces_of(&g, &seeds, &mut memo, neg), Some(vec![(-(5 << 16), -(5 << 16)), (-(1 << 16), 1 << 16)]));
-        // An unseeded cell is unknown, and so is anything over it.
+        assert_eq!(pieces_of(&g, &mut memo, sel), Some(vec![(-(1 << 16), 1 << 16), (5 << 16, 5 << 16)]));
+        assert_eq!(pieces_of(&g, &mut memo, neg), Some(vec![(-(5 << 16), -(5 << 16)), (-(1 << 16), 1 << 16)]));
+        // A cell is unknown, and so is anything over it.
         let other = g.leaf(Op::Cell(2));
         let sum = g.add(Op::Add, vec![s, other]);
-        assert_eq!(pieces_of(&g, &seeds, &mut memo, sum), None);
+        assert_eq!(pieces_of(&g, &mut memo, sum), None);
+        assert_eq!(pieces_of(&g, &mut memo, raw), None);
     }
 
     /// `Lo`/`Hi` of a hull are not points, so nothing may decide a comparison
@@ -1447,10 +1448,9 @@ mod tests {
         let vals = g.eval_lenient(&HashMap::from([(0u32, hull)])).expect("eval");
         assert_eq!(vals[hi as usize], hull, "Hi of a hull is the hull");
         assert_eq!(vals[le as usize], Val::Bool(None), "a lane [0, 0.5] has Hi <= 1, a lane [2, 3] does not");
-        let seeds: HashMap<NodeId, (i64, i64)> = HashMap::from([(v, (0, 3 << 16))]);
-        assert_eq!(pieces_of(&g, &seeds, &mut HashMap::new(), hi), Some(vec![(0, 3 << 16)]));
         let r = g.add(Op::Restrict(0, 3 << 16), vec![v]);
         let hi_r = g.add(Op::Hi, vec![r]);
+        assert_eq!(pieces_of(&g, &mut HashMap::new(), hi_r), Some(vec![(0, 3 << 16)]));
         let le_r = g.add(Op::Le, vec![hi_r, one]);
         let (out, map, _) = crate::transpile::ival::fold(&g, &[le_r], None).expect("fold");
         assert_eq!(out.get(map[le_r as usize]).op, Op::Le, "the fold leaves it to the lanes");
@@ -1485,14 +1485,13 @@ pub fn normalize_pieces(mut v: Pieces) -> Option<Pieces> {
 }
 
 /// The static range of `n` (raw 16.16) as PIECES, from `Op::Restrict` nodes
-/// and seeded input cells through the arithmetic; a select on a non-constant
-/// condition is the union of its arms (the dash's ±5 beside a run speed
-/// under 1). `None` is unknown, never wrong; a restriction's own error, and
-/// the runtime guard on a seed, make it a fact. `memo` is valid for one
-/// graph and seed set.
+/// through the arithmetic; a select on a non-constant condition is the union
+/// of its arms (the dash's ±5 beside a run speed under 1). `None` is unknown,
+/// never wrong; a restriction's own error makes it a fact. An input cell has
+/// no range: nothing is assumed that no node checks. `memo` is valid for one
+/// graph.
 pub fn pieces_of(
     g: &Graph,
-    seeds: &HashMap<NodeId, (i64, i64)>,
     memo: &mut HashMap<NodeId, Option<Pieces>>,
     n: NodeId,
 ) -> Option<Pieces> {
@@ -1509,10 +1508,9 @@ pub fn pieces_of(
     };
     let raw = |p: Pico8Num| p.as_raw_u32() as i32 as i64;
     let p8 = |v: i64| Pico8Num::from_raw(v as i32);
-    let rec = |memo: &mut HashMap<NodeId, Option<Pieces>>, k: usize| pieces_of(g, seeds, memo, args[k]);
+    let rec = |memo: &mut HashMap<NodeId, Option<Pieces>>, k: usize| pieces_of(g, memo, args[k]);
     let r: Option<Pieces> = match op {
         Op::Const(lo, hi) => Some(vec![(lo as i64, hi as i64)]),
-        Op::Cell(_) => seeds.get(&n).map(|r| vec![*r]),
         // The assumed range (as `eval`): its own error makes it a fact.
         Op::Restrict(lo, hi) => {
             let (lo, hi) = (lo as i64, hi as i64);
@@ -1598,7 +1596,7 @@ pub fn pieces_of(
             let low = matches!(op, Op::Lo);
             let arg = g.get(args[0]).clone();
             match arg.op {
-                Op::Span => pieces_of(g, seeds, memo, arg.args[if low { 0 } else { 1 }]),
+                Op::Span => pieces_of(g, memo, arg.args[if low { 0 } else { 1 }]),
                 Op::Const(l, h) => {
                     let v = if low { l } else { h } as i64;
                     Some(vec![(v, v)])

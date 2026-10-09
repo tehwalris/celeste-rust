@@ -240,7 +240,9 @@ pub fn trace_frame<'a>(
     }
     // The fly fruit's widened fields replaced before any read.
     if it.d.fruit_unknown {
-        super::widen::fork_fruit_inputs(&mut st, &mut it.d)?;
+        for ob in super::widen::fork_fruit_inputs(&mut st, &mut it.d)? {
+            admissible = it.d.graph.fold(crate::transpile::graph::Op::And, vec![admissible, ob]);
+        }
     }
     // Near floors: `collideable` derived from `state`, except mid split frame
     // (read as stored, an unknown one forked).
@@ -714,7 +716,7 @@ impl Points {
 
     /// Where `c` can come out true, and where false.
     fn answers(&mut self, d: &Symbolic, room: Option<&crate::transpile::graph::Room>, c: NodeId) -> (PointSet, PointSet) {
-        use crate::transpile::graph::{Op, Val};
+        use crate::transpile::graph::Val;
         use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
         if let Some(hit) = self.memo.get(&c) {
             return hit.clone();
@@ -723,17 +725,14 @@ impl Points {
         let nodes = cone(&d.graph, &[c]);
         let mut g = d.graph.like();
         let mut map: rustc_hash::FxHashMap<NodeId, NodeId> = Default::default();
-        let mut ranges: std::collections::HashMap<u32, (i32, i32)> = Default::default();
         for &n in &nodes {
             let node = d.graph.get(n);
             let args = node.args.iter().map(|a| map[a]).collect();
             map.insert(n, g.add(node.op.clone(), args));
-            if let (Op::Cell(k), Some(r)) = (&node.op, d.ranges.get(&n)) {
-                ranges.insert(*k, (r.0 as i32, r.1 as i32));
-            }
         }
         let root = map[&c] as usize;
-        let base = crate::transpile::ival::seed_cells(&g, &ranges);
+        // Every cell at its weakest; a bounded input narrows at its `Restrict`.
+        let base = crate::transpile::ival::seed_cells(&g);
         let exact = |v: i32| Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(v), Pico8Num::from_raw(v)));
         let eval = |cells: &std::collections::HashMap<u32, Val>| -> Option<bool> {
             let v = match room {
