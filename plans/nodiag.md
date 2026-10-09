@@ -129,6 +129,11 @@ solved in any% only with the split frame. What blocked them, and what changed:
   independently, past 8,192 paths per stored row at ~20 two-way forks
   deep, each path a full state. A fix needs a different probe (e.g.
   concrete members of the row), not a bigger cap.
+  2026-10-09: `arc-check` now steps at the level (`RefEngine::step_at`)
+  with two exact pins (plans/abstractions.md, `f`): the fly fruit's motion
+  and the floors isolated from the player. Room (3,0) 100% `r0sxhfn` runs;
+  the balloons' and springs' widened phases still fork per straddling
+  comparison (room (7,0) not re-measured).
 
 ## The three rooms that failed on size (2026-10-08, branch `nodiag-big`; all three solved since)
 

@@ -345,8 +345,12 @@ remainder; every backward reads the records and re-runs no kernel
   function of the graph). Iteration i marks exactly the states that win by H
   from frame i but not i+1 - with SOME remainder: i is the state's DEADLINE.
 - **Checks.** `rewrite arc-check` (every record has a transfer; sampled
-  transfers probed with the reference engine inside and outside their
-  guards). The kernel re-run backward that was the BFS's oracle
+  transfers probed with the reference engine at the tree's level -
+  `RefEngine::step_at`, the row's unknowns forked as the kernels fork them -
+  inside and outside their guards: inside, some input reaches the target
+  with the predicted remainder and every one that reaches it lands where a
+  record of the pair taking the point predicts; outside, none reaches it.
+  `--fault action|guard` corrupts every transfer first, to see it fail). The kernel re-run backward that was the BFS's oracle
   (`bench-backward --diff`, which found every graph bug of 2026-09) is gone
   with the ladder (2026-10-05); the arc gate pins the BFS's marks.
 

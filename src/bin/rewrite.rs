@@ -214,10 +214,13 @@ enum Command {
     },
     /// DIAGNOSTIC: the TRANSFERS of a level-0 tree's edges, checked. Every
     /// recorded edge carries a transfer; then `--samples` records per frame,
-    /// the source row stepped by the REFERENCE engine (all 64 inputs): at
-    /// remainders INSIDE the guard some input must reach the target with the
-    /// predicted remainder, and at points no record of that (pred, target)
-    /// covers none may. Fails (exit != 0) on any disagreement.
+    /// the source row stepped by the REFERENCE engine at the level (all 64
+    /// inputs, the row's unknowns forked as the kernels fork them:
+    /// `RefEngine::step_at`): at remainders INSIDE the guard some input must
+    /// reach the target with the predicted remainder and every one that
+    /// reaches it must land where some record of that (pred, target) taking
+    /// the point predicts, and at points no record of the pair covers none
+    /// may. Fails (exit != 0) on any disagreement.
     ArcCheck {
         #[arg(long)]
         level_dir: String,
@@ -235,6 +238,11 @@ enum Command {
         /// The tree's level (what a successor is projected onto).
         #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
         level: Level,
+        /// Check the CHECK: corrupt every decoded transfer in memory first
+        /// (`action`: the x action moved by one point; `guard`: the x guard's
+        /// lowest point dropped), which must make it fail.
+        #[arg(long)]
+        fault: Option<String>,
     },
     /// DIAGNOSTIC: how coarse a level could be. Per frame, the distinct
     /// states of a tree with the named cells (`inspect::cell_names`) whose
@@ -1041,7 +1049,7 @@ fn main() -> Result<()> {
                 states_in[3]
             );
         }
-        Command::ArcCheck { level_dir, room, win_at, from, to, samples, level } => {
+        Command::ArcCheck { level_dir, room, win_at, from, to, samples, level, fault } => {
             use celeste_engine::runtime2::{Col, AV};
             use celeste_rust::search::arcs::{point, Rect, Rects, Set, CIRCLE};
             std::env::set_var("CELESTE_START_ROOM", &room);
@@ -1062,14 +1070,25 @@ fn main() -> Result<()> {
             type Succ = ((u64, (u64, u64), u32), Option<(u32, u32)>);
             let steps = std::cell::Cell::new(0u64);
             let mut successors = |row: &Block, rem: (u32, u32)| -> Result<Vec<Succ>> {
+                // As the kernels read it: projected onto the level (the start
+                // row is stored exact), then the probe's remainder.
                 let mut rt2 = row.rt2().clone_block();
+                widen_rt2_to(&mut rt2, level);
                 if let Some((cx, cy)) = rem_cells(&rt2) {
                     rt2.cols[cx] = Col::U(AV::Num(celeste_rust::pico8_num::Pico8Num::from_raw(rem.0 as i32 - 32768)));
                     rt2.cols[cy] = Col::U(AV::Num(celeste_rust::pico8_num::Pico8Num::from_raw(rem.1 as i32 - 32768)));
                 }
                 let mut out = Vec::new();
+                // An input that agrees with one already run on the buttons it
+                // read makes the same successors (`RefEngine::step_reads`).
+                let mut ran: Vec<(u8, u8)> = Vec::new();
                 for b in 0..64u8 {
-                    for blk in eng.step(&rt2, b)? {
+                    if ran.iter().any(|(r, m)| (r ^ b) & m == 0) {
+                        continue;
+                    }
+                    let (blocks, read) = eng.step_at(&rt2, b, level)?;
+                    ran.push((b, read));
+                    for blk in blocks {
                         steps.set(steps.get() + 1);
                         let q = match rem_cells(blk.rt2()) {
                             Some((cx, cy)) => {
@@ -1091,6 +1110,23 @@ fn main() -> Result<()> {
             };
             let (mut missing_total, mut records_total) = (0u64, 0u64);
             let (mut inside, mut inside_bad, mut outside, mut outside_bad, mut no_player) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut unpredicted = 0u64;
+            // The injected fault (`--fault`), on one decoded x transfer.
+            let corrupt = |mut t: celeste_rust::search::arcs::Transfer| -> Result<celeste_rust::search::arcs::Transfer> {
+                use celeste_rust::search::arcs::Action;
+                match fault.as_deref() {
+                    None => {}
+                    Some("action") => {
+                        t.action = match t.action {
+                            Action::Rotate(v) => Action::Rotate(v + 1),
+                            Action::Const(c) => Action::Const((c + 1) % CIRCLE),
+                        }
+                    }
+                    Some("guard") => t.guard.lo = (t.guard.lo + 1).min(t.guard.hi - 1),
+                    Some(other) => anyhow::bail!("--fault {other}: `action` or `guard`"),
+                }
+                Ok(t)
+            };
             let (mut sampled, mut kinds) = (0u64, std::collections::BTreeMap::<String, u64>::new());
             let t0 = std::time::Instant::now();
             /// A record with its transfer decoded.
@@ -1107,8 +1143,9 @@ fn main() -> Result<()> {
                 missing_total += missing;
                 let recs: Vec<Rec> = all
                     .iter()
-                    .filter_map(|e| graph.pair(frame, e.xfer).map(|p| Rec { target: e.target, base: e.base, mask: e.mask, x: p.0.transfer(), y: p.1.transfer() }))
-                    .collect();
+                    .filter_map(|e| graph.pair(frame, e.xfer).map(|p| (e, p)))
+                    .map(|(e, p)| Ok(Rec { target: e.target, base: e.base, mask: e.mask, x: corrupt(p.0.transfer())?, y: p.1.transfer() }))
+                    .collect::<Result<_>>()?;
                 records_total += recs.len() as u64;
                 for r in &recs {
                     for (axis, t) in [("x", &r.x), ("y", &r.y)] {
@@ -1126,9 +1163,10 @@ fn main() -> Result<()> {
                     let (tshape, tkeys, tcells) = widened_keys(&tgt_row, level)?;
                     let target = (tshape, tkeys[0], tcells[0]);
                     let (gx, gy) = (r.x.guard, r.y.guard);
-                    // Every guard of this (pred, target), as rectangles.
+                    // Every record of this (pred, target), and its guards as rectangles.
+                    let pair: Vec<&Rec> = recs.iter().filter(|q| q.target == r.target && src >= q.base && src < q.base + 64 && q.mask >> (src - q.base) & 1 == 1).collect();
                     let mut union = Rects::empty();
-                    for q in recs.iter().filter(|q| q.target == r.target && src >= q.base && src < q.base + 64 && q.mask >> (src - q.base) & 1 == 1) {
+                    for q in &pair {
                         union.add(Rect { x: q.x.guard_set(), y: q.y.guard_set() });
                     }
                     let has_player = rem_cells(src_row.rt2()).is_some();
@@ -1152,6 +1190,21 @@ fn main() -> Result<()> {
                                     None => true,
                                 }
                         });
+                        // Every successor on the target lands where a record
+                        // of the pair that takes `p` predicts.
+                        let predicted = |q: &(u32, u32)| {
+                            pair.iter().any(|o| {
+                                o.x.takes(p.0)
+                                    && o.y.takes(p.1)
+                                    && o.x.action.image(&Set::point(p.0)).contains(q.0)
+                                    && o.y.action.image(&Set::point(p.1)).contains(q.1)
+                            })
+                        };
+                        let stray: Vec<(u32, u32)> = succs.iter().filter(|(id, _)| *id == target).filter_map(|(_, q)| *q).filter(|q| !predicted(q)).collect();
+                        if !stray.is_empty() {
+                            unpredicted += 1;
+                            eprintln!("[arc-check] f{frame} pred {src:#x} -> {:#x}: inside {p:?} the reference reaches the target at {stray:?}, which no record of the pair taking the point predicts", r.target);
+                        }
                         if !ok {
                             inside_bad += 1;
                             let reached: Vec<&Option<(u32, u32)>> = succs.iter().filter(|(id, _)| *id == target).map(|(_, q)| q).collect();
@@ -1178,7 +1231,7 @@ fn main() -> Result<()> {
                     }
                 }
                 eprintln!(
-                    "[arc-check] f{frame:03}: {} records, {missing} without a transfer; so far inside {inside} ({inside_bad} bad), outside {outside} ({outside_bad} bad), {} ref steps, {:.1} s",
+                    "[arc-check] f{frame:03}: {} records, {missing} without a transfer; so far inside {inside} ({inside_bad} bad, {unpredicted} unpredicted), outside {outside} ({outside_bad} bad), {} ref steps, {:.1} s",
                     recs.len(),
                     steps.get(),
                     t0.elapsed().as_secs_f64()
@@ -1187,10 +1240,10 @@ fn main() -> Result<()> {
             println!("arc-check f{from}-f{to}: {records_total} records; transfers per axis {kinds:?}");
             println!("completeness: {missing_total} recorded edges without a transfer");
             println!(
-                "agreement: {sampled} sampled records ({no_player} from a row without a player); inside the guard {inside} probes, {inside_bad} disagree; outside every guard {outside} probes, {outside_bad} reach the target; {} reference steps",
+                "agreement: {sampled} sampled records ({no_player} from a row without a player); inside the guard {inside} probes, {inside_bad} disagree, {unpredicted} reach the target unpredicted; outside every guard {outside} probes, {outside_bad} reach the target; {} reference steps",
                 steps.get()
             );
-            anyhow::ensure!(missing_total == 0 && inside_bad == 0 && outside_bad == 0, "arc-check: disagreement");
+            anyhow::ensure!(missing_total == 0 && inside_bad == 0 && unpredicted == 0 && outside_bad == 0, "arc-check: disagreement");
         }
         Command::CoarseCensus { level_dir, from, to, erase } => {
             let erase = prefixes(&erase);
