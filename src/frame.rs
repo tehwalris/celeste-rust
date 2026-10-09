@@ -1711,7 +1711,8 @@ pub fn forward_frame(
         let _ = m.table();
     }
     if t_warm.elapsed().as_secs_f64() > 0.5 {
-        eprintln!("[fwd] f{frame}: engine and level -1 table built in {:.1} s, before the wave", t_warm.elapsed().as_secs_f64());
+        // Not `[fwd] f...`: log readers (`export-ui`) parse those as frames.
+        eprintln!("[warm] f{frame}: engine and level -1 table built in {:.1} s, before the wave", t_warm.elapsed().as_secs_f64());
     }
     let mut st = FrameStats::default();
     let workers = threads();

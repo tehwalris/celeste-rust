@@ -208,6 +208,13 @@ fn after<'a>(toks: &[&'a str], key: &str, nth: usize) -> Result<&'a str> {
     bail!("no token {key:?} (#{nth}) in line")
 }
 
+/// A frame's `[fwd] fNNN in ...` line, not another `[fwd] f...` line (the
+/// binaries of 2026-10-09 38ea337..6c3c1bd wrote `[fwd] f1: engine and
+/// level -1 table built ...`, now `[warm]`).
+fn is_frame_line(line: &str) -> bool {
+    line.strip_prefix("[fwd] f").and_then(|r| r.split_once(' ')).is_some_and(|(f, rest)| f.bytes().all(|b| b.is_ascii_digit()) && rest.starts_with("in "))
+}
+
 fn parse_fwd(line: &str) -> Result<FwdLine> {
     let t: Vec<&str> = line.split_whitespace().collect();
     let (ib, il) = after(&t, "in", 0)?.split_once('/').context("in b/l")?;
@@ -274,7 +281,7 @@ pub fn parse_log(text: &str) -> Result<(Vec<LevelRun>, u32, Option<f64>, Option<
         let ctx = || format!("log line {}: {line}", ln + 1);
         if line.starts_with("[fwd] first win at f") {
             first_win = Some(num(line.rsplit(' ').next().unwrap_or("")).with_context(ctx)?);
-        } else if line.starts_with("[fwd] f") {
+        } else if is_frame_line(line) {
             fwd.push(parse_fwd(line).with_context(ctx)?);
         } else if let Some(rest) = line.strip_prefix("[search] level ") {
             let t: Vec<&str> = rest.split_whitespace().collect();
@@ -1018,6 +1025,21 @@ mod tests {
         assert_eq!(by_cell_dist[0], vec![(3, 0, 2), (4, 0, 1)]);
         assert_eq!(by_cell_dist[1], vec![(3, 1, 1), (3, 2, 1)], "sorted by (dist, cell)");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Only `[fwd] fNNN in ...` lines are frames: the warm line some
+    /// binaries wrote as `[fwd] f1: ...` is skipped, not an error.
+    #[test]
+    fn a_log_reads_only_frame_lines_as_frames() {
+        let log = "[search] room 1,0, levels r0sx, horizon 3\n\
+[fwd] f1: engine and level -1 table built in 3.8 s, before the wave\n\
+[fwd] f001 in 1/1 raw 3 kept 2 out 1/2 visited 3 | wave 1 (idle 0%) door 0 edges 0 ckpt 0 pos 0 total 1 ms | flushes 1 (3 rows avg) edges 0 | in 0.00 queues 0.00 door 0.00 GB rss start 0.10 wave 0.10 end 0.10 peak 0.10 GB (anon; file 0.00)\n\
+[fwd] first win at f1\n\
+[search] level 0 (r0sx): forward to f3 in 0.1 s; first win Some(1)\n";
+        let (levels, ..) = parse_log(log).unwrap();
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].fwd.len(), 1, "one frame line; the warm line skipped");
+        assert_eq!(levels[0].fwd[0].kept, 2);
     }
 
     /// The search's `witness.txt` and a labelled path file with dashes that
