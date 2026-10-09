@@ -331,6 +331,8 @@ pub fn prep_bits(dir: &str, door: &[u8]) {
     std::fs::write(format!("{pd}/pcnt.bin"), crate::as_bytes(&pcnt)).unwrap();
     std::fs::write(format!("{pd}/refid.bin"), crate::as_bytes(&refid)).unwrap();
     let sshape: Vec<u32> = (0..n_shards).map(|i| shard_sc[i].0 as u32).collect();
+    let scell: Vec<u32> = (0..n_shards).map(|i| shard_sc[i].1).collect();
+    std::fs::write(format!("{pd}/scell.bin"), crate::as_bytes(&scell)).unwrap();
     std::fs::write(format!("{pd}/sshape.bin"), crate::as_bytes(&sshape)).unwrap();
     eprintln!("[prepbits] wrote {pd}/qb.bin, db.bin, pcnt.bin, refid.bin; {:.1} s", t.elapsed().as_secs_f64());
 }
@@ -682,6 +684,18 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     let dsh: &[u32] = crate::from_bytes(&sm); let db: &[(u32, u32)] = crate::from_bytes(&dsm); let sshape: &[u32] = crate::from_bytes(&shm);
     let n_src: usize = std::fs::read_to_string(format!("{pd}/nsrc.txt")).unwrap().trim().parse().unwrap();
     let n_shards = sshape.len();
+    // posmask{R}: the directory per (shape, R x R region) on (high, spd.y), the mask over the region's cells.
+    let pr: i32 = mode.strip_prefix("posmask").map_or(0, |r| r.parse().unwrap());
+    let scm = map("scell.bin");
+    let scell: &[u32] = crate::from_bytes(&scm);
+    let mut gid: FxHashMap<(u32, i32, i32), u32> = FxHashMap::default();
+    let (grp, ppos): (Vec<u32>, Vec<u32>) = (0..n_shards).map(|s| {
+        if pr == 0 { return (s as u32, 0); }
+        let (x, y) = crate::structure::cell_xy(scell[s]);
+        let n = gid.len() as u32;
+        (*gid.entry((sshape[s], x.div_euclid(pr), y.div_euclid(pr))).or_insert(n), (x.rem_euclid(pr) + pr * y.rem_euclid(pr)) as u32)
+    }).unzip();
+    let n_groups = if pr == 0 { n_shards } else { gid.len() };
     // The packing's digits per shape (as prepbits built them).
     let f = Fields::open(dir);
     let mut by_shape: Vec<Vec<usize>> = vec![Vec::new(); f.shapes.len()];
@@ -705,6 +719,7 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
         match mode {
             "bitcell" => (high as u64, low as u64),
             "bitspd" => (spd * dar + da, fl),
+            _ if pr > 0 => (high as u64 * low_r[s] + low as u64, ppos[sh as usize] as u64),
             _ => (spd, fl * dar + da),
         }
     };
@@ -714,25 +729,28 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     let mut local: Vec<FxHashMap<u64, u32>> = vec![Default::default(); n_shards];
     let mut width: Vec<u64> = vec![0; n_shards];
     let mut keyed: FxHashMap<(u32, u32, u32), (u32, u32)> = FxHashMap::default(); // (shard, high, low) -> (hk, bit), memo
-    if mode == "bitspd" {
+    if pr > 0 {
+        for s in 0..n_shards { width[s] = (pr * pr) as u64; }
+    } else if mode == "bitspd" {
         for s in 0..n_shards { let sp = sshape[s] as usize; width[s] = roles[sp].iter().filter(|x| x.1 == 0).map(|x| x.0).product(); }
     } else {
         for (sh, h, l) in all() { let (_, m) = split(sh, h, l); let d = &mut local[sh as usize]; let n = d.len() as u32; d.entry(m).or_insert(n); }
         for s in 0..n_shards { width[s] = local[s].len().max(1) as u64; }
     }
     let words: Vec<u64> = width.iter().map(|w| w.div_ceil(64)).collect();
-    let mut pre: Vec<FxHashSet<u32>> = vec![Default::default(); n_shards];
+    let mut pre: Vec<FxHashSet<u32>> = vec![Default::default(); n_groups];
     let mut key_of = |sh: u32, h: u32, l: u32| -> (u32, u32) {
         *keyed.entry((sh, h, l)).or_insert_with(|| {
             let (k, m) = split(sh, h, l);
-            let m = if mode == "bitspd" { m } else { local[sh as usize][&m] as u64 };
+            let m = if mode == "bitspd" || pr > 0 { m } else { local[sh as usize][&m] as u64 };
             let hk = k * words[sh as usize] + (m >> 6) + 1;
             assert!(hk < u32::MAX as u64);
             (hk as u32, (m & 63) as u32)
         })
     };
     let dq: Vec<(u32, u32)> = (0..n_door).map(|i| key_of(dsh[i], db[i].0, db[i].1)).collect();
-    let qw: Vec<QB> = qs.iter().map(|q| { let (hk, b) = key_of(q.shard, q.high, q.low); QB { shard: q.shard, src: q.src, xfer: q.xfer, low: b, high: hk, _p: [0; 3] } }).collect();
+    let qw: Vec<QB> = qs.iter().map(|q| { let (hk, b) = key_of(q.shard, q.high, q.low); QB { shard: grp[q.shard as usize], src: q.src, xfer: q.xfer, low: b, high: hk, _p: [0; 3] } }).collect();
+    let dsh: Vec<u32> = dsh.iter().map(|&s| grp[s as usize]).collect();
     drop(keyed);
     for (i, &(hk, _)) in dq.iter().enumerate() { pre[dsh[i] as usize].insert(hk); }
     let n_old = pre.iter().map(|p| p.len()).sum::<usize>();
@@ -743,7 +761,7 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     let mut load = 0.5;
     let cap_of = |c: u64, load: f64| ((c.max(1) as f64 / load).ceil() as u64).next_power_of_two();
     if pcnt.iter().map(|&c| cap_of(c, load)).sum::<u64>() * 64 >= 1 << 32 { load = 0.8; }
-    let mut off: Vec<(u32, u32)> = Vec::with_capacity(n_shards);
+    let mut off: Vec<(u32, u32)> = Vec::with_capacity(n_groups);
     let mut total = 0u64;
     for &c in &pcnt { let cap = cap_of(c, load); off.push((total as u32, (cap - 1) as u32)); total += cap; }
     assert!(total * 64 < 1 << 32, "ids slot << 6 | bit must fit 32 bits");
@@ -751,6 +769,7 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     #[derive(Clone, Copy)]
     struct W { hk: u32, bits: u64 }
     let mut tab: Vec<W> = vec![W { hk: 0, bits: 0 }; total as usize];
+    huge(&mut tab);
     macro_rules! probe { ($sh:expr, $hk:expr) => {{
         let (b, m) = off[$sh as usize];
         let mut s = slot_of($hk, (b, m));
@@ -761,9 +780,9 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
     for i in 0..n_door { let (hk, b) = dq[i]; let s = probe!(dsh[i], hk); let e = &mut tab[s as usize]; let w = e.bits; e.bits = w | 1 << b; old_ids.insert(s << 6 | b); }
     drop(dq);
     let mem = total as f64 * std::mem::size_of::<W>() as f64;
-    let wsum = |g: &dyn Fn(usize) -> u64| (0..n_shards).map(g).sum::<u64>();
-    eprintln!("[{mode}] setup {:.1} s (untimed): mask widths: {} shards, mean {:.1} bits (by entries); {n_old} entries at the frame start, {entries} at its end ({:.2} states each, mask fill {:.2}%); directory {} slots x {} B at load {load} = {:.2} GB",
-        t.elapsed().as_secs_f64(), n_shards, wsum(&|s| pcnt[s] * width[s].min(64)) as f64 / entries as f64, (n_door + 6_735_699) as f64 / entries as f64,
+    let wsum = |g: &dyn Fn(usize) -> u64| (0..n_groups).map(g).sum::<u64>();
+    eprintln!("[{mode}] setup {:.1} s (untimed): mask widths: {} directory groups, mean {:.1} bits (by entries); {n_old} entries at the frame start, {entries} at its end ({:.2} states each, mask fill {:.2}%); directory {} slots x {} B at load {load} = {:.2} GB",
+        t.elapsed().as_secs_f64(), n_groups, wsum(&|s| pcnt[s] * width[s].min(64)) as f64 / entries as f64, (n_door + 6_735_699) as f64 / entries as f64,
         100.0 * (n_door + 6_735_699) as f64 / wsum(&|s| pcnt[s] * 64) as f64, total, std::mem::size_of::<W>(), mem / 1e9);
     let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * crate::PAYLOAD);
     let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qw.len());
@@ -787,4 +806,76 @@ pub fn run_words(dir: &str, n_door: usize, mode: &str) {
         if nw == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qw.len() as f64, mem / 1e9);
     if std::env::var_os("BENCH_NOCHECK").is_some() { return; }
     check(mode, &pd, &edges, n_door, &|m| old_ids.contains(&m), false);
+}
+
+/// `bitintern`: `bits` with the 128-bit spd.y mask INTERNED - a directory
+/// entry is (high digits, id of a shared mask); the room's distinct masks
+/// (~80k at f57) sit in one small table, hash-consed on insert.
+pub fn run_intern(dir: &str, n_door: usize) {
+    let t = std::time::Instant::now();
+    let pd = format!("{dir}/prep");
+    let map = |f: &str| unsafe { memmap2::Mmap::map(&std::fs::File::open(format!("{pd}/{f}")).unwrap()).unwrap() };
+    let (qm, dm, pm, sm, dsm) = (map("qb.bin"), map("d.bin"), map("pcnt.bin"), map("dshard.bin"), map("db.bin"));
+    let qs: &[QB] = crate::from_bytes(&qm); let ds: &[u32] = crate::from_bytes(&dm); let pcnt: &[u64] = crate::from_bytes(&pm);
+    let dsh: &[u32] = crate::from_bytes(&sm); let db: &[(u32, u32)] = crate::from_bytes(&dsm);
+    let n_src: usize = std::fs::read_to_string(format!("{pd}/nsrc.txt")).unwrap().trim().parse().unwrap();
+    let mut off: Vec<(u32, u32)> = Vec::with_capacity(pcnt.len());
+    let mut total = 0u64;
+    for &c in pcnt { let cap = (2 * c.max(1)).next_power_of_two(); off.push((total as u32, (cap - 1) as u32)); total += cap; }
+    assert!(total * 128 < 1 << 32);
+    #[repr(C)] #[derive(Clone, Copy)] struct E { hk: u32, set: u32 }
+    let mut tab: Vec<E> = vec![E { hk: 0, set: 0 }; total as usize];
+    let mut masks: Vec<u128> = vec![0];
+    let mut intern: FxHashMap<u128, u32> = FxHashMap::default();
+    intern.insert(0, 0);
+    macro_rules! probe { ($sh:expr, $hk:expr) => {{
+        let (b, m) = off[$sh as usize];
+        let mut s = slot_of($hk, (b, m));
+        loop { let e = &mut tab[s as usize]; if e.hk == $hk { break; } if e.hk == 0 { e.hk = $hk; break; } s = b + ((s - b + 1) & m); }
+        s
+    }}; }
+    // The door: each entry's mask, then interned.
+    let mut acc: Vec<u128> = vec![0; total as usize];
+    let mut old_ids: FxHashSet<u32> = FxHashSet::default();
+    for i in 0..n_door { let (h, l) = db[i]; let s = probe!(dsh[i], h + 1); acc[s as usize] |= 1u128 << l; old_ids.insert(s << 7 | l); }
+    for (s, m) in acc.iter().enumerate() { if *m != 0 { let n = masks.len() as u32; let id = *intern.entry(*m).or_insert_with(|| { masks.push(*m); n }); tab[s].set = id; } }
+    drop(acc);
+    let n_old_masks = masks.len();
+    let mem = total as f64 * 8.0;
+    eprintln!("[bitintern] setup {:.1} s: directory {total} slots x 8 B = {:.2} GB; {n_old_masks} distinct masks at the frame start ({:.1} MB)", t.elapsed().as_secs_f64(), mem / 1e9, n_old_masks as f64 * 16.0 / 1e6);
+    let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * crate::PAYLOAD);
+    let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qs.len());
+    let mut dropmin: Vec<u32> = vec![u32::MAX; n_src];
+    crate::perf_on(true);
+    let t = std::time::Instant::now();
+    for &d in ds { let m = &mut dropmin[d as usize]; *m = (*m).min(1); }
+    let t_drops = t.elapsed().as_secs_f64();
+    let mut nw = 0u64;
+    for q in qs {
+        let s = probe!(q.shard, q.high + 1);
+        let e = &mut tab[s as usize];
+        let m = masks[e.set as usize];
+        let b = 1u128 << q.low;
+        if m & b == 0 {
+            let nm = m | b;
+            let n = masks.len() as u32;
+            e.set = *intern.entry(nm).or_insert_with(|| { masks.push(nm); n });
+            nw += 1; frontier.extend_from_slice(&[0u8; crate::PAYLOAD]);
+        }
+        edges.push((q.src, s << 7 | q.low, q.xfer));
+    }
+    let dt = t.elapsed().as_secs_f64();
+    crate::perf_on(false);
+    std::hint::black_box((&frontier, &dropmin));
+    eprintln!("[bitintern] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {nw} ({}), {:.1} ns per query; directory {:.2} GB + masks {} ({:.1} MB) at the frame end",
+        if nw == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qs.len() as f64, mem / 1e9, masks.len(), masks.len() as f64 * 16.0 / 1e6);
+    if std::env::var_os("BENCH_NOCHECK").is_some() { return; }
+    check("bitintern", &pd, &edges, n_door, &|m| old_ids.contains(&m), false);
+}
+
+/// MADV_HUGEPAGE over a fresh (untouched) table.
+pub fn huge<T>(v: &mut [T]) {
+    let (p, n) = (v.as_mut_ptr() as usize, std::mem::size_of_val(v));
+    let a = (p + 4095) & !4095;
+    if n > 8192 { unsafe { libc::madvise(a as *mut libc::c_void, (p + n - a) & !4095, libc::MADV_HUGEPAGE); } }
 }

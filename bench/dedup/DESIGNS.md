@@ -196,6 +196,155 @@ Production would need each cell's spd.y dictionary (or an append-only per-cell
 one assigned on first sight, itself a lookup per emission), and the room's
 flag/dash/spd.x value sets in advance or a fatal guard on a new value.
 
+## I. The structure of the state set (`structure`, `sharing`, `bitintern`; 2026-10-09)
+
+The set: the visited set at the END of f57 (door f0-56 + f57's 6,735,699 new),
+shapes 2, 3, 7 (43,841,483 states, 17,854 (shape, cell) shards; the five
+spawn/death shapes, ~120 rows, left out). Fields: freeze, has_dashed,
+dash_effect_time, dash_time, djump, grace, dash_accel x/y, dash_target x/y,
+flip.x, spd.x, spd.y (13; x, y = the cell); values as numeric ranks of the
+room dictionaries (alphabets 3 2 11 5 3 7 3 3 3 3 2 1351 96).
+
+### What a shard looks like (/var/tmp/emitcap/shards/2_<cell>.txt)
+
+Samples: tiny (56,18) 8 states, median (103,107) 485, weighted-median (70,97)
+12,079, heaviest (47,114) 69,428, near spawn (32,104) 15,723, mid-room (64,64)
+1,262. Weighted-median, sorted flags, dash, spd.y, spd.x:
+
+    freeze djump grace flip hasd d_time det tgt.x tgt.y accel.x accel.y  spd.y               spd.x
+         0     2     0    0    0      0   0     0     0       0       0  -0.320068359375     0.7001190185546875
+         0     2     0    0    0      0   0     0     0       0       0  -0.320068359375     0.7498779296875
+         0     2     0    0    0      0   0     0     0       0       0  -0.320068359375     0.749908447265625
+         0     2     0    0    0      0   0     0     0       0       0  -0.320068359375     0.7499237060546875
+         ...   (0.74993896, 0.74995422, 0.74996948, 0.74998474, 0.75, 0.75001526, ...: consecutive ulps)
+         0     2     0    1    0      0   0     0     0       0       0  -0.110076904296875  -0.6999359130859375
+         0     2     0    1    0      0   0     0     0       0       0  -0.110076904296875  -0.699920654296875
+
+- spd.x comes in tight CLUSTERS around multiples of 0.05 (0.7, 0.75, 0.2, 0.6,
+  1): runs of consecutive raw fixed-point values (1/65536 apart) - friction and
+  acceleration rounding, i.e. the remainder's widening does not reach spd.
+  spd.y is a gravity ladder (-0.87, -0.66, -0.45, -0.24, -0.03, 0.075, 0.18,
+  0.39, ...) shared by all flag groups of a cell.
+- Functional dependences: dash_time is a function of dash_effect_time;
+  dash_accel x/y and has_dashed are functions of dash_target (1.00 children a
+  parent in the trie); the dash fields persist after a dash (direction of the
+  LAST dash), so the 89 "combos" are ~(dash_time, target x, target y).
+- The same sub-sets repeat ACROSS cells (`sharing`): the 10.06M nodes
+  (shard, flags+dash, spd.x) carry only 79,390 distinct spd.y sets (0.8%);
+  the 3.10M nodes (shard, flags+dash) only 93,211 distinct (spd.x, spd.y)
+  sets (3.0%).
+
+### Compression, bytes a state (raw: 14 B, u8 a field, spd.x u16)
+
+| encoding | gzip -6 | zstd -3 | zstd -19 | xz -6 |
+|---|---|---|---|---|
+| all, row-major, layer order | 3.43 | 3.63 | 2.36 | 2.11 |
+| all, column-major, layer order | 3.39 | 3.57 | 2.97 | 2.87 |
+| all, sorted flags+dash > spd.x > spd.y (o0), row | 2.12 | 0.82 | 0.235 | 0.220 |
+| o0, column | 0.358 | 0.375 | 0.145 | 0.153 |
+| o0, delta to previous row | 0.455 | 0.444 | 0.131 | 0.166 |
+| o0, first-changed field + its delta (raw 2.67 B) | 0.198 | 0.190 | 0.068 | 0.073 |
+| greedy order (fewest trie nodes), first-changed (raw 3.31 B) | 0.240 | 0.201 | 0.040 | 0.053 |
+| dash > flags > spd.y > spd.x (o3), first-changed (raw 3.39 B) | - | 0.204 | **0.040** | - |
+| spd.x first / spd.y first, first-changed | - | 0.65 / 0.64 | 0.125 / 0.094 | - |
+| 6 sample shards, raw row / o0 first-changed | 3.98 / 0.234 | 4.26 / 0.297 | 3.15 / 0.193 | 2.83 / **0.183** |
+
+zstd's window decides it: greedy first-changed at -19 is 0.236 B with a 16 KB
+window, 0.111 at 128 KB, 0.074 at 1 MB, 0.040 at 8 MB. The last factor ~6
+is CROSS-SHARD repetition; within a shard (the samples, compressed apart) it
+is ~1.5 bits a state.
+
+### Tries and bounds (whole set; per level: `structure/report.txt`)
+
+| order | subset bound sum log2 C(alphabet, children) | succinct trie (LOUDS or bitmap per level) |
+|---|---|---|
+| flags+dash > spd.x > spd.y | **6.45 bits** | **12.41 bits (1.55 B)** |
+| dash > flags > spd.y > spd.x | 7.33 | 14.73 |
+| greedy: has_dashed > grace > accel.x > tgt.y > accel.y > tgt.x > djump > flip > freeze > dash_time > det > spd.y > spd.x | 7.34 | 14.77 |
+| spd.x > spd.y > flags+dash | 15.00 | 29.84 |
+
+Flat bound log2 C(product, n) per shard: 21.0 bits (local dictionaries),
+25.5 (room alphabets). Conditional entropies in o0 (bits, states uniform):
+freeze 0.14, has_dashed 0.83, det 0.45, dash_time 0.00, djump 0.60, grace
+0.41, accel 0.38 + 0.41, target 0.21 + 0.21, flip 0.97, spd.x 5.55, spd.y 2.87
+(sum 13.05 = mean log2 of the shard size). The flags+dash prefix has 3.10M
+nodes (175 a shard); spd.x then fans out 3.24, spd.y 4.36.
+
+### Conclusions
+
+- Flags+dash first, then the speeds, exposes the most per-shard structure;
+  whatever is first, the speeds carry ~8.4 of the 13 bits of entropy.
+- Achievable: ~6.5 bits a state per shard in theory (trie subset bound),
+  ~12 bits as a plain succinct trie, ~1.5 bits with a good model of a shard
+  (sample compression), ~0.3 bits exploiting cross-cell repetition - against
+  12-20 B in the hash tables now, 8-12 B a state for bitcell's directory
+  (0.35 GB; its masks alone 2.8 B a state).
+- Structure 1, measured (`bitintern`): `bits` with the 128-bit spd.y mask
+  hash-consed: entry = (high digits u32, mask id u32); the room's distinct
+  masks in one table (68k at the frame start, 230k by its end with the
+  garbage of inserts; 3.7 MB, L2/L3-resident); an insert interns mask | bit.
+  0.23 GB (5.2 B a state). Interleaved x3, cpu 4, load 2.1-2.6: v3c 3.16-3.17 s,
+  bits 2.27-2.28, **bitintern 2.45-2.47** (8.4 ns: +4.7G instructions for the
+  intern, -16% DRAM fills against bits), bitcell 2.78-2.80. Validated as before
+  (6,735,699 new, fingerprint 51e2f3ecb444e25d, 0 violations).
+  bitcell was 2.09-2.13 s in H2's reps and is 2.77-2.80 s today, reproducibly
+  (DRAM fills 25M -> 51M, dTLB misses 2.7M against bits' 0.19M; its process is
+  21 GB RSS from the untimed precompute and only 4.7 GB of it on huge pages,
+  MemFree 22 GB): page-size luck, not the design - unresolved.
+- Structure 2 (sketch): a DAG trie - per shard a directory on the flags+dash
+  combo (3.10M entries, 175 a shard: a sorted u16 array per shard, SIMD
+  search, ~1 line) pointing to an INTERNED spd set (93k distinct sets holding
+  4.27M (spd.x, spd.y-set id) entries, ~17 MB) and interned spd.y masks (79k x
+  16 B = 1.3 MB). ~25 MB + 17 MB + 1.3 MB = ~45 MB, ~1 B a state. Lookup: shard
+  array -> combo search -> spd.x binary search in a shared, cache-hot set (~6
+  steps over ~46 entries) -> mask bit: ~3 dependent loads, mostly L2/L3
+  (~15-25 ns cold, ~5-10 ns in a sweep). Insert (2.6% of lookups):
+  copy-on-write of the path, intern 2 sets (~100-200 ns) -> +0.7-1.3 s of 6.7M
+  inserts single-threaded, the catch; garbage collection of dead sets at the
+  frame's end.
+- Structure 3 (sketch): LSM - old layers frozen per shard as first-changed
+  encoded blocks of 64 states with a block index (~3 B a state uncompressed,
+  0.1-0.3 B with zstd blocks); the current frames in bitcell/bitintern. A
+  lookup probes the small delta, then decodes one block (~64 x 3 B, ~50-100
+  ns): only worth it where memory, not time, binds.
+
+### I2. Position LAST: a mask over a region's cells (`posregion`, `posmask4`, `posmask8`)
+
+Regions as the kernels tile them (`RegionGrid::of`: `x.div_euclid(px)`,
+aligned at 0), keyed with the shape. Tree A: (shape, region) > flags+dash >
+spd.x > spd.y > position mask. Same f57 set (43.8M states).
+
+| R | regions | A leaves | states/leaf | mask fill | key u32 + mask, B/state (load 0.5) | distinct masks; interned B/state | succinct trie A / C | subset bound A | zstd -19 per region, A / C | explicit gamma, room / group dicts (A) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 (cell) | 17,854 | 43.8M | 1 | - | 5.0 (10.0) | - | 13.4 / 12.5 b | 6.45 b | 0.352 / 0.341 B | 11.7 / 8.7 b |
+| 4x4 | 1,262 | 5.47M | 8.0 | 50% | 0.75 (1.5) | 2,108; 1.0 | **3.5** / 12.1 b | 1.71 b | 0.066 / 0.116 B | 3.9 / 3.6 b |
+| 8x8 | 385 | 2.19M | 20.0 | 31% | **0.60 (1.2)** | 19,095; 0.40 + 0.2 MB | 3.8 / 12.1 b | 1.76 b | 0.037 / 0.083 B | 3.5 / 3.2 b |
+| 16x16 | 123 | 1.12M | 39.0 | 15% | 0.92 (1.8) | 47,236; 0.20 + 1.5 MB | 6.9 / 12.2 b | 2.38 b | **0.028** / 0.071 B | 3.45 / 3.2 b |
+
+- The cross-position repetition IS now inside one region: zstd per 8x8
+  region alone (0.037 B) matches the whole-set 8 MB window (0.040, section I);
+  per cell it is 0.35. Position after flags+dash (C) loses it (12 bits).
+- B (mask over (spd.y, position) under spd.x) is worse: 109 states a leaf at
+  8x8 but 1.8% fill (room spd.y), 3.0% (per-region spd.y): 4.2 B/state.
+- Explicit coding (no compressor; first changed level gamma(levels - level),
+  its index delta gamma, following fields gamma(index + 1)): 3.2-3.9 bits a
+  state with regions, 8.7-11.7 per cell. Section I's zstd inputs were already
+  room-dictionary indices (numeric ranks), u8 a field, spd.x u16.
+- Live window of the x-major sweep (A leaves; (region, high) entries): cell
+  548k / 289k; 4x4 163k (1.0 MB) / 67k; 8x8 120k (1.4 MB at 12 B) / 43k;
+  16x16 86k (3.1 MB at 36 B) / 27k. All L2/L3-sized.
+
+`posmask4` / `posmask8` (run_words with a directory per (shape, region) on
+(high digits, spd.y) = u32, one 64-bit word over the region's cells, id =
+slot << 6 | cell; tables MADV_HUGEPAGE): posmask8 2.19M entries, 6.2M slots
+x 12 B = **0.07 GB** (1.7 B a state); posmask4 5.47M entries, 0.19 GB (16 of
+64 bits used). Validated: 6,735,699 new, fingerprint 51e2f3ecb444e25d, 0 id
+bijection / decision violations. SMOKE timing only (load 4-6, cpu 4 shared:
+the drops loop alone varied 0.30-0.63 s): posmask4 1.89 s, posmask8 2.19 s
+(and 3.16 / 4.59 s under heavier contention), bits 4.64 s in the same
+contended window (2.27 quiet). AnonHugePages at the timed loop 4-8.7 GB of
+21 GB RSS (most RSS is the untimed precompute; the table is 70-190 MB).
+
 ## Sweep front (`sweep`, src/bin/sweep; 2026-10-09)
 
 Approach #2, doing what `vprod` does, multithreaded, from the same capture.
