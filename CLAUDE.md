@@ -174,13 +174,15 @@ always reaching for the most expensive profile out of habit.
 - **`touch` the file you care about** to measure what an edit really costs:
   `touch src/transpile/lower.rs && time cargo nextest run transpile`.
 
-**The ignored tests** (2, `#[ignore]` rather than an env check so nextest
+**The ignored tests** (3, `#[ignore]` rather than an env check so nextest
 prints them as skipped): `forward_extended_frame_by_frame_matches_fresh`
-(resume) and `room_71_table_builds_with_its_balloon` (level -1). They are
+(resume), `room_71_table_builds_with_its_balloon` (level -1) and
+`pinning_isolated_floors_keeps_the_projected_successors` (the reference
+engine's floor pin for `arc-check`, ~200 s). They are
 NOT part of the pre-commit run. Run them, AND the three pinned oracles
 (below), when you touched the tracer, the lowering, the ASM codegen, the
-edge recording, resume or level -1: the kernels are assembled at startup,
-so the oracles are what check what they COMPUTE.
+edge recording, resume, level -1 or the reference engine: the kernels are
+assembled at startup, so the oracles are what check what they COMPUTE.
 
 Do NOT read past the "N skipped" line and call the suite green when one of
 those reasons applies. That is the exact mistake behind `a8f4635`.

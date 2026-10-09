@@ -131,9 +131,22 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   "both ways", and its solid side owed `collideable` false with the player
   inside - a coverage gap at f42. Refuted like every flag, by the objects
   ladder (`r0sxhfn,r0sxhn,r0sxh`) and the concrete search. `rewrite
-  arc-check` cannot run at an `f` level (the reference engine does not step
-  an unknown fruit; it reports the spawn frame's records as bad and runs out
-  of memory); `rewrite follow` with the community route agrees with the
+  arc-check` runs at an `f` level since 2026-10-09 (`RefEngine::step_at`:
+  the reference steps the probe row projected onto the level with its
+  unknowns forked as the kernels fork them - `fly` both ways, every
+  comparison on the unknown `y`/`step` both ways - instead of reading
+  their placeholders, which missed the fruit flying off or being collected:
+  room (6,2) 100% `r0sxhf` f1-f40, 351 of 1214 inside probes bad before, 0
+  after). Two pins keep it affordable, both exact for a successor projected
+  onto the level and each checked against the unpinned reference by a test:
+  the fly fruit's `spd.y`/`rem.y` pinned to 0 (they only move the unknown
+  `y`, and the projection widens them again; ~140 leaves a step to ~9), and
+  at `n` a floor ISOLATED from the player (20 px Chebyshev, no spring
+  near; the player's per-frame move <= 8 checked on every leaf) pinned to
+  state 0 (unpinned the floors' states are a product: room (3,0)'s 12
+  floors passed 1M paths a step). Room (3,0) 100% `r0sxhfn` f1-f45: 0 bad
+  (1460 inside, 622 outside; 65 min single-threaded); `--fault` makes both
+  rooms fail. `rewrite follow` with the community route agrees with the
   `r0sxhfn` tree's keys through the spawn and the fruit taking off (f35)
   to the end of a tree built to f46. Room (3,0) nodiag: bound 76 against
   the optimum 93 (plans/nodiag.md).

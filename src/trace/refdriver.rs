@@ -50,10 +50,11 @@ pub fn run_frame_all<'a>(
     it.d.cursor = Cursor::new();
     let mut outputs = Vec::new();
     let mut paths = 0usize;
-    // Unknown fly fruit and platforms have no reference form yet.
-    if level.fruit {
-        anyhow::bail!("the reference engine does not run fruit-unknown levels (plans/fly-fruit.md)");
-    }
+    // An unknown fly fruit needs nothing here: its `fly` is an unknown
+    // boolean (forked below), `step`/`y` the unknown number and `spd.y`/
+    // `rem.y` intervals, whose comparisons the domain forks
+    // (`RefDomain::compare`) as the kernels' undecided atoms do. Unknown
+    // platforms have no reference form yet.
     if level.platforms {
         anyhow::bail!("the reference engine does not run platforms-unknown levels (plans/platforms-unknown.md)");
     }
