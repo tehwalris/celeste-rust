@@ -468,9 +468,18 @@ pub fn room_constant_lattice(
                 if it.d.as_const(&n).is_some() {
                     continue;
                 }
+                // Under the loading jank (CELESTE_LOADING_JANK) the start's
+                // `rnd` draw has had one update (a balloon's `offset += 0.01`,
+                // its `y` from `sin(offset)`): not a literal but a function of
+                // one. Its static range's hull stands for it - a superset of
+                // the start's values, sound for level -1's lower bound (it only
+                // widens the start; the correlation between slots is dropped).
                 let lit = match it.d.graph.get(n).op {
                     crate::transpile::graph::Op::Const(lo, hi) => Some((lo, hi)),
-                    _ => None,
+                    _ => it.d.range_of(n).and_then(|ps| {
+                        let (lo, hi) = (ps.iter().map(|p| p.0).min()?, ps.iter().map(|p| p.1).max()?);
+                        Some((i32::try_from(lo).ok()?, i32::try_from(hi).ok()?))
+                    }),
                 };
                 start_ivals.insert(p.clone(), lit);
                 let zero = it.d.num(celeste_core::pico8_num::Pico8Num::from_i16(0));
