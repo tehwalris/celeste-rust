@@ -92,6 +92,7 @@ fn main() {
         "regionbatch8" | "regionbatch16" => regionbatch::regionbatch(dir, door.len() / 40, variant[11..].parse().unwrap(), args.get(3).map_or("merge,hash", |s| s.as_str()), args.get(4).is_some_and(|s| s == "ids")),
         "edgecensus" => edgecensus::edgecensus(args.get(3).map_or(dir.as_str(), |s| s.as_str()), dir, &door, &maps),
         "edgepairs" => edgecensus::edgepairs(args.get(3).map_or(dir.as_str(), |s| s.as_str()), dir, &door, &maps),
+        "edgeregions" => edgecensus::edgeregions(args.get(3).map_or(dir.as_str(), |s| s.as_str()), dir, &door, &maps, args.get(4).map_or(8, |s| s.parse().unwrap())),
         "regionedge" => regionedge::regionedge(&args[3], dir, &door, &maps, &args[4..]),
         "regionpar" => regionpar::regionpar(dir, door.len() / 40, &args[3..]),
         "bitintern" => bits::run_intern(dir, door.len() / 40),

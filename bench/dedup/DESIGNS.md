@@ -638,3 +638,98 @@ local index, dense target number), or keep the kernel's source order (an
 edge's group repeats across the source cells of one entry, which a sweep
 visits in x-major runs), and the 8-B batch with the edge payload carried
 by the producer.
+
+### M2. Cheaper grouping (2026-10-10, quiet: load 1.9-3.8)
+
+All variants write the same validated output (decoded back, fingerprint
+fca41b0f1a28b51d, id bijection 0 violations, 6,735,699 new; checked once each
+at 1 and 16 threads); the `rel*` group order is source-major, `relt` / `relf`
+TARGET-major (the backward's pull order wants by-source, its invalidation
+by-target; see N). Single thread / 16 threads, 100k-lookup units, ns an edge
+of the whole unit pass (dedup alone: 2.46 / 0.41):
+
+| method | 1 thread | 16 threads | edges, B |
+|---|---|---|---|
+| `rel`: u128 `sort_unstable` of the unit's edges | 26.4 | 2.13 | 2.10 |
+| `relc`: dense local ids (src via a small hash), two stable counting passes (target, then source), sequential emit | 22.9 | 2.50 | 2.10 |
+| `relg`: one custom open-addressing pass (24-B entries, zeroed per unit) grouping (src, tgt slot, transfer) -> mask, then sort only the groups | 20.0 | 1.97 | 2.10 |
+| `relf`: flat accumulator cleared by GENERATION, key (tgt slot, src region, src entry, transfer, shift), value the u64 mask; then rank + sort the bundles | 18.7 | 1.95 | 1.97 |
+| `relt`: dense target ranks, ONE counting pass of packed u64 edges by target, each target's segment insertion-sorted (<= 32) or sorted | **19.4** | **1.45** (50k units) | **1.95** |
+
+(The earlier `relh` was also a custom open-addressing table, 48-B entries
+with u128 keys, not std HashMap; 0.93 s at 16 threads.)
+Phase split, 1 thread: `relf` accumulator 1.89 s (7.3 ns an edge, the same at
+25k units: L2-resident, not cache-bound - compute and the 20% insert rate),
+bundle collect + rank + sort 1.62 s, emit 0.65; `relt` counting 0.94 s
+(3.6 ns), segment sorts + emit 3.15 s (12 ns: popular targets' segments are
+long), target ranks 0.28.
+
+relt, 3 interleaved reps, wall: 1 thread 4.99-5.05 s; 8: 0.653-0.655; 16:
+0.391-0.413 (100k), **0.369-0.373 (50k)**, 0.407-0.410 (200k); 32: 0.400-0.404
+(50k), 0.443-0.457 (100k). Dedup alone (same 16-B batches): 0.104-0.110 s at
+16. Edges cost 3.5x the dedup at 16 threads: the 2x target is NOT met. The
+dedup pass itself is DRAM-bound (16-B batch stream); the edge pass is
+compute-bound at ~17 ns an edge single-threaded. Remaining ideas: emit
+without sorting long segments (bucket a target's edges by source rank with
+a counting pass inside the unit: needs dense source ranks, the src table
+cost 4 ns in relc), SIMD the shift/mask building, an 8-B batch.
+
+## N. Source-side edge layout: one set per region with GHOSTS (census; `edgeregions`)
+
+Philippe's layout: each SOURCE region R keeps ONE posmask set - its own
+states plus GHOSTS, the targets of its edges that live outside R, keyed the
+same way, positioned relative to R's corner (a HALO around the core: core
+cells own, halo cells ghosts; beyond the halo, overflow entries (key,
+offset)). Edges are (local src, local tgt, transfer) into that set; only
+ghosts need a translation to their owner's stable id, once per ghost ENTRY.
+f57: 257,724,013 edges (canonical transfers), all 43.8M states.
+
+| | 8x8 | 16x16 |
+|---|---|---|
+| self-region edges (no translation at all) | 66.9% | 82.0% |
+| target distance outside the source's core, edge-weighted: 0 / <=1 / <=2 / <=4 px | 66.9 / 83.3 / 96.6 / 99.1% | 82.0 / 91.2 / 97.9 / 99.1% |
+| halo for 99% of edges; the last 0.9% | 3 px; shape changes (death / respawn), always overflow | same |
+| distinct (R, target) (if every target were translated) | 14.9M | 13.0M |
+| ghost states (c) | 6.11M | 3.14M |
+| ghost ENTRIES at halo 2 / 4 (+ overflow) | 0.62M + 0.78M / 0.62M + 0.13M | 0.29M + 0.41M / 0.29M + 0.12M |
+| own entries | 2.19M | 1.12M |
+| set bytes: own + ghosts, no halo (ghosts 6 B each) | 26 + 37 MB | 40 + 19 MB |
+| halo 2 (12x12 / 20x20 masks) | 48 + 18 MB | 61 + 18 MB |
+| halo 4 (16x16 / 24x24 masks) | 79 + 23 MB | 85 + 23 MB |
+| translation entries (R, owner region, key) = remaining global dedup lookups | **1.25M** (5 MB) | **0.48M** (2 MB) |
+| local-index edges: fixed bits / flat varint (zstd -1) | 7.24 / 5.25 (0.19) B | 7.94 / 5.26 (0.16) B |
+| local-index BUNDLES (src entry, tgt entry, transfer, shift) -> mask | 34.9M of 7.4 edges: **1.89 B** (zstd -1 0.14) | 23.9M of 10.8: **1.63 B** (0.10) |
+
+Global dedup work left: 1.25M / 0.48M translations against 257.7M edges,
+10.9M distinct targets and production's unit cache (31.7M rows reaching the
+door). Total a frame, 8x8, halo 4: edges 1.89 + ghosts 0.09 + translation
+0.02 = **~2.0 B an edge** raw (~0.25 with zstd -1), against K1's per-pair
+relation 1.76 / 0.18 and flat stable ids 4.76 / 1.37; 16x16: ~1.73 B.
+
+Classes of each region's unified set (8x8; states):
+
+| scope | (a) own only | (b) own + target of R's edges | (c) ghost only |
+|---|---|---|---|
+| A: frontier (f56) + new (f57) | 5.94M (31.8%) | 6.65M (35.6%) | 6.11M (32.7%) |
+| B: the whole visited set | 35.05M (70.2%) | 8.79M (17.6%) | 6.11M (12.2%) |
+
+Scope A leaves out 2.14M older states of R that R's edges touch. Per region
+(scope A): (a) p10 0.17, median 0.31, p90 0.99; (b) 0.00 / 0.33 / 0.45; (c)
+0.00 / 0.33 / 0.48. Heaviest regions (scope A, a / b / c): r26 306k / 369k /
+274k, r54 276k / 302k / 290k, r25 221k / 234k / 203k. 16x16: A 32.7 / 47.3 /
+20.0%, B 72.4 / 20.9 / 6.7%. The halo does not change the classes (a ghost
+is a ghost wherever it is stored); it changes the storage (masks against
+overflow entries).
+
+How the backward consumes edges (fgwt `src/search/arc_dp.rs`): `backward`
+PULLS per source - `W_t(i) = U over i's out-edges pull(W_{t+1}(dst))`
+(`pull`, out-edges by source, `out_of`) - and selects its candidates
+incrementally by TARGET: the predecessors (`preds_of`) of the nodes whose set
+changed, plus nodes whose deadline starts. So it needs both directions. The
+pull maps onto this layout directly, per source region: R's edges reference
+its own states' and its ghosts' W; a ghost's W is the owner's, fetched through
+the translation (once per ghost entry, per frame of the backward). The
+by-target invalidation becomes coarser but cheap: a changed state's region
+marks the regions holding it as a ghost (the translation table inverted,
+1.25M entries), and those regions re-pull their affected sources (or all of
+them).

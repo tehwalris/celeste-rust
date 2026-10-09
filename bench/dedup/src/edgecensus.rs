@@ -396,3 +396,118 @@ pub fn edgepairs(dir: &str, cap: &str, door: &[u8], maps: &[memmap2::Mmap]) {
         println!("  dumped {label} pair ({} edges) -> {path}", es.len());
     }
 }
+
+/// `edgeregions R`: Philippe's SOURCE-side layout (DESIGNS N). Each source
+/// region R (R x R, aligned) keeps ONE set: its own states plus GHOSTS - the
+/// targets of its edges that live outside R, keyed alike, positioned relative
+/// to R's corner (a halo around the core). Edges are (local src, local tgt,
+/// transfer); ghosts are translated to their owner's stable id once each.
+pub fn edgeregions(dir: &str, cap: &str, door: &[u8], maps: &[memmap2::Mmap], rr: i32) {
+    let ld = load(dir, cap, door, maps);
+    let (cell, key, edges) = (&ld.cell, &ld.key, &ld.edges);
+    let n = ld.f.n;
+    let frame: Vec<u8> = (0..n).map(|i| ld.f.hdr(i).2 as u8).collect();
+    let xy: Vec<(i32, i32)> = cell.iter().map(|&c| cell_xy(c)).collect();
+    // Regions: (shape, x div R, y div R).
+    let mut rid: FxHashMap<(u8, i32, i32), u32> = FxHashMap::default();
+    let mut corner: Vec<(i32, i32)> = Vec::new();
+    let reg: Vec<u32> = (0..n).map(|i| { let (x, y) = xy[i]; let k = (ld.shape[i], x.div_euclid(rr), y.div_euclid(rr)); let m = rid.len() as u32; *rid.entry(k).or_insert_with(|| { corner.push((k.1 * rr, k.2 * rr)); m }) }).collect();
+    let ng = rid.len();
+    let mut rshape = vec![0u8; ng]; for (&(sh, _, _), &r) in &rid { rshape[r as usize] = sh; }
+    let ne = edges.len() as f64;
+    // Distance of a cell outside region r's core (0 inside).
+    let outside = |r: u32, (x, y): (i32, i32)| { let (cx, cy) = corner[r as usize]; let dx = if x < cx { cx - x } else if x >= cx + rr { x - cx - rr + 1 } else { 0 }; let dy = if y < cy { cy - y } else if y >= cy + rr { y - cy - rr + 1 } else { 0 }; dx.max(dy) };
+    // Per edge: the target's distance outside the source's core; self-region edges.
+    let mut dhist = vec![0u64; 600];
+    let mut self_edges = 0u64;
+    for &(s, t, _) in edges.iter() {
+        let r = reg[s as usize];
+        let d = if ld.shape[t as usize] != ld.shape[s as usize] { 599 } else { outside(r, xy[t as usize]).min(598) as usize };
+        dhist[d] += 1;
+        if reg[t as usize] == r { self_edges += 1; }
+    }
+    let cover = |p: f64| { let mut a = 0u64; for (d, &c) in dhist.iter().enumerate() { a += c; if a as f64 >= p * ne { return d as i64; } } -1 };
+    println!("edgeregions R = {rr}x{rr}: {ng} regions, {} edges; self-region edges {self_edges} ({:.1}%)", edges.len(), 100.0 * self_edges as f64 / ne);
+    println!("  target distance outside the source's core (edge-weighted): 0: {:.1}%, <=1: {:.1}%, <=2: {:.1}%, <=4: {:.1}%, <=8: {:.1}%; halo for 99% {} px, 99.9% {} px, 100% {} (599 = another shape)",
+        100.0 * dhist[0] as f64 / ne, 100.0 * dhist[..2].iter().sum::<u64>() as f64 / ne, 100.0 * dhist[..3].iter().sum::<u64>() as f64 / ne, 100.0 * dhist[..5].iter().sum::<u64>() as f64 / ne, 100.0 * dhist[..9].iter().sum::<u64>() as f64 / ne, cover(0.99), cover(0.999), cover(1.0));
+    // Distinct (R, target) pairs.
+    let mut rt: Vec<u64> = edges.iter().map(|&(s, t, _)| (reg[s as usize] as u64) << 32 | t as u64).collect();
+    rt.sort_unstable(); rt.dedup();
+    let ghosts: Vec<(u32, u32)> = rt.iter().map(|&v| ((v >> 32) as u32, v as u32)).filter(|&(r, t)| reg[t as usize] != r).collect();
+    let in_r_targets = rt.len() - ghosts.len();
+    println!("  distinct (R, target) = dictionary entries / global dedup lookups if every target were translated: {} (vs 257.7M edges, 10.9M distinct targets, production's unit cache 31.7M); in-R targets {in_r_targets}, ghost states {}", rt.len(), ghosts.len());
+    // Classes per region, two scopes: A = frontier (f56) + new (f57) states; B = the whole visited set.
+    let mut is_tgt_in_r = vec![false; n]; // a state of R targeted by R's own edges
+    for &v in &rt { let (r, t) = ((v >> 32) as u32, v as u32); if reg[t as usize] == r { is_tgt_in_r[t as usize] = true; } }
+    let mut ghost_cnt = vec![0u64; ng]; for &(r, _) in &ghosts { ghost_cnt[r as usize] += 1; }
+    for (scope, inscope) in [("A frontier+new", Box::new(|i: usize| frame[i] >= 56) as Box<dyn Fn(usize) -> bool>), ("B whole visited set", Box::new(|_: usize| true))] {
+        let (mut a, mut b, mut b_out) = (vec![0u64; ng], vec![0u64; ng], 0u64);
+        for i in 0..n { let r = reg[i] as usize; if inscope(i) { if is_tgt_in_r[i] { b[r] += 1; } else { a[r] += 1; } } else if is_tgt_in_r[i] { b_out += 1; } }
+        let (ta, tb, tc): (u64, u64, u64) = (a.iter().sum(), b.iter().sum(), ghost_cnt.iter().sum());
+        let tot = (ta + tb + tc) as f64;
+        let mut frac_c: Vec<(f64, u64, u32)> = (0..ng).filter(|&r| a[r] + b[r] + ghost_cnt[r] > 0).map(|r| { let s = a[r] + b[r] + ghost_cnt[r]; (ghost_cnt[r] as f64 / s as f64, s, r as u32) }).collect();
+        let fr = |k: usize| -> String { let mut v: Vec<f64> = (0..ng).filter(|&r| a[r] + b[r] + ghost_cnt[r] > 0).map(|r| { let s = (a[r] + b[r] + ghost_cnt[r]) as f64; [a[r], b[r], ghost_cnt[r]][k] as f64 / s }).collect(); v.sort_by(|x, y| x.partial_cmp(y).unwrap()); let q = |p: f64| v[((v.len() - 1) as f64 * p) as usize]; format!("p10 {:.2} median {:.2} p90 {:.2}", q(0.1), q(0.5), q(0.9)) };
+        println!("  scope {scope}: (a) own only {ta} ({:.1}%), (b) own + target {tb} ({:.1}%), (c) ghost only {tc} ({:.1}%){}; per region (a) {}, (b) {}, (c) {}",
+            100.0 * ta as f64 / tot, 100.0 * tb as f64 / tot, 100.0 * tc as f64 / tot, if b_out > 0 { format!(" [+{b_out} older states of R targeted, outside the scope]") } else { String::new() }, fr(0), fr(1), fr(2));
+        frac_c.sort_by_key(|x| std::cmp::Reverse(x.1));
+        println!("    heaviest regions (states in the set; a / b / c): {}", frac_c.iter().take(4).map(|&(_, s, r)| format!("r{r} {s}: {}/{}/{}", a[r as usize], b[r as usize], ghost_cnt[r as usize])).collect::<Vec<_>>().join(", "));
+    }
+    // Entries (posmask: key -> cell mask). Own entries: R's keys. Ghost entries with halo h: per (R, key) over ghosts within h; beyond h: overflow (R, key, cell).
+    let mut own_e: Vec<u64> = (0..n).map(|i| (reg[i] as u64) << 32 | key[i] as u64).collect(); own_e.sort_unstable(); own_e.dedup();
+    let own_entries = own_e.len() as u64;
+    println!("  own entries (all {} states): {own_entries} ({:.1} states each)", n, n as f64 / own_entries as f64);
+    for h in [0i32, 2, 4, 8] {
+        let mut ge: Vec<u64> = Vec::new(); let mut over = 0u64;
+        for &(r, t) in &ghosts { if ld.shape[t as usize] == rshape[r as usize] && outside(r, xy[t as usize]) <= h && h > 0 { ge.push((r as u64) << 32 | key[t as usize] as u64); } else { over += 1; } }
+        ge.sort_unstable(); ge.dedup();
+        let w = rr + 2 * h; let mask_b = ((w * w) as f64 / 8.0).ceil();
+        let own_b = own_entries as f64 * (4.0 + mask_b);
+        let ghost_b = ge.len() as f64 * (4.0 + mask_b) + over as f64 * 6.0;
+        println!("  halo {h}: window {w}x{w} ({mask_b} B masks); ghost entries {} + overflow {over} (key + offset, 6 B); set bytes own {:.0} MB + ghosts {:.0} MB = {:.2} B per edge for the ghosts",
+            ge.len(), own_b / 1e6, ghost_b / 1e6, ghost_b / ne);
+    }
+    // Translation: distinct (R, owner region, key) among ghosts - one global lookup each.
+    let mut tr: Vec<(u32, u32, u32)> = ghosts.iter().map(|&(r, t)| (r, reg[t as usize], key[t as usize])).collect();
+    tr.sort_unstable(); tr.dedup();
+    println!("  translation entries (R, owner region, key): {} = the remaining global dedup lookups (one per ghost ENTRY), ~4 B each = {:.2} B per edge", tr.len(), tr.len() as f64 * 4.0 / ne);
+    // Local-index edges per R: src local = (own entry rank, cell); tgt local = (entry rank in R's unified set, cell relative to the corner).
+    // Encoded per R: (a) flat sorted varints, (b) bundles (src entry, tgt entry, xfer, shift) -> source-cell mask.
+    let mut ord: Vec<u32> = (0..edges.len() as u32).collect();
+    ord.sort_unstable_by_key(|&e| { let (s, _, _) = edges[e as usize]; reg[s as usize] });
+    let (mut flat, mut fz, mut bund, mut bz, mut groups) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut fixed_bits = 0f64;
+    let mut i = 0;
+    while i < ord.len() {
+        let r = reg[edges[ord[i] as usize].0 as usize];
+        let mut j = i; while j < ord.len() && reg[edges[ord[j] as usize].0 as usize] == r { j += 1; }
+        let es: Vec<(u32, u32, u32)> = ord[i..j].iter().map(|&e| edges[e as usize]).collect();
+        // unified keys of R: own + targets' keys, ranked
+        let mut keys: Vec<u32> = es.iter().flat_map(|&(s, t, _)| [key[s as usize], key[t as usize]]).collect(); keys.sort_unstable(); keys.dedup();
+        let kr = |k: u32| keys.binary_search(&k).unwrap() as u64;
+        let (cx, cy) = corner[r as usize];
+        let rel = |i: u32| { let (x, y) = xy[i as usize]; ((x - cx + 512) as u64) << 10 | (y - cy + 512) as u64 };
+        let mut v: Vec<(u64, u64, u32)> = es.iter().map(|&(s, t, x)| (kr(key[s as usize]) << 20 | rel(s), kr(key[t as usize]) << 20 | rel(t), x)).collect();
+        v.sort_unstable();
+        let nset = (keys.len() * (rr * rr) as usize) as f64;
+        fixed_bits += es.len() as f64 * (2.0 * nset.log2().ceil() + 17.0);
+        let mut o = Vec::new(); let mut p = (u64::MAX, 0u64);
+        for &(a, b, x) in &v { varint(&mut o, a.wrapping_sub(p.0)); if a != p.0 { p = (a, 0); } varint(&mut o, b.wrapping_sub(p.1)); p.1 = b; varint(&mut o, x as u64); }
+        flat += o.len() as u64; fz += zstd::bulk::compress(&o, 1).unwrap().len() as u64;
+        // bundles
+        let mut g: Vec<(u64, u64, u32, u64, u64)> = v.iter().map(|&(a, b, x)| { let (sx, sy) = ((a >> 10 & 1023) as i64, (a & 1023) as i64); let (tx, ty) = ((b >> 10 & 1023) as i64, (b & 1023) as i64); (a >> 20, b >> 20, x, (((tx - sx) + 1024) << 12 | ((ty - sy) + 1024)) as u64, ((sx - 512) + rr as i64 * (sy - 512)) as u64) }).collect();
+        g.sort_unstable();
+        let mut o = Vec::new(); let mut k = 0; let mut pg = (u64::MAX, u64::MAX, u32::MAX, u64::MAX);
+        while k < g.len() {
+            let gk = (g[k].0, g[k].1, g[k].2, g[k].3);
+            let mut l = k; let mut mask = 0u64; let mut cnt = 0u64; while l < g.len() && (g[l].0, g[l].1, g[l].2, g[l].3) == gk { mask |= 1u64.wrapping_shl(g[l].4 as u32 & 63); cnt += 1; l += 1; }
+            if gk.0 != pg.0 { varint(&mut o, gk.0.wrapping_sub(pg.0)); varint(&mut o, gk.1); } else { o.push(0); varint(&mut o, gk.1.wrapping_sub(pg.1)); }
+            varint(&mut o, gk.2 as u64); varint(&mut o, gk.3); varint(&mut o, cnt);
+            if cnt >= 8 || rr > 8 { o.extend_from_slice(&mask.to_le_bytes()); } else { for q in 0..64 { if mask >> q & 1 == 1 { o.push(q as u8); } } }
+            groups += 1; pg = gk; k = l;
+        }
+        bund += o.len() as u64; bz += zstd::bulk::compress(&o, 1).unwrap().len() as u64;
+        i = j;
+    }
+    println!("  local-index edges: fixed bits {:.2} B an edge; flat sorted varint {:.2} B (zstd -1 {:.2}); bundles {groups} ({:.2} edges each) {:.2} B (zstd -1 {:.2}) an edge",
+        fixed_bits / 8.0 / ne, flat as f64 / ne, fz as f64 / ne, ne / groups as f64, bund as f64 / ne, bz as f64 / ne);
+}
