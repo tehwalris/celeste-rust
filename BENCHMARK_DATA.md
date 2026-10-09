@@ -28,7 +28,13 @@ INSIDE the first wave, the other workers waiting on the build's lock (61 of
 | 38ea337 | kernels and level -1 table built before the wave | **5.6** | **8.0** |
 | 853724c | edge buffers as u128 words sorted in place (page faults 5.1M -> 3.3M a 2-frame run) | 5.2 | 7.7 |
 | 4163a00 | a unit's lanes bucketed by region across id groups (padding 36% -> 11%, kernel 10.5 -> 7.2 worker-s) | 4.85 | 7.19 |
-| (next) | units of ~16 a worker, 1024-4096 lanes (here 4096) | **4.56** | **6.97** |
+| 197267a | units of ~16 a worker, 1024-4096 lanes (here 4096) | 4.56 | 6.97 |
+| (next) | raw edge buffers written unsorted (0 of 252M records were duplicates; flush.edges 10.6 -> 6.7 worker-s) | **4.35** | - |
+
+End to end, the whole search (`tools/category_runner.py`, 100% 2300m,
+`r0sxhf,r0sxh`, L-1 94,5, the real-play start J 2, 16 threads): OPTIMAL 93
+(67f) in **587 s** with 197267a, against 27 min 20 s for e50c575 (the same
+optimum, bounds 89 / 93).
 
 A kernel-bound second harness: room (3,0) 100% at `r0sxhfn` with 8 px regions
 (`CELESTE_LOADING_JANK=3 CELESTE_REGION=8,6 CELESTE_LEVEL_MINUS_ONE=88,5`),

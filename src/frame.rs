@@ -768,15 +768,12 @@ fn append_record(
 }
 
 /// Append `buf` to the worker's raw file for `layer` at `frame`, and clear it.
-/// Its equal records go once: an edge re-recorded by another kernel call of
-/// the same unit lands in the same buffer (the compaction would merge it).
-/// Sorted and written in place: a fresh buffer per write was a fifth of the
-/// wave's page faults (room (6,2) 100% f57).
+/// Written as it is: equal records are merged by the compaction
+/// (`encode_sorted`), and the sink's merges leave none to sort out here
+/// (room (6,2) 100% f57: 0 of 252M records were duplicates in a buffer;
+/// the sort was ~1/3 of `flush.edges`).
 fn write_edges(dir: &std::path::Path, frame: u32, layer: usize, worker: u32, buf: &mut Vec<u128>) -> Result<()> {
     use std::io::Write;
-    // Only the dedup matters here; the compaction sorts by target.
-    buf.sort_unstable();
-    buf.dedup();
     // A record is its word's little-endian bytes (`edges::push_records`).
     const _: () = assert!(cfg!(target_endian = "little"));
     // SAFETY: u128 has no padding; the bytes of `buf` are initialized.
