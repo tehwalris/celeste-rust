@@ -1072,7 +1072,7 @@ fn cache_file(root: &FsPath, spd_px: i32) -> Result<Option<(PathBuf, String)>> {
         }
     }
     cart.sort();
-    const IRRELEVANT: [&str; 3] = ["CELESTE_THREADS", "CELESTE_LEVEL_MINUS_ONE", "CELESTE_L1_CACHE"];
+    const IRRELEVANT: [&str; 5] = ["CELESTE_THREADS", "CELESTE_LEVEL_MINUS_ONE", "CELESTE_L1_CACHE", "CELESTE_PHASES", "CELESTE_UNIT_LANES"];
     let mut env: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k.starts_with("CELESTE_") && !IRRELEVANT.contains(&k.as_str())).collect();
     env.sort();
     let room = crate::game_runner::start_room();

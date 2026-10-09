@@ -20,11 +20,23 @@ pub(crate) fn run_chunk_kernel(
     let n = lanes.len() as u64;
     let hit = super::asm_kernel::run_chunk(chunk, cell_in, lanes, sink);
     if hit {
-        KERNEL_HITS[0].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        HITS.with(|c| c.set(c.get() + n));
         return true;
     }
     KERNEL_HITS[1].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     false
+}
+
+thread_local! {
+    /// This thread's kernel hits, folded in by `fold_hits` (a shared add per
+    /// call contends across the wave's workers).
+    static HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Fold this thread's hits and kernel call counters into the shared ones.
+pub fn fold_hits() {
+    KERNEL_HITS[0].fetch_add(HITS.with(|c| c.replace(0)), std::sync::atomic::Ordering::Relaxed);
+    super::asm_kernel::fold_call_stats();
 }
 
 /// Lanes [0] the kernels ran, [1] missed.
@@ -40,6 +52,7 @@ pub fn missed_lanes() -> u64 {
 }
 
 pub fn print_kernel_hits() {
+    fold_hits();
     let v: Vec<u64> = KERNEL_HITS
         .iter()
         .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))

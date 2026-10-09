@@ -52,8 +52,13 @@ struct AsmBody {
 
 /// A body's transfer roots (`FrameOut::arc`): per axis took, pre, frag, ox,
 /// fin as (offset, kind); `fin` whether the outcome ends with a player.
-/// `ArcSlots::words`: two words per transfer root.
-pub(crate) const RAW_WORDS: usize = 4 * crate::trace::verify::ARC_AXIS_ROOTS;
+/// `ArcSlots::words16`: two words per transfer root, then the outcome's
+/// `fin` flag - the words alone do not decode: without a fin root its words
+/// are 0 and the axis has no `fin`, with one they are `fin = Some((0, 0))`.
+/// Keyed on the words alone, `ForwardSink::xfer_id_raw`'s cache gave a lane
+/// whichever body's transfer was interned first (a scheduling-dependent edge,
+/// room (1,0) f61, 2026-10-09).
+pub(crate) const RAW_WORDS: usize = 4 * crate::trace::verify::ARC_AXIS_ROOTS + 1;
 pub(crate) type RawWords = [u32; RAW_WORDS];
 
 #[derive(Clone, Copy)]
@@ -63,29 +68,68 @@ struct ArcSlots {
 }
 
 impl ArcSlots {
-    /// Lane `i`'s transfer as the kernel computed it, as plain words off the
-    /// output slots: per root its (low, high) 16.16 words, a boolean root's
-    /// (value, known) bits; `RAW_WORDS` words, the fin roots 0 where the
-    /// outcome has none. What `ForwardSink::xfer_id_raw` caches on.
+    /// Every lane's transfer words, word-major: `out[k][i]` is lane `i`'s
+    /// word `k` of `words`.
     #[inline]
-    fn words(&self, buf: &[u8], i: usize) -> RawWords {
-        let w = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
-        let mut out = [0u32; RAW_WORDS];
+    fn words16(&self, buf: &[u8]) -> [[u32; 16]; RAW_WORDS] {
+        let w16 = |o: usize| -> [u32; 16] {
+            let b: &[u8; 64] = buf[o..o + 64].try_into().unwrap();
+            std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
+        };
+        let mut out = [[0u32; 16]; RAW_WORDS];
         for (k, &(off, kind)) in self.roots.iter().enumerate() {
             if !self.fin && k % crate::trace::verify::ARC_AXIS_ROOTS == 4 {
                 continue;
             }
-            let (lo, hi) = match kind {
-                RootKind::Num => (w(off + i * 4), w(off + i * 4)),
-                RootKind::Ival => (w(off + i * 4), w(off + 64 + i * 4)),
+            match kind {
+                RootKind::Num => {
+                    let v = w16(off);
+                    out[2 * k] = v;
+                    out[2 * k + 1] = v;
+                }
+                RootKind::Ival => {
+                    out[2 * k] = w16(off);
+                    out[2 * k + 1] = w16(off + 64);
+                }
                 RootKind::Bool => {
                     let v = u16::from_le_bytes([buf[off], buf[off + 1]]);
                     let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
-                    ((v >> i & 1) as u32, (known >> i & 1) as u32)
+                    out[2 * k] = std::array::from_fn(|i| (v >> i & 1) as u32);
+                    out[2 * k + 1] = std::array::from_fn(|i| (known >> i & 1) as u32);
                 }
-            };
-            out[2 * k] = lo;
-            out[2 * k + 1] = hi;
+            }
+        }
+        out[RAW_WORDS - 1] = [self.fin as u32; 16];
+        out
+    }
+
+    /// The transfer id of every lane in `take`: lanes are grouped by EXACT
+    /// equality of all their words (word-major compares), one interning
+    /// per group - a body's lanes in a slice mostly share their transfer.
+    #[inline]
+    fn ids16(&self, buf: &[u8], take: u16, chunk: &Rt2, lanes: &[usize], outcome: usize, sink: &mut crate::frame::ForwardSink) -> [u32; 16] {
+        let w = self.words16(buf);
+        let mut out = [0u32; 16];
+        let mut left = take;
+        while left != 0 {
+            let l = left.trailing_zeros() as usize;
+            let mut same = left;
+            for row in &w {
+                let v = row[l];
+                let mut m = 0u16;
+                for (i, &x) in row.iter().enumerate() {
+                    m |= ((x == v) as u16) << i;
+                }
+                same &= m;
+            }
+            let words: RawWords = std::array::from_fn(|k| w[k][l]);
+            let id = sink.xfer_id_raw(&words, |ws| ArcSlots::decode(&self.raw(ws, chunk, lanes[l], outcome), chunk, lanes[l], outcome));
+            let mut m = same;
+            while m != 0 {
+                out[m.trailing_zeros() as usize] = id;
+                m &= m - 1;
+            }
+            left &= !same;
         }
         out
     }
@@ -143,21 +187,33 @@ impl KeyField {
         KeyField { c: [KEY_SEED1 ^ ck, KEY_SEED2 ^ ck], root, read }
     }
 
-    /// `runtime2::av_code` of lane `i`'s value, off the output slot.
+    /// `runtime2::av_code` of every lane's value, off the output slot.
     #[inline]
-    fn code(&self, buf: &[u8], i: usize) -> u64 {
+    fn codes(&self, buf: &[u8], out: &mut [u64; 16]) {
+        use celeste_engine::runtime2::{ival_code, num_code};
         let base = self.root;
-        let word = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+        let words = |o: usize| -> [u32; 16] {
+            let b: &[u8; 64] = buf[o..o + 64].try_into().unwrap();
+            std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
+        };
         match self.read {
-            KeyRead::Num => celeste_engine::runtime2::num_code(word(base + i * 4)),
-            KeyRead::Ival => celeste_engine::runtime2::ival_code(word(base + i * 4), word(base + 64 + i * 4)),
+            KeyRead::Num => {
+                let w = words(base);
+                for i in 0..16 {
+                    out[i] = num_code(w[i]);
+                }
+            }
+            KeyRead::Ival => {
+                let (lo, hi) = (words(base), words(base + 64));
+                for i in 0..16 {
+                    out[i] = ival_code(lo[i], hi[i]);
+                }
+            }
             KeyRead::Bool => {
                 let val = u16::from_le_bytes([buf[base], buf[base + 1]]);
                 let known = u16::from_le_bytes([buf[base + 2], buf[base + 3]]);
-                if known & (1 << i) != 0 {
-                    3u64 << 56 | (val >> i & 1) as u64
-                } else {
-                    4u64 << 56
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = if known & (1 << i) != 0 { 3u64 << 56 | (val >> i & 1) as u64 } else { 4u64 << 56 };
                 }
             }
         }
@@ -165,15 +221,21 @@ impl KeyField {
 }
 
 impl AsmBody {
-    /// Row `i`'s `Σ cell_mix` per half; `mix64(part + h)` is the boundary's key.
+    /// Every lane's `Σ cell_mix` per half (`mix64(part + h)` is the boundary's
+    /// key), LANE-MAJOR so it vectorizes: one pass per field over 16 lanes
+    /// (a body that fires averages ~7 live lanes; one key per emission
+    /// in scalar code was a third of the forward, room (6,2) 100% f57).
     #[inline]
-    fn key_words(&self, buf: &[u8], i: usize) -> (u64, u64) {
+    fn key_words16(&self, buf: &[u8]) -> ([u64; 16], [u64; 16]) {
         use celeste_engine::runtime2::mix64;
-        let (mut h1, mut h2) = (0u64, 0u64);
+        let (mut h1, mut h2) = ([0u64; 16], [0u64; 16]);
+        let mut code = [0u64; 16];
         for f in &self.key_fields {
-            let code = f.code(buf, i);
-            h1 = h1.wrapping_add(mix64(f.c[0] ^ code));
-            h2 = h2.wrapping_add(mix64(f.c[1] ^ code));
+            f.codes(buf, &mut code);
+            for i in 0..16 {
+                h1[i] = h1[i].wrapping_add(mix64(f.c[0] ^ code[i]));
+                h2[i] = h2[i].wrapping_add(mix64(f.c[1] ^ code[i]));
+            }
         }
         (h1, h2)
     }
@@ -276,7 +338,7 @@ impl AsmKernel {
     ) -> bool {
         debug_assert_eq!(cell_in.len(), chunk.width, "one input cell per input row");
         debug_assert!(lanes.end <= chunk.width);
-        CALL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats([1, 0, 0, 0, 0, 0, 0]);
         let mut lo = lanes.start;
         let mut idx = [0usize; 16];
         while lo < lanes.end {
@@ -310,6 +372,7 @@ impl AsmKernel {
         only: u16,
         sink: &mut crate::frame::ForwardSink,
     ) -> bool {
+        let t_setup = crate::frame::phases::start();
         let n = lanes.len();
         debug_assert!((1..=16).contains(&n));
         assert!(lanes.iter().all(|&l| l & !63 == lanes[0] & !63), "a slice within one id group: lanes {lanes:?}");
@@ -323,8 +386,6 @@ impl AsmKernel {
         let Scratch { inbuf, outbuf, .. } = &mut sc;
         let body_cols = &self.body_cols;
 
-        CALL_STATS[1].fetch_add(only.count_ones().min(n as u32) as u64, std::sync::atomic::Ordering::Relaxed);
-        CALL_STATS[2].fetch_add(16, std::sync::atomic::Ordering::Relaxed);
         // Utilization tallies, folded into `CALL_STATS[3..]` at the end.
         let (mut n_bodies, mut n_bodies_taken, mut n_lanes, mut n_unique) = (0u64, 0u64, 0u64, 0u64);
         {
@@ -336,7 +397,9 @@ impl AsmKernel {
                 Some(sk) => (0..n).filter(|&i| sk[lanes[i]]).fold(0u16, |m, i| m | (1 << i)),
                 None => 0,
             };
+            let t_ph = crate::frame::phases::add(crate::frame::phases::SETUP, t_setup);
             self.pack_input(&views, lanes, inbuf);
+            let t_ph = crate::frame::phases::add(crate::frame::phases::PACK, t_ph);
             // The spill frame is on THIS thread's stack: refuse rather than overrun.
             let (frame, stack) = (self.compiled.frame_bytes as usize, thread_stack());
             assert!(
@@ -353,6 +416,8 @@ impl AsmKernel {
                     &ctx as *const AsmCtx as *const c_void,
                 );
             }
+            let t_emit = crate::frame::phases::add(crate::frame::phases::KERNEL, t_ph);
+            let flush_before = sink.flush_ticks;
             let valid = (((1u32 << n) - 1) as u16) & only;
             for (body, cols) in self.bodies.iter().zip(body_cols) {
                 // Tri-state masks, each read where it MAY hold.
@@ -408,10 +473,15 @@ impl AsmKernel {
                 n_bodies_taken += 1;
                 n_lanes += take.count_ones() as u64;
                 let template = &self.acc_templates[body.outcome];
+                let keys = body.key_words16(outbuf);
+                let xfers = match slice_base {
+                    Some(_) => body.arc.ids16(outbuf, take, chunk, lanes, body.outcome, sink),
+                    None => [0; 16],
+                };
                 while take != 0 {
                     let i = take.trailing_zeros() as usize;
                     take &= take - 1;
-                    let (h1, h2) = body.key_words(outbuf, i);
+                    let (h1, h2) = (keys.0[i], keys.1[i]);
                     let part = template.part;
                     let key = (
                         runtime2::mix64(part.0.wrapping_add(h1)),
@@ -419,13 +489,7 @@ impl AsmKernel {
                     );
                     let cin = cell_in[lanes[i]];
                     // THE TRANSFER: per producer, on the edge, never in the row.
-                    let xfer = match slice_base {
-                        Some(_) => {
-                            let words = body.arc.words(outbuf, i);
-                            sink.xfer_id_raw(&words, |w| ArcSlots::decode(&body.arc.raw(w, chunk, lanes[i], body.outcome), chunk, lanes[i], body.outcome))
-                        }
-                        None => 0,
-                    };
+                    let xfer = xfers[i];
                     // EMISSION-TIME PROVENANCE: the pos-graph and backward
                     // edges from lane `i` are recorded right here.
                     if let Some((first_cin, r)) = sink.seen.insert_ref(key, cin, 0) {
@@ -468,11 +532,13 @@ impl AsmKernel {
                     sink.pushed(q).expect("flushing a full queue");
                 }
             }
+            if t_emit != 0 {
+                crate::frame::phases::add(crate::frame::phases::EMIT, t_emit);
+                crate::frame::phases::sub(crate::frame::phases::EMIT, sink.flush_ticks - flush_before);
+            }
         }
         sc.put_back();
-        for (i, n) in [n_bodies, n_bodies_taken, n_lanes, n_unique].into_iter().enumerate() {
-            CALL_STATS[3 + i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-        }
+        stats([0, only.count_ones().min(n as u32) as u64, 16, n_bodies, n_bodies_taken, n_lanes, n_unique]);
         true
     }
 
@@ -1015,7 +1081,7 @@ impl Registry {
         // (the other lanes masked off), not one call per run of a region: a
         // unit's cell order changes region every ~12 rows, so per-run calls
         // left half of every slice empty (room (1,0) f0-f70: 48% padding).
-        CALL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats([1, 0, 0, 0, 0, 0, 0]);
         let mut lo = lanes.start;
         let mut idx = [0usize; 16];
         let mut key = [None; 16];
@@ -1534,8 +1600,38 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
 static CALL_STATS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+thread_local! {
+    /// This thread's share of `CALL_STATS`, folded in by `fold_call_stats`:
+    /// six shared atomic adds per slice from every worker cost more than the
+    /// slice's kernel (room (6,2) f57: ~60 worker-seconds of 260).
+    static LOCAL_STATS: std::cell::Cell<[u64; 7]> = const { std::cell::Cell::new([0; 7]) };
+}
+
+/// Add `d` to this thread's counters (one thread-local access per slice).
+#[inline]
+fn stats(d: [u64; 7]) {
+    LOCAL_STATS.with(|c| {
+        let mut v = c.get();
+        for (a, b) in v.iter_mut().zip(d) {
+            *a += b;
+        }
+        c.set(v);
+    });
+}
+
+/// Fold this thread's counters into the shared ones (a wave worker's end).
+pub(crate) fn fold_call_stats() {
+    let v = LOCAL_STATS.with(|c| c.replace([0; 7]));
+    for (a, n) in CALL_STATS.iter().zip(v) {
+        if n != 0 {
+            a.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// Take (and reset) the call-shape counters.
 pub(crate) fn take_call_stats() -> [u64; 7] {
+    fold_call_stats();
     std::array::from_fn(|i| CALL_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 

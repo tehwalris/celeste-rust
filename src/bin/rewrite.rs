@@ -813,6 +813,9 @@ fn main() -> Result<()> {
                         celeste_rust::search::arc_edges::encode_pair(&mut b, &pair);
                         let p = b.iter().fold(0u64, |h, &x| celeste_engine::runtime2::mix64(h ^ x as u64));
                         let (t, s) = (node(e.target)?, node(e.base)?);
+                        if std::env::var("CELESTE_EDGE_DUMP").is_ok_and(|v| v == frame.to_string()) {
+                            eprintln!("edge {t:016x} {s:016x} {pair:?}");
+                        }
                         acc = acc.wrapping_add(celeste_engine::runtime2::mix64(t ^ s.rotate_left(21) ^ p.rotate_left(42)));
                         n += 1;
                     }

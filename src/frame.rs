@@ -11,6 +11,69 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
+/// Wave phase timers (`CELESTE_PHASES=1`): TSC ticks summed over workers,
+/// printed by `print_phases`. Off, `phase_start` is one load and a branch.
+pub mod phases {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub const NAMES: [&str; 14] = ["pack", "kernel", "emit (net of flush)", "flush", "flush.sort", "flush.admit", "flush.edges", "flush.gather", "end_call", "flush.pre", "flush.post", "slice.setup", "finish", "unit (all of engine.run)"];
+    pub const PACK: usize = 0;
+    pub const KERNEL: usize = 1;
+    pub const EMIT: usize = 2;
+    pub const FLUSH: usize = 3;
+    pub const SORT: usize = 4;
+    pub const ADMIT: usize = 5;
+    pub const EDGES: usize = 6;
+    pub const GATHER: usize = 7;
+    pub const END_CALL: usize = 8;
+    pub const PRE: usize = 9;
+    pub const POST: usize = 10;
+    pub const SETUP: usize = 11;
+    pub const FINISH: usize = 12;
+    pub const UNIT: usize = 13;
+    static TICKS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CELESTE_PHASES").is_ok_and(|v| v == "1"))
+    }
+    #[inline]
+    pub fn start() -> u64 {
+        if on() {
+            unsafe { core::arch::x86_64::_rdtsc() }
+        } else {
+            0
+        }
+    }
+    /// Add the ticks since `t0` (a `start`) to phase `p`; returns now.
+    #[inline]
+    pub fn add(p: usize, t0: u64) -> u64 {
+        if t0 == 0 {
+            return 0;
+        }
+        let t = unsafe { core::arch::x86_64::_rdtsc() };
+        TICKS[p].fetch_add(t - t0, Ordering::Relaxed);
+        t
+    }
+    /// Subtract nested ticks from phase `p` (the emit loop's flushes).
+    pub fn sub(p: usize, ticks: u64) {
+        TICKS[p].fetch_sub(ticks, Ordering::Relaxed);
+    }
+    pub fn print_phases(wall: std::time::Duration, workers: usize) {
+        if !on() {
+            return;
+        }
+        let v: Vec<u64> = TICKS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+        // TSC rate: ticks per second, measured against the wall clock.
+        let t0 = std::time::Instant::now();
+        let c0 = unsafe { core::arch::x86_64::_rdtsc() };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let hz = (unsafe { core::arch::x86_64::_rdtsc() } - c0) as f64 / t0.elapsed().as_secs_f64();
+        let budget = wall.as_secs_f64() * workers as f64;
+        let line: Vec<String> = NAMES.iter().zip(&v).map(|(n, &t)| format!("{n} {:.1}s ({:.0}%)", t as f64 / hz, 100.0 * t as f64 / hz / budget)).collect();
+        eprintln!("[phases] worker-seconds of {:.1} ({} x {:.2} s): {}", budget, workers, wall.as_secs_f64(), line.join(", "));
+    }
+}
+
+
 /// A columnar batch of lanes of one shape: the kernels' own `Rt2` with its
 /// key column. Only the per-lane key and position are exposed.
 pub struct Block {
@@ -763,9 +826,9 @@ pub struct ForwardSink<'a> {
     /// Note the sources of the rows level -1 drops (`drops`): a level-0
     /// tree's, so that a raise can re-expand them.
     note_drops: bool,
-    /// Per source id, the smallest horizon that admits one of its dropped
-    /// successors (`CostToGo::admitted_from`).
-    pub drops: rustc_hash::FxHashMap<u64, u32>,
+    /// Per source, the smallest horizon that admits one of its dropped
+    /// successors (`CostToGo::admitted_from`), shared by the wave's workers.
+    drops: Option<&'a DropNotes>,
     /// The next piece's seq, shared by the wave's workers.
     seqs: Option<&'a AtomicU32>,
     /// A raise's wave (`Layer::Raised`): no state may come from a later
@@ -816,6 +879,8 @@ pub struct ForwardSink<'a> {
     pub edges: rustc_hash::FxHashSet<(u32, u32)>,
     /// Rows emitted after the step's within-call dedup (the raw fan-out).
     pub emitted: u64,
+    /// TSC ticks spent in flushes (`phases`), nested in the emit loop.
+    pub flush_ticks: u64,
 }
 
 const NO_QUEUE: ((u64, u32), u32) = ((u64::MAX, u32::MAX), u32::MAX);
@@ -831,7 +896,7 @@ impl<'a> ForwardSink<'a> {
             door: None,
             filters: Filters::default(),
             note_drops: false,
-            drops: Default::default(),
+            drops: None,
             seqs: None,
             raised: None,
             sources_old: false,
@@ -863,7 +928,7 @@ impl<'a> ForwardSink<'a> {
             edges_on,
             edges: Default::default(),
             emitted: 0,
-
+            flush_ticks: 0,
         }
     }
 
@@ -878,8 +943,10 @@ impl<'a> ForwardSink<'a> {
         edges_dir: Option<&std::path::Path>,
         seqs: &'a AtomicU32,
         raised: Option<Raised>,
+        drops: Option<&'a DropNotes>,
     ) -> Self {
         let mut s = Self::empty(edges_on);
+        s.drops = drops;
         s.door = Some(door);
         s.filters = filters;
         s.note_drops = filters.notes_drops() && edges_dir.is_some();
@@ -895,8 +962,8 @@ impl<'a> ForwardSink<'a> {
     /// `admitted_from`; 0: a raise's known edge): one more source to note.
     #[inline]
     pub fn dropped_again(&mut self, base: u64, lane: usize, r: u64) {
-        if self.note_drops && r != 0 {
-            note_drop(&mut self.drops, base, 1u64 << lane, r as u32);
+        if let (true, Some(d), true) = (self.note_drops, self.drops, r != 0) {
+            d.note(base, 1u64 << lane, r as u32);
         }
     }
 
@@ -964,6 +1031,12 @@ impl<'a> ForwardSink<'a> {
 
     /// The step's end of a kernel call: the merge cache drains.
     pub fn end_call(&mut self) {
+        let t = phases::start();
+        self.end_call_inner();
+        phases::add(phases::END_CALL, t);
+    }
+
+    fn end_call_inner(&mut self) {
         for i in 0..self.direct.len() {
             let e = self.direct[i];
             if e.0 != u64::MAX {
@@ -1069,7 +1142,16 @@ impl<'a> ForwardSink<'a> {
     /// Flush queue `q`: filter, sort and collapse duplicates, admit at the
     /// door, gather into this worker's piece; the queue becomes a spare.
     fn flush(&mut self, q: usize) -> Result<()> {
+        let t_flush = phases::start();
+        let r = self.flush_inner(q);
+        let t_end = phases::add(phases::FLUSH, t_flush);
+        self.flush_ticks += t_end.saturating_sub(t_flush);
+        r
+    }
+
+    fn flush_inner(&mut self, q: usize) -> Result<()> {
         let door = self.door.expect("flush without a door");
+        let t_pre = phases::start();
         let slot = &mut self.slots[q];
         let n = slot.rows();
         if n > 0 {
@@ -1091,8 +1173,9 @@ impl<'a> ForwardSink<'a> {
             // A level-0 tree notes the dropped rows' sources (`raise`).
             if let (Some(from), true) = (dropped, self.note_drops && slot.pred_base.len() == n) {
                 let rows = slot.pred_base.iter().zip(&slot.pred_mask).map(|(&b, &m)| (b, m));
+                let d = self.drops.expect("a sink noting drops has the wave's notes");
                 for (b, m) in rows.chain(slot.extra.iter().map(|&(_, b, _, m)| (b, m))) {
-                    note_drop(&mut self.drops, b, m, from);
+                    d.note(b, m, from);
                 }
             }
             self.sort_buf.clear();
@@ -1103,6 +1186,7 @@ impl<'a> ForwardSink<'a> {
                     .filter(|(r, _)| allow.as_ref().is_none_or(|a| a[*r]))
                     .map(|(r, k)| (*k, r as u32)),
             );
+            let t_ph = phases::add(phases::PRE, t_pre);
             self.sort_buf.sort_unstable();
             // Rows sharing a key are one state with several predecessor masks.
             self.keys_buf.clear();
@@ -1130,7 +1214,9 @@ impl<'a> ForwardSink<'a> {
                 (slot.empty_piece(), seq, Vec::new())
             });
             let first_new = pack_id(frame, *seq, piece.width as u32);
+            let t_ph = phases::add(phases::SORT, t_ph);
             door.admit(slot.shape, slot.cell, &self.keys_buf, first_new, &mut self.ids_buf, &mut self.new_buf);
+            let t_ph = phases::add(phases::ADMIT, t_ph);
             // A RAISE runs old frames against the whole tree's door: a state
             // of a later layer here means the larger horizon reaches it
             // sooner, which would renumber the tree - refused, never absorbed.
@@ -1173,6 +1259,7 @@ impl<'a> ForwardSink<'a> {
                 }
                 self.t_edges += t_e.elapsed();
             }
+            let t_ph = phases::add(phases::EDGES, t_ph);
             if !self.new_buf.is_empty() {
                 self.rows_buf.clear();
                 // The first row of a new key's group is the one kept.
@@ -1186,7 +1273,9 @@ impl<'a> ForwardSink<'a> {
                 ids.extend((0..self.rows_buf.len() as u32).map(|k| first_new + k as u64));
                 debug_assert_eq!(ids.len(), piece.width);
             }
+            let t_ph = phases::add(phases::GATHER, t_ph);
             slot.clear();
+            phases::add(phases::POST, t_ph);
         }
         slot.live = false;
         slot.touched = false;
@@ -1342,14 +1431,65 @@ impl Filters<'_> {
     }
 }
 
-/// Note `mask`'s lanes from `base` as sources of a row dropped until horizon
-/// `from`, keeping each source's smallest.
-fn note_drop(drops: &mut rustc_hash::FxHashMap<u64, u32>, base: u64, mut mask: u64, from: u32) {
-    while mask != 0 {
-        let id = base + mask.trailing_zeros() as u64;
-        mask &= mask - 1;
-        let e = drops.entry(id).or_insert(from);
-        *e = (*e).min(from);
+/// The sources of rows level -1 dropped, per source its smallest horizon that
+/// admits one of them: DENSE over the wave's input rows (an atomic min per
+/// row), not a map - the sources are always input rows, and per-worker hash
+/// maps of tens of millions of entries were 68% of a frame (room (6,2) 100%
+/// f57). Looked up by id through the input's runs of consecutive ids.
+pub struct DropNotes {
+    /// `(first id, rows, offset into mins)` per run, sorted by id.
+    runs: Vec<(u64, u32, u32)>,
+    mins: Vec<AtomicU32>,
+}
+
+impl DropNotes {
+    pub fn new(blocks: &[Block]) -> Self {
+        let mut runs = Vec::new();
+        let mut off = 0u32;
+        for b in blocks {
+            let ids = &b.ids;
+            let mut i = 0;
+            while i < ids.len() {
+                let mut j = i + 1;
+                while j < ids.len() && ids[j] == ids[j - 1] + 1 {
+                    j += 1;
+                }
+                runs.push((ids[i], (j - i) as u32, off));
+                off += (j - i) as u32;
+                i = j;
+            }
+        }
+        runs.sort_unstable();
+        let mins = (0..off).map(|_| AtomicU32::new(u32::MAX)).collect();
+        DropNotes { runs, mins }
+    }
+
+    /// Note `mask`'s lanes from `base` as sources of a row dropped until `from`.
+    pub fn note(&self, base: u64, mask: u64, from: u32) {
+        let k = self.runs.partition_point(|r| r.0 <= base);
+        let (start, len, off) = self.runs[k.checked_sub(1).expect("a dropped row's source is an input row")];
+        let mut m = mask;
+        while m != 0 {
+            let id = base + m.trailing_zeros() as u64;
+            m &= m - 1;
+            let at = id - start;
+            assert!(at < len as u64, "source {id:#x} outside its input run");
+            self.mins[(off as u64 + at) as usize].fetch_min(from, Ordering::Relaxed);
+        }
+    }
+
+    /// `(id, smallest horizon)` per noted source, by id.
+    pub fn into_sorted(self) -> Vec<(u64, u32)> {
+        let mut out = Vec::new();
+        for (start, len, off) in &self.runs {
+            for k in 0..*len {
+                let m = self.mins[(off + k) as usize].load(Ordering::Relaxed);
+                if m != u32::MAX {
+                    out.push((start + k as u64, m));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1534,6 +1674,7 @@ pub fn forward_frame(
     );
     let mut st = FrameStats::default();
     let workers = threads();
+    let t_frame = std::time::Instant::now();
     st.blocks_in = frontier.len();
     st.lanes_in = frontier.iter().map(Block::lanes).sum();
     st.bytes_in = frontier.iter().map(Block::bytes).sum();
@@ -1549,6 +1690,8 @@ pub fn forward_frame(
     });
     units.sort_by_key(|&(bi, lo, _)| (cells[bi][lo], bi, lo));
     let next_unit = AtomicUsize::new(0);
+    // Level -1's drops are noted against the input rows (`DropNotes`).
+    let notes = (filters.notes_drops() && edges_dir.is_some()).then(|| DropNotes::new(&frontier));
     let (seqs, raised) = match layer {
         Layer::New => (AtomicU32::new(0), None),
         Layer::Raised(r) => (AtomicU32::new(r.first_seq), Some(r)),
@@ -1557,7 +1700,6 @@ pub fn forward_frame(
     let t = Instant::now();
     struct Done {
         pieces: Vec<Block>,
-        drops: rustc_hash::FxHashMap<u64, u32>,
         won: bool,
         kept: usize,
         flushes: u64,
@@ -1572,11 +1714,11 @@ pub fn forward_frame(
     let done: Vec<Done> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
-                let (frontier, cells, units, next_unit, seqs) = (&frontier, &cells, &units, &next_unit, &seqs);
+                let (frontier, cells, units, next_unit, seqs, notes) = (&frontier, &cells, &units, &next_unit, &seqs, notes.as_ref());
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     let t = Instant::now();
-                    let mut sink = ForwardSink::forward(door, filters, pos.is_some(), frame, w as u32, edges_dir, seqs, raised);
+                    let mut sink = ForwardSink::forward(door, filters, pos.is_some(), frame, w as u32, edges_dir, seqs, raised, notes);
                     loop {
                         let u = next_unit.fetch_add(1, Ordering::Relaxed);
                         let Some(&(bi, lo, hi)) = units.get(u) else { break };
@@ -1591,12 +1733,16 @@ pub fn forward_frame(
                         // rows after the cache). Its refs stay valid across
                         // calls: queued rows carry a generation, flushed ones an id.
                         sink.seen.clear();
+                        let t_unit = phases::start();
                         engine.run(b, &cells[bi], lo..hi, &mut sink)?;
+                        phases::add(phases::UNIT, t_unit);
                     }
+                    let t_fin = phases::start();
                     let pieces = sink.finish()?;
+                    phases::add(phases::FINISH, t_fin);
+                    crate::compiled::dispatch::fold_hits();
                     Ok(Done {
                         pieces,
-                        drops: std::mem::take(&mut sink.drops),
                         won: sink.won,
                         kept: sink.kept,
                         flushes: sink.flushes,
@@ -1628,9 +1774,7 @@ pub fn forward_frame(
 
     let mut won = false;
     let mut pieces: Vec<Block> = Vec::new();
-    let mut dropped: Vec<(u64, u32)> = Vec::new();
     for d in done {
-        dropped.extend(d.drops);
         st.lanes_raw += d.emitted as usize;
         st.lanes_kept += d.kept;
         st.flushes += d.flushes;
@@ -1650,9 +1794,8 @@ pub fn forward_frame(
     st.rss_file = crate::metrics::current_file_rss_gb();
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
-    // Per source its smallest horizon (sorted, so the first of an id's).
-    dropped.sort_unstable();
-    dropped.dedup_by_key(|e| e.0);
+    let dropped = notes.map_or_else(Vec::new, DropNotes::into_sorted);
+    phases::print_phases(t_frame.elapsed(), workers);
     Ok(Wave { next, won, stats: st, dropped })
 }
 
