@@ -24,13 +24,14 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{collapse_uniform, Cell2, Col, Rt2, AV};
 
 use crate::frame::{id_layer, id_row, id_seq, pack_id, Block};
 
 /// Rows per canonical piece: a shape's rows are cut into pieces of at most
 /// this many (the checkpoint writes one file per piece, in parallel).
-pub const PIECE_ROWS: usize = 1 << 18;
+pub const PIECE_ROWS: usize = 1 << 17;
 
 /// A wave's renumbering, flush id -> canonical id (`canonical_layer`). Ids
 /// of other layers, and of pieces below `first_seq` (a raised frame's own
@@ -148,8 +149,9 @@ pub fn canonical_layer(pieces: Vec<Flushed>, frame: u32, first_seq: u32) -> Resu
     shapes.sort_unstable();
     shapes.dedup();
     let grid = crate::trace::kernel::region_grid();
-    // Per shape its pieces and its rows in canonical order.
-    let mut orders: Vec<(Vec<usize>, Vec<Placed>)> = Vec::with_capacity(shapes.len());
+    // Per shape its pieces and its rows in canonical order, a bucket (cell)
+    // at a time, with the buckets' first positions (one more at the end).
+    let mut orders: Vec<(Vec<usize>, Vec<Vec<Placed>>, Vec<usize>)> = Vec::with_capacity(shapes.len());
     for &shape in &shapes {
         let ps: Vec<usize> = (0..pieces.len()).filter(|&i| pieces[i].rt2.shape_hash == shape).collect();
         let t = &pieces[ps[0]].rt2;
@@ -198,7 +200,8 @@ pub fn canonical_layer(pieces: Vec<Flushed>, frame: u32, first_seq: u32) -> Resu
         // Each bucket's rows by key.
         let buckets: Vec<usize> = (0..nb).collect();
         let sorted: Vec<Result<Vec<Placed>>> = par_map(&buckets, threads, |&b| {
-            let mut v: Vec<Placed> = Vec::new();
+            let n: usize = by_bucket.iter().map(|(_, at)| (at[b + 1] - at[b]) as usize).sum();
+            let mut v: Vec<Placed> = Vec::with_capacity(n);
             for (k, (&i, (rows, at))) in ps.iter().zip(&by_bucket).enumerate() {
                 let keys = &pieces[i].rt2.row_keys;
                 v.extend(rows[at[b] as usize..at[b + 1] as usize].iter().map(|&r| (keys[r as usize], (k as u64) << 32 | r as u64)));
@@ -208,17 +211,23 @@ pub fn canonical_layer(pieces: Vec<Flushed>, frame: u32, first_seq: u32) -> Resu
             ensure!(v.windows(2).all(|w| w[0].0 != w[1].0), "frame {frame}: shape {shape:016x} cell {}: a key flushed twice", cells[b]);
             Ok(v)
         });
-        let order: Vec<Placed> = sorted.into_iter().collect::<Result<Vec<_>>>()?.concat();
-        orders.push((ps, order));
+        let sorted: Vec<Vec<Placed>> = sorted.into_iter().collect::<Result<_>>()?;
+        let mut at = Vec::with_capacity(nb + 1);
+        at.push(0);
+        for v in &sorted {
+            at.push(at.last().unwrap() + v.len());
+        }
+        orders.push((ps, sorted, at));
     }
 
     // The canonical pieces: each shape's order cut into `PIECE_ROWS`, seqs in order.
     let mut jobs: Vec<(usize, usize, usize, u32)> = Vec::new();
     let mut seq = first_seq;
-    for (s, (_, order)) in orders.iter().enumerate() {
+    for (s, (_, _, at)) in orders.iter().enumerate() {
+        let n = *at.last().unwrap();
         let mut lo = 0;
-        while lo < order.len() {
-            let hi = (lo + PIECE_ROWS).min(order.len());
+        while lo < n {
+            let hi = (lo + PIECE_ROWS).min(n);
             ensure!(seq <= u16::MAX as u32, "frame {frame}: piece seq {seq} past the 16 bits an id holds");
             jobs.push((s, lo, hi, seq));
             seq += 1;
@@ -226,15 +235,22 @@ pub fn canonical_layer(pieces: Vec<Flushed>, frame: u32, first_seq: u32) -> Resu
         }
     }
     let blocks: Vec<Block> = par_map(&jobs, threads, |&(s, lo, hi, seq)| {
-        let (ps, order) = &orders[s];
-        let rows = &order[lo..hi];
+        let (ps, buckets, at) = &orders[s];
+        // The buckets' parts in positions `lo..hi`.
+        let mut parts: Vec<&[Placed]> = Vec::new();
+        let mut b = at.partition_point(|&x| x <= lo) - 1;
+        while b < buckets.len() && at[b] < hi {
+            parts.push(&buckets[b][lo.max(at[b]) - at[b]..hi.min(at[b + 1]) - at[b]]);
+            b += 1;
+        }
+        let rows = || parts.iter().flat_map(|p| p.iter());
         let srcs: Vec<&Rt2> = ps.iter().map(|&i| &pieces[i].rt2).collect();
-        for (r, &(_, src)) in rows.iter().enumerate() {
+        for (r, &(_, src)) in rows().enumerate() {
             let p = &pieces[ps[(src >> 32) as usize]];
             let at = starts[(p.seq - first_seq) as usize] + (src as u32) as u64;
             ids[at as usize].store(pack_id(frame, seq, r as u32), Ordering::Relaxed);
         }
-        let rt2 = gather(&srcs, rows);
+        let rt2 = gather(&srcs, rows, hi - lo);
         crate::compiled::asm_kernel::key_check_block(&rt2);
         let ids = (0..rt2.width as u32).map(|r| pack_id(frame, seq, r)).collect();
         Block::with_ids(rt2, ids, seq)
@@ -244,13 +260,30 @@ pub fn canonical_layer(pieces: Vec<Flushed>, frame: u32, first_seq: u32) -> Resu
     Ok((blocks, Renumber { layer: frame, first_seq, starts, ids }))
 }
 
-/// The block of `rows` (sources `(piece << 32 | row)` into `srcs`, one
-/// shape): a column the pieces hold alike stays uniform; otherwise numbers
-/// as `N`, intervals as `I`, anything else as `V`, then agreeing columns
-/// become uniform - a function of the rows' values, not of the pieces.
-fn gather(srcs: &[&Rt2], rows: &[Placed]) -> Rt2 {
+/// One source's column as the gather reads it: its rows, or one value.
+enum Src<'a, T> {
+    Rows(&'a [T]),
+    Same(T),
+}
+
+impl<T: Copy> Src<'_, T> {
+    #[inline]
+    fn at(&self, i: usize) -> T {
+        match self {
+            Src::Rows(v) => v[i],
+            Src::Same(x) => *x,
+        }
+    }
+}
+
+/// The block of the `n` rows `rows()` yields (sources `(piece << 32 |
+/// row)` into `srcs`, one shape): a column the pieces hold alike stays
+/// uniform; otherwise numbers as `N`, intervals as `I`, anything else as
+/// `V`, then agreeing columns become uniform - a function of the rows'
+/// values, not of the pieces.
+fn gather<'a, I: Iterator<Item = &'a Placed>>(srcs: &[&Rt2], rows: impl Fn() -> I, n: usize) -> Rt2 {
     let t = srcs[0];
-    let at = |s: u64| (srcs[(s >> 32) as usize], (s as u32) as usize);
+    let split = |s: u64| ((s >> 32) as usize, (s as u32) as usize);
     let cols = (0..t.cols.len())
         .map(|c| {
             if !matches!(t.structure[c], Cell2::Val) {
@@ -261,40 +294,41 @@ fn gather(srcs: &[&Rt2], rows: &[Placed]) -> Rt2 {
                     return Col::U(v);
                 }
             }
-            let col = if srcs.iter().all(|s| matches!(s.cols[c], Col::N(_) | Col::U(AV::Num(_)))) {
-                Col::N(rows
-                    .iter()
-                    .map(|&(_, s)| {
-                        let (r, i) = at(s);
-                        match &r.cols[c] {
-                            Col::N(v) => v[i],
-                            Col::U(AV::Num(n)) => *n,
-                            _ => unreachable!("checked: a number column"),
-                        }
-                    })
-                    .collect())
-            } else if srcs.iter().all(|s| matches!(s.cols[c], Col::I(_) | Col::U(AV::Ival(..)))) {
-                Col::I(rows
-                    .iter()
-                    .map(|&(_, s)| {
-                        let (r, i) = at(s);
-                        match &r.cols[c] {
-                            Col::I(v) => v[i],
-                            Col::U(AV::Ival(a, b)) => (*a, *b),
-                            _ => unreachable!("checked: an interval column"),
-                        }
-                    })
-                    .collect())
+            let nums: Option<Vec<Src<P8>>> = srcs
+                .iter()
+                .map(|s| match &s.cols[c] {
+                    Col::N(v) => Some(Src::Rows(v.as_slice())),
+                    Col::U(AV::Num(x)) => Some(Src::Same(*x)),
+                    _ => None,
+                })
+                .collect();
+            let ivals: Option<Vec<Src<(P8, P8)>>> = srcs
+                .iter()
+                .map(|s| match &s.cols[c] {
+                    Col::I(v) => Some(Src::Rows(v.as_slice())),
+                    Col::U(AV::Ival(a, b)) => Some(Src::Same((*a, *b))),
+                    _ => None,
+                })
+                .collect();
+            let col = if let Some(src) = nums {
+                Col::N(rows().map(|&(_, s)| {
+                    let (p, i) = split(s);
+                    src[p].at(i)
+                }).collect())
+            } else if let Some(src) = ivals {
+                Col::I(rows().map(|&(_, s)| {
+                    let (p, i) = split(s);
+                    src[p].at(i)
+                }).collect())
             } else {
-                let vs: Vec<AV> = rows
-                    .iter()
+                let vs: Vec<AV> = rows()
                     .map(|&(_, s)| {
-                        let (r, i) = at(s);
-                        r.cols[c].at(i)
+                        let (p, i) = split(s);
+                        srcs[p].cols[c].at(i)
                     })
                     .collect();
                 if vs.iter().all(|v| matches!(v, AV::Num(_))) {
-                    Col::N(vs.iter().map(|v| if let AV::Num(n) = v { *n } else { unreachable!() }).collect())
+                    Col::N(vs.iter().map(|v| if let AV::Num(x) = v { *x } else { unreachable!() }).collect())
                 } else if vs.iter().all(|v| matches!(v, AV::Ival(..))) {
                     Col::I(vs.iter().map(|v| if let AV::Ival(a, b) = v { (*a, *b) } else { unreachable!() }).collect())
                 } else {
@@ -305,7 +339,7 @@ fn gather(srcs: &[&Rt2], rows: &[Placed]) -> Rt2 {
         })
         .collect();
     Rt2 {
-        width: rows.len(),
+        width: n,
         structure: t.structure.clone(),
         cols,
         globals: t.globals.clone(),
@@ -314,6 +348,6 @@ fn gather(srcs: &[&Rt2], rows: &[Placed]) -> Rt2 {
         cache: t.cache.clone(),
         prints: t.prints.clone(),
         shape_hash: t.shape_hash,
-        row_keys: rows.iter().map(|r| r.0).collect(),
+        row_keys: rows().map(|r| r.0).collect(),
     }
 }
