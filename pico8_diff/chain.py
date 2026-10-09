@@ -139,6 +139,11 @@ def summary(name, lines, nsegs=1):
         s += ("PREVIOUS ROOM FAILED (" if early else "FAILED (") + "; ".join(bad) + ")"
     if last:
         s += f"exit {last['count']}f berry {last['berry']}"
+    elif not bad and len(exits) < nsegs - 1:
+        # An earlier segment's database file never exits on PICO-8 (it
+        # finishes only in UCT/Celia, which compute in doubles): this room
+        # is never reached.
+        s += f"PREVIOUS ROOM DID NOT EXIT (segment {len(exits) + 1} of {nsegs})"
     elif not bad:
         s += "NO EXIT"
     return s, last

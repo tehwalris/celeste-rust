@@ -309,6 +309,9 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
         "  printh('@P8@ '..line)",
         "  end",
         "end",
+        # The run's end: a chain whose earlier segment never exits prints no
+        # frame line (they are the last segment's), and that is a result.
+        "printh('@P8@ end')",
         "_init = nil _update = nil _draw = nil",
     ]
     # __map__: rows 0..31 as 32 lines of 128 bytes. Rows 32..63 live in the
@@ -334,6 +337,10 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
         f.write("__map__\n" + "\n".join(map_lines) + "\n")
 
 
+class NoCartOutput(RuntimeError):
+    """PICO-8 ran the cart and it printed nothing (`run`)."""
+
+
 def run(inputs, frames, keep=False, **kw):
     """Build the cart (`build_cart`'s keywords), run it on PICO-8 headless,
     return its `@P8@` lines."""
@@ -349,10 +356,12 @@ def run(inputs, frames, keep=False, **kw):
         sys.exit(f"[replay] pico8 timed out; it said: {(e.stdout or b'')[-500:]!r}")
     lines = [l[len("@P8@ "):] for l in proc.stdout.splitlines() if l.startswith("@P8@ ")]
     if not lines:
-        print("[replay] no cart output; pico8 said:", file=sys.stderr)
-        print(proc.stdout[-2000:], file=sys.stderr)
-        print(proc.stderr[-2000:], file=sys.stderr)
-        sys.exit(1)
+        # The driver always prints its `end` line: none means the cart did not
+        # run to its end (a runtime error, a halt). Raised, not exited, so a
+        # caller in the same process (category_runner, check_uploads) can
+        # report it: a SystemExit passes `except Exception` and killed the
+        # runner silently (gemskip100 2900m, 2026-10-09).
+        raise NoCartOutput(f"no cart output ({cart}); pico8 said: {(proc.stdout[-500:] + proc.stderr[-500:]).strip()!r}")
     if not keep:
         os.remove(cart)
         os.rmdir(work)
@@ -382,9 +391,14 @@ def main():
         ap.error("a witness file or --inputs is required")
     room = tuple(int(v) for v in args.room.split(",")) if args.room else None
     seeds = [float(v) for v in args.balloon_seeds.split(",") if v] if args.balloon_seeds is not None else None
-    for l in run(inputs, args.frames or len(inputs), args.keep, lua_path=args.lua, begin_game=args.begin_game, room=room, balloon_seeds=seeds,
-                 one_dash=args.one_dash, jank=args.jank, dump=args.dump, trace_objects=args.trace_objects):
-        print(l)
+    try:
+        lines = run(inputs, args.frames or len(inputs), args.keep, lua_path=args.lua, begin_game=args.begin_game, room=room, balloon_seeds=seeds,
+                     one_dash=args.one_dash, jank=args.jank, dump=args.dump, trace_objects=args.trace_objects)
+    except NoCartOutput as e:
+        sys.exit(f"[replay] {e}")
+    for l in lines:
+        if l != "end":
+            print(l)
 
 
 if __name__ == "__main__":

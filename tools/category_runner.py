@@ -350,7 +350,13 @@ def run(job, outdir, binary):
                 continue
             mine = os.path.join(jd, f"ours-{entry['file']}")
             open(mine, "w").write(f"[{sd}]" + ",".join(map(str, ours[cut:])))
-            res["real_play"], res["upload_cut"] = check_uploads.check(mine, False, cat), cut
+            # A replay that fails (PICO-8 printed nothing; a chain.py
+            # SystemExit) is this candidate's result, not the runner's end.
+            try:
+                res["real_play"] = check_uploads.check(mine, False, cat)
+            except (Exception, SystemExit) as ex:
+                res["real_play"] = f"check failed: {type(ex).__name__}: {ex}"[:300]
+            res["upload_cut"] = cut
             if res["real_play"].endswith("\tVALID"):
                 if sd != seeds:
                     res["upload_seeds"] = sd
@@ -445,8 +451,11 @@ def main():
         print(f"[{time.strftime('%H:%M')}] {job['cat']} {job['name']} {job['room']}", flush=True)
         try:
             res = run(job, outdir, binary)
-        except Exception as ex:
-            res = {"key": f"{job['cat']}/{job['name']}{job.get('tag', '')}", "status": f"runner error: {ex}"[:300]}
+        except (Exception, SystemExit) as ex:
+            # SystemExit too: chain.py and replay.py exit on what they cannot
+            # run, and it passed `except Exception` and ended the runner with
+            # no results line (gemskip100 2900m, 2026-10-09).
+            res = {"key": f"{job['cat']}/{job['name']}{job.get('tag', '')}", "status": f"runner error: {type(ex).__name__}: {ex}"[:300]}
         res["end"] = time.strftime("%H:%M")
         with open(results, "a") as f:
             f.write(json.dumps(res) + "\n")

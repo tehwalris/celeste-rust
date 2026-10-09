@@ -76,14 +76,19 @@ def check(path, nudge, cat):
     st, n = uct(level, path, gemskip)
     cst, cn = celia(level, path, gemskip)
     ch, ch_s = chain_result(chain.chain(cat, level, seeds, inputs, max(level - 1, 1)), 2 if level > 1 else 1)
-    # A database file that dies on PICO-8 (it was made in a tool computing in
-    # doubles: gemskipany 2600m) breaks the boot chain: it restarts at the
-    # level after it, by an IL load, and says so.
+    # A database file that dies on PICO-8, or never exits there (it was made
+    # in a tool computing in doubles: gemskipany 2600m dies, gemskip100 2800m
+    # never exits), breaks the boot chain: it restarts at the level after it,
+    # by an IL load, and says so (as chain.entry_jank does).
     first = 1
     while True:
+        nsegs = level - first + 1
         lines = chain.chain(cat, level, seeds, inputs, first)
-        bt, bt_s = chain_result(lines, level - first + 1)
-        early = [int(l.split()[2]) for l in chain.parse(lines)[1] if l.startswith("death seg ") and int(l.split()[2]) < level - first + 1]
+        bt, bt_s = chain_result(lines, nsegs)
+        exits, bad, _ = chain.parse(lines)
+        early = [int(l.split()[2]) for l in bad if l.startswith("death seg ") and int(l.split()[2]) < nsegs]
+        if not early and not bad and len(exits) < nsegs - 1:
+            early = [len(exits) + 1]
         if not early:
             break
         bt_s += f" -> from level {first + early[0]}"
