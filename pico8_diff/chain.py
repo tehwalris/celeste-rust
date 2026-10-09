@@ -147,8 +147,8 @@ def summary(name, lines, nsegs=1):
 def entry_jank(cat, level):
     """The loading-frame index J real play enters `level` with: the leaving
     player's index in the category's boot chain (its database files from
-    100m). A database file that dies on PICO-8 breaks the chain: it restarts
-    at the level after it (an IL load). None for 100m (the boot's loading
+    100m). A database file that dies on PICO-8, or never exits there, breaks
+    the chain: it restarts at the level after it (an IL load). None for 100m (the boot's loading
     frame updates no object)."""
     if level == 1:
         return None
@@ -158,9 +158,15 @@ def entry_jank(cat, level):
         if len(exits) >= level - first:
             return int(exits[level - first - 1]["player_idx"])
         dead = [int(b.split()[2]) for b in bad if b.startswith("death seg ")]
-        if not dead:
+        # A file that dies, or that never exits on PICO-8 (it finishes only
+        # in UCT/Celia, which compute in doubles), breaks the chain there.
+        stuck = len(exits) if not bad and len(exits) < level - first else None
+        if not dead and stuck is None:
             raise SystemExit(f"chain.py: the {cat} boot chain to level {level} failed: {bad}")
-        first += dead[0]
+        first += dead[0] if dead else stuck + 1
+        if first >= level:
+            # The previous room's file is what breaks: `level` is IL-loaded.
+            return None
 
 
 def check_start(cat, level, binary):
