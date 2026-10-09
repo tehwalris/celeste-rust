@@ -53,6 +53,7 @@ pub fn missed_lanes() -> u64 {
 
 pub fn print_kernel_hits() {
     fold_hits();
+    super::asm_kernel::print_body_stats();
     let v: Vec<u64> = KERNEL_HITS
         .iter()
         .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))

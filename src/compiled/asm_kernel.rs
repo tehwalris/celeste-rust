@@ -318,6 +318,8 @@ fn thread_stack() -> usize {
 
 /// One shape's assembled kernel and the metadata the append needs.
 struct AsmKernel {
+    /// DIAGNOSTIC: per body (lanes taken, lanes emitted after the dup mask).
+    body_stats: Vec<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
     loaded: Loaded,
     compiled: Compiled,
     bodies: Vec<AsmBody>,
@@ -481,6 +483,7 @@ impl AsmKernel {
                 // outcome, every stored root and transfer root equal) is
                 // that body's emission again: skip it (`DupRef`).
                 took[bi] = take;
+                let take_before = take;
                 if take != 0 {
                     for r in &body.dup_refs {
                         let cand = take & took[r.body];
@@ -491,6 +494,10 @@ impl AsmKernel {
                             }
                         }
                     }
+                }
+                if take_before != 0 {
+                    self.body_stats[bi].0.fetch_add(take_before.count_ones() as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.body_stats[bi].1.fetch_add(take.count_ones() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 n_bodies += 1;
                 if take == 0 {
@@ -1478,6 +1485,130 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
         b.pos = pos_sources(&acc_templates[b.outcome].build(), &b.fields)?;
     }
     dup_refs(&mut asm_bodies);
+    if let Ok(th) = std::env::var("CELESTE_GRAPH_REPORT") {
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let th: usize = th.parse().unwrap_or(300);
+        if bodies.len() >= th && !DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            use crate::transpile::graph::{NodeId, Op};
+            let nm = crate::search::inspect::cell_names(&r.frame.in_rt2, crate::compiled::ids());
+            let labels: Vec<String> = { let mut nb = 0; let names = ["left", "right", "up", "down", "jump", "dash"]; r.frame.fork_origins.iter().map(|(_, o)| if o == crate::trace::domain::UNKNOWN_BOOL_ORIGIN { nb += 1; names.get(nb - 1).unwrap_or(&"btn?").to_string() } else { o.chars().take(30).collect() }).collect() };
+            { let mut v: Vec<_> = nm.iter().filter(|(c, _)| [20usize, 259, 260, 271, 282, 283, 324, 41].contains(c)).collect(); v.sort(); eprintln!("[graph] names {:?}", v); }
+            eprintln!("[graph] kernel shape {si} {tag}: {} bodies, {} fused nodes, {} outcomes; forks {:?}", bodies.len(), fused.len(), r.bound.outcomes.len(), labels);
+            for (o, out) in r.bound.outcomes.iter().enumerate() {
+                let bs: Vec<usize> = (0..bodies.len()).filter(|&i| bodies[i].outcome == o).collect();
+                let nf = out.outputs.len();
+                eprintln!("[graph] outcome {o}: {} bodies, {} output fields", bs.len(), nf);
+                if bs.len() < 2 { continue; }
+                // divergence: lockstep walk collecting (guard chain, a, b)
+                fn diverge(g: &crate::transpile::graph::Graph, a: NodeId, b: NodeId, path: &mut Vec<(NodeId, bool)>, out: &mut Vec<(Vec<(NodeId, bool)>, NodeId, NodeId)>, budget: &mut usize) {
+                    if a == b || *budget == 0 { return; }
+                    *budget -= 1;
+                    let (na, nb) = (g.get(a), g.get(b));
+                    if na.op == nb.op && na.args.len() == nb.args.len() && !na.args.is_empty() {
+                        let is_sel = matches!(na.op, Op::Sel) && na.args[0] == nb.args[0];
+                        for k in 0..na.args.len() {
+                            if na.args[k] == nb.args[k] { continue; }
+                            if is_sel && k > 0 { path.push((na.args[0], k == 1)); diverge(g, na.args[k], nb.args[k], path, out, budget); path.pop(); }
+                            else { diverge(g, na.args[k], nb.args[k], path, out, budget); }
+                        }
+                    } else { out.push((path.clone(), a, b)); }
+                }
+                for d in 0..labels.len() {
+                    let (mut pairs, mut diff_pairs) = (0usize, 0usize);
+                    let mut fields: std::collections::BTreeMap<String, usize> = Default::default();
+                    let mut guards: std::collections::BTreeMap<String, usize> = Default::default();
+                    let mut sample: Option<String> = None;
+                    for &j in &bs { for &i in &bs { if i >= j { continue; }
+                        let (a, b) = (&bodies[i], &bodies[j]);
+                        if (0..a.splits.len()).filter(|&k| a.splits.get(k) != b.splits.get(k)).collect::<Vec<_>>() != vec![d] { continue; }
+                        pairs += 1;
+                        let dk: Vec<usize> = (0..a.roots.len()).filter(|&k| a.roots[k] != b.roots[k]).collect();
+                        if dk.is_empty() { continue; }
+                        diff_pairs += 1;
+                        for &k in &dk {
+                            let fname = if k < nf { nm.get(&(out.outputs[k].0 as usize)).cloned().unwrap_or(format!("cell{}", out.outputs[k].0)) } else if k == nf { "ERROR".into() } else if k == nf + 1 { "LIVE".into() } else { format!("transfer{}", k - nf - 2) };
+                            *fields.entry(fname.clone()).or_default() += 1;
+                            let mut outv = Vec::new(); let mut budget = 2000;
+                            diverge(&fused, a.roots[k], b.roots[k], &mut Vec::new(), &mut outv, &mut budget);
+                            for (path, x, y) in &outv {
+                                let gs: Vec<String> = path.iter().map(|(c, pos)| format!("{}{}", if *pos {""} else {"NOT "}, crate::trace::emit::show_tree(&fused, *c, 2))).collect();
+                                *guards.entry(format!("[{}] depth {}", gs.join(" & ").chars().take(220).collect::<String>(), path.len())).or_default() += 1;
+                                if sample.is_none() && k < nf { sample = Some(format!("{fname}: guards {:?}\n        A {}\n        B {}", gs, crate::trace::emit::show_tree(&fused, *x, 3), crate::trace::emit::show_tree(&fused, *y, 3))); }
+                            }
+                        }
+                    } }
+                    if pairs == 0 { continue; }
+                    eprintln!("[graph]   fork {} ({}): {pairs} one-flip pairs, {diff_pairs} with differing roots", d, labels[d]);
+                    let mut fv: Vec<_> = fields.into_iter().collect(); fv.sort_by_key(|x| std::cmp::Reverse(x.1));
+                    eprintln!("[graph]     fields differing (pairs): {:?}", fv.iter().take(14).collect::<Vec<_>>());
+                    let mut gv: Vec<_> = guards.into_iter().collect(); gv.sort_by_key(|x| std::cmp::Reverse(x.1));
+                    for (g, n) in gv.iter().take(5) { eprintln!("[graph]     {n:5} x guards {g}"); }
+                    if let Some(s) = sample { eprintln!("[graph]     sample {s}"); }
+                }
+            }
+        }
+    }
+    if let Ok(th) = std::env::var("CELESTE_EQ_REPORT") {
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let th: usize = th.parse().unwrap_or(300);
+        if bodies.len() >= th && !DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eq_report(&fused, &bodies, r, si);
+        }
+    }
+    if std::env::var_os("CELESTE_OUTCOME_DUMP").is_some() && si == 1 {
+        let nm = crate::search::inspect::cell_names(&r.frame.in_rt2, crate::compiled::ids());
+        let want = ["freeze", "has_dashed", "player[0].dash_time", "player[0].djump", "player.x", "player.y"];
+        eprintln!("[odump] shape {si}: {} outcomes, {} bodies, forks {:?}", r.bound.outcomes.len(), bodies.len(), r.frame.fork_origins.iter().map(|(d,o)| format!("{d}:{}", if o == crate::trace::domain::UNKNOWN_BOOL_ORIGIN {"btn"} else {o.as_str()})).collect::<Vec<_>>());
+        for (o, out) in r.bound.outcomes.iter().enumerate() {
+            let bs: Vec<&crate::trace::emit::AsmBody> = bodies.iter().filter(|b| b.outcome == o).collect();
+            eprintln!("[odump] outcome {o}: {} bodies, {} output fields", bs.len(), out.outputs.len());
+            // the body with only the dash button pressed, else the first
+            let pick = bs.iter().find(|b| b.splits.iter().enumerate().all(|(d, v)| if d == 5 { *v == 1 } else { *v == 0 })).or(bs.first());
+            if let Some(b) = pick {
+                eprintln!("[odump]   body splits {:?}", b.splits);
+                for (k, (cell, _, _)) in out.outputs.iter().enumerate() {
+                    if let Some(n) = nm.get(&(*cell as usize)) { if want.contains(&n.as_str()) {
+                        eprintln!("[odump]     {n} = {}", crate::trace::emit::show_tree(&fused, b.roots[k], 4));
+                    } }
+                }
+                let nf = out.outputs.len();
+                eprintln!("[odump]     live = {}", crate::trace::emit::show_tree(&fused, b.roots[nf + 1], 3));
+            }
+        }
+    }
+    if std::env::var_os("CELESTE_DUP_EXPLAIN").is_some() {
+        static DONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let btn: Vec<u8> = r.frame.fork_origins.iter().filter(|(_, o)| o == crate::trace::domain::UNKNOWN_BOOL_ORIGIN).map(|(d, _)| *d).collect();
+        let names = ["left", "right", "up", "down", "jump", "dash"];
+        let want_btn = std::env::var("CELESTE_DUP_EXPLAIN").unwrap().parse::<usize>().unwrap_or(5);
+        if let Some(&dd) = btn.get(want_btn) {
+            'outer: for j in 0..bodies.len() {
+                for i in 0..j {
+                    let (a, b) = (&bodies[i], &bodies[j]);
+                    if a.outcome != b.outcome { continue; }
+                    let diff: Vec<usize> = (0..a.splits.len()).filter(|&d| a.splits.get(d) != b.splits.get(d)).collect();
+                    if diff != vec![dd as usize] { continue; }
+                    let nf = r.bound.outcomes[a.outcome].outputs.len();
+                    let fields: Vec<usize> = (0..nf).filter(|&k| a.roots[k] != b.roots[k]).collect();
+                    if fields.is_empty() || fields.len() > 6 { continue; }
+                    if DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2 { break 'outer; }
+                    eprintln!("[explain] shape {si} outcome {}: bodies {i} and {j} differ only in btn {} ({:?} vs {:?}); forks: {:?}", a.outcome, names[want_btn], a.splits.get(dd as usize), b.splits.get(dd as usize), r.frame.fork_origins.iter().map(|(d,o)| format!("{d}:{}", if o == crate::trace::domain::UNKNOWN_BOOL_ORIGIN {"btn"} else {o.as_str()})).collect::<Vec<_>>());
+                    eprintln!("[explain]   split values a {:?}", a.splits);
+                    let nm = crate::search::inspect::cell_names(&r.frame.in_rt2, crate::compiled::ids());
+                    let mut ks: Vec<_> = nm.iter().filter(|(c, _)| [20usize, 41, 237, 238, 247].contains(c)).collect(); ks.sort();
+                    eprintln!("[explain]   names {:?}", ks);
+                    let nf2 = r.bound.outcomes[a.outcome].outputs.len();
+                    eprintln!("[explain]   live A = {}\n      live B = {}", crate::trace::emit::show_tree(&fused, a.roots[nf2 + 1], 9), crate::trace::emit::show_tree(&fused, b.roots[nf2 + 1], 9));
+                    for k in 0..nf2 { let c = r.bound.outcomes[a.outcome].outputs[k].0; if let Some(n) = nm.get(&(c as usize)) { if n.contains("dash_time") || n.contains("djump") || n.contains("spd") { eprintln!("[explain]   {n}: A = {} | B = {}", crate::trace::emit::show_tree(&fused, a.roots[k], 3), crate::trace::emit::show_tree(&fused, b.roots[k], 3)); } } }
+                    for k in fields {
+                        let cell = r.bound.outcomes[a.outcome].outputs[k].0;
+                        eprintln!("[explain]   field {k} (cell {cell}):\n      A = {}\n      B = {}", crate::trace::emit::show_tree(&fused, a.roots[k], 7), crate::trace::emit::show_tree(&fused, b.roots[k], 7));
+                    }
+                    break 'outer;
+                }
+            }
+        }
+    }
 
     let input_names = compiled
         .input_cells
@@ -1491,6 +1622,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
                 .unwrap_or_else(|| format!("cell {c}, not an input slot"))
         })
         .collect();
+    let asm_bodies_len = asm_bodies.len();
     Ok((
         shape,
         AsmKernel {
@@ -1505,6 +1637,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
             flat_roots: if kernel_graph_kept() { flat_roots } else { Vec::new() },
             room,
             input_names,
+            body_stats: (0..asm_bodies_len).map(|_| Default::default()).collect(),
         },
     ))
 }
@@ -1828,4 +1961,231 @@ pub(crate) fn run_chunk(
         Some(reg) => reg.run_chunk(chunk, cell_in, lanes, sink),
         None => false,
     }
+}
+
+
+/// DIAGNOSTIC (CELESTE_EQ_REPORT): the symbolic "same successor" predicate of
+/// one-fork body pairs, built by structural rules over the fused graph.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+enum EqE {
+    T,
+    F,
+    /// A guard: node `c` is true (`true`) or false (`false`).
+    C(crate::transpile::graph::NodeId, bool),
+    /// Two nodes the rules cannot relate: a per-lane comparison.
+    Opaque(crate::transpile::graph::NodeId, crate::transpile::graph::NodeId),
+    And(Vec<EqE>),
+    Or(Vec<EqE>),
+}
+
+impl EqE {
+    fn and(v: Vec<EqE>) -> EqE {
+        let mut out = Vec::new();
+        for e in v {
+            match e {
+                EqE::T => {}
+                EqE::F => return EqE::F,
+                EqE::And(xs) => out.extend(xs),
+                x => out.push(x),
+            }
+        }
+        out.sort();
+        out.dedup();
+        match out.len() { 0 => EqE::T, 1 => out.pop().unwrap(), _ => EqE::And(out) }
+    }
+    fn or(v: Vec<EqE>) -> EqE {
+        let mut out = Vec::new();
+        for e in v {
+            match e {
+                EqE::F => {}
+                EqE::T => return EqE::T,
+                EqE::Or(xs) => out.extend(xs),
+                x => out.push(x),
+            }
+        }
+        out.sort();
+        out.dedup();
+        // c or not c
+        for x in &out { if let EqE::C(n, b) = x { if out.contains(&EqE::C(*n, !b)) { return EqE::T; } } }
+        match out.len() { 0 => EqE::F, 1 => out.pop().unwrap(), _ => EqE::Or(out) }
+    }
+    fn size(&self) -> (usize, usize) {
+        match self {
+            EqE::T | EqE::F => (0, 0),
+            EqE::C(..) => (1, 0),
+            EqE::Opaque(..) => (0, 1),
+            EqE::And(v) | EqE::Or(v) => v.iter().fold((0, 0), |a, e| { let s = e.size(); (a.0 + s.0, a.1 + s.1) }),
+        }
+    }
+    fn show(&self, g: &crate::transpile::graph::Graph, names: &dyn Fn(crate::transpile::graph::NodeId) -> String) -> String {
+        match self {
+            EqE::T => "T".into(),
+            EqE::F => "F".into(),
+            EqE::C(c, b) => format!("{}{}", if *b { "" } else { "!" }, names(*c)),
+            EqE::Opaque(a, b) => format!("[{} == {}]", crate::trace::emit::show_tree(g, *a, 1), crate::trace::emit::show_tree(g, *b, 1)),
+            EqE::And(v) => format!("({})", v.iter().map(|e| e.show(g, names)).collect::<Vec<_>>().join(" & ")),
+            EqE::Or(v) => format!("({})", v.iter().map(|e| e.show(g, names)).collect::<Vec<_>>().join(" | ")),
+        }
+    }
+}
+
+fn eq_nodes(
+    g: &crate::transpile::graph::Graph,
+    a: crate::transpile::graph::NodeId,
+    b: crate::transpile::graph::NodeId,
+    memo: &mut HashMap<(u32, u32), EqE>,
+    depth: usize,
+) -> EqE {
+    use crate::transpile::graph::Op;
+    if a == b { return EqE::T; }
+    let key = (a.min(b) as u32, a.max(b) as u32);
+    if let Some(e) = memo.get(&key) { return e.clone(); }
+    let (na, nb) = (g.get(a), g.get(b));
+    let e = if depth > 40 {
+        EqE::Opaque(a, b)
+    } else {
+        match (&na.op, &nb.op) {
+            (Op::Const(l1, h1), Op::Const(l2, h2)) => if (l1, h1) == (l2, h2) { EqE::T } else { EqE::F },
+            (Op::ConstBool(x), Op::ConstBool(y)) => if x == y { EqE::T } else { EqE::F },
+            (Op::Sel, Op::Sel) if na.args[0] == nb.args[0] => {
+                let c = na.args[0];
+                EqE::or(vec![
+                    EqE::and(vec![EqE::C(c, true), eq_nodes(g, na.args[1], nb.args[1], memo, depth + 1)]),
+                    EqE::and(vec![EqE::C(c, false), eq_nodes(g, na.args[2], nb.args[2], memo, depth + 1)]),
+                ])
+            }
+            (Op::Sel, _) => {
+                let c = na.args[0];
+                EqE::or(vec![
+                    EqE::and(vec![EqE::C(c, true), eq_nodes(g, na.args[1], b, memo, depth + 1)]),
+                    EqE::and(vec![EqE::C(c, false), eq_nodes(g, na.args[2], b, memo, depth + 1)]),
+                ])
+            }
+            (_, Op::Sel) => {
+                let c = nb.args[0];
+                EqE::or(vec![
+                    EqE::and(vec![EqE::C(c, true), eq_nodes(g, a, nb.args[1], memo, depth + 1)]),
+                    EqE::and(vec![EqE::C(c, false), eq_nodes(g, a, nb.args[2], memo, depth + 1)]),
+                ])
+            }
+            (x, y) if x == y && na.args.len() == nb.args.len() && !na.args.is_empty() => {
+                // Equal operands give equal results (sufficient, not necessary).
+                let parts: Vec<EqE> = na.args.iter().zip(&nb.args).map(|(p, q)| eq_nodes(g, *p, *q, memo, depth + 1)).collect();
+                let all = EqE::and(parts);
+                match all { EqE::F => EqE::Opaque(a, b), x => if x.size().1 > 0 && matches!(x, EqE::And(_)) { EqE::Opaque(a, b) } else { x } }
+            }
+            _ => EqE::Opaque(a, b),
+        }
+    };
+    memo.insert(key, e.clone());
+    e
+}
+
+fn eq_report(fused: &crate::transpile::graph::Graph, bodies: &[crate::trace::emit::AsmBody], r: &crate::trace::kernel::Reference, si: usize) {
+    let nm = crate::search::inspect::cell_names(&r.frame.in_rt2, crate::compiled::ids());
+    let names = |c: crate::transpile::graph::NodeId| -> String {
+        let s = crate::trace::emit::show_tree(fused, c, 2);
+        let mut out = s.clone();
+        for (cell, n) in &nm { out = out.replace(&format!("Cell({cell})"), n); }
+        out.chars().take(70).collect()
+    };
+    let labels: Vec<String> = { let mut nb = 0; let ns = ["left", "right", "up", "down", "jump", "dash"]; r.frame.fork_origins.iter().map(|(_, o)| if o == crate::trace::domain::UNKNOWN_BOOL_ORIGIN { nb += 1; ns.get(nb - 1).unwrap_or(&"btn?").to_string() } else { o.chars().take(24).collect() }).collect() };
+    eprintln!("[eq] kernel shape {si}: {} bodies, {} outcomes, forks {:?}", bodies.len(), r.bound.outcomes.len(), labels);
+    let mut memo: HashMap<(u32, u32), EqE> = HashMap::new();
+    for d in 0..labels.len() {
+        let (mut pairs, mut f, mut t, mut guard_only, mut opaque) = (0, 0, 0, 0, 0);
+        let (mut gsum, mut osum) = (0usize, 0usize);
+        let mut sample: Option<String> = None;
+        for j in 0..bodies.len() { for i in 0..j {
+            let (a, b) = (&bodies[i], &bodies[j]);
+            if a.outcome != b.outcome { continue; }
+            if (0..a.splits.len()).filter(|&k| a.splits.get(k) != b.splits.get(k)).collect::<Vec<_>>() != vec![d] { continue; }
+            pairs += 1;
+            let e = EqE::and(a.roots.iter().zip(&b.roots).map(|(x, y)| eq_nodes(fused, *x, *y, &mut memo, 0)).collect());
+            let (gs, os) = e.size();
+            match e { EqE::F => f += 1, EqE::T => t += 1, _ => if os == 0 { guard_only += 1; gsum += gs } else { opaque += 1; gsum += gs; osum += os } }
+            if sample.is_none() && e != EqE::F && a.outcome == 0 { sample = Some(e.show(fused, &names).chars().take(900).collect()); }
+        } }
+        if pairs == 0 { continue; }
+        eprintln!("[eq] fork {d} ({}): {pairs} pairs: Eq=F {f}, Eq=T {t}, guards only {guard_only}, with per-lane comparisons {opaque}; avg guard atoms {:.1}, avg comparisons {:.1}",
+            labels[d], gsum as f64 / (guard_only + opaque).max(1) as f64, osum as f64 / opaque.max(1) as f64);
+        if let Some(s) = sample { eprintln!("[eq]   sample (outcome 0): {s}"); }
+    }
+    // Divergence points: the first node pairs where two formulas differ
+    // (memoized DAG walk, path-insensitive). A point `sel(c, x, e)` vs `e`
+    // (or `sel(c, t, x)` vs `t`) is a GUARDED alternative: equal unless `c`
+    // (resp. `!c`) holds. Anything else is a raw difference.
+    fn points(g: &crate::transpile::graph::Graph, a: crate::transpile::graph::NodeId, b: crate::transpile::graph::NodeId, seen: &mut std::collections::HashSet<(u32, u32)>, out: &mut Vec<(crate::transpile::graph::NodeId, crate::transpile::graph::NodeId)>) {
+        if a == b || !seen.insert((a, b)) { return; }
+        let (na, nb) = (g.get(a), g.get(b));
+        let guarded = |s: &crate::transpile::graph::Node, other: crate::transpile::graph::NodeId| matches!(s.op, crate::transpile::graph::Op::Sel) && (s.args[1] == other || s.args[2] == other);
+        if guarded(na, b) || guarded(nb, a) { out.push((a, b)); return; }
+        if na.op == nb.op && na.args.len() == nb.args.len() && !na.args.is_empty() {
+            for k in 0..na.args.len() { points(g, na.args[k], nb.args[k], seen, out); }
+        } else { out.push((a, b)); }
+    }
+    for d in 0..labels.len() {
+        let (mut pairs, mut pts_sum, mut guarded_sum, mut raw_sum, mut conds_sum, mut all_guarded) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut sample: Option<String> = None;
+        for j in 0..bodies.len() { for i in 0..j {
+            let (a, b) = (&bodies[i], &bodies[j]);
+            if a.outcome != b.outcome { continue; }
+            if (0..a.splits.len()).filter(|&k| a.splits.get(k) != b.splits.get(k)).collect::<Vec<_>>() != vec![d] { continue; }
+            pairs += 1;
+            let mut seen = std::collections::HashSet::new();
+            let mut pts = Vec::new();
+            for (x, y) in a.roots.iter().zip(&b.roots) { points(fused, *x, *y, &mut seen, &mut pts); }
+            let mut conds = std::collections::BTreeSet::new();
+            let (mut gd, mut raw) = (0, 0);
+            let mut raws = Vec::new();
+            for &(x, y) in &pts {
+                let (nx, ny) = (fused.get(x), fused.get(y));
+                if matches!(nx.op, crate::transpile::graph::Op::Sel) && (nx.args[1] == y || nx.args[2] == y) { gd += 1; conds.insert((nx.args[0], nx.args[2] == y)); }
+                else if matches!(ny.op, crate::transpile::graph::Op::Sel) && (ny.args[1] == x || ny.args[2] == x) { gd += 1; conds.insert((ny.args[0], ny.args[2] == x)); }
+                else { raw += 1; raws.push((x, y)); }
+            }
+            pts_sum += pts.len(); guarded_sum += gd; raw_sum += raw; conds_sum += conds.len();
+            if raw == 0 { all_guarded += 1; }
+            if sample.is_none() && a.outcome == 0 {
+                let cs: Vec<String> = conds.iter().map(|(c, pos)| format!("{}{}", if *pos { "" } else { "!" }, names(*c))).collect();
+                let rs: Vec<String> = raws.iter().take(3).map(|(x, y)| format!("[{} | {}]", crate::trace::emit::show_tree(fused, *x, 2), crate::trace::emit::show_tree(fused, *y, 2))).collect();
+                sample = Some(format!("conds that must not fire {:?}; raw {:?}", cs, rs).chars().take(1200).collect());
+            }
+        } }
+        if pairs == 0 { continue; }
+        let p = pairs as f64;
+        eprintln!("[div] fork {d} ({}): {pairs} pairs: per pair {:.1} divergence points ({:.1} guarded, {:.1} raw), {:.1} distinct guard conditions; {} pairs fully guarded",
+            labels[d], pts_sum as f64 / p, guarded_sum as f64 / p, raw_sum as f64 / p, conds_sum as f64 / p, all_guarded);
+        if let Some(s) = sample { eprintln!("[div]   sample: {s}"); }
+    }
+}
+
+
+/// DIAGNOSTIC (CELESTE_BODY_STATS): per body, lanes taken vs emitted after the dup mask.
+pub(crate) fn print_body_stats() {
+    if std::env::var_os("CELESTE_BODY_STATS").is_none() { return; }
+    let Some(reg) = registry() else { return };
+    use std::sync::atomic::Ordering::Relaxed;
+    let (mut bodies, mut never, mut always_dup, mut some, mut taken_all, mut taken_dupbody, mut emitted) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut frac_hist = [0u64; 11];
+    let mut worst: Vec<(u64, String)> = Vec::new();
+    for ((shape, key), k) in &reg.kernels {
+        let mut kn = (0u64, 0u64, 0u64);
+        for (bi, (t, e)) in k.body_stats.iter().enumerate() {
+            let (t, e) = (t.load(Relaxed), e.load(Relaxed));
+            bodies += 1;
+            taken_all += t; emitted += e;
+            if t == 0 { never += 1; continue; }
+            if e == 0 { always_dup += 1; taken_dupbody += t; kn.0 += 1; } else { some += 1; }
+            frac_hist[((e * 10) / t) as usize] += 1;
+            kn.1 += 1; kn.2 += t;
+            let _ = bi;
+        }
+        if kn.2 > 0 { worst.push((kn.2, format!("shape {shape:#x} key {key:?}: {} bodies, {} taken a lane, {} of them never emitting anything new, {} lanes", k.bodies.len(), kn.1, kn.0, kn.2))); }
+    }
+    eprintln!("[bodies] {bodies} bodies over {} kernels: {never} never took a lane; {always_dup} took lanes but NEVER emitted anything new (all their lanes duplicates; {taken_dupbody} lanes); {some} emitted something new", reg.kernels.len());
+    eprintln!("[bodies] lanes taken {taken_all}, emitted {emitted} ({:.1}%)", 100.0 * emitted as f64 / taken_all.max(1) as f64);
+    eprintln!("[bodies] bodies by share of their lanes that were new (0-10%, 10-20%, ..., 100%): {:?}", frac_hist);
+    worst.sort_by_key(|w| std::cmp::Reverse(w.0));
+    for (_, w) in worst.iter().take(6) { eprintln!("[bodies]   {w}"); }
 }
