@@ -169,3 +169,29 @@ All: 6,735,699 new, decision fingerprint 51e2f3ecb444e25d, and an exhaustive
 per-lookup decision + id-bijection check against v3c's ids: 0 violations.
 Packing from raw fields (scalar, binary search for spd): 34.6 ns a row
 against 29.7 ns for the scalar 2 x 15 mix64 key.
+
+### H2. Per-(shape, cell) dictionaries; speed-keyed masks (`cellcensus`, `bitcell`, `bitspd`, `bitspd2`)
+
+Per cell (17,882 shards; "by states" = weighted): distinct spd.x p50 33
+(by states 579, max 1273), spd.y 32 (57, max 75), dash combo 45 (72, max
+89), flags combo 11 (19, max 54), flags+dash joint 151 (356, max 713).
+Dense bitmask per cell over its LOCAL product, total and occupancy:
+flags x dash x spd.x x spd.y 20.4 GB, 0.03%; (flags+dash) x spd.x x spd.y
+4.7 GB, 0.12%; (flags+dash) x (spd.x, spd.y) joint 0.83 GB, 0.66%. None is a
+few % dense. Only with a directory: key ((flags+dash), spd.x), mask over the
+cell's spd.y dictionary: 8.9% of the product, 61 MB of masks + the directory.
+Speed-keyed (mask over flags): key (cell, spd, dash), mask freeze/djump/grace/flip
+(126): 1.36 states an entry, 1.07% fill; key (cell, spd), mask over the cell's
+flags+dash joint (<= 768 bits): 2.37 states an entry, 0.61% fill (room-wide
+dictionary 1419 values: 0.16%, 3.4 GB).
+
+Implemented with ONE 64-bit word per directory entry (the word's index in the
+key; 12-B entries), (key, bit) precomputed untimed like `bits`' packing.
+Interleaved x3, cpu 4, load 1.9-2.2: v3c 2.98-3.00 s; bits 2.26-2.27;
+**bitcell 2.09-2.13 s (7.0 ns, 0.35 GB; 10.07M words, 6.8% filled)**; bitspd
+2.29 (0.70 GB, load 0.8 so ids fit 32 bits); bitspd2 2.22-2.23 (0.69 GB).
+DRAM fills 52.6M / 28.4M / 25.4M / 33.4M / 30.7M. All: 6,735,699 new,
+fingerprint 51e2f3ecb444e25d, exhaustive decision + id check 0 violations.
+Production would need each cell's spd.y dictionary (or an append-only per-cell
+one assigned on first sight, itself a lookup per emission), and the room's
+flag/dash/spd.x value sets in advance or a fatal guard on a new value.

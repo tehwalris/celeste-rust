@@ -330,6 +330,8 @@ pub fn prep_bits(dir: &str, door: &[u8]) {
     std::fs::write(format!("{pd}/db.bin"), crate::as_bytes(&db)).unwrap();
     std::fs::write(format!("{pd}/pcnt.bin"), crate::as_bytes(&pcnt)).unwrap();
     std::fs::write(format!("{pd}/refid.bin"), crate::as_bytes(&refid)).unwrap();
+    let sshape: Vec<u32> = (0..n_shards).map(|i| shard_sc[i].0 as u32).collect();
+    std::fs::write(format!("{pd}/sshape.bin"), crate::as_bytes(&sshape)).unwrap();
     eprintln!("[prepbits] wrote {pd}/qb.bin, db.bin, pcnt.bin, refid.bin; {:.1} s", t.elapsed().as_secs_f64());
 }
 
@@ -441,16 +443,21 @@ pub fn run_bits(dir: &str, n_door: usize, rank: bool) {
         if new == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qs.len() as f64,
         if rank { format!("; frame-end rank pass {t_end:.2} s") } else { String::new() }, mem / 1e9);
     if std::env::var_os("BENCH_NOCHECK").is_some() { return; }
-    // UNTIMED: every lookup's decision and target against the reference (v3c's
-    // ids: door index, new states numbered in sweep order).
-    let rm = map("refid.bin");
+    if rank { check(tag, &pd, &edges, n_door, &|m| (m as usize) < n_door, true) } else { check(tag, &pd, &edges, n_door, &|m| old_ids.contains(&m), false) }
+}
+
+/// UNTIMED: every lookup's decision and target against the reference (v3c's
+/// ids: door index, new states numbered in sweep order); the fingerprint is
+/// over THIS variant's decisions.
+fn check(tag: &str, pd: &str, edges: &[(u32, u32, u32)], n_door: usize, is_old: &dyn Fn(u32) -> bool, rank: bool) {
+    let rm = unsafe { memmap2::Mmap::map(&std::fs::File::open(format!("{pd}/refid.bin")).unwrap()).unwrap() };
     let refid: &[u32] = crate::from_bytes(&rm);
     let mut mine_of_ref: Vec<u32> = vec![u32::MAX; n_door + 6_735_699];
     let mut ref_of_mine: FxHashMap<u32, u32> = FxHashMap::default();
     let (mut bad_map, mut bad_dec) = (0u64, 0u64);
     let mut seen_ref = vec![false; n_door + 6_735_699];
     let mut seen_mine: FxHashSet<u32> = FxHashSet::default();
-    let mut fp = 0u64;
+    let (mut fp, mut new) = (0u64, 0u64);
     for (i, ed) in edges.iter().enumerate() {
         let (r, m) = (refid[i], ed.1);
         let slot = &mut mine_of_ref[r as usize];
@@ -458,16 +465,16 @@ pub fn run_bits(dir: &str, n_door: usize, rank: bool) {
         if *ref_of_mine.entry(m).or_insert(r) != r { bad_map += 1; }
         let ref_new = r as usize >= n_door && !seen_ref[r as usize];
         seen_ref[r as usize] = true;
-        // Mine: new iff this id was never seen and is not an old state's.
-        let mine_new = if rank { m as usize >= n_door } else { !old_ids.contains(&m) } && seen_mine.insert(m);
+        let mine_new = !is_old(m) && seen_mine.insert(m);
         if ref_new != mine_new { bad_dec += 1; }
-        fp = fp.wrapping_mul(0x100_0000_01b3) ^ (ref_new as u64);
+        new += mine_new as u64;
+        fp = fp.wrapping_mul(0x100_0000_01b3) ^ (mine_new as u64);
     }
     if rank {
         let dense = edges.iter().all(|e| (e.1 as usize) < n_door + 6_735_699);
         eprintln!("[{tag}] ids dense in [0, {}): {dense}", n_door + 6_735_699);
     }
-    eprintln!("[{tag}] CHECK {} lookups: id bijection violations {bad_map}, decision mismatches {bad_dec}; decision fingerprint {fp:016x}", edges.len());
+    eprintln!("[{tag}] CHECK {} lookups: {new} new, id bijection violations {bad_map}, decision mismatches {bad_dec}; decision fingerprint {fp:016x}", edges.len());
 }
 
 /// How one field's raw 32-bit value becomes its digit: an affine map
@@ -564,4 +571,220 @@ pub fn pack_time(dir: &str) {
         let t_pack = t.elapsed().as_secs_f64(); std::hint::black_box(acc);
         println!("  rep {rep}: read {:.2} ns/row, KEY (2 x {nf} mix64) {:.2} ns/row, PACK {:.2} ns/row", t_read * 1e9 / n, t_key * 1e9 / n, t_pack * 1e9 / n);
     }
+}
+
+/// `cellcensus`: every field's dictionary built PER (shape, cell). Per cell:
+/// the local distinct counts of spd.x, spd.y, the dash combo, the flags combo
+/// and flags+dash joint; the dense local product under several groupings;
+/// its occupancy, and the total memory with a dense bitmask per cell.
+pub fn cell_census(dir: &str) {
+    let f = Fields::open(dir);
+    // Per row: (shape, cell, flags tuple, dash tuple, spd.x, spd.y).
+    let mut v: Vec<(u32, u32, u64, u64, u32, u32)> = Vec::with_capacity(f.n);
+    let plan: Vec<(Vec<usize>, Vec<usize>, Option<usize>, Option<usize>)> = (0..f.shapes.len()).map(|s| {
+        let dash: Vec<usize> = ["dash_time", "dash_effect_time", "dash_target.x", "dash_target.y", "dash_accel.x", "dash_accel.y", "has_dashed"].iter().filter_map(|n| f.find(s, n)).collect();
+        let (sx, sy) = (f.find(s, "spd.x"), f.find(s, "spd.y"));
+        let flags = (0..f.shapes[s].len()).filter(|&j| !dash.contains(&j) && Some(j) != sx && Some(j) != sy && f.shapes[s][j].name != "player.x" && f.shapes[s][j].name != "player.y").collect();
+        (flags, dash, sx, sy)
+    }).collect();
+    for i in 0..f.n {
+        let (s, c, _) = f.hdr(i);
+        let (fl, da, sx, sy) = &plan[s];
+        let tup = |js: &[usize]| js.iter().fold(0u64, |a, &j| a * f.shapes[s][j].codes.len() as u64 + f.val(i, j) as u64);
+        v.push((s as u32, c, tup(fl), tup(da), sx.map_or(0, |j| f.val(i, j)), sy.map_or(0, |j| f.val(i, j))));
+    }
+    v.sort_unstable();
+    // Room-wide flags+dash joint dictionary size per shape.
+    let mut room_fd = vec![0u64; f.shapes.len()];
+    { let mut h: FxHashSet<(u32, u64, u64)> = Default::default(); for x in &v { h.insert((x.0, x.2, x.3)); } for &(s, _, _) in &h { room_fd[s as usize] += 1; } }
+    println!("room-wide flags+dash joint per shape: {room_fd:?}");
+    // Groupings: name, and per cell the local product from the distinct counts.
+    struct Cell { n: u64, sx: u64, sy: u64, d: u64, fl: u64, fd: u64, sxy: u64, fdx: u64, e1: u64, flr: u64, fdr: u64 }
+    let mut cells: Vec<Cell> = Vec::new();
+    let mut i = 0;
+    let distinct = |mut k: Vec<u64>| { k.sort_unstable(); k.dedup(); k.len() as u64 };
+    while i < v.len() {
+        let mut j = i; while j < v.len() && (v[j].0, v[j].1) == (v[i].0, v[i].1) { j += 1; }
+        let r = &v[i..j];
+        let fd = |x: &(u32, u32, u64, u64, u32, u32)| x.2.wrapping_mul(0x1_0000_0001) ^ x.3;
+        cells.push(Cell { n: r.len() as u64,
+            sx: distinct(r.iter().map(|x| x.4 as u64).collect()), sy: distinct(r.iter().map(|x| x.5 as u64).collect()),
+            d: distinct(r.iter().map(|x| x.3).collect()), fl: distinct(r.iter().map(|x| x.2).collect()),
+            fd: distinct(r.iter().map(fd).collect()), sxy: distinct(r.iter().map(|x| (x.4 as u64) << 32 | x.5 as u64).collect()),
+            fdx: distinct(r.iter().map(|x| fd(x) ^ (x.4 as u64) << 40).collect()),
+            e1: distinct(r.iter().map(|x| ((x.4 as u64) << 32 | x.5 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ x.3).collect()),
+            flr: plan[r[0].0 as usize].0.iter().map(|&j| f.shapes[r[0].0 as usize][j].codes.len() as u64).product(),
+            fdr: room_fd[r[0].0 as usize] });
+        i = j;
+    }
+    let total: u64 = cells.iter().map(|c| c.n).sum();
+    println!("cellcensus: {} (shape, cell) shards, {total} states", cells.len());
+    // Distribution, unweighted and weighted by states.
+    let dist = |name: &str, g: &dyn Fn(&Cell) -> f64| {
+        let mut a: Vec<(f64, u64)> = cells.iter().map(|c| (g(c), c.n)).collect();
+        a.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+        let q = |p: f64| a[((a.len() - 1) as f64 * p) as usize].0;
+        let wq = |p: f64| { let t = (total as f64 * p) as u64; let mut acc = 0; for &(x, n) in &a { acc += n; if acc >= t { return x; } } a[a.len() - 1].0 };
+        println!("  {name:<34} cells p50 {:>9.3} p90 {:>9.3} max {:>9.3} | by states p10 {:>9.3} p50 {:>9.3} p90 {:>9.3} p99 {:>9.3}", q(0.5), q(0.9), q(1.0), wq(0.1), wq(0.5), wq(0.9), wq(0.99));
+    };
+    dist("distinct spd.x", &|c| c.sx as f64);
+    dist("distinct spd.y", &|c| c.sy as f64);
+    dist("distinct (spd.x, spd.y) joint", &|c| c.sxy as f64);
+    dist("distinct dash combo", &|c| c.d as f64);
+    dist("distinct flags combo", &|c| c.fl as f64);
+    dist("distinct flags+dash joint", &|c| c.fd as f64);
+    dist("states", &|c| c.n as f64);
+    let groupings: Vec<(&str, Box<dyn Fn(&Cell) -> u64>)> = vec![
+        ("A flags x dash x spd.x x spd.y", Box::new(|c: &Cell| c.fl * c.d * c.sx * c.sy)),
+        ("B (flags+dash) x spd.x x spd.y", Box::new(|c: &Cell| c.fd * c.sx * c.sy)),
+        ("C (flags+dash) x (spd.x,spd.y)", Box::new(|c: &Cell| c.fd * c.sxy)),
+        ("D ((flags+dash),spd.x) x spd.y", Box::new(|c: &Cell| c.fdx * c.sy)),
+    ];
+    // `bitspd`: a directory keyed by speed, a mask over the flags.
+    let w = |b: u64| b.div_ceil(64) * 64;
+    let e1: u64 = cells.iter().map(|c| c.e1).sum();
+    let e2: u64 = cells.iter().map(|c| c.sxy).sum();
+    let m1: u64 = cells.iter().map(|c| c.e1 * w(c.flr)).sum();
+    let m2l: u64 = cells.iter().map(|c| c.sxy * w(c.fd)).sum();
+    let m2r: u64 = cells.iter().map(|c| c.sxy * w(c.fdr)).sum();
+    println!("S1 key (cell, spd.x, spd.y, dash combo), mask over freeze/djump/grace/flip (room radix): {e1} entries, {:.2} states/entry, occupancy {:.2}%, masks {:.3} GB",
+        total as f64 / e1 as f64, 100.0 * total as f64 / m1 as f64, m1 as f64 / 8e9);
+    println!("S2 key (cell, spd.x, spd.y), mask over flags+dash: {e2} entries, {:.2} states/entry; per-cell dict: occupancy {:.2}%, masks {:.3} GB; room-wide dict: occupancy {:.3}%, masks {:.3} GB",
+        total as f64 / e2 as f64, 100.0 * total as f64 / m2l as f64, m2l as f64 / 8e9, 100.0 * total as f64 / m2r as f64, m2r as f64 / 8e9);
+    dist("S1 states per entry (cell mean)", &|c| c.n as f64 / c.e1 as f64);
+    dist("S2 states per entry (cell mean)", &|c| c.n as f64 / c.sxy as f64);
+    dist("S2 per-cell mask bits", &|c| w(c.fd) as f64);
+    for (name, g) in &groupings {
+        println!("{name}:");
+        dist("  product bits", &|c| (g(c) as f64).log2());
+        dist("  occupancy %", &|c| 100.0 * c.n as f64 / g(c) as f64);
+        let bits: u64 = cells.iter().map(|c| g(c).div_ceil(64) * 64).sum();
+        println!("    TOTAL dense bitmasks {:.3} GB ({:.2}% occupied overall); states/product overall {:.2}%", bits as f64 / 8e9, 100.0 * total as f64 / bits as f64, 100.0 * total as f64 / cells.iter().map(|c| g(c)).sum::<u64>() as f64);
+    }
+}
+
+/// `bitcell` / `bitspd` / `bitspd2`: one 64-bit mask word per directory
+/// entry, the entry's key carrying the word's index. Per (shape, cell) shard:
+/// - `bitcell`: key = the high digits (freeze, djump, grace, flip, spd.x, dash
+///   combo), mask over spd.y's PER-CELL dictionary (<= 75 values here);
+/// - `bitspd`: key = (spd.x, spd.y, dash combo), mask over freeze x djump x
+///   grace x flip (room radix, 126 for shape 2);
+/// - `bitspd2`: key = (spd.x, spd.y), mask over the PER-CELL dictionary of
+///   the (flags, dash combo) joint.
+/// The per-cell dictionaries come from the data (door + the frame); the
+/// (key, bit) of every state is precomputed untimed, as `bits`' packing is.
+pub fn run_words(dir: &str, n_door: usize, mode: &str) {
+    let t = std::time::Instant::now();
+    let pd = format!("{dir}/prep");
+    let map = |f: &str| unsafe { memmap2::Mmap::map(&std::fs::File::open(format!("{pd}/{f}")).unwrap()).unwrap() };
+    let (qm, dm, sm, dsm, shm) = (map("qb.bin"), map("d.bin"), map("dshard.bin"), map("db.bin"), map("sshape.bin"));
+    let qs: &[QB] = crate::from_bytes(&qm); let ds: &[u32] = crate::from_bytes(&dm);
+    let dsh: &[u32] = crate::from_bytes(&sm); let db: &[(u32, u32)] = crate::from_bytes(&dsm); let sshape: &[u32] = crate::from_bytes(&shm);
+    let n_src: usize = std::fs::read_to_string(format!("{pd}/nsrc.txt")).unwrap().trim().parse().unwrap();
+    let n_shards = sshape.len();
+    // The packing's digits per shape (as prepbits built them).
+    let f = Fields::open(dir);
+    let mut by_shape: Vec<Vec<usize>> = vec![Vec::new(); f.shapes.len()];
+    for i in 0..f.n { by_shape[f.hdr(i).0].push(i); }
+    let packs: Vec<Packing> = (0..f.shapes.len()).map(|s| packing(&f, s, &by_shape[s])).collect();
+    drop(by_shape);
+    // Per shape: the high digits' radices and roles (0 flag, 1 spd.x, 2 dash).
+    let roles: Vec<Vec<(u64, u8)>> = packs.iter().map(|p| p.high.iter().map(|&d| (p.digits[d].radix, if p.digits[d].name == "spd.x" { 1 } else if p.digits[d].table.is_some() { 2 } else { 0 })).collect()).collect();
+    let low_r: Vec<u64> = packs.iter().map(|p| p.low.map_or(1, |d| p.digits[d].radix)).collect();
+    // A state (shard, high, low) -> (mask key, mask index) before per-cell dictionaries.
+    let split = |sh: u32, high: u32, low: u32| -> (u64, u64) {
+        let s = sshape[sh as usize] as usize;
+        let mut h = high as u64;
+        let mut ds_: Vec<(u64, u64, u8)> = Vec::with_capacity(8);
+        for &(r, role) in roles[s].iter().rev() { ds_.push((h % r, r, role)); h /= r; }
+        ds_.reverse();
+        let (mut fl, mut sx, mut da) = (0u64, 0u64, 0u64);
+        for &(d, r, role) in &ds_ { match role { 0 => fl = fl * r + d, 1 => sx = sx * r + d, _ => da = da * r + d } }
+        let dar: u64 = roles[s].iter().filter(|x| x.1 == 2).map(|x| x.0).product();
+        let spd = sx * low_r[s] + low as u64;
+        match mode {
+            "bitcell" => (high as u64, low as u64),
+            "bitspd" => (spd * dar + da, fl),
+            _ => (spd, fl * dar + da),
+        }
+    };
+    // Per-cell dictionaries over the mask index (bitcell: spd.y; bitspd2: the
+    // flags+dash joint); bitspd keeps the room radix.
+    let all = || db.iter().enumerate().map(|(i, &(h, l))| (dsh[i], h, l)).chain(qs.iter().map(|q| (q.shard, q.high, q.low)));
+    let mut local: Vec<FxHashMap<u64, u32>> = vec![Default::default(); n_shards];
+    let mut width: Vec<u64> = vec![0; n_shards];
+    let mut keyed: FxHashMap<(u32, u32, u32), (u32, u32)> = FxHashMap::default(); // (shard, high, low) -> (hk, bit), memo
+    if mode == "bitspd" {
+        for s in 0..n_shards { let sp = sshape[s] as usize; width[s] = roles[sp].iter().filter(|x| x.1 == 0).map(|x| x.0).product(); }
+    } else {
+        for (sh, h, l) in all() { let (_, m) = split(sh, h, l); let d = &mut local[sh as usize]; let n = d.len() as u32; d.entry(m).or_insert(n); }
+        for s in 0..n_shards { width[s] = local[s].len().max(1) as u64; }
+    }
+    let words: Vec<u64> = width.iter().map(|w| w.div_ceil(64)).collect();
+    let mut pre: Vec<FxHashSet<u32>> = vec![Default::default(); n_shards];
+    let mut key_of = |sh: u32, h: u32, l: u32| -> (u32, u32) {
+        *keyed.entry((sh, h, l)).or_insert_with(|| {
+            let (k, m) = split(sh, h, l);
+            let m = if mode == "bitspd" { m } else { local[sh as usize][&m] as u64 };
+            let hk = k * words[sh as usize] + (m >> 6) + 1;
+            assert!(hk < u32::MAX as u64);
+            (hk as u32, (m & 63) as u32)
+        })
+    };
+    let dq: Vec<(u32, u32)> = (0..n_door).map(|i| key_of(dsh[i], db[i].0, db[i].1)).collect();
+    let qw: Vec<QB> = qs.iter().map(|q| { let (hk, b) = key_of(q.shard, q.high, q.low); QB { shard: q.shard, src: q.src, xfer: q.xfer, low: b, high: hk, _p: [0; 3] } }).collect();
+    drop(keyed);
+    for (i, &(hk, _)) in dq.iter().enumerate() { pre[dsh[i] as usize].insert(hk); }
+    let n_old = pre.iter().map(|p| p.len()).sum::<usize>();
+    for q in &qw { pre[q.shard as usize].insert(q.high); }
+    let pcnt: Vec<u64> = pre.iter().map(|p| p.len() as u64).collect();
+    drop(pre);
+    let entries: u64 = pcnt.iter().sum();
+    let mut load = 0.5;
+    let cap_of = |c: u64, load: f64| ((c.max(1) as f64 / load).ceil() as u64).next_power_of_two();
+    if pcnt.iter().map(|&c| cap_of(c, load)).sum::<u64>() * 64 >= 1 << 32 { load = 0.8; }
+    let mut off: Vec<(u32, u32)> = Vec::with_capacity(n_shards);
+    let mut total = 0u64;
+    for &c in &pcnt { let cap = cap_of(c, load); off.push((total as u32, (cap - 1) as u32)); total += cap; }
+    assert!(total * 64 < 1 << 32, "ids slot << 6 | bit must fit 32 bits");
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    struct W { hk: u32, bits: u64 }
+    let mut tab: Vec<W> = vec![W { hk: 0, bits: 0 }; total as usize];
+    macro_rules! probe { ($sh:expr, $hk:expr) => {{
+        let (b, m) = off[$sh as usize];
+        let mut s = slot_of($hk, (b, m));
+        loop { let e = &mut tab[s as usize]; let k = e.hk; if k == $hk { break; } if k == 0 { e.hk = $hk; break; } s = b + ((s - b + 1) & m); }
+        s
+    }}; }
+    let mut old_ids: FxHashSet<u32> = FxHashSet::default();
+    for i in 0..n_door { let (hk, b) = dq[i]; let s = probe!(dsh[i], hk); let e = &mut tab[s as usize]; let w = e.bits; e.bits = w | 1 << b; old_ids.insert(s << 6 | b); }
+    drop(dq);
+    let mem = total as f64 * std::mem::size_of::<W>() as f64;
+    let wsum = |g: &dyn Fn(usize) -> u64| (0..n_shards).map(g).sum::<u64>();
+    eprintln!("[{mode}] setup {:.1} s (untimed): mask widths: {} shards, mean {:.1} bits (by entries); {n_old} entries at the frame start, {entries} at its end ({:.2} states each, mask fill {:.2}%); directory {} slots x {} B at load {load} = {:.2} GB",
+        t.elapsed().as_secs_f64(), n_shards, wsum(&|s| pcnt[s] * width[s].min(64)) as f64 / entries as f64, (n_door + 6_735_699) as f64 / entries as f64,
+        100.0 * (n_door + 6_735_699) as f64 / wsum(&|s| pcnt[s] * 64) as f64, total, std::mem::size_of::<W>(), mem / 1e9);
+    let mut frontier: Vec<u8> = Vec::with_capacity(7_000_000 * crate::PAYLOAD);
+    let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(qw.len());
+    let mut dropmin: Vec<u32> = vec![u32::MAX; n_src];
+    crate::perf_on(true);
+    let t = std::time::Instant::now();
+    for &d in ds { let m = &mut dropmin[d as usize]; *m = (*m).min(1); }
+    let t_drops = t.elapsed().as_secs_f64();
+    let mut nw = 0u64;
+    for q in &qw {
+        let s = probe!(q.shard, q.high);
+        let e = &mut tab[s as usize];
+        let (w, b) = (e.bits, 1u64 << q.low);
+        if w & b == 0 { e.bits = w | b; nw += 1; frontier.extend_from_slice(&[0u8; crate::PAYLOAD]); }
+        edges.push((q.src, s << 6 | q.low, q.xfer));
+    }
+    let dt = t.elapsed().as_secs_f64();
+    crate::perf_on(false);
+    std::hint::black_box((&frontier, &dropmin));
+    eprintln!("[{mode}] TIMED single thread {dt:.2} s (drops {t_drops:.2} s): new {nw} ({}), {:.1} ns per query; structure {:.2} GB",
+        if nw == 6735699 { "OK" } else { "MISMATCH" }, (dt - t_drops) * 1e9 / qw.len() as f64, mem / 1e9);
+    if std::env::var_os("BENCH_NOCHECK").is_some() { return; }
+    check(mode, &pd, &edges, n_door, &|m| old_ids.contains(&m), false);
 }
