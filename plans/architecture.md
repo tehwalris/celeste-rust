@@ -158,7 +158,8 @@ OR(error(args))`, materialized once, after fusion:
 | an unrolled loop | its condition still holds after the bound (`State::ended`) |
 | interval `Add`/`Sub`/`Neg` | `not NoWrap(op)`: an endpoint overflowed 16.16 on this lane (`b47b118`; skipped where the static ranges bound the result) |
 | a widening | containment of the slot it writes (`widen::SlotErrors`), only where stored |
-| the frame | inputs outside the kernel's admissible set (pins, region bounds) |
+| `Restrict(lo, hi)(x)` (a bounded input) | `Lo(x) < lo or Hi(x) > hi` on the raw input, charged to EVERY outcome |
+| the frame | inputs outside the kernel's pins |
 
 An own error holds where its operator was EVALUATED (`own and at`, `at` the
 path's decisions at its site, `Symbolic::evaluated`): the kernel evaluates
@@ -196,6 +197,23 @@ once no new region is left. A region (`RegionGrid`, `CELESTE_REGION`, default
 speed to [-S, S], S <= 7 because `move`'s loop is unrolled for `abs(amount)
 <= 8`), all guarded per lane; the range analysis folds the far objects'
 collision tests. A row outside every region has no kernel and stops the run.
+
+**A bound is a node, not an environment** (`Op::Restrict`, 2026-10-09). A
+bounded input (the region's square, speed and remainder; the no-player
+phase's hulls) enters the body only as `Restrict(lo, hi)(cell)`: the value
+unchanged, the range ATTACHED. Every range analysis - the tracer's
+`range_of`/`pieces_of`, `Points`, `widen::bounds`, the lowering's interval
+fold (`Graph::eval` narrows to the range) - reads the range off that node;
+nothing seeds a cell. The node's own error is the check, on the RAW cell,
+which nothing narrows, so no fold removes it. It is charged to every outcome
+of the frame (`error::for_outcomes`), not by reachability: a comparison the
+range decided is a constant that no longer reads the node. Until then the
+bounds were both seeded (`d.ranges`, and the lowering's `fold_with(..,
+ranges)`) and guarded, and the lowering's fold, seeded with the very range,
+folded the guard to true: a lane with speed or remainder outside was
+computed silently wrong (x/y were held by the dispatch alone). The trees
+audited (`rewrite bounds-audit`) never held such a row. The codegen emits
+`Restrict` as the identity; the error is two compares a bound.
 
 **Keys.** The row key is folded per EMITTED row in the append step
 (`AsmBody::key_words`: `Σ cell_mix` over the key fields read off the packed

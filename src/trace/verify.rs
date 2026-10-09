@@ -171,8 +171,9 @@ pub fn trace_frame<'a>(
     // Apply the boundary widenings INSIDE the frame (a row hashes on what it
     // stores) and capture the arc transfers. Off for the concrete check.
     widen: bool,
-    // Input slots known to lie in a RANGE (raw 16.16, inclusive): the body
-    // is specialized on them; outside them is an error, like a pin.
+    // Input slots BOUNDED to a range (raw 16.16, inclusive): the body reads
+    // them through `Op::Restrict`, specialized on the range; outside it is
+    // the restriction's own error (`trace::error`), like a pin.
     bounds: &[(Path, (i32, i32))],
 ) -> Result<Frame> {
     it.trace_start_nodes = it.d.node_count();
@@ -190,16 +191,32 @@ pub fn trace_frame<'a>(
     it.d.fork_origins.clear();
     it.d.evaluated.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
-    // THE KERNEL'S ADMISSIBLE INPUTS (pins, region ranges): a lane outside
-    // is an error of the whole frame.
+    // THE KERNEL'S ADMISSIBLE INPUTS: the pins, a lane outside is an error
+    // of the whole frame.
     let mut admissible = iface::pin_guard(&mut it.d, &iface);
-    // The player's input position and region, for `Points`.
+    // The BOUNDED inputs (the region's square, speed and remainder; the
+    // no-player phase's hulls): the body reads each through its restriction,
+    // whose own error is the bound's check. Nothing seeds the raw cell, so
+    // nothing folds that check away.
     let player = super::shapes::player_path(&st);
+    // The player's raw input position and region, for `Points`.
     let mut position: [Option<(NodeId, (i32, i32))>; 2] = [None, None];
     for (p, (lo, hi)) in bounds {
         let i = iface.slots.iter().position(|q| q == p).ok_or_else(|| anyhow!("bounded {} is not an input slot", iface::show(p)))?;
         let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(i as u32));
-        it.d.ranges.insert(cell, (*lo as i64, *hi as i64));
+        let held = match iface::get(&st, p) {
+            Some(Value::Num(n)) => n,
+            other => bail!("bounded {} holds {other:?}, not a number", iface::show(p)),
+        };
+        if held != cell {
+            // Pinned: the pin guard checks the lane, the range the pin.
+            let v = it.d.as_const(&held).ok_or_else(|| anyhow!("bounded {} is neither its cell nor pinned", iface::show(p)))?;
+            let raw = v.as_raw_u32() as i32;
+            anyhow::ensure!((*lo..=*hi).contains(&raw), "bounded {} is pinned to {raw:#x}, outside [{lo:#x}, {hi:#x}]", iface::show(p));
+            continue;
+        }
+        let r = it.d.restrict(cell, *lo, *hi);
+        iface::set(&mut st, p, Value::Num(r))?;
         if let Some(pl) = &player {
             for (k, f) in ["x", "y"].iter().enumerate() {
                 if p.len() == pl.len() + 1 && p.starts_with(pl) && p[pl.len()] == iface::key(f) {
@@ -207,15 +224,6 @@ pub fn trace_frame<'a>(
                 }
             }
         }
-    // Built on the graph directly so the range analysis it seeds cannot fold
-    // it away.
-        use crate::transpile::graph::Op;
-        let (klo, khi) = (it.d.graph.leaf(Op::Const(*lo, *lo)), it.d.graph.leaf(Op::Const(*hi, *hi)));
-        let (vlo, vhi) = (it.d.graph.fold(Op::Lo, vec![cell]), it.d.graph.fold(Op::Hi, vec![cell]));
-        let a = it.d.graph.fold(Op::Ge, vec![vlo, klo]);
-        let b = it.d.graph.fold(Op::Le, vec![vhi, khi]);
-        let both = it.d.graph.fold(Op::And, vec![a, b]);
-        admissible = it.d.graph.fold(Op::And, vec![admissible, both]);
     }
     // The engine numbering for the INPUT shape (`symbolize` changed values,
     // not the shape).

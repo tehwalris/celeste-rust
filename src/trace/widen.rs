@@ -680,8 +680,8 @@ fn comparison_facts(d: &Symbolic, c: crate::transpile::graph::NodeId) -> Option<
     Some((x, yes, no))
 }
 
-/// A static raw range of `n` (literals, a platform's input `x`, sums and
-/// differences), narrowed by the enclosing branches; `None` otherwise.
+/// A static raw range of `n` (literals, a platform's input `x`, a bounded
+/// input, sums and differences), narrowed by the enclosing branches; `None` otherwise.
 fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::transpile::graph::NodeId, i64, i64)]) -> Option<(i64, i64)> {
     let node = d.graph.get(n);
     let structural = || -> Option<(i64, i64)> {
@@ -706,6 +706,15 @@ fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::tra
                 (a.0 - b.1, a.1 - b.0)
             }
             Op::Cell(_) if d.ranges.contains_key(&n) => d.ranges[&n],
+            // A bounded input (`Op::Restrict`; as `graph::pieces_of`).
+            Op::Restrict(lo, hi) => {
+                let (lo, hi) = (lo as i64, hi as i64);
+                match bounds(d, node.args[0], facts) {
+                    Some(a) if a.0.max(lo) <= a.1.min(hi) => (a.0.max(lo), a.1.min(hi)),
+                    Some(a) => a,
+                    None => (lo, hi),
+                }
+            }
             _ => return None,
         })
     };

@@ -211,6 +211,8 @@ fn eval_nodes(
                 let flag = n(4).lane(0);
                 V::B(zn_tile_flag_at(cache, cart, n(0), n(1), w, h, flag))
             }
+            // The operand unchanged, as the codegen.
+            Op::Restrict(..) => vals[node.args[0] as usize],
             other => panic!("oracle: unsupported op {other:?}"),
         };
         vals.push(v);

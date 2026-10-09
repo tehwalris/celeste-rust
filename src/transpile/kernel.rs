@@ -23,16 +23,13 @@ pub(crate) struct Emit {
     /// The map, when the caller has it: lets the interval pass decide
     /// collision tests instead of treating them as unknown.
     pub(crate) room: Option<crate::transpile::graph::Room>,
-    /// Input cells (engine numbering) known to lie in a range, folded at
-    /// decide time (`ival::fold_with`).
-    pub(crate) ranges: std::collections::HashMap<u32, (i32, i32)>,
 }
 
 impl Emit {
     /// An `Emit` around the tracer's graph; the caller fills in `fork_depth`
     /// and `room`.
     pub(crate) fn bare(graph: Graph) -> Self {
-        Emit { fork_depth: 0, graph, decide: true, room: None, ranges: Default::default() }
+        Emit { fork_depth: 0, graph, decide: true, room: None }
     }
 }
 
