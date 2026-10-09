@@ -373,7 +373,7 @@ impl AsmKernel {
         true
     }
 
-    /// Run ONE slice of up to 16 lanes in one id group, keeping lanes in `only`.
+    /// Run ONE slice of up to 16 lanes (of any id groups), keeping lanes in `only`.
     fn run_slice(
         &self,
         chunk: &Rt2,
@@ -385,7 +385,6 @@ impl AsmKernel {
         let t_setup = crate::frame::phases::start();
         let n = lanes.len();
         debug_assert!((1..=16).contains(&n));
-        assert!(lanes.iter().all(|&l| l & !63 == lanes[0] & !63), "a slice within one id group: lanes {lanes:?}");
         // Skip the set insert for a repeated (input cell, output cell) pair.
         let mut last_edge = (u32::MAX, u32::MAX);
         let views = self.input_views(chunk);
@@ -399,9 +398,11 @@ impl AsmKernel {
         // Utilization tallies, folded into `CALL_STATS[3..]` at the end.
         let (mut n_bodies, mut n_bodies_taken, mut n_lanes, mut n_unique) = (0u64, 0u64, 0u64, 0u64);
         {
-            let lo = lanes[0];
-            // The predecessor GROUP's first id (ids are consecutive in a block).
-            let slice_base: Option<u64> = sink.ids_in.map(|ids| ids[lo & !63]);
+            // Per lane its predecessor GROUP's first id (ids are consecutive
+            // in a block; a slice may span groups): a predecessor record is
+            // that id plus the lane's bit in its group.
+            let bases: Option<[u64; 16]> = sink.ids_in.map(|ids| std::array::from_fn(|i| if i < n { ids[lanes[i] & !63] } else { 0 }));
+            let base = |i: usize| bases.map(|b| b[i]);
             let glane = |i: usize| lanes[i] & 63;
             let skip: u16 = match sink.skip_in {
                 Some(sk) => (0..n).filter(|&i| sk[lanes[i]]).fold(0u16, |m, i| m | (1 << i)),
@@ -515,7 +516,7 @@ impl AsmKernel {
                             last_edge = (cin, cout);
                             sink.edges.insert((cin, cout));
                         }
-                        if let Some(b) = slice_base {
+                        if let Some(b) = base(i) {
                             sink.dropped_again(b, glane(i), from as u64);
                         }
                     }
@@ -535,7 +536,7 @@ impl AsmKernel {
                     );
                     let cin = cell_in[lanes[i]];
                     // THE TRANSFER: per producer, on the edge, never in the row.
-                    let xfer = match slice_base {
+                    let xfer = match base(i) {
                         Some(_) => {
                             let words = body.arc.words(outbuf, i);
                             sink.xfer_id_raw(&words, |w| ArcSlots::decode(&body.arc.raw(w, chunk, lanes[i], body.outcome), chunk, lanes[i], body.outcome))
@@ -550,7 +551,7 @@ impl AsmKernel {
                         if sink.edges_on && first_cin != cin {
                             sink.edges.insert((cin, couts[i]));
                         }
-                        match slice_base {
+                        match base(i) {
                             Some(b) if r & RowCache::ID_FLAG != 0 => {
                                 sink.direct_edge(r & !RowCache::ID_FLAG, b, xfer, glane(i));
                                 continue;
@@ -577,7 +578,7 @@ impl AsmKernel {
                     // the queue's must be that one (flush filters by it).
                     assert_eq!(sink.slots[q].shape, template.union.shape_hash, "a queue's shape is its template union's");
                     cols.push_row(&mut sink.slots[q], outbuf, i, key, cout);
-                    if let Some(b) = slice_base {
+                    if let Some(b) = base(i) {
                         sink.slots[q].pred_base.push(b);
                         sink.slots[q].pred_mask.push(1u64 << (glane(i)));
                         sink.slots[q].pred_xfer.push(xfer);
@@ -1135,32 +1136,27 @@ impl Registry {
         let Some(grid) = self.grid.filter(|_| !chunk.player_objects(crate::compiled::ids()).is_empty()) else {
             return self.run_key(chunk, None, cell_in, lanes, sink);
         };
-        // Per 64-lane id group (predecessor records are the group's first id
-        // plus a lane bit), the live lanes bucketed by region, each bucket cut
-        // into slices of 16. Slicing in lane order instead ran every slice
-        // once per region it held: a unit's cell order changes region every
-        // ~12 rows, and room (6,2) 100% f57 executed 53% padding.
+        // The unit's live lanes bucketed by region, each bucket cut into
+        // slices of 16 (a slice may span id groups: `run_slice` keys each
+        // lane's predecessor records by its own group). Slicing in lane
+        // order ran every slice once per region it held (a unit's cell order
+        // changes region every ~12 rows); bucketing per 64-lane group still
+        // left room (6,2) 100% f57 36% padding and room (3,0) at 8 px 53%.
         stats([1, 0, 0, 0, 0, 0, 0]);
-        let mut lo = lanes.start;
-        let mut by_region: Vec<(Option<Region>, usize)> = Vec::with_capacity(64);
+        let mut by_region: Vec<(Option<Region>, usize)> =
+            lanes.filter(|&l| !sink.skip_in.is_some_and(|sk| sk[l])).map(|l| (grid.of_cell(cell_in[l]), l)).collect();
+        by_region.sort_unstable();
         let mut idx: Vec<usize> = Vec::with_capacity(16);
-        while lo < lanes.end {
-            let hi = lanes.end.min((lo & !63) + 64);
-            by_region.clear();
-            by_region.extend((lo..hi).filter(|&l| !sink.skip_in.is_some_and(|sk| sk[l])).map(|l| (grid.of_cell(cell_in[l]), l)));
-            by_region.sort_unstable();
-            lo = hi;
-            for run in by_region.chunk_by(|a, b| a.0 == b.0) {
-                let key = run[0].0;
-                let Some(k) = self.kernels.get(&(chunk.shape_hash, key)) else {
-                    return self.run_key(chunk, key, cell_in, run[0].1..run[0].1 + 1, sink);
-                };
-                for part in run.chunks(16) {
-                    idx.clear();
-                    idx.extend(part.iter().map(|&(_, l)| l));
-                    if !k.run_slice(chunk, cell_in, &idx, ((1u32 << idx.len()) - 1) as u16, sink) {
-                        return false;
-                    }
+        for run in by_region.chunk_by(|a, b| a.0 == b.0) {
+            let key = run[0].0;
+            let Some(k) = self.kernels.get(&(chunk.shape_hash, key)) else {
+                return self.run_key(chunk, key, cell_in, run[0].1..run[0].1 + 1, sink);
+            };
+            for part in run.chunks(16) {
+                idx.clear();
+                idx.extend(part.iter().map(|&(_, l)| l));
+                if !k.run_slice(chunk, cell_in, &idx, ((1u32 << idx.len()) - 1) as u16, sink) {
+                    return false;
                 }
             }
         }
