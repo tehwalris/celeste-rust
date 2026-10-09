@@ -70,13 +70,13 @@ schedules and against the binary before), plus the gates and the full suite.
    packed state fits a u64 (≤ 41 bits) with zero collisions: no hash, no
    collision caveat, and cheaper than the 2 x 14.6 mixes an emission pays.
    It moves every key, so the gates would need re-pinning on evidence.
+4. **Forking on `freeze > 0` / `dash_time > 0` at trace time** (the research
+   pass's further option) would let the build collapse ~95 bodies into one
+   on those lanes, saving kernel work too. The mask already took the emit
+   side; this would add forks the abstractions doc warns about. Not done.
 5. **mimalloc's purge delay.** 0 (safe-run.sh) returns every freed page
    at once; 100 ms makes the frame ~10% faster (page faults 5.1M -> 1.2M a
    2-frame run, sys 32 -> 12 s) but keeps ~2 GB more resident between
    frames here, proportionally more in a big room. Left at 0; the better
    fix is fewer transient allocations (the edge buffers were the first, a
    fifth of the faults).
-4. **Forking on `freeze > 0` / `dash_time > 0` at trace time** (the research
-   pass's further option) would let the build collapse ~95 bodies into one
-   on those lanes, saving kernel work too. The mask already took the emit
-   side; this would add forks the abstractions doc warns about. Not done.
