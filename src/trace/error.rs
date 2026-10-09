@@ -360,17 +360,20 @@ mod tests {
     fn interval_arithmetic_the_static_ranges_bound_owns_nothing() {
         let mut d = Symbolic::default();
         let x = cell(&mut d, 0, true);
-        d.ranges.insert(x, (-(4 << 16), 4 << 16));
+        let x = d.restrict(x, -(4 << 16), 4 << 16);
         let one = d.graph.leaf(Op::Const(1 << 16, 1 << 16));
         let s = d.graph.fold(Op::Add, vec![x, one]);
+        // Nothing beyond the restriction's own check.
         let e = of(&mut d, &[s]);
-        assert_eq!(d.graph.get(e).op, Op::ConstBool(false));
+        assert_eq!(e, of(&mut d, &[x]));
+        assert_ne!(d.graph.get(e).op, Op::ConstBool(false), "the restriction itself is checked");
         // A range that reaches past the 16.16 range is still checked.
         let y = cell(&mut d, 1, true);
-        d.ranges.insert(y, (0, i32::MAX as i64));
+        let y = d.restrict(y, 0, i32::MAX);
         let t = d.graph.fold(Op::Add, vec![y, one]);
         let fits = d.graph.fold(Op::NoWrap, vec![t]);
-        assert_eq!(of(&mut d, &[t]), d.graph.fold(Op::Not, vec![fits]));
+        let e = of(&mut d, &[t]);
+        assert!(crate::transpile::bdd::reachable(&d.graph, &[e])[fits as usize], "the sum's NoWrap is owed");
     }
 
     #[test]

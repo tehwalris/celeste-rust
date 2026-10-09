@@ -307,7 +307,7 @@ pub(crate) fn specialize_frame(
         // while live somewhere declines every lane it takes. Show the leaves of
         // its `error` Or-tree the interval evaluator decided true.
         if trace {
-            let cells = crate::transpile::ival::seed_cells(&sp, &Default::default());
+            let cells = crate::transpile::ival::seed_cells(&sp);
             let vals = match room {
                 Some(r) => sp.eval_lenient_in(&cells, r),
                 None => sp.eval_lenient(&cells),

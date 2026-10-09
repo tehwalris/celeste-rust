@@ -719,10 +719,15 @@ pub fn room_constant_lattice(
 /// objects); `rnd`-derived ones come on top (`with_extra`).
 fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: crate::abstraction::Level) -> Vec<super::iface::Path> {
     let mut ival = super::shapes::ival_paths(st);
-    // The moving platforms' `x` and `last` at a platforms-unknown level.
+    // The moving platforms' `x`, `last` and `rem.x` at a platforms-unknown
+    // level. The body reads `rem.x` only to check that the literal standing
+    // for it covers the lane (`widen::platform_inputs`).
     if opts.platforms {
-        let pp = super::widen::platform_paths(st);
-        ival.extend(pp.x.iter().chain(pp.last.iter()).cloned());
+        ival.extend(super::widen::platform_paths(st).all().cloned());
+    }
+    // The fly fruit's `spd.y`/`rem.y`, likewise (`widen::fork_fruit_inputs`).
+    if opts.fruit {
+        ival.extend(super::widen::fly_fruit_paths(st).ranges.into_iter().map(|(p, _)| p));
     }
     // Near level: floors and object phases (countdowns are the unknown
     // number instead, `widen::forget_countdown_inputs`).

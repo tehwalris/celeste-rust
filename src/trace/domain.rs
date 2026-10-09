@@ -425,13 +425,11 @@ pub struct Symbolic {
     beneath_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// `may_answers`'s memo: `(may_true, may_false)`.
     may_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, (NodeId, NodeId)>>,
-    /// STATIC RANGES of input cells, and `range_of`'s memo; a comparison they
-    /// decide folds. Per frame. A seed is NOT checked here: its caller owes a
-    /// guard (a platform's speed); a kernel input's bounds are `restricts`.
-    pub ranges: std::collections::HashMap<NodeId, (i64, i64)>,
-    /// The frame's `Op::Restrict` nodes (`restrict`): its bounded inputs.
-    /// Their own errors are charged to every outcome (`trace::error`).
+    /// The frame's `Op::Restrict` nodes (`restrict`): its bounded inputs, the
+    /// only source of a static range (no cell is seeded with one). Their own
+    /// errors are charged to every outcome (`trace::error`). Per frame.
     pub restricts: Vec<NodeId>,
+    /// `range_of`'s memo; a comparison the ranges decide folds.
     range_memo: std::collections::HashMap<NodeId, Option<Pieces>>,
     /// Comparisons decided from ranges this frame (a probe stat).
     pub range_folds: u64,
@@ -442,7 +440,6 @@ pub use crate::transpile::graph::Pieces;
 impl Symbolic {
     /// Forget the static ranges (a new frame, new cells).
     pub fn clear_ranges(&mut self) {
-        self.ranges.clear();
         self.restricts.clear();
         self.range_memo.clear();
         self.range_folds = 0;
@@ -576,16 +573,15 @@ impl Symbolic {
         go(&self.graph, &self.ival_cells, &mut self.abstract_memo.borrow_mut(), n)
     }
 
-    /// The static range of `n` (`graph::pieces_of` over the restrictions and
-    /// the seeded cells).
+    /// The static range of `n` (`graph::pieces_of`: from the restrictions).
     pub fn range_of(&mut self, n: NodeId) -> Option<Pieces> {
-        crate::transpile::graph::pieces_of(&self.graph, &self.ranges, &mut self.range_memo, n)
+        crate::transpile::graph::pieces_of(&self.graph, &mut self.range_memo, n)
     }
 
-    /// Does anything give this frame a static range (a seeded cell or a
-    /// restriction)? Without, no comparison is decided by one.
+    /// Does anything give this frame a static range (a restriction)?
+    /// Without, no comparison is decided by one.
     fn has_ranges(&self) -> bool {
-        !self.ranges.is_empty() || !self.restricts.is_empty()
+        !self.restricts.is_empty()
     }
 
     /// `x` restricted to `[lo, hi]` (`Op::Restrict`), recorded so its own
@@ -1217,7 +1213,7 @@ impl Domain for Symbolic {
     }
 
     fn flr_ways(&mut self, v: &NodeId) -> u8 {
-        // Only restrictions and seeded ranges know a static range; otherwise
+        // Only restrictions know a static range; otherwise
         // the fixed arity.
         if !self.has_ranges() {
             return MOVE_WAYS;
@@ -1480,10 +1476,8 @@ mod tests {
     #[test]
     fn level_minus_one_sizes_a_move_fork_by_the_hull_of_its_pieces() {
         let mut d = Symbolic::default();
-        let rem = d.graph.leaf(Op::Cell(0));
-        let spd = d.graph.leaf(Op::Cell(1));
-        d.ranges.insert(rem, (-0x8000, 0x7fff));
-        d.ranges.insert(spd, (-5 << 16, 5 << 16));
+        let (rem, spd) = (d.graph.leaf(Op::Cell(0)), d.graph.leaf(Op::Cell(1)));
+        let (rem, spd) = (d.restrict(rem, -0x8000, 0x7fff), d.restrict(spd, -5 << 16, 5 << 16));
         let zero = d.graph.leaf(Op::Const(0, 0));
         let k = |d: &mut Symbolic, v: i32| d.graph.leaf(Op::Const(v, v));
         let (neg, pos, half) = (k(&mut d, -0x18000), k(&mut d, 0x18000), k(&mut d, 0x8000));

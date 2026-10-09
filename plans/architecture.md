@@ -214,6 +214,23 @@ folded the guard to true: a lane with speed or remainder outside was
 computed silently wrong (x/y were held by the dispatch alone). The trees
 audited (`rewrite bounds-audit`) never held such a row. The codegen emits
 `Restrict` as the identity; the error is two compares a bound.
+The platforms (`p`, 2026-10-09) were the last seeded ranges: a platform's
+`x` (the path) and, with a player, its `spd.x` (its range over the worlds)
+were `Symbolic::ranges` entries - `x`'s checked nowhere, `spd.x`'s by a
+separate obligation. Both are restrictions now, and `Symbolic::ranges`, the
+seeds of `pieces_of` and of `ival::seed_cells` are gone: no input cell has a
+range, only a node does. `Points` pins a world's `x` on the raw cell beneath
+the restriction. Two INPUT LITERALS remain, and are owed, not assumed: a
+platform's `rem.x` and the fly fruit's `spd.y`/`rem.y` are READ as their
+whole literal range (no merge across them otherwise), which stands for the
+lane only where the lane's own value lies inside; the frame owes that per
+lane on the raw cell (`widen::platform_inputs`, `fork_fruit_inputs`; the
+cells are typed interval inputs for it). A stored row holds the literal
+itself, so it never fires on the search's own rows; it is what makes a row
+from elsewhere (a start state, a test) decline instead of being computed as
+something it is not. `rewrite bounds-audit --room` audits all of these.
+The no-player phase's `spd.x` (the literal, owing `0 or v`) is a pin, not a
+range.
 
 **Keys.** The row key is folded per EMITTED row in the append step
 (`AsmBody::key_words`: `Σ cell_mix` over the key fields read off the packed

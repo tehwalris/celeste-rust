@@ -374,15 +374,21 @@ enum Command {
         #[arg(long)]
         horizon: u32,
     },
-    /// AUDIT: did any kernel ever take a lane outside its region bounds? Every
+    /// AUDIT: did any kernel ever take a lane outside its bounds? Every
     /// stored row of every frame (a kernel's inputs are stored rows): the
     /// player's `spd.x`/`spd.y` outside `[-S, S]` px (`CELESTE_REGION`'s S)
-    /// and `rem.x`/`rem.y` outside `[-0.5, 0.5)`. Until `Op::Restrict` a
-    /// kernel did not check these; frames whose rows were trimmed
+    /// and `rem.x`/`rem.y` outside `[-0.5, 0.5)`; a moving platform's `x`/
+    /// `last` outside its path, `rem.x` outside `[-0.5, 0.5)`, `spd.x` outside
+    /// its range over the platform worlds (`--room` needed); a fly fruit's
+    /// `spd.y`/`rem.y` outside the `f` level's literals. Until `Op::Restrict`
+    /// a kernel did not check these; frames whose rows were trimmed
     /// (`CELESTE_TRIM_ROWS`) are counted, not read.
     BoundsAudit {
         #[arg(long)]
         level_dir: String,
+        /// The tree's room: the platform worlds come from it.
+        #[arg(long)]
+        room: Option<String>,
     },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed. Per
     /// shape: rows, every varying column's distinct value count (capped at
@@ -1603,19 +1609,41 @@ fn main() -> Result<()> {
             println!("pairs whose transfers are exactly x-pieces x y-pieces: {product} ({:.1}%); x part constant {x_const} ({:.1}%), y part constant {y_const} ({:.1}%)", 100.0 * product as f64 / n_pairs as f64, 100.0 * x_const as f64 / n_pairs as f64, 100.0 * y_const as f64 / n_pairs as f64);
             println!("distinct transfer sets {}, x sets {}, y sets {} (frame table: {} pairs)", sets.len(), xsets.len(), ysets.len(), pairs.len());
         }
-        Command::BoundsAudit { level_dir } => {
+        Command::BoundsAudit { level_dir, room } => {
+            use celeste_engine::runtime2::{Col, AV, FLY_FRUIT_REM_Y, FLY_FRUIT_SPD_Y, PLATFORM_PATH, PLATFORM_REM};
+            if let Some(room) = &room {
+                std::env::set_var("CELESTE_START_ROOM", room);
+            }
             let dir = std::path::Path::new(&level_dir);
             let ids = celeste_rust::compiled::ids();
             let speed = celeste_rust::trace::kernel::region_grid().map_or(7, |g| g.speed);
             let (spd_max, rem) = ((speed as i64) << 16, (-0x8000i64, 0x7fffi64));
+            let path = ((PLATFORM_PATH.0 as i64) << 16, (PLATFORM_PATH.1 as i64) << 16);
+            let f_dir = celeste_names::FIELD_NAMES.iter().position(|n| *n == "dir").expect("a `dir` field") as u32;
+            // The platform worlds, read only where a row holds a platform.
+            let mut worlds: Option<Vec<Vec<[i32; celeste_rust::concrete::WORLD_FIELDS]>>> = None;
             let mut frames: Vec<u32> = std::fs::read_dir(dir.join("frames"))?
                 .filter_map(|e| e.ok()?.file_name().to_str()?.strip_prefix('f')?.parse().ok())
                 .collect();
             frames.sort_unstable();
-            // Per field: rows outside, and the extreme seen.
-            let names = ["spd.x", "spd.y", "rem.x", "rem.y"];
-            let (mut outside, mut lo, mut hi) = ([0u64; 4], [i64::MAX; 4], [i64::MIN; 4]);
-            let (mut rows, mut trimmed, mut first_bad) = (0u64, 0u64, None::<(u32, &str)>);
+            // Per field: rows outside, the extreme seen, the first frame outside.
+            let mut seen: std::collections::BTreeMap<String, (u64, i64, i64)> = Default::default();
+            let (mut rows, mut trimmed, mut first_bad) = (0u64, 0u64, None::<(u32, String)>);
+            let raw = |av: AV, f: u32, n: &str| -> Result<(i64, i64)> {
+                let (a, b) = match av {
+                    AV::Num(v) => (v, v),
+                    AV::Ival(a, b) => (a, b),
+                    other => anyhow::bail!("f{f}: {n} holds {other:?}"),
+                };
+                Ok((a.as_raw_u32() as i32 as i64, b.as_raw_u32() as i32 as i64))
+            };
+            // A table field's sub-field (`spd.x`).
+            let sub = |rt2: &Rt2, obj: u32, f: u32, axis: u32| -> Option<usize> {
+                match rt2.cols[rt2.obj_field_cell(obj, f)? as usize] {
+                    Col::U(AV::Ptr(t)) => rt2.obj_field_cell(t, axis).map(|c| c as usize),
+                    _ => None,
+                }
+            };
             for &f in &frames {
                 for (_, ff) in frame_files(dir, f)? {
                     let width = ff.width();
@@ -1625,23 +1653,63 @@ fn main() -> Result<()> {
                     }
                     for lo_row in (0..width).step_by(1 << 20) {
                         let Some(rt2) = ff.load_rows(&[lo_row..(lo_row + (1 << 20)).min(width)])? else { break };
-                        let named = cell_names(&rt2, ids);
                         rows += rt2.width as u64;
-                        for (k, n) in names.iter().enumerate() {
-                            let Some((&c, _)) = named.iter().find(|(_, m)| m.as_str() == *n) else { continue };
-                            let (min, max) = if k < 2 { (-spd_max, spd_max) } else { rem };
+                        // (name, cell, the bound per row).
+                        let mut checks: Vec<(String, usize, Box<dyn Fn(&Rt2, usize) -> Result<(i64, i64)>>)> = Vec::new();
+                        let named = cell_names(&rt2, ids);
+                        for n in ["spd.x", "spd.y", "rem.x", "rem.y"] {
+                            if let Some((&c, _)) = named.iter().find(|(_, m)| m.as_str() == n) {
+                                let r = if n.starts_with("spd") { (-spd_max, spd_max) } else { rem };
+                                checks.push((format!("player.{n}"), c, Box::new(move |_, _| Ok(r))));
+                            }
+                        }
+                        let platforms = rt2.objects_of_type(ids, ids.g_platform);
+                        if !platforms.is_empty() && worlds.is_none() {
+                            anyhow::ensure!(room.is_some(), "the tree holds moving platforms: --room gives their worlds");
+                            worlds = Some(celeste_rust::concrete::platform_worlds(celeste_rust::trace::kernel::PLATFORM_WORLD_FRAMES)?);
+                        }
+                        for &obj in &platforms {
+                            for (n, c) in [("x", rt2.obj_field_cell(obj, ids.f_x)), ("last", rt2.obj_field_cell(obj, ids.f_last))] {
+                                let c = c.ok_or_else(|| anyhow::anyhow!("f{f}: a platform without `{n}`"))? as usize;
+                                checks.push((format!("platform.{n}"), c, Box::new(move |_, _| Ok(path))));
+                            }
+                            let c = sub(&rt2, obj, ids.f_rem, ids.f_x).ok_or_else(|| anyhow::anyhow!("f{f}: a platform without `rem.x`"))?;
+                            let r = (PLATFORM_REM.0 as i64, PLATFORM_REM.1 as i64);
+                            checks.push(("platform.rem.x".to_string(), c, Box::new(move |_, _| Ok(r))));
+                            // `spd.x` over the worlds of the platforms alike in `y` and `dir`
+                            // (as `widen::platform_inputs` matches them).
+                            let c = sub(&rt2, obj, ids.f_spd, ids.f_x).ok_or_else(|| anyhow::anyhow!("f{f}: a platform without `spd.x`"))?;
+                            let (cy, cd) = (rt2.obj_field_cell(obj, ids.f_y), rt2.obj_field_cell(obj, f_dir));
+                            let (cy, cd) = (cy.ok_or_else(|| anyhow::anyhow!("a platform without `y`"))? as usize, cd.ok_or_else(|| anyhow::anyhow!("a platform without `dir`"))? as usize);
+                            let w = worlds.clone().expect("built above");
+                            checks.push((
+                                "platform.spd.x".to_string(),
+                                c,
+                                Box::new(move |rt2: &Rt2, r: usize| {
+                                    let (y, d) = (raw(rt2.cols[cy].at(r), f, "y")?, raw(rt2.cols[cd].at(r), f, "dir")?);
+                                    let alike: Vec<i64> = w.iter().flat_map(|wd| wd.iter().filter(|p| p[4] as i64 == y.0 && p[5] as i64 == d.0).map(|p| p[3] as i64)).collect();
+                                    anyhow::ensure!(y.0 == y.1 && d.0 == d.1 && !alike.is_empty(), "f{f}: no platform world at y {y:?} dir {d:?}");
+                                    Ok((*alike.iter().min().expect("one"), *alike.iter().max().expect("one")))
+                                }),
+                            ));
+                        }
+                        for obj in rt2.objects_of_type(ids, ids.g_fly_fruit) {
+                            for (n, field, r) in [("spd.y", ids.f_spd, FLY_FRUIT_SPD_Y), ("rem.y", ids.f_rem, FLY_FRUIT_REM_Y)] {
+                                let c = sub(&rt2, obj, field, ids.f_y).ok_or_else(|| anyhow::anyhow!("f{f}: a fly fruit without `{n}`"))?;
+                                let r = (r.0 as i64, r.1 as i64);
+                                checks.push((format!("fly_fruit.{n}"), c, Box::new(move |_, _| Ok(r))));
+                            }
+                        }
+                        for (n, c, bound) in &checks {
+                            let e = seen.entry(n.clone()).or_insert((0, i64::MAX, i64::MIN));
                             for r in 0..rt2.width {
-                                let (a, b) = match rt2.cols[c].at(r) {
-                                    celeste_engine::runtime2::AV::Num(v) => (v, v),
-                                    celeste_engine::runtime2::AV::Ival(a, b) => (a, b),
-                                    other => anyhow::bail!("f{f}: {n} holds {other:?}"),
-                                };
-                                let (a, b) = (a.as_raw_u32() as i32 as i64, b.as_raw_u32() as i32 as i64);
-                                lo[k] = lo[k].min(a);
-                                hi[k] = hi[k].max(b);
+                                let (a, b) = raw(rt2.cols[*c].at(r), f, n)?;
+                                let (min, max) = bound(&rt2, r)?;
+                                e.1 = e.1.min(a);
+                                e.2 = e.2.max(b);
                                 if a < min || b > max {
-                                    outside[k] += 1;
-                                    first_bad.get_or_insert((f, n));
+                                    e.0 += 1;
+                                    first_bad.get_or_insert((f, n.clone()));
                                 }
                             }
                         }
@@ -1650,10 +1718,8 @@ fn main() -> Result<()> {
             }
             let px = |v: i64| v as f64 / 65536.0;
             println!("[bounds-audit] {}: {} frames, {rows} rows read, {trimmed} trimmed (not read); speed bound {speed} px", dir.display(), frames.len());
-            for (k, n) in names.iter().enumerate() {
-                if lo[k] <= hi[k] {
-                    println!("[bounds-audit]   {n}: {} rows outside, range [{:.4}, {:.4}]", outside[k], px(lo[k]), px(hi[k]));
-                }
+            for (n, (outside, lo, hi)) in &seen {
+                println!("[bounds-audit]   {n}: {outside} rows outside, range [{:.4}, {:.4}]", px(*lo), px(*hi));
             }
             match first_bad {
                 Some((f, n)) => println!("[bounds-audit] OUT OF BOUNDS: first at f{f} ({n})"),
