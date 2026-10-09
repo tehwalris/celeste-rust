@@ -145,7 +145,7 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   near; the player's per-frame move <= 8 checked on every leaf) pinned to
   state 0 (unpinned the floors' states are a product: room (3,0)'s 12
   floors passed 1M paths a step). Room (3,0) 100% `r0sxhfn` f1-f45: 0 bad
-  (1460 inside, 622 outside; 75 min single-threaded); `--fault` makes both
+  (1460 inside, 622 outside; 65 min single-threaded); `--fault` makes both
   rooms fail. `rewrite follow` with the community route agrees with the
   `r0sxhfn` tree's keys through the spawn and the fruit taking off (f35)
   to the end of a tree built to f46. Room (3,0) nodiag: bound 76 against
