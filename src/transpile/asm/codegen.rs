@@ -205,6 +205,13 @@ pub struct Compiled {
     pub spill_slots: usize,
     /// The stack frame in bytes, for the caller's stack check.
     pub frame_bytes: u32,
+    /// `CELESTE_KERNEL_MIX` only (else empty): per SSA instruction `k`, the
+    /// graph node it was lowered from (a root store: the root) and its kind;
+    /// the text then marks each instruction's lines with a `#@k` line.
+    pub prov: Vec<(NodeId, &'static str)>,
+    /// `CELESTE_KERNEL_MIX` only: per SSA instruction, whether plain bit
+    /// identities over the stream remove it (`foldable`).
+    pub foldable: Vec<bool>,
 }
 
 // ---- constant pool ----
@@ -1148,7 +1155,7 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
 }
 
 /// List-schedule the SSA stream: highest critical path first, to hide latency.
-fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
+fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> (Vec<Inst>, Vec<u32>) {
     let n = insts.len();
     let mut def_inst = vec![u32::MAX; n_vregs as usize];
     for (i, inst) in insts.iter().enumerate() {
@@ -1273,7 +1280,8 @@ fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
     }
     assert_eq!(order.len(), n, "list scheduler dropped instructions");
     let mut slots: Vec<Option<Inst>> = insts.into_iter().map(Some).collect();
-    order.into_iter().map(|i| slots[i as usize].take().unwrap()).collect()
+    let out = order.iter().map(|&i| slots[i as usize].take().unwrap()).collect();
+    (out, order)
 }
 
 fn inst_def(inst: &Inst) -> Option<Vreg> {
@@ -1793,9 +1801,14 @@ pub fn compile(
     let mut kind_ix: HashMap<String, u16> = HashMap::new();
     let mut vreg_kind: Vec<u16> = Vec::new();
     let mut insts_by_kind: Vec<usize> = Vec::new();
+    let mix = super::mix_on();
+    let mut prov_node: Vec<NodeId> = Vec::new();
     for id in order {
         let (v0, i0) = (lo.next_vreg, lo.insts.len());
         lo.lower_node(id)?;
+        if mix {
+            prov_node.resize(lo.insts.len(), id);
+        }
         if stats {
             let name = format!("{:?}", g.get(id).op).split('(').next().unwrap_or("").to_string();
             let k = *kind_ix.entry(name.clone()).or_insert_with(|| {
@@ -1871,10 +1884,20 @@ pub fn compile(
             None => bail!("root {} was never lowered", r),
         };
         root_kinds.push(kind);
+        if mix {
+            prov_node.resize(lo.insts.len(), *r);
+        }
     }
 
     let t = std::time::Instant::now();
-    lo.insts = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
+    let (insts, order) = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
+    lo.insts = insts;
+    let prov: Vec<(NodeId, &'static str)> = if mix {
+        order.iter().zip(&lo.insts).map(|(&i, inst)| (prov_node[i as usize], inst_kind(inst))).collect()
+    } else {
+        Vec::new()
+    };
+    let foldable = if mix { foldable(&lo.insts, lo.next_vreg) } else { Vec::new() };
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
     }
@@ -1942,7 +1965,11 @@ pub fn compile(
     // Body first (fills the pool), then wrap with prologue/epilogue.
     let mut body = String::new();
     std::mem::swap(&mut em.out, &mut body);
-    for inst in &lo.insts {
+    for (k, inst) in lo.insts.iter().enumerate() {
+        if mix {
+            // A comment line: assembles to nothing, and `drop_redundant_reloads` passes it.
+            writeln!(em.out, "#@{k}").unwrap();
+        }
         em.emit_inst(inst);
     }
     std::mem::swap(&mut em.out, &mut body); // em.out empty again, body holds the code
@@ -1967,6 +1994,9 @@ pub fn compile(
     }
     writeln!(asm, "    vpxorq %zmm{Z}, %zmm{Z}, %zmm{Z}", Z = ZERO).unwrap();
     asm.push_str(&body);
+    if mix {
+        writeln!(asm, "#@end").unwrap();
+    }
     if frame > 0 {
         writeln!(asm, "    add ${}, %rsp", frame).unwrap();
     }
@@ -1996,5 +2026,196 @@ pub fn compile(
         sym: sym.to_string(),
         spill_slots,
         frame_bytes: frame,
+        prov,
+        foldable,
     })
+}
+
+/// A vreg's value as far as bit identities know it.
+#[derive(Clone, Copy, PartialEq)]
+enum Known {
+    Opaque,
+    /// The same i32 in every lane.
+    Const(i32),
+    /// Equal to another (opaque) vreg.
+    Alias(Vreg),
+}
+
+/// The instructions plain bit identities REMOVE (`CELESTE_KERNEL_MIX`'s
+/// estimate; nothing in the build uses it): constants folded through
+/// `x & -1 = x`, `x | -1 = -1`, `x | 0 = x`, `x & 0 = 0`, `c ? t : t = t`, a
+/// select or operation on constants, and so on; then every instruction no
+/// store needs (through the resolved operands) is removable. A constant a
+/// kept instruction still reads keeps its broadcast. Exact per lane: an
+/// identity holds for every input, so this drops no check.
+fn foldable(insts: &[Inst], n_vregs: Vreg) -> Vec<bool> {
+    let mut kn = vec![Known::Opaque; n_vregs as usize];
+    let res = |kn: &[Known], v: Vreg| -> Known {
+        match kn[v as usize] {
+            Known::Opaque => Known::Alias(v),
+            k => k,
+        }
+    };
+    let src = |kn: &[Known], s: &Src| -> Known {
+        match s {
+            Src::Reg(v) => res(kn, *v),
+            Src::BI32(c) => Known::Const(*c),
+        }
+    };
+    for inst in insts {
+        let (dst, k) = match inst {
+            Inst::BcastD { dst, val } => (*dst, Known::Const(*val)),
+            Inst::RBin { dst, op, a, b } => {
+                let (x, y) = (res(&kn, *a), src(&kn, b));
+                let k = match (op, x, y) {
+                    (_, Known::Const(p), Known::Const(q)) => Known::Const(match op {
+                        ROp::AddD => p.wrapping_add(q),
+                        ROp::SubD => p.wrapping_sub(q),
+                        ROp::MinSD => p.min(q),
+                        ROp::MaxSD => p.max(q),
+                        ROp::AndD => p & q,
+                        ROp::OrD => p | q,
+                        ROp::XorD => p ^ q,
+                        ROp::AndnD => !p & q,
+                    }),
+                    (ROp::AndD, z, Known::Const(-1)) | (ROp::AndD, Known::Const(-1), z) => z,
+                    (ROp::AndD, _, Known::Const(0)) | (ROp::AndD, Known::Const(0), _) => Known::Const(0),
+                    (ROp::OrD, _, Known::Const(-1)) | (ROp::OrD, Known::Const(-1), _) => Known::Const(-1),
+                    (ROp::OrD, z, Known::Const(0)) | (ROp::OrD, Known::Const(0), z) => z,
+                    (ROp::AndD | ROp::OrD | ROp::MinSD | ROp::MaxSD, p, q) if p == q => p,
+                    (ROp::XorD, z, Known::Const(0)) | (ROp::XorD, Known::Const(0), z) => z,
+                    (ROp::XorD | ROp::SubD, p, q) if p == q => Known::Const(0),
+                    (ROp::AndnD, Known::Const(-1), _) | (ROp::AndnD, _, Known::Const(0)) => Known::Const(0),
+                    (ROp::AndnD, Known::Const(0), z) => z,
+                    (ROp::AndnD, p, q) if p == q => Known::Const(0),
+                    (ROp::AddD | ROp::SubD, z, Known::Const(0)) => z,
+                    (ROp::AddD, Known::Const(0), z) => z,
+                    _ => Known::Opaque,
+                };
+                (*dst, k)
+            }
+            Inst::Cmp { dst, imm, a, b } => {
+                let k = match (res(&kn, *a), src(&kn, b)) {
+                    (Known::Const(p), Known::Const(q)) => {
+                        let t = match imm {
+                            0 => p == q,
+                            1 => p < q,
+                            2 => p <= q,
+                            4 => p != q,
+                            5 => p >= q,
+                            6 => p > q,
+                            _ => return vec![false; insts.len()],
+                        };
+                        Known::Const(if t { -1 } else { 0 })
+                    }
+                    (p, q) if p == q => match imm {
+                        0 | 2 | 5 => Known::Const(-1),
+                        _ => Known::Const(0),
+                    },
+                    _ => Known::Opaque,
+                };
+                (*dst, k)
+            }
+            Inst::Ternlog { dst, a, b, c, imm } => {
+                let (x, y, z) = (res(&kn, *a), res(&kn, *b), res(&kn, *c));
+                let k = match (x, y, z) {
+                    (Known::Const(p), Known::Const(q), Known::Const(r)) => {
+                        let mut out = 0i32;
+                        for bit in 0..32 {
+                            let i = ((p >> bit) & 1) << 2 | ((q >> bit) & 1) << 1 | ((r >> bit) & 1);
+                            out |= ((*imm as i32 >> i) & 1) << bit;
+                        }
+                        Known::Const(out)
+                    }
+                    _ if *imm == 0xca && y == z => y,
+                    (Known::Const(-1), _, _) if *imm == 0xca => y,
+                    (Known::Const(0), _, _) if *imm == 0xca => z,
+                    _ => Known::Opaque,
+                };
+                (*dst, k)
+            }
+            other => match inst_def(other) {
+                Some(d) => (d, Known::Opaque),
+                None => continue,
+            },
+        };
+        // An alias of itself is just opaque.
+        kn[dst as usize] = if k == Known::Alias(dst) { Known::Opaque } else { k };
+    }
+    // Liveness from the stores through resolved operands.
+    let mut def_at = vec![u32::MAX; n_vregs as usize];
+    for (i, inst) in insts.iter().enumerate() {
+        if let Some(d) = inst_def(inst) {
+            def_at[d as usize] = i as u32;
+        }
+    }
+    let mut const_def: HashMap<i32, u32> = HashMap::new();
+    for (i, inst) in insts.iter().enumerate() {
+        if let Inst::BcastD { val, .. } = inst {
+            const_def.entry(*val).or_insert(i as u32);
+        }
+    }
+    let mut needed = vec![false; insts.len()];
+    let mut stack: Vec<u32> = Vec::new();
+    let mut buf = Vec::new();
+    let need_vreg = |v: Vreg, stack: &mut Vec<u32>, needed: &mut Vec<bool>| {
+        let at = match res(&kn, v) {
+            Known::Alias(w) => def_at[w as usize],
+            // A constant operand needs its broadcast (or an embedded one).
+            Known::Const(c) => const_def.get(&c).copied().unwrap_or(u32::MAX),
+            Known::Opaque => def_at[v as usize],
+        };
+        if at != u32::MAX && !needed[at as usize] {
+            needed[at as usize] = true;
+            stack.push(at);
+        }
+    };
+    for (i, inst) in insts.iter().enumerate() {
+        if matches!(inst, Inst::Store { .. } | Inst::StoreMask { .. } | Inst::Call { .. }) {
+            needed[i] = true;
+            stack.push(i as u32);
+        }
+    }
+    while let Some(i) = stack.pop() {
+        buf.clear();
+        inst_uses(&insts[i as usize], &mut buf);
+        for &v in &buf {
+            need_vreg(v, &mut stack, &mut needed);
+        }
+    }
+    needed.iter().map(|n| !n).collect()
+}
+
+/// An instruction's kind for `Compiled::prov`: the variant, a binary op's
+/// operation, and whether its operand is the floor mask or the NOT constant.
+fn inst_kind(inst: &Inst) -> &'static str {
+    match inst {
+        Inst::Load { .. } => "load",
+        Inst::LoadMask { .. } => "loadmask",
+        Inst::BcastD { .. } => "bcast",
+        Inst::RBin { op, b, .. } => match (op, b) {
+            (ROp::AndD, Src::BI32(FLR_MASK)) => "flr",
+            (ROp::XorD, Src::BI32(-1)) => "not",
+            (ROp::AddD, _) => "add",
+            (ROp::SubD, _) => "sub",
+            (ROp::MinSD, _) => "min",
+            (ROp::MaxSD, _) => "max",
+            (ROp::AndD, _) => "and",
+            (ROp::OrD, _) => "or",
+            (ROp::XorD, _) => "xor",
+            (ROp::AndnD, _) => "andn",
+        },
+        Inst::Neg { .. } => "neg",
+        Inst::Abs { .. } => "abs",
+        Inst::Muldq { .. } => "muldq",
+        Inst::Sraq { .. } => "sraq",
+        Inst::Sllq { .. } => "sllq",
+        Inst::BlendImm { .. } => "blendimm",
+        Inst::Cmp { .. } => "cmp",
+        Inst::Ternlog { imm: 0xca, .. } => "sel",
+        Inst::Ternlog { .. } => "ternlog",
+        Inst::Call { .. } => "call",
+        Inst::Store { .. } => "store",
+        Inst::StoreMask { .. } => "storemask",
+    }
 }
