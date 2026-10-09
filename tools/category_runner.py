@@ -21,11 +21,13 @@ Per job:
  1. the reference: the community TAS replayed in the ORIGINAL cart behind the
     room's prologue (the earliest offset around `offset` that exits);
  2. `rewrite search --ceiling REF --prefer <the community TAS>` with the
-    category's mode (CELESTE_NODIAG / CELESTE_GEMSKIP / CELESTE_HUNDRED) and
+    category's mode (CELESTE_NODIAG / CELESTE_ONLYDIAG / CELESTE_GEMSKIP /
+    CELESTE_HUNDRED) and
     the level -1 filter if `l1` (retried without it if its table refuses);
     `--to H` instead with a job's "to";
  3. our witness replayed in the original cart (must exit at the optimum; no
-    diagonal dash in a nodiag category);
+    diagonal dash in a nodiag category, every dash diagonal in an onlydiag
+    one);
  4. the upload (OUTDIR/upload/<cat>/TAS<n>.tas): the first candidate cut
     VALID in REAL PLAY - the boot chain on a real PICO-8 and Celia
     (tools/uct/check_uploads.py), "real_play" in the result; both files
@@ -41,13 +43,15 @@ import chain  # noqa: E402
 DB = os.path.expanduser("~/src/github.com/CelesteClassic/tasdatabase")
 ORIG = os.path.expanduser("~/src/github.com/tehwalris/celeste_ocaml/celeste.lua")
 UI = "/var/tmp/celeste-ui/data"
-CAT_LABEL = {"nodiag": "No Diagonal Dashes", "gemskipany": "Gemskip any%", "gemskipnodiag": "Gemskip No Diagonal Dashes", "100": "100%"}
+CAT_LABEL = {"nodiag": "No Diagonal Dashes", "gemskipany": "Gemskip any%", "gemskipnodiag": "Gemskip No Diagonal Dashes", "100": "100%", "onlydiag": "Only Diagonal Dashes"}
 
 
 def mode_env(cat):
     env = {}
     if "nodiag" in cat:
         env["CELESTE_NODIAG"] = "1"
+    if "onlydiag" in cat:
+        env["CELESTE_ONLYDIAG"] = "1"
     if cat.startswith("gemskip"):
         env["CELESTE_GEMSKIP"] = "1"
     if cat in ("100", "gemskip100"):
@@ -105,6 +109,17 @@ def diag_dashes(inputs):
     bad, prev = [], 0
     for i, b in enumerate(inputs):
         if b & 32 and not prev & 32 and (b & 3) and (b & 12):
+            bad.append(i + 1)
+        prev = b
+    return bad
+
+
+def straight_dashes(inputs):
+    """The dash presses (onlydiag) without BOTH a horizontal and a vertical
+    direction held: a press with neither dashes the facing direction."""
+    bad, prev = [], 0
+    for i, b in enumerate(inputs):
+        if b & 32 and not prev & 32 and not ((b & 3) and (b & 12)):
             bad.append(i + 1)
         prev = b
     return bad
@@ -321,6 +336,8 @@ def run(job, outdir, binary):
         res["berry"] = berry
     if "nodiag" in cat:
         res["diagonal_dashes"] = diag_dashes(ours)
+    if "onlydiag" in cat:
+        res["straight_dashes"] = straight_dashes(ours)
     lead = next((i for i, b in enumerate(ours) if b), len(ours))
     res["first_input"] = lead
     # 4. The upload, chosen by REAL PLAY. It starts at the room's first
