@@ -3136,6 +3136,64 @@ mod tests {
         assert_eq!(k.difference(&r).count() + r.difference(&k).count(), 0, "kernels {} successors, reference {}: {} only in the reference", k.len(), r.len(), r.difference(&k).count());
     }
 
+    /// A REGION KERNEL CHECKS ITS BOUNDS: a lane whose speed or remainder lies
+    /// outside the ranges its kernel was specialized on DECLINES (the
+    /// restrictions' own error, `Op::Restrict`), and the same lane inside them
+    /// runs. Before the restriction, the lowering's interval fold seeded the
+    /// input cells with those ranges and folded the check away: such a lane
+    /// was computed silently wrong.
+    #[test]
+    fn a_lane_outside_its_kernels_bounds_declines() {
+        use crate::abstraction::{set_level, Level};
+        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        let level = Level::parse("r0sxh").expect("level");
+        set_level(level);
+        let grid = crate::trace::kernel::region_grid().expect("the default region grid");
+        let _kernels = crate::compiled::FrameEngine::new_for_start_room().expect("kernels");
+        // The first frame with a player, a few frames in: standing, at rest.
+        let mut reference = RefEngine::new().expect("ref engine");
+        let mut row = reference.initial().expect("initial state");
+        let ids = crate::compiled::ids();
+        let mut after = 0;
+        while after < 3 {
+            row = reference.step_one(&row, 0).expect("frame").into_rt2();
+            if !row.player_objects(ids).is_empty() {
+                after += 1;
+            }
+        }
+        widen_rt2_to(&mut row, level);
+        let player = row.player_objects(ids)[0];
+        let cell_of = |rt2: &Rt2, f: u32, axis: u32| -> usize {
+            let pc = rt2.obj_field_cell(player, f).expect("the player's table field");
+            let Col::U(AV::Ptr(t)) = rt2.cols[pc as usize] else { panic!("the player's field is not a table") };
+            rt2.obj_field_cell(t, axis).expect("its axis") as usize
+        };
+        // `row` with one field set; a number column or an interval one, as it was.
+        let with = |f: u32, axis: u32, v: P8| -> Rt2 {
+            let mut r = row.clone_block();
+            let c = cell_of(&r, f, axis);
+            r.cols[c] = match r.cols[c] {
+                Col::U(AV::Ival(..)) | Col::I(_) => Col::U(AV::Ival(v, v)),
+                _ => Col::U(AV::Num(v)),
+            };
+            r
+        };
+        let runs = |r: &Rt2| -> bool {
+            let cells = crate::search::pos_graph::block_cells(r).expect("cells");
+            assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
+            let mut sink = ForwardSink::empty(false);
+            crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
+        };
+        let px = |n: i16| P8::from_i16(n);
+        let half = P8::from_parts(0, 0x8000);
+        assert!(runs(&row), "the lane as played runs");
+        assert!(runs(&with(ids.f_spd, ids.f_x, px(grid.speed as i16))), "speed at the bound runs");
+        assert!(runs(&with(ids.f_rem, ids.f_x, half - P8::from_raw(1))), "the remainder at its upper bound runs");
+        assert!(!runs(&with(ids.f_spd, ids.f_x, px(grid.speed as i16) + half)), "speed.x past the bound declines");
+        assert!(!runs(&with(ids.f_spd, ids.f_y, -(px(grid.speed as i16) + half))), "speed.y past the bound declines");
+        assert!(!runs(&with(ids.f_rem, ids.f_x, half)), "a remainder of 0.5 declines");
+    }
+
     /// Room (1,3)'s 127-frame EXIT FRAME: the kernels make the concrete exit's
     /// state, KEY included. Guards a number and its point interval keying alike.
     #[test]

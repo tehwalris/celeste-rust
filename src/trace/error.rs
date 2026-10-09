@@ -15,6 +15,13 @@
 //! | a fork's fragment (`Split`, `SplitInt`) of a set | not covered: `not SplitOk(ways)` | a lane spanning more parts than are enumerated has none to go to |
 //! | `Sel(c, t, f)`, `c` lane-undecidable | `not Known(c)` | the kernel picks an arm by `c`'s value bit |
 //! | `Add`, `Sub`, `Neg` of an interval, not bounded inside the 16.16 range by the static ranges | `not NoWrap(op)` | the kernel computes each endpoint in wrapping i32: an overflow wraps it apart from the other |
+//! | `Restrict(lo, hi)(x)` | `Lo(x) < lo or Hi(x) > hi`, on the raw `x` | the body was specialized on the range: the static ranges folded comparisons with it |
+//!
+//! A RESTRICTION's own error is charged to EVERY outcome of the frame, not
+//! only to those that reach the node: a comparison its range decided folded
+//! to a constant that no longer reads it (in the tracer, `Points` and the
+//! lowering's interval fold alike), so reachability cannot see the use. It
+//! reads only the raw input, which nothing seeds, so no fold removes it.
 //!
 //! A fork's VALIDITY (`SplitValid*`) owns nothing: it is defined on every
 //! lane, and a row that does not read a fragment's value is the right row
@@ -30,8 +37,7 @@
 //! derivation, which would copy the guard and value DAG above every source.
 //!
 //! Not here: what no graph operator carries (an output widening's
-//! containment, the kernel's admissible inputs, an unfinished unrolled
-//! loop). The tracer states those and ORs them into the outcome's error
+//! containment, the pins, an unfinished unrolled loop). The tracer states those and ORs them into the outcome's error
 //! (`verify::trace_frame`).
 
 use crate::transpile::graph::{NodeId, Op};
@@ -53,7 +59,9 @@ pub fn of(d: &mut Symbolic, roots: &[NodeId]) -> NodeId {
 /// would be outcomes x graph.
 pub fn for_outcomes(d: &mut Symbolic, outcomes: &[Vec<NodeId>]) -> Vec<NodeId> {
     let sites: Vec<NodeId> = d.evaluated.values().copied().collect();
-    let all: Vec<NodeId> = outcomes.iter().flatten().copied().chain(sites).collect();
+    // Every outcome reads every restriction (the module doc).
+    let assumed = d.restricts.clone();
+    let all: Vec<NodeId> = outcomes.iter().flatten().copied().chain(sites).chain(assumed.iter().copied()).collect();
     let reach = crate::transpile::bdd::reachable(&d.graph, &all);
     // The sources and their own errors, in node order.
     let mut sources: Vec<(NodeId, NodeId)> = Vec::new();
@@ -102,7 +110,7 @@ pub fn for_outcomes(d: &mut Symbolic, outcomes: &[Vec<NodeId>]) -> Vec<NodeId> {
         .iter()
         .map(|roots| {
             let mut have = vec![0u64; words];
-            for r in roots {
+            for r in roots.iter().chain(&assumed) {
                 for (w, x) in have.iter_mut().zip(&sets[set_of[*r as usize] as usize]) {
                     *w |= x;
                 }
@@ -162,6 +170,16 @@ fn own_error(d: &mut Symbolic, n: NodeId) -> Option<NodeId> {
         Op::Add | Op::Sub | Op::Neg if d.is_interval(&n) && !bounded(d, n) => {
             let fits = d.graph.fold(Op::NoWrap, vec![n]);
             d.graph.fold(Op::Not, vec![fits])
+        }
+        // The assumption, checked on the raw operand: `Lo`/`Hi` of a number
+        // are the number.
+        Op::Restrict(lo, hi) => {
+            let x = a?;
+            let (klo, khi) = (d.graph.leaf(Op::Const(lo, lo)), d.graph.leaf(Op::Const(hi, hi)));
+            let (vlo, vhi) = (d.graph.fold(Op::Lo, vec![x]), d.graph.fold(Op::Hi, vec![x]));
+            let below = d.graph.fold(Op::Lt, vec![vlo, klo]);
+            let above = d.graph.fold(Op::Gt, vec![vhi, khi]);
+            d.graph.fold(Op::Or, vec![below, above])
         }
         _ => return None,
     };
@@ -353,6 +371,27 @@ mod tests {
         let t = d.graph.fold(Op::Add, vec![y, one]);
         let fits = d.graph.fold(Op::NoWrap, vec![t]);
         assert_eq!(of(&mut d, &[t]), d.graph.fold(Op::Not, vec![fits]));
+    }
+
+    #[test]
+    fn a_restriction_is_checked_on_the_raw_input_in_every_outcome() {
+        let mut d = Symbolic::default();
+        let x = cell(&mut d, 0, false);
+        let r = d.restrict(x, -(6 << 16), 6 << 16);
+        // A comparison its range decides folds and reads nothing...
+        let seven = d.graph.leaf(Op::Const(7 << 16, 7 << 16));
+        let decided = d.compare(super::super::domain::Cmp::Lt, &r, &seven).expect("compare");
+        assert_eq!(d.graph.get(decided).op, Op::ConstBool(true), "the range decides it");
+        // ...yet every outcome, one reading nothing at all, owes the bound.
+        let (klo, khi) = (d.graph.leaf(Op::Const(-(6 << 16), -(6 << 16))), d.graph.leaf(Op::Const(6 << 16, 6 << 16)));
+        let (lo, hi) = (d.graph.fold(Op::Lo, vec![x]), d.graph.fold(Op::Hi, vec![x]));
+        let below = d.graph.fold(Op::Lt, vec![lo, klo]);
+        let above = d.graph.fold(Op::Gt, vec![hi, khi]);
+        let own = d.graph.fold(Op::Or, vec![below, above]);
+        let errs = for_outcomes(&mut d, &[vec![decided], vec![]]);
+        assert_eq!(errs, vec![own, own]);
+        // The check reads the raw cell, which no range covers.
+        assert_eq!(d.range_of(x), None);
     }
 
     #[test]

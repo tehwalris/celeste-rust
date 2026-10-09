@@ -51,11 +51,11 @@ pub(crate) fn lattice_kernel_refs(
     let mut lw = room_constant_lattice(root, opts)?;
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
     // Each frame was bound by the walk in the worker arena it was traced in.
-    let frames: Vec<(Option<Region>, super::verify::Frame, Bounds, Bound)> = std::mem::take(&mut lw.frames)
+    let frames: Vec<(Option<Region>, super::verify::Frame, Bound)> = std::mem::take(&mut lw.frames)
         .into_iter()
         .map(|((shape, region), wf)| -> Result<_> {
             let bound = wf.bound.map_err(|e| anyhow::anyhow!("the walk's frame of shape {shape} region {region:?} did not bind: {e}"))?;
-            Ok((region, wf.frame, wf.bounds, bound))
+            Ok((region, wf.frame, bound))
         })
         .collect::<Result<Vec<_>>>()?;
     // Lower (the expensive half of a build), in parallel.
@@ -69,7 +69,7 @@ pub(crate) fn lattice_kernel_refs(
         .min(frames.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
     // Each frame is taken by exactly one worker (a `Frame` is not cloned).
-    let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::verify::Frame, Bounds, Bound)>>> =
+    let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::verify::Frame, Bound)>>> =
         frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
     let slots = &slots;
     let mut built: Vec<(usize, Result<(Option<Region>, Reference)>)> = std::thread::scope(|scope| {
@@ -82,9 +82,9 @@ pub(crate) fn lattice_kernel_refs(
                         let mut out = Vec::new();
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some((key, f, bounds, bound)) = slots.get(i).and_then(|m| m.lock().unwrap().take()) else { break };
+                            let Some((key, f, bound)) = slots.get(i).and_then(|m| m.lock().unwrap().take()) else { break };
                             let r = (|| -> Result<(Option<Region>, Reference)> {
-                                let lowered = super::emit::lower_frame(&bound, Some(room.clone()), engine_ranges(&f, &bounds))
+                                let lowered = super::emit::lower_frame(&bound, Some(room.clone()))
                                     .map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
                                 Ok((key, Reference { frame: f, bound, lowered, cart: cart.clone(), cache: cache.clone() }))
                             })();
@@ -105,7 +105,11 @@ pub(crate) fn lattice_kernel_refs(
 /// THE REGION KEY: a kernel is specialized on the player's whole-pixel
 /// position in one `px`-pixel grid square and speed in `[-speed, speed]`,
 /// so the range analysis folds away far-off collision tests; a lane outside
-/// declines loudly.
+/// declines loudly. Each bound is an `Op::Restrict` on its input cell
+/// (`verify::trace_frame`): the range analyses read the range off that node,
+/// and its own error, on the raw cell, is the per-lane check (`trace::error`).
+/// The dispatch picks the kernel by the lane's region, so `x`/`y` hold by
+/// construction; speed and remainder hold only by that check.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Region {
     pub ix: i16,
@@ -346,17 +350,6 @@ impl NoPlayer {
         }
         Ok(out)
     }
-}
-
-/// A frame's bounds by ENGINE cell, for the lowering's decide and pruning.
-fn engine_ranges(
-    f: &super::verify::Frame,
-    bounds: &[(super::iface::Path, (i32, i32))],
-) -> std::collections::HashMap<u32, (i32, i32)> {
-    bounds
-        .iter()
-        .filter_map(|(p, r)| f.iface.slots.iter().position(|q| q == p).map(|i| (f.in_cells[i], *r)))
-        .collect()
 }
 
 #[cfg(test)]

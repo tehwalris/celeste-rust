@@ -138,6 +138,8 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                     a(2)?
                 }
             }
+            // The value; the range is the node's own error, not a value.
+            Op::Restrict(..) => a(0)?,
             // Every leaf was substituted, so everything is determined.
             Op::Known => Conc::Bool(true),
             // Concrete arithmetic wraps as PICO-8 does: never an interval.

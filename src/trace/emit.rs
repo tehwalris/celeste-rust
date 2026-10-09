@@ -307,13 +307,11 @@ fn asm_fused_of(
 pub fn lower_frame(
     bound: &Bound,
     room: Option<crate::transpile::graph::Room>,
-    ranges: std::collections::HashMap<u32, (i32, i32)>,
 ) -> Result<Lowered> {
     let (graph, outcomes, forks) = (&bound.graph, &bound.outcomes, bound.forks);
     let mut e = Emit::bare(graph.clone());
     e.room = room;
     e.fork_depth = forks as usize;
-    e.ranges = ranges;
     let mut outs: Vec<crate::transpile::lower::Outcome> = outcomes
         .iter()
         .map(|o| crate::transpile::lower::Outcome {

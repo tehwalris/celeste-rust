@@ -426,8 +426,12 @@ pub struct Symbolic {
     /// `may_answers`'s memo: `(may_true, may_false)`.
     may_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, (NodeId, NodeId)>>,
     /// STATIC RANGES of input cells, and `range_of`'s memo; a comparison they
-    /// decide folds. Per frame.
+    /// decide folds. Per frame. A seed is NOT checked here: its caller owes a
+    /// guard (a platform's speed); a kernel input's bounds are `restricts`.
     pub ranges: std::collections::HashMap<NodeId, (i64, i64)>,
+    /// The frame's `Op::Restrict` nodes (`restrict`): its bounded inputs.
+    /// Their own errors are charged to every outcome (`trace::error`).
+    pub restricts: Vec<NodeId>,
     range_memo: std::collections::HashMap<NodeId, Option<Pieces>>,
     /// Comparisons decided from ranges this frame (a probe stat).
     pub range_folds: u64,
@@ -439,6 +443,7 @@ impl Symbolic {
     /// Forget the static ranges (a new frame, new cells).
     pub fn clear_ranges(&mut self) {
         self.ranges.clear();
+        self.restricts.clear();
         self.range_memo.clear();
         self.range_folds = 0;
     }
@@ -556,6 +561,8 @@ impl Symbolic {
                 // PARTIAL: a singleton only on pain of error.
                 Op::Flr => any(memo, &args),
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min | Op::Max | Op::Sin => any(memo, &args),
+                // The operand's, narrowed.
+                Op::Restrict(..) => any(memo, &args),
                 Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => any(memo, &args),
                 Op::Not | Op::And | Op::Or => any(memo, &args),
                 // The condition counts.
@@ -569,9 +576,26 @@ impl Symbolic {
         go(&self.graph, &self.ival_cells, &mut self.abstract_memo.borrow_mut(), n)
     }
 
-    /// The static range of `n` (`graph::pieces_of` over the seeded cells).
+    /// The static range of `n` (`graph::pieces_of` over the restrictions and
+    /// the seeded cells).
     pub fn range_of(&mut self, n: NodeId) -> Option<Pieces> {
         crate::transpile::graph::pieces_of(&self.graph, &self.ranges, &mut self.range_memo, n)
+    }
+
+    /// Does anything give this frame a static range (a seeded cell or a
+    /// restriction)? Without, no comparison is decided by one.
+    fn has_ranges(&self) -> bool {
+        !self.ranges.is_empty() || !self.restricts.is_empty()
+    }
+
+    /// `x` restricted to `[lo, hi]` (`Op::Restrict`), recorded so its own
+    /// error is charged to every outcome.
+    pub fn restrict(&mut self, x: NodeId, lo: i32, hi: i32) -> NodeId {
+        let r = self.graph.add(Op::Restrict(lo, hi), vec![x]);
+        if !self.restricts.contains(&r) {
+            self.restricts.push(r);
+        }
+        r
     }
 
     /// The unknown number (`Op::UnknownNum`).
@@ -1064,7 +1088,7 @@ impl Domain for Symbolic {
             _ => {}
         }
         // Decided by static ranges iff every pair of pieces agrees.
-        if !self.ranges.is_empty() {
+        if self.has_ranges() {
             if let (Some(xs), Some(ys)) = (self.range_of(*a), self.range_of(*b)) {
                 let one = |x: (i64, i64), y: (i64, i64)| -> Option<bool> {
                     match op {
@@ -1171,7 +1195,7 @@ impl Domain for Symbolic {
                 // A span's bounds differ (`fold` collapses a literal span).
                 Op::Span => true,
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs
-                | Op::Min | Op::Max => any(memo, a),
+                | Op::Min | Op::Max | Op::Restrict(..) => any(memo, a),
                 // The CONDITION does not make the result an interval.
                 Op::Sel => any(memo, &a[1..]),
                 // Exact where the lane survives (else its own error).
@@ -1193,8 +1217,9 @@ impl Domain for Symbolic {
     }
 
     fn flr_ways(&mut self, v: &NodeId) -> u8 {
-        // Only seeded ranges know a static range; otherwise the fixed arity.
-        if self.ranges.is_empty() {
+        // Only restrictions and seeded ranges know a static range; otherwise
+        // the fixed arity.
+        if !self.has_ranges() {
             return MOVE_WAYS;
         }
         // At most `MOVE_WAYS`: the static range covers ALL lanes, but one

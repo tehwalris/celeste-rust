@@ -3,12 +3,14 @@
 //!
 //! `transpile::bdd` treats every comparison as an independent variable, so
 //! it cannot see that `0 > abs(x)` is always false. This pass runs the
-//! interval evaluator (`Graph::eval`) with every input at TOP (or its known
-//! range), and every node it pins down is a constant, unconditionally.
+//! interval evaluator (`Graph::eval`) with every input at TOP, and every node
+//! it pins down is a constant, unconditionally.
 //!
 //! **Exact, not merely sound.** The interval domain over-approximates, so a
 //! node evaluated to `Bool(Some(b))` under TOP inputs is `b` under every
-//! assignment. Replacing it changes nothing the graph computes and can only
+//! assignment - every assignment the body is defined on: an
+//! `Op::Restrict` narrows its operand, and a lane outside its range is in
+//! error (the restriction's own, charged to every outcome). Replacing it changes nothing the graph computes and can only
 //! improve precision downstream (unlike a general equality substitution,
 //! see `bdd`'s "proved and deliberately not acted on").
 
@@ -39,7 +41,9 @@ pub struct Stats {
 /// Returns the new graph, a FULL-length node map (`UNREACHABLE` where a
 /// node was not reached), and what it found.
 pub fn fold(g: &Graph, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph, Vec<NodeId>, Stats)> {
-    fold_with(g, roots, room, &HashMap::new())
+    let mut out = g.like();
+    let (map, st) = fold_into(g, roots, room, &mut out)?;
+    Ok((out, map, st))
 }
 
 /// Every input cell at its weakest value - a bool cell unknown, a number
@@ -66,30 +70,18 @@ pub(crate) fn seed_cells(g: &Graph, ranges: &HashMap<u32, (i32, i32)>) -> HashMa
     cells
 }
 
-/// `fold` with input cells `ranges` known to lie in a range (raw,
-/// inclusive), e.g. a region kernel's input ranges.
-pub fn fold_with(
+/// `fold`, writing into `out`: what several graphs fold to lands in one
+/// hash-consed arena, so equal results are the same node. A bounded input's
+/// range comes from its `Op::Restrict`, never from a seed: a fact assumed
+/// here would be checked nowhere.
+pub fn fold_into(
     g: &Graph,
     roots: &[NodeId],
     room: Option<&Room>,
-    ranges: &HashMap<u32, (i32, i32)>,
-) -> Result<(Graph, Vec<NodeId>, Stats)> {
-    let mut out = g.like();
-    let (map, st) = fold_with_into(g, roots, room, ranges, &mut out)?;
-    Ok((out, map, st))
-}
-
-/// `fold_with`, writing into `out`: what several graphs fold to lands in one
-/// hash-consed arena, so equal results are the same node.
-pub fn fold_with_into(
-    g: &Graph,
-    roots: &[NodeId],
-    room: Option<&Room>,
-    ranges: &HashMap<u32, (i32, i32)>,
     out: &mut Graph,
 ) -> Result<(Vec<NodeId>, Stats)> {
     let need = super::bdd::reachable(g, roots);
-    let cells = seed_cells(g, ranges);
+    let cells = seed_cells(g, &HashMap::new());
     let vals = match room {
         Some(r) => g.eval_lenient_in(&cells, r)?,
         None => g.eval_lenient(&cells)?,

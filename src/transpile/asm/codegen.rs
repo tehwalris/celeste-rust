@@ -938,6 +938,12 @@ impl<'a> Lower<'a> {
                 let (frag, _) = self.zi_fork_flr(ar, *c);
                 Value::Ival([NumVal::Reg(frag[0]), NumVal::Reg(frag[1])])
             }
+            // The operand unchanged: the range is the node's own error
+            // (`trace::error`), checked on the raw operand.
+            Op::Restrict(..) => match self.vals[a[0] as usize] {
+                Some(v) => v,
+                None => bail!("node {}: its operand was not lowered", id),
+            },
             Op::FragOk(c) => {
                 let iv = self.as_ival(a[0])?;
                 let ar = self.ival_regs(iv);

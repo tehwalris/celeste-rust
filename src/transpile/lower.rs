@@ -85,21 +85,20 @@ fn roots_under(graph: &Graph, cfg: &[u8], need: &[bool], want: &[NodeId], out: &
 }
 
 /// The roots of each configuration of `cfgs` DECIDED (the interval fold with
-/// the region's ranges and the map), in one fresh arena so equal results are
+/// the restrictions' ranges and the map), in one fresh arena so equal results are
 /// one node (before the fold, e.g. each platform world is a different node).
 fn decided_roots(
     graph: &Graph,
     cfgs: &[Vec<u8>],
     (need, want): (&[bool], &[NodeId]),
     room: Option<&crate::transpile::graph::Room>,
-    ranges: &std::collections::HashMap<u32, (i32, i32)>,
 ) -> Vec<Vec<NodeId>> {
     let mut probe = graph.like();
     let mut decided = graph.like();
     cfgs.iter()
         .map(|c| {
             let sig = roots_under(graph, c, need, want, &mut probe);
-            let (dm, _) = crate::transpile::ival::fold_with_into(&probe, &sig, room, ranges, &mut decided).expect("interval fold");
+            let (dm, _) = crate::transpile::ival::fold_into(&probe, &sig, room, &mut decided).expect("interval fold");
             sig.iter().map(|r| dm[*r as usize]).collect()
         })
         .collect()
@@ -120,7 +119,6 @@ pub(crate) fn specialize_frame(
     forks: u8,
     decide: bool,
     room: Option<&crate::transpile::graph::Room>,
-    ranges: &std::collections::HashMap<u32, (i32, i32)>,
 ) -> (Graph, Vec<SpecializedBody>) {
     let trace = std::env::var_os("CELESTE_BUILD_TRACE").is_some();
     let t0 = std::time::Instant::now();
@@ -218,7 +216,7 @@ pub(crate) fn specialize_frame(
                 let raw: Vec<Vec<NodeId>> = any.iter().map(|c| roots_under(graph, c, &need, &want, &mut probe)).collect();
                 raw.iter().all(|r| *r == raw[0])
                     || (decide && {
-                        let dec = decided_roots(graph, &any, (&need, &want), room, ranges);
+                        let dec = decided_roots(graph, &any, (&need, &want), room);
                         dec.iter().all(|r| *r == dec[0])
                     })
             })
@@ -259,10 +257,10 @@ pub(crate) fn specialize_frame(
                         return (0..valid[i]).collect();
                     }
                     // Per fork, its values that agree, compared decided when the body is:
-                    // a test against one platform world folds only with the region's ranges.
+                    // a test against one platform world folds only with the restrictions' ranges.
                     let plain: Vec<Vec<u8>> = (0..valid[i]).map(with).collect();
                     let sigs = if decide {
-                        decided_roots(graph, &plain, this, room, ranges)
+                        decided_roots(graph, &plain, this, room)
                     } else {
                         plain.iter().map(|c| roots_under(graph, c, &need, &want, &mut probe)).collect()
                     };
@@ -302,14 +300,14 @@ pub(crate) fn specialize_frame(
         let all: Vec<NodeId> = cands.iter().flat_map(|c| c.2.iter().copied()).collect();
         let t_phase = std::time::Instant::now();
         let (g1, m1, _) =
-            crate::transpile::ival::fold_with(&sp, &all, room, ranges).expect("interval fold");
+            crate::transpile::ival::fold(&sp, &all, room).expect("interval fold");
         build_add(4, t_phase);
         let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
         // DIAGNOSTIC (CELESTE_BUILD_TRACE): a body whose `error` folded to true
         // while live somewhere declines every lane it takes. Show the leaves of
         // its `error` Or-tree the interval evaluator decided true.
         if trace {
-            let cells = crate::transpile::ival::seed_cells(&sp, ranges);
+            let cells = crate::transpile::ival::seed_cells(&sp, &Default::default());
             let vals = match room {
                 Some(r) => sp.eval_lenient_in(&cells, r),
                 None => sp.eval_lenient(&cells),
@@ -381,7 +379,7 @@ pub(crate) fn specialize_frame(
         let r2: Vec<NodeId> = r1.iter().map(|x| m2[*x as usize]).collect();
         let t_phase = std::time::Instant::now();
         let (g3, m3, _) =
-            crate::transpile::ival::fold_with(&g2, &r2, room, ranges).expect("interval fold 2");
+            crate::transpile::ival::fold(&g2, &r2, room).expect("interval fold 2");
         build_add(6, t_phase);
         let mut it = r2.iter().map(|x| m3[*x as usize]);
         for c in cands.iter_mut() {
@@ -465,7 +463,7 @@ pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> (Graph, Vec<Spec
         .map(|o| (o.of.fields.iter().map(|f| f.node).collect(), o.error, o.live, o.arc.clone()))
         .collect();
     let (sp, bodies) =
-        specialize_frame(&e.graph, &outs_spec, e.fork_depth as u8, e.decide, e.room.as_ref(), &e.ranges);
+        specialize_frame(&e.graph, &outs_spec, e.fork_depth as u8, e.decide, e.room.as_ref());
     for (oi, o) in outs.iter_mut().enumerate() {
         let mine: Vec<&Vec<NodeId>> = bodies.iter().filter(|b| b.0 == oi).map(|b| &b.2).collect();
         let Some(first) = mine.first() else {

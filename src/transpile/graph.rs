@@ -96,6 +96,15 @@ pub enum Op {
     /// with per-lane bounds (a fruit's bob band). Exactly the hull; containment
     /// is the widening's own error.
     Span,
+    /// `Restrict(lo, hi)(x)`: `x`, ASSUMED to lie in `[lo, hi]` (raw 16.16,
+    /// inclusive). A bounded kernel input (the region's square, speed and
+    /// remainder) enters the body only through one, so the range analyses
+    /// (`eval`'s hull, `pieces_of`) take the range from this node and never
+    /// from a seeded environment. The kernel computes `x` unchanged; the
+    /// assumption is the node's OWN ERROR, `Lo(x) < lo or Hi(x) > hi` on the
+    /// raw operand (`trace::error`), charged to every outcome of the frame,
+    /// because a comparison the range decided no longer reads the node.
+    Restrict(i32, i32),
     /// THE UNKNOWN NUMBER. Not the full-range interval (interval arithmetic
     /// at the extremes raises): it stays unknown under every operation and a
     /// comparison with it is an `UnknownBool`. It never reaches a kernel: it
@@ -618,6 +627,14 @@ impl Graph {
                 Op::Span => {
                     let (lo, hi) = (a!(0).as_num("Span")?.low, a!(1).as_num("Span")?.high);
                     Val::Num(Pico8NumInterval::new(lo.min(hi), lo.max(hi)))
+                }
+                // The operand inside the assumed range: a lane outside is in
+                // error (the node's own), so the value need not cover it.
+                // Disjoint, every lane is in error: the operand, as the kernel.
+                Op::Restrict(lo, hi) => {
+                    let x = a!(0).as_num("Restrict")?;
+                    let (lo, hi) = (x.low.max(Pico8Num::from_raw(*lo)), x.high.min(Pico8Num::from_raw(*hi)));
+                    Val::Num(if lo <= hi { Pico8NumInterval::new(lo, hi) } else { x })
                 }
                 // A split RESTRICTS its operand: lenient, the operand covers it.
                 Op::Split(d) if lenient => {
@@ -1432,8 +1449,11 @@ mod tests {
         assert_eq!(vals[le as usize], Val::Bool(None), "a lane [0, 0.5] has Hi <= 1, a lane [2, 3] does not");
         let seeds: HashMap<NodeId, (i64, i64)> = HashMap::from([(v, (0, 3 << 16))]);
         assert_eq!(pieces_of(&g, &seeds, &mut HashMap::new(), hi), Some(vec![(0, 3 << 16)]));
-        let (out, map, _) = crate::transpile::ival::fold_with(&g, &[le], None, &std::collections::HashMap::from([(0u32, (0, 3 << 16))])).expect("fold");
-        assert_eq!(out.get(map[le as usize]).op, Op::Le, "the fold leaves it to the lanes");
+        let r = g.add(Op::Restrict(0, 3 << 16), vec![v]);
+        let hi_r = g.add(Op::Hi, vec![r]);
+        let le_r = g.add(Op::Le, vec![hi_r, one]);
+        let (out, map, _) = crate::transpile::ival::fold(&g, &[le_r], None).expect("fold");
+        assert_eq!(out.get(map[le_r as usize]).op, Op::Le, "the fold leaves it to the lanes");
     }
 }
 
@@ -1464,11 +1484,12 @@ pub fn normalize_pieces(mut v: Pieces) -> Option<Pieces> {
     Some(out)
 }
 
-/// The static range of `n` (raw 16.16) as PIECES, from seeded input cells
-/// through the arithmetic; a select on a non-constant condition is the union
-/// of its arms (the dash's ±5 beside a run speed under 1). `None` is unknown,
-/// never wrong; the runtime guard on the seeds makes it a fact. `memo` is
-/// valid for one graph and seed set.
+/// The static range of `n` (raw 16.16) as PIECES, from `Op::Restrict` nodes
+/// and seeded input cells through the arithmetic; a select on a non-constant
+/// condition is the union of its arms (the dash's ±5 beside a run speed
+/// under 1). `None` is unknown, never wrong; a restriction's own error, and
+/// the runtime guard on a seed, make it a fact. `memo` is valid for one
+/// graph and seed set.
 pub fn pieces_of(
     g: &Graph,
     seeds: &HashMap<NodeId, (i64, i64)>,
@@ -1492,6 +1513,17 @@ pub fn pieces_of(
     let r: Option<Pieces> = match op {
         Op::Const(lo, hi) => Some(vec![(lo as i64, hi as i64)]),
         Op::Cell(_) => seeds.get(&n).map(|r| vec![*r]),
+        // The assumed range (as `eval`): its own error makes it a fact.
+        Op::Restrict(lo, hi) => {
+            let (lo, hi) = (lo as i64, hi as i64);
+            match rec(memo, 0) {
+                None => Some(vec![(lo, hi)]),
+                Some(a) => {
+                    let inside: Pieces = a.iter().map(|p| (p.0.max(lo), p.1.min(hi))).filter(|p| p.0 <= p.1).collect();
+                    if inside.is_empty() { Some(a) } else { normalize_pieces(inside) }
+                }
+            }
+        }
         Op::Add | Op::Sub | Op::Min | Op::Max => {
             let (a, b) = (rec(memo, 0)?, rec(memo, 1)?);
             let mut out = Vec::new();

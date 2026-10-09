@@ -374,6 +374,16 @@ enum Command {
         #[arg(long)]
         horizon: u32,
     },
+    /// AUDIT: did any kernel ever take a lane outside its region bounds? Every
+    /// stored row of every frame (a kernel's inputs are stored rows): the
+    /// player's `spd.x`/`spd.y` outside `[-S, S]` px (`CELESTE_REGION`'s S)
+    /// and `rem.x`/`rem.y` outside `[-0.5, 0.5)`. Until `Op::Restrict` a
+    /// kernel did not check these; frames whose rows were trimmed
+    /// (`CELESTE_TRIM_ROWS`) are counted, not read.
+    BoundsAudit {
+        #[arg(long)]
+        level_dir: String,
+    },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed. Per
     /// shape: rows, every varying column's distinct value count (capped at
     /// `cap`), named, and the distinct (spd.x, spd.y) pairs.
@@ -1592,6 +1602,63 @@ fn main() -> Result<()> {
             println!("transfers per pair: {hist:?}");
             println!("pairs whose transfers are exactly x-pieces x y-pieces: {product} ({:.1}%); x part constant {x_const} ({:.1}%), y part constant {y_const} ({:.1}%)", 100.0 * product as f64 / n_pairs as f64, 100.0 * x_const as f64 / n_pairs as f64, 100.0 * y_const as f64 / n_pairs as f64);
             println!("distinct transfer sets {}, x sets {}, y sets {} (frame table: {} pairs)", sets.len(), xsets.len(), ysets.len(), pairs.len());
+        }
+        Command::BoundsAudit { level_dir } => {
+            let dir = std::path::Path::new(&level_dir);
+            let ids = celeste_rust::compiled::ids();
+            let speed = celeste_rust::trace::kernel::region_grid().map_or(7, |g| g.speed);
+            let (spd_max, rem) = ((speed as i64) << 16, (-0x8000i64, 0x7fffi64));
+            let mut frames: Vec<u32> = std::fs::read_dir(dir.join("frames"))?
+                .filter_map(|e| e.ok()?.file_name().to_str()?.strip_prefix('f')?.parse().ok())
+                .collect();
+            frames.sort_unstable();
+            // Per field: rows outside, and the extreme seen.
+            let names = ["spd.x", "spd.y", "rem.x", "rem.y"];
+            let (mut outside, mut lo, mut hi) = ([0u64; 4], [i64::MAX; 4], [i64::MIN; 4]);
+            let (mut rows, mut trimmed, mut first_bad) = (0u64, 0u64, None::<(u32, &str)>);
+            for &f in &frames {
+                for (_, ff) in frame_files(dir, f)? {
+                    let width = ff.width();
+                    if ff.trimmed() {
+                        trimmed += width as u64;
+                        continue;
+                    }
+                    for lo_row in (0..width).step_by(1 << 20) {
+                        let Some(rt2) = ff.load_rows(&[lo_row..(lo_row + (1 << 20)).min(width)])? else { break };
+                        let named = cell_names(&rt2, ids);
+                        rows += rt2.width as u64;
+                        for (k, n) in names.iter().enumerate() {
+                            let Some((&c, _)) = named.iter().find(|(_, m)| m.as_str() == *n) else { continue };
+                            let (min, max) = if k < 2 { (-spd_max, spd_max) } else { rem };
+                            for r in 0..rt2.width {
+                                let (a, b) = match rt2.cols[c].at(r) {
+                                    celeste_engine::runtime2::AV::Num(v) => (v, v),
+                                    celeste_engine::runtime2::AV::Ival(a, b) => (a, b),
+                                    other => anyhow::bail!("f{f}: {n} holds {other:?}"),
+                                };
+                                let (a, b) = (a.as_raw_u32() as i32 as i64, b.as_raw_u32() as i32 as i64);
+                                lo[k] = lo[k].min(a);
+                                hi[k] = hi[k].max(b);
+                                if a < min || b > max {
+                                    outside[k] += 1;
+                                    first_bad.get_or_insert((f, n));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let px = |v: i64| v as f64 / 65536.0;
+            println!("[bounds-audit] {}: {} frames, {rows} rows read, {trimmed} trimmed (not read); speed bound {speed} px", dir.display(), frames.len());
+            for (k, n) in names.iter().enumerate() {
+                if lo[k] <= hi[k] {
+                    println!("[bounds-audit]   {n}: {} rows outside, range [{:.4}, {:.4}]", outside[k], px(lo[k]), px(hi[k]));
+                }
+            }
+            match first_bad {
+                Some((f, n)) => println!("[bounds-audit] OUT OF BOUNDS: first at f{f} ({n})"),
+                None => println!("[bounds-audit] every row read lies within the bounds"),
+            }
         }
         Command::ColCensus { level_dir, frame, cap, cell, erase, every } => {
             use celeste_engine::runtime2::{av_code, num_code, Cell2, Col, AV};
