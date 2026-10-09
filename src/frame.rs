@@ -772,11 +772,13 @@ fn append_record(
 fn write_edges(dir: &std::path::Path, frame: u32, layer: usize, worker: u32, buf: &mut Vec<u8>) -> Result<()> {
     use crate::search::edges::RECORD_BYTES;
     use std::io::Write;
-    let mut recs: Vec<[u8; RECORD_BYTES]> = buf.chunks_exact(RECORD_BYTES).map(|c| c.try_into().expect("a record")).collect();
+    // As u128s: a sort of byte arrays compares bytewise (~4% of a frame).
+    // Only the dedup matters here; the compaction sorts by target.
+    let mut recs: Vec<u128> = buf.chunks_exact(RECORD_BYTES).map(|c| u128::from_le_bytes(c.try_into().expect("a record"))).collect();
     recs.sort_unstable();
     recs.dedup();
     buf.clear();
-    buf.extend(recs.iter().flatten());
+    buf.extend(recs.iter().flat_map(|r| r.to_le_bytes()));
     let path = crate::search::edges::raw_path(dir, frame, layer as u32, worker);
     std::fs::create_dir_all(path.parent().expect("a raw dir"))?;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;

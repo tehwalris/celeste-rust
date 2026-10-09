@@ -45,14 +45,15 @@ type Rec = (u64, u64, u32);
 /// buffer, a record each.
 #[inline]
 pub fn encode_record(out: &mut Vec<u8>, target: u64, base: u64, xfer: u32, mut mask: u64) {
+    // The target's half once; one 16-byte store per source.
+    let (tseq, trow) = (crate::frame::id_seq(target) as u16 as u128, crate::frame::id_row(target) as u128);
+    let head = tseq | trow << 16 | (xfer as u128) << 96;
+    out.reserve(mask.count_ones() as usize * RECORD_BYTES);
     while mask != 0 {
         let src = base + mask.trailing_zeros() as u64;
         mask &= mask - 1;
-        out.extend_from_slice(&(crate::frame::id_seq(target) as u16).to_le_bytes());
-        out.extend_from_slice(&crate::frame::id_row(target).to_le_bytes());
-        out.extend_from_slice(&(crate::frame::id_seq(src) as u16).to_le_bytes());
-        out.extend_from_slice(&crate::frame::id_row(src).to_le_bytes());
-        out.extend_from_slice(&xfer.to_le_bytes());
+        let rec = head | (crate::frame::id_seq(src) as u16 as u128) << 48 | (crate::frame::id_row(src) as u128) << 64;
+        out.extend_from_slice(&rec.to_le_bytes());
     }
 }
 
