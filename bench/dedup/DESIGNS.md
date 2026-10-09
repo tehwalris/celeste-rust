@@ -344,3 +344,152 @@ the drops loop alone varied 0.30-0.63 s): posmask4 1.89 s, posmask8 2.19 s
 (and 3.16 / 4.59 s under heavier contention), bits 4.64 s in the same
 contended window (2.27 quiet). AnonHugePages at the timed loop 4-8.7 GB of
 21 GB RSS (most RSS is the untimed precompute; the table is 70-190 MB).
+
+## Compact. Quotiented per-position storage (`compactprep`, `cqa`, `cqb`, `cqc`; src/compact.rs; 2026-10-09)
+
+Aim: fewer bytes a state, so the sweep's live window sits deep in cache.
+
+### Layout
+
+- **`QTable`, the frame-start set**: one static Robin Hood table per group
+  (a (shape, cell), or a (shape, R x R region) for `p*`). The key `k < 2^b`
+  is the state's dictionary digits in mixed radix. It is scrambled by a
+  bijection of [0, 2^b) (odd multiplies mod 2^b, right xorshifts), giving
+  `h = q * cap + home`, with Lemire's exact 32-bit fastdiv and a
+  non-power-of-two `cap`. A slot stores only `q << dbits | (displacement + 1)`
+  (0 = empty) in 1, 2 or 4 bytes, chosen per group at build time. The
+  maximal displacement is known because the table is built once from the
+  frame-start set; the table and its tag width are chosen per group as the
+  fewest bytes among loads <= 0.9. There is no wrap-around: the overflow
+  slots sit past the end and the last slot is always empty. Tags and
+  payloads are separate arrays. The probe (`QTable::find`, standalone;
+  `home_addr` is there for prefetching) scans 8 u16 tags at once (SSE2): the
+  first lane whose displacement is below the probe's distance ends the run,
+  and a hit is a lane before it with equal distance and quotient. Ids are
+  global slots, stable for the frame.
+- **`NTable`, the frame's new entries**: non-moving linear probing on the
+  full u32 key + payload, load 0.75; the id is the slot. In the bench it is
+  sized from the frame's known per-group new count; a full group is FATAL.
+- **Kinds**:
+  - `cqa`: one entry a state.
+  - `cqb`: the key without the last field, payload = a mask over it (spd.y
+    for `bcell`, the region's cells for `p4*` (u16) and `p8*` (u64)); id =
+    slot << 6 | bit.
+  - `cqc`: payload = the u32 id of an INTERNED u128 mask (SPIN-style
+    collapse; an insert hash-conses mask | bit); id = slot << 7 | bit.
+- **Dictionaries**:
+  - `cell`/`region`: per (shape, cell) or per (shape, region) sorted local
+    dictionaries of flags+dash (joint), spd.x and spd.y;
+  - `room`: the packing's room digits (no per-group dictionary);
+  - `p2`: power-of-two headroom radices;
+  - `collapse`: a joint (spd.x, spd.y) dictionary.
+
+### Sizes (f57, 43,841,605 states at the frame end; `compactprep` -> /var/tmp/emitcap/compact/sizes.txt)
+
+The frame's structure is static old + new table. The windows are over the
+x-major sweep (prep's): "group" = the peak bytes of the groups live from
+their first to their last lookup (dictionaries included); "state" = the
+per-state live peak, 548,051 states, x bytes a state.
+
+| config | entries (old + new) | frame MB | B/state | dict MB | window group / state MB | tags 1/2/4 B |
+|---|---|---|---|---|---|---|
+| v4 (12 B, load <= 0.8) | 43.8M | 939 | 21.4 | - | 125 / 11.7 | - |
+| bitcell / bits / bitintern | | 352 / 693 / 231 | 8.0 / 15.8 / 5.3 | - | 45 / 90 / 30 | - |
+| posmask8 (I2, 12 B, load 0.5 pow2) | 2.19M | 70 | 1.60 | - | ~9 / 0.9 | - |
+| acell | 37.1M + 6.7M | 121 | **2.75** | 47 | 20.4 / 2.1 | 0/100/0% |
+| aroom / acellp2 / acollapse | | 199 / 192 / 118 | 4.53 / 4.37 / 2.70 | 0 / 47 / 173 | | |
+| bcell (mask over spd.y) | 9.25M + 1.03M | 120 | 2.73 | 47 | 19.0 / 2.1 | 7/93/0% |
+| croom (interned spd.y masks) | 9.07M + 1.00M | 74 | 1.68 | 0 | 9.3 / 0.9 | 0/96/4% |
+| p4cell (u16 mask over 4x4) | 4.63M + 0.85M | 28 | **0.64** | 4.0 | 7.0 / 0.4 | 0/100/0% |
+| p8cell (u64 mask over 8x8) | 1.85M + 0.34M | 27 | **0.61** | 1.3 | 9.8 / 0.4 | 0/98/2% |
+| p8room (no dictionaries) | same | 30 | 0.68 | 0 | 10.6 / 0.4 | 0/12/88% |
+| p8int (interned 8x8 masks) | same | **16.4** | **0.37** | 1.3 | **6.1** / 0.2 | 0/100/0% |
+
+Interned masks add their table: croom 68k -> 230k masks (3.7 MB with the
+insert garbage), p8int 18k -> 236k (3.8 MB; 19k live), plus the intern map.
+A u16 mask id would need a frame-end GC. The mean displacement is 3.5-4.1
+everywhere, max 41-62. A static table rebuilt over the end set ("end MB"):
+acell 2.26, p8cell 0.57, p8int 0.34 B/state.
+
+### Validation
+
+For every variant timed (cqa:acell, cqb:bcell, cqc:croom, cqb:p4cell,
+cqb:p8cell, cqc:p8int):
+- 6,735,699 new and decision fingerprint 51e2f3ecb444e25d;
+- exhaustive per-lookup decision + id-bijection check against v3c's ids
+  (`bits::check`): 0 violations;
+- `QTable::verify`: every slot decodes to its key and every key is found;
+- prep asserts that every query's (shard, high, low) is its reference id's
+  state, and that (group, key, bit) is injective over the 43.8M states, per
+  configuration;
+- a value missing from its dictionary panics (FATAL); there is no merge.
+
+### Smoke timings (NOISY: load 3-6, cpu 4 shared, so the clock ran ~2.5 GHz)
+
+Single thread, the same 257.7M sweep-ordered lookups, every table on
+MADV_HUGEPAGE (100% huge pages). The first scalar probe of cqa took 34.1G
+cycles (509M branch misses: the Robin Hood scan's exit is unpredictable).
+The SSE2 scan, tags split from payloads and no wrap-around halved that to
+17.4G. One rep at load ~6 (`bench.sh`):
+
+| variant | Gcycles | Ginsn | L2 miss | DRAM fills |
+|---|---|---|---|---|
+| posmask8 | 9.8 | 18.7 | 34M | 41M |
+| p8cell | 14.5 | 34.2 | 38M | 23M |
+| p8int | ~16 | 39.6 | 42M | 20M |
+
+So once the window is cache-resident (posmask8's already is: 1.4 MB per
+I2), the compact probe is **instruction-bound**, at ~130 instructions a
+lookup against posmask's ~72: scramble, fastdiv, SIMD setup, and the miss
+path into a second table. Halving the bytes does not pay single-threaded.
+What could close the gap:
+- a power-of-two cap (`home = h & mask`, `q = h >> lg`) at ~1.3x the bytes;
+- one multiply as the scramble;
+- folding the new table into reserved slack.
+Fewer bytes matter where the window does NOT fit: 32 threads sharing L3
+(posmask8's whole table, 70 MB, against p8int's 16 MB), and bigger rooms.
+
+### Envelope
+
+p8int's whole frame structure (16 MB + 4 MB masks) fits the 96 MB L3 with
+room to spare, and a 1/32 band of its group window (6.1 MB peak) is ~0.2 MB,
+inside one L2. A lookup is then an L2 hit plus ~130 instructions, ~30
+cycles: 257.7M x 30 / 32 threads / 5 GHz = **~0.05 s**, the same as the
+compute floor at the top. At ~72 instructions (a posmask-style probe on
+these bytes) it is ~0.03 s. Memory then no longer bounds the core; the key
+packing (34.6 ns a row, H) and the edges out do.
+
+### What production must know, and how a dictionary grows
+
+- `room` configurations (croom, p8room, p8introom) need only the room
+  alphabets: flags+dash (1419 combos in shape 2), spd.x (1351) and spd.y
+  (96). f57 appended 35 flags+dash values to the room dictionary.
+- `cell`/`region` configurations need per-group dictionaries. Against
+  dictionaries from the frame-start set, f57 appended 138,853 flags+dash,
+  211,967 spd.x and 32,217 spd.y values per cell (on 4.7%, 9.8% and 3.3% of
+  its new states). 802 cells were first occupied in f57. Region
+  dictionaries are ~20x smaller in total (8x8: 84k / 68k / 14k entries).
+- **Growing append-only during a frame**: a group's dictionary is a small
+  value -> index map; a miss appends `index = len` (one more lookup per
+  emission on that path, not measured here: the bench precomputes keys, as
+  bits and bitcell do). Indices never change within a frame. The key's
+  radices must be RESERVED with headroom so existing keys stay valid.
+  Sized `next_pow2(2n)` from the frame start, 690 / 291 / 374 cells still
+  outgrew it in one frame (`acellp2` costs 4.4 against 2.75 B/state). A
+  group that outgrows its radix can neither re-key its static table
+  mid-frame (ids are slots) nor merge (unsound): its states must go to an
+  exact side table (on room digits) until the frame-end rebuild, or the run
+  stops FATAL.
+- The frame end rebuilds every touched group's static table (production's
+  door already rebuilds every shard each frame), merging the new table and
+  renumbering ids and dictionaries.
+- The NTable's ids are slots, so it cannot simply grow. Production either
+  bounds the per-group new count, chains a second layer (id = layer base +
+  slot), or gives new states arrival ids (+4 B for the frame's ~15% new).
+- Interned masks: the intern table only grows within a frame; garbage is
+  collected at the frame end.
+
+`bench.sh` (/var/tmp/emitcap/compact) runs v4, bitcell, posmask4, posmask8
+and the six compact configurations, interleaved, 3 reps each, pinned to one
+cpu, with perf over the timed loop only, the hugepage line, and a summary
+table (B/state, cycles). It is for a quiet machine.

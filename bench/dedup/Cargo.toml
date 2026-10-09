@@ -10,7 +10,6 @@ edition = "2021"
 memmap2 = "0.9"
 rustc-hash = "2"
 zstd = "0.13"
-libc = "0.2"
 
 [profile.release]
 debug = true

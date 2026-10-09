@@ -84,12 +84,15 @@ pub fn huge_report(tag: &str, regions: &[(usize, usize)]) {
 
 /// A bijection of [0, 2^b) (odd multiplies mod 2^b and right xorshifts).
 #[inline(always)]
-pub fn scr(k: u32, b: u32) -> u32 {
-    let m = ((1u64 << b) - 1) as u32;
+pub fn scr(k: u32, b: u32) -> u32 { let (m, s1, s2) = scr_consts(b); scr_with(k, m, s1, s2) }
+/// Its per-shard constants: the mask and the two shifts.
+pub fn scr_consts(b: u32) -> (u32, u32, u32) { (((1u64 << b) - 1) as u32, b / 2 + 1, b / 3 + 1) }
+#[inline(always)]
+pub fn scr_with(k: u32, m: u32, s1: u32, s2: u32) -> u32 {
     let mut x = k.wrapping_mul(0x9E37_79B1) & m;
-    x ^= x >> (b / 2 + 1);
+    x ^= x >> s1;
     x = x.wrapping_mul(0x85EB_CA6B) & m;
-    x ^ (x >> (b / 3 + 1))
+    x ^ (x >> s2)
 }
 
 /// Lemire's exact division for 32-bit numerators: `M = ceil(2^64 / d)`, d >= 2.
@@ -101,7 +104,7 @@ fn divmod(h: u32, m: u64, d: u32) -> (u32, u32) { let q = ((h as u128 * m as u12
 fn bitlen(x: u64) -> u32 { 64 - x.leading_zeros() }
 
 #[derive(Clone, Copy, Default, Debug)]
-pub struct QShard { pub off: u64, pub poff: u64, pub base: u32, pub cap: u32, pub m: u64, pub b: u8, pub dbits: u8, pub tagw: u8, pub pay: u8 }
+pub struct QShard { pub off: u64, pub poff: u64, pub base: u32, pub cap: u32, pub m: u64, pub kmask: u32, pub s1: u8, pub s2: u8, pub b: u8, pub dbits: u8, pub tagw: u8, pub pay: u8 }
 
 /// One shard's layout, chosen at build time: `cap` is the home range, `len`
 /// the slots (cap + the overflow past the end; no wrap-around, the last slot
@@ -214,7 +217,8 @@ impl QTable {
         let (mut off, mut base) = (0u64, 0u64);
         let mut sh = Vec::with_capacity(plans.len());
         for (i, p) in plans.iter_mut().enumerate() {
-            sh.push(QShard { off, poff: base * pay as u64, base: base as u32, cap: p.cap, m: if p.cap >= 2 { fastdiv_m(p.cap) } else { 0 }, b: b[i] as u8, dbits: p.dbits as u8, tagw: p.tagw as u8, pay: pay as u8 });
+            let (kmask, s1, s2) = scr_consts(b[i]);
+            sh.push(QShard { off, poff: base * pay as u64, base: base as u32, cap: p.cap, m: if p.cap >= 2 { fastdiv_m(p.cap) } else { 0 }, kmask, s1: s1 as u8, s2: s2 as u8, b: b[i] as u8, dbits: p.dbits as u8, tagw: p.tagw as u8, pay: pay as u8 });
             for (j, &t) in p.tags.iter().enumerate() {
                 let a = (off + j as u64 * p.tagw as u64) as usize;
                 match p.tagw { 1 => tags[a] = t as u8, 2 => tags[a..a + 2].copy_from_slice(&(t as u16).to_le_bytes()), _ => tags[a..a + 4].copy_from_slice(&t.to_le_bytes()) }
@@ -243,7 +247,7 @@ impl QTable {
     pub fn find(&self, sh: u32, k: u32) -> Option<(u32, usize)> {
         let s = unsafe { self.sh.get_unchecked(sh as usize) };
         if s.cap == 0 { return None; }
-        let (q, home) = divmod(scr(k, s.b as u32), s.m, s.cap);
+        let (q, home) = divmod(scr_with(k, s.kmask, s.s1 as u32, s.s2 as u32), s.m, s.cap);
         let found = if s.tagw == 2 {
             unsafe { scan_u16(self.tags.as_ptr().add(s.off as usize + 2 * home as usize), q, s.dbits as u32) }.map(|j| home + j)
         } else {
@@ -268,7 +272,7 @@ impl QTable {
     pub fn home_addr(&self, sh: u32, k: u32) -> *const u8 {
         let s = unsafe { self.sh.get_unchecked(sh as usize) };
         if s.cap == 0 { return self.tags.as_ptr(); }
-        let (_, home) = divmod(scr(k, s.b as u32), s.m, s.cap);
+        let (_, home) = divmod(scr_with(k, s.kmask, s.s1 as u32, s.s2 as u32), s.m, s.cap);
         unsafe { self.tags.as_ptr().add(s.off as usize + home as usize * s.tagw as usize) }
     }
 
@@ -276,6 +280,10 @@ impl QTable {
     pub fn pay_u64(&self, a: usize) -> u64 { unsafe { (self.pays.as_ptr().add(a) as *const u64).read_unaligned() } }
     #[inline(always)]
     pub fn set_u64(&mut self, a: usize, x: u64) { unsafe { (self.pays.as_mut_ptr().add(a) as *mut u64).write_unaligned(x) } }
+    #[inline(always)]
+    pub fn pay_u16(&self, a: usize) -> u16 { unsafe { (self.pays.as_ptr().add(a) as *const u16).read_unaligned() } }
+    #[inline(always)]
+    pub fn set_u16(&mut self, a: usize, x: u16) { unsafe { (self.pays.as_mut_ptr().add(a) as *mut u16).write_unaligned(x) } }
     #[inline(always)]
     pub fn pay_u32(&self, a: usize) -> u32 { unsafe { (self.pays.as_ptr().add(a) as *const u32).read_unaligned() } }
     #[inline(always)]
@@ -376,7 +384,40 @@ struct ShardInfo { shape: u32, nfd: u32, nsx: u32, nsy: u32, nsp: u32 }
 /// `a*`: one entry a state; `b*`: a directory entry with a u64 mask over the
 /// local (or room) spd.y index, the word in the key; `c*`: a directory entry
 /// with an interned u128 mask over the ROOM spd.y digit.
-const CFGS: [&str; 8] = ["acell", "acellp2", "aroom", "acollapse", "bcell", "broom", "ccell", "croom"];
+/// `p{R}*`: POSITION LAST (DESIGNS I2): the shard is a (shape, R x R region),
+/// the key (flags+dash, spd.x, spd.y) under region (`cell`) or room
+/// dictionaries, the mask over the region's cells (u16 for 4x4, u64 for 8x8;
+/// `int`: an interned mask's id).
+const CFGS: [&str; 16] = ["acell", "acellp2", "aroom", "acollapse", "bcell", "broom", "ccell", "croom",
+    "p4cell", "p4room", "p4int", "p4introom", "p8cell", "p8room", "p8int", "p8introom"];
+
+/// (grouping: 0 cell, 1 = 4x4, 2 = 8x8; kind: 'a' a state an entry, 'm' a mask
+/// payload, 'i' an interned mask id; payload bytes).
+pub fn cfg_kind(cfg: &str) -> (usize, char, u32) {
+    match cfg {
+        "acell" | "acellp2" | "aroom" | "acollapse" => (0, 'a', 0),
+        "bcell" | "broom" => (0, 'm', 8),
+        "ccell" | "croom" => (0, 'i', 4),
+        "p4cell" | "p4room" => (1, 'm', 2),
+        "p8cell" | "p8room" => (2, 'm', 8),
+        "p4int" | "p4introom" => (1, 'i', 4),
+        "p8int" | "p8introom" => (2, 'i', 4),
+        _ => panic!("unknown configuration {cfg}"),
+    }
+}
+
+/// Per state and region grouping: the region-local dictionary indices.
+#[derive(Clone, Copy, Default)]
+struct GDig { fd: u16, sx: u16, sy: u8 }
+
+/// (b, key, bit) of a state under a `p*` configuration.
+fn keyof_region(cfg: &str, d: &Dig, g: &GDig, gi: &ShardInfo, pos: u32, r: &Room, shape: usize) -> (u32, u64, u32) {
+    let blen = |p: u64| bitlen(p.max(1) - 1);
+    let (rf, rx, ry) = (r.nfd[shape] as u64, r.nsx[shape] as u64, r.nsy[shape] as u64);
+    let (nf, nx, ny) = (gi.nfd as u64, gi.nsx as u64, gi.nsy as u64);
+    if cfg.ends_with("room") { (blen(rf * rx * ry), (d.fdr as u64 * rx + d.sxr as u64) * ry + d.syr as u64, pos) }
+    else { (blen(nf * nx * ny), (g.fd as u64 * nx + g.sx as u64) * ny + g.sy as u64, pos) }
+}
 
 struct Room { nfd: Vec<u32>, nsx: Vec<u32>, nsy: Vec<u32> }
 
@@ -519,6 +560,40 @@ pub fn prep(dir: &str, door: &[u8]) {
     eprintln!("[compactprep] local dictionaries (entries over {n_shards} shards): flags+dash {}, spd.x {}, spd.y {}, (spd.x, spd.y) {}; max {} / {} / {} / {}; {:.1} s",
         dsum(&|x| x.nfd), dsum(&|x| x.nsx), dsum(&|x| x.nsy), dsum(&|x| x.nsp),
         info.iter().map(|x| x.nfd).max().unwrap(), info.iter().map(|x| x.nsx).max().unwrap(), info.iter().map(|x| x.nsy).max().unwrap(), info.iter().map(|x| x.nsp).max().unwrap(), t0.elapsed().as_secs_f64());
+    // 2b. Region groupings (DESIGNS I2: x.div_euclid(R), aligned at 0) and
+    //     their region-local dictionaries.
+    let scm = map("scell.bin");
+    let scell: &[u32] = crate::from_bytes(&scm);
+    struct Grouping { of: Vec<u32>, pos: Vec<u32>, n: usize, gi: Vec<ShardInfo>, gd: Vec<GDig> }
+    let mut groupings: Vec<Grouping> = vec![Grouping { of: (0..n_shards as u32).collect(), pos: vec![0; n_shards], n: n_shards, gi: info.clone(), gd: Vec::new() }];
+    for r in [4i32, 8] {
+        let mut gid: FxHashMap<(u32, i32, i32), u32> = FxHashMap::default();
+        let (of, pos): (Vec<u32>, Vec<u32>) = (0..n_shards).map(|s| {
+            let (x, y) = crate::structure::cell_xy(scell[s]);
+            let n = gid.len() as u32;
+            (*gid.entry((sshape[s], x.div_euclid(r), y.div_euclid(r))).or_insert(n), (x.rem_euclid(r) + r * y.rem_euclid(r)) as u32)
+        }).unzip();
+        let ng = gid.len();
+        let dict = |v: &dyn Fn(usize) -> u64| -> (Vec<u32>, Vec<u64>) {
+            let mut kv: Vec<(u32, u64)> = (0..n_st).map(|i| (of[st[i].0 as usize], v(i))).collect();
+            kv.sort_unstable(); kv.dedup();
+            let mut start = vec![0u32; ng + 1];
+            for &(g, _) in &kv { start[g as usize + 1] += 1; }
+            for g in 0..ng { start[g + 1] += start[g]; }
+            (start, kv.into_iter().map(|x| x.1).collect())
+        };
+        let (gfd, gsx, gsy) = (dict(&vfd), dict(&vsx), dict(&vsy));
+        let gi: Vec<ShardInfo> = (0..ng).map(|g| ShardInfo { shape: 0, nfd: size(&gfd, g), nsx: size(&gsx, g), nsy: size(&gsy, g), nsp: 0 }).collect();
+        let gd: Vec<GDig> = (0..n_st).map(|i| {
+            let g = of[st[i].0 as usize];
+            let ix = |d: &(Vec<u32>, Vec<u64>), v: u64| idx(d, g, v).expect("a value missing from its own dictionary: FATAL");
+            GDig { fd: ix(&gfd, vfd(i)) as u16, sx: ix(&gsx, vsx(i)) as u16, sy: ix(&gsy, vsy(i)) as u8 }
+        }).collect();
+        eprintln!("[compactprep] {r}x{r} regions: {ng} (shape, region) groups; region dictionaries: flags+dash {} (max {}), spd.x {} (max {}), spd.y {} (max {})",
+            gi.iter().map(|x| x.nfd as u64).sum::<u64>(), gi.iter().map(|x| x.nfd).max().unwrap(), gi.iter().map(|x| x.nsx as u64).sum::<u64>(), gi.iter().map(|x| x.nsx).max().unwrap(),
+            gi.iter().map(|x| x.nsy as u64).sum::<u64>(), gi.iter().map(|x| x.nsy).max().unwrap());
+        groupings.push(Grouping { of, pos, n: ng, gi, gd });
+    }
     // 3. Append-only: dictionaries from the frame-start set only; what f57 adds.
     {
         let (ofd, osx, osy) = (local(&vfd, true), local(&vsx, true), local(&vsy, true));
@@ -579,10 +654,23 @@ pub fn prep(dir: &str, door: &[u8]) {
     let mut entries_of: FxHashMap<&str, Vec<u64>> = FxHashMap::default();
     for cfg in CFGS {
         let t = std::time::Instant::now();
+        let (gx, kind, pay) = cfg_kind(cfg);
+        let gr = &groupings[gx];
+        let n_shards = gr.n;
+        // The group's span over the sweep: its cells' first to last lookup.
+        let mut gspans = vec![(u32::MAX, 0u32); n_shards];
+        for (s, &(f, l)) in hspans.iter().enumerate() { if f != u32::MAX { let g = &mut gspans[gr.of[s] as usize]; g.0 = g.0.min(f); g.1 = g.1.max(l); } }
         let mut ks: Vec<(u32, u64, u32)> = Vec::with_capacity(n_st);
         let mut bsh = vec![0u32; n_shards];
-        for d in &dig { let (b, k, bit) = keyof(cfg, d, &info[d.shard as usize], &room); assert!(b <= 32 && k < 1u64 << b.max(1) || b == 0 && k == 0, "{cfg}: key {k} beyond {b} bits"); bsh[d.shard as usize] = b; ks.push((d.shard, k, bit)); }
-        let dir = !cfg.starts_with('a');
+        for (i, d) in dig.iter().enumerate() {
+            let g = gr.of[d.shard as usize];
+            let (b, k, bit) = if gx == 0 { keyof(cfg, d, &info[d.shard as usize], &room) } else { keyof_region(cfg, d, &gr.gd[i], &gr.gi[g as usize], gr.pos[d.shard as usize], &room, sshape[d.shard as usize] as usize) };
+            assert!(b <= 32 && k < 1u64 << b.max(1) || b == 0 && k == 0, "{cfg}: key {k} beyond {b} bits");
+            assert!(bsh[g as usize] == 0 || bsh[g as usize] == b || b == 0, "{cfg}: two key widths in one group");
+            bsh[g as usize] = bsh[g as usize].max(b);
+            ks.push((g, k, bit));
+        }
+        let dir = kind != 'a';
         // Old and end entries per shard (distinct keys).
         let entries = |range: std::ops::Range<usize>| -> Vec<Vec<u32>> {
             let mut v: Vec<Vec<u32>> = vec![Vec::new(); n_shards];
@@ -596,20 +684,27 @@ pub fn prep(dir: &str, door: &[u8]) {
         else { let mut p: Vec<(u32, u32, u32)> = ks.iter().map(|&(s, k, b)| (s, k as u32, b)).collect(); p.sort_unstable(); assert!(p.windows(2).all(|w| w[0] != w[1]), "{cfg}: two states, one (key, bit)"); }
         let n_old_e: u64 = old.iter().map(|v| v.len() as u64).sum();
         let n_end_e: u64 = end.iter().map(|v| v.len() as u64).sum();
-        let pay = match &cfg[..1] { "a" => 0, "b" => 8, _ => 4 };
         let plans = plan_all(&old, &bsh, pay, max_load, false);
         let plans_end = plan_all(&end, &bsh, pay, max_load, false);
         let new_e: Vec<u64> = (0..n_shards).map(|s| (end[s].len() - old[s].len()) as u64).collect();
         let shard_old = |s: usize| plans[s].len as f64 * (plans[s].tagw + pay) as f64;
         let shard_new = |s: usize| if new_e[s] == 0 { 0.0 } else { ((new_e[s] as f64 / new_load).ceil().max(new_e[s] as f64 + 1.0)) * (4 + pay) as f64 };
-        let dict_entries = |s: usize| -> f64 { let x = &info[s]; (match cfg { "acell" | "acellp2" | "bcell" => x.nfd + x.nsx + x.nsy, "ccell" => x.nfd + x.nsx, "acollapse" => x.nfd + x.nsp, _ => 0 }) as f64 };
+        let dict_entries = |s: usize| -> f64 { let x = &gr.gi[s]; (match cfg { "acell" | "acellp2" | "bcell" | "p4cell" | "p8cell" | "p4int" | "p8int" => x.nfd + x.nsx + x.nsy, "ccell" => x.nfd + x.nsx, "acollapse" => x.nfd + x.nsp, _ => 0 }) as f64 };
+        // Interned masks: the distinct masks at the frame start and end (u128 each; inserts add garbage at run time).
+        let masks = |range: std::ops::Range<usize>| -> u64 {
+            if kind != 'i' { return 0; }
+            let mut m: FxHashMap<(u32, u32), u128> = FxHashMap::default();
+            for i in range { *m.entry((ks[i].0, ks[i].1 as u32)).or_default() |= 1u128 << ks[i].2; }
+            let mut v: Vec<u128> = m.into_values().collect(); v.sort_unstable(); v.dedup(); v.len() as u64
+        };
+        let (m_old, m_end) = (masks(0..n_door), masks(0..n_st));
         let shard_bytes = |s: usize| shard_old(s) + shard_new(s) + 8.0 * dict_entries(s);
         let old_b: f64 = (0..n_shards).map(shard_old).sum();
         let new_b: f64 = (0..n_shards).map(shard_new).sum();
         let dict_b: f64 = (0..n_shards).map(|s| 8.0 * dict_entries(s)).sum();
         let end_b: f64 = plans_end.iter().map(|p| p.len as f64 * (p.tagw + pay) as f64).sum();
         let frame = old_b + new_b;
-        let (wp, _) = window(&hspans, &shard_bytes);
+        let (wp, _) = window(&gspans, &shard_bytes);
         let mut tw = [0f64; 3];
         for (s, p) in plans.iter().enumerate() { tw[match p.tagw { 1 => 0, 2 => 1, _ => 2 }] += old[s].len() as f64; }
         let te: f64 = tw.iter().sum();
@@ -617,11 +712,12 @@ pub fn prep(dir: &str, door: &[u8]) {
         let meand = plans.iter().map(|p| p.sumd).sum::<u64>() as f64 / n_old_e as f64;
         rep += &format!("{cfg:<10} {n_old_e:>10} {:>10} {:>9.1} {:>9.1} {:>9.1} {:>9.2} {:>8.1} {:>9.1} {:>10.2} {:>10.1} {:>10.1} {:>5.0}/{:>4.0}/{:>4.0}   disp mean {meand:.2} max {maxd}{}\n",
             n_end_e - n_old_e, old_b / 1e6, new_b / 1e6, frame / 1e6, frame / n_st as f64, dict_b / 1e6, end_b / 1e6, end_b / n_st as f64, wp / 1e6, st_peak * (frame + dict_b) / n_st as f64 / 1e6,
-            100.0 * tw[0] / te, 100.0 * tw[1] / te, 100.0 * tw[2] / te, if dir { format!("; {:.2} states an entry", n_st as f64 / n_end_e as f64) } else { String::new() });
+            100.0 * tw[0] / te, 100.0 * tw[1] / te, 100.0 * tw[2] / te,
+            if dir { format!("; {} groups, {:.2} states an entry{}", n_shards, n_st as f64 / n_end_e as f64, if kind == 'i' { format!("; masks {m_old} -> {m_end} distinct ({:.2} MB at 16 B)", m_end as f64 * 16e-6) } else { String::new() }) } else { String::new() });
         eprintln!("[compactprep] {cfg}: {:.1} s", t.elapsed().as_secs_f64());
         entries_of.insert(cfg, end.iter().map(|v| v.len() as u64).collect());
         // The timed configurations' streams.
-        let emit = std::env::var("COMPACT_EMIT").unwrap_or("acell,bcell,croom".into());
+        let emit = std::env::var("COMPACT_EMIT").unwrap_or("acell,bcell,croom,p4cell,p8cell,p8int".into());
         if emit.split(',').any(|c| c == cfg) {
             let stb: Vec<u32> = ks.iter().flat_map(|&(s, k, b)| [s, k as u32, b]).collect();
             std::fs::write(format!("{OUT}/{cfg}_st.bin"), crate::as_bytes(&stb)).unwrap();
@@ -629,8 +725,8 @@ pub fn prep(dir: &str, door: &[u8]) {
             let mut w = std::io::BufWriter::with_capacity(1 << 24, std::fs::File::create(format!("{OUT}/q_{cfg}.bin")).unwrap());
             for (q, &r) in qs.iter().zip(refid) {
                 let (s, k, b) = ks[r as usize];
-                assert_eq!(s, q.shard);
-                let rec = QC { shard: q.shard, src: q.src, xfer: q.xfer, k: k as u32, bit: b, _p: [0; 3] };
+                assert_eq!(s, gr.of[q.shard as usize]);
+                let rec = QC { shard: s, src: q.src, xfer: q.xfer, k: k as u32, bit: b, _p: [0; 3] };
                 w.write_all(crate::as_bytes(std::slice::from_ref(&rec))).unwrap();
             }
             w.flush().unwrap();
@@ -657,7 +753,7 @@ pub fn prep(dir: &str, door: &[u8]) {
 pub fn run(dir: &str, n_door: usize, variant: &str) {
     let t = std::time::Instant::now();
     let pd = format!("{dir}/prep");
-    let cfg = std::env::var("COMPACT_CFG").unwrap_or(match variant { "cqa" => "acell", "cqb" => "bcell", _ => "croom" }.into());
+    let cfg = std::env::var("COMPACT_CFG").ok().filter(|c| !c.is_empty()).unwrap_or(match variant { "cqa" => "acell", "cqb" => "p8cell", _ => "p8int" }.into());
     let max_load: f64 = std::env::var("COMPACT_LOAD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.9);
     let tag = format!("{variant}:{cfg}");
     let n_st = n_door + 6_735_699;
@@ -676,7 +772,8 @@ pub fn run(dir: &str, n_door: usize, variant: &str) {
         let nc = newk.iter_mut().map(|v| { v.sort_unstable(); v.dedup(); v.len() as u64 }).collect();
         (old, nc, (0..n_door).map(st).collect())
     };
-    let pay = match variant { "cqa" => 0, "cqb" => 8, _ => 4 };
+    let (_, kind, pay) = cfg_kind(&cfg);
+    assert_eq!(kind, match variant { "cqa" => 'a', "cqb" => 'm', _ => 'i' }, "{cfg} is not a {variant} configuration");
     let (mut tab, plans) = QTable::build(&keys_old, &bsh, pay, max_load);
     let lens: Vec<u32> = plans.iter().map(|p| p.len).collect();
     let bad = tab.verify(&keys_old, &lens);
@@ -729,34 +826,40 @@ pub fn run(dir: &str, n_door: usize, variant: &str) {
             std::hint::black_box(&nt.slots);
         }
         "cqb" => {
-            for &(sh, k, b) in &old_states { let (_, a) = tab.find(sh, k).unwrap(); let w = tab.pay_u64(a); tab.set_u64(a, w | 1 << b); }
-            let mut ids: Vec<u32> = old_states.iter().map(|&(sh, k, b)| tab.find(sh, k).unwrap().0 << 6 | b).collect();
-            drop(old_states);
-            ids.sort_unstable();
-            old_ids = ids;
-            let mut nt: NTable<u64> = NTable::new(&new_counts, 0.75);
-            new_bytes = nt.e.bytes_used() as f64;
-            let old_slots = tab.slots as u32;
-            assert!((tab.slots + nt.slots) << 6 < 1 << 32);
-            eprintln!("[{tag}] setup {:.1} s: old directory {n_old_e} entries in {} slots ({:.1} MB, disp mean {meand:.2}), new directory {} slots ({:.1} MB)", t.elapsed().as_secs_f64(), tab.slots, old_bytes / 1e6, nt.slots, new_bytes / 1e6);
-            huge_report(&tag, &[tab.regions()[0], tab.regions()[1], nt.e.region(), edges.region(), frontier.region()]);
-            (dt, t_drops, nw) = timed!({
-                let mut nw = 0u64;
-                for q in qs {
-                    let b = 1u64 << q.bit;
-                    let id = match tab.find(q.shard, q.k) {
-                        Some((s, a)) => { let w = tab.pay_u64(a); if w & b == 0 { tab.set_u64(a, w | b); nw += 1; frontier.extend_zero(crate::PAYLOAD); } s << 6 | q.bit }
-                        None => {
-                            let (s, _) = nt.find_or_insert(q.shard, q.k, 0);
-                            let w = nt.get(s);
-                            if w & b == 0 { nt.set(s, w | b); nw += 1; frontier.extend_zero(crate::PAYLOAD); }
-                            (old_slots + s) << 6 | q.bit
-                        }
-                    };
-                    edges.push((q.src, id, q.xfer));
-                }
-                nw
-            });
+            // The mask payload: u64 (bcell, 8x8 regions) or u16 (4x4 regions).
+            macro_rules! mask_variant { ($t:ty, $get:ident, $set:ident) => {{
+                for &(sh, k, b) in &old_states { let (_, a) = tab.find(sh, k).unwrap(); let w = tab.$get(a); tab.$set(a, w | (1 as $t) << b); }
+                let mut ids: Vec<u32> = old_states.iter().map(|&(sh, k, b)| tab.find(sh, k).unwrap().0 << 6 | b).collect();
+                drop(old_states);
+                ids.sort_unstable();
+                let mut nt: NTable<$t> = NTable::new(&new_counts, 0.75);
+                let nb = nt.e.bytes_used() as f64;
+                let old_slots = tab.slots as u32;
+                assert!((tab.slots + nt.slots) << 6 < 1 << 32);
+                eprintln!("[{tag}] setup {:.1} s: old directory {n_old_e} entries in {} slots ({:.1} MB, disp mean {meand:.2}), new directory {} slots ({:.1} MB); {}-bit masks", t.elapsed().as_secs_f64(), tab.slots, old_bytes / 1e6, nt.slots, nb / 1e6, 8 * std::mem::size_of::<$t>());
+                huge_report(&tag, &[tab.regions()[0], tab.regions()[1], nt.e.region(), edges.region(), frontier.region()]);
+                let r = timed!({
+                    let mut nw = 0u64;
+                    for q in qs {
+                        let b = (1 as $t) << q.bit;
+                        let id = match tab.find(q.shard, q.k) {
+                            Some((s, a)) => { let w = tab.$get(a); if w & b == 0 { tab.$set(a, w | b); nw += 1; frontier.extend_zero(crate::PAYLOAD); } s << 6 | q.bit }
+                            None => {
+                                let (s, _) = nt.find_or_insert(q.shard, q.k, 0);
+                                let w = nt.get(s);
+                                if w & b == 0 { nt.set(s, w | b); nw += 1; frontier.extend_zero(crate::PAYLOAD); }
+                                (old_slots + s) << 6 | q.bit
+                            }
+                        };
+                        edges.push((q.src, id, q.xfer));
+                    }
+                    nw
+                });
+                (r, nb, ids)
+            }}; }
+            let r;
+            (r, new_bytes, old_ids) = if pay == 2 { mask_variant!(u16, pay_u16, set_u16) } else { mask_variant!(u64, pay_u64, set_u64) };
+            (dt, t_drops, nw) = r;
             extra = String::new();
         }
         _ => {
