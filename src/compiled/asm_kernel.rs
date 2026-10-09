@@ -2186,6 +2186,16 @@ pub(crate) fn print_body_stats() {
     eprintln!("[bodies] {bodies} bodies over {} kernels: {never} never took a lane; {always_dup} took lanes but NEVER emitted anything new (all their lanes duplicates; {taken_dupbody} lanes); {some} emitted something new", reg.kernels.len());
     eprintln!("[bodies] lanes taken {taken_all}, emitted {emitted} ({:.1}%)", 100.0 * emitted as f64 / taken_all.max(1) as f64);
     eprintln!("[bodies] bodies by share of their lanes that were new (0-10%, 10-20%, ..., 100%): {:?}", frac_hist);
+    if let Ok(path) = std::env::var("CELESTE_BODY_STATS_TSV") {
+        let mut out = String::from("kernel\tshape\tregion\tbody\toutcome\tsplits\ttaken\temitted\n");
+        for ((shape, key), k) in &reg.kernels {
+            for (bi, (t, e)) in k.body_stats.iter().enumerate() {
+                let b = &k.bodies[bi];
+                out.push_str(&format!("{}\t{shape:#x}\t{key:?}\t{bi}\t{}\t{:?}\t{}\t{}\n", k.compiled.sym, b.outcome, b.splits, t.load(Relaxed), e.load(Relaxed)));
+            }
+        }
+        std::fs::write(&path, out).expect("write body stats");
+    }
     worst.sort_by_key(|w| std::cmp::Reverse(w.0));
     for (_, w) in worst.iter().take(6) { eprintln!("[bodies]   {w}"); }
 }

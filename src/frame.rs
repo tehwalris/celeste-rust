@@ -1738,6 +1738,15 @@ pub fn forward_frame(
 
     let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
     // Units in WAVE order: by first cell across the cell-sorted pieces.
+    // DIAGNOSTIC (CELESTE_FRONTIER_SAMPLE=k): expand every k-th lane only (the rest skipped).
+    let mut frontier = frontier;
+    if let Some(k) = std::env::var("CELESTE_FRONTIER_SAMPLE").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&k| k > 1) {
+        for b in frontier.iter_mut() {
+            let n = b.lanes();
+            let old = b.skip.clone();
+            b.set_skip((0..n).map(|l| l % k != 0 || old.get(l).copied().unwrap_or(false)).collect());
+        }
+    }
     let mut units = units_of(frontier.iter().map(Block::lanes), unit_lanes(frontier.iter().map(Block::lanes).sum(), workers));
     // A unit of only skipped lanes is not run (it may have no kernel).
     units.retain(|&(bi, lo, hi)| {
