@@ -574,3 +574,67 @@ across a run of source cells with one shift - the mask.
 3. **The real kernels end to end**, behind the gates (ckhash, posgraph, arc
    gate, arc-check, the known route), at the same throughput. The goal state
    is kernel compute (~0.44 s a frame) being the limit.
+
+## M. Edges in the region pass (`regionedge`; roadmap stage 1, 2026-10-09)
+
+Data: /var/tmp/emitcap2 (the capture with per-worker transfer tables, K1),
+the field dump of its tree. Setup (untimed, ~35-40 s, plus 20 s to build
+the units at split 100k): every non-dropped emission becomes a 16-B batch
+element of its TARGET (shape, 8x8) region in kernel / capture order - (target
+key, target cell, source region, source entry number, source cell, global
+transfer id); transfers interned by CONTENT across the worker tables
+(92,406). Units = target regions split by a key hash into parts of <= 100k
+lookups (2,877 units); work stealing heaviest first, per-thread scratch and
+edge arenas prefaulted, pinned as J2.
+
+Stable ids: (region, entry number, cell). Frame-start entries numbered by
+key within the region (the source ids are these); a frame's NEW entries
+numbered at the unit's end `NEW | part << 20 | rank` (rank by key among the
+part's new entries: canonical, schedule-free; dense renumbering is left to
+the frame boundary). A new bit in an existing entry keeps the entry's number.
+
+Edge encodings, written by each unit into its thread's arena right after
+the dedup (no inline compression):
+- `rel`: per (source region, target region) block, groups (src entry, tgt
+  entry, transfer), first-changed varint; members: count + a uniform shift
+  (zigzag varints) + a u64 source-cell mask (>= 8 members) or a list of
+  source cells, else explicit (src cell, tgt cell) pairs. Built by sorting
+  the unit's edges as u128 keys.
+- `flat`: per target region, sorted (tgt entry, tgt cell, src id), varint
+  deltas + transfer.
+- `relh` (tried, slower): the groups by a hash table instead of a sort -
+  0.93 s at 16 threads against 0.56: the group table is ~20% of the edges and
+  does not stay in cache.
+
+Validation (untimed, after every rel/flat run): every unit's block decoded
+back to (src shape, cell, key, tgt shape, cell, key, transfer content) - 257,724,013
+edges, order-free fingerprint fca41b0f1a28b51d EQUAL to the capture's; once
+EXHAUSTIVELY (both sets sorted and compared: IDENTICAL, 257,724,013
+distinct); the stable-id bijection over all 43,841,605 states: 0 violations;
+6,735,699 new in every run.
+
+Wall, 3 interleaved reps (load 2.0-3.6), split 100k:
+
+| threads | none (dedup only, 16-B batch) | rel | flat |
+|---|---|---|---|
+| 1 | 0.630-0.642 s | 6.88-6.90 s | 6.81 s |
+| 8 | 0.102-0.104 | 0.915-0.921 | 0.958-0.964 |
+| 16 | 0.106-0.107 | **0.550-0.557** | 0.608-0.611 |
+| 32 | 0.120-0.121 | 0.652-0.688 | 0.725-0.730 |
+
+Edge bytes: rel **2.10 B an edge** (0.54 GB for the frame; zstd -1 per unit
+block, untimed, 0.62 B); flat 6.17 B (zstd -1 3.74). The per-unit split costs
+rel some grouping against K1's per-pair 1.76 B. Production ~4.3 B.
+DRAM (system-wide UMC, timed part): none 1 thread 4.6 GB, 16 threads 4.8 GB
+in 0.107 s (45 GB/s: the 16-B batch stream, 4.1 GB, at the DRAM ceiling;
+J2's 8-B batch ran in 0.057 s); rel 1 thread 10.5 GB, 16 threads 16.9 GB in
+0.562 s (30 GB/s); flat 16 threads 21.2 GB.
+
+Where the time goes: the dedup is 0.64 s of one core; the edges add ~6.2 s
+of one core (26.7 ns an edge against 2.5), almost all the u128 sort of each
+unit's edges (100k x 16 B spills L2) and its traffic. Next: a cheaper
+grouping - a radix / counting sort on a narrower per-unit key (source region
+local index, dense target number), or keep the kernel's source order (an
+edge's group repeats across the source cells of one entry, which a sweep
+visits in x-major runs), and the 8-B batch with the edge payload carried
+by the producer.
