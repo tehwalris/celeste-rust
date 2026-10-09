@@ -88,11 +88,15 @@ schedules and against the binary before), plus the gates and the full suite.
    fifth of the faults).
 6. **Kernel-bound rooms.** Room (3,0) 100% at `r0sxhfn` (8 px regions):
    335k bodies, the largest kernel 3,328 bodies and 221k fused nodes; a
-   frame of 8.4M states takes ~90 s, 54% of it in the kernels themselves
-   (perf on the live search, f67). A slice evaluates every body's nodes
-   whichever are live. Evaluating the fork conditions first and skipping
-   body groups no lane reaches would be the structural fix there (a
-   codegen change); the harness room is emit-bound instead (kernel 9%).
+   frame of 8.4M states took ~90 s, 54% of it in the kernels themselves
+   (perf on the live search at f67, the binary before the unit-wide
+   slices). Half of that was padding (49% of slice lanes empty at 8 px),
+   now 11% (f49: kernel 21.7 -> 7.7 worker-s, wave 3.77 -> 2.08 s). What
+   remains: a slice evaluates every body's nodes, live or not (32% of
+   (body, slice) pairs take a lane there). Evaluating the fork conditions
+   first and skipping body groups no lane reaches would be the structural
+   fix (a codegen change: values live across a skipped region must not
+   move); not started.
 
 The compaction's own cost (`rewrite compact-bench` over a frame's raw
 records kept by `CELESTE_KEEP_RAW=1`): f57's 258M records, 2.6 s wall and
