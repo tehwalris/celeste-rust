@@ -57,6 +57,9 @@ peak): 0 (safe-run.sh's) 5.53 / 8.00 s, 5.1M, 32 s, 5.5 GB; 100 ms 5.23 /
 10 s, 7.9 GB. A delay keeps ~2 GB more resident at each frame's end (rss end
 5.7 against 3.6 GB at f57): left at 0 (memory binds big rooms first).
 
+The unit dedup cache (`RowCache`, 4096-lane units): 16k / 32k / 64k entries,
+f57 4.24 / 4.33 / 4.49 s; room (3,0) f49 2.04 / 2.05 / -. Left at 32k.
+
 Threads (f57 / f58): 16 -> 5.74 / 8.13 s, 24 -> 5.43 / 8.04, 32 -> 5.28 /
 8.02. Not worth a default change.
 
