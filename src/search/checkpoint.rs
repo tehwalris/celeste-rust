@@ -1,5 +1,7 @@
-//! Frame checkpoints: one file per (frame, shape piece), rows in flush order
-//! (a row's position is its id) with an index of per-cell runs, columns RAW
+//! Frame checkpoints: one file per (frame, shape piece), rows in the layer's
+//! canonical order (`canon`: by region, cell, key; a tree written before it
+//! has them in flush order), a row's position its id, with an index of
+//! per-cell runs, columns RAW
 //! and fixed-width, so "the rows in these cells" is a few range copies out
 //! of an mmap.
 //!
@@ -62,7 +64,7 @@ struct Header {
     /// Data offset of the key column, 16 bytes per row.
     keys: u64,
     /// The runs of rows at one cell, `(cell, start, len)` sorted by
-    /// `(cell, start)`: one per flush that appended to the piece.
+    /// `(cell, start)`: one per cell (one per flush in an older tree).
     index: Vec<(u32, u32, u32)>,
     /// The rows that are wins (`Block::wins`), ascending, with their cell.
     wins: Vec<(u32, u32)>,

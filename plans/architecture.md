@@ -303,7 +303,15 @@ remainder; every backward reads the records and re-runs no kernel
 
 - **Ids.** `frame::pack_id(layer, seq, row)`: the checkpoint file and the
   row in it. The door stores the id with the key, so a re-emission of an old
-  state resolves to its id; a resume rebuilds that from the files.
+  state resolves to its id; a resume rebuilds that from the files. A layer
+  is stored CANONICAL (`canon`, 2026-10-09): per shape by (region, cell,
+  key), pieces of at most 2^17 rows, so ids do not depend on the
+  scheduling and the frontier is in position order. During the wave a new
+  state carries its FLUSH id (worker piece, flush order); at the wave's end
+  `canon::Renumber` maps those to the canonical ones in the door
+  (`end_frame`) and, saved as `edges/raw/f{frame}/renumber.bin`, in the
+  targets of the frame's records into its own layer where the compaction
+  decodes them. Sources are the previous layer's, canonical already.
 - **Recording.** A queued row carries `(pred_base, pred_xfer, pred_mask)`: a
   64-lane predecessor group, the TRANSFER of those lanes (the worker's
   interned id of the (x, y) pair the kernel decoded, `ForwardSink::xfer_id`)

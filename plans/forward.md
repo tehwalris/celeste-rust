@@ -51,6 +51,13 @@ new.
   (38ea337). Not a speedup of a real run (it paid the build once), but every
   one-frame number before it held a 3.9 s build (or a 34 s table rebuild).
 
+- **Canonical layers** (274eeee, 1095c1d, branch `canonical-layers`): each
+  new layer stored by (shape, region, cell, key), ids renumbered once at the
+  wave's end (`canon`); the load-time sort of a213214 is gone. A unit now
+  sees every row of its cells: room (3,0) f49 rows after the unit cache
+  5.37M -> 3.65M, wave 1.47 -> 1.18 s; room (6,2) f57 33.4M -> 31.7M, the
+  wave within the noise, ~0.3 s of reorder (BENCHMARK_DATA.md).
+
 Each was checked byte-identical on the graph (`ckhash --edges`, two
 schedules and against the binary before), plus the gates and the full suite.
 

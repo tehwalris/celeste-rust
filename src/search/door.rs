@@ -13,6 +13,8 @@
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::canon::Renumber;
+
 pub type Key = (u64, u64);
 
 /// A door entry: the key and the state's id `(layer, file seq, row)` packed
@@ -26,8 +28,9 @@ pub trait Admit: Sync {
     /// entry's, or `first_new + k` for the k-th new key (recorded); `new`
     /// gets the new keys' indices.
     fn admit(&self, shape: u64, cell: u32, keys: &[Key], first_new: u64, ids: &mut Vec<u64>, new: &mut Vec<u32>);
-    /// The frame is over: fold this frame's admissions into the base.
-    fn end_frame(&self, workers: usize);
+    /// The frame is over: fold this frame's admissions into the base, their
+    /// ids through `renumber` (`canon`: the layer's canonical ids).
+    fn end_frame(&self, workers: usize, renumber: Option<&Renumber>);
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -123,11 +126,11 @@ impl Shard {
         }
     }
 
-    fn end_frame(&mut self) {
+    fn end_frame(&mut self, renumber: Option<&Renumber>) {
         if self.delta.is_empty() {
             return;
         }
-        let mut delta: Vec<Entry> = self.delta.drain().collect();
+        let mut delta: Vec<Entry> = self.delta.drain().map(|(k, id)| (k, renumber.map_or(id, |r| r.map(id)))).collect();
         self.delta.shrink_to_fit();
         delta.sort_unstable_by_key(|e| e.0);
         if self.base.last().is_some_and(|last| last.0 < delta[0].0) || self.base.is_empty() {
@@ -214,7 +217,7 @@ impl Admit for Door {
         shard.admit(keys, first_new, ids, new)
     }
 
-    fn end_frame(&self, workers: usize) {
+    fn end_frame(&self, workers: usize, renumber: Option<&Renumber>) {
         let shards: Vec<Arc<Mutex<Shard>>> = self.shards.read().expect("door").values().cloned().collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -223,7 +226,7 @@ impl Admit for Door {
                 scope.spawn(move || loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(s) = shards.get(i) else { break };
-                    s.lock().expect("door shard").end_frame();
+                    s.lock().expect("door shard").end_frame(renumber);
                 });
             }
         });
@@ -279,7 +282,15 @@ impl Admit for HashDoor {
         }
     }
 
-    fn end_frame(&self, _workers: usize) {}
+    fn end_frame(&self, _workers: usize, renumber: Option<&Renumber>) {
+        if let Some(r) = renumber {
+            for s in self.shards.read().expect("door").values() {
+                for id in s.lock().expect("door shard").values_mut() {
+                    *id = r.map(*id);
+                }
+            }
+        }
+    }
 
     fn len(&self) -> usize {
         self.shards.read().expect("door").values().map(|s| s.lock().expect("door shard").len()).sum()
@@ -342,7 +353,7 @@ mod tests {
             }
             admitted.sort_unstable();
             out.push(admitted);
-            door.end_frame(3);
+            door.end_frame(3, None);
         }
         out
     }
@@ -384,7 +395,7 @@ mod tests {
         door.admit(1, 2, &[(0, 0), (6, 0), (7, 0)], 200, &mut ids, &mut new);
         assert_eq!(new, vec![2]);
         assert_eq!(ids, vec![100, 101, 200]);
-        door.end_frame(2);
+        door.end_frame(2, None);
         assert_eq!(door.len(), 5);
         new.clear();
         ids.clear();

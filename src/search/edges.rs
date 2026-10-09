@@ -21,6 +21,7 @@
 use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
+use crate::canon::Renumber;
 use crate::frame::{id_layer, pack_id};
 
 /// One edge record in a worker's buffer, ONE LANE, a u128 (`push_records`):
@@ -174,6 +175,12 @@ pub fn raw_path(dir: &Path, frame: u32, layer: u32, worker: u32) -> PathBuf {
 /// A worker's transfer table of one frame: the pairs its records' ids index.
 pub fn raw_xfer_path(dir: &Path, frame: u32, worker: u32) -> PathBuf {
     raw_dir(dir, frame).join(format!("x_w{:03}.bin", worker))
+}
+
+/// The frame's renumbering of its own layer's ids (`canon::Renumber`),
+/// which the targets of its records into that layer were written under.
+pub fn renumber_path(dir: &Path, frame: u32) -> PathBuf {
+    raw_dir(dir, frame).join("renumber.bin")
 }
 
 /// The frame's transfer table (`EdgeGraph::pair`).
@@ -438,11 +445,16 @@ fn head_bytes(index: &[(u64, u64)], tabs: &RunTables) -> u64 {
 }
 /// The records of one layer of one frame, decoded from its raw files:
 /// `f(target (seq << 32 | row), source (seq << 32 | row), the frame's
-/// transfer id)`. The one place a record's fields are interpreted.
-fn layer_records(files: &[(memmap2::Mmap, &Path, &[u32])], mut f: impl FnMut(u64, u64, u32)) -> Result<u64> {
+/// transfer id)`, the target through `ren` (the frame's renumbering, when
+/// `files` are its own layer's). The one place a record's fields are
+/// interpreted.
+fn layer_records(files: &[(memmap2::Mmap, &Path, &[u32])], ren: Option<&Renumber>, mut f: impl FnMut(u64, u64, u32)) -> Result<u64> {
     let mut n = 0;
     for (b, path, remap) in files {
-        n += read_chunks(b, path, |t, s, x| f(t, s, remap[x as usize]))?;
+        n += match ren {
+            Some(r) => read_chunks(b, path, |t, s, x| f(r.map_local(t), s, remap[x as usize]))?,
+            None => read_chunks(b, path, |t, s, x| f(t, s, remap[x as usize]))?,
+        };
     }
     Ok(n)
 }
@@ -461,9 +473,9 @@ struct LayerBufs {
 /// and the run's tables, then a counting sort of the edges as encoded
 /// (dense source, transfer rank) into place - and the encoder
 /// over the whole layer (`remaps`: per worker, its transfer ids' in the
-/// frame's table). Single-threaded: an inversion runs many layers at
+/// frame's table; `renumber`: the frame's, applied to its own layer). Single-threaded: an inversion runs many layers at
 /// once (`compact_frames`). Returns (records, edges, run bytes).
-fn invert_layer(files: &[RawFile], remaps: &rustc_hash::FxHashMap<u32, Vec<u32>>, layer: u32, frame: u32, out: &Path, tmp: &Path, bufs: &mut LayerBufs) -> Result<(u64, u64, u64)> {
+fn invert_layer(files: &[RawFile], (remaps, renumber): &(rustc_hash::FxHashMap<u32, Vec<u32>>, Renumber), layer: u32, frame: u32, out: &Path, tmp: &Path, bufs: &mut LayerBufs) -> Result<(u64, u64, u64)> {
     let maps: Vec<(memmap2::Mmap, &Path, &[u32])> = files
         .iter()
         .map(|(f, w)| -> Result<_> {
@@ -473,12 +485,13 @@ fn invert_layer(files: &[RawFile], remaps: &rustc_hash::FxHashMap<u32, Vec<u32>>
             Ok((unsafe { memmap2::Mmap::map(&file)? }, f.as_path(), remaps.get(w).map_or(&[][..], |v| v.as_slice())))
         })
         .collect::<Result<_>>()?;
+    let ren = (renumber.layer() == layer).then_some(renumber);
     let counts = &mut bufs.counts;
     for c in counts.iter_mut() {
         c.clear();
     }
     let mut tc = TableCounts::default();
-    let n = layer_records(&maps, |t, s, x| {
+    let n = layer_records(&maps, ren, |t, s, x| {
         let (seq, row) = ((t >> 32) as usize, t as u32 as usize);
         if counts.len() <= seq {
             counts.resize_with(seq + 1, Vec::new);
@@ -509,7 +522,7 @@ fn invert_layer(files: &[RawFile], remaps: &rustc_hash::FxHashMap<u32, Vec<u32>>
     {
         let ptr = items.as_mut_ptr();
         let mut placed = 0usize;
-        layer_records(&maps, |t, s, x| {
+        layer_records(&maps, ren, |t, s, x| {
             let slot = &mut counts[(t >> 32) as usize][t as u32 as usize];
             let e = ((tabs.seq_start[(s >> 32) as usize] + s as u32) as u64) << 32 | tabs.rank[x as usize] as u64;
             // SAFETY: the slots of the first pass's counts partition 0..n,
@@ -591,19 +604,8 @@ const INVERT_MEM: u64 = 24 << 30;
 fn compact_frames(dir: &Path, frames: &[u32], raised: bool) -> Result<CompactStats> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let mut st = CompactStats::default();
-    // Per frame its transfer remaps (in parallel: a tree's tables are a
-    // few seconds' work); every layer still to do as a job.
-    let remaps: Vec<rustc_hash::FxHashMap<u32, Vec<u32>>> = std::thread::scope(|scope| {
-        let chunk = frames.len().div_ceil(std::thread::available_parallelism().map_or(2, |n| n.get())).max(1);
-        let hs: Vec<_> = frames
-            .chunks(chunk)
-            .map(|part| scope.spawn(move || part.iter().map(|&f| merge_xfer_tables(dir, f, raised)).collect::<Result<Vec<_>>>()))
-            .collect();
-        hs.into_iter().map(|h| h.join().expect("transfer table merge panicked")).collect::<Result<Vec<_>>>()
-    })?
-    .into_iter()
-    .flatten()
-    .collect();
+    // Every layer still to do as a job; a layer whose (non-raised) run is
+    // in place is done, its leftover raw files stale.
     let mut jobs: Vec<(usize, u32, Vec<RawFile>, u64)> = Vec::new();
     for (i, &frame) in frames.iter().enumerate() {
         for (layer, files, bytes) in raw_files(dir, frame) {
@@ -620,13 +622,49 @@ fn compact_frames(dir: &Path, frames: &[u32], raised: bool) -> Result<CompactSta
     jobs.sort_by_key(|j| std::cmp::Reverse(j.3));
     st.layers = jobs.len();
     let left: Vec<AtomicUsize> = (0..frames.len()).map(|i| AtomicUsize::new(jobs.iter().filter(|j| j.0 == i).count())).collect();
+    // Per frame with layers to do: its transfer remaps (the workers' tables
+    // merged, in parallel: a tree's are seconds of work) and its renumbering
+    // (`canon::Renumber`: the targets in its own layer were written as flush
+    // ids; a frame's raw records are refused without it). A frame with none
+    // left (an inversion killed after its last layer) only loses its leftovers:
+    // merging its remaining tables again would overwrite the frame's.
+    type FrameMaps = Option<(rustc_hash::FxHashMap<u32, Vec<u32>>, Renumber)>;
+    let todo: Vec<usize> = (0..frames.len()).collect();
+    let maps: Vec<FrameMaps> = std::thread::scope(|scope| {
+        let chunk = todo.len().div_ceil(std::thread::available_parallelism().map_or(2, |n| n.get())).max(1);
+        let hs: Vec<_> = todo
+            .chunks(chunk)
+            .map(|part| {
+                let left = &left;
+                scope.spawn(move || -> Result<Vec<FrameMaps>> {
+                    part.iter()
+                        .map(|&i| {
+                            if left[i].load(Ordering::Relaxed) == 0 {
+                                return Ok(None);
+                            }
+                            let remaps = merge_xfer_tables(dir, frames[i], raised)?;
+                            Ok(Some((remaps, Renumber::load(&renumber_path(dir, frames[i]))?)))
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("transfer table merge panicked")).collect::<Result<Vec<_>>>()
+    })?
+    .into_iter()
+    .flatten()
+    .collect();
+    // A frame's tables and renumbering go after its last layer, then (last)
+    // its raw dir: a frame is inverted once its raw dir is gone (`invert`).
     let finish_frame = |i: usize| -> Result<()> {
-        let frame = frames[i];
-        for w in remaps[i].keys() {
-            std::fs::remove_file(raw_xfer_path(dir, frame, *w))?;
+        let raw = raw_dir(dir, frames[i]);
+        for e in std::fs::read_dir(&raw).into_iter().flatten().flatten() {
+            let p = e.path();
+            let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if n.starts_with("x_w") || n == "renumber.bin" {
+                std::fs::remove_file(&p)?;
+            }
         }
-        // Last: a frame is inverted once its raw dir is gone (`invert`).
-        let raw = raw_dir(dir, frame);
         if raw.exists() {
             std::fs::remove_dir(&raw).with_context(|| format!("{}: left over after the compaction", raw.display()))?;
         }
@@ -643,7 +681,7 @@ fn compact_frames(dir: &Path, frames: &[u32], raised: bool) -> Result<CompactSta
     let totals: Vec<(u64, u64, u64)> = std::thread::scope(|scope| {
         let hs: Vec<_> = (0..workers)
             .map(|_| {
-                let (jobs, next, budget, left, remaps, finish_frame) = (&jobs, &next, &budget, &left, &remaps, &finish_frame);
+                let (jobs, next, budget, left, maps, finish_frame) = (&jobs, &next, &budget, &left, &maps, &finish_frame);
                 scope.spawn(move || -> Result<(u64, u64, u64)> {
                     let mut bufs = LayerBufs::default();
                     let mut tot = (0u64, 0u64, 0u64);
@@ -659,7 +697,7 @@ fn compact_frames(dir: &Path, frames: &[u32], raised: bool) -> Result<CompactSta
                         }
                         let out = if raised { raised_path(dir, layer, frame) } else { run_path(dir, layer, frame) };
                         let tmp = layer_dir(dir, layer).join(format!("tmp-f{:03}.bin", frame));
-                        let r = invert_layer(files, &remaps[i], layer, frame, &out, &tmp, &mut bufs)
+                        let r = invert_layer(files, maps[i].as_ref().expect("a frame with layers to do has its maps"), layer, frame, &out, &tmp, &mut bufs)
                             .with_context(|| format!("inverting layer {layer} of frame {frame} in {}", dir.display()));
                         // Big buffers go back after a big layer.
                         if need > INVERT_MEM / 8 {
@@ -1295,6 +1333,45 @@ mod tests {
         let a = crate::search::arc_edges::AxisXfer { lo: 0, hi: crate::search::arcs::CIRCLE, tag: 0, val: 0 };
         crate::search::arc_edges::encode_pair(&mut t, &(a, a));
         std::fs::write(raw_xfer_path(dir, frame, worker), t).unwrap();
+        // Targets already canonical (a test renumbering writes its own).
+        if !renumber_path(dir, frame).exists() {
+            Renumber::identity(frame).save(&renumber_path(dir, frame)).unwrap();
+        }
+    }
+
+    /// The frame's records into its own layer carry flush ids: the run holds
+    /// them renumbered (`canon::Renumber`), sorted by the canonical target;
+    /// records into older layers keep theirs.
+    #[test]
+    fn a_frames_own_targets_are_renumbered_at_compaction() {
+        let dir = std::env::temp_dir().join(format!("celeste-edges-renumber-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let frame = 3;
+        // Flush piece 2 of layer 3, rows 0..4, are canonically (5, 3 - r).
+        let to: Vec<u64> = (0..4).map(|r| pack_id(frame, 5, 3 - r)).collect();
+        std::fs::create_dir_all(raw_dir(&dir, frame)).unwrap();
+        Renumber::of_piece(frame, 2, to.clone()).save(&renumber_path(&dir, frame)).unwrap();
+        let src = |r: u32| pack_id(frame - 1, 0, r);
+        let own: Vec<Edge> = (0..4).map(|r| Edge { target: pack_id(frame, 2, r), base: src(r), xfer: 0, mask: 1 }).collect();
+        write_worker(&dir, frame, frame, 0, &own);
+        let old = Edge { target: pack_id(1, 2, 1), base: src(9), xfer: 0, mask: 1 };
+        write_worker(&dir, frame, 1, 0, &[old]);
+        compact_frame(&dir, frame).unwrap();
+        assert!(!raw_dir(&dir, frame).exists(), "the renumbering goes with the raw files");
+        let g = EdgeGraph::open(&dir, frame).unwrap();
+        let mut buf = Vec::new();
+        for r in 0..4u32 {
+            buf.clear();
+            g.preds_at(to[r as usize], frame, &mut buf);
+            assert_eq!(buf, vec![Edge { target: to[r as usize], base: src(r), xfer: 0, mask: 1 }], "flush row {r}");
+        }
+        buf.clear();
+        g.preds_at(pack_id(frame, 2, 0), frame, &mut buf);
+        assert!(buf.is_empty(), "no edge under a flush id");
+        buf.clear();
+        g.preds_at(old.target, frame, &mut buf);
+        assert_eq!(buf, vec![old], "an older layer's target is not renumbered");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A mark's deadline is the last frame it still reaches a win by the

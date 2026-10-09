@@ -343,31 +343,17 @@ impl AsmKernel {
         &self,
         chunk: &Rt2,
         cell_in: &[u32],
-        lanes: std::ops::Range<usize>,
+        lanes: &[usize],
         sink: &mut crate::frame::ForwardSink,
     ) -> bool {
         debug_assert_eq!(cell_in.len(), chunk.width, "one input cell per input row");
-        debug_assert!(lanes.end <= chunk.width);
         stats([1, 0, 0, 0, 0, 0, 0]);
-        let mut lo = lanes.start;
-        let mut idx = [0usize; 16];
-        while lo < lanes.end {
-            // A slice stays in one 64-lane id group (predecessor records are
-            // the group's first id plus a lane bit).
-            let n = 16.min(lanes.end - lo).min(64 - (lo & 63));
-            for (i, l) in idx.iter_mut().enumerate().take(n) {
-                *l = lo + i;
-            }
-            // A slice of only skipped lanes emits nothing (a raise re-expands
-            // a few rows of each 64-row group it loads).
-            if sink.skip_in.is_some_and(|sk| idx[..n].iter().all(|&l| sk[l])) {
-                lo += n;
-                continue;
-            }
-            if !self.run_slice(chunk, cell_in, &idx[..n], u16::MAX, sink) {
+        // Slices of 16 live lanes (of any id groups: `run_slice`).
+        let live: Vec<usize> = lanes.iter().copied().filter(|&l| !sink.skip_in.is_some_and(|sk| sk[l])).collect();
+        for part in live.chunks(16) {
+            if !self.run_slice(chunk, cell_in, part, ((1u32 << part.len()) - 1) as u16, sink) {
                 return false;
             }
-            lo += n;
         }
         sink.end_call();
         true
@@ -1062,6 +1048,29 @@ pub(crate) fn key_check(slot: &crate::frame::Slot) {
     );
 }
 
+/// `CELESTE_KERNEL_KEY_CHECK=1` on a block the forward STORES (a canonical
+/// piece, `canon::canonical_layer`): the boundary over a copy must keep its
+/// shape, structure and keys - its gather moved rows, not values.
+pub(crate) fn key_check_block(blk: &Rt2) {
+    if !key_check_on() {
+        return;
+    }
+    let mut b = blk.clone_block();
+    b.boundary(&super::boundary_ids());
+    let (mut want, mut got) = (blk.row_keys.clone(), b.row_keys.clone());
+    want.sort_unstable();
+    got.sort_unstable();
+    assert!(
+        b.shape_hash == blk.shape_hash && b.structure == blk.structure && got == want,
+        "KERNEL KEY CHECK: a stored piece of shape {:#x} ({} rows) is not what the boundary keys it as (shape {:#x}, structure {}, {} keys)",
+        blk.shape_hash,
+        blk.width,
+        b.shape_hash,
+        if b.structure == blk.structure { "same" } else { "DIFFERENT" },
+        if got == want { "same" } else { "DIFFERENT" },
+    );
+}
+
 /// `CELESTE_KERNEL_KEY_CHECK=1` (see `key_check`).
 fn key_check_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1126,7 +1135,7 @@ impl Registry {
         &self,
         chunk: &Rt2,
         cell_in: &[u32],
-        lanes: std::ops::Range<usize>,
+        lanes: &[usize],
         sink: &mut crate::frame::ForwardSink,
     ) -> bool {
         if self.grid.is_none() {
@@ -1144,13 +1153,13 @@ impl Registry {
         // left room (6,2) 100% f57 36% padding and room (3,0) at 8 px 53%.
         stats([1, 0, 0, 0, 0, 0, 0]);
         let mut by_region: Vec<(Option<Region>, usize)> =
-            lanes.filter(|&l| !sink.skip_in.is_some_and(|sk| sk[l])).map(|l| (grid.of_cell(cell_in[l]), l)).collect();
+            lanes.iter().copied().filter(|&l| !sink.skip_in.is_some_and(|sk| sk[l])).map(|l| (grid.of_cell(cell_in[l]), l)).collect();
         by_region.sort_unstable();
         let mut idx: Vec<usize> = Vec::with_capacity(16);
         for run in by_region.chunk_by(|a, b| a.0 == b.0) {
             let key = run[0].0;
             let Some(k) = self.kernels.get(&(chunk.shape_hash, key)) else {
-                return self.run_key(chunk, key, cell_in, run[0].1..run[0].1 + 1, sink);
+                return self.run_key(chunk, key, cell_in, &[run[0].1], sink);
             };
             for part in run.chunks(16) {
                 idx.clear();
@@ -1169,7 +1178,7 @@ impl Registry {
         chunk: &Rt2,
         key: Option<Region>,
         cell_in: &[u32],
-        lanes: std::ops::Range<usize>,
+        lanes: &[usize],
         sink: &mut crate::frame::ForwardSink,
     ) -> bool {
         match self.kernels.get(&(chunk.shape_hash, key)) {
@@ -1821,7 +1830,7 @@ fn build_registry_for_level(level: crate::abstraction::Level) -> Option<Registry
 pub(crate) fn run_chunk(
     chunk: &Rt2,
     cell_in: &[u32],
-    lanes: std::ops::Range<usize>,
+    lanes: &[usize],
     sink: &mut crate::frame::ForwardSink,
 ) -> bool {
     match registry() {
